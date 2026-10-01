@@ -9,10 +9,10 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_unresolved_call_count, tc_lookup_node_tid, tc_tid_is_concrete, tc_tid_resolved, tc_stamp_program, tc_stamp_name_child, tc_name_is_item, TYPE_INT, TYPE_STR, TYPE_U8, TYPE_BOOL, TYPE_FLOAT}
+import typecheck.{check_types, tc_unresolved_call_count, tc_lookup_node_tid, tc_tid_is_concrete, tc_tid_resolved, tc_stamp_program, tc_stamp_name_child, tc_name_is_item, TYPE_INT, TYPE_STR, TYPE_CHAR, TYPE_U8, TYPE_BOOL, TYPE_FLOAT}
 import parser.{nodes, node_kind, node_name, node_method, node_value, node_body, node_condition, node_unclaimed_child_field, node_value_child_ids}
 import ast.{NodeKind, AstNode, nk_bridge_gap, nk_of, nk_is_typed}
-import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries, NO_SUCH_FIELD}
+import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries, NO_SUCH_FIELD, UNRESOLVED_METHOD}
 import std.io
 import embedded_stdlib_registry.{init_embedded_stdlib}
 
@@ -30,6 +30,17 @@ fn stamp_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, D
     // asserts that no node in the program it compiled holds a child field the table omits.
     assert(unclaimed_child_fields() == 0)
     diag_count + diag_ice_count
+}
+
+// The code of the one error the last probe raised, or "" when it raised none or several, so a
+// row that expects a diagnostic cannot pass on some other one.
+fn sole_error_code() -> Str {
+    let mut codes: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { codes.push(d.code) }
+    }
+    if codes.len() != 1 { return "" }
+    codes.get(0).unwrap()
 }
 
 fn unclaimed_child_fields() -> Int {
@@ -535,12 +546,7 @@ fn with_tail_untyped_src() -> Str {
 test "a with-block whose tail read is untyped is not reported above the tail" {
     assert(stamp_probe("build/stamp_with_tail_untyped.bl", with_tail_untyped_src()) == 1)
     assert_eq(diag_ice_count, 0)
-    let mut codes: List[Str] = []
-    for d in diag_entries {
-        if d.severity == "error" { codes.push(d.code) }
-    }
-    assert_eq(codes.len(), 1)
-    assert_eq(codes.get(0).unwrap(), NO_SUCH_FIELD)
+    assert_eq(sole_error_code(), NO_SUCH_FIELD)
     // The block above the unanswered tail carries nothing: what the test pins is that the pass
     // stays quiet about the PARENT of an unanswered child, not that everything got a type.
     assert(tc_tid_is_concrete(tc_lookup_node_tid(first_node_of(NodeKind.WithBlock))) == 0)
@@ -711,9 +717,9 @@ test "a name in a qualifier or callee position is a spelling and carries no type
     assert(untyped_value_nodes_in(body) == 0)
 }
 
-// A match arm that binds nothing: a nullary variant and a wildcard. The variant MATCHES a value
-// of the scrutinee's type, which is the type a binder in its place would take, so it carries
-// that type. `_` is a WildcardPattern, a kind that denotes no value at all and carries none.
+// A match arm that binds nothing: a nullary variant and a wildcard. Each MATCHES a value of the
+// scrutinee's type, which is the type a binder in its place would take, so each carries that
+// type. `_` matches any value and discards it (§3), so it has a type though it binds no name.
 fn nullary_pattern_src() -> Str {
     let mut s = "fn zzpat(zzo: Option[Int]) -> Int \{\n"
     s = s.concat("    match zzo \{\n")
@@ -725,11 +731,11 @@ fn nullary_pattern_src() -> Str {
     s
 }
 
-test "a nullary variant pattern carries the matched type and a wildcard denotes no value" {
+test "a nullary variant pattern and a wildcard carry the matched type" {
     assert(stamp_probe("build/stamp_nullary_pattern.bl", nullary_pattern_src()) == 0)
     let body = fn_body_of("zzpat")
     assert(tc_tid_is_concrete(tid_in(body, NodeKind.IdentPattern, "None")) != 0)
-    assert(tc_tid_is_concrete(tid_in(body, NodeKind.WildcardPattern, "")) == 0)
+    assert(tc_tid_is_concrete(tid_in(body, NodeKind.WildcardPattern, "")) != 0)
     assert(untyped_value_nodes_in(body) == 0)
 }
 
@@ -767,12 +773,12 @@ test "a field reached through a pointer carries the field's type, and so do its 
 }
 
 // The three iterables whose element rule lived only in codegen. A `for` binder is a value like
-// any other binder, so it carries the element type of whatever it walks: a Str yields the
-// one-character Strs codegen binds, a Bytes yields U8, a Channel yields what it carries.
+// any other binder, so it carries the element type of whatever it walks: a Str yields Char,
+// because Str is IntoIterator[Char] (§3), a Bytes yields U8, a Channel yields what it carries.
 fn iter_elem_src() -> Str {
     let mut s = "fn zziter(zzc: Channel[Int]) -> Int \{\n"
     s = s.concat("    let mut zzn = 0\n")
-    s = s.concat("    for zzs in \"ab\" \{ zzn = zzn + zzs.len() }\n")
+    s = s.concat("    for zzs in \"ab\" \{ zzn = zzn + zzs.to_int() }\n")
     s = s.concat("    for zzu in Bytes.from_str(\"ab\") \{ zzn = zzn + zzu.to_int() }\n")
     s = s.concat("    for zzi in zzc \{ zzn = zzn + zzi }\n")
     s = s.concat("    zzn\n")
@@ -784,7 +790,7 @@ fn iter_elem_src() -> Str {
 test "a for binder over a string, a byte buffer or a channel carries the element type" {
     assert(stamp_probe("build/stamp_iter_elem.bl", iter_elem_src()) == 0)
     let body = fn_body_of("zziter")
-    assert(tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "zzs")) == TYPE_STR)
+    assert(tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "zzs")) == TYPE_CHAR)
     assert(tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "zzu")) == TYPE_U8)
     assert(tc_tid_resolved(tid_in(body, NodeKind.IdentPattern, "zzi")) == TYPE_INT)
     assert(untyped_value_nodes_in(body) == 0)
@@ -942,9 +948,9 @@ test "a method call on a bounded type parameter answers the bound trait's signat
     assert(untyped_value_nodes_in(body) == 0)
 }
 
-// A member reached through an UNBOUNDED type parameter names no type at this site: the field
-// belongs to whatever T stands for, so the answer exists only once T is bound. The pass must
-// treat that as a cascade and stay quiet, not report it as a hole.
+// A member reached through an UNBOUNDED type parameter names no type at this site. §3
+// Parametricity makes the read NoSuchField, so the source is not clean: the row pins that this
+// one error is the only report, and that the pass does not add a hole on top of it.
 fn tparam_projection_src() -> Str {
     let mut s = "type ZzC \{ zzcount: Int }\n"
     s = s.concat("fn zzproj[T](zzr: Result[T, Str]) -> Int \{\n")
@@ -958,10 +964,11 @@ fn tparam_projection_src() -> Str {
 }
 
 test "a member reached through a type parameter is a cascade, not a hole" {
-    assert(stamp_probe("build/stamp_tparam_projection.bl", tparam_projection_src()) == 0)
+    assert(stamp_probe("build/stamp_tparam_projection.bl", tparam_projection_src()) == 1)
+    assert_eq(diag_ice_count, 0)
+    assert_eq(sole_error_code(), NO_SUCH_FIELD)
     let body = fn_body_of("zzproj")
-    // The binder is typed — it is T. The projection off it is not, and that is the point:
-    // the mono pass records this node's tid once per instantiation.
+    // The binder is typed — it is T. The projection off it is not: it names no field.
     assert(tc_tid_is_concrete(tid_in(body, NodeKind.IdentPattern, "zzv")) != 0)
     assert(tc_tid_is_concrete(tid_in(body, NodeKind.FieldAccess, "zzcount")) == 0)
 }
@@ -1034,10 +1041,10 @@ test "an arena allocation with no target type is reported, not defaulted" {
     assert(diag_ice_count == 0)
 }
 
-// A method that resolves nowhere on its receiver. Typecheck does not model every builtin method,
-// so it neither answers the call nor rejects it — the codegen backstop names the type and the
-// method. The pass stands down for the whole program rather than pre-empting that report with an
-// internal error, the same way it stands down once a diagnostic has been raised.
+// A method that resolves nowhere on its receiver. List has no `concat` (its concatenation is
+// `append`), and typecheck now reports that itself as UnresolvedMethod. The row pins that this
+// one error is the only report: the pass stands down once a diagnostic has been raised, and does
+// not pre-empt it with an internal error.
 fn unresolved_method_src() -> Str {
     let mut s = "fn zzunres() -> Int \{\n"
     s = s.concat("    let zzxs: List[Int] = [1]\n")
@@ -1048,8 +1055,10 @@ fn unresolved_method_src() -> Str {
     s
 }
 
-test "a call typecheck cannot resolve is left to the backstop, not reported as a hole" {
-    assert(stamp_probe("build/stamp_unresolved_method.bl", unresolved_method_src()) == 0)
+test "a call typecheck cannot resolve is reported as unresolved, not as a hole" {
+    assert(stamp_probe("build/stamp_unresolved_method.bl", unresolved_method_src()) == 1)
+    assert_eq(diag_ice_count, 0)
+    assert_eq(sole_error_code(), UNRESOLVED_METHOD)
     let body = fn_body_of("zzunres")
     assert(tc_tid_is_concrete(tc_lookup_node_tid(let_value_of("zzys"))) == 0)
 }
