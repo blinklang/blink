@@ -804,6 +804,11 @@ fn tc_type_has_eq_impl(tname: Str) -> Int {
     0
 }
 
+// Does `tname` implement Eq by hand, rather than by a derive?
+fn tc_type_has_hand_eq(tname: Str) -> Bool {
+    tc_method_trait_names(tname, "eq").contains("Eq") != 0
+}
+
 // Does `tname` carry an Ord impl usable by `<`/`>`/`<=`/`>=`?
 // Covers @derive(Ord) and a user `impl Ord for T` (records `cmp` under `Ord`).
 fn tc_type_has_ord_impl(tname: Str) -> Int {
@@ -8726,10 +8731,9 @@ fn tc_check_derive_debug() ! Diag.Report {
 // tc_check_derive_debug (the Debug-field pass). Fail-open on generic /
 // unresolved names so the compiler's own generic code keeps typechecking.
 //
-// v1 policy (spec §3.4:329): collections (List/Map/Set/Option/Result) have no
-// value-equality/hash/ordering — `==` is pointer identity and there is no
-// Eq/Hash/Ord impl for them as value types — so they are rejected under any of
-// the three derives. Per-scalar: Float is not Hashable; Bool is not Orderable.
+// Eq asks each field what `==` asks of its type (tc_eq_need), so a container field is
+// `Eq` when its parts are. Hash and Ord still go by the field's written name:
+// collections are rejected under both, Float is not Hashable and Bool is not Orderable.
 
 // Is a bare scalar type name integer-like (Int / sized ints / Char)?
 fn tc_is_integer_scalar(n: Str) -> Int {
@@ -8744,7 +8748,7 @@ fn tc_is_float_scalar(n: Str) -> Int {
     0
 }
 
-// Does the named field type satisfy `tr` ("Hash"/"Eq"/"Ord")? Returns 1 for
+// Does the named field type satisfy `tr` ("Hash"/"Ord")? Returns 1 for
 // OK, 0 for reject. Fails OPEN (returns 1) for names that are neither a builtin
 // scalar nor a known user type — generics / type params we can't resolve here.
 fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
@@ -8753,7 +8757,7 @@ fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
     // message, because that is the text the author can change.
     let ftype_name = resolve_alias_type_name(written)
 
-    // Collections are never value-comparable/hashable/orderable in v1.
+    // Collections are never hashable or orderable in v1.
     if tc_is_container_name(ftype_name) != 0 { return 0 }
 
     // Tuple struct fields: a tuple is structurally Hash/Eq/Ord when its
@@ -8788,10 +8792,6 @@ fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
             if tc_type_name_derives(nominal, "Hash") != 0 { return 1 }
             return 0
         }
-        if tr == "Eq" {
-            if tc_type_has_eq_impl(nominal) != 0 || tc_type_has_eq_impl(bare) != 0 { return 1 }
-            return 0
-        }
         // Ord
         if tc_type_has_ord_impl(nominal) != 0 || tc_type_has_ord_impl(bare) != 0 { return 1 }
         return 0
@@ -8801,12 +8801,64 @@ fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
     1
 }
 
-fn tc_check_one_derive_trait_field(f: Int, tname: Str, tr: Str) ! Diag.Report {
+fn tc_check_one_derive_trait_field(f: Int, ftid: Int, tname: Str, tr: Str) ! Diag.Report {
     let ann = node_value(f)
     let ftype_name = node_name(ann)
-    if tc_field_type_derivable(ftype_name, tr) == 0 {
-        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive({tr}) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not implement {tr}", f, "remove the field from the derive, give it a type that implements {tr}, or implement {tr} by hand")
+    let generic_help = "remove the field from the derive, give it a type that implements {tr}, or implement {tr} by hand"
+    if tr == "Eq" {
+        tc_check_derive_eq_field(f, ftid, tname, generic_help)
+        return
     }
+    if tc_field_type_derivable(ftype_name, tr) == 0 {
+        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive({tr}) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not implement {tr}", f, generic_help)
+    }
+}
+
+// A derived Eq compares each field the way `==` would (03_types.md, *Derived Equality*),
+// so a field is asked what `==` asks of its type. The field's declared tid is read over the
+// type's own binders, which pass here: a generic derive is `Eq` where its arguments are,
+// and that is asked at each instance.
+fn tc_check_derive_eq_field(f: Int, ftid: Int, tname: Str, generic_help: Str) ! Diag.Report {
+    if ftid < 0 { return }
+    let path = tc_eq_need(ftid, [])
+    if path.len() == 0 { return }
+    let mut notes: List[Str] = []
+    let mut i = 0
+    while i + 1 < path.len() {
+        notes.push("`{type_to_str(path.get(i).unwrap())}` is `Eq` only if `{type_to_str(path.get(i + 1).unwrap())}` is `Eq`")
+        i = i + 1
+    }
+    let leaf = path.get(path.len() - 1).unwrap()
+    let k = type_kind(leaf)
+    let help = if k == TyKind.Struct || k == TyKind.Enum {
+        let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
+        "add `@derive(Eq)` to `type {strip_module_qualifier(tc_type_name(base))}`"
+    } else {
+        generic_help
+    }
+    diag_error_at_notes("NonDerivableTrait", NON_DERIVABLE_TRAIT,
+        "@derive(Eq) on `{tname}`: field `{node_name(f)}` has type `{type_to_str(path.get(0).unwrap())}` which does not implement Eq",
+        f, help, notes)
+}
+
+// The declared tid of the struct field `f`, or of the `fi`th field of variant `v`; -1 when
+// the pools hold no entry for it.
+fn tc_derive_struct_field_tid(ttid: Int, f: Int) -> Int {
+    if ttid < 0 || type_kind(ttid) != TyKind.Struct { return -1 }
+    get_struct_field_tid(ttid, node_name(f))
+}
+
+fn tc_derive_variant_field_tid(v: Int, fi: Int) -> Int {
+    let mut slot = 0
+    while slot < evar_decl_nodes.len() {
+        if evar_decl_nodes.get(slot).unwrap() == v {
+            let fslots = tc_evar_field_slots(slot)
+            if fi >= fslots.len() { return -1 }
+            return tc_evfield_tid(fslots.get(fi).unwrap())
+        }
+        slot = slot + 1
+    }
+    -1
 }
 
 fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
@@ -8815,6 +8867,7 @@ fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_type_decl_nodes.get(tname) ?? -1
         if td != -1 && tc_decl_derives(td, tr) != 0 {
+            let ttid = named_type_ids.get(ti) ?? -1
             let saved_module = nr_current_module
             nr_current_module = node_module(td)
             let flds_sl = node_fields(td)
@@ -8825,11 +8878,11 @@ fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
                     let vflds_sl = node_fields(f)
                     let mut vi = 0
                     while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
-                        tc_check_one_derive_trait_field(sublist_get(vflds_sl, vi), tname, tr)
+                        tc_check_one_derive_trait_field(sublist_get(vflds_sl, vi), tc_derive_variant_field_tid(f, vi), tname, tr)
                         vi = vi + 1
                     }
                 } else {
-                    tc_check_one_derive_trait_field(f, tname, tr)
+                    tc_check_one_derive_trait_field(f, tc_derive_struct_field_tid(ttid, f), tname, tr)
                 }
                 i = i + 1
             }
@@ -11259,10 +11312,6 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // @derive(Debug) requires every user-type field to also derive Debug.
     tc_check_derive_debug()
 
-    // @derive(Hash/Eq/Ord) requires every field's type to implement that trait
-    // (spec §3.6.6 NonDerivableTrait, E1401).
-    tc_check_derive_hash_eq_ord()
-
     // @derive(Serialize) requires every field's type to be serializable by the
     // generated to_json (spec §3.6.2/§3.6.6 NonDerivableTrait, E1401).
     tc_check_derive_serialize()
@@ -11529,6 +11578,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // Validate trait impl contracts
     validate_trait_impls(program)
+
+    // @derive(Hash/Eq/Ord) requires every field's type to implement that trait
+    // (spec §3.6.6 NonDerivableTrait, E1401). After the impl registrations, because a
+    // field type may implement the trait by hand.
+    tc_check_derive_hash_eq_ord()
 
     // The signatures of the namespace intrinsics codegen emits directly.
     register_ns_intrinsic_sigs()
@@ -16257,7 +16311,9 @@ fn tc_eq_need_parts(tid: Int, parts: List[Int], visiting: List[Int]) -> List[Int
 // payloads.
 fn tc_eq_need_enum(tid: Int, visiting: List[Int]) -> List[Int] {
     let base = tc_enum_base_tid(tid)
-    if tc_type_has_eq_impl(strip_module_qualifier(tc_type_name(base))) != 0 { return [] }
+    let bname = strip_module_qualifier(tc_type_name(base))
+    if tc_type_has_hand_eq(bname) { return [] }
+    if tc_type_name_derives(bname, "Eq") != 0 && base == tid { return [] }
     if !tc_enum_has_payload(base) { return [] }
     if visiting.contains(base) { return [] }
     let inst = if base == tid { -1 } else { tid }
@@ -16266,6 +16322,25 @@ fn tc_eq_need_enum(tid: Int, visiting: List[Int]) -> List[Int] {
         for fslot in tc_evar_field_slots(vslot) {
             parts.push(tc_member_tid_at_instance(tc_evfield_tid(fslot), inst))
         }
+    }
+    let mut inner: List[Int] = []
+    for v in visiting { inner.push(v) }
+    inner.push(base)
+    tc_eq_need_parts(tid, parts, inner)
+}
+
+// A hand impl answers for every instance. A derive answers from the fields, read at the
+// instance, so `Box[Widget]` asks about `Widget` (03_types.md, *Generic Type Bound
+// Inference*). A struct already being walked counts as `Eq`, as an enum does.
+fn tc_eq_need_struct(tid: Int, visiting: List[Int]) -> List[Int] {
+    let base = tc_struct_base_tid(tid)
+    let bname = strip_module_qualifier(tc_type_name(base))
+    if tc_type_has_hand_eq(bname) { return [] }
+    if tc_type_name_derives(bname, "Eq") == 0 { return [tid] }
+    if base == tid || visiting.contains(base) { return [] }
+    let mut parts: List[Int] = []
+    for slot in tc_struct_field_slots(base) {
+        parts.push(tc_member_tid_at_instance(tc_sfield_tid(slot), tid))
     }
     let mut inner: List[Int] = []
     for v in visiting { inner.push(v) }
@@ -16294,10 +16369,7 @@ fn tc_eq_need(tid0: Int, visiting: List[Int]) -> List[Int] {
         return tc_eq_need_parts(tid, elems, visiting)
     }
     if k == TyKind.Enum { return tc_eq_need_enum(tid, visiting) }
-    if k == TyKind.Struct {
-        if tc_type_has_eq_impl(strip_module_qualifier(tc_type_name(tc_struct_base_tid(tid)))) != 0 { return [] }
-        return [tid]
-    }
+    if k == TyKind.Struct { return tc_eq_need_struct(tid, visiting) }
     if k == TyKind.Typevar {
         // "" is a name that is not an active type parameter (a builtin lowered to a
         // typevar); it passes, as reject_unlicensed_comparison lets it pass.
@@ -16314,6 +16386,8 @@ fn tc_eq_need(tid0: Int, visiting: List[Int]) -> List[Int] {
 fn tc_kind_is_plain_eq(k: TyKind) -> Bool {
     if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Float || k == TyKind.Char { return true }
     if k == TyKind.Str || k == TyKind.Bytes || is_sized_int(k) != 0 { return true }
+    // A Ptr compares by address (07_trust_modules_metadata.md).
+    if k == TyKind.Ptr { return true }
     k == TyKind.Void || k == TyKind.Unknown || k == TyKind.Never
 }
 

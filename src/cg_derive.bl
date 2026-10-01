@@ -28,8 +28,9 @@ import cg_reg.{cg_reg_tid_for_decl, cg_reg_global_decls, cg_reg_module_of}
 import mono.{instances}
 import cg_call.{
     cg_call_element_from_runtime, cg_call_element_to_slot, cg_call_stdlib_declares,
-    cg_call_stdlib_symbol,
+    cg_call_stdlib_symbol, cg_call_equality_fn,
 }
+import cg_promote.{cg_promote_has_pending, cg_promote_print_walkers}
 import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
@@ -337,6 +338,12 @@ fn eq_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = eq_body(decl, tid, arg)
     if body < 0 { return }
+    // A field compared through a function built on demand calls a name the unit has not
+    // printed yet, and this body prints after the unit's last walker flush.
+    if cg_promote_has_pending() {
+        print_typedef_blocks(layout_take_typedefs())
+        cg_promote_print_walkers()
+    }
     print_fn(false, ret, symbol, params, false, body)
 }
 
@@ -460,14 +467,17 @@ fn eq_differs(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Rep
     if k == TyKind.Str { return eq_helper_differs("str_eq", lhs, rhs, bools, span) }
     // A Float's equality is total, and C's != is not: it answers true for two NaNs.
     if k == TyKind.Float { return eq_helper_differs("float_eq", lhs, rhs, bools, span) }
+    if k == TyKind.Bytes { return eq_helper_differs("bytes_eq", lhs, rhs, bools, span) }
     if eq_is_scalar(k) { return ir_binary(TYPE_BOOL, span, bools, "!=", lhs, rhs) }
     if k == TyKind.Struct || k == TyKind.Enum {
         return eq_nested_differs(ftid, lhs, rhs, bools, path, span)
     }
-    // A tuple element is compared by the element tuple's own method, which this stage
-    // writes from the type rather than from a declaration the tuple does not have.
-    if k == TyKind.Tuple {
-        return eq_call_differs(c_tid_derive_method_name(tc_resolve(ftid), "eq"), lhs, rhs, bools, span)
+    // A container, carrier or tuple field compares by Container Equality, through the
+    // function `==` on two of them calls, so the derive and the operator never disagree.
+    if k == TyKind.List || k == TyKind.Set || k == TyKind.Map || k == TyKind.Tuple || k == TyKind.Option || k == TyKind.Result {
+        let symbol = cg_call_equality_fn(span, tc_resolve(ftid))
+        if symbol == "" { return -1 }
+        return eq_call_differs(symbol, lhs, rhs, bools, span)
     }
     not_built(span, "@derive(Eq) on the {tk_name(k)} field `{path}`")
     -1
@@ -481,9 +491,12 @@ fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span:
         derive_ice(span, "field type {ftid} has no unambiguous declaration to compare through")
         return -1
     }
+    // A type with no derived eq compares the way `==` on it does: through its hand impl,
+    // or an enum through its payloads.
     if !defines_eq(fdecl) {
-        not_built(span, "@derive(Eq) on a field whose type `{node_name(fdecl)}` implements Eq by hand")
-        return -1
+        let symbol = cg_call_equality_fn(span, tc_resolve(ftid))
+        if symbol == "" { return -1 }
+        return eq_call_differs(symbol, lhs, rhs, bools, span)
     }
     let refusal = shape_refusal(fdecl, ftid, derive_eq)
     if refusal != "" {
@@ -548,6 +561,8 @@ fn eq_helper_differs(helper: Str, lhs: Int, rhs: Int, bools: Str, span: Int) -> 
 // NaN with NaN and C's != does not, so a Float is compared through a helper instead.
 fn eq_is_scalar(k: TyKind) -> Bool {
     if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char { return true }
+    // A Ptr's equality is its address (sections/07_trust_modules_metadata.md).
+    if k == TyKind.Ptr { return true }
     if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return true }
     if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return true }
     false
