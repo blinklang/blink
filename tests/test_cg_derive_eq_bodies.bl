@@ -11,6 +11,7 @@ import ast.{NodeKind, nk_of}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_tid_for_decl, cg_reg_type_decls}
 import cg_derive.{cg_derive_reset, cg_derive_emit_decls, cg_derive_emit_bodies}
+import cg_promote.{cg_promote_reset}
 import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_saying}
 import parser.{node_name, nodes, node_kind, node_source_module}
 import diagnostics.{diag_entries, CODEGEN_STAGE_NOT_BUILT_NAME}
@@ -48,7 +49,8 @@ fn main() { }
 }
 
 // Compiling resets the diagnostic counters, so a test that counts what this stage
-// records must read the counters after the probe is built, never before it.
+// records must read the counters after the probe is built, never before it. The on-demand
+// function table is reset as each unit's is: a symbol one probe wrote is not in the next.
 fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let program = cg_probe_compile("build/{stem}_probe_src.bl", src)
     layout_reset()
@@ -57,6 +59,7 @@ fn program_of(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Di
     cg_reg_reset()
     cg_reg_build(program)
     cg_derive_reset()
+    cg_promote_reset()
     program
 }
 
@@ -77,6 +80,7 @@ fn program_of_but(stem: Str, src: Str, expected: Str) -> Int ! Lex.Tokenize, Par
     cg_reg_reset()
     cg_reg_build(program)
     cg_derive_reset()
+    cg_promote_reset()
     program
 }
 
@@ -253,8 +257,8 @@ test "a derive this stage has not built reports an internal error" {
         "@derive(Deserialize) on field `xs` of kind Option"), 1)
 }
 
-// A raw pointer field passes the front end's derive-field check, and no comparison of
-// one is a value comparison.
+// A Ptr's equality is its address (sections/07_trust_modules_metadata.md), so the word
+// comparison every scalar uses is the value comparison here.
 fn unsupported_field_src() -> Str {
     #"@derive(Eq)
 type Handle { raw: Ptr[U8] }
@@ -262,11 +266,64 @@ fn main() { }
 "#
 }
 
-// The pre-rewrite emitter dropped a field it had no rule for, so two different values
-// answered equal. A field with no comparison is an internal error instead.
-test "a field kind with no comparison is an internal error, not a dropped field" {
+test "a Ptr field is compared by address with the inequality operator, not refused" {
     assert_eq(refusals_saying("cg_derive_unsupported", unsupported_field_src(), CODEGEN_STAGE_NOT_BUILT_NAME,
-        "@derive(Eq) on the Ptr field `raw`"), 1)
+        "@derive(Eq)"), 0)
+    let text = one_fn(bodies_of("cg_derive_unsupported", unsupported_field_src()), "int blink_Handle_eq")
+    assert_has(text, #"if (self.raw != other.raw) {"#)
+}
+
+// A container, carrier or tuple field compares by Container Equality, through the same
+// comparison `==` calls. That comparison is printed on demand, so it must be in the unit
+// before the derived body that calls it.
+fn container_field_src() -> Str {
+    #"@derive(Eq)
+type Bag {
+    names: List[Str]
+    counts: Map[Str, Int]
+    seen: Set[Int]
+    label: Option[Str]
+    outcome: Result[Int, Str]
+    pair: (Int, Str)
+}
+fn main() { }
+"#
+}
+
+test "a container field calls the comparison == uses, printed before the derived body" {
+    assert_eq(refusals_saying("cg_derive_container", container_field_src(), CODEGEN_STAGE_NOT_BUILT_NAME,
+        "@derive(Eq)"), 0)
+    let text = bodies_of("cg_derive_container", container_field_src())
+    let body = one_fn(text, "int blink_Bag_eq(")
+    assert_has(body, "(self.names, other.names)")
+    assert_has(body, "(self.counts, other.counts)")
+    assert_has(body, "(self.seen, other.seen)")
+    assert_has(body, "(self.label, other.label)")
+    assert_has(body, "(self.outcome, other.outcome)")
+    assert_has(body, "(self.pair, other.pair)")
+    let first_helper = text.index_of("blink_eq_")
+    assert(first_helper >= 0)
+    assert(first_helper < text.index_of("int blink_Bag_eq("))
+}
+
+// A field whose type implements Eq by hand compares through that impl, the method `==`
+// on two of those values would call.
+fn hand_eq_field_src() -> Str {
+    #"type Celsius { deg: Int }
+impl Eq for Celsius {
+    fn eq(self, other: Celsius) -> Bool { self.deg / 10 == other.deg / 10 }
+}
+@derive(Eq)
+type Room { t: Celsius }
+fn main() { }
+"#
+}
+
+test "a field whose type implements Eq by hand calls that impl" {
+    assert_eq(refusals_saying("cg_derive_hand_eq", hand_eq_field_src(), CODEGEN_STAGE_NOT_BUILT_NAME,
+        "implements Eq by hand"), 0)
+    let body = one_fn(bodies_of("cg_derive_hand_eq", hand_eq_field_src()), "int blink_Room_eq(")
+    assert_has(body, "(self.t, other.t)")
 }
 
 // layout.bl owns the one reader of the @derive annotation, so the derive stage and
