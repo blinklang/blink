@@ -32,6 +32,11 @@ let mut fmt_lines: List[Str] = []
 let mut fmt_indent: Int = 0
 let fmt_max_line: Int = 100
 
+// While on, format_expr answers a marker for each form that needs its own lines and records the
+// node, so the caller can lay the rest of the expression out around that form.
+let mut fmt_collect_holes: Bool = false
+let mut fmt_holes: List[Int] = []
+
 fn fmt_emit(line: Str) ! Format.Emit {
     if line == "" {
         fmt_lines.push("")
@@ -320,6 +325,10 @@ pub fn format_expr(node: Int) -> Str {
         return ""
     }
     let kind = node_kind(node)
+    if fmt_collect_holes && is_multiline_form(node) {
+        fmt_holes.push(node)
+        return fmt_hole_mark()
+    }
 
     if kind == NodeKind.IntLit {
         let s = node_str_val(node)
@@ -591,6 +600,9 @@ fn format_interp_string(node: Int) -> Str {
     if parts_sl == -1 {
         return "\"\""
     }
+    // An interpolation must stay on one line, so a form inside it gets no hole.
+    let collecting = fmt_collect_holes
+    fmt_collect_holes = false
     let mut sb = StringBuilder.new()
     sb.write("\"")
     let mut i = 0
@@ -606,6 +618,7 @@ fn format_interp_string(node: Int) -> Str {
         }
         i = i + 1
     }
+    fmt_collect_holes = collecting
     sb.write("\"")
     sb.to_str()
 }
@@ -782,7 +795,7 @@ fn emit_call_wrapped(node: Int, prefix: Str) ! Format.Emit {
             emit_args_with_trailing_block(open, args_sl)
             return
         }
-        if any_arg_needs_multiline(args_sl) != 0 {
+        if any_needs_multiline(args_sl) != 0 {
             emit_args_with_block_args(open, args_sl)
             return
         }
@@ -817,7 +830,7 @@ fn emit_call_wrapped(node: Int, prefix: Str) ! Format.Emit {
             emit_args_with_trailing_block(open, args_sl)
             return
         }
-        if any_arg_needs_multiline(args_sl) != 0 {
+        if any_needs_multiline(args_sl) != 0 {
             emit_args_with_block_args(open, args_sl)
             return
         }
@@ -850,11 +863,12 @@ fn emit_list_wrapped(node: Int, prefix: Str) ! Format.Emit {
     fmt_indent = fmt_indent + 1
     let mut i = 0
     while i < sublist_length(elems_sl) {
-        let elem_str = format_expr(sublist_get(elems_sl, i))
-        if i < sublist_length(elems_sl) - 1 {
-            fmt_emit(elem_str.concat(","))
+        let elem = sublist_get(elems_sl, i)
+        let sep = if i < sublist_length(elems_sl) - 1 { "," } else { "" }
+        if block_needs_multiline(elem) != 0 {
+            emit_expr_wrapped(elem, "", sep)
         } else {
-            fmt_emit(elem_str)
+            fmt_emit(format_expr(elem).concat(sep))
         }
         i = i + 1
     }
@@ -874,18 +888,17 @@ fn emit_struct_lit_wrapped(node: Int, prefix: Str) ! Format.Emit {
     let mut i = 0
     while i < sublist_length(flds_sl) {
         let fld = sublist_get(flds_sl, i)
-        let mut fld_str = ""
-        if node_kind(fld) == NodeKind.SpreadExpr {
-            fld_str = format_expr(fld)
-        } else {
-            let fname = node_name(fld)
-            let fval = node_value(fld)
-            fld_str = "{fname}: {format_expr(fval)}"
+        let sep = if i < sublist_length(flds_sl) - 1 { "," } else { "" }
+        let mut fld_prefix = ""
+        let mut fval = fld
+        if node_kind(fld) != NodeKind.SpreadExpr {
+            fld_prefix = node_name(fld).concat(": ")
+            fval = node_value(fld)
         }
-        if i < sublist_length(flds_sl) - 1 {
-            fmt_emit(fld_str.concat(","))
+        if block_needs_multiline(fval) != 0 {
+            emit_expr_wrapped(fval, fld_prefix, sep)
         } else {
-            fmt_emit(fld_str)
+            fmt_emit(fld_prefix.concat(format_expr(fval)).concat(sep))
         }
         i = i + 1
     }
@@ -893,47 +906,37 @@ fn emit_struct_lit_wrapped(node: Int, prefix: Str) ! Format.Emit {
     fmt_emit("}")
 }
 
-let mut binop_parts: List[Str] = []
-let mut binop_ops: List[Str] = []
-
 fn emit_binop_wrapped(node: Int, prefix: Str) ! Format.Emit {
-    binop_parts = []
-    binop_ops = []
-    flatten_binop_chain(node)
-    if binop_parts.len() == 0 {
+    if node_kind(node) != NodeKind.BinOp {
         fmt_emit(prefix.concat(format_expr(node)))
         return
     }
-    fmt_emit(prefix.concat(binop_parts.get(0).unwrap()))
+    // The chain is the left spine of one operator; a different operator below it is an operand.
+    let op = node_op(node)
+    let mut spine: List[Int] = []
+    let mut cur = node
+    while node_kind(cur) == NodeKind.BinOp && node_op(cur) == op {
+        spine.push(cur)
+        cur = node_left(cur)
+    }
+    let mut parts = [format_binop_side(format_expr(cur), cur, op, 0)]
+    let mut i = spine.len() - 1
+    while i >= 0 {
+        let right = node_right(spine.get(i).unwrap())
+        parts.push(format_binop_side(format_expr(right), right, op, 1))
+        i = i - 1
+    }
+    fmt_emit(prefix.concat(parts.get(0).unwrap()))
     fmt_indent = fmt_indent + 1
-    let mut i = 0
-    while i < binop_ops.len() {
+    let mut k = 1
+    while k < parts.len() {
         let prev_idx = fmt_lines.len() - 1
         let prev = fmt_lines.get(prev_idx).unwrap()
-        fmt_lines.set(prev_idx, prev.concat(" ").concat(binop_ops.get(i).unwrap()))
-        fmt_emit(binop_parts.get(i + 1).unwrap())
-        i = i + 1
+        fmt_lines.set(prev_idx, prev.concat(" ").concat(op))
+        fmt_emit(parts.get(k).unwrap())
+        k = k + 1
     }
     fmt_indent = fmt_indent - 1
-}
-
-fn flatten_binop_chain(node: Int) {
-    let kind = node_kind(node)
-    if kind != NodeKind.BinOp {
-        binop_parts.push(format_expr(node))
-        return
-    }
-    let op = node_op(node)
-    let left = node_left(node)
-    let right = node_right(node)
-    let left_kind = node_kind(left)
-    if left_kind == NodeKind.BinOp && node_op(left) == op {
-        flatten_binop_chain(left)
-    } else {
-        binop_parts.push(format_binop_side(format_expr(left), left, op, 0))
-    }
-    binop_ops.push(op)
-    binop_parts.push(format_binop_side(format_expr(right), right, op, 1))
 }
 
 fn emit_method_chain_wrapped(node: Int, prefix: Str) ! Format.Emit {
@@ -990,47 +993,21 @@ fn chain_depth(node: Int) -> Int {
     depth
 }
 
-fn block_stmt_expr_needs_multiline(inner: Int) -> Int {
-    let k = node_kind(inner)
-    if k == NodeKind.MatchExpr { return 1 }
-    if k == NodeKind.HandlerExpr { return 1 }
-    if k == NodeKind.WithBlock { return 1 }
-    if k == NodeKind.Closure { return block_needs_multiline(inner) }
-    if k == NodeKind.Block { return block_needs_multiline(inner) }
-    if k == NodeKind.IfExpr { return block_needs_multiline(inner) }
-    if k == NodeKind.AsyncScope { return block_needs_multiline(inner) }
-    if k == NodeKind.AsyncSpawn { return block_needs_multiline(inner) }
-    if k == NodeKind.Call || k == NodeKind.MethodCall { return block_needs_multiline(inner) }
-    0
-}
-
 fn check_stmts_multiline(stmts_sl: Int) -> Int {
     if stmts_sl == -1 || sublist_length(stmts_sl) == 0 { return 0 }
     if sublist_length(stmts_sl) > 1 { return 1 }
     let stmt = sublist_get(stmts_sl, 0)
     let sk = node_kind(stmt)
     if sk == NodeKind.ExprStmt {
-        return block_stmt_expr_needs_multiline(node_value(stmt))
+        return block_needs_multiline(node_value(stmt))
     }
     if sk == NodeKind.Return {
         let val = node_value(stmt)
         if val == -1 { return 0 }
-        return block_stmt_expr_needs_multiline(val)
+        return block_needs_multiline(val)
     }
-    is_simple_expr_kind(sk) == 0
-}
-
-fn any_arg_needs_multiline(args_sl: Int) -> Int {
-    if args_sl == -1 { return 0 }
-    let n = sublist_length(args_sl)
-    let mut i = 0
-    while i < n {
-        if block_needs_multiline(sublist_get(args_sl, i)) != 0 {
-            return 1
-        }
-        i = i + 1
-    }
-    0
+    if is_simple_expr_kind(sk) == 0 { return 1 }
+    block_needs_multiline(stmt)
 }
 
 fn any_non_last_arg_needs_multiline(args_sl: Int) -> Int {
@@ -1047,35 +1024,105 @@ fn any_non_last_arg_needs_multiline(args_sl: Int) -> Int {
     0
 }
 
-fn block_needs_multiline(node: Int) -> Int {
-    let kind = node_kind(node)
-    if kind == NodeKind.MatchExpr { return 1 }
-    if kind == NodeKind.HandlerExpr { return 1 }
-    if kind == NodeKind.AsyncScope || kind == NodeKind.AsyncSpawn {
-        let body = node_body(node)
-        if body == -1 { return 0 }
-        return check_stmts_multiline(node_stmts(body))
+fn any_needs_multiline(items_sl: Int) -> Int {
+    if items_sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(items_sl) {
+        if block_needs_multiline(sublist_get(items_sl, i)) != 0 {
+            return 1
+        }
+        i = i + 1
     }
-    if kind == NodeKind.Closure {
+    0
+}
+
+fn if_needs_multiline(node: Int) -> Int {
+    let then_b = node_then_body(node)
+    if then_b != -1 && check_stmts_multiline(node_stmts(then_b)) != 0 { return 1 }
+    let else_b = node_else_body(node)
+    if else_b == -1 { return 0 }
+    let else_stmts = node_stmts(else_b)
+    // An `else if` chain stays inline when every link fits inline.
+    if else_stmts != -1 && sublist_length(else_stmts) == 1 {
+        let inner = sublist_get(else_stmts, 0)
+        if node_kind(inner) == NodeKind.IfExpr {
+            return if_needs_multiline(inner)
+        }
+    }
+    check_stmts_multiline(else_stmts)
+}
+
+// A form that has no one-line layout. format_expr either reaches it in a hole-collecting pass or
+// is never asked to lay it out.
+fn is_multiline_form(node: Int) -> Bool {
+    let kind = node_kind(node)
+    if kind == NodeKind.MatchExpr || kind == NodeKind.HandlerExpr || kind == NodeKind.WithBlock {
+        return true
+    }
+    if kind == NodeKind.AsyncScope || kind == NodeKind.AsyncSpawn || kind == NodeKind.Closure {
         let body = node_body(node)
-        if body == -1 { return 0 }
-        return check_stmts_multiline(node_stmts(body))
+        if body == -1 { return false }
+        return check_stmts_multiline(node_stmts(body)) != 0
     }
     if kind == NodeKind.Block {
-        return check_stmts_multiline(node_stmts(node))
+        return check_stmts_multiline(node_stmts(node)) != 0
     }
     if kind == NodeKind.IfExpr {
-        let then_b = node_then_body(node)
-        if then_b == -1 { return 0 }
-        return check_stmts_multiline(node_stmts(then_b))
+        return if_needs_multiline(node) != 0
     }
-    if kind == NodeKind.Call {
+    false
+}
+
+// Whether any part of the expression has no one-line layout. An interpolation is not searched,
+// since a form inside it cannot move to its own lines.
+fn block_needs_multiline(node: Int) -> Int {
+    if node == -1 { return 0 }
+    if is_multiline_form(node) { return 1 }
+    let kind = node_kind(node)
+    if kind == NodeKind.BinOp {
         if block_needs_multiline(node_left(node)) != 0 { return 1 }
-        return any_arg_needs_multiline(node_args(node))
+        return block_needs_multiline(node_right(node))
+    }
+    if kind == NodeKind.UnaryOp || kind == NodeKind.Call {
+        if block_needs_multiline(node_left(node)) != 0 { return 1 }
+        if kind == NodeKind.UnaryOp { return 0 }
+        return any_needs_multiline(node_args(node))
     }
     if kind == NodeKind.MethodCall {
         if block_needs_multiline(node_obj(node)) != 0 { return 1 }
-        return any_arg_needs_multiline(node_args(node))
+        return any_needs_multiline(node_args(node))
+    }
+    if kind == NodeKind.FieldAccess || kind == NodeKind.AwaitExpr {
+        return block_needs_multiline(node_obj(node))
+    }
+    if kind == NodeKind.IndexExpr {
+        if block_needs_multiline(node_obj(node)) != 0 { return 1 }
+        return block_needs_multiline(node_index(node))
+    }
+    if kind == NodeKind.TupleLit || kind == NodeKind.ListLit {
+        return any_needs_multiline(node_elements(node))
+    }
+    if kind == NodeKind.StructLit {
+        let flds_sl = node_fields(node)
+        if flds_sl == -1 { return 0 }
+        let mut i = 0
+        while i < sublist_length(flds_sl) {
+            let fld = sublist_get(flds_sl, i)
+            let fval = if node_kind(fld) == NodeKind.SpreadExpr { fld } else { node_value(fld) }
+            if block_needs_multiline(fval) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    if kind == NodeKind.RangeLit {
+        if block_needs_multiline(node_start(node)) != 0 { return 1 }
+        return block_needs_multiline(node_end(node))
+    }
+    if kind == NodeKind.SpreadExpr || kind == NodeKind.NamedArg {
+        return block_needs_multiline(node_value(node))
+    }
+    if kind == NodeKind.ChannelNew {
+        return any_needs_multiline(node_args(node))
     }
     0
 }
@@ -1224,36 +1271,80 @@ fn emit_iife_wrapped(call_node: Int, callee: Int, prefix: Str, suffix: Str) ! Fo
     fmt_emit(sb.to_str())
 }
 
-fn emit_block_expr_wrapped(node: Int, prefix: Str) ! Format.Emit {
+fn emit_block_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     fmt_emit("{prefix}\{")
     fmt_indent = fmt_indent + 1
     format_block_body(node)
     fmt_indent = fmt_indent - 1
-    fmt_emit("}")
+    fmt_emit("}{suffix}")
 }
 
-fn emit_async_scope_wrapped(node: Int, prefix: Str) ! Format.Emit {
+fn emit_async_scope_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     let body = node_body(node)
     fmt_emit("{prefix}async.scope \{")
     fmt_indent = fmt_indent + 1
     format_block_body(body)
     fmt_indent = fmt_indent - 1
-    fmt_emit("}")
+    fmt_emit("}{suffix}")
 }
 
-fn emit_async_spawn_wrapped(node: Int, prefix: Str) ! Format.Emit {
+fn emit_async_spawn_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     let body = node_body(node)
     fmt_emit("{prefix}async.spawn \{")
     fmt_indent = fmt_indent + 1
     format_block_body(body)
     fmt_indent = fmt_indent - 1
-    fmt_emit("}")
+    fmt_emit("}{suffix}")
+}
+
+fn callee_needs_multiline(node: Int) -> Int {
+    let kind = node_kind(node)
+    if kind == NodeKind.Call { return block_needs_multiline(node_left(node)) }
+    if kind == NodeKind.MethodCall { return block_needs_multiline(node_obj(node)) }
+    0
+}
+
+fn fmt_hole_mark() -> Str {
+    str_from_code_point(1)
+}
+
+// Lays out an expression that holds forms with no one-line layout. The text around each form
+// stays on the form's first and last lines, and two forms in a row share the line where the
+// first one closes.
+fn emit_expr_with_holes(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
+    fmt_holes = []
+    fmt_collect_holes = true
+    let text = format_expr(node)
+    fmt_collect_holes = false
+    let holes = fmt_holes
+    fmt_holes = []
+    let pieces = text.split(fmt_hole_mark())
+    if holes.len() == 0 || pieces.len() != holes.len() + 1 {
+        io.eprintln("formatter: {holes.len()} multi-line forms left {pieces.len()} text pieces in a {node_kind_name(node_kind(node))}")
+        exit(101)
+        return
+    }
+    let pad_len = fmt_indent * 4
+    let mut lead = prefix.concat(pieces.get(0).unwrap())
+    let mut i = 0
+    while i < holes.len() {
+        if i > 0 {
+            let last = fmt_lines.pop().unwrap()
+            lead = last.substring(pad_len, last.len() - pad_len)
+        }
+        let mut tail = pieces.get(i + 1).unwrap()
+        if i == holes.len() - 1 {
+            tail = tail.concat(suffix)
+        }
+        emit_expr_wrapped(holes.get(i).unwrap(), lead, tail)
+        i = i + 1
+    }
 }
 
 fn call_has_any_block_arg(node: Int) -> Int {
     let kind = node_kind(node)
     if kind != NodeKind.Call && kind != NodeKind.MethodCall { return 0 }
-    any_arg_needs_multiline(node_args(node))
+    any_needs_multiline(node_args(node))
 }
 
 // These wrapped emitters end on their own closing line, so a suffix the caller needs after the
@@ -1299,23 +1390,37 @@ fn emit_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
             emit_handler_wrapped(node, prefix, suffix)
             return
         }
-        if suffix == "" {
-            if kind == NodeKind.Block {
-                emit_block_expr_wrapped(node, prefix)
-                return
-            }
-            if kind == NodeKind.AsyncScope {
-                emit_async_scope_wrapped(node, prefix)
-                return
-            }
-            if kind == NodeKind.AsyncSpawn {
-                emit_async_spawn_wrapped(node, prefix)
-                return
-            }
+        if kind == NodeKind.WithBlock {
+            format_with_block_with_prefix(node, prefix, suffix)
+            return
         }
-    }
-    if suffix == "" && call_has_any_block_arg(node) != 0 {
-        emit_call_wrapped(node, prefix)
+        if kind == NodeKind.Block {
+            emit_block_expr_wrapped(node, prefix, suffix)
+            return
+        }
+        if kind == NodeKind.AsyncScope {
+            emit_async_scope_wrapped(node, prefix, suffix)
+            return
+        }
+        if kind == NodeKind.AsyncSpawn {
+            emit_async_spawn_wrapped(node, prefix, suffix)
+            return
+        }
+        if suffix == "" && call_has_any_block_arg(node) != 0 && callee_needs_multiline(node) == 0 {
+            emit_call_wrapped(node, prefix)
+            return
+        }
+        if kind == NodeKind.ListLit {
+            emit_list_wrapped(node, prefix)
+            fmt_append_last(suffix)
+            return
+        }
+        if kind == NodeKind.StructLit {
+            emit_struct_lit_wrapped(node, prefix)
+            fmt_append_last(suffix)
+            return
+        }
+        emit_expr_with_holes(node, prefix, suffix)
         return
     }
     let expr_str = format_expr(node)
@@ -1459,7 +1564,7 @@ fn format_stmt(node: Int) ! Format.Emit {
         }
         prefix = prefix.concat(" = ")
         if node_kind(val) == NodeKind.WithBlock {
-            format_with_block_with_prefix(val, prefix)
+            format_with_block_with_prefix(val, prefix, "")
             return
         }
         emit_expr_wrapped(val, prefix, "")
@@ -1747,10 +1852,10 @@ fn format_match_arm(node: Int) ! Format.Emit {
 }
 
 fn format_with_block(node: Int) ! Format.Emit {
-    format_with_block_with_prefix(node, "")
+    format_with_block_with_prefix(node, "", "")
 }
 
-fn format_with_block_with_prefix(node: Int, prefix: Str) ! Format.Emit {
+fn format_with_block_with_prefix(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     let handlers_sl = node_handlers(node)
     let body = node_body(node)
     if handlers_sl != -1 && sublist_length(handlers_sl) == 1 {
@@ -1772,7 +1877,7 @@ fn format_with_block_with_prefix(node: Int, prefix: Str) ! Format.Emit {
             fmt_indent = fmt_indent + 1
             format_block_body(body)
             fmt_indent = fmt_indent - 1
-            fmt_emit("}")
+            fmt_emit("}{suffix}")
             return
         }
     }
@@ -1799,7 +1904,7 @@ fn format_with_block_with_prefix(node: Int, prefix: Str) ! Format.Emit {
     fmt_indent = fmt_indent + 1
     format_block_body(body)
     fmt_indent = fmt_indent - 1
-    fmt_emit("}")
+    fmt_emit("}{suffix}")
 }
 
 fn format_block_body(node: Int) ! Format.Emit {
