@@ -4,6 +4,8 @@
 
 Resolves br **tn17vz** — "Spec: Hash seed contract + iteration order + `--deterministic` CLI flag." Follow-up to the 42cvjx triage (which produced an informal 6-0 starting draft but ran no spec round) and to the `h0geg9` Map runtime work (per-K kops vtable, [decisions/map-runtime-architecture.md](map-runtime-architecture.md)).
 
+> **Erratum (2026-09-30).** This record first wrote the sort as `.sorted()`, a method that does not exist, and wrote `names.sort()` as a statement, which discards the sorted copy. Both now read `.sort()`, which returns a new list. No vote changed. See [List Sort Stability and Comparator](list-sort-stability-comparator.md).
+
 ### Grounding facts (verified in-tree before deliberation)
 
 The runtime already ships the behavior under discussion; this deliberation ratifies and documents it, and closes the soundness gaps around it.
@@ -22,7 +24,7 @@ Six panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML, minimalism) d
 - **Systems:** Entropy-seed by default; `--deterministic` pins seed 0 (compile-time, travels with the binary), `BLINK_MAP_SEED` is the runtime no-recompile pin. *"This is exactly Go's model: per-process random hash seed, iteration order deliberately randomized... Java is the cautionary tale — `HashMap` has no seed... CVE-2011-4858 hash-collision DoS."* On Float: explicit text grounded in IEEE-754 — *"say 'F32/F64 do not, because bitwise hashing violates the Eq/Hash contract under NaN and signed zero.'"*
 - **Web/Scripting:** Keep randomized default; fight the Python prior loudly. *"A stable-but-unspecified order is the worst outcome... Randomizing per-run converts a latent time-bomb into an immediate, local, every-run failure."* Proposed `blink test` auto-pin so snapshots "just work" (later conceded). Float error must teach the NaN/precision reason + an alternative.
 - **PLT:** Codify two laws. *"Law H1 (Coherence, seed-independent): a == b ⟹ a.hash() == b.hash(), at the trait level before any runtime mixing. Law H2 (Mixing is a bucketing-layer endofunction)... never observable through hash(), never stored, serialized, or compared."* Raised the load-bearing soundness point (Proposal 2a): *"'pure' first_key(m) can return different values in different runs... That is a soundness contradiction"* — iteration order must be removed from value-identity and order-dependent fns excluded from §4.16.3 memoization. Default randomized as the principled forcing function; `--deterministic` an explicit opt-in (CLI flag, not env var, on ocap grounds). Seed write-once pre-main, **not** an effect.
-- **DevOps/Tooling:** Corrected the diagnostic code to **E1400** and confirmed env+flag both already ship. `BLINK_MAP_SEED` *"is the ONLY mechanism that crosses a `process_run`/exec boundary."* Proposed `W08xx`/`W1401 MapOrderAssumption` lint with machine-applicable `.sorted()` fix. Float exclusion needs explicit spec text: *"without spec text it's an implementation detail a future contributor could 'fix' by adding a Float Hash impl."*
+- **DevOps/Tooling:** Corrected the diagnostic code to **E1400** and confirmed env+flag both already ship. `BLINK_MAP_SEED` *"is the ONLY mechanism that crosses a `process_run`/exec boundary."* Proposed `W08xx`/`W1401 MapOrderAssumption` lint with machine-applicable `.sort()` fix. Float exclusion needs explicit spec text: *"without spec text it's an implementation detail a future contributor could 'fix' by adding a Float Hash impl."*
 - **AI/ML:** Ratify the randomized default already in the tree; spec must say **"randomized,"** not "unspecified" — *"'Unspecified' reads to a model as 'implementation-defined but probably insertion order like Python.'"* The Python-insertion-order training prior is the dominant AI-correctness risk; randomization makes order-dependence fail fast in the AI's own edit/test loop. `--deterministic` flag + `BLINK_MAP_SEED` env, no determinism env var.
 - **Minimalism:** *"~90% a spec-text gap."* Everything ships already. Demote `--deterministic`/`BLINK_MAP_SEED` to tooling §8.10, not normative §3. Proposed deleting `BLINK_MAP_SEED` (M2, net −1 surface). Float already closed three times over — no new normative text. *"Go added zero knobs... and the ecosystem is healthier for it."*
 
@@ -81,7 +83,7 @@ Q1 default seed (settled 6-0 randomized); Q2 `--deterministic` surface (A both /
   - **min:** Endorsed substance; named laws stay in the rationale doc, **not** §3 (*"formalism inflation"*) — PLT agreed.
 
 - **Q7: Ship `W1401 MapOrderAssumption` lint?** (**5-1 SHIP**; min dissent — soft consensus with follow-up)
-  - **sys/web/plt/devops/aiml:** SHIP, scoped: warning never error, intraprocedural/direct-flow only, machine-applicable `.sort()`/`.sorted()` fix, default-on. The majority's concern fields all echo the false-positive risk and commit to demote-to-opt-in if it proves high.
+  - **sys/web/plt/devops/aiml:** SHIP, scoped: warning never error, intraprocedural/direct-flow only, machine-applicable `.sort()` fix, default-on. The majority's concern fields all echo the false-positive risk and commit to demote-to-opt-in if it proves high.
   - **min:** *(dissent)* DEFER — *"a new maintained analysis surface with inherent false-positive risk, and the randomized default already teaches the lesson at runtime with zero maintenance. YAGNI — defer until a br:friction signal."*
 
 ### AI-First Review (Step 8.5) — 5/5 pass
@@ -102,8 +104,7 @@ trait Hash: Eq {
 }
 
 // Stable iteration requires an explicit sort — order is randomized per process.
-let mut names = scores.keys()
-names.sort()
+let names = scores.keys().sort()
 for name in names { io.println("{name}: {scores.get(name).unwrap()}") }
 ```
 
@@ -129,7 +130,7 @@ Precedence: `--deterministic` (0) > `BLINK_MAP_SEED` (N) > entropy.
 - `--deterministic` flag (pins 0; wired into `build`/`run`, **and now `test`**) + `BLINK_MAP_SEED` env (decimal, runtime, crosses process boundaries). Contract in §3.6; mechanisms in §8.10. Reproducibility mechanisms, **not** security controls.
 - `--seed` (§8.10.4 test RNG) and the hash seed are **independent** — `--seed` does not pin map order. One cross-reference sentence; no flag coupling (user tiebreak).
 - Float (and any type transitively containing one) rejected as a `Map`/`Set` key at type-check as `E1400 MapKeyNotHashable` — a permanent contract (one normative sentence) grounded in Eq/Hash coherence (`-0.0 == 0.0`, distinct bit patterns).
-- `W1401 MapOrderAssumption` — default-on warning, intraprocedural/direct-flow only, machine-applicable `.sorted()` fix, never an error. Indirect sorting is not analyzed and will not warn (documented bound).
+- `W1401 MapOrderAssumption` — default-on warning, intraprocedural/direct-flow only, machine-applicable `.sort()` fix, never an error. Indirect sorting is not analyzed and will not warn (documented bound).
 
 ### Dissents recorded
 

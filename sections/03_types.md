@@ -372,10 +372,11 @@ trait ListOps[T] {
     fn slice(self, start: Int, end: Int) -> List[T]
     fn reverse(self) -> List[T]
     fn sort(self) -> List[T]
+    fn sort_by(self, cmp: fn(T, T) -> Ordering ! _) -> List[T] ! _
 }
 ```
 
-The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`, plus `join` from `Joinable`):
+The full `List[T]` method surface (14 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`, plus `join` from `Joinable`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
@@ -395,7 +396,8 @@ The full `List[T]` method surface (13 methods from `ListOps` + 2 from `Sized` + 
 | `slice` | `fn(self, Int, Int) -> List[T]` | no | Sub-list `[start, end)`, returns new list |
 | `join` | `fn(self, Str) -> Str` | no | Join with a separator — `List[Str]` only, via `Joinable` (§3.2.1) |
 | `reverse` | `fn(self) -> List[T]` | no | Reversed copy |
-| `sort` | `fn(self) -> List[T]` | no | Sorted copy (requires `T: Ord`) |
+| `sort` | `fn(self) -> List[T]` | no | Stable sorted copy (requires `T: Ord`) |
+| `sort_by` | `fn(self, fn(T, T) -> Ordering ! _) -> List[T] ! _` | no | Stable sorted copy by a comparator (no bound on `T`) |
 
 ```blink
 let mut items = [3, 1, 4, 1, 5]
@@ -415,6 +417,36 @@ items.index_of(1)                    // Some(1) — first occurrence
 items.last()                         // Some(5)
 items.clear()                        // items is now [], capacity retained
 ```
+
+**Sorting.** `sort` and `sort_by` return a sorted copy. The receiver keeps its order. Both sorts are **stable**: elements that compare `Equal` keep their input order. There is no unstable sort. `sort` needs `T: Ord`. `sort_by` takes a comparator that returns `Ordering` (§3.6) and needs no bound on `T`. `xs.sort()` gives the same result as `xs.sort_by(fn(a, b) { a.cmp(b) })`.
+
+```blink
+type Person { name: Str, age: Int }
+
+let people = [
+    Person { name: "Bo", age: 30 },
+    Person { name: "Al", age: 25 },
+    Person { name: "Cy", age: 30 },
+]
+let by_age = people.sort_by(fn(a, b) { a.age.cmp(b.age) })
+// Al 25, Bo 30, Cy 30: Bo and Cy compare Equal and keep their input order
+
+let oldest_first = people.sort_by(fn(a, b) { b.age.cmp(a.age) })
+// Bo 30, Cy 30, Al 25: swap the arguments to sort in descending order
+
+let by_age_then_name = people.sort_by(fn(a, b) {
+    match a.age.cmp(b.age) {
+        Equal => a.name.cmp(b.name)
+        other => other
+    }
+})
+```
+
+To sort in descending order, swap the comparator's arguments. Do not call `.reverse()` on the result: `reverse` also reverses the order of equal elements.
+
+The comparator may have effects. `sort_by` carries them through `! _`, as `map` does (§4.15.2). The number and the order of comparator calls are not specified. If the comparator does not return (a panic, or an effect that does not resume), the receiver is unchanged. The comparator need only be a total preorder; *Ord laws* (§3.6) gives the rules and what happens when a comparator breaks them.
+
+There is no `sorted` method: `sort` already returns a new list. A call to `.sorted()` is `UnresolvedMethod`, and its help line says so.
 
 **Why `.get()` returns `Option[T]`.** Out-of-bounds access is a runtime error in most languages. Returning `Option[T]` forces the caller to handle the absence case — a read never panics on an index that is out of bounds, and there are no null pointer exceptions. A write through `set` panics on an index that is out of bounds. Use `??` for default values: `list.get(i) ?? 0`.
 
@@ -2203,8 +2235,7 @@ type Ordering {
 The seed perturbs **only** bucket placement. It is never observable through `hash()`, never stored, serialized, or compared, and is set once before `main` runs — it is not an effect, not a capability, and there is no API that reads or sets it from Blink code. Programs therefore **must not** depend on iteration order; code that needs a stable order must sort the keys or entries explicitly:
 
 ```blink
-let mut names = scores.keys()
-names.sort()
+let names = scores.keys().sort()
 for name in names {
     io.println("{name}: {scores.get(name).unwrap()}")
 }
@@ -2728,6 +2759,14 @@ fn main() {
 **Ord.** `Set` and `Map` never implement `Ord`: no order over them is canonical and agrees with membership equality.
 
 **Eq laws.** An `Eq` impl must be reflexive (`a == a`), symmetric (`a == b` implies `b == a`) and transitive (`a == b` and `b == c` imply `a == c`). The compiler and the container impls may rely on these laws, as `Map` and `Set` rely on the Hash coherence law. For example, `==` may return `true` without comparing elements when both operands are the same cell. Every built-in `Eq` obeys the laws; `Float` obeys them because `NaN == NaN` (*Float Total Ordering*). If a user impl breaks a law, `==` on a container that holds that type returns an unspecified `Bool`. It stays memory-safe.
+
+**Ord laws.** An `Ord` impl must be a total order that agrees with `Eq`:
+
+- `a.cmp(b) == Equal` exactly when `a == b`.
+- `a.cmp(b) == Less` exactly when `b.cmp(a) == Greater`.
+- If `a.cmp(b) == Less` and `b.cmp(c) == Less`, then `a.cmp(c) == Less`.
+
+A `sort_by` comparator need only be a **total preorder**. It obeys the second and third laws, and `cmp(a, a)` is `Equal`, but it may return `Equal` for two values that are not `==`. A comparator on one field, such as `fn(a, b) { a.age.cmp(b.age) }`, does this, and stability (*The `ListOps` Trait*, §3.2.2) keeps such elements in their input order. Every built-in `Ord` obeys the laws; `Float` obeys them because `NaN` sorts last (*Float Total Ordering*). If a user `Ord` impl or a comparator breaks a law, `sort` and `sort_by` still terminate. They return a permutation of the input, in which each element occurs exactly once, in an unspecified order. They stay memory-safe and do not panic.
 
 **Cyclic data.** `List`, `Map` and `Set` are shared cells, so a value can contain itself (for example, through a struct field that holds the list that holds the struct). `==` on cyclic data may not terminate. The compiler adds no cycle guard.
 
@@ -4205,7 +4244,7 @@ assert_eq(a, b)
 
 // Ord — lexicographic comparison
 let pairs = [(3, "c"), (1, "b"), (1, "a")]
-let sorted = pairs.into_iter().sort().collect()
+let sorted = pairs.sort()
 // [(1, "a"), (1, "b"), (3, "c")]
 
 // Hash — tuples as Map keys
@@ -4227,7 +4266,7 @@ error[TraitBoundNotSatisfied]: trait bound not satisfied
   |                         ^^^^ `(Int, Canvas)` does not implement `Ord`
   |
   = note: `Canvas` does not implement `Ord` (element .1 of tuple)
-  = help: implement `Ord` for `Canvas`, or extract a sortable key
+  = help: implement `Ord` for `Canvas`, or sort with a comparator: `shapes.sort_by(fn(a, b) { a.0.cmp(b.0) })`
 ```
 
 #### Tuples vs Structs
