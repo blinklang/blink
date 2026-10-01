@@ -1,0 +1,293 @@
+// A caller must declare every effect its callee declares (spec §4.5); `main` is the one
+// function that holds every effect implicitly (§4.6). These rows cover calls to a fn or
+// method that declares effects, calls to a user effect's operations, and the `Arena`
+// marker, from ordinary functions. A `with` block adds the effect of the handler it
+// installs to the row its body holds; `with arena` is the `Arena` case of that rule.
+
+import compile_test_helpers
+
+fn tattle_src() -> Str {
+    #"effect Tattle {
+    effect Note {
+        fn emit() -> Int
+    }
+}
+"#
+}
+
+fn with_tattle(body: Str) -> Str {
+    "{tattle_src()}{body}"
+}
+
+test "a fn calling a fn that declares IO without declaring it is E0500 at the call" {
+    let src = #"fn greet() ! IO {
+    io.println("hello")
+}
+fn bad() {
+    greet()
+}
+fn main() {
+    bad()
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_direct_call")
+    compile_test_helpers.expect_error(out, "E0500", "missing IO on a direct call")
+    compile_test_helpers.expect_contains(out, "`greet`", "the diagnostic names the callee")
+    compile_test_helpers.expect_contains(out, "`IO`", "the diagnostic names the missing effect")
+    compile_test_helpers.expect_contains(out, "\"line\":5", "the diagnostic points at the call")
+}
+
+test "a fn that declares the callee's effect compiles clean" {
+    let src = #"fn greet() ! IO {
+    io.println("hello")
+}
+fn caller() ! IO {
+    greet()
+}
+fn main() {
+    caller()
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_declared_ok")
+    compile_test_helpers.expect_compiles_clean(out, "a declared effect is satisfied")
+}
+
+test "main calls a fn that declares an effect without declaring it" {
+    let src = #"fn greet() ! IO {
+    io.println("hello")
+}
+fn main() {
+    greet()
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_main_exempt")
+    compile_test_helpers.expect_compiles_clean(out, "main holds every effect")
+}
+
+test "an effect missing several levels down is reported at the first fn that lacks it" {
+    let src = #"fn greet() ! IO {
+    io.println("hello")
+}
+fn middle() ! IO {
+    greet()
+}
+fn outer() {
+    middle()
+}
+fn main() {
+    outer()
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_transitive")
+    compile_test_helpers.expect_error(out, "E0500", "outer lacks the IO that middle declares")
+    compile_test_helpers.expect_contains(out, "`middle`", "the diagnostic names the direct callee")
+}
+
+test "a parent effect satisfies a callee that declares one of its children" {
+    let src = with_tattle(#"fn note_once() -> Int ! Tattle.Note {
+    tattle.emit()
+}
+fn caller() -> Int ! Tattle {
+    note_once()
+}
+fn main() {
+    with handler Tattle { fn emit() -> Int { 7 } } {
+        io.println("{caller()}")
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_parent_covers_child")
+    compile_test_helpers.expect_compiles_clean(out, "Tattle covers Tattle.Note")
+}
+
+test "a child effect does not satisfy a callee that declares a parent with other children" {
+    let src = #"effect Ledger {
+    effect Read {
+        fn get() -> Int
+    }
+    effect Write {
+        fn put(n: Int)
+    }
+}
+fn whole() -> Int ! Ledger {
+    ledger.get()
+}
+fn caller() -> Int ! Ledger.Read {
+    whole()
+}
+fn main() {
+    with handler Ledger {
+        fn get() -> Int { 1 }
+        fn put(n: Int) { }
+    } {
+        io.println("{caller()}")
+    }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_child_not_parent")
+    compile_test_helpers.expect_error(out, "E0500", "Ledger.Read does not cover Ledger")
+}
+
+test "a plain fn performing a user effect operation is E0500" {
+    let src = with_tattle(#"fn helper() -> Int {
+    tattle.emit()
+}
+fn main() {
+    with handler Tattle { fn emit() -> Int { 7 } } {
+        io.println("{helper()}")
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_user_op")
+    compile_test_helpers.expect_error(out, "E0500", "a user op needs its effect")
+    compile_test_helpers.expect_contains(out, "Tattle.Note", "the diagnostic names the op's effect")
+}
+
+test "a with handler block gives its body the handler's effect" {
+    let src = with_tattle(#"fn helper() -> Int {
+    with handler Tattle { fn emit() -> Int { 7 } } {
+        tattle.emit()
+    }
+}
+fn main() {
+    io.println("{helper()}")
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_handler_discharges")
+    compile_test_helpers.expect_compiles_clean(out, "the installed handler supplies Tattle")
+}
+
+test "a with handler block does not cover a call after the block" {
+    let src = with_tattle(#"fn helper() -> Int {
+    let a = with handler Tattle { fn emit() -> Int { 7 } } {
+        tattle.emit()
+    }
+    a + tattle.emit()
+}
+fn main() {
+    with handler Tattle { fn emit() -> Int { 1 } } {
+        io.println("{helper()}")
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_after_handler_block")
+    compile_test_helpers.expect_error(out, "E0500", "the op after the block is unhandled")
+}
+
+test "an Arena call outside with arena is E0500 and inside it is not" {
+    let outside = #"fn consume(xs: List[Int]) -> Int ! Arena {
+    xs.len()
+}
+fn wrapper() -> Int {
+    consume([1, 2])
+}
+fn main() {
+    io.println("{wrapper()}")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(outside, "undeclared_effect_arena_outside")
+    compile_test_helpers.expect_error(out, "E0500", "Arena outside an arena block")
+    compile_test_helpers.expect_contains(out, "`Arena`", "the diagnostic names Arena")
+
+    let inside = #"fn consume(xs: List[Int]) -> Int ! Arena {
+    xs.len()
+}
+fn wrapper() -> Int {
+    with arena {
+        consume([1, 2])
+    }
+}
+fn main() {
+    io.println("{wrapper()}")
+}
+"#
+    let out2 = compile_test_helpers.compile_and_capture(inside, "undeclared_effect_arena_inside")
+    compile_test_helpers.expect_compiles_clean(out2, "with arena supplies Arena")
+}
+
+test "a closure body holds the effects of the fn that encloses it" {
+    let bad = #"fn greet() ! IO {
+    io.println("hello")
+}
+fn bad() -> Int {
+    let f = fn() -> Int {
+        greet()
+        1
+    }
+    f()
+}
+fn main() {
+    io.println("{bad()}")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(bad, "undeclared_effect_closure_bad")
+    compile_test_helpers.expect_error(out, "E0500", "a closure in a pure fn cannot call an IO fn")
+
+    let good = #"fn greet() ! IO {
+    io.println("hello")
+}
+fn good() -> Int ! IO {
+    let f = fn() -> Int {
+        greet()
+        1
+    }
+    f()
+}
+fn main() {
+    io.println("{good()}")
+}
+"#
+    let out2 = compile_test_helpers.compile_and_capture(good, "undeclared_effect_closure_good")
+    compile_test_helpers.expect_compiles_clean(out2, "a closure in an IO fn may call an IO fn")
+}
+
+test "a method calling a fn that declares an effect must declare it" {
+    let src = #"fn greet() ! IO {
+    io.println("hello")
+}
+trait Count {
+    fn count(self) -> Int
+}
+type Box {
+    n: Int
+}
+impl Count for Box {
+    fn count(self) -> Int {
+        greet()
+        self.n
+    }
+}
+fn main() {
+    let b = Box { n: 3 }
+    io.println("{b.count()}")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_method")
+    compile_test_helpers.expect_error(out, "E0500", "a method lacks the IO its callee declares")
+    compile_test_helpers.expect_contains(out, "`count`", "the diagnostic names the method that lacks it")
+}
+
+test "a method call to a method that declares an effect needs it in the caller" {
+    let src = #"trait Show {
+    fn show(self) -> Int ! IO
+}
+type Box {
+    n: Int
+}
+impl Show for Box {
+    fn show(self) -> Int ! IO {
+        io.println("{self.n}")
+        self.n
+    }
+}
+fn bad(b: Box) -> Int {
+    b.show()
+}
+fn main() {
+    io.println("{bad(Box { n: 3 })}")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_method_callee")
+    compile_test_helpers.expect_error(out, "E0500", "calling an IO method from a pure fn")
+    compile_test_helpers.expect_contains(out, "`show`", "the diagnostic names the method")
+}
