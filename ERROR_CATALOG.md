@@ -188,7 +188,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AssignmentInPredicate | E1306 | Predicate contains an assignment | Refinement contracts | §3b |
 | ImpureBodyForPureAnnotation | E1307 | `@pure` function body contains a non-pure construct | Refinement contracts | §3b |
 | ModifiesArgNotSimplePath | E1308 | `@modifies` argument is not a simple path | Refinement contracts | §3b |
-| MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or non-derived user type) | Generic collections | §3.6 |
+| MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or a user type with no `Hash` impl, derived or written) | Generic collections | §3.6 |
 | NonDerivableTrait | E1401 | A `@derive(Hash/Eq/Ord)` field's type does not implement the derived trait | Generic collections | §3.6 |
 | ContractUnverifiable | V0003 | The solver can neither prove nor disprove a `@requires`/`@ensures`, and the fn has no `@verify(fallback: ...)` | Contract verification | §3b.4 |
 

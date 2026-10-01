@@ -2245,7 +2245,7 @@ A function whose result depends on unsorted `Map`/`Set` iteration order is **not
 
 **Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would map equal values to different buckets. Round to an integer key instead.
 
-**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), a tuple whose elements are all hashable, and a user `struct`/`enum` carrying `@derive(Hash, Eq)` implement `Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one via `@derive`, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
+**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
 
 For pinning the seed (golden-file tests, fixture-driven runners, self-hosting diff stability) and for the `--deterministic` flag and `BLINK_MAP_SEED` environment variable, see §8.10.
 
@@ -3153,7 +3153,7 @@ For reference, the eight derivable traits and their required methods:
 | `Ord` | `fn cmp(self, other: Self) -> Ordering` | `Eq` |
 | `Hash` | `fn hash(self) -> U64` | `Eq` |
 | `Clone` | `fn clone(self) -> Self` | — |
-| `Display` | `fn display(self) -> Str` | — |
+| `Display` | `fn fmt(self, mut sb: StringBuilder)` (the trait supplies `final fn display(self) -> Str`; see *Display Trait Shape*) | — |
 | `Debug` | `fn debug(self) -> Str` | — |
 | `Serialize` | `fn to_json(self) -> JsonValue` | — |
 | `Deserialize` | `fn from_json(json: JsonValue) -> Result[Self, JsonError]` | — |
@@ -3572,7 +3572,7 @@ Format Protocol*) one level down.
 Two container shapes stay rejected with `E0520` at **every** level of nesting (not just the top
 field): `Set` and `Result` are not Debug-renderable, and a `Map` whose **key** type is itself a
 container (`Map[List[Int], V]`, etc.) is rejected — map keys must be a scalar (`Str` / `Char` /
-`Int` / `Bool` / sized-int) or a `@derive(Debug, Hash, Eq)` struct. (Container-typed map *values*
+`Int` / `Bool` / sized-int) or a struct that implements `Debug`, `Hash` and `Eq`. (Container-typed map *values*
 render fine; only container keys are excluded, because the renderer reads keys back through the map's
 key-ops storage layer, which has no descriptor for a container key.)
 
