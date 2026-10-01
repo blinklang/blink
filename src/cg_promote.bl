@@ -38,7 +38,7 @@ import cname.{
     c_promote_closure_walker_name, c_capture_word_walker_name, c_capture_cell_fill_name,
     c_capture_table_name, c_effect_vtable_slot_name, c_vtable_userdata_member, c_vtable_promoter_name,
 }
-import cg_print.{print_fn, print_capture_desc_table}
+import cg_print.{print_fn, print_fn_decl, print_capture_desc_table}
 import escape.{ea_closure_is_promoted, ea_refuse_recursive_crossing}
 import cg_reg.{cg_reg_effect_ops, cg_reg_effect_root_decl, cg_reg_tid_for_decl}
 import cg_call.{cg_call_element_from_runtime, cg_call_element_from_word, cg_call_element_to_slot_in}
@@ -178,11 +178,16 @@ let mut walk_memo: Map[Int, Int] = Map()
 // Walker symbols this unit has written or is writing: 1 written, 2 being built.
 let mut walker_names: Map[Str, Int] = Map()
 
+// A function this unit builds on demand and prints before the body that first called it.
+// `forward` asks for a prototype ahead of every body of the batch: a function that can
+// reach itself through another one, as an equality over a recursive type does, has no
+// order in which each callee is defined above its caller.
 type PendingWalker {
     symbol: Str
     ret: Str
     params: List[Str]
     body: Int
+    forward: Bool
 }
 
 let mut pending_walkers: List[PendingWalker] = []
@@ -220,10 +225,35 @@ pub fn cg_promote_has_pending() -> Bool { pending_walkers.len() > 0 || pending_t
 pub fn cg_promote_print_walkers() ! Diag.Report {
     let ws = pending_walkers
     pending_walkers = []
+    for w in ws {
+        if w.forward { print_fn_decl(true, w.ret, w.symbol, w.params, false) }
+    }
     for w in ws { print_fn(true, w.ret, w.symbol, w.params, false, w.body) }
     let ts = pending_tables
     pending_tables = []
     for t in ts { print_capture_desc_table(t.symbol, t.name_lits, t.sizes, t.walks, t.fills) }
+}
+
+// Other stages build functions on demand that print where the walkers print, so they
+// share the walkers' queue and symbol table rather than keeping a second pair. Each such
+// symbol carries its own prefix, so it never meets a walker's.
+pub let ON_DEMAND_UNSEEN = 0
+pub let ON_DEMAND_WRITTEN = 1
+pub let ON_DEMAND_BUILDING = 2
+pub let ON_DEMAND_REFUSED = 3
+
+pub fn cg_promote_on_demand_state(symbol: Str) -> Int {
+    match walker_names.get(symbol) {
+        Some(state) => state
+        None => ON_DEMAND_UNSEEN
+    }
+}
+
+pub fn cg_promote_on_demand_mark(symbol: Str, state: Int) { walker_names.insert(symbol, state) }
+
+pub fn cg_promote_on_demand_queue(symbol: Str, ret: Str, params: List[Str], body: Int) {
+    pending_walkers.push(PendingWalker { symbol: symbol, ret: ret, params: params, body: body, forward: true })
+    walker_names.insert(symbol, ON_DEMAND_WRITTEN)
 }
 
 // ── What a type holds ─────────────────────────────────────────────────────
@@ -497,7 +527,7 @@ fn build_walker(tid: Int, symbol: Str, span: Int) -> Bool ! Diag.Report {
     }
     let params = ["{layout_of(tid, Position.Param).c_spelling} {w.value}", ctx_param(span)]
     pending_walkers.push(PendingWalker { symbol: symbol, ret: layout_of(tid, Position.Return).c_spelling,
-        params: params, body: body })
+        params: params, body: body, forward: false })
     true
 }
 
@@ -1048,6 +1078,6 @@ fn queue_capture_walker(symbol: Str, ret: Str, params: List[Str], frame: List[St
         invariant(span, "the capture walker {symbol} does not verify: {problems.get(0).unwrap()}")
         return false
     }
-    pending_walkers.push(PendingWalker { symbol: symbol, ret: ret, params: params, body: body })
+    pending_walkers.push(PendingWalker { symbol: symbol, ret: ret, params: params, body: body, forward: false })
     true
 }

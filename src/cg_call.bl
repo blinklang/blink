@@ -31,6 +31,7 @@ import typecheck.{
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
     tc_type_str,
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count, tc_tid_child,
+    tc_evar_field_slots, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance,
     tc_struct_field_slots, tc_sfield_name, get_struct_field_tid,
     tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_call_user_effect, tc_call_builtin_default,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
@@ -50,7 +51,7 @@ import layout.{
     async_scope_handles_spelling,
 }
 import mono.{instances, instance_for_call, iterator_route_name, iterator_route_module}
-import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of}
+import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
@@ -58,12 +59,14 @@ import cname.{
     cname_ffi_struct_mirror, c_local_name,
     c_variant_discriminant, c_variant_member_name,
     c_container_ctor, c_pool_global,
+    c_values_eq_name, c_tuple_member, c_enum_payload_member,
 }
 import ir.{
     ir_call_direct, ir_call_runtime, ir_call_closure, ir_call_indirect, ir_cast, ir_unary, ir_unbox, ir_box, ir_box_into,
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
     ir_field_set, ir_enum_new, ir_container_new, ir_container_spread, ir_sized_alloc, ir_heap_alloc, ir_select, ir_switch, ir_expr_stmt,
+    ir_return, ir_verify_in_frame,
 }
 import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
@@ -77,6 +80,10 @@ import cg_eff.{
     cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
 }
 import cg_print.{vtable_slot_self_spelling}
+import cg_promote.{
+    cg_promote_on_demand_state, cg_promote_on_demand_mark, cg_promote_on_demand_queue,
+    ON_DEMAND_WRITTEN, ON_DEMAND_BUILDING, ON_DEMAND_REFUSED,
+}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_error_at, diag_file_for_node, diag_source_file,
@@ -214,6 +221,7 @@ fn cc_values_equal(node: Int, tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report
     if k == TyKind.Bytes { return cc_helper_equal(node, bools, "bytes_eq", lhs, rhs) }
     if k == TyKind.Float { return cc_helper_equal(node, bools, "float_eq", lhs, rhs) }
     if k == TyKind.Option || k == TyKind.Result { return cc_carrier_equal(node, tid, bools, lhs, rhs) }
+    if cc_compares_members(k) { return cc_members_equal_call(node, tid, bools, lhs, rhs) }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
     if x_is_c_comparable(tid, rec) { return ir_binary(TYPE_BOOL, node, bools.c_spelling, "==", lhs, rhs) }
@@ -227,6 +235,7 @@ fn cc_values_equal(node: Int, tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report
 fn cc_equality_resolves(node: Int, tid: Int) -> Bool ! Diag.Report {
     let k = cc_kind(tid)
     if k == TyKind.Str || k == TyKind.Bytes || k == TyKind.Float { return true }
+    if cc_compares_members(k) { return cc_members_eq_fn(node, tid) != "" }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return false }
     if k == TyKind.Option || k == TyKind.Result {
@@ -331,6 +340,8 @@ fn cc_equality_symbol(node: Int, decl: Int, recv_tid: Int) -> Str ! Diag.Report 
     if im == IMPL_REFUSED { return "" }
     if im >= 0 { return c_impl_method_name(im, method_eq) }
     if cc_derives_equality(decl) { return c_derived_method_symbol(recv_tid, method_eq) }
+    // An enum is Eq when every payload is, so one with neither compares its members.
+    if cc_kind(recv_tid) == TyKind.Enum { return cc_members_eq_fn(node, recv_tid) }
     diag_ice_at("EqualityMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "`{node_name(decl)}` has neither a derived nor a written {trait_eq} method", node,
         "typecheck must reject a comparison whose operand carries no equality; this is a compiler bug")
@@ -417,6 +428,311 @@ fn cc_ordering_variant(node: Int, otid: Int, spelling: Str, name: Str) -> Int ! 
 // whether two values are equal on the way to answering which is smaller.
 fn cc_derives_equality(decl: Int) -> Bool {
     decl_has_derive(decl, trait_eq) || decl_has_derive(decl, trait_ord)
+}
+
+// ── Equality by members ───────────────────────────────────────────────────
+//
+// A List, Set, Map or tuple declares no equality method, and neither does an enum that
+// derives none, so `==` on one calls a function built here from the type. A List compares
+// its length and then each index. A Set or Map compares its size and then looks each
+// member of one side up in the other, so insertion order is no part of the value. A tuple
+// or an enum compares each member it holds. A member compares by its own `==`, which can
+// build another such function, and a type that holds itself reaches its own function
+// while that function is being built.
+
+let eq_lhs = "lhs"
+let eq_rhs = "rhs"
+
+type EqFn {
+    tid: Int
+    node: Int
+    param: LayoutRecord
+    bools: LayoutRecord
+    ints: LayoutRecord
+}
+
+fn cc_compares_members(k: TyKind) -> Bool {
+    k == TyKind.List || k == TyKind.Set || k == TyKind.Map || k == TyKind.Tuple
+}
+
+fn cc_members_equal_call(node: Int, tid: Int, bools: LayoutRecord, lhs: Int, rhs: Int) -> Int ! Diag.Report {
+    let symbol = cc_members_eq_fn(node, tid)
+    if symbol == "" { return -1 }
+    ir_call_direct(TYPE_BOOL, node, bools.c_spelling, symbol, bools.slot_form, [lhs, rhs])
+}
+
+// The function's symbol, built the first time a type is compared. "" is a refusal already
+// reported, the first time if this is a later ask.
+fn cc_members_eq_fn(node: Int, tid: Int) -> Str ! Diag.Report {
+    let r = tc_resolve(tid)
+    let symbol = c_values_eq_name(r)
+    if diag_is_ice_seg(symbol) {
+        diag_ice_at("EqualityFunctionUnnamed", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no equality function name for {tc_type_str(r)}: {symbol}", node,
+            "a type compared by its members must be concrete and nameable; this is a compiler bug")
+        return ""
+    }
+    let state = cg_promote_on_demand_state(symbol)
+    // A function being built is called by name too: its forward declaration is printed
+    // ahead of every body, so a type that holds itself compiles.
+    if state == ON_DEMAND_WRITTEN || state == ON_DEMAND_BUILDING { return symbol }
+    if state == ON_DEMAND_REFUSED { return "" }
+    cg_promote_on_demand_mark(symbol, ON_DEMAND_BUILDING)
+    if !cc_members_eq_build(node, r, symbol) {
+        cg_promote_on_demand_mark(symbol, ON_DEMAND_REFUSED)
+        return ""
+    }
+    symbol
+}
+
+fn cc_members_eq_build(node: Int, r: Int, symbol: Str) -> Bool ! Diag.Report {
+    let _td = ensure_typedef_for(r)
+    let param = cc_eq_param(node, r)
+    if cc_stopped(param) { return false }
+    let bools = cc_local(TYPE_BOOL, node)
+    if cc_stopped(bools) { return false }
+    let ints = cc_local(TYPE_INT, node)
+    if cc_stopped(ints) { return false }
+    let e = EqFn { tid: r, node: node, param: param, bools: bools, ints: ints }
+    let mut stmts: List[Int] = []
+    if !cc_members_eq_stmts(e, stmts) { return false }
+    stmts.push(ir_return(node, cc_eq_answer(e, "1")))
+    let body = ir_block(node, stmts)
+    let problems = ir_verify_in_frame(body, [eq_lhs, eq_rhs])
+    if problems.len() > 0 {
+        diag_ice_at("EqualityFunctionMalformed", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "the equality function {symbol} does not verify: {problems.get(0).unwrap()}", node,
+            "every function this stage builds must verify before it is printed; this is a compiler bug")
+        return false
+    }
+    let params = ["{param.c_spelling} {eq_lhs}", "{param.c_spelling} {eq_rhs}"]
+    cg_promote_on_demand_queue(symbol, bools.c_spelling, params, body)
+    true
+}
+
+fn cc_eq_param(node: Int, tid: Int) -> LayoutRecord ! Diag.Report {
+    let rec = layout_of(tid, Position.Param)
+    let why = "an equality function's parameter has no C layout: {rec.decline_reason}"
+    if rec.decline_reason == "" { return rec }
+    diag_ice_at("UnspellableEqualityParam", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
+        "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    cc_stop(rec)
+}
+
+fn cc_members_eq_stmts(e: EqFn, out: List[Int]) -> Bool ! Diag.Report {
+    let k = cc_kind(e.tid)
+    if k == TyKind.List { return cc_list_eq_stmts(e, out) }
+    if k == TyKind.Set { return cc_keyed_eq_stmts(e, false, out) }
+    if k == TyKind.Map { return cc_keyed_eq_stmts(e, true, out) }
+    if k == TyKind.Tuple { return cc_tuple_eq_stmts(e, out) }
+    if k == TyKind.Enum { return cc_enum_eq_stmts(e, out) }
+    diag_ice_at("EqualityByMembersKindUnknown", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "a {tk_name(k)} reached the equality-by-members builder", e.node,
+        "only a List, Set, Map, tuple or enum compares by its members; this is a compiler bug")
+    false
+}
+
+fn cc_eq_side(e: EqFn, name: Str) -> Int {
+    ir_var_ref(e.tid, e.node, e.param.c_spelling, name, e.param.slot_form)
+}
+
+fn cc_eq_answer(e: EqFn, value: Str) -> Int {
+    ir_const(TYPE_BOOL, e.node, e.bools.c_spelling, value)
+}
+
+fn cc_eq_int(e: EqFn, value: Str) -> Int {
+    ir_const(TYPE_INT, e.node, e.ints.c_spelling, value)
+}
+
+fn cc_eq_int_ref(e: EqFn, name: Str) -> Int {
+    ir_var_ref(TYPE_INT, e.node, e.ints.c_spelling, name, e.ints.slot_form)
+}
+
+fn cc_eq_fails_when(e: EqFn, cond: Int) -> Int {
+    ir_if(e.node, cond, ir_block(e.node, [ir_return(e.node, cc_eq_answer(e, "0"))]), -1)
+}
+
+// `if (!(l == r)) return 0`, after whatever the member's own compare hoists. False is a
+// refusal already reported.
+fn cc_eq_member_into(e: EqFn, mtid: Int, l: Int, r: Int, out: List[Int]) -> Bool ! Diag.Report {
+    if cc_kind(mtid) == TyKind.Void { return true }
+    if l < 0 || r < 0 { return false }
+    if !cc_equality_resolves(e.node, mtid) { return false }
+    let mark = cg_expr_pending_count()
+    let eq = cc_values_equal(e.node, mtid, l, r)
+    let hoisted = cg_expr_take_pending(mark)
+    if eq < 0 { return false }
+    for s in hoisted { out.push(s) }
+    out.push(cc_eq_fails_when(e, ir_unary(TYPE_BOOL, e.node, e.bools.c_spelling, "!", eq)))
+    true
+}
+
+fn cc_eq_sizes_differ(e: EqFn, len_helper: Str) -> Int {
+    let h = c_runtime_helper(len_helper)
+    ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, "!=",
+        ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, h, e.ints.slot_form, [cc_eq_side(e, eq_lhs)]),
+        ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, h, e.ints.slot_form, [cc_eq_side(e, eq_rhs)]))
+}
+
+// `for i in 0..count(lhs) { turn }`, the count read once.
+fn cc_eq_index_loop(e: EqFn, count_helper: Str, i: Str, turn: List[Int], out: List[Int]) {
+    let n = c_mint_local("n")
+    let count = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper(count_helper),
+        e.ints.slot_form, [cc_eq_side(e, eq_lhs)])
+    let done = ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, ">=", cc_eq_int_ref(e, i), cc_eq_int_ref(e, n))
+    let mut body: List[Int] = [ir_if(e.node, done, ir_block(e.node, [ir_break(e.node)]), -1)]
+    for s in turn { body.push(s) }
+    body.push(ir_assign(e.node, cc_eq_int_ref(e, i),
+        ir_binary(TYPE_INT, e.node, e.ints.c_spelling, "+", cc_eq_int_ref(e, i), cc_eq_int(e, "1"))))
+    out.push(ir_let(TYPE_INT, e.node, e.ints.c_spelling, i, e.ints.slot_form, cc_eq_int(e, "0")))
+    out.push(ir_let(TYPE_INT, e.node, e.ints.c_spelling, n, e.ints.slot_form, count))
+    out.push(ir_loop(e.node, ir_block(e.node, body)))
+}
+
+fn cc_list_eq_stmts(e: EqFn, out: List[Int]) -> Bool ! Diag.Report {
+    let elem = child_tid(e.tid, Slot.Inner1)
+    if elem < 0 { return cc_element_type_unrecorded(e.node, TyKind.List) >= 0 }
+    out.push(cc_eq_fails_when(e, cc_eq_sizes_differ(e, "list_len")))
+    let i = c_mint_local("i")
+    let get = c_runtime_helper("list_get")
+    let l = cg_call_element_from_runtime(e.node, elem, get, [cc_eq_side(e, eq_lhs), cc_eq_int_ref(e, i)])
+    let r = cg_call_element_from_runtime(e.node, elem, get, [cc_eq_side(e, eq_rhs), cc_eq_int_ref(e, i)])
+    let mut turn: List[Int] = []
+    if !cc_eq_member_into(e, elem, l, r, turn) { return false }
+    cc_eq_index_loop(e, "list_len", i, turn, out)
+    true
+}
+
+// Each live slot of the left side is looked up in the right, and equal sizes then make
+// the two key sets the same. A map's value is read from each side by that key.
+fn cc_keyed_eq_stmts(e: EqFn, is_map: Bool, out: List[Int]) -> Bool ! Diag.Report {
+    let kind = if is_map { TyKind.Map } else { TyKind.Set }
+    let prefix = if is_map { "map" } else { "set" }
+    let key = child_tid(e.tid, Slot.Inner1)
+    if key < 0 { return cc_element_type_unrecorded(e.node, kind) >= 0 }
+    let krec = cc_local(key, e.node)
+    if cc_stopped(krec) { return false }
+    // The lookup takes a pointer to the key. An inline key is read at its address in the
+    // slot; any other slot word is that pointer already: a Str, or the box of a wide key.
+    let key_read = if krec.kops_inline_key { if is_map { "map_slot_key_addr" } else { "set_slot_item_addr" } } else { if is_map { "map_slot_key_word" } else { "set_slot_item_word" } }
+    let lookup = if is_map { "map_has" } else { "set_contains" }
+    out.push(cc_eq_fails_when(e, cc_eq_sizes_differ(e, "{prefix}_len")))
+    let i = c_mint_local("i")
+    let found = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper(lookup), e.ints.slot_form,
+        [cc_eq_side(e, eq_rhs), cc_eq_key_word(e, key, key_read, i)])
+    let mut live: List[Int] = [cc_eq_fails_when(e, ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, "==", found, cc_eq_int(e, "0")))]
+    if is_map {
+        let value = child_tid(e.tid, Slot.Inner2)
+        if value < 0 { return cc_element_type_unrecorded(e.node, kind) >= 0 }
+        let l = cg_call_element_from_runtime(e.node, value, c_runtime_helper("map_slot_value"),
+            [cc_eq_side(e, eq_lhs), cc_eq_int_ref(e, i)])
+        let r = cg_call_element_from_runtime(e.node, value, c_runtime_helper("map_get"),
+            [cc_eq_side(e, eq_rhs), cc_eq_key_word(e, key, key_read, i)])
+        if !cc_eq_member_into(e, value, l, r, live) { return false }
+    }
+    let slot_live = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper("{prefix}_slot_live"),
+        e.ints.slot_form, [cc_eq_side(e, eq_lhs), cc_eq_int_ref(e, i)])
+    let is_live = ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, "!=", slot_live, cc_eq_int(e, "0"))
+    cc_eq_index_loop(e, "{prefix}_slot_count", i, [ir_if(e.node, is_live, ir_block(e.node, live), -1)], out)
+    true
+}
+
+fn cc_eq_key_word(e: EqFn, key: Int, key_read: Str, i: Str) -> Int {
+    ir_call_runtime(key, e.node, container_slot_spelling(), c_runtime_helper(key_read), SlotForm.InlineWord,
+        [cc_eq_side(e, eq_lhs), cc_eq_int_ref(e, i)])
+}
+
+fn cc_tuple_eq_stmts(e: EqFn, out: List[Int]) -> Bool ! Diag.Report {
+    let mut i = 0
+    while i < tc_tid_child_count(e.tid) {
+        let etid = child_tid(e.tid, Slot.Elem(i))
+        let erec = cc_element_layout(e.node, etid, Position.TupleElem)
+        if cc_stopped(erec) { return false }
+        let l = ir_field_get(etid, e.node, erec.c_spelling, c_tuple_member(i), erec.slot_form, cc_eq_side(e, eq_lhs))
+        let r = ir_field_get(etid, e.node, erec.c_spelling, c_tuple_member(i), erec.slot_form, cc_eq_side(e, eq_rhs))
+        if !cc_eq_member_into(e, etid, l, r, out) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// Tags first: a payload member of a variant the value is not in holds whatever was there
+// before, so it is read only once both tags name the same variant.
+fn cc_enum_eq_stmts(e: EqFn, out: List[Int]) -> Bool ! Diag.Report {
+    let decl = tc_tid_decl_node(e.tid)
+    if decl < 0 { return cc_eq_variant_unmatched(e, "") }
+    let slots = tc_enum_variant_slots(cg_reg_tid_for_decl(decl))
+    let vars = node_fields(decl)
+    let lhs_tag = enum_tag_word(e.tid, cc_eq_side(e, eq_lhs), e.node, e.ints.c_spelling)
+    if lhs_tag < 0 { return cc_newtype_eq_into(e, slots, out) }
+    let rhs_tag = enum_tag_word(e.tid, cc_eq_side(e, eq_rhs), e.node, e.ints.c_spelling)
+    out.push(cc_eq_fails_when(e, ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, "!=", lhs_tag, rhs_tag)))
+    let mut cases: List[Int] = []
+    let mut i = 0
+    while i < slots.len() {
+        let slot = slots.get(i).unwrap()
+        let vnode = if vars == -1 || i >= sublist_length(vars) { -1 } else { sublist_get(vars, i) }
+        if vnode < 0 || node_name(vnode) != tc_evar_name(slot) { return cc_eq_variant_unmatched(e, tc_evar_name(slot)) }
+        let mut body: List[Int] = []
+        if !cc_variant_eq_into(e, slot, "{c_enum_payload_member()}.{tc_evar_name(slot)}.", body) { return false }
+        if body.len() > 0 {
+            let label = c_variant_discriminant(e.tid, vnode)
+            if diag_is_ice_seg(label) { return cc_variant_tag_unspellable(e.node, tc_type_str(e.tid), tc_evar_name(slot), label) >= 0 }
+            cases.push(ir_const(TYPE_INT, e.node, e.ints.c_spelling, label))
+            cases.push(ir_block(e.node, body))
+        }
+        i = i + 1
+    }
+    if cases.len() == 0 { return true }
+    let tag = enum_tag_word(e.tid, cc_eq_side(e, eq_lhs), e.node, e.ints.c_spelling)
+    out.push(ir_switch(e.node, tag, cases, ir_block(e.node, [])))
+    true
+}
+
+// A one-variant newtype keeps no tag and is its one field, so the value is read as that field.
+fn cc_newtype_eq_into(e: EqFn, slots: List[Int], out: List[Int]) -> Bool ! Diag.Report {
+    let fields = if slots.len() == 1 { tc_evar_field_slots(slots.get(0).unwrap()) } else { [] }
+    if fields.len() != 1 {
+        diag_ice_at("EqualityNewtypeShape", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "{tc_type_str(e.tid)} keeps no tag but is not one variant of one field", e.node,
+            "layout drops the tag only for a one-field newtype; this is a compiler bug")
+        return false
+    }
+    let ftid = tc_member_tid_at_instance(tc_evfield_tid(fields.get(0).unwrap()), e.tid)
+    let l = ir_var_ref(ftid, e.node, e.param.c_spelling, eq_lhs, e.param.slot_form)
+    let r = ir_var_ref(ftid, e.node, e.param.c_spelling, eq_rhs, e.param.slot_form)
+    cc_eq_member_into(e, ftid, l, r, out)
+}
+
+fn cc_variant_eq_into(e: EqFn, slot: Int, prefix: Str, out: List[Int]) -> Bool ! Diag.Report {
+    for f in tc_evar_field_slots(slot) {
+        let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), e.tid)
+        let path = "{prefix}{c_field_name(tc_evfield_name(f))}"
+        let l = cc_eq_variant_field(e, ftid, path, eq_lhs)
+        let r = cc_eq_variant_field(e, ftid, path, eq_rhs)
+        if !cc_eq_member_into(e, ftid, l, r, out) { return false }
+    }
+    true
+}
+
+// A field that holds its own enum is boxed, and its word is read back as the pointer.
+fn cc_eq_variant_field(e: EqFn, ftid: Int, path: Str, side: Str) -> Int ! Diag.Report {
+    let member = x_layout_checked(field_layout_of(e.tid, ftid), e.node, "UnspellableVariantField",
+        "variant field `{path}` has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    if cc_stopped(member) { return -1 }
+    let read = ir_field_get(ftid, e.node, member.c_spelling, path, member.slot_form, cc_eq_side(e, side))
+    if member.slot_form != SlotForm.PointerBoxed { return read }
+    let held = cc_local(ftid, e.node)
+    if cc_stopped(held) { return -1 }
+    let ptr = ir_cast(ftid, e.node, pointer_spelling(held.c_spelling), read)
+    ir_unbox(ftid, e.node, held.c_spelling, held.slot_form, ptr)
+}
+
+fn cc_eq_variant_unmatched(e: EqFn, vname: Str) -> Bool ! Diag.Report {
+    diag_ice_at("EqualityVariantNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "variant `{vname}` of {tc_type_str(e.tid)} is registered and declared differently", e.node,
+        "typecheck registers each variant in declaration order; this is a compiler bug")
+    false
 }
 
 // An interpolation hole whose type has no printf form renders through the sealed
