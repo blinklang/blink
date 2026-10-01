@@ -95,7 +95,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | InvalidKeywordArg | E0511 | A call-site label names no keyword parameter of the callee — including a label written on a positional parameter | Name resolution | §2.13 |
 | QuestionMarkErrorMismatch | E0512 | `?` error type mismatch — inner E1 ≠ function return E2 | Type checking | §3c.2 |
 | CoalesceRequiresOption | E0513 | `??` operator used on non-Option value | Type checking | §3c.2 |
-| AmbiguousMethodCall | E0522 | Unqualified method call resolves to a method defined by two or more implemented traits | Name resolution | §3.6 |
+| AmbiguousMethodCall | E0522 | Unqualified method call resolves to a method defined by two or more implemented traits, a sealed built-in trait counting as one of them | Name resolution | §3c.4 |
 | MissingDisplayImpl | E0523 | Interpolated `{expr}` type does not implement `Display` | Type checking | §3.6 |
 | ReservedTypeName | E0524 | A `type`, type alias, `trait` or `effect` declaration takes a reserved name: `Self`, a scalar type that literal syntax produces, or `Void` | Name resolution | §10.6 |
 | NoSuchField | E0525 | Field access names a field the struct, tuple, or opaque handle does not declare | Type checking | §3.2 |
@@ -215,6 +215,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
 | OverrideOfDeprecatedDefault | W0731 | `impl` overrides a trait default marked `@deprecate_override` | Trait sealing | §3.6 |
+| SealedMethodNameCollision | W0734 | A method in an `impl` for a built-in type has the same name as a method a sealed trait gives that type; unqualified calls of the name are E0522. Fires at the method only, never at calls. On by default, never an error, no effect on resolution | Method resolution | §3c.4 |
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
 | ShadowedPreludeName | W1010 | A `type`, type alias, `trait` or `effect` declaration takes a compiler-known type name or prelude trait name that is not reserved; it shadows the builtin in its module. The `help:` line names the `import blink.core.{X as Y}` (or `blink.ffi`) escape | Modules | §10.6 |

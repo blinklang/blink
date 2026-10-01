@@ -739,7 +739,94 @@ impl Parse for Str {
 
 Built-in types (`Str`, `List[T]`, `Map[K,V]`, `Set[T]`, `Bytes`, `StringBuilder`, `Instant`, `Duration`, `Iterator[T]`) have their methods defined by compiler-known traits (`Sized`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `StringBuildOps`, `IteratorOps`, etc.). These surfaces are **sealed** — a user program cannot implement or override them. The underlying FFI bridge functions in `lib/std/` are internal — not part of the public API. Users interact exclusively through method syntax (§3.2).
 
-**Implementation note:** The current compiler implements dispatch for these types via hardcoded pattern matching in `codegen_methods.bl` rather than real trait resolution. This is an implementation shortcut — the spec-level semantics are trait-based, and the compiler should migrate to real trait resolution as the trait system matures. The hardcoded dispatch produces identical codegen (direct C function calls) and is invisible to users.
+**A sealed trait is an ordinary owner in lookup.** *Trait Method Lookup* above applies to a built-in receiver without change. Each sealed trait that gives the receiver a method is one trait in the search, and it is always in scope (§3.2.2). No trait ranks above another: a sealed trait does not win over a user trait, and a user trait does not win over a sealed trait. This holds for every built-in receiver and for every method name.
+
+A user trait may give a built-in type a method whose name a sealed trait already uses. The orphan rule (§3.6 *Trait Coherence*) permits the impl when the package owns the trait, and the impl is not an error. An unqualified call with that name then has two owners, so it is `AmbiguousMethodCall` (E0522). A qualified call names one owner and always resolves:
+
+```blink
+trait Tidy {
+    fn trim(self) -> Str
+}
+
+impl Tidy for Str {               // warning W0734: see below
+    fn trim(self) -> Str { "X" }
+}
+
+fn main() ! IO {
+    let text = "  hi  "
+    let a = text.trim()           // COMPILE ERROR E0522: `trim` is in StrOps (built-in) and Tidy
+    let b = StrOps.trim(text)     // OK: "hi"
+    let c = Tidy.trim(text)       // OK: "X"
+    let n = text.len()            // OK: only Sized gives Str a `len`
+}
+```
+
+```
+error[AmbiguousMethodCall]: ambiguous method call
+ --> tidy.bl:11:18
+  |
+11|     let a = text.trim()
+  |                  ^^^^ method `trim` found in multiple traits
+  |
+  = note: `trim` is a built-in `StrOps` method and is also defined by `Tidy`
+  = help: use qualified syntax to disambiguate:
+  |   StrOps.trim(text)
+  |   Tidy.trim(text)
+```
+
+When one of the owners is a sealed trait, the E0522 note names that trait and says that it is built-in, and the help lists the qualified call for each owner. The spec fixes this content, not the wording.
+
+**An impl body gets no special treatment.** Inside `impl Tidy for Str`, `self` has type `Str`, and `self.trim()` follows the same lookup as any other call. It is E0522. The body does not prefer its own trait, so the call is neither a recursive call nor a silent call to the built-in. Name the owner:
+
+```blink
+trait Tidy {
+    fn tidy(self) -> Str
+    fn trim(self) -> Str
+}
+
+impl Tidy for Str {
+    fn tidy(self) -> Str { self.trim() }                    // COMPILE ERROR E0522
+    fn trim(self) -> Str { StrOps.trim(self).to_upper() }   // OK: calls the built-in (W0734 here)
+}
+```
+
+**Resolution is fixed where the call is checked.** The type checker resolves each method call once, to one trait: against the bounds when the receiver's type is a type parameter, else against the traits in scope for the concrete type. Monomorphization keeps that trait for each instance. It never looks the method up again by name. So a bound selects its trait for every type argument, including a built-in type:
+
+```blink
+fn g[T: Tidy](x: T) -> Str {
+    x.trim()                      // resolves to Tidy.trim: T has only the bound Tidy
+}
+
+g("  hi  ")                       // "X": calls Tidy.trim, never the built-in StrOps.trim
+```
+
+If monomorphization looked `trim` up again with `T = Str`, the instance would run a method the type checker did not choose, and `g` would act differently at `Str` than at every other type. The rule above forbids that.
+
+**A sealed surface may grow.** A release can add a method to a sealed trait. When the name is the same as a method that a user trait already gives that type, unqualified calls that compiled before become E0522, and W0734 fires at the user's impl. The program never changes what it does without a diagnostic, which is the guarantee *No Inherent Methods* gives for user traits.
+
+**Warning W0734 `SealedMethodNameCollision`.** The compiler reports this warning at a method declaration in an `impl` block when both of these are true:
+
+1. The type the block implements the trait for is a built-in type.
+2. A sealed trait already gives that type a method with this name.
+
+The warning fires once per method. It never fires at a call, at a qualified call, or through a generic bound. Its note names the sealed trait, and its help says to rename the method or to call it in the qualified form. The warning is on by default. `@allow(SealedMethodNameCollision)` on the method suppresses it (`@allow` attaches to a `fn`, §11.1), and records that the author chose the name. The warning is never an error.
+
+```
+warning[SealedMethodNameCollision]: `Tidy.trim` has the same name as a built-in method on `Str`
+ --> tidy.bl:6:8
+  |
+6 |     fn trim(self) -> Str { "X" }
+  |        ^^^^ `trim` is a built-in `StrOps` method
+  |
+  = note: every unqualified `.trim()` call on a `Str` that has `Tidy` in scope is ambiguous (E0522)
+  = help: rename the method, or call it as `Tidy.trim(x)`
+```
+
+W0734 is diagnostic only. It has no effect on resolution, on monomorphization or on the code the compiler emits. A release that grows a sealed surface may make W0734 fire on an impl that compiled before without it, and that is not a breaking change. A later release may remove W0734, and that is not a breaking change either.
+
+**Why one owner and not a priority.** If the built-in method won, a user impl could be declared but never reached with dot syntax. A release that added a sealed method would also change, without a diagnostic, which code runs at existing call sites. If the impl were an error, a release that added a sealed method would break the declaration in the package that owns the trait, and every package that uses it, and only a rename could fix it. An ordinary owner turns each collision into an error at the call, which a qualified call fixes. (Vote: 6-0 one owner on every receiver; 6-0 resolution fixed at type check; 6-0 no special case in an impl body; 6-0 the note names the built-in owner; 6-0 W0734 on by default, in round 2 after 3-3 in round 1. See [Sealed Method Name Collision](../decisions/sealed-method-name-collision.md).)
+
+**Implementation note:** The current compiler implements dispatch for these types via hardcoded pattern matching in `codegen_methods.bl` rather than real trait resolution. This is an implementation shortcut — the spec-level semantics are trait-based, and the compiler should migrate to real trait resolution as the trait system matures. The shortcut is correct only where it gives the result of the rules above. Both the E0522 check and W0734 read one table of the sealed methods of each receiver.
 
 #### Resolution Summary
 
