@@ -1,0 +1,149 @@
+import compile_test_helpers
+
+// A closure handed to async.spawn may not capture a `let mut` binding (§2.8, E0650): the
+// task and the enclosing scope would share one mutable binding with no order between them.
+// The rule is on the capture, not on a write, so a task that only reads the binding is
+// rejected too. Copying the value into a `let` first is the fix the spec names, and a
+// closure that captures a `let mut` but is never spawned is ordinary.
+
+fn expect_rejected(src: Str, tag: Str, name: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0650", "{tag}: spawn capturing `{name}` is E0650")
+    compile_test_helpers.expect_contains(out, "`{name}`", "{tag}: the report names `{name}`")
+}
+
+fn expect_accepted(src: Str, tag: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, "{tag}: compiles with no error")
+}
+
+test "a spawned closure that assigns a let mut is rejected" {
+    expect_rejected(#"fn main() ! Async {
+    let mut counter = 0
+    async.scope {
+        let _h = async.spawn(fn() { counter += 1 })
+    }
+}
+"#, "_spawnmut_assign", "counter")
+}
+
+test "a spawned closure that only reads a let mut is rejected" {
+    expect_rejected(#"fn main() ! Async, IO {
+    let mut counter = 0
+    let h = async.spawn(fn() { counter + 1 })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_read", "counter")
+}
+
+test "a closure held in a let and then spawned is rejected for its let mut capture" {
+    expect_rejected(#"fn main() ! Async, IO {
+    let mut counter = 0
+    let f = fn() { counter + 1 }
+    let h = async.spawn(f)
+    io.println("{h.await}")
+}
+"#, "_spawnmut_alias", "counter")
+}
+
+test "a closure nested in a spawned closure is rejected for its let mut capture" {
+    expect_rejected(#"fn main() ! Async, IO {
+    let mut counter = 0
+    let h = async.spawn(fn() {
+        let g = fn() { counter + 1 }
+        g()
+    })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_nested", "counter")
+}
+
+test "a let mut closure reassigned to one that captures a let mut is rejected when spawned" {
+    expect_rejected(#"fn main() ! Async, IO {
+    let mut counter = 0
+    let mut f = fn() { 0 }
+    f = fn() { counter + 1 }
+    let h = async.spawn(f)
+    io.println("{h.await}")
+}
+"#, "_spawnmut_reassigned", "counter")
+}
+
+test "a spawned closure in a method body is rejected for its let mut capture" {
+    expect_rejected(#"type Box { n: Int }
+trait Runner {
+    fn run(self) -> Int ! Async
+}
+impl Runner for Box {
+    fn run(self) -> Int ! Async {
+        let mut total = self.n
+        let h = async.spawn(fn() { total + 1 })
+        h.await
+    }
+}
+fn main() ! Async, IO {
+    io.println("{Box { n: 1 }.run()}")
+}
+"#, "_spawnmut_method", "total")
+}
+
+test "a destructured let mut captured by a spawned closure is rejected" {
+    expect_rejected(#"fn main() ! Async, IO {
+    let mut (left, right) = (1, 2)
+    let h = async.spawn(fn() { left + right })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_destructure", "left")
+}
+
+test "a snapshot of a let mut copied into a let may be spawned" {
+    expect_accepted(#"fn main() ! Async, IO {
+    let mut counter = 0
+    counter = 5
+    let snapshot = counter
+    let h = async.spawn(fn() { snapshot + 1 })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_snapshot")
+}
+
+test "a let mut declared inside the spawned closure is the task's own" {
+    expect_accepted(#"fn main() ! Async, IO {
+    let h = async.spawn(fn() {
+        let mut n = 0
+        n += 2
+        n
+    })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_inner")
+}
+
+test "immutable captures of a list and a channel may be spawned" {
+    expect_accepted(#"fn main() ! Async, IO {
+    let xs = [1, 2, 3]
+    let ch = channel.new[Int](buffer: 1)
+    let h = async.spawn(fn() {
+        ch.send(xs.len())
+        0
+    })
+    let _ = h.await
+    for got in ch {
+        io.println("{got}")
+        break
+    }
+}
+"#, "_spawnmut_immutable")
+}
+
+test "a closure that captures a let mut and is called, not spawned, is accepted" {
+    expect_accepted(#"fn main() ! Async, IO {
+    let mut counter = 0
+    let bump = fn() { counter += 1 }
+    bump()
+    let snapshot = counter
+    let h = async.spawn(fn() { snapshot })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_sync_call")
+}
