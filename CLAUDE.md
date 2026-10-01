@@ -22,11 +22,8 @@ Ignore short-term gain, and always think about what is most correct according to
 Pipeline: lexer → parser → typecheck → mono → lowering to IR → C printer
 Codegen layer: src/cg.bl (driver, four emit modes) over src/cg_*.bl (stages), src/mono.bl,
 src/layout.bl (C shape of a tid), src/cname.bl (C symbol names), src/ir.bl (typed lowered IR)
-IMPORTANT: the tid-native emitters land stage by stage. A stage that has not landed
-reports ICE I0004 CodegenStageNotBuilt, so some programs do not compile yet. The compiler
-itself does: gen0 is pinned to a self-hosting build of this codegen (tag
-gen0-rewrite-selfhost-2). `task ci` is the gate. `test`, `test-fmt` and `ci-release` run
-but fail on the programs the new codegen cannot compile yet
+gen0 is pinned to a self-hosting build of this codegen (tag gen0-rewrite-selfhost-2).
+`task ci` is the gate for each change; `task ci-release` is the release gate
 Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/blinkc_main.bl (compiler binary)
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/
 Build output: build/ (gitignored)
@@ -39,21 +36,21 @@ Adding a lib/std or lib/pkg module: `task regen` refreshes the embedded registry
 Known-good compilers: /home/nhumrich/blinklang/compilers/ holds every gen0 pin (MANIFEST.txt has version + sha256). Copy each new pin there before installing it. Recover from a miscompile with `BLINK_GEN0_SEED=<dir>/bin/blink` or by copying a dir back to build/gen0
 CLI: `build/blink build <file.bl>` | `build/blink run <file.bl>` | `build/blink check <file.bl>` | `build/blink doc <module>`
 Build CLI: `task build-cli` — produces `build/blink` (needs a seeded build/, see Bootstrap). `task gen1` produces `build/gen1/bin/{blinkc,blink}` without one
-Test: `task test` — compile+run all test_*.bl in tests/. Runs, but fails until the corpus passes: prefer `task corpus` during the rewrite
-Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks. Runs, but its semantic check fails on programs the corpus fails; `task ci` runs the goldens with the semantic check off
+Test: `task test` — compile+run all test_*.bl in tests/
+Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks; `task ci` runs the goldens with the semantic check off
 Single test: `task compile-test -- test_name` (needs a seeded build/)
-Rewrite gate: `task ci` — gen0 compiles src (gen1) + corpus monotone + lint + fmt goldens + typecheck suite + rewrite unit suite. Run after every change during the codegen rewrite. See docs/codegen-rewrite/harness.md
-Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points. Fails today: test and test-fmt fail as above, and test-node-tid-diff still expects the retired BLINK_MONO_DIFF harness
+Gate: `task ci` — gen0 compiles src (gen1) + corpus monotone + lint + fmt goldens + typecheck suite + rewrite unit suite. Run after every change. See docs/codegen-rewrite/harness.md
+Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points
 Corpus: `task corpus` — every tests/test_*.bl compiled+run on its own under gen1 (the current source compiled by the pinned gen0); result in build/corpus.json; `task corpus-check` gates it against scripts/corpus_baseline.json
 Quick run: `build/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc. Use `build/gen1/bin/blink` when build/ is not seeded
 Low-level (dev): `build/blinkc <file.bl> <output.c>` then `cc -o <binary> <output.c> -lm`
 Archive-linked (dev): `build/blinkc --link-archive build/libblink_std.h <file.bl> <out.c>` then `cc -o <bin> <out.c> -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections`
-After modifying compiler sources: `task ci` during the rewrite; `task regen` then `task ci-release` at release points
+After modifying compiler sources: `task ci`; `task regen` then `task ci-release` at release points
 
 ## Debugging
 
 These commands work with a seeded build/ (see Bootstrap) or with `build/gen1/bin/blink` in place
-of `build/blink`. A program that hits an unbuilt codegen stage still stops at ICE I0004.
+of `build/blink`.
 
 Inspect generated C: `build/blink build --emit c <file.bl>` — output goes to `build/<name>.c`
 Trace compiler phases: `build/blink run --blink-trace typecheck <file.bl>` (also: lex, parse, mono, all)
@@ -69,7 +66,7 @@ Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compi
 The compiler compiles itself. `task regen` verifies by compiling the compiler twice (Gen1 + Gen2)
 and diffing the output — they must match
 
-During the rewrite `task ci` builds src with the pinned gen0, not with build/blinkc, so a regen
+`task ci` builds src with the pinned gen0, not with build/blinkc, so a regen
 does not lock a feature in for the gate. Step 1 of each dance below is: add the feature, `task ci`.
 Before src may use it, re-pin gen0 to a build that has it (new tag, scripts/gen0.sh default, copy
 into the compilers dir). `task regen` still proves the fixed point once build/ is seeded
