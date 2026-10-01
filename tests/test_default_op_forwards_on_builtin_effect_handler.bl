@@ -1,0 +1,185 @@
+// `default.op(args)` inside a handler operation of a builtin effect forwards
+// to the handler that was in scope when this handler was installed (spec §4
+// "Explicit delegation"). A builtin root names its operations by the handler
+// operation names (§4.3: IO print, print_no_nl, log; Time read, sleep), not
+// by the caller names io.println and io.print reach them through.
+
+import compile_test_helpers
+
+fn print_forward_src() -> Str {
+    #"
+fn main() {
+    with handler IO {
+        fn print(msg: Str) { default.print("[WRAPPED] {msg}") }
+    } {
+        io.println("hello")
+    }
+    io.println("after")
+}
+"#
+}
+
+test "default.print in an IO handler reaches the default handler" {
+    let r = compile_test_helpers.compile_and_run(print_forward_src(), "default_op_io_print")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[WRAPPED] hello\n"))
+    assert(r.out.contains("after"))
+    assert(!r.out.contains("[WRAPPED] after"))
+}
+
+fn nested_src() -> Str {
+    #"
+fn main() {
+    with handler IO {
+        fn print(msg: Str) { default.print("[OUTER] {msg}") }
+    } {
+        with handler IO {
+            fn print(msg: Str) { default.print("[INNER] {msg}") }
+        } {
+            io.println("x")
+        }
+    }
+}
+"#
+}
+
+test "default.print reaches the enclosing IO handler, not the default one" {
+    let r = compile_test_helpers.compile_and_run(nested_src(), "default_op_io_nested")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[OUTER] [INNER] x"))
+}
+
+fn print_no_nl_src() -> Str {
+    #"
+fn main() {
+    with handler IO {
+        fn print_no_nl(msg: Str) { default.print_no_nl("[N] {msg}") }
+    } {
+        io.print("a")
+    }
+    io.println("|")
+}
+"#
+}
+
+test "default.print_no_nl names the op io.print reaches" {
+    let r = compile_test_helpers.compile_and_run(print_no_nl_src(), "default_op_io_print_no_nl")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[N] a|"))
+}
+
+fn sibling_src() -> Str {
+    #"
+fn main() {
+    with handler IO {
+        fn log(msg: Str) { default.print("[LOGGED] {msg}") }
+    } {
+        io.log("x")
+    }
+}
+"#
+}
+
+test "default reaches a sibling op of the builtin handler" {
+    let r = compile_test_helpers.compile_and_run(sibling_src(), "default_op_io_sibling")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[LOGGED] x"))
+}
+
+fn time_src() -> Str {
+    #"
+fn main() {
+    with handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(100) }
+        fn sleep(d: Duration) { io.println("[BASE] sleep {d.to_ms()}") }
+    } {
+        with handler Time {
+            fn read() -> Instant { default.read().add(Duration.seconds(5)) }
+            fn sleep(d: Duration) { default.sleep(d.scale(2)) }
+        } {
+            io.println("now {time.read().to_unix_secs()}")
+            time.sleep(Duration.ms(7))
+        }
+    }
+}
+"#
+}
+
+test "default.read and default.sleep forward through a Time handler" {
+    let r = compile_test_helpers.compile_and_run(time_src(), "default_op_time")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("now 105"))
+    assert(r.out.contains("[BASE] sleep 14"))
+}
+
+fn arg_type_src() -> Str {
+    #"
+fn main() {
+    with handler IO {
+        fn print(_msg: Str) { default.print(1) }
+    } {
+        io.println("x")
+    }
+}
+"#
+}
+
+test "default.op on a builtin root checks its arguments against the op" {
+    let out = compile_test_helpers.compile_and_capture(arg_type_src(), "default_op_io_arg_type")
+    compile_test_helpers.expect_contains(out, "expects Str, got Int", "builtin default.op arg type")
+    assert(!out.contains("ICE"))
+}
+
+fn caller_name_src() -> Str {
+    #"
+fn main() {
+    with handler IO {
+        fn print(msg: Str) { default.println(msg) }
+    } {
+        io.println("x")
+    }
+}
+"#
+}
+
+test "default.op names a handler op, not the caller name that reaches it" {
+    let out = compile_test_helpers.compile_and_capture(caller_name_src(), "default_op_io_caller_name")
+    compile_test_helpers.expect_contains(out, "effect `IO` has no operation `println`", "builtin default.op caller name")
+    assert(!out.contains("ICE"))
+}
+
+fn eprint_src() -> Str {
+    #"
+fn main() {
+    with handler IO {
+        fn print(msg: Str) { default.eprint(msg) }
+    } {
+        io.println("x")
+    }
+}
+"#
+}
+
+test "io.eprint is not interceptable, so default.eprint names no operation" {
+    let out = compile_test_helpers.compile_and_capture(eprint_src(), "default_op_io_eprint")
+    compile_test_helpers.expect_contains(out, "effect `IO` has no operation `eprint`", "default.eprint")
+    assert(!out.contains("ICE"))
+}
+
+fn env_src() -> Str {
+    #"
+fn main() {
+    with handler Env {
+        fn cwd() -> Str { default.cwd() }
+    } {
+        io.println(env.cwd())
+    }
+}
+"#
+}
+
+test "default in an Env handler is a clear compile error" {
+    let out = compile_test_helpers.compile_and_capture(env_src(), "default_op_env")
+    compile_test_helpers.expect_contains(out, "`default` is not supported yet in a handler of effect `Env`", "default in Env handler")
+    assert(!out.contains("ICE"))
+}

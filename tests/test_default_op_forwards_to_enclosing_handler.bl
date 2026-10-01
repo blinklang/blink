@@ -1,0 +1,215 @@
+// `default.op(args)` inside a handler operation body forwards to the handler
+// that was in scope when this handler was installed (spec §4 "Explicit
+// delegation"). These rows cover user-effect roots. `default` names the whole
+// enclosing handler, so a sibling op is reachable too, and it must reach the
+// same outer handler that an omitted op auto-delegates to.
+
+import compile_test_helpers
+
+fn audit_effect_src() -> Str {
+    #"effect Audit {
+    effect Log {
+        fn record(msg: Str)
+        fn count() -> Int
+    }
+}
+"#
+}
+
+fn with_audit(body: Str) -> Str {
+    "{audit_effect_src()}{body}"
+}
+
+fn forward_src() -> Str {
+    with_audit(#"
+fn main() {
+    with handler Audit {
+        fn record(msg: Str) { io.println("[BASE] {msg}") }
+        fn count() -> Int { 41 }
+    } {
+        with handler Audit {
+            fn record(msg: Str) { default.record("[FILTERED] {msg}") }
+            fn count() -> Int { default.count() + 1 }
+        } {
+            audit.record("event")
+            io.println("count {audit.count()}")
+        }
+    }
+}
+"#)
+}
+
+test "default.op forwards the call and its result to the enclosing handler" {
+    let r = compile_test_helpers.compile_and_run(forward_src(), "default_op_forward")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[BASE] [FILTERED] event"))
+    assert(r.out.contains("count 42"))
+}
+
+fn sibling_src() -> Str {
+    with_audit(#"
+fn main() {
+    with handler Audit {
+        fn record(msg: Str) { io.println("[BASE] {msg}") }
+        fn count() -> Int { 41 }
+    } {
+        with handler Audit {
+            fn record(msg: Str) { default.record("{msg} n={default.count()}") }
+            fn count() -> Int { 0 }
+        } {
+            audit.record("event")
+        }
+    }
+}
+"#)
+}
+
+test "default reaches a sibling op of the enclosing handler" {
+    let r = compile_test_helpers.compile_and_run(sibling_src(), "default_op_sibling")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[BASE] event n=41"))
+}
+
+fn same_outer_src() -> Str {
+    with_audit(#"
+fn main() {
+    with handler Audit {
+        fn record(msg: Str) { io.println("[A] {msg}") }
+        fn count() -> Int { 1 }
+    } {
+        with handler Audit {
+            fn record(msg: Str) { io.println("[B] {msg}") }
+            fn count() -> Int { 2 }
+        } {
+            with handler Audit {
+                fn record(msg: Str) { default.record(msg) }
+            } {
+                audit.record("explicit")
+                io.println("omitted {audit.count()}")
+            }
+        }
+    }
+}
+"#)
+}
+
+test "explicit default.op and an omitted op reach the same outer handler" {
+    let r = compile_test_helpers.compile_and_run(same_outer_src(), "default_op_same_outer")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[B] explicit"))
+    assert(r.out.contains("omitted 2"))
+    assert(!r.out.contains("[A]"))
+}
+
+fn arg_type_src() -> Str {
+    with_audit(#"
+fn main() {
+    with handler Audit {
+        fn record(msg: Str) { io.println(msg) }
+        fn count() -> Int { 0 }
+    } {
+        with handler Audit {
+            fn record(_msg: Str) { default.record(1) }
+            fn count() -> Int { 0 }
+        } {
+            audit.record("x")
+        }
+    }
+}
+"#)
+}
+
+test "default.op checks its arguments against the op signature" {
+    let out = compile_test_helpers.compile_and_capture(arg_type_src(), "default_op_arg_type")
+    compile_test_helpers.expect_contains(out, "expects Str, got Int", "default.op arg type")
+}
+
+fn outside_op_src() -> Str {
+    with_audit(#"
+fn log_it() ! Audit.Log {
+    default.record("x")
+}
+
+fn main() {
+    with handler Audit {
+        fn record(msg: Str) { io.println(msg) }
+        fn count() -> Int { 0 }
+    } {
+        log_it()
+    }
+}
+"#)
+}
+
+test "default outside a handler op is a clear compile error" {
+    let out = compile_test_helpers.compile_and_capture(outside_op_src(), "default_op_outside")
+    compile_test_helpers.expect_contains(out, "`default` is only valid inside a handler operation body", "default outside op")
+    assert(!out.contains("ICE"))
+}
+
+fn in_closure_src() -> Str {
+    with_audit(#"
+fn main() {
+    with handler Audit {
+        fn record(msg: Str) { io.println(msg) }
+        fn count() -> Int { 0 }
+    } {
+        with handler Audit {
+            fn record(msg: Str) {
+                let f = fn() { default.record(msg) }
+                f()
+            }
+            fn count() -> Int { 0 }
+        } {
+            audit.record("x")
+        }
+    }
+}
+"#)
+}
+
+test "default inside a closure in a handler op is a clear compile error" {
+    let out = compile_test_helpers.compile_and_capture(in_closure_src(), "default_op_in_closure")
+    compile_test_helpers.expect_contains(out, "`default` cannot be used inside a closure", "default in closure")
+    assert(!out.contains("ICE"))
+}
+
+fn shadowed_src() -> Str {
+    with_audit(#"
+type Sink {
+    tag: Str
+}
+
+trait Recorder {
+    fn record(self, msg: Str)
+}
+
+impl Recorder for Sink {
+    fn record(self, msg: Str) { io.println("[{self.tag}] {msg}") }
+}
+
+fn main() {
+    with handler Audit {
+        fn record(msg: Str) { io.println("[OUTER] {msg}") }
+        fn count() -> Int { 0 }
+    } {
+        with handler Audit {
+            fn record(msg: Str) {
+                let default = Sink { tag: "LOCAL" }
+                default.record(msg)
+            }
+            fn count() -> Int { 0 }
+        } {
+            audit.record("x")
+        }
+    }
+}
+"#)
+}
+
+test "a local named default shadows the enclosing handler" {
+    let r = compile_test_helpers.compile_and_run(shadowed_src(), "default_op_shadowed")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("[LOCAL] x"))
+    assert(!r.out.contains("[OUTER]"))
+}

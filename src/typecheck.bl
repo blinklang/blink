@@ -3077,6 +3077,15 @@ fn ensure_runtime_struct_type(name: Str, fnames: List[Str], ftids: List[Int], de
     tid
 }
 
+// Instant and Duration as lib/std/time.bl declares them, `derives` included.
+fn runtime_instant_tid() -> Int {
+    ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Hash", "Clone", "Debug"])
+}
+
+fn runtime_duration_tid() -> Int {
+    ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Clone", "Debug"])
+}
+
 fn runtime_process_result_tid() -> Int {
     ensure_runtime_struct_type("ProcessResult", ["out", "err_out", "exit_code"], [TYPE_STR, TYPE_STR, TYPE_INT], [])
 }
@@ -6066,7 +6075,12 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     // implicit Result[Void, TestError] (spec §3c.2).
     let saved_in_test = tc_in_test_body
     tc_in_test_body = 0
+    // And it is not inside any closure written around the handler: tc_current_fn_ret now names
+    // this method's own return, which is what depth 0 promises.
+    let saved_closure_depth = tc_in_closure_depth
+    tc_in_closure_depth = 0
     tc_check_body(body)
+    tc_in_closure_depth = saved_closure_depth
     tc_in_test_body = saved_in_test
     tc_check_missing_tail_value(body, tc_current_fn_ret, mname, m)
     nr_pop_scope()
@@ -11762,6 +11776,96 @@ pub fn tc_call_user_effect(call_node: Int) -> Int {
     tc_ue_op_root.get(decl) ?? -1
 }
 
+// The builtin Handler tid a `default.op(args)` call performs through, or -1. Name resolution
+// typed the receiver as the handler the enclosing operation belongs to; a user root answers
+// through tc_call_user_effect instead, and a local named `default` is a value.
+pub fn tc_call_builtin_default(call: Int) -> Int {
+    if call < 0 || node_kind(call) != NodeKind.MethodCall { return -1 }
+    let obj = node_obj(call)
+    if obj < 0 || node_kind(obj) != NodeKind.Ident || node_name(obj) != "default" { return -1 }
+    if tc_mc_obj_is_value(call) != 0 { return -1 }
+    let tid = tc_lookup_node_tid(obj)
+    let eff = tc_tid_handler_effect(tid)
+    if eff == "" || !builtin_root_has_handler_ops(tc_handler_effect_root(eff)) { return -1 }
+    tid
+}
+
+// `default` in a handler operation names the handler this one was installed over (§4
+// explicit delegation). Name resolution is the walk that knows which operation it is in, so it
+// types the receiver as that handler and records the operation the call performs; inference and
+// codegen then read the call as a perform of the root, the same one an omitted operation reaches.
+fn nr_resolve_default_receiver(call: Int, obj: Int) {
+    if tc_current_fn_node < 0 { return }
+    let eff = tc_tid_handler_effect(tc_lookup_node_tid(tc_current_fn_node))
+    if eff == "" { return }
+    let root = tc_handler_effect_root(eff)
+    tc_publish_node_tid(obj, make_handler_type(root))
+    let handle = str_to_lower(root)
+    if is_user_effect_handle_name(handle) == 0 { return }
+    let sig = lookup_fnsig("{handle}.{node_method(call)}")
+    if sig != -1 { nr_note_call_decl(call, fnsig_pool.get(sig).unwrap().decl) }
+}
+
+// The answer of `default.method(args)`, whose receiver name resolution typed as a handler of
+// `root`. A closure can outlive the operation it is written in, so there is no enclosing
+// handler for it to name.
+fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_in_closure_depth > 0 {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+            "`default` cannot be used inside a closure within a handler operation", call,
+            "call `default.{method}` in the operation body itself")
+        return tc_error_recovery_tid()
+    }
+    let handle = str_to_lower(root)
+    let user = is_user_effect_handle_name(handle) != 0
+    if !user && !builtin_root_has_handler_ops(root) {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+            "`default` is not supported yet in a handler of effect `{root}`", call,
+            "call the effect's handle directly, or forward to a handler you hold")
+        return tc_error_recovery_tid()
+    }
+    let key = if user { "{handle}.{method}" } else { builtin_handler_op_key(root, method) }
+    let sig = if user { lookup_fnsig(key) } else { builtin_handler_op_sig(root, method) }
+    if sig == -1 {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{root}` has no operation `{method}`", call, "")
+        return tc_error_recovery_tid()
+    }
+    let _ = check_arg_shapes(key, sig, node_args(call), 0, call)
+    fnsig_pool.get(sig).unwrap().ret
+}
+
+// The builtin roots whose handler operations the spec names (§4.3): IO's three, which take
+// the rendered text, and Time's two. Env's names differ between the spec and the runtime, so
+// it has none here until that is settled; the other builtin roots name none.
+fn builtin_root_has_handler_ops(root: Str) -> Bool {
+    root == "IO" || root == "Time"
+}
+
+// No source spelling reaches this key, so no declaration can take it over.
+fn builtin_handler_op_key(root: Str, op: Str) -> Str {
+    "Handler[{root}].{op}"
+}
+
+// The signature of a handler operation of a builtin root, or -1 for a name the spec does not
+// give that root. io.eprint is not interceptable, so eprint is no operation, and a caller
+// name such as println is not one either. Registered on first use, so Instant and Duration are
+// minted only for a program that delegates a Time operation.
+fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
+    let key = builtin_handler_op_key(root, op)
+    let found = lookup_fnsig(key)
+    if found != -1 { return found }
+    if root == "IO" && (op == "print" || op == "print_no_nl" || op == "log") {
+        register_intrinsic_fn_sig(key, [TYPE_STR], TYPE_VOID)
+    } else if root == "Time" && op == "read" {
+        register_intrinsic_fn_sig(key, [], runtime_instant_tid())
+    } else if root == "Time" && op == "sleep" {
+        register_intrinsic_fn_sig(key, [runtime_duration_tid()], TYPE_VOID)
+    } else {
+        return -1
+    }
+    lookup_fnsig(key)
+}
+
 pub fn is_user_effect_handle_name(name: Str) -> Int {
     let mut i = 0
     while i < tc_ue_handles.len() {
@@ -14992,6 +15096,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.MethodCall {
         let obj = node_obj(node)
         nr_check_call_type_args(node)
+        if obj != -1 && node_kind(obj) == NodeKind.Ident && node_name(obj) == "default" && nr_has_binding("default") == 0 {
+            nr_resolve_default_receiver(node, obj)
+        }
         let mut is_module_qual = 0
         if obj != -1 && node_kind(obj) == NodeKind.Ident {
             let obj_name = node_name(obj)
@@ -15041,6 +15148,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let mut is_ue_call = 0
                 if obj != -1 && node_kind(obj) == NodeKind.Ident {
                     if is_user_effect_handle_name(node_name(obj)) != 0 {
+                        is_ue_call = 1
+                    }
+                    if node_name(obj) == "default" && tc_tid_handler_effect(tc_lookup_node_tid(obj)) != "" {
                         is_ue_call = 1
                     }
                     // is_builtin_method is keyed on the BARE method name, so it cannot tell a
@@ -15377,7 +15487,11 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if methods_sl != -1 {
             let mut i = 0
             while i < sublist_length(methods_sl) {
-                nr_check_fn(sublist_get(methods_sl, i))
+                let m = sublist_get(methods_sl, i)
+                // An operation carries the handler it belongs to, which is what a `default`
+                // in its body names (nr_resolve_default_receiver).
+                if node_name(node) != "" { tc_publish_node_tid(m, make_handler_type(node_name(node))) }
+                nr_check_fn(m)
                 i = i + 1
             }
         }
@@ -18524,7 +18638,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // lookup runs first inside ensure_runtime_struct_type, so the declared tid wins
                 // and `.to_ms()` on the result still resolves through `Duration_to_ms`. Same
                 // idempotent-mint reasoning as the Instant tid at the time.read() arm.
-                return ensure_runtime_struct_type("Duration", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Clone", "Debug"])
+                return runtime_duration_tid()
             }
             // The synthesized sealed Display.display() has no user-written fnsig; it
             // always returns Str.
@@ -18651,6 +18765,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // `nr_is_defined` gates it so a local binding that happens to share the handle's
             // spelling keeps its own type — that variable's receiver arm has already run and
             // fallen through only because the method was genuinely unresolved on it.
+            if obj_name == "default" && nr_has_binding(obj_name) == 0 {
+                let dflt_eff = tc_tid_handler_effect(tc_lookup_node_tid(obj_node))
+                if dflt_eff != "" {
+                    let dflt_ret = tc_infer_default_perform(node, dflt_eff, method)
+                    if dflt_ret != -1 { return dflt_ret }
+                }
+            }
             if nr_is_defined(obj_name) == 0 && is_user_effect_handle_name(obj_name) != 0 {
                 let ue_sig = lookup_fnsig("{obj_name}.{method}")
                 if ue_sig != -1 {
@@ -18669,7 +18790,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // is normally present — but a silent fall-through when it is not would
                     // be the same fail-open erasure as the process builtins had. Mint it,
                     // so the type is right whether or not std.time is in scope.
-                    return ensure_runtime_struct_type("Instant", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Hash", "Clone", "Debug"])
+                    return runtime_instant_tid()
                 }
                 if obj_name == "time" && method == "sleep" { return TYPE_VOID }
             }
@@ -24019,7 +24140,10 @@ fn tc_report_unclaimed_calls() ! Diag.Report {
                 uc, tc_unresolved_method_help(type_kind(recv), tname, mname))
         } else if node_kind(obj) == NodeKind.Ident {
             let q = node_name(obj)
-            if is_builtin_namespace(q) == 1 || is_import_module_name(q) == 1 {
+            if q == "default" {
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "`default` is only valid inside a handler operation body", uc,
+                    "`default` names the handler an operation's own handler was installed over")
+            } else if is_builtin_namespace(q) == 1 || is_import_module_name(q) == 1 {
                 let near = suggest_module_member(tc_qualifier_to_module_or_self(q), mname)
                 let help = if near != "" { "did you mean `{q}.{near}`?" } else { "" }
                 diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{mname}` on module `{q}`", uc, help)
