@@ -572,6 +572,8 @@ All built-in method-surface traits are in the prelude — no import required. Th
 
 **These traits are sealed.** Their implementations are compiler-provided for the built-in types listed above; user code may not implement them (`impl StrOps for MyType`) or redefine them (`trait StrOps { … }`). Both are compile errors — the trait names are reserved by the prelude (§10.6), and a user implementation would create a second meaning for a method the compiler dispatches intrinsically. To add string-like or collection-like behavior to your own type, define your own trait with a different name.
 
+Sealing forbids an impl of the sealed trait itself. It does not forbid a user trait that gives a built-in type a method with a name a sealed trait already uses, such as `impl Tidy for Str { fn trim(self) -> Str { … } }`. The sealed trait and the user trait are then two owners of the name, so an unqualified call is E0522 and a qualified call picks one; the impl draws warning W0734 (§3c.4 *Built-in Type Method Dispatch*).
+
 A sealed trait may still be named in a generic bound — e.g. `fn f[T: Sized](x: T) -> Int { x.len() }`. `Sized` spans several built-in types, so a bound on it is genuinely polymorphic. A bound on a single-implementor trait (`StrOps`, `BytesOps`, `StringBuildOps`) is legal but degenerate: it is satisfiable only by the one built-in type that implements it (e.g. `[T: StrOps]` admits only `Str`), so it carries no more abstraction than naming that type directly.
 
 ---
