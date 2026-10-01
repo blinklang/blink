@@ -2339,7 +2339,8 @@ fn tc_ops_trait_qualified_ret(method: Str, recv: Int, node: Int) -> Int ! TypeCh
         // `tc_method_unavailable_on_receiver`, which is keyed on the receiver KIND alone, and
         // `contains` is on the List surface for every element. Only this row knows the element.
         if method == "contains" {
-            if tc_list_contains_elem_scannable(elem) == 0 { return tc_refuse_list_contains(node, recv) }
+            let need = tc_list_contains_elem_need(elem)
+            if need.len() > 0 { return tc_refuse_list_contains(node, recv, need) }
             return TYPE_BOOL
         }
         if method == "join" { return TYPE_STR }
@@ -13983,37 +13984,41 @@ fn tc_suggest_method(obj_k: TyKind, tname: Str, method: Str) -> Str {
     tc_builtin_method_edit1(method)
 }
 
-// The help line for an unresolved method: the rename note the resolver already carries for
-// a renamed List operation, else the near-miss suggestion, else nothing.
-// The element types `List.contains` can scan. The method walks the elements comparing each
-// with `==`, and the language defines that comparison by value only for Int, Bool, Str and
-// Float (sections/03_types.md:339). On a struct, an enum or a nested collection `==` is
-// pointer identity, so a scan over one answers a membership question nobody asked, and
-// answers it from addresses rather than values.
+// What `List[T].contains` needs of its element: the method walks the elements comparing
+// each with `==`, so `T` must be `Eq` (sections/03_types.md, *The `Contains` Trait*). The
+// answer is the same chain `==` reports, empty when the element is `Eq`.
 //
 // An element nothing has chosen yet is not refused. There is no type to name as lacking the
 // comparison, and the instance the call is monomorphised to meets this same gate once its
 // element is decided.
-fn tc_list_contains_elem_scannable(elem: Int) -> Int {
+fn tc_list_contains_elem_need(elem: Int) -> List[Int] {
     let k = type_kind(elem)
-    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Float { return 1 }
-    if k == TyKind.Unknown || k == TyKind.Typevar { return 1 }
-    if tc_tid_has_unbound_metavar(elem) != 0 { return 1 }
-    0
+    if k == TyKind.Unknown { return [] }
+    if tc_tid_has_unbound_metavar(elem) != 0 { return [] }
+    tc_eq_need(elem, [])
 }
 
 // Refused as hard, the way every other method the receiver does not answer is, so inference
 // does not go on to flush the softer W0501 about the same call. The answer is poisoned
 // rather than absent, so a declared Bool over the call unifies with the recovery tid instead
 // of drawing a second error about a type the program never had.
-fn tc_refuse_list_contains(node: Int, obj_t: Int) -> Int ! Diag.Report {
+fn tc_refuse_list_contains(node: Int, obj_t: Int, need: List[Int]) -> Int ! Diag.Report {
     tc_unresolved_method_hard.insert(node, 1)
+    let leaf = need.get(need.len() - 1).unwrap()
+    let mut help = "`.contains` compares elements with `==`, and `{type_to_str(leaf)}` does not implement `Eq`"
+    let k = type_kind(leaf)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
+        help = "{help}; add `@derive(Eq)` to `type {strip_module_qualifier(tc_type_name(base))}`"
+    }
+    if k == TyKind.Typevar { help = "{help}; add the bound `[{type_to_str(leaf)}: Eq]`" }
     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
-        "unresolved method `.contains` on type {type_to_str(obj_t)}", node,
-        "element equality is defined for Int, Bool, Str and Float only; use `.into_iter().filter(...)` over other element types")
+        "unresolved method `.contains` on type {type_to_str(obj_t)}", node, help)
     tc_error_recovery_tid()
 }
 
+// The help line for an unresolved method: the rename note the resolver already carries for
+// a renamed List operation, else the near-miss suggestion, else nothing.
 fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str) -> Str {
     if method == "display" {
         return "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
@@ -18159,7 +18164,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return obj_t
             }
             if method == "contains" {
-                if tc_list_contains_elem_scannable(elem) == 0 { return tc_refuse_list_contains(node, obj_t) }
+                let need = tc_list_contains_elem_need(elem)
+                if need.len() > 0 { return tc_refuse_list_contains(node, obj_t, need) }
                 check_builtin_arg(method, 0, elem, args_sl, "List")
                 return TYPE_BOOL
             }

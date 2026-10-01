@@ -341,12 +341,12 @@ trait Contains[T] {
 | Type | `contains` semantics | Status |
 |------|---------------------|--------|
 | `Set[T]` | Hash-based membership test | Implemented |
-| `List[T]` | Linear scan for element equality; needs `T: Eq` | Implemented (primitive elements) |
+| `List[T]` | Linear scan for element equality; needs `T: Eq` | Implemented |
 | `Map[K, V]` | Key presence check (equivalent to `contains_key`) | Implemented |
 
 **Why a shared trait.** Containment is a universal set-theoretic predicate — "is X in this collection?" Every collection answers it, and generic code benefits: `fn has_item[C: Contains[T], T](c: C, item: T) -> Bool { c.contains(item) }`. The alternative — putting `contains` in each per-type trait — prevents writing functions generic over "any collection that can test membership." (Vote: 5-0.)
 
-**Implementation status.** `Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` is equivalent to `Map.contains_key(k)`. `List.contains` is implemented for **primitive element types** — `Int`, `Bool`, `Str`, `Float` — via a linear scan over element equality; `Str` elements use string-value equality. `List[T].contains` needs `T: Eq` and compares elements with `==` (§3.6 *Container Equality*), so it applies to lists of `Eq` structs, enums and nested containers too. The compiler does not implement that yet: `.contains()` on a list of structs/enums or of nested collections (`List[List[_]]`, `List[Map[_,_]]`) is a compile error (`UnresolvedMethod`) until it does. Use `xs.into_iter().filter(...)` for those cases in the meantime.
+**Implementation status.** `Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` is equivalent to `Map.contains_key(k)`. `List[T].contains` needs `T: Eq` and compares elements with `==` (§3.6 *Container Equality*) in a linear scan, so it applies to lists of `Eq` structs, enums and nested containers as well as primitives. An element type that does not implement `Eq` is a compile error (`UnresolvedMethod`).
 
 **Note on `Str`.** `Str` exposes substring search as `"hello".contains("ell")` — semantically "contains substring," not "contains element." This routes through `StrOps` (§3.2.1); `Str` is not a meaningful `Contains[Char]` element-membership type. For character search use `someStr.contains("{c}")`.
 
@@ -382,7 +382,7 @@ The full `List[T]` method surface (14 methods from `ListOps` + 2 from `Sized` + 
 |--------|-----------|---------|-------|
 | `len` | `fn(self) -> Int` | no | Via `Sized` |
 | `is_empty` | `fn(self) -> Bool` | no | Via `Sized` |
-| `contains` | `fn(self, T) -> Bool` | no | Via `Contains`, linear scan — primitive element types (`Int`/`Bool`/`Str`/`Float`); struct/enum/nested-collection elements not yet supported (see §3.2.2 *The `Contains` Trait*) |
+| `contains` | `fn(self, T) -> Bool` | no | Via `Contains`, linear scan by `==`; needs `T: Eq` (see §3.2.2 *The `Contains` Trait*) |
 | `get` | `fn(self, Int) -> Option[T]` | no | Safe indexed access |
 | `last` | `fn(self) -> Option[T]` | no | Last element |
 | `index_of` | `fn(self, T) -> Option[Int]` | no | First occurrence |
@@ -412,7 +412,7 @@ let sorted = items.sort()            // [1, 1, 4, 5, 99] — new list
 let rev = items.reverse()            // [5, 1, 4, 1, 99] — new list
 let combined = items.append([6, 7])  // [99, 1, 4, 1, 5, 6, 7] — new list
 
-items.contains(4)                    // true — linear scan (primitive elements, §3.2.2)
+items.contains(4)                    // true — linear scan (§3.2.2)
 items.index_of(1)                    // Some(1) — first occurrence
 items.last()                         // Some(5)
 items.clear()                        // items is now [], capacity retained
@@ -566,7 +566,7 @@ These are the **built-in method-surface traits** — the traits that host the me
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |
 | `StringBuildOps` | StringBuilder | `write`, `write_char`, `to_str`, `len`, `capacity`, `clear` | Yes |
 
-> **`Contains` membership covers `Set`, `Map`, and `List`.** `Set.contains` is a hash lookup, `Map.contains` is key presence (identical to `contains_key`), and `List.contains` is a linear scan over **primitive element types** (`Int`/`Bool`/`Str`/`Float`). `List` elements that are structs/enums or nested collections are **not yet supported** (`UnresolvedMethod`) — element value-equality for those is not yet defined. Substring search on `Str` (`"hello".contains("ell")`) is a separate operation hosted by `StrOps` (§3.2.1), not element membership. This table reflects what compiles today.
+> **`Contains` membership covers `Set`, `Map`, and `List`.** `Set.contains` is a hash lookup, `Map.contains` is key presence (identical to `contains_key`), and `List.contains` is a linear scan that compares elements with `==`, so it needs `T: Eq`. Substring search on `Str` (`"hello".contains("ell")`) is a separate operation hosted by `StrOps` (§3.2.1), not element membership. This table reflects what compiles today.
 
 All built-in method-surface traits are in the prelude — no import required. This matches the rationale from §10.6: operators like `for` desugar through `IntoIterator`, method calls resolve through traits, and requiring imports for built-in collection methods would add ceremony with no information value.
 

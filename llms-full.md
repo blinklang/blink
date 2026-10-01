@@ -536,7 +536,7 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.pop()` | Option[T] | Remove last |
 | `.get(idx)` | Option[T] | Element at index (None if OOB) |
 | `.set(idx, val)` | Void | Set element (mutates) |
-| `.contains(elem)` | Bool | Membership check (primitive elements: Int/Bool/Str/Float) |
+| `.contains(elem)` | Bool | Membership check by `==`; needs `T: Eq` |
 | `.append(other)` | List[T] | Concatenate, returns a new list |
 | `.slice(start, end)` | List[T] | Sub-list |
 | `.join(sep)` | Str | Join as string (List[Str]) |
