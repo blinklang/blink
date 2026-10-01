@@ -111,6 +111,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | SubEffectAsType | E0536 | A sub-effect is written as a type (`Template[DB.Read]`); only a top-level effect gives a type | Type checking | §3b.5 |
 | JsonTextForValue | E0537 | A `Str` is passed to a `from_json` that takes `JsonValue`, or `to_json()`'s result is used as a `Str`; the fix names `json.decode[T]` / `json.encode` | Type checking | §3.6.2 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
+| MutableCaptureInSpawn | E0650 | A closure passed to `async.spawn` captures a `let mut` binding | Closures | §2.8 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |
 | ArenaClosureTailUnsupported | E0702 | Closure-typed arena tail cannot be promoted (umbrella) | Arena | §5.2 |

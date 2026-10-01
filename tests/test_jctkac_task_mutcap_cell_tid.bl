@@ -1,14 +1,31 @@
-// jctkac: the async.spawn task-body emitter declared a mutable-capture cell from the raw
-// flat kind (c_type_str(tp_get_kind(cap.tp_id))). The flat kind cannot name an aggregate —
-// c_type_str(CT_STRUCT) is "void", and a data enum lowers to a struct too — so a task that
-// mutably captured a struct or a data enum declared a `void* cell` and its body deref
-// (`(*cell).field`, or passing `*cell` to a fn) failed to compile. Spell the cell through the
-// tid-first capture_cell_c_type, the same channel the closure-body mut-cap emitter already
-// uses, so the cell carries the real nominal type.
+import compile_test_helpers
 
-type Point { x: Int, y: Int }
+// A spawned task may not capture a `let mut` (§2.8, E0650), whatever the binding's type.
+// These rows hold the aggregate shapes: a struct and a data enum. Both lower to a C struct,
+// so a check keyed on scalar kinds would let them through.
 
-type Shape { Circle(Int), Square(Int) }
+fn expect_rejected(src: Str, tag: Str, name: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0650", "{tag}: spawn capturing `{name}` is E0650")
+    compile_test_helpers.expect_contains(out, "`{name}`", "{tag}: the report names `{name}`")
+}
+
+test "spawn mutably capturing a struct is rejected" {
+    expect_rejected(#"type Point { x: Int, y: Int }
+
+fn main() ! Async, IO {
+    let mut p = Point { x: 1, y: 2 }
+    let h = async.spawn(fn() {
+        p = Point { x: 10, y: 20 }
+        p.x + p.y
+    })
+    io.println("{h.await}")
+}
+"#, "_mutcap_struct", "p")
+}
+
+test "spawn mutably capturing a data enum is rejected" {
+    expect_rejected(#"type Shape { Circle(Int), Square(Int) }
 
 fn area(s: Shape) -> Int {
     match s {
@@ -17,20 +34,13 @@ fn area(s: Shape) -> Int {
     }
 }
 
-test "spawn mutably capturing a struct types the cell by the tid" {
-    let mut p = Point { x: 1, y: 2 }
-    let h = async.spawn(fn() {
-        p = Point { x: 10, y: 20 }
-        p.x + p.y
-    })
-    assert_eq(h.await, 30)
-}
-
-test "spawn mutably capturing a data enum types the cell by the tid" {
+fn main() ! Async, IO {
     let mut s = Circle(5)
     let h = async.spawn(fn() {
         s = Square(3)
         area(s)
     })
-    assert_eq(h.await, 18)
+    io.println("{h.await}")
+}
+"#, "_mutcap_enum", "s")
 }

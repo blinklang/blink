@@ -3,7 +3,7 @@ import parser.{
     node_kind, node_name, node_left, node_right, node_body, node_condition,
     node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
-    node_stmts, node_arms, node_fields, node_elements, node_handlers,
+    node_stmts, node_arms, node_fields, node_elements, node_handlers, node_methods, node_captures,
     node_type_name, node_effects, node_str_val, node_op, node_type_ann,
     node_pattern, node_for_binder, node_value_child_ids, node_is_mut, node_line, sublist_get, sublist_length,
 }
@@ -12,7 +12,7 @@ import diagnostics.{
     diag_source_file, diag_file_for_node,
     diag_push_allows, diag_clear_allows,
     ARENA_VALUE_ESCAPES, ARENA_TYPE_CONTAINS_CYCLE, ARENA_EFFECT_REDUNDANT,
-    ARENA_CLOSURE_TAIL_NONLITERAL, CLOSEABLE_ESCAPES_SCOPE,
+    ARENA_CLOSURE_TAIL_NONLITERAL, CLOSEABLE_ESCAPES_SCOPE, MUTABLE_CAPTURE_IN_SPAWN,
 }
 import typecheck.{
     TyKind, tc_call_decl_is_fn, tc_call_decl_node, tc_fn_has_effect, tc_lookup_node_tid,
@@ -1166,6 +1166,154 @@ fn emit_spawn_scoped_capture(node: Int, binder: Int) ! Diag.Report {
     diag_source_file = saved
 }
 
+// ── E0650 a `let mut` captured by a spawned task (MutableCaptureInSpawn) ─────────
+// A task and the scope that spawned it would share one mutable binding with no order
+// between their accesses, so a spawned closure may not capture a `let mut` at all, even
+// to read it (§2.8). Copying a closure shares its captures, so the walk follows a binder
+// whose value is a closure; copying any other value takes a snapshot, which is the fix.
+// The body is walked here, not from walk_expr, because a `let mut` closure's value may
+// come from any assignment in the body, before or after the spawn.
+
+fn check_spawn_mut_captures(fn_node: Int) ! Diag.Report {
+    let body = node_body(fn_node)
+    if body == -1 { return }
+    let mut mut_leaves: List[Int] = []
+    let_mut_pattern_leaves(body, mut_leaves)
+    smc_walk(body, body, mut_leaves)
+}
+
+// A destructuring `let mut (a, b)` binds each leaf IdentPattern, and only the LetBinding
+// above it records the `mut`.
+fn let_mut_pattern_leaves(node: Int, out: List[Int]) {
+    if node == -1 { return }
+    if node_kind(node) == NodeKind.LetBinding && node_is_mut(node) != 0 {
+        pattern_leaves(node_elements(node), out)
+    }
+    for kid in node_value_child_ids(node) { let_mut_pattern_leaves(kid, out) }
+}
+
+fn pattern_leaves(pat: Int, out: List[Int]) {
+    if pat == -1 { return }
+    if node_kind(pat) == NodeKind.TuplePattern {
+        let elems_sl = node_elements(pat)
+        let mut i = 0
+        while elems_sl != -1 && i < sublist_length(elems_sl) {
+            pattern_leaves(sublist_get(elems_sl, i), out)
+            i = i + 1
+        }
+        return
+    }
+    out.push(pat)
+}
+
+fn smc_walk(node: Int, body: Int, mut_leaves: List[Int]) ! Diag.Report {
+    if node == -1 { return }
+    if node_kind(node) == NodeKind.MethodCall && is_async_spawn(node) {
+        let args_sl = node_args(node)
+        let mut i = 0
+        while args_sl != -1 && i < sublist_length(args_sl) {
+            let arg = sublist_get(args_sl, i)
+            let mut reads: List[Int] = []
+            let mut seen: List[Int] = []
+            mut_captures_reached(arg, body, mut_leaves, reads, seen)
+            for read in reads { emit_spawn_mut_capture(arg, read) }
+            i = i + 1
+        }
+    }
+    for kid in node_value_child_ids(node) { smc_walk(kid, body, mut_leaves) }
+}
+
+// Collects one read per `let mut` binder the value of `node` captures. `seen` holds the
+// binders already visited, so a binder is reported once and a self-referencing let ends.
+fn mut_captures_reached(node: Int, body: Int, mut_leaves: List[Int], reads: List[Int], seen: List[Int]) {
+    if node == -1 { return }
+    let k = node_kind(node)
+    if k == NodeKind.Closure {
+        for read in closure_read_idents(node) {
+            let binder = tc_ident_binder_node(read)
+            if binder < 0 || seen.contains(binder) { continue }
+            seen.push(binder)
+            if is_let_mut_binder(binder) || mut_leaves.contains(binder) {
+                reads.push(read)
+            } else if is_fn_typed(read) {
+                closure_values_of(binder, body, mut_leaves, reads, seen)
+            }
+        }
+        return
+    }
+    if k == NodeKind.Ident {
+        let binder = tc_ident_binder_node(node)
+        if binder < 0 || seen.contains(binder) { return }
+        seen.push(binder)
+        closure_values_of(binder, body, mut_leaves, reads, seen)
+        return
+    }
+    if k == NodeKind.IfExpr {
+        mut_captures_reached(node_then_body(node), body, mut_leaves, reads, seen)
+        mut_captures_reached(node_else_body(node), body, mut_leaves, reads, seen)
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        let mut i = 0
+        while arms_sl != -1 && i < sublist_length(arms_sl) {
+            mut_captures_reached(node_body(sublist_get(arms_sl, i)), body, mut_leaves, reads, seen)
+            i = i + 1
+        }
+        return
+    }
+    if k == NodeKind.Block {
+        mut_captures_reached(block_tail_node(node), body, mut_leaves, reads, seen)
+        return
+    }
+    if k == NodeKind.ExprStmt {
+        mut_captures_reached(node_value(node), body, mut_leaves, reads, seen)
+    }
+}
+
+// Every value a `let` binder can hold: its initializer and, for a `let mut`, each value
+// assigned to it in the body.
+fn closure_values_of(binder: Int, body: Int, mut_leaves: List[Int], reads: List[Int], seen: List[Int]) {
+    if node_kind(binder) != NodeKind.LetBinding { return }
+    mut_captures_reached(node_value(binder), body, mut_leaves, reads, seen)
+    if node_is_mut(binder) == 0 { return }
+    let mut assigned: List[Int] = []
+    assignments_to(body, binder, assigned)
+    for v in assigned { mut_captures_reached(v, body, mut_leaves, reads, seen) }
+}
+
+fn assignments_to(node: Int, binder: Int, out: List[Int]) {
+    if node == -1 { return }
+    if node_kind(node) == NodeKind.Assignment {
+        let target = node_target(node)
+        if target != -1 && node_kind(target) == NodeKind.Ident && tc_ident_binder_node(target) == binder {
+            out.push(node_value(node))
+        }
+    }
+    for kid in node_value_child_ids(node) { assignments_to(kid, binder, out) }
+}
+
+fn is_let_mut_binder(binder: Int) -> Bool {
+    node_kind(binder) == NodeKind.LetBinding && node_is_mut(binder) != 0
+}
+
+// Reported at the read when the spawned closure holds it, and at the argument when the
+// read sits in a closure written elsewhere and reached through a binder.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn emit_spawn_mut_capture(arg: Int, read: Int) ! Diag.Report {
+    let at = if node_encloses(arg, read) { read } else { arg }
+    let saved = diag_source_file
+    diag_source_file = diag_file_for_node(at)
+    let name = node_name(read)
+    diag_error_at(
+        "MutableCaptureInSpawn", MUTABLE_CAPTURE_IN_SPAWN,
+        "mutable binding `{name}` is captured by a spawned task",
+        at,
+        "copy the value into a `let` before the spawn (`let snapshot = {name}`), or send it over a channel"
+    )
+    diag_source_file = saved
+}
+
 // Function-return escape: a returned value tagged with ANY still-live local
 // ffi.scope dangles once the function returns.
 fn check_ffi_ptr_return_escape(val_node: Int) ! Diag.Report {
@@ -2045,6 +2193,7 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
         // A function with no declared return type returns nothing.
         if ann != -1 { check_body_tail_flows(body, tc_lookup_node_tid(ann)) }
     }
+    check_spawn_mut_captures(fn_node)
     ea_pop_body()
     check_redundant_arena_effect(fn_node, arena_eff_node)
     diag_clear_allows()
@@ -2098,4 +2247,39 @@ pub fn analyze_escapes(program: Int) ! Diag.Report {
         analyze_fn(sublist_get(fns_sl, i))
         i = i + 1
     }
+    check_spawn_mut_captures_outside_fns(program)
+}
+
+// analyze_fn sees only top-level fns, but a method, a trait default body or a test may
+// spawn a task too.
+fn check_spawn_mut_captures_outside_fns(program: Int) ! Diag.Report {
+    check_spawn_mut_captures_of_holders(node_methods(program))
+    check_spawn_mut_captures_of_holders(node_arms(program))
+    check_spawn_mut_captures_of_list(node_captures(program))
+}
+
+fn check_spawn_mut_captures_of_holders(holders_sl: Int) ! Diag.Report {
+    let mut i = 0
+    while holders_sl != -1 && i < sublist_length(holders_sl) {
+        check_spawn_mut_captures_of_list(node_methods(sublist_get(holders_sl, i)))
+        i = i + 1
+    }
+}
+
+fn check_spawn_mut_captures_of_list(owners_sl: Int) ! Diag.Report {
+    let mut i = 0
+    while owners_sl != -1 && i < sublist_length(owners_sl) {
+        check_spawn_mut_captures_in(sublist_get(owners_sl, i))
+        i = i + 1
+    }
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn check_spawn_mut_captures_in(owner: Int) ! Diag.Report {
+    let saved_source = diag_source_file
+    diag_source_file = diag_file_for_node(owner)
+    diag_push_allows(owner)
+    check_spawn_mut_captures(owner)
+    diag_clear_allows()
+    diag_source_file = saved_source
 }
