@@ -3188,14 +3188,20 @@ Key differences:
 | `List[T]` (iff `T: Debug`) | `"[1, 2, 3]"` | — |
 | `Option[T]` (iff `T: Debug`) | `"Some(42)"` / `"None"` | — |
 | `Map[K,V]` (iff `K: Debug`, `V: Debug`) | `"{\"a\": 1}"` | — |
+| `Set[T]` (iff `T: Debug`) | `"{1, 2}"` | — |
+| `Result[T,E]` (iff `T: Debug`, `E: Debug`) | `"Ok(42)"` / `"Err(\"io\")"` | — |
+| tuple (iff every element is `Debug`) | `"(1, \"a\")"` | `"(1, a)"` |
 
 String interpolation (`"{value}"`) invokes `Display`. Explicit `value.debug()` is required for the structural form.
 
-`List`, `Option`, and `Map` implement `Debug` **conditionally** — a `List[T]` is `Debug` iff its
-element type `T` is `Debug`; an `Option[T]` iff `T` is `Debug`; a `Map[K,V]` iff **both** `K` and
-`V` are `Debug`. These are the only conditional (constrained) built-in `Debug` instances; their
-element-wise rendering and the v1 nesting boundary are specified in *Container Debug Rendering*
-below.
+`List`, `Option`, `Map`, `Set`, `Result` and tuples implement `Debug` **conditionally** — a
+`List[T]`, `Option[T]` or `Set[T]` is `Debug` iff `T` is `Debug`; a `Map[K,V]` iff **both** `K` and
+`V` are `Debug`; a `Result[T,E]` iff **both** `T` and `E` are `Debug`; a tuple iff every element is
+`Debug`. These are the only conditional (constrained) built-in `Debug` instances. They cover the same
+types as the conditional `Eq` instances (*Container Equality*), so a value that can be compared can
+also be shown, which the assertion built-ins need (§2.20 *Built-in Assertions*). Their element-wise
+rendering and the one remaining exclusion (container map keys) are specified in *Container Debug
+Rendering* below.
 
 **Scalar debug-forms.** The scalar leaf forms split by whether the type is textual or not. `Int`,
 `Float`, `Bool`, and the sized integers render **bare** — their `debug()` equals their `display()`.
@@ -3526,7 +3532,8 @@ Per-trait sum type rules:
 
 ##### Container Debug Rendering
 
-A field of a `@derive(Debug)` type may be a container — `List[T]`, `Option[T]`, or `Map[K,V]`. The
+A field of a `@derive(Debug)` type may be a container — `List[T]`, `Option[T]`, `Map[K,V]`,
+`Set[T]`, `Result[T,E]` or a tuple. The
 uniform per-field model (each field renders via `{field.debug()}`) holds: the container's own
 `debug()` renders its contents, with every element, key, and value rendered in **debug-form** (so a
 `Str` element is quoted and escaped, matching `Str.debug()`). The compiler provides these `debug()`
@@ -3541,6 +3548,17 @@ between a map key and its value; there is no inner padding.
 | `List[T]` | `"[" + elems.join(", ") + "]"`, each elem via its own `.debug()` | `"[]"` |
 | `Option[T]` | `"Some(" + inner.debug() + ")"` when present | `"None"` (bare, no parens) |
 | `Map[K,V]` | `"{" + entries.join(", ") + "}"`, each entry `key.debug() + ": " + value.debug()` | `"{}"` |
+| `Set[T]` | `"{" + elems.join(", ") + "}"`, each elem via its own `.debug()`, in sorted order (below) | `"{}"` |
+| `Result[T,E]` | `"Ok(" + value.debug() + ")"` or `"Err(" + error.debug() + ")"` | — |
+| tuple | `"(" + elems.join(", ") + ")"`, each elem via its own `.debug()` | — |
+
+**Set element order.** `Set[T].debug()` sorts the rendered element strings by their UTF-8 bytes
+before it joins them. It does not use iteration order. The hash seed changes per process (*Hash
+Contract and Seeding*), and two equal sets can hold their elements in different orders after
+different insert and remove histories, so iteration order would break the rule that
+`a == b` gives `a.debug() == b.debug()`. Sorting by the debug string needs no `Ord` bound. The order
+is by text, not by value: a `Set[Int]` of 1, 2 and 10 renders `{1, 10, 2}`. An empty `Set` renders
+`{}`, the same text as an empty `Map`; the static type tells them apart.
 
 ```blink
 @derive(Debug)
@@ -3569,12 +3587,19 @@ non-Debug case: rendering `<?>` (or any silent stand-in) is forbidden, because i
 banned silent fallback (the panel's 5-0 rule against `[object Object]`-style fallbacks, *Display
 Format Protocol*) one level down.
 
-Two container shapes stay rejected with `E0520` at **every** level of nesting (not just the top
-field): `Set` and `Result` are not Debug-renderable, and a `Map` whose **key** type is itself a
-container (`Map[List[Int], V]`, etc.) is rejected — map keys must be a scalar (`Str` / `Char` /
-`Int` / `Bool` / sized-int) or a struct that implements `Debug`, `Hash` and `Eq`. (Container-typed map *values*
-render fine; only container keys are excluded, because the renderer reads keys back through the map's
-key-ops storage layer, which has no descriptor for a container key.)
+One container shape stays rejected with `E0520` at **every** level of nesting (not just the top
+field): a `Map` whose **key** type is itself a container (`Map[List[Int], V]`, `Map[(Str, Int), V]`,
+etc.), and for the same reason a `Set` whose **element** type is a container. Map keys and set
+elements must be a scalar (`Str` / `Char` / `Int` / `Bool` / sized-int) or a struct that implements
+`Debug`, `Hash` and `Eq`. (Container-typed map *values* render fine; only container keys and set
+elements are excluded, because the renderer reads them back through the key-ops storage layer, which
+has no descriptor for a container key.) Outside a derive, the same shape fails a `T: Debug` bound
+with `E0306`, and the note names the container key type.
+
+`Set` and `Result` were excluded from `Debug` until the assertion bound changed from `Display` to
+`Debug`. The record gave no reason for that exclusion other than scope, and assertions need every
+`Eq` container to be `Debug`, so the panel extended this decision to `Set`, `Result` and tuples
+(vote: 6-0; see [assert_eq Debug bound](../decisions/assert-eq-debug-bound.md)).
 
 ```blink
 type Plain { a: Int }              // does NOT derive Debug
@@ -3600,8 +3625,8 @@ type Maybe { xs: Option[List[Int]] }     // Some([1, 2]) => "Maybe { xs: Some([1
 ```
 
 The rule is fully inductive in both the **typecheck** and the **emitter**. The typechecker recurses
-to prove every nested element / key / value type is `Debug` (rejecting non-Debug, `Set`/`Result`,
-and container map keys at any level). The emitter materializes one recursive per-monomorphization
+to prove every nested element / key / value type is `Debug` (rejecting non-Debug types and
+container map keys or set elements at any level). The emitter materializes one recursive per-monomorphization
 `debug()` function per distinct nested container shape (mirroring the arena-promotion descriptor
 walker); these functions call each other, so an arbitrarily deep type renders through a chain of
 composed calls with the no-silent-fallback invariant preserved at every level. See
@@ -3673,10 +3698,10 @@ All failing fields are reported in one pass so the developer can fix everything 
 
 For `@derive(Debug)` specifically, the per-field check fires **`E0520 DeriveDebugFieldNoDebug`** when
 a field's type has no `debug()` to call. For a **container** field (`List[T]` / `Option[T]` /
-`Map[K,V]`), the check peels the container and recurses on the element type — and on **both** `K`
-and `V` for a `Map` — so `E0520` also names a non-Debug *element/key/value* type, and a container
-nested inside a container (depth+1) raises `E0520` under the v1 one-level limit. See *Container Debug
-Rendering* above.
+`Set[T]` / `Map[K,V]` / `Result[T,E]` / tuple), the check peels the container and recurses on each
+type argument — **both** `K` and `V` for a `Map`, **both** `T` and `E` for a `Result`, every element
+of a tuple — so `E0520` also names a non-Debug *element/key/value* type at any depth. See *Container
+Debug Rendering* above.
 
 #### §3.6.2 Serialization Traits
 
@@ -4234,6 +4259,7 @@ The compiler automatically implements traits for tuple types when all element ty
 | `Ord` | Lexicographic. Compare `.0` first; if equal, compare `.1`; etc. | All elements: `Ord` |
 | `Hash` | Combine element hashes | All elements: `Hash` |
 | `Display` | `"(a, b, c)"` format | All elements: `Display` |
+| `Debug` | `"(a, b, c)"` format, each element via its own `.debug()` | All elements: `Debug` |
 | `Clone` | Element-wise clone | All elements: `Clone` |
 
 ```blink
