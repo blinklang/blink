@@ -321,7 +321,8 @@ warning[ScopedValueWithoutWith]: `Closeable` value used without `with...as`
 5 |     with fs.open("data.txt")? as file {
 6 |         // use file here
 7 |     }
-  = note: suppress with `@trusted(audit: "AUDIT-ID")` for manual resource management
+  = note: suppress with `@trusted(audit: "AUDIT-ID")` for manual resource management;
+          it needs a record `AUDIT-ID` in audits.toml (§9.1)
   = note: upgrade to error in blink.toml `[lints]`
 ```
 
@@ -341,7 +342,7 @@ warning[ScopedValueWithoutWith]: `BlockHandler` value used without `with`
 5 |     }
 ```
 
-This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted(audit: K)` for framework code (connection pools, resource managers) that deliberately manages scoped-value lifetimes manually.
+This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted(audit: K)` for framework code (connection pools, resource managers) that deliberately manages scoped-value lifetimes manually. `K` must name a record in `audits.toml` with a current pin, by the rule in §9.1 *Audit Records*; a stale pin lets the warning fire again.
 
 **E0601: closeable escapes scope**
 

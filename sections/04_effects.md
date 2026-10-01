@@ -161,6 +161,21 @@ effect Process {
 | `! DB.Write` | Database mutations: `db.exec(...)`, `db.execute(...)`, `db.begin()`, `db.commit()`, `db.rollback()` |
 | `! DB` | Full database access: read and write |
 
+**An effect name must exist.** Every name in an effect row must be a built-in effect (above) or one the program declares (§4.12). Any other name is rejected with `UnknownEffect` (E0538). There is no `FFI` effect, so `! FFI` is the usual way to meet this error; for that name the diagnostic adds a help line that points to §9.1:
+
+```
+error[UnknownEffect]: unknown effect `FFI`
+ --> sys.bl:3:24
+  |
+3 | fn c_getpid() -> Int ! FFI
+  |                        ^^^ no effect named `FFI`
+  |
+  = help: a foreign call is not an effect of its own; declare the effects the
+          foreign code has (`IO`, `Net`, ...) or the explicit pure claim (§9.1)
+```
+
+No fix is machine-applicable: an effect row on an `@ffi` decl is a claim about foreign code, and no tool writes that claim for the author.
+
 Declaring a parent is syntactic sugar for declaring all children. `! FS` and `! FS.Read, FS.Write, FS.Delete, FS.Watch` are identical to the compiler. The short form exists for the (rare) functions that genuinely need everything; the long form is what most functions should use.
 
 **Why hierarchical and not flat:**
@@ -1023,6 +1038,10 @@ DB.Read + DB.Write = DB
 
 This is standard capability attenuation: you can always pass a more-powerful capability where a less-powerful one is expected, but never the reverse.
 
+**Proven and assumed rows.** Every effect row in Blink is either compiler-proven (including discharge by handler or `with`) or is the declared row of an @ffi decl, assumed under audit key K. An assumed row is an upper bound on the foreign call's behaviour; handlers do not intercept foreign calls. FFI regions change Ptr rules only, never rows.
+
+This is the one normative statement of these rules. §9.1 (*`@effects`*, *`@trusted`*) and §4.7 refer to it. An `@ffi` decl's row enters the program at the decl and from there propagates by the rules above, with no special case. `@trusted` does not discharge or narrow a row: a wrapper that calls an `@ffi` decl with row `! Net.Connect` must itself declare `Net.Connect` or discharge it in the usual way. The FFI regions of §9.1.1 (an `@ffi` or `@trusted` body, `with ffi.scope()`) decide where a `Ptr[T]` may appear; they do not change what any row says.
+
 **Effect rows on trait impls.** When a trait declares a method `m` with effect row `R_t`, every `impl` that provides `m` must declare a row `R_i` such that `R_i ⊆ R_t` under the lattice above. The rule covers required methods and overrides of open defaults alike. An impl may *narrow* the signature (drop effects the trait declares but the impl does not use) but may not *widen* it (introduce effects the trait does not declare). A trait method with no `!` has the empty row, so its impls must have no `!` either. This preserves the trait's stated capability contract for every implementation: callers parameterized over `T: Trait` can rely on the trait's row as a sound upper bound on `m`'s effects across all `T`. A widening impl is rejected with `error[TraitContractEffectMismatch]` (E0904). Sealed (`final`) defaults have no override site and are therefore effect-monomorphic at their declaration. See §3.6 *Effect-row subtype for trait impls* for an example and §3.6 *The `final` Modifier* for the override-prevention semantics.
 
 ---
@@ -1058,6 +1077,8 @@ The LSP displays `main`'s actual effect set as an inlay hint, computed from the 
 ### 4.7 Effect Handlers
 
 Effect handlers replace the implementation behind effect handles. They are the mechanism for dependency injection, testing, sandboxing, and capability attenuation.
+
+For how handlers relate to calls into foreign code, see §4.5 *Proven and assumed rows*; §9.1 *`@effects`* shows how a safe wrapper makes a foreign effect replaceable.
 
 #### Basic handler syntax
 
