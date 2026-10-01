@@ -916,3 +916,81 @@ fn resilient_fetch(city: Str) -> Result[Weather?, AppError] ! Net, IO {
 ```
 
 Errors are values. They compose, propagate, and pattern-match like any other value. Every error path is visible in the type signature. The compiler enforces exhaustive handling. The AI never has to guess what can go wrong.
+
+### 7.5 Panicking Accessors: `unwrap` and `unwrap_err`
+
+`unwrap` and `unwrap_err` take the payload out of a `Result` or an `Option`. When the value holds the other arm, they panic. The panic message shows the value that was there, so the arm a method panics on must implement `Debug` (§3.6.1 *Debug vs Display*). The methods are built in and behave as if declared:
+
+```blink
+impl[T, E] Result[T, E] where E: Debug {
+    fn unwrap(self) -> T        // panics on Err(e)
+}
+
+impl[T, E] Result[T, E] where T: Debug {
+    fn unwrap_err(self) -> E    // panics on Ok(v)
+}
+
+impl[T] Option[T] {
+    fn unwrap(self) -> T        // panics on None; no bound, None holds no value
+}
+```
+
+**The rule.** A `Result` or `Option` method that panics on an arm requires `Debug` on that arm's payload type. The rule applies to every such method, including any method added in a later version. A form that never panics carries no bound: `unwrap_or`, `unwrap_or_else`, `?`, `??` and `match`.
+
+**Checked at the call.** The compiler checks the bound at each call against the receiver's type. A missing `Debug` is `error[TraitBoundNotSatisfied]` (E0306), the same code that assertions use (§2.20 *Built-in Assertions*). A generic function does not get the bound from its body. A function that calls `.unwrap()` on a `Result[T, E]` with a type parameter `E` declares `E: Debug` itself:
+
+```blink
+fn first_ok[T, E: Debug](results: List[Result[T, E]]) -> T {
+    results.get(0).unwrap().unwrap()
+}
+```
+
+There is no placeholder. A program that could print a value it cannot render does not compile.
+
+**Panic message.** The text after the prefix is exactly `debug()` of the payload:
+
+| Call | Panics on | Message |
+|------|-----------|---------|
+| `r.unwrap()` | `Err(e)` | `unwrap called on Err: ` followed by `e.debug()` |
+| `r.unwrap_err()` | `Ok(v)` | `unwrap_err called on Ok: ` followed by `v.debug()` |
+| `o.unwrap()` | `None` | `unwrap called on None` |
+
+This text is normative, so a test can match it with `assert_panics` (§2.20):
+
+```blink
+@derive(Debug)
+type ParseError {
+    Empty
+    BadDigit(ch: Char)
+}
+
+test "unwrap shows the error" {
+    let r: Result[Int, ParseError] = Err(ParseError.BadDigit('x'))
+    assert_panics(matching: "unwrap called on Err: BadDigit('x')") {
+        let _ = r.unwrap()
+    }
+}
+```
+
+The runtime may add a lead-in such as `panic: ` and a location suffix such as ` at main.bl:12`. Those parts are not normative; do not match on them. A change to the `Debug` format of a type (§3.6.1) also changes this message.
+
+**Diagnostic.** The primary span is the `.unwrap()` call. When the payload type is a type parameter, a secondary label points at its binder. The help lists the fixes in this order:
+
+1. Add `@derive(Debug)` to the type, or `: Debug` to the binder. The compiler offers the `@derive(Debug)` fix only for a type the user declares. It never offers it for a stdlib type or a type from another package.
+2. Use `match` and call `panic` with a message.
+3. Use `unwrap_or` or `unwrap_or_else` when the code must not panic. This changes behavior.
+
+```
+error[E0306]: trait bound not satisfied
+ --> src/config.bl:8:16
+   |
+ 8 |     let port = parse_port(raw).unwrap()
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^ `PortError` does not implement `Debug`
+   |
+   = note: `unwrap` panics on `Err` and shows the error with `debug()`
+   = help: add `@derive(Debug)` to `PortError`
+   = help: or use `match` and call `panic` with a message
+   = help: or use `unwrap_or` to give a default (this does not panic)
+```
+
+The stdlib error types, such as `ConversionError`, `FsError`, `DBError` and `NetError`, implement `Debug`, so `.unwrap()` on a stdlib `Result` compiles. Their `Display` impls stay.

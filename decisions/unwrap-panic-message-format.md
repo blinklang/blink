@@ -4,6 +4,8 @@
 
 ### Status
 
+**Superseded** by [unwrap-panic-debug-bound.md](unwrap-panic-debug-bound.md): the panel voted 6-0 for a `Debug` bound on the arm `unwrap` / `unwrap_err` panic on, rendering with `debug()` and no `<TypeName>` placeholder. The text below records the older interim behavior.
+
 Additive implementation decision (no panel, no spec edit). Recorded here because
 it pins a user-observable runtime string; see "No spec contract" below for why
 this is a decision rather than a spec change.
