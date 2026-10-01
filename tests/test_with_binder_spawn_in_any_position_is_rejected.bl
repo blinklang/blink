@@ -1,0 +1,165 @@
+// A spawn that captures a `with ... as` binding is rejected wherever the spawn is written
+// (§2.8, E0601): inside a labelled argument, a spread, a handler method or a channel's
+// buffer expression, the same as in a positional argument. The same spawns over a plain
+// `let` stay legal, and a handler method keeps its own bindings.
+
+import compile_test_helpers
+
+fn handler_prelude() -> Str {
+    #"
+import std.traits
+type Ctx { v: Int }
+type BH { x: Int }
+impl BlockHandler for BH {
+    type Context = Ctx
+    fn enter(self) -> Ctx { Ctx { v: 1 } }
+    fn exit(self, ok: Bool) { }
+}
+"#
+}
+
+fn expect_scoped_escape(src: Str, tag: Str) {
+    let out = compile_test_helpers.compile_and_capture(handler_prelude().concat(src), tag)
+    compile_test_helpers.expect_error(out, "E0601", "{tag}: spawn capturing the binding is E0601")
+    compile_test_helpers.expect_contains(out, "CloseableEscapesScope", "{tag}: reported as CloseableEscapesScope")
+}
+
+// expect_compiles_clean does not count an internal compiler error, so this checks for one.
+fn expect_clean(src: Str, tag: Str) {
+    let out = compile_test_helpers.compile_and_capture(handler_prelude().concat(src), tag)
+    compile_test_helpers.expect_compiles_clean(out, "{tag}: compiles with no error")
+    let ice = out.contains("\"severity\":\"ice\"")
+    if ice { io.println("FAIL: {tag}: internal compiler error") }
+    assert(!ice)
+}
+
+test "a spawn in a labelled argument that captures the binding is rejected" {
+    expect_scoped_escape(#"
+fn run(-- h: Handle[Int]) -> Int { h.await }
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let _n = run(h: async.spawn(fn() { ctx.v }))
+        }
+    }
+}
+"#, "_walkpos_named_arg")
+}
+
+test "a spawn in a list spread that captures the binding is rejected" {
+    expect_scoped_escape(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let hs = [..[async.spawn(fn() { ctx.v })]]
+            assert_eq(hs.len(), 1)
+        }
+    }
+}
+"#, "_walkpos_spread")
+}
+
+test "a spawn in a handler method that captures the binding is rejected" {
+    expect_scoped_escape(#"
+effect Cnt {
+    effect Get {
+        fn get(i: Int) -> Int
+    }
+}
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let hd = handler Cnt {
+                fn get(i: Int) -> Int {
+                    let h = async.spawn(fn() { ctx.v })
+                    h.await + i
+                }
+            }
+            with hd { assert_eq(cnt.get(0), 1) }
+        }
+    }
+}
+"#, "_walkpos_handler")
+}
+
+test "a spawn in a channel buffer expression that captures the binding is rejected" {
+    expect_scoped_escape(#"
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let ch = channel.new[Int](buffer: async.spawn(fn() { ctx.v }).await)
+            ch.send(1)
+        }
+    }
+}
+"#, "_walkpos_channel_buffer")
+}
+
+test "spawns over a plain let in each position compile" {
+    expect_clean(#"
+fn run(-- h: Handle[Int]) -> Int { h.await }
+effect Cnt {
+    effect Get {
+        fn get(i: Int) -> Int
+    }
+}
+fn main() {
+    let n = 1
+    async.scope {
+        let _a = run(h: async.spawn(fn() { n }))
+        let hs = [..[async.spawn(fn() { n })]]
+        assert_eq(hs.len(), 1)
+        let hd = handler Cnt {
+            fn get(i: Int) -> Int {
+                let h = async.spawn(fn() { n })
+                h.await + i
+            }
+        }
+        with hd { assert_eq(cnt.get(0), 1) }
+        let ch = channel.new[Int](buffer: async.spawn(fn() { n }).await)
+        ch.send(1)
+    }
+}
+"#, "_walkpos_plain_let")
+}
+
+test "a handler method may read the binding without spawning" {
+    expect_clean(#"
+effect Cnt {
+    effect Get {
+        fn get(i: Int) -> Int
+    }
+}
+fn main() {
+    with BH { x: 0 } as ctx {
+        let hd = handler Cnt {
+            fn get(i: Int) -> Int { ctx.v + i }
+        }
+        with hd { assert_eq(cnt.get(0), 1) }
+    }
+}
+"#, "_walkpos_handler_reads")
+}
+
+test "a handler method parameter named like the binding is its own value" {
+    expect_clean(#"
+effect Cnt {
+    effect Get {
+        fn get(ctx: Int) -> Int
+    }
+}
+fn main() {
+    with BH { x: 0 } as ctx {
+        async.scope {
+            let hd = handler Cnt {
+                fn get(ctx: Int) -> Int {
+                    let h = async.spawn(fn() { ctx })
+                    h.await
+                }
+            }
+            with hd { assert_eq(cnt.get(ctx.v), 1) }
+        }
+    }
+}
+"#, "_walkpos_handler_param")
+}
