@@ -385,7 +385,7 @@ io.println("Found {count}")  // prints the actual count, not 0
 
 **Immutable captures.** For `let` bindings, shared reference is observationally equivalent to by-value copy — the value never changes, so there is no difference. The optimizer may inline or copy the value freely.
 
-**Mutable captures.** For `let mut` bindings, mutations through the closure are visible in the enclosing scope and vice versa. The compiler heap-allocates (boxes) the mutable binding into a shared cell so closure and outer scope share it. Escape analysis eliminates this boxing when the closure does not outlive the enclosing scope.
+**Mutable captures.** For `let mut` bindings, mutations through the closure are visible in the enclosing scope and vice versa. The compiler heap-allocates (boxes) the mutable binding into a shared cell (§3.6 *Shared cells*) so closure and outer scope share it. Escape analysis eliminates this boxing when the closure does not outlive the enclosing scope.
 
 ```blink
 let mut total = 0
@@ -2095,7 +2095,7 @@ fn main() {
 
 #### Assignment places
 
-A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. A field path holds only names, so it has no sub-expressions that have effects or can fail. `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost.
+A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. A field path holds only names, so it has no sub-expressions that have effects or can fail. `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost. Storage the compiler shares between values is never a place. A feature that adds places must keep that rule (§3.6.1 *Clone Semantics*).
 
 ```blink
 type Stats {

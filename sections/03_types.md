@@ -318,7 +318,7 @@ let mut form = Form { tags: List.new() }
 form.tags.push("new")                           // OK — root `form` is mut
 ```
 
-**Why `Type.new()` + `let mut`.** Mutability is a property of the *binding*, not the *type*. `List[T]` is one type regardless of whether the binding is mutable — no `MutList`/`ImmutableList` split, no doubled API surface, no coercion rules at function boundaries. `mut` marks every place where a mutation starts: each mutating call and each assignment names a `let mut` binding or a `mut` parameter. It does not mark every value that changes. Collections are shared cells, so an immutable name can observe a change made through a `mut` alias:
+**Why `Type.new()` + `let mut`.** Mutability is a property of the *binding*, not the *type*. `List[T]` is one type regardless of whether the binding is mutable — no `MutList`/`ImmutableList` split, no doubled API surface, no coercion rules at function boundaries. `mut` marks every place where a mutation starts: each mutating call and each assignment names a `let mut` binding or a `mut` parameter. It does not mark every value that changes. Collections are shared cells (§3.6 *Shared cells*), so an immutable name can observe a change made through a `mut` alias:
 
 ```blink
 let a = [1, 2]
@@ -1802,7 +1802,7 @@ The set of names that may not be declared at all, and the rule for a declaration
 
 #### Recursive Types
 
-Types can reference themselves. The compiler handles the indirection:
+Types can reference themselves. The compiler handles the indirection, and no program can see it: a recursive field is a value like any other, and a copy of it follows §3.6.1 *Clone Semantics*.
 
 ```blink
 type Tree {
@@ -2443,7 +2443,15 @@ error[SelfNotConstructor]: `Self` is not a constructor
 
 A method cannot change its caller's value through `self`. State that must persist across calls lives in a `let mut` binding captured by a closure or handler (§2.8, §4.7). An assignment to a field of `self`, or of any parameter, is a compile error (see *Mutable Parameters*).
 
-Passing or binding a struct copies its fields. A field whose value is a shared cell — a `List`, `Map` or `Set`, or a closure or handler that captured a `let mut` binding — refers to the same cell after the copy. After `let mut b = a` and `b.x = 2`, `a.x` is unchanged; after `b.xs.push(5)`, `a.xs` holds the new element too.
+**Shared cells.** Passing or binding a struct copies its fields. A field whose value is a shared cell refers to the same cell after the copy. After `let mut b = a` and `b.x = 2`, `a.x` is unchanged; after `b.xs.push(5)`, `a.xs` holds the new element too. The shared cells are:
+
+- `List`, `Map` and `Set`
+- `StringBuilder`
+- a closure or handler that captured a `let mut` binding (§2.8, §4.7)
+
+This list is the only one; other sections refer to it. It does not yet say whether a `Channel` or an effect handle is a shared cell.
+
+Only a shared cell can change through a second name. A value of any other type, at any depth, cannot. This holds for every copy: bind, pass, return and `clone()` (§3.6.1 *Clone Semantics*).
 
 #### Mutable Parameters
 
@@ -3160,12 +3168,26 @@ For reference, the eight derivable traits and their required methods:
 
 ##### Clone Semantics
 
-`Clone` performs a **logical copy** (one-level deep): allocate a new struct or enum wrapper, copy field values. GC pointers are copied, not recursively cloned.
+`clone()` on a struct or enum equals a copy on bind. Shared cells (§3.6 *Shared cells*) stay shared; a clone does not copy their contents. `Clone` exists so generic code with a `T: Clone` bound can copy a value.
 
-- **Value types** (`Int`, `Float`, `Bool`, `Char`): value copy (trivial)
-- **`Str`**: new GC root to same string data (strings are immutable, sharing is safe)
-- **Collections** (`List`, `Map`, `Set`): new GC root to same backing storage. Mutations to a cloned collection **do** affect the original — same semantics as JS spread (`{...obj}`) or Python `copy.copy()`
-- **User structs/enums**: field-wise value copy via derived `Clone`
+- **Value types** (`Int`, `Float`, `Bool`, `Char`, `Str`): a copy of the value. A `Str` cannot change, so no program can see whether a copy shares its bytes.
+- **`List`, `Map`, `Set` and other shared cells** (§3.6 *Shared cells*): the clone refers to the same cell. A change made through the clone **does** show in the original — the same as JS spread (`{...obj}`) or Python `copy.copy()`.
+- **User structs and enums**: `x.clone()` gives the same value as `let y = x`. Each field is copied by its declared type, using the rules above. A field whose declared type is a struct or enum is a value, and its copy is a value too, even when the compiler stores that field out of line (for example, a payload of the enum's own type, §3.4 *Recursive Types*). No program can see whether such storage is shared, because a payload field is not a place (§2.22 *Assignment places*). The compiler may share it.
+
+**Shared storage stays out of places.** Storage the compiler shares between values is never inside a place (§2.22). A feature that would put it inside one must copy that storage before the write, or reject the write.
+
+> **Note (not normative).** Today a derived `clone()` of a struct or enum is one value copy and does not allocate.
+
+```blink
+@derive(Clone)
+type Tree {
+    Leaf
+    Node(value: Int, next: Tree)
+}
+
+let a = Tree.Node(value: 1, next: Tree.Leaf)
+let b = a.clone()          // same value as `let b = a`
+```
 
 Deep clone is not provided in v1. A `DeepClone` trait can be added post-v1 for use cases requiring full structural independence.
 
@@ -3478,7 +3500,7 @@ Per-trait product type rules:
 | `Eq` | `self.f1.eq(other.f1) && self.f2.eq(other.f2) && ...` |
 | `Ord` | Lexicographic: compare `f1`, if `Equal` compare `f2`, ... |
 | `Hash` | Combine field hashes with mixing: `hash(f1) ^ hash(f2) ^ ...` |
-| `Clone` | `Type { f1: self.f1, f2: self.f2, ... }` (value copy, no recursive clone) |
+| `Clone` | `Type { f1: self.f1, f2: self.f2, ... }`: the same value as a copy on bind (§3.6.1 *Clone Semantics*) |
 | `Display` | `fmt`: `sb.write(self.f1); sb.write(", "); sb.write(self.f2); ...` (comma-separated, push-style) |
 | `Debug` | `"TypeName { f1: {f1.debug()}, f2: {f2.debug()}, ... }"` |
 
@@ -3526,7 +3548,7 @@ Per-trait sum type rules:
 | `Eq` | Match variant pairs; field-wise eq within same variant; `_ => false` for mismatched variants |
 | `Ord` | Compare variant index first; if same variant, field-wise lexicographic comparison |
 | `Hash` | Hash variant index, then hash fields of data-carrying variants |
-| `Clone` | Match + reconstruct variant with copied field values |
+| `Clone` | The same value as a copy on bind (§3.6.1 *Clone Semantics*) |
 | `Display` | Variant name for unit variants; `"Variant(f1, f2)"` for data-carrying. Exception: a Str-backed enum writes its backing literal, so the output equals `to_str()` (§3.4 *Str-Backed Enums*) |
 | `Debug` | `"Variant"` for unit variants; `"Variant({f1.debug()}, {f2.debug()})"` for data-carrying |
 

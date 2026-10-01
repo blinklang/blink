@@ -1088,7 +1088,7 @@ with handler_expression {
 }
 ```
 
-A `handler E { ... }` expression captures bindings from its enclosing scope exactly as a closure does (§2.8). A captured `let mut` binding is a shared cell: writes in a handler op are visible to the enclosing scope and to any closure that captured the same binding. This differs from `BlockHandler` block bodies (§4.6.3), which run in the caller's scope and capture nothing. The `std.testing` mock controllers (§8.10.3) depend on this rule.
+A `handler E { ... }` expression captures bindings from its enclosing scope exactly as a closure does (§2.8). A captured `let mut` binding is a shared cell (§3.6 *Shared cells*): writes in a handler op are visible to the enclosing scope and to any closure that captured the same binding. This differs from `BlockHandler` block bodies (§4.6.3), which run in the caller's scope and capture nothing. The `std.testing` mock controllers (§8.10.3) depend on this rule.
 
 #### Testing: mock handlers
 
