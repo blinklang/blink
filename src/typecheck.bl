@@ -16226,6 +16226,177 @@ fn tc_type_name(tid: Int) -> Str {
     ty_pool.get(tid).unwrap().name
 }
 
+// What `==` needs of a type, read through every type it is built from (03_types.md,
+// *Container Equality*). `missing` runs from the type asked to the innermost type with
+// no `Eq`, and is empty when the type is `Eq`. `unbuilt` marks a type that is `Eq` by
+// the spec but whose `==` code generation cannot lower yet: comparing it would compile
+// to an identity compare or a compiler crash, so it is refused until that lands.
+type EqNeed {
+    missing: List[Int]
+    unbuilt: Bool
+}
+
+fn eq_need_met(unbuilt: Bool) -> EqNeed {
+    EqNeed { missing: [], unbuilt: unbuilt }
+}
+
+fn eq_need_through(tid: Int, inner: EqNeed) -> EqNeed {
+    let mut path: List[Int] = [tid]
+    for t in inner.missing { path.push(t) }
+    EqNeed { missing: path, unbuilt: inner.unbuilt }
+}
+
+// A type built from `parts` is `Eq` when every part is. The first part with no `Eq`
+// is the one reported, so the chain names a single innermost type.
+fn tc_eq_need_parts(tid: Int, parts: List[Int], visiting: List[Int], unbuilt: Bool) -> EqNeed {
+    let mut any_unbuilt = unbuilt
+    for p in parts {
+        let need = tc_eq_need(p, visiting)
+        if need.missing.len() > 0 { return eq_need_through(tid, need) }
+        if need.unbuilt { any_unbuilt = true }
+    }
+    eq_need_met(any_unbuilt)
+}
+
+// The interim enum rule: an enum with an `Eq` impl or derive is `Eq`, one with no
+// payloads is `Eq`, and any other is `Eq` only if every payload type is. Payloads are
+// read at the instance, so `Tree[Widget]` asks about `Widget`, not `T`. An enum already
+// being walked counts as `Eq`, which lets a self-recursive enum answer from its other
+// payloads.
+fn tc_eq_need_enum(tid: Int, visiting: List[Int]) -> EqNeed {
+    let base = tc_enum_base_tid(tid)
+    if tc_type_has_eq_impl(strip_module_qualifier(tc_type_name(base))) != 0 { return eq_need_met(false) }
+    if !tc_enum_has_payload(base) { return eq_need_met(false) }
+    if visiting.contains(base) { return eq_need_met(false) }
+    let inst = if base == tid { -1 } else { tid }
+    let mut parts: List[Int] = []
+    for vslot in tc_enum_variant_slots(base) {
+        for fslot in tc_evar_field_slots(vslot) {
+            parts.push(tc_member_tid_at_instance(tc_evfield_tid(fslot), inst))
+        }
+    }
+    let mut inner: List[Int] = []
+    for v in visiting { inner.push(v) }
+    inner.push(base)
+    tc_eq_need_parts(tid, parts, inner, true)
+}
+
+fn tc_eq_need(tid0: Int, visiting: List[Int]) -> EqNeed {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 { return eq_need_met(false) }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TyKind.Option || k == TyKind.List { return tc_eq_need_parts(tid, [t.inner1], visiting, k == TyKind.List) }
+    if k == TyKind.Result { return tc_eq_need_parts(tid, [t.inner1, t.inner2], visiting, false) }
+    // A Set element is `Hash`, and `Hash` requires `Eq`, so a Set is always `Eq`.
+    if k == TyKind.Set { return eq_need_met(true) }
+    // A Map key is `Hash` as well, so only the value type can lack `Eq`.
+    if k == TyKind.Map { return tc_eq_need_parts(tid, [t.inner2], visiting, true) }
+    if k == TyKind.Tuple {
+        let mut elems: List[Int] = []
+        let mut i = 0
+        while i < t.params_count {
+            elems.push(ty_param_list.get(t.params_start + i).unwrap())
+            i = i + 1
+        }
+        return tc_eq_need_parts(tid, elems, visiting, true)
+    }
+    if k == TyKind.Enum { return tc_eq_need_enum(tid, visiting) }
+    if k == TyKind.Struct {
+        if tc_type_has_eq_impl(strip_module_qualifier(tc_type_name(tc_struct_base_tid(tid)))) != 0 { return eq_need_met(false) }
+        return EqNeed { missing: [tid], unbuilt: false }
+    }
+    if k == TyKind.Typevar {
+        // "" is a name that is not an active type parameter (a builtin lowered to a
+        // typevar); it passes, as reject_unlicensed_comparison lets it pass.
+        let traits = tc_tparam_bound_traits(type_to_str(tid))
+        if traits == "" || tc_pipe_has(traits, "Eq") != 0 || tc_pipe_has(traits, "Ord") != 0 { return eq_need_met(false) }
+        return EqNeed { missing: [tid], unbuilt: false }
+    }
+    if tc_kind_is_plain_eq(k) { return eq_need_met(false) }
+    EqNeed { missing: [tid], unbuilt: false }
+}
+
+// Kinds that are `Eq` with no parts to ask about. Void, Unknown and Never carry no
+// value to compare, so they pass rather than stack a second report on an earlier one.
+fn tc_kind_is_plain_eq(k: TyKind) -> Bool {
+    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Float || k == TyKind.Char { return true }
+    if k == TyKind.Str || k == TyKind.Bytes || is_sized_int(k) != 0 { return true }
+    k == TyKind.Void || k == TyKind.Unknown || k == TyKind.Never
+}
+
+// The kinds whose `==` this check decides: the containers, and the nominal types whose
+// `Eq` comes from an impl, a derive, or (for an enum) its payloads.
+fn tc_kind_takes_eq_need(k: TyKind) -> Bool {
+    if k == TyKind.Option || k == TyKind.Result || k == TyKind.List || k == TyKind.Set { return true }
+    k == TyKind.Map || k == TyKind.Tuple || k == TyKind.Enum || k == TyKind.Struct
+}
+
+fn tc_is_none_lit(node: Int) -> Bool {
+    node != -1 && node_kind(node) == NodeKind.Ident && node_name(node) == "None"
+}
+
+fn tc_eq_need_help(leaf: Int, op: Str, node: Int) -> Str {
+    let mut lines: List[Str] = []
+    let lhs = node_left(node)
+    let rhs = node_right(node)
+    let other = if tc_is_none_lit(rhs) { lhs } else if tc_is_none_lit(lhs) { rhs } else { -1 }
+    if other != -1 {
+        let call = if op == "==" { "is_none" } else { "is_some" }
+        if node_kind(other) == NodeKind.Ident {
+            lines.push("to test for `None`, write `{node_name(other)}.{call}()`")
+        } else {
+            lines.push("to test for `None`, call `.{call}()`")
+        }
+    }
+    let k = type_kind(leaf)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
+        lines.push("add `@derive(Eq)` to `type {strip_module_qualifier(tc_type_name(base))}`")
+    }
+    if k == TyKind.Typevar { lines.push("add the bound `[{type_to_str(leaf)}: Eq]`") }
+    lines.join("\n")
+}
+
+// `==` and `!=` need `Eq` on the operand type, recursively. Returns 1 when it reported,
+// so the caller does not stack an "incompatible types" error on the same comparison.
+// Operands of different shapes are left to the caller's own type match.
+fn reject_eq_less_operands(op: Str, lt: Int, rt: Int, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    let a = resolve_alias_tid(tc_resolve(lt))
+    let b = resolve_alias_tid(tc_resolve(rt))
+    let k = type_kind(a)
+    if k != type_kind(b) || !tc_kind_takes_eq_need(k) { return 0 }
+    if k == TyKind.Enum && tc_enum_base_tid(a) != tc_enum_base_tid(b) { return 0 }
+    if k == TyKind.Struct && tc_struct_base_tid(a) != tc_struct_base_tid(b) { return 0 }
+    if types_compatible(a, b) == 0 { return 0 }
+    // A bare `None` operand types as `Option` over an unknown, which asks nothing, so
+    // the other side is asked too.
+    let mut asked = a
+    let mut need = tc_eq_need(a, [])
+    if need.missing.len() == 0 && !need.unbuilt {
+        asked = b
+        need = tc_eq_need(b, [])
+    }
+    if need.missing.len() > 0 {
+        let path = need.missing
+        let mut notes: List[Str] = []
+        let mut i = 0
+        while i + 1 < path.len() {
+            notes.push("`{type_to_str(path.get(i).unwrap())}` is `Eq` only if `{type_to_str(path.get(i + 1).unwrap())}` is `Eq`")
+            i = i + 1
+        }
+        diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `Eq`", node,
+            tc_eq_need_help(path.get(path.len() - 1).unwrap(), op, node), notes)
+        return 1
+    }
+    if need.unbuilt {
+        diag_error_at("TypeError", TYPE_ERROR, "`{op}` on `{type_to_str(asked)}` is not supported yet", node,
+            "compare the parts one at a time until `{op}` on this type is built")
+        return 1
+    }
+    0
+}
+
 // The spec enum-vs-Int comparison exception (03_types.md:1093). An
 // enum value stays comparable to an Int (shared tag representation), in EITHER
 // operand order. This is what keeps the compiler's own `node_kind(x) ==
@@ -16286,8 +16457,9 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
     // Str: full Eq + Ord.
     if ka == TyKind.Str && kb == TyKind.Str { return 1 }
 
-    // Option[T]: codegen only lowers ==/!= on matching inner; relational is rejected.
-    if ka == TyKind.Option && kb == TyKind.Option {
+    // Option and Result have no Ord. Whether their parts have Eq is decided by
+    // reject_eq_less_operands, which the caller runs first.
+    if (ka == TyKind.Option && kb == TyKind.Option) || (ka == TyKind.Result && kb == TyKind.Result) {
         if relational != 0 { return 0 }
         return types_compatible(a, b)
     }
@@ -17053,7 +17225,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
                     if lit_r == 0 && lit_l == 0 {
                         let relational = if op == "==" || op == "!=" { 0 } else { 1 }
-                        if cmp_operands_ok(lt, rt, relational) == 0 {
+                        let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { 0 }
+                        if refused == 0 && cmp_operands_ok(lt, rt, relational) == 0 {
                             // Operands that pass as an equality pair fail only for want of Ord.
                             // Name the side without it: `1 < true` lacks Ord on the Bool.
                             if relational != 0 && cmp_operands_ok(lt, rt, 0) != 0 {
