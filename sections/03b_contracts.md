@@ -627,9 +627,12 @@ warning[RawBypassesParam]: Raw() bypasses parameterization
   |                                  ^^^^^^^^^^ concatenated into the query text, not parameterized
   |
   = help: if `table` comes from user input, parameterize it instead: `{table}`
-  = help: if this value is known-safe, record the review:
-          add @trusted(audit: "AUDIT-ID") to the enclosing function
+  = help: only if no parameterized form exists, record the review: add
+          @trusted(audit: "AUDIT-ID") to the enclosing function; it needs a
+          record `AUDIT-ID` in audits.toml
 ```
+
+Neither help line is machine-applicable, and the second is never offered as a quick fix. The record holds the author's claim that the value cannot carry an injection; §9.1 *Audit Records* says what the record must hold and when its pin lapses.
 
 The warning does **not** fire on an ordinary interpolated string, because an ordinary string contains no `Raw[T]`. That is what making the marker a type buys: the trigger is the value's type, so it is neither defeated by binding the value to a variable first nor raised by a string that merely mentions the word.
 

@@ -82,7 +82,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | NoConversionImpl | E0312 | A conversion has no impl: `x.into()` and `T.from(x)` need `impl From[S] for T`, `T.try_from(x)` needs `impl TryFrom[S] for T`, with S the source's type (an alias is the type it names). Every type converts to itself. Repair: declare the impl, or use the named conversion (`.to_float()`, `.truncate()`, `.to_int_checked()`, `try_from`, `.to_string()`) | Type checking | §3c |
 | NoIndexOperator | E0313 | A postfix `[...]` holds a value (`xs[1]`, `m["k"]`, `fns[0](x)`). Blink has no index operator. Decided by the bracket contents at name resolution, whether or not a call follows. Repair: `.get()` (returns `Option`), or `.0` for a tuple; no machine fix when a call follows. A store `xs[i] = v` is the same error: repair `.set(i, v)` (List, Bytes) or `.insert(k, v)` (Map), never `.insert` for a List | Name resolution | §3.4, §2.22 |
 | TypeArgsWithoutCall | E0314 | A well-formed type-argument list with no call `(` or literal `{` after it (`let f = identity[Int]`). First help: remove the brackets when an expected type fixes the same arguments; annotate the binding when there is no expected type; no machine fix when they conflict | Type checking | §3.4 |
-| UndeclaredEffect | E0500 | Callee requires effect not declared by caller | Effects | §4.5 |
+| UndeclaredEffect | E0500 | Callee requires effect not declared by caller. The declared row of an `@ffi` callee counts like any other row | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | QuestionMarkInvalidOperand | E0502 | `?` operator used on non-Result, non-Option type | Type checking | §3c.2 |
 | UndefinedFunction | E0504 | Call to undefined function | Name resolution | §6.3 |
@@ -110,6 +110,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | EffectTypeAsValue | E0535 | An effect's type is written as the type of a value (`fn f(x: DB)`, `let x: DB`); it is valid only as a type argument | Type checking | §3b.5 |
 | SubEffectAsType | E0536 | A sub-effect is written as a type (`Template[DB.Read]`); only a top-level effect gives a type | Type checking | §3b.5 |
 | JsonTextForValue | E0537 | A `Str` is passed to a `from_json` that takes `JsonValue`, or `to_json()`'s result is used as a `Str`; the fix names `json.decode[T]` / `json.encode` | Type checking | §3.6.2 |
+| UnknownEffect | E0538 | An effect row names an effect that is neither built-in nor declared. For `FFI` the help says a foreign call is not an effect and points to §9.1. No machine-applicable fix | Effects | §4.3 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | MutableCaptureInSpawn | E0650 | A closure passed to `async.spawn` captures a `let mut` binding | Closures | §2.8 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
@@ -141,6 +142,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AssertPanicsOutsideTest | E0833 | `assert_panics` called outside a test | Test runner | §2.20 |
 | AssertPanicsNestedExpectPanic | E0834 | `assert_panics` nested inside another `assert_panics` | Test runner | §2.20 |
 | XfailMissingReason | E0835 | `test.failing(...)` missing or empty `reason:` | Type checking | §8.10.6 |
+| AuditRecordNotFound | E0829 | `@trusted(audit: K)` names a `K` that has no record in the package's `audits.toml`, or whose record has an empty `claim` | FFI | §9.1 |
+| AuditRecordUnknownKey | E0830 | A record in `audits.toml` holds a key other than `claim` and `pins`. The message names the allowed keys and the nearest one | FFI | §9.1 |
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
 | FfiOffsetUnknownStride | E0838 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
@@ -237,7 +240,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | Code | Name | Implementation |
 |------|------|---------------|
 | E0004 | NonExhaustiveMatch | `typecheck.bl` — `tc_check_match_exhaustive`, on a match whose scrutinee resolves to a declared enum. Under-approximating: Int/Str/Char ranges, tuple/struct patterns and nested refutable sub-patterns contribute nothing rather than risk a false positive |
-| E0500 | UndeclaredEffect | `typecheck.bl` — `tc_check_effect_rows`, at each call to a fn or method that declares effects, each user effect operation, and each `! Arena` callee, in every fn but `main`. Not yet checked: a builtin namespace call (`io.println`), the `FFI` effect, and test blocks |
+| E0500 | UndeclaredEffect | `typecheck.bl` — `tc_check_effect_rows`, at each call to a fn or method that declares effects, each user effect operation, and each `! Arena` callee, in every fn but `main`. Not yet checked: a builtin namespace call (`io.println`), the declared row of an `@ffi` callee, and test blocks |
 | E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |
 | E0513 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |

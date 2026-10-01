@@ -25,7 +25,7 @@ The `@ffi("library", "symbol")` annotation names the shared library and the symb
 
 #### `@effects` — Manually Declared Effects
 
-Because the compiler cannot analyze foreign code, effects **must** be declared manually on FFI functions. The compiler trusts this declaration — it cannot verify it. This is the one place in Blink where effect annotations are not compiler-proven.
+Because the compiler cannot analyze foreign code, effects **must** be declared manually on FFI functions. The compiler assumes this declaration — it cannot verify it. This is the one place in Blink where an effect row is not compiler-proven (§4.5, *Proven and assumed rows*).
 
 ```blink
 @ffi("libcurl", "curl_easy_perform")
@@ -34,16 +34,42 @@ Because the compiler cannot analyze foreign code, effects **must** be declared m
 fn curl_perform(handle: Ptr[Void]) -> Int
 ```
 
-Omitting `@effects` on an `@ffi` function is a compile error. The compiler refuses to guess.
+**There is no `FFI` effect.** A foreign call is not an effect of its own. The row of an `@ffi` decl names the Blink effects the foreign code has: `Net`, `IO`, `Crypto` and so on (§4.3). Callers see that row by the usual transitivity rule (§4.5), exactly as they see the row of a Blink function. `! FFI` is not a valid row: `FFI` is not a declared effect, so it is rejected with `UnknownEffect` (E0538, §4.3).
+
+The declared row is an **accounting** claim, not routing. It says which capabilities a caller must hold to reach the foreign code. How it relates to handlers is stated once, in §4.5 *Proven and assumed rows*. When a foreign effect must be replaceable — mocked in a test, sandboxed, swapped — the safe wrapper performs it through a Blink effect operation, and a handler then replaces that operation (§4.7):
+
+```blink
+effect Clock {
+    fn now_ms() -> Int
+}
+
+@ffi("c", "blink_clock_ms")
+@effects(Time.Read)
+@trusted(audit: "TIME-001")
+fn raw_clock_ms() -> Int
+
+// The real implementation calls C; a test installs its own `handler Clock`.
+pub fn real_clock() -> Handler[Clock] {
+    handler Clock {
+        fn now_ms() -> Int {
+            raw_clock_ms()
+        }
+    }
+}
+```
+
+Omitting `@effects` on an `@ffi` function is a compile error (`FfiNoEffects`, E0802). The compiler refuses to guess. This holds for a pure binding too: a foreign function with no effects (`strlen`, `memcmp`) states that claim explicitly, so a missing row and a claimed-pure row never look the same. The spelling of the explicit pure claim is fixed with the `@effects` implementation; it must not be one that reads as an omitted row.
 
 #### `@trusted` — Audit Trail
 
-The `@trusted` annotation links to an external audit record. It signals that a human has reviewed the FFI binding for correctness (types match the C header, effects are accurate, memory safety is maintained by the wrapper).
+`@trusted(audit: K)` records a claim, by an author who may be human or agent, that the binding matches the foreign code: its types, its effect row and its memory use. The compiler assumes the claim; it does not prove it. `K` must name a record of that claim. The language promises that the record exists, not who wrote it.
+
+`audit: K` is the only argument. Authorship, dates and ticket links go in the record's `claim` text or in version control, not in the annotation. The record lives in the package's `audits.toml` (*Audit Records* below).
 
 ```blink
 @ffi("sqlite3", "sqlite3_open")
 @effects(IO)
-@trusted(audit: "DB-003", reviewer: "nhumrich", date: "2026-01-15")
+@trusted(audit: "DB-003")
 fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int
 ```
 
@@ -57,12 +83,16 @@ warning[W0800]: unaudited foreign function
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: FFI function `sqlite3_open` has no @trusted annotation
-  = help: add @trusted(audit: "AUDIT-ID") after review
+  = help: if `std.libc` already binds this symbol, call that binding instead
+  = help: after you check the binding against the C header, record the review:
+          add @trusted(audit: "AUDIT-ID") and a record `AUDIT-ID` in audits.toml
 ```
+
+Neither help line is machine-applicable. No tool writes a claim for the author (§9.1, *Audit Records*).
 
 #### Audit-Gated Diagnostics — One Channel, Stated Once
 
-A handful of diagnostics exist to force a **record**, not to report a mistake. The program they fire on is legal and may well be correct; what the language asks is that a human looked at it and said so in a place a reviewer can find. `@trusted(audit: K)` is that place, and this subsection states the mechanism once for every diagnostic that uses it. No other section restates it.
+A handful of diagnostics exist to force a **record**, not to report a mistake. The program they fire on is legal and may well be correct; what the language asks is that its author, human or agent, looked at it and wrote a claim in a place a reviewer can find. `@trusted(audit: K)` is that place, and this subsection states the mechanism once for every diagnostic that uses it. No other section restates it.
 
 **`audit:` is mandatory and non-empty.** `@trusted` without an `audit:` argument, or with an empty one, is rejected. A bare `@trusted` would silence the diagnostic and record nothing, which is the one outcome the annotation exists to prevent.
 
@@ -89,8 +119,8 @@ fn sqlite3_close(db: Ptr[Void]) -> Int
 
 | Diagnostic | What the record is for |
 |------------|------------------------|
-| `UnauditedFfi` (W0800) | A human checked this foreign binding against the C header |
-| `RawBypassesParam` | A human checked this un-parameterized interpolation for injection |
+| `UnauditedFfi` (W0800) | The author claims this foreign binding matches the C header: types, effect row, memory use |
+| `RawBypassesParam` (W0310) | The author claims this un-parameterized interpolation cannot carry an injection |
 
 **Membership criterion.** A diagnostic belongs on this list **only when silently suppressing it would destroy a record the language promises exists**. That is the whole gate. A diagnostic an author merely finds noisy does not qualify, however strongly; the list is not a place to park warnings someone wants to be unignorable.
 
@@ -99,6 +129,98 @@ fn sqlite3_close(db: Ptr[Void]) -> Int
 **Every position that can raise one of these can annotate.** `test` blocks are annotatable, so a diagnostic raised inside one has somewhere to attach. An audit-gated diagnostic must never fire in a position from which its own repair cannot be written (§3.1).
 
 **This removes a capability that works today.** `@allow` currently reaches these warnings. Narrowing it is a breaking change, not a clarification, and release notes should say so in those words.
+
+#### Audit Records — `audits.toml`
+
+`K` in `@trusted(audit: K)` is not free text. It names a record in the package's **`audits.toml`**, a TOML file at the package root, next to `blink.toml`. Every package has its own: the standard library has one, and each dependency ships its own. A package resolves `K` only against its own file.
+
+A record is a TOML table keyed by `K`. It holds exactly two keys:
+
+- `claim` — required, non-empty text. What the author claims and why it holds. Ticket links and authorship go here when a team wants them.
+- `pins` — a table from the path of each function that carries `@trusted(audit: K)` to that function's pin.
+
+```toml
+# audits.toml
+[DB-003]
+claim = "Checked against sqlite3.h 3.45: two pointer params, int return, file IO only. The wrapper passes a NUL-terminated path from Str.as_cstr() and a fresh out-cell."
+pins = { "db.sqlite.sqlite3_open" = "ast1:3f9c0a4e1b7d" }
+
+[RPT-002]
+claim = "table is checked against REPORT_TABLES in the same function before Raw()."
+pins = { "report.fetch_table" = "ast1:c08e51aa2d90" }
+```
+
+**A pin covers one whole function.** The pin is a hash of the function's syntax tree: its signature, its effect row and its body. It ignores formatting and comments, so `blink fmt` and a comment edit never make a pin stale. An `@ffi` decl has no body, so its pin covers only its signature and row. Pins are opaque: `blink audit pin` writes them, and nobody edits them by hand.
+
+The pin covers the function's own body and nothing else. A guard in a **caller** is outside every pin: deleting it changes no pin, and the claim can become false with no warning. Keep the guard inside the audited function, and keep that function small:
+
+```blink
+pub fn fetch_table(table: Str) -> Result[List[Row], DBError] ! DB.Read {
+    if !REPORT_TABLES.contains(table) {
+        return Err(DBError.PermissionDenied("unknown table {table}"))
+    }
+    db.query("SELECT * FROM {Raw(table)}")
+}
+```
+
+Give `fetch_table` the annotation `@trusted(audit: "RPT-002")` and the record above. When someone later deletes the `contains` check, the pin no longer matches and `RawBypassesParam` fires again. If the guard were in the caller, the same deletion would leave the pin unchanged.
+
+**How a suppression applies.** `@trusted(audit: K)` on a function `f` suppresses an audit-gated diagnostic in `f` only when all three hold:
+
+1. `audits.toml` has a record `K` with a non-empty `claim`;
+2. that record has a pin for `f`;
+3. the pin equals the current hash of `f`.
+
+The compiler checks this in `blink check`, `blink build` and the LSP. The rule applies to every `@trusted(audit: K)`, whatever diagnostic it is for, including `ScopedValueWithoutWith` (§5).
+
+**A missing record is an error.** When `audits.toml` has no record `K`, or record `K` has an empty `claim`, the annotation is rejected:
+
+```
+error[AuditRecordNotFound]: no audit record `DB-003`
+ --> db/sqlite.bl:3:1
+  |
+3 | @trusted(audit: "DB-003")
+  |                 ^^^^^^^^ no record `DB-003` in audits.toml
+  |
+  = help: add a `[DB-003]` table with a non-empty `claim` to audits.toml,
+          then run `blink audit pin DB-003`
+```
+
+**A stale or missing pin is not an error.** When record `K` exists but has no pin for `f`, or its pin for `f` does not match, the suppression lapses: the original diagnostic fires again, with a note that names `K` and the reason. No new diagnostic code is involved.
+
+```
+warning[RawBypassesParam]: Raw() bypasses parameterization
+ --> report.bl:5:30
+  |
+5 |     db.query("SELECT * FROM {Raw(table)}")
+  |                              ^^^^^^^^^^ concatenated into the query text, not parameterized
+  |
+  = note: `report.fetch_table` changed since audit record `RPT-002` was pinned
+  = help: re-read the claim in `RPT-002`; if it still holds, run `blink audit pin RPT-002 report.fetch_table`
+```
+
+`blink audit --require-all` treats a lapsed suppression as unaudited, so CI fails on it.
+
+**The schema is closed.** A key other than `claim` and `pins` in a record is an error, `AuditRecordUnknownKey`. It names the allowed keys and suggests the nearest one:
+
+```
+error[AuditRecordUnknownKey]: unknown key `claims` in audit record `DB-003`
+ --> audits.toml:2:1
+  |
+2 | claims = "checked against sqlite3.h"
+  | ^^^^^^ a record holds only `claim` and `pins`
+  |
+  = help: did you mean `claim`?
+  = note: put ticket links and authorship in the `claim` text; version control records who wrote it
+```
+
+**Who writes what.** The author writes `claim` by hand. `blink audit pin K [fn]` writes pins only:
+
+- It refuses when `audits.toml` has no record `K`, or when its `claim` is empty.
+- With `fn`, it pins that function. Without it, it pins every function that carries `@trusted(audit: K)`.
+- It prints the existing claim before it writes, so the author re-reads what the pin vouches for.
+
+No command re-pins more than one record at a time, and no autofix writes a claim. A command may list stale pins, but it never re-pins them in bulk. A re-pin is therefore always visible in review: the diff shows the function change and, beside it, a pin change under an unchanged claim.
 
 #### Mandatory Safe Wrappers
 
@@ -186,7 +308,9 @@ Raw Query Summary: 2 raw queries across 1 module
 Raw query audit coverage: 1/2 (50%)
 ```
 
-This output is structured JSON when `--json` is passed. CI pipelines can enforce `blink audit --require-all` to block merges with unaudited FFI.
+This output is structured JSON when `--json` is passed. CI pipelines can enforce `blink audit --require-all` to block merges with unaudited FFI. Under `--require-all`, a `@trusted` function whose pin is stale or missing counts as unaudited (*Audit Records* above).
+
+`blink audit pin K [fn]` writes the pins of record `K` in `audits.toml`. See *Audit Records* above for what it refuses and why there is no bulk re-pin.
 
 ### 9.1.1 FFI Type Specification
 
@@ -802,7 +926,7 @@ fn read(fd: I32, n: Int) -> Result[Bytes, Str] ! IO {
 Signature:
 
 ```blink
-fn with_ptr[R](self: Bytes, body: fn(Ptr[U8]) -> R ! FFI) -> R ! FFI
+fn with_ptr[R](self: Bytes, body: fn(Ptr[U8]) -> R ! _) -> R ! _
 ```
 
 The closure body holds a `Ptr[U8]` aliasing the `Bytes`'s GC-managed `data` field. Soundness rests on three invariants:
@@ -811,7 +935,7 @@ The closure body holds a `Ptr[U8]` aliasing the `Bytes`'s GC-managed `data` fiel
 2. **The closure capture of `self` keeps the `Bytes` reachable** for the duration of the call — BDW's conservative scan sees the `blink_bytes*` on the C stack inside the inlined closure body.
 3. **The closure body must not call growth-effecting methods on `self`.** This is the closure-lexical no-grow check (§9.1.3.1 below).
 
-`Bytes.with_ptr` is `! FFI`-effected and ships in `std.bytes`. It is the only sanctioned form of Bytes→Ptr aliasing. User-code Bytes→Ptr bridges are forbidden (see Bytes Bridge Doctrine below).
+`Bytes.with_ptr` forwards the effect row of its closure (`! _`, §4.15.2): the call has exactly the effects of the `@ffi` functions the closure calls. It ships in `std.bytes`. It is the only sanctioned form of Bytes→Ptr aliasing. User-code Bytes→Ptr bridges are forbidden (see Bytes Bridge Doctrine below).
 
 ##### 9.1.3.1 Closure-lexical no-grow check
 
@@ -838,7 +962,7 @@ User code is **forbidden** from constructing a `Ptr[U8]` that aliases a `Bytes`'
 
 The sanctioned paths for Bytes ↔ FFI interop are:
 
-1. `Bytes.with_ptr(fn(p) { ... })` — closure-scoped, in-stdlib `! FFI` use only.
+1. `Bytes.with_ptr(fn(p) { ... })` — closure-scoped, for use inside an FFI region only.
 2. `libc.copy_to_buf(b: Bytes) -> Buf[U8]` — copies bytes into a freshly-allocated, scope-tied `Buf[U8]`. See §9.1.3.2 for the runtime representation, surface, and naming rules.
 3. `libc.copy_from_buf(buf: Buf[U8]) -> Bytes` — copies bytes out of a `Buf[U8]` into a fresh `Bytes`. The byte count is read from the buffer's internal length field.
 4. `libc.copy_from_buf_n(buf: Buf[U8], n: I64) -> Bytes` — truncating copy: copies up to `n` bytes (or fewer if the buffer is shorter) into a fresh `Bytes`. Used by syscalls whose return value reports the actual byte count (`read(2)`, `recv(2)`).
@@ -2305,7 +2429,7 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | `@perf(constraint)` | fn | Performance contract. Benchmark assertion, not statically provable. | `blink bench --check-contracts` |
 | `@capabilities(list)` | module | Hard ceiling on effects permitted in this module. | Compile-time effect checker |
 | `@ffi("lib", "sym")` | fn | Declares a foreign function binding. | Linker (compile-time) |
-| `@trusted(audit: "ID")` | fn (with @ffi) | Audit trail for reviewed FFI bindings. | `blink audit` tooling |
+| `@trusted(audit: "ID")` | fn | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `ID` must name a record in `audits.toml`. Never makes an `@ffi` fn `pub` (E0801). | Compile-time record check (`AuditRecordNotFound`); `blink audit` tooling |
 | `@effects(list)` | fn (with @ffi) | Manually declared effects for foreign functions. | Compile-time effect checker |
 | `@alt("ID", "desc")` | fn | Marks an alternative implementation. | Tooling (`blink alt list`, `blink alt select`) |
 | `@verify(strategy)` | fn | Hints to the SMT solver about verification strategy. | Verification engine |

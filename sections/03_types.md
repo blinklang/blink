@@ -699,7 +699,7 @@ C representation: `typedef struct { uint8_t* data; int64_t len; int64_t cap; } b
 | `set_u32_le` / `set_u32_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 4-byte unsigned at offset (in-place, bounds vs `len`) |
 | `set_i64_le` / `set_i64_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 8-byte signed at offset (in-place, bounds vs `len`) |
 | `set_u64_le` / `set_u64_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 8-byte unsigned at offset (in-place, bounds vs `len`) |
-| `with_ptr` | `fn[R](self, fn(Ptr[U8]) -> R ! FFI) -> R ! FFI` | Closure-scoped FFI pin (see §9.1.3) |
+| `with_ptr` | `fn[R](self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Closure-scoped FFI pin; forwards the closure's effect row (see §9.1.3) |
 
 The `set_*_le/be(off, v)` family is the symmetric counterpart of the existing `read_*_le/be(off)` family: it writes at a given offset, requires `off + width <= len` (returns `Err` otherwise — does not grow), and complements the append-only `write_*_le/be(v)` constructors. `set_*` and `write_*` are deliberately distinct verbs: `set` writes in-place at a known offset, `write` appends. (Panel decision: [`ffi-struct-construction`](../decisions/ffi-struct-construction.md), Q-α-bytes-offset-API.)
 
