@@ -18,6 +18,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
+    diag_set_last_fix, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION,
@@ -2876,7 +2877,7 @@ fn tc_typevar_is_rigid(tid: Int) -> Int {
 
 // A type parameter declares no fields and a bound adds only methods, so no field is
 // readable on it in its own body (§3 Parametricity), whatever it is instantiated at.
-fn tc_reject_type_parameter_field(tid: Int, fname: Str, node: Int) -> Int {
+fn tc_reject_type_parameter_field(tid: Int, fname: Str, node: Int) -> Int ! Diag.Report {
     let tp = type_to_str(tid)
     diag_error_at("NoSuchField", NO_SUCH_FIELD, "type parameter {tp} has no field `{fname}`", node, "a type parameter has no fields; bound {tp} by a trait with a method that returns the value, and call it")
     tc_error_recovery_tid()
@@ -23114,6 +23115,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
         }
     }
 
+    tc_check_effect_rows(program)
     nr_pop_scope()
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined.
@@ -24351,4 +24353,215 @@ pub fn impl_is_element_agnostic(im: Int) -> Int {
         j = j + 1
     }
     1
+}
+
+// ── Effect rows (E0500) ──────────────────────────────────────────────
+// A caller must declare every effect its callees require (sections/04_effects.md §4.5). The
+// walk carries the row a body holds as a parameter: a fn's own `!` list, extended inside a
+// `with` block by the effect each item installs. A closure or a handler-literal op body runs
+// with the row of the fn that encloses it.
+
+// Only a user effect's children are known here, from its declaration. A builtin parent must
+// be held as written: the children the runtime routes through a builtin parent (IO.Eprint)
+// are not the list in §4.3, and a second copy of either list would drift from the other.
+fn tc_er_user_children(program: Int, root: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    let eds = node_args(program)
+    if eds == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(eds) {
+        let ed = sublist_get(eds, i)
+        let kids = node_elements(ed)
+        if node_name(ed) == root && kids != -1 {
+            let mut k = 0
+            while k < sublist_length(kids) {
+                out.push(node_name(sublist_get(kids, k)))
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Holding a parent grants each of its children; holding every child of a parent grants
+// the parent (§4.3).
+fn tc_er_satisfied(program: Int, held: List[Str], req: Str) -> Bool {
+    for h in held {
+        if h == req || req.starts_with("{h}.") { return true }
+    }
+    if req.contains(".") { return false }
+    let kids = tc_er_user_children(program, req)
+    if kids.len() == 0 { return false }
+    for kid in kids {
+        if !tc_er_satisfied(program, held, "{req}.{kid}") { return false }
+    }
+    true
+}
+
+// The effect an operation of user effect `ed` requires: the child that declares it, or the
+// effect itself for an op declared at its top level.
+fn tc_er_op_effect(ed: Int, op: Int) -> Str {
+    let kids = node_elements(ed)
+    if kids != -1 {
+        let mut ci = 0
+        while ci < sublist_length(kids) {
+            let c = sublist_get(kids, ci)
+            let ops = node_methods(c)
+            if ops != -1 {
+                let mut oi = 0
+                while oi < sublist_length(ops) {
+                    if sublist_get(ops, oi) == op { return "{node_name(ed)}.{node_name(c)}" }
+                    oi = oi + 1
+                }
+            }
+            ci = ci + 1
+        }
+    }
+    node_name(ed)
+}
+
+fn tc_er_require(program: Int, site: Int, held: List[Str], owner: Str, callee: Str, req: Str) ! Diag.Report {
+    if tc_er_satisfied(program, held, req) { return }
+    diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+        "call to `{callee}` needs effect `{req}`, which `{owner}` does not declare", site,
+        "add `{req}` to the `!` list of `{owner}`, or make the call inside a `with` block that provides it")
+    diag_set_last_fix("add effect", req)
+}
+
+fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: Str) ! Diag.Report {
+    let decl = tc_call_decl_node(node)
+    if decl < 0 { return }
+    match tc_ue_op_root.get(decl) {
+        Some(ed) => {
+            tc_er_require(program, node, held, owner, "{node_name(ed)}.{node_name(decl)}", tc_er_op_effect(ed, decl))
+            return
+        }
+        None => {}
+    }
+    let idx = fnsig_by_decl.get(decl) ?? -1
+    if idx < 0 { return }
+    let fs = fnsig_pool.get(idx).unwrap()
+    let mut i = 0
+    while i < fs.effects_count {
+        let req = fnsig_effect_names.get(fs.effects_start + i).unwrap()
+        // FFI is left out until the owner rules on whether @trusted discharges it; reporting
+        // it now, or making the lib wrappers declare it, would settle that question here.
+        if req != "FFI" && !req.starts_with("FFI.") {
+            tc_er_require(program, node, held, owner, node_name(decl), req)
+        }
+        i = i + 1
+    }
+}
+
+fn tc_er_row_with(held: List[Str], extra: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for h in held { out.push(h) }
+    if extra != "" { out.push(extra) }
+    out
+}
+
+fn tc_er_fn_row(fn_node: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let effs = node_effects(fn_node)
+    if effs != -1 {
+        let mut i = 0
+        while i < sublist_length(effs) {
+            out.push(node_name(sublist_get(effs, i)))
+            i = i + 1
+        }
+    }
+    out
+}
+
+// Items nest left to right, so each item's expression runs under the effects the items
+// before it installed (§4.6.3).
+fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let mut row = tc_er_row_with(held, "")
+    let items = node_handlers(node)
+    if items == -1 { return row }
+    let mut i = 0
+    while i < sublist_length(items) {
+        let it = sublist_get(items, i)
+        let ik = nk_of(node_kind(it))
+        if ik == NodeKind.Ident && node_name(it) == "arena" {
+            row = tc_er_row_with(row, "Arena")
+        } else {
+            let vn = if ik == NodeKind.WithResource { node_value(it) } else { it }
+            tc_er_walk(program, vn, row, owner)
+            let vt = resolve_alias_tid(tc_lookup_node_tid(vn))
+            let mut e = tc_tid_handler_effect(vt)
+            if e == "" && vt >= 0 { e = tc_tid_handler_effect(resolve_alias_tid(tc_with_binder_tid(vt))) }
+            row = tc_er_row_with(row, e)
+        }
+        i = i + 1
+    }
+    row
+}
+
+fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: Str) ! TypeCheck.Resolve, Diag.Report {
+    if node < 0 { return }
+    let k = nk_of(node_kind(node))
+    if k == NodeKind.FnDef {
+        tc_er_walk_fn(program, node)
+        return
+    }
+    if k == NodeKind.WithBlock {
+        tc_er_walk(program, node_body(node), tc_er_with_row(program, node, held, owner), owner)
+        return
+    }
+    if k == NodeKind.HandlerExpr {
+        let ms = node_methods(node)
+        if ms != -1 {
+            let mut i = 0
+            while i < sublist_length(ms) {
+                tc_er_walk(program, node_body(sublist_get(ms, i)), held, owner)
+                i = i + 1
+            }
+        }
+    }
+    if k == NodeKind.Call || k == NodeKind.MethodCall { tc_er_check_call(program, node, held, owner) }
+    for c in node_value_child_ids(node) {
+        if k != NodeKind.HandlerExpr || nk_of(node_kind(c)) != NodeKind.FnDef {
+            tc_er_walk(program, c, held, owner)
+        }
+    }
+}
+
+fn tc_er_walk_fn(program: Int, fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
+    // `main` holds every effect (§4.6).
+    if node_name(fn_node) == "main" && node_source_module(fn_node) == "__main__" { return }
+    tc_er_walk(program, node_body(fn_node), tc_er_fn_row(fn_node), node_name(fn_node))
+}
+
+// `owners` is a list of impl or trait nodes; each one's methods are walked.
+fn tc_er_walk_methods(program: Int, owners: Int) ! TypeCheck.Resolve, Diag.Report {
+    if owners == -1 { return }
+    let mut i = 0
+    while i < sublist_length(owners) {
+        let ms = node_methods(sublist_get(owners, i))
+        if ms != -1 {
+            let mut j = 0
+            while j < sublist_length(ms) {
+                tc_er_walk_fn(program, sublist_get(ms, j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Test blocks are not walked: whether a test body holds every effect, as `main` does, is
+// still open with the owner.
+fn tc_check_effect_rows(program: Int) ! TypeCheck.Resolve, Diag.Report {
+    let fns = node_params(program)
+    if fns != -1 {
+        let mut i = 0
+        while i < sublist_length(fns) {
+            tc_er_walk_fn(program, sublist_get(fns, i))
+            i = i + 1
+        }
+    }
+    tc_er_walk_methods(program, node_methods(program))
+    tc_er_walk_methods(program, node_arms(program))
 }

@@ -236,7 +236,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | Code | Name | Implementation |
 |------|------|---------------|
 | E0004 | NonExhaustiveMatch | `typecheck.bl` — `tc_check_match_exhaustive`, on a match whose scrutinee resolves to a declared enum. Under-approximating: Int/Str/Char ranges, tuple/struct patterns and nested refutable sub-patterns contribute nothing rather than risk a false positive |
-| E0500 | UndeclaredEffect | `codegen_types.bl` — effect propagation check |
+| E0500 | UndeclaredEffect | `typecheck.bl` — `tc_check_effect_rows`, at each call to a fn or method that declares effects, each user effect operation, and each `! Arena` callee, in every fn but `main`. Not yet checked: a builtin namespace call (`io.println`), the `FFI` effect, and test blocks |
 | E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |
 | E0513 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |
