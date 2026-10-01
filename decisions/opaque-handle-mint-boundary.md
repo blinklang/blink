@@ -188,6 +188,9 @@ new syntax or ceremony).
 
 ### Final Spec
 
+> **Later change:** site classification is now typed, and E0811 covers function bodies. The region
+> predicate stays syntactic. See [opaque-audit-round-trip.md](opaque-audit-round-trip.md).
+
 The mint boundary is the **FFI region** set that E0811 permits a `Ptr[T]` to appear in, stated
 once with *Pointer Operations* (§9.1.1, E0811) and referenced everywhere else:
 
