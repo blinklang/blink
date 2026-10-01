@@ -2120,3 +2120,102 @@ The formatter never reorders arguments, struct-literal fields or list elements, 
 **Why not "unspecified".** C leaves argument order unspecified, and the C compilers Blink targets differ. An unspecified order would give one Blink program different output under gcc, clang and zig cc. No diagnostic can find the order-sensitive cases, because effect rows do not record writes to captured `let mut` bindings or overflow panics. That is under-determined behaviour with no error, which Blink rejects (§3.4, `E0301`).
 
 **Panel vote: 6-0** on each point: written order everywhere, the closed list, compound assignment, the formatter rule, and assignment places. See [decisions/argument-evaluation-order.md](../decisions/argument-evaluation-order.md).
+
+### 2.23 Reserved Words
+
+#### The Keyword Table
+
+These words are **keywords**. The lexer reads each one as a keyword token in every position:
+
+| Keyword | Note |
+|---|---|
+| `fn`, `let`, `mut`, `const`, `type`, `trait`, `impl`, `pub`, `import`, `as`, `self`, `effect`, `handler`, `with`, `test` | declarations, bindings and handlers |
+| `if`, `else`, `match`, `for`, `in`, `while`, `loop`, `break`, `continue`, `return` | control flow |
+| `assert`, `assert_eq`, `assert_ne`, `assert_panics` | built-in assertions (§2.20 *Built-in Assertions*) |
+| `mod` | reserved, unused. Blink has no `mod name { }` block (§10.1.1 *No Inline Modules*). The parser keeps the word so that a `mod` block written from Rust habit gets a targeted error, not a parse error. |
+
+`true` and `false` are literals of type `Bool` (§10.6). They are not names, and no position accepts them as a name.
+
+`async` is **not** a keyword. It is an ordinary identifier, the namespace of `async.spawn` and `async.scope` (§4).
+
+This table is the one list of keywords. §10.6 and the `blink explain E1103` text refer to it. A CI test fails if the set of words in this table is not exactly the set the lexer reads as keywords.
+
+#### Members and Bindings
+
+**A keyword may name a member. A keyword may never name a binding.**
+
+A **member name** is a name that a program reaches only through a type or a value: after `.`, or as a field label. These are the member-name positions, and the list is closed:
+
+1. A field declaration in a `type` body: `handler: fn(Request) -> Response`.
+2. A field label in a struct literal, written with `:`: `Route { handler: f }`.
+3. The name after `.`: field access `r.handler`, method call `r.match(path)`, and a qualified name `m.x`.
+4. A field label in a struct pattern, written with `:`: `Route { handler: h, .. }`.
+5. A method name declared in an `impl` or `trait` body: `fn match(self, path: Str) -> Bool`. A caller reaches the method only through `.`.
+
+In grammar terms, each of these positions takes a `MEMBER_NAME`, and every other name position takes an `IDENT`:
+
+```
+MEMBER_NAME ::= IDENT | KEYWORD      // KEYWORD = any word in the table above
+```
+
+Every other position that takes a name is a **binding** position, and a keyword there is `error[KeywordAsIdentifier]` (E1103). The binding positions include:
+
+- `let` and `for` names, and pattern bindings
+- function and closure parameters
+- keyword-parameter names (§2.13), and so call-site labels too. A label names a parameter, and a parameter is a local of the function body. A body can never refer to a local named `type`, so a call-site label `type:` can never match a parameter.
+- top-level names: `fn`, `type`, `trait`, `effect`, `const` and module-level `let`
+- operation names declared in an `effect` body. A handler and the effect's own module can call an operation by its bare name, so the name is not a member name.
+
+```blink
+@derive(Serialize, Deserialize)
+type Event {
+    type: Str
+    id: Int
+}
+
+type Route {
+    method: Str
+    pattern: Str
+    handler: fn(Request) -> Response
+}
+
+impl Route {
+    fn match(self, path: Str) -> Bool {
+        path == self.pattern
+    }
+}
+
+fn dispatch(r: Route, req: Request, fallback: Route) -> Response {
+    let h = if r.match(req.path) { r.handler } else { fallback.handler }
+    h(req)
+}
+
+fn kind(e: Event) -> Str {
+    match e {
+        Event { type: t, .. } => t
+    }
+}
+```
+
+`Event` derives `Serialize` with the JSON key `"type"`. Blink has no `@json("name")` field rename (see [JsonValue derive signatures](../decisions/json-value-derive-and-str-backed-enums.md)), so a derived type can model a JSON key only when the field can have the same name. This rule is what lets a field have the name of a keyword.
+
+**Field punning cannot name a keyword field.** Punning `{ name }` in a struct pattern means `{ name: name }`, and the second `name` is a binding (§3.5). So the punned form is legal only when the field name is also a legal binding name:
+
+```
+error[KeywordAsIdentifier]: field `type` cannot use the short form because `type` is a keyword
+  --> app.bl:22:17
+   |
+22 |         Event { type, .. } => type
+   |                 ^^^^ the short form binds a local named `type`
+   = help: write `type: <name>`, for example `Event { type: t, .. }`
+```
+
+The E1103 message names the position. At a binding it says that a keyword cannot name a variable or a parameter and that keywords are legal only as member names. At a call-site label it says that keywords cannot name parameters.
+
+#### Soft Keywords
+
+A **soft keyword** is a word that the parser reads as a keyword only in one position, and as an ordinary identifier everywhere else. In v1 there is one soft keyword: `final`, as a modifier on a default method in a trait body (§3.6 *The `final` Modifier*). An edition may promote a soft keyword to a keyword (§8.16.1 *Editions*).
+
+The member-name rule above does **not** make any keyword soft. A keyword in a member-name position is still a keyword token. The positions accept it as a name, and the word stays reserved in every binding position. A keyword never becomes legal as a binding.
+
+**Panel vote: 6-0** on each point: keywords as member names, method names included, labels and effect operations reserved, `mod` reserved with its reason, the soft-keyword definition, and the CI check against the lexer. See [decisions/keywords-as-member-names.md](../decisions/keywords-as-member-names.md).

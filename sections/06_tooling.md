@@ -1769,7 +1769,7 @@ edition = "2026"
 - **Per-package.** Each package in a dependency graph can use a different edition. A 2026-edition library compiles alongside a 2028-edition application with no friction — the compiler carries code for all editions simultaneously.
 - **Scope.** Editions gate three things:
   1. **Stdlib API** — deprecated functions become errors, new defaults take effect
-  2. **Keywords** — a new edition can reserve identifiers (e.g., promoting a soft keyword to a hard keyword)
+  2. **Keywords** — a new edition can reserve identifiers (e.g., promoting a soft keyword to a keyword; §2.23 *Soft Keywords*)
   3. **Lint severity** — warnings in edition N can become errors in edition N+1
 - **NOT core syntax.** Editions never change the grammar of `fn`, `match`, `let`, `if`, braces, or any core construct. An edition cannot make previously-valid syntax invalid (except for newly reserved keywords). The AST structure is eternal.
 - **Infinite compatibility.** Every edition is supported forever. The compiler never drops support for an older edition. A `edition = "2026"` package compiles with the 2035 compiler. There is no "upgrade or die" — upgrading editions is always voluntary.
