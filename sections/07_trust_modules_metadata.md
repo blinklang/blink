@@ -1397,7 +1397,7 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 
 #### 10.1.1 No Inline Modules
 
-Blink has no `mod name { }` syntax for creating sub-modules within a file. The `mod` keyword is reserved but unused in v1.
+Blink has no `mod name { }` syntax for creating sub-modules within a file. The `mod` keyword is reserved but unused in v1 (§2.23 *Reserved Words*).
 
 **The rule is absolute: one file = one module.** If you need a sub-module, create a separate file in a subdirectory.
 
@@ -1874,12 +1874,9 @@ The prelude is fixed. It cannot be extended by users or libraries. Only compiler
 
 #### Keywords and Literals
 
-The following are **language keywords** recognized by the parser, not identifiable names:
+`true` and `false` are the two values of type `Bool`. The keywords are in the one table in §2.23 *Reserved Words*.
 
-- `true`, `false` — the two values of type `Bool`
-- `fn`, `let`, `mut`, `type`, `trait`, `impl`, `match`, `if`, `else`, `for`, `in`, `while`, `loop`, `break`, `continue`, `return`, `pub`, `import`, `mod`, `with`, `as`, `test`, `effect`, `handler`, `async`
-
-Keywords cannot be used as identifiers, shadowed, or imported.
+A keyword cannot name a binding, so a keyword cannot be shadowed or imported. A keyword can name a member: a field, or a method in an `impl` or `trait` body (§2.23 *Members and Bindings*).
 
 #### Prelude Types
 
@@ -2050,7 +2047,7 @@ error[TypeArgArity]: type `Handler` takes 0 type arguments, found 1
 
 Shadowing never changes what the compiler inserts. `x?`, `T?`, `for`, `..`, `with`, `async.spawn` and every other desugaring use the compiler-known type by identity (§3.4 *Type Name Resolution*, *Hygiene*).
 
-Keywords (`true`, `false`, `fn`, `handler`, etc.) cannot be shadowed — they are reserved by the parser.
+Keywords and the literals `true` and `false` cannot be shadowed, because a keyword cannot name a binding (§2.23).
 
 ### 10.7 Standard Library Resolution
 

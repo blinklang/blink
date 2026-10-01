@@ -14,7 +14,7 @@ The workflow is:
 **Phase A (independent proposals) → Phase A.5 (mechanical dedupe) → Phase B (open debate, conditional) → Phase C (silent vote) → Phase D (focused re-debate, conditional)** →
 8. Summarize → 8.5. AI-first review → 9. Write spec → 10. Update tracking → 11. Quality checks → 12. Report
 
-The user signs off on the tally before any spec is written. Stop and report when votes are in.
+The user signs off on the tally before any spec is written. Stop and report when votes are in — unless every question passed 6-0 (see **Unanimous fast path** in Phase C).
 
 ---
 
@@ -137,6 +137,8 @@ Wait for all 6 votes. Tally per question. Identify dissent.
 
 **Pause and report to the user before any spec writing.** This is the votes-in checkpoint. The user signs off on the tally (and any soft-consensus interpretation) before Phase E or any subsequent step.
 
+**Unanimous fast path:** if every question passed 6-0 (no tiebreak, no soft-consensus reading) and the Step 8.5 AI-first review fails at most one criterion, skip the sign-off. Report the tally to the user as in Step 8, then go straight on through Phase E and Steps 9–12. Any split vote, any tie, or 2+ AI-first failures keeps the checkpoint.
+
 ## Phase D — Round 2 (conditional)
 
 **Trigger condition:** any single question result is closer than 5-1 (i.e., 4-2, 3-3, 3-2-1, etc.). Unanimous (6-0) and lopsided (5-1) results skip Phase D.
@@ -165,7 +167,7 @@ State to the user:
 - **Dissent summary**: 1–2 sentences per dissenter explaining their position.
 - **Key argument**: the single strongest argument that swung each decision.
 
-This summary is the votes-in checkpoint. Do not proceed to spec writing without explicit user sign-off.
+This summary is the votes-in checkpoint. Do not proceed to spec writing without explicit user sign-off, except on the unanimous fast path (Phase C).
 
 ## Step 8.5: AI-First Review
 

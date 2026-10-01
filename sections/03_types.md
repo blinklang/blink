@@ -1827,8 +1827,8 @@ pattern_list  ::= pattern ( "," pattern )*
 field_patterns ::= field_pattern ( "," field_pattern )* ( "," ".." )?
                |   ".."
 
-field_pattern  ::= IDENT ":" pattern                          // field with sub-pattern
-               |   IDENT                                      // field punning
+field_pattern  ::= MEMBER_NAME ":" pattern                    // field with sub-pattern; a keyword is legal (§2.23)
+               |   IDENT                                      // field punning; never a keyword
 
 guard         ::= "if" expression
 
@@ -1935,7 +1935,7 @@ error[NonExhaustiveMatch]: non-exhaustive match on List[Str]
   = help: add a `_` wildcard arm or `[_, _, ..] rest pattern
 ```
 
-**Struct patterns.** Match struct types by field values. Type name is required (nominal matching). Field punning binds a field to a variable of the same name. `..` is required when not all fields are listed.
+**Struct patterns.** Match struct types by field values. Type name is required (nominal matching). Field punning binds a field to a variable of the same name, so a field named by a keyword cannot use the short form: write `Event { type: t, .. }` (§2.23 *Members and Bindings*). `..` is required when not all fields are listed.
 
 ```blink
 match user {
