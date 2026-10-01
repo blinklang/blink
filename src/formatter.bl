@@ -1033,6 +1033,7 @@ fn any_needs_multiline(items_sl: Int) -> Int {
 }
 
 fn if_needs_multiline(node: Int) -> Int {
+    if block_needs_multiline(node_condition(node)) != 0 { return 1 }
     let then_b = node_then_body(node)
     if then_b != -1 && check_stmts_multiline(node_stmts(then_b)) != 0 { return 1 }
     let else_b = node_else_body(node)
@@ -1158,7 +1159,7 @@ fn format_closure_header(node: Int) -> Str {
 fn emit_match_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     let scrut = node_scrutinee(node)
     let arms_sl = node_arms(node)
-    fmt_emit("{prefix}match {format_expr(scrut)} \{")
+    emit_header("{prefix}match ", scrut, " \{")
     fmt_indent = fmt_indent + 1
     if arms_sl != -1 {
         let mut i = 0
@@ -1180,8 +1181,7 @@ fn emit_if_else_tail(else_b: Int, suffix: Str) ! Format.Emit {
     if else_stmts != -1 && sublist_length(else_stmts) == 1 {
         let inner = sublist_get(else_stmts, 0)
         if node_kind(inner) == NodeKind.IfExpr {
-            let cond_str = format_expr(node_condition(inner))
-            fmt_emit("} else if {cond_str} \{")
+            emit_header("} else if ", node_condition(inner), " \{")
             fmt_indent = fmt_indent + 1
             format_block_body(node_then_body(inner))
             fmt_indent = fmt_indent - 1
@@ -1199,17 +1199,7 @@ fn emit_if_else_tail(else_b: Int, suffix: Str) ! Format.Emit {
 fn emit_if_expr_wrapped(node: Int, prefix: Str, suffix: Str) ! Format.Emit {
     let cond = node_condition(node)
     let then_b = node_then_body(node)
-    let cond_str = format_expr(cond)
-    let if_line = "{prefix}if {cond_str} \{"
-    if fmt_needs_wrap(if_line) != 0 && node_kind(cond) == NodeKind.BinOp {
-        fmt_emit("{prefix}if")
-        fmt_indent = fmt_indent + 1
-        emit_binop_wrapped(cond, "")
-        fmt_indent = fmt_indent - 1
-        fmt_emit("\{")
-    } else {
-        fmt_emit(if_line)
-    }
+    emit_cond_header("{prefix}if", cond)
     fmt_indent = fmt_indent + 1
     format_block_body(then_b)
     fmt_indent = fmt_indent - 1
@@ -1327,13 +1317,11 @@ fn emit_text_with_holes(text: Str, holes: List[Int], prefix: Str, suffix: Str, w
         exit(101)
         return
     }
-    let pad_len = fmt_indent * 4
     let mut lead = prefix.concat(pieces.get(0).unwrap())
     let mut i = 0
     while i < holes.len() {
         if i > 0 {
-            let last = fmt_lines.pop().unwrap()
-            lead = last.substring(pad_len, last.len() - pad_len)
+            lead = fmt_pop_last_line()
         }
         let mut tail = pieces.get(i + 1).unwrap()
         if i == holes.len() - 1 {
@@ -1342,6 +1330,43 @@ fn emit_text_with_holes(text: Str, holes: List[Int], prefix: Str, suffix: Str, w
         emit_expr_wrapped(holes.get(i).unwrap(), lead, tail)
         i = i + 1
     }
+}
+
+// Takes back the line just emitted, without its indent, so the caller can continue it.
+fn fmt_pop_last_line() -> Str ! Format.Emit {
+    let pad_len = fmt_indent * 4
+    let last = fmt_lines.pop().unwrap()
+    last.substring(pad_len, last.len() - pad_len)
+}
+
+// A header such as `if cond {` holds its expression on one line unless a form inside the
+// expression has no one-line layout; then the form spans lines and the header closes on its
+// last line.
+fn emit_header(prefix: Str, expr: Int, suffix: Str) ! Format.Emit {
+    if block_needs_multiline(expr) != 0 {
+        emit_expr_with_holes(expr, prefix, suffix)
+        return
+    }
+    fmt_emit("{prefix}{format_expr(expr)}{suffix}")
+}
+
+// The keyword header of an if or while. A long condition that is a chain of one operator wraps
+// one operand per line between the keyword and the brace.
+fn emit_cond_header(keyword: Str, cond: Int) ! Format.Emit {
+    if block_needs_multiline(cond) != 0 {
+        emit_expr_with_holes(cond, "{keyword} ", " \{")
+        return
+    }
+    let line = "{keyword} {format_expr(cond)} \{"
+    if fmt_needs_wrap(line) != 0 && node_kind(cond) == NodeKind.BinOp {
+        fmt_emit(keyword)
+        fmt_indent = fmt_indent + 1
+        emit_binop_wrapped(cond, "")
+        fmt_indent = fmt_indent - 1
+        fmt_emit("\{")
+        return
+    }
+    fmt_emit(line)
 }
 
 fn call_has_any_block_arg(node: Int) -> Int {
@@ -1659,11 +1684,15 @@ fn format_stmt(node: Int) ! Format.Emit {
         if for_fmt_pat != -1 {
             for_var_str = format_pattern(for_fmt_pat)
         }
-        let for_line = "for {for_var_str} in {format_expr(iterable)} \{"
-        if fmt_needs_wrap(for_line) != 0 {
-            emit_expr_wrapped(iterable, "for {for_var_str} in ", " \{")
+        if block_needs_multiline(iterable) != 0 {
+            emit_expr_with_holes(iterable, "for {for_var_str} in ", " \{")
         } else {
-            fmt_emit(for_line)
+            let for_line = "for {for_var_str} in {format_expr(iterable)} \{"
+            if fmt_needs_wrap(for_line) != 0 {
+                emit_expr_wrapped(iterable, "for {for_var_str} in ", " \{")
+            } else {
+                fmt_emit(for_line)
+            }
         }
         fmt_indent = fmt_indent + 1
         format_block_body(body)
@@ -1675,16 +1704,7 @@ fn format_stmt(node: Int) ! Format.Emit {
     if kind == NodeKind.WhileLoop {
         let cond = node_condition(node)
         let body = node_body(node)
-        let while_line = "while {format_expr(cond)} \{"
-        if fmt_needs_wrap(while_line) != 0 && node_kind(cond) == NodeKind.BinOp {
-            fmt_emit("while")
-            fmt_indent = fmt_indent + 1
-            emit_binop_wrapped(cond, "")
-            fmt_indent = fmt_indent - 1
-            fmt_emit("\{")
-        } else {
-            fmt_emit(while_line)
-        }
+        emit_cond_header("while", cond)
         fmt_indent = fmt_indent + 1
         format_block_body(body)
         fmt_indent = fmt_indent - 1
@@ -1743,17 +1763,7 @@ fn format_if_chain(node: Int, prefix: Str) ! Format.Emit {
     let cond = node_condition(node)
     let then_b = node_then_body(node)
     let else_b = node_else_body(node)
-    let cond_str = format_expr(cond)
-    let if_line = "{prefix} {cond_str} \{"
-    if fmt_needs_wrap(if_line) != 0 && node_kind(cond) == NodeKind.BinOp {
-        fmt_emit("{prefix}")
-        fmt_indent = fmt_indent + 1
-        emit_binop_wrapped(cond, "")
-        fmt_indent = fmt_indent - 1
-        fmt_emit("\{")
-    } else {
-        fmt_emit(if_line)
-    }
+    emit_cond_header(prefix, cond)
     fmt_indent = fmt_indent + 1
     format_block_body(then_b)
     fmt_indent = fmt_indent - 1
@@ -1783,7 +1793,7 @@ fn format_else_if(_node: Int) -> Str {
 fn format_match_stmt(node: Int) ! Format.Emit {
     let scrut = node_scrutinee(node)
     let arms_sl = node_arms(node)
-    fmt_emit("match {format_expr(scrut)} \{")
+    emit_header("match ", scrut, " \{")
     fmt_indent = fmt_indent + 1
     if arms_sl != -1 {
         let mut i = 0
@@ -1802,7 +1812,12 @@ fn format_match_arm(node: Int) ! Format.Emit {
     let body = node_body(node)
     let mut line = format_pattern(pat)
     if guard != -1 {
-        line = line.concat(" if ").concat(format_expr(guard))
+        if block_needs_multiline(guard) != 0 {
+            emit_expr_with_holes(guard, line.concat(" if "), "")
+            line = fmt_pop_last_line()
+        } else {
+            line = line.concat(" if ").concat(format_expr(guard))
+        }
     }
     line = line.concat(" => ")
     let body_kind = node_kind(body)
