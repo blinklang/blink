@@ -3388,6 +3388,27 @@ Built-in types (`Int`, `Float`, `Bool`, `Str`, `Char`) have compiler-provided `D
 
 **The intrinsic seam.** These five impls are prelude impls whose `fmt` body the compiler provides. They are the only `fmt` bodies that do not call `sb.write`, and the list is closed: every other `Display` impl, including every derived one, writes through `sb.write`, `sb.write_char` or a child's `fmt`. `Str.fmt` appends the receiver's bytes to the builder directly; it does not call `sb.write`, so `sb.write(s)` for a `Str` lowers to `s.fmt(sb)` and stops there. `Str.display()` returns a `Str` equal to the receiver. (Implementation note: the compiler-provided impl may return the receiver without a copy.)
 
+**A scalar renders to `Str` only through `Display`.** To get a `Str` from an `Int`, `Float` or `Bool`, write `"{x}"` when the value is part of a larger string, and `x.display()` when you need the `Str` value alone. These types have no `to_str` and no `to_string` method. Rendering is not a conversion: a scalar has a `to_` method only as sugar over a `From` or `TryFrom` impl (§3c.3), and no `From[Int] for Str`, `From[Float] for Str` or `From[Bool] for Str` exists. `Char` has `to_str` because `From[Char] for Str` exists (§3c.3 *Char → Str*).
+
+```blink
+let n = 42
+let s = n.display()                         // "42"
+let line = "port {n}"                       // "port 42"
+let names = [80, 443].map(fn(p) { p.display() })
+```
+
+A call to `to_str`, `to_string` or `toString` on one of these types is `UnresolvedMethod` (E0505). The help line names `display()` and interpolation, and the diagnostic carries a machine-applicable fix that replaces the method name with `display`. The type and the output stay the same:
+
+```
+error[E0505]: unresolved method `.to_string` on type Int
+  --> src/server.bl:41:22
+   |
+41 |     let s = port.to_string()
+   |                  ^^^^^^^^^
+   = help: a number becomes a `Str` with `.display()`, or with `"{port}"` inside a larger string
+   = fix: replace `.to_string()` with `.display()`
+```
+
 **Every Display sink uses the same bound.** `"{x}"`, `x.display()`, `sb.write(x)` (§3.2 *String Building*) and the `io` print functions (§4.4) each require `T: Display` and nothing else. A `Str` argument is one `Display` type among five; it takes no separate path in the type system. A value that fails the bound at any of these sinks, or at any other call whose type parameter is bounded by `Display`, gets the same `MissingDisplayImpl` (E0523) error. The message names the sink and the span covers the argument:
 
 ```

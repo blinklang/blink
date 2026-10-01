@@ -422,6 +422,8 @@ fn load_user(id: Int) -> Result[User, AppError] ! DB {
 
 Numeric types support both named conversion methods (for discoverability) and From/TryFrom impls (for generic programming). Named methods are sugar over the trait impls — one source of truth.
 
+**The `to_` rule for scalars.** On the built-in scalar types (`Int`, `Float`, `Bool`, `Char` and the sized integers), every `to_` conversion method is sugar over a `From` or `TryFrom` impl. `.to_X()` stands for `From` and returns `X`. `.to_X_checked()` stands for `TryFrom` and returns `Result[X, ConversionError]`. A scalar has no `to_` method without such an impl. Rendering a scalar as text is not a conversion: it goes through `Display` (`x.display()` or `"{x}"`, §3.6 *Display Format Protocol*), not through a `to_str` method.
+
 #### Widening Conversions (Infallible — `From`)
 
 Widening conversions never lose information. They are implemented via `From` and also available as named methods.
@@ -581,6 +583,19 @@ let vowels = "hello"
 | Char → Str | encoding | `.to_str()` | `From[Char] for Str` | No |
 
 (Vote: Q1 4-1, Q2 4-1, Q3 5-0. See [Char Conversions rationale](../decisions/char-conversions.md).)
+
+##### Int, Float, Bool → Str (Rendering — `Display`)
+
+`Int`, `Float` and `Bool` have no `From` impl into `Str`, so by the `to_` rule above they have no `to_str` method. They render through `Display`:
+
+```blink
+let s = 42.display()          // "42"
+let t = "{2.5} and {true}"    // "2.5 and true"
+```
+
+`'a'.to_str()` compiles and `5.to_str()` does not, because `From[Char] for Str` exists and `From[Int] for Str` does not. A `Char` is one Unicode scalar value, and `to_str` encodes it as a one-character `Str` without loss. An `Int` has no single `Str` encoding that the type fixes; its text is how `Display` renders it. A call to `to_str` or `to_string` on `Int`, `Float` or `Bool` is `UnresolvedMethod` (E0505), with a fix that rewrites it to `display()` (§3.6 *Display Format Protocol*).
+
+(Vote: Q1 5-1, Q2 5-1. See [Scalar → Str rationale](../decisions/scalar-to-str.md).)
 
 ---
 
