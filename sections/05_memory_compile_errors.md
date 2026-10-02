@@ -80,7 +80,7 @@ error[ArenaValueEscapes]: arena-scoped value escapes
   |                             ^^^^^^ `leaked` is arena-allocated and cannot escape
   |
   = note: arena values are freed when the arena scope exits
-  = fix: remove `! Arena` and let the value be GC-managed, or copy the value explicitly:
+  = fix: remove `! Arena` and let the value live outside the arena, or copy the value explicitly:
   |
 3 |     some_global_cache.store(leaked.clone())
   |                                   ++++++++
