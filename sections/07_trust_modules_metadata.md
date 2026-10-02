@@ -1972,19 +1972,7 @@ pub import auth.rate_limit.{RateLimiter}
 
 **Consumer-side access:** Re-exported items are indistinguishable from locally-defined `pub` items. If module A does `pub import B.{foo}`, then consumers can access `foo` via both selective import (`import A.{foo}`) and qualified access (`A.foo`). The same access rules apply as for any other pub item in A's namespace.
 
-**Name collisions:** If a module both defines and re-exports the same public name, this is a compile error:
-
-```
-error[E1012]: duplicate public symbol `foo` in module `A`
- --> src/A.bl:5:1
-  |
-3 | pub import B.{foo}
-  |                ^^^ re-exported here
-5 | pub fn foo() { ... }
-  |        ^^^ also defined here
-  |
-  = help: remove the re-export or rename the local definition
-```
+**Name collisions:** a module that both defines and re-exports one name gets E1012, the same error as for a plain import (*Imported and Declared Names* below).
 
 **Unused import warnings:** `pub import` never triggers W0602 (unused import). Re-exports declare public API surface, not local usage intent. The re-exporting module does not need to use the re-exported items itself.
 
@@ -2001,6 +1989,47 @@ pub import codegen_types.{c_fn_name, c_safe_name, c_type_str}
 import codegen_common.{emit_line, CT_INT, CT_STRING, c_fn_name}
 ```
 
+#### Imported and Declared Names
+
+A selective import binds each listed name in module scope, and module scope is one flat namespace (§2.12.1, §10.6 *Shadowing Rules*). So a module may not both import a name and declare it. A module-level declaration of a name that a selective import binds is a compile error, `DuplicateSymbol` (E1012). The rule covers every declaration kind in both namespaces: `type`, type alias, `trait`, `effect`, `fn` and module-level `let`. It applies to `import` and `pub import` alike, and to every visibility of the declaration.
+
+```blink
+import alpha.{Point}
+
+type Point {    // error[E1012]: `Point` is imported from `alpha`
+    b: Int
+}
+```
+
+```
+error[E1012]: `Point` is both imported and declared in module `main`
+ --> src/main.bl:3:6
+  |
+1 | import alpha.{Point}
+  |               ^^^^^ imported from `alpha` here
+3 | type Point {
+  |      ^^^^^ also declared here
+  |
+  = help: drop `Point` from the import list and use `alpha.Point`,
+          or import it under another name: import alpha.{Point as AlphaPoint}
+```
+
+The check uses the name that the import binds, which is the name after `as` when there is one:
+
+```blink
+import alpha.{Point as P}
+type P { b: Int }        // error[E1012]: `P` is both imported and declared
+```
+
+```blink
+import alpha.{Point as AlphaPoint}
+type Point { b: Int }    // OK: the import binds `AlphaPoint`, not `Point`
+```
+
+A whole-module import (`import alpha`) binds no bare name, so it never collides with a declaration.
+
+**Fix.** For a plain `import`, the fix "drop the name from the import list" is machine-applicable (§8.6): every bare use of the name then means the local declaration. When the edit empties the list, the fix rewrites the line to `import alpha`, because a selective import also gives qualified access (§10.1 *Qualified Access*). It deletes the line only when no name in the file resolves through the `alpha` qualifier; the check uses name resolution, not text search. For `pub import`, the same edit changes the module's public API, so the fix is a suggestion only. On that import entry, E1012 replaces W0602 (unused import): one mistake gives one diagnostic.
+
 #### Import Errors
 
 | Code | Error | Cause |
@@ -2015,7 +2044,7 @@ import codegen_common.{emit_line, CT_INT, CT_STRING, c_fn_name}
 | E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
 | E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
 | E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar |
-| E1012 | Duplicate public symbol | Module both defines and re-exports the same public name |
+| E1012 | Duplicate symbol | A module-level declaration takes a name that a selective import (`import` or `pub import`) binds |
 
 ```
 error[E1003]: item `Token` is private in module `auth.internal`
@@ -2202,7 +2231,9 @@ warning[W1010]: name shadows compiler-known type
           import blink.core.{Handler as EffectHandler}
 ```
 
-The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. It also covers module-level definitions reached by an explicit import. Local bindings (`let`) live in the value namespace and are not type declarations.
+The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. It also covers such a name that another module declares and this module imports (`import geo.{Handler}`). Local bindings (`let`) live in the value namespace and are not type declarations.
+
+**Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings in module scope, from declarations or selective imports, are a duplicate, never a shadow. So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. The rule in §10.1 *Qualified Access* that a local definition hides a module qualifier (`let auth = 5` makes `auth.login()` a method call) is a different layer, and this rule does not change it.
 
 **Diagnostics that involve a shadowing name.** The escape must be visible where the error is, not only at the declaration. So:
 
