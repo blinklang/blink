@@ -10,14 +10,24 @@ if [ "${5:-}" = "--ignore-timeouts" ]; then
     IGNORE_TIMEOUTS=1
 fi
 CRASH_DIR=".tmp/fuzz_crashes"
-INPUT_FILE=".tmp/fuzz_input.bl"
 
+# A seed must name one run: every input comes from $RANDOM, the mutation corpus is
+# listed in one fixed order, and each run writes its own input file.
+export LC_ALL=C
 mkdir -p "$CRASH_DIR"
+INPUT_FILE=$(mktemp .tmp/fuzz_input_XXXXXX.bl)
+trap 'rm -f "$INPUT_FILE"' EXIT
 
 # --- Input generators ---
 
 gen_random_bytes() {
-    head -c $((RANDOM % 512 + 1)) /dev/urandom | base64 | head -c $((RANDOM % 256 + 1))
+    local alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+    local count=$((RANDOM % 256 + 1))
+    local output=""
+    for ((j=0; j<count; j++)); do
+        output+="${alphabet:$((RANDOM % ${#alphabet})):1}"
+    done
+    printf '%s' "$output"
 }
 
 gen_token_soup() {
@@ -105,13 +115,16 @@ gen_malformed_string() {
     esac
 }
 
+# Only committed test sources: the formatter checks write fmt-sem-* copies into
+# tests/ while other jobs run, so those never enter the corpus.
 MUTATION_FILES=()
-while IFS= read -r f; do
+for f in tests/test_*.bl; do
+    [ -f "$f" ] || continue
     size=$(wc -c < "$f")
     if ((size <= 5120)); then
         MUTATION_FILES+=("$f")
     fi
-done < <(ls tests/test_*.bl 2>/dev/null)
+done
 
 gen_mutated_program() {
     if [ ${#MUTATION_FILES[@]} -eq 0 ]; then
@@ -140,13 +153,16 @@ gen_mutated_program() {
                 content="${content:0:pos}${content:$((pos+1))}"
                 ;;
             1) # insert a random byte
+                # $RANDOM inside $(...) reads the subshell's reseeded state, not the run's seed.
+                local code=$((RANDOM % 95 + 32))
                 local byte
-                byte=$(printf "\\$(printf '%03o' $((RANDOM % 95 + 32)))")
+                byte=$(printf "\\$(printf '%03o' "$code")")
                 content="${content:0:pos}${byte}${content:pos}"
                 ;;
             2) # substitute a random byte
+                local code=$((RANDOM % 95 + 32))
                 local byte
-                byte=$(printf "\\$(printf '%03o' $((RANDOM % 95 + 32)))")
+                byte=$(printf "\\$(printf '%03o' "$code")")
                 content="${content:0:pos}${byte}${content:$((pos+1))}"
                 ;;
         esac
