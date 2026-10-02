@@ -686,7 +686,7 @@ error[AmbiguousMethodCall]: ambiguous method call
 
 #### Qualified Method Calls
 
-Any trait method can be called using qualified syntax: `TraitName.method(receiver, args)`. The receiver is passed explicitly as the first argument (the `self` parameter).
+Any trait method can be called using qualified syntax: `TraitName.method(receiver, args)`. The receiver is passed explicitly as the first argument (the `self` parameter). A method without `self` (an associated function) has no receiver to pass; *Impl-Qualified Calls* below gives its form.
 
 ```blink
 // Unqualified — works when unambiguous
@@ -704,6 +704,80 @@ fn show[T: Display](val: T) -> Str {
 Qualified syntax is also useful for calling a specific trait's default method, or a `final` (sealed) default whose body is fixed by the trait — like `Display.display`, which is always defined as `let sb = StringBuilder.new(); self.fmt(sb); sb.to_str()` regardless of which type implements `Display`.
 
 Qualified call is a *call-site* mechanism, not a *super-call* mechanism. Inside an `impl` block overriding an open trait default, writing `Trait.method(self, ...)` does not reach the trait's default body — it resolves to the same method the call site sees, which is the impl's override. Blink has no method-resolution-order chain to walk back through. If an override needs the default's body, factor that body into a free helper function and call the helper from both sites. See §3.6 *The `final` Modifier* for the replace-only override rule.
+
+#### Impl-Qualified Calls
+
+`Trait.method(receiver, args)` gets `Self` from its receiver. An associated function has no receiver, so that form cannot say which type's impl to call. When two traits give one type an associated function with the same name, the unqualified call `Type.fn()` is E0522, and the program needs a form that names both the trait and the type. That form is the **impl-qualified call**:
+
+```blink
+trait Alpha { fn make() -> Self }
+trait Beta { fn make() -> Self }
+
+type Widget { v: Int }
+
+impl Alpha for Widget { fn make() -> Self { Widget { v: 1 } } }
+impl Beta for Widget { fn make() -> Self { Widget { v: 2 } } }
+
+fn main() {
+    let a = Widget.make()                // COMPILE ERROR E0522: `make` is in Alpha and Beta
+    let b = Alpha.make()                 // COMPILE ERROR: no receiver, so no `Self`
+    let c = (Alpha for Widget).make()    // OK: Widget { v: 1 }
+    let d = (Beta for Widget).make()     // OK: Widget { v: 2 }
+}
+```
+
+The head `(Trait for Type)` uses the same words in the same order as the header `impl Trait for Type`. It selects that impl. The call then takes any method of the trait, with `Self` set to `Type` and with the parameters the trait declares for that method. Resolution is fixed at type check, as for every other call (*Built-in Type Method Dispatch* below), and the call lowers to a direct call to that impl's method.
+
+The rules:
+
+- **A trait instance on the left, a type on the right.** A generic trait takes its full instance, so `(From[U8] for Widget)` and `(From[Char] for Widget)` select different impls. Inside a generic function the type may be a type parameter, under its own name: `(Alpha for T).make()` needs the bound `T: Alpha`.
+- **Only a callee head.** `(Trait for Type)` is valid only directly before `.method(`. It is not a type and not a value: `let m = (Alpha for Widget)` and `(Alpha for Widget).make` without a call are errors.
+- **The type must implement the trait.** If it does not, the call is `TraitBoundNotSatisfied` (E0306), reported at the head.
+- **The method must belong to the trait.** A method that the trait does not declare is a compile error, the same as `Trait.method(x)` with a method the trait does not have.
+- **A method's own type parameters** follow §3.4 *Explicit Type Application*, as for any callee.
+- **The left side must name a trait.** If it does not, the call is `QualifiedHeadNotTrait` (E0740). The most likely cause is the order of Rust's `<Widget as Alpha>`: `(Widget for Alpha)`. When the left side resolves to a type and the right side resolves to a trait, the note says which side is the trait, and the help gives the corrected head `(Alpha for Widget)`. When either name does not resolve, or the kinds are not swapped, the help suggests no swap, and an unresolved name keeps its own error. The spec fixes this content, not the wording.
+
+```blink
+fn pair[T: Alpha + Beta]() -> (T, T) {
+    ((Alpha for T).make(), (Beta for T).make())    // the type parameter, under its own name
+}
+
+let w = (From[U8] for Widget).from(b)              // a generic trait, with its full instance
+
+let x = (Widget for Alpha).make()   // COMPILE ERROR E0740: `Alpha` is a trait; write `(Alpha for Widget)`
+```
+
+```
+error[QualifiedHeadNotTrait]: the left side of `for` must name a trait
+ --> main.bl:9:10
+  |
+9 | let x = (Widget for Alpha).make()
+  |          ^^^^^^^^^^^^^^^^ `Widget` is a type and `Alpha` is a trait
+  |
+  = note: the head is `(Trait for Type)`, in the same order as `impl Trait for Type`
+  = help: write `(Alpha for Widget).make()`
+```
+
+**A method with a receiver.** The head also works on a method that takes `self`, and then the receiver is the first argument: `(Display for User).display(u)` is the same call as `Display.display(u)`. The rule is one rule for every method: select the impl, then call the method with its declared parameters. The shorter `Trait.method(x)` stays the normal form for a call with a receiver. Help text and documentation print that form, and `blink fmt` never rewrites either form to the other.
+
+**No inference of `Self`.** `Alpha.make()` stays an error even when an expected type is present, as in `let w: Widget = Alpha.make()`. The error's help gives the impl-qualified form. Inference of `Self` from the expected type is not part of the language. A later version can add it without a change to the meaning of any program that compiles today.
+
+**E0522 help.** When the ambiguous call has a receiver, the help keeps one `Trait.method(x)` line per owner, as in *Trait Method Lookup* above. When the ambiguous method is an associated function, the help gives one impl-qualified line per owner, each one a line the user can paste without edits:
+
+```
+error[AmbiguousMethodCall]: ambiguous method call
+ --> main.bl:10:13
+   |
+10 |     let a = Widget.make()
+   |                    ^^^^ method `make` found in multiple traits
+   |
+   = note: `make` is defined in both `Alpha` and `Beta` for `Widget`
+   = help: use an impl-qualified call to choose one:
+   |   (Alpha for Widget).make()
+   |   (Beta for Widget).make()
+```
+
+In a generic body the help prints the type parameter under its own name (`(Alpha for T).make()`). For a generic trait it prints the full instance as the bound spells it (`(From[U8] for Widget).from(b)`). A rename of one method is also a fix, and `blink explain E0522` gives it; the help lines give only the calls.
 
 #### Effect Handle Operations
 
