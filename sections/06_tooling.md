@@ -4,7 +4,7 @@
 
 Most languages treat tooling as an afterthought — a separate ecosystem of linters, formatters, package managers, and IDE plugins built by third parties, often incompatible, always fragmented. Blink rejects this entirely.
 
-In Blink, the tooling is not adjacent to the language. It is the language. The compiler, formatter, package manager, test runner, and LSP are a single unified system with one dependency graph, one data model, and one structured output format. Every tool speaks the same AST. Every tool is driven by the same daemon process.
+In Blink, the tooling is not adjacent to the language. It is the language. The compiler, formatter, package manager, test runner, and LSP are a single unified system with one dependency graph, one data model, and one structured output format. Every tool is driven by the same daemon process.
 
 This matters for AI-assisted development because:
 
@@ -20,53 +20,28 @@ The combined effect is transformative: Blink gives an AI agent roughly 8x the ef
 
 ---
 
-### 8.2 Compiler-as-Service Architecture
+### 8.2 Compiler as a Service
 
-The Blink compiler is not a batch process. It is a persistent daemon that runs for the lifetime of a development session, maintaining a live, incremental model of the entire codebase.
-
-```
-┌─────────────────────────────────────────────────┐
-│                 blink daemon                      │
-│                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
-│  │ Parser   │  │ Type     │  │ Effect       │   │
-│  │ (incr.)  │──│ Checker  │──│ Checker      │   │
-│  └──────────┘  └──────────┘  └──────────────┘   │
-│       │              │              │             │
-│       ▼              ▼              ▼             │
-│  ┌───────────────────────────────────────────┐   │
-│  │         Symbol-Level Dependency Graph      │   │
-│  └───────────────────────────────────────────┘   │
-│       │         │         │         │             │
-│       ▼         ▼         ▼         ▼             │
-│     LSP     Diagnostics  Query    Codegen        │
-│    Server    (JSON)      Engine   (on demand)    │
-│                                                  │
-└─────────────────────────────────────────────────┘
-```
+The Blink compiler is not a batch process. It runs as a persistent daemon for the length of a development session. The daemon keeps a live model of the codebase between commands.
 
 Key properties:
 
-**Symbol-level granularity.** The dependency graph tracks individual functions, types, and traits — not files. When you change one function, the daemon re-checks only that function and its direct dependents. File-level granularity (Rust, Go) re-checks entire files; Blink re-checks the minimal subgraph.
+**Fine-grained re-checking.** When you change one function, the daemon re-checks that function and the code that depends on it. It does not re-check the whole file.
 
-**The compiler IS the LSP.** There is no separate LSP implementation that reimplements half the compiler and gets the other half wrong. Completions, hover info, go-to-definition, refactoring, and diagnostics all come from the same type-checking pass that produces compilation errors. They are always consistent.
+**The compiler IS the LSP.** There is no separate LSP implementation that reimplements half the compiler and gets the other half wrong. Completions, hover info, go-to-definition, refactoring, and diagnostics all come from the same checks that produce compilation errors. The CLI and the LSP always give the same diagnostics.
 
 **Structured JSON output.** Every compiler output — errors, warnings, query results, completions — is structured data with stable schemas. AI agents consume compiler output directly, not through regex parsing of terminal text.
 
-**Sub-200ms incremental checking.** Target latency for re-checking a single changed function in a 100k-line codebase. This is what makes the AI's tight generate-compile-fix loop viable. The daemon achieves this by:
-- Keeping the full symbol table in memory
-- Tracking fine-grained dependencies (function A calls function B, not "file X imports file Y")
-- Only re-running type inference / effect checking on the changed symbol and its reverse dependencies
-- Deferring codegen until explicitly requested
+**Sub-200ms incremental checking.** The goal is a latency under 200ms for re-checking a single changed function in a 100k-line codebase. This is what makes the AI's tight generate-compile-fix loop viable. The daemon generates code only when you ask for it.
 
 ```sh
 # The daemon starts automatically on first blink command
 blink check              # type-check, daemon stays alive
-blink check src/auth.bl  # re-check one file (daemon uses cached graph)
+blink check src/auth.bl  # re-check one file (daemon uses cached results)
 
 # Explicit daemon management
 blink daemon start       # start manually
-blink daemon status      # show uptime, memory, graph size
+blink daemon status      # show uptime and memory use
 blink daemon stop        # shut down
 ```
 
@@ -427,7 +402,7 @@ What this means in practice:
 - **No bikeshedding.** Tabs vs spaces, brace placement, line length — none of these are decisions. They are answered by the grammar itself.
 - **Deterministic output.** Given any syntactically valid Blink program, `blink fmt` produces exactly one output. Two developers formatting the same code always get identical results.
 
-The formatter runs in the compiler daemon, so it shares the parser. Formatting is near-instantaneous — it is a render pass over the AST, not a separate parse-transform-emit pipeline.
+The formatter runs in the compiler daemon.
 
 ---
 
@@ -877,7 +852,7 @@ test "unwrap on empty list panics" {
 
 The body is a `{ ... }` block (not a closure), the optional `matching:` argument is a literal **substring** test on the panic message, and the construct is test-only and valueless. On failure the runner renders structured output: a body that returns without panicking is **E0831** (`expected the block to panic, but it returned normally`); a panic whose message lacks the `matching:` substring is **E0832**, which prints the expected substring, the **full actual panic message**, and the source location where the panic fired. A passing `assert_panics` consumes the panic — the test status is `"passed"`, not `"panicked"`. In-scope `with`/`Closeable` resources opened inside the block are released on the expected panic (§4.6.3, *armed* catchable unwind). See §2.20 for the full semantics, the test-only (E0833) and no-nesting (E0834) rules, and the R3-fence amendment.
 
-For testing that a *separate binary* exits via panic (e.g. the compiler's own end-to-end suite), continue to isolate the call in a subprocess via `process_run` and inspect `exit_code`/`err_out` (the approach used by `tests/compile_test_helpers.bl`); `assert_panics` is for in-process expressions within the test itself.
+For testing that a *separate binary* exits via panic, continue to isolate the call in a subprocess via `process_run` and inspect `exit_code`/`err_out`; `assert_panics` is for in-process expressions within the test itself.
 
 ##### Table-driven tests: `for_each`
 
@@ -1101,7 +1076,7 @@ test "setup writes log path before reload" {
 `capture_log` is a free-fn factory: `fn capture_log(messages: List[Str]) -> Handler[IO.Log]`. `mock_clock` and `mock_env` are controller structs returned by `mock_clock(start)` / `mock_env(initial)`. **The shapes diverge deliberately:**
 
 - **Free-fn factory for stateless sinks.** `IO.Log`, `IO.Print`, `IO.Eprint` are write-only — the test passes in a `List[Str]`, the handler appends, the test asserts on the list. There is no state to inspect beyond the captured list. The free-fn factory shape is the minimum surface that does the job.
-- **Controller struct for stateful mocks.** `Time` and `Env` have mock state that the test wants to read *and* manipulate: `mock_clock` needs `.advance(d)` to drive timeouts past thresholds; `mock_env` needs `.set(name, value)` for mid-test mutation and `.writes()` for CUT-write observation. A free-fn factory `frozen_clock(i: Instant) -> Handler[Time]` with module-level `mut` state for recording would break under nested `with` blocks (the inner `frozen_clock(t2)` would overwrite the outer `_clock_fixed`, and the outer scope's resumption would read inner time on inner exit). Each factory call makes new `let mut` bindings, and the controller's handler and closures capture them (§2.8, §4.7), so nested mocks stay isolated. The state does not live in the controller's fields: `self` is a by-value copy, and a write through it does not reach the caller (§3.6). The `Cleanup` precedent in `lib/std/testing.bl` (`type Cleanup { action: fn() -> () }` with `impl BlockHandler for Cleanup`) proves the controller pattern is library-deliverable today.
+- **Controller struct for stateful mocks.** `Time` and `Env` have mock state that the test wants to read *and* manipulate: `mock_clock` needs `.advance(d)` to drive timeouts past thresholds; `mock_env` needs `.set(name, value)` for mid-test mutation and `.writes()` for CUT-write observation. A free-fn factory such as `frozen_clock(i: Instant) -> Handler[Time]` cannot hold this state safely: nested `with` blocks would share it, and the inner mock would change the time the outer mock reports. Each factory call makes new `let mut` bindings, and the controller's handler and closures capture them (§2.8, §4.7), so nested mocks stay isolated. The state does not live in the controller's fields: `self` is a by-value copy, and a write through it does not reach the caller (§3.6).
 
 **Rule for AI generation and for adding future mocks:**
 
@@ -1165,13 +1140,7 @@ blink test                              # entropy-seeded; seed printed on failur
 
 The `--seed` flag accepts either a `0x`-prefixed hex literal or a decimal integer. Without `--seed`, the runner picks a fresh seed from OS entropy at the start of each invocation. In both cases the seed is the **suite seed** — it is the root from which every property test's input stream and every effect-handler installation derives a deterministic sub-seed.
 
-**Per-property sub-seed derivation.** Inside a test that uses `prop_check`, the runner does not pass the suite seed directly to the property's RNG. Instead it derives a stable per-property sub-seed:
-
-```
-sub_seed = splitmix64(suite_seed XOR siphash24(property_name))
-```
-
-The bare property name is hashed (no module prefix) so that moving a test between modules does not invalidate a reproducer. Within a binary, two `prop_check` blocks with the same `test "<name>"` are rejected by the runner — the runner emits a diagnostic listing both locations and exits with non-zero status, because A1 derivation would otherwise have them silently share a stream.
+**Per-property sub-seed derivation.** Inside a test that uses `prop_check`, the runner does not pass the suite seed directly to the property's RNG. Instead it derives a stable per-property sub-seed. The sub-seed is a deterministic function of the suite seed and the bare property name. The name has no module prefix, so that moving a test between modules does not invalidate a reproducer. Within a binary, two `prop_check` blocks with the same `test "<name>"` are rejected by the runner — the runner emits a diagnostic listing both locations and exits with non-zero status, because this derivation would otherwise have them silently share a stream.
 
 Reordering tests, filtering with `--filter`, or running shards in parallel does **not** perturb any test's sub-seed — every test is reproducible in isolation given `--seed <suite> --filter '<name>'`.
 
@@ -1292,7 +1261,7 @@ test "shuffle preserves length" {
 
 ##### PRNG algorithm
 
-`MockRand` and the runner's per-property RNG are **implementation-defined, deterministic given seed**. The current implementation uses `xoshiro256**` initialized from a `U64` seed via SplitMix64 expansion. The choice is intentionally not in the spec surface — if a future `Rand` resolution names a specific generator for the production handler, the testing-side implementation will align without breaking the user-facing API. The reproduce-by-seed contract holds for any single compiler version; the spec does not guarantee bit-identical reproduction across major versions.
+`MockRand` and the runner's per-property RNG are **implementation-defined, deterministic given seed**. The choice is intentionally not in the spec surface — if a future `Rand` resolution names a specific generator for the production handler, the testing-side implementation will align without breaking the user-facing API. The reproduce-by-seed contract holds for any single compiler version; the spec does not guarantee bit-identical reproduction across major versions.
 
 ##### Stated assumption about the `Rand` effect
 
@@ -1306,7 +1275,7 @@ The following are intentionally out of scope for this subsection and are tracked
 - **`--rerun-failed`**. Re-reads the previous run's NDJSON and replays only the failing tests at their recorded sub-seeds. Distinct from `--seed`.
 - **`unseeded_rand_in_test` lint**. Warn when a test installs the real `rand` handler without seeding.
 
-**Panel vote: 6-0** for the `MockRand` controller struct shape, `mock_rand` naming, resolving now (not deferring on `Rand` effect finalization), and SplitMix64-of-name-hash sub-seed derivation. **5-1** for shipping `--seed` (Minimalism dissent: pure-addition without removal, prefers persisted counterexamples as the reproducibility primitive). See [DECISIONS.md](../DECISIONS.md) and [decisions/test-seed-determinism.md](../decisions/test-seed-determinism.md).
+**Panel vote: 6-0** for the `MockRand` controller struct shape, `mock_rand` naming, resolving now (not deferring on `Rand` effect finalization), and the per-property sub-seed derivation. **5-1** for shipping `--seed` (Minimalism dissent: pure-addition without removal, prefers persisted counterexamples as the reproducibility primitive). See [DECISIONS.md](../DECISIONS.md) and [decisions/test-seed-determinism.md](../decisions/test-seed-determinism.md).
 
 ---
 
@@ -1422,10 +1391,10 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 
 `Map` and `Set` randomize their hash seed per process by default (§3.6, Hash Contract and Seeding). Iteration order therefore varies between runs. Two mechanisms pin it for cases that need byte-stable output — golden-file tests, fixture-driven runners, and the self-hosting Gen1/Gen2 diff:
 
-- **`--deterministic`** (a `build` / `run` / `test` flag): pins the hash seed to `0`. The pin is baked into the emitted program, so a `--deterministic`-built binary reproduces its iteration order regardless of environment. This is the knob golden-file and self-host-diff runs pass.
+- **`--deterministic`** (a `build` / `run` / `test` flag): pins the hash seed to `0`. A `--deterministic`-built binary uses seed `0` and reproduces its iteration order regardless of environment. This is the knob golden-file and self-host-diff runs pass.
 - **`BLINK_MAP_SEED=<u64>`** (environment variable, decimal): pins the hash seed to an arbitrary value at runtime, without recompiling. It is the no-rebuild reproduction path — capture the seed a failing run reports and re-run with `BLINK_MAP_SEED=<value>` — and, unlike a flag, it propagates across `process_run`/`exec` boundaries to child processes.
 
-Precedence, highest first: `--deterministic` (pins `0`) > `BLINK_MAP_SEED` (pins its value) > entropy (`time ^ pid`, the default). Both are **reproducibility mechanisms, not security controls**: the seed grants no capability and the value is not part of any program's observable semantics (§3.6).
+Precedence, highest first: `--deterministic` (pins `0`) > `BLINK_MAP_SEED` (pins its value) > a per-process random seed (the default). Both are **reproducibility mechanisms, not security controls**: the seed grants no capability and the value is not part of any program's observable semantics (§3.6).
 
 **Relationship to `--seed`.** The test runner's `--seed` (§8.10.4) is a separate knob: it seeds the RNG / `prop_check` input streams, and does **not** affect `Map`/`Set` hash seeding. Map-iteration determinism is controlled only by `--deterministic` / `BLINK_MAP_SEED`. The two are independent because reproducing a random *draw* and reproducing hash *bucketing* are different concerns; pinning one does not pin the other (panel: 3-2-1, resolved NO / keep-distinct by user tiebreak — see [decisions/hash-seed-iteration-order.md](../decisions/hash-seed-iteration-order.md)).
 
@@ -1555,7 +1524,7 @@ Semantic diffs answer the questions humans and AI actually care about:
 
 ### 8.13 `blink eval` — Fast Interactive Execution
 
-For rapid AI iteration, `blink eval` interprets code directly from the AST with full type checking and effect tracking — no compilation step:
+For rapid AI iteration, `blink eval` interprets code with full type checking and effect tracking — no compilation step:
 
 ```sh
 blink eval "auth.login(\"test@example.com\", \"pass123\", \"127.0.0.1\")"
@@ -1704,7 +1673,7 @@ Per-event fields:
 | `args` | `{name: str}` | `effect` | Operation arguments as Display strings |
 
 Design notes:
-- **`span` appears only on `enter`** — source location is static per function, saving ~40 bytes on other events.
+- **`span` appears only on `enter`** — source location is static per function.
 - **`module` is a separate field** despite being derivable from `fn` — enables O(1) module-level filtering without string splitting.
 - **`duration_us` on `exit`** — computed by the emitter rather than requiring consumers to maintain an enter-timestamp stack.
 - **All values are Display strings** — bounded serialization cost; values longer than 200 characters are truncated with a `"truncated":true` field appended.
@@ -1745,7 +1714,7 @@ Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment va
 
 #### 8.15.6 Timestamp Semantics
 
-`ts_us` is a monotonic microsecond counter relative to trace start (not wall-clock time). The clock source is `clock_gettime(CLOCK_MONOTONIC)` on Linux, `mach_absolute_time()` on macOS. Microsecond resolution matches the instrumentation overhead — sub-microsecond precision would measure the tracer, not the program.
+`ts_us` is a monotonic microsecond counter relative to trace start (not wall-clock time). Microsecond resolution matches the instrumentation overhead — sub-microsecond precision would measure the tracer, not the program.
 
 ---
 
@@ -1766,7 +1735,7 @@ edition = "2026"
 
 **Semantics:**
 
-- **Per-package.** Each package in a dependency graph can use a different edition. A 2026-edition library compiles alongside a 2028-edition application with no friction — the compiler carries code for all editions simultaneously.
+- **Per-package.** Each package in a dependency graph can use a different edition. A 2026-edition library compiles alongside a 2028-edition application with no friction.
 - **Scope.** Editions gate three things:
   1. **Stdlib API** — deprecated functions become errors, new defaults take effect
   2. **Keywords** — a new edition can reserve identifiers (e.g., promoting a soft keyword to a keyword; §2.23 *Soft Keywords*)
@@ -1885,7 +1854,7 @@ The `blink migrate` command is idempotent. Running it on a package that is alrea
 
 #### 8.16.4 `blink editions`
 
-The `blink editions` command displays a built-in changelog of all editions, compiled directly into the `blink` binary. No network access required — the changelog is always available offline.
+The `blink editions` command displays a changelog of all editions. No network access required — the changelog is always available offline.
 
 ```sh
 blink editions
@@ -1916,7 +1885,7 @@ The changelog is also exposed in the `llms.txt` header (§8.3) as an edition-spe
 
 - **At most one edition per year.** Editions are not releases — they are compatibility snapshots. Most years will have zero or one edition.
 - **2+ year deprecation window.** Any item deprecated in edition N cannot have `removal` earlier than edition N+2. This gives downstream consumers at minimum two years to migrate.
-- **Infinite backward compatibility.** The compiler never drops edition support. Edition 2026 code compiles with the 2040 compiler. The cost of carrying old editions is near-zero — edition logic is a small set of conditionals in stdlib resolution and lint severity tables.
+- **Infinite backward compatibility.** The compiler never drops edition support. Edition 2026 code compiles with the 2040 compiler.
 - **Enforced semver (v2).** In v2, the package manager enforces that `removal` editions align with major version bumps of the package. A library cannot remove a deprecated API within the same major version. This is not enforced in v1 (path + git deps only, no registry infrastructure).
 - **No flag days.** Because editions are per-package and compatibility is infinite, there is never a moment where the ecosystem must upgrade in lockstep. Each package migrates on its own schedule.
 
