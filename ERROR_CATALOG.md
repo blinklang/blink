@@ -176,6 +176,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | PackageEntryNotFound | E1009 | Package entry file `<pkg>/src/<name>.bl` is missing | Modules | §10.1 |
 | OrphanFile | E1010 | Source file has no enclosing `blink.toml` | Modules | §10.1 |
 | InvalidPackageName | E1011 | `[package].name` violates package-name grammar | Modules | §10.1 |
+| DuplicateSymbol | E1012 | A module-level declaration (`type`, alias, `trait`, `effect`, `fn`, `let`) takes a name that a selective import (`import` or `pub import`) binds; the check uses the name after `as`. Replaces W0602 on that import entry | Modules | §10.5 |
 | InlineModuleNotSupported | E1015 | Inline `mod name { ... }` blocks are not supported | Modules | §10.1 |
 | PackageNotDeclared | E1052 | Package not declared in blink.toml — Tier 2 package needs explicit dependency | Stdlib | §10.7.1 |
 | UnexpectedToken | E1100 | Parser found a token in an unexpected position | Parser | §2 |
