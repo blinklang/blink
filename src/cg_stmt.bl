@@ -1754,8 +1754,9 @@ fn lower_tail_block_into(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int 
 // place it does not belong: a block of its own, which is walked for each of its own
 // statements; a closure body, which is another function; a loop test, a match guard and
 // the right operand of a short-circuit, each of which runs a different number of times
-// than the statement around it. A shape left unwalked is not wrong C. The expression
-// stage refuses a value it was given no temp for, by name.
+// than the statement around it. Each of those gets a walk of its own where it runs, from
+// cg_stmt_materialise_where_run. A shape left unwalked is not wrong C. The expression stage
+// refuses a value it was given no temp for, by name.
 //
 // Answers false when a shape was refused, so the statement stops on the one named report
 // rather than lowering into a read of a temp nothing declared; see The stop above.
@@ -1763,6 +1764,23 @@ fn materialise_stmt_values(s: Int) -> Bool ! Diag.Report {
     mv_work = []
     mv_in_target = false
     mv_stmt(s)
+}
+
+// A part of a statement that runs a different number of times than the statement -- a
+// loop test, a match guard, the right operand of `&&`, `||` or `??` -- walked where it
+// runs rather than above the statement, so the temps it needs land in the pending
+// statements its caller places there. It can sit inside a walk of an enclosing statement
+// (a guard in a value-position match), so that walk's record is put back once this one is
+// done.
+pub fn cg_stmt_materialise_where_run(e: Int) -> Bool ! Diag.Report {
+    let outer_work = mv_work
+    let outer_in_target = mv_in_target
+    mv_work = []
+    mv_in_target = false
+    let ok = mv_expr(e)
+    mv_work = outer_work
+    mv_in_target = outer_in_target
+    ok
 }
 
 fn mv_stmt(s: Int) -> Bool ! Diag.Report {
@@ -2022,7 +2040,8 @@ fn mv_binop(e: Int) -> Bool ! Diag.Report {
     // The right operand of `&&`, `||` and `??` runs only when the left one decided
     // nothing, and the expression stage builds each as an `if`. A temp filled in front of
     // the statement would run it every time, which both changes what the program does and
-    // can run work the left operand was guarding.
+    // can run work the left operand was guarding, so the expression stage walks it inside
+    // that `if` instead.
     if op == "&&" { return mv_moves_work(e) }
     if op == "||" { return mv_moves_work(e) }
     if op == "??" { return mv_moves_work(e) }
@@ -2257,6 +2276,7 @@ fn lower_while(node: Int) -> Int ! Diag.Report {
     // turns after the first would read a stale temp. The loop body already runs every turn,
     // so the statements land there, ahead of the guard that reads what they filled.
     let mark = cg_expr_pending_count()
+    if !cg_stmt_materialise_where_run(cond_node) { return -1 }
     let tested = lower_value(cond_node)
     let hoisted = cg_expr_take_pending(mark)
     let cond = ir_binary(tid, cond_node, rec.c_spelling, "==",
@@ -4064,6 +4084,10 @@ fn guarded_arm_block(ctx: MatchCtx, arm: Int, guard: Int, extra: List[Int]) -> I
     // the guard's `if`. Left to the enclosing block it would run above the whole match, for
     // arms that never match, before the binders it reads exist.
     let mark = cg_expr_pending_count()
+    if !cg_stmt_materialise_where_run(guard) {
+        close_scope()
+        return -1
+    }
     let tested = lower_value(guard)
     let hoisted = cg_expr_take_pending(mark)
     let mut h = 0
