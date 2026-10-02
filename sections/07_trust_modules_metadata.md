@@ -423,7 +423,7 @@ This is the **canonical** `Ptr[T]` operations table. §9.1.3 extends it with `@f
 
 | Operation | Signature | C Mapping | Description |
 |-----------|-----------|-----------|-------------|
-| `alloc_ptr[T]()` | `fn alloc_ptr[T]() -> Ptr[T]` | `calloc(1, sizeof(T))` | Allocate zero-initialized memory for one `T` (GC-registered fallback; prefer `scope.alloc`) |
+| `alloc_ptr[T]()` | `fn alloc_ptr[T]() -> Ptr[T]` | zeroed memory of `sizeof(T)` bytes | Allocate zero-initialized memory for one `T` (freed at an unspecified later time; prefer `scope.alloc`) |
 | `null_ptr[T]()` | `fn null_ptr[T]() -> Ptr[T]` | `NULL` | Construct a null pointer of type `Ptr[T]` — the only way to spell `NULL` in Blink |
 | `.deref()` | `fn deref(self) -> T` | `*ptr` | Read the value behind the pointer. **No null check** — the pointee is an audited premise (see *Nullability*). Rejected on `Ptr[Void]` (E0825) |
 | `.write(value)` | `fn write(self, value: T)` | `*ptr = value` | Write a value through the pointer. Takes plain `self`: a write through a pointer is an effect, not a `mut` mutation (§3.6 *Mutable Parameters*). Rejected on `Ptr[Void]` (E0825) |
@@ -453,9 +453,9 @@ with ffi.scope() as scope {
 
 **`.write()` restriction:** Writing a GC-managed reference through a pointer is a compile error. Only FFI-compatible values (integers, floats, other pointers) can be written.
 
-**`.as_cstr()` semantics:** Creates a `malloc`'d null-terminated copy of the Blink string's bytes. The copy is allocated outside the GC and must be freed via `ffi.scope()` or manual cleanup. This is a method on `Str`, not on `Ptr[T]`.
+**`.as_cstr()` semantics:** Creates a null-terminated copy of the Blink string's bytes. Free the copy with `ffi.scope()` or manual cleanup. This is a method on `Str`, not on `Ptr[T]`.
 
-**`.to_str()` semantics:** Reads bytes from a `Ptr[U8]` until a null terminator, creates a GC-managed Blink `Str`. Returns `None` if the pointer is null — an `Option` earned by the walk to the terminator, which observes nullness as a value.
+**`.to_str()` semantics:** Reads bytes from a `Ptr[U8]` until a null terminator, and creates a Blink `Str`. Returns `None` if the pointer is null — an `Option` earned by the walk to the terminator, which observes nullness as a value.
 
 #### Example: Complete FFI Wrapper
 
@@ -532,15 +532,15 @@ fn leaks() ! IO {
                                          //   only as a `with ... as` resource
                                          // help: bind it as a `with` resource:
                                          //   `with ffi.scope() as arena { ... }`
-                                         // help: for one plain allocation with GC cleanup, use
+                                         // help: for one plain allocation with late cleanup, use
                                          //   `alloc_ptr[T]()` instead of a scope
     let buf = arena.alloc[U8]()
 }
 ```
 
-The rule is stated over the **type**, not over the `ffi.scope()` call, because the hazard belongs to the value. A scope owns a libc `malloc`/`free` arena whose extent must be lexical, and every position the rule excludes is a position from which that arena outlives the block that frees it — however the value arrived there. A rule stated over the call site would test how the call is *written*, so any binding or indirection walks past it while the hazard is unchanged, and it would need a fresh clause for every future function that produces a scope.
+The rule is stated over the **type**, not over the `ffi.scope()` call, because the hazard belongs to the value. A scope owns memory whose extent must be lexical, and every position the rule excludes is a position from which that memory outlives the block that frees it — however the value arrived there. A rule stated over the call site would test how the call is *written*, so any binding or indirection walks past it while the hazard is unchanged, and it would need a fresh clause for every future function that produces a scope.
 
-**Why this is an error where the `Closeable`-without-scope rule is a warning.** A `Closeable` value used outside `with ... as` is still reclaimed; that warning reports a resource released late and non-deterministically. An `FfiScope` used outside `with ... as` releases **nothing** — its arena is libc memory the collector does not see, so every allocation made through it leaks for the life of the process. The two rules differ in severity because they differ in outcome, not in strictness. (See §5.5, *`Closeable` values and `with ... as`*, named here rather than cited by code number.)
+**Why this is an error where the `Closeable`-without-scope rule is a warning.** A `Closeable` value used outside `with ... as` is still reclaimed; that warning reports a resource released late and non-deterministically. An `FfiScope` used outside `with ... as` releases **nothing** — every allocation made through it leaks for the life of the process. The two rules differ in severity because they differ in outcome, not in strictness. (See §5.5, *`Closeable` values and `with ... as`*, named here rather than cited by code number.)
 
 **Message conditions** (normative, per §3.1 *Diagnostic Discipline*):
 - The shown repair carries the **author's own binder**, not a hardcoded `scope`.
@@ -577,17 +577,17 @@ pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
 }
 ```
 
-**Standalone `alloc_ptr[T]()`:** The top-level `alloc_ptr[T]()` function (not on a scope) allocates GC-registered memory with a finalizer that calls `free()` on collection. This is the fallback for simple cases where scoped allocation is unnecessarily ceremonial. Prefer `ffi.scope()` for deterministic cleanup.
+**Standalone `alloc_ptr[T]()`:** The top-level `alloc_ptr[T]()` function (not on a scope) allocates zeroed memory that the runtime frees at some later, unspecified time. This is the fallback for simple cases where scoped allocation is unnecessarily ceremonial. Prefer `ffi.scope()` for deterministic cleanup.
 
 ```blink
-// Simple case: GC handles cleanup
-let buf = alloc_ptr[U8]()  // GC-registered, freed on collection
+// Simple case: the runtime frees the memory later
+let buf = alloc_ptr[U8]()  // freed at an unspecified later time
 let rc = raw_gethostname(buf, 256)
 let hostname = buf.to_str() ?? "unknown"
-// buf freed whenever GC collects it
+// buf freed at some later, unspecified time
 ```
 
-**Guidance:** Use `ffi.scope()` when the C library requires deterministic cleanup (databases, file handles, allocated buffers). Use standalone `alloc_ptr` only for trivial, short-lived allocations where GC collection is acceptable.
+**Guidance:** Use `ffi.scope()` when the C library requires deterministic cleanup (databases, file handles, allocated buffers). Use standalone `alloc_ptr` only for trivial, short-lived allocations where a late free is acceptable.
 
 #### Scope tags
 
@@ -693,7 +693,7 @@ warning[W0810]: unscoped pointer allocation
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ allocated outside `ffi.scope()`
   |
   = help: wrap in `with ffi.scope() as scope { scope.alloc[Void]() }`
-  = note: unscoped pointers rely on GC finalization (non-deterministic)
+  = note: unscoped pointers are freed at an unspecified later time (non-deterministic)
 
 error[E0825]: cannot deref `Ptr[Void]` — the pointee type is unknown
  --> db/sqlite.bl:22:13
@@ -795,9 +795,9 @@ error[E0820]: @ffi references undeclared native dependency
 
 The compiler uses different linking strategies for host and cross-compilation targets:
 
-**Host builds** (`blink build` with no `--target`): Dynamic linking by default. The compiler uses system-installed libraries via `-l` flags. `pkg-config` entries are resolved via the host's `pkg-config` tool.
+**Host builds** (`blink build` with no `--target`): Dynamic linking by default. The compiler uses system-installed libraries. `pkg-config` entries are resolved via the host's `pkg-config` tool.
 
-**Cross-compilation** (`blink build --target <triple>`): Static linking by default. The compiler compiles vendored C sources alongside the generated C output using the cross-compiler (e.g., `zig cc -target <triple>`). Dependencies declared as `type = "system"` with no vendored fallback produce a clear error:
+**Cross-compilation** (`blink build --target <triple>`): Static linking by default. The compiler compiles vendored C sources alongside the generated C output using a C cross-compiler (for example, `zig cc -target <triple>`). Dependencies declared as `type = "system"` with no vendored fallback produce a clear error:
 
 ```
 error[E0821]: native dependency unavailable for cross-target
@@ -813,7 +813,7 @@ error[E0821]: native dependency unavailable for cross-target
 
 The `link = "dynamic"` override forces dynamic linking for a cross-target. This is an explicit opt-in — the user accepts that the target system must have the library installed.
 
-**Compiler-managed deps** follow the same strategy automatically: the compiler bundles source for its own dependencies (e.g., the sqlite3 amalgamation) and compiles them from source during cross-compilation, or dynamically links on the host. Users never interact with this.
+**Compiler-managed deps** follow the same strategy automatically: the toolchain bundles its own dependencies (for example, sqlite3) and builds them from source during cross-compilation, or dynamically links on the host. Users never interact with this.
 
 #### Compiler-Managed Dependency List
 
@@ -821,7 +821,7 @@ The following native C dependencies are compiler-managed. This list is exhaustiv
 
 | Module | C Dependency | Strategy |
 |--------|-------------|----------|
-| `db.*` | sqlite3 | Amalgamation bundled with compiler |
+| `db.*` | sqlite3 | Bundled with the toolchain |
 | `net.*` | POSIX sockets | System headers (no library linkage) |
 | runtime | libc, libm | System (always available) |
 | `async.*` | pthreads | System (`-pthread` flag) |
@@ -863,7 +863,7 @@ pub type Pollfd {
 }
 ```
 
-`@ffi.struct(header, name)` declares that a Blink type mirrors a named C struct from a specific C header. The header is resolved against the project's `[native-dependencies].headers` list. Fields are listed in declaration order and must use sized FFI-compatible types: `I8`/`I16`/`I32`/`Int`, `U8`/`U16`/`U32`/`U64`, `F32`/`Float`, `Bool`, `Ptr[T]`, or another `@ffi.struct` type. List, Str, Bytes, Map, Result, Option, and trait types are rejected with `E0812` (extending the existing GC-types-cannot-cross-FFI rule from `E0810` for `Ptr[T]`). A `Buf[T]` field is rejected with `E0822`: a `Buf` value is a `blink_buf_t*`, not the C pointer the field declares, and the size `_Static_assert` cannot catch the difference. Use `Ptr[T]`.
+`@ffi.struct(header, name)` declares that a Blink type mirrors a named C struct from a specific C header. The header is resolved against the project's `[native-dependencies].headers` list. Fields are listed in declaration order and must use sized FFI-compatible types: `I8`/`I16`/`I32`/`Int`, `U8`/`U16`/`U32`/`U64`, `F32`/`Float`, `Bool`, `Ptr[T]`, or another `@ffi.struct` type. List, Str, Bytes, Map, Result, Option, and trait types are rejected with `E0812` (extending the existing GC-types-cannot-cross-FFI rule from `E0810` for `Ptr[T]`). A `Buf[T]` field is rejected with `E0822`: a `Buf` is not the C pointer the field declares, and the layout check cannot catch the difference. Use `Ptr[T]`.
 
 **`Bool` at the FFI boundary.** In an FFI position (an `@ffi.struct` field, an `@ffi` parameter or an `@ffi` return), `Bool` is C `bool` (`_Bool`): the struct mirror and the foreign prototype spell it `bool`, with C's size and alignment. A `Bool` read from C (an `@ffi` return, or an `@ffi.struct` field read) is always `true` or `false`, as every `Bool` is (§3.4 *`Bool` Is Distinct from `Int`*). A C `int` used as a flag is not a `bool`: declare it `I32` and convert with `!= 0`.
 
@@ -906,9 +906,9 @@ with ffi.scope() as scope {
 }
 ```
 
-Desugaring rule: `p.field.read()` lowers to `*(typeof(field)*)((char*)p + offsetof(T, field))`; `p.field.write(v)` lowers to the same `lvalue = v`. The `_Static_assert` codegen described below witnesses that the offsets the Blink compiler computed match the C ABI.
+Rule: `p.field.read()` reads the C field at its C offset; `p.field.write(v)` writes it. The layout check described below verifies that the offsets of the declaration match the C ABI.
 
-`p.field` outside a `read()`/`write()` call is rejected. There is no first-class "pointer to field" value in user surface — `field_addr` is a compiler-internal desugar, not a user-callable op.
+`p.field` outside a `read()`/`write()` call is rejected. There is no first-class "pointer to field" value.
 
 #### Array allocation: `scope.alloc_n[T](n)`
 
@@ -925,7 +925,7 @@ with ffi.scope() as scope {
 }
 ```
 
-`scope.alloc_n[T](n)` allocates `n * sizeof(T)` zeroed bytes (`calloc`) and returns a `Ptr[T]` aliasing the first cell. The result lives until the enclosing `ffi.scope` exits. `pfds.offset(i)` (added to the §9.1.1 op table as op #9) returns a `Ptr[T]` aliasing cell `i`; bounds are not checked at the language level — the user is responsible for staying within `n`.
+`scope.alloc_n[T](n)` allocates zeroed memory for `n` cells of `T` and returns a `Ptr[T]` aliasing the first cell. The result lives until the enclosing `ffi.scope` exits. `pfds.offset(i)` (added to the §9.1.1 op table as op #9) returns a `Ptr[T]` aliasing cell `i`; bounds are not checked at the language level — the user is responsible for staying within `n`.
 
 `offset(i)` is permitted only on `Ptr[T]` values returned by `alloc_n` or by another `offset`; it is rejected on the singleton-cell `alloc[T]()` result with `E0813`.
 
@@ -951,10 +951,10 @@ Signature:
 fn with_ptr[R](self: Bytes, body: fn(Ptr[U8]) -> R ! _) -> R ! _
 ```
 
-The closure body holds a `Ptr[U8]` aliasing the `Bytes`'s GC-managed `data` field. Soundness rests on three invariants:
+The closure body holds a `Ptr[U8]` aliasing the data of the `Bytes`. Soundness rests on three invariants:
 
-1. **The Boehm-Demers-Weiser collector is non-moving by design contract.** This is a runtime constraint on the GC choice, not an accident; replacing BDW with a moving collector would require revisiting α-1.
-2. **The closure capture of `self` keeps the `Bytes` reachable** for the duration of the call — BDW's conservative scan sees the `blink_bytes*` on the C stack inside the inlined closure body.
+1. **The memory of the `Bytes` does not move** while the closure runs.
+2. **The closure keeps the `Bytes` alive** for the duration of the call.
 3. **The closure body must not call growth-effecting methods on `self`.** This is the closure-lexical no-grow check (§9.1.3.1 below).
 
 `Bytes.with_ptr` forwards the effect row of its closure (`! _`, §4.15.2): the call has exactly the effects of the `@ffi` functions the closure calls. It ships in `std.bytes`. It is the only sanctioned form of Bytes→Ptr aliasing. User-code Bytes→Ptr bridges are forbidden (see Bytes Bridge Doctrine below).
@@ -985,19 +985,19 @@ User code is **forbidden** from constructing a `Ptr[U8]` that aliases a `Bytes`'
 The sanctioned paths for Bytes ↔ FFI interop are:
 
 1. `Bytes.with_ptr(fn(p) { ... })` — closure-scoped, for use inside an FFI region only.
-2. `libc.copy_to_buf(b: Bytes) -> Buf[U8]` — copies bytes into a freshly-allocated, scope-tied `Buf[U8]`. See §9.1.3.2 for the runtime representation, surface, and naming rules.
-3. `libc.copy_from_buf(buf: Buf[U8]) -> Bytes` — copies bytes out of a `Buf[U8]` into a fresh `Bytes`. The byte count is read from the buffer's internal length field.
+2. `libc.copy_to_buf(b: Bytes) -> Buf[U8]` — copies bytes into a freshly-allocated, scope-tied `Buf[U8]`. See §9.1.3.2 for the surface and naming rules.
+3. `libc.copy_from_buf(buf: Buf[U8]) -> Bytes` — copies bytes out of a `Buf[U8]` into a fresh `Bytes`. The byte count is the length of the buffer.
 4. `libc.copy_from_buf_n(buf: Buf[U8], n: I64) -> Bytes` — truncating copy: copies up to `n` bytes (or fewer if the buffer is shorter) into a fresh `Bytes`. Used by syscalls whose return value reports the actual byte count (`read(2)`, `recv(2)`).
 
-The copies are the soundness witness: bytes cross the firewall, addresses do not. The cost is one `memcpy` per call; high-throughput byte-payload bindings (`read`, `write`, `recv`, `send`) avoid it by using `with_ptr` directly.
+The copies are the soundness witness: bytes cross the firewall, addresses do not. High-throughput byte-payload bindings (`read`, `write`, `recv`, `send`) can avoid the copy by using `with_ptr` directly.
 
 ##### Why the bridge is forbidden in user code
 
-Two reasons. First, `Bytes.data` is `GC_MALLOC`/`GC_REALLOC`-managed (see `bootstrap/runtime_core.h:146-174`); a `Ptr[U8]` aliasing it is invalidated by any growth-effecting call on the source `Bytes`, and the panel rejected the alias analysis required to detect such a call across helper boundaries. Second, the language goal is preserving the moving-GC migration option as a future possibility — keeping `Ptr` and `Buf` from naming GC-managed memory in user code makes that migration mechanical rather than ABI-breaking.
+A `Ptr[U8]` into a `Bytes` is invalid after any call that grows that `Bytes`. The panel rejected the alias analysis that would detect such a call across helper boundaries. So user code cannot hold a `Ptr` or a `Buf` that names memory of a `Bytes`.
 
-##### 9.1.3.2 `Buf[T]` runtime representation
+##### 9.1.3.2 `Buf[T]`: the scope-tied buffer
 
-Resolves the v1 ambiguity in §9.1.3 about what `Buf` actually *is*. Decided by panel deliberation [`buf-u8-runtime-representation`](../decisions/buf-u8-runtime-representation.md).
+Resolves the v1 ambiguity in §9.1.3 about what `Buf` is. Decided by panel deliberation [`buf-u8-runtime-representation`](../decisions/buf-u8-runtime-representation.md).
 
 **One generic type.** `Buf[T]` is a single generic nominal type, tagged to the enclosing `ffi.scope` by the same inferred scope tags as `Ptr[T]` (§9.1.1, *Scope tags*; `Buf[T]^σ` is meta-notation for that tag, not source syntax). The typechecker accepts any `T` at declaration sites in `@ffi.fn` signatures. There is no separate `Buf[U8]` sibling type.
 
@@ -1011,21 +1011,11 @@ Here "**language version**" denotes the compiler/spec revision reported by `blin
 
 **Sealed user surface.** `Buf[T]` has no public methods. Specifically:
 
-- No `.len()` (length lives in the runtime struct and is read by bridge primitives only).
+- No `.len()` (the length is read by bridge primitives only).
 - No `.as_ptr()`, `.read(i)`, `.write(i, v)`.
 - No public constructors. The only way to obtain a `Buf` is `libc.copy_to_buf(b)`, which returns a `Buf[U8]` tagged to the innermost enclosing `ffi.scope`. `scope.alloc_n[T](n)` returns a `Ptr[T]`, not a `Buf` (§9.1.3; see [`ffi-scope-tag-inference`](../decisions/ffi-scope-tag-inference.md), which amends this section's original decision).
 
-**Runtime representation.** A `Buf[T]` value is a pointer to a heap-allocated struct of the shape:
-
-```c
-typedef struct {
-    void*  data;     /* malloc'd, sizeof(T) * len bytes */
-    int64_t len;     /* element count, not byte count */
-    int64_t cap;     /* element capacity */
-} blink_buf_t;
-```
-
-The struct and its `data` payload are `malloc`'d (not GC-managed), registered with the enclosing `ffi.scope`, and freed in LIFO order on scope unwind. No finalizer is registered; lifetime is purely lexical.
+**Lifetime.** A `Buf[T]` is freed when its enclosing `ffi.scope` exits. Its lifetime is lexical.
 
 **Nameability — the V3 carve-out.** Whether `Buf` can be named in source depends on the syntactic context:
 
@@ -1130,7 +1120,7 @@ A curated `*_bytes` wrapper **must keep its `@ffi` syscall call inline inside th
 
 The `bytes-bridge` doc page (`blink doc bytes-bridge`) is the single canonical explainer for the byte bridge, and the `W0816` and `E0822` diagnostic explain-texts both deep-link it. It answers, in order: (1) most code never names `Buf` — use `libc.recv_bytes` / `read_bytes` / `getentropy_bytes`; (2) `Buf` is bridge-only and `U8`-only, fixed by the compiler version; (3) for a typed region use `scope.alloc_n[T]`.
 
-**Machine-queryable alphabet — one constant, three projections.** The bridge alphabet exists as exactly one normative source: a compile-time constant in the compiler (the same constant `W0816` consults). Every reporting surface is a projection of that constant, never an independently-maintained list. A build-time test asserts each surface equals the constant the typechecker reads, so they cannot drift on a future expansion:
+**Machine-queryable alphabet — one constant, three projections.** The bridge alphabet has exactly one normative definition: the set that `W0816` consults. Every reporting surface shows that same set, so the surfaces cannot differ:
 
 1. **`blink --version --json`** — the normative machine surface, for CI and humans:
 
@@ -1170,10 +1160,10 @@ Both follow the naming law of §9.1.3.3: the peer address is a non-buffer out-pa
 **`MsgFlags` (normative).** `MsgFlags` is the type of the `flags` argument of `recv_bytes`, `send_bytes`, `recvfrom_bytes` and `sendto_bytes`. It is an opaque type: it has no public constructor and no public field.
 
 - The only values are the named constants. This gate ratifies two: `MsgFlags.NONE` (no flags) and `MsgFlags.PEEK` (read a datagram without removing it from the queue). Each is a const expression (§2.21), so it is legal as a keyword default.
-- The bits inside `MsgFlags` use **Blink's** numbering, not the platform's. The runtime translates each Blink bit to the native `MSG_*` value from the C headers. A named constant has the same meaning on every platform.
+- The bits inside `MsgFlags` use **Blink's** numbering, not the platform's. A named constant has the same meaning on every platform.
 - The wrapper checks the bits before the syscall. A bit that is not a ratified constant returns `Err(Errno(ERR_INVAL))` on every platform, and the syscall does not run. A native value never reaches the kernel as a native flag.
 - `MsgFlags` has no `|` operator yet. The bit-or implementation ships with the second ratified constant that can combine with `PEEK`.
-- New constants (for example `DONTWAIT`, `WAITALL`) are added under the growth gate of §9.1.3.3. Each addition is one constant plus one row in the runtime translation table, and it does not change the meaning of any existing call.
+- New constants (for example `DONTWAIT`, `WAITALL`) are added under the growth gate of §9.1.3.3. Each addition is one constant, and it does not change the meaning of any existing call.
 - User code cannot write `MsgFlags(n)` or `MsgFlags { bits: n }`; either is a compile error. A general rule for fields that are private to their module does not exist yet. Until it does, `MsgFlags` is opaque by compiler knowledge, in the same way as `Instant` (§3).
 
 ```blink
@@ -1188,26 +1178,16 @@ libc.recv_bytes(fd, 16, flags: 0x40)                        // error: expected M
 - A 0-length result from `recvfrom_bytes` is an empty datagram, not end-of-file.
 - A datagram larger than `max` is truncated without an error. Code that must detect truncation uses a larger `max`; `recvmsg` stays out of the scope of the naming law.
 - The peer is `None` when the kernel returns no address, or returns an address of a family that `SockAddr` does not model (for example `AF_UNIX`). `None` is not an error.
-- `sendto_bytes` encodes `dest` into a C `sockaddr_in` or `sockaddr_in6` inside the runtime. `SockAddr` never crosses as a C struct.
+- `SockAddr` is not a C struct in any `@ffi` signature. `sendto_bytes` takes a `SockAddr` for `dest`.
 - These wrappers have the effect `! IO`, the same as every `libc.*_bytes` member. They are not subject to `Net` attenuation (§4.3). The `byte-pin` audit category reports them.
 
 #### Static layout assertions
 
-For every `@ffi.struct` declaration, the codegen emits, into the generated C immediately after the corresponding `typedef`:
+For every `@ffi.struct` declaration, the build checks that the size of the struct and the offset of each field match the named C struct in the header. If they differ, the build fails and reports the struct and the field.
 
-```c
-_Static_assert(sizeof(blink_pollfd) == sizeof(struct pollfd),
-               "blink_pollfd size mismatch with C struct pollfd");
-_Static_assert(offsetof(blink_pollfd, fd) == offsetof(struct pollfd, fd),
-               "blink_pollfd.fd offset mismatch");
-_Static_assert(offsetof(blink_pollfd, events) == offsetof(struct pollfd, events),
-               "blink_pollfd.events offset mismatch");
-/* ... one per field ... */
-```
+The C compiler is the authority for the C ABI. The headers used at user-build time can differ from the layout in the `@ffi.struct` declaration (libc version bump, cross-compile platform mismatch, BSD vs glibc). The layout check finds this before linking.
 
-The C compiler is the authoritative oracle for the C ABI. If the headers used at user-build time differ from the layout encoded in the `@ffi.struct` declaration (libc version bump, cross-compile platform mismatch, BSD vs glibc), the C compiler emits a static-assert failure with file and line, and the Blink build fails before linking.
-
-The static-assert codegen requires `[native-dependencies].headers` to point at the canonical headers:
+The layout check requires `[native-dependencies].headers` to point at the canonical headers:
 
 ```toml
 [native-dependencies]
@@ -1262,9 +1242,9 @@ type Sqlite3
 type Sqlite3Stmt
 ```
 
-`@ffi.opaque(header, name)` declares a **bare nominal, arity-0** handle type that mirrors a named, possibly-incomplete C type. The type has **no body** — no fields, no variants (a body is rejected). `header` is resolved against `[native-dependencies].headers` exactly as for `@ffi.struct` (§9.1.3). `name` is the C type the handle points at; the Blink type lowers to `name *` — one machine word. Because the pointee is incomplete, **no `sizeof`/`offsetof` `_Static_assert` is emitted** (the deliberate contrast with `@ffi.struct`, whose whole purpose is a known layout).
+`@ffi.opaque(header, name)` declares a **bare nominal, arity-0** handle type that mirrors a named, possibly-incomplete C type. The type has **no body** — no fields, no variants (a body is rejected). `header` is resolved against `[native-dependencies].headers` exactly as for `@ffi.struct` (§9.1.3). `name` is the C type the handle points at; the Blink type maps to the C pointer type `name *`. Because the pointee is incomplete, **no size or offset check applies** (the deliberate contrast with `@ffi.struct`, whose whole purpose is a known layout).
 
-Each `@ffi.opaque` declaration is its own **nominal type**. `Sqlite3` and `Sqlite3Stmt` are distinct and never interchangeable, even though both lower to a C pointer — the nominal distinctness `Ptr[Void]` could not provide.
+Each `@ffi.opaque` declaration is its own **nominal type**. `Sqlite3` and `Sqlite3Stmt` are distinct and never interchangeable, even though both are C pointers at the boundary — the nominal distinctness `Ptr[Void]` could not provide.
 
 #### Flows freely in non-FFI code — containment stays syntactic
 
@@ -1287,15 +1267,15 @@ This does **not** relax E0811. The rule is unchanged — "a `Ptr[T]` may appear 
 
 An `@ffi.opaque` type has **no methods and no operations**. There is no `.deref()`, `.addr()`, `.offset()`, field access, arithmetic, or `==`. The only things you can do with a handle are hold it, pass it, return it, and store it in a field. It carries no readable value — its C type is incomplete. A method access is rejected by the ordinary "no method on `<Type>`" diagnostic; a field access is rejected by the general field-existence diagnostic E0525 (`NoSuchField`), because an opaque handle is a bodiless nominal type that declares zero fields, so every field access on it is provably absent from its declared shape. Neither diagnostic is dedicated to opaque handles — both are the ordinary nominal-type machinery applied to a type with no members. This inertness is **permanent and by construction**: the handle exposes zero raw-pointer surface to non-FFI code, which is exactly why it is safer than a `Ptr[Void]` in the wild.
 
-#### Nullability — `Option[T]`, with guaranteed null-pointer optimization
+#### Nullability — `Option[T]`, mapped to NULL
 
 An `@ffi.opaque` handle is **non-null by the FFI-boundary contract**. Absence is modeled **only** by `Option[Sqlite3]`, and only where a C API makes NULL an observed outcome (a constructor or lookup that can fail) — the "Option must be earned" principle (§9.1.1, *Nullability*). Unlike `Ptr[T]`, an opaque handle has **no `.is_null()`** and **no null sentinel** (`null_opaque` / `Opaque[T]?` were considered and rejected as a second null channel). `Option` is the sole absence channel.
 
-**Null-pointer optimization is guaranteed, not best-effort.** `Option[Sqlite3]` is represented as a single machine word: the C `NULL` pointer *is* the `None` niche, and a present handle is the non-null pointer. A nullable handle therefore costs exactly one word and one comparison — never a tagged struct. This guarantee holds for every `@ffi.opaque` type because the compiler knows the representation is a pointer whose null value is unused.
+**`Option[Handle]` maps to a nullable C pointer.** At the FFI boundary, `None` is the C `NULL` pointer, and `Some(h)` is the non-null handle pointer. This holds for every `@ffi.opaque` type.
 
 #### Construction — sealed to the FFI boundary
 
-A handle value can be produced **only at the FFI boundary**: as the return value of an `@ffi` function, or by reading one out of a `Ptr` cell wherever a `Ptr[T]` may legally appear — an **FFI region** in the sense of E0811 (§9.1.1, *Pointer Operations* — an `@ffi`/`@trusted` body or a `with ffi.scope() as _ { }` block). The mint boundary is exactly that region set: it is not restated here, so the two cannot drift. There is no literal and no user-callable constructor; constructing or coercing an `@ffi.opaque` value from ordinary Blink code is rejected by the existing construction / type-mismatch diagnostics (no new error code). `Ptr[Sqlite3]` is a legal FFI inner type (it lowers to `sqlite3 **`, the standard out-parameter shape), so a handle is minted by dereferencing the out-cell at the boundary:
+A handle value can be produced **only at the FFI boundary**: as the return value of an `@ffi` function, or by reading one out of a `Ptr` cell wherever a `Ptr[T]` may legally appear — an **FFI region** in the sense of E0811 (§9.1.1, *Pointer Operations* — an `@ffi`/`@trusted` body or a `with ffi.scope() as _ { }` block). The mint boundary is exactly that region set: it is not restated here, so the two cannot drift. There is no literal and no user-callable constructor; constructing or coercing an `@ffi.opaque` value from ordinary Blink code is rejected by the existing construction / type-mismatch diagnostics (no new error code). `Ptr[Sqlite3]` is a legal FFI inner type (it maps to `sqlite3 **`, the standard out-parameter shape), so a handle is minted by dereferencing the out-cell at the boundary:
 
 ```blink
 // raw FFI binding — private, audited
@@ -1355,7 +1335,7 @@ pub fn hand_back(h: CFile) -> CFile ! IO {
 | Mechanism | C shape | Flows in non-FFI code? | Nominal identity | Layout known |
 |-----------|---------|------------------------|------------------|--------------|
 | `Ptr[Void]` (§9.1.1) | `void *` | No — E0811-gated | No — all collapse to one type | n/a (opaque) |
-| `@ffi.struct` (§9.1.3) | complete `struct` | via `Ptr[T]`, E0811-gated | Yes | Yes (`sizeof`/`offsetof` asserted) |
+| `@ffi.struct` (§9.1.3) | complete `struct` | via `Ptr[T]`, E0811-gated | Yes | Yes (size and offsets checked) |
 | `@ffi.opaque` (§9.1.4) | incomplete type, held as `T *` | **Yes** — not a `Ptr` | **Yes** — one per declaration | No — incomplete by design |
 
 Use `@ffi.opaque` for a named handle whose innards C hides from you and that your Blink code must carry around; use `@ffi.struct` when you own the layout and read fields; drop to `Ptr[Void]` only for a fully anonymous pointer that never leaves the `@ffi` region.
@@ -1901,7 +1881,7 @@ error[E1001]: duplicate module name
 
 #### Cycle Detection
 
-**Intra-package cycles are allowed.** Modules within the same package (directory) may import each other freely. The compiler resolves all declarations within a package before type-checking bodies — the same approach used by ML-family languages.
+**Intra-package cycles are allowed.** Modules within the same package (directory) may import each other freely. The declarations of a package do not depend on the order of its modules.
 
 ```blink
 // src/auth/login.bl
@@ -1911,10 +1891,7 @@ import auth.types.{AuthError}    // sibling — allowed
 import auth.login.{LoginEvent}   // sibling — allowed (intra-package cycle)
 ```
 
-Within a package, the compiler:
-1. Collects all declarations (function signatures, types, traits) from all modules in the package
-2. Builds a unified symbol table for the package
-3. Type-checks all function bodies against the unified table
+Within a package, every module sees the declarations (function signatures, types, traits) of every other module in the package, whatever the order of the files.
 
 **Cross-package cycles are compile errors.** If package `auth` imports from package `billing` and `billing` imports from `auth`, the compiler rejects it:
 
@@ -2141,7 +2118,7 @@ All built-in types are in the prelude. They are available in every module withou
 | `U8`, `U16`, `U32`, `U64` | Unsigned integers |
 | `Float` | 64-bit IEEE 754 floating point |
 | `F32`, `F64` | Sized floating point (§3.2.3) |
-| `Str` | UTF-8 string, GC-managed |
+| `Str` | UTF-8 string |
 | `Char` | Unicode scalar value |
 | `Bool` | Boolean (`true` / `false`) |
 | `()` | Unit type |
@@ -2190,7 +2167,7 @@ All compiler-known traits are in the prelude. They are compiler-known for one of
 | `StrOps`, `BytesOps`, `StringBuildOps` | methods on `Str` / `Bytes` / `StringBuilder` |
 | `ListOps`, `MapOps`, `SetOps`, `Joinable` | methods on `List` / `Map` / `Set` |
 
-The built-in method-surface traits (`Sized`, `Contains`, `StrOps`, `BytesOps`, `StringBuildOps`, `ListOps`, `MapOps`, `SetOps`, `Joinable`) are **sealed**: their implementations are compiler-provided for the built-in types, and user code may neither implement nor redefine them (see §3.2.2 for the full method surface and the sealing rule). Method dispatch on a built-in receiver is resolved intrinsically and never depends on the trait name being imported.
+The built-in method-surface traits (`Sized`, `Contains`, `StrOps`, `BytesOps`, `StringBuildOps`, `ListOps`, `MapOps`, `SetOps`, `Joinable`) are **sealed**: their implementations are compiler-provided for the built-in types, and user code may neither implement nor redefine them (see §3.2.2 for the full method surface and the sealing rule). A method call on a built-in receiver never depends on the trait name being imported.
 
 Because every prelude name is unconditionally in scope, **importing a prelude name is permitted and has no effect** — it binds nothing new and is not an error.
 
@@ -2205,7 +2182,7 @@ Inside `test` blocks, the following functions are auto-available without import:
 | `assert_ne(a, b)` | `fn assert_ne[T: Eq + Debug](left: T, right: T)` |
 | `prop_check(f)` | `fn prop_check[...](f: fn(...) -> ())` — the property closure given directly to the intrinsic may use `?`; it is elaborated to `fn(...) -> Result[(), TestError]` like a test body (§2.20) |
 
-These are compiler intrinsics — not library functions. They capture source locations, generate diffs, and are stripped from release builds. They are scoped to `test` blocks; using them outside a test block is a compile error.
+These are built into the language — not library functions. On failure they report the source location and a diff of the values. They are scoped to `test` blocks; using them outside a test block is a compile error.
 
 User-defined names shadow test builtins within test blocks (standard scoping rules). The compiler warns when a test builtin is shadowed.
 
@@ -2237,7 +2214,7 @@ The prelude trait names in *Prelude Traits* share the type namespace and follow 
 
 Every name marked *shadows* can also be named through a pseudo-module: `Ptr` and `Buf` through `blink.ffi`, every other one through `blink.core`. No such import is needed; `import blink.core.{Handler}` is an inert documentation marker (§10.7). An **aliased** import (*Import Aliases*, §10.5) binds the alias to the compiler-known type — `import blink.core.{Handle as TaskHandle}` — and this is how a module that shadows one of these names still reaches the builtin.
 
-`FfiScope` is not in the table. No program can write it: an `FfiScope` value occurs only as the resource of a `with ... as` block (§9.1.1), and its type is never written. The name is not reserved, and a user type named `FfiScope` is an ordinary type with no diagnostic. The same holds for spellings the compiler uses internally for function types (`fn(A) -> B`) and tuple types (`(A, B)`): they are not names, and a user may declare `type Fn` or `type Tuple` like any other type.
+`FfiScope` is not in the table. No program can write it: an `FfiScope` value occurs only as the resource of a `with ... as` block (§9.1.1), and its type is never written. The name is not reserved, and a user type named `FfiScope` is an ordinary type with no diagnostic. The same holds for the spellings of function types (`fn(A) -> B`) and tuple types (`(A, B)`): they are not names, and a user may declare `type Fn` or `type Tuple` like any other type.
 
 #### Shadowing Rules
 
@@ -2351,19 +2328,9 @@ Local modules shadow stdlib with warning W1000 (same as any dependency shadowing
 
 #### Physical Location
 
-Stdlib source ships alongside the compiler binary in `<blinkc_dir>/lib/std/`. The compiler discovers this path relative to its own binary — no environment variables, no configuration. This satisfies the existing 5-0 decision: "no env vars, no configurable roots."
+Stdlib source ships with the toolchain. The compiler finds it without environment variables and without configuration. This satisfies the existing 5-0 decision: "no env vars, no configurable roots."
 
-```
-blink/
-  bin/blink              # compiler binary
-  lib/std/
-    toml.bl           # std.toml module
-    semver.bl         # std.semver module
-    core.bl           # std.core (ConversionError, Range, Handler)
-    ...
-```
-
-When the compiler encounters `import std.toml`, it resolves to `<blinkc_dir>/lib/std/toml.bl` through the normal dependency resolution path.
+When the compiler encounters `import std.toml`, it resolves to the `toml` module of the bundled stdlib through the normal dependency resolution path.
 
 #### All Stdlib is Implicit
 
@@ -2411,17 +2378,12 @@ error[E1050]: stdlib module not found
 2 | import std.toml
   |        ^^^^^^^^ module `std.toml` not found
   |
-  = note: expected at /usr/lib/blink/lib/std/toml.bl
   = help: your Blink installation may be incomplete; reinstall with `blink self update`
 ```
 
-### 10.8 Compilation Model
+### 10.8 Visibility Enforcement
 
-The Blink compiler uses an **emit-all** compilation model. When a module is imported, all of its items — both `pub` and non-pub — are included in the generated C output. The `pub` keyword controls Blink-level visibility, not C-level inclusion.
-
-#### Why Emit-All
-
-The compiler generates a single `.c` file per program. When module `auth.token` is imported, every function, type, and constant defined in `auth/token.bl` appears in the C output — including private helpers that pub functions call internally. This eliminates the class of linker errors where pub functions reference missing private dependencies.
+The `pub` keyword controls which items other modules can use. The compiler enforces this at compile time.
 
 ```blink
 // auth/token.bl
@@ -2438,7 +2400,7 @@ pub fn verify(token: Str) -> Result[Claims, AuthError] ! Crypto {
 }
 ```
 
-When another module writes `import auth.token.{verify}`, both `verify` and `validate_format` appear in the C output. The importer can call `verify` but **cannot** call `validate_format` — the compiler rejects it:
+When another module writes `import auth.token.{verify}`, it can call `verify`. It **cannot** call the non-`pub` helper `validate_format` in the same file. The compiler rejects the call:
 
 ```
 error[E1003]: item `validate_format` is private to module `auth.token`
@@ -2451,47 +2413,13 @@ error[E1003]: item `validate_format` is private to module `auth.token`
   = help: if this item should be accessible, add `pub` to its declaration
 ```
 
-#### Visibility Enforcement
+The rules:
 
-Visibility is enforced at **compile time** by the name resolution pass, not at the C level:
+1. When a function call or type reference crosses a module boundary, the compiler checks the `pub` status of the item.
+2. A non-`pub` item from another module produces error E1003 (*Import Errors*, §10.5).
+3. Items within the same module can access all sibling items regardless of `pub`.
 
-1. **Name resolution** builds a symbol table of all items and their declaring modules
-2. When a function call or type reference crosses a module boundary, the resolver checks `pub` status
-3. Non-pub items from other modules produce error E1003 (*Import Errors*, §10.5)
-4. Items within the same module can access all sibling items regardless of `pub`
-
-This means `pub` is a **hard guarantee**, not advisory. Code that compiles respects all module boundaries. The emit-all model is an implementation detail of the C backend, not a visibility loophole.
-
-#### Symbol Naming
-
-All symbols in generated C use **module-qualified names** to prevent collisions and aid debugging:
-
-```c
-// Generated from auth/token.bl
-int blink_auth_token_validate_format(blink_string* token) { ... }
-blink_result blink_auth_token_verify(blink_string* token) { ... }
-
-// Generated from auth/session.bl
-blink_session* blink_auth_session_create(blink_claims* claims) { ... }
-```
-
-The naming scheme is `blink_<module_path>_<item_name>`, where module path separators (`.`) become underscores. This applies to **all** items — pub and private alike. Benefits:
-
-- **No collisions**: Two modules defining private `helper()` produce distinct C symbols
-- **Debuggable**: gdb/lldb backtraces show which module a function belongs to
-- **Separate-compilation ready**: Symbols are already globally unique when the compiler eventually moves to one `.c` per module
-
-#### Relationship to Separate Compilation
-
-Emit-all is the v1 compilation model. The intended v2 optimization is **separate compilation**: each module emits its own `.c` file, compiled to `.o`, then linked. The design choices made here — enforced `pub`, module-qualified symbols — ensure that the migration path from emit-all to separate compilation requires no language-level changes. User code written against v1 will compile identically under v2's separate compilation.
-
-| Property | v1 (emit-all) | v2 (separate compilation) |
-|----------|---------------|--------------------------|
-| C files per program | 1 | 1 per module |
-| Dead code | Included (gcc may optimize) | Excluded by linker |
-| Incremental rebuild | Full recompile | Per-module |
-| `pub` enforcement | Name resolution | Name resolution + linker |
-| Symbol naming | Module-qualified | Module-qualified (unchanged) |
+`pub` is a **hard guarantee**, not advisory. Code that compiles respects all module boundaries.
 
 ---
 
@@ -2507,14 +2435,14 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | `@requires(expr)` | fn | Precondition. Must hold when the function is called. | SMT solver (compile-time) or runtime assertion |
 | `@ensures(expr)` | fn | Postcondition. Must hold when the function returns. `result` refers to the return value. | SMT solver (compile-time) or runtime assertion |
 | `@where(expr)` | fn, type | Type-level constraint on generics or refinements. | Compile-time type checker |
-| `@invariant(expr)` | type | Invariant that must hold for all instances of this type at all times. | SMT solver + runtime checks on construction/mutation |
+| `@invariant(expr)` | type | Invariant that must hold for all instances of this type at all times. | Static check and runtime checks on construction and mutation |
 | `@perf(constraint)` | fn | Performance contract. Benchmark assertion, not statically provable. | `blink bench --check-contracts` |
 | `@capabilities(list)` | module | Hard ceiling on effects permitted in this module. | Compile-time effect checker |
 | `@ffi("lib", "sym")` | fn | Declares a foreign function binding. | Linker (compile-time) |
 | `@trusted(audit: "ID")` | fn | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `ID` must name a record in `audits.toml`. Never makes an `@ffi` fn `pub` (E0801). | Compile-time record check (`AuditRecordNotFound`); `blink audit` tooling |
 | `@alt("ID", "desc")` | fn | Marks an alternative implementation. | Tooling (`blink alt list`, `blink alt select`) |
-| `@verify(strategy)` | fn | Hints to the SMT solver about verification strategy. | Verification engine |
-| `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time codegen |
+| `@verify(strategy)` | fn | Hints to the static checker about verification strategy. | Static checker |
+| `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time derivation |
 | `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `blink.toml` `[lints]` config. See §4.16.8. | Compiler diagnostic filter |
 | `@deprecated(since, removal, replacement, fix)` | fn, type | Edition-aware deprecation with structured migration. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). Emits W2000 when current edition < `removal`, E2001 when current edition >= `removal`. Machine-applicable fixes in structured diagnostics when `fix` is `"replace"` or `"inline"`. See §8.16.2. | Compiler warning/error (edition-gated) |
 
@@ -2675,4 +2603,4 @@ Requirement Coverage:
 Coverage: 2/4 fully covered (50%)
 ```
 
-Provenance is metadata — it has zero runtime cost, zero imblink on compilation, and zero interaction with the type system. It exists purely for traceability and tooling. But it is compiler-tracked, meaning the compiler knows about it, stores it in the AST, and exposes it through the query API. It is not a comment that can silently drift.
+Provenance is metadata — it has zero runtime cost, zero impact on compilation, and zero interaction with the type system. It exists purely for traceability and tooling. But it is compiler-tracked, meaning the compiler knows about it and exposes it through the query API. It is not a comment that can silently drift.
