@@ -298,6 +298,8 @@ Re-vote: **closed schema, 6-0.** An unknown key is an error that names the allow
 
 ### Final Spec
 
+> **Superseded in part by [FFI Effect Row and Pure Claim](ffi-effect-row-pure-claim.md).** There is no `@effects` annotation. The row goes after `!` in the signature (`-> Int ! DB`), and the pure claim is `! ()`. The `@effects(DB)` example below records this ruling as voted; do not copy it.
+
 An `@ffi` decl states its real row. `FFI` is not an effect. The pure claim is written, not left out. The `@effects` spelling is left to the `@effects` implementation ticket. The safe wrapper is an ordinary fn. A caller sees the row by normal transitivity.
 
 ```blink
