@@ -2,17 +2,15 @@
 
 ### 5.1 Tracing GC as Default
 
-Blink uses a tracing garbage collector as its default memory management strategy. The shipping collector is the Boehm-Demers-Weiser conservative collector: tracing, stop-the-world, and non-generational.
+Blink uses a tracing garbage collector as its default memory management strategy.
 
 The programmer does not think about memory. There are no lifetime annotations, no ownership transfers, no borrow checker. You allocate, you use, the runtime cleans up.
-
-**Forward-looking:** Generational, concurrent, and low-pause (sub-millisecond) collection is a Phase 3 migration target -- a custom precise GC that replaces Boehm behind the `blink_alloc` abstraction if and when pause times become a measured bottleneck. The intervening Phase 2 introduces static reuse analysis, where the compiler inserts deterministic frees where provably safe. See `decisions/memory-management-gc.md` for the ratified Phase 1/2/3 path.
 
 ```blink
 fn process_request(req: Request) -> Response ! DB, IO {
     let user = db.find_user(req.user_id)?
     let items = db.get_items(user.id)?
-    let summary = build_summary(items)     // allocated on heap, GC manages it
+    let summary = build_summary(items)     // the runtime frees it when it is no longer in use
     io.println("Processed {items.len()} items")
     Response.ok(summary)
 }
@@ -28,9 +26,9 @@ No annotation on `summary`. No `Box`, `Rc`, `Arc`. No `&'a`. It just works.
 
 3. **Cognitive overhead destroys locality.** A function with three lifetime parameters requires understanding the lifetime relationships of its entire call graph. This is the opposite of "a function's behavior is determinable from its signature."
 
-4. **GC is proven at scale.** Go serves millions of RPS with sub-millisecond GC pauses in its own collector; Java runs the world's financial infrastructure. That is industry evidence that GC at scale is viable -- the "GC is slow" argument died somewhere around 2015 -- not a claim about Blink's current Boehm collector. Discord moved from Go to Rust for specific tail-latency reasons; most services never hit that bar.
+4. **GC is proven at scale.** Go serves millions of RPS with sub-millisecond GC pauses in its own collector; Java runs the world's financial infrastructure. That is industry evidence that GC at scale is viable -- the "GC is slow" argument died somewhere around 2015 -- not a claim about Blink's collector. Discord moved from Go to Rust for specific tail-latency reasons; most services never hit that bar.
 
-5. **Deterministic resource cleanup is orthogonal to GC.** File handles, sockets, database connections -- these are managed through the `Closeable` trait and `with...as` scoped resource blocks, not GC finalization. The GC manages memory. `Closeable` manages resources. See section 5.5.
+5. **Deterministic resource cleanup is orthogonal to GC.** File handles, sockets, database connections -- these are managed through the `Closeable` trait and `with...as` scoped resource blocks, not by the GC. The GC manages memory. `Closeable` manages resources. See section 5.5.
 
 ### 5.2 Opt-in Arenas via the Arena Effect
 
@@ -82,7 +80,7 @@ error[ArenaValueEscapes]: arena-scoped value escapes
   |                             ^^^^^^ `leaked` is arena-allocated and cannot escape
   |
   = note: arena values are freed when the arena scope exits
-  = fix: remove `! Arena` and let the value be GC-managed, or copy the value explicitly:
+  = fix: remove `! Arena` and let the value live outside the arena, or copy the value explicitly:
   |
 3 |     some_global_cache.store(leaked.clone())
   |                                   ++++++++
@@ -90,44 +88,28 @@ error[ArenaValueEscapes]: arena-scoped value escapes
 
 #### 5.2.1 Arena Semantics
 
-This subsection fixes the four semantic points needed to implement the arena effect: return-value promotion, escape classification, handler plumbing, and nesting. See the [Arena Allocation Semantics deliberation](../decisions/arena-allocation-semantics.md) for rationale.
+This subsection fixes four semantic points of the arena effect: return-value promotion, escape classification, handler behavior, and nesting. See the [Arena Allocation Semantics deliberation](../decisions/arena-allocation-semantics.md) for rationale.
 
-##### Promotion walkers
+##### Promotion
 
-The compiler generates a per-type promotion function `blink_promote_<Type>(value, target_allocator)` for every type that crosses a `with arena { }` boundary. The walker:
+A value that crosses a `with arena { }` boundary is copied out of the arena. The copy is deep: the copy of a value includes everything the value refers to (struct fields, list elements, map entries). The copy goes into the nearest enclosing arena. If no arena is active, it goes into the garbage-collected heap.
 
-- copies the top-level value into `target_allocator` (an outer arena if one is active, otherwise the GC heap);
-- recurses into pointer fields structurally (struct fields, list elements, map entries);
-- copies strings via `GC_MALLOC_ATOMIC` (they are non-pointer-containing);
-- rejects cyclic types at compile time with `error[E0701]: arena type contains a cycle`, since a compile-time walker cannot safely materialize a cyclic graph into another allocator.
-
-Walkers are emitted only for types that actually cross an arena boundary in the program (detected by escape analysis), so the code-size cost scales with usage, not with the type pool.
+A type that contains a cycle, directly or through other types, cannot cross an arena boundary. The compiler rejects it with `error[E0701]: arena type contains a cycle`.
 
 ##### Escape rule
 
 An allocation site inside an `! Arena` function is classified as either **promoted** or **escaped**:
 
-- **Promoted** — the value flows (possibly through `if` / `match` / early `return`) to the block's result expression. The compiler inserts a `blink_promote_<Type>` call at the `with arena` boundary.
+- **Promoted** — the value flows (possibly through `if` / `match` / early `return`) to the block's result expression. The value is copied out of the arena at the boundary.
 - **Escaped** — the value flows anywhere else: captured by a closure that outlives the block, stored into a field of a non-arena-local struct, passed as an argument to a function whose parameter is not itself arena-local, or written to a module-level `let mut`. These sites produce `error[E0700]: ArenaValueEscapes` at compile time.
 
 "Arena-local parameter" is inferred from the callee's signature: an `! Arena` function's parameters are arena-transparent for the caller's escape analysis. No region-variable annotations are required or accepted.
 
-##### Handler plumbing
+##### Handler behavior
 
-`with arena { body }` is implemented as a `BlockHandler` (§4.6.3). The block handler's `enter()` captures the prior value of the thread-local `__blink_current_arena`, installs a freshly-created `blink_arena_t*`, and returns `()`. Its `exit(ok: Bool)` restores the saved pointer and destroys the inner arena unconditionally (commit and rollback paths are identical — arena lifetime is not tied to `ok`).
+`with arena { body }` behaves as a `BlockHandler` (§4.6.3). On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
 
-`blink_alloc(size)` takes the fast path through `__blink_current_arena`:
-
-```c
-// runtime_core.h (conceptual)
-static void* blink_alloc(int64_t size) {
-    blink_arena_t* a = __blink_current_arena;
-    if (a != NULL) return blink_arena_alloc(a, size);
-    return GC_MALLOC((size_t)size);
-}
-```
-
-Because the block is a `BlockHandler`, arena enter/exit events are emitted by `--blink-trace` and `--trace all` uniformly with every other block-scoped construct. `! Arena` on a function signature is a *marker* effect consumed by escape analysis; it does not participate in evidence-passing dispatch.
+Because the block is a `BlockHandler`, arena enter and exit events appear in `--blink-trace` and `--trace all` output, as for every other block-scoped construct. `! Arena` on a function signature is a *marker* effect. The escape check uses it. It does not select a handler.
 
 ##### Nesting
 
@@ -147,14 +129,14 @@ fn main() {
 }
 ```
 
-Because the nearest enclosing arena is the promotion target, `blink_promote_<Type>` takes the target allocator as a parameter rather than hardcoding `GC_MALLOC`. A value promoted from the outermost `with arena` block lands in the GC heap.
+The nearest enclosing arena is the promotion target. A value promoted from the outermost `with arena` block goes into the garbage-collected heap.
 
 ##### Error codes
 
 - `E0700 ArenaValueEscapes` — an allocation site reaches a non-return position (closure capture, field store on non-arena target, argument to a non-arena-local parameter, module-level `let mut` assignment). The message prints the resolved promotion target: `would be promoted into: outer arena` when the escaping block is nested inside another `with arena`, otherwise `would be promoted into: GC heap`.
 - `E0701 ArenaTypeContainsCycle` — a type crossing a `with arena { }` boundary contains a cycle (directly or transitively). Break the cycle or allocate the cyclic value on the GC heap outside the arena.
 - `E0702a ArenaClosureTailNonLiteral` — the tail evaluates to a closure whose origin isn't a closure literal bound in this block (e.g. returned from a call, or reassigned through a variable). Fix: construct the closure outside the `with arena { }` block, or bind it via `let f = fn(…) { … }` immediately inside the block.
-- `E0702d ArenaClosureUnsupportedCapture` — a closure-tail capture is of a kind the descriptor walker can't materialize. Fix: construct the closure outside the arena block.
+- `E0702d ArenaClosureUnsupportedCapture` — a closure-tail capture is of a kind that cannot be copied out of the arena. Fix: construct the closure outside the arena block.
 
 ##### Warning codes
 
@@ -167,8 +149,8 @@ how early exits interact with promotion, and how the promotion target is
 discovered. See [Arena Expression-Form Semantics](../decisions/arena-expression-form-semantics.md).
 
 **1. Tail-return semantics.** `with arena { body }` evaluates to the value of
-`body`'s tail expression, deep-copied via `blink_promote_<T>` into the
-target allocator at the closing `}`. A block whose last statement is `let x =
+`body`'s tail expression, deep-copied into the
+target at the closing `}`. A block whose last statement is `let x =
 ...; x` yields `x`. A block with a statement-only tail (type `()`) yields `()`
 and promotion is a no-op. Tail position propagates through `if`/`match` arms;
 all branches must be tail.
@@ -181,13 +163,13 @@ what would apply to the block's tail value at that program point.
 
 **3. Handler composition order.** `with h1, arena, h2 { body }` runs:
 
-1. `h1.enter()`, `arena.enter()` (snapshotting `__blink_current_arena`),
+1. `h1.enter()`, `arena.enter()` (which records the promotion target),
    `h2.enter()`
 2. `body`, producing `tail` in the inner arena
 3. `h2.exit(ok)` (inner arena still live)
-4. `blink_promote_<T>(tail, snapshot_target)` — the walker writes into the
-   target captured at `arena.enter()`
-5. `arena.exit(ok)` — restores TLS and destroys the inner arena
+4. Promotion of `tail` into the target recorded at `arena.enter()`
+5. `arena.exit(ok)` — makes the previous arena active again and destroys the
+   inner arena
 6. `h1.exit(ok)` (post-promotion; can observe the promoted value)
 
 Non-arena handlers **right** of `arena` in the `with` clause observe
@@ -195,18 +177,16 @@ pre-promotion state; handlers **left** observe post-promotion state.
 
 Run `blink llms --topic arena` for a worked handler-composition timeline example.
 
-**4. Outer target threading.** The promotion target for a given `with arena { }`
-is the value of `__blink_current_arena` at the moment of its `enter()`,
-stored as a field of the BlockHandler's restore struct. No handler-stack walk,
-no separate TLS slot. If the snapshot is `NULL`, promotion targets the GC heap.
+**4. Promotion target.** The promotion target of a `with arena { }` is the
+nearest enclosing arena at the moment the block starts. If no arena is active
+then, the target is the garbage-collected heap.
 
 **5. Escape boundary for `! Arena`.** `with arena { }` is the **escape
 boundary** for the `! Arena` marker effect: an `! Arena` callee invoked inside
 a `with arena { body }` does not cause the enclosing function to require
 `! Arena` on its signature. Conversely, any `! Arena` callee invoked outside
 such a block requires the enclosing function to carry `! Arena`. `! Arena`
-remains a marker effect — it drives escape analysis, not evidence-passing
-dispatch.
+remains a marker effect: it drives the escape check only.
 
 **6. Resources in the same `with` clause.** `with arena, file = open(...)? as
 file { body }` runs `body` with both `file` open and the arena active, then
@@ -217,48 +197,15 @@ not retain references into any `Closeable`'s buffers** — such capture is
 E0700 (value escapes into a non-promotable reference).
 
 **7. Nested closure captures in promoted tails.** A closure-typed tail of
-`with arena { expr }` is promoted by a per-signature
-`blink_promote_closure_<Mangled>` that walks the closure's capture
-descriptor table, recursing into closure-typed captures. There is no
-restriction on what a captured closure may itself capture: primitive,
-struct, list, map, mut cell, or nested closure. The closure ABI reserves
-a per-capture descriptor slot for this purpose; details in
+`with arena { expr }` is promoted together with all of its captures. This
+includes captured closures, to any depth. There is no restriction on what a
+captured closure may itself capture: primitive, struct, list, map, mut cell,
+or nested closure. See
 [arena-nested-closure-capture-promotion](../decisions/arena-nested-closure-capture-promotion.md).
-
-### 5.3 Compiler-Driven Optimization
-
-The current default path is plain Boehm GC: every heap allocation routes through `blink_alloc`, which is an unconditional `GC_MALLOC` (the arena effect in §5.2 is the only redirection). The optimizations below reduce GC pressure without programmer intervention, but they are the Phase 2 static-reuse-analysis roadmap from `decisions/memory-management-gc.md`, not current behavior.
-
-**Escape analysis (forward-looking):** A future compiler pass could prove that values do not escape a function and stack-allocate them, sidestepping the GC entirely for the common case of temporary values. Today the shipping Boehm path heap-allocates every list, map, and template through `blink_alloc` and does not stack-allocate non-escaping values; the stack-allocation comments in the example below describe the intended Phase 2 behavior, not today's codegen. This is a whole-function GC-avoidance analysis, distinct from the opt-in `with arena` escape analysis (§5.2, `src/escape.bl`), which classifies allocations inside a `with arena { }` block as promoted or escaped. This is not current behavior; see `decisions/memory-management-gc.md`.
-
-```blink
-fn distance(a: Point, b: Point) -> Float {
-    let dx = a.x - b.x   // future: stack-allocated, never escapes
-    let dy = a.y - b.y   // future: stack-allocated, never escapes
-    math.sqrt(dx * dx + dy * dy)
-}
-```
-
-**Region inference (forward-looking):** A future compiler pass could identify groups of allocations with correlated lifetimes and batch their deallocation — within a loop body, temporaries created per iteration freed together rather than individually traced. This automatic batching is not current behavior; the shipping way to get batched/region deallocation today is the explicit `with arena { }` effect (§5.2), which frees the whole arena in one shot on scope exit. The example below illustrates the intended Phase 2 optimization. This is not current behavior; see `decisions/memory-management-gc.md`.
-
-```blink
-fn process_all(items: List[Item]) -> List[Result] {
-    items.map(fn(item) {
-        // Future: the compiler infers that `parsed`, `validated`, and
-        // `enriched` all die at the end of this closure and batch-frees them.
-        let parsed = parse(item)
-        let validated = validate(parsed)
-        let enriched = enrich(validated)
-        enriched.to_result()
-    })
-}
-```
-
-**Generational collection (forward-looking):** The shipping Boehm collector is non-generational — it does not segregate young from old objects. A future precise collector (the Phase 3 target in §5.1) could exploit the generational hypothesis: short-lived objects (most objects) collected cheaply in a young generation, long-lived objects promoted and collected infrequently, with the effect system's scope information helping tune generation boundaries. This is not current behavior; see `decisions/memory-management-gc.md`.
 
 ### 5.5 Deterministic Resource Cleanup: `Closeable` + `with...as`
 
-The GC handles memory. But file handles, sockets, locks, database cursors, and temp files need deterministic cleanup — released at a specific program point, not whenever the GC runs a finalizer.
+The GC handles memory. But file handles, sockets, locks, database cursors, and temp files need deterministic cleanup — released at a specific program point, not at some later, unspecified time.
 
 Blink solves this with two pieces: the `Closeable` trait (section 3.6) and the `with...as` syntax (section 2.18).
 
@@ -291,7 +238,7 @@ Desugars to:
 
 The compiler inserts `name.close()` on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.6.3 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
 
-This rule is uniform with `BlockHandler.exit()` (§4.6.3): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with conn = db.connect() { assert(...) }` block releases `conn` on assertion failure inside a test block, because the test runner's per-test frame is a runtime catch boundary.
+This rule is uniform with `BlockHandler.exit()` (§4.6.3): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with conn = db.connect() { assert(...) }` block releases `conn` on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.6.3).
 
 #### Multiple resources
 
@@ -384,17 +331,6 @@ error[CloseableStoredInCollection]: `Closeable` value stored in collection
 
 These three diagnostics form a closed net: ScopedValueWithoutWith (W0610) catches forgotten `with...as`, E0601 catches escape via return or assignment, E0602 catches escape via collections. Together they ensure `Closeable` values are always scoped and always cleaned up.
 
-### 5.6 Future: Compiler Optimization Improvements
-
-The GC-first design leaves room for the compiler to get smarter over time without changing the language:
-
-- **Profile-guided arena insertion:** The compiler could automatically insert arena allocation for functions that show high allocation rates in profiling data, without the programmer adding `! Arena`.
-- **Escape analysis improvements:** More aggressive interprocedural escape analysis could stack-allocate values that pass through multiple functions but never truly escape.
-- **Value types:** Small, immutable structs could be passed by value (unboxed) rather than heap-allocated. The compiler can make this decision based on size and usage patterns.
-- **GC tuning per effect scope:** Different effect handlers could configure GC behavior -- e.g., a request handler scope could use a bump allocator that bulk-frees on scope exit.
-
-None of these changes require language syntax changes. The programmer writes the same code. The compiler gets smarter underneath.
-
 ---
 
 ## 6. Compilation
@@ -418,7 +354,7 @@ Hello, world!
 
 1. **Single binary deployment.** Copy one file. Run it. No JVM, no .NET runtime, no Python interpreter, no node_modules. Ops teams want `scp myapp server:` and done. Container images are a single `FROM scratch` + `COPY myapp`.
 
-2. **Algebraic effects compile well to native code.** Effect handlers are implemented via direct stack manipulation -- segmented stacks or continuation-passing. This is natural in native code and painful on a VM that wasn't designed for delimited continuations (see: Project Loom's multi-year slog).
+2. **Algebraic effects fit native code.** Native code gives direct control of the stack. Such control is painful on a VM that wasn't designed for delimited continuations (see: Project Loom's multi-year slog).
 
 3. **Predictable performance.** No JIT warmup curve. The first request is as fast as the millionth. An AI agent cannot distinguish "slow because JIT is warming up" from "slow because the generated code is buggy." Nondeterminism in performance is noise that wastes AI iteration cycles.
 
@@ -438,29 +374,9 @@ Hello, world!
 - JIT warmup introduces nondeterminism. "It's slow for the first 10 requests then fast" is not acceptable for latency-sensitive services or AI-assisted profiling.
 - Julia's time-to-first-call problem is infamous. Blink's compiler-as-service architecture provides fast iteration without a JIT.
 
-### 6.1.1 Internal Type Representation
-
-The compiler represents types internally as an **interned type node pool** — a flat array of type nodes, each referenced by an integer handle (`TypeId`). Type nodes carry a kind tag and up to two child `TypeId` references for parameterized types, enabling arbitrary nesting depth.
-
-```
-TypeId 0: Int
-TypeId 1: Str
-TypeId 2: Option[Int]     → kind=Option, child1=0
-TypeId 3: List[Option[Int]] → kind=List, child1=2
-```
-
-**Key properties:**
-
-- **Recursive:** `List[Option[Result[Int, MyError]]]` is a chain of type-id references — no depth limit, no special-casing per nesting level.
-- **Interned:** Each structurally unique type exists exactly once in the pool. Type equality is integer comparison (`==` on `TypeId`), O(1).
-- **Unified across passes:** Typecheck and codegen share one type pool for identity. Phase-specific metadata (C type names, constraint sets) lives in separate side tables indexed by `TypeId`.
-- **Parallel-array layout:** The pool uses parallel arrays (`tp_kind`, `tp_child1`, `tp_child2`, `tp_sname`), matching the parser's AST node pool pattern. This will migrate to an enum-based representation when the compiler supports enum-with-data in lists.
-
-See [Compiler Internal Type Representation rationale](../decisions/compiler-type-representation.md) for the full panel deliberation.
-
 ### 6.2 `blink eval` Interpreter Mode
 
-For development and AI iteration loops, Blink includes an AST-walking interpreter that executes code directly without codegen:
+For development and AI iteration loops, Blink includes an interpreter that runs code directly, without building a native binary:
 
 ```sh
 $ blink eval 'add(2, 3)'
@@ -490,60 +406,43 @@ $ blink eval 'process_order(42)' --effects mock
 
 ### 6.3 Name Resolution
 
-The Blink compiler performs name resolution as a dedicated phase between parsing and code generation. After imports are merged into a single AST (§10.8, emit-all model), the name resolution pass validates every identifier reference in the program before any C code is emitted.
+The compiler checks every identifier reference in the program before it produces any output.
 
-#### 6.3.1 Compilation Phases
+#### 6.3.1 Order of Checks
 
-```
-Source → Lexer → Parser → Import Merge → Name Resolution → Type Checking → Codegen → C
-                                              ↓
-                                    Annotated AST (decorated nodes)
-```
+Names resolve before the compiler produces output. If the program has a name error, the compiler produces no output (§6.3.5).
 
-Name resolution runs post-parse, pre-codegen. It writes results back into the AST node pool as additional parallel arrays (`np_resolved_sym`, `np_resolved_type`). Codegen reads these annotations rather than performing its own name lookups.
+#### 6.3.2 What Resolution Checks
 
-#### 6.3.2 Annotated AST Architecture
+- Every identifier refers to a declaration that is in scope.
+- Every function call refers to a function.
+- Every method call refers to a method of the receiver type.
+- Every struct literal refers to a type.
 
-The name resolution pass decorates AST nodes with resolution results using new parallel arrays in the node pool. This extends the existing parallel-array architecture naturally — the same pattern as `np_type_ann`, `np_line`, `np_col`.
+#### 6.3.3 Name Errors and Method Errors
 
-After name resolution:
-- Every `Ident` node carries a resolved symbol reference (or an error diagnostic)
-- Every `Call` node carries a resolved function reference
-- Every `MethodCall` node carries a resolved trait method reference (after the type-aware phase)
-- Every `StructLit` node carries a resolved type reference
+A name error means that an identifier does not refer to anything. A method error means that the receiver type has no such method. The two kinds of error have different codes.
 
-Codegen reads these annotations via node index — O(1) lookup, cache-friendly, no separate symbol table query.
-
-#### 6.3.3 Two-Phase Method Resolution
-
-Name resolution runs in two phases within the type checking stage:
-
-**Phase 1 — Name Binding:** Resolves variables, function calls, type references — everything that does not require type information. Builds scope chains, checks that every referenced name exists in scope, validates import visibility.
-
-**Phase 2 — Type-Aware Method Resolution and Operator Validation:** Walks function bodies again with type information from inference. Verifies that every method call (`x.foo()`) resolves against a known trait implementation for the receiver's type. Reports E0505 (UnresolvedMethod) for methods that don't exist on the inferred type. Also validates type-dependent operators: the `?` operator is checked here — verifying the operand is `Result[T, E]` or `Option[T]`, the enclosing function's return type is compatible, and error types match exactly (§3c.2). Reports E0502, E0508, E0509, E0512 for `?` operator violations.
-
-This separation reflects a fundamental distinction: name binding answers "does this identifier refer to something?", while method resolution answers "which implementation does this call dispatch to?" These require different information and are correctly modeled as distinct phases.
+A name error is E0504 (UndefinedFunction) for a function, or E1003 for a name that is not visible. A call `x.foo()` with no method `foo` for the type of `x` is E0505 (UnresolvedMethod). The `?` operator checks the operand type, the return type of the enclosing function, and the error types (§3c.2). Violations give E0502, E0508, E0509, or E0512.
 
 ```blink
 fn example(items: List[Str]) -> Int {
-    let count = items.len()       // Phase 1: `items` resolves to parameter
-                                  // Phase 2: `.len()` resolves to Sized.len on List[Str]
-    let x = unknown_fn()          // Phase 1: E0504 — `unknown_fn` not defined
-    items.nonexistent()           // Phase 2: E0505 — no method `nonexistent` on List[Str]
+    let count = items.len()       // `items` is a parameter; `.len()` is Sized.len on List[Str]
+    let x = unknown_fn()          // E0504 — `unknown_fn` not defined
+    items.nonexistent()           // E0505 — no method `nonexistent` on List[Str]
     count
 }
 ```
 
-When the receiver type is unknown after inference (TYPE_UNKNOWN), the compiler reports a specific diagnostic rather than silently accepting the call.
+If the compiler cannot find the type of the receiver, it reports an error. It never accepts the call without a check.
 
-#### 6.3.4 Module-Scoped Symbol Table
+#### 6.3.4 Module Scope
 
-The symbol table maintains module identity for every declaration. Each symbol is tagged with its source module, enabling:
+Every declaration belongs to one module. This gives these rules:
 
 - **`pub` enforcement** (§10.8): Using a non-pub item from outside its module produces E1003 (PrivateItemAccess)
 - **Qualified error messages**: "cannot access `json.internal_parse`, it is private to module `std.json`"
 - **Ambiguity detection**: Two imports in one file that bind one name to different items produce E1005 (AmbiguousImport)
-- **Module-qualified C symbols**: `blink_<module>_<name>` naming requires knowing the source module
 
 Name lookup follows standard lexical scoping priority:
 
@@ -558,12 +457,7 @@ Effect handles occupy a reserved namespace separate from variables (§3c.4). Att
 
 #### 6.3.5 Error Recovery
 
-Name resolution accumulates all errors across the entire program, then halts compilation before codegen. Codegen never runs on a program with unresolved names.
-
-This clean phase gate ensures:
-- Users see all name errors in a single compilation run
-- Codegen only processes fully-resolved programs — no garbage C output
-- Error codes E0504/E0505 in codegen become unreachable assertions
+The compiler reports all name errors of the program in one run. If the program has a name error, the compiler produces no output.
 
 ```
 error[UndefinedFunction]: undefined function `fetch_users`
@@ -580,33 +474,14 @@ When a missing import causes cascading errors (one unresolved name triggers many
 
 ### 6.4 Compiler-as-Service Daemon Architecture
 
-The Blink compiler runs as a persistent daemon process that maintains an incremental compilation state:
-
-```
-┌─────────────────────────────────────────────┐
-│               blink daemon                    │
-│                                              │
-│  ┌──────────┐  ┌──────────┐  ┌───────────┐  │
-│  │ Incremental│  │   LSP    │  │ Structured│  │
-│  │ Dependency │  │  Server  │  │ Diagnostic│  │
-│  │   Graph    │  │          │  │  Emitter  │  │
-│  └──────────┘  └──────────┘  └───────────┘  │
-│        │              │              │        │
-│  Symbol-level    Completions     JSON with    │
-│  granularity     Hover info    machine fixes  │
-│                  Refactoring                  │
-└─────────────────────────────────────────────┘
-          │                    │
-     IDE / Editor         AI Agent
-     (human-facing)    (machine-facing)
-```
+The Blink compiler can run as a persistent daemon process. The daemon keeps its answers current as source files change.
 
 **Key properties:**
 
-- **Symbol-level incremental compilation.** The dependency graph tracks individual functions, types, and traits -- not files. Changing one function only retypechecks that function and its direct dependents.
-- **Target: sub-200ms incremental type-check** for a single changed function. This is the critical number -- the AI's generate-compile-check-fix loop runs at the speed of the compiler.
-- **Unified with LSP.** The compiler daemon IS the language server. Completions, hover info, go-to-definition, and refactoring are not a separate tool -- they are the same compiler answering different questions.
-- **File watching built in.** The daemon watches source files and keeps its internal state current. Queries against a stale state are impossible.
+- **Incremental checking.** After a change to one function, the daemon checks only that function and the code that depends on it.
+- **Target: a type-check of a single changed function in under 200 ms.** This is a tooling goal, not a language rule. The generate-compile-check-fix loop of an AI agent runs at the speed of the compiler.
+- **Unified with LSP.** The daemon is also the language server. Completions, hover information, go-to-definition, and refactoring come from the same compiler.
+- **File watching built in.** The daemon watches source files. A query never returns an answer for an old version of a file.
 
 ### 6.5 Structured Diagnostics
 
