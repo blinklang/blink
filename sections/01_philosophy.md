@@ -12,7 +12,7 @@ Every programming language since the days of C has been designed to make humans 
 
 The effect system is the clearest expression of this philosophy: a function that declares `! DB` can see the database; one that does not is blinkered from it entirely. Capabilities are not granted by default and restricted — they are invisible until explicitly opened.
 
-The name has a second layer: **blink** evokes speed. Sub-200ms incremental compilation. Structured diagnostics with machine-applicable fixes. The generate-compile-check-fix loop completes in the blink of an eye.
+The name has a second layer: **blink** evokes speed. The tooling goal is incremental compilation in under 200ms. Structured diagnostics with machine-applicable fixes. The generate-compile-check-fix loop completes in the blink of an eye.
 
 File extension: `.bl`
 CLI tool: `blink`
@@ -23,7 +23,7 @@ CLI tool: `blink`
 
 AI writes code in tight iterations. It generates a candidate, the compiler checks it, the AI reads the diagnostics, and it fixes the problems. This loop runs hundreds of times per task. Every millisecond of compiler latency, every ambiguous error message, every syntax choice that causes wasted generations -- these costs compound multiplicatively.
 
-Blink is designed around this loop. The compiler runs as a persistent daemon with sub-200ms incremental checking. All diagnostics are structured data with machine-applicable fixes. The syntax is deterministic -- there is never a question of "which valid form should I generate?" because there is only one.
+Blink is designed around this loop. The compiler can run as a persistent daemon. The tooling goal is incremental checking in under 200ms. All diagnostics are structured data with machine-applicable fixes. The syntax is deterministic -- there is never a question of "which valid form should I generate?" because there is only one.
 
 *This is the operational principle. Every other principle exists in service of making this loop faster and more reliable.*
 
