@@ -385,14 +385,14 @@ fn raw_getenv(name: Ptr[U8]) -> Ptr[U8] ! Env
 
 `()` and `Void` are two different kinds of thing, and the confinement of `Void` to `Ptr[Void]` is its definition, not a restriction bolted onto a general type. `()` is an *inhabited* value type: one value, a representation, usable as a return, a field, or a generic argument (`Result[(), E]`, `Map[Str, ()]`). `Void` mirrors C's incomplete `void` — no value representation, existing only as the thing a `void*` points at. This is exactly why `Ptr[Void].deref()` / `.write()` are rejected (E0825, below): there is no value of type `Void` to read or write.
 
-**Valid type parameters:** `Ptr[T]` accepts only FFI-compatible types: `Void`, `U8`, `U16`, `U32`, `U64`, `I8`, `I16`, `I32`, `Int` (maps to `int64_t`), `Float` (maps to `double`), and `Ptr[T]` itself (for pointer-to-pointer). Using a GC-managed type (e.g., `Ptr[Str]`, `Ptr[List[T]]`) is a compile error.
+**Valid type parameters:** `Ptr[T]` accepts only FFI-compatible types: `Void`, `U8`, `U16`, `U32`, `U64`, `I8`, `I16`, `I32`, `Int` (maps to `int64_t`), `Float` (maps to `double`), and `Ptr[T]` itself (for pointer-to-pointer). Any other type (e.g., `Ptr[Str]`, `Ptr[List[T]]`) is a compile error.
 
 ```
 error[E0810]: invalid Ptr type parameter
  --> db/sqlite.bl:5:20
   |
 5 | fn bad(data: Ptr[Str]) -> Int
-  |                  ^^^ `Str` is GC-managed and cannot be pointed to
+  |                  ^^^ `Str` is not FFI-compatible and cannot be pointed to
   |
   = help: use `Ptr[U8]` for C strings, convert with `.as_cstr()`
 ```
@@ -451,7 +451,7 @@ with ffi.scope() as scope {
 
 **`null_ptr[T]()` semantics.** Constructs a null `Ptr[T]`. It is the sole way to spell `NULL` in Blink surface — required to pass `NULL` *into* C and to compare against a possibly-null C return (`p == null_ptr()`, or equivalently `p.is_null()`).
 
-**`.write()` restriction:** Writing a GC-managed reference through a pointer is a compile error. Only FFI-compatible values (integers, floats, other pointers) can be written.
+**`.write()` restriction:** Only FFI-compatible values (integers, floats, other pointers) can be written.
 
 **`.as_cstr()` semantics:** Creates a null-terminated copy of the Blink string's bytes. Free the copy with `ffi.scope()` or manual cleanup. This is a method on `Str`, not on `Ptr[T]`.
 
@@ -673,7 +673,7 @@ error[E0810]: invalid Ptr type parameter
  --> crypto/sodium.bl:5:20
   |
 5 | fn bad(data: Ptr[List[U8]]) -> Int
-  |                  ^^^^^^^^ `List[U8]` is GC-managed
+  |                  ^^^^^^^^ `List[U8]` is not FFI-compatible
   |
   = help: use `Ptr[U8]` and convert manually
 
@@ -863,7 +863,7 @@ pub type Pollfd {
 }
 ```
 
-`@ffi.struct(header, name)` declares that a Blink type mirrors a named C struct from a specific C header. The header is resolved against the project's `[native-dependencies].headers` list. Fields are listed in declaration order and must use sized FFI-compatible types: `I8`/`I16`/`I32`/`Int`, `U8`/`U16`/`U32`/`U64`, `F32`/`Float`, `Bool`, `Ptr[T]`, or another `@ffi.struct` type. List, Str, Bytes, Map, Result, Option, and trait types are rejected with `E0812` (extending the existing GC-types-cannot-cross-FFI rule from `E0810` for `Ptr[T]`). A `Buf[T]` field is rejected with `E0822`: a `Buf` is not the C pointer the field declares, and the layout check cannot catch the difference. Use `Ptr[T]`.
+`@ffi.struct(header, name)` declares that a Blink type mirrors a named C struct from a specific C header. The header is resolved against the project's `[native-dependencies].headers` list. Fields are listed in declaration order and must use sized FFI-compatible types: `I8`/`I16`/`I32`/`Int`, `U8`/`U16`/`U32`/`U64`, `F32`/`Float`, `Bool`, `Ptr[T]`, or another `@ffi.struct` type. List, Str, Bytes, Map, Result, Option, and trait types are rejected with `E0812` (the same FFI-compatible rule that `E0810` applies to `Ptr[T]`). A `Buf[T]` field is rejected with `E0822`: a `Buf` is not the C pointer the field declares, and the layout check cannot catch the difference. Use `Ptr[T]`.
 
 **`Bool` at the FFI boundary.** In an FFI position (an `@ffi.struct` field, an `@ffi` parameter or an `@ffi` return), `Bool` is C `bool` (`_Bool`): the struct mirror and the foreign prototype spell it `bool`, with C's size and alignment. A `Bool` read from C (an `@ffi` return, or an `@ffi.struct` field read) is always `true` or `false`, as every `Bool` is (§3.4 *`Bool` Is Distinct from `Int`*). A C `int` used as a flag is not a `bool`: declare it `I32` and convert with `!= 0`.
 
@@ -1212,7 +1212,7 @@ For C surfaces β cannot reach (varargs, signal handlers, glibc-version-conditio
 
 | Code | Class | Meaning |
 |------|-------|---------|
-| `E0812` | error | `@ffi.struct` field uses GC-managed type |
+| `E0812` | error | `@ffi.struct` field uses a type that is not FFI-compatible |
 | `E0813` | error | `offset(i)` called on singleton `alloc[T]()` result |
 | `E0814` | error | growth-effecting call on `Bytes` inside its `with_ptr` closure body |
 | `E0815` | error | pinned `Bytes` passed as argument inside `with_ptr` closure body |
