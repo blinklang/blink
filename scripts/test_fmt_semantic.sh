@@ -3,8 +3,11 @@
 # program behaves differently from the original: a test that fails on its own,
 # or prints FAIL inside a passing run, is not a formatter bug. Also proves the
 # test binary finds the prelude, which a probe suite needs to compile programs
-# in process. Runs an unmodified copy of the script in a throwaway root with a
-# fake compiler whose C output acts on markers in the source.
+# in process. Proves both scripts/run_fmt_semantic.sh and
+# scripts/run_fmt_idempotent.sh fail a file the formatter cannot format, so a
+# formatter abort never reads as a skip. Runs unmodified copies of the scripts
+# in a throwaway root with a fake compiler whose C output acts on markers in
+# the source.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -14,13 +17,20 @@ fail=0
 
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/.tmp" "$R/lib/std" "$R/fake"
-cp scripts/run_fmt_semantic.sh "$R/scripts/"
+cp scripts/run_fmt_semantic.sh scripts/run_fmt_idempotent.sh "$R/scripts/"
 
 # The fake formatter turns SELFTEST_FMT_BREAKS_RUN into SELFTEST_FAILS and adds
-# a line, so line numbers in the formatted copy differ from the original.
+# a line, so line numbers in the formatted copy differ from the original. It
+# aborts on SELFTEST_FMT_ABORTS, and turns SELFTEST_FMT_OUTPUT_ABORTS into
+# SELFTEST_FMT_ABORTS, so the second pass of the idempotency check aborts.
 cat > "$R/fake/blinkc" <<'EOF'
 #!/bin/bash
 if [ "$3" = "--emit" ]; then
+    grep -q SELFTEST_FMT_ABORTS "$1" && exit 101
+    if grep -q SELFTEST_FMT_OUTPUT_ABORTS "$1"; then
+        sed 's/SELFTEST_FMT_OUTPUT_ABORTS/SELFTEST_FMT_ABORTS/' "$1" > "$2"
+        exit 0
+    fi
     { echo "// formatted"; sed 's/SELFTEST_FMT_BREAKS_RUN/SELFTEST_FAILS/' "$1"; } > "$2"
     exit 0
 fi
@@ -60,24 +70,31 @@ fixture test_fails_on_its_own SELFTEST_FAILS
 fixture test_prints_fail_in_a_pass SELFTEST_PRINTS_FAIL
 fixture test_needs_prelude SELFTEST_NEEDS_PRELUDE
 fixture test_fmt_breaks_run SELFTEST_FMT_BREAKS_RUN
+fixture test_fmt_aborts SELFTEST_FMT_ABORTS
+fixture test_fmt_output_aborts SELFTEST_FMT_OUTPUT_ABORTS
 # A file with a main and test blocks runs its tests; the main would hide the
 # formatted copy's failing test.
 printf 'test "probe" {\n    // SELFTEST_MAIN_AND_TESTS SELFTEST_FMT_BREAKS_RUN\n}\n\nfn main() {\n}\n' > "$R/tests/test_main_and_tests.bl"
 
-expect() {
-    local name="$1" want="$2" got
-    got=$(cd "$R" && ./scripts/run_fmt_semantic.sh "tests/$name.bl" "$R/fake/blinkc" /dev/null 2>&1 | tail -1)
+# expect <runner> <fixture> <verdict>
+expect_run() {
+    local runner="$1" name="$2" want="$3" got
+    got=$(cd "$R" && "./scripts/$runner" "tests/$name.bl" "$R/fake/blinkc" /dev/null 2>&1 | tail -1)
     if [ "${got%% *}" != "$want" ]; then
-        echo "test_fmt_semantic: $name: want $want, got: $got"
+        echo "test_fmt_semantic: $runner $name: want $want, got: $got"
         fail=1
     fi
 }
+expect() { expect_run run_fmt_semantic.sh "$1" "$2"; }
 expect test_plain_pass PASS
 expect test_fails_on_its_own PASS
 expect test_prints_fail_in_a_pass PASS
 expect test_needs_prelude PASS
 expect test_fmt_breaks_run FAIL
 expect test_main_and_tests FAIL
+expect test_fmt_aborts FAIL
+expect_run run_fmt_idempotent.sh test_fmt_aborts FAIL
+expect_run run_fmt_idempotent.sh test_fmt_output_aborts FAIL
 
 leftover=$(ls "$R/tests" | grep -c fmt-sem- || true)
 if [ "$leftover" -ne 0 ]; then

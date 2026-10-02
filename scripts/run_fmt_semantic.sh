@@ -14,10 +14,12 @@ fmt_bin=$(mktemp .tmp/fmt-sem-XXXXXX)
 orig_c=$(mktemp .tmp/fmt-sem-XXXXXX.c)
 orig_bin=$(mktemp .tmp/fmt-sem-XXXXXX)
 cleanup() { rm -f "$fmt_src" "$fmt_c" "$fmt_bin" "$orig_c" "$orig_bin"; }
+# A file the formatter cannot format is a formatter bug; only the skip list
+# may excuse it.
 if ! "$blinkc" "$f" "$fmt_src" --emit blink 2>/dev/null; then
   cleanup
-  echo "SKIP sem_${name}"
-  exit 0
+  echo "FAIL (format) ${name}"
+  exit 1
 fi
 
 # Re-linking the 10MB monolith for every fixture dominates this script's cost,
