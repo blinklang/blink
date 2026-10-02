@@ -542,7 +542,7 @@ The symbol table maintains module identity for every declaration. Each symbol is
 
 - **`pub` enforcement** (§10.8): Using a non-pub item from outside its module produces E1003 (PrivateItemAccess)
 - **Qualified error messages**: "cannot access `json.internal_parse`, it is private to module `std.json`"
-- **Ambiguity detection**: Two imported modules defining the same name produces E1005 (AmbiguousImport)
+- **Ambiguity detection**: Two imports in one file that bind one name to different items produce E1005 (AmbiguousImport)
 - **Module-qualified C symbols**: `blink_<module>_<name>` naming requires knowing the source module
 
 Name lookup follows standard lexical scoping priority:
