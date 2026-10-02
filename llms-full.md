@@ -396,7 +396,7 @@ env.var(name)                   // -> Option[Str] (read env var, effect: Env.Rea
 env.cwd()                       // -> Str (current working directory, effect: Env.Read)
 env.set_var(name, value)        // set env var (effect: Env.Write)
 env.remove_var(name)            // remove env var (effect: Env.Write)
-env.exit(code)                  // terminate process (effect: Env)
+env.exit(code)                  // terminate process (effect: Env.Exit)
 
 // Time
 time.read()                     // -> Instant

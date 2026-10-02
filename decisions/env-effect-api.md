@@ -24,6 +24,8 @@ Five panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML) voted indepe
 
 **Q3: env.exit() placement (5-0 for A: Under Env)**
 
+> **Amended** by [Effect Leaf Operations](effect-leaf-operations.md) (6-0): `exit` moves into a child `Env.Exit`. `! Env.Exit` or `! Env` grants it; `! Env.Read` and `! Env.Write` do not. The placement this question decided (on the `env` handle, interceptable, `-> Never`) is unchanged.
+
 - **Systems:** `exit()` is in the same domain as process environment. Consistency with existing examples matters. Moving to `Process` means CLI programs need two effects (`Env.Read` + `Process`) — needlessly verbose. Standalone `exit()` breaks the ocap model entirely — can't be intercepted by handlers, can't be mocked in tests.
 - **Web/Scripting:** `env.exit()` is the most intuitive. `Process` is about spawning/signaling child processes — different domain. Free function `exit()` would be the only side-effectful free function, contradicting Blink's core thesis.
 - **PLT:** `exit` is intentional control flow with observable results (exit code), unlike `panic` which represents program errors. Making it an effect operation means handlers can intercept it for testing. The `-> Never` return type on handler operations is sound — handlers abort the computation rather than resuming past exit.
@@ -31,6 +33,8 @@ Five panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML) voted indepe
 - **AI/ML:** Despite `process.exit(1)` having massive Node.js training weight, Blink has no `process` handle for this. Creating Process just to match Node idiom adds confusion. LLMs that generate `process.exit(1)` get a clear error and self-correct.
 
 **Q4: Env sub-effect granularity (5-0 for A: Keep Read + Write)**
+
+> **Amended** by [Effect Leaf Operations](effect-leaf-operations.md) (6-0): `Env` gains a third child, `Exit`, which holds only `exit`. `Read` and `Write` are unchanged.
 
 - **Systems:** Read/Write matches every other effect. Meaningful attenuation: compromised dependency with `Env.Read` can observe but not mutate. `Env.Args` distinction doesn't prevent real attacks — args often contain secrets too. Flattening loses useful information.
 - **Web/Scripting:** Config-loading code declares `! Env.Read`, test setup declares `! Env.Write`. Matches mental model. `Env.Args` is over-engineering — args and env vars co-occur in practice.

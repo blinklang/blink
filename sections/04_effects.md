@@ -127,6 +127,7 @@ effect IO {
 effect Env {
     effect Read       // read environment variables
     effect Write      // set environment variables
+    effect Exit       // terminate the process
 }
 
 effect Time {
@@ -703,7 +704,7 @@ server.get("/static/*", static_files("./public"))
 
 #### 4.4.3 Env Operations
 
-The `Env` effect provides access to the process environment: command-line arguments, environment variables, working directory, and process exit. Operations are split between `Env.Read` (observation) and `Env.Write` (mutation), with `exit` requiring full `Env` authority.
+The `Env` effect provides access to the process environment: command-line arguments, environment variables, working directory, and process exit. Operations are split between `Env.Read` (observation), `Env.Write` (mutation) and `Env.Exit` (process termination).
 
 ```blink
 effect Env {
@@ -730,9 +731,11 @@ effect Env {
         fn remove_var(name: Str)
     }
 
-    /// Terminate the process with an exit code. Requires full Env, not just Read or Write.
-    /// This is a non-resumable operation — handlers intercept but cannot resume past exit.
-    fn exit(code: Int) -> Never
+    effect Exit {
+        /// Terminate the process with an exit code. Requires Env.Exit (or Env), not Read or Write.
+        /// This is a non-resumable operation — handlers intercept but cannot resume past exit.
+        fn exit(code: Int) -> Never
+    }
 }
 ```
 
@@ -742,9 +745,10 @@ effect Env {
 |---|---|
 | `! Env.Read` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()` |
 | `! Env.Write` | `env.set_var(...)`, `env.remove_var(...)` |
-| `! Env` | All of the above plus `env.exit(...)` |
+| `! Env.Exit` | `env.exit(...)` |
+| `! Env` | All of the above |
 
-`env.exit()` requires `! Env` (the parent) because it is neither pure observation nor environment mutation — it is process termination. A function declaring only `! Env.Read` or `! Env.Write` cannot call `env.exit()`:
+`env.exit()` requires `! Env.Exit` (granted by `! Env`) because it is neither pure observation nor environment mutation — it is process termination. A function declaring only `! Env.Read` or `! Env.Write` cannot call `env.exit()`. A CLI entry point that only reads arguments and exits can declare `! Env.Read, Env.Exit` and leave out `Env.Write`:
 
 ```blink
 fn load_config() -> Config ! Env.Read {
@@ -753,11 +757,11 @@ fn load_config() -> Config ! Env.Read {
     Config { db_url: db, port: port.parse_int() ?? 8080 }
 }
 
-fn run_cli() ! Env, IO {
+fn run_cli() ! Env.Read, Env.Exit, IO {
     let args = env.args()
     if args.len() < 2 {
         io.println("Usage: mytool <command>")
-        env.exit(1)  // requires ! Env, not just Env.Read
+        env.exit(1)  // requires ! Env.Exit; ! Env grants it
     }
     let verbose = env.var("VERBOSE").is_some()
     let cwd = env.cwd()
@@ -771,7 +775,7 @@ fn run_cli() ! Env, IO {
 
 1. Handlers can intercept it for testing — a mock `Env` handler captures exit codes instead of terminating the test runner
 2. The capability system tracks which code can terminate the process
-3. Sandboxed code cannot exit unless granted `! Env`
+3. Sandboxed code cannot exit unless granted `! Env.Exit` (or `! Env`)
 
 ```blink
 test "CLI exits with 1 on missing args" {
@@ -794,6 +798,8 @@ test "CLI exits with 1 on missing args" {
     assert_eq(exit_code, 1)
 }
 ```
+
+The mock lists all seven operations at one level. A handler for an effect with children gives every operation of the tree, whichever child declares it (§4.12 *Leaf effects and effect trees*).
 
 **`env.vars()` returns a snapshot:** The returned `Map[Str, Str]` is a copy of the environment at the time of the call. Subsequent `env.set_var()` or `env.remove_var()` calls do not affect previously returned maps. This ensures deterministic behavior in concurrent code.
 
@@ -2001,6 +2007,96 @@ effect Metrics {
 ```
 
 A function declaring `! Metrics.Emit` gets `metrics.counter(...)`, `metrics.gauge(...)`, and `metrics.histogram(...)` but not `metrics.get(...)`.
+
+**Leaf effects and effect trees:**
+
+An effect with no sub-effects is a *leaf effect*. A leaf effect declares its operations directly in its body:
+
+```blink
+effect Store {
+    fn get(key: Str) -> Int
+    fn put(key: Str, value: Int)
+}
+
+fn load() -> Int ! Store {
+    store.get("count")
+}
+```
+
+`! Store` grants `store.get(...)` and `store.put(...)`. A leaf has no sub-effects, so a row grants all of its operations or none of them. The built-in `Rand` (§4.3) is a leaf of this kind.
+
+Four rules govern an effect body:
+
+1. **Operations or sub-effects, never both.** A body holds operations (`fn` items) or sub-effects (`effect` items), never both. The rule applies to every node of every effect tree, built-in or user-declared. So an operation always sits on a node with no sub-effects, and every operation has a node that a row can name. A body with both is `MixedEffectBody` (E0541):
+
+   ```
+   error[MixedEffectBody]: effect `Store` declares both operations and sub-effects
+    --> store.bl:3:5
+     |
+   1 | effect Store {
+   2 |     effect Read { fn get(key: Str) -> Int }
+   3 |     fn clear()
+     |     ^^^^^^^^^^ operation beside a sub-effect
+     |
+     = help: an effect body holds operations or sub-effects, not both;
+             move the operations into a sub-effect of their own:
+                 effect Ops { fn clear() }
+             then give `Ops` a name that says what it grants
+   ```
+
+   The fix moves every operation of the body into one new sub-effect. Its name is a placeholder that does not collide with an existing sub-effect. The fix never moves an operation up to the parent.
+
+2. **Two levels at most.** In v1 an effect tree has at most two levels: the top-level effect and one level of sub-effects. A sub-effect cannot declare sub-effects. A sub-effect inside a sub-effect is `EffectNestingTooDeep` (E0542). Rule 1 does not depend on depth, so it stays true if a later version lifts the limit.
+
+3. **Operation names are unique across one tree.** Every operation goes through the one top-level handle (`metrics.counter`, not `metrics.emit.counter`), and a handler lists the operations of the whole tree at one level. So no two nodes of one top-level effect may declare operations with the same name. A duplicate is `DuplicateEffectOp` (E0543), and the diagnostic names both declarations, for example `Metrics.Emit.get` and `Metrics.Query.get`. Two different top-level effects may share an operation name (`store.get`, `cache.get`) because their handles differ.
+
+4. **An empty body is no body.** `effect Audit {}` means the same as `effect Audit`: a leaf with no operations. `blink fmt` rewrites `effect Audit {}` to `effect Audit`. When the braces hold a comment, `blink fmt` keeps the braces and the comment.
+
+The grammar of an effect declaration:
+
+```
+effect_decl  ::= "pub"? "effect" IDENT effect_body?
+effect_body  ::= "{" ( op_sig* | child_effect* ) "}"
+child_effect ::= "effect" IDENT ( "{" op_sig* "}" )?
+op_sig       ::= "fn" IDENT "(" params? ")" ( "->" type )?
+```
+
+`op_sig` is a function signature with no body; `params` and `type` are as in a `fn` declaration (§2). A `child_effect` has no `effect_body`, which is the two-level limit of rule 2. A `child_effect` with empty braces is the same as a bare `child_effect` (rule 4).
+
+**A row names effects, not operations.** `! Store.get` and `! Clock.now_ms` name no effect, so each is `UnknownEffect` (E0538, §4.3). When the name before the dot is a leaf effect, the diagnostic adds a note that lists the leaf's operations and a help line that names the whole effect. Only the error is normative; the note and help text below are guidance for tools:
+
+```
+error[UnknownEffect]: unknown effect `Store.get`
+ --> load.bl:1:20
+  |
+1 | fn load() -> Int ! Store.get {
+  |                    ^^^^^^^^^ `Store` has no sub-effect `get`
+  |
+  = note: `Store` is a leaf effect; its operations are `get` and `put`
+  = help: write `! Store`
+```
+
+**Splitting a leaf later:** A leaf can grow sub-effects without breaking its users. When `Store` above becomes
+
+```blink
+effect Store {
+    effect Read {
+        fn get(key: Str) -> Int
+    }
+
+    effect Write {
+        fn put(key: Str, value: Int)
+    }
+}
+```
+
+the following stay valid with no change:
+
+- **Rows.** `! Store` grants every operation of the tree, as before (§4.3).
+- **Handlers.** `handler Store { fn get(...) ... fn put(...) ... }` is still complete, because completeness covers every operation of the tree (§4.7.1 *Completeness and auto-delegation*).
+- **Calls.** `store.get(...)` is the same call, because operations go through the top-level handle.
+
+Only the declaration changes. Functions can then narrow their rows to `! Store.Read` one at a time. The built-in `Env` (§4.4.3) is an example: moving `exit` into `Env.Exit` kept every `! Env` row and every `handler Env` valid.
 
 **Standard library handlers:**
 

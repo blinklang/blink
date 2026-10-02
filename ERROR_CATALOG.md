@@ -110,8 +110,11 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | EffectTypeAsValue | E0535 | An effect's type is written as the type of a value (`fn f(x: DB)`, `let x: DB`); it is valid only as a type argument | Type checking | §3b.5 |
 | SubEffectAsType | E0536 | A sub-effect is written as a type (`Template[DB.Read]`); only a top-level effect gives a type | Type checking | §3b.5 |
 | JsonTextForValue | E0537 | A `Str` is passed to a `from_json` that takes `JsonValue`, or `to_json()`'s result is used as a `Str`; the fix names `json.decode[T]` / `json.encode` | Type checking | §3.6.2 |
-| UnknownEffect | E0538 | An effect row names an effect that is neither built-in nor declared. For `FFI` the help says a foreign call is not an effect and points to §9.1. No machine-applicable fix | Effects | §4.3 |
+| UnknownEffect | E0538 | An effect row names an effect that is neither built-in nor declared. For `FFI` the help says a foreign call is not an effect and points to §9.1. When the name before the dot is a leaf effect, a note lists its operations and the help names the whole effect. No machine-applicable fix | Effects | §4.3, §4.12 |
 | UnhandledEffect | E0539 | An effect reaches a root with no `with` that discharges it: a user-declared effect in `main`, or any effect in a test block. The header names the root (in `main`, or in test "..."); in `main` the help says user-declared effects have no root handler | Effects | §4.6, §2.20 |
+| MixedEffectBody | E0541 | An effect body declares both operations and sub-effects; a body holds one or the other. The fix moves the operations into a new sub-effect with a placeholder name, never up to the parent | Parser | §4.12 |
+| EffectNestingTooDeep | E0542 | A sub-effect declares a sub-effect; in v1 an effect tree has the top-level effect and one level of sub-effects | Parser | §4.12 |
+| DuplicateEffectOp | E0543 | Two nodes of one top-level effect tree declare operations with the same name. The message names both declarations (`Metrics.Emit.get`, `Metrics.Query.get`) | Effects | §4.12 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | MutableCaptureInSpawn | E0650 | A closure passed to `async.spawn` captures a `let mut` binding | Closures | §2.8 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
