@@ -80,7 +80,7 @@ error[ArenaValueEscapes]: arena-scoped value escapes
   |                             ^^^^^^ `leaked` is arena-allocated and cannot escape
   |
   = note: arena values are freed when the arena scope exits
-  = fix: remove `! Arena` and let the value live outside the arena, or copy the value explicitly:
+  = fix: remove `! Arena` and let the value be GC-managed, or copy the value explicitly:
   |
 3 |     some_global_cache.store(leaked.clone())
   |                                   ++++++++
@@ -408,7 +408,7 @@ $ blink eval 'process_order(42)' --effects mock
 
 The compiler checks every identifier reference in the program before it produces any output.
 
-#### 6.3.1 Order of Checks
+#### 6.3.1 Resolution Before Output
 
 Names resolve before the compiler produces output. If the program has a name error, the compiler produces no output (§6.3.5).
 
