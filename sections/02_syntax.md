@@ -83,7 +83,7 @@ Two string types (`"plain"` vs `f"interpolated"`) create problems:
 2. The formatter must handle two syntaxes for the same concept.
 3. Developers forget the prefix, get no error, and ship broken output.
 
-With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is present, the compiler treats it as a plain string literal — zero cost. Literal braces use `\{`, which is rare enough (JSON templates, regex) to be acceptable. The trade is a one-character escape in edge cases vs eliminating an entire class of bugs in the common case.
+With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is present, the literal is a plain `Str`. Literal braces use `\{`, which is rare enough (JSON templates, regex) to be acceptable. The trade is a one-character escape in edge cases vs eliminating an entire class of bugs in the common case.
 
 Holes evaluate left to right, and each hole's value is appended before the next hole starts: `"{next()} {next()}"` calls the first `next()` first (§2.22).
 
@@ -248,12 +248,12 @@ let json = #"{"name":"#{name}","active":true}"#
 Maximum depth is 3. Beyond that, use `#embed("path")` for file inclusion.
 
 ```blink
-// Generating C code with interpolation — the main use case:
-emit_line(#"result = blink_str_concat(result, "\"#{field_name}\":");"#)
-// Produces: result = blink_str_concat(result, "\"fieldName\":");
+// Building a regex with interpolation — a main use case:
+let pattern = #"^\s*#{name}\s*=\s*"(.*)"$"#
+// With name = "port": ^\s*port\s*=\s*"(.*)"$
 
 // Without extended delimiters, this would be:
-emit_line("result = blink_str_concat(result, \"\\\"{field_name}\\\":\");")
+let pattern = "^\\s*{name}\\s*=\\s*\"(.*)\"$"
 ```
 
 Rules:
@@ -370,7 +370,7 @@ let add = fn(a: Int, b: Int) -> Int { a + b }
 
 #### Capture Semantics
 
-Closures capture variables from enclosing scope by **shared reference**. All captures — immutable (`let`) and mutable (`let mut`) — share the original binding. In a GC'd language, "shared reference" means the closure holds a GC pointer to the same value as the enclosing scope. No explicit capture syntax is needed. No `move` keyword, no capture lists.
+Closures capture variables from enclosing scope by **shared reference**. All captures — immutable (`let`) and mutable (`let mut`) — share the original binding. "Shared reference" means the closure and the enclosing scope see the same binding. No explicit capture syntax is needed. No `move` keyword, no capture lists.
 
 ```blink
 let threshold = 10
@@ -383,9 +383,9 @@ items.for_each(fn(x) {
 io.println("Found {count}")  // prints the actual count, not 0
 ```
 
-**Immutable captures.** For `let` bindings, shared reference is observationally equivalent to by-value copy — the value never changes, so there is no difference. The optimizer may inline or copy the value freely.
+**Immutable captures.** For `let` bindings, shared reference is observationally equivalent to by-value copy — the value never changes, so there is no difference.
 
-**Mutable captures.** For `let mut` bindings, mutations through the closure are visible in the enclosing scope and vice versa. The compiler heap-allocates (boxes) the mutable binding into a shared cell (§3.6 *Shared cells*) so closure and outer scope share it. Escape analysis eliminates this boxing when the closure does not outlive the enclosing scope.
+**Mutable captures.** For `let mut` bindings, mutations through the closure are visible in the enclosing scope and vice versa.
 
 ```blink
 let mut total = 0
@@ -436,12 +436,12 @@ error[MutableCaptureInSpawn]: mutable binding captured in spawned task
   | async.spawn(fn() { use(snapshot) })
 ```
 
-Immutable captures in `async.spawn` are safe — the GC keeps the value alive, and no mutation means no data race:
+Immutable captures in `async.spawn` are safe — the value stays valid while the closure can run, and no mutation means no data race:
 
 ```blink
 let data = prepare_data()
 async.spawn(fn() {
-    process(data)  // OK: data is immutable, shared GC pointer
+    process(data)  // OK: data is immutable and shared
 })
 ```
 
@@ -472,7 +472,7 @@ Same logic applies to arena-allocated values — closures capturing arena bindin
 
 #### Capture Rules Summary
 
-- All captures are **shared reference** (GC pointer to same binding)
+- All captures are **shared reference** (the closure and the enclosing scope see one binding)
 - `let` captures: immutable, observationally equivalent to copy
 - `let mut` captures: mutations visible across closure boundary
 - No explicit capture syntax (no `move`, no capture lists)
@@ -746,7 +746,7 @@ The primary span is on the later declaration in source order, and a label marks 
 
 **`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For compile-time constants, prefer `const` (see [2.21](#221-const-declarations)) — `let` at module level is for runtime-initialized values.
 
-**`pub let mut` is forbidden.** Mutable module-level state must not be directly exposed to other modules. The compiler tracks which functions write to module-level `let mut` bindings via mutation analysis (see §4.16). The compiler reports `PubLetMutForbidden` (E1013). This check is not yet enforced.
+**`pub let mut` is forbidden.** Mutable module-level state must not be directly exposed to other modules. The compiler reports `PubLetMutForbidden` (E1013) for `pub let mut`.
 
 ```blink
 // Compile-time constants — prefer const (§2.21)
@@ -813,7 +813,7 @@ transfer(300, to: bob, from: alice)  // valid, binds the same way; `bob` is eval
 
 **Where a label resolves.** A call-site label resolves in the callee's **keyword-parameter namespace** — the parameters declared after `--`, and nothing else. This rule governs calls to functions and to methods. A label in a variant-payload application or a struct literal names a **field**, not a parameter, and is outside this rule; the rule governing those labels is stated separately.
 
-**Extent of enforcement.** The rule is stated for every call against a declared `fn` signature, **method calls included**. Where the compiler's keyword-argument check is not reachable from a call path, the rule is not yet enforced on that path. That is an implementation gap, not a narrower rule: a rule that held for `f(x: 1)` and not for `b.f(x: 1)` would select two behaviours by the receiver's spelling, and making the check reachable from every call path is a prerequisite for this section to be true as written.
+**Extent of enforcement.** The rule is stated for every call against a declared `fn` signature, **method calls included**. A rule that held for `f(x: 1)` and not for `b.f(x: 1)` would select two behaviours by the receiver's spelling.
 
 #### Call-Site Diagnostics
 
@@ -897,7 +897,7 @@ let config = ServerConfig { port: 3000, debug: true }
 
 - Default values must be const expressions (see [2.21](#221-const-declarations))
 - Fields without defaults are always required at construction
-- The compiler inserts default values at construction sites — no runtime lookup
+- An omitted field takes its default value
 - Struct field defaults do not interact with the type system: `ServerConfig` is the same type regardless of which fields were explicitly provided
 
 #### Why Struct Defaults, Not Function Param Defaults
@@ -963,7 +963,7 @@ fn deposit(acct: Account, amount: Int) -> Account {
 }
 ```
 
-This is purely syntactic sugar. The compiler desugars `T { f1: e1, ..src }` to `T { f1: e1, f2: src.f2, f3: src.f3, ... }` at typecheck time — zero runtime cost beyond a normal struct literal.
+This is purely syntactic sugar. The compiler desugars `T { f1: e1, ..src }` to `T { f1: e1, f2: src.f2, f3: src.f3, ... }` at typecheck time.
 
 **Rules:**
 
@@ -1029,7 +1029,7 @@ Annotations use the `@` prefix and are **compiler-checked** — they are not com
 
 #### `@requires` and `@ensures` — Contracts
 
-Preconditions and postconditions form verifiable contracts on function behavior. The compiler attempts static proof via SMT solver. Three outcomes: proven (zero-cost), disproven (compile error with counterexample), or unknown (runtime assertion inserted, warning emitted).
+Preconditions and postconditions form verifiable contracts on function behavior. The compiler attempts static proof via SMT solver. Three outcomes: proven (no runtime check), disproven (compile error with counterexample), or unknown (runtime assertion inserted, warning emitted).
 
 ```blink
 @requires(list.len() > 0)
@@ -1367,7 +1367,7 @@ match expr {
 }
 ```
 
-For `Option[T]` operands, the lowering is identical except the `None` arm produces a `TestError` whose `message` is `"None"` and `error_type` is `"Option"`. Allocation occurs only on the error path; passing tests pay zero cost for this elaboration.
+For `Option[T]` operands, the lowering is identical except the `None` arm produces a `TestError` whose `message` is `"None"` and `error_type` is `"Option"`.
 
 **`Display` is required at each `?` site.** If `E` does not implement `Display`, the test fails to compile with E0514 pointing at the `?` site. This is the same rule the compiler uses for `?` outside tests under the exact-structural-match constraint (§3c.2 Rule 4): the test author must guarantee the error type can be rendered. The diagnostic suggests implementing `Display` for `E`, or deriving `Debug` for `E` and calling `.unwrap()`, which needs only `Debug` (§7.5).
 
@@ -1418,7 +1418,7 @@ test "let-bound property closure is not elaborated" {
 }
 ```
 
-Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. The runner ABI is unchanged — every property iteration returns `Result[(), TestError]`, so the elaborated property closure and an assertion-only one share one monomorphic shape; the closure's `E` never reaches the runner. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
+Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
 
 **Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.6.3 — it runs `BlockHandler.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
 
@@ -1675,7 +1675,7 @@ Expression introspection is bounded to one level of sub-expressions (direct oper
 
 The test runner distinguishes assertion failures (`"status": "failed"`) from unexpected panics (`"status": "panicked"`) in structured output, enabling CI to categorize "test found a bug" vs "test itself is broken."
 
-**Panel vote: 4-1** for expression introspection. PLT dissented (left/right is structurally honest; introspection is ad-hoc compiler analysis). Majority: compiler already has the AST, introspection is zero-cost on the hot path (failure code is cold), and sub-expression values dramatically improve debugging. See [DECISIONS.md](../DECISIONS.md).
+**Panel vote: 4-1** for expression introspection. PLT dissented (left/right is structurally honest; introspection is ad-hoc compiler analysis). Majority: sub-expression values greatly improve debugging. See [DECISIONS.md](../DECISIONS.md).
 
 #### Property-Based Testing
 
@@ -1745,7 +1745,7 @@ test "full order flow" {
 }
 ```
 
-The `@tags(...)` annotation attaches string tags to a test block for structured filtering. Tags are compile-time metadata — zero runtime cost, stripped with test bodies in release builds.
+The `@tags(...)` annotation attaches string tags to a test block for structured filtering. Tags are compile-time metadata — stripped with test bodies in release builds.
 
 **CLI filtering:**
 
@@ -1821,7 +1821,7 @@ test "platform specific" {
 
 Both `@skip` and `skip()` produce the same `"skipped"` status in JSON output. The `"skipped"` count in the summary reflects both.
 
-**Panel vote: 3-2** for both mechanisms. PLT and AI/ML dissented (wanted `@skip` only — Principle 2 concern). Majority: compile-time and runtime skips are fundamentally different evaluation times; conflating them forces either losing zero-cost static skipping or losing runtime conditional skipping. See [DECISIONS.md](../DECISIONS.md).
+**Panel vote: 3-2** for both mechanisms. PLT and AI/ML dissented (wanted `@skip` only — Principle 2 concern). Majority: compile-time and runtime skips are fundamentally different evaluation times; conflating them forces either losing static skipping at compile time or losing runtime conditional skipping. See [DECISIONS.md](../DECISIONS.md).
 
 #### Doc-Tests
 
@@ -1864,7 +1864,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 
 ### 2.21 Const Declarations
 
-The `const` keyword declares compile-time constants. Unlike `let` (runtime-initialized, immutable), `const` bindings are evaluated by the compiler during compilation and their values are substituted at every use site. The right-hand side must be a **const expression**.
+The `const` keyword declares compile-time constants. Unlike `let` (runtime-initialized, immutable), `const` bindings are evaluated by the compiler during compilation and their values are fixed at compile time. The right-hand side must be a **const expression**.
 
 ```blink
 const MAX_RETRIES = 5
@@ -2002,33 +2002,20 @@ There is no `const mut` — constants are inherently immutable. `const mut` is a
 |-|---------|-------|
 | Evaluation | Compile time | Program initialization |
 | RHS | Must be const expression | Any expression (runtime) |
-| Substitution | Inlined at use sites | Read from memory |
 | Mutability | Never | `let mut` allowed |
 | `pub` export | Yes | Yes (immutable only) |
 
 Module-level `let` remains valid for runtime-initialized module state:
 
 ```blink
-// Compile-time: evaluated by the compiler, inlined everywhere
+// Compile-time constant
 const MAX_RETRIES = 5
 
 // Runtime: initialized when the module loads
 let mut request_count = 0
 ```
 
-#### C Codegen
-
-The compiler evaluates all const expressions during compilation and emits the resulting values as C literals. Arithmetic like `1024 * 64` is folded to `65536` by the Blink compiler, not the C compiler. Struct consts are emitted as C designated initializers with all fields resolved.
-
-```c
-// Blink: const BUFFER_SIZE = 1024 * 64
-static const int64_t BUFFER_SIZE = 65536;
-
-// Blink: const DEFAULT_CONFIG = ServerConfig { host: "localhost", port: 3000 }
-static const ServerConfig DEFAULT_CONFIG = { .host = "localhost", .port = 3000, .debug = 0 };
-```
-
-This keeps the C output maximally simple and portable — no macros, no platform-dependent initializer rules.
+The compiler folds const expressions at compile time. Arithmetic like `1024 * 64` gives `65536`, and struct consts have all fields resolved.
 
 #### Error Codes
 
