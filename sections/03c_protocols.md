@@ -31,11 +31,11 @@ let first_two = names
 
 **Why eager collection adapters.** A `List` is data you already have in memory; mapping over it should give you data you already have. Every mainstream ecosystem that a working programmer knows — JavaScript `Array.map`, Python list comprehensions, Kotlin `List.map`, Java requiring an explicit `.stream()` first — landed on *eager on the collection, lazy opt-in on a separate carrier*. Making `list.map` lazy imports the single most-asked lazy-evaluation footgun: a side-effecting map that is never consumed silently does nothing, with no diagnostic — which contradicts Blink's stance that under-determined behavior is a hard error, not a silent guess (§3.4 *Under-Determined Types*, `E0301`). Eager keeps evaluation order equal to source order (§2.22). (Vote: 5-0, Minimalism dissented — see below.)
 
-**Why not one uniform rule.** Making *all* adapters lazy is one rule instead of two, and the Minimalism panelist held that line: `list.map(f).filter(g).sum()` under eager evaluation allocates intermediate lists that a uniform-lazy pipeline would not. The trade the majority accepted: the two-worlds cost is a *type mismatch on a named type* — `expected List[Int], found Iterator[Int]`, fixed by adding `.collect()` or dropping `.into_iter()` — which is loud, greppable, and self-correcting, whereas the uniform-lazy cost is a *silent no-op* that produces a wrong program with a green build. A benign, frequent, self-correcting error beats a fatal, frequent, silent one. Blink also has effect rows: an eager adapter chain whose closures are pure is provably deforestable, so the intermediate lists are a *permitted* optimization target, not a permanent tax. (Minimalism dissent recorded: [Iterator Protocol rationale](../decisions/iterator-protocol.md).)
+**Why not one uniform rule.** Making *all* adapters lazy is one rule instead of two, and the Minimalism panelist held that line. The trade the majority accepted: the two-worlds cost is a *type mismatch on a named type* — `expected List[Int], found Iterator[Int]`, fixed by adding `.collect()` or dropping `.into_iter()` — which is loud, greppable, and self-correcting, whereas the uniform-lazy cost is a *silent no-op* that produces a wrong program with a green build. A benign, frequent, self-correcting error beats a fatal, frequent, silent one. (Minimalism dissent recorded: [Iterator Protocol rationale](../decisions/iterator-protocol.md).)
 
 #### `Iterator[T]` — a Sealed, Lazy Carrier
 
-`Iterator[T]` is a **built-in, sealed, opaque type**, not a user-implementable trait. Its representation is unspecified: it holds a source plus a chain of adapters, and the compiler chooses the layout. Users cannot write `impl Iterator[Int] for Foo` — the type is closed, exactly as `Str` and `List` are closed. Its adapter surface is a sealed set of built-in methods (dispatched like `StrOps`/`ListOps`, §3c.4), which no user program may extend or override.
+`Iterator[T]` is a **built-in, sealed, opaque type**, not a user-implementable trait. Its representation is unspecified. Users cannot write `impl Iterator[Int] for Foo` — the type is closed, exactly as `Str` and `List` are closed. Its adapter surface is a sealed set of built-in methods, which no user program may extend or override.
 
 An iterator is a **restartable recipe, not a stateful cursor.** This is forced by Blink's value semantics: values are copied on bind (§3.6, there is no `&mut self`), and there is no linearity checker to forbid aliasing. If an iterator were a mutable cursor, `let b = a` would give two handles to one advancing position, and advancing `b` would observably advance `a` — mutable state aliased through a value type, which the language forbids everywhere else. Modeling the carrier as a persistent recipe — conceptually `Unit -> Option[(T, Iterator[T])]`, the same shape as OCaml's `Seq.t` — removes the hazard: each node is re-entered, never mutated in place, so copying is free and re-traversal recomputes rather than resumes.
 
@@ -81,7 +81,7 @@ fn for_each(self, f: fn(T))
 **Lazy means no work until consumed.** `.map(f).filter(p)` builds a pipeline description — zero elements are processed. Elements flow through one at a time when a consuming method (`collect`, `fold`, `count`, `for_each`, `any`, `all`, `find`) or a `for` loop pulls from the end.
 
 ```blink
-// No intermediate List allocated — elements flow one at a time
+// Elements flow through the chain one at a time
 let result = names
     .into_iter()
     .filter(fn(n) { n.len() > 3 })
@@ -107,7 +107,7 @@ The compiler desugars `for x in expr { body }` into:
 ```blink
 let mut __iter = expr.into_iter()
 loop {
-    match __iter.next() {   // next() is the carrier's internal pull; not a public method
+    match __iter.next() {   // next() is not a public method
         Some(x) => { body }
         None => break
     }
@@ -131,7 +131,7 @@ Writing `.into_iter()` explicitly (the door of §3c.1) and letting `for` desugar
 | `List[T]` | `T` | Elements in order |
 | `Set[T]` | `T` | Unspecified order |
 | `Map[K, V]` | `(K, V)` | Key-value pairs, unspecified order |
-| `Range[T]` | `T` | Lazy; `0..1000000` allocates nothing |
+| `Range[T]` | `T` | Lazy: elements are produced on demand |
 | `Str` | `Char` | Unicode scalar values |
 | `Channel[T]` | `T` | Receives until the channel is closed and empty, then stops. Consumes what it receives, so a second loop sees only later values |
 | `Iterator[T]` | `T` | Identity (returns self) |
@@ -198,7 +198,7 @@ Only `IntoIterator` is the extension point that opens. `Iterator[T]` itself — 
 
 The v1 iterator is **pure** — an adapter closure that performs effects is a v1 error, and `Iterator[T]` carries exactly one user-visible type parameter, now and permanently. This means `for line in file.lines() ! IO` is not expressible through the iterator protocol in v1.
 
-The effect row is **reserved** rather than surfaced: it lives only in the carrier's internal representation (the monomorphization key, §4.15.3), never in v1 surface syntax or diagnostics. Because `Iterator[T]` stays a one-parameter type and the row rides the internal mono key, v2 can widen the family to effectful iteration as a **conservative extension** — every v1 program keeps its exact typing — instead of a breaking change that would rewrite the effect signature of every function that touches an iterator. (The PLT panelist argued for threading a live effect-row variable through the v1 checker immediately; the panel reserved the design without building the checker plumbing yet.)
+The effect row is **reserved** rather than surfaced: it never appears in v1 surface syntax or diagnostics. Because `Iterator[T]` stays a one-parameter type, v2 can widen the family to effectful iteration as a **conservative extension** — every v1 program keeps its exact typing — instead of a breaking change that would rewrite the effect signature of every function that touches an iterator. (The PLT panelist argued for threading a live effect-row variable through the v1 checker immediately; the panel reserved the design without building the checker plumbing yet.)
 
 **Workaround for v1:** Use explicit loops with effect-performing calls:
 
@@ -346,7 +346,7 @@ impl TryFrom[Int] for Port {
 
 #### The `?` Operator and Error Types
 
-The `?` operator is early-return sugar for unwrapping `Result[T, E]` and `Option[T]`. It is validated during the **type checking phase** — codegen never sees an invalid `?` usage. Four rules govern its behavior:
+The `?` operator is early-return sugar for unwrapping `Result[T, E]` and `Option[T]`. A misused `?` is a compile error. Four rules govern its behavior:
 
 **Rule 1: Operand must be `Result[T, E]` or `Option[T]`.** Using `?` on any other type is a compile error (E0502).
 
@@ -411,8 +411,6 @@ fn load_user(id: Int) -> Result[User, AppError] ! DB {
 **Why no auto-conversion.** Blink explicitly rejected implicit conversions. Auto-calling `.into()` on `?` is implicit conversion — the error type changes without visible syntax at the call site. Explicit `.map_err()` makes every conversion visible, greppable, and unambiguous. Start strict, can relax later; can never tighten without breaking code. (Vote: 4-1, DevOps dissented wanting auto-conversion with strong diagnostics. Reaffirmed 5-0 during `?` operator validation deliberation.)
 
 **Why both Result and Option.** `?` is fundamentally early-return sugar on the "failure" branch of a sum type. For `Result` that branch is `Err(e)`, for `Option` it is `None`. The same control flow pattern applies to both — forcing different syntax for structurally identical operations would be an arbitrary distinction. (Vote: 5-0.)
-
-**Why type checking, not codegen.** `?` validation requires type information (is this a Result or Option? what are its type parameters?). Placing validation in the type checking phase ensures codegen only processes fully-validated programs, matching the phase gate architecture (§6.3). Invalid `?` usage that reaches codegen previously generated broken C output — the type checker eliminates this entire class of bugs. (Vote: 5-0.)
 
 **`?` inside test bodies.** A `test "..." { body }` block has no written return type, but `?` is permitted inside its body. The compiler implicitly elaborates the body to `Result[(), TestError]` whenever any `?` appears, and rewrites each `Err`/`None` arm to render via `Display[E]` into a sealed `TestError` carrier. `Display[E]` is required at every `?` site (E0514 if missing). The same elaboration rule applies in both `blink check` and `blink test`. See §2.20 *Error Propagation: `?` in Test Bodies* for the full lowering. Closures passed to ordinary higher-order functions (`for_each` and any user-callable HOF) do **not** inherit this elaboration and continue to obey Rules 2 and 3 against their own return types. The one exception is the property closure given as the **direct syntactic argument** of the `prop_check` intrinsic: it is a closed test-grammar surface (the runner is its sole caller, like the test body) and receives the same `Result[(), TestError]` elaboration on its own account — see §2.20 *Property-Based Testing*. A `prop_check` argument bound to a `let` first is a value, not a closed surface, and obeys Rules 2/3 normally. (Vote: 6-0 implicit elaboration, 6-0 `TestError` carrier shape, 5-1 explicit reject of annotation form; `prop_check` direct-argument elaboration follow-up 6-0.)
 
@@ -726,7 +724,7 @@ fn main() {
 }
 ```
 
-The head `(Trait for Type)` uses the same words in the same order as the header `impl Trait for Type`. It selects that impl. The call then takes any method of the trait, with `Self` set to `Type` and with the parameters the trait declares for that method. Resolution is fixed at type check, as for every other call (*Built-in Type Method Dispatch* below), and the call lowers to a direct call to that impl's method.
+The head `(Trait for Type)` uses the same words in the same order as the header `impl Trait for Type`. It selects that impl. The call then takes any method of the trait, with `Self` set to `Type` and with the parameters the trait declares for that method. Resolution is fixed at type check, as for every other call (*Built-in Type Method Dispatch* below), and the call runs that impl's method.
 
 The rules:
 
@@ -804,7 +802,7 @@ error[EffectHandleShadowed]: cannot shadow effect handle
 
 Effect handle operations are syntactically identical to method calls (`io.println(msg)`, `db.read(query)`), but they are resolved through the effect system, not through trait lookup. The compiler knows which identifiers are effect handles from the function's `!` declaration, so there is never ambiguity between `io.println()` (effect operation) and a hypothetical trait method `println` on some type — `io` is not a value of any type, it is a capability handle.
 
-**Why reserved.** Effect handles are capability proofs (§4.4). Allowing `let io = something_else` would break the guarantee that `io.println()` always routes through the effect handler chain. The reserved namespace ensures go-to-definition on any effect operation always reaches the effect declaration, LSP always shows effect operations in autocomplete, and the evidence-passing compilation ([Codegen Backend rationale](../decisions/codegen-backend-bootstrap.md)) can assume handle names are stable.
+**Why reserved.** Effect handles are capability proofs (§4.4). Allowing `let io = something_else` would break the guarantee that `io.println()` always routes through the effect handler chain. The reserved namespace ensures go-to-definition on any effect operation always reaches the effect declaration, and LSP always shows effect operations in autocomplete.
 
 #### No Inherent Methods
 
@@ -826,7 +824,7 @@ impl Parse for Str {
 
 #### Built-in Type Method Dispatch
 
-Built-in types (`Str`, `List[T]`, `Map[K,V]`, `Set[T]`, `Bytes`, `StringBuilder`, `Instant`, `Duration`, `Iterator[T]`) have their methods defined by compiler-known traits (`Sized`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `StringBuildOps`, `IteratorOps`, etc.). These surfaces are **sealed** — a user program cannot implement or override them. The underlying FFI bridge functions in `lib/std/` are internal — not part of the public API. Users interact exclusively through method syntax (§3.2).
+Built-in types (`Str`, `List[T]`, `Map[K,V]`, `Set[T]`, `Bytes`, `StringBuilder`, `Instant`, `Duration`, `Iterator[T]`) have their methods defined by compiler-known traits (`Sized`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `StringBuildOps`, `IteratorOps`, etc.). These surfaces are **sealed** — a user program cannot implement or override them. The underlying FFI bridge functions are internal and not part of the public API. Users interact exclusively through method syntax (§3.2).
 
 **A sealed trait is an ordinary owner in lookup.** *Trait Method Lookup* above applies to a built-in receiver without change. Each sealed trait that gives the receiver a method is one trait in the search, and it is always in scope (§3.2.2). No trait ranks above another: a sealed trait does not win over a user trait, and a user trait does not win over a sealed trait. This holds for every built-in receiver and for every method name.
 
@@ -889,7 +887,7 @@ fn g[T: Tidy](x: T) -> Str {
 g("  hi  ")                       // "X": calls Tidy.trim, never the built-in StrOps.trim
 ```
 
-If monomorphization looked `trim` up again with `T = Str`, the instance would run a method the type checker did not choose, and `g` would act differently at `Str` than at every other type. The rule above forbids that.
+If the call looked `trim` up again at `T = Str`, it would run a method the bound does not name, and `g` would act differently at `Str` than at every other type. The rule above forbids that.
 
 **A sealed surface may grow.** A release can add a method to a sealed trait. When the name is the same as a method that a user trait already gives that type, unqualified calls that compiled before become E0522, and W0734 fires at the user's impl. The program never changes what it does without a diagnostic, which is the guarantee *No Inherent Methods* gives for user traits.
 
@@ -911,11 +909,9 @@ warning[SealedMethodNameCollision]: `Tidy.trim` has the same name as a built-in 
   = help: rename the method, or call it as `Tidy.trim(x)`
 ```
 
-W0734 is diagnostic only. It has no effect on resolution, on monomorphization or on the code the compiler emits. A release that grows a sealed surface may make W0734 fire on an impl that compiled before without it, and that is not a breaking change. A later release may remove W0734, and that is not a breaking change either.
+W0734 is diagnostic only. It has no effect on which method a call runs. A release that grows a sealed surface may make W0734 fire on an impl that compiled before without it, and that is not a breaking change. A later release may remove W0734, and that is not a breaking change either.
 
 **Why one owner and not a priority.** If the built-in method won, a user impl could be declared but never reached with dot syntax. A release that added a sealed method would also change, without a diagnostic, which code runs at existing call sites. If the impl were an error, a release that added a sealed method would break the declaration in the package that owns the trait, and every package that uses it, and only a rename could fix it. An ordinary owner turns each collision into an error at the call, which a qualified call fixes. (Vote: 6-0 one owner on every receiver; 6-0 resolution fixed at type check; 6-0 no special case in an impl body; 6-0 the note names the built-in owner; 6-0 W0734 on by default, in round 2 after 3-3 in round 1. See [Sealed Method Name Collision](../decisions/sealed-method-name-collision.md).)
-
-**Implementation note:** The current compiler implements dispatch for these types via hardcoded pattern matching in `codegen_methods.bl` rather than real trait resolution. This is an implementation shortcut — the spec-level semantics are trait-based, and the compiler should migrate to real trait resolution as the trait system matures. The shortcut is correct only where it gives the result of the rules above. Both the E0522 check and W0734 read one table of the sealed methods of each receiver.
 
 #### Resolution Summary
 
@@ -929,10 +925,10 @@ W0734 is diagnostic only. It has no effect on resolution, on monomorphization or
 
 #### Interaction with Other Features
 
-**Iterator adapters** (§3c.1): `.map()`, `.filter()`, `.collect()` etc. are the sealed built-in method surface of the opaque `Iterator[T]` carrier, dispatched like the other built-in types above (`StrOps`/`ListOps`), not user-overridable trait defaults. Collections carry their own **eager** adapter surface that answers a collection; `.into_iter()` crosses into the lazy `Iterator` surface and `.collect()` crosses back.
+**Iterator adapters** (§3c.1): `.map()`, `.filter()`, `.collect()` etc. are the sealed built-in method surface of the opaque `Iterator[T]` carrier. A user program cannot override them. Collections carry their own **eager** adapter surface that answers a collection; `.into_iter()` crosses into the lazy `Iterator` surface and `.collect()` crosses back.
 
 **Operator desugaring** (§3.6): `a + b` desugars to `Add.add(a, b)` — a qualified trait call, not dot syntax. Operators bypass method resolution entirely.
 
-**String interpolation** (§3.6.1): `"{value}"` requires `T: Display` at compile time. The compiler checks the trait bound during type checking, then optimizes codegen: built-in types use direct format specifiers, user types emit `value.fmt(sb)` — a direct push into the interpolation's internal `StringBuilder`, with no intermediate `Str` per slot. In `Template[C]` context, Display is not invoked — interpolation produces parameterized placeholders instead. See §3.6 Display Format Protocol.
+**String interpolation** (§3.6.1): `"{value}"` requires `T: Display`, checked at compile time. In `Template[C]` context, Display is not invoked — interpolation produces parameterized placeholders instead. See §3.6 Display Format Protocol.
 
 **`self` in trait methods**: Inside an `impl Trait for Foo` block, `self` has type `Foo`. Field access on `self` uses `self.field`. Method calls on `self` use `self.method()` with normal trait lookup.
