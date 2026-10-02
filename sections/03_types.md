@@ -1232,7 +1232,7 @@ The `..` rest sigil is a pattern-only construct (§3.5); it has no meaning in co
 
 #### Enums Are Nominally Distinct from `Int`
 
-An enum is a distinct type from `Int`. Although a variant lowers to an integer tag at runtime, the tag's representation does not make the enum *assignable* to `Int`, exactly as a `U8`'s 8-bit representation does not make it assignable to `Int` (see *Sized Integer Types*). An enum value is not assignable to an `Int` target, and an `Int` is not assignable to an enum target — at let-bindings, function arguments, and function returns:
+An enum is a distinct type from `Int`. Although each variant of a fieldless enum has an integer tag (see *Tag Operations* below), the tag does not make the enum *assignable* to `Int`, exactly as a `U8`'s 8-bit range does not make it assignable to `Int` (see *Sized Integer Types*). An enum value is not assignable to an `Int` target, and an `Int` is not assignable to an enum target — at let-bindings, function arguments, and function returns:
 
 ```blink
 type State { Idle, Running, Done }
@@ -1248,14 +1248,32 @@ fn main() {
 
 This is what makes a single-payload enum a real newtype: `type Errno { Errno(Int) }` used as the error arm of `Result[Int, Errno]` cannot be confused with a plain `Int` count, which is the entire reason to prefer it over `Result[Int, Int]`.
 
-**Comparison is unaffected.** The comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) remain defined between an enum and `Int`: they compare the shared tag representation and yield `Bool`. This is a representation-level operation, not an assignability claim, so it does not weaken the nominal distinctness above.
+**Tag Operations.** Three operations use an enum's integer tag: comparison with an `Int`, `Enum.to_int()` and `Enum.from_int()`. They are defined only on a **fieldless enum**, an enum whose variants all have no payload.
+
+- **Comparison with `Int`.** The comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) are defined between a fieldless enum and `Int`. They compare the enum's tag with the `Int` and yield `Bool`. This is a comparison, not an assignability claim, so it does not weaken the nominal distinctness above.
+- **Crossing the boundary is explicit.** To get the tag as an `Int`, use `Enum.to_int()` (total). To go the other way, use `Enum.from_int(n) -> Option[Enum]`. It is fallible, because an arbitrary `Int` may not be a valid tag. There is no implicit coercion and no cast operator.
 
 ```blink
 let s = State.Running
-if s == State.Running { }   // OK — comparison, not assignment
+if s == State.Running { }   // OK: comparison, not assignment
+let n = s.to_int()          // OK: State is fieldless
 ```
 
-**Crossing the boundary is explicit.** To obtain the tag as an `Int`, use `Enum.to_int()` (total). To go the other way, `Enum.from_int(n) -> Option[Enum]` is fallible — an arbitrary `Int` may not be a valid tag — so it returns `Option`. There is no implicit coercion and no cast operator.
+**Payload enums have no tag operations.** An enum with at least one payload variant has no comparison with `Int`, no `to_int()` and no `from_int()`. Each use is a compile error, `error[TypeError]`. A tag does not identify a payload value, and `from_int` cannot make one. To compare the payload, match on it:
+
+```blink
+type Code { Code(Int) }
+
+let c = Code(5)
+let a = c == 5         // error[TypeError]: Code has a payload variant and does not compare with Int
+                       //   help: match on the payload: match c { Code(n) => n == 5 }
+let b = c.to_int()     // error[TypeError]: to_int() is defined only on fieldless enums
+let ok = match c {
+    Code(n) => n == 5
+}
+```
+
+This rule applies to every enum with a payload, including the stdlib `Errno` (§9.1.3.3).
 
 > Pattern matching an `Int` scrutinee against enum-variant patterns (`match someInt { State.Idle => ... }`) is the pattern-side dual of the assignability rule and is likewise ill-typed. Enforcement of that case is staged behind the compiler's internal `kind: Int → NodeKind` representation migration; the rule itself holds from this decision.
 

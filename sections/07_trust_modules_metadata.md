@@ -1089,7 +1089,7 @@ Each member ships at v1; the set **blocks the v1 release**.
 
 **`recv_bytes` / `send_bytes` take `flags` as a trailing keyword argument** of type `MsgFlags` (§9.1.3.4), with the default `MsgFlags.NONE`. A call that omits `flags` behaves as `flags = 0`, so the examples above do not change. The keyword is part of the v1 signature: labels are call-site sugar, so adding the parameter after v1 would change the function-value type. No separate flagged name (such as `recv_flags_bytes`) exists or will be added.
 
-**Error type.** Every member returns `Result[_, Errno]`, where `Errno` is a thin, transparent, zero-cost newtype over the OS errno `Int` (no boxing, no tag, monomorphizes to a bare int). It carries a name/projection (`.code() -> Int`, named errno constants) so callers match on errno meaningfully rather than on a bare `Int`, and so a `write`'s two return arms (count-written vs errno) are nominally distinct. A rich variant `IoError` hierarchy is **not** part of this gate — it is a separate post-v1 task, layered additively on `Errno` (e.g. `.kind()`) without changing any wrapper signature. `Errno` is domain-neutral; a file read's `ENOSPC` is *not* typed as a network error.
+**Error type.** Every member returns `Result[_, Errno]`, where `Errno` is a newtype over the OS errno `Int`: a single-variant enum, `type Errno { Errno(Int) }`, nominally distinct from `Int` (§3). It carries a name/projection (`.code() -> Int`, named errno constants) so callers match on errno meaningfully rather than on a bare `Int`, and so a `write`'s two return arms (count-written vs errno) are nominally distinct. A rich variant `IoError` hierarchy is **not** part of this gate — it is a separate post-v1 task, layered additively on `Errno` (e.g. `.kind()`) without changing any wrapper signature. `Errno` is domain-neutral; a file read's `ENOSPC` is *not* typed as a network error.
 
 **Naming law (normative).** Every `libc` byte-moving syscall wrapper conforms to a fixed shape, so the family is name-predictable and post-v1 additions are mechanical rather than designed:
 
@@ -1167,7 +1167,7 @@ fn sendto_bytes(fd: Int, data: Bytes, dest: SockAddr, -- flags: MsgFlags = MsgFl
 
 Both follow the naming law of §9.1.3.3: the peer address is a non-buffer out-parameter, so it follows the `Bytes` in the success tuple, and it is `Option` because the kernel may return no address.
 
-**`MsgFlags` (normative).** `MsgFlags` is the type of the `flags` argument of `recv_bytes`, `send_bytes`, `recvfrom_bytes` and `sendto_bytes`. It is an opaque type: it has no public constructor and no public field. Its C representation is one `int64_t`, so it costs nothing at run time.
+**`MsgFlags` (normative).** `MsgFlags` is the type of the `flags` argument of `recv_bytes`, `send_bytes`, `recvfrom_bytes` and `sendto_bytes`. It is an opaque type: it has no public constructor and no public field.
 
 - The only values are the named constants. This gate ratifies two: `MsgFlags.NONE` (no flags) and `MsgFlags.PEEK` (read a datagram without removing it from the queue). Each is a const expression (§2.21), so it is legal as a keyword default.
 - The bits inside `MsgFlags` use **Blink's** numbering, not the platform's. The runtime translates each Blink bit to the native `MSG_*` value from the C headers. A named constant has the same meaning on every platform.
