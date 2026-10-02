@@ -711,21 +711,42 @@ type HashedPassword {
 
 Module-level `let` and `let mut` declare module-scoped bindings. These follow different rules from function-local bindings:
 
-**Duplicate names are a compile error.** A module may not declare two `let` bindings with the same name. Module scope is a flat namespace — there is no inner scope for shadowing to inhabit, so "redeclaration" has no well-defined semantics. The compiler reports `DuplicateModuleBinding` (E1009).
+**Duplicate names are a compile error.** Module scope has two namespaces. The value namespace holds `let`, `let mut`, `const` and `fn`. The type namespace holds `type`, type alias, `trait` and `effect`. Each bare name has at most one declaration in each namespace. Module scope is a flat namespace: there is no inner scope for shadowing to inhabit, so a second declaration of a name has no defined meaning. The kinds of the two declarations do not matter: two `let`s, two `fn`s, a `let` and a `fn`, two `type`s, or a `type` and a `trait`, all collide. A `type` and a `fn` of one name do not collide, because they are in different namespaces.
+
+Blink has no function overloading, so two `fn` declarations of one name are an error whatever their signatures. Neither one wins.
+
+The compiler reports `DuplicateModuleBinding` (E1016). Two other codes report the same rule for other pairs: `AmbiguousImport` (E1005) when two selective imports bind one name, and `DuplicateSymbol` (E1012) when a selective import and a declaration bind one name (§10.5 *Imported and Declared Names*). The code tells which pair collided; the rule is the same.
 
 ```blink
-// Valid — each name is unique
+// Valid — each name is unique in its namespace
 let max_retries = 3
 let mut request_count = 0
 
-// INVALID — compile error E1009
+// INVALID — compile error E1016
 let x = 1
-let x = 2  // error[DuplicateModuleBinding]: duplicate module-level binding `x`
+let x = 2                    // error[E1016]: `x` is declared twice in module `main`
+
+fn f() -> Int { 1 }
+fn f(n: Int) -> Int { n }    // error[E1016]: `f` is declared twice in module `main`
 ```
+
+```
+error[E1016]: `f` is declared twice in module `main`
+ --> src/main.bl:2:4
+  |
+1 | fn f() -> Int { 1 }
+  |    - first declared here
+2 | fn f(n: Int) -> Int { n }
+  |    ^ declared again here
+  |
+  = help: rename one of the two declarations
+```
+
+The primary span is on the later declaration in source order, and a label marks the first. N declarations of one name give N-1 diagnostics, each one pointing at the first declaration. The fix is a suggestion only, never machine-applicable: the compiler cannot know which declaration to rename. The program does not compile. To check the rest of the module after the error, the compiler binds the name to the first declaration. This is error recovery only; it does not make the first declaration the winner.
 
 **`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For compile-time constants, prefer `const` (see [2.21](#221-const-declarations)) — `let` at module level is for runtime-initialized values.
 
-**`pub let mut` is forbidden.** Mutable module-level state must not be directly exposed to other modules. The compiler tracks which functions write to module-level `let mut` bindings via mutation analysis (see §4.16). The compiler reports `PubLetMutForbidden` (E1006).
+**`pub let mut` is forbidden.** Mutable module-level state must not be directly exposed to other modules. The compiler tracks which functions write to module-level `let mut` bindings via mutation analysis (see §4.16). The compiler reports `PubLetMutForbidden` (E1013). This check is not yet enforced.
 
 ```blink
 // Compile-time constants — prefer const (§2.21)
@@ -735,7 +756,7 @@ pub const default_timeout = 30
 // Runtime module state — use let
 let mut connection_count = 0
 
-// INVALID — compile error E1006
+// INVALID — compile error E1013
 pub let mut shared_counter = 0  // error[PubLetMutForbidden]: `pub let mut` is forbidden
                                 // help: expose mutable state through functions with effect tracking
 ```
