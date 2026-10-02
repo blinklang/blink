@@ -532,7 +532,7 @@ fn leaks() ! IO {
                                          //   only as a `with ... as` resource
                                          // help: bind it as a `with` resource:
                                          //   `with ffi.scope() as arena { ... }`
-                                         // help: for one plain allocation with GC cleanup, use
+                                         // help: for one plain allocation with late cleanup, use
                                          //   `alloc_ptr[T]()` instead of a scope
     let buf = arena.alloc[U8]()
 }
@@ -693,7 +693,7 @@ warning[W0810]: unscoped pointer allocation
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ allocated outside `ffi.scope()`
   |
   = help: wrap in `with ffi.scope() as scope { scope.alloc[Void]() }`
-  = note: unscoped pointers rely on GC finalization (non-deterministic)
+  = note: unscoped pointers are freed at an unspecified later time (non-deterministic)
 
 error[E0825]: cannot deref `Ptr[Void]` — the pointee type is unknown
  --> db/sqlite.bl:22:13
