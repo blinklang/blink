@@ -303,11 +303,11 @@ Cleanup is LIFO — `b.close()` runs before `a.close()`. If `expr2` fails (via `
 
 #### Compiler diagnostics
 
-**ScopedValueWithoutWith: scoped value that does not go into a `with`**
+**W0610 `ScopedValueWithoutWith`: scoped value that does not go into a `with`**
 
 The lint applies to every **scoped value**: a value whose type implements `Closeable` or `BlockHandler` (§4.6.3). It fires when such a value reaches anything other than a `with` item. The check follows the value, not its construction: `let tx = db.transaction()` followed by `with tx { }` does not warn. A scoped value returned from a function is not reported in that function.
 
-The numeric code for this lint is not assigned yet. The diagnostic catalog gives W0600 to `UnusedVariable`, and the catalog fixes the code for this lint when it resolves that clash.
+The code for this lint is W0610. Code W0600 is `UnusedVariable`, and it never refers to this lint.
 
 ```
 warning[ScopedValueWithoutWith]: `Closeable` value used without `with...as`
@@ -323,7 +323,7 @@ warning[ScopedValueWithoutWith]: `Closeable` value used without `with...as`
 7 |     }
   = note: suppress with `@trusted(audit: "AUDIT-ID")` for manual resource management;
           it needs a record `AUDIT-ID` in audits.toml (§9.1)
-  = note: upgrade to error in blink.toml `[lints]`
+  = note: upgrade to error in blink.toml: [lints] W0610 = "error"
 ```
 
 For a `BlockHandler`, the help names the `with` form that the type takes:
@@ -382,7 +382,7 @@ error[CloseableStoredInCollection]: `Closeable` value stored in collection
 12|         results.push(cursor.next()?)
 ```
 
-These three diagnostics form a closed net: ScopedValueWithoutWith catches forgotten `with...as`, E0601 catches escape via return or assignment, E0602 catches escape via collections. Together they ensure `Closeable` values are always scoped and always cleaned up.
+These three diagnostics form a closed net: ScopedValueWithoutWith (W0610) catches forgotten `with...as`, E0601 catches escape via return or assignment, E0602 catches escape via collections. Together they ensure `Closeable` values are always scoped and always cleaned up.
 
 ### 5.6 Future: Compiler Optimization Improvements
 

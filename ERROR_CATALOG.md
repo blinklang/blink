@@ -40,6 +40,8 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | W055x | Mutation analysis |
 | E05xx | Effects / capabilities |
 | E06xx | Resource scope / closures |
+| W060x | Linting |
+| W061x | Resource scope lints |
 | E07xx | Method resolution / arena / coherence |
 | E08xx | FFI |
 | E09xx | Module capabilities / trait contracts |
@@ -213,6 +215,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnusedImport | W0602 | Module imported but no symbols referenced | Linting | §6 |
 | ShadowedVariable | W0603 | Variable shadows another with the same name in an outer scope | Linting | §6 |
 | UnusedTypeParamBinder | W0604 | Type parameter occurs nowhere in the declaration or its body; the binder is removable | Linting | §3.4 |
+| ScopedValueWithoutWith | W0610 | A `Closeable` or `BlockHandler` value reaches anything other than a `with` item (flow-based). Suppress with `@trusted(audit: K)`; upgrade to an error with `W0610 = "error"` under `[lints]` | Resources | §5.5 |
 | UnreachableCode | W0700 | Code follows an unconditional return/break/continue | Linting | §6 |
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
@@ -227,12 +230,13 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 
 ## Retired Codes
 
-A retired code and its name are never reused (see *Conventions*). `blink explain` on a retired name or code says it is retired and names the codes that replace it.
+A retired code and its name are never reused (see *Conventions*). `blink explain` on a retired name or code says it is retired and names the codes that replace it. A Code cell of "—" means this catalog published the name, but no compiler ever emitted it under a code.
 
 | Name | Code | Retired because | Replaced by |
 |------|------|-----------------|-------------|
 | CallSiteTypeArgs | E0307 | It refused explicit type application at a call, which §3.4 *Explicit Type Application* makes legal | TypeArgArity (E0303), NoIndexOperator (E0313), TypeArgsWithoutCall (E0314) |
 | WithPtrBodyTooComplex | E0816 | It rejected a `Bytes.with_ptr` body of more than one expression, an inlining limit of the old codegen; §9.1.3 lets the body be any `fn(Ptr[U8]) -> R` | None |
+| CloseableWithoutScope | — | The lint it named now covers every `Closeable` and `BlockHandler` value, under a new name. Its old code, W0600, belongs to `UnusedVariable` | ScopedValueWithoutWith (W0610) |
 
 ---
 
