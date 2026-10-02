@@ -1647,7 +1647,7 @@ type PasswordHash {
 }
 ```
 
-**`pub let` exports immutable module-level bindings.** A module-level `let` (without `mut`) marked `pub` is importable by other modules as a read-only value. `pub let mut` is a compile error (E1006) — mutable state must be accessed through functions, with mutation tracked by the compiler's write-set analysis (§4.16). See §2.12.1 for full rules on module-level bindings.
+**`pub let` exports immutable module-level bindings.** A module-level `let` (without `mut`) marked `pub` is importable by other modules as a read-only value. `pub let mut` is a compile error (E1013, not yet enforced) — mutable state must be accessed through functions, with mutation tracked by the compiler's write-set analysis (§4.16). See §2.12.1 for full rules on module-level bindings.
 
 There is no `pub(crate)`, no `protected`, no `internal`, no `friend`. Two levels: private and public. This is a deliberate constraint.
 
@@ -2079,14 +2079,19 @@ import auth.{Token, Token as AuthToken}   // OK: two names, one item
 | E1000 | Module not found | No file at resolved path, no matching dependency |
 | E1001 | Duplicate module name | Two files claim same `@module` name |
 | E1002 | Circular package dependency | Cross-package import cycle |
-| E1003 | Item not found | Named item doesn't exist or isn't `pub` in the target module |
+| E1003 | Private item access | Referencing or importing a function, type, trait, variant or other item that is not `pub` in its declaring module |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
 | E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items |
+| E1006 | Import not selected | A bare name comes from an imported module but is not in the selective import list |
+| E1007 | Module-qualified type member | A type member or variant is reached through a module qualifier (`mod.Type.Member`) instead of an imported type |
 | E1008 | Invalid module annotation | `@module(...)` disagrees with parent package or entry file's `[package].name` |
 | E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
 | E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
 | E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar |
 | E1012 | Duplicate symbol | A module-level declaration takes a name that a selective import (`import` or `pub import`) binds |
+| E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
+| E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |
+| E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1) |
 
 ```
 error[E1003]: item `Token` is private in module `auth.internal`
@@ -2265,7 +2270,7 @@ warning[W1010]: name shadows compiler-known type
 
 The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. It also covers such a name that another module declares and this module imports (`import geo.{Handler}`). Local bindings (`let`) live in the value namespace and are not type declarations.
 
-**Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings in module scope, from declarations or selective imports, are a duplicate, never a shadow. So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. The rule in §10.1 *Qualified Access* that a local definition hides a module qualifier (`let auth = 5` makes `auth.login()` a method call) is a different layer, and this rule does not change it.
+**Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or selective imports, are a duplicate, never a shadow. One rule covers every pair, and the code tells which pair collided: two selective imports are E1005 (`AmbiguousImport`), a selective import and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. The rule in §10.1 *Qualified Access* that a local definition hides a module qualifier (`let auth = 5` makes `auth.login()` a method call) is a different layer, and this rule does not change it.
 
 **Diagnostics that involve a shadowing name.** The escape must be visible where the error is, not only at the declaration. So:
 
@@ -2436,7 +2441,7 @@ pub fn verify(token: Str) -> Result[Claims, AuthError] ! Crypto {
 When another module writes `import auth.token.{verify}`, both `verify` and `validate_format` appear in the C output. The importer can call `verify` but **cannot** call `validate_format` — the compiler rejects it:
 
 ```
-error[E1010]: item `validate_format` is private to module `auth.token`
+error[E1003]: item `validate_format` is private to module `auth.token`
  --> app.bl:5:12
   |
 5 |     let ok = validate_format(raw)
@@ -2452,7 +2457,7 @@ Visibility is enforced at **compile time** by the name resolution pass, not at t
 
 1. **Name resolution** builds a symbol table of all items and their declaring modules
 2. When a function call or type reference crosses a module boundary, the resolver checks `pub` status
-3. Non-pub items from other modules produce error E1010
+3. Non-pub items from other modules produce error E1003 (*Import Errors*, §10.5)
 4. Items within the same module can access all sibling items regardless of `pub`
 
 This means `pub` is a **hard guarantee**, not advisory. Code that compiles respects all module boundaries. The emit-all model is an implementation detail of the C backend, not a visibility loophole.
@@ -2487,13 +2492,6 @@ Emit-all is the v1 compilation model. The intended v2 optimization is **separate
 | Incremental rebuild | Full recompile | Per-module |
 | `pub` enforcement | Name resolution | Name resolution + linker |
 | Symbol naming | Module-qualified | Module-qualified (unchanged) |
-
-#### Compilation Model Errors
-
-| Code | Error | Cause |
-|------|-------|-------|
-| E1010 | Private item access | Referencing a non-pub item from outside its declaring module |
-| E1011 | Ambiguous import | Two imported modules export the same pub name (use selective import to disambiguate) |
 
 ---
 
