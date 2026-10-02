@@ -1574,7 +1574,7 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 - Qualified access works for functions (`auth.login()`), types (`auth.Token`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`.
 - Only the leaf module name is used as qualifier. `import std.num` enables `num.parse_int()`, not `std.num.parse_int()`. For modules with the same leaf name, use aliases: `import legacy.auth as legacy_auth`.
 - Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works.
-- Qualified access resolves name ambiguity (E1005). If `import foo` and `import bar` both export `helper`, bare `helper()` is an error — use `foo.helper()` or `bar.helper()`.
+- A whole-module import binds only its qualifier. If `import foo` and `import bar` both export `helper`, nothing collides: call `foo.helper()` or `bar.helper()`. Two imports that bind one name, bare name or qualifier, are E1005 (*Imported Names*, §10.5).
 - Local definitions shadow module names: if `let auth = 5` exists, `auth.login()` is a method call on the integer, not a module-qualified call.
 
 **No wildcard imports.** `import auth.*` does not exist. Every name in scope is explicitly imported. This is non-negotiable for locality of reasoning — an AI reading a file can determine every available name from the import block alone.
@@ -2030,6 +2030,48 @@ A whole-module import (`import alpha`) binds no bare name, so it never collides 
 
 **Fix.** For a plain `import`, the fix "drop the name from the import list" is machine-applicable (§8.6): every bare use of the name then means the local declaration. When the edit empties the list, the fix rewrites the line to `import alpha`, because a selective import also gives qualified access (§10.1 *Qualified Access*). It deletes the line only when no name in the file resolves through the `alpha` qualifier; the check uses name resolution, not text search. For `pub import`, the same edit changes the module's public API, so the fix is a suggestion only. On that import entry, E1012 replaces W0602 (unused import): one mistake gives one diagnostic.
 
+#### Imported Names
+
+Each file has its own binding table. A selective import binds each listed name, and a whole-module import binds its qualifier (the leaf name, or the name after `as`). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. The compiler checks each import when it reads it, whether or not the file uses the name.
+
+```blink
+import auth.{Error}
+import db.{Error}             // error[E1005]: `Error` is imported twice
+```
+
+```
+error[E1005]: `Error` is imported twice in module `main`
+ --> src/main.bl:2:12
+  |
+1 | import auth.{Error}
+  |              ^^^^^ first imported from `auth` here
+2 | import db.{Error}
+  |            ^^^^^ imported again from `db` here
+  |
+  = help: import one under another name: import db.{Error as DbError}
+          or drop it from the list and use `db.Error`
+```
+
+The same rule covers qualifiers:
+
+```blink
+import http
+import http2 as http          // error[E1005]: `http` is imported twice
+
+import db
+import auth.{Token as db}     // error[E1005]: `db` is imported twice
+```
+
+Two imports that bind one name to the **same** item are not E1005. The compiler compares the items that name resolution reaches after it follows `pub import` chains, not the import paths. The later entry gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). One item under two names binds no name twice, so it is legal:
+
+```blink
+import auth.{Error}
+import auth.{Error}                   // warning[W0602]: `Error` already imports this item
+import auth.{Token, Token as AuthToken}   // OK: two names, one item
+```
+
+**Fix.** Which import should keep the name is the author's choice, so the fix is a suggestion only: rename one import with `as`, or drop the name and use the qualified path. The help should print a concrete name that is not already bound in the file. On the colliding entry, E1005 replaces W0602: one mistake gives one diagnostic. When a declaration also takes the name, every import entry that collides with it gets E1012 (*Imported and Declared Names*), and E1005 applies only between import entries that have no E1012.
+
 #### Import Errors
 
 | Code | Error | Cause |
@@ -2039,7 +2081,7 @@ A whole-module import (`import alpha`) binds no bare name, so it never collides 
 | E1002 | Circular package dependency | Cross-package import cycle |
 | E1003 | Item not found | Named item doesn't exist or isn't `pub` in the target module |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
-| E1005 | Ambiguous import | Item name exists in multiple imported modules (use qualified path) |
+| E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items |
 | E1008 | Invalid module annotation | `@module(...)` disagrees with parent package or entry file's `[package].name` |
 | E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
 | E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
@@ -2056,18 +2098,6 @@ error[E1003]: item `Token` is private in module `auth.internal`
   = help: import from the public API: `import auth.{Token}`
 ```
 
-```
-error[E1005]: ambiguous import `Error`
- --> src/main.bl:4:1
-  |
-2 | import auth.{Error}
-3 | import db.{Error}
-  |
-  = note: `Error` exists in both `auth` and `db`
-  = help: use qualified names: `auth.Error` and `db.Error`
-         or rename: `import auth.{Error as AuthError}`
-```
-
 #### Import Aliases
 
 Imports can be renamed at the import site to resolve ambiguity or improve local clarity:
@@ -2077,7 +2107,9 @@ import auth.{AuthError as LoginError}
 import db.connection.{Connection as DbConn}
 ```
 
-Aliases are local to the importing file. They do not affect the imported module or any other consumers.
+Aliases are local to the importing file. They do not affect the imported module or any other consumers. Two imports in one file that bind one alias to different items are E1005 (*Imported Names*); two files may bind one alias to different items.
+
+An alias that is a compiler-known name (`import auth.{Error as Option}`) shadows it and gets W1010 (§10.6 *Shadowing Rules*).
 
 ### 10.6 Module Prelude
 

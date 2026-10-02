@@ -169,7 +169,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | CircularPackageDep | E1002 | Circular package dependency | Modules | §10.5 |
 | PrivateItemAccess | E1003 | Access to private item in another module | Modules | §10.5 |
 | VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |
-| AmbiguousImport | E1005 | Ambiguous import — name exists in multiple modules | Modules | §10.5 |
+| AmbiguousImport | E1005 | Two imports in one file bind one name (bare name or module qualifier) to different items; the check uses the name after `as`. Two imports of the same item get W0602 instead. Replaces W0602 on the colliding entry | Modules | §10.5 |
 | ImportNotSelected | E1006 | Selective import does not list the referenced symbol | Modules | §10.5 |
 | ModuleQualifiedType | E1007 | Type referenced via module-qualified path is invalid | Modules | §10.5 |
 | InvalidModuleAnnotation | E1008 | `@module` value does not match parent package name | Modules | §10.1 |
