@@ -5,7 +5,8 @@
 # test binary finds the prelude, which a probe suite needs to compile programs
 # in process. Proves both scripts/run_fmt_semantic.sh and
 # scripts/run_fmt_idempotent.sh fail a file the formatter cannot format, so a
-# formatter abort never reads as a skip. Runs unmodified copies of the scripts
+# formatter abort never reads as a skip. Proves a test that names its own file
+# keeps passing in the formatted copy. Runs unmodified copies of the scripts
 # in a throwaway root with a fake compiler whose C output acts on markers in
 # the source.
 set -u
@@ -52,6 +53,14 @@ src="$1"; out="$2"
     if grep -q SELFTEST_MAIN_AND_TESTS "$src"; then
         echo '    if (argc < 2 || strcmp(argv[1], "--test") != 0) { printf("main ran\n"); return 0; }'
     fi
+    # A test that pins its own file name, as a panic location match does, fails
+    # unless the source it was built from keeps that name.
+    if grep -q SELFTEST_NAMES_ITS_FILE "$src"; then
+        case "$src" in
+            *_test_names_its_file.bl|tests/test_names_its_file.bl) ;;
+            *) echo '    printf("test probe ... FAIL\n\n0 passed, 1 failed (of 1)\n"); return 1;' ;;
+        esac
+    fi
     if grep -q SELFTEST_FAILS "$src"; then
         echo '    printf("test probe ... \033[31mFAIL\033[0m\n\n0 passed, 1 failed (of 1)\n"); return 1;'
     fi
@@ -72,6 +81,7 @@ fixture test_needs_prelude SELFTEST_NEEDS_PRELUDE
 fixture test_fmt_breaks_run SELFTEST_FMT_BREAKS_RUN
 fixture test_fmt_aborts SELFTEST_FMT_ABORTS
 fixture test_fmt_output_aborts SELFTEST_FMT_OUTPUT_ABORTS
+fixture test_names_its_file SELFTEST_NAMES_ITS_FILE
 # A file with a main and test blocks runs its tests; the main would hide the
 # formatted copy's failing test.
 printf 'test "probe" {\n    // SELFTEST_MAIN_AND_TESTS SELFTEST_FMT_BREAKS_RUN\n}\n\nfn main() {\n}\n' > "$R/tests/test_main_and_tests.bl"
@@ -90,6 +100,7 @@ expect test_plain_pass PASS
 expect test_fails_on_its_own PASS
 expect test_prints_fail_in_a_pass PASS
 expect test_needs_prelude PASS
+expect test_names_its_file PASS
 expect test_fmt_breaks_run FAIL
 expect test_main_and_tests FAIL
 expect test_fmt_aborts FAIL

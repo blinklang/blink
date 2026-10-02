@@ -8,7 +8,9 @@ skip_file="$3"
 name=$(basename "$f" .bl)
 [ -f "$skip_file" ] && grep -qw "$name" "$skip_file" && { echo "SKIP sem_${name}"; exit 0; }
 src_dir=$(dirname "$f")
-fmt_src=$(mktemp "$src_dir/fmt-sem-XXXXXX.bl")
+# The formatted copy ends in the original file name, so a test that matches its
+# own file name in a panic location or diagnostic still matches.
+fmt_src=$(mktemp --suffix="_$name.bl" "$src_dir/fmt-sem-XXXXXX")
 fmt_c=$(mktemp .tmp/fmt-sem-XXXXXX.c)
 fmt_bin=$(mktemp .tmp/fmt-sem-XXXXXX)
 orig_c=$(mktemp .tmp/fmt-sem-XXXXXX.c)
