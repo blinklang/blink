@@ -4,13 +4,12 @@ Blink's type system, effect system, and contract system form a closed verificati
 
 ### 9.1 FFI Rules and Annotations
 
-Every foreign function call requires three annotations. No exceptions.
+Every foreign function binding carries `@ffi`, an explicit effect row and `@trusted`. Only `@trusted` may be omitted, and omitting it gives a warning (W0800).
 
 #### `@ffi` — Declaring the Foreign Binding
 
 ```blink
 @ffi("libsodium", "crypto_secretbox_easy")
-@effects(Crypto)
 @trusted(audit: "SEC-042")
 fn sodium_secretbox(
     ciphertext: Ptr[U8],
@@ -18,20 +17,19 @@ fn sodium_secretbox(
     msg_len: U64,
     nonce: Ptr[U8],
     key: Ptr[U8]
-) -> Int
+) -> Int ! Crypto
 ```
 
 The `@ffi("library", "symbol")` annotation names the shared library and the symbol to link. The compiler does not type-check the foreign function's body — it does not have one. The signature is the developer's claim about what the foreign function expects and returns.
 
-#### `@effects` — Manually Declared Effects
+#### The Effect Row — Declared by the Author
 
-Because the compiler cannot analyze foreign code, effects **must** be declared manually on FFI functions. The compiler assumes this declaration — it cannot verify it. This is the one place in Blink where an effect row is not compiler-proven (§4.5, *Proven and assumed rows*).
+Because the compiler cannot analyze foreign code, the author **must** write the effect row of an `@ffi` function. It uses the same `!` syntax as every other function (§4.2). The compiler assumes this row — it cannot verify it. This is the one place in Blink where an effect row is not compiler-proven (§4.5, *Proven and assumed rows*).
 
 ```blink
 @ffi("libcurl", "curl_easy_perform")
-@effects(Net, IO)
 @trusted(audit: "NET-007")
-fn curl_perform(handle: Ptr[Void]) -> Int
+fn curl_perform(handle: Ptr[Void]) -> Int ! Net, IO
 ```
 
 **There is no `FFI` effect.** A foreign call is not an effect of its own. The row of an `@ffi` decl names the Blink effects the foreign code has: `Net`, `IO`, `Crypto` and so on (§4.3). Callers see that row by the usual transitivity rule (§4.5), exactly as they see the row of a Blink function. `! FFI` is not a valid row: `FFI` is not a declared effect, so it is rejected with `UnknownEffect` (E0538, §4.3).
@@ -44,9 +42,8 @@ effect Clock {
 }
 
 @ffi("c", "blink_clock_ms")
-@effects(Time.Read)
 @trusted(audit: "TIME-001")
-fn raw_clock_ms() -> Int
+fn raw_clock_ms() -> Int ! Time.Read
 
 // The real implementation calls C; a test installs its own `handler Clock`.
 pub fn real_clock() -> Handler[Clock] {
@@ -58,7 +55,41 @@ pub fn real_clock() -> Handler[Clock] {
 }
 ```
 
-Omitting `@effects` on an `@ffi` function is a compile error (`FfiNoEffects`, E0802). The compiler refuses to guess. This holds for a pure binding too: a foreign function with no effects (`strlen`, `memcmp`) states that claim explicitly, so a missing row and a claimed-pure row never look the same. The spelling of the explicit pure claim is fixed with the `@effects` implementation; it must not be one that reads as an omitted row.
+Omitting the row on an `@ffi` function is a compile error (`FfiNoEffects`, E0802). The compiler refuses to guess. This holds for a pure binding too: a foreign function with no effects (`strlen`, `memcmp`) states that claim with the explicit empty row `! ()`, so a missing row and a claimed-pure row never look the same:
+
+```blink
+@ffi("c", "strlen")
+@trusted(audit: "LIBC-STRLEN")
+fn c_strlen(s: Ptr[U8]) -> Int ! ()
+```
+
+`! ()` means "no effects". It is not a return type. It is legal only on an `@ffi` decl; everywhere else an omitted row already means pure, and `! ()` is an error (§4.2, `EmptyRowOutsideFfi`). The E0802 help names both choices, and neither is machine-applicable, because the row is a claim about foreign code:
+
+```
+error[FfiNoEffects]: foreign function `c_strlen` has no effect row
+ --> str.bl:3:1
+  |
+3 | fn c_strlen(s: Ptr[U8]) -> Int
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: write the effects the foreign code has after the return type
+          (`-> Int ! IO`), or `! ()` (the empty effect row) if it has none
+```
+
+There is no `@effects` annotation. The row goes after `!` in the signature, on foreign and Blink functions alike. Code written for an earlier draft of this section that puts `@effects(...)` on any function gets one error (`EffectsAnnotationRemoved`) and not E0802 as well:
+
+```
+error[EffectsAnnotationRemoved]: `@effects` is not an annotation
+ --> sys.bl:2:1
+  |
+2 | @effects(IO)
+  | ^^^^^^^^^^^^ effects go in the signature, after `!`
+  |
+  = help: remove `@effects(IO)` and write the row after the return type:
+          `-> Int ! IO`; on an `@ffi` decl with no effects, write `! ()`
+```
+
+No fix is machine-applicable: moving the row into the signature would make a tool write the claim for the author.
 
 #### `@trusted` — Audit Trail
 
@@ -68,9 +99,8 @@ Omitting `@effects` on an `@ffi` function is a compile error (`FfiNoEffects`, E0
 
 ```blink
 @ffi("sqlite3", "sqlite3_open")
-@effects(IO)
 @trusted(audit: "DB-003")
-fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int
+fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
 ```
 
 FFI without `@trusted` compiles but emits a warning:
@@ -98,17 +128,15 @@ A handful of diagnostics exist to force a **record**, not to report a mistake. T
 
 ```blink
 @ffi("sqlite3", "sqlite3_open")
-@effects(IO)
 @trusted(audit: "DB-003")           // OK
-fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int
+fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
 
 // intentional-error example
 @ffi("sqlite3", "sqlite3_close")
-@effects(IO)
 @trusted                            // error[TrustedRequiresAudit]: `@trusted` requires a non-empty
                                     //   `audit:` identifier
                                     // help: `@trusted(audit: "DB-004")`
-fn sqlite3_close(db: Ptr[Void]) -> Int
+fn sqlite3_close(db: Ptr[Void]) -> Int ! IO
 ```
 
 **`@trusted(audit: K)` is the sole channel.** For the diagnostics listed below, it is the only construct that suppresses them. In particular they are **not** reachable from `@allow(Name)` (§4.16.8) and **not** reachable from `[lints]` in `blink.toml`.
@@ -229,9 +257,8 @@ FFI functions are **not callable from application code directly**. They must be 
 ```blink
 // The raw FFI binding — private, unsafe, audited
 @ffi("sqlite3", "sqlite3_open")
-@effects(IO)
 @trusted(audit: "DB-003")
-fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int
+fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
 
 // The safe wrapper — this is what application code calls
 pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
@@ -262,9 +289,8 @@ FFI functions cannot carry `@requires` or `@ensures` annotations. The compiler c
 
 ```blink
 @ffi("zlib", "compress")
-@effects(IO)
 @trusted(audit: "COMP-001")
-fn raw_compress(dest: Ptr[U8], dest_len: Ptr[U64], src: Ptr[U8], src_len: U64) -> Int
+fn raw_compress(dest: Ptr[U8], dest_len: Ptr[U64], src: Ptr[U8], src_len: U64) -> Int ! IO
 
 @requires(data.len() > 0)
 @ensures(result.is_ok() => result.unwrap().len() <= data.len())
@@ -347,9 +373,8 @@ fn raw_sqlite3_exec(db: Ptr[Void], sql: Ptr[U8]) -> Int
 
 // A C function that can return NULL — test the result with .is_null()
 @ffi("libc", "getenv")
-@effects(Env)
 @trusted(audit: "ENV-001")
-fn raw_getenv(name: Ptr[U8]) -> Ptr[U8]
+fn raw_getenv(name: Ptr[U8]) -> Ptr[U8] ! Env
 ```
 
 `Ptr[T]?` (sugar for `Option[Ptr[T]]`) is **reserved** for a future *enforced* nullability model in which the compiler inserts a null-check at FFI return boundaries and forbids `.deref()` until the `Option` is eliminated. That model — and the boundary check — are **not yet implemented**; until they are, a possibly-null C return is spelled `Ptr[T]` and validated with `.is_null()`. When `Ptr[T]?` lands it must be revisited together with `.to_str()`, whose `Option[Str]` result is earned only because `Ptr[U8]` admits null today.
@@ -438,14 +463,12 @@ with ffi.scope() as scope {
 import blink.ffi.{Ptr, Void, alloc_ptr}
 
 @ffi("sqlite3", "sqlite3_open")
-@effects(IO)
 @trusted(audit: "DB-003")
-fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int
+fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
 
 @ffi("sqlite3", "sqlite3_close")
-@effects(IO)
 @trusted(audit: "DB-004")
-fn raw_sqlite3_close(db: Ptr[Void]) -> Int
+fn raw_sqlite3_close(db: Ptr[Void]) -> Int ! IO
 
 pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
     with ffi.scope() as scope {
@@ -854,9 +877,8 @@ pub type Opts {
 }
 
 @ffi("libfoo", "foo_is_open")
-@effects(IO)
 @trusted(audit: "FOO-1")
-fn foo_is_open(h: Ptr[Void]) -> I32      // C: int foo_is_open(foo_t *h);
+fn foo_is_open(h: Ptr[Void]) -> I32 ! IO // C: int foo_is_open(foo_t *h);
 
 @trusted(audit: "FOO-1")
 fn is_open(h: Ptr[Void]) -> Bool {
@@ -1278,9 +1300,8 @@ A handle value can be produced **only at the FFI boundary**: as the return value
 ```blink
 // raw FFI binding — private, audited
 @ffi("sqlite3", "sqlite3_open")
-@effects(IO)
 @trusted(audit: "DB-003")
-fn raw_sqlite3_open(path: Ptr[U8], out: Ptr[Sqlite3]) -> Int
+fn raw_sqlite3_open(path: Ptr[U8], out: Ptr[Sqlite3]) -> Int ! IO
 
 // safe wrapper — mints the opaque handle at the boundary
 pub fn open(path: Str) -> Option[Connection] ! IO {
@@ -2430,7 +2451,6 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | `@capabilities(list)` | module | Hard ceiling on effects permitted in this module. | Compile-time effect checker |
 | `@ffi("lib", "sym")` | fn | Declares a foreign function binding. | Linker (compile-time) |
 | `@trusted(audit: "ID")` | fn | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `ID` must name a record in `audits.toml`. Never makes an `@ffi` fn `pub` (E0801). | Compile-time record check (`AuditRecordNotFound`); `blink audit` tooling |
-| `@effects(list)` | fn (with @ffi) | Manually declared effects for foreign functions. | Compile-time effect checker |
 | `@alt("ID", "desc")` | fn | Marks an alternative implementation. | Tooling (`blink alt list`, `blink alt select`) |
 | `@verify(strategy)` | fn | Hints to the SMT solver about verification strategy. | Verification engine |
 | `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time codegen |
@@ -2456,7 +2476,7 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 }
 ```
 
-The ordering: `@module` > `@capabilities` > `@derive` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@perf` > `@ffi` > `@trusted` > `@effects` > `@alt` > `@verify` > `@allow` > `@deprecated`.
+The ordering: `@module` > `@capabilities` > `@derive` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@perf` > `@ffi` > `@trusted` > `@alt` > `@verify` > `@allow` > `@deprecated`.
 
 Rationale: metadata about the container (module, capabilities) comes first. Then provenance (why does this exist?). Then contracts (what must be true?). Then operational concerns (performance, FFI). Then lifecycle (alternatives, deprecation).
 

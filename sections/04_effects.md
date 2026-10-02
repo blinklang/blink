@@ -94,6 +94,28 @@ fn dangerous_migration() ! DB {
 
 The `!` was chosen by 3-2 vote over `/`. It universally signals danger or impurity (`!` in Scheme for mutation, Rust for macros, Swift for throwing). It is a single character -- maximally token-efficient. It is visually distinctive in a signature. It does not collide with any operator in expression position.
 
+**The explicit empty row `! ()`.** `! ()` is the empty effect row written out. It means "no effects", the same as an omitted row; it is not a return type. Its one use is on an `@ffi` decl, where the row is a claim the author must write and a missing row is an error (§9.1). On any other function, fn type or trait method signature, the compiler already proves purity, so `! ()` is an error there. The grammar admits `()` after `!` everywhere; a check after parsing rejects it outside an `@ffi` decl. Both spellings denote the same row, so `c_strlen` still checks against `fn(Ptr[U8]) -> Int`.
+
+```blink
+// intentional-error example
+fn add(a: Int, b: Int) -> Int ! () {   // error[EmptyRowOutsideFfi]
+    a + b
+}
+```
+
+```
+error[EmptyRowOutsideFfi]: `! ()` is only for `@ffi` declarations
+ --> math.bl:2:31
+  |
+2 | fn add(a: Int, b: Int) -> Int ! () {
+  |                               ^^^^ no row already means no effects
+  |
+  = help: remove `! ()`; it is required only on an `@ffi` decl whose foreign
+          code has no effects (§9.1)
+```
+
+In a fn type the help says the same thing: `let f: fn(Ptr[U8]) -> Int ! () = c_strlen` is rejected with "in a fn type, no row already means pure; remove `! ()`". `()` cannot be combined with an effect name: `! (), IO` is a parse error.
+
 ---
 
 ### 4.3 Effect Hierarchy
@@ -172,7 +194,7 @@ error[UnknownEffect]: unknown effect `FFI`
   |                        ^^^ no effect named `FFI`
   |
   = help: a foreign call is not an effect of its own; declare the effects the
-          foreign code has (`IO`, `Net`, ...) or the explicit pure claim (§9.1)
+          foreign code has (`IO`, `Net`, ...), or `! ()` if it has none (§9.1)
 ```
 
 No fix is machine-applicable: an effect row on an `@ffi` decl is a claim about foreign code, and no tool writes that claim for the author.
@@ -1046,7 +1068,7 @@ This is standard capability attenuation: you can always pass a more-powerful cap
 
 **Proven and assumed rows.** Every effect row in Blink is either compiler-proven (including discharge by handler or `with`) or is the declared row of an @ffi decl, assumed under audit key K. An assumed row is an upper bound on the foreign call's behaviour; handlers do not intercept foreign calls. FFI regions change Ptr rules only, never rows.
 
-This is the one normative statement of these rules. §9.1 (*`@effects`*, *`@trusted`*) and §4.7 refer to it. An `@ffi` decl's row enters the program at the decl and from there propagates by the rules above, with no special case. `@trusted` does not discharge or narrow a row: a wrapper that calls an `@ffi` decl with row `! Net.Connect` must itself declare `Net.Connect` or discharge it in the usual way. The FFI regions of §9.1.1 (an `@ffi` or `@trusted` body, `with ffi.scope()`) decide where a `Ptr[T]` may appear; they do not change what any row says.
+This is the one normative statement of these rules. §9.1 (*The Effect Row*, *`@trusted`*) and §4.7 refer to it. An `@ffi` decl's row enters the program at the decl and from there propagates by the rules above, with no special case. `@trusted` does not discharge or narrow a row: a wrapper that calls an `@ffi` decl with row `! Net.Connect` must itself declare `Net.Connect` or discharge it in the usual way. The FFI regions of §9.1.1 (an `@ffi` or `@trusted` body, `with ffi.scope()`) decide where a `Ptr[T]` may appear; they do not change what any row says.
 
 **Effect rows on trait impls.** When a trait declares a method `m` with effect row `R_t`, every `impl` that provides `m` must declare a row `R_i` such that `R_i ⊆ R_t` under the lattice above. The rule covers required methods and overrides of open defaults alike. An impl may *narrow* the signature (drop effects the trait declares but the impl does not use) but may not *widen* it (introduce effects the trait does not declare). A trait method with no `!` has the empty row, so its impls must have no `!` either. This preserves the trait's stated capability contract for every implementation: callers parameterized over `T: Trait` can rely on the trait's row as a sound upper bound on `m`'s effects across all `T`. A widening impl is rejected with `error[TraitContractEffectMismatch]` (E0904). Sealed (`final`) defaults have no override site and are therefore effect-monomorphic at their declaration. See §3.6 *Effect-row subtype for trait impls* for an example and §3.6 *The `final` Modifier* for the override-prevention semantics.
 
@@ -1125,7 +1147,7 @@ The check runs at compile time, so it cannot see every operation. A handler may 
 
 Effect handlers replace the implementation behind effect handles. They are the mechanism for dependency injection, testing, sandboxing, and capability attenuation.
 
-For how handlers relate to calls into foreign code, see §4.5 *Proven and assumed rows*; §9.1 *`@effects`* shows how a safe wrapper makes a foreign effect replaceable.
+For how handlers relate to calls into foreign code, see §4.5 *Proven and assumed rows*; §9.1 *The Effect Row* shows how a safe wrapper makes a foreign effect replaceable.
 
 #### Basic handler syntax
 
