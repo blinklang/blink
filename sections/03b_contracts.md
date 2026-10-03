@@ -6,7 +6,7 @@ Refinement types are Blink's answer to the question every language designer face
 
 Most languages punt entirely -- `Int` means "any integer," and if you need a port number, you write runtime validation code. Fully dependent type systems go to the other extreme -- the type encodes everything, but inference becomes undecidable and error messages become incomprehensible.
 
-Blink takes the middle path. Refinement types let you attach predicates to existing types using `@where`. The predicates are checked by an SMT solver (Z3) at compile time when possible, and at boundaries when not.
+Blink takes the middle path. Refinement types let you attach predicates to existing types using `@where`. The predicates are checked by an SMT solver at compile time when possible, and at boundaries when not.
 
 ```blink
 type Port = Int @where(self > 0 && self <= 65535)
@@ -231,7 +231,7 @@ fn pop[T](stack: Stack[T]) -> (T, Stack[T]) {
 
 #### SMT Verification
 
-Contracts are verified by an integrated SMT solver (Z3). The solver is **lazy** -- it is only invoked when contracts exist. Code without `@requires`, `@ensures`, or `@invariant` annotations never touches the solver. The type checker handles everything else with standard Hindley-Milner inference.
+Contracts are verified by the compiler's static checker, which uses an SMT solver. Code without `@requires`, `@ensures`, or `@invariant` annotations has nothing to verify.
 
 When the solver runs, it attempts to prove that:
 1. Every `@requires` clause is satisfied at every call site
@@ -278,7 +278,7 @@ The verifier never reads `find_min`'s body when verifying `compute_lower_bound`.
 
 **Scalability.** Whole-program analysis is O(program size). Modular verification is O(function size). A million-line codebase verifies in the same time as a thousand-line codebase, function by function.
 
-**Incrementality.** Change one function, re-verify only that function and its direct callers. The compiler-as-service daemon can do this in milliseconds.
+**Incrementality.** Change one function, re-verify only that function and its direct callers.
 
 **Composability.** Libraries publish contracts. Consumers verify against those contracts without access to the library's source code. The contract is the interface.
 
@@ -319,10 +319,10 @@ info[V0001]: contract proven
 15| @ensures(result.balance == old(self.balance) - amount)
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ proven by SMT
   |
-  = note: zero runtime cost
+  = note: no runtime check
 ```
 
-This is the ideal outcome. Well-written contracts on well-written code are often provable. The incentive structure is correct: writing clearer code with tighter types makes contracts easier to prove, which makes them free.
+This is the ideal outcome. Well-written contracts on well-written code are often provable. The incentive structure is correct: writing clearer code with tighter types makes contracts easier to prove, which removes the runtime check.
 
 #### Disproven (Compile Error with Counterexample)
 
@@ -682,7 +682,7 @@ Each context defines its own reassembly strategy. The developer writes the same 
 
 **Why not a new string syntax:** Adding `sql"..."` or `q"..."` prefixes violates the "one string syntax" principle (Section 2.2). The receiving type determines behavior, not a prefix on the literal.
 
-**Why phantom types:** `Template[DB]` and `Template[Shell]` are distinct types. You cannot pass a `Template[Shell]` to a function expecting `Template[DB]`. The phantom parameter prevents cross-context confusion with zero runtime cost — the phantom is erased at codegen, so `Template[DB]` and `Template[Shell]` have identical runtime representations.
+**Why phantom types:** `Template[DB]` and `Template[Shell]` are distinct types. You cannot pass a `Template[Shell]` to a function expecting `Template[DB]`. The phantom parameter prevents cross-context confusion at compile time.
 
 **Why decomposed structure (not compiler-rewritten `$1/$2`):** Parameterization syntax is database-specific (PostgreSQL `$1`, MySQL `?`, Oracle `:name`). The compiler should decompose the interpolated string, not rewrite it. This follows the universal industry pattern: Python 3.14 `Template`, C# `FormattableString`, and JS tagged templates all have the language decompose and the library reassemble. User-authored effect handlers participate on equal footing with stdlib handlers.
 

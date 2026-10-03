@@ -13,7 +13,7 @@ The consequences are structural:
 - A package declaring `capabilities(Net.Connect)` in its manifest **cannot** open a listening socket. The compiler proves it.
 - An effect handler can attenuate capabilities -- handing a function a `Net.Connect` that only permits connections to a specific allowlist. The runtime enforces it.
 
-There is no separate "permissions" system, no runtime ACLs, no sandbox configuration files. The effect system **is** all of these things. Capabilities are tracked through the type system, enforced by the compiler, and attenuated through handlers. Zero runtime cost for the checks themselves -- if your code compiles, the capability discipline is guaranteed.
+There is no separate "permissions" system, no runtime ACLs, no sandbox configuration files. The effect system **is** all of these things. Capabilities are tracked through the type system, enforced by the compiler, and attenuated through handlers. If your code compiles, the capability discipline is guaranteed.
 
 **Why fine-grained effects must be v1, not v2:**
 
@@ -94,7 +94,7 @@ fn dangerous_migration() ! DB {
 
 The `!` was chosen by 3-2 vote over `/`. It universally signals danger or impurity (`!` in Scheme for mutation, Rust for macros, Swift for throwing). It is a single character -- maximally token-efficient. It is visually distinctive in a signature. It does not collide with any operator in expression position.
 
-**The explicit empty row `! ()`.** `! ()` is the empty effect row written out. It means "no effects", the same as an omitted row; it is not a return type. Its one use is on an `@ffi` decl, where the row is a claim the author must write and a missing row is an error (§9.1). On any other function, fn type or trait method signature, the compiler already proves purity, so `! ()` is an error there. The grammar admits `()` after `!` everywhere; a check after parsing rejects it outside an `@ffi` decl. Both spellings denote the same row, so `c_strlen` still checks against `fn(Ptr[U8]) -> Int`.
+**The explicit empty row `! ()`.** `! ()` is the empty effect row written out. It means "no effects", the same as an omitted row; it is not a return type. Its one use is on an `@ffi` decl, where the row is a claim the author must write and a missing row is an error (§9.1). On any other function, fn type or trait method signature, the compiler already proves purity, so `! ()` is an error there. The grammar admits `()` after `!` everywhere, but `! ()` outside an `@ffi` decl is an error. Both spellings denote the same row, so `c_strlen` still checks against `fn(Ptr[U8]) -> Int`.
 
 ```blink
 // intentional-error example
@@ -224,7 +224,7 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 
 **IO operations by dispatch mode:**
 
-| Operation | Argument | Behavior | Vtable-dispatched | Handler-interceptable | Trace |
+| Operation | Argument | Behavior | Handler-dispatched | Handler-interceptable | Trace |
 |---|---|---|---|---|---|
 | `io.print(x)` | `T: Display` | stdout, no newline | Yes (`IO.Print`) | Yes | Yes |
 | `io.println(x)` | `T: Display` | stdout, with newline | Yes (`IO.Print`) | Yes | Yes |
@@ -234,7 +234,7 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 | `io.print_raw(s)` | `Str` | raw stdout, no newline | No | No | No |
 | `io.eprint_raw(s)` | `Str` | raw stderr, no newline | No | No | No |
 
-The `_raw` variants are escape hatches for cases where direct C output is needed (e.g., streaming JSON fragments, progress indicators). They bypass the effect handler system entirely and emit no trace effects. Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
+The `_raw` variants are escape hatches for cases where direct stdout or stderr output is needed (e.g., streaming JSON fragments, progress indicators). They bypass the effect handler system entirely and emit no trace effects. Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
 
 **Argument types.** Each non-`_raw` operation takes any `Display` value, as `sb.write` and `"{x}"` do (§3.6 *Display Format Protocol*). So `io.println(42)`, `io.println(p)` and `io.println("n = {n}")` all compile, and a value with no `Display` impl is `error[E0523]` at the argument. The `_raw` operations take `Str` only. The split follows the `_raw` name, not the dispatch mode: `io.eprint` is not interceptable and still takes `Display`. A non-`Str` argument to a `_raw` operation is a type mismatch:
 
@@ -256,7 +256,7 @@ error[TypeError]: mismatched types
 | `IO.Print` | `fn print_no_nl(msg: Str)` | `io.print(x)` |
 | `IO.Log` | `fn log(msg: Str)` | `io.log(x)` |
 
-The wrapper selects the operation; it does not add the newline to `msg`. A handler therefore sees the same `msg` for `io.println(42)` and `io.println("42")`: the text `42`, with no newline. (Implementation note: for a `Str` argument, `display()` returns the receiver, so the wrapper passes it on without a copy; §3.6.)
+The wrapper selects the operation; it does not add the newline to `msg`. A handler therefore sees the same `msg` for `io.println(42)` and `io.println("42")`: the text `42`, with no newline.
 
 **Handle naming is deterministic:**
 
@@ -567,7 +567,7 @@ server.get("/users/:id", handle_get_user)
 server.post("/users", handle_create_user)
 ```
 
-**Why functional wrapping over effect handler stacking (4-1 vote):** `fn(handler) -> handler` compiles to direct function pointer composition in C — the wrapping chain collapses at server startup, not per-request. Effect handler stacking would require per-request vtable traversal through nested `with` blocks. Functional composition is also the most universal middleware pattern across web frameworks (Express, Rack, WSGI, Go), giving LLMs strong training signal for correct code generation.
+**Why functional wrapping over effect handler stacking (4-1 vote):** Wrapping runs once at server startup, not per request. Effect handler stacking would run the nested `with` blocks again for each request. Functional composition is also the most universal middleware pattern across web frameworks (Express, Rack, WSGI, Go), giving LLMs strong training signal for correct code generation.
 
 ##### Error Recovery
 
@@ -615,7 +615,7 @@ server.get("/api/users/:id", handle_get_user).on_error(json_error_handler)
 server.get("/pages/:slug", handle_page).on_error(html_error_handler)
 ```
 
-The default error handler returns a plain-text 500 response. Handler panics are caught by the server runtime (no `setjmp`/`longjmp` — the server event loop wraps each handler invocation in a safe call boundary).
+The default error handler returns a plain-text 500 response. The server catches a panic in a route handler, so the panic does not stop the server.
 
 ##### @requires Validation at System Boundaries
 
@@ -825,7 +825,7 @@ The mock lists all seven operations at one level. A handler for an effect with c
 
 **`env.vars()` returns a snapshot:** The returned `Map[Str, Str]` is a copy of the environment at the time of the call. Subsequent `env.set_var()` or `env.remove_var()` calls do not affect previously returned maps. This ensures deterministic behavior in concurrent code.
 
-**Thread safety:** `env.set_var()` and `env.remove_var()` are process-global mutations. The runtime serializes these calls (mutex-protected `setenv`/`unsetenv`). In concurrent programs using `! Async`, only one task can modify the environment at a time. Use sparingly — prefer configuration structs over environment mutation.
+**Thread safety:** `env.set_var()` and `env.remove_var()` are process-global mutations. Calls are serialized. In concurrent programs using `! Async`, only one task can modify the environment at a time. Use sparingly — prefer configuration structs over environment mutation.
 
 ---
 
@@ -865,7 +865,7 @@ fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[(), DBError] ! DB.W
 
 **Manual API:** `db.begin()`, `db.commit()`, `db.rollback()` remain available for advanced patterns (nested transactions via SAVEPOINTs, long-running operations). See [db-module-design.md](../decisions/db-module-design.md) Q6.
 
-**History:** Originally specified as a parser special form (3-1 vote, see [transaction-block-syntax.md](../decisions/transaction-block-syntax.md)). Superseded by the general `BlockHandler` mechanism (5-0 vote, see [scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md)) which provides the same block semantics through a trait-based approach.
+**History:** Originally specified as special syntax (3-1 vote, see [transaction-block-syntax.md](../decisions/transaction-block-syntax.md)). Superseded by the general `BlockHandler` mechanism (5-0 vote, see [scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md)), which gives the same block semantics through a trait.
 
 ---
 
@@ -906,7 +906,7 @@ pub type FsError {
 }
 ```
 
-`code` is the `Errno` newtype from `std.errno` — the same zero-cost error code returned by `libc.*` and `io.*`. `fs` wraps it with the operation and the path so the message can name *what* was being done and *to what*. `Errno` on its own says `ENOENT`; `FsError` says that reading `/etc/app.toml` gave `ENOENT`.
+`code` is the `Errno` newtype from `std.errno` — the same `Errno` value that `libc.*` and `io.*` return. `fs` wraps it with the operation and the path so the message can name *what* was being done and *to what*. `Errno` on its own says `ENOENT`; `FsError` says that reading `/etc/app.toml` gave `ENOENT`.
 
 `FsError` implements `Display`. The rendered form follows the convention `op path: message`:
 
@@ -944,7 +944,7 @@ fn read_cache(cache_path: Str) -> Result[Option[Str], FsError] ! FS.Read {
 
 Decided by panel deliberation [`udp-gate-sockaddr-flags`](../decisions/udp-gate-sockaddr-flags.md). `std.net` gives UDP a socket type built on `libc.recvfrom_bytes` and `libc.sendto_bytes` (§9.1.3.4).
 
-**Addresses.** `SockAddr` is a plain Blink enum. It is not an `@ffi.struct`. The runtime converts it to and from the C `sockaddr_storage`.
+**Addresses.** `SockAddr` is a plain Blink enum. It is not an `@ffi.struct`.
 
 ```blink
 pub type Ipv4Addr { bits: Int }             // 32-bit address, host order
@@ -978,8 +978,8 @@ pub trait UdpSocketOps {
 }
 ```
 
-- `udp_bind` creates the socket and binds it in one runtime call. `std.libc` has no `socket` or `bind` wrapper. Bind to port 0 to get a free port, then read it with `local_addr`.
-- `recv_from` returns one datagram and its sender. The semantics of §9.1.3.4 apply: a 0-length datagram is `Ok` with empty `Bytes`, and a datagram larger than `max` is truncated without an error. The default `max` of 65535 holds any UDP datagram. Code on a hot path with small datagrams passes a smaller `max`, because each call allocates `max` bytes.
+- `udp_bind` creates the socket and binds it. Bind to port 0 to get a free port, then read it with `local_addr`.
+- `recv_from` returns one datagram and its sender. The semantics of §9.1.3.4 apply: a 0-length datagram is `Ok` with empty `Bytes`, and a datagram larger than `max` is truncated without an error. The default `max` of 65535 holds any UDP datagram. A program that expects only small datagrams can pass a smaller `max`.
 - `send_to` sends the whole datagram or returns an error. If the kernel sends fewer bytes than `data.len()`, `send_to` returns an `Err`, so no count is returned.
 - `resolve` returns every address that the name resolves to, in resolver order. It uses the same resolver as `net.request`.
 - `UdpSocket` has no `connect`, no unbound constructor, and no `recv` or `send` without an address in this gate.
@@ -1102,7 +1102,7 @@ The LSP displays `main`'s actual effect set as an inlay hint, computed from the 
 
 #### Unhandled user effects
 
-A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows the type checker infers (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.6.3 *Scoped effect handlers* for a `BlockHandler` whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
+A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.6.3 *Scoped effect handlers* for a `BlockHandler` whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
 
 ```blink
 effect Store {
@@ -1410,7 +1410,7 @@ fn good_example() ! FS, Async {
 
 ### 4.6.3 BlockHandler Trait — Scoped Blocks
 
-The `BlockHandler` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It replaces the need for parser special forms for each new block-accepting API.
+The `BlockHandler` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It lets a type accept a block without new syntax for each API.
 
 ```blink
 trait BlockHandler {
@@ -1439,7 +1439,7 @@ trait BlockHandler {
 
 The runtime catch frames are the test runner's per-test boundary, the `?`/`return` desugar, and — within a test only — the boundary armed by an `assert_panics` block (§2.20). The set of runtime catch boundaries is **exhaustively defined by this spec and cannot be extended by user code**. Introducing user-level panic recovery (e.g., `recover`, `catch_panic`) would require a separate spec amendment that re-evaluates `exit()`/`close()` semantics under the new boundary set.
 
-**Amendment — `assert_panics` extends the catchable-unwind set (compiler-managed, not user-extensible).** Be precise about what changed: outside a test, a real `panic()` does *not* unwind to any in-process catch frame — it terminates the process and bypasses `exit()`/`close()` (the last row above). `assert_panics` (§2.20) genuinely *adds* a new catch boundary: within the dynamic extent of its block, a panic is caught and converted to a test pass/fail rather than terminating the process. This boundary is **compiler-managed and test-only** — it is armed exclusively by the compiler's `assert_panics` lowering, is rejected outside a test (E0833), is not nestable (E0834), and exposes **no user-nameable symbol** (there is no `recover`/`catch_panic` a user can call). It therefore does not extend the set of catch boundaries reachable by *user code*; the user-extensible set remains empty, and the fence above holds.
+**Amendment — `assert_panics` extends the catchable-unwind set (compiler-managed, not user-extensible).** Be precise about what changed: outside a test, a real `panic()` does *not* unwind to any in-process catch frame — it terminates the process and bypasses `exit()`/`close()` (the last row above). `assert_panics` (§2.20) genuinely *adds* a new catch boundary: within the dynamic extent of its block, a panic is caught and converted to a test pass/fail rather than terminating the process. This boundary is **compiler-managed and test-only** — only an `assert_panics` block arms it, is rejected outside a test (E0833), is not nestable (E0834), and exposes **no user-nameable symbol** (there is no `recover`/`catch_panic` a user can call). It therefore does not extend the set of catch boundaries reachable by *user code*; the user-extensible set remains empty, and the fence above holds.
 
 The `panic: Never` typing claim (§2.20, *`panic()` Function*) is preserved: the `assert_panics` construct has type `()`, its body is a recognized block (not a reified `fn` value), and the `matching:` argument binds nothing into user scope — so no user expression acquires a type that witnesses the panic. As with `BlockHandler.exit(false)` itself, the cleanup that runs during an armed-panic unwind cannot receive the panic value, cannot inspect any discriminant beyond `ok: Bool`, cannot suppress the unwind, and cannot rescue the test.
 
@@ -1603,9 +1603,9 @@ fn bad_example() ! DB, Async {
 | Block form | Mechanism | Migration status |
 |-----------|-----------|-----------------|
 | `db.transaction { }` | `BlockHandler` | Migrated — uses `with db.transaction() { }` |
-| `async.scope { }` | Parser special form | v1: remains special form. v2: migrate to `BlockHandler` |
+| `async.scope { }` | Special syntax | v1: remains special syntax. v2: migrate to `BlockHandler` |
 
-`async.scope` remains a parser special form in v1 because its structured concurrency semantics (task cancellation, panic propagation, implicit join at scope exit) require deeper compiler integration than `enter()/exit()` provides. Once `BlockHandler` proves itself on simpler use cases, `async.scope` migration will be evaluated for v2.
+`async.scope` is not a `BlockHandler` in v1, because its structured concurrency semantics (task cancellation, panic propagation, implicit join at scope exit) need more than `enter()/exit()` provides. Once `BlockHandler` proves itself on simpler use cases, `async.scope` migration will be evaluated for v2.
 
 **Panel vote: 5-0 (runoff).** See [decisions/scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md).
 
@@ -1613,7 +1613,7 @@ fn bad_example() ! DB, Async {
 
 ### 4.7.1 Handler Type System
 
-`Handler[E]` is a compiler-known generic type parameterized by an effect. It is the type of values produced by `handler E { ... }` expressions. At the source level, `Handler[E]` is a single type constructor; at the C level, each `Handler[E]` compiles to an effect-specific vtable struct managed by the GC.
+`Handler[E]` is a compiler-known generic type parameterized by an effect. It is the type of values produced by `handler E { ... }` expressions. At the source level, `Handler[E]` is a single type constructor.
 
 #### Type identity
 
@@ -1673,11 +1673,11 @@ fn run_with(h: Handler[DB]) ! DB {
 }
 ```
 
-At the C level, handler values are GC-managed copies of the vtable struct. Storing a handler copies the struct (function pointers + captured state); the GC tracks the copy. This means handlers are safe to store beyond the scope that created them — no dangling references.
+A handler value can be stored beyond the scope that created it. It never becomes a dangling reference.
 
 #### Effect projection
 
-A `Handler[E]` where `E` is a parent effect can be used where a `Handler[E.Sub]` is expected. The compiler automatically projects the relevant vtable slots:
+A `Handler[E]` where `E` is a parent effect can be used where a `Handler[E.Sub]` is expected. The compiler converts it implicitly to a handler for the sub-effect:
 
 ```blink
 fn read_only_test(h: Handler[DB.Read]) ! DB.Read {
@@ -1687,10 +1687,10 @@ fn read_only_test(h: Handler[DB.Read]) ! DB.Read {
 }
 
 let full: Handler[DB] = mock_db(data)
-read_only_test(full)  // OK: compiler projects DB → DB.Read
+read_only_test(full)  // OK: DB converts to DB.Read
 ```
 
-This is not subtyping — the compiler extracts the relevant operation slots from the parent handler's vtable and constructs a projected handler. The projection is implicit at the call site but explicit in the generated code.
+This is not subtyping. The conversion is implicit at the call site. The resulting handler handles only the operations of `E.Sub`.
 
 Projection only works in one direction. A `Handler[DB.Read]` cannot be used where `Handler[DB]` is expected — the handler is missing `write` and `admin` operations:
 
@@ -1707,7 +1707,7 @@ error[InsufficientHandlerCoverage]: insufficient handler coverage
 
 #### Completeness and auto-delegation
 
-Handlers may be **partial** — omitted operations automatically delegate to the dynamically enclosing handler. The compiler generates `default.op(args)` forwarding for each unimplemented operation:
+Handlers may be **partial** — omitted operations automatically delegate to the dynamically enclosing handler. An omitted operation forwards to the enclosing handler as if `default.op(args)` were written:
 
 ```blink
 fn logging_db(label: Str) -> Handler[DB] {
@@ -1752,24 +1752,6 @@ The operation never returns and never produces a default value, whatever its ret
 #### Generic handler parameters
 
 In v1, handler type parameters must be concrete effects: `Handler[DB]`, `Handler[IO]`, `Handler[Net.Connect]`. Effect-kinded generic parameters (e.g., `fn foo[E: Effect](h: Handler[E])`) are deferred to v2, alongside named effect variables.
-
-#### Compilation model
-
-Each `Handler[E]` compiles to a C struct containing one function pointer per operation in effect `E`, plus a `void*` for captured closure state:
-
-```c
-// Generated for Handler[DB] (conceptual)
-typedef struct {
-    blink_result (*read)(void* state, blink_query query);
-    blink_result (*write)(void* state, blink_query query);
-    blink_result (*admin)(void* state, blink_query query);
-    void* state;  // captured environment (GC-managed)
-} blink_handler_DB;
-```
-
-Handler values are heap-allocated via the GC. Storing a handler in a struct field or list copies the struct (function pointers are plain pointers; `state` is a GC root). The evidence-passing model (§4.5, [Codegen Backend rationale](../decisions/codegen-backend-bootstrap.md)) installs handler vtables into the evidence vector when entering a `with` block.
-
-Effect projection (`Handler[DB]` → `Handler[DB.Read]`) generates a new struct containing only the relevant function pointer slots, populated from the source handler.
 
 ---
 
@@ -2149,7 +2131,7 @@ Concurrency in Blink is not a language keyword or a function color — it is an 
 
 | Primitive | Purpose |
 |-----------|---------|
-| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: parser special form; v2: may migrate to `BlockHandler` — see §4.6.3)* |
+| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: special syntax; v2: may become a `BlockHandler` — see §4.6.3)* |
 | `async.spawn(fn() { ... })` | Launch a concurrent task within the current scope. Returns `Handle[T]`. |
 | `handle.await` | Wait for a spawned task's result. Method on `Handle[T]`, returns `T`. |
 | `channel.new[T](buffer: N)` | Create a buffered channel for inter-task communication. |
@@ -2279,7 +2261,7 @@ fn main() {
 }
 ```
 
-The runtime (green thread scheduler, M:N threading) is wired implicitly. Every other function that suspends must declare `! Async` explicitly.
+The runtime schedules tasks implicitly. Every other function that suspends must declare `! Async` explicitly.
 
 **Panel vote: 5-0** for `handle.await`. See [OPEN_QUESTIONS.md](../OPEN_QUESTIONS.md).
 
@@ -2499,7 +2481,7 @@ fn for_each(self, f: fn(T) -> () ! _) ! _ {
 }
 ```
 
-> **v1 note.** The `Iterator` adapters above illustrate the *shape* of wildcard forwarding; they do not describe v1 `Iterator`. In v1 the built-in `Iterator[T]` carrier is **pure** — an adapter callback that performs effects is a compile error, and the effect row is reserved in the carrier's internal representation, never spelled on a v1 surface signature (§3c.1 *Effectful Iteration: Deferred to v2*). The `! _` forwarding shown here is the reserved v2 shape and the live mechanism for ordinary user higher-order functions. It is used here because it is the clearest worked example of the wildcard rule.
+> **v1 note.** The `Iterator` adapters above illustrate the *shape* of wildcard forwarding; they do not describe v1 `Iterator`. In v1 the built-in `Iterator[T]` carrier is **pure** — an adapter callback that performs effects is a compile error, and no v1 surface signature spells the effect row (§3c.1 *Effectful Iteration: Deferred to v2*). The `! _` forwarding shown here is the reserved v2 shape and the live mechanism for ordinary user higher-order functions. It is used here because it is the clearest worked example of the wildcard rule.
 
 The wildcard `_` means: "whatever effects the callback has, this function has too." At call sites, the compiler resolves `_` to the concrete effects of the callback passed:
 
@@ -2541,15 +2523,13 @@ fn logged_map[U](self, label: Str, f: fn(T) -> U ! _) -> Iterator[U] ! IO.Log, _
 
 Here `! IO.Log, _` means: this function always requires `IO.Log` (for its own logging), plus whatever the callback needs.
 
-#### 4.15.3 Compilation
+#### 4.15.3 Call-Site Resolution
 
-Effect polymorphism compiles via the existing evidence-passing model (§4.2, [Codegen Backend rationale](../decisions/codegen-backend-bootstrap.md)):
+- **Concrete effect function types** (`fn(T) -> U ! IO.Log`): The caller must hold the required effects at the call site.
 
-- **Concrete effect function types** (`fn(T) -> U ! IO.Log`): The callback receives the caller's evidence vector. The compiler verifies the caller holds the required effect slots at the call site. Zero additional overhead — same as any effectful function call.
+- **Wildcard forwarding** (`! _`): `_` resolves at each call site to the concrete effects of the callback argument.
 
-- **Wildcard forwarding** (`! _`): The compiler resolves `_` at each call site to the concrete effects of the callback argument. The HOF is monomorphized per distinct effect set (same as generic type parameters). At the C level, the evidence vector is threaded through — no new mechanism, just one more monomorphization axis.
-
-- **Pure callbacks in wildcard positions**: When a pure callback is passed to a `! _` function, `_` resolves to the empty effect set. The function becomes pure at that call site. The evidence vector threading is elided entirely.
+- **Pure callbacks in wildcard positions**: When a pure callback is passed to a `! _` function, `_` resolves to the empty effect set. The function is pure at that call site.
 
 #### 4.15.4 Interaction with Existing Features
 
@@ -2598,7 +2578,7 @@ Named variables enable: distinguishing effect sets from different callbacks, con
 
 ### 4.16 Module-Level Mutation Analysis
 
-Module-level `let mut` bindings are a real and necessary feature — the Blink compiler itself uses them extensively (parser position, token buffers, pending comments). But untracked mutation of these bindings caused three real bugs where speculative lookahead saved and restored `pos` but not `pending_comments`, because nothing indicated which state each function touched.
+Module-level `let mut` bindings are a real and necessary feature. But untracked mutation of these bindings is a common source of bugs. For example, speculative lookahead can save and restore `pos` but not `pending_comments`, because nothing shows which state each function touches.
 
 Blink addresses this with a **two-tier model**: automatic compiler analysis (intra-module) and opt-in user-defined effects (cross-module).
 
@@ -2612,10 +2592,10 @@ The compiler performs **mutation analysis** on every function in a module. For e
 - **Writes only** — reading a `let mut` binding is free, not tracked as mutation.
 - **Includes method calls** — `list.push(x)` on a module-level `let mut` binding counts as a write.
 - **Transitive within module** — if `fn a()` calls `fn b()` which writes `pos`, then `a`'s write set includes `pos`.
-- **Zero runtime cost** — purely compile-time analysis. Generated C is identical.
+- **No runtime effect** — the analysis changes no program behavior.
 - **Not an effect** — this is a compiler analysis like type inference, not a declared effect. No `!` annotations needed.
 
-Example of what the compiler tracks internally:
+Example of write sets:
 
 ```
 advance()               → writes {pos}
@@ -2657,7 +2637,7 @@ The LSP shows inferred write sets on hover — developers and AI can see which g
 
 A function with no `!` and an empty write set is **non-mutating** — it does not write to any module-level `let mut` bindings. This is weaker than full referential transparency because the function may still *read* mutable state and thus return different values on different calls.
 
-Truly pure functions — those that neither read nor write module-level mutable state, with output depending only on inputs — can be identified by the compiler for optimization (memoization, reordering). This is an internal optimization analysis, not a user-facing annotation.
+Truly pure functions — those that neither read nor write module-level mutable state, with output depending only on inputs — have no annotation. The language has no syntax to mark a function as pure in this sense.
 
 ```blink
 let mut pos = 0
@@ -2821,8 +2801,6 @@ Valid severity levels: `"off"` (suppress), `"warn"` (default for W0550/W0551), `
 
 **Precedence:** Function-level `@allow` always overrides project-level `blink.toml` configuration. A function annotated with `@allow(UnrestoredMutation)` will not emit W0551 even if `blink.toml` sets `W0551 = "error"`.
 
-#### 4.16.9 Compilation
+#### 4.16.9 No Runtime Effect
 
-Mutation analysis is a **purely compile-time pass**. It generates no runtime code. The generated C for a function is identical whether or not mutation analysis is enabled — module-level `let mut` compiles to a C global variable regardless. The analysis exists solely to enable diagnostics and tooling.
-
-The analysis runs after parsing and type checking, as a separate compiler pass. It builds a call graph within each module and propagates write sets bottom-up. The time complexity is linear in the number of functions × call edges within a module.
+Mutation analysis changes no program behavior. It only produces diagnostics and tooling data.

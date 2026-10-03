@@ -22,7 +22,7 @@ Three rules govern every diagnostic the type system emits. They constrain diagno
 
 1. **Never emit a diagnostic whose prescribed repair does not exist.** If a rule rejects a program, some edit the diagnostic names must make the program legal. A `help:` that cannot be followed is worse than silence, because both a human and a tool will follow it — and a machine-applicable fix that compiles while deleting the construct the user needed is the worst outcome of all.
 
-2. **Every typing rule must be visible to `blink check`.** No rule is enforced only at codegen. A rule the front end cannot see is a rule no editor, no formatter, no fixer, and no agent in a loop can act on, and it turns a user error into an internal compiler error. The `UnsolvedTypeVarAtCodegen` backstop (I0001) exists to catch violations of *this* rule, not to serve as one.
+2. **Every typing rule must be visible to `blink check`.** No rule is enforced only at codegen. A rule the front end cannot see is a rule no editor, no formatter, no fixer, and no agent in a loop can act on, and it turns a user error into an internal compiler error.
 
 3. **Diagnostics at one program point must converge.** When more than one diagnostic fires at the same point, at least one prescribed repair, applied, must discharge all of them — and it must be the repair the diagnostic names *first*. Two diagnostics that each demand the opposite of the other leave the user with no terminating edit; a converging repair that is offered second is a guarantee a mechanical fixer never reaches.
 
@@ -38,7 +38,7 @@ U8, U16, U32, U64  // Unsigned integers
 Float           // 64-bit IEEE 754 floating point
 
 // Text
-Str             // UTF-8 string, GC-managed
+Str             // UTF-8 string
 Char            // Unicode scalar value
 
 // Logic
@@ -68,11 +68,11 @@ Result[T, E]    // Ok(value) | Err(error)
 
 **Why `Option` and `Result` are built-in.** These aren't library types bolted on after the fact. The compiler understands them: `T?` desugars to `Option[T]`, the `?` operator desugars to a match on `Result`, `??` desugars to a match on `Option`. Special syntax demands special compiler support.
 
-**Stdlib API surface: methods only.** Built-in types expose their API exclusively through trait methods — `.len()`, `.split()`, `.push()`, `.write()`, etc. The underlying FFI bridge functions in `lib/std/` (e.g., `str_len`, `bytes_push`, `sb_write`) are internal implementation details: non-public, non-importable, not part of the API. There is one way to call an operation on a built-in type: method syntax. Constructors use static method syntax on the type name (`Bytes.new()`, `StringBuilder.with_capacity(1024)`, `Duration.ms(100)`). This follows Principle 2 — no decision point between `s.len()` and `str_len(s)`. (Panel vote: 4-1. See [Stdlib API Surface rationale](../decisions/stdlib-api-surface.md).)
+**Stdlib API surface: methods only.** Built-in types expose their API exclusively through trait methods — `.len()`, `.split()`, `.push()`, `.write()`, etc. No function form of a built-in method exists. There is one way to call an operation on a built-in type: method syntax. Constructors use static method syntax on the type name (`Bytes.new()`, `StringBuilder.with_capacity(1024)`, `Duration.ms(100)`). This follows Principle 2 — no decision point between `s.len()` and `str_len(s)`. (Panel vote: 4-1. See [Stdlib API Surface rationale](../decisions/stdlib-api-surface.md).)
 
 #### §3.2.1 String Methods
 
-Strings are not bare character arrays. They are UTF-8 encoded, GC-managed, immutable values with a method surface designed to be complete enough that 90% of programs never need a string utility library. Methods are organized into two traits: `Sized` (generic, shared with collections) and `StrOps` (string-specific).
+Strings are not bare character arrays. They are UTF-8 encoded, immutable values with a method surface designed to be complete enough that 90% of programs never need a string utility library. Methods are organized into two traits: `Sized` (generic, shared with collections) and `StrOps` (string-specific).
 
 ##### The `Sized` Trait
 
@@ -89,7 +89,7 @@ trait Sized {
 
 `is_empty` is `final` (§3.6 *The `final` Modifier*): it is a fixed derived view of `len`. No `impl Sized` may override it — implementors provide `len` only, and `is_empty` is mechanically derived from `len() == 0`. This guarantees that `x.is_empty()` and `x.len() == 0` always agree.
 
-For `Str`, `.len()` returns the **codepoint count** — the number of Unicode scalar values, not the number of bytes. This is O(n) for general UTF-8 (the implementation may cache the result), but it gives the semantically correct answer: `"café".len()` is `4`, not `5`.
+For `Str`, `.len()` returns the **codepoint count** — the number of Unicode scalar values, not the number of bytes. This is O(n) for general UTF-8, but it gives the semantically correct answer: `"café".len()` is `4`, not `5`.
 
 ##### The `StrOps` Trait
 
@@ -189,7 +189,7 @@ let vowels = "hello".chars().filter(fn(c) { "aeiou".contains("{c}") }).collect()
 
 ##### Parsing
 
-`parse_int` and `parse_float` are methods on `Str` rather than standalone functions. They delegate to `TryFrom` internally but provide a discoverable, grep-able API surface.
+`parse_int` and `parse_float` are methods on `Str` rather than standalone functions. They give a discoverable, grep-able API surface.
 
 ```blink
 let port = "8080".parse_int()?                      // Ok(8080)
@@ -254,7 +254,7 @@ fn build_json(fields: List[(Str, Str)]) -> Str {
 }
 ```
 
-`StringBuilder` is a mutable buffer backed by a contiguous byte array with amortized O(1) append. It is a compiler-known built-in type: like `Str`/`List`/`Map`/`Set`, both the type name (including `StringBuilder.new()` / `StringBuilder.with_capacity(n)`) and its methods are in the prelude and require no import. Methods are on the compiler-known `StringBuildOps` trait:
+`StringBuilder` is a mutable buffer with amortized O(1) append. It is a compiler-known built-in type: like `Str`/`List`/`Map`/`Set`, both the type name (including `StringBuilder.new()` / `StringBuilder.with_capacity(n)`) and its methods are in the prelude and require no import. Methods are on the compiler-known `StringBuildOps` trait:
 
 ```blink
 trait StringBuildOps {
@@ -272,7 +272,7 @@ trait StringBuildOps {
 | Method | Signature | Notes |
 |--------|-----------|-------|
 | `new` | `fn() -> StringBuilder` | Empty buffer, default capacity |
-| `with_capacity` | `fn(n: Int) -> StringBuilder` | Pre-allocate `n` bytes to avoid reallocs |
+| `with_capacity` | `fn(n: Int) -> StringBuilder` | Sets the initial `capacity()` to `n` |
 | `write` | `fn[T: Display](self, x: T)` | Append `x` rendered by `Display`; same as `x.fmt(sb)`. Requires `let mut` |
 | `write_char` | `fn(self, c: Char)` | Append single character. Not generic; does not go through `Display` |
 | `to_str` | `fn(self) -> Str` | Produce immutable `Str` (copies buffer) |
@@ -280,9 +280,7 @@ trait StringBuildOps {
 | `capacity` | `fn(self) -> Int` | Current buffer capacity |
 | `clear` | `fn(self)` | Reset to empty, retains capacity for reuse |
 
-**`to_str()` always copies.** The returned `Str` is an independent immutable value. Subsequent `write()` or `clear()` calls on the builder do not affect previously returned strings. This is the only safe semantics given GC-managed immutable `Str`.
-
-**Interpolation optimization.** When the compiler sees `sb.write("{x}: {y}")` where the argument is an interpolated string literal, it lowers the call to a sequence of individual writes (`sb.write(x_str); sb.write(": "); sb.write(y_str)`) instead of materializing a temporary `Str`. This is a codegen optimization, transparent to the type system: the argument is a `Str`, so the call checks against `write[T: Display]` with `T = Str`, as any other `Str` argument does. (Vote: 4-1, Systems dissented wanting explicit multi-write.)
+**`to_str()` always copies.** The returned `Str` is an independent immutable value. Subsequent `write()` or `clear()` calls on the builder do not affect previously returned strings. This is the only safe semantics given immutable `Str`.
 
 **When to use which:**
 - **Interpolation** — inline composition, the 80% case
@@ -338,15 +336,15 @@ trait Contains[T] {
 }
 ```
 
-| Type | `contains` semantics | Status |
-|------|---------------------|--------|
-| `Set[T]` | Hash-based membership test | Implemented |
-| `List[T]` | Linear scan for element equality; needs `T: Eq` | Implemented |
-| `Map[K, V]` | Key presence check (equivalent to `contains_key`) | Implemented |
+| Type | `contains` semantics |
+|------|---------------------|
+| `Set[T]` | Hash-based membership test |
+| `List[T]` | Linear scan for element equality; needs `T: Eq` |
+| `Map[K, V]` | Key presence check (equivalent to `contains_key`) |
 
 **Why a shared trait.** Containment is a universal set-theoretic predicate — "is X in this collection?" Every collection answers it, and generic code benefits: `fn has_item[C: Contains[T], T](c: C, item: T) -> Bool { c.contains(item) }`. The alternative — putting `contains` in each per-type trait — prevents writing functions generic over "any collection that can test membership." (Vote: 5-0.)
 
-**Implementation status.** `Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` is equivalent to `Map.contains_key(k)`. `List[T].contains` needs `T: Eq` and compares elements with `==` (§3.6 *Container Equality*) in a linear scan, so it applies to lists of `Eq` structs, enums and nested containers as well as primitives. An element type that does not implement `Eq` is a compile error (`UnresolvedMethod`).
+`Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` is equivalent to `Map.contains_key(k)`. `List[T].contains` needs `T: Eq` and compares elements with `==` (§3.6 *Container Equality*) in a linear scan, so it applies to lists of `Eq` structs, enums and nested containers as well as primitives. An element type that does not implement `Eq` is a compile error (`UnresolvedMethod`).
 
 **Note on `Str`.** `Str` exposes substring search as `"hello".contains("ell")` — semantically "contains substring," not "contains element." This routes through `StrOps` (§3.2.1); `Str` is not a meaningful `Contains[Char]` element-membership type. For character search use `someStr.contains("{c}")`.
 
@@ -506,7 +504,7 @@ let removed = config.remove("port")        // Some("8080")
 config.clear()                             // config is now empty, capacity retained
 ```
 
-**Why `contains_key` when `Contains` exists.** `Contains[K]` on `Map[K, V]` checks key presence — identical to `contains_key`. Both exist because `contains` comes from the generic `Contains` trait (for generic code) and `contains_key` lives in `MapOps` (for map-specific code that reads more clearly). They have identical semantics; the compiler may optimize `contains` to `contains_key` internally.
+**Why `contains_key` when `Contains` exists.** `Contains[K]` on `Map[K, V]` checks key presence — identical to `contains_key`. Both exist because `contains` comes from the generic `Contains` trait (for generic code) and `contains_key` lives in `MapOps` (for map-specific code that reads more clearly). They have identical semantics.
 
 **Why 9 methods (vote: 3-2).** Systems and PLT argued for 6, noting that `entries` duplicates `IntoIterator` (which yields `(K, V)` tuples) and `get_or_default` duplicates `get(k) ?? default`. Web/Scripting, DevOps, and AI/ML argued that `entries` is the standard "dump the map" operation every developer expects (Python's `dict.items()`, JS's `Map.entries()`), and `get_or_default` eliminates the most common map boilerplate pattern. Discoverability and training data representation won.
 
@@ -551,7 +549,7 @@ let combined = a.union(b)                  // all elements from both
 
 ##### Trait Summary
 
-These are the **built-in method-surface traits** — the traits that host the method API of the built-in types. Like every compiler-known trait, they are in the prelude (§10.6): the trait names are in scope without import, and method dispatch on a built-in receiver (`"x".len()`, `sb.write(...)`) is resolved intrinsically by the compiler to a direct call — it never consults whether the trait name is imported.
+These are the **built-in method-surface traits** — the traits that host the method API of the built-in types. Like every compiler-known trait, they are in the prelude (§10.6): the trait names are in scope without import, and method dispatch on a built-in receiver (`"x".len()`, `sb.write(...)`) resolves without the trait name being imported.
 
 | Trait | Applies to | Methods | In prelude |
 |-------|-----------|---------|------------|
@@ -566,7 +564,7 @@ These are the **built-in method-surface traits** — the traits that host the me
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |
 | `StringBuildOps` | StringBuilder | `write`, `write_char`, `to_str`, `len`, `capacity`, `clear` | Yes |
 
-> **`Contains` membership covers `Set`, `Map`, and `List`.** `Set.contains` is a hash lookup, `Map.contains` is key presence (identical to `contains_key`), and `List.contains` is a linear scan that compares elements with `==`, so it needs `T: Eq`. Substring search on `Str` (`"hello".contains("ell")`) is a separate operation hosted by `StrOps` (§3.2.1), not element membership. This table reflects what compiles today.
+> **`Contains` membership covers `Set`, `Map`, and `List`.** `Set.contains` is a hash lookup, `Map.contains` is key presence (identical to `contains_key`), and `List.contains` is a linear scan that compares elements with `==`, so it needs `T: Eq`. Substring search on `Str` (`"hello".contains("ell")`) is a separate operation hosted by `StrOps` (§3.2.1), not element membership.
 
 All built-in method-surface traits are in the prelude — no import required. This matches the rationale from §10.6: operators like `for` desugar through `IntoIterator`, method calls resolve through traits, and requiring imports for built-in collection methods would add ceremony with no information value.
 
@@ -606,7 +604,7 @@ fn format_log() -> Str ! Time.Read {
 }
 ```
 
-**Instant** is an opaque struct (no public fields). Internal representation: `int64_t` nanoseconds since epoch. C codegen: `typedef struct { int64_t nanos; } blink_instant;` — same footprint as `Int`, but nominally typed.
+**Instant** is an opaque struct (no public fields). It has nanosecond precision.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
@@ -621,7 +619,7 @@ Instant implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. Does NOT i
 
 Instant's `Display` writes RFC 9557 in UTC with a `Z` offset: `2026-02-14T12:00:00Z`. A zero fraction of a second is left out. Any other fraction is written without trailing zeros: `2026-02-14T12:00:00.5Z`, `2026-02-14T12:00:00.000000001Z`. An instant before the epoch rounds down to the earlier second: 500 ms before the epoch is `1969-12-31T23:59:59.5Z`. `to_rfc3339` does not change: it always drops the fraction.
 
-**Duration** is a typed time span. Internal representation: `int64_t` nanoseconds. Named constructors enforce units at construction — no ambiguity between seconds and milliseconds.
+**Duration** is a typed time span. Named constructors enforce units at construction — no ambiguity between seconds and milliseconds.
 
 | Constructor | Signature | Example |
 |-------------|-----------|---------|
@@ -650,7 +648,7 @@ Duration's `Display` writes the same text as Go's `time.Duration.String`. A dura
 
 **Why Instant/Duration instead of raw Int.** Time points form an affine space over durations: `Instant - Instant → Duration`, `Instant + Duration → Instant`, but `Instant + Instant` is nonsensical. Raw `Int` allows all three operations — a type error that the type system should catch. Duration carries dimensional information; `Int` is dimensionless. `time.sleep(port_number)` type-checks with raw Int but is a bug. `time.sleep(Duration.seconds(5))` makes units explicit at every call site. (Panel vote: 5-0.)
 
-**Why stdlib Tier 2, not prelude.** Instant and Duration require no special syntax, no special desugaring, and no special inference rules. They are nominal types with named methods. The effect system's `Time.Read` and `Time.Sleep` operations reference these types, creating a coupling between compiler effects and stdlib — resolved by pinning the type layout as part of the effect specification. Not every program uses time operations. (Panel vote: 5-0.)
+**Why stdlib Tier 2, not prelude.** Instant and Duration require no special syntax, no special desugaring, and no special inference rules. They are nominal types with named methods. The effect system's `Time.Read` and `Time.Sleep` operations reference these types, creating a coupling between compiler effects and stdlib, so the spec fixes these types as part of the effect specification. Not every program uses time operations. (Panel vote: 5-0.)
 
 **Wall-clock DateTime.** Calendar-aware datetime (year, month, day, timezone) lives in `std.time.DateTime`, constructed from an `Instant` via `DateTime.from(instant)`. Calendar decomposition carries unbounded complexity (timezones, DST, leap seconds) that belongs in stdlib, not built-in types.
 
@@ -676,7 +674,7 @@ fn decode(b: Bytes) -> Result[Str, ConversionError] {
 }
 ```
 
-C representation: `typedef struct { uint8_t* data; int64_t len; int64_t cap; } blink_bytes;` — contiguous, cache-friendly, FFI-compatible. This is fundamentally different from `List[U8]`, which is a GC-managed array with potential per-element boxing overhead.
+`Bytes` is a contiguous buffer. `with_ptr` gives FFI a `Ptr[U8]` to it. `List[U8]` is a different type and makes no such promise.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
@@ -707,7 +705,7 @@ The `set_*_le/be(off, v)` family is the symmetric counterpart of the existing `r
 
 Bytes implements: `Sized`, `Eq`, `Clone`, `Debug`, `IntoIterator[U8]`.
 
-**Why a separate type from `List[U8]`.** Memory layout is non-negotiable for I/O, FFI, and crypto. `List[U8]` makes no contiguous-memory guarantee — every FFI call would require copying to a C buffer. `memcpy` on contiguous `Bytes` is SIMD-optimized; iterating boxed `List[U8]` has pointer-chasing overhead per element. For a 1MB file read, this is 10-100x slower. (Panel vote: 5-0.)
+**Why a separate type from `List[U8]`.** `Bytes` is the type for I/O, FFI, and crypto. `List[U8]` makes no contiguous-memory guarantee, so it cannot give FFI a `Ptr[U8]` view. (Panel vote: 5-0.)
 
 **Why Tier 1, not prelude.** `Bytes` is needed by core effects (`FS.Read`, `Net.Connect`, `Crypto.Hash`) but not every program does binary I/O. Tier 1 means it ships with the compiler and is version-locked. The API surface should remain minimal in Tier 1; richer operations (base64, compression) belong in higher tiers. (Panel vote: 5-0.)
 
@@ -721,7 +719,7 @@ let y: F32 = x.mul(F32.from(2.0))
 let back: Float = y.to_float()     // widening via From, infallible
 ```
 
-`F32` maps to C `float` (32-bit IEEE 754). It joins the existing sized numeric family (`I8`, `I16`, `I32`, `U8`, `U16`, `U32`, `U64`). Widening `F32 → Float` via `From` (infallible). Narrowing `Float → F32` via `TryFrom` (precision loss). F32 is relevant for GPU interop, ML inference weights, and memory-constrained numerical arrays. (Panel vote: 5-0.)
+`F32` is a 32-bit IEEE 754 float. In `@ffi` signatures it maps to C `float`. It joins the existing sized numeric family (`I8`, `I16`, `I32`, `U8`, `U16`, `U32`, `U64`). Widening `F32 → Float` via `From` (infallible). Narrowing `Float → F32` via `TryFrom` (precision loss). F32 is relevant for GPU interop, ML inference weights, and memory-constrained numerical arrays. (Panel vote: 5-0.)
 
 **Decimal** (`std.decimal`, Tier 2):
 
@@ -737,7 +735,7 @@ let tax_rate = Decimal.from_str("0.0825")?
 let tax = calculate_tax(price, tax_rate)    // exact: "1.649175"
 ```
 
-128-bit fixed-point representation. Covers financial use cases (38 digits of precision) without unbounded allocation. Arithmetic via named methods (`.add()`, `.sub()`, `.mul()`, `.div()`) — sealed arithmetic traits are not extended. `Decimal` implements `Eq`, `Ord`, `Display`, `Clone`. Construction: `Decimal.from_str(Str)`, `Decimal.from_int(Int)`, `Decimal.zero()`.
+`Decimal` holds up to 38 decimal digits. It covers financial use cases. Arithmetic via named methods (`.add()`, `.sub()`, `.mul()`, `.div()`) — sealed arithmetic traits are not extended. `Decimal` implements `Eq`, `Ord`, `Display`, `Clone`. Construction: `Decimal.from_str(Str)`, `Decimal.from_int(Int)`, `Decimal.zero()`.
 
 **BigInt** (`std.math`, Tier 2):
 
@@ -755,7 +753,7 @@ fn factorial(n: Int) -> BigInt {
 }
 ```
 
-GC-managed arbitrary-precision integer. Arithmetic via named methods. `From[Int]` for widening. Needed for cryptography, combinatorics, and scientific computing. Not the default `Int` — Blink chose `Int = i64` for predictable C codegen performance. (Panel vote: 5-0.)
+Arbitrary-precision integer. Arithmetic via named methods. `From[Int]` for widening. Needed for cryptography, combinatorics, and scientific computing. Not the default `Int`: `Int` is 64-bit. (Panel vote: 5-0.)
 
 **Why sealed arithmetic is not extended.** The 4-1 sealed decision applies uniformly. `Decimal` and `BigInt` are library types with library implementations, not hardware-mapped primitives. If `Decimal` gets `+`, users rightfully ask why their `Money` newtype cannot. Named methods `.add()`, `.mul()` are usable and maintain the bright-line boundary. (Panel vote: 5-0.)
 
@@ -776,7 +774,7 @@ fn lookup(raw_id: Str) -> Result[User, AppError] ! DB.Read {
 }
 ```
 
-C representation: `typedef struct { uint64_t hi; uint64_t lo; } blink_uuid;` — 16 bytes, two 64-bit words. Fast comparison (`memcmp` on 16 bytes vs 36-byte string), fast hashing (already well-distributed).
+`to_bytes` returns 16 bytes.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
@@ -788,7 +786,7 @@ C representation: `typedef struct { uint64_t hi; uint64_t lo; } blink_uuid;` —
 
 UUID implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`, `Serialize`, `Deserialize`.
 
-**Why a nominal type, not Str.** UUID is 128 bits, not 36 characters. The `Str` representation is lossy (2.25x memory, slower comparison, no binary form). A distinct type prevents confusion: `fn get_user(id: UUID)` is self-documenting; `fn get_user(id: Str)` is ambiguous. `UUID.parse()` validates once and carries the proof in the type. (Panel vote: 5-0.)
+**Why a nominal type, not Str.** UUID is 128 bits, not 36 characters. A `Str` has no binary form. A distinct type prevents confusion: `fn get_user(id: UUID)` is self-documenting; `fn get_user(id: Str)` is ambiguous. `UUID.parse()` validates once and carries the proof in the type. (Panel vote: 5-0.)
 
 **Why `UUID.random()` requires `! Rand`.** UUID v4 generation needs entropy. This integrates naturally with the effect system — in tests, `with mock_rand(seed: 42) { UUID.random() }` gives deterministic UUIDs. Parsing is pure: `UUID.parse(str)` returns `Result[UUID, ConversionError]` with no effect. (Panel vote: 5-0.)
 
@@ -799,18 +797,18 @@ UUID implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`, `Serialize`, 
 | `Instant` | `std.time` | 2 | No | Effect return type, opaque, nanosecond precision |
 | `Duration` | `std.time` | 2 | No | Effect parameter type, named constructors eliminate unit confusion |
 | `Bytes` | `std.bytes` | 1 | No | Contiguous binary buffer for I/O, FFI, crypto |
-| `F32` | built-in | — | Yes | Sized numeric alongside I8–U64, maps to C `float` |
-| `Decimal` | `std.decimal` | 2 | No | 128-bit fixed-point for financial arithmetic |
+| `F32` | built-in | — | Yes | Sized numeric alongside I8–U64; `@ffi` maps it to C `float` |
+| `Decimal` | `std.decimal` | 2 | No | Exact decimal (38 digits) for financial arithmetic |
 | `BigInt` | `std.math` | 2 | No | Arbitrary-precision integer for crypto/scientific |
 | `UUID` | `std.uuid` | 2 | No | 128-bit identity type, Rand effect integration |
 
 ##### Sized Integer Types
 
-Blink provides a family of fixed-width integer types alongside the default `Int`. These are first-class nominal types -- not refinements of `Int`, not aliases, not newtypes. A `U8` has a fundamentally different *representation* than an `Int`: 8 bits instead of 64 bits. Refinement types constrain values; sized types constrain representation. Different widths have different overflow boundaries, different bitwise semantics, and different memory layouts.
+Blink provides a family of fixed-width integer types alongside the default `Int`. These are first-class nominal types -- not refinements of `Int`, not aliases, not newtypes. A `U8` has a different value range than an `Int`: 8 bits instead of 64 bits. Different widths have different overflow boundaries and different bitwise semantics.
 
 **Type table:**
 
-| Type | Width | Range | C Type | Signed |
+| Type | Width | Range | C Type (`@ffi` mapping) | Signed |
 |------|-------|-------|--------|--------|
 | `I8` | 8-bit | -128 to 127 | `int8_t` | Yes |
 | `I16` | 16-bit | -32,768 to 32,767 | `int16_t` | Yes |
@@ -821,9 +819,9 @@ Blink provides a family of fixed-width integer types alongside the default `Int`
 | `U32` | 32-bit | 0 to 4,294,967,295 | `uint32_t` | No |
 | `U64` | 64-bit | 0 to 2^64-1 | `uint64_t` | No |
 
-All sized types map directly to their C equivalents for zero-cost FFI. No wrapper structs, no indirection -- `U8` *is* `uint8_t` in the generated C. (Panel vote: 5-0.)
+In `@ffi` signatures, each sized type maps to the C type in the table. (Panel vote: 5-0.)
 
-**Why not just `Int` everywhere.** `Int` (64-bit) is the default and covers most use cases. Sized types exist for three reasons: (1) memory efficiency -- `[U8]` is 8x denser than `[Int]`, critical for buffers, images, and network protocols; (2) C FFI -- matching the exact width the foreign function expects; (3) domain semantics -- a byte is 0-255, not -2^63 to 2^63-1. Use `Int` unless you have a specific reason not to. (Panel vote: 3-1-1, Web dissented wanting refinement types, AI/ML dissented wanting FFI-only.)
+**Why not just `Int` everywhere.** `Int` (64-bit) is the default and covers most use cases. Sized types exist for two reasons: (1) C FFI -- matching the exact width the foreign function expects; (2) domain semantics -- a byte is 0-255, not -2^63 to 2^63-1. Use `Int` unless you have a specific reason not to. (Panel vote: 3-1-1, Web dissented wanting refinement types, AI/ML dissented wanting FFI-only.)
 
 **Overflow behavior:**
 
@@ -949,7 +947,7 @@ The compiler performs range checking on all constant expressions assigned to siz
 
 **Why no literal suffixes.** Languages like Rust use `42u8`, `100i32`, etc. Blink omits suffixes because (1) function signatures already provide the context -- `fn process(val: U8)` makes `process(200)` unambiguous; (2) suffixes add visual noise to a language designed for readability; (3) the rare case where disambiguation is needed can use a type annotation: `let x: U8 = 42`. (Panel vote: 4-1, Systems expert preferred constructor syntax `U8(42)`.)
 
-**Why not refinement types.** Sized integers are not `Int @where(self >= 0 && self <= 255)`. Refinement types constrain values but not representation -- a refined `Int` still occupies 64 bits. `U8` occupies 8 bits, enables efficient array layouts (`[U8]` is 8x denser than `[Int]`), and maps directly to C `uint8_t` for zero-cost FFI. The overflow and bitwise semantics also differ by width: `U8(255) + U8(1)` wraps to 0 (with `wrapping_add`), while a refined `Int` would just be 256. These are fundamentally different kinds of types serving different purposes. (Panel vote: 5-0.)
+**Why not refinement types.** Sized integers are not `Int @where(self >= 0 && self <= 255)`. A refined `Int` is still an `Int`: it has the 64-bit range and overflow of `Int`. `U8` has an 8-bit range and maps to C `uint8_t` in `@ffi` signatures. The overflow and bitwise semantics also differ by width: `U8(255) + U8(1)` wraps to 0 (with `wrapping_add`), while a refined `Int` would just be 256. These are fundamentally different kinds of types serving different purposes. (Panel vote: 5-0.)
 
 ---
 
@@ -1189,7 +1187,7 @@ The bare form (`NotFound { msg: "x" }`) and the qualified form (`QueryError.NotF
 2. **Hint-directed** — the expected type at the site (a binding annotation, a function return type, a function parameter type, or a `Result`/`Option` carrier such as `Ok`/`Err`/`Some`) names an enum that has a variant `Name`. The hint is consulted *first* among the unqualified rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
 3. **Global-unique** — if no hint applies, `Name` resolves to the one enum variant of that name across the whole program. If the name is not globally unique, see the ambiguity rule below.
 
-Resolution is entirely compile-time; there is no runtime dispatch.
+Resolution is static.
 
 **Name collisions** fall into two distinct kinds:
 
@@ -1275,7 +1273,7 @@ let ok = match c {
 
 This rule applies to every enum with a payload, including the stdlib `Errno` (§9.1.3.3).
 
-> Pattern matching an `Int` scrutinee against enum-variant patterns (`match someInt { State.Idle => ... }`) is the pattern-side dual of the assignability rule and is likewise ill-typed. Enforcement of that case is staged behind the compiler's internal `kind: Int → NodeKind` representation migration; the rule itself holds from this decision.
+> Pattern matching an `Int` scrutinee against enum-variant patterns (`match someInt { State.Idle => ... }`) is the pattern-side dual of the assignability rule and is likewise ill-typed.
 
 #### Str-Backed Enums
 
@@ -1433,7 +1431,7 @@ let buf = alloc_ptr[U8]()
 
 Explicit type application is a third supply mechanism alongside inference at a construction site and a type annotation on the binding. All three name the same type parameters and differ only in where the program writes them. Brackets in this position can never be confused with indexing or comparison — Blink has no index operator, and element access is `.get()` (§2.6).
 
-**No erasure.** Every type parameter a declaration binds belongs to that declaration's monomorphization key, whether or not a parameter type or the return type mentions it. `probe[Int]()` and `probe[Str]()` are distinct instantiations and compile to distinct functions. A type parameter is never dropped from the key, never defaulted, and never collapsed onto another instantiation's — the guarantee §3.4 *Under-Determined Types* makes at a binding, applied to a declaration.
+**No erasure.** Every type parameter a declaration binds is part of that declaration's instantiation, whether or not a parameter type or the return type mentions it. `probe[Int]()` and `probe[Str]()` are distinct instantiations. A type parameter is never dropped, never defaulted, and never merged with another instantiation's — the guarantee §3.4 *Under-Determined Types* makes at a binding, applied to a declaration.
 
 **When brackets are mandatory.** A type parameter is **supplied by the signature** when it occurs in a parameter type or in the return type: inference solves it from the call's arguments, or from the annotation on the binding the call feeds. A type parameter the signature does not supply has no other source, so every call must write it:
 
@@ -1480,7 +1478,7 @@ fn main() {
 
 The first `help:` names the **annotation**, not a bracket form. Brackets on a callee supply type arguments to a *call*; this position has no call, so there is nothing for them to attach to. Writing them anyway — `let f = identity[Int]` — is `error[TypeArgsWithoutCall]` (E0314, §3.4 *Postfix Brackets That Are Not a Type Application*).
 
-*Rationale (normative).* The rule this replaces refused `apply(identity, 3)` and accepted `let f = identity` followed by `apply(f, 3)` — the same value, one line apart, separated by where it was written rather than by anything about its type. A rule that distinguishes a term from its own η-expansion is a syntactic filter standing in a typing rule's position, and its prescribed repair — wrapping the name in a closure — lowers to the identical allocation and the identical indirect call. It refused one spelling of a machine-identical program, it was defeated by one `let`, and it has been deleted rather than restated.
+*Rationale (normative).* The rule this replaces refused `apply(identity, 3)` and accepted `let f = identity` followed by `apply(f, 3)` — the same value, one line apart, separated by where it was written rather than by anything about its type. A rule that distinguishes a term from its own η-expansion is a syntactic filter standing in a typing rule's position, and its prescribed repair — wrapping the name in a closure — means the same program. It refused one spelling of an identical program, it was defeated by one `let`, and it has been deleted rather than restated.
 
 **Where the error is reported.** `error[CannotInferType]` (E0301) is reported **where its repair attaches**. For an under-determined *binding* that is the `let` (§3.4 *Under-Determined Types*). For a type parameter with no source it is the call's type-argument position, because that is where the brackets go — including when the call stands alone as a statement and there is no binding to annotate:
 
@@ -1589,7 +1587,7 @@ fn main() {
 
 **A rejected list supplies nothing.** When E0303 fires on a list, the list binds none of the declaration's type parameters. Neither `error[CannotInferType]` (E0301) nor `error[TraitBoundNotSatisfied]` (E0306) is reported for the binders of that call: an ill-arity list has no argument *i* for binder *i*, so "unbound" and "bound not met" have no meaning there. Fixing the count is the converging repair (§3.1 rule 3).
 
-**E0303 is decided when the head resolves, from the declaration's binder count and the written list alone.** For a type expression or a path callee, that is at name resolution, before inference runs. For a method callee (`x.decode[A, B]()`), the receiver's type selects the method, so the count is checked once that type is known. In neither case is inference of the call's own arguments consulted. A constructor's arity is a property of its declaration alone, so the mismatch is known the moment the head is resolved. This is what distinguishes E0303 from `error[CannotInferType]` (E0301, §3.4 *Under-Determined Types*): E0301 fires when inference *terminates* with a type variable no use ever fixed; E0303 fires when a type expression was never well-formed to begin with. A bare `Channel` annotation is not an unsolved variable that a later use might constrain — it names a slot the program neglected to fill, and no downstream use can fill an argument the annotation did not open. The two never co-fire on the same type expression: a well-formed constructor application may leave a variable under-determined (E0301), but an ill-formed one is rejected first (E0303).
+**E0303 is decided when the head resolves, from the declaration's binder count and the written list alone.** For a method callee (`x.decode[A, B]()`), the receiver's type selects the method, so the count is checked once that type is known. The call's own arguments play no part in the check. E0303 is reported instead of E0301 and E0306. A constructor's arity is a property of its declaration alone, so the mismatch is known the moment the head is resolved. This is what distinguishes E0303 from `error[CannotInferType]` (E0301, §3.4 *Under-Determined Types*): E0301 fires when inference *terminates* with a type variable no use ever fixed; E0303 fires when a type expression was never well-formed to begin with. A bare `Channel` annotation is not an unsolved variable that a later use might constrain — it names a slot the program neglected to fill, and no downstream use can fill an argument the annotation did not open. The two never co-fire on the same type expression: a well-formed constructor application may leave a variable under-determined (E0301), but an ill-formed one is rejected first (E0303).
 
 **The repair depends on the case, and the first `help:` offered is normative** (§3.4 *Explicit Type Application*):
 
@@ -1767,11 +1765,11 @@ The `Err(e) => n` arm does not rescue the scrutinee. It binds `e` but discards i
 
 **What pins `E`.** The error type of a `Result` is determined by any one of four things: a type annotation on the binding (`let r: Result[Int, Str] = Ok(3)`), a `?` in a context whose error type it must match, a `match` arm that reads the `Err` payload's type, or an enclosing return type that names it. When none is present, `E` is under-determined and the constructor must state it. The repair is an explicit type-argument list on the constructor — `Ok[Int, Str](3)` (§3.4 *Explicit Type Application*) — placed where the open parameter lives. As with every under-determined binding, E0301 is reported where its repair attaches (§3.4, as amended): the `let` when a binding dominates the value, otherwise the constructor's type-argument position, with the dual-span blame at the open constructor.
 
-There is no "an Ok-only value proves the error type is uninhabited, so resolve it to a bottom type" rule. Inferring a type the program never wrote — whether the erased unit `Void` or a bottom `Never` — into an unconstrained slot is the same unlicensed substitution the two-state model forbids; a `Never` error type is reached only when a program *writes* `Result[Int, Never]`, never chosen by inference for an open slot. The I0001 backstop that catches a variable reaching monomorphization keys on the variable's *kind*, never on the concrete tag it would have been given, so a genuine `Result[Void, Str]` or an explicitly-written `Result[Int, Never]` is unaffected.
+There is no "an Ok-only value proves the error type is uninhabited, so resolve it to a bottom type" rule. Inferring a type the program never wrote — whether the erased unit `Void` or a bottom `Never` — into an unconstrained slot is the same unlicensed substitution the two-state model forbids; a `Never` error type is reached only when a program *writes* `Result[Int, Never]`, never chosen by inference for an open slot. A genuine `Result[Void, Str]` or an explicitly-written `Result[Int, Never]` is unaffected.
 
 #### Type Name Resolution (normative)
 
-A type name resolves **once**, at name resolution, to **one declaration identity**. Every later phase — inference, trait resolution, monomorphization, code generation — works on that identity and never looks the name up again.
+A type name denotes **one declaration identity**.
 
 - A name that resolves to no declaration is `error[UnknownType]` (E0507).
 - Only an explicit `[T]` binder on the enclosing declaration creates a type variable. A type name is never turned into a type variable because it is unresolved, special, or compiler-known.
@@ -1816,13 +1814,13 @@ fn first(xs: List[Int]) -> Int? {  // `Int?` is the builtin Option[Int], by iden
 }
 ```
 
-**Identity, not spelling, selects behavior.** No compiler phase may choose behavior — a runtime representation, a method surface, a desugaring, a C name — from a type's name string. It chooses it from the declaration identity alone. Two types with the same name and different identities are different types everywhere.
+**Identity, not spelling, selects behavior.** Behavior depends on a type's declaration identity, not on its spelling. Two types with the same name and different identities are different types everywhere.
 
 The set of names that may not be declared at all, and the rule for a declaration that takes any other compiler-known name, are in §10.6 *Shadowing Rules*.
 
 #### Recursive Types
 
-Types can reference themselves. The compiler handles the indirection, and no program can see it: a recursive field is a value like any other, and a copy of it follows §3.6.1 *Clone Semantics*.
+Types can reference themselves. A recursive field is a value like any other, and a copy of it follows §3.6.1 *Clone Semantics*.
 
 ```blink
 type Tree {
@@ -1972,7 +1970,7 @@ fn process(tokens: List[Str]) -> Str {
 }
 ```
 
-`..` in list patterns cannot bind a variable. Use `.slice()` or loops for tail access. (Rest binding deferred — would require O(n) copy or a slice type.)
+`..` in list patterns cannot bind a variable. Use `.slice()` or loops for tail access.
 
 The `..` rest sigil is unified across struct and list patterns — same concept ("remaining elements I didn't name"), same sigil. See §2.16 for the full spread/rest operator specification, including the construction-side dual (`..source` in struct literals).
 
@@ -2248,11 +2246,9 @@ type Ordering {
 
 #### Hash Contract and Seeding
 
-`hash(self) -> U64` returns a **pre-seed** value. Implementations must satisfy the coherence law with `Eq`: for any `a` and `b`, `a == b` implies `a.hash() == b.hash()`. Coherence holds at the trait level and is **independent of any runtime seed** — it is a property of `hash` against `eq`, not of how the runtime stores keys.
+`hash(self) -> U64` returns a hash of the value. Implementations must satisfy the coherence law with `Eq`: for any `a` and `b`, `a == b` implies `a.hash() == b.hash()`. Coherence is a property of `hash` against `eq`.
 
-`Map` and `Set` mix a **process-global seed** into hash values before bucket selection. The seed is drawn once at process start and is **randomized per process by default**: iteration order over a `Map` or `Set`, and the concrete bucket a key lands in, vary from run to run, build to build, and across compiler versions. This is deliberate — randomization forces accidental order-dependence to fail early rather than rot silently (vote: 6-0; see [Hash Seed & Iteration Order rationale](../decisions/hash-seed-iteration-order.md)).
-
-The seed perturbs **only** bucket placement. It is never observable through `hash()`, never stored, serialized, or compared, and is set once before `main` runs — it is not an effect, not a capability, and there is no API that reads or sets it from Blink code. Programs therefore **must not** depend on iteration order; code that needs a stable order must sort the keys or entries explicitly:
+The iteration order of a `Map` or `Set` varies from run to run, build to build, and across compiler versions. This is deliberate — randomization forces accidental order-dependence to fail early rather than rot silently (vote: 6-0; see [Hash Seed & Iteration Order rationale](../decisions/hash-seed-iteration-order.md)). Programs therefore **must not** depend on iteration order; code that needs a stable order must sort the keys or entries explicitly:
 
 ```blink
 let names = scores.keys().sort()
@@ -2261,9 +2257,9 @@ for name in names {
 }
 ```
 
-A function whose result depends on unsorted `Map`/`Set` iteration order is **not** referentially transparent with respect to its `Map`/`Set` arguments, even though it has no effect annotation. The compiler's purity analysis (§4 effects, truly-pure classification) treats iteration over a `Map`/`Set` as an opaque-order read of process state: any function that iterates a `Map` or `Set` is conservatively excluded from memoization and reordering. Iteration order is **not** part of a `Map`/`Set` value's identity — two maps with equal entry sets are `==`-equal regardless of insertion history or seed (§3.6 *Container Equality*).
+A function whose result depends on unsorted `Map`/`Set` iteration order is **not** referentially transparent with respect to its `Map`/`Set` arguments, even though it has no effect annotation. Iteration order is **not** part of a `Map`/`Set` value's identity — two maps with equal entry sets are `==`-equal regardless of insertion history (§3.6 *Container Equality*).
 
-**Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would map equal values to different buckets. Round to an integer key instead.
+**Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would give equal values different hashes. Round to an integer key instead.
 
 **Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
 
@@ -2459,7 +2455,7 @@ error[SelfNotConstructor]: `Self` is not a constructor
   = help: use the concrete type name: `Point { x: 0, y: 0 }`
 ```
 
-**`self` is always passed by value.** Blink is garbage-collected — there is no by-reference vs by-move distinction. The `self` parameter is a value like any other parameter. No `&self`, `&mut self`, or `self: Box[Self]` forms exist. `mut self` is a mutable parameter (see *Mutable Parameters* below), not a reference.
+**`self` is always passed by value.** Blink has no by-reference vs by-move distinction. The `self` parameter is a value like any other parameter. No `&self`, `&mut self`, or `self: Box[Self]` forms exist. `mut self` is a mutable parameter (see *Mutable Parameters* below), not a reference.
 
 A method cannot change its caller's value through `self`. State that must persist across calls lives in a `let mut` binding captured by a closure or handler (§2.8, §4.7). An assignment to a field of `self`, or of any parameter, is a compile error (see *Mutable Parameters*).
 
@@ -2469,7 +2465,7 @@ A method cannot change its caller's value through `self`. State that must persis
 - `StringBuilder`
 - a closure or handler that captured a `let mut` binding (§2.8, §4.7)
 
-This list is the only one; other sections refer to it. It does not yet say whether a `Channel` or an effect handle is a shared cell.
+This list is the only one; other sections refer to it.
 
 Only a shared cell can change through a second name. A value of any other type, at any depth, cannot. This holds for every copy: bind, pass, return and `clone()` (§3.6.1 *Clone Semantics*).
 
@@ -2574,8 +2570,7 @@ This is the parametricity rule of *Polymorphic Trait Implementations* applied to
 `Self`: a default body may vary behavior only through bounds the trait declares.
 Because every `impl` must satisfy the trait's supertraits, a default body that
 type-checks under the guarantee set is valid for every implementor — the check is
-complete at the definition and is never re-run per implementor or per
-monomorphization.
+complete at the definition.
 
 ```blink
 trait Eq {
@@ -2782,11 +2777,11 @@ fn main() {
 
 **Generic code.** `==` on a container of a type parameter needs the bound that the table gives. `fn same[T](a: Option[T], b: Option[T]) -> Bool { a == b }` is an error. Write `fn same[T: Eq](a: Option[T], b: Option[T]) -> Bool { a == b }`.
 
-**Enums (interim rule).** An enum with no `Eq` impl and no `@derive(Eq)` is `Eq` only if every payload type is `Eq`. An enum with no payloads is `Eq`. So `Option[Color]` is `Eq` for a payload-free `Color`, and `Option[Shape]` is not `Eq` if a `Shape` variant carries a `List[Widget]`. Whether a data enum must write `@derive(Eq)` is an open question.
+**Enums (interim rule).** An enum with no `Eq` impl and no `@derive(Eq)` is `Eq` only if every payload type is `Eq`. An enum with no payloads is `Eq`. So `Option[Color]` is `Eq` for a payload-free `Color`, and `Option[Shape]` is not `Eq` if a `Shape` variant carries a `List[Widget]`.
 
 **Ord.** `Set` and `Map` never implement `Ord`: no order over them is canonical and agrees with membership equality.
 
-**Eq laws.** An `Eq` impl must be reflexive (`a == a`), symmetric (`a == b` implies `b == a`) and transitive (`a == b` and `b == c` imply `a == c`). The compiler and the container impls may rely on these laws, as `Map` and `Set` rely on the Hash coherence law. For example, `==` may return `true` without comparing elements when both operands are the same cell. Every built-in `Eq` obeys the laws; `Float` obeys them because `NaN == NaN` (*Float Total Ordering*). If a user impl breaks a law, `==` on a container that holds that type returns an unspecified `Bool`. It stays memory-safe.
+**Eq laws.** An `Eq` impl must be reflexive (`a == a`), symmetric (`a == b` implies `b == a`) and transitive (`a == b` and `b == c` imply `a == c`). The compiler and the container impls may rely on these laws, as `Map` and `Set` rely on the Hash coherence law. Every built-in `Eq` obeys the laws; `Float` obeys them because `NaN == NaN` (*Float Total Ordering*). If a user impl breaks a law, `==` on a container that holds that type returns an unspecified `Bool`. It stays memory-safe.
 
 **Ord laws.** An `Ord` impl must be a total order that agrees with `Eq`:
 
@@ -2893,7 +2888,7 @@ Traits also support retroactive implementation -- you can implement a trait for 
 
 #### Trait Coherence
 
-Coherence guarantees that for any (Trait, Type) pair, at most one implementation exists in the entire program. This invariant is essential -- trait dispatch must be deterministic, and evidence-passing compilation ([Codegen Backend rationale](../decisions/codegen-backend-bootstrap.md)) requires exactly one vtable per (Trait, Type) pair at every call site.
+Coherence guarantees that for any (Trait, Type) pair, at most one implementation exists in the entire program. This invariant is essential -- trait dispatch must be deterministic.
 
 Three rules enforce coherence: the orphan rule, the overlap rule, and the impl placement rule.
 
@@ -2984,7 +2979,7 @@ error[OverlappingImpls]: overlapping impls
   = help: use a newtype wrapper or restructure with a helper trait
 ```
 
-**Why no specialization.** Specialization requires a partial ordering on impls and interacts with type inference in subtle, unsound ways. Rust has kept specialization unstable for over a decade due to repeated soundness holes. Without specialization, adding a new impl to a library can never silently change which impl is selected for existing code -- it can only cause a new overlap error, which is loud and fixable. Each (Trait, Type) pair maps to exactly one vtable with zero ambiguity.
+**Why no specialization.** Specialization requires a partial ordering on impls and interacts with type inference in subtle, unsound ways. Rust has kept specialization unstable for over a decade due to repeated soundness holes. Without specialization, adding a new impl to a library can never silently change which impl is selected for existing code -- it can only cause a new overlap error, which is loud and fixable. Each (Trait, Type) pair has exactly one impl.
 
 **Workarounds for specialized behavior:** Use a helper trait to dispatch on the element type, or use the newtype pattern to create a distinct type with its own impl.
 
@@ -3062,9 +3057,9 @@ impl[T] Show for Box[T] { ... }          // OK -- T binds the receiver's type ar
 
 This is the mirror image of the W0604 gate (§3.4 *Explicit Type Application*), and the two are consistent rather than contradictory. There, a bound *is* an occurrence, because a generic function's binder can be supplied by an explicit type argument and the bound decides which arguments are accepted. Here there is no supply site at all: impl selection admits no type-argument list, so no use site could ever repair the declaration. That distinction — between *constraining* a type parameter and *determining* it — is what makes a declaration-site **error** the right severity for an impl binder and a **warning** the right severity for a function binder. A declaration is rejected outright only when no use site could ever repair it; where a use site can, the diagnostic goes to the use site and the declaration gets a lint.
 
-**Compilation model: monomorphization.** Each distinct instantiation referenced in the program (`List[Int]`, `List[Str]`, `List[User]`, etc.) compiles to a separate function. The compiler substitutes the concrete type for `T` before codegen, so each instantiation has type-appropriate storage and method dispatch baked in. The linker's dead-code stripping (`--gc-sections`) removes instantiations the final binary does not call. Stdlib monomorphizations live in the stdlib archive's `monolith.o`; user-code monomorphizations live as `static inline` in each `.o` that instantiates them. See [generic-mono-ownership-per-module](../decisions/generic-mono-ownership-per-module.md) for the storage rules.
+**Instantiations.** Each distinct instantiation (`List[Int]`, `List[Str]`, `List[User]`, etc.) is a distinct type.
 
-**No runtime type information.** Blink exposes no `size_of[T]`, `is_pointer_kind[T]`, `TypeRepr[T]`, `align_of[T]`, or `TypeId[T]` forms — neither to user code nor as `@compiler_internal` primitives. The compiler decides layout and dispatch entirely at codegen time. Stdlib needs that require a layout query at the C level route through `@ffi` to a runtime C helper, not through a Blink intrinsic.
+**No runtime type information.** Blink exposes no `size_of[T]`, `is_pointer_kind[T]`, `TypeRepr[T]`, `align_of[T]`, or `TypeId[T]` forms — neither to user code nor as `@compiler_internal` primitives.
 
 **Parametricity (normative).** Any generic body (a generic function, a polymorphic impl, or a trait default body) must be **parametric in its type parameters**. The body may not:
 
@@ -3073,7 +3068,7 @@ This is the mirror image of the W0604 gate (§3.4 *Explicit Type Application*), 
 - **Call any function that exposes `T`'s runtime shape.** This rules out reading `T` from any reflective API.
 - **Read or write a field of `T`.** A type parameter declares no fields, and a bound adds only methods: `error[NoSuchField]` (E0525).
 
-The **only legal way** for a polymorphic impl body to vary behavior based on `T` is to introduce a trait bound and call a method on that bound. `(x: T).display()` is permitted when `T: Display` — it is dispatched at monomorphization time and resolves to the bound type's `Display` impl, not to a runtime type check.
+The **only legal way** for a polymorphic impl body to vary behavior based on `T` is to introduce a trait bound and call a method on that bound. `(x: T).display()` is permitted when `T: Display` — it resolves to the bound type's `Display` impl.
 
 ```blink
 // Allowed: behavior varies via trait bound, not via T's identity
@@ -3111,7 +3106,7 @@ error[E0701]: cannot inspect type parameter T
      `where T: Eq` and call `(t: T).eq(other)` instead
 ```
 
-**Why parametricity is normative, not just mechanical.** Monomorphization removes `T` before codegen, so a violation can't physically reach the C output. But parametricity is the *language guarantee* user code is allowed to assume about `T`, not just a consequence of how today's backend lowers generics. Spec-level enforcement preserves the compiler's freedom to change builtin layouts (e.g., niche-filled `Option[Int]`, future tagged-union changes), to add alternate backends (a `blink check` interpreter, JIT, or alternate linkage), or to evolve monomorphization strategy — none of which can silently weaken what user code is permitted to do. Without the spec rule, the first `@trusted` block or FFI shim that peeks at `T`'s lowered representation has no principled rejection, and every layout decision becomes a backward-compatibility commitment by accident.
+**Why parametricity is normative.** Parametricity is the *language guarantee* user code is allowed to assume about `T`. User code may rely on the bounds of `T` and on nothing else. Without the rule, the first `@trusted` block or FFI shim that peeks at `T` has no principled rejection.
 
 **Interaction with coherence.** Polymorphic impls follow the same orphan, overlap, and placement rules as concrete impls. `impl[T] Trait for BuiltinGeneric[T] where T: Bound` and `impl Trait for BuiltinGeneric[Int]` overlap (because `Int` satisfies any reasonable `Bound`), and the program is rejected with `error[OverlappingImpls]` — Blink does not specialize. See [Trait Coherence](#trait-coherence) above for the full rules. See [polymorphic-builtin-generic-impls](../decisions/polymorphic-builtin-generic-impls.md) for the panel rationale.
 
@@ -3126,7 +3121,7 @@ Certain traits have special meaning to the compiler. They are defined in the sta
 | `Eq` | Enables `==` and `!=` operators. `@derive(Eq)` auto-generates structural equality. |
 | `Ord` | Enables `<`, `>`, `<=`, `>=` and `cmp`. Requires `Eq`. |
 | `Hash` | Enables use as `Map` key or `Set` element. Requires `Eq`. |
-| `Clone` | Logical copy. `@derive(Clone)` auto-generates field-wise value copy (GC pointer copy, not recursive clone). |
+| `Clone` | Logical copy. `@derive(Clone)` auto-generates the same value as a copy on bind (§3.6.1 *Clone Semantics*). |
 | `Debug` | Developer-facing structural representation. `@derive(Debug)` auto-generates `"TypeName { field: {field.debug()} }"` format. |
 | `Display` | Enables string interpolation (`"{value}"`). |
 | `Add` | Enables `+` operator. Sealed to numeric types. |
@@ -3150,7 +3145,7 @@ trait Closeable {
 }
 ```
 
-A type implementing `Closeable` holds resources (file handles, sockets, locks, database cursors) that must be released deterministically — not when the GC gets around to it, but at a specific point in the program. The `with...as` construct (section 2.18, section 5.5) guarantees `close()` is called on all exit paths.
+A type implementing `Closeable` holds resources (file handles, sockets, locks, database cursors) that must be released deterministically — not at some later, unspecified time, but at a specific point in the program. The `with...as` construct (section 2.18, section 5.5) guarantees `close()` is called on all exit paths.
 
 ```blink
 type FileHandle {
@@ -3192,9 +3187,9 @@ For reference, the eight derivable traits and their required methods:
 
 - **Value types** (`Int`, `Float`, `Bool`, `Char`, `Str`): a copy of the value. A `Str` cannot change, so no program can see whether a copy shares its bytes.
 - **`List`, `Map`, `Set` and other shared cells** (§3.6 *Shared cells*): the clone refers to the same cell. A change made through the clone **does** show in the original — the same as JS spread (`{...obj}`) or Python `copy.copy()`.
-- **User structs and enums**: `x.clone()` gives the same value as `let y = x`. Each field is copied by its declared type, using the rules above. A field whose declared type is a struct or enum is a value, and its copy is a value too, even when the compiler stores that field out of line (for example, a payload of the enum's own type, §3.4 *Recursive Types*). No program can see whether such storage is shared, because a payload field is not a place (§2.22 *Assignment places*). The compiler may share it.
+- **User structs and enums**: `x.clone()` gives the same value as `let y = x`. Each field is copied by its declared type, using the rules above. A field whose declared type is a struct or enum is a value, and its copy is a value too (for example, a payload of the enum's own type, §3.4 *Recursive Types*).
 
-**Shared storage stays out of places.** Storage the compiler shares between values is never inside a place (§2.22). A feature that would put it inside one must copy that storage before the write, or reject the write.
+**A write to a place stays in its value.** A write to a place (§2.22) changes only the value that owns that place, even when that value is a copy of another value. Only a shared cell (§3.6 *Shared cells*) can change through a second name.
 
 > **Note (not normative).** Today a derived `clone()` of a struct or enum is one value copy and does not allocate.
 
@@ -3330,7 +3325,7 @@ trait Display {
 }
 ```
 
-**`fmt` (push, required).** Pushes the rendered representation into a caller-provided `StringBuilder`. Recursive impls call `child.fmt(sb)` into the *same* builder, giving O(n) composition with no intermediate allocations:
+**`fmt` (push, required).** Pushes the rendered representation into a caller-provided `StringBuilder`. Recursive impls call `child.fmt(sb)` into the *same* builder, giving O(n) composition:
 
 ```blink
 @derive(Display)
@@ -3381,13 +3376,13 @@ error[SealedMethodOverride]: cannot override sealed method `display`
 
 **Three call shapes, one impl.** Every `T: Display` is consumable three ways, all routing through `fmt`:
 
-| Shape | Lowering | When to use |
-|-------|----------|-------------|
-| `"{x}"` interpolation | `x.fmt(sb_internal)` | Building a Str literal |
-| `x.display()` | `let sb = ...; x.fmt(sb); sb.to_str()` | Need a Str directly |
-| `sb.write(x)` | `x.fmt(sb)` | Building into a builder you already own |
+| Shape | When to use |
+|-------|-------------|
+| `"{x}"` interpolation | Building a Str literal |
+| `x.display()` | Need a Str directly |
+| `sb.write(x)` | Building into a builder you already own |
 
-The interpolation lowering (built-in fast-path optimization aside) and the `display` derivation share the same call: `x.fmt(sb)`. They cannot disagree.
+All three call `x.fmt(sb)`. They cannot disagree.
 
 **`fmt` has no effect row.** `Display.fmt` declares no `!`, and that empty row is its contract. A function with no `!` performs no side effects (§4.1), and no impl may widen a trait method's row (§3.6 *Effect-row subtype for trait impls*). So no `fmt` impl can perform IO or use any other capability, and `"{x}"`, `x.display()` and `sb.write(x)` never need an effect or a handler in scope. An impl whose `fmt` declares an effect is rejected with `TraitContractEffectMismatch` (E0904). Writing into the supplied `sb` is not an effect: it mutates a parameter, which neither the effect row nor mutation analysis tracks (§4.16.2). Access to module-level `let mut` bindings is governed by §4.16, not by the effect row. There is no `StringBuilderPure` effect; `fmt(self, sb: StringBuilder) ! StringBuilderPure` names an undeclared effect.
 
@@ -3410,7 +3405,7 @@ error[E0523]: type `Matrix` does not implement `Display`
 
 Built-in types (`Int`, `Float`, `Bool`, `Str`, `Char`) have compiler-provided `Display` implementations. User types require `@derive(Display)` or a manual `impl Display for T` block. There is no fallback to `Debug` and no auto-synthesis — the trait bound is checked like any other.
 
-**The intrinsic seam.** These five impls are prelude impls whose `fmt` body the compiler provides. They are the only `fmt` bodies that do not call `sb.write`, and the list is closed: every other `Display` impl, including every derived one, writes through `sb.write`, `sb.write_char` or a child's `fmt`. `Str.fmt` appends the receiver's bytes to the builder directly; it does not call `sb.write`, so `sb.write(s)` for a `Str` lowers to `s.fmt(sb)` and stops there. `Str.display()` returns a `Str` equal to the receiver. (Implementation note: the compiler-provided impl may return the receiver without a copy.)
+**Built-in `Display` impls.** The five impls for `Str`, `Int`, `Float`, `Bool` and `Char` are built in, and the list is closed: every other `Display` impl, including every derived one, writes through `sb.write`, `sb.write_char` or a child's `fmt`. `Str.fmt` appends the receiver's bytes to the builder. `Str.display()` returns a `Str` equal to the receiver.
 
 **A scalar renders to `Str` only through `Display`.** To get a `Str` from an `Int`, `Float` or `Bool`, write `"{x}"` when the value is part of a larger string, and `x.display()` when you need the `Str` value alone. These types have no `to_str` and no `to_string` method. Rendering is not a conversion: a scalar has a `to_` method only as sugar over a `From` or `TryFrom` impl (§3c.3), and no `From[Int] for Str`, `From[Float] for Str` or `From[Bool] for Str` exists. `Char` has `to_str` because `From[Char] for Str` exists (§3c.3 *Char → Str*).
 
@@ -3448,16 +3443,9 @@ error[E0523]: type `Matrix` does not implement `Display`
 
 A `Raw[T]` argument is the one exception: it reports `RawOutsideTemplate` (§3b.5 *`Raw(expr)` — The Escape Hatch*), not E0523.
 
-**Desugaring: two-phase (check + optimize).** The compiler processes string interpolation in two phases:
+**Typing rule.** The compiler checks `T: Display` for every `{expr}`. This is a standard trait bound check — identical to requiring `T: Eq` for equality comparison.
 
-1. **Type check phase:** Verify `T: Display` for every `{expr}`. This is a standard trait bound check — identical to requiring `T: Eq` for equality comparison.
-
-2. **Codegen phase:** Optimize based on type knowledge:
-   - **Built-in types** (`Int`, `Float`, `Bool`, `Char`): emit direct format specifiers (`%d`, `%f`, `%s`, etc. in C backend). No function call overhead.
-   - **`Str`**: emit direct string concatenation. No conversion needed.
-   - **User types**: emit `expr.fmt(sb_internal)` — a direct push into the interpolation's internal `StringBuilder`. No intermediate `Str` allocation per interpolation slot, even for deeply nested types.
-
-Example desugaring:
+Example:
 
 ```blink
 let name = "Alice"
@@ -3465,8 +3453,6 @@ let age = 30
 let msg = "hello {name}, you are {age} years old"
 
 // Type check: Str: Display ✓, Int: Display ✓
-// Codegen (conceptual C):
-//   snprintf(buf, ..., "hello %s, you are %d years old", name, age)
 ```
 
 ```blink
@@ -3477,14 +3463,8 @@ let p = Point { x: 1.0, y: 2.5 }
 let msg = "at {p}"
 
 // Type check: Point: Display ✓ (via @derive)
-// Codegen (conceptual C):
-//   StringBuilder sb = sb_new();
-//   sb_write_str(sb, "at ");
-//   Display_fmt_Point(p, sb);     // pushes "Point { x: 1.0, y: 2.5 }" into sb
-//   Str msg = sb_to_str(sb);
+// msg is "at Point { x: 1.0, y: 2.5 }"
 ```
-
-The two-phase approach preserves the semantic guarantee (every interpolated type has a Display impl) while allowing the C backend to use efficient format specifiers for built-in types. This matches the current compiler's existing snprintf-based codegen.
 
 **Template[C] context: Display not invoked.** In `Template[C]` typed strings (§3b.5), interpolation has different semantics — `{expr}` is decomposed into the `values` list as a typed value, not concatenated via Display. Display is **not** invoked in Template context:
 
@@ -3544,7 +3524,7 @@ Per-trait product type rules:
 |-------|---------------|
 | `Eq` | `self.f1.eq(other.f1) && self.f2.eq(other.f2) && ...` |
 | `Ord` | Lexicographic: compare `f1`, if `Equal` compare `f2`, ... |
-| `Hash` | Combine field hashes with mixing: `hash(f1) ^ hash(f2) ^ ...` |
+| `Hash` | Hash of all fields; equal values give equal hashes |
 | `Clone` | `Type { f1: self.f1, f2: self.f2, ... }`: the same value as a copy on bind (§3.6.1 *Clone Semantics*) |
 | `Display` | `fmt`: `sb.write(self.f1); sb.write(", "); sb.write(self.f2); ...` (comma-separated, push-style) |
 | `Debug` | `"TypeName { f1: {f1.debug()}, f2: {f2.debug()}, ... }"` |
@@ -3592,7 +3572,7 @@ Per-trait sum type rules:
 |-------|---------------|
 | `Eq` | Match variant pairs; field-wise eq within same variant; `_ => false` for mismatched variants |
 | `Ord` | Compare variant index first; if same variant, field-wise lexicographic comparison |
-| `Hash` | Hash variant index, then hash fields of data-carrying variants |
+| `Hash` | Hash of the variant and the fields of data-carrying variants; equal values give equal hashes |
 | `Clone` | The same value as a copy on bind (§3.6.1 *Clone Semantics*) |
 | `Display` | Variant name for unit variants; `"Variant(f1, f2)"` for data-carrying. Exception: a Str-backed enum writes its backing literal, so the output equals `to_str()` (§3.4 *Str-Backed Enums*) |
 | `Debug` | `"Variant"` for unit variants; `"Variant({f1.debug()}, {f2.debug()})"` for data-carrying |
@@ -3659,8 +3639,7 @@ field): a `Map` whose **key** type is itself a container (`Map[List[Int], V]`, `
 etc.), and for the same reason a `Set` whose **element** type is a container. Map keys and set
 elements must be a scalar (`Str` / `Char` / `Int` / `Bool` / sized-int) or a struct that implements
 `Debug`, `Hash` and `Eq`. (Container-typed map *values* render fine; only container keys and set
-elements are excluded, because the renderer reads them back through the key-ops storage layer, which
-has no descriptor for a container key.) Outside a derive, the same shape fails a `T: Debug` bound
+elements are excluded.) Outside a derive, the same shape fails a `T: Debug` bound
 with `E0306`, and the note names the container key type.
 
 `Set` and `Result` were excluded from `Debug` until the assertion bound changed from `Display` to
@@ -3691,12 +3670,9 @@ type Deep { m: Map[Str, List[Int]] }     // => "Deep { m: {\"a\": [1, 2]} }"
 type Maybe { xs: Option[List[Int]] }     // Some([1, 2]) => "Maybe { xs: Some([1, 2]) }"
 ```
 
-The rule is fully inductive in both the **typecheck** and the **emitter**. The typechecker recurses
-to prove every nested element / key / value type is `Debug` (rejecting non-Debug types and
-container map keys or set elements at any level). The emitter materializes one recursive per-monomorphization
-`debug()` function per distinct nested container shape (mirroring the arena-promotion descriptor
-walker); these functions call each other, so an arbitrarily deep type renders through a chain of
-composed calls with the no-silent-fallback invariant preserved at every level. See
+The rule is fully inductive. The typechecker recurses to prove every nested element / key / value
+type is `Debug` (rejecting non-Debug types and container map keys or set elements at any level).
+There is no depth cap, so an arbitrarily deep type renders, with no silent fallback at any level. See
 [Container Debug rendering](../decisions/debug-container-rendering.md) for the full deliberation.
 
 **Enum-variant fields.** Container Debug applies to struct fields **and** enum-variant fields alike;
@@ -3773,8 +3749,6 @@ Debug Rendering* above.
 #### §3.6.2 Serialization Traits
 
 Blink provides compiler-known `Serialize` and `Deserialize` traits for JSON serialization. These are Tier 1 (ship with the compiler) and derivable via `@derive`.
-
-> **Spec-only.** The compiler does not build `JsonValue` or `JsonError` yet, so this section describes the language, not the current compiler. Today a derived `to_json` returns JSON text as `Str`, and a derived `from_json` takes a `Str` and returns `Result[Self, Str]`. That Str surface is not part of the language: it becomes `json.encode` and `json.decode[T]` (§3.6.3). Built today: `@derive(Serialize, Deserialize)` on structs and enums (with the Str signatures), and Str-backed enums (§3.4). Each part of this note goes when the compiler builds that part.
 
 ##### Trait Declarations
 
@@ -3955,9 +3929,7 @@ The code, the trigger, the named replacements and the fix are part of the langua
 
 The `std.json` module provides the public API for JSON parsing, serialization, and typed deserialization. All functions are pure — IO effects belong to the caller.
 
-> **Spec-only.** The compiler does not build this module surface yet: none of `parse`, `stringify`, `pretty`, `decode`, `encode` or the `JsonValue` methods exist. Today `lib/std/json.bl` ships an integer-handle API (`json_parse`, `json_get`, `json_serialize`, `json_clear` and others). That API is not part of the language. It leaves the public surface in the release where `JsonValue` lands. Each part of this note goes when the compiler builds that part.
-
-`std.json` keeps no global shared mutable state. A `JsonValue` is an ordinary value, and no call changes or frees a value that another caller holds. This also holds for any private store or cache behind the module.
+`std.json` keeps no global shared mutable state. A `JsonValue` is an ordinary value, and no call changes or frees a value that another caller holds.
 
 ##### Module API
 
@@ -3999,8 +3971,6 @@ The spec defines `json.encode` and `json.decode[T]` by their results, not by how
   ```
 
 "Equal" includes every `JsonError` field: the same `path` and the same `message` text. Both paths accept the same inputs, give the same `Ok` values, and follow the number rules and the first-match key rule of §3.6.2.
-
-An implementation may fuse the two steps into a reader or writer per type that builds no `JsonValue` tree. Only derived impls may fuse. When a field's type has a hand-written `Deserialize`, the fused reader parses that field's part of the input into a `JsonValue` and calls that type's `from_json`.
 
 ##### Dynamic Navigation (JsonValue Methods)
 
@@ -4262,7 +4232,7 @@ error[TupleArityExceeded]: tuple arity exceeds maximum
   = help: use a named struct for data with more than 6 fields
 ```
 
-**Why cap at 6.** Tuples are anonymous — elements have no names, only positions. Beyond 3-4 elements, positional access (`.4`, `.5`) becomes unreadable and error-prone. A cap at 6 provides headroom for real use cases (coordinate triples, tagged pairs, iterator adapters) while pushing complex data toward named structs where field names carry semantic information. The cap also bounds the compiler's trait impl generation to a small fixed set of arities.
+**Why cap at 6.** Tuples are anonymous — elements have no names, only positions. Beyond 3-4 elements, positional access (`.4`, `.5`) becomes unreadable and error-prone. A cap at 6 provides headroom for real use cases (coordinate triples, tagged pairs, iterator adapters) while pushing complex data toward named structs where field names carry semantic information.
 
 #### Element Access
 
@@ -4324,7 +4294,7 @@ The compiler automatically implements traits for tuple types when all element ty
 |-------|----------|-------------|
 | `Eq` | Element-wise `==`. `(a0, a1) == (b0, b1)` iff `a0 == b0 && a1 == b1` | All elements: `Eq` |
 | `Ord` | Lexicographic. Compare `.0` first; if equal, compare `.1`; etc. | All elements: `Ord` |
-| `Hash` | Combine element hashes | All elements: `Hash` |
+| `Hash` | Hash of all elements; equal tuples give equal hashes | All elements: `Hash` |
 | `Display` | `"(a, b, c)"` format | All elements: `Display` |
 | `Debug` | `"(a, b, c)"` format, each element via its own `.debug()` | All elements: `Debug` |
 | `Clone` | Element-wise clone | All elements: `Clone` |
