@@ -2513,7 +2513,7 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | `@alt("ID", "desc")` | fn | Marks an alternative implementation. | Tooling (`blink alt list`, `blink alt select`) |
 | `@verify(strategy)` | fn | Hints to the static checker about verification strategy. | Static checker |
 | `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time derivation |
-| `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `blink.toml` `[lints]` config. See §4.16.8. | Compiler diagnostic filter |
+| `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `blink.toml` `[lints]` config. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842). See §4.16.8. | Compiler diagnostic filter |
 | `@deprecated(since, removal, replacement, fix)` | fn, type | Edition-aware deprecation with structured migration. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). Emits W2000 when current edition < `removal`, E2001 when current edition >= `removal`. Machine-applicable fixes in structured diagnostics when `fix` is `"replace"` or `"inline"`. See §8.16.2. | Compiler warning/error (edition-gated) |
 
 #### Canonical Ordering

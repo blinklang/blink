@@ -24,8 +24,13 @@ error[NonExhaustiveMatch]: non-exhaustive match
 
 - **Names** are PascalCase, stable API. Once published, a name is frozen — never renamed, never reassigned.
 - **Codes** are secondary comblink identifiers (E/W/V + 4 digits). Codes are never reused after retirement.
-- **Suppression** uses names: `@allow(NonExhaustiveMatch)`.
-- **`blink explain <name>`** prints a detailed explanation (future — not yet implemented).
+- **Suppression** uses names: `@allow(NonExhaustiveMatch)`. `@allow` takes names only.
+- **Each `@allow` argument and each `[lints]` key must identify a live diagnostic** — one listed under *Error Names* or *Warning Names*, not under *Retired Codes*. Any other argument or key is the error `UnknownDiagnosticName` (E0842): a misspelled name, a retired name or code, or a code given to `@allow`. No `@allow` or `[lints]` entry suppresses E0842 or changes its severity. The compiler reports each such argument and key, not only the first. An audit-gated name is `AuditGatedSuppression` (E0837), not E0842.
+  - **Retired name or code:** the `help:` line says to remove the argument or key. A `note:` lists the *Replaced by* cell of its *Retired Codes* row as information only. The help never proposes a replacement as an `@allow` argument.
+  - **Code given to `@allow`:** the `help:` line names the live diagnostic that has that code.
+  - **Any other string:** the compiler compares it with the live names after it ignores case, `_` and `-`. If exactly one live name is nearest, and it is near enough, the `help:` line names it. A retired name or a code is never suggested. If two or more live names are equally near, or no live name is near enough, there is no suggestion. The implementation sets how near is near enough. For one compiler version, the same input gives the same suggestion in the compiler, the language server and `blink explain`.
+  - No two live names are equal when case, `_` and `-` are ignored.
+- **`blink explain <name-or-code>`** prints a detailed explanation of a live diagnostic and exits 0. For a retired name or code, the first line says it is retired, the output shows the same *Replaced by* list as the E0842 note, and the exit status is 0. For any other string, it prints `no diagnostic named <string>`, a suggestion by the rule above if there is one, and exits with a non-zero status.
 - **Every entry in this catalog is bound by the three rules in §3.1 *Diagnostic Discipline*:** a diagnostic never prescribes a repair that does not exist, no rule is enforced only at codegen, and diagnostics firing at one program point must converge on a repair the first `help:` names.
 
 ---
@@ -154,6 +159,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AuditRecordUnknownKey | E0830 | A record in `audits.toml` holds a key other than `claim` and `pins`. The message names the allowed keys and the nearest one | FFI | §9.1 |
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
+| UnknownDiagnosticName | E0842 | An `@allow` argument or `[lints]` key that does not identify a live diagnostic: a misspelled name, a retired name or code, or a code given to `@allow`. Refused, not ignored. No `@allow` or `[lints]` entry suppresses it. The `help:` line removes a retired entry, names the diagnostic for a code, or suggests the one nearest live name (see *Conventions*) | Linting | §4.16.8 |
 | FfiOffsetUnknownStride | E0838 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
 | NonHandlerWithItem | E0839 | A `with` item without `as` is neither a `Handler[E]` nor a `BlockHandler` | Effects | §4.7 |
 | TraitContractMissingMethod | E0900 | Trait contract: required method not implemented | Trait contract | §3.6 |
@@ -235,7 +241,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 
 ## Retired Codes
 
-A retired code and its name are never reused (see *Conventions*). `blink explain` on a retired name or code says it is retired and names the codes that replace it. A Code cell of "—" means this catalog published the name, but no compiler ever emitted it under a code.
+A retired code and its name are never reused (see *Conventions*). `blink explain` on a retired name or code says it is retired and names the codes that replace it. Naming one in `@allow` or as a `[lints]` key is `UnknownDiagnosticName` (E0842). A Code cell of "—" means this catalog published the name, but no compiler ever emitted it under a code.
 
 | Name | Code | Retired because | Replaced by |
 |------|------|-----------------|-------------|
