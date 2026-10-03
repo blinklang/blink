@@ -37,7 +37,7 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 
 | Task | What it does | Fails when |
 | --- | --- | --- |
-| `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `test-corpus`, `commit-messages`, `test-commit-messages`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `typecheck-suite`, `rewrite-suite`. | Any step fails. |
+| `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `test-corpus`, `commit-messages`, `test-commit-messages`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `suites-in-corpus`. | Any step fails. |
 | `task gen1` | gen0 compiles `src/blinkc_main.bl` and `src/cli.bl`, then links `build/gen1/bin/blinkc` and `build/gen1/bin/blink`. | Nonzero exit, an `error[` line, or a link error. |
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen1. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
 | `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. | The pass count drops, or a file that passed no longer passes. |
@@ -48,6 +48,7 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 | `task commit-messages` | Runs `scripts/lint_commit_messages.sh` over `main..HEAD`, or over `HEAD^..HEAD` when HEAD is on main, so the main gate checks a merge message and every commit it brought. It matches every token that `br` lists as a ticket or project id. Without `br` it checks only the forms `br <id>`, `ticket: <id>` and `#<id>`, and says so. | A message names a br id. |
 | `task test-lint` | Runs `scripts/test_lint_codegen.sh`: each row goes red on a fixture. | A row does not catch its construct. |
 | `task ratchet` | Debt counts over the whole compiler (see below), then the lint. | A count rises, on the tip or on any commit of the branch, or a zero-gate row is not zero. |
+| `task suites-in-corpus` | Reads `build/corpus.json` and requires every file of the typecheck and rewrite suites to be there with status `pass`. The corpus runs each of them under gen1, so `task ci` uses this check in place of the gen0 suite runs; `task ci-fast` still runs the suites. | A suite file is missing or did not pass, a suite selects no file, or the JSON is not from gen1 at this commit and blinkc hash. |
 | `task typecheck-suite` | Runs the files in `scripts/typecheck_suite.txt` under gen0. They assert typechecker behaviour by RUNNING, so they need a compiler that can emit; under gen0 the suite measures gen0's typechecker, not this tree's. | Any file does not pass. |
 | `task rewrite-suite` | Runs every rewrite unit-test file under gen0: `tests/test_cg_*.bl`, `test_layout_*.bl`, `test_cname_*.bl`, `test_ir_*.bl`, minus `scripts/rewrite_suite_exclude.txt`. Writes `build/rewrite_suite.json`. | Any file does not pass, a prelude root is missing, one of the four prefixes matches no file, the exclude file is gone, or an exclude line names a file that does not exist or that the glob does not select. |
 | `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke. `mono-diff`, `node-tid-diff` and `test-node-tid-diff` are parked: still tasks, no longer in any gate. | Any step fails. |
