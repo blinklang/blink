@@ -22,6 +22,18 @@ fn sodium_secretbox(
 
 The `@ffi("library", "symbol")` annotation names the shared library and the symbol to link. The compiler does not type-check the foreign function's body — it does not have one. The signature is the developer's claim about what the foreign function expects and returns.
 
+The library argument is a key of `[native-dependencies]` in `blink.toml`, or one of the two runtime libraries: `"c"` (the C library) and `"m"` (the math library). The runtime libraries need no manifest entry (§9.1.2, *Runtime libraries*).
+
+**One-argument form.** `@ffi("symbol")` binds a symbol from the runtime libraries `c` and `m`. It needs no `[native-dependencies]` entry and adds no link flag. An optional `header:` argument names the C header that declares the symbol, and it has the same meaning in both forms:
+
+```blink
+@ffi("cos", header: "math.h")
+@trusted(audit: "LIBM-COS")
+fn c_cos(x: Float) -> Float ! ()
+```
+
+Outside `lib/std`, prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library.
+
 #### The Effect Row — Declared by the Author
 
 Because the compiler cannot analyze foreign code, the author **must** write the effect row of an `@ffi` function. It uses the same `!` syntax as every other function (§4.2). The compiler assumes this row — it cannot verify it. This is the one place in Blink where an effect row is not compiler-proven (§4.5, *Proven and assumed rows*).
@@ -38,18 +50,18 @@ The declared row is an **accounting** claim, not routing. It says which capabili
 
 ```blink
 effect Clock {
-    fn now_ms() -> Int
+    fn cpu_ticks() -> Int
 }
 
-@ffi("c", "blink_clock_ms")
+@ffi("c", "clock")
 @trusted(audit: "TIME-001")
-fn raw_clock_ms() -> Int ! Time.Read
+fn raw_clock() -> Int ! Time.Read
 
 // The real implementation calls C; a test installs its own `handler Clock`.
 pub fn real_clock() -> Handler[Clock] {
     handler Clock {
-        fn now_ms() -> Int {
-            raw_clock_ms()
+        fn cpu_ticks() -> Int {
+            raw_clock()
         }
     }
 }
@@ -351,7 +363,7 @@ The `ffi` namespace and the FFI pointer types are **compiler-known intrinsics**,
 **The two real gates.** The unsafe FFI surface is gated twice, and these are the *only* gates:
 
 1. **`PtrOutsideFFI` (E0811)** — a `Ptr[T]` may appear only inside an **FFI region**: the body of an `@ffi`/`@trusted` function, or a `with ffi.scope() as _ { }` block (the canonical region list lives with *Pointer Operations*, E0811, below). This is a per-function capability gate on *where* pointer types are allowed, checked structurally regardless of imports.
-2. **`#275` native-dependency manifest** — an `@ffi` declaration without a matching `[native-dependencies]` entry in `blink.toml` is a compile error (§10.5.4).
+2. **`#275` native-dependency manifest** — an `@ffi` declaration that names a library with no matching `[native-dependencies]` entry in `blink.toml` is a compile error. The runtime libraries `c` and `m` need no entry (§9.1.2).
 
 There is **no import gate** on FFI. A per-file `import blink.ffi` requirement would be strictly weaker than `rg '@ffi'` and would make `import` a capability boundary it is nowhere else in the language. See [FFI import namespace resolution](../decisions/ffi-import-namespace-resolution.md).
 
@@ -372,7 +384,7 @@ This import is **optional** — a documentation marker, not a requirement. `Ptr[
 fn raw_sqlite3_exec(db: Ptr[Void], sql: Ptr[U8]) -> Int
 
 // A C function that can return NULL — test the result with .is_null()
-@ffi("libc", "getenv")
+@ffi("c", "getenv")
 @trusted(audit: "ENV-001")
 fn raw_getenv(name: Ptr[U8]) -> Ptr[U8] ! Env
 ```
@@ -750,11 +762,13 @@ Native C dependencies fall into two categories:
 
 **User-managed** dependencies are C libraries bound via `@ffi`. The user is responsible for declaring how to resolve them. The compiler cannot know what arbitrary C libraries a project needs.
 
-The boundary is crisp: if the API is behind a Blink effect handle (`db.*`, `net.*`, `io.*`), the compiler manages its native deps. If it's raw `@ffi`, the user manages it.
+The boundary is crisp: if the API is behind a Blink effect handle (`db.*`, `net.*`, `io.*`), the compiler manages its native deps. If it's raw `@ffi`, the user manages it, except for the runtime libraries `c` and `m`, which every program links (*Runtime libraries*, below).
 
 #### `[native-dependencies]` in `blink.toml`
 
-User `@ffi` bindings require a corresponding entry in the `[native-dependencies]` section of `blink.toml`. An `@ffi` annotation referencing a library not declared in `[native-dependencies]` is a compile error.
+User `@ffi` bindings require a corresponding entry in the `[native-dependencies]` section of `blink.toml`. An `@ffi` annotation that names a library not declared in `[native-dependencies]` is a compile error (E0820). The two runtime libraries `c` and `m` are the only exception (*Runtime libraries*, below).
+
+A program with no `blink.toml` gets the same check as a manifest with an empty `[native-dependencies]` section. It can bind `c` and `m`; any other library is E0820, and the help tells the user to create `blink.toml`.
 
 ```toml
 [native-dependencies]
@@ -791,6 +805,62 @@ error[E0820]: @ffi references undeclared native dependency
   = help:   libsodium = { type = "system" }
 ```
 
+When the program has no `blink.toml`, the help shows a complete file to create, not a section to add:
+
+```
+  = help: create blink.toml (`blink init` writes one), with:
+  = help:   [package]
+  = help:   name = "sodium_demo"
+  = help:   version = "0.1.0"
+  = help:
+  = help:   [native-dependencies]
+  = help:   libsodium = { type = "system" }
+```
+
+#### Runtime libraries
+
+The runtime row of the *Compiler-Managed Dependency List* (below) names libc and libm. Every Blink program links them, so the compiler manages them. In `@ffi` they have exactly one name each: `"c"` for libc and `"m"` for libm. That row is the whole set: no other library is implicit (pthreads, sqlite3 and POSIX sockets are not), and the set changes only by spec revision.
+
+- `@ffi("c", ...)` and `@ffi("m", ...)` need no `[native-dependencies]` entry, and they add no link flag. The one-argument form `@ffi("symbol")` binds from the same two libraries (§9.1).
+- `@ffi("libc", ...)` and `@ffi("libm", ...)` are E0820. The library is not declared, and the fix changes only the library argument to `"c"` or `"m"`. The fix is machine-applicable, and it never changes the symbol argument.
+- A `[native-dependencies]` key that names a runtime library (`c`, `m`, `libc` or `libm`) is a compile error (E0841). The compiler already links that library, so the entry can only add a second copy to the link or be ignored. The diagnostic points at the key in `blink.toml`, and its machine-applicable fix deletes the line.
+
+```blink
+@ffi("c", "getenv")
+@trusted(audit: "ENV-001")
+fn raw_getenv(name: Ptr[U8]) -> Ptr[U8] ! Env
+
+@ffi("m", "cos")
+@trusted(audit: "LIBM-COS")
+fn raw_cos(x: Float) -> Float ! ()
+```
+
+**Diagnostic — runtime library spelled with a `lib` prefix:**
+
+```
+error[E0820]: @ffi references undeclared native dependency
+ --> env.bl:1:1
+  |
+1 | @ffi("libc", "getenv")
+  |      ^^^^^^ library "libc" not in [native-dependencies]
+  |
+  = note: libc is a runtime library; @ffi names it "c"
+  = help: replace "libc" with "c"
+```
+
+**Diagnostic — runtime library declared in the manifest:**
+
+```
+error[E0841]: native dependency names a runtime library
+ --> blink.toml:7:1
+  |
+7 | m = { type = "system" }
+  | ^ "m" is a runtime library; the compiler links it into every program
+  |
+  = note: @ffi("m", ...) needs no [native-dependencies] entry
+  = help: delete this line
+```
+
 #### Linking Strategy
 
 The compiler uses different linking strategies for host and cross-compilation targets:
@@ -823,7 +893,7 @@ The following native C dependencies are compiler-managed. This list is exhaustiv
 |--------|-------------|----------|
 | `db.*` | sqlite3 | Bundled with the toolchain |
 | `net.*` | POSIX sockets | System headers (no library linkage) |
-| runtime | libc, libm | System (always available) |
+| runtime | libc, libm (`@ffi` names: `c`, `m`) | System (always available) |
 | `async.*` | pthreads | System (`-pthread` flag) |
 
 #### Interaction with `blink audit`
