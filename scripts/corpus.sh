@@ -85,8 +85,20 @@ fi
 [ -f build/gc_unity.c ] || ./scripts/gen_gc_unity.sh build/gc_unity.c || exit 2
 
 results="build/corpus/results"
-rm -rf "$results" build/corpus/work
+rm -rf "$results" build/corpus/work build/corpus/native
 mkdir -p "$results" build/corpus
+
+# A file whose program links a vendored native dep compiles that dep's C source
+# into its sandbox .tmp/, and each sandbox starts empty, so the sweep compiled
+# sqlite3 once per such file. Build each object once with the flags `blink build
+# --debug` uses; corpus_one.sh copies it in with its mtime, which is what lets
+# the build skip the compile.
+mkdir -p build/corpus/native
+for d in lib/native/*/; do
+    name=$(basename "$d")
+    [ -f "$d$name.c" ] || continue
+    cc -pipe -g -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" || exit 2
+done
 
 echo "corpus: $total files, compiler $comp, $jobs workers"
 start=$(date +%s)
