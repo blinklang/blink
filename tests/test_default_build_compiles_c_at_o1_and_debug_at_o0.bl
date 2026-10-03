@@ -1,0 +1,73 @@
+// `blink build` and `blink run` with no mode flag compile the user's C at -O1;
+// `--debug` compiles it at -g -O0 and `--release` at -O2. The test puts a `cc` (and a
+// `ccache`, so a host ccache cannot bypass it) first on PATH that logs each argument
+// and then runs the real compiler, so it checks the flags the CLI really passes. The
+// object cache is on, in a directory of the test's own, because a cached object built at
+// one level must not be linked into a build at another.
+
+fn cc_args_for(base: Str, blink_root: Str, real_cc: Str, tag: Str, cmd: Str) -> List[Str] {
+    let log = "{blink_root}/{base}/{tag}.log"
+    shell_exec("rm -f {log}")
+    let line = "cd {base} && PATH={blink_root}/{base}/bin:$PATH BLINK_CACHE_DIR={blink_root}/{base}/objcache BLINK_CC_LOG={log} REAL_CC={real_cc} {blink_root}/build/blink {cmd} 2>&1"
+    let r = process_run("sh", ["-c", line])
+    assert(r.exit_code == 0, "`blink {cmd}` failed:\n{r.out}{r.err_out}")
+    if file_exists(log) == 0 { return [] }
+    let mut args: List[Str] = []
+    for a in read_file(log).lines() { args.push(a) }
+    args
+}
+
+fn setup(base: Str) -> Str {
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}/bin")
+    write_file("{base}/bin/cc", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$BLINK_CC_LOG\"; done\nexec \"$REAL_CC\" \"$@\"\n")
+    write_file("{base}/bin/ccache", "#!/bin/sh\nshift\nexec cc \"$@\"\n")
+    shell_exec("chmod +x {base}/bin/cc {base}/bin/ccache")
+    write_file("{base}/hello.bl", "fn main() ! IO \{\n    io.println(\"hello\")\n}\n")
+    process_run("sh", ["-c", "command -v cc"]).out.trim()
+}
+
+test "the default build and run compile the user's C at -O1" {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let base = ".tmp/_default_build_opt_level"
+    let real_cc = setup(base)
+    for cmd in ["build hello.bl --output hello_default", "run hello.bl"] {
+        let args = cc_args_for(base, blink_root, real_cc, "default", cmd)
+        assert(args.contains("-O1"), "`blink {cmd}` did not pass -O1: {args.join(" ")}")
+        assert(!args.contains("-O0"), "`blink {cmd}` passed -O0: {args.join(" ")}")
+        assert(!args.contains("-O2"), "`blink {cmd}` passed -O2: {args.join(" ")}")
+    }
+    shell_exec("rm -rf {base}")
+}
+
+test "--debug compiles the user's C at -g -O0 and --release at -O2" {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let base = ".tmp/_debug_release_opt_level"
+    let real_cc = setup(base)
+    let debug = cc_args_for(base, blink_root, real_cc, "debug", "build --debug hello.bl --output hello_debug")
+    assert(debug.contains("-O0") && debug.contains("-g"), "--debug did not pass -g -O0: {debug.join(" ")}")
+    assert(!debug.contains("-O1"), "--debug passed -O1: {debug.join(" ")}")
+    let release = cc_args_for(base, blink_root, real_cc, "release", "build --release hello.bl --output hello_release")
+    assert(release.contains("-O2"), "--release did not pass -O2: {release.join(" ")}")
+    assert(!release.contains("-O1") && !release.contains("-O0"), "--release passed a second level: {release.join(" ")}")
+    shell_exec("rm -rf {base}")
+}
+
+test "an object cached at -O0 is not reused by a default build" {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let base = ".tmp/_cached_object_opt_level"
+    let real_cc = setup(base)
+    // One output name for all three builds, because the cache key holds the C file's
+    // path. hello.bl has no debug_assert, so --debug emits the same C, and only the
+    // level differs between the keys.
+    let debug = cc_args_for(base, blink_root, real_cc, "debug", "build --debug hello.bl --output hello")
+    assert(debug.contains("-c") && debug.contains("-O0"), "the --debug build did not compile an object: {debug.join(" ")}")
+    let first = cc_args_for(base, blink_root, real_cc, "first", "build hello.bl --output hello")
+    assert(first.contains("-c") && first.contains("-O1"), "the default build reused the -O0 object: {first.join(" ")}")
+    // A second default build hits the cache, so the miss above came from the level in
+    // the key and not from a cache that never stores.
+    let second = cc_args_for(base, blink_root, real_cc, "second", "build hello.bl --output hello")
+    assert(!second.contains("-c"), "the second default build missed the cache: {second.join(" ")}")
+    assert(second.contains("-O1"), "the second default build linked without -O1: {second.join(" ")}")
+    shell_exec("rm -rf {base}")
+}
