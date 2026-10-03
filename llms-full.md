@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.53.1**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.54.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.53`, `0.53.1` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.54`, `0.54.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -36,7 +36,7 @@ Blink can call C functions via the `@ffi` annotation and `Ptr[T]` type.
 
 ```blink
 @ffi("sqlite3", "sqlite3_open")
-fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int
+fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! FFI
 ```
 
 `@ffi("library", "symbol")` — first arg is library name, second is C symbol name.
@@ -44,25 +44,25 @@ fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int
 ### @trusted Audit Marker
 
 ```blink
-@trusted
+@trusted(audit: "SEC-101")
 @ffi("c", "malloc")
-fn malloc(size: Int) -> Ptr[Int]
+fn malloc(size: Int) -> Ptr[Int] ! FFI
 ```
 
-`@trusted` marks FFI functions as audited for safety.
+`@trusted(audit: "ID")` marks an FFI function as audited for safety. The `audit:` text is required: a bare `@trusted` or an empty `audit:` is `E0836`. The text is free-form (a ticket or review ID). `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead.
 
 ### Ptr[T] Type
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `.deref()` | T | Dereference pointer |
+| `.deref()` | T | Dereference pointer. `T` is the pointee type: `Ptr[U8].deref()` is `U8` |
 | `.addr()` | Int | Get raw address |
-| `.write(val)` | Void | Write value at pointer |
+| `.write(val)` | () | Write value at pointer |
 | `.is_null()` | Bool | Null check |
 | `.to_str()` | Str | Convert to string (for char*) |
 | `.as_cstr()` | Str | Read as C string |
-| `.offset(i)` | Ptr[T] | Advance by `i * sizeof(T)` strides. Only valid for pointers from `scope.alloc_n[T](n)`; rejected (`E0813`) on a singleton `scope.alloc()` |
-| `.field.read()` / `.field.write(v)` | T / Void | Typed field access for `Ptr[@ffi.struct T]` — lowered to direct C field reads/writes |
+| `.offset(i)` | Ptr[T] | Advance by `i * sizeof(T)` strides. Only valid for pointers from `scope.alloc_n[T](n)`; rejected (`E0813`) on a singleton `scope.alloc()`, and `E0838` when the stride is unknown |
+| `.field.read()` / `.field.write(v)` | T / () | Typed field access for `Ptr[@ffi.struct T]` — lowered to direct C field reads/writes |
 
 ### ffi.scope() Resource Management
 
@@ -87,6 +87,21 @@ with ffi.scope() as scope {
 
 A scope-allocated pointer that escapes the block without `.take()` is a compile error (E0601, reused from `Closeable`).
 
+### @ffi.opaque (C handle type)
+
+```blink
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "fopen")
+@trusted(audit: "SEC-103")
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> Option[CFile] ! FFI { }
+```
+
+`@ffi.opaque(header, name)` declares a nominal type for a C handle such as `FILE*` or `sqlite3*`. It lowers to a bare pointer. It has no deref, `==`, fields or arithmetic, and `Option[CFile]` uses `NULL` for `None`. `blink audit --ffi` lists it as `opaque-ffi-handle`. A struct literal whose head is an `@ffi.opaque` type is `E0300`.
+
+`Ptr[T]` accepts only FFI-valid pointee types (`E0810` otherwise, also inside aliases, fields, payloads, closure and trait signatures, and nested `Ptr[Ptr[T]]`). `Bool` is not a valid pointee. A field read through a `Ptr` types only when the pointee is an `@ffi.struct`.
+
 ### @ffi.struct (C struct layout twin)
 
 ```blink
@@ -108,7 +123,7 @@ let b = Bytes.zeroed(64)
 b.with_ptr(fn(p) { libc_memcpy(p, src_ptr, 64) })
 ```
 
-`Bytes.with_ptr(fn(p) { ... })` is the only sanctioned path from a `Bytes` to a `Ptr[U8]`. The closure body pins the buffer; a parser-level no-grow check rejects mutating receiver methods that could relocate the buffer (`E0814` for `push`/`append`/`concat`/`extend`/`clear`/`truncate`/`resize`/`write_*_le/be`), and rejects passing the receiver as an argument (`E0815`). Calling `Bytes.as_ptr()` outside a `with_ptr` closure is rejected with `E0817`.
+`Bytes.with_ptr(fn(p) { ... })` is the only sanctioned path from a `Bytes` to a `Ptr[U8]`. The closure body pins the buffer and may hold statements; a parser-level no-grow check rejects mutating receiver methods that could relocate the buffer (`E0814` for `push`/`append`/`concat`/`extend`/`clear`/`truncate`/`resize`/`write_*_le/be`), and rejects passing the receiver as an argument (`E0815`). Calling `Bytes.as_ptr()` outside a `with_ptr` closure is rejected with `E0817`.
 
 ### blink shim init (third-tier FFI escape hatch)
 
@@ -150,12 +165,14 @@ fn add(a: Int, b: Int) -> Int {
     a + b                        // last expression is return value
 }
 
-fn greet(name: Str) ! IO {       // ! declares effects
-    io.println("Hello, {name}!")
+fn greet(name: Str, -- greeting: Str = "Hello") ! IO {   // ! declares effects
+    io.println("{greeting}, {name}!")
 }
 
-// Keyword arguments
-greet(name: "Alice", greeting: "Hi")
+// Keyword arguments: parameters after `--` must be passed by label.
+// A default must be a constant, and may only follow `--`.
+greet("Alice", greeting: "Hi")
+greet("Bob")                     // greeting gets "Hello"
 
 // Closures
 let double = fn(x: Int) -> Int { x * 2 }
@@ -194,6 +211,9 @@ match args {
 // Control flow
 if x > 0 { "positive" } else { "non-positive" }  // expression
 for item in list { io.println(item) }
+for c in "héy" { io.println("{c}") }      // over a Str: each Unicode scalar value, as a Char
+for x in some_set { io.println("{x}") }   // over a Set
+for (k, v) in some_map { io.println("{k}={v}") }   // over a Map
 while count < 10 { count += 1 }
 loop { if done { break } }
 
@@ -225,9 +245,10 @@ test "addition works" {
 | Str | `"hello"` | Immutable UTF-8 string |
 | Char | `'a'`, `'\n'` | Unicode scalar value (single-quote literal) |
 | Bool | `true`, `false` | Boolean |
-| List[T] | `[1, 2, 3]` | Dynamic array |
-| Map[K, V] | `Map()` | Hash map (construct with `Map()`, not `{}`) |
-| Set[T] | `Set()` | Hash set (construct with `Set()`) |
+| List[T] | `[1, 2, 3]` | Dynamic array. Empty list: `[]` with a type from context, or `List.new[T]()`. All elements of a list literal must have one type. |
+| () | `()` | Unit type: the type of "no value". Write `-> ()`, `Result[(), E]`, `Map[Str, ()]`. `Void` is valid only inside `Ptr[...]` |
+| Map[K, V] | `Map()` | Hash map (construct with `Map()`, `Map.new[K, V]()` or `Map[K, V]()`, not `{}`) |
+| Set[T] | `Set()` | Hash set (construct with `Set()` or `Set.new[T]()`) |
 | Option[T] | `Some(v)`, `None` | Nullable value |
 | Result[T, E] | `Ok(v)`, `Err(e)` | Error-or-value |
 | Ordering | `Less`, `Equal`, `Greater` | Result of `.cmp(other)`; prelude enum auto-imported via `std.traits`. Produced by `@derive(Ord)` and the ordering operators. |
@@ -244,6 +265,22 @@ test "addition works" {
 **Enums are nominally distinct from `Int`.** An enum value is not interchangeable with `Int` at `let` / argument / return positions — passing one where the other is expected is a type error. Convert explicitly with `.to_int()` / `Type.from_int(n)`. (`==` between an enum and its int still works.)
 
 **Transparent newtypes.** A single-variant enum wrapping exactly one `Int` payload (`pub type Errno { Errno(Int) }`) is lowered to a bare `int64_t` in carriers and at FFI boundaries — no box, no tag. It stays nominally distinct in the type system (so `Result[Int, Errno]` can't confuse the count with the errno) while costing nothing at runtime.
+
+### Type Inference and Checking Rules
+
+- **A type that nothing fixes is `E0301 CannotInferType`.** This covers an empty `[]`, a bare `None`, `Map()` or `Set()` that no use types, a `channel.new` whose element type nothing fixes, an unannotated closure parameter that no context types, `for x in []`, and a generic call whose type parameter no argument or return names. Fix it with an annotation (`let xs: List[Int] = []`) or an explicit type argument (`List.new[Int]()`, `Map[Str, Int]()`, `Set.new[Int]()`, `channel.new[Int](buffer: 4)`).
+- **Explicit type arguments at a call:** `pair[Int, Str](1, "a")`, `x.method[T]()`, `mod.f[T]()`. A wrong count is `E0307 CallSiteTypeArgs`. A bare `List` or `Map[Int]` is `E0303 TypeArgArity`.
+- **A type parameter is rigid inside its generic body.** `T` is not `Int`: using it as one is `E0300` at the definition. Arithmetic on `T` needs the trait in the bound (`+` needs `Add`, `-` `Sub`, `*` `Mul`, `/` `Div`, `%` `Rem`, unary `-` `Neg`): `fn add[T: Add](a: T, b: T) -> T { a + b }`.
+- **Bounds and arguments are checked at the call.** `sum("a", "b")` for `fn sum[T: Add]` is `E0306`. Arguments must agree on each type parameter: `pick(1, "a")` is `E0300`.
+- **A fn's tail is checked against its declared return type.** A fn with a return type whose body can end with no value (a `while`, a `for`, or a `loop` that a `break` leaves) is `E0311 MissingReturn`. An `if` with no `else` used as a value is `E0304 MissingElse`.
+- **An undeclared type name is `E0507 UnknownType`.** A user type named `Tuple`, `Fn` or `Self` is `E0524 ReservedTypeName`.
+- **Operators need operands they apply to.** `+ - * / %`, unary `-` and the compound forms on `Bool`, `()`, structs, `Str - Str` or opaque handles are `E0300`.
+- **Indexing `x[0]` works on a `List` only.** Use `.get(i)` on other types, `.insert(k, v)` on a `Map`. A tuple field is `t.0`; `t._0` is rejected. A field that does not exist is `E0525 NoSuchField`.
+- **A mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` is `E0610`.** Use `let mut`.
+- **`for x in <non-iterable>` is `E0302`.**
+- **A value in a string interpolation must implement `Display`** (`E0523`).
+- **`==`, `!=`, `assert_eq` and `assert_ne` need `Eq`**, also through `Option`, `Result`, containers and enum payloads (`E0306`, with the `@derive(Eq)` fix). `x.into()`, `T.from(x)` and `T.try_from(x)` need a matching `From`/`TryFrom` impl (`E0312`). `Int` widens to `Float` through `From[Int]`.
+- **`const X = some_fn()` is `E0533`.** A const takes a constant expression.
 
 ### Sized Integer Type Methods
 
@@ -262,16 +299,13 @@ Conversion methods available on `I8`, `I16`, `I32`, `U8`, `U16`, `U32`, `U64`, a
 
 Arithmetic on sized ints (`+`, `-`, `*`, `/`, `%`, unary `-`) **traps on
 overflow**, division by zero, and signed `INT_MIN / -1`. Use the
-explicit modular escape hatches when you want wrap-around:
+explicit modular escape hatches when you want wrap-around (there is no `wrapping_div`, `wrapping_rem` or `wrapping_neg`):
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
 | `.wrapping_add(rhs)` | self type | Modular addition |
 | `.wrapping_sub(rhs)` | self type | Modular subtraction |
 | `.wrapping_mul(rhs)` | self type | Modular multiplication |
-| `.wrapping_div(rhs)` | self type | Truncating division (still panics on `/0`) |
-| `.wrapping_rem(rhs)` | self type | Truncating remainder (still panics on `/0`) |
-| `.wrapping_neg()` | self type | Modular negation |
 
 `Type.from(x)` and `Type.try_from(x)` cover the widening / narrowing
 conversion matrix between sized ints — see the `From` / `TryFrom`
@@ -324,7 +358,7 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | Function | Returns | Purpose |
 |----------|---------|---------|
 | `read_file(path)` | Str | Read file to string |
-| `write_file(path, content)` | Void | Write string to file |
+| `write_file(path, content)` | () | Write string to file |
 | `file_exists(path)` | Int | 1 if exists, 0 if not |
 | `is_dir(path)` | Int | 1 if directory |
 | `path_join(a, b)` | Str | Join path components — **moved to `std.path`**, use `import std.path` |
@@ -335,12 +369,12 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `shell_exec(cmd)` | Int | Run shell command, return exit code |
 | `process_run(cmd, args)` | ProcessResult | Run command with args (`List[Str]`), capture stdout/stderr/exit_code |
 | `process_run_with_stdin(cmd, args, input)` | ProcessResult | Like `process_run` but pipes `input` (Str) to child's stdin |
-| `process_exec(cmd, args)` | Void | Exec binary directly (replaces process). `args` is `List[Str]` |
+| `process_exec(cmd, args)` | () | Exec binary directly (replaces process). `args` is `List[Str]` |
 | `process_spawn(cmd, args)` | Int | Fork + exec a child process; returns raw pid handle. Idiomatic API: `std.process.spawn` |
 | `process_pid_wait(pid)` | ProcessResult | Block until child exits; returns its `ProcessResult` |
 | `process_pid_kill(pid, sig)` | Int | Send signal to child by pid; returns 0 on success |
 | `process_pid_send_signal(pid, sig)` | Int | Alias of `process_pid_kill` for the `send_signal` trait method |
-| `exit(code)` | Void | Exit with code |
+| `exit(code)` | () | Exit with code |
 | `arg_count()` | Int | CLI argument count |
 | `get_arg(idx)` | Str | CLI argument by index |
 | `time_ms()` | Int | Current time in milliseconds |
@@ -350,19 +384,11 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `unix_socket_connect(path)` | Int | Connect to Unix domain socket |
 | `unix_socket_accept(fd)` | Int | Accept incoming connection |
 | `unix_socket_accept_timeout(fd, ms)` | Int | Accept with timeout (ms) |
-| `unix_socket_close(fd)` | Void | Close socket |
+| `unix_socket_close(fd)` | () | Close socket |
 | `socket_read_line(fd)` | Str | Read line from socket |
-| `socket_write(fd, data)` | Void | Write data to socket |
-| `tcp_listen(host, port)` | Int | Listen on TCP socket |
-| `tcp_connect(host, port)` | Int | Connect to TCP host:port |
-| `tcp_accept(fd)` | Int | Accept incoming TCP connection |
-| `tcp_read(fd, max_bytes)` | Str | Read up to max_bytes from TCP socket |
-| `tcp_read_all(fd)` | Str | Read all available data from TCP socket |
-| `tcp_read_bytes(fd, max_bytes)` | Result[Bytes, NetError] | Binary-safe read; preserves null bytes and non-UTF-8 |
-| `tcp_write(fd, data)` | Void | Write data to TCP socket |
-| `tcp_write_bytes(fd, data)` | Result[Void, NetError] | Binary-safe write of Bytes buffer |
-| `tcp_close(fd)` | Void | Close TCP socket |
-| `tcp_set_timeout(fd, ms)` | Void | Set read timeout on TCP socket |
+| `socket_write(fd, data)` | () | Write data to socket |
+
+The `tcp_*` functions are not builtins. They live in `std.net`: `import std.net` (see Standard Library). `tcp_connect`, `tcp_listen` and `tcp_accept` return `Result[TcpSocket, NetError]` or `Result[TcpListener, NetError]`; `tcp_read_bytes` returns `Result[Bytes, NetError]`.
 
 ## Namespace Methods
 
@@ -383,8 +409,8 @@ io.eprint_raw("error")          // raw fprintf stderr (bypasses vtable)
 // Filesystem (effect: FS) — the signed surface returns Result[T, FsError];
 // `import std.fs` to name FsError/FsOp in a caller that handles the error.
 fs.read(path)                   // -> Result[Str, FsError]
-fs.write(path, content)         // -> Result[Void, FsError]
-fs.delete(path)                 // -> Result[Void, FsError] (delete file, backed by unlink(2))
+fs.write(path, content)         // -> Result[(), FsError]
+fs.delete(path)                 // -> Result[(), FsError] (delete file, backed by unlink(2))
 fs.list_dir(dir)                // -> Result[List[Str], FsError] (filenames)
 // FsError { op: FsOp, path: Str, code: Errno } — the error the fs.* surface returns.
 "{err}"                         // Display renders `op path: message`, e.g. `read /etc/app.toml: No such file or directory`
@@ -416,7 +442,8 @@ let v = ch.recv() ?? 0          // handle the closed case; .unwrap() panics on i
 
 // Database (effect: DB) — stdlib module, requires `import std.db`
 // Connection: effect-handler scoped (no global state)
-with db.connect(path) {         // open SQLite DB, installs DB handler for scope (v0.35+)
+// The enclosing fn must return a Result whose error takes DBError (`import std.db_error.{DBError}`)
+with db.connect(path)? {        // returns Result[Connection, DBError]; `?` unwraps it. Installs DB handler for scope
     // all db.* operations use this connection within scope
 }
 // Or with explicit imports for more control:
@@ -442,7 +469,7 @@ db.query(tpl)                   // -> Result[List[Row], DBError] (all rows)
 db.query_one(tpl)               // -> Result[Option[Row], DBError] (first row or None)
 
 // Mutations (effect: DB.Write)
-db.exec(tpl)                    // -> Result[Void, DBError] (DDL/DML, no return)
+db.exec(tpl)                    // -> Result[(), DBError] (DDL/DML, no return)
 db.execute(tpl)                 // -> Result[Int, DBError] (returns last insert rowid)
 
 // Row type (named column access)
@@ -466,9 +493,9 @@ stmt.finalize()                 // free statement
 with db.transaction() {         // scoped: auto-commit on success, auto-rollback on error
     db.exec("INSERT ...")?
 }
-db.begin()                      // -> Result[Void, DBError] (manual)
-db.commit()                     // -> Result[Void, DBError]
-db.rollback()                   // -> Result[Void, DBError]
+db.begin()                      // -> Result[(), DBError] (manual)
+db.commit()                     // -> Result[(), DBError]
+db.rollback()                   // -> Result[(), DBError]
 
 // DBError enum variants: QueryError, ExecError, ConnectionError, NotFound
 
@@ -477,10 +504,10 @@ net.listen(host, port)          // -> Int (listen fd)
 net.accept(fd)                  // -> Int (connection fd)
 net.read(fd, max_bytes)         // -> Str (read up to max_bytes)
 net.read_all(fd)                // -> Str (read all available data)
-net.write(fd, data)             // -> Void
-net.close(fd)                   // -> Void
+net.write(fd, data)             // -> ()
+net.close(fd)                   // -> ()
 net.connect(host, port)         // -> Int (connection fd)
-net.set_timeout(fd, ms)         // -> Void (set read timeout)
+net.set_timeout(fd, ms)         // -> () (set read timeout)
 ```
 
 ## String Methods
@@ -532,10 +559,10 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 |--------|---------|---------|
 | `.len()` | Int | Length |
 | `.is_empty()` | Bool | Check if empty |
-| `.push(item)` | Void | Append (mutates) |
+| `.push(item)` | () | Append (mutates) |
 | `.pop()` | Option[T] | Remove last |
 | `.get(idx)` | Option[T] | Element at index (None if OOB) |
-| `.set(idx, val)` | Void | Set element (mutates) |
+| `.set(idx, val)` | () | Set element (mutates) |
 | `.contains(elem)` | Bool | Membership check by `==`; needs `T: Eq` |
 | `.append(other)` | List[T] | Concatenate, returns a new list |
 | `.slice(start, end)` | List[T] | Sub-list |
@@ -547,14 +574,14 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.any(fn(T)->Bool)` | Bool | Any match? |
 | `.all(fn(T)->Bool)` | Bool | All match? |
 | `.count()` | Int | Count elements |
-| `.for_each(fn(T)->Void)` | Void | Apply to each element |
+| `.for_each(fn(T)->())` | () | Apply to each element |
 | `.chain(other)` | List[T] | Concatenate, returns a new list (eager) |
 | `.flat_map(fn(T)->List[U])` | List[U] | Map then flatten (eager) |
 | `.zip(other)` | List[(T,U)] | Pair elements (eager, list of tuples) |
 | `.enumerate()` | List[(Int,T)] | Index each element (eager, list of tuples) |
 | `.take(n)` | List[T] | First n (eager) |
 | `.skip(n)` | List[T] | All but first n (eager) |
-| `.clear()` | Void | Remove all elements (mutates) |
+| `.clear()` | () | Remove all elements (mutates) |
 
 ## Iterator[T] (Lazy)
 
@@ -586,7 +613,7 @@ let first_two = names
 | `.any(fn(T)->Bool)` | Bool | Any match? (drains) |
 | `.all(fn(T)->Bool)` | Bool | All match? (drains) |
 | `.find(fn(T)->Bool)` | Option[T] | First match (drains) |
-| `.for_each(fn(T))` | Void | Apply to each (drains) |
+| `.for_each(fn(T))` | () | Apply to each (drains) |
 
 `Iterator[T]` is a sealed, opaque built-in: it is not user-implementable, exactly as `Str` and `List` are closed. It is a restartable recipe, not a stateful cursor — collecting it twice recomputes from the source.
 
@@ -596,23 +623,22 @@ let first_two = names
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `Map()` | Map[K,V] | Create empty map (NOT `{}`) |
-| `map[key] = val` | Void | Insert/update via index assignment |
-| `.insert(key, val)` | Void | Insert/update (method form) |
+| `Map()` / `Map.new[K, V]()` | Map[K,V] | Create empty map (NOT `{}`). Index assignment `m[k] = v` is an error; use `insert` |
+| `.insert(key, val)` | () | Insert/update (method form) |
 | `.get(key)` | Option[V] | Safe lookup — pattern-match `Some(v)` / `None` |
 | `.contains_key(key)` | Bool | Key exists? |
 | `.contains(key)` | Bool | Key exists? (alias of `contains_key`) |
-| `.remove(key)` | Bool | Remove key, returns `true` if removed |
+| `.remove(key)` | Option[V] | Remove key, returns the old value, or `None` if absent |
 | `.len()` | Int | Entry count |
 | `.keys()` | List[K] | All keys |
 | `.values()` | List[V] | All values |
-| `.clear()` | Void | Remove all entries (mutates) |
+| `.clear()` | () | Remove all entries (mutates) |
 
 ## Set[T] Methods
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `Set()` | Set[T] | Create empty set |
+| `Set()` / `Set.new[T]()` | Set[T] | Create empty set |
 | `.insert(elem)` | Bool | Add element to set |
 | `.remove(elem)` | Bool | Remove element from set |
 | `.contains(elem)` | Bool | Membership check |
@@ -627,9 +653,9 @@ let first_two = names
 | `Bytes.new()` / `Bytes()` | Bytes | Create empty byte buffer |
 | `Bytes.zeroed(n)` | Bytes | Create zero-filled buffer of length `n` |
 | `Bytes.from_str(s)` | Bytes | Create from string |
-| `.push(byte)` | Void | Append byte (mutates) |
+| `.push(byte)` | () | Append byte (mutates) |
 | `.get(idx)` | Option[Int] | Byte at index |
-| `.set(idx, byte)` | Void | Set byte (mutates) |
+| `.set(idx, byte)` | () | Set byte (mutates) |
 | `.len()` | Int | Length |
 | `.is_empty()` | Bool | Check if empty |
 | `.slice(start, end)` | Bytes | Sub-buffer |
@@ -644,26 +670,26 @@ let first_two = names
 | `.read_i32_le(offset)` | Result[Int, Str] | Read signed 32-bit little-endian at offset |
 | `.read_i64_be(offset)` | Result[Int, Str] | Read signed 64-bit big-endian at offset |
 | `.read_i64_le(offset)` | Result[Int, Str] | Read signed 64-bit little-endian at offset |
-| `.write_u16_be(val)` | Void | Append unsigned 16-bit big-endian (grows buffer) |
-| `.write_u16_le(val)` | Void | Append unsigned 16-bit little-endian (grows buffer) |
-| `.write_u32_be(val)` | Void | Append unsigned 32-bit big-endian (grows buffer) |
-| `.write_u32_le(val)` | Void | Append unsigned 32-bit little-endian (grows buffer) |
-| `.write_i32_be(val)` | Void | Append signed 32-bit big-endian (grows buffer) |
-| `.write_i32_le(val)` | Void | Append signed 32-bit little-endian (grows buffer) |
-| `.write_i64_be(val)` | Void | Append signed 64-bit big-endian (grows buffer) |
-| `.write_i64_le(val)` | Void | Append signed 64-bit little-endian (grows buffer) |
-| `.set_u16_be(off, v)` | Result[Void, Str] | In-place write unsigned 16-bit big-endian at offset (no growth, bounds-checked) |
-| `.set_u16_le(off, v)` | Result[Void, Str] | In-place write unsigned 16-bit little-endian at offset |
-| `.set_i16_be(off, v)` | Result[Void, Str] | In-place write signed 16-bit big-endian at offset |
-| `.set_i16_le(off, v)` | Result[Void, Str] | In-place write signed 16-bit little-endian at offset |
-| `.set_u32_be(off, v)` | Result[Void, Str] | In-place write unsigned 32-bit big-endian at offset |
-| `.set_u32_le(off, v)` | Result[Void, Str] | In-place write unsigned 32-bit little-endian at offset |
-| `.set_i32_be(off, v)` | Result[Void, Str] | In-place write signed 32-bit big-endian at offset |
-| `.set_i32_le(off, v)` | Result[Void, Str] | In-place write signed 32-bit little-endian at offset |
-| `.set_u64_be(off, v)` | Result[Void, Str] | In-place write unsigned 64-bit big-endian at offset |
-| `.set_u64_le(off, v)` | Result[Void, Str] | In-place write unsigned 64-bit little-endian at offset |
-| `.set_i64_be(off, v)` | Result[Void, Str] | In-place write signed 64-bit big-endian at offset |
-| `.set_i64_le(off, v)` | Result[Void, Str] | In-place write signed 64-bit little-endian at offset |
+| `.write_u16_be(val)` | () | Append unsigned 16-bit big-endian (grows buffer) |
+| `.write_u16_le(val)` | () | Append unsigned 16-bit little-endian (grows buffer) |
+| `.write_u32_be(val)` | () | Append unsigned 32-bit big-endian (grows buffer) |
+| `.write_u32_le(val)` | () | Append unsigned 32-bit little-endian (grows buffer) |
+| `.write_i32_be(val)` | () | Append signed 32-bit big-endian (grows buffer) |
+| `.write_i32_le(val)` | () | Append signed 32-bit little-endian (grows buffer) |
+| `.write_i64_be(val)` | () | Append signed 64-bit big-endian (grows buffer) |
+| `.write_i64_le(val)` | () | Append signed 64-bit little-endian (grows buffer) |
+| `.set_u16_be(off, v)` | Result[(), Str] | In-place write unsigned 16-bit big-endian at offset (no growth, bounds-checked) |
+| `.set_u16_le(off, v)` | Result[(), Str] | In-place write unsigned 16-bit little-endian at offset |
+| `.set_i16_be(off, v)` | Result[(), Str] | In-place write signed 16-bit big-endian at offset |
+| `.set_i16_le(off, v)` | Result[(), Str] | In-place write signed 16-bit little-endian at offset |
+| `.set_u32_be(off, v)` | Result[(), Str] | In-place write unsigned 32-bit big-endian at offset |
+| `.set_u32_le(off, v)` | Result[(), Str] | In-place write unsigned 32-bit little-endian at offset |
+| `.set_i32_be(off, v)` | Result[(), Str] | In-place write signed 32-bit big-endian at offset |
+| `.set_i32_le(off, v)` | Result[(), Str] | In-place write signed 32-bit little-endian at offset |
+| `.set_u64_be(off, v)` | Result[(), Str] | In-place write unsigned 64-bit big-endian at offset |
+| `.set_u64_le(off, v)` | Result[(), Str] | In-place write unsigned 64-bit little-endian at offset |
+| `.set_i64_be(off, v)` | Result[(), Str] | In-place write signed 64-bit big-endian at offset |
+| `.set_i64_le(off, v)` | Result[(), Str] | In-place write signed 64-bit little-endian at offset |
 | `.with_ptr(fn(p) { ... })` | T | Pin buffer and call closure with `Ptr[U8]` (FFI alias path; no growth allowed inside) |
 
 ## StringBuilder Methods
@@ -672,16 +698,24 @@ let first_two = names
 |--------|---------|---------|
 | `StringBuilder.new()` | StringBuilder | Create empty builder |
 | `StringBuilder.with_capacity(n)` | StringBuilder | Create with pre-allocated capacity |
-| `.write(s)` | Void | Append string |
-| `.write_char(ch)` | Void | Append one `Char` |
-| `.write_int(n)` | Void | Append integer as string |
-| `.write_float(f)` | Void | Append float as string |
-| `.write_bool(b)` | Void | Append bool as string |
+| `.write(s)` | () | Append string |
+| `.write_char(ch)` | () | Append one `Char` |
 | `.to_str()` | Str | Build final string |
 | `.len()` | Int | Current length |
 | `.capacity()` | Int | Allocated capacity |
-| `.clear()` | Void | Reset to empty |
+| `.clear()` | () | Reset to empty |
 | `.is_empty()` | Bool | Check if empty |
+
+## Float Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `.ieee_eq(other)` | Bool | IEEE 754 equality: `NaN.ieee_eq(NaN)` is `false`, `0.0.ieee_eq(-0.0)` is `true` |
+| `.is_nan()` | Bool | NaN check (needs `import std.float`) |
+| `.truncate()` | Int | Drop the fraction |
+| `.to_int_checked()` | Result | Float to Int; fails out of range |
+
+`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` below `0.0`. Use `ieee_eq` for IEEE comparison.
 
 ## Option[T] Methods
 
@@ -798,10 +832,10 @@ Low-level JSON API (`import std.json`):
 | `json_new_array()` | Int | Create empty array node |
 | `json_new_str(s)` | Int | Create string node |
 | `json_new_int(n)` | Int | Create integer node |
-| `json_set(obj, key, val)` | Void | Set key-value on object (add or replace) |
-| `json_push(arr, val)` | Void | Append value to array |
-| `json_remove(obj, key)` | Void | Remove key from object |
-| `json_clear()` | Void | Reset all JSON state for next parse |
+| `json_set(obj, key, val)` | () | Set key-value on object (add or replace) |
+| `json_push(arr, val)` | () | Append value to array |
+| `json_remove(obj, key)` | Int | Remove key from object; returns 1 if removed, else 0 |
+| `json_clear()` | () | Reset all JSON state for next parse |
 
 ## CLI Argument Parsing (std.args)
 
@@ -1012,8 +1046,8 @@ trait BlockHandler {
 }
 
 impl BlockHandler for Transaction {
-    type Context = Void             // implementer defines the type
-    fn enter(self) -> Void { ... }
+    type Context = ()               // implementer defines the type
+    fn enter(self) -> () { ... }
     fn exit(self, ok: Bool) { ... }
 }
 ```

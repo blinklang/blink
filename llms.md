@@ -14,7 +14,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.53`, `0.53.1` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.54`, `0.54.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -28,6 +28,13 @@ Key facts:
 - Effects: `fn foo() ! IO, DB` — tracked in signatures, provided by handlers
 - `io.println(...)` not `print(...)` — IO goes through effect handles
 - No string `+` operator — use interpolation or `.concat()`
+- The unit type is `()`. `Void` exists only in `Ptr[Void]`
+- No silent type defaults: an empty `[]`, a bare `None` or an unused `Map()` is `E0301`. Annotate it, or write `List.new[T]()`, `Map.new[K, V]()`, `Set.new[T]()`
+- Type parameters are rigid in a generic body: arithmetic on `T` needs a bound (`T: Add`). Bounds are checked at the call (`E0306`). Explicit call type arguments: `f[T](x)`
+- Keyword parameters follow `--`: `fn f(a: Int, -- b: Str = "x")`. Defaults are constants
+- `Map.remove` returns `Option[V]`. `m[k] = v` is an error; use `m.insert(k, v)`. `channel.new[T](buffer: n)`; `ch.recv()` returns `Option[T]`
+- `Float` has a total order (`NaN == NaN`); use `x.ieee_eq(y)` for IEEE equality
+- `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type
 
 ## Standard Library
 

@@ -2,18 +2,103 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
-## Changes (unreleased)
+## Breaking Changes (v0.54.0)
 
-- **`blink build` and `blink run` with no mode flag compile the C at `-O1`.** Before, the default passed no optimization level, so cc used `-O0`. Most programs run faster; the build takes about the same time. `--debug` still compiles at `-g -O0`, `--release` at `-O2`, and `blink test` builds in debug mode as before. Objects cached at the old default are not reused, because the cache key holds the level.
-- **E0650 MutableCaptureInSpawn is reported (breaking).** A closure passed to `async.spawn` may not capture a `let mut` binding, even to read it (§2.8). The check follows a closure held in a `let` (or assigned to a `let mut`) and a closure nested inside the spawned one. Before, such a program compiled and the task shared the binding with the scope that spawned it. Fix: copy the value into a `let` before the spawn, or send values over a channel. Not checked: a module-level `let mut`, which is not a capture, and a closure that reaches `async.spawn` through a function parameter.
-- **E0500 UndeclaredEffect is reported again (breaking).** A function must declare every effect its callees declare (§4.5). A call to a fn or method whose signature lists an effect, a call to a user effect's operation, and a call to a `! Arena` fn now report E0500 at the call when the caller does not hold that effect. A parent effect covers its children, a `with` block adds the effect of each handler it installs (and `with arena` adds `Arena`), a closure holds the effects of the fn around it, and `main` holds every effect. Fix: add the effect to the caller's `!` list, or make the call inside a `with` block that provides it. Not yet checked: builtin namespace calls such as `io.println`, the `FFI` effect, and test blocks.
-- **E0816 WithPtrBodyTooComplex is retired.** A `Bytes.with_ptr` closure body may hold statements before its result, as §9.1.3 always allowed. A body that binds a `let` and ends in an `Int` expression compiles, and the call returns that `Int`. The code was an inlining limit of the old codegen, not a language rule, and is no longer reported; `blink explain E0816` says it is retired.
-- **`for c in s` over a `Str` compiles, and binds each Unicode scalar value as a `Char`.** A multi-byte character is one turn, not one turn per byte. Ill-formed UTF-8 that reaches a `Str` from FFI reads as one `U+FFFD` per maximal ill-formed subpart; the walk never yields a surrogate.
-- **`Channel.recv()` returns `Option[T]` (breaking).** It answers `Some(value)` for each value sent, in order, and `None` only once the channel is closed and every buffered value is received. Before, `recv` on a closed, empty channel panicked. Code that bound the element directly now gets a type error whose help names the fixes: `ch.recv() ?? default`, a `match`, or `for v in ch`; use `.unwrap()` only where a value must be there. `send` on a closed channel still panics, now at the line of the send.
-- **`test.failing` takes only a name and `reason:`.** The `ticket:` argument is gone: writing it is now an `UnexpectedToken` error ("test.failing(...) takes only a name and `reason:`"). To point at tracked work, write the reference in the reason. The test report's `xfail_reason` is the reason as written, with no `br:<ticket> — ` prefix.
-- **A method that resolves to nothing on a known receiver type is now an error, not a warning.** `xs.iter()` on a `List[Int]`, `"hi".charAt(0)`, or `b.bogus()` on a `Bytes` used to emit `warning[UnknownMethod]: unknown method '...' -- may fail at compile time` and then fail later in the C compiler or at a codegen backstop. Any receiver whose type the front end knows -- the builtin scalars and containers, plus structs and enums, which already errored -- now reports **E0505 UnresolvedMethod** naming both the receiver type and the method, with a "did you mean" suggestion where one is close. The call's type is poisoned, so a declared type over the call does not draw a second, derived error. **W0501 UnknownMethod** survives for the one case that has no type to name: a receiver whose type is still a bare type parameter or an unresolved metavariable at the call.
-- **The `Bytes.set_*_le/be(offset, value)` family type-checks.** All twelve (`set_u16_be` through `set_i64_le`) are pinned by the spec and have been emitted by codegen since the family landed, but the front end did not know the names, so it reported them as unknown methods. They now check their two `Int` arguments and are typed `Result[(), Str]`.
-- **`--test-json` per-test status is now `"passed"`, not `"pass"`.** The per-test record's `status` value disagreed with both the summary object's `passed` count key and §8.10's documented wire format. Any external consumer matching the literal string `"pass"` needs updating to `"passed"`; the in-repo test suite has been updated to match.
+### Type inference and type checking
+- **E0301 CannotInferType replaces silent defaults.** A type that nothing fixes is an error: an empty `[]`, a bare `None`, `Map()` or `Set()` that no use types, a `Channel` whose element type nothing fixes, a one-sided `Ok(3)`/`None` in a position that needs a full type, an unannotated closure parameter that no context types, `for x in []`, and a generic call whose type parameter no argument or return names. Before, these defaulted to `Int` or `Void`, or codegen made up a type. The check applies at module scope too, and gives the same result with and without `--incremental`. The help shows the annotation or bracket list that fixes it.
+- **A type parameter is rigid in its own generic body.** Using `T` where `Int` or `Box[Int]` is expected (in a `let`, field, return, argument or impl method) is E0300 at the definition, even with no caller. Reading a field of a `T` value is also an error. Arithmetic on `T` needs the operator's trait in the bound (`+` needs `Add`, `-` `Sub`, `*` `Mul`, `/` `Div`, `%` `Rem`, unary `-` `Neg`), so `fn add[T](a: T, b: T) { a + b }` is E0300 with the bound to add.
+- **Bounds and type arguments are checked at the call.** `sum("a", "b")` for `fn sum[T: Add]` is E0306 TraitBoundNotSatisfied. Arguments must agree on each type parameter: `pick(1, "a")` is E0300. A generic struct literal keeps the type arguments its fields fix: `Box { value: "s" }` where `Box[Int]` is expected is E0300. A qualified trait call `B.go(v)` on a type-parameter receiver is checked against the bounds.
+- **A fn's declared return type is checked against its tail**, including a tail `if`/`match` and a closure body with a declared return type. A function with a return type whose body can end without a value (a `while`, `for`, or a `loop` that a `break` leaves) is E0311 MissingReturn; before, it returned garbage. An `if` without `else` used as a value is E0304 MissingElse.
+- **Closures, handler expressions and `async.scope` bodies are type-checked** in every position. Errors in them that went unreported now show. A closure that spells a parameter or result type contradicting its declared function type is E0300.
+- **Operators need operands they apply to.** `+ - * / %`, unary `-` and the compound forms on Bool, `Void`, structs, `Str - Str` or opaque handles are E0300 (before: wrong output or a C error).
+- **Undeclared type names are errors** (E0507 UnknownType) in fn signatures, struct fields, enum payloads, type aliases, closure annotations and trait method signatures. Before, an undeclared single-letter name became a free type variable. `F32` and `F64` are reserved and report that they are not yet supported.
+- **E0303 TypeArgArity:** a type applied to the wrong number of type arguments (bare `List`, `Map[Int]`) is an error with a fix hint.
+- **`()` is the unit type.** Write `-> ()`, `Result[(), E]`, `Map[Str, ()]`. Use `Void` only inside `Ptr[...]`; the compiler does not reject it elsewhere yet. `()` can key a `Map` or `Set`.
+- **The elements of a list literal must have one type.** `[1, "a"]` and `[2.5, 1]` are errors (before: wrong memory reads). A spread element must be a list.
+- **Field access on an undeclared field is E0525 NoSuchField**, for runtime structs too (`ProcessResult`, `Duration`, `Instant`, `FsError`). Before, it printed `<value>`. The tuple accessor is `t.0`; `t._0` is rejected.
+- **A struct literal whose head is a builtin, an enum or an `@ffi.opaque` handle is E0300.**
+- **Indexing with `x[0]` is an error on anything but a List.** `List.fold` with one argument and `zip()` with no iterable argument are arity errors. `List.contains` on struct, enum or nested-container elements needs `Eq`.
+- **E0308:** an `E.V` pattern against an Int, Bool, Str or Float scrutinee is an error.
+- **`for x in <non-iterable>` is E0302 NotIterable.**
+- **A mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` is E0610 MutationRequiresMut.**
+- **A plain `=` to a module global that the module did not import is an error** (before: internal compiler error).
+- **E1016 DuplicateModuleBinding:** a module-level `let` and a fn with the same name.
+
+### Methods and the standard library
+- **Unresolved methods are errors.** A method that does not exist on a known receiver type is E0505 UnresolvedMethod, with a "did you mean" suggestion. Before, it was warning W0501 and then a C compiler error. This covers the qualified spelling (`MapOps.entries(m)`), static calls, and `.collect()` on a collection in `blink check`. W0501 stays only for a receiver whose type is still an unbound type parameter.
+- **Iteration has two forms.** Adapters on a collection (`list.map/filter/take/skip/chain/flat_map/enumerate/zip`) are eager and return a List, so `.len()` and `.get()` work and `.collect()` is not needed. `.into_iter()` gives a lazy `Iterator[T]`, whose adapters stay lazy and end with `.collect()`. An `Iterator[T]` is restartable: each consumer starts a fresh cursor. A List no longer satisfies an `Iterator[T]` parameter.
+- **`Map.remove(key)` returns `Option[V]`** (the removed value), not `Bool`. `m.set(k, v)` on a Map is an error; use `insert`.
+- **`List.concat` is renamed `List.append`.**
+- **`fs.*` path operations return `Result[T, FsError]`** and need `import std.fs`. `FsError` implements Display and has `not_found()`.
+- **Channels.** Build a channel with `channel.new[T](buffer: n)`; `Channel(n)` and `Channel.new(n)` are gone. `Channel.recv()` returns `Option[T]`: `Some(v)` for each value sent, `None` once the channel is closed and drained. Before, `recv` on a closed empty channel panicked. The type error on old code names the fixes (`?? default`, `match`, `for v in ch`). `send` on a closed channel still panics, now at the line of the send.
+- **`StringBuilder()` and `StringBuilder(n)` are errors;** use `StringBuilder.new()` or `StringBuilder.with_capacity(n)`. `StringBuilder.write_char` takes a `Char`. An empty-container constructor takes no argument; `List(...)` names `List.new()` as the fix.
+- **`Ptr` changes.** `Ptr.deref()` has the pointee type (`Ptr[U8]` gives `U8`) and `Ptr.addr()` is `Int`. E0810 InvalidPtrType applies wherever a pointee is written (aliases, fields, payloads, closure and trait signatures, effect ops, nested `Ptr[Ptr[T]]`) and per generic instance; `Bool` is not a valid pointee. A field through a `Ptr` types only when the pointee is an `@ffi.struct`. `Ptr.offset` on an unknown stride is E0838 (E0822 now means naming `Buf` outside the FFI surface).
+- **`std.db_sqlite` uses opaque handle types** `Sqlite3`, `Sqlite3Stmt`, `SqliteResult`; `sqlite_prepare` returns `Option[Sqlite3Stmt]`.
+- **Sized-int `wrapping_neg`, `wrapping_div` and `wrapping_rem` are removed.**
+- **`io.println` and the print family return `()`** and check the argument count (a second argument was dropped).
+
+### Traits, equality and conversion
+- **`==`, `!=`, `assert_eq` and `assert_ne` need `Eq`** through Option, Result, containers and enum payloads (E0306, naming the chain and the `@derive(Eq)` fix).
+- **Float equality and order use the spec's total order:** NaN equals NaN and sorts above every other value; -0.0 equals 0.0. `Float.ieee_eq` gives C/IEEE 754 `==`. `assert_close_rel` refuses a NaN bound.
+- **E0312 NoConversionImpl:** `x.into()`, `T.from(x)` and `T.try_from(x)` need a matching `From`/`TryFrom` impl. The `Int` `into()` cast fallback is gone; `Int` widens to `Float` through a `From` impl.
+- **A value in a string interpolation must implement Display** (E0523).
+- **E1400 MapKeyNotHashable:** a Set element or Map key must be hashable, also when reached through a type argument. An alias to a hashable type (`type Port = Int`) is accepted.
+- **Overlapping impls** are an error at type check. An impl must satisfy each direct supertrait (E0911); a trait default body may use an operation on `Self` only if a bound grants it (E0305). An impl of a trait method declared with no arrow may not return a value.
+- **E0907:** an `impl` on a sealed built-in type (Iterator, the collections, StringBuilder, Instant, Duration) names the type as sealed.
+- **`@derive` checks:** an unknown derive name is E1112; `@derive(Serialize)` on a field that would serialize as `null` is E1401.
+
+### Calls, keywords, annotations and effects
+- **Keyword-parameter rules are enforced on every call** (§2.13): E0510 missing keyword argument, E0529 keyword parameter passed by position, E0511 label that names no keyword parameter, E0527 positional after a label, E0528 label written twice. A labelled call through a function value is an error.
+- **E0533:** `const X = some_fn()` is an error. Before, it compiled to no value.
+- **E0500 UndeclaredEffect is reported again.** A function must declare every effect its callees declare. A parent effect covers its children, a `with` adds the effect of each handler it installs, a closure holds the effects of its enclosing fn, and `main` holds every effect. Not yet checked: builtin namespace calls such as `io.println`, the `FFI` effect, and test blocks.
+- **E0650 MutableCaptureInSpawn:** a closure passed to `async.spawn` may not capture a `let mut`. `async.spawn` needs a `fn() -> T` argument (any function value, not only a literal).
+- **E0601 scope escapes:** a `with ... as x` binding may not be captured by `async.spawn` or leave its block (return, block value, assignment to an outer variable). A pointer or capturing closure stored into a cell that outlives its `ffi.scope` is rejected.
+- **E0839 NonHandlerWithItem:** a `with` item without `as` must be a `Handler[E]` or `BlockHandler`.
+- **E0819:** `FfiScope` is valid only as the resource of `with ... as`.
+- **`@trusted` needs `audit:`** (E0836). `@allow` and `[lints]` cannot name an audit-gated diagnostic (E0837). `Raw[T]` is a marker type: W0310 fires at the `Template[C]` coercion, and a `Raw` that no template uses is E0530.
+- **Contracts:** `@requires`/`@ensures` without a `@verify` fallback is V0003 ContractUnverifiable; a fallback other than `runtime` or `trust` is E1110. Annotations on impl and trait methods are no longer dropped in silence: a misplaced one is E1110. Stray tokens in a trait or impl body are E1100.
+- **`test.failing` takes a name and `reason:`** only. A missing reason is E0835; `ticket:` is an error.
+- **`--test-json` per-test status is `"passed"`,** not `"pass"`.
+- **A user type named like an internal compiler type** is E0524 ReservedTypeName.
+
+## What's New (v0.54.0)
+
+- **`blink build` and `blink run` compile C at `-O1` by default.** `--debug` stays `-g -O0`, `--release` `-O2`, `blink test` builds in debug mode.
+- **Explicit type arguments at a call:** `pair[Int, Str]()`, `x.method[T]()`, `mod.f[T]()`, `Map[K, V]()`, `Set.new[T]()`, `List.new[Int]()`. Wrong count or a bracket list with no call is E0307 CallSiteTypeArgs.
+- **Keyword parameters take defaults:** `-- host: Str = "0.0.0.0"`. A default before `--` is E0531; a non-const default is E0532.
+- **`@ffi.opaque(header, name)`** declares a nominal C handle type (`FILE*`, `sqlite3*`) that lowers to a bare pointer. It has no deref, `==`, fields or arithmetic, and `Option[Handle]` uses NULL for None. `blink audit --ffi` reports it as `opaque-ffi-handle`.
+- **Generic enums** (`type Name[T]`), self-recursive generic enums, and nested patterns over tuple and struct-style variant payloads.
+- **`impl[T] Trait for Box[T]`** over a user generic type, and poly impls over `List[T]`/`Set[T]`/`Map[K, V]`, compile per instance.
+- **`==` compares lists, sets, maps, tuples and payload enums by value** (Set and Map ignore order). `@derive(Eq)` compares container fields by value. `Bytes ==` compares content.
+- **`@verify(fallback: "runtime")` contracts run:** `@requires` on entry, `@ensures` at every exit with `old(e)`, `@where` aliases on parameters and results.
+- **`for c in s` over a `Str`** binds each Unicode scalar value as a `Char`.
+- **`for x in set` and `for (k, v) in map` loop.** Before, they ran zero times.
+- **`Set[T]` and `Map` take Int and struct keys,** and `Channel[T]` takes any element type.
+- **`std.db`: `db.connect(path)`** is a scoped handler: `with db.connect(path)? { ... }`.
+- **`Instant` prints as RFC 9557, `Duration` as `1h2m3s`;** `Duration.to_iso8601()` is new. Both derive Eq, Ord, Clone and Debug; `Instant` also Hash.
+- **`Eq`, `Ord`, `Hash`, `Clone` and `Debug` are prelude traits,** so a hand-written `impl Eq for T` is accepted. `ConversionError` implements Display.
+- **`default.op(args)`** in a handler operation forwards to the enclosing handler.
+- **A generic fn passed by name as a function value** (`apply(identity, 3)`) is accepted; E0517 is gone.
+- **`Bytes.set_u16_be` through `set_i64_le`** type-check.
+- **E0816 is retired:** a `Bytes.with_ptr` body may hold statements.
+- **Diagnostics quote code with backticks.**
+- **`blink check`** reports a missing `#embed` file and runs per-instance checks.
+
+## Fixes (v0.54.0)
+
+- Closure parameter types come from the expected function type at every position, through `if`/`match` arms, list elements and later generic arguments.
+- An empty `[]`, `Map()` or `Set()` takes its types from the assignment target, field, payload, closure return or `??` fallback. An Int-keyed `Map()` no longer uses the string hasher.
+- `@derive(Hash/Debug/Serialize)` bound checks decide per instance (`Box[Int]` vs `Box[NoHash]`). `@derive` on a generic type works per instance. Deriving `Hash` alone also gives `Eq`.
+- Two modules that each declare a type with the same name stay separate. Renamed selective imports and re-exporting `pub import` facades resolve.
+- Type parameters with names longer than one letter resolve.
+- A nested or partial effect handler no longer reads the inner handler's captures (a segfault from safe code).
+- A nested destructuring `let` binds every leaf.
+- A braceless `match` arm that returns, breaks or continues no longer makes sibling arms yield 0.
+- Impl overlap is judged on the whole type: `From[List[Int]]` and `From[List[Str]]` are distinct.
+- A duplicate operation name across sub-effects of one root effect is E0516, not an internal error.
+- Assigning to an undeclared name is E0506, not an internal error. A failing `assert` outside a test is an uncaught panic, not a crash.
+- `blink fmt` keeps parentheses around a leading `if`/`match`/`with` operand, lays out multi-line forms inside expressions and headers, and exits 101 naming the node kind instead of dropping code.
+- `blinkc` exits 1 and writes no C on a user error.
 
 ## Fixes (v0.53.1)
 
