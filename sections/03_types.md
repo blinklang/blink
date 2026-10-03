@@ -1621,9 +1621,34 @@ Blink has no index operator (§2.6). A postfix `[...]` after an expression is le
 2. **Every item is a type:** the brackets are a type-argument list, and their count is checked against the head (§3.4 *Kind-Correctness*). The wrong count is `error[TypeArgArity]` (E0303). A value head, or a non-generic declaration, binds zero.
 3. **The list is well-formed, and no `(` or `{` follows:** `error[TypeArgsWithoutCall]` (E0314).
 
-An item is a **type** when it parses as a type expression and every name in it resolves to a type or a type parameter. Every other item is a **value**: a literal, a local, a constant, or any other expression. Name resolution decides this in every case, so the code never depends on the receiver's type. `xs[i]` and `self.items[i]` get the same code at the same stage.
+An item is a **type** when it parses as a type expression and every name in it resolves in the type namespace (§2.12.1): to a type, a type alias, or a type parameter in scope. Every other item is a **value**: a literal, a local, a constant, or any other expression. Name resolution decides this in every case, so the code never depends on the receiver's type. `xs[i]` and `self.items[i]` get the same code at the same stage.
+
+**A name in both namespaces.** A bracket item is in type position, so each name in it resolves the same way as in a type annotation: only the type namespace is searched. A value of the same name, at module scope or as a local, does not change the result. A `let` binds in the value namespace and cannot hide a type (§10.6 *Shadowing Rules*). So `make[MAX]()` and `let d: List[MAX]` always read `MAX` as the same type. Names in the arguments of a type application, such as the `MAX` in `xs[List[MAX]]`, are in type position too.
+
+**A name that does not resolve.** When a name in an item resolves in neither namespace, only the name-resolution error is reported for that bracket suffix. E0313, E0303 and E0314 are not reported for it, because the correct code depends on what the name turns out to be: a type gives E0303, a value gives E0313 (§3.1 rule 3). This also applies to a name inside a compound item, such as `Foo` in `xs[List[Foo]]`. Other bracket suffixes in the same expression are checked as usual.
 
 E0303 is checked before E0314 because deleting the list discharges both. A value head with type contents, such as `xs[Int]`, is therefore E0303 (`xs` takes 0 type arguments), and its repair, deleting the list, exists.
+
+When the head is a value and the item is a bare name that also has a value binding, the author most likely meant to read an element. The first `help:` is then the element read, chosen from the receiver's type as for E0313 below: `.get()` where the type has it, and a field access for a tuple. Deleting the list is the second `help:`. When the receiver has neither, deleting the list is the only `help:`. Any bracket diagnostic on a bare-name item that also has a value binding carries a `note:` that names both declarations and says that the name is read as a type:
+
+```blink
+type MAX { n: Int }
+const MAX = 2
+
+fn make[T]() -> List[T] { [] }
+
+fn main() {
+    let xs = [10, 20, 30]
+    let a = make[MAX]()        // OK -- `MAX` is the type
+    let b: List[MAX] = a       // OK -- the same type
+    let c = xs[MAX]            // error[TypeArgArity]: `xs` takes 0 type arguments
+                               // note: `MAX` is read as a type here (line 1); it is also a value (line 2)
+                               // help: `xs.get(MAX)` returns `Option[Int]`
+                               // help: delete the list -- `xs`
+    let d = xs[List[MAX]]      // error[TypeArgArity]: `xs` takes 0 type arguments
+                               // help: delete the list -- `xs`
+}
+```
 
 **NoIndexOperator (E0313).** Element access is a method call. The first `help:` depends on the receiver's type: `.get()` where the type has it, and a field access for a tuple:
 
