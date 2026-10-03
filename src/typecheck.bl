@@ -16424,13 +16424,31 @@ fn tc_eq_need_help(leaf: Int, op: Str, node: Int) -> Str {
             lines.push("to test for `None`, call `.{call}()`")
         }
     }
+    for line in tc_eq_need_fixes(leaf) { lines.push(line) }
+    lines.join("\n")
+}
+
+// The fix for the innermost type with no `Eq`, the same for `==` and for assert_eq.
+fn tc_eq_need_fixes(leaf: Int) -> List[Str] {
+    let mut lines: List[Str] = []
     let k = type_kind(leaf)
     if k == TyKind.Struct || k == TyKind.Enum {
         let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
         lines.push("add `@derive(Eq)` to `type {strip_module_qualifier(tc_type_name(base))}`")
     }
     if k == TyKind.Typevar { lines.push("add the bound `[{type_to_str(leaf)}: Eq]`") }
-    lines.join("\n")
+    lines
+}
+
+// Each step of the chain from the compared type to the innermost type with no `Eq`.
+fn tc_eq_need_notes(path: List[Int]) -> List[Str] {
+    let mut notes: List[Str] = []
+    let mut i = 0
+    while i + 1 < path.len() {
+        notes.push("`{type_to_str(path.get(i).unwrap())}` is `Eq` only if `{type_to_str(path.get(i + 1).unwrap())}` is `Eq`")
+        i = i + 1
+    }
+    notes
 }
 
 // `==` and `!=` need `Eq` on the operand type, recursively. Returns 1 when it reported,
@@ -16449,17 +16467,31 @@ fn reject_eq_less_operands(op: Str, lt: Int, rt: Int, node: Int) -> Int ! TypeCh
     let mut path = tc_eq_need(a, [])
     if path.len() == 0 { path = tc_eq_need(b, []) }
     if path.len() > 0 {
-        let mut notes: List[Str] = []
-        let mut i = 0
-        while i + 1 < path.len() {
-            notes.push("`{type_to_str(path.get(i).unwrap())}` is `Eq` only if `{type_to_str(path.get(i + 1).unwrap())}` is `Eq`")
-            i = i + 1
-        }
         diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `Eq`", node,
-            tc_eq_need_help(path.get(path.len() - 1).unwrap(), op, node), notes)
+            tc_eq_need_help(path.get(path.len() - 1).unwrap(), op, node), tc_eq_need_notes(path))
         return 1
     }
     0
+}
+
+// assert_eq and assert_ne carry a `T: Eq` bound, checked the way `==` is checked, so a
+// type `==` refuses is refused here as an unmet bound (02_syntax.md, test assertions).
+// A type parameter is asked here as well: `==` asks it in reject_unlicensed_comparison,
+// which an assertion does not reach. Arguments of different types are left to the
+// argument check.
+fn reject_eq_less_assert_args(lt: Int, rt: Int, node: Int) ! TypeCheck.Report, Diag.Report {
+    let a = resolve_alias_tid(tc_resolve(lt))
+    let b = resolve_alias_tid(tc_resolve(rt))
+    let k = type_kind(a)
+    if k != type_kind(b) { return }
+    if !tc_kind_takes_eq_need(k) && k != TyKind.Typevar { return }
+    if types_compatible(a, b) == 0 { return }
+    let mut path = tc_eq_need(a, [])
+    if path.len() == 0 { path = tc_eq_need(b, []) }
+    if path.len() == 0 { return }
+    diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
+        "`{type_to_str(path.get(0).unwrap())}` does not implement `Eq`", node,
+        tc_eq_need_fixes(path.get(path.len() - 1).unwrap()).join("\n"), tc_eq_need_notes(path))
 }
 
 // The spec enum-vs-Int comparison exception (03_types.md:1093). An
@@ -16683,16 +16715,18 @@ fn tc_container_slot_from_hint(want: TyKind, slot: Int) -> Int {
     s
 }
 
-// assert_eq/assert_ne check each argument independently, so a bare Ok/Err/None
+// assert_eq/assert_ne infer each argument independently, so a bare Ok/Err/None
 // argument mints an unbound metavariable for the slot it doesn't spell. Unify
-// both sides after inferring them so either argument can be the bare literal.
-fn tc_infer_assert_eq_args(args_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// both sides after inferring them so either argument can be the bare literal, then
+// ask for the `Eq` bound on the unified type.
+fn tc_check_assert_eq_args(args_sl: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let arg0 = sublist_get(args_sl, 0)
     let arg1 = sublist_get(args_sl, 1)
     let t0 = infer_type(arg0)
     let t1 = infer_type(arg1)
     if tc_tid_has_unbound_metavar(t0) != 0 { let _ = tc_unify(t0, t1) }
     if tc_tid_has_unbound_metavar(t1) != 0 { let _ = tc_unify(t1, t0) }
+    reject_eq_less_assert_args(t0, t1, node)
 }
 
 fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -17525,7 +17559,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let bf_args = node_args(node)
                     if bf_args != -1 {
                         if (fn_name == "assert_eq" || fn_name == "assert_ne") && sublist_length(bf_args) == 2 {
-                            tc_infer_assert_eq_args(bf_args)
+                            tc_check_assert_eq_args(bf_args, node)
                         } else {
                             let mut bai = 0
                             while bai < sublist_length(bf_args) {
