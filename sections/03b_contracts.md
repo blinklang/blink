@@ -108,7 +108,7 @@ Three annotation forms:
 - `@ensures(predicate)` -- postcondition: what must be true after the function returns
 - `@invariant(predicate)` -- type invariant: what must always be true about a type's state
 
-Contracts attach to functions and to methods in `impl` blocks. A `@requires`, `@ensures` or `@verify` on a trait method declaration is a compile error (E1110); contracts on trait methods are not yet specified.
+Contracts attach to functions, to methods in `impl` blocks, and to trait method declarations. A trait method's contract binds every impl of that method; see *Contracts on Trait Methods* below.
 
 #### Preconditions with `@requires`
 
@@ -228,6 +228,175 @@ fn pop[T](stack: Stack[T]) -> (T, Stack[T]) {
     (item, rest)
 }
 ```
+
+#### Contracts That Call Their Own Function
+
+A contract predicate of function `f` may not call `f`, directly or through a cycle. To check this rule, the compiler builds a graph: an edge runs from a function's contract predicates to each function they call. Calls in a function *body* are not edges, so a recursive body is still legal. A cycle in this graph is a compile error (`error[RecursiveContractPredicate]`, E1309). The diagnostic prints the cycle.
+
+```blink
+@ensures(result == depth(n))           // E1309 -- `depth`'s contract calls `depth`
+@pure
+fn depth(n: Int) -> Int {
+    if n <= 0 { 0 } else { 1 + depth(n - 1) }    // OK: a body call is not an edge
+}
+
+@requires(is_ok(x))                    // E1309 -- cycle: `check` -> `is_ok` -> `check`
+@pure
+fn check(x: Int) -> Bool { x > 0 }
+
+@requires(check(x))
+@pure
+fn is_ok(x: Int) -> Bool { x >= 0 }
+```
+
+```
+error[RecursiveContractPredicate]: a contract of `check` calls `check`
+ --> pred.bl:7:11
+  |
+7 | @requires(is_ok(x))
+  |           ^^^^^^^^ `is_ok` is called here
+  |
+  = note: cycle: contract of `check` calls `is_ok`; contract of `is_ok` calls `check`
+  = help: state the predicate without a call back into `check`
+```
+
+The rule applies the same way to trait methods: a predicate on `Trait.m` may not call `m` through any receiver. Without it, the verifier would need `m`'s contract to check `m`'s contract.
+
+#### Contracts on Trait Methods
+
+A trait method declaration may carry `@requires` and `@ensures`. Every impl of that method inherits them. The rule in one line: **an impl may promise more, never demand more.** It has the same narrow-only shape as the effect-row rule for impls (§3.6, E0904).
+
+```blink
+trait Stack {
+    fn size(self) -> Int
+
+    @requires(self.size() > 0)
+    @ensures(result.size() == old(self.size()) - 1)
+    fn drop_top(self) -> Self
+}
+
+type IntStack { items: List[Int] }
+
+impl Stack for IntStack {
+    fn size(self) -> Int { self.items.len() }
+
+    // Inherits `@requires(self.size() > 0)` and the trait's `@ensures`.
+    @ensures(result.items.len() == self.items.len() - 1)    // OK: an impl may add @ensures
+    @verify(fallback: "runtime")
+    fn drop_top(self) -> IntStack {
+        IntStack { items: self.items.drop_last() }
+    }
+}
+```
+
+**What an impl inherits.** The trait's `@requires` and `@ensures` apply to every impl of the method, with no restatement. The compiler elaborates each impl method to a plain function with this contract:
+
+- `@requires`: the trait's predicate `P_t[σ]`
+- `@ensures`: `Q_t[σ] && Q_i`, where `Q_t` is the trait's predicate and `Q_i` is the impl's own `@ensures` (true if the impl writes none)
+- `@verify`: the effective policy (see *`@verify` on trait methods* below)
+
+Here `σ` binds the trait's parameters to the impl's parameters by position (see *Parameter binding* below). From this point, the impl method is verified and run as any other function (§3b.3, §3b.4). Hover and `blink query` show this elaborated contract, with each inherited row tagged `[inherited: Trait.m]`.
+
+**An impl may not write `@requires`.** A generic caller through `T: Trait` sees only the trait's precondition. If an impl could demand more, a call that is correct for the trait could fail for one type. A `@requires` on an impl method of a trait is a compile error (`error[TraitImplAddsPrecondition]`, E0912), even when the predicate is the same as the trait's. To restrict input, the fixes are:
+
+- move the predicate to the trait method, so every caller sees it
+- give the parameter a refinement type (§3b.1) in the trait's signature; a refined type on the impl alone is a param type mismatch (E0902), because it also demands more than the trait
+- put the restricted operation in a free function that is not a trait method
+
+```
+error[TraitImplAddsPrecondition]: an impl of a trait method may not add `@requires`
+ --> stack.bl:14:5
+   |
+14 |     @requires(self.items.len() > 1)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `IntStack.drop_top` implements `Stack.drop_top`
+   |
+   = note: `@requires(self.size() > 0)` is already inherited from `Stack.drop_top`
+   = help: a caller through `T: Stack` cannot see this precondition; move it to
+           `Stack.drop_top`, give the parameter a refinement type in the trait, or use a free function
+```
+
+**An impl may add `@ensures`.** The impl's own `@ensures` is ANDed with the trait's. An impl `@ensures` that restates an inherited predicate adds nothing and gets a warning (`warning[RestatedInheritedEnsures]`, W0900); the compiler checks it once.
+
+**What a caller assumes.** A call through a bound (`x.m()` with `x: T` and `T: Trait`) checks the trait's `@requires` at the call site and assumes only the trait's `@ensures` after it. Monomorphization never brings in a contract from the impl: a generic function verifies once, against the trait. A call that names the concrete type statically (`s.drop_top()` with `s: IntStack`) checks the same `@requires` and assumes both the trait's and the impl's `@ensures`.
+
+**Parameter binding.** An impl may name its parameters differently from the trait (§3.6). Inherited predicates bind by position, with capture-avoiding substitution. `self` binds to position 0 whatever name the impl gives it. The compiler adds no parameter-name check. Every diagnostic and tool surface that shows an inherited predicate prints both names, for example "trait param `n` (impl param `count`)". This includes hover, `blink query`, and V0002 counterexamples.
+
+```blink
+trait Buffer {
+    @requires(n >= 0)
+    @ensures(result.len() == n)
+    fn take(self, n: Int) -> List[Int]
+}
+
+impl Buffer for Ring {
+    // `n` binds to `count` by position: the inherited @requires is `count >= 0`.
+    @verify(fallback: "runtime")
+    fn take(self, count: Int) -> List[Int] {
+        self.items.take(count)
+    }
+}
+```
+
+**`@verify` on trait methods.** A trait method declaration may carry `@verify`, with `fallback: "runtime"` only. It is the default policy for every impl body of that method that has no `@verify` of its own. `@verify(fallback: "trust")` on a trait method declaration is a compile error (`error[TrustOnTraitMethod]`, E0913): a trust decision covers one body, and a trait author cannot see the bodies of downstream impls.
+
+- An impl method's own `@verify` (`"trust"` included) replaces the trait's default as a whole. The two never merge.
+- The default resolves at elaboration, before verification. It also applies to an open-default body and to each override of it.
+- A fallback applies only when the outcome is Unknown (§3b.4). A Proven contract costs nothing, so a trait default never adds a check that the solver can remove.
+- An inherited `"runtime"` check follows the same build-mode rule as any other runtime fallback (§3b.4 *Option 2*). The verification report lists the inherited runtime checks for each impl.
+
+With the trait default, a trait author can add a contract to a published trait without forcing a `@verify` into every downstream impl.
+
+```blink
+trait Score {
+    @ensures(result >= 0 && result <= 100)
+    @verify(fallback: "runtime")              // default for every impl body
+    fn score(self) -> Int
+}
+
+impl Score for Exam {
+    // No @verify: the trait's "runtime" default applies to this body.
+    fn score(self) -> Int {
+        self.correct * 100 / self.total
+    }
+}
+
+impl Score for Model {
+    @verify(fallback: "trust")                // replaces the trait default for this body
+    fn score(self) -> Int {
+        self.eval_score()
+    }
+}
+
+trait Shape {
+    @ensures(result >= 0.0)
+    @verify(fallback: "trust")                // E0913 -- "trust" on a trait method declaration
+    fn area(self) -> Float
+}
+```
+
+If no `@verify` applies and the outcome is Unknown, the error is V0003 at the impl method. The message says that the contract comes from the trait and names the impl method as the place for `@verify`. For example, with a trait method `Gauge.level` that has `@ensures(result >= 0)` and no `@verify`:
+
+```
+error[V0003]: contract unverifiable
+ --> tank.bl:9:5
+  |
+9 |     fn level(self) -> Int {
+  |     ^^^^^^^^ solver returned unknown
+  |
+  = note: `@ensures(result >= 0)` is inherited from `Gauge.level`
+  = help: add `@verify(fallback: "runtime")` to this impl method, or to `Gauge.level`
+          to set a default for every impl
+```
+
+**Default methods.** A trait default body is verified once against the trait's contract, generically over `Self` (the default body is parametric in `Self`, §3.6 *Operations on `Self` in a Default Body*). Its monomorphized copies use that result. An open default's override inherits the same contract and must discharge it in its own body. A `final` default fixes both its body and its contract.
+
+**Predicate scope.** A trait-method predicate may use the method's parameters, `self`, `result` (in `@ensures`), `old(...)`, and methods of the trait, of its supertraits, and of the bounds on its type parameters. The purity rules are the same as for function contracts (E1301, E1302).
+
+**Supertraits.** A subtrait may not redeclare a supertrait method to add or change its contract. This is `E0733 SubtraitMethodRedeclaration` (§3.6 *The `final` Modifier*), for the same coherence reason: `x.m()` would have two contracts, one through each bound.
+
+**`@ffi`.** A trait method that has a contract may not be implemented directly by an `@ffi` function. A safe wrapper implements it and carries the contract (E0803).
+
+**Migration.** Before this rule, an impl method could carry `@requires`, and a trait method declaration could not carry contracts (E1110). An existing impl `@requires` is now E0912. To fix it, move the predicate to the trait method, give the parameter a refinement type in the trait's signature, or call a free function.
 
 #### SMT Verification
 
@@ -368,7 +537,9 @@ The developer has three options:
 
 **Option 1: Simplify the contract.** Rewrite the predicate to use operations the solver understands. This is the best outcome -- it means the contract is now provable.
 
-**Option 2: Runtime fallback.** Add `@verify(fallback: "runtime")` to insert a runtime check. The contract becomes an assertion that runs in debug builds (and optionally in release builds):
+**Option 2: Runtime fallback.** Add `@verify(fallback: "runtime")` to insert a runtime check. The contract becomes an assertion that runs in debug builds (and optionally in release builds).
+
+A function's own `@verify` governs its whole contract, `@requires` included. A runtime `@requires` check runs at the function's entry, so every caller gets it. A caller never writes `@verify` for a callee's contract:
 
 ```blink
 @ensures(result.is_valid_signature())

@@ -134,7 +134,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | QualifiedHeadNotTrait | E0740 | The left side of `for` in an impl-qualified call head `(Trait for Type)` does not name a trait. When the left side is a type and the right side is a trait, the note says which side is the trait and the help gives the swapped head; otherwise the help suggests no swap | Method resolution | §3c.4 |
 | FfiFunctionPublic | E0801 | FFI function cannot be `pub` | FFI | §9.1 |
 | FfiNoEffects | E0802 | `@ffi` function declares no effects | FFI | §9.1 |
-| ContractOnFfi | E0803 | `@requires`/`@ensures` not allowed on `@ffi` function | FFI | §9.1, §3b |
+| ContractOnFfi | E0803 | `@requires`/`@ensures` not allowed on `@ffi` function, and an `@ffi` fn may not directly implement a trait method that has a contract | FFI | §9.1, §3b |
 | InvalidPtrTypeParam | E0810 | Invalid `Ptr[T]` type parameter | FFI | §9.1.1 |
 | PtrOutsideFfiContext | E0811 | `Ptr[T]` used outside FFI context | FFI | §9.1.1 |
 | FfiStructGcField | E0812 | `@ffi.struct` field uses GC-managed or non-FFI type | FFI | §9.1.1 |
@@ -173,6 +173,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | PolyImplUnsupported | E0908 | Polymorphic impl header parses but is not yet compiled (project b1bdnh) | Trait contract | §3.6 |
 | ImplBinderUnused | E0909 | Impl type-parameter binder unused in the impl header's type positions | Trait contract | §3.6 |
 | TraitContractArgArity | E0910 | Impl supplies the wrong number of trait type arguments | Trait contract | §3.6 |
+| TraitImplAddsPrecondition | E0912 | An impl method of a trait writes `@requires`; the impl inherits the trait method's `@requires` and may not add to it. The `note:` names the inherited contract; the `help:` names the fixes (move it to the trait, a refinement type in the trait's signature, a free fn) | Trait contract | §3b.2 |
+| TrustOnTraitMethod | E0913 | `@verify(fallback: "trust")` on a trait method declaration; only `"runtime"` may be a trait default | Trait contract | §3b.2 |
 | CircularPackageDep | E1002 | Circular package dependency | Modules | §10.5 |
 | PrivateItemAccess | E1003 | Access to private item in another module | Modules | §10.5 |
 | VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |
@@ -207,9 +209,10 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AssignmentInPredicate | E1306 | Predicate contains an assignment | Refinement contracts | §3b |
 | ImpureBodyForPureAnnotation | E1307 | `@pure` function body contains a non-pure construct | Refinement contracts | §3b |
 | ModifiesArgNotSimplePath | E1308 | `@modifies` argument is not a simple path | Refinement contracts | §3b |
+| RecursiveContractPredicate | E1309 | A contract predicate of fn `f` calls `f`, directly or through a cycle of contract predicates (body calls are not edges); the diagnostic prints the cycle | Refinement contracts | §3b.2 |
 | MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or a user type with no `Hash` impl, derived or written) | Generic collections | §3.6 |
 | NonDerivableTrait | E1401 | A `@derive(Hash/Eq/Ord)` field's type does not implement the derived trait | Generic collections | §3.6 |
-| ContractUnverifiable | V0003 | The solver can neither prove nor disprove a `@requires`/`@ensures`, and the fn has no `@verify(fallback: ...)` | Contract verification | §3b.4 |
+| ContractUnverifiable | V0003 | The solver can neither prove nor disprove a `@requires`/`@ensures`, and the fn has no `@verify(fallback: ...)` (for an impl method, neither its own nor the trait method's default) | Contract verification | §3b.4 |
 
 ---
 
@@ -234,6 +237,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | SealedMethodNameCollision | W0734 | A method in an `impl` for a built-in type has the same name as a method a sealed trait gives that type; unqualified calls of the name are E0522. Fires at the method only, never at calls. On by default, never an error, no effect on resolution | Method resolution | §3c.4 |
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
+| RestatedInheritedEnsures | W0900 | An impl `@ensures` restates a predicate it already inherits from the trait method | Trait contract | §3b.2 |
 | ShadowedPreludeName | W1010 | A `type`, type alias, `trait` or `effect` declaration takes a compiler-known type name or prelude trait name that is not reserved; it shadows the builtin in its module. The `help:` line names the `import blink.core.{X as Y}` (or `blink.ffi`) escape | Modules | §10.6 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
 

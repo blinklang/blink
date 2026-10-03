@@ -2380,9 +2380,11 @@ error[SubtraitMethodRedeclaration]: cannot seal inherited open default `greet`
    = help: to specialize behavior for one type, override `greet` normally in its `impl`
 ```
 
-`E0733` fires at the subtrait's redeclaration site, not at any call site, and applies only to redeclaring a method a supertrait already provides as an open default. A normal `impl`-block override of that open default (without `final`) is unaffected — that is the ordinary replace-only override of §3.6 *The `final` Modifier*.
+`E0733` fires at the subtrait's redeclaration site, not at any call site, and applies to two cases: redeclaring a method a supertrait already provides as an open default, and redeclaring any supertrait method to add or change its contract (§3b.2 *Contracts on Trait Methods*). A normal `impl`-block override of that open default (without `final`) is unaffected — that is the ordinary replace-only override of §3.6 *The `final` Modifier*.
 
 **Effect-row subtype for trait impls.** Every method an `impl` provides for a trait, whether it implements a required method or overrides an open default, must declare an effect row `R_i` with `R_i ⊆ R_t`, where `R_t` is the row the trait declares for that method. An impl may *narrow* the row (drop effects it does not use) but may not *widen* it (add effects the trait does not declare). A trait method with no `!` has the empty row, so every impl of it must also have no `!`. This rule is what lets a bound `T: Trait` stand as an upper bound on the effects of a call through it: a generic function with no `!` that calls `x.m()` for `x: T` performs no effects for any `T`. A widening impl is rejected at the impl method with `error[TraitContractEffectMismatch]` (E0904). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults have no override site, so their row is fixed at the declaration.
+
+Contracts on trait methods follow the same narrow-only shape: an impl inherits the trait method's `@requires` and `@ensures`, may add `@ensures`, and may not add `@requires` (E0912). See §3b.2 *Contracts on Trait Methods*.
 
 ```blink
 trait Shout {
