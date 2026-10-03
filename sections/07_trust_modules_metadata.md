@@ -2502,8 +2502,8 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | Annotation | Target | Purpose | Checked by |
 |------------|--------|---------|------------|
 | `@src(kind: "ID")` | fn, type, module | Provenance link to requirement, design doc, issue, or compliance mandate. | `blink trace` tooling |
-| `@requires(expr)` | fn | Precondition. Must hold when the function is called. | SMT solver (compile-time) or runtime assertion |
-| `@ensures(expr)` | fn | Postcondition. Must hold when the function returns. `result` refers to the return value. | SMT solver (compile-time) or runtime assertion |
+| `@requires(expr)` | fn, trait method | Precondition. Must hold when the function is called. | SMT solver (compile-time) or runtime assertion |
+| `@ensures(expr)` | fn, trait method | Postcondition. Must hold when the function returns. `result` refers to the return value. | SMT solver (compile-time) or runtime assertion |
 | `@where(expr)` | fn, type | Type-level constraint on generics or refinements. | Compile-time type checker |
 | `@invariant(expr)` | type | Invariant that must hold for all instances of this type at all times. | Static check and runtime checks on construction and mutation |
 | `@perf(constraint)` | fn | Performance contract. Benchmark assertion, not statically provable. | `blink bench --check-contracts` |
@@ -2511,7 +2511,7 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | `@ffi("lib", "sym")` | fn | Declares a foreign function binding. | Linker (compile-time) |
 | `@trusted(audit: "ID")` | fn | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `ID` must name a record in `audits.toml`. Never makes an `@ffi` fn `pub` (E0801). | Compile-time record check (`AuditRecordNotFound`); `blink audit` tooling |
 | `@alt("ID", "desc")` | fn | Marks an alternative implementation. | Tooling (`blink alt list`, `blink alt select`) |
-| `@verify(strategy)` | fn | Hints to the static checker about verification strategy. | Static checker |
+| `@verify(strategy)` | fn, trait method | Hints to the static checker about verification strategy. | Static checker |
 | `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time derivation |
 | `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `blink.toml` `[lints]` config. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842). See §4.16.8. | Compiler diagnostic filter |
 | `@deprecated(since, removal, replacement, fix)` | fn, type | Edition-aware deprecation with structured migration. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). Emits W2000 when current edition < `removal`, E2001 when current edition >= `removal`. Machine-applicable fixes in structured diagnostics when `fix` is `"replace"` or `"inline"`. See §8.16.2. | Compiler warning/error (edition-gated) |
