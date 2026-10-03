@@ -250,9 +250,10 @@ The first `///` line declares human intent — structured, versioned, queryable.
 
 ```sh
 # Build and execute
-blink build <file>              # Compile .bl to native binary
+blink build <file>              # Compile .bl to native binary (default: -O1)
 blink build <file> --output <path>  # Custom output path
 blink build <file> --debug      # Debug mode (-g -O0)
+blink build <file> --release    # Optimized build (-O2)
 blink run <file>                # Build and execute in one step
 blink check <file>              # Type-check without producing binary
 

@@ -1114,6 +1114,9 @@ build/blink doc std.json --json     # module docs as JSON
 build/blink audit src/main.bl     # FFI audit report
 build/blink update                  # update deps + blink-version in blink.toml
 
+# Default builds (no mode flag) compile the C at -O1
+build/blink build src/main.bl
+
 # Release builds (optimized with -O2)
 build/blink build src/main.bl --release
 build/blink build src/main.bl -R
