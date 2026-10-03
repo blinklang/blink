@@ -138,11 +138,12 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | PinnedBytesEscape | E0815 | Pinned Bytes receiver escapes its `with_ptr` closure | FFI | §9.1.1 |
 | BytesPtrCastForbidden | E0817 | Bytes coerced to `Ptr[U8]` outside `with_ptr` | FFI | §9.1.1 |
 | FfiScopeNotWithResource | E0819 | An `FfiScope` value occurs somewhere other than as a `with ... as` resource — bound by `let`, passed, returned, stored, or written as a type argument (its libc arena would never be freed) | FFI | §9.1.1 |
-| MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.2.1 |
-| NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.2.1 |
+| MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.1.2 |
+| NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.1.2 |
 | BufOutsideFfiSurface | E0822 | The name `Buf` written outside the `@ffi.fn` / `@ffi.struct` surface — an annotated binding, a parameter or return type, a struct field, or a generic bound | FFI | §9.1.3.2 |
 | CleanupPanickedDuringUnwind | E0824 | `exit(false)`/`close()` panicked during catchable unwind; original panic preserved, cleanup surfaces as warning | Test runner | §4.6.3 |
 | IncompatibleStdlibArchive | E0840 | Installed stdlib archive built by a different toolchain than the linking compiler (ABI/struct-layout mismatch) — rejected at link time | FFI | §9.2.1 |
+| CompilerManagedNativeDep | E0841 | `[native-dependencies]` key names a runtime library (`c`, `m`, `libc`, `libm`) that the compiler already links | FFI | §9.1.2 |
 | SkipOutsideTest | E0827 | `skip()` called outside a `test { ... }` block | Type checking | §2.20 |
 | AssertPanicsBodyReturned | E0831 | `assert_panics` body returned normally instead of panicking | Test runner | §2.20 |
 | AssertPanicsMessageMismatch | E0832 | `assert_panics` panic message did not match expected pattern | Test runner | §2.20 |

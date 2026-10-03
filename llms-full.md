@@ -45,7 +45,7 @@ fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int
 
 ```blink
 @trusted
-@ffi("libc", "malloc")
+@ffi("c", "malloc")
 fn malloc(size: Int) -> Ptr[Int]
 ```
 
