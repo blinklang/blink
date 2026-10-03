@@ -4,6 +4,12 @@
 # the baseline as it stood in the previous commit. The pass count may not
 # drop against either, and no file may flip from pass to anything else.
 #
+# Known failures (see corpus_one.sh): no file's count may rise against either
+# reference. A file the reference lacks counts from 0; a file that did not
+# pass in the reference is not compared, since its rows were hidden behind
+# the failure. A passing file whose report did not read fails the gate,
+# because null would hide any count. A reference written before the count existed skips this part.
+#
 #   scripts/corpus_check.sh            gate
 #   scripts/corpus_check.sh --update   write the baseline from build/corpus.json
 #
@@ -68,7 +74,7 @@ if [ "${1:-}" = "--update" ]; then
     jq '{
           compiler, blinkc_sha256_prefix, git_head, generated_utc,
           total, passed,
-          files: (.files | map({file, status}))
+          files: (.files | map({file, status, known_failures}))
         }' "$json" > "$baseline"
     echo "corpus-check: baseline written: $(jq -r '"\(.passed)/\(.total)"' "$baseline") passed"
     exit 0
@@ -121,11 +127,37 @@ compare() {
         printf '%s\n' "$flips"
         fail=1
     fi
+    if jq -e 'any(.files[]; has("known_failures"))' "$ref" >/dev/null 2>&1; then
+        rises=$(jq -r --slurpfile now "$json" '
+            (.files | map({key: .file, value: .}) | from_entries) as $old
+            | $now[0].files[]
+            | select((.known_failures | type) == "number")
+            | . as $f
+            | ($old[$f.file] // {status: "pass", known_failures: 0}) as $o
+            | select($o.status == "pass" and ($o.known_failures | type) == "number")
+            | select($f.known_failures > $o.known_failures)
+            | "  \($f.file): \($o.known_failures) -> \($f.known_failures)"' "$ref")
+        if [ -n "$rises" ]; then
+            echo "corpus-check: FAIL known failures rose against $label:"
+            printf '%s\n' "$rises"
+            fail=1
+        fi
+    else
+        echo "corpus-check: $label has no known-failure counts; skipping that comparison"
+    fi
     new_files=$(jq -r --slurpfile ref "$ref" '
         ($ref[0].files | map(.file)) as $known
         | .files[] | select(.file as $f | $known | index($f) | not) | .file' "$json" | wc -l | tr -d ' ')
     [ "$new_files" -gt 0 ] && echo "corpus-check: $new_files file(s) not in the $label baseline (new tests)"
 }
+
+unreadable=$(jq -r '.files[] | select(.status == "pass" and (.known_failures | type) != "number") | "  \(.file)"' "$json")
+if [ -n "$unreadable" ]; then
+    echo "corpus-check: FAIL passing files whose known-failure report did not read"
+    echo "  (most often a test printed to stdout, which lands inside the --test-json report):"
+    printf '%s\n' "$unreadable"
+    fail=1
+fi
 
 compare baseline "$baseline"
 

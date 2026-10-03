@@ -22,6 +22,10 @@
 # path per line, blank lines and # comments ignored) and defaults CORPUS_OUT
 # to build/corpus_subset.json. The typecheck suite uses this.
 #
+# A second summary line gives the known failures: test.failing rows that
+# still fail, which a passing file hides (see corpus_one.sh), and the passing
+# files whose report did not read.
+#
 # Exit: 2 when the run itself cannot be trusted (no compiler, malformed JSON).
 # Under --only, 1 when any listed file fails: a bucket names files that must
 # pass, so its exit code must say whether they did. A full run exits 0 with
@@ -115,7 +119,7 @@ while IFS= read -r f; do
     if [ -f "$results/$b.json" ]; then
         cat "$results/$b.json"
     else
-        printf '{"file":"%s","status":"compile_fail","seconds":0,"first_error_line":"corpus runner produced no record"}\n' "$f"
+        printf '{"file":"%s","status":"compile_fail","seconds":0,"first_error_line":"corpus runner produced no record","known_failures":null}\n' "$f"
     fi
 done < "$list" > "$records"
 
@@ -137,6 +141,7 @@ jq -s \
       compile_fail: (map(select(.status == "compile_fail")) | length),
       run_fail: (map(select(.status == "run_fail")) | length),
       timeout: (map(select(.status == "timeout")) | length),
+      known_failures: (map(.known_failures // 0) | add // 0),
       files: .
     }' "$records" > "$out"
 rm -f "$records"
@@ -152,6 +157,12 @@ if [ "$passed" -ne "$total" ]; then
     echo "corpus: failing files:"
     jq -r '.files[] | select(.status != "pass") | "  \(.status) \(.file): \(.first_error_line)"' "$out"
 fi
+jq -r '
+    (.files | map(select((.known_failures // 0) > 0))) as $counted
+    | (.files | map(select(.status == "pass" and .known_failures == null))) as $unread
+    | "corpus: known failures \(.known_failures) in \($counted | length) file(s), \($unread | length) unreadable report(s)",
+      ($counted[] | "  \(.known_failures) \(.file)"),
+      ($unread[] | "  unreadable \(.file)")' "$out"
 
 if [ "$run_lint" -eq 1 ] && [ -z "$only" ]; then
     ./scripts/lint_codegen.sh || exit 1
