@@ -825,7 +825,7 @@ In `@ffi` signatures, each sized type maps to the C type in the table. (Panel vo
 
 **Overflow behavior:**
 
-Arithmetic overflow is checked by default. An operation that exceeds the type's range panics at runtime with a descriptive message. The compiler also catches overflow in constant expressions at compile time.
+Arithmetic overflow is checked by default. An operation that exceeds the type's range panics at runtime with a descriptive message. The compiler also catches overflow in constant expressions at compile time. The remainder `%` never exceeds the range, so for a signed type `MIN % -1` is 0 and does not panic (§3.6, *Integer Division*).
 
 ```blink
 let x: U8 = 255
@@ -2841,6 +2841,21 @@ error[TypeError]: `Option[List[Widget]]` does not implement `Eq`
 #### Integer Division
 
 `Int / Int` performs integer division (truncates toward zero). `Float / Float` performs IEEE 754 division. Division by zero on integers is a runtime panic.
+
+On every integer type, for a non-zero `b`, `a % b` is `a - b * q`, where `q` is the exact quotient of `a` and `b` truncated toward zero, and the arithmetic is on the mathematical integers. The remainder has the sign of `a`, or is 0, and its magnitude is less than the magnitude of `b`. So the remainder is always in the type's range, and `%` never overflows (§3.2, *Overflow behavior*). Where `a / b` does not panic, `a == (a / b) * b + a % b`.
+
+For a signed type, `MIN / -1` panics, because the quotient `-MIN` is out of range. `MIN % -1` is 0.
+
+```blink
+let a: I32 = -2147483648
+let b: I32 = -1
+let r = a % b       // 0
+let q = a / b       // RUNTIME PANIC: I32 overflow in division (-2147483648 / -1)
+let s = -7 % 3      // -1: the sign of the dividend (Python gives 2)
+let t = 7 % -3      // 1
+```
+
+`%` is not the floored modulo of Python. Code that needs a result in `0..n` for a negative `a` must adjust the remainder itself.
 
 Traits can have default method implementations (`ne` above). Traits can require other traits (`Hash: Eq` means implementing `Hash` requires implementing `Eq`).
 
