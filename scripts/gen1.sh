@@ -56,8 +56,7 @@ if [ ! -f "$archive_h" ] || [ ! -f "$archive_a" ]; then
     exit 2
 fi
 
-fail=0
-# compile_src <source> <c output>
+# compile_src <source> <c output>; returns 1 when gen0 does not compile it.
 compile_src() {
     src="$1"; cfile="$2"
     log="$out/$(basename "$cfile" .c).log"
@@ -67,13 +66,17 @@ compile_src() {
     if [ "$rc" -ne 0 ] || [ "$errs" -ne 0 ] || [ ! -s "$cfile" ]; then
         echo "gen1: FAIL gen0 does not compile $src (exit $rc, $errs error line(s)); see $log"
         grep -m5 'error\[' "$log" | sed 's/^/  /'
-        fail=1
-    else
-        echo "gen1: ok gen0 compiles $src"
+        return 1
     fi
+    echo "gen1: ok gen0 compiles $src"
 }
-compile_src src/blinkc_main.bl "$out/blinkc.c"
-compile_src src/cli.bl "$out/cli.c"
+# The two compiles share nothing but their inputs, so they run side by side. Each
+# PID is waited on by itself: a bare `wait` returns 0 and would hide a failure.
+compile_src src/blinkc_main.bl "$out/blinkc.c" & blinkc_pid=$!
+compile_src src/cli.bl "$out/cli.c" & cli_pid=$!
+fail=0
+wait "$blinkc_pid" || fail=1
+wait "$cli_pid" || fail=1
 [ "$fail" -eq 0 ] || exit 1
 
 # link_bin <binary> <c file>
@@ -85,8 +88,12 @@ link_bin() {
         exit 1
     fi
 }
-link_bin blinkc blinkc.c
-link_bin blink cli.c
+link_bin blinkc blinkc.c & blinkc_pid=$!
+link_bin blink cli.c & cli_pid=$!
+fail=0
+wait "$blinkc_pid" || fail=1
+wait "$cli_pid" || fail=1
+[ "$fail" -eq 0 ] || exit 1
 
 # Compat links for callers that still look for the tools beside the compiler rather
 # than under share/blink. Guarded so a sidecar gen0 does not ship never becomes a
