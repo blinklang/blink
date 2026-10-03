@@ -2801,6 +2801,17 @@ Valid severity levels: `"off"` (suppress), `"warn"` (default for W0550/W0551), `
 
 **Precedence:** Function-level `@allow` always overrides project-level `blink.toml` configuration. A function annotated with `@allow(UnrestoredMutation)` will not emit W0551 even if `blink.toml` sets `W0551 = "error"`.
 
+**Unknown names.** Each `@allow` argument and each `[lints]` key must identify a live diagnostic. A misspelled name, a retired name or code, or a code given to `@allow` is the error `UnknownDiagnosticName` (E0842). No `@allow` or `[lints]` entry suppresses it, so a typo cannot silently disable a suppression or an `"error"` gate.
+
+```blink
+@allow(UnrestoredMutaton)   // error[UnknownDiagnosticName]: help: did you mean `UnrestoredMutation`?
+fn parse_fast() -> Node {
+    parse_simple()
+}
+```
+
+ERROR_CATALOG.md *Conventions* gives the `help:` line for each case and what `blink explain` prints for a retired or unknown name.
+
 #### 4.16.9 No Runtime Effect
 
 Mutation analysis changes no program behavior. It only produces diagnostics and tooling data.
