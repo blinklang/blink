@@ -1,0 +1,211 @@
+// The type pool interns compound types, so for canonically built compounds tid equality is
+// type equality: building the same compound twice answers the same tid and adds no entry.
+// The intern key is over the raw child tids as stored. Two different unbound metavars are two
+// different children, so a compound over each must get its own tid; if the key ever merged
+// them, `let a: Option[Int] = None` and `let b: Option[Str] = None` would share one alpha and
+// binding it through `a` would silently retype `b`.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, make_list_type, make_set_type, make_option_type, make_result_type, make_map_type, make_tuple_type, make_fn_type, make_struct_instance_type, make_enum_instance_type, make_handle_type, make_channel_type, make_iterator_type, make_ptr_type, make_template_type, make_raw_type, make_handler_type, make_ffi_scope_type, make_metavar}
+import parser.{nodes}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got}, want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_ne_int(label: Str, a: Int, b: Int) {
+    if a == b { io.println("FAIL: {label}: both are {a}") }
+    assert(a != b)
+}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The first node tid whose rendering is `want`, or -1.
+fn find_tid_by_str(want: Str) -> Int {
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want { return tid }
+        idx = idx + 1
+    }
+    -1
+}
+
+// Counts distinct tids by a linear scan over a List. A Map keyed by the rendering would
+// merge equal strings on insert and could never see two tids for one type.
+fn count_distinct_tids_by_str(want: Str) -> Int {
+    let mut distinct: List[Int] = []
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 && tc_type_str(tid) == want && !distinct.contains(tid) { distinct.push(tid) }
+        idx = idx + 1
+    }
+    distinct.len()
+}
+
+fn scalar_probe_src() -> Str {
+    "fn probe() -> Int \{\n    let a = 1\n    let b = \"s\"\n    a\n}\n"
+}
+
+// Scalar tids are private globals seeded by check_types, which also resets the pool and the
+// intern table, so every test harvests first and builds compounds after.
+fn harvest(path: Str, want: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    typecheck_probe(path, scalar_probe_src())
+    let tid = find_tid_by_str(want)
+    if tid < 0 { io.println("FAIL: the probe produced no {want} tid") }
+    assert(tid >= 0)
+    tid
+}
+
+// make_metavar never interns, so the tid it mints is the pool length at that moment.
+fn pool_len_now() -> Int { make_metavar() }
+
+test "each compound constructor answers one tid for a repeat construction" {
+    let i = harvest("build/test_typecheck_ty_pool_interns_compounds_a.bl", "Int")
+    let s = find_tid_by_str("Str")
+    assert(s >= 0)
+    assert_eq_int("List", make_list_type(i), make_list_type(i))
+    assert_eq_int("Set", make_set_type(i), make_set_type(i))
+    assert_eq_int("Option", make_option_type(i), make_option_type(i))
+    assert_eq_int("Result", make_result_type(i, s), make_result_type(i, s))
+    assert_eq_int("Map", make_map_type(s, i), make_map_type(s, i))
+    assert_eq_int("Tuple", make_tuple_type([i, s]), make_tuple_type([i, s]))
+    assert_eq_int("Fn", make_fn_type(i, [s, i]), make_fn_type(i, [s, i]))
+    assert_eq_int("struct instance", make_struct_instance_type("Box", [i]), make_struct_instance_type("Box", [i]))
+    assert_eq_int("enum instance", make_enum_instance_type("Tree", [i]), make_enum_instance_type("Tree", [i]))
+    assert_eq_int("Handle", make_handle_type(i), make_handle_type(i))
+    assert_eq_int("Channel", make_channel_type(i), make_channel_type(i))
+    assert_eq_int("Iterator", make_iterator_type(i), make_iterator_type(i))
+    assert_eq_int("Ptr", make_ptr_type(i), make_ptr_type(i))
+    assert_eq_int("Template", make_template_type(i), make_template_type(i))
+    assert_eq_int("Raw", make_raw_type(i), make_raw_type(i))
+    assert_eq_int("Handler", make_handler_type("Metrics"), make_handler_type("Metrics"))
+    assert_eq_int("FfiScope", make_ffi_scope_type(), make_ffi_scope_type())
+    // Nested: the outer key is over the inner tid, which is itself interned.
+    assert_eq_int("Option[Box[Int]]", make_option_type(make_struct_instance_type("Box", [i])), make_option_type(make_struct_instance_type("Box", [i])))
+}
+
+test "different children, names or kinds give different tids" {
+    let i = harvest("build/test_typecheck_ty_pool_interns_compounds_b.bl", "Int")
+    let s = find_tid_by_str("Str")
+    assert(s >= 0)
+    assert_ne_int("List[Int] vs List[Str]", make_list_type(i), make_list_type(s))
+    assert_ne_int("Set[Int] vs Set[Str]", make_set_type(i), make_set_type(s))
+    assert_ne_int("Option[Int] vs Option[Str]", make_option_type(i), make_option_type(s))
+    assert_ne_int("Result[Int, Str] vs Result[Str, Int]", make_result_type(i, s), make_result_type(s, i))
+    assert_ne_int("Map[Str, Int] vs Map[Int, Str]", make_map_type(s, i), make_map_type(i, s))
+    assert_ne_int("Tuple[Int, Str] vs Tuple[Str, Int]", make_tuple_type([i, s]), make_tuple_type([s, i]))
+    assert_ne_int("Tuple2 vs Tuple3", make_tuple_type([i, s]), make_tuple_type([i, s, i]))
+    assert_ne_int("Fn return", make_fn_type(i, [s]), make_fn_type(s, [s]))
+    assert_ne_int("Fn params", make_fn_type(i, [s]), make_fn_type(i, [i]))
+    assert_ne_int("Fn arity", make_fn_type(i, [s]), make_fn_type(i, [s, s]))
+    assert_ne_int("Box[Int] vs Box[Str]", make_struct_instance_type("Box", [i]), make_struct_instance_type("Box", [s]))
+    assert_ne_int("Box[Int] vs Cell[Int]", make_struct_instance_type("Box", [i]), make_struct_instance_type("Cell", [i]))
+    // The name is raw, so a module-qualified namesake stays a different type.
+    assert_ne_int("Box vs helper.Box", make_struct_instance_type("Box", [i]), make_struct_instance_type("helper.Box", [i]))
+    assert_ne_int("struct vs enum of one name", make_struct_instance_type("Box", [i]), make_enum_instance_type("Box", [i]))
+    assert_ne_int("List vs Set over Int", make_list_type(i), make_set_type(i))
+    assert_ne_int("Option vs Raw over Int", make_option_type(i), make_raw_type(i))
+    assert_ne_int("Handle vs Channel over Int", make_handle_type(i), make_channel_type(i))
+    assert_ne_int("Handler[Metrics] vs Handler[IO]", make_handler_type("Metrics"), make_handler_type("IO"))
+}
+
+test "a repeat construction adds no pool entry" {
+    let i = harvest("build/test_typecheck_ty_pool_interns_compounds_c.bl", "Int")
+    let s = find_tid_by_str("Str")
+    assert(s >= 0)
+    let _ = make_option_type(make_map_type(s, make_list_type(i)))
+    let _ = make_fn_type(i, [make_tuple_type([i, s])])
+    let _ = make_struct_instance_type("Pair", [i, s])
+    let before = pool_len_now()
+    let _ = make_option_type(make_map_type(s, make_list_type(i)))
+    let _ = make_fn_type(i, [make_tuple_type([i, s])])
+    let _ = make_struct_instance_type("Pair", [i, s])
+    let _ = make_raw_type(i)
+    let _ = make_raw_type(i)
+    // One entry for the first Raw[Int], then the probe metavar itself.
+    assert_eq_int("pool grew only by the new Raw[Int]", pool_len_now(), before + 2)
+}
+
+// The tripwire for the invariant in the file header. Do not delete it.
+test "a compound over two different fresh metavars gets two tids" {
+    let a = make_metavar()
+    let b = make_metavar()
+    assert_ne_int("the metavars differ", a, b)
+    assert_ne_int("Option over each", make_option_type(a), make_option_type(b))
+    assert_ne_int("List over each", make_list_type(a), make_list_type(b))
+    assert_ne_int("Map[_, each]", make_map_type(a, a), make_map_type(a, b))
+    assert_ne_int("Tuple over each", make_tuple_type([a]), make_tuple_type([b]))
+    assert_ne_int("Box over each", make_struct_instance_type("Box", [a]), make_struct_instance_type("Box", [b]))
+    // The same metavar is the same child, so that one does intern.
+    assert_eq_int("Option over one metavar twice", make_option_type(a), make_option_type(a))
+}
+
+fn none_probe_src() -> Str {
+    #"fn main() {
+    let a: Option[Int] = None
+    let b: Option[Str] = None
+    assert(a.is_none())
+    assert(b.is_none())
+}
+"#
+}
+
+test "two annotated None bindings do not share one alpha" {
+    typecheck_probe("build/test_typecheck_ty_pool_interns_compounds_d.bl", none_probe_src())
+    let a_tid = find_tid_by_str("Option[Int]")
+    let b_tid = find_tid_by_str("Option[Str]")
+    assert(a_tid != -1)
+    assert(b_tid != -1)
+    assert_ne_int("Option[Int] vs Option[Str]", a_tid, b_tid)
+}
+
+fn two_sites_probe_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+fn make_a() -> Option[Box[Int]] {
+    Some(Box { v: 1 })
+}
+
+fn make_b() -> Option[Box[Int]] {
+    Some(Box { v: 2 })
+}
+
+fn main() {
+    let a = make_a()
+    let b = make_b()
+    assert(a.is_some())
+    assert(b.is_some())
+}
+"#
+}
+
+test "Option[Box[Int]] written at two independent sites is one tid" {
+    typecheck_probe("build/test_typecheck_ty_pool_interns_compounds_e.bl", two_sites_probe_src())
+    assert_eq_int("distinct Option[Box[Int]] tids", count_distinct_tids_by_str("Option[Box[Int]]"), 1)
+}
+
+// check_types clears the intern table with the pool. A table that outlived the pool would
+// hand back tids from the old pool in a long-lived process such as a daemon or LSP.
+test "interning holds across a second check_types run in one process" {
+    let i1 = harvest("build/test_typecheck_ty_pool_interns_compounds_f.bl", "Int")
+    let box1 = make_struct_instance_type("Box", [i1])
+    assert_eq_int("run 1 interns", make_struct_instance_type("Box", [i1]), box1)
+    let i2 = harvest("build/test_typecheck_ty_pool_interns_compounds_g.bl", "Int")
+    let box2 = make_struct_instance_type("Box", [i2])
+    assert_eq_int("run 2 interns", make_struct_instance_type("Box", [i2]), box2)
+    // A fresh compound after the reset is a new entry at the end of the new pool.
+    let next = pool_len_now()
+    assert_eq_int("run 2 Box[Int] is the newest entry before the probe", box2, next - 1)
+}

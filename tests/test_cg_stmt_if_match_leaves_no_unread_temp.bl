@@ -1,0 +1,189 @@
+import compile_test_helpers
+
+// An `if` or a `match` whose value nobody reads is a statement of type `()`, so it gets no
+// result temp. A temp there is harmless at run time, since C never reads it, which is why
+// these rows read the emitted C: a program that runs cannot tell the two apart. The
+// value-position rows guard the other side, so a fix that dropped every temp would fail too.
+
+fn probe_src() -> Str {
+    #"type Box { v: Int }
+fn armtailif(o: Option[Str]) -> Str {
+    match o {
+        Some(p) => {
+            if p != "" { return p }
+        }
+        None => {}
+    }
+    "default"
+}
+fn findbox(o: Option[Box]) -> Box {
+    match o {
+        Some(b) => return b
+        None => {}
+    }
+    Box { v: 0 }
+}
+fn stmtif(n: Int) -> Int {
+    let mut t = 0
+    if n > 0 { t = 1 } else { t = 2 }
+    t
+}
+fn stmtmatch(n: Int) -> Int {
+    let mut t = 0
+    match n {
+        0 => { t = 5 }
+        _ => { t = 6 }
+    }
+    t
+}
+fn valif(c: Bool) -> Int {
+    let vv = if c { 10 } else { 20 }
+    vv
+}
+fn valmatch(n: Int) -> Int {
+    let vm = match n {
+        0 => 100
+        _ => 200
+    }
+    vm
+}
+fn main() {
+    io.println("{armtailif(Some("x"))} {findbox(Some(Box { v: 5 })).v} {stmtif(1)} {stmtmatch(0)}")
+    io.println("{valif(true)} {valmatch(0)}")
+}
+"#
+}
+
+// One compile serves every row.
+let mut probe_c = ""
+
+fn emitted_c() -> Str {
+    if probe_c == "" {
+        probe_c = compile_test_helpers.compile_and_emit_c(probe_src(), "cg_stmt_if_match_no_unread_temp")
+    }
+    probe_c
+}
+
+// The C definition of `name`, from its signature line to the closing brace at column 0.
+// Temp numbers are global across the file, so a row reads one function, never the whole C.
+fn fn_body(c: Str, name: Str) -> Str {
+    let head = "blink_u_{name}("
+    let mut out = ""
+    let mut inside = false
+    for line in c.lines() {
+        if inside {
+            out = out.concat(line).concat("\n")
+            if line == "}" { return out }
+        } else if line.contains(head) && line.ends_with(") \{") {
+            inside = true
+            out = line.concat("\n")
+        }
+    }
+    out
+}
+
+// The statement stage names the result temp of a value-position `if` or `match`
+// `_cg_val<N>`. A digit must follow, because `_cg_vals<N>` is a different temp.
+fn has_result_temp(body: Str) -> Bool {
+    let needle = "_cg_val"
+    let mut rest = body
+    while rest.contains(needle) {
+        let after = rest.index_of(needle) + needle.len()
+        if after < rest.len() && "0123456789".contains(rest.slice(after, after + 1)) { return true }
+        rest = rest.slice(after, rest.len())
+    }
+    false
+}
+
+fn assert_no_result_temp(name: Str) {
+    let body = fn_body(emitted_c(), name)
+    if body == "" { io.println("FAIL: no C definition of `{name}`") }
+    assert(body != "")
+    if has_result_temp(body) { io.println("FAIL: `{name}` declares a result temp nothing reads:\n{body}") }
+    assert(!has_result_temp(body))
+}
+
+fn assert_result_temp(name: Str) {
+    let body = fn_body(emitted_c(), name)
+    if body == "" { io.println("FAIL: no C definition of `{name}`") }
+    assert(body != "")
+    if !has_result_temp(body) { io.println("FAIL: `{name}` lost the result temp its reader needs:\n{body}") }
+    assert(has_result_temp(body))
+}
+
+// The arm's tail is an else-less `if`, which never yields a value, and its only branch
+// returns, so the enclosing return type must not leak in as a temp type.
+test "an else-less if at the tail of a statement match arm gets no result temp" {
+    assert_no_result_temp("armtailif")
+}
+
+// A struct-returning function: the match must not borrow the function's return type for a
+// temp when its own value is discarded.
+test "a statement match in a struct-returning function gets no result temp" {
+    assert_no_result_temp("findbox")
+}
+
+test "a statement if/else whose arms assign gets no result temp" {
+    assert_no_result_temp("stmtif")
+}
+
+test "a statement match whose arms assign gets no result temp" {
+    assert_no_result_temp("stmtmatch")
+}
+
+test "an if/else whose value is bound keeps its result temp" {
+    assert_result_temp("valif")
+}
+
+test "a match whose value is bound keeps its result temp" {
+    assert_result_temp("valmatch")
+}
+
+// The C rows read the shape only; these run the same functions, so the statement forms
+// still compute what they did with a temp.
+type Box { v: Int }
+
+fn armtailif(o: Option[Str]) -> Str {
+    match o {
+        Some(p) => {
+            if p != "" { return p }
+        }
+        None => {}
+    }
+    "default"
+}
+
+fn findbox(o: Option[Box]) -> Box {
+    match o {
+        Some(b) => return b
+        None => {}
+    }
+    Box { v: 0 }
+}
+
+fn stmtif(n: Int) -> Int {
+    let mut t = 0
+    if n > 0 { t = 1 } else { t = 2 }
+    t
+}
+
+fn stmtmatch(n: Int) -> Int {
+    let mut t = 0
+    match n {
+        0 => { t = 5 }
+        _ => { t = 6 }
+    }
+    t
+}
+
+test "the statement forms compute the right values" {
+    assert_eq(armtailif(Some("x")), "x")
+    assert_eq(armtailif(Some("")), "default")
+    assert_eq(armtailif(None), "default")
+    assert_eq(findbox(Some(Box { v: 5 })).v, 5)
+    assert_eq(findbox(None).v, 0)
+    assert_eq(stmtif(1), 1)
+    assert_eq(stmtif(0), 2)
+    assert_eq(stmtmatch(0), 5)
+    assert_eq(stmtmatch(3), 6)
+}

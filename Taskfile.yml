@@ -121,7 +121,9 @@ tasks:
     desc: Compile and run all test_*.bl files
     deps: [build-cli]
     cmds:
-      - '{{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}}'
+      # Each test binary lands in build/tests/, which has no lib/ beside it, so a
+      # test that compiles a program in process finds the prelude through BLINK_ROOT.
+      - 'BLINK_ROOT="$(pwd)" {{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}}'
 
   build-cli:
     desc: Build the blink CLI tool
@@ -507,6 +509,12 @@ tasks:
     cmds:
       - ./scripts/test_corpus.sh
 
+  test-fmt-semantic:
+    desc: Self-test scripts/run_fmt_semantic.sh and run_fmt_idempotent.sh verdicts on a fake compiler
+    silent: true
+    cmds:
+      - ./scripts/test_fmt_semantic.sh
+
   commit-messages:
     desc: Fail if a commit message on this branch, or the merge at HEAD, names a br id
     silent: true
@@ -528,19 +536,15 @@ tasks:
 
   # Release gate: the old full CI under its new name. Self-host regen, the
   # whole test suite, per-module invariants, installed-layout smoke.
-  #
-  # NOT RUNNABLE during the codegen rewrite: every step below needs a compiler
-  # that can emit C, and this tree raises I0004 until the emitters land. `task ci`
-  # is the daily gate. mono-diff, node-tid-diff and test-node-tid-diff read a
-  # stderr census that run_mono_diff produced; that pass went with the old mono,
-  # so those three cannot pass either until the rewrite restores or retires them.
+  # mono-diff, node-tid-diff and test-node-tid-diff read a stderr census that
+  # went with the old mono, so no gate runs them.
   ci-release:
     desc: Release CI (self-host regen + full suite + per-module invariants)
     silent: true
     cmds:
       - task: ratchet
       - task: test-ratchet
-      - task: test-node-tid-diff
+      - task: test-fmt-semantic
       - task: ci-monolith
       - task: ci-per-module-checks
 
@@ -625,7 +629,8 @@ tasks:
   #   (a) gen0 compiles the current compiler sources (gen1)
   #   (b) the debt counts hold, no commit message names a br id, and every gate
   #       script catches what it exists to catch (ratchet, commit-messages,
-  #       test-ratchet, test-lint, test-corpus, test-commit-messages)
+  #       test-ratchet, test-lint, test-corpus, test-fmt-semantic,
+  #       test-commit-messages)
   #   (c) the corpus pass count is monotone (corpus, then corpus-check)
   #   (d) formatter goldens with the gen1 compiler
   #   (e) the typecheck suite passes in full
@@ -641,6 +646,7 @@ tasks:
       - task: test-ratchet
       - task: test-lint
       - task: test-corpus
+      - task: test-fmt-semantic
       - task: commit-messages
       - task: test-commit-messages
       - task: corpus
@@ -667,6 +673,7 @@ tasks:
       - task: test-ratchet
       - task: test-lint
       - task: test-corpus
+      - task: test-fmt-semantic
       - task: commit-messages
       - task: test-commit-messages
       - task: corpus-sample
@@ -742,7 +749,7 @@ tasks:
         {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
         sed -i 's/blink_cli_version = "dev"/blink_cli_version = "{{.VERSION}}-dev+'"$(date +%Y%m%d%H%M%S)"'"/' {{.BUILD_DIR}}/cli.c
         cc -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -I{{.BUILD_DIR}} {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
-      - '{{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet'
+      - 'BLINK_ROOT="$(pwd)" {{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet'
       - task: test-bootstrap-cold
       - task: test-sqlite-peel
       - task: __fmt-goldens
@@ -837,7 +844,7 @@ tasks:
         '
 
         # Phase 5: full test suite (429-ish files).
-        time_phase blink-test "{{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet"
+        time_phase blink-test "BLINK_ROOT=$(pwd) {{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet"
 
         # Phase 6: fmt waves — each parallel invocation timed separately and
         # given its own --joblog so per-file timings are available for free.
@@ -892,6 +899,8 @@ tasks:
       - lib/std/*.bl
       - tests/multifile/src/*.bl
       - tests/multifile_stdlib_priv/src/*.bl
+      - tests/multifile_effect/src/*.bl
+      - tests/multifile_runtime_state/src/*.bl
     cmds:
       - |
         set -e
@@ -946,6 +955,39 @@ tasks:
           echo "FAIL ci-per-module-checks: stdlib-priv per-module output differs from monolith"
           echo "--- monolith"; cat "$TMPDIR/priv_mono.out"
           echo "--- per-module"; cat "$TMPDIR/priv_pm.out"
+          exit 1
+        fi
+
+        # A user effect declared in one module and handled in another: every
+        # module header names blink_ev and the effect's vtable in its
+        # prototypes, so the header must carry both typedefs.
+        {{.BUILD_DIR}}/blink run tests/multifile_effect/src/main.bl > "$TMPDIR/eff_mono.out" 2>&1
+        mkdir -p "$TMPDIR/eff_pm"
+        {{.BUILD_DIR}}/blink __emit-per-module tests/multifile_effect/src/main.bl "$TMPDIR/eff_pm"
+        cc -o "$TMPDIR/eff_pm/bin" $(ls "$TMPDIR"/eff_pm/*.c | sort) -Ibuild -lm -lgc
+        "$TMPDIR/eff_pm/bin" > "$TMPDIR/eff_pm.out" 2>&1
+        if diff -u "$TMPDIR/eff_mono.out" "$TMPDIR/eff_pm.out" > /dev/null; then
+          echo "ci-per-module-checks: ok (cross-module effect, output matches monolith)"
+        else
+          echo "FAIL ci-per-module-checks: cross-module effect per-module output differs from monolith"
+          echo "--- monolith"; cat "$TMPDIR/eff_mono.out"
+          echo "--- per-module"; cat "$TMPDIR/eff_pm.out"
+          exit 1
+        fi
+
+        # Runtime state (argv here) set by main() must be the state every
+        # other module object reads, not a private per-object copy.
+        {{.BUILD_DIR}}/blink run tests/multifile_runtime_state/src/main.bl > "$TMPDIR/rt_mono.out" 2>&1
+        mkdir -p "$TMPDIR/rt_pm"
+        {{.BUILD_DIR}}/blink __emit-per-module tests/multifile_runtime_state/src/main.bl "$TMPDIR/rt_pm"
+        cc -o "$TMPDIR/rt_pm/bin" $(ls "$TMPDIR"/rt_pm/*.c | sort) -Ibuild -lm -lgc
+        "$TMPDIR/rt_pm/bin" > "$TMPDIR/rt_pm.out" 2>&1
+        if diff -u "$TMPDIR/rt_mono.out" "$TMPDIR/rt_pm.out" > /dev/null; then
+          echo "ci-per-module-checks: ok (runtime state shared across module objects)"
+        else
+          echo "FAIL ci-per-module-checks: a module object reads its own copy of runtime state"
+          echo "--- monolith"; cat "$TMPDIR/rt_mono.out"
+          echo "--- per-module"; cat "$TMPDIR/rt_pm.out"
           exit 1
         fi
 

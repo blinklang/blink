@@ -40,7 +40,7 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 | `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `test-corpus`, `commit-messages`, `test-commit-messages`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `typecheck-suite`, `rewrite-suite`. | Any step fails. |
 | `task gen1` | gen0 compiles `src/blinkc_main.bl` and `src/cli.bl`, then links `build/gen1/bin/blinkc` and `build/gen1/bin/blink`. | Nonzero exit, an `error[` line, or a link error. |
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen1. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
-| `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. A test that now lives in `tests/pinned/` is dropped from both references first. | The pass count drops, or a file that passed no longer passes. |
+| `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. | The pass count drops, or a file that passed no longer passes. |
 | `task corpus-baseline` | Rewrites `scripts/corpus_baseline.json` from `build/corpus.json`. Run it only after a real gain. | Never. |
 | `task ci-fast` | The branch gate: every step of `ci`, with `corpus-sample` in place of `corpus` and `corpus-check`. | Any step fails. |
 | `task corpus-sample` | Compiles and runs the files in `scripts/corpus_sample.txt` under gen1 and holds the pass count to the `# floor:` line in that list. Writes `build/corpus_sample.json`. | Fewer files pass than the floor. It names them. |
@@ -50,9 +50,9 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 | `task ratchet` | Debt counts over the whole compiler (see below), then the lint. | A count rises, on the tip or on any commit of the branch, or a zero-gate row is not zero. |
 | `task typecheck-suite` | Runs the files in `scripts/typecheck_suite.txt` under gen0. They assert typechecker behaviour by RUNNING, so they need a compiler that can emit; under gen0 the suite measures gen0's typechecker, not this tree's. | Any file does not pass. |
 | `task rewrite-suite` | Runs every rewrite unit-test file under gen0: `tests/test_cg_*.bl`, `test_layout_*.bl`, `test_cname_*.bl`, `test_ir_*.bl`, minus `scripts/rewrite_suite_exclude.txt`. Writes `build/rewrite_suite.json`. | Any file does not pass, a prelude root is missing, one of the four prefixes matches no file, the exclude file is gone, or an exclude line names a file that does not exist or that the glob does not select. |
-| `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke. `mono-diff` and `node-tid-diff` are parked: still tasks, no longer in any gate. | Any step fails. |
+| `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke. `mono-diff`, `node-tid-diff` and `test-node-tid-diff` are parked: still tasks, no longer in any gate. | Any step fails. |
 
-`mono-diff` and `node-tid-diff` still exist as tasks. Neither gate runs
+`mono-diff`, `node-tid-diff` and `test-node-tid-diff` still exist as tasks. No gate runs
 them.
 
 The formatter step in `task ci` runs the golden and idempotency checks
@@ -73,8 +73,7 @@ joins the suite by existing, and nobody can forget it. To keep a file out,
 name it in `scripts/rewrite_suite_exclude.txt` with a reason above the line.
 A line there must name a file that exists and that the glob selects, or the
 suite stops; an exclusion that names no file hides a file instead of skipping
-it. The glob is not recursive, so a test parked in `tests/pinned/` needs no
-line. Each prefix must also match at least one file, or a whole group could
+it. Each prefix must also match at least one file, or a whole group could
 leave the suite and the other three would still report ok.
 
 The suite runs through `corpus.sh --only`, so each file gets the same private

@@ -1,0 +1,160 @@
+// A mono instance's C name must be injective over (base, arguments): two distinct
+// instances that spell one name are one typedef or function, and the `#ifndef BLINK_TD_`
+// guard drops the second definition. The producer escapes a literal `_` to `_1` and joins
+// arguments with `_0`, so an underscore in a base or an argument cannot fake a separator.
+// Each row compares whole names; a pinned spelling alone would not catch a collision.
+
+import typecheck.{make_tuple_type}
+import ast.{NodeKind}
+import cname.{c_mono_fn_name, c_mono_type_c_name, c_typedef_name}
+import cname_test_helpers.{assert_eq_str, find_decl, tid_of, compile_probe}
+import std.io
+
+fn probe_src() -> Str {
+    #"type A { n: Int }
+type B { n: Int }
+type C { n: Int }
+type D { n: Int }
+type A_B { n: Int }
+type B_C { n: Int }
+type C_D { n: Int }
+type _Int { n: Int }
+type Box[T] { v: T }
+type Box_[T] { v: T }
+type Box_0A { n: Int }
+fn a[T](x: T) -> T { x }
+fn a_b[T](x: T) -> T { x }
+fn box[T](x: T) -> T { x }
+fn box_[T](x: T) -> T { x }
+fn main() {
+    let a0 = A { n: 1 }
+    let ba: Box[A] = Box { v: a0 }
+    let bab: Box[A_B] = Box { v: A_B { n: 1 } }
+    let bba: Box[Box[A]] = Box { v: ba }
+    let b0a = Box_0A { n: 1 }
+    let bb0a: Box[Box_0A] = Box { v: b0a }
+    let b_a: Box_[A] = Box_ { v: a0 }
+    let _b = B { n: 1 }
+    let _c = C { n: 1 }
+    let _d = D { n: 1 }
+    let _bc = B_C { n: 1 }
+    let _cd = C_D { n: 1 }
+    let _i = _Int { n: 1 }
+    let _r = a(1)
+    let _s = a_b(1)
+    let _t = box(1)
+    let _u = box_(1)
+    io.println("{bab.v.n} {bba.v.v.n} {bb0a.v.n} {b_a.v.n}")
+}
+"#
+}
+
+fn assert_all_distinct(label: Str, names: List[Str]) {
+    let mut i = 0
+    while i < names.len() {
+        let mut j = i + 1
+        while j < names.len() {
+            let ni = names.get(i).unwrap()
+            let nj = names.get(j).unwrap()
+            if ni == nj { io.println("FAIL: {label}: rows {i} and {j} both spell '{ni}'") }
+            assert(ni != nj)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// The arity mismatch is on purpose: the producer reads the argument list off the tuple,
+// and these four lists all joined to `A_B_C_D` under a bare `_` separator.
+fn underscore_split_names(m: Map[Str, Int]) -> List[Str] {
+    let fa = find_decl(NodeKind.FnDef, "a", "")
+    let fab = find_decl(NodeKind.FnDef, "a_b", "")
+    let b = tid_of(m, "B")
+    let c = tid_of(m, "C")
+    let d = tid_of(m, "D")
+    [
+        c_mono_fn_name(fa, make_tuple_type([b, c, d])),
+        c_mono_fn_name(fab, make_tuple_type([c, d])),
+        c_mono_fn_name(fa, make_tuple_type([tid_of(m, "B_C"), d])),
+        c_mono_fn_name(fa, make_tuple_type([b, tid_of(m, "C_D")])),
+    ]
+}
+
+// An underscore on each side of the base/argument boundary. Under a doubling escape both
+// spelled `box___Int`.
+fn boundary_names(m: Map[Str, Int]) -> List[Str] {
+    [
+        c_mono_fn_name(find_decl(NodeKind.FnDef, "box_", ""), make_tuple_type([tid_of(m, "Int")])),
+        c_mono_fn_name(find_decl(NodeKind.FnDef, "box", ""), make_tuple_type([tid_of(m, "_Int")])),
+    ]
+}
+
+fn type_instance_names(m: Map[Str, Int]) -> List[Str] {
+    [
+        c_mono_type_c_name(tid_of(m, "Box[A]")),
+        c_mono_type_c_name(tid_of(m, "Box[A_B]")),
+        c_mono_type_c_name(tid_of(m, "Box[Box[A]]")),
+        c_mono_type_c_name(tid_of(m, "Box_[A]")),
+    ]
+}
+
+test "an underscore inside a base or an argument never reads as an argument separator" {
+    let m = compile_probe("cname_mono_injective", probe_src())
+    let names = underscore_split_names(m)
+    assert_eq_str("a[B, C, D]", names.get(0).unwrap(), "blink_a_0B_0C_0D")
+    assert_eq_str("a_b[C, D]", names.get(1).unwrap(), "blink_a_1b_0C_0D")
+    assert_eq_str("a[B_C, D]", names.get(2).unwrap(), "blink_a_0B_1C_0D")
+    assert_eq_str("a[B, C_D]", names.get(3).unwrap(), "blink_a_0B_0C_1D")
+    assert_all_distinct("underscore split", names)
+}
+
+test "an underscore at the base/argument boundary stays on its own side" {
+    let m = compile_probe("cname_mono_injective", probe_src())
+    let names = boundary_names(m)
+    assert_eq_str("box_[Int]", names.get(0).unwrap(), "blink_box_1_0Int")
+    assert_eq_str("box[_Int]", names.get(1).unwrap(), "blink_box_0_1Int")
+    assert_all_distinct("boundary", names)
+}
+
+test "struct instances over underscore and nested arguments spell distinct names" {
+    let m = compile_probe("cname_mono_injective", probe_src())
+    let names = type_instance_names(m)
+    assert_eq_str("Box[A]", names.get(0).unwrap(), "blink_Box_0A")
+    assert_eq_str("Box[A_B]", names.get(1).unwrap(), "blink_Box_0A_1B")
+    assert_eq_str("Box[Box[A]]", names.get(2).unwrap(), "blink_Box_0Box_10A")
+    assert_eq_str("Box_[A]", names.get(3).unwrap(), "blink_Box_1_0A")
+    assert_all_distinct("type instances", names)
+}
+
+// Every row above in one pool: a later escape change can trade a collision in one group
+// for a collision across groups.
+test "every mono name in the probe is distinct from every other" {
+    let m = compile_probe("cname_mono_injective", probe_src())
+    let mut all: List[Str] = []
+    for n in underscore_split_names(m) { all.push(n) }
+    for n in boundary_names(m) { all.push(n) }
+    for n in type_instance_names(m) { all.push(n) }
+    assert_all_distinct("all", all)
+}
+
+// A declared name is not escaped, so a user type spelled like an escaped instance stem
+// takes that stem's C name.
+test.failing(
+    "a bare type named like an instance stem does not share the instance's C name",
+    reason: "c_type_decl_name does not escape a declared name, so `type Box_0A` and `Box[A]` both spell blink_Box_0A; a program that uses both fails in cc because the typedef guard drops the second struct",
+) {
+    let m = compile_probe("cname_mono_injective", probe_src())
+    let bare = c_typedef_name(tid_of(m, "Box_0A"))
+    let inst = c_mono_type_c_name(tid_of(m, "Box[A]"))
+    assert(bare != inst, "Box_0A and Box[A] both spell '{bare}'")
+}
+
+test.failing(
+    "an argument named like an instance stem does not share the nested instance's C name",
+    reason: "c_type_decl_tag does not escape a declared name, so Box[Box_0A] and Box[Box[A]] both spell blink_Box_0Box_10A",
+) {
+    let m = compile_probe("cname_mono_injective", probe_src())
+    let flat = c_mono_type_c_name(tid_of(m, "Box[Box_0A]"))
+    let nested = c_mono_type_c_name(tid_of(m, "Box[Box[A]]"))
+    assert(flat != nested, "Box[Box_0A] and Box[Box[A]] both spell '{flat}'")
+}

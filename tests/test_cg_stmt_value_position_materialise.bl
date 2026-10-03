@@ -23,7 +23,7 @@ import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_expr.{cg_expr_reset, cg_expr_pending_count}
 import lower_test_helpers.{
-    assert_eq_str, ice_count, ice_count_exactly, last_ice, shape,
+    assert_eq_str, ice_count, last_ice, shape,
 }
 
 fn find_fn(name: Str) -> Int {
@@ -173,36 +173,34 @@ test "an arm ending in a loop no break leaves counts as leaving the block" {
         "Block(Let(Const), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Loop(Block))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
-// The three places the materialiser will not put a temp, because a temp filled in front of
-// the statement runs a different number of times than the expression that reads it. Each
-// leaves the expression stage with no temp to read, and it refuses by name.
+// The three places the materialiser will not put a temp in front of the statement, because
+// there the temp would run a different number of times than the expression that reads it.
+// Each gets a walk of its own where it runs, so its temp is filled there.
 
-test "an if in the right operand of a short-circuit is left to refuse in the reader" {
+test "an if in the right operand of a short-circuit fills its temp inside the branch that runs it" {
     let body = probe_body("cg_stmt_value_short_circuit", #"fn main() {
     let c = 1
     let held = c > 0 && (if c > 1 { true } else { false })
     let _keep = [held]
 }
 "#, "main")
-    assert_eq_str("reader shape", shape(body),
-        "Block(Let(Const), Let(Const), Let(ContainerNew(Cast(Cast(VarRef)))))")
-    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Binary(VarRef, Const)), If(VarRef, Block(Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Assign(VarRef, VarRef))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
-test "an if in a loop test is left to refuse in the reader" {
+test "an if in a loop test fills its temp on every pass, before the test" {
     let body = probe_body("cg_stmt_value_loop_test", #"fn main() {
     let mut c = 1
     while (if c > 0 { true } else { false }) { c = c - 1 }
 }
 "#, "main")
-    assert_eq_str("reader shape", shape(body),
-        "Block(Let(Const), Loop(Block(If(Binary(Const, Const), Block(Break)), Block(Let(Const), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef))))), Assign(VarRef, VarRef)))))")
-    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Loop(Block(Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), If(Binary(VarRef, Const), Block(Break)), Block(Let(Const), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef))))), Assign(VarRef, VarRef)))))")
 }
 
-test "an if in a match guard is left to refuse in the reader" {
+test "an if in a match guard fills its temp after the arm's pattern matched" {
     let body = probe_body("cg_stmt_value_guard", #"fn main() {
     let c = 1
     let picked = match c {
@@ -212,17 +210,15 @@ test "an if in a match guard is left to refuse in the reader" {
     let _keep = [picked]
 }
 "#, "main")
-    assert_eq_str("reader shape", shape(body),
-        "Block(Let(Const), Let, Block(Let(VarRef), Let(Const), If(Binary(VarRef, Const), Block(Let(VarRef), If(Const, Block(Assign(VarRef, Const), Block(Assign(VarRef, VarRef)))))), If(Binary(VarRef, Const), Block(Assign(VarRef, Const), Block(Assign(VarRef, Const)))), If(Binary(VarRef, Const), Block(Unreachable))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
-    assert_eq_str("refusal", last_ice(), "UnmaterialisedValueExpr")
-    assert_eq_str("refusals recorded",
-        "{ice_count_exactly("UnmaterialisedValueExpr", "IfExpr in value position was not materialised")}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let, Block(Let(VarRef), Let(Const), If(Binary(VarRef, Const), Block(Let(VarRef), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), If(VarRef, Block(Assign(VarRef, Const), Block(Assign(VarRef, VarRef)))))), If(Binary(VarRef, Const), Block(Assign(VarRef, Const), Block(Assign(VarRef, Const)))), If(Binary(VarRef, Const), Block(Unreachable))), Let(VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
 // A temp stands at the top of the block, so an arm moved into it runs before everything
 // the source wrote after the point the arm came from. That is only safe when nothing
 // earlier in the statement can decide the arm never runs -- so a construct the walk finds
-// in a place it cannot reorder (the three sections above) still refuses by name. Nothing
+// in a place it cannot reorder (the three sections above) gets a walk of its own. Nothing
 // else that precedes a value-position construct in straight-line code decides whether it
 // runs, so the walk hoists each such part into a temp of its own, ahead of the construct's
 // temp, in the order the source wrote them, rather than refusing.

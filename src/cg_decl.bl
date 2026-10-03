@@ -30,7 +30,7 @@ import cname.{
 }
 import cg_print.{
     print_effect_default_vtable, print_effect_vtable_typedef,
-    print_ev, print_epilogue, print_fn, print_fn_decl, print_vtable_slot_fn, print_foreign_decl, print_global_decl,
+    print_ev, print_ev_typedef, print_epilogue, print_fn, print_fn_decl, print_vtable_slot_fn, print_foreign_decl, print_global_decl,
     print_global_init, print_prologue, print_prologue_declares, print_foreign_includes, print_ffi_layout_asserts,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
     print_typedef_blocks,
@@ -1079,17 +1079,48 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
         let slot_tid = make_handler_type(node_name(e))
         let vtable = c_vtable_type_name(slot_tid)
         let field = c_ev_field_name(slot_tid)
-        if diag_is_ice_seg(vtable) || diag_is_ice_seg(field) {
-            diag_ice_at("EvidenceFieldNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                "no evidence field for effect `{node_name(e)}`", e,
-                "every declared effect must name a slot of the evidence vector; this is a compiler bug")
-            return
-        }
+        if !ev_slot_nameable(e, vtable, field) { return }
         if emit_effect_vtable(e, slot_tid, vtable) == 0 { return }
         vtables.push(vtable)
         fields.push(field)
     }
     print_ev(td_guard_name(c_ev_type_name()), vtables, fields, ev_storage)
+}
+
+// The vector's type and each user effect's vtable type, and nothing that defines storage.
+// A per-module header declares every prototype with a `blink_ev*` parameter, so it needs
+// the type before them; the default vtables and the vector itself stay in the module
+// objects. The object writes the same guarded typedefs again after including the header,
+// and the guards make that second copy a no-op.
+pub fn cg_decl_emit_ev_typedef() ! Diag.Report {
+    let mut vtables: List[Str] = []
+    let mut fields: List[Str] = []
+    for e in cg_reg_effect_decls() {
+        let slot_tid = make_handler_type(node_name(e))
+        let vtable = c_vtable_type_name(slot_tid)
+        let field = c_ev_field_name(slot_tid)
+        if !ev_slot_nameable(e, vtable, field) { return }
+        if (vtable_state.get(vtable) ?? 0) == 1 { return }
+        let sig = vtable_sig(e, slot_tid)
+        if !sig.ok {
+            vtable_state.insert(vtable, 1)
+            return
+        }
+        emit_vtable_typedef(vtable, sig)
+        vtables.push(vtable)
+        fields.push(field)
+    }
+    print_ev_typedef(td_guard_name(c_ev_type_name()), vtables, fields)
+}
+
+fn ev_slot_nameable(effect_decl: Int, vtable: Str, field: Str) -> Bool ! Diag.Report {
+    if diag_is_ice_seg(vtable) || diag_is_ice_seg(field) {
+        diag_ice_at("EvidenceFieldNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no evidence field for effect `{node_name(effect_decl)}`", effect_decl,
+            "every declared effect must name a slot of the evidence vector; this is a compiler bug")
+        return false
+    }
+    true
 }
 
 // One root effect's vtable struct, a default body per operation, and the default instance the
