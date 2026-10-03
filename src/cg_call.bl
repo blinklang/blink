@@ -55,7 +55,7 @@ import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_im
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
-    c_runtime_helper, c_ffi_symbol, c_mint_local, c_string_literal, c_field_name,
+    c_runtime_helper, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_string_literal, c_field_name,
     cname_ffi_struct_mirror, c_local_name,
     c_variant_discriminant, c_variant_member_name,
     c_container_ctor, c_pool_global,
@@ -66,7 +66,7 @@ import ir.{
     ir_assign, ir_binary, ir_block, ir_break, ir_carrier_tag, ir_carrier_wrap,
     ir_const, ir_global_ref, ir_if, ir_let, ir_loop, ir_panic, ir_struct_new, ir_var_ref, ir_field_get,
     ir_field_set, ir_enum_new, ir_container_new, ir_container_spread, ir_sized_alloc, ir_heap_alloc, ir_select, ir_switch, ir_expr_stmt,
-    ir_return, ir_verify_in_frame,
+    ir_return, ir_verify_in_frame, ir_kind, ir_c_name, ir_c_spelling, ir_slot_form, IrKind,
 }
 import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
@@ -4852,11 +4852,12 @@ fn cc_carrier_read(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag
     let _td = ensure_typedef_for(c.tid)
     // The receiver is bound before it is read twice. The guard and the read each name the
     // binding, so an expression that produced the carrier runs once however many times the
-    // carrier itself is read.
+    // carrier itself is read. A receiver that is already a minted temp is named as it is:
+    // nothing can assign it between here and the read. A local the program named still gets
+    // the copy, because a later operand may assign it before the read runs.
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
-    let name = c_mint_local("u")
-    cg_expr_push_pending(node, ir_let(c.tid, node, c.held.c_spelling, name, c.held.slot_form, recv))
+    let name = cc_receiver_binding(node, c, recv)
     if c.held.slot_form == SlotForm.InlineWord {
         if !cc_push_guard(node, c, name, render, cc_handle_is(node, c, cc_carrier_ref(node, c, name), false)) { return -1 }
         return ir_cast(inner, node, value.c_spelling, cc_carrier_ref(node, c, name))
@@ -4866,6 +4867,16 @@ fn cc_carrier_read(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag
     if !cc_push_guard(node, c, name, render, absent) { return -1 }
     x_unbox_payload(inner, node, cc_carrier_ref(node, c, name), member, value,
         cc_arm_member(kind, cc_read_slot(kind, method)))
+}
+
+fn cc_receiver_binding(node: Int, c: CarrierRef, recv: Int) -> Str ! Diag.Report {
+    if ir_kind(recv) == IrKind.VarRef && c_is_minted_temp(ir_c_name(recv)) &&
+        ir_c_spelling(recv) == c.held.c_spelling && ir_slot_form(recv) == c.held.slot_form {
+        return ir_c_name(recv)
+    }
+    let name = c_mint_local("u")
+    cg_expr_push_pending(node, ir_let(c.tid, node, c.held.c_spelling, name, c.held.slot_form, recv))
+    name
 }
 
 // Which arm the read answers, and which arm it panicked on. They are always the two

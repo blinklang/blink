@@ -774,23 +774,14 @@ fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
         errs.push("root {root}: node id out of range (arena holds {ir_node_count()})")
         return errs
     }
-    let mut seen: List[Int] = []
-    let mut on_stack: List[Int] = []
-    let mut i = 0
-    while i < ir_node_count() {
-        seen.push(0)
-        on_stack.push(0)
-        i += 1
-    }
+    // Keyed by id, not sized to the arena: the arena holds every body of the unit, and the
+    // driver verifies each body, so arena-sized scratch would make a unit quadratic.
+    let mut seen: Map[Int, Int] = Map()
+    let mut on_stack: Map[Int, Int] = Map()
     if ir_kind(root) == IrKind.ContainerSpread {
         errs.push("root {root} (ContainerSpread): {SPREAD_MISPLACED}")
     }
-    let mut first_block: List[Int] = []
-    let mut j = 0
-    while j < ir_node_count() {
-        first_block.push(-1)
-        j += 1
-    }
+    let mut first_block: Map[Int, Int] = Map()
     // -1 is the scope outside every Block. A body is always a Block, so it is only ever the
     // frame a bare fragment sits in, and it encloses everything.
     let mut blocks: List[Int] = [-1]
@@ -888,28 +879,28 @@ let SPREAD_MISPLACED: Str = "ContainerSpread outside a ContainerNew, it extends 
 let VARREF_UNDECLARED: Str = "no enclosing Let, parameter or global declares it"
 let MATERIALIZE_SECOND_BLOCK: Str = "reached from a second block"
 
-fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], first_block: List[Int], blocks: List[Int], errs: List[Str], scope: List[Str], declared: List[Str], scoped: Bool) {
+fn verify_node(id: Int, seen: Map[Int, Int], on_stack: Map[Int, Int], first_block: Map[Int, Int], blocks: List[Int], errs: List[Str], scope: List[Str], declared: List[Str], scoped: Bool) {
     let kind = ir_kind(id)
     let block = blocks.get(blocks.len() - 1).unwrap()
     let label = "node {id} ({ir_kind_name(kind)})"
-    if on_stack.get(id).unwrap() == 1 {
+    if (on_stack.get(id) ?? 0) == 1 {
         errs.push("{label}: cycle, the node contains itself")
         return
     }
-    if seen.get(id).unwrap() == 1 {
+    if (seen.get(id) ?? 0) == 1 {
         if !ir_kind_is_value(kind) {
             errs.push("{label}: statement reached twice, a statement has one owner")
         } else if ir_must_materialize(id) == 0 {
             errs.push("{label}: value reached twice without must_materialize")
-        } else if !blocks.contains(first_block.get(id).unwrap()) {
-            let owner = first_block.get(id).unwrap()
+        } else if !blocks.contains(first_block.get(id) ?? -1) {
+            let owner = first_block.get(id) ?? -1
             errs.push("{label}: {MATERIALIZE_SECOND_BLOCK}, the temporary bound in block {owner} is out of scope in block {block}")
         }
         return
     }
-    seen.set(id, 1)
-    first_block.set(id, block)
-    on_stack.set(id, 1)
+    seen.insert(id, 1)
+    first_block.insert(id, block)
+    on_stack.insert(id, 1)
     verify_fields(id, kind, label, errs)
     if scoped && reads_a_name(kind) && !in_scope(ir_c_name(id), scope, declared) {
         errs.push("{label}: reads `{ir_c_name(id)}`, {VARREF_UNDECLARED}")
@@ -938,7 +929,7 @@ fn verify_node(id: Int, seen: List[Int], on_stack: List[Int], first_block: List[
     // A Let declares its name only after its own initialiser is verified, so `let b = b`
     // reads a name that is not in scope yet, exactly as the C it prints would.
     if scoped && declares_a_name(kind) { scope.push(ir_c_name(id)) }
-    on_stack.set(id, 0)
+    on_stack.insert(id, 0)
 }
 
 fn declares_a_name(kind: IrKind) -> Bool {

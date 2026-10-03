@@ -1,0 +1,111 @@
+// The driver verifies every body of a unit against one arena that is never reset, so the
+// verifier's bookkeeping (which nodes it has reached, which are on the walk, which block
+// first reached each) belongs to one call and keys on node id. These cases build bodies the
+// way a unit does: after many earlier nodes, and after earlier calls to the verifier.
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_node_count, ir_verify, ir_mark_materialize,
+    ir_const, ir_call_direct, ir_expr_stmt, ir_return, ir_if, ir_block,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_rejects(label: Str, root: Int, needle: Str) {
+    let errs = ir_verify(root)
+    let mut hit = 0
+    for e in errs { if e.contains(needle) { hit += 1 } }
+    if hit == 0 { io.println("FAIL: {label}: no error contains '{needle}'; got: {errs.join(" | ")}") }
+    assert_eq_int("{label} reports '{needle}'", if hit > 0 { 1 } else { 0 }, 1)
+}
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq_int("{label} verifies", errs.len(), 0)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn call_f() -> Int { ir_call_direct(1, 0, "int64_t", "main_f", SlotForm.InlineWord, []) }
+
+// Earlier bodies of the unit: valid, verified, and left in the arena.
+fn earlier_bodies(count: Int) {
+    let mut i = 0
+    while i < count {
+        let body = ir_block(0, [ir_expr_stmt(0, call_f()), ir_return(0, int_const("{i}"))])
+        assert_valid("earlier body {i}", body)
+        i += 1
+    }
+}
+
+test "a later body with a value reached twice is rejected after many verified bodies" {
+    ir_reset()
+    earlier_bodies(500)
+    let shared = call_f()
+    let root = ir_block(0, [ir_expr_stmt(0, shared), ir_return(0, shared)])
+    assert_rejects("late shared call", root, "reached twice")
+}
+
+test "a later body with a statement reached twice is rejected after many verified bodies" {
+    ir_reset()
+    earlier_bodies(500)
+    let stmt = ir_expr_stmt(0, call_f())
+    let root = ir_block(0, [stmt, stmt])
+    assert_rejects("late shared statement", root, "statement reached twice")
+}
+
+test "a later body with a cycle is rejected after many verified bodies" {
+    ir_reset()
+    earlier_bodies(500)
+    let self_loop = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [ir_node_count()])
+    assert_rejects("late self cycle", self_loop, "cycle")
+}
+
+test "a later flagged value reached from a second block is rejected after many verified bodies" {
+    ir_reset()
+    earlier_bodies(500)
+    let call = call_f()
+    ir_mark_materialize(call)
+    let arm = ir_block(0, [ir_expr_stmt(0, call)])
+    let root = ir_block(0, [ir_if(0, int_const("1"), arm, -1), ir_return(0, call)])
+    assert_rejects("late call shared with the if arm", root, "reached from a second block")
+}
+
+test "a node reached by an earlier verified body is not reached twice in a later one" {
+    ir_reset()
+    let call = call_f()
+    let first = ir_block(0, [ir_expr_stmt(0, call)])
+    assert_valid("first body reaches the call", first)
+    let second = ir_block(0, [ir_return(0, call)])
+    assert_valid("second body reaches the same call once", second)
+}
+
+test "verifying the same bad body twice reports the same errors both times" {
+    ir_reset()
+    earlier_bodies(50)
+    let shared = call_f()
+    let root = ir_block(0, [ir_expr_stmt(0, shared), ir_return(0, shared)])
+    let once = ir_verify(root)
+    let twice = ir_verify(root)
+    assert_eq_int("error count on the second run", twice.len(), once.len())
+    assert_eq_int("first run reports an error", if once.len() > 0 { 1 } else { 0 }, 1)
+    let mut i = 0
+    while i < once.len() {
+        assert(once.get(i).unwrap() == twice.get(i).unwrap())
+        i += 1
+    }
+}
+
+test "a cycle left by an earlier call does not mark nodes of a later body" {
+    ir_reset()
+    let self_loop = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [ir_node_count()])
+    assert_rejects("self cycle", self_loop, "cycle")
+    let body = ir_block(0, [ir_expr_stmt(0, call_f()), ir_return(0, int_const("0"))])
+    assert_valid("body after the cycle", body)
+}
