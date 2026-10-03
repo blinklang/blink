@@ -50,6 +50,13 @@ log_dir="$root/build/corpus/logs"
 mkdir -p "$log_dir"
 rm -rf "$work"
 mkdir -p "$work/build" "$work/.tmp"
+# corpus.sh builds each vendored native object once per sweep. The build skips
+# its own compile when the object is no older than the source, so -p keeps the
+# mtime; a link instead of a copy saves writing the object into every sandbox.
+for o in "$root"/build/corpus/native/*.o; do
+    [ -f "$o" ] || continue
+    cp -pl "$o" "$work/.tmp/" 2>/dev/null || cp -p "$o" "$work/.tmp/"
+done
 # bootstrap/ is for tests that drive cc over the runtime headers directly.
 for d in tests src lib bootstrap blink.toml; do
     [ -e "$root/$d" ] && ln -s "$root/$d" "$work/$d"
