@@ -24,6 +24,17 @@
 # run the binary; a file with test blocks and a `fn main(` runs with --test.
 # A file with no test blocks is a plain program: compile and run main.
 #
+# Known failures: a test.failing row that still fails counts as a pass, so a
+# file whose only failing rows are known failures passes. The record carries
+# their number as "known_failures", read from the binary's --test-json report
+# (rows with expected_fail and status "passed"); corpus_check.sh fails when
+# it rises. Only a passing file with a top-level test.failing row runs that
+# second time; any other file has no such row, so its count is 0. The files
+# that test test.failing itself hold their rows in source strings, not at top
+# level, so they count 0 like any other file. A report
+# that does not run or does not parse gives null, never 0. A test.failing row
+# that skips does not carry expected_fail in the report, so it is not counted.
+#
 # Env:
 #   CORPUS_BUILD_TIMEOUT  seconds per compile (default 900)
 #   CORPUS_RUN_TIMEOUT    seconds per run (default 600)
@@ -102,6 +113,8 @@ has_tests=0
 if grep -qE '^test "|^test\.failing\(' "$root/$file"; then has_tests=1; fi
 has_main=0
 if grep -q 'fn main(' "$root/$file"; then has_main=1; fi
+has_known=0
+if grep -qE '^test\.failing\(' "$root/$file"; then has_known=1; fi
 
 json_str() { printf '%s' "$1" | jq -Rs .; }
 
@@ -157,14 +170,35 @@ else
         status=pass
     fi
 fi
+known=null
+if [ "$status" = pass ]; then
+    known=0
+    if [ "$has_known" -eq 1 ]; then
+        # A fresh .tmp, so a test that creates a scratch file and asserts it
+        # is new behaves as it did on the first run.
+        rm -rf "$work/.tmp" && mkdir -p "$work/.tmp"
+        report="$log_dir/$base.report.json"
+        (
+            cd "$work" || exit 2
+            unset BLINK_ROOT BLINK_BIN
+            export BLINK_CACHE_DIR=""
+            timeout -k 10 "$run_timeout" "./build/$base" "${run_args[@]}" --test-json
+        ) > "$report" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            known=$(jq -e '[.results[] | select(.expected_fail == true and .status == "passed")] | length' "$report" 2>/dev/null) || known=null
+        else
+            known=null
+        fi
+    fi
+fi
 end=$(date +%s.%N)
 seconds=$(printf '%.2f' "$(echo "$end - $start" | bc)")
 
 # ANSI color codes in the first error line make the JSON hard to read.
 first_error=$(printf '%s' "$first_error" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-300)
 
-printf '{"file":%s,"status":"%s","seconds":%s,"first_error_line":%s}\n' \
-    "$(json_str "$file")" "$status" "$seconds" "$(json_str "$first_error")" \
+printf '{"file":%s,"status":"%s","seconds":%s,"first_error_line":%s,"known_failures":%s}\n' \
+    "$(json_str "$file")" "$status" "$seconds" "$(json_str "$first_error")" "$known" \
     > "$results_dir/$base.json"
 
 # Keep the sandbox small: the binary and C file can be large.
