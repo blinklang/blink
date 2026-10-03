@@ -36,4 +36,16 @@ BLINK_RT_FN const char* blink_strerror(int64_t code) {
 }
 #endif
 
+// Portable errno read. glibc spells the thread-local accessor __errno_location()
+// and macOS spells it __error(), so no single @ffi symbol names it on both.
+// std.libc binds this instead; read it right after the failing call.
+#include <errno.h>
+
+BLINK_RT_FN int64_t blink_errno_get(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_errno_get(void) {
+    return (int64_t)errno;
+}
+#endif
+
 #endif
