@@ -2840,9 +2840,9 @@ error[TypeError]: `Option[List[Widget]]` does not implement `Eq`
 
 #### Integer Division
 
-`Int / Int` performs integer division (truncates toward zero). `Float / Float` performs IEEE 754 division. Division by zero on integers is a runtime panic.
+`Int / Int` performs integer division (truncates toward zero). `Float / Float` performs IEEE 754 division. On every integer type, `a / b` and `a % b` panic when `b` is 0. The panic message contains `division by zero`. The rest of the message and the source location are not specified.
 
-On every integer type, for a non-zero `b`, `a % b` is `a - b * q`, where `q` is the exact quotient of `a` and `b` truncated toward zero, and the arithmetic is on the mathematical integers. The remainder has the sign of `a`, or is 0, and its magnitude is less than the magnitude of `b`. So the remainder is always in the type's range, and `%` never overflows (§3.2, *Overflow behavior*). Where `a / b` does not panic, `a == (a / b) * b + a % b`.
+On every integer type, for a non-zero `b` (a zero `b` panics, as above), `a % b` is `a - b * q`, where `q` is the exact quotient of `a` and `b` truncated toward zero, and the arithmetic is on the mathematical integers. The remainder has the sign of `a`, or is 0, and its magnitude is less than the magnitude of `b`. So the remainder is always in the type's range, and `%` never overflows (§3.2, *Overflow behavior*). Where `a / b` does not panic, `a == (a / b) * b + a % b`.
 
 For a signed type, `MIN / -1` panics, because the quotient `-MIN` is out of range. `MIN % -1` is 0.
 
@@ -2853,6 +2853,8 @@ let r = a % b       // 0
 let q = a / b       // RUNTIME PANIC: I32 overflow in division (-2147483648 / -1)
 let s = -7 % 3      // -1: the sign of the dividend (Python gives 2)
 let t = 7 % -3      // 1
+let z = 0
+let m = 7 % z       // RUNTIME PANIC: Int division by zero
 ```
 
 `%` is not the floored modulo of Python. Code that needs a result in `0..n` for a negative `a` must adjust the remainder itself.
