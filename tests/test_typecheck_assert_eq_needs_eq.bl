@@ -1,0 +1,122 @@
+// assert_eq and assert_ne carry a `T: Eq` bound that is checked the same way as `==`
+// (sections/02_syntax.md, test assertions; 03_types.md, *Container Equality*). A type
+// that `==` refuses is refused here as E0306 TraitBoundNotSatisfied, with the same chain
+// to the innermost type with no `Eq` and the same `@derive(Eq)` help. A container whose
+// parts are `Eq` is accepted.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    init_embedded_stdlib()
+    let path = "/tmp/zz_asserteq_{stem}.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out = out.concat("{d.code} {d.name}: {d.message}\n")
+            for n in d.notes { out = out.concat("note: {n}\n") }
+            if d.help != "" { out = out.concat("help: {d.help}\n") }
+        }
+    }
+    out
+}
+
+fn assert_has(stem: Str, errs: Str, want: Str) {
+    if !errs.contains(want) { io.println("FAIL: {stem}: want '{want}', got:\n{errs}") }
+    assert(errs.contains(want))
+}
+
+fn assert_accepted(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    if errs != "" { io.println("FAIL: {stem}: unexpected diagnostics:\n{errs}") }
+    assert(errs == "")
+}
+
+fn assert_refused(stem: Str, src: Str, operand: Str, chain: Str, help: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    assert_has(stem, errs, "E0306 TraitBoundNotSatisfied: `{operand}` does not implement `Eq`")
+    if chain != "" { assert_has(stem, errs, chain) }
+    assert_has(stem, errs, help)
+}
+
+fn widget_decl() -> Str {
+    "type Widget \{ id: Int }\n\n"
+}
+
+fn assert_src(decls: Str, ty: Str, a: Str, b: Str, call: Str) -> Str {
+    "{decls}test \"t\" \{\n    let a: {ty} = {a}\n    let b: {ty} = {b}\n    {call}(a, b)\n}\n"
+}
+
+test "assert_eq on a struct with no Eq is refused with E0306 and offers derive" {
+    let src = assert_src(widget_decl(), "Widget", "Widget \{ id: 1 }", "Widget \{ id: 1 }", "assert_eq")
+    assert_refused("struct", src, "Widget", "", "add `@derive(Eq)` to `type Widget`")
+}
+
+test "assert_ne on a struct with no Eq is refused the same way" {
+    let src = assert_src(widget_decl(), "Widget", "Widget \{ id: 1 }", "Widget \{ id: 2 }", "assert_ne")
+    assert_refused("struct_ne", src, "Widget", "", "add `@derive(Eq)` to `type Widget`")
+}
+
+test "assert_eq on a List over a struct with no Eq names the struct" {
+    let src = assert_src(widget_decl(), "List[Widget]", "[]", "[]", "assert_eq")
+    assert_refused("list_widget", src, "List[Widget]", "`List[Widget]` is `Eq` only if `Widget` is `Eq`",
+        "add `@derive(Eq)` to `type Widget`")
+}
+
+test "the chain runs from the argument type to the innermost type with no Eq" {
+    let src = assert_src(widget_decl(), "Map[Str, Option[Widget]]", "Map()", "Map()", "assert_eq")
+    assert_refused("map_opt_widget", src, "Map[Str, Option[Widget]]",
+        "`Map[Str, Option[Widget]]` is `Eq` only if `Option[Widget]` is `Eq`", "add `@derive(Eq)` to `type Widget`")
+    assert_has("map_opt_widget", probe("map_opt_widget2", src), "`Option[Widget]` is `Eq` only if `Widget` is `Eq`")
+}
+
+test "assert_eq on an enum whose payload has no Eq names the payload type" {
+    let decls = "{widget_decl()}type Slot \{\n    Held(w: Widget)\n    Empty\n}\n\n"
+    let src = assert_src(decls, "Slot", "Slot.Empty", "Slot.Empty", "assert_eq")
+    assert_refused("enum_payload", src, "Slot", "`Slot` is `Eq` only if `Widget` is `Eq`",
+        "add `@derive(Eq)` to `type Widget`")
+}
+
+test "assert_eq on a type parameter with no Eq bound asks for the bound" {
+    let src = "fn same[T](a: T, b: T) \{\n    assert_eq(a, b)\n}\n\nfn main() \{\n    same(1, 1)\n}\n"
+    assert_refused("generic", src, "T", "", "`[T: Eq]`")
+}
+
+test "a bare None argument asks the other side" {
+    let src = "{widget_decl()}test \"t\" \{\n    let a: Option[Widget] = None\n    assert_eq(a, None)\n}\n"
+    assert_refused("none_lit", src, "Option[Widget]", "", "add `@derive(Eq)` to `type Widget`")
+}
+
+test "containers whose parts are Eq are accepted" {
+    assert_accepted("list", assert_src("", "List[Int]", "[1]", "[1]", "assert_eq"))
+    assert_accepted("set", assert_src("", "Set[Int]", "Set()", "Set()", "assert_eq"))
+    assert_accepted("map", assert_src("", "Map[Str, List[Int]]", "Map()", "Map()", "assert_ne"))
+    assert_accepted("tuple", assert_src("", "(Int, Str)", "(1, \"a\")", "(1, \"a\")", "assert_eq"))
+    assert_accepted("opt", assert_src("", "Option[List[Int]]", "Some([1])", "None", "assert_ne"))
+    assert_accepted("res", assert_src("", "Result[Int, Str]", "Ok(1)", "Err(\"x\")", "assert_ne"))
+}
+
+test "user types that derive or write Eq, and payload enums over Eq parts, are accepted" {
+    let derived = "@derive(Eq)\ntype Point \{ x: Int, y: Int }\n\n"
+    assert_accepted("derived", assert_src(derived, "List[Point]", "[Point \{ x: 1, y: 2 }]", "[]", "assert_ne"))
+    let written = "type Cell \{ v: Int }\n\nimpl Eq for Cell \{\n    fn eq(self, other: Cell) -> Bool \{ self.v == other.v }\n}\n\n"
+    assert_accepted("written", assert_src(written, "Cell", "Cell \{ v: 1 }", "Cell \{ v: 1 }", "assert_eq"))
+    let shape = "type Shape \{\n    Circle(r: Int)\n    Dot\n}\n\n"
+    assert_accepted("enum_eq_payload", assert_src(shape, "Shape", "Shape.Dot", "Shape.Circle(1)", "assert_ne"))
+    assert_accepted("generic_bound", "fn same[T: Eq](a: T, b: T) \{\n    assert_eq(a, b)\n}\n\nfn main() \{\n    same(1, 1)\n}\n")
+}
+
+test "scalars, Str and Float are accepted" {
+    assert_accepted("int", assert_src("", "Int", "1", "1", "assert_eq"))
+    assert_accepted("str", assert_src("", "Str", "\"a\"", "\"b\"", "assert_ne"))
+    assert_accepted("float", assert_src("", "Float", "1.0", "1.0", "assert_eq"))
+}
