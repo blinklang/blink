@@ -1,9 +1,7 @@
 #!/bin/bash
 # Compile and run every tests/test_*.bl independently and write
-# build/corpus.json. This is the progress metric for the codegen rewrite: a
-# pass count over the whole corpus, with no fail-fast and no directory-mode
-# pre-typecheck, so a tree that compiles only part of the corpus still gets
-# an honest number.
+# build/corpus.json, with no fail-fast and no directory-mode pre-typecheck, so
+# one broken file cannot hide the result of the others.
 #
 # The compiler under test is gen1 — the CURRENT source compiled by the pinned
 # gen0. gen0 itself is a fixed binary, so a corpus run against it measures
@@ -29,8 +27,7 @@
 # Exit: 2 when the run itself cannot be trusted (no compiler, malformed JSON).
 # Under --only, 1 when any listed file fails: a bucket names files that must
 # pass, so its exit code must say whether they did. A full run exits 0 with
-# failing files, because its judge is corpus-check against the baseline, not
-# an all-pass rule. A caller that holds a subset to its own floor (the suites,
+# failing files, because its judge is corpus-check. A caller that holds a subset to its own floor (the suites,
 # corpus-sample) accepts 1 and reads the JSON.
 set -u
 cd "$(dirname "$0")/.." || exit 2

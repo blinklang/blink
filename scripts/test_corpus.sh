@@ -4,9 +4,10 @@
 # corpus_sample.sh still holds a subset to its floor instead of stopping on
 # that exit code. Also proves each file's known-failure count (test.failing
 # rows that still fail) comes from the test binary's report, and that
-# corpus_check.sh fails when a count rises. Runs an unmodified copy of the scripts in a throwaway root
-# with a fake compiler, so it takes seconds and never touches this checkout's
-# build/corpus, which a real corpus run beside it may be writing.
+# corpus_check.sh holds the corpus to all-pass. Runs an unmodified copy of the
+# scripts in a throwaway root with a fake compiler, so it takes seconds and
+# never touches this checkout's build/corpus, which a real corpus run beside
+# it may be writing.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -154,49 +155,71 @@ else
     fail=1
 fi
 
-# corpus_check.sh on hand-written result and baseline files. The fixture root
-# is not a git checkout, so only the baseline half runs.
-rec() { printf '{"file":"%s","status":"pass","known_failures":%s}' "$1" "$2"; }
+# corpus_check.sh on hand-written result files. The fixture root holds one
+# stub tests/test_check_N.bl per record, so the total can match the tests on
+# disk. The fixtures above sit in the same tests/ directory, so the check runs
+# in its own root.
+C="$WORK/checkroot"
+mkdir -p "$C/scripts" "$C/tests"
+cp scripts/corpus_check.sh "$C/scripts/"
+stubs() { # <n>: leave exactly n test files in the check root
+    rm -f "$C"/tests/test_*.bl
+    i=1
+    while [ "$i" -le "$1" ]; do : > "$C/tests/test_check_$i.bl"; i=$((i + 1)); done
+}
+rec() { printf '{"file":"%s","status":"%s","known_failures":%s}' "$1" "$2" "$3"; }
 corpus_file() { # <out> <record>...
     out="$1"; shift
-    printf '%s\n' "$@" | jq -s '{total: length, passed: length, files: .}' > "$out"
+    printf '%s\n' "$@" | jq -s '{total: length, passed: (map(select(.status == "pass")) | length), files: .}' > "$out"
 }
 run_check() {
-    (cd "$R" && CORPUS_JSON="$WORK/now.json" CORPUS_BASELINE="$WORK/base.json" CORPUS_HEAD1_REF=no-such-ref ./scripts/corpus_check.sh "$@") > "$WORK/out.log" 2>&1
+    (cd "$C" && CORPUS_JSON="$WORK/now.json" ./scripts/corpus_check.sh) > "$WORK/out.log" 2>&1
 }
-corpus_file "$WORK/base.json" "$(rec tests/a.bl 1)" "$(rec tests/b.bl 0)"
+names() { # <label> <file>: the failure line names the file
+    if grep -q "^  $2" "$WORK/out.log"; then
+        echo "PASS $1"
+    else
+        echo "FAIL $1: the failure does not name $2"
+        sed 's/^/    /' "$WORK/out.log"
+        fail=1
+    fi
+}
 
-corpus_file "$WORK/now.json" "$(rec tests/a.bl 1)" "$(rec tests/b.bl 0)"
-run_check; expect "check-known-equal" 0 $?
-corpus_file "$WORK/now.json" "$(rec tests/a.bl 0)" "$(rec tests/b.bl 0)"
-run_check; expect "check-known-drop" 0 $?
-corpus_file "$WORK/now.json" "$(rec tests/a.bl 2)" "$(rec tests/b.bl 0)"
-run_check; expect "check-known-rise" 1 $?
-corpus_file "$WORK/now.json" "$(rec tests/a.bl 1)" "$(rec tests/b.bl 0)" "$(rec tests/c.bl 1)"
-run_check; expect "check-known-new-file" 1 $?
-corpus_file "$WORK/now.json" "$(rec tests/a.bl 1)" "$(rec tests/b.bl 0)" "$(rec tests/c.bl 0)"
-run_check; expect "check-known-new-file-zero" 0 $?
-corpus_file "$WORK/now.json" "$(rec tests/a.bl null)" "$(rec tests/b.bl 0)"
-run_check; expect "check-known-unreadable" 1 $?
-if grep -q '^  tests/a.bl$' "$WORK/out.log" && grep -q 'printed to stdout' "$WORK/out.log"; then
-    echo "PASS check-known-unreadable-names-file"
+stubs 2
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 1)" "$(rec tests/test_check_2.bl pass 0)"
+run_check; expect "check-all-pass" 0 $?
+if grep -q '^corpus-check: ok 2/2 passed$' "$WORK/out.log" && grep -q 'known failures.*: 1$' "$WORK/out.log"; then
+    echo "PASS check-all-pass-summary"
 else
-    echo "FAIL check-known-unreadable-names-file: the failure does not name the file and the cause"
+    echo "FAIL check-all-pass-summary: no ok line or known-failure count"
     sed 's/^/    /' "$WORK/out.log"
     fail=1
 fi
-# A baseline from before the count existed holds no number to compare against.
-printf '%s\n' '{"file":"tests/a.bl","status":"pass"}' '{"file":"tests/b.bl","status":"pass"}' | jq -s '{total: length, passed: length, files: .}' > "$WORK/base.json"
-corpus_file "$WORK/now.json" "$(rec tests/a.bl 2)" "$(rec tests/b.bl 0)"
-run_check; expect "check-known-old-schema" 0 $?
-run_check --update
-expect "check-update" 0 $?
-if [ "$(jq -r '.files[] | select(.file == "tests/a.bl") | .known_failures' "$WORK/base.json")" = "2" ]; then
-    echo "PASS check-update-writes-count"
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)" "$(rec tests/test_check_2.bl run_fail null)"
+run_check; expect "check-run-fail" 1 $?
+names "check-run-fail-names-file" "tests/test_check_2.bl: run_fail"
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)"
+run_check; expect "check-total-below-tests" 1 $?
+if grep -q 'covers 1 file(s); tests/ holds 2' "$WORK/out.log"; then
+    echo "PASS check-total-names-both-numbers"
 else
-    echo "FAIL check-update-writes-count: the baseline has no known_failures"
+    echo "FAIL check-total-names-both-numbers"
+    sed 's/^/    /' "$WORK/out.log"
     fail=1
 fi
+stubs 1
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)" "$(rec tests/test_check_2.bl pass 0)"
+run_check; expect "check-total-above-tests" 1 $?
+stubs 0
+printf '{"total":0,"passed":0,"files":[]}\n' > "$WORK/now.json"
+run_check; expect "check-total-zero" 1 $?
+stubs 2
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass null)" "$(rec tests/test_check_2.bl pass 0)"
+run_check; expect "check-known-unreadable" 1 $?
+names "check-known-unreadable-names-file" "tests/test_check_1.bl$"
+grep -q 'printed to stdout' "$WORK/out.log" || { echo "FAIL check-known-unreadable-cause: no cause given"; fail=1; }
+echo '{"total":' > "$WORK/now.json"
+run_check; expect "check-malformed" 2 $?
 
 if [ "$fail" -ne 0 ]; then
     echo "test_corpus: FAILED"

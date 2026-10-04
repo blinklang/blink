@@ -27,8 +27,8 @@
 # Known failures: a test.failing row that still fails counts as a pass, so a
 # file whose only failing rows are known failures passes. The record carries
 # their number as "known_failures", read from the binary's --test-json report
-# (rows with expected_fail and status "passed"); corpus_check.sh fails when
-# it rises. Only a passing file with a top-level test.failing row runs that
+# (rows with expected_fail and status "passed"); corpus_check.sh prints
+# the total. Only a passing file with a top-level test.failing row runs that
 # second time; any other file has no such row, so its count is 0. The files
 # that test test.failing itself hold their rows in source strings, not at top
 # level, so they count 0 like any other file. A report
