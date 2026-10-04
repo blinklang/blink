@@ -5,7 +5,7 @@ import parser.{
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
     node_stmts, node_arms, node_fields, node_elements, node_handlers, node_methods, node_captures,
     node_type_name, node_effects, node_str_val, node_op, node_type_ann,
-    node_pattern, node_for_binder, node_value_child_ids, node_is_mut, node_line, sublist_get, sublist_length,
+    node_pattern, node_for_binder, node_value_child_ids, node_push_value_child_ids, node_is_mut, node_line, sublist_get, sublist_length,
 }
 import diagnostics.{
     Diag, diag_error_at, diag_warn_at, diag_set_last_fix,
@@ -1178,18 +1178,27 @@ fn check_spawn_mut_captures(fn_node: Int) ! Diag.Report {
     let body = node_body(fn_node)
     if body == -1 { return }
     let mut mut_leaves: List[Int] = []
-    let_mut_pattern_leaves(body, mut_leaves)
-    smc_walk(body, body, mut_leaves)
+    let mut kids: List[Int] = []
+    let_mut_pattern_leaves(body, mut_leaves, kids)
+    smc_walk(body, body, mut_leaves, kids)
 }
 
 // A destructuring `let mut (a, b)` binds each leaf IdentPattern, and only the LetBinding
 // above it records the `mut`.
-fn let_mut_pattern_leaves(node: Int, out: List[Int]) {
+fn let_mut_pattern_leaves(node: Int, out: List[Int], kids: List[Int]) {
     if node == -1 { return }
     if node_kind(node) == NodeKind.LetBinding && node_is_mut(node) != 0 {
         pattern_leaves(node_elements(node), out)
     }
-    for kid in node_value_child_ids(node) { let_mut_pattern_leaves(kid, out) }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        let_mut_pattern_leaves(kids.get(i).unwrap(), out, kids)
+        i = i + 1
+    }
+    drop_kids_to(kids, base)
 }
 
 fn pattern_leaves(pat: Int, out: List[Int]) {
@@ -1206,7 +1215,7 @@ fn pattern_leaves(pat: Int, out: List[Int]) {
     out.push(pat)
 }
 
-fn smc_walk(node: Int, body: Int, mut_leaves: List[Int]) ! Diag.Report {
+fn smc_walk(node: Int, body: Int, mut_leaves: List[Int], kids: List[Int]) ! Diag.Report {
     if node == -1 { return }
     if node_kind(node) == NodeKind.MethodCall && is_async_spawn(node) {
         let args_sl = node_args(node)
@@ -1220,7 +1229,23 @@ fn smc_walk(node: Int, body: Int, mut_leaves: List[Int]) ! Diag.Report {
             i = i + 1
         }
     }
-    for kid in node_value_child_ids(node) { smc_walk(kid, body, mut_leaves) }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        smc_walk(kids.get(i).unwrap(), body, mut_leaves, kids)
+        i = i + 1
+    }
+    drop_kids_to(kids, base)
+}
+
+// Both walks above share one child buffer down the descent: each node appends its children,
+// walks them, and gives the slots back, so a body is walked without a list per node.
+fn drop_kids_to(kids: List[Int], base: Int) {
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
 }
 
 // Collects one read per `let mut` binder the value of `node` captures. `seen` holds the

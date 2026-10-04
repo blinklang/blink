@@ -14,7 +14,7 @@ import parser.{
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
     node_set_module, node_set_name, node_supertraits, synth_struct_decl,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
-    node_xfail_reason, node_value_child_ids, node_spell_child_ids,
+    node_xfail_reason, node_value_child_ids, node_push_value_child_ids, node_spell_child_ids,
     sublist_get, sublist_length,
 }
 import diagnostics.{
@@ -24273,6 +24273,7 @@ pub fn tc_stamp_walk(root: Int, owner: Map[Int, Int]) -> List[Int] ! TypeCheck.R
     let mut seen: Map[Int, Int] = Map()
     let mut stack: List[Int] = [root]
     let mut owners: List[Int] = [-1]
+    let mut kids: List[Int] = []
     while stack.len() > 0 {
         let n = stack.pop().unwrap()
         let o = owners.pop().unwrap()
@@ -24292,7 +24293,8 @@ pub fn tc_stamp_walk(root: Int, owner: Map[Int, Int]) -> List[Int] ! TypeCheck.R
         }
         let nk = node_kind(n)
         let inner = if nk == NodeKind.FnDef || nk == NodeKind.TestBlock { n } else { o }
-        let kids = node_value_child_ids(n)
+        kids.clear()
+        node_push_value_child_ids(n, kids)
         let mut i = 0
         while i < kids.len() {
             let kid = kids.get(i).unwrap()
@@ -24766,7 +24768,7 @@ fn tc_er_fn_row(fn_node: Int) -> List[Str] {
 
 // Items nest left to right, so each item's expression runs under the effects the items
 // before it installed (§4.6.3).
-fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str, kids: List[Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
     let mut row = tc_er_row_with(held, "")
     let items = node_handlers(node)
     if items == -1 { return row }
@@ -24778,7 +24780,7 @@ fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str) -> List[
             row = tc_er_row_with(row, "Arena")
         } else {
             let vn = if ik == NodeKind.WithResource { node_value(it) } else { it }
-            tc_er_walk(program, vn, row, owner)
+            tc_er_walk(program, vn, row, owner, kids)
             let vt = resolve_alias_tid(tc_lookup_node_tid(vn))
             let mut e = tc_tid_handler_effect(vt)
             if e == "" && vt >= 0 { e = tc_tid_handler_effect(resolve_alias_tid(tc_with_binder_tid(vt))) }
@@ -24789,15 +24791,15 @@ fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str) -> List[
     row
 }
 
-fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: Str) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: Str, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     if node < 0 { return }
     let k = nk_of(node_kind(node))
     if k == NodeKind.FnDef {
-        tc_er_walk_fn(program, node)
+        tc_er_walk_fn(program, node, kids)
         return
     }
     if k == NodeKind.WithBlock {
-        tc_er_walk(program, node_body(node), tc_er_with_row(program, node, held, owner), owner)
+        tc_er_walk(program, node_body(node), tc_er_with_row(program, node, held, owner, kids), owner, kids)
         return
     }
     if k == NodeKind.HandlerExpr {
@@ -24805,27 +24807,38 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: Str) ! TypeCheck.
         if ms != -1 {
             let mut i = 0
             while i < sublist_length(ms) {
-                tc_er_walk(program, node_body(sublist_get(ms, i)), held, owner)
+                tc_er_walk(program, node_body(sublist_get(ms, i)), held, owner, kids)
                 i = i + 1
             }
         }
     }
     if k == NodeKind.Call || k == NodeKind.MethodCall { tc_er_check_call(program, node, held, owner) }
-    for c in node_value_child_ids(node) {
+    // One child buffer serves the whole descent: each node appends its children, walks them,
+    // and gives the slots back, so a body is walked without a list per node.
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        let c = kids.get(i).unwrap()
         if k != NodeKind.HandlerExpr || nk_of(node_kind(c)) != NodeKind.FnDef {
-            tc_er_walk(program, c, held, owner)
+            tc_er_walk(program, c, held, owner, kids)
         }
+        i = i + 1
+    }
+    while kids.len() > base {
+        let _ = kids.pop()
     }
 }
 
-fn tc_er_walk_fn(program: Int, fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk_fn(program: Int, fn_node: Int, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     // `main` holds every effect (§4.6).
     if node_name(fn_node) == "main" && node_source_module(fn_node) == "__main__" { return }
-    tc_er_walk(program, node_body(fn_node), tc_er_fn_row(fn_node), node_name(fn_node))
+    tc_er_walk(program, node_body(fn_node), tc_er_fn_row(fn_node), node_name(fn_node), kids)
 }
 
 // `owners` is a list of impl or trait nodes; each one's methods are walked.
-fn tc_er_walk_methods(program: Int, owners: Int) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk_methods(program: Int, owners: Int, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     if owners == -1 { return }
     let mut i = 0
     while i < sublist_length(owners) {
@@ -24833,7 +24846,7 @@ fn tc_er_walk_methods(program: Int, owners: Int) ! TypeCheck.Resolve, Diag.Repor
         if ms != -1 {
             let mut j = 0
             while j < sublist_length(ms) {
-                tc_er_walk_fn(program, sublist_get(ms, j))
+                tc_er_walk_fn(program, sublist_get(ms, j), kids)
                 j = j + 1
             }
         }
@@ -24844,14 +24857,15 @@ fn tc_er_walk_methods(program: Int, owners: Int) ! TypeCheck.Resolve, Diag.Repor
 // Test blocks are not walked: whether a test body holds every effect, as `main` does, is
 // still open with the owner.
 fn tc_check_effect_rows(program: Int) ! TypeCheck.Resolve, Diag.Report {
+    let mut kids: List[Int] = []
     let fns = node_params(program)
     if fns != -1 {
         let mut i = 0
         while i < sublist_length(fns) {
-            tc_er_walk_fn(program, sublist_get(fns, i))
+            tc_er_walk_fn(program, sublist_get(fns, i), kids)
             i = i + 1
         }
     }
-    tc_er_walk_methods(program, node_methods(program))
-    tc_er_walk_methods(program, node_arms(program))
+    tc_er_walk_methods(program, node_methods(program), kids)
+    tc_er_walk_methods(program, node_arms(program), kids)
 }

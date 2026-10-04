@@ -11,7 +11,7 @@
 import ast.{NodeKind, nk_of}
 import parser.{
     node_args, node_body, node_elements, node_is_mut, node_kind, node_method, node_methods, node_name, node_obj,
-    node_params, node_recv_type_args, node_stmts, node_target, node_trait_name, node_type_ann, node_value, node_value_child_ids, sublist_get,
+    node_params, node_recv_type_args, node_stmts, node_target, node_trait_name, node_type_ann, node_value, node_push_value_child_ids, sublist_get,
     sublist_length,
 }
 import typecheck.{
@@ -1266,13 +1266,14 @@ pub fn cg_eff_scan_shared_binders(fn_like: Int) {
     if body < 0 { return }
     let mut env: List[FrameBinder] = []
     let mut written: List[Int] = []
-    scan_frame_writes(body, env, 0, written)
+    let mut kids: List[Int] = []
+    scan_frame_writes(body, env, 0, written, kids)
     eff_frame_written = written
     let mut read: List[Str] = []
-    collect_captured_names(body, read)
+    collect_captured_names(body, read, kids)
     if read.len() == 0 { return }
     let mut found: List[Str] = []
-    collect_shared_muts(body, read, found)
+    collect_shared_muts(body, read, found, kids)
     eff_shared_names = found
 }
 
@@ -1306,18 +1307,18 @@ pub fn cg_eff_frame_written(decl: Int) -> Bool {
 // Resolves each assignment to the innermost binder of its name, so a shadowing `let` in a
 // nested block takes the write and the outer binder keeps its plain local. A closure or a
 // nested `fn` is a frame of its own, scanned when its own body lowers.
-fn scan_frame_writes(node: Int, env: List[FrameBinder], depth: Int, out: List[Int]) {
+fn scan_frame_writes(node: Int, env: List[FrameBinder], depth: Int, out: List[Int], kids: List[Int]) {
     if node < 0 { return }
     let k = nk_of(node_kind(node))
     if k == NodeKind.Closure || k == NodeKind.FnDef { return }
     if k == NodeKind.AssertPanics {
-        scan_frame_writes(node_value(node), env, depth, out)
-        scan_frame_writes(node_body(node), env, depth + 1, out)
+        scan_frame_writes(node_value(node), env, depth, out, kids)
+        scan_frame_writes(node_body(node), env, depth + 1, out, kids)
         return
     }
     // The initializer reads the outer binding of the name, so it is walked first.
     if k == NodeKind.LetBinding {
-        scan_frame_writes(node_value(node), env, depth, out)
+        scan_frame_writes(node_value(node), env, depth, out, kids)
         enter_let_binders(node, env, depth)
         return
     }
@@ -1326,7 +1327,15 @@ fn scan_frame_writes(node: Int, env: List[FrameBinder], depth: Int, out: List[In
         if b.decl >= 0 && b.depth < depth && !out.contains(b.decl) { out.push(b.decl) }
     }
     let mark = env.len()
-    for kid in node_value_child_ids(node) { scan_frame_writes(kid, env, depth, out) }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        scan_frame_writes(kids.get(i).unwrap(), env, depth, out, kids)
+        i += 1
+    }
+    drop_kids_to(kids, base)
     if k == NodeKind.Block {
         while env.len() > mark {
             let _ = env.pop()
@@ -1381,7 +1390,7 @@ fn innermost_frame_binder(env: List[FrameBinder], name: Str) -> FrameBinder {
 // Every name read by a closure written anywhere in this body. A nested literal's own free
 // names arrive with the outer one's, because the outer walk binds the nested parameters and
 // keeps what is still free.
-fn collect_captured_names(node: Int, out: List[Str]) {
+fn collect_captured_names(node: Int, out: List[Str], kids: List[Int]) {
     if node < 0 { return }
     let k = nk_of(node_kind(node))
     if k == NodeKind.Closure {
@@ -1393,13 +1402,21 @@ fn collect_captured_names(node: Int, out: List[Str]) {
     // A nested `fn` opens its own frame and captures nothing, so a closure inside it shares
     // that frame's bindings and none of this one's.
     if k == NodeKind.FnDef { return }
-    for kid in node_value_child_ids(node) { collect_captured_names(kid, out) }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        collect_captured_names(kids.get(i).unwrap(), out, kids)
+        i += 1
+    }
+    drop_kids_to(kids, base)
 }
 
 // The `let mut` declarations of this body whose name one of those closures reads. The
 // intersection is what makes a private mutable local stay a local: celling every `let mut`
 // would put a heap allocation in front of every mutable binding in the language.
-fn collect_shared_muts(node: Int, read: List[Str], out: List[Str]) {
+fn collect_shared_muts(node: Int, read: List[Str], out: List[Str], kids: List[Int]) {
     if node < 0 { return }
     let k = nk_of(node_kind(node))
     if k == NodeKind.Closure || k == NodeKind.FnDef { return }
@@ -1415,7 +1432,23 @@ fn collect_shared_muts(node: Int, read: List[Str], out: List[Str]) {
             if read.contains(leaf) && !out.contains(leaf) { out.push(leaf) }
         }
     }
-    for kid in node_value_child_ids(node) { collect_shared_muts(kid, read, out) }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        collect_shared_muts(kids.get(i).unwrap(), read, out, kids)
+        i += 1
+    }
+    drop_kids_to(kids, base)
+}
+
+// The walkers above share one child buffer down the descent: each node appends its children,
+// walks them, and gives the slots back, so a body is walked without a list per node.
+fn drop_kids_to(kids: List[Int], base: Int) {
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
 }
 
 // ── Handler installs ──────────────────────────────────────────────────────────────
