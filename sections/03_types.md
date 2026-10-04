@@ -460,11 +460,11 @@ trait MapOps[K, V] {
     fn values(self) -> List[V]
     fn entries(self) -> List[(K, V)]
     fn get_or_default(self, key: K, default: V) -> V
+    fn contains_key(self, key: K) -> Bool
 
     // Mutation (requires let mut)
     fn insert(self, key: K, value: V)
     fn remove(self, key: K) -> Option[V]
-    fn contains_key(self, key: K) -> Bool
     fn clear(self)
 }
 ```
