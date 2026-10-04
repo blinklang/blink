@@ -867,6 +867,20 @@ BLINK_RT_FN blink_list* blink_list_new(void) {
 }
 #endif
 
+/* For a list whose slots hold integer words, never pointers. The collector
+   does not scan its storage, and blink_list_push grows it through
+   blink_realloc, which keeps the block unscanned. */
+BLINK_RT_FN blink_list* blink_list_new_atomic(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_list_new_atomic(void) {
+    blink_list* l = (blink_list*)blink_alloc(sizeof(blink_list));
+    l->cap = 8;
+    l->len = 0;
+    l->items = (void**)blink_alloc_atomic(sizeof(void*) * l->cap);
+    return l;
+}
+#endif
+
 BLINK_RT_FN void blink_list_push(blink_list* l, void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_list_push(blink_list* l, void* item) {
@@ -3012,6 +3026,21 @@ BLINK_RT_FN blink_list* blink_list_copy_shell(blink_promote_ctx* ctx, const blin
     out->len = l->len;
     out->cap = l->cap;
     out->items = (void**)blink_promote_ctx_alloc(ctx, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
+    if (l->len > 0) memcpy(out->items, l->items, sizeof(void*) * (size_t)l->len);
+    return out;
+}
+#endif
+
+/* The shell copy of a list built by blink_list_new_atomic: its slots hold no
+   pointer, so the copy's storage stays unscanned too. */
+BLINK_RT_FN blink_list* blink_list_copy_shell_atomic(blink_promote_ctx* ctx, const blink_list* l);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_list_copy_shell_atomic(blink_promote_ctx* ctx, const blink_list* l) {
+    if (!l) return NULL;
+    blink_list* out = (blink_list*)blink_promote_ctx_alloc(ctx, sizeof(blink_list));
+    out->len = l->len;
+    out->cap = l->cap;
+    out->items = (void**)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
     if (l->len > 0) memcpy(out->items, l->items, sizeof(void*) * (size_t)l->len);
     return out;
 }

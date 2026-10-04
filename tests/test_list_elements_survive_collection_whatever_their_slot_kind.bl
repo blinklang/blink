@@ -1,0 +1,209 @@
+// A list whose elements are integer words keeps them in memory the collector
+// does not scan, and every other list keeps its elements where it does. Each
+// test fills a list, forces full collections while it allocates garbage, then
+// reads every element back. A list of pointers kept in unscanned memory would
+// lose its elements here.
+
+@ffi("GC_gcollect", header: "gc.h")
+@trusted(audit: "TEST-GC-COLLECT: force a full collection so lost elements show")
+fn t_gc_collect() -> Void ! FFI {}
+
+type Shade { Red, Green, Blue }
+
+type Shape { Dot, Circle(Float), Label(Str) }
+
+type Holder { ids: List[Int], names: List[Str] }
+
+fn churn() {
+    let mut i = 0
+    while i < 4 {
+        let sb = StringBuilder.new()
+        let mut j = 0
+        while j < 20000 {
+            sb.write("garbage {j} ")
+            j += 1
+        }
+        let _ = sb.to_str().split(" ")
+        t_gc_collect()
+        i += 1
+    }
+}
+
+fn name_of(i: Int) -> Str { "name-{i}-{i * 7}" }
+
+fn repeat_into[T](x: T, n: Int) -> List[T] {
+    let mut out: List[T] = []
+    let mut i = 0
+    while i < n {
+        out.push(x)
+        i += 1
+    }
+    out
+}
+
+test "a list of Int keeps every element across collections" {
+    let mut xs: List[Int] = []
+    let mut i = 0
+    while i < 100000 {
+        xs.push(i * 3)
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 100000 {
+        assert_eq(xs.get(k).unwrap(), k * 3)
+        k += 1
+    }
+}
+
+test "a list of Str keeps every element across collections" {
+    let mut xs: List[Str] = []
+    let mut i = 0
+    while i < 20000 {
+        xs.push(name_of(i))
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 20000 {
+        assert(xs.get(k).unwrap() == name_of(k))
+        k += 1
+    }
+}
+
+test "a list made by List.new keeps Str elements across collections" {
+    let xs: List[Str] = List.new()
+    let mut ys = xs
+    let mut i = 0
+    while i < 5000 {
+        ys.push(name_of(i))
+        i += 1
+    }
+    churn()
+    assert(ys.get(4999).unwrap() == name_of(4999))
+    assert(ys.get(0).unwrap() == name_of(0))
+}
+
+test "a list literal of Str keeps its elements across collections" {
+    let xs = [name_of(1), name_of(2), name_of(3)]
+    churn()
+    assert(xs.get(0).unwrap() == name_of(1))
+    assert(xs.get(2).unwrap() == name_of(3))
+}
+
+test "lists of Bool, Char, U8 and plain enums keep their elements" {
+    let mut bs: List[Bool] = []
+    let mut cs: List[Char] = []
+    let mut us: List[U8] = []
+    let mut es: List[Shade] = []
+    let mut i = 0
+    while i < 3000 {
+        bs.push(i % 3 == 0)
+        cs.push(if i % 2 == 0 { 'a' } else { 'z' })
+        us.push((i % 256).to_u8())
+        es.push(if i % 3 == 0 { Shade.Red } else if i % 3 == 1 { Shade.Green } else { Shade.Blue })
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 3000 {
+        assert_eq(bs.get(k).unwrap(), k % 3 == 0)
+        let want_c = if k % 2 == 0 { 'a' } else { 'z' }
+        assert(cs.get(k).unwrap() == want_c)
+        assert_eq(us.get(k).unwrap().to_int(), k % 256)
+        let want = if k % 3 == 0 { Shade.Red } else if k % 3 == 1 { Shade.Green } else { Shade.Blue }
+        assert(es.get(k).unwrap() == want)
+        k += 1
+    }
+}
+
+test "lists of Float, Option and payload enums keep their elements" {
+    let mut fs: List[Float] = []
+    let mut os: List[Option[Int]] = []
+    let mut ss: List[Shape] = []
+    let mut i = 0
+    while i < 3000 {
+        fs.push(i.to_float() * 0.5)
+        os.push(if i % 2 == 0 { Some(i) } else { None })
+        ss.push(if i % 3 == 0 { Shape.Dot } else if i % 3 == 1 { Shape.Circle(i.to_float()) } else { Shape.Label(name_of(i)) })
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 3000 {
+        assert(fs.get(k).unwrap() == k.to_float() * 0.5)
+        match os.get(k).unwrap() {
+            Some(v) => assert_eq(v, k)
+            None => assert(k % 2 == 1)
+        }
+        match ss.get(k).unwrap() {
+            Shape.Dot => assert(k % 3 == 0)
+            Shape.Circle(r) => assert(r == k.to_float())
+            Shape.Label(s) => assert(s == name_of(k))
+        }
+        k += 1
+    }
+}
+
+test "a list of lists of Int keeps both levels across collections" {
+    let mut outer: List[List[Int]] = []
+    let mut i = 0
+    while i < 2000 {
+        outer.push([i, i + 1, i + 2])
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 2000 {
+        let inner = outer.get(k).unwrap()
+        assert_eq(inner.get(2).unwrap(), k + 2)
+        k += 1
+    }
+}
+
+test "a generic list keeps Str elements and Int elements alike" {
+    let strs = repeat_into(name_of(42), 3000)
+    let ints = repeat_into(42, 3000)
+    churn()
+    assert(strs.get(2999).unwrap() == name_of(42))
+    assert_eq(ints.get(2999).unwrap(), 42)
+}
+
+test "struct fields hold a list of Int and a list of Str across collections" {
+    let mut h = Holder { ids: [], names: [] }
+    let mut i = 0
+    while i < 5000 {
+        h.ids.push(i)
+        h.names.push(name_of(i))
+        i += 1
+    }
+    churn()
+    assert_eq(h.ids.get(4999).unwrap(), 4999)
+    assert(h.names.get(4999).unwrap() == name_of(4999))
+}
+
+test "lists of Int and Str promoted out of an arena keep their elements" {
+    let pair = with arena {
+        let mut ids: List[Int] = []
+        let mut names: List[Str] = []
+        let mut i = 0
+        while i < 5000 {
+            ids.push(i * 2)
+            names.push(name_of(i))
+            i += 1
+        }
+        (ids, names)
+    }
+    churn()
+    let mut k = 0
+    while k < 5000 {
+        assert_eq(pair.0.get(k).unwrap(), k * 2)
+        assert(pair.1.get(k).unwrap() == name_of(k))
+        k += 1
+    }
+    let mut more = pair.0
+    more.push(7)
+    churn()
+    assert_eq(more.get(5000).unwrap(), 7)
+    assert_eq(more.get(4999).unwrap(), 9998)
+}
