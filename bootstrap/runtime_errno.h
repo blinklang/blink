@@ -26,12 +26,12 @@ BLINK_RT_FN const char* blink_strerror(int64_t code) {
     buf[0] = '\0';
 #if defined(_GNU_SOURCE) && !defined(__APPLE__)
     const char* msg = strerror_r((int)code, buf, sizeof(buf));
-    return blink_strdup(msg ? msg : "unknown error");
+    return blink_str_from_cstr_gc(msg ? msg : "unknown error");
 #else
     if (strerror_r((int)code, buf, sizeof(buf)) != 0) {
-        return blink_strdup("unknown error");
+        return blink_str_from_cstr_gc("unknown error");
     }
-    return blink_strdup(buf);
+    return blink_str_from_cstr_gc(buf);
 #endif
 }
 #endif

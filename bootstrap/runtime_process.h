@@ -80,12 +80,8 @@ static void blink_drain_two_fds(int fd_a, int fd_b, char** out_a, char** out_b) 
         blink_pump_fd(fd_a, &open_a, pfd_a, &buf_a, &cap_a, &len_a);
         blink_pump_fd(fd_b, &open_b, pfd_b, &buf_b, &cap_b, &len_b);
     }
-    /* Skipped fds keep the "" literal (already terminated); only real
-     * buffers need the NUL written. */
-    if (fd_a >= 0) buf_a[len_a] = '\0';
-    if (fd_b >= 0) buf_b[len_b] = '\0';
-    *out_a = buf_a;
-    *out_b = buf_b;
+    *out_a = fd_a >= 0 ? (char*)blink_str_from_bytes(buf_a, len_a) : (char*)BLINK_STR_EMPTY;
+    *out_b = fd_b >= 0 ? (char*)blink_str_from_bytes(buf_b, len_b) : (char*)BLINK_STR_EMPTY;
 }
 
 BLINK_RT_FN void blink_process_exec(const char* cmd, const blink_list* args);
@@ -103,12 +99,12 @@ BLINK_RT_FN void blink_process_exec(const char* cmd, const blink_list* args) {
 BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data) {
-    blink_ProcessResult result = { "", "", -1 };
+    blink_ProcessResult result = { BLINK_STR_EMPTY, BLINK_STR_EMPTY, -1 };
     int stdin_pipe[2] = {-1, -1}, stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1};
     if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
         if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
         if (stdout_pipe[0] >= 0) { close(stdout_pipe[0]); close(stdout_pipe[1]); }
-        result.err_out = blink_strdup("pipe() failed");
+        result.err_out = blink_str_from_cstr_gc("pipe() failed");
         return result;
     }
     pid_t pid = fork();
@@ -116,7 +112,7 @@ BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, co
         close(stdin_pipe[0]); close(stdin_pipe[1]);
         close(stdout_pipe[0]); close(stdout_pipe[1]);
         close(stderr_pipe[0]); close(stderr_pipe[1]);
-        result.err_out = blink_strdup("fork() failed");
+        result.err_out = blink_str_from_cstr_gc("fork() failed");
         return result;
     }
     if (pid == 0) {
@@ -262,15 +258,15 @@ BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args)
     slot->out_fd = -1;
     slot->err_fd = -1;
     slot->reaped = 0;
-    slot->cached.out = "";
-    slot->cached.err_out = "";
+    slot->cached.out = BLINK_STR_EMPTY;
+    slot->cached.err_out = BLINK_STR_EMPTY;
     slot->cached.exit_code = -1;
 
     int out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
     if (pipe(out_pipe) < 0 || pipe(err_pipe) < 0) {
         if (out_pipe[0] >= 0) { close(out_pipe[0]); close(out_pipe[1]); }
         slot->reaped = 1;
-        slot->cached.err_out = blink_strdup("pipe() failed");
+        slot->cached.err_out = blink_str_from_cstr_gc("pipe() failed");
         return h;
     }
     pid_t pid = fork();
@@ -278,7 +274,7 @@ BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args)
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
         slot->reaped = 1;
-        slot->cached.err_out = blink_strdup("fork() failed");
+        slot->cached.err_out = blink_str_from_cstr_gc("fork() failed");
         return h;
     }
     if (pid == 0) {
@@ -306,7 +302,7 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle);
 BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
     blink_pid_slot* slot = blink_pid_table_get(handle);
     if (!slot) {
-        blink_ProcessResult r = { "", blink_strdup("invalid pid handle"), -1 };
+        blink_ProcessResult r = { BLINK_STR_EMPTY, blink_str_from_cstr_gc("invalid pid handle"), -1 };
         return r;
     }
     if (slot->reaped) return slot->cached;

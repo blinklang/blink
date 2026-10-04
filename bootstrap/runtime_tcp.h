@@ -42,10 +42,12 @@ BLINK_RT_FN int64_t blink_tcp_accept(int64_t listen_fd) {
 BLINK_RT_FN const char* blink_tcp_read(int64_t fd, int64_t max_bytes);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_tcp_read(int64_t fd, int64_t max_bytes) {
-    char* buf = (char*)blink_alloc(max_bytes + 1);
+    if (max_bytes < 0) max_bytes = 0;
+    char* buf = blink_str_alloc(max_bytes);
     ssize_t n = read((int)fd, buf, (size_t)max_bytes);
     if (n < 0) n = 0;
-    buf[n] = '\0';
+    const char* nul = n > 0 ? (const char*)memchr(buf, 0, (size_t)n) : NULL;
+    blink_str_shrink(buf, nul ? (int64_t)(nul - buf) : (int64_t)n);
     return buf;
 }
 #endif
@@ -167,14 +169,13 @@ BLINK_RT_FN const char* blink_tcp_read_all(int64_t fd) {
         if (len + 1024 > cap) {
             cap *= 2;
             buf = (char*)GC_REALLOC(buf, (size_t)cap);
-            if (!buf) return "";
+            if (!buf) return BLINK_STR_EMPTY;
         }
         ssize_t n = read((int)fd, buf + len, (size_t)(cap - len - 1));
         if (n <= 0) break;
         len += n;
     }
-    buf[len] = '\0';
-    return buf;
+    return blink_str_from_bytes(buf, len);
 }
 #endif
 
