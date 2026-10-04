@@ -49,7 +49,11 @@ static char** blink_process_build_argv(const char* cmd, const blink_list* args) 
  * poll entry for this fd, or NULL when the fd is not being polled (skipped). */
 static void blink_pump_fd(int fd, int* open, struct pollfd* pfd, char** buf, int64_t* cap, int64_t* len) {
     if (!*open || pfd == NULL || !(pfd->revents & (POLLIN | POLLHUP | POLLERR))) return;
-    if (*len + 1024 > *cap) { *cap *= 2; *buf = (char*)GC_REALLOC(*buf, (size_t)*cap); }
+    if (*len + 1024 > *cap) {
+        int64_t old_cap = *cap;
+        *cap *= 2;
+        *buf = (char*)blink_realloc(*buf, old_cap, *cap);
+    }
     ssize_t rc = read(fd, *buf + *len, (size_t)(*cap - *len - 1));
     if (rc < 0 && errno == EINTR) return; /* retry next loop */
     if (rc <= 0) { close(fd); *open = 0; return; }
@@ -66,8 +70,8 @@ static void blink_pump_fd(int fd, int* open, struct pollfd* pfd, char** buf, int
 static void blink_drain_two_fds(int fd_a, int fd_b, char** out_a, char** out_b) {
     int open_a = fd_a >= 0, open_b = fd_b >= 0;
     int64_t cap_a = 4096, len_a = 0, cap_b = 4096, len_b = 0;
-    char* buf_a = open_a ? (char*)blink_alloc(cap_a) : (char*)"";
-    char* buf_b = open_b ? (char*)blink_alloc(cap_b) : (char*)"";
+    char* buf_a = open_a ? (char*)blink_alloc_atomic(cap_a) : (char*)"";
+    char* buf_b = open_b ? (char*)blink_alloc_atomic(cap_b) : (char*)"";
     while (open_a || open_b) {
         struct pollfd pfds[2];
         int n = 0;

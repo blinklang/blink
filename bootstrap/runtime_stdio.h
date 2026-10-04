@@ -30,8 +30,8 @@ BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n) {
     blink_bytes* b = blink_bytes_new();
     if (n <= 0) return b;
     if (n > b->cap) {
+        b->data = (uint8_t*)blink_realloc(b->data, b->cap, n);
         b->cap = n;
-        b->data = (uint8_t*)GC_REALLOC(b->data, (size_t)b->cap);
     }
     int64_t total = 0;
     while (total < n) {
