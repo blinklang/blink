@@ -1,0 +1,296 @@
+// Every pass that walks the tree reads a node's children through one table, and several of
+// them depend on the ORDER it answers in: the stamp pass records nodes in visit order, and
+// diagnostics come out in that order. These rows pin, for every node kind, which fields the
+// value walk and the spelling walk reach and in what order, so a change to how the table is
+// stored or read cannot move a child.
+//
+// Each probe node fills every child field. A node-id field holds its own marker, and a sublist
+// field holds a real sublist with a marker, an absent member (-1), and a second marker. The
+// answer is printed back as field names, so a row reads as the walk a kind performs.
+
+import parser.{nodes, node_value_child_ids, node_spell_child_ids, node_unclaimed_child_field, new_sublist, sublist_push, finalize_sublist}
+import ast.{NodeKind, AstNode, nk_of, nk_name}
+
+let REF_BASE = 100000
+let LIST_BASE = 200000
+
+fn ref_names() -> List[Str] {
+    ["left", "right", "body", "condition", "then_body", "else_body", "scrutinee", "pattern", "guard", "value", "target", "iterable", "start", "end", "obj", "index", "type_ann", "for_binder"]
+}
+
+fn list_names() -> List[Str] {
+    ["params", "args", "stmts", "arms", "fields", "elements", "methods", "type_params", "effects", "captures", "handlers", "assoc_types", "impl_binders", "recv_type_args", "impl_where_bounds", "supertraits"]
+}
+
+fn filled_sublist(f: Int) -> Int ! Parse.Build {
+    let sl = new_sublist()
+    sublist_push(sl, LIST_BASE + f * 10)
+    sublist_push(sl, -1)
+    sublist_push(sl, LIST_BASE + f * 10 + 1)
+    finalize_sublist(sl)
+    sl
+}
+
+// Sublist ids by list field, in list_names() order.
+fn filled_sublists() -> List[Int] ! Parse.Build {
+    let mut out: List[Int] = []
+    let mut f = 0
+    while f < list_names().len() {
+        out.push(filled_sublist(f))
+        f = f + 1
+    }
+    out
+}
+
+fn r(i: Int) -> Int { REF_BASE + i }
+
+fn probe(kind: NodeKind, name: Str, body: Int, sls: List[Int]) -> Int {
+    let id = nodes.len()
+    nodes.push(AstNode {
+        kind: kind, name: name,
+        left: r(0), right: r(1), body: body, condition: r(3), then_body: r(4), else_body: r(5),
+        scrutinee: r(6), pattern: r(7), guard: r(8), value: r(9), target: r(10), iterable: r(11),
+        start: r(12), end: r(13), obj: r(14), index: r(15), type_ann: r(16), for_binder: r(17),
+        params: sls.get(0).unwrap(), args: sls.get(1).unwrap(), stmts: sls.get(2).unwrap(),
+        arms: sls.get(3).unwrap(), fields: sls.get(4).unwrap(), elements: sls.get(5).unwrap(),
+        methods: sls.get(6).unwrap(), type_params: sls.get(7).unwrap(), effects: sls.get(8).unwrap(),
+        captures: sls.get(9).unwrap(), handlers: sls.get(10).unwrap(), assoc_types: sls.get(11).unwrap(),
+        impl_binders: sls.get(12).unwrap(), recv_type_args: sls.get(13).unwrap(),
+        impl_where_bounds: sls.get(14).unwrap(), supertraits: sls.get(15).unwrap(),
+    })
+    id
+}
+
+fn empty_probe(kind: NodeKind, name: Str) -> Int {
+    let id = nodes.len()
+    nodes.push(AstNode { kind: kind, name: name })
+    id
+}
+
+// A child id spelled as the field it came from: `left`, `args.0` for a sublist member, or
+// `elements@` for a sublist id read as a node id.
+fn spell_child(c: Int, sls: List[Int]) -> Str {
+    if c >= LIST_BASE {
+        let f = (c - LIST_BASE) / 10
+        let m = (c - LIST_BASE) - f * 10
+        return "{list_names().get(f).unwrap()}.{m}"
+    }
+    if c >= REF_BASE { return ref_names().get(c - REF_BASE).unwrap() }
+    let mut f = 0
+    while f < sls.len() {
+        if sls.get(f).unwrap() == c { return "{list_names().get(f).unwrap()}@" }
+        f = f + 1
+    }
+    "?{c}"
+}
+
+fn spell_all(ids: List[Int], sls: List[Int]) -> Str {
+    let mut parts: List[Str] = []
+    for c in ids { parts.push(spell_child(c, sls)) }
+    parts.join(",")
+}
+
+// One field set and every other child absent, except that a fn keeps its body when the probe
+// asks for it: the arm a fn takes depends on whether it has a body.
+fn single_probe(kind: NodeKind, name: Str, field: Str, keep_body: Bool, sls: List[Int]) -> Int {
+    let id = nodes.len()
+    let mut n = AstNode { kind: kind, name: name }
+    if keep_body && kind == NodeKind.FnDef { n.body = r(2) }
+    let ri = index_of(ref_names(), field)
+    if field == "left" { n.left = r(ri) }
+    if field == "right" { n.right = r(ri) }
+    if field == "body" { n.body = r(ri) }
+    if field == "condition" { n.condition = r(ri) }
+    if field == "then_body" { n.then_body = r(ri) }
+    if field == "else_body" { n.else_body = r(ri) }
+    if field == "scrutinee" { n.scrutinee = r(ri) }
+    if field == "pattern" { n.pattern = r(ri) }
+    if field == "guard" { n.guard = r(ri) }
+    if field == "value" { n.value = r(ri) }
+    if field == "target" { n.target = r(ri) }
+    if field == "iterable" { n.iterable = r(ri) }
+    if field == "start" { n.start = r(ri) }
+    if field == "end" { n.end = r(ri) }
+    if field == "obj" { n.obj = r(ri) }
+    if field == "index" { n.index = r(ri) }
+    if field == "type_ann" { n.type_ann = r(ri) }
+    if field == "for_binder" { n.for_binder = r(ri) }
+    let li = index_of(list_names(), field)
+    let sl = if li >= 0 { sls.get(li).unwrap() } else { -1 }
+    if field == "params" { n.params = sl }
+    if field == "args" { n.args = sl }
+    if field == "stmts" { n.stmts = sl }
+    if field == "arms" { n.arms = sl }
+    if field == "fields" { n.fields = sl }
+    if field == "elements" { n.elements = sl }
+    if field == "methods" { n.methods = sl }
+    if field == "type_params" { n.type_params = sl }
+    if field == "effects" { n.effects = sl }
+    if field == "captures" { n.captures = sl }
+    if field == "handlers" { n.handlers = sl }
+    if field == "assoc_types" { n.assoc_types = sl }
+    if field == "impl_binders" { n.impl_binders = sl }
+    if field == "recv_type_args" { n.recv_type_args = sl }
+    if field == "impl_where_bounds" { n.impl_where_bounds = sl }
+    if field == "supertraits" { n.supertraits = sl }
+    nodes.push(n)
+    id
+}
+
+fn index_of(names: List[Str], name: Str) -> Int {
+    let mut i = 0
+    while i < names.len() {
+        if names.get(i).unwrap() == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The fields a kind claims as children, read one field at a time from the unclaimed-child
+// check, so the bucketed form of the table is pinned along with the flat walks.
+fn claimed(kind: NodeKind, name: Str, keep_body: Bool, sls: List[Int]) -> Str {
+    let mut out: List[Str] = []
+    for f in ref_names().chain(list_names()) {
+        if node_unclaimed_child_field(single_probe(kind, name, f, keep_body, sls)) == "" { out.push(f) }
+    }
+    out.join(",")
+}
+
+fn row(label: Str, kind: NodeKind, name: Str, keep_body: Bool, sls: List[Int]) -> Str {
+    let id = probe(kind, name, if keep_body { r(2) } else { -1 }, sls)
+    "{label} v=[{spell_all(node_value_child_ids(id), sls)}] s=[{spell_all(node_spell_child_ids(id), sls)}] c=[{claimed(kind, name, keep_body, sls)}]"
+}
+
+// Every kind once, plus the arms that read more than the kind: a fn with and without a body,
+// and an annotation that is a contract and one that is not.
+fn all_rows() -> List[Str] ! Parse.Build {
+    let sls = filled_sublists()
+    let mut out: List[Str] = []
+    let mut t = 0
+    while t < nk_tag_count() {
+        let k = nk_of(t)
+        let nm = nk_name(k)
+        if k == NodeKind.FnDef {
+            out.push(row("FnDef+body", k, "f", true, sls))
+            out.push(row("FnDef-body", k, "f", false, sls))
+        } else if k == NodeKind.Annotation {
+            out.push(row("Annotation@requires", k, "requires", true, sls))
+            out.push(row("Annotation@ensures", k, "ensures", true, sls))
+            out.push(row("Annotation@derive", k, "derive", true, sls))
+        } else {
+            out.push(row(nm, k, "x", true, sls))
+        }
+        t = t + 1
+    }
+    out
+}
+
+fn nk_tag_count() -> Int {
+    let mut t = 0
+    while nk_of(t) != NodeKind.KindCount { t = t + 1 }
+    t + 1
+}
+
+fn expected_rows() -> List[Str] {
+    [
+        "IntLit v=[] s=[] c=[]",
+        "FloatLit v=[] s=[] c=[]",
+        "Ident v=[] s=[] c=[]",
+        "Call v=[left,args.0,args.1] s=[type_params.0,type_params.1] c=[left,args,type_params]",
+        "MethodCall v=[obj,args.0,args.1] s=[type_params.0,type_params.1] c=[obj,args,type_params]",
+        "BinOp v=[left,right] s=[] c=[left,right]",
+        "UnaryOp v=[left] s=[] c=[left]",
+        "InterpString v=[elements.0,elements.1] s=[] c=[elements]",
+        "BoolLit v=[] s=[] c=[]",
+        "TupleLit v=[elements.0,elements.1] s=[] c=[elements]",
+        "ListLit v=[elements.0,elements.1] s=[] c=[elements]",
+        "StructLit v=[fields.0,fields.1] s=[] c=[fields]",
+        "FieldAccess v=[obj] s=[] c=[obj]",
+        "IndexExpr v=[obj,index] s=[] c=[obj,index]",
+        "RangeLit v=[start,end] s=[] c=[start,end]",
+        "IfExpr v=[condition,then_body,else_body] s=[] c=[condition,then_body,else_body]",
+        "MatchExpr v=[scrutinee,arms.0,arms.1] s=[] c=[scrutinee,arms]",
+        "Closure v=[body,params.0,params.1] s=[type_ann] c=[body,type_ann,params]",
+        "LetBinding v=[value,elements@,handlers.0,handlers.1] s=[target] c=[value,target,elements,handlers]",
+        "ExprStmt v=[value] s=[] c=[value]",
+        "Assignment v=[target,value] s=[] c=[value,target]",
+        "CompoundAssign v=[target,value] s=[] c=[value,target]",
+        "Return v=[value] s=[] c=[value]",
+        "ForIn v=[for_binder,iterable,body,elements@] s=[] c=[body,iterable,for_binder,elements]",
+        "WhileLoop v=[condition,body] s=[] c=[body,condition]",
+        "LoopExpr v=[body] s=[] c=[body]",
+        "Break v=[] s=[] c=[]",
+        "Continue v=[] s=[] c=[]",
+        "Block v=[stmts.0,stmts.1] s=[] c=[stmts]",
+        "FnDef+body v=[body,params.0,params.1,handlers.0,handlers.1] s=[type_ann,type_params.0,type_params.1,effects.0,effects.1] c=[body,type_ann,params,type_params,effects,handlers]",
+        "FnDef-body v=[handlers.0,handlers.1] s=[type_ann,type_params.0,type_params.1,params.0,params.1,effects.0,effects.1] c=[body,type_ann,params,type_params,effects,handlers]",
+        "Param v=[] s=[type_ann,value] c=[value,type_ann]",
+        "Program v=[params.0,params.1,fields.0,fields.1,stmts.0,stmts.1,arms.0,arms.1,methods.0,methods.1,elements.0,elements.1,args.0,args.1,handlers.0,handlers.1,captures.0,captures.1] s=[] c=[params,args,stmts,arms,fields,elements,methods,captures,handlers]",
+        "TypeDef v=[condition,fields.0,fields.1,handlers.0,handlers.1] s=[value,type_params.0,type_params.1] c=[condition,value,fields,type_params,handlers]",
+        "TypeField v=[condition] s=[value] c=[condition,value]",
+        "TypeVariant v=[fields.0,fields.1] s=[] c=[fields]",
+        "TraitDef v=[assoc_types.0,assoc_types.1,methods.0,methods.1,handlers.0,handlers.1] s=[type_params.0,type_params.1,supertraits.0,supertraits.1] c=[methods,type_params,handlers,assoc_types,supertraits]",
+        "ImplBlock v=[assoc_types.0,assoc_types.1,methods.0,methods.1,handlers.0,handlers.1] s=[type_params.0,type_params.1,impl_binders.0,impl_binders.1,recv_type_args.0,recv_type_args.1,impl_where_bounds.0,impl_where_bounds.1] c=[methods,type_params,handlers,assoc_types,impl_binders,recv_type_args,impl_where_bounds]",
+        "TestBlock v=[body,handlers.0,handlers.1] s=[] c=[body,handlers]",
+        "IntPattern v=[] s=[] c=[]",
+        "WildcardPattern v=[] s=[] c=[]",
+        "IdentPattern v=[] s=[] c=[]",
+        "TuplePattern v=[elements.0,elements.1] s=[] c=[elements]",
+        "StringPattern v=[] s=[] c=[]",
+        "OrPattern v=[elements.0,elements.1] s=[] c=[elements]",
+        "RangePattern v=[] s=[] c=[]",
+        "StructPattern v=[fields.0,fields.1] s=[] c=[fields]",
+        "EnumPattern v=[fields.0,fields.1] s=[] c=[fields]",
+        "AsPattern v=[pattern] s=[] c=[pattern]",
+        "ListPattern v=[elements.0,elements.1] s=[] c=[elements]",
+        "MatchArm v=[pattern,guard,body] s=[] c=[body,pattern,guard]",
+        "StructLitField v=[pattern,value] s=[] c=[pattern,value]",
+        "WithBlock v=[body,handlers.0,handlers.1] s=[] c=[body,handlers]",
+        "WithResource v=[value] s=[] c=[value]",
+        "HandlerExpr v=[methods.0,methods.1] s=[] c=[methods]",
+        "Annotation@requires v=[args.0,args.1] s=[] c=[args]",
+        "Annotation@ensures v=[args.0,args.1] s=[] c=[args]",
+        "Annotation@derive v=[] s=[args.0,args.1] c=[args]",
+        "ModBlock v=[] s=[] c=[]",
+        "ImportStmt v=[handlers.0,handlers.1] s=[args.0,args.1] c=[args,handlers]",
+        "TypeAnn v=[] s=[type_ann,elements.0,elements.1] c=[type_ann,elements]",
+        "TypeParam v=[] s=[elements.0,elements.1] c=[elements]",
+        "EffectDecl v=[elements.0,elements.1,methods.0,methods.1,handlers.0,handlers.1] s=[] c=[elements,methods,handlers]",
+        "AsyncScope v=[body] s=[] c=[body]",
+        "AsyncSpawn v=[body] s=[] c=[body]",
+        "AwaitExpr v=[obj] s=[] c=[obj]",
+        "ChannelNew v=[args.0,args.1] s=[type_params.0,type_params.1] c=[args,type_params]",
+        "EmbedExpr v=[] s=[] c=[]",
+        "NamedArg v=[value] s=[] c=[value]",
+        "AssocType v=[] s=[type_ann] c=[type_ann]",
+        "SpreadExpr v=[value] s=[] c=[value]",
+        "CharLit v=[] s=[] c=[]",
+        "AssertPanics v=[value,body] s=[] c=[body,value]",
+        "KindCount v=[] s=[] c=[]",
+    ]
+}
+
+test "every node kind walks its children in the pinned order" {
+    let got = all_rows()
+    let want = expected_rows()
+    assert_eq(got.len(), want.len())
+    let mut i = 0
+    while i < got.len() {
+        assert_eq(got.get(i).unwrap(), want.get(i).unwrap())
+        i = i + 1
+    }
+}
+
+test "a node with no children present walks none" {
+    let mut t = 0
+    while t < nk_tag_count() {
+        let k = nk_of(t)
+        for nm in ["x", "requires"] {
+            let id = empty_probe(k, nm)
+            assert_eq(node_value_child_ids(id).len(), 0)
+            assert_eq(node_spell_child_ids(id).len(), 0)
+            assert_eq(node_unclaimed_child_field(id), "")
+        }
+        t = t + 1
+    }
+}
