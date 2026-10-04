@@ -234,6 +234,7 @@ type EnumVariantEntry {
     name: Str
     tag: Int
     has_data: Int
+    enum_decl: Int
 }
 let mut evar_pool: List[EnumVariantEntry] = []
 // Flat side-table PARALLEL to evar_pool (same index, same length): the AST node that
@@ -242,6 +243,16 @@ let mut evar_pool: List[EnumVariantEntry] = []
 // is first-declared-wins per bare variant name, so two enums sharing a variant name get one
 // answer between them.
 let mut evar_decl_nodes: List[Int] = []
+// First-declared evar_pool slot per variant name. Name lookups run once per identifier,
+// so they must not scan evar_pool.
+let mut evar_first_by_name: Map[Str, Int] = Map()
+
+// The enum declaration of the first-declared variant named `name`, or -1.
+fn tc_variant_enum_decl_node(name: Str) -> Int {
+    let i = evar_first_by_name.get(name) ?? -1
+    if i < 0 { return -1 }
+    evar_pool.get(i).unwrap().enum_decl
+}
 
 fn tc_variant_decl_node(var_idx: Int) -> Int {
     if var_idx < 0 || var_idx >= evar_decl_nodes.len() { return -1 }
@@ -1310,7 +1321,6 @@ let mut depr_type_nodes: Map[Str, Int] = Map()
 // Decl nodes captured at registration so the E0518 diagnostic can point a
 // primary span at the struct decl and a secondary span at the enum decl.
 pub let mut tc_struct_decl_nodes: Map[Str, Int] = Map()
-let mut tc_variant_enum_decl_nodes: Map[Str, Int] = Map()
 
 // Dedupe so each colliding name is reported once, not per use site.
 let mut tc_collision_reported: Map[Str, Int] = Map()
@@ -8530,10 +8540,10 @@ fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
                     fi = fi + 1
                 }
             }
-            evar_pool.push(EnumVariantEntry { enum_id: tid, name: vname, tag: _tag, has_data: _has_data })
+            evar_pool.push(EnumVariantEntry { enum_id: tid, name: vname, tag: _tag, has_data: _has_data, enum_decl: td })
             evar_decl_nodes.push(v)
-            if tc_variant_enum_decl_nodes.contains_key(vname) == 0 {
-                tc_variant_enum_decl_nodes.insert(vname, td)
+            if evar_first_by_name.contains_key(vname) == 0 {
+                evar_first_by_name.insert(vname, var_idx)
             }
 
             _tag = _tag + 1
@@ -9070,7 +9080,7 @@ fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
         if tc_collision_reported.contains_key(vname) == 0 && stid != -1 {
             tc_collision_reported.insert(vname, 1)
             let struct_node = tc_struct_decl_nodes.get(tc_tid_name(stid)) ?? -1
-            let enum_node = tc_variant_enum_decl_nodes.get(vname) ?? -1
+            let enum_node = tc_variant_enum_decl_node(vname)
             diag_error_at("NameCollision", NAME_COLLISION, "struct `{vname}` has the same name as an enum variant `{vname}`; bare construction would be ambiguous (note: two different enums MAY share a variant name — only a struct-vs-variant clash is rejected)", struct_node, "rename either the struct or the variant")
             if enum_node != -1 {
                 diag_error_at("NameCollision", NAME_COLLISION, "the conflicting variant `{vname}` is declared here", enum_node, "rename either the struct or the variant")
@@ -11139,6 +11149,7 @@ fn init_types() ! TypeCheck.Register {
     nr_callable_field_names.clear()
     evar_pool.clear()
     evar_decl_nodes.clear()
+    evar_first_by_name.clear()
     evfield_pool.clear()
     fnsig_pool.clear()
     fnsig_by_decl.clear()
@@ -11195,7 +11206,6 @@ fn init_types() ! TypeCheck.Register {
     depr_fn_nodes.clear()
     depr_type_nodes.clear()
     tc_struct_decl_nodes.clear()
-    tc_variant_enum_decl_nodes.clear()
     tc_collision_reported.clear()
     ffi_struct_type_set.clear()
     ffi_opaque_type_set.clear()
@@ -13379,26 +13389,13 @@ fn is_builtin_variant_name(name: Str) -> Int {
 
 fn is_variant_name(name: Str) -> Int {
     if is_builtin_variant_name(name) != 0 { return 1 }
-    let mut i = 0
-    while i < evar_pool.len() {
-        if evar_pool.get(i).unwrap().name == name {
-            return 1
-        }
-        i = i + 1
-    }
-    0
+    evar_first_by_name.contains_key(name)
 }
 
 fn get_variant_enum_tid(name: Str) -> Int {
-    let mut i = 0
-    while i < evar_pool.len() {
-        let ev = evar_pool.get(i).unwrap()
-        if ev.name == name {
-            return ev.enum_id
-        }
-        i = i + 1
-    }
-    TYPE_UNKNOWN
+    let i = evar_first_by_name.get(name) ?? -1
+    if i < 0 { return TYPE_UNKNOWN }
+    evar_pool.get(i).unwrap().enum_id
 }
 
 // Reverse-infer a generic-enum INSTANCE tid (`Tree[Int]`) from a variant
@@ -13612,14 +13609,7 @@ fn tc_nullary_variant_tid(enum_tid: Int, decl: Int, var_idx: Int) -> Int {
 // evar_pool.len() just before pushing the variant), so it lets variant_field_count
 // look up the declared field count for that variant. Returns -1 if not found.
 fn get_variant_var_idx(name: Str) -> Int {
-    let mut i = 0
-    while i < evar_pool.len() {
-        if evar_pool.get(i).unwrap().name == name {
-            return i
-        }
-        i = i + 1
-    }
-    -1
+    evar_first_by_name.get(name) ?? -1
 }
 
 // Number of declared fields for the variant at the given evar_pool index, by
@@ -17245,7 +17235,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let vt = nr_get_type(name)
         if tc_tid_is_no_info(vt) == 0 { return vt }
         if is_variant_name(name) != 0 {
-            let vdecl = tc_variant_enum_decl_nodes.get(name) ?? -1
+            let vdecl = tc_variant_enum_decl_node(name)
             return tc_nullary_variant_tid(get_variant_enum_tid(name), vdecl, get_variant_var_idx(name))
         }
         // A named function used as a VALUE (`take_fn(m, bump)`) denotes its own signature. No
@@ -17602,7 +17592,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
                     // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
                     // it; a non-generic enum keeps the bare tid.
-                    let vdecl = tc_variant_enum_decl_nodes.get(fn_name) ?? -1
+                    let vdecl = tc_variant_enum_decl_node(fn_name)
                     return tc_enum_ctor_instance_tid(venum, vdecl, fn_name, node_args(node))
                 }
                 // Local lexical scope shadows module-level definitions
@@ -19705,7 +19695,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // enum tid, so a generic enum reverse-infers its instance (`Tree[Int]`);
                 // the two spellings must "emit identical code" (03_types.md:1036). The decl
                 // node comes from tc_type_decl_nodes keyed by the ENUM — NOT from
-                // tc_variant_enum_decl_nodes, which is first-declared-wins per variant name
+                // tc_variant_enum_decl_node, which is first-declared-wins per variant name
                 // and would hand back the other enum's decl for a shared name, the very
                 // confusion this block exists to end.
                 //
@@ -19777,7 +19767,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let venum = get_variant_enum_tid(sname)
                     // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
                     // infers its concrete instance tid; non-generic keeps bare.
-                    let vdecl = tc_variant_enum_decl_nodes.get(sname) ?? -1
+                    let vdecl = tc_variant_enum_decl_node(sname)
                     return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
                 }
                 if n > 1 {
@@ -20754,7 +20744,7 @@ fn tc_args_are_const(args_sl: Int) -> Int {
 // are named because they are variants the language declares rather than the program.
 fn tc_name_is_variant_ctor(name: Str) -> Int {
     if name == "Some" || name == "Ok" || name == "Err" || name == "None" { return 1 }
-    if tc_variant_enum_decl_nodes.contains_key(name) != 0 { return 1 }
+    if evar_first_by_name.contains_key(name) != 0 { return 1 }
     0
 }
 
