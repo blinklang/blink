@@ -374,115 +374,280 @@ pub type NodeChildren {
     spell_lists: List[Int] = []
 }
 
-fn nk_drop_absent(ids: List[Int]) -> List[Int] {
-    let mut out: List[Int] = []
-    let mut i = 0
-    while i < ids.len() {
-        let c = ids.get(i).unwrap()
-        if c != -1 { out.push(c) }
-        i = i + 1
-    }
-    out
+// Which of a node's children a read of the table collects. `Value` and `Spell` are the flat
+// walks: node ids only, each sublist expanded to its members. The other four collect one
+// bucket of NodeChildren as the table holds it, sublists unexpanded.
+pub type ChildWalk {
+    Value, Spell, ValueRefs, ValueLists, SpellRefs, SpellLists
 }
 
-fn nk_kids(refs: List[Int], lists: List[Int], spell_refs: List[Int], spell_lists: List[Int]) -> NodeChildren {
-    NodeChildren {
-        refs: nk_drop_absent(refs), lists: nk_drop_absent(lists),
-        spell_refs: nk_drop_absent(spell_refs), spell_lists: nk_drop_absent(spell_lists),
+// Where a read of the table puts what it collects. The walkers run once per node per pass,
+// so they append to a list the caller owns rather than build lists of their own.
+// `sublists` is the parser's sublist store, which a flat walk reads to expand a sublist.
+type ChildSink {
+    walk: ChildWalk
+    sublists: List[List[Int]]
+    out: List[Int]
+}
+
+fn nc_ref(s: ChildSink, id: Int, spell: Bool) {
+    if id == -1 { return }
+    let flat = if spell { ChildWalk.Spell } else { ChildWalk.Value }
+    let bucket = if spell { ChildWalk.SpellRefs } else { ChildWalk.ValueRefs }
+    if s.walk == flat || s.walk == bucket { s.out.push(id) }
+}
+
+fn nc_list(s: ChildSink, sl: Int, spell: Bool) {
+    if sl == -1 { return }
+    let flat = if spell { ChildWalk.Spell } else { ChildWalk.Value }
+    let bucket = if spell { ChildWalk.SpellLists } else { ChildWalk.ValueLists }
+    if s.walk == bucket { s.out.push(sl) }
+    if s.walk != flat { return }
+    let members = s.sublists.get(sl).unwrap()
+    let mut i = 0
+    while i < members.len() {
+        let c = members.get(i).unwrap()
+        if c != -1 { s.out.push(c) }
+        i = i + 1
     }
+}
+
+fn nc_v(s: ChildSink, id: Int) { nc_ref(s, id, false) }
+fn nc_vl(s: ChildSink, sl: Int) { nc_list(s, sl, false) }
+fn nc_s(s: ChildSink, id: Int) { nc_ref(s, id, true) }
+fn nc_sl(s: ChildSink, sl: Int) { nc_list(s, sl, true) }
+
+// Appends to `out` the children of `node` that `walk` asks for, in table order. `sublists`
+// is read only by the flat walks.
+pub fn node_child_ids_into(node: AstNode, walk: ChildWalk, sublists: List[List[Int]], out: List[Int]) {
+    nc_table(node, ChildSink { walk: walk, sublists: sublists, out: out })
 }
 
 // EVERY child of a node, for any pass that must not miss one.
 pub fn node_children(node: AstNode) -> NodeChildren {
+    let no_sublists: List[List[Int]] = []
+    let kids = NodeChildren {}
+    node_child_ids_into(node, ChildWalk.ValueRefs, no_sublists, kids.refs)
+    node_child_ids_into(node, ChildWalk.ValueLists, no_sublists, kids.lists)
+    node_child_ids_into(node, ChildWalk.SpellRefs, no_sublists, kids.spell_refs)
+    node_child_ids_into(node, ChildWalk.SpellLists, no_sublists, kids.spell_lists)
+    kids
+}
+
+// The one table of every node kind's children. Each arm names its value children before its
+// spelling children, and node ids before sublists within each, so a flat walk answers in that
+// order.
+fn nc_table(node: AstNode, s: ChildSink) {
     match nk_of(node.kind) {
-        NodeKind.IntLit => nk_kids([], [], [], [])
-        NodeKind.FloatLit => nk_kids([], [], [], [])
-        NodeKind.Ident => nk_kids([], [], [], [])
+        NodeKind.IntLit => {}
+        NodeKind.FloatLit => {}
+        NodeKind.Ident => {}
         // A call's `left` is the CALLEE EXPRESSION — an Ident for a named call, any value for
         // a call through a closure — so it is a value child, not a spelling.
-        NodeKind.Call => nk_kids([node.left], [node.args], [], [node.type_params])
-        NodeKind.MethodCall => nk_kids([node.obj], [node.args], [], [node.type_params])
-        NodeKind.BinOp => nk_kids([node.left, node.right], [], [], [])
-        NodeKind.UnaryOp => nk_kids([node.left], [], [], [])
-        NodeKind.InterpString => nk_kids([], [node.elements], [], [])
-        NodeKind.BoolLit => nk_kids([], [], [], [])
-        NodeKind.TupleLit => nk_kids([], [node.elements], [], [])
-        NodeKind.ListLit => nk_kids([], [node.elements], [], [])
-        NodeKind.StructLit => nk_kids([], [node.fields], [], [])
-        NodeKind.FieldAccess => nk_kids([node.obj], [], [], [])
-        NodeKind.IndexExpr => nk_kids([node.obj, node.index], [], [], [])
-        NodeKind.RangeLit => nk_kids([node.start, node.end], [], [], [])
-        NodeKind.IfExpr => nk_kids([node.condition, node.then_body, node.else_body], [], [], [])
-        NodeKind.MatchExpr => nk_kids([node.scrutinee], [node.arms], [], [])
-        NodeKind.Closure => nk_kids([node.body], [node.params], [node.type_ann], [])
-        NodeKind.LetBinding => nk_kids([node.value, node.elements], [node.handlers], [node.target], [])
-        NodeKind.ExprStmt => nk_kids([node.value], [], [], [])
-        NodeKind.Assignment => nk_kids([node.target, node.value], [], [], [])
-        NodeKind.CompoundAssign => nk_kids([node.target, node.value], [], [], [])
-        NodeKind.Return => nk_kids([node.value], [], [], [])
-        NodeKind.ForIn => nk_kids([node.for_binder, node.iterable, node.body, node.elements], [], [], [])
-        NodeKind.WhileLoop => nk_kids([node.condition, node.body], [], [], [])
-        NodeKind.LoopExpr => nk_kids([node.body], [], [], [])
-        NodeKind.Break => nk_kids([], [], [], [])
-        NodeKind.Continue => nk_kids([], [], [], [])
-        NodeKind.Block => nk_kids([], [node.stmts], [], [])
+        NodeKind.Call => {
+            nc_v(s, node.left)
+            nc_vl(s, node.args)
+            nc_sl(s, node.type_params)
+        }
+        NodeKind.MethodCall => {
+            nc_v(s, node.obj)
+            nc_vl(s, node.args)
+            nc_sl(s, node.type_params)
+        }
+        NodeKind.BinOp => {
+            nc_v(s, node.left)
+            nc_v(s, node.right)
+        }
+        NodeKind.UnaryOp => nc_v(s, node.left)
+        NodeKind.InterpString => nc_vl(s, node.elements)
+        NodeKind.BoolLit => {}
+        NodeKind.TupleLit => nc_vl(s, node.elements)
+        NodeKind.ListLit => nc_vl(s, node.elements)
+        NodeKind.StructLit => nc_vl(s, node.fields)
+        NodeKind.FieldAccess => nc_v(s, node.obj)
+        NodeKind.IndexExpr => {
+            nc_v(s, node.obj)
+            nc_v(s, node.index)
+        }
+        NodeKind.RangeLit => {
+            nc_v(s, node.start)
+            nc_v(s, node.end)
+        }
+        NodeKind.IfExpr => {
+            nc_v(s, node.condition)
+            nc_v(s, node.then_body)
+            nc_v(s, node.else_body)
+        }
+        NodeKind.MatchExpr => {
+            nc_v(s, node.scrutinee)
+            nc_vl(s, node.arms)
+        }
+        NodeKind.Closure => {
+            nc_v(s, node.body)
+            nc_vl(s, node.params)
+            nc_s(s, node.type_ann)
+        }
+        NodeKind.LetBinding => {
+            nc_v(s, node.value)
+            nc_v(s, node.elements)
+            nc_vl(s, node.handlers)
+            nc_s(s, node.target)
+        }
+        NodeKind.ExprStmt => nc_v(s, node.value)
+        NodeKind.Assignment => {
+            nc_v(s, node.target)
+            nc_v(s, node.value)
+        }
+        NodeKind.CompoundAssign => {
+            nc_v(s, node.target)
+            nc_v(s, node.value)
+        }
+        NodeKind.Return => nc_v(s, node.value)
+        NodeKind.ForIn => {
+            nc_v(s, node.for_binder)
+            nc_v(s, node.iterable)
+            nc_v(s, node.body)
+            nc_v(s, node.elements)
+        }
+        NodeKind.WhileLoop => {
+            nc_v(s, node.condition)
+            nc_v(s, node.body)
+        }
+        NodeKind.LoopExpr => nc_v(s, node.body)
+        NodeKind.Break => {}
+        NodeKind.Continue => {}
+        NodeKind.Block => nc_vl(s, node.stmts)
         // A bodiless fn is a SIGNATURE — a trait method, an effect operation — so its
         // params and return annotation spell types and bind nothing. The same kind with a
         // body binds its params to values.
         NodeKind.FnDef => if node.body == -1 {
-            nk_kids([], [node.handlers], [node.type_ann], [node.type_params, node.params, node.effects])
+            nc_vl(s, node.handlers)
+            nc_s(s, node.type_ann)
+            nc_sl(s, node.type_params)
+            nc_sl(s, node.params)
+            nc_sl(s, node.effects)
         } else {
-            nk_kids([node.body], [node.params, node.handlers], [node.type_ann], [node.type_params, node.effects])
+            nc_v(s, node.body)
+            nc_vl(s, node.params)
+            nc_vl(s, node.handlers)
+            nc_s(s, node.type_ann)
+            nc_sl(s, node.type_params)
+            nc_sl(s, node.effects)
         }
-        NodeKind.Param => nk_kids([], [], [node.type_ann, node.value], [])
-        NodeKind.Program => nk_kids([], [node.params, node.fields, node.stmts, node.arms, node.methods, node.elements, node.args, node.handlers, node.captures], [], [])
+        NodeKind.Param => {
+            nc_s(s, node.type_ann)
+            nc_s(s, node.value)
+        }
+        NodeKind.Program => {
+            nc_vl(s, node.params)
+            nc_vl(s, node.fields)
+            nc_vl(s, node.stmts)
+            nc_vl(s, node.arms)
+            nc_vl(s, node.methods)
+            nc_vl(s, node.elements)
+            nc_vl(s, node.args)
+            nc_vl(s, node.handlers)
+            nc_vl(s, node.captures)
+        }
         // A type alias's `condition` is its @where REFINEMENT PREDICATE: an expression over
         // `self` that the boundary checks evaluate, so it is typed like any other value.
-        NodeKind.TypeDef => nk_kids([node.condition], [node.fields, node.handlers], [node.value], [node.type_params])
-        NodeKind.TypeField => nk_kids([node.condition], [], [node.value], [])
-        NodeKind.TypeVariant => nk_kids([], [node.fields], [], [])
-        NodeKind.TraitDef => nk_kids([], [node.assoc_types, node.methods, node.handlers], [], [node.type_params, node.supertraits])
-        NodeKind.ImplBlock => nk_kids([], [node.assoc_types, node.methods, node.handlers], [], [node.type_params, node.impl_binders, node.recv_type_args, node.impl_where_bounds])
-        NodeKind.TestBlock => nk_kids([node.body], [node.handlers], [], [])
-        NodeKind.IntPattern => nk_kids([], [], [], [])
-        NodeKind.WildcardPattern => nk_kids([], [], [], [])
-        NodeKind.IdentPattern => nk_kids([], [], [], [])
-        NodeKind.TuplePattern => nk_kids([], [node.elements], [], [])
-        NodeKind.StringPattern => nk_kids([], [], [], [])
-        NodeKind.OrPattern => nk_kids([], [node.elements], [], [])
-        NodeKind.RangePattern => nk_kids([], [], [], [])
-        NodeKind.StructPattern => nk_kids([], [node.fields], [], [])
-        NodeKind.EnumPattern => nk_kids([], [node.fields], [], [])
-        NodeKind.AsPattern => nk_kids([node.pattern], [], [], [])
-        NodeKind.ListPattern => nk_kids([], [node.elements], [], [])
-        NodeKind.MatchArm => nk_kids([node.pattern, node.guard, node.body], [], [], [])
-        NodeKind.StructLitField => nk_kids([node.pattern, node.value], [], [], [])
-        NodeKind.WithBlock => nk_kids([node.body], [node.handlers], [], [])
-        NodeKind.WithResource => nk_kids([node.value], [], [], [])
-        NodeKind.HandlerExpr => nk_kids([], [node.methods], [], [])
+        NodeKind.TypeDef => {
+            nc_v(s, node.condition)
+            nc_vl(s, node.fields)
+            nc_vl(s, node.handlers)
+            nc_s(s, node.value)
+            nc_sl(s, node.type_params)
+        }
+        NodeKind.TypeField => {
+            nc_v(s, node.condition)
+            nc_s(s, node.value)
+        }
+        NodeKind.TypeVariant => nc_vl(s, node.fields)
+        NodeKind.TraitDef => {
+            nc_vl(s, node.assoc_types)
+            nc_vl(s, node.methods)
+            nc_vl(s, node.handlers)
+            nc_sl(s, node.type_params)
+            nc_sl(s, node.supertraits)
+        }
+        NodeKind.ImplBlock => {
+            nc_vl(s, node.assoc_types)
+            nc_vl(s, node.methods)
+            nc_vl(s, node.handlers)
+            nc_sl(s, node.type_params)
+            nc_sl(s, node.impl_binders)
+            nc_sl(s, node.recv_type_args)
+            nc_sl(s, node.impl_where_bounds)
+        }
+        NodeKind.TestBlock => {
+            nc_v(s, node.body)
+            nc_vl(s, node.handlers)
+        }
+        NodeKind.IntPattern => {}
+        NodeKind.WildcardPattern => {}
+        NodeKind.IdentPattern => {}
+        NodeKind.TuplePattern => nc_vl(s, node.elements)
+        NodeKind.StringPattern => {}
+        NodeKind.OrPattern => nc_vl(s, node.elements)
+        NodeKind.RangePattern => {}
+        NodeKind.StructPattern => nc_vl(s, node.fields)
+        NodeKind.EnumPattern => nc_vl(s, node.fields)
+        NodeKind.AsPattern => nc_v(s, node.pattern)
+        NodeKind.ListPattern => nc_vl(s, node.elements)
+        NodeKind.MatchArm => {
+            nc_v(s, node.pattern)
+            nc_v(s, node.guard)
+            nc_v(s, node.body)
+        }
+        NodeKind.StructLitField => {
+            nc_v(s, node.pattern)
+            nc_v(s, node.value)
+        }
+        NodeKind.WithBlock => {
+            nc_v(s, node.body)
+            nc_vl(s, node.handlers)
+        }
+        NodeKind.WithResource => nc_v(s, node.value)
+        NodeKind.HandlerExpr => nc_vl(s, node.methods)
         // A contract's predicate is an expression the runtime check evaluates; every other
         // annotation's arguments only spell names and options.
         NodeKind.Annotation => if node.name == "requires" || node.name == "ensures" {
-            nk_kids([], [node.args], [], [])
+            nc_vl(s, node.args)
         } else {
-            nk_kids([], [], [], [node.args])
+            nc_sl(s, node.args)
         }
-        NodeKind.ModBlock => nk_kids([], [], [], [])
-        NodeKind.ImportStmt => nk_kids([], [node.handlers], [], [node.args])
-        NodeKind.TypeAnn => nk_kids([], [], [node.type_ann], [node.elements])
-        NodeKind.TypeParam => nk_kids([], [], [], [node.elements])
-        NodeKind.EffectDecl => nk_kids([], [node.elements, node.methods, node.handlers], [], [])
-        NodeKind.AsyncScope => nk_kids([node.body], [], [], [])
-        NodeKind.AsyncSpawn => nk_kids([node.body], [], [], [])
-        NodeKind.AwaitExpr => nk_kids([node.obj], [], [], [])
-        NodeKind.ChannelNew => nk_kids([], [node.args], [], [node.type_params])
-        NodeKind.EmbedExpr => nk_kids([], [], [], [])
-        NodeKind.NamedArg => nk_kids([node.value], [], [], [])
-        NodeKind.AssocType => nk_kids([], [], [node.type_ann], [])
-        NodeKind.SpreadExpr => nk_kids([node.value], [], [], [])
-        NodeKind.CharLit => nk_kids([], [], [], [])
-        NodeKind.AssertPanics => nk_kids([node.value, node.body], [], [], [])
-        NodeKind.KindCount => nk_kids([], [], [], [])
+        NodeKind.ModBlock => {}
+        NodeKind.ImportStmt => {
+            nc_vl(s, node.handlers)
+            nc_sl(s, node.args)
+        }
+        NodeKind.TypeAnn => {
+            nc_s(s, node.type_ann)
+            nc_sl(s, node.elements)
+        }
+        NodeKind.TypeParam => nc_sl(s, node.elements)
+        NodeKind.EffectDecl => {
+            nc_vl(s, node.elements)
+            nc_vl(s, node.methods)
+            nc_vl(s, node.handlers)
+        }
+        NodeKind.AsyncScope => nc_v(s, node.body)
+        NodeKind.AsyncSpawn => nc_v(s, node.body)
+        NodeKind.AwaitExpr => nc_v(s, node.obj)
+        NodeKind.ChannelNew => {
+            nc_vl(s, node.args)
+            nc_sl(s, node.type_params)
+        }
+        NodeKind.EmbedExpr => {}
+        NodeKind.NamedArg => nc_v(s, node.value)
+        NodeKind.AssocType => nc_s(s, node.type_ann)
+        NodeKind.SpreadExpr => nc_v(s, node.value)
+        NodeKind.CharLit => {}
+        NodeKind.AssertPanics => {
+            nc_v(s, node.value)
+            nc_v(s, node.body)
+        }
+        NodeKind.KindCount => {}
     }
 }
 
