@@ -456,6 +456,24 @@ BLINK_RT_FN void* blink_alloc(int64_t size) {
 }
 #endif
 
+/* For a block that never holds a pointer, such as string or byte data: the
+   GC neither scans it nor zero-fills it, so the caller must write every byte
+   it later reads. GC_REALLOC keeps the kind of an object, so blink_realloc
+   keeps the block atomic. In an arena the two kinds are the same memory. */
+BLINK_RT_FN void* blink_alloc_atomic(int64_t size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_alloc_atomic(int64_t size) {
+    blink_arena_t* a = __blink_current_arena;
+    if (a != NULL) return blink_arena_alloc_atomic(a, size);
+    void* p = GC_MALLOC_ATOMIC((size_t)size);
+    if (!p) {
+        fprintf(stderr, "blink: out of memory\n");
+        exit(1);
+    }
+    return p;
+}
+#endif
+
 /* A thread pool, task, handle or channel is shared with other threads and read after
    the arena it was made in closes, and arena promotion passes its pointer through
    unchanged. So it always lives on the GC heap, even inside `with arena`. */
@@ -599,7 +617,7 @@ BLINK_RT_FN char* blink_str_alloc(int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN char* blink_str_alloc(int64_t len) {
     blink_str_gc_offset();
-    char* base = (char*)blink_alloc(BLINK_STR_HDR_SIZE + len + 1);
+    char* base = (char*)blink_alloc_atomic(BLINK_STR_HDR_SIZE + len + 1);
     char* data = base + BLINK_STR_HDR_SIZE;
     blink_str_write_hdr(data, len);
     return data;
@@ -1115,7 +1133,7 @@ BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops) {
     size_t stride = blink_kops_stride(kops);
     m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
     m->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
-    m->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)m->cap);
+    m->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)m->cap);
     memset(m->states, 0, (size_t)m->cap);
     return m;
 }
@@ -1137,7 +1155,7 @@ BLINK_RT_FN void blink_map_grow(blink_map* m) {
     int64_t mask = m->cap - 1;
     m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
     m->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
-    m->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)m->cap);
+    m->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)m->cap);
     memset(m->states, 0, (size_t)m->cap);
     m->len = 0;
     for (int64_t i = 0; i < old_cap; i++) {
@@ -1477,7 +1495,7 @@ BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops) {
     s->kops = kops;
     size_t stride = blink_kops_stride(kops);
     s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
-    s->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)s->cap);
+    s->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)s->cap);
     memset(s->states, 0, (size_t)s->cap);
     return s;
 }
@@ -1496,7 +1514,7 @@ BLINK_RT_FN void blink_set_grow(blink_set* s) {
     s->cap = old_cap * 2;
     int64_t mask = s->cap - 1;
     s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
-    s->states = (uint8_t*)blink_alloc(sizeof(uint8_t) * (size_t)s->cap);
+    s->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)s->cap);
     memset(s->states, 0, (size_t)s->cap);
     s->len = 0;
     for (int64_t i = 0; i < old_cap; i++) {
@@ -1688,7 +1706,7 @@ BLINK_RT_FN blink_bytes* blink_bytes_new(void) {
     blink_bytes* b = (blink_bytes*)blink_alloc(sizeof(blink_bytes));
     b->cap = 16;
     b->len = 0;
-    b->data = (uint8_t*)blink_alloc((size_t)b->cap);
+    b->data = (uint8_t*)blink_alloc_atomic((size_t)b->cap);
     return b;
 }
 #endif
@@ -2191,7 +2209,7 @@ BLINK_RT_FN blink_bytes* blink_bytes_zeroed(int64_t n) {
     blink_bytes* b = (blink_bytes*)blink_alloc(sizeof(blink_bytes));
     b->cap = n > 16 ? n : 16;
     b->len = n;
-    b->data = (uint8_t*)blink_alloc((size_t)b->cap);
+    b->data = (uint8_t*)blink_alloc_atomic((size_t)b->cap);
     if (n > 0) memset(b->data, 0, (size_t)n);
     return b;
 }
@@ -2237,7 +2255,7 @@ BLINK_RT_FN blink_sb* blink_sb_new(void) {
     blink_sb* sb = (blink_sb*)blink_alloc(sizeof(blink_sb));
     sb->cap = 64;
     sb->len = 0;
-    sb->data = (char*)blink_alloc((size_t)sb->cap);
+    sb->data = (char*)blink_alloc_atomic((size_t)sb->cap);
     sb->data[0] = '\0';
     return sb;
 }
@@ -2250,7 +2268,7 @@ BLINK_RT_FN blink_sb* blink_sb_with_capacity(int64_t cap) {
     blink_sb* sb = (blink_sb*)blink_alloc(sizeof(blink_sb));
     sb->cap = cap;
     sb->len = 0;
-    sb->data = (char*)blink_alloc((size_t)sb->cap);
+    sb->data = (char*)blink_alloc_atomic((size_t)sb->cap);
     sb->data[0] = '\0';
     return sb;
 }

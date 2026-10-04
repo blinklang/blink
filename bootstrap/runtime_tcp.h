@@ -164,12 +164,11 @@ BLINK_RT_FN const char* blink_tcp_read_all(int64_t fd);
 BLINK_RT_FN const char* blink_tcp_read_all(int64_t fd) {
     int64_t cap = 4096;
     int64_t len = 0;
-    char* buf = (char*)blink_alloc(cap);
+    char* buf = (char*)blink_alloc_atomic(cap);
     while (1) {
         if (len + 1024 > cap) {
+            buf = (char*)blink_realloc(buf, cap, cap * 2);
             cap *= 2;
-            buf = (char*)GC_REALLOC(buf, (size_t)cap);
-            if (!buf) return BLINK_STR_EMPTY;
         }
         ssize_t n = read((int)fd, buf + len, (size_t)(cap - len - 1));
         if (n <= 0) break;

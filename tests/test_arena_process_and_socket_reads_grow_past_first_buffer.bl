@@ -1,0 +1,63 @@
+// A process or socket read that outgrows its first buffer inside `with arena`
+// must grow the buffer within the arena. The read starts with 4 KB, so each
+// case here reads well past it, and the bytes must arrive intact.
+import std.net.{tcp_read_all, tcp_write, tcp_close}
+
+@ffi("blinkrt_socketpair_packed")
+@trusted(audit: "TEST-TCP-SOCKET")
+fn socketpair_packed() -> Int ! FFI {}
+
+fn expected_lines(n: Int) -> Str {
+    let sb = StringBuilder.new()
+    let mut i = 1
+    while i <= n {
+        sb.write("{i}\n")
+        i += 1
+    }
+    sb.to_str()
+}
+
+fn line_block(n: Int) -> Str {
+    let sb = StringBuilder.new()
+    let mut i = 0
+    while i < n {
+        sb.write("line {i} of the socket payload\n")
+        i += 1
+    }
+    sb.to_str()
+}
+
+test "process output larger than the first buffer is intact inside an arena" {
+    let want = expected_lines(20000)
+    with arena {
+        let r = process_run("seq", ["1", "20000"])
+        assert_eq(r.exit_code, 0)
+        assert_eq(r.out.len(), want.len())
+        assert(r.out == want)
+    }
+}
+
+test "process stderr larger than the first buffer is intact inside an arena" {
+    let want = expected_lines(20000)
+    with arena {
+        let r = process_run("sh", ["-c", "seq 1 20000 1>&2"])
+        assert_eq(r.err_out.len(), want.len())
+        assert(r.err_out == want)
+    }
+}
+
+test "socket read_all larger than the first buffer is intact inside an arena" {
+    let payload = line_block(2000)
+    let packed = socketpair_packed()
+    assert(packed >= 0)
+    let a = packed >> 32
+    let b = packed & 4294967295
+    tcp_write(a, payload)
+    tcp_close(a)
+    with arena {
+        let got = tcp_read_all(b)
+        assert_eq(got.len(), payload.len())
+        assert(got == payload)
+    }
+    tcp_close(b)
+}
