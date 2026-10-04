@@ -20,7 +20,7 @@ import cname.{
 import ast.{NodeKind, nk_of}
 import parser.{
     ann_str_val, node_args, node_body, node_handlers, node_int_val, node_kind, node_name,
-    node_str_val, node_value, node_value_child_ids, node_xfail_reason,
+    node_str_val, node_value, node_push_value_child_ids, node_xfail_reason,
     sublist_get, sublist_length,
 }
 import layout.{Position, layout_of, layout_reset, set_current_inst, layout_take_typedefs}
@@ -336,29 +336,40 @@ fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: 
 }
 
 // Whether `id`'s own subtree holds a node of `kind`, walked through every child so a scope
-// buried inside a closure, an if, or a match arm is still found.
-fn subtree_has_kind(id: Int, kind: NodeKind) -> Bool {
+// buried inside a closure, an if, or a match arm is still found. `kids` is one buffer shared
+// down the walk, so a subtree is searched without a list per node.
+fn subtree_has_kind(id: Int, kind: NodeKind, kids: List[Int]) -> Bool {
     if id < 0 { return false }
     if nk_of(node_kind(id)) == kind { return true }
-    for child in node_value_child_ids(id) {
-        if subtree_has_kind(child, kind) { return true }
+    let base = kids.len()
+    node_push_value_child_ids(id, kids)
+    let end = kids.len()
+    let mut i = base
+    let mut found = false
+    while i < end && !found {
+        found = subtree_has_kind(kids.get(i).unwrap(), kind, kids)
+        i = i + 1
     }
-    false
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
+    found
 }
 
 // Whether this unit will lower an AsyncScope, answered ahead of emit_definitions: it fuses
 // lowering with printing one body at a time, so the guard support must already be printed
 // by the time the first one needs it. Tests are scanned only for the unit that calls emit_entry.
 fn unit_uses_async_scope(fns: List[Int], methods: List[Int], include_tests: Bool) -> Bool {
+    let mut kids: List[Int] = []
     for f in fns {
-        if subtree_has_kind(node_body(f), NodeKind.AsyncScope) { return true }
+        if subtree_has_kind(node_body(f), NodeKind.AsyncScope, kids) { return true }
     }
     for m in methods {
-        if subtree_has_kind(node_body(m), NodeKind.AsyncScope) { return true }
+        if subtree_has_kind(node_body(m), NodeKind.AsyncScope, kids) { return true }
     }
     if include_tests {
         for t in cg_reg_test_decls() {
-            if subtree_has_kind(node_body(t), NodeKind.AsyncScope) { return true }
+            if subtree_has_kind(node_body(t), NodeKind.AsyncScope, kids) { return true }
         }
     }
     false
