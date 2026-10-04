@@ -55,7 +55,7 @@ import cg_reg.{cg_reg_fn_decls, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_im
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
-    c_runtime_helper, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_string_literal, c_field_name,
+    c_runtime_helper, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_str_const, c_field_name,
     cname_ffi_struct_mirror, c_local_name,
     c_variant_discriminant, c_variant_member_name,
     c_container_ctor, c_pool_global,
@@ -842,8 +842,8 @@ fn cc_bool_display(node: Int, obj: Int) -> Int ! Diag.Report {
     if cc_stopped(rec) { return -1 }
     let held = c_mint_local("bd")
     cg_expr_push_pending(node, ir_let(TYPE_STR, node, rec.c_spelling, held, rec.slot_form, -1))
-    let no = ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal("false"))
-    let yes = ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal("true"))
+    let no = ir_const(TYPE_STR, node, rec.c_spelling, c_str_const("false"))
+    let yes = ir_const(TYPE_STR, node, rec.c_spelling, c_str_const("true"))
     cg_expr_push_pending(node, ir_if(node, cond,
         ir_block(node, [ir_assign(node, cc_temp_ref(node, TYPE_STR, rec, held), yes)]),
         ir_block(node, [ir_assign(node, cc_temp_ref(node, TYPE_STR, rec, held), no)])))
@@ -904,7 +904,7 @@ pub fn cc_display_or_placeholder(node: Int, tid: Int, value: Int) -> Int ! Diag.
     if im >= 0 { return cc_display_call(node, im, value) }
     let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
-    ir_const(TYPE_STR, node, rec.c_spelling, c_string_literal("<{tc_tid_name(tid)}>"))
+    ir_const(TYPE_STR, node, rec.c_spelling, c_str_const("<{tc_tid_name(tid)}>"))
 }
 
 // `[..xs, y]` copies every element of `xs` into the list being built. The copy moves cells
@@ -2400,10 +2400,10 @@ fn cc_lower_ptr_addr(node: Int, obj: Int) -> Int ! Diag.Report {
     ir_cast(TYPE_INT, node, rec.c_spelling, ptr)
 }
 
-// `p.to_str()` reinterprets the pointer's own bits as a Str -- `Ptr[U8]` and `Str` share
-// one C representation, so the payload needs no runtime call, only the same null test
-// `is_null` already makes. A null pointer answers None; anything else answers Some of the
-// reinterpreted bits, built the way `cc_checked_read` builds an Option carrier.
+// `p.to_str()` copies the C string `p` points at into a new Str. The bits alone are not a
+// Str: a Str has a length header before its bytes, and C memory has none. A null pointer
+// answers None, the same null test `is_null` makes; anything else answers Some of the
+// copy, built the way `cc_checked_read` builds an Option carrier.
 fn cc_lower_ptr_to_str(node: Int, obj: Int) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
     if given != 0 { return cc_intrinsic_arity_wrong(node, TyKind.Ptr, "to_str", 0, given) }
@@ -2429,7 +2429,9 @@ fn cc_lower_ptr_to_str(node: Int, obj: Int) -> Int ! Diag.Report {
     let present = ir_binary(TYPE_BOOL, node, present_rec.c_spelling, "!=",
         cc_temp_ref(node, ptr_tid, ptr_rec, ptr_name), ir_const(ptr_tid, node, ptr_rec.c_spelling, "0"))
     let str_tid = child_tid(tid, Slot.Inner1)
-    let payload = ir_cast(str_tid, node, value_mem.c_spelling, cc_temp_ref(node, ptr_tid, ptr_rec, ptr_name))
+    let as_chars = ir_cast(str_tid, node, value_mem.c_spelling, cc_temp_ref(node, ptr_tid, ptr_rec, ptr_name))
+    let payload = ir_call_runtime(str_tid, node, value_mem.c_spelling, c_runtime_helper("str_from_cstr"),
+        value_mem.slot_form, [as_chars])
     let some = cg_expr_option_some(tid, node, carrier, payload)
     if some < 0 { return -1 }
     let none = cg_expr_option_none(tid, node, carrier)
@@ -2567,7 +2569,7 @@ fn cc_lower_enum_to_str(node: Int, obj: Int) -> Int ! Diag.Report {
     while i < n {
         let v = sublist_get(flds, i)
         let label = ir_const(TYPE_INT, node, carrier.c_spelling, c_variant_discriminant(enum_tid, v))
-        let text = ir_const(tid, node, carrier.c_spelling, c_string_literal(node_str_val(v)))
+        let text = ir_const(tid, node, carrier.c_spelling, c_str_const(node_str_val(v)))
         cases.push(label)
         cases.push(ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), text)]))
         i = i + 1
@@ -2627,7 +2629,7 @@ fn cc_lower_enum_from_str(node: Int) -> Int ! Diag.Report {
         let label = c_variant_discriminant(enum_tid, v)
         if diag_is_ice_seg(label) { return -1 }
         let same = ir_call_runtime(TYPE_BOOL, node, bools.c_spelling, c_runtime_helper("str_eq"), bools.slot_form,
-            [cc_temp_ref(node, TYPE_STR, text_rec, text), ir_const(TYPE_STR, node, text_rec.c_spelling, c_string_literal(node_str_val(v)))])
+            [cc_temp_ref(node, TYPE_STR, text_rec, text), ir_const(TYPE_STR, node, text_rec.c_spelling, c_str_const(node_str_val(v)))])
         let some = cg_expr_option_some(tid, node, carrier, ir_const(enum_tid, node, member.c_spelling, label))
         if some < 0 { return -1 }
         cg_expr_push_pending(node, ir_if(node, same,
@@ -3556,7 +3558,7 @@ fn cc_conversion_error_refused(node: Int, why: Str, empty: ConversionErrorPlan) 
 fn cc_conversion_error_value(node: Int, err_mem: LayoutRecord, fault: ConversionErrorPlan) -> Int {
     let mut fields: List[Int] = []
     for text in fault.texts {
-        fields.push(ir_const(TYPE_STR, node, fault.string_spelling, c_string_literal(text)))
+        fields.push(ir_const(TYPE_STR, node, fault.string_spelling, c_str_const(text)))
     }
     let built = ir_struct_new(fault.tid, node, fault.spelling, fields)
     if err_mem.slot_form != SlotForm.PointerBoxed { return built }
@@ -4031,7 +4033,7 @@ fn cc_channel_send(node: Int, obj: Int) -> Int ! Diag.Report {
     let from = ir_unary(shape.tid, node, pointer_spelling(shape.value.c_spelling), "&",
         cc_temp_ref(node, shape.tid, shape.value, elem))
     let message = ir_const(TYPE_STR, node, said.c_spelling,
-        c_string_literal(cc_panic_message(node, channel_send_closed)))
+        c_str_const(cc_panic_message(node, channel_send_closed)))
     ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(channel_send_op), result.slot_form, [receiver, from, message])
 }
 
@@ -4939,7 +4941,7 @@ fn cc_push_guard(node: Int, c: CarrierRef, name: Str, render: PanicRender, absen
 // starts with would otherwise be read as a conversion and print some other argument.
 fn cc_panic_said(node: Int, c: CarrierRef, name: Str, render: PanicRender) -> Int ! Diag.Report {
     match render.say {
-        PanicSay.Nothing => ir_const(TYPE_STR, node, c.g.message, c_string_literal(cc_panic_message(node, render.what)))
+        PanicSay.Nothing => ir_const(TYPE_STR, node, c.g.message, c_str_const(cc_panic_message(node, render.what)))
         _ => cc_panic_formatted(node, c, name, render)
     }
 }
@@ -4950,10 +4952,10 @@ fn cc_panic_formatted(node: Int, c: CarrierRef, name: Str, render: PanicRender) 
     let text = format_spec_of(TYPE_STR)
     let fmt = cc_panic_sentence(render.what, ": {render.spec}", text, text)
     let args = [
-        ir_const(TYPE_STR, node, c.g.message, c_string_literal(fmt)),
+        ir_const(TYPE_STR, node, c.g.message, c_str_const(fmt)),
         shown,
-        ir_const(TYPE_STR, node, c.g.message, c_string_literal(cc_panic_file(node))),
-        ir_const(TYPE_STR, node, c.g.message, c_string_literal(cc_panic_line(node))),
+        ir_const(TYPE_STR, node, c.g.message, c_str_const(cc_panic_file(node))),
+        ir_const(TYPE_STR, node, c.g.message, c_str_const(cc_panic_line(node))),
     ]
     ir_call_runtime(TYPE_STR, node, c.g.message, c_runtime_helper("str_format"),
         c.g.message_form, args)

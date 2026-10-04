@@ -29,7 +29,7 @@ BLINK_RT_FN int64_t blink_sqlite3_exec(sqlite3* db, const char* sql,
     char* err = NULL;
     int rc = sqlite3_exec(db, sql, callback, arg, &err);
     if (errmsg) {
-        *errmsg = err ? blink_strdup(err) : NULL;
+        *errmsg = err ? blink_str_from_cstr_gc(err) : NULL;
     }
     if (err) sqlite3_free(err);
     return (int64_t)rc;
@@ -39,13 +39,13 @@ BLINK_RT_FN int blink_sqlite3_query_cb(void* ud, int ncols, char** values, char*
     blink_sqlite3_result* res = (blink_sqlite3_result*)ud;
     if (res->num_rows == 0) {
         for (int i = 0; i < ncols; i++) {
-            blink_list_push(res->columns, (void*)blink_strdup(names[i]));
+            blink_list_push(res->columns, (void*)blink_str_from_cstr_gc(names[i]));
         }
         res->num_cols = (int64_t)ncols;
     }
     blink_list* row = blink_list_new();
     for (int i = 0; i < ncols; i++) {
-        blink_list_push(row, (void*)blink_strdup(values[i] ? values[i] : ""));
+        blink_list_push(row, (void*)blink_str_from_cstr_gc(values[i] ? values[i] : ""));
     }
     blink_list_push(res->rows, (void*)row);
     res->num_rows++;
@@ -93,8 +93,8 @@ BLINK_RT_FN int64_t blink_sqlite3_column_int(sqlite3_stmt* stmt, int64_t col) {
 
 BLINK_RT_FN const char* blink_sqlite3_column_text(sqlite3_stmt* stmt, int64_t col) {
     const unsigned char* text = sqlite3_column_text(stmt, (int)col);
-    if (!text) return blink_strdup("");
-    return blink_strdup((const char*)text);
+    if (!text) return blink_str_from_cstr_gc("");
+    return blink_str_from_cstr_gc((const char*)text);
 }
 
 BLINK_RT_FN int64_t blink_sqlite3_reset(sqlite3_stmt* stmt) {
@@ -115,7 +115,7 @@ BLINK_RT_FN int64_t blink_sqlite3_column_count(sqlite3_stmt* stmt) {
 
 BLINK_RT_FN const char* blink_sqlite3_column_name_str(sqlite3_stmt* stmt, int64_t idx) {
     const char* name = sqlite3_column_name(stmt, (int)idx);
-    return name ? blink_strdup(name) : blink_strdup("");
+    return name ? blink_str_from_cstr_gc(name) : blink_str_from_cstr_gc("");
 }
 
 BLINK_RT_FN int64_t blink_sqlite3_last_insert_rowid(sqlite3* db) {
@@ -128,7 +128,7 @@ BLINK_RT_FN int64_t blink_sqlite3_close(sqlite3* db) {
 
 BLINK_RT_FN const char* blink_sqlite3_errmsg(sqlite3* db) {
     const char* msg = sqlite3_errmsg(db);
-    return msg ? blink_strdup(msg) : blink_strdup("");
+    return msg ? blink_str_from_cstr_gc(msg) : blink_str_from_cstr_gc("");
 }
 
 BLINK_RT_FN int64_t blink_sqlite3_begin(sqlite3* db) {
@@ -169,14 +169,14 @@ BLINK_RT_FN int64_t blink_sqlite3_result_num_cols(blink_sqlite3_result* res) {
 }
 
 BLINK_RT_FN const char* blink_sqlite3_result_column_name(blink_sqlite3_result* res, int64_t idx) {
-    if (idx < 0 || idx >= res->num_cols) return "";
+    if (idx < 0 || idx >= res->num_cols) return BLINK_STR_EMPTY;
     return (const char*)blink_list_get(res->columns, idx);
 }
 
 BLINK_RT_FN const char* blink_sqlite3_result_cell(blink_sqlite3_result* res, int64_t row, int64_t col) {
-    if (row < 0 || row >= res->num_rows) return "";
+    if (row < 0 || row >= res->num_rows) return BLINK_STR_EMPTY;
     blink_list* row_data = (blink_list*)blink_list_get(res->rows, row);
-    if (col < 0 || col >= blink_list_len(row_data)) return "";
+    if (col < 0 || col >= blink_list_len(row_data)) return BLINK_STR_EMPTY;
     return (const char*)blink_list_get(row_data, col);
 }
 

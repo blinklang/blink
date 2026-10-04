@@ -506,6 +506,182 @@ BLINK_RT_FN char* blink_strdup(const char* s) {
 }
 #endif
 
+/* ── Str representation ─────────────────────────────────────────────────
+   A Str points at NUL-terminated UTF-8 bytes, so C code can read it as a C
+   string. The 16 bytes right before those bytes hold a header that records
+   the byte length, so len is O(1) and no operation has to scan for the NUL.
+   A Str cannot hold a NUL byte, so the length and the terminator agree.
+
+   Every Str must come from a producer that writes the header:
+   blink_str_alloc and the blink_str_from_* copies here, BLINK_STR_STATIC for
+   a literal in the runtime, and the compiler for a literal in a program. A
+   bare C string (argv, getenv, a C literal) is not a Str until it is copied.
+
+   A header is never written after its Str exists: compiled literals live in
+   read-only memory. So `flags` (0: nothing known) must be set by the
+   producer, and a compiled literal is not aligned, so the header is read with
+   memcpy. `magic` sits right before the bytes so a check can find a pointer
+   that never had a header. The compiler writes literal headers as bytes,
+   little-endian. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "blink: the Str header layout assumes a little-endian target"
+#endif
+
+typedef struct {
+    int64_t len;
+    uint32_t flags;
+    uint32_t magic;
+} blink_str_hdr;
+
+#define BLINK_STR_HDR_SIZE ((int64_t)16)
+#define BLINK_STR_MAGIC ((uint32_t)0x9E3779B1u)
+
+_Static_assert(sizeof(blink_str_hdr) == 16, "blink_str_hdr must be 16 bytes");
+
+/* A Str-shaped static for a literal the runtime returns. `name.d` is the Str. */
+#define BLINK_STR_STATIC(name, text) \
+    BLINK_UNUSED static const struct { blink_str_hdr h; char d[sizeof(text)]; } name = \
+        { { (int64_t)sizeof(text) - 1, 0, BLINK_STR_MAGIC }, text }
+
+/* On by default: the check costs one load and one compare in len, and a
+   pointer without a header would otherwise read garbage as a length. */
+#ifndef BLINK_STR_CHECK
+#define BLINK_STR_CHECK 1
+#endif
+
+BLINK_RT_FN void blink_str_bad(const char* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_str_bad(const char* s) {
+    if (!s) {
+        __blink_panic_dispatch("blink: internal error: a Str is NULL");
+    }
+    __blink_panic_dispatch("blink: internal error: a Str has no length header "
+                           "(a C string reached Blink without a copy)");
+}
+#endif
+
+/* Inline in every TU, archive or not: len is on the hot path of every byte loop. */
+static inline int64_t blink_str_len(const char* s) {
+#if BLINK_STR_CHECK
+    uint32_t magic;
+    if (__builtin_expect(s == NULL, 0)) { blink_str_bad(s); }
+    memcpy(&magic, s - 4, sizeof(magic));
+    if (__builtin_expect(magic != BLINK_STR_MAGIC, 0)) { blink_str_bad(s); }
+#endif
+    int64_t n;
+    memcpy(&n, s - BLINK_STR_HDR_SIZE, sizeof(n));
+    return n;
+}
+
+static inline void blink_str_write_hdr(char* data, int64_t len) {
+    blink_str_hdr h = { len, 0, BLINK_STR_MAGIC };
+    memcpy(data - BLINK_STR_HDR_SIZE, &h, sizeof(h));
+    data[len] = '\0';
+}
+
+/* A heap Str is the only pointer to its block and points 16 bytes past the
+   start. The system libgc treats any interior pointer as live, but the
+   vendored one (cross-target and release builds) is built without
+   ALL_INTERIOR_POINTERS and would free the block, so the offset is
+   registered. The GC checks the table at mark time, so registering on the
+   first allocation is soon enough, and a repeat is harmless. */
+static inline void blink_str_gc_offset(void) {
+    static int registered = 0;
+    if (__builtin_expect(!__atomic_load_n(&registered, __ATOMIC_RELAXED), 0)) {
+        GC_register_displacement((size_t)BLINK_STR_HDR_SIZE);
+        __atomic_store_n(&registered, 1, __ATOMIC_RELAXED);
+    }
+}
+
+/* Room for a Str of `len` bytes, header and terminator written. The caller
+   fills the bytes. Arena-aware, like every other runtime allocation. */
+BLINK_RT_FN char* blink_str_alloc(int64_t len);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN char* blink_str_alloc(int64_t len) {
+    blink_str_gc_offset();
+    char* base = (char*)blink_alloc(BLINK_STR_HDR_SIZE + len + 1);
+    char* data = base + BLINK_STR_HDR_SIZE;
+    blink_str_write_hdr(data, len);
+    return data;
+}
+#endif
+
+/* The same on the GC heap, never in an arena, and not scanned by the GC: for
+   a Str that must outlive any open `with arena` (what blink_strdup gave). */
+BLINK_RT_FN char* blink_str_alloc_gc(int64_t len);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN char* blink_str_alloc_gc(int64_t len) {
+    blink_str_gc_offset();
+    char* base = (char*)GC_MALLOC_ATOMIC((size_t)(BLINK_STR_HDR_SIZE + len + 1));
+    if (!base) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    char* data = base + BLINK_STR_HDR_SIZE;
+    blink_str_write_hdr(data, len);
+    return data;
+}
+#endif
+
+/* A shorter length for a Str this code just allocated and nothing else has
+   seen yet. */
+static inline void blink_str_shrink(char* data, int64_t len) {
+    blink_str_write_hdr(data, len);
+}
+
+/* A Str copy of `n` bytes from outside Blink. Bytes from a file or a socket
+   can hold a NUL, which a Str cannot, so the copy ends at the first one. */
+BLINK_RT_FN const char* blink_str_from_bytes(const char* p, int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_from_bytes(const char* p, int64_t n) {
+    if (n < 0) n = 0;
+    const char* nul = n > 0 ? (const char*)memchr(p, 0, (size_t)n) : NULL;
+    if (nul) n = (int64_t)(nul - p);
+    char* s = blink_str_alloc(n);
+    if (n > 0) memcpy(s, p, (size_t)n);
+    return s;
+}
+#endif
+
+/* A Str copy of a C string. NULL stays NULL so the caller decides what an
+   absent value means. */
+BLINK_RT_FN const char* blink_str_from_cstr(const char* p);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_from_cstr(const char* p) {
+    if (!p) return NULL;
+    int64_t n = (int64_t)strlen(p);
+    char* s = blink_str_alloc(n);
+    memcpy(s, p, (size_t)n);
+    return s;
+}
+#endif
+
+/* The same on the GC heap (see blink_str_alloc_gc). */
+BLINK_RT_FN const char* blink_str_from_cstr_gc(const char* p);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_from_cstr_gc(const char* p) {
+    if (!p) return NULL;
+    int64_t n = (int64_t)strlen(p);
+    char* s = blink_str_alloc_gc(n);
+    memcpy(s, p, (size_t)n);
+    return s;
+}
+#endif
+
+/* A Str that a foreign function returned. The C side owns that memory and
+   wrote no header, so it is copied. A NULL here cannot be a Str. */
+BLINK_RT_FN const char* blink_str_from_foreign(const char* p, const char* symbol);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_from_foreign(const char* p, const char* symbol) {
+    if (!p) {
+        __blink_panic_dispatchf("blink: foreign function `%s` returned NULL for a Str; "
+                                "declare it `-> Ptr[U8]` and use `.to_str()` to handle NULL",
+                                symbol);
+    }
+    return blink_str_from_cstr(p);
+}
+#endif
+
+BLINK_STR_STATIC(blink_str_empty_lit, "");
+#define BLINK_STR_EMPTY (blink_str_empty_lit.d)
+
 /* Promotion allocation: target==NULL means GC heap; else allocate in target
    arena. Bypasses __blink_current_arena because during promotion the TLS may
    still reference the inner (dying) arena. */
@@ -565,10 +741,11 @@ BLINK_RT_FN const char* blink_promote_str(blink_promote_ctx* ctx, const char* s)
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_promote_str(blink_promote_ctx* ctx, const char* s) {
     if (!s) return NULL;
-    size_t len = strlen(s) + 1;
-    char* p = (char*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)len);
-    memcpy(p, s, len);
-    return p;
+    int64_t len = blink_str_len(s);
+    blink_str_gc_offset();
+    char* base = (char*)blink_promote_ctx_alloc_atomic(ctx, BLINK_STR_HDR_SIZE + len + 1);
+    memcpy(base, s - BLINK_STR_HDR_SIZE, (size_t)(BLINK_STR_HDR_SIZE + len + 1));
+    return base + BLINK_STR_HDR_SIZE;
 }
 #endif
 
@@ -1639,6 +1816,9 @@ BLINK_RT_FN blink_bytes* blink_bytes_slice(const blink_bytes* b, int64_t start, 
 /* Validate UTF-8. Returns NULL on success, or a static error message on failure. */
 BLINK_RT_FN const char* blink_bytes_validate_utf8(const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_STR_STATIC(blink_utf8_err_continuation, "invalid UTF-8: unexpected continuation byte");
+BLINK_STR_STATIC(blink_utf8_err_truncated, "invalid UTF-8: truncated sequence");
+BLINK_STR_STATIC(blink_utf8_err_bad_continuation, "invalid UTF-8: bad continuation byte");
 BLINK_RT_FN const char* blink_bytes_validate_utf8(const blink_bytes* b) {
     int64_t i = 0;
     while (i < b->len) {
@@ -1648,10 +1828,10 @@ BLINK_RT_FN const char* blink_bytes_validate_utf8(const blink_bytes* b) {
         else if ((c & 0xE0) == 0xC0) { seq_len = 2; }
         else if ((c & 0xF0) == 0xE0) { seq_len = 3; }
         else if ((c & 0xF8) == 0xF0) { seq_len = 4; }
-        else { return "invalid UTF-8: unexpected continuation byte"; }
-        if (i + seq_len > b->len) { return "invalid UTF-8: truncated sequence"; }
+        else { return blink_utf8_err_continuation.d; }
+        if (i + seq_len > b->len) { return blink_utf8_err_truncated.d; }
         for (int64_t j = 1; j < seq_len; j++) {
-            if ((b->data[i + j] & 0xC0) != 0x80) { return "invalid UTF-8: bad continuation byte"; }
+            if ((b->data[i + j] & 0xC0) != 0x80) { return blink_utf8_err_bad_continuation.d; }
         }
         i += seq_len;
     }
@@ -1669,11 +1849,8 @@ BLINK_RT_FN blink_Result_str_str blink_bytes_to_str_result(const blink_bytes* b)
         r.err = err;
         return r;
     }
-    char* s = (char*)blink_alloc(b->len + 1);
-    memcpy(s, b->data, (size_t)b->len);
-    s[b->len] = '\0';
     r.tag = 0;
-    r.ok = s;
+    r.ok = blink_str_from_bytes((const char*)b->data, b->len);
     return r;
 }
 #endif
@@ -1681,11 +1858,10 @@ BLINK_RT_FN blink_Result_str_str blink_bytes_to_str_result(const blink_bytes* b)
 BLINK_RT_FN const char* blink_bytes_to_hex(const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_bytes_to_hex(const blink_bytes* b) {
-    char* hex = (char*)blink_alloc(b->len * 2 + 1);
+    char* hex = blink_str_alloc(b->len * 2);
     for (int64_t i = 0; i < b->len; i++) {
         sprintf(hex + i * 2, "%02x", b->data[i]);
     }
-    hex[b->len * 2] = '\0';
     return hex;
 }
 #endif
@@ -2140,7 +2316,9 @@ BLINK_RT_FN void blink_sb_write_bool(blink_sb* sb, int val) {
 BLINK_RT_FN const char* blink_sb_to_str(const blink_sb* sb);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_sb_to_str(const blink_sb* sb) {
-    return blink_strdup(sb->data);
+    char* s = blink_str_alloc_gc(sb->len);
+    memcpy(s, sb->data, (size_t)sb->len);
+    return s;
 }
 #endif
 
@@ -2184,13 +2362,6 @@ BLINK_RT_FN void blink_sb_free(blink_sb* sb) {
 #endif
 
 /* ── String operations ──────────────────────────────────────────────── */
-
-BLINK_RT_FN int64_t blink_str_len(const char* s);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_str_len(const char* s) {
-    return (int64_t)strlen(s);
-}
-#endif
 
 BLINK_RT_FN int64_t blink_str_char_at(const char* s, int64_t i);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -2243,9 +2414,8 @@ BLINK_RT_FN int blink_str_next_char(const char* s, int64_t* pos, int32_t* out) {
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len) {
-    char* buf = (char*)blink_alloc(len + 1);
+    char* buf = blink_str_alloc(len);
     memcpy(buf, s + start, (size_t)len);
-    buf[len] = '\0';
     return buf;
 }
 #endif
@@ -2255,31 +2425,26 @@ BLINK_RT_FN const char* blink_str_from_char_code(int64_t code);
 BLINK_RT_FN const char* blink_str_from_char_code(int64_t code) {
     char* buf;
     if (code < 0x80) {
-        buf = (char*)blink_alloc(2);
+        buf = blink_str_alloc(1);
         buf[0] = (char)code;
-        buf[1] = '\0';
     } else if (code < 0x800) {
-        buf = (char*)blink_alloc(3);
+        buf = blink_str_alloc(2);
         buf[0] = (char)(0xC0 | (code >> 6));
         buf[1] = (char)(0x80 | (code & 0x3F));
-        buf[2] = '\0';
     } else if (code < 0x10000) {
-        buf = (char*)blink_alloc(4);
+        buf = blink_str_alloc(3);
         buf[0] = (char)(0xE0 | (code >> 12));
         buf[1] = (char)(0x80 | ((code >> 6) & 0x3F));
         buf[2] = (char)(0x80 | (code & 0x3F));
-        buf[3] = '\0';
     } else if (code <= 0x10FFFF) {
-        buf = (char*)blink_alloc(5);
+        buf = blink_str_alloc(4);
         buf[0] = (char)(0xF0 | (code >> 18));
         buf[1] = (char)(0x80 | ((code >> 12) & 0x3F));
         buf[2] = (char)(0x80 | ((code >> 6) & 0x3F));
         buf[3] = (char)(0x80 | (code & 0x3F));
-        buf[4] = '\0';
     } else {
-        buf = (char*)blink_alloc(2);
+        buf = blink_str_alloc(1);
         buf[0] = '?';
-        buf[1] = '\0';
     }
     return buf;
 }
@@ -2313,13 +2478,13 @@ BLINK_RT_FN const char* blink_char_to_str(int64_t code) {
  * counterpart of blink_char_debug below. */
 BLINK_RT_FN const char* blink_str_debug(const char* s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_STR_STATIC(blink_str_debug_empty_lit, "\"\"");
 BLINK_RT_FN const char* blink_str_debug(const char* s) {
-    if (!s) return "\"\"";
-    int64_t n = 0;
-    while (s[n] != '\0') n++;
-    /* Two bytes is the widest escape, so twice the input plus the quotes and the
-     * terminator can never be exceeded. */
-    char* buf = (char*)blink_alloc(n * 2 + 3);
+    if (!s) return blink_str_debug_empty_lit.d;
+    int64_t n = blink_str_len(s);
+    /* Two bytes is the widest escape, so twice the input plus the quotes can
+     * never be exceeded; the length is cut to what was written. */
+    char* buf = blink_str_alloc(n * 2 + 2);
     int64_t w = 0;
     buf[w++] = '"';
     for (int64_t i = 0; i < n; i++) {
@@ -2342,7 +2507,7 @@ BLINK_RT_FN const char* blink_str_debug(const char* s) {
         }
     }
     buf[w++] = '"';
-    buf[w] = '\0';
+    blink_str_shrink(buf, w);
     return buf;
 }
 #endif
@@ -2370,22 +2535,19 @@ BLINK_RT_FN const char* blink_char_debug(int64_t code) {
         default: break;
     }
     if (esc) {
-        char* buf = (char*)blink_alloc(5);
+        char* buf = blink_str_alloc(4);
         buf[0] = '\'';
         buf[1] = esc[0];
         buf[2] = esc[1];
         buf[3] = '\'';
-        buf[4] = '\0';
         return buf;
     }
     const char* body = blink_str_from_char_code(code);
-    int64_t n = 0;
-    while (body[n] != '\0') n++;
-    char* buf = (char*)blink_alloc(n + 3);
+    int64_t n = blink_str_len(body);
+    char* buf = blink_str_alloc(n + 2);
     buf[0] = '\'';
     for (int64_t i = 0; i < n; i++) buf[i + 1] = body[i];
     buf[n + 1] = '\'';
-    buf[n + 2] = '\0';
     return buf;
 }
 #endif
@@ -2425,10 +2587,9 @@ BLINK_RT_FN const char* blink_str_concat(const char* a, const char* b);
 BLINK_RT_FN const char* blink_str_concat(const char* a, const char* b) {
     int64_t la = blink_str_len(a);
     int64_t lb = blink_str_len(b);
-    char* buf = (char*)blink_alloc(la + lb + 1);
+    char* buf = blink_str_alloc(la + lb);
     memcpy(buf, a, (size_t)la);
     memcpy(buf + la, b, (size_t)lb);
-    buf[la + lb] = '\0';
     return buf;
 }
 #endif
@@ -2440,10 +2601,14 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
     va_list ap2; va_copy(ap2, ap);
     int needed = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    if (needed < 0) { va_end(ap2); return ""; }
-    char* buf = (char*)blink_alloc((int64_t)needed + 1);
+    if (needed < 0) { va_end(ap2); return BLINK_STR_EMPTY; }
+    char* buf = blink_str_alloc((int64_t)needed);
     vsnprintf(buf, (size_t)needed + 1, fmt, ap2);
     va_end(ap2);
+    /* A %c of a NUL or a %s of a non-Str could put a NUL inside; a Str ends
+       at its first one. */
+    int64_t real = (int64_t)strlen(buf);
+    if (real != (int64_t)needed) blink_str_shrink(buf, real);
     return buf;
 }
 #endif
@@ -2510,8 +2675,8 @@ BLINK_RT_FN int blink_str_starts_with(const char* s, const char* prefix) {
 BLINK_RT_FN int blink_str_ends_with(const char* s, const char* suffix);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_str_ends_with(const char* s, const char* suffix) {
-    size_t slen = strlen(s);
-    size_t sufflen = strlen(suffix);
+    size_t slen = (size_t)blink_str_len(s);
+    size_t sufflen = (size_t)blink_str_len(suffix);
     if (sufflen > slen) return 0;
     return memcmp(s + slen - sufflen, suffix, sufflen) == 0;
 }
@@ -2521,16 +2686,12 @@ BLINK_RT_FN const char* blink_str_slice(const char* s, int64_t start, int64_t en
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_slice(const char* s, int64_t start, int64_t end) {
     if (start < 0) start = 0;
-    if (start >= end) return blink_strdup("");
-    /* Only the first `end` bytes can be in the slice, so the NUL is looked for there
-       and not in the whole string: a slice costs O(end), not O(strlen(s)). */
-    const char* nul = (const char*)memchr(s, 0, (size_t)end);
-    if (nul) end = (int64_t)(nul - s);
-    if (start >= end) return blink_strdup("");
+    int64_t slen = blink_str_len(s);
+    if (end > slen) end = slen;
+    if (start >= end) return BLINK_STR_EMPTY;
     int64_t rlen = end - start;
-    char* buf = (char*)blink_alloc(rlen + 1);
+    char* buf = blink_str_alloc(rlen);
     memcpy(buf, s + start, (size_t)rlen);
-    buf[rlen] = '\0';
     return buf;
 }
 #endif
@@ -2587,16 +2748,19 @@ BLINK_RT_FN const char* blink_read_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) {
         blink_fs_errno = (int64_t)errno;
-        return "";
+        return BLINK_STR_EMPTY;
     }
     blink_fs_errno = 0;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char* buf = (char*)blink_alloc(size + 1);
-    fread(buf, 1, (size_t)size, f);
-    buf[size] = '\0';
+    if (size < 0) size = 0;
+    char* buf = blink_str_alloc((int64_t)size);
+    size_t got = fread(buf, 1, (size_t)size, f);
     fclose(f);
+    /* The file can shrink between ftell and fread, and a NUL byte ends a Str. */
+    const char* nul = got > 0 ? (const char*)memchr(buf, 0, got) : NULL;
+    blink_str_shrink(buf, nul ? (int64_t)(nul - buf) : (int64_t)got);
     return buf;
 }
 #endif
@@ -2651,7 +2815,7 @@ BLINK_RT_FN const char* blink_get_arg(int64_t index) {
     if (index < 0 || index >= blink_g_argc) {
         __blink_panic_dispatchf("blink: arg index out of bounds: %lld", (long long)index);
     }
-    return blink_g_argv[index];
+    return blink_str_from_cstr_gc(blink_g_argv[index]);
 }
 #endif
 
@@ -2660,7 +2824,7 @@ BLINK_RT_FN blink_list* blink_env_args(void);
 BLINK_RT_FN blink_list* blink_env_args(void) {
     blink_list* args = blink_list_new();
     for (int i = 0; i < blink_g_argc; i++) {
-        blink_list_push(args, (void*)blink_g_argv[i]);
+        blink_list_push(args, (void*)blink_str_from_cstr_gc(blink_g_argv[i]));
     }
     return args;
 }
@@ -2696,7 +2860,7 @@ BLINK_RT_FN blink_list* blink_list_dir(const char* path) {
     while ((entry = readdir(d)) != NULL) {
         if (entry->d_name[0] == '.' && (entry->d_name[1] == '\0' ||
             (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) continue;
-        blink_list_push(result, (void*)blink_strdup(entry->d_name));
+        blink_list_push(result, (void*)blink_str_from_cstr_gc(entry->d_name));
     }
     closedir(d);
     return result;
@@ -3435,11 +3599,13 @@ BLINK_RT_FN const char* blink_Instant_to_rfc3339(blink_Instant i) {
     time_t epoch_secs = (time_t)(i.nanos / 1000000000LL);
     struct tm utc;
     gmtime_r(&epoch_secs, &utc);
-    char* buf = (char*)blink_alloc(64);
-    snprintf(buf, 64, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-             utc.tm_hour, utc.tm_min, utc.tm_sec);
-    return buf;
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                     utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                     utc.tm_hour, utc.tm_min, utc.tm_sec);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    return blink_str_from_bytes(buf, (int64_t)n);
 }
 #endif
 
@@ -3540,7 +3706,7 @@ BLINK_RT_FN const char* blink_env_default_read(void* __self, const char* name);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_env_default_read(void* __self, const char* name) {
     const char* v = getenv(name);
-    return v ? blink_strdup(v) : NULL;
+    return v ? blink_str_from_cstr_gc(v) : NULL;
 }
 #endif
 
@@ -3564,7 +3730,7 @@ BLINK_RT_FN const char* blink_env_default_cwd(void* __self) {
     char buf[4096];
     char* r = getcwd(buf, sizeof(buf));
     if (!r) { fprintf(stderr, "blink: getcwd failed, falling back to \".\"\n"); }
-    return r ? blink_strdup(r) : blink_strdup(".");
+    return blink_str_from_cstr_gc(r ? r : ".");
 }
 #endif
 

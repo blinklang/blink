@@ -19,7 +19,7 @@ BLINK_RT_FN const char* blink_stdin_read_line(void) {
     }
     if (pos > 0 && buf[pos - 1] == '\r') pos--;
     buf[pos] = '\0';
-    return blink_strdup(buf);
+    return blink_str_from_cstr_gc(buf);
 }
 #endif
 

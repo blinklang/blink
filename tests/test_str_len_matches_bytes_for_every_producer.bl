@@ -1,0 +1,200 @@
+// A Str records its own byte length when it is made, so every way of making one must
+// record the right length. Each case compares s.len() with an expected count, and with
+// the byte count of the same text copied into Bytes, which counts to the terminator and
+// so does not trust the recorded length. The texts are ASCII so the byte count and the
+// character count agree.
+
+import std.fs
+
+@ffi("getenv")
+@trusted(audit: "TEST-STR-LEN")
+fn c_getenv(name: Str) -> Str ! FFI {}
+
+// The runtime's own symbols already return a Str, so this one reaches Blink uncopied.
+@ffi("blink_strerror")
+@trusted(audit: "TEST-STR-LEN")
+fn runtime_strerror(code: Int) -> Str ! FFI {}
+
+let GREETING: Str = "hello, world"
+
+@derive(Debug)
+type Shade { Light, Dark }
+
+@derive(Debug)
+type Tagged { label: Str, shade: Shade }
+
+fn byte_count(s: Str) -> Int {
+    Bytes.from_str(s).len()
+}
+
+fn expect_len(s: Str, want: Int) {
+    assert_eq(s.len(), want)
+    assert_eq(byte_count(s), want)
+}
+
+test "literals" {
+    expect_len("", 0)
+    expect_len("a", 1)
+    expect_len("hello", 5)
+    expect_len("tab\tnew\nquote\"brace\{\}", 21)
+    expect_len(GREETING, 12)
+    let long = "0123456789012345678901234567890123456789012345678901234567890123456789"
+    expect_len(long, 70)
+}
+
+test "interpolation" {
+    let n = 42
+    let name = "blink"
+    expect_len("{name}", 5)
+    expect_len("{n}", 2)
+    expect_len("<{name}:{n}>", 10)
+    expect_len("{""}", 0)
+    expect_len("{-7}", 2)
+    expect_len("{true} {false}", 10)
+    expect_len("{1.5}", 3)
+    expect_len("{'x'}", 1)
+}
+
+test "concat, slice and substring" {
+    expect_len("ab".concat("cde"), 5)
+    expect_len("".concat(""), 0)
+    expect_len("ab".concat(""), 2)
+    let s = "hello world"
+    expect_len(s.slice(0, 5), 5)
+    expect_len(s.slice(6, 11), 5)
+    expect_len(s.slice(3, 3), 0)
+    expect_len(s.slice(4, 2), 0)
+    expect_len(s.slice(6, 100), 5)
+    expect_len(s.substring(2, 3), 3)
+}
+
+test "methods built in the standard library" {
+    expect_len("  pad  ".trim(), 3)
+    expect_len("  pad".trim_left(), 3)
+    expect_len("pad  ".trim_right(), 3)
+    expect_len("abc".to_upper(), 3)
+    expect_len("a-b-c".replace("-", "--"), 7)
+    let parts = "a,bb,ccc".split(",")
+    assert_eq(parts.len(), 3)
+    expect_len(parts.get(0).unwrap(), 1)
+    expect_len(parts.get(2).unwrap(), 3)
+    expect_len(parts.join("+"), 8)
+    let lines = "one\ntwo\n".lines()
+    expect_len(lines.get(1).unwrap(), 3)
+}
+
+test "string builder" {
+    let sb = StringBuilder.new()
+    expect_len(sb.to_str(), 0)
+    sb.write("abc")
+    sb.write("de")
+    expect_len(sb.to_str(), 5)
+}
+
+test "scalar conversions" {
+    expect_len('q'.to_str(), 1)
+    expect_len(Char.from_code_point(65).unwrap().to_str(), 1)
+    expect_len("{12345}", 5)
+    let shade = Shade.Dark.debug()
+    expect_len(shade, byte_count(shade))
+    assert(shade.len() > 0)
+    let tagged = Tagged { label: "q\"t", shade: Shade.Light }.debug()
+    expect_len(tagged, byte_count(tagged))
+    assert(tagged.contains("\\\""))
+}
+
+test "bytes" {
+    let b = Bytes.from_str("xyz")
+    match b.to_str() {
+        Ok(s) => expect_len(s, 3)
+        Err(_e) => assert(false)
+    }
+    expect_len(b.to_hex(), 6)
+    let empty = Bytes.from_str("")
+    match empty.to_str() {
+        Ok(s) => expect_len(s, 0)
+        Err(_e) => assert(false)
+    }
+    let bad = Bytes.from_str("a")
+    bad.push(255)
+    match bad.to_str() {
+        Ok(_s) => assert(false)
+        Err(msg) => expect_len(msg, byte_count(msg))
+    }
+}
+
+test "files" {
+    let path = "build/str_len_matches_bytes_probe.txt"
+    write_file(path, "line one\nline two\n")
+    expect_len(read_file(path), 18)
+    match fs.read(path) {
+        Ok(s) => expect_len(s, 18)
+        Err(_e) => assert(false)
+    }
+    write_file(path, "")
+    expect_len(read_file(path), 0)
+    expect_len(read_file("build/str_len_matches_bytes_no_such_file.txt"), 0)
+    match fs.list_dir("build") {
+        Ok(names) => {
+            assert(names.len() > 0)
+            let mut i = 0
+            while i < names.len() {
+                let name = names.get(i).unwrap()
+                expect_len(name, byte_count(name))
+                i = i + 1
+            }
+        }
+        Err(_e) => assert(false)
+    }
+}
+
+test "environment" {
+    let args = env.args()
+    assert(args.len() > 0)
+    let prog = args.get(0).unwrap()
+    expect_len(prog, byte_count(prog))
+    match env.var("PATH") {
+        Some(v) => expect_len(v, byte_count(v))
+        None => {}
+    }
+    let cwd = env.cwd()
+    assert(cwd.len() > 0)
+    expect_len(cwd, byte_count(cwd))
+}
+
+test "foreign pointers and functions" {
+    let p = "pointer text".as_cstr()
+    match p.to_str() {
+        Some(s) => expect_len(s, 12)
+        None => assert(false)
+    }
+    let home = c_getenv("PATH")
+    assert(home.len() > 0)
+    expect_len(home, byte_count(home))
+}
+
+test "process output" {
+    let r = process_run("sh", ["-c", "printf abcdef; printf xy 1>&2"])
+    expect_len(r.out, 6)
+    expect_len(r.err_out, 2)
+}
+
+test "time formatting" {
+    let rfc = Instant.from_epoch_secs(1735689600).to_rfc3339()
+    expect_len(rfc, byte_count(rfc))
+    assert(rfc.len() >= 20)
+}
+
+test "runtime error text" {
+    let enoent = runtime_strerror(2)
+    assert(enoent.len() > 0)
+    expect_len(enoent, byte_count(enoent))
+    match fs.read("build/str_len_matches_bytes_no_such_file.txt") {
+        Ok(_s) => assert(false)
+        Err(e) => {
+            let said = "{e}"
+            expect_len(said, byte_count(said))
+            assert(said.ends_with(enoent))
+        }
+    }
+}

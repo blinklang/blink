@@ -25,7 +25,7 @@ import cname.{
     c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name, c_vtable_userdata_member,
     c_impl_method_name, c_display_dispatch_name, c_local_name, c_runtime_helper,
-    c_typedef_name, c_variant_discriminant,
+    c_typedef_name, c_variant_discriminant, c_string_literal,
     cname_is_runtime_owned, td_guard_name, c_enum_tag_member, c_enum_payload_member,
 }
 import cg_print.{
@@ -826,9 +826,22 @@ fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, args: List[Int]) -> I
     let tid = fn_ret_tid(fn_node)
     let k = tc_tid_kind(tc_resolve(tid))
     let drops = k == TyKind.Void || k == TyKind.Never
-    let call = ir_call_direct(tid, fn_node, ret, symbol, SlotForm.Inline, args)
+    let direct = ir_call_direct(tid, fn_node, ret, symbol, SlotForm.Inline, args)
+    let call = if k == TyKind.Str && !foreign_symbol_makes_strs(symbol) {
+        // A C string has no Str length header, so the answer is copied into a Str.
+        ir_call_runtime(tid, fn_node, ret, c_runtime_helper("str_from_foreign"), SlotForm.Inline,
+            [direct, ir_const(tid, fn_node, ret, c_string_literal(symbol))])
+    } else {
+        direct
+    }
     let stmt = if drops { ir_expr_stmt(fn_node, call) } else { ir_return(fn_node, call) }
     ir_block(fn_node, [stmt])
+}
+
+// The runtime's own functions answer real Strs, header and all; any other symbol answers a
+// plain C string.
+fn foreign_symbol_makes_strs(symbol: Str) -> Bool {
+    symbol.starts_with("blink_") || symbol.starts_with("blinkrt_") || symbol.starts_with("__blink")
 }
 
 fn foreign_call_args(fn_node: Int, declared: Bool) -> List[Int] ! Diag.Report {
