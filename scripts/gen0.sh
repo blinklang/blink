@@ -1,9 +1,8 @@
 #!/bin/sh
 # Build the pinned gen0 compiler from the tag into build/gen0/.
 #
-# gen0 is the fixed compiler that builds the tree during the codegen
-# rewrite. It must come from the tag, never from a live build, so its
-# provenance is provable. The script checks the tag out into a scratch
+# gen0 is the fixed compiler that builds the tree. It must come from the
+# tag, never from a live build, so its provenance is provable. The script checks the tag out into a scratch
 # worktree, bootstraps it there with the normal seed rules, then installs
 # it into build/gen0/ in the installed layout:
 #
@@ -20,7 +19,7 @@
 # BLINK_ROOT when you run the gen0 binaries: it overrides that root.
 #
 # Env:
-#   BLINK_GEN0_TAG    tag to pin (default: gen0-rewrite-selfhost-2)
+#   BLINK_GEN0_TAG    tag to pin (default: v0.54.0)
 #   BLINK_GEN0_WORK   scratch dir for the worktree (default: mktemp under $TMPDIR)
 #   BLINK_GEN0_SEED   path of the `blink` binary that seeds the bootstrap
 #                     (default: build/blink of this tree, else `blink` on PATH).
@@ -31,7 +30,7 @@ set -eu
 CALLER_DIR="$(pwd)"
 cd "$(dirname "$0")/.."
 ROOT_DIR="$(pwd)"
-TAG="${BLINK_GEN0_TAG:-gen0-rewrite-selfhost-2}"
+TAG="${BLINK_GEN0_TAG:-v0.54.0}"
 OUT="$ROOT_DIR/build/gen0"
 
 TAG_SHA="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
