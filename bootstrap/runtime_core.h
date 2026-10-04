@@ -895,29 +895,30 @@ BLINK_RT_FN void blink_list_push(blink_list* l, void* item) {
 }
 #endif
 
-BLINK_RT_FN void* blink_list_get(const blink_list* l, int64_t index);
+/* The panic stays out of line so the inlined reads below carry only a compare and a call. */
+BLINK_RT_FN void blink_list_index_oob(int64_t index, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void* blink_list_get(const blink_list* l, int64_t index) {
-    if (index < 0 || index >= l->len) {
-        __blink_panic_dispatchf("blink: list index out of bounds: idx=%lld len=%lld", (long long)index, (long long)l->len);
+BLINK_RT_FN void blink_list_index_oob(int64_t index, int64_t len) {
+    __blink_panic_dispatchf("blink: list index out of bounds: idx=%lld len=%lld", (long long)index, (long long)len);
+}
+#endif
+
+/* Inline in every TU, archive or not: under the archive an extern call here cost every
+   list index in a program a call it could not inline. */
+static inline void* blink_list_get(const blink_list* l, int64_t index) {
+    if (__builtin_expect(index < 0 || index >= l->len, 0)) {
+        blink_list_index_oob(index, l->len);
     }
     return l->items[index];
 }
-#endif
 
-BLINK_RT_FN int blink_list_in_bounds(const blink_list* l, int64_t index);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_list_in_bounds(const blink_list* l, int64_t index) {
+static inline int blink_list_in_bounds(const blink_list* l, int64_t index) {
     return (index >= 0 && index < l->len);
 }
-#endif
 
-BLINK_RT_FN int64_t blink_list_len(const blink_list* l);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_list_len(const blink_list* l) {
+static inline int64_t blink_list_len(const blink_list* l) {
     return l->len;
 }
-#endif
 
 BLINK_RT_FN void blink_list_set(blink_list* l, int64_t index, void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
