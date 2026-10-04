@@ -2520,9 +2520,12 @@ BLINK_RT_FN int blink_str_ends_with(const char* s, const char* suffix) {
 BLINK_RT_FN const char* blink_str_slice(const char* s, int64_t start, int64_t end);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_slice(const char* s, int64_t start, int64_t end) {
-    int64_t slen = (int64_t)strlen(s);
     if (start < 0) start = 0;
-    if (end > slen) end = slen;
+    if (start >= end) return blink_strdup("");
+    /* Only the first `end` bytes can be in the slice, so the NUL is looked for there
+       and not in the whole string: a slice costs O(end), not O(strlen(s)). */
+    const char* nul = (const char*)memchr(s, 0, (size_t)end);
+    if (nul) end = (int64_t)(nul - s);
     if (start >= end) return blink_strdup("");
     int64_t rlen = end - start;
     char* buf = (char*)blink_alloc(rlen + 1);
@@ -2537,6 +2540,20 @@ BLINK_RT_FN int64_t blink_str_index_of(const char* s, const char* needle);
 BLINK_RT_FN int64_t blink_str_index_of(const char* s, const char* needle) {
     if (!s || !needle) return -1;
     const char* found = strstr(s, needle);
+    if (!found) return -1;
+    return (int64_t)(found - s);
+}
+#endif
+
+/* The byte index in `s` of the first `needle` at or after byte `from`, or -1. The caller
+   must know that from <= strlen(s). Checking it here would scan the first `from` bytes,
+   and that scan is the cost a search from an offset is for avoiding. */
+BLINK_RT_FN int64_t blink_str_index_of_from(const char* s, const char* needle, int64_t from);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_str_index_of_from(const char* s, const char* needle, int64_t from) {
+    if (!s || !needle) return -1;
+    if (from < 0) from = 0;
+    const char* found = strstr(s + from, needle);
     if (!found) return -1;
     return (int64_t)(found - s);
 }
