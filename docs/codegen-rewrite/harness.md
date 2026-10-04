@@ -40,8 +40,7 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 | `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `test-corpus`, `commit-messages`, `test-commit-messages`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `suites-in-corpus`. | Any step fails. |
 | `task gen1` | gen0 compiles `src/blinkc_main.bl` and `src/cli.bl`, then links `build/gen1/bin/blinkc` and `build/gen1/bin/blink`. | Nonzero exit, an `error[` line, or a link error. |
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen1. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
-| `task corpus-check` | Compares `build/corpus.json` with `scripts/corpus_baseline.json` and with the baseline in the previous commit. | The pass count drops, or a file that passed no longer passes. |
-| `task corpus-baseline` | Rewrites `scripts/corpus_baseline.json` from `build/corpus.json`. Run it only after a real gain. | Never. |
+| `task corpus-check` | Reads `build/corpus.json`. Prints the known-failure count for information. | A file does not pass, or the run does not cover every `tests/test_*.bl` file. |
 | `task ci-fast` | The branch gate: every step of `ci`, with `corpus-sample` in place of `corpus` and `corpus-check`. | Any step fails. |
 | `task corpus-sample` | Compiles and runs the files in `scripts/corpus_sample.txt` under gen1 and holds the pass count to the `# floor:` line in that list. Writes `build/corpus_sample.json`. | Fewer files pass than the floor. It names them. |
 | `task lint` | Runs `scripts/lint_codegen.sh`, the eleven rows below. | A row rises above its limit, or a row in debt rises above the previous commit or on any commit of the branch. |
@@ -149,10 +148,10 @@ jq -r '.files | sort_by(-.seconds) | .[:10][] | "\(.seconds)s \(.file)"' build/c
 
 To rerun a subset, write the file names to a list and run
 `scripts/corpus.sh --only <list>`. The result goes to
-`build/corpus_subset.json` and does not touch the baseline. A subset run
+`build/corpus_subset.json` and does not touch `build/corpus.json`. A subset run
 exits 1 when any listed file fails and 2 when the run itself failed. A full
-run exits 0 with failing files, because corpus-check judges it against the
-baseline. `scripts/test_corpus.sh` proves these exit codes.
+run exits 0 with failing files, because corpus-check judges it.
+`scripts/test_corpus.sh` proves these exit codes.
 
 ## The corpus sample
 
@@ -249,39 +248,3 @@ To allow a new pub mutable global, add a line to
 row still holds every global, pub or not, and its cap stays 8. The list names globals that EXIST: a stage that has not landed
 adds its line in the commit that adds the global, so the file can never
 pre-approve a name nobody has had to justify yet.
-
-## When the corpus baseline moves
-
-Run `task corpus`, read the failing list, and confirm the gain is real.
-Then run `task corpus-baseline` and commit `scripts/corpus_baseline.json`
-in the same commit as the change that earned it. The baseline lives under
-`scripts/` because `build/` is ignored as a whole directory and git cannot
-re-include a file below it.
-
-## When the corpus baseline resets
-
-A change that removes the ability to compile at all drops the pass count
-to zero for a reason no gain can offset. The rewrite's first commit is
-one: it deletes the emitters, so every file fails with I0004
-`CodegenStageNotBuilt`. The gate does not bend for this on its own.
-
-Add a hand-written `reset` object to `scripts/corpus_baseline.json`, next
-to `passed`:
-
-```json
-"reset": {
-  "reason": "<why the count went to zero>",
-  "resets_baseline_git_head": "<git_head of the baseline being left>",
-  "previous_passed": <its pass count>
-}
-```
-
-`corpus-check` then skips the previous-commit half for exactly that one
-predecessor and prints the reason and the number of passing files given
-up. The baseline half of the gate still runs in full, so the run must
-still match the baseline you just wrote.
-
-It is self-disarming: the next commit's predecessor is the reset baseline
-itself, whose `git_head` no longer matches. `corpus-check --update` never
-writes the object, so a reset is always a deliberate hand edit. Do not
-add one to paper over a regression.

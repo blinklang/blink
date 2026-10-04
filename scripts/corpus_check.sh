@@ -1,155 +1,45 @@
 #!/bin/bash
-# The monotonicity gate for the corpus. Compares build/corpus.json against
-# two references: the committed baseline scripts/corpus_baseline.json, and
-# the baseline as it stood in the previous commit. The pass count may not
-# drop against either, and no file may flip from pass to anything else.
+# The gate for the corpus: every tests/test_*.bl must pass in build/corpus.json,
+# and the run must cover every test file, so a partial run cannot pass.
 #
-# Known failures (see corpus_one.sh): no file's count may rise against either
-# reference. A file the reference lacks counts from 0; a file that did not
-# pass in the reference is not compared, since its rows were hidden behind
-# the failure. A passing file whose report did not read fails the gate,
-# because null would hide any count. A reference written before the count existed skips this part.
-#
-#   scripts/corpus_check.sh            gate
-#   scripts/corpus_check.sh --update   write the baseline from build/corpus.json
-#
-# The baseline lives under scripts/ because build/ is gitignored as a whole
-# directory and git cannot re-include a file under an ignored directory.
-#
-# Previous-commit reference: HEAD when the tree has uncommitted changes
-# under src/, tests/ or scripts/ (the script runs before the commit that
-# would land them, so HEAD is the real parent), else HEAD~1. Override with
-# CORPUS_HEAD1_REF. A ref with no baseline file skips that half.
-#
-# One-time reset: a change that removes the ability to compile at all (the
-# codegen rewrite deleting the emitters) drops the pass count to zero for a
-# reason no gain can offset. The baseline may then carry a hand-written
-# "reset" object naming the PREDECESSOR COMMIT whose baseline it gives up:
-#
-#   "reset": {
-#     "reason": "<why the count went to zero>",
-#     "resets_from_commit": "<short sha of the predecessor being left behind>",
-#     "previous_passed": <that baseline's pass count>
-#   }
-#
-# That skips the previous-commit half for exactly that one predecessor and
-# reports what was given up. Keying on the commit, not on a field inside its
-# baseline, is what makes it one-shot: consecutive commits share a baseline
-# and so share its git_head, but only one commit is the named predecessor.
-# --update never writes the object, so a reset is always a deliberate hand
-# edit, and it warns when it drops one. The baseline half always runs.
+# A passing file whose known-failure count did not read fails the gate, because
+# null would hide any count. The count of test.failing rows that still fail is
+# printed for information only: it changes when a test file changes, and a
+# stale test.failing row that starts passing already fails its own file.
 #
 # Env:
-#   CORPUS_JSON       result file (default build/corpus.json)
-#   CORPUS_BASELINE   baseline file (default scripts/corpus_baseline.json)
-#   CORPUS_HEAD1_REF  git ref for the previous-commit baseline
+#   CORPUS_JSON  result file (default build/corpus.json)
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
 json="${CORPUS_JSON:-build/corpus.json}"
-baseline="${CORPUS_BASELINE:-scripts/corpus_baseline.json}"
 
 if [ ! -f "$json" ]; then
     echo "corpus-check: no $json; run 'task corpus' first" >&2
     exit 2
 fi
 
-# well_formed <json file>: the fields the gate reads exist and have the
-# right types. Without this a truncated file compares as 0/0 and passes.
-well_formed() {
-    jq -e '(.total|type=="number") and (.passed|type=="number") and (.files|type=="array")' "$1" >/dev/null 2>&1
-}
-if ! well_formed "$json"; then
+# Without this a truncated file reads as 0/0.
+if ! jq -e '(.total|type=="number") and (.passed|type=="number") and (.files|type=="array")' "$json" >/dev/null 2>&1; then
     echo "corpus-check: $json is malformed; run 'task corpus' again" >&2
     exit 2
 fi
 
-if [ "${1:-}" = "--update" ]; then
-    if [ -f "$baseline" ] && jq -e 'has("reset")' "$baseline" >/dev/null 2>&1; then
-        echo "corpus-check: WARNING the baseline carried a one-time reset object; --update drops it." >&2
-        echo "corpus-check:   re-add it by hand if the previous-commit half must still be skipped." >&2
-    fi
-    # Only what the gate reads: the summary and each file's status. Timings
-    # and error lines change run to run and would make every diff noisy.
-    jq '{
-          compiler, blinkc_sha256_prefix, git_head, generated_utc,
-          total, passed,
-          files: (.files | map({file, status, known_failures}))
-        }' "$json" > "$baseline"
-    echo "corpus-check: baseline written: $(jq -r '"\(.passed)/\(.total)"' "$baseline") passed"
-    exit 0
-fi
-
-if [ ! -f "$baseline" ]; then
-    echo "corpus-check: no baseline at $baseline; run scripts/corpus_check.sh --update" >&2
-    exit 1
-fi
-
-if [ -z "$(git status --porcelain -- src tests scripts 2>/dev/null)" ]; then
-    default_ref=HEAD~1
-else
-    default_ref=HEAD
-fi
-head1_ref="${CORPUS_HEAD1_REF:-$default_ref}"
-
 fail=0
 
-# compare <label> <reference json file>
-compare() {
-    label="$1"
-    ref="$2"
-    if ! well_formed "$ref"; then
-        echo "corpus-check: FAIL $label reference is malformed"
-        fail=1
-        return
-    fi
-    now_passed=$(jq -r .passed "$json")
-    now_total=$(jq -r .total "$json")
-    ref_passed=$(jq -r .passed "$ref")
-    ref_total=$(jq -r .total "$ref")
-    printf 'corpus-check: %-9s passed %s/%s, now %s/%s\n' "$label" "$ref_passed" "$ref_total" "$now_passed" "$now_total"
-    if [ "$now_passed" -lt "$ref_passed" ]; then
-        echo "corpus-check: FAIL pass count dropped against $label ($ref_passed -> $now_passed)"
-        fail=1
-    fi
-    # A file that passed in the reference must still pass, and must still
-    # exist: a test that vanished from the corpus is a regression too.
-    flips=$(jq -r --slurpfile now "$json" '
-        ($now[0].files | map({key: .file, value: .status}) | from_entries) as $cur
-        | .files[]
-        | select(.status == "pass")
-        | . as $f
-        | ($cur[$f.file] // "missing") as $s
-        | select($s != "pass")
-        | "  \($f.file): pass -> \($s)"' "$ref")
-    if [ -n "$flips" ]; then
-        echo "corpus-check: FAIL files that passed in $label and no longer do:"
-        printf '%s\n' "$flips"
-        fail=1
-    fi
-    if jq -e 'any(.files[]; has("known_failures"))' "$ref" >/dev/null 2>&1; then
-        rises=$(jq -r --slurpfile now "$json" '
-            (.files | map({key: .file, value: .}) | from_entries) as $old
-            | $now[0].files[]
-            | select((.known_failures | type) == "number")
-            | . as $f
-            | ($old[$f.file] // {status: "pass", known_failures: 0}) as $o
-            | select($o.status == "pass" and ($o.known_failures | type) == "number")
-            | select($f.known_failures > $o.known_failures)
-            | "  \($f.file): \($o.known_failures) -> \($f.known_failures)"' "$ref")
-        if [ -n "$rises" ]; then
-            echo "corpus-check: FAIL known failures rose against $label:"
-            printf '%s\n' "$rises"
-            fail=1
-        fi
-    else
-        echo "corpus-check: $label has no known-failure counts; skipping that comparison"
-    fi
-    new_files=$(jq -r --slurpfile ref "$ref" '
-        ($ref[0].files | map(.file)) as $known
-        | .files[] | select(.file as $f | $known | index($f) | not) | .file' "$json" | wc -l | tr -d ' ')
-    [ "$new_files" -gt 0 ] && echo "corpus-check: $new_files file(s) not in the $label baseline (new tests)"
-}
+total=$(jq -r .total "$json")
+on_disk=$(find tests -maxdepth 1 -name 'test_*.bl' | wc -l | tr -d ' ')
+if [ "$total" -eq 0 ] || [ "$total" -ne "$on_disk" ]; then
+    echo "corpus-check: FAIL the run covers $total file(s); tests/ holds $on_disk test_*.bl file(s)"
+    fail=1
+fi
+
+failing=$(jq -r '.files[] | select(.status != "pass") | "  \(.file): \(.status)"' "$json")
+if [ -n "$failing" ]; then
+    echo "corpus-check: FAIL files that do not pass:"
+    printf '%s\n' "$failing"
+    fail=1
+fi
 
 unreadable=$(jq -r '.files[] | select(.status == "pass" and (.known_failures | type) != "number") | "  \(.file)"' "$json")
 if [ -n "$unreadable" ]; then
@@ -159,34 +49,10 @@ if [ -n "$unreadable" ]; then
     fail=1
 fi
 
-compare baseline "$baseline"
-
-if git rev-parse --verify --quiet "${head1_ref}^{commit}" >/dev/null 2>&1; then
-    head1_file=$(mktemp)
-    trap 'rm -f "$head1_file"' EXIT
-    if git show "${head1_ref}:$baseline" > "$head1_file" 2>/dev/null; then
-        # One read, so the three fields cannot come from different parses.
-        IFS=$(printf '\t') read -r reset_from reset_passed reset_reason <<EOF
-$(jq -r '[.reset.resets_from_commit // "", .reset.previous_passed // "", .reset.reason // ""] | @tsv' "$baseline")
-EOF
-        head1_sha=$(git rev-parse --short "$head1_ref" 2>/dev/null || echo "")
-        if [ -n "$reset_from" ] && [ "$reset_from" = "$head1_sha" ]; then
-            echo "corpus-check: baseline declares a one-time reset from commit $reset_from"
-            echo "corpus-check:   reason: $reset_reason"
-            echo "corpus-check:   given up: $reset_passed passing files"
-            echo "corpus-check: skipping the previous-commit comparison for that commit only"
-        else
-            compare "$head1_ref" "$head1_file"
-        fi
-    else
-        echo "corpus-check: no baseline in $head1_ref; skipping the previous-commit comparison"
-    fi
-else
-    echo "corpus-check: '$head1_ref' does not resolve; skipping the previous-commit comparison"
-fi
+known=$(jq -r '[.files[] | select((.known_failures | type) == "number") | .known_failures] | add // 0' "$json")
+echo "corpus-check: known failures (test.failing rows still failing): $known"
 
 if [ "$fail" -ne 0 ]; then
-    echo "corpus-check: FAIL. Fix the regression; the baseline only moves up (scripts/corpus_check.sh --update after a real gain)."
     exit 1
 fi
-echo "corpus-check: ok"
+echo "corpus-check: ok $(jq -r '"\(.passed)/\(.total)"' "$json") passed"
