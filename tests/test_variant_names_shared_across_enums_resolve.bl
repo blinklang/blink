@@ -1,0 +1,70 @@
+// Two enums may declare the same variant name (sections/03_types.md §3.4). Qualified
+// construction, bare construction of a name only one enum declares, and bare patterns
+// against a known scrutinee type must each land on the right enum, within one module
+// and across a module boundary.
+
+import compile_test_helpers.{run_xmod}
+
+type JobState { Pending, Running(pct: Int), Done }
+type NetState { Pending, Running(host: Str, port: Int), Closed }
+
+fn job_label(s: JobState) -> Str {
+    match s {
+        Pending => "job-pending"
+        Running(p) => "job-running {p}"
+        Done => "job-done"
+    }
+}
+
+fn net_label(s: NetState) -> Str {
+    match s {
+        Pending => "net-pending"
+        Running(h, p) => "net-running {h}:{p}"
+        Closed => "net-closed"
+    }
+}
+
+fn job_done_or(s: JobState) -> Str {
+    match s {
+        Done => "done"
+        other => job_label(other)
+    }
+}
+
+test "qualified construction picks each enum's own shared variant" {
+    assert_eq(job_label(JobState.Pending), "job-pending")
+    assert_eq(net_label(NetState.Pending), "net-pending")
+    assert_eq(job_label(JobState.Running(9)), "job-running 9")
+    assert_eq(net_label(NetState.Running("h", 80)), "net-running h:80")
+}
+
+test "bare construction of a variant only one enum declares" {
+    assert_eq(job_label(Done), "job-done")
+    assert_eq(net_label(Closed), "net-closed")
+    let d = Done
+    assert_eq(job_label(d), "job-done")
+}
+
+test "bare shared names in patterns follow the scrutinee type" {
+    let states = [JobState.Pending, JobState.Running(3), JobState.Done]
+    let mut labels: List[Str] = []
+    for s in states {
+        labels.push(job_label(s))
+    }
+    assert_eq(labels.join(","), "job-pending,job-running 3,job-done")
+    assert_eq(net_label(NetState.Closed), "net-closed")
+}
+
+test "a variant name is a pattern test and a lowercase name is a binder" {
+    assert_eq(job_done_or(JobState.Done), "done")
+    assert_eq(job_done_or(JobState.Pending), "job-pending")
+    assert_eq(job_done_or(JobState.Running(1)), "job-running 1")
+}
+
+test "an imported enum and a local enum may share variant names" {
+    let helper = "pub type Signal \{ Pending, Ready, Halted(code: Int) \}\npub fn signal_label(s: Signal) -> Str \{\n    match s \{\n        Pending => \"signal-pending\"\n        Ready => \"signal-ready\"\n        Halted(c) => \"signal-halted \{c\}\"\n    \}\n\}\npub fn fresh_signal() -> Signal \{ Pending \}\n"
+    let entry = "import vm.helper.\{Signal, signal_label, fresh_signal\}\ntype Local \{ Pending, Idle, Halted(code: Int) \}\nfn local_label(s: Local) -> Str \{\n    match s \{\n        Pending => \"local-pending\"\n        Idle => \"local-idle\"\n        Halted(c) => \"local-halted \{c\}\"\n    \}\n\}\npub fn main() \{\n    io.println(signal_label(fresh_signal()))\n    io.println(signal_label(Signal.Halted(3)))\n    io.println(signal_label(Ready))\n    io.println(local_label(Local.Pending))\n    io.println(local_label(Local.Halted(4)))\n    io.println(local_label(Idle))\n\}\n"
+    let r = run_xmod(entry, "vm", "helper", helper, "shared_variant_xmod")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "signal-pending\nsignal-halted 3\nsignal-ready\nlocal-pending\nlocal-halted 4\nlocal-idle\n")
+}
