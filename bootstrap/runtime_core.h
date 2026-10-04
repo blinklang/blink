@@ -3472,12 +3472,14 @@ BLINK_RT_FN int blink_net_default_listen(void* __self, const char* addr, int por
 }
 #endif
 
+/* A Str slot never holds NULL: reading its length panics. The empty Str is the
+   no-result value, as in blink_read_file. */
 BLINK_RT_FN const char* blink_net_default_dns(void* __self, const char* hostname);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_net_default_dns(void* __self, const char* hostname) {
     (void)hostname;
     fprintf(stderr, "blink: net.dns not implemented\n");
-    return NULL;
+    return BLINK_STR_EMPTY;
 }
 #endif
 
@@ -3518,7 +3520,7 @@ BLINK_RT_FN const char* blink_crypto_default_hash(void* __self, const char* data
 BLINK_RT_FN const char* blink_crypto_default_hash(void* __self, const char* data) {
     (void)data;
     fprintf(stderr, "blink: crypto.hash not implemented\n");
-    return NULL;
+    return BLINK_STR_EMPTY;
 }
 #endif
 
@@ -3527,7 +3529,7 @@ BLINK_RT_FN const char* blink_crypto_default_sign(void* __self, const char* data
 BLINK_RT_FN const char* blink_crypto_default_sign(void* __self, const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "blink: crypto.sign not implemented\n");
-    return NULL;
+    return BLINK_STR_EMPTY;
 }
 #endif
 
@@ -3536,7 +3538,7 @@ BLINK_RT_FN const char* blink_crypto_default_encrypt(void* __self, const char* d
 BLINK_RT_FN const char* blink_crypto_default_encrypt(void* __self, const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "blink: crypto.encrypt not implemented\n");
-    return NULL;
+    return BLINK_STR_EMPTY;
 }
 #endif
 
@@ -3545,7 +3547,7 @@ BLINK_RT_FN const char* blink_crypto_default_decrypt(void* __self, const char* d
 BLINK_RT_FN const char* blink_crypto_default_decrypt(void* __self, const char* data, const char* key) {
     (void)data; (void)key;
     fprintf(stderr, "blink: crypto.decrypt not implemented\n");
-    return NULL;
+    return BLINK_STR_EMPTY;
 }
 #endif
 
