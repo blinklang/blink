@@ -74,6 +74,8 @@ Result[T, E]    // Ok(value) | Err(error)
 
 Strings are not bare character arrays. They are UTF-8 encoded, immutable values with a method surface designed to be complete enough that 90% of programs never need a string utility library. Methods are organized into two traits: `Sized` (generic, shared with collections) and `StrOps` (string-specific).
 
+**Every `Str` is valid UTF-8.** Every safe way to make a `Str` gives valid UTF-8: literals, interpolation, the `Str` methods, `StringBuilder`, and `Bytes.to_str`, which returns `Err` on input that is not valid UTF-8. A `Str` that comes in through `@ffi` or `@trusted` code (§9) must also be valid UTF-8. The compiler cannot check that, so the author of that boundary must make sure of it. The codepoint methods and the `byte_slice` boundary check depend on this invariant.
+
 ##### The `Sized` Trait
 
 `Sized` provides length-awareness to any container type. `Str`, `List[T]`, `Map[K, V]`, and `Set[T]` all implement it.
@@ -101,12 +103,14 @@ trait StrOps {
     fn char_at(self, index: Int) -> Option[Char]
     fn byte_len(self) -> Int
     fn byte_at(self, index: Int) -> U8
+    fn byte_slice(self, start: Int, end: Int) -> Str
 
     // Search
     fn contains(self, needle: Str) -> Bool
     fn starts_with(self, prefix: Str) -> Bool
     fn ends_with(self, suffix: Str) -> Bool
     fn index_of(self, needle: Str) -> Option[Int]
+    fn byte_index_of(self, needle: Str, from: Int) -> Option[Int]
 
     // Extraction and transformation
     fn substring(self, start: Int, end: Int) -> Str
@@ -130,13 +134,13 @@ The full method surface (15 core methods from `Sized` + `StrOps`, plus byte-acce
 
 | Method | Signature | Returns |
 |--------|-----------|---------|
-| `len` | `fn(self) -> Int` | Codepoint count |
+| `len` | `fn(self) -> Int` | Codepoint count (O(n)) |
 | `is_empty` | `fn(self) -> Bool` | `self.len() == 0` |
-| `char_at` | `fn(self, Int) -> Option[Char]` | Codepoint at logical index |
+| `char_at` | `fn(self, Int) -> Option[Char]` | Codepoint at logical index; `None` when out of bounds |
 | `contains` | `fn(self, Str) -> Bool` | Substring presence |
 | `starts_with` | `fn(self, Str) -> Bool` | Prefix check |
 | `ends_with` | `fn(self, Str) -> Bool` | Suffix check |
-| `substring` | `fn(self, Int, Int) -> Str` | Codepoint-indexed slice |
+| `substring` | `fn(self, Int, Int) -> Str` | Codepoint-indexed slice `[start, end)`; clamps |
 | `concat` | `fn(self, Str) -> Str` | Concatenation |
 | `split` | `fn(self, Str) -> List[Str]` | Split by separator |
 | `to_upper` | `fn(self) -> Str` | Uppercase (Unicode-aware) |
@@ -150,7 +154,11 @@ The full method surface (15 core methods from `Sized` + `StrOps`, plus byte-acce
 | `parse_int` | `fn(self) -> Result[Int, ConversionError]` | Parse as integer |
 | `parse_float` | `fn(self) -> Result[Float, ConversionError]` | Parse as float |
 | `byte_len` | `fn(self) -> Int` | Byte count (O(1)) |
-| `byte_at` | `fn(self, Int) -> U8` | Raw byte at offset |
+| `byte_at` | `fn(self, Int) -> U8` | Raw byte at offset; panics when out of bounds |
+| `byte_slice` | `fn(self, Int, Int) -> Str` | Byte-range slice `[start, end)`; clamps; panics when a bound falls inside a codepoint |
+| `byte_index_of` | `fn(self, Str, Int) -> Option[Int]` | Byte offset of first match at or after `from` |
+
+The `byte_` methods are exactly the four in this table: `byte_len`, `byte_at`, `byte_slice` and `byte_index_of`. The prefix does not extend to other methods; there is no `byte_split` or `byte_starts_with`.
 
 ##### Unicode Semantics
 
@@ -169,10 +177,70 @@ Byte-access methods use the `byte_` prefix. These exist for interop, binary prot
 
 ```blink
 let s = "héllo"
-s.byte_len()         // 6
-s.byte_at(0)         // 104 (ASCII 'h')
-s.byte_at(1)         // 195 (first byte of 'é')
+s.byte_len()                // 6
+s.byte_at(0)                // 104 (ASCII 'h')
+s.byte_at(1)                // 195 (first byte of 'é')
+s.byte_slice(0, 3)          // "hé" (bytes 0..3; 'é' is 2 bytes)
+s.byte_index_of("l", 0)     // Some(3)
+s.byte_index_of("l", 4)     // Some(4)
 ```
+
+Byte code pairs `byte_index_of` with `byte_slice`. Both use byte offsets into the same string, so a scanner never adds offsets back by hand:
+
+```blink
+fn fields(line: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut start = 0
+    loop {
+        match line.byte_index_of(",", start) {
+            Some(i) => {
+                out.push(line.byte_slice(start, i))
+                start = i + 1
+            }
+            None => {
+                out.push(line.byte_slice(start, line.byte_len()))
+                return out
+            }
+        }
+    }
+}
+```
+
+A non-empty needle that is valid UTF-8 can only match at a codepoint boundary. So every `Some(i)` from `byte_index_of` is a valid `byte_slice` bound, and so is `i + needle.byte_len()`.
+
+Do not mix the two units. `index_of`, `char_at`, `substring` and `len` use codepoint indices; `byte_index_of`, `byte_at`, `byte_slice` and `byte_len` use byte offsets. Both are `Int`, so the type checker does not catch a codepoint index passed to a `byte_` method. On ASCII text the two units agree, so the mistake shows only on non-ASCII input.
+
+##### Out-of-range indices
+
+A **point read** reads one element at an index: `char_at`, `byte_at`, `List.get`, `Bytes.get`. A point read never makes up a value. It returns `Option` when its return type can say "absent", and otherwise panics:
+
+- `char_at` returns `Option[Char]`, so an index out of bounds gives `None`.
+- `byte_at` returns a bare `U8`, so an index `< 0` or `>= byte_len()` panics. The panic message names the method, the index and `byte_len`. Byte loops already prove the bound with `i < s.byte_len()`. Code that wants an `Option[U8]` uses `Bytes.get`.
+
+A **range read** returns the part of a sequence in the half-open range `[start, end)`: `substring`, `byte_slice`, `List.slice` and `Bytes.slice`. All four use the same rule. A range read clamps its bounds and never panics on an out-of-range index:
+
+- `start < 0` is read as `0`.
+- `end` past the length is read as the length (`len()` for `substring`, `byte_len()` for `byte_slice`, `len()` for `List` and `Bytes`).
+- `start >= end` gives an empty result. The bounds are not swapped.
+- A negative index does not count from the end.
+
+```blink
+"abc".substring(0, 99)      // "abc"
+"abc".substring(-5, 2)      // "ab"
+"hello".substring(5, 2)     // "" (no swap)
+[1, 2, 3].slice(1, 99)      // [2, 3]
+```
+
+A clamped result is a real value of the type, so the rule keeps this law for every `a <= b <= c`, in range or not: `s.substring(a, b).concat(s.substring(b, c)) == s.substring(a, c)`.
+
+`byte_slice` adds one rule: after clamping, it panics when `start` or `end` falls inside a multi-byte codepoint. The result would not be valid UTF-8, and the method does not move the bound to a boundary for you.
+
+```blink
+"café".byte_slice(0, 4)     // panics: byte 4 is inside 'é' (bytes 3..5)
+"café".byte_slice(0, 5)     // "café"
+```
+
+`byte_index_of(needle, from)` searches from byte offset `from`. A `from < 0` is read as `0`. A `from` past `byte_len()` gives `None`. A `from` inside a multi-byte codepoint panics, so `None` always means "not found" and never "bad offset". Use `from = 0` to search the whole string.
 
 **Why codepoint-default.** The choice is between three levels of abstraction: bytes (Go, C), codepoints (Python 3, Java), and grapheme clusters (Swift). Bytes are too low-level — indexing into the middle of a multibyte character is a bug factory. Grapheme clusters are linguistically correct but expensive and complex (cluster boundaries depend on Unicode version and locale). Codepoints hit the pragmatic middle: they correspond to what most programmers mean by "character," they are well-defined by Unicode, and they avoid the worst class of string bugs. The `byte_` prefix makes raw access available but intentionally inconvenient (panel vote: 3-2, Systems and PLT dissented wanting byte-default).
 
@@ -391,7 +459,7 @@ The full `List[T]` method surface (14 methods from `ListOps` + 2 from `Sized` + 
 | `remove` | `fn(self, Int) -> T` | yes | Remove at index, shift left |
 | `clear` | `fn(self)` | yes | Reset to empty, retains capacity |
 | `append` | `fn(self, List[T]) -> List[T]` | no | Concatenate, returns new list |
-| `slice` | `fn(self, Int, Int) -> List[T]` | no | Sub-list `[start, end)`, returns new list |
+| `slice` | `fn(self, Int, Int) -> List[T]` | no | Sub-list `[start, end)`, returns new list; clamps (§3.2.1 *Out-of-range indices*) |
 | `join` | `fn(self, Str) -> Str` | no | Join with a separator — `List[Str]` only, via `Joinable` (§3.2.1) |
 | `reverse` | `fn(self) -> List[T]` | no | Reversed copy |
 | `sort` | `fn(self) -> List[T]` | no | Stable sorted copy (requires `T: Ord`) |
@@ -446,7 +514,7 @@ The comparator may have effects. `sort_by` carries them through `! _`, as `map` 
 
 There is no `sorted` method: `sort` already returns a new list. A call to `.sorted()` is `UnresolvedMethod`, and its help line says so.
 
-**Why `.get()` returns `Option[T]`.** Out-of-bounds access is a runtime error in most languages. Returning `Option[T]` forces the caller to handle the absence case — a read never panics on an index that is out of bounds, and there are no null pointer exceptions. A write through `set` panics on an index that is out of bounds. Use `??` for default values: `list.get(i) ?? 0`.
+**Why `.get()` returns `Option[T]`.** Out-of-bounds access is a runtime error in most languages. Returning `Option[T]` forces the caller to handle the absence case, and there are no null pointer exceptions. The general rule (§3.2.1 *Out-of-range indices*): a point read never makes up a value. It returns `Option` when its return type can say "absent", and otherwise panics. So `List.get` and `char_at` give `None` out of bounds, and `Str.byte_at`, which returns a bare `U8`, panics. A write through `set` panics on an index that is out of bounds. A range read such as `slice` clamps. Use `??` for default values: `list.get(i) ?? 0`.
 
 **Why 13 methods (vote: 3-2).** Systems and PLT argued for 8, excluding `insert`, `remove`, `index_of`, and `last` as O(n) operations better served by iterator methods. Web/Scripting, DevOps, and AI/ML argued these are bread-and-butter operations in every major language (Python `list`, JS `Array`, Java `ArrayList`), and their absence would cause every user to write the same helpers on day one. The expanded surface won on developer experience grounds — performance characteristics should be documented, not hidden.
 
@@ -681,7 +749,7 @@ fn decode(b: Bytes) -> Result[Str, ConversionError] {
 | `len` | `fn(self) -> Int` | Via `Sized` |
 | `is_empty` | `fn(self) -> Bool` | Via `Sized` |
 | `get` | `fn(self, Int) -> Option[U8]` | Byte at index |
-| `slice` | `fn(self, Int, Int) -> Bytes` | Sub-buffer (copy) |
+| `slice` | `fn(self, Int, Int) -> Bytes` | Sub-buffer `[start, end)` (copy); clamps (§3.2.1 *Out-of-range indices*) |
 | `concat` | `fn(self, Bytes) -> Bytes` | Concatenation |
 | `to_str` | `fn(self) -> Result[Str, ConversionError]` | UTF-8 decode |
 | `to_hex` | `fn(self) -> Str` | Hex string |
