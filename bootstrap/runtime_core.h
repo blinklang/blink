@@ -2447,6 +2447,12 @@ BLINK_RT_FN int blink_str_next_char(const char* s, int64_t* pos, int32_t* out) {
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len) {
+    /* A start or a count past the end keeps only what s has, as blink_str_slice
+       does, so the copy stays inside s and the header counts the bytes copied. */
+    int64_t slen = blink_str_len(s);
+    if (start < 0) start = 0;
+    if (start >= slen || len <= 0) return BLINK_STR_EMPTY;
+    if (len > slen - start) len = slen - start;
     char* buf = blink_str_alloc(len);
     memcpy(buf, s + start, (size_t)len);
     return buf;
