@@ -47,14 +47,17 @@
 #                            A fact filed under a spelled name is a fact the tid
 #                            cannot answer, and each table is a second place for
 #                            a type to be described
-#   node_pool_writes         writes to the parser's node pool outside node_push,
-#                            node_pop, node_replace and parser_reset; absolute
-#                            zero gate. node_kind answers from a column those four
-#                            keep beside the pool, so any other write leaves the
-#                            column holding a kind the pool no longer has. Counted
-#                            in src/, lib/ and tests/: in parser.bl outside the
-#                            four, and in every file that imports `nodes` from
-#                            parser or spells `parser.nodes`. A historical ref is
+#   node_pool_writes         writes to the parser's node pool, or to the columns
+#                            kept beside it, outside node_push, node_pop,
+#                            node_replace, parser_reset and the two child-slot
+#                            helpers they call; absolute zero gate. node_kind and
+#                            the child walks answer from those columns, so any
+#                            other write leaves a column holding a kind or a child
+#                            the pool no longer has. Counted in src/, lib/ and
+#                            tests/: in parser.bl outside the writers (the pool
+#                            and its non-pub `columns`), and in every file that
+#                            imports `nodes` from parser or spells
+#                            `parser.nodes`. A historical ref is
 #                            materialized with src/ alone, so its count leaves out
 #                            lib/ and tests/; the zero gate still holds the tree
 #
@@ -146,6 +149,9 @@ decline_unhandled() {
 # Mutating calls on the pool and assignments into a slot or a field of one, spelled bare or as
 # `parser.nodes`.
 POOL_WRITE='\b(parser\.)?nodes(\.(push|pop|set|clear|insert|remove|truncate|append|extend|reverse|sort|swap)\(|\[[^]]*\](\.[a-z_]+)*\s*=[^=])'
+# The same writes to a field of parser.bl's `columns`, plus a reassignment of a field or of
+# the whole value.
+COLUMN_WRITE='\bcolumns(\s*=[^=]|\.[a-z_]+(\.(push|pop|set|clear|insert|remove|truncate|append|extend|reverse|sort|swap)\(|\[[^]]*\]\s*=[^=]|\s*=[^=]))'
 
 pool_writes() {
   root="$1"
@@ -153,9 +159,9 @@ pool_writes() {
   p="$root/src/parser.bl"
   if [ -f "$p" ]; then
     n=$(awk '
-      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset)\(/ { inw = 1 }
+      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset|node_append_child_slots|node_drop_child_slots_from)\(/ { inw = 1 }
       !inw { print }
-      inw && /^}/ { inw = 0 }' "$p" | rg -o "$POOL_WRITE" | wc -l | tr -d ' ')
+      inw && /^}/ { inw = 0 }' "$p" | rg -o "$POOL_WRITE|$COLUMN_WRITE" | wc -l | tr -d ' ')
     total=$((total + n))
   fi
   files=$(rg -U -l -g '*.bl' 'import parser\.\{[^}]*\bnodes\b|\bparser\.nodes\b' \
