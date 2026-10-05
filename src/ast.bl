@@ -374,22 +374,19 @@ pub type NodeChildren {
     spell_lists: List[Int] = []
 }
 
-// Which of a node's children a read of the table collects. `Value` and `Spell` are the flat
-// walks: node ids only, each sublist expanded to its members. The other four collect one
+// Which of a node's children a read of the table collects. The four bucket walks collect one
 // bucket of NodeChildren as the table holds it, sublists unexpanded. `Slots` collects every
 // child in table order as one Int each: the node or sublist id times 4, plus 1 for a sublist
-// and 2 for a spelling. The parser keeps these beside the pool so a walk does not run the
-// table again.
+// and 2 for a spelling. The parser keeps these beside the pool and expands a sublist slot
+// when a walk reads it, so a walk does not run the table again.
 pub type ChildWalk {
-    Value, Spell, ValueRefs, ValueLists, SpellRefs, SpellLists, Slots
+    ValueRefs, ValueLists, SpellRefs, SpellLists, Slots
 }
 
-// Where a read of the table puts what it collects. The walkers run once per node per pass,
-// so they append to a list the caller owns rather than build lists of their own.
-// `sublists` is the parser's sublist store, which a flat walk reads to expand a sublist.
+// Where a read of the table puts what it collects. A read appends to a list the caller owns
+// rather than build a list of its own.
 type ChildSink {
     walk: ChildWalk
-    sublists: List[List[Int]]
     out: List[Int]
 }
 
@@ -399,9 +396,8 @@ fn nc_ref(s: ChildSink, id: Int, spell: Bool) {
         s.out.push(id * 4 + (if spell { 2 } else { 0 }))
         return
     }
-    let flat = if spell { ChildWalk.Spell } else { ChildWalk.Value }
     let bucket = if spell { ChildWalk.SpellRefs } else { ChildWalk.ValueRefs }
-    if s.walk == flat || s.walk == bucket { s.out.push(id) }
+    if s.walk == bucket { s.out.push(id) }
 }
 
 fn nc_list(s: ChildSink, sl: Int, spell: Bool) {
@@ -410,17 +406,8 @@ fn nc_list(s: ChildSink, sl: Int, spell: Bool) {
         s.out.push(sl * 4 + (if spell { 3 } else { 1 }))
         return
     }
-    let flat = if spell { ChildWalk.Spell } else { ChildWalk.Value }
     let bucket = if spell { ChildWalk.SpellLists } else { ChildWalk.ValueLists }
     if s.walk == bucket { s.out.push(sl) }
-    if s.walk != flat { return }
-    let members = s.sublists.get(sl).unwrap()
-    let mut i = 0
-    while i < members.len() {
-        let c = members.get(i).unwrap()
-        if c != -1 { s.out.push(c) }
-        i = i + 1
-    }
 }
 
 fn nc_v(s: ChildSink, id: Int) { nc_ref(s, id, false) }
@@ -428,28 +415,26 @@ fn nc_vl(s: ChildSink, sl: Int) { nc_list(s, sl, false) }
 fn nc_s(s: ChildSink, id: Int) { nc_ref(s, id, true) }
 fn nc_sl(s: ChildSink, sl: Int) { nc_list(s, sl, true) }
 
-// Appends to `out` the children of `pool[id]` that `walk` asks for, in table order. `sublists`
-// is read only by the flat walks. The table reads each field in place: an AstNode is large, and
-// a copy per call showed up in the profile.
-pub fn node_child_ids_into(pool: List[AstNode], id: Int, walk: ChildWalk, sublists: List[List[Int]], out: List[Int]) {
-    nc_table(pool, id, ChildSink { walk: walk, sublists: sublists, out: out })
+// Appends to `out` the children of `pool[id]` that `walk` asks for, in table order. The table
+// reads each field in place: an AstNode is large, and a copy per call showed up in the profile.
+pub fn node_child_ids_into(pool: List[AstNode], id: Int, walk: ChildWalk, out: List[Int]) {
+    nc_table(pool, id, ChildSink { walk: walk, out: out })
 }
 
 // EVERY child of a node, for any pass that must not miss one.
 pub fn node_children(node: AstNode) -> NodeChildren {
-    let no_sublists: List[List[Int]] = []
     let pool = [node]
     let kids = NodeChildren {}
-    node_child_ids_into(pool, 0, ChildWalk.ValueRefs, no_sublists, kids.refs)
-    node_child_ids_into(pool, 0, ChildWalk.ValueLists, no_sublists, kids.lists)
-    node_child_ids_into(pool, 0, ChildWalk.SpellRefs, no_sublists, kids.spell_refs)
-    node_child_ids_into(pool, 0, ChildWalk.SpellLists, no_sublists, kids.spell_lists)
+    node_child_ids_into(pool, 0, ChildWalk.ValueRefs, kids.refs)
+    node_child_ids_into(pool, 0, ChildWalk.ValueLists, kids.lists)
+    node_child_ids_into(pool, 0, ChildWalk.SpellRefs, kids.spell_refs)
+    node_child_ids_into(pool, 0, ChildWalk.SpellLists, kids.spell_lists)
     kids
 }
 
 // The one table of every node kind's children. Each arm names its value children before its
-// spelling children, and node ids before sublists within each, so a flat walk answers in that
-// order.
+// spelling children, and node ids before sublists within each, so the slot walk, and the
+// parser's value and spelling walks that read its slots, answer in that order.
 fn nc_table(pool: List[AstNode], id: Int, s: ChildSink) {
     match nk_of(pool[id].kind) {
         NodeKind.IntLit => {}
