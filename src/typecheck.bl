@@ -700,7 +700,7 @@ fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
     }
     for source_mod in mods.split("|") {
         if source_mod == "" { continue }
-        match per_module_imports.get("{reader}:{source_mod}") {
+        match module_import(reader, source_mod) {
             Some(imp_node) => {
                 if imp_node != -1 && is_selected_import(bare, imp_node) != 0 { return "{source_mod}.{bare}" }
             }
@@ -11947,9 +11947,10 @@ pub fn is_user_effect_handle_name(name: Str) -> Int {
 }
 
 // ── Selective import filtering ──────────────────────────────────────
-// Key: "consuming_mod:source_mod" → the import node, or -1 for a whole-module import.
+// consuming_mod → source_mod → the import node, or -1 for a whole-module import. Keyed by
+// the consuming module first, since a lookup by bare name asks for one module's imports.
 // The driver fills it while it resolves imports; the checks that read it live here.
-pub let mut per_module_imports: Map[Str, Int] = Map()
+pub let mut per_module_imports: Map[Str, Map[Str, Int]] = Map()
 pub let mut tc_import_modules: List[Str] = []
 pub let mut tc_import_qualifiers: List[Str] = []
 pub let mut tc_import_nodes: List[Int] = []
@@ -11957,6 +11958,24 @@ let mut tc_module_import_node: Map[Str, Int] = Map()
 let mut tc_qualifier_to_module: Map[Str, Str] = Map()
 let mut tc_import_modules_idx: Map[Str, Int] = Map()
 let mut tc_import_qualifiers_set: Map[Str, Int] = Map()
+
+pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int) {
+    match per_module_imports.get(consuming_mod) {
+        Some(imports) => imports.insert(source_mod, imp_node)
+        None => {
+            let mut imports: Map[Str, Int] = Map()
+            imports.insert(source_mod, imp_node)
+            per_module_imports.insert(consuming_mod, imports)
+        }
+    }
+}
+
+fn module_import(consuming_mod: Str, source_mod: Str) -> Option[Int] {
+    match per_module_imports.get(consuming_mod) {
+        Some(imports) => imports.get(source_mod)
+        None => None
+    }
+}
 
 // ── Pub import re-export tracking ──────────────────────────────────
 // Key: "reexporting_mod:item_name" → source module name (selective re-exports)
@@ -12097,8 +12116,7 @@ fn is_filtered_for_module(name: Str, source_mod: Str, consuming_mod: Str) -> Int
     if source_mod == consuming_mod { return 0 }
     if source_mod == "" || source_mod == "__main__" { return 0 }
     if consuming_mod == "" { return 0 }
-    let key = "{consuming_mod}:{source_mod}"
-    match per_module_imports.get(key) {
+    match module_import(consuming_mod, source_mod) {
         Some(imp_node) => {
             if imp_node == -1 { return 1 }
             return is_selected_import(name, imp_node) == 0
@@ -12129,8 +12147,7 @@ fn nr_is_unimported_prelude_free_fn(name: Str) -> Int {
     }
     if nr_current_module == source_mod { return 0 }
     // An explicit import (bare or selective-including-name) makes it visible.
-    let key = "{nr_current_module}:{source_mod}"
-    match per_module_imports.get(key) {
+    match module_import(nr_current_module, source_mod) {
         Some(imp_node) => {
             if imp_node == -1 { return 0 }
             if is_selected_import(name, imp_node) != 0 { return 0 }
@@ -12329,13 +12346,7 @@ fn nr_note_local_binder(ident_node: Int, name: Str) {
 // module, not against the entry file, because the file that selected both owns the choice.
 fn tc_check_namesake_import_ambiguity() ! Diag.Report {
     if tc_namesake_type_modules.len() == 0 { return }
-    let mut seen_readers: Map[Str, Int] = Map()
-    for key in per_module_imports.keys() {
-        let colon = key.index_of(":")
-        if colon < 0 { continue }
-        let reader = key.slice(0, colon)
-        if seen_readers.contains_key(reader) { continue }
-        seen_readers.insert(reader, 1)
+    for reader in per_module_imports.keys() {
         for bare in tc_namesake_type_modules.keys() {
             let mods = tc_namesake_type_modules.get(bare) ?? ""
             // A module's own declaration wins outright, so it is never asked to choose.
@@ -12345,7 +12356,7 @@ fn tc_check_namesake_import_ambiguity() ! Diag.Report {
             let mut second = ""
             for source_mod in mods.split("|") {
                 if source_mod == "" { continue }
-                let imp_node = per_module_imports.get("{reader}:{source_mod}") ?? -1
+                let imp_node = module_import(reader, source_mod) ?? -1
                 if imp_node == -1 { continue }
                 if is_selected_import(bare, imp_node) == 0 { continue }
                 hits = hits + 1
@@ -12365,15 +12376,18 @@ fn tc_check_namesake_import_ambiguity() ! Diag.Report {
 fn nr_resolve_imported_decl(name: Str, consuming_mod: Str) -> Int {
     if name == "" { return -1 }
     if consuming_mod == "" { return -1 }
-    let prefix = "{consuming_mod}:"
+    let imports = match per_module_imports.get(consuming_mod) {
+        Some(m) => m
+        None => return -1
+    }
+    // The answer does not depend on the order the imports are visited in: a second hit
+    // either names the declaration already found or settles nothing.
     let mut found = -1
-    for key in per_module_imports.keys() {
-        if key.starts_with(prefix) == 0 { continue }
-        let imp_node = per_module_imports.get(key) ?? -1
+    for source_mod in imports.keys() {
+        let imp_node = imports.get(source_mod) ?? -1
         if imp_node == -1 { continue }
         let names_sl = node_args(imp_node)
         if names_sl == -1 { continue }
-        let source_mod = key.substring(prefix.len(), key.len() - prefix.len())
         let mut i = 0
         while i < sublist_length(names_sl) {
             let name_node = sublist_get(names_sl, i)
