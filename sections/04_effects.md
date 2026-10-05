@@ -157,7 +157,7 @@ effect Time {
     effect Sleep      // sleep / delay execution
 }
 
-effect Rand           // generate random numbers (leaf effect, no children)
+effect Rand           // generate random numbers (leaf effect, operations in §4.4.7)
 
 effect Crypto {
     effect Hash       // hash functions (SHA, BLAKE, etc.)
@@ -268,7 +268,7 @@ The wrapper selects the operation; it does not add the newline to `msg`. A handl
 | `Net` / `Net.*` | `net` | `net.request(...)`, `net.get(...)`, `net.post(...)`, `net.listen(...)`, `net.dns(...)` |
 | `Env` / `Env.*` | `env` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()`, `env.set_var(...)`, `env.remove_var(...)`, `env.exit(...)` |
 | `Time` / `Time.*` | `time` | `time.read() -> Instant`, `time.sleep(Duration)` |
-| `Rand` | `rand` | `rand.int(...)`, `rand.float(...)`, `rand.bytes(...)` |
+| `Rand` | `rand` | `rand.int(Range[Int])`, `rand.float()`, `rand.bytes(Int)` (§4.4.7) |
 | `Crypto` / `Crypto.*` | `crypto` | `crypto.hash(...)`, `crypto.sign(...)`, `crypto.encrypt(...)`, `crypto.decrypt(...)` |
 | `Process` / `Process.*` | `process` | `process.spawn(...)`, `process.signal(...)` |
 
@@ -995,6 +995,122 @@ fn echo_once() -> Result[(), NetError] ! Net.Listen, Net.Connect {
     sock.close()
     Ok(())
 }
+```
+
+#### 4.4.7 Rand Operations
+
+The `Rand` effect gives random values. It is a leaf effect with three operations:
+
+```blink
+effect Rand {
+    /// A uniform random integer in the closed interval [lo, hi]. The caller makes sure lo <= hi.
+    fn int(lo: Int, hi: Int) -> Int
+
+    /// A uniform random float in the half-open interval [0.0, 1.0).
+    fn float() -> Float
+
+    /// n uniform random bytes. The caller makes sure n >= 0. The result has length n.
+    fn bytes(n: Int) -> Bytes
+}
+```
+
+**Handler operations are monomorphic.** As with `IO` (§4.4), the surface that a program calls is a stdlib wrapper, not the effect operation. Each wrapper does exactly one operation call:
+
+| Wrapper on the `rand` handle | Operation it calls | Argument rule |
+|---|---|---|
+| `rand.int(r: Range[Int]) -> Int` | `int(lo, hi)` | `a..b` gives `int(a, b - 1)`; `a..=b` gives `int(a, b)`. An empty range panics |
+| `rand.float() -> Float` | `float()` | None |
+| `rand.bytes(n: Int) -> Bytes` | `bytes(n)` | `n < 0` panics |
+
+```blink
+fn roll() -> Int ! Rand {
+    rand.int(1..=6)
+}
+
+fn token() -> Bytes ! Rand {
+    rand.bytes(32)
+}
+```
+
+User code calls only the wrappers. `rand.int(lo, hi)` with two `Int` arguments does not compile. The two-`Int` form is the operation that a `handler Rand { ... }` implements, and that a handler calls as `default.int(lo, hi)` (§4.7.1).
+
+```blink
+fn always_low() -> Handler[Rand] {
+    handler Rand {
+        fn int(lo: Int, hi: Int) -> Int { lo }
+        // float and bytes omitted -- auto-delegate to the enclosing handler (§4.7.1)
+    }
+}
+```
+
+Under `with always_low() { ... }`, `rand.int(1..=6)` returns 1.
+
+**Empty range.** `rand.int` panics when its range holds no value: `5..5`, `5..2`, or `5..=4`. The panic message names `rand.int` and the range, for example `rand.int: empty range 5..5`. A range with literal ends gets no compile-time check here; it panics at run time like a computed range.
+
+**Uniformity.** Every handler must give exactly uniform results. `int(lo, hi)` gives each value in `[lo, hi]` with the same probability, with no modulo bias. `float()` gives a uniform value in `[0.0, 1.0)`. `bytes(n)` gives `n` independent uniform bytes. This is an obligation on each handler, the default handler and user handlers alike. The spec names no algorithm.
+
+**The wrapper checks each result.** A user handler can return a value that breaks the operation contract. Each wrapper checks the result of every call, in every build mode:
+
+- `int(lo, hi)`: the result is in `[lo, hi]`.
+- `float()`: the result is in `[0.0, 1.0)`.
+- `bytes(n)`: the result length is `n`.
+
+A failed check panics with `Rand handler contract violated`, then the operation, its arguments and the value it returned, for example `Rand handler contract violated: int(0, 4) returned 9`. Code that uses a result, such as an index into a list, can trust it.
+
+**The default handler.** The stdlib default handler is a cryptographically secure generator. It has these properties:
+
+- Its output cannot be predicted from earlier output.
+- It is seeded from operating-system entropy.
+- No two threads share a stream.
+- After a process fork, the child does not repeat the stream of the parent.
+
+The spec names no algorithm. The default handler is suitable for secret material such as keys and tokens. An installed `with` handler replaces it, so code that makes secrets must not run under a handler it does not trust.
+
+**Seeding is a handler concern.** `Rand` has no seed, reseed or fork operation. To get a deterministic stream, install a handler, for example `with mock_rand(seed).as_handler() { ... }` in a test (§8.10.4). The stdlib has no production seeded handler.
+
+**Helpers in `std.random`.** Generic helpers are free functions in `std.random`, not methods on the handle:
+
+```blink
+pub fn shuffle[T](xs: List[T]) -> List[T] ! Rand
+pub fn choice[T](xs: List[T]) -> Option[T] ! Rand
+```
+
+- `shuffle` returns a new list. It does a Fisher-Yates shuffle with exactly `xs.len() - 1` calls to `rand.int` (none for an empty list). `xs` does not change.
+- `choice` returns `None` for an empty list and makes no draw. Otherwise it returns one element from one call to `rand.int`.
+
+```blink
+import std.random.{shuffle, choice}
+
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    shuffle(deck)
+}
+
+fn pick_server(servers: List[Str]) -> Option[Str] ! Rand {
+    choice(servers)
+}
+```
+
+**`rand.<name>` always means the handle.** `rand` is a reserved handle name (§3c.4 *Effect Handle Operations*), so `rand.shuffle(xs)` does not find the free function. It is `UnresolvedMethod` (E0505). The diagnostic lists the operations of `Rand` and gives the import:
+
+```
+error[E0505]: `shuffle` is not an operation of effect `Rand`
+  = note: `Rand` operations are `int`, `float`, `bytes`
+  = help: `shuffle` is a function in `std.random`
+  = fix: add `import std.random.{shuffle}` and call `shuffle(deck)`
+```
+
+**Python-style integer calls.** `rand.int(0, 10)` and `rand.int(10)` do not compile. Each diagnostic gives the fix as a range:
+
+```
+error: `rand.int` takes 1 argument (a Range), found 2
+  = fix: rand.int(0..10)
+  = note: use `0..=10` to include 10 (Python's randint includes the upper bound)
+```
+
+```
+error[TypeError]: mismatched types
+  = note: expected `Range[Int]`, found `Int`
+  = fix: rand.int(0..10)
 ```
 
 ---
@@ -2027,7 +2143,7 @@ fn load() -> Int ! Store {
 }
 ```
 
-`! Store` grants `store.get(...)` and `store.put(...)`. A leaf has no sub-effects, so a row grants all of its operations or none of them. The built-in `Rand` (§4.3) is a leaf of this kind.
+`! Store` grants `store.get(...)` and `store.put(...)`. A leaf has no sub-effects, so a row grants all of its operations or none of them. The built-in `Rand` (§4.4.7) is a leaf of this kind.
 
 Four rules govern an effect body:
 
