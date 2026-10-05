@@ -143,11 +143,7 @@ echo "gen0: bootstrapping $TAG @ $TAG_SHORT in $WT"
 
 # A fixed version stamp keeps the binaries reproducible.
 stamp_version() {
-    sed -i "s/blink_cli_version = \"dev\"/blink_cli_version = \"$STAMP\"/" "$1"
-    if ! grep -q "blink_cli_version = \"$STAMP\"" "$1"; then
-        echo "gen0: ERROR version stamp not applied to $1" >&2
-        exit 1
-    fi
+    "$ROOT_DIR/scripts/stamp_cli_version.sh" "$1" "$STAMP"
 }
 link_archived() {
     cc -o "$1" "$2" -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
