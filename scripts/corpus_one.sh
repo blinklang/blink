@@ -35,6 +35,11 @@
 # that does not run or does not parse gives null, never 0. A test.failing row
 # that skips does not carry expected_fail in the report, so it is not counted.
 #
+# The record also says whether the binary linked the prebuilt compiler
+# archive ("compiler_archive"), read from the binary's own symbols rather than
+# from how the build was asked for: a build that silently falls back to one
+# unit must read false, so corpus_check.sh can hold the count to its floor.
+#
 # Env:
 #   CORPUS_BUILD_TIMEOUT  seconds per compile (default 900)
 #   CORPUS_RUN_TIMEOUT    seconds per run (default 600)
@@ -138,6 +143,12 @@ timed_out() {
     timeout -k 10 "$build_timeout" "$blink_bin" build "tests/$base.bl" -o "build/$base" --debug
 ) > "$build_log" 2>&1
 build_rc=$?
+# The compiler archive's globals init fn: main calls it, so a binary that
+# linked the archive always keeps it.
+compiler_archive=false
+if [ -f "$work/build/$base" ] && nm --defined-only "$work/build/$base" 2>/dev/null | grep -q ' __blink_init_compiler_globals$'; then
+    compiler_archive=true
+fi
 if timed_out "$build_rc" "$start" "$build_timeout"; then
     status=timeout
     first_error="compile exceeded ${build_timeout}s"
@@ -197,8 +208,8 @@ seconds=$(printf '%.2f' "$(echo "$end - $start" | bc)")
 # ANSI color codes in the first error line make the JSON hard to read.
 first_error=$(printf '%s' "$first_error" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-300)
 
-printf '{"file":%s,"status":"%s","seconds":%s,"first_error_line":%s,"known_failures":%s}\n' \
-    "$(json_str "$file")" "$status" "$seconds" "$(json_str "$first_error")" "$known" \
+printf '{"file":%s,"status":"%s","seconds":%s,"first_error_line":%s,"known_failures":%s,"compiler_archive":%s}\n' \
+    "$(json_str "$file")" "$status" "$seconds" "$(json_str "$first_error")" "$known" "$compiler_archive" \
     > "$results_dir/$base.json"
 
 # Keep the sandbox small: the binary and C file can be large.
