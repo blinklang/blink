@@ -1,0 +1,173 @@
+// `.len()` on a concrete List or Str is the runtime's own length read, not a call into the
+// stdlib archive. The answer still comes from `impl Sized for List[T]` / `impl Sized for Str`:
+// each `len` there only hands `self` to a foreign binding, so the call site calls that
+// binding, which the runtime header defines inline. A method whose body does more is called
+// as written, and so is a user type's own `len`.
+//
+// The first half pins what the methods answer. The second half lowers probe functions and
+// reads which C functions each one calls.
+
+import std.io
+import mono.{run_mono}
+import ir.{ir_c_name, ir_kid, ir_kid_count, ir_kind, IrKind}
+import cg_stmt.{cg_stmt_reset, lower_fn}
+import lower_test_helpers.{assert_eq_str, fn_decl_of, ice_count, probe}
+
+// ── What the methods answer ───────────────────────────────────────────────
+
+fn sized_len[T: Sized](x: T) -> Int { x.len() }
+
+fn sized_empty[T: Sized](x: T) -> Bool { x.is_empty() }
+
+type Bag {
+    items: List[Int]
+}
+
+trait Counted {
+    fn len(self) -> Int
+}
+
+impl Counted for Bag {
+    fn len(self) -> Int { self.items.len() + 100 }
+}
+
+test "an empty list has length zero" {
+    let xs: List[Int] = []
+    assert_eq(xs.len(), 0)
+    assert_eq(xs.count(), 0)
+    assert(xs.is_empty())
+}
+
+test "a list's length counts its elements" {
+    let xs = [4, 5, 6]
+    assert_eq(xs.len(), 3)
+    assert_eq(xs.count(), 3)
+    assert(!xs.is_empty())
+}
+
+test "push and pop move a list's length" {
+    let mut xs: List[Str] = []
+    xs.push("a")
+    xs.push("b")
+    assert_eq(xs.len(), 2)
+    let _top = xs.pop()
+    assert_eq(xs.len(), 1)
+    let _last = xs.pop()
+    assert_eq(xs.len(), 0)
+    assert(xs.is_empty())
+}
+
+test "a length read each turn sees the list the loop body grows" {
+    let mut xs = [1]
+    let mut i = 0
+    while i < xs.len() {
+        if xs.len() < 5 { xs.push(i) }
+        i = i + 1
+    }
+    assert_eq(i, 5)
+}
+
+test "an empty string has length zero" {
+    assert_eq("".len(), 0)
+    assert("".is_empty())
+}
+
+test "an ASCII string's length counts its characters" {
+    let s = "hello"
+    assert_eq(s.len(), 5)
+    assert(!s.is_empty())
+}
+
+// Whether Str.len counts bytes or code points is an open question between the spec and the
+// runtime, so this row pins only that every route to the length gives the same answer.
+test "a non-ASCII string has one length whichever way it is asked" {
+    let s = "café"
+    assert_eq(s.len(), sized_len(s))
+    assert(s.len() >= 4)
+    assert(!s.is_empty())
+}
+
+test "a generic Sized bound reads the same length as the concrete call" {
+    let xs = [1, 2, 3, 4]
+    assert_eq(sized_len(xs), 4)
+    assert_eq(sized_len("abc"), 3)
+    assert(sized_empty(""))
+    let none: List[Int] = []
+    assert(sized_empty(none))
+}
+
+test "a user type's own len is the one called" {
+    let b = Bag { items: [1, 2] }
+    assert_eq(b.len(), 102)
+}
+
+// ── What the call sites call ──────────────────────────────────────────────
+
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = probe(stem, src)
+    run_mono(program)
+    cg_stmt_reset()
+    lower_fn(fn_decl_of(name))
+}
+
+// Every C function the tree calls by name, in call order.
+fn called(id: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    collect_called(id, out)
+    out
+}
+
+fn collect_called(id: Int, out: List[Str]) {
+    if id < 0 { return }
+    if ir_kind(id) == IrKind.CallDirect || ir_kind(id) == IrKind.CallRuntime { out.push(ir_c_name(id)) }
+    let mut i = 0
+    while i < ir_kid_count(id) {
+        collect_called(ir_kid(id, i), out)
+        i = i + 1
+    }
+}
+
+test "a concrete list's len calls the runtime length read" {
+    let body = probe_fn("cg_call_list_len", #"fn probe_list_len(xs: List[Int]) -> Int { xs.len() }
+"#, "probe_list_len")
+    assert_eq_str("calls", called(body).join(", "), "blink_list_len")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+test "a concrete string's len calls the runtime length read" {
+    let body = probe_fn("cg_call_str_len", #"fn probe_str_len(s: Str) -> Int { s.len() }
+"#, "probe_str_len")
+    assert_eq_str("calls", called(body).join(", "), "blink_str_len")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+test "a list's count calls the same runtime length read as len" {
+    let body = probe_fn("cg_call_list_count", #"fn probe_list_count(xs: List[Int]) -> Int { xs.count() }
+"#, "probe_list_count")
+    assert_eq_str("calls", called(body).join(", "), "blink_list_len")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// is_empty's body compares a length with zero rather than handing `self` on, so the call
+// site calls the impl method.
+test "a list's is_empty still calls the impl method" {
+    let body = probe_fn("cg_call_list_is_empty", #"fn probe_list_is_empty(xs: List[Int]) -> Bool { xs.is_empty() }
+"#, "probe_list_is_empty")
+    assert_eq_str("calls", called(body).join(", "), "blink_std_list_List_Sized_is_empty")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+test "a user type's own len is called, not a runtime read" {
+    let body = probe_fn("cg_call_user_len", #"type Box { items: List[Int] }
+trait Counted { fn len(self) -> Int }
+impl Counted for Box {
+    fn len(self) -> Int { 7 }
+}
+fn probe_user_len(b: Box) -> Int { b.len() }
+"#, "probe_user_len")
+    let calls = called(body)
+    assert_eq_str("call count", "{calls.len()}", "1")
+    assert(!calls.contains("blink_list_len"))
+    assert(calls.get(0).unwrap().ends_with("_len"))
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}

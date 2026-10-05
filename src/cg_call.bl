@@ -19,7 +19,7 @@
 
 import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
-    node_line, node_body, node_is_mut,
+    node_line, node_body, node_is_mut, node_handlers, node_stmts,
     node_methods, node_trait_name, node_impl_binders, node_type_params,
     node_module, node_source_module, node_params, node_fields, node_value, node_str_val,
     sublist_get, sublist_length,
@@ -3653,6 +3653,8 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     }
     let method = cc_method_of(im, node_method(node))
     if method < 0 { return -1 }
+    let bound = cc_forwarded_binding(kind, method)
+    if bound >= 0 { return cc_build_declared_call(node, cc_call_symbol(node, bound, c_fn_decl_name(bound)), obj, bound) }
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
     cc_build_declared_call(node, symbol, obj, method)
@@ -5248,8 +5250,9 @@ fn cc_num_intrinsic(kind: TyKind, method: Str) -> Str {
 }
 
 // `len`, `is_empty` and `clear` are absent because real impls answer them, as they do for
-// Str. `push` and `set` are absent because no Blink declaration answers them; they reach
-// cc_runtime_method instead. `get`, `pop` and `contains` are absent because none of the
+// Str; an impl method that only hands `self` to a foreign binding is called through that
+// binding (cc_forwarded_binding), so `len` still reaches list_len. `push` and `set` are
+// absent because no Blink declaration answers them; they reach cc_runtime_method instead. `get`, `pop` and `contains` are absent because none of the
 // three is one call: the first two fill a carrier behind a bounds or emptiness test, and
 // the last is a scan. Each is refused under its own name in cc_list_not_built.
 //
@@ -5327,8 +5330,9 @@ fn cc_list_join_callee(node: Int) -> Str ! Diag.Report {
 }
 
 // `len` and `is_empty` are absent on purpose: a real `impl Sized for Str` answers both,
-// and this table declining is what lets the impl path answer them. `substring` and
-// `substr` are two spellings of one function, and `to_int` and `parse_int` likewise,
+// and this table declining is what lets the impl path answer them. That path calls `len`
+// through the binding its body forwards to (cc_forwarded_binding), not through a row here.
+// `substring` and `substr` are two spellings of one function, and `to_int` and `parse_int` likewise,
 // exactly as typecheck has them. `as_cstr` is absent because no stdlib function answers
 // it: the copy it hands back is a direct runtime call this stage builds itself
 // (cc_str_as_cstr), read before the impls the same way this table is.
@@ -5860,6 +5864,36 @@ fn cc_method_index(im: Int, mname: Str) -> Int {
         i = i + 1
     }
     -1
+}
+
+// The foreign binding an impl method does nothing but hand `self` to, or -1. Calling the
+// binding at the call site is the same call one step shorter, and for List and Str the
+// binding is a length read the runtime header defines inline, which a call into the
+// archive's copy of the method hides from the C compiler. The body is read rather than the
+// method's name, so an impl whose body does more is called as written. Annotations decline
+// too: a contract on the method checks something the binding does not.
+fn cc_forwarded_binding(kind: TyKind, method: Int) -> Int {
+    if kind != TyKind.List && kind != TyKind.Str { return -1 }
+    let anns = node_handlers(method)
+    if anns != -1 && sublist_length(anns) > 0 { return -1 }
+    let params = node_params(method)
+    if params == -1 || sublist_length(params) != 1 { return -1 }
+    let body = node_body(method)
+    if body < 0 || nk_of(node_kind(body)) != NodeKind.Block { return -1 }
+    let stmts = node_stmts(body)
+    if stmts == -1 || sublist_length(stmts) != 1 { return -1 }
+    let only = sublist_get(stmts, 0)
+    if nk_of(node_kind(only)) != NodeKind.ExprStmt { return -1 }
+    let call = node_value(only)
+    if call < 0 || nk_of(node_kind(call)) != NodeKind.Call { return -1 }
+    let args = node_args(call)
+    if args == -1 || sublist_length(args) != 1 { return -1 }
+    let arg = sublist_get(args, 0)
+    if nk_of(node_kind(arg)) != NodeKind.Ident || node_name(arg) != node_name(sublist_get(params, 0)) { return -1 }
+    if !tc_call_decl_is_fn(call) { return -1 }
+    let decl = tc_call_decl_node(call)
+    if c_ffi_symbol(decl) == "" { return -1 }
+    decl
 }
 
 fn cc_method_of(im: Int, mname: Str) -> Int ! Diag.Report {
