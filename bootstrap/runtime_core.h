@@ -1098,9 +1098,13 @@ BLINK_RT_FN int blink_str_eq(const char* a, const char* b);
 BLINK_RT_FN uint64_t blink_map_hash(const char* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN uint64_t blink_map_hash(const char* key) {
+    /* Bounded by the recorded length, the same bytes blink_str_eq compares, so
+       equal Strs hash equal. A Str holds no NUL, so this is the same value a
+       scan to the terminator gives. */
+    int64_t n = blink_str_len(key);
     uint64_t h = 14695981039346656037ULL;
-    for (const char* p = key; *p; p++) {
-        h ^= (uint64_t)(unsigned char)*p;
+    for (int64_t i = 0; i < n; i++) {
+        h ^= (uint64_t)(unsigned char)key[i];
         h *= 1099511628211ULL;
     }
     return h;
@@ -2655,7 +2659,13 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b) {
-    return strcmp(a, b) == 0;
+    /* Most unequal pairs differ in length, which the header answers without
+       reading the bytes. blink_str_len checks both headers, so a C string that
+       reached Blink without a copy stops here as it would at .len(). */
+    if (a == b) return 1;
+    int64_t n = blink_str_len(a);
+    if (n != blink_str_len(b)) return 0;
+    return memcmp(a, b, (size_t)n) == 0;
 }
 #endif
 
