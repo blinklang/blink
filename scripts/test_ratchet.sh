@@ -41,6 +41,53 @@ EOF
   cat > "$dir/src/typecheck.bl" <<'EOF'
 let mut named_type_map: Map[Str, Int] = Map()
 EOF
+  # The node pool with its four writers, a test that imports the pool across
+  # lines and only reads it, and a file whose own local list is named `nodes`.
+  cat > "$dir/src/parser.bl" <<'EOF'
+pub let mut nodes: List[AstNode] = []
+let mut node_kinds: List[Int] = []
+
+pub fn parser_reset() {
+    nodes.clear()
+    node_kinds.clear()
+}
+
+pub fn node_push(n: AstNode) -> Int {
+    let id = nodes.len()
+    nodes.push(n)
+    node_kinds.push(n.kind)
+    id
+}
+
+pub fn node_pop() {
+    let _ = nodes.pop()
+    let _ = node_kinds.pop()
+}
+
+fn node_replace(id: Int, n: AstNode) {
+    nodes.set(id, n)
+    node_kinds.set(id, n.kind)
+}
+
+pub fn node_kind(id: Int) -> Int { node_kinds[id] }
+EOF
+  cat > "$dir/src/free_names.bl" <<'EOF'
+fn collect() {
+    let mut nodes: List[Int] = []
+    nodes.push(1)
+}
+EOF
+  mkdir -p "$dir/tests" "$dir/lib/std"
+  cat > "$dir/tests/test_pool_reader.bl" <<'EOF'
+import parser.{
+    nodes,
+    node_kind,
+}
+
+test "reads" {
+    assert(nodes.len() == 0 || node_kind(0) == nodes[0].kind)
+}
+EOF
   : > "$dir/Taskfile.yml"
 }
 
@@ -166,6 +213,63 @@ check_row layout_decline_unhandled cname.bl     'let far = d.decline_reason
 // two
 // three
 diag_ice("TooLate", far)'
+
+# node_pool_writes is an absolute zero gate over src/, lib/ and tests/: each
+# write below bypasses the writers that keep node_kind's column in step with the
+# pool, and must fail on that row.
+check_pool_write() {
+  label="$1"; file="$2"; extra="$3"
+  d="$WORK/pool_$label"
+  rm -rf "$d"
+  cp -r "$BASE" "$d"
+  printf '%s\n' "$extra" >> "$d/$file"
+  out=$(RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+  if [ $? = 0 ]; then
+    echo "FAIL node_pool_writes-$label: a write outside the writers did not fail ratchet.sh"
+    fail=1
+  elif ! printf '%s\n' "$out" | rg -q '^node_pool_writes .*NONZERO'; then
+    echo "FAIL node_pool_writes-$label: the run failed, but not on node_pool_writes"
+    printf '%s\n' "$out"
+    fail=1
+  else
+    echo "PASS node_pool_writes-$label: a write outside the writers failed ratchet.sh"
+  fi
+}
+
+check_pool_write parser-push src/parser.bl 'fn scratch() -> Int {
+    nodes.push(AstNode {})
+    0
+}'
+check_pool_write test-pop tests/test_pool_reader.bl 'fn drop_one() { let _ = nodes.pop() }'
+check_pool_write test-set tests/test_pool_reader.bl 'fn swap_in() { nodes.set(0, AstNode {}) }'
+check_pool_write test-field tests/test_pool_reader.bl 'fn rekind() { nodes[0].kind = 3 }'
+check_pool_write lib-qualified lib/std/pool_user.bl 'fn drop_one() { let _ = parser.nodes.pop() }'
+
+# A steady write that the baseline and HEAD~1 already hold still fails.
+POOL_STEADY="$WORK/pool_steady"
+rm -rf "$POOL_STEADY"
+cp -r "$BASE" "$POOL_STEADY"
+printf '%s\n' 'fn drop_one() { let _ = nodes.pop() }' >> "$POOL_STEADY/tests/test_pool_reader.bl"
+POOL_STEADY_BASELINE="$WORK/pool_steady_baseline.txt"
+RATCHET_SRC_DIR="$POOL_STEADY" RATCHET_BASELINE="$POOL_STEADY_BASELINE" ./scripts/ratchet.sh --update > /dev/null
+if RATCHET_SRC_DIR="$POOL_STEADY" RATCHET_BASELINE="$POOL_STEADY_BASELINE" RATCHET_HEAD1_DIR="$POOL_STEADY" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL node_pool_writes-absolute-zero: baseline=1, head~1=1, now=1 should still fail"
+  fail=1
+else
+  echo "PASS node_pool_writes-absolute-zero: a steady pool write fails even though it does not increase"
+fi
+
+# A file's own list that is named `nodes` is not the pool.
+POOL_LOCAL="$WORK/pool_local_list"
+rm -rf "$POOL_LOCAL"
+cp -r "$BASE" "$POOL_LOCAL"
+printf '%s\n' 'fn more(nodes: List[Int]) { nodes.push(2) }' >> "$POOL_LOCAL/src/free_names.bl"
+if ! RATCHET_SRC_DIR="$POOL_LOCAL" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL node_pool_writes-local-list: a push to a local list named nodes was counted"
+  fail=1
+else
+  echo "PASS node_pool_writes-local-list: a local list named nodes is not counted"
+fi
 
 # br_ids_in_source is an absolute zero gate: it must fail even when the
 # baseline and HEAD~1 both already read 1, where the plain non-increasing
