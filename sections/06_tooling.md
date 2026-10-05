@@ -1129,7 +1129,7 @@ Use the inline `handler E { fn op(...) { calls.push(...) } }` pattern at the tes
 
 #### 8.10.4 Deterministic randomness: `--seed` and `mock_rand`
 
-Tests that call `rand.int`/`rand.float`/`rand.bytes` (the `Rand` effect, §4.3), and `prop_check` blocks that generate random inputs, are nondeterministic by default. A failure in CI cannot be reproduced locally without the inputs that triggered it. `std.testing` and the test runner together close this gap with two coupled mechanisms: a runner-level `--seed` flag for reproducing whole runs, and an in-test `mock_rand` controller for asserting on deterministic streams.
+Tests that call `rand.int`/`rand.float`/`rand.bytes` (the `Rand` effect, §4.4.7), and `prop_check` blocks that generate random inputs, are nondeterministic by default. A failure in CI cannot be reproduced locally without the inputs that triggered it. `std.testing` and the test runner together close this gap with two coupled mechanisms: a runner-level `--seed` flag for reproducing whole runs, and an in-test `mock_rand` controller for asserting on deterministic streams.
 
 ##### Runner flag: `blink test --seed <u64>`
 
@@ -1238,6 +1238,7 @@ Usage:
 
 ```blink
 import std.testing.{mock_rand, MockRand}
+import std.random.{shuffle}
 
 test "shuffle preserves length" {
     let r = mock_rand(0x1234)
@@ -1251,7 +1252,7 @@ test "shuffle preserves length" {
 
 **`.as_handler()` semantics.** `.as_handler()` returns the `Handler[Rand]` that `mock_rand` built. Each `rand.int`/`rand.float`/`rand.bytes` call through it advances the captured `state`. The method is **idempotent**: calling `r.as_handler()` twice on the same `MockRand`, or on a copy of it, returns the same handler value over the same captured state, not two independent streams. A second `with r.as_handler() { ... }` block continues the stream where the first one left off. For an independent stream from the same seed, construct a second `MockRand`.
 
-**`.draws()` semantics.** Returns the number of `rand.*` operations that have been served by this handler since construction or the last `reseed`. **One op call = one draw**, regardless of how many bytes or how many random values the op produces internally (`rand.bytes(64)` counts as one draw). The `.draws()` counter is intended as a coarse audit hook — "did this code path reach the RNG?" — and is explicitly **not stable across compiler versions**: a future PRNG-algorithm change or runtime optimization may change how individual ops decompose. Do not commit regression tests that assert exact draw counts as part of the property under test; use it for shape-of-behavior checks only.
+**`.draws()` semantics.** Returns the number of `rand.*` operations that have been served by this handler since construction or the last `reseed`. **One op call = one draw**, regardless of how many bytes or how many random values the op produces internally (`rand.bytes(64)` counts as one draw). Each `rand.*` wrapper makes exactly one op call (§4.4.7), so `shuffle` on five elements is four draws. The `.draws()` counter is intended as a coarse audit hook — "did this code path reach the RNG?" — and is explicitly **not stable across compiler versions**: a future PRNG-algorithm change or runtime optimization may change how individual ops decompose. Do not commit regression tests that assert exact draw counts as part of the property under test; use it for shape-of-behavior checks only.
 
 **`.reseed(seed)`.** Resets `state` to the given seed and zeroes `draw_count`. Useful for sub-loops in a single test that want fresh streams without constructing a new `MockRand`.
 
@@ -1261,11 +1262,11 @@ test "shuffle preserves length" {
 
 ##### PRNG algorithm
 
-`MockRand` and the runner's per-property RNG are **implementation-defined, deterministic given seed**. The choice is intentionally not in the spec surface — if a future `Rand` resolution names a specific generator for the production handler, the testing-side implementation will align without breaking the user-facing API. The reproduce-by-seed contract holds for any single compiler version; the spec does not guarantee bit-identical reproduction across major versions.
+`MockRand` and the runner's per-property RNG are **implementation-defined, deterministic given seed**. The spec names no algorithm. The `Rand` resolution (§4.4.7) names none for the default handler either, and the stdlib has no production seeded handler. If one is added later, it must name its algorithm and keep its stream stable across versions; this testing surface does not change. The reproduce-by-seed contract holds for any single compiler version; the spec does not guarantee bit-identical reproduction across major versions.
 
-##### Stated assumption about the `Rand` effect
+##### The `Rand` effect surface
 
-This design assumes the `Rand` effect (§4.3) keeps ops `rand.int` / `rand.float` / `rand.bytes` and gains no user-visible seeding op such as `rand.reseed(seed: U64)`. Seeding is a handler-installation concern — `mock_rand(seed).as_handler()` and `--seed`-derived runner handlers are both ways of installing a deterministic interpretation. If a future revision adds a stateful seeding op to the effect surface, `MockRand` will specify whether it traps or honors it as a follow-up.
+The `Rand` resolution (§4.4.7, [decisions/random-stdlib-module.md](../decisions/random-stdlib-module.md)) confirms the assumption this design rests on. `Rand` has exactly the ops `int` / `float` / `bytes` and no seed, reseed or fork op. Seeding is a handler-installation concern: `mock_rand(seed).as_handler()` and `--seed`-derived runner handlers both install a deterministic interpretation. A `MockRand` handler implements the three ops and nothing else.
 
 ##### Out of scope
 
