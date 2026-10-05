@@ -1,0 +1,85 @@
+// A selective import binds its spelling in the file that wrote it and nowhere else: a file
+// that never imported a name cannot reach it through a module that did. Within one file, two
+// imports that bind a spelling to the same declaration agree, and two that bind it to
+// different declarations make the spelling ambiguous.
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_import_binds_per_module_pkg"
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcimpbinds\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/alpha.bl", "pub fn tag_a() -> Int \{ 1 \}\n")
+    write_file("{PKG}/src/beta.bl", "pub fn tag_b() -> Int \{ 2 \}\n")
+    write_file("{PKG}/src/facade.bl", "pub import alpha.\{tag_a\}\n")
+    // user_two's module name starts with user's, so a lookup that matched module keys by
+    // prefix would hand one module the other's bindings.
+    write_file("{PKG}/src/user.bl", "import alpha.\{tag_a as t\}\npub fn use_t() -> Int \{ t() \}\n")
+    write_file("{PKG}/src/user_two.bl", "import beta.\{tag_b as u\}\npub fn use_u() -> Int \{ u() \}\n")
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+fn error_names() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d.name) }
+    }
+    out
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered.
+fn assert_errors(label: Str, want: List[Str]) {
+    let got = error_names()
+    let same = got.len() == want.len() && got.join("\n") == want.join("\n")
+    if !same {
+        io.eprintln("FAIL: {label}:\n  got:")
+        for e in got { io.eprintln("    {e}") }
+        io.eprintln("  want:")
+        for e in want { io.eprintln("    {e}") }
+    }
+    assert(same)
+}
+
+fn test_each_module_resolves_its_own_alias() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import user.\{use_t\}\nimport user_two.\{use_u\}\nfn main() \{\n    assert(use_t() == 1)\n    assert(use_u() == 2)\n\}\n")
+    assert_errors("user binds t to alpha, user_two binds u to beta", [])
+    cleanup()
+}
+
+fn test_an_alias_another_module_bound_is_not_in_scope_here() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import user.\{use_t\}\nimport user_two.\{use_u\}\nfn main() \{\n    assert(use_t() == 1)\n    assert(t() == 1)\n    assert(u() == 2)\n\}\n")
+    assert_errors("t and u are bound in user and user_two, not in probe",
+        ["ImportNotSelected", "ImportNotSelected"])
+    cleanup()
+}
+
+fn test_two_imports_of_one_declaration_agree() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{tag_a\}\nimport facade.\{tag_a\}\nfn main() \{ assert(tag_a() == 1) \}\n")
+    assert_errors("tag_a from alpha and through facade", [])
+    cleanup()
+}
+
+fn test_two_imports_binding_one_alias_to_two_declarations_are_ambiguous() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import alpha.\{tag_a as t\}\nimport beta.\{tag_b as t\}\nfn main() \{ assert(t() == 1) \}\n")
+    assert_errors("t bound to tag_a and to tag_b in one file", ["AmbiguousImport"])
+    cleanup()
+}
+
+fn main() {
+    test_each_module_resolves_its_own_alias()
+    test_an_alias_another_module_bound_is_not_in_scope_here()
+    test_two_imports_of_one_declaration_agree()
+    test_two_imports_binding_one_alias_to_two_declarations_are_ambiguous()
+    io.println("selective import binds only in the importing module: ok")
+}
