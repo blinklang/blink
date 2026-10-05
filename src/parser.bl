@@ -25,13 +25,25 @@ effect Parse {
 // ── Node pool ──────────────────────────────────────────────────────
 // Each node is an index into the nodes list. -1 means "no node".
 // Readers index `nodes` directly; only node_push, node_pop, node_replace and parser_reset
-// write it, because each of them also writes node_kinds.
+// write it, because each of them also writes the columns.
 pub let mut nodes: List[AstNode] = []
 
-// The kind of each node, indexed by node id. Walks ask a node's kind far more often than
-// anything else about it, and a read from this column touches 8 bytes where a read from the
-// pool loads a node hundreds of bytes wide, one cache miss per node.
-let mut node_kinds: List[Int] = []
+// Facts about each node kept beside the pool, so a walk that needs only these never loads
+// the wide node, one cache miss per node.
+// `kinds`: the kind of each node, indexed by node id. Walks ask a node's kind far more often
+// than anything else about it.
+// `child_slots`: each node's children as ChildWalk.Slots writes them, one run per node. A
+// sublist stays one slot and is expanded when read, so a member appended to a sublist after
+// its owner exists is still seen.
+// `child_at`: where node id's run in child_slots starts and how long it is, packed as
+// start << 8 | count. A write that changes a node's children appends a new run and leaves
+// the old one unread.
+type NodeColumns {
+    kinds: List[Int]
+    child_at: List[Int]
+    child_slots: List[Int]
+}
+let mut columns: NodeColumns = NodeColumns { kinds: [], child_at: [], child_slots: [] }
 
 // Sublists: for lists of node references (params, args, stmts, etc.). `lists` holds every
 // sublist by id; `open` is the stack of ids a parse has started and not yet finalized.
@@ -62,7 +74,7 @@ pub let mut source_module_for_node: Map[Int, Str] = Map()
 
 pub fn parser_reset() {
     nodes.clear()
-    node_kinds.clear()
+    columns = NodeColumns { kinds: [], child_at: [], child_slots: [] }
     sublists = SublistPool { lists: [], open: [] }
     annotation_nodes.clear()
     program_annotation_nodes.clear()
@@ -90,19 +102,88 @@ pub fn new_node(kind: NodeKind) -> Int ! Parse.Build {
 pub fn node_push(n: AstNode) -> Int {
     let id = nodes.len()
     nodes.push(n)
-    node_kinds.push(n.kind)
+    columns.kinds.push(n.kind)
+    columns.child_at.push(node_append_child_slots(id))
     id
 }
 
 // Drops the newest node, as a caller that made a scratch node does to give its id back.
 pub fn node_pop() {
     let _ = nodes.pop()
-    let _ = node_kinds.pop()
+    let _ = columns.kinds.pop()
+    let at = columns.child_at.pop() ?? 0
+    if (at >> 8) + (at & 255) == columns.child_slots.len() {
+        node_drop_child_slots_from(at >> 8)
+    }
 }
 
 fn node_replace(id: Int, n: AstNode) {
     nodes.set(id, n)
-    node_kinds.set(id, n.kind)
+    columns.kinds.set(id, n.kind)
+    // Most setters change a field that is not a child, so a run equal to the old one is
+    // dropped again instead of growing the column on every write.
+    let old = columns.child_at[id]
+    let at = node_append_child_slots(id)
+    if node_child_runs_equal(old, at) {
+        node_drop_child_slots_from(at >> 8)
+    } else {
+        columns.child_at.set(id, at)
+    }
+}
+
+// Appends the child slots of nodes[id] to the tail of child_slots and returns the packed
+// start and count of that run.
+fn node_append_child_slots(id: Int) -> Int {
+    let start = columns.child_slots.len()
+    node_child_ids_into(nodes, id, ChildWalk.Slots, sublists.lists, columns.child_slots)
+    let count = columns.child_slots.len() - start
+    if count > 255 {
+        io.println("FATAL: node {id} has {count} children; child_at packs at most 255")
+        exit(1)
+    }
+    (start << 8) | count
+}
+
+fn node_drop_child_slots_from(start: Int) {
+    while columns.child_slots.len() > start {
+        let _ = columns.child_slots.pop()
+    }
+}
+
+fn node_child_runs_equal(a: Int, b: Int) -> Bool {
+    let count = a & 255
+    if count != (b & 255) { return false }
+    let mut i = 0
+    while i < count {
+        if columns.child_slots[(a >> 8) + i] != columns.child_slots[(b >> 8) + i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+// Appends to `out` the children of `id` on one side, read from the node's run of child
+// slots. `side` is 0 for value children and 2 for spellings, the slot's spelling bit.
+fn node_push_slot_children(id: Int, side: Int, out: List[Int]) {
+    let at = columns.child_at[id]
+    let mut i = at >> 8
+    let end = i + (at & 255)
+    while i < end {
+        let slot = columns.child_slots[i]
+        if (slot & 2) == side {
+            if (slot & 1) == 0 {
+                out.push(slot >> 2)
+            } else {
+                let members = sublists.lists[slot >> 2]
+                let mut k = 0
+                while k < members.len() {
+                    let m = members[k]
+                    if m != -1 { out.push(m) }
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
 }
 
 pub fn new_sublist() -> Int ! Parse.Build {
@@ -149,13 +230,13 @@ pub fn sublist_length(sl: Int) -> Int {
 // types walks these and stops at a spelling edge, where there is no value and so no type to
 // find. A walker that runs over every node passes one list down and reuses it.
 pub fn node_push_value_child_ids(id: Int, out: List[Int]) {
-    node_child_ids_into(nodes, checked_node_id(id, "node_push_value_child_ids"), ChildWalk.Value, sublists.lists, out)
+    node_push_slot_children(checked_node_id(id, "node_push_value_child_ids"), 0, out)
 }
 
 // Appends to `out` the children of `id` that spell a type: annotations, type parameters and
 // explicit type arguments. The complement of node_push_value_child_ids.
 pub fn node_push_spell_child_ids(id: Int, out: List[Int]) {
-    node_child_ids_into(nodes, checked_node_id(id, "node_push_spell_child_ids"), ChildWalk.Spell, sublists.lists, out)
+    node_push_slot_children(checked_node_id(id, "node_push_spell_child_ids"), 2, out)
 }
 
 // The children of `id` in VALUE position, as a new list.
@@ -351,7 +432,7 @@ fn node_die(id: Int, where: Str) {
     exit(2)
 }
 
-pub fn node_kind(id: Int) -> Int { node_kinds[checked_node_id(id, "node_kind")] }
+pub fn node_kind(id: Int) -> Int { columns.kinds[checked_node_id(id, "node_kind")] }
 pub fn node_int_val(id: Int) -> Int { nodes[checked_node_id(id, "node_int_val")].int_val }
 pub fn node_str_val(id: Int) -> Str { nodes[checked_node_id(id, "node_str_val")].str_val }
 pub fn node_name(id: Int) -> Str { nodes[checked_node_id(id, "node_name")].name }

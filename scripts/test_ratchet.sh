@@ -41,35 +41,50 @@ EOF
   cat > "$dir/src/typecheck.bl" <<'EOF'
 let mut named_type_map: Map[Str, Int] = Map()
 EOF
-  # The node pool with its four writers, a test that imports the pool across
+  # The node pool with its writers and its columns, a test that imports the pool across
   # lines and only reads it, and a file whose own local list is named `nodes`.
   cat > "$dir/src/parser.bl" <<'EOF'
 pub let mut nodes: List[AstNode] = []
-let mut node_kinds: List[Int] = []
+let mut columns: NodeColumns = NodeColumns { kinds: [], child_at: [], child_slots: [] }
 
 pub fn parser_reset() {
     nodes.clear()
-    node_kinds.clear()
+    columns = NodeColumns { kinds: [], child_at: [], child_slots: [] }
 }
 
 pub fn node_push(n: AstNode) -> Int {
     let id = nodes.len()
     nodes.push(n)
-    node_kinds.push(n.kind)
+    columns.kinds.push(n.kind)
+    columns.child_at.push(node_append_child_slots(id))
     id
 }
 
 pub fn node_pop() {
     let _ = nodes.pop()
-    let _ = node_kinds.pop()
+    let _ = columns.kinds.pop()
+    let _ = columns.child_at.pop()
+    node_drop_child_slots_from(0)
 }
 
 fn node_replace(id: Int, n: AstNode) {
     nodes.set(id, n)
-    node_kinds.set(id, n.kind)
+    columns.kinds.set(id, n.kind)
+    columns.child_at.set(id, node_append_child_slots(id))
 }
 
-pub fn node_kind(id: Int) -> Int { node_kinds[id] }
+fn node_append_child_slots(id: Int) -> Int {
+    columns.child_slots.push(id)
+    0
+}
+
+fn node_drop_child_slots_from(start: Int) {
+    let _ = columns.child_slots.pop()
+}
+
+pub fn node_kind(id: Int) -> Int { columns.kinds[id] }
+
+fn node_push_slot_children(id: Int, out: List[Int]) { out.push(columns.child_slots[columns.child_at[id]]) }
 EOF
   cat > "$dir/src/free_names.bl" <<'EOF'
 fn collect() {
@@ -215,7 +230,7 @@ check_row layout_decline_unhandled cname.bl     'let far = d.decline_reason
 diag_ice("TooLate", far)'
 
 # node_pool_writes is an absolute zero gate over src/, lib/ and tests/: each
-# write below bypasses the writers that keep node_kind's column in step with the
+# write below bypasses the writers that keep the columns in step with the
 # pool, and must fail on that row.
 check_pool_write() {
   label="$1"; file="$2"; extra="$3"
@@ -244,6 +259,11 @@ check_pool_write test-pop tests/test_pool_reader.bl 'fn drop_one() { let _ = nod
 check_pool_write test-set tests/test_pool_reader.bl 'fn swap_in() { nodes.set(0, AstNode {}) }'
 check_pool_write test-field tests/test_pool_reader.bl 'fn rekind() { nodes[0].kind = 3 }'
 check_pool_write lib-qualified lib/std/pool_user.bl 'fn drop_one() { let _ = parser.nodes.pop() }'
+check_pool_write parser-column-push src/parser.bl 'fn scratch() { columns.child_slots.push(0) }'
+check_pool_write parser-column-set src/parser.bl 'fn scratch() { columns.child_at.set(0, 1) }'
+check_pool_write parser-column-slot src/parser.bl 'fn scratch() { columns.kinds[0] = 3 }'
+check_pool_write parser-column-field src/parser.bl 'fn scratch() { columns.child_slots = [] }'
+check_pool_write parser-column-whole src/parser.bl 'fn scratch() { columns = NodeColumns { kinds: [], child_at: [], child_slots: [] } }'
 
 # A steady write that the baseline and HEAD~1 already hold still fails.
 POOL_STEADY="$WORK/pool_steady"

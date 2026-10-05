@@ -1,0 +1,162 @@
+// A child walk reads a node's children from slots kept beside the node pool, so the walk does
+// not run the per-kind child table again for every visit. The slots are right only if every
+// write to the pool writes them too: a setter that swaps a child, a pop then a push of another
+// shape at the same id, a reset, and every node a real parse and typecheck make. A sublist
+// stays a sublist in the slots, so a member the typecheck appends after the owner exists, the
+// way a keyword default fills an omitted argument, must show up as well.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import parser.{nodes, node_count, node_push, node_pop, node_kind, node_name, node_left, node_args, node_set_right, node_set_args, node_value_child_ids, node_spell_child_ids, sublist_of, sublist_get, sublist_length, parser_reset}
+import ast.{AstNode, NodeKind, node_children}
+import diagnostics.{diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn expand(refs: List[Int], lists: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for r in refs { out.push(r) }
+    for sl in lists {
+        let mut k = 0
+        while k < sublist_length(sl) {
+            let m = sublist_get(sl, k)
+            if m != -1 { out.push(m) }
+            k = k + 1
+        }
+    }
+    out
+}
+
+fn same(a: List[Int], b: List[Int]) -> Bool {
+    if a.len() != b.len() { return false }
+    let mut i = 0
+    while i < a.len() {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn agrees_at(i: Int) -> Bool {
+    let kids = node_children(nodes[i])
+    same(node_value_child_ids(i), expand(kids.refs, kids.lists)) && same(node_spell_child_ids(i), expand(kids.spell_refs, kids.spell_lists))
+}
+
+fn slots_agree() -> Bool {
+    let mut i = 0
+    while i < nodes.len() {
+        if !agrees_at(i) { return false }
+        i = i + 1
+    }
+    true
+}
+
+test "a pushed node reads back its children" {
+    let a = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let b = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let bin = node_push(AstNode { kind: NodeKind.BinOp, left: a, right: b, line: 1, col: 1 })
+    assert(same(node_value_child_ids(bin), [a, b]))
+    assert(slots_agree())
+    node_pop()
+    node_pop()
+    node_pop()
+}
+
+test "a setter that swaps a child reads the new child" {
+    let a = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let b = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let bin = node_push(AstNode { kind: NodeKind.BinOp, left: a, right: a, line: 1, col: 1 })
+    node_set_right(bin, b)
+    assert(same(node_value_child_ids(bin), [a, b]))
+    assert(slots_agree())
+    node_pop()
+    node_pop()
+    node_pop()
+}
+
+test "a setter that swaps a sublist reads the new members" {
+    let callee = node_push(AstNode { kind: NodeKind.Ident, name: "f", line: 1, col: 1 })
+    let x = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let y = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let call = node_push(AstNode { kind: NodeKind.Call, left: callee, args: sublist_of([x]), line: 1, col: 1 })
+    assert(same(node_value_child_ids(call), [callee, x]))
+    node_set_args(call, sublist_of([y, x]))
+    assert(same(node_value_child_ids(call), [callee, y, x]))
+    assert(slots_agree())
+    node_pop()
+    node_pop()
+    node_pop()
+    node_pop()
+}
+
+test "a pop then a push of another shape at the same id reads the new children" {
+    let a = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let first = node_push(AstNode { kind: NodeKind.UnaryOp, left: a, line: 1, col: 1 })
+    assert(same(node_value_child_ids(first), [a]))
+    node_pop()
+    let second = node_push(AstNode { kind: NodeKind.Ident, name: "x", line: 1, col: 1 })
+    assert_eq(second, first)
+    assert_eq(node_value_child_ids(second).len(), 0)
+    assert(slots_agree())
+    node_pop()
+    node_pop()
+}
+
+test "a reset empties the slots with the pool" {
+    let a = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let _ = node_push(AstNode { kind: NodeKind.UnaryOp, left: a, line: 1, col: 1 })
+    parser_reset()
+    assert_eq(node_count(), 0)
+    let b = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let neg = node_push(AstNode { kind: NodeKind.UnaryOp, left: b, line: 1, col: 1 })
+    assert_eq(neg, 1)
+    assert(same(node_value_child_ids(neg), [b]))
+    assert(slots_agree())
+    parser_reset()
+}
+
+test "every node a parse and a typecheck make reads back its children" {
+    init_embedded_stdlib()
+    let path = "build/child_slots_parse_probe.bl"
+    write_file(path, #"type Shape {
+    Circle(r: Int)
+    Square(s: Int)
+}
+
+fn area(s: Shape) -> Int {
+    match s {
+        Circle(r) => r * r * 3
+        Square(x) => x * x
+    }
+}
+
+fn zzscaled(n: Int, -- zzby: Int = 7) -> Int { n * zzby }
+
+fn main() {
+    let shapes: List[Shape] = [Circle(1), Square(2)]
+    for s in shapes { io.println("{zzscaled(area(s))}") }
+}
+"#)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    assert(nodes.len() > 50)
+    assert(slots_agree())
+
+    // The call omits `zzby`, so the typecheck appended the default to the call's argument
+    // sublist after the call node was pushed. The walk must see that appended argument.
+    let mut found = 0
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == NodeKind.Call && node_kind(node_left(i)) == NodeKind.Ident && node_name(node_left(i)) == "zzscaled" {
+            assert_eq(sublist_length(node_args(i)), 2)
+            let kids = node_value_child_ids(i)
+            assert_eq(kids.len(), 3)
+            assert_eq(kids[2], sublist_get(node_args(i), 1))
+            found = found + 1
+        }
+        i = i + 1
+    }
+    assert_eq(found, 1)
+}
