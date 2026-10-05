@@ -1,0 +1,167 @@
+// Str equality compares the recorded lengths first and then the bytes, and the Map hash
+// reads the same recorded bytes. Strs made in different ways must still compare equal
+// when their text matches, and must find each other as Map and Set keys. Each case also
+// pins the unequal pairs that a length check alone, or a byte check alone, would get wrong.
+
+@ffi("blink_strerror")
+@trusted(audit: "TEST-STR-EQ")
+fn runtime_strerror(code: Int) -> Str ! FFI {}
+
+@ffi("strerror")
+@trusted(audit: "TEST-STR-EQ")
+fn libc_strerror(code: Int) -> Str ! FFI {}
+
+@derive(Hash, Eq)
+type Named { name: Str, n: Int }
+
+let LONG: Str = "0123456789abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+fn built(parts: List[Str]) -> Str {
+    let mut sb = StringBuilder.new()
+    for p in parts {
+        sb.write(p)
+    }
+    sb.to_str()
+}
+
+// Each one makes "hello" in a different way.
+fn hellos() -> List[Str] {
+    let he = "he"
+    let llo = "llo"
+    let h = 'h'
+    [
+        "hello",
+        he.concat(llo),
+        "{he}{llo}",
+        "say hello!".slice(4, 9),
+        "say hello!".substring(4, 5),
+        built(["h", "el", "lo"]),
+        "  hello ".trim(),
+        "{h}ello",
+        "HELLO".to_lower(),
+    ]
+}
+
+test "equal text from different producers compares equal" {
+    let hs = hellos()
+    for a in hs {
+        for b in hs {
+            assert(a == b, "{a} == {b}")
+            assert(!(a != b), "{a} != {b}")
+        }
+    }
+}
+
+test "empty Strs from different producers compare equal" {
+    let empties = ["", "abc".slice(1, 1), "abc".substring(3, 0), built([]), "{""}", "   ".trim()]
+    for a in empties {
+        assert_eq(a.len(), 0)
+        for b in empties {
+            assert(a == b, "empty == empty")
+        }
+        assert(a != "a", "empty != a")
+        assert("a" != a, "a != empty")
+    }
+}
+
+test "a Str equals itself" {
+    let s = built(["x", "y"])
+    assert(s == s, "identity")
+    assert(LONG == LONG, "identity of a global")
+}
+
+test "a prefix is not equal to the longer Str" {
+    assert("ab" != "abc", "ab != abc")
+    assert("abc" != "ab", "abc != ab")
+    assert("" != "a", "empty != a")
+    let full = built(["ab", "c"])
+    assert(full.slice(0, 2) != full, "slice prefix != whole")
+    assert(full.slice(0, 2) == "ab", "slice prefix == ab")
+}
+
+test "same length, different bytes, is not equal" {
+    assert("abc" != "abd", "last byte")
+    assert("abc" != "xbc", "first byte")
+    assert("abc" != "aXc", "middle byte")
+    let changed = "{LONG.slice(0, 36)}!{LONG.slice(37, LONG.len())}"
+    assert_eq(changed.len(), LONG.len())
+    assert(changed != LONG, "one byte in the middle of a long Str")
+    let copy = "{LONG.slice(0, 36)}{LONG.slice(36, LONG.len())}"
+    assert(copy == LONG, "long Str rebuilt from two halves")
+}
+
+test "multi-byte UTF-8 text compares by bytes" {
+    let cafe = "café"
+    let built_cafe = built(["ca", "f", "é"])
+    assert(cafe == built_cafe, "same UTF-8 bytes")
+    assert_eq(cafe.len(), 5)
+    assert(cafe != "cafe", "accent differs")
+    assert("é" != "è", "same length, last byte differs")
+}
+
+test "Strs from C compare by their text" {
+    // blink_strerror returns a runtime Str; strerror returns a C string that the FFI
+    // boundary copies into a Str. Both must equal a Str made in Blink with that text.
+    let from_runtime = runtime_strerror(2)
+    let from_c = libc_strerror(2)
+    assert(from_runtime == from_c, "runtime Str == copied C string")
+    let rebuilt = built([from_c.slice(0, 3), from_c.slice(3, from_c.len())])
+    assert(rebuilt == from_c, "rebuilt == copied C string")
+    assert(from_c != "{from_c} ", "C string != C string plus a space")
+}
+
+test "a Map finds a key made by a different producer" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("hello", 1)
+    m.insert("hell", 2)
+    m.insert("helloo", 3)
+    m.insert("", 4)
+    m.insert(LONG, 5)
+    for h in hellos() {
+        assert_eq(m.get(h), Some(1))
+    }
+    for h in hellos() {
+        m.insert(h, 10)
+    }
+    assert_eq(m.len(), 5)
+    assert_eq(m.get(built(["he", "ll"])), Some(2))
+    assert_eq(m.get("hello".concat("o")), Some(3))
+    assert_eq(m.get("abc".slice(2, 2)), Some(4))
+    assert_eq(m.get("{LONG.slice(0, 10)}{LONG.slice(10, LONG.len())}"), Some(5))
+    assert_eq(m.get("hellp"), None)
+    assert_eq(m.get("hel"), None)
+}
+
+test "a Set holds one entry for equal text" {
+    let mut s: Set[Str] = Set()
+    for h in hellos() {
+        s.insert(h)
+    }
+    assert_eq(s.len(), 1)
+    assert(s.contains(built(["hel", "lo"])), "contains rebuilt")
+    assert(!s.contains("hell"), "prefix not contained")
+    assert(!s.contains("helloo"), "longer not contained")
+}
+
+test "a derived Hash key with a Str field finds a key made by a different producer" {
+    let mut m: Map[Named, Int] = Map()
+    m.insert(Named { name: "hello", n: 1 }, 7)
+    for h in hellos() {
+        assert_eq(m.get(Named { name: h, n: 1 }), Some(7))
+    }
+    assert_eq(m.get(Named { name: "hell", n: 1 }), None)
+    assert_eq(m.get(Named { name: "hello", n: 2 }), None)
+}
+
+test "match on a Str pattern compares by text" {
+    for h in hellos() {
+        let r = match h {
+            "hell" => 1
+            "jello" => 4
+            "hello" => 2
+            "helloo" => 3
+            _ => 0
+        }
+        assert_eq(r, 2)
+    }
+}

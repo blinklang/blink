@@ -1098,9 +1098,13 @@ BLINK_RT_FN int blink_str_eq(const char* a, const char* b);
 BLINK_RT_FN uint64_t blink_map_hash(const char* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN uint64_t blink_map_hash(const char* key) {
+    /* Bounded by the recorded length, the same bytes blink_str_eq compares, so
+       equal Strs hash equal. A Str holds no NUL, so this is the same value a
+       scan to the terminator gives. */
+    int64_t n = blink_str_len(key);
     uint64_t h = 14695981039346656037ULL;
-    for (const char* p = key; *p; p++) {
-        h ^= (uint64_t)(unsigned char)*p;
+    for (int64_t i = 0; i < n; i++) {
+        h ^= (uint64_t)(unsigned char)key[i];
         h *= 1099511628211ULL;
     }
     return h;
@@ -2447,6 +2451,12 @@ BLINK_RT_FN int blink_str_next_char(const char* s, int64_t* pos, int32_t* out) {
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len) {
+    /* A start or a count past the end keeps only what s has, as blink_str_slice
+       does, so the copy stays inside s and the header counts the bytes copied. */
+    int64_t slen = blink_str_len(s);
+    if (start < 0) start = 0;
+    if (start >= slen || len <= 0) return BLINK_STR_EMPTY;
+    if (len > slen - start) len = slen - start;
     char* buf = blink_str_alloc(len);
     memcpy(buf, s + start, (size_t)len);
     return buf;
@@ -2630,18 +2640,29 @@ BLINK_RT_FN const char* blink_str_concat(const char* a, const char* b) {
 BLINK_RT_FN const char* blink_str_format(const char* fmt, ...);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
+    /* Most results fit the stack buffer, so they take one formatting pass and
+       a copy. Only a longer result formats a second time, from ap2. */
+    char small[256];
     va_list ap; va_start(ap, fmt);
     va_list ap2; va_copy(ap2, ap);
-    int needed = vsnprintf(NULL, 0, fmt, ap);
+    int needed = vsnprintf(small, sizeof small, fmt, ap);
     va_end(ap);
     if (needed < 0) { va_end(ap2); return BLINK_STR_EMPTY; }
+    /* A %c of a NUL or a %s of a non-Str could put a NUL inside; a Str ends
+       at its first one. */
+    if ((size_t)needed < sizeof small) {
+        va_end(ap2);
+        const char* nul = (const char*)memchr(small, '\0', (size_t)needed);
+        int64_t real = nul ? (int64_t)(nul - small) : (int64_t)needed;
+        char* buf = blink_str_alloc(real);
+        memcpy(buf, small, (size_t)real);
+        return buf;
+    }
     char* buf = blink_str_alloc((int64_t)needed);
     vsnprintf(buf, (size_t)needed + 1, fmt, ap2);
     va_end(ap2);
-    /* A %c of a NUL or a %s of a non-Str could put a NUL inside; a Str ends
-       at its first one. */
-    int64_t real = (int64_t)strlen(buf);
-    if (real != (int64_t)needed) blink_str_shrink(buf, real);
+    const char* nul = (const char*)memchr(buf, '\0', (size_t)needed);
+    if (nul) blink_str_shrink(buf, (int64_t)(nul - buf));
     return buf;
 }
 #endif
@@ -2649,7 +2670,13 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b) {
-    return strcmp(a, b) == 0;
+    /* Most unequal pairs differ in length, which the header answers without
+       reading the bytes. blink_str_len checks both headers, so a C string that
+       reached Blink without a copy stops here as it would at .len(). */
+    if (a == b) return 1;
+    int64_t n = blink_str_len(a);
+    if (n != blink_str_len(b)) return 0;
+    return memcmp(a, b, (size_t)n) == 0;
 }
 #endif
 
