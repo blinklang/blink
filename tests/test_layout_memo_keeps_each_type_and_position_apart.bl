@@ -1,0 +1,118 @@
+// layout_of caches one record per (type, position). A record asked for after a full
+// cache must be the record an empty cache computes: two pairs that shared a cache row
+// would hand the second asker the first one's answer, and only the order of the asks
+// would show it.
+import layout.{layout_of, layout_reset, Position, SlotForm, LayoutRecord}
+import cname_test_helpers.{assert_eq_str, tid_of, compile_probe}
+
+fn probe_src() -> Str {
+    #"type Point {
+    x: Int
+    y: Int
+}
+
+fn main() {
+    let i: Int = 1
+    let f: Float = 2.5
+    let s: Str = "s"
+    let b: Bool = true
+    let p = Point { x: i, y: 2 }
+    let o: Option[Int] = Some(i)
+    let xs: List[Int] = [i]
+    assert(b && f > 0.0 && s.len() == 1 && p.x == 1 && o.is_some() && xs.len() == 1)
+}
+"#
+}
+
+fn positions() -> List[Position] {
+    [Position.Local, Position.Field, Position.Param, Position.Return,
+        Position.ContainerSlot, Position.VtableSlot, Position.TupleElem]
+}
+
+fn form_name(f: SlotForm) -> Str {
+    match f {
+        SlotForm.Inline => "inline"
+        SlotForm.PointerBoxed => "boxed"
+        SlotForm.InlineWord => "word"
+    }
+}
+
+fn fingerprint(r: LayoutRecord) -> Str {
+    "{r.c_spelling}|{form_name(r.slot_form)}|{r.carrier_tag}|{r.is_transparent}|{r.kops_table}|{r.kops_inline_key}|{r.slot_word}|{r.decline_reason}"
+}
+
+fn probe_tids() -> List[Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let m = compile_probe("layout_memo_keys", probe_src())
+    // The low tids are adjacent, so a key that let one tid run into the next is reached.
+    let mut tids: List[Int] = []
+    let mut t = 0
+    while t < 16 {
+        tids.push(t)
+        t = t + 1
+    }
+    for key in ["Int", "Float", "Str", "Bool", "Point", "Option[Int]", "List[Int]"] {
+        tids.push(tid_of(m, key))
+    }
+    tids
+}
+
+// Each pair is first asked of an empty cache, so its answer cannot come from another row.
+fn fresh_answers(tids: List[Int]) -> List[Str] {
+    let mut out: List[Str] = []
+    for tid in tids {
+        for pos in positions() {
+            layout_reset()
+            out.push(fingerprint(layout_of(tid, pos)))
+        }
+    }
+    out
+}
+
+test "a full cache answers every type and position as an empty one does" {
+    let tids = probe_tids()
+    let fresh = fresh_answers(tids)
+    layout_reset()
+    let mut i = 0
+    for tid in tids {
+        for pos in positions() {
+            assert_eq_str("tid {tid} position {i % 7}", fingerprint(layout_of(tid, pos)), fresh.get(i).unwrap())
+            i = i + 1
+        }
+    }
+}
+
+// Asked in the reverse order, a pair that shares a row with an earlier pair shows a
+// different earlier pair's answer, so both orders are checked.
+test "the answers do not depend on the order the pairs are asked in" {
+    let tids = probe_tids()
+    let fresh = fresh_answers(tids)
+    layout_reset()
+    let per = positions().len()
+    let mut i = tids.len() * per
+    while i > 0 {
+        i = i - 1
+        let tid = tids.get(i / per).unwrap()
+        let pos = positions().get(i % per).unwrap()
+        assert_eq_str("tid {tid} position {i % per}", fingerprint(layout_of(tid, pos)), fresh.get(i).unwrap())
+    }
+}
+
+// The probe has to reach answers that differ by position, or a cache that ignored the
+// position would pass both rows above.
+test "the probe reaches answers that differ by position" {
+    let tids = probe_tids()
+    let fresh = fresh_answers(tids)
+    let per = positions().len()
+    let mut differs = false
+    let mut t = 0
+    while t < tids.len() {
+        let base = fresh.get(t * per).unwrap()
+        let mut p = 1
+        while p < per {
+            if fresh.get(t * per + p).unwrap() != base { differs = true }
+            p = p + 1
+        }
+        t = t + 1
+    }
+    assert(differs)
+}
