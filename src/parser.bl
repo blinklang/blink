@@ -24,11 +24,23 @@ effect Parse {
 
 // ── Node pool ──────────────────────────────────────────────────────
 // Each node is an index into the nodes list. -1 means "no node".
+// Readers index `nodes` directly; only node_push, node_pop, node_replace and parser_reset
+// write it, because each of them also writes node_kinds.
 pub let mut nodes: List[AstNode] = []
 
-// Sublists: for lists of node references (params, args, stmts, etc.)
-let mut sl_data: List[List[Int]] = []
-let mut sl_stack: List[Int] = []
+// The kind of each node, indexed by node id. Walks ask a node's kind far more often than
+// anything else about it, and a read from this column touches 8 bytes where a read from the
+// pool loads a node hundreds of bytes wide, one cache miss per node.
+let mut node_kinds: List[Int] = []
+
+// Sublists: for lists of node references (params, args, stmts, etc.). `lists` holds every
+// sublist by id; `open` is the stack of ids a parse has started and not yet finalized.
+type SublistPool {
+    lists: List[List[Int]]
+    open: List[Int]
+}
+
+let mut sublists: SublistPool = SublistPool { lists: [], open: [] }
 
 let mut annotation_nodes: List[Int] = []
 let mut program_annotation_nodes: List[Int] = []
@@ -50,8 +62,8 @@ pub let mut source_module_for_node: Map[Int, Str] = Map()
 
 pub fn parser_reset() {
     nodes.clear()
-    sl_data.clear()
-    sl_stack.clear()
+    node_kinds.clear()
+    sublists = SublistPool { lists: [], open: [] }
     annotation_nodes.clear()
     program_annotation_nodes.clear()
     source_module_for_node.clear()
@@ -71,48 +83,65 @@ pub fn node_source_module(id: Int) -> Str {
 }
 
 pub fn new_node(kind: NodeKind) -> Int ! Parse.Build {
-    let id = node_count()
-    nodes.push(AstNode { kind: kind, line: peek_line(), col: peek_col() })
+    node_push(AstNode { kind: kind, line: peek_line(), col: peek_col() })
+}
+
+// Appends `n` to the pool and returns its id.
+pub fn node_push(n: AstNode) -> Int {
+    let id = nodes.len()
+    nodes.push(n)
+    node_kinds.push(n.kind)
     id
 }
 
+// Drops the newest node, as a caller that made a scratch node does to give its id back.
+pub fn node_pop() {
+    let _ = nodes.pop()
+    let _ = node_kinds.pop()
+}
+
+fn node_replace(id: Int, n: AstNode) {
+    nodes.set(id, n)
+    node_kinds.set(id, n.kind)
+}
+
 pub fn new_sublist() -> Int ! Parse.Build {
-    let id = sl_data.len()
+    let id = sublists.lists.len()
     let inner: List[Int] = []
-    sl_data.push(inner)
-    sl_stack.push(id)
+    sublists.lists.push(inner)
+    sublists.open.push(id)
     id
 }
 
 pub fn sublist_push(sl: Int, node_id: Int) ! Parse.Build {
-    if sl_stack.len() == 0 {
+    if sublists.open.len() == 0 {
         io.println("FATAL: sublist_push() called with no open sublist")
         exit(1)
     }
-    let mut items = sl_data.get(sl).unwrap()
+    let mut items = sublists.lists.get(sl).unwrap()
     items.push(node_id)
 }
 
 pub fn finalize_sublist(sl: Int) ! Parse.Build {
-    if sl_stack.len() == 0 {
+    if sublists.open.len() == 0 {
         io.println("FATAL: finalize_sublist() called with no open sublist")
         exit(1)
     }
-    let top = sl_stack.get(sl_stack.len() - 1).unwrap()
+    let top = sublists.open.get(sublists.open.len() - 1).unwrap()
     if top != sl {
         io.println("FATAL: finalize_sublist({sl}) but top of stack is {top}")
         exit(1)
     }
-    sl_stack.pop()
+    sublists.open.pop()
 }
 
 pub fn sublist_get(sl: Int, idx: Int) -> Int {
-    let items = sl_data.get(sl).unwrap()
+    let items = sublists.lists.get(sl).unwrap()
     items.get(idx).unwrap()
 }
 
 pub fn sublist_length(sl: Int) -> Int {
-    let items = sl_data.get(sl).unwrap()
+    let items = sublists.lists.get(sl).unwrap()
     items.len()
 }
 
@@ -120,13 +149,13 @@ pub fn sublist_length(sl: Int) -> Int {
 // types walks these and stops at a spelling edge, where there is no value and so no type to
 // find. A walker that runs over every node passes one list down and reuses it.
 pub fn node_push_value_child_ids(id: Int, out: List[Int]) {
-    node_child_ids_into(nodes, checked_node_id(id, "node_push_value_child_ids"), ChildWalk.Value, sl_data, out)
+    node_child_ids_into(nodes, checked_node_id(id, "node_push_value_child_ids"), ChildWalk.Value, sublists.lists, out)
 }
 
 // Appends to `out` the children of `id` that spell a type: annotations, type parameters and
 // explicit type arguments. The complement of node_push_value_child_ids.
 pub fn node_push_spell_child_ids(id: Int, out: List[Int]) {
-    node_child_ids_into(nodes, checked_node_id(id, "node_push_spell_child_ids"), ChildWalk.Spell, sl_data, out)
+    node_child_ids_into(nodes, checked_node_id(id, "node_push_spell_child_ids"), ChildWalk.Spell, sublists.lists, out)
 }
 
 // The children of `id` in VALUE position, as a new list.
@@ -202,38 +231,38 @@ pub fn get_str_named_arg(ann: Int, label: Str) -> Str {
 // `derives` becomes one @derive annotation, so the traits read the same as on the declaration
 // lib/std would have given.
 pub fn synth_struct_decl(name: Str, fnames: List[Str], ftypes: List[Str], derives: List[Str]) -> Int {
-    let flds = sl_data.len()
+    let flds = sublists.lists.len()
     let inner: List[Int] = []
-    sl_data.push(inner)
-    let mut items = sl_data.get(flds).unwrap()
+    sublists.lists.push(inner)
+    let mut items = sublists.lists.get(flds).unwrap()
     let mut i = 0
     while i < fnames.len() {
         let ta = node_count()
-        nodes.push(AstNode { kind: NodeKind.TypeAnn, name: ftypes.get(i).unwrap(), line: 0, col: 0 })
+        node_push(AstNode { kind: NodeKind.TypeAnn, name: ftypes.get(i).unwrap(), line: 0, col: 0 })
         let tf = node_count()
-        nodes.push(AstNode { kind: NodeKind.TypeField, name: fnames.get(i).unwrap(), value: ta, condition: -1, line: 0, col: 0 })
+        node_push(AstNode { kind: NodeKind.TypeField, name: fnames.get(i).unwrap(), value: ta, condition: -1, line: 0, col: 0 })
         items.push(tf)
         i = i + 1
     }
     let mut anns = -1
     if derives.len() > 0 {
-        let args = sl_data.len()
+        let args = sublists.lists.len()
         let arg_inner: List[Int] = []
-        sl_data.push(arg_inner)
-        let mut arg_items = sl_data.get(args).unwrap()
+        sublists.lists.push(arg_inner)
+        let mut arg_items = sublists.lists.get(args).unwrap()
         for d in derives {
             let a = node_count()
-            nodes.push(AstNode { kind: NodeKind.Ident, name: d, line: 0, col: 0 })
+            node_push(AstNode { kind: NodeKind.Ident, name: d, line: 0, col: 0 })
             arg_items.push(a)
         }
         let ann = node_count()
-        nodes.push(AstNode { kind: NodeKind.Annotation, name: "derive", args: args, line: 0, col: 0 })
-        anns = sl_data.len()
+        node_push(AstNode { kind: NodeKind.Annotation, name: "derive", args: args, line: 0, col: 0 })
+        anns = sublists.lists.len()
         let ann_inner: List[Int] = [ann]
-        sl_data.push(ann_inner)
+        sublists.lists.push(ann_inner)
     }
     let td = node_count()
-    nodes.push(AstNode { kind: NodeKind.TypeDef, name: name, fields: flds, handlers: anns, line: 0, col: 0 })
+    node_push(AstNode { kind: NodeKind.TypeDef, name: name, fields: flds, handlers: anns, line: 0, col: 0 })
     td
 }
 
@@ -245,7 +274,7 @@ pub fn synth_struct_decl(name: Str, fnames: List[Str], ftypes: List[Str], derive
 // filled value turns out to be the wrong one.
 pub fn synth_named_arg(label: Str, value: Int, line: Int, col: Int) -> Int {
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.NamedArg, name: label, value: value, line: line, col: col })
+    node_push(AstNode { kind: NodeKind.NamedArg, name: label, value: value, line: line, col: col })
     nd
 }
 
@@ -253,15 +282,15 @@ pub fn synth_named_arg(label: Str, value: Int, line: Int, col: Int) -> Int {
 // stack is empty, which is the right guard while a parse is running and the wrong one after
 // it has finished.
 pub fn sublist_append(sl: Int, node_id: Int) {
-    let mut items = sl_data.get(sl).unwrap()
+    let mut items = sublists.lists.get(sl).unwrap()
     items.push(node_id)
 }
 
 // A sublist built after parsing, from members already in the pool. It stays off the sublist
 // stack for the reason sublist_append does: no parse is open for it to belong to.
 pub fn sublist_of(members: List[Int]) -> Int {
-    let id = sl_data.len()
-    sl_data.push(members)
+    let id = sublists.lists.len()
+    sublists.lists.push(members)
     id
 }
 
@@ -290,8 +319,8 @@ fn node_die(id: Int, where: Str) {
     let dump = env.var("BLINK_PARSER_PANIC_DUMP") ?? ""
     if dump != "" {
         let nlen = nodes.len()
-        let sl_len = sl_data.len()
-        io.eprintln("parser-dump: pos={pos} src='{diag_source_file}' sl_data.len={sl_len}")
+        let sl_len = sublists.lists.len()
+        io.eprintln("parser-dump: pos={pos} src='{diag_source_file}' sublists.len={sl_len}")
         // Tail of the node pool — last 32 kinds + line:col, oldest first.
         let mut start = nlen - 32
         if start < 0 { start = 0 }
@@ -309,7 +338,7 @@ fn node_die(id: Int, where: Str) {
         let mut max_sl = 0
         let mut max_sl_idx = -1
         while j < sl_len {
-            let items = sl_data.get(j).unwrap()
+            let items = sublists.lists.get(j).unwrap()
             let l = items.len()
             if l > max_sl {
                 max_sl = l
@@ -322,7 +351,7 @@ fn node_die(id: Int, where: Str) {
     exit(2)
 }
 
-pub fn node_kind(id: Int) -> Int { nodes[checked_node_id(id, "node_kind")].kind }
+pub fn node_kind(id: Int) -> Int { node_kinds[checked_node_id(id, "node_kind")] }
 pub fn node_int_val(id: Int) -> Int { nodes[checked_node_id(id, "node_int_val")].int_val }
 pub fn node_str_val(id: Int) -> Str { nodes[checked_node_id(id, "node_str_val")].str_val }
 pub fn node_name(id: Int) -> Str { nodes[checked_node_id(id, "node_name")].name }
@@ -385,266 +414,266 @@ pub fn node_xfail_reason(id: Int) -> Str { nodes[checked_node_id(id, "node_xfail
 // and the compiler driver (e.g. attaching pub/annotations after a nested
 // parse returns). New parser code should construct nodes directly:
 //   let nd = node_count()
-//   nodes.push(AstNode { kind: K, field: val, ..., line: peek_line(), col: peek_col() })
+//   node_push(AstNode { kind: K, field: val, ..., line: peek_line(), col: peek_col() })
 
 pub fn node_set_int_val(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_int_val")
-    nodes.set(id, AstNode { int_val: val, ..n })
+    node_replace(id, AstNode { int_val: val, ..n })
 }
 
 pub fn node_set_str_val(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_str_val")
-    nodes.set(id, AstNode { str_val: val, ..n })
+    node_replace(id, AstNode { str_val: val, ..n })
 }
 
 pub fn node_set_name(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_name")
-    nodes.set(id, AstNode { name: val, ..n })
+    node_replace(id, AstNode { name: val, ..n })
 }
 
 pub fn node_set_left(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_left")
-    nodes.set(id, AstNode { left: val, ..n })
+    node_replace(id, AstNode { left: val, ..n })
 }
 
 pub fn node_set_body(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_body")
-    nodes.set(id, AstNode { body: val, ..n })
+    node_replace(id, AstNode { body: val, ..n })
 }
 
 pub fn node_set_condition(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_condition")
-    nodes.set(id, AstNode { condition: val, ..n })
+    node_replace(id, AstNode { condition: val, ..n })
 }
 
 pub fn node_set_value(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_value")
-    nodes.set(id, AstNode { value: val, ..n })
+    node_replace(id, AstNode { value: val, ..n })
 }
 
 pub fn node_set_obj(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_obj")
-    nodes.set(id, AstNode { obj: val, ..n })
+    node_replace(id, AstNode { obj: val, ..n })
 }
 
 pub fn node_set_args(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_args")
-    nodes.set(id, AstNode { args: val, ..n })
+    node_replace(id, AstNode { args: val, ..n })
 }
 
 pub fn node_set_is_pub(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_is_pub")
-    nodes.set(id, AstNode { is_pub: val, ..n })
+    node_replace(id, AstNode { is_pub: val, ..n })
 }
 
 pub fn node_set_module(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_module")
-    nodes.set(id, AstNode { module: val, ..n })
+    node_replace(id, AstNode { module: val, ..n })
 }
 
 pub fn node_set_type_name(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_type_name")
-    nodes.set(id, AstNode { type_name: val, ..n })
+    node_replace(id, AstNode { type_name: val, ..n })
 }
 
 pub fn node_set_type_params(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_type_params")
-    nodes.set(id, AstNode { type_params: val, ..n })
+    node_replace(id, AstNode { type_params: val, ..n })
 }
 
 pub fn node_set_type_ann(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_type_ann")
-    nodes.set(id, AstNode { type_ann: val, ..n })
+    node_replace(id, AstNode { type_ann: val, ..n })
 }
 
 pub fn node_set_handlers(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_handlers")
-    nodes.set(id, AstNode { handlers: val, ..n })
+    node_replace(id, AstNode { handlers: val, ..n })
 }
 
 pub fn node_set_fields(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_fields")
-    nodes.set(id, AstNode { fields: val, ..n })
+    node_replace(id, AstNode { fields: val, ..n })
 }
 
 pub fn node_set_captures(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_captures")
-    nodes.set(id, AstNode { captures: val, ..n })
+    node_replace(id, AstNode { captures: val, ..n })
 }
 
 pub fn node_set_assoc_types(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_assoc_types")
-    nodes.set(id, AstNode { assoc_types: val, ..n })
+    node_replace(id, AstNode { assoc_types: val, ..n })
 }
 
 pub fn node_set_line(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_line")
-    nodes.set(id, AstNode { line: val, ..n })
+    node_replace(id, AstNode { line: val, ..n })
 }
 
 pub fn node_set_col(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_col")
-    nodes.set(id, AstNode { col: val, ..n })
+    node_replace(id, AstNode { col: val, ..n })
 }
 
 pub fn node_set_end_line(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_end_line")
-    nodes.set(id, AstNode { end_line: val, ..n })
+    node_replace(id, AstNode { end_line: val, ..n })
 }
 
 pub fn node_set_end_col(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_end_col")
-    nodes.set(id, AstNode { end_col: val, ..n })
+    node_replace(id, AstNode { end_col: val, ..n })
 }
 
 pub fn node_set_pos(id: Int, l: Int, c: Int) {
     let n = node_or_die(id, "node_set_pos")
-    nodes.set(id, AstNode { line: l, col: c, ..n })
+    node_replace(id, AstNode { line: l, col: c, ..n })
 }
 
 pub fn node_set_end_pos(id: Int, l: Int, c: Int) {
     let n = node_or_die(id, "node_set_end_pos")
-    nodes.set(id, AstNode { end_line: l, end_col: c, ..n })
+    node_replace(id, AstNode { end_line: l, end_col: c, ..n })
 }
 
 pub fn node_set_leading_comments(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_leading_comments")
-    nodes.set(id, AstNode { leading_comments: val, ..n })
+    node_replace(id, AstNode { leading_comments: val, ..n })
 }
 
 pub fn node_set_trailing_comments(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_trailing_comments")
-    nodes.set(id, AstNode { trailing_comments: val, ..n })
+    node_replace(id, AstNode { trailing_comments: val, ..n })
 }
 
 pub fn node_set_doc_comment(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_doc_comment")
-    nodes.set(id, AstNode { doc_comment: val, ..n })
+    node_replace(id, AstNode { doc_comment: val, ..n })
 }
 
 pub fn node_set_params(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_params")
-    nodes.set(id, AstNode { params: val, ..n })
+    node_replace(id, AstNode { params: val, ..n })
 }
 
 pub fn node_set_stmts(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_stmts")
-    nodes.set(id, AstNode { stmts: val, ..n })
+    node_replace(id, AstNode { stmts: val, ..n })
 }
 
 pub fn node_set_arms(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_arms")
-    nodes.set(id, AstNode { arms: val, ..n })
+    node_replace(id, AstNode { arms: val, ..n })
 }
 
 pub fn node_set_methods(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_methods")
-    nodes.set(id, AstNode { methods: val, ..n })
+    node_replace(id, AstNode { methods: val, ..n })
 }
 
 pub fn node_set_elements(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_elements")
-    nodes.set(id, AstNode { elements: val, ..n })
+    node_replace(id, AstNode { elements: val, ..n })
 }
 
 pub fn node_set_effects(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_effects")
-    nodes.set(id, AstNode { effects: val, ..n })
+    node_replace(id, AstNode { effects: val, ..n })
 }
 
 pub fn node_set_op(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_op")
-    nodes.set(id, AstNode { op: val, ..n })
+    node_replace(id, AstNode { op: val, ..n })
 }
 
 pub fn node_set_right(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_right")
-    nodes.set(id, AstNode { right: val, ..n })
+    node_replace(id, AstNode { right: val, ..n })
 }
 
 pub fn node_set_target(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_target")
-    nodes.set(id, AstNode { target: val, ..n })
+    node_replace(id, AstNode { target: val, ..n })
 }
 
 pub fn node_set_then_body(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_then_body")
-    nodes.set(id, AstNode { then_body: val, ..n })
+    node_replace(id, AstNode { then_body: val, ..n })
 }
 
 pub fn node_set_else_body(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_else_body")
-    nodes.set(id, AstNode { else_body: val, ..n })
+    node_replace(id, AstNode { else_body: val, ..n })
 }
 
 pub fn node_set_scrutinee(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_scrutinee")
-    nodes.set(id, AstNode { scrutinee: val, ..n })
+    node_replace(id, AstNode { scrutinee: val, ..n })
 }
 
 pub fn node_set_pattern(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_pattern")
-    nodes.set(id, AstNode { pattern: val, ..n })
+    node_replace(id, AstNode { pattern: val, ..n })
 }
 
 pub fn node_set_guard(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_guard")
-    nodes.set(id, AstNode { guard: val, ..n })
+    node_replace(id, AstNode { guard: val, ..n })
 }
 
 pub fn node_set_iterable(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_iterable")
-    nodes.set(id, AstNode { iterable: val, ..n })
+    node_replace(id, AstNode { iterable: val, ..n })
 }
 
 pub fn node_set_var_name(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_var_name")
-    nodes.set(id, AstNode { var_name: val, ..n })
+    node_replace(id, AstNode { var_name: val, ..n })
 }
 
 pub fn node_set_is_mut(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_is_mut")
-    nodes.set(id, AstNode { is_mut: val, ..n })
+    node_replace(id, AstNode { is_mut: val, ..n })
 }
 
 pub fn node_set_is_const(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_is_const")
-    nodes.set(id, AstNode { is_const: val, ..n })
+    node_replace(id, AstNode { is_const: val, ..n })
 }
 
 pub fn node_set_inclusive(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_inclusive")
-    nodes.set(id, AstNode { inclusive: val, ..n })
+    node_replace(id, AstNode { inclusive: val, ..n })
 }
 
 pub fn node_set_start(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_start")
-    nodes.set(id, AstNode { start: val, ..n })
+    node_replace(id, AstNode { start: val, ..n })
 }
 
 pub fn node_set_end(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_end")
-    nodes.set(id, AstNode { end: val, ..n })
+    node_replace(id, AstNode { end: val, ..n })
 }
 
 pub fn node_set_method(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_method")
-    nodes.set(id, AstNode { method: val, ..n })
+    node_replace(id, AstNode { method: val, ..n })
 }
 
 pub fn node_set_index(id: Int, val: Int) {
     let n = node_or_die(id, "node_set_index")
-    nodes.set(id, AstNode { index: val, ..n })
+    node_replace(id, AstNode { index: val, ..n })
 }
 
 pub fn node_set_return_type(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_return_type")
-    nodes.set(id, AstNode { return_type: val, ..n })
+    node_replace(id, AstNode { return_type: val, ..n })
 }
 
 pub fn node_set_trait_name(id: Int, val: Str) {
     let n = node_or_die(id, "node_set_trait_name")
-    nodes.set(id, AstNode { trait_name: val, ..n })
+    node_replace(id, AstNode { trait_name: val, ..n })
 }
 
 // ── Token input ─────────────────────────────────────────────────────
@@ -829,7 +858,7 @@ fn maybe_desugar_expect_panic(decl: Int) ! Parse.Build {
     let body_end_c = node_end_col(body)
 
     let ap_id = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.AssertPanics,
         body: body, value: match_expr,
         line: decl_line, col: decl_col,
@@ -840,7 +869,7 @@ fn maybe_desugar_expect_panic(decl: Int) ! Parse.Build {
     sublist_push(stmts, ap_id)
     finalize_sublist(stmts)
     let block_id = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.Block, stmts: stmts,
         line: decl_line, col: decl_col,
         end_line: body_end_l, end_col: body_end_c,
@@ -878,7 +907,7 @@ fn parse_import_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 item_alias = expect_value(TokenKind.Ident)
             }
             let name_node = node_count()
-            nodes.push(AstNode {
+            node_push(AstNode {
                 kind: NodeKind.Ident, name: item_name, str_val: item_alias,
                 line: item_line, col: item_col,
             })
@@ -894,7 +923,7 @@ fn parse_import_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     }
 
     let node = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.ImportStmt, str_val: path, args: names_sl,
         line: imp_line, col: imp_col,
     })
@@ -939,7 +968,7 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                         } else {
                             let val_name = expect_value(TokenKind.Ident)
                             let kv_nd = node_count()
-                            nodes.push(AstNode { kind: NodeKind.Ident, name: full_arg.concat(":").concat(val_name), line: peek_line(), col: peek_col() })
+                            node_push(AstNode { kind: NodeKind.Ident, name: full_arg.concat(":").concat(val_name), line: peek_line(), col: peek_col() })
                             ann_arg_nodes.push(kv_nd)
                         }
                     } else {
@@ -949,7 +978,7 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                             full_arg = full_arg.concat(".").concat(child)
                         }
                         let arg_nd = node_count()
-                        nodes.push(AstNode { kind: NodeKind.Ident, name: full_arg, line: peek_line(), col: peek_col() })
+                        node_push(AstNode { kind: NodeKind.Ident, name: full_arg, line: peek_line(), col: peek_col() })
                         ann_arg_nodes.push(arg_nd)
                     }
                 }
@@ -972,7 +1001,7 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
     }
     let ann_nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.Annotation, name: ann_name, args: ann_args_sl,
         line: ann_start_line, col: ann_start_col,
     })
@@ -1226,7 +1255,7 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
         finalize_sublist(tests_sl)
     }
     let prog = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.Program,
         params: fns, fields: types, stmts: lets, arms: traits,
         methods: impls, elements: imports, args: effect_decls,
@@ -1259,7 +1288,7 @@ fn parse_type_params() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         finalize_sublist(bounds_sl)
     }
     let tp = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.TypeParam, name: pname, elements: bounds_sl,
         line: peek_line(), col: peek_col(),
     })
@@ -1281,7 +1310,7 @@ fn parse_type_params() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             finalize_sublist(bs2)
         }
         let tp2 = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.TypeParam, name: pn2, elements: bs2,
             line: peek_line(), col: peek_col(),
         })
@@ -1310,7 +1339,7 @@ fn parse_where_constraint() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         finalize_sublist(bounds_sl)
     }
     let tp = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.TypeParam, name: cname, elements: bounds_sl,
         line: peek_line(), col: peek_col(),
     })
@@ -1347,7 +1376,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             }
         }
         let td = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.TypeDef,
             name: name, type_params: tparams,
             value: alias_type, condition: where_expr,
@@ -1405,7 +1434,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                     tf_default = parse_expr()
                 }
                 let tf = node_count()
-                nodes.push(AstNode {
+                node_push(AstNode {
                     kind: NodeKind.TypeField,
                     name: fname, value: type_ann, condition: tf_default,
                     line: tf_line, col: tf_col,
@@ -1445,7 +1474,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                         // the formatter round-trips `Variant(Type)` rather than leaking
                         // the synthesized name as `Variant(_0: Type)`.
                         let is_positional = if is_named != 0 { 0 } else { 1 }
-                        nodes.push(AstNode {
+                        node_push(AstNode {
                             kind: NodeKind.TypeField, name: vf_name, value: vf_type,
                             int_val: is_positional,
                             line: vf_line, col: vf_col,
@@ -1465,7 +1494,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 skip_newlines_and_comments()
                 expect(TokenKind.RParen)
                 let tv = node_count()
-                nodes.push(AstNode {
+                node_push(AstNode {
                     kind: NodeKind.TypeVariant, name: fname, fields: vflds,
                     line: peek_line(), col: peek_col(),
                 })
@@ -1486,7 +1515,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                     expect(TokenKind.Colon)
                     let vf_type = parse_type_annotation()
                     let vf = node_count()
-                    nodes.push(AstNode {
+                    node_push(AstNode {
                         kind: NodeKind.TypeField, name: vf_name, value: vf_type,
                         line: peek_line(), col: peek_col(),
                     })
@@ -1500,7 +1529,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 expect(TokenKind.RBrace)
                 let tv = node_count()
                 // int_val = 1: reuse shared AstNode flag to distinguish struct-style from tuple-style
-                nodes.push(AstNode {
+                node_push(AstNode {
                     kind: NodeKind.TypeVariant, name: fname, fields: vflds, int_val: 1,
                     line: peek_line(), col: peek_col(),
                 })
@@ -1522,7 +1551,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                     }
                 }
                 let tv = node_count()
-                nodes.push(AstNode {
+                node_push(AstNode {
                     kind: NodeKind.TypeVariant, name: fname, str_val: tv_str,
                     line: tv_line, col: tv_col,
                 })
@@ -1539,7 +1568,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         finalize_sublist(flds)
     }
     let td = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.TypeDef,
         name: name, fields: flds, type_params: tparams,
         line: td_start_line, col: td_start_col,
@@ -1559,7 +1588,7 @@ fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         sublist_push(elems, inner)
         finalize_sublist(elems)
         let ta = node_count()
-        nodes.push(AstNode { kind: NodeKind.TypeAnn, name: "List", elements: elems, line: peek_line(), col: peek_col() })
+        node_push(AstNode { kind: NodeKind.TypeAnn, name: "List", elements: elems, line: peek_line(), col: peek_col() })
         return ta
     }
     if at(TokenKind.LParen) {
@@ -1570,7 +1599,7 @@ fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             // The unit type is the 0-tuple, and it is the type an omitted return type
             // already names, so it is spelled here the way that one is.
             let ua = node_count()
-            nodes.push(AstNode { kind: NodeKind.TypeAnn, name: "Void", line: peek_line(), col: peek_col() })
+            node_push(AstNode { kind: NodeKind.TypeAnn, name: "Void", line: peek_line(), col: peek_col() })
             return ua
         }
         let elems = new_sublist()
@@ -1584,7 +1613,7 @@ fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         expect(TokenKind.RParen)
         finalize_sublist(elems)
         let ta = node_count()
-        nodes.push(AstNode { kind: NodeKind.TypeAnn, name: "Tuple", elements: elems, line: peek_line(), col: peek_col() })
+        node_push(AstNode { kind: NodeKind.TypeAnn, name: "Tuple", elements: elems, line: peek_line(), col: peek_col() })
         return ta
     }
     if at(TokenKind.Fn) {
@@ -1613,7 +1642,7 @@ fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             ret_ann = rt
         }
         let ta = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.TypeAnn, name: "Fn", elements: elems,
             return_type: ret_name, type_ann: ret_ann,
             line: peek_line(), col: peek_col(),
@@ -1629,7 +1658,7 @@ fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         sublist_push(elems, eff_ann)
         finalize_sublist(elems)
         let ta = node_count()
-        nodes.push(AstNode { kind: NodeKind.TypeAnn, name: "Handler", elements: elems, line: peek_line(), col: peek_col() })
+        node_push(AstNode { kind: NodeKind.TypeAnn, name: "Handler", elements: elems, line: peek_line(), col: peek_col() })
         return ta
     }
     let mut name = expect_value(TokenKind.Ident)
@@ -1652,14 +1681,14 @@ fn parse_type_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         finalize_sublist(elems)
     }
     let ta = node_count()
-    nodes.push(AstNode { kind: NodeKind.TypeAnn, name: name, elements: elems, line: peek_line(), col: peek_col() })
+    node_push(AstNode { kind: NodeKind.TypeAnn, name: name, elements: elems, line: peek_line(), col: peek_col() })
     if at(TokenKind.Question) {
         advance()
         let inner_sl = new_sublist()
         sublist_push(inner_sl, ta)
         finalize_sublist(inner_sl)
         let opt = node_count()
-        nodes.push(AstNode { kind: NodeKind.TypeAnn, name: "Option", elements: inner_sl, line: peek_line(), col: peek_col() })
+        node_push(AstNode { kind: NodeKind.TypeAnn, name: "Option", elements: inner_sl, line: peek_line(), col: peek_col() })
         return opt
     }
     ta
@@ -1696,7 +1725,7 @@ fn parse_effect_op_sig() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         ret_ann = rt
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.FnDef,
         name: op_name, params: params_sl,
         return_type: ret_str, type_ann: ret_ann,
@@ -1732,7 +1761,7 @@ fn parse_effect_decl() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 finalize_sublist(child_methods_sl)
             }
             let child = node_count()
-            nodes.push(AstNode {
+            node_push(AstNode {
                 kind: NodeKind.EffectDecl, name: child_name, methods: child_methods_sl,
                 line: peek_line(), col: peek_col(),
             })
@@ -1746,14 +1775,14 @@ fn parse_effect_decl() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         expect(TokenKind.RBrace)
         finalize_sublist(children_sl)
         let nd = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.EffectDecl, name: name, elements: children_sl,
             line: eff_start_line, col: eff_start_col,
         })
         return nd
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.EffectDecl, name: name,
         line: eff_start_line, col: eff_start_col,
     })
@@ -1816,7 +1845,7 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             eff_name = eff_name.concat(".").concat(expect_value(TokenKind.Ident))
         }
         let eff = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: eff_name, line: peek_line(), col: peek_col() })
+        node_push(AstNode { kind: NodeKind.Ident, name: eff_name, line: peek_line(), col: peek_col() })
         sublist_push(effects_sl, eff)
         while at(TokenKind.Comma) {
             advance()
@@ -1827,7 +1856,7 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 eff_name2 = eff_name2.concat(".").concat(expect_value(TokenKind.Ident))
             }
             let eff2 = node_count()
-            nodes.push(AstNode { kind: NodeKind.Ident, name: eff_name2, line: peek_line(), col: peek_col() })
+            node_push(AstNode { kind: NodeKind.Ident, name: eff_name2, line: peek_line(), col: peek_col() })
             sublist_push(effects_sl, eff2)
         }
         finalize_sublist(effects_sl)
@@ -1847,7 +1876,7 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.FnDef,
         name: name, params: params, body: body_id,
         return_type: ret_str, type_params: tparams,
@@ -1892,7 +1921,7 @@ fn parse_test_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         tb_end_c = node_end_col(body)
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.TestBlock,
         str_val: test_name, name: test_name, body: body,
         line: test_start_line, col: test_start_col,
@@ -1982,7 +2011,7 @@ fn parse_test_failing_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         tf_end_c = node_end_col(body)
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.TestBlock,
         str_val: test_name, name: test_name, body: body,
         xfail_reason: reason, int_val: 1,
@@ -2022,7 +2051,7 @@ fn parse_param() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         default_id = parse_expr()
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.Param,
         name: name, type_name: type_str,
         is_mut: is_mut, type_ann: type_ann_id,
@@ -2075,7 +2104,7 @@ fn parse_closure() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     skip_newlines_and_comments()
     let body_id = parse_block()
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.Closure,
         params: params, body: body_id,
         return_type: ret_str, type_ann: ret_ann,
@@ -2141,7 +2170,7 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             let atype_name = expect_value(TokenKind.Ident)
             reject_pending_annotations("before associated type `{atype_name}`: an associated type takes no annotation", "remove the annotation, or move it above the method it belongs to")
             let at_node = node_count()
-            nodes.push(AstNode { kind: NodeKind.AssocType, name: atype_name, line: peek_line(), col: peek_col() })
+            node_push(AstNode { kind: NodeKind.AssocType, name: atype_name, line: peek_line(), col: peek_col() })
             sublist_push(assoc_types, at_node)
         } else {
             reject_body_token("trait `{name}`", 1)
@@ -2156,7 +2185,7 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     finalize_sublist(methods)
     finalize_sublist(assoc_types)
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.TraitDef,
         name: name, methods: methods, assoc_types: assoc_types,
         type_params: trait_type_args, supertraits: supertraits,
@@ -2250,7 +2279,7 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             let ta = parse_type_annotation()
             let concrete_name = node_name(ta)
             let at_node = node_count()
-            nodes.push(AstNode {
+            node_push(AstNode {
                 kind: NodeKind.AssocType,
                 name: atype_name, type_name: concrete_name, type_ann: ta,
                 line: peek_line(), col: peek_col(),
@@ -2269,7 +2298,7 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     finalize_sublist(methods)
     finalize_sublist(assoc_types)
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.ImplBlock,
         trait_name: trait_name, name: type_name,
         methods: methods, assoc_types: assoc_types,
@@ -2308,7 +2337,7 @@ fn parse_handler_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.RBrace)
     finalize_sublist(methods)
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.HandlerExpr, name: full_name, methods: methods,
         line: peek_line(), col: peek_col(),
     })
@@ -2332,7 +2361,7 @@ fn parse_with_item() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         if !at(TokenKind.As) {
             diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "expected `as <name>` after `{lhs_name} = <expr>` in with-clause, got {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), "")
             let wr = node_count()
-            nodes.push(AstNode {
+            node_push(AstNode {
                 kind: NodeKind.WithResource, value: rhs, name: lhs_name,
                 line: peek_line(), col: peek_col(),
             })
@@ -2350,7 +2379,7 @@ fn parse_with_item() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "with-clause binding name `{binding}` must match left side `{lhs_name}`", peek_line(), peek_col(), peek_end_col(), "")
         }
         let wr = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.WithResource, value: rhs, name: binding,
             line: peek_line(), col: peek_col(),
         })
@@ -2360,7 +2389,7 @@ fn parse_with_item() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         advance()
         let binding = expect_value(TokenKind.Ident)
         let wr = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.WithResource, value: expr, name: binding,
             line: peek_line(), col: peek_col(),
         })
@@ -2382,7 +2411,7 @@ fn parse_with_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let body = parse_block()
     finalize_sublist(handlers_sl)
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.WithBlock, handlers: handlers_sl, body: body,
         line: peek_line(), col: peek_col(),
     })
@@ -2415,7 +2444,7 @@ fn parse_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.RBrace)
     finalize_sublist(stmts)
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.Block, stmts: stmts,
         line: block_start_line, col: block_start_col,
         end_line: rbrace_line, end_col: rbrace_col,
@@ -2505,12 +2534,12 @@ fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         expect(TokenKind.RParen)
         finalize_sublist(args_sl)
         let fn_ident = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: assert_name, line: assert_start_line, col: assert_start_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: assert_name, line: assert_start_line, col: assert_start_col })
         let call_nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Call, left: fn_ident, args: args_sl, line: assert_start_line, col: assert_start_col })
+        node_push(AstNode { kind: NodeKind.Call, left: fn_ident, args: args_sl, line: assert_start_line, col: assert_start_col })
         maybe_newline()
         let stmt_nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.ExprStmt, value: call_nd, line: assert_start_line, col: assert_start_col })
+        node_push(AstNode { kind: NodeKind.ExprStmt, value: call_nd, line: assert_start_line, col: assert_start_col })
         return stmt_nd
     }
 
@@ -2562,7 +2591,7 @@ fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
         maybe_newline()
         let ap_nd = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.AssertPanics,
             body: ap_body, value: matching_expr,
             line: ap_start_line, col: ap_start_col,
@@ -2579,7 +2608,7 @@ fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let val = parse_expr()
         maybe_newline()
         let nd = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.Assignment, target: expr, value: val,
             line: node_line(expr), col: node_col(expr),
         })
@@ -2601,7 +2630,7 @@ fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             op_str = "/"
         }
         let nd = node_count()
-        nodes.push(AstNode {
+        node_push(AstNode {
             kind: NodeKind.CompoundAssign, op: op_str,
             target: expr, value: val,
             line: node_line(expr), col: node_col(expr),
@@ -2611,7 +2640,7 @@ fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 
     maybe_newline()
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.ExprStmt, value: expr,
         line: node_line(expr), col: node_col(expr),
     })
@@ -2643,7 +2672,7 @@ fn parse_let_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         // of asking how it is spelled.
         if name == "_" {
             pat = node_count()
-            nodes.push(AstNode { kind: NodeKind.WildcardPattern, line: binder_line, col: binder_col })
+            node_push(AstNode { kind: NodeKind.WildcardPattern, line: binder_line, col: binder_col })
             name = ""
         }
     }
@@ -2661,7 +2690,7 @@ fn parse_let_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let_elems = pat
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.LetBinding,
         name: name, value: val, is_mut: is_mut, target: type_ann,
         elements: let_elems,
@@ -2685,7 +2714,7 @@ fn parse_const_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let val = parse_expr()
     maybe_newline()
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.LetBinding,
         name: name, value: val, is_const: 1, target: type_ann,
         line: const_start_line, col: const_start_col,
@@ -2709,7 +2738,7 @@ fn parse_embed_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     skip_newlines()
     expect(TokenKind.RParen)
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.EmbedExpr, str_val: path,
         line: peek_line(), col: peek_col(),
     })
@@ -2723,13 +2752,13 @@ fn parse_return_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     if at(TokenKind.Newline) || at(TokenKind.RBrace) || at(TokenKind.EOF) {
         maybe_newline()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Return, line: ret_start_line, col: ret_start_col })
+        node_push(AstNode { kind: NodeKind.Return, line: ret_start_line, col: ret_start_col })
         return nd
     }
     let val = parse_expr()
     maybe_newline()
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.Return, value: val, line: ret_start_line, col: ret_start_col })
+    node_push(AstNode { kind: NodeKind.Return, value: val, line: ret_start_line, col: ret_start_col })
     nd
 }
 
@@ -2759,14 +2788,14 @@ fn parse_if_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             sublist_push(stmts, inner)
             finalize_sublist(stmts)
             let blk = node_count()
-            nodes.push(AstNode { kind: NodeKind.Block, stmts: stmts, line: peek_line(), col: peek_col() })
+            node_push(AstNode { kind: NodeKind.Block, stmts: stmts, line: peek_line(), col: peek_col() })
             else_b = blk
         } else {
             else_b = parse_block()
         }
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.IfExpr,
         condition: cond, then_body: then_b, else_body: else_b,
         line: if_start_line, col: if_start_col,
@@ -2783,7 +2812,7 @@ fn parse_while_loop() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     skip_newlines_and_comments()
     let body = parse_block()
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.WhileLoop, condition: cond, body: body,
         line: while_start_line, col: while_start_col,
     })
@@ -2797,7 +2826,7 @@ fn parse_loop_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     skip_newlines_and_comments()
     let body = parse_block()
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.LoopExpr, body: body,
         line: loop_start_line, col: loop_start_col,
     })
@@ -2823,7 +2852,7 @@ fn parse_for_in() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let var_col = peek_col()
         var = expect_value(TokenKind.Ident)
         simple_binder = node_count()
-        nodes.push(AstNode { kind: NodeKind.IdentPattern, name: var, line: var_line, col: var_col })
+        node_push(AstNode { kind: NodeKind.IdentPattern, name: var, line: var_line, col: var_col })
     }
     expect(TokenKind.In)
     let iter = parse_expr()
@@ -2834,7 +2863,7 @@ fn parse_for_in() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         for_elems = pat
     }
     let nd = node_count()
-    nodes.push(AstNode {
+    node_push(AstNode {
         kind: NodeKind.ForIn, var_name: var, iterable: iter, body: body,
         elements: for_elems, for_binder: simple_binder,
         line: for_start_line, col: for_start_col,
@@ -2857,7 +2886,7 @@ fn parse_nullcoalesce() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_or()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: "??", left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: "??", left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2872,7 +2901,7 @@ fn parse_or() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_and()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: "||", left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: "||", left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2887,7 +2916,7 @@ fn parse_and() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_bit_or()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: "&&", left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: "&&", left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2902,7 +2931,7 @@ fn parse_bit_or() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_bit_xor()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: "|", left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: "|", left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2917,7 +2946,7 @@ fn parse_bit_xor() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_bit_and()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: "^", left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: "^", left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2932,7 +2961,7 @@ fn parse_bit_and() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_equality()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: "&", left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: "&", left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2947,7 +2976,7 @@ fn parse_equality() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_comparison()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2962,7 +2991,7 @@ fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_additive()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2977,7 +3006,7 @@ fn parse_additive() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_shift()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -2992,7 +3021,7 @@ fn parse_shift() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_multiplicative()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -3007,7 +3036,7 @@ fn parse_multiplicative() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines()
         let right = parse_unary()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -3020,7 +3049,7 @@ fn parse_unary() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         advance()
         let operand = parse_unary()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.UnaryOp, op: "-", left: operand, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.UnaryOp, op: "-", left: operand, line: op_line, col: op_col })
         return nd
     }
     if at(TokenKind.Bang) {
@@ -3029,7 +3058,7 @@ fn parse_unary() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         advance()
         let operand = parse_unary()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.UnaryOp, op: "!", left: operand, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.UnaryOp, op: "!", left: operand, line: op_line, col: op_col })
         return nd
     }
     if at(TokenKind.Tilde) {
@@ -3038,7 +3067,7 @@ fn parse_unary() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         advance()
         let operand = parse_unary()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.UnaryOp, op: "~", left: operand, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.UnaryOp, op: "~", left: operand, line: op_line, col: op_col })
         return nd
     }
     parse_postfix()
@@ -3064,12 +3093,12 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             if member == "scope" && node_kind(node) == NodeKind.Ident && node_name(node) == "async" && at(TokenKind.LBrace) {
                 let body = parse_block()
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.AsyncScope, body: body, line: node_line(node), col: node_col(node) })
+                node_push(AstNode { kind: NodeKind.AsyncScope, body: body, line: node_line(node), col: node_col(node) })
                 node = nd
             // .await — postfix await on handles
             } else if member == "await" {
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.AwaitExpr, obj: node, line: node_line(node), col: node_col(node) })
+                node_push(AstNode { kind: NodeKind.AwaitExpr, obj: node, line: node_line(node), col: node_col(node) })
                 node = nd
             // channel.new[T](buffer) — typed channel constructor
             } else if member == "new" && node_kind(node) == NodeKind.Ident && node_name(node) == "channel" && at(TokenKind.LBracket) {
@@ -3098,12 +3127,12 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 expect(TokenKind.RParen)
                 finalize_sublist(cn_args)
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.ChannelNew, type_params: tparams, args: cn_args, line: node_line(node), col: node_col(node) })
+                node_push(AstNode { kind: NodeKind.ChannelNew, type_params: tparams, args: cn_args, line: node_line(node), col: node_col(node) })
                 node = nd
             } else if at(TokenKind.LParen) {
                 let args = parse_call_args()
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.MethodCall, obj: node, method: member, args: args, line: node_line(node), col: node_col(node) })
+                node_push(AstNode { kind: NodeKind.MethodCall, obj: node, method: member, args: args, line: node_line(node), col: node_col(node) })
                 node = nd
             } else if at(TokenKind.LBracket) && brackets_then_call() && is_type_start(peek_kind_at(first_token_in_brackets())) {
                 advance()
@@ -3111,11 +3140,11 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 let targs = parse_type_arg_list()
                 let args = parse_call_args()
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.MethodCall, obj: node, method: member, args: args, type_params: targs, line: node_line(node), col: node_col(node) })
+                node_push(AstNode { kind: NodeKind.MethodCall, obj: node, method: member, args: args, type_params: targs, line: node_line(node), col: node_col(node) })
                 node = nd
             } else {
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.FieldAccess, obj: node, name: member, line: node_line(node), col: node_col(node) })
+                node_push(AstNode { kind: NodeKind.FieldAccess, obj: node, name: member, line: node_line(node), col: node_col(node) })
                 node = nd
                 // Check for struct literal after field access (e.g. Foo.Bar { ... })
                 if at(TokenKind.LBrace) {
@@ -3131,14 +3160,14 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         } else if at(TokenKind.LParen) {
             let args = parse_call_args()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.Call, left: node, args: args, line: node_line(node), col: node_col(node) })
+            node_push(AstNode { kind: NodeKind.Call, left: node, args: args, line: node_line(node), col: node_col(node) })
             node = nd
         } else if at(TokenKind.LBracket) {
             node = parse_bracket_suffix(node)
         } else if at(TokenKind.Question) {
             advance()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.UnaryOp, op: "?", left: node, line: node_line(node), col: node_col(node) })
+            node_push(AstNode { kind: NodeKind.UnaryOp, op: "?", left: node, line: node_line(node), col: node_col(node) })
             node = nd
         } else if at(TokenKind.Newline) || at(TokenKind.Comment) {
             let mut peek_pos = pos
@@ -3261,7 +3290,7 @@ fn parse_bracket_suffix(obj: Int) -> Int ! Parse.Advance, Parse.Build, Diag.Repo
         let targs = parse_type_arg_list()
         let args = parse_call_args()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Call, left: obj, args: args, type_params: targs, line: node_line(obj), col: node_col(obj) })
+        node_push(AstNode { kind: NodeKind.Call, left: obj, args: args, type_params: targs, line: node_line(obj), col: node_col(obj) })
         return nd
     }
     if then_call { report_value_in_type_args() }
@@ -3269,7 +3298,7 @@ fn parse_bracket_suffix(obj: Int) -> Int ! Parse.Advance, Parse.Build, Diag.Repo
     skip_newlines()
     expect(TokenKind.RBracket)
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.IndexExpr, obj: obj, index: idx, line: node_line(obj), col: node_col(obj) })
+    node_push(AstNode { kind: NodeKind.IndexExpr, obj: obj, index: idx, line: node_line(obj), col: node_col(obj) })
     nd
 }
 
@@ -3300,7 +3329,7 @@ fn parse_maybe_named_arg() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             skip_newlines()
             let inner = parse_expr()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.NamedArg, name: label, value: inner, line: na_line, col: na_col })
+            node_push(AstNode { kind: NodeKind.NamedArg, name: label, value: inner, line: na_line, col: na_col })
             return nd
         } else {
             pos = saved
@@ -3367,7 +3396,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         diag_error_range("KeywordAsIdentifier", KEYWORD_AS_IDENTIFIER, "`match` is a keyword and cannot be used as an identifier", peek_line(), peek_col(), peek_end_col(), "use a different name")
         advance()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: "match", line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: "match", line: pm_line, col: pm_col })
         return nd
     }
     if at(TokenKind.If) {
@@ -3379,13 +3408,13 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         diag_error_range("KeywordAsIdentifier", KEYWORD_AS_IDENTIFIER, "`if` is a keyword and cannot be used as an identifier", peek_line(), peek_col(), peek_end_col(), "use a different name")
         advance()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: "if", line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: "if", line: pm_line, col: pm_col })
         return nd
     }
     if at(TokenKind.Self) {
         advance()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: "self", line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: "self", line: pm_line, col: pm_col })
         return nd
     }
 
@@ -3397,7 +3426,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         diag_error_range("KeywordAsIdentifier", KEYWORD_AS_IDENTIFIER, "`fn` is a keyword and cannot be used as an identifier", peek_line(), peek_col(), peek_end_col(), "use a different name")
         advance()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: "fn", line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: "fn", line: pm_line, col: pm_col })
         return nd
     }
 
@@ -3412,7 +3441,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         diag_error_range("KeywordAsIdentifier", KEYWORD_AS_IDENTIFIER, "`handler` is a keyword and cannot be used as an identifier", peek_line(), peek_col(), peek_end_col(), "use a different name")
         advance()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: "handler", line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: "handler", line: pm_line, col: pm_col })
         return nd
     }
 
@@ -3425,7 +3454,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         diag_error_range("KeywordAsIdentifier", KEYWORD_AS_IDENTIFIER, "`with` is a keyword and cannot be used as an identifier", peek_line(), peek_col(), peek_end_col(), "use a different name")
         advance()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: "with", line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: "with", line: pm_line, col: pm_col })
         return nd
     }
 
@@ -3433,39 +3462,39 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         let name = advance_value()
         if name == "true" {
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.BoolLit, int_val: 1, line: pm_line, col: pm_col })
+            node_push(AstNode { kind: NodeKind.BoolLit, int_val: 1, line: pm_line, col: pm_col })
             return nd
         }
         if name == "false" {
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.BoolLit, int_val: 0, line: pm_line, col: pm_col })
+            node_push(AstNode { kind: NodeKind.BoolLit, int_val: 0, line: pm_line, col: pm_col })
             return nd
         }
         if at(TokenKind.LBrace) && looks_like_struct_lit() {
             return parse_struct_lit(name)
         }
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: name, line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: name, line: pm_line, col: pm_col })
         return nd
     }
 
     if at(TokenKind.Int) {
         let val_str = advance_value()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.IntLit, str_val: val_str, line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.IntLit, str_val: val_str, line: pm_line, col: pm_col })
         // Check for range
         if at(TokenKind.DotDot) {
             advance()
             let end_nd = parse_primary()
             let rng = node_count()
-            nodes.push(AstNode { kind: NodeKind.RangeLit, start: nd, end: end_nd, line: pm_line, col: pm_col })
+            node_push(AstNode { kind: NodeKind.RangeLit, start: nd, end: end_nd, line: pm_line, col: pm_col })
             return rng
         }
         if at(TokenKind.DotDoteq) {
             advance()
             let end_nd = parse_primary()
             let rng = node_count()
-            nodes.push(AstNode { kind: NodeKind.RangeLit, start: nd, end: end_nd, inclusive: 1, line: pm_line, col: pm_col })
+            node_push(AstNode { kind: NodeKind.RangeLit, start: nd, end: end_nd, inclusive: 1, line: pm_line, col: pm_col })
             return rng
         }
         return nd
@@ -3474,14 +3503,14 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     if at(TokenKind.Float) {
         let val_str = advance_value()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.FloatLit, str_val: val_str, line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.FloatLit, str_val: val_str, line: pm_line, col: pm_col })
         return nd
     }
 
     if at(TokenKind.CharLit) {
         let val_str = advance_value()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.CharLit, str_val: val_str, line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.CharLit, str_val: val_str, line: pm_line, col: pm_col })
         return nd
     }
 
@@ -3492,7 +3521,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             advance()
             // Unit / empty tuple — empty TupleLit infers as Void; codegen emits 0.
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.TupleLit, line: pm_line, col: pm_col })
+            node_push(AstNode { kind: NodeKind.TupleLit, line: pm_line, col: pm_col })
             return nd
         }
         let first = parse_expr()
@@ -3510,7 +3539,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             expect(TokenKind.RParen)
             finalize_sublist(elems)
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.TupleLit, elements: elems, line: pm_line, col: pm_col })
+            node_push(AstNode { kind: NodeKind.TupleLit, elements: elems, line: pm_line, col: pm_col })
             return nd
         }
         skip_newlines()
@@ -3545,7 +3574,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         diag_error_range("KeywordAsIdentifier", KEYWORD_AS_IDENTIFIER, "`{kw_name}` is a keyword and cannot be used as an identifier", peek_line(), peek_col(), peek_end_col(), "use a different name")
         advance()
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.Ident, name: kw_name, line: pm_line, col: pm_col })
+        node_push(AstNode { kind: NodeKind.Ident, name: kw_name, line: pm_line, col: pm_col })
         return nd
     }
 
@@ -3575,7 +3604,7 @@ fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Re
             advance()
             let spread_src = parse_expr()
             let sp = node_count()
-            nodes.push(AstNode { kind: NodeKind.SpreadExpr, value: spread_src, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.SpreadExpr, value: spread_src, line: sp_line, col: sp_col })
             sublist_push(flds, sp)
             if at(TokenKind.Comma) {
                 advance()
@@ -3590,7 +3619,7 @@ fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Re
         skip_newlines()
         let fval = parse_expr()
         let sf = node_count()
-        nodes.push(AstNode { kind: NodeKind.StructLitField, name: fname, value: fval, line: fld_line, col: fld_col })
+        node_push(AstNode { kind: NodeKind.StructLitField, name: fname, value: fval, line: fld_line, col: fld_col })
         sublist_push(flds, sf)
         if at(TokenKind.Comma) {
             advance()
@@ -3600,7 +3629,7 @@ fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Re
     expect(TokenKind.RBrace)
     finalize_sublist(flds)
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.StructLit, type_name: type_name, fields: flds, line: sl_line, col: sl_col })
+    node_push(AstNode { kind: NodeKind.StructLit, type_name: type_name, fields: flds, line: sl_line, col: sl_col })
     nd
 }
 
@@ -3617,7 +3646,7 @@ fn parse_list_lit() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             advance()
             let spread_src = parse_expr()
             let sp = node_count()
-            nodes.push(AstNode { kind: NodeKind.SpreadExpr, value: spread_src, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.SpreadExpr, value: spread_src, line: sp_line, col: sp_col })
             sublist_push(elems, sp)
         } else {
             sublist_push(elems, parse_expr())
@@ -3630,7 +3659,7 @@ fn parse_list_lit() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.RBracket)
     finalize_sublist(elems)
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.ListLit, elements: elems, line: ll_line, col: ll_col })
+    node_push(AstNode { kind: NodeKind.ListLit, elements: elems, line: ll_line, col: ll_col })
     nd
 }
 
@@ -3645,7 +3674,7 @@ fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             let sp_col = peek_col()
             let s = advance_value()
             let sn = node_count()
-            nodes.push(AstNode { kind: NodeKind.Ident, str_val: s, name: s, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.Ident, str_val: s, name: s, line: sp_line, col: sp_col })
             sublist_push(parts, sn)
         } else if at(TokenKind.InterpStart) {
             let br_line = peek_line()
@@ -3711,7 +3740,7 @@ fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     expect(TokenKind.StringEnd)
     finalize_sublist(parts)
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.InterpString, elements: parts, line: is_line, col: is_col })
+    node_push(AstNode { kind: NodeKind.InterpString, elements: parts, line: is_line, col: is_col })
     nd
 }
 
@@ -3741,7 +3770,7 @@ fn parse_match_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.RBrace)
     finalize_sublist(arms)
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.MatchExpr, scrutinee: scrut, arms: arms, line: mx_line, col: mx_col })
+    node_push(AstNode { kind: NodeKind.MatchExpr, scrutinee: scrut, arms: arms, line: mx_line, col: mx_col })
     nd
 }
 
@@ -3765,7 +3794,7 @@ fn parse_match_arm() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         body = parse_stmt()
     }
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.MatchArm, pattern: pat, body: body, guard: guard, line: ma_line, col: ma_col })
+    node_push(AstNode { kind: NodeKind.MatchArm, pattern: pat, body: body, guard: guard, line: ma_line, col: ma_col })
     nd
 }
 
@@ -3783,7 +3812,7 @@ fn parse_pattern() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     }
     finalize_sublist(alts)
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.OrPattern, elements: alts, line: node_line(first), col: node_col(first) })
+    node_push(AstNode { kind: NodeKind.OrPattern, elements: alts, line: node_line(first), col: node_col(first) })
     nd
 }
 
@@ -3796,7 +3825,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         if at(TokenKind.RBracket) {
             advance()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.ListPattern, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.ListPattern, line: sp_line, col: sp_col })
             return nd
         }
         let elems = new_sublist()
@@ -3827,7 +3856,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         expect(TokenKind.RBracket)
         finalize_sublist(elems)
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.ListPattern, elements: elems, inclusive: has_rest, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.ListPattern, elements: elems, inclusive: has_rest, line: sp_line, col: sp_col })
         return nd
     }
     if at(TokenKind.LParen) {
@@ -3844,7 +3873,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         expect(TokenKind.RParen)
         finalize_sublist(elems)
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.TuplePattern, elements: elems, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.TuplePattern, elements: elems, line: sp_line, col: sp_col })
         return nd
     }
     if at(TokenKind.StringStart) {
@@ -3855,7 +3884,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             str_val = node_str_val(sublist_get(parts_sl, 0))
         }
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.StringPattern, str_val: str_val, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.StringPattern, str_val: str_val, line: sp_line, col: sp_col })
         return nd
     }
     if at(TokenKind.Int) {
@@ -3864,18 +3893,18 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             advance()
             let hi = advance_value()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, line: sp_line, col: sp_col })
             return nd
         }
         if at(TokenKind.DotDoteq) {
             advance()
             let hi = advance_value()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, inclusive: 1, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, inclusive: 1, line: sp_line, col: sp_col })
             return nd
         }
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.IntPattern, str_val: v, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.IntPattern, str_val: v, line: sp_line, col: sp_col })
         return nd
     }
     if at(TokenKind.CharLit) {
@@ -3884,35 +3913,35 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             advance()
             let hi = advance_value()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, line: sp_line, col: sp_col })
             return nd
         }
         if at(TokenKind.DotDoteq) {
             advance()
             let hi = advance_value()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, inclusive: 1, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.RangePattern, str_val: v, name: hi, inclusive: 1, line: sp_line, col: sp_col })
             return nd
         }
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.IntPattern, str_val: v, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.IntPattern, str_val: v, line: sp_line, col: sp_col })
         return nd
     }
     if at(TokenKind.Ident) {
         let name = advance_value()
         if name == "_" {
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.WildcardPattern, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.WildcardPattern, line: sp_line, col: sp_col })
             return nd
         }
         if name == "true" {
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.IntPattern, str_val: "1", line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.IntPattern, str_val: "1", line: sp_line, col: sp_col })
             return nd
         }
         if name == "false" {
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.IntPattern, str_val: "0", line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.IntPattern, str_val: "0", line: sp_line, col: sp_col })
             return nd
         }
         // Qualified variant: Type.Variant or Type.Variant(fields) or Type.Variant { fields }
@@ -3935,7 +3964,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                 expect(TokenKind.RParen)
                 finalize_sublist(flds)
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.EnumPattern, name: name, type_name: variant, fields: flds, line: sp_line, col: sp_col })
+                node_push(AstNode { kind: NodeKind.EnumPattern, name: name, type_name: variant, fields: flds, line: sp_line, col: sp_col })
                 return nd
             }
             if at(TokenKind.LBrace) {
@@ -3963,11 +3992,11 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                         skip_newlines()
                         let fpat = parse_pattern()
                         let sf = node_count()
-                        nodes.push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, line: fld_line, col: fld_col })
+                        node_push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, line: fld_line, col: fld_col })
                         sublist_push(flds, sf)
                     } else {
                         let sf = node_count()
-                        nodes.push(AstNode { kind: NodeKind.StructLitField, name: fname, line: fld_line, col: fld_col })
+                        node_push(AstNode { kind: NodeKind.StructLitField, name: fname, line: fld_line, col: fld_col })
                         sublist_push(flds, sf)
                     }
                     if at(TokenKind.Comma) {
@@ -3978,11 +4007,11 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                 expect(TokenKind.RBrace)
                 finalize_sublist(flds)
                 let nd = node_count()
-                nodes.push(AstNode { kind: NodeKind.EnumPattern, name: name, type_name: variant, fields: flds, int_val: 1, inclusive: has_rest, line: sp_line, col: sp_col })
+                node_push(AstNode { kind: NodeKind.EnumPattern, name: name, type_name: variant, fields: flds, int_val: 1, inclusive: has_rest, line: sp_line, col: sp_col })
                 return nd
             }
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.EnumPattern, name: name, type_name: variant, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.EnumPattern, name: name, type_name: variant, line: sp_line, col: sp_col })
             return nd
         }
         if at(TokenKind.LParen) {
@@ -4001,7 +4030,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             expect(TokenKind.RParen)
             finalize_sublist(flds)
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.EnumPattern, name: name, fields: flds, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.EnumPattern, name: name, fields: flds, line: sp_line, col: sp_col })
             return nd
         }
         if at(TokenKind.LBrace) {
@@ -4028,11 +4057,11 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                     skip_newlines()
                     let fpat = parse_pattern()
                     let sf = node_count()
-                    nodes.push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, line: fld_line, col: fld_col })
+                    node_push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, line: fld_line, col: fld_col })
                     sublist_push(flds, sf)
                 } else {
                     let sf = node_count()
-                    nodes.push(AstNode { kind: NodeKind.StructLitField, name: fname, line: fld_line, col: fld_col })
+                    node_push(AstNode { kind: NodeKind.StructLitField, name: fname, line: fld_line, col: fld_col })
                     sublist_push(flds, sf)
                 }
                 if at(TokenKind.Comma) {
@@ -4043,24 +4072,24 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             expect(TokenKind.RBrace)
             finalize_sublist(flds)
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.StructPattern, type_name: name, fields: flds, inclusive: has_rest, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.StructPattern, type_name: name, fields: flds, inclusive: has_rest, line: sp_line, col: sp_col })
             return nd
         }
         if at(TokenKind.As) {
             advance()
             let inner = parse_pattern()
             let nd = node_count()
-            nodes.push(AstNode { kind: NodeKind.AsPattern, name: name, pattern: inner, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.AsPattern, name: name, pattern: inner, line: sp_line, col: sp_col })
             return nd
         }
         let nd = node_count()
-        nodes.push(AstNode { kind: NodeKind.IdentPattern, name: name, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.IdentPattern, name: name, line: sp_line, col: sp_col })
         return nd
     }
     diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "unexpected token in pattern: {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), "")
     advance()
     let nd = node_count()
-    nodes.push(AstNode { kind: NodeKind.WildcardPattern, line: sp_line, col: sp_col })
+    node_push(AstNode { kind: NodeKind.WildcardPattern, line: sp_line, col: sp_col })
     nd
 }
 

@@ -47,6 +47,16 @@
 #                            A fact filed under a spelled name is a fact the tid
 #                            cannot answer, and each table is a second place for
 #                            a type to be described
+#   node_pool_writes         writes to the parser's node pool outside node_push,
+#                            node_pop, node_replace and parser_reset; absolute
+#                            zero gate. node_kind answers from a column those four
+#                            keep beside the pool, so any other write leaves the
+#                            column holding a kind the pool no longer has. Counted
+#                            in src/, lib/ and tests/: in parser.bl outside the
+#                            four, and in every file that imports `nodes` from
+#                            parser or spells `parser.nodes`. A historical ref is
+#                            materialized with src/ alone, so its count leaves out
+#                            lib/ and tests/; the zero gate still holds the tree
 #
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
 # lint over the rewrite's files, and fails if that fails. RATCHET_NO_LINT=1
@@ -133,6 +143,29 @@ decline_unhandled() {
   echo "$total"
 }
 
+# Mutating calls on the pool and assignments into a slot or a field of one, spelled bare or as
+# `parser.nodes`.
+POOL_WRITE='\b(parser\.)?nodes(\.(push|pop|set|clear|insert|remove|truncate|append|extend|reverse|sort|swap)\(|\[[^]]*\](\.[a-z_]+)*\s*=[^=])'
+
+pool_writes() {
+  root="$1"
+  total=0
+  p="$root/src/parser.bl"
+  if [ -f "$p" ]; then
+    n=$(awk '
+      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset)\(/ { inw = 1 }
+      !inw { print }
+      inw && /^}/ { inw = 0 }' "$p" | rg -o "$POOL_WRITE" | wc -l | tr -d ' ')
+    total=$((total + n))
+  fi
+  files=$(rg -U -l -g '*.bl' 'import parser\.\{[^}]*\bnodes\b|\bparser\.nodes\b' \
+    "$root/src" "$root/lib" "$root/tests" 2>/dev/null | rg -v '/src/parser\.bl$')
+  for f in $files; do
+    total=$((total + $(cnt "$POOL_WRITE" "$f")))
+  done
+  echo "$total"
+}
+
 # Takes a root dir instead of reading the repo directly, so the same row
 # definitions run against the real tree, a materialized historical ref, or a
 # synthetic test fixture without duplicating the row list three times.
@@ -151,6 +184,7 @@ layout_decline_unhandled $(decline_unhandled "$root")
 cg_name_string_compares $(cnt '\b[a-z_0-9]*(method|name|trait)[a-z_0-9]*(\([^()]*\))?\s*[!=]=\s*"|[!=]=\s*(method|trait)_[a-z_0-9]+\b' "$cgbl")
 fallback_idiom $(pcnt 'if ([a-z_][a-z_0-9.]*) >= 0 \{ \1 \} else' "$allbl")
 typecheck_str_keyed_tables $(cnt '^(pub )?let mut [A-Za-z_][A-Za-z_0-9]*: Map\[Str' "$tcbl")
+node_pool_writes $(pool_writes "$root")
 ROWS
 }
 
@@ -254,7 +288,7 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   # Absolute zero gates: an id means nothing to another reader or to training
   # data, and a swallowed decline is a wrong answer waiting to be found.
   case "$name" in
-    br_ids_in_source|layout_decline_unhandled)
+    br_ids_in_source|layout_decline_unhandled|node_pool_writes)
       [ "$now" -gt 0 ] && mark="$mark NONZERO(must-be-zero)" ;;
   esac
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"

@@ -1,0 +1,89 @@
+// node_kind answers from a column of kinds kept beside the node pool, so a walk that asks only
+// for kinds never loads the wide node. The column is right only if every write to the pool
+// writes it too: a pop then a push of another kind at the same id, a reset, and every node a
+// real parse makes must all leave node_kind(i) equal to the kind the pool holds at i.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import parser.{nodes, node_kind, node_count, node_push, node_pop, node_set_name, parser_reset}
+import ast.{AstNode, NodeKind}
+import diagnostics.{diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn column_agrees() -> Bool {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) != nodes[i].kind { return false }
+        i = i + 1
+    }
+    true
+}
+
+test "a pushed node reads back its kind" {
+    let id = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    assert_eq(id, nodes.len() - 1)
+    assert_eq(node_kind(id), NodeKind.IntLit)
+    assert(column_agrees())
+    node_pop()
+}
+
+test "a pop then a push of another kind at the same id reads the new kind" {
+    let first = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    assert_eq(node_kind(first), NodeKind.IntLit)
+    node_pop()
+    assert_eq(node_count(), first)
+    let second = node_push(AstNode { kind: NodeKind.Ident, name: "x", line: 1, col: 1 })
+    assert_eq(second, first)
+    assert_eq(node_kind(second), NodeKind.Ident)
+    assert(column_agrees())
+    node_pop()
+}
+
+test "a setter keeps the kind the column holds" {
+    let id = node_push(AstNode { kind: NodeKind.Ident, name: "before", line: 1, col: 1 })
+    node_set_name(id, "after")
+    assert_eq(node_kind(id), NodeKind.Ident)
+    assert(column_agrees())
+    node_pop()
+}
+
+test "a reset empties the column with the pool" {
+    let _ = node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+    let _ = node_push(AstNode { kind: NodeKind.Ident, name: "y", line: 1, col: 1 })
+    parser_reset()
+    assert_eq(node_count(), 0)
+    let id = node_push(AstNode { kind: NodeKind.Block, line: 1, col: 1 })
+    assert_eq(id, 0)
+    assert_eq(node_kind(0), NodeKind.Block)
+    assert(column_agrees())
+    parser_reset()
+}
+
+test "every node a parse and a typecheck make reads back its kind" {
+    init_embedded_stdlib()
+    let path = "build/node_kind_column_parse_probe.bl"
+    write_file(path, #"type Shape {
+    Circle(r: Int)
+    Square(s: Int)
+}
+
+fn area(s: Shape) -> Int {
+    match s {
+        Circle(r) => r * r * 3
+        Square(x) => x * x
+    }
+}
+
+fn main() {
+    let shapes = [Circle(1), Square(2)]
+    for s in shapes { io.println("{area(s)}") }
+}
+"#)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    assert(nodes.len() > 50)
+    assert(column_agrees())
+}
