@@ -1,0 +1,64 @@
+// Every verifier error starts with the node it was found at, as `node <id> (<Kind>)`, and a
+// defect in a kid's position names the parent that holds the kid. These cases pin the whole
+// text of each error, not a fragment, so a change to how the verifier builds that name shows.
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_verify, ir_mark_materialize,
+    ir_const, ir_expr_stmt, ir_return, ir_if, ir_block, ir_break,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_errors(label: Str, root: Int, want: Str) {
+    let got = ir_verify(root).join(" | ")
+    if got != want { io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}") }
+    assert(got == want)
+}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+
+test "an arity defect names the node and its kind" {
+    ir_reset()
+    let one = int_const("1")
+    let add = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [one])
+    assert_errors("Binary with one kid", ir_expr_stmt(0, add), "node 1 (Binary): expects 2 kids, has 1")
+}
+
+test "a field defect names the node and its kind" {
+    ir_reset()
+    let bad = ir_const(1, 0, "", "1")
+    assert_errors("Const without a spelling", ir_expr_stmt(0, bad), "node 0 (Const): empty c_spelling")
+}
+
+test "a kid in the wrong position is named by its parent" {
+    ir_reset()
+    let brk = ir_break(0)
+    assert_errors("Break as an operand", ir_expr_stmt(0, brk),
+        "node 1 (ExprStmt): kid 0 is a statement where a value is required")
+}
+
+test "a cycle names the node that contains itself" {
+    ir_reset()
+    let self_loop = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [0])
+    assert_errors("self cycle", self_loop, "node 0 (Block): cycle, the node contains itself")
+}
+
+test "a value reached twice is named at its second reach" {
+    ir_reset()
+    let shared = int_const("7")
+    let root = ir_block(0, [ir_expr_stmt(0, shared), ir_return(0, shared)])
+    assert_errors("shared const", root, "node 0 (Const): value reached twice without must_materialize")
+}
+
+test "a flagged value reached from a second block names both blocks" {
+    ir_reset()
+    let shared = int_const("7")
+    ir_mark_materialize(shared)
+    let arm = ir_block(0, [ir_expr_stmt(0, shared)])
+    let cond = int_const("1")
+    let root = ir_block(0, [ir_if(0, cond, arm, -1), ir_return(0, shared)])
+    assert_errors("flagged const shared with the if arm", root,
+        "node 0 (Const): reached from a second block, the temporary bound in block 2 is out of scope in block 6")
+}

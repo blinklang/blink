@@ -82,7 +82,10 @@ pub type IrNode {
 // not mean "unset".
 let mut ir_nodes: List[IrNode] = []
 
-pub fn ir_reset() { ir_nodes = [] }
+pub fn ir_reset() {
+    ir_nodes = []
+    verify_marks = VerifyMarks { epoch: 0, words: [] }
+}
 
 pub fn ir_node_count() -> Int { ir_nodes.len() }
 
@@ -776,19 +779,15 @@ fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
         errs.push("root {root}: node id out of range (arena holds {ir_node_count()})")
         return errs
     }
-    // Keyed by id, not sized to the arena: the arena holds every body of the unit, and the
-    // driver verifies each body, so arena-sized scratch would make a unit quadratic.
-    let mut seen: Map[Int, Int] = Map()
-    let mut on_stack: Map[Int, Int] = Map()
+    begin_verify_marks()
     if ir_kind(root) == IrKind.ContainerSpread {
         errs.push("root {root} (ContainerSpread): {SPREAD_MISPLACED}")
     }
-    let mut first_block: Map[Int, Int] = Map()
     // -1 is the scope outside every Block. A body is always a Block, so it is only ever the
     // frame a bare fragment sits in, and it encloses everything.
     let mut blocks: List[Int] = [-1]
     let mut scope: List[Str] = []
-    verify_node(root, seen, on_stack, first_block, blocks, errs, scope, declared, scoped)
+    verify_node(root, blocks, errs, scope, declared, scoped)
     // Both forms run it, as the driver verifies whole units through ir_verify. The walk
     // needs a tree without cycles, which the pass above proved.
     if errs.len() == 0 {
@@ -798,6 +797,31 @@ fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
     }
     errs
 }
+
+// What one verify_root call has learnt about each node id, two words per id: the walk
+// state, then the block that first reached the node. The arena holds every body of a unit
+// and the driver verifies each body, so the table is kept across calls and each call takes
+// a fresh epoch instead of clearing it; a word written under an older epoch reads as never
+// reached. The walk state is 2 * epoch while the node is on the walk and 2 * epoch + 1 once
+// it is done.
+type VerifyMarks {
+    epoch: Int
+    words: List[Int]
+}
+
+let mut verify_marks: VerifyMarks = VerifyMarks { epoch: 0, words: [] }
+
+fn begin_verify_marks() {
+    let mut words = verify_marks.words
+    while words.len() < 2 * ir_node_count() { words.push(0) }
+    verify_marks = VerifyMarks { epoch: verify_marks.epoch + 1, words: words }
+}
+
+fn mark_on_walk(id: Int) -> Bool { verify_marks.words[2 * id] == 2 * verify_marks.epoch }
+
+fn mark_reached(id: Int) -> Bool { verify_marks.words[2 * id] >= 2 * verify_marks.epoch }
+
+fn mark_first_block(id: Int) -> Int { verify_marks.words[2 * id + 1] }
 
 // A local in scope during verify_frame_writes: its C name, its kind, and how many PanicCatch
 // bodies enclosed its declaration.
@@ -812,12 +836,12 @@ type FrameDecl {
 // address of a VolatileLet is a pointer to volatile, which no callee parameter is spelled to take.
 fn verify_frame_writes(id: Int, decls: List[FrameDecl], depth: Int, errs: List[Str]) {
     let kind = ir_kind(id)
-    let kids = ir_kids(id)
+    let n = ir_kid_count(id)
     let mark = decls.len()
     let mut i = 0
-    while i < kids.len() {
-        let is_body = kind == IrKind.PanicCatch && i == kids.len() - 1
-        verify_frame_writes(kids.get(i).unwrap(), decls, if is_body { depth + 1 } else { depth }, errs)
+    while i < n {
+        let is_body = kind == IrKind.PanicCatch && i == n - 1
+        verify_frame_writes(ir_kid(id, i), decls, if is_body { depth + 1 } else { depth }, errs)
         i += 1
     }
     if kind == IrKind.Block { drop_decls_to(decls, mark) }
@@ -874,54 +898,57 @@ fn verify_frame_exits(id: Int, frame: Str, loops: Int, errs: List[Str]) {
     }
     let inner_frame = if kind == IrKind.PanicCatch { ir_c_name(id) } else { frame }
     let inner_loops = if kind == IrKind.PanicCatch { 0 } else if kind == IrKind.Loop { loops + 1 } else { loops }
-    for kid in ir_kids(id) { verify_frame_exits(kid, inner_frame, inner_loops, errs) }
+    let n = ir_kid_count(id)
+    let mut i = 0
+    while i < n {
+        verify_frame_exits(ir_kid(id, i), inner_frame, inner_loops, errs)
+        i += 1
+    }
 }
 
 let SPREAD_MISPLACED: Str = "ContainerSpread outside a ContainerNew, it extends only the container that holds it"
 let VARREF_UNDECLARED: Str = "no enclosing Let, parameter or global declares it"
 let MATERIALIZE_SECOND_BLOCK: Str = "reached from a second block"
 
-fn verify_node(id: Int, seen: Map[Int, Int], on_stack: Map[Int, Int], first_block: Map[Int, Int], blocks: List[Int], errs: List[Str], scope: List[Str], declared: List[Str], scoped: Bool) {
+fn verify_node(id: Int, blocks: List[Int], errs: List[Str], scope: List[Str], declared: List[Str], scoped: Bool) {
     let kind = ir_kind(id)
     let block = blocks.get(blocks.len() - 1).unwrap()
-    let label = "node {id} ({ir_kind_name(kind)})"
-    if (on_stack.get(id) ?? 0) == 1 {
-        errs.push("{label}: cycle, the node contains itself")
+    if mark_on_walk(id) {
+        errs.push("{node_label(id)}: cycle, the node contains itself")
         return
     }
-    if (seen.get(id) ?? 0) == 1 {
+    if mark_reached(id) {
         if !ir_kind_is_value(kind) {
-            errs.push("{label}: statement reached twice, a statement has one owner")
+            errs.push("{node_label(id)}: statement reached twice, a statement has one owner")
         } else if ir_must_materialize(id) == 0 {
-            errs.push("{label}: value reached twice without must_materialize")
-        } else if !blocks.contains(first_block.get(id) ?? -1) {
-            let owner = first_block.get(id) ?? -1
-            errs.push("{label}: {MATERIALIZE_SECOND_BLOCK}, the temporary bound in block {owner} is out of scope in block {block}")
+            errs.push("{node_label(id)}: value reached twice without must_materialize")
+        } else if !blocks.contains(mark_first_block(id)) {
+            let owner = mark_first_block(id)
+            errs.push("{node_label(id)}: {MATERIALIZE_SECOND_BLOCK}, the temporary bound in block {owner} is out of scope in block {block}")
         }
         return
     }
-    seen.insert(id, 1)
-    first_block.insert(id, block)
-    on_stack.insert(id, 1)
-    verify_fields(id, kind, label, errs)
+    verify_marks.words.set(2 * id, 2 * verify_marks.epoch)
+    verify_marks.words.set(2 * id + 1, block)
+    verify_fields(id, kind, errs)
     if scoped && reads_a_name(kind) && !in_scope(ir_c_name(id), scope, declared) {
-        errs.push("{label}: reads `{ir_c_name(id)}`, {VARREF_UNDECLARED}")
+        errs.push("{node_label(id)}: reads `{ir_c_name(id)}`, {VARREF_UNDECLARED}")
     }
-    let kids = ir_kids(id)
+    let n = ir_kid_count(id)
     let block_mark = scope.len()
     // A Block is the braces the printer writes, so it is the C scope a temporary lives in.
     let opens_block = kind == IrKind.Block
     if opens_block { blocks.push(id) }
-    if verify_arity(kind, label, kids.len(), errs) {
-        if kind == IrKind.EnumNew { verify_enum_new(id, label, kids.len(), errs) }
+    if verify_arity(id, kind, n, errs) {
+        if kind == IrKind.EnumNew { verify_enum_new(id, n, errs) }
         let mut i = 0
-        while i < kids.len() {
-            let kid = kids.get(i).unwrap()
+        while i < n {
+            let kid = ir_kid(id, i)
             if kid < 0 || kid >= ir_node_count() {
-                errs.push("{label}: kid {i} id {kid} out of range (arena holds {ir_node_count()})")
+                errs.push("{node_label(id)}: kid {i} id {kid} out of range (arena holds {ir_node_count()})")
             } else {
-                verify_kid_shape(kind, label, i, kids.len(), kid, errs)
-                verify_node(kid, seen, on_stack, first_block, blocks, errs, scope, declared, scoped)
+                verify_kid_shape(id, kind, i, n, kid, errs)
+                verify_node(kid, blocks, errs, scope, declared, scoped)
             }
             i += 1
         }
@@ -931,8 +958,12 @@ fn verify_node(id: Int, seen: Map[Int, Int], on_stack: Map[Int, Int], first_bloc
     // A Let declares its name only after its own initialiser is verified, so `let b = b`
     // reads a name that is not in scope yet, exactly as the C it prints would.
     if scoped && declares_a_name(kind) { scope.push(ir_c_name(id)) }
-    on_stack.insert(id, 0)
+    verify_marks.words.set(2 * id, 2 * verify_marks.epoch + 1)
 }
+
+// Each defect names the node it was found at. The name is built only for a defect: the
+// verifier reaches every node of every unit, and almost all of them have none.
+fn node_label(id: Int) -> Str { "node {id} ({ir_kind_name(ir_kind(id))})" }
 
 fn declares_a_name(kind: IrKind) -> Bool {
     kind == IrKind.Let || kind == IrKind.CellLet || kind == IrKind.VolatileLet
@@ -957,28 +988,28 @@ fn drop_to(scope: List[Str], mark: Int) {
     }
 }
 
-fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
+fn verify_fields(id: Int, kind: IrKind, errs: List[Str]) {
     if kind == IrKind.EvidenceVector {
-        if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, the vector has no Blink type") }
+        if ir_tid(id) >= 0 { errs.push("{node_label(id)}: carries tid {ir_tid(id)}, the vector has no Blink type") }
     } else if kind == IrKind.EvidenceAddress {
         if ir_tid(id) >= 0 {
-            errs.push("{label}: carries tid {ir_tid(id)}, the address of the vector has no Blink type")
+            errs.push("{node_label(id)}: carries tid {ir_tid(id)}, the address of the vector has no Blink type")
         }
     } else if kind == IrKind.ArenaTarget {
-        if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, an arena pointer has no Blink type") }
+        if ir_tid(id) >= 0 { errs.push("{node_label(id)}: carries tid {ir_tid(id)}, an arena pointer has no Blink type") }
     } else if kind == IrKind.PromoteCtx {
-        if ir_tid(id) >= 0 { errs.push("{label}: carries tid {ir_tid(id)}, a promotion context has no Blink type") }
-        if ir_kid_count(id) == 0 && ir_c_name(id) == "" { errs.push("{label}: a context with no target names no parameter") }
+        if ir_tid(id) >= 0 { errs.push("{node_label(id)}: carries tid {ir_tid(id)}, a promotion context has no Blink type") }
+        if ir_kid_count(id) == 0 && ir_c_name(id) == "" { errs.push("{node_label(id)}: a context with no target names no parameter") }
     } else if ir_kind_is_value(kind) && ir_tid(id) < 0 {
-        errs.push("{label}: value node without a tid")
+        errs.push("{node_label(id)}: value node without a tid")
     }
     if (ir_kind_is_value(kind) || declares_a_name(kind)) && ir_c_spelling(id) == "" {
-        errs.push("{label}: empty c_spelling")
+        errs.push("{node_label(id)}: empty c_spelling")
     }
     let wrap_with_payload = kind == IrKind.CarrierWrap && ir_kid_count(id) == 2
     let arm_with_payload = kind == IrKind.EnumNew && ir_kid_count(id) > 1
     if (kind_needs_c_name(kind) || wrap_with_payload || arm_with_payload) && ir_c_name(id) == "" {
-        errs.push("{label}: empty c_name")
+        errs.push("{node_label(id)}: empty c_name")
     }
     // C's && and || skip the right operand, but a statement the printer binds for it is
     // written before the operator and runs regardless. The lowering guards such an operand
@@ -986,7 +1017,7 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
     if kind == IrKind.Binary && (ir_c_name(id) == "&&" || ir_c_name(id) == "||") && ir_kid_count(id) == 2 {
         let rhs = ir_kid(id, 1)
         if rhs >= 0 && rhs < ir_node_count() && ir_binds_statement(rhs) {
-            errs.push("{label}: right operand of `{ir_c_name(id)}` binds a statement the operator cannot skip")
+            errs.push("{node_label(id)}: right operand of `{ir_c_name(id)}` binds a statement the operator cannot skip")
         }
     }
     // A conditional reaches one answer and skips the other, so the same rule covers both:
@@ -997,7 +1028,7 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
         while i < 3 {
             let answer = ir_kid(id, i)
             if answer >= 0 && answer < ir_node_count() && ir_binds_statement(answer) {
-                errs.push("{label}: an answer binds a statement the conditional cannot skip")
+                errs.push("{node_label(id)}: an answer binds a statement the conditional cannot skip")
             }
             i = i + 1
         }
@@ -1012,7 +1043,7 @@ fn verify_fields(id: Int, kind: IrKind, label: Str, errs: List[Str]) {
             let operand = ir_c_spelling(kid)
             let want = pointer_spelling(operand)
             if ir_c_spelling(id) != want {
-                errs.push("{label}: address spelled `{ir_c_spelling(id)}`, the pointer form of its operand's `{operand}` is `{want}`")
+                errs.push("{node_label(id)}: address spelled `{ir_c_spelling(id)}`, the pointer form of its operand's `{operand}` is `{want}`")
             }
         }
     }
@@ -1027,30 +1058,30 @@ fn is_address_node(kind: IrKind, id: Int) -> Bool {
 
 // The node is held to its declaration: the tid is an enum, the variant is one of that
 // enum's, and the payload count is the variant's arity.
-fn verify_enum_new(id: Int, label: Str, n: Int, errs: List[Str]) {
+fn verify_enum_new(id: Int, n: Int, errs: List[Str]) {
     let variant = ir_decl(id)
     if variant < 0 {
-        errs.push("{label}: no variant declaration")
+        errs.push("{node_label(id)}: no variant declaration")
         return
     }
     // node_name aborts the process on a bad id; the verifier must report, not die.
     if variant >= node_count() {
-        errs.push("{label}: variant declaration {variant} out of range (parser holds {node_count()})")
+        errs.push("{node_label(id)}: variant declaration {variant} out of range (parser holds {node_count()})")
         return
     }
     let vname = node_name(variant)
     if tc_tid_kind(ir_tid(id)) != TyKind.Enum {
-        errs.push("{label}: tid is not an enum, variant `{vname}` has no union to fill")
+        errs.push("{node_label(id)}: tid is not an enum, variant `{vname}` has no union to fill")
         return
     }
     if !enum_declares_variant(tc_tid_decl_node(ir_tid(id)), variant) {
-        errs.push("{label}: variant `{vname}` is not declared by this enum")
+        errs.push("{node_label(id)}: variant `{vname}` is not declared by this enum")
         return
     }
     let arity = variant_arity(variant)
     let have = n - 1
     if have != arity {
-        errs.push("{label}: variant `{vname}` takes {arity} payload{plural(arity)}, has {have}")
+        errs.push("{node_label(id)}: variant `{vname}` takes {arity} payload{plural(arity)}, has {have}")
     }
 }
 
@@ -1072,16 +1103,16 @@ fn variant_arity(variant: Int) -> Int {
     if fields < 0 { 0 } else { sublist_length(fields) }
 }
 
-fn verify_arity(kind: IrKind, label: Str, n: Int, errs: List[Str]) -> Bool {
+fn verify_arity(id: Int, kind: IrKind, n: Int, errs: List[Str]) -> Bool {
     let lo = kind_min_kids(kind)
     let hi = kind_max_kids(kind)
     if n < lo || (hi >= 0 && n > hi) {
         if hi < 0 {
-            errs.push("{label}: expects at least {lo} kid{plural(lo)}, has {n}")
+            errs.push("{node_label(id)}: expects at least {lo} kid{plural(lo)}, has {n}")
         } else if lo == hi {
-            errs.push("{label}: expects {lo} kids, has {n}")
+            errs.push("{node_label(id)}: expects {lo} kids, has {n}")
         } else {
-            errs.push("{label}: expects {lo} or {hi} kids, has {n}")
+            errs.push("{node_label(id)}: expects {lo} or {hi} kids, has {n}")
         }
         return false
     }
@@ -1092,43 +1123,43 @@ fn plural(n: Int) -> Str { if n == 1 { "" } else { "s" } }
 
 // Which category each kid position takes: a value, any statement, a Block, or a handler
 // slot read off the evidence vector.
-fn verify_kid_shape(kind: IrKind, label: Str, i: Int, n: Int, kid: Int, errs: List[Str]) {
+fn verify_kid_shape(id: Int, kind: IrKind, i: Int, n: Int, kid: Int, errs: List[Str]) {
     let kid_kind = ir_kind(kid)
     let kid_is_value = ir_kind_is_value(kid_kind)
     if kid_kind == IrKind.ContainerSpread && kind != IrKind.ContainerNew {
-        errs.push("{label}: kid {i} is a {SPREAD_MISPLACED}")
+        errs.push("{node_label(id)}: kid {i} is a {SPREAD_MISPLACED}")
     }
     match kid_slot(kind, i, n) {
         KidSlot.Value => {
-            if !kid_is_value { errs.push("{label}: kid {i} is a statement where a value is required") }
+            if !kid_is_value { errs.push("{node_label(id)}: kid {i} is a statement where a value is required") }
         }
         KidSlot.Stmt => {
-            if kid_is_value { errs.push("{label}: kid {i} is a value where a statement is required") }
+            if kid_is_value { errs.push("{node_label(id)}: kid {i} is a value where a statement is required") }
         }
         KidSlot.BlockOnly => {
-            if kid_kind != IrKind.Block { errs.push("{label}: kid {i} must be a Block") }
+            if kid_kind != IrKind.Block { errs.push("{node_label(id)}: kid {i} must be a Block") }
         }
         KidSlot.ConstLabel => {
-            if kid_kind != IrKind.Const { errs.push("{label}: kid {i} case label must be a Const") }
+            if kid_kind != IrKind.Const { errs.push("{node_label(id)}: kid {i} case label must be a Const") }
         }
         KidSlot.ConstTag => {
-            if kid_kind != IrKind.Const { errs.push("{label}: kid {i} tag must be a Const") }
+            if kid_kind != IrKind.Const { errs.push("{node_label(id)}: kid {i} tag must be a Const") }
         }
         KidSlot.Lvalue => {
-            if !is_lvalue_kind(kid_kind) { errs.push("{label}: kid {i} target must be an lvalue") }
+            if !is_lvalue_kind(kid_kind) { errs.push("{node_label(id)}: kid {i} target must be an lvalue") }
         }
         KidSlot.VectorOnly => {
             if kid_kind != IrKind.EvidenceVector {
-                errs.push("{label}: kid {i} must be the EvidenceVector, is a {ir_kind_name(kid_kind)}")
+                errs.push("{node_label(id)}: kid {i} must be the EvidenceVector, is a {ir_kind_name(kid_kind)}")
             } else if ir_held_by_pointer(kid) {
-                errs.push("{label}: kid {i} is already held by pointer, a vector parameter is its own address")
+                errs.push("{node_label(id)}: kid {i} is already held by pointer, a vector parameter is its own address")
             }
         }
         KidSlot.HandlerSlot => {
             if !names_a_handler_place(kid) {
-                errs.push("{label}: kid {i} must read a handler slot of the EvidenceVector, a global or a local, since the perform prints it twice; a {ir_kind_name(kid_kind)} is none of these")
+                errs.push("{node_label(id)}: kid {i} must read a handler slot of the EvidenceVector, a global or a local, since the perform prints it twice; a {ir_kind_name(kid_kind)} is none of these")
             } else if !ir_held_by_pointer(kid) {
-                errs.push("{label}: handler slot must be held by pointer, a handler is a vtable pointer")
+                errs.push("{node_label(id)}: handler slot must be held by pointer, a handler is a vtable pointer")
             }
         }
     }
@@ -1321,26 +1352,25 @@ fn quote(s: Str) -> Str {
 
 // The cursor is module state so the recursive reader needs no tuple returns. A malformed
 // text answers -1 and leaves whatever nodes it had already built in the arena.
-// pr_labels maps a dump label #k to the node id its full occurrence built.
+// `labels` maps a dump label #k to the node id its full occurrence built.
 let mut pr_text: Str = ""
 let mut pr_pos: Int = 0
 let mut pr_failed: Bool = false
-let mut pr_labels: List[Int] = []
 
 pub fn ir_parse(text: Str) -> Int {
     pr_text = text
     pr_pos = 0
     pr_failed = false
-    pr_labels = []
-    let id = parse_node()
+    let labels: List[Int] = []
+    let id = parse_node(labels)
     skip_ws()
     if pr_failed || pr_pos != pr_text.len() { return -1 }
     id
 }
 
-fn parse_node() -> Int {
+fn parse_node(labels: List[Int]) -> Int {
     skip_ws()
-    if eat("#") { return parse_label_ref() }
+    if eat("#") { return parse_label_ref(labels) }
     if !eat("(") { return fail() }
     let kind_name = read_ident()
     skip_ws()
@@ -1379,7 +1409,7 @@ fn parse_node() -> Int {
     skip_ws()
     while !peek_is(")") {
         if pr_pos >= pr_text.len() { return fail() }
-        let kid = parse_node()
+        let kid = parse_node(labels)
         if pr_failed { return -1 }
         kids.push(kid)
         skip_ws()
@@ -1396,24 +1426,24 @@ fn parse_node() -> Int {
     let id = set_named_slots(stamp_tagged_members(ir_new(kind, tid, span, spelling, name, slot, kids)), kops, descs, promoter)
     if mat == 1 { ir_mark_materialize(id) }
     if decl >= 0 { set_decl(id, decl) }
-    if label >= 0 { bind_label(label, id) }
+    if label >= 0 { bind_label(labels, label, id) }
     id
 }
 
 // A reference must follow the labelled node's full occurrence; a forward reference (which
 // only a cyclic tree can dump) is malformed.
-fn parse_label_ref() -> Int {
+fn parse_label_ref(labels: List[Int]) -> Int {
     let label = read_int()
     if pr_failed { return -1 }
-    if label < 0 || label >= pr_labels.len() { return fail() }
-    let id = pr_labels.get(label).unwrap()
+    if label < 0 || label >= labels.len() { return fail() }
+    let id = labels.get(label).unwrap()
     if id < 0 { return fail() }
     id
 }
 
-fn bind_label(label: Int, id: Int) {
-    while pr_labels.len() <= label { pr_labels.push(-1) }
-    pr_labels.set(label, id)
+fn bind_label(labels: List[Int], label: Int, id: Int) {
+    while labels.len() <= label { labels.push(-1) }
+    labels.set(label, id)
 }
 
 fn fail() -> Int {
