@@ -63,7 +63,8 @@ echo "Building stdlib archive..."
 echo "Self-compiling blinkc (Gen 1)..."
 "$GEN0_BLINKC" --link-archive "$BUILD_DIR/libblink_std.h" \
     "$ROOT_DIR/src/blinkc_main.bl" "$BUILD_DIR/blinkc_gen1.c"
-cc -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" \
+. "$ROOT_DIR/scripts/link_opt.sh"
+cc $BLINK_LINK_OPT -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" \
     -I"$BUILD_DIR" "$BUILD_DIR/libblink_std.a" -lm -lgc -pthread -Wl,--gc-sections
 
 echo "Self-compiling blinkc (Gen 2)..."

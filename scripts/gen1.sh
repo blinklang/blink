@@ -79,9 +79,10 @@ wait "$blinkc_pid" || fail=1
 wait "$cli_pid" || fail=1
 [ "$fail" -eq 0 ] || exit 1
 
+. scripts/link_opt.sh
 # link_bin <binary> <c file>
 link_bin() {
-    if ! cc -o "$out/bin/$1" "$out/$2" -I"$out/share/blink" "$archive_a" \
+    if ! cc $BLINK_GEN1_LINK_OPT -o "$out/bin/$1" "$out/$2" -I"$out/share/blink" "$archive_a" \
             -lm -lgc -pthread -Wl,--gc-sections > "$out/link-$1.log" 2>&1; then
         echo "gen1: FAIL cc could not link $out/bin/$1; see $out/link-$1.log"
         head -20 "$out/link-$1.log"
