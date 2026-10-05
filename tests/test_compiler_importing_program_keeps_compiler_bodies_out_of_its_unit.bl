@@ -1,0 +1,91 @@
+import compile_test_helpers.{emit_c_via_cli}
+
+// A program that imports the compiler modules should take their bodies from the prebuilt
+// compiler archive, not compile them again in its own unit. Each corpus test that imports
+// the compiler otherwise pays for a full compiler compile. The fixture is built the way the
+// corpus builds such a test: through the CLI, with --debug.
+
+fn fixture_src() -> Str {
+    "import tokens.\{keyword_lookup\}\nimport compiler.\{compile_to_program\}\n\nfn main() \{\n    io.println(\"\{keyword_lookup(\"fn\").to_int()\}\")\n\}\n"
+}
+
+fn src_modules() -> List[Str] {
+    let listing = process_run("sh", ["-c", "ls src"]).out
+    let mut out: List[Str] = []
+    for name in listing.split("\n") {
+        if name.ends_with(".bl") {
+            out.push(name.slice(0, name.len() - 3))
+        }
+    }
+    out
+}
+
+// The name of the function a line of C defines, or "" when the line opens no external
+// definition. A static function is a private copy, which no archive could hold.
+fn defined_fn_name(line: Str) -> Str {
+    if !line.ends_with(") \{") { return "" }
+    if line.starts_with(" ") || line.starts_with("static") || line.starts_with("typedef") || line.starts_with("extern") || line.starts_with("#") {
+        return ""
+    }
+    let open = line.index_of("(")
+    if open < 0 { return "" }
+    let words = line.slice(0, open).split(" ")
+    words.get(words.len() - 1).unwrap().replace("*", "")
+}
+
+// The src-module functions the C defines, each with whether it takes the evidence vector.
+fn compiler_defs(c: Str) -> List[(Str, Bool)] {
+    let mods = src_modules()
+    let mut out: List[(Str, Bool)] = []
+    for line in c.split("\n") {
+        let name = defined_fn_name(line)
+        if name == "" { continue }
+        for m in mods {
+            if name.starts_with("blink_{m}_") {
+                out.push((name, line.contains("blink_ev*")))
+                break
+            }
+        }
+    }
+    out
+}
+
+fn fixture_c() -> Str {
+    emit_c_via_cli(fixture_src(), "compiler_importing_fixture", "--debug")
+}
+
+test "the fixture builds and its unit defines main" {
+    assert(src_modules().contains("compiler"), "src/ lists no compiler module from this cwd")
+    let c = fixture_c()
+    assert(c.contains("int main("), "the fixture did not reach codegen")
+}
+
+test "the definition scanner finds an external compiler function and skips static ones" {
+    let c = "static int blink_tokens_private(int x) \{\nint64_t blink_tokens_is_keyword(const char* s) \{\nconst char* blink_lexer_lex(int64_t n, blink_ev* __ev) \{\nint64_t blink_u_main(void) \{\n"
+    let defs = compiler_defs(c)
+    assert_eq(defs.len(), 2)
+    assert_eq(defs.get(0).unwrap(), ("blink_tokens_is_keyword", false))
+    assert_eq(defs.get(1).unwrap(), ("blink_lexer_lex", true))
+}
+
+test.failing(
+    "the program's unit defines no compiler function that skips the evidence vector",
+    reason: "the corpus does not link a compiler archive yet, so every imported compiler body lands in the program's unit",
+) {
+    let c = fixture_c()
+    assert(c.contains("int main("), "the fixture did not reach codegen")
+    let mut plain: List[Str] = []
+    for d in compiler_defs(c) {
+        if !d.1 { plain.push(d.0) }
+    }
+    assert_eq(plain.len(), 0)
+}
+
+test.failing(
+    "the program's unit defines no compiler function at all",
+    reason: "the compiler archive cannot hold a function that takes the evidence vector until its layout is fixed",
+) {
+    let c = fixture_c()
+    assert(c.contains("int main("), "the fixture did not reach codegen")
+    assert_eq(compiler_defs(c).len(), 0)
+}

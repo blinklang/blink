@@ -22,7 +22,8 @@
 #
 # A second summary line gives the known failures: test.failing rows that
 # still fail, which a passing file hides (see corpus_one.sh), and the passing
-# files whose report did not read.
+# files whose report did not read. A third gives how many binaries linked
+# the prebuilt compiler archive; corpus_check.sh holds that to a floor.
 #
 # Exit: 2 when the run itself cannot be trusted (no compiler, malformed JSON).
 # Under --only, 1 when any listed file fails: a bucket names files that must
@@ -64,7 +65,7 @@ if [ ! -x "$comp/blink" ] || [ ! -x "$comp/blinkc" ]; then
     echo "corpus: no compiler at $comp (run 'task gen1' or set CORPUS_COMPILER)" >&2
     exit 2
 fi
-for tool in parallel jq bc timeout; do
+for tool in parallel jq bc timeout nm; do
     command -v "$tool" >/dev/null 2>&1 || { echo "corpus: missing tool: $tool" >&2; exit 2; }
 done
 
@@ -116,7 +117,7 @@ while IFS= read -r f; do
     if [ -f "$results/$b.json" ]; then
         cat "$results/$b.json"
     else
-        printf '{"file":"%s","status":"compile_fail","seconds":0,"first_error_line":"corpus runner produced no record","known_failures":null}\n' "$f"
+        printf '{"file":"%s","status":"compile_fail","seconds":0,"first_error_line":"corpus runner produced no record","known_failures":null,"compiler_archive":false}\n' "$f"
     fi
 done < "$list" > "$records"
 
@@ -139,6 +140,7 @@ jq -s \
       run_fail: (map(select(.status == "run_fail")) | length),
       timeout: (map(select(.status == "timeout")) | length),
       known_failures: (map(.known_failures // 0) | add // 0),
+      compiler_archive_linked: (map(select(.compiler_archive == true)) | length),
       files: .
     }' "$records" > "$out"
 rm -f "$records"
@@ -160,6 +162,8 @@ jq -r '
     | "corpus: known failures \(.known_failures) in \($counted | length) file(s), \($unread | length) unreadable report(s)",
       ($counted[] | "  \(.known_failures) \(.file)"),
       ($unread[] | "  unreadable \(.file)")' "$out"
+
+echo "compiler-archive: linked $(jq -r .compiler_archive_linked "$out") files"
 
 if [ "$run_lint" -eq 1 ] && [ -z "$only" ]; then
     ./scripts/lint_codegen.sh || exit 1

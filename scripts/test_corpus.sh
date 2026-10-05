@@ -54,6 +54,11 @@ elif n=$(grep -o 'SELFTEST_XFAIL=[0-9]*' "$src" | cut -d= -f2) && [ -n "$n" ]; t
     done
     printf '{"results":[%s],"summary":{"total":%d}}\n' "$rows" "$((n + 1))" > "$out.report"
     printf '#!/bin/sh\ncase " $* " in *" --test-json "*) cat "%s";; esac\nexit 0\n' "$out.report" > "$out"
+elif grep -q SELFTEST_COMPILER_ARCHIVE "$src"; then
+    # corpus_one.sh reads the archive's init fn from the binary's symbols, so
+    # this fixture must be a real binary that defines it.
+    printf 'void __blink_init_compiler_globals(void) {}\nint main(void) { __blink_init_compiler_globals(); return 0; }\n' > "$out.c"
+    cc -o "$out" "$out.c" || exit 1
 else
     printf '#!/bin/sh\nexit 0\n' > "$out"
 fi
@@ -155,6 +160,29 @@ else
     fail=1
 fi
 
+# Each record says whether the binary linked the compiler archive, read from
+# the binary itself, and the summary counts them.
+echo '// SELFTEST_COMPILER_ARCHIVE' > "$R/tests/test_selftest_compiler_archive.bl"
+printf 'tests/test_selftest_ok.bl\ntests/test_selftest_compiler_archive.bl\ntests/test_selftest_compile_fail.bl\n' > "$WORK/archive.txt"
+run_corpus --only "$WORK/archive.txt" --no-lint
+ca() { jq -r --arg f "$1" '.files[] | select(.file == $f) | .compiler_archive' "$R/build/corpus_subset.json" 2>/dev/null; }
+for row in "tests/test_selftest_ok.bl false" "tests/test_selftest_compiler_archive.bl true" "tests/test_selftest_compile_fail.bl false"; do
+    set -- $row
+    if [ "$(ca "$1")" = "$2" ]; then
+        echo "PASS compiler-archive $1: $2"
+    else
+        echo "FAIL compiler-archive $1: want $2, got '$(ca "$1")'"
+        fail=1
+    fi
+done
+if grep -q '^compiler-archive: linked 1 files$' "$WORK/out.log" && [ "$(jq -r .compiler_archive_linked "$R/build/corpus_subset.json")" = 1 ]; then
+    echo "PASS compiler-archive-summary"
+else
+    echo "FAIL compiler-archive-summary: no summary line or JSON count of 1"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+fi
+
 # corpus_check.sh on hand-written result files. The fixture root holds one
 # stub tests/test_check_N.bl per record, so the total can match the tests on
 # disk. The fixtures above sit in the same tests/ directory, so the check runs
@@ -162,12 +190,14 @@ fi
 C="$WORK/checkroot"
 mkdir -p "$C/scripts" "$C/tests"
 cp scripts/corpus_check.sh "$C/scripts/"
+floor() { printf '# fixture floor\n%s\n' "$1" > "$C/scripts/corpus_compiler_archive_floor.txt"; }
+floor 0
 stubs() { # <n>: leave exactly n test files in the check root
     rm -f "$C"/tests/test_*.bl
     i=1
     while [ "$i" -le "$1" ]; do : > "$C/tests/test_check_$i.bl"; i=$((i + 1)); done
 }
-rec() { printf '{"file":"%s","status":"%s","known_failures":%s}' "$1" "$2" "$3"; }
+rec() { printf '{"file":"%s","status":"%s","known_failures":%s,"compiler_archive":%s}' "$1" "$2" "$3" "${4:-false}"; }
 corpus_file() { # <out> <record>...
     out="$1"; shift
     printf '%s\n' "$@" | jq -s '{total: length, passed: (map(select(.status == "pass")) | length), files: .}' > "$out"
@@ -220,6 +250,23 @@ names "check-known-unreadable-names-file" "tests/test_check_1.bl$"
 grep -q 'printed to stdout' "$WORK/out.log" || { echo "FAIL check-known-unreadable-cause: no cause given"; fail=1; }
 echo '{"total":' > "$WORK/now.json"
 run_check; expect "check-malformed" 2 $?
+
+# The compiler-archive floor.
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0 true)" "$(rec tests/test_check_2.bl pass 0 false)"
+floor 1
+run_check; expect "check-archive-at-floor" 0 $?
+grep -q '^corpus-check: compiler archive linked 1 file(s), floor 1$' "$WORK/out.log" || { echo "FAIL check-archive-count-line: no count line"; fail=1; }
+floor 2
+run_check; expect "check-archive-below-floor" 1 $?
+grep -q 'below the floor of 2' "$WORK/out.log" || { echo "FAIL check-archive-below-floor-cause: no cause given"; fail=1; }
+floor 0
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)" '{"file":"tests/test_check_2.bl","status":"pass","known_failures":0}'
+run_check; expect "check-archive-unflagged" 1 $?
+names "check-archive-unflagged-names-file" "tests/test_check_2.bl$"
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)" "$(rec tests/test_check_2.bl pass 0)"
+floor x
+run_check; expect "check-archive-floor-unreadable" 2 $?
+floor 0
 
 if [ "$fail" -ne 0 ]; then
     echo "test_corpus: FAILED"

@@ -7,6 +7,11 @@
 # printed for information only: it changes when a test file changes, and a
 # stale test.failing row that starts passing already fails its own file.
 #
+# The number of binaries that linked the prebuilt compiler archive must reach
+# the floor in scripts/corpus_compiler_archive_floor.txt. Each file whose
+# build falls back to one unit compiles the whole compiler again, so a drop is
+# a slowdown no test result would show.
+#
 # Env:
 #   CORPUS_JSON  result file (default build/corpus.json)
 set -u
@@ -46,6 +51,27 @@ if [ -n "$unreadable" ]; then
     echo "corpus-check: FAIL passing files whose known-failure report did not read"
     echo "  (most often a test printed to stdout, which lands inside the --test-json report):"
     printf '%s\n' "$unreadable"
+    fail=1
+fi
+
+floor_file=scripts/corpus_compiler_archive_floor.txt
+floor=$(grep -v '^#' "$floor_file" 2>/dev/null | tr -d '[:space:]')
+case "$floor" in
+    ''|*[!0-9]*)
+        echo "corpus-check: $floor_file does not hold a number" >&2
+        exit 2 ;;
+esac
+# A record with no flag would read as "not linked" and hide in the count.
+unflagged=$(jq -r '.files[] | select((.compiler_archive | type) != "boolean") | "  \(.file)"' "$json")
+if [ -n "$unflagged" ]; then
+    echo "corpus-check: FAIL files whose record does not say whether the compiler archive linked:"
+    printf '%s\n' "$unflagged"
+    fail=1
+fi
+linked=$(jq -r '[.files[] | select(.compiler_archive == true)] | length' "$json")
+echo "corpus-check: compiler archive linked $linked file(s), floor $floor"
+if [ "$linked" -lt "$floor" ]; then
+    echo "corpus-check: FAIL compiler archive linked $linked file(s), below the floor of $floor"
     fail=1
 fi
 
