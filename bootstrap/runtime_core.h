@@ -2400,9 +2400,23 @@ BLINK_RT_FN void blink_sb_free(blink_sb* sb) {
 
 /* ── String operations ──────────────────────────────────────────────── */
 
+BLINK_RT_FN void blink_str_index_oob(const char* method, int64_t index, int64_t len);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_str_index_oob(const char* method, int64_t index, int64_t len) {
+    __blink_panic_dispatchf("blink: Str.%s index out of bounds: idx=%lld byte_len=%lld",
+                            method, (long long)index, (long long)len);
+}
+#endif
+
+/* byte_at returns a bare byte and so cannot say "absent"; the unsigned compare also
+   catches a negative index. */
 BLINK_RT_FN int64_t blink_str_char_at(const char* s, int64_t i);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_str_char_at(const char* s, int64_t i) {
+    int64_t len = blink_str_len(s);
+    if (__builtin_expect((uint64_t)i >= (uint64_t)len, 0)) {
+        blink_str_index_oob("byte_at", i, len);
+    }
     return (int64_t)(unsigned char)s[i];
 }
 #endif
@@ -2777,6 +2791,55 @@ BLINK_RT_FN int64_t blink_str_index_of_from(const char* s, const char* needle, i
     const char* found = strstr(s + from, needle);
     if (!found) return -1;
     return (int64_t)(found - s);
+}
+#endif
+
+#define BLINK_UTF8_IS_CONT(b) ((((unsigned char)(b)) & 0xC0) == 0x80)
+
+/* Panics for a byte offset `off` that falls inside a codepoint. The message names the
+   codepoint the offset cuts and the bytes it spans, so the caller can see which unit
+   it mixed up. */
+BLINK_RT_FN void blink_str_cut_panic(const char* method, const char* bound, const char* s, int64_t off, int64_t len);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_str_cut_panic(const char* method, const char* bound, const char* s, int64_t off, int64_t len) {
+    int64_t lead = off;
+    while (lead > 0 && off - lead < 3 && BLINK_UTF8_IS_CONT(s[lead])) lead--;
+    int64_t next = lead;
+    int32_t cp = 0xFFFD;
+    if (!blink_str_next_char(s, &next, &cp)) next = lead + 1;
+    __blink_panic_dispatchf("blink: Str.%s %s=%lld is inside a codepoint: cuts U+%04X at bytes %lld..%lld byte_len=%lld",
+                            method, bound, (long long)off, (unsigned)cp, (long long)lead, (long long)next, (long long)len);
+}
+#endif
+
+/* The out-of-range rule clamps first; a cut inside a codepoint is never clamped,
+   because any result would be invalid UTF-8 or a silent move of the caller's offset. */
+BLINK_RT_FN const char* blink_str_byte_slice(const char* s, int64_t start, int64_t end);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_byte_slice(const char* s, int64_t start, int64_t end) {
+    int64_t slen = blink_str_len(s);
+    if (start < 0) start = 0;
+    if (end > slen) end = slen;
+    if (start >= end) return BLINK_STR_EMPTY;
+    if (BLINK_UTF8_IS_CONT(s[start])) blink_str_cut_panic("byte_slice", "start", s, start, slen);
+    if (BLINK_UTF8_IS_CONT(s[end])) blink_str_cut_panic("byte_slice", "end", s, end, slen);
+    int64_t rlen = end - start;
+    char* buf = blink_str_alloc(rlen);
+    memcpy(buf, s + start, (size_t)rlen);
+    return buf;
+}
+#endif
+
+/* -1 means not found. A `from` inside a codepoint panics rather than giving -1, so
+   "not found" never also means "bad offset". */
+BLINK_RT_FN int64_t blink_str_byte_index_of(const char* s, const char* needle, int64_t from);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_str_byte_index_of(const char* s, const char* needle, int64_t from) {
+    int64_t slen = blink_str_len(s);
+    if (from < 0) from = 0;
+    if (from > slen) return -1;
+    if (BLINK_UTF8_IS_CONT(s[from])) blink_str_cut_panic("byte_index_of", "from", s, from, slen);
+    return blink_str_index_of_from(s, needle, from);
 }
 #endif
 
