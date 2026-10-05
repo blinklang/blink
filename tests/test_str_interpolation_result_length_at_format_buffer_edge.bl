@@ -1,0 +1,99 @@
+// String interpolation formats into a fixed stack buffer first, and formats a second time
+// only when the result does not fit. A result of 255 bytes fits with its terminator; one
+// of 256 or more takes the second pass. Each case checks the result against the same text
+// built with a StringBuilder, so a result cut at the buffer edge or written past it shows.
+
+fn repeat(c: Str, n: Int) -> Str {
+    let mut sb = StringBuilder.with_capacity(n)
+    let mut i = 0
+    while i < n {
+        sb.write(c)
+        i = i + 1
+    }
+    sb.to_str()
+}
+
+fn expect_text(got: Str, want: Str) {
+    assert_eq(got.len(), want.len())
+    assert(got == want, "formatted text differs from the built text at length {want.len()}")
+    assert_eq(Bytes.from_str(got).len(), want.len())
+}
+
+// "<" + body + ":" + n + ">" with an Int conversion, so the edge falls on formatted digits
+// and not only on a copied Str.
+fn framed(body_len: Int, n: Int) -> Str {
+    let body = repeat("x", body_len)
+    "<{body}:{n}>"
+}
+
+fn framed_want(body_len: Int, n: Int) -> Str {
+    let mut sb = StringBuilder.new()
+    sb.write("<")
+    sb.write(repeat("x", body_len))
+    sb.write(":")
+    sb.write("{n}")
+    sb.write(">")
+    sb.to_str()
+}
+
+test "results of 254 through 258 bytes keep every byte" {
+    for total in [254, 255, 256, 257, 258] {
+        // "<" + body + ":" + "42" + ">" is body + 5 bytes.
+        let body_len = total - 5
+        let got = framed(body_len, 42)
+        assert_eq(got.len(), total)
+        expect_text(got, framed_want(body_len, 42))
+    }
+}
+
+test "a result of exactly 255, 256 and 257 bytes from Str holes" {
+    let a = repeat("a", 100)
+    let b = repeat("b", 100)
+    for extra in [53, 54, 55] {
+        let c = repeat("c", extra)
+        let got = "{a}-{b}-{c}"
+        assert_eq(got.len(), 202 + extra)
+        expect_text(got, a.concat("-").concat(b).concat("-").concat(c))
+    }
+}
+
+test "the edge falls inside a formatted number" {
+    // 250 bytes of body and 3 bytes of frame, then the digits: 42, 123 and 1234 make
+    // results of 255, 256 and 257 bytes.
+    for n in [7, 42, 123, 1234, 123456789, 9223372036854775807, -9223372036854775807] {
+        let got = framed(250, n)
+        expect_text(got, framed_want(250, n))
+    }
+}
+
+test "a very long result keeps every byte" {
+    let chunk = "0123456789abcdef"
+    let big = repeat(chunk, 8192)
+    let got = "[{big}|{big.len()}]"
+    let want = "[".concat(big).concat("|131072]")
+    expect_text(got, want)
+    assert_eq(got.slice(got.len() - 8, got.len()), "|131072]")
+}
+
+test "a short result and an empty result" {
+    let empty = ""
+    expect_text("{empty}", "")
+    expect_text("{empty}{empty}", "")
+    let n = 5
+    expect_text("n={n}", "n=5")
+}
+
+// A Str holds no NUL, so a NUL Char in a hole must not leave one inside the result, on
+// either path. The text on both sides of the hole stays.
+test "a NUL Char hole keeps the text around it on both paths" {
+    let nul = '\0'
+    let short = "ab{nul}cd"
+    assert_eq(short.len(), Bytes.from_str(short).len())
+    assert(short.starts_with("ab"), "short result keeps the text before the hole")
+    assert(short.ends_with("cd"), "short result keeps the text after the hole")
+    let body = repeat("y", 300)
+    let long = "{body}{nul}tail"
+    assert_eq(long.len(), Bytes.from_str(long).len())
+    assert(long.starts_with(body), "long result keeps the text before the hole")
+    assert(long.ends_with("tail"), "long result keeps the text after the hole")
+}

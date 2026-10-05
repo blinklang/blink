@@ -2640,18 +2640,29 @@ BLINK_RT_FN const char* blink_str_concat(const char* a, const char* b) {
 BLINK_RT_FN const char* blink_str_format(const char* fmt, ...);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
+    /* Most results fit the stack buffer, so they take one formatting pass and
+       a copy. Only a longer result formats a second time, from ap2. */
+    char small[256];
     va_list ap; va_start(ap, fmt);
     va_list ap2; va_copy(ap2, ap);
-    int needed = vsnprintf(NULL, 0, fmt, ap);
+    int needed = vsnprintf(small, sizeof small, fmt, ap);
     va_end(ap);
     if (needed < 0) { va_end(ap2); return BLINK_STR_EMPTY; }
+    /* A %c of a NUL or a %s of a non-Str could put a NUL inside; a Str ends
+       at its first one. */
+    if ((size_t)needed < sizeof small) {
+        va_end(ap2);
+        const char* nul = (const char*)memchr(small, '\0', (size_t)needed);
+        int64_t real = nul ? (int64_t)(nul - small) : (int64_t)needed;
+        char* buf = blink_str_alloc(real);
+        memcpy(buf, small, (size_t)real);
+        return buf;
+    }
     char* buf = blink_str_alloc((int64_t)needed);
     vsnprintf(buf, (size_t)needed + 1, fmt, ap2);
     va_end(ap2);
-    /* A %c of a NUL or a %s of a non-Str could put a NUL inside; a Str ends
-       at its first one. */
-    int64_t real = (int64_t)strlen(buf);
-    if (real != (int64_t)needed) blink_str_shrink(buf, real);
+    const char* nul = (const char*)memchr(buf, '\0', (size_t)needed);
+    if (nul) blink_str_shrink(buf, (int64_t)(nul - buf));
     return buf;
 }
 #endif
