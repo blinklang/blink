@@ -3,6 +3,8 @@
 # only set how fast the linked compiler runs.
 # Installed and bootstrap binaries: -O2, since users run them.
 BLINK_LINK_OPT="${BLINK_LINK_OPT--O2}"
-# gen1 is rebuilt on every gate run and the corpus is dominated by cc and the
-# test programs, so a -O2 link costs more wall time than it saves.
-BLINK_GEN1_LINK_OPT="${BLINK_GEN1_LINK_OPT--O0}"
+# gen1 is rebuilt on every gate run, and its blink emits the C for every corpus
+# file. At -O0 the runtime's static inline list accessors stay calls, and the
+# emit is about a quarter of corpus work; -O1 nearly halves the emit for a few
+# seconds more link. -O2 adds about 8s more link for little more emit speed.
+BLINK_GEN1_LINK_OPT="${BLINK_GEN1_LINK_OPT--O1}"
