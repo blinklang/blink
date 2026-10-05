@@ -12,7 +12,7 @@
 import std.fs
 import std.io
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_stamp_walk}
+import typecheck.{check_types, tc_stamp_walk, tc_stamp_owner_index, tc_stamp_owner_of, TC_STAMP_UNOWNED}
 import parser.{nodes, node_kind, node_name, node_body, node_value_child_ids}
 import ast.{NodeKind}
 import diagnostics.{diag_reset}
@@ -78,20 +78,18 @@ fn subtree_of(root: Int) -> List[Int] {
     out
 }
 
-fn assert_all_owned_by(label: Str, sub: List[Int], owner: Map[Int, Int], want: Int) {
+fn assert_all_owned_by(label: Str, sub: List[Int], owner: List[Int], want: Int) {
     let mut wrong = 0
     let mut checked = 0
     for n in sub {
-        match owner.get(n) {
-            Some(o) => {
-                checked = checked + 1
-                if o != want {
-                    if wrong == 0 { io.println("FAIL: {label}: node {n} ({node_kind(n)}) owned by {o}, want {want}") }
-                    wrong = wrong + 1
-                }
-            }
-            None => {
-                if wrong == 0 { io.println("FAIL: {label}: node {n} ({node_kind(n)}) has no owner") }
+        let o = tc_stamp_owner_of(owner, n)
+        if o == TC_STAMP_UNOWNED {
+            if wrong == 0 { io.println("FAIL: {label}: node {n} ({node_kind(n)}) has no owner") }
+            wrong = wrong + 1
+        } else {
+            checked = checked + 1
+            if o != want {
+                if wrong == 0 { io.println("FAIL: {label}: node {n} ({node_kind(n)}) owned by {o}, want {want}") }
                 wrong = wrong + 1
             }
         }
@@ -103,21 +101,23 @@ fn assert_all_owned_by(label: Str, sub: List[Int], owner: Map[Int, Int], want: I
 
 test "one descent fills the assert order and the owner column over the same nodes" {
     let program = compile_probe("build/stamp_descends_once_probe.bl", probe_src())
-    let mut owner: Map[Int, Int] = Map()
-    let order = tc_stamp_walk(program, owner)
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
     assert(order.len() > 20)
+    let owner = tc_stamp_owner_index(order, owners)
     let mut missing = 0
     for n in order {
-        if owner.contains_key(n) == false { missing = missing + 1 }
+        if tc_stamp_owner_of(owner, n) == TC_STAMP_UNOWNED { missing = missing + 1 }
     }
     assert_eq(missing, 0)
-    assert_eq(owner.len(), order.len())
+    assert_eq(owners.len(), order.len())
 }
 
 test "the owner of a node is the nearest enclosing function, and a closure is not a fence" {
     let program = compile_probe("build/stamp_owner_is_nearest_body_probe.bl", probe_src())
-    let mut owner: Map[Int, Int] = Map()
-    let _order = tc_stamp_walk(program, owner)
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
+    let owner = tc_stamp_owner_index(order, owners)
     let outer = node_named(NodeKind.FnDef, "stamp_probe_outer")
     assert(outer != -1)
     assert_all_owned_by("outer body", subtree_of(node_body(outer)), owner, outer)
@@ -125,8 +125,9 @@ test "the owner of a node is the nearest enclosing function, and a closure is no
 
 test "a test block owns the nodes in its own body" {
     let program = compile_probe("build/stamp_owner_test_block_probe.bl", probe_src())
-    let mut owner: Map[Int, Int] = Map()
-    let _order = tc_stamp_walk(program, owner)
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
+    let owner = tc_stamp_owner_index(order, owners)
     let tb = first_test_block()
     assert(tb != -1)
     assert_all_owned_by("test block body", subtree_of(node_body(tb)), owner, tb)
@@ -134,14 +135,15 @@ test "a test block owns the nodes in its own body" {
 
 test "an ffi body is absent from both columns while the declaration itself is in both" {
     let program = compile_probe("build/stamp_ffi_body_absent_probe.bl", probe_src())
-    let mut owner: Map[Int, Int] = Map()
-    let order = tc_stamp_walk(program, owner)
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
+    let owner = tc_stamp_owner_index(order, owners)
     let ffi_fn = node_named(NodeKind.FnDef, "stamp_probe_open")
     assert(ffi_fn != -1)
     assert(order.contains(ffi_fn))
-    assert(owner.contains_key(ffi_fn))
+    assert(tc_stamp_owner_of(owner, ffi_fn) != TC_STAMP_UNOWNED)
     let ffi_body = node_body(ffi_fn)
     assert(ffi_body != -1)
     assert(order.contains(ffi_body) == false)
-    assert(owner.contains_key(ffi_body) == false)
+    assert_eq(tc_stamp_owner_of(owner, ffi_body), TC_STAMP_UNOWNED)
 }

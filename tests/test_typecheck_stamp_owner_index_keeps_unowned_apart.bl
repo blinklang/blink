@@ -1,0 +1,139 @@
+// The stamp pass looks a node's owner up in a table with one slot per node id. An owner is a
+// function or test block node, or -1 for a node at module level, so the slot that says "the
+// walk never reached this node" must hold a value that is neither. The stand-down reads the
+// two cases the same, but its trace names them apart, so a sentinel that collides with -1 or
+// with a node id would move a node from one case to the other without a test noticing.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_stamp_walk, tc_stamp_owner_index, tc_stamp_owner_of, TC_STAMP_UNOWNED}
+import parser.{nodes, node_kind, node_name, node_body}
+import ast.{NodeKind}
+import diagnostics.{diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn compile_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn probe_src() -> Str {
+    #"@ffi("blink_owner_index_probe_open")
+@trusted(audit: "TEST-TYPECHECK-STAMP-OWNER-INDEX")
+fn owner_index_probe_open(path: Str) -> Int ! FFI {}
+
+let OWNER_INDEX_PROBE_BASE = 1
+
+fn owner_index_probe_outer(n: Int) -> Int {
+    let seed = n + OWNER_INDEX_PROBE_BASE
+    let bump = fn(a: Int) -> Int { a + seed }
+    bump(seed)
+}
+
+test "a body the stamp pass owns" {
+    assert_eq(owner_index_probe_outer(2) > 0, true)
+}
+"#
+}
+
+fn node_named(kind: NodeKind, nm: Str) -> Int {
+    let mut i = 0
+    while i < nodes.len() {
+        if node_kind(i) == kind && node_name(i) == nm { return i }
+        i = i + 1
+    }
+    -1
+}
+
+test "the unowned sentinel is neither module level nor a node id" {
+    assert(TC_STAMP_UNOWNED != -1)
+    assert(TC_STAMP_UNOWNED < 0)
+}
+
+test "every walked node reads back the owner the walk gave it" {
+    let program = compile_probe("build/stamp_owner_index_walked_probe.bl", probe_src())
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
+    assert_eq(owners.len(), order.len())
+    assert(order.len() > 20)
+    let index = tc_stamp_owner_index(order, owners)
+    let mut module_level = 0
+    let mut in_body = 0
+    let mut i = 0
+    while i < order.len() {
+        let n = order.get(i).unwrap()
+        let want = owners.get(i).unwrap()
+        assert_eq(tc_stamp_owner_of(index, n), want)
+        assert(tc_stamp_owner_of(index, n) != TC_STAMP_UNOWNED)
+        if want == -1 { module_level = module_level + 1 } else { in_body = in_body + 1 }
+        i = i + 1
+    }
+    // Both kinds of owner must occur, or the row proves nothing about keeping them apart.
+    assert(module_level > 0)
+    assert(in_body > 0)
+}
+
+test "a module-level node is owned by -1 and not reported unowned" {
+    let program = compile_probe("build/stamp_owner_index_module_probe.bl", probe_src())
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
+    let index = tc_stamp_owner_index(order, owners)
+    let base = node_named(NodeKind.LetBinding, "OWNER_INDEX_PROBE_BASE")
+    assert(base != -1)
+    assert_eq(tc_stamp_owner_of(index, base), -1)
+}
+
+test "a function body node is owned by its function" {
+    let program = compile_probe("build/stamp_owner_index_fn_probe.bl", probe_src())
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
+    let index = tc_stamp_owner_index(order, owners)
+    let outer = node_named(NodeKind.FnDef, "owner_index_probe_outer")
+    assert(outer != -1)
+    assert_eq(tc_stamp_owner_of(index, node_body(outer)), outer)
+}
+
+test "a node the walk never reached reads as unowned" {
+    let program = compile_probe("build/stamp_owner_index_unreached_probe.bl", probe_src())
+    let mut owners: List[Int] = []
+    let order = tc_stamp_walk(program, owners, [])
+    let index = tc_stamp_owner_index(order, owners)
+    // An @ffi body is skipped by the walk on purpose.
+    let ffi_fn = node_named(NodeKind.FnDef, "owner_index_probe_open")
+    assert(ffi_fn != -1)
+    let ffi_body = node_body(ffi_fn)
+    assert(ffi_body != -1)
+    assert(order.contains(ffi_body) == false)
+    assert_eq(tc_stamp_owner_of(index, ffi_body), TC_STAMP_UNOWNED)
+    // Ids past the table, as for a node made after the walk, read as unowned and do not panic.
+    assert_eq(tc_stamp_owner_of(index, nodes.len() + 5), TC_STAMP_UNOWNED)
+    assert_eq(tc_stamp_owner_of(index, -1), TC_STAMP_UNOWNED)
+}
+
+// The walks share one seen buffer, as the program walk shares it with the field-default and
+// @where walks its recovery runs, so a mark one walk leaves behind would hide a node from the next.
+test "a later walk over the same seen buffer sees every node again" {
+    let program = compile_probe("build/stamp_owner_index_rewalk_probe.bl", probe_src())
+    let mut seen: List[Int] = []
+    let mut first: List[Int] = []
+    let all = tc_stamp_walk(program, first, seen)
+    let mut marked = 0
+    for m in seen { marked = marked + m }
+    assert_eq(marked, 0)
+    let outer = node_named(NodeKind.FnDef, "owner_index_probe_outer")
+    assert(outer != -1)
+    let mut a: List[Int] = []
+    let once = tc_stamp_walk(outer, a, seen)
+    let mut b: List[Int] = []
+    let twice = tc_stamp_walk(outer, b, seen)
+    assert(once.len() > 5)
+    assert(once.len() < all.len())
+    assert_eq(twice.len(), once.len())
+    let mut again: List[Int] = []
+    assert_eq(tc_stamp_walk(program, again, seen).len(), all.len())
+}
