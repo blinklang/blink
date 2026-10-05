@@ -233,6 +233,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnreachableCode | W0700 | Code follows an unconditional return/break/continue | Linting | §6 |
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
+| TodoInCode | W0703 | A call resolves to the built-in `todo()`. Fires in every context, test blocks included; in a test the `help:` line names `@skip`. `unreachable()` has no warning | Linting | §2.20 |
 | OverrideOfDeprecatedDefault | W0731 | `impl` overrides a trait default marked `@deprecate_override` | Trait sealing | §3.6 |
 | SealedMethodNameCollision | W0734 | A method in an `impl` for a built-in type has the same name as a method a sealed trait gives that type; unqualified calls of the name are E0522. Fires at the method only, never at calls. On by default, never an error, no effect on resolution | Method resolution | §3c.4 |
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
