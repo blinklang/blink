@@ -57,7 +57,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.12](#212-visibility). |
 | Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; `as` disambiguates. 3-0 over `defer`. |
 | Constants | `const NAME = expr` | Compile-time constants. Distinct from `let` (runtime). Literals + arithmetic + boolean ops + references to other consts. See [2.21](#221-const-declarations). |
-| Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()` for unreachable states. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
+| Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()`, `todo()` and `unreachable()` diverge. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
 | Spread/rest operator | `..` | General spread/rest sigil. Patterns: `{ name, .. }`, `[first, ..]` (ignore rest). Construction: `{ field: val, ..source }` (copy rest), `[..list1, ..list2]` (list spread). See [2.16](#216-spread--rest-operator-). |
 
 ### 2.3 Contested: Braces vs Indentation
@@ -1486,9 +1486,78 @@ fn divide(a: Int, b: Int) -> Int {
 
 `panic` returns `Never` (bottom type), which inhabits every type — allowing it in any expression position. Panic is *not* an algebraic effect — it is untracked divergence, like integer division by zero or array bounds violations. It cannot be caught or handled in normal code (only the test runner catches it).
 
-**Use `Result[T, E]` for recoverable errors.** `panic` is reserved for programmer errors, violated invariants, and genuinely unreachable states. A lint warns when `panic()` appears in library code.
+**Use `Result[T, E]` for recoverable errors.** `panic` is reserved for programmer errors, violated invariants, and genuinely unreachable states. A lint warns when `panic()` appears in library code. It does not fire on `todo()` or `unreachable()` (below).
 
 **Panel vote: 5-0 unanimous.** See [DECISIONS.md](../DECISIONS.md).
+
+#### `todo()` and `unreachable()`
+
+Two more built-ins diverge the same way as `panic`. Each has two forms:
+
+```
+todo() -> Never
+todo(msg: Str) -> Never
+unreachable() -> Never
+unreachable(msg: Str) -> Never
+```
+
+Both are available in all code. At run time each one is a `panic` (above): untracked divergence, caught by the test runner in a test block, process termination in production code. Neither is an effect, and neither adds a typing rule: each call has type `Never`, so it diverges by the rule in §3.3 *Divergence and Body Completeness*.
+
+The two forms are a property of these built-ins only. A user function has one signature, and a positional parameter cannot have a default value (§2.13). Writing `msg: Str = ""` for these built-ins would show a signature that no user can write, so the spec lists both forms.
+
+**Which one to use.**
+
+| Situation | Write |
+|---|---|
+| Code that is not written yet | `todo()` or `todo("what is missing")` |
+| A path that the author states can never run | `unreachable()` or `unreachable("why it cannot run")` |
+| An error the caller can handle | `Result[T, E]` |
+| Any other programmer error | `panic(msg)` |
+
+```blink
+fn refund(order: Order) -> Int {
+    match order.status {
+        Pending => 0
+        Shipped => order.total
+        Cancelled => todo("refund rules for cancelled orders")
+    }
+}
+
+fn weekday_name(day: Int) -> Str {
+    // `day` comes from `day_of_week()`, which returns 0 through 6
+    match day {
+        0 => "Sun"
+        1 => "Mon"
+        2 => "Tue"
+        3 => "Wed"
+        4 => "Thu"
+        5 => "Fri"
+        6 => "Sat"
+        _ => unreachable("day_of_week returns 0 through 6")
+    }
+}
+```
+
+**`unreachable()` is a checked panic in every build mode. It is never undefined behavior.** No build mode, optimization level or flag lets the compiler assume that an `unreachable()` call does not run, or remove the call. If the author's claim is false, the program panics; it does not continue in an undefined state.
+
+**Messages.** The panic message of `todo` contains the text `not yet implemented`. The panic message of `unreachable` contains the text `entered unreachable code`. When the call has a `msg`, the panic message also contains `msg`. These two substrings are stable: a test can match them with `assert_panics(matching: "not yet implemented")`. The rest of the message text is not specified here.
+
+**`TodoInCode` (W0703).** Each call that resolves to the built-in `todo` gets this warning, in every context, test blocks included. A `todo` marks unfinished code, so CI can find each one before release. In a test, the `help:` line names `@skip("reason")` (*Skipping Tests*, below), which is the tool for a test that is not finished. Suppress the warning with `@allow(TodoInCode)`, or set its level with `W0703` under `[lints]` (§4.16.8).
+
+```
+warning[TodoInCode]: `todo()` left in code
+ --> order.bl:5:22
+  |
+5 |         Cancelled => todo("refund rules for cancelled orders")
+  |                      ^^^^ this panics if it runs
+  |
+  = help: write the missing code
+  = note: upgrade to error in blink.toml: [lints] W0703 = "error"
+```
+
+`unreachable` has no warning. It states a claim about the program, not unfinished work.
+
+**The library-panic lint.** Neither built-in triggers the lint on `panic()` in library code (above). `todo` already has its own warning. `unreachable` is the form that the paragraph on `panic` allows for states that cannot occur. The exemption applies only to a call that resolves to the built-in; a user function named `todo` or `unreachable` gets no exemption. The lint's `help:` line names `Result[T, E]` for error paths and `unreachable` only for paths that cannot run. It never proposes changing `panic` to `unreachable` as the repair by itself.
 
 #### `assert_panics` — Asserting Expected Panics
 

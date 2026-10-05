@@ -1107,7 +1107,10 @@ Two facts about the type lattice decide every case:
 A construct has type `Never` when it **provably diverges** — control cannot leave it
 normally:
 
-- `panic(msg)` and `env.exit(code)` (§2.20, §4.6) — untracked divergence.
+- A call whose result type is `Never` — untracked divergence. This covers built-ins such
+  as `panic(msg)`, `todo()`, `unreachable()` (§2.20) and `env.exit(code)` (§4.6), and a
+  user function declared `-> Never`. The rule reads the callee's declared result type,
+  never its name.
 - A bare `return`, `?`-propagation on the error path, `break`, or `continue` in tail
   position — control leaves the block by another edge.
 - A `loop { }` that **no `break` targets** — it runs forever. The search for a targeting
@@ -1170,7 +1173,20 @@ gets the same answer — a compile-time error, not a fabricated value. See
 `Never` here is not inference choosing the bottom type for an open slot — which §3.4
 forbids. A loop's type is fixed by its own structure (whether a `break` targets it),
 decided before it is compared against `R`; the check never *picks* `Never` to make a
-program type-check.
+program type-check. The same holds for a call: its type is `Never` only when the callee
+declares `-> Never`. A call whose result type is still open is not taken to diverge.
+
+```blink
+fn fail(msg: Str) -> Never {
+    panic("config: {msg}")
+}
+
+// Accepted: `fail` returns Never, so the tail diverges and Never <: Int.
+fn port(raw: Str) -> Int {
+    if raw == "" { return 8080 }
+    fail("bad port")
+}
+```
 
 **error[MissingReturn] (E0311).** Fires when control can reach the end of a block that
 must produce a value of type `R` along a path that yields `()` — a fall-through function
@@ -1181,7 +1197,8 @@ diagnostic data, not as a separate error code, so an editor or agent can offer t
 repair from one stable key. The repair named first is the one that always compiles: add a
 trailing `return <value>` (or a tail value expression), or — when "no value" is a real
 outcome — change the return type to `Option[R]` (§3.7) and yield `None`. A diverging tail
-(`panic(...)`, or a `loop` no `break` targets) is accepted and needs no repair. This
+(a call that returns `Never` such as `panic(...)` or `todo()`, or a `loop` no `break`
+targets) is accepted and needs no repair. This
 satisfies the Diagnostic Discipline of §3.1: every rejection names a repair that exists.
 
 ---
