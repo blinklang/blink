@@ -79,21 +79,24 @@ let mut vtable_state: Map[Str, Int] = Map()
 // ask for the same prototype or one of them is wrong.
 let mut foreign_decls: Map[Str, Str] = Map()
 
-// What kind of unit this is, as the prologue was told it. Linkage reads all three: a
-// name another file can see is not this unit's to keep. The values before a prologue are
-// the ones that keep every declaration external, so a caller that emits no prologue
-// cannot make a symbol private by omission.
-let mut unit_declares_for_others: Bool = true
-let mut unit_links_archive: Bool = false
-let mut unit_is_the_archive: Bool = false
+// How much of a unit's own functions may be private, as the prologue was told it. A name
+// another file can see is not this unit's to keep, so a unit that declares for others or is
+// the archive keeps everything external; a unit linked against the archive keeps only the
+// program's own module. The value before a prologue keeps every declaration external, so a
+// caller that emits no prologue cannot make a symbol private by omission.
+type UnitLinkage {
+    AllExternal
+    ProgramModuleOnly
+    WholeUnit
+}
+
+let mut unit_linkage: UnitLinkage = UnitLinkage.AllExternal
 
 pub fn cg_decl_reset() {
     typedef_state = Map()
     vtable_state = Map()
     foreign_decls = Map()
-    unit_declares_for_others = true
-    unit_links_archive = false
-    unit_is_the_archive = false
+    unit_linkage = UnitLinkage.AllExternal
 }
 
 // ── The spelling gate ─────────────────────────────────────────────────────
@@ -523,8 +526,13 @@ let entry_module = "__main__"
 //
 // One reader, so the prototype and the body cannot answer it apart.
 fn cg_decl_fn_is_internal(fn_node: Int) -> Bool {
-    if unit_declares_for_others || unit_is_the_archive { return false }
-    if unit_links_archive && cg_reg_module_of(fn_node) != entry_module { return false }
+    match unit_linkage {
+        UnitLinkage.AllExternal => return false
+        UnitLinkage.ProgramModuleOnly => {
+            if cg_reg_module_of(fn_node) != entry_module { return false }
+        }
+        UnitLinkage.WholeUnit => {}
+    }
     if node_is_pub(fn_node) == 1 { return false }
     if fn_node == cg_reg_entry_point() { return false }
     if c_ffi_symbol(fn_node) != "" { return false }
@@ -1001,9 +1009,13 @@ pub fn cg_decl_has_deferred_global(globals: List[Int], inits: Map[Int, Int]) -> 
 // ── Prologue and evidence vector ─────────────────────────────────────────────
 
 pub fn cg_decl_emit_prologue(user_tu: Bool, define_storage: Bool, test_build: Bool, header_guard: Str, self_header: Str) ! Diag.Report {
-    unit_declares_for_others = header_guard != "" || self_header != ""
-    unit_links_archive = user_tu
-    unit_is_the_archive = define_storage
+    unit_linkage = if header_guard != "" || self_header != "" || define_storage {
+        UnitLinkage.AllExternal
+    } else if user_tu {
+        UnitLinkage.ProgramModuleOnly
+    } else {
+        UnitLinkage.WholeUnit
+    }
     print_prologue(user_tu, define_storage, test_build, header_guard, self_header, program_native_gates())
     let includes = program_foreign_includes()
     print_foreign_includes(includes.headers, includes.gates)
