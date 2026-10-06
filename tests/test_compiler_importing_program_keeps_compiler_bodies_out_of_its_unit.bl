@@ -51,18 +51,33 @@ fn compiler_defs(c: Str) -> List[(Str, Bool)] {
     out
 }
 
+// Scratch paths carry this file's name, so a parallel `blink test` of another file
+// cannot write to them.
+fn scratch(name: Str) -> Str {
+    "{process_run("pwd", []).out.trim()}/build/test_compiler_importing_program_keeps_compiler_bodies_out_of_its_unit-{name}"
+}
+
+fn build_archive(dir: Str) {
+    let built = process_run("build/blink", ["__build-compiler-archive", dir, "tokens", "compiler"])
+    assert_eq(built.exit_code, 0, "the compiler archive did not build:\n{built.err_out}")
+    assert(file_exists("{dir}/libblink_compiler.a") != 0, "no compiler archive at {dir}:\n{built.out}{built.err_out}")
+}
+
 // The archive the corpus built for this run, or one this test builds from the fixture's
 // imports when it runs on its own.
 let mut built_archive_dir: Str = ""
 
 fn archive_dir() -> Str {
-    let given = env.var("BLINK_COMPILER_ARCHIVE") ?? ""
-    if given != "" { return given }
     if built_archive_dir != "" { return built_archive_dir }
-    let dir = "{process_run("pwd", []).out.trim()}/build/_compiler_importing_fixture_archive"
-    let built = process_run("build/blink", ["__build-compiler-archive", dir, "tokens", "compiler"])
-    assert_eq(built.exit_code, 0, "the compiler archive did not build:\n{built.err_out}")
-    assert(file_exists("{dir}/libblink_compiler.a") != 0, "no compiler archive at {dir}:\n{built.out}{built.err_out}")
+    let mut dir = env.var("BLINK_COMPILER_ARCHIVE") ?? ""
+    if dir == "" {
+        dir = scratch("archive")
+        build_archive(dir)
+    }
+    // An empty archive would leave nothing out of the program's unit, and the rows that
+    // count what the unit defines would pass on it.
+    let nm = process_run("nm", ["--defined-only", "{dir}/libblink_compiler.a"])
+    assert(nm.out.contains(" T blink_tokens_keyword_lookup"), "the compiler archive at {dir} does not define the function the fixture calls")
     built_archive_dir = dir
     dir
 }
@@ -126,7 +141,7 @@ test "the program's unit defines compiler functions when no compiler archive is 
 // proves they compile and link beside the archive.
 test "the program built through the compiler archive links and runs" {
     let path = ".tmp/_linkcli_compiler_importing_fixture.bl"
-    let bin = "build/_linkcli_compiler_importing_fixture"
+    let bin = scratch("bin")
     write_file(path, fixture_src())
     let b = cli(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], ["build", "--debug", path, "-o", bin])
     fs_remove(path)
@@ -135,6 +150,7 @@ test "the program built through the compiler archive links and runs" {
     assert(nm.out.contains("__blink_init_compiler_globals"), "the binary did not link the compiler archive")
     let r = process_run(bin, [])
     fs_remove(bin)
+    if file_exists("{bin}.c") != 0 { fs_remove("{bin}.c") }
     assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
     assert_eq(r.out.trim(), "0")
 }
@@ -161,9 +177,8 @@ test.failing(
 // An archive built from another version of a module the program imports would link two
 // versions of the compiler into one binary.
 test "a compiler archive built from other source than the program imports is refused" {
-    let dir = "{process_run("pwd", []).out.trim()}/build/_compiler_importing_fixture_stale_archive"
-    let built = process_run("build/blink", ["__build-compiler-archive", dir, "tokens", "compiler"])
-    assert_eq(built.exit_code, 0, "the compiler archive did not build:\n{built.err_out}")
+    let dir = scratch("stale-archive")
+    build_archive(dir)
     let copy = "{dir}/src/tokens.bl"
     assert(file_exists(copy) != 0, "the archive keeps no copy of tokens")
     write_file(copy, "{read_file(copy)}\n// changed after the build\n")
@@ -174,4 +189,27 @@ test "a compiler archive built from other source than the program imports is ref
     let _ = process_run("rm", ["-rf", dir])
     assert(r.exit_code != 0, "a stale archive still reached codegen")
     assert(r.err_out.contains("is stale: tokens changed"), "the refusal does not name the changed module:\n{r.err_out}")
+    assert(r.err_out.contains("rebuild the compiler archive"), "the refusal does not say to rebuild the archive:\n{r.err_out}")
+}
+
+// The archive holds a module by its source text, not its name: a program's own module
+// that shares a compiler module's name is not the one the archive holds.
+test "a program whose own module is named like a compiler module builds in one unit and runs" {
+    let held = read_file("{archive_dir()}/skip_modules.txt").split("\n")
+    assert(held.contains("ast"), "the compiler archive holds no module named ast, so this row proves nothing")
+    let pkg = scratch("ast-pkg")
+    let _ = process_run("rm", ["-rf", pkg])
+    let _ = process_run("mkdir", ["-p", "{pkg}/src"])
+    write_file("{pkg}/blink.toml", "[package]\nname = \"astfixture\"\n")
+    write_file("{pkg}/src/ast.bl", "pub fn answer() -> Int \{\n    42\n\}\n")
+    write_file("{pkg}/main.bl", "import ast.\{answer\}\n\nfn main() \{\n    io.println(\"\{answer()\}\")\n\}\n")
+    let bin = "{pkg}/main"
+    let b = cli(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], ["build", "--debug", "{pkg}/main.bl", "-o", bin])
+    assert_eq(b.exit_code, 0, "the build failed:\n{b.err_out}")
+    let nm = process_run("nm", [bin])
+    let r = process_run(bin, [])
+    let _ = process_run("rm", ["-rf", pkg])
+    assert(!nm.out.contains("__blink_init_compiler_globals"), "the program linked the compiler archive")
+    assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
+    assert_eq(r.out.trim(), "42")
 }
