@@ -101,29 +101,44 @@ pub fn format_request(req: Request, host: Str, path: Str) -> Str {
     sb.to_str()
 }
 
-fn decode_chunked(raw: Str) -> Str {
-    let sb = StringBuilder.new()
+// Chunk sizes count bytes and a chunk may end inside a character, so the body is
+// rebuilt byte by byte and checked as UTF-8 only once it is whole.
+fn decode_chunked(raw: Str) -> Result[Str, NetError] {
+    let mut out = Bytes.new()
     let rlen = raw.len()
     let mut cursor = 0
     while cursor < rlen {
-        let crlf_idx = raw.slice(cursor, rlen).index_of("\r\n")
-        if crlf_idx < 0 { break }
-        let size_str = raw.byte_slice(cursor, cursor + crlf_idx).trim()
-        let chunk_size = parse_hex(size_str)
-        if chunk_size <= 0 { break }
-        let data_start = cursor + crlf_idx + 2
-        let data_end = data_start + chunk_size
-        if data_end > rlen {
-            sb.write(raw.slice(data_start, rlen))
-            break
+        let mut crlf = cursor
+        while crlf + 1 < rlen && !(raw.byte_at(crlf) == 13 && raw.byte_at(crlf + 1) == 10) {
+            crlf = crlf + 1
         }
-        sb.write(raw.slice(data_start, data_end))
+        if crlf + 1 >= rlen { break }
+        let mut h = cursor
+        while h < crlf && (raw.byte_at(h) == 32 || raw.byte_at(h) == 9) {
+            h = h + 1
+        }
+        let mut chunk_size = 0
+        while h < crlf && hex_char_val(raw.byte_at(h)) >= 0 {
+            chunk_size = chunk_size * 16 + hex_char_val(raw.byte_at(h))
+            h = h + 1
+        }
+        if chunk_size <= 0 { break }
+        let data_start = crlf + 2
+        let data_end = if data_start + chunk_size > rlen { rlen } else { data_start + chunk_size }
+        let mut i = data_start
+        while i < data_end {
+            out.push(raw.byte_at(i))
+            i = i + 1
+        }
         cursor = data_end
         if cursor + 2 <= rlen && raw.byte_at(cursor) == 13 && raw.byte_at(cursor + 1) == 10 {
             cursor = cursor + 2
         }
     }
-    sb.to_str()
+    match out.to_str() {
+        Ok(body) => Ok(body)
+        Err(_) => Err(NetError.ProtocolError("chunked body is not valid UTF-8"))
+    }
 }
 
 pub fn parse_response(raw: Str) -> Result[Response, NetError] {
@@ -183,7 +198,10 @@ pub fn parse_response(raw: Str) -> Result[Response, NetError] {
     let mut body = body_raw
     let te = hdrs.get("transfer-encoding") ?? ""
     if te != "" && te.contains("chunked") {
-        body = decode_chunked(body_raw)
+        body = match decode_chunked(body_raw) {
+            Ok(b) => b
+            Err(e) => { return Err(e) }
+        }
     }
 
     Ok(Response { status: status_code, body: body, headers: hdrs })

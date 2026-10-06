@@ -1,62 +1,63 @@
-// Str.slice(start, end) takes byte offsets and clamps them: a negative start reads from
-// 0, an end past the string reads to its end, and a range that is empty after clamping
-// gives "".
+// Str has no `slice` (or `substr`): a range of a Str is either codepoints or bytes, and the
+// old names did not say which. Each row below is a call that used to compile; it now draws
+// UnresolvedMethod with help that names both replacements, whatever the receiver or the
+// arguments look like. The byte-range clamping these rows once pinned lives on in
+// test_str_byte_slice_clamps_and_panics_on_a_cut_codepoint.bl.
+import compile_test_helpers
 
-test "an in-range slice gives the bytes between the bounds" {
-    assert_eq("hello".slice(0, 5), "hello")
-    assert_eq("hello".slice(1, 4), "ell")
-    assert_eq("hello".slice(4, 5), "o")
+fn error_count(out: Str) -> Int {
+    out.split("\"severity\":\"error\"").len() - 1
 }
 
-test "an empty range gives the empty string" {
-    assert_eq("hello".slice(0, 0), "")
-    assert_eq("hello".slice(5, 5), "")
-    assert_eq("hello".slice(3, 1), "")
+// One error, on this method, with both ways out in its help: a second error would mean the
+// refusal cascaded into the code around it.
+fn expect_refused(tag: Str, src: Str, method: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_contains(out, "\"name\":\"UnresolvedMethod\"", "{tag}: UnresolvedMethod")
+    compile_test_helpers.expect_contains(out, "Str has no `.{method}`", "{tag}: names the method")
+    compile_test_helpers.expect_contains(out, "`.substring`", "{tag}: help names substring")
+    compile_test_helpers.expect_contains(out, "`.byte_slice(start, end)`", "{tag}: help names byte_slice")
+    assert_eq(error_count(out), 1)
 }
 
-test "a negative start is clamped to zero" {
-    assert_eq("hello".slice(-2, 2), "he")
-    assert_eq("hello".slice(-9, 99), "hello")
+test "slice on a Str literal is refused with help naming substring and byte_slice" {
+    expect_refused("str_slice_lit", "fn main() \{\n    let _x = \"hello\".slice(1, 4)\n}\n", "slice")
 }
 
-test "an end past the string is clamped to its length" {
-    assert_eq("hello".slice(2, 99), "llo")
-    assert_eq("hello".slice(0, 6), "hello")
+test "slice on a Str variable is refused" {
+    expect_refused("str_slice_var", "fn main() \{\n    let s = \"hello\"\n    let _x = s.slice(0, 5)\n}\n", "slice")
 }
 
-test "a start at or past the end gives the empty string" {
-    assert_eq("hello".slice(5, 9), "")
-    assert_eq("hello".slice(7, 9), "")
-    assert_eq("hello".slice(7, 3), "")
+test "slice with out-of-range bounds is refused, not clamped" {
+    expect_refused("str_slice_neg", "fn main() \{\n    let _x = \"hello\".slice(-2, 99)\n}\n", "slice")
 }
 
-test "a negative end gives the empty string" {
-    assert_eq("hello".slice(1, -1), "")
-    assert_eq("hello".slice(-5, -1), "")
-    assert_eq("hello".slice(0, -1), "")
+test "slice bound to a declared Str is refused once, with no type error after it" {
+    expect_refused("str_slice_decl", "fn main() \{\n    let _x: Str = \"hello\".slice(0, 2)\n}\n", "slice")
 }
 
-test "slicing the empty string gives the empty string" {
-    assert_eq("".slice(0, 0), "")
-    assert_eq("".slice(0, 3), "")
-    assert_eq("".slice(-1, 1), "")
+test "substr is refused with the same help" {
+    expect_refused("str_substr", "fn main() \{\n    let _x = \"hello\".substr(1, 3)\n}\n", "substr")
 }
 
-test "offsets count bytes, not characters" {
-    assert_eq("héllo".slice(1, 3), "é")
-    assert_eq("héllo".slice(3, 6), "llo")
-    assert_eq("héllo".len(), 6)
+test "slice on the empty Str is refused" {
+    expect_refused("str_slice_empty", "fn main() \{\n    let _x = \"\".slice(0, 0)\n}\n", "slice")
 }
 
-test "a slice near the start of a long string reads only its range" {
-    let sb = StringBuilder.new()
-    let mut i = 0
-    while i < 100000 {
-        sb.write("abcdefghij")
-        i = i + 1
-    }
-    let s = sb.to_str()
-    assert_eq(s.slice(0, 3), "abc")
-    assert_eq(s.slice(999995, 1000005), "fghij")
-    assert_eq(s.slice(999998, 2000000), "ij")
+test "slice on a Str with multi-byte characters is refused" {
+    expect_refused("str_slice_utf8", "fn main() \{\n    let _x = \"héllo€😀\".slice(1, 3)\n}\n", "slice")
+}
+
+test "slice on a Str returned by a call is refused" {
+    expect_refused("str_slice_call", "fn main() \{\n    let sb = StringBuilder.new()\n    sb.write(\"abc\")\n    let _x = sb.to_str().slice(0, 2)\n}\n", "slice")
+}
+
+test "a StrOps-qualified slice is refused" {
+    expect_refused("str_slice_qual", "import std.traits.\{StrOps}\nfn main() \{\n    let _x = StrOps.slice(\"hello\", 0, 5)\n}\n", "slice")
+}
+
+test "List and Bytes keep slice" {
+    let src = "fn main() \{\n    let xs = [1, 2, 3]\n    let _a = xs.slice(0, 2)\n    let b = Bytes.from_str(\"abc\")\n    let _c = b.slice(0, 2)\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "list_bytes_slice")
+    compile_test_helpers.expect_compiles_clean(out, "List and Bytes slice compile")
 }

@@ -2465,7 +2465,7 @@ BLINK_RT_FN int blink_str_next_char(const char* s, int64_t* pos, int32_t* out) {
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len) {
-    /* A start or a count past the end keeps only what s has, as blink_str_slice
+    /* A start or a count past the end keeps only what s has, as blink_str_byte_slice
        does, so the copy stays inside s and the header counts the bytes copied. */
     int64_t slen = blink_str_len(s);
     if (start < 0) start = 0;
@@ -2753,20 +2753,6 @@ BLINK_RT_FN int blink_str_ends_with(const char* s, const char* suffix) {
     size_t sufflen = (size_t)blink_str_len(suffix);
     if (sufflen > slen) return 0;
     return memcmp(s + slen - sufflen, suffix, sufflen) == 0;
-}
-#endif
-
-BLINK_RT_FN const char* blink_str_slice(const char* s, int64_t start, int64_t end);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_str_slice(const char* s, int64_t start, int64_t end) {
-    if (start < 0) start = 0;
-    int64_t slen = blink_str_len(s);
-    if (end > slen) end = slen;
-    if (start >= end) return BLINK_STR_EMPTY;
-    int64_t rlen = end - start;
-    char* buf = blink_str_alloc(rlen);
-    memcpy(buf, s + start, (size_t)rlen);
-    return buf;
 }
 #endif
 
