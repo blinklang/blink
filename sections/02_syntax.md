@@ -773,6 +773,115 @@ fn transform(x: Int) -> Int {
 }
 ```
 
+### 2.12.2 Opaque Types
+
+`pub type T { ... }` exports the name `T` and its body: its fields or its variants. Code in any module can build a `T`, match on it, and read its fields. `pub opaque type T { ... }` exports only the name. The body is visible only in the module that declares `T`.
+
+```blink
+@module("clock")
+
+pub opaque type Stamp {
+    nanos: Int
+}
+
+pub const Stamp.ZERO = Stamp { nanos: 0 }
+
+pub fn Stamp.from_secs(s: Int) -> Stamp {
+    Stamp { nanos: s * 1000000000 }
+}
+```
+
+Outside the module `clock`:
+
+```blink
+import clock.{Stamp}
+
+fn demo(s: Stamp) {
+    let a = Stamp.ZERO                 // OK: a `pub` constant (§2.12.3)
+    let b = Stamp.from_secs(5)         // OK: a `pub` type-scoped fn (§2.12.3)
+    let c = Stamp { nanos: 5 }         // error[E1003]: the body of `Stamp` is private to `clock`
+    let n = s.nanos                    // error[E1003]
+    match s {
+        Stamp { .. } => {}             // error[E1003]: no pattern on an opaque type
+    }
+}
+```
+
+**What the rule hides.** Outside the declaring module, code cannot:
+
+- build a value with a struct literal, a spread (§2.16) or a variant;
+- read or write a field;
+- match a pattern on the type. This includes `T { .. }`, which names no field. Bind the value to a name, or use `_`.
+
+Everything else works the same as for any type. Code can hold, pass, return and store a value, call trait methods on it, and use the `pub` constants and type-scoped functions of the type (§2.12.3).
+
+**Enums.** An opaque enum hides all of its variants. Outside the declaring module, code cannot build a variant or match on one. No outside `match` on the type can exist, so no exhaustiveness question comes up.
+
+**Where the rule applies.** The check uses the module of the source text:
+
+- Generic code in the declaring module can use the body, wherever mono instantiates it. Generic code in another module cannot.
+- A type alias does not open the type. `type Moment = Stamp` in another module is opaque there too.
+- In a const expression (§2.21) outside the declaring module, `==`, `!=`, `<`, `>`, `<=` and `>=` on an opaque type are errors. At run time these operators call the type's `Eq` and `Ord` impls. Const evaluation compares the representation directly, which would read the hidden body.
+
+**Value semantics do not change.** `opaque` changes visibility only. A value of an opaque type is copied, passed and stored like a value of any other type. An opaque type is not an `@ffi.opaque` handle (§9.1.4), which stands for a C type that has no layout on the Blink side.
+
+**`opaque` is on the type, not on fields.** There is no per-field `pub`. A type with public fields is a plain `pub type`. A type that has an invariant to protect is a `pub opaque type`. A private type (no `pub`) needs no `opaque`: no other module can name it.
+
+**Derived impls.** A derived impl runs in the declaring module, so it can use the body. *Note (informative):* `@derive(Debug)` on an opaque type works as on any type, and its output shows the hidden fields. To hide a field, such as a secret, write `impl Debug` by hand.
+
+**Diagnostic.** A use of the body outside the declaring module is `PrivateItemAccess` (E1003), the same code as a use of an item that is not `pub`. The message names the type and its module, not a hidden field. The help names the public way in, such as a constant or a type-scoped function.
+
+```
+error[E1003]: the body of `Stamp` is private to module `clock`
+ --> src/main.bl:5:13
+  |
+5 |     let c = Stamp { nanos: 5 }
+  |             ^^^^^ `Stamp` is an opaque type
+  |
+  = help: build a `Stamp` with a `pub` constant or function of `Stamp`, such as `Stamp.from_secs`
+```
+
+`opaque` is a contextual word. It has this meaning only between `pub` and `type` (§2.23).
+
+### 2.12.3 Type-Scoped Declarations
+
+A module can declare a constant or a function in the scope of a type that the module declares. The name has the form `T.name`, and code reaches it as `T.name`:
+
+```blink
+pub opaque type MsgFlags {
+    bits: Int
+}
+
+pub const MsgFlags.NONE = MsgFlags { bits: 0 }
+pub const MsgFlags.PEEK = MsgFlags { bits: 1 }
+
+pub type Duration {
+    nanos: Int
+}
+
+pub fn Duration.ms(n: Int) -> Duration {
+    Duration { nanos: n * 1000000 }
+}
+
+fn read(-- flags: MsgFlags = MsgFlags.NONE) { /* ... */ }
+
+let d = Duration.ms(100)
+```
+
+**Constants.** `const T.NAME = <expr>` follows every rule of a plain `const` (§2.21). The right side must be a const expression. A type annotation is optional, with the same rule as a plain `const`. `T.NAME` is a const reference, so it is legal in every place that requires a const expression, such as a keyword default.
+
+**Functions.** `fn T.name(params) -> R` is an ordinary function that has no receiver. A `self` parameter is a compile error: a method belongs to a trait (§3c.4 *No Inherent Methods*). Method syntax `x.name()` never reaches a type-scoped function. Only `T.name(...)` calls it.
+
+**Rules for both kinds:**
+
+- **Only the declaring module.** `T` must be a type that the same module declares. `const Other.X` or `fn Other.f()` for a type from another module is a compile error, and the message names the module that declares `Other`. The constants of a builtin type, such as `Float.INF`, belong to the prelude, which declares `Float`.
+- **Visibility.** `pub` exports the name. Without `pub`, the name is private to the module, as for any item (§2.12). An opaque type uses this to give the outside its way in.
+- **Use from another module.** Import the type, then write `T.name`. The form `mod.T.name` is E1007.
+- **No constants on generic types for now.** `T` in `const T.NAME` must not take type parameters.
+- **One `T.` namespace.** The variants of `T`, its type-scoped constants and functions, and the associated functions that trait impls give `T` (§3c.4) all share the names after `T.`. Two of them with one name are `DuplicateModuleBinding` (E1016). The check covers the whole package, because a trait impl can live in any module of the package (§3.6). When the trait impl is in another package, the declaration site cannot see it, so the clash is an ambiguity at the use site (E0522). Name the trait's function with an impl-qualified call: `(Trait for T).name()` (§3c.4).
+
+**Why a top-level declaration, not a declaration in the type body.** The type body holds only the representation, fields or variants. For an opaque type, the body is the hidden part, and an API inside it would mix the two. The declaration text is also the same as the use text, so a search for `MsgFlags.NONE` finds both.
+
 ### 2.13 Declaration-Site Keyword Arguments
 
 Functions use a `--` separator to divide positional parameters from keyword parameters. Positional params come before `--`, keyword params come after. The function author decides which params are keyword — the caller has no choice. Principle 2 preserved.
@@ -1351,7 +1460,7 @@ pub type TestError {
 }
 ```
 
-`TestError` is opaque to user code — it cannot be pattern-matched on, constructed, or extended. The runner is its sole consumer.
+`TestError` is an opaque type (§2.12.2) — user code cannot pattern-match on it or construct it, and it cannot be extended. The runner is its sole consumer.
 
 **Lowering.** At each `?` site inside a test body, the `Err(e)` arm of the desugar (§3c.2 Rule 2) is rewritten to invoke `Display.display(e)` and return `Err(TestError { ... })`. For an operand of type `Result[T, E]`, the lowering is:
 
@@ -1954,7 +2063,7 @@ A **const expression** is built from a closed set of operations that the compile
 | Arithmetic | `+`, `-`, `*`, `/`, `%`, unary `-` | `1024 * 64`, `TIMEOUT / 3` |
 | Boolean | `&&`, `\|\|`, `!` | `true && !DEBUG` |
 | Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` | `MAX > 0` |
-| Const references | Other `const` bindings by name | `MAX_PAYLOAD * 2` |
+| Const references | Other `const` bindings by name, and type-scoped constants (§2.12.3) | `MAX_PAYLOAD * 2`, `MsgFlags.NONE` |
 | Struct literals | Struct construction with all-const fields | `ServerConfig { port: 8080 }` |
 | Enum variants | Variant construction with const payloads | `LogLevel.Info`, `Some(42)` |
 
@@ -1965,6 +2074,7 @@ What is **not** a const expression:
 - `let` bindings: referencing a `let` variable is not const
 - Collection constructors: `List.new()`, `Map.new()` — these allocate
 - Mutable state: anything involving `let mut`
+- An operator on a user type: `MsgFlags.PEEK | MsgFlags.WAITALL`. The operator is a call to a trait impl (§3.6), so §2.21 does not admit it. To use a combination as a default, declare it as its own constant.
 
 ```blink
 // Valid const expressions
@@ -2232,6 +2342,8 @@ These words are **keywords**. The lexer reads each one as a keyword token in eve
 
 `async` is **not** a keyword. It is an ordinary identifier, the namespace of `async.spawn` and `async.scope` (§4).
 
+`opaque` is **not** a keyword. It is a contextual word: it has meaning only between `pub` and `type` (§2.12.2). In every other position it is an ordinary identifier.
+
 This table is the one list of keywords. §10.6 and the `blink explain E1103` text refer to it. A CI test fails if the set of words in this table is not exactly the set the lexer reads as keywords.
 
 #### Members and Bindings
@@ -2245,6 +2357,7 @@ A **member name** is a name that a program reaches only through a type or a valu
 3. The name after `.`: field access `r.handler`, method call `r.match(path)`, and a qualified name `m.x`.
 4. A field label in a struct pattern, written with `:`: `Route { handler: h, .. }`.
 5. A method name declared in an `impl` or `trait` body: `fn match(self, path: Str) -> Bool`. A caller reaches the method only through `.`.
+6. The name after `T.` in a type-scoped declaration (§2.12.3): `const T.NAME` or `fn T.name`. A caller reaches it only through `T.`.
 
 In grammar terms, each of these positions takes a `MEMBER_NAME`, and every other name position takes an `IDENT`:
 

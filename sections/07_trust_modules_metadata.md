@@ -1229,14 +1229,14 @@ fn sendto_bytes(fd: Int, data: Bytes, dest: SockAddr, -- flags: MsgFlags = MsgFl
 
 Both follow the naming law of §9.1.3.3: the peer address is a non-buffer out-parameter, so it follows the `Bytes` in the success tuple, and it is `Option` because the kernel may return no address.
 
-**`MsgFlags` (normative).** `MsgFlags` is the type of the `flags` argument of `recv_bytes`, `send_bytes`, `recvfrom_bytes` and `sendto_bytes`. It is an opaque type: it has no public constructor and no public field.
+**`MsgFlags` (normative).** `MsgFlags` is the type of the `flags` argument of `recv_bytes`, `send_bytes`, `recvfrom_bytes` and `sendto_bytes`. It is declared `pub opaque type MsgFlags` (§2.12.2): it has no public constructor and no public field.
 
-- The only values are the named constants. This gate ratifies two: `MsgFlags.NONE` (no flags) and `MsgFlags.PEEK` (read a datagram without removing it from the queue). Each is a const expression (§2.21), so it is legal as a keyword default.
+- The only values are the named constants. This gate ratifies two: `MsgFlags.NONE` (no flags) and `MsgFlags.PEEK` (read a datagram without removing it from the queue). Each is a type-scoped constant (`pub const MsgFlags.NONE = ...`, §2.12.3), so it is a const expression (§2.21) and legal as a keyword default.
 - The bits inside `MsgFlags` use **Blink's** numbering, not the platform's. A named constant has the same meaning on every platform.
 - The wrapper checks the bits before the syscall. A bit that is not a ratified constant returns `Err(Errno(ERR_INVAL))` on every platform, and the syscall does not run. A native value never reaches the kernel as a native flag.
-- `MsgFlags` has no `|` operator yet. The bit-or implementation ships with the second ratified constant that can combine with `PEEK`.
+- `MsgFlags` has no `|` operator yet. The bit-or implementation ships with the second ratified constant that can combine with `PEEK`. A `|` expression is a trait call, so it is not a const expression (§2.21). A combined default is declared as its own constant.
 - New constants (for example `DONTWAIT`, `WAITALL`) are added under the growth gate of §9.1.3.3. Each addition is one constant, and it does not change the meaning of any existing call.
-- User code cannot write `MsgFlags(n)` or `MsgFlags { bits: n }`; either is a compile error. A general rule for fields that are private to their module does not exist yet. Until it does, `MsgFlags` is opaque by compiler knowledge, in the same way as `Instant` (§3).
+- User code cannot write `MsgFlags(n)` or `MsgFlags { bits: n }`; either is a compile error (E1003, §2.12.2).
 
 ```blink
 let head = libc.recv_bytes(fd, 16, flags: MsgFlags.PEEK)?   // peek at the header
@@ -2128,7 +2128,7 @@ import auth.{Token, Token as AuthToken}   // OK: two names, one item
 | E1000 | Module not found | No file at resolved path, no matching dependency |
 | E1001 | Duplicate module name | Two files claim same `@module` name |
 | E1002 | Circular package dependency | Cross-package import cycle |
-| E1003 | Private item access | Referencing or importing a function, type, trait, variant or other item that is not `pub` in its declaring module |
+| E1003 | Private item access | Referencing or importing a function, type, trait, variant or other item that is not `pub` in its declaring module, or using the body of an opaque type outside its declaring module (§2.12.2) |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
 | E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items |
 | E1006 | Import not selected | A bare name comes from an imported module but is not in the selective import list |
@@ -2140,7 +2140,7 @@ import auth.{Token, Token as AuthToken}   // OK: two names, one item
 | E1012 | Duplicate symbol | A module-level declaration takes a name that a selective import (`import` or `pub import`) binds |
 | E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
 | E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |
-| E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1) |
+| E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), or two members of one `T.` namespace in a package share a name (§2.12.3) |
 
 ```
 error[E1003]: item `Token` is private in module `auth.internal`
