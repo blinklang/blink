@@ -89,7 +89,7 @@ All six panelists agreed to drop W0811 (init-flow analysis), W0813 (zero-len Buf
 
 ```blink
 // β-minimal: typed C-shaped record
-@ffi.struct(header = "poll.h", name = "pollfd")
+@ffi.struct(header: "poll.h", name: "pollfd")
 pub type Pollfd {
     fd: I32,
     events: I16,
