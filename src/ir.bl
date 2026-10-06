@@ -20,8 +20,8 @@
 // sibling or from further out names a local that is out of scope there, and the verifier
 // rejects that tree; lowering shares such a value through a Let instead.
 //
-// The kids of a node are node ids into one arena. Ids are dense and stable for the life of
-// the arena; ir_reset() empties it. A node is created after its kids, so a well-formed tree
+// The kids of a node are node ids into one arena. No id is reused before ir_reset() empties
+// it, so an id names one node or none. A node is created after its kids, so a well-formed tree
 // is one where every kid id is smaller than its parent id. The verifier does not rely on
 // that ordering: it walks the tree and reports a cycle.
 
@@ -81,17 +81,76 @@ pub type IrNode {
     gc_layout: Str
 }
 
-// The arena. A node id is an index into this list, the same shape parser.bl uses for AST
-// nodes. Statements carry tid -1: tid 0 is a real type (the first interned one), so 0 can
-// not mean "unset".
-let mut ir_nodes: List[IrNode] = []
+// The arena, in two parts. Statements carry tid -1: tid 0 is a real type (the first
+// interned one), so 0 can not mean "unset".
+//
+// The driver prints a body as soon as it is lowered and never reads that body's nodes
+// again, so each body releases the one before it; keeping them would hold the whole unit's
+// IR live to the collector. What was built before the first body is kept: the deferred
+// global initializers are lowered ahead of every body and printed after all of them.
+//
+// pinned holds ids [0, floor), the nodes built before the first body. nodes holds ids from
+// base up, the current body's. Ids in [floor, base) belonged to released bodies, and a read
+// of one stops the compiler: the node a reused index held instead would print the wrong C
+// with no report.
+type IrArena {
+    pinned: List[IrNode]
+    nodes: List[IrNode]
+    floor: Int
+    base: Int
+    body_open: Bool
+}
+
+let mut ir_arena: IrArena = IrArena { pinned: [], nodes: [], floor: 0, base: 0, body_open: false }
 
 pub fn ir_reset() {
-    ir_nodes = []
+    ir_arena = IrArena { pinned: [], nodes: [], floor: 0, base: 0, body_open: false }
     verify_marks = VerifyMarks { epoch: 0, words: [] }
 }
 
-pub fn ir_node_count() -> Int { ir_nodes.len() }
+// The start of one body, and the end of the body before it.
+pub fn ir_begin_body() {
+    let a = ir_arena
+    if !a.body_open {
+        let n = a.nodes.len()
+        ir_arena = IrArena { pinned: a.nodes, nodes: [], floor: n, base: n, body_open: true }
+    } else {
+        ir_arena = IrArena { pinned: a.pinned, nodes: [], floor: a.floor, base: a.base + a.nodes.len(), body_open: true }
+    }
+}
+
+// The id the next node will get.
+pub fn ir_node_count() -> Int { ir_arena.base + ir_arena.nodes.len() }
+
+// Whether `id` names a node a reader may still read.
+fn in_arena(id: Int) -> Bool {
+    if id >= ir_arena.base { return id < ir_node_count() }
+    id >= 0 && id < ir_arena.floor
+}
+
+fn part_of(id: Int) -> List[IrNode] { if id < ir_arena.floor { ir_arena.pinned } else { ir_arena.nodes } }
+
+// Every node read passes through here, so the current body's case stays small enough for
+// the C compiler to inline; the rest lives in pinned_index.
+fn index_in_part(id: Int) -> Int {
+    if id >= ir_arena.base { return id - ir_arena.base }
+    pinned_index(id)
+}
+
+fn pinned_index(id: Int) -> Int {
+    if id >= 0 && id < ir_arena.floor { return id }
+    // src has no panic call of its own, and a failed assert inside a test is reported
+    // rather than raised; unwrapping an Err panics with its text.
+    let stale: Result[Int, Str] = Err("internal compiler error: IR node {id} read but not in the arena (ids {ir_arena.floor} to {ir_arena.base - 1} were released with their bodies)")
+    stale.unwrap()
+}
+
+// A dense index over both parts, for a table kept per readable node.
+fn arena_index(id: Int) -> Int { if id < ir_arena.floor { id } else { ir_arena.floor + index_in_part(id) } }
+
+fn arena_len() -> Int { ir_arena.floor + ir_arena.nodes.len() }
+
+fn set_node(id: Int, n: IrNode) { part_of(id).set(index_in_part(id), n) }
 
 // The raw constructor. Every per-kind constructor goes through it; tests use it directly to
 // build trees the per-kind constructors refuse to shape, so the verifier can be exercised.
@@ -102,14 +161,14 @@ pub fn ir_new(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, s
         IrKind.EffectPerform => c_vtable_userdata_member(c_name)
         _ => ""
     }
-    ir_nodes.push(IrNode {
+    ir_arena.nodes.push(IrNode {
         kind: kind, tid: tid, span: span, c_spelling: c_spelling, c_name: c_name,
         slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids), decl: -1,
         tag_member: "", payload_member: "", kops_table: "",
         userdata_member: userdata,
         capture_descs: "", promoter: "", gc_layout: "",
     })
-    ir_nodes.len() - 1
+    ir_node_count() - 1
 }
 
 fn copy_ids(xs: List[Int]) -> List[Int] {
@@ -120,40 +179,40 @@ fn copy_ids(xs: List[Int]) -> List[Int] {
 
 // ── Accessors ─────────────────────────────────────────────────────────────
 
-pub fn ir_node(id: Int) -> IrNode { ir_nodes.get(id).unwrap() }
+pub fn ir_node(id: Int) -> IrNode { part_of(id)[index_in_part(id)] }
 // The field accessors read in place: ir_node returns a copy of the whole node, and every
 // stage asks these once or more per node.
-pub fn ir_kind(id: Int) -> IrKind { ir_nodes[id].kind }
-pub fn ir_tid(id: Int) -> Int { ir_nodes[id].tid }
-pub fn ir_span(id: Int) -> Int { ir_nodes[id].span }
-pub fn ir_c_spelling(id: Int) -> Str { ir_nodes[id].c_spelling }
-pub fn ir_c_name(id: Int) -> Str { ir_nodes[id].c_name }
+pub fn ir_kind(id: Int) -> IrKind { part_of(id)[index_in_part(id)].kind }
+pub fn ir_tid(id: Int) -> Int { part_of(id)[index_in_part(id)].tid }
+pub fn ir_span(id: Int) -> Int { part_of(id)[index_in_part(id)].span }
+pub fn ir_c_spelling(id: Int) -> Str { part_of(id)[index_in_part(id)].c_spelling }
+pub fn ir_c_name(id: Int) -> Str { part_of(id)[index_in_part(id)].c_name }
 
-pub fn ir_tag_member(id: Int) -> Str { ir_nodes[id].tag_member }
+pub fn ir_tag_member(id: Int) -> Str { part_of(id)[index_in_part(id)].tag_member }
 
-pub fn ir_payload_member(id: Int) -> Str { ir_nodes[id].payload_member }
+pub fn ir_payload_member(id: Int) -> Str { part_of(id)[index_in_part(id)].payload_member }
 
-pub fn ir_kops_table(id: Int) -> Str { ir_nodes[id].kops_table }
+pub fn ir_kops_table(id: Int) -> Str { part_of(id)[index_in_part(id)].kops_table }
 
-pub fn ir_userdata_member(id: Int) -> Str { ir_nodes[id].userdata_member }
+pub fn ir_userdata_member(id: Int) -> Str { part_of(id)[index_in_part(id)].userdata_member }
 
-pub fn ir_capture_descs(id: Int) -> Str { ir_nodes[id].capture_descs }
+pub fn ir_capture_descs(id: Int) -> Str { part_of(id)[index_in_part(id)].capture_descs }
 
-pub fn ir_promoter(id: Int) -> Str { ir_nodes[id].promoter }
+pub fn ir_promoter(id: Int) -> Str { part_of(id)[index_in_part(id)].promoter }
 
-pub fn ir_gc_layout(id: Int) -> Str { ir_nodes[id].gc_layout }
-pub fn ir_slot_form(id: Int) -> SlotForm { ir_nodes[id].slot_form }
+pub fn ir_gc_layout(id: Int) -> Str { part_of(id)[index_in_part(id)].gc_layout }
+pub fn ir_slot_form(id: Int) -> SlotForm { part_of(id)[index_in_part(id)].slot_form }
 // The printer's one type-shaped question, asked without importing SlotForm.
 pub fn ir_held_by_pointer(id: Int) -> Bool {
-    match ir_nodes[id].slot_form {
+    match part_of(id)[index_in_part(id)].slot_form {
         SlotForm.PointerBoxed => true
         _ => false
     }
 }
-pub fn ir_must_materialize(id: Int) -> Int { ir_nodes[id].must_materialize }
-pub fn ir_decl(id: Int) -> Int { ir_nodes[id].decl }
-pub fn ir_kid_count(id: Int) -> Int { ir_nodes[id].kids.len() }
-pub fn ir_kid(id: Int, i: Int) -> Int { ir_nodes[id].kids[i] }
+pub fn ir_must_materialize(id: Int) -> Int { part_of(id)[index_in_part(id)].must_materialize }
+pub fn ir_decl(id: Int) -> Int { part_of(id)[index_in_part(id)].decl }
+pub fn ir_kid_count(id: Int) -> Int { part_of(id)[index_in_part(id)].kids.len() }
+pub fn ir_kid(id: Int, i: Int) -> Int { part_of(id)[index_in_part(id)].kids[i] }
 
 // A copy, so a caller can not grow a node's kid list behind the verifier's back.
 pub fn ir_kids(id: Int) -> List[Int] { copy_ids(ir_node(id).kids) }
@@ -179,8 +238,8 @@ fn binds_statement_within(id: Int, budget: Int) -> Bool {
     if ir_must_materialize(id) == 1 && !ir_kind_is_name(kind) { return true }
     if kind == IrKind.Box { return true }
     if (kind == IrKind.ContainerNew || kind == IrKind.ClosureNew) && ir_kid_count(id) > 0 { return true }
-    for kid in ir_nodes[id].kids {
-        if kid >= 0 && kid < ir_node_count() && binds_statement_within(kid, budget - 1) { return true }
+    for kid in part_of(id)[index_in_part(id)].kids {
+        if in_arena(kid) && binds_statement_within(kid, budget - 1) { return true }
     }
     false
 }
@@ -194,7 +253,7 @@ pub fn ir_kind_is_name(kind: IrKind) -> Bool { kind == IrKind.VarRef || kind == 
 
 pub fn ir_mark_materialize(id: Int) {
     let n = ir_node(id)
-    ir_nodes.set(id, IrNode { must_materialize: 1, ..n })
+    set_node(id, IrNode { must_materialize: 1, ..n })
 }
 
 // ── Kind tables ───────────────────────────────────────────────────────────
@@ -488,7 +547,7 @@ pub fn ir_enum_new(tid: Int, span: Int, c_spelling: Str, variant: Int, member: S
 
 fn set_decl(id: Int, decl: Int) {
     let n = ir_node(id)
-    ir_nodes.set(id, IrNode { decl: decl, ..n })
+    set_node(id, IrNode { decl: decl, ..n })
 }
 
 // Stamped wherever a node is built, from the one producer of each name, so that no build
@@ -503,7 +562,7 @@ fn stamp_tagged_members(id: Int) -> Int {
         _ => return id
     }
     let n = ir_node(id)
-    ir_nodes.set(id, IrNode { tag_member: c_enum_tag_member(), payload_member: payload, ..n })
+    set_node(id, IrNode { tag_member: c_enum_tag_member(), payload_member: payload, ..n })
     id
 }
 
@@ -519,7 +578,7 @@ pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, 
 fn set_named_slots(id: Int, kops: Str, capture_descs: Str, promoter: Str) -> Int {
     if kops == "" && capture_descs == "" && promoter == "" { return id }
     let n = ir_node(id)
-    ir_nodes.set(id, IrNode { kops_table: kops, capture_descs: capture_descs, promoter: promoter, ..n })
+    set_node(id, IrNode { kops_table: kops, capture_descs: capture_descs, promoter: promoter, ..n })
     id
 }
 
@@ -541,7 +600,7 @@ pub fn ir_box(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value
 fn set_gc_layout(id: Int, gc_layout: Str) -> Int {
     if gc_layout == "" { return id }
     let n = ir_node(id)
-    ir_nodes.set(id, IrNode { gc_layout: gc_layout, ..n })
+    set_node(id, IrNode { gc_layout: gc_layout, ..n })
     id
 }
 
@@ -789,7 +848,7 @@ pub fn ir_verify_in_frame(root: Int, declared: List[Str]) -> List[Str] {
 
 fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
     let mut errs: List[Str] = []
-    if root < 0 || root >= ir_node_count() {
+    if !in_arena(root) {
         errs.push("root {root}: node id out of range (arena holds {ir_node_count()})")
         return errs
     }
@@ -812,9 +871,9 @@ fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
     errs
 }
 
-// What one verify_root call has learnt about each node id, two words per id: the walk
-// state, then the block that first reached the node. The arena holds every body of a unit
-// and the driver verifies each body, so the table is kept across calls and each call takes
+// What one verify_root call has learnt about each node id, two words per id at its
+// arena_index: the walk state, then the block that first reached the node. The driver
+// verifies every body of a unit, so the table is kept across calls and each call takes
 // a fresh epoch instead of clearing it; a word written under an older epoch reads as never
 // reached. The walk state is 2 * epoch while the node is on the walk and 2 * epoch + 1 once
 // it is done.
@@ -827,15 +886,15 @@ let mut verify_marks: VerifyMarks = VerifyMarks { epoch: 0, words: [] }
 
 fn begin_verify_marks() {
     let mut words = verify_marks.words
-    while words.len() < 2 * ir_node_count() { words.push(0) }
+    while words.len() < 2 * arena_len() { words.push(0) }
     verify_marks = VerifyMarks { epoch: verify_marks.epoch + 1, words: words }
 }
 
-fn mark_on_walk(id: Int) -> Bool { verify_marks.words[2 * id] == 2 * verify_marks.epoch }
+fn mark_on_walk(id: Int) -> Bool { verify_marks.words[2 * arena_index(id)] == 2 * verify_marks.epoch }
 
-fn mark_reached(id: Int) -> Bool { verify_marks.words[2 * id] >= 2 * verify_marks.epoch }
+fn mark_reached(id: Int) -> Bool { verify_marks.words[2 * arena_index(id)] >= 2 * verify_marks.epoch }
 
-fn mark_first_block(id: Int) -> Int { verify_marks.words[2 * id + 1] }
+fn mark_first_block(id: Int) -> Int { verify_marks.words[2 * arena_index(id) + 1] }
 
 // A local in scope during verify_frame_writes: its C name, its kind, and how many PanicCatch
 // bodies enclosed its declaration.
@@ -942,8 +1001,8 @@ fn verify_node(id: Int, blocks: List[Int], errs: List[Str], scope: List[Str], de
         }
         return
     }
-    verify_marks.words.set(2 * id, 2 * verify_marks.epoch)
-    verify_marks.words.set(2 * id + 1, block)
+    verify_marks.words.set(2 * arena_index(id), 2 * verify_marks.epoch)
+    verify_marks.words.set(2 * arena_index(id) + 1, block)
     verify_fields(id, kind, errs)
     if scoped && reads_a_name(kind) && !in_scope(ir_c_name(id), scope, declared) {
         errs.push("{node_label(id)}: reads `{ir_c_name(id)}`, {VARREF_UNDECLARED}")
@@ -958,7 +1017,7 @@ fn verify_node(id: Int, blocks: List[Int], errs: List[Str], scope: List[Str], de
         let mut i = 0
         while i < n {
             let kid = ir_kid(id, i)
-            if kid < 0 || kid >= ir_node_count() {
+            if !in_arena(kid) {
                 errs.push("{node_label(id)}: kid {i} id {kid} out of range (arena holds {ir_node_count()})")
             } else {
                 verify_kid_shape(id, kind, i, n, kid, errs)
@@ -972,7 +1031,7 @@ fn verify_node(id: Int, blocks: List[Int], errs: List[Str], scope: List[Str], de
     // A Let declares its name only after its own initialiser is verified, so `let b = b`
     // reads a name that is not in scope yet, exactly as the C it prints would.
     if scoped && declares_a_name(kind) { scope.push(ir_c_name(id)) }
-    verify_marks.words.set(2 * id, 2 * verify_marks.epoch + 1)
+    verify_marks.words.set(2 * arena_index(id), 2 * verify_marks.epoch + 1)
 }
 
 // Each defect names the node it was found at. The name is built only for a defect: the
@@ -1030,7 +1089,7 @@ fn verify_fields(id: Int, kind: IrKind, errs: List[Str]) {
     // with a temp and an `if`; a Binary still holding one is a tree the printer cannot order.
     if kind == IrKind.Binary && (ir_c_name(id) == "&&" || ir_c_name(id) == "||") && ir_kid_count(id) == 2 {
         let rhs = ir_kid(id, 1)
-        if rhs >= 0 && rhs < ir_node_count() && ir_binds_statement(rhs) {
+        if in_arena(rhs) && ir_binds_statement(rhs) {
             errs.push("{node_label(id)}: right operand of `{ir_c_name(id)}` binds a statement the operator cannot skip")
         }
     }
@@ -1041,7 +1100,7 @@ fn verify_fields(id: Int, kind: IrKind, errs: List[Str]) {
         let mut i = 1
         while i < 3 {
             let answer = ir_kid(id, i)
-            if answer >= 0 && answer < ir_node_count() && ir_binds_statement(answer) {
+            if in_arena(answer) && ir_binds_statement(answer) {
                 errs.push("{node_label(id)}: an answer binds a statement the conditional cannot skip")
             }
             i = i + 1
@@ -1053,7 +1112,7 @@ fn verify_fields(id: Int, kind: IrKind, errs: List[Str]) {
         // The kid-range walk runs after this, so an operand outside the arena is left
         // for it to report rather than read here.
         let kid = ir_kid(id, 0)
-        if kid >= 0 && kid < ir_node_count() {
+        if in_arena(kid) {
             let operand = ir_c_spelling(kid)
             let want = pointer_spelling(operand)
             if ir_c_spelling(id) != want {
@@ -1193,7 +1252,7 @@ fn names_a_handler_place(read: Int) -> Bool {
 fn reads_evidence_vector(read: Int) -> Bool {
     if ir_kind(read) != IrKind.FieldGet || ir_kid_count(read) != 1 { return false }
     let obj = ir_kid(read, 0)
-    if obj < 0 || obj >= ir_node_count() { return false }
+    if !in_arena(obj) { return false }
     ir_kind(obj) == IrKind.EvidenceVector
 }
 
@@ -1247,10 +1306,10 @@ fn is_lvalue_kind(kind: IrKind) -> Bool {
 // so sharing survives a parse and the text stays arena-independent. The label also ends the
 // walk on a cyclic tree, so a dump of a malformed tree still terminates.
 pub fn ir_dump(root: Int) -> Str {
-    if root < 0 || root >= ir_node_count() { return "(out-of-range {root})" }
-    let refs = int_list(ir_node_count(), 0)
+    if !in_arena(root) { return "(out-of-range {root})" }
+    let refs = int_list(arena_len(), 0)
     count_refs(root, refs)
-    let labels = int_list(ir_node_count(), -1)
+    let labels = int_list(arena_len(), -1)
     let sb = StringBuilder.new()
     dump_node(sb, root, 0, refs, labels, [0])
     sb.to_str()
@@ -1267,11 +1326,11 @@ fn int_list(n: Int, fill: Int) -> List[Int] {
 }
 
 fn count_refs(id: Int, refs: List[Int]) {
-    let seen = refs.get(id).unwrap()
-    refs.set(id, seen + 1)
+    let seen = refs.get(arena_index(id)).unwrap()
+    refs.set(arena_index(id), seen + 1)
     if seen > 0 { return }
     for kid in ir_node(id).kids {
-        if kid >= 0 && kid < ir_node_count() { count_refs(kid, refs) }
+        if in_arena(kid) { count_refs(kid, refs) }
     }
 }
 
@@ -1282,11 +1341,11 @@ fn dump_node(sb: StringBuilder, id: Int, depth: Int, refs: List[Int], labels: Li
         sb.write("  ")
         d += 1
     }
-    if id < 0 || id >= ir_node_count() {
+    if !in_arena(id) {
         sb.write("(out-of-range {id})")
         return
     }
-    let label = labels.get(id).unwrap()
+    let label = labels.get(arena_index(id)).unwrap()
     if label >= 0 {
         sb.write("#{label}")
         return
@@ -1295,10 +1354,10 @@ fn dump_node(sb: StringBuilder, id: Int, depth: Int, refs: List[Int], labels: Li
     sb.write("(")
     sb.write(ir_kind_name(n.kind))
     // The label sits before the fields so a parser never confuses it with a `#k` kid.
-    if refs.get(id).unwrap() > 1 {
+    if refs.get(arena_index(id)).unwrap() > 1 {
         let k = next_label.get(0).unwrap()
         next_label.set(0, k + 1)
-        labels.set(id, k)
+        labels.set(arena_index(id), k)
         sb.write(" #{k}")
     }
     sb.write(" {n.tid} {n.span} {ir_slot_form_name(n.slot_form)} {n.must_materialize} ")
