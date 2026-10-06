@@ -6,7 +6,7 @@
 import std.fs
 import std.io
 import layout.{layout_reset}
-import cname.{cname_reset, c_archive_header_guard, c_layer_archive_header_guard}
+import cname.{cname_reset, c_archive_header_guard, c_layer_archive_header_guard, c_layer_archive_header_name}
 import cg_test_helpers.{cg_probe_compile}
 import cg.{CgConfig, generate, generate_archive_header}
 import mono.{run_mono}
@@ -54,13 +54,13 @@ fn std_keys() -> Map[Str, Int] {
 fn layered_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
         skip_modules: std_keys(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 1,
-        archive_over_std: 1 }
+        archive_over_std: 1, links_compiler_archive: 0 }
 }
 
 fn user_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
         skip_modules: std_keys(), user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0,
-        archive_over_std: 0 }
+        archive_over_std: 0, links_compiler_archive: 0 }
 }
 
 // A std generic instantiated at a type of this layer, a non-generic std function the layer
@@ -254,4 +254,50 @@ test "the layer header compiles after the stdlib archive header" {
     let _ = fs.delete(h_path)
     let _ = fs.delete(c_path)
     assert_eq(cc.exit_code, 0, "cc failed:\n{cc.err_out}")
+}
+
+fn linking_user_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: std_keys(), user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0,
+        archive_over_std: 0, links_compiler_archive: 1 }
+}
+
+// The layer header names std types and functions, so the stdlib archive header must come
+// first.
+test "a user unit that links the layer reads its header after the stdlib archive header" {
+    let program = build_probe(layer_src(), "cg_layer_user_include_probe")
+    let c = generate(program, linking_user_cfg())
+    let std_at = c.byte_index_of("#include \"libblink_std.h\"", 0) ?? -1
+    let layer_at = c.byte_index_of("#include \"libblink_compiler.h\"", 0) ?? -1
+    assert(std_at >= 0, "the unit does not include the stdlib archive header")
+    assert(layer_at >= 0, "the unit does not include the layer header")
+    assert(std_at < layer_at, "the unit includes the layer header before the stdlib archive header")
+}
+
+// The layer globals may read std globals, and the program globals may read layer ones.
+test "a user unit that links the layer runs its globals init between the stdlib and its own" {
+    let program = build_probe(layer_src(), "cg_layer_user_link_order_probe")
+    let c = generate(program, linking_user_cfg())
+    let std_at = c.byte_index_of("__blink_init_stdlib_globals();", 0) ?? -1
+    let layer_at = c.byte_index_of("__blink_init_compiler_globals();", 0) ?? -1
+    let own_at = c.byte_index_of("__blink_init_globals();", 0) ?? -1
+    assert(std_at >= 0 && layer_at >= 0 && own_at >= 0, "the shim misses an init call:\n{c}")
+    assert(std_at < layer_at, "the shim runs the layer init before the stdlib init")
+    assert(layer_at < own_at, "the shim runs the program init before the layer init")
+}
+
+// The archive build writes the header under this name and the link passes -I for its dir,
+// so the unit's include and the file must agree.
+test "a user unit that links the layer includes the header by the name the archive build writes" {
+    assert_eq(c_layer_archive_header_name(), "libblink_compiler.h")
+    let program = build_probe(layer_src(), "cg_layer_user_header_name_probe")
+    let c = generate(program, linking_user_cfg())
+    assert(c.contains("#include \"{c_layer_archive_header_name()}\""), "the unit does not include the layer header by its name")
+}
+
+test "a user unit that does not link the layer neither reads its header nor runs its init" {
+    let program = build_probe(layer_src(), "cg_layer_user_unlinked_probe")
+    let c = generate(program, user_cfg())
+    assert_lacks(c, "libblink_compiler.h")
+    assert_lacks(c, "__blink_init_compiler_globals")
 }
