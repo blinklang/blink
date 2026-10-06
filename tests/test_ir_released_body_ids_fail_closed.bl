@@ -1,0 +1,82 @@
+// The driver releases each body's IR nodes once that body is printed, and keeps the nodes
+// lowered before the first body (the deferred global initializers) for the whole unit.
+// A read of a released id must stop the compiler; reading the node the next body put in
+// that place instead would print the wrong C without a word.
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_begin_body, ir_node_count, ir_verify, ir_kind, ir_c_name,
+    ir_const, ir_call_direct, ir_expr_stmt, ir_return, ir_block,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn call_f() -> Int { ir_call_direct(1, 0, "int64_t", "main_f", SlotForm.InlineWord, []) }
+fn body_of(value: Int) -> Int { ir_block(0, [ir_expr_stmt(0, call_f()), ir_return(0, value)]) }
+
+fn assert_valid(label: Str, root: Int) {
+    let errs = ir_verify(root)
+    if errs.len() > 0 { io.println("FAIL: {label}: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 0)
+}
+
+test "reading a node of a released body is an internal compiler error" {
+    ir_reset()
+    ir_begin_body()
+    let old = int_const("1")
+    ir_begin_body()
+    let _ = int_const("2")
+    assert_panics(matching: "released") {
+        let _ = ir_kind(old)
+    }
+}
+
+test "an id is not reused by the body after the one that released it" {
+    ir_reset()
+    ir_begin_body()
+    let old = int_const("1")
+    ir_begin_body()
+    let fresh = int_const("2")
+    assert(fresh > old)
+    assert_eq(ir_c_name(fresh), "2")
+}
+
+test "nodes built before the first body outlive every body of the unit" {
+    ir_reset()
+    let pinned = int_const("7")
+    let mut i = 0
+    while i < 5 {
+        ir_begin_body()
+        assert_valid("body {i}", body_of(int_const("{i}")))
+        i += 1
+    }
+    assert_eq(ir_c_name(pinned), "7")
+    // A tree built after the bodies may still name the pinned node, as the global init
+    // function names the deferred initializers.
+    assert_valid("late tree over a pinned node", ir_block(0, [ir_return(0, pinned)]))
+}
+
+test "the verifier reports a kid of a released body instead of reading it" {
+    ir_reset()
+    ir_begin_body()
+    let old = int_const("1")
+    ir_begin_body()
+    // Built raw: a per-kind constructor reads its kids, and the point is what the verifier does.
+    let ret = ir_new(IrKind.Return, -1, 0, "", "", SlotForm.Inline, [old])
+    let root = ir_new(IrKind.Block, -1, 0, "", "", SlotForm.Inline, [ret])
+    let errs = ir_verify(root)
+    assert(errs.len() > 0)
+    assert(errs.get(0).unwrap().contains("out of range"))
+}
+
+test "a reset starts the ids again from zero" {
+    ir_reset()
+    ir_begin_body()
+    let _ = int_const("1")
+    ir_begin_body()
+    ir_reset()
+    assert_eq(ir_node_count(), 0)
+    assert_eq(int_const("3"), 0)
+}
