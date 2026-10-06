@@ -1,0 +1,47 @@
+import compile_test_helpers.{emit_c_via_cli}
+
+// A prebuilt compiler archive runs its module globals' initialisers from an init function
+// that takes no arguments, called by each program before main. That holds only while no
+// compiler global's initialiser performs an effect: one that did would need the evidence
+// vector, which the archive does not own. The fixture imports the compiler the way a
+// corpus test does, and every compiler global's deferred initialiser lands in the
+// program's one init function.
+
+fn fixture_src() -> Str {
+    "import tokens.\{keyword_lookup\}\nimport compiler.\{compile_to_program\}\nimport cg.\{generate\}\n\nfn main() \{\n    io.println(\"\{keyword_lookup(\"fn\").to_int()\}\")\n\}\n"
+}
+
+// The body of the C function `name` defines, or "" when `c` defines no such function.
+fn fn_body(c: Str, name: Str) -> Str {
+    let lines = c.split("\n")
+    let mut out: List[Str] = []
+    let mut inside = false
+    for line in lines {
+        if !inside {
+            if line.contains(" {name}(void) \{") && !line.starts_with(" ") { inside = true }
+            continue
+        }
+        if line == "}" { break }
+        out.push(line)
+    }
+    out.join("\n")
+}
+
+fn init_body() -> Str {
+    let c = emit_c_via_cli(fixture_src(), "compiler_global_inits_fixture", "--debug")
+    assert(c.contains("int main("), "the fixture did not reach codegen")
+    fn_body(c, "__blink_init_globals")
+}
+
+test "the body scanner reads one function's body" {
+    let c = "static void __blink_init_globals(void) \{\n    a = 1;\n    b = f(__ev);\n}\nint x(void) \{\n}\n"
+    assert_eq(fn_body(c, "__blink_init_globals"), "    a = 1;\n    b = f(__ev);")
+    assert_eq(fn_body(c, "nope"), "")
+}
+
+test "the compiler's global initialisers read no evidence vector" {
+    let body = init_body()
+    assert(body.split("\n").len() > 50, "the init function holds too few compiler globals to be the compiler's:\n{body}")
+    assert(!body.contains("__ev"), "a compiler global initialiser reads the evidence vector:\n{body}")
+    assert(!body.contains("__blink_ev"), "a compiler global initialiser reads the evidence vector:\n{body}")
+}

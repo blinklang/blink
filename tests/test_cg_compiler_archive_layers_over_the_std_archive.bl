@@ -1,0 +1,219 @@
+// A second archive, built over the stdlib archive, is linked into the same binary as the
+// stdlib archive and the program. So it must take the runtime's storage and every std
+// definition from the stdlib archive and define none of them itself, keep its own
+// functions external for the program to call, and give the program a named init function
+// to run after the stdlib's.
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset, c_archive_header_guard, c_layer_archive_header_guard}
+import cg_test_helpers.{cg_probe_compile}
+import cg.{CgConfig, generate, generate_archive_header}
+import mono.{run_mono}
+
+fn assert_lacks(text: Str, needle: Str) {
+    if text.contains(needle) {
+        io.println("FAIL: output must not have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(!text.contains(needle))
+}
+
+fn assert_has(text: Str, needle: Str) {
+    if !text.contains(needle) {
+        io.println("FAIL: output must have '{needle}'\n--- output ---\n{text}")
+    }
+    assert(text.contains(needle))
+}
+
+fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+// The std modules the stdlib archive beside this one was built with, as that build wrote
+// them down.
+fn std_key_list() -> List[Str] {
+    let mut out: List[Str] = []
+    for k in read_file("build/skip_modules.txt").split("\n") {
+        if k != "" { out.push(k) }
+    }
+    out
+}
+
+fn std_keys() -> Map[Str, Int] {
+    let mut out: Map[Str, Int] = Map()
+    for k in std_key_list() { out.insert(k, 1) }
+    out
+}
+
+fn layered_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: std_keys(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 1,
+        archive_over_std: 1 }
+}
+
+fn user_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: std_keys(), user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0,
+        archive_over_std: 0 }
+}
+
+// A std generic instantiated at a type of this layer, a std function the layer calls, a
+// global that cannot take its value on its definition line, and a private function.
+fn layer_src() -> Str {
+    #"import std.list.{list_skip}
+
+type Point { x: Int, y: Int }
+
+let origin: Point = Point { x: 1, y: 2 }
+
+fn bump(n: Int) -> Int {
+    n + 1
+}
+
+fn rest_len(ps: List[Point]) -> Int {
+    list_skip(ps, 1).len()
+}
+
+fn main() {
+    let _ = bump(rest_len([origin]))
+}
+"#
+}
+
+fn layer_c(name: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen {
+    generate(build_probe(layer_src(), name), layered_cfg())
+}
+
+// The lines of `c` that open a function definition whose name has `part` in it.
+fn definitions_naming(c: Str, part: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in c.split("\n") {
+        if line.starts_with(" ") || line.starts_with("#") { continue }
+        if !line.ends_with(") \{") { continue }
+        if line.contains(part) { out.push(line) }
+    }
+    out
+}
+
+test "the layer shares the runtime storage the stdlib archive defines" {
+    let c = layer_c("cg_layer_storage_probe")
+    assert_has(c, "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
+    assert_lacks(c, "BLINK_RUNTIME_STORAGE_DEFINE")
+}
+
+test "the layer reads std declarations from the stdlib archive header" {
+    let c = layer_c("cg_layer_include_probe")
+    assert_has(c, "#include \"libblink_std.h\"")
+    assert_lacks(c, "#include \"runtime.h\"")
+}
+
+test "the layer defines a non-static compiler globals init and no stdlib one" {
+    let c = layer_c("cg_layer_init_probe")
+    assert_has(c, "void __blink_init_compiler_globals(void)")
+    assert_lacks(c, "static void __blink_init_compiler_globals")
+    assert_lacks(c, "__blink_init_stdlib_globals")
+    assert_lacks(c, "__blink_init_globals(")
+}
+
+test "the layer has no entry point and does not own the evidence vector" {
+    let c = layer_c("cg_layer_entry_probe")
+    assert_lacks(c, "int main(")
+    assert_has(c, "extern blink_ev __blink_ev;")
+}
+
+// A private function of the layer is called by the program that links the archive, which
+// is a different unit, so it cannot be static.
+test "the layer keeps its private functions external" {
+    let c = layer_c("cg_layer_linkage_probe")
+    let defs = definitions_naming(c, "bump(")
+    assert_eq(defs.len(), 1)
+    assert(!defs.get(0).unwrap().starts_with("static"), "bump is static: {defs.get(0).unwrap()}")
+}
+
+// The stdlib archive was built without this layer's types, so the layer writes its own copy
+// of a std generic's instance. The program writes another, so each copy must be private.
+test "the layer writes std generic instances as private copies" {
+    let c = layer_c("cg_layer_instance_probe")
+    let defs = definitions_naming(c, "skip")
+    assert(defs.len() > 0, "no list_skip instance body in the layer")
+    for d in defs { assert(d.starts_with("static"), "list_skip instance is external: {d}") }
+}
+
+test "the layer header declares the compiler globals init and reads the stdlib header" {
+    let program = build_probe(layer_src(), "cg_layer_header_probe")
+    let h = generate_archive_header(program, layered_cfg())
+    assert_has(h, "void __blink_init_compiler_globals(void);")
+    assert_has(h, "#include \"libblink_std.h\"")
+    assert_lacks(h, "__blink_init_stdlib_globals")
+    assert_has(h, "#ifndef {c_layer_archive_header_guard()}")
+    assert(c_layer_archive_header_guard() != c_archive_header_guard(), "the two archive headers share one include guard")
+}
+
+// The layer runs no code of its own before the stdlib's globals are set, so the program
+// runs the stdlib init first and its own last.
+test "a user unit runs the stdlib globals init before its own" {
+    let program = build_probe(layer_src(), "cg_layer_user_order_probe")
+    let c = generate(program, user_cfg())
+    let std_at = c.byte_index_of("__blink_init_stdlib_globals();", 0) ?? -1
+    let own_at = c.byte_index_of("__blink_init_globals();", 0) ?? -1
+    assert(std_at >= 0, "the shim does not run the stdlib init")
+    assert(own_at >= 0, "the shim does not run the program init")
+    assert(std_at < own_at, "the shim runs the program init before the stdlib init")
+}
+
+
+// The proof that nothing collides at link: the layer compiles against the stdlib archive
+// header, and the only names it exports are its own module's and its init function. A
+// std symbol or a per-type helper exported here would also be defined by the stdlib
+// archive or by the program.
+test "the layer compiles beside the stdlib archive and exports only its own names" {
+    let c = layer_c("cg_layer_nm_probe")
+    let c_path = "build/cg_layer_nm_probe.c"
+    let o_path = "build/cg_layer_nm_probe.o"
+    write_file(c_path, c)
+    let cc = process_run("cc", ["-c", "-Ibuild", "-o", o_path, c_path])
+    assert_eq(cc.exit_code, 0, "cc failed:\n{cc.err_out}")
+    let nm = process_run("nm", ["--defined-only", o_path])
+    assert_eq(nm.exit_code, 0, "nm failed:\n{nm.err_out}")
+    let _ = fs.delete(c_path)
+    let _ = fs.delete(o_path)
+    let mut foreign: List[Str] = []
+    let mut own = 0
+    let mut saw_init = false
+    for line in nm.out.split("\n") {
+        let words = line.split(" ")
+        if words.len() < 3 { continue }
+        let kind = words.get(1).unwrap()
+        let name = words.get(2).unwrap()
+        if kind.to_lower() == kind { continue }
+        if name == "__blink_init_compiler_globals" {
+            saw_init = true
+        } else if name.starts_with("blink_u_") {
+            own = own + 1
+        } else {
+            foreign.push("{kind} {name}")
+        }
+    }
+    assert(saw_init, "the object exports no __blink_init_compiler_globals")
+    assert(own >= 3, "the object exports {own} of the layer's own names, expected bump, rest_len and origin")
+    assert_eq(foreign.len(), 0, "exported names the layer does not own: {foreign.join(", ")}")
+}
+
+// A unit includes the stdlib archive header and then this one, and may meet either twice.
+test "the layer header compiles after the stdlib archive header" {
+    let program = build_probe(layer_src(), "cg_layer_header_cc_probe")
+    let h_path = "build/cg_layer_header_cc_probe.h"
+    let c_path = "build/cg_layer_header_cc_probe.c"
+    write_file(h_path, generate_archive_header(program, layered_cfg()))
+    write_file(c_path, "#include \"libblink_std.h\"\n#include \"cg_layer_header_cc_probe.h\"\n#include \"cg_layer_header_cc_probe.h\"\nint main(void) \{ __blink_init_compiler_globals(); return 0; }\n")
+    let cc = process_run("cc", ["-fsyntax-only", "-Ibuild", c_path])
+    let _ = fs.delete(h_path)
+    let _ = fs.delete(c_path)
+    assert_eq(cc.exit_code, 0, "cc failed:\n{cc.err_out}")
+}
