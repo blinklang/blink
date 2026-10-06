@@ -20,14 +20,22 @@ trap 'rm -rf "$WORK"' EXIT
 fail=0
 
 R="$WORK/root"
-mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std"
+mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std" "$R/src"
 cp scripts/corpus.sh scripts/corpus_one.sh scripts/corpus_sample.sh scripts/corpus_check.sh "$R/scripts/"
 : > "$R/build/gc_unity.c"
+# corpus.sh takes the compiler archive roots from the compiler binary's imports.
+printf 'import std.fs\nimport lexer.{Lex}\nimport cg\n\nfn main() {}\n' > "$R/src/blinkc_main.bl"
 
 # A marker in the test file picks the outcome, so each fixture file says what
 # it expects.
 cat > "$R/fakec/blink" <<'EOF'
 #!/bin/bash
+if [ "$1" = "__build-compiler-archive" ]; then
+    [ -n "${SELFTEST_ARCHIVE_FAIL:-}" ] && { echo "error: fake compiler archive failure" >&2; exit 1; }
+    dir="$2"; shift 2
+    mkdir -p "$dir" && : > "$dir/libblink_compiler.a" && echo "$*" > "$dir/roots"
+    exit 0
+fi
 out=""; src=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -55,6 +63,9 @@ elif n=$(grep -o 'SELFTEST_XFAIL=[0-9]*' "$src" | cut -d= -f2) && [ -n "$n" ]; t
     printf '{"results":[%s],"summary":{"total":%d}}\n' "$rows" "$((n + 1))" > "$out.report"
     printf '#!/bin/sh\ncase " $* " in *" --test-json "*) cat "%s";; esac\nexit 0\n' "$out.report" > "$out"
 elif grep -q SELFTEST_COMPILER_ARCHIVE "$src"; then
+    # The build links the archive the run built, which it finds through the
+    # env var the run exports.
+    [ -f "${BLINK_COMPILER_ARCHIVE:-}/libblink_compiler.a" ] || { echo "error[E0000]: no compiler archive in the env"; exit 1; }
     # corpus_one.sh reads the archive's init fn from the binary's symbols, so
     # this fixture must be a real binary that defines it.
     printf 'void __blink_init_compiler_globals(void) {}\nint main(void) { __blink_init_compiler_globals(); return 0; }\n' > "$out.c"
@@ -179,6 +190,37 @@ if grep -q '^compiler-archive: linked 1 files$' "$WORK/out.log" && [ "$(jq -r .c
     echo "PASS compiler-archive-summary"
 else
     echo "FAIL compiler-archive-summary: no summary line or JSON count of 1"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+fi
+
+# The run builds the compiler archive from the compiler binary's imports and
+# the codegen test helpers, and stops when it cannot.
+roots="$(cat "$R/build/corpus/compiler_archive/roots" 2>/dev/null)"
+if [ "$roots" = "cg lexer cg_test_helpers lower_test_helpers cname_test_helpers" ]; then
+    echo "PASS compiler-archive-roots"
+else
+    echo "FAIL compiler-archive-roots: got '$roots'"
+    fail=1
+fi
+(cd "$R" && SELFTEST_ARCHIVE_FAIL=1 CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/all_pass.txt" --no-lint) > "$WORK/out.log" 2>&1
+expect "compiler-archive-build-fails" 2 $?
+if grep -q "fake compiler archive failure" "$WORK/out.log"; then
+    echo "PASS compiler-archive-build-fails-says-why"
+else
+    echo "FAIL compiler-archive-build-fails-says-why: the archive's error is not in the output"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+fi
+
+# A run told to skip the archive builds none and exports no path to one.
+(cd "$R" && rm -rf build/corpus/compiler_archive && SELFTEST_ARCHIVE_FAIL=1 CORPUS_COMPILER_ARCHIVE=0 BLINK_COMPILER_ARCHIVE=/nonexistent \
+    CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/archive.txt" --no-lint) > "$WORK/out.log" 2>&1
+if [ ! -e "$R/build/corpus/compiler_archive" ] && [ "$(ca tests/test_selftest_compiler_archive.bl)" = false ] \
+        && [ "$(ca tests/test_selftest_ok.bl)" = false ]; then
+    echo "PASS compiler-archive-off"
+else
+    echo "FAIL compiler-archive-off: the run built or linked a compiler archive"
     sed 's/^/    /' "$WORK/out.log"
     fail=1
 fi

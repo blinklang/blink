@@ -15,6 +15,9 @@
 #   CORPUS_OUT       output JSON (default build/corpus.json)
 #   CORPUS_PRELUDE_LIB  lib/ root each sandbox exposes as the prelude, passed
 #                    through to corpus_one.sh (default: the compiler's own)
+#   CORPUS_COMPILER_ARCHIVE  0 builds every file in one unit, with no compiler
+#                    archive (default 1). For a compiler that predates the
+#                    archive, such as the pinned gen0 the suites run under.
 #
 # --only <list file> restricts the run to the files named in the list (one
 # path per line, blank lines and # comments ignored) and defaults CORPUS_OUT
@@ -24,6 +27,11 @@
 # still fail, which a passing file hides (see corpus_one.sh), and the passing
 # files whose report did not read. A third gives how many binaries linked
 # the prebuilt compiler archive; corpus_check.sh holds that to a floor.
+#
+# Hundreds of files import the compiler modules, and each would compile the
+# whole compiler into its own unit. So the run first builds those modules once
+# into a compiler archive with the compiler under test, and exports
+# BLINK_COMPILER_ARCHIVE so each build that imports them links it instead.
 #
 # Exit: 2 when the run itself cannot be trusted (no compiler, malformed JSON).
 # Under --only, 1 when any listed file fails: a bucket names files that must
@@ -87,7 +95,7 @@ fi
 [ -f build/gc_unity.c ] || ./scripts/gen_gc_unity.sh build/gc_unity.c || exit 2
 
 results="build/corpus/results"
-rm -rf "$results" build/corpus/work build/corpus/native
+rm -rf "$results" build/corpus/work build/corpus/native build/corpus/compiler_archive
 mkdir -p "$results" build/corpus
 
 # A file whose program links a vendored native dep compiles that dep's C source
@@ -101,6 +109,27 @@ for d in lib/native/*/; do
     [ -f "$d$name.c" ] || continue
     cc -pipe -g -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" || exit 2
 done
+
+# The roots are the modules the compiler binary imports plus the test helpers
+# that import the codegen; the archive holds their import closure. The helper
+# every runtime test imports, compile_test_helpers, stays out: it imports no
+# compiler module, and a file that links the archive pays to read its header.
+# No fallback when this fails: a run that quietly built each file in one unit
+# would report the old cost as if it were the new.
+carchive="$(pwd)/build/corpus/compiler_archive"
+if [ "${CORPUS_COMPILER_ARCHIVE:-1}" = 0 ]; then
+    unset BLINK_COMPILER_ARCHIVE
+else
+    roots=$(sed -n 's/^import \([a-z_][a-z_0-9]*\).*/\1/p' src/blinkc_main.bl | grep -vx std | sort -u)
+    if ! (unset BLINK_ROOT BLINK_COMPILER_ARCHIVE; "$comp/blink" __build-compiler-archive "$carchive" \
+            $roots cg_test_helpers lower_test_helpers cname_test_helpers) > build/corpus/compiler_archive.log 2>&1 \
+            || [ ! -f "$carchive/libblink_compiler.a" ]; then
+        echo "corpus: ERROR the compiler archive did not build, see build/corpus/compiler_archive.log" >&2
+        tail -20 build/corpus/compiler_archive.log >&2
+        exit 2
+    fi
+    export BLINK_COMPILER_ARCHIVE="$carchive"
+fi
 
 echo "corpus: $total files, compiler $comp, $jobs workers"
 start=$(date +%s)
