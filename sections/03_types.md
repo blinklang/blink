@@ -386,7 +386,7 @@ trait StringBuildOps {
 
 ##### Construction and Mutability
 
-Collections are constructed via `Type.new()` for empty collections or literal syntax where available. A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, and every `write` method on `StringBuilder`. A call to a mutating method needs a mutable **root**: the first name of the receiver path must be a `let mut` binding or a `mut` parameter. `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`.
+Collections are constructed via `Type.new()` for empty collections or literal syntax where available. A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A call to a mutating method needs a mutable **root**: the first name of the receiver path must be a `let mut` binding or a `mut` parameter. `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`.
 
 ```blink
 // Empty collections
@@ -765,7 +765,7 @@ fn decode(b: Bytes) -> Result[Str, ConversionError] {
 }
 ```
 
-`Bytes` is a contiguous buffer. `with_ptr` gives FFI a `Ptr[U8]` to it. `List[U8]` is a different type and makes no such promise.
+`Bytes` is a contiguous buffer. `with_ptr` and `with_mut_ptr` give FFI a `Ptr[U8]` to it. `List[U8]` is a different type and makes no such promise.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
@@ -779,20 +779,49 @@ fn decode(b: Bytes) -> Result[Str, ConversionError] {
 | `to_list` | `fn(self) -> List[U8]` | Convert to list |
 | `from_str` | `fn(Str) -> Bytes` | UTF-8 encode |
 | `from_list` | `fn(List[U8]) -> Bytes` | From list |
+| `new` | `fn() -> Bytes` | Empty buffer, `len == 0` |
 | `zeroed` | `fn(Int) -> Bytes` | Pre-sized buffer with `len == n`, all zero |
 | `read_u16_le` / `read_u16_be` | `fn(self, Int) -> Result[Int, Str]` | Decode 2-byte little/big-endian unsigned at offset |
 | `read_u32_le` / `read_u32_be` | `fn(self, Int) -> Result[Int, Str]` | Decode 4-byte little/big-endian unsigned at offset |
 | `read_i32_le` / `read_i32_be` | `fn(self, Int) -> Result[Int, Str]` | Decode 4-byte little/big-endian signed at offset |
 | `read_i64_le` / `read_i64_be` | `fn(self, Int) -> Result[Int, Str]` | Decode 8-byte little/big-endian signed at offset |
-| `set_i16_le` / `set_i16_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 2-byte signed at offset (in-place, bounds vs `len`) |
-| `set_u16_le` / `set_u16_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 2-byte unsigned at offset (in-place, bounds vs `len`) |
-| `set_i32_le` / `set_i32_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 4-byte signed at offset (in-place, bounds vs `len`) |
-| `set_u32_le` / `set_u32_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 4-byte unsigned at offset (in-place, bounds vs `len`) |
-| `set_i64_le` / `set_i64_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 8-byte signed at offset (in-place, bounds vs `len`) |
-| `set_u64_le` / `set_u64_be` | `fn(self, Int, Int) -> Result[(), Str]` | Write 8-byte unsigned at offset (in-place, bounds vs `len`) |
-| `with_ptr` | `fn[R](self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Closure-scoped FFI pin; forwards the closure's effect row (see §9.1.3) |
+| `set_i16_le` / `set_i16_be` | `fn(mut self, Int, Int) -> Result[(), Str]` | Write 2-byte signed at offset (bounds vs `len`) |
+| `set_u16_le` / `set_u16_be` | `fn(mut self, Int, Int) -> Result[(), Str]` | Write 2-byte unsigned at offset (bounds vs `len`) |
+| `set_i32_le` / `set_i32_be` | `fn(mut self, Int, Int) -> Result[(), Str]` | Write 4-byte signed at offset (bounds vs `len`) |
+| `set_u32_le` / `set_u32_be` | `fn(mut self, Int, Int) -> Result[(), Str]` | Write 4-byte unsigned at offset (bounds vs `len`) |
+| `set_i64_le` / `set_i64_be` | `fn(mut self, Int, Int) -> Result[(), Str]` | Write 8-byte signed at offset (bounds vs `len`) |
+| `set_u64_le` / `set_u64_be` | `fn(mut self, Int, Int) -> Result[(), Str]` | Write 8-byte unsigned at offset (bounds vs `len`) |
+| `set` | `fn(mut self, Int, Int)` | Write the low 8 bits of the value at index; panics when the index is not in `[0, len)` |
+| `push` | `fn(mut self, Int)` | Append the low 8 bits of the value as one byte; *grows* |
+| `write_u16_le` / `write_u16_be` | `fn(mut self, Int)` | Append 2-byte little/big-endian unsigned; *grows* |
+| `write_u32_le` / `write_u32_be` | `fn(mut self, Int)` | Append 4-byte little/big-endian unsigned; *grows* |
+| `write_i32_le` / `write_i32_be` | `fn(mut self, Int)` | Append 4-byte little/big-endian signed; *grows* |
+| `write_i64_le` / `write_i64_be` | `fn(mut self, Int)` | Append 8-byte little/big-endian signed; *grows* |
+| `with_ptr` | `fn[R](self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Read-only closure-scoped FFI pin; C must not write through the pointer; forwards the closure's effect row (see §9.1.3) |
+| `with_mut_ptr` | `fn[R](mut self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Closure-scoped FFI pin that C may write through; forwards the closure's effect row (see §9.1.3) |
 
-The `set_*_le/be(off, v)` family is the symmetric counterpart of the existing `read_*_le/be(off)` family: it writes at a given offset, requires `off + width <= len` (returns `Err` otherwise — does not grow), and complements the append-only `write_*_le/be(v)` constructors. `set_*` and `write_*` are deliberately distinct verbs: `set` writes in-place at a known offset, `write` appends. (Panel decision: [`ffi-struct-construction`](../decisions/ffi-struct-construction.md), Q-α-bytes-offset-API.)
+The `set_*_le/be(off, v)` family is the symmetric counterpart of the existing `read_*_le/be(off)` family: it writes at a given offset, requires `off + width <= len` (returns `Err` otherwise — does not grow), and complements the append-only `write_*_le/be(v)` writers. `set_*` and `write_*` are deliberately distinct verbs: `set` writes at a known offset, `write` appends. (Panel decision: [`ffi-struct-construction`](../decisions/ffi-struct-construction.md), Q-α-bytes-offset-API.)
+
+**`Bytes` is a value.** `Bytes` is not a shared cell (§3.6 *Shared cells*). A write through one name never shows through another name. This holds for every copy: bind, pass, return, `clone()`, a struct field and a template hole. Every writer (`set`, `set_*`, `push`, `write_*` and `with_mut_ptr`) declares `mut self`, so a call to one needs a mutable root (§3.2.2 *Construction and Mutability*). A call on an immutable root is `error[E0610] MutationRequiresMut`.
+
+```blink
+fn header(len: Int) -> Result[Bytes, Str] {
+    let mut b = Bytes.zeroed(4)
+    b.set_u16_be(0, 1)?
+    b.set_u16_be(2, len)?
+    Ok(b)
+}
+
+fn main() ! IO {
+    let a = Bytes.zeroed(2)
+    let mut b = a
+    b.push(5)                           // OK — root `b` is mut
+    io.println("{a.len()} {b.len()}")   // 2 3 — `a` is unchanged
+    a.push(5)                           // error[E0610] — `a` is not mut
+}
+```
+
+A method marked *grows* in the table above can change `len` and move the storage of the buffer. §9.1.3.1 forbids a call to such a method inside a pin closure. A new `Bytes` method that can move the storage carries the mark. (Panel vote: 6-0. See [Bytes value semantics rationale](../decisions/bytes-value-semantics.md).)
 
 Bytes implements: `Sized`, `Eq`, `Clone`, `Debug`, `IntoIterator[U8]`.
 
@@ -2603,7 +2632,7 @@ A method cannot change its caller's value through `self`. State that must persis
 - `StringBuilder`
 - a closure or handler that captured a `let mut` binding (§2.8, §4.7)
 
-This list is the only one; other sections refer to it.
+This list is the only one; other sections refer to it. `Bytes` is not on it: a `Bytes` is a value (§3.2.3 *Bytes*).
 
 Only a shared cell can change through a second name. A value of any other type, at any depth, cannot. This holds for every copy: bind, pass, return and `clone()` (§3.6.1 *Clone Semantics*).
 
@@ -3404,6 +3433,7 @@ For reference, the eight derivable traits and their required methods:
 `clone()` on a struct or enum equals a copy on bind. Shared cells (§3.6 *Shared cells*) stay shared; a clone does not copy their contents. `Clone` exists so generic code with a `T: Clone` bound can copy a value.
 
 - **Value types** (`Int`, `Float`, `Bool`, `Char`, `Str`): a copy of the value. A `Str` cannot change, so no program can see whether a copy shares its bytes.
+- **`Bytes`**: a copy of the value. A write through the clone does not show in the original.
 - **`List`, `Map`, `Set` and other shared cells** (§3.6 *Shared cells*): the clone refers to the same cell. A change made through the clone **does** show in the original — the same as JS spread (`{...obj}`) or Python `copy.copy()`.
 - **User structs and enums**: `x.clone()` gives the same value as `let y = x`. Each field is copied by its declared type, using the rules above. A field whose declared type is a struct or enum is a value, and its copy is a value too (for example, a payload of the enum's own type, §3.4 *Recursive Types*).
 
