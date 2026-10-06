@@ -95,17 +95,18 @@ fi
 [ -f build/gc_unity.c ] || ./scripts/gen_gc_unity.sh build/gc_unity.c || exit 2
 
 results="build/corpus/results"
-rm -rf "$results" build/corpus/work build/corpus/native build/corpus/compiler_archive build/corpus/cc
+rm -rf "$results" build/corpus/work build/corpus/native build/corpus/compiler_archive build/corpus/cc build/corpus/pch
 mkdir -p "$results" build/corpus
 
 # The corpus builds with --debug for debug_assert and the runtime's debug
 # checks. The -g that --debug also passes changes no code, nothing in the
 # corpus reads debug info, and it costs cc and link time in every build. The
 # compiler archive and each file's build run with this cc first on PATH, which
-# drops -g and runs the real cc.
+# drops -g and runs the real cc. It also passes -Winvalid-pch, so a row whose
+# cc drops the PCH below says why in its log.
 real_cc="$(command -v cc)" || { echo "corpus: no cc on PATH" >&2; exit 2; }
 mkdir -p build/corpus/cc
-printf '#!/bin/sh\nfor a do\n    shift\n    [ "$a" = -g ] || set -- "$@" "$a"\ndone\nexec %s "$@"\n' "'$real_cc'" > build/corpus/cc/cc
+printf '#!/bin/sh\nfor a do\n    shift\n    [ "$a" = -g ] || set -- "$@" "$a"\ndone\nexec %s -Winvalid-pch "$@"\n' "'$real_cc'" > build/corpus/cc/cc
 chmod +x build/corpus/cc/cc
 
 # A file whose program links a vendored native dep compiles that dep's C source
@@ -119,6 +120,26 @@ for d in lib/native/*/; do
     [ -f "$d$name.c" ] || continue
     cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" || exit 2
 done
+
+# Each row's unit includes libblink_std.h first, and reading it is about a
+# quarter of a small row's cc. Precompile it once, beside links to the two
+# headers a sandbox links, with the flags of a corpus build: those of
+# `blink build --debug`, less -g, plus the define the unit puts before the
+# include (-pthread defines _REENTRANT, which the header reads). gcc drops a
+# PCH built with other flags or macros and reads the header instead. With no
+# PCH every row still builds, so a failure here costs time only.
+pch_key=$(./scripts/corpus_std_pch_key.sh "$comp")
+if [ -n "$pch_key" ]; then
+    pch_dir="build/corpus/pch/$(sed -n 1p <<< "$pch_key")"
+    mkdir -p "$pch_dir"
+    ln -s "$(sed -n 2p <<< "$pch_key")" "$pch_dir/libblink_std.h"
+    ln -s "$(sed -n 3p <<< "$pch_key")" "$pch_dir/runtime.h"
+    if ! cc -pipe -O0 -DBLINK_DEBUG -pthread -DBLINK_USE_EXTERN_RUNTIME_STORAGE=1 -x c-header \
+            -o "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h" > build/corpus/pch.log 2>&1 \
+            || ! mv "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h.gch"; then
+        echo "corpus: no PCH of libblink_std.h, rows read the header (see build/corpus/pch.log)" >&2
+    fi
+fi
 
 # The roots are the modules the compiler binary imports; the archive holds their
 # import closure. The test helpers stay out, those that import the codegen too:
