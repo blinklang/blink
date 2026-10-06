@@ -79,7 +79,9 @@ set -e
 # otherwise a stdlib change here is invisible to all of them and a diagnostic this
 # tree adds fires against a stdlib this tree cannot fix.
 # Exit 1 is a failing file, which the count below reports; only 2 stops here.
-CORPUS_PRELUDE_LIB="$(pwd)/lib" CORPUS_COMPILER="$comp" CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint || [ $? -eq 1 ]
+# CORPUS_COMPILER_ARCHIVE=0: the default compiler, the pinned gen0, predates the
+# compiler archive.
+CORPUS_COMPILER_ARCHIVE=0 CORPUS_PRELUDE_LIB="$(pwd)/lib" CORPUS_COMPILER="$comp" CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint || [ $? -eq 1 ]
 passed=$(jq -r .passed "$out")
 total=$(jq -r .total "$out")
 selected=$(wc -l < "$list" | tr -d ' ')

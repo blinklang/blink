@@ -1,0 +1,199 @@
+// The compiler archive: `libblink_compiler.{a,h}`, the compiler's own modules compiled once
+// and layered over the stdlib archive, for the test corpus. Hundreds of corpus tests import
+// the compiler, and without it each one emits and compiles the whole compiler in its own
+// unit.
+//
+// Internal and undocumented. `blink __build-compiler-archive <dir> <module>...` builds it from
+// the import closure of the named modules; a build reads it when BLINK_COMPILER_ARCHIVE names
+// that dir and the program imports a module it holds.
+
+import lexer.{Lex}
+import parser.{Parse}
+import typecheck.{TypeCheck, check_types, desugar_sealed_ops_calls}
+import compiler.{compile_to_program, check_unused_imports, import_map_modules}
+import cg.{Codegen, CgConfig, generate, generate_archive_header}
+import mutation_analysis.{analyze_mutations, analyze_save_restore}
+import escape.{analyze_escapes}
+import mono.{run_mono}
+import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush, diag_module_files}
+import cli.{resolve_archive_dir, run_cc}
+import build_stdlib.{list_stdlib_modules, list_stdlib_module_keys}
+import cname.{c_layer_archive_header_name}
+import std.path.{path_join}
+
+pub fn compiler_archive_env() -> Str {
+    env.var("BLINK_COMPILER_ARCHIVE") ?? ""
+}
+
+fn archive_lib_name() -> Str { "libblink_compiler.a" }
+
+// The stdlib archive this one was compiled against, as its identity stamp read then. The
+// layer's bodies use that archive's types and symbols, so it links beside no other.
+fn std_id_name() -> Str { "std-archive-id" }
+
+fn source_copy_path(dir: Str, key: Str) -> Str { path_join(dir, "src/{key}.bl") }
+
+fn bail_on_diag() -> Int ! Diag.Report {
+    if diag_ice_count > 0 {
+        diag_flush()
+        return 101
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return 1
+    }
+    0
+}
+
+fn std_archive_id() -> Str {
+    let p = path_join(resolve_archive_dir(), ".archive-id")
+    if file_exists(p) == 0 { return "" }
+    read_file(p)
+}
+
+fn std_keys() -> Map[Str, Int] {
+    let mut out: Map[Str, Int] = Map()
+    for k in list_stdlib_module_keys() { out.insert(k, 1) }
+    out
+}
+
+// Every std module, peeled ones too: none of them is the layer's.
+fn is_std_key(key: Str) -> Bool {
+    for m in list_stdlib_modules() {
+        if m.replace(".", "_") == key { return true }
+    }
+    false
+}
+
+pub fn build_compiler_archive(dir: Str, roots: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let std_dir = resolve_archive_dir()
+    let std_id = std_archive_id()
+    if std_id == "" {
+        io.eprintln("error: no stdlib archive identity at {std_dir}/.archive-id")
+        return 1
+    }
+    shell_exec("rm -rf {dir} && mkdir -p {dir}/src")
+    let mut sb = StringBuilder.new()
+    for r in roots { sb.write("import {r}\n") }
+    sb.write("\nfn main() \{\}\n")
+    let entry_bl = path_join(dir, "__archive_main.bl")
+    write_file(entry_bl, sb.to_str())
+
+    let program = compile_to_program(entry_bl, 1)
+    let _tc_err = check_types(program)
+    check_unused_imports()
+    let tc_rc = bail_on_diag()
+    if tc_rc != 0 { return tc_rc }
+    desugar_sealed_ops_calls(program)
+    analyze_mutations(program)
+    analyze_save_restore(program)
+    analyze_escapes(program)
+    run_mono(program)
+    let esc_rc = bail_on_diag()
+    if esc_rc != 0 { return esc_rc }
+
+    let skip = std_keys()
+    let mut layer: List[Str] = []
+    for key in import_map_modules {
+        if layer.contains(key) { continue }
+        if skip.contains_key(key) { continue }
+        // A peeled std module is compiled into each program that reaches it, so a second
+        // copy here would not link.
+        if is_std_key(key) {
+            io.eprintln("error: the compiler archive cannot hold the peeled std module {key}")
+            return 1
+        }
+        layer.push(key)
+    }
+    for key in layer {
+        let src = diag_module_files.get(key) ?? ""
+        if src == "" || file_exists(src) == 0 {
+            io.eprintln("error: no source file recorded for module {key}")
+            return 1
+        }
+        write_file(source_copy_path(dir, key), read_file(src))
+    }
+
+    // debug_mode 1: the corpus builds with --debug, and a release archive would drop the
+    // compiler's own debug checks from every test that links it.
+    let cfg = CgConfig { debug_mode: 1, trace_codegen: 0, deterministic: 0,
+        emit_only_module: "", skip_modules: skip, user_tu_mode: 0,
+        blink_ev_extern_only: 0, archive_build_mode: 1, archive_over_std: 1, links_compiler_archive: 0 }
+    let header = generate_archive_header(program, cfg)
+    let hdr_rc = bail_on_diag()
+    if hdr_rc != 0 { return hdr_rc }
+    write_file(path_join(dir, c_layer_archive_header_name()), header)
+    let monolith_c = generate(program, cfg)
+    let mono_rc = bail_on_diag()
+    if mono_rc != 0 { return mono_rc }
+    let c_path = path_join(dir, "monolith.c")
+    let o_path = path_join(dir, "monolith.o")
+    write_file(c_path, monolith_c)
+    let rc = run_cc("-c -ffunction-sections -fdata-sections -o {o_path} {c_path} -I{dir} -I{std_dir}", 1, 0, "")
+    if rc != 0 {
+        io.eprintln("error: cc failed building the compiler archive (rc={rc})")
+        return rc
+    }
+    let ar_rc = shell_exec("ar rcs {path_join(dir, archive_lib_name())} {o_path}")
+    if ar_rc != 0 {
+        io.eprintln("error: ar failed building the compiler archive (rc={ar_rc})")
+        return ar_rc
+    }
+    write_file(path_join(dir, "skip_modules.txt"), "{layer.join("\n")}\n")
+    write_file(path_join(dir, std_id_name()), std_id)
+    0
+}
+
+fn read_layer_keys(dir: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    let p = path_join(dir, "skip_modules.txt")
+    if file_exists(p) == 0 { return out }
+    for k in read_file(p).split("\n") {
+        if k != "" { out.push(k) }
+    }
+    out
+}
+
+// The modules of the loaded program that the archive in `dir` holds, or none. A module is
+// the archive's when its key and its source text both match what the archive was built
+// from: a program in another package may reuse a module name, and that module is its own.
+// An archive that holds some of the program's modules but differs on another it names was
+// built from an older tree, and linking it would mix two versions of the compiler.
+pub fn compiler_archive_skip_keys(dir: Str) -> List[Str] ! Diag.Report {
+    let keys = read_layer_keys(dir)
+    let mut held: List[Str] = []
+    if keys.len() == 0 {
+        io.eprintln("error: BLINK_COMPILER_ARCHIVE={dir} holds no compiler archive")
+        exit(1)
+    }
+    let mut differs: List[Str] = []
+    for key in keys {
+        let src = diag_module_files.get(key) ?? ""
+        if src == "" { continue }
+        if read_file(src) == read_file(source_copy_path(dir, key)) {
+            held.push(key)
+        } else {
+            differs.push(key)
+        }
+    }
+    if held.len() == 0 { return held }
+    if differs.len() > 0 {
+        io.eprintln("error: the compiler archive at {dir} is stale: {differs.join(", ")} changed since it was built; rebuild the compiler archive")
+        exit(1)
+    }
+    if read_file(path_join(dir, std_id_name())) != std_archive_id() {
+        io.eprintln("error: the compiler archive at {dir} was built against another stdlib archive than {resolve_archive_dir()}; rebuild the compiler archive")
+        exit(1)
+    }
+    keys
+}
+
+// The archive a user unit was compiled to link, or "": the unit includes the layer header
+// only when the compile left the archive modules out of it.
+pub fn compiler_archive_of_unit(c_source: Str) -> Str {
+    if c_source.contains("#include \"{c_layer_archive_header_name()}\"") { compiler_archive_env() } else { "" }
+}
+
+pub fn compiler_archive_link_args(dir: Str) -> Str {
+    "-I{dir} {path_join(dir, archive_lib_name())}"
+}

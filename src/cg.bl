@@ -14,7 +14,7 @@ import diagnostics.{
     UNVERIFIED_IR_AT_PRINT,
 }
 import cname.{
-    c_archive_header_guard, c_layer_archive_header_guard, c_module_header_guard, c_module_init_globals_name,
+    c_archive_header_guard, c_layer_archive_header_guard, c_layer_archive_header_name, c_module_header_guard, c_module_init_globals_name,
     c_string_literal, c_test_fn_name,
 }
 import ast.{NodeKind, nk_of}
@@ -25,7 +25,7 @@ import parser.{
 }
 import layout.{Position, layout_of, layout_reset, set_current_inst, layout_take_typedefs}
 import cg_print.{
-    print_fn, print_fn_decl, print_main_shim, print_reset, print_scope_restore_support,
+    print_fn, print_fn_decl, print_include, print_main_shim, print_reset, print_scope_restore_support,
     print_take, print_test_fn, print_test_table, print_typedef_blocks,
 }
 import cg_reg.{
@@ -99,6 +99,9 @@ pub type CgConfig {
     // The archive being built is linked beside the stdlib archive, which defines the
     // runtime's storage and every std module this archive skips.
     archive_over_std: Int
+    // This user unit links the archive layered over the stdlib archive, so it reads that
+    // archive's header and runs its globals init.
+    links_compiler_archive: Int
 }
 
 
@@ -233,6 +236,7 @@ fn globals_in_scope(cfg: CgConfig, module_key: Str, declare_only: Bool) -> List[
 // else runs; a header declares no definition and so never has any to answer.
 fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool) -> List[Int] ! Diag.Report {
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, defines_runtime_storage(cfg), false, header_guard, self_header)
+    if cfg.links_compiler_archive != 0 { print_include(c_layer_archive_header_name()) }
     cg_decl_emit_typedefs()
     if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
     // The definition half owns exactly the globals in scope for this unit: a skipped
@@ -632,8 +636,9 @@ fn emit_entry(cfg: CgConfig, init_fns: List[Str]) ! Diag.Report {
 // The init functions of the archives this unit links, in link-layer order, ahead of the
 // program's own: a global the program initialises may read one an archive set.
 fn archive_init_fns(cfg: CgConfig) -> List[Str] {
-    if cfg.user_tu_mode != 0 { return [stdlib_init_globals_name()] }
-    []
+    if cfg.user_tu_mode == 0 { return [] }
+    if cfg.links_compiler_archive != 0 { return [stdlib_init_globals_name(), layer_init_globals_name()] }
+    [stdlib_init_globals_name()]
 }
 
 fn stdlib_init_globals_name() -> Str { "__blink_init_stdlib_globals" }
@@ -641,9 +646,11 @@ fn stdlib_init_globals_name() -> Str { "__blink_init_stdlib_globals" }
 // A layered archive's init runs in the same program as the stdlib's, so the two names
 // must differ.
 fn archive_init_globals_name(cfg: CgConfig) -> Str {
-    if cfg.archive_over_std != 0 { return "__blink_init_compiler_globals" }
+    if cfg.archive_over_std != 0 { return layer_init_globals_name() }
     stdlib_init_globals_name()
 }
+
+fn layer_init_globals_name() -> Str { "__blink_init_compiler_globals" }
 
 // One function running every deferred global assignment, in the order the globals were
 // declared in, or nothing if every global already took its value on the definition line.

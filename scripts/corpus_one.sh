@@ -45,6 +45,8 @@
 #   CORPUS_RUN_TIMEOUT    seconds per run (default 600)
 #   CORPUS_PRELUDE_LIB    lib/ root the sandbox exposes as the prelude
 #                         (default: the compiler's own lib/)
+#   BLINK_COMPILER_ARCHIVE  the compiler archive corpus.sh built for the run;
+#                         a build that imports the modules it holds links it
 set -u
 
 file="$1"

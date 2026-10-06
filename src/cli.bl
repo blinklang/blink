@@ -46,6 +46,7 @@ import compiler.{
     set_strict_struct_layout,
 }
 import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules}
+import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
 import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path, resolve_runtime_h}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
@@ -553,11 +554,21 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
         skip_modules.insert(archived.get(ai).unwrap(), 1)
         ai = ai + 1
     }
+    let mut links_layer = 0
+    let layer_dir = compiler_archive_env()
+    if layer_dir != "" {
+        let layer_keys = compiler_archive_skip_keys(layer_dir)
+        if layer_keys.len() > 0 {
+            links_layer = 1
+            for k in layer_keys { skip_modules.insert(k, 1) }
+        }
+    }
 
     let cfg = CgConfig { debug_mode: if debug_mode != 0 { 1 } else { 0 },
         trace_codegen: cli_trace_codegen, deterministic: cli_deterministic,
         emit_only_module: env.var("BLINK_ONLY_MODULE") ?? "", skip_modules: skip_modules,
-        user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0 }
+        user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
+        links_compiler_archive: links_layer }
     let c_output = generate(final_program, cfg)
 
     if diag_ice_count > 0 {
@@ -1003,7 +1014,7 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report {
     1
 }
 
-fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! Diag.Report {
+fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -1017,7 +1028,9 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     if vrc != 0 {
         return vrc
     }
-    let archive = " -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections"
+    // The layer goes ahead of the stdlib archive, whose symbols it uses.
+    let layer = if compiler_archive != "" { " {compiler_archive_link_args(compiler_archive)}" } else { "" }
+    let archive = "{layer} -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections"
     let mut effective_link_flags = link_flags
     // obj_files / include_flags carry per-build vendored deps the caller
     // resolved via detect_native_deps(c_source); the archive itself owns
@@ -1037,7 +1050,9 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     // that surfaced a scary fatal error on every db build; on a cache hit it
     // would never have produced the .o at all.
     let cache_includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
-    let cached_o = cache_compile_user_c(c_path, debug_mode, release_mode, target, cache_includes)
+    // The object key does not cover the compiler archive header, which each corpus run
+    // rebuilds, so a unit that reads it is never cached.
+    let cached_o = if compiler_archive != "" { "" } else { cache_compile_user_c(c_path, debug_mode, release_mode, target, cache_includes) }
     let compile_input = if cached_o != "" { cached_o } else { c_path }
     let rc = run_cc("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
     if rc != 0 {
@@ -1140,6 +1155,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     let has_async = detect_async(source)
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
+    let compiler_archive = compiler_archive_of_unit(c_source)
 
     let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
     if has_toml == 1 && ffi_libs.len() > 0 {
@@ -1167,7 +1183,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, target)
         let inc_flags = resolve_vendored_includes(used_deps, target)
-        let lrc = do_link_target(output_path, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, target)
+        let lrc = do_link_target(output_path, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive)
         if lrc != 0 {
             return lrc
         }
@@ -1192,7 +1208,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
         shell_exec("rm -f {out}")
-        let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple)
+        let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive)
         if lrc != 0 {
             return lrc
         }
@@ -2864,7 +2880,7 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
 
     let hdr_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace_codegen,
         deterministic: cli_deterministic, emit_only_module: "", skip_modules: Map(),
-        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0 }
+        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, links_compiler_archive: 0 }
     let header = generate_archive_header(final_program, hdr_cfg)
 
     if diag_ice_count > 0 {
@@ -2923,7 +2939,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
 
     let mod_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace_codegen,
         deterministic: cli_deterministic, emit_only_module: "", skip_modules: Map(),
-        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0 }
+        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, links_compiler_archive: 0 }
 
     let modules = enumerate_program_modules(final_program)
     // Gate the module list before the loops below read it. An empty list makes both
@@ -3984,6 +4000,20 @@ fn main() {
             hi = hi + 1
         }
         cmd_emit_per_module(hidden_args)
+        return
+    }
+
+    if arg_count() >= 3 && get_arg(1) == "__build-compiler-archive" {
+        let mut roots: List[Str] = []
+        let mut ri = 3
+        while ri < arg_count() {
+            roots.push(get_arg(ri))
+            ri = ri + 1
+        }
+        let rc = build_compiler_archive(get_arg(2), roots)
+        if rc != 0 {
+            exit(rc)
+        }
         return
     }
 
