@@ -194,10 +194,10 @@ else
     fail=1
 fi
 
-# The run builds the compiler archive from the compiler binary's imports and
-# the codegen test helpers, and stops when it cannot.
+# The run builds the compiler archive from the compiler binary's imports, and
+# stops when it cannot.
 roots="$(cat "$R/build/corpus/compiler_archive/roots" 2>/dev/null)"
-if [ "$roots" = "cg lexer cg_test_helpers lower_test_helpers cname_test_helpers" ]; then
+if [ "$roots" = "cg lexer" ]; then
     echo "PASS compiler-archive-roots"
 else
     echo "FAIL compiler-archive-roots: got '$roots'"
