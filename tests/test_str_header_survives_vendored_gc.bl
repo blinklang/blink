@@ -1,0 +1,59 @@
+// A heap Str points 16 bytes into its GC block, so the Str pointer is an
+// interior pointer. The system libgc treats every interior pointer as live;
+// the vendored libgc that release and cross builds link does not, and relies
+// on the displacement blink_str_gc_offset registers. The rest of the corpus
+// links the system libgc and cannot see that registration go missing.
+//
+// This test builds the vendored libgc the way the release link does (the same
+// source and defines as the build-binaries step), links a C driver against it,
+// and holds Str values only through their Str pointers across forced
+// collections. Without the registration the vendored collector frees them and
+// the driver reports the damaged count.
+
+fn driver() -> Str {
+    "#include \"bootstrap/runtime.h\"\n"
+        .concat("#define N 60000\n")
+        .concat("static char** held;\n")
+        .concat("static void fill(char* s, int64_t i, int64_t len) \{\n")
+        .concat("    for (int64_t k = 0; k < len; k++) s[k] = (char)('a' + (i + k) % 26);\n")
+        .concat("\}\n")
+        .concat("int main(void) \{\n")
+        .concat("    GC_INIT();\n")
+        .concat("    held = (char**)GC_MALLOC(sizeof(char*) * N);\n")
+        .concat("    for (int64_t i = 0; i < N; i++) \{\n")
+        .concat("        int64_t len = 1 + (i * 7) % 90;\n")
+        .concat("        char* s = (i % 2 == 0) ? blink_str_alloc(len) : blink_str_alloc_gc(len);\n")
+        .concat("        fill(s, i, len);\n")
+        .concat("        held[i] = s;\n")
+        .concat("        for (int j = 0; j < 4; j++) \{ GC_MALLOC_ATOMIC(64 + (i % 5) * 32); \}\n")
+        .concat("        if (i % 10000 == 0) GC_gcollect();\n")
+        .concat("    \}\n")
+        .concat("    GC_gcollect(); GC_gcollect();\n")
+        .concat("    for (int j = 0; j < 200000; j++) \{ GC_MALLOC_ATOMIC(128); \}\n")
+        .concat("    GC_gcollect();\n")
+        .concat("    int64_t bad = 0;\n")
+        .concat("    for (int64_t i = 0; i < N; i++) \{\n")
+        .concat("        int64_t len = 1 + (i * 7) % 90;\n")
+        .concat("        char* s = held[i];\n")
+        .concat("        int ok = blink_str_len(s) == len && s[len] == 0;\n")
+        .concat("        for (int64_t k = 0; ok && k < len; k++) if (s[k] != (char)('a' + (i + k) % 26)) ok = 0;\n")
+        .concat("        if (!ok) bad++;\n")
+        .concat("    \}\n")
+        .concat("    printf(\"bad=%lld of %d\\n\", (long long)bad, N);\n")
+        .concat("    return bad == 0 ? 0 : 1;\n")
+        .concat("\}\n")
+}
+
+test "heap Str values stay intact across collections under the vendored libgc" {
+    write_file("build/_str_hdr_vendored_gc.c", driver())
+    let defs = "-DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP"
+    let script = "cc -c -O2 {defs} -Ibootstrap/vendor/gc/include -o build/_str_hdr_vendored_gc_gc.o bootstrap/vendor/gc/extra/gc.c 2>&1"
+        .concat(" && cc -O2 -w -I. -Ibootstrap -Ibootstrap/vendor/gc/include -o build/_str_hdr_vendored_gc_app build/_str_hdr_vendored_gc.c build/_str_hdr_vendored_gc_gc.o -lm -pthread 2>&1")
+        .concat(" && ./build/_str_hdr_vendored_gc_app 2>&1")
+    let r = process_run("sh", ["-c", script])
+    fs_remove("build/_str_hdr_vendored_gc.c")
+    fs_remove("build/_str_hdr_vendored_gc_gc.o")
+    fs_remove("build/_str_hdr_vendored_gc_app")
+    assert(r.out.contains("bad=0 of"), "vendored libgc freed or damaged live heap Str values: {r.out}")
+    assert(r.exit_code == 0, "driver must build, link and exit 0: {r.out}")
+}
