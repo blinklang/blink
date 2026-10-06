@@ -646,6 +646,8 @@ fn log_it(t: Template[Ctx]) -> Int {
 
 This rule is what makes the literal coercion the only way to put text into the parts. Without it, any function that receives a template could push text into the parts, with no `Raw` and no `RawBypassesParam`. *(Non-normative: an implementation may share storage between the template and the returned list until the first write, provided no program can observe the sharing.)*
 
+The values follow the same rule. No Template value type is a shared cell (§3.6 *Shared cells*), so a write through another name, such as a `set_*` call on a `Bytes` that was a hole, does not change the template.
+
 A handler reads each value with a `match` over `TemplateValue`. Read `values()` once, before the loop, because each call makes a new list:
 
 ```blink
@@ -659,6 +661,7 @@ fn bind_template(stmt: Sqlite3Stmt, tpl: Template[DB]) -> Int {
             TemplateValue.Float(f) => sqlite_bind_double(stmt, i, f)
             TemplateValue.Bool(b) => sqlite_bind_int(stmt, i, if b { 1 } else { 0 })
             TemplateValue.Str(s) => sqlite_bind_text(stmt, i, s)
+            TemplateValue.Bytes(b) => sqlite_bind_blob(stmt, i, b)
             TemplateValue.Null => sqlite_bind_null(stmt, i)
         }
         if rc != 0 { return rc }
@@ -677,11 +680,12 @@ type TemplateValue {
     Float(Float)
     Bool(Bool)
     Str(Str)
+    Bytes(Bytes)
     Null
 }
 ```
 
-It is the same for every context `C`. To add a variant is a language change, because every handler's exhaustive `match` must then change (E0004 names each site).
+It is the same for every context `C`. To add a variant is a language change, because every handler's exhaustive `match` must then change (E0004 names each site). A handler names each variant; a `_` arm hides the next language change from E0004. A context with no use for a kind still names its arm and rejects the value there, for example with an `Err` that names the kind.
 
 Each interpolation hole in a `Template[C]` literal becomes one value, by the hole's static type:
 
@@ -691,14 +695,16 @@ Each interpolation hole in a `Template[C]` literal becomes one value, by the hol
 | `Float`, `F32` | `TemplateValue.Float`, widened to `Float` |
 | `Bool` | `TemplateValue.Bool` |
 | `Str` | `TemplateValue.Str` |
+| `Bytes` | `TemplateValue.Bytes` |
 | `Option[T]`, where `T` is a type in the rows above | `Some(x)` gives the value for `x`; `None` gives `TemplateValue.Null` |
-| `Raw[T]` | No value: the text folds into the parts (see below) |
+| `Raw[T]` | No value: the text folds into the parts (see below; `Raw[Bytes]` is an error) |
 
 `Display` is not invoked on a hole (§3.6 *Display Format Protocol*). Any other hole type is `error[TemplateHoleType]` (E0534). That includes `Char`, `U64`, `Option[Option[T]]` (`None` and `Some(None)` would both give `Null`, and the handler could not tell them apart), and every struct, enum, tuple and collection. The compiler reports it at typecheck, at the hole, and never at codegen. Each `help:` line is a repair that compiles and keeps the value a parameter:
 
 - the type has `Display`: send its text, `{p.display()}`
 - a struct with fields of a valid type: send a field, `{p.id}`
 - `U64`: convert first, `let n = Int.try_from(big)?`, then `{n}`
+- `List[U8]`: send it as bytes, `{Bytes.from_list(xs)}`
 - `Option[Option[T]]`: `match` to one level of `Option` first
 
 A `help:` line never offers `Raw(...)`. `Raw` is an audited bypass, not a repair for a type error. If no repair in the list applies to the type, the diagnostic gives the `note:` line only:
@@ -710,8 +716,8 @@ error[TemplateHoleType]: `Point` cannot be a Template value
 4 |     db.execute("INSERT INTO pts VALUES ({p})")
   |                                          ^ `Point` is not a Template value type
   |
-  = note: Template values are Int, Float, Bool, Str, the narrower integers,
-          F32, and Option of these
+  = note: Template values are Int, Float, Bool, Str, Bytes, the narrower
+          integers, F32, and Option of these
   = help: send it as a string value: `{p.display()}`
   = help: or send its fields: `{p.x}`
 ```
@@ -773,6 +779,17 @@ For dynamic SQL (table names, column lists, generated clauses), wrapping an inte
 - `Raw[T]` implements **no `Display`**. The only thing that consumes it is a `Template[C]` coercion, which concatenates the wrapped value into the adjacent literal segment.
 - The marker survives a binding. `let t = Raw(table)` has type `Raw[Str]`, and interpolating `t` into a template is the same bypass as writing `Raw(table)` inline — with the same audit obligation.
 - Nothing strips it implicitly. A `Raw[T]` is not a `T`, and there is no coercion from one to the other.
+
+**A `Raw[Bytes]` cannot fold.** The parts are `List[Str]`, and a `Bytes` value has no lossless map into a `Str`. So `{Raw(b)}` with `b: Bytes` is `error[TemplateHoleType]` (E0534), and its `help:` sends the value as a parameter:
+
+```blink
+// intentional-error example
+fn store(img: Bytes) -> Result[Int, DBError] ! DB.Write {
+    db.execute("INSERT INTO imgs VALUES ({Raw(img)})")   // error[TemplateHoleType]: a `Raw[Bytes]`
+                                                         //   cannot fold into the parts
+                                                         // help: send it as a parameter: `{img}`
+}
+```
 
 ```blink
 fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
@@ -860,6 +877,10 @@ Each context defines its own reassembly strategy. The developer writes the same 
 **Why decomposed (not phantom-only):** Handlers need to read `parts()` and `values()` at runtime to reassemble the template with their dialect-specific syntax. A phantom over a plain string would leave handlers with an opaque string they cannot decompose.
 
 **Why opaque (not a struct with fields):** A `values` field would need a type for "any interpolated value", and Blink has no surface top type (§3.4 *Under-Determined Types*). The closed `TemplateValue` enum is the type instead: it keeps each value's kind, so an `Int` reaches the driver as an integer, and a handler's `match` over it is exhaustive. Public fields would also let code build a template without the literal coercion, which is the one construction path the injection rule depends on.
+
+**Why a `Bytes` variant:** A `Str` must be valid UTF-8 and a `Bytes` need not be, so no existing variant carries a binary value without loss. Database drivers bind a BLOB as its own kind (`sqlite3_bind_blob`, libpq binary parameters). Without the variant, the repair users find, `{b.to_hex()}`, compiles and stores text in a BLOB column. A context with no use for bytes, such as Shell or HTML, rejects them in a named arm.
+
+**When a variant is admitted:** The enum is closed by a rule, not by habit. A new kind becomes a variant only if (a) a value of that kind has no lossless map into an existing variant, and (b) a driver we ship binds it as its own kind. A kind that fails (a), such as a timestamp that a driver sends as an integer or as text, stays a conversion at the hole. Each later vote on a variant applies this test. (Panel vote: 6-0. See [TemplateValue Bytes rationale](../decisions/template-value-bytes.md).)
 
 **Cross-language precedent:**
 
