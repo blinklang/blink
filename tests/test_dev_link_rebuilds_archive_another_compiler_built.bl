@@ -1,0 +1,33 @@
+// A dev tree's build/libblink_std.a may come from a compiler that has since been
+// rebuilt in place. `blink build` must not link it: the archive's C came from the
+// other compiler's codegen. The stale archive here is empty, so linking it fails.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+test "blink build rebuilds a dev archive another compiler built" {
+    let root = sh("pwd -P")
+    let blink = sh("readlink -f build/blink")
+    let arc = sh("dirname \"$(readlink -f build/libblink_std.h)\"")
+    let tree = "{root}/.tmp/_dev_archive_{getpid()}"
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {blink} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    shell_exec("cp -L {root}/build/runtime.h {tree}/build/runtime.h")
+    shell_exec("cp -L {arc}/libblink_std.h {arc}/skip_modules.txt {tree}/build/")
+    shell_exec("ar rc {tree}/build/libblink_std.a")
+    let zeros = "0000000000000000000000000000000000000000000000000000000000000000"
+    shell_exec("cut -d'|' -f1,2 {arc}/.archive-id | sed 's/$/|{zeros}|other/' > {tree}/build/.archive-id")
+    write_file("{tree}/hello.bl", "fn main() \{\n    io.println(\"hello from a fresh archive\")\n\}\n")
+
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT BLINK_CACHE_DIR= build/blink build hello.bl -o {tree}/hello 2>&1"])
+    assert(r.exit_code == 0, "build linked the archive another compiler built: {r.out}")
+    assert_eq(sh("{tree}/hello"), "hello from a fresh archive")
+    let stamped = sh("cut -d'|' -f3 {tree}/build/.archive-id")
+    assert_eq(stamped, sh("sha256sum {tree}/build/blink | cut -d' ' -f1"))
+    shell_exec("rm -rf {tree}")
+}
