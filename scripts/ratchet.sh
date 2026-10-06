@@ -67,6 +67,12 @@
 #                            lib/ may still call `substring`. Str.slice is gone
 #                            too but is not counted: the text alone cannot tell
 #                            it from List.slice and Bytes.slice
+#   str_len_in_byte_args     a `.len()` inside the argument list of a
+#                            `.byte_slice(`, `.byte_at(` or `.byte_index_of(`
+#                            call in src/ or lib/; absolute zero gate. Str.len
+#                            counts codepoints and those methods take byte
+#                            offsets, so the bound is byte_len. Only a call on
+#                            one line is seen, so the count is a lower bound
 #
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
 # lint over the rewrite's files, and fails if that fails. RATCHET_NO_LINT=1
@@ -185,6 +191,15 @@ lib_substr() {
   rg -o -g '*.bl' '\.substr\(' "$1/lib" 2>/dev/null | wc -l | tr -d ' '
 }
 
+# The PCRE group matches the whole balanced argument list, so a `.len()` nested in
+# another call inside it still counts.
+len_in_byte_args() {
+  dirs="$1/src"
+  [ -d "$1/lib" ] && dirs="$dirs $1/lib"
+  rg -o -P -g '*.bl' '\.(?:byte_slice|byte_at|byte_index_of)(\((?:[^()]++|(?1))*\))' $dirs 2>/dev/null |
+    rg -o '\.len\(\)' | wc -l | tr -d ' '
+}
+
 # Takes a root dir instead of reading the repo directly, so the same row
 # definitions run against the real tree, a materialized historical ref, or a
 # synthetic test fixture without duplicating the row list three times.
@@ -205,6 +220,7 @@ fallback_idiom $(pcnt 'if ([a-z_][a-z_0-9.]*) >= 0 \{ \1 \} else' "$allbl")
 typecheck_str_keyed_tables $(cnt '^(pub )?let mut [A-Za-z_][A-Za-z_0-9]*: Map\[Str' "$tcbl")
 node_pool_writes $(pool_writes "$root")
 str_substring_callers $(( $(cnt '\.(substring|substr)\(' "$allbl") + $(lib_substr "$root") ))
+str_len_in_byte_args $(len_in_byte_args "$root")
 ROWS
 }
 
@@ -308,7 +324,7 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   # Absolute zero gates: an id means nothing to another reader or to training
   # data, and a swallowed decline is a wrong answer waiting to be found.
   case "$name" in
-    br_ids_in_source|layout_decline_unhandled|node_pool_writes|str_substring_callers)
+    br_ids_in_source|layout_decline_unhandled|node_pool_writes|str_substring_callers|str_len_in_byte_args)
       [ "$now" -gt 0 ] && mark="$mark NONZERO(must-be-zero)" ;;
   esac
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"

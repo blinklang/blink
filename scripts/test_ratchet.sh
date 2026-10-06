@@ -228,6 +228,38 @@ else
   fail=1
 fi
 
+# A codepoint length used as a byte offset counts in src/ and lib/, nested calls
+# included; byte_len in the same place does not.
+check_named_row str_len_in_byte_args lexer.bl \
+  'let tail = raw.byte_slice(0, raw.len() - 1)'
+check_named_row str_len_in_byte_args typecheck.bl \
+  'let last = s.byte_at(max(0, s.len() - 1))'
+LENARGS="$WORK/lib_len_args"
+rm -rf "$LENARGS"
+cp -r "$BASE" "$LENARGS"
+printf '%s\n' 'fn from_end(s: Str, n: Str) -> Option[Int] { s.byte_index_of(n, s.len() - n.len()) }' >> "$LENARGS/lib/std/text.bl"
+out=$(RATCHET_SRC_DIR="$LENARGS" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+if [ $? = 0 ]; then
+  echo "FAIL str_len_in_byte_args-lib: a lib/ len in byte_index_of did not fail ratchet.sh"
+  fail=1
+elif ! printf '%s\n' "$out" | rg -q '^str_len_in_byte_args .*NONZERO'; then
+  echo "FAIL str_len_in_byte_args-lib: the run failed, but not on str_len_in_byte_args"
+  printf '%s\n' "$out"
+  fail=1
+else
+  echo "PASS str_len_in_byte_args-lib: a lib/ len in byte_index_of failed ratchet.sh"
+fi
+BYTELEN="$WORK/lib_byte_len_args"
+rm -rf "$BYTELEN"
+cp -r "$BASE" "$BYTELEN"
+printf '%s\n' 'fn chop(s: Str) -> Str { s.byte_slice(0, s.byte_len() - 1) }' >> "$BYTELEN/lib/std/text.bl"
+if RATCHET_SRC_DIR="$BYTELEN" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "PASS str_len_in_byte_args-byte-len: a byte_len bound passed ratchet.sh"
+else
+  echo "FAIL str_len_in_byte_args-byte-len: a byte_len bound failed ratchet.sh"
+  fail=1
+fi
+
 # A branch on one value that answers with another is not the idiom: the row
 # needs the same name on both sides, or it counts every signed compare.
 NOFALLBACK="$WORK/no_fallback"
