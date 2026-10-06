@@ -21,6 +21,9 @@
 #include <sys/time.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #define GC_THREADS
 #include <gc.h>
 
@@ -3149,6 +3152,40 @@ BLINK_RT_FN int64_t blink_getpid(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_getpid(void) {
     return (int64_t)getpid();
+}
+#endif
+
+/* The running executable, absolute, with every symlink resolved; "" when the host does not
+   say. Asked of the OS in process: argv[0] can name anything, and `readlink -f` is missing
+   on macOS before 12.3. */
+BLINK_RT_FN const char* blink_exe_path(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_exe_path(void) {
+#if defined(__APPLE__)
+    uint32_t n = 0;
+    _NSGetExecutablePath(NULL, &n);
+    char* raw = (char*)malloc(n);
+    if (!raw) return BLINK_STR_EMPTY;
+    if (_NSGetExecutablePath(raw, &n) != 0) {
+        free(raw);
+        return BLINK_STR_EMPTY;
+    }
+    char* real = realpath(raw, NULL);
+    free(raw);
+    if (!real) return BLINK_STR_EMPTY;
+    const char* s = blink_str_from_cstr_gc(real);
+    free(real);
+    return s;
+#elif defined(__linux__)
+    /* The kernel resolves this link itself, so it needs no realpath. */
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf);
+    if (n <= 0 || n >= (ssize_t)sizeof buf) return BLINK_STR_EMPTY;
+    buf[n] = '\0';
+    return blink_str_from_cstr_gc(buf);
+#else
+    return BLINK_STR_EMPTY;
+#endif
 }
 #endif
 
