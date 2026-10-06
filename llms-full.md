@@ -717,7 +717,7 @@ let first_two = names
 | `.truncate()` | Int | Drop the fraction |
 | `.to_int_checked()` | Result | Float to Int; fails out of range |
 
-`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` below `0.0`. Use `ieee_eq` for IEEE comparison.
+`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign of zero, use `1.0 / x < 0.0`.
 
 ## Option[T] Methods
 
