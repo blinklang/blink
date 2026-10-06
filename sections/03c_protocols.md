@@ -640,11 +640,24 @@ This means field access and method calls occupy distinct syntactic positions: `x
 
 #### Trait Method Lookup
 
-When the compiler sees `x.foo(args)`, it searches all traits in scope that x's type implements, looking for a method named `foo` with a compatible signature. The search follows these rules:
+When the compiler sees `x.foo(args)`, it searches the candidate impls for x's type, looking for a method named `foo` with a compatible signature. §3.6 *Impl visibility* gives the candidates: each impl in the type's own package whose trait is visible, and each other impl whose trait is in scope at the call site. The search follows these rules:
 
-1. **Single match.** Exactly one trait in scope has `foo` for this type → call it.
-2. **No match.** No trait in scope has `foo` for this type → compile error.
-3. **Multiple matches.** Two or more traits have `foo` for this type → compile error with disambiguation hint.
+1. **Single match.** Exactly one candidate trait has `foo` for this type → call it.
+2. **No match.** No candidate trait has `foo` for this type → compile error E0505 (`UnresolvedMethod`).
+3. **Multiple matches.** Two or more candidate traits have `foo` for this type → compile error E0522 (`AmbiguousMethodCall`) with a disambiguation hint.
+
+**E0505 help for a trait not in scope.** Suppose an impl for the receiver's type, of a trait that has `foo`, lives in the type's package or in a package that the current package declares as a dependency, and the trait is visible at the call site. Then E0505 names that trait by its full path and gives the import line as a machine-applicable fix (§8.6). When the file already has a whole-module import of the trait's module, the note says that this import does not bring trait methods into method-call scope, and the fix changes that line in place to a selective import. When several traits match, the help may rank them and stop the list with "and N more". The spec fixes this content, not the wording and not how the compiler finds the impls. A tool may also search more widely, for example the whole workspace in the language server.
+
+```
+error[UnresolvedMethod]: no method `zap` in scope for type `Ctl`
+ --> app.bl:6:7
+  |
+6 |     c.zap()
+  |       ^^^ `ext.Extra` has `zap` for `Ctl`, but `Extra` is not in scope
+  |
+  = note: `import ext` does not bring trait methods into method-call scope
+  = help: change `import ext` to `import ext.{Extra}`
+```
 
 ```blink
 trait Serializable {
@@ -760,7 +773,7 @@ error[QualifiedHeadNotTrait]: the left side of `for` must name a trait
 
 **No inference of `Self`.** `Alpha.make()` stays an error even when an expected type is present, as in `let w: Widget = Alpha.make()`. The error's help gives the impl-qualified form. Inference of `Self` from the expected type is not part of the language. A later version can add it without a change to the meaning of any program that compiles today.
 
-**E0522 help.** When the ambiguous call has a receiver, the help keeps one `Trait.method(x)` line per owner, as in *Trait Method Lookup* above. When the ambiguous method is an associated function, the help gives one impl-qualified line per owner, each one a line the user can paste without edits:
+**E0522 help.** The note names each owner trait by its full path. For an owner that is a candidate because an import puts it in scope, the note also names that import. When the ambiguous call has a receiver, the help keeps one `Trait.method(x)` line per owner, as in *Trait Method Lookup* above. When the ambiguous method is an associated function, the help gives one impl-qualified line per owner, each one a line the user can paste without edits:
 
 ```
 error[AmbiguousMethodCall]: ambiguous method call
@@ -879,7 +892,7 @@ impl Tidy for Str {
 }
 ```
 
-**Resolution is fixed where the call is checked.** The type checker resolves each method call once, to one trait: against the bounds when the receiver's type is a type parameter, else against the traits in scope for the concrete type. Monomorphization keeps that trait for each instance. It never looks the method up again by name. So a bound selects its trait for every type argument, including a built-in type:
+**Resolution is fixed where the call is checked.** The type checker resolves each method call once, to one trait: against the bounds when the receiver's type is a type parameter, else against the candidate impls for the concrete type (§3.6 *Impl visibility*). Monomorphization keeps that trait for each instance. It never looks the method up again by name. So a bound selects its trait for every type argument, including a built-in type:
 
 ```blink
 fn g[T: Tidy](x: T) -> Str {

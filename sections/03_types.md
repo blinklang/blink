@@ -3188,18 +3188,55 @@ impl Display for User {
 
 This is valid because `User` is defined in `myapp` and the impl is also in `myapp`. Intra-package module references are allowed (§10.5).
 
-**Impl visibility.** Impls are automatically brought into scope when the type or the trait is imported. There is no syntax to import an impl directly -- importing `User` or importing `Display` is sufficient for the compiler to find and use `impl Display for User`.
+**Impl visibility.** No syntax imports an impl. For a method call `x.foo()` where `x: T`, two rules give the candidate impls:
+
+1. **An impl in `T`'s package goes with the value.** An impl that lives in the package that defines `T` is a candidate at every call site where its trait is visible. The file does not import `T`, the trait, or any module for it. How the code got the value does not matter: a factory call, a field, a closure parameter and a generic return all give the same methods.
+2. **Any other impl needs its trait in scope.** An impl that lives only in the trait's package is a candidate when the trait is in scope at the call site. A trait is in scope when the module declares it, when a selective import binds its name (`import ext.{Extra}`), when the prelude gives it (§10.6), or when it bounds the receiver's type parameter. A whole-module import (`import ext`) does not put the traits of `ext` in scope for method calls. The call `x.zap()` uses `zap` as a bare name, and only a selection binds a bare name (§10.1 *Qualified Access*). The qualified call `ext.Extra.zap(x)` works with `import ext`.
+
+A trait is **visible** at a call site when the file can name it: the module declares it, or it is `pub` in a module the file can import (§10.2). Rule 1 applies only to a visible trait, so a private helper trait in `T`'s package gives `T` no methods outside the module that declares it. A bound counts as a trait in scope, so a generic body calls the methods of its bounds (§3c.4 *Resolution is fixed where the call is checked*).
 
 ```blink
-import models.{User}
+// Package clockm, src/clockm.bl
+pub type Ctl { ms: Int }
 
-// Display impl for User is automatically visible because User is in scope
-let s = user.display()
+pub trait CtlOps {
+    fn advance(self, ms: Int) -> Ctl
+}
+
+impl CtlOps for Ctl {
+    fn advance(self, ms: Int) -> Ctl { Ctl { ms: self.ms + ms } }
+}
+
+pub fn make() -> Ctl { Ctl { ms: 0 } }
+
+// Package ext, src/ext.bl. It depends on clockm.
+import clockm.{Ctl}
+
+pub trait Extra {
+    fn zap(self) -> Int
+}
+
+impl Extra for Ctl {
+    fn zap(self) -> Int { self.ms * 2 }
+}
+
+// Package app. It depends on clockm and ext.
+import clockm.{make}
+import ext.{Extra}
+
+fn run() -> Int {
+    let c = make().advance(10)    // OK: the CtlOps impl lives in Ctl's package
+    c.zap()                       // OK: the selective import puts Extra in scope
+}
 ```
 
-This means the compiler's impl search is: for `x.foo()` where `x: T`, find all impls of traits with method `foo` for type `T` that are reachable through the import graph. An impl is reachable if it is in a package that the current compilation unit depends on (directly or transitively) and either the trait or the type is in scope.
+With `import ext` in place of `import ext.{Extra}`, `c.zap()` is E0505. The error says that `import ext` does not bring trait methods into method-call scope, and its fix changes the line to `import ext.{Extra}` (§3c.4 *Trait Method Lookup*).
 
-**Why auto-visibility.** Requiring explicit impl imports would be pure boilerplate -- you would need to know the module path of every impl for every trait you use. Auto-visibility on trait/type import means that importing a type gives you access to all its behavior, and importing a trait gives you access to all types that implement it. This is the right default for locality of reasoning: one import, complete behavior.
+The impls in `T`'s package are fixed by the contents of that package, at the version the build uses. They never depend on which modules the build loaded. An import in another file, or a module that some dependency loads, adds no candidates to this file. The same holds for rule 2: only this file's own declarations and imports put a trait in scope.
+
+**A type's package may grow.** A release of `T`'s package can add an impl whose method name is the same as a method of a trait that a caller imports. The caller's unqualified calls with that name then become E0522, with no change to the caller's file. This is a breaking change for the package that adds the impl, and the E0522 help gives the qualified call for each owner. The program never changes what it does without a diagnostic.
+
+**Why the type's package.** The code that a reader expects to work does work: a value from `udp_bind(addr)?` has the socket methods, and the file imports only `udp_bind`. A call's methods depend on two things: the receiver's type and this file's text. The package is also the unit of the orphan rule, so a library can move an impl from one of its files to another and no caller changes. An impl from another package is an extension, and the file opts in to it by name, as with extension methods in Kotlin and C#. Because a whole-module import does not enable method calls, each import shows its effect in the file text: a file that has `import ext` and no `ext.` does not use that import.
 
 ---
 

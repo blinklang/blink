@@ -917,12 +917,12 @@ A `defer` keyword for in-test (and general) teardown is being deliberated separa
 Beyond the stateless IO capture handlers (§8.10.1), `std.testing` ships controller-style mocks for the two effects whose default-handler behavior is hostile to tests: `Time` (the real clock is nondeterministic) and `Env` (the real `env.exit` terminates the test runner).
 
 ```blink
-import std.testing.{mock_clock, MockClock, mock_env, MockEnv}
+import std.testing.{mock_clock, mock_env}
 ```
 
 `mock_clock` and `mock_env` return **controller structs**, not bare handlers. Each controller gives `.as_handler()` (to plug into `with`) and methods that read or change the mock's state. This shape is deliberately different from `capture_log` — see the *Two shapes, one rule* note below.
 
-Import the controller type with its factory. The controller's methods come from a trait impl, and an impl comes into scope when its type or its trait is imported (§3.6). If a test imports only `mock_clock`, `mc.advance(d)` does not resolve.
+Import only the factory. The controller's methods come from a trait impl in the controller type's own package, so they go with the value (§3.6 *Impl visibility*). An import of `MockClock` or `MockEnv` adds nothing, and W0602 flags it (§10.5 *Unused Imports*).
 
 ##### `mock_clock` — deterministic `Time` handler
 
@@ -964,7 +964,7 @@ The mock's state lives in the factory's `let mut` bindings `now` and `slept`. Th
 Construct the controller with a starting instant, plug `.as_handler()` into a `with` block, and (optionally) `.advance(d)` the clock between calls to the code under test to drive time-based control flow:
 
 ```blink
-import std.testing.{mock_clock, MockClock}
+import std.testing.{mock_clock}
 
 test "retry backoff sleeps with increasing delay" {
     let mc = mock_clock(Instant.from_epoch_secs(0))
@@ -1020,7 +1020,7 @@ pub fn mock_env(initial: Map[Str, Str]) -> MockEnv
 Construct with the initial environment, plug `.as_handler()` into a `with` block, optionally call `.set(name, value)` to mutate the environment between CUT calls, and inspect `.writes()` afterward to see what the CUT wrote:
 
 ```blink
-import std.testing.{mock_env, MockEnv}
+import std.testing.{mock_env}
 
 test "loader reads DATABASE_URL with fallback" {
     let me = mock_env(Map.from([("DATABASE_URL", "postgres://test")]))
@@ -1075,7 +1075,7 @@ This rule applies forward to `MockFs`, `MockNet`, `MockRand` and any future effe
 The mocks compose with each other and with the IO capture handlers via the standard `with a, b, c` handler chain:
 
 ```blink
-import std.testing.{mock_clock, MockClock, mock_env, MockEnv, capture_log}
+import std.testing.{mock_clock, mock_env, capture_log}
 
 test "scheduled job logs progress with mocked clock and env" {
     let mc = mock_clock(Instant.from_epoch_secs(1735689600))
