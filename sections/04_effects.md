@@ -799,6 +799,8 @@ fn run_cli() ! Env.Read, Env.Exit, IO {
 2. The capability system tracks which code can terminate the process
 3. Sandboxed code cannot exit unless granted `! Env.Exit` (or `! Env`)
 
+**A handler cannot return from an op declared `-> Never`.** This rule applies to every effect op declared `-> Never`, not only to `exit`. A handler gives an op its result when the op's `fn` returns (§4.7 *Defining a handler*). No value of type `Never` exists (§3.2), so the handler's `fn` for such an op cannot return. Its body must diverge (§3.3 *Divergence and Body Completeness*). The mock below ends its `exit` with `abort`.
+
 ```blink
 test "CLI exits with 1 on missing args" {
     let mut exit_code = -1
