@@ -1,6 +1,8 @@
 import std.fs
 import compiler.{compile_to_program, load_phase, load_phase_begin, load_phase_check, load_phase_end, load_phase_keeps_gc_off}
-import diagnostics.{diag_reset}
+import diagnostics.{Diag, diag_count, diag_reset}
+import lexer.{Lex}
+import parser.{Parse}
 
 @ffi("GC_is_disabled", header: "gc.h")
 @trusted(audit: "Reads the collector's disable counter; takes no arguments and returns an int.")
@@ -8,6 +10,17 @@ fn collector_disable_count() -> I32 ! FFI {}
 
 fn gc_off() -> Bool {
     collector_disable_count() != 0
+}
+
+// Load errors come back as diagnostics, not as an abort, so the language server and the
+// test runner go on to the next compile; each one must find collection on.
+fn compile_failing_source(name: Str, source: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    let path = "build/compiler_load_phase_gc_off_{name}.bl"
+    diag_reset()
+    write_file(path, source)
+    let _ = compile_to_program(path, 1)
+    let _ = fs.delete(path)
+    assert(diag_count > 0)
 }
 
 test "collection stays off for an AST up to the node bound and resumes past it" {
@@ -64,5 +77,20 @@ test "a load phase that panics before its end leaves collection on" {
             let _ = unread.get(0).unwrap()
         }
     }
+    assert(!gc_off())
+}
+
+test "a compile whose source fails to lex leaves collection on" {
+    compile_failing_source("lex", "fn main() \{ let s = \"unterminated\n\}\n")
+    assert(!gc_off())
+}
+
+test "a compile whose source fails to parse leaves collection on" {
+    compile_failing_source("parse", "fn main( \{\n")
+    assert(!gc_off())
+}
+
+test "a compile that imports a missing module leaves collection on" {
+    compile_failing_source("import", "import nosuch.module\nfn main() \{ \}\n")
     assert(!gc_off())
 }
