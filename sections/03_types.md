@@ -1936,7 +1936,7 @@ error[TypeError]: mismatched types
 
 `Handler` in `use_it` is the module's own struct (it shadows the compiler-known `Handler[E]`, §10.6 *Shadowing Rules*), so `use_it(5)` is an ordinary type mismatch. It is never a type variable that accepts `5`.
 
-**Hygiene.** Syntax that the compiler expands, and types the compiler inserts, refer to the compiler-known type **by identity**, never by the name that is in scope at the use site. This covers `T?` and `??` (`Option`), `?` (`Result`/`Option`), `for` (`IntoIterator`/`Iterator`), `..`/`..=` (`Range`), `==`/`<` and the other operators (their traits), `with` (`Handler`, `Closeable`), `async.spawn` (`Handle`), `Template[C]` coercion, literals (`Int`, `Float`, `Str`, `Char`, `Bool`), and every other desugaring in this spec. A module that declares its own `Option` still gets the builtin `Option` from `x?`:
+**Hygiene.** Syntax that the compiler expands, and types the compiler inserts, refer to the compiler-known type **by identity**, never by the name that is in scope at the use site. This covers `T?` and `??` (`Option`), `?` (`Result`/`Option`), `for` (`IntoIterator`/`Iterator`), `..`/`..=` (`Range`), `==`/`<` and the other operators (their traits), `with` (`Handler`, `Closeable`), `async.spawn` (`Handle`), `Template[C]` coercion, literals (`Int`, `Float`, `Str`, `Char`, `Bool`), and every other desugaring in this spec. A trait name that the user writes (a bound, an `impl`, a supertrait clause, a `@derive` argument) is not a desugaring and resolves by scope (§10.6 *Shadowing a Prelude Trait*). A module that declares its own `Option` still gets the builtin `Option` from `x?`:
 
 ```blink
 type Option {
@@ -3321,6 +3321,8 @@ The compiler uses `Closeable` to power the ScopedValueWithoutWith lint (warn whe
 
 The `@derive` annotation (§11.1) instructs the compiler to auto-generate trait implementations. Eight traits are derivable in v1: `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Serialize`, `Deserialize`.
 
+The argument of `@derive` is a name that the user writes, so it resolves by scope. When it does not denote one of these eight compiler-known traits by identity, the compiler reports E1402 `NotDerivable`. In a module that shadows `Eq`, `@derive(Eq)` names the local trait and is E1402. `import blink.core.{Eq as CoreEq}` and `@derive(CoreEq)` derive the compiler-known trait (§10.6 *Shadowing a Prelude Trait*).
+
 ##### Derivable Trait Declarations
 
 For reference, the eight derivable traits and their required methods:
@@ -3866,11 +3868,11 @@ Some traits have supertraits: `Ord` requires `Eq`, `Hash` requires `Eq`. When de
 1. If the supertrait is already implemented (explicit `impl` or prior `@derive`), use the existing implementation
 2. If not, the compiler auto-derives the supertrait
 
-This means `@derive(Ord)` implicitly derives `Eq` if not already present. Redundant listing like `@derive(Eq, Ord)` is allowed — no error, no warning. The `Eq` derivation happens once regardless.
+This means `@derive(Ord)` implicitly derives `Eq` if not already present. The supertrait is the compiler-known `Eq` by identity, also in a module that shadows `Eq` (§10.6 *Shadowing a Prelude Trait*). Redundant listing like `@derive(Eq, Ord)` is allowed — no error, no warning. The `Eq` derivation happens once regardless.
 
 ##### Error Reporting
 
-When `@derive` fails because a field's type doesn't implement the required trait, the compiler reports **all** non-derivable fields in a single diagnostic (not just the first):
+An argument that is not a derivable compiler-known trait is E1402 `NotDerivable` (see *Derive Mechanics* above). When `@derive` fails because a field's type doesn't implement the required trait, the compiler reports **all** non-derivable fields in a single diagnostic (not just the first):
 
 ```
 error[NonDerivableTrait]: cannot derive `Hash` for `Measurement`
