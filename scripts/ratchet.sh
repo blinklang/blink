@@ -50,11 +50,14 @@
 #   node_pool_writes         writes to the parser's node pool, the non-pub
 #                            `columns` (one column per node field plus the
 #                            child-slot columns), outside node_push, node_pop,
-#                            node_replace, parser_reset and the two child-slot
-#                            helpers they call; absolute zero gate. Each writer
-#                            writes every column, so any other write leaves one
-#                            column holding a field or a child the others do
-#                            not. Counted in src/, lib/ and tests/: in parser.bl
+#                            node_replace, parser_reset, the two plain-field
+#                            writers and the chunk and child-slot helpers they
+#                            call; absolute zero gate. A plain-field writer
+#                            writes only a field the child table never reads;
+#                            every other writer writes every column. Any other
+#                            write leaves one column holding a field or a child
+#                            the others do not. Counted in src/, lib/ and
+#                            tests/: in parser.bl
 #                            outside the writers, and in every file that imports
 #                            `nodes` from parser or spells `parser.nodes`, the
 #                            name the pool had before it was split into
@@ -163,9 +166,9 @@ decline_unhandled() {
 # Mutating calls on the pool and assignments into a slot or a field of one, spelled bare or as
 # `parser.nodes`.
 POOL_WRITE='\b(parser\.)?nodes(\.(push|pop|set|clear|insert|remove|truncate|append|extend|reverse|sort|swap)\(|\[[^]]*\](\.[a-z_]+)*\s*=[^=])'
-# The same writes to a field of parser.bl's `columns`, plus a reassignment of a field or of
-# the whole value.
-COLUMN_WRITE='\bcolumns(\s*=[^=]|\.[a-z_]+(\.(push|pop|set|clear|insert|remove|truncate|append|extend|reverse|sort|swap)\(|\[[^]]*\]\s*=[^=]|\s*=[^=]))'
+# The same writes to a field of parser.bl's `columns` or to one chunk of it, plus a
+# reassignment of a field or of the whole value.
+COLUMN_WRITE='\bcolumns(\s*=[^=]|\.[a-z_]+(\[[^]]*\])?(\.(push|pop|set|clear|insert|remove|truncate|append|extend|reverse|sort|swap)\(|\[[^]]*\]\s*=[^=]|\s*=[^=]))'
 
 pool_writes() {
   root="$1"
@@ -173,7 +176,7 @@ pool_writes() {
   p="$root/src/parser.bl"
   if [ -f "$p" ]; then
     n=$(awk '
-      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset|node_append_child_slots|node_drop_child_slots_from)\(/ { inw = 1 }
+      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset|node_write_plain_int|node_write_plain_str|node_columns_open_chunk|node_columns_close_chunk|node_append_child_slots|node_drop_child_slots_from)\(/ { inw = 1 }
       !inw { print }
       inw && /^}/ { inw = 0 }' "$p" | rg -o "$POOL_WRITE|$COLUMN_WRITE" | wc -l | tr -d ' ')
     total=$((total + n))
