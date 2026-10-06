@@ -1,0 +1,265 @@
+// A Str records its codepoint count in its header when it is made, and len() trusts that
+// count, so a wrong count is a wrong answer with no error. Every way of making a Str must
+// record the count, and record it right. Each case reads the raw field through a runtime
+// hook: 0 means the producer recorded nothing and len() will walk the bytes, and n means
+// a count of n - 1. A case fails if the field is 0, so a producer that stops recording
+// fails here, not only one that records a wrong count. The reference count is a for
+// loop over the characters, which walks the bytes and does not read the header.
+
+import std.fs
+import std.net.{tcp_read, tcp_read_all, tcp_write, tcp_close}
+
+@ffi("blink_str_recorded_cps")
+@trusted(audit: "TEST-STR-CPS")
+fn recorded_cps_plus1(s: Str) -> Int ! FFI {}
+
+@ffi("getenv")
+@trusted(audit: "TEST-STR-CPS")
+fn c_getenv(name: Str) -> Str ! FFI {}
+
+@ffi("blink_strerror")
+@trusted(audit: "TEST-STR-CPS")
+fn runtime_strerror(code: Int) -> Str ! FFI {}
+
+@ffi("blink_str_debug")
+@trusted(audit: "TEST-STR-CPS")
+fn runtime_str_debug(s: Str) -> Str ! FFI {}
+
+@ffi("blink_char_debug")
+@trusted(audit: "TEST-STR-CPS")
+fn runtime_char_debug(code: Int) -> Str ! FFI {}
+
+@ffi("blinkrt_socketpair_packed")
+@trusted(audit: "TEST-STR-CPS")
+fn socketpair_packed() -> Int ! FFI {}
+
+let GREETING: Str = "héllo, wörld"
+
+@derive(Debug)
+type Shade { Light, Dark }
+
+@derive(Debug)
+type Tagged { label: Str, shade: Shade }
+
+@derive(Debug)
+type Glyph { ch: Char, name: Str }
+
+fn walked_count(s: Str) -> Int {
+    let mut n = 0
+    for _ch in s {
+        n = n + 1
+    }
+    n
+}
+
+fn expect_recorded(s: Str, want: Int) {
+    let field = recorded_cps_plus1(s)
+    assert(field != 0, "the Str recorded no codepoint count: {s}")
+    assert_eq(field - 1, want)
+    assert_eq(walked_count(s), want)
+}
+
+// For a producer whose output this test does not fix, such as an error message.
+fn expect_recorded_right(s: Str) {
+    expect_recorded(s, walked_count(s))
+}
+
+test "literals count the decoded characters" {
+    expect_recorded("", 0)
+    expect_recorded("a", 1)
+    expect_recorded("café", 4)
+    expect_recorded("€😀", 2)
+    expect_recorded(GREETING, 12)
+    let long = "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+    expect_recorded(long, 71)
+}
+
+test "a literal counts each escape as the one character it decodes to" {
+    // Six escapes, each two source characters, plus é: 7 characters in 9 bytes.
+    expect_recorded("\t\n\\\"\{\}é", 7)
+    expect_recorded("tab\té\"quote\{ü\}", 14)
+}
+
+test "interpolation" {
+    let n = 42
+    let name = "blïnk"
+    expect_recorded("{name}", 5)
+    expect_recorded("{n}", 2)
+    expect_recorded("<{name}:{n}>é", 11)
+    expect_recorded("{""}", 0)
+    expect_recorded("{-7}", 2)
+    expect_recorded("{true} {false}", 10)
+    expect_recorded("{1.5}", 3)
+    expect_recorded("{'x'}", 1)
+}
+
+test "concat" {
+    expect_recorded("ab".concat("cdé"), 5)
+    expect_recorded("".concat(""), 0)
+    expect_recorded("é".concat(""), 1)
+    expect_recorded("".concat("€"), 1)
+    let built = "x".concat("{1}")
+    expect_recorded(built.concat("😀"), 3)
+}
+
+test "byte_slice and substring" {
+    let s = "héllo wörld"
+    expect_recorded(s.byte_slice(0, 6), 5)
+    expect_recorded(s.byte_slice(7, 13), 5)
+    expect_recorded(s.byte_slice(3, 3), 0)
+    expect_recorded(s.byte_slice(4, 2), 0)
+    expect_recorded(s.byte_slice(7, 100), 5)
+    expect_recorded_right(s.substring(0, 3))
+    expect_recorded_right(s.substring(3, 6))
+}
+
+test "methods built in the standard library" {
+    expect_recorded("  péd  ".trim(), 3)
+    expect_recorded("  péd".trim_left(), 3)
+    expect_recorded("péd  ".trim_right(), 3)
+    expect_recorded("abé".to_upper(), 3)
+    expect_recorded("ABÉ".to_lower(), 3)
+    expect_recorded("a-é-c".replace("-", "--"), 7)
+    let parts = "a,éé,ccc".split(",")
+    expect_recorded(parts.get(1).unwrap(), 2)
+    expect_recorded(parts.join("+"), 8)
+    let lines = "one\ntwö\n".lines()
+    expect_recorded(lines.get(1).unwrap(), 3)
+}
+
+test "string builder" {
+    let sb = StringBuilder.new()
+    expect_recorded(sb.to_str(), 0)
+    sb.write("abé")
+    sb.write("€😀")
+    expect_recorded(sb.to_str(), 5)
+}
+
+test "scalar conversions" {
+    expect_recorded('q'.to_str(), 1)
+    expect_recorded(Char.from_code_point(65).unwrap().to_str(), 1)
+    expect_recorded(Char.from_code_point(233).unwrap().to_str(), 1)
+    expect_recorded(Char.from_code_point(8364).unwrap().to_str(), 1)
+    expect_recorded(Char.from_code_point(128512).unwrap().to_str(), 1)
+    expect_recorded("{12345}", 5)
+    expect_recorded("{-3.25}", 5)
+    expect_recorded("{12345}".concat("{0.5}"), 8)
+}
+
+test "debug text" {
+    // A derived debug() renders a Str or Char field through these two runtime helpers.
+    expect_recorded(runtime_str_debug(""), 2)
+    expect_recorded(runtime_str_debug("é\"x"), 6)
+    expect_recorded(runtime_char_debug(113), 3)
+    expect_recorded(runtime_char_debug(10), 4)
+    expect_recorded(runtime_char_debug(233), 3)
+    expect_recorded(runtime_char_debug(128512), 3)
+    expect_recorded_right(Shade.Dark.debug())
+    expect_recorded_right(Tagged { label: "q\"é", shade: Shade.Light }.debug())
+    expect_recorded_right(Glyph { ch: 'q', name: "é€" }.debug())
+}
+
+test "bytes" {
+    let b = Bytes.from_str("xyé")
+    match b.to_str() {
+        Ok(s) => expect_recorded(s, 3)
+        Err(_e) => assert(false)
+    }
+    expect_recorded(b.to_hex(), 8)
+    match Bytes.from_str("").to_str() {
+        Ok(s) => expect_recorded(s, 0)
+        Err(_e) => assert(false)
+    }
+    let bad = Bytes.from_str("a")
+    bad.push(255)
+    match bad.to_str() {
+        Ok(_s) => assert(false)
+        Err(msg) => expect_recorded_right(msg)
+    }
+    let cut = Bytes.from_str("a")
+    cut.push(195)
+    match cut.to_str() {
+        Ok(_s) => assert(false)
+        Err(msg) => expect_recorded_right(msg)
+    }
+}
+
+test "files" {
+    let path = "build/str_records_cps_probe.txt"
+    write_file(path, "line ône\nline twö\n")
+    expect_recorded(read_file(path), 18)
+    match fs.read(path) {
+        Ok(s) => expect_recorded(s, 18)
+        Err(_e) => assert(false)
+    }
+    write_file(path, "")
+    expect_recorded(read_file(path), 0)
+    expect_recorded(read_file("build/str_records_cps_no_such_file.txt"), 0)
+    match fs.list_dir("build") {
+        Ok(names) => {
+            assert(names.len() > 0)
+            for name in names {
+                expect_recorded_right(name)
+            }
+        }
+        Err(_e) => assert(false)
+    }
+}
+
+test "environment" {
+    let args = env.args()
+    expect_recorded_right(args.get(0).unwrap())
+    match env.var("PATH") {
+        Some(v) => expect_recorded_right(v)
+        None => {}
+    }
+    expect_recorded_right(env.cwd())
+}
+
+test "foreign pointers and functions" {
+    let p = "pöinter".as_cstr()
+    match p.to_str() {
+        Some(s) => expect_recorded(s, 7)
+        None => assert(false)
+    }
+    expect_recorded_right(c_getenv("PATH"))
+    expect_recorded_right(runtime_strerror(2))
+}
+
+test "process output" {
+    let r = process_run("sh", ["-c", "printf abcdé; printf xÿ 1>&2"])
+    expect_recorded(r.out, 5)
+    expect_recorded(r.err_out, 2)
+}
+
+test "socket reads" {
+    let packed = socketpair_packed()
+    assert(packed >= 0)
+    let a = packed >> 32
+    let b = packed & 4294967295
+    tcp_write(a, "sôck")
+    expect_recorded(tcp_read(b, 64), 4)
+    tcp_write(a, "rést")
+    tcp_close(a)
+    expect_recorded(tcp_read_all(b), 4)
+    tcp_close(b)
+}
+
+test "time formatting" {
+    expect_recorded_right(Instant.from_epoch_secs(1735689600).to_rfc3339())
+}
+
+test "runtime error text" {
+    match fs.read("build/str_records_cps_no_such_file.txt") {
+        Ok(_s) => assert(false)
+        Err(e) => expect_recorded_right("{e}")
+    }
+}
+
+test "a Str made in an arena keeps its count when it leaves" {
+    let n = 7
+    let out = with arena {
+        "é{n}".concat("ü")
+    }
+    expect_recorded(out, 3)
+}

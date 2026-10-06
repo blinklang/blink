@@ -527,27 +527,34 @@ BLINK_RT_FN char* blink_strdup(const char* s) {
 /* ── Str representation ─────────────────────────────────────────────────
    A Str points at NUL-terminated UTF-8 bytes, so C code can read it as a C
    string. The 16 bytes right before those bytes hold a header that records
-   the byte length, so len is O(1) and no operation has to scan for the NUL.
-   A Str cannot hold a NUL byte, so the length and the terminator agree.
+   the byte length and the codepoint count, so byte_len and len are O(1) and
+   no operation has to scan for the NUL. A Str cannot hold a NUL byte, so the
+   length and the terminator agree.
 
    Every Str must come from a producer that writes the header:
    blink_str_alloc and the blink_str_from_* copies here, BLINK_STR_STATIC for
    a literal in the runtime, and the compiler for a literal in a program. A
    bare C string (argv, getenv, a C literal) is not a Str until it is copied.
 
+   `cps_plus1` holds the codepoint count plus one; 0 means not recorded, and
+   len() then counts. A codepoint is a byte that is not a continuation byte
+   (10xxxxxx), the same rule for every producer and for the --debug check, so
+   bytes that are not valid UTF-8 (a file read as is) still get a count and
+   never a panic. A count that does not fit is stored as 0.
+
    A header is never written after its Str exists: compiled literals live in
-   read-only memory. So `flags` (0: nothing known) must be set by the
-   producer, and a compiled literal is not aligned, so the header is read with
-   memcpy. `magic` sits right before the bytes so a check can find a pointer
-   that never had a header. The compiler writes literal headers as bytes,
-   little-endian. */
+   read-only memory. So the producer sets `cps_plus1` once its bytes are final
+   (after any blink_str_shrink, which rewrites the header), and a compiled
+   literal is not aligned, so the header is read with memcpy. `magic` sits
+   right before the bytes so a check can find a pointer that never had a
+   header. The compiler writes literal headers as bytes, little-endian. */
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "blink: the Str header layout assumes a little-endian target"
 #endif
 
 typedef struct {
     int64_t len;
-    uint32_t flags;
+    uint32_t cps_plus1;
     uint32_t magic;
 } blink_str_hdr;
 
@@ -556,10 +563,18 @@ typedef struct {
 
 _Static_assert(sizeof(blink_str_hdr) == 16, "blink_str_hdr must be 16 bytes");
 
-/* A Str-shaped static for a literal the runtime returns. `name.d` is the Str. */
+/* How far before the bytes `cps_plus1` sits. */
+#define BLINK_STR_CPS_BACK ((int64_t)8)
+_Static_assert(__builtin_offsetof(blink_str_hdr, cps_plus1) == 16 - 8, "cps_plus1 must sit 8 bytes before the Str");
+
+/* A Str-shaped static for a literal the runtime returns. `name.d` is the Str.
+   `text` must be ASCII: C cannot count codepoints at compile time, so the
+   count recorded is the byte count. Every use is a C literal except the CLI
+   version, and scripts/stamp_cli_version.sh rejects a version that is not
+   ASCII. */
 #define BLINK_STR_STATIC(name, text) \
     BLINK_UNUSED static const struct { blink_str_hdr h; char d[sizeof(text)]; } name = \
-        { { (int64_t)sizeof(text) - 1, 0, BLINK_STR_MAGIC }, text }
+        { { (int64_t)sizeof(text) - 1, (uint32_t)sizeof(text), BLINK_STR_MAGIC }, text }
 
 /* On by default: the check costs one load and one compare in len, and a
    pointer without a header would otherwise read garbage as a length. */
@@ -589,6 +604,49 @@ static inline int64_t blink_str_len(const char* s) {
     int64_t n;
     memcpy(&n, s - BLINK_STR_HDR_SIZE, sizeof(n));
     return n;
+}
+
+static inline int64_t blink_str_count_cps(const char* p, int64_t n) {
+    int64_t c = 0;
+    for (int64_t i = 0; i < n; i++) c += (((unsigned char)p[i]) & 0xC0) != 0x80;
+    return c;
+}
+
+/* The raw field: count + 1, or 0 when not recorded. Tests read it to tell a
+   recorded count from a fallback. */
+static inline int64_t blink_str_recorded_cps(const char* s) {
+    (void)blink_str_len(s);
+    uint32_t c;
+    memcpy(&c, s - BLINK_STR_CPS_BACK, sizeof(c));
+    return (int64_t)c;
+}
+
+/* Inline in every TU, so a --debug build checks the calls it compiles. Only
+   those: the prebuilt std archive is not built with BLINK_DEBUG, so a len()
+   inside a std function trusts the count even under --debug. */
+static inline int64_t blink_str_cp_len(const char* s) {
+    int64_t n = blink_str_len(s);
+    uint32_t c;
+    memcpy(&c, s - BLINK_STR_CPS_BACK, sizeof(c));
+    if (__builtin_expect(c == 0, 0)) return blink_str_count_cps(s, n);
+#ifdef BLINK_DEBUG
+    int64_t walked = blink_str_count_cps(s, n);
+    if (walked != (int64_t)c - 1) {
+        __blink_panic_dispatchf("blink: internal error: a Str records %lld codepoints but holds %lld",
+                                (long long)c - 1, (long long)walked);
+    }
+#endif
+    return (int64_t)c - 1;
+}
+
+/* Set by the producer once the bytes are final. */
+static inline void blink_str_set_cps(char* data, int64_t cps) {
+    uint32_t c = (cps >= 0 && cps < (int64_t)UINT32_MAX) ? (uint32_t)(cps + 1) : 0;
+    memcpy(data - BLINK_STR_CPS_BACK, &c, sizeof(c));
+}
+
+static inline void blink_str_count_and_set_cps(char* data) {
+    blink_str_set_cps(data, blink_str_count_cps(data, blink_str_len(data)));
 }
 
 static inline void blink_str_write_hdr(char* data, int64_t len) {
@@ -654,6 +712,7 @@ BLINK_RT_FN const char* blink_str_from_bytes(const char* p, int64_t n) {
     if (nul) n = (int64_t)(nul - p);
     char* s = blink_str_alloc(n);
     if (n > 0) memcpy(s, p, (size_t)n);
+    blink_str_count_and_set_cps(s);
     return s;
 }
 #endif
@@ -667,6 +726,7 @@ BLINK_RT_FN const char* blink_str_from_cstr(const char* p) {
     int64_t n = (int64_t)strlen(p);
     char* s = blink_str_alloc(n);
     memcpy(s, p, (size_t)n);
+    blink_str_count_and_set_cps(s);
     return s;
 }
 #endif
@@ -679,6 +739,7 @@ BLINK_RT_FN const char* blink_str_from_cstr_gc(const char* p) {
     int64_t n = (int64_t)strlen(p);
     char* s = blink_str_alloc_gc(n);
     memcpy(s, p, (size_t)n);
+    blink_str_count_and_set_cps(s);
     return s;
 }
 #endif
@@ -1899,6 +1960,7 @@ BLINK_RT_FN const char* blink_bytes_to_hex(const blink_bytes* b) {
     for (int64_t i = 0; i < b->len; i++) {
         sprintf(hex + i * 2, "%02x", b->data[i]);
     }
+    blink_str_set_cps(hex, b->len * 2);
     return hex;
 }
 #endif
@@ -2355,6 +2417,7 @@ BLINK_RT_FN const char* blink_sb_to_str(const blink_sb* sb);
 BLINK_RT_FN const char* blink_sb_to_str(const blink_sb* sb) {
     char* s = blink_str_alloc_gc(sb->len);
     memcpy(s, sb->data, (size_t)sb->len);
+    blink_str_count_and_set_cps(s);
     return s;
 }
 #endif
@@ -2473,6 +2536,7 @@ BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t l
     if (len > slen - start) len = slen - start;
     char* buf = blink_str_alloc(len);
     memcpy(buf, s + start, (size_t)len);
+    blink_str_count_and_set_cps(buf);
     return buf;
 }
 #endif
@@ -2503,6 +2567,7 @@ BLINK_RT_FN const char* blink_str_from_char_code(int64_t code) {
         buf = blink_str_alloc(1);
         buf[0] = '?';
     }
+    blink_str_set_cps(buf, 1);
     return buf;
 }
 #endif
@@ -2565,6 +2630,7 @@ BLINK_RT_FN const char* blink_str_debug(const char* s) {
     }
     buf[w++] = '"';
     blink_str_shrink(buf, w);
+    blink_str_count_and_set_cps(buf);
     return buf;
 }
 #endif
@@ -2597,6 +2663,7 @@ BLINK_RT_FN const char* blink_char_debug(int64_t code) {
         buf[1] = esc[0];
         buf[2] = esc[1];
         buf[3] = '\'';
+        blink_str_set_cps(buf, 4);
         return buf;
     }
     const char* body = blink_str_from_char_code(code);
@@ -2605,6 +2672,7 @@ BLINK_RT_FN const char* blink_char_debug(int64_t code) {
     buf[0] = '\'';
     for (int64_t i = 0; i < n; i++) buf[i + 1] = body[i];
     buf[n + 1] = '\'';
+    blink_str_set_cps(buf, 3);
     return buf;
 }
 #endif
@@ -2647,6 +2715,7 @@ BLINK_RT_FN const char* blink_str_concat(const char* a, const char* b) {
     char* buf = blink_str_alloc(la + lb);
     memcpy(buf, a, (size_t)la);
     memcpy(buf + la, b, (size_t)lb);
+    blink_str_set_cps(buf, blink_str_cp_len(a) + blink_str_cp_len(b));
     return buf;
 }
 #endif
@@ -2670,6 +2739,7 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
         int64_t real = nul ? (int64_t)(nul - small) : (int64_t)needed;
         char* buf = blink_str_alloc(real);
         memcpy(buf, small, (size_t)real);
+        blink_str_count_and_set_cps(buf);
         return buf;
     }
     char* buf = blink_str_alloc((int64_t)needed);
@@ -2677,6 +2747,7 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
     va_end(ap2);
     const char* nul = (const char*)memchr(buf, '\0', (size_t)needed);
     if (nul) blink_str_shrink(buf, (int64_t)(nul - buf));
+    blink_str_count_and_set_cps(buf);
     return buf;
 }
 #endif
@@ -2812,6 +2883,7 @@ BLINK_RT_FN const char* blink_str_byte_slice(const char* s, int64_t start, int64
     int64_t rlen = end - start;
     char* buf = blink_str_alloc(rlen);
     memcpy(buf, s + start, (size_t)rlen);
+    blink_str_count_and_set_cps(buf);
     return buf;
 }
 #endif
@@ -2870,6 +2942,7 @@ BLINK_RT_FN const char* blink_read_file(const char* path) {
     /* The file can shrink between ftell and fread, and a NUL byte ends a Str. */
     const char* nul = got > 0 ? (const char*)memchr(buf, 0, got) : NULL;
     blink_str_shrink(buf, nul ? (int64_t)(nul - buf) : (int64_t)got);
+    blink_str_count_and_set_cps(buf);
     return buf;
 }
 #endif

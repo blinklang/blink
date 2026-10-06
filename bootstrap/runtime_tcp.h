@@ -48,6 +48,7 @@ BLINK_RT_FN const char* blink_tcp_read(int64_t fd, int64_t max_bytes) {
     if (n < 0) n = 0;
     const char* nul = n > 0 ? (const char*)memchr(buf, 0, (size_t)n) : NULL;
     blink_str_shrink(buf, nul ? (int64_t)(nul - buf) : (int64_t)n);
+    blink_str_count_and_set_cps(buf);
     return buf;
 }
 #endif
