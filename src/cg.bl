@@ -14,7 +14,7 @@ import diagnostics.{
     UNVERIFIED_IR_AT_PRINT,
 }
 import cname.{
-    c_archive_header_guard, c_module_header_guard, c_module_init_globals_name,
+    c_archive_header_guard, c_layer_archive_header_guard, c_module_header_guard, c_module_init_globals_name,
     c_string_literal, c_test_fn_name,
 }
 import ast.{NodeKind, nk_of}
@@ -93,8 +93,12 @@ pub type CgConfig {
     // Declare `blink_ev` extern instead of defining it, so the linker resolves the
     // single definition the program has.
     blink_ev_extern_only: Int
-    // This TU is the stdlib archive being built.
+    // This TU is an archive being built: the stdlib's, or with `archive_over_std` one layered
+    // over it.
     archive_build_mode: Int
+    // The archive being built is linked beside the stdlib archive, which defines the
+    // runtime's storage and every std module this archive skips.
+    archive_over_std: Int
 }
 
 
@@ -228,9 +232,7 @@ fn globals_in_scope(cfg: CgConfig, module_key: Str, declare_only: Bool) -> List[
 // definition line, in declaration order, for the entry point to assign before anything
 // else runs; a header declares no definition and so never has any to answer.
 fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool) -> List[Int] ! Diag.Report {
-    let user_tu = cfg.user_tu_mode != 0
-    let define_storage = cfg.archive_build_mode != 0
-    cg_decl_emit_prologue(user_tu, define_storage, false, header_guard, self_header)
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, defines_runtime_storage(cfg), false, header_guard, self_header)
     cg_decl_emit_typedefs()
     if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
     // The definition half owns exactly the globals in scope for this unit: a skipped
@@ -239,12 +241,22 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
     // non-const global, a second definition the linker rejects. The header half keeps the
     // unfiltered set — every global in the program needs a declaration somewhere, and a
     // header is where one that lives in the archive gets it.
-    let globals = if globals_extern { cg_reg_global_decls() } else { globals_in_scope(cfg, "", false) }
+    // A layered archive's header leaves the skipped modules to the stdlib archive's header,
+    // which every unit that reads this one has already included.
+    let all_globals = globals_extern && cfg.archive_over_std == 0
+    let globals = if all_globals { cg_reg_global_decls() } else { globals_in_scope(cfg, "", false) }
     let inits = if globals_extern { Map() } else { lower_global_inits(globals) }
     let deferred = cg_decl_emit_globals(globals_extern, globals, inits)
-    emit_root_signatures(fns_in_scope(cfg, "", shared, true), methods_in_scope(cfg, "", shared, true))
+    let declare_only = !(globals_extern && cfg.archive_over_std != 0)
+    emit_root_signatures(fns_in_scope(cfg, "", shared, declare_only), methods_in_scope(cfg, "", shared, declare_only))
     cg_derive_emit_decls(derived_decls_declared_everywhere())
     deferred
+}
+
+// Only the stdlib archive defines the runtime's storage. A layered archive is linked beside
+// it, so a second definition would not link.
+fn defines_runtime_storage(cfg: CgConfig) -> Bool {
+    cfg.archive_build_mode != 0 && cfg.archive_over_std == 0
 }
 
 // "" for the unit that owns the vector and is linked against, "extern " for a unit that
@@ -297,9 +309,11 @@ fn is_entry_point(fn_node: Int) -> Bool {
 // evidence vector names a type the archive does not define, and one archive serves many
 // programs, so the archive left those out. A generic has no body of its own at all: what a program links
 // are its instances, and which instances a program needs follows from that program's call
-// sites, which the archive was compiled without. Both are left for the user's unit.
+// sites, which the archive was compiled without. Both are left for the user's unit. An
+// archive layered over the stdlib archive is in the same position for a std generic: it
+// writes its own copy of each instance its bodies call.
 fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
-    if cfg.user_tu_mode == 0 { return false }
+    if cfg.user_tu_mode == 0 && cfg.archive_over_std == 0 { return false }
     if cg_decl_takes_ev(decl) { return true }
     match cg_decl_body_site(decl) {
         BodySite.PerInstance => true
@@ -612,10 +626,24 @@ fn emit_entry(cfg: CgConfig, init_fns: List[Str]) ! Diag.Report {
     let tests = cg_reg_test_decls()
     emit_test_bodies(tests)
     print_main_shim(cg_reg_has_main(), tests.len() > 0, cg_eff_program_uses_async(),
-        cfg.user_tu_mode != 0, cfg.trace_codegen != 0, cfg.deterministic, init_fns)
+        cfg.trace_codegen != 0, cfg.deterministic, archive_init_fns(cfg).append(init_fns))
 }
 
-fn archive_init_globals_name() -> Str { "__blink_init_stdlib_globals" }
+// The init functions of the archives this unit links, in link-layer order, ahead of the
+// program's own: a global the program initialises may read one an archive set.
+fn archive_init_fns(cfg: CgConfig) -> List[Str] {
+    if cfg.user_tu_mode != 0 { return [stdlib_init_globals_name()] }
+    []
+}
+
+fn stdlib_init_globals_name() -> Str { "__blink_init_stdlib_globals" }
+
+// A layered archive's init runs in the same program as the stdlib's, so the two names
+// must differ.
+fn archive_init_globals_name(cfg: CgConfig) -> Str {
+    if cfg.archive_over_std != 0 { return "__blink_init_compiler_globals" }
+    stdlib_init_globals_name()
+}
 
 // One function running every deferred global assignment, in the order the globals were
 // declared in, or nothing if every global already took its value on the definition line.
@@ -631,7 +659,7 @@ fn emit_global_init_fn(cfg: CgConfig, program: Int, deferred: List[Int]) -> List
     flush_walkers()
     let mut name = "__blink_init_globals"
     if is_archive {
-        name = archive_init_globals_name()
+        name = archive_init_globals_name(cfg)
         print_fn(false, layout_of(TYPE_VOID, Position.Return).c_spelling, name, [], false, body)
     } else {
         print_test_fn(name, body)
@@ -679,9 +707,10 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
 // definitions of one C type is an ODR violation.
 pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
-    let _ = emit_declarations(cfg, c_archive_header_guard(), "", false, true, true)
-    print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, archive_init_globals_name(), [], false)
-    cg_decl_emit_epilogue(c_archive_header_guard())
+    let guard = if cfg.archive_over_std != 0 { c_layer_archive_header_guard() } else { c_archive_header_guard() }
+    let _ = emit_declarations(cfg, guard, "", false, true, true)
+    print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, archive_init_globals_name(cfg), [], false)
+    cg_decl_emit_epilogue(guard)
     print_take()
 }
 
@@ -689,7 +718,7 @@ pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Di
 pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     let guard = c_module_header_guard(module_key)
-    cg_decl_emit_prologue(cfg.user_tu_mode != 0, false, false, guard, "")
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, guard, "")
     cg_decl_emit_typedefs()
     cg_decl_emit_ev_typedef()
     // Every global is declared extern here regardless of which module owns it: the
@@ -727,8 +756,8 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     cg_promote_set_trace(cfg.trace_codegen != 0)
     // The entry module's object defines the runtime's storage and bodies, the way it owns
     // __blink_ev; every other object declares them.
-    let define_storage = cfg.archive_build_mode != 0 || module_key == "__main__"
-    cg_decl_emit_prologue(cfg.user_tu_mode != 0, define_storage, false, "", self_header)
+    let define_storage = defines_runtime_storage(cfg) || module_key == "__main__"
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, define_storage, false, "", self_header)
     cg_decl_emit_ev(ev_storage(cfg))
     let own_globals = globals_in_scope(cfg, module_key, false)
     let inits = lower_global_inits(own_globals)
