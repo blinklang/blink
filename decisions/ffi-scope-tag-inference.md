@@ -1014,7 +1014,7 @@ Full round-1 texts, verbatim:
 Governing text: [§9.1.1 *Scope tags*](../sections/07_trust_modules_metadata.md), plus the `@ffi.struct` field list and §9.1.3.2 amendments.
 
 ```blink
-@ffi.struct(header = "sys/uio.h", name = "iovec")
+@ffi.struct(header: "sys/uio.h", name: "iovec")
 pub type IoVec {
     iov_base: Ptr[U8],
     iov_len: U64,

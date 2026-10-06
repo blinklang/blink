@@ -239,10 +239,10 @@ vs `Opaque[Sqlite3]`). The panel converged on A partly *on* these grounds.
 ### Final Spec
 
 ```blink
-@ffi.opaque(header = "sqlite3.h", name = "sqlite3")
+@ffi.opaque(header: "sqlite3.h", name: "sqlite3")
 type Sqlite3
 
-@ffi.opaque(header = "sqlite3.h", name = "sqlite3_stmt")
+@ffi.opaque(header: "sqlite3.h", name: "sqlite3_stmt")
 type Sqlite3Stmt
 
 // flows through ordinary non-FFI code — Sqlite3 is not a Ptr, so no @trusted

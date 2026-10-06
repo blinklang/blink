@@ -2174,7 +2174,7 @@ fn main() {
 
 #### Assignment places
 
-A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. A field path holds only names, so it has no sub-expressions that have effects or can fail. `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost. Storage the compiler shares between values is never a place. A feature that adds places must keep that rule (§3.6.1 *Clone Semantics*).
+A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. Each step of a field path names a struct field (`s.f`) or a tuple field (`t.0`), so a path such as `s.f.0` has no sub-expressions that have effects or can fail. No step goes through a `Ptr`: for `p: Ptr[S]`, `p.f = v` is not an assignment to a place, and the help names `p.f.write(v)` (§9.1.1). `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost. Storage the compiler shares between values is never a place. A feature that adds places must keep that rule (§3.6.1 *Clone Semantics*). A store to a place is rule 1 of E0601 (§9.1.1 *Scope tags*).
 
 ```blink
 type Stats {
