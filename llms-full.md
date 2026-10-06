@@ -522,7 +522,6 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 | `.index_of(s)` | Int | Find index (-1 if not found) |
 | `.concat(s)` | Str | Concatenate |
 | `.substring(start, len)` | Str | Extract by position + length |
-| `.slice(start, end)` | Str | Extract by range |
 | `.split(sep)` | List[Str] | Split by separator |
 | `.lines()` | List[Str] | Split by newlines |
 | `.trim()` | Str | Strip leading and trailing whitespace |
@@ -534,7 +533,10 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 | `.to_int()` | Int | Parse as integer |
 | `.parse_float()` | Float | Parse as float |
 | `.char_at(idx)` | Option[Char] | Char at index, `None` if out of range or mid-codepoint |
-| `.byte_at(idx)` | Int | Raw byte at index |
+| `.byte_len()` | Int | Length in bytes (O(1)) |
+| `.byte_at(idx)` | U8 | Raw byte at byte offset; panics when out of bounds |
+| `.byte_slice(start, end)` | Str | Byte range `[start, end)`; clamps; panics inside a codepoint |
+| `.byte_index_of(s, from)` | Option[Int] | Byte offset of first match at or after `from` |
 
 ## Char Methods
 

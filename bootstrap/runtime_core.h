@@ -2410,14 +2410,14 @@ BLINK_RT_FN void blink_str_index_oob(const char* method, int64_t index, int64_t 
 
 /* byte_at returns a bare byte and so cannot say "absent"; the unsigned compare also
    catches a negative index. */
-BLINK_RT_FN int64_t blink_str_char_at(const char* s, int64_t i);
+BLINK_RT_FN uint8_t blink_str_char_at(const char* s, int64_t i);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_str_char_at(const char* s, int64_t i) {
+BLINK_RT_FN uint8_t blink_str_char_at(const char* s, int64_t i) {
     int64_t len = blink_str_len(s);
     if (__builtin_expect((uint64_t)i >= (uint64_t)len, 0)) {
         blink_str_index_oob("byte_at", i, len);
     }
-    return (int64_t)(unsigned char)s[i];
+    return (uint8_t)s[i];
 }
 #endif
 

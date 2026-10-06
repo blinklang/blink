@@ -91,8 +91,8 @@ method name and never the arm:
 | method | args | reads |
 |---|---|---|
 | `contains`, `starts_with`, `ends_with`, `concat`, `byte_at`, `index_of`, `char_at`, `split` | 1 | typed |
-| `replace`, `substring`, `substr`, `slice` | 2 | typed |
-| `len`, `as_cstr`, `trim`, `trim_left`, `trim_right`, `to_lower`, `to_upper`, `to_int`, `lines`, `parse_float`, `parse_int`, `is_empty` | 0 | none |
+| `replace`, `substring`, `byte_slice`, `byte_index_of` | 2 | typed |
+| `len`, `byte_len`, `as_cstr`, `trim`, `trim_left`, `trim_right`, `to_lower`, `to_upper`, `to_int`, `lines`, `parse_float`, `parse_int`, `is_empty` | 0 | none |
 
 ### Int, Float, Char, sized ints
 
