@@ -64,12 +64,13 @@ fn user_cfg() -> CgConfig {
 }
 
 // A std generic instantiated at a type of this layer, a non-generic std function the layer
-// calls, a std global the layer reads, a global that cannot take its value on its definition
-// line, and a private function.
+// calls, a std function that takes the evidence vector, a std global the layer reads, a
+// global that cannot take its value on its definition line, and a private function.
 fn layer_src() -> Str {
     #"import std.list.{list_skip}
 import std.str.{str_trim}
 import std.process.{SIGTERM}
+import std.io.{read_fully}
 
 type Point { x: Int, y: Int }
 
@@ -91,9 +92,14 @@ fn term_signal() -> Int {
     SIGTERM
 }
 
+fn drain(fd: Int) ! IO {
+    let _ = read_fully(fd, 0)
+}
+
 fn main() {
     let _ = bump(rest_len([origin]) + term_signal())
     let _ = tidy(" a ")
+    drain(0)
 }
 "#
 }
@@ -186,6 +192,36 @@ test "the layer defines no non-generic std function it calls" {
     assert(c.contains("str_trim("), "the layer does not reach str_trim")
     let defs = definitions_naming(c, "str_trim(")
     assert_eq(defs.len(), 0, "the layer defines str_trim: {defs.join(", ")}")
+}
+
+// The stdlib archive holds no std function that takes the evidence vector, since each
+// program spells its own vector. The program that links the layer defines such a function
+// external in its own unit, so the layer's copy must be local to its object or the two
+// collide at link.
+test "the layer keeps a std function that takes the evidence vector local to its object" {
+    let program = build_probe(layer_src(), "cg_layer_std_ev_probe")
+    let c = generate(program, layered_cfg())
+    let defs = definitions_naming(c, "read_fully(")
+    assert_eq(defs.len(), 1, "the layer does not define read_fully once: {defs.join(", ")}")
+    assert(defs.get(0).unwrap().starts_with("static"), "read_fully is external in the layer: {defs.get(0).unwrap()}")
+    let user = definitions_naming(generate(program, user_cfg()), "read_fully(")
+    assert_eq(user.len(), 1, "the program unit does not define read_fully once: {user.join(", ")}")
+    assert(!user.get(0).unwrap().starts_with("static"), "read_fully is static in the program unit: {user.get(0).unwrap()}")
+    let c_path = "build/cg_layer_std_ev_probe.c"
+    let o_path = "build/cg_layer_std_ev_probe.o"
+    write_file(c_path, c)
+    let cc = process_run("cc", ["-c", "-Ibuild", "-o", o_path, c_path])
+    assert_eq(cc.exit_code, 0, "cc failed:\n{cc.err_out}")
+    let nm = process_run("nm", ["--defined-only", o_path])
+    let _ = fs.delete(c_path)
+    let _ = fs.delete(o_path)
+    let mut kinds: List[Str] = []
+    for line in nm.out.split("\n") {
+        let words = line.split(" ")
+        if words.len() < 3 { continue }
+        if words.get(2).unwrap().ends_with("read_fully") { kinds.push(words.get(1).unwrap()) }
+    }
+    assert_eq(kinds.join(","), "t", "read_fully in the layer object is not one local symbol:\n{nm.out}")
 }
 
 // The program reads the layer globals through this header. The stdlib archive header
