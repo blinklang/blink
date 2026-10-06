@@ -1,0 +1,236 @@
+// A struct too wide for a word is copied to the heap when it enters a list slot or an
+// Option payload. The collector scans only the words of that copy that can hold a
+// pointer, so a field that holds one and is left out of the scan loses what it points
+// at. Each test fills a list with such copies, forces full collections while it
+// allocates garbage, then reads every field back.
+
+@ffi("GC_gcollect", header: "gc.h")
+@trusted(audit: "TEST-GC-COLLECT: force a full collection so lost fields show")
+fn t_gc_collect() -> Void ! FFI {}
+
+type Shade { Red, Green, Blue }
+
+type Shape { Dot, Circle(Float), Label(Str) }
+
+type Inner { tag: Int, label: Str }
+
+// Word fields and pointer fields mixed, so the pointer words are not all at the front.
+type Mix {
+    id: Int
+    name: Str
+    ratio: Float
+    tags: List[Str]
+    small: I32
+    inner: Inner
+    flag: Bool
+    nick: Option[Str]
+    ch: Char
+    pair: (Int, Str)
+    shade: Shade
+    shape: Shape
+    last: Str
+}
+
+type Pair[T] { left: T, n: Int, right: T }
+
+type Words { a: Int, b: Float, c: Bool, d: Shade, e: U8, f: U16 }
+
+type Wrap { v: Int, label: Str, held: Option[Inner] }
+
+let SEEDED: List[Inner] = [Inner { tag: 1, label: name_of(1) }, Inner { tag: 2, label: name_of(2) }]
+
+fn churn() {
+    let mut i = 0
+    while i < 4 {
+        let sb = StringBuilder.new()
+        let mut j = 0
+        while j < 20000 {
+            sb.write("garbage {j} ")
+            j += 1
+        }
+        let _ = sb.to_str().split(" ")
+        t_gc_collect()
+        i += 1
+    }
+}
+
+fn name_of(i: Int) -> Str { "name-{i}-{i * 7}" }
+
+fn make_mix(i: Int) -> Mix {
+    Mix {
+        id: i,
+        name: name_of(i),
+        ratio: i.to_float() / 2.0,
+        tags: [name_of(i + 1), name_of(i + 2)],
+        small: (i % 1000).to_i32(),
+        inner: Inner { tag: i * 3, label: name_of(i + 3) },
+        flag: i % 2 == 0,
+        nick: if i % 3 == 0 { None } else { Some(name_of(i + 4)) },
+        ch: if i % 2 == 0 { 'a' } else { 'z' },
+        pair: (i * 5, name_of(i + 5)),
+        shade: if i % 2 == 0 { Shade.Green } else { Shade.Blue },
+        shape: if i % 2 == 0 { Shape.Label(name_of(i + 6)) } else { Shape.Circle(1.5) },
+        last: name_of(i + 7),
+    }
+}
+
+fn check_mix(m: Mix, i: Int) {
+    assert_eq(m.id, i)
+    assert_eq(m.name, name_of(i))
+    assert(m.ratio == i.to_float() / 2.0)
+    assert_eq(m.tags.len(), 2)
+    assert_eq(m.tags.get(0).unwrap(), name_of(i + 1))
+    assert_eq(m.tags.get(1).unwrap(), name_of(i + 2))
+    assert_eq(m.small.to_int(), i % 1000)
+    assert_eq(m.inner.tag, i * 3)
+    assert_eq(m.inner.label, name_of(i + 3))
+    assert_eq(m.flag, i % 2 == 0)
+    if i % 3 == 0 {
+        assert(m.nick.is_none())
+    } else {
+        assert_eq(m.nick.unwrap(), name_of(i + 4))
+    }
+    let want_ch = if i % 2 == 0 { 'a' } else { 'z' }
+    assert(m.ch == want_ch)
+    assert_eq(m.pair.0, i * 5)
+    assert_eq(m.pair.1, name_of(i + 5))
+    let want_shade = if i % 2 == 0 { Shade.Green } else { Shade.Blue }
+    assert(m.shade == want_shade)
+    match m.shape {
+        Shape.Label(s) => {
+            assert(i % 2 == 0)
+            assert_eq(s, name_of(i + 6))
+        }
+        Shape.Circle(r) => {
+            assert(i % 2 == 1)
+            assert(r == 1.5)
+        }
+        Shape.Dot => assert(false)
+    }
+    assert_eq(m.last, name_of(i + 7))
+}
+
+test "a list of boxed structs keeps every pointer field across collections" {
+    let mut xs: List[Mix] = []
+    let mut i = 0
+    while i < 5000 {
+        xs.push(make_mix(i))
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 5000 {
+        check_mix(xs.get(k).unwrap(), k)
+        k += 1
+    }
+}
+
+test "a boxed struct in an Option payload keeps its pointer fields across collections" {
+    let mut xs: List[Option[Mix]] = []
+    let mut i = 0
+    while i < 3000 {
+        xs.push(if i % 4 == 0 { None } else { Some(make_mix(i)) })
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 3000 {
+        match xs.get(k).unwrap() {
+            Some(m) => check_mix(m, k)
+            None => assert(k % 4 == 0)
+        }
+        k += 1
+    }
+}
+
+test "a generic struct keeps its fields at Int and at Str across collections" {
+    let mut ints: List[Pair[Int]] = []
+    let mut strs: List[Pair[Str]] = []
+    let mut i = 0
+    while i < 5000 {
+        ints.push(Pair { left: i, n: i * 2, right: i * 3 })
+        strs.push(Pair { left: name_of(i), n: i * 2, right: name_of(i + 9) })
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 5000 {
+        let a = ints.get(k).unwrap()
+        assert_eq(a.left, k)
+        assert_eq(a.n, k * 2)
+        assert_eq(a.right, k * 3)
+        let b = strs.get(k).unwrap()
+        assert_eq(b.left, name_of(k))
+        assert_eq(b.n, k * 2)
+        assert_eq(b.right, name_of(k + 9))
+        k += 1
+    }
+}
+
+test "a struct of word fields only keeps every field across collections" {
+    let mut xs: List[Words] = []
+    let mut i = 0
+    while i < 20000 {
+        xs.push(Words { a: i, b: i.to_float() * 0.25, c: i % 2 == 1, d: Shade.Red, e: (i % 200).to_u8(), f: (i * 11 % 60000).to_u16() })
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 20000 {
+        let w = xs.get(k).unwrap()
+        assert_eq(w.a, k)
+        assert(w.b == k.to_float() * 0.25)
+        assert_eq(w.c, k % 2 == 1)
+        assert(w.d == Shade.Red)
+        assert_eq(w.e.to_int(), k % 200)
+        assert_eq(w.f.to_int(), k * 11 % 60000)
+        k += 1
+    }
+}
+
+test "a boxed struct behind an Option field of another boxed struct survives collections" {
+    let mut xs: List[Wrap] = []
+    let mut i = 0
+    while i < 3000 {
+        xs.push(Wrap { v: i, label: name_of(i), held: Some(Inner { tag: i + 1, label: name_of(i + 1) }) })
+        i += 1
+    }
+    churn()
+    let mut k = 0
+    while k < 3000 {
+        let w = xs.get(k).unwrap()
+        assert_eq(w.v, k)
+        assert_eq(w.label, name_of(k))
+        let h = w.held.unwrap()
+        assert_eq(h.tag, k + 1)
+        assert_eq(h.label, name_of(k + 1))
+        k += 1
+    }
+}
+
+test "boxed structs built in an arena keep their fields once promoted out of it" {
+    let xs = with arena {
+        let mut out: List[Mix] = []
+        let mut i = 0
+        while i < 2000 {
+            out.push(make_mix(i))
+            i += 1
+        }
+        out
+    }
+    churn()
+    let mut k = 0
+    while k < 2000 {
+        check_mix(xs.get(k).unwrap(), k)
+        k += 1
+    }
+}
+
+test "boxed structs from a global initializer keep their fields across collections" {
+    churn()
+    assert_eq(SEEDED.len(), 2)
+    assert_eq(SEEDED.get(0).unwrap().tag, 1)
+    assert_eq(SEEDED.get(0).unwrap().label, name_of(1))
+    assert_eq(SEEDED.get(1).unwrap().tag, 2)
+    assert_eq(SEEDED.get(1).unwrap().label, name_of(2))
+}
