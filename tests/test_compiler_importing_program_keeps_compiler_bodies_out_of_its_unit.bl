@@ -1,9 +1,10 @@
-import compile_test_helpers.{emit_c_via_cli}
+import std.process.{ProcessResult}
 
 // A program that imports the compiler modules should take their bodies from the prebuilt
 // compiler archive, not compile them again in its own unit. Each corpus test that imports
 // the compiler otherwise pays for a full compiler compile. The fixture is built the way the
-// corpus builds such a test: through the CLI, with --debug.
+// corpus builds such a test: through the CLI, with --debug, and with BLINK_COMPILER_ARCHIVE
+// naming the archive the corpus built for the run.
 
 fn fixture_src() -> Str {
     "import tokens.\{keyword_lookup\}\nimport compiler.\{compile_to_program\}\n\nfn main() \{\n    io.println(\"\{keyword_lookup(\"fn\").to_int()\}\")\n\}\n"
@@ -50,8 +51,50 @@ fn compiler_defs(c: Str) -> List[(Str, Bool)] {
     out
 }
 
+// The archive the corpus built for this run, or one this test builds from the fixture's
+// imports when it runs on its own.
+let mut built_archive_dir: Str = ""
+
+fn archive_dir() -> Str {
+    let given = env.var("BLINK_COMPILER_ARCHIVE") ?? ""
+    if given != "" { return given }
+    if built_archive_dir != "" { return built_archive_dir }
+    let dir = "{process_run("pwd", []).out.trim()}/build/_compiler_importing_fixture_archive"
+    let built = process_run("build/blink", ["__build-compiler-archive", dir, "tokens", "compiler"])
+    assert_eq(built.exit_code, 0, "the compiler archive did not build:\n{built.err_out}")
+    assert(file_exists("{dir}/libblink_compiler.a") != 0, "no compiler archive at {dir}:\n{built.out}{built.err_out}")
+    built_archive_dir = dir
+    dir
+}
+
+// `env` sets or removes BLINK_COMPILER_ARCHIVE for the one child, so neither mode leaks
+// into the other.
+fn cli(env_args: List[Str], cli_args: List[Str]) -> ProcessResult {
+    let mut args = env_args
+    args.push("build/blink")
+    for a in cli_args { args.push(a) }
+    process_run("env", args)
+}
+
+fn emit_c(env_args: List[Str], tag: Str) -> Str {
+    let path = ".tmp/_emitc_{tag}.bl"
+    write_file(path, fixture_src())
+    let _ = cli(env_args, ["build", "--emit", "c", "--debug", path])
+    fs_remove(path)
+    let c_path = "build/_emitc_{tag}.c"
+    if file_exists(c_path) == 0 { return "" }
+    let c = read_file(c_path)
+    fs_remove(c_path)
+    c
+}
+
 fn fixture_c() -> Str {
-    emit_c_via_cli(fixture_src(), "compiler_importing_fixture", "--debug")
+    emit_c(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], "compiler_importing_fixture")
+}
+
+// The one-unit build, as a program gets it when no compiler archive is named.
+fn fixture_c_one_unit() -> Str {
+    emit_c(["-u", "BLINK_COMPILER_ARCHIVE"], "compiler_importing_fixture_one_unit")
 }
 
 test "the fixture builds and its unit defines main" {
@@ -68,10 +111,35 @@ test "the definition scanner finds an external compiler function and skips stati
     assert_eq(defs.get(1).unwrap(), ("blink_lexer_lex", true))
 }
 
-test.failing(
-    "the program's unit defines no compiler function that skips the evidence vector",
-    reason: "the corpus does not link a compiler archive yet, so every imported compiler body lands in the program's unit",
-) {
+// Without this control the rows below would pass on a scanner that finds nothing.
+test "the program's unit defines compiler functions when no compiler archive is named" {
+    let c = fixture_c_one_unit()
+    assert(c.contains("int main("), "the fixture did not reach codegen")
+    let mut plain = 0
+    for d in compiler_defs(c) {
+        if !d.1 { plain = plain + 1 }
+    }
+    assert(plain > 0, "the one-unit build defines no compiler function that skips the evidence vector")
+}
+
+// The unit still defines the compiler functions that take the evidence vector, so this
+// proves they compile and link beside the archive.
+test "the program built through the compiler archive links and runs" {
+    let path = ".tmp/_linkcli_compiler_importing_fixture.bl"
+    let bin = "build/_linkcli_compiler_importing_fixture"
+    write_file(path, fixture_src())
+    let b = cli(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], ["build", "--debug", path, "-o", bin])
+    fs_remove(path)
+    assert_eq(b.exit_code, 0, "the build failed:\n{b.err_out}")
+    let nm = process_run("nm", [bin])
+    assert(nm.out.contains("__blink_init_compiler_globals"), "the binary did not link the compiler archive")
+    let r = process_run(bin, [])
+    fs_remove(bin)
+    assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
+    assert_eq(r.out.trim(), "0")
+}
+
+test "the program's unit defines no compiler function that skips the evidence vector" {
     let c = fixture_c()
     assert(c.contains("int main("), "the fixture did not reach codegen")
     let mut plain: List[Str] = []
@@ -88,4 +156,22 @@ test.failing(
     let c = fixture_c()
     assert(c.contains("int main("), "the fixture did not reach codegen")
     assert_eq(compiler_defs(c).len(), 0)
+}
+
+// An archive built from another version of a module the program imports would link two
+// versions of the compiler into one binary.
+test "a compiler archive built from other source than the program imports is refused" {
+    let dir = "{process_run("pwd", []).out.trim()}/build/_compiler_importing_fixture_stale_archive"
+    let built = process_run("build/blink", ["__build-compiler-archive", dir, "tokens", "compiler"])
+    assert_eq(built.exit_code, 0, "the compiler archive did not build:\n{built.err_out}")
+    let copy = "{dir}/src/tokens.bl"
+    assert(file_exists(copy) != 0, "the archive keeps no copy of tokens")
+    write_file(copy, "{read_file(copy)}\n// changed after the build\n")
+    let path = ".tmp/_stalecli_compiler_importing_fixture.bl"
+    write_file(path, fixture_src())
+    let r = cli(["BLINK_COMPILER_ARCHIVE={dir}"], ["build", "--emit", "c", "--debug", path])
+    fs_remove(path)
+    let _ = process_run("rm", ["-rf", dir])
+    assert(r.exit_code != 0, "a stale archive still reached codegen")
+    assert(r.err_out.contains("is stale: tokens changed"), "the refusal does not name the changed module:\n{r.err_out}")
 }
