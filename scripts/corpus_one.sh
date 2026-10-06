@@ -109,6 +109,14 @@ if [ ! -d "$prelude_lib/std" ]; then
     exit 2
 fi
 ln -s "$(readlink -f "$prelude_lib")" "$work/build/lib"
+# The unit's cc looks for libblink_std.h.gch beside the libblink_std.h it
+# includes. corpus.sh keeps its PCH under a key of the headers it read, and a
+# compiler that ships other headers finds none, so its row reads the header.
+pch_key=$(./scripts/corpus_std_pch_key.sh "$comp_dir" | head -1)
+pch="$root/build/corpus/pch/$pch_key/libblink_std.h.gch"
+if [ -n "$pch_key" ] && [ -f "$pch" ]; then
+    ln -s "$pch" "$work/build/libblink_std.h.gch"
+fi
 if [ ! -x "$work/build/blink" ]; then
     echo "corpus_one: no blink binary in $comp_dir" >&2
     exit 2

@@ -21,7 +21,7 @@ fail=0
 
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std" "$R/src"
-cp scripts/corpus.sh scripts/corpus_one.sh scripts/corpus_sample.sh scripts/corpus_check.sh "$R/scripts/"
+cp scripts/corpus.sh scripts/corpus_one.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh "$R/scripts/"
 : > "$R/build/gc_unity.c"
 # corpus.sh takes the compiler archive roots from the compiler binary's imports.
 printf 'import std.fs\nimport lexer.{Lex}\nimport cg\n\nfn main() {}\n' > "$R/src/blinkc_main.bl"
@@ -75,6 +75,16 @@ elif grep -q SELFTEST_COMPILER_ARCHIVE "$src"; then
     # this fixture must be a real binary that defines it.
     printf 'void __blink_init_compiler_globals(void) {}\nint main(void) { __blink_init_compiler_globals(); return 0; }\n' > "$out.c"
     cc -o "$out" "$out.c" || exit 1
+elif grep -q SELFTEST_STD_PCH "$src"; then
+    # The prologue of a user unit and the cc line of `blink build --debug`. The
+    # -H trace, kept beside the binary, names each header file cc read. A gated
+    # unit defines a macro the header tests before the include, as a native dep
+    # gate does.
+    gate=""
+    grep -q SELFTEST_STD_PCH_GATED "$src" && gate='#define BLINK_TEST_BUILD 1\n'
+    printf "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1\n${gate}#include \"libblink_std.h\"\nint main(void) { return std_marker() - STD_MARKER; }\n" > "$out.c"
+    cc -pipe -g -O0 -DBLINK_DEBUG -H -o "$out" "$out.c" -I"$(dirname "$0")" -Wl,--gc-sections -lm -pthread 2> "$out.trace" || { cat "$out.trace"; exit 1; }
+    cat "$out.trace"
 elif grep -q SELFTEST_DEBUG_INFO "$src"; then
     # The cc line `blink build --debug` runs. The row deletes the binary when
     # it ends, so its section table is kept beside it.
@@ -88,6 +98,16 @@ fi
 chmod +x "$out"
 EOF
 cp "$R/fakec/blink" "$R/fakec/blinkc"
+cat > "$R/fakec/libblink_std.h" <<'EOF'
+#include "runtime.h"
+#ifdef BLINK_TEST_BUILD
+#define STD_MARKER 1
+#else
+#define STD_MARKER 0
+#endif
+static inline int std_marker(void) { return STD_MARKER + RT_ZERO; }
+EOF
+printf '#define RT_ZERO 0\n' > "$R/fakec/runtime.h"
 chmod +x "$R/fakec/blink" "$R/fakec/blinkc"
 
 echo '// passes' > "$R/tests/test_selftest_ok.bl"
@@ -233,6 +253,56 @@ elif grep -q '\.debug_info' "$sections"; then
 else
     echo "PASS compiler-archive-no-debug-info"
 fi
+
+# Each row's unit includes the stdlib archive header first, so the run
+# precompiles it once and the row's cc reads the PCH in its place.
+printf '// SELFTEST_STD_PCH\n' > "$R/tests/test_selftest_std_pch.bl"
+printf '// SELFTEST_STD_PCH SELFTEST_STD_PCH_GATED\n' > "$R/tests/test_selftest_std_pch_gated.bl"
+printf 'tests/test_selftest_std_pch.bl\ntests/test_selftest_std_pch_gated.bl\n' > "$WORK/std_pch.txt"
+pch_trace="$R/build/corpus/work/test_selftest_std_pch/build/test_selftest_std_pch.trace"
+pch_used() { head -1 "$pch_trace" 2>/dev/null | grep -q '^! .*/libblink_std\.h\.gch$'; }
+# run_pch_row <label> <why>: one row through corpus_one.sh alone, which must
+# pass without reading a PCH.
+run_pch_row() {
+    (cd "$R" && ./scripts/corpus_one.sh tests/test_selftest_std_pch.bl fakec build/corpus/results) > "$WORK/out.log" 2>&1
+    if [ "$(jq -r .status "$R/build/corpus/results/test_selftest_std_pch.json")" = pass ] && [ -s "$pch_trace" ] && ! pch_used; then
+        echo "PASS $1"
+    else
+        echo "FAIL $1: $2"
+        sed 's/^/    /' "$WORK/out.log" "$pch_trace"
+        fail=1
+    fi
+}
+run_corpus --only "$WORK/std_pch.txt" --no-lint
+expect "std-pch-build" 0 $?
+if pch_used; then
+    echo "PASS std-pch-used"
+else
+    echo "FAIL std-pch-used: the row did not read a PCH of libblink_std.h"
+    sed 's/^/    /' "$pch_trace" 2>/dev/null | head -5
+    fail=1
+fi
+# gcc drops a PCH whose pre-include macros differ and reads the header; the
+# corpus cc warns, so the row's log says why.
+if grep -q 'libblink_std\.h\.gch.*not used because' "$R/build/corpus/logs/test_selftest_std_pch_gated.build.log"; then
+    echo "PASS std-pch-rejected-warns"
+else
+    echo "FAIL std-pch-rejected-warns: no -Winvalid-pch line in the gated row log"
+    sed 's/^/    /' "$R/build/corpus/logs/test_selftest_std_pch_gated.build.log"
+    fail=1
+fi
+# gcc never compares a PCH with the headers it was built from, so a row whose
+# compiler ships another libblink_std.h or runtime.h must not get the run's PCH.
+cp "$R/fakec/libblink_std.h" "$WORK/std.h.orig"
+cp "$R/fakec/runtime.h" "$WORK/runtime.h.orig"
+printf 'static inline int std_other(void) { return 0; }\n' >> "$R/fakec/libblink_std.h"
+run_pch_row "std-pch-other-header" "the row used a PCH of another libblink_std.h, or failed"
+cp "$WORK/std.h.orig" "$R/fakec/libblink_std.h"
+printf '#define RT_ZERO (0)\n' > "$R/fakec/runtime.h"
+run_pch_row "std-pch-other-runtime" "the row used a PCH of another runtime.h, or failed"
+cp "$WORK/runtime.h.orig" "$R/fakec/runtime.h"
+rm -rf "$R/build/corpus/pch"
+run_pch_row "std-pch-missing" "the row failed with no PCH"
 
 # The run builds the compiler archive from the compiler binary's imports, and
 # stops when it cannot.
