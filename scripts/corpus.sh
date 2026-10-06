@@ -165,12 +165,37 @@ else
     export BLINK_COMPILER_ARCHIVE="$carchive"
 fi
 
+# Instructions and CPU time cover the per-file compile and run only (the
+# parallel sweep and the processes it starts), not the gen1 build, the compiler
+# archive or the PCH before it. Wall time moves with machine load; user-space
+# instructions do not. The measurement is optional: a perf that is missing or
+# denied (a probe run decides) leaves the sweep unwrapped and the fields null.
+perf_out="build/corpus/perf_stat.txt"
+rm -f "$perf_out"
+perf_cmd=()
+perf_bin="${PERF:-perf}"
+if command -v "$perf_bin" >/dev/null 2>&1 \
+        && "$perf_bin" stat -x, -e instructions:u,task-clock -o /dev/null -- true >/dev/null 2>&1; then
+    perf_cmd=("$perf_bin" stat -x, -e instructions:u,task-clock -o "$perf_out" --)
+fi
+
 echo "corpus: $total files, compiler $comp, $jobs workers"
 start=$(date +%s)
-parallel -j "$jobs" --halt never --line-buffer \
+"${perf_cmd[@]}" parallel -j "$jobs" --halt never --line-buffer \
     ./scripts/corpus_one.sh {} "$comp" "$results" :::: "$list" \
     | awk '{ n[$1]++ } END { for (k in n) printf "corpus: %s %d\n", k, n[k] }'
 end=$(date +%s)
+
+# Each field reads null unless perf wrote a plain number for it; a counter
+# perf could not read prints "<not counted>" and must not become a value.
+instructions_u=null
+cpu_seconds=null
+if [ -s "$perf_out" ]; then
+    i=$(awk -F, '$3 ~ /^instructions/ && $1 ~ /^[0-9]+$/ { print $1; exit }' "$perf_out")
+    ms=$(awk -F, '$3 ~ /^task-clock/ && $1 ~ /^[0-9]+(\.[0-9]+)?$/ { print $1; exit }' "$perf_out")
+    [ -n "$i" ] && instructions_u="$i"
+    [ -n "$ms" ] && cpu_seconds=$(awk -v ms="$ms" 'BEGIN { printf "%.2f", ms / 1000 }')
+fi
 
 # One record per file, in corpus order; a file with no record means the
 # runner itself died, which is recorded as compile_fail so the total holds.
@@ -190,13 +215,17 @@ jq -s \
     --arg blinkc_sha256_prefix "$comp_sha" \
     --arg git "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --argjson secs "$((end - start))" '
+    --argjson secs "$((end - start))" \
+    --argjson instructions_u "$instructions_u" \
+    --argjson cpu_seconds "$cpu_seconds" '
     {
       compiler: $compiler,
       blinkc_sha256_prefix: $blinkc_sha256_prefix,
       git_head: $git,
       generated_utc: $when,
       wall_seconds: $secs,
+      cpu_seconds: $cpu_seconds,
+      instructions_u: $instructions_u,
       total: length,
       passed: (map(select(.status == "pass")) | length),
       compile_fail: (map(select(.status == "compile_fail")) | length),
@@ -214,7 +243,12 @@ if ! jq -e '(.total|type=="number") and (.passed|type=="number") and (.files|typ
     exit 2
 fi
 passed=$(jq -r .passed "$out")
-echo "corpus: $passed/$total passed in $((end - start))s -> $out"
+if [ "$instructions_u" != null ] && [ "$cpu_seconds" != null ]; then
+    perf_note=$(awk -v c="$cpu_seconds" -v i="$instructions_u" 'BEGIN { printf "cpu %ss, %.2f G instructions", c, i / 1e9 }')
+else
+    perf_note="perf n/a"
+fi
+echo "corpus: $passed/$total passed in $((end - start))s ($perf_note) -> $out"
 if [ "$passed" -ne "$total" ]; then
     echo "corpus: failing files:"
     jq -r '.files[] | select(.status != "pass") | "  \(.status) \(.file): \(.first_error_line)"' "$out"
