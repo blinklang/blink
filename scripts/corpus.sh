@@ -95,19 +95,29 @@ fi
 [ -f build/gc_unity.c ] || ./scripts/gen_gc_unity.sh build/gc_unity.c || exit 2
 
 results="build/corpus/results"
-rm -rf "$results" build/corpus/work build/corpus/native build/corpus/compiler_archive
+rm -rf "$results" build/corpus/work build/corpus/native build/corpus/compiler_archive build/corpus/cc
 mkdir -p "$results" build/corpus
+
+# The corpus builds with --debug for debug_assert and the runtime's debug
+# checks. The -g that --debug also passes changes no code, nothing in the
+# corpus reads debug info, and it costs cc and link time in every build. The
+# compiler archive and each file's build run with this cc first on PATH, which
+# drops -g and runs the real cc.
+real_cc="$(command -v cc)" || { echo "corpus: no cc on PATH" >&2; exit 2; }
+mkdir -p build/corpus/cc
+printf '#!/bin/sh\nfor a do\n    shift\n    [ "$a" = -g ] || set -- "$@" "$a"\ndone\nexec %s "$@"\n' "'$real_cc'" > build/corpus/cc/cc
+chmod +x build/corpus/cc/cc
 
 # A file whose program links a vendored native dep compiles that dep's C source
 # into its sandbox .tmp/, and each sandbox starts empty, so the sweep compiled
-# sqlite3 once per such file. Build each object once with the flags `blink build
-# --debug` uses; corpus_one.sh copies it in with its mtime, which is what lets
-# the build skip the compile.
+# sqlite3 once per such file. Build each object once with the flags a corpus
+# build uses (those of `blink build --debug`, less -g); corpus_one.sh copies it
+# in with its mtime, which is what lets the build skip the compile.
 mkdir -p build/corpus/native
 for d in lib/native/*/; do
     name=$(basename "$d")
     [ -f "$d$name.c" ] || continue
-    cc -pipe -g -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" || exit 2
+    cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" || exit 2
 done
 
 # The roots are the modules the compiler binary imports; the archive holds their
@@ -123,7 +133,8 @@ if [ "${CORPUS_COMPILER_ARCHIVE:-1}" = 0 ]; then
     unset BLINK_COMPILER_ARCHIVE
 else
     roots=$(sed -n 's/^import \([a-z_][a-z_0-9]*\).*/\1/p' src/blinkc_main.bl | grep -vx std | sort -u)
-    if ! (unset BLINK_ROOT BLINK_COMPILER_ARCHIVE; "$comp/blink" __build-compiler-archive "$carchive" \
+    if ! (unset BLINK_ROOT BLINK_COMPILER_ARCHIVE; PATH="$(pwd)/build/corpus/cc:$PATH" \
+            "$comp/blink" __build-compiler-archive "$carchive" \
             $roots) > build/corpus/compiler_archive.log 2>&1 \
             || [ ! -f "$carchive/libblink_compiler.a" ]; then
         echo "corpus: ERROR the compiler archive did not build, see build/corpus/compiler_archive.log" >&2
