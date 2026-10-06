@@ -2845,7 +2845,16 @@ Operands must be the same type. Mixed-type arithmetic (`Int + Float`) is a compi
 - `-0.0 == 0.0` is `true`
 - `Float` does **not** implement `Hash` — bitwise hashing cannot stay coherent with `Eq` (e.g. `-0.0 == 0.0` with distinct bit patterns), so `Float` keys are rejected as `E1400` (see Hash Contract and Seeding, §3.6)
 
-For IEEE 754-strict comparison where `NaN != NaN` and `-0.0 != 0.0`: use `float.ieee_eq(other)` from stdlib.
+For IEEE 754 equality, use the method `x.ieee_eq(y)`. It is the IEEE 754 equality predicate (C's `==`): `NaN` is unequal to every value, itself included, and `(-0.0).ieee_eq(0.0)` is `true`. `x == y` is `true` exactly when `x.ieee_eq(y)` is `true` or both operands are `NaN`. No `Float` equality tells `-0.0` from `0.0`. To test the sign of zero, use `1.0 / x < 0.0`.
+
+```blink
+let nan = 0.0 / 0.0
+assert(nan == nan)              // total order
+assert(!nan.ieee_eq(nan))       // IEEE: NaN is unequal to itself
+assert(-0.0 == 0.0)
+assert((-0.0).ieee_eq(0.0))     // IEEE: the zeros are equal
+assert(1.0 / -0.0 < 0.0)        // the sign of zero
+```
 
 #### Built-in Type Trait Implementations
 
