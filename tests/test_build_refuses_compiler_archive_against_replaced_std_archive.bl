@@ -1,0 +1,40 @@
+// A dev build rebuilds a std archive another compiler built. A compiler archive built
+// against the replaced std archive must then be refused, not linked beside the new one:
+// its bodies were compiled against the other archive.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+test "blink build refuses a compiler archive built against a std archive it rebuilt" {
+    let root = sh("pwd -P")
+    let blink = sh("readlink -f build/blink")
+    let arc = sh("dirname \"$(readlink -f build/libblink_std.h)\"")
+    let tree = "{root}/.tmp/_compiler_archive_std_{getpid()}"
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {blink} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    shell_exec("ln -s {root}/src {tree}/src")
+    shell_exec("cp -L {root}/blink.toml {tree}/blink.toml")
+    shell_exec("cp -L {root}/build/runtime.h {tree}/build/runtime.h")
+    shell_exec("cp -L {arc}/libblink_std.a {arc}/libblink_std.h {arc}/skip_modules.txt {arc}/.archive-id {tree}/build/")
+    let carch = "{tree}/carch"
+    let cr = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE build/blink __build-compiler-archive {carch} tokens 2>&1"])
+    assert(cr.exit_code == 0, "compiler archive did not build: {cr.out}")
+
+    // Another compiler's std archive takes the tree, and the compiler archive was built
+    // against it.
+    let ones = "1111111111111111111111111111111111111111111111111111111111111111"
+    shell_exec("cut -d'|' -f1,2 {arc}/.archive-id | sed 's/$/|{ones}|other/' > {tree}/stale.id")
+    shell_exec("rm -f {tree}/build/.archive-id && cp {tree}/stale.id {tree}/build/.archive-id && cp {tree}/stale.id {carch}/std-archive-id")
+    write_file("{tree}/user.bl", "import tokens\n\nfn main() \{\n    io.println(tokens.token_kind_name(tokens.keyword_lookup(\"fn\")))\n\}\n")
+
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT BLINK_CACHE_DIR= BLINK_COMPILER_ARCHIVE={carch} build/blink build user.bl -o {tree}/user 2>&1"])
+    assert(r.exit_code != 0, "build linked a compiler archive built against another std archive: {r.out}")
+    assert(r.out.contains("built against another stdlib archive"), "unexpected failure: {r.out}")
+    assert_eq(file_exists("{tree}/user"), 0)
+    shell_exec("rm -rf {tree}")
+}
