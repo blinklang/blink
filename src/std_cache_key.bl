@@ -1,7 +1,36 @@
 // The key the stdlib archive cache is stored under. It lives apart from build_stdlib
 // so a test can import it: build_stdlib imports cli, whose fn main no test can link.
 
-pub fn compute_cache_key(blinkc: Str, std_dir: Str, rt_path: Str, manifest: Str) -> Str {
+// The archive's C is emitted in process, so the binary to hash is the running one, not a
+// build/blinkc beside it: a compiler rebuild need not touch that file, and an installed
+// tree has none. "" when it cannot be found.
+pub fn archive_compiler_path() -> Str {
+    // /proc/<pid>, not /proc/self: readlink runs as a child, where self is readlink.
+    let proc_exe = "/proc/{getpid()}/exe"
+    if file_exists(proc_exe) == 1 {
+        return real_file(proc_exe)
+    }
+    // No /proc (macOS): argv[0], looked up on PATH when it has no slash.
+    let argv0 = get_arg(0)
+    if argv0 == "" { return "" }
+    let mut exe = argv0
+    if !argv0.contains("/") {
+        exe = process_run("sh", ["-c", "command -v {argv0}"]).out.trim()
+        if exe == "" { return "" }
+    }
+    real_file(exe)
+}
+
+fn real_file(path: Str) -> Str {
+    let resolved = process_run("readlink", ["-f", path]).out.trim()
+    if resolved == "" || file_exists(resolved) == 0 { return "" }
+    resolved
+}
+
+// "" when the compiler binary is missing: a key without it would match an archive that any
+// compiler emitted.
+pub fn compute_cache_key(compiler: Str, std_dir: Str, rt_path: Str, manifest: Str) -> Str {
+    if compiler == "" || file_exists(compiler) == 0 { return "" }
     // Cache key = sha256 over manifest + content of compiler binary,
     // stdlib sources, runtime.h, cc version. Manifest is fed inline via
     // a heredoc so we don't touch the disk on the cache-hit path.
@@ -11,9 +40,7 @@ pub fn compute_cache_key(blinkc: Str, std_dir: Str, rt_path: Str, manifest: Str)
     cmd.write("(cat <<'__BLINK_MANIFEST_EOF__'\n")
     cmd.write(manifest)
     cmd.write("__BLINK_MANIFEST_EOF__\n")
-    if blinkc != "" {
-        cmd.write("sha256sum {blinkc} 2>/dev/null\n")
-    }
+    cmd.write("sha256sum {compiler}\n")
     cmd.write("sha256sum {std_dir}/*.bl 2>/dev/null\n")
     if rt_path != "" {
         cmd.write("sha256sum {rt_path} 2>/dev/null\n")

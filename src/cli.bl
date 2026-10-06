@@ -47,13 +47,14 @@ import compiler.{
 }
 import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
-import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_blinkc_path, resolve_runtime_h}
+import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_runtime_h}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
     stdlib_native_dep_header_dir, stdlib_native_dep_compile_defs, stdlib_native_dep_link_flag_dynamic,
     peeled_module_keys,
 }
 import build_objcache
+import std_cache_key.{archive_compiler_path}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
@@ -912,11 +913,11 @@ fn apply_cache_flag(a: Args) {
     cg_obj_cache_enabled = if args_has(a, "no-cache") { 0 } else { 1 }
 }
 
-// blinkc_sha and cc_id are constant for the life of this process —
+// compiler_sha and cc_id are constant for the life of this process —
 // memoize so multi-link runs (e.g. `blink test`) don't re-hash a
-// multi-MB blinkc + spawn `cc --version` on every link.
-let mut cached_blinkc_sha: Str = ""
-let mut cached_blinkc_sha_init: Int = 0
+// multi-MB compiler + spawn `cc --version` on every link.
+let mut cached_compiler_sha: Str = ""
+let mut cached_compiler_sha_init: Int = 0
 let mut cached_cc_id: Str = ""
 let mut cached_cc_id_init: Int = 0
 
@@ -928,12 +929,12 @@ pub fn sha256_of_file_first(path: Str) -> Str {
     r.out.trim()
 }
 
-pub fn process_blinkc_sha() -> Str {
-    if cached_blinkc_sha_init == 0 {
-        cached_blinkc_sha = sha256_of_file_first(resolve_blinkc_path())
-        cached_blinkc_sha_init = 1
+pub fn process_compiler_sha() -> Str {
+    if cached_compiler_sha_init == 0 {
+        cached_compiler_sha = sha256_of_file_first(archive_compiler_path())
+        cached_compiler_sha_init = 1
     }
-    cached_blinkc_sha
+    cached_compiler_sha
 }
 
 fn process_cc_id() -> Str {
@@ -955,11 +956,16 @@ fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target:
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() {
         return ""
     }
+    // A key without the compiler would match an object compiled against any compiler's
+    // archive header, so with no compiler hash there is no cache.
+    if process_compiler_sha() == "" {
+        return ""
+    }
     let src_sha = sha256_of_file_first(c_path)
     let flags = cc_opt_flags(debug_mode, release_mode)
     let key = build_objcache.compute_obj_key(
         c_path, src_sha, [],
-        "", process_blinkc_sha(), process_cc_id(), flags, target,
+        "", process_compiler_sha(), process_cc_id(), flags, target,
     )
     let hit = build_objcache.lookup_obj(key)
     if hit != "" {
@@ -988,7 +994,7 @@ fn sha8(sha: Str) -> Str {
 // stdlib sources + runtime.h + cc version), so it needs no check. An
 // *installed* archive (copied out of the cache into <prefix>/share/blink/,
 // losing the hash-named directory) carries a `.archive-id` stamp instead:
-// runtime.h SHA | blinkc SHA | version.
+// runtime.h SHA | archive-header SHA | compiler SHA | version.
 //
 // The decisive checks are the runtime.h SHA and the archive-header
 // (libblink_std.h) SHA. BOTH headers are #included by the freshly emitted user
@@ -1001,9 +1007,8 @@ fn sha8(sha: Str) -> Str {
 // reported Option[Row] UAF was exactly this skew: a stale 161789-byte install
 // vs the current 172853-byte runtime.h). Both headers are resolvable on the
 // link side (they ship next to the archive in share/blink/), so both are
-// re-checked. The blinkc SHA is recorded for forensics but NOT re-checked —
-// an installed tree ships only `bin/blink`, no `blinkc` to hash — and is
-// unnecessary once both header surfaces are pinned. The version is shown in
+// re-checked. The compiler SHA is recorded for forensics but NOT re-checked —
+// it is unnecessary once both header surfaces are pinned. The version is shown in
 // the diagnostic only.
 //
 // Returns 0 when the link may proceed (dev archive, or matching installed
