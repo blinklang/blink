@@ -22,7 +22,7 @@ Ignore short-term gain, and always think about what is most correct according to
 Pipeline: lexer → parser → typecheck → mono → lowering to IR → C printer
 Codegen layer: src/cg.bl (driver, four emit modes) over src/cg_*.bl (stages), src/mono.bl,
 src/layout.bl (C shape of a tid), src/cname.bl (C symbol names), src/ir.bl (typed lowered IR)
-gen0 is pinned to tag gen0-rewrite-selfhost-6 (main at b0e39e88, VERSION 0.54.0).
+gen0 is pinned to tag gen0-rewrite-selfhost-7 (main at b79950d8, VERSION 0.54.0).
 `task ci` is the gate for each change; `task ci-release` is the release gate
 Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/blinkc_main.bl (compiler binary)
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/
