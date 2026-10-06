@@ -1848,9 +1848,11 @@ pub fn tc_tid_handler_effect(tid: Int) -> Str {
 // default stub return a zero value or panic as "unhandled operation"?) rather than a type-identity
 // one.
 pub fn tc_handler_effect_root(effect_name: Str) -> Str {
-    let dot = effect_name.index_of(".")
-    if dot < 0 { return effect_name }
-    effect_name.slice(0, dot)
+    let dot = match effect_name.byte_index_of(".", 0) {
+        Some(i) => i
+        None => { return effect_name }
+    }
+    effect_name.byte_slice(0, dot)
 }
 
 // The fifth case of the audit above, and the worst of them: TyKind.Ptr did not
@@ -3001,10 +3003,10 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
 // ── Type lookup ─────────────────────────────────────────────────────
 
 pub fn lookup_named_type(name: Str) -> Int {
-    let dot = name.index_of(".")
+    let dot = name.byte_index_of(".", 0)
     // A bare namesake means the reading module's own declaration, or the one its imports
     // select, before the bare key (which only the main file can hold).
-    if dot < 0 && tc_is_namesake_type_name(name) != 0 {
+    if dot.is_none() && tc_is_namesake_type_name(name) != 0 {
         match named_type_map.get(tc_nominal_type_name_in(name, nr_current_module)) {
             Some(v) => return v
             None => {}
@@ -3020,7 +3022,7 @@ pub fn lookup_named_type(name: Str) -> Int {
     // bare alias this way; a type asked for one got -1 and read back as an unknown type.
     // The original goes through the reader's own namesake resolution, because two modules may
     // declare the name and only the import the rename sits on says which one was selected.
-    if dot < 0 {
+    if dot.is_none() {
         match tc_alias_to_original.get(name) {
             Some(original) => {
                 match named_type_map.get(tc_nominal_type_name_in(original, nr_current_module)) {
@@ -3035,24 +3037,27 @@ pub fn lookup_named_type(name: Str) -> Int {
             None => {}
         }
     }
-    if dot >= 0 {
-        let bare = name.slice(dot + 1, name.len())
-        // A written qualifier on a namesake names one module's declaration and nothing else:
-        // the bare key would answer with another module's type of the same name.
-        if tc_is_namesake_type_name(bare) != 0 {
-            let qual = name.slice(0, dot)
-            let mod_key = tc_qualifier_to_module.get(qual) ?? qual
-            return named_type_map.get("{mod_key}.{bare}") ?? -1
+    match dot {
+        Some(at) => {
+            let bare = name.byte_slice(at + 1, name.len())
+            // A written qualifier on a namesake names one module's declaration and nothing else:
+            // the bare key would answer with another module's type of the same name.
+            if tc_is_namesake_type_name(bare) != 0 {
+                let qual = name.byte_slice(0, at)
+                let mod_key = tc_qualifier_to_module.get(qual) ?? qual
+                return named_type_map.get("{mod_key}.{bare}") ?? -1
+            }
+            let resolved = tc_alias_to_original.get(bare) ?? bare
+            match named_type_map.get(resolved) {
+                Some(v) => return v
+                None => {}
+            }
+            match named_type_map.get(bare) {
+                Some(v) => return v
+                None => {}
+            }
         }
-        let resolved = tc_alias_to_original.get(bare) ?? bare
-        match named_type_map.get(resolved) {
-            Some(v) => return v
-            None => {}
-        }
-        match named_type_map.get(bare) {
-            Some(v) => return v
-            None => {}
-        }
+        None => {}
     }
     -1
 }
@@ -6593,7 +6598,7 @@ fn tc_pipe_merge(a: Str, b: Str) -> Str {
     while i <= b.len() {
         if i == b.len() || b.byte_at(i) == 124 {
             if i > seg_start {
-                acc = tc_pipe_add(acc, b.substring(seg_start, i - seg_start))
+                acc = tc_pipe_add(acc, b.byte_slice(seg_start, i))
             }
             seg_start = i + 1
         }
@@ -10863,7 +10868,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
             while ci <= supers.len() {
                 if ci == supers.len() || supers.byte_at(ci) == 124 {
                     if ci > seg_start {
-                        let sname = supers.substring(seg_start, ci - seg_start)
+                        let sname = supers.byte_slice(seg_start, ci)
                         if tc_type_satisfies_trait(impl_type, sname, impls_sl) == 0 {
                             let fix = if is_arith_trait_name(sname) != 0 {
                                 "{sname} is a sealed arithmetic trait — only built-in numeric types implement it, so no user type can satisfy `{trait_name}: {sname}`; implement `{trait_name}` only for a numeric type, or drop the `: {sname}` supertrait if `{trait_name}` does not need it"
@@ -10885,7 +10890,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         while ati < tc_trait_assoc_names.len() {
             let full_name = tc_trait_assoc_names.get(ati).unwrap()
             if full_name.starts_with("{trait_name}.") {
-                let expected_assoc = full_name.substring(trait_name.len() + 1, full_name.len() - trait_name.len() - 1)
+                let expected_assoc = full_name.byte_slice(trait_name.len() + 1, full_name.len())
                 let mut found_assoc = 0
                 if impl_assoc_sl != -1 {
                     let mut aj = 0
@@ -11993,33 +11998,37 @@ fn tc_apply_reexport_remapping() {
     let mut i = 0
     while i < keys.len() {
         let key = keys.get(i).unwrap()
-        let colon_idx = key.index_of(":")
-        if colon_idx > 0 {
-            let reexporter = key.substring(0, colon_idx)
-            let rest = key.substring(colon_idx + 1, key.len() - colon_idx - 1)
-            if rest.starts_with("*:") {
-                let source_mod = rest.substring(2, rest.len() - 2)
-                let sym_keys = tc_symbol_module.keys()
-                let mut si = 0
-                while si < sym_keys.len() {
-                    let sym = sym_keys.get(si).unwrap()
-                    if tc_symbol_module.get(sym).unwrap() == source_mod {
-                        tc_symbol_module.insert(sym, reexporter)
-                    }
-                    si = si + 1
-                }
-            } else {
-                let item_name = rest
-                match tc_symbol_module.get(item_name) {
-                    Some(current_mod) => {
-                        let source_mod = tc_reexport_source.get(key).unwrap()
-                        if current_mod == source_mod {
-                            tc_symbol_module.insert(item_name, reexporter)
+        match key.byte_index_of(":", 0) {
+            Some(colon_idx) => {
+                if colon_idx > 0 {
+                    let reexporter = key.byte_slice(0, colon_idx)
+                    let rest = key.byte_slice(colon_idx + 1, key.len())
+                    if rest.starts_with("*:") {
+                        let source_mod = rest.byte_slice(2, rest.len())
+                        let sym_keys = tc_symbol_module.keys()
+                        let mut si = 0
+                        while si < sym_keys.len() {
+                            let sym = sym_keys.get(si).unwrap()
+                            if tc_symbol_module.get(sym).unwrap() == source_mod {
+                                tc_symbol_module.insert(sym, reexporter)
+                            }
+                            si = si + 1
+                        }
+                    } else {
+                        let item_name = rest
+                        match tc_symbol_module.get(item_name) {
+                            Some(current_mod) => {
+                                let source_mod = tc_reexport_source.get(key).unwrap()
+                                if current_mod == source_mod {
+                                    tc_symbol_module.insert(item_name, reexporter)
+                                }
+                            }
+                            None => {}
                         }
                     }
-                    None => {}
                 }
             }
+            None => {}
         }
         i = i + 1
     }
@@ -12478,7 +12487,7 @@ fn nr_resolve_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
     let wildcard_prefix = "{target}:*:"
     for key in tc_reexport_source.keys() {
         if key.starts_with(wildcard_prefix) == 0 { continue }
-        let src = key.substring(wildcard_prefix.len(), key.len() - wildcard_prefix.len())
+        let src = key.byte_slice(wildcard_prefix.len(), key.len())
         let hit = nr_resolve_decl_in_module(src, member, depth + 1)
         if hit != -1 { return hit }
     }
@@ -13745,10 +13754,10 @@ fn str_levenshtein(a: Str, b: Str) -> Int {
     while i < alen {
         let mut curr: List[Int] = []
         curr.push(i + 1)
-        let ac = a.slice(i, i + 1)
+        let ac = a.byte_at(i)
         let mut k = 0
         while k < blen {
-            let bc = b.slice(k, k + 1)
+            let bc = b.byte_at(k)
             let cost = if ac == bc { 0 } else { 1 }
             let del = prev.get(k + 1).unwrap() + 1
             let ins = curr.get(k).unwrap() + 1
@@ -14091,13 +14100,13 @@ fn tc_builtin_method_edit1(method: Str) -> Str {
     if n < 3 { return "" }
     let mut i = 0
     while i + 1 < n {
-        let c = method.slice(0, i).concat(method.slice(i + 1, i + 2)).concat(method.slice(i, i + 1)).concat(method.slice(i + 2, n))
+        let c = method.byte_slice(0, i).concat(method.byte_slice(i + 1, i + 2)).concat(method.byte_slice(i, i + 1)).concat(method.byte_slice(i + 2, n))
         if is_builtin_method(c) != 0 { return c }
         i = i + 1
     }
     i = 0
     while i < n {
-        let c = method.slice(0, i).concat(method.slice(i + 1, n))
+        let c = method.byte_slice(0, i).concat(method.byte_slice(i + 1, n))
         if is_builtin_method(c) != 0 { return c }
         i = i + 1
     }
@@ -14107,7 +14116,7 @@ fn tc_builtin_method_edit1(method: Str) -> Str {
     while i < n {
         let mut a = 0
         while a < alen {
-            let c = method.slice(0, i).concat(alpha.slice(a, a + 1)).concat(method.slice(i + 1, n))
+            let c = method.byte_slice(0, i).concat(alpha.byte_slice(a, a + 1)).concat(method.byte_slice(i + 1, n))
             if is_builtin_method(c) != 0 { return c }
             a = a + 1
         }
@@ -14117,7 +14126,7 @@ fn tc_builtin_method_edit1(method: Str) -> Str {
     while i <= n {
         let mut a = 0
         while a < alen {
-            let c = method.slice(0, i).concat(alpha.slice(a, a + 1)).concat(method.slice(i, n))
+            let c = method.byte_slice(0, i).concat(alpha.byte_slice(a, a + 1)).concat(method.byte_slice(i, n))
             if is_builtin_method(c) != 0 { return c }
             a = a + 1
         }
@@ -14138,8 +14147,12 @@ fn tc_suggest_method(obj_k: TyKind, tname: Str, method: Str) -> Str {
     // The registry stores the impl head (`List` for `impl Trait for List[Int]`), while a
     // builtin receiver reaches here spelled with its arguments, so match on the head.
     let mut head = tname
-    let br = tname.index_of("[")
-    if br > 0 { head = tname.slice(0, br) }
+    match tname.byte_index_of("[", 0) {
+        Some(br) => {
+            if br > 0 { head = tname.byte_slice(0, br) }
+        }
+        None => {}
+    }
     let mut best_dist = -1
     let mut best_name = ""
     let mut i = 0
@@ -15566,32 +15579,34 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.StructLit {
         let type_name = node_type_name(node)
         if type_name != "" {
-            let dot_pos = type_name.index_of(".")
-            if dot_pos >= 0 {
-                let prefix = type_name.substr(0, dot_pos)
-                if is_import_module_name(prefix) != 0 && nr_is_defined(prefix) == 0 {
-                    // module.Type qualified construction: mark module used; nr_check_type_ref not needed
-                    // (lookup_named_type in type inference strips the qualifier and resolves the bare name)
-                    tc_mark_qualifier_used(prefix)
-                } else {
-                    // Enum.Variant struct-style construction: check the enum type only
-                    nr_check_type_ref(prefix, node)
+            match type_name.byte_index_of(".", 0) {
+                Some(dot_pos) => {
+                    let prefix = type_name.byte_slice(0, dot_pos)
+                    if is_import_module_name(prefix) != 0 && nr_is_defined(prefix) == 0 {
+                        // module.Type qualified construction: mark module used; nr_check_type_ref not needed
+                        // (lookup_named_type in type inference strips the qualifier and resolves the bare name)
+                        tc_mark_qualifier_used(prefix)
+                    } else {
+                        // Enum.Variant struct-style construction: check the enum type only
+                        nr_check_type_ref(prefix, node)
+                    }
                 }
-            } else {
-                if is_variant_name(type_name) != 0 {
-                    // bare struct-style variant construction; resolved in infer_type.
-                    // This gate only suppresses the false UnknownType — it never picks a winner.
-                } else {
-                    let stid = lookup_named_type(type_name)
-                    if stid == -1 {
-                        let suggestion = suggest_variant(type_name)
-                        if suggestion != "" {
-                            diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type `{type_name}`", node, "did you mean {suggestion}? construct as {suggestion} \{ ... }")
+                None => {
+                    if is_variant_name(type_name) != 0 {
+                        // bare struct-style variant construction; resolved in infer_type.
+                        // This gate only suppresses the false UnknownType — it never picks a winner.
+                    } else {
+                        let stid = lookup_named_type(type_name)
+                        if stid == -1 {
+                            let suggestion = suggest_variant(type_name)
+                            if suggestion != "" {
+                                diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type `{type_name}`", node, "did you mean {suggestion}? construct as {suggestion} \{ ... }")
+                            } else {
+                                nr_check_type_ref(type_name, node)
+                            }
                         } else {
                             nr_check_type_ref(type_name, node)
                         }
-                    } else {
-                        nr_check_type_ref(type_name, node)
                     }
                 }
             }
@@ -19821,102 +19836,104 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.StructLit {
         let sname = node_type_name(node)
         if sname != "" {
-            let dot = sname.index_of(".")
-            if dot >= 0 {
-                // A qualified struct-style variant `E.V { .. }` is named by its PREFIX —
-                // 03_types.md:1040 rule 1: "if the site is already written `Enum.Variant {
-                // ... }`, that names the variant directly". This must be tried BEFORE
-                // lookup_named_type(sname) below, which strips the qualifier and looks up
-                // the SUFFIX. That is right for the module-qualified struct literal it was
-                // written for (`mod.Type { .. }`, suffix IS the type) and wrong here: the
-                // suffix is the variant name, never a type (E0518 makes struct-vs-variant a
-                // declaration-time error). Getting the order wrong would infer TYPE_UNKNOWN,
-                // which unifies with anything — and worse, an unrelated enum that happened
-                // to be NAMED like the variant would hijack the lookup and reject correct
-                // code.
-                //
-                // Mirrors the bare path (:10131) exactly rather than returning the bare
-                // enum tid, so a generic enum reverse-infers its instance (`Tree[Int]`);
-                // the two spellings must "emit identical code" (03_types.md:1036). The decl
-                // node comes from tc_type_decl_nodes keyed by the ENUM — NOT from
-                // tc_variant_enum_decl_node, which is first-declared-wins per variant name
-                // and would hand back the other enum's decl for a shared name, the very
-                // confusion this block exists to end.
-                //
-                // Guarded on the prefix being a TyKind.Enum that HAS the variant, so a
-                // module qualifier still falls through untouched. A prefix enum without the
-                // named variant also falls through, staying TYPE_UNKNOWN as before — that
-                // needs an unknown-variant diagnostic which does not exist yet, and covers
-                // the unit and tuple spellings too.
-                let qual = sname.slice(0, dot)
-                let vname = sname.slice(dot + 1, sname.len())
-                let qtid = lookup_named_type(qual)
-                if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
-                    check_deprecated_type(qual, node)
-                    let edecl = tc_decl_node_for_type(type_to_str(qtid))
-                    return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
+            match sname.byte_index_of(".", 0) {
+                Some(dot) => {
+                    // A qualified struct-style variant `E.V { .. }` is named by its PREFIX —
+                    // 03_types.md:1040 rule 1: "if the site is already written `Enum.Variant {
+                    // ... }`, that names the variant directly". This must be tried BEFORE
+                    // lookup_named_type(sname) below, which strips the qualifier and looks up
+                    // the SUFFIX. That is right for the module-qualified struct literal it was
+                    // written for (`mod.Type { .. }`, suffix IS the type) and wrong here: the
+                    // suffix is the variant name, never a type (E0518 makes struct-vs-variant a
+                    // declaration-time error). Getting the order wrong would infer TYPE_UNKNOWN,
+                    // which unifies with anything — and worse, an unrelated enum that happened
+                    // to be NAMED like the variant would hijack the lookup and reject correct
+                    // code.
+                    //
+                    // Mirrors the bare path (:10131) exactly rather than returning the bare
+                    // enum tid, so a generic enum reverse-infers its instance (`Tree[Int]`);
+                    // the two spellings must "emit identical code" (03_types.md:1036). The decl
+                    // node comes from tc_type_decl_nodes keyed by the ENUM — NOT from
+                    // tc_variant_enum_decl_node, which is first-declared-wins per variant name
+                    // and would hand back the other enum's decl for a shared name, the very
+                    // confusion this block exists to end.
+                    //
+                    // Guarded on the prefix being a TyKind.Enum that HAS the variant, so a
+                    // module qualifier still falls through untouched. A prefix enum without the
+                    // named variant also falls through, staying TYPE_UNKNOWN as before — that
+                    // needs an unknown-variant diagnostic which does not exist yet, and covers
+                    // the unit and tuple spellings too.
+                    let qual = sname.byte_slice(0, dot)
+                    let vname = sname.byte_slice(dot + 1, sname.len())
+                    let qtid = lookup_named_type(qual)
+                    if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
+                        check_deprecated_type(qual, node)
+                        let edecl = tc_decl_node_for_type(type_to_str(qtid))
+                        return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
+                    }
+                    let etid = lookup_named_type(sname)
+                    if etid != -1 {
+                        check_deprecated_type(sname, node)
+                        if tc_head_constructible_struct(etid) == 0 {
+                            tc_report_unconstructible_head(etid, sname, node)
+                            return tc_error_recovery_tid()
+                        }
+                        // `mod.Type { .. }` is the same construction as `Type { .. }` and must
+                        // answer the same way — the bare spelling reverse-infers its instance and
+                        // types its field values, this one returned the head and looked at nothing,
+                        // so every field value under a qualified literal carried no type.
+                        return tc_struct_lit_instance_tid(etid, node)
+                    }
                 }
-                let etid = lookup_named_type(sname)
-                if etid != -1 {
-                    check_deprecated_type(sname, node)
-                    if tc_head_constructible_struct(etid) == 0 {
-                        tc_report_unconstructible_head(etid, sname, node)
+                None => {
+                    // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
+                    //    rebind a locally-determined site).
+                    if tc_construct_hint >= 0 && type_kind(tc_construct_hint) == TyKind.Enum && get_variant_by_name(tc_construct_hint, sname) != -1 {
+                        // The hint answers the literal's own type without looking inside it, so the
+                        // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
+                        // left the inner literal's fields with nothing.
+                        tc_infer_enum_structlit_field_values(sname, node_fields(node))
+                        return tc_construct_hint
+                    }
+                    // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
+                    //    User-first: a user type shadowing a builtin name (`type Char { .. }`)
+                    //    resolves here and stays constructible, matching how the annotation and
+                    //    field-access paths resolve the same name.
+                    let stid = lookup_named_type(sname)
+                    if stid != -1 {
+                        check_deprecated_type(sname, node)
+                        if tc_head_constructible_struct(stid) == 0 {
+                            tc_report_unconstructible_head(stid, sname, node)
+                            return tc_error_recovery_tid()
+                        }
+                        // Reverse-infer the concrete instance tid (Box[Int]) from the
+                        // field values so the literal carries its specialization, not the
+                        // bare generic tid. Falls back to the bare stid when no concrete
+                        // bind is discoverable (all-typevar / empty collection fields).
+                        return tc_struct_lit_instance_tid(stid, node)
+                    }
+                    // A builtin type used as a struct-literal head — scalar (`Int { }`) or
+                    // structural (`List { }`, `Map { }`, `Option { }`) — is not a product struct
+                    // and cannot be built with `{ ... }`. A user type of the same name was handled
+                    // above (user-first), so this fires only for a genuine builtin, which
+                    // lookup_named_type (name-map only) never finds.
+                    if is_primitive_type(sname) != 0 {
+                        tc_report_unconstructible_head(-1, sname, node)
                         return tc_error_recovery_tid()
                     }
-                    // `mod.Type { .. }` is the same construction as `Type { .. }` and must
-                    // answer the same way — the bare spelling reverse-infers its instance and
-                    // types its field values, this one returned the head and looked at nothing,
-                    // so every field value under a qualified literal carried no type.
-                    return tc_struct_lit_instance_tid(etid, node)
-                }
-            } else {
-                // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
-                //    rebind a locally-determined site).
-                if tc_construct_hint >= 0 && type_kind(tc_construct_hint) == TyKind.Enum && get_variant_by_name(tc_construct_hint, sname) != -1 {
-                    // The hint answers the literal's own type without looking inside it, so the
-                    // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
-                    // left the inner literal's fields with nothing.
-                    tc_infer_enum_structlit_field_values(sname, node_fields(node))
-                    return tc_construct_hint
-                }
-                // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
-                //    User-first: a user type shadowing a builtin name (`type Char { .. }`)
-                //    resolves here and stays constructible, matching how the annotation and
-                //    field-access paths resolve the same name.
-                let stid = lookup_named_type(sname)
-                if stid != -1 {
-                    check_deprecated_type(sname, node)
-                    if tc_head_constructible_struct(stid) == 0 {
-                        tc_report_unconstructible_head(stid, sname, node)
+                    // 3) global-unique variant.
+                    let n = count_enums_with_variant(sname)
+                    if n == 1 {
+                        let venum = get_variant_enum_tid(sname)
+                        // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
+                        // infers its concrete instance tid; non-generic keeps bare.
+                        let vdecl = tc_variant_enum_decl_node(sname)
+                        return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
+                    }
+                    if n > 1 {
+                        diag_error_at("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "bare construction of `{sname}` is ambiguous: `{sname}` is a variant of {n} enums; qualify it (e.g. SomeEnum.{sname} \{ ... }) or add a type annotation", node, "qualify with the enum name or annotate the binding")
                         return tc_error_recovery_tid()
                     }
-                    // Reverse-infer the concrete instance tid (Box[Int]) from the
-                    // field values so the literal carries its specialization, not the
-                    // bare generic tid. Falls back to the bare stid when no concrete
-                    // bind is discoverable (all-typevar / empty collection fields).
-                    return tc_struct_lit_instance_tid(stid, node)
-                }
-                // A builtin type used as a struct-literal head — scalar (`Int { }`) or
-                // structural (`List { }`, `Map { }`, `Option { }`) — is not a product struct
-                // and cannot be built with `{ ... }`. A user type of the same name was handled
-                // above (user-first), so this fires only for a genuine builtin, which
-                // lookup_named_type (name-map only) never finds.
-                if is_primitive_type(sname) != 0 {
-                    tc_report_unconstructible_head(-1, sname, node)
-                    return tc_error_recovery_tid()
-                }
-                // 3) global-unique variant.
-                let n = count_enums_with_variant(sname)
-                if n == 1 {
-                    let venum = get_variant_enum_tid(sname)
-                    // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
-                    // infers its concrete instance tid; non-generic keeps bare.
-                    let vdecl = tc_variant_enum_decl_node(sname)
-                    return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
-                }
-                if n > 1 {
-                    diag_error_at("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "bare construction of `{sname}` is ambiguous: `{sname}` is a variant of {n} enums; qualify it (e.g. SomeEnum.{sname} \{ ... }) or add a type annotation", node, "qualify with the enum name or annotate the binding")
-                    return tc_error_recovery_tid()
                 }
             }
         }
@@ -23088,7 +23105,7 @@ pub fn sanitize_test_name(name: Str) -> Str {
         if ch == 32 || ch == 95 {
             out = out.concat("_")
         } else if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
-            out = out.concat(name.substring(i, 1))
+            out = out.concat(name.byte_slice(i, i + 1))
         }
         i = i + 1
     }
@@ -24683,11 +24700,13 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
 // keeps its qualifier: `alpha.Point` IS the nominal name when another module also declares
 // `Point`, so stripping it would collapse the two types every comparison keeps apart.
 pub fn strip_module_qualifier(name: Str) -> Str {
-    let dot_pos = name.index_of(".")
-    if dot_pos >= 0 {
-        let rest = name.substr(dot_pos + 1, name.len() - dot_pos - 1)
-        if tc_is_namesake_type_name(rest) != 0 { return name }
-        return rest
+    match name.byte_index_of(".", 0) {
+        Some(dot_pos) => {
+            let rest = name.byte_slice(dot_pos + 1, name.len())
+            if tc_is_namesake_type_name(rest) != 0 { return name }
+            return rest
+        }
+        None => {}
     }
     name
 }

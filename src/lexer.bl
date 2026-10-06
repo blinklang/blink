@@ -98,6 +98,52 @@ fn peek(source: Str, source_len: Int, scan_pos: Int) -> Int {
     }
 }
 
+// Offset just past the character that starts at pos. A byte that does not start a
+// well-formed UTF-8 sequence is a character on its own, so a file that is not UTF-8 still
+// lexes one byte at a time instead of swallowing the bytes after it.
+fn codepoint_end(source: Str, source_len: Int, pos: Int) -> Int {
+    let b = peek(source, source_len, pos)
+    let w = if b >= 194 && b < 224 { 2 } else if b >= 224 && b < 240 { 3 } else if b >= 240 && b < 245 { 4 } else { 1 }
+    if pos + w > source_len { return pos + 1 }
+    let mut k = 1
+    while k < w {
+        let c = peek(source, source_len, pos + k)
+        if c < 128 || c >= 192 { return pos + 1 }
+        k = k + 1
+    }
+    pos + w
+}
+
+// The text of the character at pos..end, for a diagnostic. A byte that is not UTF-8 is
+// spelled `\xNN`: it is not text, and slicing it out would cut a codepoint.
+fn char_text(source: Str, pos: Int, end: Int) -> Str {
+    let b = source.byte_at(pos)
+    if end - pos > 1 || b < 128 { return source.byte_slice(pos, end) }
+    let digits = "0123456789ABCDEF"
+    "\\x".concat(digits.byte_slice(b / 16, b / 16 + 1)).concat(digits.byte_slice(b % 16, b % 16 + 1))
+}
+
+// ` (U+XXXX)` for a multi-byte character at pos..end, so a diagnostic names a character that
+// may not render; empty for ASCII and for a byte that is not UTF-8.
+fn codepoint_label(source: Str, pos: Int, end: Int) -> Str {
+    let w = end - pos
+    if w < 2 { return "" }
+    let b = source.byte_at(pos)
+    let mut cp = if w == 2 { b % 32 } else if w == 3 { b % 16 } else { b % 8 }
+    let mut k = 1
+    while k < w {
+        cp = cp * 64 + source.byte_at(pos + k) % 64
+        k = k + 1
+    }
+    let digits = "0123456789ABCDEF"
+    let mut hex = ""
+    while cp > 0 || hex.len() < 4 {
+        hex = digits.byte_slice(cp % 16, cp % 16 + 1).concat(hex)
+        cp = cp / 16
+    }
+    " (U+{hex})"
+}
+
 fn peek_at(source: Str, source_len: Int, scan_pos: Int, offset: Int) -> Int {
     peek(source, source_len, scan_pos + offset)
 }
@@ -172,7 +218,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
-                let text = source.substring(text_start, scan_pos - text_start)
+                let text = source.byte_slice(text_start, scan_pos)
                 if is_doc {
                     tokens.push(Token { kind: TokenKind.DocComment, value: text, line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.DocComment
@@ -266,8 +312,12 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     else if esc == CH_0 { codepoint = 0 }
                     else if esc == CH_SQUOTE { codepoint = 39 }
                     else {
-                        let esc_ch = source.substring(scan_pos - 1, 1)
-                        io.eprintln("lexer error: unknown char escape '\\{esc_ch}' at line {t_line} col {t_col}")
+                        let esc_end = codepoint_end(source, source_len, scan_pos - 1)
+                        let esc_ch = char_text(source, scan_pos - 1, esc_end)
+                        let esc_label = codepoint_label(source, scan_pos - 1, esc_end)
+                        col = col + esc_end - scan_pos
+                        scan_pos = esc_end
+                        io.eprintln("lexer error: unknown char escape '\\{esc_ch}'{esc_label} at line {t_line} col {t_col}")
                         codepoint = esc
                     }
                 } else {
@@ -720,7 +770,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
-                let word = source.substring(start, scan_pos - start)
+                let word = source.byte_slice(start, scan_pos)
                 let kind = keyword_lookup(word)
                 tokens.push(Token { kind: kind, value: word, line: t_line, col: t_col, end_col: col })
                 _last_kind = kind
@@ -743,10 +793,10 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                         scan_pos = scan_pos + 1
                         col = col + 1
                     }
-                    tokens.push(Token { kind: TokenKind.Float, value: source.substring(start, scan_pos - start), line: t_line, col: t_col, end_col: col })
+                    tokens.push(Token { kind: TokenKind.Float, value: source.byte_slice(start, scan_pos), line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.Float
                 } else {
-                    tokens.push(Token { kind: TokenKind.Int, value: source.substring(start, scan_pos - start), line: t_line, col: t_col, end_col: col })
+                    tokens.push(Token { kind: TokenKind.Int, value: source.byte_slice(start, scan_pos), line: t_line, col: t_col, end_col: col })
                     _last_kind = TokenKind.Int
                 }
                 continue
@@ -764,12 +814,14 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             }
 
             // Recover by skipping the character so we can surface every bad
-            // byte in one pass rather than aborting on the first.
-            let bad_ch = source.substring(scan_pos, 1)
+            // character in one pass rather than aborting on the first.
+            let bad_end = codepoint_end(source, source_len, scan_pos)
+            let bad_ch = char_text(source, scan_pos, bad_end)
+            let bad_w = bad_end - scan_pos
             let hint = if bad_ch == ";" { "Blink uses newlines as statement terminators; delete the `;`" } else { "" }
-            diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{bad_ch}`", line, col, col + 1, hint)
-            scan_pos = scan_pos + 1
-            col = col + 1
+            diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{bad_ch}`{codepoint_label(source, scan_pos, bad_end)}", line, col, col + bad_w, hint)
+            scan_pos = bad_end
+            col = col + bad_w
 
         } else {
             // ── STRING MODE ───────────────────────────────────────
@@ -778,7 +830,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             // Interpolation start: { (or #{...} for extended strings)
             if ch == CH_LBRACE {
                 if _run_start != -1 {
-                    string_buf.write(source.substring(_run_start, scan_pos - _run_start))
+                    string_buf.write(source.byte_slice(_run_start, scan_pos))
                     _run_start = -1
                 }
                 let t_line = line
@@ -812,7 +864,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                         }
                         if all_hash == 1 {
                             // Remove trailing # chars from string_buf
-                            let trimmed = buf_str.substring(0, buf_len - sdepth)
+                            let trimmed = buf_str.byte_slice(0, buf_len - sdepth)
                             scan_pos = scan_pos + 1
                             col = col + 1
                             tokens.push(Token { kind: TokenKind.StringPart, value: trimmed, line: t_line, col: t_col, end_col: col })
@@ -836,7 +888,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             // String end: " (or "# / "## / "### for extended strings)
             if ch == CH_DQUOTE {
                 if _run_start != -1 {
-                    string_buf.write(source.substring(_run_start, scan_pos - _run_start))
+                    string_buf.write(source.byte_slice(_run_start, scan_pos))
                     _run_start = -1
                 }
                 let t_line = line
@@ -889,7 +941,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             // Escape sequences
             if ch == CH_BACKSLASH {
                 if _run_start != -1 {
-                    string_buf.write(source.substring(_run_start, scan_pos - _run_start))
+                    string_buf.write(source.byte_slice(_run_start, scan_pos))
                     _run_start = -1
                 }
                 let sdepth = string_depth_stack.get(string_depth_stack.len() - 1).unwrap()
@@ -939,10 +991,33 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 } else if esc == CH_RBRACE {
                     string_buf.write("}")
                 } else {
-                    let esc_ch = source.substring(scan_pos - 1, 1)
-                    io.eprintln("warning: unknown escape sequence '\\{esc_ch}' at line {line} col {col - 2}")
+                    let esc_end = codepoint_end(source, source_len, scan_pos - 1)
+                    let esc_ch = char_text(source, scan_pos - 1, esc_end)
+                    io.eprintln("warning: unknown escape sequence '\\{esc_ch}'{codepoint_label(source, scan_pos - 1, esc_end)} at line {line} col {col - 2}")
+                    col = col + esc_end - scan_pos
+                    scan_pos = esc_end
                     string_buf.write("\\")
                 }
+                continue
+            }
+
+            // A Str must hold UTF-8, so a byte that is not part of a well-formed sequence
+            // cannot go into the literal; it is an error, spelled `\xNN`. A well-formed
+            // sequence joins the run whole, so a later flush never ends inside it.
+            if ch >= 128 {
+                let cp_end = codepoint_end(source, source_len, scan_pos)
+                if cp_end == scan_pos + 1 {
+                    if _run_start != -1 {
+                        string_buf.write(source.byte_slice(_run_start, scan_pos))
+                        _run_start = -1
+                    }
+                    let bad_ch = char_text(source, scan_pos, cp_end)
+                    diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{bad_ch}` in string literal: source text must be UTF-8", line, col, col + 1, "")
+                } else if _run_start == -1 {
+                    _run_start = scan_pos
+                }
+                col = col + cp_end - scan_pos
+                scan_pos = cp_end
                 continue
             }
 

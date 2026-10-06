@@ -64,7 +64,7 @@ pub fn parse_pattern(pattern: Str) -> List[RouteSegment] {
     while i < parts.len() {
         let part = parts.get(i).unwrap()
         if part.len() > 0 && part.byte_at(0) == 58 {
-            let name = part.substring(1, part.len() - 1)
+            let name = part.byte_slice(1, part.len())
             segments.push(RouteSegment.Param(name))
         } else {
             segments.push(RouteSegment.Literal(part))
@@ -180,7 +180,7 @@ pub fn parse_request(raw: Str) -> Request {
     while i < raw.len() && raw.byte_at(i) != 32 {
         i = i + 1
     }
-    method = raw.substring(0, i)
+    method = raw.byte_slice(0, i)
 
     // Skip space
     i = i + 1
@@ -190,7 +190,7 @@ pub fn parse_request(raw: Str) -> Request {
     while i < raw.len() && raw.byte_at(i) != 32 {
         i = i + 1
     }
-    url = raw.substring(url_start, i - url_start)
+    url = raw.byte_slice(url_start, i)
 
     // Skip to end of request line (find \r\n)
     while i < raw.len() - 1 {
@@ -202,7 +202,7 @@ pub fn parse_request(raw: Str) -> Request {
                     // Body starts after \r\n\r\n
                     let body_start = i + 4
                     if body_start < raw.len() {
-                        body = raw.substring(body_start, raw.len() - body_start)
+                        body = raw.byte_slice(body_start, raw.len())
                     }
                     return request_new_with_body(method, url, body)
                 }
@@ -236,12 +236,16 @@ pub fn format_response(resp: Response) -> Str {
 
 fn parse_content_length(headers: Str) -> Int {
     let lower = headers.to_lower()
-    let idx = lower.index_of("content-length:")
-    if idx < 0 { return 0 }
-    let after_raw = lower.slice(idx + 15, lower.len())
-    let cr = after_raw.index_of("\r")
-    if cr < 0 { return 0 }
-    let val = str_trim(after_raw.slice(0, cr))
+    let idx = match lower.byte_index_of("content-length:", 0) {
+        Some(i) => i
+        None => { return 0 }
+    }
+    let start = idx + 15
+    let cr = match lower.byte_index_of("\r", start) {
+        Some(i) => i
+        None => { return 0 }
+    }
+    let val = str_trim(lower.byte_slice(start, cr))
     val.to_int()
 }
 
@@ -256,7 +260,7 @@ pub fn read_http_request(conn: Int) -> Str {
         } else {
             sb.write(chunk)
             let boundary = "{tail}{chunk}"
-            if boundary.index_of("\r\n\r\n") >= 0 {
+            if boundary.contains("\r\n\r\n") {
                 done = true
             }
             let clen = chunk.len()
@@ -264,9 +268,11 @@ pub fn read_http_request(conn: Int) -> Str {
         }
     }
     let headers_raw = sb.to_str()
-    let hdr_end = headers_raw.index_of("\r\n\r\n")
-    if hdr_end < 0 { return headers_raw }
-    let header_section = headers_raw.slice(0, hdr_end)
+    let hdr_end = match headers_raw.byte_index_of("\r\n\r\n", 0) {
+        Some(i) => i
+        None => { return headers_raw }
+    }
+    let header_section = headers_raw.byte_slice(0, hdr_end)
     let content_length = parse_content_length(header_section)
     if content_length <= 0 { return headers_raw }
     let body_start = hdr_end + 4
@@ -405,21 +411,17 @@ pub fn server_serve_async(srv: Server) ! Net.Listen, IO, Async {
 
 fn split_path(path: Str) -> List[Str] {
     let mut parts: List[Str] = []
-    let mut current = ""
+    // Cut only at / bytes, so a multi-byte codepoint in a segment stays whole.
+    let mut run = 0
     let mut i = 0
-    while i < path.len() {
-        if path.byte_at(i) == 47 {
-            if current.len() > 0 {
-                parts.push(current)
-                current = ""
+    while i <= path.len() {
+        if i == path.len() || path.byte_at(i) == 47 {
+            if i > run {
+                parts.push(path.byte_slice(run, i))
             }
-        } else {
-            current = current.concat(path.substring(i, 1))
+            run = i + 1
         }
         i = i + 1
-    }
-    if current.len() > 0 {
-        parts.push(current)
     }
     parts
 }

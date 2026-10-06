@@ -31,22 +31,26 @@ pub fn parse_url(url: Str) -> Result[UrlParts, NetError] {
         return Err(NetError.TlsError("HTTPS not supported"))
     }
     if p.starts_with("http://") {
-        p = p.slice(7, p.len())
+        p = p.byte_slice(7, p.len())
     }
-    let slash_idx = p.index_of("/")
     let mut host_port = p
     let mut path = "/"
-    if slash_idx >= 0 {
-        host_port = p.slice(0, slash_idx)
-        path = p.slice(slash_idx, p.len())
+    match p.byte_index_of("/", 0) {
+        Some(slash_idx) => {
+            host_port = p.byte_slice(0, slash_idx)
+            path = p.byte_slice(slash_idx, p.len())
+        }
+        None => {}
     }
-    let colon_idx = host_port.index_of(":")
     let mut host = host_port
     let mut port = 80
-    if colon_idx >= 0 {
-        host = host_port.slice(0, colon_idx)
-        let port_str = host_port.slice(colon_idx + 1, host_port.len())
-        port = port_str.to_int()
+    match host_port.byte_index_of(":", 0) {
+        Some(colon_idx) => {
+            host = host_port.byte_slice(0, colon_idx)
+            let port_str = host_port.byte_slice(colon_idx + 1, host_port.len())
+            port = port_str.to_int()
+        }
+        None => {}
     }
     if host.is_empty() {
         return Err(NetError.InvalidUrl("empty host"))
@@ -104,7 +108,7 @@ fn decode_chunked(raw: Str) -> Str {
     while cursor < rlen {
         let crlf_idx = raw.slice(cursor, rlen).index_of("\r\n")
         if crlf_idx < 0 { break }
-        let size_str = raw.slice(cursor, cursor + crlf_idx).trim()
+        let size_str = raw.byte_slice(cursor, cursor + crlf_idx).trim()
         let chunk_size = parse_hex(size_str)
         if chunk_size <= 0 { break }
         let data_start = cursor + crlf_idx + 2
@@ -123,49 +127,57 @@ fn decode_chunked(raw: Str) -> Str {
 }
 
 pub fn parse_response(raw: Str) -> Result[Response, NetError] {
-    let hdr_end_idx = raw.index_of("\r\n\r\n")
-    if hdr_end_idx < 0 {
-        return Err(NetError.ProtocolError("malformed HTTP response"))
+    let hdr_end_idx = match raw.byte_index_of("\r\n\r\n", 0) {
+        Some(i) => i
+        None => { return Err(NetError.ProtocolError("malformed HTTP response")) }
     }
-    let header_section = raw.slice(0, hdr_end_idx)
+    let header_section = raw.byte_slice(0, hdr_end_idx)
     let body_start = hdr_end_idx + 4
-    let body_raw = raw.slice(body_start, raw.len())
+    let body_raw = raw.byte_slice(body_start, raw.len())
 
-    let first_crlf = header_section.index_of("\r\n")
-    let status_line = header_section.slice(0, if first_crlf >= 0 { first_crlf } else { header_section.len() })
+    let first_crlf = header_section.byte_index_of("\r\n", 0)
+    let status_line = header_section.byte_slice(0, first_crlf ?? header_section.len())
 
     let mut status_code = 0
     if status_line.len() > 12 && status_line.starts_with("HTTP/") {
-        let space_idx = status_line.index_of(" ")
-        if space_idx >= 0 {
-            let after_space = status_line.slice(space_idx + 1, status_line.len())
-            let space2 = after_space.index_of(" ")
-            let mut code_str = after_space
-            if space2 >= 0 {
-                code_str = after_space.slice(0, space2)
+        match status_line.byte_index_of(" ", 0) {
+            Some(space_idx) => {
+                let after_space = status_line.byte_slice(space_idx + 1, status_line.len())
+                let code_str = match after_space.byte_index_of(" ", 0) {
+                    Some(space2) => after_space.byte_slice(0, space2)
+                    None => after_space
+                }
+                status_code = parse_int(code_str)
             }
-            status_code = parse_int(code_str)
+            None => {}
         }
     }
 
     let mut hdrs: Map[Str, Str] = Map()
-    if first_crlf >= 0 && first_crlf < hdr_end_idx {
-        let hdr_lines_str = header_section.slice(first_crlf + 2, header_section.len())
-        let hdr_lines = hdr_lines_str.split("\r\n")
-        let mut i = 0
-        while i < hdr_lines.len() {
-            let line = hdr_lines.get(i).unwrap()
-            let colon_idx = line.index_of(":")
-            if colon_idx > 0 {
-                let key = line.slice(0, colon_idx).to_lower()
-                let mut val = line.slice(colon_idx + 1, line.len())
-                if val.len() > 0 && val.byte_at(0) == 32 {
-                    val = val.slice(1, val.len())
+    match first_crlf {
+        Some(crlf) => {
+            let hdr_lines_str = header_section.byte_slice(crlf + 2, header_section.len())
+            let hdr_lines = hdr_lines_str.split("\r\n")
+            let mut i = 0
+            while i < hdr_lines.len() {
+                let line = hdr_lines.get(i).unwrap()
+                match line.byte_index_of(":", 0) {
+                    Some(colon_idx) => {
+                        if colon_idx > 0 {
+                            let key = line.byte_slice(0, colon_idx).to_lower()
+                            let mut val = line.byte_slice(colon_idx + 1, line.len())
+                            if val.len() > 0 && val.byte_at(0) == 32 {
+                                val = val.byte_slice(1, val.len())
+                            }
+                            hdrs.insert(key, val)
+                        }
+                    }
+                    None => {}
                 }
-                hdrs.insert(key, val)
+                i = i + 1
             }
-            i = i + 1
         }
+        None => {}
     }
 
     let mut body = body_raw
