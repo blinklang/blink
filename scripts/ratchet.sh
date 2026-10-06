@@ -47,17 +47,18 @@
 #                            A fact filed under a spelled name is a fact the tid
 #                            cannot answer, and each table is a second place for
 #                            a type to be described
-#   node_pool_writes         writes to the parser's node pool, or to the columns
-#                            kept beside it, outside node_push, node_pop,
+#   node_pool_writes         writes to the parser's node pool, the non-pub
+#                            `columns` (one column per node field plus the
+#                            child-slot columns), outside node_push, node_pop,
 #                            node_replace, parser_reset and the two child-slot
-#                            helpers they call; absolute zero gate. node_kind and
-#                            the child walks answer from those columns, so any
-#                            other write leaves a column holding a kind or a child
-#                            the pool no longer has. Counted in src/, lib/ and
-#                            tests/: in parser.bl outside the writers (the pool
-#                            and its non-pub `columns`), and in every file that
-#                            imports `nodes` from parser or spells
-#                            `parser.nodes`. A historical ref is
+#                            helpers they call; absolute zero gate. Each writer
+#                            writes every column, so any other write leaves one
+#                            column holding a field or a child the others do
+#                            not. Counted in src/, lib/ and tests/: in parser.bl
+#                            outside the writers, and in every file that imports
+#                            `nodes` from parser or spells `parser.nodes`, the
+#                            name the pool had before it was split into
+#                            columns. A historical ref is
 #                            materialized with src/ alone, so its count leaves out
 #                            lib/ and tests/; the zero gate still holds the tree
 #   str_substring_callers    a `.substring(` or `.substr(` call anywhere in src/,
