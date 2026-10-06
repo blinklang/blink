@@ -1,0 +1,136 @@
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, make_struct_instance_type}
+import layout.{box_gc_layout_of, layout_reset, layout_take_typedefs}
+import cname.{c_gc_layout_name, c_typedef_name}
+import ir.{ir_reset, ir_box, ir_const, ir_gc_layout, ir_dump, ir_parse}
+import parser.{nodes}
+import compiler.{compile_to_program}
+import cname_test_helpers.{assert_eq_str}
+
+fn probe_src() -> Str {
+    #"type Shade { Red, Green }
+type Mix { id: Int, name: Str, small: I32, tags: List[Str], ratio: Float, nick: Option[Str], shade: Shade, flag: Bool }
+type Words { a: Int, b: Float, c: Bool, d: Shade, e: U8 }
+type Pair[T] { left: T, n: Int, right: T }
+fn main() {
+    let m = Mix { id: 1, name: "a", small: 2, tags: ["x"], ratio: 1.5, nick: None, shade: Shade.Red, flag: true }
+    let w = Words { a: 1, b: 2.0, c: false, d: Shade.Green, e: 3 }
+    let pi: Pair[Int] = Pair { left: 1, n: 2, right: 3 }
+    let ps: Pair[Str] = Pair { left: "l", n: 2, right: "r" }
+    io.println("{m.id} {w.a} {pi.n} {ps.left}")
+}
+"#
+}
+
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_box_gc_layout_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < nodes.len() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    if tid == -1 {
+        io.println("FAIL: harvested map has no tid for rendered type string '{key}'")
+    }
+    assert(tid != -1)
+    tid
+}
+
+// Answers the one queued definition of the descriptor function `name`.
+fn layout_text(name: Str) -> Str {
+    let mut found = ""
+    for t in layout_take_typedefs() {
+        if t.contains(" {name}(void)") { found = t }
+    }
+    if found == "" { io.println("FAIL: no queued definition for '{name}'") }
+    assert(found != "")
+    found
+}
+
+fn assert_scans(label: Str, text: Str, spelling: Str, field: Str, want: Bool) {
+    let got = text.contains("offsetof({spelling}, {field})")
+    if got != want { io.println("FAIL: {label}: field '{field}' scanned={got} want {want}\n{text}") }
+    assert(got == want)
+}
+
+test "a mixed struct's descriptor marks its pointer fields and leaves out its word fields" {
+    let m = harvest_type_tids()
+    let mix = expect_tid(m, "Mix")
+    let sp = c_typedef_name(mix)
+    let name = box_gc_layout_of(mix, sp)
+    assert_eq_str("named for the type", name, c_gc_layout_name(mix))
+    let text = layout_text(name)
+    assert_scans("Mix", text, sp, "name", true)
+    assert_scans("Mix", text, sp, "tags", true)
+    assert_scans("Mix", text, sp, "nick", true)
+    assert_scans("Mix", text, sp, "id", false)
+    assert_scans("Mix", text, sp, "small", false)
+    assert_scans("Mix", text, sp, "ratio", false)
+    assert_scans("Mix", text, sp, "shade", false)
+    assert_scans("Mix", text, sp, "flag", false)
+}
+
+test "a struct of only word fields has a descriptor with no spans" {
+    let m = harvest_type_tids()
+    let words = expect_tid(m, "Words")
+    let name = box_gc_layout_of(words, c_typedef_name(words))
+    let text = layout_text(name)
+    assert(!text.contains("offsetof("))
+    assert(text.contains("NULL, 0"))
+}
+
+// The type argument decides whether `left` and `right` hold pointers, so each instance has
+// its own descriptor.
+test "each instance of a generic struct has its own descriptor" {
+    let m = harvest_type_tids()
+    let at_int = make_struct_instance_type("Pair", [expect_tid(m, "Int")])
+    let at_str = make_struct_instance_type("Pair", [expect_tid(m, "Str")])
+    let n_int = box_gc_layout_of(at_int, c_typedef_name(at_int))
+    let n_str = box_gc_layout_of(at_str, c_typedef_name(at_str))
+    assert(n_int != "")
+    assert(n_str != "")
+    assert(n_int != n_str)
+    let all = layout_take_typedefs().join("\n")
+    let sp_str = c_typedef_name(at_str)
+    assert_scans("Pair[Str]", all, sp_str, "left", true)
+    assert_scans("Pair[Str]", all, sp_str, "right", true)
+    assert_scans("Pair[Str]", all, sp_str, "n", false)
+    assert(!all.contains("offsetof({c_typedef_name(at_int)},"))
+}
+
+test "a type this does not describe gets no descriptor" {
+    let m = harvest_type_tids()
+    let mix = expect_tid(m, "Mix")
+    assert_eq_str("an Int", box_gc_layout_of(expect_tid(m, "Int"), "int64_t"), "")
+    assert_eq_str("an enum", box_gc_layout_of(expect_tid(m, "Shade"), c_typedef_name(expect_tid(m, "Shade"))), "")
+    assert_eq_str("a box sized by another spelling", box_gc_layout_of(mix, "int64_t"), "")
+}
+
+test "a box of a struct names its descriptor and keeps it through dump and parse" {
+    let m = harvest_type_tids()
+    let mix = expect_tid(m, "Mix")
+    let sp = c_typedef_name(mix)
+    ir_reset()
+    let b = ir_box(mix, 0, "{sp}*", sp, ir_const(mix, 0, sp, "v"))
+    assert_eq_str("stamped", ir_gc_layout(b), c_gc_layout_name(mix))
+    let text = ir_dump(b)
+    let back = ir_parse(text)
+    assert(back >= 0)
+    assert_eq_str("survives", ir_gc_layout(back), c_gc_layout_name(mix))
+    assert_eq_str("re-dump is stable", ir_dump(back), text)
+    let plain = ir_box(expect_tid(m, "Int"), 0, "int64_t*", "int64_t", ir_const(expect_tid(m, "Int"), 0, "int64_t", "1"))
+    assert_eq_str("not a struct", ir_gc_layout(plain), "")
+}

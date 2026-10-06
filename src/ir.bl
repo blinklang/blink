@@ -25,7 +25,7 @@
 // is one where every kid id is smaller than its parent id. The verifier does not rely on
 // that ordering: it walks the tree and reports a cycle.
 
-import layout.{SlotForm, pointer_spelling}
+import layout.{SlotForm, pointer_spelling, box_gc_layout_of}
 import cname.{c_enum_tag_member, c_enum_payload_member, c_cell_name, c_vtable_userdata_member}
 import typecheck.{TyKind, tc_tid_kind, tc_tid_decl_node}
 import parser.{node_name, node_fields, sublist_length, sublist_get, node_count}
@@ -75,6 +75,10 @@ pub type IrNode {
     // "" on every other kind, and on a closure that captures nothing or is never promoted.
     capture_descs: Str
     promoter: Str
+    // The function that answers the collector descriptor a Box allocates its copy with, so
+    // the collector scans only the copy's pointer words; "" on every other kind, and on a
+    // Box whose copy is scanned whole.
+    gc_layout: Str
 }
 
 // The arena. A node id is an index into this list, the same shape parser.bl uses for AST
@@ -103,7 +107,7 @@ pub fn ir_new(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, s
         slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids), decl: -1,
         tag_member: "", payload_member: "", kops_table: "",
         userdata_member: userdata,
-        capture_descs: "", promoter: "",
+        capture_descs: "", promoter: "", gc_layout: "",
     })
     ir_nodes.len() - 1
 }
@@ -136,6 +140,8 @@ pub fn ir_userdata_member(id: Int) -> Str { ir_nodes[id].userdata_member }
 pub fn ir_capture_descs(id: Int) -> Str { ir_nodes[id].capture_descs }
 
 pub fn ir_promoter(id: Int) -> Str { ir_nodes[id].promoter }
+
+pub fn ir_gc_layout(id: Int) -> Str { ir_nodes[id].gc_layout }
 pub fn ir_slot_form(id: Int) -> SlotForm { ir_nodes[id].slot_form }
 // The printer's one type-shaped question, asked without importing SlotForm.
 pub fn ir_held_by_pointer(id: Int) -> Bool {
@@ -528,7 +534,15 @@ pub fn ir_container_spread(tid: Int, span: Int, c_spelling: Str, extend_symbol: 
 // c_spelling is the box's own pointer type like every other value node. The pointee type
 // goes in c_name: it is the token the printer writes inside sizeof for the heap copy.
 pub fn ir_box(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value: Int) -> Int {
-    ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value])
+    set_gc_layout(ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value]),
+        box_gc_layout_of(tid, pointee_spelling))
+}
+
+fn set_gc_layout(id: Int, gc_layout: Str) -> Int {
+    if gc_layout == "" { return id }
+    let n = ir_node(id)
+    ir_nodes.set(id, IrNode { gc_layout: gc_layout, ..n })
+    id
 }
 
 // A box allocated in the target of the promotion `ctx` names (the GC heap when it is NULL)
@@ -1307,6 +1321,10 @@ fn dump_node(sb: StringBuilder, id: Int, depth: Int, refs: List[Int], labels: Li
         sb.write(" promoter=")
         sb.write(quote(n.promoter))
     }
+    if n.gc_layout != "" {
+        sb.write(" gclayout=")
+        sb.write(quote(n.gc_layout))
+    }
     for kid in n.kids {
         sb.write("\n")
         dump_node(sb, kid, depth + 1, refs, labels, next_label)
@@ -1387,6 +1405,7 @@ fn parse_node(labels: List[Int]) -> Int {
     let mut kops = ""
     let mut descs = ""
     let mut promoter = ""
+    let mut gc_layout = ""
     skip_ws()
     while !peek_is(")") && !peek_is("(") && !peek_is("#") {
         if pr_pos >= pr_text.byte_len() { return fail() }
@@ -1400,6 +1419,8 @@ fn parse_node(labels: List[Int]) -> Int {
             descs = text
         } else if field == "promoter" {
             promoter = text
+        } else if field == "gclayout" {
+            gc_layout = text
         } else {
             return fail()
         }
@@ -1423,7 +1444,7 @@ fn parse_node(labels: List[Int]) -> Int {
         Some(f) => f
         None => return fail()
     }
-    let id = set_named_slots(stamp_tagged_members(ir_new(kind, tid, span, spelling, name, slot, kids)), kops, descs, promoter)
+    let id = set_gc_layout(set_named_slots(stamp_tagged_members(ir_new(kind, tid, span, spelling, name, slot, kids)), kops, descs, promoter), gc_layout)
     if mat == 1 { ir_mark_materialize(id) }
     if decl >= 0 { set_decl(id, decl) }
     if label >= 0 { bind_label(labels, label, id) }
