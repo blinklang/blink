@@ -2346,6 +2346,81 @@ error[TypeArgArity]: type `Handler` takes 0 type arguments, found 1
 
 Shadowing never changes what the compiler inserts. `x?`, `T?`, `for`, `..`, `with`, `async.spawn` and every other desugaring use the compiler-known type by identity (§3.4 *Type Name Resolution*, *Hygiene*).
 
+#### Shadowing a Prelude Trait
+
+A module that declares a prelude trait name (`trait Eq`, `trait Ord`, `trait Add`) has two traits with that name. They are different traits (§3.4 *Identity, not spelling, selects behavior*). Who wrote the name selects the trait:
+
+- **A name that the user writes resolves by scope.** In the declaring module, a bound `T: Eq`, `impl Eq for P`, a supertrait clause `trait Shape: Eq`, and the argument of `@derive(Eq)` all name the local trait.
+- **A form that the compiler inserts uses the compiler-known trait by identity** (§3.4 *Hygiene*). These forms are the operators (`==`, `!=`, `<`, `>`, `<=`, `>=`, and the arithmetic operators); the bounds that prelude declarations state (`Ord: Eq`, `Hash: Eq`, `Map`/`Set` keys, `assert_eq`, `assert_ne`, *Container Equality*); and the `Eq` supertrait that `@derive(Ord)` derives (§3.6.1 *Supertrait Auto-Derivation*).
+
+So in a module that declares `trait Eq`, `a == b` needs the compiler-known `Eq` for the type of `a`. A bound `T: Eq` names the local trait, so it does not make `==` legal on a `T`. An impl of one trait never satisfies a bound on the other. When a diagnostic names both traits, each prints as `Name (module)` (rule 3 of *Diagnostics that involve a shadowing name*): "`P` implements `Eq (blink.core)` but not `Eq (geo.sim)`".
+
+To name the compiler-known trait in a written position, import it under another name:
+
+```blink
+import blink.core.{Eq as CoreEq}
+
+trait Eq {
+    fn eq(self, other: Int) -> Bool
+}                                    // warning[W1010]
+
+@derive(CoreEq)
+type P {
+    x: Int
+}
+
+fn same[T: CoreEq](a: T, b: T) -> Bool {
+    a == b
+}
+
+fn main() {
+    assert(P { x: 1 } == P { x: 1 })
+    assert(same(P { x: 1 }, P { x: 1 }))
+}
+```
+
+**A shadow has module scope.** A shadow changes name lookup only in the module that declares it and in each module that imports that declaration. Every other module resolves the name to the compiler-known trait. A `trait Eq` in one module does not change what `Eq`, `==` or `@derive(Eq)` mean in a different module.
+
+**`@derive` takes compiler-known traits only.** The argument of `@derive` resolves by scope. When it does not denote one of the derivable compiler-known traits (§3.6.1) by identity, the compiler reports E1402 `NotDerivable`. This covers a local shadow and every other user trait. When the argument is a shadow, the error has the `note:` and `help:` lines of rule 2 of *Diagnostics that involve a shadowing name*, and the `help:` line also gives the new `@derive` argument:
+
+```blink
+trait Eq {
+    fn eq(self, other: Int) -> Bool
+}
+
+@derive(Eq)                          // error[NotDerivable]: see below
+type P {
+    x: Int
+}
+```
+
+```
+error[NotDerivable]: cannot derive `Eq`: it is not a compiler-known trait
+ --> geo/sim.bl:5:9
+  |
+5 | @derive(Eq)
+  |         ^^ `Eq` here is `trait Eq` (geo/sim.bl:1), a user trait
+  |
+  = note: @derive takes Eq, Ord, Hash, Clone, Display, Debug, Serialize, Deserialize (§3.6.1)
+  = note: `Eq` here is `trait Eq` (geo/sim.bl:1), which shadows the compiler-known `Eq` (blink.core)
+  = help: import blink.core.{Eq as CoreEq}
+          then write @derive(CoreEq)
+```
+
+**W1010 on a trait that a desugaring uses.** When the shadowed prelude trait is one that a desugaring uses (§3.4 *Hygiene*, and the *Used by* column of *Prelude Traits*), the W1010 warning adds one `note:` line. The note names the forms in this module that still use the compiler-known trait. The spec sets the content of the note, not its words. The list of forms comes from those two places only, so a new desugaring adds to the note with no change here. `@derive(X)` is never in the list, because its argument resolves by scope.
+
+```
+warning[W1010]: name shadows compiler-known trait
+ --> geo/sim.bl:1:7
+  |
+1 | trait Eq {
+  |       ^^ shadows compiler-known trait `Eq` (blink.core)
+  |
+  = note: `==`, `!=`, `assert_eq` and Map/Set keys in this module still use `Eq` (blink.core)
+  = help: to use the compiler-known trait in this module, import it under another name:
+          import blink.core.{Eq as CoreEq}
+```
+
 Keywords and the literals `true` and `false` cannot be shadowed, because a keyword cannot name a binding (§2.23).
 
 ### 10.7 Standard Library Resolution

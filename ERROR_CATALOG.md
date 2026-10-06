@@ -212,6 +212,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | RecursiveContractPredicate | E1309 | A contract predicate of fn `f` calls `f`, directly or through a cycle of contract predicates (body calls are not edges); the diagnostic prints the cycle | Refinement contracts | §3b.2 |
 | MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or a user type with no `Hash` impl, derived or written) | Generic collections | §3.6 |
 | NonDerivableTrait | E1401 | A `@derive(Hash/Eq/Ord)` field's type does not implement the derived trait | Generic collections | §3.6 |
+| NotDerivable | E1402 | A `@derive` argument does not denote a derivable compiler-known trait by identity (a user trait, or a local trait that shadows a prelude trait); help gives `import blink.core.{X as Y}` and `@derive(Y)` | Generic collections | §3.6.1, §10.6 |
 | ContractUnverifiable | V0003 | The solver can neither prove nor disprove a `@requires`/`@ensures`, and the fn has no `@verify(fallback: ...)` (for an impl method, neither its own nor the trait method's default) | Contract verification | §3b.4 |
 
 ---
