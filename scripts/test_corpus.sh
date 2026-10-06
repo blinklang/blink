@@ -34,13 +34,18 @@ if [ "$1" = "__build-compiler-archive" ]; then
     [ -n "${SELFTEST_ARCHIVE_FAIL:-}" ] && { echo "error: fake compiler archive failure" >&2; exit 1; }
     dir="$2"; shift 2
     mkdir -p "$dir" && : > "$dir/libblink_compiler.a" && echo "$*" > "$dir/roots"
+    # The archive's cc line passes -g as a --debug build does.
+    printf 'int f(void) { return 0; }\n' > "$dir/unit.c"
+    cc -pipe -g -O0 -DBLINK_DEBUG -c -o "$dir/unit.o" "$dir/unit.c" || exit 1
+    readelf -S "$dir/unit.o" > "$dir/unit.sections"
     exit 0
 fi
-out=""; src=""
+out=""; src=""; debug=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -o) out="$2"; shift 2 ;;
-        build|--debug) shift ;;
+        --debug) debug=1; shift ;;
+        build) shift ;;
         *) src="$1"; shift ;;
     esac
 done
@@ -70,6 +75,13 @@ elif grep -q SELFTEST_COMPILER_ARCHIVE "$src"; then
     # this fixture must be a real binary that defines it.
     printf 'void __blink_init_compiler_globals(void) {}\nint main(void) { __blink_init_compiler_globals(); return 0; }\n' > "$out.c"
     cc -o "$out" "$out.c" || exit 1
+elif grep -q SELFTEST_DEBUG_INFO "$src"; then
+    # The cc line `blink build --debug` runs. The row deletes the binary when
+    # it ends, so its section table is kept beside it.
+    [ "$debug" = 1 ] || { echo "error[E0000]: built without --debug"; exit 1; }
+    printf 'int main(void) { return 0; }\n' > "$out.c"
+    cc -pipe -g -O0 -DBLINK_DEBUG -o "$out" "$out.c" || exit 1
+    readelf -S "$out" > "$out.sections"
 else
     printf '#!/bin/sh\nexit 0\n' > "$out"
 fi
@@ -192,6 +204,34 @@ else
     echo "FAIL compiler-archive-summary: no summary line or JSON count of 1"
     sed 's/^/    /' "$WORK/out.log"
     fail=1
+fi
+
+# A row still builds with --debug, for debug_assert, but neither its binary
+# nor the compiler archive carries debug info: nothing in the corpus reads it,
+# and it costs cc and link time.
+echo '// SELFTEST_DEBUG_INFO' > "$R/tests/test_selftest_debug_info.bl"
+printf 'tests/test_selftest_debug_info.bl\n' > "$WORK/debug_info.txt"
+run_corpus --only "$WORK/debug_info.txt" --no-lint
+expect "debug-build" 0 $?
+sections="$R/build/corpus/work/test_selftest_debug_info/build/test_selftest_debug_info.sections"
+if [ ! -s "$sections" ]; then
+    echo "FAIL debug-build-no-debug-info: no section table at $sections"
+    fail=1
+elif grep -q '\.debug_info' "$sections"; then
+    echo "FAIL debug-build-no-debug-info: the row binary has a .debug_info section"
+    fail=1
+else
+    echo "PASS debug-build-no-debug-info"
+fi
+sections="$R/build/corpus/compiler_archive/unit.sections"
+if [ ! -s "$sections" ]; then
+    echo "FAIL compiler-archive-no-debug-info: no section table at $sections"
+    fail=1
+elif grep -q '\.debug_info' "$sections"; then
+    echo "FAIL compiler-archive-no-debug-info: the archive object has a .debug_info section"
+    fail=1
+else
+    echo "PASS compiler-archive-no-debug-info"
 fi
 
 # The run builds the compiler archive from the compiler binary's imports, and

@@ -23,6 +23,9 @@
 # Pass rule (same as `blink test` directory mode): build with --debug, then
 # run the binary; a file with test blocks and a `fn main(` runs with --test.
 # A file with no test blocks is a plain program: compile and run main.
+# The build runs with the cc corpus.sh makes first on PATH, which drops the -g
+# that --debug passes (see corpus.sh). The run keeps the real PATH, so a test
+# that runs a build of its own gets what a user's `blink build --debug` gets.
 #
 # Known failures: a test.failing row that still fails counts as a pass, so a
 # file whose only failing rows are known failures passes. The record carries
@@ -112,6 +115,11 @@ if [ ! -x "$work/build/blink" ]; then
 fi
 
 blink_bin="$(readlink -f "$work/build/blink")"
+ccdir="$root/build/corpus/cc"
+if [ ! -x "$ccdir/cc" ]; then
+    echo "corpus_one: no $ccdir/cc; scripts/corpus.sh makes it" >&2
+    exit 2
+fi
 build_log="$log_dir/$base.build.log"
 run_log="$log_dir/$base.run.log"
 : > "$run_log"
@@ -142,6 +150,7 @@ timed_out() {
     cd "$work" || exit 2
     unset BLINK_ROOT BLINK_BIN
     export BLINK_CACHE_DIR=""
+    export PATH="$ccdir:$PATH"
     timeout -k 10 "$build_timeout" "$blink_bin" build "tests/$base.bl" -o "build/$base" --debug
 ) > "$build_log" 2>&1
 build_rc=$?
