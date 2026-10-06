@@ -1,0 +1,68 @@
+import std.fs
+import compiler.{compile_to_program, load_phase, load_phase_begin, load_phase_check, load_phase_end, load_phase_keeps_gc_off}
+import diagnostics.{diag_reset}
+
+@ffi("GC_is_disabled", header: "gc.h")
+@trusted(audit: "Reads the collector's disable counter; takes no arguments and returns an int.")
+fn collector_disable_count() -> I32 ! FFI {}
+
+fn gc_off() -> Bool {
+    collector_disable_count() != 0
+}
+
+test "collection stays off for an AST up to the node bound and resumes past it" {
+    assert(load_phase_keeps_gc_off(0))
+    assert(load_phase_keeps_gc_off(300000))
+    assert(load_phase_keeps_gc_off(1000000))
+    assert(!load_phase_keeps_gc_off(1000001))
+}
+
+test "the load phase turns collection off and its end turns it back on" {
+    assert(!gc_off())
+    load_phase_begin()
+    assert(gc_off())
+    load_phase_check(1000)
+    assert(gc_off())
+    load_phase_end()
+    assert(!gc_off())
+}
+
+// A load phase that never reached its end must not leave the next one, or the rest of a
+// long-lived process such as the language server, with collection off.
+test "a second begin without an end still needs only one end" {
+    load_phase_begin()
+    load_phase_begin()
+    load_phase_end()
+    assert(!gc_off())
+    load_phase_end()
+    assert(!gc_off())
+}
+
+test "an AST past the bound turns collection back on before the phase ends" {
+    load_phase_begin()
+    load_phase_check(1000000)
+    assert(gc_off())
+    load_phase_check(1000001)
+    assert(!gc_off())
+    load_phase_end()
+    assert(!gc_off())
+}
+
+test "compiling a program leaves collection on" {
+    let path = "build/compiler_load_phase_gc_off.bl"
+    diag_reset()
+    write_file(path, "fn main() \{ io.println(\"hi\") \}\n")
+    let _ = compile_to_program(path, 1)
+    let _ = fs.delete(path)
+    assert(!gc_off())
+}
+
+test "a load phase that panics before its end leaves collection on" {
+    assert_panics {
+        with load_phase() {
+            let unread: List[Int] = []
+            let _ = unread.get(0).unwrap()
+        }
+    }
+    assert(!gc_off())
+}

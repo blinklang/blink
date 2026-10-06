@@ -30,6 +30,73 @@ import comment_attach.{attach_comments_pass}
 // overrides so the flag wins regardless of manifest configuration.
 pub let mut compiler_strict_struct_layout: Int = 0
 
+// Collections while modules load free almost nothing, since the AST they mark only grows,
+// so collection stays off from the first lex until every module is parsed. Past this many
+// AST nodes it comes back on, so the garbage the lexer and parser leave stays bounded on a
+// very large input. The compiler itself loads about 300k.
+let LOAD_PHASE_GC_OFF_MAX_NODES: Int = 1000000
+
+@ffi("GC_disable", header: "gc.h")
+@trusted(audit: "Increments the collector's disable counter; takes and returns nothing. load_phase_begin holds at most one.")
+fn gc_disable() ! FFI {}
+
+@ffi("GC_enable", header: "gc.h")
+@trusted(audit: "Decrements the collector's disable counter; takes and returns nothing. load_phase_end calls it only while the counter is held.")
+fn gc_enable() ! FFI {}
+
+@ffi("GC_is_disabled", header: "gc.h")
+@trusted(audit: "Reads the collector's disable counter; takes no arguments and returns an int.")
+fn gc_is_disabled() -> I32 ! FFI {}
+
+pub fn load_phase_keeps_gc_off(nodes: Int) -> Bool {
+    nodes <= LOAD_PHASE_GC_OFF_MAX_NODES
+}
+
+// Nothing else in the compiler turns collection off, so the collector's own counter says
+// whether a phase holds it. A phase that never reached its end leaves one disable behind,
+// and the next begin reuses it instead of stacking a second.
+pub fn load_phase_begin() {
+    if gc_is_disabled() == 0 {
+        gc_disable()
+    }
+}
+
+// Called before each module is lexed, with the nodes parsed so far.
+pub fn load_phase_check(nodes: Int) {
+    if !load_phase_keeps_gc_off(nodes) {
+        load_phase_end()
+    }
+}
+
+pub fn load_phase_end() {
+    if gc_is_disabled() != 0 {
+        gc_enable()
+    }
+}
+
+// Holds the load phase for one `with` scope, so a panic that unwinds out of the scope cannot
+// leave collection off in a process that goes on compiling. `held` is never read: a type with
+// no fields does not yet lower to valid C.
+pub type LoadPhase {
+    held: Bool
+}
+
+impl BlockHandler for LoadPhase {
+    type Context = Void
+    fn enter(self) -> Void {
+        let _ = self
+        load_phase_begin()
+    }
+    fn exit(self, ok: Bool) {
+        let _ = ok
+        load_phase_end()
+    }
+}
+
+pub fn load_phase() -> LoadPhase {
+    LoadPhase { held: true }
+}
+
 pub fn set_strict_struct_layout(flag: Int) {
     compiler_strict_struct_layout = flag
 }
@@ -91,20 +158,23 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
     diag_source_file = file_path
 
     let source = read_file(file_path)
-    lex(source)
-    let first_node = node_count()
-    let program = parse_program()
-    attach_comments_pass(program, first_node)
-    loaded_files.push(file_path)
-
-    reject_empty_module_annotation(program)
-
+    let mut program = 0
     let mut imported_programs: List[Int] = []
-    collect_root_imports(program)
-    current_import_file = file_path
-    collect_imports(program, src_root, imported_programs)
-    if use_prelude != 0 {
-        inject_prelude(src_root, imported_programs)
+    with load_phase() {
+        lex(source)
+        let first_node = node_count()
+        program = parse_program()
+        attach_comments_pass(program, first_node)
+        loaded_files.push(file_path)
+
+        reject_empty_module_annotation(program)
+
+        collect_root_imports(program)
+        current_import_file = file_path
+        collect_imports(program, src_root, imported_programs)
+        if use_prelude != 0 {
+            inject_prelude(src_root, imported_programs)
+        }
     }
     build_reexport_map(imported_programs)
 
@@ -1122,6 +1192,7 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
     } else {
         source = read_file(file_path)
     }
+    load_phase_check(node_count())
     lex(source)
     pos = 0
     let first_imp_node = node_count()
