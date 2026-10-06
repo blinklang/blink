@@ -154,6 +154,49 @@ expect "only-compile-fail" 1 $?
 run_corpus --no-lint
 expect "full-run-with-failure" 0 $?
 
+# Instructions and CPU time come from perf stat. A fake perf pins the parse;
+# a perf that is missing, denied or unreadable must leave the result and the
+# exit code as they are, with the fields null.
+cat > "$WORK/fake_perf" <<"FEOF"
+#!/bin/bash
+[ "${FAKE_PERF_MODE:-}" = deny ] && exit 255
+out=/dev/null
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+if [ "${FAKE_PERF_MODE:-}" = uncounted ]; then
+    printf "<not counted>,,instructions:u,0,0.00,,\n<not supported>,msec,task-clock:u,0,0.00,,\n" > "$out"
+else
+    printf "# started on now\n\n2500000000,,instructions:u,1,100.00,,\n4500.50,msec,task-clock:u,1,100.00,,\n" > "$out"
+fi
+"$@"
+FEOF
+chmod +x "$WORK/fake_perf"
+perf_case() {
+    name="$1"; mode="$2"; perf="$3"; ins="$4"; cpu="$5"; note="$6"
+    (cd "$R" && PERF="$perf" FAKE_PERF_MODE="$mode" CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/run_fail.txt" --no-lint) > "$WORK/out.log" 2>&1
+    got=$?
+    gi=$(jq -c .instructions_u "$R/build/corpus_subset.json" 2>/dev/null)
+    gc=$(jq -c .cpu_seconds "$R/build/corpus_subset.json" 2>/dev/null)
+    gp=$(jq -r "\"\(.passed)/\(.total)\"" "$R/build/corpus_subset.json" 2>/dev/null)
+    if [ "$got" -eq 1 ] && [ "$gp" = "1/2" ] && [ "$gi" = "$ins" ] && [ "$gc" = "$cpu" ] \
+            && grep -qF "passed in" "$WORK/out.log" && grep -qF "($note)" "$WORK/out.log"; then
+        echo "PASS perf-$name: exit $got, instructions_u $gi, cpu_seconds $gc"
+    else
+        echo "FAIL perf-$name: exit $got, passed $gp, instructions_u $gi, cpu_seconds $gc"
+        sed "s/^/    /" "$WORK/out.log"
+        fail=1
+    fi
+}
+perf_case parsed ok "$WORK/fake_perf" 2500000000 4.50 "cpu 4.50s, 2.50 G instructions"
+perf_case missing ok "$WORK/no_such_perf" null null "perf n/a"
+perf_case denied deny "$WORK/fake_perf" null null "perf n/a"
+perf_case unreadable uncounted "$WORK/fake_perf" null null "perf n/a"
+
 (cd "$R" && CORPUS_COMPILER=missing ./scripts/corpus.sh --only "$WORK/all_pass.txt" --no-lint) > "$WORK/out.log" 2>&1
 expect "no-compiler" 2 $?
 
