@@ -194,12 +194,18 @@ fn parse_string(s: Str, start: Int) {
                     p = p + 6
                 }
             } else {
-                result = result.concat(s.substring(p, 1))
+                result = result.concat(s.byte_slice(p, p + 1))
                 p = p + 1
             }
         } else {
-            result = result.concat(s.substring(p, 1))
+            // Copy up to the next quote or backslash in one piece, so a multi-byte codepoint
+            // is never cut.
+            let run = p
             p = p + 1
+            while p < s.len() && peek(s, p) != CH_DQUOTE && peek(s, p) != CH_BACKSLASH {
+                p = p + 1
+            }
+            result = result.concat(s.byte_slice(run, p))
         }
     }
     tmp_str = result
@@ -243,7 +249,7 @@ fn parse_number(s: Str, start: Int) {
         }
     }
 
-    let num_str = s.substring(start, p - start)
+    let num_str = s.byte_slice(start, p)
     tmp_pos = p
 
     if is_float == 1 {
@@ -321,6 +327,18 @@ fn parse_float_val(s: Str) -> Float {
     result
 }
 
+// Compares bytes, so a codepoint that straddles the end of the word reads as a mismatch
+// instead of a cut.
+fn word_at(s: Str, p: Int, word: Str) -> Bool {
+    if p + word.len() > s.len() { return false }
+    let mut k = 0
+    while k < word.len() {
+        if s.byte_at(p + k) != word.byte_at(k) { return false }
+        k = k + 1
+    }
+    true
+}
+
 // ── Forward declaration workaround ─────────────────────────────────
 // Blink doesn't have forward declarations. We use a dispatch pattern
 // where json_parse_value is defined before parse_array/parse_object call it.
@@ -347,7 +365,7 @@ fn json_parse_value(s: Str, cursor: Int, parent: Int, key: Str) -> Int {
     // Number
     if is_digit(c) || c == CH_MINUS {
         parse_number(s, p)
-        let num_str = s.substring(p, tmp_pos - p)
+        let num_str = s.byte_slice(p, tmp_pos)
         // Check if float
         let mut has_dot = 0
         let mut ci = 0
@@ -370,7 +388,7 @@ fn json_parse_value(s: Str, cursor: Int, parent: Int, key: Str) -> Int {
     }
 
     // true
-    if c == CH_t && p + 4 <= s.len() && s.substring(p, 4) == "true" {
+    if c == CH_t && word_at(s, p, "true") {
         tmp_pos = p + 4
         let idx = alloc_node(JSON_BOOL, parent, key)
         json_bool_vals.set(idx, 1)
@@ -378,7 +396,7 @@ fn json_parse_value(s: Str, cursor: Int, parent: Int, key: Str) -> Int {
     }
 
     // false
-    if c == CH_f && p + 5 <= s.len() && s.substring(p, 5) == "false" {
+    if c == CH_f && word_at(s, p, "false") {
         tmp_pos = p + 5
         let idx = alloc_node(JSON_BOOL, parent, key)
         json_bool_vals.set(idx, 0)
@@ -386,7 +404,7 @@ fn json_parse_value(s: Str, cursor: Int, parent: Int, key: Str) -> Int {
     }
 
     // null
-    if c == CH_n && p + 4 <= s.len() && s.substring(p, 4) == "null" {
+    if c == CH_n && word_at(s, p, "null") {
         tmp_pos = p + 4
         let idx = alloc_node(JSON_NULL, parent, key)
         return idx
@@ -644,24 +662,33 @@ pub fn json_obj_child_at(parent: Int, i: Int) -> Int {
 
 fn escape_json_str(s: Str) -> Str {
     let sb = StringBuilder.new()
+    // Unescaped bytes are copied a run at a time: a run ends only at an ASCII byte, so it
+    // never cuts a multi-byte codepoint.
+    let mut run = 0
     let mut i = 0
     while i < s.len() {
         let c = s.byte_at(i)
-        if c == CH_DQUOTE {
-            sb.write("\\\"")
+        let esc = if c == CH_DQUOTE {
+            "\\\""
         } else if c == CH_BACKSLASH {
-            sb.write("\\\\")
+            "\\\\"
         } else if c == CH_NEWLINE {
-            sb.write("\\n")
+            "\\n"
         } else if c == CH_TAB {
-            sb.write("\\t")
+            "\\t"
         } else if c == CH_CR {
-            sb.write("\\r")
+            "\\r"
         } else {
-            sb.write(s.substring(i, 1))
+            ""
+        }
+        if esc != "" {
+            sb.write(s.byte_slice(run, i))
+            sb.write(esc)
+            run = i + 1
         }
         i = i + 1
     }
+    sb.write(s.byte_slice(run, s.len()))
     sb.to_str()
 }
 

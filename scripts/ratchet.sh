@@ -60,6 +60,11 @@
 #                            `parser.nodes`. A historical ref is
 #                            materialized with src/ alone, so its count leaves out
 #                            lib/ and tests/; the zero gate still holds the tree
+#   str_substring_callers    a `.substring(` or `.substr(` call anywhere in src/;
+#                            absolute zero gate. src/ reads text by byte offset,
+#                            which Str.byte_slice names. Str.slice is the same
+#                            debt but is not counted: the text alone cannot tell
+#                            it from List.slice and Bytes.slice
 #
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
 # lint over the rewrite's files, and fails if that fails. RATCHET_NO_LINT=1
@@ -191,6 +196,7 @@ cg_name_string_compares $(cnt '\b[a-z_0-9]*(method|name|trait)[a-z_0-9]*(\([^()]
 fallback_idiom $(pcnt 'if ([a-z_][a-z_0-9.]*) >= 0 \{ \1 \} else' "$allbl")
 typecheck_str_keyed_tables $(cnt '^(pub )?let mut [A-Za-z_][A-Za-z_0-9]*: Map\[Str' "$tcbl")
 node_pool_writes $(pool_writes "$root")
+str_substring_callers $(cnt '\.(substring|substr)\(' "$allbl")
 ROWS
 }
 
@@ -294,7 +300,7 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   # Absolute zero gates: an id means nothing to another reader or to training
   # data, and a swallowed decline is a wrong answer waiting to be found.
   case "$name" in
-    br_ids_in_source|layout_decline_unhandled|node_pool_writes)
+    br_ids_in_source|layout_decline_unhandled|node_pool_writes|str_substring_callers)
       [ "$now" -gt 0 ] && mark="$mark NONZERO(must-be-zero)" ;;
   esac
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"

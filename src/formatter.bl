@@ -255,14 +255,20 @@ fn format_pattern(node: Int) -> Str {
 
 // ── Expression formatting ───────────────────────────────────────────
 
+// Mirrors the parser's precedence chain (parse_nullcoalesce down to parse_multiplicative).
+// Every level there is left-associative, so a right operand at the same level needs parens.
 fn op_precedence(op: Str) -> Int {
-    if op == "||" { return 1 }
-    if op == "&&" { return 2 }
-    if op == "==" || op == "!=" { return 3 }
-    if op == "<" || op == ">" || op == "<=" || op == ">=" { return 4 }
-    if op == "??" { return 5 }
-    if op == "+" || op == "-" { return 6 }
-    if op == "*" || op == "/" || op == "%" { return 7 }
+    if op == "??" { return 1 }
+    if op == "||" { return 2 }
+    if op == "&&" { return 3 }
+    if op == "|" { return 4 }
+    if op == "^" { return 5 }
+    if op == "&" { return 6 }
+    if op == "==" || op == "!=" { return 7 }
+    if op == "<" || op == ">" || op == "<=" || op == ">=" { return 8 }
+    if op == "+" || op == "-" { return 9 }
+    if op == "<<" || op == ">>" { return 10 }
+    if op == "*" || op == "/" || op == "%" { return 11 }
     0
 }
 
@@ -274,9 +280,19 @@ fn is_stmt_leading_form(node: Int) -> Bool {
     kind == NodeKind.IfExpr || kind == NodeKind.MatchExpr || kind == NodeKind.WithBlock
 }
 
+// A postfix operator binds tighter than any prefix or binary operator or a range, so those
+// forms keep their parens when they are the operand of `.`, `[]`, a call or `?`.
+fn binds_looser_than_postfix(node: Int) -> Bool {
+    let kind = node_kind(node)
+    if kind == NodeKind.UnaryOp {
+        return node_op(node) != "?"
+    }
+    kind == NodeKind.BinOp || kind == NodeKind.RangeLit
+}
+
 fn left_spine_text(node: Int) -> Str {
     let s = format_expr(node)
-    if is_stmt_leading_form(node) {
+    if is_stmt_leading_form(node) || binds_looser_than_postfix(node) {
         return "(".concat(s).concat(")")
     }
     s
@@ -572,26 +588,35 @@ pub fn format_expr(node: Int) -> Str {
 
 fn fmt_escape_str_literal(s: Str) -> Str {
     let mut sb = StringBuilder.new()
+    // Unescaped bytes are copied a run at a time: a run ends only at an ASCII byte, so it
+    // never cuts a multi-byte codepoint.
+    let mut run = 0
     let mut i = 0
     while i < s.len() {
         let ch = s.byte_at(i)
-        if ch == 92 {
-            sb.write("\\\\")
+        let esc = if ch == 92 {
+            "\\\\"
         } else if ch == 34 {
-            sb.write("\\\"")
+            "\\\""
         } else if ch == 10 {
-            sb.write("\\n")
+            "\\n"
         } else if ch == 9 {
-            sb.write("\\t")
+            "\\t"
         } else if ch == 123 {
-            sb.write("\\\{")
+            "\\\{"
         } else if ch == 125 {
-            sb.write("\\}")
+            "\\}"
         } else {
-            sb.write(s.substring(i, 1))
+            ""
+        }
+        if esc != "" {
+            sb.write(s.byte_slice(run, i))
+            sb.write(esc)
+            run = i + 1
         }
         i = i + 1
     }
+    sb.write(s.byte_slice(run, s.len()))
     sb.to_str()
 }
 
@@ -1336,7 +1361,7 @@ fn emit_text_with_holes(text: Str, holes: List[Int], prefix: Str, suffix: Str, w
 fn fmt_pop_last_line() -> Str ! Format.Emit {
     let pad_len = fmt_indent * 4
     let last = fmt_lines.pop().unwrap()
-    last.substring(pad_len, last.len() - pad_len)
+    last.byte_slice(pad_len, last.len())
 }
 
 // A header such as `if cond {` holds its expression on one line unless a form inside the
@@ -1505,7 +1530,7 @@ fn emit_comments(node: Int) ! Format.Emit {
         let mut _line_start = 0
         while i <= doc.len() {
             if i == doc.len() || doc.byte_at(i) == 10 {
-                let line = doc.substring(_line_start, i - _line_start)
+                let line = doc.byte_slice(_line_start, i)
                 fmt_emit("///".concat(line))
                 _line_start = i + 1
             }
@@ -1518,7 +1543,7 @@ fn emit_comments(node: Int) ! Format.Emit {
         let mut _line_start = 0
         while i <= leading.len() {
             if i == leading.len() || leading.byte_at(i) == 10 {
-                let line = leading.substring(_line_start, i - _line_start)
+                let line = leading.byte_slice(_line_start, i)
                 fmt_emit("//".concat(line))
                 _line_start = i + 1
             }
@@ -1545,7 +1570,7 @@ fn emit_trailing_comments_block(node: Int) ! Format.Emit {
         let mut _line_start = 0
         while i <= trailing.len() {
             if i == trailing.len() || trailing.byte_at(i) == 10 {
-                let line = trailing.substring(_line_start, i - _line_start)
+                let line = trailing.byte_slice(_line_start, i)
                 fmt_emit("//".concat(line))
                 _line_start = i + 1
             }

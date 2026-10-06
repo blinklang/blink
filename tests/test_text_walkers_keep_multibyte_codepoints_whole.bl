@@ -1,0 +1,70 @@
+import std.json.{json_clear, json_parse, json_as_str, json_new_str, json_serialize}
+import std.toml.{toml_clear, toml_parse, toml_get}
+import std.str.{json_escape_str, str_from_code_point}
+import std.term
+import std.http_types.{Request, Response, response_ok}
+import std.http_server.{server_new, server_get, match_route}
+
+// Each walker below scans bytes for ASCII delimiters. Text between delimiters holds 2-, 3- and
+// 4-byte codepoints, which a copy of one byte at a time would cut.
+let MIXED = "aé€😀b"
+
+test "json parse keeps multi-byte text whole" {
+    json_clear()
+    let idx = json_parse("\"x{MIXED}\\n{MIXED}\"")
+    assert_eq(json_as_str(idx), "x{MIXED}\n{MIXED}")
+}
+
+test "json parse keeps a multi-byte codepoint after an escape" {
+    json_clear()
+    let idx = json_parse("\"\\t😀\"")
+    assert_eq(json_as_str(idx), "\t😀")
+}
+
+test "json serialize keeps multi-byte text whole" {
+    json_clear()
+    let idx = json_new_str("{MIXED}\"{MIXED}")
+    assert_eq(json_serialize(idx), "\"{MIXED}\\\"{MIXED}\"")
+}
+
+test "json_escape_str keeps multi-byte text whole" {
+    assert_eq(json_escape_str("{MIXED}\n{MIXED}"), "\"{MIXED}\\n{MIXED}\"")
+}
+
+test "toml quoted value keeps multi-byte text whole" {
+    toml_clear()
+    toml_parse("name = \"{MIXED}\\t{MIXED}\"\n")
+    assert_eq(toml_get("name"), "{MIXED}\t{MIXED}")
+}
+
+test "strip_ansi keeps multi-byte text whole" {
+    let e = str_from_code_point(27)
+    assert_eq(term.strip_ansi("{e}[31m{MIXED}{e}[0m{MIXED}"), "{MIXED}{MIXED}")
+}
+
+test "route matching keeps multi-byte path segments whole" {
+    let mut srv = server_new("127.0.0.1", 8080)
+    srv = server_get(srv, "/café/:name", fn(_req: Request) -> Response { response_ok("ok") })
+    let r = match_route(srv, "GET", "/café/{MIXED}")
+    assert(r.index >= 0)
+    assert_eq(r.param_values.get(0).unwrap(), MIXED)
+}
+
+// A keyword compare must read a multi-byte codepoint that straddles the keyword end as a
+// mismatch, not cut it.
+test "json parse rejects a keyword whose last letter is a multi-byte codepoint" {
+    json_clear()
+    assert_eq(json_parse("tru€"), -1)
+    json_clear()
+    assert_eq(json_parse("fals😀"), -1)
+    json_clear()
+    assert_eq(json_parse("nulé"), -1)
+}
+
+test "toml skips a bool whose last letter is a multi-byte codepoint" {
+    toml_clear()
+    toml_parse("a = tru€\nb = fals😀\nc = true\n")
+    assert_eq(toml_get("a"), "")
+    assert_eq(toml_get("b"), "")
+    assert_eq(toml_get("c"), "1")
+}

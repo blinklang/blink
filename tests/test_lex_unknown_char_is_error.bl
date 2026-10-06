@@ -9,6 +9,7 @@
 // flake noise correlated with the running test (br 437zzt).
 
 import compile_test_helpers
+import std.process.{ProcessResult}
 
 test "stray semicolon emits E1113" {
     let src = "fn main() \{\n  let x = 3\n  io.println(\"v=\{x\}\");\n\}\n"
@@ -32,4 +33,82 @@ test "blink check refuses a stray semicolon" {
     assert(result.exit_code != 0)
     assert(!result.out.contains("ok:"))
     shell_exec("rm -f {fixture}")
+}
+
+fn count_of(s: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut from = 0
+    loop {
+        match s.byte_index_of(needle, from) {
+            Some(at) => {
+                n = n + 1
+                from = at + needle.len()
+            }
+            None => { break }
+        }
+    }
+    n
+}
+
+// A non-ASCII stray character is reported once, whole, not as one diagnostic per byte.
+test "a multi-byte stray character emits E1113 naming the whole character" {
+    let src = "fn main() \{\n  let x = 3 é\n  let y = 3 €\n  let z = 3 😀\n\}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "lex_multibyte_stray")
+    compile_test_helpers.expect_error(output, "E1113", "multi-byte stray char is E1113")
+    compile_test_helpers.expect_contains(output, "unexpected character `é` (U+00E9)", "names a 2-byte character")
+    compile_test_helpers.expect_contains(output, "unexpected character `€` (U+20AC)", "names a 3-byte character")
+    compile_test_helpers.expect_contains(output, "unexpected character `😀` (U+1F600)", "names a 4-byte character")
+    assert_eq(count_of(output, "unexpected character"), 3)
+}
+
+test "an unknown escape before a multi-byte character does not stop the compile" {
+    let src = "fn main() \{\n  io.println(\"a\\é€😀b\")\n\}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "lex_multibyte_escape")
+    assert(!output.contains("inside a codepoint"))
+    compile_test_helpers.expect_compiles_clean(output, "unknown multi-byte escape compiles")
+}
+
+test "an unknown escape names a 2-, 3- or 4-byte character once" {
+    let src = "fn main() \{\n  io.println(\"\\é\\€\\😀\")\n\}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "lex_multibyte_escape_names")
+    compile_test_helpers.expect_contains(output, "'\\é' (U+00E9)", "names a 2-byte escape")
+    compile_test_helpers.expect_contains(output, "'\\€' (U+20AC)", "names a 3-byte escape")
+    compile_test_helpers.expect_contains(output, "'\\😀' (U+1F600)", "names a 4-byte escape")
+    assert_eq(count_of(output, "unknown escape sequence"), 3)
+}
+
+// A Blink string literal cannot hold a byte that is not UTF-8, so these rows write the
+// fixture with printf octal escapes (\351 is 0xE9, \251 is 0xA9, \047 is a single quote).
+fn check_bytes(tag: Str, printf_body: Str) -> ProcessResult {
+    let fixture = ".tmp/_test_lex_{tag}_{getpid()}.bl"
+    shell_exec("printf '{printf_body}' > {fixture}")
+    let result = process_run("build/blink", ["check", fixture])
+    shell_exec("rm -f {fixture}")
+    result
+}
+
+test "a stray byte that is not UTF-8 is one E1113 and does not swallow the next line" {
+    let result = check_bytes("bad_byte", "fn main() \{\\n  let x = 1 \\351\\n  let _y = x\\n\}\\n")
+    let output = "{result.out}{result.err_out}"
+    assert(result.exit_code != 0)
+    assert(!output.contains("inside a codepoint"))
+    assert(output.contains("unexpected character `\\xE9`"))
+    assert(output.contains("1 error(s) found"))
+}
+
+test "a byte that is not UTF-8 inside a string literal is E1113, not a crash" {
+    let result = check_bytes("bad_str", "fn main() \{\\n  let s = \"\\251a\\351b\"\\n  let _k = s\\n\}\\n")
+    let output = "{result.out}{result.err_out}"
+    assert(result.exit_code != 0)
+    assert(!output.contains("inside a codepoint"))
+    assert(output.contains("unexpected character `\\xA9` in string literal"))
+    assert(output.contains("unexpected character `\\xE9` in string literal"))
+}
+
+test "a byte that is not UTF-8 after a backslash does not crash the lexer" {
+    let result = check_bytes("bad_esc", "fn main() \{\\n  let _c = \\047\\\\\\251\\047\\n  let _s = \"a\\\\\\351b\"\\n\}\\n")
+    let output = "{result.out}{result.err_out}"
+    assert(!output.contains("inside a codepoint"))
+    assert(output.contains("\\xA9"))
+    assert(output.contains("\\xE9"))
 }

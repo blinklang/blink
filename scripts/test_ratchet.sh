@@ -195,6 +195,12 @@ check_named_row fallback_idiom escape.bl \
 check_named_row fallback_idiom cg_eff.bl \
   'let fwd = if th.forward_to >= 0 { th.forward_to } else { 0 }'
 
+# Both spellings of the old offset read count, in any src/ file.
+check_named_row str_substring_callers lexer.bl \
+  'let word = source.substring(start, scan_pos - start)'
+check_named_row str_substring_callers typecheck.bl \
+  'let head = name.substr(0, dot)'
+
 # A branch on one value that answers with another is not the idiom: the row
 # needs the same name on both sides, or it counts every signed compare.
 NOFALLBACK="$WORK/no_fallback"
