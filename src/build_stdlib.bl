@@ -18,28 +18,10 @@ import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import escape.{analyze_escapes}
 import mono.{run_mono}
 import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
-import cli.{resolve_install_root, run_cc, sha256_of_file_first, process_blinkc_sha, blink_cli_version}
+import cli.{resolve_install_root, run_cc, sha256_of_file_first, process_compiler_sha, blink_cli_version}
 import stdlib_native_deps.{peeled_module_keys, peeled_module_dotted, peeled_module_underscored}
-import std_cache_key.{compute_cache_key}
+import std_cache_key.{compute_cache_key, archive_compiler_path}
 import std.path.{path_join}
-
-fn resolve_under_root(rel: Str) -> Str {
-    let blink_root = env.var("BLINK_ROOT") ?? ""
-    if blink_root != "" {
-        let p = path_join(blink_root, rel)
-        if file_exists(p) == 1 {
-            return p
-        }
-    }
-    if file_exists(rel) == 1 {
-        return rel
-    }
-    ""
-}
-
-pub fn resolve_blinkc_path() -> Str {
-    resolve_under_root("build/blinkc")
-}
 
 pub fn resolve_runtime_h() -> Str {
     let blink_root = env.var("BLINK_ROOT") ?? ""
@@ -154,10 +136,10 @@ fn synthesize_entry_source(modules: List[Str]) -> Str {
     sb.to_str()
 }
 
-fn build_manifest(blinkc: Str, std_dir: Str, modules: List[Str], rt_path: Str, peeled: List[Str]) -> Str {
+fn build_manifest(compiler: Str, std_dir: Str, modules: List[Str], rt_path: Str, peeled: List[Str]) -> Str {
     let mut sb = StringBuilder.new()
-    sb.write("blinkc-path:")
-    sb.write(blinkc)
+    sb.write("compiler-path:")
+    sb.write(compiler)
     sb.write("\n")
     sb.write("std-dir:")
     sb.write(std_dir)
@@ -230,7 +212,11 @@ fn bail_on_diag() -> Int ! Diag.Report {
 }
 
 pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
-    let blinkc = resolve_blinkc_path()
+    let compiler = archive_compiler_path()
+    if compiler == "" {
+        io.eprintln("error: cannot locate the running compiler binary, which the stdlib-archive cache key must hash")
+        return 1
+    }
     let std_dir = resolve_stdlib_dir()
     let rt_path_final = resolve_runtime_h()
     if rt_path_final == "" {
@@ -251,8 +237,8 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
         if !peeled_set.contains(m) { modules.push(m) }
         mi = mi + 1
     }
-    let manifest = build_manifest(blinkc, std_dir, modules, rt_path_final, peeled)
-    let hash = compute_cache_key(blinkc, std_dir, rt_path_final, manifest)
+    let manifest = build_manifest(compiler, std_dir, modules, rt_path_final, peeled)
+    let hash = compute_cache_key(compiler, std_dir, rt_path_final, manifest)
     if hash == "" {
         io.eprintln("error: failed to compute stdlib-archive cache key")
         return 1
@@ -323,7 +309,7 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
 }
 
 // Compatibility identity for the built archive: runtime.h SHA + the archive
-// header (libblink_std.h) SHA + blinkc SHA + the CLI version. These are the
+// header (libblink_std.h) SHA + compiler SHA + the CLI version. These are the
 // same inputs the std-cache hash already covers, so a dev build is
 // self-consistent by construction. The stamp exists so an *installed* archive
 // (copied out of the cache dir, losing the hash-named directory) can still be
@@ -334,12 +320,12 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
 // layouts; libblink_std.h carries the stdlib struct typedefs (e.g. db Row,
 // std.args.* — emitted by codegen, so they can diverge when codegen changes
 // even if runtime.h is byte-identical). The user TU `#include`s both, so the
-// verify side gates on both SHAs. blinkc SHA is recorded for forensics but
-// not re-checked (an installed tree ships no blinkc to hash).
+// verify side gates on both SHAs. The compiler SHA is recorded for forensics
+// but not re-checked.
 fn archive_id_string(rt_path: Str, hdr_path: Str) -> Str {
     let rt_sha = sha256_of_file_first(rt_path)
     let hdr_sha = sha256_of_file_first(hdr_path)
-    let bc_sha = process_blinkc_sha()
+    let bc_sha = process_compiler_sha()
     "{rt_sha}|{hdr_sha}|{bc_sha}|{blink_cli_version}"
 }
 

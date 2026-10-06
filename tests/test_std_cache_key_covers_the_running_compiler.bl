@@ -1,0 +1,48 @@
+// The stdlib archive's C is emitted in-process by the running compiler, so the archive cache
+// key must hash that binary. A key that hashed some other file would stay the same across a
+// compiler rebuild and link a new program against an archive emitted by the old compiler.
+//
+// The test runs copies of its own binary: each copy computes the key as the running
+// compiler. Two copies at one path that differ by one byte must get different keys.
+
+import std_cache_key.{compute_cache_key, archive_compiler_path}
+
+let DIR = "build/std_cache_key_running_compiler_probe"
+let OUT_VAR = "BLINK_STD_CACHE_KEY_PROBE_OUT"
+
+fn probe_key() -> Str {
+    compute_cache_key(archive_compiler_path(), DIR, "{DIR}/runtime.h", "manifest\n")
+}
+
+fn key_from(exe: Str) -> Str {
+    let out = "{DIR}/key.txt"
+    shell_exec("rm -f {out}")
+    let rc = shell_exec("{OUT_VAR}={out} {exe} >/dev/null 2>&1")
+    assert_eq(rc, 0)
+    read_file(out)
+}
+
+test "the cache key changes when the running compiler binary changes" {
+    let probe_out = env.var(OUT_VAR) ?? ""
+    if probe_out != "" {
+        write_file(probe_out, probe_key())
+    } else {
+        shell_exec("rm -rf {DIR} && mkdir -p {DIR}")
+        write_file("{DIR}/runtime.h", "int blink_part(void);\n")
+        let exe = "{DIR}/compiler"
+        assert_eq(shell_exec("cp /proc/{getpid()}/exe {exe}"), 0)
+        let before = key_from(exe)
+        assert_eq(shell_exec("printf x >> {exe}"), 0)
+        let after = key_from(exe)
+        let again = key_from(exe)
+        shell_exec("rm -rf {DIR}")
+        assert(before != "")
+        assert(before != after)
+        assert_eq(after, again)
+    }
+}
+
+test "the cache key is empty when the compiler binary is missing" {
+    assert_eq(compute_cache_key("{DIR}_missing/compiler", DIR, "", "manifest\n"), "")
+    assert_eq(compute_cache_key("", DIR, "", "manifest\n"), "")
+}
