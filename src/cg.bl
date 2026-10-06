@@ -25,7 +25,7 @@ import parser.{
 }
 import layout.{Position, layout_of, layout_reset, set_current_inst, layout_take_typedefs}
 import cg_print.{
-    print_fn, print_fn_decl, print_include, print_main_shim, print_reset, print_scope_restore_support,
+    print_ev_default_decl, print_ev_storage, print_fn, print_fn_decl, print_include, print_main_shim, print_reset, print_scope_restore_support,
     print_take, print_test_fn, print_test_table, print_typedef_blocks,
 }
 import cg_reg.{
@@ -34,7 +34,7 @@ import cg_reg.{
     cg_reg_test_decls, cg_reg_type_decls,
 }
 import cg_decl.{
-    BodySite, cg_decl_body_site, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_ev, cg_decl_emit_ev_typedef,
+    BodySite, cg_decl_body_site, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_ev, cg_decl_emit_ev_owned_by_archive, cg_decl_emit_ev_typedef,
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_foreign_wrapper,
     cg_decl_emit_impl_method_decl,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
@@ -99,9 +99,10 @@ pub type CgConfig {
     // The archive being built is linked beside the stdlib archive, which defines the
     // runtime's storage and every std module this archive skips.
     archive_over_std: Int
-    // This user unit links the archive layered over the stdlib archive, so it reads that
-    // archive's header and runs its globals init.
-    links_compiler_archive: Int
+    // The modules of the archive layered over the stdlib archive, when this user unit links
+    // it: the unit reads that archive's header and runs its globals init. Empty when the
+    // unit links no such archive.
+    compiler_archive_modules: Map[Str, Int]
 }
 
 
@@ -138,10 +139,30 @@ fn instance_rows_of(decl: Int) -> List[Int] {
 // A declaration node belongs to no instance, so reading one while an instance is current
 // is refused rather than answered. Every walk over declarations therefore starts from the
 // root, whatever the walk before it left current.
-fn emit_root_signatures(decls: List[Int], methods: List[Int]) ! Diag.Report {
+fn emit_root_signatures(cfg: CgConfig, decls: List[Int], methods: List[Int]) ! Diag.Report {
     set_current_inst(-1)
-    for f in decls { cg_decl_emit_fn_decl(f, false) }
-    for m in methods { cg_decl_emit_impl_method_decl(m, false) }
+    for f in decls { cg_decl_emit_fn_decl(f, is_archive_private_copy(cfg, f)) }
+    for m in methods { cg_decl_emit_impl_method_decl(m, is_archive_private_copy(cfg, m)) }
+}
+
+// A std function that takes the evidence vector, written into the archive layered over the
+// stdlib archive. The stdlib archive does not hold it, since it does not define the vector
+// such a signature names. The layered archive is one object, so every symbol its bodies call
+// must resolve even in a program whose own graph never reaches that std function: the
+// archive writes its own copy. A program that calls the function writes another, so the
+// archive's copy is internal.
+fn is_archive_private_copy(cfg: CgConfig, decl: Int) -> Bool {
+    cfg.archive_over_std != 0 && cfg.skip_modules.contains_key(cg_reg_module_of(decl)) && cg_decl_takes_ev(decl)
+}
+
+// A header offers what other units may call, and an internal copy is not callable from
+// outside its unit.
+fn without_private_copies(cfg: CgConfig, decls: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for d in decls {
+        if !is_archive_private_copy(cfg, d) { out.push(d) }
+    }
+    out
 }
 
 // One prototype per instance. A unit that defines an instance and declares none puts the
@@ -236,9 +257,14 @@ fn globals_in_scope(cfg: CgConfig, module_key: Str, declare_only: Bool) -> List[
 // else runs; a header declares no definition and so never has any to answer.
 fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool) -> List[Int] ! Diag.Report {
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, defines_runtime_storage(cfg), false, header_guard, self_header)
-    if cfg.links_compiler_archive != 0 { print_include(c_layer_archive_header_name()) }
+    if links_compiler_archive(cfg) { print_include(c_layer_archive_header_name()) }
     cg_decl_emit_typedefs()
-    if define_ev { cg_decl_emit_ev(ev_storage(cfg)) }
+    if define_ev {
+        emit_ev(cfg)
+    } else if cfg.archive_over_std != 0 {
+        cg_decl_emit_ev_typedef()
+        print_ev_default_decl()
+    }
     // The definition half owns exactly the globals in scope for this unit: a skipped
     // module's own globals are the archive's to define, and the archive's header already
     // promises them extern, so a second declaration here is redundant at best and, for a
@@ -252,9 +278,27 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
     let inits = if globals_extern { Map() } else { lower_global_inits(globals) }
     let deferred = cg_decl_emit_globals(globals_extern, globals, inits)
     let declare_only = !(globals_extern && cfg.archive_over_std != 0)
-    emit_root_signatures(fns_in_scope(cfg, "", shared, declare_only), methods_in_scope(cfg, "", shared, declare_only))
+    let fns = fns_in_scope(cfg, "", shared, declare_only)
+    let methods = methods_in_scope(cfg, "", shared, declare_only)
+    if globals_extern {
+        emit_root_signatures(cfg, without_private_copies(cfg, fns), without_private_copies(cfg, methods))
+    } else {
+        emit_root_signatures(cfg, fns, methods)
+    }
     cg_derive_emit_decls(derived_decls_declared_everywhere())
     deferred
+}
+
+// A unit that links the archive layered over the stdlib archive reads the vector's typedef,
+// vtables and default from that archive's header, and defines only the vector itself.
+fn emit_ev(cfg: CgConfig) ! Diag.Report {
+    if links_compiler_archive(cfg) {
+        print_ev_storage(ev_storage(cfg))
+    } else if cfg.archive_over_std != 0 {
+        cg_decl_emit_ev_owned_by_archive()
+    } else {
+        cg_decl_emit_ev(ev_storage(cfg))
+    }
 }
 
 // Only the stdlib archive defines the runtime's storage. A layered archive is linked beside
@@ -310,33 +354,37 @@ fn is_entry_point(fn_node: Int) -> Bool {
 
 // A module compiled into the archive is declared by the user's unit, not compiled again
 // — except for the declarations the archive could not hold. A signature that takes the
-// evidence vector names a type the archive does not define, and one archive serves many
-// programs, so the archive left those out. A generic has no body of its own at all: what a program links
-// are its instances, and which instances a program needs follows from that program's call
-// sites, which the archive was compiled without. Both are left for the user's unit. An
-// archive layered over the stdlib archive is in the same position for a std generic: it
-// writes its own copy of each instance its bodies call.
+// evidence vector names a type the stdlib archive does not define, and one archive serves
+// many programs, so the stdlib archive left those out. The archive layered over it does
+// define the vector, and a unit that links that archive takes the vector from it, so a
+// function of one of its modules that takes the vector is the archive's to define. A
+// generic has no body of its own at all: what a program links are its instances, and which
+// instances a program needs follows from that program's call sites, which the archive was
+// compiled without. Those are left for the user's unit. An archive layered over the stdlib
+// archive is in the same position for a std generic: it writes its own copy of each
+// instance its bodies call.
 fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
     if cfg.user_tu_mode == 0 && cfg.archive_over_std == 0 { return false }
-    if cg_decl_takes_ev(decl) { return true }
     match cg_decl_body_site(decl) {
-        BodySite.PerInstance => true
-        BodySite.ThisUnit => false
-        BodySite.ForeignWrapper => false
-        BodySite.Nothing => false
+        BodySite.PerInstance => return true
+        BodySite.ThisUnit => {}
+        BodySite.ForeignWrapper => {}
+        BodySite.Nothing => {}
     }
+    cg_decl_takes_ev(decl) && !cfg.compiler_archive_modules.contains_key(cg_reg_module_of(decl))
 }
 
-// The archive holds neither the entry point nor a function that takes the evidence
-// vector: one archive serves many programs, and it does not define the vector such a
-// signature names. Those are compiled into the user's unit instead. A foreign binding
-// carries `! FFI` but is a plain C wrapper that reads no evidence, which is why the
-// signature is asked rather than the effects list.
+// The archive holds no entry point: one archive serves many programs. The stdlib archive
+// also holds no function that takes the evidence vector, since it does not define the
+// vector such a signature names; those are compiled into the user's unit instead. The
+// archive layered over it defines the vector and holds them. A foreign binding carries
+// `! FFI` but is a plain C wrapper that reads no evidence, which is why the signature is
+// asked rather than the effects list.
 fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for f in decls_in_scope(cfg, module_key, cg_reg_fn_decls(), declare_only) {
         if shared && is_entry_point(f) { continue }
-        if shared && cg_decl_takes_ev(f) { continue }
+        if shared && cg_decl_takes_ev(f) && cfg.archive_over_std == 0 { continue }
         out.push(f)
     }
     out
@@ -347,7 +395,7 @@ fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool
 fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for m in decls_in_scope(cfg, module_key, cg_reg_impl_methods(), declare_only) {
-        if shared && cg_decl_takes_ev(m) { continue }
+        if shared && cg_decl_takes_ev(m) && cfg.archive_over_std == 0 { continue }
         out.push(m)
     }
     out
@@ -405,7 +453,7 @@ fn emit_bodies(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
     set_current_inst(-1)
     for d in decls {
         match cg_decl_body_site(d) {
-            BodySite.ThisUnit => cg_decl_emit_fn_def(d, false, lower_body(d))
+            BodySite.ThisUnit => cg_decl_emit_fn_def(d, is_archive_private_copy(cfg, d), lower_body(d))
             BodySite.PerInstance => emit_instance_bodies(d, instance_is_private_copy(cfg, d))
             BodySite.ForeignWrapper => cg_decl_emit_foreign_wrapper(d)
             BodySite.Nothing => {}
@@ -637,9 +685,11 @@ fn emit_entry(cfg: CgConfig, init_fns: List[Str]) ! Diag.Report {
 // program's own: a global the program initialises may read one an archive set.
 fn archive_init_fns(cfg: CgConfig) -> List[Str] {
     if cfg.user_tu_mode == 0 { return [] }
-    if cfg.links_compiler_archive != 0 { return [stdlib_init_globals_name(), layer_init_globals_name()] }
+    if links_compiler_archive(cfg) { return [stdlib_init_globals_name(), layer_init_globals_name()] }
     [stdlib_init_globals_name()]
 }
+
+fn links_compiler_archive(cfg: CgConfig) -> Bool { cfg.compiler_archive_modules.len() > 0 }
 
 fn stdlib_init_globals_name() -> Str { "__blink_init_stdlib_globals" }
 
@@ -709,9 +759,10 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
 // The stdlib archive's public header: every declaration a user TU needs to link
 // against the archive, and no definition.
 //
-// The evidence vector is left out on purpose. A user unit declares its own, longer
-// vector — the archive's builtin fields followed by the user program's effects — and two
-// definitions of one C type is an ODR violation.
+// The stdlib archive's header leaves the evidence vector out on purpose. A user unit
+// declares its own, longer vector — the archive's builtin fields followed by the user
+// program's effects — and two definitions of one C type is an ODR violation. The header of
+// an archive layered over it carries the vector instead, for the user unit to use as it is.
 pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     let guard = if cfg.archive_over_std != 0 { c_layer_archive_header_guard() } else { c_archive_header_guard() }
@@ -739,7 +790,7 @@ pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> S
     }
     let fns = fns_in_scope(cfg, module_key, false, true)
     let methods = methods_in_scope(cfg, module_key, false, true)
-    emit_root_signatures(fns, methods)
+    emit_root_signatures(cfg, fns, methods)
     // The one header that does declare instances. Nothing is compiled ahead of this
     // program, so its modules home their own generics' instances, and a module that calls
     // one compiled into another module's object needs the name from that module's header.

@@ -54,22 +54,23 @@ fn std_keys() -> Map[Str, Int] {
 fn layered_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
         skip_modules: std_keys(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 1,
-        archive_over_std: 1, links_compiler_archive: 0 }
+        archive_over_std: 1, compiler_archive_modules: Map() }
 }
 
 fn user_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
         skip_modules: std_keys(), user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0,
-        archive_over_std: 0, links_compiler_archive: 0 }
+        archive_over_std: 0, compiler_archive_modules: Map() }
 }
 
 // A std generic instantiated at a type of this layer, a non-generic std function the layer
-// calls, a std global the layer reads, a global that cannot take its value on its definition
-// line, and a private function.
+// calls, a std function that takes the evidence vector, a std global the layer reads, a
+// global that cannot take its value on its definition line, and a private function.
 fn layer_src() -> Str {
     #"import std.list.{list_skip}
 import std.str.{str_trim}
 import std.process.{SIGTERM}
+import std.io.{read_fully}
 
 type Point { x: Int, y: Int }
 
@@ -91,9 +92,14 @@ fn term_signal() -> Int {
     SIGTERM
 }
 
+fn drain(fd: Int) ! IO {
+    let _ = read_fully(fd, 0)
+}
+
 fn main() {
     let _ = bump(rest_len([origin]) + term_signal())
     let _ = tidy(" a ")
+    drain(0)
 }
 "#
 }
@@ -188,6 +194,36 @@ test "the layer defines no non-generic std function it calls" {
     assert_eq(defs.len(), 0, "the layer defines str_trim: {defs.join(", ")}")
 }
 
+// The stdlib archive holds no std function that takes the evidence vector, since each
+// program spells its own vector. The program that links the layer defines such a function
+// external in its own unit, so the layer's copy must be local to its object or the two
+// collide at link.
+test "the layer keeps a std function that takes the evidence vector local to its object" {
+    let program = build_probe(layer_src(), "cg_layer_std_ev_probe")
+    let c = generate(program, layered_cfg())
+    let defs = definitions_naming(c, "read_fully(")
+    assert_eq(defs.len(), 1, "the layer does not define read_fully once: {defs.join(", ")}")
+    assert(defs.get(0).unwrap().starts_with("static"), "read_fully is external in the layer: {defs.get(0).unwrap()}")
+    let user = definitions_naming(generate(program, user_cfg()), "read_fully(")
+    assert_eq(user.len(), 1, "the program unit does not define read_fully once: {user.join(", ")}")
+    assert(!user.get(0).unwrap().starts_with("static"), "read_fully is static in the program unit: {user.get(0).unwrap()}")
+    let c_path = "build/cg_layer_std_ev_probe.c"
+    let o_path = "build/cg_layer_std_ev_probe.o"
+    write_file(c_path, c)
+    let cc = process_run("cc", ["-c", "-Ibuild", "-o", o_path, c_path])
+    assert_eq(cc.exit_code, 0, "cc failed:\n{cc.err_out}")
+    let nm = process_run("nm", ["--defined-only", o_path])
+    let _ = fs.delete(c_path)
+    let _ = fs.delete(o_path)
+    let mut kinds: List[Str] = []
+    for line in nm.out.split("\n") {
+        let words = line.split(" ")
+        if words.len() < 3 { continue }
+        if words.get(2).unwrap().ends_with("read_fully") { kinds.push(words.get(1).unwrap()) }
+    }
+    assert_eq(kinds.join(","), "t", "read_fully in the layer object is not one local symbol:\n{nm.out}")
+}
+
 // The program reads the layer globals through this header. The stdlib archive header
 // already declares the std globals.
 test "the layer header declares its own globals extern and no std global" {
@@ -207,9 +243,10 @@ test "the layer header declares its own globals extern and no std global" {
 }
 
 // The proof that nothing collides at link: the layer compiles against the stdlib archive
-// header, and the only names it exports are its own module's and its init function. A
-// std symbol or a per-type helper exported here would also be defined by the stdlib
-// archive or by the program.
+// header, and the only names it exports are its own module's, its init function and the
+// evidence vector's default, which a program that links the layer takes from it. A std
+// symbol or a per-type helper exported here would also be defined by the stdlib archive or
+// by the program.
 test "the layer compiles beside the stdlib archive and exports only its own names" {
     let c = layer_c("cg_layer_nm_probe")
     let c_path = "build/cg_layer_nm_probe.c"
@@ -224,6 +261,7 @@ test "the layer compiles beside the stdlib archive and exports only its own name
     let mut foreign: List[Str] = []
     let mut own = 0
     let mut saw_init = false
+    let mut saw_ev_default = false
     for line in nm.out.split("\n") {
         let words = line.split(" ")
         if words.len() < 3 { continue }
@@ -232,6 +270,8 @@ test "the layer compiles beside the stdlib archive and exports only its own name
         if kind.to_lower() == kind { continue }
         if name == "__blink_init_compiler_globals" {
             saw_init = true
+        } else if name == "blink_ev_default" {
+            saw_ev_default = true
         } else if name.starts_with("blink_u_") {
             own = own + 1
         } else {
@@ -239,6 +279,7 @@ test "the layer compiles beside the stdlib archive and exports only its own name
         }
     }
     assert(saw_init, "the object exports no __blink_init_compiler_globals")
+    assert(saw_ev_default, "the object exports no blink_ev_default")
     assert(own >= 3, "the object exports {own} of the layer's own names, expected bump, rest_len and origin")
     assert_eq(foreign.len(), 0, "exported names the layer does not own: {foreign.join(", ")}")
 }
@@ -256,10 +297,13 @@ test "the layer header compiles after the stdlib archive header" {
     assert_eq(cc.exit_code, 0, "cc failed:\n{cc.err_out}")
 }
 
+// The probe is one module, so it stands in for the archive the unit links.
 fn linking_user_cfg() -> CgConfig {
+    let mut layer: Map[Str, Int] = Map()
+    layer.insert("__main__", 1)
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
         skip_modules: std_keys(), user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0,
-        archive_over_std: 0, links_compiler_archive: 1 }
+        archive_over_std: 0, compiler_archive_modules: layer }
 }
 
 // The layer header names std types and functions, so the stdlib archive header must come

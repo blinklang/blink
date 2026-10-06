@@ -91,9 +91,9 @@ fn cli(env_args: List[Str], cli_args: List[Str]) -> ProcessResult {
     process_run("env", args)
 }
 
-fn emit_c(env_args: List[Str], tag: Str) -> Str {
+fn emit_c(env_args: List[Str], tag: Str, src: Str) -> Str {
     let path = ".tmp/_emitc_{tag}.bl"
-    write_file(path, fixture_src())
+    write_file(path, src)
     let _ = cli(env_args, ["build", "--emit", "c", "--debug", path])
     fs_remove(path)
     let c_path = "build/_emitc_{tag}.c"
@@ -104,12 +104,12 @@ fn emit_c(env_args: List[Str], tag: Str) -> Str {
 }
 
 fn fixture_c() -> Str {
-    emit_c(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], "compiler_importing_fixture")
+    emit_c(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], "compiler_importing_fixture", fixture_src())
 }
 
 // The one-unit build, as a program gets it when no compiler archive is named.
 fn fixture_c_one_unit() -> Str {
-    emit_c(["-u", "BLINK_COMPILER_ARCHIVE"], "compiler_importing_fixture_one_unit")
+    emit_c(["-u", "BLINK_COMPILER_ARCHIVE"], "compiler_importing_fixture_one_unit", fixture_src())
 }
 
 test "the fixture builds and its unit defines main" {
@@ -137,8 +137,6 @@ test "the program's unit defines compiler functions when no compiler archive is 
     assert(plain > 0, "the one-unit build defines no compiler function that skips the evidence vector")
 }
 
-// The unit still defines the compiler functions that take the evidence vector, so this
-// proves they compile and link beside the archive.
 test "the program built through the compiler archive links and runs" {
     let path = ".tmp/_linkcli_compiler_importing_fixture.bl"
     let bin = scratch("bin")
@@ -165,10 +163,7 @@ test "the program's unit defines no compiler function that skips the evidence ve
     assert_eq(plain.len(), 0)
 }
 
-test.failing(
-    "the program's unit defines no compiler function at all",
-    reason: "the compiler archive cannot hold a function that takes the evidence vector until its layout is fixed",
-) {
+test "the program's unit defines no compiler function at all" {
     let c = fixture_c()
     assert(c.contains("int main("), "the fixture did not reach codegen")
     assert_eq(compiler_defs(c).len(), 0)
@@ -212,4 +207,168 @@ test "a program whose own module is named like a compiler module builds in one u
     assert(!nm.out.contains("__blink_init_compiler_globals"), "the program linked the compiler archive")
     assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
     assert_eq(r.out.trim(), "42")
+}
+
+// ── The evidence vector the archive and the program share ───────────────────────────
+
+// A program that runs a compiler function taking the evidence vector, so the archive's
+// copy of that body reads the vector the program's own unit defines.
+fn ev_fixture_src() -> Str {
+    [
+        #"import tokens.{keyword_lookup}"#,
+        #"import lexer.{lex, tokens}"#,
+        "",
+        #"fn main() {"#,
+        #"    lex("fn main() 1")"#,
+        #"    io.println("{keyword_lookup("fn").to_int()} {tokens.len()}")"#,
+        "}",
+        "",
+    ].join("\n")
+}
+
+// A program that declares an effect of its own, which gives its vector a slot the archive's
+// does not have. `root` names the effect, so a program can also reuse the name of an effect
+// the archive holds.
+fn own_effect_fixture_src(root: Str) -> Str {
+    [
+        #"import tokens.{keyword_lookup}"#,
+        "",
+        #"effect #{root} {"#,
+        #"    effect Ask {"#,
+        #"        fn ping() -> Int"#,
+        "    }",
+        "}",
+        "",
+        #"fn ask() -> Int ! #{root}.Ask {"#,
+        #"    #{root.to_lower()}.ping()"#,
+        "}",
+        "",
+        #"fn main() {"#,
+        #"    with handler #{root} {"#,
+        #"        fn ping() -> Int { 7 }"#,
+        #"    } {"#,
+        #"        io.println("{keyword_lookup("fn").to_int()} {ask()}")"#,
+        "    }",
+        "}",
+        "",
+    ].join("\n")
+}
+
+// A program that installs its own handlers around a compiler function the archive holds:
+// one for an archive effect and one for IO. The archive's `lex` prints through IO when a
+// string ends after a backslash, so the line it prints shows whose handler it called.
+fn own_handler_fixture_src() -> Str {
+    [
+        #"import lexer.{lex}"#,
+        "",
+        #"fn main() {"#,
+        #"    with handler Lex {"#,
+        #"    }, handler IO {"#,
+        #"        fn print(msg: Str) { default.print("[mine] {msg}") }"#,
+        #"    } {"#,
+        #"        lex("\"\\")"#,
+        "    }",
+        "}",
+        "",
+    ].join("\n")
+}
+
+type FixtureRun { linked: Bool, exit_code: Int, out: Str, err_out: Str }
+
+// Builds `src` with the archive named, the way the corpus builds a test, and runs it.
+fn build_and_run(tag: Str, src: Str) -> FixtureRun {
+    let path = ".tmp/_evcli_{tag}.bl"
+    let bin = scratch("{tag}-bin")
+    write_file(path, src)
+    let b = cli(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], ["build", "--debug", path, "-o", bin])
+    fs_remove(path)
+    assert_eq(b.exit_code, 0, "the build of {tag} failed:\n{b.err_out}")
+    let nm = process_run("nm", [bin])
+    let r = process_run(bin, [])
+    fs_remove(bin)
+    if file_exists("{bin}.c") != 0 { fs_remove("{bin}.c") }
+    FixtureRun { linked: nm.out.contains("__blink_init_compiler_globals"), exit_code: r.exit_code, out: r.out, err_out: r.err_out }
+}
+
+// The guarded typedef of the evidence vector in a unit's C, or "" when the unit has none.
+fn ev_typedef_block(c: Str) -> Str {
+    let open = "#ifndef BLINK_TD_blink_ev\n"
+    let start = c.byte_index_of(open, 0) ?? -1
+    if start < 0 { return "" }
+    let close = "} blink_ev;\n#endif\n"
+    let end = c.byte_index_of(close, start) ?? -1
+    if end < 0 { return "" }
+    c.byte_slice(start, end + close.byte_len())
+}
+
+test "the evidence vector scanner takes the guarded typedef and nothing around it" {
+    let c = "int a;\n#ifndef BLINK_TD_blink_ev\n#define BLINK_TD_blink_ev\ntypedef struct \{\n    blink_io_vtable* io;\n} blink_ev;\n#endif\nint b;\n"
+    assert_eq(ev_typedef_block(c), "#ifndef BLINK_TD_blink_ev\n#define BLINK_TD_blink_ev\ntypedef struct \{\n    blink_io_vtable* io;\n} blink_ev;\n#endif\n")
+    assert_eq(ev_typedef_block("int a;\n"), "")
+}
+
+// Two units that spell the vector apart read each other's fields at the wrong offsets, and
+// C reports nothing: the archive's bodies and the program must compile against one
+// typedef text.
+test "the archive's bodies and its header spell one evidence vector" {
+    let dir = archive_dir()
+    let header = ev_typedef_block(read_file("{dir}/libblink_compiler.h"))
+    assert(header.contains("ue_diag"), "the compiler archive header carries no evidence vector with the archive's effects:\n{header}")
+    assert_eq(ev_typedef_block(read_file("{dir}/monolith.c")), header)
+}
+
+test "a program that links the compiler archive takes its evidence vector from the archive header" {
+    let c = fixture_c()
+    assert(c.contains("#include \"libblink_compiler.h\""), "the program's unit does not read the compiler archive header")
+    assert_eq(ev_typedef_block(c), "")
+}
+
+// Without this control the row above would pass on a build that wrote no vector at all.
+// The program it builds is the one the next row runs: it reaches fewer effects than the
+// archive holds, so on its own it spells a vector the archive's bodies would read at other
+// offsets, and the run below cannot pass only because the two vectors happen to agree.
+test "the one-unit build spells its own evidence vector, shorter than the archive's" {
+    let own = ev_typedef_block(emit_c(["-u", "BLINK_COMPILER_ARCHIVE"], "ev_fixture_one_unit", ev_fixture_src()))
+    let archive = ev_typedef_block(read_file("{archive_dir()}/libblink_compiler.h"))
+    assert(own.contains("blink_io_vtable* io;"), "the one-unit build wrote no evidence vector:\n{own}")
+    assert(own.byte_len() < archive.byte_len(), "the program's own vector is not shorter than the archive's:\n{own}")
+}
+
+test "a program that runs a compiler function taking the evidence vector links the archive and runs" {
+    let r = build_and_run("ev_fixture", ev_fixture_src())
+    assert(r.linked, "the binary did not link the compiler archive")
+    assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
+    assert_eq(r.out.trim(), "0 6")
+}
+
+// The program's unit builds the handler values the archive's bodies read from the vector,
+// so it must take their vtable types from the archive header and not spell its own.
+test "a program that links the compiler archive takes an archive effect's vtable from the header" {
+    let c = emit_c(["BLINK_COMPILER_ARCHIVE={archive_dir()}"], "own_handler_fixture", own_handler_fixture_src())
+    assert(c.contains("blink_ue_lex_vtable*"), "the program's unit installs no Lex handler:\n{c}")
+    assert(!c.contains("} blink_ue_lex_vtable;"), "the program's unit spells its own Lex vtable")
+    assert(read_file("{archive_dir()}/libblink_compiler.h").contains("} blink_ue_lex_vtable;"), "the compiler archive header has no Lex vtable")
+}
+
+test "a program that installs its own handlers around an archive body links the archive and the body calls them" {
+    let r = build_and_run("own_handler_fixture", own_handler_fixture_src())
+    assert(r.linked, "the binary did not link the compiler archive")
+    assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
+    assert_eq(r.out.trim(), "[mine] lexer error: unexpected end of string after backslash")
+}
+
+test "a program that declares an effect of its own builds in one unit and runs" {
+    let r = build_and_run("own_effect_fixture", own_effect_fixture_src("Extra"))
+    assert(!r.linked, "a program with an effect the archive does not hold linked the compiler archive")
+    assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
+    assert_eq(r.out.trim(), "0 7")
+}
+
+// The archive holds an effect by the module that declares it, not by its name.
+test "a program that declares its own effect under an archive effect's name builds in one unit and runs" {
+    assert(read_file("{archive_dir()}/libblink_compiler.h").contains("ue_lex"), "the compiler archive holds no Lex effect, so this row proves nothing")
+    let r = build_and_run("same_name_effect_fixture", own_effect_fixture_src("Lex"))
+    assert(!r.linked, "a program with its own Lex effect linked the compiler archive")
+    assert_eq(r.exit_code, 0, "the run failed:\n{r.err_out}")
+    assert_eq(r.out.trim(), "0 7")
 }
