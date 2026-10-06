@@ -2662,6 +2662,21 @@ error[ParamAssign]: cannot assign to parameter `a`
 
 The fix-it names a new binding. `let mut a = a` shadows the parameter and triggers `warning[W0603] ShadowedVariable`.
 
+Inside `enter()` of a `BlockHandler` impl, a write to a field of `self` gets a different help line. The usual cause is an attempt to keep state for `exit()`, and a local copy does not reach `exit()`:
+
+```
+error[ParamAssign]: cannot assign to parameter `self`
+ --> timer.bl:9:9
+  |
+9 |         self.start = time.read()
+  |         ^^^^^^^^^^ `self` is a parameter
+  |
+  = note: `exit()` receives the value the `with` item built, not this copy
+  = help: set `start` when the value is built, and build it in the `with` item (§4.6.3)
+```
+
+This help text appears only in `BlockHandler.enter()`. Every other parameter assignment gets the `let mut` help above.
+
 **What `mut self` covers.** A method is mutating if and only if it declares `mut self`. The standard library declares `mut self` on methods that change state Blink holds as a value: the contents of a `List`, `Map`, `Set` or `StringBuilder`. A change to state outside the language — memory behind a `Ptr`, a socket, a file, a database — is an effect, tracked by the effect row (§4) and the `@trusted` boundary (§9), not by `mut`. So `Ptr.write` (§9 *Pointer Operations*) and `TcpConn.write` take plain `self`, and a plain `let` pointer can write through.
 
 **Traits and impls.** A trait method's `mut` markers are part of its contract. An impl may drop a `mut` that the trait declares, because an implementation that does not mutate satisfies a contract that allows mutation. An impl may not add a `mut` that the trait does not declare: `error[ImplAddsMut]`, with a related span on the trait's signature.

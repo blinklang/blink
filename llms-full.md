@@ -1036,6 +1036,26 @@ with db.transaction() {
 // auto-commit on success, auto-rollback on error/early exit
 ```
 
+`self` is passed by value, so `enter()` cannot pass state to `exit()`, and `self.x = ...` in `enter()` is a compile error. Give the value all its state when it is built, and call the builder in the `with` item, so each `with` gets a new value:
+
+```blink
+pub fn timer(label: Str) -> Timer ! Time.Read {
+    Timer { label: label, start: time.read() }
+}
+
+impl BlockHandler for Timer {
+    type Context = ()
+    fn enter(self) -> () {}
+    fn exit(self, ok: Bool) ! Time.Read, IO.Log {
+        io.log("{self.label}: {self.start.elapsed()}")
+    }
+}
+
+with timer("db_query") { run_query()? }
+```
+
+A scoped value must reach exactly one `with`. W0611 `ScopedValueEnteredTwice` warns when one value reaches two, for example a value built before a loop and entered inside it.
+
 ## Associated Types on Traits
 
 Traits can declare associated type members with `type Name`. Implementers must define these types.

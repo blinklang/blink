@@ -107,7 +107,7 @@ An allocation site inside an `! Arena` function is classified as either **promot
 
 ##### Handler behavior
 
-`with arena { body }` behaves as a `BlockHandler` (§4.6.3). On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
+`with arena { body }` behaves as a `BlockHandler` (§4.6.3), as if the compiler builds a new scope value at each `with arena`. `arena` is a keyword form, not a value that a program can store and enter again. On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
 
 Because the block is a `BlockHandler`, arena enter and exit events appear in `--blink-trace` and `--trace all` output, as for every other block-scoped construct. `! Arena` on a function signature is a *marker* effect. The escape check uses it. It does not select a handler.
 
@@ -290,6 +290,28 @@ warning[ScopedValueWithoutWith]: `BlockHandler` value used without `with`
 ```
 
 This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted(audit: K)` for framework code (connection pools, resource managers) that deliberately manages scoped-value lifetimes manually. `K` must name a record in `audits.toml` with a current pin, by the rule in §9.1 *Audit Records*; a stale pin lets the warning fire again.
+
+**W0611 `ScopedValueEnteredTwice`: scoped value that goes into more than one `with`**
+
+A scoped value must reach exactly one `with` item. W0611 fires when one value reaches two or more, including a `with` inside a loop body that enters a value built outside the loop. Its state was fixed when it was built, so a second `exit()` releases it again. It uses the same flow analysis as W0610, and it has the same limit: it does not follow a value into a function it is passed to. No W0611 is not a proof that a value goes into one `with` only.
+
+```
+warning[ScopedValueEnteredTwice]: `BlockHandler` value goes into more than one `with`
+ --> app.bl:4:14
+  |
+2 |     let conn = db.connect("app.db")?
+  |         ---- `conn` is built once here
+3 |     for job in jobs {
+4 |         with conn {
+  |              ^^^^ `conn` goes into this `with` on each pass of the loop
+  |
+  = note: `exit()` runs at the end of each `with`, on the same `conn`
+  = help: build a new value in each `with` item:
+  |
+4 |         with db.connect("app.db")? {
+```
+
+When the value is a call result bound to a name, the fix moves the call into each `with` item. That fix is machine-applicable (§8.6) if the call has no other use. W0611 is a warning by default, and is upgradeable to an error with `W0611 = "error"` under `[lints]` without a change to W0610. Suppress it with `@trusted(audit: K)`, by the same rule as W0610. A type whose `exit()` is correct to run more than once, such as `std.testing`'s `Cleanup` when the action is meant to run twice, is a case for that suppression.
 
 **E0601: closeable escapes scope**
 
