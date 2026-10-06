@@ -514,14 +514,14 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `.len()` | Int | Length in bytes |
+| `.len()` | Int | Length in codepoints (O(1)) |
 | `.is_empty()` | Bool | Check if empty |
 | `.contains(s)` | Bool | Substring check |
 | `.starts_with(s)` | Bool | Prefix check |
 | `.ends_with(s)` | Bool | Suffix check |
-| `.index_of(s)` | Int | Find index (-1 if not found) |
+| `.index_of(s)` | Option[Int] | Codepoint index of first match |
 | `.concat(s)` | Str | Concatenate |
-| `.substring(start, len)` | Str | Extract by position + length |
+| `.substring(start, end)` | Str | Codepoint range `[start, end)`; clamps |
 | `.split(sep)` | List[Str] | Split by separator |
 | `.lines()` | List[Str] | Split by newlines |
 | `.trim()` | Str | Strip leading and trailing whitespace |
@@ -532,7 +532,7 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 | `.replace(old, new)` | Str | Replace all occurrences |
 | `.to_int()` | Int | Parse as integer |
 | `.parse_float()` | Float | Parse as float |
-| `.char_at(idx)` | Option[Char] | Char at index, `None` if out of range or mid-codepoint |
+| `.char_at(idx)` | Option[Char] | Char at codepoint index, `None` if out of range |
 | `.byte_len()` | Int | Length in bytes (O(1)) |
 | `.byte_at(idx)` | U8 | Raw byte at byte offset; panics when out of bounds |
 | `.byte_slice(start, end)` | Str | Byte range `[start, end)`; clamps; panics inside a codepoint |
