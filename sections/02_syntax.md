@@ -643,7 +643,7 @@ for item in items {
 
 Both `while` and `loop` are statements that evaluate to `()` (above). One refinement
 makes value-returning functions sound: a `loop { }` that **no `break` targets** never
-exits, so it has type `Never` (§2.20) rather than `()`, and may stand as the tail of a
+exits, so it has type `Never` (§3.2) rather than `()`, and may stand as the tail of a
 function returning any type.
 
 ```blink
@@ -1484,7 +1484,7 @@ fn divide(a: Int, b: Int) -> Int {
 }
 ```
 
-`panic` returns `Never` (bottom type), which inhabits every type — allowing it in any expression position. Panic is *not* an algebraic effect — it is untracked divergence, like integer division by zero or array bounds violations. It cannot be caught or handled in normal code (only the test runner catches it).
+`panic` returns `Never` (§3.2), the bottom type. `Never` has no values and is a subtype of every type, so a call to `panic` fits in any expression position. Panic is *not* an algebraic effect — it is untracked divergence, like integer division by zero or array bounds violations. It cannot be caught or handled in normal code (only the test runner catches it).
 
 **Use `Result[T, E]` for recoverable errors.** `panic` is reserved for programmer errors, violated invariants, and genuinely unreachable states. A lint warns when `panic()` appears in library code. It does not fire on `todo()` or `unreachable()` (below).
 

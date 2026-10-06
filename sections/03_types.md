@@ -47,6 +47,9 @@ Bool            // true, false
 // Unit
 ()              // The unit type. One value. No information.
 
+// Bottom
+Never           // The bottom type. No values. The type of code that cannot finish.
+
 // Collections
 List[T]         // Growable ordered sequence
 [T]             // Shorthand -- [Str] is List[Str]
@@ -57,6 +60,26 @@ Set[T]          // Hash set
 Option[T]       // Some(value) | None
 Result[T, E]    // Ok(value) | Err(error)
 ```
+
+**`Never` is the bottom type.** `Never` has no values. It is the type of a construct that cannot finish normally: a call to `panic(...)`, `todo()` or `unreachable()` (§2.20), a call to a function declared `-> Never`, or a `loop` that no `break` targets. §3.3 *Divergence and Body Completeness* lists every such construct. No literal, constructor or conversion makes a `Never`. Only a construct that diverges (§3.3) has this type. A program may write `Never` in any type position: a return type, a parameter, a field, a `let` annotation, or a type argument such as `Result[Int, Never]`. `Never` is a subtype of every type. Inference never chooses `Never` for a slot that the program left open (§3.4 *Under-Determined Types*). `Never` is not `()`: `()` has one value, and `Never` has none.
+
+Because `Never` is a subtype of every type (§3.3), a value of type `Never` fits wherever any type is expected. This does not go through a type constructor: `List[Never]` is not a `List[Int]`, `Result[Int, Never]` is not a `Result[Int, Str]`, and `fn() -> Never` is not a `fn() -> Int`. To widen such a value, take it apart and build it again:
+
+```blink
+fn load() -> Result[Int, Str] {
+    let r: Result[Int, Never] = Ok(3)
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => e,
+    }
+}
+```
+
+The `Err(e)` arm is required (§3.5 *Exhaustiveness*). Its body `e` has type `Never`, so it fits the declared return type `Result[Int, Str]`. A type mismatch (E0300) between a type that has `Never` as a type argument and a wider type names this `match` rewrite as its repair. It may also name a `map_err` call with the target error type written out.
+
+`Never` implements no trait unless the prelude declares an impl of that trait for `Never`. No rule derives an impl for `Never` from the fact that it has no values.
+
+`-> Never` does not remove the effect row. `fn exit(code: Int) -> Never` in `Env.Exit` (§4.4.3) still needs `! Env.Exit` at each call.
 
 **Why short names.** `Str` not `String`. `Int` not `Integer`. `Bool` not `Boolean`. These are the most-written types in any codebase. Over thousands of occurrences, 3 characters vs 6 saves real token budget. All types are PascalCase -- no special casing rules, no distinction between "primitive" and "user-defined." `Str` and `UserProfile` follow the same convention.
 
@@ -1098,9 +1121,8 @@ subtype of `R`. This is the ordinary subtyping check; there is no loop-specific 
 
 Two facts about the type lattice decide every case:
 
-- **`Never` is a subtype of every type.** `Never` (§2.20) is the bottom type — it has no
-  values, so a construct of type `Never` never produces one and vacuously satisfies any
-  expected type.
+- **`Never` is a subtype of every type.** `Never` (§3.2) has no values, so a construct
+  of type `Never` produces no value and satisfies any expected type.
 - **`()` is a subtype only of `()`.** The unit type is ordinary; a block whose tail type
   is `()` satisfies `-> ()` (equivalently `-> Void`) and nothing else.
 
@@ -1196,7 +1218,10 @@ value of type `R`"); the tail kind (loop, `if`-without-`else`, …) is carried a
 diagnostic data, not as a separate error code, so an editor or agent can offer the right
 repair from one stable key. The repair named first is the one that always compiles: add a
 trailing `return <value>` (or a tail value expression), or — when "no value" is a real
-outcome — change the return type to `Option[R]` (§3.7) and yield `None`. A diverging tail
+outcome — change the return type to `Option[R]` (§3.7) and yield `None`. When `R` is
+`Never`, no value of type `R` exists, so the help names only a diverging tail: a call to
+`panic(...)` or `unreachable()`, or a call to a function declared `-> Never`. It does not
+offer `Option[R]`. A diverging tail
 (a call that returns `Never` such as `panic(...)` or `todo()`, or a `loop` no `break`
 targets) is accepted and needs no repair. This
 satisfies the Diagnostic Discipline of §3.1: every rejection names a repair that exists.
@@ -2229,6 +2254,7 @@ The exhaustiveness checker handles:
 - **Nested patterns** — recursive analysis through constructors, tuples, and structs
 - **Guards** — treated as opaque (may be false), so guarded arms do not contribute to exhaustiveness
 - **OR-patterns** — union of covered patterns per alternative
+- **`Never` payloads** — a variant whose payload type is `Never` still needs an arm. The checker does not remove the arm because no value can reach it. The arm body may be the payload itself, which has type `Never` and fits any expected type. §3.2 shows the `Err(e) => e` form.
 
 **Why exhaustiveness matters for AI.** The single most common bug AI-generated code produces is the forgotten case. A missing `None` handler, an unhandled error variant, an enum value added without updating all consumers. Exhaustive matching makes this class of bug structurally impossible. The compiler mechanically identifies what's missing and suggests the fix. An AI agent can apply the fix automatically — this is the generate-compile-fix loop working as designed.
 
@@ -4209,7 +4235,7 @@ These are not restrictions. They are the elimination of two categories of bugs t
 
 #### No Null
 
-There is no `null`, `nil`, `None`-as-implicit-value, or bottom type that inhabits every type. A `Str` is always a string. An `Int` is always an integer. If a value might be absent, the type says so:
+There is no `null`, `nil`, or `None`-as-implicit-value: no value belongs to every type. `Never` (§3.2) is the bottom type, but it has no values. It marks code that cannot finish, not a value that might be missing. A `Str` is always a string. An `Int` is always an integer. If a value might be absent, the type says so:
 
 ```blink
 // This function might not find a user. The type says so.
