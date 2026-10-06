@@ -2121,6 +2121,23 @@ import auth.{Token, Token as AuthToken}   // OK: two names, one item
 
 **Fix.** Which import should keep the name is the author's choice, so the fix is a suggestion only: rename one import with `as`, or drop the name and use the qualified path. The help should print a concrete name that is not already bound in the file. On the colliding entry, E1005 replaces W0602: one mistake gives one diagnostic. When a declaration also takes the name, every import entry that collides with it gets E1012 (*Imported and Declared Names*), and E1005 applies only between import entries that have no E1012.
 
+#### Unused Imports
+
+An import entry is **used** when a name in the file resolves through it, or when a method call in the file resolves to a trait that the entry puts in scope (§3.6 *Impl visibility*). An entry that is not used gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). Deleting an unused entry never changes what the file means.
+
+A type imported only so that its methods work is unused. The impls in the type's own package go with its values, so the methods resolve without the import:
+
+```blink
+import std.testing.{mock_clock, MockClock}   // warning[W0602]: `MockClock` is not used
+
+test "advance moves the clock" {
+    let mc = mock_clock(Instant.from_epoch_secs(0))
+    mc.advance(Duration.ms(5000))           // resolves with no import of MockClock
+}
+```
+
+When the entry names a type whose methods the file calls, the note says that the methods of that type come with the value and that the import is not needed. A whole-module import (`import ext`) puts no trait in scope for method calls, so a method call never makes it used. `pub import` never gets W0602 (*Re-exports*).
+
 #### Import Errors
 
 | Code | Error | Cause |
