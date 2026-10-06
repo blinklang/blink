@@ -154,7 +154,9 @@ link_archived() {
 # tag's compiler emitted, so: build the CLI from the tag, rebuild the
 # archive with it, re-emit blinkc against that archive, rebuild the archive
 # once more so its identity stamp names the final blinkc, then link the
-# final CLI.
+# final CLI. A tag whose stamp names the blink that built the archive, and
+# whose blink refuses an installed archive another blink built, needs the
+# archive rebuilt once more by that final CLI.
 echo "gen0: building CLI from the tag"
 build/blinkc src/cli.bl build/cli.c
 stamp_version build/cli.c
@@ -167,6 +169,7 @@ BLINK_FORCE_STDLIB_REBUILD=1 build/blink __build-stdlib-archive
 build/blinkc --link-archive build/libblink_std.h src/cli.bl build/cli.c
 stamp_version build/cli.c
 link_archived build/blink build/cli.c
+BLINK_FORCE_STDLIB_REBUILD=1 build/blink __build-stdlib-archive
 
 echo "gen0: installing into $OUT"
 rm -rf "$OUT"

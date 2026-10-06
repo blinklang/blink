@@ -1,0 +1,50 @@
+// An installed share/blink archive whose stamp names another compiler was emitted by
+// that compiler's codegen, even when both headers match. `blink build` must refuse
+// it, and must still link an archive the running compiler built.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn install_tree(tree: Str, blink: Str, arc: Str, root: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/bin {tree}/share/blink")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {blink} {tree}/bin/blink")
+    shell_exec("cp -L {arc}/libblink_std.a {arc}/libblink_std.h {arc}/skip_modules.txt {arc}/.archive-id {tree}/share/blink/")
+    shell_exec("cp -L {root}/build/runtime.h {tree}/share/blink/runtime.h")
+    write_file("{tree}/hello.bl", "fn main() \{\n    io.println(\"hello from an installed archive\")\n\}\n")
+}
+
+// The exit code and the combined output of a build in the tree.
+fn build_in(tree: Str) -> (Int, Str) {
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT BLINK_CACHE_DIR= {tree}/bin/blink build hello.bl -o {tree}/hello 2>&1"])
+    (r.exit_code, r.out)
+}
+
+test "installed archive built by the running compiler links" {
+    let root = sh("pwd -P")
+    let blink = sh("readlink -f build/blink")
+    let arc = sh("dirname \"$(readlink -f build/libblink_std.h)\"")
+    let tree = "{root}/.tmp/_installed_archive_ok_{getpid()}"
+    install_tree(tree, blink, arc, root)
+    let (rc, out) = build_in(tree)
+    assert(rc == 0, "installed archive the running compiler built was refused: {out}")
+    assert_eq(sh("{tree}/hello"), "hello from an installed archive")
+    shell_exec("rm -rf {tree}")
+}
+
+test "installed archive built by another compiler is refused" {
+    let root = sh("pwd -P")
+    let blink = sh("readlink -f build/blink")
+    let arc = sh("dirname \"$(readlink -f build/libblink_std.h)\"")
+    let tree = "{root}/.tmp/_installed_archive_other_{getpid()}"
+    install_tree(tree, blink, arc, root)
+    let zeros = "0000000000000000000000000000000000000000000000000000000000000000"
+    shell_exec("cut -d'|' -f1,2 {arc}/.archive-id | sed 's/$/|{zeros}|other/' > {tree}/share/blink/.archive-id")
+    let (rc, out) = build_in(tree)
+    assert(rc != 0, "installed archive another compiler built was linked")
+    assert(out.contains("IncompatibleStdlibArchive"), "expected IncompatibleStdlibArchive: {out}")
+    assert(file_exists("{tree}/hello") == 0, "a binary was produced from the refused archive")
+    shell_exec("rm -rf {tree}")
+}

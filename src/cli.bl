@@ -47,7 +47,7 @@ import compiler.{
 }
 import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
-import build_stdlib.{build_stdlib_archive, list_stdlib_module_keys, resolve_runtime_h}
+import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
     stdlib_native_dep_header_dir, stdlib_native_dep_compile_defs, stdlib_native_dep_link_flag_dynamic,
@@ -988,28 +988,52 @@ fn sha8(sha: Str) -> Str {
     if sha.byte_len() >= 8 { sha.byte_slice(0, 8) } else { sha }
 }
 
+// A dev archive's links can point at an archive another compiler built (build-cli
+// links a new blink against the old blink's archive), so before a link a dev compiler
+// checks the stamp's compiler SHA and rebuilds on a mismatch. The full std-cache key
+// is not recomputed on each run: it costs tens of ms, and the compiler SHA is already
+// memoized for the obj cache. An installed archive is never rebuilt;
+// verify_installed_archive checks it instead.
+fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let arc_dir = resolve_archive_dir()
+    if arc_dir.ends_with("share/blink") {
+        return 0
+    }
+    let stamp_path = path_join(arc_dir, ".archive-id")
+    let cur_bc_sha = process_compiler_sha()
+    if cur_bc_sha != "" && file_exists(stamp_path) == 1 && file_exists(path_join(arc_dir, "libblink_std.a")) == 1 {
+        let parts = read_file(stamp_path).trim().split("|")
+        if parts.len() > 2 && parts.get(2).unwrap() == cur_bc_sha {
+            return 0
+        }
+    }
+    let rc = build_stdlib_archive_in(arc_dir, peeled_module_keys(), false)
+    if rc != 0 {
+        io.eprintln("error: failed to build stdlib archive in {arc_dir} (rc={rc})")
+    }
+    rc
+}
+
 // Reject a stale *installed* stdlib archive before it can be linked into a
-// user binary. The dev `build/` archive lives at build/std-cache/<hash>/ and
-// is self-consistent by construction (the hash is sha256 of compiler binary +
-// stdlib sources + runtime.h + cc version), so it needs no check. An
-// *installed* archive (copied out of the cache into <prefix>/share/blink/,
-// losing the hash-named directory) carries a `.archive-id` stamp instead:
+// user binary. A dev archive is brought up to date by ensure_dev_archive and
+// needs no check here. An *installed* archive (copied out of the cache into
+// <prefix>/share/blink/, losing the hash-named directory) carries a
+// `.archive-id` stamp instead:
 // runtime.h SHA | archive-header SHA | compiler SHA | version.
 //
-// The decisive checks are the runtime.h SHA and the archive-header
-// (libblink_std.h) SHA. BOTH headers are #included by the freshly emitted user
-// TU and define the structs it shares with the archive's monolith.o:
-// runtime.h carries the runtime struct layouts; libblink_std.h carries the
-// stdlib struct typedefs (e.g. the db Row, std.args.*)
-// which are emitted by codegen and so can diverge when the compiler changes
-// even if runtime.h is byte-identical. If either disagrees, boxed values are
-// read at the wrong offsets and the binary corrupts memory at runtime (the
-// reported Option[Row] UAF was exactly this skew: a stale 161789-byte install
-// vs the current 172853-byte runtime.h). Both headers are resolvable on the
-// link side (they ship next to the archive in share/blink/), so both are
-// re-checked. The compiler SHA is recorded for forensics but NOT re-checked —
-// it is unnecessary once both header surfaces are pinned. The version is shown in
-// the diagnostic only.
+// The runtime.h and archive-header (libblink_std.h) SHAs catch a torn install:
+// BOTH headers are #included by the freshly emitted user TU and define the
+// structs it shares with the archive's monolith.o. runtime.h carries the
+// runtime struct layouts; libblink_std.h carries the stdlib struct typedefs
+// (e.g. the db Row, std.args.*). If either disagrees, boxed values are read at
+// the wrong offsets and the binary corrupts memory at runtime (the reported
+// Option[Row] UAF was exactly this skew: a stale 161789-byte install vs the
+// current 172853-byte runtime.h).
+//
+// The headers do not cover the archive's function bodies, which another
+// compiler's codegen may have emitted under the same headers, so the stamp's
+// compiler SHA must name the running compiler. Every installer stamps the
+// binary it ships. The version is shown in the diagnostic only.
 //
 // Returns 0 when the link may proceed (dev archive, or matching installed
 // stamp), 1 when an installed archive is incompatible or unstamped (a
@@ -1030,11 +1054,13 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report {
     let parts = stamp.split("|")
     let arc_rt_sha = if parts.len() > 0 { parts.get(0).unwrap() } else { "" }
     let arc_hdr_sha = if parts.len() > 1 { parts.get(1).unwrap() } else { "" }
+    let arc_bc_sha = if parts.len() > 2 { parts.get(2).unwrap() } else { "" }
     let arc_ver = if parts.len() > 3 { parts.get(3).unwrap() } else { "?" }
-    if arc_rt_sha == cur_rt_sha && arc_hdr_sha == cur_hdr_sha {
+    let cur_bc_sha = process_compiler_sha()
+    if arc_rt_sha == cur_rt_sha && arc_hdr_sha == cur_hdr_sha && cur_bc_sha != "" && arc_bc_sha == cur_bc_sha {
         return 0
     }
-    diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "installed stdlib archive is incompatible with this compiler\n  archive built by blink {arc_ver} (runtime {sha8(arc_rt_sha)}, header {sha8(arc_hdr_sha)}), current blink is {blink_cli_version} (runtime {sha8(cur_rt_sha)}, header {sha8(cur_hdr_sha)})", "reinstall: task install   (or rebuild against the current toolchain)")
+    diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "installed stdlib archive is incompatible with this compiler\n  archive built by blink {arc_ver} (compiler {sha8(arc_bc_sha)}, runtime {sha8(arc_rt_sha)}, header {sha8(arc_hdr_sha)}), current blink is {blink_cli_version} (compiler {sha8(cur_bc_sha)}, runtime {sha8(cur_rt_sha)}, header {sha8(cur_hdr_sha)})", "reinstall: task install   (or rebuild against the current toolchain)")
     diag_flush()
     1
 }
@@ -1166,6 +1192,14 @@ fn stamp_blink_version() {
 
 fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     shell_exec("rm -f {output_path}")
+    // Before the compile: it checks a compiler archive against the stdlib archive's
+    // stamp, which a rebuild here would change.
+    if emit_mode != "c" {
+        let arc_rc = ensure_dev_archive()
+        if arc_rc != 0 {
+            return arc_rc
+        }
+    }
     let rc = do_compile(source_path, c_path, format_flag, debug_mode, strict_mode)
     if rc != 0 {
         return rc
@@ -2473,6 +2507,10 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if arc_rc != 0 {
         io.eprintln("error: failed to build stdlib archive (rc={arc_rc})")
         exit(arc_rc)
+    }
+    let dev_rc = ensure_dev_archive()
+    if dev_rc != 0 {
+        exit(dev_rc)
     }
     if source_path != "" {
         check_file_exists(source_path)
@@ -4034,6 +4072,11 @@ fn main() {
         while ri < arg_count() {
             roots.push(get_arg(ri))
             ri = ri + 1
+        }
+        // The compiler archive records the stdlib archive it was built against.
+        let arc_rc = ensure_dev_archive()
+        if arc_rc != 0 {
+            exit(arc_rc)
         }
         let rc = build_compiler_archive(get_arg(2), roots)
         if rc != 0 {

@@ -33,6 +33,10 @@ pub fn resolve_runtime_h() -> Str {
     }
     let install_root = resolve_install_root()
     if install_root != "" {
+        // A dev tree's own build/ first, chosen as resolve_archive_dir chooses it: an
+        // archive rebuilt there must not take the runtime.h of the directory blink runs in.
+        let p_dev = path_join(install_root, "build/runtime.h")
+        if file_exists(path_join(install_root, "build/libblink_std.a")) == 1 && file_exists(p_dev) == 1 { return p_dev }
         let p_install = path_join(install_root, "share/blink/runtime.h")
         if file_exists(p_install) == 1 { return p_install }
     }
@@ -181,11 +185,16 @@ pub fn sha256_of_manifest(text: Str) -> Str {
     res.out.trim()
 }
 
-fn relink_archive(cache_dir_rel: Str) {
-    shell_exec("ln -sfn {cache_dir_rel}/libblink_std.a build/libblink_std.a")
-    shell_exec("ln -sfn {cache_dir_rel}/libblink_std.h build/libblink_std.h")
-    shell_exec("ln -sfn {cache_dir_rel}/skip_modules.txt build/skip_modules.txt")
-    shell_exec("ln -sfn {cache_dir_rel}/.archive-id build/.archive-id")
+// Every dev run and build gets here, often several at once, so a link that already
+// points at the cache dir is left alone, and one that does not is replaced by a
+// rename: a concurrent link never finds it missing.
+fn relink_archive(build_dir: Str, cache_dir_rel: Str) {
+    let mut cmd = StringBuilder.new()
+    cmd.write("for f in libblink_std.a libblink_std.h skip_modules.txt .archive-id; do ")
+    cmd.write("t=\"{cache_dir_rel}/$f\"; l=\"{build_dir}/$f\"; ")
+    cmd.write("[ \"$(readlink \"$l\")\" = \"$t\" ] || \{ ln -sfn \"$t\" \"$l.$$\" && mv -f \"$l.$$\" \"$l\"; \}; ")
+    cmd.write("done")
+    shell_exec(cmd.to_str())
 }
 
 fn write_skip_modules_file(path: Str, keys: List[Str]) {
@@ -212,6 +221,13 @@ fn bail_on_diag() -> Int ! Diag.Report {
 }
 
 pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let force = (env.var("BLINK_FORCE_STDLIB_REBUILD") ?? "") != ""
+    build_stdlib_archive_in("build", peeled, force)
+}
+
+// Builds the archive under build_dir/std-cache/<key> unless that entry exists, and
+// points build_dir's archive links at it.
+pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
     let compiler = archive_compiler_path()
     if compiler == "" {
         io.eprintln("error: cannot locate the running compiler binary, which the stdlib-archive cache key must hash")
@@ -220,7 +236,7 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     let std_dir = resolve_stdlib_dir()
     let rt_path_final = resolve_runtime_h()
     if rt_path_final == "" {
-        io.eprintln("error: cannot locate runtime.h (checked $BLINK_ROOT/build, $BLINK_ROOT/bootstrap, <install-root>/share/blink, ./build, ./bootstrap)")
+        io.eprintln("error: cannot locate runtime.h (checked $BLINK_ROOT/build, $BLINK_ROOT/bootstrap, <install-root>/build, <install-root>/share/blink, ./build, ./bootstrap)")
         return 1
     }
 
@@ -243,18 +259,20 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
         io.eprintln("error: failed to compute stdlib-archive cache key")
         return 1
     }
-    let cache_dir = "build/std-cache/{hash}"
-    let stamp = "{cache_dir}/.stamp"
-    let force_rebuild = (env.var("BLINK_FORCE_STDLIB_REBUILD") ?? "") != ""
-    if file_exists(stamp) == 1 && !force_rebuild {
+    let final_dir = "{build_dir}/std-cache/{hash}"
+    if file_exists("{final_dir}/.stamp") == 1 && !force_rebuild {
         // Backfill the identity stamp for caches built before .archive-id
         // existed, so relink_archive's symlink never dangles.
-        if file_exists("{cache_dir}/.archive-id") == 0 {
-            write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h")
+        if file_exists("{final_dir}/.archive-id") == 0 {
+            write_archive_id("{final_dir}/.archive-id", rt_path_final, "{final_dir}/libblink_std.h")
         }
-        relink_archive("std-cache/{hash}")
+        relink_archive(build_dir, "std-cache/{hash}")
         return 0
     }
+    // Built aside and renamed into place, so a concurrent build of the same key never
+    // reads a half-written entry.
+    let cache_dir = "{final_dir}.tmp-{getpid()}"
+    shell_exec("rm -rf {cache_dir}")
     shell_exec("mkdir -p {cache_dir}")
 
     let entry_bl = "{cache_dir}/__archive_main.bl"
@@ -303,25 +321,28 @@ pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Par
     shell_exec("ar rcs {cache_dir}/libblink_std.a {cache_dir}/monolith.o")
     write_skip_modules_file("{cache_dir}/skip_modules.txt", list_stdlib_module_keys())
     write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h")
-    write_file(stamp, "")
-    relink_archive("std-cache/{hash}")
+    write_file("{cache_dir}/.stamp", "")
+    if force_rebuild { shell_exec("rm -rf {final_dir}") }
+    // A concurrent build of the same key that renamed first wins; its entry is as good.
+    shell_exec("if [ -e {final_dir} ]; then rm -rf {cache_dir}; else mv {cache_dir} {final_dir}; fi")
+    relink_archive(build_dir, "std-cache/{hash}")
     0
 }
 
 // Compatibility identity for the built archive: runtime.h SHA + the archive
-// header (libblink_std.h) SHA + compiler SHA + the CLI version. These are the
-// same inputs the std-cache hash already covers, so a dev build is
-// self-consistent by construction. The stamp exists so an *installed* archive
-// (copied out of the cache dir, losing the hash-named directory) can still be
-// checked against the compiler that links a user TU — guarding the ABI-skew
-// class of bug where a stale installed archive is silently linked.
+// header (libblink_std.h) SHA + compiler SHA + the CLI version. A dev link
+// rebuilds the archive when the compiler SHA does not name the running compiler.
+// An *installed* archive (copied out of the cache dir, losing the hash-named
+// directory) is never rebuilt, so the stamp lets it be checked against the
+// compiler that links a user TU — guarding the ABI-skew class of bug where a
+// stale installed archive is silently linked.
 //
 // BOTH headers are load-bearing ABI. runtime.h carries the runtime struct
 // layouts; libblink_std.h carries the stdlib struct typedefs (e.g. db Row,
 // std.args.* — emitted by codegen, so they can diverge when codegen changes
-// even if runtime.h is byte-identical). The user TU `#include`s both, so the
-// verify side gates on both SHAs. The compiler SHA is recorded for forensics
-// but not re-checked.
+// even if runtime.h is byte-identical). The user TU `#include`s both. The
+// function bodies are not in either header, so the verify side also requires
+// the compiler SHA to name the running compiler.
 fn archive_id_string(rt_path: Str, hdr_path: Str) -> Str {
     let rt_sha = sha256_of_file_first(rt_path)
     let hdr_sha = sha256_of_file_first(hdr_path)
