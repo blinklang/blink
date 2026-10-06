@@ -30,7 +30,7 @@ import cname.{
 }
 import cg_print.{
     print_effect_default_vtable, print_effect_vtable_typedef,
-    print_ev, print_ev_typedef, print_epilogue, print_fn, print_fn_decl, print_vtable_slot_fn, print_foreign_decl, print_global_decl,
+    print_ev, print_ev_with_external_default, print_ev_typedef, print_epilogue, print_fn, print_fn_decl, print_vtable_slot_fn, print_foreign_decl, print_global_decl,
     print_global_init, print_prologue, print_prologue_declares, print_foreign_includes, print_ffi_layout_asserts,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
     print_typedef_blocks,
@@ -1101,19 +1101,40 @@ pub fn cg_decl_emit_epilogue(header_guard: Str) {
 // C must have read the typedef by then. A vector that dropped a field would put every later
 // field at a different offset, which the archive reads as the field it expected.
 pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
-    let effects = cg_reg_effect_decls()
+    let slots = emit_ev_vtables()
+    if !slots.ok { return }
+    print_ev(td_guard_name(c_ev_type_name()), slots.vtables, slots.fields, ev_storage)
+}
+
+// The vector of the archive layered over the stdlib archive. A program that links it calls
+// the archive's bodies with its own vector, and C checks nothing across the two objects, so
+// the archive is the one place the vector is spelled: its header carries the typedef and
+// the default for the program to use as they are.
+pub fn cg_decl_emit_ev_owned_by_archive() ! Diag.Report {
+    let slots = emit_ev_vtables()
+    if !slots.ok { return }
+    print_ev_with_external_default(td_guard_name(c_ev_type_name()), slots.vtables, slots.fields)
+}
+
+type EvSlots {
+    vtables: List[Str]
+    fields: List[Str]
+    ok: Bool
+}
+
+fn emit_ev_vtables() -> EvSlots ! Diag.Report {
     let mut vtables: List[Str] = []
     let mut fields: List[Str] = []
-    for e in effects {
+    for e in cg_reg_effect_decls() {
         let slot_tid = make_handler_type(node_name(e))
         let vtable = c_vtable_type_name(slot_tid)
         let field = c_ev_field_name(slot_tid)
-        if !ev_slot_nameable(e, vtable, field) { return }
-        if emit_effect_vtable(e, slot_tid, vtable) == 0 { return }
+        if !ev_slot_nameable(e, vtable, field) { return EvSlots { vtables: vtables, fields: fields, ok: false } }
+        if emit_effect_vtable(e, slot_tid, vtable) == 0 { return EvSlots { vtables: vtables, fields: fields, ok: false } }
         vtables.push(vtable)
         fields.push(field)
     }
-    print_ev(td_guard_name(c_ev_type_name()), vtables, fields, ev_storage)
+    EvSlots { vtables: vtables, fields: fields, ok: true }
 }
 
 // The vector's type and each user effect's vtable type, and nothing that defines storage.
