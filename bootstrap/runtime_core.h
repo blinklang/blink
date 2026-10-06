@@ -621,6 +621,11 @@ static inline int64_t blink_str_recorded_cps(const char* s) {
     return (int64_t)c;
 }
 
+/* The longest Str whose recorded count a --debug len() checks with a full
+   walk. `blink test` builds with --debug, so a walk on every call would make
+   a loop bounded by s.len() quadratic in debug and test builds. */
+#define BLINK_STR_CPS_CHECK_MAX ((int64_t)4096)
+
 /* Inline in every TU, so a --debug build checks the calls it compiles. Only
    those: the prebuilt std archive is not built with BLINK_DEBUG, so a len()
    inside a std function trusts the count even under --debug. */
@@ -630,10 +635,17 @@ static inline int64_t blink_str_cp_len(const char* s) {
     memcpy(&c, s - BLINK_STR_CPS_BACK, sizeof(c));
     if (__builtin_expect(c == 0, 0)) return blink_str_count_cps(s, n);
 #ifdef BLINK_DEBUG
-    int64_t walked = blink_str_count_cps(s, n);
-    if (walked != (int64_t)c - 1) {
-        __blink_panic_dispatchf("blink: internal error: a Str records %lld codepoints but holds %lld",
-                                (long long)c - 1, (long long)walked);
+    int64_t cps = (int64_t)c - 1;
+    if (n <= BLINK_STR_CPS_CHECK_MAX) {
+        int64_t walked = blink_str_count_cps(s, n);
+        if (walked != cps) {
+            __blink_panic_dispatchf("blink: internal error: a Str records %lld codepoints but holds %lld",
+                                    (long long)cps, (long long)walked);
+        }
+    } else if (cps > n || cps * 4 < n) {
+        /* A codepoint is 1 to 4 bytes, so n bytes hold n/4 to n of them. */
+        __blink_panic_dispatchf("blink: internal error: a Str records %lld codepoints in %lld bytes",
+                                (long long)cps, (long long)n);
     }
 #endif
     return (int64_t)c - 1;
@@ -2898,6 +2910,73 @@ BLINK_RT_FN int64_t blink_str_byte_index_of(const char* s, const char* needle, i
     if (from > slen) return -1;
     if (BLINK_UTF8_IS_CONT(s[from])) blink_str_cut_panic("byte_index_of", "from", s, from, slen);
     return blink_str_index_of_from(s, needle, from);
+}
+#endif
+
+/* ── Codepoint indexing ─────────────────────────────────────────────────
+   len, char_at, substring and index_of count in codepoints. When the
+   recorded count equals the byte length the text is ASCII, so a codepoint
+   index is a byte offset and no walk is needed. */
+
+/* The byte offset of codepoint `cp` in s, walking from byte `from` which
+   is at codepoint `from_cp`. cp past the end gives the byte length. */
+static inline int64_t blink_str_cp_offset(const char* s, int64_t n, int64_t from, int64_t from_cp, int64_t cp) {
+    int64_t i = from;
+    int64_t k = from_cp;
+    while (i < n) {
+        if (!BLINK_UTF8_IS_CONT(s[i])) {
+            if (k == cp) return i;
+            k++;
+        }
+        i++;
+    }
+    return n;
+}
+
+BLINK_RT_FN const char* blink_str_cp_substring(const char* s, int64_t start, int64_t end);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_cp_substring(const char* s, int64_t start, int64_t end) {
+    int64_t n = blink_str_len(s);
+    int64_t cps = blink_str_cp_len(s);
+    if (start < 0) start = 0;
+    if (end > cps) end = cps;
+    if (start >= end) return BLINK_STR_EMPTY;
+    int64_t bs = start;
+    int64_t be = end;
+    if (cps != n) {
+        bs = blink_str_cp_offset(s, n, 0, 0, start);
+        be = blink_str_cp_offset(s, n, bs, start, end);
+    }
+    char* buf = blink_str_alloc(be - bs);
+    memcpy(buf, s + bs, (size_t)(be - bs));
+    blink_str_set_cps(buf, end - start);
+    return buf;
+}
+#endif
+
+/* The codepoint at codepoint index i, or -1 out of bounds. */
+BLINK_RT_FN int64_t blink_str_cp_char_at(const char* s, int64_t i);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_str_cp_char_at(const char* s, int64_t i) {
+    int64_t n = blink_str_len(s);
+    int64_t cps = blink_str_cp_len(s);
+    if (i < 0 || i >= cps) return -1;
+    if (cps == n) return (int64_t)(unsigned char)s[i];
+    int64_t at = blink_str_cp_offset(s, n, 0, 0, i);
+    int32_t cp = 0xFFFD;
+    if (!blink_str_next_char(s, &at, &cp)) return 0xFFFD;
+    return (int64_t)cp;
+}
+#endif
+
+/* The codepoint index of the first needle, or -1. */
+BLINK_RT_FN int64_t blink_str_cp_index_of(const char* s, const char* needle);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_str_cp_index_of(const char* s, const char* needle) {
+    int64_t at = blink_str_index_of(s, needle);
+    if (at <= 0) return at;
+    if (blink_str_cp_len(s) == blink_str_len(s)) return at;
+    return blink_str_count_cps(s, at);
 }
 #endif
 
