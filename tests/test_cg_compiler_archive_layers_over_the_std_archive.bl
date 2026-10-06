@@ -63,10 +63,13 @@ fn user_cfg() -> CgConfig {
         archive_over_std: 0 }
 }
 
-// A std generic instantiated at a type of this layer, a std function the layer calls, a
-// global that cannot take its value on its definition line, and a private function.
+// A std generic instantiated at a type of this layer, a non-generic std function the layer
+// calls, a std global the layer reads, a global that cannot take its value on its definition
+// line, and a private function.
 fn layer_src() -> Str {
     #"import std.list.{list_skip}
+import std.str.{str_trim}
+import std.process.{SIGTERM}
 
 type Point { x: Int, y: Int }
 
@@ -80,8 +83,17 @@ fn rest_len(ps: List[Point]) -> Int {
     list_skip(ps, 1).len()
 }
 
+fn tidy(s: Str) -> Str {
+    str_trim(s)
+}
+
+fn term_signal() -> Int {
+    SIGTERM
+}
+
 fn main() {
-    let _ = bump(rest_len([origin]))
+    let _ = bump(rest_len([origin]) + term_signal())
+    let _ = tidy(" a ")
 }
 "#
 }
@@ -167,6 +179,32 @@ test "a user unit runs the stdlib globals init before its own" {
     assert(std_at < own_at, "the shim runs the program init before the stdlib init")
 }
 
+// The stdlib archive defines every non-generic std function, so the layer only declares
+// one it calls.
+test "the layer defines no non-generic std function it calls" {
+    let c = layer_c("cg_layer_std_body_probe")
+    assert(c.contains("str_trim("), "the layer does not reach str_trim")
+    let defs = definitions_naming(c, "str_trim(")
+    assert_eq(defs.len(), 0, "the layer defines str_trim: {defs.join(", ")}")
+}
+
+// The program reads the layer globals through this header. The stdlib archive header
+// already declares the std globals.
+test "the layer header declares its own globals extern and no std global" {
+    let program = build_probe(layer_src(), "cg_layer_header_globals_probe")
+    let h = generate_archive_header(program, layered_cfg())
+    let c = generate(program, layered_cfg())
+    assert(c.contains("blink_std_process_SIGTERM"), "the layer does not read the std global SIGTERM")
+    let mut own = 0
+    let mut std: List[Str] = []
+    for line in h.split("\n") {
+        if !line.starts_with("extern ") { continue }
+        if line.contains("blink_u_origin") { own = own + 1 }
+        if line.contains("blink_std_") { std.push(line) }
+    }
+    assert(own == 1, "the header has {own} extern declarations of origin:\n{h}")
+    assert_eq(std.len(), 0, "the header declares std globals: {std.join(", ")}")
+}
 
 // The proof that nothing collides at link: the layer compiles against the stdlib archive
 // header, and the only names it exports are its own module's and its init function. A
