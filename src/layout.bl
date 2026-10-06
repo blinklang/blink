@@ -14,7 +14,7 @@ import typecheck.{
     TyKind, tk_name, tc_tid_kind, tc_tid_child, tc_tid_child_count, tc_tid_name, tc_resolve,
     tc_is_unbound_metavar, tc_lookup_node_tid, tc_type_decl_nodes, tc_tid_decl_node,
     DECL_NODE_AMBIGUOUS, tc_resolve_transparent_alias_name, tc_type_has_display_impl, tc_type_str, tc_decl_derive_args,
-    TYPE_I32,
+    TYPE_I32, tc_struct_field_slots, tc_sfield_tid, tc_sfield_name, tc_member_tid_at_instance,
 }
 import parser.{
     node_fields, node_name, node_value, node_kind, node_type_params,
@@ -26,7 +26,8 @@ import diagnostics.{diag_ice_at, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN}
 import cname.{
     c_typedef_name, c_type_decl_name, c_seg_inner, c_tuple_member, c_vtable_type_name, c_kops_table_name,
     td_guard_open_lines, td_guard_close_line, cname_reset, cname_mark_transparent_newtype,
-    cname_mark_runtime_owned, cname_is_transparent_newtype,
+    cname_mark_runtime_owned, cname_is_transparent_newtype, cname_is_runtime_owned, c_gc_layout_name,
+    c_field_name,
 }
 
 pub type Position { Local, Field, Param, Return, ContainerSlot, VtableSlot, TupleElem }
@@ -371,6 +372,69 @@ pub fn ensure_typedef_for(tid: Int) -> Str {
         lo_emit_tuple_typedef(r, rec.c_spelling)
     }
     rec.c_spelling
+}
+
+// The function that answers the collector descriptor for a heap copy of `tid`, with its
+// definition queued in the typedef buffer, or "" when the copy must be scanned whole. A
+// word is left out of the scan only when its field's type can never hold a pointer, so
+// any type this cannot read field by field is scanned whole rather than guessed at.
+// `pointee_spelling` is what the box is sized by; a box whose pointee is not this tid's
+// own struct typedef is not one this layout describes.
+pub fn box_gc_layout_of(tid: Int, pointee_spelling: Str) -> Str {
+    if lo_decline_reason_of(tid) != "" { return "" }
+    let r = lo_res(tid)
+    if tc_tid_kind(r) != TyKind.Struct || lo_fits_word(r) { return "" }
+    let decl = tc_tid_decl_node(r)
+    if decl < 0 || cname_is_runtime_owned(decl) { return "" }
+    if c_typedef_name(r) != pointee_spelling { return "" }
+    let name = c_gc_layout_name(r)
+    if diag_is_ice_seg(name) { return "" }
+    if typedef_guard.contains_key(name) != 0 { return name }
+    let inst = if tc_tid_child_count(r) > 0 { r } else { -1 }
+    let mut spans: List[Str] = []
+    for slot in tc_struct_field_slots(r) {
+        let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), inst)
+        let rec = field_layout_of(r, ftid)
+        if rec.decline_reason != "" { return "" }
+        if lo_field_never_holds_pointer(ftid, rec) { continue }
+        let f = c_field_name(tc_sfield_name(slot))
+        spans.push("offsetof({pointee_spelling}, {f}), sizeof((({pointee_spelling}*)0)->{f})")
+    }
+    let size = "(int64_t)sizeof({pointee_spelling})"
+    let call = if spans.len() == 0 {
+        "blink_gc_descr_get(&cell, {size}, NULL, 0)"
+    } else {
+        "blink_gc_descr_get(&cell, {size}, spans, {spans.len()})"
+    }
+    let table = if spans.len() == 0 { "" } else { "    static const int64_t spans[] = \{ {spans.join(", ")} };\n" }
+    lo_guard_and_push(name, "static BLINK_UNUSED GC_descr {name}(void) \{\n    static blink_gc_descr_cell cell;\n{table}    return {call};\n}")
+    name
+}
+
+// Only a field whose every value is an integer or a float word. An enum qualifies only as
+// an ordinal or a transparent newtype; an opaque handle is a foreign pointer.
+fn lo_field_never_holds_pointer(field_tid: Int, rec: LayoutRecord) -> Bool {
+    if rec.slot_form != SlotForm.InlineWord { return false }
+    let r = lo_res(field_tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Enum {
+        if lo_is_transparent_newtype(r) { return true }
+        return !lo_is_opaque(r) && !lo_decl_is_data_enum(tc_tid_decl_node(r))
+    }
+    match k {
+        TyKind.Int => true
+        TyKind.I8 => true
+        TyKind.I16 => true
+        TyKind.I32 => true
+        TyKind.U8 => true
+        TyKind.U16 => true
+        TyKind.U32 => true
+        TyKind.U64 => true
+        TyKind.Float => true
+        TyKind.Bool => true
+        TyKind.Char => true
+        _ => false
+    }
 }
 
 // Drains the typedef buffer in emit order. Each entry is one guarded block.

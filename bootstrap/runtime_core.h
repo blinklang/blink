@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stddef.h>
 #include <time.h>
 #include <unistd.h>
 #ifndef _WIN32
@@ -26,6 +27,16 @@
 #endif
 #define GC_THREADS
 #include <gc.h>
+/* The vendored headers sit flat beside gc.h; a system install keeps this one under gc/. */
+#if defined(__has_include)
+#if __has_include(<gc_typed.h>)
+#include <gc_typed.h>
+#else
+#include <gc/gc_typed.h>
+#endif
+#else
+#include <gc_typed.h>
+#endif
 
 #ifdef __GNUC__
 #define BLINK_UNUSED __attribute__((unused))
@@ -469,6 +480,63 @@ BLINK_RT_FN void* blink_alloc_atomic(int64_t size) {
     blink_arena_t* a = __blink_current_arena;
     if (a != NULL) return blink_arena_alloc_atomic(a, size);
     void* p = GC_MALLOC_ATOMIC((size_t)size);
+    if (!p) {
+        fprintf(stderr, "blink: out of memory\n");
+        exit(1);
+    }
+    return p;
+}
+#endif
+
+/* A heap copy of a struct whose pointer words are known. The collector scans
+   only the words its descriptor marks, so a struct that is mostly integers costs
+   the marker only its pointers. One cell per struct type holds the descriptor,
+   built on first use from that type's pointer spans: `spans` is n pairs of
+   (byte offset, byte length), and every word a span touches is marked. A
+   descriptor of 0 means no word can hold a pointer, so the copy is atomic. A
+   typed block must never reach GC_REALLOC, which would drop its descriptor. */
+typedef struct { GC_descr descr; int ready; } blink_gc_descr_cell;
+
+BLINK_RT_FN GC_descr blink_gc_descr_init(blink_gc_descr_cell* cell, int64_t size, const int64_t* spans, int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN GC_descr blink_gc_descr_init(blink_gc_descr_cell* cell, int64_t size, const int64_t* spans, int64_t n) {
+    int64_t wsz = (int64_t)sizeof(GC_word);
+    int64_t nwords = (size + wsz - 1) / wsz;
+    int64_t bits = (int64_t)(8 * sizeof(GC_word));
+    GC_word* bm = (GC_word*)calloc((size_t)((nwords + bits - 1) / bits + 1), sizeof(GC_word));
+    if (!bm) {
+        fprintf(stderr, "blink: out of memory\n");
+        exit(1);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t off = spans[2 * i];
+        int64_t len = spans[2 * i + 1];
+        if (len <= 0) continue;
+        for (int64_t w = off / wsz; w <= (off + len - 1) / wsz && w < nwords; w++) GC_set_bit(bm, w);
+    }
+    GC_descr d = GC_make_descriptor(bm, (size_t)nwords);
+    free(bm);
+    /* Two threads may both build it; they build the same value. */
+    cell->descr = d;
+    __atomic_store_n(&cell->ready, 1, __ATOMIC_RELEASE);
+    return d;
+}
+#endif
+
+static inline GC_descr blink_gc_descr_get(blink_gc_descr_cell* cell, int64_t size, const int64_t* spans, int64_t n) {
+    if (__builtin_expect(__atomic_load_n(&cell->ready, __ATOMIC_ACQUIRE), 1)) return cell->descr;
+    return blink_gc_descr_init(cell, size, spans, n);
+}
+
+BLINK_RT_FN void* blink_alloc_typed(int64_t size, GC_descr d);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_alloc_typed(int64_t size, GC_descr d) {
+    blink_arena_t* a = __blink_current_arena;
+    if (a != NULL) return blink_arena_alloc(a, size);
+    if (d == 0) return blink_alloc_atomic(size);
+    /* The descriptor may cover the last word whole, so the block must too. */
+    int64_t wsz = (int64_t)sizeof(GC_word);
+    void* p = GC_MALLOC_EXPLICITLY_TYPED((size_t)((size + wsz - 1) / wsz * wsz), d);
     if (!p) {
         fprintf(stderr, "blink: out of memory\n");
         exit(1);
