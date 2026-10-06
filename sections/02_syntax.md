@@ -1885,7 +1885,7 @@ test "platform specific" {
 **JSON output for skipped tests:**
 
 ```json
-{"name": "async test", "status": "skipped", "reason": "waiting on async support"}
+{"record": "test", "file": "tests/test_async.bl", "name": "async test", "status": "skipped", "reason": "waiting on async support"}
 ```
 
 Both `@skip` and `skip()` produce the same `"skipped"` status in JSON output. The `"skipped"` count in the summary reflects both.

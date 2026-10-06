@@ -608,46 +608,32 @@ fn parse_int(s: Str) -> Result[Int, ParseError] {
 blink test --json
 ```
 
+The output is NDJSON: one complete JSON object per line. Each line has a `record` key that names its kind:
+
+| `record` | Written | Carries |
+|----------|---------|---------|
+| `"test"` | when a test ends | `file`, and the test record described below |
+| `"file"` | when a test file ends, or when it does not build | `file`, `outcome`, `summary`, and the fields of its outcome (§8.10.5) |
+| `"run"` | last, once | `summary` for all tests, and `files` (§8.10.5) |
+
 ```json
-{
-  "suite": "auth",
-  "results": [
-    {
-      "name": "login succeeds with valid credentials",
-      "status": "passed",
-      "duration_ms": 12
-    },
-    {
-      "name": "login rejects after rate limit",
-      "status": "failed",
-      "cause": "assertion",
-      "assertion": "assert_eq(result, Err(RateLimit))",
-      "expected": "Err(RateLimit)",
-      "actual": "Ok(AuthSuccess { ... })",
-      "span": {"file": "src/auth.bl", "line": 58, "col": 5}
-    },
-    {
-      "name": "connect and query",
-      "status": "failed",
-      "cause": "propagated_error",
-      "error": {
-        "message": "connection refused: 127.0.0.1:5432",
-        "error_type": "pg.ConnectError"
-      },
-      "span": {"file": "src/db_test.bl", "line": 12, "col": 21}
-    },
-    {
-      "name": "session token decodes",
-      "status": "panicked",
-      "message": "unwrap called on None",
-      "span": {"file": "src/auth.bl", "line": 91, "col": 17}
-    }
-  ],
-  "summary": {"total": 14, "passed": 11, "failed": 2, "panicked": 1, "skipped": 0, "duration_ms": 340}
-}
+{"record": "test", "file": "tests/test_auth.bl", "name": "login succeeds with valid credentials", "status": "passed", "duration_ms": 12}
+{"record": "test", "file": "tests/test_db.bl", "name": "connect and query", "status": "failed", "cause": "propagated_error", "error": {"message": "connection refused: 127.0.0.1:5432", "error_type": "pg.ConnectError"}, "span": {"file": "tests/test_db.bl", "line": 12, "col": 21}}
+{"record": "test", "file": "tests/test_auth.bl", "name": "login rejects after rate limit", "status": "failed", "cause": "assertion", "assertion": "assert_eq(result, Err(RateLimit))", "expected": "Err(RateLimit)", "actual": "Ok(AuthSuccess { ... })", "span": {"file": "src/auth.bl", "line": 58, "col": 5}}
+{"record": "test", "file": "tests/test_auth.bl", "name": "session token decodes", "status": "panicked", "message": "unwrap called on None", "span": {"file": "src/auth.bl", "line": 91, "col": 17}}
+{"record": "file", "file": "tests/test_db.bl", "outcome": "ran", "summary": {"total": 1, "passed": 0, "failed": 1, "panicked": 0, "skipped": 0, "duration_ms": 31}}
+{"record": "file", "file": "tests/test_auth.bl", "outcome": "ran", "summary": {"total": 3, "passed": 1, "failed": 1, "panicked": 1, "skipped": 0, "duration_ms": 340}}
+{"record": "run", "summary": {"total": 4, "passed": 1, "failed": 2, "panicked": 1, "skipped": 0, "duration_ms": 352}, "files": {"total": 2, "ran": 2, "build_failed": 0, "aborted": 0}}
 ```
 
 The AI reads structured test failures the same way it reads structured compiler errors — exact location, expected vs actual values, no string parsing.
+
+**Stream rules.**
+
+- A `test` line is final when it is written. No later line changes or removes it.
+- Test files run in parallel, so lines from different files interleave. The lines of one file keep their order, and that file's `file` line comes after all of its `test` lines. A consumer groups `test` lines by `file`, not by position.
+- A consumer ignores a line whose `record` value it does not know. This rule applies to `record` only. `status`, `cause` and `outcome` are closed enums.
+- `blink test` on one file writes the same lines as on a directory.
 
 **Failure `cause` discriminator.** Records with `"status": "failed"` carry a `cause` field whose value is one of a closed enum:
 
@@ -669,13 +655,13 @@ A `panicked` record has no `cause`, no `error` object and no `assertion` fields.
 
 `message` and `span` have one meaning on every status that carries them: `message` is the text of the outcome, and `span` is where the outcome fired.
 
-**Summary and exit code.** The `summary` object always carries all six keys — `total`, `passed`, `failed`, `panicked`, `skipped`, `duration_ms` — even when a count is `0`. The counts partition the tests:
+**Summary and exit code.** The `summary` object on every `file` line and on the `run` line always carries all six keys — `total`, `passed`, `failed`, `panicked`, `skipped`, `duration_ms` — even when a count is `0`. The counts partition the `test` lines it covers:
 
 ```
 total = passed + failed + panicked + skipped
 ```
 
-A test counts once, under the status of its record. The test binary exits non-zero when `failed + panicked > 0`. A panic has no exit code of its own.
+A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise (§8.10.5).
 
 **Human-readable output.** The per-test line for a panicked test uses the word `PANIC`, and the panic message follows it:
 
@@ -705,7 +691,7 @@ test rejects bad header ... ok
   warning: E0824 cleanup panicked during unwind: close on released handle
 ```
 
-A signal crash (for example `SIGSEGV`) is not a Blink panic. This section does not specify a record for it.
+A signal crash (for example `SIGSEGV`) is not a Blink panic and gives no `test` line. It ends the test binary, and the `file` line reports it with `outcome: "aborted"` (§8.10.5).
 
 ```sh
 blink test                       # run all tests
@@ -1160,27 +1146,30 @@ FAIL  tests/test_parser.bl::"reverse is involutive"
 NDJSON form (`blink test --json`):
 
 ```json
-{"event": "test_fail",
+{"record": "test",
+ "file": "tests/test_parser.bl",
  "name": "reverse is involutive",
- "module": "test_parser",
+ "status": "failed",
+ "cause": "assertion",
  "seed": "0xDEADBEEFCAFE1234",
  "shrunk_input": "[1, 2, 2, -9]",
  "reproduce": "blink test --seed 0xDEADBEEFCAFE1234 --filter 'reverse is involutive'",
- "loc": {"file": "tests/test_parser.bl", "line": 42, "col": 3}}
+ "span": {"file": "tests/test_parser.bl", "line": 42, "col": 3}}
 ```
 
-When a property fails because a `?` inside the property closure propagated an `Err` (rather than an assertion failing), the same `test_fail` event additionally carries the `cause` discriminator and the `error` object — the property fields and the propagated-error fields co-exist in one record:
+When a property fails because a `?` inside the property closure propagated an `Err` (rather than an assertion failing), the `test` line carries `cause: "propagated_error"` and the `error` object — the property fields and the propagated-error fields co-exist in one record:
 
 ```json
-{"event": "test_fail",
+{"record": "test",
+ "file": "tests/test_net.bl",
  "name": "port strings round-trip",
- "module": "test_net",
+ "status": "failed",
  "cause": "propagated_error",
  "error": {"message": "invalid port: 70000", "error_type": "net.ParseError"},
  "seed": "0xDEADBEEFCAFE1234",
  "shrunk_input": "70000",
  "reproduce": "blink test --seed 0xDEADBEEFCAFE1234 --filter 'port strings round-trip'",
- "loc": {"file": "tests/test_net.bl", "line": 18, "col": 21}}
+ "span": {"file": "tests/test_net.bl", "line": 18, "col": 21}}
 ```
 
 The human-readable form mirrors an assertion failure, with the rendered error directly beneath the shrunk input:
@@ -1280,15 +1269,82 @@ The following are intentionally out of scope for this subsection and are tracked
 
 ---
 
-#### 8.10.5 Test files that do not build
+#### 8.10.5 File outcomes: files that do not build or do not finish
 
-A test file that does not build is not a test. `blink test` reports it as a build failure for that file and runs the other files.
+A test file that does not build is not a test. `blink test` reports it as a build failure for that file and runs the other files. A file that does not build never stops the run: each such file gets its own diagnostics.
 
-The runner has no store, flag or event class for files that do not build. This section does not specify an NDJSON record for a build failure.
+The runner has no store, flag or event class for files that do not build.
+
+Every test file gives exactly one `file` line (§8.10). Its `outcome` is one value of a closed enum:
+
+| `outcome` | Meaning | Fields for this outcome |
+|-----------|---------|-------------------------|
+| `"ran"` | The test binary reported the end of its run and was not ended by a signal. | — |
+| `"build_failed"` | The file did not build. None of its tests ran. | `diagnostics` |
+| `"aborted"` | The test binary was ended by a signal, or it exited before it reported the end of its run. An exit with code `0` before that point is `aborted` too. | `signal` or `exit_code`; `running` when known |
+
+Every `file` line carries the six-key `summary`. For `build_failed`, every count is `0`: the file added no tests. For `aborted`, the counts cover the `test` lines that the file wrote before it ended. Those lines stay in the stream and count in the `run` summary.
+
+```json
+{"record": "file", "file": "tests/test_codec.bl", "outcome": "ran", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 1}}
+{"record": "file", "file": "tests/test_parse.bl", "outcome": "build_failed", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 0},
+ "diagnostics": [{"severity": "error", "name": "TypeError", "code": "E0300", "message": "expected Int, found Str", "span": {"file": "tests/test_parse.bl", "line": 14, "col": 22}}]}
+{"record": "file", "file": "tests/test_ffi.bl", "outcome": "aborted", "signal": "SIGSEGV", "running": "reads mapped page", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 9}}
+{"record": "run", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 10}, "files": {"total": 3, "ran": 1, "build_failed": 1, "aborted": 1}}
+```
+
+The first line is a file that built and holds no tests. Compare it with the second: the counts are the same, and `outcome` tells the two apart.
+
+**`build_failed` fields.**
+
+- `diagnostics` is a list of diagnostic objects in the shape of §8.6. It is never empty.
+- A diagnostic with no source location has no `span`. It never carries a placeholder location such as `line: 0`.
+- When the front end accepts the file and a later build step fails, `diagnostics` holds one diagnostic for that step:
+  - The generated C does not compile: `severity: "ice"` (internal compiler error). This is a compiler bug, not an error in the test file.
+  - The link step or a native-dependency step fails: `severity: "error"`. The cause is the project's setup, for example a missing native library.
+  - `message` names the failed step and gives the tool's first error line. `notes` is a list of strings that holds the tool's full output, one line per entry. `blink test` may cut `notes` short; when it does, the last entry says that the output was cut.
+
+**`aborted` fields.**
+
+- Exactly one of `signal` and `exit_code` is present. A process that a signal ended has no exit code.
+- `signal` is the signal name as a string, for example `"SIGSEGV"`. When the platform has no name for the signal, the value is `"SIG<n>"`, for example `"SIG34"`. A signal number is not portable (`SIGBUS` is 7 on Linux and 10 on macOS), so the record never carries a bare number.
+- `exit_code` is the code of a process that exited before it reported the end of its run.
+- `running` is the name of the test that was running when the binary ended. It is present only when `blink test` knows it, and it is never a guess or a placeholder. When the binary ended outside any test, `running` is absent.
+
+*Informative.* `blink test` can learn `running` because the test lines are written as each test ends: the running test is the first test, in the file's run order under the same filter, that has no `test` line.
+
+**Run counts and exit code.** The `run` line carries `files`:
+
+```
+files.total = files.ran + files.build_failed + files.aborted
+```
+
+When `files.aborted > 0`, the test counts are a lower bound: tests of an aborted file that wrote no `test` line are in no count.
+
+`blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It has no other non-zero exit code.
+
+**Human-readable output.** A file that does not build prints `BUILD FAILED` and its diagnostics. A file that aborted prints `ABORTED` and how it ended, with the test name when it is known:
+
+```
+BUILD FAILED tests/test_parse.bl
+  error[E0300]: expected Int, found Str
+  at tests/test_parse.bl:14:22
+
+ABORTED tests/test_ffi.bl
+  signal SIGSEGV in test "reads mapped page"
+```
+
+The summary line adds a file clause for each of these counts only when it is above `0`:
+
+```
+2 passed, 0 failed (of 2); 1 file did not build, 1 file aborted
+```
 
 *Informative.* To test that a compiler rejects a program, or does not yet accept it, write a test that builds: it passes the program's source as a string to a compile step and asserts the result. The project supplies that compile step; the standard library does not.
 
 **Panel vote: 6-0** to remove the `.tmp/<ticket>/` parking workflow, the `--parked` flag, the `parked_file` NDJSON event and the `.tmp/` lint. **5-1** for the behavioral sentence above and **5-1** for the informative note; Minimalism dissented on both (the build-failure behavior belongs with the separate ticket that specifies its record shape, and the note serves only projects whose tests drive a compiler). This supersedes the 5-1 parking vote of the expected-failure decision. See [DECISIONS.md](../DECISIONS.md) and [decisions/parking-removal-and-xfail-ticket.md](../decisions/parking-removal-and-xfail-ticket.md).
+
+**Panel vote** (file outcomes and the line stream): **6-0** for one `file` line per file with the closed `outcome` enum, the `files` counts, the exit code, the lower-bound rule, and `aborted` on an early exit with no end-of-run report; **6-0** for one line per test (after 3-3 in the first vote) and for ignoring an unknown `record` value; **6-0** for the signal name (after 3-3), with flat keys by user (BDFL) tiebreak after 3-3; **4-2** for the severity split by build step (Systems and DevOps dissented: generated C can fail on a user's header, so they wanted `error` for every step), with the tool output in `notes` by user decision; **5-1** for an all-zero `summary` on `build_failed` (Minimalism dissented); **5-1** for `running` with the method left informative (Minimalism dissented); **5-1** for the word `ABORTED` (Web/Scripting dissented for `CRASHED`/`EXITED`). See [DECISIONS.md](../DECISIONS.md) and [decisions/test-file-outcomes.md](../decisions/test-file-outcomes.md).
 
 ---
 
