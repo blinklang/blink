@@ -1600,34 +1600,40 @@ let result = with db.transaction() {
 
 #### Implementing BlockHandler
 
-Any type can implement `BlockHandler`:
-
-> **Note:** this example assigns to `self.start` in `enter`. That write does not persist: `self` is a by-value copy, and `exit` receives the value the `with` expression built (§3.6). How state passes from `enter` to `exit` is an open question (the BlockHandler state ticket). Do not copy the `self.start = ...` line.
+Any type can implement `BlockHandler`. A handler gets all its state when it is built: `self` is a by-value copy (§3.6), so `enter()` cannot pass new state to `exit()`. Put the build in a function, and call that function in the `with` item. Step 1 of the *Order* below evaluates the item right before `enter()`, so each `with` gets a new value:
 
 ```blink
-struct Timer {
+pub type Timer {
     label: Str
     start: Instant
+}
+
+pub fn timer(label: Str) -> Timer ! Time.Read {
+    Timer { label: label, start: time.read() }
 }
 
 impl BlockHandler for Timer {
     type Context = ()
 
-    fn enter(self) -> () {
-        self.start = time.now()
-    }
+    fn enter(self) -> () {}
 
-    fn exit(self, ok: Bool) ! IO.Log {
-        let elapsed = time.now().since(self.start)
-        io.log("{self.label}: {elapsed}ms (ok={ok})")
+    fn exit(self, ok: Bool) ! Time.Read, IO.Log {
+        let elapsed = self.start.elapsed()
+        io.log("{self.label}: {elapsed} (ok={ok})")
     }
 }
 
 // Usage
-with Timer { label: "db_query", start: time.now() } {
+with timer("db_query") {
     db.query("SELECT * FROM large_table")?
 }
 ```
+
+Nested items are correct for the same reason. In `with timer("a") { with timer("b") { } }`, each value is built right before its own `enter()`, and the two `exit()` calls run in LIFO order.
+
+A value that is stored and then goes into two `with` items runs `exit()` twice on one state. The scope lints (§5.5) warn about this: W0610 for a value that reaches no `with`, and W0611 for a value that reaches more than one.
+
+`enter()` cannot write to `self`. An assignment such as `self.start = time.read()` is a parameter assignment, which is a compile error (§3.6). Inside `enter()` of a `BlockHandler` impl, that error's help text names the fix: set the field when the value is built, and build the value in the `with` item.
 
 #### Scoped effect handlers
 
@@ -1685,7 +1691,9 @@ The rule applies only when `T.Context` normalizes to `Handler[E]` with a concret
 
 **Binding.** `with expr as name { }` installs the handler and binds `name` to the same `Handler[E]` value. `name` follows the scoping rules in *Interaction with async* below.
 
-**Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Entering the same value in two `with` blocks runs `exit()` twice. The scope lint (§5.5) warns about a scoped value that does not go into a `with`.
+**Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Build it in the `with` item, as `connect` does above. Entering the same value in two `with` blocks runs `exit()` twice; W0611 (§5.5) warns about it.
+
+A second `exit()` on a value whose resource is already released should do nothing, or should fail with a defined error. The stdlib's native handles do this: after `close`, a call on the handle returns an error such as `Err(ConnectionError("connection is closed"))`, not a use-after-free. This is guidance for user impls, not a rule the compiler checks. `std.testing`'s `Cleanup` runs its action on each `exit()`, so a second entry runs the action a second time.
 
 A failed acquisition uses `?` on the item: `with db.connect(p)? { }`. The `?` fires before the scope is entered, so a failed open needs no cleanup.
 
