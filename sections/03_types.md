@@ -695,7 +695,7 @@ fn format_log() -> Str ! Time.Read {
 }
 ```
 
-**Instant** is an opaque struct (no public fields). It has nanosecond precision.
+**Instant** is an opaque type (§2.12.2), declared `pub opaque type Instant` in `std.time`. It has nanosecond precision. Code builds an `Instant` only through `time.read()` and its type-scoped functions, such as `Instant.from_epoch_secs` (§2.12.3).
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
