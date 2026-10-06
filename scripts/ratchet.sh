@@ -60,10 +60,12 @@
 #                            `parser.nodes`. A historical ref is
 #                            materialized with src/ alone, so its count leaves out
 #                            lib/ and tests/; the zero gate still holds the tree
-#   str_substring_callers    a `.substring(` or `.substr(` call anywhere in src/;
-#                            absolute zero gate. src/ reads text by byte offset,
-#                            which Str.byte_slice names. Str.slice is the same
-#                            debt but is not counted: the text alone cannot tell
+#   str_substring_callers    a `.substring(` or `.substr(` call anywhere in src/,
+#                            or a `.substr(` call anywhere in lib/; absolute zero
+#                            gate. src/ reads text by byte offset, which
+#                            Str.byte_slice names, and Str has no `substr`.
+#                            lib/ may still call `substring`. Str.slice is gone
+#                            too but is not counted: the text alone cannot tell
 #                            it from List.slice and Bytes.slice
 #
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
@@ -177,6 +179,12 @@ pool_writes() {
   echo "$total"
 }
 
+# lib/ nests (std/, pkg/), so it is searched as a tree rather than through a glob.
+lib_substr() {
+  [ -d "$1/lib" ] || { echo 0; return; }
+  rg -o -g '*.bl' '\.substr\(' "$1/lib" 2>/dev/null | wc -l | tr -d ' '
+}
+
 # Takes a root dir instead of reading the repo directly, so the same row
 # definitions run against the real tree, a materialized historical ref, or a
 # synthetic test fixture without duplicating the row list three times.
@@ -196,7 +204,7 @@ cg_name_string_compares $(cnt '\b[a-z_0-9]*(method|name|trait)[a-z_0-9]*(\([^()]
 fallback_idiom $(pcnt 'if ([a-z_][a-z_0-9.]*) >= 0 \{ \1 \} else' "$allbl")
 typecheck_str_keyed_tables $(cnt '^(pub )?let mut [A-Za-z_][A-Za-z_0-9]*: Map\[Str' "$tcbl")
 node_pool_writes $(pool_writes "$root")
-str_substring_callers $(cnt '\.(substring|substr)\(' "$allbl")
+str_substring_callers $(( $(cnt '\.(substring|substr)\(' "$allbl") + $(lib_substr "$root") ))
 ROWS
 }
 

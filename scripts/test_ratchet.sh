@@ -201,6 +201,33 @@ check_named_row str_substring_callers lexer.bl \
 check_named_row str_substring_callers typecheck.bl \
   'let head = name.substr(0, dot)'
 
+# In lib/, `substr` counts and `substring` does not: lib/ may still read by codepoint.
+LIBSUBSTR="$WORK/lib_substr"
+rm -rf "$LIBSUBSTR"
+cp -r "$BASE" "$LIBSUBSTR"
+printf '%s\n' 'fn head(s: Str) -> Str { s.substr(0, 1) }' >> "$LIBSUBSTR/lib/std/text.bl"
+out=$(RATCHET_SRC_DIR="$LIBSUBSTR" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+if [ $? = 0 ]; then
+  echo "FAIL str_substring_callers-lib: a lib/ substr did not fail ratchet.sh"
+  fail=1
+elif ! printf '%s\n' "$out" | rg -q '^str_substring_callers .*NONZERO'; then
+  echo "FAIL str_substring_callers-lib: the run failed, but not on str_substring_callers"
+  printf '%s\n' "$out"
+  fail=1
+else
+  echo "PASS str_substring_callers-lib: a lib/ substr failed ratchet.sh"
+fi
+LIBSUBSTRING="$WORK/lib_substring"
+rm -rf "$LIBSUBSTRING"
+cp -r "$BASE" "$LIBSUBSTRING"
+printf '%s\n' 'fn head(s: Str) -> Str { s.substring(0, 1) }' >> "$LIBSUBSTRING/lib/std/text.bl"
+if RATCHET_SRC_DIR="$LIBSUBSTRING" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "PASS str_substring_callers-lib-substring: a lib/ substring passed ratchet.sh"
+else
+  echo "FAIL str_substring_callers-lib-substring: a lib/ substring failed ratchet.sh"
+  fail=1
+fi
+
 # A branch on one value that answers with another is not the idiom: the row
 # needs the same name on both sides, or it counts every signed compare.
 NOFALLBACK="$WORK/no_fallback"
