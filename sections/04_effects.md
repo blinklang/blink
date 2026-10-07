@@ -1849,7 +1849,7 @@ fn logging_db(label: Str) -> Handler[DB] {
 
 The compiler desugars the above as if `write` and `admin` were defined with `default.write(query)` and `default.admin(query)` respectively. Explicit `default.op(args)` remains available for custom delegation logic (e.g., logging before forwarding, as shown for `read` above).
 
-`default` is a contextual name, not a keyword. In the body of a handler operation, `default.op(args)` delegates to the handler that this operation's handler was installed over. Elsewhere, an unshadowed use of `default` is a compile error (E0544). A local binding named `default` shadows it.
+`default` is a contextual name, not a keyword. In the body of a handler operation, `default.op(args)` delegates to the handler that this operation's handler was installed over. Elsewhere, including in a closure written inside an operation body, an unshadowed use of `default` is a compile error (E0544). A local binding named `default` shadows it.
 
 ```blink
 effect Audit {
@@ -1875,6 +1875,45 @@ error[DefaultOutsideHandlerOp]: `default` is only valid inside a handler operati
 ```
 
 The second help line shows the call through the effect's handle (§4.4), built from the handle and the operation of the call. When the compiler cannot build it, the line says: "Outside an operation, call the effect operation directly through its handle, or move this call into a handler operation." There is no machine-applicable fix: a call through the handle goes to the innermost handler, so it does not do the same thing as a delegation.
+
+A closure body is not a handler operation body, even when the closure is written inside one. `default` in such a closure is E0544, whether or not the closure outlives the operation. The message names the closure:
+
+```blink
+with handler Audit {
+    fn record(msg: Str) {
+        msg.split("\n").for_each(fn(l) { default.record(l) })   // error: inside a closure
+    }
+} {
+    audit.record("a\nb")
+}
+```
+
+```
+error[DefaultOutsideHandlerOp]: `default` is not valid inside a closure, even in a handler operation
+ --> audit.bl:3:42
+  |
+3 |         msg.split("\n").for_each(fn(l) { default.record(l) })   // error: inside a closure
+  |                                          ^^^^^^^
+  |
+  = help: a closure body is not an operation body; call `default.record` in the operation body itself
+  = help: a closure that runs while the operation runs can call `audit.record(l)`, which reaches the same handler
+```
+
+The second help line follows from the next rule. There is no machine-applicable fix, because a closure that runs after the operation has returned does not reach the same handler.
+
+**A handler does not handle its own operations.** While an operation body of a handler runs, that handler is not in force for the effect it handles. Every call through the effect's handle made while the body runs reaches the handler that this operation's handler was installed over. This holds whether the call is written in the body, in a closure that the body calls, or in a function that the body calls. Handlers of other effects stay in force. In an operation body, `audit.record(m)` and `default.record(m)` therefore do the same thing, and the closure above can be written as:
+
+```blink
+with handler Audit {
+    fn record(msg: Str) {
+        msg.split("\n").for_each(fn(l) { audit.record(l) })   // reaches the outer handler
+    }
+} {
+    audit.record("a\nb")
+}
+```
+
+When the operation returns or panics, the handler is in force again. A closure that runs after the operation has returned performs its effects with the handlers in force where it is called (§4.15.4). If no outer handler implements the operation, the call panics, as below.
 
 Auto-delegation means a `Handler[DB]` that only overrides `read` is still a complete `Handler[DB]` — the type system does not distinguish partial from total handlers. At runtime, unhandled operations bubble up to the nearest enclosing handler that implements them.
 
