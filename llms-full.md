@@ -559,7 +559,10 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
+| `List.new()` | List[T] | Create an empty list; T comes from context or later use, or write `List.new[T]()` |
+| `List.with_capacity(n)` | List[T] | Create an empty list with room for at least n elements; T as for `List.new()`. n <= 0 is the same as `List.new()` |
 | `.len()` | Int | Length |
+| `.capacity()` | Int | Elements the list holds before it grows; always >= `.len()` |
 | `.is_empty()` | Bool | Check if empty |
 | `.push(item)` | () | Append (mutates) |
 | `.pop()` | Option[T] | Remove last |
@@ -583,7 +586,9 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.enumerate()` | List[(Int,T)] | Index each element (eager, list of tuples) |
 | `.take(n)` | List[T] | First n (eager) |
 | `.skip(n)` | List[T] | All but first n (eager) |
-| `.clear()` | () | Remove all elements (mutates) |
+| `.clear()` | () | Remove all elements (mutates); does not lower `.capacity()` |
+
+Use `List.with_capacity(n)` only when the final size is known. `.capacity()` is for tests and diagnostics; do not branch on it.
 
 ## Iterator[T] (Lazy)
 
