@@ -1,0 +1,110 @@
+import lexer.{lex, token_count, token_at, tokens}
+import tokens.{TokenKind, token_kind_name}
+
+// One row as text, read from the columns, so a failure names the token that differs.
+fn row(i: Int) -> Str {
+    let k = token_kind_name(tokens.kinds.get(i).unwrap())
+    "{k} [{tokens.values.get(i).unwrap()}] {tokens.lines.get(i).unwrap()}:{tokens.cols.get(i).unwrap()}-{tokens.end_cols.get(i).unwrap()}"
+}
+
+// The same row read through the Token view the language server uses.
+fn view_row(i: Int) -> Str {
+    let t = token_at(i)
+    "{token_kind_name(t.kind)} [{t.value}] {t.line}:{t.col}-{t.end_col}"
+}
+
+fn rows() -> List[Str] {
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < token_count() {
+        out.push(row(i))
+        assert_eq(view_row(i), row(i))
+        i = i + 1
+    }
+    out
+}
+
+test "every field of every token reads back across many lines" {
+    let n = 3000
+    let mut src = StringBuilder.new()
+    let mut i = 0
+    while i < n {
+        src.write("let x{i} = {i * 7} + y\n")
+        i = i + 1
+    }
+    lex(src.to_str())
+    // let, ident, =, int, +, ident, newline per line, then EOF.
+    assert_eq(token_count(), n * 7 + 1)
+    assert_eq(tokens.values.len(), token_count())
+    assert_eq(tokens.lines.len(), token_count())
+    assert_eq(tokens.cols.len(), token_count())
+    assert_eq(tokens.end_cols.len(), token_count())
+    let got = rows()
+    let mut l = 0
+    while l < n {
+        let b = l * 7
+        let line = l + 1
+        let name = "x{l}"
+        let num = "{l * 7}"
+        let c_eq = 5 + name.byte_len() + 1
+        let c_num = c_eq + 2
+        let c_plus = c_num + num.byte_len() + 1
+        assert_eq(got.get(b).unwrap(), "let [let] {line}:1-4")
+        assert_eq(got.get(b + 1).unwrap(), "IDENT [{name}] {line}:5-{5 + name.byte_len()}")
+        assert_eq(got.get(b + 2).unwrap(), "= [=] {line}:{c_eq}-{c_eq + 1}")
+        assert_eq(got.get(b + 3).unwrap(), "INT [{num}] {line}:{c_num}-{c_num + num.byte_len()}")
+        assert_eq(got.get(b + 4).unwrap(), "+ [+] {line}:{c_plus}-{c_plus + 1}")
+        assert_eq(got.get(b + 5).unwrap(), "IDENT [y] {line}:{c_plus + 2}-{c_plus + 3}")
+        assert_eq(got.get(b + 6).unwrap(), "NEWLINE [\\n] {line}:{c_plus + 3}-1")
+        l = l + 1
+    }
+    assert_eq(got.get(n * 7).unwrap(), "EOF [] {n + 1}:1-1")
+}
+
+test "string interpolation tokens keep their kinds, values and positions" {
+    lex("let s = \"a\{b\}c\"\nlet t = \"\{x\}\"\n")
+    let want = [
+        "let [let] 1:1-4", "IDENT [s] 1:5-6", "= [=] 1:7-8", "STRING_START [\"] 1:9-10",
+        "STRING_PART [a] 1:11-12", "INTERP_START [\{] 1:11-12", "IDENT [b] 1:12-13",
+        "INTERP_END [\}] 1:13-14", "STRING_PART [c] 1:15-16", "STRING_END [\"] 1:15-16",
+        "NEWLINE [\\n] 1:16-1",
+        "let [let] 2:1-4", "IDENT [t] 2:5-6", "= [=] 2:7-8", "STRING_START [\"] 2:9-10",
+        "STRING_PART [] 2:10-11", "INTERP_START [\{] 2:10-11", "IDENT [x] 2:11-12",
+        "INTERP_END [\}] 2:12-13", "STRING_PART [] 2:13-14", "STRING_END [\"] 2:13-14",
+        "NEWLINE [\\n] 2:14-1", "EOF [] 3:1-1",
+    ]
+    assert_eq(rows(), want)
+}
+
+test "a keyword token's value is its source spelling" {
+    let words = [
+        "fn", "if", "in", "as", "let", "mut", "for", "pub", "mod", "type", "impl", "else", "loop",
+        "with", "self", "test", "const", "trait", "match", "while", "break", "return", "import",
+        "effect", "assert", "handler", "continue", "assert_eq", "assert_ne", "assert_panics",
+    ]
+    lex(words.join(" "))
+    assert_eq(token_count(), words.len() + 1)
+    let mut i = 0
+    while i < words.len() {
+        assert(tokens.kinds.get(i).unwrap() != TokenKind.Ident, "{words.get(i).unwrap()} lexed as an identifier")
+        assert_eq(tokens.values.get(i).unwrap(), words.get(i).unwrap())
+        i = i + 1
+    }
+}
+
+test "a second lex replaces every column of the first" {
+    let mut big = StringBuilder.new()
+    let mut i = 0
+    while i < 500 {
+        big.write("fn f{i}() \{ g(\"s\{i\}\") \}\n")
+        i = i + 1
+    }
+    lex(big.to_str())
+    assert(token_count() > 5000)
+    lex("a.b")
+    assert_eq(rows(), ["IDENT [a] 1:1-2", ". [.] 1:2-3", "IDENT [b] 1:3-4", "EOF [] 1:4-4"])
+    assert_eq(tokens.values.len(), 4)
+    assert_eq(tokens.lines.len(), 4)
+    assert_eq(tokens.cols.len(), 4)
+    assert_eq(tokens.end_cols.len(), 4)
+}
