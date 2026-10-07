@@ -24,25 +24,27 @@ effect Parse {
 // ── Node pool ──────────────────────────────────────────────────────
 // Each node is an index into the pool. -1 means "no node".
 // A node stores only the fields it holds: a field that still holds its AstNode default
-// takes no space. Which fields a node holds is its shape, interned in a table, so the
-// pool keeps one `head` word per node: (int_base << 16) | shape. The node's Int fields sit
-// in `ints` from int_base on, and its Str fields in `strs`, in field order. A node of most
+// takes no space. Which fields a node holds is its shape, interned in a table. A node of most
 // kinds holds three or four fields of the 57, and one kind has many sets of fields (a fn
 // with or without a return type, pub or not), so a shape per node, not one per kind.
-// `at_<field>[shape]` is the field's offset in the node's payload, or -1 when the shape
-// does not hold it and a read answers `node_blank`'s value. A shape with a Str field puts
-// the start of its Str payload in Int word 0, so its Int fields start at 1.
-// Int and Str data stay in separate arenas because a List[Int] buffer is allocated
-// pointer-free, so the collector never scans the Int arena. Each arena is a list of chunks
-// of 65536 slots, addressed as chunk << 16 | index; a chunk is made at full size and never
-// moves, and a payload never straddles two chunks (it starts a new chunk and leaves the old
-// tail unused), so a payload is one run in one chunk.
+// `at_<field>[shape]` is the field's offset in the node's Int or Str payload, or -1 when the
+// shape does not hold it and a read answers `node_blank`'s value.
+// Nodes sit in chunks of 4096 ids. Chunk c of `ints` holds the head word of each of its
+// nodes at [0, 4096) and their Int payloads after that, and chunk c of `strs` holds their
+// Str payloads. A head word is (str_off << 40) | (int_off << 16) | shape, both offsets into
+// the node's own chunks, so a read finds the chunk from the id alone and goes from the head
+// word to the field with one more load: no load waits on a payload address read from
+// another arena. Int and Str data stay in separate lists because a List[Int] buffer is
+// allocated pointer-free, so the collector never scans the Int chunks.
+// A chunk is made with room for its predecessor's payload and an eighth more, since a chunk
+// that grows past its room is copied to one twice its size.
 // A write that gives a node a field its shape does not hold moves the node's whole payload
-// to the arena end under a wider shape; the old payload stays unread. Shapes only widen, so
-// a held field written back to its default keeps its slot.
-// `head`, `kind` and `child_at` are per node: `head` and `child_at` in chunks of 4096 as
-// above, `kind` in one flat list since almost every walk of the tree reads it and a read
-// through a chunk must load the chunk's own header first.
+// to its chunks' ends under a wider shape; the old payload stays unread. Shapes only widen,
+// so a held field written back to its default keeps its slot. A field that a later pass
+// writes on nearly every node of a kind is in the node's shape from its push
+// (`node_kind_fields`), so that pass moves no payloads into chunks that are already full.
+// `kind` is in one flat list since almost every walk of the tree reads it and a read through
+// a chunk must load the chunk's own header first; `child_at` is in chunks of 4096.
 // Only node_push, node_pop, node_replace, node_write_plain_int, node_write_plain_str,
 // parser_reset and the helpers they call write the pool.
 // `child_slots`: each node's children as ChildWalk.Slots writes them, one run per node. A
@@ -54,7 +56,6 @@ effect Parse {
 type NodeColumns {
     count: Int
     kind: List[Int]
-    head: List[List[Int]]
     ints: List[List[Int]]
     strs: List[List[Str]]
     shape_mask: List[Int]
@@ -132,7 +133,7 @@ let node_blank: AstNode = AstNode {}
 fn node_columns_empty() -> NodeColumns {
     let mut memo: List[Int] = List.with_capacity(512)
     while memo.len() < 512 { memo.push(-1) }
-    NodeColumns { count: 0, kind: [], head: [], ints: [], strs: [], shape_mask: [], shape_ints: [], shape_strs: [], shape_slot: [], shape_of_mask: Map(), shape_memo: memo, at_str_val: [], at_name: [], at_op: [], at_var_name: [], at_module: [], at_method: [], at_return_type: [], at_type_name: [], at_trait_name: [], at_leading_comments: [], at_trailing_comments: [], at_doc_comment: [], at_xfail_reason: [], at_int_val: [], at_left: [], at_right: [], at_body: [], at_condition: [], at_then_body: [], at_else_body: [], at_scrutinee: [], at_pattern: [], at_guard: [], at_value: [], at_target: [], at_iterable: [], at_is_mut: [], at_is_pub: [], at_is_const: [], at_inclusive: [], at_start: [], at_end: [], at_obj: [], at_index: [], at_params: [], at_args: [], at_stmts: [], at_arms: [], at_fields: [], at_elements: [], at_methods: [], at_type_params: [], at_effects: [], at_captures: [], at_type_ann: [], at_handlers: [], at_line: [], at_col: [], at_end_line: [], at_end_col: [], at_assoc_types: [], at_impl_binders: [], at_recv_type_args: [], at_impl_where_bounds: [], at_for_binder: [], at_supertraits: [], child_at: [], child_slots: [] }
+    NodeColumns { count: 0, kind: [], ints: [], strs: [], shape_mask: [], shape_ints: [], shape_strs: [], shape_slot: [], shape_of_mask: Map(), shape_memo: memo, at_str_val: [], at_name: [], at_op: [], at_var_name: [], at_module: [], at_method: [], at_return_type: [], at_type_name: [], at_trait_name: [], at_leading_comments: [], at_trailing_comments: [], at_doc_comment: [], at_xfail_reason: [], at_int_val: [], at_left: [], at_right: [], at_body: [], at_condition: [], at_then_body: [], at_else_body: [], at_scrutinee: [], at_pattern: [], at_guard: [], at_value: [], at_target: [], at_iterable: [], at_is_mut: [], at_is_pub: [], at_is_const: [], at_inclusive: [], at_start: [], at_end: [], at_obj: [], at_index: [], at_params: [], at_args: [], at_stmts: [], at_arms: [], at_fields: [], at_elements: [], at_methods: [], at_type_params: [], at_effects: [], at_captures: [], at_type_ann: [], at_handlers: [], at_line: [], at_col: [], at_end_line: [], at_end_col: [], at_assoc_types: [], at_impl_binders: [], at_recv_type_args: [], at_impl_where_bounds: [], at_for_binder: [], at_supertraits: [], child_at: [], child_slots: [] }
 }
 
 let mut columns: NodeColumns = node_columns_empty()
@@ -282,7 +283,7 @@ fn node_shape_new(m: Int) -> Int {
     }
     let base = s * 56
     let mut bit = 1
-    let mut ioff = if (m & 72048797944905728) != 0 { 1 } else { 0 }
+    let mut ioff = 0
     let mut soff = 0
     let mut f = 0
     while f < 56 {
@@ -361,105 +362,84 @@ fn node_shape_new(m: Int) -> Int {
     s
 }
 
-// The address of `n` free words at the end of an arena whose last chunk has `len` used
-// slots, given its chunk count; -1 when they do not fit in that chunk.
-fn node_arena_fit(chunks: Int, len: Int, n: Int) -> Int {
-    if chunks == 0 || len + n > 65536 { return -1 }
-    ((chunks - 1) << 16) + len
+// Appends `n`'s fields of shape `s` to the ends of node chunk `c` and returns the head word
+// that addresses them.
+fn node_store(n: AstNode, s: Int, c: Int) -> Int {
+    let mk = columns.shape_mask[s]
+    let ib = columns.ints[c].len()
+    let sb = columns.strs[c].len()
+    if ib + columns.shape_ints[s] >= 16777216 || sb + columns.shape_strs[s] >= 8388608 {
+        io.eprintln("FATAL: node chunk {c} holds more payload than a head word addresses")
+        exit(1)
+    }
+    if (mk & 8796093022208) != 0 { columns.strs[c].push(n.str_val) }
+    if (mk & 17592186044416) != 0 { columns.strs[c].push(n.name) }
+    if (mk & 35184372088832) != 0 { columns.strs[c].push(n.op) }
+    if (mk & 70368744177664) != 0 { columns.strs[c].push(n.var_name) }
+    if (mk & 140737488355328) != 0 { columns.strs[c].push(n.module) }
+    if (mk & 281474976710656) != 0 { columns.strs[c].push(n.method) }
+    if (mk & 562949953421312) != 0 { columns.strs[c].push(n.return_type) }
+    if (mk & 1125899906842624) != 0 { columns.strs[c].push(n.type_name) }
+    if (mk & 2251799813685248) != 0 { columns.strs[c].push(n.trait_name) }
+    if (mk & 4503599627370496) != 0 { columns.strs[c].push(n.leading_comments) }
+    if (mk & 9007199254740992) != 0 { columns.strs[c].push(n.trailing_comments) }
+    if (mk & 18014398509481984) != 0 { columns.strs[c].push(n.doc_comment) }
+    if (mk & 36028797018963968) != 0 { columns.strs[c].push(n.xfail_reason) }
+    if (mk & 1) != 0 { columns.ints[c].push(n.int_val) }
+    if (mk & 2) != 0 { columns.ints[c].push(n.left) }
+    if (mk & 4) != 0 { columns.ints[c].push(n.right) }
+    if (mk & 8) != 0 { columns.ints[c].push(n.body) }
+    if (mk & 16) != 0 { columns.ints[c].push(n.condition) }
+    if (mk & 32) != 0 { columns.ints[c].push(n.then_body) }
+    if (mk & 64) != 0 { columns.ints[c].push(n.else_body) }
+    if (mk & 128) != 0 { columns.ints[c].push(n.scrutinee) }
+    if (mk & 256) != 0 { columns.ints[c].push(n.pattern) }
+    if (mk & 512) != 0 { columns.ints[c].push(n.guard) }
+    if (mk & 1024) != 0 { columns.ints[c].push(n.value) }
+    if (mk & 2048) != 0 { columns.ints[c].push(n.target) }
+    if (mk & 4096) != 0 { columns.ints[c].push(n.iterable) }
+    if (mk & 8192) != 0 { columns.ints[c].push(n.is_mut) }
+    if (mk & 16384) != 0 { columns.ints[c].push(n.is_pub) }
+    if (mk & 32768) != 0 { columns.ints[c].push(n.is_const) }
+    if (mk & 65536) != 0 { columns.ints[c].push(n.inclusive) }
+    if (mk & 131072) != 0 { columns.ints[c].push(n.start) }
+    if (mk & 262144) != 0 { columns.ints[c].push(n.end) }
+    if (mk & 524288) != 0 { columns.ints[c].push(n.obj) }
+    if (mk & 1048576) != 0 { columns.ints[c].push(n.index) }
+    if (mk & 2097152) != 0 { columns.ints[c].push(n.params) }
+    if (mk & 4194304) != 0 { columns.ints[c].push(n.args) }
+    if (mk & 8388608) != 0 { columns.ints[c].push(n.stmts) }
+    if (mk & 16777216) != 0 { columns.ints[c].push(n.arms) }
+    if (mk & 33554432) != 0 { columns.ints[c].push(n.fields) }
+    if (mk & 67108864) != 0 { columns.ints[c].push(n.elements) }
+    if (mk & 134217728) != 0 { columns.ints[c].push(n.methods) }
+    if (mk & 268435456) != 0 { columns.ints[c].push(n.type_params) }
+    if (mk & 536870912) != 0 { columns.ints[c].push(n.effects) }
+    if (mk & 1073741824) != 0 { columns.ints[c].push(n.captures) }
+    if (mk & 2147483648) != 0 { columns.ints[c].push(n.type_ann) }
+    if (mk & 4294967296) != 0 { columns.ints[c].push(n.handlers) }
+    if (mk & 8589934592) != 0 { columns.ints[c].push(n.line) }
+    if (mk & 17179869184) != 0 { columns.ints[c].push(n.col) }
+    if (mk & 34359738368) != 0 { columns.ints[c].push(n.end_line) }
+    if (mk & 68719476736) != 0 { columns.ints[c].push(n.end_col) }
+    if (mk & 137438953472) != 0 { columns.ints[c].push(n.assoc_types) }
+    if (mk & 274877906944) != 0 { columns.ints[c].push(n.impl_binders) }
+    if (mk & 549755813888) != 0 { columns.ints[c].push(n.recv_type_args) }
+    if (mk & 1099511627776) != 0 { columns.ints[c].push(n.impl_where_bounds) }
+    if (mk & 2199023255552) != 0 { columns.ints[c].push(n.for_binder) }
+    if (mk & 4398046511104) != 0 { columns.ints[c].push(n.supertraits) }
+    (sb << 40) | (ib << 16) | s
 }
 
-// Writes `n`'s fields of shape `s` at the end of the arenas and returns the Int payload's
-// address.
-fn node_store(n: AstNode, s: Int) -> Int {
-    let ni = columns.shape_ints[s]
-    if ni == 0 { return 0 }
+// Writes every field shape `s` holds from `n`, over the payload that head word `h` of a
+// node in chunk `c` addresses.
+fn node_overwrite(n: AstNode, s: Int, h: Int, c: Int) {
     let mk = columns.shape_mask[s]
-    let ns = columns.shape_strs[s]
-    let ilast = columns.ints.len() - 1
-    let mut base = if ilast < 0 { -1 } else { node_arena_fit(ilast + 1, columns.ints[ilast].len(), ni) }
-    if base < 0 {
-        columns.ints.push(List.with_capacity(65536))
-        base = (columns.ints.len() - 1) << 16
-    }
-    let ic = base >> 16
-    if ns > 0 {
-        let slast = columns.strs.len() - 1
-        let mut sbase = if slast < 0 { -1 } else { node_arena_fit(slast + 1, columns.strs[slast].len(), ns) }
-        if sbase < 0 {
-            columns.strs.push(List.with_capacity(65536))
-            sbase = (columns.strs.len() - 1) << 16
-        }
-        let sc = sbase >> 16
-        columns.ints[ic].push(sbase)
-        if (mk & 8796093022208) != 0 { columns.strs[sc].push(n.str_val) }
-        if (mk & 17592186044416) != 0 { columns.strs[sc].push(n.name) }
-        if (mk & 35184372088832) != 0 { columns.strs[sc].push(n.op) }
-        if (mk & 70368744177664) != 0 { columns.strs[sc].push(n.var_name) }
-        if (mk & 140737488355328) != 0 { columns.strs[sc].push(n.module) }
-        if (mk & 281474976710656) != 0 { columns.strs[sc].push(n.method) }
-        if (mk & 562949953421312) != 0 { columns.strs[sc].push(n.return_type) }
-        if (mk & 1125899906842624) != 0 { columns.strs[sc].push(n.type_name) }
-        if (mk & 2251799813685248) != 0 { columns.strs[sc].push(n.trait_name) }
-        if (mk & 4503599627370496) != 0 { columns.strs[sc].push(n.leading_comments) }
-        if (mk & 9007199254740992) != 0 { columns.strs[sc].push(n.trailing_comments) }
-        if (mk & 18014398509481984) != 0 { columns.strs[sc].push(n.doc_comment) }
-        if (mk & 36028797018963968) != 0 { columns.strs[sc].push(n.xfail_reason) }
-    }
-    if (mk & 1) != 0 { columns.ints[ic].push(n.int_val) }
-    if (mk & 2) != 0 { columns.ints[ic].push(n.left) }
-    if (mk & 4) != 0 { columns.ints[ic].push(n.right) }
-    if (mk & 8) != 0 { columns.ints[ic].push(n.body) }
-    if (mk & 16) != 0 { columns.ints[ic].push(n.condition) }
-    if (mk & 32) != 0 { columns.ints[ic].push(n.then_body) }
-    if (mk & 64) != 0 { columns.ints[ic].push(n.else_body) }
-    if (mk & 128) != 0 { columns.ints[ic].push(n.scrutinee) }
-    if (mk & 256) != 0 { columns.ints[ic].push(n.pattern) }
-    if (mk & 512) != 0 { columns.ints[ic].push(n.guard) }
-    if (mk & 1024) != 0 { columns.ints[ic].push(n.value) }
-    if (mk & 2048) != 0 { columns.ints[ic].push(n.target) }
-    if (mk & 4096) != 0 { columns.ints[ic].push(n.iterable) }
-    if (mk & 8192) != 0 { columns.ints[ic].push(n.is_mut) }
-    if (mk & 16384) != 0 { columns.ints[ic].push(n.is_pub) }
-    if (mk & 32768) != 0 { columns.ints[ic].push(n.is_const) }
-    if (mk & 65536) != 0 { columns.ints[ic].push(n.inclusive) }
-    if (mk & 131072) != 0 { columns.ints[ic].push(n.start) }
-    if (mk & 262144) != 0 { columns.ints[ic].push(n.end) }
-    if (mk & 524288) != 0 { columns.ints[ic].push(n.obj) }
-    if (mk & 1048576) != 0 { columns.ints[ic].push(n.index) }
-    if (mk & 2097152) != 0 { columns.ints[ic].push(n.params) }
-    if (mk & 4194304) != 0 { columns.ints[ic].push(n.args) }
-    if (mk & 8388608) != 0 { columns.ints[ic].push(n.stmts) }
-    if (mk & 16777216) != 0 { columns.ints[ic].push(n.arms) }
-    if (mk & 33554432) != 0 { columns.ints[ic].push(n.fields) }
-    if (mk & 67108864) != 0 { columns.ints[ic].push(n.elements) }
-    if (mk & 134217728) != 0 { columns.ints[ic].push(n.methods) }
-    if (mk & 268435456) != 0 { columns.ints[ic].push(n.type_params) }
-    if (mk & 536870912) != 0 { columns.ints[ic].push(n.effects) }
-    if (mk & 1073741824) != 0 { columns.ints[ic].push(n.captures) }
-    if (mk & 2147483648) != 0 { columns.ints[ic].push(n.type_ann) }
-    if (mk & 4294967296) != 0 { columns.ints[ic].push(n.handlers) }
-    if (mk & 8589934592) != 0 { columns.ints[ic].push(n.line) }
-    if (mk & 17179869184) != 0 { columns.ints[ic].push(n.col) }
-    if (mk & 34359738368) != 0 { columns.ints[ic].push(n.end_line) }
-    if (mk & 68719476736) != 0 { columns.ints[ic].push(n.end_col) }
-    if (mk & 137438953472) != 0 { columns.ints[ic].push(n.assoc_types) }
-    if (mk & 274877906944) != 0 { columns.ints[ic].push(n.impl_binders) }
-    if (mk & 549755813888) != 0 { columns.ints[ic].push(n.recv_type_args) }
-    if (mk & 1099511627776) != 0 { columns.ints[ic].push(n.impl_where_bounds) }
-    if (mk & 2199023255552) != 0 { columns.ints[ic].push(n.for_binder) }
-    if (mk & 4398046511104) != 0 { columns.ints[ic].push(n.supertraits) }
-    base
-}
-
-// Writes every field shape `s` holds from `n`, over the payload at `base`.
-fn node_overwrite(n: AstNode, s: Int, base: Int) {
-    let mk = columns.shape_mask[s]
-    let ic = base >> 16
-    let mut ij = base & 65535
+    let ic = c
+    let mut ij = (h >> 16) & 16777215
     if columns.shape_strs[s] > 0 {
-        let sbase = columns.ints[ic][ij]
-        let sc = sbase >> 16
-        let mut sj = sbase & 65535
+        let sc = c
+        let mut sj = h >> 40
         if (mk & 8796093022208) != 0 {
             columns.strs[sc].set(sj, n.str_val)
             sj = sj + 1
@@ -512,7 +492,6 @@ fn node_overwrite(n: AstNode, s: Int, base: Int) {
             columns.strs[sc].set(sj, n.xfail_reason)
             sj = sj + 1
         }
-        ij = ij + 1
     }
     if (mk & 1) != 0 {
         columns.ints[ic].set(ij, n.int_val)
@@ -688,50 +667,56 @@ fn node_overwrite(n: AstNode, s: Int, base: Int) {
     }
 }
 
-// The arena end, as an address: the next word a payload would take if it fit.
-fn node_ints_end() -> Int {
-    let last = columns.ints.len() - 1
-    if last < 0 { return 0 }
-    (last << 16) + columns.ints[last].len()
-}
-
-fn node_strs_end() -> Int {
-    let last = columns.strs.len() - 1
-    if last < 0 { return 0 }
-    (last << 16) + columns.strs[last].len()
-}
-
-fn node_ints_drop(n: Int) {
-    let last = columns.ints.len() - 1
+fn node_ints_drop(c: Int, n: Int) {
     let mut k = 0
     while k < n {
-        let _ = columns.ints[last].pop()
+        let _ = columns.ints[c].pop()
         k = k + 1
     }
-    if columns.ints[last].len() == 0 { let _ = columns.ints.pop() }
 }
 
-fn node_strs_drop(n: Int) {
-    let last = columns.strs.len() - 1
+fn node_strs_drop(c: Int, n: Int) {
     let mut k = 0
     while k < n {
-        let _ = columns.strs[last].pop()
+        let _ = columns.strs[c].pop()
         k = k + 1
     }
-    if columns.strs[last].len() == 0 { let _ = columns.strs.pop() }
+}
+
+// The fields a node of `kind` holds from its push whatever their values: a later pass
+// writes them on nearly every node of that kind (name resolution the module of each binding,
+// comment attachment and pub marking a fn's), and a write outside the shape would move the
+// node's payload into a chunk already full.
+fn node_kind_fields(kind: Int) -> Int {
+    if kind == NodeKind.FnDef { return 4644337115742208 }
+    if kind == NodeKind.LetBinding || kind == NodeKind.Param || kind == NodeKind.ForIn { return 140737488355328 }
+    0
 }
 
 // Appends `n` to the pool and returns its id.
 pub fn node_push(n: AstNode) -> Int {
     let id = columns.count
+    let c = id >> 12
     if (id & 4095) == 0 {
-        columns.head.push(List.with_capacity(4096))
+        let mut iroom = 12288
+        let mut sroom = 4096
+        if c > 0 {
+            let iused = columns.ints[c - 1].len() - 4096
+            let sused = columns.strs[c - 1].len()
+            iroom = iused + iused / 8 + 256
+            sroom = sused + sused / 8 + 64
+        }
+        columns.ints.push(List.with_capacity(4096 + iroom))
+        let mut k = 0
+        while k < 4096 {
+            columns.ints[c].push(0)
+            k = k + 1
+        }
+        columns.strs.push(List.with_capacity(sroom))
         columns.child_at.push(List.with_capacity(4096))
     }
-    let c = id >> 12
-    let s = node_shape(node_mask(n), n.kind)
-    let base = node_store(n, s)
-    columns.head[c].push((base << 16) | s)
+    let s = node_shape(node_mask(n) | node_kind_fields(n.kind), n.kind)
+    columns.ints[c].set(id & 4095, node_store(n, s, c))
     columns.kind.push(n.kind)
     let start = columns.child_slots.len()
     node_child_ids_into(n, ChildWalk.Slots, columns.child_slots)
@@ -741,27 +726,24 @@ pub fn node_push(n: AstNode) -> Int {
 }
 
 // Drops the newest node, as a caller that made a scratch node does to give its id back.
-// Its payload is given back only when it is still the arena end: a node written to after
-// this one was pushed moved its payload past this one's.
+// Its payload is given back only when it is still at its chunks' ends: a node written to
+// after this one was pushed moved its payload past this one's.
 pub fn node_pop() {
     if columns.count == 0 { return }
     let id = columns.count - 1
     let c = id >> 12
-    let h = columns.head[c].pop() ?? 0
+    let h = columns.ints[c][id & 4095]
     let s = h & 65535
-    let base = h >> 16
     let ni = columns.shape_ints[s]
     let ns = columns.shape_strs[s]
-    if ns > 0 {
-        let sbase = columns.ints[base >> 16][base & 65535]
-        if sbase + ns == node_strs_end() { node_strs_drop(ns) }
-    }
-    if ni > 0 && base + ni == node_ints_end() { node_ints_drop(ni) }
+    if ns > 0 && (h >> 40) + ns == columns.strs[c].len() { node_strs_drop(c, ns) }
+    if ni > 0 && ((h >> 16) & 16777215) + ni == columns.ints[c].len() { node_ints_drop(c, ni) }
     let _ = columns.kind.pop()
     let at = columns.child_at[c].pop() ?? 0
     columns.count = id
     if (id & 4095) == 0 {
-        let _ = columns.head.pop()
+        let _ = columns.ints.pop()
+        let _ = columns.strs.pop()
         let _ = columns.child_at.pop()
     }
     if (at >> 8) + (at & 255) == columns.child_slots.len() {
@@ -772,16 +754,15 @@ pub fn node_pop() {
 fn node_replace(id: Int, n: AstNode) {
     let c = id >> 12
     let j = id & 4095
-    let h = columns.head[c][j]
+    let h = columns.ints[c][j]
     let s = h & 65535
     let held = columns.shape_mask[s]
     let m = node_mask(n)
     if (m & held) == m {
-        node_overwrite(n, s, h >> 16)
+        node_overwrite(n, s, h, c)
     } else {
         let s2 = node_shape(m | held, n.kind)
-        let base = node_store(n, s2)
-        columns.head[c].set(j, (base << 16) | s2)
+        columns.ints[c].set(j, node_store(n, s2, c))
     }
     columns.kind.set(id, n.kind)
     // Most setters change a field that is not a child, so a run equal to the old one is
@@ -802,10 +783,9 @@ fn node_replace(id: Int, n: AstNode) {
 fn node_widen(i: Int, bit: Int) {
     let c = i >> 12
     let j = i & 4095
-    let s = columns.head[c][j] & 65535
+    let s = columns.ints[c][j] & 65535
     let s2 = node_shape(columns.shape_mask[s] | bit, columns.kind[i])
-    let base = node_store(node_or_die(i, "node_widen"), s2)
-    columns.head[c].set(j, (base << 16) | s2)
+    columns.ints[c].set(j, node_store(node_or_die(i, "node_widen"), s2, c))
 }
 
 // `i` is checked; `f` is the field's index in mask-bit order, `bit` its mask bit and `dflt`
@@ -813,50 +793,46 @@ fn node_widen(i: Int, bit: Int) {
 fn node_write_int(i: Int, f: Int, bit: Int, dflt: Int, val: Int) {
     let c = i >> 12
     let j = i & 4095
-    let mut h = columns.head[c][j]
+    let mut h = columns.ints[c][j]
     let mut o = columns.shape_slot[(h & 65535) * 56 + f]
     if o < 0 {
         if val == dflt { return }
         node_widen(i, bit)
-        h = columns.head[c][j]
+        h = columns.ints[c][j]
         o = columns.shape_slot[(h & 65535) * 56 + f]
     }
-    let p = (h >> 16) + o
-    columns.ints[p >> 16].set(p & 65535, val)
+    columns.ints[c].set(((h >> 16) & 16777215) + o, val)
 }
 
 fn node_write_str(i: Int, f: Int, bit: Int, dflt: Str, val: Str) {
     let c = i >> 12
     let j = i & 4095
-    let mut h = columns.head[c][j]
+    let mut h = columns.ints[c][j]
     let mut o = columns.shape_slot[(h & 65535) * 56 + f]
     if o < 0 {
         if val == dflt { return }
         node_widen(i, bit)
-        h = columns.head[c][j]
+        h = columns.ints[c][j]
         o = columns.shape_slot[(h & 65535) * 56 + f]
     }
-    let b = h >> 16
-    let p = columns.ints[b >> 16][b & 65535] + o
-    columns.strs[p >> 16].set(p & 65535, val)
+    columns.strs[c].set((h >> 40) + o, val)
 }
 
 // Field reads for node `i` (checked) through the field's `at` table.
 fn node_get_int(i: Int, at: List[Int], dflt: Int) -> Int {
-    let h = columns.head[i >> 12][i & 4095]
+    let chunk = columns.ints[i >> 12]
+    let h = chunk[i & 4095]
     let o = at[h & 65535]
     if o < 0 { return dflt }
-    let p = (h >> 16) + o
-    columns.ints[p >> 16][p & 65535]
+    chunk[((h >> 16) & 16777215) + o]
 }
 
 fn node_get_str(i: Int, at: List[Int], dflt: Str) -> Str {
-    let h = columns.head[i >> 12][i & 4095]
+    let c = i >> 12
+    let h = columns.ints[c][i & 4095]
     let o = at[h & 65535]
     if o < 0 { return dflt }
-    let b = h >> 16
-    let p = columns.ints[b >> 16][b & 65535] + o
-    columns.strs[p >> 16][p & 65535]
+    columns.strs[c][(h >> 40) + o]
 }
 
 // The fields a setter writes in place: the child table reads none of them for any kind, so
@@ -1210,13 +1186,12 @@ fn checked_node_id(id: Int, where: Str) -> Int {
 
 fn node_or_die(id: Int, where: Str) -> AstNode {
     let i = checked_node_id(id, where)
-    let h = columns.head[i >> 12][i & 4095]
+    let ic = i >> 12
+    let h = columns.ints[ic][i & 4095]
     let s = h & 65535
-    let ic = (h >> 16) >> 16
-    let ij = (h >> 16) & 65535
-    let sbase = if columns.shape_strs[s] > 0 { columns.ints[ic][ij] } else { 0 }
-    let sc = sbase >> 16
-    let sj = sbase & 65535
+    let ij = (h >> 16) & 16777215
+    let sc = ic
+    let sj = h >> 40
     let o_str_val = columns.at_str_val[s]
     let o_name = columns.at_name[s]
     let o_op = columns.at_op[s]
