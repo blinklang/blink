@@ -3518,7 +3518,7 @@ let a = Tree.Node(value: 1, next: Tree.Leaf)
 let b = a.clone()          // same value as `let b = a`
 ```
 
-Deep clone is not provided in v1. A `DeepClone` trait can be added post-v1 for use cases requiring full structural independence.
+Deep clone is not provided in v1: no function or method makes a deep copy. `ch.send` copies the shared cells a value reaches, but only as part of the send (§4.13 *Shared cells cross a channel as copies*). A `DeepClone` trait can be added post-v1 for use cases requiring full structural independence.
 
 ##### Debug vs Display
 

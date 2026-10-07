@@ -2405,7 +2405,7 @@ ch.send(batch)
 batch.clear()          // the receiver still gets [1, 2]
 ```
 
-The copy takes time in proportion to the size of the cells it copies. It is the only deep copy in the language: `clone()` and binding share a cell (§3.6.1 *Clone Semantics*). A capture in `async.spawn` is not copied; the spawn freezes the cells it reaches instead (§2.8 *Shared cells in a spawned task*). See [decisions/spawn-shared-cell-freeze.md](../decisions/spawn-shared-cell-freeze.md).
+The copy takes time in proportion to the size of the cells it copies. It is the only deep copy in the language, and no function exposes it on its own: `clone()` and binding share a cell (§3.6.1 *Clone Semantics*). A capture in `async.spawn` is not copied; the spawn freezes the cells it reaches instead (§2.8 *Shared cells in a spawned task*). See [decisions/spawn-shared-cell-freeze.md](../decisions/spawn-shared-cell-freeze.md).
 
 **The delivery guarantee.** A drain of the channel receives every sent value, in the order sent. A sent value never ends the stream. Closed is a state of the channel, never a value of `T`. `0`, `""`, `false` and — on a `Channel[Option[T]]` — `None` all arrive as `Some(...)`:
 

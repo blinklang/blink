@@ -455,7 +455,7 @@ async.spawn(fn() {
 
 - From `async.spawn` until the spawner joins the task, each shared cell that the closure's captures reach is read-only. The spawner joins the task with `h.await`, or when the enclosing `async.scope` exits.
 - A write to a frozen cell, through any name and from any task, panics. A cell that more than one task reaches stays frozen until each of those tasks is joined.
-- Reads do not change. Read-only fan-out costs nothing extra.
+- Reads do not change.
 
 The freeze ends in the spawner's program order, so a write panics or succeeds at the same line on every run. It never depends on thread timing. To change a cell that a task reads, await the task first:
 

@@ -2,7 +2,7 @@
 
 # Shared Cells in a Spawned Task — Design Rationale
 
-The old §2.8 sentence "Immutable captures in `async.spawn` are safe — the value stays valid while the closure can run, and no mutation means no data race" was false. An immutable `let` can reach a List, Map or Set that a `let mut` alias or a `mut` parameter changes. `async.spawn` runs on real threads, and collections have no locks. A concurrent `push` can realloc the buffer under a reader. The probe in the brief passed `blink check` with no output.
+The old §2.8 sentence "Immutable captures in `async.spawn` are safe — the value stays valid while the closure can run, and no mutation means no data race" was false. An immutable `let` can reach a List, Map or Set that a `let mut` alias or a `mut` parameter changes. `async.spawn` runs on real threads, and collections have no locks. A concurrent `push` can realloc the buffer under a reader. A probe program with this shape passed `blink check` with no diagnostic.
 
 Governs: `sections/02_syntax.md` §2.8 *Closures and `async.spawn`*; `sections/03_types.md` §3.6 *Shared cells*; `sections/04_effects.md` §4.13 *Channel operations*, §4.15.4.
 
@@ -249,6 +249,6 @@ fn main() {
 - The freeze ends at join: `h.await` or exit of the enclosing `async.scope`. The spawner releases it in its own program order, so a panic never depends on thread timing.
 - A write through any name to a frozen cell panics. Reads are unchanged.
 - `warning[SpawnCaptureMutAlias]` fires on a write through a direct alias inside the spawn-to-join window. The check is not complete. The freeze is the guarantee.
-- `ch.send` copies every shared cell the value reaches, at any depth. It is the only deep copy in the language. Its cost grows with the size of the value. Channel and effect handles stay off the §3.6 list.
+- `ch.send` copies every shared cell the value reaches, at any depth. It is the only deep copy in the language. Its cost grows with the size of the value. The rule assumes Channel and effect handles stay off the §3.6 list; that question is open and is decided elsewhere.
 - E0650 help follows Q4-a. It keeps `let snapshot = count` for scalars. It adds that binding a List does not copy it (§3.6). It tells the user to compute the value inside the task or send results through a channel. It shows `xs.slice(0, xs.len())` for a List, marked "one level only".
 - The handler state at a spawn site is not yet decided.
