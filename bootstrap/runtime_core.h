@@ -1312,6 +1312,7 @@ typedef struct {
     void** values;
     uint8_t* states;       /* 0=empty, 1=occupied, 2=tombstone */
     int64_t len;
+    int64_t used;          /* occupied + tombstone slots: a probe stops only at an empty one */
     int64_t cap;
     const blink_kops* kops;
 } blink_map;
@@ -1333,6 +1334,7 @@ BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops) {
     blink_map* m = (blink_map*)blink_alloc(sizeof(blink_map));
     m->cap = 16;
     m->len = 0;
+    m->used = 0;
     m->kops = kops;
     size_t stride = blink_kops_stride(kops);
     m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
@@ -1343,11 +1345,14 @@ BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops) {
 }
 #endif
 
-BLINK_RT_FN void blink_map_grow(blink_map* m);
+/* Rehashes every live entry into fresh slots, which drops the tombstones. When live entries
+   are few, the rebuild keeps cap, so a map under insert/remove churn does not grow without
+   bound; after a same-cap rebuild at least 30% of cap goes to new keys before the next one. */
+BLINK_RT_FN void blink_map_rebuild(blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_map_grow(blink_map* m) {
+BLINK_RT_FN void blink_map_rebuild(blink_map* m) {
     /* cap is always a power of two: initial cap is 16, this is the only
-       mutator, and it doubles. The probe paths replace `% cap` with
+       mutator, and it doubles or keeps it. The probe paths replace `% cap` with
        `& (cap - 1)` — break the pow2 invariant and lookups silently corrupt. */
     const blink_kops* k = m->kops;
     int64_t old_cap = m->cap;
@@ -1355,7 +1360,7 @@ BLINK_RT_FN void blink_map_grow(blink_map* m) {
     void** old_values = m->values;
     uint8_t* old_states = m->states;
     size_t stride = blink_kops_stride(k);
-    m->cap = old_cap * 2;
+    m->cap = (m->len * 10 >= old_cap * 4) ? old_cap * 2 : old_cap;
     int64_t mask = m->cap - 1;
     m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
     m->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
@@ -1375,6 +1380,7 @@ BLINK_RT_FN void blink_map_grow(blink_map* m) {
         m->states[idx] = 1;
         m->len++;
     }
+    m->used = m->len;
     if (__blink_current_arena == NULL) {
         GC_FREE(old_keys);
         GC_FREE(old_values);
@@ -1386,7 +1392,7 @@ BLINK_RT_FN void blink_map_grow(blink_map* m) {
 BLINK_RT_FN void blink_map_set(blink_map* m, const void* key, void* value);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_map_set(blink_map* m, const void* key, void* value) {
-    if (m->len * 10 >= m->cap * 7) blink_map_grow(m);
+    if (m->used * 10 >= m->cap * 7) blink_map_rebuild(m);
     const blink_kops* k = m->kops;
     size_t stride = blink_kops_stride(k);
     int64_t mask = m->cap - 1;
@@ -1403,6 +1409,7 @@ BLINK_RT_FN void blink_map_set(blink_map* m, const void* key, void* value) {
                 *(const void**)slot = key;
             }
             m->values[ins] = value;
+            if (first_tombstone < 0) m->used++;
             m->states[ins] = 1;
             m->len++;
             return;
@@ -1513,6 +1520,7 @@ BLINK_RT_FN void blink_map_clear(blink_map* m);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_map_clear(blink_map* m) {
     m->len = 0;
+    m->used = 0;
     memset(m->states, 0, sizeof(uint8_t) * (size_t)m->cap);
 }
 #endif
@@ -1702,6 +1710,7 @@ typedef struct {
     void* items;           /* cap * (inline_key ? key_size : sizeof(void*)) bytes */
     uint8_t* states;       /* 0=empty, 1=occupied, 2=tombstone */
     int64_t len;
+    int64_t used;          /* occupied + tombstone slots: a probe stops only at an empty one */
     int64_t cap;
     const blink_kops* kops;
 } blink_set;
@@ -1717,6 +1726,7 @@ BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops) {
     blink_set* s = (blink_set*)blink_alloc(sizeof(blink_set));
     s->cap = 16;
     s->len = 0;
+    s->used = 0;
     s->kops = kops;
     size_t stride = blink_kops_stride(kops);
     s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
@@ -1726,17 +1736,17 @@ BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops) {
 }
 #endif
 
-BLINK_RT_FN void blink_set_grow(blink_set* s);
+BLINK_RT_FN void blink_set_rebuild(blink_set* s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_set_grow(blink_set* s) {
-    /* cap is a power of two (initial 16, only doubled here); probe wraps with
-       `& (cap - 1)`. Mirrors blink_map_grow. */
+BLINK_RT_FN void blink_set_rebuild(blink_set* s) {
+    /* cap is a power of two (initial 16, only doubled or kept here); probe wraps with
+       `& (cap - 1)`. Mirrors blink_map_rebuild. */
     const blink_kops* k = s->kops;
     int64_t old_cap = s->cap;
     void* old_items = s->items;
     uint8_t* old_states = s->states;
     size_t stride = blink_kops_stride(k);
-    s->cap = old_cap * 2;
+    s->cap = (s->len * 10 >= old_cap * 4) ? old_cap * 2 : old_cap;
     int64_t mask = s->cap - 1;
     s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
     s->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)s->cap);
@@ -1754,6 +1764,7 @@ BLINK_RT_FN void blink_set_grow(blink_set* s) {
         s->states[idx] = 1;
         s->len++;
     }
+    s->used = s->len;
     if (__blink_current_arena == NULL) {
         GC_FREE(old_items);
         GC_FREE(old_states);
@@ -1764,7 +1775,7 @@ BLINK_RT_FN void blink_set_grow(blink_set* s) {
 BLINK_RT_FN int64_t blink_set_insert(blink_set* s, const void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_set_insert(blink_set* s, const void* item) {
-    if (s->len * 10 >= s->cap * 7) blink_set_grow(s);
+    if (s->used * 10 >= s->cap * 7) blink_set_rebuild(s);
     const blink_kops* k = s->kops;
     size_t stride = blink_kops_stride(k);
     int64_t mask = s->cap - 1;
@@ -1780,6 +1791,7 @@ BLINK_RT_FN int64_t blink_set_insert(blink_set* s, const void* item) {
             } else {
                 *(const void**)slot = item;
             }
+            if (first_tombstone < 0) s->used++;
             s->states[ins] = 1;
             s->len++;
             return 1;
@@ -3450,6 +3462,7 @@ BLINK_RT_FN blink_map* blink_map_copy_shell(blink_promote_ctx* ctx, const blink_
     blink_map* out = (blink_map*)blink_promote_ctx_alloc(ctx, sizeof(blink_map));
     size_t stride = blink_kops_stride(m->kops);
     out->len = m->len;
+    out->used = m->used;
     out->cap = m->cap;
     out->kops = m->kops;
     out->keys = blink_promote_ctx_alloc(ctx, (int64_t)(stride * (size_t)m->cap));
@@ -3520,6 +3533,7 @@ BLINK_RT_FN blink_set* blink_set_copy_shell(blink_promote_ctx* ctx, const blink_
     blink_set* out = (blink_set*)blink_promote_ctx_alloc(ctx, sizeof(blink_set));
     size_t stride = blink_kops_stride(s->kops);
     out->len = s->len;
+    out->used = s->used;
     out->cap = s->cap;
     out->kops = s->kops;
     out->items = blink_promote_ctx_alloc(ctx, (int64_t)(stride * (size_t)s->cap));

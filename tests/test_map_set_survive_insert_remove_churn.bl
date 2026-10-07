@@ -1,0 +1,198 @@
+// A Map or Set that sees insert then remove of many distinct keys must keep working:
+// a remove leaves a slot that a later probe has to step over, and those slots must not
+// pile up until no probe can stop. Each churn runs far past the initial table size.
+// Iteration order is unspecified, so the checks sum or count, never index by position.
+
+fn sum_ints(xs: List[Int]) -> Int {
+    let mut total = 0
+    for x in xs {
+        total = total + x
+    }
+    total
+}
+
+test "Map[Str, Int] survives insert/remove churn of distinct keys" {
+    let mut m: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < 3000 {
+        m.insert("k{i}", i)
+        assert_eq(m.remove("k{i}") ?? -1, i)
+        i = i + 1
+    }
+    assert_eq(m.len(), 0)
+    assert_eq(m.get("k5") ?? -1, -1)
+    assert_eq(m.get("never") ?? -1, -1)
+    assert(!m.contains_key("k2999"))
+    assert_eq(m.keys().len(), 0)
+    assert_eq(m.values().len(), 0)
+    m.insert("after", 42)
+    assert_eq(m.get("after") ?? -1, 42)
+    assert_eq(m.len(), 1)
+}
+
+test "Map[Int, Int] survives insert/remove churn of distinct keys" {
+    let mut m: Map[Int, Int] = Map()
+    let mut i = 0
+    while i < 3000 {
+        m.insert(i, i * 2)
+        assert_eq(m.remove(i) ?? -1, i * 2)
+        i = i + 1
+    }
+    assert_eq(m.len(), 0)
+    assert_eq(m.get(7) ?? -1, -1)
+    assert_eq(m.get(-5) ?? -1, -1)
+    assert(!m.contains(2999))
+    m.insert(1, 10)
+    m.insert(2, 20)
+    assert_eq(m.keys().len(), 2)
+    assert_eq(sum_ints(m.keys()), 3)
+    assert_eq(sum_ints(m.values()), 30)
+}
+
+test "Map churn keeps a few live keys intact throughout" {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    m.insert("b", 2)
+    m.insert("c", 3)
+    let mut i = 0
+    while i < 3000 {
+        m.insert("t{i}", i)
+        if i % 500 == 0 {
+            m.insert("b", 2 + i)
+        }
+        m.remove("t{i}")
+        assert_eq(m.get("a") ?? -1, 1)
+        i = i + 1
+    }
+    assert_eq(m.len(), 3)
+    assert_eq(m.get("a") ?? -1, 1)
+    assert_eq(m.get("b") ?? -1, 2502)
+    assert_eq(m.get("c") ?? -1, 3)
+    assert_eq(m.get("t10") ?? -1, -1)
+    assert(m.contains_key("c"))
+    let ks = m.keys()
+    assert_eq(ks.len(), 3)
+    assert(ks.contains("a") && ks.contains("b") && ks.contains("c"))
+    assert_eq(m.values().len(), 3)
+    assert_eq(sum_ints(m.values()), 2506)
+    let mut n = 0
+    for (k, v) in m {
+        n = n + 1
+        assert_eq(m.get(k) ?? -1, v)
+    }
+    assert_eq(n, 3)
+}
+
+test "Map churn with a growing live set keeps every live key" {
+    let mut m: Map[Int, Int] = Map()
+    let mut i = 0
+    while i < 4000 {
+        m.insert(i, i)
+        if i % 4 != 0 {
+            m.remove(i)
+        }
+        i = i + 1
+    }
+    assert_eq(m.len(), 1000)
+    let mut j = 0
+    while j < 4000 {
+        if j % 4 == 0 {
+            assert_eq(m.get(j) ?? -1, j)
+        } else {
+            assert(!m.contains_key(j))
+        }
+        j = j + 1
+    }
+}
+
+test "Map clear after churn leaves a usable map" {
+    let mut m: Map[Int, Int] = Map()
+    let mut i = 0
+    while i < 1000 {
+        m.insert(i, i)
+        m.remove(i)
+        i = i + 1
+    }
+    m.clear()
+    i = 0
+    while i < 1000 {
+        m.insert(i, i)
+        m.remove(i)
+        i = i + 1
+    }
+    assert_eq(m.len(), 0)
+    assert_eq(m.get(3) ?? -1, -1)
+}
+
+test "Set[Str] survives insert/remove churn of distinct items" {
+    let mut s: Set[Str] = Set()
+    let mut i = 0
+    while i < 3000 {
+        assert(s.insert("s{i}"))
+        assert(s.remove("s{i}"))
+        i = i + 1
+    }
+    assert_eq(s.len(), 0)
+    assert(s.is_empty())
+    assert(!s.contains("s5"))
+    assert(!s.contains("never"))
+    assert(!s.remove("never"))
+    assert(s.insert("after"))
+    assert(s.contains("after"))
+    assert_eq(s.len(), 1)
+}
+
+test "Set[Int] churn keeps a few live items intact throughout" {
+    let mut s: Set[Int] = Set()
+    s.insert(-1)
+    s.insert(-2)
+    let mut i = 0
+    while i < 3000 {
+        s.insert(i)
+        s.remove(i)
+        assert(s.contains(-1))
+        i = i + 1
+    }
+    assert(!s.insert(-2))
+    assert_eq(s.len(), 2)
+    assert(!s.contains(17))
+    let mut total = 0
+    let mut n = 0
+    for x in s {
+        total = total + x
+        n = n + 1
+    }
+    assert_eq(n, 2)
+    assert_eq(total, -3)
+    let u = s.union(s)
+    assert_eq(u.len(), 2)
+}
+
+fn churned_in_arena() -> Map[Int, Int] {
+    with arena {
+        let mut m: Map[Int, Int] = Map()
+        m.insert(-1, 100)
+        let mut i = 0
+        while i < 2000 {
+            m.insert(i, i)
+            m.remove(i)
+            i = i + 1
+        }
+        m
+    }
+}
+
+test "Map churn inside with-arena promotes a usable map" {
+    let mut m = churned_in_arena()
+    assert_eq(m.len(), 1)
+    assert_eq(m.get(-1) ?? -1, 100)
+    assert_eq(m.get(5) ?? -1, -1)
+    let mut i = 0
+    while i < 2000 {
+        m.insert(i, i)
+        m.remove(i)
+        i = i + 1
+    }
+    assert_eq(m.len(), 1)
+    assert_eq(m.get(-1) ?? -1, 100)
+}
