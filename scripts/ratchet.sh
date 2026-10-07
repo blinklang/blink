@@ -176,7 +176,7 @@ pool_writes() {
   p="$root/src/parser.bl"
   if [ -f "$p" ]; then
     n=$(awk '
-      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset|node_write_plain_int|node_write_plain_str|node_columns_open_chunk|node_columns_close_chunk|node_append_child_slots|node_drop_child_slots_from)\(/ { inw = 1 }
+      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset|node_write_plain_int|node_write_plain_str|node_columns_open_chunk|node_columns_close_chunk|node_drop_child_slots_from)\(/ { inw = 1 }
       !inw { print }
       inw && /^}/ { inw = 0 }' "$p" | rg -o "$POOL_WRITE|$COLUMN_WRITE" | wc -l | tr -d ' ')
     total=$((total + n))

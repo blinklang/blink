@@ -30,6 +30,9 @@ effect Parse {
 // after a doubling, and copy every column at each one; a chunk wastes at most its own tail
 // and never moves. 4096 slots of 8 bytes is 32 KiB per chunk, so the unused tail is under
 // 2 MiB over all columns, and a column's chunk list stays small enough to sit in cache.
+// `kind` is one flat list instead: almost every walk of the tree reads it, and a read through
+// a chunk must load the chunk's own header before the slot, which costs about as much as the
+// slot. One list of 8 bytes per node leaves at most a few MiB unused.
 // Only node_push, node_pop, node_replace, node_write_plain_int, node_write_plain_str,
 // parser_reset and the chunk and child-slot helpers they call write the columns. All but
 // the two plain writers write every column, so all columns hold the same nodes.
@@ -54,7 +57,7 @@ type NodeColumns {
     trailing_comments: List[List[Str]]
     doc_comment: List[List[Str]]
     xfail_reason: List[List[Str]]
-    kind: List[List[Int]]
+    kind: List[Int]
     int_val: List[List[Int]]
     left: List[List[Int]]
     right: List[List[Int]]
@@ -163,7 +166,7 @@ pub fn new_node(kind: NodeKind) -> Int ! Parse.Build {
     node_push(AstNode { kind: kind, line: peek_line(), col: peek_col() })
 }
 
-// Adds an empty chunk to the end of every column, for the node that starts it.
+// Adds an empty chunk to the end of every chunked column, for the node that starts it.
 fn node_columns_open_chunk() {
     columns.str_val.push([])
     columns.name.push([])
@@ -178,7 +181,6 @@ fn node_columns_open_chunk() {
     columns.trailing_comments.push([])
     columns.doc_comment.push([])
     columns.xfail_reason.push([])
-    columns.kind.push([])
     columns.int_val.push([])
     columns.left.push([])
     columns.right.push([])
@@ -225,7 +227,7 @@ fn node_columns_open_chunk() {
     columns.child_at.push([])
 }
 
-// Drops the empty last chunk of every column, once its first node is popped.
+// Drops the empty last chunk of every chunked column, once its first node is popped.
 fn node_columns_close_chunk() {
     let _ = columns.str_val.pop()
     let _ = columns.name.pop()
@@ -240,7 +242,6 @@ fn node_columns_close_chunk() {
     let _ = columns.trailing_comments.pop()
     let _ = columns.doc_comment.pop()
     let _ = columns.xfail_reason.pop()
-    let _ = columns.kind.pop()
     let _ = columns.int_val.pop()
     let _ = columns.left.pop()
     let _ = columns.right.pop()
@@ -305,7 +306,7 @@ pub fn node_push(n: AstNode) -> Int {
     columns.trailing_comments[c].push(n.trailing_comments)
     columns.doc_comment[c].push(n.doc_comment)
     columns.xfail_reason[c].push(n.xfail_reason)
-    columns.kind[c].push(n.kind)
+    columns.kind.push(n.kind)
     columns.int_val[c].push(n.int_val)
     columns.left[c].push(n.left)
     columns.right[c].push(n.right)
@@ -349,7 +350,9 @@ pub fn node_push(n: AstNode) -> Int {
     columns.impl_where_bounds[c].push(n.impl_where_bounds)
     columns.for_binder[c].push(n.for_binder)
     columns.supertraits[c].push(n.supertraits)
-    columns.child_at[c].push(node_append_child_slots(id, n))
+    let start = columns.child_slots.len()
+    node_child_ids_into(n, ChildWalk.Slots, columns.child_slots)
+    columns.child_at[c].push(node_child_run(id, start))
     columns.count = id + 1
     id
 }
@@ -372,7 +375,7 @@ pub fn node_pop() {
     let _ = columns.trailing_comments[c].pop()
     let _ = columns.doc_comment[c].pop()
     let _ = columns.xfail_reason[c].pop()
-    let _ = columns.kind[c].pop()
+    let _ = columns.kind.pop()
     let _ = columns.int_val[c].pop()
     let _ = columns.left[c].pop()
     let _ = columns.right[c].pop()
@@ -440,7 +443,7 @@ fn node_replace(id: Int, n: AstNode) {
     columns.trailing_comments[c].set(j, n.trailing_comments)
     columns.doc_comment[c].set(j, n.doc_comment)
     columns.xfail_reason[c].set(j, n.xfail_reason)
-    columns.kind[c].set(j, n.kind)
+    columns.kind.set(id, n.kind)
     columns.int_val[c].set(j, n.int_val)
     columns.left[c].set(j, n.left)
     columns.right[c].set(j, n.right)
@@ -487,7 +490,9 @@ fn node_replace(id: Int, n: AstNode) {
     // Most setters change a field that is not a child, so a run equal to the old one is
     // dropped again instead of growing the column on every write.
     let old = columns.child_at[c][j]
-    let at = node_append_child_slots(id, n)
+    let start = columns.child_slots.len()
+    node_child_ids_into(n, ChildWalk.Slots, columns.child_slots)
+    let at = node_child_run(id, start)
     if node_child_runs_equal(old, at) {
         node_drop_child_slots_from(at >> 8)
     } else {
@@ -543,11 +548,10 @@ fn node_write_plain_str(id: Int, f: NodePlainStr, val: Str) {
     }
 }
 
-// Appends the child slots of `n`, the node at `id`, to the tail of child_slots and returns the
-// packed start and count of that run.
-fn node_append_child_slots(id: Int, n: AstNode) -> Int {
-    let start = columns.child_slots.len()
-    node_child_ids_into(n, ChildWalk.Slots, columns.child_slots)
+// The packed start and count of the run of child slots that node `id`'s walk of the table
+// appended from `start` to the tail of child_slots. The writers walk the table themselves:
+// AstNode is passed by value, so each function it passes through copies all of it.
+fn node_child_run(id: Int, start: Int) -> Int {
     let count = columns.child_slots.len() - start
     if count > 255 {
         io.println("FATAL: node {id} has {count} children; child_at packs at most 255")
@@ -815,7 +819,7 @@ fn node_or_die(id: Int, where: Str) -> AstNode {
         trailing_comments: columns.trailing_comments[c][j],
         doc_comment: columns.doc_comment[c][j],
         xfail_reason: columns.xfail_reason[c][j],
-        kind: columns.kind[c][j],
+        kind: columns.kind[i],
         int_val: columns.int_val[c][j],
         left: columns.left[c][j],
         right: columns.right[c][j],
@@ -885,7 +889,7 @@ fn node_die(id: Int, where: Str) {
         if start < 0 { start = 0 }
         let mut i = start
         while i < nlen {
-            let nk = columns.kind[i >> 12][i & 4095]
+            let nk = columns.kind[i]
             let nl = columns.line[i >> 12][i & 4095]
             let nc = columns.col[i >> 12][i & 4095]
             io.eprintln("parser-dump: node[{i}] kind={nk} line={nl} col={nc}")
@@ -910,8 +914,7 @@ fn node_die(id: Int, where: Str) {
 }
 
 pub fn node_kind(id: Int) -> Int {
-    let i = checked_node_id(id, "node_kind")
-    columns.kind[i >> 12][i & 4095]
+    columns.kind[checked_node_id(id, "node_kind")]
 }
 pub fn node_int_val(id: Int) -> Int {
     let i = checked_node_id(id, "node_int_val")

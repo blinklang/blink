@@ -56,7 +56,8 @@ pub fn node_push(n: AstNode) -> Int {
     let id = nodes.len()
     nodes.push(n)
     columns.kinds.push(n.kind)
-    columns.child_at.push(node_append_child_slots(id))
+    columns.child_slots.push(id)
+    columns.child_at.push(node_child_run(id))
     id
 }
 
@@ -70,12 +71,12 @@ pub fn node_pop() {
 fn node_replace(id: Int, n: AstNode) {
     nodes.set(id, n)
     columns.kinds.set(id, n.kind)
-    columns.child_at.set(id, node_append_child_slots(id))
+    columns.child_slots.push(id)
+    columns.child_at.set(id, node_child_run(id))
 }
 
-fn node_append_child_slots(id: Int) -> Int {
-    columns.child_slots.push(id)
-    0
+fn node_child_run(id: Int) -> Int {
+    columns.child_slots.len() - 1
 }
 
 fn node_drop_child_slots_from(start: Int) {
