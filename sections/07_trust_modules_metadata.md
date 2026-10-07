@@ -1003,12 +1003,12 @@ with ffi.scope() as scope {
 
 #### `Bytes.with_ptr` — opaque-byte FFI helper
 
-For libc surfaces that take `void*` / `uint8_t*` / `char*` (read, write, recv, send, mmap-region, `iovec.iov_base`, `getrandom`, `ioctl`-data), the curated `std.libc.*` wrappers use `Bytes.with_ptr`:
+For libc surfaces that take `void*` / `uint8_t*` / `char*` (read, write, recv, send, mmap-region, `iovec.iov_base`, `getrandom`, `ioctl`-data), the curated `std.libc.*` wrappers use `Bytes.with_mut_ptr` when C writes into the buffer and `Bytes.with_ptr` when C only reads it:
 
 ```blink
 fn read(fd: I32, n: Int) -> Result[Bytes, Str] ! IO {
-    let buf = Bytes.zeroed(n)
-    let got = buf.with_ptr(fn(p) { c_read(fd, p, n) })
+    let mut buf = Bytes.zeroed(n)
+    let got = buf.with_mut_ptr(fn(p) { c_read(fd, p, n) })
     if got < 0 {
         Err("read failed")
     } else {
@@ -1017,34 +1017,35 @@ fn read(fd: I32, n: Int) -> Result[Bytes, Str] ! IO {
 }
 ```
 
-Signature:
+Signatures:
 
 ```blink
 fn with_ptr[R](self: Bytes, body: fn(Ptr[U8]) -> R ! _) -> R ! _
+fn with_mut_ptr[R](mut self: Bytes, body: fn(Ptr[U8]) -> R ! _) -> R ! _
 ```
 
-The closure body holds a `Ptr[U8]` aliasing the data of the `Bytes`. Soundness rests on three invariants:
+The closure body holds a `Ptr[U8]` aliasing the data of the `Bytes`. The two pins differ only in who may write:
+
+- **`with_ptr` is read-only.** It takes plain `self`. C must not write through `p`. The compiler cannot check what C does, so the `byte-pin` audit category (§9.1.3.3) lists every call site for review.
+- **`with_mut_ptr` lets C write.** It declares `mut self` (§3.6 *Mutable Parameters*), so its receiver needs a mutable root; a call on an immutable root is `E0610`. A write that C makes through `p` changes only the receiver's value. It never shows through another name, because `Bytes` is a value (§3.2.3 *Bytes*).
+
+Soundness of both pins rests on three invariants:
 
 1. **The memory of the `Bytes` does not move** while the closure runs.
 2. **The closure keeps the `Bytes` alive** for the duration of the call.
 3. **The closure body must not call growth-effecting methods on `self`.** This is the closure-lexical no-grow check (§9.1.3.1 below).
 
-`Bytes.with_ptr` forwards the effect row of its closure (`! _`, §4.15.2): the call has exactly the effects of the `@ffi` functions the closure calls. It ships in `std.bytes`. It is the only sanctioned form of Bytes→Ptr aliasing. User-code Bytes→Ptr bridges are forbidden (see Bytes Bridge Doctrine below).
+`Bytes.with_ptr` and `Bytes.with_mut_ptr` forward the effect row of their closure (`! _`, §4.15.2): the call has exactly the effects of the `@ffi` functions the closure calls. They ship in `std.bytes`. They are the only sanctioned forms of Bytes→Ptr aliasing. User-code Bytes→Ptr bridges are forbidden (see Bytes Bridge Doctrine below).
 
 ##### 9.1.3.1 Closure-lexical no-grow check
 
-Inside the body of `b.with_ptr(fn(p) { ... })`, the parser rejects any of the following calls applied syntactically to `b` (the receiver of the `with_ptr` call):
+Inside the body of `b.with_ptr(fn(p) { ... })` or `b.with_mut_ptr(fn(p) { ... })`, the compiler rejects a call, applied syntactically to `b` (the receiver of the pin), to any method that the §3.2.3 *Bytes* table marks *grows*. Those are `push` and the `write_*_le/be` family. The table is the only list; a new method that can move the storage carries the mark there. A method that returns a new `Bytes` and leaves its receiver unchanged, such as `concat` or `slice`, does not grow.
 
-- `b.push(_)`, `b.append(_)`, `b.concat(_)`, `b.extend(_)`
-- `b.write_*_le(_)` / `b.write_*_be(_)` (the append-style writers)
-- `b.clear()`, `b.truncate(_)`, `b.resize(_)`
-- Any future method tagged `@bytes_grows` in the stdlib.
+Diagnostic: `E0814: cannot grow Bytes inside its pin closure` with a caret on the offending call and a note pointing at the enclosing `with_ptr` or `with_mut_ptr` site.
 
-Diagnostic: `E0814: cannot grow Bytes inside with_ptr closure` with a caret on the offending call and a note pointing at the enclosing `with_ptr` site.
+The check is **syntactic and conservative**: it does not walk into helper functions called from the closure body. Passing `b` as a `Bytes` argument to a function call inside the closure is rejected with `E0815: pinned Bytes cannot escape its pin closure as argument`. The user can pass `p` (the `Ptr[U8]`) or an integer slice instead.
 
-The check is **syntactic and conservative**: it does not walk into helper functions called from the closure body. Passing `b` as a `Bytes` argument to a function call inside the closure is rejected with `E0815: pinned Bytes cannot escape with_ptr closure as argument`. The user can pass `p` (the `Ptr[U8]`) or an integer slice instead.
-
-The check accepts that helper-function bodies are out of scope. Documentation marks `with_ptr` as the FFI-only helper that, like Rust pinning, requires the user not to defeat the pin via reflection-style escapes; the audit category for `with_ptr` calls in `blink audit` makes the call sites easy to review.
+The check accepts that helper-function bodies are out of scope. Documentation marks `with_ptr` as the FFI-only helper that, like Rust pinning, requires the user not to defeat the pin via reflection-style escapes; the audit category for `with_ptr` and `with_mut_ptr` calls in `blink audit` makes the call sites easy to review.
 
 #### Bytes Bridge Doctrine
 
@@ -1056,12 +1057,12 @@ User code is **forbidden** from constructing a `Ptr[U8]` that aliases a `Bytes`'
 
 The sanctioned paths for Bytes ↔ FFI interop are:
 
-1. `Bytes.with_ptr(fn(p) { ... })` — closure-scoped, for use inside an FFI region only.
+1. `Bytes.with_ptr(fn(p) { ... })` (read-only) and `Bytes.with_mut_ptr(fn(p) { ... })` (C may write) — closure-scoped, for use inside an FFI region only.
 2. `libc.copy_to_buf(b: Bytes) -> Buf[U8]` — copies bytes into a freshly-allocated, scope-tied `Buf[U8]`. See §9.1.3.2 for the surface and naming rules.
 3. `libc.copy_from_buf(buf: Buf[U8]) -> Bytes` — copies bytes out of a `Buf[U8]` into a fresh `Bytes`. The byte count is the length of the buffer.
 4. `libc.copy_from_buf_n(buf: Buf[U8], n: I64) -> Bytes` — truncating copy: copies up to `n` bytes (or fewer if the buffer is shorter) into a fresh `Bytes`. Used by syscalls whose return value reports the actual byte count (`read(2)`, `recv(2)`).
 
-The copies are the soundness witness: bytes cross the firewall, addresses do not. High-throughput byte-payload bindings (`read`, `write`, `recv`, `send`) can avoid the copy by using `with_ptr` directly.
+The copies are the soundness witness: bytes cross the firewall, addresses do not. High-throughput byte-payload bindings (`read`, `write`, `recv`, `send`) can avoid the copy by using `with_ptr` or `with_mut_ptr` directly.
 
 ##### Why the bridge is forbidden in user code
 
@@ -1126,7 +1127,7 @@ let chunk = libc.read_bytes(fd, 8192)?    // read up to 8192 bytes from any fd
 libc.write_bytes(out_fd, chunk)?          // write raw bytes to a file/pipe/socket fd
 ```
 
-These wrappers do **not** use the byte-bridge primitives. They are built on `Bytes.with_ptr` (§9.1.1, the sanctioned `Bytes → Ptr[U8]` borrow): a read pins a `Bytes.zeroed(n)` buffer to receive into and returns `buf.slice(0, got)`; a write pins the caller's `Bytes` read-only and hands C a `const uint8_t*`. `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` are reserved **exclusively** for the sealed-`Buf` path (where the user can never name `Buf`); the curated wrappers never call them. The boundary is *user-owned `Bytes` (→ `with_ptr`)* vs *unnameable sealed `Buf` (→ bridge primitives)*, not reads-vs-writes.
+These wrappers do **not** use the byte-bridge primitives. They are built on the sanctioned `Bytes → Ptr[U8]` pins (§9.1.3): a read binds `let mut buf = Bytes.zeroed(n)`, pins it with `with_mut_ptr` to receive into and returns `buf.slice(0, got)`; a write pins the caller's `Bytes` read-only with `with_ptr` and hands C a `const uint8_t*`. `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` are reserved **exclusively** for the sealed-`Buf` path (where the user can never name `Buf`); the curated wrappers never call them. The boundary is *user-owned `Bytes` (→ `with_ptr`)* vs *unnameable sealed `Buf` (→ bridge primitives)*, not reads-vs-writes.
 
 ##### 9.1.3.3 The v1 `libc.*_bytes` minimum set (A2 ship gate)
 
@@ -1159,7 +1160,7 @@ Each member ships at v1; the set **blocks the v1 release**.
 - **Arguments** = POSIX C argument order. The `(void* buf, size_t len)` pair is replaced in place by `max: Int` (reads) or `data: Bytes` (writes; length is `data.len()`, never passed explicitly). `flags` is always the trailing keyword `-- flags: MsgFlags = MsgFlags.NONE`, exempt from C order.
 - **Return** = `Result[Bytes, Errno]` (Bytes-out) or `Result[Int, Errno]` (Bytes-in), bound to direction — a write may not be typed `Result[Bytes, Errno]`. A non-buffer out-parameter moves into the success value as a tuple after the `Bytes` or count, in C order. A pointer-typed out-parameter that may be empty is `Option` (e.g. `recvfrom_bytes` → `Result[(Bytes, Option[SockAddr]), Errno]`).
 - **Effect** = `! IO`.
-- **Mechanism** = `Bytes.with_ptr`, never the byte-bridge primitives.
+- **Mechanism** = `Bytes.with_mut_ptr` (reads) or `Bytes.with_ptr` (writes), never the byte-bridge primitives.
 
 The law governs only the *shape* of a wrapper; it is not a license to auto-add wrappers (see growth governance below). `getentropy_bytes` is the one principled exception to the arg rule (no fd, no `(buf, len)` pair) — it takes `n: Int` and fills exactly `n`. Syscalls that cannot conform — vectored I/O (`readv`/`writev`, which need an `iovec[]` array), `recvmsg`/`sendmsg` (`msghdr`), or any surface requiring a non-`Bytes` buffer shape — are **out of scope of the law** and must not be forced into a `*_bytes` wrapper; they get their own deliberated API.
 
@@ -1177,11 +1178,11 @@ The law governs only the *shape* of a wrapper; it is not a license to auto-add w
 
 - `bridge-call` — call sites of `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` (the sealed-`Buf` path).
 - `buf-mention` — any source mention of `Buf` (legally, inside `@ffi.fn` signatures).
-- `byte-pin` — `Bytes.with_ptr` call sites (the `libc.*_bytes` family's crossings, both read-side and write-side pins).
+- `byte-pin` — `Bytes.with_ptr` and `Bytes.with_mut_ptr` call sites (the `libc.*_bytes` family's crossings, both read-side and write-side pins).
 
-A single `blink audit bytes-bridge` query therefore returns *every* raw-byte crossing in a module — sealed-`Buf` copies and `with_ptr` pins alike — with no direction asymmetry. CI may use `blink build --no-unaudited-bridges` to require every `bytes-bridge` subcategory entry outside `lib/std/` to be approved by `blink audit approve`.
+A single `blink audit bytes-bridge` query therefore returns *every* raw-byte crossing in a module — sealed-`Buf` copies and `with_ptr` / `with_mut_ptr` pins alike — with no direction asymmetry. CI may use `blink build --no-unaudited-bridges` to require every `bytes-bridge` subcategory entry outside `lib/std/` to be approved by `blink audit approve`.
 
-A curated `*_bytes` wrapper **must keep its `@ffi` syscall call inline inside the `with_ptr` closure body** — the closure-lexical no-grow / no-escape check (§9.1.3.1) is syntactic and does not descend into helper functions, so factoring the call out would defeat the `E0814`/`E0815`/`E0817` pin guarantees.
+A curated `*_bytes` wrapper **must keep its `@ffi` syscall call inline inside the `with_ptr` or `with_mut_ptr` closure body** — the closure-lexical no-grow / no-escape check (§9.1.3.1) is syntactic and does not descend into helper functions, so factoring the call out would defeat the `E0814`/`E0815`/`E0817` pin guarantees.
 
 **Doc / LSP.** `blink doc` and the LSP hover for `Buf[T]` render a fixed banner, followed by the value's tag as `(scope: name)` when hovering a value:
 
@@ -1286,8 +1287,8 @@ For C surfaces β cannot reach (varargs, signal handlers, glibc-version-conditio
 |------|-------|---------|
 | `E0812` | error | `@ffi.struct` field uses a type that is not FFI-compatible |
 | `E0813` | error | `offset(i)` called on singleton `alloc[T]()` result |
-| `E0814` | error | growth-effecting call on `Bytes` inside its `with_ptr` closure body |
-| `E0815` | error | pinned `Bytes` passed as argument inside `with_ptr` closure body |
+| `E0814` | error | call to a *grows* method (§3.2.3 *Bytes*) on `Bytes` inside its `with_ptr` or `with_mut_ptr` closure body |
+| `E0815` | error | pinned `Bytes` passed as argument inside its `with_ptr` or `with_mut_ptr` closure body |
 | `E0817` | error | `Bytes` ↔ `Ptr[U8]` cast or `as_ptr` use in user code (use `with_ptr`, `libc.copy_to_buf`, or `libc.copy_from_buf`) |
 | `E0822` | error | `Buf` named in user Blink-typed code outside `@ffi.fn` signatures, including as an `@ffi.struct` field type (§9.1.3, §9.1.3.2) |
 | `W0812` | warning | `@ffi.struct` declared without canonical header in `[native-dependencies].headers`; escalated to error under `--strict-struct-layout` (default-on for `@ffi` modules) |
