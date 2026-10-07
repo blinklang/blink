@@ -618,7 +618,7 @@ fn cc_list_eq_stmts(e: EqFn, out: List[Int]) -> Bool ! Diag.Report {
 }
 
 // Each live slot of the left side is looked up in the right, and equal sizes then make
-// the two key sets the same. A map's value is read from each side by that key.
+// the two key sets the same. A map's value is read from each side by the slot that holds it.
 fn cc_keyed_eq_stmts(e: EqFn, is_map: Bool, out: List[Int]) -> Bool ! Diag.Report {
     let kind = if is_map { TyKind.Map } else { TyKind.Set }
     let prefix = if is_map { "map" } else { "set" }
@@ -629,20 +629,28 @@ fn cc_keyed_eq_stmts(e: EqFn, is_map: Bool, out: List[Int]) -> Bool ! Diag.Repor
     // The lookup takes a pointer to the key. An inline key is read at its address in the
     // slot; any other slot word is that pointer already: a Str, or the box of a wide key.
     let key_read = if krec.kops_inline_key { if is_map { "map_slot_key_addr" } else { "set_slot_item_addr" } } else { if is_map { "map_slot_key_word" } else { "set_slot_item_word" } }
-    let lookup = if is_map { "map_has" } else { "set_contains" }
     out.push(cc_eq_fails_when(e, cc_eq_sizes_differ(e, "{prefix}_len")))
     let i = c_mint_local("i")
-    let found = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper(lookup), e.ints.slot_form,
-        [cc_eq_side(e, eq_rhs), cc_eq_key_word(e, key, key_read, i)])
-    let mut live: List[Int] = [cc_eq_fails_when(e, ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, "==", found, cc_eq_int(e, "0")))]
+    let mut live: List[Int] = []
     if is_map {
         let value = child_tid(e.tid, Slot.Inner2)
         if value < 0 { return cc_element_type_unrecorded(e.node, kind) >= 0 }
+        // The slot the right side holds the key in answers both whether it is there and where
+        // its value is, so the key is hashed and compared once.
+        let j = c_mint_local("j")
+        let find = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper("map_find"), e.ints.slot_form,
+            [cc_eq_side(e, eq_rhs), cc_eq_key_word(e, key, key_read, i)])
+        live.push(ir_let(TYPE_INT, e.node, e.ints.c_spelling, j, e.ints.slot_form, find))
+        live.push(cc_eq_fails_when(e, ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, "<", cc_eq_int_ref(e, j), cc_eq_int(e, "0"))))
         let l = cg_call_element_from_runtime(e.node, value, c_runtime_helper("map_slot_value"),
             [cc_eq_side(e, eq_lhs), cc_eq_int_ref(e, i)])
-        let r = cg_call_element_from_runtime(e.node, value, c_runtime_helper("map_get"),
-            [cc_eq_side(e, eq_rhs), cc_eq_key_word(e, key, key_read, i)])
+        let r = cg_call_element_from_runtime(e.node, value, c_runtime_helper("map_slot_value"),
+            [cc_eq_side(e, eq_rhs), cc_eq_int_ref(e, j)])
         if !cc_eq_member_into(e, value, l, r, live) { return false }
+    } else {
+        let found = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper("set_contains"), e.ints.slot_form,
+            [cc_eq_side(e, eq_rhs), cc_eq_key_word(e, key, key_read, i)])
+        live.push(cc_eq_fails_when(e, ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, "==", found, cc_eq_int(e, "0"))))
     }
     let slot_live = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper("{prefix}_slot_live"),
         e.ints.slot_form, [cc_eq_side(e, eq_lhs), cc_eq_int_ref(e, i)])
@@ -4342,11 +4350,11 @@ fn cc_is_map_slot_method(kind: TyKind, method: Str) -> Bool {
 
 // A present test and a value read, chosen between by one Select rather than declared into a
 // carrier by a statement: CarrierWrap already prints as a compound literal, so both arms are
-// expressions and the choice between them is too. The map and the key each appear on both
-// sides of that choice, so each is bound to its own local once, ahead of it, rather than
-// lowered or travelled a second time -- lowering an effectful key expression twice would run
-// it twice, and travelling the same raw value twice only ever declares a second local, never
-// re-reads the source.
+// expressions and the choice between them is too. Both come from one lookup, which answers
+// the key's slot or -1: a test then a read would hash and compare the key twice, and a read
+// alone cannot say absent, since a stored 0 is the same word. The map, the key and that slot
+// are each bound to their own local once, ahead of the choice -- lowering an effectful key
+// expression twice would run it twice.
 fn cc_map_slot_method(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     let container = tid_of_node(obj)
     if container < 0 { return -1 }
@@ -4370,24 +4378,25 @@ fn cc_map_slot_method(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! D
     if recv_val < 0 { return -1 }
     let recv_name = c_mint_local("mg")
     cg_expr_push_pending(node, ir_let(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form, recv_val))
-    let recv_has = ir_var_ref(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form)
-    let recv_get = ir_var_ref(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form)
+    let recv_find = ir_var_ref(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form)
+    let recv_read = ir_var_ref(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form)
 
     let key_val = lower_expr(sublist_get(node_args(node), 0))
     if key_val < 0 { return -1 }
     let key_name = c_mint_local("mg")
     cg_expr_push_pending(node, ir_let(plan.tid, node, plan.value.c_spelling, key_name, plan.value.slot_form, key_val))
-    let key_has_raw = ir_var_ref(plan.tid, node, plan.value.c_spelling, key_name, plan.value.slot_form)
-    let key_get_raw = ir_var_ref(plan.tid, node, plan.value.c_spelling, key_name, plan.value.slot_form)
-    let key_has = cc_key_travel(node, plan, key_has_raw)
-    if key_has < 0 { return -1 }
-    let key_get = cc_key_travel(node, plan, key_get_raw)
-    if key_get < 0 { return -1 }
+    let key_raw = ir_var_ref(plan.tid, node, plan.value.c_spelling, key_name, plan.value.slot_form)
+    let key = cc_key_travel(node, plan, key_raw)
+    if key < 0 { return -1 }
 
-    let has_call = ir_call_runtime(TYPE_INT, node, found.c_spelling, c_runtime_helper(row.op), found.slot_form, [recv_has, key_has])
-    let cond = ir_binary(TYPE_BOOL, node, found.c_spelling, "!=", has_call, ir_const(TYPE_INT, node, found.c_spelling, "0"))
+    let find_call = ir_call_runtime(TYPE_INT, node, found.c_spelling, c_runtime_helper("map_find"), found.slot_form, [recv_find, key])
+    let slot_name = c_mint_local("mg")
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, found.c_spelling, slot_name, found.slot_form, find_call))
+    let slot_test = ir_var_ref(TYPE_INT, node, found.c_spelling, slot_name, found.slot_form)
+    let slot_read = ir_var_ref(TYPE_INT, node, found.c_spelling, slot_name, found.slot_form)
+    let cond = ir_binary(TYPE_BOOL, node, found.c_spelling, ">=", slot_test, ir_const(TYPE_INT, node, found.c_spelling, "0"))
 
-    let get_call = ir_call_runtime(shape.tid, node, container_slot_spelling(), c_runtime_helper("map_get"), SlotForm.InlineWord, [recv_get, key_get])
+    let get_call = ir_call_runtime(shape.tid, node, container_slot_spelling(), c_runtime_helper("map_slot_value"), SlotForm.InlineWord, [recv_read, slot_read])
     let native = ir_cast(shape.tid, node, shape.slot.c_spelling, cc_from_slot_word(shape.tid, node, shape.slot, get_call))
     let member = cc_member_layout(node, tid, Slot.Inner1)
     if cc_stopped(member) { return -1 }

@@ -1,0 +1,161 @@
+// A Map read has to tell a present key from an absent one by something other than the value:
+// a slot can hold 0, false or an empty Str, and each of those is the same word the runtime
+// would answer for a key it does not hold.
+
+@derive(Hash)
+type Point { x: Int  y: Int }
+
+test "a present key whose value is zero, false or empty answers Some" {
+    let mut ints: Map[Str, Int] = Map.new()
+    ints.insert("zero", 0)
+    assert_eq(ints.get("zero"), Some(0))
+    let mut bools: Map[Str, Bool] = Map.new()
+    bools.insert("no", false)
+    assert_eq(bools.get("no"), Some(false))
+    let mut strs: Map[Str, Str] = Map.new()
+    strs.insert("blank", "")
+    assert_eq(strs.get("blank"), Some(""))
+    let mut floats: Map[Int, Float] = Map.new()
+    floats.insert(0, 0.0)
+    assert_eq(floats.get(0), Some(0.0))
+}
+
+test "an absent key answers None" {
+    let mut ints: Map[Str, Int] = Map.new()
+    assert_eq(ints.get("missing"), None)
+    ints.insert("zero", 0)
+    assert_eq(ints.get("missing"), None)
+    let mut bools: Map[Int, Bool] = Map.new()
+    bools.insert(1, false)
+    assert_eq(bools.get(2), None)
+}
+
+test "?? takes the stored value when the key is present, even a zero one" {
+    let mut ints: Map[Str, Int] = Map.new()
+    ints.insert("zero", 0)
+    assert_eq(ints.get("zero") ?? 7, 0)
+    assert_eq(ints.get("missing") ?? 7, 7)
+    let mut strs: Map[Str, Str] = Map.new()
+    strs.insert("blank", "")
+    assert_eq(strs.get("blank") ?? "fallback", "")
+    assert_eq(strs.get("missing") ?? "fallback", "fallback")
+    let mut bools: Map[Int, Bool] = Map.new()
+    bools.insert(3, false)
+    assert_eq(bools.get(3) ?? true, false)
+    assert_eq(bools.get(4) ?? true, true)
+}
+
+// A removed key leaves a marker in its slot that a probe has to walk past, not stop at:
+// keys inserted after it may sit further along the same chain.
+test "a lookup after removes finds the keys that are left and misses the removed ones" {
+    let mut m: Map[Int, Int] = Map.new()
+    let mut i = 0
+    while i < 64 {
+        m.insert(i, i * 10)
+        i = i + 1
+    }
+    i = 0
+    while i < 64 {
+        if i % 3 == 0 { let _gone = m.remove(i) }
+        i = i + 1
+    }
+    i = 0
+    while i < 64 {
+        if i % 3 == 0 {
+            assert_eq(m.get(i), None)
+            assert_eq(m.get(i) ?? -1, -1)
+        } else {
+            assert_eq(m.get(i), Some(i * 10))
+            assert_eq(m.get(i) ?? -1, i * 10)
+        }
+        i = i + 1
+    }
+    m.insert(0, 0)
+    assert_eq(m.get(0), Some(0))
+}
+
+test "a lookup after the table grows still finds every key" {
+    let mut m: Map[Str, Int] = Map.new()
+    let mut i = 0
+    while i < 2000 {
+        m.insert("k{i}", i)
+        i = i + 1
+    }
+    i = 0
+    while i < 2000 {
+        assert_eq(m.get("k{i}"), Some(i))
+        i = i + 1
+    }
+    assert_eq(m.get("k2000"), None)
+    assert_eq(m.get("k0") ?? -1, 0)
+}
+
+test "struct keys are found by value, not by address" {
+    let mut m: Map[Point, Int] = Map.new()
+    m.insert(Point { x: 1, y: 2 }, 0)
+    m.insert(Point { x: 3, y: 4 }, 34)
+    assert_eq(m.get(Point { x: 1, y: 2 }), Some(0))
+    assert_eq(m.get(Point { x: 3, y: 4 }) ?? -1, 34)
+    assert_eq(m.get(Point { x: 2, y: 1 }), None)
+    assert_eq(m.get(Point { x: 2, y: 1 }) ?? -1, -1)
+}
+
+test "Str keys are found by contents, not by address" {
+    let mut m: Map[Str, Int] = Map.new()
+    let a = "ab"
+    m.insert(a.concat("c"), 0)
+    let probe = "a".concat("bc")
+    assert_eq(m.get(probe), Some(0))
+    assert_eq(m.get("abd"), None)
+}
+
+fn counted_key(calls: List[Int], key: Int) -> Int {
+    calls.push(key)
+    key
+}
+
+// The key expression runs once per read, however the read is lowered.
+test "a read runs its key expression once" {
+    let mut m: Map[Int, Int] = Map.new()
+    m.insert(1, 10)
+    let calls: List[Int] = []
+    let got = m.get(counted_key(calls, 1))
+    assert_eq(got, Some(10))
+    assert_eq(calls.len(), 1)
+    let other = m.get(counted_key(calls, 5)) ?? 0
+    assert_eq(other, 0)
+    assert_eq(calls.len(), 2)
+}
+
+test "maps with the same keys and values are equal, including zero values" {
+    let mut a: Map[Str, Int] = Map.new()
+    let mut b: Map[Str, Int] = Map.new()
+    a.insert("zero", 0)
+    a.insert("one", 1)
+    b.insert("one", 1)
+    b.insert("zero", 0)
+    assert(a == b)
+    let mut c: Map[Str, Str] = Map.new()
+    let mut d: Map[Str, Str] = Map.new()
+    c.insert("blank", "")
+    d.insert("blank", "")
+    assert(c == d)
+}
+
+test "maps that differ in a value or a key are not equal" {
+    let mut a: Map[Str, Int] = Map.new()
+    let mut b: Map[Str, Int] = Map.new()
+    a.insert("k", 0)
+    b.insert("k", 1)
+    assert(a != b)
+    let mut c: Map[Str, Int] = Map.new()
+    c.insert("j", 0)
+    assert(a != c)
+    let mut p: Map[Point, Bool] = Map.new()
+    let mut q: Map[Point, Bool] = Map.new()
+    p.insert(Point { x: 1, y: 1 }, false)
+    q.insert(Point { x: 1, y: 1 }, false)
+    assert(p == q)
+    q.insert(Point { x: 1, y: 1 }, true)
+    assert(p != q)
+}
