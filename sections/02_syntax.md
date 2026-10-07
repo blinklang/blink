@@ -383,7 +383,7 @@ items.for_each(fn(x) {
 io.println("Found {count}")  // prints the actual count, not 0
 ```
 
-**Immutable captures.** For `let` bindings, shared reference is observationally equivalent to by-value copy — the value never changes, so there is no difference.
+**Immutable captures.** For a `let` binding, shared reference and by-value copy differ only when the value reaches a shared cell (§3.6 *Shared cells*). A change made to that cell through another name shows through the capture too. A value that reaches no shared cell never changes, so there is no difference.
 
 **Mutable captures.** For `let mut` bindings, mutations through the closure are visible in the enclosing scope and vice versa.
 
@@ -399,7 +399,7 @@ results.for_each(fn(r) {
 io.println("Total: {total}, Errors: {errors}")  // both reflect actual values
 ```
 
-**Snapshot idiom.** When you want a copy independent of future mutations, bind to a new `let`:
+**Snapshot idiom.** When you want a copy independent of future mutations, bind a value type to a new `let`:
 
 ```blink
 let mut count = 0
@@ -408,6 +408,8 @@ let f = fn() { snapshot }  // captures immutable snapshot
 count = 42
 // f() == 0, count == 42
 ```
+
+For a shared cell, a new `let` is a second name for the same cell, not a copy. `let snap = xs` does not copy the list `xs`. `xs.slice(0, xs.len())` makes a new list, but it copies one level only: a list of lists still shares the inner lists.
 
 **Capture does not affect the function type.** A closure `fn(Int) -> Bool` that captures mutable variables has the same type as one that captures nothing. Captures are part of the closure's *value*, not its *type*. Higher-order functions, trait implementations, and type inference are unaffected by captures.
 
@@ -430,20 +432,64 @@ error[MutableCaptureInSpawn]: mutable binding captured in spawned task
   |             ^^^    ^^^^^ mutable capture not permitted in spawn
   |
   = note: spawned tasks cannot share mutable state — data race risk
-  = help: copy the value before spawning, or use a channel:
+  = note: binding a List does not copy it (§3.6)
+  = help: compute the value inside the task, or send results through a channel
+  = help: for a scalar, copy it into a `let` before the spawn:
   |
   | let snapshot = count
   | async.spawn(fn() { use(snapshot) })
+  |
+  = help: for a List, `xs.slice(0, xs.len())` makes a new list (one level only)
 ```
 
-Immutable captures in `async.spawn` are safe — the value stays valid while the closure can run, and no mutation means no data race:
+An immutable capture of a value that reaches no shared cell is safe. The value cannot change while the task runs:
 
 ```blink
-let data = prepare_data()
+let limit = config.max_items
 async.spawn(fn() {
-    process(data)  // OK: data is immutable and shared
+    process(limit)  // OK: an Int never changes
 })
 ```
+
+**Shared cells in a spawned task.** An immutable capture can still reach a shared cell (§3.6 *Shared cells*), at any depth. Another name can change that cell: a `let mut` alias, a `mut` parameter, or a struct field. So `async.spawn` freezes it:
+
+- From `async.spawn` until the spawner joins the task, each shared cell that the closure's captures reach is read-only. The spawner joins the task with `h.await`, or when the enclosing `async.scope` exits.
+- A write to a frozen cell, through any name and from any task, panics. A cell that more than one task reaches stays frozen until each of those tasks is joined.
+- Reads do not change. Read-only fan-out costs nothing extra.
+
+The freeze ends in the spawner's program order, so a write panics or succeeds at the same line on every run. It never depends on thread timing. To change a cell that a task reads, await the task first:
+
+```blink
+fn main() {
+    let xs = [1, 2, 3]
+    let mut ys = xs                // ys and xs share one list (§3.6)
+    async.scope {
+        let h = async.spawn(fn() { xs.len() })
+        ys.push(4)                 // PANIC: the task can still read xs
+        let n = h.await
+        ys.push(n)                 // OK: the task is joined
+    }
+}
+```
+
+The panic message names the write site, the `async.spawn` site, and the captured binding that reaches the cell. Other wording is not specified:
+
+```
+panic: write to a List that a spawned task can read
+ --> app.bl:6:9
+  |
+6 |         ys.push(4)
+  |         ^^ this List is frozen until the task is joined
+  |
+5 |         let h = async.spawn(fn() { xs.len() })
+  |                 ----------- the task captured `xs`, which reaches this List
+  |
+  = help: await the task before this write
+```
+
+The rule for the state of a handler in force at the spawn site (§4.13) is not yet decided.
+
+**Lint.** `warning[SpawnCaptureMutAlias]` fires on a write through a `let mut` that directly aliases a captured `let` (for example `let mut ys = xs`), when the write is inside the `async.scope` after the spawn and before the `h.await`. The check is not complete. It does not see an alias made through a call result (`id(xs)`), a struct literal (`W { xs: xs }`) or a `mut` parameter. A clean `blink check` does not prove that no write panics. The freeze is the guarantee.
 
 For inter-task communication with mutable state, use channels:
 
@@ -453,6 +499,8 @@ async.spawn(fn() {
     ch.send(compute_result())  // explicit communication, no shared mutation
 })
 ```
+
+`ch.send` copies each shared cell the sent value reaches, so the receiver gets its own (§4.13 *Channel operations*).
 
 #### Closures and Scoped Resources
 
@@ -473,14 +521,15 @@ Same logic applies to arena-allocated values — closures capturing arena bindin
 #### Capture Rules Summary
 
 - All captures are **shared reference** (the closure and the enclosing scope see one binding)
-- `let` captures: immutable, observationally equivalent to copy
+- `let` captures: immutable. Equivalent to a copy, except that a change to a shared cell (§3.6) through another name shows through the capture
 - `let mut` captures: mutations visible across closure boundary
 - No explicit capture syntax (no `move`, no capture lists)
 - `async.spawn` closures: immutable captures only. `let mut` captures are compile error E0650
+- `async.spawn` freezes each shared cell its captures reach until the spawner joins the task; a write to a frozen cell panics
 - `Closeable`/arena captures: existing escape rules (E0601/E0700) apply transitively through closures
 - Capture mode is not part of the function type
 
-**Panel vote:** Shared reference 3-2 (PLT/AI/DevOps for shared; Sys/Web for by-value). No explicit syntax 4-1 (DevOps dissented for `move`). Spawn restriction 3-2 (PLT/DevOps/AI for compile error; Sys/Web for auto-copy). See [DECISIONS.md](../DECISIONS.md).
+**Panel vote:** Shared reference 3-2 (PLT/AI/DevOps for shared; Sys/Web for by-value). No explicit syntax 4-1 (DevOps dissented for `move`). Spawn restriction 3-2 (PLT/DevOps/AI for compile error; Sys/Web for auto-copy). See [DECISIONS.md](../DECISIONS.md). Shared cells in a spawned task: freeze until join 4-2 (Web/AI for a copy at spawn); `SpawnCaptureMutAlias` warning 4-2 (Sys/DevOps for an error); copy at `ch.send` 5-1; E0650 help 5-1. See [decisions/spawn-shared-cell-freeze.md](../decisions/spawn-shared-cell-freeze.md).
 
 ### 2.9 If/Else Expressions
 

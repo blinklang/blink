@@ -2670,6 +2670,8 @@ A method cannot change its caller's value through `self`. State that must persis
 
 This list is the only one; other sections refer to it. `Bytes` is not on it: a `Bytes` is a value (§3.2.3 *Bytes*).
 
+Across tasks, `async.spawn` freezes each shared cell its captures reach until the task is joined (§2.8 *Shared cells in a spawned task*), and `ch.send` copies each shared cell the sent value reaches (§4.13 *Channel operations*).
+
 Only a shared cell can change through a second name. A value of any other type, at any depth, cannot. This holds for every copy: bind, pass, return and `clone()` (§3.6.1 *Clone Semantics*).
 
 #### Mutable Parameters
