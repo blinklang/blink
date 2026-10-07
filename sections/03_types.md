@@ -363,12 +363,12 @@ trait StringBuildOps {
 | Method | Signature | Notes |
 |--------|-----------|-------|
 | `new` | `fn() -> StringBuilder` | Empty buffer, default capacity |
-| `with_capacity` | `fn(n: Int) -> StringBuilder` | Sets the initial `capacity()` to `n` |
+| `with_capacity` | `fn(n: Int) -> StringBuilder` | Empty buffer with `capacity() >= n` (§3.2.2 *Capacity*) |
 | `write` | `fn[T: Display](self, x: T)` | Append `x` rendered by `Display`; same as `x.fmt(sb)`. Requires `let mut` |
 | `write_char` | `fn(self, c: Char)` | Append single character. Not generic; does not go through `Display` |
 | `to_str` | `fn(self) -> Str` | Produce immutable `Str` (copies buffer) |
 | `len` | `fn(self) -> Int` | Current content length in codepoints |
-| `capacity` | `fn(self) -> Int` | Current buffer capacity |
+| `capacity` | `fn(self) -> Int` | Current buffer capacity (§3.2.2 *Capacity*) |
 | `clear` | `fn(self)` | Reset to empty, retains capacity for reuse |
 
 **`to_str()` always copies.** The returned `Str` is an independent immutable value. Subsequent `write()` or `clear()` calls on the builder do not affect previously returned strings. This is the only safe semantics given immutable `Str`.
@@ -386,7 +386,7 @@ trait StringBuildOps {
 
 ##### Construction and Mutability
 
-Collections are constructed via `Type.new()` for empty collections or literal syntax where available. A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A call to a mutating method needs a mutable **root**: the first name of the receiver path must be a `let mut` binding or a `mut` parameter. `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`.
+Collections are constructed via `Type.new()` for empty collections or literal syntax where available. `List.with_capacity(n)` also makes an empty list (see *Capacity* below). A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A call to a mutating method needs a mutable **root**: the first name of the receiver path must be a `let mut` binding or a `mut` parameter. `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`.
 
 ```blink
 // Empty collections
@@ -416,6 +416,38 @@ b.push(3)              // `a` now holds 3 as well
 ```
 
 (Vote: 5-0. Rationale text revised by the parameter-mutation panel, 6-0 — see [Parameter Mutation rationale](../decisions/parameter-mutation.md).)
+
+##### Capacity
+
+`List.with_capacity(n)` makes an empty list that can hold `n` elements before it grows. Use it only when you know the final size before the first `push`. The list is empty: `len()` is 0 and no element is set. A `push` past `n` grows the list as usual. Apart from `capacity()`, `n` changes no result.
+
+```blink
+fn squares(n: Int) -> List[Int] {
+    let mut out = List.with_capacity(n)
+    for i in 0..n {
+        out.push(i * i)
+    }
+    out
+}
+```
+
+`capacity()` returns how many elements the list can hold before it grows. The language promises only these three rules:
+
+- `xs.capacity() >= xs.len()` at all times.
+- `capacity() >= n` right after `List.with_capacity(n)`.
+- `clear()` does not lower `capacity()`.
+
+The growth factor and all exact values are unspecified, and a release can change them. Use `capacity()` in tests and diagnostics. Do not branch on it.
+
+Every `with_capacity` constructor (`List`, `StringBuilder`) follows the same rules:
+
+- `n <= 0` gives the same result as `new()`. It does not panic.
+- `len()` is 0 after construction.
+- When a large `n` cannot be allocated, the program takes the same out-of-memory path as any other allocation.
+
+`Map` and `Set` have no `with_capacity` and no `capacity()`.
+
+(Panel vote: 6-0 on `with_capacity`; 6-0 on `capacity()` in round 2 after 3-3 in round 1; 4-2 on `n <= 0`. See [List Capacity rationale](../decisions/list-capacity.md).)
 
 ##### The `Contains` Trait
 
@@ -448,6 +480,9 @@ trait ListOps[T] {
     fn last(self) -> Option[T]
     fn index_of(self, value: T) -> Option[Int]
 
+    // Capacity (§3.2.2 Capacity)
+    fn capacity(self) -> Int
+
     // Mutation (requires let mut)
     fn push(self, value: T)
     fn pop(self) -> Option[T]
@@ -465,7 +500,7 @@ trait ListOps[T] {
 }
 ```
 
-The full `List[T]` method surface (14 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`, plus `join` from `Joinable`):
+The full `List[T]` method surface (15 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`, plus `join` from `Joinable`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
@@ -475,6 +510,7 @@ The full `List[T]` method surface (14 methods from `ListOps` + 2 from `Sized` + 
 | `get` | `fn(self, Int) -> Option[T]` | no | Safe indexed access |
 | `last` | `fn(self) -> Option[T]` | no | Last element |
 | `index_of` | `fn(self, T) -> Option[Int]` | no | First occurrence |
+| `capacity` | `fn(self) -> Int` | no | Elements the list holds before it grows (§3.2.2 *Capacity*) |
 | `push` | `fn(self, T)` | yes | Append to end |
 | `pop` | `fn(self) -> Option[T]` | yes | Remove from end |
 | `set` | `fn(self, Int, T)` | yes | Replace at index; panics when the index is out of bounds |
@@ -648,7 +684,7 @@ These are the **built-in method-surface traits** — the traits that host the me
 | `Contains[T]` | Set, List, Map | `contains` (element/key membership) | Yes |
 | `StrOps` | Str | string methods (`char_at`, `byte_at`, `contains`, `split`, `to_upper`, `trim`, `replace`, …) | Yes |
 | `BytesOps` | Bytes | byte methods (`push`, `get`, `slice`, `to_str`, `to_hex`, `read_u32_be`, …) | Yes |
-| `ListOps[T]` | List | 13 methods | Yes |
+| `ListOps[T]` | List | 15 methods | Yes |
 | `MapOps[K, V]` | Map | 9 methods | Yes |
 | `SetOps[T]` | Set | 3 methods | Yes |
 | `IntoIterator[T]` | List, Map, Set, Str, Range, Channel | `into_iter` | Yes (§3c.1) |
