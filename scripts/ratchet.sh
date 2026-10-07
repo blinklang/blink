@@ -48,15 +48,16 @@
 #                            cannot answer, and each table is a second place for
 #                            a type to be described
 #   node_pool_writes         writes to the parser's node pool, the non-pub
-#                            `columns` (one column per node field plus the
-#                            child-slot columns), outside node_push, node_pop,
+#                            `columns` (the head words, the Int and Str payload
+#                            arenas, the shape tables and the child-slot
+#                            columns), outside node_push, node_pop,
 #                            node_replace, parser_reset, the two plain-field
-#                            writers and the chunk and child-slot helpers they
-#                            call; absolute zero gate. A plain-field writer
-#                            writes only a field the child table never reads;
-#                            every other writer writes every column. Any other
-#                            write leaves one column holding a field or a child
-#                            the others do not. Counted in src/, lib/ and
+#                            writers and the store, shape, arena and child-slot
+#                            helpers they call; absolute zero gate. A
+#                            plain-field writer writes only a field the child
+#                            table never reads. Any other write can leave a
+#                            payload that its head word's shape does not
+#                            describe. Counted in src/, lib/ and
 #                            tests/: in parser.bl
 #                            outside the writers, and in every file that imports
 #                            `nodes` from parser or spells `parser.nodes`, the
@@ -176,7 +177,7 @@ pool_writes() {
   p="$root/src/parser.bl"
   if [ -f "$p" ]; then
     n=$(awk '
-      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset|node_write_plain_int|node_write_plain_str|node_columns_open_chunk|node_columns_close_chunk|node_drop_child_slots_from)\(/ { inw = 1 }
+      /^(pub )?fn (node_push|node_pop|node_replace|parser_reset|node_write_plain_int|node_write_plain_str|node_write_int|node_write_str|node_widen|node_store|node_overwrite|node_shape|node_shape_new|node_ints_drop|node_strs_drop|node_drop_child_slots_from)\(/ { inw = 1 }
       !inw { print }
       inw && /^}/ { inw = 0 }' "$p" | rg -o "$POOL_WRITE|$COLUMN_WRITE" | wc -l | tr -d ' ')
     total=$((total + n))
