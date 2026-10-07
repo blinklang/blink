@@ -661,7 +661,7 @@ A `panicked` record has no `cause`, no `error` object and no `assertion` fields.
 total = passed + failed + panicked + skipped
 ```
 
-A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise (§8.10.5).
+A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. An unexpected pass counts as `failed` (§8.10.6). A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise (§8.10.5).
 
 **Human-readable output.** The per-test line for a panicked test uses the word `PANIC`, and the panic message follows it:
 
@@ -1418,10 +1418,14 @@ An **unexpected pass** (the test was expected to fail but actually passed) becom
   "xfail_reason": "Phase 3 trait elaboration not yet implemented" }
 ```
 
-The suite-failure rule is mechanical:
+The suite-failure rule is mechanical. It reads only `status`:
 
-- `status == "failed" && !expected_fail` — ordinary test failure.
-- `status == "passed" && expected_fail` — unexpected pass; suite fails.
+- `status == "failed"` — the suite fails. When `expected_fail` is absent or `false`, this is an ordinary test failure. When `expected_fail` is `true`, this is an unexpected pass, with `cause: "assertion"` and `assertion: "expected failure, got pass"`.
+- `status == "panicked"` — the suite fails.
+- `status == "passed"` — the suite does not fail. When `expected_fail` is `true`, this is an expected red (see `xfail_observed`).
+- `status == "skipped"` — the suite does not fail.
+
+An unexpected pass is the only record with `expected_fail: true` and `status: "failed"`. A consumer tests the pair, not the `assertion` text. `expected_fail` is never true on a `panicked` record.
 
 There is **no** soft / "warn-only" mode for unexpected passes. The intent of `test.failing` is to record a known red state; the moment it goes green, the test must be moved back to `test(...)` in the same commit that removes the `test.failing` registration.
 
@@ -1441,6 +1445,8 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 **Panel vote.** Q1 (`.tmp/<ticket>/` parking workflow with runner integration): **5-1**, PLT dissent. Q2 (ship runtime xfail now, not later): **3-3 → user (BDFL) tiebreak in favor of shipping** — Blink users are actively requesting it. Q3 (encoding under closed-status / closed-cause enums): **4-2** for the boolean `expected_fail` field with paired `xfail_reason` (rejected alternatives: new top-level `xfailed` status, new `cause` value). Mandatory non-empty `reason:` and strict-by-default unexpected-pass semantics are non-negotiable mitigations bundled with shipping. See [DECISIONS.md](../DECISIONS.md) and [decisions/xfail-and-parking.md](../decisions/xfail-and-parking.md).
 
 **Superseded in part.** A later decision removed the parking workflow (Q1 above, §8.10.5) and the `br` coupling: the panel voted to remove parking and the closed-ticket lint (**6-0** each), and the user (BDFL) overruled the panel's optional `ticket:` to remove the argument from the language, so `xfail_reason` holds the reason only. See [decisions/parking-removal-and-xfail-ticket.md](../decisions/parking-removal-and-xfail-ticket.md).
+
+**Rule text fixed.** A later panel fixed the suite-failure rule above to match the unexpected-pass example and the runtime. Rule keyed by `status` alone, over all four statuses: **5-1** (Minimalism dissent, for rules keyed by `status` and `expected_fail` together). The "only record" sentence with "a consumer tests the pair": **5-1** after a second round (Systems dissent, for the first sentence only). "`expected_fail` is never true on a `panicked` record", with no sentence on `xfail_observed`: **3-3 → user (BDFL) tiebreak**. No sentence that `expected_fail` is a property of the test: **3-3 → user tiebreak**. The added sentence in §8.10: **5-1** (Minimalism dissent: two copies can drift). See [decisions/xfail-unexpected-pass-rule.md](../decisions/xfail-unexpected-pass-rule.md).
 
 ---
 
