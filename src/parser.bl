@@ -111,14 +111,21 @@ fn node_columns_empty() -> NodeColumns {
 
 let mut columns: NodeColumns = node_columns_empty()
 
-// Sublists: for lists of node references (params, args, stmts, etc.). `lists` holds every
-// sublist by id; `open` is the stack of ids a parse has started and not yet finalized.
+// Sublists: for lists of node references (params, args, stmts, etc.). Every closed sublist is
+// a run of `arena`, so a read is one load chain, not one through a List per sublist; `start`
+// and `len` hold the run of each sublist id. Sublists nest while a parse runs, so an open one
+// cannot grow in place in the arena: it builds in `scratch` at its depth on the `open` stack,
+// and its start reads -2 - depth until finalize_sublist copies it to the arena end. Its length
+// stays live so a read before finalize still reads right.
 type SublistPool {
-    lists: List[List[Int]]
+    arena: List[Int]
+    start: List[Int]
+    len: List[Int]
     open: List[Int]
+    scratch: List[List[Int]]
 }
 
-let mut sublists: SublistPool = SublistPool { lists: [], open: [] }
+let mut sublists: SublistPool = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
 
 let mut annotation_nodes: List[Int] = []
 let mut program_annotation_nodes: List[Int] = []
@@ -140,7 +147,7 @@ pub let mut source_module_for_node: Map[Int, Str] = Map()
 
 pub fn parser_reset() {
     columns = node_columns_empty()
-    sublists = SublistPool { lists: [], open: [] }
+    sublists = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
     annotation_nodes.clear()
     program_annotation_nodes.clear()
     source_module_for_node.clear()
@@ -590,10 +597,11 @@ fn node_push_slot_children(id: Int, side: Int, out: List[Int]) {
             if (slot & 1) == 0 {
                 out.push(slot >> 2)
             } else {
-                let members = sublists.lists[slot >> 2]
+                let sl = slot >> 2
+                let n = sublist_length(sl)
                 let mut k = 0
-                while k < members.len() {
-                    let m = members[k]
+                while k < n {
+                    let m = sublist_get(sl, k)
                     if m != -1 { out.push(m) }
                     k = k + 1
                 }
@@ -604,9 +612,17 @@ fn node_push_slot_children(id: Int, side: Int, out: List[Int]) {
 }
 
 pub fn new_sublist() -> Int ! Parse.Build {
-    let id = sublists.lists.len()
-    let inner: List[Int] = []
-    sublists.lists.push(inner)
+    let id = sublists.start.len()
+    let depth = sublists.open.len()
+    if depth == sublists.scratch.len() {
+        let items: List[Int] = []
+        sublists.scratch.push(items)
+    } else {
+        let mut items = sublists.scratch[depth]
+        items.clear()
+    }
+    sublists.start.push(-2 - depth)
+    sublists.len.push(0)
     sublists.open.push(id)
     id
 }
@@ -616,8 +632,7 @@ pub fn sublist_push(sl: Int, node_id: Int) ! Parse.Build {
         io.println("FATAL: sublist_push() called with no open sublist")
         exit(1)
     }
-    let mut items = sublists.lists.get(sl).unwrap()
-    items.push(node_id)
+    sublist_add(sl, node_id)
 }
 
 pub fn finalize_sublist(sl: Int) ! Parse.Build {
@@ -631,16 +646,62 @@ pub fn finalize_sublist(sl: Int) ! Parse.Build {
         exit(1)
     }
     sublists.open.pop()
+    let items = sublists.scratch[sublists.open.len()]
+    sublists.start.set(sl, sublists.arena.len())
+    for m in items {
+        sublists.arena.push(m)
+    }
 }
 
+// One branch holds every check so the hot path stays small; the read of an open sublist and
+// the error report live in sublist_get_slow.
 pub fn sublist_get(sl: Int, idx: Int) -> Int {
-    let items = sublists.lists.get(sl).unwrap()
-    items.get(idx).unwrap()
+    let s = sublists.start[sl]
+    if s < 0 || idx < 0 || idx >= sublists.len[sl] {
+        return sublist_get_slow(sl, idx)
+    }
+    sublists.arena[s + idx]
 }
 
 pub fn sublist_length(sl: Int) -> Int {
-    let items = sublists.lists.get(sl).unwrap()
-    items.len()
+    sublists.len[sl]
+}
+
+fn sublist_get_slow(sl: Int, idx: Int) -> Int {
+    let s = sublists.start[sl]
+    let n = sublists.len[sl]
+    if idx < 0 || idx >= n {
+        io.eprintln("FATAL: sublist_get({sl}, {idx}) out of bounds; sublist length is {n}")
+        exit(2)
+    }
+    if s >= 0 {
+        return sublists.arena[s + idx]
+    }
+    sublists.scratch[-2 - s][idx]
+}
+
+// An open sublist grows in its scratch list. A closed one grows at the arena end: in place
+// when its run is already last, else after its run is copied there. The old run stays as
+// dead space, which is cheap because growth after close is rare.
+fn sublist_add(sl: Int, node_id: Int) {
+    let s = sublists.start[sl]
+    let n = sublists.len[sl]
+    if s < 0 {
+        let mut items = sublists.scratch[-2 - s]
+        items.push(node_id)
+    } else {
+        if s + n != sublists.arena.len() {
+            let dest = sublists.arena.len()
+            let mut k = 0
+            while k < n {
+                sublists.arena.push(sublists.arena[s + k])
+                k = k + 1
+            }
+            sublists.start.set(sl, dest)
+        }
+        sublists.arena.push(node_id)
+    }
+    sublists.len.set(sl, n + 1)
 }
 
 // Appends to `out` the children of `id` in VALUE position only. A pass that reasons about
@@ -729,10 +790,7 @@ pub fn get_str_named_arg(ann: Int, label: Str) -> Str {
 // `derives` becomes one @derive annotation, so the traits read the same as on the declaration
 // lib/std would have given.
 pub fn synth_struct_decl(name: Str, fnames: List[Str], ftypes: List[Str], derives: List[Str]) -> Int {
-    let flds = sublists.lists.len()
-    let inner: List[Int] = []
-    sublists.lists.push(inner)
-    let mut items = sublists.lists.get(flds).unwrap()
+    let mut items: List[Int] = []
     let mut i = 0
     while i < fnames.len() {
         let ta = node_count()
@@ -742,22 +800,19 @@ pub fn synth_struct_decl(name: Str, fnames: List[Str], ftypes: List[Str], derive
         items.push(tf)
         i = i + 1
     }
+    let flds = sublist_of(items)
     let mut anns = -1
     if derives.len() > 0 {
-        let args = sublists.lists.len()
-        let arg_inner: List[Int] = []
-        sublists.lists.push(arg_inner)
-        let mut arg_items = sublists.lists.get(args).unwrap()
+        let mut arg_items: List[Int] = []
         for d in derives {
             let a = node_count()
             node_push(AstNode { kind: NodeKind.Ident, name: d, line: 0, col: 0 })
             arg_items.push(a)
         }
+        let args = sublist_of(arg_items)
         let ann = node_count()
         node_push(AstNode { kind: NodeKind.Annotation, name: "derive", args: args, line: 0, col: 0 })
-        anns = sublists.lists.len()
-        let ann_inner: List[Int] = [ann]
-        sublists.lists.push(ann_inner)
+        anns = sublist_of([ann])
     }
     let td = node_count()
     node_push(AstNode { kind: NodeKind.TypeDef, name: name, fields: flds, handlers: anns, line: 0, col: 0 })
@@ -780,15 +835,18 @@ pub fn synth_named_arg(label: Str, value: Int, line: Int, col: Int) -> Int {
 // stack is empty, which is the right guard while a parse is running and the wrong one after
 // it has finished.
 pub fn sublist_append(sl: Int, node_id: Int) {
-    let mut items = sublists.lists.get(sl).unwrap()
-    items.push(node_id)
+    sublist_add(sl, node_id)
 }
 
 // A sublist built after parsing, from members already in the pool. It stays off the sublist
 // stack for the reason sublist_append does: no parse is open for it to belong to.
 pub fn sublist_of(members: List[Int]) -> Int {
-    let id = sublists.lists.len()
-    sublists.lists.push(members)
+    let id = sublists.start.len()
+    sublists.start.push(sublists.arena.len())
+    sublists.len.push(members.len())
+    for m in members {
+        sublists.arena.push(m)
+    }
     id
 }
 
@@ -883,7 +941,7 @@ fn node_die(id: Int, where: Str) {
     let dump = env.var("BLINK_PARSER_PANIC_DUMP") ?? ""
     if dump != "" {
         let nlen = columns.count
-        let sl_len = sublists.lists.len()
+        let sl_len = sublists.start.len()
         io.eprintln("parser-dump: pos={pos} src='{diag_source_file}' sublists.len={sl_len}")
         // Tail of the node pool — last 32 kinds + line:col, oldest first.
         let mut start = nlen - 32
@@ -901,8 +959,7 @@ fn node_die(id: Int, where: Str) {
         let mut max_sl = 0
         let mut max_sl_idx = -1
         while j < sl_len {
-            let items = sublists.lists.get(j).unwrap()
-            let l = items.len()
+            let l = sublists.len[j]
             if l > max_sl {
                 max_sl = l
                 max_sl_idx = j
