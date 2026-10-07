@@ -1,0 +1,226 @@
+// A node's kids and its named slots are copied into the arena when the node is built, and a
+// body's storage is released when the next body starts. Whatever shape that storage takes,
+// each node must read back exactly what it was built with: no caller list it was built from,
+// no node built after it, and no node of a released body may change what it reads.
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_new, ir_begin_body, ir_node, ir_kid_count, ir_kid, ir_kids,
+    ir_c_name, ir_decl, ir_kops_table, ir_capture_descs, ir_promoter, ir_must_materialize,
+    ir_mark_materialize, ir_const, ir_block, ir_call_direct, ir_call_indirect, ir_enum_new,
+    ir_container_new, ir_closure_new, ir_switch, ir_panic_catch, ir_if,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn int_const(n: Int) -> Int { ir_const(1, 0, "int64_t", "{n}") }
+
+// Every way a reader can see a node's kids must agree with the list it was built from.
+fn assert_kids(label: Str, id: Int, want: List[Int]) {
+    assert_eq_int("{label} count", ir_kid_count(id), want.len())
+    let copied = ir_kids(id)
+    let record = ir_node(id).kids
+    assert_eq_int("{label} ir_kids len", copied.len(), want.len())
+    assert_eq_int("{label} record len", record.len(), want.len())
+    let mut i = 0
+    while i < want.len() {
+        let w = want.get(i).unwrap()
+        assert_eq_int("{label} kid {i}", ir_kid(id, i), w)
+        assert_eq_int("{label} ir_kids {i}", copied.get(i).unwrap(), w)
+        assert_eq_int("{label} record {i}", record.get(i).unwrap(), w)
+        i += 1
+    }
+}
+
+// The kids of node k: k leaves, so the counts cross every small size and the growth of any
+// fixed-size storage.
+fn build_wide(k: Int) -> List[Int] {
+    let mut kids: List[Int] = []
+    let mut j = 0
+    while j < k {
+        kids.push(int_const(k * 100 + j))
+        j += 1
+    }
+    kids
+}
+
+test "the kids of many nodes of every width read back after later nodes are built" {
+    ir_reset()
+    ir_begin_body()
+    let mut parents: List[Int] = []
+    let mut wants: List[List[Int]] = []
+    let mut k = 0
+    while k < 20 {
+        let kids = build_wide(k)
+        parents.push(ir_block(0, kids))
+        wants.push(kids)
+        k += 1
+    }
+    let mut i = 0
+    while i < parents.len() {
+        assert_kids("width {i}", parents.get(i).unwrap(), wants.get(i).unwrap())
+        i += 1
+    }
+}
+
+test "every constructor shape keeps its kids in order" {
+    ir_reset()
+    ir_begin_body()
+    let a = int_const(1)
+    let b = int_const(2)
+    let c = int_const(3)
+    let d = int_const(4)
+    assert_kids("indirect call", ir_call_indirect(1, 0, "int64_t", SlotForm.InlineWord, a, [b, c]), [a, b, c])
+    assert_kids("enum", ir_enum_new(1, 0, "E", 77, "V", a, [b, c, d]), [a, b, c, d])
+    assert_kids("switch with default", ir_switch(0, a, [b, c], d), [a, b, c, d])
+    assert_kids("switch without default", ir_switch(0, a, [b, c], -1), [a, b, c])
+    assert_kids("catch with matcher", ir_panic_catch(0, "f", a, b, c, d, a), [a, b, c, d, a])
+    assert_kids("catch without matcher", ir_panic_catch(0, "f", a, b, c, -1, d), [a, b, c, d])
+    assert_kids("if with else", ir_if(0, a, b, c), [a, b, c])
+    assert_kids("if without else", ir_if(0, a, b, -1), [a, b])
+}
+
+test "a scratch list reused for two nodes does not rewrite the first" {
+    ir_reset()
+    ir_begin_body()
+    let a = int_const(1)
+    let b = int_const(2)
+    let c = int_const(3)
+    let mut scratch: List[Int] = [a, b]
+    let first = ir_call_direct(1, 0, "int64_t", "f", SlotForm.InlineWord, scratch)
+    scratch.set(0, c)
+    scratch.push(a)
+    let second = ir_call_direct(1, 0, "int64_t", "g", SlotForm.InlineWord, scratch)
+    scratch.clear()
+    scratch.push(b)
+    assert_kids("first", first, [a, b])
+    assert_kids("second", second, [c, b, a])
+}
+
+test "a list returned by ir_kids is the caller's own" {
+    ir_reset()
+    ir_begin_body()
+    let a = int_const(1)
+    let b = int_const(2)
+    let blk = ir_block(0, [a, b])
+    let mut got = ir_kids(blk)
+    got.set(0, b)
+    got.push(a)
+    assert_kids("block", blk, [a, b])
+}
+
+test "pinned nodes and the current body read right across many body releases" {
+    ir_reset()
+    let p1 = int_const(1)
+    let p2 = int_const(2)
+    let pinned = ir_block(0, [p1, p2])
+    let pinned_closure = ir_closure_new(1, 0, "blink_closure*", "f_pinned", "descs_p", "promote_p", [p1])
+    let mut round = 0
+    while round < 6 {
+        ir_begin_body()
+        let kids = build_wide(round + 3)
+        let blk = ir_block(0, kids)
+        // A body bigger than the one before it, so storage kept from an earlier body grows.
+        let more = build_wide(round * 5)
+        let blk2 = ir_block(0, more)
+        assert_kids("round {round} block", blk, kids)
+        assert_kids("round {round} second block", blk2, more)
+        assert_kids("round {round} pinned", pinned, [p1, p2])
+        assert_eq_str("round {round} pinned descs", ir_capture_descs(pinned_closure), "descs_p")
+        round += 1
+    }
+    assert_kids("pinned after the bodies", pinned, [p1, p2])
+    assert_eq_str("pinned promoter", ir_promoter(pinned_closure), "promote_p")
+}
+
+test "a node of a later body does not inherit the slots of the node a released body put at its index" {
+    ir_reset()
+    ir_begin_body()
+    let e = ir_enum_new(1, 0, "E", 42, "V", int_const(0), [])
+    let m = ir_container_new(1, 0, "blink_map*", "blink_map_new", "kops_t", [])
+    let cl = ir_closure_new(1, 0, "blink_closure*", "f", "descs_t", "promote_t", [])
+    ir_mark_materialize(m)
+    assert_eq_int("enum decl", ir_decl(e), 42)
+    assert_eq_str("map kops", ir_kops_table(m), "kops_t")
+    assert_eq_int("map mark", ir_must_materialize(m), 1)
+    ir_begin_body()
+    let mut fresh: List[Int] = []
+    let mut i = 0
+    while i < 6 {
+        fresh.push(int_const(i))
+        i += 1
+    }
+    for id in fresh {
+        assert_eq_int("fresh {id} decl", ir_decl(id), -1)
+        assert_eq_str("fresh {id} kops", ir_kops_table(id), "")
+        assert_eq_str("fresh {id} descs", ir_capture_descs(id), "")
+        assert_eq_str("fresh {id} promoter", ir_promoter(id), "")
+        assert_eq_int("fresh {id} mark", ir_must_materialize(id), 0)
+        assert_eq_int("fresh {id} kids", ir_kid_count(id), 0)
+    }
+    assert_eq_str("closure c_name was its own", ir_c_name(fresh.get(2).unwrap()), "2")
+    assert(cl < fresh.get(0).unwrap())
+}
+
+test "a slot set on one node leaves its neighbours alone" {
+    ir_reset()
+    ir_begin_body()
+    let before = int_const(1)
+    let m = ir_container_new(1, 0, "blink_map*", "blink_map_new", "kops_t", [before])
+    let after = int_const(2)
+    ir_mark_materialize(m)
+    assert_eq_str("before kops", ir_kops_table(before), "")
+    assert_eq_str("after kops", ir_kops_table(after), "")
+    assert_eq_int("before mark", ir_must_materialize(before), 0)
+    assert_eq_int("after mark", ir_must_materialize(after), 0)
+    assert_kids("container", m, [before])
+}
+
+test "reading the kids of a released node is an internal compiler error" {
+    ir_reset()
+    ir_begin_body()
+    let old = ir_block(0, [int_const(1)])
+    ir_begin_body()
+    let _ = ir_block(0, [int_const(2), int_const(3)])
+    assert_panics(matching: "released") {
+        let _ = ir_kid_count(old)
+    }
+    assert_panics(matching: "released") {
+        let _ = ir_kid(old, 0)
+    }
+    assert_panics(matching: "released") {
+        let _ = ir_kids(old)
+    }
+}
+
+test "a kid index past a node's kids stops instead of reading the next node's" {
+    ir_reset()
+    ir_begin_body()
+    let a = int_const(1)
+    let first = ir_block(0, [a])
+    let _ = ir_block(0, [int_const(2), int_const(3)])
+    assert_panics(matching: "out of bounds") {
+        let _ = ir_kid(first, 1)
+    }
+    assert_panics(matching: "out of bounds") {
+        let _ = ir_kid(first, -1)
+    }
+}
+
+test "a raw node keeps kids the per-kind constructors would refuse" {
+    ir_reset()
+    ir_begin_body()
+    let raw = ir_new(IrKind.Block, -1, 0, "", "", SlotForm.Inline, [5, -3, 99])
+    assert_kids("raw", raw, [5, -3, 99])
+}
