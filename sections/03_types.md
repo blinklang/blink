@@ -2462,7 +2462,7 @@ A function whose result depends on unsorted `Map`/`Set` iteration order is **not
 
 **Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would give equal values different hashes. Round to an integer key instead.
 
-**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
+**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). A fieldless enum is `Eq` already (*Container Equality*), so it needs only `@derive(Hash)` or an `impl Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
 
 For pinning the seed (golden-file tests, fixture-driven runners, self-hosting diff stability) and for the `--deterministic` flag and `BLINK_MAP_SEED` environment variable, see §8.10.
 
@@ -3004,7 +3004,35 @@ fn main() {
 
 **Generic code.** `==` on a container of a type parameter needs the bound that the table gives. `fn same[T](a: Option[T], b: Option[T]) -> Bool { a == b }` is an error. Write `fn same[T: Eq](a: Option[T], b: Option[T]) -> Bool { a == b }`.
 
-**Enums (interim rule).** An enum with no `Eq` impl and no `@derive(Eq)` is `Eq` only if every payload type is `Eq`. An enum with no payloads is `Eq`. So `Option[Color]` is `Eq` for a payload-free `Color`, and `Option[Shape]` is not `Eq` if a `Shape` variant carries a `List[Widget]`.
+**Enums.** A **fieldless enum** (§3.4 *Tag Operations*: no variant has a payload, as the declaration is written) is `Eq` with no derive and no impl. Two of its values are `==` when they are the same variant. An enum with at least one payload is `Eq` only through `@derive(Eq)` or a written `impl Eq`, the same as a struct (vote: 6-0; see [Enum Equality rationale](../decisions/enum-equality.md)). The payload types alone never make an enum `Eq`. So `Option[Color]` is `Eq` for a fieldless `Color`, and `Option[Shape]` is not `Eq` until `Shape` has `@derive(Eq)` or an `impl Eq`.
+
+```blink
+type Color { Red  Green  Blue }
+
+@derive(Eq)
+type Shape { Circle(r: Int)  Sq(s: Int) }
+
+fn main() {
+    let c = Color.Red == Color.Green            // OK: fieldless, compares the variant
+    let s = Shape.Circle(1) == Shape.Circle(1)  // OK: derived
+    let o = Some(Color.Red) == Some(Color.Red)  // OK: `Option[Color]` is `Eq`
+    io.println("{c} {s} {o}")                   // false true true
+}
+```
+
+A derive on a data enum checks each payload by the rule above, and fails at the declaration when a payload type is not `Eq`:
+
+```blink
+type Widget { id: Int }
+
+@derive(Eq)
+type Bag { Items(xs: List[Widget])  Empty }     // error[NonDerivableTrait] (E1401): `Widget` does not implement `Eq`
+```
+
+- **No `impl Eq` on a fieldless enum.** A written `impl Eq for E`, where `E` is a fieldless enum, is a compile error. `E` already compares by variant. A second `Eq` could make two values `==` that are different variants. Then `==` would disagree with the tag comparison with `Int`, and a derived `Hash` would break the `Hash`/`Eq` coherence law (*Hash Contract and Seeding*). To compare in a different way, write a named method.
+- **A redundant derive is legal.** `@derive(Eq)` on a fieldless enum is allowed, with no error and no warning. The compiler checks it as it checks any `@derive`.
+- **The first payload.** When a fieldless enum gets its first payload variant, `==` on it is an error until the declaration has `@derive(Eq)` or an `impl Eq`.
+- **Recursive types.** `@derive(Eq)` and `impl Eq` on a recursive type resolve coinductively: while the compiler checks the payloads, it assumes that the type is `Eq`. This applies to a type that contains itself (`type Tree { Leaf  Node(kids: List[Tree]) }`), to two or more types that contain each other, also across modules, and to a generic type such as `Tree[T]`, where the derive adds the bound `T: Eq` (§3.6.1 *Generic Type Bound Inference*).
 
 **Ord.** `Set` and `Map` never implement `Ord`: no order over them is canonical and agrees with membership equality.
 
@@ -3022,7 +3050,7 @@ A `sort_by` comparator need only be a **total preorder**. It obeys the second an
 
 **Diagnostic for a failed `Eq` check.** When `==`, `!=`, an `Eq` bound (for example `assert_eq`, E0306) or `@derive(Eq)` (E1401) fails on a type that has no `Eq`, the error names the **innermost** type argument that has no `Eq`, and the chain from the operand type to it. It offers **at least** these machine-applicable fixes (§8.6):
 
-- `@derive(Eq)` on that type, when it is a user-declared `struct` or `enum`.
+- `@derive(Eq)` on that type, when it is a user-declared `struct` or `enum`. For an enum with a payload, the error also notes that only fieldless enums are `Eq` with no `@derive(Eq)`, and the fix edits the enum's declaration.
 - `x.is_none()` in place of `x == None` (and `x.is_some()` in place of `x != None`), when one operand is a bare `None` literal. `is_none()` and `is_some()` need no `Eq`.
 
 The exact wording is not normative, and tools may offer more fixes.
