@@ -1849,6 +1849,33 @@ fn logging_db(label: Str) -> Handler[DB] {
 
 The compiler desugars the above as if `write` and `admin` were defined with `default.write(query)` and `default.admin(query)` respectively. Explicit `default.op(args)` remains available for custom delegation logic (e.g., logging before forwarding, as shown for `read` above).
 
+`default` is a contextual name, not a keyword. In the body of a handler operation, `default.op(args)` delegates to the handler that this operation's handler was installed over. Elsewhere, an unshadowed use of `default` is a compile error (E0544). A local binding named `default` shadows it.
+
+```blink
+effect Audit {
+    effect Log {
+        fn record(msg: Str)
+    }
+}
+
+fn log_it() ! Audit.Log {
+    default.record("x")   // error: not in a handler operation
+}
+```
+
+```
+error[DefaultOutsideHandlerOp]: `default` is only valid inside a handler operation body
+ --> audit.bl:8:5
+  |
+8 |     default.record("x")   // error: not in a handler operation
+  |     ^^^^^^^
+  |
+  = help: `default` forwards to the handler that the enclosing operation's handler was installed over
+  = help: to call the effect from ordinary code, use its handle: `audit.record("x")`
+```
+
+The second help line shows the call through the effect's handle (§4.4), built from the handle and the operation of the call. When the compiler cannot build it, the line says: "Outside an operation, call the effect operation directly through its handle, or move this call into a handler operation." There is no machine-applicable fix: a call through the handle goes to the innermost handler, so it does not do the same thing as a delegation.
+
 Auto-delegation means a `Handler[DB]` that only overrides `read` is still a complete `Handler[DB]` — the type system does not distinguish partial from total handlers. At runtime, unhandled operations bubble up to the nearest enclosing handler that implements them.
 
 When no enclosing handler implements the operation, the operation panics. This happens when a partial handler omits it and no outer handler implements it, or when a handler calls `default.op(args)` with no outer handler. The compile-time check at the roots (§4.6 *Unhandled user effects*, §2.20) does not rule this out, because it sees a partial handler as a complete one:

@@ -122,6 +122,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | MixedEffectBody | E0541 | An effect body declares both operations and sub-effects; a body holds one or the other. The fix moves the operations into a new sub-effect with a placeholder name, never up to the parent | Parser | §4.12 |
 | EffectNestingTooDeep | E0542 | A sub-effect declares a sub-effect; in v1 an effect tree has the top-level effect and one level of sub-effects | Parser | §4.12 |
 | DuplicateEffectOp | E0543 | Two nodes of one top-level effect tree declare operations with the same name. The message names both declarations (`Metrics.Emit.get`, `Metrics.Query.get`) | Effects | §4.12 |
+| DefaultOutsideHandlerOp | E0544 | `default` used outside the body of a handler operation, with no local binding named `default` in scope. The help shows the call through the effect's handle, built from the call (`audit.record("x")`), or says in words to call through the handle or move the call into a handler operation. No machine-applicable fix. A `default` binding in scope makes `default.x` ordinary member access (E0505 for a missing member) | Effects | §4.7.1 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | MutableCaptureInSpawn | E0650 | A closure passed to `async.spawn` captures a `let mut` binding | Closures | §2.8 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
