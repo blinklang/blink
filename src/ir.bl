@@ -42,6 +42,7 @@ pub type IrKind {
     Panic, Unreachable, PanicCatch, PanicCatchExit,
 }
 
+// One node as a record: what ir_node assembles from the arena's columns.
 pub type IrNode {
     kind: IrKind
     tid: Int
@@ -67,7 +68,7 @@ pub type IrNode {
     // other kind and on a list, which compares no keys.
     kops_table: Str
     // The vtable member a perform passes back to the operation as its capture word. It is
-    // the slot's neighbour, so ir_new stamps it from the slot on every EffectPerform and the
+    // the slot's neighbour, so record stamps it from the slot on every EffectPerform and the
     // printer never spells it; "" on every other kind.
     userdata_member: Str
     // How a closure is moved into an arena: what each capture holds, and the function that
@@ -81,6 +82,64 @@ pub type IrNode {
     gc_layout: Str
 }
 
+// The fields few nodes set, kept out of the columns every node pays for. A node gets a
+// row only when one of them is set; a node with no row reads the defaults below.
+type IrSlots {
+    decl: Int
+    tag_member: Str
+    payload_member: Str
+    kops_table: Str
+    userdata_member: Str
+    capture_descs: Str
+    promoter: Str
+    gc_layout: Str
+}
+
+fn no_slots() -> IrSlots {
+    IrSlots { decl: -1, tag_member: "", payload_member: "", kops_table: "", userdata_member: "", capture_descs: "", promoter: "", gc_layout: "" }
+}
+
+// One part of the arena, a column per field and a row per node. A list of records boxes
+// each record, so a node held that way costs an allocation of its own; a row costs one
+// word in each column. A node's kids are the kid_lens[i] ids at kid_starts[i] in kids,
+// and slot_rows[i] is its row in slots, or -1.
+type IrPart {
+    kinds: List[IrKind]
+    tids: List[Int]
+    spans: List[Int]
+    c_spellings: List[Str]
+    c_names: List[Str]
+    slot_forms: List[SlotForm]
+    marks: List[Int]
+    kid_starts: List[Int]
+    kid_lens: List[Int]
+    slot_rows: List[Int]
+    kids: List[Int]
+    slots: List[IrSlots]
+}
+
+fn new_part() -> IrPart {
+    IrPart {
+        kinds: [], tids: [], spans: [], c_spellings: [], c_names: [], slot_forms: [], marks: [],
+        kid_starts: [], kid_lens: [], slot_rows: [], kids: [], slots: [],
+    }
+}
+
+fn clear_part(p: IrPart) {
+    p.kinds.clear()
+    p.tids.clear()
+    p.spans.clear()
+    p.c_spellings.clear()
+    p.c_names.clear()
+    p.slot_forms.clear()
+    p.marks.clear()
+    p.kid_starts.clear()
+    p.kid_lens.clear()
+    p.slot_rows.clear()
+    p.kids.clear()
+    p.slots.clear()
+}
+
 // The arena, in two parts. Statements carry tid -1: tid 0 is a real type (the first
 // interned one), so 0 can not mean "unset".
 //
@@ -89,38 +148,44 @@ pub type IrNode {
 // IR live to the collector. What was built before the first body is kept: the deferred
 // global initializers are lowered ahead of every body and printed after all of them.
 //
+// A release empties the current part's columns but keeps their storage, so a body does not
+// regrow every column from nothing. The words past a column's length still name what the
+// released body held until the next body writes over them, which bounds what a release
+// leaves live to the largest body, not the unit.
+//
 // pinned holds ids [0, floor), the nodes built before the first body. nodes holds ids from
 // base up, the current body's. Ids in [floor, base) belonged to released bodies, and a read
 // of one stops the compiler: the node a reused index held instead would print the wrong C
 // with no report.
 type IrArena {
-    pinned: List[IrNode]
-    nodes: List[IrNode]
+    pinned: IrPart
+    nodes: IrPart
     floor: Int
     base: Int
     body_open: Bool
 }
 
-let mut ir_arena: IrArena = IrArena { pinned: [], nodes: [], floor: 0, base: 0, body_open: false }
+let mut ir_arena: IrArena = IrArena { pinned: new_part(), nodes: new_part(), floor: 0, base: 0, body_open: false }
 
 pub fn ir_reset() {
-    ir_arena = IrArena { pinned: [], nodes: [], floor: 0, base: 0, body_open: false }
+    ir_arena = IrArena { pinned: new_part(), nodes: new_part(), floor: 0, base: 0, body_open: false }
     verify_marks = VerifyMarks { epoch: 0, words: [] }
 }
 
 // The start of one body, and the end of the body before it.
 pub fn ir_begin_body() {
     let a = ir_arena
+    let n = a.nodes.kinds.len()
     if !a.body_open {
-        let n = a.nodes.len()
-        ir_arena = IrArena { pinned: a.nodes, nodes: [], floor: n, base: n, body_open: true }
+        ir_arena = IrArena { pinned: a.nodes, nodes: new_part(), floor: n, base: n, body_open: true }
     } else {
-        ir_arena = IrArena { pinned: a.pinned, nodes: [], floor: a.floor, base: a.base + a.nodes.len(), body_open: true }
+        clear_part(a.nodes)
+        ir_arena = IrArena { pinned: a.pinned, nodes: a.nodes, floor: a.floor, base: a.base + n, body_open: true }
     }
 }
 
 // The id the next node will get.
-pub fn ir_node_count() -> Int { ir_arena.base + ir_arena.nodes.len() }
+pub fn ir_node_count() -> Int { ir_arena.base + ir_arena.nodes.kinds.len() }
 
 // Whether `id` names a node a reader may still read.
 fn in_arena(id: Int) -> Bool {
@@ -128,7 +193,7 @@ fn in_arena(id: Int) -> Bool {
     id >= 0 && id < ir_arena.floor
 }
 
-fn part_of(id: Int) -> List[IrNode] { if id < ir_arena.floor { ir_arena.pinned } else { ir_arena.nodes } }
+fn part_of(id: Int) -> IrPart { if id < ir_arena.floor { ir_arena.pinned } else { ir_arena.nodes } }
 
 // Every node read passes through here, so the current body's case stays small enough for
 // the C compiler to inline; the rest lives in pinned_index.
@@ -148,74 +213,172 @@ fn pinned_index(id: Int) -> Int {
 // A dense index over both parts, for a table kept per readable node.
 fn arena_index(id: Int) -> Int { if id < ir_arena.floor { id } else { ir_arena.floor + index_in_part(id) } }
 
-fn arena_len() -> Int { ir_arena.floor + ir_arena.nodes.len() }
+fn arena_len() -> Int { ir_arena.floor + ir_arena.nodes.kinds.len() }
 
-fn set_node(id: Int, n: IrNode) { part_of(id).set(index_in_part(id), n) }
-
-// The raw constructor. Every per-kind constructor goes through it; tests use it directly to
-// build trees the per-kind constructors refuse to shape, so the verifier can be exercised.
-// The kid list is copied: Blink lists are references, and a caller that reuses one scratch
-// list across call sites must not rewrite an earlier node.
+// The raw constructor. Every per-kind constructor goes through record; tests use this one
+// directly to build trees the per-kind constructors refuse to shape, so the verifier can be
+// exercised. The kid list is copied: Blink lists are references, and a caller that reuses
+// one scratch list across call sites must not rewrite an earlier node.
 pub fn ir_new(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, kids: List[Int]) -> Int {
-    let userdata = match kind {
-        IrKind.EffectPerform => c_vtable_userdata_member(c_name)
-        _ => ""
-    }
-    ir_arena.nodes.push(IrNode {
-        kind: kind, tid: tid, span: span, c_spelling: c_spelling, c_name: c_name,
-        slot_form: slot_form, must_materialize: 0, kids: copy_ids(kids), decl: -1,
-        tag_member: "", payload_member: "", kops_table: "",
-        userdata_member: userdata,
-        capture_descs: "", promoter: "", gc_layout: "",
-    })
-    ir_node_count() - 1
+    let start = kid_mark()
+    for kid in kids { push_kid(kid) }
+    record(kind, tid, span, c_spelling, c_name, slot_form, start)
 }
 
-fn copy_ids(xs: List[Int]) -> List[Int] {
-    let mut out: List[Int] = []
-    for x in xs { out.push(x) }
-    out
+// A node's kids are the ids pushed to the current part since its kid_mark. A constructor
+// pushes them and then records the node with no other node built in between, or that
+// node's kids would land inside this one's run. The per-kind constructors push their kids
+// straight from their arguments, so building a node allocates no list for them.
+fn kid_mark() -> Int { ir_arena.nodes.kids.len() }
+
+fn push_kid(kid: Int) { ir_arena.nodes.kids.push(kid) }
+
+fn record(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, kid_start: Int) -> Int {
+    let p = ir_arena.nodes
+    p.kinds.push(kind)
+    p.tids.push(tid)
+    p.spans.push(span)
+    p.c_spellings.push(c_spelling)
+    p.c_names.push(c_name)
+    p.slot_forms.push(slot_form)
+    p.marks.push(0)
+    p.kid_starts.push(kid_start)
+    p.kid_lens.push(p.kids.len() - kid_start)
+    p.slot_rows.push(-1)
+    let id = ir_node_count() - 1
+    if kind == IrKind.EffectPerform {
+        set_slots(id, IrSlots { userdata_member: c_vtable_userdata_member(c_name), ..no_slots() })
+    }
+    id
+}
+
+fn node0(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm) -> Int {
+    record(kind, tid, span, c_spelling, c_name, slot_form, kid_mark())
+}
+
+fn node1(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, a: Int) -> Int {
+    let start = kid_mark()
+    push_kid(a)
+    record(kind, tid, span, c_spelling, c_name, slot_form, start)
+}
+
+fn node2(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, a: Int, b: Int) -> Int {
+    let start = kid_mark()
+    push_kid(a)
+    push_kid(b)
+    record(kind, tid, span, c_spelling, c_name, slot_form, start)
+}
+
+fn node3(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, a: Int, b: Int, c: Int) -> Int {
+    let start = kid_mark()
+    push_kid(a)
+    push_kid(b)
+    push_kid(c)
+    record(kind, tid, span, c_spelling, c_name, slot_form, start)
+}
+
+// `head` and then every id of `rest`, without building the joined list.
+fn node_after(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, head: Int, rest: List[Int]) -> Int {
+    let start = kid_mark()
+    push_kid(head)
+    for kid in rest { push_kid(kid) }
+    record(kind, tid, span, c_spelling, c_name, slot_form, start)
+}
+
+fn slots_of(id: Int) -> IrSlots {
+    let p = part_of(id)
+    let row = p.slot_rows[index_in_part(id)]
+    if row < 0 { return no_slots() }
+    p.slots[row]
+}
+
+fn set_slots(id: Int, s: IrSlots) {
+    let p = part_of(id)
+    let at = index_in_part(id)
+    let row = p.slot_rows[at]
+    if row < 0 {
+        p.slot_rows.set(at, p.slots.len())
+        p.slots.push(s)
+    } else {
+        p.slots.set(row, s)
+    }
 }
 
 // ── Accessors ─────────────────────────────────────────────────────────────
 
-pub fn ir_node(id: Int) -> IrNode { part_of(id)[index_in_part(id)] }
-// The field accessors read in place: ir_node returns a copy of the whole node, and every
-// stage asks these once or more per node.
-pub fn ir_kind(id: Int) -> IrKind { part_of(id)[index_in_part(id)].kind }
-pub fn ir_tid(id: Int) -> Int { part_of(id)[index_in_part(id)].tid }
-pub fn ir_span(id: Int) -> Int { part_of(id)[index_in_part(id)].span }
-pub fn ir_c_spelling(id: Int) -> Str { part_of(id)[index_in_part(id)].c_spelling }
-pub fn ir_c_name(id: Int) -> Str { part_of(id)[index_in_part(id)].c_name }
+// The whole node as one record, kids copied. Every stage reads a node through the field
+// accessors below instead, which read the columns in place.
+pub fn ir_node(id: Int) -> IrNode {
+    let p = part_of(id)
+    let at = index_in_part(id)
+    let s = slots_of(id)
+    IrNode {
+        kind: p.kinds[at], tid: p.tids[at], span: p.spans[at], c_spelling: p.c_spellings[at],
+        c_name: p.c_names[at], slot_form: p.slot_forms[at], must_materialize: p.marks[at],
+        kids: ir_kids(id), decl: s.decl, tag_member: s.tag_member, payload_member: s.payload_member,
+        kops_table: s.kops_table, userdata_member: s.userdata_member,
+        capture_descs: s.capture_descs, promoter: s.promoter, gc_layout: s.gc_layout,
+    }
+}
+pub fn ir_kind(id: Int) -> IrKind { part_of(id).kinds[index_in_part(id)] }
+pub fn ir_tid(id: Int) -> Int { part_of(id).tids[index_in_part(id)] }
+pub fn ir_span(id: Int) -> Int { part_of(id).spans[index_in_part(id)] }
+pub fn ir_c_spelling(id: Int) -> Str { part_of(id).c_spellings[index_in_part(id)] }
+pub fn ir_c_name(id: Int) -> Str { part_of(id).c_names[index_in_part(id)] }
 
-pub fn ir_tag_member(id: Int) -> Str { part_of(id)[index_in_part(id)].tag_member }
+pub fn ir_tag_member(id: Int) -> Str { slots_of(id).tag_member }
 
-pub fn ir_payload_member(id: Int) -> Str { part_of(id)[index_in_part(id)].payload_member }
+pub fn ir_payload_member(id: Int) -> Str { slots_of(id).payload_member }
 
-pub fn ir_kops_table(id: Int) -> Str { part_of(id)[index_in_part(id)].kops_table }
+pub fn ir_kops_table(id: Int) -> Str { slots_of(id).kops_table }
 
-pub fn ir_userdata_member(id: Int) -> Str { part_of(id)[index_in_part(id)].userdata_member }
+pub fn ir_userdata_member(id: Int) -> Str { slots_of(id).userdata_member }
 
-pub fn ir_capture_descs(id: Int) -> Str { part_of(id)[index_in_part(id)].capture_descs }
+pub fn ir_capture_descs(id: Int) -> Str { slots_of(id).capture_descs }
 
-pub fn ir_promoter(id: Int) -> Str { part_of(id)[index_in_part(id)].promoter }
+pub fn ir_promoter(id: Int) -> Str { slots_of(id).promoter }
 
-pub fn ir_gc_layout(id: Int) -> Str { part_of(id)[index_in_part(id)].gc_layout }
-pub fn ir_slot_form(id: Int) -> SlotForm { part_of(id)[index_in_part(id)].slot_form }
+pub fn ir_gc_layout(id: Int) -> Str { slots_of(id).gc_layout }
+pub fn ir_slot_form(id: Int) -> SlotForm { part_of(id).slot_forms[index_in_part(id)] }
 // The printer's one type-shaped question, asked without importing SlotForm.
 pub fn ir_held_by_pointer(id: Int) -> Bool {
-    match part_of(id)[index_in_part(id)].slot_form {
+    match part_of(id).slot_forms[index_in_part(id)] {
         SlotForm.PointerBoxed => true
         _ => false
     }
 }
-pub fn ir_must_materialize(id: Int) -> Int { part_of(id)[index_in_part(id)].must_materialize }
-pub fn ir_decl(id: Int) -> Int { part_of(id)[index_in_part(id)].decl }
-pub fn ir_kid_count(id: Int) -> Int { part_of(id)[index_in_part(id)].kids.len() }
-pub fn ir_kid(id: Int, i: Int) -> Int { part_of(id)[index_in_part(id)].kids[i] }
+pub fn ir_must_materialize(id: Int) -> Int { part_of(id).marks[index_in_part(id)] }
+pub fn ir_decl(id: Int) -> Int { slots_of(id).decl }
+pub fn ir_kid_count(id: Int) -> Int { part_of(id).kid_lens[index_in_part(id)] }
+
+pub fn ir_kid(id: Int, i: Int) -> Int {
+    let p = part_of(id)
+    let at = index_in_part(id)
+    let n = p.kid_lens[at]
+    if i < 0 || i >= n { return kid_out_of_bounds(id, i, n) }
+    p.kids[p.kid_starts[at] + i]
+}
+
+// The kid column holds every node's run back to back, so a read past this node's run
+// would return another node's kid and print the wrong C with no report.
+fn kid_out_of_bounds(id: Int, i: Int, n: Int) -> Int {
+    let bad: Result[Int, Str] = Err("internal compiler error: kid {i} of IR node {id} is out of bounds (it has {n})")
+    bad.unwrap()
+}
 
 // A copy, so a caller can not grow a node's kid list behind the verifier's back.
-pub fn ir_kids(id: Int) -> List[Int] { copy_ids(ir_node(id).kids) }
+pub fn ir_kids(id: Int) -> List[Int] {
+    let p = part_of(id)
+    let at = index_in_part(id)
+    let start = p.kid_starts[at]
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < p.kid_lens[at] {
+        out.push(p.kids[start + i])
+        i += 1
+    }
+    out
+}
 
 // Whether printing this value writes a statement before the expression that reads it: a
 // Box, a container or closure built from elements, or a node marked to materialise binds
@@ -238,8 +401,12 @@ fn binds_statement_within(id: Int, budget: Int) -> Bool {
     if ir_must_materialize(id) == 1 && !ir_kind_is_name(kind) { return true }
     if kind == IrKind.Box { return true }
     if (kind == IrKind.ContainerNew || kind == IrKind.ClosureNew) && ir_kid_count(id) > 0 { return true }
-    for kid in part_of(id)[index_in_part(id)].kids {
+    let n = ir_kid_count(id)
+    let mut i = 0
+    while i < n {
+        let kid = ir_kid(id, i)
         if in_arena(kid) && binds_statement_within(kid, budget - 1) { return true }
+        i += 1
     }
     false
 }
@@ -252,8 +419,7 @@ fn binds_statement_within(id: Int, budget: Int) -> Bool {
 pub fn ir_kind_is_name(kind: IrKind) -> Bool { kind == IrKind.VarRef || kind == IrKind.GlobalRef }
 
 pub fn ir_mark_materialize(id: Int) {
-    let n = ir_node(id)
-    set_node(id, IrNode { must_materialize: 1, ..n })
+    part_of(id).marks.set(index_in_part(id), 1)
 }
 
 // ── Kind tables ───────────────────────────────────────────────────────────
@@ -486,27 +652,27 @@ fn kind_max_kids(kind: IrKind) -> Int {
 // ── Constructors: values ──────────────────────────────────────────────────
 
 pub fn ir_const(tid: Int, span: Int, c_spelling: Str, literal: Str) -> Int {
-    ir_new(IrKind.Const, tid, span, c_spelling, literal, SlotForm.InlineWord, [])
+    node0(IrKind.Const, tid, span, c_spelling, literal, SlotForm.InlineWord)
 }
 
 pub fn ir_var_ref(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm) -> Int {
-    ir_new(IrKind.VarRef, tid, span, c_spelling, c_name, slot_form, [])
+    node0(IrKind.VarRef, tid, span, c_spelling, c_name, slot_form)
 }
 
 pub fn ir_global_ref(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm) -> Int {
-    ir_new(IrKind.GlobalRef, tid, span, c_spelling, c_name, slot_form, [])
+    node0(IrKind.GlobalRef, tid, span, c_spelling, c_name, slot_form)
 }
 
 pub fn ir_unary(tid: Int, span: Int, c_spelling: Str, op: Str, operand: Int) -> Int {
-    ir_new(IrKind.Unary, tid, span, c_spelling, op, SlotForm.InlineWord, [operand])
+    node1(IrKind.Unary, tid, span, c_spelling, op, SlotForm.InlineWord, operand)
 }
 
 pub fn ir_binary(tid: Int, span: Int, c_spelling: Str, op: Str, lhs: Int, rhs: Int) -> Int {
-    ir_new(IrKind.Binary, tid, span, c_spelling, op, SlotForm.InlineWord, [lhs, rhs])
+    node2(IrKind.Binary, tid, span, c_spelling, op, SlotForm.InlineWord, lhs, rhs)
 }
 
 pub fn ir_cast(tid: Int, span: Int, c_spelling: Str, expr: Int) -> Int {
-    ir_new(IrKind.Cast, tid, span, c_spelling, "", SlotForm.InlineWord, [expr])
+    node1(IrKind.Cast, tid, span, c_spelling, "", SlotForm.InlineWord, expr)
 }
 
 // One of two values, chosen by a test the values themselves cannot answer. A read that
@@ -515,11 +681,11 @@ pub fn ir_cast(tid: Int, span: Int, c_spelling: Str, expr: Int) -> Int {
 // The node names no container, so a bounds-checked read chooses through it too, with a
 // comparison as the test instead of a call.
 pub fn ir_select(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, cond: Int, when_true: Int, when_false: Int) -> Int {
-    ir_new(IrKind.Select, tid, span, c_spelling, "", slot_form, [cond, when_true, when_false])
+    node3(IrKind.Select, tid, span, c_spelling, "", slot_form, cond, when_true, when_false)
 }
 
 pub fn ir_field_get(tid: Int, span: Int, c_spelling: Str, field: Str, slot_form: SlotForm, obj: Int) -> Int {
-    ir_new(IrKind.FieldGet, tid, span, c_spelling, field, slot_form, [obj])
+    node1(IrKind.FieldGet, tid, span, c_spelling, field, slot_form, obj)
 }
 
 pub fn ir_struct_new(tid: Int, span: Int, c_spelling: Str, fields: List[Int]) -> Int {
@@ -538,16 +704,14 @@ pub fn ir_tuple_new(tid: Int, span: Int, c_spelling: Str, elems: List[Int]) -> I
 // A payload the layout boxes (a self-recursive field) arrives already boxed: the kid's shape
 // is lowering's decision, read from layout_of, and this node re-derives nothing.
 pub fn ir_enum_new(tid: Int, span: Int, c_spelling: Str, variant: Int, member: Str, tag: Int, payload: List[Int]) -> Int {
-    let mut kids = [tag]
-    for p in payload { kids.push(p) }
-    let id = ir_new(IrKind.EnumNew, tid, span, c_spelling, member, SlotForm.Inline, kids)
+    let id = node_after(IrKind.EnumNew, tid, span, c_spelling, member, SlotForm.Inline, tag, payload)
     set_decl(id, variant)
     stamp_tagged_members(id)
 }
 
 fn set_decl(id: Int, decl: Int) {
-    let n = ir_node(id)
-    set_node(id, IrNode { decl: decl, ..n })
+    let s = slots_of(id)
+    set_slots(id, IrSlots { decl: decl, ..s })
 }
 
 // Stamped wherever a node is built, from the one producer of each name, so that no build
@@ -561,8 +725,8 @@ fn stamp_tagged_members(id: Int) -> Int {
         IrKind.CarrierTag => ""
         _ => return id
     }
-    let n = ir_node(id)
-    set_node(id, IrNode { tag_member: c_enum_tag_member(), payload_member: payload, ..n })
+    let s = slots_of(id)
+    set_slots(id, IrSlots { tag_member: c_enum_tag_member(), payload_member: payload, ..s })
     id
 }
 
@@ -577,8 +741,8 @@ pub fn ir_container_new(tid: Int, span: Int, c_spelling: Str, ctor_symbol: Str, 
 // together, so a node is stamped with all three at once.
 fn set_named_slots(id: Int, kops: Str, capture_descs: Str, promoter: Str) -> Int {
     if kops == "" && capture_descs == "" && promoter == "" { return id }
-    let n = ir_node(id)
-    set_node(id, IrNode { kops_table: kops, capture_descs: capture_descs, promoter: promoter, ..n })
+    let s = slots_of(id)
+    set_slots(id, IrSlots { kops_table: kops, capture_descs: capture_descs, promoter: promoter, ..s })
     id
 }
 
@@ -587,20 +751,20 @@ fn set_named_slots(id: Int, kops: Str, capture_descs: Str, promoter: Str) -> Int
 // container the printer is building and no node has to name it. c_name is the runtime
 // copy symbol (blink_list_extend); the one kid is the source container.
 pub fn ir_container_spread(tid: Int, span: Int, c_spelling: Str, extend_symbol: Str, source: Int) -> Int {
-    ir_new(IrKind.ContainerSpread, tid, span, c_spelling, extend_symbol, SlotForm.InlineWord, [source])
+    node1(IrKind.ContainerSpread, tid, span, c_spelling, extend_symbol, SlotForm.InlineWord, source)
 }
 
 // c_spelling is the box's own pointer type like every other value node. The pointee type
 // goes in c_name: it is the token the printer writes inside sizeof for the heap copy.
 pub fn ir_box(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value: Int) -> Int {
-    set_gc_layout(ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value]),
+    set_gc_layout(node1(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, value),
         box_gc_layout_of(tid, pointee_spelling))
 }
 
 fn set_gc_layout(id: Int, gc_layout: Str) -> Int {
     if gc_layout == "" { return id }
-    let n = ir_node(id)
-    set_node(id, IrNode { gc_layout: gc_layout, ..n })
+    let s = slots_of(id)
+    set_slots(id, IrSlots { gc_layout: gc_layout, ..s })
     id
 }
 
@@ -608,11 +772,11 @@ fn set_gc_layout(id: Int, gc_layout: Str) -> Int {
 // instead of the current arena: a promotion walker's copies must not land in the arena that
 // is dying.
 pub fn ir_box_into(tid: Int, span: Int, c_spelling: Str, pointee_spelling: Str, value: Int, ctx: Int) -> Int {
-    ir_new(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, [value, ctx])
+    node2(IrKind.Box, tid, span, c_spelling, pointee_spelling, SlotForm.PointerBoxed, value, ctx)
 }
 
 pub fn ir_unbox(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, ptr: Int) -> Int {
-    ir_new(IrKind.Unbox, tid, span, c_spelling, "", slot_form, [ptr])
+    node1(IrKind.Unbox, tid, span, c_spelling, "", slot_form, ptr)
 }
 
 // Room for `count` cells of one named type, taken from the scope the first kid names and
@@ -622,28 +786,32 @@ pub fn ir_unbox(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, ptr: 
 // at, as on every value node; elem_spelling is the token the printer writes inside sizeof.
 // A single cell and an array differ only in the count, so one shape serves both spellings.
 pub fn ir_sized_alloc(tid: Int, span: Int, c_spelling: Str, elem_spelling: Str, scope: Int, count: Int) -> Int {
-    ir_new(IrKind.SizedAlloc, tid, span, c_spelling, elem_spelling, SlotForm.PointerBoxed, [scope, count])
+    node2(IrKind.SizedAlloc, tid, span, c_spelling, elem_spelling, SlotForm.PointerBoxed, scope, count)
 }
 
 // One zeroed cell of a named type on the collected heap: no scope owns it, so it has no
 // kids. It is not a Box either, since a Box copies a value in and this copies nothing.
 pub fn ir_heap_alloc(tid: Int, span: Int, c_spelling: Str, elem_spelling: Str) -> Int {
-    ir_new(IrKind.HeapAlloc, tid, span, c_spelling, elem_spelling, SlotForm.PointerBoxed, [])
+    node0(IrKind.HeapAlloc, tid, span, c_spelling, elem_spelling, SlotForm.PointerBoxed)
 }
 
 // member is the carrier field the payload lands in ("value", "ok", "err"); "" for None.
 // The tag kid is a Const so the printer writes both designators without knowing the carrier.
 pub fn ir_carrier_wrap(tid: Int, span: Int, c_spelling: Str, member: Str, tag: Int, payload: Int) -> Int {
-    let kids = if payload < 0 { [tag] } else { [tag, payload] }
-    stamp_tagged_members(ir_new(IrKind.CarrierWrap, tid, span, c_spelling, member, SlotForm.Inline, kids))
+    let id = if payload < 0 {
+        node1(IrKind.CarrierWrap, tid, span, c_spelling, member, SlotForm.Inline, tag)
+    } else {
+        node2(IrKind.CarrierWrap, tid, span, c_spelling, member, SlotForm.Inline, tag, payload)
+    }
+    stamp_tagged_members(id)
 }
 
 pub fn ir_carrier_unwrap(tid: Int, span: Int, c_spelling: Str, member: Str, slot_form: SlotForm, carrier: Int) -> Int {
-    ir_new(IrKind.CarrierUnwrap, tid, span, c_spelling, member, slot_form, [carrier])
+    node1(IrKind.CarrierUnwrap, tid, span, c_spelling, member, slot_form, carrier)
 }
 
 pub fn ir_carrier_tag(tid: Int, span: Int, c_spelling: Str, carrier: Int) -> Int {
-    stamp_tagged_members(ir_new(IrKind.CarrierTag, tid, span, c_spelling, "", SlotForm.InlineWord, [carrier]))
+    stamp_tagged_members(node1(IrKind.CarrierTag, tid, span, c_spelling, "", SlotForm.InlineWord, carrier))
 }
 
 pub fn ir_call_direct(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_form: SlotForm, args: List[Int]) -> Int {
@@ -651,16 +819,16 @@ pub fn ir_call_direct(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_fo
 }
 
 pub fn ir_call_indirect(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, callee: Int, args: List[Int]) -> Int {
-    ir_new(IrKind.CallIndirect, tid, span, c_spelling, "", slot_form, prepend(callee, args))
+    node_after(IrKind.CallIndirect, tid, span, c_spelling, "", slot_form, callee, args)
 }
 
 // fn_type is the C function-pointer type the closure's fn_ptr is cast to before the call.
 pub fn ir_call_closure(tid: Int, span: Int, c_spelling: Str, fn_type: Str, slot_form: SlotForm, closure: Int, args: List[Int]) -> Int {
-    ir_new(IrKind.CallClosure, tid, span, c_spelling, fn_type, slot_form, prepend(closure, args))
+    node_after(IrKind.CallClosure, tid, span, c_spelling, fn_type, slot_form, closure, args)
 }
 
 pub fn ir_call_virtual(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, receiver: Int, args: List[Int]) -> Int {
-    ir_new(IrKind.CallVirtual, tid, span, c_spelling, slot, slot_form, prepend(receiver, args))
+    node_after(IrKind.CallVirtual, tid, span, c_spelling, slot, slot_form, receiver, args)
 }
 
 pub fn ir_call_runtime(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_form: SlotForm, args: List[Int]) -> Int {
@@ -679,7 +847,7 @@ pub fn ir_closure_new(tid: Int, span: Int, c_spelling: Str, fn_symbol: Str, capt
 // scope binds to the arena that was current when the scope was entered. It has no Blink
 // type, so like the evidence vector its tid is -1. NULL at run time means the GC heap.
 pub fn ir_arena_target(span: Int, c_name: Str) -> Int {
-    ir_new(IrKind.ArenaTarget, -1, span, "blink_arena_t*", c_name, SlotForm.InlineWord, [])
+    node0(IrKind.ArenaTarget, -1, span, "blink_arena_t*", c_name, SlotForm.InlineWord)
 }
 
 // One promotion: where its copies go, which arenas are closing, and the records it has
@@ -687,18 +855,18 @@ pub fn ir_arena_target(span: Int, c_name: Str) -> Int {
 // one from the ArenaTarget it copies into; a walker reads the one it was handed, its
 // parameter c_name. Like the ArenaTarget it has no Blink type.
 pub fn ir_promote_ctx(span: Int, target: Int) -> Int {
-    ir_new(IrKind.PromoteCtx, -1, span, "blink_promote_ctx*", "", SlotForm.InlineWord, [target])
+    node1(IrKind.PromoteCtx, -1, span, "blink_promote_ctx*", "", SlotForm.InlineWord, target)
 }
 
 pub fn ir_promote_ctx_param(span: Int, c_name: Str) -> Int {
-    ir_new(IrKind.PromoteCtx, -1, span, "blink_promote_ctx*", c_name, SlotForm.InlineWord, [])
+    node0(IrKind.PromoteCtx, -1, span, "blink_promote_ctx*", c_name, SlotForm.InlineWord)
 }
 
 // The evidence vector in scope: the `blink_ev*` parameter of an effectful function
 // (PointerBoxed) or the program's global vector (Inline). It has no Blink type, so it is
 // the one value node whose tid is -1; c_name comes from cname's two vector producers.
 pub fn ir_evidence_vector(span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm) -> Int {
-    ir_new(IrKind.EvidenceVector, -1, span, c_spelling, c_name, slot_form, [])
+    node0(IrKind.EvidenceVector, -1, span, c_spelling, c_name, slot_form)
 }
 
 // The address of the vector: what a call to an effectful function passes when the caller
@@ -707,41 +875,39 @@ pub fn ir_evidence_vector(span: Int, c_spelling: Str, c_name: Str, slot_form: Sl
 // and every other value node carries a tid. The spelling is the pointer form of the
 // operand's, so the vector stays the one producer of both the type name and the C name.
 pub fn ir_evidence_address(span: Int, vector: Int) -> Int {
-    ir_new(IrKind.EvidenceAddress, -1, span, pointer_spelling(ir_c_spelling(vector)), "",
-        SlotForm.InlineWord, [vector])
+    node1(IrKind.EvidenceAddress, -1, span, pointer_spelling(ir_c_spelling(vector)), "",
+        SlotForm.InlineWord, vector)
 }
 
 // A perform is a virtual call through the vector: `slot_read` is a FieldGet that reads the
 // effect's slot off an EvidenceVector, and `slot` is the vtable member the runtime or the
 // user effect declares. Printing it as `(handler)->slot(args)` is the printer's rule.
 pub fn ir_effect_perform(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, slot_read: Int, args: List[Int]) -> Int {
-    ir_new(IrKind.EffectPerform, tid, span, c_spelling, slot, slot_form, prepend(slot_read, args))
+    node_after(IrKind.EffectPerform, tid, span, c_spelling, slot, slot_form, slot_read, args)
 }
-
-fn prepend(head: Int, rest: List[Int]) -> List[Int] { [head].append(rest) }
 
 // ── Constructors: statements ──────────────────────────────────────────────
 
 pub fn ir_field_set(span: Int, field: Str, obj: Int, value: Int) -> Int {
-    ir_new(IrKind.FieldSet, -1, span, "", field, SlotForm.Inline, [obj, value])
+    node2(IrKind.FieldSet, -1, span, "", field, SlotForm.Inline, obj, value)
 }
 
 pub fn ir_handler_install(span: Int, ev_field: Str, handler_value: Int, body: Int) -> Int {
-    ir_new(IrKind.HandlerInstall, -1, span, "", ev_field, SlotForm.Inline, [handler_value, body])
+    node2(IrKind.HandlerInstall, -1, span, "", ev_field, SlotForm.Inline, handler_value, body)
 }
 
 // init < 0 declares without initialising; lowering uses that to materialise an if or match value.
 pub fn ir_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, init: Int) -> Int {
-    let kids: List[Int] = if init < 0 { [] } else { [init] }
-    ir_new(IrKind.Let, tid, span, c_spelling, c_name, slot_form, kids)
+    if init < 0 { return node0(IrKind.Let, tid, span, c_spelling, c_name, slot_form) }
+    node1(IrKind.Let, tid, span, c_spelling, c_name, slot_form, init)
 }
 
 // A binding declared outside a PanicCatch and assigned inside its body. The catch comes back
 // through longjmp, which leaves a changed local that is not volatile indeterminate (C11
 // 7.13.2.1p3), so the printer qualifies the declared object itself.
 pub fn ir_volatile_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, init: Int) -> Int {
-    let kids: List[Int] = if init < 0 { [] } else { [init] }
-    ir_new(IrKind.VolatileLet, tid, span, c_spelling, c_name, slot_form, kids)
+    if init < 0 { return node0(IrKind.VolatileLet, tid, span, c_spelling, c_name, slot_form) }
+    node1(IrKind.VolatileLet, tid, span, c_spelling, c_name, slot_form, init)
 }
 
 // A binding whose storage is a heap cell: the declaration allocates the cell and writes
@@ -749,41 +915,41 @@ pub fn ir_volatile_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_f
 // read it. The node carries the pointer's spelling and the cell's name, which is all the
 // printer needs -- the size comes off the pointer itself.
 pub fn ir_cell_let(tid: Int, span: Int, value_spelling: Str, name: Str, slot_form: SlotForm, init: Int) -> Int {
-    let kids: List[Int] = if init < 0 { [] } else { [init] }
-    ir_new(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(name), slot_form, kids)
+    if init < 0 { return node0(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(name), slot_form) }
+    node1(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(name), slot_form, init)
 }
 
 // The value inside a cell. It is a place, so one node serves a read and the target of an
 // assignment, which is what keeps the two from spelling the same binding differently.
 pub fn ir_cell_ref(tid: Int, span: Int, value_spelling: Str, name: Str, slot_form: SlotForm) -> Int {
-    ir_new(IrKind.CellRef, tid, span, value_spelling, c_cell_name(name), slot_form, [])
+    node0(IrKind.CellRef, tid, span, value_spelling, c_cell_name(name), slot_form)
 }
 
 pub fn ir_assign(span: Int, target: Int, value: Int) -> Int {
-    ir_new(IrKind.Assign, -1, span, "", "", SlotForm.Inline, [target, value])
+    node2(IrKind.Assign, -1, span, "", "", SlotForm.Inline, target, value)
 }
 
 pub fn ir_expr_stmt(span: Int, expr: Int) -> Int {
-    ir_new(IrKind.ExprStmt, -1, span, "", "", SlotForm.Inline, [expr])
+    node1(IrKind.ExprStmt, -1, span, "", "", SlotForm.Inline, expr)
 }
 
 pub fn ir_return(span: Int, value: Int) -> Int {
-    let kids: List[Int] = if value < 0 { [] } else { [value] }
-    ir_new(IrKind.Return, -1, span, "", "", SlotForm.Inline, kids)
+    if value < 0 { return node0(IrKind.Return, -1, span, "", "", SlotForm.Inline) }
+    node1(IrKind.Return, -1, span, "", "", SlotForm.Inline, value)
 }
 
 pub fn ir_if(span: Int, cond: Int, then_block: Int, else_block: Int) -> Int {
-    let kids: List[Int] = if else_block < 0 { [cond, then_block] } else { [cond, then_block, else_block] }
-    ir_new(IrKind.If, -1, span, "", "", SlotForm.Inline, kids)
+    if else_block < 0 { return node2(IrKind.If, -1, span, "", "", SlotForm.Inline, cond, then_block) }
+    node3(IrKind.If, -1, span, "", "", SlotForm.Inline, cond, then_block, else_block)
 }
 
 pub fn ir_loop(span: Int, body: Int) -> Int {
-    ir_new(IrKind.Loop, -1, span, "", "", SlotForm.Inline, [body])
+    node1(IrKind.Loop, -1, span, "", "", SlotForm.Inline, body)
 }
 
-pub fn ir_break(span: Int) -> Int { ir_new(IrKind.Break, -1, span, "", "", SlotForm.Inline, []) }
+pub fn ir_break(span: Int) -> Int { node0(IrKind.Break, -1, span, "", "", SlotForm.Inline) }
 
-pub fn ir_continue(span: Int) -> Int { ir_new(IrKind.Continue, -1, span, "", "", SlotForm.Inline, []) }
+pub fn ir_continue(span: Int) -> Int { node0(IrKind.Continue, -1, span, "", "", SlotForm.Inline) }
 
 pub fn ir_block(span: Int, stmts: List[Int]) -> Int {
     ir_new(IrKind.Block, -1, span, "", "", SlotForm.Inline, stmts)
@@ -791,42 +957,48 @@ pub fn ir_block(span: Int, stmts: List[Int]) -> Int {
 
 // cases alternates (Const label, Block body). default_block < 0 means no default arm.
 pub fn ir_switch(span: Int, scrutinee: Int, cases: List[Int], default_block: Int) -> Int {
-    let mut kids: List[Int] = [scrutinee]
-    for k in cases { kids.push(k) }
-    if default_block >= 0 { kids.push(default_block) }
-    ir_new(IrKind.Switch, -1, span, "", "", SlotForm.Inline, kids)
+    let start = kid_mark()
+    push_kid(scrutinee)
+    for k in cases { push_kid(k) }
+    if default_block >= 0 { push_kid(default_block) }
+    record(IrKind.Switch, -1, span, "", "", SlotForm.Inline, start)
 }
 
 // resource < 0 is a scope with no resource value (an arena block).
 pub fn ir_with_scope(span: Int, cleanup_symbol: Str, resource: Int, body: Int) -> Int {
-    let kids: List[Int] = if resource < 0 { [body] } else { [resource, body] }
-    ir_new(IrKind.WithScope, -1, span, "", cleanup_symbol, SlotForm.Inline, kids)
+    if resource < 0 { return node1(IrKind.WithScope, -1, span, "", cleanup_symbol, SlotForm.Inline, body) }
+    node2(IrKind.WithScope, -1, span, "", cleanup_symbol, SlotForm.Inline, resource, body)
 }
 
 // An arena block. target_name is the local the scope binds to the arena it was entered
 // from, for an ArenaTarget in the body to read; "" when nothing in the body promotes.
 pub fn ir_arena_scope(span: Int, target_name: Str, body: Int) -> Int {
-    ir_new(IrKind.WithScope, -1, span, "", target_name, SlotForm.Inline, [body])
+    node1(IrKind.WithScope, -1, span, "", target_name, SlotForm.Inline, body)
 }
 
 pub fn ir_panic(span: Int, message: Int) -> Int {
-    ir_new(IrKind.Panic, -1, span, "", "", SlotForm.Inline, [message])
+    node1(IrKind.Panic, -1, span, "", "", SlotForm.Inline, message)
 }
 
-pub fn ir_unreachable(span: Int) -> Int { ir_new(IrKind.Unreachable, -1, span, "", "", SlotForm.Inline, []) }
+pub fn ir_unreachable(span: Int) -> Int { node0(IrKind.Unreachable, -1, span, "", "", SlotForm.Inline) }
 
 // An assert_panics frame. `frame` is the C name of the frame record, and the file, line and
 // column are the Consts its two failures report. matcher < 0 is a frame that accepts any
 // message. The body is the last kid, so the matcher is evaluated before the frame arms.
 pub fn ir_panic_catch(span: Int, frame: Str, file: Int, line: Int, col: Int, matcher: Int, body: Int) -> Int {
-    let kids: List[Int] = if matcher < 0 { [file, line, col, body] } else { [file, line, col, matcher, body] }
-    ir_new(IrKind.PanicCatch, -1, span, "", frame, SlotForm.Inline, kids)
+    let start = kid_mark()
+    push_kid(file)
+    push_kid(line)
+    push_kid(col)
+    if matcher >= 0 { push_kid(matcher) }
+    push_kid(body)
+    record(IrKind.PanicCatch, -1, span, "", frame, SlotForm.Inline, start)
 }
 
 // Leaves the named frame's body without a panic, which is the failure that the body
 // returned. It names its frame so the verifier can hold it to one that encloses it.
 pub fn ir_panic_catch_exit(span: Int, frame: Str) -> Int {
-    ir_new(IrKind.PanicCatchExit, -1, span, "", frame, SlotForm.Inline, [])
+    node0(IrKind.PanicCatchExit, -1, span, "", frame, SlotForm.Inline)
 }
 
 // ── Verifier ──────────────────────────────────────────────────────────────
@@ -1329,8 +1501,12 @@ fn count_refs(id: Int, refs: List[Int]) {
     let seen = refs.get(arena_index(id)).unwrap()
     refs.set(arena_index(id), seen + 1)
     if seen > 0 { return }
-    for kid in ir_node(id).kids {
+    let n = ir_kid_count(id)
+    let mut i = 0
+    while i < n {
+        let kid = ir_kid(id, i)
         if in_arena(kid) { count_refs(kid, refs) }
+        i += 1
     }
 }
 
