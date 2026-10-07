@@ -23,19 +23,28 @@ effect Parse {
 
 // ── Node pool ──────────────────────────────────────────────────────
 // Each node is an index into the pool. -1 means "no node".
-// The pool holds one column per AstNode field, so a read of one field loads that field and
-// its neighbours' rather than the whole wide node, and a push allocates no per-node box.
-// A column is a list of chunks of 4096 slots: node id's slot is chunk id >> 12, index
-// id & 4095. One growing list per column would leave up to half of every column unused
-// after a doubling, and copy every column at each one; a chunk wastes at most its own tail
-// and never moves. 4096 slots of 8 bytes is 32 KiB per chunk, so the unused tail is under
-// 2 MiB over all columns, and a column's chunk list stays small enough to sit in cache.
-// `kind` is one flat list instead: almost every walk of the tree reads it, and a read through
-// a chunk must load the chunk's own header before the slot, which costs about as much as the
-// slot. One list of 8 bytes per node leaves at most a few MiB unused.
+// A node stores only the fields it holds: a field that still holds its AstNode default
+// takes no space. Which fields a node holds is its shape, interned in a table, so the
+// pool keeps one `head` word per node: (int_base << 16) | shape. The node's Int fields sit
+// in `ints` from int_base on, and its Str fields in `strs`, in field order. A node of most
+// kinds holds three or four fields of the 57, and one kind has many sets of fields (a fn
+// with or without a return type, pub or not), so a shape per node, not one per kind.
+// `at_<field>[shape]` is the field's offset in the node's payload, or -1 when the shape
+// does not hold it and a read answers `node_blank`'s value. A shape with a Str field puts
+// the start of its Str payload in Int word 0, so its Int fields start at 1.
+// Int and Str data stay in separate arenas because a List[Int] buffer is allocated
+// pointer-free, so the collector never scans the Int arena. Each arena is a list of chunks
+// of 65536 slots, addressed as chunk << 16 | index; a chunk is made at full size and never
+// moves, and a payload never straddles two chunks (it starts a new chunk and leaves the old
+// tail unused), so a payload is one run in one chunk.
+// A write that gives a node a field its shape does not hold moves the node's whole payload
+// to the arena end under a wider shape; the old payload stays unread. Shapes only widen, so
+// a held field written back to its default keeps its slot.
+// `head`, `kind` and `child_at` are per node: `head` and `child_at` in chunks of 4096 as
+// above, `kind` in one flat list since almost every walk of the tree reads it and a read
+// through a chunk must load the chunk's own header first.
 // Only node_push, node_pop, node_replace, node_write_plain_int, node_write_plain_str,
-// parser_reset and the chunk and child-slot helpers they call write the columns. All but
-// the two plain writers write every column, so all columns hold the same nodes.
+// parser_reset and the helpers they call write the pool.
 // `child_slots`: each node's children as ChildWalk.Slots writes them, one run per node. A
 // sublist stays one slot and is expanded when read, so a member appended to a sublist after
 // its owner exists is still seen.
@@ -44,69 +53,86 @@ effect Parse {
 // the old one unread.
 type NodeColumns {
     count: Int
-    str_val: List[List[Str]]
-    name: List[List[Str]]
-    op: List[List[Str]]
-    var_name: List[List[Str]]
-    module: List[List[Str]]
-    method: List[List[Str]]
-    return_type: List[List[Str]]
-    type_name: List[List[Str]]
-    trait_name: List[List[Str]]
-    leading_comments: List[List[Str]]
-    trailing_comments: List[List[Str]]
-    doc_comment: List[List[Str]]
-    xfail_reason: List[List[Str]]
     kind: List[Int]
-    int_val: List[List[Int]]
-    left: List[List[Int]]
-    right: List[List[Int]]
-    body: List[List[Int]]
-    condition: List[List[Int]]
-    then_body: List[List[Int]]
-    else_body: List[List[Int]]
-    scrutinee: List[List[Int]]
-    pattern: List[List[Int]]
-    guard: List[List[Int]]
-    value: List[List[Int]]
-    target: List[List[Int]]
-    iterable: List[List[Int]]
-    is_mut: List[List[Int]]
-    is_pub: List[List[Int]]
-    is_const: List[List[Int]]
-    inclusive: List[List[Int]]
-    start: List[List[Int]]
-    end: List[List[Int]]
-    obj: List[List[Int]]
-    index: List[List[Int]]
-    params: List[List[Int]]
-    args: List[List[Int]]
-    stmts: List[List[Int]]
-    arms: List[List[Int]]
-    fields: List[List[Int]]
-    elements: List[List[Int]]
-    methods: List[List[Int]]
-    type_params: List[List[Int]]
-    effects: List[List[Int]]
-    captures: List[List[Int]]
-    type_ann: List[List[Int]]
-    handlers: List[List[Int]]
-    line: List[List[Int]]
-    col: List[List[Int]]
-    end_line: List[List[Int]]
-    end_col: List[List[Int]]
-    assoc_types: List[List[Int]]
-    impl_binders: List[List[Int]]
-    recv_type_args: List[List[Int]]
-    impl_where_bounds: List[List[Int]]
-    for_binder: List[List[Int]]
-    supertraits: List[List[Int]]
+    head: List[List[Int]]
+    ints: List[List[Int]]
+    strs: List[List[Str]]
+    shape_mask: List[Int]
+    shape_ints: List[Int]
+    shape_strs: List[Int]
+    // Offset of field f in shape s's payload at s * 56 + f, f in mask-bit order.
+    shape_slot: List[Int]
+    shape_of_mask: Map[Int, Int]
+    // (mask, shape) of the last shape made for a kind, at (kind & 255) * 2: nodes of a kind
+    // mostly repeat one shape, and the memo saves the map lookup for them.
+    shape_memo: List[Int]
+    at_str_val: List[Int]
+    at_name: List[Int]
+    at_op: List[Int]
+    at_var_name: List[Int]
+    at_module: List[Int]
+    at_method: List[Int]
+    at_return_type: List[Int]
+    at_type_name: List[Int]
+    at_trait_name: List[Int]
+    at_leading_comments: List[Int]
+    at_trailing_comments: List[Int]
+    at_doc_comment: List[Int]
+    at_xfail_reason: List[Int]
+    at_int_val: List[Int]
+    at_left: List[Int]
+    at_right: List[Int]
+    at_body: List[Int]
+    at_condition: List[Int]
+    at_then_body: List[Int]
+    at_else_body: List[Int]
+    at_scrutinee: List[Int]
+    at_pattern: List[Int]
+    at_guard: List[Int]
+    at_value: List[Int]
+    at_target: List[Int]
+    at_iterable: List[Int]
+    at_is_mut: List[Int]
+    at_is_pub: List[Int]
+    at_is_const: List[Int]
+    at_inclusive: List[Int]
+    at_start: List[Int]
+    at_end: List[Int]
+    at_obj: List[Int]
+    at_index: List[Int]
+    at_params: List[Int]
+    at_args: List[Int]
+    at_stmts: List[Int]
+    at_arms: List[Int]
+    at_fields: List[Int]
+    at_elements: List[Int]
+    at_methods: List[Int]
+    at_type_params: List[Int]
+    at_effects: List[Int]
+    at_captures: List[Int]
+    at_type_ann: List[Int]
+    at_handlers: List[Int]
+    at_line: List[Int]
+    at_col: List[Int]
+    at_end_line: List[Int]
+    at_end_col: List[Int]
+    at_assoc_types: List[Int]
+    at_impl_binders: List[Int]
+    at_recv_type_args: List[Int]
+    at_impl_where_bounds: List[Int]
+    at_for_binder: List[Int]
+    at_supertraits: List[Int]
     child_at: List[List[Int]]
     child_slots: List[Int]
 }
 
+// The value of every field a node does not hold.
+let node_blank: AstNode = AstNode {}
+
 fn node_columns_empty() -> NodeColumns {
-    NodeColumns { count: 0, str_val: [], name: [], op: [], var_name: [], module: [], method: [], return_type: [], type_name: [], trait_name: [], leading_comments: [], trailing_comments: [], doc_comment: [], xfail_reason: [], kind: [], int_val: [], left: [], right: [], body: [], condition: [], then_body: [], else_body: [], scrutinee: [], pattern: [], guard: [], value: [], target: [], iterable: [], is_mut: [], is_pub: [], is_const: [], inclusive: [], start: [], end: [], obj: [], index: [], params: [], args: [], stmts: [], arms: [], fields: [], elements: [], methods: [], type_params: [], effects: [], captures: [], type_ann: [], handlers: [], line: [], col: [], end_line: [], end_col: [], assoc_types: [], impl_binders: [], recv_type_args: [], impl_where_bounds: [], for_binder: [], supertraits: [], child_at: [], child_slots: [] }
+    let mut memo: List[Int] = List.with_capacity(512)
+    while memo.len() < 512 { memo.push(-1) }
+    NodeColumns { count: 0, kind: [], head: [], ints: [], strs: [], shape_mask: [], shape_ints: [], shape_strs: [], shape_slot: [], shape_of_mask: Map(), shape_memo: memo, at_str_val: [], at_name: [], at_op: [], at_var_name: [], at_module: [], at_method: [], at_return_type: [], at_type_name: [], at_trait_name: [], at_leading_comments: [], at_trailing_comments: [], at_doc_comment: [], at_xfail_reason: [], at_int_val: [], at_left: [], at_right: [], at_body: [], at_condition: [], at_then_body: [], at_else_body: [], at_scrutinee: [], at_pattern: [], at_guard: [], at_value: [], at_target: [], at_iterable: [], at_is_mut: [], at_is_pub: [], at_is_const: [], at_inclusive: [], at_start: [], at_end: [], at_obj: [], at_index: [], at_params: [], at_args: [], at_stmts: [], at_arms: [], at_fields: [], at_elements: [], at_methods: [], at_type_params: [], at_effects: [], at_captures: [], at_type_ann: [], at_handlers: [], at_line: [], at_col: [], at_end_line: [], at_end_col: [], at_assoc_types: [], at_impl_binders: [], at_recv_type_args: [], at_impl_where_bounds: [], at_for_binder: [], at_supertraits: [], child_at: [], child_slots: [] }
 }
 
 let mut columns: NodeColumns = node_columns_empty()
@@ -163,8 +189,7 @@ pub fn node_source_module(id: Int) -> Str {
     match source_module_for_node.get(id) {
         Some(key) => key
         None => {
-            let i = checked_node_id(id, "node_source_module")
-            columns.module[i >> 12][i & 4095]
+            node_get_str(checked_node_id(id, "node_source_module"), columns.at_module, node_blank.module)
         }
     }
 }
@@ -173,191 +198,541 @@ pub fn new_node(kind: NodeKind) -> Int ! Parse.Build {
     node_push(AstNode { kind: kind, line: peek_line(), col: peek_col() })
 }
 
-// Adds an empty chunk to the end of every chunked column, for the node that starts it.
-// Each chunk is made at its full size, so filling it never regrows and copies it.
-fn node_columns_open_chunk() {
-    columns.str_val.push(List.with_capacity(4096))
-    columns.name.push(List.with_capacity(4096))
-    columns.op.push(List.with_capacity(4096))
-    columns.var_name.push(List.with_capacity(4096))
-    columns.module.push(List.with_capacity(4096))
-    columns.method.push(List.with_capacity(4096))
-    columns.return_type.push(List.with_capacity(4096))
-    columns.type_name.push(List.with_capacity(4096))
-    columns.trait_name.push(List.with_capacity(4096))
-    columns.leading_comments.push(List.with_capacity(4096))
-    columns.trailing_comments.push(List.with_capacity(4096))
-    columns.doc_comment.push(List.with_capacity(4096))
-    columns.xfail_reason.push(List.with_capacity(4096))
-    columns.int_val.push(List.with_capacity(4096))
-    columns.left.push(List.with_capacity(4096))
-    columns.right.push(List.with_capacity(4096))
-    columns.body.push(List.with_capacity(4096))
-    columns.condition.push(List.with_capacity(4096))
-    columns.then_body.push(List.with_capacity(4096))
-    columns.else_body.push(List.with_capacity(4096))
-    columns.scrutinee.push(List.with_capacity(4096))
-    columns.pattern.push(List.with_capacity(4096))
-    columns.guard.push(List.with_capacity(4096))
-    columns.value.push(List.with_capacity(4096))
-    columns.target.push(List.with_capacity(4096))
-    columns.iterable.push(List.with_capacity(4096))
-    columns.is_mut.push(List.with_capacity(4096))
-    columns.is_pub.push(List.with_capacity(4096))
-    columns.is_const.push(List.with_capacity(4096))
-    columns.inclusive.push(List.with_capacity(4096))
-    columns.start.push(List.with_capacity(4096))
-    columns.end.push(List.with_capacity(4096))
-    columns.obj.push(List.with_capacity(4096))
-    columns.index.push(List.with_capacity(4096))
-    columns.params.push(List.with_capacity(4096))
-    columns.args.push(List.with_capacity(4096))
-    columns.stmts.push(List.with_capacity(4096))
-    columns.arms.push(List.with_capacity(4096))
-    columns.fields.push(List.with_capacity(4096))
-    columns.elements.push(List.with_capacity(4096))
-    columns.methods.push(List.with_capacity(4096))
-    columns.type_params.push(List.with_capacity(4096))
-    columns.effects.push(List.with_capacity(4096))
-    columns.captures.push(List.with_capacity(4096))
-    columns.type_ann.push(List.with_capacity(4096))
-    columns.handlers.push(List.with_capacity(4096))
-    columns.line.push(List.with_capacity(4096))
-    columns.col.push(List.with_capacity(4096))
-    columns.end_line.push(List.with_capacity(4096))
-    columns.end_col.push(List.with_capacity(4096))
-    columns.assoc_types.push(List.with_capacity(4096))
-    columns.impl_binders.push(List.with_capacity(4096))
-    columns.recv_type_args.push(List.with_capacity(4096))
-    columns.impl_where_bounds.push(List.with_capacity(4096))
-    columns.for_binder.push(List.with_capacity(4096))
-    columns.supertraits.push(List.with_capacity(4096))
-    columns.child_at.push(List.with_capacity(4096))
+// The fields of `n` that differ from their default, one bit per field: Int fields from bit
+// 0 in AstNode order, then Str fields from bit 43.
+fn node_mask(n: AstNode) -> Int {
+    let mut m = 0
+    if n.int_val != node_blank.int_val { m = m | 1 }
+    if n.left != node_blank.left { m = m | 2 }
+    if n.right != node_blank.right { m = m | 4 }
+    if n.body != node_blank.body { m = m | 8 }
+    if n.condition != node_blank.condition { m = m | 16 }
+    if n.then_body != node_blank.then_body { m = m | 32 }
+    if n.else_body != node_blank.else_body { m = m | 64 }
+    if n.scrutinee != node_blank.scrutinee { m = m | 128 }
+    if n.pattern != node_blank.pattern { m = m | 256 }
+    if n.guard != node_blank.guard { m = m | 512 }
+    if n.value != node_blank.value { m = m | 1024 }
+    if n.target != node_blank.target { m = m | 2048 }
+    if n.iterable != node_blank.iterable { m = m | 4096 }
+    if n.is_mut != node_blank.is_mut { m = m | 8192 }
+    if n.is_pub != node_blank.is_pub { m = m | 16384 }
+    if n.is_const != node_blank.is_const { m = m | 32768 }
+    if n.inclusive != node_blank.inclusive { m = m | 65536 }
+    if n.start != node_blank.start { m = m | 131072 }
+    if n.end != node_blank.end { m = m | 262144 }
+    if n.obj != node_blank.obj { m = m | 524288 }
+    if n.index != node_blank.index { m = m | 1048576 }
+    if n.params != node_blank.params { m = m | 2097152 }
+    if n.args != node_blank.args { m = m | 4194304 }
+    if n.stmts != node_blank.stmts { m = m | 8388608 }
+    if n.arms != node_blank.arms { m = m | 16777216 }
+    if n.fields != node_blank.fields { m = m | 33554432 }
+    if n.elements != node_blank.elements { m = m | 67108864 }
+    if n.methods != node_blank.methods { m = m | 134217728 }
+    if n.type_params != node_blank.type_params { m = m | 268435456 }
+    if n.effects != node_blank.effects { m = m | 536870912 }
+    if n.captures != node_blank.captures { m = m | 1073741824 }
+    if n.type_ann != node_blank.type_ann { m = m | 2147483648 }
+    if n.handlers != node_blank.handlers { m = m | 4294967296 }
+    if n.line != node_blank.line { m = m | 8589934592 }
+    if n.col != node_blank.col { m = m | 17179869184 }
+    if n.end_line != node_blank.end_line { m = m | 34359738368 }
+    if n.end_col != node_blank.end_col { m = m | 68719476736 }
+    if n.assoc_types != node_blank.assoc_types { m = m | 137438953472 }
+    if n.impl_binders != node_blank.impl_binders { m = m | 274877906944 }
+    if n.recv_type_args != node_blank.recv_type_args { m = m | 549755813888 }
+    if n.impl_where_bounds != node_blank.impl_where_bounds { m = m | 1099511627776 }
+    if n.for_binder != node_blank.for_binder { m = m | 2199023255552 }
+    if n.supertraits != node_blank.supertraits { m = m | 4398046511104 }
+    if n.str_val != node_blank.str_val { m = m | 8796093022208 }
+    if n.name != node_blank.name { m = m | 17592186044416 }
+    if n.op != node_blank.op { m = m | 35184372088832 }
+    if n.var_name != node_blank.var_name { m = m | 70368744177664 }
+    if n.module != node_blank.module { m = m | 140737488355328 }
+    if n.method != node_blank.method { m = m | 281474976710656 }
+    if n.return_type != node_blank.return_type { m = m | 562949953421312 }
+    if n.type_name != node_blank.type_name { m = m | 1125899906842624 }
+    if n.trait_name != node_blank.trait_name { m = m | 2251799813685248 }
+    if n.leading_comments != node_blank.leading_comments { m = m | 4503599627370496 }
+    if n.trailing_comments != node_blank.trailing_comments { m = m | 9007199254740992 }
+    if n.doc_comment != node_blank.doc_comment { m = m | 18014398509481984 }
+    if n.xfail_reason != node_blank.xfail_reason { m = m | 36028797018963968 }
+    m
 }
 
-// Drops the empty last chunk of every chunked column, once its first node is popped.
-fn node_columns_close_chunk() {
-    let _ = columns.str_val.pop()
-    let _ = columns.name.pop()
-    let _ = columns.op.pop()
-    let _ = columns.var_name.pop()
-    let _ = columns.module.pop()
-    let _ = columns.method.pop()
-    let _ = columns.return_type.pop()
-    let _ = columns.type_name.pop()
-    let _ = columns.trait_name.pop()
-    let _ = columns.leading_comments.pop()
-    let _ = columns.trailing_comments.pop()
-    let _ = columns.doc_comment.pop()
-    let _ = columns.xfail_reason.pop()
-    let _ = columns.int_val.pop()
-    let _ = columns.left.pop()
-    let _ = columns.right.pop()
-    let _ = columns.body.pop()
-    let _ = columns.condition.pop()
-    let _ = columns.then_body.pop()
-    let _ = columns.else_body.pop()
-    let _ = columns.scrutinee.pop()
-    let _ = columns.pattern.pop()
-    let _ = columns.guard.pop()
-    let _ = columns.value.pop()
-    let _ = columns.target.pop()
-    let _ = columns.iterable.pop()
-    let _ = columns.is_mut.pop()
-    let _ = columns.is_pub.pop()
-    let _ = columns.is_const.pop()
-    let _ = columns.inclusive.pop()
-    let _ = columns.start.pop()
-    let _ = columns.end.pop()
-    let _ = columns.obj.pop()
-    let _ = columns.index.pop()
-    let _ = columns.params.pop()
-    let _ = columns.args.pop()
-    let _ = columns.stmts.pop()
-    let _ = columns.arms.pop()
-    let _ = columns.fields.pop()
-    let _ = columns.elements.pop()
-    let _ = columns.methods.pop()
-    let _ = columns.type_params.pop()
-    let _ = columns.effects.pop()
-    let _ = columns.captures.pop()
-    let _ = columns.type_ann.pop()
-    let _ = columns.handlers.pop()
-    let _ = columns.line.pop()
-    let _ = columns.col.pop()
-    let _ = columns.end_line.pop()
-    let _ = columns.end_col.pop()
-    let _ = columns.assoc_types.pop()
-    let _ = columns.impl_binders.pop()
-    let _ = columns.recv_type_args.pop()
-    let _ = columns.impl_where_bounds.pop()
-    let _ = columns.for_binder.pop()
-    let _ = columns.supertraits.pop()
-    let _ = columns.child_at.pop()
+// The shape whose fields are the bits of `m`, made on first use.
+fn node_shape(m: Int, kind: Int) -> Int {
+    let k = (kind & 255) * 2
+    if columns.shape_memo[k] == m { return columns.shape_memo[k + 1] }
+    let s = match columns.shape_of_mask.get(m) {
+        Some(found) => found
+        None => node_shape_new(m)
+    }
+    columns.shape_memo.set(k, m)
+    columns.shape_memo.set(k + 1, s)
+    s
+}
+
+fn node_shape_new(m: Int) -> Int {
+    let s = columns.shape_mask.len()
+    if s > 65535 {
+        io.println("FATAL: the node pool has more than 65536 shapes; head packs at most that")
+        exit(1)
+    }
+    let base = s * 56
+    let mut bit = 1
+    let mut ioff = if (m & 72048797944905728) != 0 { 1 } else { 0 }
+    let mut soff = 0
+    let mut f = 0
+    while f < 56 {
+        if (m & bit) == 0 {
+            columns.shape_slot.push(-1)
+        } else if f < 43 {
+            columns.shape_slot.push(ioff)
+            ioff = ioff + 1
+        } else {
+            columns.shape_slot.push(soff)
+            soff = soff + 1
+        }
+        bit = bit * 2
+        f = f + 1
+    }
+    columns.shape_mask.push(m)
+    columns.shape_ints.push(ioff)
+    columns.shape_strs.push(soff)
+    columns.at_str_val.push(columns.shape_slot[base + 43])
+    columns.at_name.push(columns.shape_slot[base + 44])
+    columns.at_op.push(columns.shape_slot[base + 45])
+    columns.at_var_name.push(columns.shape_slot[base + 46])
+    columns.at_module.push(columns.shape_slot[base + 47])
+    columns.at_method.push(columns.shape_slot[base + 48])
+    columns.at_return_type.push(columns.shape_slot[base + 49])
+    columns.at_type_name.push(columns.shape_slot[base + 50])
+    columns.at_trait_name.push(columns.shape_slot[base + 51])
+    columns.at_leading_comments.push(columns.shape_slot[base + 52])
+    columns.at_trailing_comments.push(columns.shape_slot[base + 53])
+    columns.at_doc_comment.push(columns.shape_slot[base + 54])
+    columns.at_xfail_reason.push(columns.shape_slot[base + 55])
+    columns.at_int_val.push(columns.shape_slot[base + 0])
+    columns.at_left.push(columns.shape_slot[base + 1])
+    columns.at_right.push(columns.shape_slot[base + 2])
+    columns.at_body.push(columns.shape_slot[base + 3])
+    columns.at_condition.push(columns.shape_slot[base + 4])
+    columns.at_then_body.push(columns.shape_slot[base + 5])
+    columns.at_else_body.push(columns.shape_slot[base + 6])
+    columns.at_scrutinee.push(columns.shape_slot[base + 7])
+    columns.at_pattern.push(columns.shape_slot[base + 8])
+    columns.at_guard.push(columns.shape_slot[base + 9])
+    columns.at_value.push(columns.shape_slot[base + 10])
+    columns.at_target.push(columns.shape_slot[base + 11])
+    columns.at_iterable.push(columns.shape_slot[base + 12])
+    columns.at_is_mut.push(columns.shape_slot[base + 13])
+    columns.at_is_pub.push(columns.shape_slot[base + 14])
+    columns.at_is_const.push(columns.shape_slot[base + 15])
+    columns.at_inclusive.push(columns.shape_slot[base + 16])
+    columns.at_start.push(columns.shape_slot[base + 17])
+    columns.at_end.push(columns.shape_slot[base + 18])
+    columns.at_obj.push(columns.shape_slot[base + 19])
+    columns.at_index.push(columns.shape_slot[base + 20])
+    columns.at_params.push(columns.shape_slot[base + 21])
+    columns.at_args.push(columns.shape_slot[base + 22])
+    columns.at_stmts.push(columns.shape_slot[base + 23])
+    columns.at_arms.push(columns.shape_slot[base + 24])
+    columns.at_fields.push(columns.shape_slot[base + 25])
+    columns.at_elements.push(columns.shape_slot[base + 26])
+    columns.at_methods.push(columns.shape_slot[base + 27])
+    columns.at_type_params.push(columns.shape_slot[base + 28])
+    columns.at_effects.push(columns.shape_slot[base + 29])
+    columns.at_captures.push(columns.shape_slot[base + 30])
+    columns.at_type_ann.push(columns.shape_slot[base + 31])
+    columns.at_handlers.push(columns.shape_slot[base + 32])
+    columns.at_line.push(columns.shape_slot[base + 33])
+    columns.at_col.push(columns.shape_slot[base + 34])
+    columns.at_end_line.push(columns.shape_slot[base + 35])
+    columns.at_end_col.push(columns.shape_slot[base + 36])
+    columns.at_assoc_types.push(columns.shape_slot[base + 37])
+    columns.at_impl_binders.push(columns.shape_slot[base + 38])
+    columns.at_recv_type_args.push(columns.shape_slot[base + 39])
+    columns.at_impl_where_bounds.push(columns.shape_slot[base + 40])
+    columns.at_for_binder.push(columns.shape_slot[base + 41])
+    columns.at_supertraits.push(columns.shape_slot[base + 42])
+    columns.shape_of_mask.insert(m, s)
+    s
+}
+
+// The address of `n` free words at the end of an arena whose last chunk has `len` used
+// slots, given its chunk count; -1 when they do not fit in that chunk.
+fn node_arena_fit(chunks: Int, len: Int, n: Int) -> Int {
+    if chunks == 0 || len + n > 65536 { return -1 }
+    ((chunks - 1) << 16) + len
+}
+
+// Writes `n`'s fields of shape `s` at the end of the arenas and returns the Int payload's
+// address.
+fn node_store(n: AstNode, s: Int) -> Int {
+    let ni = columns.shape_ints[s]
+    if ni == 0 { return 0 }
+    let mk = columns.shape_mask[s]
+    let ns = columns.shape_strs[s]
+    let ilast = columns.ints.len() - 1
+    let mut base = if ilast < 0 { -1 } else { node_arena_fit(ilast + 1, columns.ints[ilast].len(), ni) }
+    if base < 0 {
+        columns.ints.push(List.with_capacity(65536))
+        base = (columns.ints.len() - 1) << 16
+    }
+    let ic = base >> 16
+    if ns > 0 {
+        let slast = columns.strs.len() - 1
+        let mut sbase = if slast < 0 { -1 } else { node_arena_fit(slast + 1, columns.strs[slast].len(), ns) }
+        if sbase < 0 {
+            columns.strs.push(List.with_capacity(65536))
+            sbase = (columns.strs.len() - 1) << 16
+        }
+        let sc = sbase >> 16
+        columns.ints[ic].push(sbase)
+        if (mk & 8796093022208) != 0 { columns.strs[sc].push(n.str_val) }
+        if (mk & 17592186044416) != 0 { columns.strs[sc].push(n.name) }
+        if (mk & 35184372088832) != 0 { columns.strs[sc].push(n.op) }
+        if (mk & 70368744177664) != 0 { columns.strs[sc].push(n.var_name) }
+        if (mk & 140737488355328) != 0 { columns.strs[sc].push(n.module) }
+        if (mk & 281474976710656) != 0 { columns.strs[sc].push(n.method) }
+        if (mk & 562949953421312) != 0 { columns.strs[sc].push(n.return_type) }
+        if (mk & 1125899906842624) != 0 { columns.strs[sc].push(n.type_name) }
+        if (mk & 2251799813685248) != 0 { columns.strs[sc].push(n.trait_name) }
+        if (mk & 4503599627370496) != 0 { columns.strs[sc].push(n.leading_comments) }
+        if (mk & 9007199254740992) != 0 { columns.strs[sc].push(n.trailing_comments) }
+        if (mk & 18014398509481984) != 0 { columns.strs[sc].push(n.doc_comment) }
+        if (mk & 36028797018963968) != 0 { columns.strs[sc].push(n.xfail_reason) }
+    }
+    if (mk & 1) != 0 { columns.ints[ic].push(n.int_val) }
+    if (mk & 2) != 0 { columns.ints[ic].push(n.left) }
+    if (mk & 4) != 0 { columns.ints[ic].push(n.right) }
+    if (mk & 8) != 0 { columns.ints[ic].push(n.body) }
+    if (mk & 16) != 0 { columns.ints[ic].push(n.condition) }
+    if (mk & 32) != 0 { columns.ints[ic].push(n.then_body) }
+    if (mk & 64) != 0 { columns.ints[ic].push(n.else_body) }
+    if (mk & 128) != 0 { columns.ints[ic].push(n.scrutinee) }
+    if (mk & 256) != 0 { columns.ints[ic].push(n.pattern) }
+    if (mk & 512) != 0 { columns.ints[ic].push(n.guard) }
+    if (mk & 1024) != 0 { columns.ints[ic].push(n.value) }
+    if (mk & 2048) != 0 { columns.ints[ic].push(n.target) }
+    if (mk & 4096) != 0 { columns.ints[ic].push(n.iterable) }
+    if (mk & 8192) != 0 { columns.ints[ic].push(n.is_mut) }
+    if (mk & 16384) != 0 { columns.ints[ic].push(n.is_pub) }
+    if (mk & 32768) != 0 { columns.ints[ic].push(n.is_const) }
+    if (mk & 65536) != 0 { columns.ints[ic].push(n.inclusive) }
+    if (mk & 131072) != 0 { columns.ints[ic].push(n.start) }
+    if (mk & 262144) != 0 { columns.ints[ic].push(n.end) }
+    if (mk & 524288) != 0 { columns.ints[ic].push(n.obj) }
+    if (mk & 1048576) != 0 { columns.ints[ic].push(n.index) }
+    if (mk & 2097152) != 0 { columns.ints[ic].push(n.params) }
+    if (mk & 4194304) != 0 { columns.ints[ic].push(n.args) }
+    if (mk & 8388608) != 0 { columns.ints[ic].push(n.stmts) }
+    if (mk & 16777216) != 0 { columns.ints[ic].push(n.arms) }
+    if (mk & 33554432) != 0 { columns.ints[ic].push(n.fields) }
+    if (mk & 67108864) != 0 { columns.ints[ic].push(n.elements) }
+    if (mk & 134217728) != 0 { columns.ints[ic].push(n.methods) }
+    if (mk & 268435456) != 0 { columns.ints[ic].push(n.type_params) }
+    if (mk & 536870912) != 0 { columns.ints[ic].push(n.effects) }
+    if (mk & 1073741824) != 0 { columns.ints[ic].push(n.captures) }
+    if (mk & 2147483648) != 0 { columns.ints[ic].push(n.type_ann) }
+    if (mk & 4294967296) != 0 { columns.ints[ic].push(n.handlers) }
+    if (mk & 8589934592) != 0 { columns.ints[ic].push(n.line) }
+    if (mk & 17179869184) != 0 { columns.ints[ic].push(n.col) }
+    if (mk & 34359738368) != 0 { columns.ints[ic].push(n.end_line) }
+    if (mk & 68719476736) != 0 { columns.ints[ic].push(n.end_col) }
+    if (mk & 137438953472) != 0 { columns.ints[ic].push(n.assoc_types) }
+    if (mk & 274877906944) != 0 { columns.ints[ic].push(n.impl_binders) }
+    if (mk & 549755813888) != 0 { columns.ints[ic].push(n.recv_type_args) }
+    if (mk & 1099511627776) != 0 { columns.ints[ic].push(n.impl_where_bounds) }
+    if (mk & 2199023255552) != 0 { columns.ints[ic].push(n.for_binder) }
+    if (mk & 4398046511104) != 0 { columns.ints[ic].push(n.supertraits) }
+    base
+}
+
+// Writes every field shape `s` holds from `n`, over the payload at `base`.
+fn node_overwrite(n: AstNode, s: Int, base: Int) {
+    let mk = columns.shape_mask[s]
+    let ic = base >> 16
+    let mut ij = base & 65535
+    if columns.shape_strs[s] > 0 {
+        let sbase = columns.ints[ic][ij]
+        let sc = sbase >> 16
+        let mut sj = sbase & 65535
+        if (mk & 8796093022208) != 0 {
+            columns.strs[sc].set(sj, n.str_val)
+            sj = sj + 1
+        }
+        if (mk & 17592186044416) != 0 {
+            columns.strs[sc].set(sj, n.name)
+            sj = sj + 1
+        }
+        if (mk & 35184372088832) != 0 {
+            columns.strs[sc].set(sj, n.op)
+            sj = sj + 1
+        }
+        if (mk & 70368744177664) != 0 {
+            columns.strs[sc].set(sj, n.var_name)
+            sj = sj + 1
+        }
+        if (mk & 140737488355328) != 0 {
+            columns.strs[sc].set(sj, n.module)
+            sj = sj + 1
+        }
+        if (mk & 281474976710656) != 0 {
+            columns.strs[sc].set(sj, n.method)
+            sj = sj + 1
+        }
+        if (mk & 562949953421312) != 0 {
+            columns.strs[sc].set(sj, n.return_type)
+            sj = sj + 1
+        }
+        if (mk & 1125899906842624) != 0 {
+            columns.strs[sc].set(sj, n.type_name)
+            sj = sj + 1
+        }
+        if (mk & 2251799813685248) != 0 {
+            columns.strs[sc].set(sj, n.trait_name)
+            sj = sj + 1
+        }
+        if (mk & 4503599627370496) != 0 {
+            columns.strs[sc].set(sj, n.leading_comments)
+            sj = sj + 1
+        }
+        if (mk & 9007199254740992) != 0 {
+            columns.strs[sc].set(sj, n.trailing_comments)
+            sj = sj + 1
+        }
+        if (mk & 18014398509481984) != 0 {
+            columns.strs[sc].set(sj, n.doc_comment)
+            sj = sj + 1
+        }
+        if (mk & 36028797018963968) != 0 {
+            columns.strs[sc].set(sj, n.xfail_reason)
+            sj = sj + 1
+        }
+        ij = ij + 1
+    }
+    if (mk & 1) != 0 {
+        columns.ints[ic].set(ij, n.int_val)
+        ij = ij + 1
+    }
+    if (mk & 2) != 0 {
+        columns.ints[ic].set(ij, n.left)
+        ij = ij + 1
+    }
+    if (mk & 4) != 0 {
+        columns.ints[ic].set(ij, n.right)
+        ij = ij + 1
+    }
+    if (mk & 8) != 0 {
+        columns.ints[ic].set(ij, n.body)
+        ij = ij + 1
+    }
+    if (mk & 16) != 0 {
+        columns.ints[ic].set(ij, n.condition)
+        ij = ij + 1
+    }
+    if (mk & 32) != 0 {
+        columns.ints[ic].set(ij, n.then_body)
+        ij = ij + 1
+    }
+    if (mk & 64) != 0 {
+        columns.ints[ic].set(ij, n.else_body)
+        ij = ij + 1
+    }
+    if (mk & 128) != 0 {
+        columns.ints[ic].set(ij, n.scrutinee)
+        ij = ij + 1
+    }
+    if (mk & 256) != 0 {
+        columns.ints[ic].set(ij, n.pattern)
+        ij = ij + 1
+    }
+    if (mk & 512) != 0 {
+        columns.ints[ic].set(ij, n.guard)
+        ij = ij + 1
+    }
+    if (mk & 1024) != 0 {
+        columns.ints[ic].set(ij, n.value)
+        ij = ij + 1
+    }
+    if (mk & 2048) != 0 {
+        columns.ints[ic].set(ij, n.target)
+        ij = ij + 1
+    }
+    if (mk & 4096) != 0 {
+        columns.ints[ic].set(ij, n.iterable)
+        ij = ij + 1
+    }
+    if (mk & 8192) != 0 {
+        columns.ints[ic].set(ij, n.is_mut)
+        ij = ij + 1
+    }
+    if (mk & 16384) != 0 {
+        columns.ints[ic].set(ij, n.is_pub)
+        ij = ij + 1
+    }
+    if (mk & 32768) != 0 {
+        columns.ints[ic].set(ij, n.is_const)
+        ij = ij + 1
+    }
+    if (mk & 65536) != 0 {
+        columns.ints[ic].set(ij, n.inclusive)
+        ij = ij + 1
+    }
+    if (mk & 131072) != 0 {
+        columns.ints[ic].set(ij, n.start)
+        ij = ij + 1
+    }
+    if (mk & 262144) != 0 {
+        columns.ints[ic].set(ij, n.end)
+        ij = ij + 1
+    }
+    if (mk & 524288) != 0 {
+        columns.ints[ic].set(ij, n.obj)
+        ij = ij + 1
+    }
+    if (mk & 1048576) != 0 {
+        columns.ints[ic].set(ij, n.index)
+        ij = ij + 1
+    }
+    if (mk & 2097152) != 0 {
+        columns.ints[ic].set(ij, n.params)
+        ij = ij + 1
+    }
+    if (mk & 4194304) != 0 {
+        columns.ints[ic].set(ij, n.args)
+        ij = ij + 1
+    }
+    if (mk & 8388608) != 0 {
+        columns.ints[ic].set(ij, n.stmts)
+        ij = ij + 1
+    }
+    if (mk & 16777216) != 0 {
+        columns.ints[ic].set(ij, n.arms)
+        ij = ij + 1
+    }
+    if (mk & 33554432) != 0 {
+        columns.ints[ic].set(ij, n.fields)
+        ij = ij + 1
+    }
+    if (mk & 67108864) != 0 {
+        columns.ints[ic].set(ij, n.elements)
+        ij = ij + 1
+    }
+    if (mk & 134217728) != 0 {
+        columns.ints[ic].set(ij, n.methods)
+        ij = ij + 1
+    }
+    if (mk & 268435456) != 0 {
+        columns.ints[ic].set(ij, n.type_params)
+        ij = ij + 1
+    }
+    if (mk & 536870912) != 0 {
+        columns.ints[ic].set(ij, n.effects)
+        ij = ij + 1
+    }
+    if (mk & 1073741824) != 0 {
+        columns.ints[ic].set(ij, n.captures)
+        ij = ij + 1
+    }
+    if (mk & 2147483648) != 0 {
+        columns.ints[ic].set(ij, n.type_ann)
+        ij = ij + 1
+    }
+    if (mk & 4294967296) != 0 {
+        columns.ints[ic].set(ij, n.handlers)
+        ij = ij + 1
+    }
+    if (mk & 8589934592) != 0 {
+        columns.ints[ic].set(ij, n.line)
+        ij = ij + 1
+    }
+    if (mk & 17179869184) != 0 {
+        columns.ints[ic].set(ij, n.col)
+        ij = ij + 1
+    }
+    if (mk & 34359738368) != 0 {
+        columns.ints[ic].set(ij, n.end_line)
+        ij = ij + 1
+    }
+    if (mk & 68719476736) != 0 {
+        columns.ints[ic].set(ij, n.end_col)
+        ij = ij + 1
+    }
+    if (mk & 137438953472) != 0 {
+        columns.ints[ic].set(ij, n.assoc_types)
+        ij = ij + 1
+    }
+    if (mk & 274877906944) != 0 {
+        columns.ints[ic].set(ij, n.impl_binders)
+        ij = ij + 1
+    }
+    if (mk & 549755813888) != 0 {
+        columns.ints[ic].set(ij, n.recv_type_args)
+        ij = ij + 1
+    }
+    if (mk & 1099511627776) != 0 {
+        columns.ints[ic].set(ij, n.impl_where_bounds)
+        ij = ij + 1
+    }
+    if (mk & 2199023255552) != 0 {
+        columns.ints[ic].set(ij, n.for_binder)
+        ij = ij + 1
+    }
+    if (mk & 4398046511104) != 0 {
+        columns.ints[ic].set(ij, n.supertraits)
+        ij = ij + 1
+    }
+}
+
+// The arena end, as an address: the next word a payload would take if it fit.
+fn node_ints_end() -> Int {
+    let last = columns.ints.len() - 1
+    if last < 0 { return 0 }
+    (last << 16) + columns.ints[last].len()
+}
+
+fn node_strs_end() -> Int {
+    let last = columns.strs.len() - 1
+    if last < 0 { return 0 }
+    (last << 16) + columns.strs[last].len()
+}
+
+fn node_ints_drop(n: Int) {
+    let last = columns.ints.len() - 1
+    let mut k = 0
+    while k < n {
+        let _ = columns.ints[last].pop()
+        k = k + 1
+    }
+    if columns.ints[last].len() == 0 { let _ = columns.ints.pop() }
+}
+
+fn node_strs_drop(n: Int) {
+    let last = columns.strs.len() - 1
+    let mut k = 0
+    while k < n {
+        let _ = columns.strs[last].pop()
+        k = k + 1
+    }
+    if columns.strs[last].len() == 0 { let _ = columns.strs.pop() }
 }
 
 // Appends `n` to the pool and returns its id.
 pub fn node_push(n: AstNode) -> Int {
     let id = columns.count
-    if (id & 4095) == 0 { node_columns_open_chunk() }
+    if (id & 4095) == 0 {
+        columns.head.push(List.with_capacity(4096))
+        columns.child_at.push(List.with_capacity(4096))
+    }
     let c = id >> 12
-    columns.str_val[c].push(n.str_val)
-    columns.name[c].push(n.name)
-    columns.op[c].push(n.op)
-    columns.var_name[c].push(n.var_name)
-    columns.module[c].push(n.module)
-    columns.method[c].push(n.method)
-    columns.return_type[c].push(n.return_type)
-    columns.type_name[c].push(n.type_name)
-    columns.trait_name[c].push(n.trait_name)
-    columns.leading_comments[c].push(n.leading_comments)
-    columns.trailing_comments[c].push(n.trailing_comments)
-    columns.doc_comment[c].push(n.doc_comment)
-    columns.xfail_reason[c].push(n.xfail_reason)
+    let s = node_shape(node_mask(n), n.kind)
+    let base = node_store(n, s)
+    columns.head[c].push((base << 16) | s)
     columns.kind.push(n.kind)
-    columns.int_val[c].push(n.int_val)
-    columns.left[c].push(n.left)
-    columns.right[c].push(n.right)
-    columns.body[c].push(n.body)
-    columns.condition[c].push(n.condition)
-    columns.then_body[c].push(n.then_body)
-    columns.else_body[c].push(n.else_body)
-    columns.scrutinee[c].push(n.scrutinee)
-    columns.pattern[c].push(n.pattern)
-    columns.guard[c].push(n.guard)
-    columns.value[c].push(n.value)
-    columns.target[c].push(n.target)
-    columns.iterable[c].push(n.iterable)
-    columns.is_mut[c].push(n.is_mut)
-    columns.is_pub[c].push(n.is_pub)
-    columns.is_const[c].push(n.is_const)
-    columns.inclusive[c].push(n.inclusive)
-    columns.start[c].push(n.start)
-    columns.end[c].push(n.end)
-    columns.obj[c].push(n.obj)
-    columns.index[c].push(n.index)
-    columns.params[c].push(n.params)
-    columns.args[c].push(n.args)
-    columns.stmts[c].push(n.stmts)
-    columns.arms[c].push(n.arms)
-    columns.fields[c].push(n.fields)
-    columns.elements[c].push(n.elements)
-    columns.methods[c].push(n.methods)
-    columns.type_params[c].push(n.type_params)
-    columns.effects[c].push(n.effects)
-    columns.captures[c].push(n.captures)
-    columns.type_ann[c].push(n.type_ann)
-    columns.handlers[c].push(n.handlers)
-    columns.line[c].push(n.line)
-    columns.col[c].push(n.col)
-    columns.end_line[c].push(n.end_line)
-    columns.end_col[c].push(n.end_col)
-    columns.assoc_types[c].push(n.assoc_types)
-    columns.impl_binders[c].push(n.impl_binders)
-    columns.recv_type_args[c].push(n.recv_type_args)
-    columns.impl_where_bounds[c].push(n.impl_where_bounds)
-    columns.for_binder[c].push(n.for_binder)
-    columns.supertraits[c].push(n.supertraits)
     let start = columns.child_slots.len()
     node_child_ids_into(n, ChildWalk.Slots, columns.child_slots)
     columns.child_at[c].push(node_child_run(id, start))
@@ -366,70 +741,29 @@ pub fn node_push(n: AstNode) -> Int {
 }
 
 // Drops the newest node, as a caller that made a scratch node does to give its id back.
+// Its payload is given back only when it is still the arena end: a node written to after
+// this one was pushed moved its payload past this one's.
 pub fn node_pop() {
     if columns.count == 0 { return }
     let id = columns.count - 1
     let c = id >> 12
-    let _ = columns.str_val[c].pop()
-    let _ = columns.name[c].pop()
-    let _ = columns.op[c].pop()
-    let _ = columns.var_name[c].pop()
-    let _ = columns.module[c].pop()
-    let _ = columns.method[c].pop()
-    let _ = columns.return_type[c].pop()
-    let _ = columns.type_name[c].pop()
-    let _ = columns.trait_name[c].pop()
-    let _ = columns.leading_comments[c].pop()
-    let _ = columns.trailing_comments[c].pop()
-    let _ = columns.doc_comment[c].pop()
-    let _ = columns.xfail_reason[c].pop()
+    let h = columns.head[c].pop() ?? 0
+    let s = h & 65535
+    let base = h >> 16
+    let ni = columns.shape_ints[s]
+    let ns = columns.shape_strs[s]
+    if ns > 0 {
+        let sbase = columns.ints[base >> 16][base & 65535]
+        if sbase + ns == node_strs_end() { node_strs_drop(ns) }
+    }
+    if ni > 0 && base + ni == node_ints_end() { node_ints_drop(ni) }
     let _ = columns.kind.pop()
-    let _ = columns.int_val[c].pop()
-    let _ = columns.left[c].pop()
-    let _ = columns.right[c].pop()
-    let _ = columns.body[c].pop()
-    let _ = columns.condition[c].pop()
-    let _ = columns.then_body[c].pop()
-    let _ = columns.else_body[c].pop()
-    let _ = columns.scrutinee[c].pop()
-    let _ = columns.pattern[c].pop()
-    let _ = columns.guard[c].pop()
-    let _ = columns.value[c].pop()
-    let _ = columns.target[c].pop()
-    let _ = columns.iterable[c].pop()
-    let _ = columns.is_mut[c].pop()
-    let _ = columns.is_pub[c].pop()
-    let _ = columns.is_const[c].pop()
-    let _ = columns.inclusive[c].pop()
-    let _ = columns.start[c].pop()
-    let _ = columns.end[c].pop()
-    let _ = columns.obj[c].pop()
-    let _ = columns.index[c].pop()
-    let _ = columns.params[c].pop()
-    let _ = columns.args[c].pop()
-    let _ = columns.stmts[c].pop()
-    let _ = columns.arms[c].pop()
-    let _ = columns.fields[c].pop()
-    let _ = columns.elements[c].pop()
-    let _ = columns.methods[c].pop()
-    let _ = columns.type_params[c].pop()
-    let _ = columns.effects[c].pop()
-    let _ = columns.captures[c].pop()
-    let _ = columns.type_ann[c].pop()
-    let _ = columns.handlers[c].pop()
-    let _ = columns.line[c].pop()
-    let _ = columns.col[c].pop()
-    let _ = columns.end_line[c].pop()
-    let _ = columns.end_col[c].pop()
-    let _ = columns.assoc_types[c].pop()
-    let _ = columns.impl_binders[c].pop()
-    let _ = columns.recv_type_args[c].pop()
-    let _ = columns.impl_where_bounds[c].pop()
-    let _ = columns.for_binder[c].pop()
-    let _ = columns.supertraits[c].pop()
     let at = columns.child_at[c].pop() ?? 0
     columns.count = id
-    if (id & 4095) == 0 { node_columns_close_chunk() }
+    if (id & 4095) == 0 {
+        let _ = columns.head.pop()
+        let _ = columns.child_at.pop()
+    }
     if (at >> 8) + (at & 255) == columns.child_slots.len() {
         node_drop_child_slots_from(at >> 8)
     }
@@ -438,63 +772,18 @@ pub fn node_pop() {
 fn node_replace(id: Int, n: AstNode) {
     let c = id >> 12
     let j = id & 4095
-    columns.str_val[c].set(j, n.str_val)
-    columns.name[c].set(j, n.name)
-    columns.op[c].set(j, n.op)
-    columns.var_name[c].set(j, n.var_name)
-    columns.module[c].set(j, n.module)
-    columns.method[c].set(j, n.method)
-    columns.return_type[c].set(j, n.return_type)
-    columns.type_name[c].set(j, n.type_name)
-    columns.trait_name[c].set(j, n.trait_name)
-    columns.leading_comments[c].set(j, n.leading_comments)
-    columns.trailing_comments[c].set(j, n.trailing_comments)
-    columns.doc_comment[c].set(j, n.doc_comment)
-    columns.xfail_reason[c].set(j, n.xfail_reason)
+    let h = columns.head[c][j]
+    let s = h & 65535
+    let held = columns.shape_mask[s]
+    let m = node_mask(n)
+    if (m & held) == m {
+        node_overwrite(n, s, h >> 16)
+    } else {
+        let s2 = node_shape(m | held, n.kind)
+        let base = node_store(n, s2)
+        columns.head[c].set(j, (base << 16) | s2)
+    }
     columns.kind.set(id, n.kind)
-    columns.int_val[c].set(j, n.int_val)
-    columns.left[c].set(j, n.left)
-    columns.right[c].set(j, n.right)
-    columns.body[c].set(j, n.body)
-    columns.condition[c].set(j, n.condition)
-    columns.then_body[c].set(j, n.then_body)
-    columns.else_body[c].set(j, n.else_body)
-    columns.scrutinee[c].set(j, n.scrutinee)
-    columns.pattern[c].set(j, n.pattern)
-    columns.guard[c].set(j, n.guard)
-    columns.value[c].set(j, n.value)
-    columns.target[c].set(j, n.target)
-    columns.iterable[c].set(j, n.iterable)
-    columns.is_mut[c].set(j, n.is_mut)
-    columns.is_pub[c].set(j, n.is_pub)
-    columns.is_const[c].set(j, n.is_const)
-    columns.inclusive[c].set(j, n.inclusive)
-    columns.start[c].set(j, n.start)
-    columns.end[c].set(j, n.end)
-    columns.obj[c].set(j, n.obj)
-    columns.index[c].set(j, n.index)
-    columns.params[c].set(j, n.params)
-    columns.args[c].set(j, n.args)
-    columns.stmts[c].set(j, n.stmts)
-    columns.arms[c].set(j, n.arms)
-    columns.fields[c].set(j, n.fields)
-    columns.elements[c].set(j, n.elements)
-    columns.methods[c].set(j, n.methods)
-    columns.type_params[c].set(j, n.type_params)
-    columns.effects[c].set(j, n.effects)
-    columns.captures[c].set(j, n.captures)
-    columns.type_ann[c].set(j, n.type_ann)
-    columns.handlers[c].set(j, n.handlers)
-    columns.line[c].set(j, n.line)
-    columns.col[c].set(j, n.col)
-    columns.end_line[c].set(j, n.end_line)
-    columns.end_col[c].set(j, n.end_col)
-    columns.assoc_types[c].set(j, n.assoc_types)
-    columns.impl_binders[c].set(j, n.impl_binders)
-    columns.recv_type_args[c].set(j, n.recv_type_args)
-    columns.impl_where_bounds[c].set(j, n.impl_where_bounds)
-    columns.for_binder[c].set(j, n.for_binder)
-    columns.supertraits[c].set(j, n.supertraits)
     // Most setters change a field that is not a child, so a run equal to the old one is
     // dropped again instead of growing the column on every write.
     let old = columns.child_at[c][j]
@@ -506,6 +795,68 @@ fn node_replace(id: Int, n: AstNode) {
     } else {
         columns.child_at[c].set(j, at)
     }
+}
+
+// Moves node `i`'s payload to a shape that also holds the field of mask bit `bit`, which
+// reads its default.
+fn node_widen(i: Int, bit: Int) {
+    let c = i >> 12
+    let j = i & 4095
+    let s = columns.head[c][j] & 65535
+    let s2 = node_shape(columns.shape_mask[s] | bit, columns.kind[i])
+    let base = node_store(node_or_die(i, "node_widen"), s2)
+    columns.head[c].set(j, (base << 16) | s2)
+}
+
+// `i` is checked; `f` is the field's index in mask-bit order, `bit` its mask bit and `dflt`
+// its default.
+fn node_write_int(i: Int, f: Int, bit: Int, dflt: Int, val: Int) {
+    let c = i >> 12
+    let j = i & 4095
+    let mut h = columns.head[c][j]
+    let mut o = columns.shape_slot[(h & 65535) * 56 + f]
+    if o < 0 {
+        if val == dflt { return }
+        node_widen(i, bit)
+        h = columns.head[c][j]
+        o = columns.shape_slot[(h & 65535) * 56 + f]
+    }
+    let p = (h >> 16) + o
+    columns.ints[p >> 16].set(p & 65535, val)
+}
+
+fn node_write_str(i: Int, f: Int, bit: Int, dflt: Str, val: Str) {
+    let c = i >> 12
+    let j = i & 4095
+    let mut h = columns.head[c][j]
+    let mut o = columns.shape_slot[(h & 65535) * 56 + f]
+    if o < 0 {
+        if val == dflt { return }
+        node_widen(i, bit)
+        h = columns.head[c][j]
+        o = columns.shape_slot[(h & 65535) * 56 + f]
+    }
+    let b = h >> 16
+    let p = columns.ints[b >> 16][b & 65535] + o
+    columns.strs[p >> 16].set(p & 65535, val)
+}
+
+// Field reads for node `i` (checked) through the field's `at` table.
+fn node_get_int(i: Int, at: List[Int], dflt: Int) -> Int {
+    let h = columns.head[i >> 12][i & 4095]
+    let o = at[h & 65535]
+    if o < 0 { return dflt }
+    let p = (h >> 16) + o
+    columns.ints[p >> 16][p & 65535]
+}
+
+fn node_get_str(i: Int, at: List[Int], dflt: Str) -> Str {
+    let h = columns.head[i >> 12][i & 4095]
+    let o = at[h & 65535]
+    if o < 0 { return dflt }
+    let b = h >> 16
+    let p = columns.ints[b >> 16][b & 65535] + o
+    columns.strs[p >> 16][p & 65535]
 }
 
 // The fields a setter writes in place: the child table reads none of them for any kind, so
@@ -522,37 +873,33 @@ type NodePlainStr {
 
 // `id` is already checked.
 fn node_write_plain_int(id: Int, f: NodePlainInt, val: Int) {
-    let c = id >> 12
-    let j = id & 4095
     match f {
-        NodePlainInt.IntVal => columns.int_val[c].set(j, val)
-        NodePlainInt.IsPub => columns.is_pub[c].set(j, val)
-        NodePlainInt.Line => columns.line[c].set(j, val)
-        NodePlainInt.Col => columns.col[c].set(j, val)
-        NodePlainInt.EndLine => columns.end_line[c].set(j, val)
-        NodePlainInt.EndCol => columns.end_col[c].set(j, val)
-        NodePlainInt.IsMut => columns.is_mut[c].set(j, val)
-        NodePlainInt.IsConst => columns.is_const[c].set(j, val)
-        NodePlainInt.Inclusive => columns.inclusive[c].set(j, val)
+        NodePlainInt.IntVal => node_write_int(id, 0, 1, node_blank.int_val, val)
+        NodePlainInt.IsPub => node_write_int(id, 14, 16384, node_blank.is_pub, val)
+        NodePlainInt.Line => node_write_int(id, 33, 8589934592, node_blank.line, val)
+        NodePlainInt.Col => node_write_int(id, 34, 17179869184, node_blank.col, val)
+        NodePlainInt.EndLine => node_write_int(id, 35, 34359738368, node_blank.end_line, val)
+        NodePlainInt.EndCol => node_write_int(id, 36, 68719476736, node_blank.end_col, val)
+        NodePlainInt.IsMut => node_write_int(id, 13, 8192, node_blank.is_mut, val)
+        NodePlainInt.IsConst => node_write_int(id, 15, 32768, node_blank.is_const, val)
+        NodePlainInt.Inclusive => node_write_int(id, 16, 65536, node_blank.inclusive, val)
     }
 }
 
 // `id` is already checked.
 fn node_write_plain_str(id: Int, f: NodePlainStr, val: Str) {
-    let c = id >> 12
-    let j = id & 4095
     match f {
-        NodePlainStr.StrVal => columns.str_val[c].set(j, val)
-        NodePlainStr.Module => columns.module[c].set(j, val)
-        NodePlainStr.TypeName => columns.type_name[c].set(j, val)
-        NodePlainStr.LeadingComments => columns.leading_comments[c].set(j, val)
-        NodePlainStr.TrailingComments => columns.trailing_comments[c].set(j, val)
-        NodePlainStr.DocComment => columns.doc_comment[c].set(j, val)
-        NodePlainStr.Op => columns.op[c].set(j, val)
-        NodePlainStr.VarName => columns.var_name[c].set(j, val)
-        NodePlainStr.Method => columns.method[c].set(j, val)
-        NodePlainStr.ReturnType => columns.return_type[c].set(j, val)
-        NodePlainStr.TraitName => columns.trait_name[c].set(j, val)
+        NodePlainStr.StrVal => node_write_str(id, 43, 8796093022208, node_blank.str_val, val)
+        NodePlainStr.Module => node_write_str(id, 47, 140737488355328, node_blank.module, val)
+        NodePlainStr.TypeName => node_write_str(id, 50, 1125899906842624, node_blank.type_name, val)
+        NodePlainStr.LeadingComments => node_write_str(id, 52, 4503599627370496, node_blank.leading_comments, val)
+        NodePlainStr.TrailingComments => node_write_str(id, 53, 9007199254740992, node_blank.trailing_comments, val)
+        NodePlainStr.DocComment => node_write_str(id, 54, 18014398509481984, node_blank.doc_comment, val)
+        NodePlainStr.Op => node_write_str(id, 45, 35184372088832, node_blank.op, val)
+        NodePlainStr.VarName => node_write_str(id, 46, 70368744177664, node_blank.var_name, val)
+        NodePlainStr.Method => node_write_str(id, 48, 281474976710656, node_blank.method, val)
+        NodePlainStr.ReturnType => node_write_str(id, 49, 562949953421312, node_blank.return_type, val)
+        NodePlainStr.TraitName => node_write_str(id, 51, 2251799813685248, node_blank.trait_name, val)
     }
 }
 
@@ -863,70 +1210,131 @@ fn checked_node_id(id: Int, where: Str) -> Int {
 
 fn node_or_die(id: Int, where: Str) -> AstNode {
     let i = checked_node_id(id, where)
-    let c = i >> 12
-    let j = i & 4095
+    let h = columns.head[i >> 12][i & 4095]
+    let s = h & 65535
+    let ic = (h >> 16) >> 16
+    let ij = (h >> 16) & 65535
+    let sbase = if columns.shape_strs[s] > 0 { columns.ints[ic][ij] } else { 0 }
+    let sc = sbase >> 16
+    let sj = sbase & 65535
+    let o_str_val = columns.at_str_val[s]
+    let o_name = columns.at_name[s]
+    let o_op = columns.at_op[s]
+    let o_var_name = columns.at_var_name[s]
+    let o_module = columns.at_module[s]
+    let o_method = columns.at_method[s]
+    let o_return_type = columns.at_return_type[s]
+    let o_type_name = columns.at_type_name[s]
+    let o_trait_name = columns.at_trait_name[s]
+    let o_leading_comments = columns.at_leading_comments[s]
+    let o_trailing_comments = columns.at_trailing_comments[s]
+    let o_doc_comment = columns.at_doc_comment[s]
+    let o_xfail_reason = columns.at_xfail_reason[s]
+    let o_int_val = columns.at_int_val[s]
+    let o_left = columns.at_left[s]
+    let o_right = columns.at_right[s]
+    let o_body = columns.at_body[s]
+    let o_condition = columns.at_condition[s]
+    let o_then_body = columns.at_then_body[s]
+    let o_else_body = columns.at_else_body[s]
+    let o_scrutinee = columns.at_scrutinee[s]
+    let o_pattern = columns.at_pattern[s]
+    let o_guard = columns.at_guard[s]
+    let o_value = columns.at_value[s]
+    let o_target = columns.at_target[s]
+    let o_iterable = columns.at_iterable[s]
+    let o_is_mut = columns.at_is_mut[s]
+    let o_is_pub = columns.at_is_pub[s]
+    let o_is_const = columns.at_is_const[s]
+    let o_inclusive = columns.at_inclusive[s]
+    let o_start = columns.at_start[s]
+    let o_end = columns.at_end[s]
+    let o_obj = columns.at_obj[s]
+    let o_index = columns.at_index[s]
+    let o_params = columns.at_params[s]
+    let o_args = columns.at_args[s]
+    let o_stmts = columns.at_stmts[s]
+    let o_arms = columns.at_arms[s]
+    let o_fields = columns.at_fields[s]
+    let o_elements = columns.at_elements[s]
+    let o_methods = columns.at_methods[s]
+    let o_type_params = columns.at_type_params[s]
+    let o_effects = columns.at_effects[s]
+    let o_captures = columns.at_captures[s]
+    let o_type_ann = columns.at_type_ann[s]
+    let o_handlers = columns.at_handlers[s]
+    let o_line = columns.at_line[s]
+    let o_col = columns.at_col[s]
+    let o_end_line = columns.at_end_line[s]
+    let o_end_col = columns.at_end_col[s]
+    let o_assoc_types = columns.at_assoc_types[s]
+    let o_impl_binders = columns.at_impl_binders[s]
+    let o_recv_type_args = columns.at_recv_type_args[s]
+    let o_impl_where_bounds = columns.at_impl_where_bounds[s]
+    let o_for_binder = columns.at_for_binder[s]
+    let o_supertraits = columns.at_supertraits[s]
     AstNode {
-        str_val: columns.str_val[c][j],
-        name: columns.name[c][j],
-        op: columns.op[c][j],
-        var_name: columns.var_name[c][j],
-        module: columns.module[c][j],
-        method: columns.method[c][j],
-        return_type: columns.return_type[c][j],
-        type_name: columns.type_name[c][j],
-        trait_name: columns.trait_name[c][j],
-        leading_comments: columns.leading_comments[c][j],
-        trailing_comments: columns.trailing_comments[c][j],
-        doc_comment: columns.doc_comment[c][j],
-        xfail_reason: columns.xfail_reason[c][j],
+        str_val: if o_str_val < 0 { node_blank.str_val } else { columns.strs[sc][sj + o_str_val] },
+        name: if o_name < 0 { node_blank.name } else { columns.strs[sc][sj + o_name] },
+        op: if o_op < 0 { node_blank.op } else { columns.strs[sc][sj + o_op] },
+        var_name: if o_var_name < 0 { node_blank.var_name } else { columns.strs[sc][sj + o_var_name] },
+        module: if o_module < 0 { node_blank.module } else { columns.strs[sc][sj + o_module] },
+        method: if o_method < 0 { node_blank.method } else { columns.strs[sc][sj + o_method] },
+        return_type: if o_return_type < 0 { node_blank.return_type } else { columns.strs[sc][sj + o_return_type] },
+        type_name: if o_type_name < 0 { node_blank.type_name } else { columns.strs[sc][sj + o_type_name] },
+        trait_name: if o_trait_name < 0 { node_blank.trait_name } else { columns.strs[sc][sj + o_trait_name] },
+        leading_comments: if o_leading_comments < 0 { node_blank.leading_comments } else { columns.strs[sc][sj + o_leading_comments] },
+        trailing_comments: if o_trailing_comments < 0 { node_blank.trailing_comments } else { columns.strs[sc][sj + o_trailing_comments] },
+        doc_comment: if o_doc_comment < 0 { node_blank.doc_comment } else { columns.strs[sc][sj + o_doc_comment] },
+        xfail_reason: if o_xfail_reason < 0 { node_blank.xfail_reason } else { columns.strs[sc][sj + o_xfail_reason] },
         kind: columns.kind[i],
-        int_val: columns.int_val[c][j],
-        left: columns.left[c][j],
-        right: columns.right[c][j],
-        body: columns.body[c][j],
-        condition: columns.condition[c][j],
-        then_body: columns.then_body[c][j],
-        else_body: columns.else_body[c][j],
-        scrutinee: columns.scrutinee[c][j],
-        pattern: columns.pattern[c][j],
-        guard: columns.guard[c][j],
-        value: columns.value[c][j],
-        target: columns.target[c][j],
-        iterable: columns.iterable[c][j],
-        is_mut: columns.is_mut[c][j],
-        is_pub: columns.is_pub[c][j],
-        is_const: columns.is_const[c][j],
-        inclusive: columns.inclusive[c][j],
-        start: columns.start[c][j],
-        end: columns.end[c][j],
-        obj: columns.obj[c][j],
-        index: columns.index[c][j],
-        params: columns.params[c][j],
-        args: columns.args[c][j],
-        stmts: columns.stmts[c][j],
-        arms: columns.arms[c][j],
-        fields: columns.fields[c][j],
-        elements: columns.elements[c][j],
-        methods: columns.methods[c][j],
-        type_params: columns.type_params[c][j],
-        effects: columns.effects[c][j],
-        captures: columns.captures[c][j],
-        type_ann: columns.type_ann[c][j],
-        handlers: columns.handlers[c][j],
-        line: columns.line[c][j],
-        col: columns.col[c][j],
-        end_line: columns.end_line[c][j],
-        end_col: columns.end_col[c][j],
-        assoc_types: columns.assoc_types[c][j],
-        impl_binders: columns.impl_binders[c][j],
-        recv_type_args: columns.recv_type_args[c][j],
-        impl_where_bounds: columns.impl_where_bounds[c][j],
-        for_binder: columns.for_binder[c][j],
-        supertraits: columns.supertraits[c][j],
+        int_val: if o_int_val < 0 { node_blank.int_val } else { columns.ints[ic][ij + o_int_val] },
+        left: if o_left < 0 { node_blank.left } else { columns.ints[ic][ij + o_left] },
+        right: if o_right < 0 { node_blank.right } else { columns.ints[ic][ij + o_right] },
+        body: if o_body < 0 { node_blank.body } else { columns.ints[ic][ij + o_body] },
+        condition: if o_condition < 0 { node_blank.condition } else { columns.ints[ic][ij + o_condition] },
+        then_body: if o_then_body < 0 { node_blank.then_body } else { columns.ints[ic][ij + o_then_body] },
+        else_body: if o_else_body < 0 { node_blank.else_body } else { columns.ints[ic][ij + o_else_body] },
+        scrutinee: if o_scrutinee < 0 { node_blank.scrutinee } else { columns.ints[ic][ij + o_scrutinee] },
+        pattern: if o_pattern < 0 { node_blank.pattern } else { columns.ints[ic][ij + o_pattern] },
+        guard: if o_guard < 0 { node_blank.guard } else { columns.ints[ic][ij + o_guard] },
+        value: if o_value < 0 { node_blank.value } else { columns.ints[ic][ij + o_value] },
+        target: if o_target < 0 { node_blank.target } else { columns.ints[ic][ij + o_target] },
+        iterable: if o_iterable < 0 { node_blank.iterable } else { columns.ints[ic][ij + o_iterable] },
+        is_mut: if o_is_mut < 0 { node_blank.is_mut } else { columns.ints[ic][ij + o_is_mut] },
+        is_pub: if o_is_pub < 0 { node_blank.is_pub } else { columns.ints[ic][ij + o_is_pub] },
+        is_const: if o_is_const < 0 { node_blank.is_const } else { columns.ints[ic][ij + o_is_const] },
+        inclusive: if o_inclusive < 0 { node_blank.inclusive } else { columns.ints[ic][ij + o_inclusive] },
+        start: if o_start < 0 { node_blank.start } else { columns.ints[ic][ij + o_start] },
+        end: if o_end < 0 { node_blank.end } else { columns.ints[ic][ij + o_end] },
+        obj: if o_obj < 0 { node_blank.obj } else { columns.ints[ic][ij + o_obj] },
+        index: if o_index < 0 { node_blank.index } else { columns.ints[ic][ij + o_index] },
+        params: if o_params < 0 { node_blank.params } else { columns.ints[ic][ij + o_params] },
+        args: if o_args < 0 { node_blank.args } else { columns.ints[ic][ij + o_args] },
+        stmts: if o_stmts < 0 { node_blank.stmts } else { columns.ints[ic][ij + o_stmts] },
+        arms: if o_arms < 0 { node_blank.arms } else { columns.ints[ic][ij + o_arms] },
+        fields: if o_fields < 0 { node_blank.fields } else { columns.ints[ic][ij + o_fields] },
+        elements: if o_elements < 0 { node_blank.elements } else { columns.ints[ic][ij + o_elements] },
+        methods: if o_methods < 0 { node_blank.methods } else { columns.ints[ic][ij + o_methods] },
+        type_params: if o_type_params < 0 { node_blank.type_params } else { columns.ints[ic][ij + o_type_params] },
+        effects: if o_effects < 0 { node_blank.effects } else { columns.ints[ic][ij + o_effects] },
+        captures: if o_captures < 0 { node_blank.captures } else { columns.ints[ic][ij + o_captures] },
+        type_ann: if o_type_ann < 0 { node_blank.type_ann } else { columns.ints[ic][ij + o_type_ann] },
+        handlers: if o_handlers < 0 { node_blank.handlers } else { columns.ints[ic][ij + o_handlers] },
+        line: if o_line < 0 { node_blank.line } else { columns.ints[ic][ij + o_line] },
+        col: if o_col < 0 { node_blank.col } else { columns.ints[ic][ij + o_col] },
+        end_line: if o_end_line < 0 { node_blank.end_line } else { columns.ints[ic][ij + o_end_line] },
+        end_col: if o_end_col < 0 { node_blank.end_col } else { columns.ints[ic][ij + o_end_col] },
+        assoc_types: if o_assoc_types < 0 { node_blank.assoc_types } else { columns.ints[ic][ij + o_assoc_types] },
+        impl_binders: if o_impl_binders < 0 { node_blank.impl_binders } else { columns.ints[ic][ij + o_impl_binders] },
+        recv_type_args: if o_recv_type_args < 0 { node_blank.recv_type_args } else { columns.ints[ic][ij + o_recv_type_args] },
+        impl_where_bounds: if o_impl_where_bounds < 0 { node_blank.impl_where_bounds } else { columns.ints[ic][ij + o_impl_where_bounds] },
+        for_binder: if o_for_binder < 0 { node_blank.for_binder } else { columns.ints[ic][ij + o_for_binder] },
+        supertraits: if o_supertraits < 0 { node_blank.supertraits } else { columns.ints[ic][ij + o_supertraits] },
     }
 }
 
-// The whole node at `id`, built from its columns. A pass that reads one or two fields uses
+// The whole node at `id`, built from its payload. A pass that reads one or two fields uses
 // their accessors instead.
 pub fn node_at(id: Int) -> AstNode { node_or_die(id, "node_at") }
 
@@ -950,8 +1358,8 @@ fn node_die(id: Int, where: Str) {
         let mut i = start
         while i < nlen {
             let nk = columns.kind[i]
-            let nl = columns.line[i >> 12][i & 4095]
-            let nc = columns.col[i >> 12][i & 4095]
+            let nl = node_get_int(i, columns.at_line, node_blank.line)
+            let nc = node_get_int(i, columns.at_col, node_blank.col)
             io.eprintln("parser-dump: node[{i}] kind={nk} line={nl} col={nc}")
             i = i + 1
         }
@@ -976,228 +1384,172 @@ pub fn node_kind(id: Int) -> Int {
     columns.kind[checked_node_id(id, "node_kind")]
 }
 pub fn node_int_val(id: Int) -> Int {
-    let i = checked_node_id(id, "node_int_val")
-    columns.int_val[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_int_val"), columns.at_int_val, node_blank.int_val)
 }
 pub fn node_str_val(id: Int) -> Str {
-    let i = checked_node_id(id, "node_str_val")
-    columns.str_val[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_str_val"), columns.at_str_val, node_blank.str_val)
 }
 pub fn node_name(id: Int) -> Str {
-    let i = checked_node_id(id, "node_name")
-    columns.name[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_name"), columns.at_name, node_blank.name)
 }
 pub fn node_op(id: Int) -> Str {
-    let i = checked_node_id(id, "node_op")
-    columns.op[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_op"), columns.at_op, node_blank.op)
 }
 pub fn node_left(id: Int) -> Int {
-    let i = checked_node_id(id, "node_left")
-    columns.left[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_left"), columns.at_left, node_blank.left)
 }
 pub fn node_right(id: Int) -> Int {
-    let i = checked_node_id(id, "node_right")
-    columns.right[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_right"), columns.at_right, node_blank.right)
 }
 pub fn node_body(id: Int) -> Int {
-    let i = checked_node_id(id, "node_body")
-    columns.body[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_body"), columns.at_body, node_blank.body)
 }
 pub fn node_condition(id: Int) -> Int {
-    let i = checked_node_id(id, "node_condition")
-    columns.condition[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_condition"), columns.at_condition, node_blank.condition)
 }
 pub fn node_then_body(id: Int) -> Int {
-    let i = checked_node_id(id, "node_then_body")
-    columns.then_body[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_then_body"), columns.at_then_body, node_blank.then_body)
 }
 pub fn node_else_body(id: Int) -> Int {
-    let i = checked_node_id(id, "node_else_body")
-    columns.else_body[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_else_body"), columns.at_else_body, node_blank.else_body)
 }
 pub fn node_scrutinee(id: Int) -> Int {
-    let i = checked_node_id(id, "node_scrutinee")
-    columns.scrutinee[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_scrutinee"), columns.at_scrutinee, node_blank.scrutinee)
 }
 pub fn node_pattern(id: Int) -> Int {
-    let i = checked_node_id(id, "node_pattern")
-    columns.pattern[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_pattern"), columns.at_pattern, node_blank.pattern)
 }
 pub fn node_guard(id: Int) -> Int {
-    let i = checked_node_id(id, "node_guard")
-    columns.guard[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_guard"), columns.at_guard, node_blank.guard)
 }
 pub fn node_value(id: Int) -> Int {
-    let i = checked_node_id(id, "node_value")
-    columns.value[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_value"), columns.at_value, node_blank.value)
 }
 pub fn node_target(id: Int) -> Int {
-    let i = checked_node_id(id, "node_target")
-    columns.target[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_target"), columns.at_target, node_blank.target)
 }
 pub fn node_iterable(id: Int) -> Int {
-    let i = checked_node_id(id, "node_iterable")
-    columns.iterable[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_iterable"), columns.at_iterable, node_blank.iterable)
 }
 pub fn node_var_name(id: Int) -> Str {
-    let i = checked_node_id(id, "node_var_name")
-    columns.var_name[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_var_name"), columns.at_var_name, node_blank.var_name)
 }
 pub fn node_is_mut(id: Int) -> Int {
-    let i = checked_node_id(id, "node_is_mut")
-    columns.is_mut[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_is_mut"), columns.at_is_mut, node_blank.is_mut)
 }
 pub fn node_is_pub(id: Int) -> Int {
-    let i = checked_node_id(id, "node_is_pub")
-    columns.is_pub[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_is_pub"), columns.at_is_pub, node_blank.is_pub)
 }
 pub fn node_is_const(id: Int) -> Int {
-    let i = checked_node_id(id, "node_is_const")
-    columns.is_const[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_is_const"), columns.at_is_const, node_blank.is_const)
 }
 pub fn node_module(id: Int) -> Str {
-    let i = checked_node_id(id, "node_module")
-    columns.module[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_module"), columns.at_module, node_blank.module)
 }
 pub fn node_inclusive(id: Int) -> Int {
-    let i = checked_node_id(id, "node_inclusive")
-    columns.inclusive[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_inclusive"), columns.at_inclusive, node_blank.inclusive)
 }
 pub fn node_start(id: Int) -> Int {
-    let i = checked_node_id(id, "node_start")
-    columns.start[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_start"), columns.at_start, node_blank.start)
 }
 pub fn node_end(id: Int) -> Int {
-    let i = checked_node_id(id, "node_end")
-    columns.end[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_end"), columns.at_end, node_blank.end)
 }
 pub fn node_obj(id: Int) -> Int {
-    let i = checked_node_id(id, "node_obj")
-    columns.obj[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_obj"), columns.at_obj, node_blank.obj)
 }
 pub fn node_method(id: Int) -> Str {
-    let i = checked_node_id(id, "node_method")
-    columns.method[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_method"), columns.at_method, node_blank.method)
 }
 pub fn node_index(id: Int) -> Int {
-    let i = checked_node_id(id, "node_index")
-    columns.index[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_index"), columns.at_index, node_blank.index)
 }
 pub fn node_return_type(id: Int) -> Str {
-    let i = checked_node_id(id, "node_return_type")
-    columns.return_type[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_return_type"), columns.at_return_type, node_blank.return_type)
 }
 pub fn node_type_name(id: Int) -> Str {
-    let i = checked_node_id(id, "node_type_name")
-    columns.type_name[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_type_name"), columns.at_type_name, node_blank.type_name)
 }
 pub fn node_trait_name(id: Int) -> Str {
-    let i = checked_node_id(id, "node_trait_name")
-    columns.trait_name[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_trait_name"), columns.at_trait_name, node_blank.trait_name)
 }
 pub fn node_params(id: Int) -> Int {
-    let i = checked_node_id(id, "node_params")
-    columns.params[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_params"), columns.at_params, node_blank.params)
 }
 pub fn node_args(id: Int) -> Int {
-    let i = checked_node_id(id, "node_args")
-    columns.args[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_args"), columns.at_args, node_blank.args)
 }
 pub fn node_stmts(id: Int) -> Int {
-    let i = checked_node_id(id, "node_stmts")
-    columns.stmts[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_stmts"), columns.at_stmts, node_blank.stmts)
 }
 pub fn node_arms(id: Int) -> Int {
-    let i = checked_node_id(id, "node_arms")
-    columns.arms[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_arms"), columns.at_arms, node_blank.arms)
 }
 pub fn node_fields(id: Int) -> Int {
-    let i = checked_node_id(id, "node_fields")
-    columns.fields[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_fields"), columns.at_fields, node_blank.fields)
 }
 pub fn node_elements(id: Int) -> Int {
-    let i = checked_node_id(id, "node_elements")
-    columns.elements[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_elements"), columns.at_elements, node_blank.elements)
 }
 pub fn node_for_binder(id: Int) -> Int {
-    let i = checked_node_id(id, "node_for_binder")
-    columns.for_binder[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_for_binder"), columns.at_for_binder, node_blank.for_binder)
 }
 pub fn node_methods(id: Int) -> Int {
-    let i = checked_node_id(id, "node_methods")
-    columns.methods[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_methods"), columns.at_methods, node_blank.methods)
 }
 pub fn node_type_params(id: Int) -> Int {
-    let i = checked_node_id(id, "node_type_params")
-    columns.type_params[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_type_params"), columns.at_type_params, node_blank.type_params)
 }
 pub fn node_effects(id: Int) -> Int {
-    let i = checked_node_id(id, "node_effects")
-    columns.effects[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_effects"), columns.at_effects, node_blank.effects)
 }
 pub fn node_captures(id: Int) -> Int {
-    let i = checked_node_id(id, "node_captures")
-    columns.captures[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_captures"), columns.at_captures, node_blank.captures)
 }
 pub fn node_type_ann(id: Int) -> Int {
-    let i = checked_node_id(id, "node_type_ann")
-    columns.type_ann[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_type_ann"), columns.at_type_ann, node_blank.type_ann)
 }
 pub fn node_handlers(id: Int) -> Int {
-    let i = checked_node_id(id, "node_handlers")
-    columns.handlers[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_handlers"), columns.at_handlers, node_blank.handlers)
 }
 pub fn node_leading_comments(id: Int) -> Str {
-    let i = checked_node_id(id, "node_leading_comments")
-    columns.leading_comments[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_leading_comments"), columns.at_leading_comments, node_blank.leading_comments)
 }
 pub fn node_trailing_comments(id: Int) -> Str {
-    let i = checked_node_id(id, "node_trailing_comments")
-    columns.trailing_comments[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_trailing_comments"), columns.at_trailing_comments, node_blank.trailing_comments)
 }
 pub fn node_doc_comment(id: Int) -> Str {
-    let i = checked_node_id(id, "node_doc_comment")
-    columns.doc_comment[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_doc_comment"), columns.at_doc_comment, node_blank.doc_comment)
 }
 pub fn node_line(id: Int) -> Int {
-    let i = checked_node_id(id, "node_line")
-    columns.line[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_line"), columns.at_line, node_blank.line)
 }
 pub fn node_col(id: Int) -> Int {
-    let i = checked_node_id(id, "node_col")
-    columns.col[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_col"), columns.at_col, node_blank.col)
 }
 pub fn node_end_line(id: Int) -> Int {
-    let i = checked_node_id(id, "node_end_line")
-    columns.end_line[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_end_line"), columns.at_end_line, node_blank.end_line)
 }
 pub fn node_end_col(id: Int) -> Int {
-    let i = checked_node_id(id, "node_end_col")
-    columns.end_col[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_end_col"), columns.at_end_col, node_blank.end_col)
 }
 pub fn node_assoc_types(id: Int) -> Int {
-    let i = checked_node_id(id, "node_assoc_types")
-    columns.assoc_types[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_assoc_types"), columns.at_assoc_types, node_blank.assoc_types)
 }
 pub fn node_impl_binders(id: Int) -> Int {
-    let i = checked_node_id(id, "node_impl_binders")
-    columns.impl_binders[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_impl_binders"), columns.at_impl_binders, node_blank.impl_binders)
 }
 pub fn node_recv_type_args(id: Int) -> Int {
-    let i = checked_node_id(id, "node_recv_type_args")
-    columns.recv_type_args[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_recv_type_args"), columns.at_recv_type_args, node_blank.recv_type_args)
 }
 pub fn node_impl_where_bounds(id: Int) -> Int {
-    let i = checked_node_id(id, "node_impl_where_bounds")
-    columns.impl_where_bounds[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_impl_where_bounds"), columns.at_impl_where_bounds, node_blank.impl_where_bounds)
 }
 pub fn node_supertraits(id: Int) -> Int {
-    let i = checked_node_id(id, "node_supertraits")
-    columns.supertraits[i >> 12][i & 4095]
+    node_get_int(checked_node_id(id, "node_supertraits"), columns.at_supertraits, node_blank.supertraits)
 }
 pub fn node_xfail_reason(id: Int) -> Str {
-    let i = checked_node_id(id, "node_xfail_reason")
-    columns.xfail_reason[i >> 12][i & 4095]
+    node_get_str(checked_node_id(id, "node_xfail_reason"), columns.at_xfail_reason, node_blank.xfail_reason)
 }
 
 // ── Node setter functions ───────────────────────────────────────────
