@@ -1,0 +1,179 @@
+// The argument checks of one call read nothing a previous call left behind, and skip no rule
+// when a call has little to check.
+//
+// What a generic call's earlier arguments fix for its type parameters is the call's own: a
+// second call to the same function starts from nothing. A call with no labels against a
+// signature with no keyword parameters has no keyword rule to break, but a label anywhere,
+// or a keyword parameter in the signature, still brings every keyword rule into play, with
+// or without positional arguments and with no arguments at all.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe_error_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn assert_names(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn first_arg_hints_later_src() -> Str {
+    #"fn first_of[T](a: T, rest: List[T]) -> T { a }
+
+fn main() {
+    io.println("{first_of(1, [])}")
+}
+"#
+}
+
+fn first_arg_fixes_later_src() -> Str {
+    #"fn pick[T](a: T, b: T) -> T { a }
+
+fn main() {
+    io.println("{pick(1, "x")}")
+}
+"#
+}
+
+fn two_instantiations_src() -> Str {
+    #"fn pick[T](a: T, b: T) -> T { a }
+
+fn main() {
+    let n = pick(1, 2)
+    let s = pick("a", "b")
+    io.println("{n} {s}")
+}
+"#
+}
+
+fn keyword_only_src() -> Str {
+    #"fn area(-- width: Int, height: Int) -> Int { width * height }
+
+fn main() {
+    io.println("{area(height: 2, width: 3)}")
+}
+"#
+}
+
+fn no_args_all_defaulted_src() -> Str {
+    #"fn area(-- width: Int = 3, height: Int = 2) -> Int { width * height }
+
+fn main() {
+    io.println("{area()}")
+}
+"#
+}
+
+fn no_args_missing_keyword_src() -> Str {
+    #"fn area(-- width: Int, height: Int = 2) -> Int { width * height }
+
+fn main() {
+    io.println("{area()}")
+}
+"#
+}
+
+fn repeated_label_without_positional_src() -> Str {
+    #"fn area(-- width: Int, height: Int) -> Int { width * height }
+
+fn main() {
+    io.println("{area(width: 1, width: 2, height: 3)}")
+}
+"#
+}
+
+fn label_on_sig_without_keywords_src() -> Str {
+    #"fn double(x: Int) -> Int { x * 2 }
+
+fn main() {
+    io.println("{double(x: 4)}")
+}
+"#
+}
+
+fn generic_with_keyword_src() -> Str {
+    #"fn wrap[T](item: T, -- times: Int) -> List[T] {
+    let mut out: List[T] = []
+    let mut i = 0
+    while i < times {
+        out.push(item)
+        i = i + 1
+    }
+    out
+}
+
+fn main() {
+    let a = wrap(1, times: 2)
+    let b = wrap("x", times: 1)
+    io.println("{a.len()} {b.len()}")
+}
+"#
+}
+
+fn pick[T](a: T, b: T) -> T { a }
+
+fn first_of[T](a: T, rest: List[T]) -> T {
+    if rest.len() > 0 { return rest.get(0).unwrap() }
+    a
+}
+
+test "an earlier argument's type hints a later empty literal" {
+    assert_names("first_of(1, [])", probe_error_names("tc_cbc_hint", first_arg_hints_later_src()), "")
+}
+
+test "an earlier argument's type is the one a later argument is checked against" {
+    let got = probe_error_names("tc_cbc_fixes", first_arg_fixes_later_src())
+    if got == "" { io.println("FAIL: pick(1, \"x\") drew no error") }
+    assert(got != "")
+}
+
+test "a second call to a generic function starts from no bindings" {
+    assert_names("pick twice", probe_error_names("tc_cbc_twice", two_instantiations_src()), "")
+}
+
+test "keyword arguments with no positional argument are accepted in any order" {
+    assert_names("area(height:, width:)", probe_error_names("tc_cbc_kwonly", keyword_only_src()), "")
+}
+
+test "a call with no arguments takes every keyword default" {
+    assert_names("area()", probe_error_names("tc_cbc_dflt", no_args_all_defaulted_src()), "")
+}
+
+test "a call with no arguments still owes a keyword parameter with no default" {
+    assert_names("area() missing width",
+        probe_error_names("tc_cbc_missing", no_args_missing_keyword_src()), "MissingKeywordArg")
+}
+
+test "a repeated label is reported with no positional argument before it" {
+    assert_names("area(width:, width:, height:)",
+        probe_error_names("tc_cbc_dup", repeated_label_without_positional_src()), "DuplicateKeywordArg")
+}
+
+test "a label is reported against a signature that declares no keyword parameter" {
+    assert_names("double(x: 4)",
+        probe_error_names("tc_cbc_nokw", label_on_sig_without_keywords_src()), "InvalidKeywordArg")
+}
+
+test "a generic call with a keyword argument binds afresh each call" {
+    assert_names("wrap twice", probe_error_names("tc_cbc_gkw", generic_with_keyword_src()), "")
+}
+
+test "generic calls give each call its own instantiation when run" {
+    assert(pick(1, 2) == 1)
+    assert(pick("a", "b") == "a")
+    assert(first_of(5, []) == 5)
+    assert(first_of(5, [7]) == 7)
+}

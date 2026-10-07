@@ -4828,6 +4828,10 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     let mut argc = 0
     if args_sl != -1 { argc = sublist_length(args_sl) }
 
+    // With no label in the call and no keyword parameter in the signature, no rule below can
+    // fire. Most calls are that shape, and each would otherwise build a `seen` Map for nothing.
+    if kw_start >= param_count && tc_args_have_label(args_sl, argc) == 0 { return 0 }
+
     let mut seen: Map[Str, Int] = Map()
     let mut first_label = -1
     let mut i = 0
@@ -4911,6 +4915,15 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     0
 }
 
+fn tc_args_have_label(args_sl: Int, argc: Int) -> Int {
+    let mut i = 0
+    while i < argc {
+        if node_kind(sublist_get(args_sl, i)) == NodeKind.NamedArg { return 1 }
+        i = i + 1
+    }
+    0
+}
+
 // Interpolation parts whose value is a `Raw[T]`. §3b.5 gives a Raw exactly one consumer —
 // the `Template[C]` coercion at an argument position — and that coercion is decided after
 // the literal it sits in has been inferred. So a part is recorded here when it is seen and
@@ -4982,9 +4995,12 @@ fn tc_raw_report_unconsumed() ! Diag.Report {
 // writes cumulative inference state that is intended to persist, not roll back.
 @allow(UnrestoredMutation)
 fn check_arg_shapes(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int, call_node: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let no_binds: Map[Str, Int] = Map()
-    check_arg_shapes_with_binds(fn_name, sig, args_sl, self_offset, call_node, no_binds)
+    check_arg_shapes_with_binds(fn_name, sig, args_sl, self_offset, call_node, tc_no_binds)
 }
+
+// One empty binds Map for every call that has none, instead of a new one per call. Only ever
+// read: it reaches substitute_typevar_tid and nothing else.
+let tc_no_binds: Map[Str, Int] = Map()
 
 // Same as check_arg_shapes, but substitutes each param tid through `binds` first.
 // A poly-impl method on List[T] must hint a bare literal from the receiver's
@@ -5022,7 +5038,10 @@ fn check_arg_shapes_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offset
         let mut arg_t = -1
         if pidx >= 0 && pidx < param_count {
             let formal = fnsig_param_list.get(param_start + pidx).unwrap()
-            let ptid = substitute_typevar_tid(substitute_typevar_tid(formal, binds), tc_concrete_binds(seen))
+            // The second substitution is not skipped when nothing is bound: it still resolves
+            // the metavariables in the formal.
+            let concrete = if seen.len() == 0 { tc_no_binds } else { tc_concrete_binds(seen) }
+            let ptid = substitute_typevar_tid(substitute_typevar_tid(formal, binds), concrete)
             if tc_tid_is_no_info(ptid) == 0 { arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid) }
             if arg_t >= 0 { unify_typevar_binds(formal, arg_t, seen) }
         }
