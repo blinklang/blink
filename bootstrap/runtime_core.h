@@ -1440,6 +1440,27 @@ BLINK_RT_FN void* blink_map_get(const blink_map* m, const void* key) {
 }
 #endif
 
+/* The slot that holds key, or -1. A read that must tell absence from a stored 0 tests this
+   and then reads blink_map_slot_value, so it hashes and compares the key once. */
+BLINK_RT_FN int64_t blink_map_find(const blink_map* m, const void* key);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_map_find(const blink_map* m, const void* key) {
+    const blink_kops* k = m->kops;
+    size_t stride = blink_kops_stride(k);
+    int64_t mask = m->cap - 1;
+    uint64_t h = k->hash(key);
+    int64_t idx = (int64_t)(h & (uint64_t)mask);
+    while (m->states[idx] != 0) {
+        if (m->states[idx] == 1) {
+            const void* existing = blink_map_key_slot(m, idx, stride);
+            if (k->eq(existing, key)) return idx;
+        }
+        idx = (idx + 1) & mask;
+    }
+    return -1;
+}
+#endif
+
 BLINK_RT_FN int64_t blink_map_has(const blink_map* m, const void* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_map_has(const blink_map* m, const void* key) {

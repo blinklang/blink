@@ -1,0 +1,92 @@
+// A Map read hashes its key and walks the probe chain once. The runtime answers the slot the
+// key sits in, or -1 when it holds no such key, and both the present test and the value read
+// come from that one answer. A present test followed by a value read would hash and compare
+// the same key twice, and a value read alone cannot say "absent": a slot holding 0 is the
+// same word the runtime would answer for a key it does not hold.
+
+import lower_test_helpers.{probe, rhs_of, assert_eq_str, assert_verifies}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import cg_print.{print_reset, print_take, print_expr, print_stmt}
+import cg_promote.{cg_promote_reset, cg_promote_print_walkers}
+import diagnostics.{Diag}
+import std.io
+
+fn count_of(text: Str, needle: Str) -> Int { text.split(needle).len() - 1 }
+
+// Every probe of the table the C makes, by entry point.
+fn assert_one_find(label: Str, text: Str) {
+    let finds = count_of(text, "blink_map_find(")
+    let has = count_of(text, "blink_map_has(")
+    let gets = count_of(text, "blink_map_get(")
+    if finds != 1 || has != 0 || gets != 0 {
+        io.println("FAIL: {label}: find {finds}, has {has}, get {gets} in:\n{text}")
+    }
+    assert_eq(finds, 1)
+    assert_eq(has, 0)
+    assert_eq(gets, 0)
+}
+
+// The C of one read: the statements it hoists, then the expression that answers it.
+fn read_c(anchor: Str) -> Str ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(anchor))
+    let stmts = cg_expr_take_pending(mark)
+    assert_verifies(anchor, built)
+    print_reset()
+    for s in stmts { print_stmt(s) }
+    let hoisted = print_take()
+    let answer = print_expr(built)
+    "{hoisted}\n{answer}"
+}
+
+test "a map read through a Str key probes the table once" {
+    probe("one_probe_str", #"fn main() {
+    let m: Map[Str, Int] = Map.new()
+    let v = m.get("k")
+}
+"#)
+    let text = read_c("v")
+    assert_one_find("Str key", text)
+    // The value comes out of the slot the lookup answered, not out of a second lookup.
+    assert(text.contains("blink_map_slot_value("))
+}
+
+test "a map read through a struct key probes the table once" {
+    probe("one_probe_struct", #"@derive(Hash)
+type Point { x: Int  y: Int }
+
+fn main() {
+    let m: Map[Point, Str] = Map.new()
+    let v = m.get(Point { x: 1, y: 2 })
+}
+"#)
+    assert_one_find("struct key", read_c("v"))
+}
+
+test "a map read under ?? probes the table once" {
+    probe("one_probe_default", #"fn main() {
+    let m: Map[Int, Int] = Map.new()
+    let v = m.get(3) ?? 0
+}
+"#)
+    assert_one_find("??", read_c("v"))
+}
+
+// Equality looks each key of the left map up in the right one and compares the values. The
+// lookup that says the key is there is also the one the right value is read through.
+test "map equality probes the right map once per key" {
+    probe("one_probe_eq", #"fn main() {
+    let a: Map[Str, Int] = Map.new()
+    let b: Map[Str, Int] = Map.new()
+    let same = a == b
+}
+"#)
+    cg_promote_reset()
+    let built = lower_expr(rhs_of("same"))
+    assert(built >= 0)
+    print_reset()
+    cg_promote_print_walkers()
+    let text = print_take()
+    assert_one_find("equality", text)
+    assert(text.contains("blink_map_slot_value("))
+}
