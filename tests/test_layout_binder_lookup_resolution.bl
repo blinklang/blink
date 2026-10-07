@@ -1,0 +1,173 @@
+// How a name resolves through the binder frames.
+//
+// The innermost frame on the scope's chain that binds the name wins, and within one frame
+// the newest entry wins. A frame that is not on the chain is never seen, however new its
+// entry is, and a scope whose frame is gone answers nothing.
+
+import std.io
+import layout.{
+    BinderMut, bind_binder, bind_binder_cell, bind_binder_mut, binder_is_celled,
+    binder_mutability_of, binder_scope_pop, binder_scope_push, layout_reset, tid_of_binder,
+}
+
+// Layout stores a binder's tid without reading it, so distinct numbers stand in for types.
+// The typecheck TYPE_ constants are -1 until a check runs, which is also "no entry".
+let TYPE_INT = 10
+let TYPE_STR = 20
+let TYPE_BOOL = 30
+let TYPE_FLOAT = 40
+
+fn assert_tid(label: Str, scope: Int, name: Str, want: Int) {
+    let got = tid_of_binder(scope, name)
+    if got != want {
+        io.println("FAIL: {label}: got {got} want {want}")
+    }
+    assert_eq(got, want)
+}
+
+test "a second bind of a name in the same frame shadows the first" {
+    layout_reset()
+    let s = binder_scope_push()
+    bind_binder(s, "x", TYPE_INT)
+    bind_binder(s, "y", TYPE_BOOL)
+    bind_binder(s, "x", TYPE_STR)
+    assert_tid("newest in frame", s, "x", TYPE_STR)
+    assert_tid("other name", s, "y", TYPE_BOOL)
+    binder_scope_pop()
+}
+
+test "a child frame shadows its parent, and the parent still sees its own" {
+    layout_reset()
+    let outer = binder_scope_push()
+    bind_binder(outer, "x", TYPE_INT)
+    let inner = binder_scope_push()
+    bind_binder(inner, "x", TYPE_STR)
+    assert_tid("inner", inner, "x", TYPE_STR)
+    assert_tid("outer while inner is open", outer, "x", TYPE_INT)
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "a name bound in an outer frame is seen from every frame inside it" {
+    layout_reset()
+    let a = binder_scope_push()
+    bind_binder(a, "far", TYPE_INT)
+    let b = binder_scope_push()
+    bind_binder(b, "near", TYPE_BOOL)
+    let c = binder_scope_push()
+    assert_tid("two frames up", c, "far", TYPE_INT)
+    assert_tid("one frame up", c, "near", TYPE_BOOL)
+    assert_tid("not on the chain", b, "absent", -1)
+    binder_scope_pop()
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "popping a frame gives the name back to the binder it shadowed" {
+    layout_reset()
+    let outer = binder_scope_push()
+    bind_binder(outer, "x", TYPE_INT)
+    let inner = binder_scope_push()
+    bind_binder(inner, "x", TYPE_STR)
+    bind_binder(inner, "x", TYPE_BOOL)
+    bind_binder(inner, "only_inner", TYPE_FLOAT)
+    binder_scope_pop()
+    assert_tid("restored", outer, "x", TYPE_INT)
+    assert_tid("gone with its frame", outer, "only_inner", -1)
+    let again = binder_scope_push()
+    assert_tid("a new sibling sees the outer binder", again, "x", TYPE_INT)
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "an innermost frame wins over a newer entry in an outer frame" {
+    // The outer entry is bound after the inner one, so newest-first alone would pick it.
+    layout_reset()
+    let outer = binder_scope_push()
+    let inner = binder_scope_push()
+    bind_binder(inner, "x", TYPE_STR)
+    bind_binder(outer, "x", TYPE_INT)
+    assert_tid("innermost first", inner, "x", TYPE_STR)
+    assert_tid("outer reads its own", outer, "x", TYPE_INT)
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "a sibling frame's entry is not on the chain" {
+    layout_reset()
+    let root = binder_scope_push()
+    bind_binder(root, "x", TYPE_INT)
+    let left = binder_scope_push()
+    bind_binder(left, "x", TYPE_STR)
+    binder_scope_pop()
+    let right = binder_scope_push()
+    assert_tid("sibling", right, "x", TYPE_INT)
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "a scope whose frame is gone answers nothing, even for a name its parent binds" {
+    layout_reset()
+    let outer = binder_scope_push()
+    bind_binder(outer, "x", TYPE_INT)
+    let inner = binder_scope_push()
+    bind_binder(inner, "y", TYPE_STR)
+    binder_scope_pop()
+    assert_tid("dead scope, parent name", inner, "x", -1)
+    assert_tid("dead scope, own name", inner, "y", -1)
+    let later = binder_scope_push()
+    bind_binder(later, "y", TYPE_BOOL)
+    assert_tid("dead scope after a new frame binds its name", inner, "y", -1)
+    assert_tid("no such scope", 9999, "x", -1)
+    assert_tid("negative scope", -1, "x", -1)
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "the type, the mutability and the cell come off the same entry" {
+    layout_reset()
+    let outer = binder_scope_push()
+    bind_binder_cell(outer, "n", TYPE_INT)
+    let inner = binder_scope_push()
+    bind_binder_mut(inner, "n", TYPE_STR, false)
+    assert_tid("inner tid", inner, "n", TYPE_STR)
+    assert(binder_mutability_of(inner, "n") == BinderMut.Immutable)
+    assert(!binder_is_celled(inner, "n"))
+    assert_tid("outer tid", outer, "n", TYPE_INT)
+    assert(binder_mutability_of(outer, "n") == BinderMut.Mutable)
+    assert(binder_is_celled(outer, "n"))
+    binder_scope_pop()
+    assert(binder_is_celled(outer, "n"))
+    binder_scope_pop()
+}
+
+test "a reset forgets every name bound before it" {
+    layout_reset()
+    let s = binder_scope_push()
+    bind_binder(s, "x", TYPE_INT)
+    layout_reset()
+    let fresh = binder_scope_push()
+    assert_eq(fresh, s)
+    assert_tid("after reset", fresh, "x", -1)
+    bind_binder(fresh, "x", TYPE_STR)
+    assert_tid("rebound after reset", fresh, "x", TYPE_STR)
+    binder_scope_pop()
+}
+
+test "each of many names in one frame resolves to its own entry" {
+    layout_reset()
+    let s = binder_scope_push()
+    let mut i = 0
+    while i < 300 {
+        bind_binder(s, "v{i}", 100 + i)
+        i = i + 1
+    }
+    let inner = binder_scope_push()
+    i = 0
+    while i < 300 {
+        assert_tid("many", inner, "v{i}", 100 + i)
+        i = i + 1
+    }
+    binder_scope_pop()
+    binder_scope_pop()
+}
