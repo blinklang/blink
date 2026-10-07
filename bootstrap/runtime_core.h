@@ -1025,6 +1025,43 @@ BLINK_RT_FN blink_list* blink_list_new_atomic(void) {
 }
 #endif
 
+/* List.with_capacity(n). n <= 0 is new(): the spec gives every with_capacity constructor
+   that rule, and a cap of 0 would never grow, since push doubles it. An n whose byte count
+   does not fit in an int64_t takes the out-of-memory exit rather than wrapping to a small block. */
+BLINK_RT_FN void blink_list_capacity_oom(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_list_capacity_oom(void) {
+    fprintf(stderr, "blink: out of memory\n");
+    exit(1);
+}
+#endif
+
+BLINK_RT_FN blink_list* blink_list_with_capacity(int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_list_with_capacity(int64_t n) {
+    if (n <= 0) return blink_list_new();
+    if (n > INT64_MAX / (int64_t)sizeof(void*)) blink_list_capacity_oom();
+    blink_list* l = (blink_list*)blink_alloc(sizeof(blink_list));
+    l->cap = n;
+    l->len = 0;
+    l->items = (void**)blink_alloc((int64_t)sizeof(void*) * n);
+    return l;
+}
+#endif
+
+BLINK_RT_FN blink_list* blink_list_with_capacity_atomic(int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_list* blink_list_with_capacity_atomic(int64_t n) {
+    if (n <= 0) return blink_list_new_atomic();
+    if (n > INT64_MAX / (int64_t)sizeof(void*)) blink_list_capacity_oom();
+    blink_list* l = (blink_list*)blink_alloc(sizeof(blink_list));
+    l->cap = n;
+    l->len = 0;
+    l->items = (void**)blink_alloc_atomic((int64_t)sizeof(void*) * n);
+    return l;
+}
+#endif
+
 BLINK_RT_FN void blink_list_push(blink_list* l, void* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_list_push(blink_list* l, void* item) {
@@ -1062,6 +1099,10 @@ static inline int blink_list_in_bounds(const blink_list* l, int64_t index) {
 
 static inline int64_t blink_list_len(const blink_list* l) {
     return l->len;
+}
+
+static inline int64_t blink_list_capacity(const blink_list* l) {
+    return l->cap;
 }
 
 BLINK_RT_FN void blink_list_set(blink_list* l, int64_t index, void* item);
@@ -2428,6 +2469,7 @@ BLINK_RT_FN blink_sb* blink_sb_new(void) {
 BLINK_RT_FN blink_sb* blink_sb_with_capacity(int64_t cap);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_sb* blink_sb_with_capacity(int64_t cap) {
+    if (cap <= 0) return blink_sb_new();
     if (cap < 16) cap = 16;
     blink_sb* sb = (blink_sb*)blink_alloc(sizeof(blink_sb));
     sb->cap = cap;
