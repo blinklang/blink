@@ -3606,11 +3606,11 @@ fn tc_tuple_tid_references_enum(tup_rtid: Int, enum_tid: Int) -> Int {
 
 fn lookup_fnsig(name: Str) -> Int {
     if nr_current_module != "" {
-        let qualified = "{nr_current_module}:{name}"
-        match fnsig_map.get(qualified) {
-            Some(v) => return v
-            None => {}
+        let own = match nr_module_names.get(nr_current_module) {
+            Some(r) => r.sigs.get(name) ?? -1
+            None => -1
         }
+        if own != -1 { return own }
     }
     fnsig_map.get(name) ?? -1
 }
@@ -9186,7 +9186,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     fnsig_by_decl.insert(fn_node, sig_idx)
     let fn_mod = node_module(fn_node)
     if fn_mod != "" {
-        fnsig_map.insert("{fn_mod}:{name}", sig_idx)
+        nr_module_names_of(fn_mod).sigs.insert(name, sig_idx)
     }
     let start = fnsig_param_list.len()
 
@@ -11175,6 +11175,9 @@ fn init_types() ! TypeCheck.Register {
     fnsig_pool.clear()
     fnsig_by_decl.clear()
     fnsig_map.clear()
+    for mod_name in nr_module_names.keys() {
+        nr_module_names_of(mod_name).sigs.clear()
+    }
     fnsig_param_list.clear()
     fnsig_param_names.clear()
     fnsig_param_kw.clear()
@@ -11970,8 +11973,9 @@ pub fn is_user_effect_handle_name(name: Str) -> Int {
 // ── Selective import filtering ──────────────────────────────────────
 // consuming_mod → source_mod → the import node, or -1 for a whole-module import. Keyed by
 // the consuming module first, since a lookup by bare name asks for one module's imports.
-// The driver fills it while it resolves imports; the checks that read it live here.
-pub let mut per_module_imports: Map[Str, Map[Str, Int]] = Map()
+// The driver fills it through record_module_import while it resolves imports; the checks that
+// read it live here.
+let mut per_module_imports: Map[Str, Map[Str, Int]] = Map()
 pub let mut tc_import_modules: List[Str] = []
 pub let mut tc_import_qualifiers: List[Str] = []
 pub let mut tc_import_nodes: List[Int] = []
@@ -11980,7 +11984,14 @@ let mut tc_qualifier_to_module: Map[Str, Str] = Map()
 let mut tc_import_modules_idx: Map[Str, Int] = Map()
 let mut tc_import_qualifiers_set: Map[Str, Int] = Map()
 
+// One name a selective import selects: the module it is selected from and its spelling there.
+type ImportBinding {
+    source_mod: Str
+    member: Str
+}
+
 pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int) {
+    nr_drop_import_index(consuming_mod)
     match per_module_imports.get(consuming_mod) {
         Some(imports) => imports.insert(source_mod, imp_node)
         None => {
@@ -11989,6 +12000,56 @@ pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int) 
             per_module_imports.insert(consuming_mod, imports)
         }
     }
+}
+
+pub fn clear_module_imports() {
+    per_module_imports.clear()
+    for mod_name in nr_module_names.keys() {
+        nr_drop_import_index(mod_name)
+    }
+}
+
+// The index is derived from per_module_imports[consuming_mod] alone, so a change to that one
+// import list is all that makes it stale.
+fn nr_drop_import_index(consuming_mod: Str) {
+    match nr_module_names.get(consuming_mod) {
+        Some(r) => {
+            if r.imports_built {
+                r.imports.clear()
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, imports_built: false })
+            }
+        }
+        None => {}
+    }
+}
+
+fn nr_module_import_index(consuming_mod: Str) -> Map[Str, List[ImportBinding]] {
+    let r = nr_module_names_of(consuming_mod)
+    if r.imports_built { return r.imports }
+    let mut idx = r.imports
+    match per_module_imports.get(consuming_mod) {
+        Some(imports) => {
+            for source_mod in imports.keys() {
+                let imp_node = imports.get(source_mod) ?? -1
+                if imp_node == -1 { continue }
+                let names_sl = node_args(imp_node)
+                if names_sl == -1 { continue }
+                let mut i = 0
+                while i < sublist_length(names_sl) {
+                    let name_node = sublist_get(names_sl, i)
+                    let alias = node_str_val(name_node)
+                    let bound = if alias != "" { alias } else { node_name(name_node) }
+                    let mut binds = idx.get(bound) ?? []
+                    binds.push(ImportBinding { source_mod: source_mod, member: node_name(name_node) })
+                    idx.insert(bound, binds)
+                    i = i + 1
+                }
+            }
+        }
+        None => {}
+    }
+    nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, imports_built: true })
+    idx
 }
 
 fn module_import(consuming_mod: Str, source_mod: Str) -> Option[Int] {
@@ -12218,9 +12279,22 @@ pub fn tc_qualifier_to_module_or_self(qualifier: Str) -> Str {
 fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
     if is_builtin_name(name) != 0 { return 0 }
+    nr_check_selective_access_at(name, node, nr_top_index(name))
+}
+
+// nr_check_selective_access for a binding already looked up; `idx` is -1 when nothing binds
+// the name.
+fn nr_check_selective_access_at(name: Str, node: Int, idx: Int) -> Int ! Diag.Report {
+    if nr_current_module == "" { return 0 }
+    if is_builtin_name(name) != 0 { return 0 }
     // A local binding holds a value, not a declaration some module exported. It may be spelled
     // like an exported name, and an import list has nothing to say about a local.
-    if nr_name_top.contains_key(name) && nr_top_binding_is_global(name) == 0 { return 0 }
+    if idx != -1 && nr_index_is_global(idx) == 0 { return 0 }
+    nr_check_selective_import(name, node)
+}
+
+// The import-list half of nr_check_selective_access, for a name no local binding holds.
+fn nr_check_selective_import(name: Str, node: Int) -> Int ! Diag.Report {
     if nr_module_declares(nr_current_module, name) != 0 { return 0 }
     // A namesake type is in scope when this module's import list selects one declaration of
     // it; the last-writer symbol table below knows only one module for the name.
@@ -12252,23 +12326,65 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
 let mut nr_private_imports: Map[Str, Str] = Map()
 let mut nr_current_module: Str = ""
 let mut nr_name_source_module: Map[Str, Str] = Map()
-// Every top-level declaration, keyed "module|name" and holding the declaration node. A
-// module's own declaration is what its bare name means, whatever other loaded modules
-// declare under the same spelling.
-let mut nr_module_decls: Map[Str, Int] = Map()
+// What one module's bare names mean inside it. Filed by module and then by bare name because
+// name resolution asks these per name reference, and building a "module|name" key there cost
+// an allocation and a hash of the longer key on each question. Each table keeps the lifetime
+// it had on its own: init_types clears `sigs`, resolve_names clears `decls`, and `imports` is
+// dropped whenever the module's import list changes.
+type ModuleNames {
+    // Every top-level declaration of the module, holding the declaration node. A module's own
+    // declaration is what its bare name means, whatever other loaded modules declare under the
+    // same spelling.
+    decls: Map[Str, Int]
+    // The signature index of each function the module registers. lookup_fnsig asks the current
+    // module before the bare-name table, which a namesake in another module may hold.
+    sigs: Map[Str, Int]
+    // per_module_imports of the module turned inside out: the spelling an import binds (the
+    // alias of a renaming import, or else the selected name) → every selection that binds it.
+    // nr_resolve_imported_decl runs for each bare name a module reads that it does not declare,
+    // and walking every name of every import list there was the cost of that question. Built
+    // on first use; meaningless while imports_built is false.
+    imports: Map[Str, List[ImportBinding]]
+    imports_built: Bool
+}
+let mut nr_module_names: Map[Str, ModuleNames] = Map()
 // The same declarations gathered by bare name, so a caller can see every module that spells
 // it and let its own import list choose between them.
 let mut nr_decls_by_name: Map[Str, List[Int]] = Map()
 
+// The record of `mod_name`, created empty on first use. Its maps are shared with the stored
+// record, so a caller fills them in place.
+fn nr_module_names_of(mod_name: Str) -> ModuleNames {
+    match nr_module_names.get(mod_name) {
+        Some(r) => r
+        None => {
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), imports_built: false }
+            nr_module_names.insert(mod_name, r)
+            r
+        }
+    }
+}
+
+// The declaration `mod_name` itself makes under `name`, or -1.
+fn nr_module_decl(mod_name: Str, name: Str) -> Int {
+    match nr_module_names.get(mod_name) {
+        Some(r) => r.decls.get(name) ?? -1
+        None => -1
+    }
+}
+
 fn nr_record_decl(name: Str, mod_name: Str, decl_node: Int) {
-    nr_module_decls.insert("{mod_name}|{name}", decl_node)
+    nr_module_names_of(mod_name).decls.insert(name, decl_node)
     let mut seen = nr_decls_by_name.get(name) ?? []
     seen.push(decl_node)
     nr_decls_by_name.insert(name, seen)
 }
 
 fn nr_module_declares(mod_name: Str, name: Str) -> Int {
-    if nr_module_decls.contains_key("{mod_name}|{name}") { 1 } else { 0 }
+    match nr_module_names.get(mod_name) {
+        Some(r) => if r.decls.contains_key(name) { 1 } else { 0 }
+        None => 0
+    }
 }
 
 // ── The declaration a call resolved to ──────────────────────────────
@@ -12358,8 +12474,14 @@ pub fn tc_ident_binder_node(ident_node: Int) -> Int {
 }
 
 fn nr_note_local_binder(ident_node: Int, name: Str) {
-    if nr_top_binding_is_global(name) != 0 { return }
-    let binder = nr_binding_node(name)
+    nr_note_local_binder_at(ident_node, nr_top_index(name))
+}
+
+// nr_note_local_binder for a binding already looked up; `idx` is -1 when nothing binds the name.
+fn nr_note_local_binder_at(ident_node: Int, idx: Int) {
+    if idx == -1 { return }
+    if nr_index_is_global(idx) != 0 { return }
+    let binder = nr_scope_nodes.get(idx).unwrap()
     if binder < 0 { return }
     tc_local_binder.insert(ident_node, binder)
 }
@@ -12401,31 +12523,18 @@ fn tc_check_namesake_import_ambiguity() ! Diag.Report {
 fn nr_resolve_imported_decl(name: Str, consuming_mod: Str) -> Int {
     if name == "" { return -1 }
     if consuming_mod == "" { return -1 }
-    let imports = match per_module_imports.get(consuming_mod) {
-        Some(m) => m
+    let binds = match nr_module_import_index(consuming_mod).get(name) {
+        Some(b) => b
         None => return -1
     }
     // The answer does not depend on the order the imports are visited in: a second hit
     // either names the declaration already found or settles nothing.
     let mut found = -1
-    for source_mod in imports.keys() {
-        let imp_node = imports.get(source_mod) ?? -1
-        if imp_node == -1 { continue }
-        let names_sl = node_args(imp_node)
-        if names_sl == -1 { continue }
-        let mut i = 0
-        while i < sublist_length(names_sl) {
-            let name_node = sublist_get(names_sl, i)
-            let alias = node_str_val(name_node)
-            let bound = if alias != "" { alias } else { node_name(name_node) }
-            if bound == name {
-                let hit = nr_resolve_decl_in_module(source_mod, node_name(name_node), 0)
-                // Two imports binding one spelling to different declarations settle nothing.
-                if hit != -1 && found != -1 && hit != found { return -1 }
-                if hit != -1 { found = hit }
-            }
-            i = i + 1
-        }
+    for b in binds {
+        let hit = nr_resolve_decl_in_module(b.source_mod, b.member, 0)
+        // Two imports binding one spelling to different declarations settle nothing.
+        if hit != -1 && found != -1 && hit != found { return -1 }
+        if hit != -1 { found = hit }
     }
     found
 }
@@ -12485,7 +12594,7 @@ fn nr_same_named_arm(td: Int, name: Str) -> Int {
 // it. A facade module holds no declaration of its own: the re-export makes the name reachable
 // under the facade's qualifier while the declaration stays in the module that wrote it.
 fn nr_resolve_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
-    let direct = nr_module_decls.get("{target}|{member}") ?? -1
+    let direct = nr_module_decl(target, member)
     if direct != -1 { return direct }
     if depth >= 8 { return -1 }
     match tc_reexport_source.get("{target}:{member}") {
@@ -12820,27 +12929,39 @@ fn nr_define_typed(name: Str, is_mut: Int, tid: Int, node: Int) {
 fn nr_is_defined(name: Str) -> Int {
     match nr_name_top.get(name) {
         Some(i) => {
-            nr_scope_reads.set(i, 1)
-            // If the read happens inside a closure body, the capture may be
-            // observed on a later call — don't let subsequent writes in the
-            // enclosing scope cancel this read (W0601 false positive).
-            if nr_in_closure_depth > 0 {
-                // Only mark entries in enclosing scopes (outside the closure
-                // frame) as captured. Locals inside the closure are walked
-                // the normal way.
-                let mut frame_start = 0
-                if nr_scope_frames.len() > 0 {
-                    frame_start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
-                }
-                if i < frame_start {
-                    nr_scope_captured.set(i, 1)
-                }
-            }
+            nr_mark_read_at(i)
             return 1
         }
         None => {}
     }
     0
+}
+
+// The scope index of `name`'s current top binding, or -1 when nothing binds it. A reference
+// that asks several questions of its binding looks the name up once here and asks the rest by
+// index, since each lookup by name hashes and compares the whole spelling again.
+fn nr_top_index(name: Str) -> Int {
+    nr_name_top.get(name) ?? -1
+}
+
+// nr_is_defined's side effects for a binding already looked up.
+fn nr_mark_read_at(i: Int) {
+    nr_scope_reads.set(i, 1)
+    // If the read happens inside a closure body, the capture may be
+    // observed on a later call — don't let subsequent writes in the
+    // enclosing scope cancel this read (W0601 false positive).
+    if nr_in_closure_depth > 0 {
+        // Only mark entries in enclosing scopes (outside the closure
+        // frame) as captured. Locals inside the closure are walked
+        // the normal way.
+        let mut frame_start = 0
+        if nr_scope_frames.len() > 0 {
+            frame_start = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
+        }
+        if i < frame_start {
+            nr_scope_captured.set(i, 1)
+        }
+    }
 }
 
 // Does `name` have ANY binding in scope right now? nr_is_defined's answer without
@@ -12862,10 +12983,13 @@ fn nr_has_binding(name: Str) -> Int {
 // E1003 must not fire. Pure inspection — must not call
 // nr_is_defined (which has read/capture side effects).
 fn nr_top_binding_is_global(name: Str) -> Int {
-    let idx = match nr_name_top.get(name) {
-        Some(i) => i
-        None => return 0
-    }
+    let idx = nr_top_index(name)
+    if idx == -1 { return 0 }
+    nr_index_is_global(idx)
+}
+
+// nr_top_binding_is_global for a binding already looked up.
+fn nr_index_is_global(idx: Int) -> Int {
     if nr_scope_frames.len() < 2 {
         return 1
     }
@@ -14311,7 +14435,9 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_bh_context = Map()
     nr_private_imports = Map()
     nr_name_source_module = Map()
-    nr_module_decls = Map()
+    for mod_name in nr_module_names.keys() {
+        nr_module_names_of(mod_name).decls.clear()
+    }
     nr_decls_by_name = Map()
     tc_call_decl = Map()
     tc_global_read_decl = Map()
@@ -14462,7 +14588,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             // rule that picks between them. They also need one C symbol between them, so
             // whichever loses it cannot be spelled at all. Functions register before
             // bindings in this pass, so the function is already on record here.
-            let prior = nr_module_decls.get("{mod_name}|{l_name}") ?? -1
+            let prior = nr_module_decl(mod_name, l_name)
             if prior >= 0 && nk_of(node_kind(prior)) == NodeKind.FnDef {
                 diag_error_at("DuplicateModuleBinding", DUPLICATE_MODULE_BINDING,
                     "module-level binding `{l_name}` has the name of a function this module declares", l,
@@ -15196,17 +15322,20 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" || name == "None" { return }
-        if nr_is_defined(name) != 0 {
-            if nr_check_selective_access(name, node) != 0 { return }
-            nr_note_local_binder(node, name)
-            if nr_top_binding_is_global(name) != 0 && is_private_access(name) != 0 {
+        let top = nr_top_index(name)
+        if top != -1 {
+            nr_mark_read_at(top)
+            if nr_check_selective_access_at(name, node, top) != 0 { return }
+            nr_note_local_binder_at(node, top)
+            let global = nr_index_is_global(top) != 0
+            if global && is_private_access(name) != 0 {
                 tc_errors.push("cannot access private item `{name}`")
                 diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item `{name}` from another module", node, "mark the item as `pub` in its module")
                 return
             }
             // A local binder of the same spelling holds a value, not a declaration, so a
             // read through it names no global.
-            if nr_top_binding_is_global(name) != 0 {
+            if global {
                 let decl = nr_resolve_bare_decl(name, nr_current_module)
                 nr_note_global_decl(node, decl)
                 nr_note_fn_value_decl(node, decl)
@@ -15285,14 +15414,18 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             nr_check_call_type_args(node)
             if callee_kind == NodeKind.Ident {
                 let fn_name = node_name(callee)
-                if nr_check_selective_access(fn_name, node) == 0 {
+                let top = nr_top_index(fn_name)
+                if nr_check_selective_access_at(fn_name, node, top) == 0 {
                     // A call through a local closure reads that binding like any other
                     // read, and the escape pass follows it to what the closure captures.
-                    nr_note_local_binder(callee, fn_name)
-                    if nr_is_defined(fn_name) != 0 && nr_top_binding_is_global(fn_name) != 0 && is_private_access(fn_name) != 0 {
+                    nr_note_local_binder_at(callee, top)
+                    let defined = top != -1
+                    if defined { nr_mark_read_at(top) }
+                    let global = defined && nr_index_is_global(top) != 0
+                    if global && is_private_access(fn_name) != 0 {
                         tc_errors.push("cannot access private function `{fn_name}`")
                         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{fn_name}` from another module", node, "mark the function as `pub` in its module")
-                    } else if nr_is_defined(fn_name) == 0 && is_variant_name(fn_name) != 0 && is_private_access(fn_name) != 0 {
+                    } else if !defined && is_variant_name(fn_name) != 0 && is_private_access(fn_name) != 0 {
                         tc_errors.push("cannot access private variant `{fn_name}`")
                         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{fn_name}` from another module", node, "mark the enum as `pub` in its module")
                     } else if nr_is_unimported_prelude_free_fn(fn_name) != 0 {
@@ -15303,7 +15436,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_type_args_unresolved.insert(node, 1)
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, tc_no_call_form_repair(fn_name))
-                    } else if nr_is_defined(fn_name) == 0 && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
+                    } else if !defined && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "")
                     } else {
@@ -15311,7 +15444,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     }
                     // A local binding of the same spelling holds a value, not a declaration,
                     // so a call through it is a call through a closure and records nothing.
-                    if nr_top_binding_is_global(fn_name) != 0 || nr_is_defined(fn_name) == 0 {
+                    if global || !defined {
                         nr_note_call_decl(node, nr_resolve_bare_call_decl(fn_name, nr_current_module))
                     }
                 }
@@ -17407,7 +17540,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let name = node_name(node)
         if name == "true" || name == "false" { return TYPE_BOOL }
         if name == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
-        let vt = nr_get_type(name)
+        let top = nr_top_index(name)
+        let vt = if top != -1 { nr_scope_types.get(top).unwrap() } else { -1 }
         if tc_tid_is_no_info(vt) == 0 { return vt }
         if is_variant_name(name) != 0 {
             let vdecl = tc_variant_enum_decl_node(name)
@@ -17434,7 +17568,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // the name-resolution walk registers a local before anything types it, and reads types as
         // it goes. Answering from the function table there types a shadowing local as the
         // function it shadows.
-        if nr_has_binding(name) != 0 && nr_top_binding_is_global(name) == 0 { return -1 }
+        if top != -1 && nr_index_is_global(top) == 0 { return -1 }
         let fn_sig = lookup_fnsig(name)
         if fn_sig != -1 {
             let fs = fnsig_pool.get(fn_sig).unwrap()
@@ -24228,9 +24362,9 @@ pub fn tc_name_position_child(n: Int) -> Int {
 fn tc_record_name_position_value(n: Int) {
     let c = tc_name_position_child(n)
     if c == -1 { return }
-    let nm = node_name(c)
-    if nr_has_binding(nm) == 0 { return }
-    if nr_top_binding_is_global(nm) != 0 { return }
+    let top = nr_top_index(node_name(c))
+    if top == -1 { return }
+    if nr_index_is_global(top) != 0 { return }
     if c >= tc_name_position_is_value.len() { return }
     tc_name_position_is_value.set(c, 1)
 }
