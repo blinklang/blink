@@ -560,17 +560,16 @@ BLINK_RT_FN void* blink_alloc_shared(int64_t size) {
 }
 #endif
 
-/* Arena-aware realloc. When a `with arena` block is active, GC_REALLOC on
-   an interior pointer into a GC_MALLOC_ATOMIC arena chunk will free the
-   whole chunk out from under us and crash on arena destroy. Allocate fresh
-   inside the arena and copy instead; the old buffer is reclaimed wholesale
-   on arena tear-down. Outside an arena, fall back to GC_REALLOC. */
-BLINK_RT_FN void* blink_realloc(void* ptr, int64_t old_size, int64_t new_size);
+/* Arena-aware realloc. ptr must be owned by owner: an arena, or the GC heap
+   when owner is NULL. GC_REALLOC on an interior pointer into an arena chunk
+   would free the whole chunk out from under us and crash on arena destroy.
+   So in an arena, allocate fresh and copy; the old buffer is reclaimed
+   wholesale on arena tear-down. */
+BLINK_RT_FN void* blink_realloc_in(blink_arena_t* owner, void* ptr, int64_t old_size, int64_t new_size);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void* blink_realloc(void* ptr, int64_t old_size, int64_t new_size) {
-    blink_arena_t* a = __blink_current_arena;
-    if (a != NULL) {
-        void* np = blink_arena_alloc(a, new_size);
+BLINK_RT_FN void* blink_realloc_in(blink_arena_t* owner, void* ptr, int64_t old_size, int64_t new_size) {
+    if (owner != NULL) {
+        void* np = blink_arena_alloc(owner, new_size);
         if (ptr && old_size > 0) {
             int64_t copy = old_size < new_size ? old_size : new_size;
             memcpy(np, ptr, (size_t)copy);
@@ -578,6 +577,40 @@ BLINK_RT_FN void* blink_realloc(void* ptr, int64_t old_size, int64_t new_size) {
         return np;
     }
     void* p = GC_REALLOC(ptr, (size_t)new_size);
+    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    return p;
+}
+#endif
+
+/* For a buffer made in this same call, so the active arena owns it. A container
+   outlives the call and may grow under another arena: it uses blink_realloc_in
+   with its owner. */
+BLINK_RT_FN void* blink_realloc(void* ptr, int64_t old_size, int64_t new_size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_realloc(void* ptr, int64_t old_size, int64_t new_size) {
+    return blink_realloc_in(__blink_current_arena, ptr, old_size, new_size);
+}
+#endif
+
+/* Allocation in a named arena, or on the GC heap when owner is NULL, whatever
+   arena is active. A container grows here, in the allocator that owns it: a
+   List made on the GC heap and pushed to inside `with arena` must not point
+   into the arena once the block destroys it. */
+BLINK_RT_FN void* blink_alloc_in(blink_arena_t* owner, int64_t size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_alloc_in(blink_arena_t* owner, int64_t size) {
+    if (owner != NULL) return blink_arena_alloc(owner, size);
+    void* p = GC_MALLOC((size_t)size);
+    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    return p;
+}
+#endif
+
+BLINK_RT_FN void* blink_alloc_atomic_in(blink_arena_t* owner, int64_t size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_alloc_atomic_in(blink_arena_t* owner, int64_t size) {
+    if (owner != NULL) return blink_arena_alloc_atomic(owner, size);
+    void* p = GC_MALLOC_ATOMIC((size_t)size);
     if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
     return p;
 }
@@ -850,20 +883,14 @@ BLINK_STR_STATIC(blink_str_empty_lit, "");
 BLINK_RT_FN void* blink_promote_alloc(blink_arena_t* target, int64_t size);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_promote_alloc(blink_arena_t* target, int64_t size) {
-    if (target != NULL) return blink_arena_alloc(target, size);
-    void* p = GC_MALLOC((size_t)size);
-    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
-    return p;
+    return blink_alloc_in(target, size);
 }
 #endif
 
 BLINK_RT_FN void* blink_promote_alloc_atomic(blink_arena_t* target, int64_t size);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_promote_alloc_atomic(blink_arena_t* target, int64_t size) {
-    if (target != NULL) return blink_arena_alloc(target, size);
-    void* p = GC_MALLOC_ATOMIC((size_t)size);
-    if (!p) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
-    return p;
+    return blink_alloc_atomic_in(target, size);
 }
 #endif
 
@@ -998,29 +1025,34 @@ typedef struct {
     void** items;
     int64_t len;
     int64_t cap;
+    /* The arena that holds the storage, or NULL for the GC heap. The storage
+       grows there, whichever arena is active at the time (§5.2.1). */
+    blink_arena_t* owner;
 } blink_list;
 
 BLINK_RT_FN blink_list* blink_list_new(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_list* blink_list_new(void) {
     blink_list* l = (blink_list*)blink_alloc(sizeof(blink_list));
+    l->owner = __blink_current_arena;
     l->cap = 8;
     l->len = 0;
-    l->items = (void**)blink_alloc(sizeof(void*) * l->cap);
+    l->items = (void**)blink_alloc_in(l->owner, sizeof(void*) * l->cap);
     return l;
 }
 #endif
 
 /* For a list whose slots hold integer words, never pointers. The collector
    does not scan its storage, and blink_list_push grows it through
-   blink_realloc, which keeps the block unscanned. */
+   blink_realloc_in, which keeps the block unscanned. */
 BLINK_RT_FN blink_list* blink_list_new_atomic(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_list* blink_list_new_atomic(void) {
     blink_list* l = (blink_list*)blink_alloc(sizeof(blink_list));
+    l->owner = __blink_current_arena;
     l->cap = 8;
     l->len = 0;
-    l->items = (void**)blink_alloc_atomic(sizeof(void*) * l->cap);
+    l->items = (void**)blink_alloc_atomic_in(l->owner, sizeof(void*) * l->cap);
     return l;
 }
 #endif
@@ -1042,9 +1074,10 @@ BLINK_RT_FN blink_list* blink_list_with_capacity(int64_t n) {
     if (n <= 0) return blink_list_new();
     if (n > INT64_MAX / (int64_t)sizeof(void*)) blink_list_capacity_oom();
     blink_list* l = (blink_list*)blink_alloc(sizeof(blink_list));
+    l->owner = __blink_current_arena;
     l->cap = n;
     l->len = 0;
-    l->items = (void**)blink_alloc((int64_t)sizeof(void*) * n);
+    l->items = (void**)blink_alloc_in(l->owner, (int64_t)sizeof(void*) * n);
     return l;
 }
 #endif
@@ -1055,9 +1088,10 @@ BLINK_RT_FN blink_list* blink_list_with_capacity_atomic(int64_t n) {
     if (n <= 0) return blink_list_new_atomic();
     if (n > INT64_MAX / (int64_t)sizeof(void*)) blink_list_capacity_oom();
     blink_list* l = (blink_list*)blink_alloc(sizeof(blink_list));
+    l->owner = __blink_current_arena;
     l->cap = n;
     l->len = 0;
-    l->items = (void**)blink_alloc_atomic((int64_t)sizeof(void*) * n);
+    l->items = (void**)blink_alloc_atomic_in(l->owner, (int64_t)sizeof(void*) * n);
     return l;
 }
 #endif
@@ -1068,7 +1102,7 @@ BLINK_RT_FN void blink_list_push(blink_list* l, void* item) {
     if (l->len >= l->cap) {
         int64_t old_cap = l->cap;
         l->cap *= 2;
-        l->items = (void**)blink_realloc(l->items,
+        l->items = (void**)blink_realloc_in(l->owner, l->items,
             sizeof(void*) * (size_t)old_cap,
             sizeof(void*) * (size_t)l->cap);
     }
@@ -1315,6 +1349,9 @@ typedef struct {
     int64_t used;          /* occupied + tombstone slots: a probe stops only at an empty one */
     int64_t cap;
     const blink_kops* kops;
+    /* The arena that holds the storage, or NULL for the GC heap. The storage
+       grows there, whichever arena is active at the time (§5.2.1). */
+    blink_arena_t* owner;
 } blink_map;
 
 /* `static inline` so the compiler can fold the kops->inline_key branch
@@ -1332,14 +1369,15 @@ BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_map* blink_map_new(const blink_kops* kops) {
     blink_map* m = (blink_map*)blink_alloc(sizeof(blink_map));
+    m->owner = __blink_current_arena;
     m->cap = 16;
     m->len = 0;
     m->used = 0;
     m->kops = kops;
     size_t stride = blink_kops_stride(kops);
-    m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
-    m->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
-    m->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)m->cap);
+    m->keys = blink_alloc_in(m->owner, (int64_t)(stride * (size_t)m->cap));
+    m->values = (void**)blink_alloc_in(m->owner, sizeof(void*) * (size_t)m->cap);
+    m->states = (uint8_t*)blink_alloc_atomic_in(m->owner, sizeof(uint8_t) * (size_t)m->cap);
     memset(m->states, 0, (size_t)m->cap);
     return m;
 }
@@ -1362,9 +1400,9 @@ BLINK_RT_FN void blink_map_rebuild(blink_map* m) {
     size_t stride = blink_kops_stride(k);
     m->cap = (m->len * 10 >= old_cap * 4) ? old_cap * 2 : old_cap;
     int64_t mask = m->cap - 1;
-    m->keys = blink_alloc((int64_t)(stride * (size_t)m->cap));
-    m->values = (void**)blink_alloc(sizeof(void*) * (size_t)m->cap);
-    m->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)m->cap);
+    m->keys = blink_alloc_in(m->owner, (int64_t)(stride * (size_t)m->cap));
+    m->values = (void**)blink_alloc_in(m->owner, sizeof(void*) * (size_t)m->cap);
+    m->states = (uint8_t*)blink_alloc_atomic_in(m->owner, sizeof(uint8_t) * (size_t)m->cap);
     memset(m->states, 0, (size_t)m->cap);
     m->len = 0;
     for (int64_t i = 0; i < old_cap; i++) {
@@ -1381,7 +1419,8 @@ BLINK_RT_FN void blink_map_rebuild(blink_map* m) {
         m->len++;
     }
     m->used = m->len;
-    if (__blink_current_arena == NULL) {
+    /* A GC_FREE of arena memory would free a chunk the arena still owns. */
+    if (m->owner == NULL) {
         GC_FREE(old_keys);
         GC_FREE(old_values);
         GC_FREE(old_states);
@@ -1713,6 +1752,9 @@ typedef struct {
     int64_t used;          /* occupied + tombstone slots: a probe stops only at an empty one */
     int64_t cap;
     const blink_kops* kops;
+    /* The arena that holds the storage, or NULL for the GC heap. The storage
+       grows there, whichever arena is active at the time (§5.2.1). */
+    blink_arena_t* owner;
 } blink_set;
 
 static inline const void* blink_set_item_slot(const blink_set* s, int64_t i, size_t stride) {
@@ -1724,13 +1766,14 @@ BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_set* blink_set_new(const blink_kops* kops) {
     blink_set* s = (blink_set*)blink_alloc(sizeof(blink_set));
+    s->owner = __blink_current_arena;
     s->cap = 16;
     s->len = 0;
     s->used = 0;
     s->kops = kops;
     size_t stride = blink_kops_stride(kops);
-    s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
-    s->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)s->cap);
+    s->items = blink_alloc_in(s->owner, (int64_t)(stride * (size_t)s->cap));
+    s->states = (uint8_t*)blink_alloc_atomic_in(s->owner, sizeof(uint8_t) * (size_t)s->cap);
     memset(s->states, 0, (size_t)s->cap);
     return s;
 }
@@ -1748,8 +1791,8 @@ BLINK_RT_FN void blink_set_rebuild(blink_set* s) {
     size_t stride = blink_kops_stride(k);
     s->cap = (s->len * 10 >= old_cap * 4) ? old_cap * 2 : old_cap;
     int64_t mask = s->cap - 1;
-    s->items = blink_alloc((int64_t)(stride * (size_t)s->cap));
-    s->states = (uint8_t*)blink_alloc_atomic(sizeof(uint8_t) * (size_t)s->cap);
+    s->items = blink_alloc_in(s->owner, (int64_t)(stride * (size_t)s->cap));
+    s->states = (uint8_t*)blink_alloc_atomic_in(s->owner, sizeof(uint8_t) * (size_t)s->cap);
     memset(s->states, 0, (size_t)s->cap);
     s->len = 0;
     for (int64_t i = 0; i < old_cap; i++) {
@@ -1765,7 +1808,8 @@ BLINK_RT_FN void blink_set_rebuild(blink_set* s) {
         s->len++;
     }
     s->used = s->len;
-    if (__blink_current_arena == NULL) {
+    /* A GC_FREE of arena memory would free a chunk the arena still owns. */
+    if (s->owner == NULL) {
         GC_FREE(old_items);
         GC_FREE(old_states);
     }
@@ -1935,15 +1979,19 @@ typedef struct {
     uint8_t* data;
     int64_t len;
     int64_t cap;
+    /* The arena that holds the storage, or NULL for the GC heap. The storage
+       grows there, whichever arena is active at the time (§5.2.1). */
+    blink_arena_t* owner;
 } blink_bytes;
 
 BLINK_RT_FN blink_bytes* blink_bytes_new(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_bytes* blink_bytes_new(void) {
     blink_bytes* b = (blink_bytes*)blink_alloc(sizeof(blink_bytes));
+    b->owner = __blink_current_arena;
     b->cap = 16;
     b->len = 0;
-    b->data = (uint8_t*)blink_alloc_atomic((size_t)b->cap);
+    b->data = (uint8_t*)blink_alloc_atomic_in(b->owner, (int64_t)b->cap);
     return b;
 }
 #endif
@@ -1954,7 +2002,7 @@ BLINK_RT_FN void blink_bytes_push(blink_bytes* b, int64_t byte) {
     if (b->len >= b->cap) {
         int64_t old_cap = b->cap;
         b->cap *= 2;
-        b->data = (uint8_t*)blink_realloc(b->data, (size_t)old_cap, (size_t)b->cap);
+        b->data = (uint8_t*)blink_realloc_in(b->owner, b->data, (size_t)old_cap, (size_t)b->cap);
     }
     b->data[b->len++] = (uint8_t)(byte & 0xFF);
 }
@@ -2038,7 +2086,7 @@ BLINK_RT_FN blink_bytes* blink_bytes_concat(const blink_bytes* a, const blink_by
     if (total > r->cap) {
         int64_t old_cap = r->cap;
         r->cap = total;
-        r->data = (uint8_t*)blink_realloc(r->data, (size_t)old_cap, (size_t)r->cap);
+        r->data = (uint8_t*)blink_realloc_in(r->owner, r->data, (size_t)old_cap, (size_t)r->cap);
     }
     if (a->len > 0) memcpy(r->data, a->data, (size_t)a->len);
     if (b->len > 0) memcpy(r->data + a->len, b->data, (size_t)b->len);
@@ -2059,7 +2107,7 @@ BLINK_RT_FN blink_bytes* blink_bytes_slice(const blink_bytes* b, int64_t start, 
         if (slen > r->cap) {
             int64_t old_cap = r->cap;
             r->cap = slen;
-            r->data = (uint8_t*)blink_realloc(r->data, (size_t)old_cap, (size_t)r->cap);
+            r->data = (uint8_t*)blink_realloc_in(r->owner, r->data, (size_t)old_cap, (size_t)r->cap);
         }
         memcpy(r->data, b->data + start, (size_t)slen);
         r->len = slen;
@@ -2134,7 +2182,7 @@ BLINK_RT_FN void blinkrt_bytes_reserve(blink_bytes* b, int64_t extra) {
     int64_t old_cap = b->cap;
     int64_t new_cap = b->cap > 0 ? b->cap : 16;
     while (new_cap < needed) new_cap *= 2;
-    b->data = (uint8_t*)blink_realloc(b->data, (size_t)old_cap, (size_t)new_cap);
+    b->data = (uint8_t*)blink_realloc_in(b->owner, b->data, (size_t)old_cap, (size_t)new_cap);
     b->cap = new_cap;
 }
 #endif
@@ -2445,9 +2493,10 @@ BLINK_RT_FN blink_bytes* blink_bytes_zeroed(int64_t n);
 BLINK_RT_FN blink_bytes* blink_bytes_zeroed(int64_t n) {
     if (n < 0) n = 0;
     blink_bytes* b = (blink_bytes*)blink_alloc(sizeof(blink_bytes));
+    b->owner = __blink_current_arena;
     b->cap = n > 16 ? n : 16;
     b->len = n;
-    b->data = (uint8_t*)blink_alloc_atomic((size_t)b->cap);
+    b->data = (uint8_t*)blink_alloc_atomic_in(b->owner, (int64_t)b->cap);
     if (n > 0) memset(b->data, 0, (size_t)n);
     return b;
 }
@@ -2461,7 +2510,7 @@ BLINK_RT_FN blink_bytes* blink_bytes_from_str(const char* s) {
     if (slen > b->cap) {
         int64_t old_cap = b->cap;
         b->cap = slen;
-        b->data = (uint8_t*)blink_realloc(b->data, (size_t)old_cap, (size_t)b->cap);
+        b->data = (uint8_t*)blink_realloc_in(b->owner, b->data, (size_t)old_cap, (size_t)b->cap);
     }
     memcpy(b->data, s, (size_t)slen);
     b->len = slen;
@@ -2485,15 +2534,19 @@ typedef struct {
     char* data;
     int64_t len;
     int64_t cap;
+    /* The arena that holds the storage, or NULL for the GC heap. The storage
+       grows there, whichever arena is active at the time (§5.2.1). */
+    blink_arena_t* owner;
 } blink_sb;
 
 BLINK_RT_FN blink_sb* blink_sb_new(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_sb* blink_sb_new(void) {
     blink_sb* sb = (blink_sb*)blink_alloc(sizeof(blink_sb));
+    sb->owner = __blink_current_arena;
     sb->cap = 64;
     sb->len = 0;
-    sb->data = (char*)blink_alloc_atomic((size_t)sb->cap);
+    sb->data = (char*)blink_alloc_atomic_in(sb->owner, (int64_t)sb->cap);
     sb->data[0] = '\0';
     return sb;
 }
@@ -2505,9 +2558,10 @@ BLINK_RT_FN blink_sb* blink_sb_with_capacity(int64_t cap) {
     if (cap <= 0) return blink_sb_new();
     if (cap < 16) cap = 16;
     blink_sb* sb = (blink_sb*)blink_alloc(sizeof(blink_sb));
+    sb->owner = __blink_current_arena;
     sb->cap = cap;
     sb->len = 0;
-    sb->data = (char*)blink_alloc_atomic((size_t)sb->cap);
+    sb->data = (char*)blink_alloc_atomic_in(sb->owner, (int64_t)sb->cap);
     sb->data[0] = '\0';
     return sb;
 }
@@ -2523,7 +2577,7 @@ BLINK_RT_FN void blink_sb_write_n(blink_sb* sb, const char* s, int64_t slen) {
         int64_t new_cap = sb->cap * 2;
         while (new_cap < needed) new_cap *= 2;
         sb->cap = new_cap;
-        sb->data = (char*)blink_realloc(sb->data, (size_t)old_cap, (size_t)sb->cap);
+        sb->data = (char*)blink_realloc_in(sb->owner, sb->data, (size_t)old_cap, (size_t)sb->cap);
     }
     memcpy(sb->data + sb->len, s, (size_t)slen);
     sb->len += slen;
@@ -3432,6 +3486,7 @@ BLINK_RT_FN blink_list* blink_list_copy_shell(blink_promote_ctx* ctx, const blin
 BLINK_RT_FN blink_list* blink_list_copy_shell(blink_promote_ctx* ctx, const blink_list* l) {
     if (!l) return NULL;
     blink_list* out = (blink_list*)blink_promote_ctx_alloc(ctx, sizeof(blink_list));
+    out->owner = ctx->target;
     out->len = l->len;
     out->cap = l->cap;
     out->items = (void**)blink_promote_ctx_alloc(ctx, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
@@ -3447,6 +3502,7 @@ BLINK_RT_FN blink_list* blink_list_copy_shell_atomic(blink_promote_ctx* ctx, con
 BLINK_RT_FN blink_list* blink_list_copy_shell_atomic(blink_promote_ctx* ctx, const blink_list* l) {
     if (!l) return NULL;
     blink_list* out = (blink_list*)blink_promote_ctx_alloc(ctx, sizeof(blink_list));
+    out->owner = ctx->target;
     out->len = l->len;
     out->cap = l->cap;
     out->items = (void**)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(sizeof(void*) * (size_t)(l->cap > 0 ? l->cap : 1)));
@@ -3460,6 +3516,7 @@ BLINK_RT_FN blink_map* blink_map_copy_shell(blink_promote_ctx* ctx, const blink_
 BLINK_RT_FN blink_map* blink_map_copy_shell(blink_promote_ctx* ctx, const blink_map* m) {
     if (!m) return NULL;
     blink_map* out = (blink_map*)blink_promote_ctx_alloc(ctx, sizeof(blink_map));
+    out->owner = ctx->target;
     size_t stride = blink_kops_stride(m->kops);
     out->len = m->len;
     out->used = m->used;
@@ -3531,6 +3588,7 @@ BLINK_RT_FN blink_set* blink_set_copy_shell(blink_promote_ctx* ctx, const blink_
 BLINK_RT_FN blink_set* blink_set_copy_shell(blink_promote_ctx* ctx, const blink_set* s) {
     if (!s) return NULL;
     blink_set* out = (blink_set*)blink_promote_ctx_alloc(ctx, sizeof(blink_set));
+    out->owner = ctx->target;
     size_t stride = blink_kops_stride(s->kops);
     out->len = s->len;
     out->used = s->used;
@@ -3584,6 +3642,7 @@ BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_promote_ctx* ctx, const bl
 BLINK_RT_FN blink_bytes* blink_bytes_copy_shell(blink_promote_ctx* ctx, const blink_bytes* b) {
     if (!b) return NULL;
     blink_bytes* out = (blink_bytes*)blink_promote_ctx_alloc(ctx, sizeof(blink_bytes));
+    out->owner = ctx->target;
     out->len = b->len;
     out->cap = b->cap;
     out->data = (uint8_t*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(b->cap > 0 ? b->cap : 1));
@@ -3597,6 +3656,7 @@ BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_promote_ctx* ctx, const blink_sb
 BLINK_RT_FN blink_sb* blink_sb_copy_shell(blink_promote_ctx* ctx, const blink_sb* sb) {
     if (!sb) return NULL;
     blink_sb* out = (blink_sb*)blink_promote_ctx_alloc(ctx, sizeof(blink_sb));
+    out->owner = ctx->target;
     out->len = sb->len;
     out->cap = sb->cap;
     out->data = (char*)blink_promote_ctx_alloc_atomic(ctx, (int64_t)(sb->cap > 0 ? sb->cap : 1));
