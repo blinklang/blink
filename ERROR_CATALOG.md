@@ -231,8 +231,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnusedImport | W0602 | Module imported but no symbols referenced | Linting | §6 |
 | ShadowedVariable | W0603 | Variable shadows another with the same name in an outer scope | Linting | §6 |
 | UnusedTypeParamBinder | W0604 | Type parameter occurs nowhere in the declaration or its body; the binder is removable | Linting | §3.4 |
-| ScopedValueWithoutWith | W0610 | A `Closeable` or `BlockHandler` value reaches anything other than a `with` item (flow-based). Suppress with `@trusted(audit: K)`; upgrade to an error with `W0610 = "error"` under `[lints]` | Resources | §5.5 |
-| ScopedValueEnteredTwice | W0611 | A `Closeable` or `BlockHandler` value reaches more than one `with` item, including a `with` in a loop that enters a value built outside it (flow-based, same analysis as W0610). Suppress with `@trusted(audit: K)`; upgrade to an error with `W0611 = "error"` under `[lints]` | Resources | §5.5 |
+| ScopedValueWithoutWith | W0610 | A `Closeable` or `BlockHandler` value reaches anything other than a `with` item (flow-based). Suppress with `@allow(ScopedValueWithoutWith)`; `@trusted(audit: K)` does not suppress it; upgrade to an error with `W0610 = "error"` under `[lints]` | Resources | §5.5 |
+| ScopedValueEnteredTwice | W0611 | A `Closeable` or `BlockHandler` value reaches more than one `with` item, including a `with` in a loop that enters a value built outside it (flow-based, same analysis as W0610). Suppress with `@allow(ScopedValueEnteredTwice)`; `@trusted(audit: K)` does not suppress it; upgrade to an error with `W0611 = "error"` under `[lints]` | Resources | §5.5 |
 | UnreachableCode | W0700 | Code follows an unconditional return/break/continue | Linting | §6 |
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
