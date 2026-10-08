@@ -378,6 +378,37 @@ of `d1cf8f55` (before) and of `7f4d7dbb` (after), in two runs on one machine on 
   In the like-for-like columns each edit case's range overlaps its before
   range; the largest change in a median is +0.015 s, on cli `body-cname`.
 
+### After the flip
+
+`task bench-edit-loop` on the gen1 `blink` built from `6ee0ea14`, 5 reps, 12
+cores, under `blink-gates.slice`, with no flags (the per-module default) and
+with `BENCH_FLAGS=--no-per-module` (one unit).
+`bench/edit_loop/per_module_6ee0ea14.tsv` and
+`bench/edit_loop/monolith_6ee0ea14.tsv` hold the rows. Median wall seconds,
+then the default's split.
+
+| target | case | `--no-per-module` | default | emit_s | cc_s | link_s |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.770 | 0.496 | 0.452 | 0.000 | 0.043 |
+| cli | body-cname | 10.504 | 1.142 | 0.947 | 0.152 | 0.043 |
+| cli | body-typecheck | 10.515 | 3.403 | 0.944 | 2.412 | 0.043 |
+| cli | pubfn-cname | 10.508 | 1.826 | 0.948 | 0.839 | 0.043 |
+| cli | run-body-cname | 10.558 | 1.124 | 0.932 | 0.151 | 0.042 |
+| cli | test-body-cname | 2.123 | 0.603 | 0.465 | 0.102 | 0.035 |
+| cli | cold-obj | 10.530 | 3.580 | 0.505 | 3.034 | 0.043 |
+| cli | cold-all | 12.918 | 5.942 | 0.590 | 5.302 | 0.043 |
+| small | nochange | 0.073 | 0.071 | 0.052 | 0.000 | 0.019 |
+| small | body-inventory | 0.139 | 0.121 | 0.065 | 0.036 | 0.019 |
+| small | pubfn-model | 0.139 | 0.121 | 0.066 | 0.036 | 0.019 |
+| small | run-body-inventory | 0.137 | 0.121 | 0.065 | 0.037 | 0.019 |
+| small | test-body-inventory | 0.141 | 0.135 | 0.062 | 0.053 | 0.020 |
+| small | cold-obj | 0.137 | 0.120 | 0.064 | 0.037 | 0.019 |
+
+The default rows match the `--per-module` rows on `7f4d7dbb` within their
+spread: the flip changes which path runs, not the path. A body edit on cli
+spends 0.95 s of its 1.14 s in emit (front end, codegen, cache hashing), so
+the 1.0 s goal for it needs a faster emit, not a faster cc.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
