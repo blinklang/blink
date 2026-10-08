@@ -1,0 +1,69 @@
+// A tuple key has no declaration, so no module owns its key-operations table. Under the
+// per-module build the entry unit defines every such table once and every other unit
+// declares it, so a map keyed on a pair links whichever modules create it, and two
+// modules keying on one pair do not define it twice.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"keys_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/grid.bl", [
+        #"pub fn cell_sum() -> Int {"#,
+        #"    let mut cells: Map[(Int, Str), Int] = Map()"#,
+        #"    cells.insert((1, "a"), 10)"#,
+        #"    cells.insert((2, "b"), 20)"#,
+        #"    let mut seen: Set[(Str, Int)] = Set()"#,
+        #"    seen.insert(("x", 1))"#,
+        #"    seen.insert(("x", 1))"#,
+        #"    (cells.get((1, "a")) ?? 0) + (cells.get((2, "b")) ?? 0) + seen.len()"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import grid.{cell_sum}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let mut m: Map[(Int, Str), Int] = Map()"#,
+        #"    m.insert((1, "a"), 2)"#,
+        #"    io.println("{m.get((1, "a")) ?? 0} {cell_sum()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes
+// --per-module build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_PER_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+test "a map and a set keyed on tuples link and run under the per-module build" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_tuple_keys_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    let units = sh("cd {tree}/out/app.units 2>/dev/null && ls *.c | LC_ALL=C sort | tr '\\n' ' '")
+    let defs = sh("cat {tree}/out/app.units/*.c 2>/dev/null | grep -c '^const blink_kops kops_'")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    assert_eq(units, "__main__.c grid.c")
+    // (Int, Str) keyed in both modules and (Str, Int) in one: two tables, each defined once.
+    assert_eq(defs, "2")
+    assert_eq(out, "2 31")
+}
