@@ -6,13 +6,14 @@
 //
 //   <16-hex>.o                — the cached object
 //   <16-hex>.meta             — "<unix-mtime> <module_key> <src_sha>"
-//   tmp/<pid>.<rand>.o        — atomic-write staging
+//   tmp/unit.<rand>/          — a build's private C snapshot and staged .o
+//   tmp/<label>.<pid>.<n>.o   — `blink cache __store` staging
 //
 // Hits touch .meta mtime so LRU-by-mtime survives stdlib re-reads.
 // Stores rename(2) into place. Two parallel jobs racing on the same
 // key both compile and both rename — content is byte-identical.
 
-import std_cache_key.{sha256_of_manifest}
+import std_cache_key.{sha256_of_manifest, sha256_of_file_first, SHA256SUM_SH}
 
 pub fn obj_cache_dir() -> Str {
     let override_val = env.var("BLINK_CACHE_DIR") ?? ""
@@ -52,6 +53,18 @@ pub fn make_staging_path(label: Str) -> Str {
     stage_counter = stage_counter + 1
     let pid = getpid()
     "{obj_cache_dir()}/tmp/{label}.{pid}.{stage_counter}.o"
+}
+
+// A directory no other build writes, under tmp/ so a rename out of it stays on one
+// filesystem. A pid and a counter are not enough: two pid namespaces can share a cache
+// dir. "" when it cannot be made.
+pub fn make_private_dir() -> Str {
+    ensure_dir()
+    let r = process_run("sh", ["-c", "mktemp -d {obj_cache_dir()}/tmp/unit.XXXXXX"])
+    if r.exit_code != 0 {
+        return ""
+    }
+    r.out.trim()
 }
 
 fn cc_identity() -> Str {
@@ -111,6 +124,80 @@ pub fn compute_obj_key(
     sha256_of_manifest(m.to_str())
 }
 
+// "<path>=<sha256>" for each header in dirs. None when one cannot be hashed, so a header
+// the unit may read never drops out of the key.
+fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] {
+    let mut lines: List[Str] = []
+    if dirs.len() == 0 {
+        return Some(lines)
+    }
+    let mut cmd = StringBuilder.new()
+    cmd.write(SHA256SUM_SH)
+    cmd.write("for d in")
+    for d in dirs {
+        cmd.write(" \"{d}\"")
+    }
+    cmd.write("; do for f in \"$d\"/*.h; do [ -e \"$f\" ] || continue; sha256sum \"$f\" || exit 1; done; done")
+    let r = process_run("sh", ["-c", cmd.to_str()])
+    if r.exit_code != 0 {
+        return None
+    }
+    for line in r.out.lines() {
+        // sha256sum prints "<64 hex>  <path>".
+        if line.byte_len() < 67 {
+            continue
+        }
+        lines.push("{line.byte_slice(66, line.byte_len())}={line.byte_slice(0, 64)}")
+    }
+    Some(lines)
+}
+
+// The key of a user unit compiled from the C at src_path. The unit includes
+// libblink_std.h from arc_dir, which includes the runtime.h beside it; cc reads a
+// libblink_std.h.gch there in place of the header; a vendored dependency's headers come
+// from its include dir. Each shapes the object, so each is in the key. "" when an input
+// cannot be read: a key without it would match an object built from other headers.
+pub fn user_unit_key(
+    src_path: Str,
+    module_key: Str,
+    arc_dir: Str,
+    vendored_include_dirs: List[Str],
+    blinkc_sha: Str,
+    cc_id: Str,
+    flags: List[Str],
+    target: Str,
+) -> Str {
+    if blinkc_sha == "" || cc_id == "" {
+        return ""
+    }
+    let src_sha = sha256_of_file_first(src_path)
+    let runtime_sha = sha256_of_file_first("{arc_dir}/runtime.h")
+    let archive_header_sha = sha256_of_file_first("{arc_dir}/libblink_std.h")
+    if src_sha == "" || runtime_sha == "" || archive_header_sha == "" {
+        return ""
+    }
+    let mut headers = ["libblink_std.h={archive_header_sha}"]
+    let pch = "{arc_dir}/libblink_std.h.gch"
+    if file_exists(pch) == 1 {
+        let pch_sha = sha256_of_file_first(pch)
+        if pch_sha == "" {
+            return ""
+        }
+        headers.push("libblink_std.h.gch={pch_sha}")
+    }
+    match header_lines_in(vendored_include_dirs) {
+        Some(lines) => {
+            for line in lines {
+                headers.push(line)
+            }
+        }
+        None => {
+            return ""
+        }
+    }
+    compute_obj_key(module_key, src_sha, headers, runtime_sha, blinkc_sha, cc_id, flags, target)
+}
+
 // Hash an arbitrary manifest passed as a string. Used by `blink cache
 // key <manifest>` for tests and for tooling that wants to drive the
 // digest directly.
@@ -137,7 +224,8 @@ pub fn lookup_obj(key: Str) -> Str {
 // Atomically install obj_tmp_path as <key>.o under the cache, plus
 // write the .meta sidecar. Caller is responsible for putting a fresh
 // obj at obj_tmp_path; we rename it (so the temp path is consumed).
-// Returns true iff a new entry was installed (signal for maybe_gc).
+// Returns true iff a new entry was installed (signal for maybe_gc); on
+// false the caller must not link <key>.o.
 pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool {
     if !cache_enabled() {
         return false
@@ -145,7 +233,9 @@ pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool
     ensure_dir()
     let dir = obj_cache_dir()
     let final_obj = "{dir}/{key}.o"
-    shell_exec("mv -f {obj_tmp_path} {final_obj}")
+    if shell_exec("mv -f {obj_tmp_path} {final_obj}") != 0 {
+        return false
+    }
     let now_res = process_run("sh", ["-c", "date +%s"])
     let now = now_res.out.trim()
     let meta_path = "{dir}/{key}.meta"
