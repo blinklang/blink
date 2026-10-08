@@ -1236,7 +1236,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
             return arc_rc
         }
     }
-    if unit_jobs > 0 {
+    if unit_jobs != 0 {
         let reason = per_module_fallback_reason(emit_mode, format_flag)
         if reason == "" {
             return do_build_units(source_path, output_path, debug_mode, release_mode, targets, json_output, strict_mode, unit_jobs)
@@ -1326,9 +1326,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
 // hold. See docs/build/per-module-o-default.md.
 
 // How many units a build and run compile at once: 0 without --per-module, which builds one
-// C unit, else --jobs, BLINK_JOBS or the CPU count. A job count that is not a positive
-// integer is an error rather than a silent fallback, so a typo cannot quietly serialise a
-// build. Only a per-module build reads the count, so only it can fail on one.
+// C unit, else --jobs, BLINK_JOBS or -1 for the CPU count. A job count that is not a
+// positive integer is an error rather than a silent fallback, so a typo cannot quietly
+// serialise a build. Only a per-module build reads the count, so only it can fail on one.
 fn unit_jobs_from_args(a: Args) -> Int {
     if !args_has(a, "per-module") { return 0 }
     let flag = args_get(a, "jobs")
@@ -1342,6 +1342,11 @@ fn unit_jobs_from_args(a: Args) -> Int {
         }
         return n
     }
+    // Read only when a unit compiles: it costs an exec, and a no-change build compiles none.
+    -1
+}
+
+fn cpu_count() -> Int {
     let r = process_run("sh", ["-c", "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null"])
     let n = r.out.trim().to_int()
     if n > 0 { n } else { 1 }
@@ -1497,8 +1502,21 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
 }
 
 fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[EmittedUnit], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report {
-    // The scans below read what the one-unit build reads from its single C file.
-    let c_source = process_run("sh", ["-c", "cat {work}/*.h {work}/*.c"]).out
+    // The scans below read what the one-unit build reads from its single C file: each unit
+    // and each header a unit includes, which is all cc compiles. A marker the scans look
+    // for starts a line, so each file starts one.
+    let mut c_parts: List[Str] = []
+    let mut seen: Map[Str, Bool] = Map()
+    for u in units {
+        for h in u.headers {
+            if seen.contains_key(h) == 0 {
+                seen.insert(h, true)
+                c_parts.push(read_file("{work}/{h}"))
+            }
+        }
+        c_parts.push(read_file("{work}/{u.module}.c"))
+    }
+    let c_source = c_parts.join("\n")
     let has_async = detect_async(read_file(source_path))
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
@@ -1562,17 +1580,19 @@ type UnitCompile {
     err_out: Str
 }
 
-// Runs each command under sh with at most `jobs` at a time, starting them in list order.
+// Runs each command under sh with at most `unit_jobs` at a time (the CPU count for -1),
+// starting them in list order.
 // Answers one result per command, indexed by its place in the list.
 // The children are started and reaped from this thread rather than from async tasks: the
 // async pool has four threads and a task that waits on a child holds one, so tasks could
 // never run more than four at once. Children are reaped in start order with no wait for
 // whichever ends first, so a child that ends early holds its slot until those started
 // before it are reaped.
-fn run_unit_compiles(cmds: List[Str], jobs: Int) -> List[UnitCompile] {
+fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] {
     let n = cmds.len()
     let mut by_idx: List[UnitCompile] = []
     if n == 0 { return by_idx }
+    let jobs = if unit_jobs > 0 { unit_jobs } else { cpu_count() }
     process_install_signal_forwarding()
     let mut pids: List[Int] = []
     let mut started = 0
