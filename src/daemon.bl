@@ -1,12 +1,12 @@
 import symbol_index.{si_build, si_reset, si_sym_count, si_file_count}
 import query.{query_dispatch}
-import diagnostics.{Diag, diag_entries, diag_count, diag_ice_count}
-import std.json.{json_clear, json_new_array, json_new_object, json_set, json_new_str, json_new_int, json_push, json_encode, json_parse, json_get, json_as_str}
+import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render}
+import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int}
 import std.path.{path_join}
 import lexer.{Lex}
 import parser.{Parse}
 import typecheck.{TypeCheck}
-import check_pipeline.{check_source, checked_inputs_changed, checked_inputs_reset}
+import check_pipeline.{check_source, checked_inputs_changed, checked_inputs_reset, check_exit_code, check_status_line}
 
 effect Daemon {
     effect Serve
@@ -24,13 +24,25 @@ let mut daemon_running: Int = 0
 let mut daemon_socket_fd: Int = -1
 let mut daemon_pid_path: Str = ""
 let mut daemon_sock_path: Str = ""
-let mut daemon_project_root: Str = ""
 let mut daemon_source_path: Str = ""
 let mut daemon_start_time: Int = 0
 let mut daemon_check_count: Int = 0
-let mut daemon_program: Int = -1
-// The findings of the last check, which hold until an input changes.
-let mut daemon_last_check: Str = ""
+// A diagnostic spells its file as the entry path was typed, relative to the working
+// directory, so the daemon answers only a client in the directory it started in.
+let mut daemon_cwd: Str = ""
+
+// The findings of a check, rendered both ways a client can ask for, since the diagnostics
+// themselves do not outlive the next check.
+type DaemonCheck {
+    human: Str
+    json: Str
+    errors: Int
+    warnings: Int
+    ices: Int
+}
+
+// The last check, which holds until an input changes.
+let mut daemon_last: Option[DaemonCheck] = None
 
 // ── Extract request type ────────────────────────────────────────────
 
@@ -43,62 +55,69 @@ fn daemon_extract_type(request: Str) -> Option[Str] {
     Some(json_as_str(json_get(root, "type")))
 }
 
-// ── Diagnostics to JSON ─────────────────────────────────────────────
-// Collects current diagnostics into a JSON array string instead of printing.
-
-fn daemon_diags_to_json() -> Str {
-    json_clear()
-    let arr = json_new_array()
-    let mut i = 0
-    while i < diag_entries.len() {
-        let d = diag_entries.get(i).unwrap()
-        let obj = json_new_object()
-        json_set(obj, "severity", json_new_str(d.severity))
-        json_set(obj, "name", json_new_str(d.name))
-        json_set(obj, "code", json_new_str(d.code))
-        json_set(obj, "message", json_new_str(d.message))
-        json_set(obj, "file", json_new_str(d.file))
-        json_set(obj, "line", json_new_int(d.line))
-        json_set(obj, "col", json_new_int(d.col))
-        if d.help != "" {
-            json_set(obj, "help", json_new_str(d.help))
-        }
-        json_push(arr, obj)
-        i = i + 1
-    }
-    json_encode(arr)
-}
-
 // ── Handle: check ───────────────────────────────────────────────────
 
 // Each check sees the whole program: mono and the mutation passes judge across functions,
 // so a recheck of only the changed functions could miss what an edit broke elsewhere.
-fn daemon_check_program() -> Str ! Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_check_program() -> DaemonCheck ! Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     let program = check_source(daemon_source_path)
-    daemon_program = program
     si_reset()
     si_build(program, daemon_source_path, "main")
-    let diags_json = daemon_diags_to_json()
-    let err_count = diag_count
-    let ice_count = diag_ice_count
-    "\"errors\":{err_count},\"ice\":{ice_count},\"diagnostics\":{diags_json}"
+    DaemonCheck {
+        human: diag_render(0),
+        json: diag_render(1),
+        errors: diag_count,
+        warnings: diag_warn_count,
+        ices: diag_ice_count,
+    }
 }
 
+fn daemon_not_served(why: Str) -> Str {
+    json_clear()
+    let reply = json_new_object()
+    json_set(reply, "ok", json_new_bool(0))
+    json_set(reply, "served", json_new_int(0))
+    json_set(reply, "error", json_new_str(why))
+    json_encode(reply)
+}
+
+// The reply carries what a cold `blink check` would print on stdout and stderr and the code
+// it would exit with, so the client prints the bytes and needs no rendering of its own.
 // With no input changed, the last answer still holds, so the daemon gives it again rather
 // than an empty list that would read as clean.
-fn daemon_handle_check() -> Str ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
-    daemon_check_count = daemon_check_count + 1
+fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    json_clear()
+    let root = json_parse(request)
+    let cwd = json_as_str(json_get(root, "cwd"))
+    let path = json_as_str(json_get(root, "path"))
+    let json_status = json_as_int(json_get(root, "json"))
+    let diag_json = json_as_int(json_get(root, "diag_json"))
+    let strict = json_as_int(json_get(root, "strict"))
+    if cwd != daemon_cwd || path != daemon_source_path {
+        return daemon_not_served("the daemon checks {daemon_source_path} in {daemon_cwd}")
+    }
     // The loader exits on a missing entry file, which would take the daemon down with it.
     if file_exists(daemon_source_path) != 1 {
-        daemon_last_check = ""
-        return "\{\"ok\":false,\"error\":\"source file not found: {daemon_source_path}\"}"
+        daemon_last = None
+        return daemon_not_served("source file not found: {daemon_source_path}")
     }
+    daemon_check_count = daemon_check_count + 1
     let mut changed = 0
-    if daemon_last_check == "" || checked_inputs_changed(daemon_source_path) {
-        daemon_last_check = daemon_check_program()
+    if daemon_last.is_none() || checked_inputs_changed(daemon_source_path) {
+        daemon_last = Some(daemon_check_program())
         changed = 1
     }
-    "\{\"ok\":true,\"changed\":{changed},{daemon_last_check}}"
+    let c = daemon_last.unwrap()
+    let status = check_status_line(daemon_source_path, json_status, strict, c.ices, c.errors, c.warnings)
+    json_clear()
+    let reply = json_new_object()
+    json_set(reply, "ok", json_new_bool(1))
+    json_set(reply, "served", json_new_int(1))
+    json_set(reply, "changed", json_new_int(changed))
+    json_set(reply, "exit", json_new_int(check_exit_code(strict, c.ices, c.errors, c.warnings)))
+    json_set(reply, "stdout", json_new_str(status.concat("\n")))
+    json_set(reply, "stderr", json_new_str(if diag_json == 1 { c.json } else { c.human }))
+    json_encode(reply)
 }
 
 // ── Handle: query ───────────────────────────────────────────────────
@@ -139,7 +158,7 @@ fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Di
 
         let mut response = ""
         if req_type == "check" {
-            response = daemon_handle_check()
+            response = daemon_handle_check(request)
         } else if req_type == "query" {
             response = daemon_handle_query(request)
         } else if req_type == "status" {
@@ -170,15 +189,15 @@ fn daemon_stop() ! Daemon.Serve {
     }
     si_reset()
     checked_inputs_reset()
-    daemon_last_check = ""
+    daemon_last = None
     daemon_running = 0
 }
 
 // ── Startup ─────────────────────────────────────────────────────────
 
 pub fn daemon_start(root: Str, source: Str) ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
-    daemon_project_root = root
     daemon_source_path = source
+    daemon_cwd = env.cwd()
     daemon_start_time = time_ms()
 
     // Ensure .blink/ directory exists
@@ -198,7 +217,7 @@ pub fn daemon_start(root: Str, source: Str) ! Daemon.Serve, Lex.Tokenize, Parse,
         return
     }
 
-    daemon_last_check = daemon_check_program()
+    daemon_last = Some(daemon_check_program())
 
     io.eprintln("daemon: listening on {daemon_sock_path} (pid {pid})")
     daemon_running = 1

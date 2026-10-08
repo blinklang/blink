@@ -8,8 +8,8 @@ import std.args.{
     generate_help, generate_command_help,
 }
 import std.json.{
-    json_clear, json_parse, json_new_object, json_new_str,
-    json_new_bool, json_set, json_get, json_remove, json_encode,
+    json_clear, json_parse, json_new_object, json_new_str, json_new_int,
+    json_new_bool, json_set, json_get, json_remove, json_encode, json_as_int, json_as_str,
 }
 import std.path.{path_join, path_dirname, path_basename}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
@@ -61,7 +61,7 @@ import std_cache_key.{archive_compiler_path, sha256_of_file_first}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
-import check_pipeline.{check_source, run_build_analyses}
+import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
 import symbol_index.{collect_effects, si_build, si_reset}
 import query.{query_filtered_layer}
 import diagnostics.{
@@ -3394,57 +3394,62 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 
     trace_mode = args_get(a, "blink-trace")
     ensure_deps_resolved()
-    let mut daemon_used = 0
-    let sock = find_daemon_sock()
-    if sock.is_some() {
-        let fd = unix_socket_connect(sock.unwrap())
-        if fd >= 0 {
-            socket_write(fd, "\{\"type\":\"check\"}\n")
-            let response = socket_read_line(fd)
-            unix_socket_close(fd)
-            daemon_used = 1
-            io.println(response)
+    if format_flag != "" {
+        diag_format = 1
+    }
+    // The daemon checks with no trace and with the default layout rule, so a check that
+    // asks for either runs cold.
+    if trace_mode == "" && strict_struct_layout_flag == 0 {
+        if check_through_daemon(source_path, json_output, diag_format, strict_flag) {
+            return
         }
     }
-    if daemon_used == 0 {
-        if format_flag != "" {
-            diag_format = 1
-        }
-        let _ = check_source(source_path)
+    let _ = check_source(source_path)
+    diag_flush()
+    io.println(check_status_line(source_path, json_output, strict_flag, diag_ice_count, diag_count, diag_warn_count))
+    let code = check_exit_code(strict_flag, diag_ice_count, diag_count, diag_warn_count)
+    if code != 0 {
+        exit(code)
+    }
+}
 
-        if diag_ice_count > 0 {
-            diag_flush()
-            if json_output != 0 {
-                io.println("\{\"status\":\"ice\",\"file\":\"{source_path}\"}")
-            } else {
-                io.println("error: internal compiler error")
-            }
-            exit(101)
-        } else if diag_count > 0 {
-            diag_flush()
-            if json_output != 0 {
-                io.println("\{\"status\":\"error\",\"file\":\"{source_path}\"}")
-            } else {
-                io.println("error: check failed")
-            }
-            exit(1)
-        } else if strict_flag != 0 && diag_warn_count > 0 {
-            diag_flush()
-            if json_output != 0 {
-                io.println("\{\"status\":\"error\",\"file\":\"{source_path}\"}")
-            } else {
-                io.println("error: check failed (warnings treated as errors in --strict mode)")
-            }
-            exit(1)
-        } else {
-            diag_flush()
-            if json_output != 0 {
-                io.println("\{\"status\":\"ok\",\"file\":\"{source_path}\"}")
-            } else {
-                io.println("ok: {source_path}")
-            }
-        }
+// A daemon started on `<path>` listens next to it, so the path names the socket as well as
+// the entry. The daemon answers only for the entry it serves and from the directory it
+// started in, since a diagnostic spells its file relative to both. Anything else, and any
+// reply the client can not read, falls back to a cold check: the daemon may make a check
+// faster, never different. True when the daemon's answer was printed.
+fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, strict: Int) -> Bool {
+    let sock = path_join(path_dirname(source_path), ".blink/daemon.sock")
+    if !file_exists(sock) {
+        return false
     }
+    let fd = unix_socket_connect(sock)
+    if fd < 0 {
+        return false
+    }
+    json_clear()
+    let req = json_new_object()
+    json_set(req, "type", json_new_str("check"))
+    json_set(req, "cwd", json_new_str(env.cwd()))
+    json_set(req, "path", json_new_str(source_path))
+    json_set(req, "json", json_new_int(json_status))
+    json_set(req, "diag_json", json_new_int(diag_json))
+    json_set(req, "strict", json_new_int(strict))
+    socket_write(fd, json_encode(req).concat("\n"))
+    let reply = socket_read_line(fd)
+    unix_socket_close(fd)
+    json_clear()
+    let root = json_parse(reply)
+    if root < 0 || json_as_int(json_get(root, "served")) != 1 {
+        return false
+    }
+    io.eprint(json_as_str(json_get(root, "stderr")))
+    io.print(json_as_str(json_get(root, "stdout")))
+    let code = json_as_int(json_get(root, "exit"))
+    if code != 0 {
+        exit(code)
+    }
+    true
 }
 
 fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {

@@ -380,13 +380,13 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `time_ms()` | Int | Current time in milliseconds |
 | `getpid()` | Int | Process ID |
 | `str_from_code_point(n)` | Str | Convert char code to 1-char string (was `str_from_char_code`) |
-| `unix_socket_listen(path)` | Int | Listen on Unix domain socket |
-| `unix_socket_connect(path)` | Int | Connect to Unix domain socket |
+| `unix_socket_listen(path)` | Int | Listen on Unix domain socket; -1 on failure, and for a path longer than a socket address holds (107 bytes on Linux) |
+| `unix_socket_connect(path)` | Int | Connect to Unix domain socket; -1 on failure, and for a path longer than a socket address holds |
 | `unix_socket_accept(fd)` | Int | Accept incoming connection |
 | `unix_socket_accept_timeout(fd, ms)` | Int | Accept with timeout (ms) |
 | `unix_socket_close(fd)` | () | Close socket |
-| `socket_read_line(fd)` | Str | Read line from socket |
-| `socket_write(fd, data)` | () | Write data to socket |
+| `socket_read_line(fd)` | Str | Read one line of any length, without its newline; `""` at end of input |
+| `socket_write(fd, data)` | Int | Write all of `data`; returns the bytes written, or -1 when the peer has closed or the write fails |
 
 The `tcp_*` functions are not builtins. They live in `std.net`: `import std.net` (see Standard Library). `tcp_connect`, `tcp_listen` and `tcp_accept` return `Result[TcpSocket, NetError]` or `Result[TcpListener, NetError]`; `tcp_read_bytes` returns `Result[Bytes, NetError]`.
 

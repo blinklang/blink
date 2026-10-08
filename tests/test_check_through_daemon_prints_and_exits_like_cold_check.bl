@@ -1,0 +1,102 @@
+// `blink check` gives one answer whether or not a daemon runs: through the daemon it prints the
+// same bytes on stdout and on stderr, and exits with the same code, as a check without one.
+// Each case is checked cold first, then through a daemon serving the same file, and
+// `daemon status` must show that the daemon answered, not a cold check behind it.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/check_daemon_like_cold"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn clean_src() -> Str {
+    "fn main() \{\n    io.println(\"hi\")\n}\n"
+}
+
+fn warn_src() -> Str {
+    "fn f() -> Int \{\n    return 1\n    2\n}\n\nfn main() \{\n    io.println(\"\{f()}\")\n}\n"
+}
+
+fn error_src() -> Str {
+    "fn main() \{\n    let s: Int = \"no\"\n    io.println(\"\{s}\")\n}\n"
+}
+
+fn check() -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && $B check main.bl")
+}
+
+// The pid of a daemon serving main.bl, or -1. The timeout ends a daemon that nothing stopped.
+fn start_daemon() -> Int {
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && rm -rf .blink && (timeout 120 $B daemon start main.bl > daemon.log 2>&1 &); for i in $(seq 1 400); do if [ -S .blink/daemon.sock ]; then cat .blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f .blink/daemon.pid ] && kill $(cat .blink/daemon.pid); exit 1")
+    if r.exit_code != 0 { return -1 }
+    r.out.trim().to_int()
+}
+
+fn stop_daemon(pid: Int) {
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+fn served_checks() -> Str {
+    let out = sh("B=$(pwd)/build/blink; cd {DIR} && $B daemon status").out
+    match out.byte_index_of("\"checks\":", 0) {
+        Some(at) => out.byte_slice(at, out.byte_len()).trim()
+        None => "no status: {out}"
+    }
+}
+
+fn same(label: Str, cold: ProcessResult, warm: ProcessResult) -> Bool {
+    let ok = cold.out == warm.out && cold.err_out == warm.err_out && cold.exit_code == warm.exit_code
+    if !ok {
+        io.eprintln("{label} cold (exit {cold.exit_code}):\n{cold.out}\n--stderr--\n{cold.err_out}")
+        io.eprintln("{label} daemon (exit {warm.exit_code}):\n{warm.out}\n--stderr--\n{warm.err_out}")
+    }
+    ok
+}
+
+test "check through the daemon prints and exits like a cold check" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/main.bl", clean_src())
+    let cold_clean = check()
+    write_file("{DIR}/main.bl", warn_src())
+    let cold_warn = check()
+    write_file("{DIR}/main.bl", error_src())
+    let cold_error = check()
+
+    let pid = start_daemon()
+    let before = served_checks()
+    let warm_error = check()
+    write_file("{DIR}/main.bl", warn_src())
+    let warm_warn = check()
+    write_file("{DIR}/main.bl", clean_src())
+    let warm_clean = check()
+    let after = served_checks()
+    if pid > 0 { stop_daemon(pid) }
+
+    assert(pid > 0)
+    assert_eq(cold_clean.exit_code, 0)
+    assert(cold_warn.err_out.contains("UnreachableCode"))
+    assert_eq(cold_error.exit_code, 1)
+    assert(same("clean", cold_clean, warm_clean))
+    assert(same("warnings", cold_warn, warm_warn))
+    assert(same("errors", cold_error, warm_error))
+    // The daemon checked main.bl once at start; each of the three checks above is its own.
+    if after != "\"checks\":3}" { io.eprintln("status before: {before}, after: {after}") }
+    assert_eq(after, "\"checks\":3}")
+}
+
+test "check --json through the daemon prints and exits like a cold check --json" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/main.bl", error_src())
+    let cold = sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json main.bl")
+    let pid = start_daemon()
+    let warm = sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json main.bl")
+    let after = served_checks()
+    if pid > 0 { stop_daemon(pid) }
+
+    assert(pid > 0)
+    assert(cold.err_out.contains("\"code\":\"E0300\""))
+    assert(same("json", cold, warm))
+    assert_eq(after, "\"checks\":1}")
+}
