@@ -833,8 +833,8 @@ fn decode(b: Bytes) -> Result[Str, ConversionError] {
 | `write_u32_le` / `write_u32_be` | `fn(mut self, Int)` | Append 4-byte little/big-endian unsigned; *grows* |
 | `write_i32_le` / `write_i32_be` | `fn(mut self, Int)` | Append 4-byte little/big-endian signed; *grows* |
 | `write_i64_le` / `write_i64_be` | `fn(mut self, Int)` | Append 8-byte little/big-endian signed; *grows* |
-| `with_ptr` | `fn[R](self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Read-only closure-scoped FFI pin; C must not write through the pointer; forwards the closure's effect row (see §9.1.3) |
-| `with_mut_ptr` | `fn[R](mut self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Closure-scoped FFI pin that C may write through; forwards the closure's effect row (see §9.1.3) |
+| `with_ptr` | `fn[R](self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Read-only closure-scoped FFI pin, legal only inside an FFI region (§9.1.1); C must not write through the pointer; forwards the closure's effect row (see §9.1.3) |
+| `with_mut_ptr` | `fn[R](mut self, fn(Ptr[U8]) -> R ! _) -> R ! _` | Closure-scoped FFI pin that C may write through, legal only inside an FFI region (§9.1.1); forwards the closure's effect row (see §9.1.3) |
 
 The `set_*_le/be(off, v)` family is the symmetric counterpart of the existing `read_*_le/be(off)` family: it writes at a given offset, requires `off + width <= len` (returns `Err` otherwise — does not grow), and complements the append-only `write_*_le/be(v)` writers. `set_*` and `write_*` are deliberately distinct verbs: `set` writes at a known offset, `write` appends. (Panel decision: [`ffi-struct-construction`](../decisions/ffi-struct-construction.md), Q-α-bytes-offset-API.)
 

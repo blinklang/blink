@@ -424,8 +424,43 @@ The region is a **purely syntactic**, per-function structural property, decided 
 - A closure literal written inside a region **inherits** it — the pointer operations stay legal in the closure body.
 - A `fn` clause in a `handler E { }` expression written inside a region **inherits** it, the same as a closure literal. A handler clause is a member of an expression value that captures its environment the same way a closure does (§4.7, *Basic handler syntax*), not an item: you cannot call, import or refer to it by name.
 - A **named** nested `fn` item does **not** inherit the enclosing region: it is its own function and needs its own `@ffi`/`@trusted` annotation or its own `ffi.scope` block. Blink does not parse named nested `fn` items today; this rule fixes their region behavior in advance, and it does not apply to handler clauses.
+- A closure passed to `Bytes.with_ptr` or `Bytes.with_mut_ptr` (§9.1.3) is an ordinary closure literal. It is **not** a region of its own: it inherits the region it is written in, or it has none. Its parameter is a `Ptr[U8]`, so outside a region that parameter is an E0811 site, whether it is named or `_`. So a `with_ptr` or `with_mut_ptr` call is legal only inside a region.
+
+```blink
+@trusted(audit: "LIBC-WRITE")
+pub fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO {
+    // the closure inherits the region of the @trusted body
+    let rc = data.with_ptr(fn(p) -> I64 { c_write(fd.to_i32(), p, data.len().to_u64()) })
+    if rc < 0 {
+        return Err(Errno(c_errno()))
+    }
+    Ok(rc)
+}
+
+fn peek(b: Bytes) -> U8 {
+    b.with_ptr(fn(p) -> U8 { p.deref() })  // E0811: `p` is a Ptr[U8] outside every region
+}
+```
 
 **E0811 covers bodies, not only signatures.** E0811 rejects a `Ptr[T]` (or an `@ffi.struct` that holds a `Ptr` field) at every site outside a region: a parameter or return type, a `let` annotation, and every expression in a function body whose checked type is a `Ptr[T]`. Whether a site is in a region is syntactic; whether an expression is a `Ptr` comes from its checked type. So a `p.deref()` in an ordinary function, outside every region, does not compile.
+
+**One report per pointer source.** E0811 reports once, at the outermost expression whose type holds a `Ptr`. A type holds a `Ptr` when it is a `Ptr[T]`, an `@ffi.struct` that holds a `Ptr` field, or a function type with a parameter or return type that holds one. *Outermost* is by the syntax tree, not by source order: when two such expressions nest, the enclosing one reports and the one inside it does not. A site that gets its pointer from a site already reported (a parameter, a `let` binding, or an enclosing expression) is not reported again. A pointer from a separate source, such as another `alloc_ptr`, `null_ptr` or `@ffi` call, is a separate site and reports on its own, so one report never hides an unrelated one. For `b.with_ptr(fn(p) { ... })` outside a region, that expression is the closure literal, because its type `fn(Ptr[U8]) -> R` holds a `Ptr`. E0811 reports once, on the closure literal, with a label that names the parameter, whether it is named or `_`. The uses of `p` in the body are not reported again.
+
+**E0811 help lines.** The help for an E0811 report lists the fixes that need no pointer before the `@trusted` fix. For a `with_ptr` or `with_mut_ptr` closure parameter, those fixes are a curated `std.libc.*_bytes` wrapper (§9.1.3.3) and `b.get(i)`. The help offers `b.get(i)` only when a syntactic test is certain that the closure body uses `p` only as the receiver of `.deref()` or `.offset(i)` and never passes `p` as an argument to a call; when the test is not certain, the line is left out. The help never suggests `with ffi.scope()`: a scope block costs an allocation at run time and gives a pin nothing. Neither help line is machine-applicable. No tool writes a claim for the author (§9.1, *Audit Records*). This section fixes the order and these limits, not the words:
+
+```
+error[E0811]: Ptr[T] used outside FFI context
+ --> app/main.bl:2:16
+  |
+2 |     b.with_ptr(fn(p) -> U8 { p.deref() })
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^ closure takes a `Ptr[U8]`
+  |                   - parameter `p` is a `Ptr[U8]`
+  |
+  = note: a `with_ptr` closure is not an FFI region; it inherits the region it is written in
+  = help: to read a byte, use `b.get(i)`; no pointer is needed
+  = help: to bind C yourself, put this call in an `@trusted(audit: "AUDIT-ID")` function
+          and add a record `AUDIT-ID` in audits.toml
+```
 
 A pointer that *escapes* its region dynamically — returned, stored past it, captured by an escaping closure, passed to an effect handler, or passed beside a pointer-holding argument — is not E0811's concern; that is the scope-escape diagnostic E0601 (§9.1.1, *Scope tags*).
 
@@ -1006,6 +1041,7 @@ with ffi.scope() as scope {
 For libc surfaces that take `void*` / `uint8_t*` / `char*` (read, write, recv, send, mmap-region, `iovec.iov_base`, `getrandom`, `ioctl`-data), the curated `std.libc.*` wrappers use `Bytes.with_mut_ptr` when C writes into the buffer and `Bytes.with_ptr` when C only reads it:
 
 ```blink
+@trusted(audit: "LIBC-READ")
 fn read(fd: I32, n: Int) -> Result[Bytes, Str] ! IO {
     let mut buf = Bytes.zeroed(n)
     let got = buf.with_mut_ptr(fn(p) { c_read(fd, p, n) })
@@ -1024,7 +1060,7 @@ fn with_ptr[R](self: Bytes, body: fn(Ptr[U8]) -> R ! _) -> R ! _
 fn with_mut_ptr[R](mut self: Bytes, body: fn(Ptr[U8]) -> R ! _) -> R ! _
 ```
 
-The closure body holds a `Ptr[U8]` aliasing the data of the `Bytes`. The two pins differ only in who may write:
+The closure body holds a `Ptr[U8]` aliasing the data of the `Bytes`. The closure is not an FFI region of its own: its parameter is a `Ptr[U8]`, so a call to either pin is legal only inside an FFI region (§9.1.1, *FFI regions*). The two pins differ only in who may write:
 
 - **`with_ptr` is read-only.** It takes plain `self`. C must not write through `p`. The compiler cannot check what C does, so the `byte-pin` audit category (§9.1.3.3) lists every call site for review.
 - **`with_mut_ptr` lets C write.** It declares `mut self` (§3.6 *Mutable Parameters*), so its receiver needs a mutable root; a call on an immutable root is `E0610`. A write that C makes through `p` changes only the receiver's value. It never shows through another name, because `Bytes` is a value (§3.2.3 *Bytes*).
@@ -1057,7 +1093,7 @@ User code is **forbidden** from constructing a `Ptr[U8]` that aliases a `Bytes`'
 
 The sanctioned paths for Bytes ↔ FFI interop are:
 
-1. `Bytes.with_ptr(fn(p) { ... })` (read-only) and `Bytes.with_mut_ptr(fn(p) { ... })` (C may write) — closure-scoped, for use inside an FFI region only.
+1. `Bytes.with_ptr(fn(p) { ... })` (read-only) and `Bytes.with_mut_ptr(fn(p) { ... })` (C may write) — closure-scoped. The closure parameter is a `Ptr[U8]`, so a call is legal only inside an FFI region (§9.1.1).
 2. `libc.copy_to_buf(b: Bytes) -> Buf[U8]` — copies bytes into a freshly-allocated, scope-tied `Buf[U8]`. See §9.1.3.2 for the surface and naming rules.
 3. `libc.copy_from_buf(buf: Buf[U8]) -> Bytes` — copies bytes out of a `Buf[U8]` into a fresh `Bytes`. The byte count is the length of the buffer.
 4. `libc.copy_from_buf_n(buf: Buf[U8], n: I64) -> Bytes` — truncating copy: copies up to `n` bytes (or fewer if the buffer is shorter) into a fresh `Bytes`. Used by syscalls whose return value reports the actual byte count (`read(2)`, `recv(2)`).
@@ -1127,7 +1163,7 @@ let chunk = libc.read_bytes(fd, 8192)?    // read up to 8192 bytes from any fd
 libc.write_bytes(out_fd, chunk)?          // write raw bytes to a file/pipe/socket fd
 ```
 
-These wrappers do **not** use the byte-bridge primitives. They are built on the sanctioned `Bytes → Ptr[U8]` pins (§9.1.3): a read binds `let mut buf = Bytes.zeroed(n)`, pins it with `with_mut_ptr` to receive into and returns `buf.slice(0, got)`; a write pins the caller's `Bytes` read-only with `with_ptr` and hands C a `const uint8_t*`. `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` are reserved **exclusively** for the sealed-`Buf` path (where the user can never name `Buf`); the curated wrappers never call them. The boundary is *user-owned `Bytes` (→ `with_ptr`)* vs *unnameable sealed `Buf` (→ bridge primitives)*, not reads-vs-writes.
+These wrappers do **not** use the byte-bridge primitives. They are built on the sanctioned `Bytes → Ptr[U8]` pins (§9.1.3): a read binds `let mut buf = Bytes.zeroed(n)`, pins it with `with_mut_ptr` to receive into and returns `buf.slice(0, got)`; a write pins the caller's `Bytes` read-only with `with_ptr` and hands C a `const uint8_t*`. Each wrapper is a `@trusted(audit: K)` `pub fn`, so its pin closure is inside an FFI region (§9.1.1). Its audit record states what the compiler cannot check: C does not write through a `with_ptr` pointer, and the length passed to C matches the buffer. `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` are reserved **exclusively** for the sealed-`Buf` path (where the user can never name `Buf`); the curated wrappers never call them. The boundary is *user-owned `Bytes` (→ `with_ptr`)* vs *unnameable sealed `Buf` (→ bridge primitives)*, not reads-vs-writes.
 
 ##### 9.1.3.3 The v1 `libc.*_bytes` minimum set (A2 ship gate)
 
