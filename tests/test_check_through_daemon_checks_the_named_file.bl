@@ -1,7 +1,7 @@
 // `blink check <path>` checks the file it names, daemon or no daemon. The daemon answers only
 // for the file it serves, asked from the directory it started in; for any other file the check
-// runs cold. The client finds the socket beside the file it checks (`<dir of path>/.blink`),
-// which is where `blink daemon start <path>` puts it.
+// runs cold. The client finds the project's daemon in .blink/ at the project root (the
+// directory holding blink.toml), wherever in the project the file it checks lives.
 
 import std.process.{ProcessResult}
 
@@ -19,10 +19,10 @@ fn error_src() -> Str {
     "fn main() \{\n    let s: Int = \"no\"\n    io.println(\"\{s}\")\n}\n"
 }
 
-// The pid of a daemon started in DIR on `entry`, or -1. `sock_dir` is where its socket goes.
-// The timeout ends a daemon that nothing stopped.
-fn start_daemon(entry: Str, sock_dir: Str) -> Int {
-    let r = sh("B=$(pwd)/build/blink; cd {DIR} && rm -rf {sock_dir}/.blink && (timeout 120 $B daemon start {entry} > daemon.log 2>&1 &); for i in $(seq 1 400); do if [ -S {sock_dir}/.blink/daemon.sock ]; then cat {sock_dir}/.blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f {sock_dir}/.blink/daemon.pid ] && kill $(cat {sock_dir}/.blink/daemon.pid); exit 1")
+// The pid of a daemon started in DIR on `entry`, or -1. Its socket goes at the project root,
+// DIR. The timeout ends a daemon that nothing stopped.
+fn start_daemon(entry: Str) -> Int {
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && rm -rf .blink && (timeout 120 $B daemon start {entry} > daemon.log 2>&1 &); for i in $(seq 1 400); do if [ -S .blink/daemon.sock ]; then cat .blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f .blink/daemon.pid ] && kill $(cat .blink/daemon.pid); exit 1")
     if r.exit_code != 0 { return -1 }
     r.out.trim().to_int()
 }
@@ -31,8 +31,8 @@ fn stop_daemon(pid: Int) {
     let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
 }
 
-fn served_checks(sock_dir: Str) -> Str {
-    let out = sh("B=$(pwd)/build/blink; cd {DIR}/{sock_dir} && $B daemon status").out
+fn served_checks() -> Str {
+    let out = sh("B=$(pwd)/build/blink; cd {DIR} && $B daemon status").out
     match out.byte_index_of("\"checks\":", 0) {
         Some(at) => out.byte_slice(at, out.byte_len()).trim()
         None => "no status: {out}"
@@ -41,12 +41,15 @@ fn served_checks(sock_dir: Str) -> Str {
 
 test "a check of another file in the daemon's directory checks that file" {
     let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"check_named_file\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check here.
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
     write_file("{DIR}/main.bl", clean_src())
     write_file("{DIR}/other.bl", error_src())
     let cold = sh("B=$(pwd)/build/blink; cd {DIR} && $B check other.bl")
-    let pid = start_daemon("main.bl", ".")
+    let pid = start_daemon("main.bl")
     let warm = sh("B=$(pwd)/build/blink; cd {DIR} && $B check other.bl")
-    let after = served_checks(".")
+    let after = served_checks()
     if pid > 0 { stop_daemon(pid) }
 
     assert(pid > 0)
@@ -61,13 +64,15 @@ test "a check of another file in the daemon's directory checks that file" {
     assert_eq(after, "\"checks\":0}")
 }
 
-test "a check finds the daemon socket beside the file it names" {
+test "a check of a file in a subdirectory asks the project daemon" {
     let _ = sh("rm -rf {DIR}; mkdir -p {DIR}/sub")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"check_named_file\"\nversion = \"0.1.0\"\n")
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
     write_file("{DIR}/sub/main.bl", error_src())
     let cold = sh("B=$(pwd)/build/blink; cd {DIR} && $B check sub/main.bl")
-    let pid = start_daemon("sub/main.bl", "sub")
+    let pid = start_daemon("sub/main.bl")
     let warm = sh("B=$(pwd)/build/blink; cd {DIR} && $B check sub/main.bl")
-    let after = served_checks("sub")
+    let after = served_checks()
     if pid > 0 { stop_daemon(pid) }
 
     assert(pid > 0)

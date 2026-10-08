@@ -2,7 +2,7 @@ import symbol_index.{si_build, si_reset, si_sym_count, si_file_count}
 import query.{query_dispatch}
 import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render}
 import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int}
-import std.path.{path_join}
+import std.path.{path_join, path_dirname}
 import lexer.{Lex}
 import parser.{Parse}
 import typecheck.{TypeCheck}
@@ -193,15 +193,38 @@ fn daemon_stop() ! Daemon.Serve {
     daemon_running = 0
 }
 
+// ── Socket location ─────────────────────────────────────────────────
+
+// A project has one daemon. It keeps its socket and pid file in .blink/ at the project root:
+// the nearest directory at or above the cwd that holds blink.toml, else the cwd. Every daemon
+// subcommand and client asks this one function, so they agree on whether a daemon runs. The
+// path stays relative to the cwd, since bind refuses a socket path over 107 bytes.
+fn daemon_dir() -> Str {
+    let mut abs = env.cwd()
+    let mut rel = ""
+    while file_exists(path_join(rel, "blink.toml")) != 1 {
+        let up = path_dirname(abs)
+        if up == abs {
+            return ".blink"
+        }
+        abs = up
+        rel = path_join(rel, "..")
+    }
+    path_join(rel, ".blink")
+}
+
+pub fn daemon_socket_path() -> Str {
+    path_join(daemon_dir(), "daemon.sock")
+}
+
 // ── Startup ─────────────────────────────────────────────────────────
 
-pub fn daemon_start(root: Str, source: Str) ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+pub fn daemon_start(source: Str) ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     daemon_source_path = source
     daemon_cwd = env.cwd()
     daemon_start_time = time_ms()
 
-    // Ensure .blink/ directory exists
-    let blink_dir = path_join(root, ".blink")
+    let blink_dir = daemon_dir()
     shell_exec("mkdir -p {blink_dir}")
 
     // Write PID file
@@ -210,7 +233,7 @@ pub fn daemon_start(root: Str, source: Str) ! Daemon.Serve, Lex.Tokenize, Parse,
     write_file(daemon_pid_path, "{pid}")
 
     // Create Unix socket
-    daemon_sock_path = path_join(blink_dir, "daemon.sock")
+    daemon_sock_path = daemon_socket_path()
     daemon_socket_fd = unix_socket_listen(daemon_sock_path)
     if daemon_socket_fd < 0 {
         io.eprintln("daemon: failed to create socket at {daemon_sock_path}")

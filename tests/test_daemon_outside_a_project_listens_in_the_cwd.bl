@@ -1,0 +1,48 @@
+// Outside any project (no blink.toml in the cwd or above it), the daemon listens in .blink/ in
+// the cwd, not beside the entry file, and status from that cwd finds it. The fixture lives
+// under a fresh temporary directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// Starts `blink daemon start <entry>` from `from` and gives the pid of its timeout runner, which
+// passes a kill on to the daemon. The timeout ends a daemon that nothing stopped.
+fn start_daemon(from: Str, entry: Str, log: Str) -> Int {
+    let r = sh("B=$(pwd)/build/blink; L={log}; cd {from} && (timeout 120 $B daemon start {entry} > $L 2>&1 & echo $!)")
+    r.out.trim().to_int()
+}
+
+// True once the socket at `sock` exists, within 20 seconds.
+fn wait_for_socket(sock: Str) -> Bool {
+    sh("for i in $(seq 1 400); do [ -S {sock} ] && exit 0; sleep 0.05; done; exit 1").exit_code == 0
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+test "outside a project the daemon listens in the cwd" {
+    let dir = sh("mktemp -d /tmp/blink_daemon_no_project.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/app")
+    write_file("{dir}/app/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    let no_project = sh("d={dir}; while [ \"$d\" != / ]; do [ -e \"$d/blink.toml\" ] && exit 1; d=$(dirname \"$d\"); done; exit 0").exit_code == 0
+    let pid = start_daemon(dir, "app/main.bl", "{dir}/daemon.log")
+    let up = wait_for_socket("{dir}/.blink/daemon.sock")
+    let beside_entry = sh("[ -e {dir}/app/.blink/daemon.sock ]").exit_code == 0
+    let status = sh("B=$(pwd)/build/blink; cd {dir} && $B daemon status")
+    stop_daemon(pid)
+    let log = read_file("{dir}/daemon.log")
+    let _ = sh("rm -rf {dir}")
+    if !up { io.eprintln(log) }
+
+    assert(no_project)
+    assert(pid > 0)
+    assert(up)
+    assert(!beside_entry)
+    assert_eq(status.exit_code, 0)
+    assert(status.out.contains("\"uptime_ms\":"))
+}

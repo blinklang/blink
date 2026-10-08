@@ -1,0 +1,73 @@
+// When a daemon answers, `blink check` prints the daemon's stdout and stderr and exits with its
+// code; it runs no check of its own. The test plays the daemon: it listens on the project
+// daemon socket, .blink/daemon.sock at the project root, and replies with text and a code that
+// no check of main.bl could give, so the test passes only when the client used the reply, never
+// through a cold check.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/check_prints_daemon_reply"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// Starts `blink check main.bl` in the background; its output and exit code land in files.
+fn start_client() {
+    let _ = sh("B=$(pwd)/build/blink; cd {DIR} && ((timeout 60 $B check main.bl > out.txt 2> err.txt; echo $? > rc.txt) > /dev/null 2>&1 &)")
+}
+
+fn wait_client() -> Str {
+    let r = sh("cd {DIR} && for i in $(seq 1 600); do [ -s rc.txt ] && cat rc.txt && exit 0; sleep 0.05; done; exit 1")
+    r.out.trim()
+}
+
+test "check prints the stdout and stderr of a daemon reply and exits with its code" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}/.blink")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"prints_reply\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check here.
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{DIR}/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    let listener = unix_socket_listen("{DIR}/.blink/daemon.sock")
+    assert(listener >= 0)
+    start_client()
+    let conn = unix_socket_accept_timeout(listener, 20000)
+    let mut request = ""
+    if conn >= 0 {
+        request = socket_read_line(conn)
+        socket_write(conn, "\{\"ok\":true,\"served\":1,\"changed\":0,\"exit\":3,\"stdout\":\"from the daemon\\n\",\"stderr\":\"warning: only the daemon says this\\n\"}\n")
+        unix_socket_close(conn)
+    }
+    unix_socket_close(listener)
+    let rc = wait_client()
+
+    assert(conn >= 0)
+    assert(request.contains("\"type\":\"check\""))
+    assert(request.contains("\"path\":\"main.bl\""))
+    assert_eq(rc, "3")
+    assert_eq(read_file("{DIR}/out.txt"), "from the daemon\n")
+    assert_eq(read_file("{DIR}/err.txt"), "warning: only the daemon says this\n")
+}
+
+test "check runs cold when the daemon's reply is cut short" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}/.blink")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"prints_reply\"\nversion = \"0.1.0\"\n")
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{DIR}/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    let listener = unix_socket_listen("{DIR}/.blink/daemon.sock")
+    assert(listener >= 0)
+    start_client()
+    let conn = unix_socket_accept_timeout(listener, 20000)
+    if conn >= 0 {
+        let _ = socket_read_line(conn)
+        socket_write(conn, "\{\"ok\":true,\"served\":1,\"exit\":3,\"stdo")
+        unix_socket_close(conn)
+    }
+    unix_socket_close(listener)
+    let rc = wait_client()
+
+    assert(conn >= 0)
+    assert_eq(rc, "0")
+    assert_eq(read_file("{DIR}/out.txt"), "ok: main.bl\n")
+    assert_eq(read_file("{DIR}/err.txt"), "")
+}
