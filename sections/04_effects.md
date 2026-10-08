@@ -2391,11 +2391,21 @@ fn producer_consumer() ! Async {
 
 | Method | Behavior |
 |--------|----------|
-| `ch.send(value: T)` | Blocks while the buffer is full, then adds `value`. **Panics if `ch` is closed.** |
+| `ch.send(value: T)` | Blocks while the buffer is full, then adds `value`. **Panics if `ch` is closed.** Copies each shared cell `value` reaches (see *Shared cells cross a channel as copies* below). |
 | `ch.recv() -> Option[T]` | Blocks until a value is ready or `ch` is closed. Returns `Some(value)` for the next value. Returns `None` only when `ch` is closed **and** every buffered value is received. |
 | `ch.close()` | Marks `ch` closed. Values already in the buffer stay receivable. A second `close()` does nothing. |
 
 `recv()` is the only blocking receive. There is no `try_recv` and no `is_closed()`: a check before a receive races with other consumers, and `recv()` already gives the answer in one step.
+
+**Shared cells cross a channel as copies.** `ch.send(value)` copies each shared cell (§3.6 *Shared cells*) that `value` reaches, at any depth. The receiver gets its own cells. A later change on either side does not show on the other, so a buffer can be sent and then reused:
+
+```blink
+let mut batch = [1, 2]
+ch.send(batch)
+batch.clear()          // the receiver still gets [1, 2]
+```
+
+The copy takes time in proportion to the size of the cells it copies. It is the only deep copy in the language, and no function exposes it on its own: `clone()` and binding share a cell (§3.6.1 *Clone Semantics*). A capture in `async.spawn` is not copied; the spawn freezes the cells it reaches instead (§2.8 *Shared cells in a spawned task*). See [decisions/spawn-shared-cell-freeze.md](../decisions/spawn-shared-cell-freeze.md).
 
 **The delivery guarantee.** A drain of the channel receives every sent value, in the order sent. A sent value never ends the stream. Closed is a state of the channel, never a value of `T`. `0`, `""`, `false` and — on a `Channel[Option[T]]` — `None` all arrive as `Some(...)`:
 
@@ -2750,7 +2760,7 @@ test "map with mock DB" {
 
 **Closures (§2.8):** Closures used as effectful callbacks follow the same capture rules. Effect annotations on the closure type describe what the closure *body* does, not what it captures.
 
-**async.spawn (§4.13):** `async.spawn` takes `fn() -> T ! _` — the spawned task inherits whatever effects the closure declares. The existing E0650 restriction on `let mut` captures still applies.
+**async.spawn (§4.13):** `async.spawn` takes `fn() -> T ! _` — the spawned task inherits whatever effects the closure declares. The existing E0650 restriction on `let mut` captures still applies, and so does the freeze of the shared cells its captures reach (§2.8 *Shared cells in a spawned task*).
 
 #### 4.15.5 What Is Deferred to v2
 

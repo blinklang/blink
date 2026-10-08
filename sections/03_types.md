@@ -2670,6 +2670,8 @@ A method cannot change its caller's value through `self`. State that must persis
 
 This list is the only one; other sections refer to it. `Bytes` is not on it: a `Bytes` is a value (§3.2.3 *Bytes*).
 
+Across tasks, `async.spawn` freezes each shared cell its captures reach until the task is joined (§2.8 *Shared cells in a spawned task*), and `ch.send` copies each shared cell the sent value reaches (§4.13 *Channel operations*).
+
 Only a shared cell can change through a second name. A value of any other type, at any depth, cannot. This holds for every copy: bind, pass, return and `clone()` (§3.6.1 *Clone Semantics*).
 
 #### Mutable Parameters
@@ -3516,7 +3518,7 @@ let a = Tree.Node(value: 1, next: Tree.Leaf)
 let b = a.clone()          // same value as `let b = a`
 ```
 
-Deep clone is not provided in v1. A `DeepClone` trait can be added post-v1 for use cases requiring full structural independence.
+Deep clone is not provided in v1: no function or method makes a deep copy. `ch.send` copies the shared cells a value reaches, but only as part of the send (§4.13 *Shared cells cross a channel as copies*). A `DeepClone` trait can be added post-v1 for use cases requiring full structural independence.
 
 ##### Debug vs Display
 
