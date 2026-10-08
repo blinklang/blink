@@ -48,6 +48,7 @@ import compiler.{
 import cg.{Codegen, CgConfig, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_with, generate_module_object_with, program_facts, enumerate_program_modules, archive_unit_modules}
 import build_unit_headers.{HeaderIndex, index_headers, unit_includes, splice_includes}
 import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
+import ir.{ir_track_sources, ir_sources_read}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
 import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced}
 import stdlib_native_deps.{
@@ -1365,6 +1366,9 @@ fn per_module_fallback_reason(emit_mode: Str, format_flag: Str) -> Str {
 type UnitHeaders {
     index: HeaderIndex
     order: List[Str]
+    // Every header written, the types header first, and its text.
+    files: List[Str]
+    texts: List[Str]
 }
 
 // Writes the types header and each module's two headers into dir.
@@ -1386,7 +1390,11 @@ fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, facts: Pr
         names.push(c_module_private_header_name(m))
         texts.push(hs.internal)
     }
-    Ok(UnitHeaders { index: index_headers(names, texts), order: names })
+    let mut files = [c_program_types_header_name()]
+    let mut file_texts = [types]
+    for n in names { files.push(n) }
+    for t in texts { file_texts.push(t) }
+    Ok(UnitHeaders { index: index_headers(names, texts), order: names, files: files, texts: file_texts })
 }
 
 // Module m's unit with an include of each header it needs besides its own pub header, and the
@@ -1432,7 +1440,7 @@ type CompiledUnits {
     units: List[emit_record.EmittedUnit]
     // The text of the emit's inputs; "" when this build may neither reuse nor record units.
     inputs: Str
-    // The sha of each file, when the build took the files from the last build's record.
+    // The sha of each file, when the build already hashed them.
     shas: Option[Map[Str, Str]]
     // The emit reported no diagnostic, so a build that reuses its units reports all it did.
     recordable: Bool
@@ -1491,21 +1499,143 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let unit_modules = archive_unit_modules(program, cfg)
     let urc = units_bail_on_diag()
     if urc != 0 { return Err(urc) }
+    let sources = unit_sources(unit_modules)
+    let mut taken: Option[emit_record.TakenUnits] = None
+    if inputs != "" && sources.tracked {
+        let mut candidates: List[Str] = []
+        for m in unit_modules {
+            if m != "__main__" { candidates.push(m) }
+        }
+        taken = emit_record.take_units(last_dir, dir, inputs, candidates, sources.own, hs.files, hs.texts)
+    }
+    let mut by_module: Map[Str, emit_record.EmittedUnit] = Map()
+    match taken {
+        Some(t) => {
+            for u in t.units {
+                dbg_trace("build.units", "reuse unit {u.module}")
+                by_module.insert(u.module, u)
+            }
+        }
+        None => {}
+    }
+    for m in unit_modules {
+        if by_module.contains_key(m) { continue }
+        match emit_unit(program, m, cfg, facts, hs, sources, dir) {
+            Ok(u) => by_module.insert(m, u)
+            Err(rc) => return Err(rc)
+        }
+    }
+    let mut shas: Option[Map[Str, Str]] = None
+    if inputs != "" {
+        // Hashed with the units, so the record can name the inputs text by its sha.
+        write_file("{dir}/{emit_record.inputs_name()}", inputs)
+        let last = emit_record.last_inputs_name()
+        shas = build_objcache.unit_file_shas_with(dir, resolve_archive_dir(), [emit_record.inputs_name()])
+        match taken {
+            Some(t) => {
+                let held = match shas {
+                    Some(s) => emit_record.taken_units_hold(t, s)
+                    None => false
+                }
+                if !held {
+                    // Another build replaced the last units directory after this one read its
+                    // record, so what it took may be of two builds. It emits them after all.
+                    for u in t.units {
+                        dbg_trace("build.units", "emit unit {u.module} again")
+                        shell_exec("rm -f \"{dir}/{u.module}.c\"")
+                        match emit_unit(program, u.module, cfg, facts, hs, sources, dir) {
+                            Ok(e) => by_module.insert(u.module, e)
+                            Err(rc) => return Err(rc)
+                        }
+                    }
+                    shas = build_objcache.unit_file_shas_with(dir, resolve_archive_dir(), [emit_record.inputs_name()])
+                }
+            }
+            None => {}
+        }
+        shell_exec("rm -f \"{dir}/{last}\"")
+    }
     let mut out: List[emit_record.EmittedUnit] = []
     for m in unit_modules {
-        // Copy-update, so a field added to CgConfig later keeps cfg's value here.
-        let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
-        let raw = generate_module_object_with(program, m, c_module_header_name(m), obj_cfg, facts)
-        let orc = units_bail_on_diag()
-        if orc != 0 { return Err(orc) }
-        let (c, headers) = unit_with_includes(raw, m, hs)
-        write_file("{dir}/{m}.c", c)
-        out.push(emit_record.EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers })
+        match by_module.get(m) {
+            Some(u) => out.push(u)
+            None => {}
+        }
     }
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: None, recordable: recordable })
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable })
+}
+
+// The loaded sources, as a unit's emit tells which it read.
+type UnitSources {
+    // The node ranges are in node order and one path per range, so a node names one source.
+    tracked: Bool
+    firsts: List[Int]
+    ends: List[Int]
+    paths: List[Str]
+    modules: List[Str]
+    // The path of each source of a module that has a unit.
+    own: Map[Str, Bool]
+}
+
+fn unit_sources(unit_modules: List[Str]) -> UnitSources {
+    let firsts = loaded_inputs.source_first_nodes
+    let ends = loaded_inputs.source_end_nodes
+    let paths = loaded_inputs.source_paths
+    let modules = loaded_inputs.source_modules
+    let n = paths.len()
+    let mut tracked = firsts.len() == n && ends.len() == n && modules.len() == n
+    let mut i = 0
+    while tracked && i < n {
+        if ends[i] < firsts[i] || (i > 0 && firsts[i] < ends[i - 1]) { tracked = false }
+        i = i + 1
+    }
+    let mut has_unit: Map[Str, Bool] = Map()
+    for m in unit_modules { has_unit.insert(m, true) }
+    let mut own: Map[Str, Bool] = Map()
+    if tracked {
+        i = 0
+        while i < n {
+            if has_unit.contains_key(modules[i]) { own.insert(paths[i], true) }
+            i = i + 1
+        }
+    }
+    UnitSources { tracked: tracked, firsts: firsts, ends: ends, paths: paths, modules: modules, own: own }
+}
+
+// Emits module m's unit into dir, with the sources its IR spanned.
+fn emit_unit(program: Int, m: Str, cfg: CgConfig, facts: ProgramFacts, hs: UnitHeaders, sources: UnitSources, dir: Str) -> Result[emit_record.EmittedUnit, Int] ! Diag.Report, Codegen {
+    if sources.tracked { ir_track_sources(sources.firsts, sources.ends) }
+    // Copy-update, so a field added to CgConfig later keeps cfg's value here.
+    let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
+    let raw = generate_module_object_with(program, m, c_module_header_name(m), obj_cfg, facts)
+    let orc = units_bail_on_diag()
+    if orc != 0 { return Err(orc) }
+    let (c, headers) = unit_with_includes(raw, m, hs)
+    write_file("{dir}/{m}.c", c)
+    Ok(emit_record.EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers, uses: unit_uses(m, sources) })
+}
+
+// The sources module m's unit read: those its IR spanned, and its own, whose every edit can
+// move a line the unit carries. Empty, so no later build takes the unit on its own, when the
+// module has no source of its own to key on.
+fn unit_uses(m: Str, sources: UnitSources) -> List[Str] {
+    if !sources.tracked { return [] }
+    let mut read: Map[Int, Bool] = Map()
+    for i in ir_sources_read() { read.insert(i, true) }
+    let mut out: List[Str] = []
+    let mut has_own = false
+    let mut i = 0
+    while i < sources.paths.len() {
+        let is_own = sources.modules[i] == m
+        if is_own { has_own = true }
+        if is_own || read.contains_key(i) { out.push(sources.paths[i]) }
+        i = i + 1
+    }
+    if !has_own { return [] }
+    out
 }
 
 fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {

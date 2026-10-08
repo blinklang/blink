@@ -1,0 +1,178 @@
+// A per-module build that takes some units from the last build and emits the rest writes the
+// same C as a build with no last build to take from, after each kind of edit a user makes: a
+// body edit, a signature edit, a new import, a removed import, an edit in a module only the
+// entry imports, an edit in a module every module imports, and edits to a field default and
+// a keyword-parameter default, which a unit of another module lowers, and a call that needs a
+// new instance of a generic, which the generic's own unit defines. The binaries print the
+// same. A unit whose inputs no edit touched is taken, not emitted.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"unit_reuse_app\"\nversion = \"0.1.0\"\n")
+    // Every module imports base. Its field default reads a list, so the default's lowering
+    // carries base's file and line into the unit of each module that builds a Cfg.
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub type Cfg {"#,
+        #"    n: Int = [10, 20].get(1).unwrap()"#,
+        #"}"#,
+        #""#,
+        #"pub fn scaled(x: Int, -- by: Int = 3) -> Int {"#,
+        #"    x * by"#,
+        #"}"#,
+        #""#,
+        #"pub fn pair_left[T](a: T, b: T) -> T {"#,
+        #"    a"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{Cfg, pair_left, scaled, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    let c = Cfg { }"#,
+        #"    tag("{c.n} {scaled(pair_left(2, 9))}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn other() -> Str {"#,
+        #"    tag("other")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{pair_left, tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    let _p = pair_left(1, 2)"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import other.{other}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {other()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            out.push(line.byte_slice(29, line.byte_len()))
+        }
+    }
+    out
+}
+
+// One edit's result: which C files differ between a build that keeps the last build's units
+// and a build with none, the outputs of both binaries, and the units the first build took.
+type Step {
+    what: Str
+    differ: Str
+    warm_out: Str
+    cold_out: Str
+    reused: List[Str]
+}
+
+fn warm_and_cold(tree: Str, what: Str) -> Step {
+    let warm = build_into(tree, "out")
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, "cold")
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    Step { what: what, differ: differ.split("\n").join(" "), warm_out: sh("{tree}/out/app"), cold_out: sh("{tree}/cold/app"), reused: reused_units(warm) }
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+test "units taken from the last build match a cold build after each kind of edit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_unit_reuse_cold_equal_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "out")
+    let mut steps: List[Step] = []
+    // A body edit that adds a line in the module every module imports, above the type whose
+    // field default other units lower.
+    edit(tree, "base.bl", #"2i\    let _pad = 1"#)
+    steps.push(warm_and_cold(tree, "base body"))
+    // A body edit in a module only the entry imports.
+    edit(tree, "leaf.bl", #"s/"leaf"/"leaf2"/"#)
+    steps.push(warm_and_cold(tree, "leaf body"))
+    // A signature edit, and the call that follows it.
+    edit(tree, "other.bl", #"s/pub fn other() -> Str/pub fn other(k: Int) -> Str/; s/tag("other")/tag("other{k}")/"#)
+    edit(tree, "main.bl", #"s/{other()}/{other(7)}/"#)
+    steps.push(warm_and_cold(tree, "signature"))
+    // A new import, and its use.
+    edit(tree, "mid.bl", #"1i\import leaf.{leaf_value}"#)
+    edit(tree, "mid.bl", #"s/{scaled(pair_left(2, 9))}")/{scaled(pair_left(2, 9))} {leaf_value()}")/"#)
+    steps.push(warm_and_cold(tree, "new import"))
+    // The import removed again.
+    edit(tree, "mid.bl", #"/^import leaf/d; s/ {leaf_value()}//"#)
+    steps.push(warm_and_cold(tree, "removed import"))
+    // A field default's edit, which reaches the units that build a Cfg.
+    edit(tree, "base.bl", "s/get(1).unwrap()/get(0).unwrap()/")
+    steps.push(warm_and_cold(tree, "field default"))
+    // A keyword-parameter default's edit, which reaches the units that call scaled.
+    edit(tree, "base.bl", "s/by: Int = 3/by: Int = 5/")
+    steps.push(warm_and_cold(tree, "keyword default"))
+    // A new instance of base's generic, which base's unit defines, from an edit in leaf.
+    edit(tree, "leaf.bl", #"s/tag("leaf2")/tag(pair_left("leaf2", "x"))/"#)
+    steps.push(warm_and_cold(tree, "new instance"))
+    shell_exec("rm -rf {tree}")
+    for s in steps {
+        assert_eq("{s.what}: {s.differ}", "{s.what}: ")
+        assert_eq("{s.what}: {s.warm_out}", "{s.what}: {s.cold_out}")
+    }
+    assert_eq(steps.get(4).unwrap().warm_out, "[main] [20 6] [other7] [leaf2]")
+    assert_eq(steps.get(6).unwrap().warm_out, "[main] [10 10] [other7] [leaf2]")
+    // The leaf edit touches no input of base's, mid's or other's unit.
+    assert_eq(steps.get(1).unwrap().reused.join(","), "base,mid,other")
+    assert_eq(steps.get(7).unwrap().warm_out, "[main] [10 10] [other7] [leaf2]")
+}
