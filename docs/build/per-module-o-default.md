@@ -251,8 +251,20 @@ column is the gen1 of `b59311e8` under the same conditions.
 | small | test-body-inventory | 0.141 | 0.140 | 0.139 | 1 |
 | small | cold-obj | 0.138 | 0.214 | 0.123 | 5 |
 
-The `test-*` cases do not take the flag, so both columns run the same
-path there. What the numbers show:
+When this table was measured, `blink test` did not take the flag, so the
+`test-*` rows ran the same path in both columns. Since `5ac58904` it does,
+and `BENCH_FLAGS` reaches the `test-*` cases. The `test-*` rows from the
+gen1 `blink` of `a2bb3b1a` (before) and of `5ac58904` (after), under the same
+conditions; `bench/edit_loop/monolith_5ac58904.tsv` and
+`bench/edit_loop/per_module_5ac58904.tsv` hold the full rows:
+
+| target | case | monolith before | monolith after | `--per-module` before | `--per-module` after | units compiled |
+|---|---|---|---|---|---|---|
+| cli | test-body-cname | 2.123 | 2.121 | 2.116 | 0.602 | 1 |
+| small | test-body-inventory | 0.143 | 0.139 | 0.140 | 0.134 | 1 |
+
+In the before column the flag did not reach `blink test`. The other rows of
+both runs are within 0.05 s of each other. What the numbers show:
 
 - A small program is now as fast as the monolith or faster on every case.
   No few-modules threshold sends it to the one-unit path.
