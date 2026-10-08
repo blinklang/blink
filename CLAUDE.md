@@ -26,6 +26,7 @@ gen0 is pinned to tag gen0-rewrite-selfhost-11 (main at 36aba901, VERSION 0.54.0
 `task ci` is the gate for each change; `task ci-release` is the release gate
 Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/blinkc_main.bl (compiler binary)
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/
+decisions/ holds only the rationale for panel votes (DECISIONS.md links each). Build and codegen design notes go in docs/build/
 Build output: build/ (gitignored)
 
 ## Build & Verify

@@ -1228,7 +1228,7 @@ cc -o build/main_modules/bin $(ls build/main_modules/*.c | sort) -Ibuild -lm -lg
 resolve; the entry module owns runtime globals and every other module
 externs them. The legacy hidden `__emit-per-module <file.bl> <outdir>`
 subcommand still works as a deprecation alias for one release. See
-`decisions/per-module-o-default.md` for the rationale and the path to making
+`docs/build/per-module-o-default.md` for the rationale and the path to making
 per-module the default build path.
 
 ### Compiler Daemon

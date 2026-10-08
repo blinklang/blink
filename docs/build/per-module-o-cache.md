@@ -140,7 +140,7 @@ determinism at the `.c`/`.h` level which is what `blinkc` owns.
 ### 7. Why this works — cross-link to ownership policy
 
 Cache hits are safe because each `.o` is self-contained at link time,
-which is exactly what `decisions/generic-mono-ownership-per-module.md`
+which is exactly what `generic-mono-ownership-per-module.md`
 guarantees:
 
 - Stdlib monos live in the archive `monolith.o` — never duplicated
