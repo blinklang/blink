@@ -1,7 +1,8 @@
 // An assert that fails inside a non-generic std function runs in the stdlib archive, a
 // different C unit from the test runner. It must reach the runner's per-test frame: the
 // test is reported as failed and the run goes on to the next test. A crash here exits by
-// signal and prints no record.
+// signal and prints no record. This holds for the one-unit build and for the per-module
+// build, so each test asks for its build by name.
 //
 // Fixture basenames must be unique per worker: `build/blink test` writes the compiled
 // binary to `build/<basename>`.
@@ -21,9 +22,10 @@ fn definitions_naming(c: Str, part: Str) -> List[Str] {
     out
 }
 
-test "an assert that fails in the std archive fails its test and the run goes on" {
-    let tag = "std_archive_assert_{getpid()}"
-    let scratch = ".tmp/_test_std_archive_assert_{getpid()}"
+// Runs `{blink} {fixture}` on a fixture whose first test fails inside assert_close, and
+// checks the report. `c_files` names the C the build wrote: the one file, or every unit.
+fn check_std_archive_assert(tag: Str, blink: Str, c_files: Str) {
+    let scratch = ".tmp/_test_std_archive_assert_{tag}"
     shell_exec("rm -rf {scratch}")
     shell_exec("mkdir -p {scratch}")
     let fixture = "{scratch}/{tag}.bl"
@@ -39,14 +41,14 @@ test "an assert that fails in the std archive fails its test and the run goes on
         #"}"#,
         #""#,
     ].join("\n"))
-    let r = process_run("build/blink", ["test", "--json", fixture])
-    let user_c = read_file("build/{tag}.c")
+    let r = process_run("sh", ["-c", "{blink} {fixture}"])
+    let user_c = sh("cat {c_files} 2>/dev/null")
     let archive_syms = sh("nm build/libblink_std.a 2>/dev/null | grep -c ' T blink_std_testing_assert_close$'")
-    shell_exec("rm -rf {scratch} build/{tag} build/{tag}.c")
+    shell_exec("rm -rf {scratch} build/{tag} build/{tag}.c build/{tag}.units")
     let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
 
     // The failing assert is in the archive's unit: the program only declares and calls it.
-    assert(user_c.contains("blink_std_testing_assert_close(1.0, 2.0, 0.1)"), "the program does not call assert_close")
+    assert(user_c.contains("blink_std_testing_assert_close(1.0, 2.0, 0.1)"), "the program does not call assert_close; {diag}")
     assert_eq(definitions_naming(user_c, "blink_std_testing_assert_close(").len(), 0)
     assert_eq(archive_syms, "1")
 
@@ -55,4 +57,16 @@ test "an assert that fails in the std archive fails its test and the run goes on
     assert(r.out.contains("assert_close failed"), "no assert_close message; {diag}")
     assert(r.out.contains("\{\"name\":\"runs after\",\"status\":\"passed\""), "the next test did not run; {diag}")
     assert(r.out.contains("\"passed\":1,\"failed\":1"), "wrong summary; {diag}")
+}
+
+test "an assert that fails in the std archive fails its test and the run goes on" {
+    let tag = "std_archive_assert_{getpid()}"
+    check_std_archive_assert(tag, "build/blink test --json --no-per-module", "build/{tag}.c")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// fall back to one unit, so this run drops them.
+test "an assert that fails in the std archive fails its test and the run goes on, per module" {
+    let tag = "std_archive_assert_units_{getpid()}"
+    check_std_archive_assert(tag, "env -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE build/blink test --json --per-module", "build/{tag}.units/*.c")
 }
