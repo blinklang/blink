@@ -1564,43 +1564,31 @@ type UnitCompile {
 
 // Runs each command under sh with at most `jobs` at a time, starting them in list order.
 // Answers one result per command, indexed by its place in the list.
+// The children are started and reaped from this thread rather than from async tasks: the
+// async pool has four threads and a task that waits on a child holds one, so tasks could
+// never run more than four at once. Children are reaped in start order with no wait for
+// whichever ends first, so a child that ends early holds its slot until those started
+// before it are reaped.
 fn run_unit_compiles(cmds: List[Str], jobs: Int) -> List[UnitCompile] {
     let n = cmds.len()
     let mut by_idx: List[UnitCompile] = []
-    for i in 0..n {
-        by_idx.push(UnitCompile { idx: i, exit_code: -1, out: "", err_out: "" })
-    }
     if n == 0 { return by_idx }
-    let workers = if jobs < n { jobs } else { n }
-    // A queue the workers drain in order, so the commands start in list order whatever
-    // order the scheduler runs the workers in; one stop mark per worker ends it.
-    let queue = channel.new[Int](buffer: n + workers)
-    for i in 0..n {
-        queue.send(i)
-    }
-    for _ in 0..workers {
-        queue.send(-1)
-    }
-    let results = channel.new[UnitCompile](buffer: n)
     process_install_signal_forwarding()
-    async.scope {
-        for _ in 0..workers {
-            async.spawn(fn() {
-                for idx in queue {
-                    if idx < 0 { break }
-                    let pid = process_spawn("sh", ["-c", cmds.get(idx).unwrap()])
-                    let r = process_pid_wait(pid)
-                    results.send(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out })
-                }
-                0
-            })
-        }
+    let mut pids: List[Int] = []
+    let mut started = 0
+    while started < n && started < jobs {
+        pids.push(process_spawn("sh", ["-c", cmds.get(started).unwrap()]))
+        started = started + 1
     }
-    let mut got = 0
-    for r in results {
-        by_idx.set(r.idx, r)
-        got = got + 1
-        if got == n { break }
+    let mut idx = 0
+    while idx < n {
+        let r = process_pid_wait(pids.get(idx).unwrap())
+        by_idx.push(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out })
+        if started < n {
+            pids.push(process_spawn("sh", ["-c", cmds.get(started).unwrap()]))
+            started = started + 1
+        }
+        idx = idx + 1
     }
     by_idx
 }

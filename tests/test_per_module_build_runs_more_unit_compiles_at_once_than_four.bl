@@ -1,0 +1,77 @@
+// A per-module build compiles up to --jobs units at once. The async pool a Blink program
+// runs its tasks on has four threads, and a task that waits on a child holds its thread, so
+// a build that waited for each compile from its own task could never run more than four.
+
+import std.process.{ProcessResult}
+
+fn module_count() -> Int {
+    8
+}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/shim {tree}/live")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // A cc that, for each compile, counts the compiles running beside it halfway through
+    // its own, then runs the real cc.
+    let real_cc = sh("command -v cc")
+    write_file("{tree}/shim/cc", [
+        "#!/bin/sh",
+        "case \" $* \" in *\" -c \"*)",
+        "    touch {tree}/live/$$; sleep 0.5",
+        "    ls {tree}/live | wc -l >> {tree}/counts; sleep 0.5",
+        "    rm -f {tree}/live/$$ ;;",
+        "esac",
+        "exec {real_cc} \"$@\"",
+        "",
+    ].join("\n"))
+    shell_exec("chmod +x {tree}/shim/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"wide_app\"\nversion = \"0.1.0\"\n")
+    let mut main_lines: List[Str] = []
+    let mut terms: List[Str] = []
+    let n = module_count()
+    for i in 0..n {
+        write_file("{tree}/app/src/part_{i}.bl", "pub fn value_{i}() -> Int \{\n    {i}\n\}\n")
+        main_lines.push("import part_{i}.\{value_{i}\}")
+        terms.push("value_{i}()")
+    }
+    main_lines.push("")
+    main_lines.push("fn main() \{")
+    main_lines.push("    io.println(\"sum \{{terms.join(" + ")}\}\")")
+    main_lines.push("\}")
+    main_lines.push("")
+    write_file("{tree}/app/src/main.bl", main_lines.join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes
+// --per-module build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_JOBS PATH={tree}/shim:$PATH BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+test "a per-module build with --jobs 9 runs more than four unit compiles at once" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_wide_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module --jobs 9")
+    let most = sh("sort -n {tree}/counts | tail -1")
+    let compiles = sh("wc -l < {tree}/counts")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    assert_eq(compiles, "{module_count() + 1}")
+    assert(most.to_int() > 4, "at most {most} unit compiles ran at once")
+    assert_eq(out, "sum {module_count() * (module_count() - 1) / 2}")
+}
