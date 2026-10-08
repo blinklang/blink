@@ -151,10 +151,17 @@ cache and link. The default build does not change.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
   code as the monolith.
+- **Env.** `BLINK_PER_MODULE=1` selects this path for a command that does
+  not pass `--per-module`, and so does every `blink` that the program starts.
+  `0` or unset keeps the default. Any other value is an error.
 - **Fallback.** `--emit c`, `--format blink`, `BLINK_SKIP_MODULES`,
-  `BLINK_ONLY_MODULE` and `BLINK_COMPILER_ARCHIVE` build one C unit and
-  print `note: --per-module ignored: <reason>`. `--target` uses the
-  per-module path.
+  `BLINK_ONLY_MODULE` and `BLINK_COMPILER_ARCHIVE` build one C unit. When
+  `--per-module` asked for the path, the build prints
+  `note: --per-module ignored: <reason>`. When only `BLINK_PER_MODULE`
+  asked, it prints nothing. `--target` uses the per-module path.
+- **Corpus.** `task corpus-per-module` builds every `tests/test_*.bl` on this
+  path with no compiler archive, and `task ci-release` runs it. See the
+  per-module corpus in `docs/codegen-rewrite/harness.md`.
 - **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `hit <module>` or
   `compile <module>` for each unit.
 - **Tests.** `blink test <file> --per-module` builds the program under test

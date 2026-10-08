@@ -21,7 +21,7 @@ fail=0
 
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std" "$R/src"
-cp scripts/corpus.sh scripts/corpus_one.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh "$R/scripts/"
+cp scripts/corpus.sh scripts/corpus_one.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh "$R/scripts/"
 : > "$R/build/gc_unity.c"
 # corpus.sh takes the compiler archive roots from the compiler binary's imports.
 printf 'import std.fs\nimport lexer.{Lex}\nimport cg\n\nfn main() {}\n' > "$R/src/blinkc_main.bl"
@@ -96,6 +96,9 @@ else
     printf '#!/bin/sh\nexit 0\n' > "$out"
 fi
 chmod +x "$out"
+# A per-module build leaves its units beside the binary.
+[ "${BLINK_PER_MODULE:-}" = 1 ] && mkdir -p "$out.units"
+exit 0
 EOF
 cp "$R/fakec/blink" "$R/fakec/blinkc"
 cat > "$R/fakec/libblink_std.h" <<'EOF'
@@ -378,6 +381,35 @@ else
     fail=1
 fi
 
+# The per-module mode: every build takes the per-module path, with no compiler
+# archive, into its own result file, and each record says whether its build
+# left units. The default mode builds one unit even when the caller's env asks
+# for units.
+pmr() { jq -r --arg f "$1" '.files[] | select(.file == $f) | .per_module' "$R/build/corpus_per_module_subset.json" 2>/dev/null; }
+(cd "$R" && rm -rf build/corpus/compiler_archive build/corpus_per_module_subset.json && SELFTEST_ARCHIVE_FAIL=1 CORPUS_PER_MODULE=1 \
+    CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/compile_fail.txt" --no-lint) > "$WORK/out.log" 2>&1
+expect "per-module-run" 1 $?
+if [ ! -e "$R/build/corpus/compiler_archive" ] && [ "$(jq -r .per_module "$R/build/corpus_per_module_subset.json")" = true ] \
+        && [ "$(pmr tests/test_selftest_ok.bl)" = true ] && [ "$(pmr tests/test_selftest_compile_fail.bl)" = false ] \
+        && [ "$(jq -r .per_module_built "$R/build/corpus_per_module_subset.json")" = 1 ] \
+        && grep -q '^per-module: built 1 files in units$' "$WORK/out.log"; then
+    echo "PASS per-module-records"
+else
+    echo "FAIL per-module-records: no per-module result file, a wrong per_module flag, or an archive was built"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+fi
+(cd "$R" && BLINK_PER_MODULE=1 CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/all_pass.txt" --no-lint) > "$WORK/out.log" 2>&1
+if [ "$(jq -r '.files[0].per_module' "$R/build/corpus_subset.json")" = false ] && [ "$(jq -r .per_module "$R/build/corpus_subset.json")" = false ]; then
+    echo "PASS default-mode-ignores-caller-per-module-env"
+else
+    echo "FAIL default-mode-ignores-caller-per-module-env: the default mode built units"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+fi
+(cd "$R" && CORPUS_PER_MODULE=yes CORPUS_COMPILER=fakec ./scripts/corpus.sh --only "$WORK/all_pass.txt" --no-lint) > "$WORK/out.log" 2>&1
+expect "per-module-bad-value" 2 $?
+
 # corpus_check.sh on hand-written result files. The fixture root holds one
 # stub tests/test_check_N.bl per record, so the total can match the tests on
 # disk. The fixtures above sit in the same tests/ directory, so the check runs
@@ -462,6 +494,46 @@ corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)" "$(rec tests/
 floor x
 run_check; expect "check-archive-floor-unreadable" 2 $?
 floor 0
+
+# corpus_per_module_check.sh: every file passes in units, except the listed
+# known failures, which must still fail.
+cp scripts/corpus_per_module_check.sh "$C/scripts/"
+known() { printf '# fixture\n%s' "$1" > "$C/scripts/corpus_per_module_known_failures.txt"; }
+pmrec() { printf '{"file":"%s","status":"%s","known_failures":%s,"compiler_archive":false,"per_module":%s,"first_error_line":"e"}' "$1" "$2" "$3" "$4"; }
+pm_file() {
+    printf '%s\n' "$@" | jq -s '{per_module: true, total: length, passed: (map(select(.status == "pass")) | length),
+        per_module_built: (map(select(.per_module == true)) | length), files: .}' > "$WORK/now.json"
+}
+run_pm_check() {
+    (cd "$C" && CORPUS_JSON="$WORK/now.json" ./scripts/corpus_per_module_check.sh) > "$WORK/out.log" 2>&1
+}
+stubs 2
+known ""
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl pass 0 true)"
+run_pm_check; expect "pm-check-all-pass" 0 $?
+grep -q '^corpus-per-module-check: ok 2/2 passed, 0 known failure(s) still fail, 2 built in units$' "$WORK/out.log" \
+    || { echo "FAIL pm-check-all-pass-summary"; sed 's/^/    /' "$WORK/out.log"; fail=1; }
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl compile_fail null false)"
+run_pm_check; expect "pm-check-unlisted-failure" 1 $?
+names "pm-check-unlisted-failure-names-file" "tests/test_check_2.bl: compile_fail"
+known "tests/test_check_2.bl"
+run_pm_check; expect "pm-check-listed-failure" 0 $?
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl pass 0 true)"
+run_pm_check; expect "pm-check-listed-file-passes" 1 $?
+names "pm-check-listed-file-passes-names-file" "tests/test_check_2.bl$"
+known "tests/test_check_9.bl"
+run_pm_check; expect "pm-check-listed-file-missing" 1 $?
+names "pm-check-listed-file-missing-names-file" "tests/test_check_9.bl"
+known ""
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl pass 0 false)"
+run_pm_check; expect "pm-check-one-unit-pass" 1 $?
+names "pm-check-one-unit-pass-names-file" "tests/test_check_2.bl$"
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)"
+run_pm_check; expect "pm-check-total-below-tests" 1 $?
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl pass null true)"
+run_pm_check; expect "pm-check-known-unreadable" 1 $?
+corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)" "$(rec tests/test_check_2.bl pass 0)"
+run_pm_check; expect "pm-check-default-mode-json" 2 $?
 
 if [ "$fail" -ne 0 ]; then
     echo "test_corpus: FAILED"
