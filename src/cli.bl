@@ -3403,7 +3403,10 @@ fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, stri
     json_set(req, "json", json_new_int(json_status))
     json_set(req, "diag_json", json_new_int(diag_json))
     json_set(req, "strict", json_new_int(strict))
-    socket_write(fd, json_encode(req).concat("\n"))
+    if socket_write(fd, json_encode(req).concat("\n")) < 0 {
+        unix_socket_close(fd)
+        return false
+    }
     let reply = socket_read_line(fd)
     unix_socket_close(fd)
     json_clear()
@@ -4135,35 +4138,38 @@ fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
             let mod_name = if query_module != "" { query_module } else { strip_extension(path_basename(source_path)) }
             request = "\{\"type\":\"query\",\"query_type\":\"signature\",\"module\":\"{mod_name}\"}"
         }
-        socket_write(sock_fd, request.concat("\n"))
-        let response = socket_read_line(sock_fd)
+        let sent = socket_write(sock_fd, request.concat("\n"))
+        let response = if sent >= 0 { socket_read_line(sock_fd) } else { "" }
         unix_socket_close(sock_fd)
-        io.println(response)
-    } else {
-        let source = read_file(source_path)
-        lex(source)
-        pos = 0
-        diag_source_file = source_path
-        let first_node = node_count()
-        let program = parse_program()
-        attach_comments_pass(program, first_node)
-
-        if diag_count > 0 {
-            diag_flush()
-            io.println("error: parse failed, cannot query")
-            exit(1)
+        // A daemon that took no request or gave no answer leaves the query to run cold.
+        if response != "" {
+            io.println(response)
+            return
         }
-
-        let module_name = strip_extension(path_basename(source_path))
-        si_reset()
-        si_build(program, source_path, module_name)
-
-        let vis = if query_pub != 0 { 1 } else { -1 }
-        let mod_f = if query_module != "" { query_module } else if query_fn == "" { module_name } else { "" }
-        let result = query_filtered_layer(query_layer, vis, mod_f, query_effect, query_pure, query_fn)
-
-        io.println(result)
     }
+    let source = read_file(source_path)
+    lex(source)
+    pos = 0
+    diag_source_file = source_path
+    let first_node = node_count()
+    let program = parse_program()
+    attach_comments_pass(program, first_node)
+
+    if diag_count > 0 {
+        diag_flush()
+        io.println("error: parse failed, cannot query")
+        exit(1)
+    }
+
+    let module_name = strip_extension(path_basename(source_path))
+    si_reset()
+    si_build(program, source_path, module_name)
+
+    let vis = if query_pub != 0 { 1 } else { -1 }
+    let mod_f = if query_module != "" { query_module } else if query_fn == "" { module_name } else { "" }
+    let result = query_filtered_layer(query_layer, vis, mod_f, query_effect, query_pure, query_fn)
+
+    io.println(result)
 }
 
 fn is_std_add_pkg(name: Str) -> Int {
@@ -4413,17 +4419,30 @@ fn connect_project_daemon() -> Int {
     fd
 }
 
+// Sends `request` to the project's daemon; exits 1 when the daemon is gone before it is sent.
+fn send_to_project_daemon(fd: Int, request: Str) {
+    if socket_write(fd, request) < 0 {
+        unix_socket_close(fd)
+        io.println("error: daemon not running (could not send to {daemon_socket_path()})")
+        exit(1)
+    }
+}
+
 fn cmd_daemon_status(_p: ArgParser, _a: Args) {
     let fd = connect_project_daemon()
-    socket_write(fd, "\{\"type\":\"status\"}\n")
+    send_to_project_daemon(fd, "\{\"type\":\"status\"}\n")
     let response = socket_read_line(fd)
     unix_socket_close(fd)
+    if response == "" {
+        io.println("error: daemon closed the connection without a status")
+        exit(1)
+    }
     io.println(response)
 }
 
 fn cmd_daemon_stop(_p: ArgParser, _a: Args) {
     let fd = connect_project_daemon()
-    socket_write(fd, "\{\"type\":\"stop\"}\n")
+    send_to_project_daemon(fd, "\{\"type\":\"stop\"}\n")
     let _response = socket_read_line(fd)
     unix_socket_close(fd)
     io.println("Daemon stopped")

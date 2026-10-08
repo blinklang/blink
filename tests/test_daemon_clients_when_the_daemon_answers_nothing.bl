@@ -1,0 +1,73 @@
+// A daemon that takes a connection and closes it without an answer must not pass for one that
+// answered. `blink query` then runs cold and prints what it prints with no daemon; `blink daemon
+// status` fails. The test plays the daemon on the project socket and closes each connection
+// unanswered.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/daemon_answers_nothing"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn make_project() {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"answers_nothing\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every run here.
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{DIR}/main.bl", "pub fn greet(name: Str) -> Str \{\n    \"hi \{name}\"\n}\n\nfn main() \{\n    io.println(greet(\"x\"))\n}\n")
+}
+
+// Runs `blink <args>` in DIR in the background; its output and exit code land in files.
+fn start_client(args: Str) {
+    let _ = sh("B=$(pwd)/build/blink; cd {DIR} && rm -f out.txt err.txt rc.txt && ((timeout 60 $B {args} > out.txt 2> err.txt; echo $? > rc.txt) > /dev/null 2>&1 &)")
+}
+
+fn wait_client() -> Str {
+    let r = sh("cd {DIR} && for i in $(seq 1 600); do [ -s rc.txt ] && cat rc.txt && exit 0; sleep 0.05; done; exit 1")
+    r.out.trim()
+}
+
+// Listens on the project socket before the client starts, so the client always finds it.
+fn listen_on_project_socket() -> Int {
+    let _ = sh("mkdir -p {DIR}/.blink")
+    unix_socket_listen("{DIR}/.blink/daemon.sock")
+}
+
+// Plays a daemon that accepts one connection and closes it unanswered. True when a client came.
+fn close_unanswered(listener: Int) -> Bool {
+    if listener < 0 { return false }
+    let conn = unix_socket_accept_timeout(listener, 20000)
+    if conn >= 0 { unix_socket_close(conn) }
+    unix_socket_close(listener)
+    let _ = sh("rm -f {DIR}/.blink/daemon.sock")
+    conn >= 0
+}
+
+test "query runs cold when the daemon closes the connection unanswered" {
+    make_project()
+    let cold = sh("B=$(pwd)/build/blink; cd {DIR} && $B query main.bl --fn greet")
+    let listener = listen_on_project_socket()
+    start_client("query main.bl --fn greet")
+    let came = close_unanswered(listener)
+    let rc = wait_client()
+
+    assert_eq(cold.exit_code, 0)
+    assert(cold.out.contains("greet"))
+    assert(came)
+    assert_eq(rc, "0")
+    assert_eq(read_file("{DIR}/out.txt"), cold.out)
+}
+
+test "status fails when the daemon closes the connection unanswered" {
+    make_project()
+    let listener = listen_on_project_socket()
+    start_client("daemon status")
+    let came = close_unanswered(listener)
+    let rc = wait_client()
+
+    assert(came)
+    assert_eq(rc, "1")
+    assert(read_file("{DIR}/out.txt").starts_with("error: daemon"))
+}
