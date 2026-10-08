@@ -1,0 +1,88 @@
+// A per-module build that finds every input the same as the last build's reuses that build's
+// units and headers instead of writing them again, and still links the same program.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/greet.bl", [
+        #"pub fn greet(name: Str) -> Str {"#,
+        #"    "hello {name}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import greet.{greet}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(greet("units"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// "reuse emit" or "emit": which way the build got its units, read from its build.units trace.
+fn emit_kind(r: ProcessResult) -> Str {
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line == "[dbg:build.units] reuse emit" { return "reuse emit" }
+        if line == "[dbg:build.units] emit" { return "emit" }
+    }
+    "none"
+}
+
+fn compiled(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+test "a no-change per-module build reuses the last build's units" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_nochange_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let first = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    let units_before = sh("cd {tree}/out/app.units && sha256sum *.c *.h")
+    let second = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    let units_after = sh("cd {tree}/out/app.units && sha256sum *.c *.h")
+    // Each build must find the same inputs, so a text that varies from run to run (a Map in
+    // no fixed order) shows up as an emit in one of these.
+    let mut later: List[Str] = []
+    for _ in 0..4 {
+        later.push(emit_kind(blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")))
+    }
+    let out = sh("{tree}/out/app")
+    let leftovers = sh("ls -a {tree}/out | grep -c '^\\.units\\.' || true")
+    shell_exec("rm -rf {tree}")
+    assert(first.exit_code == 0, "first build failed: {first.out}{first.err_out}")
+    assert(second.exit_code == 0, "second build failed: {second.out}{second.err_out}")
+    assert_eq(emit_kind(first), "emit")
+    assert_eq(emit_kind(second), "reuse emit")
+    assert_eq(compiled(second), 0)
+    assert_eq(later.join(","), "reuse emit,reuse emit,reuse emit,reuse emit")
+    assert_eq(units_after, units_before)
+    assert_eq(out, "hello units")
+    assert_eq(leftovers, "0")
+}

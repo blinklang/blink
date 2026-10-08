@@ -1,6 +1,6 @@
 import ast.{NodeKind, trace, trace_mode}
 import lexer.{Lex, lex}
-import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module}
+import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of}
 import typecheck.{clear_module_imports, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_get_symbol_module, tc_set_prelude_modules}
 import diagnostics.{
     Diag, diag_register_file_range, lint_set_override, diag_normalize_path,
@@ -133,6 +133,7 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report {
     let manifest_path = manifest_path_for_src_root(src_root)
     if file_exists(manifest_path) == 1 {
         manifest_clear()
+        note_config_file(manifest_path)
         if manifest_load(manifest_path) == 0 {
             let mut i = 0
             while i < lint_names.len() {
@@ -153,19 +154,21 @@ pub fn check_file_exists(path: Str) {
     }
 }
 
-// Every `#embed` of every file this program loaded, checked once the loading is done.
-// The path is read relative to the file that holds the `#embed`, so each node answers for
-// its own file. The expression stage reads the same path when it lowers, but a `blink
-// check` stops before that stage, so without this a check answered ok on a program no
-// build could produce.
+// Every `#embed` of every file this program loaded, checked and read once the loading is
+// done. The path is read relative to the file that holds the `#embed`, so each node answers
+// for its own file. The expression stage embeds the bytes read here. A `blink check` stops
+// before that stage, so without this a check answered ok on a program no build could produce.
 fn check_embed_targets() ! Diag.Report {
     let mut id = 0
     while id < node_count() {
         if node_kind(id) == NodeKind.EmbedExpr {
-            let path = "{path_dirname(diag_file_for_node(id))}/{node_str_val(id)}"
+            let path = embed_path_of(id)
             if file_exists(path) != 1 {
                 diag_error_at("FileNotFound", FILE_NOT_FOUND, "#embed file not found: {path}", id,
                     "the path is read relative to the file that holds the #embed, not the directory the compiler runs in")
+            } else if !loaded_inputs.embed_texts.contains_key(path) {
+                loaded_inputs.embed_paths.push(path)
+                loaded_inputs.embed_texts.insert(path, read_file(path))
             }
         }
         id = id + 1
@@ -181,6 +184,8 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
     diag_source_file = file_path
 
     let source = read_file(file_path)
+    loaded_inputs.source_paths.push(file_path)
+    loaded_inputs.source_texts.push(source)
     let mut program = 0
     let mut imported_programs: List[Int] = []
     with load_phase() {
@@ -188,7 +193,7 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
         let first_node = node_count()
         program = parse_program()
         attach_comments_pass(program, first_node)
-        loaded_files.push(file_path)
+        loaded_inputs.files.push(file_path)
 
         reject_empty_module_annotation(program)
 
@@ -343,7 +348,18 @@ fn read_pkg_name_from_toml(path: Str) -> Str {
         return ""
     }
     let content = read_file(path)
+    loaded_inputs.config_paths.push(path)
+    loaded_inputs.config_texts.push(content)
     toml_read_value(content, "package", "name") ?? ""
+}
+
+// A manifest or lockfile the loader is about to read. The loader reads it again itself, so
+// these bytes are a second read, and the units a build records do not rest on them: a
+// manifest or lockfile changes the emit only through which file an import loads, which the
+// loaded files show, and through [lints], which the lint levels in force show.
+fn note_config_file(path: Str) {
+    loaded_inputs.config_paths.push(path)
+    loaded_inputs.config_texts.push(read_file(path))
 }
 
 // Given a src_root like "examples/with_deps/mathlib/src/", return the path
@@ -412,12 +428,14 @@ fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report {
     }
     let lock_path_new = path_join(project_root, "blink.lock")
     if file_exists(lock_path_new) == 1 {
+        note_config_file(lock_path_new)
         lockfile_load(lock_path_new)
         validate_lockfile_versions()
         return
     }
     let lock_path = path_join(project_root, "pact.lock")
     if file_exists(lock_path) == 1 {
+        note_config_file(lock_path)
         lockfile_load(lock_path)
         validate_lockfile_versions()
         return
@@ -435,12 +453,14 @@ fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report {
         }
         let candidate_new = path_join(parent, "blink.lock")
         if file_exists(candidate_new) == 1 {
+            note_config_file(candidate_new)
             lockfile_load(candidate_new)
             validate_lockfile_versions()
             return
         }
         let candidate = path_join(parent, "pact.lock")
         if file_exists(candidate) == 1 {
+            note_config_file(candidate)
             lockfile_load(candidate)
             validate_lockfile_versions()
             return
@@ -1004,8 +1024,31 @@ pub fn merge_programs(main_prog: Int, imported: List[Int], _import_nodes_list: L
     merged
 }
 
-pub let mut loaded_files: List[Str] = []
-let mut import_map_paths: List[Str] = []
+// What the loader read for the program it last loaded.
+pub type LoadedInputs {
+    // Each file the loader took, so no file loads twice.
+    files: List[Str]
+    // Each file the loader lexed and the text it lexed, in load order. The per-module build
+    // keys its reuse of the last build's units on these bytes, not on a later read of the
+    // file, which an edit since the load could make differ from what this build compiled.
+    source_paths: List[Str]
+    source_texts: List[Str]
+    // Each manifest and lockfile the loader read, and its text.
+    config_paths: List[Str]
+    config_texts: List[Str]
+    // Each `#embed` file in the order the loader first read it, and its bytes by path. The
+    // expression stage embeds these bytes, so the program holds the bytes the input record
+    // names, not those of a later read.
+    embed_paths: List[Str]
+    embed_texts: Map[Str, Str]
+}
+
+fn loaded_inputs_empty() -> LoadedInputs {
+    LoadedInputs { files: [], source_paths: [], source_texts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map() }
+}
+
+pub let mut loaded_inputs: LoadedInputs = loaded_inputs_empty()
+pub let mut import_map_paths: List[Str] = []
 pub let mut import_map_nodes: List[Int] = []
 pub let mut import_map_modules: List[Str] = []
 pub let mut import_map_qualifiers: List[Str] = []
@@ -1162,7 +1205,7 @@ fn dfs_detect_cycle(node: Str, adj: Map[Str, List[Str]], visited: Map[Str, Int],
 
 pub fn reset_compiler_state() {
     parser_reset()
-    loaded_files.clear()
+    loaded_inputs = loaded_inputs_empty()
     import_map_paths.clear()
     import_map_nodes.clear()
     import_map_modules.clear()
@@ -1195,8 +1238,8 @@ fn find_module_key(file_path: Str) -> Str {
 
 fn is_file_loaded(path: Str) -> Int {
     let mut i = 0
-    while i < loaded_files.len() {
-        if loaded_files.get(i).unwrap() == path {
+    while i < loaded_inputs.files.len() {
+        if loaded_inputs.files.get(i).unwrap() == path {
             return 1
         }
         i = i + 1
@@ -1206,7 +1249,7 @@ fn is_file_loaded(path: Str) -> Int {
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: List[Int], imp_node: Int, label: Str) ! Lex.Tokenize, Parse, Diag.Report {
-    loaded_files.push(file_path)
+    loaded_inputs.files.push(file_path)
     if trace_mode != "" { trace("parse", "{label} {dotted_path} -> {file_path}") }
     let mut source = ""
     if file_path.starts_with("<embedded:") {
@@ -1215,6 +1258,8 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
     } else {
         source = read_file(file_path)
     }
+    loaded_inputs.source_paths.push(file_path)
+    loaded_inputs.source_texts.push(source)
     load_phase_check(node_count())
     lex(source)
     pos = 0

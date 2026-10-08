@@ -202,7 +202,7 @@ pub fn user_unit_key(
 // function SHA256SUM_SH defines, so the fallback is a command line in a variable.
 let SHA256_H_SH: Str = "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; else H=\"shasum -a 256\"; fi; "
 
-fn sorted_strs(xs: List[Str]) -> List[Str] {
+pub fn sorted_strs(xs: List[Str]) -> List[Str] {
     let mut out: List[Str] = []
     for x in xs {
         out.push(x)
@@ -251,6 +251,47 @@ pub fn unit_keys(
     flags: List[Str],
     target: Str,
 ) -> Map[Str, Str] {
+    if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
+        return Map()
+    }
+    match unit_file_shas(dir, arc_dir) {
+        Some(shas) => unit_keys_from(shas, dir, modules, unit_headers, arc_dir, vendored_include_dirs, blinkc_sha, cc_id, flags, target)
+        None => Map()
+    }
+}
+
+// The sha of each file a unit key covers: the archive's runtime.h, libblink_std.h and .gch,
+// by their path, and every .h and .c in dir, by their name in dir. A file that could not be
+// read is absent. One exec for every file: xargs keeps the list inside the exec argument
+// limit. None when the hashing could not run.
+pub fn unit_file_shas(dir: Str, arc_dir: Str) -> Option[Map[Str, Str]] {
+    let runtime_h = "{arc_dir}/runtime.h"
+    let archive_h = "{arc_dir}/libblink_std.h"
+    let pch = "{arc_dir}/libblink_std.h.gch"
+    let mut cmd = StringBuilder.new()
+    cmd.write(SHA256_H_SH)
+    cmd.write("for f in \"{runtime_h}\" \"{archive_h}\" \"{pch}\"; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; ")
+    cmd.write("cd \"{dir}\" || exit 1; for f in *.h *.c; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; exit 0")
+    let r = process_run("sh", ["-c", cmd.to_str()])
+    if r.exit_code != 0 {
+        return None
+    }
+    Some(sha_by_name(r.out))
+}
+
+// unit_keys over shas unit_file_shas answered for dir and arc_dir.
+pub fn unit_keys_from(
+    shas: Map[Str, Str],
+    dir: Str,
+    modules: List[Str],
+    unit_headers: Map[Str, List[Str]],
+    arc_dir: Str,
+    vendored_include_dirs: List[Str],
+    blinkc_sha: Str,
+    cc_id: Str,
+    flags: List[Str],
+    target: Str,
+) -> Map[Str, Str] {
     let mut keys: Map[Str, Str] = Map()
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
         return keys
@@ -258,16 +299,6 @@ pub fn unit_keys(
     let runtime_h = "{arc_dir}/runtime.h"
     let archive_h = "{arc_dir}/libblink_std.h"
     let pch = "{arc_dir}/libblink_std.h.gch"
-    // One exec for every file: xargs keeps the list inside the exec argument limit.
-    let mut cmd = StringBuilder.new()
-    cmd.write(SHA256_H_SH)
-    cmd.write("for f in \"{runtime_h}\" \"{archive_h}\" \"{pch}\"; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; ")
-    cmd.write("cd \"{dir}\" || exit 1; for f in *.h *.c; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; exit 0")
-    let r = process_run("sh", ["-c", cmd.to_str()])
-    if r.exit_code != 0 {
-        return keys
-    }
-    let shas = sha_by_name(r.out)
     let runtime_sha = shas.get(runtime_h) ?? ""
     let archive_sha = shas.get(archive_h) ?? ""
     if runtime_sha == "" || archive_sha == "" {
