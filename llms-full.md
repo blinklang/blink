@@ -1213,8 +1213,8 @@ build/blink build src/main.bl
 # generated C, or to bisect a codegen regression against one TU.
 build/blink build src/main.bl --emit c
 
-# Emit one .c and .h per program module into a directory, plus an
-# aggregator header (_blink_all.h). The output target is a DIRECTORY:
+# Emit one .c per program module into a directory, with the headers each
+# unit includes (blink.types.h, <m>.h, <m>.priv.h). The output target is a DIRECTORY:
 # pass it as the second positional, or via -o.
 build/blink build src/main.bl --emit per-module-dir build/main_modules
 build/blink build src/main.bl --emit per-module-dir -o build/main_modules
@@ -1224,8 +1224,8 @@ cc -o build/main_modules/bin $(ls build/main_modules/*.c | sort) -Ibuild -lm -lg
 ```
 
 `per-module-dir` is the documented surface for per-module emit. Each module
-`.c` includes the aggregator header so cross-module calls and typedefs
-resolve; the entry module owns runtime globals and every other module
+`.c` includes the headers of the symbols it names so cross-module calls and
+typedefs resolve; the entry module owns runtime globals and every other module
 externs them. The legacy hidden `__emit-per-module <file.bl> <outdir>`
 subcommand still works as a deprecation alias for one release. See
 `docs/build/per-module-o-default.md` for the rationale and the path to making

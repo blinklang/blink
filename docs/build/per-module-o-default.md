@@ -8,9 +8,10 @@ Blink's compiler can emit a program in two shapes:
    reachable module), compiled and linked in a single `cc` invocation.
    This is what `blink build` / `blink run` have always done, and what
    `--emit c` writes to disk.
-2. **Per-module** — one `.c` and one `.h` per program module, plus an
-   aggregator header (`_blink_all.h`) that every TU includes so
-   cross-module calls and typedefs resolve. Each module `.c` is compiled
+2. **Per-module** — one `.c` per program module, a types header
+   (`blink.types.h`), and two headers per module (`<m>.h` and
+   `<m>.priv.h`). Each TU includes the headers of the symbols it names, so
+   cross-module calls and typedefs resolve (see "Unit headers" below). Each module `.c` is compiled
    to its own `.o` and linked. See `generic-mono-ownership-per-module.md`
    and `per-module-o-cache.md` for the front-end split and the `.o`
    cache that elides unchanged recompiles.
@@ -40,8 +41,7 @@ blink build --emit per-module-dir <file.bl> <outdir>
 blink build --emit per-module-dir <file.bl> -o <outdir>
 ```
 
-It writes the per-module `.c`/`.h` set (plus `_blink_all.h`) into
-`<outdir>`. The output target is a **directory**, not the single-file
+It writes the per-module `.c`/`.h` set into `<outdir>`. The output target is a **directory**, not the single-file
 path that `--emit c` and the default binary build assume — this is the
 one structural difference in the `cmd_build` flow.
 
@@ -95,8 +95,8 @@ with monolith reachable via an explicit flag. The wins:
 The opt-in flag drives the per-module path end to end: emit, compile,
 cache and link. The default build does not change.
 
-- **Units.** One `.c` per program module, plus one `.h` per module and
-  `_blink_all.h`, written to `<output>.units/` next to the binary. The
+- **Units.** One `.c` per program module, plus the headers below,
+  written to `<output>.units/` next to the binary. The
   std modules the archive holds get no unit: the units link
   `libblink_std.a` the same as the monolith user TU does, and the archive
   defines the runtime storage and every non-generic std body. A std module
@@ -116,9 +116,10 @@ cache and link. The default build does not change.
   once; the default is the CPU count. A value that is not a positive
   integer is an error. The largest unit starts first.
 - **Object cache.** One entry per unit. The key covers the unit `.c`,
-  every header it includes (the module headers, `runtime.h`,
+  every header it includes (the unit headers it names, `runtime.h`,
   `libblink_std.h`, its `.gch`, vendored headers), the compiler, the cc
-  id, the flags and the target. The units are written to a private
+  id, the flags and the target. A header the unit does not include is
+  not in its key. The units are written to a private
   directory, so the bytes the key hashes are the bytes cc compiles. An
   unreadable input turns the cache off for that unit, or for all units
   when the input is shared. `--no-cache` turns it off. The inputs all
@@ -136,19 +137,73 @@ cache and link. The default build does not change.
 - **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `hit <module>` or
   `compile <module>` for each unit.
 
-### The `_blink_all.h` cap
+### Unit headers
 
-Every unit includes `_blink_all.h`, so every unit parses every module
-header, and a change to any header recompiles every unit. A private-body
-edit leaves the headers as they were and recompiles one unit. A pub
-signature edit, or a new pub function, changes a header and recompiles
-all units. A smaller include set per unit (only the headers of the
-modules it imports) would remove this cap.
+The build writes three kinds of header:
 
-For `src/cli.bl` the cap costs most of the gain on a pub edit: 48 units
-and 65 headers (7.3 MB of headers, parsed by every unit). `pubfn-cname`
-recompiles all 48 units in 5.6 s, against 1.8 s for a private-body edit
-to the same module.
+- `blink.types.h`: the prologue (`libblink_std.h` or `runtime.h`, the
+  native gates, the foreign includes), every typedef in the program, the
+  evidence vector and its vtables, and the declaration of every derived
+  method. Every other header includes it.
+- `<m>.h`: what other modules can name in module `m`: its pub functions
+  and globals, and the methods of its trait impls.
+- `<m>.priv.h`: the rest of `m`: its private functions and globals, its
+  init function, and the signatures of the generic instances its unit
+  defines.
+
+Unit `m` includes `<m>.h`, `<m>.priv.h`, and the header of each symbol
+its C text names. The build reads the declared names from each header it
+wrote, and scans each unit for them. A header that has a line the build
+cannot read, or a name without `blink` in it, goes into every unit.
+
+Why every type is in one header: a unit can hold a type by value that it
+got through a module it does not import (`pc` holds `pb.Seg`, which holds
+`pa.Point`). C needs the layout of `Point` to compile `pc`, so a header
+per module of types would need the import graph of each type. One types
+header gives every unit every layout.
+
+Why the scan and not the imports: a unit names symbols of modules it
+does not import (the init function of every module from `__main__`, a
+method of a type it got through another module, a generic instance that
+another module defines). It also imports modules for a type only, and
+needs no header for that.
+
+Why no unit can get a wrong or missing declaration: every header comes
+from the same front end and registries that emit the unit, so a
+declaration agrees with its definition. A missing header is a cc error:
+C rejects a call to an undeclared function and a read of an undeclared
+name. The scan can only include too much: a word that looks like a
+symbol costs one header more.
+
+What recompiles:
+
+- A private-body edit changes one unit and no header.
+- A new private function or global changes `<m>.priv.h`, which only
+  units that name a private symbol of `m` include (usually `m` alone).
+- A pub signature edit or a new pub function changes `<m>.h`, which
+  recompiles `m` and the units that name a symbol of `m`.
+- A new type, a new generic struct instance, or a new carrier changes
+  `blink.types.h`, which recompiles every unit.
+- A new instance of a generic changes the `<m>.priv.h` of the module
+  that declares the generic.
+
+`src/cli.bl` has 49 units and 131 headers (0.45 MB of headers, from 7.3 MB
+when every unit included every header).
+
+Edit-loop bench on cli, `--per-module`, 5 reps, median wall seconds (units
+compiled), the gen1 of `5626a2b6` against the gen1 of `a026a18c` (since amended):
+
+| case | every header | headers it names |
+|---|---|---|
+| nochange | 1.565 (0) | 1.510 (0) |
+| body-cname | 1.783 (1) | 1.692 (1) |
+| body-typecheck | 4.043 (1) | 3.927 (1) |
+| pubfn-cname | 5.798 (48) | 2.753 (14) |
+| cold-obj | 5.861 (48) | 5.280 (49) |
+| cold-all | 8.164 (49) | 7.138 (50) |
+
+The serial cc CPU of a cold build of the units, without sqlite3.c, went
+from 13.79 s to 10.95 s. `a026a18c` has one more module.
 
 ## Edit-loop bench
 
@@ -184,6 +239,5 @@ monolith. What the numbers show:
 
 ## Blockers before the default flips
 
-Tracked separately: remove the `_blink_all.h` cap above, cut the per-build
-emit and hash cost (`nochange` must not be slower than the monolith), and
+Tracked separately: cut the per-build emit and hash cost (`nochange` must not be slower than the monolith), and
 keep a small program as fast as the monolith.
