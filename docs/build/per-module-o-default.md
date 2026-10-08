@@ -148,6 +148,30 @@ cache and link. The default build does not change.
   compiles to a temp object, and one exec per batch moves each new object
   into the cache. The build links the cached object for each move that
   worked, and the temp object for each move that failed.
+- **Emit reuse.** The front end always runs, so each build loads its files
+  and reports their errors. Then the build writes its emit inputs as one
+  text: the compiler sha, `argv[0]`, the cwd, the entry path, the codegen
+  config, `--strict`, the skipped modules, the lint levels, the env vars
+  that change the compile (`BLINK_ROOT`, `HOME`, `BLINK_SKIP_MODULES`,
+  `BLINK_ONLY_MODULE`, `BLINK_COMPILER_ARCHIVE`, `BLINK_PER_MODULE`,
+  `BLINK_PARSER_PANIC_DUMP`), each loaded file with the bytes the lexer
+  read, each manifest and lockfile read, how each import resolved, and each
+  `#embed` file with its bytes. Keys and lines from a `Map` are sorted, so
+  the text does not change between builds. `<output>.units/` keeps this
+  text in `.emit-inputs`, and `.emit-record` lists its length, the units
+  and the sha of each `.h` and `.c`. When the record's length matches and
+  the text is the same byte for byte, the build hard-links the files into
+  its private directory, hashes them again against the record, and skips
+  the emit. If any file differs, it emits. Content decides, not mtime.
+  A new file that changes where an import resolves changes the import
+  map and the loaded files, so it changes the text. The build writes the
+  record last, only after the link succeeds, and only when the emit
+  reported no diagnostic. A build that stops early leaves the last
+  directory and its record. A reused build prints the warnings of the
+  front end again. These turn reuse off: `--no-cache`, an empty
+  `BLINK_CACHE_DIR`, `--blink-trace`, `--trace`, `BLINK_TRACE` on
+  `blink run`, and a `BLINK_TRACE_CHANNELS` channel outside `build.*`.
+  On `src/cli.bl` the text is 6.2 MB.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
   code as the monolith.
@@ -162,8 +186,9 @@ cache and link. The default build does not change.
 - **Corpus.** `task corpus-per-module` builds every `tests/test_*.bl` on this
   path with no compiler archive, and `task ci-release` runs it. See the
   per-module corpus in `docs/codegen-rewrite/harness.md`.
-- **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `hit <module>` or
-  `compile <module>` for each unit.
+- **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `reuse emit` or
+  `emit` once per build, then `hit <module>` or `compile <module>` for each
+  unit.
 - **Tests.** `blink test <file> --per-module` builds the program under test
   on this path, at the debug flags `blink test` always uses. The test bodies,
   the runner and `main` are in the `__main__` unit; each imported module is a
@@ -289,10 +314,10 @@ both runs are within 0.05 s of each other. What the numbers show:
   unit, and the time follows the size of that unit (`cname.c` 0.15 s,
   `typecheck.c` 2.4 s).
 - `cold-obj` and `pubfn-cname` gain from more than four compiles at once.
-- `nochange` on cli is still 0.19 s slower than the monolith. All of it
-  is emit (`emit_s` 0.905 against 0.725): the build still emits 131
-  headers and 49 units each time, then hashes them to find that nothing
-  changed.
+- `nochange` on cli was then 0.19 s slower than the monolith. All of it
+  was emit (`emit_s` 0.905 against 0.725): the build emitted 131 headers
+  and 49 units each time, then hashed them to find that nothing changed.
+  Emit reuse (below) removes that cost.
 
 What made the emit cheaper, from 1.48 s to 0.91 s on cli `nochange`:
 
@@ -308,10 +333,46 @@ What made the emit cheaper, from 1.48 s to 0.91 s on cli `nochange`:
   no header that no unit includes holds one (checked on cli and small), so
   the scan finds the same deps.
 
+### Emit reuse
+
+`task bench-edit-loop` on the gen1 `blink` built from `7f4d7dbb`, 5 reps, 12
+cores, under `blink-gates.slice`. Median wall seconds, with min and max where
+the ranges of two columns are near.
+`bench/edit_loop/monolith_7f4d7dbb.tsv` and
+`bench/edit_loop/per_module_7f4d7dbb.tsv` hold the rows on the `7f4d7dbb`
+tree. The bench builds the tree it is in, and `7f4d7dbb` adds a unit to
+cli, so the like-for-like columns build the `d1cf8f55` tree with the gen1
+of `d1cf8f55` (before) and of `7f4d7dbb` (after), in the same session:
+`bench/edit_loop/per_module_d1cf8f55.tsv` and
+`bench/edit_loop/per_module_7f4d7dbb_on_d1cf8f55.tsv`.
+
+| target | case | monolith | `--per-module` before | `--per-module` after | `--per-module` on `7f4d7dbb` |
+|---|---|---|---|---|---|
+| cli | nochange | 0.752 | 0.954 | 0.497 | 0.499 |
+| cli | body-cname | 10.518 | 1.109 [1.095-1.134] | 1.124 [1.101-1.140] | 1.124 |
+| cli | body-typecheck | 10.519 | 3.370 [3.339-3.375] | 3.376 [3.355-3.390] | 3.395 |
+| cli | pubfn-cname | 10.509 | 1.808 | 1.798 | 1.812 |
+| cli | run-body-cname | 10.515 | 1.124 | 1.131 | 1.130 |
+| cli | test-body-cname | 2.119 | 0.601 [0.599-0.607] | 0.608 [0.596-0.611] | 0.607 |
+| cli | cold-obj | 10.509 | 4.029 | 3.561 | 3.575 |
+| cli | cold-all | 12.871 | 6.407 | 5.918 | 5.940 |
+| small | nochange | 0.073 | 0.073 | 0.071 | 0.071 |
+| small | body-inventory | 0.139 | 0.120 [0.117-0.122] | 0.121 [0.120-0.123] | 0.121 |
+| small | pubfn-model | 0.138 | 0.121 | 0.121 | 0.122 |
+| small | run-body-inventory | 0.139 | 0.123 | 0.121 | 0.121 |
+| small | test-body-inventory | 0.141 | 0.136 | 0.135 | 0.136 |
+| small | cold-obj | 0.137 | 0.123 | 0.122 | 0.123 |
+
+- cli `nochange` is now 0.25 s faster than the monolith. The build runs
+  the front end, finds its inputs the same as the last build's, and takes
+  that build's units: `emit_s` 0.455 against 0.911.
+- `cold-obj` and `cold-all` remove the objects but keep the units, so they
+  also take the units and gain about 0.47 s.
+- An edit costs the build the inputs text (6.2 MB on cli) and its write.
+  In the like-for-like columns each edit case's range overlaps its before
+  range; the largest change in a median is +0.015 s, on cli `body-cname`.
+
 ## Blockers before the default flips
 
-Tracked separately: cut the per-build emit cost on a large program, so that
-`nochange` is not slower than the monolith. The two ways out are a front-end
-input fingerprint that skips the emit when no input changed, or a header
-snapshot so that the emit does not write the typedefs again each time.
-
+None from the edit-loop bench: `nochange` on cli is faster than the
+monolith, and no per-module case is slower than before outside its spread.
