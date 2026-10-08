@@ -1,21 +1,22 @@
 import std.json.{json_parse, json_get, json_as_str, json_as_int, json_as_bool, json_type, json_clear, JSON_BOOL, JSON_INT}
 import std.num.{parse_int}
 import diagnostics.{Diag, DiagEntry, diag_entries, diag_count, json_escape}
-import compiler.{compile_to_program, check_unused_imports}
+import compiler.{compile_to_program}
 import lexer.{Lex, lex, token_count, token_at, tokens}
-import typecheck.{TypeCheck, check_types, tc_set_incremental_filter, tc_clear_incremental_filter, tc_hints, HintEntry}
+import typecheck.{TypeCheck, tc_hints, HintEntry}
 import symbol_index.{si_reset, si_build, si_find_sym, si_file_symbols, si_get_ref_locations, si_sym_count, si_sym_name, si_sym_kind, si_sym_sig, si_sym_effects, si_sym_doc, si_sym_requires, si_sym_ensures, si_sym_file, si_sym_line, si_sym_col, si_sym_end_line, si_sym_end_col, si_sym_module, si_sym_param_types, si_dep_from, si_dep_line, si_dep_col, si_dep_name_len, SK_FN, SK_STRUCT, SK_ENUM, SK_TRAIT, SK_LET, sym_kind_name}
 import tokens.{TokenKind}
-import file_watcher.{fw_init, fw_reset, fw_clear_dirty}
-import incremental.{inc_snapshot, inc_detect_changes, inc_compute_affected, inc_affected_count, inc_affected_names, inc_reset}
 import mutation_analysis.{ma_state_len}
-import escape.{analyze_escapes}
+import check_pipeline.{check_source, checked_inputs_changed, checked_inputs_reset}
 import formatter.{Format, format}
 import parser.{node_count}
 
 let mut lsp_running: Int = 0
 let mut lsp_initialized: Int = 0
 let mut lsp_source_path: Str = ""
+// What the last check found. Formatting reloads the program and clears diag_entries, so
+// what the editor shows is kept apart from them.
+let mut lsp_checked_diags: List[DiagEntry] = []
 
 fn lsp_parse_content_length(line: Str) -> Int {
     if line.starts_with("Content-Length: ") != 0 {
@@ -123,7 +124,7 @@ fn lsp_end_col(d: DiagEntry, fallback_col: Int) -> Int {
     else { fallback_col }
 }
 
-fn lsp_build_diagnostics_json(uri: Str) -> Str {
+fn lsp_build_diagnostics_json(uri: Str, diags: List[DiagEntry]) -> Str {
     let mut sb = StringBuilder.new()
     let diag_hdr = "\{\"uri\":\""
     let diag_mid = "\",\"diagnostics\":["
@@ -131,8 +132,8 @@ fn lsp_build_diagnostics_json(uri: Str) -> Str {
     sb.write(uri)
     sb.write(diag_mid)
     let mut i = 0
-    while i < diag_entries.len() {
-        let d = diag_entries.get(i).unwrap()
+    while i < diags.len() {
+        let d = diags.get(i).unwrap()
         if i > 0 {
             sb.write(",")
         }
@@ -152,65 +153,41 @@ fn lsp_build_diagnostics_json(uri: Str) -> Str {
     sb.to_str()
 }
 
-fn lsp_compile_and_build(file_path: Str) -> Int ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
-    compile_to_program(file_path, 1)
+fn lsp_publish_diagnostics(uri: Str) ! IO {
+    let params = lsp_build_diagnostics_json(uri, lsp_checked_diags)
+    lsp_send_notification("textDocument/publishDiagnostics", params)
+    io.eprintln("blink-lsp: published {lsp_checked_diags.len()} diagnostic(s)")
 }
 
-fn lsp_publish_diagnostics(uri: Str) ! IO {
-    let params = lsp_build_diagnostics_json(uri)
-    lsp_send_notification("textDocument/publishDiagnostics", params)
-    io.eprintln("blink-lsp: published {diag_entries.len()} diagnostic(s)")
+// The check `blink check` and the daemon run, so the editor shows what the build refuses.
+fn lsp_run_check(file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let final_program = check_source(file_path)
+    lsp_checked_diags = []
+    for d in diag_entries {
+        lsp_checked_diags.push(d)
+    }
+    si_reset()
+    si_build(final_program, file_path, "main")
 }
 
 fn lsp_full_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     io.eprintln("blink-lsp: full check {file_path}")
-    let final_program = lsp_compile_and_build(file_path)
-
-    check_types(final_program)
-    check_unused_imports()
-    analyze_escapes(final_program)
-
-    si_reset()
-    si_build(final_program, file_path, "main")
-    fw_init()
-    inc_snapshot()
-
+    lsp_run_check(file_path)
     lsp_initialized = 1
     lsp_source_path = file_path
-
     lsp_publish_diagnostics(uri)
 }
 
-@allow(UnrestoredMutation, IncompleteStateRestore)
+// Mono and the mutation passes judge across functions, so a recheck runs on the whole
+// program; it is skipped only when no input the last check read has changed.
 fn lsp_incremental_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
-    inc_detect_changes()
-    inc_compute_affected()
-
-    if inc_affected_count == 0 {
-        io.eprintln("blink-lsp: no affected symbols, skipping recheck")
+    if !checked_inputs_changed(file_path) {
+        io.eprintln("blink-lsp: incremental check: no input changed, republishing")
         lsp_publish_diagnostics(uri)
         return
     }
-
-    let affected_names = inc_affected_names()
-
-    io.eprintln("blink-lsp: incremental check ({inc_affected_count} affected)")
-    let final_program = lsp_compile_and_build(file_path)
-
-    tc_set_incremental_filter(affected_names)
-    check_types(final_program)
-    tc_clear_incremental_filter()
-
-    // Escape analysis is whole-program, so run it after the incremental filter
-    // is cleared — same as lsp_full_check. Without it, the incremental path
-    // (edit-time recheck) would miss E0700/E0601 that the full check reports.
-    analyze_escapes(final_program)
-
-    si_reset()
-    si_build(final_program, file_path, "main")
-    inc_snapshot()
-    fw_clear_dirty()
-
+    io.eprintln("blink-lsp: incremental check: inputs changed, rechecking {file_path}")
+    lsp_run_check(file_path)
     lsp_publish_diagnostics(uri)
 }
 
@@ -254,8 +231,8 @@ fn lsp_handle_did_close(root: Int) ! IO {
     let file_path = lsp_uri_to_path(uri)
     if file_path == lsp_source_path {
         lsp_initialized = 0
-        fw_reset()
-        inc_reset()
+        checked_inputs_reset()
+        lsp_checked_diags = []
         si_reset()
     }
     let params = "\{\"uri\":\"{uri}\",\"diagnostics\":[]\}"
@@ -1070,8 +1047,8 @@ fn lsp_handle_code_action(id: Int, root: Int) ! IO {
     let mut first = 1
 
     let mut i = 0
-    while i < diag_entries.len() {
-        let d = diag_entries.get(i).unwrap()
+    while i < lsp_checked_diags.len() {
+        let d = lsp_checked_diags.get(i).unwrap()
         if d.fix_action == "" {
             i = i + 1
             continue

@@ -1,0 +1,95 @@
+import compiler.{compile_to_program, check_unused_imports, loaded_inputs}
+import lexer.{Lex}
+import parser.{Parse}
+import typecheck.{TypeCheck, check_types, desugar_sealed_ops_calls}
+import mutation_analysis.{analyze_mutations, analyze_save_restore}
+import escape.{analyze_escapes}
+import mono.{run_mono}
+import diagnostics.{Diag, diag_count, diag_ice_count}
+
+// check_pipeline.bl — the one check every path answers with
+//
+// `blink check`, the daemon and the LSP each call check_source, so none of them can stop
+// short of a stage the build runs and say clean on a program the build refuses. The build
+// paths call run_build_analyses for the same stages in the same order.
+
+// Some rules are judged only after typecheck: mono judges the pointee of `Ptr[T]` per
+// instance, and the mutation passes warn on unrestored state. Mono assumes a well-typed
+// program, so the build runs these only on a clean front end.
+pub fn run_build_analyses(program: Int) ! Diag.Report {
+    desugar_sealed_ops_calls(program)
+    analyze_mutations(program)
+    analyze_save_restore(program)
+    analyze_escapes(program)
+    run_mono(program)
+}
+
+// The inputs of the last check_source and the bytes it read, so a caller that answers
+// many checks can tell whether a new one could say anything different.
+let mut checked_source: Str = ""
+let mut checked_paths: List[Str] = []
+let mut checked_texts: List[Str] = []
+
+// A check sees the whole program, so it loads the imports and the prelude as the build
+// does. Escape analysis needs no well-typed program, so it still runs when the front end
+// has errors and reports what it finds next to them.
+pub fn check_source(source_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = compile_to_program(source_path, 1)
+    check_types(program)
+    check_unused_imports()
+    if diag_ice_count > 0 || diag_count > 0 {
+        analyze_escapes(program)
+    } else {
+        run_build_analyses(program)
+    }
+    record_checked_inputs(source_path)
+    program
+}
+
+fn record_checked_inputs(source_path: Str) {
+    checked_source = source_path
+    checked_paths = []
+    checked_texts = []
+    let mut i = 0
+    while i < loaded_inputs.source_paths.len() {
+        checked_paths.push(loaded_inputs.source_paths.get(i).unwrap())
+        checked_texts.push(loaded_inputs.source_texts.get(i).unwrap())
+        i = i + 1
+    }
+    i = 0
+    while i < loaded_inputs.config_paths.len() {
+        checked_paths.push(loaded_inputs.config_paths.get(i).unwrap())
+        checked_texts.push(loaded_inputs.config_texts.get(i).unwrap())
+        i = i + 1
+    }
+    i = 0
+    while i < loaded_inputs.embed_paths.len() {
+        let p = loaded_inputs.embed_paths.get(i).unwrap()
+        checked_paths.push(p)
+        checked_texts.push(loaded_inputs.embed_texts.get(p).unwrap())
+        i = i + 1
+    }
+}
+
+// Compares bytes, not mtimes: an edit inside one mtime tick still counts. A file the last
+// check did not load, such as a new module that would now shadow an import, is not seen.
+pub fn checked_inputs_changed(source_path: Str) -> Bool {
+    if checked_source == "" || checked_source != source_path { return true }
+    let mut i = 0
+    while i < checked_paths.len() {
+        let p = checked_paths.get(i).unwrap()
+        // The compiler carries the embedded stdlib, so no edit can change it.
+        if !p.starts_with("<embedded:") {
+            if file_exists(p) != 1 { return true }
+            if read_file(p) != checked_texts.get(i).unwrap() { return true }
+        }
+        i = i + 1
+    }
+    false
+}
+
+pub fn checked_inputs_reset() {
+    checked_source = ""
+    checked_paths = []
+    checked_texts = []
+}
