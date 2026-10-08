@@ -173,6 +173,20 @@ asks for the one-unit build.
   `BLINK_CACHE_DIR`, `--blink-trace`, `--trace`, `BLINK_TRACE` on
   `blink run`, and a `BLINK_TRACE_CHANNELS` channel outside `build.*`.
   On `src/cli.bl` the text is 6.2 MB.
+- **Unit reuse.** When the inputs text differs only in the bytes of loaded
+  sources, the build writes the headers, then takes each unit of the last
+  build whose sources are all unchanged. Each other field of the text must
+  be byte-equal, and so must each header. The record lists, for each unit,
+  the sources its IR spans (`uses`). This is the unit's own module and
+  each module whose nodes it lowers, such as a field default or a
+  keyword-parameter default of another module. The IR arena notes the
+  source of each node it records, so the list comes from the nodes the
+  emit used, not from the imports. A new instance of a generic changes
+  the header of the module that declares it, so no unit is taken. A
+  taken unit is hard-linked from the last directory and hashed again
+  against the record. A file that differs is emitted again. The
+  `__main__` unit and the other units are emitted. The trace prints `reuse unit <module>` for each
+  unit taken.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
   code as the monolith.
