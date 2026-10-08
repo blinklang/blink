@@ -90,7 +90,7 @@ with monolith reachable via an explicit flag. The wins:
 - **archive monolith stays for stdlib.** The stdlib is already a
   pre-built archive; per-module program emit composes with it unchanged.
 
-## `blink build --per-module` and `blink run --per-module`
+## `--per-module` for `blink build`, `blink run` and `blink test`
 
 The opt-in flag drives the per-module path end to end: emit, compile,
 cache and link. The default build does not change.
@@ -147,6 +147,16 @@ cache and link. The default build does not change.
   per-module path.
 - **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `hit <module>` or
   `compile <module>` for each unit.
+- **Tests.** `blink test <file> --per-module` builds the program under test
+  on this path, at the debug flags `blink test` always uses. The test bodies,
+  the runner and `main` are in the `__main__` unit; each imported module is a
+  unit of its own. The runner state is one set per binary and per thread
+  (`BLINK_TEST_STORAGE` in `runtime_test.h`), so an assert that fails in
+  another unit reports a test failure and the next test runs. For a
+  directory, `blink test` passes `--per-module` and `--jobs` to the build of
+  each test file, and each build runs up to `--jobs` compiles of its own.
+  An entry file of only imports and tests declares nothing that names its
+  module, but it still gets the `__main__` unit, since that unit holds `main`.
 
 ### Unit headers
 

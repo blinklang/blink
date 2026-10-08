@@ -1182,6 +1182,14 @@ build/blink build src/main.bl
 build/blink build src/main.bl --release
 build/blink build src/main.bl -R
 
+# Per-module builds (opt-in): one C unit per module, compiled in parallel and
+# cached one object per unit, so an edit recompiles only the units it changed.
+# build, run and test take the flag. --jobs N (or BLINK_JOBS=N) caps the units
+# compiled at once; the default is the CPU count.
+build/blink build src/main.bl --per-module
+build/blink run src/main.bl --per-module --jobs 4
+build/blink test tests/main_test.bl --per-module
+
 # Deterministic map iteration — pin Map hash seed to 0 for reproducible builds/runs
 # (default: reads $BLINK_MAP_SEED, falls back to time(NULL) ^ (getpid()<<16))
 build/blink build src/main.bl --deterministic
