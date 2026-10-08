@@ -1,0 +1,113 @@
+// BLINK_PER_MODULE=1 selects the per-module build for `blink build`, `run` and `test` when
+// the command line does not pass --per-module, so a build that a program starts through the
+// CLI takes the path the caller chose for the whole run. A fallback the env asked for is
+// silent: the user did not ask for --per-module on that command, so there is nothing to note.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"calc_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/calc.bl", [
+        #"pub fn double(x: Int) -> Int {"#,
+        #"    x * 2"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import calc.{double}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{double(21)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes
+// --per-module build one unit, so the run drops them.
+fn blink_in(tree: Str, env_set: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_PER_MODULE BLINK_CACHE_DIR={tree}/objcache {env_set} build/blink {args}"])
+}
+
+fn unit_files(dir: Str) -> Str {
+    sh("cd {dir} 2>/dev/null && ls *.c | LC_ALL=C sort | tr '\\n' ' '")
+}
+
+test "BLINK_PER_MODULE=1 builds one unit per module without the flag" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_env_build_{getpid()}"
+    dev_tree(root, tree)
+    let b = blink_in(tree, "BLINK_PER_MODULE=1", "build app/src/main.bl -o {tree}/out/app")
+    let units = unit_files("{tree}/out/app.units")
+    let ran = process_run("sh", ["-c", "{tree}/out/app"])
+    shell_exec("rm -rf {tree}")
+    assert(b.exit_code == 0, "build failed: {b.out}{b.err_out}")
+    assert_eq(units, "__main__.c calc.c")
+    assert_eq(ran.out.trim(), "42")
+}
+
+test "BLINK_PER_MODULE=1 reaches blink run" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_env_run_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "BLINK_PER_MODULE=1", "run app/src/main.bl")
+    let units = unit_files("{tree}/build/main.units")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "run failed: {r.out}{r.err_out}")
+    assert(r.out.contains("42"), "got: {r.out}")
+    assert_eq(units, "__main__.c calc.c")
+}
+
+test "BLINK_PER_MODULE=0 and an unset env build one unit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_env_off_{getpid()}"
+    dev_tree(root, tree)
+    let off = blink_in(tree, "BLINK_PER_MODULE=0", "build app/src/main.bl -o {tree}/out/off")
+    let unset = blink_in(tree, "", "build app/src/main.bl -o {tree}/out/unset")
+    let off_units = sh("[ -d {tree}/out/off.units ] && echo units || echo none")
+    let unset_units = sh("[ -d {tree}/out/unset.units ] && echo units || echo none")
+    shell_exec("rm -rf {tree}")
+    assert(off.exit_code == 0, "build failed: {off.out}{off.err_out}")
+    assert(unset.exit_code == 0, "build failed: {unset.out}{unset.err_out}")
+    assert_eq(off_units, "none")
+    assert_eq(unset_units, "none")
+}
+
+test "a fallback the env asked for prints no note, and one the flag asked for does" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_env_note_{getpid()}"
+    dev_tree(root, tree)
+    let by_env = blink_in(tree, "BLINK_PER_MODULE=1", "build --emit c app/src/main.bl -o {tree}/out/env")
+    let by_flag = blink_in(tree, "", "build --emit c app/src/main.bl -o {tree}/out/flag --per-module")
+    let env_c = sh("[ -f {tree}/out/env.c ] && echo c || echo none")
+    shell_exec("rm -rf {tree}")
+    assert(by_env.exit_code == 0, "emit failed: {by_env.out}{by_env.err_out}")
+    assert_eq(env_c, "c")
+    assert(!by_env.err_out.contains("--per-module ignored"), "env fallback printed: {by_env.err_out}")
+    assert(by_flag.err_out.contains("--per-module ignored"), "flag fallback printed: {by_flag.err_out}")
+}
+
+test "a BLINK_PER_MODULE value other than 0 or 1 is an error" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_env_bad_{getpid()}"
+    dev_tree(root, tree)
+    let b = blink_in(tree, "BLINK_PER_MODULE=yes", "build app/src/main.bl -o {tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(b.exit_code != 0, "a bad value built: {b.out}{b.err_out}")
+    assert(b.err_out.contains("BLINK_PER_MODULE"), "got: {b.err_out}")
+}

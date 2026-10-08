@@ -1226,7 +1226,7 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
     0
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     shell_exec("rm -f {output_path}")
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -1241,7 +1241,11 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         if reason == "" {
             return do_build_units(source_path, output_path, debug_mode, release_mode, targets, json_output, strict_mode, unit_jobs)
         }
-        io.eprintln("note: --per-module ignored: {reason}; building one C unit")
+        // BLINK_PER_MODULE alone sets a default, not a request on this command, so its
+        // fallback is silent.
+        if per_module_flag {
+            io.eprintln("note: --per-module ignored: {reason}; building one C unit")
+        }
     }
     let rc = do_compile(source_path, c_path, format_flag, debug_mode, strict_mode)
     if rc != 0 {
@@ -1325,12 +1329,14 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
 // the runtime and every std body it holds, and a unit writes only what the archive cannot
 // hold. See docs/build/per-module-o-default.md.
 
-// How many units a build, run and test compile at once: 0 without --per-module, which builds one
-// C unit, else --jobs, BLINK_JOBS or -1 for the CPU count. A job count that is not a
-// positive integer is an error rather than a silent fallback, so a typo cannot quietly
-// serialise a build. Only a per-module build reads the count, so only it can fail on one.
+// How many units a build, run and test compile at once: 0 without --per-module or
+// BLINK_PER_MODULE=1, which builds one C unit, else --jobs, BLINK_JOBS or -1 for the CPU count.
+// A job count that is not a positive integer is an error rather than a silent fallback, so a
+// typo cannot quietly serialise a build. Only a per-module build reads the count, so only it
+// can fail on one.
 fn unit_jobs_from_args(a: Args) -> Int {
-    if !args_has(a, "per-module") { return 0 }
+    let by_env = per_module_from_env()
+    if !args_has(a, "per-module") && !by_env { return 0 }
     let flag = args_get(a, "jobs")
     let env_val = env.var("BLINK_JOBS") ?? ""
     let (raw, name) = if flag != "" { (flag, "--jobs") } else { (env_val, "BLINK_JOBS") }
@@ -1344,6 +1350,18 @@ fn unit_jobs_from_args(a: Args) -> Int {
     }
     // Read only when a unit compiles: it costs an exec, and a no-change build compiles none.
     -1
+}
+
+// BLINK_PER_MODULE=1 selects the per-module build for every build, run and test that does not
+// pass --per-module, so the builds a program starts through the CLI take the same path as the
+// caller. Any value but 0 or 1 is an error, for the same reason as a bad job count.
+fn per_module_from_env() -> Bool {
+    let raw = env.var("BLINK_PER_MODULE") ?? ""
+    if raw == "" || raw == "0" { return false }
+    if raw == "1" { return true }
+    io.eprintln("error: BLINK_PER_MODULE must be 0 or 1, got '{raw}'")
+    exit(1)
+    false
 }
 
 fn cpu_count() -> Int {
@@ -2838,7 +2856,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs)
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"))
     if rc == 0 {
         if emit_flag == "c" {
             if json_output != 0 {
@@ -2901,7 +2919,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag, unit_jobs)
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag, unit_jobs, args_has(a, "per-module"))
     if rc != 0 {
         exit(1)
     }
@@ -2974,7 +2992,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         shell_exec("mkdir -p build")
         let c_path = "build/{name}.c"
         let output_path = "build/{name}"
-        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0, unit_jobs)
+        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0, unit_jobs, args_has(a, "per-module"))
         if rc != 0 {
             exit(1)
         }
@@ -3057,14 +3075,15 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         output_bins.push(tf_out)
 
         let mut ba: List[Str] = ["build", tf, "-o", tf_out, "--debug"]
-        // Without --jobs the child reads BLINK_JOBS itself, from the same environment.
-        if unit_jobs != 0 {
+        // Without --jobs the child reads BLINK_JOBS itself, and without --per-module it reads
+        // BLINK_PER_MODULE, from the same environment.
+        if args_has(a, "per-module") {
             ba.push("--per-module")
-            let jobs_flag = args_get(a, "jobs")
-            if jobs_flag != "" {
-                ba.push("--jobs")
-                ba.push(jobs_flag)
-            }
+        }
+        let jobs_flag = args_get(a, "jobs")
+        if unit_jobs != 0 && jobs_flag != "" {
+            ba.push("--jobs")
+            ba.push(jobs_flag)
         }
         build_args.push(ba)
 
