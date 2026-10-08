@@ -1,5 +1,7 @@
 // A pub signature lives in its module header, which the units that import the module include.
-// An edit to it must recompile those units, even one whose own source did not change.
+// An edit to it must recompile those units, even one whose own source did not change. The test
+// does not say whether a unit that does not import the module recompiles: today every unit
+// includes every module header, so it does, and that is a limit to remove, not a promise.
 
 import std.process.{ProcessResult}
 
@@ -69,9 +71,20 @@ fn dev_tree(root: Str, tree: Str) {
         #"}"#,
         #""#,
     ].join("\n"))
+    write_file("{tree}/app/src/labels.bl", [
+        #"fn suffix() -> Str {"#,
+        #"    "!""#,
+        #"}"#,
+        #""#,
+        #"pub fn banner(s: Str) -> Str {"#,
+        #"    "== {s}{suffix()}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
     write_file("{tree}/app/src/main.bl", [
         #"import shapes.{Shape, Describe, first_or}"#,
         #"import tally.{tally, widest}"#,
+        #"import labels.{banner}"#,
         #""#,
         #"fn main() {"#,
         #"    let xs = [Shape { name: "tri", sides: 3 }, Shape { name: "sq", sides: 4 }, Shape { name: "hex", sides: 6 }]"#,
@@ -83,6 +96,7 @@ fn dev_tree(root: Str, tree: Str) {
         #"    io.println("first {first_or([7, 8], 0)} {first_or([], \"empty\")}")"#,
         #"    let names = xs.map(fn(s: Shape) -> Str { s.name })"#,
         #"    io.println(names.join(","))"#,
+        #"    io.println(banner("done"))"#,
         #"}"#,
         #""#,
     ].join("\n"))
@@ -118,6 +132,13 @@ fn units_compiled(r: ProcessResult) -> List[Str] {
     out
 }
 
+fn has(xs: List[Str], x: Str) -> Bool {
+    for y in xs {
+        if y == x { return true }
+    }
+    false
+}
+
 fn build_units(tree: Str) -> List[Str] {
     let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
     assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
@@ -132,10 +153,20 @@ test "a pub signature edit recompiles the units that import the module" {
     shell_exec("sed -i \"s/pub fn score(s: Shape) -> Int/pub fn score(s: Shape, bonus: Int) -> Int/; s/weight(s) + 1/weight(s) + bonus/\" {tree}/app/src/shapes.bl")
     shell_exec("sed -i \"s/score(s))/score(s, 1))/\" {tree}/app/src/tally.bl")
     let edited = build_units(tree)
+    let edited_out = sh("{tree}/out/app")
+    // After the pub edit, a private-body edit to a module that imports nothing still
+    // recompiles only its own unit.
+    shell_exec("sed -i \"s/\\\"!\\\"/\\\"?\\\"/\" {tree}/app/src/labels.bl")
+    let private_edit = build_units(tree)
     let out = sh("{tree}/out/app")
     shell_exec("rm -rf {tree}")
-    assert_eq(cold, ["__main__", "shapes", "tally"])
+    assert_eq(cold, ["__main__", "labels", "shapes", "tally"])
+    let seen = edited.join(",")
     // main.bl did not change, but it imports shapes, so its unit must compile again.
-    assert_eq(edited, ["__main__", "shapes", "tally"])
-    assert(out.contains("tri/3 -> 31"), "got: {out}")
+    assert(has(edited, "__main__"), "edited: {seen}")
+    assert(has(edited, "shapes"), "edited: {seen}")
+    assert(has(edited, "tally"), "edited: {seen}")
+    assert(edited_out.contains("tri/3 -> 31"), "got: {edited_out}")
+    assert_eq(private_edit, ["labels"])
+    assert(out.contains("== done?"), "got: {out}")
 }
