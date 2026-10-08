@@ -163,17 +163,17 @@ type PendingAnnotations {
 
 let mut annotations: PendingAnnotations = PendingAnnotations { item: [], program: [] }
 
-// What a unit's emit reads of the nodes, and where the fn bodies among them lie.
-type NodeTrack {
-    reads: ReadTrack
-    bodies: FnBodies
+// The token range of each top-level fn and method body in the source parsed last, kept only
+// while a build wants each source's interface text. A body edit changes tokens inside these
+// alone.
+type FnBodies {
+    wanted: Bool
+    depth: Int
+    tok_firsts: List[Int]
+    tok_lasts: List[Int]
 }
 
-fn node_track_empty() -> NodeTrack {
-    NodeTrack { reads: read_track_off(), bodies: FnBodies { depth: 0, firsts: [], lasts: [], tok_firsts: [], tok_lasts: [] } }
-}
-
-let mut node_track: NodeTrack = node_track_empty()
+let mut fn_bodies: FnBodies = FnBodies { wanted: false, depth: 0, tok_firsts: [], tok_lasts: [] }
 
 // `@expect_panic` desugars to a real AssertPanics node during parse so the
 // compile path gets all the assert_panics machinery for free. The FORMAT path
@@ -200,7 +200,8 @@ pub fn parser_reset() {
     columns = node_columns_empty()
     sublists = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
     annotations = PendingAnnotations { item: [], program: [] }
-    node_track = node_track_empty()
+    // The build sets wanted before the front end, which resets the parser first.
+    fn_bodies = FnBodies { wanted: fn_bodies.wanted, depth: 0, tok_firsts: [], tok_lasts: [] }
     source_module_for_node.clear()
     pos = 0
     parse_desugar_enabled = 1
@@ -1205,112 +1206,29 @@ pub fn node_count() -> Int { columns.count }
 // A getter checks the id here, then reads its field's slot in its column.
 fn checked_node_id(id: Int, where: Str) -> Int {
     if id < 0 || id >= columns.count { node_die(id, where) }
-    let t = node_track.reads
-    if t.on && (id < t.own_first || id >= t.own_end) { mark_node(t.read, id) }
     id
 }
 
-// ── Read tracking ──────────────────────────────────────────────────
-
-// A per-module build takes a unit from the last build only while all its emit read is the
-// same. The columns are private to this file and every getter reaches them through
-// checked_node_id, so a mark there sees every node the emit reads; no reader can skip it.
-// A position is marked apart, since a body edit moves the lines of all that follows it.
-// Nodes in [own_first, own_end) are not marked: the unit is keyed on that source anyway,
-// and it is where most reads go.
-type ReadTrack {
-    on: Bool
-    own_first: Int
-    own_end: Int
-    read: List[Int]
-    pos: List[Int]
+// Whether the parser keeps the fn body token ranges that parsed_interface_text leaves out. A
+// build turns it on only when it may take units from the last build, so no other compile
+// pays for them.
+pub fn parser_want_interface_text(on: Bool) {
+    fn_bodies.wanted = on
 }
-
-fn read_track_off() -> ReadTrack {
-    ReadTrack { on: false, own_first: 0, own_end: 0, read: [], pos: [] }
-}
-
-// Bit b of a word, for b in 0..64, as a shift by an Int amount is not allowed.
-let word_bits: List[Int] = make_word_bits()
-
-fn make_word_bits() -> List[Int] {
-    let mut out: List[Int] = [1]
-    while out.len() < 63 { out.push(out[out.len() - 1] * 2) }
-    out.push(-9223372036854775807 - 1)
-    out
-}
-
-fn mark_node(marks: List[Int], id: Int) {
-    let w = id >> 6
-    marks.set(w, marks[w] | word_bits[id & 63])
-}
-
-fn mark_pos(id: Int) {
-    let t = node_track.reads
-    if t.on && (id < t.own_first || id >= t.own_end) { mark_node(t.pos, id) }
-}
-
-// Starts a new record of the nodes read, and of the positions read, outside [own_first, own_end).
-pub fn node_reads_begin(own_first: Int, own_end: Int) {
-    let words = (columns.count >> 6) + 1
-    let mut read: List[Int] = List.with_capacity(words)
-    let mut pos_read: List[Int] = List.with_capacity(words)
-    while read.len() < words {
-        read.push(0)
-        pos_read.push(0)
-    }
-    node_track.reads = ReadTrack { on: true, own_first: own_first, own_end: own_end, read: read, pos: pos_read }
-}
-
-// Ends the record, and gives the nodes read and the nodes whose position was read, in order.
-pub fn node_reads_end() -> (List[Int], List[Int]) {
-    let t = node_track.reads
-    node_track.reads = read_track_off()
-    (marked_nodes(t.read), marked_nodes(t.pos))
-}
-
-fn marked_nodes(marks: List[Int]) -> List[Int] {
-    let mut out: List[Int] = []
-    let mut w = 0
-    while w < marks.len() {
-        let bits = marks[w]
-        if bits != 0 {
-            let mut b = 0
-            while b < 64 {
-                if (bits & word_bits[b]) != 0 { out.push(w * 64 + b) }
-                b = b + 1
-            }
-        }
-        w = w + 1
-    }
-    out
-}
-
-// The body of each top-level fn and method, as node ranges [first, last] in node order, and
-// as token ranges of the source parsed last. A body edit changes nodes inside these alone.
-type FnBodies {
-    depth: Int
-    firsts: List[Int]
-    lasts: List[Int]
-    tok_firsts: List[Int]
-    tok_lasts: List[Int]
-}
-
-pub fn fn_body_node_ranges() -> (List[Int], List[Int]) { (node_track.bodies.firsts, node_track.bodies.lasts) }
 
 // The tokens of the source parsed last, but for those inside a fn body: what other modules
 // see of it. Each token is its kind's name and its text, each after its length, so no two
-// token lists give one text. Positions are left out: a reader of a position is marked instead.
-// "" when not wanted.
+// token lists give one text. Positions are left out: emit marks the source of each position
+// it reads. "" when not wanted here or by the build.
 pub fn parsed_interface_text(wanted: Bool) -> Str {
-    if !wanted {
-        node_track.bodies.tok_firsts.clear()
-        node_track.bodies.tok_lasts.clear()
+    if !wanted || !fn_bodies.wanted {
+        fn_bodies.tok_firsts.clear()
+        fn_bodies.tok_lasts.clear()
         return ""
     }
     let sb = StringBuilder.new()
     let n = tokens.kinds.len()
-    let b = node_track.bodies
+    let b = fn_bodies
     let mut r = 0
     let mut i = 0
     while i < n {
@@ -1326,8 +1244,8 @@ pub fn parsed_interface_text(wanted: Bool) -> Str {
         sb.write(v)
         i = i + 1
     }
-    node_track.bodies.tok_firsts.clear()
-    node_track.bodies.tok_lasts.clear()
+    fn_bodies.tok_firsts.clear()
+    fn_bodies.tok_lasts.clear()
     sb.to_str()
 }
 
@@ -1458,10 +1376,7 @@ fn node_or_die(id: Int, where: Str) -> AstNode {
 
 // The whole node at `id`, built from its payload. A pass that reads one or two fields uses
 // their accessors instead.
-pub fn node_at(id: Int) -> AstNode {
-    mark_pos(id)
-    node_or_die(id, "node_at")
-}
+pub fn node_at(id: Int) -> AstNode { node_or_die(id, "node_at") }
 
 // Named-caller panic on bad id: a plain `.unwrap()` panic doesn't tell us
 // which accessor was hit or how far out of bounds the id was, which makes
@@ -1647,19 +1562,15 @@ pub fn node_doc_comment(id: Int) -> Str {
     node_get_str(checked_node_id(id, "node_doc_comment"), columns.at_doc_comment, node_blank.doc_comment)
 }
 pub fn node_line(id: Int) -> Int {
-    mark_pos(id)
     node_get_int(checked_node_id(id, "node_line"), columns.at_line, node_blank.line)
 }
 pub fn node_col(id: Int) -> Int {
-    mark_pos(id)
     node_get_int(checked_node_id(id, "node_col"), columns.at_col, node_blank.col)
 }
 pub fn node_end_line(id: Int) -> Int {
-    mark_pos(id)
     node_get_int(checked_node_id(id, "node_end_line"), columns.at_end_line, node_blank.end_line)
 }
 pub fn node_end_col(id: Int) -> Int {
-    mark_pos(id)
     node_get_int(checked_node_id(id, "node_end_col"), columns.at_end_col, node_blank.end_col)
 }
 pub fn node_assoc_types(id: Int) -> Int {
@@ -2275,8 +2186,8 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
     let mut effect_decl_nodes: List[Int] = []
     let mut test_nodes: List[Int] = []
     annotations.item = []
-    node_track.bodies.tok_firsts.clear()
-    node_track.bodies.tok_lasts.clear()
+    fn_bodies.tok_firsts.clear()
+    fn_bodies.tok_lasts.clear()
     skip_newlines_and_comments()
     while !at(TokenKind.EOF) {
         skip_newlines_and_comments()
@@ -3120,16 +3031,13 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     skip_newlines()
     let mut body_id = -1
     if at(TokenKind.LBrace) {
-        let first = node_count()
         let tok_first = pos
-        node_track.bodies.depth = node_track.bodies.depth + 1
+        fn_bodies.depth = fn_bodies.depth + 1
         body_id = parse_block()
-        node_track.bodies.depth = node_track.bodies.depth - 1
-        if node_track.bodies.depth == 0 {
-            node_track.bodies.firsts.push(first)
-            node_track.bodies.lasts.push(body_id)
-            node_track.bodies.tok_firsts.push(tok_first)
-            node_track.bodies.tok_lasts.push(pos - 1)
+        fn_bodies.depth = fn_bodies.depth - 1
+        if fn_bodies.wanted && fn_bodies.depth == 0 {
+            fn_bodies.tok_firsts.push(tok_first)
+            fn_bodies.tok_lasts.push(pos - 1)
         }
     }
     let mut fn_end_l = -1
