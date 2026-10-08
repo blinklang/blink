@@ -1,0 +1,94 @@
+// A per-module build that takes some units from the last build lowers main and the rest in a
+// process that did not lower the units it took. Whatever the taken units would have set, main,
+// a header or another unit may read. So BLINK_EMIT_REUSE_VERIFY=1 compares every file the build
+// leaves, each unit, main and every header, with a full cold emit of the same program, not
+// only the units it took.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"emit_verify_all_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, the module filters, and the verify each
+// build here sets for itself.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_EMIT_REUSE_VERIFY BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build(tree: Str, env_args: Str) -> ProcessResult {
+    blink_in(tree, env_args, "build app/src/main.bl -o {tree}/out/app --per-module")
+}
+
+fn traced(r: ProcessResult, line: Str) -> Bool {
+    "{r.out}\n{r.err_out}".split("\n").contains("[dbg:build.units] {line}")
+}
+
+// The headers the build left in its units directory.
+fn unit_headers(tree: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for f in sh("ls {tree}/out/app.units").split("\n") {
+        if f.ends_with(".h") { out.push(f) }
+    }
+    out
+}
+
+test "verify compares every unit, main and every header with a cold emit when a build takes some units" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_emit_reuse_verify_all_{getpid()}"
+    dev_tree(root, tree)
+    let first = build(tree, "")
+    shell_exec("sed -i 's/\"leaf\"/\"lea2\"/' {tree}/app/src/leaf.bl")
+    let r = build(tree, "BLINK_EMIT_REUSE_VERIFY=1")
+    let headers = unit_headers(tree)
+    shell_exec("rm -rf {tree}")
+    assert(first.exit_code == 0, "first build failed: {first.out}{first.err_out}")
+    assert(r.exit_code == 0, "verified build failed: {r.out}{r.err_out}")
+    assert(traced(r, "reuse unit base"), "the leaf edit did not take base: {r.err_out}")
+    for m in ["base", "leaf", "__main__"] {
+        assert(traced(r, "verify unit {m} same"), "unit {m} was not verified: {r.err_out}")
+    }
+    assert(headers.len() > 0, "the build left no header")
+    for h in headers {
+        assert(traced(r, "verify header {h} same"), "header {h} was not verified: {r.err_out}")
+    }
+}
