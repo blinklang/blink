@@ -35,6 +35,7 @@ Key facts:
 - `Map.remove` returns `Option[V]`. `m[k] = v` is an error; use `m.insert(k, v)`. `channel.new[T](buffer: n)`; `ch.recv()` returns `Option[T]`
 - `Float` has a total order (`NaN == NaN`); use `x.ieee_eq(y)` for IEEE equality
 - `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type
+- `blink build`, `run` and `test` compile one C unit per module. `--no-per-module` or `BLINK_PER_MODULE=0` builds one C unit, to bisect a per-module bug
 
 ## Standard Library
 

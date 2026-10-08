@@ -1182,13 +1182,17 @@ build/blink build src/main.bl
 build/blink build src/main.bl --release
 build/blink build src/main.bl -R
 
-# Per-module builds (opt-in): one C unit per module, compiled in parallel and
+# build, run and test compile one C unit per module by default, in parallel and
 # cached one object per unit, so an edit recompiles only the units it changed.
-# build, run and test take the flag. --jobs N (or BLINK_JOBS=N) caps the units
-# compiled at once; the default is the CPU count.
-build/blink build src/main.bl --per-module
-build/blink run src/main.bl --per-module --jobs 4
-build/blink test tests/main_test.bl --per-module
+# --jobs N (or BLINK_JOBS=N) caps the units compiled at once; the default is
+# the CPU count.
+build/blink run src/main.bl --jobs 4
+
+# One C unit for the whole program, to bisect a per-module bug. A flag beats
+# BLINK_PER_MODULE (0 or 1), which beats the default. --per-module asks for the
+# default by name.
+build/blink build src/main.bl --no-per-module
+BLINK_PER_MODULE=0 build/blink test tests/main_test.bl
 
 # Deterministic map iteration — pin Map hash seed to 0 for reproducible builds/runs
 # (default: reads $BLINK_MAP_SEED, falls back to time(NULL) ^ (getpid()<<16))
@@ -1236,8 +1240,8 @@ cc -o build/main_modules/bin $(ls build/main_modules/*.c | sort) -Ibuild -lm -lg
 typedefs resolve; the entry module owns runtime globals and every other module
 externs them. The legacy hidden `__emit-per-module <file.bl> <outdir>`
 subcommand still works as a deprecation alias for one release. See
-`docs/build/per-module-o-default.md` for the rationale and the path to making
-per-module the default build path.
+`docs/build/per-module-o-default.md` for the rationale and for how the default
+build uses per-module units.
 
 ### Compiler Daemon
 

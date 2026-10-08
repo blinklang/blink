@@ -156,8 +156,9 @@ run exits 0 with failing files, because corpus-check judges it.
 
 ## The per-module corpus
 
-`task corpus` exports `BLINK_COMPILER_ARCHIVE`, and under it `--per-module`
-builds one unit, so that run never takes the per-module path.
+The per-module path is blink's default, but `task corpus` exports
+`BLINK_PER_MODULE=0` and `BLINK_COMPILER_ARCHIVE`, and under the archive even
+`--per-module` builds one unit, so that run never takes the per-module path.
 `CORPUS_PER_MODULE=1 scripts/corpus.sh` is a second mode for that path. It
 builds no compiler archive and exports `BLINK_PER_MODULE=1`, so the program
 each file builds is per-module, and so is each program the test builds

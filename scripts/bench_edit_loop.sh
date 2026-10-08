@@ -16,9 +16,10 @@
 #   BENCH_SLICE=blink-gates.slice  systemd user slice to run in; empty runs in place
 #   BENCH_WORKDIR=<dir>    parent of the scratch tree (default ${TMPDIR:-/tmp})
 #   BENCH_KEEP=1           keep the scratch tree
-#   BENCH_FLAGS="..."      extra flags for the build, run and test cases, e.g. "--per-module".
-#                          With --per-module the C hash covers the units dir
-#                          (<stem>.units/*.c and *.h) in place of <stem>.c
+#   BENCH_FLAGS="..."      extra flags for the build, run and test cases, e.g.
+#                          "--no-per-module" for the one-unit build. A per-module build (the
+#                          default) has its C hash cover the units dir (<stem>.units/*.c and
+#                          *.h); a one-unit build hashes <stem>.c
 #
 # Setup. The tree (tracked + untracked, not ignored) is copied to a scratch dir, so the
 # real src/ is never edited. The binary is copied to <scratch>/build/blink: that is the
@@ -26,7 +27,7 @@
 # <scratch>/build/std-cache that a cold case can clear and rebuild.
 #
 # Targets:
-#   cli    src/cli.bl, built from the scratch root (the compiler, one monolith C unit)
+#   cli    src/cli.bl, built from the scratch root (the compiler)
 #   small  bench/edit_loop/src/main.bl, built from bench/edit_loop (6 modules, std.json)
 #
 # Cases (each row says the file it edits):
@@ -44,8 +45,8 @@
 # put back after the run. So no run can hit an object another run stored.
 #
 # Split. A `cc` wrapper first on PATH logs each cc call. cc_s is the time at least one
-# `cc -c` call ran (the user unit, or the std monolith in cold-all; with --per-module the
-# units, which run in parallel, so their overlap counts once), link_s sums the other calls but
+# `cc -c` call ran (the units, which run in parallel, so their overlap counts once, and the
+# std monolith in cold-all; with --no-per-module the user unit), link_s sums the other calls but
 # `cc --version`, and emit_s = wall - cc_s - link_s: front end, codegen, cache hashing
 # and process start. Each split column is its own median, so they need not add up to
 # median_s. The wrapper costs a few ms per call. No trace in blink gives this split.
@@ -220,17 +221,20 @@ rep() {
     ' "$work/.bench/cc.log" >> "$raw"
 }
 
-# c_sha <c file>: the hash of the C a build wrote. A --per-module build writes no <stem>.c,
-# so its hash covers every unit and header in <stem>.units.
+# c_sha <c file>: the hash of the C a build wrote. A per-module build writes no <stem>.c,
+# so its hash covers every unit and header in <stem>.units. The path is chosen as blink
+# chooses it: a flag beats BLINK_PER_MODULE, which beats the per-module default.
 c_sha() {
-    local f=$1 u=${1%.c}.units
+    local f=$1 u=${1%.c}.units units=1
     case " ${BENCH_FLAGS:-} " in
-        *" --per-module "*)
-            if [ -d "$u" ]; then
-                (cd "$u" && LC_ALL=C ls *.c *.h | LC_ALL=C sort | xargs cat) | sha256sum | cut -d' ' -f1
-                return
-            fi ;;
+        *" --no-per-module "*) units=0 ;;
+        *" --per-module "*) ;;
+        *) [ "${BLINK_PER_MODULE:-}" = 0 ] && units=0 ;;
     esac
+    if [ "$units" = 1 ] && [ -d "$u" ]; then
+        (cd "$u" && LC_ALL=C ls *.c *.h | LC_ALL=C sort | xargs cat) | sha256sum | cut -d' ' -f1
+        return
+    fi
     sha256sum "$f" | cut -d' ' -f1
 }
 

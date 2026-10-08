@@ -96,8 +96,9 @@ else
     printf '#!/bin/sh\nexit 0\n' > "$out"
 fi
 chmod +x "$out"
-# A per-module build leaves its units beside the binary.
-[ "${BLINK_PER_MODULE:-}" = 1 ] && mkdir -p "$out.units"
+# A per-module build, blink's default, leaves its units beside the binary. A
+# compiler archive in the env makes it fall back to one unit.
+[ "${BLINK_PER_MODULE:-1}" != 0 ] && [ -z "${BLINK_COMPILER_ARCHIVE:-}" ] && mkdir -p "$out.units"
 exit 0
 EOF
 cp "$R/fakec/blink" "$R/fakec/blinkc"
@@ -404,6 +405,14 @@ if [ "$(jq -r '.files[0].per_module' "$R/build/corpus_subset.json")" = false ] &
     echo "PASS default-mode-ignores-caller-per-module-env"
 else
     echo "FAIL default-mode-ignores-caller-per-module-env: the default mode built units"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+fi
+(cd "$R" && env -u BLINK_PER_MODULE CORPUS_COMPILER_ARCHIVE=0 CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/all_pass.txt" --no-lint) > "$WORK/out.log" 2>&1
+if [ "$(jq -r '.files[0].per_module' "$R/build/corpus_subset.json")" = false ] && [ "$(jq -r .per_module "$R/build/corpus_subset.json")" = false ]; then
+    echo "PASS default-mode-without-archive-builds-one-unit"
+else
+    echo "FAIL default-mode-without-archive-builds-one-unit: the default mode built units"
     sed 's/^/    /' "$WORK/out.log"
     fail=1
 fi

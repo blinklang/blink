@@ -488,11 +488,10 @@ tasks:
         echo "PASS test-installed (install.sh layout — std.db_sqlite statically vendored from sidecar)"
 
   # `ci-release` runs the full monolith verification (`ci-monolith`) AND the
-  # four per-module emit invariants (`ci-per-module-checks`). Per-module
-  # .c/.h emit is the path we are promoting toward default; see
-  # docs/build/per-module-o-default.md. The monolith path stays reachable via
-  # `task ci-monolith` so a codegen regression can be bisected against the
-  # single-TU output.
+  # four per-module emit invariants (`ci-per-module-checks`). The per-module
+  # build is the default; see docs/build/per-module-o-default.md. The monolith
+  # path stays reachable via --no-per-module and `task ci-monolith`, so a
+  # codegen regression can be bisected against the single-TU output.
   ratchet:
     desc: Fail if any tracked compiler-debt count rose above the baseline or the previous commit
     silent: true
@@ -750,13 +749,13 @@ tasks:
       - task: gen1
       - ./scripts/corpus.sh --only {{.CLI_ARGS}} --no-lint
 
-  # Legacy monolith-only verification: regen bootstrap + run all tests on
-  # the single-TU (monolith) codegen path. Kept green as a fallback so users
+  # Monolith-only verification: regen bootstrap + run all tests on the
+  # single-TU (monolith) codegen path (--no-per-module). Kept green so users
   # / CI can bisect codegen regressions against monolith output. The
-  # per-module invariants live in `ci` via `ci-per-module-checks`.
+  # per-module invariants live in `ci-release` via `ci-per-module-checks`.
   # See docs/build/per-module-o-default.md.
   ci-monolith:
-    desc: Monolith-path CI — regen bootstrap + run all tests (per-module fallback)
+    desc: Monolith-path CI — regen bootstrap + run all tests with --no-per-module
     silent: true
     sources:
       - src/*.bl
@@ -791,7 +790,7 @@ tasks:
         {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
         scripts/stamp_cli_version.sh {{.BUILD_DIR}}/cli.c "{{.VERSION}}-dev+$(date +%Y%m%d%H%M%S)"
         cc {{.LINK_OPT}} -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -I{{.BUILD_DIR}} {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
-      - 'BLINK_ROOT="$(pwd)" {{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet'
+      - 'BLINK_ROOT="$(pwd)" {{.BUILD_DIR}}/blink test tests/ --no-per-module --parallel {{.JOBS}} --quiet'
       - task: test-bootstrap-cold
       - task: test-sqlite-peel
       - task: __fmt-goldens
@@ -886,7 +885,7 @@ tasks:
         '
 
         # Phase 5: full test suite (429-ish files).
-        time_phase blink-test "BLINK_ROOT=$(pwd) {{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}} --quiet"
+        time_phase blink-test "BLINK_ROOT=$(pwd) {{.BUILD_DIR}}/blink test tests/ --no-per-module --parallel {{.JOBS}} --quiet"
 
         # Phase 6: fmt waves — each parallel invocation timed separately and
         # given its own --joblog so per-file timings are available for free.
@@ -931,7 +930,7 @@ tasks:
   #   3. determinism (re-emit is byte-identical across runs)
   #   4. gen1/gen2 byte-equality (regen fixed-point on the .c/.h set)
   # This is the per-module half of `ci`; the monolith half is `ci-monolith`.
-  # See docs/build/per-module-o-default.md for why this is the path to default.
+  # See docs/build/per-module-o-default.md for why this path is the default.
   ci-per-module-checks:
     desc: Verify per-module .c/.h emit — four invariants (byte-equality, self-host, determinism, gen1/gen2)
     silent: true
@@ -954,7 +953,7 @@ tasks:
         trap "rm -rf $TMPDIR" EXIT
 
         # Monolith reference run.
-        {{.BUILD_DIR}}/blink run tests/multifile/src/main.bl > "$TMPDIR/monolith.out" 2>&1
+        {{.BUILD_DIR}}/blink run tests/multifile/src/main.bl --no-per-module > "$TMPDIR/monolith.out" 2>&1
 
         # Per-module emit + cc link with pinned (sorted) link order.
         mkdir -p "$TMPDIR/per_mod"
@@ -978,7 +977,7 @@ tasks:
         # (the definition is static — a foreign extern references an undefined
         # symbol). Fixture pulls std.semver (non-pub CH_*/OP_* consts) into two
         # user TUs; emit per-module, link, and assert no private extern leak.
-        {{.BUILD_DIR}}/blink run tests/multifile_stdlib_priv/src/main.bl > "$TMPDIR/priv_mono.out" 2>&1
+        {{.BUILD_DIR}}/blink run tests/multifile_stdlib_priv/src/main.bl --no-per-module > "$TMPDIR/priv_mono.out" 2>&1
         mkdir -p "$TMPDIR/priv_pm"
         {{.BUILD_DIR}}/blink __emit-per-module tests/multifile_stdlib_priv/src/main.bl "$TMPDIR/priv_pm"
         # No non-pub stdlib symbol (semver's CH_*/OP_*) may be declared extern in
@@ -1003,7 +1002,7 @@ tasks:
         # A user effect declared in one module and handled in another: every
         # module header names blink_ev and the effect's vtable in its
         # prototypes, so the header must carry both typedefs.
-        {{.BUILD_DIR}}/blink run tests/multifile_effect/src/main.bl > "$TMPDIR/eff_mono.out" 2>&1
+        {{.BUILD_DIR}}/blink run tests/multifile_effect/src/main.bl --no-per-module > "$TMPDIR/eff_mono.out" 2>&1
         mkdir -p "$TMPDIR/eff_pm"
         {{.BUILD_DIR}}/blink __emit-per-module tests/multifile_effect/src/main.bl "$TMPDIR/eff_pm"
         cc -o "$TMPDIR/eff_pm/bin" $(ls "$TMPDIR"/eff_pm/*.c | sort) -Ibuild -lm -lgc
@@ -1019,7 +1018,7 @@ tasks:
 
         # Runtime state (argv here) set by main() must be the state every
         # other module object reads, not a private per-object copy.
-        {{.BUILD_DIR}}/blink run tests/multifile_runtime_state/src/main.bl > "$TMPDIR/rt_mono.out" 2>&1
+        {{.BUILD_DIR}}/blink run tests/multifile_runtime_state/src/main.bl --no-per-module > "$TMPDIR/rt_mono.out" 2>&1
         mkdir -p "$TMPDIR/rt_pm"
         {{.BUILD_DIR}}/blink __emit-per-module tests/multifile_runtime_state/src/main.bl "$TMPDIR/rt_pm"
         cc -o "$TMPDIR/rt_pm/bin" $(ls "$TMPDIR"/rt_pm/*.c | sort) -Ibuild -lm -lgc

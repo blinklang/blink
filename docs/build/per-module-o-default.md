@@ -75,11 +75,11 @@ affected by the per-module *program* emit path.
 - `task ci-per-module-checks` holds the four per-module invariants
   (renamed from the old `ci-per-module`). `ci-profile` times this phase.
 
-## Path to default
+## Path to default (done)
 
-The eventual flip makes the per-module path the default for
-`blink build` / `blink run` (link-only fast path on warm `.o` cache),
-with monolith reachable via an explicit flag. The wins:
+The per-module path is the default for `blink build`, `blink run` and
+`blink test`. `--no-per-module` or `BLINK_PER_MODULE=0` builds the
+monolith, so a per-module bug can be bisected against it. The wins:
 
 - **cc warm-cache.** Per-module `.o` caching (`per-module-o-cache.md`)
   means an incremental build recompiles only the changed module's `.c`
@@ -90,10 +90,11 @@ with monolith reachable via an explicit flag. The wins:
 - **archive monolith stays for stdlib.** The stdlib is already a
   pre-built archive; per-module program emit composes with it unchanged.
 
-## `--per-module` for `blink build`, `blink run` and `blink test`
+## The per-module path for `blink build`, `blink run` and `blink test`
 
-The opt-in flag drives the per-module path end to end: emit, compile,
-cache and link. The default build does not change.
+The default build drives the per-module path end to end: emit, compile,
+cache and link. `--per-module` asks for it by name, and `--no-per-module`
+asks for the one-unit build.
 
 - **Units.** One `.c` per program module, plus the headers below,
   written to `<output>.units/` next to the binary. The
@@ -175,28 +176,33 @@ cache and link. The default build does not change.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
   code as the monolith.
-- **Env.** `BLINK_PER_MODULE=1` selects this path for a command that does
-  not pass `--per-module`, and so does every `blink` that the program starts.
-  `0` or unset keeps the default. Any other value is an error.
+- **Selection.** A flag on the command beats `BLINK_PER_MODULE`, which
+  beats the default. `--per-module` or `--no-per-module` decides for that
+  command; passing both is an error. Without a flag, `BLINK_PER_MODULE=0`
+  builds one unit and `1` or unset takes this path, for the command and for
+  every `blink` that the program starts. Any other value is an error, even
+  under a flag.
 - **Fallback.** `--emit c`, `--format blink`, `BLINK_SKIP_MODULES`,
   `BLINK_ONLY_MODULE` and `BLINK_COMPILER_ARCHIVE` build one C unit. When
   `--per-module` asked for the path, the build prints
-  `note: --per-module ignored: <reason>`. When only `BLINK_PER_MODULE`
-  asked, it prints nothing. `--target` uses the per-module path.
-- **Corpus.** `task corpus-per-module` builds every `tests/test_*.bl` on this
-  path with no compiler archive, and `task ci-release` runs it. See the
+  `note: --per-module ignored: <reason>`. When the default or
+  `BLINK_PER_MODULE` chose the path, it prints nothing. `--target` uses the per-module path.
+- **Corpus.** `task corpus` builds one unit per file (`BLINK_PER_MODULE=0`
+  and the compiler archive). `task corpus-per-module` builds every
+  `tests/test_*.bl` on this path with no compiler archive, and
+  `task ci-release` runs it. See the
   per-module corpus in `docs/codegen-rewrite/harness.md`.
 - **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `reuse emit` or
   `emit` once per build, then `hit <module>` or `compile <module>` for each
   unit.
-- **Tests.** `blink test <file> --per-module` builds the program under test
+- **Tests.** `blink test <file>` builds the program under test
   on this path, at the debug flags `blink test` always uses. The test bodies,
   the runner and `main` are in the `__main__` unit; each imported module is a
   unit of its own. The runner state is one set per binary and per thread
   (`BLINK_TEST_STORAGE` in `runtime_test.h`), so an assert that fails in
   another unit reports a test failure and the next test runs. For a
-  directory, `blink test` passes `--per-module` and `--jobs` to the build of
-  each test file, and each build runs up to `--jobs` compiles of its own.
+  directory, `blink test` passes the path flag it was given and
+  `--jobs` to the build of each test file, and each build runs up to `--jobs` compiles of its own.
   An entry file of only imports and tests declares nothing that names its
   module, but it still gets the `__main__` unit, since that unit holds `main`.
 
@@ -372,7 +378,38 @@ of `d1cf8f55` (before) and of `7f4d7dbb` (after), in two runs on one machine on 
   In the like-for-like columns each edit case's range overlaps its before
   range; the largest change in a median is +0.015 s, on cli `body-cname`.
 
-## Blockers before the default flips
+### After the flip
+
+`task bench-edit-loop` on the gen1 `blink` built from `6ee0ea14`, 5 reps, 12
+cores, under `blink-gates.slice`, with no flags (the per-module default) and
+with `BENCH_FLAGS=--no-per-module` (one unit).
+`bench/edit_loop/per_module_6ee0ea14.tsv` and
+`bench/edit_loop/monolith_6ee0ea14.tsv` hold the rows. Median wall seconds,
+then the default's split.
+
+| target | case | `--no-per-module` | default | emit_s | cc_s | link_s |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.770 | 0.496 | 0.452 | 0.000 | 0.043 |
+| cli | body-cname | 10.504 | 1.142 | 0.947 | 0.152 | 0.043 |
+| cli | body-typecheck | 10.515 | 3.403 | 0.944 | 2.412 | 0.043 |
+| cli | pubfn-cname | 10.508 | 1.826 | 0.948 | 0.839 | 0.043 |
+| cli | run-body-cname | 10.558 | 1.124 | 0.932 | 0.151 | 0.042 |
+| cli | test-body-cname | 2.123 | 0.603 | 0.465 | 0.102 | 0.035 |
+| cli | cold-obj | 10.530 | 3.580 | 0.505 | 3.034 | 0.043 |
+| cli | cold-all | 12.918 | 5.942 | 0.590 | 5.302 | 0.043 |
+| small | nochange | 0.073 | 0.071 | 0.052 | 0.000 | 0.019 |
+| small | body-inventory | 0.139 | 0.121 | 0.065 | 0.036 | 0.019 |
+| small | pubfn-model | 0.139 | 0.121 | 0.066 | 0.036 | 0.019 |
+| small | run-body-inventory | 0.137 | 0.121 | 0.065 | 0.037 | 0.019 |
+| small | test-body-inventory | 0.141 | 0.135 | 0.062 | 0.053 | 0.020 |
+| small | cold-obj | 0.137 | 0.120 | 0.064 | 0.037 | 0.019 |
+
+The default rows match the `--per-module` rows on `7f4d7dbb` within their
+spread: the flip changes which path runs, not the path. A body edit on cli
+spends 0.95 s of its 1.14 s in emit (front end, codegen, cache hashing), so
+the 1.0 s goal for it needs a faster emit, not a faster cc.
+
+## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
 monolith, and no per-module case is slower than before outside its spread.
