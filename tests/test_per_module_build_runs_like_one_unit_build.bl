@@ -1,0 +1,137 @@
+// --per-module compiles one C unit per module and links them against the stdlib archive. The
+// program it builds must behave the same as the one the one-unit build makes.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"shapes_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/shapes.bl", [
+        #"pub type Shape {"#,
+        #"    name: Str"#,
+        #"    sides: Int"#,
+        #"}"#,
+        #""#,
+        #"pub trait Describe {"#,
+        #"    fn describe(self) -> Str"#,
+        #"}"#,
+        #""#,
+        #"impl Describe for Shape {"#,
+        #"    fn describe(self) -> Str {"#,
+        #"        "{self.name}/{self.sides}""#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn weight(s: Shape) -> Int {"#,
+        #"    s.sides * 10"#,
+        #"}"#,
+        #""#,
+        #"pub fn score(s: Shape) -> Int {"#,
+        #"    weight(s) + 1"#,
+        #"}"#,
+        #""#,
+        #"pub fn first_or[T](xs: List[T], fallback: T) -> T {"#,
+        #"    match xs.get(0) {"#,
+        #"        Some(x) => x"#,
+        #"        None => fallback"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/tally.bl", [
+        #"import shapes.{Shape, Describe, score, first_or}"#,
+        #""#,
+        #"pub fn tally(xs: List[Shape]) -> Map[Str, Int] {"#,
+        #"    let mut m: Map[Str, Int] = Map()"#,
+        #"    for s in xs {"#,
+        #"        m.insert(s.describe(), score(s))"#,
+        #"    }"#,
+        #"    m"#,
+        #"}"#,
+        #""#,
+        #"pub fn widest(xs: List[Shape]) -> Shape {"#,
+        #"    let big = xs.filter(fn(s) { s.sides > 3 })"#,
+        #"    first_or(big, Shape { name: "none", sides: 0 })"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import shapes.{Shape, Describe, first_or}"#,
+        #"import tally.{tally, widest}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let xs = [Shape { name: "tri", sides: 3 }, Shape { name: "sq", sides: 4 }, Shape { name: "hex", sides: 6 }]"#,
+        #"    let m = tally(xs)"#,
+        #"    for k in ["tri/3", "sq/4", "hex/6"] {"#,
+        #"        io.println("{k} -> {m.get(k) ?? -1}")"#,
+        #"    }"#,
+        #"    io.println("widest {widest(xs).describe()}")"#,
+        #"    io.println("first {first_or([7, 8], 0)} {first_or([], \"empty\")}")"#,
+        #"    let names = xs.map(fn(s: Shape) -> Str { s.name })"#,
+        #"    io.println(names.join(","))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with its own object cache, and the unit trace on.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+let EXPECTED: Str = "tri/3 -> 31\nsq/4 -> 41\nhex/6 -> 61\nwidest sq/4\nfirst 7 empty\ntri,sq,hex"
+
+test "a per-module build prints what the one-unit build prints" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_same_output_{getpid()}"
+    dev_tree(root, tree)
+    let one = blink_in(tree, "build app/src/main.bl -o {tree}/out/one")
+    let units = blink_in(tree, "build app/src/main.bl -o {tree}/out/units --per-module")
+    let one_out = sh("{tree}/out/one")
+    let units_out = sh("{tree}/out/units")
+    let unit_c = sh("ls {tree}/out/units.units/*.c 2>/dev/null | wc -l").to_int()
+    shell_exec("rm -rf {tree}")
+    assert(one.exit_code == 0, "one-unit build failed: {one.out}{one.err_out}")
+    assert(units.exit_code == 0, "per-module build failed: {units.out}{units.err_out}")
+    assert_eq(one_out, EXPECTED)
+    assert_eq(units_out, EXPECTED)
+    // One unit per program module: shapes, tally and main.
+    assert_eq(unit_c, 3)
+}
+
+test "run --per-module runs the program it builds" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_run_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "run app/src/main.bl -o {tree}/out/ran --per-module --jobs 1")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "run failed: {r.out}{r.err_out}")
+    assert_eq(r.out.trim(), EXPECTED)
+}
+
+test "a job count that is not a positive integer is an error" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_bad_jobs_{getpid()}"
+    dev_tree(root, tree)
+    let flag = blink_in(tree, "build app/src/main.bl -o {tree}/out/a --per-module --jobs 0")
+    let envr = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT BLINK_JOBS=many build/blink build app/src/main.bl -o {tree}/out/b --per-module"])
+    shell_exec("rm -rf {tree}")
+    assert_eq(flag.exit_code, 1)
+    assert(flag.err_out.contains("--jobs must be a positive integer"), "got: {flag.err_out}")
+    assert_eq(envr.exit_code, 1)
+    assert(envr.err_out.contains("BLINK_JOBS must be a positive integer"), "got: {envr.err_out}")
+}
