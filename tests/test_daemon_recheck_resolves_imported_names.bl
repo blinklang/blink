@@ -1,0 +1,29 @@
+// A daemon recheck after an edit checks the whole program, so a name the entry file imports
+// from another module still resolves. A daemon that rechecks the entry file alone reports a
+// clean program as calling an undefined function.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/daemon_recheck_imports"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+test "daemon recheck after an edit resolves a selectively imported function" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}/src")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"daemon_recheck\"\nversion = \"0.1.0\"\n")
+    write_file("{DIR}/src/helper.bl", "pub fn helper() -> Int \{\n    42\n}\n")
+    write_file("{DIR}/src/main.bl", "import helper.\{helper}\n\nfn main() \{\n    io.println(\"\{helper()}\")\n}\n")
+    // The timeout ends a daemon that a failed assert left running.
+    let started = sh("B=$(pwd)/build/blink; cd {DIR} && (timeout 120 $B daemon start src/main.bl > daemon.log 2>&1 &); for i in $(seq 1 400); do [ -S src/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1")
+    assert_eq(started.exit_code, 0)
+    let first = sh("B=$(pwd)/build/blink; cd {DIR}/src && $B check main.bl 2>&1").out
+    let _ = sh("printf \"\\n\" >> {DIR}/src/main.bl")
+    let after_edit = sh("B=$(pwd)/build/blink; cd {DIR}/src && $B check main.bl 2>&1").out
+    let _ = sh("B=$(pwd)/build/blink; cd {DIR}/src && $B daemon stop")
+    if !after_edit.contains("\"changed\":1,\"errors\":0,") { io.eprintln("first: {first}\nafter edit: {after_edit}") }
+    assert(first.contains("\"errors\":0,"))
+    assert(after_edit.contains("\"changed\":1,\"errors\":0,"))
+    assert(!after_edit.contains("UndefinedFunction"))
+}
