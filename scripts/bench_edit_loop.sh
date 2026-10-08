@@ -16,6 +16,9 @@
 #   BENCH_SLICE=blink-gates.slice  systemd user slice to run in; empty runs in place
 #   BENCH_WORKDIR=<dir>    parent of the scratch tree (default ${TMPDIR:-/tmp})
 #   BENCH_KEEP=1           keep the scratch tree
+#   BENCH_FLAGS="..."      extra flags for the build and run cases, e.g. "--per-module". The
+#                          test cases do not take them. With --per-module the C hash covers
+#                          the units dir (<stem>.units/*.c and *.h) in place of <stem>.c
 #
 # Setup. The tree (tracked + untracked, not ignored) is copied to a scratch dir, so the
 # real src/ is never edited. The binary is copied to <scratch>/build/blink: that is the
@@ -40,8 +43,9 @@
 # and from every other run (checked by hash; the row fails if not), and the file is
 # put back after the run. So no run can hit an object another run stored.
 #
-# Split. A `cc` wrapper first on PATH logs each cc call. cc_s sums `cc -c` calls (the
-# user unit, or the std monolith in cold-all), link_s sums the other calls but
+# Split. A `cc` wrapper first on PATH logs each cc call. cc_s is the time at least one
+# `cc -c` call ran (the user unit, or the std monolith in cold-all; with --per-module the
+# units, which run in parallel, so their overlap counts once), link_s sums the other calls but
 # `cc --version`, and emit_s = wall - cc_s - link_s: front end, codegen, cache hashing
 # and process start. Each split column is its own median, so they need not add up to
 # median_s. The wrapper costs a few ms per call. No trace in blink gives this split.
@@ -188,22 +192,46 @@ rep() {
             (cd "$work/build" && rm -rf std-cache libblink_std.a libblink_std.h skip_modules.txt .archive-id) ;;
     esac
     case "$kind" in
-        run) args=(run "$(tv src "$target")") ;;
+        run) args=(run "$(tv src "$target")" ${BENCH_FLAGS:-}) ;;
         test) args=(test "$(tv test "$target")") ;;
-        *) args=(build "$(tv src "$target")") ;;
+        *) args=(build "$(tv src "$target")" ${BENCH_FLAGS:-}) ;;
     esac
     local load=$(load1)
     run_blink "$target" "$log" "${args[@]}"
     [ -n "$efile" ] && restore "$target" "$target-$(stem "$efile").bl" "$efile"
     [ "$rc" = 0 ] || { tail -20 "$log" >&2; die "$target $cs run $r: blink ${args[*]} exited $rc (log $log)"; }
     local sha
-    sha=$(sha256sum "$dir/$cfile" | cut -d' ' -f1)
+    sha=$(c_sha "$dir/$cfile")
     awk -v wall="$wall" -v t="$target" -v c="$cs" -v r="$r" -v sha="$sha" -v ld="$load" '
-        { d = $3 - $2 }
-        $1 == "cc" { cc += d; n++ }
-        $1 == "link" { link += d }
-        END { printf "%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%d\t%s\t%s\n", t, c, r, wall, wall - cc - link, cc, link, n, sha, ld }
+        $1 == "cc" { n++; s[n] = $2; e[n] = $3 }
+        $1 == "link" { link += $3 - $2 }
+        END {
+            for (i = 2; i <= n; i++) {
+                x = s[i]; y = e[i]
+                for (j = i - 1; j >= 1 && s[j] > x; j--) { s[j + 1] = s[j]; e[j + 1] = e[j] }
+                s[j + 1] = x; e[j + 1] = y
+            }
+            for (i = 1; i <= n; i++) {
+                if (i == 1 || s[i] > hi) { if (i > 1) cc += hi - lo; lo = s[i]; hi = e[i] }
+                else if (e[i] > hi) hi = e[i]
+            }
+            if (n > 0) cc += hi - lo
+            printf "%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%d\t%s\t%s\n", t, c, r, wall, wall - cc - link, cc, link, n, sha, ld }
     ' "$work/.bench/cc.log" >> "$raw"
+}
+
+# c_sha <c file>: the hash of the C a build wrote. A --per-module build writes no <stem>.c,
+# so its hash covers every unit and header in <stem>.units.
+c_sha() {
+    local f=$1 u=${1%.c}.units
+    case " ${BENCH_FLAGS:-} " in
+        *" --per-module "*)
+            if [ -d "$u" ]; then
+                (cd "$u" && LC_ALL=C ls *.c *.h | LC_ALL=C sort | xargs cat) | sha256sum | cut -d' ' -f1
+                return
+            fi ;;
+    esac
+    sha256sum "$f" | cut -d' ' -f1
 }
 
 # warm <target>: build, run and test once so every later case starts warm; sets base shas.
@@ -217,12 +245,12 @@ warm() {
     for f in $(tv body "$target"); do
         [ "$(grep -c "^fn ${f#*:}(" "$dir/${f%%:*}")" = 1 ] || die "$target: need one private fn ${f#*:} in ${f%%:*}"
     done
-    run_blink "$target" "$work/.bench/logs/$target-warm-build.log" build "$(tv src "$target")"
+    run_blink "$target" "$work/.bench/logs/$target-warm-build.log" build "$(tv src "$target")" ${BENCH_FLAGS:-}
     [ "$rc" = 0 ] || die "$target warm build exited $rc"
     run_blink "$target" "$work/.bench/logs/$target-warm-test.log" test "$(tv test "$target")"
     [ "$rc" = 0 ] || die "$target warm test exited $rc"
-    base_build=$(sha256sum "$dir/build/$(stem "$(tv src "$target")").c" | cut -d' ' -f1)
-    base_test=$(sha256sum "$dir/build/$(stem "$(tv test "$target")").c" | cut -d' ' -f1)
+    base_build=$(c_sha "$dir/build/$(stem "$(tv src "$target")").c")
+    base_test=$(c_sha "$dir/build/$(stem "$(tv test "$target")").c")
     echo "bench_edit_loop: $target warm; build C $base_build, test C $base_test"
 }
 
@@ -272,6 +300,7 @@ run_case() {
     echo "# tree $(cd "$repo" && git rev-parse --short=8 HEAD)$(cd "$repo" && git diff --quiet HEAD -- || echo ' (dirty)')"
     echo "# blink $blink_bin sha256 $(sha256sum "$blink_bin" | cut -c1-16)"
     echo "# cc $("$real_cc" --version | head -1); nproc $(nproc); reps $reps; slice ${slice:-none}"
+    echo "# flags ${BENCH_FLAGS:-none}"
     echo "# emit_s = wall - cc_s - link_s; split columns are medians of their own; c_check: C hash vs the warm C"
     printf 'target\tcase\tedited\tn\tmedian_s\tmin_s\tmax_s\tspread_pct\temit_s\tcc_s\tlink_s\tcc_calls\tc_check\tmax_load1\n'
 } > "$out"
