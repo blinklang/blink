@@ -15,17 +15,18 @@ import diagnostics.{
 }
 import cname.{
     c_archive_header_guard, c_layer_archive_header_guard, c_layer_archive_header_name, c_module_header_guard, c_module_init_globals_name,
+    c_module_private_header_guard, c_program_types_header_guard, c_program_types_header_name,
     c_string_literal, c_test_fn_name,
 }
 import ast.{NodeKind, nk_of}
 import parser.{
-    ann_str_val, node_args, node_body, node_handlers, node_int_val, node_kind, node_name,
+    ann_str_val, node_args, node_body, node_handlers, node_int_val, node_is_pub, node_kind, node_name, node_trait_name,
     node_str_val, node_value, node_push_value_child_ids, node_xfail_reason,
     sublist_get, sublist_length,
 }
 import layout.{Position, layout_of, layout_reset, set_current_inst, layout_take_typedefs}
 import cg_print.{
-    print_ev_default_decl, print_ev_storage, print_fn, print_fn_decl, print_include, print_main_shim, print_reset, print_scope_restore_support,
+    print_ev_default_decl, print_ev_storage, print_fn, print_fn_decl, print_guard_open, print_include, print_main_shim, print_reset, print_scope_restore_support,
     print_take, print_test_fn, print_test_table, print_typedef_blocks,
 }
 import cg_reg.{
@@ -821,33 +822,85 @@ pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Di
     print_take()
 }
 
-// One module's public header, for the per-module object mode.
-pub fn generate_module_header(program: Int, module_key: Str, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
+// The per-module mode's header of every type in the program, which every module header
+// includes. A unit can hold a type by value that came to it through a module it never
+// names, so it needs that type's layout without that module's header; one header of every
+// layout answers that for every unit. Each derived method is declared here beside its type,
+// since a unit that only uses a type still calls it.
+pub fn generate_types_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
-    let guard = c_module_header_guard(module_key)
+    let guard = c_program_types_header_guard()
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, guard, "")
     cg_decl_emit_typedefs()
     cg_decl_emit_ev_typedef()
-    // Every global is declared extern here regardless of which module owns it: the
-    // aggregator includes every module's header into every unit, so this only widens who
-    // sees the declaration, never who defines it. The definition — and the choice of
-    // which module's object that lands in — is generate_module_object's job below.
-    let _ = cg_decl_emit_globals(true, cg_reg_global_decls(), Map())
-    let own_globals = globals_in_scope(cfg, module_key, true)
-    if cg_decl_has_deferred_global(own_globals, lower_global_inits(own_globals)) {
-        print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false)
-    }
-    let fns = fns_in_scope(cfg, module_key, false, true)
-    let methods = methods_in_scope(cfg, module_key, false, true)
-    emit_root_signatures(cfg, fns, methods)
-    // The one header that does declare instances. Nothing is compiled ahead of this
-    // program, so its modules home their own generics' instances, and a module that calls
-    // one compiled into another module's object needs the name from that module's header.
-    emit_instance_signatures(cfg, fns)
-    emit_instance_signatures(cfg, methods)
     cg_derive_emit_decls(derived_decls_declared_everywhere())
     cg_decl_emit_epilogue(guard)
     print_take()
+}
+
+// One module's two headers for the per-module mode. `surface` declares what other modules
+// can name: its pub functions and globals and its trait impls' methods. `internal` declares
+// the rest: its private functions and globals, its init function, and the instances its
+// object defines. A unit includes a header only when it names a
+// symbol the header declares, so a private edit changes only `internal`, and only the
+// units that name something private to the module compile again.
+pub type ModuleHeaders {
+    surface: Str
+    internal: Str
+}
+
+pub fn generate_module_headers(program: Int, module_key: Str, cfg: CgConfig) -> ModuleHeaders ! Codegen, Diag.Report {
+    begin_unit(program)
+    // The types header already holds every typedef. Writing them here too and throwing the
+    // text away marks them written, so a signature below that spells one does not write it
+    // again. The prologue also sets the linkage the signatures are printed under.
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, c_module_header_guard(module_key), "")
+    cg_decl_emit_typedefs()
+    cg_decl_emit_ev_typedef()
+    let _ = print_take()
+    let globals = globals_in_scope(cfg, module_key, true)
+    let fns = fns_in_scope(cfg, module_key, false, true)
+    let methods = methods_in_scope(cfg, module_key, false, true)
+
+    let guard = c_module_header_guard(module_key)
+    open_module_header(guard)
+    let _ = cg_decl_emit_globals(true, surface_decls(globals, true), Map())
+    emit_root_signatures(cfg, surface_decls(fns, true), surface_decls(methods, true))
+    cg_decl_emit_epilogue(guard)
+    let surface = print_take()
+
+    let private_guard = c_module_private_header_guard(module_key)
+    open_module_header(private_guard)
+    let _ = cg_decl_emit_globals(true, surface_decls(globals, false), Map())
+    if cg_decl_has_deferred_global(globals, lower_global_inits(globals)) {
+        print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false)
+    }
+    emit_root_signatures(cfg, surface_decls(fns, false), surface_decls(methods, false))
+    // Nothing is compiled ahead of this program, so its modules home their own generics'
+    // instances, and a module that calls one compiled into another module's object needs
+    // the name from this header.
+    emit_instance_signatures(cfg, fns)
+    emit_instance_signatures(cfg, methods)
+    cg_decl_emit_epilogue(private_guard)
+    ModuleHeaders { surface: surface, internal: print_take() }
+}
+
+fn open_module_header(guard: Str) {
+    print_guard_open(guard)
+    print_include(c_program_types_header_name())
+}
+
+// The declarations of `decls` that go in a module's surface header, or with `want_surface`
+// false those that do not. A trait impl's method is named wherever its type and trait are,
+// pub or not.
+fn surface_decls(decls: List[Int], want_surface: Bool) -> List[Int] {
+    let mut out: List[Int] = []
+    for d in decls {
+        let im = cg_reg_impl_of(d)
+        let named_outside = node_is_pub(d) == 1 || (im >= 0 && !node_trait_name(im).is_empty())
+        if named_outside == want_surface { out.push(d) }
+    }
+    out
 }
 
 // One module's translation unit, including `self_header` for its own declarations. The

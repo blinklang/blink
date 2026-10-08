@@ -1,0 +1,136 @@
+// build_unit_headers.bl: which program headers each unit of the per-module build includes.
+//
+// A unit includes a module's header when its text names a symbol that header declares, and
+// no other. Its imports do not answer this. A module imported for a type alone needs no
+// header, since every type is in the types header that every module header includes. And a
+// unit names symbols of modules it never imports: a method of a type it got through another
+// module, the init function of every module from the entry unit, an instance it calls of a
+// generic declared elsewhere.
+//
+// Leaving a header out can never compile to wrong code: C rejects a call to an undeclared
+// function and a read of an undeclared name, so a missed header is a build error. The scan
+// can only err the other way, on a name that merely looks like a symbol, and that costs no
+// more than one header too many.
+
+pub type HeaderIndex {
+    // Every header that declares a symbol, by the symbol.
+    by_symbol: Map[Str, List[Str]]
+    // The headers a scan cannot vouch for, which every unit includes.
+    always: List[Str]
+}
+
+// Every program symbol has this in its name, so the scan looks only at the words that do. A
+// header that declares a name without it is put in `always`.
+fn symbol_mark() -> Str { "blink" }
+
+// The index of `texts`, the headers named by `names` at the same position.
+pub fn index_headers(names: List[Str], texts: List[Str]) -> HeaderIndex {
+    let mut by_symbol: Map[Str, List[Str]] = Map()
+    let mut always: List[Str] = []
+    let mut i = 0
+    while i < names.len() {
+        let name = names.get(i).unwrap()
+        match declared_names(texts.get(i).unwrap()) {
+            Some(syms) => {
+                let mut readable = true
+                for s in syms {
+                    if !s.contains(symbol_mark()) {
+                        readable = false
+                        continue
+                    }
+                    let mut hs = by_symbol.get(s) ?? []
+                    hs.push(name)
+                    by_symbol.insert(s, hs)
+                }
+                if !readable { always.push(name) }
+            }
+            None => always.push(name)
+        }
+        i = i + 1
+    }
+    HeaderIndex { by_symbol: by_symbol, always: always }
+}
+
+// The names a module header declares, or None if it holds a line that is not a guard, an
+// include or a one-line declaration, and so might declare a name this reader cannot see.
+fn declared_names(text: Str) -> Option[List[Str]] {
+    let mut out: List[Str] = []
+    for line in text.lines() {
+        if line == "" || line.starts_with("#") { continue }
+        if !line.ends_with(";") || line.starts_with(" ") || line.starts_with("typedef") || line.starts_with("struct") || line.starts_with("union") || line.starts_with("enum") || line.starts_with("}") {
+            return None
+        }
+        // A prototype's name is the word before its parameter list, a global's the last word.
+        let head = match line.byte_index_of("(", 0) {
+            Some(p) => line.byte_slice(0, p)
+            None => line.byte_slice(0, line.byte_len() - 1)
+        }
+        let name = last_word(head)
+        if name == "" { return None }
+        out.push(name)
+    }
+    Some(out)
+}
+
+fn is_word_byte(b: U8) -> Bool {
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+fn last_word(s: Str) -> Str {
+    let mut end = s.byte_len()
+    while end > 0 && !is_word_byte(s.byte_at(end - 1)) { end = end - 1 }
+    let mut start = end
+    while start > 0 && is_word_byte(s.byte_at(start - 1)) { start = start - 1 }
+    s.byte_slice(start, end)
+}
+
+// The headers `c` includes besides `own`, in the order of `order`: those that declare a
+// word of `c`, and every header in `always`.
+pub fn unit_includes(c: Str, own: List[Str], idx: HeaderIndex, order: List[Str]) -> List[Str] {
+    let mut wanted: Map[Str, Int] = Map()
+    for h in idx.always { wanted.insert(h, 1) }
+    let mark = symbol_mark()
+    let n = c.byte_len()
+    let mut pos = 0
+    let mut scanning = true
+    while scanning {
+        match c.byte_index_of(mark, pos) {
+            Some(at) => {
+                let mut start = at
+                while start > 0 && is_word_byte(c.byte_at(start - 1)) { start = start - 1 }
+                let mut end = at + mark.byte_len()
+                while end < n && is_word_byte(c.byte_at(end)) { end = end + 1 }
+                match idx.by_symbol.get(c.byte_slice(start, end)) {
+                    Some(hs) => {
+                        for h in hs { wanted.insert(h, 1) }
+                    }
+                    None => {}
+                }
+                pos = end
+            }
+            None => scanning = false
+        }
+    }
+    for h in own { wanted.remove(h) }
+    let mut out: List[Str] = []
+    for h in order {
+        if wanted.contains_key(h) { out.push(h) }
+    }
+    out
+}
+
+// `c` with an include of each of `headers` after its include of `after`, which every unit
+// has, ahead of anything the unit declares or defines.
+pub fn splice_includes(c: Str, after: Str, headers: List[Str]) -> Str {
+    if headers.len() == 0 { return c }
+    let line = "#include \"{after}\"\n"
+    let at = match c.byte_index_of(line, 0) {
+        Some(p) => p + line.byte_len()
+        None => return c
+    }
+    let mut sb = StringBuilder.new()
+    sb.write(c.byte_slice(0, at))
+    for h in headers { sb.write("#include \"{h}\"\n") }
+    sb.write(c.byte_slice(at, c.byte_len()))
+    sb.to_str()
+}
