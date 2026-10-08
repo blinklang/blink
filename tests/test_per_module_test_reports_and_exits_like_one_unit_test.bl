@@ -1,0 +1,130 @@
+// blink test --per-module builds the program under test one C unit per module. The report it
+// prints and the exit code it returns must be those of the one-unit build, for one test file
+// and for a directory of them.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"calc_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/calc.bl", [
+        #"fn scale() -> Int {"#,
+        #"    2"#,
+        #"}"#,
+        #""#,
+        #"pub fn double(x: Int) -> Int {"#,
+        #"    x * scale()"#,
+        #"}"#,
+        #""#,
+        #"pub fn check_positive(x: Int) {"#,
+        #"    assert(x > 0, "not positive: {x}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main_test.bl", [
+        #"import calc.{double, check_positive}"#,
+        #""#,
+        #"test "double doubles" {"#,
+        #"    assert_eq(double(2), 4)"#,
+        #"}"#,
+        #""#,
+        #"test "an assert in calc fails" {"#,
+        #"    check_positive(-1)"#,
+        #"}"#,
+        #""#,
+        #"test "runs after the failure" {"#,
+        #"    assert_eq(double(3), 6)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with its own object cache, and the unit trace on. The corpus
+// exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes --per-module
+// build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// The units a build compiled, read from its build.units trace: a unit the object cache
+// answered prints "hit", one it compiled prints "compile".
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    // Sorted, so the check does not depend on the order the units start in.
+    let mut i = 1
+    while i < out.len() {
+        let cur = out.get(i).unwrap()
+        let mut j = i
+        while j > 0 && out.get(j - 1).unwrap() > cur {
+            out.set(j, out.get(j - 1).unwrap())
+            j = j - 1
+        }
+        out.set(j, cur)
+        i = i + 1
+    }
+    out
+}
+
+// stderr without the build.units trace lines, which only a per-module build prints.
+fn without_trace(err: Str) -> Str {
+    let mut keep: List[Str] = []
+    for line in err.split("\n") {
+        if !line.starts_with("[dbg:build.units] ") { keep.push(line) }
+    }
+    keep.join("\n")
+}
+
+test "test --per-module on one file reports and exits like the one-unit build" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_test_file_report_{getpid()}"
+    dev_tree(root, tree)
+    let one = blink_in(tree, "test app/src/main_test.bl")
+    let one_units = sh("ls {tree}/build/main_test.units 2>/dev/null | wc -l").to_int()
+    let units = blink_in(tree, "test app/src/main_test.bl --per-module")
+    let unit_c = sh("cd {tree}/build/main_test.units 2>/dev/null && ls *.c | LC_ALL=C sort | tr '\\n' ' '")
+    shell_exec("rm -rf {tree}")
+    assert(one.out.contains("2 passed, 1 failed (of 3)"), "one-unit report: {one.out}{one.err_out}")
+    assert(one.err_out.contains("not positive: -1"), "one-unit report: {one.out}{one.err_out}")
+    assert_eq(one.exit_code, 1)
+    assert_eq(one_units, 0)
+    assert_eq(units.out, one.out)
+    assert_eq(without_trace(units.err_out), without_trace(one.err_out))
+    assert_eq(units.exit_code, one.exit_code)
+    assert_eq(unit_c, "__main__.c calc.c")
+    assert_eq(units_compiled(units), ["__main__", "calc"])
+}
+
+test "test --per-module on a directory reports and exits like the one-unit build" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_test_dir_report_{getpid()}"
+    dev_tree(root, tree)
+    let one = blink_in(tree, "test app/src")
+    let units = blink_in(tree, "test app/src --per-module --jobs 2")
+    let unit_c = sh("cd {tree}/build/app/src/main_test.units 2>/dev/null && ls *.c | LC_ALL=C sort | tr '\\n' ' '")
+    shell_exec("rm -rf {tree}")
+    assert(one.out.contains("1 test files: 0 passed, 1 failed, 0 build errors"), "one-unit report: {one.out}{one.err_out}")
+    assert_eq(one.exit_code, 1)
+    assert_eq(units.out, one.out)
+    assert_eq(units.exit_code, one.exit_code)
+    assert_eq(unit_c, "__main__.c calc.c")
+}

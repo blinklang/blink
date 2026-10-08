@@ -16,9 +16,9 @@
 #   BENCH_SLICE=blink-gates.slice  systemd user slice to run in; empty runs in place
 #   BENCH_WORKDIR=<dir>    parent of the scratch tree (default ${TMPDIR:-/tmp})
 #   BENCH_KEEP=1           keep the scratch tree
-#   BENCH_FLAGS="..."      extra flags for the build and run cases, e.g. "--per-module". The
-#                          test cases do not take them. With --per-module the C hash covers
-#                          the units dir (<stem>.units/*.c and *.h) in place of <stem>.c
+#   BENCH_FLAGS="..."      extra flags for the build, run and test cases, e.g. "--per-module".
+#                          With --per-module the C hash covers the units dir
+#                          (<stem>.units/*.c and *.h) in place of <stem>.c
 #
 # Setup. The tree (tracked + untracked, not ignored) is copied to a scratch dir, so the
 # real src/ is never edited. The binary is copied to <scratch>/build/blink: that is the
@@ -193,7 +193,7 @@ rep() {
     esac
     case "$kind" in
         run) args=(run "$(tv src "$target")" ${BENCH_FLAGS:-}) ;;
-        test) args=(test "$(tv test "$target")") ;;
+        test) args=(test "$(tv test "$target")" ${BENCH_FLAGS:-}) ;;
         *) args=(build "$(tv src "$target")" ${BENCH_FLAGS:-}) ;;
     esac
     local load=$(load1)
@@ -247,7 +247,7 @@ warm() {
     done
     run_blink "$target" "$work/.bench/logs/$target-warm-build.log" build "$(tv src "$target")" ${BENCH_FLAGS:-}
     [ "$rc" = 0 ] || die "$target warm build exited $rc"
-    run_blink "$target" "$work/.bench/logs/$target-warm-test.log" test "$(tv test "$target")"
+    run_blink "$target" "$work/.bench/logs/$target-warm-test.log" test "$(tv test "$target")" ${BENCH_FLAGS:-}
     [ "$rc" = 0 ] || die "$target warm test exited $rc"
     base_build=$(c_sha "$dir/build/$(stem "$(tv src "$target")").c")
     base_test=$(c_sha "$dir/build/$(stem "$(tv test "$target")").c")

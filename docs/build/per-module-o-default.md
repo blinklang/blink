@@ -90,7 +90,7 @@ with monolith reachable via an explicit flag. The wins:
 - **archive monolith stays for stdlib.** The stdlib is already a
   pre-built archive; per-module program emit composes with it unchanged.
 
-## `blink build --per-module` and `blink run --per-module`
+## `--per-module` for `blink build`, `blink run` and `blink test`
 
 The opt-in flag drives the per-module path end to end: emit, compile,
 cache and link. The default build does not change.
@@ -147,6 +147,16 @@ cache and link. The default build does not change.
   per-module path.
 - **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `hit <module>` or
   `compile <module>` for each unit.
+- **Tests.** `blink test <file> --per-module` builds the program under test
+  on this path, at the debug flags `blink test` always uses. The test bodies,
+  the runner and `main` are in the `__main__` unit; each imported module is a
+  unit of its own. The runner state is one set per binary and per thread
+  (`BLINK_TEST_STORAGE` in `runtime_test.h`), so an assert that fails in
+  another unit reports a test failure and the next test runs. For a
+  directory, `blink test` passes `--per-module` and `--jobs` to the build of
+  each test file, and each build runs up to `--jobs` compiles of its own.
+  An entry file of only imports and tests declares nothing that names its
+  module, but it still gets the `__main__` unit, since that unit holds `main`.
 
 ### Unit headers
 
@@ -241,8 +251,20 @@ column is the gen1 of `b59311e8` under the same conditions.
 | small | test-body-inventory | 0.141 | 0.140 | 0.139 | 1 |
 | small | cold-obj | 0.138 | 0.214 | 0.123 | 5 |
 
-The `test-*` cases do not take the flag, so both columns run the same
-path there. What the numbers show:
+When this table was measured, `blink test` did not take the flag, so the
+`test-*` rows ran the same path in both columns. Since `5ac58904` it does,
+and `BENCH_FLAGS` reaches the `test-*` cases. The `test-*` rows from the
+gen1 `blink` of `a2bb3b1a` (before) and of `5ac58904` (after), under the same
+conditions; `bench/edit_loop/monolith_5ac58904.tsv` and
+`bench/edit_loop/per_module_5ac58904.tsv` hold the full rows:
+
+| target | case | monolith before | monolith after | `--per-module` before | `--per-module` after | units compiled |
+|---|---|---|---|---|---|---|
+| cli | test-body-cname | 2.123 | 2.121 | 2.116 | 0.602 | 1 |
+| small | test-body-inventory | 0.143 | 0.139 | 0.140 | 0.134 | 1 |
+
+In the before column the flag did not reach `blink test`. The other rows of
+both runs are within 0.05 s of each other. What the numbers show:
 
 - A small program is now as fast as the monolith or faster on every case.
   No few-modules threshold sends it to the one-unit path.
