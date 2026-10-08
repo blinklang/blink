@@ -160,10 +160,11 @@ asks for the one-unit build.
   `#embed` file with its bytes. Keys and lines from a `Map` are sorted, so
   the text does not change between builds. `<output>.units/` keeps this
   text in `.emit-inputs`, and `.emit-record` lists its length, the units
-  and the sha of each `.h` and `.c`. When the record's length matches and
-  the text is the same byte for byte, the build hard-links the files into
-  its private directory, hashes them again against the record, and skips
-  the emit. If any file differs, it emits. Content decides, not mtime.
+  and the sha of each `.h` and `.c` and of the text. When the record's
+  length matches and the text is the same byte for byte, the build
+  hard-links the files and the text into its private directory, hashes
+  them again against the record, and skips the emit. If any file differs,
+  the text too, it emits. Content decides, not mtime.
   A new file that changes where an import resolves changes the import
   map and the loaded files, so it changes the text. The build writes the
   record last, only after the link succeeds, and only when the emit
@@ -173,20 +174,44 @@ asks for the one-unit build.
   `BLINK_CACHE_DIR`, `--blink-trace`, `--trace`, `BLINK_TRACE` on
   `blink run`, and a `BLINK_TRACE_CHANNELS` channel outside `build.*`.
   On `src/cli.bl` the text is 6.2 MB.
-- **Unit reuse.** When the inputs text differs only in the bytes of loaded
-  sources, the build writes the headers, then takes each unit of the last
-  build whose sources are all unchanged. Each other field of the text must
-  be byte-equal, and so must each header. The record lists, for each unit,
-  the sources its IR spans (`uses`). This is the unit's own module and
-  each module whose nodes it lowers, such as a field default or a
-  keyword-parameter default of another module. The IR arena notes the
-  source of each node it records, so the list comes from the nodes the
-  emit used, not from the imports. A new instance of a generic changes
-  the header of the module that declares it, so no unit is taken. A
-  taken unit is hard-linked from the last directory and hashed again
-  against the record. A file that differs is emitted again. The
-  `__main__` unit and the other units are emitted. The trace prints `reuse unit <module>` for each
-  unit taken.
+- **Unit reuse.** Beside each loaded source's bytes, the inputs text holds
+  its interface text: its tokens with no positions and with no fn body
+  inside. A source that comes with the compiler (`<embedded:...>`) has no
+  interface text, because the compiler sha names it. When the inputs text
+  differs only in the bytes of loaded sources, the build writes the
+  headers, then takes each unit of the last build whose sources are all
+  unchanged. Each other field of the text must be byte-equal, each
+  interface too, and so must each header. The record lists, for each unit,
+  the sources it read (`uses`):
+  - its own module's;
+  - each source whose nodes its IR spans, such as a field default or a
+    keyword-parameter default of another module (the IR arena notes the
+    source of each node it records);
+  - each source with a fn body node or a node position that the emit read.
+    The parser marks these in `checked_node_id`, the one path every node
+    getter takes, and in each position getter. A call site that calls a
+    Str or List impl method straight through the foreign binding its body
+    forwards to reads that body and lowers none of it
+    (`cc_forwarded_binding` in `src/cg_call.bl`).
+
+  Signatures, effects and types are declared, so the front end's facts
+  about a module's nodes come from its own text and the interfaces of the
+  rest. A new instance of a generic changes the header of the module that
+  declares it, so no unit is taken. A unit writes its private copies of
+  std generics by C name, not in the order the program first named them,
+  which an edit to another module can change. The build reads the last inputs text
+  in its own process and writes a copy into its private directory, so the
+  text it compared is the text it hashes. The exec that hashes the units
+  first hard-links each taken unit from the last directory, so a taken
+  unit costs no extra process, and a unit the build emits is never linked
+  to the last build's file. Each taken unit, and the copied text, is
+  hashed against the record. When one differs, the build emits every
+  taken unit again. The `__main__` unit and the other units are emitted.
+  The trace prints `reuse unit <module>` for each unit taken.
+- **Reuse verify.** `BLINK_EMIT_REUSE_VERIFY=1` emits each unit the build
+  takes again, and the headers when it takes the whole build. It fails,
+  naming the unit or header, when one is not byte-equal to the file taken.
+  The tests of the reuse key run under it.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
   code as the monolith.
@@ -422,6 +447,46 @@ The default rows match the `--per-module` rows on `7f4d7dbb` within their
 spread: the flip changes which path runs, not the path. A body edit on cli
 spends 0.95 s of its 1.14 s in emit (front end, codegen, cache hashing), so
 the 1.0 s goal for it needs a faster emit, not a faster cc.
+
+### Unit reuse
+
+`task bench-edit-loop` on the gen1 `blink` built from `a2e9dc72` (before) and
+from `4981a63a` (after), 5 reps, 12 cores, under `blink-gates.slice`, back to
+back on one machine, each on its own tree. Median wall seconds, with min and
+max on the rows the goal names. `bench/edit_loop/per_module_a2e9dc72.tsv`,
+`bench/edit_loop/per_module_4981a63a.tsv` and the two `monolith_*.tsv` files
+of those shas hold the rows.
+
+| target | case | `--no-per-module` after | before | after | after emit_s | after cc_s |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.917 | 0.580 | 0.624 | 0.579 | 0.000 |
+| cli | body-cname | 11.166 | 1.285 [1.258-1.298] | 1.052 [1.041-1.059] | 0.843 | 0.161 |
+| cli | body-typecheck | 11.203 | 3.629 | 3.460 | 0.910 | 2.503 |
+| cli | pubfn-cname | 11.204 | 2.016 | 2.102 | 1.147 | 0.909 |
+| cli | run-body-cname | 11.205 | 1.278 | 1.042 | 0.834 | 0.160 |
+| cli | test-body-cname | 2.326 | 0.678 | 0.569 | 0.422 | 0.110 |
+| cli | cold-obj | 11.171 | 3.843 | 3.902 | 0.663 | 3.189 |
+| cli | cold-all | 13.671 | 6.321 | 6.395 | 0.759 | 5.589 |
+| small | nochange | 0.076 | 0.073 [0.072-0.074] | 0.075 [0.073-0.076] | 0.055 | 0.000 |
+| small | body-inventory | 0.146 | 0.126 | 0.126 | 0.067 | 0.040 |
+| small | pubfn-model | 0.146 | 0.126 | 0.127 | 0.069 | 0.039 |
+| small | run-body-inventory | 0.145 | 0.126 | 0.126 | 0.067 | 0.040 |
+| small | test-body-inventory | 0.148 | 0.141 | 0.142 | 0.065 | 0.057 |
+| small | cold-obj | 0.145 | 0.126 | 0.126 | 0.067 | 0.040 |
+
+- A body edit on cli takes 47 of its units and emits two, the edited module
+  and `__main__`: `body-cname` falls by 0.23 s, to 1.05 s. That is still
+  above the 1.0 s goal. The front end (load, parse, typecheck, analyses and
+  mono) is about 0.45 s of it, and the obj-cache keys, the hash and the cc
+  id start processes that cost about 0.1 s more.
+- An edit that changes an interface (`pubfn-cname`) changes the C of 14 units and
+  pays for the longer inputs text: +0.09 s. `nochange`, `cold-obj` and
+  `cold-all` pay for it too, by 0.04 to 0.07 s, as the text grows from
+  6.2 MB to 8.1 MB on cli.
+- Each small row is within the spread of its before row.
+
+The warm daemon that builds through this reuse is parked on the branch
+`daemon-build-routing` (ticket `2je9g7`).
 
 ## Blockers before the default flipped
 
