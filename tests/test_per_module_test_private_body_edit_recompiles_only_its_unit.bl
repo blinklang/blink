@@ -1,0 +1,110 @@
+// blink test --per-module caches one object per unit, as blink build --per-module does. An
+// edit to a private function body changes only its own unit, so the next blink test
+// compiles only that unit.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"calc_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/calc.bl", [
+        #"fn scale() -> Int {"#,
+        #"    2"#,
+        #"}"#,
+        #""#,
+        #"pub fn double(x: Int) -> Int {"#,
+        #"    x * scale()"#,
+        #"}"#,
+        #""#,
+        #"pub fn check_positive(x: Int) {"#,
+        #"    assert(x > 0, "not positive: {x}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main_test.bl", [
+        #"import calc.{double, check_positive}"#,
+        #""#,
+        #"test "double doubles" {"#,
+        #"    assert_eq(double(2), 4)"#,
+        #"}"#,
+        #""#,
+        #"test "an assert in calc fails" {"#,
+        #"    check_positive(-1)"#,
+        #"}"#,
+        #""#,
+        #"test "runs after the failure" {"#,
+        #"    assert_eq(double(3), 6)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with its own object cache, and the unit trace on. The corpus
+// exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes --per-module
+// build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// The units a build compiled, read from its build.units trace: a unit the object cache
+// answered prints "hit", one it compiled prints "compile".
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    // Sorted, so the check does not depend on the order the units start in.
+    let mut i = 1
+    while i < out.len() {
+        let cur = out.get(i).unwrap()
+        let mut j = i
+        while j > 0 && out.get(j - 1).unwrap() > cur {
+            out.set(j, out.get(j - 1).unwrap())
+            j = j - 1
+        }
+        out.set(j, cur)
+        i = i + 1
+    }
+    out
+}
+
+fn test_units(tree: Str) -> (List[Str], Str) {
+    let r = blink_in(tree, "test app/src/main_test.bl --per-module")
+    assert(r.out.contains("(of 3)"), "per-module test did not run: {r.out}{r.err_out}")
+    (units_compiled(r), r.out)
+}
+
+test "a private body edit recompiles only its unit for blink test" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_test_private_edit_{getpid()}"
+    dev_tree(root, tree)
+    let (cold, _) = test_units(tree)
+    let (warm, _) = test_units(tree)
+    shell_exec("sed -i \"s/^    2$/    3/\" {tree}/app/src/calc.bl")
+    let edited_src = sh("grep -c \"^    3$\" {tree}/app/src/calc.bl")
+    let (edited, out) = test_units(tree)
+    shell_exec("rm -rf {tree}")
+    assert_eq(edited_src, "1")
+    assert_eq(cold, ["__main__", "calc"])
+    assert_eq(warm.len(), 0)
+    assert_eq(edited, ["calc"])
+    // double now triples, so both tests that call it fail.
+    assert(out.contains("0 passed, 3 failed (of 3)"), "the edit did not reach the binary: {out}")
+}
