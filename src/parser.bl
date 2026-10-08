@@ -155,8 +155,25 @@ type SublistPool {
 
 let mut sublists: SublistPool = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
 
-let mut annotation_nodes: List[Int] = []
-let mut program_annotation_nodes: List[Int] = []
+// The annotations read ahead of the next item, and the program-level ones.
+type PendingAnnotations {
+    item: List[Int]
+    program: List[Int]
+}
+
+let mut annotations: PendingAnnotations = PendingAnnotations { item: [], program: [] }
+
+// What a unit's emit reads of the nodes, and where the fn bodies among them lie.
+type NodeTrack {
+    reads: ReadTrack
+    bodies: FnBodies
+}
+
+fn node_track_empty() -> NodeTrack {
+    NodeTrack { reads: read_track_off(), bodies: FnBodies { depth: 0, firsts: [], lasts: [], tok_firsts: [], tok_lasts: [] } }
+}
+
+let mut node_track: NodeTrack = node_track_empty()
 
 // `@expect_panic` desugars to a real AssertPanics node during parse so the
 // compile path gets all the assert_panics machinery for free. The FORMAT path
@@ -182,8 +199,8 @@ pub fn embed_path_of(node: Int) -> Str {
 pub fn parser_reset() {
     columns = node_columns_empty()
     sublists = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
-    annotation_nodes.clear()
-    program_annotation_nodes.clear()
+    annotations = PendingAnnotations { item: [], program: [] }
+    node_track = node_track_empty()
     source_module_for_node.clear()
     pos = 0
     parse_desugar_enabled = 1
@@ -1188,7 +1205,124 @@ pub fn node_count() -> Int { columns.count }
 // A getter checks the id here, then reads its field's slot in its column.
 fn checked_node_id(id: Int, where: Str) -> Int {
     if id < 0 || id >= columns.count { node_die(id, where) }
+    let t = node_track.reads
+    if t.on && (id < t.own_first || id >= t.own_end) { mark_node(t.read, id) }
     id
+}
+
+// ── Read tracking ──────────────────────────────────────────────────
+
+// A per-module build takes a unit from the last build only while all its emit read is the
+// same. The columns are private to this file and every getter reaches them through
+// checked_node_id, so a mark there sees every node the emit reads; no reader can skip it.
+// A position is marked apart, since a body edit moves the lines of all that follows it.
+// Nodes in [own_first, own_end) are not marked: the unit is keyed on that source anyway,
+// and it is where most reads go.
+type ReadTrack {
+    on: Bool
+    own_first: Int
+    own_end: Int
+    read: List[Int]
+    pos: List[Int]
+}
+
+fn read_track_off() -> ReadTrack {
+    ReadTrack { on: false, own_first: 0, own_end: 0, read: [], pos: [] }
+}
+
+// Bit b of a word, for b in 0..64, as a shift by an Int amount is not allowed.
+let word_bits: List[Int] = make_word_bits()
+
+fn make_word_bits() -> List[Int] {
+    let mut out: List[Int] = [1]
+    while out.len() < 63 { out.push(out[out.len() - 1] * 2) }
+    out.push(-9223372036854775807 - 1)
+    out
+}
+
+fn mark_node(marks: List[Int], id: Int) {
+    let w = id >> 6
+    marks.set(w, marks[w] | word_bits[id & 63])
+}
+
+fn mark_pos(id: Int) {
+    let t = node_track.reads
+    if t.on && (id < t.own_first || id >= t.own_end) { mark_node(t.pos, id) }
+}
+
+// Starts a new record of the nodes read, and of the positions read, outside [own_first, own_end).
+pub fn node_reads_begin(own_first: Int, own_end: Int) {
+    let words = (columns.count >> 6) + 1
+    let mut read: List[Int] = List.with_capacity(words)
+    let mut pos_read: List[Int] = List.with_capacity(words)
+    while read.len() < words {
+        read.push(0)
+        pos_read.push(0)
+    }
+    node_track.reads = ReadTrack { on: true, own_first: own_first, own_end: own_end, read: read, pos: pos_read }
+}
+
+// Ends the record, and gives the nodes read and the nodes whose position was read, in order.
+pub fn node_reads_end() -> (List[Int], List[Int]) {
+    let t = node_track.reads
+    node_track.reads = read_track_off()
+    (marked_nodes(t.read), marked_nodes(t.pos))
+}
+
+fn marked_nodes(marks: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut w = 0
+    while w < marks.len() {
+        let bits = marks[w]
+        if bits != 0 {
+            let mut b = 0
+            while b < 64 {
+                if (bits & word_bits[b]) != 0 { out.push(w * 64 + b) }
+                b = b + 1
+            }
+        }
+        w = w + 1
+    }
+    out
+}
+
+// The body of each top-level fn and method, as node ranges [first, last] in node order, and
+// as token ranges of the source parsed last. A body edit changes nodes inside these alone.
+type FnBodies {
+    depth: Int
+    firsts: List[Int]
+    lasts: List[Int]
+    tok_firsts: List[Int]
+    tok_lasts: List[Int]
+}
+
+pub fn fn_body_node_ranges() -> (List[Int], List[Int]) { (node_track.bodies.firsts, node_track.bodies.lasts) }
+
+// The tokens of the source parsed last, but for those inside a fn body: what other modules
+// see of it. Each token is its kind's name and its text, each after its length, so no two
+// token lists give one text. Positions are left out: a reader of a position is marked instead.
+pub fn parsed_interface_text() -> Str {
+    let sb = StringBuilder.new()
+    let n = tokens.kinds.len()
+    let b = node_track.bodies
+    let mut r = 0
+    let mut i = 0
+    while i < n {
+        if r < b.tok_firsts.len() && i > b.tok_firsts[r] {
+            // Keep the closing brace, so the text still shows where each body was.
+            i = b.tok_lasts[r]
+            r = r + 1
+            continue
+        }
+        let k = token_kind_name(tokens.kinds[i])
+        let v = tokens.values[i]
+        sb.write("{k.byte_len()}:{k}{v.byte_len()}:")
+        sb.write(v)
+        i = i + 1
+    }
+    node_track.bodies.tok_firsts.clear()
+    node_track.bodies.tok_lasts.clear()
+    sb.to_str()
 }
 
 fn node_or_die(id: Int, where: Str) -> AstNode {
@@ -1318,7 +1452,10 @@ fn node_or_die(id: Int, where: Str) -> AstNode {
 
 // The whole node at `id`, built from its payload. A pass that reads one or two fields uses
 // their accessors instead.
-pub fn node_at(id: Int) -> AstNode { node_or_die(id, "node_at") }
+pub fn node_at(id: Int) -> AstNode {
+    mark_pos(id)
+    node_or_die(id, "node_at")
+}
 
 // Named-caller panic on bad id: a plain `.unwrap()` panic doesn't tell us
 // which accessor was hit or how far out of bounds the id was, which makes
@@ -1504,15 +1641,19 @@ pub fn node_doc_comment(id: Int) -> Str {
     node_get_str(checked_node_id(id, "node_doc_comment"), columns.at_doc_comment, node_blank.doc_comment)
 }
 pub fn node_line(id: Int) -> Int {
+    mark_pos(id)
     node_get_int(checked_node_id(id, "node_line"), columns.at_line, node_blank.line)
 }
 pub fn node_col(id: Int) -> Int {
+    mark_pos(id)
     node_get_int(checked_node_id(id, "node_col"), columns.at_col, node_blank.col)
 }
 pub fn node_end_line(id: Int) -> Int {
+    mark_pos(id)
     node_get_int(checked_node_id(id, "node_end_line"), columns.at_end_line, node_blank.end_line)
 }
 pub fn node_end_col(id: Int) -> Int {
+    mark_pos(id)
     node_get_int(checked_node_id(id, "node_end_col"), columns.at_end_col, node_blank.end_col)
 }
 pub fn node_assoc_types(id: Int) -> Int {
@@ -1884,25 +2025,25 @@ fn maybe_newline() ! Parse.Advance {
 }
 
 fn attach_pending_annotations(node: Int) ! Parse.Build {
-    if annotation_nodes.len() > 0 {
+    if annotations.item.len() > 0 {
         let anns_sl = new_sublist()
         let mut ai = 0
-        while ai < annotation_nodes.len() {
-            sublist_push(anns_sl, annotation_nodes.get(ai).unwrap())
+        while ai < annotations.item.len() {
+            sublist_push(anns_sl, annotations.item.get(ai).unwrap())
             ai = ai + 1
         }
         finalize_sublist(anns_sl)
         node_set_handlers(node, anns_sl)
-        annotation_nodes = []
+        annotations.item = []
     }
 }
 
 // Clearing the list keeps a rejected annotation off the next item that attaches pending ones.
 fn reject_pending_annotations(what: Str, help: Str) ! Parse.Build, Diag.Report {
-    for ann in annotation_nodes {
+    for ann in annotations.item {
         diag_error("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "@{node_name(ann)} {what}", node_line(ann), node_col(ann), help)
     }
-    annotation_nodes = []
+    annotations.item = []
 }
 
 // Skipping only up to the next item keeps one bad line to one error, and lets a method
@@ -2127,7 +2268,9 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
     let mut import_nodes: List[Int] = []
     let mut effect_decl_nodes: List[Int] = []
     let mut test_nodes: List[Int] = []
-    annotation_nodes = []
+    annotations.item = []
+    node_track.bodies.tok_firsts.clear()
+    node_track.bodies.tok_lasts.clear()
     skip_newlines_and_comments()
     while !at(TokenKind.EOF) {
         skip_newlines_and_comments()
@@ -2138,9 +2281,9 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
         if at(TokenKind.At) {
             let ann_nd = parse_annotation()
             if node_name(ann_nd) == "capabilities" {
-                program_annotation_nodes.push(ann_nd)
+                annotations.program.push(ann_nd)
             } else {
-                annotation_nodes.push(ann_nd)
+                annotations.item.push(ann_nd)
             }
             skip_newlines_and_comments()
         } else if at(TokenKind.Import) {
@@ -2336,16 +2479,16 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
         finalize_sublist(effect_decls)
     }
     let mut annotations_sl = -1
-    if annotation_nodes.len() > 0 || program_annotation_nodes.len() > 0 {
+    if annotations.item.len() > 0 || annotations.program.len() > 0 {
         annotations_sl = new_sublist()
         i = 0
-        while i < program_annotation_nodes.len() {
-            sublist_push(annotations_sl, program_annotation_nodes.get(i).unwrap())
+        while i < annotations.program.len() {
+            sublist_push(annotations_sl, annotations.program.get(i).unwrap())
             i = i + 1
         }
         i = 0
-        while i < annotation_nodes.len() {
-            sublist_push(annotations_sl, annotation_nodes.get(i).unwrap())
+        while i < annotations.item.len() {
+            sublist_push(annotations_sl, annotations.item.get(i).unwrap())
             i = i + 1
         }
         finalize_sublist(annotations_sl)
@@ -2971,7 +3114,17 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     skip_newlines()
     let mut body_id = -1
     if at(TokenKind.LBrace) {
+        let first = node_count()
+        let tok_first = pos
+        node_track.bodies.depth = node_track.bodies.depth + 1
         body_id = parse_block()
+        node_track.bodies.depth = node_track.bodies.depth - 1
+        if node_track.bodies.depth == 0 {
+            node_track.bodies.firsts.push(first)
+            node_track.bodies.lasts.push(body_id)
+            node_track.bodies.tok_firsts.push(tok_first)
+            node_track.bodies.tok_lasts.push(pos - 1)
+        }
     }
     let mut fn_end_l = -1
     let mut fn_end_c = -1
@@ -3263,11 +3416,11 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let assoc_types = new_sublist()
     let methods = new_sublist()
     // The trait's own annotations stay pending until the caller attaches them.
-    let trait_anns = annotation_nodes
-    annotation_nodes = []
+    let trait_anns = annotations.item
+    annotations.item = []
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         if at(TokenKind.At) {
-            annotation_nodes.push(parse_annotation())
+            annotations.item.push(parse_annotation())
         } else if at(TokenKind.Fn) {
             let fn_node = parse_fn_def()
             attach_pending_annotations(fn_node)
@@ -3285,7 +3438,7 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines_and_comments()
     }
     reject_pending_annotations("in trait `{name}` is not followed by a method", "move the annotation above the method it belongs to, or remove it")
-    annotation_nodes = trait_anns
+    annotations.item = trait_anns
     let trait_end_line = peek_line()
     let trait_end_col = peek_col()
     expect(TokenKind.RBrace)
@@ -3369,11 +3522,11 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let assoc_types = new_sublist()
     let methods = new_sublist()
     // The impl block's own annotations stay pending until the caller attaches them.
-    let impl_anns = annotation_nodes
-    annotation_nodes = []
+    let impl_anns = annotations.item
+    annotations.item = []
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         if at(TokenKind.At) {
-            annotation_nodes.push(parse_annotation())
+            annotations.item.push(parse_annotation())
         } else if at(TokenKind.Fn) {
             let fn_node = parse_fn_def()
             attach_pending_annotations(fn_node)
@@ -3398,7 +3551,7 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines_and_comments()
     }
     reject_pending_annotations("in impl `{trait_name} for {type_name}` is not followed by a method", "move the annotation above the method it belongs to, or remove it")
-    annotation_nodes = impl_anns
+    annotations.item = impl_anns
     let impl_end_line = peek_line()
     let impl_end_col = peek_col()
     expect(TokenKind.RBrace)

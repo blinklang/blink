@@ -1,0 +1,105 @@
+// A per-module build takes a unit from the last build only when nothing the unit's emit read
+// changed. A call to an impl method on Str whose body only hands `self` to a foreign binding
+// calls the binding direct, so the caller's unit reads the method's body without lowering
+// it. An edit to that body, with the method's signature kept, reaches the caller's unit.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"unit_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"@ffi("blink_str_len")"#,
+        #"@trusted(audit: "unit-reuse-test")"#,
+        #"fn str_bytes(s: Str) -> Int ! FFI {}"#,
+        #""#,
+        #"pub trait Measure {"#,
+        #"    fn measure(self) -> Int"#,
+        #"}"#,
+        #""#,
+        #"impl Measure for Str {"#,
+        #"    fn measure(self) -> Int { str_bytes(self) }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{Measure}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    "{"abc".measure()}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import mid.{mid_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(mid_value())"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, "", "build app/src/main.bl -o {tree}/{out}/app --per-module")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            out.push(line.byte_slice(29, line.byte_len()))
+        }
+    }
+    out.join(",")
+}
+
+// The C files that differ between out/ and a build of the same inputs with no last build.
+fn differ_from_cold(tree: Str) -> Str {
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, "cold")
+    sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done").split("\n").join(" ")
+}
+
+test "a body edit that a call site in another unit reads reaches that unit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_unit_reuse_call_site_reads_body_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "out")
+    let before = sh("{tree}/out/app")
+    let path = "{tree}/app/src/base.bl"
+    let src = read_file(path)
+    write_file(path, src.replace(#"{ str_bytes(self) }"#, #"{ str_bytes(self) * 2 }"#))
+    assert(read_file(path) != src, "the edit did not change base.bl")
+    let warm = build_into(tree, "out")
+    let after = sh("{tree}/out/app")
+    let differ = differ_from_cold(tree)
+    shell_exec("rm -rf {tree}")
+    assert_eq(before, "3")
+    assert(!reused_units(warm).split(",").contains("mid"), "the body edit took {reused_units(warm)}")
+    assert_eq(differ, "")
+    assert_eq(after, "6")
+}

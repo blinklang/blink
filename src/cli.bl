@@ -35,6 +35,7 @@ import parser.{
     node_methods, node_captures, node_type_params, node_source_module,
     sublist_length, sublist_get, get_annotation,
     ann_str_val, positional_str_arg, positional_str_arg_count,
+    node_reads_begin, node_reads_end, fn_body_node_ranges,
 }
 import ast.{NodeKind, dbg_channels, dbg_trace, trace_mode}
 import typecheck.{TypeCheck, check_types, strip_module_qualifier}
@@ -1683,21 +1684,89 @@ fn emit_unit(program: Int, m: Str, cfg: CgConfig, facts: ProgramFacts, hs: UnitH
     if sources.tracked { ir_track_sources(sources.firsts, sources.ends) }
     // Copy-update, so a field added to CgConfig later keeps cfg's value here.
     let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
+    if sources.tracked {
+        let (own_first, own_end) = unit_own_nodes(m, sources)
+        node_reads_begin(own_first, own_end)
+    }
     let raw = generate_module_object_with(program, m, c_module_header_name(m), obj_cfg, facts)
+    let mut reads: List[Int] = []
+    let mut pos_reads: List[Int] = []
+    if sources.tracked {
+        let (r, p) = node_reads_end()
+        reads = r
+        pos_reads = p
+    }
     let orc = units_bail_on_diag()
     if orc != 0 { return Err(orc) }
     let (c, headers) = unit_with_includes(raw, m, hs)
     write_file("{dir}/{m}.c", c)
-    Ok(emit_record.EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers, uses: unit_uses(m, sources) })
+    Ok(emit_record.EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers, uses: unit_uses(m, sources, reads, pos_reads) })
 }
 
-// The sources module m's unit read: those its IR spanned, and its own, whose every edit can
-// move a line the unit carries. Empty, so no later build takes the unit on its own, when the
-// module has no source of its own to key on.
-fn unit_uses(m: Str, sources: UnitSources) -> List[Str] {
+// The node range of module m's one source, whose reads need no record: the unit uses that
+// source whole. An empty range when m has more than one, so every read is recorded.
+fn unit_own_nodes(m: Str, sources: UnitSources) -> (Int, Int) {
+    let mut found = -1
+    let mut i = 0
+    while i < sources.modules.len() {
+        if sources.modules[i] == m {
+            if found >= 0 { return (0, 0) }
+            found = i
+        }
+        i = i + 1
+    }
+    if found < 0 { return (0, 0) }
+    (sources.firsts[found], sources.ends[found])
+}
+
+// The index of the source whose node range holds node, or -1 for a node no source holds.
+fn source_of_node(sources: UnitSources, node: Int) -> Int {
+    let n = sources.firsts.len()
+    if n == 0 { return -1 }
+    let mut lo = 0
+    let mut hi = n
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2
+        if sources.firsts[mid] <= node { lo = mid } else { hi = mid }
+    }
+    if node < sources.firsts[lo] || node >= sources.ends[lo] { return -1 }
+    lo
+}
+
+// Whether node lies in a fn body, given the body ranges in node order.
+fn in_fn_body(firsts: List[Int], lasts: List[Int], node: Int) -> Bool {
+    let n = firsts.len()
+    if n == 0 || node < firsts[0] { return false }
+    let mut lo = 0
+    let mut hi = n
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2
+        if firsts[mid] <= node { lo = mid } else { hi = mid }
+    }
+    node <= lasts[lo]
+}
+
+// The sources module m's unit read: those its IR spanned, its own, whose every edit can move
+// a line the unit carries, and each whose fn body nodes or node positions the emit read. The
+// record keys the rest of every source on its interface text, which leaves out bodies and
+// positions. Empty, so no later build takes the unit on its own, when the module has no
+// source of its own to key on.
+fn unit_uses(m: Str, sources: UnitSources, reads: List[Int], pos_reads: List[Int]) -> List[Str] {
     if !sources.tracked { return [] }
     let mut read: Map[Int, Bool] = Map()
     for i in ir_sources_read() { read.insert(i, true) }
+    let (body_firsts, body_lasts) = fn_body_node_ranges()
+    for node in reads {
+        if in_fn_body(body_firsts, body_lasts, node) {
+            let i = source_of_node(sources, node)
+            if i >= 0 { read.insert(i, true) }
+        }
+    }
+    for node in pos_reads {
+        let i = source_of_node(sources, node)
+        if i >= 0 { read.insert(i, true) }
+    }
+    dbg_trace("build.units", "unit {m} reads {reads.len()} nodes, {pos_reads.len()} positions outside its source")
     let mut out: List[Str] = []
     let mut has_own = false
     let mut i = 0
