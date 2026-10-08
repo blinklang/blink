@@ -105,7 +105,13 @@ cache and link. The default build does not change.
 - **Std generic instances.** A unit writes a std generic instance only as
   a `static` private copy, and only the instances its own calls name.
   User generic instances stay in the unit of the module that declares the
-  generic, so a new instantiation recompiles that unit too.
+  generic, so a new instantiation recompiles that unit too. On
+  `src/cli.bl` this writes one std instance, in one unit, so the copies
+  cost no code there. The per-module binary has 36.5 KB (0.8%) more text
+  than the monolith (4,673,490 against 4,636,962 bytes), which probably comes from
+  the split itself, such as calls cc can no longer inline across units.
+  A program that calls one std generic from many modules pays one copy
+  per unit.
 - **Jobs.** `--jobs N` or `BLINK_JOBS=N` sets how many units compile at
   once; the default is the CPU count. A value that is not a positive
   integer is an error. The largest unit starts first.
@@ -141,29 +147,29 @@ modules it imports) would remove this cap.
 
 For `src/cli.bl` the cap costs most of the gain on a pub edit: 48 units
 and 65 headers (7.3 MB of headers, parsed by every unit). `pubfn-cname`
-recompiles all 48 units in 6.2 s, against 1.8 s for a private-body edit
+recompiles all 48 units in 5.6 s, against 1.8 s for a private-body edit
 to the same module.
 
 ## Edit-loop bench
 
-`task bench-edit-loop` on the gen1 `blink` at `3f30e433`, 5 reps, 12
+`task bench-edit-loop` on the gen1 `blink` built from `67339785`, 5 reps, 12
 cores, under `blink-gates.slice`. Median wall seconds;
-`bench/edit_loop/monolith_3f30e433.tsv` and
-`bench/edit_loop/per_module_3f30e433.tsv` hold the full rows.
+`bench/edit_loop/monolith_67339785.tsv` and
+`bench/edit_loop/per_module_67339785.tsv` hold the full rows.
 
 | target | case | monolith | `--per-module` | per-module units compiled |
 |---|---|---|---|---|
-| cli | nochange | 0.758 | 1.575 | 0 |
-| cli | body-cname | 10.391 | 1.797 | 1 |
-| cli | body-typecheck | 10.388 | 4.057 | 1 |
-| cli | pubfn-cname | 10.373 | 6.234 | 48 |
-| cli | run-body-cname | 10.375 | 1.797 | 1 |
-| cli | cold-obj | 10.375 | 5.833 | 48 |
-| cli | cold-all | 12.765 | 8.045 | 49 |
-| small | nochange | 0.073 | 0.117 | 0 |
-| small | body-inventory | 0.138 | 0.165 | 1 |
-| small | pubfn-model | 0.139 | 0.204 | 5 |
-| small | cold-obj | 0.139 | 0.203 | 5 |
+| cli | nochange | 0.752 | 1.554 | 0 |
+| cli | body-cname | 10.374 | 1.780 | 1 |
+| cli | body-typecheck | 10.387 | 4.050 | 1 |
+| cli | pubfn-cname | 10.370 | 5.569 | 48 |
+| cli | run-body-cname | 10.381 | 1.790 | 1 |
+| cli | cold-obj | 10.380 | 5.874 | 48 |
+| cli | cold-all | 12.780 | 8.041 | 49 |
+| small | nochange | 0.074 | 0.116 | 0 |
+| small | body-inventory | 0.138 | 0.161 | 1 |
+| small | pubfn-model | 0.141 | 0.205 | 5 |
+| small | cold-obj | 0.140 | 0.201 | 5 |
 
 The `test-*` cases do not take the flag and stay within 0.03 s of the
 monolith. What the numbers show:
@@ -171,10 +177,10 @@ monolith. What the numbers show:
 - A body edit on a large program gains the most: the build compiles one
   unit, and the time follows the size of that unit (`cname.c` 0.2 s,
   `typecheck.c` 2.5 s).
-- The front end and emit cost more per build (`emit_s` 0.74 s to 1.54 s
+- The front end and emit cost more per build (`emit_s` 0.74 s to 1.53 s
   for cli): the build writes and hashes every unit and header each time,
   so `nochange` is 0.8 s slower.
-- A small program is slower on every case, by 0.03 to 0.07 s.
+- A small program is slower on every case, by 0.02 to 0.07 s.
 
 ## Blockers before the default flips
 
