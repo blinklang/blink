@@ -232,8 +232,8 @@ fn sha_by_name(out: Str) -> Map[Str, Str] {
 // them along with the unit's own C. The headers are named by their name in dir, not by the
 // path of dir, which differs on every build. A module whose key cannot be built is absent,
 // and its unit compiles without the cache: a key that left out an input it could not read
-// would match an object built from other bytes. Every file is hashed by one process and
-// every manifest by one more, since a build can have many units.
+// would match an object built from other bytes. Every file is hashed by one process, and the
+// manifests by as few more as the exec argument limit allows, since a build can have many units.
 pub fn unit_keys(
     dir: Str,
     modules: List[Str],
@@ -297,46 +297,97 @@ pub fn unit_keys(
             return keys
         }
     }
-    let headers_text = sorted_strs(headers).join("\n")
-    let flags_text = sorted_strs(flags).join("\n")
+    // The inputs every unit shares go into one digest that each unit's manifest names. Put
+    // in full in every manifest, the header list grows with units times headers.
+    let mut shared = ["schema:unit-2", "runtime_sha:{runtime_sha}", "blinkc_sha:{blinkc_sha}", "cc_id:{cc_id}", "target:{target}"]
+    for line in sorted_strs(headers) {
+        shared.push("import:{line}")
+    }
+    for f in sorted_strs(flags) {
+        shared.push("flag:{f}")
+    }
+    let shared_sha = digest_of_lines(shared)
+    if shared_sha == "" {
+        return keys
+    }
     let mut keyed: List[Str] = []
-    let mut hash_cmd = StringBuilder.new()
-    hash_cmd.write(SHA256SUM_SH)
+    let mut manifests: List[Str] = []
     for m in modules {
         let src_sha = shas.get("{m}.c") ?? ""
         if src_sha == "" { continue }
         keyed.push(m)
-        hash_cmd.write("(cat <<'__BLINK_MANIFEST_EOF__'\n")
-        hash_cmd.write("schema:unit-1\n")
-        hash_cmd.write("mod:{m}\n")
-        hash_cmd.write("src_sha:{src_sha}\n")
-        hash_cmd.write("imports:{headers_text}\n")
-        hash_cmd.write("runtime_sha:{runtime_sha}\n")
-        hash_cmd.write("blinkc_sha:{blinkc_sha}\n")
-        hash_cmd.write("cc_id:{cc_id}\n")
-        hash_cmd.write("flags:{flags_text}\n")
-        hash_cmd.write("target:{target}\n")
-        hash_cmd.write("__BLINK_MANIFEST_EOF__\n")
-        hash_cmd.write(") | sha256sum | cut -c1-16\n")
+        manifests.push("mod:{m}\nsrc_sha:{src_sha}\nshared:{shared_sha}")
     }
-    if keyed.len() == 0 {
-        return keys
-    }
-    let h = process_run("sh", ["-c", hash_cmd.to_str()])
-    if h.exit_code != 0 {
-        return keys
-    }
-    let digests = h.out.lines()
-    if digests.len() != keyed.len() {
-        return keys
+    let mut digests: List[Str] = []
+    for batch in exec_sized_batches(manifests) {
+        let mut hash_cmd = StringBuilder.new()
+        hash_cmd.write(SHA256SUM_SH)
+        for text in batch {
+            hash_cmd.write("(cat <<'__BLINK_MANIFEST_EOF__'\n{text}\n__BLINK_MANIFEST_EOF__\n) | sha256sum | cut -c1-16\n")
+        }
+        let h = process_run("sh", ["-c", hash_cmd.to_str()])
+        if h.exit_code != 0 {
+            return keys
+        }
+        let lines = h.out.lines()
+        if lines.len() != batch.len() {
+            return keys
+        }
+        for d in lines {
+            digests.push(d.trim())
+        }
     }
     let mut i = 0
     while i < keyed.len() {
-        let d = digests.get(i).unwrap().trim()
+        let d = digests.get(i).unwrap()
         if d.byte_len() == 16 { keys.insert(keyed.get(i).unwrap(), d) }
         i = i + 1
     }
     keys
+}
+
+// Linux caps one exec argument at 128 KiB, and an `sh -c` script is one argument.
+let EXEC_ARG_BUDGET: Int = 65536
+
+// texts in order, split into runs whose total size stays under EXEC_ARG_BUDGET, so a script
+// built from one run fits in one exec argument. A text over the budget gets a run of its own.
+fn exec_sized_batches(texts: List[Str]) -> List[List[Str]] {
+    let mut out: List[List[Str]] = []
+    let mut cur: List[Str] = []
+    let mut size = 0
+    for t in texts {
+        // The heredoc and pipe around each text add about 100 bytes.
+        let n = t.byte_len() + 128
+        if cur.len() > 0 && size + n > EXEC_ARG_BUDGET {
+            out.push(cur)
+            cur = []
+            size = 0
+        }
+        cur.push(t)
+        size = size + n
+    }
+    if cur.len() > 0 {
+        out.push(cur)
+    }
+    out
+}
+
+// The 16-hex digest of lines. Lines past one exec argument's worth are hashed a run at a
+// time, and the run digests hashed again. "" when a hash fails.
+fn digest_of_lines(lines: List[Str]) -> Str {
+    let mut parts: List[Str] = []
+    for run in exec_sized_batches(lines) {
+        let d = sha256_of_manifest(run.join("\n"))
+        if d.byte_len() != 16 {
+            return ""
+        }
+        parts.push(d)
+    }
+    if parts.len() == 1 {
+        return parts.get(0).unwrap()
+    }
+    let d = sha256_of_manifest(parts.join("\n"))
+    if d.byte_len() != 16 { "" } else { d }
 }
 
 // Hash an arbitrary manifest passed as a string. Used by `blink cache

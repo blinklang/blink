@@ -1,0 +1,83 @@
+// A per-module build keys each unit on its C and on every header the units include, so
+// the key input grows with units times headers. A warm rebuild of an app with many modules
+// must still find every unit in the object cache.
+
+import std.process.{ProcessResult}
+
+// Enough modules that the unit keys, each of which lists every header, add up to more than
+// the 128 KiB one exec argument can hold.
+fn module_count() -> Int {
+    60
+}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"many_app\"\nversion = \"0.1.0\"\n")
+    let mut main_lines: List[Str] = []
+    let mut terms: List[Str] = []
+    let n = module_count()
+    for i in 0..n {
+        write_file("{tree}/app/src/part_{i}.bl", "pub fn value_{i}() -> Int \{\n    {i}\n\}\n")
+        main_lines.push("import part_{i}.\{value_{i}\}")
+        terms.push("value_{i}()")
+    }
+    main_lines.push("")
+    main_lines.push("fn main() \{")
+    main_lines.push("    let total = {terms.join(" + ")}")
+    main_lines.push("    io.println(\"sum \{total\}\")")
+    main_lines.push("\}")
+    main_lines.push("")
+    write_file("{tree}/app/src/main.bl", main_lines.join("\n"))
+}
+
+// Runs blink in the tree with its own object cache, and the unit trace on.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// The units a build compiled, read from its build.units trace: a unit the object cache
+// answered prints "hit", one it compiled prints "compile".
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    out
+}
+
+fn build_units(tree: Str) -> List[Str] {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    units_compiled(r)
+}
+
+test "a warm rebuild of an app with many modules finds every unit in the object cache" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_many_units_{getpid()}"
+    dev_tree(root, tree)
+    let n = module_count()
+    let cold = build_units(tree)
+    let warm = build_units(tree)
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(cold.len(), n + 1)
+    assert_eq(warm, [])
+    assert_eq(out, "sum {n * (n - 1) / 2}")
+}
