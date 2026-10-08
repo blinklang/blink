@@ -198,6 +198,10 @@ pub fn user_unit_key(
     compute_obj_key(module_key, src_sha, headers, runtime_sha, blinkc_sha, cc_id, flags, target)
 }
 
+// Put first in an sh command that runs `$H` on a list of files. xargs cannot run the shell
+// function SHA256SUM_SH defines, so the fallback is a command line in a variable.
+let SHA256_H_SH: Str = "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; else H=\"shasum -a 256\"; fi; "
+
 fn sorted_strs(xs: List[Str]) -> List[Str] {
     let mut out: List[Str] = []
     for x in xs {
@@ -213,7 +217,7 @@ fn sorted_strs(xs: List[Str]) -> List[Str] {
 }
 
 // "<name>" -> sha for every file sha256sum printed, where a name is what the script passed it.
-// A file it could not read is printed as "! <name>" and so is absent here.
+// A file it could not read prints no sha line, so it is absent here.
 fn sha_by_name(out: Str) -> Map[Str, Str] {
     let mut m: Map[Str, Str] = Map()
     for line in out.lines() {
@@ -234,8 +238,8 @@ fn sha_by_name(out: Str) -> Map[Str, Str] {
 // name in dir, not by the path of dir, which differs on every build. A module whose key cannot
 // be built is absent, and its unit compiles without the cache: a key that left out an input it
 // could not read would match an object built from other bytes. Every file is hashed by one
-// process, and the manifests by as few more as the exec argument limit allows, since a build
-// can have many units.
+// process, and the manifests by one more, since a process per file or unit costs more than the
+// hashing on a no-change build.
 pub fn unit_keys(
     dir: Str,
     modules: List[Str],
@@ -254,10 +258,11 @@ pub fn unit_keys(
     let runtime_h = "{arc_dir}/runtime.h"
     let archive_h = "{arc_dir}/libblink_std.h"
     let pch = "{arc_dir}/libblink_std.h.gch"
+    // One exec for every file: xargs keeps the list inside the exec argument limit.
     let mut cmd = StringBuilder.new()
-    cmd.write(SHA256SUM_SH)
-    cmd.write("for f in \"{runtime_h}\" \"{archive_h}\" \"{pch}\"; do [ -e \"$f\" ] || continue; sha256sum \"$f\" 2>/dev/null || echo \"! $f\"; done; ")
-    cmd.write("cd \"{dir}\" || exit 1; for f in *.h *.c; do [ -e \"$f\" ] || continue; sha256sum \"$f\" 2>/dev/null || echo \"! $f\"; done")
+    cmd.write(SHA256_H_SH)
+    cmd.write("for f in \"{runtime_h}\" \"{archive_h}\" \"{pch}\"; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; ")
+    cmd.write("cd \"{dir}\" || exit 1; for f in *.h *.c; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; exit 0")
     let r = process_run("sh", ["-c", cmd.to_str()])
     if r.exit_code != 0 {
         return keys
@@ -320,29 +325,30 @@ pub fn unit_keys(
         keyed.push(m)
         manifests.push(text)
     }
-    let mut digests: List[Str] = []
-    for batch in exec_sized_batches(manifests) {
-        let mut hash_cmd = StringBuilder.new()
-        hash_cmd.write(SHA256SUM_SH)
-        for text in batch {
-            hash_cmd.write("(cat <<'__BLINK_MANIFEST_EOF__'\n{text}\n__BLINK_MANIFEST_EOF__\n) | sha256sum | cut -c1-16\n")
-        }
-        let h = process_run("sh", ["-c", hash_cmd.to_str()])
-        if h.exit_code != 0 {
-            return keys
-        }
-        let lines = h.out.lines()
-        if lines.len() != batch.len() {
-            return keys
-        }
-        for d in lines {
-            digests.push(d.trim())
-        }
-    }
+    // The manifests go through files so one sha256sum hashes them all. A file that does not
+    // read back as written would hash other bytes, so its unit gets no key.
+    let mut written: List[Bool] = []
     let mut i = 0
+    while i < manifests.len() {
+        let body = "{manifests.get(i).unwrap()}\n"
+        // A dotted name no unit or header has, so the hash of the units above cannot see it.
+        let path = "{dir}/.key.{i}"
+        write_file(path, body)
+        written.push(file_exists(path) == 1 && read_file(path) == body)
+        i = i + 1
+    }
+    // dir may be relative, so the cd stays in a subshell.
+    let h = process_run("sh", ["-c", "{SHA256_H_SH}(cd \"{dir}\" && for f in .key.*; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; rm -f .key.*); exit 0"])
+    if h.exit_code != 0 {
+        return keys
+    }
+    let digests = sha_by_name(h.out)
+    i = 0
     while i < keyed.len() {
-        let d = digests.get(i).unwrap()
-        if d.byte_len() == 16 { keys.insert(keyed.get(i).unwrap(), d) }
+        let d = digests.get(".key.{i}") ?? ""
+        if written.get(i).unwrap() && d.byte_len() == 64 {
+            keys.insert(keyed.get(i).unwrap(), d.byte_slice(0, 16))
+        }
         i = i + 1
     }
     keys
@@ -413,6 +419,33 @@ pub fn lookup_obj(key: Str) -> Str {
     let meta = "{dir}/{key}.meta"
     shell_exec("touch {meta} 2>/dev/null || true")
     obj
+}
+
+// lookup_obj for each key, in order, with every hit's .meta touched by one exec per run of
+// paths that fits an exec argument rather than one per hit. "" for an empty key.
+pub fn lookup_objs(keys: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    if !cache_enabled() {
+        for _k in keys {
+            out.push("")
+        }
+        return out
+    }
+    let dir = obj_cache_dir()
+    let mut metas: List[Str] = []
+    for key in keys {
+        let obj = "{dir}/{key}.o"
+        if key == "" || file_exists(obj) == 0 {
+            out.push("")
+            continue
+        }
+        out.push(obj)
+        metas.push("'{dir}/{key}.meta'")
+    }
+    for run in exec_sized_batches(metas) {
+        shell_exec("touch {run.join(" ")} 2>/dev/null || true")
+    }
+    out
 }
 
 // Atomically install obj_tmp_path as <key>.o under the cache, plus
