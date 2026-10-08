@@ -101,7 +101,17 @@ cache and link. The default build does not change.
   `libblink_std.a` the same as the monolith user TU does, and the archive
   defines the runtime storage and every non-generic std body. A std module
   gets a unit only for the bodies the archive cannot hold (the functions
-  that take the evidence vector).
+  that take the evidence vector). The archive leaves out the modules of
+  a native dep (`std/db_sqlite` and the `std/db*` modules that name its
+  types), so a program that reaches them gets one unit for each.
+- **Native shims.** No archive holds the C shims of a native dep
+  (`runtime_sqlite.h`), so the program defines them: the entry unit
+  writes their bodies, and each other unit writes
+  `#define BLINK_NATIVE_SHIMS_DECLS_ONLY 1` and reads only their
+  prototypes. Each unit gets the same gates, so the entry unit defines
+  every shim that any other unit can call. This also holds when a user
+  module binds a shim with `@ffi` and does not import its std module.
+  The one-unit build is that entry unit, so its C does not change.
 - **Std generic instances.** A unit writes a std generic instance only as
   a `static` private copy, and only the instances its own calls name.
   User generic instances stay in the unit of the module that declares the
@@ -298,6 +308,3 @@ Tracked separately: cut the per-build emit cost on a large program, so that
 input fingerprint that skips the emit when no input changed, or a header
 snapshot so that the emit does not write the typedefs again each time.
 
-A program whose non-main module uses `std.db` does not link with
-`--per-module`: more than one unit defines the sqlite3 shims. `b59311e8`
-fails the same way.
