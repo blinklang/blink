@@ -106,8 +106,17 @@ LRU-by-mtime is good enough — no need to track real access counts.
 
 ### 5. Atomic writes + concurrency
 
-- Write `.o` to `tmp/<pid>.<rand>.o`, then `rename(2)` into `<hash>.o`.
-  POSIX rename is atomic within a filesystem.
+- Each compile gets a private dir, `tmp/unit.<rand>/` (`mktemp -d`). The
+  build copies the `.c` into it, then hashes and compiles that copy, so
+  the bytes in the key are the bytes compiled. Another build can rewrite
+  the original `.c` at any time. A pid is not enough for the name: two
+  pid namespaces can share a cache dir.
+- Write the `.o` into that dir, then `rename(2)` it to `<hash>.o`. POSIX
+  rename is atomic within a filesystem. If the rename fails, the build
+  does not use the cache.
+- If an input to the key cannot be read, the build does not use the
+  cache. A key without that input could match an object built from other
+  inputs.
 - Write `.meta` after the `.o`. A present `.o` with missing/older `.meta`
   is treated as a cache hit (still safe; just less precise GC). A
   `.meta` with no `.o` is a miss; the `.meta` is reaped opportunistically.
