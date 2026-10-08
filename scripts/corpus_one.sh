@@ -43,6 +43,11 @@
 # from how the build was asked for: a build that silently falls back to one
 # unit must read false, so corpus_check.sh can hold the count to its floor.
 #
+# The record also says whether the build took the per-module path
+# ("per_module"), read from the units directory that path leaves beside the
+# binary, for the same reason: a per-module run whose build fell back to one
+# unit must read false.
+#
 # Env:
 #   CORPUS_BUILD_TIMEOUT  seconds per compile (default 900)
 #   CORPUS_RUN_TIMEOUT    seconds per run (default 600)
@@ -50,6 +55,8 @@
 #                         (default: the compiler's own lib/)
 #   BLINK_COMPILER_ARCHIVE  the compiler archive corpus.sh built for the run;
 #                         a build that imports the modules it holds links it
+#   BLINK_PER_MODULE      1 in the per-module mode, for the row's build and
+#                         every build its test starts through the CLI
 set -u
 
 file="$1"
@@ -168,6 +175,8 @@ compiler_archive=false
 if [ -f "$work/build/$base" ] && nm --defined-only "$work/build/$base" 2>/dev/null | grep -q ' __blink_init_compiler_globals$'; then
     compiler_archive=true
 fi
+per_module=false
+[ -d "$work/build/$base.units" ] && per_module=true
 if timed_out "$build_rc" "$start" "$build_timeout"; then
     status=timeout
     first_error="compile exceeded ${build_timeout}s"
@@ -227,10 +236,10 @@ seconds=$(printf '%.2f' "$(echo "$end - $start" | bc)")
 # ANSI color codes in the first error line make the JSON hard to read.
 first_error=$(printf '%s' "$first_error" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-300)
 
-printf '{"file":%s,"status":"%s","seconds":%s,"first_error_line":%s,"known_failures":%s,"compiler_archive":%s}\n' \
-    "$(json_str "$file")" "$status" "$seconds" "$(json_str "$first_error")" "$known" "$compiler_archive" \
+printf '{"file":%s,"status":"%s","seconds":%s,"first_error_line":%s,"known_failures":%s,"compiler_archive":%s,"per_module":%s}\n' \
+    "$(json_str "$file")" "$status" "$seconds" "$(json_str "$first_error")" "$known" "$compiler_archive" "$per_module" \
     > "$results_dir/$base.json"
 
 # Keep the sandbox small: the binary and C file can be large.
-rm -rf "$work/build/$base" "$work/build/$base.c" "$work/build/obj-cache"
+rm -rf "$work/build/$base" "$work/build/$base.c" "$work/build/$base.units" "$work/build/obj-cache"
 echo "$status $file"
