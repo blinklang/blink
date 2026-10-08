@@ -1,0 +1,75 @@
+// A project has one daemon, and every daemon subcommand finds it from anywhere in the project:
+// the socket sits in .blink/ at the project root, the nearest directory holding blink.toml.
+// A daemon started from a subdirectory and a status asked from the root (or the reverse) agree
+// that it runs.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/daemon_status_any_dir"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn make_project(dir: Str) {
+    let _ = sh("rm -rf {dir}; mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"daemon_status\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+}
+
+// Starts `blink daemon start <entry>` from `from` and gives the pid of its timeout runner, which
+// passes a kill on to the daemon. The timeout ends a daemon that nothing stopped.
+fn start_daemon(from: Str, entry: Str, log: Str) -> Int {
+    let r = sh("B=$(pwd)/build/blink; L=$(pwd)/{log}; cd {from} && (timeout 120 $B daemon start {entry} > $L 2>&1 & echo $!)")
+    r.out.trim().to_int()
+}
+
+// True once the socket at `sock` exists, within 20 seconds.
+fn wait_for_socket(sock: Str) -> Bool {
+    sh("for i in $(seq 1 400); do [ -S {sock} ] && exit 0; sleep 0.05; done; exit 1").exit_code == 0
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+fn status_in(dir: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && $B daemon status")
+}
+
+test "status at the project root finds a daemon started in a subdirectory" {
+    let dir = "{DIR}/from_sub"
+    make_project(dir)
+    let pid = start_daemon("{dir}/src", "main.bl", "{dir}/daemon.log")
+    let up = wait_for_socket("{dir}/.blink/daemon.sock")
+    let at_root = status_in(dir)
+    let in_sub = status_in("{dir}/src")
+    stop_daemon(pid)
+    if !up { io.eprintln(read_file("{dir}/daemon.log")) }
+
+    assert(pid > 0)
+    assert(up)
+    assert_eq(at_root.exit_code, 0)
+    assert(at_root.out.contains("\"uptime_ms\":"))
+    assert_eq(in_sub.exit_code, 0)
+    assert(in_sub.out.contains("\"uptime_ms\":"))
+}
+
+test "status in a subdirectory finds a daemon started at the project root" {
+    let dir = "{DIR}/from_root"
+    make_project(dir)
+    let pid = start_daemon(dir, "src/main.bl", "{dir}/daemon.log")
+    let up = wait_for_socket("{dir}/.blink/daemon.sock")
+    let in_sub = status_in("{dir}/src")
+    let at_root = status_in(dir)
+    stop_daemon(pid)
+    if !up { io.eprintln(read_file("{dir}/daemon.log")) }
+
+    assert(pid > 0)
+    assert(up)
+    assert_eq(in_sub.exit_code, 0)
+    assert(in_sub.out.contains("\"uptime_ms\":"))
+    assert_eq(at_root.exit_code, 0)
+    assert(at_root.out.contains("\"uptime_ms\":"))
+}
