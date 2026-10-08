@@ -187,12 +187,21 @@ asks for the one-unit build.
   - each source whose nodes its IR spans, such as a field default or a
     keyword-parameter default of another module (the IR arena notes the
     source of each node it records);
-  - each source with a fn body node or a node position that the emit read.
-    The parser marks these in `checked_node_id`, the one path every node
-    getter takes, and in each position getter. A call site that calls a
-    Str or List impl method straight through the foreign binding its body
-    forwards to reads that body and lowers none of it
-    (`cc_forwarded_binding` in `src/cg_call.bl`).
+  - each source whose fn body the emit lowers or reads, or whose node
+    position it writes into the C. The emit marks the source once at each
+    point where it crosses into such a node: `lower_fn` in
+    `src/cg_stmt.bl` (each fn, method, test and generic instance body,
+    and each private copy of a std generic), `cc_forwarded_binding` in
+    `src/cg_call.bl` (a call site that calls a Str or List impl method
+    straight through the foreign binding its body forwards to reads that
+    body and lowers none of it), `unit_uses_async_scope` in `src/cg.bl`,
+    and `ir_line` / `ir_col` in `src/ir.bl`, which the emit reads each
+    line and column through. The node getters do not track reads.
+
+  Only a build that may take units tracks these and has the parser keep
+  the fn body token ranges for the interface text. A build with reuse off,
+  a one-unit build, `blink check`, the LSP and the daemon's checks pay for
+  neither.
 
   Signatures, effects and types are declared, so the front end's facts
   about a module's nodes come from its own text and the interfaces of the
@@ -208,9 +217,12 @@ asks for the one-unit build.
   hashed against the record. When one differs, the build emits every
   taken unit again. The `__main__` unit and the other units are emitted.
   The trace prints `reuse unit <module>` for each unit taken.
-- **Reuse verify.** `BLINK_EMIT_REUSE_VERIFY=1` emits each unit the build
-  takes again, and the headers when it takes the whole build. It fails,
-  naming the unit or header, when one is not byte-equal to the file taken.
+- **Reuse verify.** `BLINK_EMIT_REUSE_VERIFY=1` makes a build that takes
+  units, or the whole emit, from the last build emit the whole program
+  again into a directory of its own. It fails, naming the file, unless
+  every unit, `__main__` and every header is byte-equal to the file the
+  build left. Every file, not only the taken units: a unit's lowering can
+  set state that `__main__`, a header or a unit lowered after it reads.
   The tests of the reuse key run under it.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
