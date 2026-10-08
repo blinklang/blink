@@ -1,0 +1,96 @@
+// A per-module build reuses the last build's units only when every source it read holds the
+// same bytes. An edit that keeps the file's size and mtime still reaches the binary, both in
+// an imported module and in the entry file.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/greet.bl", [
+        #"pub fn greet(name: Str) -> Str {"#,
+        #"    "hello {name}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import greet.{greet}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(greet("units"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// "reuse emit" or "emit": which way the build got its units, read from its build.units trace.
+fn emit_kind(r: ProcessResult) -> Str {
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line == "[dbg:build.units] reuse emit" { return "reuse emit" }
+        if line == "[dbg:build.units] emit" { return "emit" }
+    }
+    "none"
+}
+
+fn build(tree: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+// Swaps from for to in path and puts back the file's mtime, so only its bytes differ.
+fn same_size_edit(path: Str, from: Str, to: Str) {
+    shell_exec("touch -r {path} {path}.stamp && sed -i \"s/{from}/{to}/\" {path} && touch -r {path}.stamp {path} && rm -f {path}.stamp")
+}
+
+fn stat_of(path: Str) -> Str {
+    sh("stat -c '%s %Y' {path}")
+}
+
+test "a same-size edit to a source after a reused build reaches the binary" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_reuse_source_edit_{getpid()}"
+    dev_tree(root, tree)
+    let _cold = build(tree)
+    let warm = build(tree)
+    let greet_before = stat_of("{tree}/app/src/greet.bl")
+    same_size_edit("{tree}/app/src/greet.bl", "hello", "howdy")
+    let greet_after = stat_of("{tree}/app/src/greet.bl")
+    let imported = build(tree)
+    let out_imported = sh("{tree}/out/app")
+    let warm2 = build(tree)
+    let main_before = stat_of("{tree}/app/src/main.bl")
+    same_size_edit("{tree}/app/src/main.bl", "units", "parts")
+    let main_after = stat_of("{tree}/app/src/main.bl")
+    let entry = build(tree)
+    let out_entry = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(emit_kind(warm), "reuse emit")
+    assert_eq(greet_after, greet_before)
+    assert_eq(emit_kind(imported), "emit")
+    assert_eq(out_imported, "howdy units")
+    assert_eq(emit_kind(warm2), "reuse emit")
+    assert_eq(main_after, main_before)
+    assert_eq(emit_kind(entry), "emit")
+    assert_eq(out_entry, "howdy parts")
+}

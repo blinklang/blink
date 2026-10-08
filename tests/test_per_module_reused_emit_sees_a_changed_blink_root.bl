@@ -1,0 +1,83 @@
+// BLINK_ROOT picks where a bundled pkg module the compiler's own lib/ lacks is found. A
+// per-module build after a reused one, run with BLINK_ROOT naming another root, loads that
+// root's module, and the binary shows it.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"reuse_app\"\nversion = \"0.1.0\"\n")
+    // Two roots that share the tree's build/ and stdlib and differ only in pkg/probe.bl.
+    for r in ["one", "two"] {
+        shell_exec("mkdir -p {tree}/{r}/lib/pkg && ln -s {tree}/build {tree}/{r}/build && ln -s {root}/lib/std {tree}/{r}/lib/std")
+        write_file("{tree}/{r}/lib/pkg/probe.bl", "pub fn tag() -> Str \{\n    \"root {r}\"\n\}\n")
+    }
+    write_file("{tree}/app/src/greet.bl", [
+        #"import pkg.probe.{tag}"#,
+        #""#,
+        #"pub fn greet(name: Str) -> Str {"#,
+        #"    "hello {name} from {tag()}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import greet.{greet}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(greet("units"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str, blink_root: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_ROOT={blink_root} BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// "reuse emit" or "emit": which way the build got its units, read from its build.units trace.
+fn emit_kind(r: ProcessResult) -> Str {
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line == "[dbg:build.units] reuse emit" { return "reuse emit" }
+        if line == "[dbg:build.units] emit" { return "emit" }
+    }
+    "none"
+}
+
+fn build(tree: Str, blink_root: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module", blink_root)
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+test "a changed BLINK_ROOT after a reused build reaches the binary" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_reuse_blink_root_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build(tree, "{tree}/one")
+    let out_cold = sh("{tree}/out/app")
+    let warm = build(tree, "{tree}/one")
+    let switched = build(tree, "{tree}/two")
+    let out_switched = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(out_cold, "hello units from root one")
+    assert_eq(emit_kind(cold), "emit")
+    assert_eq(emit_kind(warm), "reuse emit")
+    assert_eq(emit_kind(switched), "emit")
+    assert_eq(out_switched, "hello units from root two")
+}

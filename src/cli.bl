@@ -41,7 +41,7 @@ import typecheck.{TypeCheck, check_types, strip_module_qualifier, desugar_sealed
 import compiler.{
     compile_to_program, reset_compiler_state, resolve_module_path,
     find_src_root, check_unused_imports, check_file_exists,
-    loaded_files, import_map_nodes, embedded_get_source,
+    loaded_inputs, import_map_nodes, embedded_get_source,
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
@@ -56,6 +56,7 @@ import stdlib_native_deps.{
     peeled_module_keys,
 }
 import build_objcache
+import emit_record
 import std_cache_key.{archive_compiler_path, sha256_of_file_first}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
@@ -65,7 +66,7 @@ import mono.{run_mono}
 import symbol_index.{collect_effects, si_build, si_reset}
 import query.{query_filtered_layer}
 import diagnostics.{
-    Diag, diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_reset,
+    Diag, diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain,
     embedded_inner_key,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
@@ -1380,13 +1381,6 @@ fn per_module_fallback_reason(emit_mode: Str, format_flag: Str) -> Str {
     ""
 }
 
-type EmittedUnit {
-    module: Str
-    c_bytes: Int
-    // Every header in the units directory this unit includes, which its cache key covers.
-    headers: List[Str]
-}
-
 // The headers of a per-module build: the types header, and each module's two headers in
 // `order`, the order a unit includes them in.
 type UnitHeaders {
@@ -1454,8 +1448,33 @@ fn units_cg_config(debug_mode: Int) -> CgConfig {
         compiler_archive_modules: Map() }
 }
 
-// Writes the per-module headers and one .c per unit into dir.
-fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: Int) -> Result[List[EmittedUnit], Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+// The units of a per-module build in its units directory, and what its record needs.
+type CompiledUnits {
+    units: List[emit_record.EmittedUnit]
+    // The text of the emit's inputs; "" when this build may neither reuse nor record units.
+    inputs: Str
+    // The sha of each file, when the build took the files from the last build's record.
+    shas: Option[Map[Str, Str]]
+    // The emit reported no diagnostic, so a build that reuses its units reports all it did.
+    recordable: Bool
+}
+
+// A build reuses or records units only when the emit would print nothing: no trace but the
+// build's own channels. --no-cache asks for every step again.
+fn emit_reuse_allowed() -> Bool {
+    if trace_mode != "" || cli_trace_codegen != 0 { return false }
+    if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() { return false }
+    if dbg_channels != "" {
+        for ch in dbg_channels.split(",") {
+            if !ch.starts_with("build.") { return false }
+        }
+    }
+    true
+}
+
+// Writes the per-module headers and one .c per unit into dir, or takes them from the record
+// in last_dir when the emit's inputs are the ones it records.
+fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
     let program = match compile_front_end(source_path, strict_mode) {
         Ok(p) => p
         Err(rc) => return Err(rc)
@@ -1464,6 +1483,27 @@ fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: In
     let modules = enumerate_program_modules(program)
     let erc = units_bail_on_diag()
     if erc != 0 { return Err(erc) }
+    let mut inputs = ""
+    if emit_reuse_allowed() {
+        let sha = process_compiler_sha()
+        if sha != "" {
+            inputs = emit_record.inputs_text(source_path, cfg, strict_mode, sha, get_arg(0))
+        }
+    }
+    if inputs != "" {
+        match emit_record.reuse(last_dir, dir, inputs, resolve_archive_dir()) {
+            Some(r) => {
+                dbg_trace("build.units", "reuse emit")
+                let wrc = units_flush_warnings(strict_mode)
+                if wrc != 0 { return Err(wrc) }
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true })
+            }
+            None => {}
+        }
+    }
+    dbg_trace("build.units", "emit")
+    let entries_before = diag_entry_count()
+    let ice_before = diag_ice_count
     let facts = program_facts(program)
     let hs = match write_unit_headers(program, modules, cfg, facts, dir) {
         Ok(h) => h
@@ -1472,7 +1512,7 @@ fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: In
     let unit_modules = archive_unit_modules(program, cfg)
     let urc = units_bail_on_diag()
     if urc != 0 { return Err(urc) }
-    let mut out: List[EmittedUnit] = []
+    let mut out: List[emit_record.EmittedUnit] = []
     for m in unit_modules {
         // Copy-update, so a field added to CgConfig later keeps cfg's value here.
         let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
@@ -1481,15 +1521,22 @@ fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: In
         if orc != 0 { return Err(orc) }
         let (c, headers) = unit_with_includes(raw, m, hs)
         write_file("{dir}/{m}.c", c)
-        out.push(EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers })
+        out.push(emit_record.EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers })
     }
+    let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
+    let wrc = units_flush_warnings(strict_mode)
+    if wrc != 0 { return Err(wrc) }
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: None, recordable: recordable })
+}
+
+fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
     if diag_warn_count > 0 {
         diag_flush()
         if strict_mode != 0 {
-            return Err(1)
+            return 1
         }
     }
-    Ok(out)
+    0
 }
 
 fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
@@ -1507,19 +1554,34 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
         io.eprintln("error: cannot make a units directory in {out_dir}")
         return 1
     }
-    let units = match do_compile_units(source_path, work, debug_mode, strict_mode) {
+    let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode) {
         Ok(u) => u
         Err(rc) => {
             shell_exec("rm -rf {work}")
             return rc
         }
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, units, debug_mode, release_mode, targets, json_output, unit_jobs)
+    // Hashed once, for both the cache keys and the record.
+    let mut shas = compiled.shas
+    if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
+        shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
+    }
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, shas, debug_mode, release_mode, targets, json_output, unit_jobs)
+    // Written last, and into the directory that replaces units_dir only after this: a build
+    // that stops before here leaves the last record beside the files it describes.
+    if rc == 0 && compiled.inputs != "" && compiled.recordable {
+        match shas {
+            Some(s) => {
+                let _ = emit_record.write_record(work, compiled.inputs, compiled.units, s)
+            }
+            None => {}
+        }
+    }
     shell_exec("rm -rf {units_dir} && mv {work} {units_dir}")
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[EmittedUnit], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -1547,7 +1609,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, target)
         let inc_flags = resolve_vendored_includes(used_deps, target)
-        let lrc = link_units(output_path, work, units_dir, units, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs)
+        let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs)
         if lrc != 0 {
             return lrc
         }
@@ -1571,7 +1633,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
         shell_exec("rm -f {out}")
-        let lrc = link_units(out, work, units_dir, units, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs)
+        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs)
         if lrc != 0 {
             return lrc
         }
@@ -1633,7 +1695,7 @@ fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] {
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
 // against the archive.
-fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report {
+fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report {
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
     if vrc != 0 {
@@ -1643,7 +1705,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], lin
     shell_exec("mkdir -p {obj_dir}")
     let use_cache = cg_obj_cache_enabled != 0 && build_objcache.cache_enabled()
     let mut keys: Map[Str, Str] = Map()
-    if use_cache {
+    if use_cache && shas.is_some() {
         let mut vendored_dirs: List[Str] = []
         for part in include_flags.split(" ") {
             if part.starts_with("-I") {
@@ -1656,10 +1718,10 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], lin
             modules.push(u.module)
             unit_headers.insert(u.module, u.headers)
         }
-        keys = build_objcache.unit_keys(work, modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), cc_opt_flags(debug_mode, release_mode), target)
+        keys = build_objcache.unit_keys_from(shas.unwrap(), work, modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), cc_opt_flags(debug_mode, release_mode), target)
     }
     let mut objs: Map[Str, Str] = Map()
-    let mut misses: List[EmittedUnit] = []
+    let mut misses: List[emit_record.EmittedUnit] = []
     let mut unit_keys: List[Str] = []
     for u in units {
         unit_keys.push(keys.get(u.module) ?? "")
@@ -4338,7 +4400,7 @@ fn cmd_ast(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
 
     let mut final_program = program
     if imports_flag != 0 {
-        loaded_files.push(source_path)
+        loaded_inputs.files.push(source_path)
         let src_root = find_src_root(source_path)
         let mut imported_programs: List[Int] = []
         collect_root_imports(program)

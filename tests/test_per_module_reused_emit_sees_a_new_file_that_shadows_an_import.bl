@@ -1,0 +1,83 @@
+// A new file can change which file an import resolves to: a module under the package's src/
+// shadows the bundled pkg module of the same name. A per-module build after a reused one
+// loads the new file, and the binary shows it.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    // The compiler's lib/ is a real directory here, so it can hold a bundled pkg module
+    // the test writes. The stdlib stays the tree's.
+    shell_exec("mkdir -p {tree}/build/lib/pkg && ln -s {root}/lib/std {tree}/build/lib/std")
+    shell_exec("ln -s {tree}/build/lib {tree}/lib")
+    write_file("{tree}/build/lib/pkg/probe.bl", "pub fn tag() -> Str \{\n    \"bundled\"\n\}\n")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/greet.bl", [
+        #"import pkg.probe.{tag}"#,
+        #""#,
+        #"pub fn greet(name: Str) -> Str {"#,
+        #"    "hello {name} from {tag()}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import greet.{greet}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(greet("units"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// "reuse emit" or "emit": which way the build got its units, read from its build.units trace.
+fn emit_kind(r: ProcessResult) -> Str {
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line == "[dbg:build.units] reuse emit" { return "reuse emit" }
+        if line == "[dbg:build.units] emit" { return "emit" }
+    }
+    "none"
+}
+
+fn build(tree: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+test "a new file that shadows an import after a reused build reaches the binary" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_reuse_shadow_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build(tree)
+    let out_cold = sh("{tree}/out/app")
+    let warm = build(tree)
+    shell_exec("mkdir -p {tree}/app/src/pkg")
+    write_file("{tree}/app/src/pkg/probe.bl", "pub fn tag() -> Str \{\n    \"local\"\n\}\n")
+    let shadowed = build(tree)
+    let out_shadowed = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(out_cold, "hello units from bundled")
+    assert_eq(emit_kind(cold), "emit")
+    assert_eq(emit_kind(warm), "reuse emit")
+    assert_eq(emit_kind(shadowed), "emit")
+    assert_eq(out_shadowed, "hello units from local")
+}
