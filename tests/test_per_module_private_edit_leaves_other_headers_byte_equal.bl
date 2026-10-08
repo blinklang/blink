@@ -1,0 +1,127 @@
+// The object cache keys a unit on the bytes of each header it includes, so a header that
+// changes when no declaration in it changed recompiles its includers for nothing. A private
+// body edit changes no header. A new private fn or global changes only the private header of
+// its own module, never its pub header and never another module's. Going back to the first
+// source gives back the first bytes, so nothing in a header counts or drifts across builds.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"privedit_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/shapes.bl", shapes_src(""))
+    write_file("{tree}/app/src/tally.bl", [
+        #"import shapes.{Shape, score}"#,
+        #""#,
+        #"pub let start = 100"#,
+        #""#,
+        #"pub fn total(xs: List[Shape]) -> Int {"#,
+        #"    let mut t = start"#,
+        #"    for s in xs {"#,
+        #"        t = t + score(s)"#,
+        #"    }"#,
+        #"    t"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import shapes.{Shape, score}"#,
+        #"import tally.{total}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let xs = [Shape { name: "tri", sides: 3 }, Shape { name: "sq", sides: 4 }]"#,
+        #"    io.println("total {total(xs)} first {score(xs.get(0).unwrap())}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// `extra` is spliced in ahead of score, which the private additions then call.
+fn shapes_src(extra: Str) -> Str {
+    let body = if extra == "" { "s.sides * 10 + 1" } else { "s.sides * 10 + hidden(1)" }
+    [
+        #"pub type Shape {"#,
+        #"    name: Str"#,
+        #"    sides: Int"#,
+        #"}"#,
+        #""#,
+        #"fn weight(s: Shape) -> Int {"#,
+        #"    s.sides"#,
+        #"}"#,
+        #""#,
+        extra,
+        #"pub fn score(s: Shape) -> Int {"#,
+        "    weight(s) * 0 + {body}",
+        #"}"#,
+        #""#,
+    ].join("\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes
+// --per-module build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+// "<header> <sha>" for every header the build wrote, one per line, in name order.
+fn build_headers(tree: Str) -> List[Str] {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    let mut out: List[Str] = []
+    for line in sh("cd {tree}/out/app.units && LC_ALL=C sha256sum *.h | awk '\{ print $2, $1 }' | LC_ALL=C sort").split("\n") {
+        if line != "" { out.push(line) }
+    }
+    out
+}
+
+fn without(rows: List[Str], header: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for r in rows {
+        if !r.starts_with("{header} ") { out.push(r) }
+    }
+    out
+}
+
+test "a private edit leaves every header but its own module's private one byte-equal" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_priv_headers_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build_headers(tree)
+    shell_exec("sed -i \"s/    s.sides$/    s.sides + 0/\" {tree}/app/src/shapes.bl")
+    let body_edit = build_headers(tree)
+    write_file("{tree}/app/src/shapes.bl", shapes_src([
+        #"let hidden_scale = 3"#,
+        #""#,
+        #"fn hidden(x: Int) -> Int {"#,
+        #"    x * hidden_scale"#,
+        #"}"#,
+        #""#,
+    ].join("\n")))
+    let added = build_headers(tree)
+    let added_out = sh("{tree}/out/app")
+    write_file("{tree}/app/src/shapes.bl", shapes_src(""))
+    let back = build_headers(tree)
+    let back_out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(cold.len() > 3, "headers: {cold.join(", ")}")
+    assert_eq(body_edit.join("\n"), cold.join("\n"))
+    assert_eq(without(added, "shapes.priv.h").join("\n"), without(cold, "shapes.priv.h").join("\n"))
+    assert(added.join(",") != cold.join(","), "the private header did not change")
+    assert_eq(back.join("\n"), cold.join("\n"))
+    assert(added_out.contains("total 176 first 33"), "got: {added_out}")
+    assert(back_out.contains("total 172 first 31"), "got: {back_out}")
+}
