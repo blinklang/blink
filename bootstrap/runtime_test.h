@@ -16,75 +16,71 @@ typedef struct {
     const char* xfail_reason;
 } blink_test_entry;
 
-BLINK_UNUSED static jmp_buf __blink_test_jmp;
-/* __blink_test_failed and __blink_test_skipped must be shared across TUs
- * because for_each (monomorphized into the stdlib monolith TU) polls them
- * via the @ffi accessors below — the runner that writes them lives in the
- * user TU. Other __blink_test_* state stays per-TU since only the user TU
- * touches it. */
+/* Per-test state. The runner sets the per-test frame, but an assert, a skip or a
+ * for_each case can run in any unit linked into the binary: the stdlib archive, a
+ * compiler archive, another module's unit. So the state is one set per binary,
+ * defined by the unit that defines the runtime storage. It is also one set per
+ * thread, as the panic catch state is: an assert on a spawned task must never
+ * write the runner's record or jump into its frame on another thread's stack. */
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
-    int __blink_test_failed = 0;
+    #define BLINK_TEST_STORAGE __thread
   #else
-    extern int __blink_test_failed;
+    #define BLINK_TEST_STORAGE extern __thread
   #endif
 #else
-BLINK_UNUSED static int __blink_test_failed;
+  #define BLINK_TEST_STORAGE BLINK_UNUSED static __thread
 #endif
-BLINK_UNUSED static char __blink_test_fail_msg[512];
-BLINK_UNUSED static int __blink_test_fail_line;
+
+BLINK_TEST_STORAGE jmp_buf __blink_test_jmp;
+BLINK_TEST_STORAGE int __blink_test_failed;
+BLINK_TEST_STORAGE char __blink_test_fail_msg[512];
+BLINK_TEST_STORAGE int __blink_test_fail_line;
 /* assert_eq separate expected/actual rendering (spec §8.10): expected = the
  * RHS argument, actual = the LHS argument. Non-empty only when the failure
  * came through __blink_assert_fail_eq; plain assert(...) leaves them empty. */
-BLINK_UNUSED static char __blink_test_fail_expected[256];
-BLINK_UNUSED static char __blink_test_fail_actual[256];
+BLINK_TEST_STORAGE char __blink_test_fail_expected[256];
+BLINK_TEST_STORAGE char __blink_test_fail_actual[256];
 /* Power-assert introspection. When non-empty, these supplement the legacy
  * fail_msg with structured assertion text, sub-expression values, and a
  * span. The runner uses them for human and JSON output. */
-BLINK_UNUSED static char __blink_test_fail_assertion[256];
+BLINK_TEST_STORAGE char __blink_test_fail_assertion[256];
 #define BLINK_PA_INTRO_BUF_SIZE 1024
-BLINK_UNUSED static char __blink_test_fail_intro[BLINK_PA_INTRO_BUF_SIZE];
-BLINK_UNUSED static char __blink_test_fail_file[256];
-BLINK_UNUSED static int __blink_test_fail_col;
-BLINK_UNUSED static char __blink_test_fail_user_msg[256];
-/* Cause discriminator for NDJSON output. Default "assertion"; set to
- * "propagated_error" by __blink_test_set_propagate for spec §2.20
- * test-body `?` propagation. Reset at the start of each test iteration. */
-BLINK_UNUSED static const char* __blink_test_fail_cause = "assertion";
-BLINK_UNUSED static char __blink_test_fail_error_type[128];
-BLINK_UNUSED static char __blink_test_fail_error_message[512];
+BLINK_TEST_STORAGE char __blink_test_fail_intro[BLINK_PA_INTRO_BUF_SIZE];
+BLINK_TEST_STORAGE char __blink_test_fail_file[256];
+BLINK_TEST_STORAGE int __blink_test_fail_col;
+BLINK_TEST_STORAGE char __blink_test_fail_user_msg[256];
+/* Cause discriminator for NDJSON output: "assertion", or "propagated_error"
+ * from __blink_test_set_propagate for spec §2.20 test-body `?` propagation.
+ * The runner sets it at the start of each test, before anything reads it. */
+BLINK_TEST_STORAGE const char* __blink_test_fail_cause;
+BLINK_TEST_STORAGE char __blink_test_fail_error_type[128];
+BLINK_TEST_STORAGE char __blink_test_fail_error_message[512];
 /* Active for_each case label. Set by std.testing.for_each before invoking
  * each case body; cleared after a case returns successfully. On unwind via
  * __blink_assert_fail*, the buffer retains the failing case label so the
  * runner can emit it in the JSON "case" field. */
-BLINK_UNUSED static char __blink_test_case_label[256];
+BLINK_TEST_STORAGE char __blink_test_case_label[256];
 
-/* Per-iteration `for_each` case records (br afazzf). std.testing.for_each calls
+/* Per-iteration `for_each` case records. std.testing.for_each calls
  * blink_record_case after each case that *returns* (pass/skip); the runner
  * synthesizes the trailing failed entry from __blink_test_case_label (which
  * survives the longjmp). Accumulate-then-emit, mirroring __blink_cleanup_warnings.
- * Plain per-TU statics: for_each monomorphizes into the same TU as blink_test_run
- * (both in the user/monolith TU, neither in the stdlib archive), so no
- * BLINK_USE_EXTERN_RUNTIME_STORAGE treatment is needed. Reset per test. */
+ * The records sit behind a pointer the runner allocates on its own thread, so
+ * every other thread pays one pointer of thread-local storage, not 64 KB, and
+ * records nothing. Reset per test. */
 #define BLINK_TEST_CASE_MAX 256
-BLINK_UNUSED static char __blink_test_case_labels[BLINK_TEST_CASE_MAX][256];
-BLINK_UNUSED static int  __blink_test_case_status[BLINK_TEST_CASE_MAX]; /* 0=pass 1=fail 2=skip */
-BLINK_UNUSED static int  __blink_test_case_record_count;
+typedef struct {
+    char label[256];
+    int status; /* 0=pass 1=fail 2=skip */
+} blink_test_case_record;
+BLINK_TEST_STORAGE blink_test_case_record* __blink_test_case_records;
+BLINK_TEST_STORAGE int __blink_test_case_record_count;
 
 /* Skip state. Propagated via Result-sentinel (set globals + plain `return`)
- * so __attribute__((cleanup)) destructors fire for in-scope `with` blocks.
- * `__blink_test_skipped` is shared across TUs (see comment on
- * `__blink_test_failed` above). The reason is user-TU-only. */
-#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
-  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
-    int __blink_test_skipped = 0;
-  #else
-    extern int __blink_test_skipped;
-  #endif
-#else
-BLINK_UNUSED static int __blink_test_skipped;
-#endif
-BLINK_UNUSED static char __blink_test_skip_reason[256];
+ * so __attribute__((cleanup)) destructors fire for in-scope `with` blocks. */
+BLINK_TEST_STORAGE int __blink_test_skipped;
+BLINK_TEST_STORAGE char __blink_test_skip_reason[256];
 
 /* Spec §2.20: an assertion failure panics. Outside a test run there is no
  * per-test frame to longjmp to, so the failure is an uncaught panic. The
@@ -152,9 +148,11 @@ BLINK_UNUSED static void blink_set_case_label(const char* s) {
  * 2=skip. Count keeps incrementing past the cap so the JSON helper can emit an
  * accurate overflow marker for the dropped remainder. */
 BLINK_UNUSED static void blink_record_case(const char* label, int64_t status) {
+    if (__blink_test_case_records == NULL) return;
     if (__blink_test_case_record_count < BLINK_TEST_CASE_MAX) {
-        BLINK_COPY_OR_EMPTY(__blink_test_case_labels[__blink_test_case_record_count], label);
-        __blink_test_case_status[__blink_test_case_record_count] = (int)status;
+        blink_test_case_record* r = &__blink_test_case_records[__blink_test_case_record_count];
+        BLINK_COPY_OR_EMPTY(r->label, label);
+        r->status = (int)status;
     }
     __blink_test_case_record_count++;
 }
@@ -383,10 +381,10 @@ BLINK_UNUSED static void __blink_test_print_case_records_json(void) {
     printf(",\"cases\":[");
     for (int w = 0; w < shown; w++) {
         if (w > 0) printf(",");
-        const char* st = __blink_test_case_status[w] == 1 ? "failed"
-                       : __blink_test_case_status[w] == 2 ? "skipped"
+        const char* st = __blink_test_case_records[w].status == 1 ? "failed"
+                       : __blink_test_case_records[w].status == 2 ? "skipped"
                        : "pass";
-        printf("{\"label\":\"%s\"", __blink_test_json_escape(__blink_test_case_labels[w]));
+        printf("{\"label\":\"%s\"", __blink_test_json_escape(__blink_test_case_records[w].label));
         printf(",\"status\":\"%s\"}", st);
     }
     if (n > BLINK_TEST_CASE_MAX) {
@@ -416,6 +414,10 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     __blink_panic_test_hook = __blink_test_panic_handler;
+    if (__blink_test_case_records == NULL) {
+        __blink_test_case_records = (blink_test_case_record*)calloc(BLINK_TEST_CASE_MAX, sizeof(blink_test_case_record));
+        if (__blink_test_case_records == NULL) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    }
 
     int pass = 0, fail = 0, skip = 0, total = 0;
     double total_ms = 0.0;

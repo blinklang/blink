@@ -1,0 +1,49 @@
+// An assert that fails on a spawned task runs on a pool thread, not the thread that set the
+// runner's per-test frame. It must never jump to that frame: a longjmp into another
+// thread's stack is undefined behaviour. Spec §4.13 says a task panic propagates to its
+// scope, so the failure belongs to the test that opened the scope and the run goes on.
+
+import std.process.{ProcessResult}
+
+fn run_fixture(tag: Str) -> ProcessResult {
+    let scratch = ".tmp/_test_spawned_task_assert_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{tag}.bl"
+    write_file(fixture, [
+        #"test "assert fails on a spawned task" {"#,
+        #"    async.scope {"#,
+        #"        let h = async.spawn(fn() -> Int {"#,
+        #"            assert(1 == 2, "from the task")"#,
+        #"            1"#,
+        #"        })"#,
+        #"        let _ = h.await"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"test "runs after" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    let r = process_run("build/blink", ["test", "--json", fixture])
+    shell_exec("rm -rf {scratch} build/{tag} build/{tag}.c")
+    r
+}
+
+test "an assert that fails on a spawned task ends the run with its message, not a signal" {
+    let r = run_fixture("spawned_task_assert_exit_{getpid()}")
+    let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
+    assert_eq(r.exit_code, 1, diag)
+    assert(r.err_out.contains("from the task"), "no assert message; {diag}")
+}
+
+test.failing(
+    "an assert that fails on a spawned task fails its test and the run goes on",
+    reason: "a task panic ends the process instead of propagating to its scope",
+) {
+    let r = run_fixture("spawned_task_assert_scope_{getpid()}")
+    let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
+    assert(r.out.contains("\{\"name\":\"assert fails on a spawned task\",\"status\":\"failed\""), "no failed record; {diag}")
+    assert(r.out.contains("\{\"name\":\"runs after\",\"status\":\"passed\""), "the next test did not run; {diag}")
+}

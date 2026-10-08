@@ -1,0 +1,78 @@
+// A duplicate for_each label panics at the start of the offending iteration (spec §8.10.2).
+// When the for_each runs in a module compiled into a compiler archive, its assert and its
+// case records live in that archive's C unit, not the test runner's. The failure must still
+// reach the runner's per-test frame, the case the archive recorded must reach the runner's
+// record, and the run must go on to the next test.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A package tree with its own blink.toml and a copy of this build's stdlib archive, so the
+// run does not depend on which build/ the binary would find from another directory.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/src")
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/blink.toml", "[package]\nname = \"dup_label_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/src/dup_cases.bl", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"pub fn run_dup_cases() {"#,
+        #"    for_each([("a", 1), ("a", 2)], fn(v: Int) { assert(v > 0) })"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/dup_label_test.bl", [
+        #"import dup_cases.{run_dup_cases}"#,
+        #""#,
+        #"test "duplicate label in another unit" {"#,
+        #"    run_dup_cases()"#,
+        #"}"#,
+        #""#,
+        #"test "runs after" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+fn blink_in(tree: Str, archive: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE {archive} BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+test "a duplicate for_each label in a compiler archive fails its test and the run goes on" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_dup_label_other_unit_{getpid()}"
+    dev_tree(root, tree)
+    let carch = "{tree}/carch"
+    let built = blink_in(tree, "", "__build-compiler-archive {carch} dup_cases")
+    let r = blink_in(tree, "BLINK_COMPILER_ARCHIVE={carch}", "test --json dup_label_test.bl")
+    let user_c = read_file("{tree}/build/dup_label_test.c")
+    let archive_c = read_file("{carch}/monolith.c")
+    shell_exec("rm -rf {tree}")
+    let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
+    assert_eq(built.exit_code, 0, "the compiler archive did not build: {built.out}{built.err_out}")
+
+    // The for_each that fails runs in the archive's unit: the program only declares the
+    // function that calls it.
+    assert(user_c.contains("void blink_dup_cases_run_dup_cases(void);"), "the program does not declare run_dup_cases")
+    assert(!user_c.contains("void blink_dup_cases_run_dup_cases(void) \{"), "the program defines run_dup_cases")
+    assert(archive_c.contains("void blink_dup_cases_run_dup_cases(void) \{"), "the archive does not define run_dup_cases")
+
+    assert_eq(r.exit_code, 1, diag)
+    assert(r.out.contains("\{\"name\":\"duplicate label in another unit\",\"status\":\"failed\""), "no failed record; {diag}")
+    assert(r.out.contains("duplicate case label"), "no duplicate-label message; {diag}")
+    // The first case passed and the archive recorded it.
+    assert(r.out.contains("\{\"label\":\"a\",\"status\":\"pass\"\}"), "the archive's case record is missing; {diag}")
+    assert(r.out.contains("\{\"name\":\"runs after\",\"status\":\"passed\""), "the next test did not run; {diag}")
+    assert(r.out.contains("\"passed\":1,\"failed\":1"), "wrong summary; {diag}")
+}
