@@ -113,8 +113,16 @@ cache and link. The default build does not change.
   A program that calls one std generic from many modules pays one copy
   per unit.
 - **Jobs.** `--jobs N` or `BLINK_JOBS=N` sets how many units compile at
-  once; the default is the CPU count. A value that is not a positive
-  integer is an error. The largest unit starts first.
+  once; the default is the CPU count, read only when a unit compiles. A
+  value that is not a positive integer is an error. The largest unit
+  starts first. The build starts and reaps the cc children from its own
+  thread. Before, each compile waited in an async task, and the async
+  pool has four threads (`blink_threadpool_init(4)`), so at most four cc
+  ran at once whatever `--jobs` said. The build reaps children in start
+  order, not whichever ends first, so a child that ends early holds its
+  slot until those started before it end. A child that writes more than
+  a pipe buffer of output before its turn waits for its turn: no
+  deadlock, but its slot stays idle.
 - **Object cache.** One entry per unit. The key covers the unit `.c`,
   every header it includes (the unit headers it names, `runtime.h`,
   `libblink_std.h`, its `.gch`, vendored headers), the compiler, the cc
@@ -126,7 +134,10 @@ cache and link. The default build does not change.
   units share go into one digest that each unit's key names, and the
   hashes run in batches that fit one exec argument (Linux caps one at
   128 KiB). With the full header list in each unit's manifest, the 48
-  units of `src/cli.bl` passed that cap, and every unit missed.
+  units of `src/cli.bl` passed that cap, and every unit missed. A miss
+  compiles to a temp object, and one exec per batch moves each new object
+  into the cache. The build links the cached object for each move that
+  worked, and the temp object for each move that failed.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
   code as the monolith.
@@ -207,37 +218,64 @@ from 13.79 s to 10.95 s. `a026a18c` has one more module.
 
 ## Edit-loop bench
 
-`task bench-edit-loop` on the gen1 `blink` built from `67339785`, 5 reps, 12
+`task bench-edit-loop` on the gen1 `blink` built from `80ee3a3e`, 5 reps, 12
 cores, under `blink-gates.slice`. Median wall seconds;
-`bench/edit_loop/monolith_67339785.tsv` and
-`bench/edit_loop/per_module_67339785.tsv` hold the full rows.
+`bench/edit_loop/monolith_80ee3a3e.tsv` and
+`bench/edit_loop/per_module_80ee3a3e.tsv` hold the full rows. The "before"
+column is the gen1 of `b59311e8` under the same conditions.
 
-| target | case | monolith | `--per-module` | per-module units compiled |
-|---|---|---|---|---|
-| cli | nochange | 0.752 | 1.554 | 0 |
-| cli | body-cname | 10.374 | 1.780 | 1 |
-| cli | body-typecheck | 10.387 | 4.050 | 1 |
-| cli | pubfn-cname | 10.370 | 5.569 | 48 |
-| cli | run-body-cname | 10.381 | 1.790 | 1 |
-| cli | cold-obj | 10.380 | 5.874 | 48 |
-| cli | cold-all | 12.780 | 8.041 | 49 |
-| small | nochange | 0.074 | 0.116 | 0 |
-| small | body-inventory | 0.138 | 0.161 | 1 |
-| small | pubfn-model | 0.141 | 0.205 | 5 |
-| small | cold-obj | 0.140 | 0.201 | 5 |
+| target | case | monolith | `--per-module` before | `--per-module` | units compiled |
+|---|---|---|---|---|---|
+| cli | nochange | 0.763 | 1.518 | 0.948 | 0 |
+| cli | body-cname | 10.424 | 1.684 | 1.118 | 1 |
+| cli | body-typecheck | 10.424 | 3.929 | 3.367 | 1 |
+| cli | pubfn-cname | 10.429 | 2.778 | 1.792 | 14 |
+| cli | run-body-cname | 10.431 | 1.691 | 1.104 | 1 |
+| cli | test-body-cname | 2.119 | 2.126 | 2.117 | 1 |
+| cli | cold-obj | 10.447 | 5.039 | 4.026 | 49 |
+| cli | cold-all | 12.807 | 7.414 | 6.394 | 50 |
+| small | nochange | 0.073 | 0.135 | 0.072 | 0 |
+| small | body-inventory | 0.138 | 0.179 | 0.119 | 1 |
+| small | pubfn-model | 0.137 | 0.184 | 0.122 | 3 |
+| small | run-body-inventory | 0.139 | 0.181 | 0.121 | 1 |
+| small | test-body-inventory | 0.141 | 0.140 | 0.139 | 1 |
+| small | cold-obj | 0.138 | 0.214 | 0.123 | 5 |
 
-The `test-*` cases do not take the flag and stay within 0.03 s of the
-monolith. What the numbers show:
+The `test-*` cases do not take the flag, so both columns run the same
+path there. What the numbers show:
 
+- A small program is now as fast as the monolith or faster on every case.
+  No few-modules threshold sends it to the one-unit path.
 - A body edit on a large program gains the most: the build compiles one
-  unit, and the time follows the size of that unit (`cname.c` 0.2 s,
-  `typecheck.c` 2.5 s).
-- The front end and emit cost more per build (`emit_s` 0.74 s to 1.53 s
-  for cli): the build writes and hashes every unit and header each time,
-  so `nochange` is 0.8 s slower.
-- A small program is slower on every case, by 0.02 to 0.07 s.
+  unit, and the time follows the size of that unit (`cname.c` 0.15 s,
+  `typecheck.c` 2.4 s).
+- `cold-obj` and `pubfn-cname` gain from more than four compiles at once.
+- `nochange` on cli is still 0.19 s slower than the monolith. All of it
+  is emit (`emit_s` 0.905 against 0.725): the build still emits 131
+  headers and 49 units each time, then hashes them to find that nothing
+  changed.
+
+What made the emit cheaper, from 1.48 s to 0.91 s on cli `nochange`:
+
+- The cache keys hash all units in one batched exec, not one exec per
+  unit, and one exec answers the cache lookup for every key.
+- The emit scans the program once for the key-table nodes and the
+  carriers it spells, not once per unit, and builds the function index
+  on its first lookup.
+- One exec per batch installs the new objects (above).
+- The CPU count is read only when a unit compiles, and the native-dep
+  scan reads the units and the headers they include in process, not
+  through `cat`. The gates and markers live in the unit `.c` files, and
+  no header that no unit includes holds one (checked on cli and small), so
+  the scan finds the same deps.
 
 ## Blockers before the default flips
 
-Tracked separately: cut the per-build emit and hash cost (`nochange` must not be slower than the monolith), and
-keep a small program as fast as the monolith.
+Tracked separately: cut the per-build emit cost on a large program, so that
+`nochange` is not slower than the monolith. The two ways out are a front-end
+input fingerprint that skips the emit when no input changed, or a header
+snapshot so that the emit does not write the typedefs again each time.
+
+A program whose non-main module uses `std.db` does not link with
+`--per-module`: more than one unit defines the sqlite3 shims. `b59311e8`
+fails the same way.
