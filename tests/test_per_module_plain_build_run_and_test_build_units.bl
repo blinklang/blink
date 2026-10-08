@@ -1,0 +1,118 @@
+// The per-module path is the default: `blink build`, `blink run` and `blink test` with no path
+// flag and no BLINK_PER_MODULE build one C unit per module, and keep no one-unit C file.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"calc_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/calc.bl", [
+        #"pub fn double(x: Int) -> Int {"#,
+        #"    x * 2"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import calc.{double}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{double(21)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main_test.bl", [
+        #"import calc.{double}"#,
+        #""#,
+        #"test "double doubles" {"#,
+        #"    assert_eq(double(2), 4)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// fall back to one unit, and the per-module corpus exports BLINK_PER_MODULE. The run drops
+// them all, so it sees the default.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_PER_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+fn unit_files(dir: Str) -> Str {
+    sh("cd {dir} 2>/dev/null && ls *.c | LC_ALL=C sort | tr '\\n' ' '")
+}
+
+fn exists(path: Str) -> Str {
+    sh("[ -e {path} ] && echo yes || echo no")
+}
+
+test "a plain blink build builds one unit per module" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_default_build_{getpid()}"
+    dev_tree(root, tree)
+    let b = blink_in(tree, "build app/src/main.bl -o {tree}/out/app")
+    let units = unit_files("{tree}/out/app.units")
+    let one_c = exists("{tree}/out/app.c")
+    let ran = process_run("sh", ["-c", "{tree}/out/app"])
+    shell_exec("rm -rf {tree}")
+    assert(b.exit_code == 0, "build failed: {b.out}{b.err_out}")
+    assert_eq(units, "__main__.c calc.c")
+    assert_eq(one_c, "no")
+    assert_eq(ran.out.trim(), "42")
+}
+
+test "a plain blink run builds one unit per module" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_default_run_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "run app/src/main.bl")
+    let units = unit_files("{tree}/build/main.units")
+    let one_c = exists("{tree}/build/main.c")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "run failed: {r.out}{r.err_out}")
+    assert(r.out.contains("42"), "got: {r.out}")
+    assert_eq(units, "__main__.c calc.c")
+    assert_eq(one_c, "no")
+}
+
+test "a plain blink test builds one unit per module" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_default_test_{getpid()}"
+    dev_tree(root, tree)
+    let t = blink_in(tree, "test app/src/main_test.bl")
+    let units = unit_files("{tree}/build/main_test.units")
+    let one_c = exists("{tree}/build/main_test.c")
+    shell_exec("rm -rf {tree}")
+    assert(t.exit_code == 0, "test failed: {t.out}{t.err_out}")
+    assert(t.out.contains("1 passed"), "got: {t.out}")
+    assert_eq(units, "__main__.c calc.c")
+    assert_eq(one_c, "no")
+}
+
+// The user asked for no path on the command, so a fallback has nothing to note.
+test "a plain build that falls back to one unit prints no note" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_default_fallback_{getpid()}"
+    dev_tree(root, tree)
+    let e = blink_in(tree, "build --emit c app/src/main.bl -o {tree}/out/app")
+    let one_c = exists("{tree}/out/app.c")
+    let units = exists("{tree}/out/app.units")
+    shell_exec("rm -rf {tree}")
+    assert(e.exit_code == 0, "emit failed: {e.out}{e.err_out}")
+    assert_eq(one_c, "yes")
+    assert_eq(units, "no")
+    assert(!e.err_out.contains("--per-module ignored"), "the default fallback printed: {e.err_out}")
+}

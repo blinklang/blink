@@ -18,7 +18,8 @@
 #   CORPUS_COMPILER_ARCHIVE  0 builds every file in one unit, with no compiler
 #                    archive (default 1). For a compiler that predates the
 #                    archive, such as the pinned gen0 the suites run under.
-#   CORPUS_PER_MODULE  1 runs the per-module mode (default 0): every build,
+#   CORPUS_PER_MODULE  1 runs the per-module mode (default 0, which exports
+#                    BLINK_PER_MODULE=0 for the one-unit build): every build,
 #                    the row's own and each one its test starts through the
 #                    CLI, takes the per-module path (BLINK_PER_MODULE=1), with
 #                    no compiler archive, since a per-module build falls back
@@ -97,7 +98,9 @@ if [ "$per_module" = 1 ]; then
     [ "$pm_jobs" -lt 1 ] && pm_jobs=1
     export BLINK_JOBS="${BLINK_JOBS:-$pm_jobs}"
 else
-    unset BLINK_PER_MODULE
+    # The per-module path is blink's default, so an unset env would not keep this
+    # mode on one unit once the compiler archive is off.
+    export BLINK_PER_MODULE=0
 fi
 
 if [ ! -x "$comp/blink" ] || [ ! -x "$comp/blinkc" ]; then

@@ -2,6 +2,10 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Changes (unreleased)
+
+- **`blink build`, `blink run` and `blink test` compile one C unit per module by default.** The units compile in parallel and each is cached on its own, so an edit recompiles only the units it changed, and a build whose inputs did not change reuses the last build's units. The units go in `<output>.units/` beside the binary, and no `<output>.c` is written. `--no-per-module` or `BLINK_PER_MODULE=0` builds the whole program as one C unit, to bisect a per-module bug; a flag beats the env var, which beats the default, and passing both flags is an error. `--per-module` still works and asks for the default by name. `--emit c`, `--format blink`, `BLINK_SKIP_MODULES`, `BLINK_ONLY_MODULE` and `BLINK_COMPILER_ARCHIVE` still build one unit, with no note unless `--per-module` was passed.
+
 ## Breaking Changes (v0.54.0)
 
 ### Type inference and type checking
