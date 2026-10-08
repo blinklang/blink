@@ -901,7 +901,8 @@ fn apply_cache_flag(a: Args) {
 let mut cached_compiler_sha: Str = ""
 let mut cached_compiler_sha_init: Int = 0
 let mut cached_cc_id: Str = ""
-let mut cached_cc_id_init: Int = 0
+// "<target>\n" once cached_cc_id holds that target's identity; "" before the first call.
+let mut cached_cc_id_for: Str = ""
 
 pub fn process_compiler_sha() -> Str {
     if cached_compiler_sha_init == 0 {
@@ -911,11 +912,18 @@ pub fn process_compiler_sha() -> Str {
     cached_compiler_sha
 }
 
-fn process_cc_id() -> Str {
-    if cached_cc_id_init == 0 {
-        let r = process_run("sh", ["-c", "cc --version 2>&1 | head -1"])
-        cached_cc_id = r.out.trim()
-        cached_cc_id_init = 1
+// The compiler run_cc runs for target: a cross build runs zig, whose clang line does not
+// move with every zig release, so the zig version is part of it.
+fn process_cc_id(target: Str) -> Str {
+    if cached_cc_id_for != "{target}\n" {
+        let cmd = if target == "" {
+            "cc --version 2>&1 | head -1"
+        } else {
+            "zig version && zig cc -target {target} --version 2>&1 | head -1"
+        }
+        let r = process_run("sh", ["-c", cmd])
+        cached_cc_id = if r.exit_code == 0 { r.out.trim().replace("\n", " ") } else { "" }
+        cached_cc_id_for = "{target}\n"
     }
     cached_cc_id
 }
@@ -925,37 +933,55 @@ fn process_cc_id() -> Str {
 // trigger a full-tree size walk.
 let mut cache_did_store: Int = 0
 
-fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target: Str, archive_include: Str) -> Str {
+fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str {
     cache_did_store = 0
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() {
         return ""
     }
-    // A key without the compiler would match an object compiled against any compiler's
-    // archive header, so with no compiler hash there is no cache.
-    if process_compiler_sha() == "" {
+    // Another build that writes the same C path can rewrite it at any time, so the key
+    // and the compile both read one private copy: a second read of c_path could compile
+    // other bytes than the ones hashed and store that object under the key.
+    let snap_dir = build_objcache.make_private_dir()
+    if snap_dir == "" {
         return ""
     }
-    let src_sha = sha256_of_file_first(c_path)
+    let obj = cache_compile_snapshot(c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags)
+    shell_exec("rm -rf {snap_dir}")
+    obj
+}
+
+fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str {
+    let snap = "{snap_dir}/{path_basename(c_path)}"
+    if shell_exec("cp {c_path} {snap}") != 0 {
+        return ""
+    }
+    let mut vendored_dirs: List[Str] = []
+    for part in include_flags.split(" ") {
+        if part.starts_with("-I") {
+            vendored_dirs.push(part.byte_slice(2, part.byte_len()))
+        }
+    }
     let flags = cc_opt_flags(debug_mode, release_mode)
-    let key = build_objcache.compute_obj_key(
-        c_path, src_sha, [],
-        "", process_compiler_sha(), process_cc_id(), flags, target,
-    )
+    let key = build_objcache.user_unit_key(snap, c_path, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), flags, target)
+    if key == "" {
+        return ""
+    }
     let hit = build_objcache.lookup_obj(key)
     if hit != "" {
         return hit
     }
-    build_objcache.ensure_dir()
-    let dir = build_objcache.obj_cache_dir()
-    let staging = build_objcache.make_staging_path(key)
-    let rc = run_cc("-c {c_path} -o {staging} {archive_include}", debug_mode, release_mode, target)
+    let staging = "{snap_dir}/unit.o"
+    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
+    // The map gives the object the __FILE__ and debug paths a compile of c_path gives.
+    let rc = run_cc("-c {snap} -o {staging} -ffile-prefix-map={snap_dir}={path_dirname(c_path)} {includes}", debug_mode, release_mode, target)
     if rc != 0 {
         return ""
     }
-    if build_objcache.store(key, staging, c_path, src_sha) {
-        cache_did_store = 1
+    if !build_objcache.store(key, staging, c_path, sha256_of_file_first(snap)) {
+        return ""
     }
-    "{dir}/{key}.o"
+    cache_did_store = 1
+    "{build_objcache.obj_cache_dir()}/{key}.o"
 }
 
 fn sha8(sha: Str) -> Str {
@@ -1074,10 +1100,9 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     // below (which does pass includes). On a host without the system header
     // that surfaced a scary fatal error on every db build; on a cache hit it
     // would never have produced the .o at all.
-    let cache_includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
     // The object key does not cover the compiler archive header, which each corpus run
     // rebuilds, so a unit that reads it is never cached.
-    let cached_o = if compiler_archive != "" { "" } else { cache_compile_user_c(c_path, debug_mode, release_mode, target, cache_includes) }
+    let cached_o = if compiler_archive != "" { "" } else { cache_compile_user_c(c_path, debug_mode, release_mode, target, arc_dir, include_flags) }
     let compile_input = if cached_o != "" { cached_o } else { c_path }
     let rc = run_cc("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
     if rc != 0 {

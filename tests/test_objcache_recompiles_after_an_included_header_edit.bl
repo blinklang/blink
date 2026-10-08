@@ -1,0 +1,52 @@
+// A dev tree whose archive dir the test can edit: a build after an edit of a header the
+// user unit includes must compile a new object, not link the one the cache holds.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    write_file("{tree}/hello.bl", "fn main() ! IO \{\n    io.println(\"hello\")\n}\n")
+}
+
+fn entries_after_build(tree: Str) -> Int {
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT BLINK_CACHE_DIR={tree}/objcache build/blink build hello.bl -o {tree}/hello 2>&1"])
+    assert(r.exit_code == 0, "build failed: {r.out}")
+    assert_eq(sh("{tree}/hello"), "hello")
+    sh("ls {tree}/objcache/*.o 2>/dev/null | wc -l").to_int()
+}
+
+test "a build after a runtime header edit compiles a new object" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_objcache_runtime_edit_{getpid()}"
+    dev_tree(root, tree)
+    let cold = entries_after_build(tree)
+    let warm = entries_after_build(tree)
+    shell_exec("echo '/* edited */' >> {tree}/build/runtime.h")
+    let edited = entries_after_build(tree)
+    shell_exec("rm -rf {tree}")
+    assert_eq(cold, 1)
+    assert_eq(warm, 1)
+    assert_eq(edited, 2)
+}
+
+test "a build after an archive header edit compiles a new object" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_objcache_archive_header_edit_{getpid()}"
+    dev_tree(root, tree)
+    let cold = entries_after_build(tree)
+    shell_exec("echo '/* edited */' >> {tree}/build/libblink_std.h")
+    let edited = entries_after_build(tree)
+    shell_exec("rm -rf {tree}")
+    assert_eq(cold, 1)
+    assert_eq(edited, 2)
+}
