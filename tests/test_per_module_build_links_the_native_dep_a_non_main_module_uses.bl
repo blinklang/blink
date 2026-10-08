@@ -1,0 +1,70 @@
+// A per-module build finds the native deps a program uses by scanning what cc compiles,
+// as the one-unit build scans its one C file. A dep that only a module other than main
+// uses must still be linked, or the build fails at link time.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"store_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/store.bl", [
+        #"import std.db_sqlite.{sqlite_open, sqlite_handler}"#,
+        #""#,
+        #"pub fn stored_names() -> Str {"#,
+        #"    let handle = sqlite_open(":memory:")"#,
+        #"    with sqlite_handler(handle) {"#,
+        #"        db.exec("CREATE TABLE t (name TEXT)").unwrap()"#,
+        #"        db.exec("INSERT INTO t VALUES ('kept')").unwrap()"#,
+        #"        let rows = db.query("SELECT name FROM t").unwrap()"#,
+        #"        rows.get(0).unwrap().get("name").unwrap()"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import store.{stored_names}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("stored {stored_names()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes
+// --per-module build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+test "a per-module build links sqlite when only a non-main module uses it" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_native_dep_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    let units = sh("ls {tree}/out/app.units | grep -c '\\.c$'")
+    // The objects the link took, one per unit: exactly one may define a shim.
+    let bodies = sh("for o in {tree}/objcache/*.o; do nm --defined-only $o; done | grep -c ' T blink_sqlite3_open$'")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    // main, store, and the five std db modules: the archive leaves out the modules of a
+    // native dep, so a program that reaches them compiles them in units of its own.
+    assert_eq(units, "7")
+    assert_eq(bodies, "1")
+    assert_eq(out, "stored kept")
+}
