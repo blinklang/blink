@@ -39,7 +39,8 @@ import cg_decl.{
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_foreign_wrapper,
     cg_decl_emit_impl_method_decl,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
-    cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_has_deferred_global, cg_decl_reset,
+    cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_emit_typedefs_over, cg_decl_has_deferred_global, cg_decl_reset,
+    cg_decl_spelled_carrier_tids,
 }
 import cg_derive.{
     cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables,
@@ -624,7 +625,7 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
 
 // The definition half. Test blocks are not here: they are written beside the entry shim,
 // which is a different unit under the per-module mode.
-fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report {
+fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool, key_table_nodes: List[Int]) ! Diag.Report {
     let fns = without_on_demand_copies(cfg, module_key, fns_in_scope(cfg, module_key, shared, false))
     let methods = without_on_demand_copies(cfg, module_key, methods_in_scope(cfg, module_key, shared, false))
     // A unit declares every instance it defines, in its own text, ahead of every body.
@@ -637,7 +638,7 @@ fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report 
     cg_derive_emit_bodies(decls_in_scope(cfg, module_key, cg_reg_type_decls(), false))
     // A tuple key has no declaration, so its table is placed by the nodes that spell it
     // rather than by a type declaration; the same scope rule answers for both.
-    cg_derive_emit_key_tables(decls_in_scope(cfg, module_key, cg_derive_key_table_nodes(), false))
+    cg_derive_emit_key_tables(decls_in_scope(cfg, module_key, key_table_nodes, false))
 }
 
 // ── Test blocks ──────────────────────────────────────────────────────────────
@@ -798,7 +799,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
-    emit_definitions(cfg, "", shared)
+    emit_definitions(cfg, "", shared, cg_derive_key_table_nodes())
     // An archive monolith has no entry point: the user TU that links against it owns
     // main(), so neither the test-body table nor the main shim belongs here.
     let init_fns = emit_global_init_fn(cfg, program, deferred)
@@ -849,13 +850,32 @@ pub type ModuleHeaders {
     internal: Str
 }
 
+// What a scan of every node answers about a program. Each unit of one program would ask
+// the same of the same nodes, and on a program with many modules the scans cost more than
+// the units, so a driver that emits many units scans once and hands the answers to each.
+// Only codegen runs between the scan and the units, and it adds no node and stamps no type.
+pub type ProgramFacts {
+    key_table_nodes: List[Int]
+    carrier_tids: List[Int]
+}
+
+pub fn program_facts(program: Int) -> ProgramFacts ! Diag.Report {
+    begin_unit(program)
+    ProgramFacts { key_table_nodes: cg_derive_key_table_nodes(), carrier_tids: cg_decl_spelled_carrier_tids() }
+}
+
 pub fn generate_module_headers(program: Int, module_key: Str, cfg: CgConfig) -> ModuleHeaders ! Codegen, Diag.Report {
+    let facts = program_facts(program)
+    generate_module_headers_with(program, module_key, cfg, facts)
+}
+
+pub fn generate_module_headers_with(program: Int, module_key: Str, cfg: CgConfig, facts: ProgramFacts) -> ModuleHeaders ! Codegen, Diag.Report {
     begin_unit(program)
     // The types header already holds every typedef. Writing them here too and throwing the
     // text away marks them written, so a signature below that spells one does not write it
     // again. The prologue also sets the linkage the signatures are printed under.
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, c_module_header_guard(module_key), "")
-    cg_decl_emit_typedefs()
+    cg_decl_emit_typedefs_over(facts.carrier_tids)
     cg_decl_emit_ev_typedef()
     let _ = print_take()
     let globals = globals_in_scope(cfg, module_key, true)
@@ -912,6 +932,11 @@ fn surface_decls(decls: List[Int], want_surface: Bool) -> List[Int] {
 // entry module also gathers every other module's init-fn name here, since every module's
 // registries are already loaded by `begin_unit` above regardless of whose object this is.
 pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
+    let facts = program_facts(program)
+    generate_module_object_with(program, module_key, self_header, cfg, facts)
+}
+
+pub fn generate_module_object_with(program: Int, module_key: Str, self_header: Str, cfg: CgConfig, facts: ProgramFacts) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     cg_promote_set_trace(cfg.trace_codegen != 0)
     // The entry module's object defines the runtime's storage and bodies, the way it owns
@@ -941,7 +966,7 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
-    emit_definitions(cfg, module_key, cfg.archive_build_mode != 0)
+    emit_definitions(cfg, module_key, cfg.archive_build_mode != 0, facts.key_table_nodes)
     if module_key == "__main__" { emit_entry(cfg, module_init_fn_names(cfg, module_key, deferred)) }
     if copies_on_demand(cfg, module_key) { emit_named_private_copies(cfg) }
     print_take()

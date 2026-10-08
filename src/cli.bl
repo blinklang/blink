@@ -45,7 +45,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
-import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_types_header, generate_module_headers, generate_module_object, enumerate_program_modules, archive_unit_modules}
+import cg.{Codegen, CgConfig, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_with, generate_module_object_with, program_facts, enumerate_program_modules, archive_unit_modules}
 import build_unit_headers.{HeaderIndex, index_headers, unit_includes, splice_includes}
 import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
@@ -1236,7 +1236,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
             return arc_rc
         }
     }
-    if unit_jobs > 0 {
+    if unit_jobs != 0 {
         let reason = per_module_fallback_reason(emit_mode, format_flag)
         if reason == "" {
             return do_build_units(source_path, output_path, debug_mode, release_mode, targets, json_output, strict_mode, unit_jobs)
@@ -1326,9 +1326,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
 // hold. See docs/build/per-module-o-default.md.
 
 // How many units a build and run compile at once: 0 without --per-module, which builds one
-// C unit, else --jobs, BLINK_JOBS or the CPU count. A job count that is not a positive
-// integer is an error rather than a silent fallback, so a typo cannot quietly serialise a
-// build. Only a per-module build reads the count, so only it can fail on one.
+// C unit, else --jobs, BLINK_JOBS or -1 for the CPU count. A job count that is not a
+// positive integer is an error rather than a silent fallback, so a typo cannot quietly
+// serialise a build. Only a per-module build reads the count, so only it can fail on one.
 fn unit_jobs_from_args(a: Args) -> Int {
     if !args_has(a, "per-module") { return 0 }
     let flag = args_get(a, "jobs")
@@ -1342,6 +1342,11 @@ fn unit_jobs_from_args(a: Args) -> Int {
         }
         return n
     }
+    // Read only when a unit compiles: it costs an exec, and a no-change build compiles none.
+    -1
+}
+
+fn cpu_count() -> Int {
     let r = process_run("sh", ["-c", "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null"])
     let n = r.out.trim().to_int()
     if n > 0 { n } else { 1 }
@@ -1372,7 +1377,7 @@ type UnitHeaders {
 }
 
 // Writes the types header and each module's two headers into dir.
-fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, dir: Str) -> Result[UnitHeaders, Int] ! Diag.Report, Codegen {
+fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, facts: ProgramFacts, dir: Str) -> Result[UnitHeaders, Int] ! Diag.Report, Codegen {
     let types = generate_types_header(program, cfg)
     let trc = units_bail_on_diag()
     if trc != 0 { return Err(trc) }
@@ -1380,7 +1385,7 @@ fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, dir: Str)
     let mut names: List[Str] = []
     let mut texts: List[Str] = []
     for m in modules {
-        let hs = generate_module_headers(program, m, cfg)
+        let hs = generate_module_headers_with(program, m, cfg, facts)
         let hrc = units_bail_on_diag()
         if hrc != 0 { return Err(hrc) }
         write_file("{dir}/{c_module_header_name(m)}", hs.surface)
@@ -1441,7 +1446,8 @@ fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: In
     let modules = enumerate_program_modules(program)
     let erc = units_bail_on_diag()
     if erc != 0 { return Err(erc) }
-    let hs = match write_unit_headers(program, modules, cfg, dir) {
+    let facts = program_facts(program)
+    let hs = match write_unit_headers(program, modules, cfg, facts, dir) {
         Ok(h) => h
         Err(rc) => return Err(rc)
     }
@@ -1452,7 +1458,7 @@ fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: In
     for m in unit_modules {
         // Copy-update, so a field added to CgConfig later keeps cfg's value here.
         let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
-        let raw = generate_module_object(program, m, c_module_header_name(m), obj_cfg)
+        let raw = generate_module_object_with(program, m, c_module_header_name(m), obj_cfg, facts)
         let orc = units_bail_on_diag()
         if orc != 0 { return Err(orc) }
         let (c, headers) = unit_with_includes(raw, m, hs)
@@ -1496,8 +1502,21 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
 }
 
 fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[EmittedUnit], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report {
-    // The scans below read what the one-unit build reads from its single C file.
-    let c_source = process_run("sh", ["-c", "cat {work}/*.h {work}/*.c"]).out
+    // The scans below read what the one-unit build reads from its single C file: each unit
+    // and each header a unit includes, which is all cc compiles. A marker the scans look
+    // for starts a line, so each file starts one.
+    let mut c_parts: List[Str] = []
+    let mut seen: Map[Str, Bool] = Map()
+    for u in units {
+        for h in u.headers {
+            if seen.contains_key(h) == 0 {
+                seen.insert(h, true)
+                c_parts.push(read_file("{work}/{h}"))
+            }
+        }
+        c_parts.push(read_file("{work}/{u.module}.c"))
+    }
+    let c_source = c_parts.join("\n")
     let has_async = detect_async(read_file(source_path))
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
@@ -1561,45 +1580,35 @@ type UnitCompile {
     err_out: Str
 }
 
-// Runs each command under sh with at most `jobs` at a time, starting them in list order.
+// Runs each command under sh with at most `unit_jobs` at a time (the CPU count for -1),
+// starting them in list order.
 // Answers one result per command, indexed by its place in the list.
-fn run_unit_compiles(cmds: List[Str], jobs: Int) -> List[UnitCompile] {
+// The children are started and reaped from this thread rather than from async tasks: the
+// async pool has four threads and a task that waits on a child holds one, so tasks could
+// never run more than four at once. Children are reaped in start order with no wait for
+// whichever ends first, so a child that ends early holds its slot until those started
+// before it are reaped.
+fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] {
     let n = cmds.len()
     let mut by_idx: List[UnitCompile] = []
-    for i in 0..n {
-        by_idx.push(UnitCompile { idx: i, exit_code: -1, out: "", err_out: "" })
-    }
     if n == 0 { return by_idx }
-    let workers = if jobs < n { jobs } else { n }
-    // A queue the workers drain in order, so the commands start in list order whatever
-    // order the scheduler runs the workers in; one stop mark per worker ends it.
-    let queue = channel.new[Int](buffer: n + workers)
-    for i in 0..n {
-        queue.send(i)
-    }
-    for _ in 0..workers {
-        queue.send(-1)
-    }
-    let results = channel.new[UnitCompile](buffer: n)
+    let jobs = if unit_jobs > 0 { unit_jobs } else { cpu_count() }
     process_install_signal_forwarding()
-    async.scope {
-        for _ in 0..workers {
-            async.spawn(fn() {
-                for idx in queue {
-                    if idx < 0 { break }
-                    let pid = process_spawn("sh", ["-c", cmds.get(idx).unwrap()])
-                    let r = process_pid_wait(pid)
-                    results.send(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out })
-                }
-                0
-            })
-        }
+    let mut pids: List[Int] = []
+    let mut started = 0
+    while started < n && started < jobs {
+        pids.push(process_spawn("sh", ["-c", cmds.get(started).unwrap()]))
+        started = started + 1
     }
-    let mut got = 0
-    for r in results {
-        by_idx.set(r.idx, r)
-        got = got + 1
-        if got == n { break }
+    let mut idx = 0
+    while idx < n {
+        let r = process_pid_wait(pids.get(idx).unwrap())
+        by_idx.push(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out })
+        if started < n {
+            pids.push(process_spawn("sh", ["-c", cmds.get(started).unwrap()]))
+            started = started + 1
+        }
+        idx = idx + 1
     }
     by_idx
 }
@@ -1633,9 +1642,15 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], lin
     }
     let mut objs: Map[Str, Str] = Map()
     let mut misses: List[EmittedUnit] = []
+    let mut unit_keys: List[Str] = []
     for u in units {
-        let key = keys.get(u.module) ?? ""
-        let hit = if key != "" { build_objcache.lookup_obj(key) } else { "" }
+        unit_keys.push(keys.get(u.module) ?? "")
+    }
+    let hits = build_objcache.lookup_objs(unit_keys)
+    let mut ui = 0
+    for u in units {
+        let hit = hits.get(ui).unwrap()
+        ui = ui + 1
         if hit != "" {
             dbg_trace("build.units", "hit {u.module}")
             objs.insert(u.module, hit)
@@ -1663,7 +1678,9 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], lin
     }
     let results = run_unit_compiles(cmds, unit_jobs)
     let mut failed = 0
-    let mut stored = false
+    let mut store_keys: List[Str] = []
+    let mut store_paths: List[Str] = []
+    let mut store_modules: List[Str] = []
     for r in results {
         let m = misses.get(r.idx).unwrap().module
         if r.exit_code != 0 {
@@ -1674,13 +1691,24 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], lin
             continue
         }
         let local = "{obj_dir}/{m}.o"
+        objs.insert(m, local)
         let key = keys.get(m) ?? ""
-        if key != "" && build_objcache.store(key, local, m, "") {
-            objs.insert(m, "{build_objcache.obj_cache_dir()}/{key}.o")
-            stored = true
-        } else {
-            objs.insert(m, local)
+        if key != "" {
+            store_keys.push(key)
+            store_paths.push(local)
+            store_modules.push(m)
         }
+    }
+    // Stored before the failure check, so a unit that compiled is not compiled again next time.
+    let mut stored = false
+    let installed = build_objcache.store_objs(store_keys, store_paths, store_modules)
+    let mut si = 0
+    while si < store_keys.len() {
+        if installed.get(si).unwrap() {
+            objs.insert(store_modules.get(si).unwrap(), "{build_objcache.obj_cache_dir()}/{store_keys.get(si).unwrap()}.o")
+            stored = true
+        }
+        si = si + 1
     }
     if failed > 0 {
         return 1
@@ -3441,7 +3469,8 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         exit(1)
     }
 
-    let hs = match write_unit_headers(final_program, modules, mod_cfg, out_dir) {
+    let facts = program_facts(final_program)
+    let hs = match write_unit_headers(final_program, modules, mod_cfg, facts, out_dir) {
         Ok(h) => h
         Err(rc) => {
             exit(rc)
@@ -3455,7 +3484,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         // Copy-update, not a fresh literal: a field added to CgConfig later must inherit
         // mod_cfg's value here, and a hand-copied literal would silently take the default.
         let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..mod_cfg }
-        let obj_c = generate_module_object(final_program, m, c_module_header_name(m), obj_cfg)
+        let obj_c = generate_module_object_with(final_program, m, c_module_header_name(m), obj_cfg, facts)
         if diag_ice_count > 0 {
             diag_flush()
             exit(101)
