@@ -1,0 +1,149 @@
+// A per-module build caches one object per unit. An edit to a private function body changes
+// only its own unit C, and leaves the module header the other units include as it was, so
+// the next build compiles only that unit.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"shapes_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/shapes.bl", [
+        #"pub type Shape {"#,
+        #"    name: Str"#,
+        #"    sides: Int"#,
+        #"}"#,
+        #""#,
+        #"pub trait Describe {"#,
+        #"    fn describe(self) -> Str"#,
+        #"}"#,
+        #""#,
+        #"impl Describe for Shape {"#,
+        #"    fn describe(self) -> Str {"#,
+        #"        "{self.name}/{self.sides}""#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn weight(s: Shape) -> Int {"#,
+        #"    s.sides * 10"#,
+        #"}"#,
+        #""#,
+        #"pub fn score(s: Shape) -> Int {"#,
+        #"    weight(s) + 1"#,
+        #"}"#,
+        #""#,
+        #"pub fn first_or[T](xs: List[T], fallback: T) -> T {"#,
+        #"    match xs.get(0) {"#,
+        #"        Some(x) => x"#,
+        #"        None => fallback"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/tally.bl", [
+        #"import shapes.{Shape, Describe, score, first_or}"#,
+        #""#,
+        #"pub fn tally(xs: List[Shape]) -> Map[Str, Int] {"#,
+        #"    let mut m: Map[Str, Int] = Map()"#,
+        #"    for s in xs {"#,
+        #"        m.insert(s.describe(), score(s))"#,
+        #"    }"#,
+        #"    m"#,
+        #"}"#,
+        #""#,
+        #"pub fn widest(xs: List[Shape]) -> Shape {"#,
+        #"    let big = xs.filter(fn(s) { s.sides > 3 })"#,
+        #"    first_or(big, Shape { name: "none", sides: 0 })"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import shapes.{Shape, Describe, first_or}"#,
+        #"import tally.{tally, widest}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let xs = [Shape { name: "tri", sides: 3 }, Shape { name: "sq", sides: 4 }, Shape { name: "hex", sides: 6 }]"#,
+        #"    let m = tally(xs)"#,
+        #"    for k in ["tri/3", "sq/4", "hex/6"] {"#,
+        #"        io.println("{k} -> {m.get(k) ?? -1}")"#,
+        #"    }"#,
+        #"    io.println("widest {widest(xs).describe()}")"#,
+        #"    io.println("first {first_or([7, 8], 0)} {first_or([], \"empty\")}")"#,
+        #"    let names = xs.map(fn(s: Shape) -> Str { s.name })"#,
+        #"    io.println(names.join(","))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with its own object cache, and the unit trace on. The corpus
+// exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes --per-module
+// build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// The units a build compiled, read from its build.units trace: a unit the object cache
+// answered prints "hit", one it compiled prints "compile".
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    // Sorted, so the check does not depend on the order the units start in.
+    let mut i = 1
+    while i < out.len() {
+        let cur = out.get(i).unwrap()
+        let mut j = i
+        while j > 0 && out.get(j - 1).unwrap() > cur {
+            out.set(j, out.get(j - 1).unwrap())
+            j = j - 1
+        }
+        out.set(j, cur)
+        i = i + 1
+    }
+    out
+}
+
+fn build_units(tree: Str) -> List[Str] {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    units_compiled(r)
+}
+
+test "a private body edit recompiles only the unit that holds it" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_private_edit_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build_units(tree)
+    let warm = build_units(tree)
+    let header_before = sh("sha256sum {tree}/out/app.units/shapes.h")
+    shell_exec("sed -i \"s/s.sides \\* 10/s.sides * 100/\" {tree}/app/src/shapes.bl")
+    let edited_src = sh("grep -c \"s.sides \\* 100\" {tree}/app/src/shapes.bl")
+    let edited = build_units(tree)
+    let header_after = sh("sha256sum {tree}/out/app.units/shapes.h")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(edited_src, "1")
+    assert_eq(cold, ["__main__", "shapes", "tally"])
+    assert_eq(warm.len(), 0)
+    assert_eq(header_after, header_before)
+    assert_eq(edited, ["shapes"])
+    assert(out.contains("tri/3 -> 301"), "the edit did not reach the binary: {out}")
+}

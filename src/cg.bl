@@ -45,7 +45,7 @@ import cg_derive.{
     cg_derive_key_table_nodes, cg_derive_reset,
 }
 import ir.{ir_begin_body, ir_block, ir_reset, ir_span, ir_verify}
-import mono.{instances}
+import mono.{instances, named_instance_rows, set_named_instance_rows}
 import typecheck.{TYPE_VOID, TyKind, tc_resolve, tc_tid_kind}
 import cg_stmt.{
     cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
@@ -121,6 +121,7 @@ fn begin_unit(program: Int) ! Diag.Report {
     cg_promote_reset()
     cg_stmt_reset()
     cg_expr_reset()
+    set_named_instance_rows([])
     cg_eff_reset()
 }
 
@@ -193,13 +194,56 @@ fn emit_instance_decls(decl: Int, is_static: Bool) ! Diag.Report {
 // instance is current only for the lowering and the signature that wraps it, and the root
 // is restored immediately after so nothing later reads a declaration through an instance.
 fn emit_instance_bodies(decl: Int, is_static: Bool) ! Diag.Report {
-    let table = instances()
     let rows = instance_rows_of(decl)
     if rows.len() == 0 { return no_instance_bodies(decl) }
-    for row in rows {
-        set_current_inst(row)
-        cg_decl_emit_signature_def(decl, table.get(row).unwrap().c_name, is_static, lower_body(decl))
-        set_current_inst(-1)
+    for row in rows { emit_instance_body(decl, row, is_static) }
+}
+
+fn emit_instance_body(decl: Int, row: Int, is_static: Bool) ! Diag.Report {
+    set_current_inst(row)
+    cg_decl_emit_signature_def(decl, instances().get(row).unwrap().c_name, is_static, lower_body(decl))
+    set_current_inst(-1)
+}
+
+// A unit of the per-module build that links the archive. The archive already holds every
+// non-generic std body, so such a unit writes a std generic's instance only as a private
+// copy, and only the ones its own calls name: writing every row into every unit would
+// compile the whole std instance set once per module.
+fn copies_on_demand(cfg: CgConfig, module_key: Str) -> Bool {
+    module_key != "" && cfg.user_tu_mode != 0
+}
+
+fn without_on_demand_copies(cfg: CgConfig, module_key: Str, decls: List[Int]) -> List[Int] {
+    if !copies_on_demand(cfg, module_key) { return decls }
+    let mut out: List[Int] = []
+    for d in decls {
+        let per_instance = match cg_decl_body_site(d) {
+            BodySite.PerInstance => true
+            _ => false
+        }
+        if !(per_instance && instance_is_private_copy(cfg, d)) { out.push(d) }
+    }
+    out
+}
+
+// The private copies this unit's calls named, and then the ones those copies' own bodies
+// name, until a pass names nothing new. Each one's prototype is already in scope: the
+// header of the module that declares the generic offers every instance as a static
+// declaration.
+fn emit_named_private_copies(cfg: CgConfig) ! Diag.Report {
+    let table = instances()
+    let mut written: Map[Int, Int] = Map()
+    let mut grew = true
+    while grew {
+        grew = false
+        for row in named_instance_rows() {
+            if written.contains_key(row) { continue }
+            written.insert(row, 1)
+            grew = true
+            let decl = table.get(row).unwrap().base_decl_node
+            if !instance_is_private_copy(cfg, decl) { continue }
+            emit_instance_body(decl, row, true)
+        }
     }
 }
 
@@ -580,8 +624,8 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
 // The definition half. Test blocks are not here: they are written beside the entry shim,
 // which is a different unit under the per-module mode.
 fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool) ! Diag.Report {
-    let fns = fns_in_scope(cfg, module_key, shared, false)
-    let methods = methods_in_scope(cfg, module_key, shared, false)
+    let fns = without_on_demand_copies(cfg, module_key, fns_in_scope(cfg, module_key, shared, false))
+    let methods = without_on_demand_copies(cfg, module_key, methods_in_scope(cfg, module_key, shared, false))
     // A unit declares every instance it defines, in its own text, ahead of every body.
     // The declaration half cannot do it: a header is read by units that define nothing,
     // and the archive's header would then offer instances the archive does not have.
@@ -818,8 +862,9 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     begin_unit(program)
     cg_promote_set_trace(cfg.trace_codegen != 0)
     // The entry module's object defines the runtime's storage and bodies, the way it owns
-    // __blink_ev; every other object declares them.
-    let define_storage = defines_runtime_storage(cfg) || module_key == "__main__"
+    // __blink_ev; every other object declares them. A unit that links the archive leaves
+    // them to the archive, which already defines them.
+    let define_storage = defines_runtime_storage(cfg) || (module_key == "__main__" && cfg.user_tu_mode == 0)
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, define_storage, false, "", self_header)
     cg_decl_emit_ev(ev_storage(cfg))
     let own_globals = globals_in_scope(cfg, module_key, false)
@@ -845,6 +890,7 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
     emit_definitions(cfg, module_key, cfg.archive_build_mode != 0)
     if module_key == "__main__" { emit_entry(cfg, module_init_fn_names(cfg, module_key, deferred)) }
+    if copies_on_demand(cfg, module_key) { emit_named_private_copies(cfg) }
     print_take()
 }
 
@@ -859,6 +905,8 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
 // latter calls `begin_unit`, which resets the print buffer this unit has already written
 // into.
 fn module_init_fn_names(cfg: CgConfig, module_key: Str, self_deferred: List[Int]) -> List[Str] ! Diag.Report {
+    // The lowering below is thrown away, so the instances it names are not this unit's.
+    let named = named_instance_rows()
     let mut out: List[Str] = []
     for m in cg_reg_modules() {
         if m == module_key {
@@ -869,6 +917,24 @@ fn module_init_fn_names(cfg: CgConfig, module_key: Str, self_deferred: List[Int]
         if cg_decl_has_deferred_global(g, lower_global_inits(g)) {
             out.push(c_module_init_globals_name(m))
         }
+    }
+    set_named_instance_rows(named)
+    out
+}
+
+// The modules that get an object of their own when the per-module build links the archive,
+// in emit order. A module the archive holds needs one only for the bodies the archive could
+// not hold, the functions that take the evidence vector; most have none.
+pub fn archive_unit_modules(program: Int, cfg: CgConfig) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    for m in enumerate_program_modules(program) {
+        if !cfg.skip_modules.contains_key(m) {
+            out.push(m)
+            continue
+        }
+        let fns = without_on_demand_copies(cfg, m, fns_in_scope(cfg, m, false, false))
+        let methods = without_on_demand_copies(cfg, m, methods_in_scope(cfg, m, false, false))
+        if fns.len() > 0 || methods.len() > 0 { out.push(m) }
     }
     out
 }

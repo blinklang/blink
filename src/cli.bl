@@ -36,7 +36,7 @@ import parser.{
     sublist_length, sublist_get, get_annotation,
     ann_str_val, positional_str_arg, positional_str_arg_count,
 }
-import ast.{NodeKind, dbg_channels, trace_mode}
+import ast.{NodeKind, dbg_channels, dbg_trace, trace_mode}
 import typecheck.{TypeCheck, check_types, strip_module_qualifier, desugar_sealed_ops_calls}
 import compiler.{
     compile_to_program, reset_compiler_state, resolve_module_path,
@@ -45,7 +45,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
-import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules}
+import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, archive_unit_modules}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
 import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced}
 import stdlib_native_deps.{
@@ -475,6 +475,46 @@ fn ensure_deps_resolved() {
     }
 }
 
+// Source to a monomorphized program: everything both build shapes share. Err carries the
+// exit code the build stops with.
+fn compile_front_end(source_path: Str, strict_mode: Int) -> Result[Int, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let final_program = compile_to_program(source_path, 1)
+
+    let _tc_err_count = check_types(final_program)
+
+    check_unused_imports()
+
+    if diag_ice_count > 0 {
+        diag_flush()
+        return Err(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return Err(1)
+    }
+    if diag_warn_count > 0 {
+        diag_flush()
+        if strict_mode != 0 {
+            return Err(1)
+        }
+    }
+
+    desugar_sealed_ops_calls(final_program)
+    analyze_mutations(final_program)
+    analyze_save_restore(final_program)
+    analyze_escapes(final_program)
+    run_mono(final_program)
+    if diag_ice_count > 0 {
+        diag_flush()
+        return Err(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return Err(1)
+    }
+    Ok(final_program)
+}
+
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     if format_flag == "blink" {
         reset_compiler_state()
@@ -501,39 +541,9 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
         write_file(c_path, fmt_output)
         return 0
     }
-    let final_program = compile_to_program(source_path, 1)
-
-    let _tc_err_count = check_types(final_program)
-
-    check_unused_imports()
-
-    if diag_ice_count > 0 {
-        diag_flush()
-        return 101
-    }
-    if diag_count > 0 {
-        diag_flush()
-        return 1
-    }
-    if diag_warn_count > 0 {
-        diag_flush()
-        if strict_mode != 0 {
-            return 1
-        }
-    }
-
-    desugar_sealed_ops_calls(final_program)
-    analyze_mutations(final_program)
-    analyze_save_restore(final_program)
-    analyze_escapes(final_program)
-    run_mono(final_program)
-    if diag_ice_count > 0 {
-        diag_flush()
-        return 101
-    }
-    if diag_count > 0 {
-        diag_flush()
-        return 1
+    let final_program = match compile_front_end(source_path, strict_mode) {
+        Ok(p) => p
+        Err(rc) => return rc
     }
 
     let skip_raw = env.var("BLINK_SKIP_MODULES") ?? ""
@@ -681,6 +691,10 @@ fn has_ccache() -> Int {
 }
 
 pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+    shell_exec(cc_command(args, debug_mode, release_mode, target))
+}
+
+fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str {
     let mut compiler = "cc"
     let mut pipe = "-pipe "
     if target != "" {
@@ -690,7 +704,7 @@ pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int
         compiler = "ccache cc"
     }
     let opt_flags = cc_opt_flags(debug_mode, release_mode).join(" ")
-    shell_exec("{compiler} {pipe}{opt_flags} {args}")
+    "{compiler} {pipe}{opt_flags} {args}"
 }
 
 // The one place a build mode becomes cc optimization flags. The object-cache key reads
@@ -1189,7 +1203,28 @@ fn stamp_blink_version() {
     }
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Report {
+    let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
+    if has_toml == 1 && ffi_libs.len() > 0 {
+        let vrc = validate_ffi_native_deps(ffi_libs)
+        if vrc != 0 {
+            return vrc
+        }
+    }
+
+    if has_toml == 1 && targets.len() > 0 {
+        let first_target = resolve_target_triple(targets.get(0).unwrap())
+        if first_target != "" {
+            let crc = validate_cross_target_deps(first_target)
+            if crc != 0 {
+                return crc
+            }
+        }
+    }
+    0
+}
+
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     shell_exec("rm -f {output_path}")
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -1198,6 +1233,13 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         if arc_rc != 0 {
             return arc_rc
         }
+    }
+    if unit_jobs > 0 {
+        let reason = per_module_fallback_reason(emit_mode, format_flag)
+        if reason == "" {
+            return do_build_units(source_path, output_path, debug_mode, release_mode, targets, json_output, strict_mode, unit_jobs)
+        }
+        io.eprintln("note: --per-module ignored: {reason}; building one C unit")
     }
     let rc = do_compile(source_path, c_path, format_flag, debug_mode, strict_mode)
     if rc != 0 {
@@ -1215,22 +1257,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     let ffi_libs = detect_ffi_libs(c_source)
     let compiler_archive = compiler_archive_of_unit(c_source)
 
-    let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
-    if has_toml == 1 && ffi_libs.len() > 0 {
-        let vrc = validate_ffi_native_deps(ffi_libs)
-        if vrc != 0 {
-            return vrc
-        }
-    }
-
-    if has_toml == 1 && targets.len() > 0 {
-        let first_target = resolve_target_triple(targets.get(0).unwrap())
-        if first_target != "" {
-            let crc = validate_cross_target_deps(first_target)
-            if crc != 0 {
-                return crc
-            }
-        }
+    let vrc = validate_build_deps(ffi_libs, targets)
+    if vrc != 0 {
+        return vrc
     }
 
     if targets.len() <= 1 {
@@ -1284,6 +1313,355 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         io.println("]}")
     }
     return 0
+}
+
+// ── Per-module build (--per-module) ─────────────────────────────────────────
+//
+// One C unit per program module, compiled in parallel and cached one object per unit, so an
+// edit recompiles the units whose C or headers changed rather than the whole program. The
+// units link against the stdlib archive the same as the one-unit build: the archive defines
+// the runtime and every std body it holds, and a unit writes only what the archive cannot
+// hold. See docs/build/per-module-o-default.md.
+
+// How many units a build and run compile at once: 0 without --per-module, which builds one
+// C unit, else --jobs, BLINK_JOBS or the CPU count. A job count that is not a positive
+// integer is an error rather than a silent fallback, so a typo cannot quietly serialise a
+// build. Only a per-module build reads the count, so only it can fail on one.
+fn unit_jobs_from_args(a: Args) -> Int {
+    if !args_has(a, "per-module") { return 0 }
+    let flag = args_get(a, "jobs")
+    let env_val = env.var("BLINK_JOBS") ?? ""
+    let (raw, name) = if flag != "" { (flag, "--jobs") } else { (env_val, "BLINK_JOBS") }
+    if raw != "" {
+        let n = raw.to_int()
+        if n <= 0 || "{n}" != raw.trim() {
+            io.eprintln("error: {name} must be a positive integer, got '{raw}'")
+            exit(1)
+        }
+        return n
+    }
+    let r = process_run("sh", ["-c", "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null"])
+    let n = r.out.trim().to_int()
+    if n > 0 { n } else { 1 }
+}
+
+// Why a --per-module build falls back to one unit, or "" when it does not.
+fn per_module_fallback_reason(emit_mode: Str, format_flag: Str) -> Str {
+    if emit_mode == "c" { return "--emit c writes one C file" }
+    if format_flag == "blink" { return "--format blink formats the source" }
+    if (env.var("BLINK_SKIP_MODULES") ?? "") != "" { return "BLINK_SKIP_MODULES is set" }
+    if (env.var("BLINK_ONLY_MODULE") ?? "") != "" { return "BLINK_ONLY_MODULE is set" }
+    if compiler_archive_env() != "" { return "BLINK_COMPILER_ARCHIVE is set" }
+    ""
+}
+
+type EmittedUnit {
+    module: Str
+    c_bytes: Int
+}
+
+fn units_bail_on_diag() -> Int ! Diag.Report {
+    if diag_ice_count > 0 {
+        diag_flush()
+        return 101
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return 1
+    }
+    0
+}
+
+// The std modules the archive holds are declared, not compiled, as in the one-unit build.
+fn units_cg_config(debug_mode: Int) -> CgConfig {
+    let mut skip: Map[Str, Int] = Map()
+    for k in list_stdlib_module_keys() {
+        skip.insert(k, 1)
+    }
+    CgConfig { debug_mode: if debug_mode != 0 { 1 } else { 0 },
+        trace_codegen: cli_trace_codegen, deterministic: cli_deterministic,
+        emit_only_module: "", skip_modules: skip,
+        user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
+        compiler_archive_modules: Map() }
+}
+
+// Writes one header per module, the aggregator every unit includes, and one .c per unit
+// into dir.
+fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: Int) -> Result[List[EmittedUnit], Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let program = match compile_front_end(source_path, strict_mode) {
+        Ok(p) => p
+        Err(rc) => return Err(rc)
+    }
+    let cfg = units_cg_config(debug_mode)
+    let modules = enumerate_program_modules(program)
+    let erc = units_bail_on_diag()
+    if erc != 0 { return Err(erc) }
+    let mut agg = StringBuilder.new()
+    agg.write("#ifndef BLINK_PROGRAM_ALL_H\n#define BLINK_PROGRAM_ALL_H\n")
+    for m in modules {
+        let header = generate_module_header(program, m, cfg)
+        let hrc = units_bail_on_diag()
+        if hrc != 0 { return Err(hrc) }
+        write_file("{dir}/{m}.h", header)
+        agg.write("#include \"{m}.h\"\n")
+    }
+    agg.write("#endif\n")
+    write_file("{dir}/_blink_all.h", agg.to_str())
+    let unit_modules = archive_unit_modules(program, cfg)
+    let urc = units_bail_on_diag()
+    if urc != 0 { return Err(urc) }
+    let mut out: List[EmittedUnit] = []
+    for m in unit_modules {
+        // Copy-update, so a field added to CgConfig later keeps cfg's value here.
+        let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
+        let c = generate_module_object(program, m, "_blink_all.h", obj_cfg)
+        let orc = units_bail_on_diag()
+        if orc != 0 { return Err(orc) }
+        write_file("{dir}/{m}.c", c)
+        out.push(EmittedUnit { module: m, c_bytes: c.byte_len() })
+    }
+    if diag_warn_count > 0 {
+        diag_flush()
+        if strict_mode != 0 {
+            return Err(1)
+        }
+    }
+    Ok(out)
+}
+
+fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let mut out_dir = path_dirname(output_path)
+    if out_dir == "" {
+        out_dir = "."
+    }
+    let units_dir = "{out_dir}/{strip_extension(path_basename(output_path))}.units"
+    // The units are written into a directory no other build writes, so the bytes a key
+    // hashes are the bytes cc compiles. It replaces units_dir once the build is done, and
+    // the objects carry units_dir's path through -ffile-prefix-map.
+    let mk = process_run("sh", ["-c", "mktemp -d {out_dir}/.units.XXXXXX"])
+    let work = mk.out.trim()
+    if mk.exit_code != 0 || work == "" {
+        io.eprintln("error: cannot make a units directory in {out_dir}")
+        return 1
+    }
+    let units = match do_compile_units(source_path, work, debug_mode, strict_mode) {
+        Ok(u) => u
+        Err(rc) => {
+            shell_exec("rm -rf {work}")
+            return rc
+        }
+    }
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, units, debug_mode, release_mode, targets, json_output, unit_jobs)
+    shell_exec("rm -rf {units_dir} && mv {work} {units_dir}")
+    rc
+}
+
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[EmittedUnit], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report {
+    // The scans below read what the one-unit build reads from its single C file.
+    let c_source = process_run("sh", ["-c", "cat {work}/*.h {work}/*.c"]).out
+    let has_async = detect_async(read_file(source_path))
+    let used_deps = detect_native_deps(c_source)
+    let ffi_libs = detect_ffi_libs(c_source)
+    let vrc = validate_build_deps(ffi_libs, targets)
+    if vrc != 0 {
+        return vrc
+    }
+    if targets.len() <= 1 {
+        let target = if targets.len() == 1 { resolve_target_triple(targets.get(0).unwrap()) } else { "" }
+        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
+        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, target)
+        let inc_flags = resolve_vendored_includes(used_deps, target)
+        let lrc = link_units(output_path, work, units_dir, units, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs)
+        if lrc != 0 {
+            return lrc
+        }
+        if json_output != 0 {
+            io.println("\{\"status\":\"ok\",\"output\":\"{output_path}\"}")
+        } else {
+            io.println("built: {output_path}")
+        }
+        return 0
+    }
+    let first_triple = resolve_target_triple(targets.get(0).unwrap())
+    let inc_flags = resolve_vendored_includes(used_deps, first_triple)
+    if json_output != 0 {
+        io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
+    }
+    let mut i = 0
+    while i < targets.len() {
+        let alias = targets.get(i).unwrap()
+        let triple = resolve_target_triple(alias)
+        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
+        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
+        let out = "{output_path}-{alias}"
+        shell_exec("rm -f {out}")
+        let lrc = link_units(out, work, units_dir, units, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs)
+        if lrc != 0 {
+            return lrc
+        }
+        if json_output != 0 {
+            if i > 0 {
+                io.print_raw(",")
+            }
+            io.print_raw("\"{out}\"")
+        } else {
+            io.println("built: {out}")
+        }
+        i = i + 1
+    }
+    if json_output != 0 {
+        io.println("]}")
+    }
+    0
+}
+
+type UnitCompile {
+    idx: Int
+    exit_code: Int
+    out: Str
+    err_out: Str
+}
+
+// Runs each command under sh with at most `jobs` at a time, starting them in list order.
+// Answers one result per command, indexed by its place in the list.
+fn run_unit_compiles(cmds: List[Str], jobs: Int) -> List[UnitCompile] {
+    let n = cmds.len()
+    let mut by_idx: List[UnitCompile] = []
+    for i in 0..n {
+        by_idx.push(UnitCompile { idx: i, exit_code: -1, out: "", err_out: "" })
+    }
+    if n == 0 { return by_idx }
+    let workers = if jobs < n { jobs } else { n }
+    // A queue the workers drain in order, so the commands start in list order whatever
+    // order the scheduler runs the workers in; one stop mark per worker ends it.
+    let queue = channel.new[Int](buffer: n + workers)
+    for i in 0..n {
+        queue.send(i)
+    }
+    for _ in 0..workers {
+        queue.send(-1)
+    }
+    let results = channel.new[UnitCompile](buffer: n)
+    process_install_signal_forwarding()
+    async.scope {
+        for _ in 0..workers {
+            async.spawn(fn() {
+                for idx in queue {
+                    if idx < 0 { break }
+                    let pid = process_spawn("sh", ["-c", cmds.get(idx).unwrap()])
+                    let r = process_pid_wait(pid)
+                    results.send(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out })
+                }
+                0
+            })
+        }
+    }
+    let mut got = 0
+    for r in results {
+        by_idx.set(r.idx, r)
+        got = got + 1
+        if got == n { break }
+    }
+    by_idx
+}
+
+// Compiles the units the cache cannot answer, largest first, then links every unit's object
+// against the archive.
+fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report {
+    let arc_dir = resolve_archive_dir()
+    let vrc = verify_installed_archive(arc_dir)
+    if vrc != 0 {
+        return vrc
+    }
+    let obj_dir = if target != "" { "{work}/obj-{target}" } else { "{work}/obj" }
+    shell_exec("mkdir -p {obj_dir}")
+    let use_cache = cg_obj_cache_enabled != 0 && build_objcache.cache_enabled()
+    let mut keys: Map[Str, Str] = Map()
+    if use_cache {
+        let mut vendored_dirs: List[Str] = []
+        for part in include_flags.split(" ") {
+            if part.starts_with("-I") {
+                vendored_dirs.push(part.byte_slice(2, part.byte_len()))
+            }
+        }
+        let mut modules: List[Str] = []
+        for u in units {
+            modules.push(u.module)
+        }
+        keys = build_objcache.unit_keys(work, modules, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), cc_opt_flags(debug_mode, release_mode), target)
+    }
+    let mut objs: Map[Str, Str] = Map()
+    let mut misses: List[EmittedUnit] = []
+    for u in units {
+        let key = keys.get(u.module) ?? ""
+        let hit = if key != "" { build_objcache.lookup_obj(key) } else { "" }
+        if hit != "" {
+            dbg_trace("build.units", "hit {u.module}")
+            objs.insert(u.module, hit)
+        } else {
+            misses.push(u)
+        }
+    }
+    // Largest first: the biggest unit bounds the wall time, so it must not start last.
+    let mut i = 1
+    while i < misses.len() {
+        let cur = misses.get(i).unwrap()
+        let mut j = i
+        while j > 0 && misses.get(j - 1).unwrap().c_bytes < cur.c_bytes {
+            misses.set(j, misses.get(j - 1).unwrap())
+            j = j - 1
+        }
+        misses.set(j, cur)
+        i = i + 1
+    }
+    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
+    let mut cmds: List[Str] = []
+    for u in misses {
+        dbg_trace("build.units", "compile {u.module}")
+        cmds.push(cc_command("-c {work}/{u.module}.c -o {obj_dir}/{u.module}.o -ffile-prefix-map={work}={units_dir} {includes}", debug_mode, release_mode, target))
+    }
+    let results = run_unit_compiles(cmds, unit_jobs)
+    let mut failed = 0
+    let mut stored = false
+    for r in results {
+        let m = misses.get(r.idx).unwrap().module
+        if r.exit_code != 0 {
+            io.eprint_raw(r.err_out)
+            io.print_raw(r.out)
+            io.println("error: C compilation failed in unit {m}")
+            failed = failed + 1
+            continue
+        }
+        let local = "{obj_dir}/{m}.o"
+        let key = keys.get(m) ?? ""
+        if key != "" && build_objcache.store(key, local, m, "") {
+            objs.insert(m, "{build_objcache.obj_cache_dir()}/{key}.o")
+            stored = true
+        } else {
+            objs.insert(m, local)
+        }
+    }
+    if failed > 0 {
+        return 1
+    }
+    let mut link_objs: List[Str] = []
+    for u in units {
+        link_objs.push(objs.get(u.module) ?? "")
+    }
+    for o in obj_files {
+        link_objs.push(o)
+    }
+    let incl = if include_flags != "" { " {include_flags}" } else { "" }
+    let effective_link_flags = if link_flags.contains("-pthread") { link_flags } else { "{link_flags} -pthread" }
+    let rc = run_cc("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target)
+    if rc != 0 {
+        io.println("error: C compilation failed while linking {out}")
+        return rc
+    }
+    if stored {
+        build_objcache.maybe_gc()
+    }
+    0
 }
 
 fn find_section_end(content: Str, section: Str) -> Int {
@@ -2325,6 +2703,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
     check_file_exists(source_path)
     apply_cache_flag(a)
+    let unit_jobs = unit_jobs_from_args(a)
     let debug_flag = if args_has(a, "debug") { 1 } else { 0 }
     let release_flag = if args_has(a, "release") { 1 } else { 0 }
     let strict_flag = if args_has(a, "strict") { 1 } else { 0 }
@@ -2390,7 +2769,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag)
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs)
     if rc == 0 {
         if emit_flag == "c" {
             if json_output != 0 {
@@ -2416,6 +2795,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     }
     check_file_exists(source_path)
     apply_cache_flag(a)
+    let unit_jobs = unit_jobs_from_args(a)
     let debug_flag = if args_has(a, "debug") { 1 } else { 0 }
     let release_flag = if args_has(a, "release") { 1 } else { 0 }
     let strict_flag = if args_has(a, "strict") { 1 } else { 0 }
@@ -2452,7 +2832,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag)
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag, unit_jobs)
     if rc != 0 {
         exit(1)
     }
@@ -2524,7 +2904,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         shell_exec("mkdir -p build")
         let c_path = "build/{name}.c"
         let output_path = "build/{name}"
-        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0)
+        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0, 0)
         if rc != 0 {
             exit(1)
         }
@@ -4206,6 +4586,10 @@ fn main() {
     p = command_add_flag(p, "run", "--release", "-R", "Optimized production build (-O2)")
     p = command_add_flag(p, "build", "--no-cache", "", "Bypass the .o cache for this build")
     p = command_add_flag(p, "run", "--no-cache", "", "Bypass the .o cache for this build")
+    p = command_add_flag(p, "build", "--per-module", "", "Compile one C unit per module, in parallel, each cached on its own")
+    p = command_add_flag(p, "run", "--per-module", "", "Compile one C unit per module, in parallel, each cached on its own")
+    p = command_add_option(p, "build", "--jobs", "", "Units --per-module compiles at once (default: CPU count; env BLINK_JOBS)")
+    p = command_add_option(p, "run", "--jobs", "", "Units --per-module compiles at once (default: CPU count; env BLINK_JOBS)")
     p = command_add_flag(p, "test", "--no-cache", "", "Bypass the .o cache for the test build")
     p = command_add_flag(p, "build", "--deterministic", "", "Pin map hash seed = 0 (reproducible iteration order)")
     p = command_add_flag(p, "run", "--deterministic", "", "Pin map hash seed = 0 (reproducible iteration order)")
