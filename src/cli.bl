@@ -37,7 +37,7 @@ import parser.{
     ann_str_val, positional_str_arg, positional_str_arg_count,
 }
 import ast.{NodeKind, dbg_channels, dbg_trace, trace_mode}
-import typecheck.{TypeCheck, check_types, strip_module_qualifier, desugar_sealed_ops_calls}
+import typecheck.{TypeCheck, check_types, strip_module_qualifier}
 import compiler.{
     compile_to_program, reset_compiler_state, resolve_module_path,
     find_src_root, check_unused_imports, check_file_exists,
@@ -60,9 +60,8 @@ import emit_record
 import std_cache_key.{archive_compiler_path, sha256_of_file_first}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
-import mutation_analysis.{analyze_mutations, analyze_save_restore}
-import escape.{analyze_escapes, ffi_scope_resource_name}
-import mono.{run_mono}
+import escape.{ffi_scope_resource_name}
+import check_pipeline.{check_source, run_build_analyses}
 import symbol_index.{collect_effects, si_build, si_reset}
 import query.{query_filtered_layer}
 import diagnostics.{
@@ -502,11 +501,7 @@ fn compile_front_end(source_path: Str, strict_mode: Int) -> Result[Int, Int] ! L
         }
     }
 
-    desugar_sealed_ops_calls(final_program)
-    analyze_mutations(final_program)
-    analyze_save_restore(final_program)
-    analyze_escapes(final_program)
-    run_mono(final_program)
+    run_build_analyses(final_program)
     if diag_ice_count > 0 {
         diag_flush()
         return Err(101)
@@ -3380,14 +3375,6 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 }
 
-// Check reports every error build would, and mono judges some rules per instance. It runs
-// only on a clean front end, as in build.
-fn check_mono(program: Int) ! Diag.Report {
-    if diag_ice_count > 0 || diag_count > 0 { return }
-    desugar_sealed_ops_calls(program)
-    run_mono(program)
-}
-
 fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let source_path = args_positional(a, 0)
     if source_path == "" {
@@ -3423,15 +3410,7 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         if format_flag != "" {
             diag_format = 1
         }
-        let final_program = compile_to_program(source_path, 1)
-
-        check_types(final_program)
-
-        check_unused_imports()
-
-        analyze_escapes(final_program)
-
-        check_mono(final_program)
+        let _ = check_source(source_path)
 
         if diag_ice_count > 0 {
             diag_flush()
@@ -3488,11 +3467,7 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
         exit(1)
     }
 
-    desugar_sealed_ops_calls(final_program)
-    analyze_mutations(final_program)
-    analyze_save_restore(final_program)
-    analyze_escapes(final_program)
-    run_mono(final_program)
+    run_build_analyses(final_program)
     if diag_ice_count > 0 {
         diag_flush()
         exit(101)
@@ -3547,11 +3522,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         exit(1)
     }
 
-    desugar_sealed_ops_calls(final_program)
-    analyze_mutations(final_program)
-    analyze_save_restore(final_program)
-    analyze_escapes(final_program)
-    run_mono(final_program)
+    run_build_analyses(final_program)
     if diag_ice_count > 0 {
         diag_flush()
         exit(101)
@@ -4437,7 +4408,7 @@ fn cmd_ast(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     }
 }
 
-fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse, TypeCheck, Diag.Report {
+fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     let daemon_source = args_positional(a, 0)
     if daemon_source == "" {
         io.println("error: daemon start requires a source file")
