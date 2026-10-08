@@ -41,8 +41,8 @@
 # BLINK_COMPILER_ARCHIVE so each build that imports them links it instead.
 #
 # The per-module mode leaves the compiler modules in each program, so a file
-# that imports them builds the whole compiler in units of its own: about 5 s
-# of cc CPU per file, against 0.6 s when it links the archive. That is the
+# that imports them builds the whole compiler in units of its own: about 3 s
+# per file, against 0.6 s when it links the archive. That is the
 # point of the mode, since those are the largest programs the corpus has.
 #
 # Exit: 2 when the run itself cannot be trusted (no compiler, malformed JSON).

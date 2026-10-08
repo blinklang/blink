@@ -50,7 +50,8 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 | `task suites-in-corpus` | Reads `build/corpus.json` and requires every file of the typecheck and rewrite suites to be there with status `pass`. The corpus runs each of them under gen1, so `task ci` uses this check in place of the gen0 suite runs; `task ci-fast` still runs the suites. | A suite file is missing or did not pass, a suite selects no file, or the JSON is not from gen1 at this commit and blinkc hash. |
 | `task typecheck-suite` | Runs the files in `scripts/typecheck_suite.txt` under gen0. They assert typechecker behaviour by RUNNING, so they need a compiler that can emit; under gen0 the suite measures gen0's typechecker, not this tree's. | Any file does not pass. |
 | `task rewrite-suite` | Runs every rewrite unit-test file under gen0: `tests/test_cg_*.bl`, `test_layout_*.bl`, `test_cname_*.bl`, `test_ir_*.bl`, minus `scripts/rewrite_suite_exclude.txt`. Writes `build/rewrite_suite.json`. | Any file does not pass, a prelude root is missing, one of the four prefixes matches no file, the exclude file is gone, or an exclude line names a file that does not exist or that the glob does not select. |
-| `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke. | Any step fails. |
+| `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke, `corpus-per-module`. | Any step fails. |
+| `task corpus-per-module` | Runs the corpus with `CORPUS_PER_MODULE=1`: every build is per-module and no build links the compiler archive. Writes `build/corpus_per_module.json`, then runs `scripts/corpus_per_module_check.sh`. | A file fails that `scripts/corpus_per_module_known_failures.txt` does not name, a named file passes or does not exist, a passing file did not build in units, or the run does not cover every `tests/test_*.bl` file. |
 
 The formatter step in `task ci` runs the golden and idempotency checks
 only. The semantic check compiles and runs every formatted test, and
@@ -152,6 +153,33 @@ To rerun a subset, write the file names to a list and run
 exits 1 when any listed file fails and 2 when the run itself failed. A full
 run exits 0 with failing files, because corpus-check judges it.
 `scripts/test_corpus.sh` proves these exit codes.
+
+## The per-module corpus
+
+`task corpus` exports `BLINK_COMPILER_ARCHIVE`, and under it `--per-module`
+builds one unit, so that run never takes the per-module path.
+`CORPUS_PER_MODULE=1 scripts/corpus.sh` is a second mode for that path. It
+builds no compiler archive and exports `BLINK_PER_MODULE=1`, so the program
+each file builds is per-module, and so is each program the test builds
+through `blink build`, `run` or `test`. A test that wants one unit asks for it
+in its own command. `BLINK_JOBS` defaults to the CPU count over the worker
+count. The lint does not run in this mode.
+
+Each record has `"per_module": true` when the build left a
+`build/<name>.units/` directory. The header has `per_module` (the mode) and
+`per_module_built` (the count of such records). A subset run writes
+`build/corpus_per_module_subset.json`.
+
+The files that import the compiler modules build the compiler in units of
+their own. The first full run under `blink-gates.slice` took 283 s wall
+and 2442 s CPU, against 70 s and 805 s for `task corpus`. So `task ci` does
+not run it, and `task ci-release` does.
+
+A known failure in this mode goes in
+`scripts/corpus_per_module_known_failures.txt`, with its cause in a comment
+above the path. A `test.failing` block would change the test for both modes.
+`scripts/corpus_per_module_check.sh` fails when a listed file passes, so the
+fix that makes it pass also takes it off the list.
 
 ## The corpus sample
 
