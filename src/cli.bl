@@ -45,7 +45,9 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
-import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_module_header, generate_module_object, enumerate_program_modules, archive_unit_modules}
+import cg.{Codegen, CgConfig, generate, generate_archive_header, generate_types_header, generate_module_headers, generate_module_object, enumerate_program_modules, archive_unit_modules}
+import build_unit_headers.{HeaderIndex, index_headers, unit_includes, splice_includes}
+import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
 import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced}
 import stdlib_native_deps.{
@@ -1358,6 +1360,50 @@ fn per_module_fallback_reason(emit_mode: Str, format_flag: Str) -> Str {
 type EmittedUnit {
     module: Str
     c_bytes: Int
+    // Every header in the units directory this unit includes, which its cache key covers.
+    headers: List[Str]
+}
+
+// The headers of a per-module build: the types header, and each module's two headers in
+// `order`, the order a unit includes them in.
+type UnitHeaders {
+    index: HeaderIndex
+    order: List[Str]
+}
+
+// Writes the types header and each module's two headers into dir.
+fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, dir: Str) -> Result[UnitHeaders, Int] ! Diag.Report, Codegen {
+    let types = generate_types_header(program, cfg)
+    let trc = units_bail_on_diag()
+    if trc != 0 { return Err(trc) }
+    write_file("{dir}/{c_program_types_header_name()}", types)
+    let mut names: List[Str] = []
+    let mut texts: List[Str] = []
+    for m in modules {
+        let hs = generate_module_headers(program, m, cfg)
+        let hrc = units_bail_on_diag()
+        if hrc != 0 { return Err(hrc) }
+        write_file("{dir}/{c_module_header_name(m)}", hs.surface)
+        write_file("{dir}/{c_module_private_header_name(m)}", hs.internal)
+        names.push(c_module_header_name(m))
+        texts.push(hs.surface)
+        names.push(c_module_private_header_name(m))
+        texts.push(hs.internal)
+    }
+    Ok(UnitHeaders { index: index_headers(names, texts), order: names })
+}
+
+// Module m's unit with an include of each header it needs besides its own pub header, and the
+// list of every header in the units directory it then includes. Its private header comes
+// first, since the unit defines what that header declares.
+fn unit_with_includes(c: Str, m: Str, hs: UnitHeaders) -> (Str, List[Str]) {
+    let own = c_module_header_name(m)
+    let own_priv = c_module_private_header_name(m)
+    let mut extra = [own_priv]
+    for h in unit_includes(c, [own, own_priv], hs.index, hs.order) { extra.push(h) }
+    let mut all = [c_program_types_header_name(), own]
+    for h in extra { all.push(h) }
+    (splice_includes(c, own, extra), all)
 }
 
 fn units_bail_on_diag() -> Int ! Diag.Report {
@@ -1385,8 +1431,7 @@ fn units_cg_config(debug_mode: Int) -> CgConfig {
         compiler_archive_modules: Map() }
 }
 
-// Writes one header per module, the aggregator every unit includes, and one .c per unit
-// into dir.
+// Writes the per-module headers and one .c per unit into dir.
 fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: Int) -> Result[List[EmittedUnit], Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
     let program = match compile_front_end(source_path, strict_mode) {
         Ok(p) => p
@@ -1396,17 +1441,10 @@ fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: In
     let modules = enumerate_program_modules(program)
     let erc = units_bail_on_diag()
     if erc != 0 { return Err(erc) }
-    let mut agg = StringBuilder.new()
-    agg.write("#ifndef BLINK_PROGRAM_ALL_H\n#define BLINK_PROGRAM_ALL_H\n")
-    for m in modules {
-        let header = generate_module_header(program, m, cfg)
-        let hrc = units_bail_on_diag()
-        if hrc != 0 { return Err(hrc) }
-        write_file("{dir}/{m}.h", header)
-        agg.write("#include \"{m}.h\"\n")
+    let hs = match write_unit_headers(program, modules, cfg, dir) {
+        Ok(h) => h
+        Err(rc) => return Err(rc)
     }
-    agg.write("#endif\n")
-    write_file("{dir}/_blink_all.h", agg.to_str())
     let unit_modules = archive_unit_modules(program, cfg)
     let urc = units_bail_on_diag()
     if urc != 0 { return Err(urc) }
@@ -1414,11 +1452,12 @@ fn do_compile_units(source_path: Str, dir: Str, debug_mode: Int, strict_mode: In
     for m in unit_modules {
         // Copy-update, so a field added to CgConfig later keeps cfg's value here.
         let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
-        let c = generate_module_object(program, m, "_blink_all.h", obj_cfg)
+        let raw = generate_module_object(program, m, c_module_header_name(m), obj_cfg)
         let orc = units_bail_on_diag()
         if orc != 0 { return Err(orc) }
+        let (c, headers) = unit_with_includes(raw, m, hs)
         write_file("{dir}/{m}.c", c)
-        out.push(EmittedUnit { module: m, c_bytes: c.byte_len() })
+        out.push(EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers })
     }
     if diag_warn_count > 0 {
         diag_flush()
@@ -1585,10 +1624,12 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[EmittedUnit], lin
             }
         }
         let mut modules: List[Str] = []
+        let mut unit_headers: Map[Str, List[Str]] = Map()
         for u in units {
             modules.push(u.module)
+            unit_headers.insert(u.module, u.headers)
         }
-        keys = build_objcache.unit_keys(work, modules, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), cc_opt_flags(debug_mode, release_mode), target)
+        keys = build_objcache.unit_keys(work, modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), cc_opt_flags(debug_mode, release_mode), target)
     }
     let mut objs: Map[Str, Str] = Map()
     let mut misses: List[EmittedUnit] = []
@@ -3390,7 +3431,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
     let modules = enumerate_program_modules(final_program)
     // Gate the module list before the loops below read it. An empty list makes both
     // loops no-ops, so without this an ICE here would leave the command writing only
-    // the aggregator header and exiting 0 -- a build that emitted nothing and said ok.
+    // the types header and exiting 0 -- a build that emitted nothing and said ok.
     if diag_ice_count > 0 {
         diag_flush()
         exit(101)
@@ -3400,35 +3441,13 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         exit(1)
     }
 
-    // First pass: emit each module's header AND build the aggregator
-    // (every module .c #includes this so cross-module fn calls and
-    // typedefs resolve). Each module .h is #ifndef-guarded so multi-include
-    // is safe. The aggregator's own guard prevents recursion when one
-    // module .h transitively includes another (none do today, but
-    // forward-compat). All headers must be on disk before pass 2.
-    let mut agg = StringBuilder.new()
-    agg.write("#ifndef BLINK_PROGRAM_ALL_H\n#define BLINK_PROGRAM_ALL_H\n")
-    let mut mi = 0
-    while mi < modules.len() {
-        let m = modules.get(mi).unwrap()
-        let header = generate_module_header(final_program, m, mod_cfg)
-        if diag_ice_count > 0 {
-            diag_flush()
-            exit(101)
+    let hs = match write_unit_headers(final_program, modules, mod_cfg, out_dir) {
+        Ok(h) => h
+        Err(rc) => {
+            exit(rc)
+            return
         }
-        if diag_count > 0 {
-            diag_flush()
-            exit(1)
-        }
-        write_file("{out_dir}/{m}.h", header)
-        agg.write("#include \"{m}.h\"\n")
-        mi = mi + 1
     }
-    agg.write("#endif\n")
-    write_file("{out_dir}/_blink_all.h", agg.to_str())
-
-    // Second pass: emit each module's .c. Pass the aggregator header as
-    // the self-include so every TU sees every other module's pub surface.
     // The "__main__" entry module owns __blink_ev; everyone else externs it.
     let mut ci = 0
     while ci < modules.len() {
@@ -3436,7 +3455,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         // Copy-update, not a fresh literal: a field added to CgConfig later must inherit
         // mod_cfg's value here, and a hand-copied literal would silently take the default.
         let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..mod_cfg }
-        let obj_c = generate_module_object(final_program, m, "_blink_all.h", obj_cfg)
+        let obj_c = generate_module_object(final_program, m, c_module_header_name(m), obj_cfg)
         if diag_ice_count > 0 {
             diag_flush()
             exit(101)
@@ -3445,7 +3464,8 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
             diag_flush()
             exit(1)
         }
-        write_file("{out_dir}/{m}.c", obj_c)
+        let (c, _) = unit_with_includes(obj_c, m, hs)
+        write_file("{out_dir}/{m}.c", c)
         ci = ci + 1
     }
 

@@ -226,17 +226,20 @@ fn sha_by_name(out: Str) -> Map[Str, Str] {
     m
 }
 
-// The keys of the per-module build's units in dir, by module. A unit includes every header
-// in dir through the aggregator, libblink_std.h and the runtime.h beside it from arc_dir (or
-// the .gch cc reads in place of the header), and the vendored headers, so a key covers all of
-// them along with the unit's own C. The headers are named by their name in dir, not by the
-// path of dir, which differs on every build. A module whose key cannot be built is absent,
-// and its unit compiles without the cache: a key that left out an input it could not read
-// would match an object built from other bytes. Every file is hashed by one process, and the
-// manifests by as few more as the exec argument limit allows, since a build can have many units.
+// The keys of the per-module build's units in dir, by module. A unit includes the headers in
+// dir that unit_headers names for it, libblink_std.h and the runtime.h beside it from arc_dir
+// (or the .gch cc reads in place of the header), and the vendored headers, so a key covers all
+// of them along with the unit's own C, and no other header in dir: one module's header can
+// change without a new key for a unit that does not include it. The headers are named by their
+// name in dir, not by the path of dir, which differs on every build. A module whose key cannot
+// be built is absent, and its unit compiles without the cache: a key that left out an input it
+// could not read would match an object built from other bytes. Every file is hashed by one
+// process, and the manifests by as few more as the exec argument limit allows, since a build
+// can have many units.
 pub fn unit_keys(
     dir: Str,
     modules: List[Str],
+    unit_headers: Map[Str, List[Str]],
     arc_dir: Str,
     vendored_include_dirs: List[Str],
     blinkc_sha: Str,
@@ -273,20 +276,6 @@ pub fn unit_keys(
         }
         headers.push("libblink_std.h.gch={pch_sha}")
     }
-    // Every header in dir is an input of every unit, so one that cannot be read leaves
-    // every unit uncached.
-    let listing = process_run("sh", ["-c", "cd \"{dir}\" && for f in *.h; do [ -e \"$f\" ] && echo \"$f\"; done"])
-    if listing.exit_code != 0 {
-        return keys
-    }
-    for name in listing.out.lines() {
-        if name == "" { continue }
-        let sha = shas.get(name) ?? ""
-        if sha == "" {
-            return keys
-        }
-        headers.push("unit:{name}={sha}")
-    }
     match header_lines_in(vendored_include_dirs) {
         Some(lines) => {
             for line in lines {
@@ -299,7 +288,7 @@ pub fn unit_keys(
     }
     // The inputs every unit shares go into one digest that each unit's manifest names. Put
     // in full in every manifest, the header list grows with units times headers.
-    let mut shared = ["schema:unit-2", "runtime_sha:{runtime_sha}", "blinkc_sha:{blinkc_sha}", "cc_id:{cc_id}", "target:{target}"]
+    let mut shared = ["schema:unit-3", "runtime_sha:{runtime_sha}", "blinkc_sha:{blinkc_sha}", "cc_id:{cc_id}", "target:{target}"]
     for line in sorted_strs(headers) {
         shared.push("import:{line}")
     }
@@ -315,8 +304,21 @@ pub fn unit_keys(
     for m in modules {
         let src_sha = shas.get("{m}.c") ?? ""
         if src_sha == "" { continue }
+        // A unit with no header list would get a key that covers none of its headers.
+        let names = match unit_headers.get(m) {
+            Some(hs) => hs
+            None => continue
+        }
+        let mut text = "mod:{m}\nsrc_sha:{src_sha}\nshared:{shared_sha}"
+        let mut readable = true
+        for name in sorted_strs(names) {
+            let sha = shas.get(name) ?? ""
+            if sha == "" { readable = false }
+            text = "{text}\nunit:{name}={sha}"
+        }
+        if !readable { continue }
         keyed.push(m)
-        manifests.push("mod:{m}\nsrc_sha:{src_sha}\nshared:{shared_sha}")
+        manifests.push(text)
     }
     let mut digests: List[Str] = []
     for batch in exec_sized_batches(manifests) {
