@@ -342,7 +342,7 @@ the ranges of two columns are near.
 `bench/edit_loop/per_module_7f4d7dbb.tsv` hold the rows on the `7f4d7dbb`
 tree. The bench builds the tree it is in, and `7f4d7dbb` adds a unit to
 cli, so the like-for-like columns build the `d1cf8f55` tree with the gen1
-of `d1cf8f55` (before) and of `7f4d7dbb` (after), in the same session:
+of `d1cf8f55` (before) and of `7f4d7dbb` (after), in two runs on one machine on the same day:
 `bench/edit_loop/per_module_d1cf8f55.tsv` and
 `bench/edit_loop/per_module_7f4d7dbb_on_d1cf8f55.tsv`.
 
