@@ -1,0 +1,59 @@
+// unit_keys writes each unit's key manifest into the units dir so that one process can hash
+// them all. A manifest left behind would be a file in the dir that no unit compiles, and the
+// next build would hash it with the units. The dir is relative, as a build's units dir is.
+
+import build_objcache.{unit_keys}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn units_dir(name: Str) -> Str {
+    let dir = ".tmp/_objcache_unit_keys_{name}_{getpid()}"
+    shell_exec("rm -rf {dir} && mkdir -p {dir}/units {dir}/arc")
+    write_file("{dir}/arc/libblink_std.h", "#include \"runtime.h\"\n")
+    write_file("{dir}/arc/runtime.h", "int blink_part(void);\n")
+    write_file("{dir}/units/a.c", "#include \"a.h\"\nint a(void) \{ return 1; }\n")
+    write_file("{dir}/units/a.h", "int a(void);\n")
+    write_file("{dir}/units/b.c", "#include \"b.h\"\nint b(void) \{ return 2; }\n")
+    write_file("{dir}/units/b.h", "int b(void);\n")
+    dir
+}
+
+fn keys_of(dir: Str) -> Map[Str, Str] {
+    let mut headers: Map[Str, List[Str]] = Map()
+    headers.insert("a", ["a.h"])
+    headers.insert("b", ["b.h"])
+    unit_keys("{dir}/units", ["a", "b"], headers, "{dir}/arc", [], "bc", "cc 1", ["-O1"], "")
+}
+
+test "keying the units leaves only the units in the dir" {
+    let dir = units_dir("clean")
+    let keys = keys_of(dir)
+    let left = sh("ls -A {dir}/units | tr '\\n' ' '")
+    shell_exec("rm -rf {dir}")
+    assert_eq((keys.get("a") ?? "").len(), 16)
+    assert_eq((keys.get("b") ?? "").len(), 16)
+    assert_eq(left, "a.c a.h b.c b.h")
+}
+
+test "keying the same units twice gives the same keys" {
+    let dir = units_dir("stable")
+    let first = keys_of(dir)
+    let second = keys_of(dir)
+    shell_exec("rm -rf {dir}")
+    assert_eq((first.get("a") ?? "").len(), 16)
+    assert_eq(first.get("a") ?? "", second.get("a") ?? "")
+    assert_eq(first.get("b") ?? "", second.get("b") ?? "")
+    assert((first.get("a") ?? "") != (first.get("b") ?? ""), "two units with other bytes got one key")
+}
+
+test "editing one unit's header changes only that unit's key" {
+    let dir = units_dir("edit")
+    let before = keys_of(dir)
+    shell_exec("echo '/* edited */' >> {dir}/units/a.h")
+    let after = keys_of(dir)
+    shell_exec("rm -rf {dir}")
+    assert((before.get("a") ?? "") != (after.get("a") ?? ""), "an a.h edit left a's key")
+    assert_eq(before.get("b") ?? "", after.get("b") ?? "")
+}

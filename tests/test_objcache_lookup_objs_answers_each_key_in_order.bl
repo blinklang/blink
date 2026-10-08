@@ -1,0 +1,57 @@
+// lookup_objs answers a list of keys at once: the path of each hit, "" for each miss and
+// for an empty key (a unit with no key), in the order of the keys, so the caller can pair
+// each answer with its unit. A hit's .meta is touched, since the size cap evicts by its
+// mtime, and an entry in use must not be the one evicted.
+
+import build_objcache.{lookup_objs}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A cache entry as store leaves one: the object and its meta, named by the key.
+fn store(scratch: Str, key: Str) {
+    shell_exec("echo {key} > {scratch}/{key}.o && echo \"1 mod_{key} \" > {scratch}/{key}.meta")
+}
+
+fn lookup_in(scratch: Str, keys: List[Str]) -> List[Str] {
+    let old = env.var("BLINK_CACHE_DIR")
+    env.set_var("BLINK_CACHE_DIR", scratch)
+    let out = lookup_objs(keys)
+    match old {
+        Some(v) => env.set_var("BLINK_CACHE_DIR", v)
+        None => env.remove_var("BLINK_CACHE_DIR")
+    }
+    out
+}
+
+test "hits, misses and empty keys come back in the order of the keys" {
+    let scratch = sh("mktemp -d")
+    store(scratch, "1111111111111111")
+    store(scratch, "3333333333333333")
+    let got = lookup_in(scratch, ["1111111111111111", "2222222222222222", "", "3333333333333333"])
+    let hit1 = file_exists(got.get(0).unwrap())
+    let hit3 = file_exists(got.get(3).unwrap())
+    shell_exec("rm -rf {scratch}")
+    assert_eq(got.len(), 4)
+    assert(got.get(0).unwrap().ends_with("1111111111111111.o"), "first key answered {got.get(0).unwrap()}")
+    assert_eq(got.get(1).unwrap(), "")
+    assert_eq(got.get(2).unwrap(), "")
+    assert(got.get(3).unwrap().ends_with("3333333333333333.o"), "last key answered {got.get(3).unwrap()}")
+    assert_eq(hit1, 1)
+    assert_eq(hit3, 1)
+}
+
+test "a hit touches its meta and a miss touches nothing" {
+    let scratch = sh("mktemp -d")
+    store(scratch, "aaaaaaaaaaaaaaaa")
+    let meta = "{scratch}/aaaaaaaaaaaaaaaa.meta"
+    shell_exec("touch -d '1 hour ago' {meta}")
+    let before = sh("stat -c %Y {meta}")
+    let _ = lookup_in(scratch, ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"])
+    let after = sh("stat -c %Y {meta}")
+    let stray = sh("ls {scratch} | grep -c bbbbbbbbbbbbbbbb")
+    shell_exec("rm -rf {scratch}")
+    assert(after.to_int() > before.to_int(), "the hit left its meta at {before}")
+    assert_eq(stray, "0")
+}

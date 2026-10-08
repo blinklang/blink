@@ -1,0 +1,55 @@
+// store_objs installs a list of compiled units at once. Each answer says whether that unit's
+// object is now in the cache, in the order of the units: the caller links the cached path
+// only on true, so a unit whose object could not be moved must answer false and leave no
+// entry another build could hit.
+
+import build_objcache.{store_objs}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn store_in(scratch: Str, keys: List[Str], paths: List[Str], modules: List[Str]) -> List[Bool] {
+    let old = env.var("BLINK_CACHE_DIR")
+    env.set_var("BLINK_CACHE_DIR", scratch)
+    let out = store_objs(keys, paths, modules)
+    match old {
+        Some(v) => env.set_var("BLINK_CACHE_DIR", v)
+        None => env.remove_var("BLINK_CACHE_DIR")
+    }
+    out
+}
+
+test "each moved object is installed with its meta and each missing one is not" {
+    let scratch = sh("mktemp -d")
+    shell_exec("mkdir -p {scratch}/work && echo a > {scratch}/work/a.o && echo c > {scratch}/work/c.o")
+    let got = store_in(scratch,
+        ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"],
+        ["{scratch}/work/a.o", "{scratch}/work/missing.o", "{scratch}/work/c.o"],
+        ["mod_a", "mod_b", "mod_c"])
+    let a_obj = sh("cat {scratch}/aaaaaaaaaaaaaaaa.o")
+    let c_obj = sh("cat {scratch}/cccccccccccccccc.o")
+    let a_meta = sh("cat {scratch}/aaaaaaaaaaaaaaaa.meta")
+    let b_entry = sh("ls {scratch} | grep -c bbbbbbbbbbbbbbbb")
+    let a_left = file_exists("{scratch}/work/a.o")
+    shell_exec("rm -rf {scratch}")
+    assert_eq(got.len(), 3)
+    assert(got.get(0).unwrap(), "a moved object answered false")
+    assert(!got.get(1).unwrap(), "a missing object answered true")
+    assert(got.get(2).unwrap(), "a moved object answered false")
+    assert_eq(a_obj, "a")
+    assert_eq(c_obj, "c")
+    assert(a_meta.ends_with(" mod_a"), "meta reads {a_meta}")
+    assert(a_meta.split(" ").get(0).unwrap().to_int() > 0, "meta has no time: {a_meta}")
+    assert_eq(b_entry, "0")
+    assert_eq(a_left, 0)
+}
+
+test "no units stores nothing" {
+    let scratch = sh("mktemp -d")
+    let got = store_in(scratch, [], [], [])
+    let count = sh("ls -A {scratch} | wc -l")
+    shell_exec("rm -rf {scratch}")
+    assert_eq(got.len(), 0)
+    assert_eq(count, "0")
+}
