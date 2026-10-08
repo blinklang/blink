@@ -1477,10 +1477,15 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             inputs = emit_record.inputs_text(source_path, cfg, strict_mode, sha, get_arg(0))
         }
     }
+    let verify = emit_reuse_verify()
     if inputs != "" {
         match emit_record.reuse(last_dir, dir, inputs, resolve_archive_dir()) {
             Some(r) => {
                 dbg_trace("build.units", "reuse emit")
+                if verify {
+                    let vrc = verify_reused_emit(program, modules, cfg, r.units, dir)
+                    if vrc != 0 { return Err(vrc) }
+                }
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
                 return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true })
@@ -1525,6 +1530,15 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             Err(rc) => return Err(rc)
         }
     }
+    if verify {
+        match taken {
+            Some(t) => {
+                let vrc = verify_units(program, t.units, cfg, facts, hs, sources, dir)
+                if vrc != 0 { return Err(vrc) }
+            }
+            None => {}
+        }
+    }
     let mut shas: Option[Map[Str, Str]] = None
     if inputs != "" {
         // Hashed with the units, so the record can name the inputs text by its sha.
@@ -1566,6 +1580,65 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
     Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable })
+}
+
+// BLINK_EMIT_REUSE_VERIFY=1 emits each unit a build takes from the last one again and fails
+// unless the two are byte-equal. It proves the reuse key in tests; it never changes the C.
+fn emit_reuse_verify() -> Bool {
+    (env.var("BLINK_EMIT_REUSE_VERIFY") ?? "") == "1"
+}
+
+// Emits the headers and every unit a build took whole from the last one again, into a
+// directory of its own, and gives 1 after naming the first file not byte-equal to the one
+// taken. The files taken are links to the last build's, so nothing is written beside them.
+fn verify_reused_emit(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str) -> Int ! Diag.Report, Codegen {
+    let vdir = "{dir}/.verify-headers"
+    shell_exec("mkdir -p \"{vdir}\"")
+    let facts = program_facts(program)
+    let hs = match write_unit_headers(program, modules, cfg, facts, vdir) {
+        Ok(h) => h
+        Err(rc) => {
+            shell_exec("rm -rf \"{vdir}\"")
+            return rc
+        }
+    }
+    let mut rc = 0
+    for f in hs.files {
+        if read_file("{vdir}/{f}") != read_file("{dir}/{f}") {
+            io.eprintln("error: emit reuse verify: header {f} taken from the last build is not the header a cold emit writes")
+            rc = 1
+            break
+        }
+    }
+    shell_exec("rm -rf \"{vdir}\"")
+    if rc != 0 { return rc }
+    let sources = unit_sources(archive_unit_modules(program, cfg))
+    verify_units(program, units, cfg, facts, hs, sources, dir)
+}
+
+// Emits each of units again, into a directory of its own, and gives 1 after naming the first
+// whose C is not byte-equal to the one taken.
+fn verify_units(program: Int, units: List[emit_record.EmittedUnit], cfg: CgConfig, facts: ProgramFacts, hs: UnitHeaders, sources: UnitSources, dir: Str) -> Int ! Diag.Report, Codegen {
+    let vdir = "{dir}/.verify"
+    shell_exec("mkdir -p \"{vdir}\"")
+    let mut rc = 0
+    for u in units {
+        match emit_unit(program, u.module, cfg, facts, hs, sources, vdir) {
+            Ok(_) => {}
+            Err(erc) => {
+                rc = erc
+                break
+            }
+        }
+        if read_file("{vdir}/{u.module}.c") != read_file("{dir}/{u.module}.c") {
+            io.eprintln("error: emit reuse verify: unit {u.module} taken from the last build is not the unit a cold emit writes")
+            rc = 1
+            break
+        }
+        dbg_trace("build.units", "verify unit {u.module} same")
+    }
+    shell_exec("rm -rf \"{vdir}\"")
+    rc
 }
 
 // The loaded sources, as a unit's emit tells which it read.

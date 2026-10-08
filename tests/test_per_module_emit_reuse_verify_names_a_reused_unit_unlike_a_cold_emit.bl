@@ -1,0 +1,117 @@
+// BLINK_EMIT_REUSE_VERIFY=1 makes a per-module build emit again every unit it would take from
+// the last build, and fail, naming the unit, when the two are not byte-equal. It holds for a
+// build that takes some units and emits the rest, and for one that takes every unit. Here the
+// last build's unit of base is changed by hand, and its record made to match, so only the
+// verify can see it.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"emit_verify_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, the module filters, and the verify each
+// build here sets for itself.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_EMIT_REUSE_VERIFY BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build(tree: Str, env_args: Str) -> ProcessResult {
+    blink_in(tree, env_args, "build app/src/main.bl -o {tree}/out/app --per-module")
+}
+
+fn traced(r: ProcessResult, line: Str) -> Bool {
+    "{r.out}\n{r.err_out}".split("\n").contains("[dbg:build.units] {line}")
+}
+
+// Changes base's unit in the last build and its size and sha in the record, so the record
+// still holds for the changed file.
+fn tamper_base_unit(tree: Str) {
+    let units = "{tree}/out/app.units"
+    let before = read_file("{units}/base.c")
+    // The record's files are links in the next build; a new file keeps the cache apart.
+    shell_exec("cp {units}/base.c {units}/base.c.new && printf 'int unit_changed_by_hand;\\n' >> {units}/base.c.new && mv {units}/base.c.new {units}/base.c")
+    assert(read_file("{units}/base.c") != before, "base.c did not change")
+    let size = sh("wc -c < {units}/base.c")
+    let sum = sh("sha256sum {units}/base.c | cut -d' ' -f1")
+    shell_exec("awk -v s={size} -v h={sum} '$1==\"unit\" && $2==\"base\" \{ $3=s \} $1==\"file\" && $2==\"base.c\" \{ $3=h \} \{ print \}' {units}/.emit-record > {units}/.emit-record.new && mv {units}/.emit-record.new {units}/.emit-record")
+}
+
+test "verify emits each taken unit again and names one unlike a cold emit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_emit_reuse_verify_taken_{getpid()}"
+    dev_tree(root, tree)
+    let first = build(tree, "")
+    shell_exec("sed -i 's/\"leaf\"/\"lea2\"/' {tree}/app/src/leaf.bl")
+    let clean = build(tree, "BLINK_EMIT_REUSE_VERIFY=1")
+    tamper_base_unit(tree)
+    shell_exec("sed -i 's/\"lea2\"/\"lea3\"/' {tree}/app/src/leaf.bl")
+    let bad = build(tree, "BLINK_EMIT_REUSE_VERIFY=1")
+    shell_exec("rm -rf {tree}")
+    assert(first.exit_code == 0, "first build failed: {first.out}{first.err_out}")
+    assert(clean.exit_code == 0, "verified build failed: {clean.out}{clean.err_out}")
+    assert(traced(clean, "reuse unit base"), "the leaf edit did not take base: {clean.err_out}")
+    assert(traced(clean, "verify unit base same"), "base was not verified: {clean.err_out}")
+    assert(bad.exit_code != 0, "a changed taken unit passed verify: {bad.err_out}")
+    assert(bad.err_out.contains("emit reuse verify: unit base "), "the error names no unit: {bad.err_out}")
+}
+
+test "verify emits every unit of a build taken whole again and names one unlike a cold emit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_emit_reuse_verify_whole_{getpid()}"
+    dev_tree(root, tree)
+    let first = build(tree, "")
+    let clean = build(tree, "BLINK_EMIT_REUSE_VERIFY=1")
+    tamper_base_unit(tree)
+    let unverified = build(tree, "")
+    tamper_base_unit(tree)
+    let bad = build(tree, "BLINK_EMIT_REUSE_VERIFY=1")
+    shell_exec("rm -rf {tree}")
+    assert(first.exit_code == 0, "first build failed: {first.out}{first.err_out}")
+    assert(clean.exit_code == 0, "verified build failed: {clean.out}{clean.err_out}")
+    assert(traced(clean, "reuse emit"), "the unchanged build was not taken whole: {clean.err_out}")
+    assert(traced(clean, "verify unit base same"), "base was not verified: {clean.err_out}")
+    // Without verify, the record that matches the changed file lets the build take it.
+    assert(unverified.exit_code == 0 && traced(unverified, "reuse emit"), "the build without verify did not take the changed unit: {unverified.err_out}")
+    assert(bad.exit_code != 0, "a changed unit taken whole passed verify: {bad.err_out}")
+    assert(bad.err_out.contains("emit reuse verify: unit base "), "the error names no unit: {bad.err_out}")
+}
