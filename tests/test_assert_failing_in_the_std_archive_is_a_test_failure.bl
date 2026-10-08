@@ -1,0 +1,58 @@
+// An assert that fails inside a non-generic std function runs in the stdlib archive, a
+// different C unit from the test runner. It must reach the runner's per-test frame: the
+// test is reported as failed and the run goes on to the next test. A crash here exits by
+// signal and prints no record.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// binary to `build/<basename>`.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// The lines of `c` that open a function definition whose name has `part` in it.
+fn definitions_naming(c: Str, part: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in c.split("\n") {
+        if line.starts_with(" ") || line.starts_with("#") { continue }
+        if !line.ends_with(") \{") { continue }
+        if line.contains(part) { out.push(line) }
+    }
+    out
+}
+
+test "an assert that fails in the std archive fails its test and the run goes on" {
+    let tag = "std_archive_assert_{getpid()}"
+    let scratch = ".tmp/_test_std_archive_assert_{getpid()}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{tag}.bl"
+    write_file(fixture, [
+        #"import std.testing.{assert_close}"#,
+        #""#,
+        #"test "fails in the std archive" {"#,
+        #"    assert_close(1.0, 2.0, 0.1)"#,
+        #"}"#,
+        #""#,
+        #"test "runs after" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    let r = process_run("build/blink", ["test", "--json", fixture])
+    let user_c = read_file("build/{tag}.c")
+    let archive_syms = sh("nm build/libblink_std.a 2>/dev/null | grep -c ' T blink_std_testing_assert_close$'")
+    shell_exec("rm -rf {scratch} build/{tag} build/{tag}.c")
+    let diag = "exit_code={r.exit_code}; captured:\n{r.out}{r.err_out}"
+
+    // The failing assert is in the archive's unit: the program only declares and calls it.
+    assert(user_c.contains("blink_std_testing_assert_close(1.0, 2.0, 0.1)"), "the program does not call assert_close")
+    assert_eq(definitions_naming(user_c, "blink_std_testing_assert_close(").len(), 0)
+    assert_eq(archive_syms, "1")
+
+    assert_eq(r.exit_code, 1, diag)
+    assert(r.out.contains("\{\"name\":\"fails in the std archive\",\"status\":\"failed\""), "no failed record; {diag}")
+    assert(r.out.contains("assert_close failed"), "no assert_close message; {diag}")
+    assert(r.out.contains("\{\"name\":\"runs after\",\"status\":\"passed\""), "the next test did not run; {diag}")
+    assert(r.out.contains("\"passed\":1,\"failed\":1"), "wrong summary; {diag}")
+}

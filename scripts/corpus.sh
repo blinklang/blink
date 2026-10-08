@@ -141,12 +141,10 @@ if [ -n "$pch_key" ]; then
     fi
 fi
 
-# The roots are the modules the compiler binary imports; the archive holds their
-# import closure. The test helpers stay out, those that import the codegen too:
-# an assert jumps back to the test runner through state each unit keeps for
-# itself, so an assert compiled into the archive jumps through a runner that
-# never ran and crashes the test. A test still links the archive for the
-# compiler modules its helpers import.
+# The roots are the modules the compiler binary imports plus the test helpers
+# that import the codegen; the archive holds their import closure. The helper
+# every runtime test imports, compile_test_helpers, stays out: it imports no
+# compiler module, and a file that links the archive pays to read its header.
 # No fallback when this fails: a run that quietly built each file in one unit
 # would report the old cost as if it were the new.
 carchive="$(pwd)/build/corpus/compiler_archive"
@@ -156,7 +154,7 @@ else
     roots=$(sed -n 's/^import \([a-z_][a-z_0-9]*\).*/\1/p' src/blinkc_main.bl | grep -vx std | sort -u)
     if ! (unset BLINK_ROOT BLINK_COMPILER_ARCHIVE; PATH="$(pwd)/build/corpus/cc:$PATH" \
             "$comp/blink" __build-compiler-archive "$carchive" \
-            $roots) > build/corpus/compiler_archive.log 2>&1 \
+            $roots cg_test_helpers lower_test_helpers cname_test_helpers) > build/corpus/compiler_archive.log 2>&1 \
             || [ ! -f "$carchive/libblink_compiler.a" ]; then
         echo "corpus: ERROR the compiler archive did not build, see build/corpus/compiler_archive.log" >&2
         tail -20 build/corpus/compiler_archive.log >&2
