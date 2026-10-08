@@ -1,0 +1,49 @@
+// The editor shows what `blink build` refuses. The pointee rule of `Ptr[T]` over a type
+// parameter (E0810) is judged per instance in mono, after typecheck, so an LSP that stops at
+// typecheck publishes a clean file the build refuses. Both the first check (didOpen) and the
+// recheck (didSave) must publish it.
+
+let DIR = ".tmp/lsp_mono_diag"
+
+fn bad_src() -> Str {
+    "type Zs \{ zf: Int }\n\n@trusted(audit: \"probe\")\nfn hold[T](_x: T) ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[T] = scope.alloc()\n        io.println(\"\{p.is_null()}\")\n    }\n}\n\nfn main() ! FFI \{\n    hold(Zs \{ zf: 1 })\n}\n"
+}
+
+fn lsp_msg(body: Str) -> Str {
+    let len = body.byte_len()
+    "Content-Length: {len}\r\n\r\n{body}"
+}
+
+fn count_of(hay: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut at = 0
+    while true {
+        match hay.byte_index_of(needle, at) {
+            Some(i) => {
+                n = n + 1
+                at = i + needle.byte_len()
+            }
+            None => { return n }
+        }
+    }
+    n
+}
+
+test "lsp publishes a pointee error that only mono judges" {
+    let _ = process_run("sh", ["-c", "rm -rf {DIR}; mkdir -p {DIR}"])
+    write_file("{DIR}/main.bl", bad_src())
+    let uri = "file://{DIR}/main.bl"
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let initialized = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}")
+    let didopen = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}")
+    let didsave = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\"\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    write_file("{DIR}/input.bin", init.concat(initialized).concat(didopen).concat(didsave).concat(shutdown).concat(exit_msg))
+    let r = process_run("sh", ["-c", "timeout 20 build/blink lsp < {DIR}/input.bin"])
+    let published = count_of(r.out, "publishDiagnostics")
+    let found = count_of(r.out, "\"code\":\"E0810\"")
+    if published != 2 || found != 2 { io.eprintln("lsp out: {r.out}\nlsp err: {r.err_out}") }
+    assert_eq(published, 2)
+    assert_eq(found, 2)
+}

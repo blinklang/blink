@@ -1,0 +1,57 @@
+// `blink check` asks a running daemon before it checks on its own, so the daemon must report
+// every error the build reports. The pointee rule of `Ptr[T]` over a type parameter (E0810) is
+// judged per instance in mono, after typecheck: a daemon that stops at typecheck says clean on
+// a program the build refuses.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/daemon_check_mono"
+
+fn bad_src() -> Str {
+    "type Zs \{ zf: Int }\n\n@trusted(audit: \"probe\")\nfn hold[T](_x: T) ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[T] = scope.alloc()\n        io.println(\"\{p.is_null()}\")\n    }\n}\n\nfn main() ! FFI \{\n    hold(Zs \{ zf: 1 })\n}\n"
+}
+
+fn good_src() -> Str {
+    "@trusted(audit: \"probe\")\nfn hold[T](_x: T) ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[T] = scope.alloc()\n        io.println(\"\{p.is_null()}\")\n    }\n}\n\nfn main() ! FFI \{\n    hold(7)\n}\n"
+}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// The timeout ends a daemon that a failed assert left running.
+fn start_daemon() -> Int {
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && rm -rf .blink && (timeout 120 $B daemon start main.bl > daemon.log 2>&1 &); for i in $(seq 1 400); do [ -S .blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1")
+    r.exit_code
+}
+
+fn stop_daemon() {
+    let _ = sh("B=$(pwd)/build/blink; cd {DIR} && $B daemon stop")
+}
+
+fn daemon_check() -> Str {
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && $B check main.bl 2>&1")
+    r.out
+}
+
+test "daemon check reports a pointee error that only mono judges" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/main.bl", bad_src())
+    assert_eq(start_daemon(), 0)
+    let first = daemon_check()
+    // The source has not changed since the daemon started: it must still report what it found.
+    let again = daemon_check()
+    write_file("{DIR}/main.bl", good_src())
+    let fixed = daemon_check()
+    write_file("{DIR}/main.bl", bad_src())
+    let broken = daemon_check()
+    stop_daemon()
+    if !first.contains("E0810") { io.eprintln("first daemon check: {first}") }
+    assert(first.contains("\"ok\":true"))
+    assert(first.contains("E0810"))
+    assert(again.contains("E0810"))
+    if fixed.contains("E0810") { io.eprintln("daemon check after the fix: {fixed}") }
+    assert(fixed.contains("\"ok\":true"))
+    assert(!fixed.contains("E0810"))
+    assert(broken.contains("E0810"))
+}

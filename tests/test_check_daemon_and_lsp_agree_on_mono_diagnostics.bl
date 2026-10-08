@@ -1,0 +1,113 @@
+// `blink check`, the daemon and the LSP are three ways to ask one question, so they must give
+// one answer. The rule they most easily disagree on is one judged after typecheck: the pointee
+// of `Ptr[T]` over a type parameter (E0810), which mono judges per instance. Each path runs on
+// the same programs and must report the same set of error codes.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/check_paths_agree"
+
+fn bad_src() -> Str {
+    "type Zs \{ zf: Int }\n\n@trusted(audit: \"probe\")\nfn hold[T](_x: T) ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[T] = scope.alloc()\n        io.println(\"\{p.is_null()}\")\n    }\n}\n\nfn main() ! FFI \{\n    hold(Zs \{ zf: 1 })\n}\n"
+}
+
+fn good_src() -> Str {
+    "@trusted(audit: \"probe\")\nfn hold[T](_x: T) ! FFI \{\n    with ffi.scope() as scope \{\n        let p: Ptr[T] = scope.alloc()\n        io.println(\"\{p.is_null()}\")\n    }\n}\n\nfn main() ! FFI \{\n    hold(7)\n}\n"
+}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// Without repeats; same_codes compares two of these as sets.
+fn error_codes(out: Str) -> List[Str] {
+    let needle = "\"code\":\"E"
+    let mut codes: List[Str] = []
+    let mut at = 0
+    while true {
+        match out.byte_index_of(needle, at) {
+            Some(i) => {
+                let start = i + needle.byte_len() - 1
+                let code = out.byte_slice(start, start + 5)
+                if !codes.contains(code) { codes.push(code) }
+                at = start
+            }
+            None => { return codes }
+        }
+    }
+    codes
+}
+
+fn same_codes(a: List[Str], b: List[Str]) -> Bool {
+    if a.len() != b.len() { return false }
+    for c in a {
+        if !b.contains(c) { return false }
+    }
+    true
+}
+
+fn via_check(src: Str) -> Str {
+    let _ = sh("rm -rf {DIR}/cli; mkdir -p {DIR}/cli")
+    write_file("{DIR}/cli/main.bl", src)
+    sh("B=$(pwd)/build/blink; cd {DIR}/cli && $B check --json main.bl 2>&1").out
+}
+
+// The timeout ends a daemon that a failed assert left running.
+fn via_daemon(src: Str) -> Str {
+    let _ = sh("rm -rf {DIR}/dmn; mkdir -p {DIR}/dmn")
+    write_file("{DIR}/dmn/main.bl", src)
+    let started = sh("B=$(pwd)/build/blink; cd {DIR}/dmn && (timeout 120 $B daemon start main.bl > daemon.log 2>&1 &); for i in $(seq 1 400); do [ -S .blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1")
+    if started.exit_code != 0 { return "daemon did not start" }
+    let out = sh("B=$(pwd)/build/blink; cd {DIR}/dmn && $B check main.bl 2>&1").out
+    let _ = sh("B=$(pwd)/build/blink; cd {DIR}/dmn && $B daemon stop")
+    out
+}
+
+fn lsp_msg(body: Str) -> Str {
+    let len = body.byte_len()
+    "Content-Length: {len}\r\n\r\n{body}"
+}
+
+fn via_lsp(src: Str) -> Str {
+    let _ = sh("rm -rf {DIR}/lsp; mkdir -p {DIR}/lsp")
+    write_file("{DIR}/lsp/main.bl", src)
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let didopen = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://{DIR}/lsp/main.bl\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    write_file("{DIR}/lsp/input.bin", init.concat(didopen).concat(shutdown).concat(exit_msg))
+    sh("timeout 20 build/blink lsp < {DIR}/lsp/input.bin").out
+}
+
+fn show(codes: List[Str]) -> Str {
+    "[{codes.join(", ")}]"
+}
+
+fn assert_paths_agree(label: Str, src: Str, want: List[Str]) {
+    let cli = via_check(src)
+    let dmn = via_daemon(src)
+    let lsp = via_lsp(src)
+    let c = error_codes(cli)
+    let d = error_codes(dmn)
+    let l = error_codes(lsp)
+    let ok_c = same_codes(c, want)
+    let ok_d = same_codes(d, want)
+    let ok_l = same_codes(l, want)
+    if !ok_c || !ok_d || !ok_l {
+        io.eprintln("FAIL {label}: want {show(want)}; check {show(c)}, daemon {show(d)}, lsp {show(l)}")
+        io.eprintln("check: {cli}\ndaemon: {dmn}\nlsp: {lsp}")
+    }
+    assert(ok_c)
+    assert(ok_d)
+    assert(ok_l)
+}
+
+test "check, daemon and lsp report the same mono-only error" {
+    let _ = sh("mkdir -p {DIR}")
+    assert_paths_agree("bad pointee", bad_src(), ["E0810"])
+}
+
+test "check, daemon and lsp agree that a legal pointee instance is clean" {
+    let _ = sh("mkdir -p {DIR}")
+    assert_paths_agree("legal pointee", good_src(), [])
+}
