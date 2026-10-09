@@ -487,7 +487,7 @@ panic: write to a List that a spawned task can read
   = help: await the task before this write
 ```
 
-The rule for the state of a handler in force at the spawn site (§4.13) is not yet decided.
+A synchronized object (§3.6 *Synchronized objects*) is not frozen. A task and its spawner may both use a captured `Channel`.
 
 **Lint.** `warning[SpawnCaptureMutAlias]` fires on a write through a `let mut` that directly aliases a captured `let` (for example `let mut ys = xs`), when the write is inside the `async.scope` after the spawn and before the `h.await`. The check is not complete. It does not see an alias made through a call result (`id(xs)`), a struct literal (`W { xs: xs }`) or a `mut` parameter. A clean `blink check` does not prove that no write panics. The freeze is the guarantee.
 
@@ -501,6 +501,39 @@ async.spawn(fn() {
 ```
 
 `ch.send` copies each shared cell the sent value reaches, so the receiver gets its own (§4.13 *Channel operations*).
+
+**Handlers in a spawned task.** A task performs effect operations with the handlers in force at its `async.spawn` site (§4.13). A handler in force there is not a capture, so the freeze does not cover it. A handler in force at an `async.spawn` site whose captures reach a shared cell (§3.6 *Shared cells*) is *homed*:
+
+- Its ops run on the task that ran its `with`, the *home task*. An op from another task waits until the home task runs it, then returns its result to that task.
+- The home task runs waiting ops whenever it blocks in a blocking operation that the runtime provides: `.await`, `recv`, `send`, the exit of an `async.scope`, `time.sleep`, and blocking I/O such as a read or an accept. A foreign call (`@ffi`) does not run them.
+- While an op of a homed handler runs on the home task, the waiting ops of that same handler do not run. Waiting ops of other homed handlers may run. So each op sees its handler's state as the last op left it.
+
+The state of a homed handler is only ever changed by its home task, so a read of that state in the home task gives the same result on every run:
+
+```blink
+import std.testing.{capture_log}
+
+fn main() {
+    let msgs: List[Str] = []
+    with capture_log(msgs) {       // capture_log reaches msgs, so it is homed on main's task
+        async.scope {
+            let h = async.spawn(fn() {
+                io.log("task started")
+                21 * 2
+            })
+            let n = h.await        // main's task runs the waiting log op here
+            io.log("got {n}")
+        }
+    }
+    io.println("{msgs.len()}")     // 2, on every run
+}
+```
+
+A home task that computes for a long time, or that blocks in a foreign call, delays each waiting op until it next blocks in the runtime.
+
+An op body that blocks can wait on a task that waits on an op of the same handler. If the op body waits with `.await` on a task, or exits an `async.scope` that joins it, and that task (directly, or through the tasks it awaits) has an op of the same handler waiting, the runtime panics. The message names the `with` site of the handler, the op, and the `async.spawn` site of the task. Other wording is not specified.
+
+A cycle through a channel has no task to name. If the op body blocks in `recv` or `send`, and only a task that waits on an op of the same handler would end that wait, the two deadlock. The runtime does not detect every such cycle.
 
 #### Closures and Scoped Resources
 
@@ -526,10 +559,11 @@ Same logic applies to arena-allocated values — closures capturing arena bindin
 - No explicit capture syntax (no `move`, no capture lists)
 - `async.spawn` closures: immutable captures only. `let mut` captures are compile error E0650
 - `async.spawn` freezes each shared cell its captures reach until the spawner joins the task; a write to a frozen cell panics
+- A handler in force at an `async.spawn` site whose captures reach a shared cell is homed: its ops run on the task that ran its `with`
 - `Closeable`/arena captures: existing escape rules (E0601/E0700) apply transitively through closures
 - Capture mode is not part of the function type
 
-**Panel vote:** Shared reference 3-2 (PLT/AI/DevOps for shared; Sys/Web for by-value). No explicit syntax 4-1 (DevOps dissented for `move`). Spawn restriction 3-2 (PLT/DevOps/AI for compile error; Sys/Web for auto-copy). See [DECISIONS.md](../DECISIONS.md). Shared cells in a spawned task: freeze until join 4-2 (Web/AI for a copy at spawn); `SpawnCaptureMutAlias` warning 4-2 (Sys/DevOps for an error); copy at `ch.send` 5-1; E0650 help 5-1. See [decisions/spawn-shared-cell-freeze.md](../decisions/spawn-shared-cell-freeze.md).
+**Panel vote:** Shared reference 3-2 (PLT/AI/DevOps for shared; Sys/Web for by-value). No explicit syntax 4-1 (DevOps dissented for `move`). Spawn restriction 3-2 (PLT/DevOps/AI for compile error; Sys/Web for auto-copy). See [DECISIONS.md](../DECISIONS.md). Shared cells in a spawned task: freeze until join 4-2 (Web/AI for a copy at spawn); `SpawnCaptureMutAlias` warning 4-2 (Sys/DevOps for an error); copy at `ch.send` 5-1; E0650 help 5-1. See [decisions/spawn-shared-cell-freeze.md](../decisions/spawn-shared-cell-freeze.md). `Channel[T]` and `Handle[T]` are synchronized objects 6-0; homed handlers 6-0; an await-shape cycle on a homed handler panics 3-3, user tiebreak (PLT/Min/AI for a stated deadlock). See [decisions/channel-handle-synchronized-objects.md](../decisions/channel-handle-synchronized-objects.md).
 
 ### 2.9 If/Else Expressions
 
