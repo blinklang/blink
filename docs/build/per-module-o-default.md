@@ -511,8 +511,8 @@ binary as typed, the compiler's sha256 and its env but `PWD`) and front-end
 settings (`--strict-struct-layout`, `BLINK_TRACE`, emit reuse) are its own.
 The worker of the entry rechecks if an input changed, then forks a child
 that builds from the program it checked: the child skips the front end and
-runs mono, the analyses, emit, unit reuse, cc and link. The worker relays the
-child's stdout, stderr and exit code. For `run`, the client runs the program itself, so the program's stdin,
+runs mono, the analyses, emit, unit reuse, cc and link. The worker sends the
+client the child's stdout, stderr and exit code. For `run`, the client runs the program itself, so the program's stdin,
 args, env, cwd and exit code are the client's. A client the daemon does not
 serve, or a child that declines (deps to resolve, a stale dev archive, a path
 that needs a second front end), builds cold.
@@ -680,9 +680,20 @@ The daemon is now a router and a set of workers:
   and its target are two keys.
 - For a new key, the router forks a worker. The worker checks that entry and
   serves it as the daemon served its one entry before. Its socket and files
-  are in `.blink/w<router pid>-<k>/`. The router forks a relay for each
-  request; the relay sends the request to the worker and the reply to the
-  client, so the router does not wait on a check or a build.
+  are in `.blink/w<router pid>-<k>/`.
+- The router does not wait on a check, a build or a query. It replies with
+  the name of the worker that serves the request:
+  `{"ok":false,"served":0,"worker":"w<router pid>-<k>"}`. The client sends
+  the same request to `.blink/w<router pid>-<k>/daemon.sock` and uses the
+  reply of the worker. `daemon_send` in `src/daemon.bl` does this for
+  `blink check`, `build`, `run` and `query`, the only clients of the
+  socket. It follows one redirect only. A second redirect, or a worker that
+  is gone, gives no reply, and the client runs cold.
+- A client from before this change does not follow the redirect. For a
+  check, build or run it reads `"served":0` as a request the daemon did not
+  serve, and runs cold, so its output stays correct. For a query it prints
+  the redirect as its answer. Run `blink daemon stop` and start the daemon
+  again after an upgrade.
 - A worker checks in the client's directory, with the entry as the client
   typed it, since a diagnostic spells its file relative to both. A new
   spelling of the same entry makes the worker check again (about 0.4 s on

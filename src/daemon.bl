@@ -16,9 +16,9 @@ effect Daemon {
 //
 // The front end keeps its state in globals, so one process holds one checked program. The
 // daemon is a router, which runs no front end, and one worker per entry file, which the router
-// forks the first time a client names that entry. The router hands a check, build or query to
-// a relay it forks, which sends it to the entry's worker and copies the reply back, so a
-// client speaks to one socket and the router serves on while a worker checks or builds.
+// forks the first time a client names that entry. The router replies to a check, build or
+// query with the name of the entry's worker, and the client sends the request there
+// (daemon_send), so the router serves on while a worker checks or builds.
 // A worker is a single-threaded event loop: accept connection, read JSON request,
 // dispatch (check/build/query/status/stop), respond, check file watcher.
 // A check runs check_pipeline.check_source, the check `blink check` runs.
@@ -731,9 +731,8 @@ type DaemonSpawn {
 
 // What the router holds. entries are the workers that serve; ended are those it stopped to
 // make room, whose counts it holds in retired_*, until it reaps them. stops are the clients
-// of a stop, held until every worker and relay ends, and held the builds that came meanwhile,
-// which then go to build cold, once no build of the daemon writes beside them. relays are the
-// pids of the relays the router has yet to reap.
+// of a stop, held until every worker ends, and held the builds that came meanwhile, which then
+// go to build cold, once no build of the daemon writes beside them.
 type DaemonRoute {
     entries: List[DaemonEntry]
     ended: List[DaemonEntry]
@@ -747,14 +746,13 @@ type DaemonRoute {
     retired_builds: Int
     stops: List[Int]
     held: List[Int]
-    relays: List[Int]
 }
 
-// What routing a request leaves the router with: the reply to send, the worker to relay the
-// request to, or, in a worker it forked, the entry to serve.
+// What routing a request leaves the router with: the reply to send, the worker to send the
+// client to, or, in a worker it forked, the entry to serve.
 type RouteTurn {
     Answer(text: Str)
-    Relay(name: Str)
+    Redirect(name: Str)
     Serve(spawn: DaemonSpawn)
 }
 
@@ -842,40 +840,15 @@ fn daemon_close_router_fds(r: DaemonRoute) {
     }
 }
 
-// Sends request to the worker named name, and its reply to the client, from a relay the
-// router forks, so the router serves on while the worker checks or builds. A relay that gets
-// no reply closes the client's connection with none, and the client then checks or builds
-// cold.
-fn daemon_relay(route: DaemonRoute, name: Str, request: Str, client_fd: Int) -> DaemonRoute ! IO {
-    let mut r = route
-    let worker_fd = unix_socket_connect(path_join(daemon_dir(), "{name}/daemon.sock"))
-    if worker_fd < 0 {
-        daemon_reply(client_fd, daemon_not_served("the daemon could not reach the worker of this entry"))
-        return r
-    }
-    // The relay inherits what stdout holds unflushed, and would print it again.
-    io.write("")
-    let pid = daemon_fork().to_int()
-    if pid == 0 {
-        daemon_close_router_fds(r)
-        let reply = if socket_write(worker_fd, request.concat("\n")) >= 0 { socket_read_line(worker_fd) } else { "" }
-        unix_socket_close(worker_fd)
-        if reply != "" {
-            daemon_reply(client_fd, reply)
-        } else {
-            unix_socket_close(client_fd)
-        }
-        // As in a worker, main's epilogue would wait on pool threads that only the router has.
-        exit(0)
-    }
-    unix_socket_close(worker_fd)
-    if pid < 0 {
-        daemon_reply(client_fd, daemon_not_served("the daemon could not fork a relay"))
-        return r
-    }
-    unix_socket_close(client_fd)
-    r.relays.push(pid)
-    r
+// The reply that sends a client to the worker named name. It says not served, so a client
+// that does not follow it checks or builds cold.
+fn daemon_redirect(name: Str) -> Str {
+    json_clear()
+    let reply = json_new_object()
+    json_set(reply, "ok", json_new_bool(0))
+    json_set(reply, "served", json_new_int(0))
+    json_set(reply, "worker", json_new_str(name))
+    json_encode(reply)
 }
 
 // Ends the worker used longest ago, past the home one, while the router holds max of them,
@@ -963,7 +936,7 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
     }
     r.entries = kept
     if found != "" {
-        return (r, RouteTurn.Relay(found))
+        return (r, RouteTurn.Redirect(found))
     }
     // The loader exits on a missing entry file, which would end the worker on its first check.
     if file_exists(key) != 1 {
@@ -981,7 +954,7 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
     if why != "" {
         return (r, RouteTurn.Answer(daemon_not_served(why)))
     }
-    (r, RouteTurn.Relay(r.entries.get(r.entries.len() - 1).unwrap().name))
+    (r, RouteTurn.Redirect(r.entries.get(r.entries.len() - 1).unwrap().name))
 }
 
 // The daemon's status: the router's own fields, and the sum of its workers' counts, with the
@@ -1015,7 +988,7 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
     "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{symbols},\"files\":{files},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"entries\":{entries},\"builds\":{served},\"checks\":{checks}}"
 }
 
-// Reaps each worker that ended, and removes its files, and each relay that ended.
+// Reaps each worker that ended, and removes its files.
 fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
     let mut r = route
     let mut live: List[DaemonEntry] = []
@@ -1036,13 +1009,6 @@ fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
         }
     }
     r.ended = ending
-    let mut relaying: List[Int] = []
-    for p in r.relays {
-        if reap(p) == -2 {
-            relaying.push(p)
-        }
-    }
-    r.relays = relaying
     r
 }
 
@@ -1077,10 +1043,10 @@ fn daemon_route_stop(route: DaemonRoute, client_fd: Int) -> DaemonRoute {
 }
 
 // Returns, in a worker it forked, the entry to serve, and None in the router once it stops.
-// While a stop waits on its workers and relays, or a worker it ended has yet to be reaped,
+// While a stop waits on its workers, or a worker it ended has yet to be reaped,
 // the accept waits 1 ms at most, so the stop ends as soon as the last of them does.
 fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
-    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, stops: [], held: [], relays: [] }
+    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, stops: [], held: [] }
     // The home worker checks the entry at once, so the first request finds it checked.
     let home_key = daemon_entry_key(r.home_cwd, r.home_path)
     let (first, home, why) = daemon_spawn(r, home_key, r.home_cwd, r.home_path, true, -1)
@@ -1093,7 +1059,7 @@ fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
     }
     while daemon_running == 1 {
         r = daemon_reap_workers(r)
-        if r.stops.len() > 0 && r.entries.len() == 0 && r.ended.len() == 0 && r.relays.len() == 0 {
+        if r.stops.len() > 0 && r.entries.len() == 0 && r.ended.len() == 0 {
             for h in r.held {
                 daemon_reply(h, daemon_not_served("the daemon is stopping"))
             }
@@ -1122,7 +1088,7 @@ fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
             r = next
             match turn {
                 Serve(s) => return Some(s)
-                Relay(name) => r = daemon_relay(r, name, request, client_fd)
+                Redirect(name) => daemon_reply(client_fd, daemon_redirect(name))
                 Answer(text) => daemon_reply(client_fd, text)
             }
         } else if req_type == "status" {
@@ -1201,6 +1167,47 @@ fn daemon_dir() -> Str {
 
 pub fn daemon_socket_path() -> Str {
     path_join(daemon_dir(), "daemon.sock")
+}
+
+// Sends request on fd, a connection to the project's daemon, closes fd, and returns the reply,
+// or "" when none came. The router replies to a check, build or query with the name of the
+// worker that serves its entry, and the request goes there once. A worker that is gone by
+// then, or a second redirect, gives "", and the client runs cold.
+pub fn daemon_send(fd: Int, request: Str) -> Str {
+    let line = request.concat("\n")
+    if socket_write(fd, line) < 0 {
+        unix_socket_close(fd)
+        return ""
+    }
+    let reply = socket_read_line(fd)
+    unix_socket_close(fd)
+    let worker = daemon_worker_of(reply)
+    if worker == "" {
+        return reply
+    }
+    let worker_fd = unix_socket_connect(path_join(daemon_dir(), "{worker}/daemon.sock"))
+    if worker_fd < 0 {
+        return ""
+    }
+    if socket_write(worker_fd, line) < 0 {
+        unix_socket_close(worker_fd)
+        return ""
+    }
+    let answer = socket_read_line(worker_fd)
+    unix_socket_close(worker_fd)
+    if daemon_worker_of(answer) != "" { "" } else { answer }
+}
+
+// The worker a reply sends the client to, or "". A name with a `/` or `..` is no worker of
+// this daemon's .blink/.
+fn daemon_worker_of(reply: Str) -> Str {
+    if !reply.contains("\"worker\"") {
+        return ""
+    }
+    json_clear()
+    let root = json_parse(reply)
+    let name = if root < 0 { "" } else { json_as_str(json_get(root, "worker")) }
+    if name.contains("/") || name.contains("..") { "" } else { name }
 }
 
 // ── Startup ─────────────────────────────────────────────────────────
