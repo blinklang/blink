@@ -535,6 +535,44 @@ then a `blink check` through the daemon takes 0.397 s median wall and 42 ticks
 of daemon CPU with it on, and 0.394 s and 43 ticks with it off (an empty
 `BLINK_CACHE_DIR`), 6 edits each.
 
+While a build child runs, the daemon serves on: a status, check or query gets
+its answer at once, and the daemon does not poll for edits. Each turn it reaps
+the child if it ended (`waitpid` with `WNOHANG`), then waits on its socket for
+1 ms at most. A build client so waits at most 1 ms past the child's exit, plus
+the one request the daemon serves then. The runtime has no wait on both the
+socket and the child: `SIGCHLD` is off, and a pipe from the child needs
+`Ptr.offset` on the `int[2]` that `pipe()` fills, which it rejects. A first
+try woke on a unix socket pair through a private listener file. It cost a
+listener, a connect and an accept per build, and the first `std.libc` import
+in src, to save under 1 ms, so the daemon ticks. Waking on the child's exit
+is a follow-up.
+
+Two builds of one entry write the same units dir and program, so a build that
+comes while a child runs waits in a queue, oldest first, and runs when the
+child ends. A stop that comes then lets the child end, since a killed build
+would leave its cc and ld writing the files the client's cold build writes
+next. The daemon then sends each queued build to build cold ("the daemon is
+stopping"), replies to the stop and exits. `blink daemon status` gives
+`building` (0 or 1), `queued` and `stopping` before `builds` and `checks`.
+
+What a user sees while a build runs through the daemon:
+
+- `blink check`, `blink daemon status` and editor queries reply at once, from
+  the files as they are. A check may recheck; the child builds from the
+  program it had at the fork, and the next build compares bytes again first.
+- A second `blink build` or `blink run` waits for the running build, then
+  runs. Its output is the same as a cold build's.
+- `blink daemon stop` waits for the running build to end, then stops. Builds
+  that were queued build cold.
+- A client that quits mid-build leaves the daemon serving. The daemon reaps
+  the child and removes its `.blink/build-<n>.*` files.
+- A daemon killed mid-build (`kill -9`, a crash) can leave
+  `.blink/build-<n>.*` files. The next daemon does not sweep them at start: it
+  cannot tell them from the files of another daemon that serves the same dir,
+  and they are small, so a sweep adds risk for no gain.
+- Two cold builds of one output at once, outside the daemon, can still race
+  on the swap of the units dir. That is a separate bug.
+
 `task bench-edit-loop` on the gen1 `blink` built from `a6b467cb` (before) and
 from `b809e4a1` (after), 5 reps, 12 cores, under `blink-gates.slice`, back to
 back on one machine, all on the `eea901c6` tree. The daemon column is
@@ -578,7 +616,8 @@ files of those shas hold the rows.
   the cold row.
 - Without a daemon, each row is within the spread of its before row, or
   0.003 s from it.
-- The daemon serves one build at a time; a second client waits for it.
+- The daemon runs one build at a time; a build sent during a build waits for
+  it. Other requests do not wait (see below).
 - With no wait between the edit and the build (`BENCH_SETTLE=0`, tree
   `a0d2bbb0`), the body-cname build through the daemon takes 1.083 s
   [1.061-1.116], 0.19 s over the cold row above (an earlier run on the
@@ -586,6 +625,45 @@ files of those shas hold the rows.
   rechecks (about 0.4 s), then builds. With a 1 s wait on the same binary it
   takes 0.680 s [0.641-0.718]. `per_module_daemon_settle0_a0d2bbb0.tsv` and
   `per_module_daemon_settle1_a0d2bbb0.tsv` hold the rows.
+
+Serve during a build. A `blink daemon status` sent 0.1 s into a build through
+the daemon on `src/cli.bl` (tree `2037f4d5`, 5 builds) took 566-621 ms on the
+gen1 `blink` built from `2037f4d5`: the daemon waited in `waitpid` until the
+build ended. On the gen1 `blink` built from `35662915` it takes 2-3 ms, the
+same as with no build. The builds take 670-724 ms before and 662-724 ms after.
+
+`task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 5 reps, 12 cores,
+under `blink-gates.slice`, back to back on the `35662915` tree, on the gen1
+`blink` built from `2037f4d5` (before) and then from `35662915` (after). Median
+wall seconds [min-max]. `per_module_daemon_settle1_2037f4d5.tsv` and
+`per_module_daemon_settle1_35662915.tsv` hold the rows.
+
+| target | case | before | after |
+|---|---|---|---|
+| cli | nochange | 0.182 [0.180-0.189] | 0.187 [0.181-0.190] |
+| cli | body-cname | 0.535 [0.511-0.547] | 0.538 [0.532-0.546] |
+| cli | body-typecheck | 2.881 [2.857-2.906] | 2.876 [2.867-2.915] |
+| cli | pubfn-cname | 1.637 [1.606-1.672] | 1.628 [1.606-1.655] |
+| cli | run-body-cname | 0.591 [0.575-0.878] | 0.567 [0.561-0.869] |
+| cli | test-body-cname | 0.483 [0.480-0.485] | 0.481 [0.477-0.485] |
+| cli | cold-obj | 3.426 [3.419-3.549] | 3.431 [3.414-3.597] |
+| cli | cold-all | 6.037 [6.025-6.064] | 6.053 [6.036-6.068] |
+| small | nochange | 0.072 [0.070-0.073] | 0.073 [0.072-0.074] |
+| small | body-inventory | 0.126 [0.123-0.129] | 0.129 [0.124-0.130] |
+| small | pubfn-model | 0.130 [0.127-0.131] | 0.130 [0.128-0.132] |
+| small | run-body-inventory | 0.131 [0.128-0.133] | 0.133 [0.129-0.134] |
+| small | test-body-inventory | 0.137 [0.136-0.138] | 0.137 [0.135-0.140] |
+| small | cold-obj | 0.129 [0.128-0.132] | 0.128 [0.126-0.133] |
+
+- Each row is within the spread of its before row. The tick adds about 0.5 ms
+  on average past the child's exit, under the noise.
+- Four cli runs of 11 reps each, before, after, before, after
+  (`per_module_daemon_settle1_cli_reps11_run<n>_<sha>.tsv`), over 22 builds
+  each: body-cname 0.5605 [0.531-0.598] before and 0.5540 [0.538-0.578]
+  after, pubfn-cname 1.7215 [1.629-1.779] and 1.6775 [1.621-1.757], and
+  run-body-cname 0.6130 [0.600-0.995] and 0.6200 [0.576-0.988].
+- The daemon spends no more CPU in a build: over 5 builds of `src/cli.bl` its
+  own CPU time is 221 and 220 ticks (of 10 ms) before, and 220 and 221 after.
 
 ### Unit headers from one walk
 

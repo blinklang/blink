@@ -17,7 +17,8 @@ effect Daemon {
 // Single-threaded event loop: accept connection, read JSON request,
 // dispatch (check/build/query/status/stop), respond, check file watcher.
 // A check runs check_pipeline.check_source, the check `blink check` runs.
-// A build runs in a child the daemon forks, which builds from the program the last check holds.
+// A build runs in a child the daemon forks, which builds from the program the last check holds,
+// and the loop serves on while the child runs.
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -67,6 +68,34 @@ type DaemonCheck {
 
 // The last check, which holds until an input changes.
 let mut daemon_last: Option[DaemonCheck] = None
+
+// A build child the daemon forked and has not reaped, and what it owes the client: the files
+// the child prints to and the connection the reply goes to.
+type DaemonChild {
+    pid: Int
+    client_fd: Int
+    out: Str
+    err: Str
+    declined: Str
+}
+
+// A request the daemon holds until its build child ends, with the connection it came on.
+type DaemonHeld {
+    request: Str
+    client_fd: Int
+}
+
+// What the loop holds about builds. child is the one it forked and has not reaped. Two builds
+// of one entry write the same units dir and program, and a client sent to build cold would
+// write them beside the child, so a build that comes while a child runs waits in queue, oldest
+// first, for its turn. stops came while a child ran; the daemon answers them and ends once the
+// child does. seq numbers each build's files, so no reply reads another build's output.
+type DaemonBuilds {
+    child: Option[DaemonChild]
+    queue: List[DaemonHeld]
+    stops: List[Int]
+    seq: Int
+}
 
 // ── Extract request type ────────────────────────────────────────────
 
@@ -196,7 +225,7 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Pa
 fn daemon_fork() -> I32 ! FFI {}
 
 @ffi("waitpid", header: "sys/wait.h")
-@trusted(audit: "Wraps waitpid(2). status is one I32 cell from ffi.scope(); options is fixed to 0.")
+@trusted(audit: "Wraps waitpid(2). status is one I32 cell from ffi.scope(); options is fixed to WNOHANG, 1 on every host.")
 fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
 
 @ffi("open", header: "fcntl.h")
@@ -232,10 +261,11 @@ pub type DaemonBuild {
     declined: Str
 }
 
-// What a build request leaves the daemon's loop with: the reply to send, or, in the child the
-// daemon forked for the build, the build to run.
+// What a build request leaves the daemon's loop with: the reply to send, nothing yet while the
+// child it forked runs, or, in that child, the build to run.
 type BuildTurn {
     Reply(text: Str)
+    Started(child: DaemonChild)
     Child(build: DaemonBuild)
 }
 
@@ -294,22 +324,38 @@ fn exit_code_of(status: Int) -> Int {
     if sig == 0 { (status >> 8) & 255 } else { 128 + sig }
 }
 
-// Waits for pid; the status it ended with, or -1 when there is no such child.
-fn wait_for(pid: Int) -> Int ! IO {
+// Reaps pid if it ended: the status it ended with, -1 when there is no such child, or -2
+// while it runs.
+fn reap(pid: Int) -> Int ! IO {
     let mut status = -1
+    // WNOHANG is 1 on every host the daemon runs on.
+    let options = 1
     with ffi.scope() as scope {
         let cell = scope.alloc[I32]()
         loop {
-            let r = daemon_waitpid(pid.to_i32(), cell, 0.to_i32()).to_int()
+            let r = daemon_waitpid(pid.to_i32(), cell, options.to_i32()).to_int()
             if r == pid {
                 status = cell.deref().to_int()
                 break
             }
+            if r == 0 {
+                status = -2
+                break
+            }
             // EINTR is 4 on every host the daemon runs on.
-            if r >= 0 || daemon_errno() != 4 { break }
+            if r > 0 || daemon_errno() != 4 { break }
         }
     }
     status
+}
+
+// Sends text and closes the connection. A client that went away takes only its own
+// connection with it; the daemon serves on.
+fn daemon_reply(client_fd: Int, text: Str) {
+    if socket_write(client_fd, text.concat("\n")) < 0 {
+        io.eprintln("daemon: could not send the reply, so it dropped the connection")
+    }
+    unix_socket_close(client_fd)
 }
 
 // A build runs the client's command line in a child of the daemon, from the program the
@@ -318,9 +364,9 @@ fn wait_for(pid: Int) -> Int ! IO {
 // the code the child exited with, so the client prints what a cold build would print and
 // exits with its code. The daemon builds only where a cold build in the client would read
 // the same: the same entry, directory, compiler, environment and front-end settings. Anything
-// else is not served, and the client builds cold. The daemon waits for the build, so it
-// answers no other client until the build ends.
-fn daemon_handle_build(request: Str, client_fd: Int) -> BuildTurn ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+// else is not served, and the client builds cold. The daemon serves on while the child runs
+// and replies to the client once the child ends (daemon_end_child).
+fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> BuildTurn ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     json_clear()
     let root = json_parse(request)
     let cwd = json_as_str(json_get(root, "cwd"))
@@ -356,9 +402,9 @@ fn daemon_handle_build(request: Str, client_fd: Int) -> BuildTurn ! Daemon.Serve
         return BuildTurn.Reply(daemon_not_served("the daemon could not capture what its check printed"))
     }
     let dir = daemon_dir()
-    let out_path = path_join(dir, "build.out")
-    let err_path = path_join(dir, "build.err")
-    let declined = path_join(dir, "build.declined")
+    let out_path = path_join(dir, "build-{builds.seq}.out")
+    let err_path = path_join(dir, "build-{builds.seq}.err")
+    let declined = path_join(dir, "build-{builds.seq}.declined")
     shell_exec("rm -f {declined}")
     // The child inherits what stdout holds unflushed, and would print it again.
     io.write("")
@@ -367,9 +413,15 @@ fn daemon_handle_build(request: Str, client_fd: Int) -> BuildTurn ! Daemon.Serve
         return BuildTurn.Reply(daemon_not_served("the daemon could not fork a build"))
     }
     if pid == 0 {
-        // The child keeps no socket, so the client hears from the daemon alone, and a stop
+        // The child keeps no socket, so each client hears from the daemon alone, and a stop
         // that removes the socket file is the daemon's.
         unix_socket_close(client_fd)
+        for h in builds.queue {
+            unix_socket_close(h.client_fd)
+        }
+        for s in builds.stops {
+            unix_socket_close(s)
+        }
         unix_socket_close(daemon_socket_fd)
         daemon_socket_fd = -1
         daemon_running = 0
@@ -379,13 +431,19 @@ fn daemon_handle_build(request: Str, client_fd: Int) -> BuildTurn ! Daemon.Serve
         }
         return BuildTurn.Child(DaemonBuild { argv: argv, program: c.program, front: c.front, out: c.out, err: c.err, declined: declined })
     }
-    let status = wait_for(pid)
-    let out = read_file(out_path)
-    let err = read_file(err_path)
-    shell_exec("rm -f {out_path} {err_path}")
-    if status < 0 || file_exists(declined) == 1 {
-        shell_exec("rm -f {declined}")
-        return BuildTurn.Reply(daemon_not_served("the daemon's build did not run"))
+    BuildTurn.Started(DaemonChild { pid: pid, client_fd: client_fd, out: out_path, err: err_path, declined: declined })
+}
+
+// Replies to the client of the build child that ended with status, and removes the child's
+// files, whether it built, declined or died.
+fn daemon_end_child(child: DaemonChild, status: Int) ! IO {
+    let out = read_file(child.out)
+    let err = read_file(child.err)
+    let declined = file_exists(child.declined) == 1
+    shell_exec("rm -f {child.out} {child.err} {child.declined}")
+    if status < 0 || declined {
+        daemon_reply(child.client_fd, daemon_not_served("the daemon's build did not run"))
+        return
     }
     daemon_origin = DaemonOrigin { builds: daemon_origin.builds + 1, ..daemon_origin }
     json_clear()
@@ -395,7 +453,51 @@ fn daemon_handle_build(request: Str, client_fd: Int) -> BuildTurn ! Daemon.Serve
     json_set(reply, "exit", json_new_int(exit_code_of(status)))
     json_set(reply, "stdout", json_new_str(out))
     json_set(reply, "stderr", json_new_str(err))
-    BuildTurn.Reply(json_encode(reply))
+    daemon_reply(child.client_fd, json_encode(reply))
+}
+
+// Runs a build request with the next number for its files, and leaves a child it forked in
+// builds. Returns the reply to send, or in the child the build to run.
+fn daemon_start_build(builds: DaemonBuilds, request: Str, client_fd: Int) -> (DaemonBuilds, Option[Str], Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    let mut next = DaemonBuilds { seq: builds.seq + 1, ..builds }
+    match daemon_handle_build(request, client_fd, next) {
+        Reply(text) => (next, Some(text), None)
+        Started(child) => {
+            next.child = Some(child)
+            (next, None, None)
+        }
+        Child(build) => (next, None, Some(build))
+    }
+}
+
+// Once the build child ends: a stop that came meanwhile sends each held build to build cold,
+// now that nothing else writes its files, answers the stop and ends the loop; else the oldest
+// held build runs. Returns the build to run in a child forked for one.
+fn daemon_after_child(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    let mut b = builds
+    if b.stops.len() > 0 {
+        for h in b.queue {
+            daemon_reply(h.client_fd, daemon_not_served("the daemon is stopping"))
+        }
+        for s in b.stops {
+            daemon_reply(s, daemon_handle_stop())
+        }
+        return (DaemonBuilds { queue: [], stops: [], ..b }, None)
+    }
+    while b.child.is_none() && b.queue.len() > 0 {
+        let h = b.queue.get(0).unwrap()
+        b.queue = b.queue.slice(1, b.queue.len())
+        let (next, reply, build) = daemon_start_build(b, h.request, h.client_fd)
+        b = next
+        if build.is_some() {
+            return (b, build)
+        }
+        match reply {
+            Some(text) => daemon_reply(h.client_fd, text)
+            None => {}
+        }
+    }
+    (b, None)
 }
 
 // ── Handle: query ───────────────────────────────────────────────────
@@ -406,14 +508,17 @@ fn daemon_handle_query(request: Str) -> Str {
 
 // ── Handle: status ──────────────────────────────────────────────────
 
-fn daemon_handle_status() -> Str {
+fn daemon_handle_status(builds: DaemonBuilds) -> Str {
     let now = time_ms()
     let uptime = now - daemon_start_time
     let sym_count = si_sym_count
     let file_count = si_file_count
     let checks = daemon_check_count
-    let builds = daemon_origin.builds
-    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{sym_count},\"files\":{file_count},\"builds\":{builds},\"checks\":{checks}}"
+    let served = daemon_origin.builds
+    let building = if builds.child.is_some() { 1 } else { 0 }
+    let queued = builds.queue.len()
+    let stopping = if builds.stops.len() > 0 { 1 } else { 0 }
+    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{sym_count},\"files\":{file_count},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"builds\":{served},\"checks\":{checks}}"
 }
 
 // ── Handle: stop ────────────────────────────────────────────────────
@@ -451,11 +556,41 @@ fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck
 }
 
 // Returns the build to run in a child forked for one, and None in the daemon once it stops.
+// While a build child runs, the accept waits 1 ms at most and each turn reaps the child if it
+// ended, so the daemon serves other requests meanwhile and its build client waits at most
+// that, plus the one request being served then, past the child's end. The runtime has no wait
+// on both the socket and the child.
 fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    let mut builds = DaemonBuilds { child: None, queue: [], stops: [], seq: 0 }
     while daemon_running == 1 {
-        let client_fd = unix_socket_accept_timeout(daemon_socket_fd, 500)
+        let mut client_fd = -1
+        match builds.child {
+            Some(child) => {
+                let status = reap(child.pid)
+                if status != -2 {
+                    daemon_end_child(child, status)
+                    builds.child = None
+                    let (next, build) = daemon_after_child(builds)
+                    builds = next
+                    if build.is_some() {
+                        return build
+                    }
+                    if daemon_running != 1 {
+                        break
+                    }
+                }
+                if builds.child.is_some() {
+                    client_fd = unix_socket_accept_timeout(daemon_socket_fd, 1)
+                }
+            }
+            None => {
+                client_fd = unix_socket_accept_timeout(daemon_socket_fd, 500)
+                if client_fd < 0 {
+                    daemon_recheck_if_changed()
+                }
+            }
+        }
         if client_fd < 0 {
-            daemon_recheck_if_changed()
             continue
         }
 
@@ -463,28 +598,44 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
         let req_type = daemon_extract_type(request) ?? ""
 
         let mut response = ""
+        let mut held = false
         if req_type == "check" {
             response = daemon_handle_check(request)
         } else if req_type == "build" {
-            match daemon_handle_build(request, client_fd) {
-                Reply(text) => response = text
-                Child(build) => return Some(build)
+            if builds.child.is_some() {
+                builds.queue.push(DaemonHeld { request: request, client_fd: client_fd })
+                held = true
+            } else {
+                let (next, reply, build) = daemon_start_build(builds, request, client_fd)
+                builds = next
+                if build.is_some() {
+                    return build
+                }
+                match reply {
+                    Some(text) => response = text
+                    None => held = true
+                }
             }
         } else if req_type == "query" {
             response = daemon_handle_query(request)
         } else if req_type == "status" {
-            response = daemon_handle_status()
+            response = daemon_handle_status(builds)
         } else if req_type == "stop" {
-            response = daemon_handle_stop()
+            // A killed build would leave its cc and ld writing the files the client's cold
+            // build writes next, so the daemon lets the build end first.
+            if builds.child.is_some() {
+                builds.stops.push(client_fd)
+                held = true
+            } else {
+                response = daemon_handle_stop()
+            }
         } else {
             response = "\{\"ok\":false,\"error\":\"unknown request type: {req_type}\"}"
         }
 
-        // A client that went away takes only its own connection with it; the daemon serves on.
-        if socket_write(client_fd, response.concat("\n")) < 0 {
-            io.eprintln("daemon: could not send the reply, so it dropped the connection")
+        if !held {
+            daemon_reply(client_fd, response)
         }
-        unix_socket_close(client_fd)
     }
     None
 }
