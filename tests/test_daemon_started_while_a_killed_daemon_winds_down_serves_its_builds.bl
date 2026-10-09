@@ -115,25 +115,30 @@ test "a daemon started while the workers of a killed daemon still end serves its
     dev_tree(root, tree)
     let mut problems: List[Str] = []
     let mut seen: List[Str] = []
+    let mut old_workers = ""
+    let mut old_ended = ""
     let first = start_daemon(tree, -1)
     with cleanup(fn() { stop_daemon(first) }) {
         assert(first > 0, "the first daemon did not start: {read_file("{tree}/daemon.log")}")
         problems.push(build(tree, "second"))
         problems.push(build(tree, "main"))
         seen.push(counts(tree))
+        old_workers = sh("ps -o pid= --ppid {first} | tr '\\n' ' '")
     }
     // Each worker of the first daemon has just begun to wait for a request, so it outlives
     // its router while the second daemon starts its own workers.
     let second = start_daemon(tree, first)
     with cleanup(fn() { stop_daemon(second) }) {
         assert(second > 0, "the second daemon did not start: {read_file("{tree}/daemon.log")}")
-        // Past the time an old worker takes to see its router is gone and end.
-        shell_exec("sleep 1.5")
+        // The builds wait for each old worker to end, so each has removed its files by then.
+        old_ended = sh("for i in $(seq 1 600); do left=''; for p in {old_workers}; do kill -0 $p 2>/dev/null && left=\"$left $p\"; done; [ -z \"$left\" ] && exit 0; sleep 0.05; done; echo $left")
         problems.push(build(tree, "main"))
         problems.push(build(tree, "second"))
         seen.push(counts(tree))
     }
     shell_exec("rm -rf {tree}")
+    assert(old_workers.trim() != "", "the first daemon had no workers")
+    assert_eq(old_ended, "")
     let found: List[Str] = problems.filter(fn(p) { p != "" })
     assert_eq(found.join("\n"), "")
     assert_eq(seen.join(", "), "builds=2 entries=2, builds=2 entries=2")
