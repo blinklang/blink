@@ -20,6 +20,12 @@
 #                          "--no-per-module" for the one-unit build. A per-module build (the
 #                          default) has its C hash cover the units dir (<stem>.units/*.c and
 #                          *.h); a one-unit build hashes <stem>.c
+#   BENCH_DAEMON=1         start `blink daemon start <target src>` in the target dir once it is
+#                          warm, so the build and run cases build through the daemon; it stops
+#                          when the target is done. A header line gives the builds it served
+#   BENCH_SETTLE=<s>       seconds to wait between the edit and the timed run (default 0). A
+#                          user takes some time between saving and building; with the daemon,
+#                          its recheck after the edit runs then
 #
 # Setup. The tree (tracked + untracked, not ignored) is copied to a scratch dir, so the
 # real src/ is never edited. The binary is copied to <scratch>/build/blink: that is the
@@ -87,7 +93,11 @@ if [ -n "$slice" ] && [ -z "${BENCH_IN_SLICE:-}" ]; then
 fi
 
 work=$(mktemp -d "${BENCH_WORKDIR:-${TMPDIR:-/tmp}}/bench-edit-loop.XXXXXX") || die "mktemp failed"
-cleanup() { [ "${BENCH_KEEP:-}" = 1 ] || rm -rf "$work"; }
+daemon_pid=
+cleanup() {
+    stop_daemon
+    [ "${BENCH_KEEP:-}" = 1 ] || rm -rf "$work"
+}
 trap cleanup EXIT
 
 echo "bench_edit_loop: scratch tree $work"
@@ -172,6 +182,39 @@ run_blink() {
 
 restore() { cp "$work/.bench/orig/$2" "$work/$(tv dir "$1")/$3"; }
 
+# start_daemon <target>: the daemon runs under the env run_blink gives blink, since it builds
+# only for a client whose env is its own.
+start_daemon() {
+    local target=$1 dir=$work/$(tv dir "$1") i
+    (cd "$dir" && exec env BENCH_CC_LOG="$work/.bench/cc.log" $(tv env "$target") "$blink" daemon start "$(tv src "$target")") \
+        > "$work/.bench/logs/$target-daemon.log" 2>&1 &
+    daemon_pid=$!
+    for i in $(seq 1 600); do
+        (cd "$dir" && "$blink" daemon status) > /dev/null 2>&1 && return 0
+        kill -0 "$daemon_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    stop_daemon
+    die "$target: the daemon did not start (log $work/.bench/logs/$target-daemon.log)"
+}
+
+stop_daemon() {
+    [ -n "$daemon_pid" ] || return 0
+    kill "$daemon_pid" 2>/dev/null
+    local i
+    for i in $(seq 1 100); do
+        kill -0 "$daemon_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -9 "$daemon_pid" 2>/dev/null
+    daemon_pid=
+}
+
+# daemon_builds <target>: how many builds the daemon ran, from `blink daemon status`.
+daemon_builds() {
+    (cd "$work/$(tv dir "$1")" && "$blink" daemon status 2>/dev/null) | sed -n 's/.*"builds":\([0-9]*\).*/\1/p'
+}
+
 edit_body() {
     local f=$1 fn=$2 nonce=$3
     sed -i "/^fn $fn(/a\\    let _bench_edit = \"$nonce\"" "$f"
@@ -197,6 +240,7 @@ rep() {
         test) args=(test "$(tv test "$target")" ${BENCH_FLAGS:-}) ;;
         *) args=(build "$(tv src "$target")" ${BENCH_FLAGS:-}) ;;
     esac
+    [ "${BENCH_SETTLE:-0}" = 0 ] || sleep "$BENCH_SETTLE"
     local load=$(load1)
     run_blink "$target" "$log" "${args[@]}"
     [ -n "$efile" ] && restore "$target" "$target-$(stem "$efile").bl" "$efile"
@@ -304,7 +348,7 @@ run_case() {
     echo "# tree $(cd "$repo" && git rev-parse --short=8 HEAD)$(cd "$repo" && git diff --quiet HEAD -- || echo ' (dirty)')"
     echo "# blink $blink_bin sha256 $(sha256sum "$blink_bin" | cut -c1-16)"
     echo "# cc $("$real_cc" --version | head -1); nproc $(nproc); reps $reps; slice ${slice:-none}"
-    echo "# flags ${BENCH_FLAGS:-none}"
+    echo "# flags ${BENCH_FLAGS:-none}; daemon ${BENCH_DAEMON:-0}; settle ${BENCH_SETTLE:-0}s"
     echo "# emit_s = wall - cc_s - link_s; split columns are medians of their own; c_check: C hash vs the warm C"
     printf 'target\tcase\tedited\tn\tmedian_s\tmin_s\tmax_s\tspread_pct\temit_s\tcc_s\tlink_s\tcc_calls\tc_check\tmax_load1\n'
 } > "$out"
@@ -312,6 +356,7 @@ run_case() {
 for target in ${BENCH_TARGETS:-cli small}; do
     [ -n "$(tv src "$target")" ] || die "unknown target $target"
     warm "$target"
+    [ "${BENCH_DAEMON:-}" = 1 ] && start_daemon "$target"
     bc=build/$(stem "$(tv src "$target")").c
     tc=build/$(stem "$(tv test "$target")").c
     run_case "$target" nochange build "$bc" same "$base_build"
@@ -327,6 +372,10 @@ for target in ${BENCH_TARGETS:-cli small}; do
     run_case "$target" "test-body-$(modname "$f")" test "$tc" changed "$base_test" "$f" "$fn"
     run_case "$target" cold-obj cold-obj "$bc" same "$base_build"
     [ "$(tv coldall "$target")" = 1 ] && run_case "$target" cold-all cold-all "$bc" same "$base_build"
+    if [ "${BENCH_DAEMON:-}" = 1 ]; then
+        sed -i "1a # daemon $target served $(daemon_builds "$target") builds" "$out"
+        stop_daemon
+    fi
 done
 
 echo
