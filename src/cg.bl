@@ -46,8 +46,8 @@ import cg_derive.{
     cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables,
     cg_derive_key_table_nodes, cg_derive_reset,
 }
-import ir.{ir_begin_body, ir_block, ir_reset, ir_span, ir_verify}
-import mono.{instances, named_instance_rows, set_named_instance_rows}
+import ir.{ir_begin_body, ir_block, ir_note_source, ir_reset, ir_span, ir_verify}
+import mono.{instances, named_instance_rows, program_spawns, set_named_instance_rows}
 import typecheck.{TYPE_VOID, TyKind, tc_resolve, tc_tid_kind}
 import cg_stmt.{
     cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
@@ -61,8 +61,7 @@ import cg_expr.{cg_expr_frame_clear, cg_expr_reset, cg_expr_set_return_type, cg_
 import cg_eff.{
     cg_eff_forwarding_body, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_register_async_scope_guard_support,
     cg_eff_register_ffi_scope_guard_support, cg_eff_reset, cg_eff_thunk_body_node, cg_eff_thunk_close,
-    cg_eff_thunk_has_body, cg_eff_thunk_open, cg_eff_thunk_ret_tid, cg_eff_thunks_drained, cg_eff_program_reset,
-    cg_eff_program_uses_async,
+    cg_eff_thunk_has_body, cg_eff_thunk_open, cg_eff_thunk_ret_tid, cg_eff_thunks_drained,
 }
 
 effect Codegen {
@@ -231,22 +230,45 @@ fn without_on_demand_copies(cfg: CgConfig, module_key: Str, decls: List[Int]) ->
 // The private copies this unit's calls named, and then the ones those copies' own bodies
 // name, until a pass names nothing new. Each one's prototype is already in scope: the
 // header of the module that declares the generic offers every instance as a static
-// declaration.
+// declaration. A pass writes its copies by C name, not in table order: the table is in the
+// order the whole program first named each instance, which an edit to another module can
+// change without changing anything this unit reads, and a unit taken from the last build
+// must match a cold emit byte for byte.
 fn emit_named_private_copies(cfg: CgConfig) ! Diag.Report {
     let table = instances()
     let mut written: Map[Int, Int] = Map()
     let mut grew = true
     while grew {
         grew = false
+        let mut pass: List[Int] = []
         for row in named_instance_rows() {
             if written.contains_key(row) { continue }
             written.insert(row, 1)
             grew = true
+            pass.push(row)
+        }
+        for row in rows_by_c_name(pass) {
             let decl = table.get(row).unwrap().base_decl_node
             if !instance_is_private_copy(cfg, decl) { continue }
             emit_instance_body(decl, row, true)
         }
     }
+}
+
+fn rows_by_c_name(rows: List[Int]) -> List[Int] {
+    let table = instances()
+    let mut out: List[Int] = []
+    for row in rows {
+        let name = table.get(row).unwrap().c_name
+        out.push(row)
+        let mut i = out.len() - 1
+        while i > 0 && table.get(out.get(i - 1).unwrap()).unwrap().c_name > name {
+            out.set(i, out.get(i - 1).unwrap())
+            i = i - 1
+        }
+        out.set(i, row)
+    }
+    out
 }
 
 // Whether this unit keeps its copies of one generic's instances to itself. Inside a
@@ -475,13 +497,16 @@ fn subtree_has_kind(id: Int, kind: NodeKind, kids: List[Int]) -> Bool {
 fn unit_uses_async_scope(fns: List[Int], methods: List[Int], include_tests: Bool) -> Bool {
     let mut kids: List[Int] = []
     for f in fns {
+        ir_note_source(f)
         if subtree_has_kind(node_body(f), NodeKind.AsyncScope, kids) { return true }
     }
     for m in methods {
+        ir_note_source(m)
         if subtree_has_kind(node_body(m), NodeKind.AsyncScope, kids) { return true }
     }
     if include_tests {
         for t in cg_reg_test_decls() {
+            ir_note_source(t)
             if subtree_has_kind(node_body(t), NodeKind.AsyncScope, kids) { return true }
         }
     }
@@ -736,7 +761,7 @@ fn tag_arg_is_positional(arg: Int) -> Bool {
 fn emit_entry(cfg: CgConfig, init_fns: List[Str]) ! Diag.Report {
     let tests = cg_reg_test_decls()
     emit_test_bodies(tests)
-    print_main_shim(cg_reg_has_main(), tests.len() > 0, cg_eff_program_uses_async(),
+    print_main_shim(cg_reg_has_main(), tests.len() > 0, program_spawns(),
         cfg.trace_codegen != 0, cfg.deterministic, archive_init_fns(cfg).append(init_fns))
 }
 
@@ -1028,7 +1053,6 @@ pub fn archive_unit_modules(program: Int, cfg: CgConfig) -> List[Str] ! Diag.Rep
 // The modules of `program` in the order the per-module mode must emit them: first-seen
 // order, which is dependency order, never sorted.
 pub fn enumerate_program_modules(program: Int) -> List[Str] ! Diag.Report {
-    cg_eff_program_reset()
     begin_unit(program)
     cg_reg_modules()
 }

@@ -155,8 +155,25 @@ type SublistPool {
 
 let mut sublists: SublistPool = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
 
-let mut annotation_nodes: List[Int] = []
-let mut program_annotation_nodes: List[Int] = []
+// The annotations read ahead of the next item, and the program-level ones.
+type PendingAnnotations {
+    item: List[Int]
+    program: List[Int]
+}
+
+let mut annotations: PendingAnnotations = PendingAnnotations { item: [], program: [] }
+
+// The token range of each top-level fn and method body in the source parsed last, kept only
+// while a build wants each source's interface text. A body edit changes tokens inside these
+// alone.
+type FnBodies {
+    wanted: Bool
+    depth: Int
+    tok_firsts: List[Int]
+    tok_lasts: List[Int]
+}
+
+let mut fn_bodies: FnBodies = FnBodies { wanted: false, depth: 0, tok_firsts: [], tok_lasts: [] }
 
 // `@expect_panic` desugars to a real AssertPanics node during parse so the
 // compile path gets all the assert_panics machinery for free. The FORMAT path
@@ -182,8 +199,9 @@ pub fn embed_path_of(node: Int) -> Str {
 pub fn parser_reset() {
     columns = node_columns_empty()
     sublists = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
-    annotation_nodes.clear()
-    program_annotation_nodes.clear()
+    annotations = PendingAnnotations { item: [], program: [] }
+    // The build sets wanted before the front end, which resets the parser first.
+    fn_bodies = FnBodies { wanted: fn_bodies.wanted, depth: 0, tok_firsts: [], tok_lasts: [] }
     source_module_for_node.clear()
     pos = 0
     parse_desugar_enabled = 1
@@ -1191,6 +1209,46 @@ fn checked_node_id(id: Int, where: Str) -> Int {
     id
 }
 
+// Whether the parser keeps the fn body token ranges that parsed_interface_text leaves out. A
+// build turns it on only when it may take units from the last build, so no other compile
+// pays for them.
+pub fn parser_want_interface_text(on: Bool) {
+    fn_bodies.wanted = on
+}
+
+// The tokens of the source parsed last, but for those inside a fn body: what other modules
+// see of it. Each token is its kind's name and its text, each after its length, so no two
+// token lists give one text. Positions are left out: emit marks the source of each position
+// it reads. "" when not wanted here or by the build.
+pub fn parsed_interface_text(wanted: Bool) -> Str {
+    if !wanted || !fn_bodies.wanted {
+        fn_bodies.tok_firsts.clear()
+        fn_bodies.tok_lasts.clear()
+        return ""
+    }
+    let sb = StringBuilder.new()
+    let n = tokens.kinds.len()
+    let b = fn_bodies
+    let mut r = 0
+    let mut i = 0
+    while i < n {
+        if r < b.tok_firsts.len() && i > b.tok_firsts[r] {
+            // Keep the closing brace, so the text still shows where each body was.
+            i = b.tok_lasts[r]
+            r = r + 1
+            continue
+        }
+        let k = token_kind_name(tokens.kinds[i])
+        let v = tokens.values[i]
+        sb.write("{k.byte_len()}:{k}{v.byte_len()}:")
+        sb.write(v)
+        i = i + 1
+    }
+    fn_bodies.tok_firsts.clear()
+    fn_bodies.tok_lasts.clear()
+    sb.to_str()
+}
+
 fn node_or_die(id: Int, where: Str) -> AstNode {
     let i = checked_node_id(id, where)
     let ic = i >> 12
@@ -1884,25 +1942,25 @@ fn maybe_newline() ! Parse.Advance {
 }
 
 fn attach_pending_annotations(node: Int) ! Parse.Build {
-    if annotation_nodes.len() > 0 {
+    if annotations.item.len() > 0 {
         let anns_sl = new_sublist()
         let mut ai = 0
-        while ai < annotation_nodes.len() {
-            sublist_push(anns_sl, annotation_nodes.get(ai).unwrap())
+        while ai < annotations.item.len() {
+            sublist_push(anns_sl, annotations.item.get(ai).unwrap())
             ai = ai + 1
         }
         finalize_sublist(anns_sl)
         node_set_handlers(node, anns_sl)
-        annotation_nodes = []
+        annotations.item = []
     }
 }
 
 // Clearing the list keeps a rejected annotation off the next item that attaches pending ones.
 fn reject_pending_annotations(what: Str, help: Str) ! Parse.Build, Diag.Report {
-    for ann in annotation_nodes {
+    for ann in annotations.item {
         diag_error("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "@{node_name(ann)} {what}", node_line(ann), node_col(ann), help)
     }
-    annotation_nodes = []
+    annotations.item = []
 }
 
 // Skipping only up to the next item keeps one bad line to one error, and lets a method
@@ -2127,7 +2185,9 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
     let mut import_nodes: List[Int] = []
     let mut effect_decl_nodes: List[Int] = []
     let mut test_nodes: List[Int] = []
-    annotation_nodes = []
+    annotations.item = []
+    fn_bodies.tok_firsts.clear()
+    fn_bodies.tok_lasts.clear()
     skip_newlines_and_comments()
     while !at(TokenKind.EOF) {
         skip_newlines_and_comments()
@@ -2138,9 +2198,9 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
         if at(TokenKind.At) {
             let ann_nd = parse_annotation()
             if node_name(ann_nd) == "capabilities" {
-                program_annotation_nodes.push(ann_nd)
+                annotations.program.push(ann_nd)
             } else {
-                annotation_nodes.push(ann_nd)
+                annotations.item.push(ann_nd)
             }
             skip_newlines_and_comments()
         } else if at(TokenKind.Import) {
@@ -2336,16 +2396,16 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
         finalize_sublist(effect_decls)
     }
     let mut annotations_sl = -1
-    if annotation_nodes.len() > 0 || program_annotation_nodes.len() > 0 {
+    if annotations.item.len() > 0 || annotations.program.len() > 0 {
         annotations_sl = new_sublist()
         i = 0
-        while i < program_annotation_nodes.len() {
-            sublist_push(annotations_sl, program_annotation_nodes.get(i).unwrap())
+        while i < annotations.program.len() {
+            sublist_push(annotations_sl, annotations.program.get(i).unwrap())
             i = i + 1
         }
         i = 0
-        while i < annotation_nodes.len() {
-            sublist_push(annotations_sl, annotation_nodes.get(i).unwrap())
+        while i < annotations.item.len() {
+            sublist_push(annotations_sl, annotations.item.get(i).unwrap())
             i = i + 1
         }
         finalize_sublist(annotations_sl)
@@ -2971,7 +3031,14 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     skip_newlines()
     let mut body_id = -1
     if at(TokenKind.LBrace) {
+        let tok_first = pos
+        fn_bodies.depth = fn_bodies.depth + 1
         body_id = parse_block()
+        fn_bodies.depth = fn_bodies.depth - 1
+        if fn_bodies.wanted && fn_bodies.depth == 0 {
+            fn_bodies.tok_firsts.push(tok_first)
+            fn_bodies.tok_lasts.push(pos - 1)
+        }
     }
     let mut fn_end_l = -1
     let mut fn_end_c = -1
@@ -3263,11 +3330,11 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let assoc_types = new_sublist()
     let methods = new_sublist()
     // The trait's own annotations stay pending until the caller attaches them.
-    let trait_anns = annotation_nodes
-    annotation_nodes = []
+    let trait_anns = annotations.item
+    annotations.item = []
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         if at(TokenKind.At) {
-            annotation_nodes.push(parse_annotation())
+            annotations.item.push(parse_annotation())
         } else if at(TokenKind.Fn) {
             let fn_node = parse_fn_def()
             attach_pending_annotations(fn_node)
@@ -3285,7 +3352,7 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines_and_comments()
     }
     reject_pending_annotations("in trait `{name}` is not followed by a method", "move the annotation above the method it belongs to, or remove it")
-    annotation_nodes = trait_anns
+    annotations.item = trait_anns
     let trait_end_line = peek_line()
     let trait_end_col = peek_col()
     expect(TokenKind.RBrace)
@@ -3369,11 +3436,11 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let assoc_types = new_sublist()
     let methods = new_sublist()
     // The impl block's own annotations stay pending until the caller attaches them.
-    let impl_anns = annotation_nodes
-    annotation_nodes = []
+    let impl_anns = annotations.item
+    annotations.item = []
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         if at(TokenKind.At) {
-            annotation_nodes.push(parse_annotation())
+            annotations.item.push(parse_annotation())
         } else if at(TokenKind.Fn) {
             let fn_node = parse_fn_def()
             attach_pending_annotations(fn_node)
@@ -3398,7 +3465,7 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         skip_newlines_and_comments()
     }
     reject_pending_annotations("in impl `{trait_name} for {type_name}` is not followed by a method", "move the annotation above the method it belongs to, or remove it")
-    annotation_nodes = impl_anns
+    annotations.item = impl_anns
     let impl_end_line = peek_line()
     let impl_end_col = peek_col()
     expect(TokenKind.RBrace)

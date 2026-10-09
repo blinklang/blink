@@ -1,0 +1,86 @@
+// Whether a program spawns decides whether main starts the thread pool. That is a fact of
+// the whole program, not of the unit main sits in, so an edit to main alone, which takes
+// the unit that spawns from the last build, must still give a main that starts the pool.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"unit_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/a.bl", [
+        #"pub fn a_value() -> Int {"#,
+        #"    let mut r = 0"#,
+        #"    async.scope {"#,
+        #"        let h = async.spawn(fn() { 6 * 7 })"#,
+        #"        r = h.await"#,
+        #"    }"#,
+        #"    r"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import a.{a_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("v {a_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_EMIT_REUSE_VERIFY BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            out.push(line.byte_slice(29, line.byte_len()))
+        }
+    }
+    out.join(",")
+}
+
+test "an edit to main alone keeps the thread pool a taken unit spawns on" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_unit_reuse_spawn_pool_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "out")
+    let path = "{tree}/app/src/main.bl"
+    write_file(path, read_file(path).replace("\"v ", "\"w "))
+    let warm = build_into(tree, "out")
+    let _cold = build_into(tree, "cold")
+    let run = process_run("sh", ["-c", "{tree}/out/app"])
+    let taken_main = read_file("{tree}/out/app.units/__main__.c")
+    let fresh_main = read_file("{tree}/cold/app.units/__main__.c")
+    shell_exec("rm -rf {tree}")
+    assert(reused_units(warm).split(",").contains("a"), "the edit of main took {reused_units(warm)}")
+    assert(fresh_main.contains("blink_threadpool_init"), "a cold main does not start the pool")
+    assert(taken_main == fresh_main, "main differs from a cold build's when a is taken")
+    assert(run.exit_code == 0, "the program exited {run.exit_code}: {run.err_out}")
+    assert_eq(run.out.trim(), "w 42")
+}

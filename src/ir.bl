@@ -28,7 +28,7 @@
 import layout.{SlotForm, pointer_spelling, box_gc_layout_of}
 import cname.{c_enum_tag_member, c_enum_payload_member, c_cell_name, c_vtable_userdata_member}
 import typecheck.{TyKind, tc_tid_kind, tc_tid_decl_node}
-import parser.{node_name, node_fields, sublist_length, sublist_get, node_count}
+import parser.{node_name, node_fields, sublist_length, sublist_get, node_count, node_col, node_line}
 
 @derive(Eq)
 pub type IrKind {
@@ -163,12 +163,13 @@ type IrArena {
     floor: Int
     base: Int
     body_open: Bool
+    sources: SourceTrack
 }
 
-let mut ir_arena: IrArena = IrArena { pinned: new_part(), nodes: new_part(), floor: 0, base: 0, body_open: false }
+let mut ir_arena: IrArena = IrArena { pinned: new_part(), nodes: new_part(), floor: 0, base: 0, body_open: false, sources: no_sources() }
 
 pub fn ir_reset() {
-    ir_arena = IrArena { pinned: new_part(), nodes: new_part(), floor: 0, base: 0, body_open: false }
+    ir_arena = IrArena { pinned: new_part(), nodes: new_part(), floor: 0, base: 0, body_open: false, sources: ir_arena.sources }
     verify_marks = VerifyMarks { epoch: 0, words: [] }
 }
 
@@ -177,10 +178,10 @@ pub fn ir_begin_body() {
     let a = ir_arena
     let n = a.nodes.kinds.len()
     if !a.body_open {
-        ir_arena = IrArena { pinned: a.nodes, nodes: new_part(), floor: n, base: n, body_open: true }
+        ir_arena = IrArena { pinned: a.nodes, nodes: new_part(), floor: n, base: n, body_open: true, sources: a.sources }
     } else {
         clear_part(a.nodes)
-        ir_arena = IrArena { pinned: a.pinned, nodes: a.nodes, floor: a.floor, base: a.base + n, body_open: true }
+        ir_arena = IrArena { pinned: a.pinned, nodes: a.nodes, floor: a.floor, base: a.base + n, body_open: true, sources: a.sources }
     }
 }
 
@@ -233,7 +234,79 @@ fn kid_mark() -> Int { ir_arena.nodes.kids.len() }
 
 fn push_kid(kid: Int) { ir_arena.nodes.kids.push(kid) }
 
+// The node range of each loaded source, in node order, and whether a node built since
+// ir_track_sources spans a node in it. A per-module build takes a unit from the last build
+// only while every source the unit's IR spanned holds the same bytes, and a unit's IR spans
+// nodes of other modules too: a field default or a keyword-parameter default lowers where
+// it is used, with its own file and line. ir_reset keeps it: a unit's emit resets the arena
+// many times.
+type SourceTrack {
+    firsts: List[Int]
+    ends: List[Int]
+    read: List[Bool]
+}
+
+fn no_sources() -> SourceTrack {
+    SourceTrack { firsts: [], ends: [], read: [] }
+}
+
+// Starts a new record of the sources the IR spans. firsts and ends give each source's nodes
+// as [first, end), in node order with no overlap.
+pub fn ir_track_sources(firsts: List[Int], ends: List[Int]) {
+    let mut read: List[Bool] = []
+    for _f in firsts { read.push(false) }
+    ir_arena = IrArena { sources: SourceTrack { firsts: firsts, ends: ends, read: read }, ..ir_arena }
+}
+
+// The index of each source a node built since ir_track_sources spans.
+pub fn ir_sources_read() -> List[Int] {
+    let read = ir_arena.sources.read
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < read.len() {
+        if read[i] { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+// Marks the source that holds node as read by the unit being emitted. Emit calls it where it
+// crosses into a node whose bytes the unit's key does not otherwise cover: a fn body it
+// lowers or inspects, or a node whose position it writes into the C. A node the IR spans is
+// marked by record already.
+pub fn ir_note_source(node: Int) { note_span(node) }
+
+// The line and column of node, for C that carries them. A body edit above node moves them
+// without changing its module's interface, so the read marks node's source.
+pub fn ir_line(node: Int) -> Int {
+    note_span(node)
+    node_line(node)
+}
+
+pub fn ir_col(node: Int) -> Int {
+    note_span(node)
+    node_col(node)
+}
+
+fn note_span(span: Int) {
+    let t = ir_arena.sources
+    let n = t.firsts.len()
+    if n == 0 || span < 0 { return }
+    // The last range whose first node is at or before span.
+    let mut lo = 0
+    let mut hi = n
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2
+        if t.firsts[mid] <= span { lo = mid } else { hi = mid }
+    }
+    // A node the parser did not build for a source, such as one a later pass made, spans no
+    // source; the pass made it inside a declaration whose own nodes the IR spans as well.
+    if span < t.firsts[lo] || span >= t.ends[lo] { return }
+    if !t.read[lo] { t.read.set(lo, true) }
+}
+
 fn record(kind: IrKind, tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_form: SlotForm, kid_start: Int) -> Int {
+    note_span(span)
     let p = ir_arena.nodes
     p.kinds.push(kind)
     p.tids.push(tid)

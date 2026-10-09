@@ -1,0 +1,139 @@
+// A per-module build killed after it took units from the last build leaves the last build's
+// units as they were and no record of its own, so the next build takes them again and writes
+// the C a build with no last build writes.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"unit_reuse_app\"\nversion = \"0.1.0\"\n")
+    // mid's unit lowers base's field default, so it reads base's source.
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub type Cfg {"#,
+        #"    n: Int = [10, 20].get(1).unwrap()"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{Cfg, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    let c = Cfg { }"#,
+        #"    tag("{c.n}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build_into(tree: Str, env_args: Str, flags: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, env_args, "build app/src/main.bl -o {tree}/{out}/app --per-module {flags}")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            out.push(line.byte_slice(29, line.byte_len()))
+        }
+    }
+    out.join(",")
+}
+
+// The C files that differ between out/ and a build of the same inputs with no last build.
+fn differ_from_cold(tree: Str, env_args: Str, flags: Str) -> Str {
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, env_args, flags, "cold")
+    sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done").split("\n").join(" ")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+// Whether the build took m's unit from the last build.
+fn took(r: ProcessResult, m: Str) -> Bool {
+    reused_units(r).split(",").contains(m)
+}
+
+// A cc first on PATH that kills the build at its link, the last step before the build
+// replaces its units directory, and passes every other call to the real cc.
+fn killing_cc(tree: Str) {
+    let real_cc = sh("command -v cc")
+    shell_exec("mkdir -p {tree}/fakebin")
+    write_file("{tree}/fakebin/cc", [
+        "#!/bin/sh",
+        "case \"$*\" in *libblink_std.a*) kill -9 $(cat {tree}/build.pid); sleep 5; exit 1;; esac",
+        "exec {real_cc} \"$@\"",
+        "",
+    ].join("\n"))
+    shell_exec("chmod +x {tree}/fakebin/cc")
+}
+
+test "a build killed after it took units leaves the last units for the next build" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_unit_reuse_killed_{getpid()}"
+    dev_tree(root, tree)
+    killing_cc(tree)
+    let _first = build_into(tree, "", "", "out")
+    edit(tree, "leaf.bl", #"s/"leaf"/"lea2"/"#)
+    let killed = process_run("sh", ["-c", "cd {tree} || exit 1; PATH={tree}/fakebin:$PATH env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module & echo $! > {tree}/build.pid; wait $!"])
+    let records_left = sh("ls -a {tree}/out/.units.*/.emit-record 2>/dev/null | wc -l")
+    let next = build_into(tree, "", "", "out")
+    let out = sh("{tree}/out/app")
+    let differ = differ_from_cold(tree, "", "")
+    shell_exec("rm -rf {tree}")
+    assert(killed.exit_code == 137, "the build was not killed: {killed.out}{killed.err_out}")
+    assert(took(killed, "base") && took(killed, "mid"), "the killed build took {reused_units(killed)}")
+    assert_eq(records_left, "0")
+    assert(took(next, "base") && took(next, "mid"), "the next build took {reused_units(next)}")
+    assert_eq(differ, "")
+    assert_eq(out, "[main] [20] [lea2]")
+}

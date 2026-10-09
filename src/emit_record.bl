@@ -10,6 +10,20 @@
 // The units directory keeps the inputs as one text, and a build compares its own inputs to
 // that text byte for byte: no hash of them can match while they differ.
 //
+// When the inputs differ, a build can still take some units. Beside each source's text, the
+// inputs hold its interface text: its tokens without positions and without the inside of any
+// fn body. The front end's facts about a node come from its own module's text and from the
+// interfaces of the rest, as signatures, effects and types are declared. A unit's C is then a
+// function of the inputs other than the texts of the program's own modules, of the headers
+// every unit includes, and of the texts of the sources whose nodes its emit read beyond what
+// an interface holds: the sources its IR spans, as a field default or a keyword-parameter
+// default reaches a unit without a header, and each source whose fn body node or node
+// position the emit read. The parser marks those reads on the one path to a node, so no
+// emit can read a node unseen. The record lists, for each unit, the sources it read, and a
+// build takes a unit when all of the rest is byte-equal to the last build's, every interface
+// among it, and every source the unit read holds the same text. The entry unit reads every
+// module's globals, so a build always emits it.
+//
 // A build writes its record into its private units directory only after its link succeeds,
 // and that directory replaces the last one only after the record is in it. A build stopped
 // part way leaves the last directory, whose record still describes its own files. A build
@@ -26,6 +40,10 @@ pub type EmittedUnit {
     c_bytes: Int
     // Every header in the units directory this unit includes, which its cache key covers.
     headers: List[Str]
+    // The path of each loaded source whose nodes this unit's IR spanned, its own sources
+    // among them. Empty when the build could not tell, and then no later build takes the
+    // unit on its own.
+    uses: List[Str]
 }
 
 // The units of a record this build took, and the shas of the files they are in, by the names
@@ -36,8 +54,15 @@ pub type ReusedUnits {
 }
 
 let RECORD_NAME: Str = ".emit-record"
-let RECORD_SCHEMA: Str = "emit-record-2"
+let RECORD_SCHEMA: Str = "emit-record-4"
 let INPUTS_NAME: Str = ".emit-inputs"
+// The last build's inputs text, linked into the new units directory, so the text a build
+// compares is the one whose sha it checked against the record.
+let LAST_INPUTS_NAME: Str = ".emit-inputs-last"
+
+pub fn inputs_name() -> Str { INPUTS_NAME }
+
+pub fn last_inputs_name() -> Str { LAST_INPUTS_NAME }
 
 // The environment the compile path reads. BLINK_ROOT and HOME change where an import
 // resolves, which the loaded files already show; the rest select another build or its
@@ -57,6 +82,7 @@ pub fn inputs_text(source_path: Str, cfg: CgConfig, strict_mode: Int, compiler_s
     // collector from growing.
     let mut size = 4096
     for t in loaded_inputs.source_texts { size = size + t.byte_len() + 32 }
+    for t in loaded_inputs.source_interfaces { size = size + t.byte_len() + 32 }
     for p in loaded_inputs.source_paths { size = size + p.byte_len() }
     for t in loaded_inputs.config_texts { size = size + t.byte_len() + 32 }
     for p in import_map_paths { size = size + p.byte_len() * 4 + 128 }
@@ -93,6 +119,7 @@ pub fn inputs_text(source_path: Str, cfg: CgConfig, strict_mode: Int, compiler_s
     while i < loaded_inputs.source_paths.len() {
         add_input(sb, "file", loaded_inputs.source_paths.get(i).unwrap())
         add_input(sb, "text", loaded_inputs.source_texts.get(i).unwrap())
+        add_input(sb, "interface", loaded_inputs.source_interfaces.get(i) ?? "")
         i = i + 1
     }
     i = 0
@@ -116,24 +143,73 @@ pub fn inputs_text(source_path: Str, cfg: CgConfig, strict_mode: Int, compiler_s
     sb.to_str()
 }
 
+// The fields of an inputs text, in order.
+type InputFields {
+    tags: List[Str]
+    values: List[Str]
+}
+
+// The fields of text, or None when it is not a whole inputs text.
+fn parse_inputs(text: Str) -> Option[InputFields] {
+    let mut tags: List[Str] = []
+    let mut values: List[Str] = []
+    let n = text.byte_len()
+    let mut pos = 0
+    while pos < n {
+        let nl = match text.byte_index_of("\n", pos) {
+            Some(i) => i
+            None => return None
+        }
+        // A tag can hold a space ("env HOME"); the length is the last word.
+        let words = text.byte_slice(pos, nl).split(" ")
+        if words.len() < 2 { return None }
+        let len_word = words.get(words.len() - 1).unwrap()
+        let len = len_word.to_int()
+        if len < 0 || "{len}" != len_word { return None }
+        let start = nl + 1
+        let end = start + len
+        if end >= n || text.byte_slice(end, end + 1) != "\n" { return None }
+        let mut tag_words: List[Str] = []
+        let mut w = 0
+        while w < words.len() - 1 {
+            tag_words.push(words.get(w).unwrap())
+            w = w + 1
+        }
+        tags.push(tag_words.join(" "))
+        values.push(text.byte_slice(start, end))
+        pos = end + 1
+    }
+    Some(InputFields { tags: tags, values: values })
+}
+
 // Writes the record of units into dir, whose .h and .c files shas names, with the inputs
-// text beside it. A build that reused units already holds that text in dir. False when the
-// record was not written whole, and then no record is left in dir. A short inputs text is
-// never taken, since a build compares all of it.
+// text beside it. A build that reused units, or hashed the text, already holds it in dir.
+// False when the record was not written whole, and then no record is left in dir. A short
+// inputs text is never taken, since a build compares all of it.
 pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[Str, Str]) -> Bool {
     let inputs_path = "{dir}/{INPUTS_NAME}"
     if file_exists(inputs_path) != 1 {
         write_file(inputs_path, inputs)
     }
     let sb = StringBuilder.new()
-    sb.write("{RECORD_SCHEMA}\ninputs {inputs.byte_len()}\n")
+    sb.write("{RECORD_SCHEMA}\ninputs {inputs.byte_len()} {shas.get(INPUTS_NAME) ?? "-"}\n")
     for u in units {
         sb.write("unit {u.module} {u.c_bytes} {u.headers.join(",")}\n")
+        // A path is the rest of its line, so one that holds a line break cannot be read back,
+        // and the unit is then left for a later build to emit.
+        let mut whole = true
+        for p in u.uses {
+            if p.contains("\n") { whole = false }
+        }
+        if whole {
+            for p in u.uses { sb.write("uses {u.module} {p}\n") }
+        }
     }
     let mut files = 0
     for name in shas.keys() {
-        // The archive's files are named by path; the record holds only files in dir.
-        if name.contains("/") { continue }
+        // The archive's files are named by path, and the inputs texts are not units; the
+        // record holds only the units' files in dir.
+        if name.contains("/") || name.starts_with(".") { continue }
         sb.write("file {name} {shas.get(name) ?? ""}\n")
         files = files + 1
     }
@@ -152,23 +228,31 @@ pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[S
 }
 
 type EmitRecord {
+    inputs_len: Int
+    // The sha of the inputs text beside the record, or "-" when the build did not hash it.
+    inputs_sha: Str
     units: List[EmittedUnit]
     files: List[Str]
     shas: Map[Str, Str]
 }
 
-// The record in dir when it is whole and its inputs are as long as `inputs`. Only the
-// inputs text beside it can show they are the same.
-fn read_record(dir: Str, inputs: Str) -> Option[EmitRecord] {
+// The record in dir when it is whole. Only the inputs text beside it can show which inputs
+// it records.
+fn read_record(dir: Str) -> Option[EmitRecord] {
     let path = "{dir}/{RECORD_NAME}"
     if file_exists(path) != 1 {
         return None
     }
     let lines = read_file(path).split("\n")
-    if lines.len() < 4 || lines.get(0).unwrap() != RECORD_SCHEMA || lines.get(1).unwrap() != "inputs {inputs.byte_len()}" {
+    if lines.len() < 4 || lines.get(0).unwrap() != RECORD_SCHEMA {
+        return None
+    }
+    let head = lines.get(1).unwrap().split(" ")
+    if head.len() != 3 || head.get(0).unwrap() != "inputs" {
         return None
     }
     let mut units: List[EmittedUnit] = []
+    let mut uses: Map[Str, List[Str]] = Map()
     let mut files: List[Str] = []
     let mut shas: Map[Str, Str] = Map()
     let mut ended = false
@@ -182,11 +266,22 @@ fn read_record(dir: Str, inputs: Str) -> Option[EmitRecord] {
             ended = true
             continue
         }
+        if line.starts_with("uses ") {
+            let sp = match line.byte_index_of(" ", 5) {
+                Some(k) => k
+                None => return None
+            }
+            let m = line.byte_slice(5, sp)
+            let mut ps = uses.get(m) ?? []
+            ps.push(line.byte_slice(sp + 1, line.byte_len()))
+            uses.insert(m, ps)
+            continue
+        }
         let parts = line.split(" ")
         let kind = parts.get(0).unwrap()
         if kind == "unit" && parts.len() == 4 {
             let hs = parts.get(3).unwrap()
-            units.push(EmittedUnit { module: parts.get(1).unwrap(), c_bytes: parts.get(2).unwrap().to_int(), headers: if hs == "" { [] } else { hs.split(",") } })
+            units.push(EmittedUnit { module: parts.get(1).unwrap(), c_bytes: parts.get(2).unwrap().to_int(), headers: if hs == "" { [] } else { hs.split(",") }, uses: [] })
         } else if kind == "file" && parts.len() == 3 {
             files.push(parts.get(1).unwrap())
             shas.insert(parts.get(1).unwrap(), parts.get(2).unwrap())
@@ -197,13 +292,31 @@ fn read_record(dir: Str, inputs: Str) -> Option[EmitRecord] {
     if !ended || units.len() == 0 || files.len() == 0 {
         return None
     }
+    let mut with_uses: List[EmittedUnit] = []
     for u in units {
         if !shas.contains_key("{u.module}.c") { return None }
         for h in u.headers {
             if !shas.contains_key(h) { return None }
         }
+        with_uses.push(EmittedUnit { uses: uses.get(u.module) ?? [], ..u })
     }
-    Some(EmitRecord { units: units, files: files, shas: shas })
+    Some(EmitRecord { inputs_len: head.get(1).unwrap().to_int(), inputs_sha: head.get(2).unwrap(), units: with_uses, files: files, shas: shas })
+}
+
+// A shell command that links (or copies) each of names from from_dir into to_dir, and fails
+// when it could do neither.
+fn link_command(from_dir: Str, to_dir: Str, names: List[Str]) -> Str {
+    let mut srcs: List[Str] = []
+    let mut dsts: List[Str] = []
+    for n in names {
+        srcs.push("\"{from_dir}/{n}\"")
+        dsts.push("\"{to_dir}/{n}\"")
+    }
+    let src_list = srcs.join(" ")
+    // A build never writes a file in a units directory once it replaced the last one, so
+    // a hard link shares bytes that no longer change. The copy is for a filesystem
+    // without hard links; it removes any link made first, since cp would write through it.
+    "\{ ln {src_list} \"{to_dir}/\"; \} 2>/dev/null || \{ rm -f {dsts.join(" ")}; cp {src_list} \"{to_dir}/\" || exit 1; \}"
 }
 
 // The units of the record in from_dir whose inputs are `inputs`, with their files and the
@@ -212,9 +325,12 @@ fn read_record(dir: Str, inputs: Str) -> Option[EmitRecord] {
 // edited or replaced since the record was written is never taken. None, with to_dir left
 // empty, when there is no such record or a file differs.
 pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[ReusedUnits] {
-    let rec = match read_record(from_dir, inputs) {
+    let rec = match read_record(from_dir) {
         Some(r) => r
         None => return None
+    }
+    if rec.inputs_len != inputs.byte_len() {
+        return None
     }
     // Many edits keep the inputs as long as the last ones, and linking and hashing every file
     // only to find the text differs costs more than reading it.
@@ -232,14 +348,12 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
     dsts.push("\"{to_dir}/{INPUTS_NAME}\"")
     let src_list = srcs.join(" ")
     let dst_list = dsts.join(" ")
-    // A build never writes a file in a units directory once it replaced the last one, so a
-    // hard link shares bytes that no longer change. The copy is for a filesystem without hard
-    // links; it removes any link made first, since cp would write through it.
+    // One cp for every file; link_command says why a link.
     let cp = process_run("sh", ["-c", "cp -l {src_list} \"{to_dir}/\" 2>/dev/null || \{ rm -f {dst_list}; cp {src_list} \"{to_dir}/\"; \}"])
     let mut ok = cp.exit_code == 0
     let mut shas: Map[Str, Str] = Map()
     if ok {
-        match build_objcache.unit_file_shas(to_dir, arc_dir) {
+        match build_objcache.unit_file_shas_with(to_dir, arc_dir, [INPUTS_NAME]) {
             Some(s) => shas = s
             None => ok = false
         }
@@ -248,6 +362,7 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
         for f in rec.files {
             if (shas.get(f) ?? "") != (rec.shas.get(f) ?? "-") { ok = false }
         }
+        if (shas.get(INPUTS_NAME) ?? "") != rec.inputs_sha { ok = false }
     }
     // Another build can replace from_dir between the read above and the link.
     if ok {
@@ -259,4 +374,133 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
         return None
     }
     Some(ReusedUnits { units: rec.units, shas: shas })
+}
+
+// The units a build takes from the last build's record while it emits the rest, what the
+// files it took must hash as once they are in its units directory, and the shell command
+// that puts the units' files there.
+pub type TakenUnits {
+    units: List[EmittedUnit]
+    shas: Map[Str, Str]
+    link: Str
+}
+
+// The units of the record in from_dir, among candidates, that this build can take: the
+// inputs other than the texts of the files in own (the sources of the program's modules)
+// match the last build's, the headers in to_dir that names and texts give match the last
+// build's, and every source each unit spanned holds the same text. The last build's inputs
+// text, as the build read it, goes into to_dir as last_inputs_name(). The build runs the
+// link command of what it takes before it hashes to_dir, and checks in taken_units_hold that
+// the files it took, the inputs text it read, and the headers it compared hash as the
+// record says, so all a build compares is of one record. Nothing goes into to_dir before
+// a unit is chosen, so a unit the build emits is never written through a link. None, with
+// nothing written, when no unit can be taken.
+pub fn take_units(from_dir: Str, to_dir: Str, inputs: Str, candidates: List[Str], own: Map[Str, Bool], names: List[Str], texts: List[Str]) -> Option[TakenUnits] {
+    let rec = match read_record(from_dir) {
+        Some(r) => r
+        None => return None
+    }
+    if rec.inputs_sha == "-" { return None }
+    let mut want: Map[Str, Bool] = Map()
+    for m in candidates { want.insert(m, true) }
+    let mut any = false
+    for u in rec.units {
+        if want.contains_key(u.module) && u.uses.len() > 0 { any = true }
+    }
+    if !any { return None }
+    // The headers are what every unit reads of the modules it does not lower, so all of them
+    // must be the last build's, and no more of them.
+    let mut rec_headers = 0
+    for f in rec.files {
+        if f.ends_with(".h") { rec_headers = rec_headers + 1 }
+    }
+    if rec_headers != names.len() { return None }
+    let mut i = 0
+    while i < names.len() {
+        let name = names.get(i).unwrap()
+        if !rec.shas.contains_key(name) { return None }
+        let path = "{from_dir}/{name}"
+        if file_exists(path) != 1 || read_file(path) != texts.get(i).unwrap() { return None }
+        i = i + 1
+    }
+    let last_inputs = "{from_dir}/{INPUTS_NAME}"
+    if file_exists(last_inputs) != 1 { return None }
+    let last_text = read_file(last_inputs)
+    let both = match texts_if_same_but_own(last_text, inputs, own) {
+        Some(t) => t
+        None => return None
+    }
+    let texts_old = both.old
+    let texts_new = both.new
+    let mut taken: List[EmittedUnit] = []
+    let mut c_names: List[Str] = []
+    for u in rec.units {
+        if !want.contains_key(u.module) || u.uses.len() == 0 { continue }
+        let mut ok = true
+        for p in u.uses {
+            // A source no longer loaded has no text to match; one the other inputs hold
+            // already matched with them.
+            if !texts_new.contains_key(p) || texts_new.get(p) != texts_old.get(p) { ok = false }
+        }
+        if ok {
+            taken.push(u)
+            c_names.push("{u.module}.c")
+        }
+    }
+    if taken.len() == 0 { return None }
+    // Written, not linked: these are the bytes the build compared, whatever from_dir holds by
+    // the time it hashes them.
+    write_file("{to_dir}/{LAST_INPUTS_NAME}", last_text)
+    let mut shas: Map[Str, Str] = Map()
+    for c in c_names { shas.insert(c, rec.shas.get(c) ?? "-") }
+    for name in names { shas.insert(name, rec.shas.get(name) ?? "-") }
+    shas.insert(LAST_INPUTS_NAME, rec.inputs_sha)
+    Some(TakenUnits { units: taken, shas: shas, link: link_command(from_dir, to_dir, c_names) })
+}
+
+// The text of each loaded source in two inputs texts, by its path.
+type SourceTexts {
+    old: Map[Str, Str]
+    new: Map[Str, Str]
+}
+
+// The source texts of old_text and new_text when their fields are the same but for the text
+// of each file own names. None when they differ anywhere else, or one is not whole.
+fn texts_if_same_but_own(old_text: Str, new_text: Str, own: Map[Str, Bool]) -> Option[SourceTexts] {
+    let o = match parse_inputs(old_text) {
+        Some(f) => f
+        None => return None
+    }
+    let n = match parse_inputs(new_text) {
+        Some(f) => f
+        None => return None
+    }
+    if o.tags.len() != n.tags.len() { return None }
+    let mut texts_old: Map[Str, Str] = Map()
+    let mut texts_new: Map[Str, Str] = Map()
+    let mut i = 0
+    while i < n.tags.len() {
+        let tag = n.tags.get(i).unwrap()
+        if o.tags.get(i).unwrap() != tag { return None }
+        let is_text = tag == "text" && i > 0 && n.tags.get(i - 1).unwrap() == "file"
+        let mut skip = false
+        if is_text {
+            // The file field before it already matched, so both texts are of one path.
+            let path = n.values.get(i - 1).unwrap()
+            texts_old.insert(path, o.values.get(i).unwrap())
+            texts_new.insert(path, n.values.get(i).unwrap())
+            skip = own.contains_key(path)
+        }
+        if !skip && o.values.get(i).unwrap() != n.values.get(i).unwrap() { return None }
+        i = i + 1
+    }
+    Some(SourceTexts { old: texts_old, new: texts_new })
+}
+
+// Whether every file of taken hashes, in shas, as the record it came from says.
+pub fn taken_units_hold(taken: TakenUnits, shas: Map[Str, Str]) -> Bool {
+    for name in taken.shas.keys() {
+        if (shas.get(name) ?? "") != (taken.shas.get(name) ?? "-") { return false }
+    }
+    true
 }

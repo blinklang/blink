@@ -1,0 +1,116 @@
+// A per-module build takes some units' files from the last build by hard link. The units it
+// emits again are written into its own files, never through a link, so the last build's
+// files keep their bytes.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"unit_reuse_app\"\nversion = \"0.1.0\"\n")
+    // mid's unit lowers base's field default, so it reads base's source.
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub type Cfg {"#,
+        #"    n: Int = [10, 20].get(1).unwrap()"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{Cfg, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    let c = Cfg { }"#,
+        #"    tag("{c.n}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build_into(tree: Str, env_args: Str, flags: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, env_args, "build app/src/main.bl -o {tree}/{out}/app --per-module {flags}")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            out.push(line.byte_slice(29, line.byte_len()))
+        }
+    }
+    out.join(",")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+// Whether the build took m's unit from the last build.
+fn took(r: ProcessResult, m: Str) -> Bool {
+    reused_units(r).split(",").contains(m)
+}
+
+test "a unit the build emits again leaves the last build's file of it as it was" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_unit_reuse_no_write_through_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "", "", "out")
+    // A second name for the last build's file, which outlives the units directory.
+    shell_exec("ln {tree}/out/app.units/leaf.c {tree}/last_leaf.c")
+    let before = read_file("{tree}/last_leaf.c")
+    edit(tree, "leaf.bl", #"s/"leaf"/"lea2"/"#)
+    let warm = build_into(tree, "", "", "out")
+    let after = read_file("{tree}/last_leaf.c")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(took(warm, "base") && took(warm, "mid") && !took(warm, "leaf"), "the leaf edit took {reused_units(warm)}")
+    assert(before.contains("\"leaf\""), "the last build's leaf.c does not hold the old text")
+    assert(after == before, "the build wrote the last build's leaf.c")
+    assert_eq(out, "[main] [20] [lea2]")
+}

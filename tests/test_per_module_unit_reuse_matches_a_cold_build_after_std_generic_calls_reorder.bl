@@ -1,0 +1,111 @@
+// A per-module unit may hold its own copies of std generics, in the order the program first
+// named them. That order can change with an edit to another module that leaves every key of
+// the unit as it was, so a unit taken from the last build must still match a cold build of
+// the same tree byte for byte.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"unit_reuse_app\"\nversion = \"0.1.0\"\n")
+    // b is walked before a, since a imports it, so b's body decides which of the two std
+    // generics the program names first.
+    write_file("{tree}/app/src/b.bl", [
+        #"import std.list.{list_any, list_all}"#,
+        #""#,
+        #"pub fn b_value() -> Int {"#,
+        #"    let xs = [1, 2, 3]"#,
+        #"    let p = list_any(xs, fn(x: Int) -> Bool { x > 2 })"#,
+        #"    let q = list_all(xs, fn(x: Int) -> Bool { x > 0 })"#,
+        #"    if p && q { 1 } else { 0 }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/a.bl", [
+        #"import std.list.{list_any, list_all}"#,
+        #"import b.{b_value}"#,
+        #""#,
+        #"pub fn a_value() -> Int {"#,
+        #"    let xs = [4, 5]"#,
+        #"    let p = list_all(xs, fn(x: Int) -> Bool { x > 3 })"#,
+        #"    let q = list_any(xs, fn(x: Int) -> Bool { x > 4 })"#,
+        #"    if p && q { b_value() + 10 } else { b_value() }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import a.{a_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{a_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build_into(tree: Str, env_args: Str, flags: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, env_args, "build app/src/main.bl -o {tree}/{out}/app --per-module {flags}")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            out.push(line.byte_slice(29, line.byte_len()))
+        }
+    }
+    out.join(",")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+// Whether the build took m's unit from the last build.
+fn took(r: ProcessResult, m: Str) -> Bool {
+    reused_units(r).split(",").contains(m)
+}
+
+test "a taken unit matches a cold build after another module names the same std generics in a new order" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_unit_reuse_std_copy_order_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "", "", "out")
+    edit(tree, "b.bl", #"/let [pq] = /{s/list_any/TMP_ANY/;s/list_all/list_any/;s/TMP_ANY/list_all/}"#)
+    let warm = build_into(tree, "", "", "out")
+    let _cold = build_into(tree, "", "", "cold")
+    let taken = read_file("{tree}/out/app.units/a.c")
+    let fresh = read_file("{tree}/cold/app.units/a.c")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(took(warm, "a") && !took(warm, "b"), "the edit of b took {reused_units(warm)}")
+    assert(fresh.contains("list_1any_0Int") && fresh.contains("list_1all_0Int"), "a's unit holds no copy of the two std generics")
+    assert(taken == fresh, "the taken a.c differs from a cold build's")
+    assert_eq(out, "10")
+}

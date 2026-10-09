@@ -1,0 +1,154 @@
+// A per-module build reads the last build's inputs text to choose what it can reuse, and
+// that text must be the one the last build's record names by its sha. An inputs text edited
+// after its record was written never makes a build reuse C that its sources no longer give.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"unit_reuse_app\"\nversion = \"0.1.0\"\n")
+    // mid's unit lowers base's field default, so it reads base's source.
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub type Cfg {"#,
+        #"    n: Int = [10, 20].get(1).unwrap()"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{Cfg, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    let c = Cfg { }"#,
+        #"    tag("{c.n}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build_into(tree: Str, env_args: Str, flags: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, env_args, "build app/src/main.bl -o {tree}/{out}/app --per-module {flags}")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            out.push(line.byte_slice(29, line.byte_len()))
+        }
+    }
+    out.join(",")
+}
+
+// The C files that differ between out/ and a build of the same inputs with no last build.
+fn differ_from_cold(tree: Str, env_args: Str, flags: Str) -> Str {
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, env_args, flags, "cold")
+    sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done").split("\n").join(" ")
+}
+
+// Puts the inputs text of a build of the tree as it is now in place of the one out/ holds,
+// and leaves out/'s record as it was.
+fn swap_inputs(tree: Str, env_args: Str, flags: Str) {
+    shell_exec("rm -rf {tree}/now")
+    let _now = build_into(tree, env_args, flags, "now")
+    let path = "{tree}/out/app.units/.emit-inputs"
+    let before = read_file(path)
+    shell_exec("rm -f {path} && cp {tree}/now/app.units/.emit-inputs {path} && rm -rf {tree}/now")
+    assert(read_file(path) != before, "the build of the tree as it is now has the same inputs text")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+// Whether the build took m's unit from the last build.
+fn took(r: ProcessResult, m: Str) -> Bool {
+    reused_units(r).split(",").contains(m)
+}
+
+// Whether the build emitted m's unit again after the files it took failed their check.
+fn emitted_again(r: ProcessResult, m: Str) -> Bool {
+    "{r.out}\n{r.err_out}".split("\n").contains("[dbg:build.units] emit unit {m} again")
+}
+
+test "an inputs text edited to match the new sources does not reuse the whole emit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_reuse_edited_inputs_whole_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "", "", "out")
+    edit(tree, "base.bl", "s/get(1)/get(0)/")
+    swap_inputs(tree, "", "")
+    let warm = build_into(tree, "", "", "out")
+    let out = sh("{tree}/out/app")
+    let differ = differ_from_cold(tree, "", "")
+    shell_exec("rm -rf {tree}")
+    let whole = "{warm.out}\n{warm.err_out}".split("\n").contains("[dbg:build.units] reuse emit")
+    assert(!whole, "the build reused the whole emit of the last build")
+    assert_eq(differ, "")
+    assert_eq(out, "[main] [10] [leaf]")
+}
+
+test "an inputs text edited to match one new source does not keep the units that read it" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_reuse_edited_inputs_units_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "", "", "out")
+    edit(tree, "base.bl", "s/get(1)/get(0)/")
+    swap_inputs(tree, "", "")
+    edit(tree, "leaf.bl", #"s/"leaf"/"lea2"/"#)
+    let warm = build_into(tree, "", "", "out")
+    let out = sh("{tree}/out/app")
+    let differ = differ_from_cold(tree, "", "")
+    shell_exec("rm -rf {tree}")
+    assert(!took(warm, "mid") || emitted_again(warm, "mid"), "the build kept mid's unit of the last build")
+    assert_eq(differ, "")
+    assert_eq(out, "[main] [10] [lea2]")
+}

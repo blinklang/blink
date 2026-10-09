@@ -11,9 +11,9 @@
 
 import ast.{NodeKind, nk_of, node_kind_name}
 import parser.{
-    node_args, node_arms, node_body, node_col, node_condition, node_elements, node_else_body,
+    node_args, node_arms, node_body, node_condition, node_elements, node_else_body,
     node_end, node_fields, node_for_binder, node_guard, node_handlers, node_inclusive,
-    node_index, node_int_val, node_is_mut, node_iterable, node_kind, node_left, node_line, node_name,
+    node_index, node_int_val, node_is_mut, node_iterable, node_kind, node_left, node_name,
     node_obj, node_op, node_params, node_pattern, node_right, node_scrutinee, node_start,
     node_stmts, node_str_val, node_target, node_then_body, node_type_name, node_type_ann,
     node_value, sublist_get, sublist_length, interp_part_is_literal,
@@ -40,7 +40,7 @@ import cname.{
     c_str_const,
 }
 import ir.{
-    IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
+    ir_note_source, ir_line, ir_col, IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
     ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kids, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
@@ -261,6 +261,7 @@ fn poison_value(node: Int) -> Int ! Diag.Report {
 // A function body. Parameters bind in the body's scope so a read of one resolves to its
 // declared type, and the body's tail value becomes the function's return.
 pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
+    ir_note_source(fn_node)
     let scope = open_scope()
     // A binding a closure of this body shares is stored in one heap cell, and the cell is
     // allocated where the binding is declared. So which names are shared has to be settled
@@ -559,7 +560,7 @@ fn diverging_tail_backstop(tail: Int) -> List[Int] ! Diag.Report {
     if !cs_debug_mode { return [ir_unreachable(tail)] }
     let fail = call_runtime_void(tail, c_debug_assert_fail_name(), [
         str_const(tail, diag_file_for_node(tail)),
-        int_const(tail, "{node_line(tail)}"),
+        int_const(tail, "{ir_line(tail)}"),
         str_const(tail, cs_current_fn_name),
         str_const(tail, "BLINK_ICE_DIVERGING_TAIL"),
         str_const(tail, "internal compiler error: a tail typecheck accepted as diverging fell through"),
@@ -919,8 +920,8 @@ fn lower_assert_call(node: Int) -> Int ! Diag.Report {
         str_const(node, assertion),
         intro_arg,
         str_const(node, diag_file_for_node(node)),
-        int_const(node, "{node_line(node)}"),
-        int_const(node, "{node_col(node)}"),
+        int_const(node, "{ir_line(node)}"),
+        int_const(node, "{ir_col(node)}"),
         user_msg,
     ])
     let mut pre = decomposed.pre
@@ -1009,7 +1010,7 @@ fn lower_assert_aggregate(node: Int, tid: Int, left_node: Int, right_node: Int, 
     if left_value < 0 || right_value < 0 { return -1 }
     let left_bound = bind_temp("left", tid, node, left_value)
     let right_bound = bind_temp("right", tid, node, right_value)
-    let line = int_const(node, "{node_line(node)}")
+    let line = int_const(node, "{ir_line(node)}")
     // The compare and the rendering both read the bound temps, so whatever they hoist must
     // land after those temps' declarations, not ahead of this whole statement.
     let mut stmts: List[Int] = [left_bound.stmt, right_bound.stmt]
@@ -1056,7 +1057,7 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
     let left_bound = bind_temp("left", tid, node, left_value)
     let right_bound = bind_temp("right", tid, node, right_value)
     let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
-    let line = int_const(node, "{node_line(node)}")
+    let line = int_const(node, "{ir_line(node)}")
     let mut pre: List[Int] = [left_bound.stmt, right_bound.stmt]
     if eq_is_str(tid) {
         let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
@@ -1105,7 +1106,7 @@ fn lower_assert_ne_call(node: Int) -> Int ! Diag.Report {
     let left_bound = bind_temp("left", tid, node, left_value)
     let right_bound = bind_temp("right", tid, node, right_value)
     let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
-    let line = int_const(node, "{node_line(node)}")
+    let line = int_const(node, "{ir_line(node)}")
     let mut pre: List[Int] = [left_bound.stmt, right_bound.stmt]
     if eq_is_str(tid) {
         let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
@@ -1154,7 +1155,7 @@ fn lower_debug_assert_call(node: Int) -> Int ! Diag.Report {
     }
     let fail_stmt = call_runtime_void(node, c_debug_assert_fail_name(), [
         str_const(node, diag_file_for_node(node)),
-        int_const(node, "{node_line(node)}"),
+        int_const(node, "{ir_line(node)}"),
         str_const(node, cs_current_fn_name),
         str_const(node, unparse_expr(cond_node)),
         msg,
@@ -2604,7 +2605,7 @@ fn wrap_handler(item: Int, inner: Int) -> Int ! Diag.Report {
 // is bound ahead of the frame, so a panic in it is not the one the frame waits for and
 // the printer reads it twice without running it twice. The body's value is discarded.
 fn lower_assert_panics(node: Int) -> Int ! Diag.Report {
-    if node_line(node) <= 0 || node_col(node) <= 0 {
+    if ir_line(node) <= 0 || ir_col(node) <= 0 {
         diag_ice_at("AssertPanicsHasNoPosition", CODEGEN_STAGE_NOT_BUILT,
             "assert_panics has no source position to report its failure at", node,
             "the runtime records a line and a column as numbers; a synthesized assert_panics must copy a position")
@@ -2628,8 +2629,8 @@ fn lower_assert_panics(node: Int) -> Int ! Diag.Report {
     cg_expr_frame_close()
     if body < 0 { return -1 }
     let file = ir_const(TYPE_STR, node, str_rec.c_spelling, c_str_const(diag_file_for_node(node)))
-    let line = ir_const(TYPE_INT, node, int_rec.c_spelling, "{node_line(node)}")
-    let col = ir_const(TYPE_INT, node, int_rec.c_spelling, "{node_col(node)}")
+    let line = ir_const(TYPE_INT, node, int_rec.c_spelling, "{ir_line(node)}")
+    let col = ir_const(TYPE_INT, node, int_rec.c_spelling, "{ir_col(node)}")
     out.push(ir_panic_catch(node, frame, file, line, col, matcher, as_block(body)))
     ir_block(node, out)
 }
