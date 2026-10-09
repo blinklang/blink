@@ -676,8 +676,12 @@ build of a second entry such as `examples/calculator.bl`.
 The daemon is now a router and a set of workers:
 
 - The router runs no front end. It keys each check, build or run by the
-  entry's absolute path, with no `.`, `..` or empty parts. A symbolic link
-  and its target are two keys.
+  entry's real path (`realpath(3)` of the client's directory and the path as
+  typed). A symbolic link to an entry, and a path through a linked
+  directory, give the key of the target, so they go to the same worker. Two
+  files never share a real path, so never a key. A path that `realpath`
+  cannot resolve, such as a missing file, falls back to the absolute path
+  with no `.`, `..` or empty parts.
 - For a new key, the router forks a worker. The worker checks that entry and
   serves it as the daemon served its one entry before. Its socket and files
   are in `.blink/w<router pid>-<k>/`.
@@ -716,9 +720,34 @@ The daemon is now a router and a set of workers:
   as the daemon and checks again at each edit, so it starts the marker
   threads again after the fork.
 - The router serves only an entry in the project root (the directory of
-  the nearest `blink.toml`) or below it, by the key above. A file outside
-  it can be part of another project, so its check or build runs cold. The
-  entry that the daemon started on is served wherever it is.
+  the nearest `blink.toml`) or below it. It compares the key above with the
+  real path of the root, so a link in the project to a file outside it is
+  outside. A file outside the root can be part of another project, so its
+  check or build runs cold. The entry that the daemon started on is served
+  wherever it is.
+- Builds of two entries do not run at the same time, as with two builds of
+  one entry. Each build uses all the cores it can get, and the daemon keeps
+  its one rule for builds. The router holds one build turn for all workers:
+  - Before the fork, the router connects to the new worker's socket. The
+    worker's first accept is that connection, its channel to the router.
+    The worker only writes on it (`{"type":"turn"}` to ask, then
+    `{"type":"done","more":0|1}`), and the router only reads, so neither
+    waits on the other. The router waits with `poll` on its socket and all
+    channels.
+  - A worker queues each build and asks for the turn. The router gives the
+    turn to the oldest asker: it connects to the worker's socket and sends
+    `{"type":"turn"}`. The worker runs its oldest build. When the build
+    child ends, the worker sends `done`, with `more` 1 when it has more
+    builds. Such a worker goes to the end of the queue, so a turn is one
+    build, and two workers with many builds take turns.
+  - `blink daemon status` gives `building` 1 for the build that holds the
+    turn and `queued` for each build that waits, in any worker.
+  - A stop waits for the build that holds the turn, as above. Each worker
+    then sends its queued builds cold, replies to the stop and exits.
+  - A worker that ends while it holds the turn frees it at the router's next
+    reap. Its build child, if one runs, is not killed (see the crash case
+    above), so it can still write while the next worker builds. It writes
+    only its own entry's units dir and output.
 - The router refuses a build from a client with another identity or other
   front-end settings before it routes the build. The client builds cold, and
   the router forks no worker for it. The worker does the same check again. A
