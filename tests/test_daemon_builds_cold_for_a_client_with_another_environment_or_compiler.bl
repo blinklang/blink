@@ -1,0 +1,194 @@
+// A build reads the compiler binary and the environment besides its sources and its command
+// line, so the daemon builds only for a client that runs its compiler under its environment.
+// A client with another variable, a compiler at another path or another compiler at the same
+// path builds cold, and gets what a cold build gives. A variable only a shell keeps for itself
+// (SHLVL, OLDPWD) is no difference, and the daemon still builds for that client.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    // The compiler's lib/ is a real directory, so it can hold a bundled pkg module that a
+    // local file later shadows. The stdlib stays the tree's.
+    shell_exec("mkdir -p {tree}/build/lib/pkg && ln -s {root}/lib/std {tree}/build/lib/std && ln -s {tree}/build/lib {tree}/lib")
+    write_file("{tree}/build/lib/pkg/probe.bl", "pub fn where() -> Str \{\n    \"bundled\"\n\}\n")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // The daemon listens at the project root, so each tree is a project of its own.
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_identity_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"import pkg.probe.{where}"#,
+        #""#,
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s} {where()}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/extra.bl", [
+        #"pub fn extra_value() -> Str {"#,
+        #"    "extra""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #"import extra.{extra_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()} {extra_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it serves only a client whose env is its own.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    client(tree, "", "blink", args)
+}
+
+// A command run as a client that differs from the daemon by env_args and by the compiler it
+// runs, build/<bin>.
+fn client(tree: Str, env_args: Str, bin: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} {env_args} ../build/{bin} {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "builds", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            n.to_int()
+        }
+        None => -1
+    }
+}
+
+// What a build printed, with its tree's path and its private units directory's random name
+// spelled the same in every tree.
+fn plain(tree: Str, s: Str) -> Str {
+    let t = s.replace(tree, "TREE")
+    let mut out = ""
+    let mut rest = t
+    loop {
+        match rest.byte_index_of(".units.", 0) {
+            Some(at) => {
+                let end = if at + 13 <= rest.byte_len() { at + 13 } else { rest.byte_len() }
+                out = "{out}{rest.byte_slice(0, at)}.units.XXXXXX"
+                rest = rest.byte_slice(end, rest.byte_len())
+            }
+            None => break
+        }
+    }
+    "{out}{rest}"
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{a.out}{a.err_out}\n-- vs --\n{b.out}{b.err_out}" }
+    if plain(a_tree, a.out) != plain(b_tree, b.out) { return "stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if plain(a_tree, a.err_out) != plain(b_tree, b.err_out) { return "stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// What two trees' last builds left that differs: a C file of the units, or the program.
+fn output_differ(a_tree: Str, b_tree: Str) -> Str {
+    sh("cd {b_tree}/app/out/app.units && for f in *.c *.h; do cmp -s $f {a_tree}/app/out/app.units/$f || echo $f; done; cd {a_tree}/app/out/app.units && for f in *.c *.h; do [ -e {b_tree}/app/out/app.units/$f ] || echo extra:$f; done; [ -e {a_tree}/app/out/app ] || [ -e {b_tree}/app/out/app ] || exit 0; cmp -s {a_tree}/app/out/app {b_tree}/app/out/app || echo program").split("\n").join(" ")
+}
+
+fn build(tree: Str, env_args: Str, bin: Str) -> ProcessResult {
+    client(tree, env_args, bin, "build src/main.bl -o out/app")
+}
+
+test "a client with another environment or compiler builds cold" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_identity_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_identity_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    for t in [warm, cold] { shell_exec("cp {t}/build/blink {t}/build/blink-copy") }
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut builds: List[Str] = []
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        let cases = [
+            ("same", "", "blink"),
+            ("another variable", "BLINK_DAEMON_BUILD_PROBE=1", "blink"),
+            ("another shell", "SHLVL=7 OLDPWD=/", "blink"),
+            ("a compiler at another path", "", "blink-copy"),
+        ]
+        for (label, env_args, bin) in cases {
+            let d = differ(warm, build(warm, env_args, bin), cold, build(cold, env_args, bin))
+            if d != "" { problems.push("{label}: {d}") }
+            let o = output_differ(warm, cold)
+            if o != "" { problems.push("{label}: {o}") }
+            builds.push("{label}={served(warm, "builds")}")
+        }
+        // One byte past the end of the ELF file: the binary runs the same, but its bytes differ.
+        // A running binary can not be written, so the new one replaces it as an install does.
+        for t in [warm, cold] {
+            shell_exec("cp {t}/build/blink {t}/build/blink.new && printf x >> {t}/build/blink.new && mv {t}/build/blink.new {t}/build/blink")
+        }
+        let d = differ(warm, build(warm, "", "blink"), cold, build(cold, "", "blink"))
+        if d != "" { problems.push("another compiler: {d}") }
+        let o = output_differ(warm, cold)
+        if o != "" { problems.push("another compiler: {o}") }
+        builds.push("another compiler={served(warm, "builds")}")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    assert_eq(problems.join("\n"), "")
+    assert_eq(builds.join(", "), "same=1, another variable=1, another shell=2, a compiler at another path=2, another compiler=2")
+}

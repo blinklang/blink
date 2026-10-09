@@ -3,13 +3,14 @@ import std.args.{
     ArgParser, Args,
     argparser_new, set_version, add_flag, add_command,
     command_add_flag, command_add_option, command_add_positional,
-    argparse, args_has, args_get, args_get_all,
+    argparse, parse_argv, args_has, args_get, args_get_all,
     args_command, args_positional, args_rest, args_error,
     generate_help, generate_command_help,
 }
 import std.json.{
     json_clear, json_parse, json_new_object, json_new_str, json_new_int,
     json_new_bool, json_set, json_get, json_remove, json_encode, json_as_int, json_as_str,
+    json_new_array, json_push,
 }
 import std.path.{path_join, path_dirname, path_basename}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
@@ -59,7 +60,7 @@ import stdlib_native_deps.{
 }
 import build_objcache
 import emit_record
-import std_cache_key.{archive_compiler_path, sha256_of_file_first}
+import std_cache_key.{SHA256SUM_SH, archive_compiler_path, sha256_of_file_first}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
@@ -72,7 +73,7 @@ import diagnostics.{
     embedded_inner_key,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
 }
-import daemon.{Daemon, daemon_start, daemon_socket_path}
+import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path}
 import docgen.{generate_doc}
 import lsp.{lsp_start}
 import comment_attach.{attach_comments_pass}
@@ -427,18 +428,24 @@ fn resolve_lockfile_path() -> Str {
     ""
 }
 
-fn ensure_deps_resolved() {
+// Whether blink.toml is newer than the lock, or has none, so a build resolves its
+// dependencies first.
+fn deps_unresolved() -> Bool {
     let manifest = resolve_manifest_path()
     if manifest == "" {
-        return
+        return false
     }
     let toml_mt = file_mtime(manifest)
     if toml_mt == -1 {
-        return
+        return false
     }
     let lockfile = resolve_lockfile_path()
     let lock_mt = if lockfile != "" { file_mtime(lockfile) } else { -1 }
-    if lock_mt == -1 || toml_mt > lock_mt {
+    lock_mt == -1 || toml_mt > lock_mt
+}
+
+fn ensure_deps_resolved() {
+    if deps_unresolved() {
         io.eprintln("resolving dependencies...")
         let rc = resolve_and_lock(".", blink_cli_version)
         if rc != 0 {
@@ -482,6 +489,38 @@ fn compile_front_end(source_path: Str, strict_mode: Int) -> Result[Int, Int] ! L
         return Err(1)
     }
     Ok(final_program)
+}
+
+// What compile_front_end returns for the program the daemon checked, printing what it would
+// print: the check ran the same stages on the same inputs, and front holds what they reported
+// where compile_front_end stops on an error.
+fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Diag.Report {
+    io.print(b.out)
+    io.eprint(b.err)
+    let f = b.front
+    if f.ices > 0 {
+        io.eprint(f.human)
+        return Err(101)
+    }
+    if f.errors > 0 {
+        io.eprint(f.human)
+        return Err(1)
+    }
+    if f.warnings > 0 {
+        io.eprint(f.human)
+        if strict_mode != 0 {
+            return Err(1)
+        }
+    }
+    if diag_ice_count > 0 {
+        diag_flush()
+        return Err(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        return Err(1)
+    }
+    Ok(b.program)
 }
 
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
@@ -978,23 +1017,32 @@ fn sha8(sha: Str) -> Str {
 // memoized for the obj cache. An installed archive is never rebuilt;
 // verify_installed_archive checks it instead.
 fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    if dev_archive_current() {
+        return 0
+    }
+    let arc_dir = resolve_archive_dir()
+    let rc = build_stdlib_archive_in(arc_dir, peeled_module_keys(), false)
+    if rc != 0 {
+        io.eprintln("error: failed to build stdlib archive in {arc_dir} (rc={rc})")
+    }
+    rc
+}
+
+// Whether ensure_dev_archive would leave the archive as it is.
+fn dev_archive_current() -> Bool {
     let arc_dir = resolve_archive_dir()
     if arc_dir.ends_with("share/blink") {
-        return 0
+        return true
     }
     let stamp_path = path_join(arc_dir, ".archive-id")
     let cur_bc_sha = process_compiler_sha()
     if cur_bc_sha != "" && file_exists(stamp_path) == 1 && file_exists(path_join(arc_dir, "libblink_std.a")) == 1 {
         let parts = read_file(stamp_path).trim().split("|")
         if parts.len() > 2 && parts.get(2).unwrap() == cur_bc_sha {
-            return 0
+            return true
         }
     }
-    let rc = build_stdlib_archive_in(arc_dir, peeled_module_keys(), false)
-    if rc != 0 {
-        io.eprintln("error: failed to build stdlib archive in {arc_dir} (rc={rc})")
-    }
-    rc
+    false
 }
 
 // Reject a stale *installed* stdlib archive before it can be linked into a
@@ -1193,7 +1241,7 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
     0
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     shell_exec("rm -f {output_path}")
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -1206,13 +1254,23 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     if unit_jobs != 0 {
         let reason = per_module_fallback_reason(emit_mode, format_flag)
         if reason == "" {
-            return do_build_units(source_path, output_path, debug_mode, release_mode, targets, json_output, strict_mode, unit_jobs)
+            return do_build_units(source_path, output_path, debug_mode, release_mode, targets, json_output, strict_mode, unit_jobs, checked)
         }
         // BLINK_PER_MODULE alone sets a default, not a request on this command, so its
         // fallback is silent.
         if per_module_flag {
             io.eprintln("note: --per-module ignored: {reason}; building one C unit")
         }
+    }
+    // The daemon's process already ran a front end, which a second one would build on. Its
+    // child gets here only if this path and daemon_may_build disagree; the client then
+    // builds cold.
+    match checked {
+        Some(b) => {
+            write_file(b.declined, "")
+            exit(0)
+        }
+        None => {}
     }
     let rc = do_compile(source_path, c_path, format_flag, debug_mode, strict_mode)
     if rc != 0 {
@@ -1462,11 +1520,19 @@ fn emit_reuse_allowed() -> Bool {
 
 // Writes the per-module headers and one .c per unit into dir, or takes them from the record
 // in last_dir when the emit's inputs are the ones it records.
-fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
-    // Only a build that may take units compares the interface texts, so only it parses for them.
-    parser_want_interface_text(emit_reuse_allowed())
-    let front = compile_front_end(source_path, strict_mode)
-    parser_want_interface_text(false)
+// checked is the build the daemon forked this process for, whose checked program it
+// compiles; None in any other process.
+fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+    let front = match checked {
+        Some(b) => checked_front_end(b, strict_mode)
+        None => {
+            // Only a build that may take units compares the interface texts, so only it parses for them.
+            parser_want_interface_text(emit_reuse_allowed())
+            let f = compile_front_end(source_path, strict_mode)
+            parser_want_interface_text(false)
+            f
+        }
+    }
     let program = match front {
         Ok(p) => p
         Err(rc) => return Err(rc)
@@ -1733,7 +1799,7 @@ fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
     0
 }
 
-fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" {
         out_dir = "."
@@ -1748,7 +1814,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
         io.eprintln("error: cannot make a units directory in {out_dir}")
         return 1
     }
-    let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode) {
+    let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode, checked) {
         Ok(u) => u
         Err(rc) => {
             shell_exec("rm -rf {work}")
@@ -3038,6 +3104,15 @@ fn do_ffi_audit(program: Int, json_output: Int) {
 }
 
 fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+    if build_through_daemon(a, "build") {
+        return
+    }
+    build_here(p, a, None)
+}
+
+// The build `blink build` runs in its own process, or in a child of the daemon, which passes
+// the build it forked the child for as checked.
+fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -3112,7 +3187,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"))
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
     if rc == 0 {
         if emit_flag == "c" {
             if json_output != 0 {
@@ -3130,11 +3205,34 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 }
 
 fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+    if build_through_daemon(a, "run") {
+        run_built(a, run_output_path(a))
+        return
+    }
+    match run_build_here(p, a, None) {
+        Some(output_path) => run_built(a, output_path)
+        None => {}
+    }
+}
+
+// Where `blink run` writes the program it runs.
+fn run_output_path(a: Args) -> Str {
+    let output_path = args_get(a, "output")
+    if output_path != "" {
+        return output_path
+    }
+    "build/{strip_extension(path_basename(args_positional(a, 0)))}"
+}
+
+// The build `blink run` runs in its own process, or in a child of the daemon, which passes
+// checked as build_here's does: the path of the program it built, or None when it names no
+// source.
+fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Option[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
         io.println(generate_command_help(p, "run"))
-        return
+        return None
     }
     check_file_exists(source_path)
     apply_cache_flag(a)
@@ -3155,12 +3253,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
         exit(1)
     }
     trace_mode = args_get(a, "blink-trace")
-    let basename = path_basename(source_path)
-    let name = strip_extension(basename)
-    let mut output_path = args_get(a, "output")
-    if output_path == "" {
-        output_path = "build/{name}"
-    }
+    let output_path = run_output_path(a)
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" {
         out_dir = "."
@@ -3168,17 +3261,26 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     shell_exec("mkdir -p {out_dir}")
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
-    let trace_val = args_get(a, "trace")
-    let trace_env = env.var("BLINK_TRACE") ?? ""
-    if trace_val != "" || trace_env != "" {
+    if run_traces(a) {
         cli_trace_codegen = 1
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag, unit_jobs, args_has(a, "per-module"))
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
     if rc != 0 {
         exit(1)
     }
+    Some(output_path)
+}
+
+// Whether `blink run` builds its program to trace the calls it makes.
+fn run_traces(a: Args) -> Bool {
+    args_get(a, "trace") != "" || (env.var("BLINK_TRACE") ?? "") != ""
+}
+
+// Runs the program `blink run` built, with the arguments meant for it.
+fn run_built(a: Args, output_path: Str) {
+    let trace_val = args_get(a, "trace")
     let mut rest = args_rest(a)
     if trace_val != "" {
         if trace_val == "all" {
@@ -3248,7 +3350,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         shell_exec("mkdir -p build")
         let c_path = "build/{name}.c"
         let output_path = "build/{name}"
-        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0, unit_jobs, args_has(a, "per-module"))
+        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0, unit_jobs, args_has(a, "per-module"), None)
         if rc != 0 {
             exit(1)
         }
@@ -3636,6 +3738,139 @@ fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, stri
         exit(code)
     }
     true
+}
+
+// Whether the daemon may run this build or run: only a per-module build that reaches the
+// unit path. A one-unit build, and a command the CLI rejects, stay cold, so each error says
+// what a cold build says. Reads nothing that can exit.
+fn daemon_may_build(a: Args) -> Bool {
+    let source_path = args_positional(a, 0)
+    if source_path == "" || !file_exists(source_path) {
+        return false
+    }
+    if args_get(a, "emit") != "" {
+        return false
+    }
+    let by_env = env.var("BLINK_PER_MODULE") ?? ""
+    if by_env != "" && by_env != "0" && by_env != "1" {
+        return false
+    }
+    let on = args_has(a, "per-module")
+    let off = args_has(a, "no-per-module")
+    if off || (!on && by_env == "0") {
+        return false
+    }
+    let mut format_flag = args_get(a, "format")
+    if args_has(a, "json") && format_flag == "" {
+        format_flag = "json"
+    }
+    per_module_fallback_reason("", format_flag) == ""
+}
+
+// The compiler binary and the environment, which a build reads besides its sources and its
+// command line. The daemon builds only for a client that names the same. `_`, SHLVL and
+// OLDPWD are left out: a shell keeps them for itself, as the command it ran, how deep it runs
+// and the directory it was in, so two shells differ in them, and a build reads none of them.
+// The variables are sorted, since a shell lists them in an order that changes as it sets
+// them, and a build reads no order. They are sorted as NUL-ended records, as a value may hold
+// a newline; an env without -0 lists them unsorted, so the order then counts, and a client in
+// another order builds cold. One shell hashes both, as each process costs a build its start.
+fn daemon_identity() -> Str {
+    let unset = "-u _ -u SHLVL -u OLDPWD"
+    let compiler = archive_compiler_path()
+    let hashes = process_run("sh", ["-c", "{SHA256SUM_SH}sha256sum '{compiler}' 2>/dev/null; \{ env -0 {unset} 2>/dev/null || env {unset}; } | LC_ALL=C sort -z | sha256sum"]).out.trim()
+    "{get_arg(0)}\n{compiler}\n{hashes}"
+}
+
+// What the front end reads besides its inputs and the environment, so a daemon's check is a
+// cold build's front end only for a client that sets each the same: the struct-layout lint
+// level, the front-end trace, and whether the parse keeps the interface texts that unit reuse
+// compares. Called once the command's flags are applied.
+fn front_settings(strict_struct_layout: Bool) -> Str {
+    "strict_struct_layout={strict_struct_layout}\nblink_trace={trace_mode}\ninterface_text={emit_reuse_allowed()}"
+}
+
+// A build or run asks the project's daemon to run the build, which it does in a child that
+// runs this command line from the program the daemon checked. The daemon serves only the
+// entry it checks, from the directory it started in, for a client with its compiler,
+// environment and front-end settings; anything else, and any reply the client can not read,
+// falls back to a cold build. The daemon may make a build faster, never different. True when
+// the build through the daemon succeeded and its output was printed; a failed build exits with
+// its code.
+fn build_through_daemon(a: Args, command: Str) -> Bool {
+    if !daemon_may_build(a) {
+        return false
+    }
+    let sock = daemon_socket_path()
+    if !file_exists(sock) {
+        return false
+    }
+    // The settings the cold build would apply, which it applies again if the daemon declines.
+    apply_cache_flag(a)
+    trace_mode = args_get(a, "blink-trace")
+    if (command == "build" && args_get(a, "trace") != "") || (command == "run" && run_traces(a)) {
+        cli_trace_codegen = 1
+    }
+    let settings = front_settings(args_has(a, "strict-struct-layout"))
+    let fd = unix_socket_connect(sock)
+    if fd < 0 {
+        return false
+    }
+    // After the connect, so a socket no daemon serves costs a build no hashing.
+    let identity = daemon_identity()
+    json_clear()
+    let req = json_new_object()
+    json_set(req, "type", json_new_str("build"))
+    json_set(req, "cwd", json_new_str(env.cwd()))
+    json_set(req, "path", json_new_str(args_positional(a, 0)))
+    json_set(req, "identity", json_new_str(identity))
+    json_set(req, "settings", json_new_str(settings))
+    let argv = json_new_array()
+    let mut i = 0
+    while i < arg_count() {
+        json_push(argv, json_new_str(get_arg(i)))
+        i = i + 1
+    }
+    json_set(req, "argv", argv)
+    if socket_write(fd, json_encode(req).concat("\n")) < 0 {
+        unix_socket_close(fd)
+        return false
+    }
+    let reply = socket_read_line(fd)
+    unix_socket_close(fd)
+    json_clear()
+    let root = json_parse(reply)
+    if root < 0 || json_as_int(json_get(root, "served")) != 1 {
+        return false
+    }
+    io.eprint(json_as_str(json_get(root, "stderr")))
+    io.print(json_as_str(json_get(root, "stdout")))
+    let code = json_as_int(json_get(root, "exit"))
+    if code != 0 {
+        exit(code)
+    }
+    true
+}
+
+// A child the daemon forked for a build runs the client's command line here, as the client
+// would have run it cold, from the program the daemon checked, and ends when the build does.
+// A build that would first resolve dependencies or rebuild the stdlib archive declines, since
+// the client's cold build reads what those write, and the archive's own front end would undo
+// the checked program.
+fn build_in_daemon_child(b: DaemonBuild) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+    let p = cli_parser()
+    let a = parse_argv(p, b.argv)
+    let command = args_command(a)
+    if args_error(a) != "" || (command != "build" && command != "run") || !daemon_may_build(a) || deps_unresolved() || !dev_archive_current() {
+        write_file(b.declined, "")
+        exit(0)
+    }
+    if command == "build" {
+        build_here(p, a, Some(b))
+    } else {
+        let _ = run_build_here(p, a, Some(b))
+    }
+    exit(0)
 }
 
 fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
@@ -4604,7 +4839,7 @@ fn cmd_ast(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
 
 // blink.toml names no entry file, so start takes it as an argument. The daemon serves the
 // project, so its socket goes at the project root wherever the entry lives.
-fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Format.Emit, Codegen {
     let daemon_source = args_positional(a, 0)
     if daemon_source == "" {
         io.println("error: daemon start needs the entry file of the program to serve")
@@ -4616,7 +4851,11 @@ fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, Lex.Tokenize, Parse,
         exit(1)
     }
     io.println("Daemon starting on {daemon_socket_path()}")
-    daemon_start(daemon_source)
+    // The daemon checks with the settings a build with no flags applies.
+    match daemon_start(daemon_source, daemon_identity(), front_settings(false), emit_reuse_allowed()) {
+        Some(b) => build_in_daemon_child(b)
+        None => {}
+    }
 }
 
 // A connection to the project's daemon; exits 1 when none answers.
@@ -4750,125 +4989,8 @@ fn cmd_shim_bare(p: ArgParser, _a: Args) {
     io.println(generate_command_help(p, "shim"))
 }
 
-fn main() {
-    tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
-    init_embedded_stdlib()
-
-    // Fine-grained internal trace channels (ast.dbg_trace). Comma-separated
-    // channel names, or "all". Empty = off (zero cost). Set once here so every
-    // command path (build/run/check + hidden archive/per-module emitters) sees it.
-    dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
-
-    if arg_count() >= 2 && get_arg(1) == "__emit-archive-header" {
-        let mut hidden_args: List[Str] = []
-        let mut hi = 2
-        while hi < arg_count() {
-            hidden_args.push(get_arg(hi))
-            hi = hi + 1
-        }
-        cmd_emit_archive_header(hidden_args)
-        return
-    }
-
-    if arg_count() >= 2 && get_arg(1) == "__emit-per-module" {
-        let mut hidden_args: List[Str] = []
-        let mut hi = 2
-        while hi < arg_count() {
-            hidden_args.push(get_arg(hi))
-            hi = hi + 1
-        }
-        cmd_emit_per_module(hidden_args)
-        return
-    }
-
-    if arg_count() >= 3 && get_arg(1) == "__build-compiler-archive" {
-        let mut roots: List[Str] = []
-        let mut ri = 3
-        while ri < arg_count() {
-            roots.push(get_arg(ri))
-            ri = ri + 1
-        }
-        // The compiler archive records the stdlib archive it was built against.
-        let arc_rc = ensure_dev_archive()
-        if arc_rc != 0 {
-            exit(arc_rc)
-        }
-        let rc = build_compiler_archive(get_arg(2), roots)
-        if rc != 0 {
-            exit(rc)
-        }
-        return
-    }
-
-    if arg_count() >= 2 && get_arg(1) == "__build-stdlib-archive" {
-        let rc = build_stdlib_archive(peeled_module_keys())
-        if rc != 0 {
-            exit(rc)
-        }
-        return
-    }
-
-    // Pipe-separated record per registered native dep, sourced from the
-    // stdlib_native_deps registry. Taskfile install + cross-compile loops
-    // consume this so they never hardcode a dep name.
-    // Format: name|source_paths(comma)|header_dir|compile_defs(comma)|gate_macro
-    if arg_count() >= 2 && get_arg(1) == "__native-deps" {
-        let names = stdlib_native_dep_names()
-        let mut ni = 0
-        while ni < names.len() {
-            let n = names.get(ni).unwrap()
-            let srcs = stdlib_native_dep_source_paths(n).join(",")
-            let hdr = stdlib_native_dep_header_dir(n)
-            let defs = stdlib_native_dep_compile_defs(n).join(",")
-            let gate = stdlib_native_dep_gate_macro(n)
-            io.println("{n}|{srcs}|{hdr}|{defs}|{gate}")
-            ni = ni + 1
-        }
-        return
-    }
-
-    if arg_count() >= 2 && get_arg(1) == "cache" {
-        let mut sub = ""
-        if arg_count() >= 3 {
-            sub = get_arg(2)
-        }
-        if sub == "" || sub == "info" {
-            exit(build_objcache.cmd_info())
-        }
-        if sub == "clean" {
-            let mut older = ""
-            let mut ai = 3
-            while ai < arg_count() {
-                let a = get_arg(ai)
-                if a == "--older-than" && ai + 1 < arg_count() {
-                    older = get_arg(ai + 1)
-                    ai = ai + 2
-                } else {
-                    ai = ai + 1
-                }
-            }
-            exit(build_objcache.cmd_clean(older))
-        }
-        if sub == "key" {
-            let mut text = ""
-            if arg_count() >= 4 {
-                text = get_arg(3)
-            }
-            exit(build_objcache.cmd_key(text))
-        }
-        if sub == "__lookup" && arg_count() >= 4 {
-            exit(build_objcache.cmd_internal_lookup(get_arg(3)))
-        }
-        if sub == "__store" && arg_count() >= 7 {
-            exit(build_objcache.cmd_internal_store(get_arg(3), get_arg(4), get_arg(5), get_arg(6)))
-        }
-        if sub == "__gc" {
-            exit(build_objcache.cmd_internal_gc())
-        }
-        io.println("usage: blink cache <info|clean [--older-than DUR]|key>")
-        exit(1)
-    }
-
+// The parser for the blink command line.
+fn cli_parser() -> ArgParser {
     let mut p = argparser_new("blink", "The Blink programming language compiler and toolchain")
     p = add_command(p, "init", "Initialize a new Blink project")
     p = add_command(p, "build", "Compile Blink source to native binary (C at -O1 unless --debug or --release)")
@@ -4990,6 +5112,129 @@ fn main() {
     p = command_add_option(p, "audit", "--baseline", "", "Audit baseline path")
     p = command_add_flag(p, "audit", "--json", "-j", "JSON output")
     p = command_add_flag(p, "audit", "--ffi", "", "Audit FFI usage in source files")
+    p
+}
+
+fn main() {
+    tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
+    init_embedded_stdlib()
+
+    // Fine-grained internal trace channels (ast.dbg_trace). Comma-separated
+    // channel names, or "all". Empty = off (zero cost). Set once here so every
+    // command path (build/run/check + hidden archive/per-module emitters) sees it.
+    dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
+
+    if arg_count() >= 2 && get_arg(1) == "__emit-archive-header" {
+        let mut hidden_args: List[Str] = []
+        let mut hi = 2
+        while hi < arg_count() {
+            hidden_args.push(get_arg(hi))
+            hi = hi + 1
+        }
+        cmd_emit_archive_header(hidden_args)
+        return
+    }
+
+    if arg_count() >= 2 && get_arg(1) == "__emit-per-module" {
+        let mut hidden_args: List[Str] = []
+        let mut hi = 2
+        while hi < arg_count() {
+            hidden_args.push(get_arg(hi))
+            hi = hi + 1
+        }
+        cmd_emit_per_module(hidden_args)
+        return
+    }
+
+    if arg_count() >= 3 && get_arg(1) == "__build-compiler-archive" {
+        let mut roots: List[Str] = []
+        let mut ri = 3
+        while ri < arg_count() {
+            roots.push(get_arg(ri))
+            ri = ri + 1
+        }
+        // The compiler archive records the stdlib archive it was built against.
+        let arc_rc = ensure_dev_archive()
+        if arc_rc != 0 {
+            exit(arc_rc)
+        }
+        let rc = build_compiler_archive(get_arg(2), roots)
+        if rc != 0 {
+            exit(rc)
+        }
+        return
+    }
+
+    if arg_count() >= 2 && get_arg(1) == "__build-stdlib-archive" {
+        let rc = build_stdlib_archive(peeled_module_keys())
+        if rc != 0 {
+            exit(rc)
+        }
+        return
+    }
+
+    // Pipe-separated record per registered native dep, sourced from the
+    // stdlib_native_deps registry. Taskfile install + cross-compile loops
+    // consume this so they never hardcode a dep name.
+    // Format: name|source_paths(comma)|header_dir|compile_defs(comma)|gate_macro
+    if arg_count() >= 2 && get_arg(1) == "__native-deps" {
+        let names = stdlib_native_dep_names()
+        let mut ni = 0
+        while ni < names.len() {
+            let n = names.get(ni).unwrap()
+            let srcs = stdlib_native_dep_source_paths(n).join(",")
+            let hdr = stdlib_native_dep_header_dir(n)
+            let defs = stdlib_native_dep_compile_defs(n).join(",")
+            let gate = stdlib_native_dep_gate_macro(n)
+            io.println("{n}|{srcs}|{hdr}|{defs}|{gate}")
+            ni = ni + 1
+        }
+        return
+    }
+
+    if arg_count() >= 2 && get_arg(1) == "cache" {
+        let mut sub = ""
+        if arg_count() >= 3 {
+            sub = get_arg(2)
+        }
+        if sub == "" || sub == "info" {
+            exit(build_objcache.cmd_info())
+        }
+        if sub == "clean" {
+            let mut older = ""
+            let mut ai = 3
+            while ai < arg_count() {
+                let a = get_arg(ai)
+                if a == "--older-than" && ai + 1 < arg_count() {
+                    older = get_arg(ai + 1)
+                    ai = ai + 2
+                } else {
+                    ai = ai + 1
+                }
+            }
+            exit(build_objcache.cmd_clean(older))
+        }
+        if sub == "key" {
+            let mut text = ""
+            if arg_count() >= 4 {
+                text = get_arg(3)
+            }
+            exit(build_objcache.cmd_key(text))
+        }
+        if sub == "__lookup" && arg_count() >= 4 {
+            exit(build_objcache.cmd_internal_lookup(get_arg(3)))
+        }
+        if sub == "__store" && arg_count() >= 7 {
+            exit(build_objcache.cmd_internal_store(get_arg(3), get_arg(4), get_arg(5), get_arg(6)))
+        }
+        if sub == "__gc" {
+            exit(build_objcache.cmd_internal_gc())
+        }
+        io.println("usage: blink cache <info|clean [--older-than DUR]|key>")
+        exit(1)
+    }
+
+    let p = cli_parser()
 
     let a = argparse(p)
 

@@ -1,12 +1,12 @@
 import symbol_index.{si_build, si_reset, si_sym_count, si_file_count}
 import query.{query_dispatch}
 import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render}
-import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int}
+import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int, json_at, json_len}
 import std.path.{path_join, path_dirname}
 import lexer.{Lex}
-import parser.{Parse}
+import parser.{Parse, parser_want_interface_text}
 import typecheck.{TypeCheck}
-import check_pipeline.{check_source, checked_inputs_changed, checked_inputs_reset, check_exit_code, check_status_line}
+import check_pipeline.{FrontEndReport, check_source_reporting, checked_inputs_changed, checked_inputs_reset, checked_probes_changed, checked_input_files, check_exit_code, check_status_line}
 
 effect Daemon {
     effect Serve
@@ -15,8 +15,9 @@ effect Daemon {
 // daemon.bl — Persistent compiler service with Unix socket IPC
 //
 // Single-threaded event loop: accept connection, read JSON request,
-// dispatch (check/query/status/stop), respond, check file watcher.
+// dispatch (check/build/query/status/stop), respond, check file watcher.
 // A check runs check_pipeline.check_source, the check `blink check` runs.
+// A build runs in a child the daemon forks, which builds from the program the last check holds.
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -28,8 +29,19 @@ let mut daemon_source_path: Str = ""
 let mut daemon_start_time: Int = 0
 let mut daemon_check_count: Int = 0
 // A diagnostic spells its file as the entry path was typed, relative to the working
-// directory, so the daemon answers only a client in the directory it started in.
-let mut daemon_cwd: Str = ""
+// directory, so the daemon answers only a client in the directory it started in. A build
+// also reads the compiler binary, the environment and the settings the front end reads, so
+// the daemon builds only for a client whose identity and settings are its own.
+type DaemonOrigin {
+    cwd: Str
+    identity: Str
+    settings: Str
+    // Whether its checks parse for the interface texts a build that may take units compares.
+    interface_text: Bool
+    builds: Int
+}
+
+let mut daemon_origin: DaemonOrigin = DaemonOrigin { cwd: "", identity: "", settings: "", interface_text: false, builds: 0 }
 
 // The findings of a check, rendered both ways a client can ask for, since the diagnostics
 // themselves do not outlive the next check.
@@ -39,6 +51,18 @@ type DaemonCheck {
     errors: Int
     warnings: Int
     ices: Int
+    // The program the check left, which a build compiles, and what the build prints first.
+    program: Int
+    front: FrontEndReport
+    // What the check printed itself, apart from its diagnostics, such as the loader's note on
+    // a local module that shadows a dependency; captured false when the daemon could not
+    // capture it, so a build would print less than a cold one.
+    out: Str
+    err: Str
+    captured: Bool
+    // The mtime and size of each file the check read, from just after it. The poll compares
+    // bytes only once one of them moves. Empty when an edit landed during the check.
+    stats: List[Int]
 }
 
 // The last check, which holds until an input changes.
@@ -59,8 +83,21 @@ fn daemon_extract_type(request: Str) -> Option[Str] {
 
 // Each check sees the whole program: mono and the mutation passes judge across functions,
 // so a recheck of only the changed functions could miss what an edit broke elsewhere.
-fn daemon_check_program() -> DaemonCheck ! Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
-    let program = check_source(daemon_source_path)
+fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    let dir = daemon_dir()
+    let out_path = path_join(dir, "check.out")
+    let err_path = path_join(dir, "check.err")
+    let saved = capture_output(out_path, err_path)
+    parser_want_interface_text(daemon_origin.interface_text)
+    let (program, front) = check_source_reporting(daemon_source_path)
+    parser_want_interface_text(false)
+    let captured = restore_output(saved)
+    let out = if captured { read_file(out_path) } else { "" }
+    let err = if captured { read_file(err_path) } else { "" }
+    // An edit after the loader read a file and before this stat leaves no stat change for a
+    // poll to see. The bytes show it, so one compare here closes that gap.
+    let taken = daemon_input_stats()
+    let stats = if checked_inputs_changed(daemon_source_path) { [] } else { taken }
     si_reset()
     si_build(program, daemon_source_path, "main")
     DaemonCheck {
@@ -69,7 +106,37 @@ fn daemon_check_program() -> DaemonCheck ! Lex.Tokenize, Parse, Parse.Build, Typ
         errors: diag_count,
         warnings: diag_warn_count,
         ices: diag_ice_count,
+        program: program,
+        front: front,
+        out: out,
+        err: err,
+        captured: captured,
+        stats: stats,
     }
+}
+
+// The mtime and size of each file the last check read, -1 for one it can not stat or open.
+// A same-size edit inside one mtime tick, or one whose mtime was set back, leaves these as
+// they were, so they only tell the poll when to compare bytes. A build compares bytes itself.
+fn daemon_input_stats() -> List[Int] ! IO {
+    let mut stats: List[Int] = []
+    for p in checked_input_files() {
+        stats.push(file_mtime(p))
+        stats.push(daemon_file_size(p))
+    }
+    stats
+}
+
+fn daemon_file_size(path: Str) -> Int ! IO {
+    let mut size = -1
+    with ffi.scope() as scope {
+        let file = daemon_open(scope.cstr(path), 0.to_i32()).to_int()
+        if file >= 0 {
+            size = daemon_lseek(file.to_i32(), 0, 2.to_i32())
+            unix_socket_close(file)
+        }
+    }
+    size
 }
 
 fn daemon_not_served(why: Str) -> Str {
@@ -85,7 +152,7 @@ fn daemon_not_served(why: Str) -> Str {
 // it would exit with, so the client prints the bytes and needs no rendering of its own.
 // With no input changed, the last answer still holds, so the daemon gives it again rather
 // than an empty list that would read as clean.
-fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     json_clear()
     let root = json_parse(request)
     let cwd = json_as_str(json_get(root, "cwd"))
@@ -93,8 +160,8 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, Lex.Tokenize, Parse,
     let json_status = json_as_int(json_get(root, "json"))
     let diag_json = json_as_int(json_get(root, "diag_json"))
     let strict = json_as_int(json_get(root, "strict"))
-    if cwd != daemon_cwd || path != daemon_source_path {
-        return daemon_not_served("the daemon checks {daemon_source_path} in {daemon_cwd}")
+    if cwd != daemon_origin.cwd || path != daemon_source_path {
+        return daemon_not_served("the daemon checks {daemon_source_path} in {daemon_origin.cwd}")
     }
     // The loader exits on a missing entry file, which would take the daemon down with it.
     if file_exists(daemon_source_path) != 1 {
@@ -120,6 +187,217 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, Lex.Tokenize, Parse,
     json_encode(reply)
 }
 
+// ── Handle: build ───────────────────────────────────────────────────
+
+// An @ffi function's C name has no module part, so these carry the module in their own names,
+// apart from std.libc's bindings over the same calls.
+@ffi("fork", header: "unistd.h")
+@trusted(audit: "Wraps fork(2). The daemon is single-threaded and the GC runs no marker threads, so the child holds no lock another thread took.")
+fn daemon_fork() -> I32 ! FFI {}
+
+@ffi("waitpid", header: "sys/wait.h")
+@trusted(audit: "Wraps waitpid(2). status is one I32 cell from ffi.scope(); options is fixed to 0.")
+fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
+
+@ffi("open", header: "fcntl.h")
+@trusted(audit: "Wraps open(2) with no mode. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY or O_WRONLY, 0 and 1 on every host.")
+fn daemon_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+
+@ffi("lseek", header: "unistd.h")
+@trusted(audit: "Wraps lseek(2). fd is one daemon_open returned; whence is fixed to SEEK_END, 2 on every host.")
+fn daemon_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FFI {}
+
+@ffi("dup", header: "unistd.h")
+@trusted(audit: "Wraps dup(2). fd is 1 or 2, which the daemon holds open.")
+fn daemon_dup(fd: I32) -> I32 ! FFI {}
+
+@ffi("dup2", header: "unistd.h")
+@trusted(audit: "Wraps dup2(2). Both descriptors are the process's own: one open or dup returned, and 1 or 2.")
+fn daemon_dup2(old_fd: I32, new_fd: I32) -> I32 ! FFI {}
+
+@ffi("blink_errno_get")
+@trusted(audit: "Wraps the runtime blink_errno_get(), which returns errno. Read right after a failed waitpid.")
+fn daemon_errno() -> Int ! FFI {}
+
+// What the child the daemon forked for a build runs: the client's command line, from the
+// program the daemon checked last. declined names the file the child makes when the build
+// needs a step a cold build takes first, such as a rebuilt stdlib archive, which the child can
+// not take with the program already loaded; the client then builds cold.
+pub type DaemonBuild {
+    argv: List[Str]
+    program: Int
+    front: FrontEndReport
+    out: Str
+    err: Str
+    declined: Str
+}
+
+// What a build request leaves the daemon's loop with: the reply to send, or, in the child the
+// daemon forked for the build, the build to run.
+type BuildTurn {
+    Reply(text: Str)
+    Child(build: DaemonBuild)
+}
+
+// Points fd at an empty file at path, or false when it cannot. write_file makes the file, so
+// open needs only O_WRONLY, which is 1 on every host, where O_CREAT and O_TRUNC differ.
+fn redirect_to(path: Str, fd: Int) -> Bool ! IO {
+    write_file(path, "")
+    let mut ok = false
+    with ffi.scope() as scope {
+        let file = daemon_open(scope.cstr(path), 1.to_i32()).to_int()
+        if file >= 0 {
+            ok = daemon_dup2(file.to_i32(), fd.to_i32()).to_int() == fd
+            if file != fd { unix_socket_close(file) }
+        }
+    }
+    ok
+}
+
+// Points stdout and stderr at the files at out_path and err_path; the descriptors they had,
+// for restore_output, or -1 for one it could not save.
+fn capture_output(out_path: Str, err_path: Str) -> (Int, Int) ! IO {
+    // What stdout holds unflushed belongs to the daemon's own output, not to the capture.
+    io.write("")
+    let saved_out = daemon_dup(1.to_i32()).to_int()
+    let saved_err = daemon_dup(2.to_i32()).to_int()
+    if saved_out < 0 || saved_err < 0 {
+        return (saved_out, saved_err)
+    }
+    if !redirect_to(out_path, 1) || !redirect_to(err_path, 2) {
+        return (-1, saved_err)
+    }
+    (saved_out, saved_err)
+}
+
+// Points stdout and stderr back where capture_output found them; whether both files hold
+// all that was printed between the two calls.
+fn restore_output(saved: (Int, Int)) -> Bool ! IO {
+    io.write("")
+    let (saved_out, saved_err) = saved
+    let mut ok = saved_out >= 0 && saved_err >= 0
+    if saved_out >= 0 {
+        ok = daemon_dup2(saved_out.to_i32(), 1.to_i32()).to_int() == 1 && ok
+        unix_socket_close(saved_out)
+    }
+    if saved_err >= 0 {
+        ok = daemon_dup2(saved_err.to_i32(), 2.to_i32()).to_int() == 2 && ok
+        unix_socket_close(saved_err)
+    }
+    ok
+}
+
+// The code the shell would report for a child that ended with status: its exit code, or 128
+// plus the signal that killed it.
+fn exit_code_of(status: Int) -> Int {
+    let sig = status & 127
+    if sig == 0 { (status >> 8) & 255 } else { 128 + sig }
+}
+
+// Waits for pid; the status it ended with, or -1 when there is no such child.
+fn wait_for(pid: Int) -> Int ! IO {
+    let mut status = -1
+    with ffi.scope() as scope {
+        let cell = scope.alloc[I32]()
+        loop {
+            let r = daemon_waitpid(pid.to_i32(), cell, 0.to_i32()).to_int()
+            if r == pid {
+                status = cell.deref().to_int()
+                break
+            }
+            // EINTR is 4 on every host the daemon runs on.
+            if r >= 0 || daemon_errno() != 4 { break }
+        }
+    }
+    status
+}
+
+// A build runs the client's command line in a child of the daemon, from the program the
+// daemon's last check left, rechecked first when an input changed, so it skips the front end
+// a cold build runs. The child's stdout and stderr go to files that the reply carries, with
+// the code the child exited with, so the client prints what a cold build would print and
+// exits with its code. The daemon builds only where a cold build in the client would read
+// the same: the same entry, directory, compiler, environment and front-end settings. Anything
+// else is not served, and the client builds cold. The daemon waits for the build, so it
+// answers no other client until the build ends.
+fn daemon_handle_build(request: Str, client_fd: Int) -> BuildTurn ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    json_clear()
+    let root = json_parse(request)
+    let cwd = json_as_str(json_get(root, "cwd"))
+    let path = json_as_str(json_get(root, "path"))
+    let identity = json_as_str(json_get(root, "identity"))
+    let settings = json_as_str(json_get(root, "settings"))
+    let argv_node = json_get(root, "argv")
+    let mut argv: List[Str] = []
+    let mut i = 0
+    while i < json_len(argv_node) {
+        argv.push(json_as_str(json_at(argv_node, i)))
+        i = i + 1
+    }
+    if cwd != daemon_origin.cwd || path != daemon_source_path {
+        return BuildTurn.Reply(daemon_not_served("the daemon builds {daemon_source_path} in {daemon_origin.cwd}"))
+    }
+    if identity != daemon_origin.identity || argv.len() < 2 {
+        return BuildTurn.Reply(daemon_not_served("the client runs another compiler or environment than the daemon"))
+    }
+    if settings != daemon_origin.settings {
+        return BuildTurn.Reply(daemon_not_served("the client sets what the front end reads otherwise than the daemon"))
+    }
+    // The loader exits on a missing entry file, which would take the daemon down with it.
+    if file_exists(daemon_source_path) != 1 {
+        daemon_last = None
+        return BuildTurn.Reply(daemon_not_served("source file not found: {daemon_source_path}"))
+    }
+    if daemon_last.is_none() || checked_inputs_changed(daemon_source_path) {
+        daemon_last = Some(daemon_check_program())
+    }
+    let c = daemon_last.unwrap()
+    if !c.captured {
+        return BuildTurn.Reply(daemon_not_served("the daemon could not capture what its check printed"))
+    }
+    let dir = daemon_dir()
+    let out_path = path_join(dir, "build.out")
+    let err_path = path_join(dir, "build.err")
+    let declined = path_join(dir, "build.declined")
+    shell_exec("rm -f {declined}")
+    // The child inherits what stdout holds unflushed, and would print it again.
+    io.write("")
+    let pid = daemon_fork().to_int()
+    if pid < 0 {
+        return BuildTurn.Reply(daemon_not_served("the daemon could not fork a build"))
+    }
+    if pid == 0 {
+        // The child keeps no socket, so the client hears from the daemon alone, and a stop
+        // that removes the socket file is the daemon's.
+        unix_socket_close(client_fd)
+        unix_socket_close(daemon_socket_fd)
+        daemon_socket_fd = -1
+        daemon_running = 0
+        if !redirect_to(out_path, 1) || !redirect_to(err_path, 2) {
+            write_file(declined, "")
+            exit(1)
+        }
+        return BuildTurn.Child(DaemonBuild { argv: argv, program: c.program, front: c.front, out: c.out, err: c.err, declined: declined })
+    }
+    let status = wait_for(pid)
+    let out = read_file(out_path)
+    let err = read_file(err_path)
+    shell_exec("rm -f {out_path} {err_path}")
+    if status < 0 || file_exists(declined) == 1 {
+        shell_exec("rm -f {declined}")
+        return BuildTurn.Reply(daemon_not_served("the daemon's build did not run"))
+    }
+    daemon_origin = DaemonOrigin { builds: daemon_origin.builds + 1, ..daemon_origin }
+    json_clear()
+    let reply = json_new_object()
+    json_set(reply, "ok", json_new_bool(1))
+    json_set(reply, "served", json_new_int(1))
+    json_set(reply, "exit", json_new_int(exit_code_of(status)))
+    json_set(reply, "stdout", json_new_str(out))
+    json_set(reply, "stderr", json_new_str(err))
+    BuildTurn.Reply(json_encode(reply))
+}
+
 // ── Handle: query ───────────────────────────────────────────────────
 
 fn daemon_handle_query(request: Str) -> Str {
@@ -134,7 +412,8 @@ fn daemon_handle_status() -> Str {
     let sym_count = si_sym_count
     let file_count = si_file_count
     let checks = daemon_check_count
-    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{sym_count},\"files\":{file_count},\"checks\":{checks}}"
+    let builds = daemon_origin.builds
+    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{sym_count},\"files\":{file_count},\"builds\":{builds},\"checks\":{checks}}"
 }
 
 // ── Handle: stop ────────────────────────────────────────────────────
@@ -146,10 +425,37 @@ fn daemon_handle_stop() -> Str {
 
 // ── Event loop ──────────────────────────────────────────────────────
 
-fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+// While no client asks, the daemon rechecks a program whose inputs changed, so the build or
+// check after an edit finds the check done. Each time the accept waits out, an unchanged
+// program costs a stat of each input and each probed path; only a moved stat or probe costs
+// a byte compare. A missed edit costs a recheck at the next request, never a stale answer:
+// a check or build compares bytes before it uses the last check.
+fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    // The loader exits on a missing entry file, which would take the daemon down with it.
+    if daemon_last.is_none() || file_exists(daemon_source_path) != 1 {
+        return
+    }
+    let mut c = daemon_last.unwrap()
+    // Taken before the compare, so an edit after it moves a stat for the next poll.
+    let stats = daemon_input_stats()
+    if stats == c.stats && !checked_probes_changed() {
+        return
+    }
+    if checked_inputs_changed(daemon_source_path) {
+        daemon_last = Some(daemon_check_program())
+    } else {
+        // A touch, or an edit undone: the next poll needs no compare.
+        c.stats = stats
+        daemon_last = Some(c)
+    }
+}
+
+// Returns the build to run in a child forked for one, and None in the daemon once it stops.
+fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     while daemon_running == 1 {
         let client_fd = unix_socket_accept_timeout(daemon_socket_fd, 500)
         if client_fd < 0 {
+            daemon_recheck_if_changed()
             continue
         }
 
@@ -159,6 +465,11 @@ fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Di
         let mut response = ""
         if req_type == "check" {
             response = daemon_handle_check(request)
+        } else if req_type == "build" {
+            match daemon_handle_build(request, client_fd) {
+                Reply(text) => response = text
+                Child(build) => return Some(build)
+            }
         } else if req_type == "query" {
             response = daemon_handle_query(request)
         } else if req_type == "status" {
@@ -175,6 +486,7 @@ fn daemon_loop() ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Di
         }
         unix_socket_close(client_fd)
     }
+    None
 }
 
 // ── Shutdown ────────────────────────────────────────────────────────
@@ -222,9 +534,12 @@ pub fn daemon_socket_path() -> Str {
 
 // ── Startup ─────────────────────────────────────────────────────────
 
-pub fn daemon_start(source: Str) ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+// Serves until a stop, then returns None. In a child forked for a build it returns the build
+// instead, for the caller to run. identity names the compiler and the environment, and
+// settings what the front end reads, which a client must share for the daemon to build for it.
+pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     daemon_source_path = source
-    daemon_cwd = env.cwd()
+    daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0 }
     daemon_start_time = time_ms()
 
     let blink_dir = daemon_dir()
@@ -240,15 +555,19 @@ pub fn daemon_start(source: Str) ! Daemon.Serve, Lex.Tokenize, Parse, Parse.Buil
     daemon_socket_fd = unix_socket_listen(daemon_sock_path)
     if daemon_socket_fd < 0 {
         io.eprintln("daemon: failed to create socket at {daemon_sock_path}")
-        return
+        return None
     }
 
     daemon_last = Some(daemon_check_program())
 
     io.eprintln("daemon: listening on {daemon_sock_path} (pid {pid})")
     daemon_running = 1
-    daemon_loop()
+    let child = daemon_loop()
+    if child.is_some() {
+        return child
+    }
 
     // Cleanup on exit
     daemon_stop()
+    None
 }

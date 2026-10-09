@@ -5,7 +5,7 @@ import typecheck.{TypeCheck, check_types, desugar_sealed_ops_calls}
 import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import escape.{analyze_escapes}
 import mono.{run_mono}
-import diagnostics.{Diag, diag_count, diag_ice_count}
+import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render}
 
 // check_pipeline.bl — the one check every path answers with
 //
@@ -43,20 +43,38 @@ fn checked_inputs_empty() -> CheckedInputs {
 
 let mut checked: CheckedInputs = checked_inputs_empty()
 
+// What the front end reported before the build analyses ran. A build prints it there, and
+// stops on an error, or on a warning under --strict, so a build from a checked program
+// prints and stops from this.
+pub type FrontEndReport {
+    errors: Int
+    warnings: Int
+    ices: Int
+    // What diag_flush printed at that point in a build.
+    human: Str
+}
+
 // A check sees the whole program, so it loads the imports and the prelude as the build
 // does. Escape analysis needs no well-typed program, so it still runs when the front end
 // has errors and reports what it finds next to them.
 pub fn check_source(source_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let (program, _) = check_source_reporting(source_path)
+    program
+}
+
+// check_source, and what its front end reported.
+pub fn check_source_reporting(source_path: Str) -> (Int, FrontEndReport) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let program = compile_to_program(source_path, 1)
     check_types(program)
     check_unused_imports()
+    let front = FrontEndReport { errors: diag_count, warnings: diag_warn_count, ices: diag_ice_count, human: diag_render(0) }
     if diag_ice_count > 0 || diag_count > 0 {
         analyze_escapes(program)
     } else {
         run_build_analyses(program)
     }
     record_checked_inputs(source_path)
-    program
+    (program, front)
 }
 
 fn record_checked_inputs(source_path: Str) {
@@ -94,13 +112,8 @@ fn record_checked_inputs(source_path: Str) {
 // read: a new module an import needed, or one that now shadows the file an import found.
 pub fn checked_inputs_changed(source_path: Str) -> Bool {
     if checked.source == "" || checked.source != source_path { return true }
+    if checked_probes_changed() { return true }
     let mut i = 0
-    while i < checked.probe_paths.len() {
-        let found = file_exists(checked.probe_paths.get(i).unwrap()) == 1
-        if found != checked.probe_found.get(i).unwrap() { return true }
-        i = i + 1
-    }
-    i = 0
     while i < checked.paths.len() {
         let p = checked.paths.get(i).unwrap()
         // The compiler carries the embedded stdlib, so no edit can change it.
@@ -111,6 +124,23 @@ pub fn checked_inputs_changed(source_path: Str) -> Bool {
         i = i + 1
     }
     false
+}
+
+// Whether a path the loader probed in the last check now finds a file where it found none, or
+// none where it found one.
+pub fn checked_probes_changed() -> Bool {
+    let mut i = 0
+    while i < checked.probe_paths.len() {
+        let found = file_exists(checked.probe_paths.get(i).unwrap()) == 1
+        if found != checked.probe_found.get(i).unwrap() { return true }
+        i = i + 1
+    }
+    false
+}
+
+// The files the last check read from disk, apart from the embedded stdlib.
+pub fn checked_input_files() -> List[Str] {
+    checked.paths.filter(fn(p) { !p.starts_with("<embedded:") })
 }
 
 pub fn checked_inputs_reset() {
