@@ -1,0 +1,64 @@
+// A Map lists its keys in an order its hash seed decides, and each process draws its own seed.
+// Two per-module builds of the same tree must still write the same files, so the record of
+// the units' files can not take its order from a Map.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"emit_record_seed_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/leaf.bl", [
+        #"pub fn leaf_value() -> Str {"#,
+        #"    "leaf""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(leaf_value())"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both and the module filters.
+fn build(tree: Str, seed: Int) -> ProcessResult {
+    shell_exec("rm -rf {tree}/out")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_MAP_SEED={seed} build/blink build app/src/main.bl -o {tree}/out/app"])
+}
+
+test "two builds of one tree under different map seeds write the same record of their units" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_emit_record_seed_{getpid()}"
+    dev_tree(root, tree)
+    let mut records: List[Str] = []
+    let mut problems: List[Str] = []
+    for seed in [1, 2, 3, 99999] {
+        let r = build(tree, seed)
+        if r.exit_code != 0 { problems.push("seed {seed}: exit {r.exit_code}: {r.out}{r.err_out}") }
+        records.push(read_file("{tree}/out/app.units/.emit-record"))
+    }
+    shell_exec("rm -rf {tree}")
+    assert_eq(problems.join("\n"), "")
+    assert(records.get(0).unwrap().contains("\nfile leaf.c "), "the record names no unit file:\n{records.get(0).unwrap()}")
+    for i in [1, 2, 3] {
+        assert_eq(records.get(i).unwrap(), records.get(0).unwrap())
+    }
+}
