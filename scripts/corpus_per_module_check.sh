@@ -13,22 +13,66 @@
 # A passing file that did not build in units fell back to one unit, so it
 # tested nothing in this mode, and fails the gate.
 #
+#   scripts/corpus_per_module_check.sh [--slice <list file>]
+#
+# --slice judges the per-module slice that `corpus.sh --per-module-slice`
+# runs inside the default corpus, by the same rules, over the files the list
+# names in place of every test on disk. The list must name at least one file,
+# and every file it names must exist: a slice that lost its files would pass
+# by testing nothing.
+#
 # Env:
-#   CORPUS_JSON        result file (default build/corpus_per_module.json)
+#   CORPUS_JSON        result file (default build/corpus_per_module.json, or
+#                      build/corpus_per_module_slice.json under --slice)
 #   CORPUS_PM_KNOWN    known-failure list (default
 #                      scripts/corpus_per_module_known_failures.txt)
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
-json="${CORPUS_JSON:-build/corpus_per_module.json}"
+slice=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --slice) slice="$2"; shift 2 ;;
+        *) echo "corpus-per-module-check: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+
+if [ -n "$slice" ]; then
+    json="${CORPUS_JSON:-build/corpus_per_module_slice.json}"
+    run_hint="task corpus"
+else
+    json="${CORPUS_JSON:-build/corpus_per_module.json}"
+    run_hint="task corpus-per-module"
+fi
 known_file="${CORPUS_PM_KNOWN:-scripts/corpus_per_module_known_failures.txt}"
 
+if [ -n "$slice" ]; then
+    if [ ! -f "$slice" ]; then
+        echo "corpus-per-module-check: FAIL no slice list $slice"
+        exit 1
+    fi
+    listed=$(./scripts/corpus_per_module_slice_entries.sh "$slice" | sort -u)
+    if [ -z "$listed" ]; then
+        echo "corpus-per-module-check: FAIL $slice names no test file"
+        exit 1
+    fi
+    absent=""
+    for f in $listed; do
+        [ -f "$f" ] || absent="$absent  $f\n"
+    done
+    if [ -n "$absent" ]; then
+        echo "corpus-per-module-check: FAIL $slice names files that do not exist:"
+        printf "$absent"
+        exit 1
+    fi
+fi
+
 if [ ! -f "$json" ]; then
-    echo "corpus-per-module-check: no $json; run 'task corpus-per-module' first" >&2
+    echo "corpus-per-module-check: no $json; run '$run_hint' first" >&2
     exit 2
 fi
 if ! jq -e '(.total|type=="number") and (.passed|type=="number") and (.files|type=="array")' "$json" >/dev/null 2>&1; then
-    echo "corpus-per-module-check: $json is malformed; run 'task corpus-per-module' again" >&2
+    echo "corpus-per-module-check: $json is malformed; run '$run_hint' again" >&2
     exit 2
 fi
 # A run of the default mode under this name would pass every row through one unit.
@@ -55,10 +99,20 @@ if [ -n "$missing" ]; then
 fi
 
 total=$(jq -r .total "$json")
-on_disk=$(find tests -maxdepth 1 -name 'test_*.bl' | wc -l | tr -d ' ')
-if [ "$total" -eq 0 ] || [ "$total" -ne "$on_disk" ]; then
-    echo "corpus-per-module-check: FAIL the run covers $total file(s); tests/ holds $on_disk test_*.bl file(s)"
-    fail=1
+if [ -n "$slice" ]; then
+    unrun=$(printf '%s\n' "$listed" | jq -R . | jq -s . \
+        | jq -r --slurpfile r "$json" '. - [$r[0].files[].file] | .[] | "  \(.)"')
+    if [ -n "$unrun" ] || [ "$total" -ne "$(printf '%s\n' "$listed" | wc -l | tr -d ' ')" ]; then
+        echo "corpus-per-module-check: FAIL the run covers $total file(s), not the files $slice names; missing:"
+        [ -n "$unrun" ] && printf '%s\n' "$unrun"
+        fail=1
+    fi
+else
+    on_disk=$(find tests -maxdepth 1 -name 'test_*.bl' | wc -l | tr -d ' ')
+    if [ "$total" -eq 0 ] || [ "$total" -ne "$on_disk" ]; then
+        echo "corpus-per-module-check: FAIL the run covers $total file(s); tests/ holds $on_disk test_*.bl file(s)"
+        fail=1
+    fi
 fi
 
 known_json=$(printf '%s\n' "$known" | jq -R . | jq -s 'map(select(. != ""))')
@@ -95,4 +149,4 @@ n_known=$(printf '%s\n' "$known" | grep -c . || true)
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi
-echo "corpus-per-module-check: ok $(jq -r '"\(.passed)/\(.total)"' "$json") passed, $n_known known failure(s) still fail, $(jq -r .per_module_built "$json") built in units"
+echo "corpus-per-module-check: ok${slice:+ (slice $slice)} $(jq -r '"\(.passed)/\(.total)"' "$json") passed, $n_known known failure(s) still fail, $(jq -r .per_module_built "$json") built in units"

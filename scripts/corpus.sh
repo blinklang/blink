@@ -7,11 +7,11 @@
 # gen0. gen0 itself is a fixed binary, so a corpus run against it measures
 # nothing about the tree and never moves.
 #
-#   scripts/corpus.sh [--only <list file>] [--no-lint]
+#   scripts/corpus.sh [--only <list file>] [--no-lint] [--per-module-slice <list file>]
 #
 # Env:
 #   CORPUS_COMPILER  dir holding blink/blinkc/libblink_std.* (default build/gen1)
-#   CORPUS_JOBS      parallel workers (default: nproc/2, minimum 1)
+#   CORPUS_JOBS      parallel workers (default: scripts/default_jobs.sh)
 #   CORPUS_OUT       output JSON (default build/corpus.json)
 #   CORPUS_PRELUDE_LIB  lib/ root each sandbox exposes as the prelude, passed
 #                    through to corpus_one.sh (default: the compiler's own)
@@ -30,6 +30,17 @@
 # --only <list file> restricts the run to the files named in the list (one
 # path per line, blank lines and # comments ignored) and defaults CORPUS_OUT
 # to build/corpus_subset.json. The typecheck suite uses this.
+#
+# --per-module-slice <list file> also runs each file the list names (same
+# format) as a second row on the per-module path (corpus_one.sh pm), in the
+# same sweep, and writes those rows to CORPUS_PM_SLICE_OUT (default
+# build/corpus_per_module_slice.json), not to CORPUS_OUT. Only in the default
+# mode: the per-module mode already builds every row that way. The run does
+# not judge the slice; corpus_per_module_check.sh --slice does.
+#
+# Rows start longest first, by the seconds each took in the last run's JSON,
+# so the slowest files do not start last and hold the sweep open. A row the
+# last run did not have starts first.
 #
 # A second summary line gives the known failures: test.failing rows that
 # still fail, which a passing file hides (see corpus_one.sh), and the passing
@@ -56,10 +67,12 @@ cd "$(dirname "$0")/.." || exit 2
 
 only=""
 run_lint=1
+slice=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --only) only="$2"; shift 2 ;;
         --no-lint) run_lint=0; shift ;;
+        --per-module-slice) slice="$2"; shift 2 ;;
         *) echo "corpus: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -70,11 +83,7 @@ case "$per_module" in
     0|1) ;;
     *) echo "corpus: CORPUS_PER_MODULE must be 0 or 1, got '$per_module'" >&2; exit 2 ;;
 esac
-# Half the cores by default: the sweep forks timeout -> blink -> cc per file,
-# so a full-width run saturates the machine and starves everything else.
-default_jobs=$(( $(nproc 2>/dev/null || echo 8) / 2 ))
-[ "$default_jobs" -lt 1 ] && default_jobs=1
-jobs="${CORPUS_JOBS:-$default_jobs}"
+jobs="${CORPUS_JOBS:-$(./scripts/default_jobs.sh)}"
 
 # Boehm sizes its marker pool from the machine, not from this worker count, so
 # every worker starts ~one marker per core and the sweep oversubscribes by that
@@ -87,6 +96,17 @@ if [ -n "$only" ]; then
     out="${CORPUS_OUT:-build/corpus${suffix}_subset.json}"
 else
     out="${CORPUS_OUT:-build/corpus${suffix}.json}"
+fi
+slice_out="${CORPUS_PM_SLICE_OUT:-build/corpus_per_module_slice.json}"
+if [ -n "$slice" ]; then
+    if [ "$per_module" = 1 ]; then
+        echo "corpus: --per-module-slice is for the default mode; CORPUS_PER_MODULE=1 builds every row per-module" >&2
+        exit 2
+    fi
+    if [ ! -f "$slice" ]; then
+        echo "corpus: no per-module slice list $slice" >&2
+        exit 2
+    fi
 fi
 # Each mode sets the path itself, so a caller's env cannot move the default one.
 if [ "$per_module" = 1 ]; then
@@ -112,7 +132,9 @@ for tool in parallel jq bc timeout nm; do
 done
 
 list=$(mktemp)
-trap 'rm -f "$list"' EXIT
+slice_list=$(mktemp)
+rows=$(mktemp)
+trap 'rm -f "$list" "$slice_list" "$rows"' EXIT
 if [ -n "$only" ]; then
     # The sandbox and the result record are keyed on the basename, so a
     # file listed twice would run twice in the same directory.
@@ -125,11 +147,41 @@ if [ "$total" -eq 0 ]; then
     echo "corpus: no test files selected" >&2
     exit 2
 fi
+if [ -n "$slice" ]; then
+    ./scripts/corpus_per_module_slice_entries.sh "$slice" > "$slice_list"
+fi
+slice_total=$(wc -l < "$slice_list" | tr -d ' ')
+
+# One job per line: a file, then its rows' modes (- for the sweep's own mode,
+# pm for a per-module slice row). A file's rows run one after the other in one
+# job: corpus_one.sh holds a lock per file, so two jobs of one file would leave
+# a worker idle on the lock. The longest jobs start first, by the previous
+# seconds from the JSON this run is about to replace; a job with a row new to
+# that JSON starts before all others.
+{
+    for j in "$out" "$slice_out"; do
+        m=""
+        [ "$j" = "$slice_out" ] && m=pm
+        [ "$j" = "$slice_out" ] && [ -z "$slice" ] && continue
+        jq -r --arg m "$m" '.files[]? | "\(.file)\t\($m)\t\(.seconds)"' "$j" 2>/dev/null
+    done
+    awk '{ print $0 "\t\t-" }' "$list"
+    awk '{ print $0 "\tpm\t-" }' "$slice_list"
+} | awk -F'\t' '
+    $3 != "-" { secs[$1 FS $2] = $3; next }
+    !($1 in total) { order[++n] = $1 }
+    {
+        k = $1 FS $2
+        total[$1] += (k in secs ? secs[k] : 1e9)
+        modes[$1] = modes[$1] " " ($2 == "" ? "-" : $2)
+    }
+    END { for (i = 1; i <= n; i++) printf "%s\t%s%s\n", total[order[i]], order[i], modes[order[i]] }' \
+  | LC_ALL=C sort -t"$(printf '\t')" -k1,1gr -k2,2 | cut -f2- > "$rows"
 
 [ -f build/gc_unity.c ] || ./scripts/gen_gc_unity.sh build/gc_unity.c || exit 2
 
 results="build/corpus/results"
-rm -rf "$results" build/corpus/work build/corpus/native build/corpus/compiler_archive build/corpus/cc build/corpus/pch
+rm -rf "$results" build/corpus/work build/corpus/native build/corpus/compiler_archive build/corpus/cc build/corpus/pch build/corpus/locks
 mkdir -p "$results" build/corpus
 
 # The corpus builds with --debug for debug_assert and the runtime's debug
@@ -148,11 +200,16 @@ chmod +x build/corpus/cc/cc
 # sqlite3 once per such file. Build each object once with the flags a corpus
 # build uses (those of `blink build --debug`, less -g); corpus_one.sh copies it
 # in with its mtime, which is what lets the build skip the compile.
+#
+# The native objects, the PCH and the compiler archive read nothing the others
+# write, and each is one cc on one core, so they build at once.
 mkdir -p build/corpus/native
+native_pids=()
 for d in lib/native/*/; do
     name=$(basename "$d")
     [ -f "$d$name.c" ] || continue
-    cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" || exit 2
+    cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" &
+    native_pids+=("$!")
 done
 
 # Each row's unit includes libblink_std.h first, and reading it is about a
@@ -163,16 +220,20 @@ done
 # PCH built with other flags or macros and reads the header instead. With no
 # PCH every row still builds, so a failure here costs time only.
 pch_key=$(./scripts/corpus_std_pch_key.sh "$comp")
+pch_pid=""
 if [ -n "$pch_key" ]; then
     pch_dir="build/corpus/pch/$(sed -n 1p <<< "$pch_key")"
     mkdir -p "$pch_dir"
     ln -s "$(sed -n 2p <<< "$pch_key")" "$pch_dir/libblink_std.h"
     ln -s "$(sed -n 3p <<< "$pch_key")" "$pch_dir/runtime.h"
-    if ! cc -pipe -O0 -DBLINK_DEBUG -pthread -DBLINK_USE_EXTERN_RUNTIME_STORAGE=1 -x c-header \
-            -o "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h" > build/corpus/pch.log 2>&1 \
-            || ! mv "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h.gch"; then
-        echo "corpus: no PCH of libblink_std.h, rows read the header (see build/corpus/pch.log)" >&2
-    fi
+    (
+        if ! cc -pipe -O0 -DBLINK_DEBUG -pthread -DBLINK_USE_EXTERN_RUNTIME_STORAGE=1 -x c-header \
+                -o "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h" > build/corpus/pch.log 2>&1 \
+                || ! mv "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h.gch"; then
+            echo "corpus: no PCH of libblink_std.h, rows read the header (see build/corpus/pch.log)" >&2
+        fi
+    ) &
+    pch_pid=$!
 fi
 
 # The roots are the modules the compiler binary imports plus the test helpers
@@ -197,6 +258,11 @@ else
     export BLINK_COMPILER_ARCHIVE="$carchive"
 fi
 
+for p in "${native_pids[@]}"; do
+    wait "$p" || exit 2
+done
+[ -n "$pch_pid" ] && wait "$pch_pid"
+
 # Instructions and CPU time cover the per-file compile and run only (the
 # parallel sweep and the processes it starts), not the gen1 build, the compiler
 # archive or the PCH before it. Wall time moves with machine load; user-space
@@ -211,12 +277,28 @@ if command -v "$perf_bin" >/dev/null 2>&1 \
     perf_cmd=("$perf_bin" stat -x, -e instructions:u,task-clock -o "$perf_out" --)
 fi
 
+# The same share of the CPUs a per-module run gives each worker.
+pm_row_jobs=$(( $(nproc 2>/dev/null || echo 8) / jobs ))
+[ "$pm_row_jobs" -lt 1 ] && pm_row_jobs=1
+export CORPUS_PM_BLINK_JOBS="$pm_row_jobs"
+
 mode_note=""
 [ "$per_module" = 1 ] && mode_note=", per-module, BLINK_JOBS=$BLINK_JOBS"
+[ "$slice_total" -gt 0 ] && mode_note="$mode_note, $slice_total per-module slice rows at BLINK_JOBS=$pm_row_jobs"
 echo "corpus: $total files, compiler $comp, $jobs workers$mode_note"
+run_rows() {
+    f=$1
+    shift
+    for m in "$@"; do
+        [ -n "$m" ] || continue
+        ./scripts/corpus_one.sh "$f" "$CORPUS_COMP" "$CORPUS_RESULTS" "${m#-}"
+    done
+}
+export -f run_rows
+export CORPUS_COMP="$comp" CORPUS_RESULTS="$results"
 start=$(date +%s)
-"${perf_cmd[@]}" parallel -j "$jobs" --halt never --line-buffer \
-    ./scripts/corpus_one.sh {} "$comp" "$results" :::: "$list" \
+"${perf_cmd[@]}" env PARALLEL_SHELL=bash parallel -j "$jobs" --halt never --line-buffer --colsep ' ' \
+    run_rows {1} {2} {3} :::: "$rows" \
     | awk '{ n[$1]++ } END { for (k in n) printf "corpus: %s %d\n", k, n[k] }'
 end=$(date +%s)
 
@@ -231,28 +313,34 @@ if [ -s "$perf_out" ]; then
     [ -n "$ms" ] && cpu_seconds=$(awk -v ms="$ms" 'BEGIN { printf "%.2f", ms / 1000 }')
 fi
 
-# One record per file, in corpus order; a file with no record means the
+# One record per file, in list order; a file with no record means the
 # runner itself died, which is recorded as compile_fail so the total holds.
-records=$(mktemp)
-while IFS= read -r f; do
-    b=$(basename "$f" .bl)
-    if [ -f "$results/$b.json" ]; then
-        cat "$results/$b.json"
-    else
-        printf '{"file":"%s","status":"compile_fail","seconds":0,"first_error_line":"corpus runner produced no record","known_failures":null,"compiler_archive":false,"per_module":false}\n' "$f"
-    fi
-done < "$list" > "$records"
+# records <list> <record suffix>
+records() {
+    awk -v r="$results" -v sfx="$2" '{
+        b = $0; sub(/.*\//, "", b); sub(/\.bl$/, "", b)
+        p = r "/" b sfx ".json"
+        if ((getline line < p) > 0) { print line; close(p) }
+        else printf "{\"file\":\"%s\",\"status\":\"compile_fail\",\"seconds\":0,\"first_error_line\":\"corpus runner produced no record\",\"known_failures\":null,\"compiler_archive\":false,\"per_module\":false}\n", $0
+    }' "$1"
+}
 
 comp_sha=$(sha256sum "$(readlink -f "$comp/blinkc")" | cut -c1-16)
-jq -s \
+# write_json <records> <out> <per_module>. The CPU time and instructions cover
+# the whole sweep, slice rows too, so they go in the main JSON only.
+write_json() {
+    local cpu=null ins=null
+    if [ "$2" = "$out" ]; then cpu="$cpu_seconds"; ins="$instructions_u"; fi
+    jq -s \
     --arg compiler "$comp" \
     --arg blinkc_sha256_prefix "$comp_sha" \
     --arg git "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
     --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson secs "$((end - start))" \
-    --argjson instructions_u "$instructions_u" \
-    --argjson cpu_seconds "$cpu_seconds" \
-    --argjson per_module "$([ "$per_module" = 1 ] && echo true || echo false)" '
+    --argjson instructions_u "$ins" \
+    --argjson cpu_seconds "$cpu" \
+    --argjson slice_rows "$slice_total" \
+    --argjson per_module "$3" '
     {
       compiler: $compiler,
       blinkc_sha256_prefix: $blinkc_sha256_prefix,
@@ -270,14 +358,26 @@ jq -s \
       known_failures: (map(.known_failures // 0) | add // 0),
       compiler_archive_linked: (map(select(.compiler_archive == true)) | length),
       per_module_built: (map(select(.per_module == true)) | length),
+      per_module_slice_rows_in_sweep: $slice_rows,
       files: .
-    }' "$records" > "$out"
-rm -f "$records"
+    }' "$1" > "$2"
+}
 
 # A truncated or malformed result file must fail here, not read as 0/0 later.
-if ! jq -e '(.total|type=="number") and (.passed|type=="number") and (.files|type=="array") and (.total == (.files|length))' "$out" >/dev/null 2>&1; then
-    echo "corpus: ERROR $out is malformed" >&2
-    exit 2
+check_json() {
+    if ! jq -e '(.total|type=="number") and (.passed|type=="number") and (.files|type=="array") and (.total == (.files|length))' "$1" >/dev/null 2>&1; then
+        echo "corpus: ERROR $1 is malformed" >&2
+        exit 2
+    fi
+}
+
+records "$list" "" > "$rows"
+write_json "$rows" "$out" "$([ "$per_module" = 1 ] && echo true || echo false)"
+check_json "$out"
+if [ -n "$slice" ]; then
+    records "$slice_list" .pm > "$rows"
+    write_json "$rows" "$slice_out" true
+    check_json "$slice_out"
 fi
 passed=$(jq -r .passed "$out")
 if [ "$instructions_u" != null ] && [ "$cpu_seconds" != null ]; then
@@ -299,6 +399,10 @@ jq -r '
 
 echo "compiler-archive: linked $(jq -r .compiler_archive_linked "$out") files"
 [ "$per_module" = 1 ] && echo "per-module: built $(jq -r .per_module_built "$out") files in units"
+if [ -n "$slice" ]; then
+    echo "per-module slice: $(jq -r '"\(.passed)/\(.total) passed, \(.per_module_built) built in units"' "$slice_out") -> $slice_out"
+    jq -r '.files[] | select(.status != "pass") | "  \(.status) \(.file): \(.first_error_line)"' "$slice_out"
+fi
 
 if [ "$run_lint" -eq 1 ] && [ -z "$only" ]; then
     ./scripts/lint_codegen.sh || exit 1

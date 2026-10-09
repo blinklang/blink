@@ -21,7 +21,7 @@ fail=0
 
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std" "$R/src"
-cp scripts/corpus.sh scripts/corpus_one.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh "$R/scripts/"
+cp scripts/corpus.sh scripts/corpus_one.sh scripts/default_jobs.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh scripts/corpus_per_module_slice_entries.sh "$R/scripts/"
 : > "$R/build/gc_unity.c"
 # corpus.sh takes the compiler archive roots from the compiler binary's imports.
 printf 'import std.fs\nimport lexer.{Lex}\nimport cg\n\nfn main() {}\n' > "$R/src/blinkc_main.bl"
@@ -419,6 +419,34 @@ fi
 (cd "$R" && CORPUS_PER_MODULE=yes CORPUS_COMPILER=fakec ./scripts/corpus.sh --only "$WORK/all_pass.txt" --no-lint) > "$WORK/out.log" 2>&1
 expect "per-module-bad-value" 2 $?
 
+# --per-module-slice runs each listed file a second time, on the per-module
+# path, in the same sweep: the main rows stay one unit and link the archive,
+# the slice rows build in units with no archive, and each goes to its own JSON.
+printf '# fixture slice\ntests/test_selftest_ok.bl\ntests/test_selftest_run_fail.bl  # manual: a marked line still runs\n# exclude tests/test_selftest_compile_fail.bl: an exclude line runs nothing\n' > "$WORK/slice.txt"
+echo '// SELFTEST_COMPILER_ARCHIVE' > "$R/tests/test_selftest_slice_archive.bl"
+printf 'tests/test_selftest_ok.bl\ntests/test_selftest_slice_archive.bl\n' > "$WORK/slice_main.txt"
+printf 'tests/test_selftest_slice_archive.bl\n' >> "$WORK/slice.txt"
+rm -f "$R/build/corpus_per_module_slice.json"
+run_corpus --only "$WORK/slice_main.txt" --no-lint --per-module-slice "$WORK/slice.txt"
+got=$?
+main_pm=$(jq -c '[.files[] | [.file, .status, .per_module, .compiler_archive]]' "$R/build/corpus_subset.json" 2>/dev/null)
+slice_rows=$(jq -c '[.files[] | [.file, .status, .per_module]]' "$R/build/corpus_per_module_slice.json" 2>/dev/null)
+if [ "$got" -eq 0 ] \
+        && [ "$main_pm" = '[["tests/test_selftest_ok.bl","pass",false,false],["tests/test_selftest_slice_archive.bl","pass",false,true]]' ] \
+        && [ "$slice_rows" = '[["tests/test_selftest_ok.bl","pass",true],["tests/test_selftest_run_fail.bl","run_fail",true],["tests/test_selftest_slice_archive.bl","compile_fail",false]]' ] \
+        && [ "$(jq -r .per_module "$R/build/corpus_per_module_slice.json")" = true ] \
+        && grep -q '^per-module slice: 1/3 passed, 2 built in units -> build/corpus_per_module_slice.json$' "$WORK/out.log"; then
+    echo "PASS slice-rows: exit 0, main rows one unit, slice rows per-module with no archive"
+else
+    echo "FAIL slice-rows: exit $got, main $main_pm, slice $slice_rows"
+    sed 's/^/    /' "$WORK/out.log"
+    fail=1
+fi
+(cd "$R" && CORPUS_PER_MODULE=1 CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/all_pass.txt" --per-module-slice "$WORK/slice.txt") > "$WORK/out.log" 2>&1
+expect "slice-in-per-module-mode" 2 $?
+run_corpus --only "$WORK/all_pass.txt" --no-lint --per-module-slice "$WORK/no_such_slice.txt"
+expect "slice-list-missing" 2 $?
+
 # corpus_check.sh on hand-written result files. The fixture root holds one
 # stub tests/test_check_N.bl per record, so the total can match the tests on
 # disk. The fixtures above sit in the same tests/ directory, so the check runs
@@ -506,7 +534,7 @@ floor 0
 
 # corpus_per_module_check.sh: every file passes in units, except the listed
 # known failures, which must still fail.
-cp scripts/corpus_per_module_check.sh "$C/scripts/"
+cp scripts/corpus_per_module_check.sh scripts/corpus_per_module_slice_entries.sh scripts/corpus_per_module_slice_drift.sh "$C/scripts/"
 known() { printf '# fixture\n%s' "$1" > "$C/scripts/corpus_per_module_known_failures.txt"; }
 pmrec() { printf '{"file":"%s","status":"%s","known_failures":%s,"compiler_archive":false,"per_module":%s,"first_error_line":"e"}' "$1" "$2" "$3" "$4"; }
 pm_file() {
@@ -543,6 +571,112 @@ pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2
 run_pm_check; expect "pm-check-known-unreadable" 1 $?
 corpus_file "$WORK/now.json" "$(rec tests/test_check_1.bl pass 0)" "$(rec tests/test_check_2.bl pass 0)"
 run_pm_check; expect "pm-check-default-mode-json" 2 $?
+
+# --slice holds the files a list names to the same rules, in place of every
+# test on disk, and holds the list itself to naming files that exist.
+slice() { printf '# fixture slice\n%s' "$1" > "$WORK/slice.txt"; }
+run_slice_check() {
+    (cd "$C" && CORPUS_JSON="$WORK/now.json" ./scripts/corpus_per_module_check.sh --slice "$WORK/slice.txt") > "$WORK/out.log" 2>&1
+}
+stubs 3
+known ""
+slice "tests/test_check_1.bl
+tests/test_check_2.bl
+"
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl pass 0 true)"
+run_slice_check; expect "slice-check-all-pass" 0 $?
+grep -q "^corpus-per-module-check: ok (slice $WORK/slice.txt) 2/2 passed, 0 known failure(s) still fail, 2 built in units$" "$WORK/out.log" \
+    || { echo "FAIL slice-check-all-pass-summary"; sed 's/^/    /' "$WORK/out.log"; fail=1; }
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl run_fail null true)"
+run_slice_check; expect "slice-check-failing-row" 1 $?
+names "slice-check-failing-row-names-file" "tests/test_check_2.bl: run_fail"
+known "tests/test_check_2.bl"
+run_slice_check; expect "slice-check-known-failure" 0 $?
+known ""
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl pass 0 false)"
+run_slice_check; expect "slice-check-one-unit-pass" 1 $?
+names "slice-check-one-unit-pass-names-file" "tests/test_check_2.bl$"
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)"
+run_slice_check; expect "slice-check-listed-file-not-run" 1 $?
+names "slice-check-listed-file-not-run-names-file" "tests/test_check_2.bl$"
+pm_file "$(pmrec tests/test_check_1.bl pass 0 true)" "$(pmrec tests/test_check_2.bl pass 0 true)"
+slice "tests/test_check_1.bl
+tests/test_check_2.bl
+tests/test_check_9.bl
+"
+run_slice_check; expect "slice-check-listed-file-missing" 1 $?
+names "slice-check-listed-file-missing-names-file" "tests/test_check_9.bl$"
+slice "tests/test_check_1.bl
+tests/test_check_2.bl   # manual: picked by hand
+# exclude tests/test_check_3.bl: a comment line, not an entry
+"
+run_slice_check; expect "slice-check-marked-lines" 0 $?
+slice "
+"
+run_slice_check; expect "slice-check-empty-list" 1 $?
+grep -q "names no test file" "$WORK/out.log" \
+    || { echo "FAIL slice-check-empty-list-says-why"; sed 's/^/    /' "$WORK/out.log"; fail=1; }
+rm -f "$WORK/slice.txt"
+run_slice_check; expect "slice-check-no-list" 1 $?
+
+# The drift check holds the list to what the selection rule picks now. The
+# fixture stands in a file of picks for the rule (SLICE_PICKED).
+picked() { printf '%s' "$1" > "$WORK/picked.txt"; }
+run_drift() {
+    (cd "$C" && SLICE_PICKED="$WORK/picked.txt" ./scripts/corpus_per_module_slice_drift.sh "$WORK/slice.txt") > "$WORK/out.log" 2>&1
+}
+stubs 4
+picked "tests/test_check_1.bl
+tests/test_check_2.bl
+"
+slice "tests/test_check_1.bl
+tests/test_check_2.bl
+tests/test_check_4.bl  # manual: picked by hand
+"
+run_drift; expect "drift-in-step" 0 $?
+grep -q "^corpus-per-module-slice-drift: ok 2 picked by the rule, 1 by hand, 0 excluded$" "$WORK/out.log" \
+    || { echo "FAIL drift-in-step-summary"; sed 's/^/    /' "$WORK/out.log"; fail=1; }
+picked "tests/test_check_1.bl
+tests/test_check_2.bl
+tests/test_check_3.bl
+"
+run_drift; expect "drift-picked-not-listed" 1 $?
+names "drift-picked-not-listed-names-file" "tests/test_check_3.bl$"
+grep -q "scripts/corpus_per_module_slice_select.sh" "$WORK/out.log" \
+    || { echo "FAIL drift-picked-not-listed-says-refresh"; sed 's/^/    /' "$WORK/out.log"; fail=1; }
+slice "tests/test_check_1.bl
+tests/test_check_2.bl
+# exclude tests/test_check_3.bl: its slice row adds nothing
+tests/test_check_4.bl  # manual: picked by hand
+"
+run_drift; expect "drift-excluded" 0 $?
+grep -q "^corpus-per-module-slice-drift: ok 2 picked by the rule, 1 by hand, 1 excluded$" "$WORK/out.log" \
+    || { echo "FAIL drift-excluded-summary"; sed 's/^/    /' "$WORK/out.log"; fail=1; }
+slice "tests/test_check_1.bl
+tests/test_check_2.bl
+tests/test_check_3.bl
+tests/test_check_4.bl
+"
+run_drift; expect "drift-unmarked-unpicked" 1 $?
+names "drift-unmarked-unpicked-names-file" "tests/test_check_4.bl$"
+picked "tests/test_check_1.bl
+"
+slice "tests/test_check_1.bl
+# exclude tests/test_check_2.bl: the rule no longer picks it
+"
+run_drift; expect "drift-stale-exclude" 1 $?
+names "drift-stale-exclude-names-file" "tests/test_check_2.bl$"
+picked "tests/test_check_1.bl
+tests/test_check_2.bl
+"
+slice "tests/test_check_1.bl
+tests/test_check_2.bl
+# exclude tests/test_check_2.bl: listed and excluded at once
+"
+run_drift; expect "drift-excluded-and-listed" 1 $?
+names "drift-excluded-and-listed-names-file" "tests/test_check_2.bl$"
+rm -f "$WORK/slice.txt"
+run_drift; expect "drift-no-list" 1 $?
 
 if [ "$fail" -ne 0 ]; then
     echo "test_corpus: FAILED"

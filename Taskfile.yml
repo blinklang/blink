@@ -4,7 +4,7 @@ vars:
   BUILD_DIR: build
   BLINKC: build/blinkc
   JOBS:
-    sh: n=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 12); h=$((n / 2)); if [ "$h" -lt 1 ]; then h=1; fi; echo "$h"
+    sh: ./scripts/default_jobs.sh
   VERSION:
     sh: cat VERSION | tr -d '\n'
 
@@ -578,7 +578,8 @@ tasks:
     cmds:
       - task: gen1
       # ci already ran the lint through ratchet; it passes CORPUS_LINT=0.
-      - ./scripts/corpus.sh {{if ne .CORPUS_LINT "1"}}--no-lint{{end}}
+      # CORPUS_PM_SLICE names a per-module slice list to run in the same sweep.
+      - ./scripts/corpus.sh {{if ne .CORPUS_LINT "1"}}--no-lint{{end}} {{if .CORPUS_PM_SLICE}}--per-module-slice {{.CORPUS_PM_SLICE}}{{end}}
 
   # The corpus with every build on the per-module path and no compiler archive,
   # held to scripts/corpus_per_module_known_failures.txt. The files that import
@@ -604,6 +605,20 @@ tasks:
     silent: true
     cmds:
       - ./scripts/corpus_check.sh
+
+  corpus-per-module-slice-drift:
+    desc: Fail unless scripts/corpus_per_module_slice.txt holds every file its selection rule picks, and only those besides its manual lines
+    silent: true
+    cmds:
+      - ./scripts/corpus_per_module_slice_drift.sh scripts/corpus_per_module_slice.txt
+
+  # ci runs the slice inside its corpus sweep (CORPUS_PM_SLICE), so this reads
+  # the JSON that sweep wrote.
+  corpus-per-module-slice-check:
+    desc: Fail unless every file in scripts/corpus_per_module_slice.txt passed per-module in build/corpus_per_module_slice.json
+    silent: true
+    cmds:
+      - ./scripts/corpus_per_module_check.sh --slice scripts/corpus_per_module_slice.txt
 
   lint:
     desc: Codegen-rewrite lint rows L1-L11 over layout/cname/mono/ir/cg_* against the baseline and the previous commit
@@ -660,21 +675,42 @@ tasks:
       - CORPUS_OUT={{.BUILD_DIR}}/corpus.json ./scripts/suites_in_corpus.sh
 
   # gen1 and the debt counts touch no common file: gen1 writes build/gen1 and
-  # ratchet reads src/ and Taskfile.yml through git. Run as deps they overlap,
-  # and either failing still fails the task.
-  __gen1-and-ratchet:
+  # ratchet reads src/ and Taskfile.yml through git. The gate scripts'
+  # self-tests each work in a temp tree of their own, commit-messages reads
+  # git only, and the slice drift check reads tests/ and src/, so none of them
+  # waits on gen1, on ratchet or on each other. Run as deps they overlap, and
+  # any one failing still fails the task.
+  __gen1-ratchet-and-selftests:
     internal: true
     silent: true
-    deps: [gen1, ratchet]
+    deps: [gen1, ratchet, __gate-selftests]
+
+  # One dep, not seven: run_together.sh prints each one's output whole.
+  __gate-selftests:
+    internal: true
+    silent: true
+    cmds:
+      - >-
+        ./scripts/run_together.sh
+        ./scripts/test_ratchet.sh
+        ./scripts/test_lint_codegen.sh
+        ./scripts/test_corpus.sh
+        ./scripts/test_fmt_semantic.sh
+        ./scripts/lint_commit_messages.sh
+        ./scripts/test_lint_commit_messages.sh
+        './scripts/corpus_per_module_slice_drift.sh scripts/corpus_per_module_slice.txt'
 
   # The daily gate for the codegen rewrite, every step in the order it runs:
   #   (a) gen0 compiles the current compiler sources (gen1), while the debt
   #       counts and the codegen lint run beside it
-  #   (b) no commit message names a br id, and every gate
+  #   (b) beside (a): no commit message names a br id, and every gate
   #       script catches what it exists to catch (commit-messages,
   #       test-ratchet, test-lint, test-corpus, test-fmt-semantic,
-  #       test-commit-messages)
-  #   (c) every file of the corpus passes (corpus, then corpus-check)
+  #       test-commit-messages), and the per-module slice list holds every
+  #       file its selection rule picks (corpus-per-module-slice-drift)
+  #   (c) every file of the corpus passes (corpus, then corpus-check), and
+  #       every file of the per-module slice passes per-module in the same
+  #       sweep (corpus-per-module-slice-check)
   #   (d) formatter goldens with the gen1 compiler
   #   (e) every typecheck-suite and rewrite-suite file passed in that corpus
   #       run. The corpus already runs each of them under gen1, so ci does not
@@ -685,16 +721,11 @@ tasks:
     desc: CI gate (gen0 compiles src, full corpus passes, lint, fmt goldens, suite files pass in the corpus)
     silent: true
     cmds:
-      - task: __gen1-and-ratchet
-      - task: test-ratchet
-      - task: test-lint
-      - task: test-corpus
-      - task: test-fmt-semantic
-      - task: commit-messages
-      - task: test-commit-messages
+      - task: __gen1-ratchet-and-selftests
       - task: corpus
-        vars: { CORPUS_LINT: "0" }
+        vars: { CORPUS_LINT: "0", CORPUS_PM_SLICE: scripts/corpus_per_module_slice.txt }
       - task: corpus-check
+      - task: corpus-per-module-slice-check
       - task: __fmt-goldens
         vars: { FMT_BLINKC: "{{.BUILD_DIR}}/gen1/blinkc", FMT_SEMANTIC: "0" }
       - task: suites-in-corpus
@@ -710,13 +741,7 @@ tasks:
     desc: "Branch gate: everything in ci, with the corpus sample in place of the full corpus"
     silent: true
     cmds:
-      - task: __gen1-and-ratchet
-      - task: test-ratchet
-      - task: test-lint
-      - task: test-corpus
-      - task: test-fmt-semantic
-      - task: commit-messages
-      - task: test-commit-messages
+      - task: __gen1-ratchet-and-selftests
       - task: corpus-sample
       - task: __fmt-goldens
         vars: { FMT_BLINKC: "{{.BUILD_DIR}}/gen1/blinkc", FMT_SEMANTIC: "0" }
