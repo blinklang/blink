@@ -463,39 +463,40 @@ the 1.0 s goal for it needs a faster emit, not a faster cc.
 ### Unit reuse
 
 `task bench-edit-loop` on the gen1 `blink` built from `a2e9dc72` (before) and
-from `4981a63a` (after), 5 reps, 12 cores, under `blink-gates.slice`, back to
-back on one machine, each on its own tree. Median wall seconds, with min and
-max on the rows the goal names. `bench/edit_loop/per_module_a2e9dc72.tsv`,
-`bench/edit_loop/per_module_4981a63a.tsv` and the two `monolith_*.tsv` files
+from `b9aaeade` (after), 5 reps, 12 cores, under `blink-gates.slice`, back to
+back on one machine, both on the `b9aaeade` tree. Median wall seconds, with
+min and max on the rows the goal names. `bench/edit_loop/per_module_a2e9dc72.tsv`,
+`bench/edit_loop/per_module_b9aaeade.tsv` and the two `monolith_*.tsv` files
 of those shas hold the rows.
 
 | target | case | `--no-per-module` after | before | after | after emit_s | after cc_s |
 |---|---|---|---|---|---|---|
-| cli | nochange | 0.917 | 0.580 | 0.624 | 0.579 | 0.000 |
-| cli | body-cname | 11.166 | 1.285 [1.258-1.298] | 1.052 [1.041-1.059] | 0.843 | 0.161 |
-| cli | body-typecheck | 11.203 | 3.629 | 3.460 | 0.910 | 2.503 |
-| cli | pubfn-cname | 11.204 | 2.016 | 2.102 | 1.147 | 0.909 |
-| cli | run-body-cname | 11.205 | 1.278 | 1.042 | 0.834 | 0.160 |
-| cli | test-body-cname | 2.326 | 0.678 | 0.569 | 0.422 | 0.110 |
-| cli | cold-obj | 11.171 | 3.843 | 3.902 | 0.663 | 3.189 |
-| cli | cold-all | 13.671 | 6.321 | 6.395 | 0.759 | 5.589 |
-| small | nochange | 0.076 | 0.073 [0.072-0.074] | 0.075 [0.073-0.076] | 0.055 | 0.000 |
-| small | body-inventory | 0.146 | 0.126 | 0.126 | 0.067 | 0.040 |
-| small | pubfn-model | 0.146 | 0.126 | 0.127 | 0.069 | 0.039 |
-| small | run-body-inventory | 0.145 | 0.126 | 0.126 | 0.067 | 0.040 |
-| small | test-body-inventory | 0.148 | 0.141 | 0.142 | 0.065 | 0.057 |
-| small | cold-obj | 0.145 | 0.126 | 0.126 | 0.067 | 0.040 |
+| cli | nochange | 0.779 | 0.508 | 0.524 | 0.482 | 0.000 |
+| cli | body-cname | 10.635 | 1.153 [1.142-1.162] | 0.890 [0.875-0.906] | 0.697 | 0.150 |
+| cli | body-typecheck | 10.603 | 3.389 | 3.204 | 0.765 | 2.396 |
+| cli | pubfn-cname | 10.610 | 1.845 | 1.862 | 0.971 | 0.845 |
+| cli | run-body-cname | 10.604 | 1.146 | 0.903 | 0.709 | 0.152 |
+| cli | test-body-cname | 2.128 | 0.612 | 0.501 | 0.360 | 0.105 |
+| cli | cold-obj | 10.600 | 3.592 | 3.611 | 0.540 | 3.033 |
+| cli | cold-all | 12.997 | 5.969 | 5.993 | 0.622 | 5.329 |
+| small | nochange | 0.075 | 0.072 [0.071-0.076] | 0.074 [0.072-0.074] | 0.054 | 0.000 |
+| small | body-inventory | 0.140 | 0.122 | 0.125 | 0.066 | 0.038 |
+| small | pubfn-model | 0.139 | 0.122 | 0.123 | 0.068 | 0.036 |
+| small | run-body-inventory | 0.141 | 0.124 | 0.125 | 0.067 | 0.038 |
+| small | test-body-inventory | 0.142 | 0.134 | 0.137 | 0.064 | 0.053 |
+| small | cold-obj | 0.139 | 0.122 | 0.123 | 0.066 | 0.038 |
 
 - A body edit on cli takes 47 of its units and emits two, the edited module
-  and `__main__`: `body-cname` falls by 0.23 s, to 1.05 s. That is still
-  above the 1.0 s goal. The front end (load, parse, typecheck, analyses and
-  mono) is about 0.45 s of it, and the obj-cache keys, the hash and the cc
-  id start processes that cost about 0.1 s more.
-- An edit that changes an interface (`pubfn-cname`) changes the C of 14 units and
-  pays for the longer inputs text: +0.09 s. `nochange`, `cold-obj` and
-  `cold-all` pay for it too, by 0.04 to 0.07 s, as the text grows from
-  6.2 MB to 8.1 MB on cli.
+  and `__main__`: `body-cname` falls by 0.26 s, to 0.89 s, under the 1.0 s
+  goal.
+- Each build that may take units parses for the interface texts and keeps
+  the longer inputs text: `nochange`, `pubfn-cname`, `cold-obj` and
+  `cold-all` on cli pay 0.02 s for it. The interface texts are 3.75% of the
+  instructions of a cli `nochange` build (callgrind).
 - Each small row is within the spread of its before row.
+- Each `--no-per-module` row is within the spread of its `a2e9dc72` row: a
+  monolith build does not track the sources it reads or parse for the
+  interface texts.
 
 The warm daemon that builds through this reuse is parked on the branch
 `daemon-build-routing` (ticket `2je9g7`).
