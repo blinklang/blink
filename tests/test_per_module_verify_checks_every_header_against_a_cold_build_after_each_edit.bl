@@ -1,0 +1,221 @@
+// Each per-module build writes every header of the program, also when the build takes no unit
+// from the last build. BLINK_EMIT_REUSE_VERIFY=1 compares each header and unit with a cold emit
+// of the same program on every per-module build, so a header that the build writes wrong is
+// found also after an edit that leaves no unit to take: a new pub type changes a surface
+// header, and the build then takes nothing. After a body edit, a signature edit, a new pub
+// type, a changed generic instance and a removed import, every header and unit equals the one
+// a build with no last build writes, and the binaries print the same. The program has the
+// shapes whose C a header spells: a struct with Option and tuple fields, a generic type, an
+// enum with payloads, an effect in a handler field, an #embed const, a global that main
+// sets at start, and pub and private globals whose Option, tuple, variant, generic instance
+// and struct types a header names, read from another module.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"header_verify_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/banner.txt", "banner\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub const banner: Str = #embed("banner.txt")"#,
+        #""#,
+        #"fn make_start() -> Int {"#,
+        #"    40 + 2"#,
+        #"}"#,
+        #""#,
+        #"pub let start = make_start()"#,
+        #""#,
+        #"pub let fallback: Option[Int] = Some(5)"#,
+        #""#,
+        #"pub let origin: (Int, Str) = (0, "o")"#,
+        #""#,
+        #"pub type Box[T] {"#,
+        #"    v: T"#,
+        #"}"#,
+        #""#,
+        #"pub type Shape {"#,
+        #"    Dot"#,
+        #"    Circle(Int)"#,
+        #"    Rect(Int, Int)"#,
+        #"}"#,
+        #""#,
+        #"pub type Rec {"#,
+        #"    name: Str"#,
+        #"    alt: Option[Int]"#,
+        #"    pair: (Int, Str)"#,
+        #"}"#,
+        #""#,
+        #"pub let first_shape: Shape = Shape.Rect(1, 2)"#,
+        #""#,
+        #"pub let boxed: Box[Int] = Box { v: 9 }"#,
+        #""#,
+        #"pub let rec0: Rec = Rec { name: "z", alt: None, pair: (3, "q") }"#,
+        #""#,
+        #"pub effect Log {"#,
+        #"    effect Note {"#,
+        #"        fn note(s: Str)"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"pub type Env {"#,
+        #"    h: Handler[Log]"#,
+        #"}"#,
+        #""#,
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub fn wrap[T](v: T) -> Box[T] {"#,
+        #"    Box { v: v }"#,
+        #"}"#,
+        #""#,
+        #"pub fn area(s: Shape) -> Int {"#,
+        #"    match s {"#,
+        #"        Dot => 0"#,
+        #"        Circle(r) => r * r * 3"#,
+        #"        Rect(w, h) => w * h"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{Box, Env, Log, Rec, Shape, area, start, tag, wrap}"#,
+        #""#,
+        #"pub fn mid_env() -> Env {"#,
+        #"    Env { h: handler Log {"#,
+        #"        fn note(s: Str) {"#,
+        #"            io.println("note {s}")"#,
+        #"        }"#,
+        #"    } }"#,
+        #"}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    let r = Rec { name: "r", alt: Some(start), pair: (1, "p") }"#,
+        #"    let b: Box[Int] = wrap(area(Shape.Rect(2, 3)))"#,
+        #"    tag("{r.name} {r.alt ?? 0} {r.pair.0} {b.v}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{Shape, area, banner, tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf {area(Shape.Circle(1))} {banner.trim()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{Log, area, boxed, fallback, first_shape, origin, rec0, tag}"#,
+        #"import mid.{mid_env, mid_value}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"let main_pair: (Int, Int) = (4, 5)"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let e = mid_env()"#,
+        #"    with e.h {"#,
+        #"        log.note("hi")"#,
+        #"    }"#,
+        #"    io.println("{tag("main")} {mid_value()} {leaf_value()}")"#,
+        #"    io.println("{fallback ?? 0} {origin.1} {main_pair.1}")"#,
+        #"    io.println("{area(first_shape)} {boxed.v} {rec0.pair.1}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, the module filters, and the verify each
+// build here sets for itself.
+fn blink_in(tree: Str, env_args: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_EMIT_REUSE_VERIFY BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {env_args} build/blink {args}"])
+}
+
+fn build_into(tree: Str, env_args: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, env_args, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+fn traced(r: ProcessResult, line: Str) -> Bool {
+    "{r.out}\n{r.err_out}".split("\n").contains("[dbg:build.units] {line}")
+}
+
+// One edit's result: the headers and units the verified build did not report as checked, the
+// C files that differ from a build with no last build, and the outputs of both binaries.
+type Step {
+    what: Str
+    unverified: Str
+    differ: Str
+    warm_out: Str
+    cold_out: Str
+}
+
+fn verified_and_cold(tree: Str, what: Str) -> Step {
+    let warm = build_into(tree, "BLINK_EMIT_REUSE_VERIFY=1", "out")
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, "", "cold")
+    let mut unverified: List[Str] = []
+    for f in sh("ls {tree}/out/app.units").split("\n") {
+        if f.ends_with(".h") && !traced(warm, "verify header {f} same") {
+            unverified.push(f)
+        }
+        if f.ends_with(".c") && !traced(warm, "verify unit {f.byte_slice(0, f.byte_len() - 2)} same") {
+            unverified.push(f)
+        }
+    }
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    Step { what: what, unverified: unverified.join(" "), differ: differ.split("\n").join(" "), warm_out: sh("{tree}/out/app"), cold_out: sh("{tree}/cold/app") }
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+test "verify checks every header and unit against a cold build after each kind of edit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_header_verify_each_edit_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "", "out")
+    let mut steps: List[Step] = []
+    edit(tree, "leaf.bl", #"s/"leaf /"leaf2 /"#)
+    steps.push(verified_and_cold(tree, "body"))
+    edit(tree, "leaf.bl", #"s/pub fn leaf_value() -> Str/pub fn leaf_value(k: Int) -> Str/; s/"leaf2 /"leaf{k} /"#)
+    edit(tree, "main.bl", #"s/{leaf_value()}/{leaf_value(7)}/"#)
+    steps.push(verified_and_cold(tree, "signature"))
+    // A new pub type with an Option field, built in another module.
+    edit(tree, "base.bl", #"$a\pub type Extra {\n    n: Option[Str]\n}"#)
+    edit(tree, "mid.bl", #"s/^import base.{Box, /import base.{Box, Extra, /; s/    let r = /    let x = Extra { n: Some("x") }\n    let r = /; s/{b.v}")/{b.v} {x.n ?? ""}")/"#)
+    steps.push(verified_and_cold(tree, "new pub type"))
+    // A Box[Str] and a wrap[Str] in place of the Int ones, which base's unit and the types
+    // header define.
+    edit(tree, "mid.bl", #"s/let b: Box\[Int\] = wrap(area(Shape.Rect(2, 3)))/let b: Box[Str] = wrap("{area(Shape.Rect(2, 3))}s")/"#)
+    steps.push(verified_and_cold(tree, "changed generic instance"))
+    edit(tree, "leaf.bl", #"s/, banner, /, /; s/ {banner.trim()}//"#)
+    steps.push(verified_and_cold(tree, "removed import"))
+    shell_exec("rm -rf {tree}")
+    for s in steps {
+        assert_eq("{s.what}: {s.unverified}", "{s.what}: ")
+        assert_eq("{s.what}: {s.differ}", "{s.what}: ")
+        assert_eq("{s.what}: {s.warm_out}", "{s.what}: {s.cold_out}")
+    }
+    assert_eq(steps.get(0).unwrap().warm_out, "note hi\n[main] [r 42 1 6] [leaf2 3 banner]\n5 o 5\n2 9 q")
+    assert_eq(steps.get(4).unwrap().warm_out, "note hi\n[main] [r 42 1 6s x] [leaf7 3]\n5 o 5\n2 9 q")
+}

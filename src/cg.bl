@@ -24,7 +24,10 @@ import parser.{
     node_str_val, node_value, node_push_value_child_ids, node_xfail_reason,
     sublist_get, sublist_length,
 }
-import layout.{Position, layout_of, layout_reset, set_current_inst, layout_take_typedefs}
+import layout.{
+    LayoutTypedefMarks, Position, layout_of, layout_reset, layout_start_from, layout_typedef_marks, set_current_inst,
+    layout_take_typedefs,
+}
 import cg_print.{
     print_ev_default_decl, print_ev_storage, print_fn, print_fn_decl, print_guard_open, print_include, print_main_shim, print_reset, print_scope_restore_support,
     print_take, print_test_fn, print_test_table, print_typedef_blocks,
@@ -40,7 +43,7 @@ import cg_decl.{
     cg_decl_emit_impl_method_decl,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
     cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_emit_typedefs_over, cg_decl_has_deferred_global, cg_decl_reset,
-    cg_decl_spelled_carrier_tids,
+    cg_decl_spelled_carrier_tids, CgDeclMarks, cg_decl_marks, cg_decl_start_from,
 }
 import cg_derive.{
     cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables,
@@ -110,13 +113,19 @@ pub type CgConfig {
 // Every mode starts from the same clean state. Two emits in one process must not see
 // each other's memo tables, and a stale entry would be read as a fact about this program.
 fn begin_unit(program: Int) ! Diag.Report {
+    reset_unit_state()
+    cg_reg_reset()
+    cg_reg_build(program)
+}
+
+// Every piece of codegen state but the registry, which cg_reg_build makes from the program
+// alone and no emit writes, so units of one program may share it.
+fn reset_unit_state() {
     print_reset()
     ir_reset()
     // layout_reset resets cname and then re-marks the declaration facts that cname holds,
     // so a second cname_reset here would clear the facts it had just written.
     layout_reset()
-    cg_reg_reset()
-    cg_reg_build(program)
     cg_decl_reset()
     cg_derive_reset()
     cg_promote_reset()
@@ -904,13 +913,59 @@ pub fn generate_module_headers(program: Int, module_key: Str, cfg: CgConfig) -> 
 
 pub fn generate_module_headers_with(program: Int, module_key: Str, cfg: CgConfig, facts: ProgramFacts) -> ModuleHeaders ! Codegen, Diag.Report {
     begin_unit(program)
-    // The types header already holds every typedef. Writing them here too and throwing the
-    // text away marks them written, so a signature below that spells one does not write it
-    // again. The prologue also sets the linkage the signatures are printed under.
+    // The prologue sets the linkage the signatures are printed under.
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, c_module_header_guard(module_key), "", false)
+    mark_typedefs_written(facts)
+    module_header_texts(module_key, cfg, false)
+}
+
+// The types header already holds every typedef. Writing them here too and throwing the
+// text away marks them written, so a signature that spells one does not write it again.
+fn mark_typedefs_written(facts: ProgramFacts) ! Diag.Report {
     cg_decl_emit_typedefs_over(facts.carrier_tids)
     cg_decl_emit_ev_typedef()
     let _ = print_take()
+}
+
+// What the typedef walk of generate_module_headers_with marks written. The walk is the same
+// for every module of a program and its text is thrown away, so a pass over the modules
+// walks once and each header starts from the marks.
+pub type HeaderPreamble {
+    decl: CgDeclMarks
+    layout: LayoutTypedefMarks
+}
+
+// The capture and the install below must cover every piece of state mark_typedefs_written
+// leaves, or a header built from the capture differs from one built after the walk. Any new
+// state the walk writes goes into HeaderPreamble, in both functions.
+pub fn header_preamble(program: Int, cfg: CgConfig, facts: ProgramFacts) -> HeaderPreamble ! Diag.Report {
+    begin_unit(program)
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, c_module_header_guard("__preamble__"), "", false)
+    mark_typedefs_written(facts)
+    HeaderPreamble { decl: cg_decl_marks(), layout: layout_typedef_marks() }
+}
+
+fn install_header_preamble(pre: HeaderPreamble) {
+    cg_decl_start_from(pre.decl)
+    layout_start_from(pre.layout)
+}
+
+// generate_module_headers_with for a module of the program `pre` was walked for, after
+// header_preamble and with no other emit between, so the registry is still that program's.
+// BLINK_EMIT_REUSE_VERIFY compares each header with the one generate_module_headers_with
+// writes.
+pub fn generate_module_headers_from(module_key: Str, cfg: CgConfig, pre: HeaderPreamble) -> ModuleHeaders ! Codegen, Diag.Report {
+    reset_unit_state()
+    cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, c_module_header_guard(module_key), "", false)
+    install_header_preamble(pre)
+    let _ = print_take()
+    module_header_texts(module_key, cfg, true)
+}
+
+// `skip_embeds`: an #embed initializer lowers to one string constant, so it never needs
+// the init function, and spelling a large file as a C literal costs more than the rest of
+// the header.
+fn module_header_texts(module_key: Str, cfg: CgConfig, skip_embeds: Bool) -> ModuleHeaders ! Codegen, Diag.Report {
     let globals = globals_in_scope(cfg, module_key, true)
     let fns = fns_in_scope(cfg, module_key, false, true)
     let methods = methods_in_scope(cfg, module_key, false, true)
@@ -925,7 +980,8 @@ pub fn generate_module_headers_with(program: Int, module_key: Str, cfg: CgConfig
     let private_guard = c_module_private_header_guard(module_key)
     open_module_header(private_guard)
     let _ = cg_decl_emit_globals(true, surface_decls(globals, false), Map())
-    if cg_decl_has_deferred_global(globals, lower_global_inits(globals)) {
+    let lowered = if skip_embeds { without_embed_inits(globals) } else { globals }
+    if cg_decl_has_deferred_global(lowered, lower_global_inits(lowered)) {
         print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false)
     }
     emit_root_signatures(cfg, surface_decls(fns, false), surface_decls(methods, false))
@@ -936,6 +992,16 @@ pub fn generate_module_headers_with(program: Int, module_key: Str, cfg: CgConfig
     emit_instance_signatures(cfg, methods)
     cg_decl_emit_epilogue(private_guard)
     ModuleHeaders { surface: surface, internal: print_take() }
+}
+
+fn without_embed_inits(globals: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for g in globals {
+        let init = node_value(g)
+        if init >= 0 && nk_of(node_kind(init)) == NodeKind.EmbedExpr { continue }
+        out.push(g)
+    }
+    out
 }
 
 fn open_module_header(guard: Str) {

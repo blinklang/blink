@@ -65,14 +65,54 @@ import stdlib_native_deps.{
 // 1 while a type's dependencies are being emitted, 2 once its typedef is written. The key
 // is the C name the typedef will carry, not the declaration: one generic declaration has
 // one typedef per instance, and two type ids that spell the same C name are one C type.
-let mut typedef_state: Map[Str, Int] = Map()
+let mut typedef_state: NameMarks = no_marks()
 
 // What this unit has written for each root effect's vtable typedef, keyed by the C name the
 // typedef carries: 1 once a name this stage cannot spell has stopped it and reported that,
 // 2 once the typedef is written. A struct field of handler type reaches an effect from the
 // type graph and the evidence vector reaches the same effect from the declarations, so both
 // read this rather than writing one typedef twice or reporting one gap twice.
-let mut vtable_state: Map[Str, Int] = Map()
+let mut vtable_state: NameMarks = no_marks()
+
+// A unit's marks over the marks of the header preamble it starts from. The preamble's marks
+// are only read, so every header of one pass shares one walk's marks and copies none.
+type NameMarks {
+    own: Map[Str, Int]
+    base: Map[Str, Int]
+}
+
+fn no_marks() -> NameMarks {
+    NameMarks { own: Map(), base: Map() }
+}
+
+fn mark_of(m: NameMarks, name: Str) -> Int {
+    m.own.get(name) ?? (m.base.get(name) ?? 0)
+}
+
+fn flat_marks(m: NameMarks) -> Map[Str, Int] {
+    if m.base.len() == 0 { return m.own }
+    let mut out: Map[Str, Int] = Map()
+    for k in m.base.keys() { out.insert(k, m.base.get(k) ?? 0) }
+    for k in m.own.keys() { out.insert(k, m.own.get(k) ?? 0) }
+    out
+}
+
+// What the typedef walk of one unit marked written, for the module headers of the same
+// program to start from instead of walking again.
+pub type CgDeclMarks {
+    typedefs: Map[Str, Int]
+    vtables: Map[Str, Int]
+}
+
+pub fn cg_decl_marks() -> CgDeclMarks {
+    CgDeclMarks { typedefs: flat_marks(typedef_state), vtables: flat_marks(vtable_state) }
+}
+
+// After cg_decl_reset: this unit has written what `m` marks.
+pub fn cg_decl_start_from(m: CgDeclMarks) {
+    typedef_state = NameMarks { own: Map(), base: m.typedefs }
+    vtable_state = NameMarks { own: Map(), base: m.vtables }
+}
 
 // The prototype this unit wrote for each foreign symbol, as its return and parameter
 // spellings. C takes one declaration per symbol, so two bindings over one symbol either
@@ -93,8 +133,8 @@ type UnitLinkage {
 let mut unit_linkage: UnitLinkage = UnitLinkage.AllExternal
 
 pub fn cg_decl_reset() {
-    typedef_state = Map()
-    vtable_state = Map()
+    typedef_state = no_marks()
+    vtable_state = no_marks()
     foreign_decls = Map()
     unit_linkage = UnitLinkage.AllExternal
 }
@@ -209,17 +249,17 @@ fn emit_typedef_for(decl: Int, inst_tid: Int) ! Diag.Report {
     // 1 means this type is already on the stack: the only way back to it is a member that
     // reaches its own owner, and such a member is stored boxed, so the cycle needs no
     // completed typedef and is not followed.
-    if (typedef_state.get(c_name) ?? 0) != 0 { return }
-    typedef_state.insert(c_name, 1)
+    if mark_of(typedef_state, c_name) != 0 { return }
+    typedef_state.own.insert(c_name, 1)
     if skips_typedef(decl) {
-        typedef_state.insert(c_name, 2)
+        typedef_state.own.insert(c_name, 2)
         return
     }
     for mtid in member_tids(decl, inst_tid) {
         for dep in nominal_deps(mtid) { emit_dep(dep) }
         emit_handler_dep(handler_dep_of(mtid))
     }
-    typedef_state.insert(c_name, 2)
+    typedef_state.own.insert(c_name, 2)
     emit_one(decl, tid, inst_tid, c_name)
 }
 
@@ -298,12 +338,12 @@ fn emit_handler_dep(handler_tid: Int) ! Diag.Report {
     if handler_tid < 0 { return }
     let vtable = c_vtable_type_name(handler_tid)
     if diag_is_ice_seg(vtable) { return }
-    if (vtable_state.get(vtable) ?? 0) != 0 { return }
+    if mark_of(vtable_state, vtable) != 0 { return }
     let decl = effect_decl_for_vtable(vtable)
     if decl < 0 { return }
     let sig = vtable_sig(decl, make_handler_type(node_name(decl)))
     if !sig.ok {
-        vtable_state.insert(vtable, 1)
+        vtable_state.own.insert(vtable, 1)
         return
     }
     emit_vtable_typedef(vtable, sig)
@@ -1166,10 +1206,10 @@ pub fn cg_decl_emit_ev_typedef() ! Diag.Report {
         let vtable = c_vtable_type_name(slot_tid)
         let field = c_ev_field_name(slot_tid)
         if !ev_slot_nameable(e, vtable, field) { return }
-        if (vtable_state.get(vtable) ?? 0) == 1 { return }
+        if mark_of(vtable_state, vtable) == 1 { return }
         let sig = vtable_sig(e, slot_tid)
         if !sig.ok {
-            vtable_state.insert(vtable, 1)
+            vtable_state.own.insert(vtable, 1)
             return
         }
         emit_vtable_typedef(vtable, sig)
@@ -1207,10 +1247,10 @@ fn ev_slot_nameable(effect_decl: Int, vtable: Str, field: Str) -> Bool ! Diag.Re
 fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Diag.Report {
     // A gap this vtable already reported is not reported again: the type graph may have
     // reached the same effect from a handler field, and one gap is one report.
-    if (vtable_state.get(vtable) ?? 0) == 1 { return 0 }
+    if mark_of(vtable_state, vtable) == 1 { return 0 }
     let sig = vtable_sig(effect_decl, slot_tid)
     if !sig.ok {
-        vtable_state.insert(vtable, 1)
+        vtable_state.own.insert(vtable, 1)
         return 0
     }
     emit_vtable_typedef(vtable, sig)
@@ -1228,8 +1268,8 @@ fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Dia
 // The typedef alone, written once per unit. Both readers of `vtable_state` come through
 // here, so whichever reaches the effect first writes it and the other one does not.
 fn emit_vtable_typedef(vtable: Str, sig: VtableSig) ! Diag.Report {
-    if (vtable_state.get(vtable) ?? 0) == 2 { return }
-    vtable_state.insert(vtable, 2)
+    if mark_of(vtable_state, vtable) == 2 { return }
+    vtable_state.own.insert(vtable, 2)
     let mut userdata: List[Str] = []
     for slot in sig.slots { userdata.push(c_vtable_userdata_member(slot)) }
     print_effect_vtable_typedef(td_guard_name(vtable), vtable, sig.slots, userdata, sig.rets, sig.params)

@@ -219,13 +219,15 @@ asks for the one-unit build.
   hashed against the record. When one differs, the build emits every
   taken unit again. The `__main__` unit and the other units are emitted.
   The trace prints `reuse unit <module>` for each unit taken.
-- **Reuse verify.** `BLINK_EMIT_REUSE_VERIFY=1` makes a build that takes
-  units, or the whole emit, from the last build emit the whole program
-  again into a directory of its own. It fails, naming the file, unless
-  every unit, `__main__` and every header is byte-equal to the file the
-  build left. Every file, not only the taken units: a unit's lowering can
-  set state that `__main__`, a header or a unit lowered after it reads.
-  The tests of the reuse key run under it.
+- **Reuse verify.** `BLINK_EMIT_REUSE_VERIFY=1` makes each per-module
+  build, also one that takes nothing from the last build, emit the whole
+  program again into a directory of its own, with each module header
+  written after a typedef walk of its own (see "Unit headers from one
+  walk"). It fails, naming the file, unless every unit, `__main__` and
+  every header is byte-equal to the file the build left. Every file, not
+  only the taken units: a unit's lowering can set state that `__main__`, a
+  header or a unit lowered after it reads. The tests of the reuse key and
+  of the module headers run under it.
 - **Errors.** A cc failure prints the cc output, then
   `error: C compilation failed in unit <module>`, and exits 1, the same
   code as the monolith.
@@ -584,6 +586,82 @@ files of those shas hold the rows.
   rechecks (about 0.4 s), then builds. With a 1 s wait on the same binary it
   takes 0.680 s [0.641-0.718]. `per_module_daemon_settle0_a0d2bbb0.tsv` and
   `per_module_daemon_settle1_a0d2bbb0.tsv` hold the rows.
+
+### Unit headers from one walk
+
+Before each module header pair, the build wrote every typedef of the
+program and threw the text away, so a signature that spells a typedef does
+not write it again. That walk is the same for every module, and on cli it
+ran 65 times: about 100 ms of the 139-145 ms the unit headers took on a
+body edit. Now the build walks once (`header_preamble` in `src/cg.bl`),
+keeps what the walk marked written (the typedef guards and buffer in
+`layout`, the typedef and vtable marks in `cg_decl`), and starts each
+module header from those marks. Each header reads them as a base under its
+own marks, so no header copies them. The cold walk and the preamble call
+one function, `mark_typedefs_written`, and the capture and the install sit
+next to each other: any state the walk comes to write must go into both.
+
+A mark-only pass, one that walks but prints nothing, would not do: a perf
+profile of the walk puts 14% of it in printing. The rest (GC, variant
+discriminants, member types, layout, typedef names) a mark-only pass pays
+too, once per module.
+
+The header still comes from the program, never from the last build, so
+nothing in it can be stale: content decides, as for every other file. The
+per-module tests run under `BLINK_EMIT_REUSE_VERIFY=1`, and verify writes
+each header after a walk of its own and compares bytes. A header pass
+skips lowering `#embed` initializers when it asks whether a module needs
+an init function: such an initializer lowers to one string constant, and
+spelling a large file as a C literal cost more than the rest of the
+header. The skip is a parameter of that call, and verify writes the
+headers without it.
+
+Phase split of a cli body edit (`src/cname.bl`), 5 reps, in ms. The unit
+headers are the program facts, the types header and the module headers:
+
+| | facts | types header | module headers | wall |
+|---|---|---|---|---|
+| before | 5-6 | 6-7 | 127-132 | 890-1000 |
+| after | 5-6 | 6-7 | 24-28 | 788-805 |
+
+The 36-41 ms left are the 65 module header pairs themselves (19-22 ms to
+write the text: each lowers its module's global initializers and prints
+its signatures), the types header and the program facts.
+
+`task bench-edit-loop` on the gen1 `blink` built from `b65ed27c` (before)
+and from `02d27d7e` (after; since amended to `96ed6b3c`, which adds a test
+and no src change), 5 reps, 12 cores, under `blink-gates.slice`, back to
+back on one machine, all on the `02d27d7e` tree. The daemon
+columns are `BENCH_DAEMON=1 BENCH_SETTLE=1`; the daemon served 30 cli
+builds in each run. Median wall seconds, with min and max on the rows the
+goal names. The `per_module_*`, `monolith_*` and
+`per_module_daemon_settle1_*` files of those two shas in `bench/edit_loop/`
+hold the rows.
+
+| target | case | `--no-per-module` before | after | before | after | daemon before | daemon after |
+|---|---|---|---|---|---|---|---|
+| cli | nochange | 0.777 | 0.773 | 0.522 | 0.526 | 0.183 | 0.185 |
+| cli | body-cname | 10.739 | 10.717 | 0.901 [0.887-0.914] | 0.796 [0.790-0.799] | 0.676 [0.649-0.719] | 0.533 [0.524-0.537] |
+| cli | body-typecheck | 10.696 | 10.680 | 3.219 | 3.099 | 3.003 | 2.890 |
+| cli | pubfn-cname | 10.682 | 10.683 | 1.902 [1.886-1.928] | 1.796 [1.792-1.821] | 1.743 | 1.679 |
+| cli | run-body-cname | 10.691 | 10.702 | 0.902 | 0.797 | 0.705 | 0.573 |
+| cli | test-body-cname | 2.117 | 2.126 | 0.495 | 0.480 | 0.498 | 0.476 |
+| cli | cold-obj | 10.697 | 10.689 | 3.622 | 3.616 | 3.446 | 3.398 |
+| cli | cold-all | 13.089 | 13.090 | 6.002 | 5.995 | 6.039 | 6.031 |
+| small | nochange | 0.075 | 0.073 | 0.073 | 0.072 | 0.071 | 0.072 |
+| small | body-inventory | 0.141 | 0.140 | 0.122 | 0.122 | 0.127 | 0.128 |
+| small | pubfn-model | 0.142 | 0.140 | 0.126 | 0.121 | 0.130 | 0.130 |
+| small | run-body-inventory | 0.139 | 0.139 | 0.124 | 0.122 | 0.131 | 0.131 |
+| small | test-body-inventory | 0.143 | 0.144 | 0.135 | 0.134 | 0.139 | 0.139 |
+| small | cold-obj | 0.139 | 0.139 | 0.124 | 0.123 | 0.127 | 0.128 |
+
+- A cli body edit builds in 0.796 s, 0.105 s under the before row, and in
+  0.533 s through the daemon, 0.143 s under. Each cli row that writes the
+  module headers gains about 0.1 s (`emit_s` of body-cname goes from 0.700
+  to 0.603, and through the daemon from 0.480 to 0.338).
+- `nochange` takes the whole emit from the last build and writes no
+  header, so it does not change. Nor do the monolith rows, which write no
+  module header, or the small rows, whose headers cost a few ms.
 
 ## Blockers before the default flipped
 
