@@ -3,7 +3,6 @@ import query.{query_dispatch}
 import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render}
 import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int, json_at, json_len}
 import std.path.{path_join, path_dirname}
-import std.libc.{poll, Pollfd, POLL_EVT_IN}
 import lexer.{Lex}
 import parser.{Parse, parser_want_interface_text}
 import typecheck.{TypeCheck}
@@ -71,11 +70,9 @@ type DaemonCheck {
 let mut daemon_last: Option[DaemonCheck] = None
 
 // A build child the daemon forked and has not reaped, and what it owes the client: the files
-// the child prints to and the connection the reply goes to. wake reads end of input once the
-// child has exited.
+// the child prints to and the connection the reply goes to.
 type DaemonChild {
     pid: Int
-    wake: Int
     client_fd: Int
     out: Str
     err: Str
@@ -228,7 +225,7 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Pa
 fn daemon_fork() -> I32 ! FFI {}
 
 @ffi("waitpid", header: "sys/wait.h")
-@trusted(audit: "Wraps waitpid(2). status is one I32 cell from ffi.scope(); options is 0 or WNOHANG, 1 on every host.")
+@trusted(audit: "Wraps waitpid(2). status is one I32 cell from ffi.scope(); options is fixed to WNOHANG, 1 on every host.")
 fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
 
 @ffi("open", header: "fcntl.h")
@@ -246,10 +243,6 @@ fn daemon_dup(fd: I32) -> I32 ! FFI {}
 @ffi("dup2", header: "unistd.h")
 @trusted(audit: "Wraps dup2(2). Both descriptors are the process's own: one open or dup returned, and 1 or 2.")
 fn daemon_dup2(old_fd: I32, new_fd: I32) -> I32 ! FFI {}
-
-@ffi("fcntl", header: "fcntl.h")
-@trusted(audit: "Wraps fcntl(2) through the header's variadic prototype. cmd is F_SETFD with FD_CLOEXEC, 2 and 1 on every host, on a socket the daemon just made.")
-fn daemon_fcntl(fd: I32, cmd: I32, arg: I32) -> I32 ! FFI {}
 
 @ffi("blink_errno_get")
 @trusted(audit: "Wraps the runtime blink_errno_get(), which returns errno. Read right after a failed waitpid.")
@@ -331,12 +324,12 @@ fn exit_code_of(status: Int) -> Int {
     if sig == 0 { (status >> 8) & 255 } else { 128 + sig }
 }
 
-// Reaps pid: the status it ended with, -1 when there is no such child, or -2 while it runs
-// and block is false.
-fn reap(pid: Int, block: Bool) -> Int ! IO {
+// Reaps pid if it ended: the status it ended with, -1 when there is no such child, or -2
+// while it runs.
+fn reap(pid: Int) -> Int ! IO {
     let mut status = -1
     // WNOHANG is 1 on every host the daemon runs on.
-    let options = if block { 0 } else { 1 }
+    let options = 1
     with ffi.scope() as scope {
         let cell = scope.alloc[I32]()
         loop {
@@ -354,31 +347,6 @@ fn reap(pid: Int, block: Bool) -> Int ! IO {
         }
     }
     status
-}
-
-// A connected pair of sockets for a build child, (the daemon's end, the child's end), or -1
-// for each when it cannot make one. The child's end closes on exec, so only the child holds
-// it, and the daemon's end reads end of input the moment the child exits. A pipe would do,
-// but Ptr.offset rejects the int[2] that pipe() fills. The listener at path is closed here,
-// and the caller removes the file.
-fn daemon_wake_pair(path: Str) -> (Int, Int) ! IO {
-    let listener = unix_socket_listen(path)
-    if listener < 0 {
-        return (-1, -1)
-    }
-    let child_end = unix_socket_connect(path)
-    let mut daemon_end = -1
-    if child_end >= 0 {
-        daemon_end = unix_socket_accept_timeout(listener, 1000)
-    }
-    unix_socket_close(listener)
-    // F_SETFD and FD_CLOEXEC are 2 and 1 on every host the daemon runs on.
-    if daemon_end < 0 || daemon_fcntl(child_end.to_i32(), 2.to_i32(), 1.to_i32()).to_int() < 0 {
-        if child_end >= 0 { unix_socket_close(child_end) }
-        if daemon_end >= 0 { unix_socket_close(daemon_end) }
-        return (-1, -1)
-    }
-    (daemon_end, child_end)
 }
 
 // Sends text and closes the connection. A client that went away takes only its own
@@ -437,24 +405,16 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
     let out_path = path_join(dir, "build-{builds.seq}.out")
     let err_path = path_join(dir, "build-{builds.seq}.err")
     let declined = path_join(dir, "build-{builds.seq}.declined")
-    let wake_path = path_join(dir, "build-{builds.seq}.wake")
-    let (wake, child_wake) = daemon_wake_pair(wake_path)
-    shell_exec("rm -f {declined} {wake_path}")
-    if wake < 0 {
-        return BuildTurn.Reply(daemon_not_served("the daemon could not make a socket to learn when a build ends"))
-    }
+    shell_exec("rm -f {declined}")
     // The child inherits what stdout holds unflushed, and would print it again.
     io.write("")
     let pid = daemon_fork().to_int()
     if pid < 0 {
-        unix_socket_close(wake)
-        unix_socket_close(child_wake)
         return BuildTurn.Reply(daemon_not_served("the daemon could not fork a build"))
     }
     if pid == 0 {
-        // The child keeps no socket but its end of the wake pair, so each client hears from
-        // the daemon alone, and a stop that removes the socket file is the daemon's.
-        unix_socket_close(wake)
+        // The child keeps no socket, so each client hears from the daemon alone, and a stop
+        // that removes the socket file is the daemon's.
         unix_socket_close(client_fd)
         for h in builds.queue {
             unix_socket_close(h.client_fd)
@@ -471,14 +431,12 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
         }
         return BuildTurn.Child(DaemonBuild { argv: argv, program: c.program, front: c.front, out: c.out, err: c.err, declined: declined })
     }
-    unix_socket_close(child_wake)
-    BuildTurn.Started(DaemonChild { pid: pid, wake: wake, client_fd: client_fd, out: out_path, err: err_path, declined: declined })
+    BuildTurn.Started(DaemonChild { pid: pid, client_fd: client_fd, out: out_path, err: err_path, declined: declined })
 }
 
 // Replies to the client of the build child that ended with status, and removes the child's
 // files, whether it built, declined or died.
 fn daemon_end_child(child: DaemonChild, status: Int) ! IO {
-    unix_socket_close(child.wake)
     let out = read_file(child.out)
     let err = read_file(child.err)
     let declined = file_exists(child.declined) == 1
@@ -597,31 +555,18 @@ fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck
     }
 }
 
-// Whether the listening socket and the wake end are ready, waiting up to timeout_ms for
-// either. A failed poll reports neither.
-fn daemon_wait_two(wake: Int, timeout_ms: Int) -> (Bool, Bool) ! IO {
-    let fds = [
-        Pollfd { fd: daemon_socket_fd.to_i32(), events: POLL_EVT_IN.to_i16(), revents: 0.to_i16() },
-        Pollfd { fd: wake.to_i32(), events: POLL_EVT_IN.to_i16(), revents: 0.to_i16() },
-    ]
-    match poll(fds, timeout_ms) {
-        Ok(out) => (out.get(0).unwrap().revents.to_int() != 0, out.get(1).unwrap().revents.to_int() != 0)
-        Err(_) => (false, false)
-    }
-}
-
 // Returns the build to run in a child forked for one, and None in the daemon once it stops.
-// While a build child runs, the daemon waits on its socket and on the child's wake end at
-// once, so it serves other requests meanwhile and replies to the build the moment the child
-// exits. The timeout reaps a child whose wake end some other process kept open.
+// While a build child runs, the accept waits 1 ms at most and each turn reaps the child if it
+// ended, so the daemon serves other requests meanwhile and its build client waits at most
+// that, plus the one request being served then, past the child's end. The runtime has no wait
+// on both the socket and the child.
 fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     let mut builds = DaemonBuilds { child: None, queue: [], stops: [], seq: 0 }
     while daemon_running == 1 {
         let mut client_fd = -1
         match builds.child {
             Some(child) => {
-                let (asked, ended) = daemon_wait_two(child.wake, 500)
-                let status = reap(child.pid, ended)
+                let status = reap(child.pid)
                 if status != -2 {
                     daemon_end_child(child, status)
                     builds.child = None
@@ -634,8 +579,8 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
                         break
                     }
                 }
-                if asked {
-                    client_fd = unix_socket_accept_timeout(daemon_socket_fd, 0)
+                if builds.child.is_some() {
+                    client_fd = unix_socket_accept_timeout(daemon_socket_fd, 1)
                 }
             }
             None => {
