@@ -744,20 +744,36 @@ The daemon is now a router and a set of workers:
     turn and `queued` for each build that waits, in any worker.
   - A stop waits for the build that holds the turn, as above. Each worker
     then sends its queued builds cold, replies to the stop and exits.
-  - A worker that ends while it holds the turn frees it at the router's next
-    reap. Its build child, if one runs, is not killed (see the crash case
-    above), so it can still write while the next worker builds. It writes
-    only its own entry's units dir and output.
+  - A worker that ends while it holds the turn frees it only once its build
+    child, and each process that child started, is gone (see below).
 - The router refuses a build from a client with another identity or other
   front-end settings before it routes the build. The client builds cold, and
   the router forks no worker for it. The worker does the same check again. A
   check request carries no identity, before and after this change.
-- When a worker ends without a stop (killed or crashed), the router reaps it
-  at its next accept tick and removes its directory. The next request for
-  that entry gets a new worker. A client whose request was in that worker
-  gets no reply and runs cold. A build child of that worker ends when its
-  build ends. Until then, it and the client's cold build can write the same
-  outputs, as when a daemon is killed mid-build (above).
+- Each worker leads a process group of its own, which its build child and
+  each cc and ld that child starts join. When a worker ends without a stop
+  (killed or crashed), the router sees its channel close, kills the group
+  with `SIGKILL`, and serves the next request for that entry from a new
+  worker. The kill comes before the reap, so the worker's pid, which names
+  the group, can name no other process. The router reaps the worker, and
+  removes its directory, once no process of the group is left, and only then
+  frees the turn if the worker held it. So no process of the dead worker
+  writes beside the next build through the daemon. A process of the group
+  that the router does not parent is reaped by init; if none reaps it, the
+  group counts as gone 10 s after the kill, since a killed process writes
+  nothing.
+- A client whose request was in that worker gets no reply and runs cold. Its
+  cold build does not take the turn, so it can write the same outputs as the
+  killed build child until the kill lands, as when a daemon is killed
+  mid-build (above).
+- When the router itself is killed, no turn is granted again, so no build
+  through that daemon starts. Each worker sees that its router is gone, ends
+  after its build child, and holds its clients until then. A new daemon that
+  starts in that time can build an entry beside a build child of an old
+  worker.
+- Since a worker leads its own group, a signal sent to the router's group
+  (by `kill` to a negative pid, or a Ctrl-C at a terminal) does not reach the
+  workers; each ends when it sees its router gone.
 - `blink daemon status` gives `entries` (the workers that serve) after
   `stopping`. `builds` and `checks` are the sums over all workers, also the
   workers the router stopped.
