@@ -37,10 +37,11 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 
 | Task | What it does | Fails when |
 | --- | --- | --- |
-| `task ci` | The rewrite gate: `gen1`, `ratchet`, `test-ratchet`, `test-lint`, `test-corpus`, `commit-messages`, `test-commit-messages`, `corpus`, `corpus-check`, formatter goldens and idempotency with gen1, `suites-in-corpus`. | Any step fails. |
+| `task ci` | The rewrite gate. First `gen1`, `ratchet` and the gate self-tests (`test-ratchet`, `test-lint`, `test-corpus`, `test-fmt-semantic`, `commit-messages`, `test-commit-messages`) run at once. Then `corpus` with the per-module slice, `corpus-check`, `corpus-per-module-slice-check`, formatter goldens and idempotency with gen1, `suites-in-corpus`. | Any step fails. |
 | `task gen1` | gen0 compiles `src/blinkc_main.bl` and `src/cli.bl`, then links `build/gen1/bin/blinkc` and `build/gen1/bin/blink`. | Nonzero exit, an `error[` line, or a link error. |
 | `task corpus` | Compiles and runs every `tests/test_*.bl` on its own under gen1. Writes `build/corpus.json`. Then runs the lint. | Never for a test result. Only when the lint fails. |
 | `task corpus-check` | Reads `build/corpus.json`. Prints the known-failure count for information. | A file does not pass, or the run does not cover every `tests/test_*.bl` file. |
+| `task corpus-per-module-slice-check` | Reads `build/corpus_per_module_slice.json`, which the ci corpus sweep writes, against `scripts/corpus_per_module_slice.txt` (see "The per-module slice"). | The list is gone, is empty, or names a file that does not exist; a listed file has no record or does not pass; a passing file did not build in units. |
 | `task ci-fast` | The branch gate: every step of `ci`, with `corpus-sample` in place of `corpus` and `corpus-check`. | Any step fails. |
 | `task corpus-sample` | Compiles and runs the files in `scripts/corpus_sample.txt` under gen1 and holds the pass count to the `# floor:` line in that list. Writes `build/corpus_sample.json`. | Fewer files pass than the floor. It names them. |
 | `task lint` | Runs `scripts/lint_codegen.sh`, the eleven rows below. | A row rises above its limit, or a row in debt rises above the previous commit or on any commit of the branch. |
@@ -112,7 +113,17 @@ the binary. A file with `test` blocks and a `fn main(` runs with `--test`.
 A file with no `test` blocks runs as a program. `blink test tests/` skips
 such files; the corpus does not.
 
-Logs are in `build/corpus/logs/<name>.build.log` and `<name>.run.log`.
+Logs are in `build/corpus/logs/<name>.build.log` and `<name>.run.log`. A
+per-module slice row of the same file uses the key `<name>.pm` for its work
+directory, logs and record.
+
+The sweep runs `scripts/default_jobs.sh` workers unless `CORPUS_JOBS` says
+otherwise: the CPUs this process may use when a quota or an affinity mask
+limits them (12 under `blink-gates.slice`), else half the machine. One job is
+one file, with its slice row after its own row when it has one. A lock per
+file keeps its two rows apart even outside the sweep, because some tests write
+fixed paths under `/tmp`. Jobs start longest first, by the seconds in the JSON
+the run replaces, so no long file starts last.
 
 A `test.failing` block is a witness for a known bug. The test binary
 reports it `ok` when the witness fails and `FAIL` when it passes, so the
@@ -181,6 +192,29 @@ A known failure in this mode goes in
 above the path. A `test.failing` block would change the test for both modes.
 `scripts/corpus_per_module_check.sh` fails when a listed file passes, so the
 fix that makes it pass also takes it off the list.
+
+## The per-module slice
+
+`task ci` runs a slice of the per-module corpus inside its corpus sweep:
+each file in `scripts/corpus_per_module_slice.txt` runs a second time on the
+per-module path (`BLINK_PER_MODULE=1`, no compiler archive, `BLINK_JOBS` the
+CPU count over the worker count). The records go to
+`build/corpus_per_module_slice.json`, and `task corpus-per-module-slice-check`
+holds them to the same rules as `scripts/corpus_per_module_check.sh`, the
+known-failures list included.
+
+`scripts/corpus_per_module_slice_select.sh` prints the files the rule picks;
+its header states the rule. In short: a file joins when it imports a module
+outside std and the compiler, builds a program of more than one module
+through the CLI, runs `blink test` through the CLI, or tests the per-module
+build or the obj cache by name. A file that imports only the compiler is one
+program, and in units it costs seconds a file, so the full run in
+`task ci-release` covers it. A few single-module programs picked by hand
+follow the rule's files in the list. When the rule's output changes, refresh
+the list from it.
+
+On the commit that added it, the slice was 157 files, and it added about 13 s
+wall and 164 s CPU to `task ci` under `blink-gates.slice`.
 
 ## The corpus sample
 
