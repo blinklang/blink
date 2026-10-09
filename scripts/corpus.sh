@@ -190,11 +190,16 @@ chmod +x build/corpus/cc/cc
 # sqlite3 once per such file. Build each object once with the flags a corpus
 # build uses (those of `blink build --debug`, less -g); corpus_one.sh copies it
 # in with its mtime, which is what lets the build skip the compile.
+#
+# The native objects, the PCH and the compiler archive read nothing the others
+# write, and each is one cc on one core, so they build at once.
 mkdir -p build/corpus/native
+native_pids=()
 for d in lib/native/*/; do
     name=$(basename "$d")
     [ -f "$d$name.c" ] || continue
-    cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" || exit 2
+    cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" &
+    native_pids+=("$!")
 done
 
 # Each row's unit includes libblink_std.h first, and reading it is about a
@@ -205,16 +210,20 @@ done
 # PCH built with other flags or macros and reads the header instead. With no
 # PCH every row still builds, so a failure here costs time only.
 pch_key=$(./scripts/corpus_std_pch_key.sh "$comp")
+pch_pid=""
 if [ -n "$pch_key" ]; then
     pch_dir="build/corpus/pch/$(sed -n 1p <<< "$pch_key")"
     mkdir -p "$pch_dir"
     ln -s "$(sed -n 2p <<< "$pch_key")" "$pch_dir/libblink_std.h"
     ln -s "$(sed -n 3p <<< "$pch_key")" "$pch_dir/runtime.h"
-    if ! cc -pipe -O0 -DBLINK_DEBUG -pthread -DBLINK_USE_EXTERN_RUNTIME_STORAGE=1 -x c-header \
-            -o "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h" > build/corpus/pch.log 2>&1 \
-            || ! mv "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h.gch"; then
-        echo "corpus: no PCH of libblink_std.h, rows read the header (see build/corpus/pch.log)" >&2
-    fi
+    (
+        if ! cc -pipe -O0 -DBLINK_DEBUG -pthread -DBLINK_USE_EXTERN_RUNTIME_STORAGE=1 -x c-header \
+                -o "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h" > build/corpus/pch.log 2>&1 \
+                || ! mv "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h.gch"; then
+            echo "corpus: no PCH of libblink_std.h, rows read the header (see build/corpus/pch.log)" >&2
+        fi
+    ) &
+    pch_pid=$!
 fi
 
 # The roots are the modules the compiler binary imports plus the test helpers
@@ -238,6 +247,11 @@ else
     fi
     export BLINK_COMPILER_ARCHIVE="$carchive"
 fi
+
+for p in "${native_pids[@]}"; do
+    wait "$p" || exit 2
+done
+[ -n "$pch_pid" ] && wait "$pch_pid"
 
 # Instructions and CPU time cover the per-file compile and run only (the
 # parallel sweep and the processes it starts), not the gen1 build, the compiler
