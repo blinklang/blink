@@ -813,7 +813,9 @@ builds on cli and 25 on small for each. Median wall seconds [min-max].
   In 4 small runs of 11 reps, after, before, after, before, cold-obj was
   0.137, 0.130, 0.138 and 0.129. With the marker threads (`799b05b3`), it is
   0.135, 0.129, 0.129 and 0.126
-  (`per_module_daemon_settle1_small_reps11_run<n>_<sha>.tsv`).
+  (`per_module_daemon_settle1_small_reps11_run<n>_<sha>.tsv`). The marker
+  threads make the gap smaller, but the bisect above shows that `799b05b3`
+  is still slower than before.
 
 ### Unit headers from one walk
 
