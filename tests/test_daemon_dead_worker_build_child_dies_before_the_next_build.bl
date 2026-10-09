@@ -1,0 +1,268 @@
+// A worker may die while its build child runs. The build child, and each cc it started, must
+// be dead before the router gives the build turn to another build: a build of the same entry
+// that starts after the death writes the same files, and a process of the dead worker that
+// still writes beside it leaves a program that no build made.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str, name: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // The daemon listens at the project root, so each tree is a project of its own.
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/second.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(tag("second"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it serves only a client whose env is its own.
+// The cc first on PATH is the tree's, which holds a compile while cc.hold exists.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache PATH={tree}/ccwrap:$PATH"
+}
+
+// The command in tree, with a bound, so a daemon that never answers fails the test instead of
+// hanging it.
+fn blink_bounded(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 20 ../build/blink {args}"])
+}
+
+// Starts the command in tree in the background. Its stdout, stderr and exit code land in
+// tree/<tag>.out, .err and .rc, and the pid of the blink process in tree/<tag>.pid: the shell
+// that writes it execs env, which execs blink.
+fn blink_bg(tree: Str, args: Str, tag: Str) {
+    shell_exec("cd {tree}/app && (sh -c 'echo $$ > {tree}/{tag}.pid; exec {env_of(tree)} ../build/blink {args}' > {tree}/{tag}.out 2> {tree}/{tag}.err; echo $? > {tree}/{tag}.rc.tmp; mv {tree}/{tag}.rc.tmp {tree}/{tag}.rc) > /dev/null 2>&1 &")
+}
+
+// Whether path exists within secs seconds.
+fn appears(path: Str, secs: Int) -> Bool {
+    process_run("sh", ["-c", "for i in $(seq 1 {secs * 20}); do [ -e {path} ] && exit 0; sleep 0.05; done; exit 1"]).exit_code == 0
+}
+
+// What a command started by blink_bg ended with; exit -1 when it has not ended in 300 s.
+fn bg_result(tree: Str, tag: Str) -> ProcessResult {
+    if !appears("{tree}/{tag}.rc", 300) {
+        return ProcessResult { out: "", err_out: "", exit_code: -1 }
+    }
+    ProcessResult { out: read_file("{tree}/{tag}.out"), err_out: read_file("{tree}/{tag}.err"), exit_code: sh("cat {tree}/{tag}.rc").to_int() }
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+fn alive(pid: Int) -> Bool {
+    shell_exec("kill -0 {pid} 2>/dev/null") == 0
+}
+
+// The children of pid, space-separated, or "".
+fn children(pid: Int) -> Str {
+    sh("ps -o pid= --ppid {pid} | tr -s ' \\n' ' '")
+}
+
+// A field of a status reply, such as "builds", or -1 when the reply has none.
+fn field_of(out: Str, field: Str) -> Int {
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+fn served(tree: Str, field: Str) -> Int {
+    field_of(blink_bounded(tree, "daemon status").out, field)
+}
+
+// What a build printed, with its tree's path and its private units directory's random name
+// spelled the same in every tree.
+fn plain(tree: Str, s: Str) -> Str {
+    let t = s.replace(tree, "TREE")
+    let mut out = ""
+    let mut rest = t
+    loop {
+        match rest.byte_index_of(".units.", 0) {
+            Some(at) => {
+                let end = if at + 13 <= rest.byte_len() { at + 13 } else { rest.byte_len() }
+                out = "{out}{rest.byte_slice(0, at)}.units.XXXXXX"
+                rest = rest.byte_slice(end, rest.byte_len())
+            }
+            None => break
+        }
+    }
+    "{out}{rest}"
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{a.out}{a.err_out}\n-- vs --\n{b.out}{b.err_out}" }
+    if plain(a_tree, a.out) != plain(b_tree, b.out) { return "stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if plain(a_tree, a.err_out) != plain(b_tree, b.err_out) { return "stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// What two trees' last builds left that differs: a C file of the units, or the program.
+fn output_differ(a_tree: Str, b_tree: Str) -> Str {
+    sh("cd {b_tree}/app/out/second.units && for f in *.c *.h; do cmp -s $f {a_tree}/app/out/second.units/$f || echo $f; done; cd {a_tree}/app/out/second.units && for f in *.c *.h; do [ -e {b_tree}/app/out/second.units/$f ] || echo extra:$f; done; cmp -s {a_tree}/app/out/second {b_tree}/app/out/second || echo program").split("\n").join(" ")
+}
+
+// The child of the router that was not among before and lives on, or -1 after 10 s.
+fn new_worker(router: Int, before: Str) -> Int {
+    let deadline = time_ms() + 10000
+    while time_ms() < deadline {
+        let mut found: List[Str] = []
+        for p in children(router).split(" ") {
+            if p != "" && !before.split(" ").contains(p) { found.push(p) }
+        }
+        if found.len() == 1 {
+            shell_exec("sleep 0.2")
+            if alive(found.get(0).unwrap().to_int()) && children(router).split(" ").contains(found.get(0).unwrap()) {
+                return found.get(0).unwrap().to_int()
+            }
+        }
+        shell_exec("sleep 0.05")
+    }
+    -1
+}
+
+fn check(tree: Str) -> ProcessResult {
+    blink_bounded(tree, "check src/second.bl")
+}
+
+fn build(tree: Str) -> ProcessResult {
+    blink_bounded(tree, "build src/second.bl -o out/second")
+}
+
+// A cc whose first call, while cc.hold exists, waits for its removal, with its pid in
+// cc.holder. Any later call removes cc.hold before it compiles: the held cc, if it still
+// lives, then marks cc.late, a write after a later build began to compile.
+fn hold_first_cc(tree: Str) {
+    let real = sh("command -v cc")
+    shell_exec("mkdir -p {tree}/ccwrap")
+    write_file("{tree}/ccwrap/cc", "#!/bin/sh\nif [ -e {tree}/cc.hold ] && mkdir {tree}/cc.claimed 2>/dev/null; then\n    echo $$ > {tree}/cc.holder\n    touch {tree}/cc.started\n    while [ -e {tree}/cc.hold ]; do sleep 0.01; done\n    touch {tree}/cc.late\nelse\n    rm -f {tree}/cc.hold\nfi\nexec {real} \"$@\"\n")
+    shell_exec("chmod +x {tree}/ccwrap/cc")
+}
+
+// The pids, space-separated, of pids that still live after secs seconds.
+fn still_alive(pids: Str, secs: Int) -> Str {
+    sh("for p in {pids}; do for i in $(seq 1 {secs * 20}); do kill -0 $p 2>/dev/null || break; sleep 0.05; done; kill -0 $p 2>/dev/null && echo $p; done; true").split("\n").join(" ").trim()
+}
+
+test "a dead worker's build child is dead before the next build of its entry starts, and that build matches cold" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_dead_worker_child_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_dead_worker_child_cold_{getpid()}"
+    dev_tree(root, warm, "daemon_dead_child_app")
+    dev_tree(root, cold, "daemon_dead_child_app")
+    hold_first_cc(warm)
+    let pid = start_daemon(warm)
+    let mut worker = -1
+    let mut held = false
+    let mut group = ""
+    let mut late = false
+    let mut orphans = "not looked at"
+    let mut b2 = ProcessResult { out: "", err_out: "", exit_code: -1 }
+    let mut c2 = ProcessResult { out: "", err_out: "", exit_code: -1 }
+    let mut o2 = "no build"
+    let mut builds = -1
+    with cleanup(fn() {
+        shell_exec("rm -f {warm}/cc.hold")
+        let client = sh("cat {warm}/b1.pid 2>/dev/null")
+        let workers = children(pid)
+        stop_daemon(pid)
+        shell_exec("for p in {client} {workers} {group}; do kill -9 $p 2>/dev/null; done; true")
+    }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        let before = children(pid)
+        let _w0 = check(warm)
+        worker = new_worker(pid, before)
+        builds = served(warm, "builds")
+        shell_exec("touch {warm}/cc.hold")
+        blink_bg(warm, "build src/second.bl -o out/second", "b1")
+        held = appears("{warm}/cc.started", 120)
+        group = "{children(worker)} {sh("cat {warm}/cc.holder 2>/dev/null")}".trim()
+        // The client goes first, so no cold build of its own runs a cc.
+        shell_exec("kill -9 {sh("cat {warm}/b1.pid")}")
+        shell_exec("kill -9 {worker}")
+        b2 = build(warm)
+        late = file_exists("{warm}/cc.late") == 1
+        orphans = still_alive(group, 30)
+        builds = served(warm, "builds") - builds
+        c2 = build(cold)
+        o2 = output_differ(warm, cold)
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    assert(worker > 0, "no worker started for src/second.bl")
+    assert(held, "no cc started in the build through the daemon")
+    assert(!late, "a cc of the dead worker's build ran on after the next build began to compile")
+    assert_eq(orphans, "")
+    assert_eq(differ(warm, b2, cold, c2), "")
+    assert_eq(o2, "")
+    assert_eq(builds, 1)
+}

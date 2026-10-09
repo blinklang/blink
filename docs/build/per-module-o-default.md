@@ -744,20 +744,36 @@ The daemon is now a router and a set of workers:
     turn and `queued` for each build that waits, in any worker.
   - A stop waits for the build that holds the turn, as above. Each worker
     then sends its queued builds cold, replies to the stop and exits.
-  - A worker that ends while it holds the turn frees it at the router's next
-    reap. Its build child, if one runs, is not killed (see the crash case
-    above), so it can still write while the next worker builds. It writes
-    only its own entry's units dir and output.
+  - A worker that ends while it holds the turn frees it only once its build
+    child, and each process that child started, is gone (see below).
 - The router refuses a build from a client with another identity or other
   front-end settings before it routes the build. The client builds cold, and
   the router forks no worker for it. The worker does the same check again. A
   check request carries no identity, before and after this change.
-- When a worker ends without a stop (killed or crashed), the router reaps it
-  at its next accept tick and removes its directory. The next request for
-  that entry gets a new worker. A client whose request was in that worker
-  gets no reply and runs cold. A build child of that worker ends when its
-  build ends. Until then, it and the client's cold build can write the same
-  outputs, as when a daemon is killed mid-build (above).
+- Each worker leads a process group of its own, which its build child and
+  each cc and ld that child starts join. When a worker ends without a stop
+  (killed or crashed), the router sees its channel close, kills the group
+  with `SIGKILL`, and serves the next request for that entry from a new
+  worker. The kill comes before the reap, so the worker's pid, which names
+  the group, can name no other process. The router reaps the worker, and
+  removes its directory, once no process of the group is left, and only then
+  frees the turn if the worker held it. So no process of the dead worker
+  writes beside the next build through the daemon. A process of the group
+  that the router does not parent is reaped by init; if none reaps it, the
+  group counts as gone 10 s after the kill, since a killed process writes
+  nothing.
+- A client whose request was in that worker gets no reply and runs cold. Its
+  cold build does not take the turn, so it can write the same outputs as the
+  killed build child until the kill lands, as when a daemon is killed
+  mid-build (above).
+- When the router itself is killed, no turn is granted again, so no build
+  through that daemon starts. Each worker sees that its router is gone, ends
+  after its build child, and holds its clients until then. A new daemon that
+  starts in that time can build an entry beside a build child of an old
+  worker.
+- Since a worker leads its own group, a signal sent to the router's group
+  (by `kill` to a negative pid, or a Ctrl-C at a terminal) does not reach the
+  workers; each ends when it sees its router gone.
 - `blink daemon status` gives `entries` (the workers that serve) after
   `stopping`. `builds` and `checks` are the sums over all workers, also the
   workers the router stopped.
@@ -857,6 +873,56 @@ builds on cli and 25 on small for each. Median wall seconds [min-max].
   (`per_module_daemon_settle1_small_reps11_run<n>_<sha>.tsv`). The marker
   threads make the gap smaller, but the bisect above shows that `799b05b3`
   is still slower than before.
+
+The cause is in when the GC collects. Each check leaves its whole working
+set as garbage, and every build child is a fork of the worker heap, so the
+child pays for the garbage it carries (page tables, and a bigger heap for
+its own GC). Before the split, the second check of the worker collected
+twice and the heap stayed at 7.7 MB. After the split, the allocations before
+the first check differ a little, and the GC grew the heap in the second check
+in place of a collection, so each fork carried about 7 MB more: forks at
+14.4, 22.8, 31.2 and 39.6 MB, against 7.7, 15.6, 24.0 and 32.4 before. The
+build child's RSS was 56 MB against 39, with no more page faults and no lost
+huge pages. A build child forked straight from the router, without the
+worker fork or the turn, was as slow as the split, and a worker without the
+marker restart was too, so the depth of the fork and the markers are not the
+cause.
+
+The worker now calls `GC_gcollect` at the end of each check, so each fork
+carries the live check and no garbage. On the small target the collection
+takes under 1 ms, and the check 13-15 ms as before. A worker that starts by
+exec of the same binary, with a fresh heap, would not help: it does the same
+checks and leaves the same garbage.
+
+Five runs back to back, 11 reps, under `blink-gates.slice`: base is the gen1
+`blink` built from `27b9888e` (sha256 `3338425dccf667b8`), split from
+`2ff0322f` (`608aa9a78b7b7a2d`), and fix from `29bc8bd0`
+(`99a0e35b4ba94c2e`), in the order base, split, fix, base, fix. Median wall
+seconds. `bench/edit_loop/daemon_worker_gc_after_check_run<n>_<sha>.tsv`
+holds the rows.
+
+| target | case | base | base | split | fix | fix |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.190 | 0.184 | 0.183 | 0.187 | 0.192 |
+| cli | body-cname | 0.561 | 0.570 | 0.566 | 0.557 | 0.562 |
+| cli | body-typecheck | 2.914 | 2.943 | 2.924 | 2.931 | 2.934 |
+| cli | pubfn-cname | 1.705 | 1.769 | 1.687 | 1.713 | 1.694 |
+| cli | run-body-cname | 0.591 | 0.608 | 0.665 | 0.593 | 0.592 |
+| cli | test-body-cname | 0.486 | 0.484 | 0.480 | 0.486 | 0.480 |
+| cli | cold-obj | 3.565 | 3.433 | 3.501 | 3.426 | 3.427 |
+| cli | cold-all | 6.066 | 6.070 | 6.072 | 6.096 | 6.054 |
+| small | nochange | 0.073 | 0.072 | 0.074 | 0.074 | 0.074 |
+| small | body-inventory | 0.131 | 0.130 | 0.131 | 0.128 | 0.127 |
+| small | pubfn-model | 0.132 | 0.132 | 0.137 | 0.127 | 0.127 |
+| small | run-body-inventory | 0.131 | 0.132 | 0.137 | 0.127 | 0.127 |
+| small | test-body-inventory | 0.138 | 0.138 | 0.139 | 0.138 | 0.139 |
+| small | cold-obj | 0.130 | 0.131 | 0.137 | 0.126 | 0.127 |
+
+- No fix row is slower than base beyond the spread of base. The small rows
+  after an edit are 3-5 ms faster than base, except test-body-inventory,
+  which does not change.
+- In the first fix run, one rep of small nochange took 1.012 s. The second
+  fix run did not repeat it (max 0.075).
 
 ### Unit headers from one walk
 

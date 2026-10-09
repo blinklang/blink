@@ -150,6 +150,11 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
     let stats = if checked_inputs_changed(daemon_source_path) { [] } else { taken }
     si_reset()
     si_build(program, daemon_source_path, "main")
+    // Each check leaves its whole working set as garbage, and the GC, sized by a few early
+    // collections, may grow the heap rather than collect it. Every build child is a fork of
+    // this heap, and pays for the garbage it carries: a collection here, where the check is
+    // all that stays live, keeps each fork as small as the program it builds.
+    daemon_gc_collect()
     DaemonCheck {
         human: diag_render(0),
         json: diag_render(1),
@@ -273,6 +278,10 @@ fn daemon_fork() -> I32 ! FFI {}
 @trusted(audit: "Wraps GC_start_mark_threads from the GC the runtime links. It takes no argument, and is a no-op in a GC built without parallel marking, as the vendored one is.")
 fn daemon_gc_start_markers() ! FFI {}
 
+@ffi("GC_gcollect")
+@trusted(audit: "Wraps GC_gcollect from the GC the runtime links. It takes no argument and returns nothing; the worker calls it from its one thread, between requests.")
+fn daemon_gc_collect() ! FFI {}
+
 @ffi("waitpid", header: "sys/wait.h")
 @trusted(audit: "Wraps waitpid(2). status is one I32 cell from ffi.scope(); options is fixed to WNOHANG, 1 on every host.")
 fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
@@ -292,6 +301,14 @@ fn daemon_dup(fd: I32) -> I32 ! FFI {}
 @ffi("dup2", header: "unistd.h")
 @trusted(audit: "Wraps dup2(2). Both descriptors are the process's own: one open or dup returned, and 1 or 2.")
 fn daemon_dup2(old_fd: I32, new_fd: I32) -> I32 ! FFI {}
+
+@ffi("setpgid", header: "unistd.h")
+@trusted(audit: "Wraps setpgid(2). The router passes the pid of a worker it just forked as both pid and group; the worker passes 0 and 0. It takes and returns ints.")
+fn daemon_setpgid(pid: I32, pgid: I32) -> I32 ! FFI {}
+
+@ffi("kill", header: "signal.h")
+@trusted(audit: "Wraps kill(2). The router sends only to the process group of a worker it forked: SIGKILL while the worker is not yet reaped, so its pid still names that group, and then signal 0, which sends nothing.")
+fn daemon_kill(pid: I32, sig: I32) -> I32 ! FFI {}
 
 @ffi("blink_errno_get")
 @trusted(audit: "Wraps the runtime blink_errno_get(), which returns errno. Read right after a failed waitpid.")
@@ -768,6 +785,7 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
 // query reads, so the router never ends it to make room. stop_fd is the connection a stop
 // went to the worker on, open until the router reaps it, else -1. chan is the router's end of
 // the connection on which the worker asks for the build turn, -1 once the worker closed it.
+// killed is when the router killed the worker's process group, once chan closed, else 0.
 type DaemonEntry {
     name: Str
     key: Str
@@ -776,6 +794,7 @@ type DaemonEntry {
     used: Int
     stop_fd: Int
     chan: Int
+    killed: Int
 }
 
 // What a worker the router forks starts on: its name, the entry spelled as the client
@@ -897,7 +916,11 @@ fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, c
         shell_exec("rm -rf {dir}")
         return (r, None, "the daemon could not fork a worker for {path}")
     }
+    // The worker leads a process group of its own, which its build children and each process
+    // they start join, so the router can end all of them once the worker is gone. Both sides
+    // set it, so the group stands before either acts on it.
     if pid == 0 {
+        let _ = daemon_setpgid(0.to_i32(), 0.to_i32())
         daemon_gc_start_markers()
         daemon_close_router_fds(r)
         unix_socket_close(chan)
@@ -906,8 +929,9 @@ fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, c
         let files = if dir.starts_with("/") { dir } else { path_join(env.cwd(), dir) }
         return (r, Some(DaemonSpawn { name: name, cwd: cwd, path: path, files: files, fd: fd, router: router, chan: worker_chan }), "")
     }
+    let _ = daemon_setpgid(pid.to_i32(), pid.to_i32())
     unix_socket_close(fd)
-    r.entries.push(DaemonEntry { name: name, key: key, pid: pid, home: home, used: r.seq, stop_fd: -1, chan: chan })
+    r.entries.push(DaemonEntry { name: name, key: key, pid: pid, home: home, used: r.seq, stop_fd: -1, chan: chan, killed: 0 })
     (r, None, "")
 }
 
@@ -1076,24 +1100,16 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
     "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{symbols},\"files\":{files},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"entries\":{entries},\"builds\":{served},\"checks\":{checks}}"
 }
 
-// Reaps each worker that ended, and removes its files. A worker that ended holds the build
-// turn no more, nor waits for it.
+// Reaps each worker that ended, and removes its files, once no process of its group is left.
+// Until then it holds the build turn if it held it: a build child of a dead worker may still
+// write the files the next build of its entry writes. A worker that ended waits for the turn
+// no more.
 fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
     let mut r = route
     let mut gone: List[Str] = []
-    let mut live: List[DaemonEntry] = []
-    for e in r.entries {
-        if reap(e.pid) == -2 {
-            live.push(e)
-        } else {
-            daemon_forget_worker(e)
-            gone.push(e.name)
-        }
-    }
-    r.entries = live
     let mut ending: List[DaemonEntry] = []
     for e in r.ended {
-        if reap(e.pid) == -2 {
+        if e.chan >= 0 || !daemon_group_gone(e) {
             ending.push(e)
         } else {
             daemon_forget_worker(e)
@@ -1109,6 +1125,33 @@ fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
         r.turn = ""
     }
     daemon_grant_turn(r)
+}
+
+// A worker closes its end of chan only as it exits, so the close is when the router ends the
+// rest of its group. The kill comes before the reap: until then the worker's pid, which names
+// the group, can name no other process.
+fn daemon_end_group(e: DaemonEntry) -> DaemonEntry {
+    unix_socket_close(e.chan)
+    // SIGKILL is 9 on every host the daemon runs on.
+    let _ = daemon_kill((0 - e.pid).to_i32(), 9.to_i32())
+    DaemonEntry { chan: -1, killed: time_ms(), ..e }
+}
+
+// Reaps the worker e, and any process of its group the router came to parent, and says
+// whether the group is gone. A killed process can not write once it is a zombie, but only its
+// parent reaps it, and an init that reaps none would hold the group forever; so 10 s after the
+// kill the group counts as gone.
+fn daemon_group_gone(e: DaemonEntry) -> Bool ! IO {
+    with ffi.scope() as scope {
+        let cell = scope.alloc[I32]()
+        loop {
+            // WNOHANG is 1 on every host the daemon runs on.
+            let w = daemon_waitpid((0 - e.pid).to_i32(), cell, 1.to_i32()).to_int()
+            // EINTR is 4 on every host the daemon runs on.
+            if w <= 0 && (w == 0 || daemon_errno() != 4) { break }
+        }
+    }
+    daemon_kill((0 - e.pid).to_i32(), 0.to_i32()).to_int() != 0 || time_ms() - e.killed >= 10000
 }
 
 fn daemon_forget_worker(e: DaemonEntry) ! IO {
@@ -1168,18 +1211,19 @@ fn daemon_route_turn(route: DaemonRoute, name: Str, line: Str) -> DaemonRoute {
 }
 
 // Reads what each worker sent on its connection to the router, as polled. A worker that closed
-// it is gone or going, and its reap frees what it held.
+// it is gone or going: the router ends its group, serves its entry from a new worker, and
+// frees what it held once its reap does.
 fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute {
     let mut r = route
     let mut names: List[Str] = []
     let mut lines: List[Str] = []
     let mut kept: List[DaemonEntry] = []
+    let mut dead: List[DaemonEntry] = []
     for e in r.entries {
         if e.chan >= 0 && ready.contains(e.chan) {
             let line = socket_read_line(e.chan)
             if line == "" {
-                unix_socket_close(e.chan)
-                kept.push(DaemonEntry { chan: -1, ..e })
+                dead.push(daemon_end_group(e))
                 continue
             }
             names.push(e.name)
@@ -1193,13 +1237,15 @@ fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute {
         if e.chan >= 0 && ready.contains(e.chan) {
             let line = socket_read_line(e.chan)
             if line == "" {
-                unix_socket_close(e.chan)
-                ending.push(DaemonEntry { chan: -1, ..e })
+                ending.push(daemon_end_group(e))
                 continue
             }
             names.push(e.name)
             lines.push(line)
         }
+        ending.push(e)
+    }
+    for e in dead {
         ending.push(e)
     }
     r.ended = ending
