@@ -152,8 +152,12 @@ if [ -n "$slice" ]; then
 fi
 slice_total=$(wc -l < "$slice_list" | tr -d ' ')
 
-# One row per line: file, then mode (empty, or pm). The previous seconds come
-# from the JSON this run is about to replace.
+# One job per line: a file, then its rows' modes (- for the sweep's own mode,
+# pm for a per-module slice row). A file's rows run one after the other in one
+# job: corpus_one.sh holds a lock per file, so two jobs of one file would leave
+# a worker idle on the lock. The longest jobs start first, by the previous
+# seconds from the JSON this run is about to replace; a job with a row new to
+# that JSON starts before all others.
 {
     for j in "$out" "$slice_out"; do
         m=""
@@ -165,8 +169,14 @@ slice_total=$(wc -l < "$slice_list" | tr -d ' ')
     awk '{ print $0 "\tpm\t-" }' "$slice_list"
 } | awk -F'\t' '
     $3 != "-" { secs[$1 FS $2] = $3; next }
-    { k = $1 FS $2; printf "%s\t%s\n", (k in secs ? secs[k] : 1e9), k }' \
-  | LC_ALL=C sort -t"$(printf '\t')" -k1,1gr -k3,3r -k2,2 | cut -f2- | tr '\t' ' ' > "$rows"
+    !($1 in total) { order[++n] = $1 }
+    {
+        k = $1 FS $2
+        total[$1] += (k in secs ? secs[k] : 1e9)
+        modes[$1] = modes[$1] " " ($2 == "" ? "-" : $2)
+    }
+    END { for (i = 1; i <= n; i++) printf "%s\t%s%s\n", total[order[i]], order[i], modes[order[i]] }' \
+  | LC_ALL=C sort -t"$(printf '\t')" -k1,1gr -k2,2 | cut -f2- > "$rows"
 
 [ -f build/gc_unity.c ] || ./scripts/gen_gc_unity.sh build/gc_unity.c || exit 2
 
@@ -276,9 +286,19 @@ mode_note=""
 [ "$per_module" = 1 ] && mode_note=", per-module, BLINK_JOBS=$BLINK_JOBS"
 [ "$slice_total" -gt 0 ] && mode_note="$mode_note, $slice_total per-module slice rows at BLINK_JOBS=$pm_row_jobs"
 echo "corpus: $total files, compiler $comp, $jobs workers$mode_note"
+run_rows() {
+    f=$1
+    shift
+    for m in "$@"; do
+        [ -n "$m" ] || continue
+        ./scripts/corpus_one.sh "$f" "$CORPUS_COMP" "$CORPUS_RESULTS" "${m#-}"
+    done
+}
+export -f run_rows
+export CORPUS_COMP="$comp" CORPUS_RESULTS="$results"
 start=$(date +%s)
-"${perf_cmd[@]}" parallel -j "$jobs" --halt never --line-buffer --colsep ' ' \
-    ./scripts/corpus_one.sh {1} "$comp" "$results" {2} :::: "$rows" \
+"${perf_cmd[@]}" env PARALLEL_SHELL=bash parallel -j "$jobs" --halt never --line-buffer --colsep ' ' \
+    run_rows {1} {2} {3} :::: "$rows" \
     | awk '{ n[$1]++ } END { for (k in n) printf "corpus: %s %d\n", k, n[k] }'
 end=$(date +%s)
 
