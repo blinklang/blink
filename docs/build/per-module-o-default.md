@@ -704,6 +704,20 @@ The daemon is now a router and a set of workers:
 - The GC stops its marker threads in a forked child. A worker lives as long
   as the daemon and checks again at each edit, so it starts the marker
   threads again after the fork.
+- The router serves only an entry in the project root (the directory of
+  the nearest `blink.toml`) or below it, by the key above. A file outside
+  it can be part of another project, so its check or build runs cold. The
+  entry that the daemon started on is served wherever it is.
+- The router refuses a build from a client with another identity or other
+  front-end settings before it routes the build. The client builds cold, and
+  the router forks no worker for it. The worker does the same check again. A
+  check request carries no identity, before and after this change.
+- When a worker ends without a stop (killed or crashed), the router reaps it
+  at its next accept tick and removes its directory. The next request for
+  that entry gets a new worker. A client whose request was in that worker
+  gets no reply and runs cold. A build child of that worker ends when its
+  build ends. Until then, it and the client's cold build can write the same
+  outputs, as when a daemon is killed mid-build (above).
 - `blink daemon status` gives `entries` (the workers that serve) after
   `stopping`. `builds` and `checks` are the sums over all workers, also the
   workers the router stopped.
