@@ -1,0 +1,178 @@
+// A daemon serves a request from any directory of its project. The check runs where the
+// command ran, so it prints what a cold check there prints: a path relative to that
+// directory, and the same answer for an entry the cold check finds outside a source root.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/app/tools")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // The daemon listens at the project root, so each tree is a project of its own.
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_other_cwd_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    for name in ["main", "second", "third"] {
+        // The unused local gives each check a warning to print, which names the file.
+        write_file("{tree}/app/src/{name}.bl", [
+            #"import base.{tag}"#,
+            #""#,
+            #"fn main() {"#,
+            "    let spare_{name} = 1",
+            "    io.println(tag(\"{name}\"))",
+            #"}"#,
+            #""#,
+        ].join("\n"))
+    }
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it builds only for a client whose env is its own.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache"
+}
+
+// Runs blink with args in dir, a directory of the project at tree/app.
+fn blink_at(tree: Str, dir: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app/{dir} && {env_of(tree)} timeout 120 {tree}/build/blink {args}"])
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    blink_at(tree, ".", args)
+}
+
+// The pid of the daemon started on src/main.bl in tree with flags, or -1. The timeout ends a
+// daemon that nothing stopped. It runs blink by the path the clients use, since
+// the daemon builds only for a client that names its compiler the same way.
+fn start_daemon(tree: Str, flags: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 {tree}/build/blink daemon start {flags} src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "checks", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+fn counts(tree: Str) -> Str {
+    "checks={served(tree, "checks")} builds={served(tree, "builds")} entries={served(tree, "entries")}"
+}
+
+// What a command printed, with its tree's path and a build's private units directory's random
+// name spelled the same in every tree.
+fn plain(tree: Str, s: Str) -> Str {
+    let t = s.replace(tree, "TREE")
+    let mut out = ""
+    let mut rest = t
+    loop {
+        match rest.byte_index_of(".units.", 0) {
+            Some(at) => {
+                let end = if at + 13 <= rest.byte_len() { at + 13 } else { rest.byte_len() }
+                out = "{out}{rest.byte_slice(0, at)}.units.XXXXXX"
+                rest = rest.byte_slice(end, rest.byte_len())
+            }
+            None => break
+        }
+    }
+    "{out}{rest}"
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{a.out}{a.err_out}\n-- vs --\n{b.out}{b.err_out}" }
+    if plain(a_tree, a.out) != plain(b_tree, b.out) { return "stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if plain(a_tree, a.err_out) != plain(b_tree, b.err_out) { return "stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// Runs args in dir in both trees; what differs, or "". A path in args spelled TREE names
+// each tree's own root.
+fn compare_at(warm: Str, cold: Str, dir: Str, args: Str) -> Str {
+    let w = blink_at(warm, dir, args.replace("TREE", warm))
+    let c = blink_at(cold, dir, args.replace("TREE", cold))
+    let d = differ(warm, w, cold, c)
+    if d != "" { "in {dir}: {args}: {d}" } else { "" }
+}
+
+fn compare(warm: Str, cold: Str, args: Str) -> Str {
+    compare_at(warm, cold, ".", args)
+}
+
+fn edit_both(warm: Str, cold: Str, file: Str, sed: Str) {
+    for t in [warm, cold] {
+        let path = "{t}/app/src/{file}"
+        let before = read_file(path)
+        shell_exec("sed -i '{sed}' {path}")
+        assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+    }
+}
+
+test "a check from another directory of the project is served and matches a cold check there" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_other_cwd_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_other_cwd_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm, "")
+    let mut problems: List[Str] = []
+    let mut seen: List[Str] = []
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        problems.push(compare_at(warm, cold, "tools", "check ../src/second.bl"))
+        problems.push(compare_at(warm, cold, "tools", "check ../src/main.bl"))
+        problems.push(compare_at(warm, cold, "src", "check main.bl"))
+        problems.push(compare_at(warm, cold, "src", "check second.bl"))
+        problems.push(compare_at(warm, cold, "tools", "check --json ../src/second.bl"))
+        seen.push(counts(warm))
+        problems.push(compare(warm, cold, "check src/second.bl"))
+        problems.push(compare(warm, cold, "check src/main.bl"))
+        seen.push(counts(warm))
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(seen.join(", "), "checks=5 builds=0 entries=2, checks=7 builds=0 entries=2")
+}

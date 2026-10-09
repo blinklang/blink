@@ -504,19 +504,20 @@ of those shas hold the rows.
 
 ### Build through the daemon
 
-`blink build` and `blink run` ask a daemon that watches their source to build.
-The daemon builds only when the client's cwd, source, identity (its binary,
-the compiler's sha256 and its env) and front-end settings
-(`--strict-struct-layout`, `BLINK_TRACE`, emit reuse) are its own. It rechecks
-if an input changed, then forks a child that builds from the program it
-checked: the child skips the front end and runs mono, the analyses, emit, unit
-reuse, cc and link. The parent relays the child's stdout, stderr and exit
-code. For `run`, the client runs the program itself, so the program's stdin,
+`blink build` and `blink run` ask the project's daemon to build. The daemon
+serves any entry file of the project, from any directory of it (see "Any
+entry of the project" below). It builds only when the client's identity (its
+binary as typed, the compiler's sha256 and its env but `PWD`) and front-end
+settings (`--strict-struct-layout`, `BLINK_TRACE`, emit reuse) are its own.
+The worker of the entry rechecks if an input changed, then forks a child
+that builds from the program it checked: the child skips the front end and
+runs mono, the analyses, emit, unit reuse, cc and link. The worker sends the
+client the child's stdout, stderr and exit code. For `run`, the client runs the program itself, so the program's stdin,
 args, env, cwd and exit code are the client's. A client the daemon does not
 serve, or a child that declines (deps to resolve, a stale dev archive, a path
 that needs a second front end), builds cold.
 
-While the daemon waits for a client, it polls each 0.5 s. A poll reads the
+While a worker waits for a client, it polls each 0.5 s. A poll reads the
 mtime (in ms) and the size of each file the last check read, and whether each
 path the loader probed finds a file. Only when one of these moved does it
 compare the files byte for byte with what the check read, and recheck if they
@@ -565,11 +566,11 @@ What a user sees while a build runs through the daemon:
 - `blink daemon stop` waits for the running build to end, then stops. Builds
   that were queued build cold.
 - A client that quits mid-build leaves the daemon serving. The daemon reaps
-  the child and removes its `.blink/build-<n>.*` files.
+  the child and removes its `.blink/w<pid>-<k>/build-<n>.*` files.
 - A daemon killed mid-build (`kill -9`, a crash) can leave
-  `.blink/build-<n>.*` files. The next daemon does not sweep them at start: it
-  cannot tell them from the files of another daemon that serves the same dir,
-  and they are small, so a sweep adds risk for no gain.
+  `.blink/w<pid>-<k>/build-<n>.*` files. The next daemon does not sweep them
+  at start: it cannot tell them from the files of another daemon that serves
+  the same dir, and they are small, so a sweep adds risk for no gain.
 - Two cold builds of one output at once, outside the daemon, can still race
   on the swap of the units dir. That is a separate bug.
 
@@ -664,6 +665,198 @@ wall seconds [min-max]. `per_module_daemon_settle1_2037f4d5.tsv` and
   run-body-cname 0.6130 [0.600-0.995] and 0.6200 [0.576-0.988].
 - The daemon spends no more CPU in a build: over 5 builds of `src/cli.bl` its
   own CPU time is 221 and 220 ticks (of 10 ms) before, and 220 and 221 after.
+
+### Any entry of the project
+
+Before this change, the daemon served only the entry it started on, as typed
+from the directory it started in. A check of `./src/cli.bl`, of its absolute
+path, or of `../src/cli.bl` from `tests/` ran cold, and so did a check or
+build of a second entry such as `examples/calculator.bl`.
+
+The daemon is now a router and a set of workers:
+
+- The router runs no front end. It keys each check, build or run by the
+  entry's real path (`realpath(3)` of the client's directory and the path as
+  typed). A symbolic link to an entry, and a path through a linked
+  directory, give the key of the target, so they go to the same worker. Two
+  files never share a real path, so never a key. A path that `realpath`
+  cannot resolve, such as a missing file, falls back to the absolute path
+  with no `.`, `..` or empty parts.
+- For a new key, the router forks a worker. The worker checks that entry and
+  serves it as the daemon served its one entry before. Its socket and files
+  are in `.blink/w<router pid>-<k>/`.
+- The router does not wait on a check, a build or a query. It replies with
+  the name of the worker that serves the request:
+  `{"ok":false,"served":0,"worker":"w<router pid>-<k>"}`. The client sends
+  the same request to `.blink/w<router pid>-<k>/daemon.sock` and uses the
+  reply of the worker. `daemon_send` in `src/daemon.bl` does this for
+  `blink check`, `build`, `run` and `query`, the only clients of the
+  socket. It follows one redirect only. A second redirect, or a worker that
+  is gone, gives no reply, and the client runs cold.
+- A client from before this change does not follow the redirect. For a
+  check, build or run it reads `"served":0` as a request the daemon did not
+  serve, and runs cold, so its output stays correct. For a query it prints
+  the redirect as its answer. Run `blink daemon stop` and start the daemon
+  again after an upgrade.
+- A worker checks in the client's directory, with the entry as the client
+  typed it, since a diagnostic spells its file relative to both. A new
+  spelling of the same entry makes the worker check again (about 0.4 s on
+  `src/cli.bl`).
+- The worker of the entry that the daemon started on (the home worker) also
+  answers editor queries, and the router does not stop it. The router keeps
+  at most `--max-entries` workers (default 8). For one more, it stops the
+  worker that a client used longest ago, but not one that builds or holds
+  builds.
+- `PWD` is not part of the identity, since each directory of a project has
+  its own. The request carries it, and the build child sets it. `argv[0]`
+  stays in the identity as typed: a build finds its `lib/` and archive from
+  it, so the daemon builds only for a client that typed it the same. A client
+  that typed it another way builds cold.
+- A worker ends when its router is gone. It sees this at its next accept tick
+  (0.5 s when idle, 1 ms while a build runs). It then removes its directory.
+  The directory name holds the router's pid, so a worker of a daemon that was
+  killed does not remove the directory of a new daemon.
+- The GC stops its marker threads in a forked child. A worker lives as long
+  as the daemon and checks again at each edit, so it starts the marker
+  threads again after the fork.
+- The router serves only an entry in the project root (the directory of
+  the nearest `blink.toml`) or below it. It compares the key above with the
+  real path of the root, so a link in the project to a file outside it is
+  outside. A file outside the root can be part of another project, so its
+  check or build runs cold. The entry that the daemon started on is served
+  wherever it is.
+- Builds of two entries do not run at the same time, as with two builds of
+  one entry. Each build uses all the cores it can get, and the daemon keeps
+  its one rule for builds. The router holds one build turn for all workers:
+  - Before the fork, the router connects to the new worker's socket. The
+    worker's first accept is that connection, its channel to the router.
+    The worker only writes on it (`{"type":"turn"}` to ask, then
+    `{"type":"done","more":0|1}`), and the router only reads, so neither
+    waits on the other. The router waits with `poll` on its socket and all
+    channels.
+  - A worker queues each build and asks for the turn. The router gives the
+    turn to the oldest asker: it connects to the worker's socket and sends
+    `{"type":"turn"}`. The worker runs its oldest build. When the build
+    child ends, the worker sends `done`, with `more` 1 when it has more
+    builds. Such a worker goes to the end of the queue, so a turn is one
+    build, and two workers with many builds take turns.
+  - `blink daemon status` gives `building` 1 for the build that holds the
+    turn and `queued` for each build that waits, in any worker.
+  - A stop waits for the build that holds the turn, as above. Each worker
+    then sends its queued builds cold, replies to the stop and exits.
+  - A worker that ends while it holds the turn frees it at the router's next
+    reap. Its build child, if one runs, is not killed (see the crash case
+    above), so it can still write while the next worker builds. It writes
+    only its own entry's units dir and output.
+- The router refuses a build from a client with another identity or other
+  front-end settings before it routes the build. The client builds cold, and
+  the router forks no worker for it. The worker does the same check again. A
+  check request carries no identity, before and after this change.
+- When a worker ends without a stop (killed or crashed), the router reaps it
+  at its next accept tick and removes its directory. The next request for
+  that entry gets a new worker. A client whose request was in that worker
+  gets no reply and runs cold. A build child of that worker ends when its
+  build ends. Until then, it and the client's cold build can write the same
+  outputs, as when a daemon is killed mid-build (above).
+- `blink daemon status` gives `entries` (the workers that serve) after
+  `stopping`. `builds` and `checks` are the sums over all workers, also the
+  workers the router stopped.
+
+A script runs each case 5 times, on the gen1 `blink` built from `27b9888e`
+(before, sha256 `3338425dccf667b8`) and then from `a3f7dfe1` (after, sha256
+`608aa9a78b7b7a2d`), back to back under `blink-gates.slice`, in a copy of the
+`a3f7dfe1` tree. `calc` is `examples/calculator.bl`. "settle1" waits 1 s
+between the edit and the command. Median wall seconds [min-max].
+`bench/edit_loop/daemon_any_entry_turn_27b9888e.tsv` and
+`bench/edit_loop/daemon_any_entry_turn_a3f7dfe1.tsv` hold the rows.
+
+| case | before | after |
+|---|---|---|
+| cold check `src/cli.bl` | 0.387 [0.379-0.388] | 0.384 [0.375-0.388] |
+| daemon check `src/cli.bl`, no change | 0.008 [0.007-0.010] | 0.008 [0.008-0.011] |
+| daemon check `src/cli.bl`, edit, no settle | 0.407 [0.403-0.411] | 0.404 [0.403-0.411] |
+| daemon check `src/cli.bl`, edit, settle1 | 0.008 [0.008-0.012] | 0.008 [0.008-0.013] |
+| daemon build `src/cli.bl`, body edit, settle1 | 0.586 [0.559-0.604] | 0.585 [0.567-0.608] |
+| daemon check `./src/cli.bl` | 0.387 [0.386-0.392] | 0.008 [0.008-0.427] |
+| daemon check absolute `src/cli.bl` | 0.391 [0.386-0.392] | 0.008 [0.008-0.416] |
+| daemon check `../src/cli.bl` from `tests/` | 0.383 [0.379-0.392] | 0.008 [0.008-0.422] |
+| cold check calc | 0.010 [0.010-0.011] | 0.011 [0.010-0.011] |
+| daemon check calc, no change | 0.011 [0.010-0.011] | 0.002 [0.002-0.002] |
+| daemon check calc, edit, settle1 | 0.010 [0.010-0.011] | 0.003 [0.002-0.003] |
+| cold build calc, body edit | 0.152 [0.151-0.154] | 0.152 [0.151-0.153] |
+| daemon build calc, body edit, settle1 | 0.163 [0.160-0.164] | 0.161 [0.158-0.163] |
+
+- Each other spelling of `src/cli.bl` now gets its answer from the daemon.
+  The max of each of those rows is the first check of a new spelling, which
+  checks again.
+- A check of calc through the daemon takes 2-3 ms, against 10-11 ms cold.
+- A build of calc through the daemon gains nothing, as with the small target
+  below: its front end is a few ms.
+
+`task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 5 reps, 12 cores,
+under `blink-gates.slice`, back to back on the `a3f7dfe1` tree, on the same two
+binaries: before from `27b9888e`, after from `a3f7dfe1`. The daemon served 30
+builds on cli and 25 on small for each. Median wall seconds [min-max].
+`per_module_daemon_settle1_turn_27b9888e.tsv` and
+`per_module_daemon_settle1_turn_a3f7dfe1.tsv` hold the rows.
+
+| target | case | before | after |
+|---|---|---|---|
+| cli | nochange | 0.181 [0.179-0.184] | 0.190 [0.190-0.198] |
+| cli | body-cname | 0.554 [0.519-0.569] | 0.547 [0.525-0.581] |
+| cli | body-typecheck | 2.871 [2.865-2.897] | 2.921 [2.888-2.936] |
+| cli | pubfn-cname | 1.675 [1.632-1.676] | 1.740 [1.711-1.774] |
+| cli | run-body-cname | 0.579 [0.571-0.920] | 0.596 [0.576-0.997] |
+| cli | test-body-cname | 0.478 [0.475-0.482] | 0.479 [0.475-0.486] |
+| cli | cold-obj | 3.420 [3.411-3.559] | 3.402 [3.385-3.529] |
+| cli | cold-all | 6.050 [6.039-6.065] | 6.044 [6.029-6.046] |
+| small | nochange | 0.072 [0.070-0.074] | 0.073 [0.072-0.074] |
+| small | body-inventory | 0.127 [0.124-0.129] | 0.132 [0.128-0.133] |
+| small | pubfn-model | 0.129 [0.128-0.131] | 0.134 [0.132-0.136] |
+| small | run-body-inventory | 0.129 [0.127-0.129] | 0.136 [0.133-0.137] |
+| small | test-body-inventory | 0.139 [0.137-0.141] | 0.138 [0.137-0.142] |
+| small | cold-obj | 0.130 [0.127-0.133] | 0.138 [0.137-0.140] |
+
+- In this run, cli nochange and pubfn-cname after are out of the spread of
+  their before rows. Four more cli runs, after, before, after, before, do not
+  show it: nochange 0.186, 0.183, 0.188, 0.188; body-typecheck 2.900, 2.883,
+  2.889, 2.900; pubfn-cname 1.670, 1.670, 1.682, 1.704
+  (`per_module_daemon_settle1_cli_alt_run<n>_<sha>.tsv`). pubfn-cname alone
+  gives 1.603, 1.596, 1.607 and 1.601 against before
+  (`per_module_daemon_settle1_pubfn_vs_before_run<n>_<sha>.tsv`), and 1.614,
+  1.605, 1.610 and 1.611 against the redirect `b9c2f852`, so the build turn
+  adds no time to it (`per_module_daemon_settle1_pubfn_vs_redirect_run<n>_<sha>.tsv`).
+  The rows of the redirect `b9c2f852` against `27b9888e` are in
+  `per_module_daemon_settle1_{27b9888e,b9c2f852}.tsv` and
+  `daemon_any_entry_{27b9888e,b9c2f852}.tsv`.
+- The small rows after an edit are 4-12 ms slower, out of the spread of
+  their before rows. Not all of it is noise. In 4 small runs of 11 reps,
+  after, before, after, before, body-inventory is 0.133, 0.126, 0.133 and
+  0.127, and cold-obj is 0.136, 0.126, 0.136 and 0.126; nochange and
+  test-body-inventory do not change
+  (`per_module_daemon_settle1_small_reps11_alt_run<n>_<sha>.tsv`). All of the
+  gap is in `emit_s`, the time before cc starts.
+- The gap comes from the split into a router and a worker, not from the
+  redirect. In 8 runs, the gen1 `blink` built from `799b05b3` (a relay
+  process), `bb914b25` (a relay process, identity check in the router) and
+  `b9c2f852` (the redirect) all give body-inventory 0.131-0.133 and cold-obj
+  0.132-0.133, against 0.128-0.129 and 0.127 before
+  (`per_module_daemon_settle1_small_bisect_run<n>_<sha>.tsv`).
+- With `GC_MARKERS=1` (no GC marker threads), the gap goes away:
+  body-inventory is 0.130 and 0.129 after, 0.128 and 0.129 before, and
+  cold-obj is 0.130 and 0.130 after, 0.129 and 0.130 before
+  (`per_module_daemon_settle1_small_gcmarkers1_run<n>_<sha>.tsv`). The cause
+  in the GC is not found. The router and the worker do no GC collection in
+  these runs, and a start of the marker threads in the build child made the
+  rows slower.
+- Without the GC marker threads in the worker (the gen1 `blink` built from
+  `75c8dc00`), the small rows were 4-8 ms slower than before after edits.
+  In 4 small runs of 11 reps, after, before, after, before, cold-obj was
+  0.137, 0.130, 0.138 and 0.129. With the marker threads (`799b05b3`), it is
+  0.135, 0.129, 0.129 and 0.126
+  (`per_module_daemon_settle1_small_reps11_run<n>_<sha>.tsv`). The marker
+  threads make the gap smaller, but the bisect above shows that `799b05b3`
+  is still slower than before.
 
 ### Unit headers from one walk
 

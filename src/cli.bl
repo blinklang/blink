@@ -73,7 +73,7 @@ import diagnostics.{
     embedded_inner_key,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
 }
-import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path}
+import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send}
 import docgen.{generate_doc}
 import lsp.{lsp_start}
 import comment_attach.{attach_comments_pass}
@@ -3711,10 +3711,10 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 }
 
-// The check asks the project's daemon. The daemon answers only for the entry it serves and
-// from the directory it started in, since a diagnostic spells its file relative to both.
-// Anything else, and any reply the client can not read, falls back to a cold check: the
-// daemon may make a check faster, never different. True when the daemon's answer was printed.
+// The check asks the project's daemon, which checks the entry as this client spells it from
+// this directory, since a diagnostic spells its file relative to both. A reply the client
+// can not read falls back to a cold check: the daemon may make a check faster, never
+// different. True when the daemon's answer was printed.
 fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, strict: Int) -> Bool {
     let sock = daemon_socket_path()
     if !file_exists(sock) {
@@ -3732,12 +3732,7 @@ fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, stri
     json_set(req, "json", json_new_int(json_status))
     json_set(req, "diag_json", json_new_int(diag_json))
     json_set(req, "strict", json_new_int(strict))
-    if socket_write(fd, json_encode(req).concat("\n")) < 0 {
-        unix_socket_close(fd)
-        return false
-    }
-    let reply = socket_read_line(fd)
-    unix_socket_close(fd)
+    let reply = daemon_send(fd, json_encode(req))
     json_clear()
     let root = json_parse(reply)
     if root < 0 || json_as_int(json_get(root, "served")) != 1 {
@@ -3783,12 +3778,14 @@ fn daemon_may_build(a: Args) -> Bool {
 // command line. The daemon builds only for a client that names the same. `_`, SHLVL and
 // OLDPWD are left out: a shell keeps them for itself, as the command it ran, how deep it runs
 // and the directory it was in, so two shells differ in them, and a build reads none of them.
+// PWD is left out as each directory of a project has its own; the request carries it, and
+// the daemon's build sets it.
 // The variables are sorted, since a shell lists them in an order that changes as it sets
 // them, and a build reads no order. They are sorted as NUL-ended records, as a value may hold
 // a newline; an env without -0 lists them unsorted, so the order then counts, and a client in
 // another order builds cold. One shell hashes both, as each process costs a build its start.
 fn daemon_identity() -> Str {
-    let unset = "-u _ -u SHLVL -u OLDPWD"
+    let unset = "-u _ -u SHLVL -u OLDPWD -u PWD"
     let compiler = archive_compiler_path()
     let hashes = process_run("sh", ["-c", "{SHA256SUM_SH}sha256sum '{compiler}' 2>/dev/null; \{ env -0 {unset} 2>/dev/null || env {unset}; } | LC_ALL=C sort -z | sha256sum"]).out.trim()
     "{get_arg(0)}\n{compiler}\n{hashes}"
@@ -3803,10 +3800,10 @@ fn front_settings(strict_struct_layout: Bool) -> Str {
 }
 
 // A build or run asks the project's daemon to run the build, which it does in a child that
-// runs this command line from the program the daemon checked. The daemon serves only the
-// entry it checks, from the directory it started in, for a client with its compiler,
-// environment and front-end settings; anything else, and any reply the client can not read,
-// falls back to a cold build. The daemon may make a build faster, never different. True when
+// runs this command line from the program the daemon checked. The daemon serves any entry
+// of the project, from any directory, for a client with its compiler, environment and
+// front-end settings; anything else, and any reply the client can not read, falls back to a
+// cold build. The daemon may make a build faster, never different. True when
 // the build through the daemon succeeded and its output was printed; a failed build exits with
 // its code.
 fn build_through_daemon(a: Args, command: Str) -> Bool {
@@ -3844,12 +3841,14 @@ fn build_through_daemon(a: Args, command: Str) -> Bool {
         i = i + 1
     }
     json_set(req, "argv", argv)
-    if socket_write(fd, json_encode(req).concat("\n")) < 0 {
-        unix_socket_close(fd)
-        return false
+    match env.var("PWD") {
+        Some(pwd) => {
+            json_set(req, "pwd", json_new_str(pwd))
+            json_set(req, "pwd_set", json_new_int(1))
+        }
+        None => json_set(req, "pwd_set", json_new_int(0))
     }
-    let reply = socket_read_line(fd)
-    unix_socket_close(fd)
+    let reply = daemon_send(fd, json_encode(req))
     json_clear()
     let root = json_parse(reply)
     if root < 0 || json_as_int(json_get(root, "served")) != 1 {
@@ -4600,9 +4599,7 @@ fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
             let mod_name = if query_module != "" { query_module } else { strip_extension(path_basename(source_path)) }
             request = "\{\"type\":\"query\",\"query_type\":\"signature\",\"module\":\"{mod_name}\"}"
         }
-        let sent = socket_write(sock_fd, request.concat("\n"))
-        let response = if sent >= 0 { socket_read_line(sock_fd) } else { "" }
-        unix_socket_close(sock_fd)
+        let response = daemon_send(sock_fd, request)
         // A daemon that took no request or gave no answer leaves the query to run cold.
         if response != "" {
             io.println(response)
@@ -4862,9 +4859,18 @@ fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, IO, Lex.Tokenize, Pa
         io.println("error: file not found: {daemon_source}")
         exit(1)
     }
+    let max_flag = args_get(a, "max-entries")
+    let mut max_entries = 8
+    if max_flag != "" {
+        max_entries = max_flag.to_int()
+        if max_entries <= 0 || "{max_entries}" != max_flag.trim() {
+            io.println("error: --max-entries must be a positive integer, got '{max_flag}'")
+            exit(1)
+        }
+    }
     io.println("Daemon starting on {daemon_socket_path()}")
     // The daemon checks with the settings a build with no flags applies.
-    match daemon_start(daemon_source, daemon_identity(), front_settings(false), emit_reuse_allowed()) {
+    match daemon_start(daemon_source, daemon_identity(), front_settings(false), emit_reuse_allowed(), max_entries) {
         Some(b) => build_in_daemon_child(b)
         None => {}
     }
@@ -5019,6 +5025,7 @@ fn cli_parser() -> ArgParser {
     p = add_command(p, "daemon.status", "Show the project daemon status")
     p = add_command(p, "daemon.stop", "Stop the project daemon")
     p = command_add_positional(p, "daemon.start", "file", "Entry file of the program to serve; the socket stays at the project root")
+    p = command_add_option(p, "daemon.start", "--max-entries", "", "Entry files the daemon keeps checked at once, each in a process of its own (default: 8)")
     p = add_command(p, "shim.init", "Scaffold a vendored C shim + @trusted wrapper (§9.1.3)")
     p = command_add_positional(p, "shim.init", "name", "Shim name (lowercase, used as native-dep key and C symbol prefix)")
     p = add_command(p, "query", "Query symbol index (uses daemon if running)")
