@@ -763,27 +763,28 @@ The daemon is now a router and a set of workers:
   workers the router stopped.
 
 A script runs each case 5 times, on the gen1 `blink` built from `27b9888e`
-(before, sha256 `3338425dccf667b8`) and then from `b9c2f852` (after, sha256
-`e3bcd08102235645`), back to back under `blink-gates.slice`, in a copy of the
-`b9c2f852` tree. `calc` is `examples/calculator.bl`. "settle1" waits 1 s
+(before, sha256 `3338425dccf667b8`) and then from `a3f7dfe1` (after, sha256
+`608aa9a78b7b7a2d`), back to back under `blink-gates.slice`, in a copy of the
+`a3f7dfe1` tree. `calc` is `examples/calculator.bl`. "settle1" waits 1 s
 between the edit and the command. Median wall seconds [min-max].
-`bench/edit_loop/daemon_any_entry_27b9888e.tsv` and
-`bench/edit_loop/daemon_any_entry_b9c2f852.tsv` hold the rows.
+`bench/edit_loop/daemon_any_entry_turn_27b9888e.tsv` and
+`bench/edit_loop/daemon_any_entry_turn_a3f7dfe1.tsv` hold the rows.
 
 | case | before | after |
 |---|---|---|
-| cold check `src/cli.bl` | 0.387 [0.380-0.392] | 0.377 [0.373-0.381] |
-| daemon check `src/cli.bl`, no change | 0.008 [0.007-0.010] | 0.008 [0.008-0.010] |
-| daemon check `src/cli.bl`, edit, settle1 | 0.008 [0.008-0.008] | 0.008 [0.008-0.014] |
-| daemon build `src/cli.bl`, body edit, settle1 | 0.580 [0.567-0.600] | 0.589 [0.568-0.617] |
-| daemon check `./src/cli.bl` | 0.383 [0.380-0.390] | 0.008 [0.008-0.411] |
-| daemon check absolute `src/cli.bl` | 0.383 [0.381-0.390] | 0.008 [0.008-0.415] |
-| daemon check `../src/cli.bl` from `tests/` | 0.380 [0.378-0.388] | 0.008 [0.008-0.404] |
+| cold check `src/cli.bl` | 0.387 [0.379-0.388] | 0.384 [0.375-0.388] |
+| daemon check `src/cli.bl`, no change | 0.008 [0.007-0.010] | 0.008 [0.008-0.011] |
+| daemon check `src/cli.bl`, edit, no settle | 0.407 [0.403-0.411] | 0.404 [0.403-0.411] |
+| daemon check `src/cli.bl`, edit, settle1 | 0.008 [0.008-0.012] | 0.008 [0.008-0.013] |
+| daemon build `src/cli.bl`, body edit, settle1 | 0.586 [0.559-0.604] | 0.585 [0.567-0.608] |
+| daemon check `./src/cli.bl` | 0.387 [0.386-0.392] | 0.008 [0.008-0.427] |
+| daemon check absolute `src/cli.bl` | 0.391 [0.386-0.392] | 0.008 [0.008-0.416] |
+| daemon check `../src/cli.bl` from `tests/` | 0.383 [0.379-0.392] | 0.008 [0.008-0.422] |
 | cold check calc | 0.010 [0.010-0.011] | 0.011 [0.010-0.011] |
-| daemon check calc, no change | 0.010 [0.010-0.011] | 0.002 [0.002-0.002] |
-| daemon check calc, edit, settle1 | 0.011 [0.011-0.012] | 0.003 [0.002-0.003] |
-| cold build calc, body edit | 0.152 [0.151-0.155] | 0.150 [0.149-0.155] |
-| daemon build calc, body edit, settle1 | 0.159 [0.158-0.163] | 0.161 [0.160-0.163] |
+| daemon check calc, no change | 0.011 [0.010-0.011] | 0.002 [0.002-0.002] |
+| daemon check calc, edit, settle1 | 0.010 [0.010-0.011] | 0.003 [0.002-0.003] |
+| cold build calc, body edit | 0.152 [0.151-0.154] | 0.152 [0.151-0.153] |
+| daemon build calc, body edit, settle1 | 0.163 [0.160-0.164] | 0.161 [0.158-0.163] |
 
 - Each other spelling of `src/cli.bl` now gets its answer from the daemon.
   The max of each of those rows is the first check of a new spelling, which
@@ -793,30 +794,41 @@ between the edit and the command. Median wall seconds [min-max].
   below: its front end is a few ms.
 
 `task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 5 reps, 12 cores,
-under `blink-gates.slice`, back to back on the `b9c2f852` tree, on the same two
-binaries: before from `27b9888e`, after from `b9c2f852`. The daemon served 30
+under `blink-gates.slice`, back to back on the `a3f7dfe1` tree, on the same two
+binaries: before from `27b9888e`, after from `a3f7dfe1`. The daemon served 30
 builds on cli and 25 on small for each. Median wall seconds [min-max].
-`per_module_daemon_settle1_27b9888e.tsv` and
-`per_module_daemon_settle1_b9c2f852.tsv` hold the rows.
+`per_module_daemon_settle1_turn_27b9888e.tsv` and
+`per_module_daemon_settle1_turn_a3f7dfe1.tsv` hold the rows.
 
 | target | case | before | after |
 |---|---|---|---|
-| cli | nochange | 0.185 [0.183-0.189] | 0.185 [0.180-0.199] |
-| cli | body-cname | 0.559 [0.526-0.586] | 0.554 [0.527-0.561] |
-| cli | body-typecheck | 2.889 [2.885-2.933] | 2.890 [2.877-2.941] |
-| cli | pubfn-cname | 1.663 [1.645-1.694] | 1.666 [1.626-1.683] |
-| cli | run-body-cname | 0.602 [0.588-0.943] | 0.585 [0.580-0.919] |
-| cli | test-body-cname | 0.482 [0.479-0.487] | 0.482 [0.475-0.490] |
-| cli | cold-obj | 3.416 [3.400-3.574] | 3.421 [3.411-3.591] |
-| cli | cold-all | 6.045 [6.036-6.060] | 6.045 [6.024-6.059] |
-| small | nochange | 0.071 [0.069-0.072] | 0.074 [0.073-0.077] |
-| small | body-inventory | 0.127 [0.123-0.128] | 0.131 [0.127-0.134] |
-| small | pubfn-model | 0.128 [0.126-0.130] | 0.133 [0.132-0.136] |
-| small | run-body-inventory | 0.130 [0.127-0.134] | 0.134 [0.132-0.136] |
-| small | test-body-inventory | 0.139 [0.137-0.142] | 0.140 [0.137-0.142] |
-| small | cold-obj | 0.127 [0.126-0.132] | 0.139 [0.137-0.141] |
+| cli | nochange | 0.181 [0.179-0.184] | 0.190 [0.190-0.198] |
+| cli | body-cname | 0.554 [0.519-0.569] | 0.547 [0.525-0.581] |
+| cli | body-typecheck | 2.871 [2.865-2.897] | 2.921 [2.888-2.936] |
+| cli | pubfn-cname | 1.675 [1.632-1.676] | 1.740 [1.711-1.774] |
+| cli | run-body-cname | 0.579 [0.571-0.920] | 0.596 [0.576-0.997] |
+| cli | test-body-cname | 0.478 [0.475-0.482] | 0.479 [0.475-0.486] |
+| cli | cold-obj | 3.420 [3.411-3.559] | 3.402 [3.385-3.529] |
+| cli | cold-all | 6.050 [6.039-6.065] | 6.044 [6.029-6.046] |
+| small | nochange | 0.072 [0.070-0.074] | 0.073 [0.072-0.074] |
+| small | body-inventory | 0.127 [0.124-0.129] | 0.132 [0.128-0.133] |
+| small | pubfn-model | 0.129 [0.128-0.131] | 0.134 [0.132-0.136] |
+| small | run-body-inventory | 0.129 [0.127-0.129] | 0.136 [0.133-0.137] |
+| small | test-body-inventory | 0.139 [0.137-0.141] | 0.138 [0.137-0.142] |
+| small | cold-obj | 0.130 [0.127-0.133] | 0.138 [0.137-0.140] |
 
-- The cli rows do not change.
+- In this run, cli nochange and pubfn-cname after are out of the spread of
+  their before rows. Four more cli runs, after, before, after, before, do not
+  show it: nochange 0.186, 0.183, 0.188, 0.188; body-typecheck 2.900, 2.883,
+  2.889, 2.900; pubfn-cname 1.670, 1.670, 1.682, 1.704
+  (`per_module_daemon_settle1_cli_alt_run<n>_<sha>.tsv`). pubfn-cname alone
+  gives 1.603, 1.596, 1.607 and 1.601 against before
+  (`per_module_daemon_settle1_pubfn_vs_before_run<n>_<sha>.tsv`), and 1.614,
+  1.605, 1.610 and 1.611 against the redirect `b9c2f852`, so the build turn
+  adds no time to it (`per_module_daemon_settle1_pubfn_vs_redirect_run<n>_<sha>.tsv`).
+  The rows of the redirect `b9c2f852` against `27b9888e` are in
+  `per_module_daemon_settle1_{27b9888e,b9c2f852}.tsv` and
+  `daemon_any_entry_{27b9888e,b9c2f852}.tsv`.
 - The small rows after an edit are 4-12 ms slower, out of the spread of
   their before rows. Not all of it is noise. In 4 small runs of 11 reps,
   after, before, after, before, body-inventory is 0.133, 0.126, 0.133 and
