@@ -1898,7 +1898,108 @@ assertion failed: assert_eq(result, Ok(500))
   --> src/bank.bl:44:5
 ```
 
-Expression introspection is bounded to one level of sub-expressions (direct operands and field accesses, not recursive descent into nested calls). The message expression is evaluated only on failure. In JSON output (`blink test --json`), introspection values appear in an `introspection` field alongside `assertion`, `expected`/`actual`, and `span`.
+The message expression is evaluated only on failure.
+
+##### Sub-expression Values
+
+For `assert(expr)`, the shape of `expr` sets which sub-expressions get a value line. The list of shapes is closed. Introspection goes one level deep: the compiler does not decompose an operand further.
+
+| Shape of `expr` | Value lines |
+|-----------------|-------------|
+| Comparison: `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, `a >= b` | `a`, then `b` |
+| Method call: `r.m(x, y)` | the receiver `r`, then each argument |
+| Function call: `f(x, y)` | each argument |
+| `!e` | the lines that `e` gets |
+| `a && b`, `a \|\| b` at the top level | one `Bool` line for each operand that ran; the operands are not decomposed |
+| Any other shape | no lines |
+
+Arithmetic has no row of its own. In `assert(a + b == c)` the lines are `a + b` and `c`. A field access such as `account.balance` is one operand.
+
+Each line is `<source text> = <value>`, and the value is rendered by `debug()` (§3.6.1 *Debug vs Display*). `Debug` quotes strings, so a `Str` value and an `Int` value never print the same. The lines come in source order. Each operand is evaluated once, left to right, as in the plain expression, and a line shows the value that the operator or the call received. The lines do not change what the program does.
+
+```
+assertion failed: assert(users.contains(name))
+  users = ["ana", "bo"]
+  name = "cy"
+  --> tests/test_users.bl:8:5
+```
+
+```
+assertion failed: assert(cart.is_open() && cart.total() > 0)
+  cart.is_open() = true
+  cart.total() > 0 = false
+  --> tests/test_cart.bl:14:5
+```
+
+**Literal operands get no line.** A literal is one of these tokens: an `Int`, `Float`, `Char` or `Bool` literal, a `Str` literal with no interpolation, or a number literal with a unary `-`. The list is closed. A composite form, such as `[1, 2]`, `Point { x: 0, y: 0 }` or `Ok(500)`, is not a literal and keeps its line:
+
+```
+assertion failed: assert(account.balance > 500)
+  account.balance = 450
+  --> src/bank.bl:43:5
+```
+
+```
+assertion failed: assert(result == Ok(500))
+  result = Err(InsufficientFunds { deficit: 499 })
+  Ok(500) = Ok(500)
+  --> src/bank.bl:46:5
+```
+
+**An operand bound to a `mut` parameter gets no line.** This applies to the receiver of a mutating method (§3.2.2 *Construction and Mutability*) and to an argument bound to a `mut` parameter. The compiler does not bind that operand to a temporary. The call runs on the original place, as written. The callee signature decides this at compile time. The other operands of the call keep their lines:
+
+```blink
+impl Queue {
+    fn try_push(mut self, job: Job) -> Bool {
+        // ...
+    }
+}
+
+test "queue accepts the job" {
+    let mut queue = Queue.new()
+    let job = Job { id: 1 }
+    assert(queue.try_push(job))     // a line for `job`; no line for `queue`
+}
+```
+
+**An operand whose type has no `Debug` gets no value line.** The compiler decides this at typecheck, from the static type of the operand as written at the `assert` site and the bounds in scope. It never decides per instantiation. In `fn check[T: Eq](a: T, b: T) { assert(a == b) }`, `a` and `b` get no line, also when `T` is `Int`. There is no placeholder value and no compile error. In its place, the output shows one `note:` line for each such operand, after the value lines and before `-->`. The note text is fixed at compile time and has one of three forms:
+
+| Static type of the operand | Note |
+|----------------------------|------|
+| A struct or enum that the package of the asserting module defines (the same test as the orphan rule, §3.6 *Trait Coherence*) | `note: <expr> not shown: <Type> has no Debug (add @derive(Debug))` |
+| A type parameter | `note: <expr> not shown: <T> has no Debug bound` |
+| Any other type: a type from another package, a function type, an opaque or FFI type, or a container whose element has no `Debug` | `note: <expr> not shown: <Type> has no Debug` |
+
+`<Type>` and `<T>` are the static type as written at the `assert` site. A type parameter stays `T`. The derive hint appears only in the first form, where the type to change is the type that the note names.
+
+```
+assertion failed: assert(order.total.covers(limit))
+  limit = 500
+  note: order.total not shown: Money has no Debug (add @derive(Debug))
+  --> src/shop.bl:21:5
+```
+
+```
+assertion failed: assert(stock.contains(item))
+  note: stock not shown: List[Item] has no Debug
+  note: item not shown: Item has no Debug (add @derive(Debug))
+  --> tests/test_inventory.bl:30:5
+```
+
+Which lines appear is decided at compile time from the source shape and static types; no runtime value changes the set of lines, except that a `&&`/`||` operand that did not run has no line. The `mut` rule and the `Debug` rule are static rules of this kind. They are not runtime exceptions.
+
+**JSON output.** In `blink test --json`, the record for a failed `assert*` call carries these two fields, in addition to its other fields (§8.10 *Built-in Test Runner*):
+
+- `introspection`: a list of `{"expr": <source text>, "value": <debug string>}`, one entry for each value line, in the same order. An operand with no line has no entry, not `null` and not a placeholder.
+- `omitted`: a list of `{"expr": <source text>, "type": <static type as written>}`, one entry for each `note:` line, in the same order.
+
+Both fields are always present. Each is `[]` when it has no entries.
+
+```json
+{"record": "test", "file": "src/shop.bl", "name": "order covers limit", "status": "failed", "cause": "assertion", "assertion": "assert(order.total.covers(limit))", "introspection": [{"expr": "limit", "value": "500"}], "omitted": [{"expr": "order.total", "type": "Money"}], "span": {"file": "src/shop.bl", "line": 21, "col": 5}}
+```
+
+**Panel vote:** Debug rendering, omission decided at typecheck, the fixed-set rule, the literal rule and the JSON fields 6-0. The `note:` line 5-1 (Minimalism dissented: a note is a stand-in one level up). The shape table 5-1 (Minimalism dissented: call rows make partial output the normal case). The note forms 6-0 after a 3-3 first round. See [decisions/power-assert-debug-rendering.md](../decisions/power-assert-debug-rendering.md).
 
 The test runner distinguishes assertion failures (`"status": "failed"`) from unexpected panics (`"status": "panicked"`) in structured output, enabling CI to categorize "test found a bug" vs "test itself is broken."
 
