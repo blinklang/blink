@@ -535,6 +535,27 @@ then a `blink check` through the daemon takes 0.397 s median wall and 42 ticks
 of daemon CPU with it on, and 0.394 s and 43 ticks with it off (an empty
 `BLINK_CACHE_DIR`), 6 edits each.
 
+While a build child runs, the daemon serves on: a status, check or query gets
+its answer at once, and the daemon does not poll for edits. Before each fork it
+makes a connected pair of unix sockets through a private listener at
+`.blink/build-<n>.wake`, and removes the file. The child's end closes on exec,
+so only the child holds it, and the daemon's end reads end of input when the
+child exits. The daemon waits on its socket and its end of the pair at once
+(`poll`), so it replies to the build with no tick. A pipe would need no
+listener file, but `Ptr.offset` rejects the `int[2]` that `pipe()` fills. A
+0.5 s timeout reaps a child whose end some other process kept open. A first
+try reaped the child each 10 ms instead; cli nochange went from 0.184 s to
+0.192 s through the daemon, with no overlap in the ranges (each on its own
+tree, not back to back), so the daemon waits on the pair.
+
+Two builds of one entry write the same units dir and program, so a build that
+comes while a child runs waits in a queue, oldest first, and runs when the
+child ends. A stop that comes then lets the child end, since a killed build
+would leave its cc and ld writing the files the client's cold build writes
+next. The daemon then sends each queued build to build cold ("the daemon is
+stopping"), replies to the stop and exits. `blink daemon status` gives
+`building` (0 or 1), `queued` and `stopping` before `builds` and `checks`.
+
 `task bench-edit-loop` on the gen1 `blink` built from `a6b467cb` (before) and
 from `b809e4a1` (after), 5 reps, 12 cores, under `blink-gates.slice`, back to
 back on one machine, all on the `eea901c6` tree. The daemon column is
@@ -578,7 +599,8 @@ files of those shas hold the rows.
   the cold row.
 - Without a daemon, each row is within the spread of its before row, or
   0.003 s from it.
-- The daemon serves one build at a time; a second client waits for it.
+- The daemon runs one build at a time; a build sent during a build waits for
+  it. Other requests do not wait (see below).
 - With no wait between the edit and the build (`BENCH_SETTLE=0`, tree
   `a0d2bbb0`), the body-cname build through the daemon takes 1.083 s
   [1.061-1.116], 0.19 s over the cold row above (an earlier run on the
@@ -586,6 +608,46 @@ files of those shas hold the rows.
   rechecks (about 0.4 s), then builds. With a 1 s wait on the same binary it
   takes 0.680 s [0.641-0.718]. `per_module_daemon_settle0_a0d2bbb0.tsv` and
   `per_module_daemon_settle1_a0d2bbb0.tsv` hold the rows.
+
+Serve during a build. A `blink daemon status` sent 0.1 s into a build through
+the daemon on `src/cli.bl` (tree `2037f4d5`, 5 builds) took 566-621 ms on the
+gen1 `blink` built from `2037f4d5`: the daemon waited in `waitpid` until the
+build ended. On the gen1 `blink` built from `03ee7e9c` it takes 2-3 ms, the
+same as with no build. The builds take 670-724 ms before and 683-719 ms after.
+
+`task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 5 reps, 12 cores,
+under `blink-gates.slice`, back to back on the `03ee7e9c` tree, on the gen1
+`blink` built from `2037f4d5` (before) and then from `03ee7e9c` (after). Median
+wall seconds [min-max]. `per_module_daemon_settle1_2037f4d5.tsv` and
+`per_module_daemon_settle1_03ee7e9c.tsv` hold the rows.
+
+| target | case | before | after |
+|---|---|---|---|
+| cli | nochange | 0.180 [0.177-0.182] | 0.184 [0.180-0.194] |
+| cli | body-cname | 0.537 [0.534-0.544] | 0.537 [0.518-0.561] |
+| cli | body-typecheck | 2.878 [2.863-2.903] | 2.872 [2.867-2.927] |
+| cli | pubfn-cname | 1.652 [1.616-1.703] | 1.626 [1.619-1.642] |
+| cli | run-body-cname | 0.578 [0.567-0.967] | 0.600 [0.590-0.943] |
+| cli | test-body-cname | 0.480 [0.478-0.484] | 0.478 [0.473-0.481] |
+| cli | cold-obj | 3.463 [3.433-3.585] | 3.379 [3.361-3.542] |
+| cli | cold-all | 6.047 [6.025-6.079] | 6.028 [6.021-6.050] |
+| small | nochange | 0.071 [0.071-0.071] | 0.072 [0.071-0.074] |
+| small | body-inventory | 0.127 [0.121-0.129] | 0.127 [0.125-0.129] |
+| small | pubfn-model | 0.129 [0.127-0.130] | 0.129 [0.126-0.131] |
+| small | run-body-inventory | 0.129 [0.127-0.131] | 0.129 [0.128-0.132] |
+| small | test-body-inventory | 0.138 [0.136-0.139] | 0.139 [0.135-0.141] |
+| small | cold-obj | 0.127 [0.126-0.129] | 0.129 [0.126-0.131] |
+
+- run-body-cname reads 22 ms slower after, and 27 ms slower (0.598 against
+  0.571) in a second cli pair run after first
+  (`per_module_daemon_settle1_cli_second_*.tsv`). In both pairs the after run
+  saw a 1-min load about 1 higher. Four cli runs of body-cname and
+  run-body-cname, 11 reps each, before, after, before, after, under even load
+  (`per_module_daemon_settle1_cli_reps11_run<n>_<sha>.tsv`): run-body-cname
+  is 0.5765 [0.558-0.599] before and 0.583 [0.557-0.610] after over 22 builds
+  each, and body-cname 0.5555 [0.517-0.590] and 0.5565 [0.523-0.580].
+- The daemon spends no more CPU in a build: over 5 builds of `src/cli.bl` its
+  own CPU time is 223 and 219 ticks (of 10 ms) before, and 217 and 216 after.
 
 ### Unit headers from one walk
 
