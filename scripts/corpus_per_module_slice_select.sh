@@ -24,13 +24,8 @@ set -u
 cd "$(dirname "$0")/.." || exit 2
 
 imports_of() { sed -n 's/^import \([a-z_][a-z_0-9]*\).*/\1/p' "$1" | sort -u; }
-# The imports of the sources a test writes, from its string literals.
-staged_imports_of() {
-    grep -oE '(^|\\n|")import [a-z_][a-z_0-9]*' "$1" | sed 's/.*import //' | sort -u
-}
 
 compiler=$(mktemp)
-trap 'rm -f "$compiler"' EXIT
 queue="blinkc_main cli compile_test_helpers cg_test_helpers lower_test_helpers cname_test_helpers"
 while [ -n "$queue" ]; do
     set -- $queue
@@ -43,24 +38,28 @@ while [ -n "$queue" ]; do
 done
 echo std >> "$compiler"
 
-for f in tests/test_*.bl; do
-    pick=0
-    for i in $(imports_of "$f"); do
-        grep -qx "$i" "$compiler" && continue
-        if [ -f "src/$i.bl" ] || [ -d "lib/$i" ]; then pick=1; break; fi
-    done
-    if [ "$pick" -eq 0 ] && grep -qE 'build/blink|blink_bin|"blink"' "$f"; then
-        for i in $(staged_imports_of "$f"); do
-            grep -qx "$i" "$compiler" && continue
-            pick=1; break
-        done
-    fi
-    if [ "$pick" -eq 0 ]; then
-        if grep -qE '_xmod\(|tests/(multifile|zz[a-z]*_calls)' "$f"; then pick=1
-        elif grep -qE '\["test"|blink test ' "$f"; then pick=1
-        else
-            case "$(basename "$f")" in *per_module*|*objcache*|*obj_cache*) pick=1 ;; esac
-        fi
-    fi
-    [ "$pick" -eq 1 ] && echo "$f"
-done | LC_ALL=C sort
+# One grep per test over the whole tree, not several per file: ci runs this
+# beside the gen1 build, and forking per file cost it seconds.
+work=$(mktemp -d)
+trap 'rm -f "$compiler"; rm -rf "$work"' EXIT
+ls src/*.bl | sed 's|^src/||; s|\.bl$||' > "$work/src"
+for d in lib/*/; do [ -d "$d" ] && basename "$d"; done > "$work/lib"
+grep -oHE '^import [a-z_][a-z_0-9]*' tests/test_*.bl | sed 's/:import /\t/' > "$work/imports"
+grep -lE 'build/blink|blink_bin|"blink"' tests/test_*.bl > "$work/cli"
+# The imports of the sources a test writes, from its string literals.
+grep -oHE '(^|\\n|")import [a-z_][a-z_0-9]*' tests/test_*.bl | sed 's/:.*import /\t/' > "$work/staged"
+grep -lE '_xmod\(|tests/(multifile|zz[a-z]*_calls)' tests/test_*.bl > "$work/multi"
+grep -lE '\["test"|blink test ' tests/test_*.bl > "$work/test"
+ls tests/test_*.bl | grep -E '/[^/]*(per_module|objcache|obj_cache)[^/]*$' > "$work/named"
+
+awk -F'\t' '
+    FILENAME == ARGV[1] { compiler[$1] = 1; next }
+    FILENAME == ARGV[2] { src[$1] = 1; next }
+    FILENAME == ARGV[3] { lib[$1] = 1; next }
+    FILENAME == ARGV[4] { if (!($2 in compiler) && (($2 in src) || ($2 in lib))) pick[$1] = 1; next }
+    FILENAME == ARGV[5] { cli[$1] = 1; next }
+    FILENAME == ARGV[6] { if (($1 in cli) && !($2 in compiler)) pick[$1] = 1; next }
+    { pick[$1] = 1 }
+    END { for (f in pick) print f }
+' "$compiler" "$work/src" "$work/lib" "$work/imports" "$work/cli" "$work/staged" \
+    "$work/multi" "$work/test" "$work/named" | LC_ALL=C sort
