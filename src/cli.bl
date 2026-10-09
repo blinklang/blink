@@ -47,7 +47,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
-import cg.{Codegen, CgConfig, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_with, generate_module_object_with, program_facts, enumerate_program_modules, archive_unit_modules}
+import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, program_facts, enumerate_program_modules, archive_unit_modules}
 import build_unit_headers.{HeaderIndex, index_headers, unit_includes, splice_includes}
 import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
@@ -1430,16 +1430,27 @@ type UnitHeaders {
     texts: List[Str]
 }
 
-// Writes the types header and each module's two headers into dir.
-fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, facts: ProgramFacts, dir: Str) -> Result[UnitHeaders, Int] ! Diag.Report, Codegen {
+// Writes the types header and each module's two headers into dir. `full_walk` walks the
+// typedefs again for each module, as the verify's cold emit does; otherwise one walk serves
+// every header.
+fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, facts: ProgramFacts, dir: Str, full_walk: Bool) -> Result[UnitHeaders, Int] ! Diag.Report, Codegen {
     let types = generate_types_header(program, cfg)
     let trc = units_bail_on_diag()
     if trc != 0 { return Err(trc) }
     write_file("{dir}/{c_program_types_header_name()}", types)
     let mut names: List[Str] = []
     let mut texts: List[Str] = []
+    let mut pre: Option[HeaderPreamble] = None
+    if !full_walk {
+        pre = Some(header_preamble(program, cfg, facts))
+        let prc = units_bail_on_diag()
+        if prc != 0 { return Err(prc) }
+    }
     for m in modules {
-        let hs = generate_module_headers_with(program, m, cfg, facts)
+        let hs = match pre {
+            Some(p) => generate_module_headers_from(m, cfg, p)
+            None => generate_module_headers_with(program, m, cfg, facts)
+        }
         let hrc = units_bail_on_diag()
         if hrc != 0 { return Err(hrc) }
         write_file("{dir}/{c_module_header_name(m)}", hs.surface)
@@ -1568,7 +1579,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let entries_before = diag_entry_count()
     let ice_before = diag_ice_count
     let facts = program_facts(program)
-    let hs = match write_unit_headers(program, modules, cfg, facts, dir) {
+    let hs = match write_unit_headers(program, modules, cfg, facts, dir, false) {
         Ok(h) => h
         Err(rc) => return Err(rc)
     }
@@ -1658,8 +1669,9 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
-// unless every file is byte-equal, also a build that takes no unit. It proves the reuse key in
-// tests; it never changes the C.
+// unless every file is byte-equal. Also a build that takes nothing: it writes its headers from
+// one shared preamble, which the cold emit does not. It proves the reuse key in tests; it never
+// changes the C.
 fn emit_reuse_verify() -> Bool {
     (env.var("BLINK_EMIT_REUSE_VERIFY") ?? "") == "1"
 }
@@ -1679,7 +1691,7 @@ fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, uni
 
 fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, vdir: Str) -> Int ! Diag.Report, Codegen {
     let facts = program_facts(program)
-    let hs = match write_unit_headers(program, modules, cfg, facts, vdir) {
+    let hs = match write_unit_headers(program, modules, cfg, facts, vdir, true) {
         Ok(h) => h
         Err(rc) => return rc
     }
@@ -3976,7 +3988,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
     }
 
     let facts = program_facts(final_program)
-    let hs = match write_unit_headers(final_program, modules, mod_cfg, facts, out_dir) {
+    let hs = match write_unit_headers(final_program, modules, mod_cfg, facts, out_dir, false) {
         Ok(h) => h
         Err(rc) => {
             exit(rc)

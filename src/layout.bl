@@ -67,7 +67,7 @@ pub type LayoutRecord {
 // the only side effects this module owns; the binder frames are the only scope state.
 let mut layout_memo: Map[Int, LayoutRecord] = Map()
 let mut typedef_buffer: List[Str] = []
-let mut typedef_guard: Map[Str, Int] = Map()
+let mut typedef_guard: TypedefGuards = TypedefGuards { own: Map(), base: Map() }
 let mut binder_frame_parent: List[Int] = []
 let mut binder_frame_alive: List[Int] = []
 let mut binder_frame_start: List[Int] = []
@@ -77,6 +77,44 @@ let mut binder_entries: List[BinderEntry] = []
 // entries a chain, newest first, so a lookup reads only the entries that carry its name:
 // it costs the name's shadow count rather than every live entry of every frame it walks.
 let mut binder_name_top: Map[Str, Int] = Map()
+
+// The typedefs this unit wrote, over those of the header preamble it starts from. The
+// preamble's set is only read, so every header of one pass shares one walk's set.
+type TypedefGuards {
+    own: Map[Str, Int]
+    base: Map[Str, Int]
+}
+
+fn lo_guarded(name: Str) -> Bool {
+    typedef_guard.own.contains_key(name) != 0 || typedef_guard.base.contains_key(name) != 0
+}
+
+// What the typedef walk of one unit wrote and has not yet drained, for the module headers
+// of the same program to start from instead of walking again.
+pub type LayoutTypedefMarks {
+    guards: Map[Str, Int]
+    buffer: List[Str]
+}
+
+pub fn layout_typedef_marks() -> LayoutTypedefMarks {
+    let mut guards = typedef_guard.own
+    if typedef_guard.base.len() > 0 {
+        guards = Map()
+        for k in typedef_guard.base.keys() { guards.insert(k, 1) }
+        for k in typedef_guard.own.keys() { guards.insert(k, 1) }
+    }
+    let mut buffer: List[Str] = []
+    for b in typedef_buffer { buffer.push(b) }
+    LayoutTypedefMarks { guards: guards, buffer: buffer }
+}
+
+// After layout_reset: this unit has written what `m` marks.
+pub fn layout_start_from(m: LayoutTypedefMarks) {
+    typedef_guard = TypedefGuards { own: Map(), base: m.guards }
+    let mut buffer: List[Str] = []
+    for b in m.buffer { buffer.push(b) }
+    typedef_buffer = buffer
+}
 
 type BinderEntry {
     frame: Int
@@ -99,7 +137,7 @@ pub fn layout_reset() {
     lo_mark_decl_facts()
     layout_memo = Map()
     typedef_buffer = []
-    typedef_guard = Map()
+    typedef_guard = TypedefGuards { own: Map(), base: Map() }
     binder_frame_parent = []
     binder_frame_alive = []
     binder_frame_start = []
@@ -396,7 +434,7 @@ pub fn box_gc_layout_of(tid: Int, pointee_spelling: Str) -> Str {
     if c_typedef_name(r) != pointee_spelling { return "" }
     let name = c_gc_layout_name(r)
     if diag_is_ice_seg(name) { return "" }
-    if typedef_guard.contains_key(name) != 0 { return name }
+    if lo_guarded(name) { return name }
     let inst = if tc_tid_child_count(r) > 0 { r } else { -1 }
     let mut spans: List[Str] = []
     for slot in tc_struct_field_slots(r) {
@@ -1179,7 +1217,7 @@ pub fn decl_has_derive(decl: Int, derive_name: Str) -> Bool {
 // ── Typedef emission ──────────────────────────────────────────────────────
 
 fn lo_guard_and_push(name: Str, body: Str) {
-    typedef_guard.insert(name, 1)
+    typedef_guard.own.insert(name, 1)
     let open = td_guard_open_lines(name)
     typedef_buffer.push("{open.get(0).unwrap()}\n{open.get(1).unwrap()}\n{body}\n{td_guard_close_line()}")
 }
@@ -1199,7 +1237,7 @@ fn lo_ensure_child_typedef(child: Int) {
 fn lo_emit_option_typedef(r: Int, name: Str) {
     let inner = lo_res(tc_tid_child(r, 0))
     if lo_is_opaque(inner) { return }
-    if typedef_guard.contains_key(name) != 0 { return }
+    if lo_guarded(name) { return }
     lo_ensure_child_typedef(inner)
     let member = if lo_fits_word(inner) { lo_member_spelling(inner) } else { pointer_spelling(lo_spell(inner)) }
     lo_guard_and_push(name, "typedef struct \{ int tag; {member} value; } {name};")
@@ -1208,9 +1246,9 @@ fn lo_emit_option_typedef(r: Int, name: Str) {
 // The ok arm is by value; a struct-typed err arm is by pointer; a Void arm is an
 // int64_t placeholder. blink_Result_str_str is declared by the runtime header.
 fn lo_emit_result_typedef(r: Int, name: Str) {
-    if typedef_guard.contains_key(name) != 0 { return }
+    if lo_guarded(name) { return }
     if name == "blink_Result_str_str" {
-        typedef_guard.insert(name, 1)
+        typedef_guard.own.insert(name, 1)
         return
     }
     let ok = lo_res(tc_tid_child(r, 0))
@@ -1231,7 +1269,7 @@ fn lo_is_struct_by_pointer_err(err: Int) -> Bool {
 
 // Every tuple element is by value.
 fn lo_emit_tuple_typedef(r: Int, name: Str) {
-    if typedef_guard.contains_key(name) != 0 { return }
+    if lo_guarded(name) { return }
     let n = tc_tid_child_count(r)
     let mut i = 0
     while i < n {

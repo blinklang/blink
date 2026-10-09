@@ -1,0 +1,86 @@
+import std.fs
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types}
+import layout.{ensure_typedef_for, layout_take_typedefs, layout_reset, layout_typedef_marks, layout_start_from}
+import parser.{node_count}
+import compiler.{compile_to_program}
+
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+fn main() {
+    let a: Option[Int] = Some(1)
+    let b: Option[Str] = None
+    let c: Option[Point] = None
+    assert(a.is_some() && b.is_none() && c.is_none())
+}
+"#
+}
+
+// The probe is deleted before any assertion so a red row never leaks the file.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_typedef_marks_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < node_count() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    assert(tid != -1)
+    tid
+}
+
+// A module header starts from the marks of one typedef walk instead of walking again, so a
+// typedef the walk wrote must stay written after the reset each header starts with.
+test "a typedef written before the marks is not written again after a start from them" {
+    let m = harvest_type_tids()
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Int]"))
+    assert_eq(layout_take_typedefs().len(), 1)
+    let marks = layout_typedef_marks()
+    layout_reset()
+    layout_start_from(marks)
+    assert_eq(ensure_typedef_for(expect_tid(m, "Option[Int]")), "blink_Option_int")
+    assert_eq(layout_take_typedefs().len(), 0)
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Str]"))
+    assert_eq(layout_take_typedefs().len(), 1)
+}
+
+// Text the walk queued and nobody drained is part of what it left; a start from the marks
+// queues the same text.
+test "typedef text not yet taken is carried to the start" {
+    let m = harvest_type_tids()
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Point]"))
+    let marks = layout_typedef_marks()
+    let queued = layout_take_typedefs()
+    assert(queued.len() > 0)
+    layout_reset()
+    layout_start_from(marks)
+    assert_eq(layout_take_typedefs().join("\n"), queued.join("\n"))
+}
+
+// Marks taken after a start hold the typedefs of the start and those written since.
+test "marks taken after a start hold the base and the typedefs written since" {
+    let m = harvest_type_tids()
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Int]"))
+    let _ = layout_take_typedefs()
+    let first = layout_typedef_marks()
+    layout_reset()
+    layout_start_from(first)
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Str]"))
+    let _ = layout_take_typedefs()
+    let second = layout_typedef_marks()
+    layout_reset()
+    layout_start_from(second)
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Int]"))
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Str]"))
+    assert_eq(layout_take_typedefs().len(), 0)
+}
