@@ -2672,7 +2672,16 @@ This list is the only one; other sections refer to it. `Bytes` is not on it: a `
 
 Across tasks, `async.spawn` freezes each shared cell its captures reach until the task is joined (§2.8 *Shared cells in a spawned task*), and `ch.send` copies each shared cell the sent value reaches (§4.13 *Channel operations*).
 
-Only a shared cell can change through a second name. A value of any other type, at any depth, cannot. This holds for every copy: bind, pass, return and `clone()` (§3.6.1 *Clone Semantics*).
+**Synchronized objects.** A synchronized object is a value whose state any task may use at the same time, with no freeze and no copy. The runtime makes each of its operations safe from any task. A copy of a synchronized object refers to the same state. The synchronized objects are:
+
+- `Channel[T]`: a copy names the same queue (§4.13 *Channel operations*)
+- `Handle[T]`: a copy names the same task (§4.13 *Handle[T]*)
+
+A type joins this list only if each operation on it is safe from any task, and a value it hands from one task to another stays reachable from one task only. A `Channel` copies the value at send; a `Handle` gives its result only after its task has ended. Only the queue of a `Channel` and the join state of a `Handle` are synchronized. The values they carry are not: `ch.send` copies the shared cells a value reaches, so a value in a channel's buffer was copied when it was sent, and no other name reaches it. For this reason `async.spawn` and `ch.send` need not look inside a synchronized object: the freeze does not cover it, and the send does not copy it.
+
+An effect handle name such as `io` or `db` is not on either list. It is not a value and cannot be bound, passed or sent (§3c.4 *Effect Handle Operations*). A `Handler[E]` value is a shared cell when its captures reach a `let mut` binding, as listed above.
+
+Only a shared cell or a synchronized object can change through a second name. A value of any other type, at any depth, cannot. This holds for every copy: bind, pass, return and `clone()` (§3.6.1 *Clone Semantics*).
 
 #### Mutable Parameters
 
@@ -3503,7 +3512,7 @@ For reference, the eight derivable traits and their required methods:
 - **`List`, `Map`, `Set` and other shared cells** (§3.6 *Shared cells*): the clone refers to the same cell. A change made through the clone **does** show in the original — the same as JS spread (`{...obj}`) or Python `copy.copy()`.
 - **User structs and enums**: `x.clone()` gives the same value as `let y = x`. Each field is copied by its declared type, using the rules above. A field whose declared type is a struct or enum is a value, and its copy is a value too (for example, a payload of the enum's own type, §3.4 *Recursive Types*).
 
-**A write to a place stays in its value.** A write to a place (§2.22) changes only the value that owns that place, even when that value is a copy of another value. Only a shared cell (§3.6 *Shared cells*) can change through a second name.
+**A write to a place stays in its value.** A write to a place (§2.22) changes only the value that owns that place, even when that value is a copy of another value. Only a shared cell (§3.6 *Shared cells*) or a synchronized object (§3.6 *Synchronized objects*) can change through a second name.
 
 > **Note (not normative).** Today a derived `clone()` of a struct or enum is one value copy and does not allocate.
 

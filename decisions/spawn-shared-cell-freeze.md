@@ -220,7 +220,7 @@ PLT conceded (*"aiml's point is correct, and it refutes my Phase D claim"*). Web
 Two further facts the record keeps:
 
 - The Q2 warning depends on `MutAliasOfImmutable` alias tracking. That tracking has no code in `src/` yet. Until it ships, the spec names a warning that does not fire, and `blink check` stays silent on the probe. The spec must not describe the warning as shipped.
-- Q3 relates to an open sibling question: whether a Channel or an effect handle is a shared cell. The Q3 copy rule needs Channel and effect handles to stay off the §3.6 list. If they join the list, a send would copy the channel itself and break every send/receive example. The sibling question stays open and this record does not decide it.
+- Q3 relates to an open sibling question: whether a Channel or an effect handle is a shared cell. The Q3 copy rule needs Channel and effect handles to stay off the §3.6 list. If they join the list, a send would copy the channel itself and break every send/receive example. The sibling question stays open and this record does not decide it. A later panel decided it: Channel and `Handle[T]` are synchronized objects, not shared cells ([channel-handle-synchronized-objects.md](channel-handle-synchronized-objects.md)).
 
 The Q2 check is not complete. It misses `id(a)`, `W { xs: a }` and `mut` parameters. §2.8 says so, and says that the freeze is the guarantee.
 
@@ -251,4 +251,4 @@ fn main() {
 - `warning[SpawnCaptureMutAlias]` fires on a write through a direct alias inside the spawn-to-join window. The check is not complete. The freeze is the guarantee.
 - `ch.send` copies every shared cell the value reaches, at any depth. It is the only deep copy in the language. Its cost grows with the size of the value. The rule assumes Channel and effect handles stay off the §3.6 list; that question is open and is decided elsewhere.
 - E0650 help follows Q4-a. It keeps `let snapshot = count` for scalars. It adds that binding a List does not copy it (§3.6). It tells the user to compute the value inside the task or send results through a channel. It shows `xs.slice(0, xs.len())` for a List, marked "one level only".
-- The handler state at a spawn site is not yet decided.
+- The handler state at a spawn site is not yet decided. A later panel decided it: such a handler is homed ([channel-handle-synchronized-objects.md](channel-handle-synchronized-objects.md)).
