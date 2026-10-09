@@ -858,6 +858,56 @@ builds on cli and 25 on small for each. Median wall seconds [min-max].
   threads make the gap smaller, but the bisect above shows that `799b05b3`
   is still slower than before.
 
+The cause is in when the GC collects. Each check leaves its whole working
+set as garbage, and every build child is a fork of the worker heap, so the
+child pays for the garbage it carries (page tables, and a bigger heap for
+its own GC). Before the split, the second check of the worker collected
+twice and the heap stayed at 7.7 MB. After the split, the allocations before
+the first check differ a little, and the GC grew the heap in the second check
+in place of a collection, so each fork carried about 7 MB more: forks at
+14.4, 22.8, 31.2 and 39.6 MB, against 7.7, 15.6, 24.0 and 32.4 before. The
+build child's RSS was 56 MB against 39, with no more page faults and no lost
+huge pages. A build child forked straight from the router, without the
+worker fork or the turn, was as slow as the split, and a worker without the
+marker restart was too, so the depth of the fork and the markers are not the
+cause.
+
+The worker now calls `GC_gcollect` at the end of each check, so each fork
+carries the live check and no garbage. On the small target the collection
+takes under 1 ms, and the check 13-15 ms as before. A worker that starts by
+exec of the same binary, with a fresh heap, would not help: it does the same
+checks and leaves the same garbage.
+
+Five runs back to back, 11 reps, under `blink-gates.slice`: base is the gen1
+`blink` built from `27b9888e` (sha256 `3338425dccf667b8`), split from
+`2ff0322f` (`608aa9a78b7b7a2d`), and fix from `29bc8bd0`
+(`99a0e35b4ba94c2e`), in the order base, split, fix, base, fix. Median wall
+seconds. `bench/edit_loop/daemon_worker_gc_after_check_run<n>_<sha>.tsv`
+holds the rows.
+
+| target | case | base | base | split | fix | fix |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.190 | 0.184 | 0.183 | 0.187 | 0.192 |
+| cli | body-cname | 0.561 | 0.570 | 0.566 | 0.557 | 0.562 |
+| cli | body-typecheck | 2.914 | 2.943 | 2.924 | 2.931 | 2.934 |
+| cli | pubfn-cname | 1.705 | 1.769 | 1.687 | 1.713 | 1.694 |
+| cli | run-body-cname | 0.591 | 0.608 | 0.665 | 0.593 | 0.592 |
+| cli | test-body-cname | 0.486 | 0.484 | 0.480 | 0.486 | 0.480 |
+| cli | cold-obj | 3.565 | 3.433 | 3.501 | 3.426 | 3.427 |
+| cli | cold-all | 6.066 | 6.070 | 6.072 | 6.096 | 6.054 |
+| small | nochange | 0.073 | 0.072 | 0.074 | 0.074 | 0.074 |
+| small | body-inventory | 0.131 | 0.130 | 0.131 | 0.128 | 0.127 |
+| small | pubfn-model | 0.132 | 0.132 | 0.137 | 0.127 | 0.127 |
+| small | run-body-inventory | 0.131 | 0.132 | 0.137 | 0.127 | 0.127 |
+| small | test-body-inventory | 0.138 | 0.138 | 0.139 | 0.138 | 0.139 |
+| small | cold-obj | 0.130 | 0.131 | 0.137 | 0.126 | 0.127 |
+
+- No fix row is slower than base beyond the spread of base. The small rows
+  after an edit are 3-5 ms faster than base, except test-body-inventory,
+  which does not change.
+- In the first fix run, one rep of small nochange took 1.012 s. The second
+  fix run did not repeat it (max 0.075).
+
 ### Unit headers from one walk
 
 Before each module header pair, the build wrote every typedef of the
