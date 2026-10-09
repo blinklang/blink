@@ -2,7 +2,13 @@
 # Compile and run ONE tests/test_*.bl file in its own sandbox and write a
 # one-line JSON record for it. scripts/corpus.sh drives this in parallel.
 #
-#   scripts/corpus_one.sh <test file> <compiler dir> <results dir>
+#   scripts/corpus_one.sh <test file> <compiler dir> <results dir> [pm]
+#
+# pm builds this row on the per-module path whatever mode the sweep runs in:
+# BLINK_PER_MODULE=1 for the row's build and every build its test starts
+# through the CLI, no compiler archive, and BLINK_JOBS from
+# CORPUS_PM_BLINK_JOBS. Its sandbox, logs and record are keyed <base>.pm, so
+# the same file can also run as an ordinary row of the same sweep.
 #
 # <compiler dir> holds `blink`, `blinkc`, `libblink_std.a`, `libblink_std.h`
 # (build/gen0 has them as symlinks into its installed layout; a flat build/
@@ -57,11 +63,13 @@
 #                         a build that imports the modules it holds links it
 #   BLINK_PER_MODULE      1 in the per-module mode, for the row's build and
 #                         every build its test starts through the CLI
+#   CORPUS_PM_BLINK_JOBS  BLINK_JOBS for a pm row
 set -u
 
 file="$1"
 comp_dir="$2"
 results_dir="$3"
+mode="${4:-}"
 
 cd "$(dirname "$0")/.." || exit 2
 root="$(pwd)"
@@ -70,12 +78,27 @@ case "$root" in *[[:space:]]*) echo "corpus_one: root path has whitespace: $root
 comp_dir="$(cd "$comp_dir" && pwd)"
 results_dir="$(mkdir -p "$results_dir" && cd "$results_dir" && pwd)"
 base="$(basename "$file" .bl)"
+key="$base"
+case "$mode" in
+    "") ;;
+    pm)
+        key="$base.pm"
+        export BLINK_PER_MODULE=1
+        unset BLINK_COMPILER_ARCHIVE
+        [ -n "${CORPUS_PM_BLINK_JOBS:-}" ] && export BLINK_JOBS="$CORPUS_PM_BLINK_JOBS"
+        ;;
+    *) echo "corpus_one: unknown mode $mode" >&2; exit 2 ;;
+esac
 build_timeout="${CORPUS_BUILD_TIMEOUT:-900}"
 run_timeout="${CORPUS_RUN_TIMEOUT:-600}"
 
-work="$root/build/corpus/work/$base"
+work="$root/build/corpus/work/$key"
 log_dir="$root/build/corpus/logs"
-mkdir -p "$log_dir"
+mkdir -p "$log_dir" "$root/build/corpus/locks"
+# A few tests write fixed paths outside their sandbox, under /tmp, so the two
+# rows of one file must not run at once.
+exec 9> "$root/build/corpus/locks/$base.lock"
+flock 9
 rm -rf "$work"
 mkdir -p "$work/build" "$work/.tmp"
 # corpus.sh builds each vendored native object once per sweep. The build skips
@@ -135,8 +158,8 @@ if [ ! -x "$ccdir/cc" ]; then
     echo "corpus_one: no $ccdir/cc; scripts/corpus.sh makes it" >&2
     exit 2
 fi
-build_log="$log_dir/$base.build.log"
-run_log="$log_dir/$base.run.log"
+build_log="$log_dir/$key.build.log"
+run_log="$log_dir/$key.run.log"
 : > "$run_log"
 
 has_tests=0
@@ -216,7 +239,7 @@ if [ "$status" = pass ]; then
         # A fresh .tmp, so a test that creates a scratch file and asserts it
         # is new behaves as it did on the first run.
         rm -rf "$work/.tmp" && mkdir -p "$work/.tmp"
-        report="$log_dir/$base.report.json"
+        report="$log_dir/$key.report.json"
         (
             cd "$work" || exit 2
             unset BLINK_ROOT BLINK_BIN
@@ -238,7 +261,7 @@ first_error=$(printf '%s' "$first_error" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-3
 
 printf '{"file":%s,"status":"%s","seconds":%s,"first_error_line":%s,"known_failures":%s,"compiler_archive":%s,"per_module":%s}\n' \
     "$(json_str "$file")" "$status" "$seconds" "$(json_str "$first_error")" "$known" "$compiler_archive" "$per_module" \
-    > "$results_dir/$base.json"
+    > "$results_dir/$key.json"
 
 # Keep the sandbox small: the binary and C file can be large.
 rm -rf "$work/build/$base" "$work/build/$base.c" "$work/build/$base.units" "$work/build/obj-cache"
