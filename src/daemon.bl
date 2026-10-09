@@ -6,7 +6,7 @@ import std.path.{path_join, path_dirname}
 import lexer.{Lex}
 import parser.{Parse, parser_want_interface_text}
 import typecheck.{TypeCheck}
-import check_pipeline.{FrontEndReport, check_source_reporting, checked_inputs_changed, checked_inputs_reset, check_exit_code, check_status_line}
+import check_pipeline.{FrontEndReport, check_source_reporting, checked_inputs_changed, checked_inputs_reset, checked_probes_changed, checked_input_files, check_exit_code, check_status_line}
 
 effect Daemon {
     effect Serve
@@ -60,6 +60,9 @@ type DaemonCheck {
     out: Str
     err: Str
     captured: Bool
+    // The mtime and size of each file the check read, from just after it. The poll compares
+    // bytes only once one of them moves. Empty when an edit landed during the check.
+    stats: List[Int]
 }
 
 // The last check, which holds until an input changes.
@@ -91,6 +94,10 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
     let captured = restore_output(saved)
     let out = if captured { read_file(out_path) } else { "" }
     let err = if captured { read_file(err_path) } else { "" }
+    // An edit after the loader read a file and before this stat leaves no stat change for a
+    // poll to see. The bytes show it, so one compare here closes that gap.
+    let taken = daemon_input_stats()
+    let stats = if checked_inputs_changed(daemon_source_path) { [] } else { taken }
     si_reset()
     si_build(program, daemon_source_path, "main")
     DaemonCheck {
@@ -104,7 +111,32 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
         out: out,
         err: err,
         captured: captured,
+        stats: stats,
     }
+}
+
+// The mtime and size of each file the last check read, -1 for one it can not stat or open.
+// A same-size edit inside one mtime tick, or one whose mtime was set back, leaves these as
+// they were, so they only tell the poll when to compare bytes. A build compares bytes itself.
+fn daemon_input_stats() -> List[Int] ! IO {
+    let mut stats: List[Int] = []
+    for p in checked_input_files() {
+        stats.push(file_mtime(p))
+        stats.push(daemon_file_size(p))
+    }
+    stats
+}
+
+fn daemon_file_size(path: Str) -> Int ! IO {
+    let mut size = -1
+    with ffi.scope() as scope {
+        let file = daemon_open(scope.cstr(path), 0.to_i32()).to_int()
+        if file >= 0 {
+            size = daemon_lseek(file.to_i32(), 0, 2.to_i32())
+            unix_socket_close(file)
+        }
+    }
+    size
 }
 
 fn daemon_not_served(why: Str) -> Str {
@@ -168,8 +200,12 @@ fn daemon_fork() -> I32 ! FFI {}
 fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
 
 @ffi("open", header: "fcntl.h")
-@trusted(audit: "Wraps open(2) with no mode. path is a NUL-terminated copy from ffi.scope(); flags is fixed to O_WRONLY.")
+@trusted(audit: "Wraps open(2) with no mode. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY or O_WRONLY, 0 and 1 on every host.")
 fn daemon_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+
+@ffi("lseek", header: "unistd.h")
+@trusted(audit: "Wraps lseek(2). fd is one daemon_open returned; whence is fixed to SEEK_END, 2 on every host.")
+fn daemon_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FFI {}
 
 @ffi("dup", header: "unistd.h")
 @trusted(audit: "Wraps dup(2). fd is 1 or 2, which the daemon holds open.")
@@ -391,14 +427,26 @@ fn daemon_handle_stop() -> Str {
 
 // While no client asks, the daemon rechecks a program whose inputs changed, so the build or
 // check after an edit finds the check done. Each time the accept waits out, an unchanged
-// program costs the daemon what a check that finds no change costs.
+// program costs a stat of each input and each probed path; only a moved stat or probe costs
+// a byte compare. A missed edit costs a recheck at the next request, never a stale answer:
+// a check or build compares bytes before it uses the last check.
 fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     // The loader exits on a missing entry file, which would take the daemon down with it.
     if daemon_last.is_none() || file_exists(daemon_source_path) != 1 {
         return
     }
+    let mut c = daemon_last.unwrap()
+    // Taken before the compare, so an edit after it moves a stat for the next poll.
+    let stats = daemon_input_stats()
+    if stats == c.stats && !checked_probes_changed() {
+        return
+    }
     if checked_inputs_changed(daemon_source_path) {
         daemon_last = Some(daemon_check_program())
+    } else {
+        // A touch, or an edit undone: the next poll needs no compare.
+        c.stats = stats
+        daemon_last = Some(c)
     }
 }
 
