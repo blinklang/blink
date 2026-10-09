@@ -742,6 +742,7 @@ type DaemonRoute {
     max: Int
     home_cwd: Str
     home_path: Str
+    root: Str
     retired_checks: Int
     retired_builds: Int
     stops: List[Int]
@@ -933,6 +934,13 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
         path = json_as_str(json_get(root, "path"))
     }
     let key = daemon_entry_key(cwd, path)
+    // A file outside the project root may belong to another project, with a blink.toml of its
+    // own, so the daemon leaves it to a cold check or build.
+    // The entry the daemon started on is served wherever it lies.
+    let home = key == daemon_entry_key(r.home_cwd, r.home_path)
+    if !home && !key.starts_with(r.root.concat("/")) {
+        return (r, RouteTurn.Answer(daemon_not_served("outside the project at {r.root}: {path}")))
+    }
     r.seq = r.seq + 1
     let mut found = ""
     let mut kept: List[DaemonEntry] = []
@@ -952,7 +960,6 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
     if file_exists(key) != 1 {
         return (r, RouteTurn.Answer(daemon_not_served("source file not found: {path}")))
     }
-    let home = key == daemon_entry_key(r.home_cwd, r.home_path)
     if !home {
         r = daemon_make_room(r)
     }
@@ -1064,7 +1071,7 @@ fn daemon_route_stop(route: DaemonRoute, client_fd: Int) -> DaemonRoute {
 // While a stop waits on its workers and relays, or a worker it ended has yet to be reaped,
 // the accept waits 1 ms at most, so the stop ends as soon as the last of them does.
 fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
-    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, retired_checks: 0, retired_builds: 0, stops: [], held: [], relays: [] }
+    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, stops: [], held: [], relays: [] }
     // The home worker checks the entry at once, so the first request finds it checked.
     let home_key = daemon_entry_key(r.home_cwd, r.home_path)
     let (first, home, why) = daemon_spawn(r, home_key, r.home_cwd, r.home_path, true, -1)
