@@ -619,7 +619,7 @@ The output is NDJSON: one complete JSON object per line. Each line has a `record
 ```json
 {"record": "test", "file": "tests/test_auth.bl", "name": "login succeeds with valid credentials", "status": "passed", "duration_ms": 12}
 {"record": "test", "file": "tests/test_db.bl", "name": "connect and query", "status": "failed", "cause": "propagated_error", "error": {"message": "connection refused: 127.0.0.1:5432", "error_type": "pg.ConnectError"}, "span": {"file": "tests/test_db.bl", "line": 12, "col": 21}}
-{"record": "test", "file": "tests/test_auth.bl", "name": "login rejects after rate limit", "status": "failed", "cause": "assertion", "assertion": "assert_eq(result, Err(RateLimit))", "expected": "Err(RateLimit)", "actual": "Ok(AuthSuccess { ... })", "span": {"file": "src/auth.bl", "line": 58, "col": 5}}
+{"record": "test", "file": "tests/test_auth.bl", "name": "login rejects after rate limit", "status": "failed", "cause": "assertion", "assertion": "assert_eq(result, Err(RateLimit))", "expected": "Err(RateLimit)", "actual": "Ok(AuthSuccess { ... })", "introspection": [], "omitted": [], "span": {"file": "src/auth.bl", "line": 58, "col": 5}}
 {"record": "test", "file": "tests/test_auth.bl", "name": "session token decodes", "status": "panicked", "message": "unwrap called on None", "span": {"file": "src/auth.bl", "line": 91, "col": 17}}
 {"record": "file", "file": "tests/test_db.bl", "outcome": "ran", "summary": {"total": 1, "passed": 0, "failed": 1, "panicked": 0, "skipped": 0, "duration_ms": 31}}
 {"record": "file", "file": "tests/test_auth.bl", "outcome": "ran", "summary": {"total": 3, "passed": 1, "failed": 1, "panicked": 1, "skipped": 0, "duration_ms": 340}}
@@ -639,7 +639,7 @@ The AI reads structured test failures the same way it reads structured compiler 
 
 | `cause` value | Meaning |
 |--------------|---------|
-| `"assertion"` | An `assert*` built-in failed. The record carries `assertion`, `expected`/`actual`, and `introspection` fields (§2.20 Assertion Failure Output). |
+| `"assertion"` | An `assert*` built-in failed. The record carries `assertion`, `expected`/`actual`, `introspection` and `omitted` fields (§2.20 Assertion Failure Output, *Sub-expression Values*). On the record for a failed `assert*` call, `introspection` and `omitted` are always present, `[]` when empty. |
 | `"propagated_error"` | The test body — **or a `prop_check` property closure** (§2.20 Error Propagation, Property-Based Testing) — returned `Err(TestError { ... })` via `?` propagation. The record carries an `error` object with `message` (the `Display`-rendered error string) and `error_type` (the static name of the source error type at the `?` site). When the failure comes from a property closure, the record *additionally* carries the property failure fields (`seed`, `shrunk_input`, `reproduce`); the `cause` axis (assertion vs propagated error) is orthogonal to whether the test is a property, so no new `cause` value is added. |
 
 `"status": "panicked"` and `"status": "skipped"` records have no `cause` field — the status itself identifies the path. The four top-level statuses (`passed | failed | panicked | skipped`) remain unchanged.
@@ -1154,6 +1154,8 @@ NDJSON form (`blink test --json`):
  "seed": "0xDEADBEEFCAFE1234",
  "shrunk_input": "[1, 2, 2, -9]",
  "reproduce": "blink test --seed 0xDEADBEEFCAFE1234 --filter 'reverse is involutive'",
+ "introspection": [],
+ "omitted": [],
  "span": {"file": "tests/test_parser.bl", "line": 42, "col": 3}}
 ```
 
