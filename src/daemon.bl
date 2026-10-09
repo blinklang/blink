@@ -6,6 +6,7 @@ import std.path.{path_join, path_dirname}
 import lexer.{Lex}
 import parser.{Parse, parser_want_interface_text}
 import typecheck.{TypeCheck}
+import std.libc.{Pollfd, poll}
 import check_pipeline.{FrontEndReport, check_source_reporting, checked_inputs_changed, checked_inputs_reset, checked_probes_changed, checked_input_files, check_exit_code, check_status_line}
 
 effect Daemon {
@@ -23,7 +24,9 @@ effect Daemon {
 // dispatch (check/build/query/status/stop), respond, check file watcher.
 // A check runs check_pipeline.check_source, the check `blink check` runs.
 // A build runs in a child the worker forks, which builds from the program the last check
-// holds, and the loop serves on while the child runs.
+// holds, and the loop serves on while the child runs. Builds of two entries can write the
+// same files (one -o, units dir or obj cache), so a worker builds only while it holds the
+// router's one build turn.
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -51,9 +54,14 @@ type DaemonOrigin {
     // print to. In the router, 0 and "".
     router: Int
     files: Str
+    // In a worker: its end of the connection the router opened to it before the fork, on which
+    // it asks for the build turn and gives it back. The worker never reads from it, so the
+    // router, which asks a worker for its status and waits for the reply, never waits on a
+    // worker that waits on the router. In the router, -1.
+    chan: Int
 }
 
-let mut daemon_origin: DaemonOrigin = DaemonOrigin { cwd: "", identity: "", settings: "", interface_text: false, builds: 0, router: 0, files: "" }
+let mut daemon_origin: DaemonOrigin = DaemonOrigin { cwd: "", identity: "", settings: "", interface_text: false, builds: 0, router: 0, files: "", chan: -1 }
 
 // The findings of a check, rendered both ways a client can ask for, since the diagnostics
 // themselves do not outlive the next check.
@@ -97,15 +105,18 @@ type DaemonHeld {
 }
 
 // What the loop holds about builds. child is the one it forked and has not reaped. Two builds
-// of one entry write the same units dir and program, and a client sent to build cold would
-// write them beside the child, so a build that comes while a child runs waits in queue, oldest
-// first, for its turn. stops came while a child ran; the daemon answers them and ends once the
-// child does. seq numbers each build's files, so no reply reads another build's output.
+// can write the same units dir and program, and a client sent to build cold would write them
+// beside the child, so a build waits in queue, oldest first, until the worker holds the
+// router's build turn and has no child. turn is 0 while the worker neither holds nor asked for
+// it, 1 once it asked, 2 while it holds it. A turn runs one build, so the entries take turns.
+// stops came while a child ran; the daemon answers them and ends once the child does. seq
+// numbers each build's files, so no reply reads another build's output.
 type DaemonBuilds {
     child: Option[DaemonChild]
     queue: List[DaemonHeld]
     stops: List[Int]
     seq: Int
+    turn: Int
 }
 
 // ── Extract request type ────────────────────────────────────────────
@@ -472,6 +483,8 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
         }
         unix_socket_close(daemon_socket_fd)
         daemon_socket_fd = -1
+        if daemon_origin.chan >= 0 { unix_socket_close(daemon_origin.chan) }
+        daemon_origin = DaemonOrigin { chan: -1, ..daemon_origin }
         daemon_running = 0
         if !redirect_to(out_path, 1) || !redirect_to(err_path, 2) {
             write_file(declined, "")
@@ -519,22 +532,45 @@ fn daemon_start_build(builds: DaemonBuilds, request: Str, client_fd: Int) -> (Da
     }
 }
 
-// Once the build child ends: a stop that came meanwhile sends each held build to build cold,
-// now that nothing else writes its files, answers the stop and ends the loop; else the oldest
-// held build runs. Returns the build to run in a child forked for one.
-fn daemon_after_child(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
-    let mut b = builds
-    if b.stops.len() > 0 {
-        for h in b.queue {
-            daemon_reply(h.client_fd, daemon_not_served("the daemon is stopping"))
-        }
-        for s in b.stops {
-            let text = daemon_handle_stop()
-            // -1 stands for the router, which ended without asking.
-            if s >= 0 { daemon_reply(s, text) }
-        }
-        return (DaemonBuilds { queue: [], stops: [], ..b }, None)
+// Sends the router one line on the worker's connection to it. False once the router is gone.
+fn daemon_tell_router(text: Str) -> Bool {
+    daemon_origin.chan >= 0 && socket_write(daemon_origin.chan, text.concat("\n")) >= 0
+}
+
+// Sends each held build to build cold, with why.
+fn daemon_send_cold(builds: DaemonBuilds, why: Str) -> DaemonBuilds {
+    for h in builds.queue {
+        daemon_reply(h.client_fd, daemon_not_served(why))
     }
+    DaemonBuilds { queue: [], ..builds }
+}
+
+// Asks the router for the build turn for the held builds, unless the worker holds it, has
+// asked, or has a child whose end gives it back.
+fn daemon_ask_turn(builds: DaemonBuilds) -> DaemonBuilds {
+    if builds.turn != 0 || builds.child.is_some() || builds.queue.len() == 0 {
+        return builds
+    }
+    if !daemon_tell_router("\{\"type\":\"turn\"}") {
+        return daemon_send_cold(builds, "the daemon could not ask its router for the build turn")
+    }
+    DaemonBuilds { turn: 1, ..builds }
+}
+
+// Gives the turn back, and asks again when builds still wait.
+fn daemon_end_turn(builds: DaemonBuilds) -> DaemonBuilds {
+    let more = if builds.queue.len() > 0 { 1 } else { 0 }
+    if !daemon_tell_router("\{\"type\":\"done\",\"more\":{more}}") {
+        return daemon_send_cold(DaemonBuilds { turn: 0, ..builds }, "the daemon could not ask its router for the build turn")
+    }
+    DaemonBuilds { turn: more, ..builds }
+}
+
+// The router gave the worker the turn: the oldest held build runs. A build the worker answers
+// at once does not hold the turn, so the next one runs, and the turn goes back once none is
+// left. Returns the build to run in a child forked for one.
+fn daemon_take_turn(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    let mut b = DaemonBuilds { turn: 2, ..builds }
     while b.child.is_none() && b.queue.len() > 0 {
         let h = b.queue.get(0).unwrap()
         b.queue = b.queue.slice(1, b.queue.len())
@@ -548,7 +584,28 @@ fn daemon_after_child(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild
             None => {}
         }
     }
+    if b.child.is_none() {
+        b = daemon_end_turn(b)
+    }
     (b, None)
+}
+
+// Once the build child ends: a stop that came meanwhile sends each held build to build cold,
+// now that nothing else writes its files, answers the stop and ends the loop; else the turn
+// goes back to the router, which gives it to the entry that asked first.
+fn daemon_after_child(builds: DaemonBuilds) -> DaemonBuilds {
+    let mut b = builds
+    if b.stops.len() > 0 {
+        b = daemon_send_cold(b, "the daemon is stopping")
+        for s in b.stops {
+            let text = daemon_handle_stop()
+            // -1 stands for the router, which ended without asking.
+            if s >= 0 { daemon_reply(s, text) }
+        }
+        let _ = daemon_tell_router("\{\"type\":\"done\",\"more\":0}")
+        return DaemonBuilds { stops: [], turn: 0, ..b }
+    }
+    daemon_end_turn(b)
 }
 
 // ── Handle: query ───────────────────────────────────────────────────
@@ -613,7 +670,7 @@ fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck
 // that, plus the one request being served then, past the child's end. The runtime has no wait
 // on both the socket and the child.
 fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
-    let mut builds = DaemonBuilds { child: None, queue: [], stops: [], seq: 0 }
+    let mut builds = DaemonBuilds { child: None, queue: [], stops: [], seq: 0, turn: 0 }
     while daemon_running == 1 {
         // A worker whose router is gone serves no one, as no client finds its socket: it ends
         // as on a stop, after its build child, if one runs.
@@ -632,11 +689,7 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
                 if status != -2 {
                     daemon_end_child(child, status)
                     builds.child = None
-                    let (next, build) = daemon_after_child(builds)
-                    builds = next
-                    if build.is_some() {
-                        return build
-                    }
+                    builds = daemon_after_child(builds)
                     if daemon_running != 1 {
                         break
                     }
@@ -664,19 +717,17 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
         if req_type == "check" {
             response = daemon_handle_check(request)
         } else if req_type == "build" {
-            if builds.child.is_some() {
-                builds.queue.push(DaemonHeld { request: request, client_fd: client_fd })
-                held = true
-            } else {
-                let (next, reply, build) = daemon_start_build(builds, request, client_fd)
-                builds = next
-                if build.is_some() {
-                    return build
-                }
-                match reply {
-                    Some(text) => response = text
-                    None => held = true
-                }
+            builds.queue.push(DaemonHeld { request: request, client_fd: client_fd })
+            held = true
+            builds = daemon_ask_turn(builds)
+        } else if req_type == "turn" {
+            // The router's grant; it waits for no reply.
+            unix_socket_close(client_fd)
+            held = true
+            let (next, build) = daemon_take_turn(builds)
+            builds = next
+            if build.is_some() {
+                return build
             }
         } else if req_type == "query" {
             response = daemon_handle_query(request)
@@ -689,6 +740,9 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
                 builds.stops.push(client_fd)
                 held = true
             } else {
+                // The router stops a worker whose builds wait for the turn only once no build
+                // of the daemon runs.
+                builds = daemon_send_cold(builds, "the daemon is stopping")
                 response = daemon_handle_stop()
             }
         } else {
@@ -708,7 +762,8 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
 // client last named it, in requests routed. name is the directory under .blink/ that holds
 // its socket and files. The home worker serves the entry the daemon started on, which a
 // query reads, so the router never ends it to make room. stop_fd is the connection a stop
-// went to the worker on, open until the router reaps it, else -1.
+// went to the worker on, open until the router reaps it, else -1. chan is the router's end of
+// the connection on which the worker asks for the build turn, -1 once the worker closed it.
 type DaemonEntry {
     name: Str
     key: Str
@@ -716,6 +771,7 @@ type DaemonEntry {
     home: Bool
     used: Int
     stop_fd: Int
+    chan: Int
 }
 
 // What a worker the router forks starts on: its name, the entry spelled as the client
@@ -727,12 +783,15 @@ type DaemonSpawn {
     files: Str
     fd: Int
     router: Int
+    chan: Int
 }
 
 // What the router holds. entries are the workers that serve; ended are those it stopped to
 // make room, whose counts it holds in retired_*, until it reaps them. stops are the clients
 // of a stop, held until every worker ends, and held the builds that came meanwhile, which then
-// go to build cold, once no build of the daemon writes beside them.
+// go to build cold, once no build of the daemon writes beside them. turn names the worker
+// that holds the build turn, or is "", and waiting the workers that asked for it, oldest
+// first. told names the workers a stop went to.
 type DaemonRoute {
     entries: List[DaemonEntry]
     ended: List[DaemonEntry]
@@ -746,6 +805,9 @@ type DaemonRoute {
     retired_builds: Int
     stops: List[Int]
     held: List[Int]
+    turn: Str
+    waiting: List[Str]
+    told: List[Str]
 }
 
 // What routing a request leaves the router with: the reply to send, the worker to send the
@@ -791,7 +853,9 @@ fn daemon_ask_worker(name: Str, request: Str) -> Str {
 
 // Forks a worker for the entry at key, as path from cwd. Its socket listens before the fork,
 // so a client the router sends there waits for the worker's first check rather than finding
-// no socket. In the worker, the router's own connections are closed. The worker's directory
+// no socket. The router connects to that socket before the fork too, so the worker's first
+// accept is the router's connection, and neither ever waits to connect to the other. In the
+// worker, the router's own connections are closed. The worker's directory
 // is named for the router's pid too: a worker of a daemon killed before ends only once it sees
 // its router is gone, and then removes its directory, which must not be this daemon's.
 fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, client_fd: Int) -> (DaemonRoute, Option[DaemonSpawn], Str) ! IO {
@@ -802,7 +866,9 @@ fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, c
     let dir = path_join(daemon_dir(), name)
     shell_exec("mkdir -p {dir}")
     let fd = unix_socket_listen(path_join(dir, "daemon.sock"))
-    if fd < 0 {
+    let chan = if fd >= 0 { unix_socket_connect(path_join(dir, "daemon.sock")) } else { -1 }
+    if chan < 0 {
+        if fd >= 0 { unix_socket_close(fd) }
         shell_exec("rm -rf {dir}")
         return (r, None, "the daemon could not make a socket for {path}")
     }
@@ -811,18 +877,21 @@ fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, c
     let pid = daemon_fork().to_int()
     if pid < 0 {
         unix_socket_close(fd)
+        unix_socket_close(chan)
         shell_exec("rm -rf {dir}")
         return (r, None, "the daemon could not fork a worker for {path}")
     }
     if pid == 0 {
         daemon_gc_start_markers()
         daemon_close_router_fds(r)
+        unix_socket_close(chan)
+        let worker_chan = unix_socket_accept(fd)
         if client_fd >= 0 { unix_socket_close(client_fd) }
         let files = if dir.starts_with("/") { dir } else { path_join(env.cwd(), dir) }
-        return (r, Some(DaemonSpawn { name: name, cwd: cwd, path: path, files: files, fd: fd, router: router }), "")
+        return (r, Some(DaemonSpawn { name: name, cwd: cwd, path: path, files: files, fd: fd, router: router, chan: worker_chan }), "")
     }
     unix_socket_close(fd)
-    r.entries.push(DaemonEntry { name: name, key: key, pid: pid, home: home, used: r.seq, stop_fd: -1 })
+    r.entries.push(DaemonEntry { name: name, key: key, pid: pid, home: home, used: r.seq, stop_fd: -1, chan: chan })
     (r, None, "")
 }
 
@@ -834,9 +903,11 @@ fn daemon_close_router_fds(r: DaemonRoute) {
     for h in r.held { unix_socket_close(h) }
     for e in r.entries {
         if e.stop_fd >= 0 { unix_socket_close(e.stop_fd) }
+        if e.chan >= 0 { unix_socket_close(e.chan) }
     }
     for e in r.ended {
         if e.stop_fd >= 0 { unix_socket_close(e.stop_fd) }
+        if e.chan >= 0 { unix_socket_close(e.chan) }
     }
 }
 
@@ -988,15 +1059,18 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
     "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{symbols},\"files\":{files},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"entries\":{entries},\"builds\":{served},\"checks\":{checks}}"
 }
 
-// Reaps each worker that ended, and removes its files.
+// Reaps each worker that ended, and removes its files. A worker that ended holds the build
+// turn no more, nor waits for it.
 fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
     let mut r = route
+    let mut gone: List[Str] = []
     let mut live: List[DaemonEntry] = []
     for e in r.entries {
         if reap(e.pid) == -2 {
             live.push(e)
         } else {
             daemon_forget_worker(e)
+            gone.push(e.name)
         }
     }
     r.entries = live
@@ -1006,30 +1080,170 @@ fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
             ending.push(e)
         } else {
             daemon_forget_worker(e)
+            gone.push(e.name)
         }
     }
     r.ended = ending
-    r
+    if gone.len() == 0 {
+        return r
+    }
+    r.waiting = r.waiting.filter(fn(w) { !gone.contains(w) })
+    if gone.contains(r.turn) {
+        r.turn = ""
+    }
+    daemon_grant_turn(r)
 }
 
 fn daemon_forget_worker(e: DaemonEntry) ! IO {
     if e.stop_fd >= 0 {
         unix_socket_close(e.stop_fd)
     }
+    if e.chan >= 0 {
+        unix_socket_close(e.chan)
+    }
     shell_exec("rm -rf {path_join(daemon_dir(), e.name)}")
 }
 
-// Sends each worker a stop. A worker ends at once, or once its build child does. The router
-// replies to the stop once it has reaped them all.
+// Gives the free build turn to the worker that asked first. A worker the grant does not reach
+// is gone, and the next one gets it. While a stop waits, no build starts, and once the turn
+// is free the stop goes to every worker.
+fn daemon_grant_turn(route: DaemonRoute) -> DaemonRoute {
+    let mut r = route
+    if r.turn != "" {
+        return r
+    }
+    if r.stops.len() > 0 {
+        return daemon_stop_workers(r)
+    }
+    while r.turn == "" && r.waiting.len() > 0 {
+        let name = r.waiting.get(0).unwrap()
+        r.waiting = r.waiting.slice(1, r.waiting.len())
+        let fd = unix_socket_connect(path_join(daemon_dir(), "{name}/daemon.sock"))
+        if fd < 0 {
+            continue
+        }
+        if socket_write(fd, "\{\"type\":\"turn\"}\n") >= 0 {
+            r.turn = name
+        }
+        unix_socket_close(fd)
+    }
+    r
+}
+
+// A line a worker sent on its connection to the router: it asks for the build turn, or gives
+// it back, with more 1 when it has more builds to run.
+fn daemon_route_turn(route: DaemonRoute, name: Str, line: Str) -> DaemonRoute {
+    let mut r = route
+    json_clear()
+    let root = json_parse(line)
+    if root < 0 {
+        return r
+    }
+    let kind = json_as_str(json_get(root, "type"))
+    let ask = kind == "turn" || (kind == "done" && json_as_int(json_get(root, "more")) == 1)
+    if kind == "done" && r.turn == name {
+        r.turn = ""
+    }
+    if ask && r.turn != name && !r.waiting.contains(name) {
+        r.waiting.push(name)
+    }
+    daemon_grant_turn(r)
+}
+
+// Reads what each worker sent on its connection to the router, as polled. A worker that closed
+// it is gone or going, and its reap frees what it held.
+fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute {
+    let mut r = route
+    let mut names: List[Str] = []
+    let mut lines: List[Str] = []
+    let mut kept: List[DaemonEntry] = []
+    for e in r.entries {
+        if e.chan >= 0 && ready.contains(e.chan) {
+            let line = socket_read_line(e.chan)
+            if line == "" {
+                unix_socket_close(e.chan)
+                kept.push(DaemonEntry { chan: -1, ..e })
+                continue
+            }
+            names.push(e.name)
+            lines.push(line)
+        }
+        kept.push(e)
+    }
+    r.entries = kept
+    let mut ending: List[DaemonEntry] = []
+    for e in r.ended {
+        if e.chan >= 0 && ready.contains(e.chan) {
+            let line = socket_read_line(e.chan)
+            if line == "" {
+                unix_socket_close(e.chan)
+                ending.push(DaemonEntry { chan: -1, ..e })
+                continue
+            }
+            names.push(e.name)
+            lines.push(line)
+        }
+        ending.push(e)
+    }
+    r.ended = ending
+    let mut i = 0
+    while i < names.len() {
+        r = daemon_route_turn(r, names.get(i).unwrap(), lines.get(i).unwrap())
+        i = i + 1
+    }
+    r
+}
+
+// Waits up to wait ms for a client or a line from a worker, reads the lines, and returns the
+// client's connection, or -1.
+fn daemon_route_wait(route: DaemonRoute, wait: Int) -> (DaemonRoute, Int) ! IO {
+    let mut fds: List[Pollfd] = [Pollfd { fd: daemon_socket_fd.to_i32(), events: 1.to_i16(), revents: 0.to_i16() }]
+    for e in route.entries {
+        if e.chan >= 0 { fds.push(Pollfd { fd: e.chan.to_i32(), events: 1.to_i16(), revents: 0.to_i16() }) }
+    }
+    for e in route.ended {
+        if e.chan >= 0 { fds.push(Pollfd { fd: e.chan.to_i32(), events: 1.to_i16(), revents: 0.to_i16() }) }
+    }
+    let polled = match poll(fds, wait) {
+        Ok(out) => out
+        // An interrupted poll reports nothing ready; the loop polls again.
+        Err(_) => return (route, -1)
+    }
+    let mut ready: List[Int] = []
+    let mut i = 1
+    while i < polled.len() {
+        let p = polled.get(i).unwrap()
+        if p.revents.to_int() != 0 { ready.push(p.fd.to_int()) }
+        i = i + 1
+    }
+    let r = if ready.len() > 0 { daemon_read_chans(route, ready) } else { route }
+    if polled.get(0).unwrap().revents.to_int() == 0 {
+        return (r, -1)
+    }
+    (r, unix_socket_accept_timeout(daemon_socket_fd, 0))
+}
+
+// Holds the stop and sends it to the workers. The router replies to it once it has reaped
+// them all.
 fn daemon_route_stop(route: DaemonRoute, client_fd: Int) -> DaemonRoute {
     let mut r = route
     r.stops.push(client_fd)
+    daemon_stop_workers(r)
+}
+
+// Sends a stop to each worker it has not gone to. A worker ends at once, or once its build
+// child does. A worker sends the builds it holds to build cold as it stops, which must not
+// happen beside a build, so while one worker holds the build turn the stop goes to it alone,
+// and to the rest once it gives the turn back or ends.
+fn daemon_stop_workers(route: DaemonRoute) -> DaemonRoute {
+    let mut r = route
     let mut sent: List[DaemonEntry] = []
     for e in r.entries {
-        if e.stop_fd >= 0 {
+        if r.told.contains(e.name) || (r.turn != "" && e.name != r.turn) {
             sent.push(e)
             continue
         }
+        r.told.push(e.name)
         let fd = unix_socket_connect(path_join(daemon_dir(), "{e.name}/daemon.sock"))
         if fd >= 0 && socket_write(fd, "\{\"type\":\"stop\"}\n") < 0 {
             unix_socket_close(fd)
@@ -1043,10 +1257,12 @@ fn daemon_route_stop(route: DaemonRoute, client_fd: Int) -> DaemonRoute {
 }
 
 // Returns, in a worker it forked, the entry to serve, and None in the router once it stops.
-// While a stop waits on its workers, or a worker it ended has yet to be reaped,
-// the accept waits 1 ms at most, so the stop ends as soon as the last of them does.
+// The router waits for a client and for the lines its workers send at once, so a worker gets
+// the build turn as soon as it is free. While a stop waits on its workers, or a worker it
+// ended has yet to be reaped, the wait is 1 ms at most, so the stop ends as soon as the last
+// of them does.
 fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
-    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, stops: [], held: [] }
+    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, stops: [], held: [], turn: "", waiting: [], told: [] }
     // The home worker checks the entry at once, so the first request finds it checked.
     let home_key = daemon_entry_key(r.home_cwd, r.home_path)
     let (first, home, why) = daemon_spawn(r, home_key, r.home_cwd, r.home_path, true, -1)
@@ -1069,7 +1285,8 @@ fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
             break
         }
         let wait = if r.stops.len() > 0 || r.ended.len() > 0 { 1 } else { 500 }
-        let client_fd = unix_socket_accept_timeout(daemon_socket_fd, wait)
+        let (polled, client_fd) = daemon_route_wait(r, wait)
+        r = polled
         if client_fd < 0 {
             continue
         }
@@ -1106,7 +1323,7 @@ fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
 // worker. In a child forked for a build it returns the build instead.
 fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     daemon_socket_fd = s.fd
-    daemon_origin = DaemonOrigin { router: s.router, files: s.files, ..daemon_origin }
+    daemon_origin = DaemonOrigin { router: s.router, files: s.files, chan: s.chan, ..daemon_origin }
     // The router's files are the router's to remove.
     daemon_pid_path = ""
     daemon_sock_path = ""
@@ -1218,7 +1435,7 @@ fn daemon_worker_of(reply: Str) -> Str {
 // max_entries is how many entry files the daemon keeps checked at once, each in a worker.
 pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     daemon_source_path = source
-    daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0, router: 0, files: "" }
+    daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0, router: 0, files: "", chan: -1 }
     daemon_start_time = time_ms()
 
     let blink_dir = daemon_dir()
