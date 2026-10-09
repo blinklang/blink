@@ -268,8 +268,7 @@ warning[ScopedValueWithoutWith]: `Closeable` value used without `with...as`
 5 |     with fs.open("data.txt")? as file {
 6 |         // use file here
 7 |     }
-  = note: suppress with `@trusted(audit: "AUDIT-ID")` for manual resource management;
-          it needs a record `AUDIT-ID` in audits.toml (§9.1)
+  = note: if this function manages the lifetime by hand, add `@allow(ScopedValueWithoutWith)`
   = note: upgrade to error in blink.toml: [lints] W0610 = "error"
 ```
 
@@ -289,7 +288,13 @@ warning[ScopedValueWithoutWith]: `BlockHandler` value used without `with`
 5 |     }
 ```
 
-This is a warning by default, upgradeable to a hard error via `blink.toml`. Suppressible with `@trusted(audit: K)` for framework code (connection pools, resource managers) that deliberately manages scoped-value lifetimes manually. `K` must name a record in `audits.toml` with a current pin, by the rule in §9.1 *Audit Records*; a stale pin lets the warning fire again.
+W0610 is a warning by default, and is upgradeable to an error with `W0610 = "error"` under `[lints]`. Framework code that manages scoped-value lifetimes by hand, such as a connection pool, suppresses it with `@allow(ScopedValueWithoutWith)` on the function. A function-level `@allow` overrides the `[lints]` setting (§4.16.8). `@trusted(audit: K)` does not suppress it (§9.1). When W0610 fires in a function that has `@trusted`, the output adds this note:
+
+```
+  = note: `@trusted` does not suppress `ScopedValueWithoutWith`; use `@allow(ScopedValueWithoutWith)`
+```
+
+The LSP offers the `with` fix first. It offers the `@allow` fix second, and that fix is never machine-applicable (§8.6).
 
 **W0611 `ScopedValueEnteredTwice`: scoped value that goes into more than one `with`**
 
@@ -309,9 +314,17 @@ warning[ScopedValueEnteredTwice]: `BlockHandler` value goes into more than one `
   = help: build a new value in each `with` item:
   |
 4 |         with db.connect("app.db")? {
+  |
+  = note: if running `exit()` more than once is intended, add `@allow(ScopedValueEnteredTwice)`
 ```
 
-When the value is a call result bound to a name, the fix moves the call into each `with` item. That fix is machine-applicable (§8.6) if the call has no other use. W0611 is a warning by default, and is upgradeable to an error with `W0611 = "error"` under `[lints]` without a change to W0610. Suppress it with `@trusted(audit: K)`, by the same rule as W0610. A type whose `exit()` is correct to run more than once, such as `std.testing`'s `Cleanup` when the action is meant to run twice, is a case for that suppression.
+When the value is a call result bound to a name, the fix moves the call into each `with` item. That fix is machine-applicable (§8.6) if the call has no other use. W0611 is a warning by default, and is upgradeable to an error with `W0611 = "error"` under `[lints]` without a change to W0610. Suppress it on a function with `@allow(ScopedValueEnteredTwice)` (§4.16.8). `@trusted(audit: K)` does not suppress it (§9.1). A type whose `exit()` is correct to run more than once, such as `std.testing`'s `Cleanup` when the action is meant to run twice, is a case for that suppression. When W0611 fires in a function that has `@trusted`, the output adds this note:
+
+```
+  = note: `@trusted` does not suppress `ScopedValueEnteredTwice`; use `@allow(ScopedValueEnteredTwice)`
+```
+
+As for W0610, the LSP offers the `with` fix first, and the `@allow` fix second. The `@allow` fix is never machine-applicable (§8.6).
 
 **E0601: closeable escapes scope**
 

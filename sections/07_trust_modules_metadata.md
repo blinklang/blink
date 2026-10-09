@@ -164,6 +164,8 @@ fn sqlite3_close(db: Ptr[Void]) -> Int ! IO
 
 **Membership criterion.** A diagnostic belongs on this list **only when silently suppressing it would destroy a record the language promises exists**. That is the whole gate. A diagnostic an author merely finds noisy does not qualify, however strongly; the list is not a place to park warnings someone wants to be unignorable.
 
+**The list is closed.** `@trusted(audit: K)` acts only on the diagnostics in the list above (and its §9.1.1 region role). It never suppresses a diagnostic outside the list. To add a diagnostic to the channel, it must meet the membership criterion.
+
 **Unsilenceable means no channel that records nothing** — not no channel at all. `@trusted(audit: K)` stays available for the legitimate case, so the list is a turnstile rather than a wall. A rule with no way through relocates the pressure into source: an indirection or a helper that launders the value past the trigger, leaving no record whatsoever, which is worse than the suppression it refused.
 
 **Every position that can raise one of these can annotate.** `test` blocks are annotatable, so a diagnostic raised inside one has somewhere to attach. An audit-gated diagnostic must never fire in a position from which its own repair cannot be written (§3.1).
@@ -211,7 +213,7 @@ Give `fetch_table` the annotation `@trusted(audit: "RPT-002")` and the record ab
 2. that record has a pin for `f`;
 3. the pin equals the current hash of `f`.
 
-The compiler checks this in `blink check`, `blink build` and the LSP. The rule applies to every `@trusted(audit: K)`, whatever diagnostic it is for, including `ScopedValueWithoutWith` (§5).
+The compiler checks this in `blink check`, `blink build` and the LSP. The rule applies to every `@trusted(audit: K)`, whatever diagnostic it is for.
 
 **A missing record is an error.** When `audits.toml` has no record `K`, or record `K` has an empty `claim`, the annotation is rejected:
 
