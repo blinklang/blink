@@ -160,7 +160,9 @@ asks for the one-unit build.
   `#embed` file with its bytes. Keys and lines from a `Map` are sorted, so
   the text does not change between builds. `<output>.units/` keeps this
   text in `.emit-inputs`, and `.emit-record` lists its length, the units
-  and the sha of each `.h` and `.c` and of the text. When the record's
+  and the sha of each `.h` and `.c` and of the text, in name order (a
+  `Map` gives its keys in an order each process seeds at random, so two
+  cold builds once wrote the lines in two orders). When the record's
   length matches and the text is the same byte for byte, the build
   hard-links the files and the text into its private directory, hashes
   them again against the record, and skips the emit. If any file differs,
@@ -510,9 +512,26 @@ reuse, cc and link. The parent relays the child's stdout, stderr and exit
 code. For `run`, the client runs the program itself, so the program's stdin,
 args, env, cwd and exit code are the client's. A client the daemon does not
 serve, or a child that declines (deps to resolve, a stale dev archive, a path
-that needs a second front end), builds cold. While the daemon waits for a
-client, it rechecks within 0.5 s of an edit, so the build after the edit finds
-the check current.
+that needs a second front end), builds cold.
+
+While the daemon waits for a client, it polls each 0.5 s. A poll reads the
+mtime (in ms) and the size of each file the last check read, and whether each
+path the loader probed finds a file. Only when one of these moved does it
+compare the files byte for byte with what the check read, and recheck if they
+differ. The runtime gives mtime only in ms and no inode; a new runtime call
+needs a gen0 re-pin, and a `struct stat` binding is laid out per platform, so
+the size comes from `lseek(fd, 0, SEEK_END)`. A same-size edit inside one ms,
+or one whose mtime was set back, moves no stat. The poll misses it, and the
+build catches it: before each build the daemon compares the bytes of every
+input and rechecks if one differs. Just after each check the daemon takes the
+stats and compares bytes once, so an edit between the loader's read and the
+stat forces a recheck at the next poll. Idle on `src/cli.bl` for 60 s, the
+daemon used 0.767% and 0.750% of a core (two runs) when each poll compared
+bytes, and 0.133% and 0.133% with the stat trigger. Interface text (kept for
+emit reuse) costs nothing that a 10 ms tick shows on a cli recheck: an edit
+then a `blink check` through the daemon takes 0.397 s median wall and 42 ticks
+of daemon CPU with it on, and 0.394 s and 43 ticks with it off (an empty
+`BLINK_CACHE_DIR`), 6 edits each.
 
 `task bench-edit-loop` on the gen1 `blink` built from `a6b467cb` (before) and
 from `b809e4a1` (after), 5 reps, 12 cores, under `blink-gates.slice`, back to
@@ -558,6 +577,13 @@ files of those shas hold the rows.
 - Without a daemon, each row is within the spread of its before row, or
   0.003 s from it.
 - The daemon serves one build at a time; a second client waits for it.
+- With no wait between the edit and the build (`BENCH_SETTLE=0`, tree
+  `a0d2bbb0`), the body-cname build through the daemon takes 1.083 s
+  [1.061-1.116], 0.19 s over the cold row above (an earlier run on the
+  `eea901c6` tree, not measured beside it): the build finds the check stale,
+  rechecks (about 0.4 s), then builds. With a 1 s wait on the same binary it
+  takes 0.680 s [0.641-0.718]. `per_module_daemon_settle0_a0d2bbb0.tsv` and
+  `per_module_daemon_settle1_a0d2bbb0.tsv` hold the rows.
 
 ## Blockers before the default flipped
 
