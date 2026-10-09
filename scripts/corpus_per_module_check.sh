@@ -51,7 +51,7 @@ if [ -n "$slice" ]; then
         echo "corpus-per-module-check: FAIL no slice list $slice"
         exit 1
     fi
-    listed=$(grep -vE '^[[:space:]]*(#|$)' "$slice" | sort -u)
+    listed=$(./scripts/corpus_per_module_slice_entries.sh "$slice" | sort -u)
     if [ -z "$listed" ]; then
         echo "corpus-per-module-check: FAIL $slice names no test file"
         exit 1

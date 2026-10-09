@@ -148,7 +148,7 @@ if [ "$total" -eq 0 ]; then
     exit 2
 fi
 if [ -n "$slice" ]; then
-    grep -vE '^[[:space:]]*(#|$)' "$slice" | awk '!seen[$0]++' > "$slice_list"
+    ./scripts/corpus_per_module_slice_entries.sh "$slice" > "$slice_list"
 fi
 slice_total=$(wc -l < "$slice_list" | tr -d ' ')
 
