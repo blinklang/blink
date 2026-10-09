@@ -3554,6 +3554,32 @@ also be shown, which the assertion built-ins need (§2.20 *Built-in Assertions*)
 rendering and the one remaining exclusion (container map keys) are specified in *Container Debug
 Rendering* below.
 
+**Debug agrees with Eq.** For a type that is both `Eq` and `Debug`, `a == b` must give
+`a.debug() == b.debug()`. This is a contract of the same kind as `Hash` agreeing with `Eq` (*Hash
+Contract and Seeding*); the compiler does not check it. A derived `Debug` obeys it when the type's
+`Eq` is also derived. A hand-written `impl` of either trait must keep the two in agreement. This type
+breaks the law, because its `Eq` ignores case but its derived `Debug` does not:
+
+```blink
+@derive(Debug)
+type Tag { name: Str }
+
+impl Eq for Tag {
+    fn eq(self, other: Self) -> Bool {
+        self.name.to_lower() == other.name.to_lower()
+    }
+}
+
+// Tag { name: "Bob" } == Tag { name: "bob" } is true,
+// but their debug() texts differ
+```
+
+The `Set` and `Map` debug order (*Container Debug Rendering*) depends on this law: when it holds for
+the elements, keys and values, equal containers render the same text. `Float` is the one built-in
+exception. `-0.0 == 0.0` is true, but the two may render differently, so a `Map[Int, Float]` that
+maps 1 to `0.0` equals one that maps 1 to `-0.0`, but their `debug()` texts may differ. Only this
+case lets a value that holds a `Float` break the law.
+
 `Result.unwrap` and `Result.unwrap_err` also require `Debug` on the arm they panic on, and their
 panic text ends with that payload's `debug()` (§7.5). A change to a type's `Debug` format therefore
 also changes that panic text.
@@ -3908,18 +3934,22 @@ between a map key and its value; there is no inner padding.
 |------|------------------|-------|
 | `List[T]` | `"[" + elems.join(", ") + "]"`, each elem via its own `.debug()` | `"[]"` |
 | `Option[T]` | `"Some(" + inner.debug() + ")"` when present | `"None"` (bare, no parens) |
-| `Map[K,V]` | `"{" + entries.join(", ") + "}"`, each entry `key.debug() + ": " + value.debug()` | `"{}"` |
+| `Map[K,V]` | `"{" + entries.join(", ") + "}"`, each entry `key.debug() + ": " + value.debug()`, in sorted order (below) | `"{}"` |
 | `Set[T]` | `"{" + elems.join(", ") + "}"`, each elem via its own `.debug()`, in sorted order (below) | `"{}"` |
 | `Result[T,E]` | `"Ok(" + value.debug() + ")"` or `"Err(" + error.debug() + ")"` | — |
 | tuple | `"(" + elems.join(", ") + ")"`, each elem via its own `.debug()` | — |
 
-**Set element order.** `Set[T].debug()` sorts the rendered element strings by their UTF-8 bytes
-before it joins them. It does not use iteration order. The hash seed changes per process (*Hash
-Contract and Seeding*), and two equal sets can hold their elements in different orders after
-different insert and remove histories, so iteration order would break the rule that
-`a == b` gives `a.debug() == b.debug()`. Sorting by the debug string needs no `Ord` bound. The order
-is by text, not by value: a `Set[Int]` of 1, 2 and 10 renders `{1, 10, 2}`. An empty `Set` renders
-`{}`, the same text as an empty `Map`; the static type tells them apart.
+**Set and Map order.** `Set[T].debug()` sorts the rendered element strings by their UTF-8 bytes
+before it joins them. `Map[K,V].debug()` sorts its entries by the UTF-8 bytes of `key.debug()`; when
+two keys render the same text, it sorts those entries by the UTF-8 bytes of `value.debug()`. Neither
+uses iteration order. The hash seed changes per process (*Hash Contract and Seeding*), and two equal
+sets or maps can hold their contents in different orders after different insert and remove
+histories, so iteration order would break the rule that `a == b` gives `a.debug() == b.debug()`
+(*Debug agrees with Eq*, §3.6.1). Sorting by the debug string needs no `Ord` bound. The order is by
+text, not by value: a `Set[Int]` of 1, 2 and 10 renders `{1, 10, 2}`, and a `Map[Int, Str]` that
+maps 1 to `"a"`, 2 to `"b"` and 10 to `"c"` renders `{1: "a", 10: "c", 2: "b"}`. Only `debug()` sorts; `keys()`,
+`values()` and `for` loops keep iteration order. An empty `Set` renders `{}`, the same text as an
+empty `Map`; the static type tells them apart.
 
 ```blink
 @derive(Debug)
