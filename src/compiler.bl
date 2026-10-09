@@ -11,7 +11,7 @@ import diagnostics.{
     PACKAGE_ENTRY_NOT_FOUND, ORPHAN_FILE, MODULE_NOT_FOUND, UNUSED_IMPORT,
     FILE_NOT_FOUND,
 }
-import pkg.lockfile.{lockfile_load, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
+import pkg.lockfile.{lockfile_load, lockfile_clear, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
 import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels}
 import std.path.{path_join, path_dirname, path_parent, path_basename, path_stem}
 import std.toml.{toml_read_value}
@@ -131,7 +131,7 @@ pub fn set_strict_struct_layout(flag: Int) {
 // keyed on this file's mtime could re-apply stale overrides.
 pub fn load_lint_overrides(src_root: Str) ! Diag.Report {
     let manifest_path = manifest_path_for_src_root(src_root)
-    if file_exists(manifest_path) == 1 {
+    if probe_file(manifest_path) {
         manifest_clear()
         note_config_file(manifest_path)
         if manifest_load(manifest_path) == 0 {
@@ -145,6 +145,17 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report {
     if compiler_strict_struct_layout != 0 {
         lint_set_override("MissingCanonicalHeader", "error")
     }
+}
+
+// Whether a file is at path, noted in loaded_inputs. A probe that resolution acts on goes
+// through here, so the probes list every path whose answer could change the program loaded.
+fn probe_file(path: Str) -> Bool {
+    let found = file_exists(path) == 1
+    if !loaded_inputs.probe_found.contains_key(path) {
+        loaded_inputs.probe_paths.push(path)
+        loaded_inputs.probe_found.insert(path, found)
+    }
+    found
 }
 
 pub fn check_file_exists(path: Str) {
@@ -163,7 +174,7 @@ fn check_embed_targets() ! Diag.Report {
     while id < node_count() {
         if node_kind(id) == NodeKind.EmbedExpr {
             let path = embed_path_of(id)
-            if file_exists(path) != 1 {
+            if !probe_file(path) {
                 diag_error_at("FileNotFound", FILE_NOT_FOUND, "#embed file not found: {path}", id,
                     "the path is read relative to the file that holds the #embed, not the directory the compiler runs in")
             } else if !loaded_inputs.embed_texts.contains_key(path) {
@@ -333,19 +344,19 @@ pub fn find_src_root(source_path: Str) -> Str {
     // return "" and the resolver rejects bare external imports with E1010.
     let mut dir = path_dirname(source_path)
     while dir != "" && dir != "." && dir != "/" {
-        if file_exists(path_join(dir, "blink.toml")) == 1 {
+        if probe_file(path_join(dir, "blink.toml")) {
             return path_join(dir, "src/")
         }
         dir = path_dirname(dir)
     }
-    if file_exists("blink.toml") == 1 {
+    if probe_file("blink.toml") {
         return "src/"
     }
     ""
 }
 
 fn read_pkg_name_from_toml(path: Str) -> Str {
-    if file_exists(path) == 0 {
+    if !probe_file(path) {
         return ""
     }
     let content = read_file(path)
@@ -428,14 +439,14 @@ fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report {
         project_root = "."
     }
     let lock_path_new = path_join(project_root, "blink.lock")
-    if file_exists(lock_path_new) == 1 {
+    if probe_file(lock_path_new) {
         note_config_file(lock_path_new)
         lockfile_load(lock_path_new)
         validate_lockfile_versions()
         return
     }
     let lock_path = path_join(project_root, "pact.lock")
-    if file_exists(lock_path) == 1 {
+    if probe_file(lock_path) {
         note_config_file(lock_path)
         lockfile_load(lock_path)
         validate_lockfile_versions()
@@ -453,14 +464,14 @@ fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report {
             return
         }
         let candidate_new = path_join(parent, "blink.lock")
-        if file_exists(candidate_new) == 1 {
+        if probe_file(candidate_new) {
             note_config_file(candidate_new)
             lockfile_load(candidate_new)
             validate_lockfile_versions()
             return
         }
         let candidate = path_join(parent, "pact.lock")
-        if file_exists(candidate) == 1 {
+        if probe_file(candidate) {
             note_config_file(candidate)
             lockfile_load(candidate)
             validate_lockfile_versions()
@@ -609,7 +620,7 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
         // without a full manifest in their tree).
         let manifest_path = path_join(base_dir, "blink.toml")
         let mut entry_name = ""
-        if file_exists(manifest_path) == 1 {
+        if probe_file(manifest_path) {
             entry_name = read_pkg_name_from_toml(manifest_path)
         }
         if entry_name == "" {
@@ -622,7 +633,7 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
         // from the lockfile; in both cases dots are forbidden, so no
         // dots-to-slashes translation is needed here.
         let entry_path = path_join(base_dir, path_join("src", entry_name.concat(".bl")))
-        if file_exists(entry_path) == 1 {
+        if probe_file(entry_path) {
             return Some(entry_path)
         }
         diag_error_no_loc("PackageEntryNotFound", PACKAGE_ENTRY_NOT_FOUND, "package entry not found: `{dotted_path}` — expected `{entry_path}`", "create `{entry_path}`, or check the `name` field in `{manifest_path}`")
@@ -631,11 +642,11 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
 
     let sub_rel = dots_to_slashes(sub_path)
     let resolved_bl = path_join(base_dir, path_join("src", sub_rel.concat(".bl")))
-    if file_exists(resolved_bl) == 1 {
+    if probe_file(resolved_bl) {
         return Some(resolved_bl)
     }
     let resolved = path_join(base_dir, path_join("src", sub_rel.concat(".pact")))
-    if file_exists(resolved) == 1 {
+    if probe_file(resolved) {
         return Some(resolved)
     }
     None
@@ -679,12 +690,12 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
 
     let rel = dots_to_slashes(dotted_path)
     let full_bl = path_join(src_root, rel.concat(".bl"))
-    let bl_exists = file_exists(full_bl) == 1
+    let bl_exists = probe_file(full_bl)
     let full_pact = path_join(src_root, rel.concat(".pact"))
     let full = if bl_exists { full_bl } else { full_pact }
 
     // Step 1: Check local src/ (skip for std.* — reserved stdlib namespace)
-    let local_exists = if is_std_ns { 0 } else if bl_exists { 1 } else { file_exists(full_pact) == 1 }
+    let local_exists = if is_std_ns { 0 } else if bl_exists { 1 } else { probe_file(full_pact) }
 
     // Step 2: Check dependencies via blink.lock
     ensure_lockfile_loaded(src_root)
@@ -711,21 +722,21 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
         let compiler_dir = path_dirname(get_arg(0))
         let pkg_rel = dots_to_slashes(dotted_path.byte_slice(4, dotted_path.byte_len()))
         let pkg_full_bl = path_join(compiler_dir, path_join("lib/pkg", pkg_rel.concat(".bl")))
-        if file_exists(pkg_full_bl) == 1 {
+        if probe_file(pkg_full_bl) {
             return pkg_full_bl
         }
         let pkg_full = path_join(compiler_dir, path_join("lib/pkg", pkg_rel.concat(".pact")))
-        if file_exists(pkg_full) == 1 {
+        if probe_file(pkg_full) {
             return pkg_full
         }
         let blink_root = env.var("BLINK_ROOT") ?? ""
         if blink_root != "" {
             let pkg_root_bl = path_join(blink_root, path_join("lib/pkg", pkg_rel.concat(".bl")))
-            if file_exists(pkg_root_bl) == 1 {
+            if probe_file(pkg_root_bl) {
                 return pkg_root_bl
             }
             let pkg_root = path_join(blink_root, path_join("lib/pkg", pkg_rel.concat(".pact")))
-            if file_exists(pkg_root) == 1 {
+            if probe_file(pkg_root) {
                 return pkg_root
             }
         }
@@ -742,12 +753,12 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
         let std_key = "std/".concat(dots_to_underscores(dotted_path.byte_slice(4, dotted_path.byte_len())))
         let mut std_resolved = ""
         let std_full_bl = path_join(compiler_dir, path_join("lib/std", std_rel.concat(".bl")))
-        if file_exists(std_full_bl) == 1 {
+        if probe_file(std_full_bl) {
             std_resolved = std_full_bl
         }
         if std_resolved == "" {
             let std_full = path_join(compiler_dir, path_join("lib/std", std_rel.concat(".pact")))
-            if file_exists(std_full) == 1 {
+            if probe_file(std_full) {
                 std_resolved = std_full
             }
         }
@@ -755,12 +766,12 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
             let blink_root = env.var("BLINK_ROOT") ?? ""
             if blink_root != "" {
                 let std_root_bl = path_join(blink_root, path_join("lib/std", std_rel.concat(".bl")))
-                if file_exists(std_root_bl) == 1 {
+                if probe_file(std_root_bl) {
                     std_resolved = std_root_bl
                 }
                 if std_resolved == "" {
                     let std_root = path_join(blink_root, path_join("lib/std", std_rel.concat(".pact")))
-                    if file_exists(std_root) == 1 {
+                    if probe_file(std_root) {
                         std_resolved = std_root
                     }
                 }
@@ -1051,10 +1062,16 @@ pub type LoadedInputs {
     // names, not those of a later read.
     embed_paths: List[Str]
     embed_texts: Map[Str, Str]
+    // Each path the loader asked about to decide which file an import, a manifest, a lockfile
+    // or an `#embed` names, in the order it first asked, and whether a file was there. The
+    // files above say what the loader read; these say what it would have read instead, so a
+    // new file that an import now finds, or that now shadows the one it found, shows here.
+    probe_paths: List[Str]
+    probe_found: Map[Str, Bool]
 }
 
 fn loaded_inputs_empty() -> LoadedInputs {
-    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map() }
+    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map() }
 }
 
 pub let mut loaded_inputs: LoadedInputs = loaded_inputs_empty()
@@ -1232,6 +1249,9 @@ pub fn reset_compiler_state() {
     current_import_file = ""
     current_import_module = "__main__"
     lockfile_loaded = 0
+    // A load that finds no lockfile keeps whatever packages are loaded, so in a process that
+    // loads again, a deleted lockfile would still resolve its packages.
+    lockfile_clear()
 }
 
 fn find_module_key(file_path: Str) -> Str {

@@ -1,0 +1,188 @@
+// A check through the daemon or the LSP answers as a cold `blink check` does after a local
+// module file appears that shadows a dependency an import resolved to (W1000). The last check
+// read the dependency's file, which did not change, so only the local path it probed and found
+// empty can tell that the import now names another file. Each fixture lives under a fresh
+// temporary directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+let ENTRY = "src/main.bl"
+
+// A path dependency mylib whose greet gives an Int, which main.bl takes as a Str, so the check
+// fails until change.sh writes a local src/mylib.bl whose greet gives a Str.
+fn setup(dir: Str) {
+    let _ = sh("rm -rf {dir}; mkdir -p {dir}/src {dir}/dep/src")
+    write_file("{dir}/dep/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/dep/src/mylib.bl", "pub fn greet() -> Int \{ 1 }\n")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check here.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n\n[[package]]\nname = \"mylib\"\nversion = \"0.1.0\"\nsource = \"path:{dir}/dep\"\nhash = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\n")
+    write_file("{dir}/src/main.bl", "import mylib\n\nfn main() \{\n    let s: Str = mylib.greet()\n    io.println(s)\n}\n")
+    write_file("{dir}/change.sh", "printf 'pub fn greet() -> Str \{ \"local\" }\\n' > src/mylib.bl\n")
+}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn change(dir: Str) {
+    let _ = sh("cd {dir} && sh change.sh")
+}
+
+fn check(dir: Str, flags: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && $B check {flags} {ENTRY}")
+}
+
+// The pid of a daemon serving ENTRY, or -1. The timeout ends a daemon that nothing stopped.
+fn start_daemon(dir: Str) -> Int {
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && rm -rf .blink && (timeout 120 $B daemon start {ENTRY} > daemon.log 2>&1 &); for i in $(seq 1 400); do if [ -S .blink/daemon.sock ]; then cat .blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f .blink/daemon.pid ] && kill $(cat .blink/daemon.pid); exit 1")
+    if r.exit_code != 0 { return -1 }
+    r.out.trim().to_int()
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+fn same(label: Str, cold: ProcessResult, warm: ProcessResult) -> Bool {
+    let ok = cold.out == warm.out && cold.err_out == warm.err_out && cold.exit_code == warm.exit_code
+    if !ok {
+        io.eprintln("{label} cold (exit {cold.exit_code}):\n{cold.out}\n--stderr--\n{cold.err_out}")
+        io.eprintln("{label} warm (exit {warm.exit_code}):\n{warm.out}\n--stderr--\n{warm.err_out}")
+    }
+    ok
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+// The LSP output of: open ENTRY, wait for its diagnostics, run change.sh, save ENTRY, wait for
+// the diagnostics again, shut down.
+fn via_lsp(dir: Str) -> Str {
+    let uri = "file://{ENTRY}"
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let open = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}")
+    let save = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\"\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    write_file("{dir}/open.bin", init.concat(open))
+    write_file("{dir}/save.bin", save)
+    write_file("{dir}/end.bin", shutdown.concat(exit_msg))
+    let _ = sh("B=$(pwd)/build/blink; cd {dir} && ( cat open.bin; for i in $(seq 1 400); do grep -q published lsp.err 2>/dev/null && break; sleep 0.05; done; sh change.sh; cat save.bin; for i in $(seq 1 400); do [ \"$(grep -c published lsp.err)\" -ge 2 ] && break; sleep 0.05; done; cat end.bin ) | timeout 60 $B lsp > lsp.out 2> lsp.err")
+    read_file("{dir}/lsp.out")
+}
+
+// The diagnostic codes in text, without repeats; same_codes compares two of these as sets.
+fn codes_in(text: Str) -> List[Str] {
+    let needle = "\"code\":\""
+    let mut codes: List[Str] = []
+    let mut at = 0
+    while true {
+        match text.byte_index_of(needle, at) {
+            Some(i) => {
+                let start = i + needle.byte_len()
+                let code = text.byte_slice(start, start + 5)
+                if !codes.contains(code) { codes.push(code) }
+                at = start
+            }
+            None => { return codes }
+        }
+    }
+    codes
+}
+
+// The codes of each publishDiagnostics notification in the LSP output, in order.
+fn published_codes(out: Str) -> List[List[Str]] {
+    let needle = "textDocument/publishDiagnostics"
+    let mut starts: List[Int] = []
+    let mut at = 0
+    while true {
+        match out.byte_index_of(needle, at) {
+            Some(i) => {
+                starts.push(i)
+                at = i + needle.byte_len()
+            }
+            None => { break }
+        }
+    }
+    let mut all: List[List[Str]] = []
+    let mut k = 0
+    while k < starts.len() {
+        let end = if k + 1 < starts.len() { starts.get(k + 1).unwrap() } else { out.byte_len() }
+        all.push(codes_in(out.byte_slice(starts.get(k).unwrap(), end)))
+        k = k + 1
+    }
+    all
+}
+
+fn same_codes(label: Str, cold: List[Str], lsp: List[Str]) -> Bool {
+    let mut ok = cold.len() == lsp.len()
+    for c in cold {
+        if !lsp.contains(c) { ok = false }
+    }
+    if !ok { io.eprintln("{label}: cold [{cold.join(", ")}], lsp [{lsp.join(", ")}]") }
+    ok
+}
+
+// out without the W1000 note: its first line and the three lines under it.
+fn without_w1000(out: Str) -> Str {
+    let lines = out.split("\n")
+    let mut kept: List[Str] = []
+    let mut skip = 0
+    for line in lines {
+        if line.starts_with("warning[W1000]") {
+            skip = 4
+        }
+        if skip > 0 {
+            skip = skip - 1
+        } else {
+            kept.push(line)
+        }
+    }
+    kept.join("\n")
+}
+
+test "the daemon answers like a cold check after a local file appears that shadows the dependency an import resolved to" {
+    let dir = sh("mktemp -d /tmp/blink_daemon_shadow.XXXXXX").out.trim()
+    setup(dir)
+    let cold_before = check(dir, "")
+    change(dir)
+    let cold_after = check(dir, "")
+    setup(dir)
+    let pid = start_daemon(dir)
+    let warm_before = check(dir, "")
+    change(dir)
+    let warm_after = check(dir, "")
+    let checks = sh("B=$(pwd)/build/blink; cd {dir} && $B daemon status").out
+    stop_daemon(pid)
+    let _ = sh("rm -rf {dir}")
+
+    assert(pid > 0)
+    assert(cold_before.err_out.contains("TypeError"))
+    assert_eq(cold_after.exit_code, 0)
+    assert(cold_after.out.contains("warning[W1000]"))
+    assert(same("before", cold_before, warm_before))
+    // The loader prints W1000 on its own stdout, which a daemon check never relays.
+    assert(same("after", ProcessResult { out: without_w1000(cold_after.out), err_out: cold_after.err_out, exit_code: cold_after.exit_code }, warm_after))
+    // Both answers came from the daemon, not from a cold check behind it.
+    assert(checks.contains("\"checks\":2}"))
+}
+
+test "the lsp answers like a cold check after a local file appears that shadows the dependency an import resolved to" {
+    let dir = sh("mktemp -d /tmp/blink_lsp_shadow.XXXXXX").out.trim()
+    setup(dir)
+    let cold_before = codes_in(check(dir, "--json").err_out)
+    change(dir)
+    let cold_after = codes_in(check(dir, "--json").err_out)
+    setup(dir)
+    let published = published_codes(via_lsp(dir))
+    let _ = sh("rm -rf {dir}")
+
+    assert(cold_before.contains("E0300"))
+    assert_eq(cold_after.len(), 0)
+    assert_eq(published.len(), 2)
+    assert(same_codes("before", cold_before, published.get(0) ?? []))
+    assert(same_codes("after", cold_after, published.get(1) ?? []))
+}

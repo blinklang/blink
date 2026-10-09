@@ -24,11 +24,24 @@ pub fn run_build_analyses(program: Int) ! Diag.Report {
     run_mono(program)
 }
 
-// The inputs of the last check_source and the bytes it read, so a caller that answers
-// many checks can tell whether a new one could say anything different.
-let mut checked_source: Str = ""
-let mut checked_paths: List[Str] = []
-let mut checked_texts: List[Str] = []
+// The inputs of the last check_source, so a caller that answers many checks can tell whether
+// a new one could say anything different.
+type CheckedInputs {
+    // The entry the check ran on, or "" before any check.
+    source: Str
+    // Each file it read, beside the bytes it read.
+    paths: List[Str]
+    texts: List[Str]
+    // Each path the loader probed, beside whether a file was there.
+    probe_paths: List[Str]
+    probe_found: List[Bool]
+}
+
+fn checked_inputs_empty() -> CheckedInputs {
+    CheckedInputs { source: "", paths: [], texts: [], probe_paths: [], probe_found: [] }
+}
+
+let mut checked: CheckedInputs = checked_inputs_empty()
 
 // A check sees the whole program, so it loads the imports and the prelude as the build
 // does. Escape analysis needs no well-typed program, so it still runs when the front end
@@ -47,41 +60,53 @@ pub fn check_source(source_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build,
 }
 
 fn record_checked_inputs(source_path: Str) {
-    checked_source = source_path
-    checked_paths = []
-    checked_texts = []
+    checked = checked_inputs_empty()
+    checked.source = source_path
     let mut i = 0
     while i < loaded_inputs.source_paths.len() {
-        checked_paths.push(loaded_inputs.source_paths.get(i).unwrap())
-        checked_texts.push(loaded_inputs.source_texts.get(i).unwrap())
+        checked.paths.push(loaded_inputs.source_paths.get(i).unwrap())
+        checked.texts.push(loaded_inputs.source_texts.get(i).unwrap())
         i = i + 1
     }
     i = 0
     while i < loaded_inputs.config_paths.len() {
-        checked_paths.push(loaded_inputs.config_paths.get(i).unwrap())
-        checked_texts.push(loaded_inputs.config_texts.get(i).unwrap())
+        checked.paths.push(loaded_inputs.config_paths.get(i).unwrap())
+        checked.texts.push(loaded_inputs.config_texts.get(i).unwrap())
         i = i + 1
     }
     i = 0
     while i < loaded_inputs.embed_paths.len() {
         let p = loaded_inputs.embed_paths.get(i).unwrap()
-        checked_paths.push(p)
-        checked_texts.push(loaded_inputs.embed_texts.get(p).unwrap())
+        checked.paths.push(p)
+        checked.texts.push(loaded_inputs.embed_texts.get(p).unwrap())
         i = i + 1
+    }
+    for p in loaded_inputs.probe_paths {
+        checked.probe_paths.push(p)
+        checked.probe_found.push(loaded_inputs.probe_found.get(p).unwrap())
     }
 }
 
-// Compares bytes, not mtimes: an edit inside one mtime tick still counts. A file the last
-// check did not load, such as a new module that would now shadow an import, is not seen.
+// A check is current while every file it read holds the same bytes and every path the
+// loader probed gives the same answer. The loader acts on nothing else that can change while
+// the process runs: its env, argv0 and cwd stay as they were. Compares bytes, not mtimes: an
+// edit inside one mtime tick still counts. The probes catch a file the last check did not
+// read: a new module an import needed, or one that now shadows the file an import found.
 pub fn checked_inputs_changed(source_path: Str) -> Bool {
-    if checked_source == "" || checked_source != source_path { return true }
+    if checked.source == "" || checked.source != source_path { return true }
     let mut i = 0
-    while i < checked_paths.len() {
-        let p = checked_paths.get(i).unwrap()
+    while i < checked.probe_paths.len() {
+        let found = file_exists(checked.probe_paths.get(i).unwrap()) == 1
+        if found != checked.probe_found.get(i).unwrap() { return true }
+        i = i + 1
+    }
+    i = 0
+    while i < checked.paths.len() {
+        let p = checked.paths.get(i).unwrap()
         // The compiler carries the embedded stdlib, so no edit can change it.
         if !p.starts_with("<embedded:") {
             if file_exists(p) != 1 { return true }
-            if read_file(p) != checked_texts.get(i).unwrap() { return true }
+            if read_file(p) != checked.texts.get(i).unwrap() { return true }
         }
         i = i + 1
     }
@@ -89,9 +114,7 @@ pub fn checked_inputs_changed(source_path: Str) -> Bool {
 }
 
 pub fn checked_inputs_reset() {
-    checked_source = ""
-    checked_paths = []
-    checked_texts = []
+    checked = checked_inputs_empty()
 }
 
 // How a check exits: 101 for a compiler bug, 1 for errors, and 1 for warnings under --strict.
