@@ -1,0 +1,234 @@
+// While a daemon serves the project, `blink build` and `blink run` build through it, from the
+// program its last check holds. The daemon may make a build faster, never different: after
+// each edit of an edit loop, a build through it prints, exits, writes C and links a program as
+// a cold build in a twin tree does, and the daemon builds each one itself.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    // The compiler's lib/ is a real directory, so it can hold a bundled pkg module that a
+    // local file later shadows. The stdlib stays the tree's.
+    shell_exec("mkdir -p {tree}/build/lib/pkg && ln -s {root}/lib/std {tree}/build/lib/std && ln -s {tree}/build/lib {tree}/lib")
+    write_file("{tree}/build/lib/pkg/probe.bl", "pub fn where() -> Str \{\n    \"bundled\"\n\}\n")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // The daemon listens at the project root, so each tree is a project of its own.
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_edit_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"import pkg.probe.{where}"#,
+        #""#,
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s} {where()}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/extra.bl", [
+        #"pub fn extra_value() -> Str {"#,
+        #"    "extra""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #"import extra.{extra_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()} {extra_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it serves only a client whose env is its own.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "builds", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            n.to_int()
+        }
+        None => -1
+    }
+}
+
+// What a build printed, with its tree's path and its private units directory's random name
+// spelled the same in every tree.
+fn plain(tree: Str, s: Str) -> Str {
+    let t = s.replace(tree, "TREE")
+    let mut out = ""
+    let mut rest = t
+    loop {
+        match rest.byte_index_of(".units.", 0) {
+            Some(at) => {
+                let end = if at + 13 <= rest.byte_len() { at + 13 } else { rest.byte_len() }
+                out = "{out}{rest.byte_slice(0, at)}.units.XXXXXX"
+                rest = rest.byte_slice(end, rest.byte_len())
+            }
+            None => break
+        }
+    }
+    "{out}{rest}"
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{a.out}{a.err_out}\n-- vs --\n{b.out}{b.err_out}" }
+    if plain(a_tree, a.out) != plain(b_tree, b.out) { return "stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if plain(a_tree, a.err_out) != plain(b_tree, b.err_out) { return "stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// What two trees' last builds left that differs: a C file of the units, or the program.
+fn output_differ(a_tree: Str, b_tree: Str) -> Str {
+    sh("cd {b_tree}/app/out/app.units && for f in *.c *.h; do cmp -s $f {a_tree}/app/out/app.units/$f || echo $f; done; cd {a_tree}/app/out/app.units && for f in *.c *.h; do [ -e {b_tree}/app/out/app.units/$f ] || echo extra:$f; done; [ -e {a_tree}/app/out/app ] || [ -e {b_tree}/app/out/app ] || exit 0; cmp -s {a_tree}/app/out/app {b_tree}/app/out/app || echo program").split("\n").join(" ")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn edit_both(warm: Str, cold: Str, file: Str, sed: Str) {
+    edit(warm, file, sed)
+    edit(cold, file, sed)
+}
+
+fn build(tree: Str) -> ProcessResult {
+    blink_in(tree, "build src/main.bl -o out/app")
+}
+
+// Builds in both trees after the step named label; what differs, or "".
+fn compare_builds(warm: Str, cold: Str, label: Str) -> Str {
+    let w = build(warm)
+    let c = build(cold)
+    let d = differ(warm, w, cold, c)
+    if d != "" { return "{label}: {d}" }
+    let o = output_differ(warm, cold)
+    if o != "" { return "{label}: {o}" }
+    if w.exit_code == 0 {
+        let ran = differ(warm, process_run("{warm}/app/out/app", []), cold, process_run("{cold}/app/out/app", []))
+        if ran != "" { return "{label} program: {ran}" }
+    }
+    ""
+}
+
+test "build and run through the daemon match a cold build after each edit of an edit loop" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_edit_loop_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_edit_loop_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut builds: List[Str] = []
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        problems.push(compare_builds(warm, cold, "first build"))
+        builds.push("{served(warm, "builds")}")
+
+        edit_both(warm, cold, "leaf.bl", #"s/"leaf"/"lea2"/"#)
+        problems.push(compare_builds(warm, cold, "body edit"))
+        builds.push("{served(warm, "builds")}")
+
+        edit_both(warm, cold, "base.bl", #"s/tag(s: Str)/tag(s: Str, n: Int)/"#)
+        edit_both(warm, cold, "base.bl", #"s/{s} {where()}/{s}{n} {where()}/"#)
+        edit_both(warm, cold, "leaf.bl", #"s/tag("lea2")/tag("lea2", 2)/"#)
+        edit_both(warm, cold, "main.bl", #"s/tag("main")/tag("main", 1)/"#)
+        problems.push(compare_builds(warm, cold, "signature edit"))
+        builds.push("{served(warm, "builds")}")
+
+        edit_both(warm, cold, "leaf.bl", #"1i\import std.path.{path_basename}"#)
+        edit_both(warm, cold, "leaf.bl", #"s/tag("lea2", 2)/tag(path_basename("a\/lea3"), 2)/"#)
+        problems.push(compare_builds(warm, cold, "new import"))
+        builds.push("{served(warm, "builds")}")
+
+        for t in [warm, cold] {
+            shell_exec("mkdir -p {t}/app/src/pkg")
+            write_file("{t}/app/src/pkg/probe.bl", "pub fn where() -> Str \{\n    \"local\"\n\}\n")
+        }
+        problems.push(compare_builds(warm, cold, "new file that shadows an import"))
+        builds.push("{served(warm, "builds")}")
+
+        // The import of the deleted module fails the build, as it fails a cold one.
+        for t in [warm, cold] { shell_exec("rm {t}/app/src/extra.bl") }
+        problems.push(compare_builds(warm, cold, "deleted module"))
+        builds.push("{served(warm, "builds")}")
+
+        edit_both(warm, cold, "main.bl", #"/import extra/d"#)
+        edit_both(warm, cold, "main.bl", #"s/ {extra_value()}//"#)
+        problems.push(compare_builds(warm, cold, "import of the deleted module removed"))
+        builds.push("{served(warm, "builds")}")
+
+        edit_both(warm, cold, "leaf.bl", #"s/a\/lea3/a\/lea4/"#)
+        let run_args = "run src/main.bl -o out/app"
+        let wr = blink_in(warm, run_args)
+        let cr = blink_in(cold, run_args)
+        let rd = differ(warm, wr, cold, cr)
+        problems.push(if rd != "" { "run: {rd}" } else { output_differ(warm, cold) })
+        builds.push("{served(warm, "builds")}")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(builds.join(","), "1,2,3,4,5,6,7,8")
+}
