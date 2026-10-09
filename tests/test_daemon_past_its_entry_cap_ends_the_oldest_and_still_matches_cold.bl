@@ -141,6 +141,23 @@ fn compare(warm: Str, cold: Str, args: Str) -> Str {
     compare_at(warm, cold, ".", args)
 }
 
+// The children of pid, space-separated, or "". A relay is a child of the router for as long
+// as it passes on one reply.
+fn children(pid: Int) -> Str {
+    sh("ps -o pid= --ppid {pid} | tr -s ' \\n' ' '").trim()
+}
+
+// The worker directories in tree's .blink/, space-separated.
+fn worker_dirs(tree: Str) -> Str {
+    sh("cd {tree}/app/.blink 2>/dev/null && ls -A | grep '^w' | tr '\\n' ' '").trim()
+}
+
+// What of the processes pids and the files in tree's .blink/ named in dirs is still there
+// after secs seconds, or "".
+fn left_after(tree: Str, pids: Str, dirs: Str, secs: Int) -> Str {
+    sh("for i in $(seq 1 {secs * 20}); do left=''; for p in {pids}; do kill -0 $p 2>/dev/null && left=\"$left pid:$p\"; done; for d in {dirs}; do [ -e {tree}/app/.blink/$d ] && left=\"$left $d\"; done; [ -z \"$left\" ] && exit 0; sleep 0.05; done; echo $left")
+}
+
 fn edit_both(warm: Str, cold: Str, file: Str, sed: Str) {
     for t in [warm, cold] {
         let path = "{t}/app/src/{file}"
@@ -159,12 +176,22 @@ test "past its cap of warm entries the daemon ends the oldest, and every answer 
     let pid = start_daemon(warm, "--max-entries 2")
     let mut problems: List[Str] = []
     let mut seen: List[Str] = []
+    let mut evicted = "not looked at"
+    let mut stopped = "not looked at"
     with cleanup(fn() { stop_daemon(pid) }) {
         assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        let home_pids = children(pid)
+        let home_dirs = worker_dirs(warm)
         problems.push(compare(warm, cold, "check src/second.bl"))
         seen.push(counts(warm))
+        let second_dir = worker_dirs(warm).replace(home_dirs, "").trim()
+        let home_list = home_pids.split(" ")
+        let second_pid = children(pid).split(" ").filter(fn(p) { !home_list.contains(p) }).join(" ")
         problems.push(compare(warm, cold, "check src/third.bl"))
         seen.push(counts(warm))
+        // The worker of src/second.bl, the oldest past the cap, ends and takes its files.
+        evicted = left_after(warm, second_pid, second_dir, 10)
+        if second_dir == "" || second_pid == "" { evicted = "no worker for src/second.bl: dir '{second_dir}', pid '{second_pid}'" }
         edit_both(warm, cold, "base.bl", #"s/"\[{s}\]"/"<{s}>"/"#)
         problems.push(compare(warm, cold, "check src/second.bl"))
         problems.push(compare(warm, cold, "build src/second.bl -o out/second"))
@@ -172,9 +199,14 @@ test "past its cap of warm entries the daemon ends the oldest, and every answer 
         problems.push(compare(warm, cold, "run src/third.bl -o out/third"))
         problems.push(compare(warm, cold, "run src/main.bl -o out/main"))
         seen.push(counts(warm))
+        let workers = children(pid)
+        let _stop = blink_in(warm, "daemon stop")
+        stopped = left_after(warm, "{pid} {workers}", "$(cd {warm}/app/.blink 2>/dev/null && ls -A | grep '^w')", 30)
     }
     shell_exec("rm -rf {warm} {cold}")
     let found: List[Str] = problems.filter(fn(p) { p != "" })
     assert_eq(found.join("\n"), "")
+    assert_eq(evicted, "")
+    assert_eq(stopped, "")
     assert_eq(seen.join(", "), "checks=1 builds=0 entries=2, checks=2 builds=0 entries=2, checks=4 builds=3 entries=2")
 }
