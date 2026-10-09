@@ -281,6 +281,30 @@ tracked_rows_at() {
     fi
 }
 
+# Writes $work/walk/<ref>.rows for each commit in $1..HEAD and each parent.
+# Each ref's rows read only that ref's own copy, so they compute at once, and
+# beside the current and previous-commit rows; one at a time, a branch of a
+# few commits cost more than the rest of ci's first stage.
+walk_rows() {
+    walk="$work/walk"
+    mkdir -p "$walk"
+    jobs=$(./scripts/default_jobs.sh)
+    running=0
+    for r in $(git rev-list --parents "$1..HEAD" | awk 'NF > 1' | tr ' ' '\n' | sort -u); do
+        (
+            materialize_ref "$r" "$walk/$r"
+            compute_rows "$walk/$r" "$walk/$r.det" > "$walk/$r.rows"
+            rm -rf "$walk/$r" "$walk/$r.det"
+        ) &
+        running=$((running + 1))
+        if [ "$running" -ge "$jobs" ]; then
+            wait -n
+            running=$((running - 1))
+        fi
+    done
+    wait
+}
+
 # Prints one line per debt row a commit in $1..HEAD raised above its parents.
 walk_branch() {
     walk="$work/walk"
@@ -317,6 +341,14 @@ ROWLIST
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+base_ref="${LINT_BASE_REF:-main}"
+walk_pid=""
+if [ "$update_flag" != "--update" ] && [ -f "$baseline" ] && [ -z "${LINT_HEAD1_DIR:-}" ] &&
+        git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+    walk_rows "$base_ref" &
+    walk_pid=$!
+fi
 
 rows_now=$(compute_rows "$now_root" "$work/now")
 
@@ -387,9 +419,9 @@ done <<EOF
 $ROWS
 EOF
 
-base_ref="${LINT_BASE_REF:-main}"
 if [ -z "${LINT_HEAD1_DIR:-}" ]; then
-    if git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+    if [ -n "$walk_pid" ]; then
+        wait "$walk_pid"
         raised=$(walk_branch "$base_ref")
         if [ -n "$raised" ]; then
             echo "lint_codegen: a commit on this branch raised a row in debt above its parent, even if a later commit paid it back:"
