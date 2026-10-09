@@ -498,8 +498,66 @@ of those shas hold the rows.
   monolith build does not track the sources it reads or parse for the
   interface texts.
 
-The warm daemon that builds through this reuse is parked on the branch
-`daemon-build-routing` (ticket `2je9g7`).
+### Build through the daemon
+
+`blink build` and `blink run` ask a daemon that watches their source to build.
+The daemon builds only when the client's cwd, source, identity (its binary,
+the compiler's sha256 and its env) and front-end settings
+(`--strict-struct-layout`, `BLINK_TRACE`, emit reuse) are its own. It rechecks
+if an input changed, then forks a child that builds from the program it
+checked: the child skips the front end and runs mono, the analyses, emit, unit
+reuse, cc and link. The parent relays the child's stdout, stderr and exit
+code. For `run`, the client runs the program itself, so the program's stdin,
+args, env, cwd and exit code are the client's. A client the daemon does not
+serve, or a child that declines (deps to resolve, a stale dev archive, a path
+that needs a second front end), builds cold. While the daemon waits for a
+client, it rechecks within 0.5 s of an edit, so the build after the edit finds
+the check current.
+
+`task bench-edit-loop` on the gen1 `blink` built from `a6b467cb` (before) and
+from `b809e4a1` (after), 5 reps, 12 cores, under `blink-gates.slice`, back to
+back on one machine, all on the `eea901c6` tree. The daemon column is
+`BENCH_DAEMON=1 BENCH_SETTLE=1` on the `b809e4a1` binary: the daemon starts
+after the warm build, and the bench waits 1 s between the edit and the timed
+build. It served 15 builds on each target. Median wall seconds, with min and
+max on the rows the goal names. `bench/edit_loop/per_module_a6b467cb.tsv`,
+`bench/edit_loop/per_module_b809e4a1.tsv`,
+`bench/edit_loop/per_module_daemon_b809e4a1.tsv` and the two `monolith_*.tsv`
+files of those shas hold the rows.
+
+| target | case | `--no-per-module` after | before | after | daemon | daemon emit_s | daemon cc_s |
+|---|---|---|---|---|---|---|---|
+| cli | nochange | 0.785 | 0.525 | 0.519 | | | |
+| cli | body-cname | 10.681 | 0.902 [0.887-0.911] | 0.894 [0.880-0.909] | 0.670 [0.650-0.706] | 0.476 | 0.152 |
+| cli | body-typecheck | 10.667 | 3.207 | 3.202 | | | |
+| cli | pubfn-cname | 10.658 | 1.900 [1.879-1.922] | 1.911 [1.879-1.918] | 1.734 [1.715-1.759] | 0.818 | 0.874 |
+| cli | run-body-cname | 10.660 | 0.909 | 0.904 | 0.713 [0.700-1.060] | 0.518 | 0.151 |
+| cli | test-body-cname | 2.127 | 0.499 | 0.497 | | | |
+| cli | cold-obj | 10.657 | 3.612 | 3.602 | | | |
+| cli | cold-all | 13.039 | 5.980 | 5.987 | | | |
+| small | nochange | 0.074 | 0.072 | 0.072 | | | |
+| small | body-inventory | 0.139 | 0.123 | 0.121 | 0.128 [0.124-0.131] | 0.072 | 0.037 |
+| small | pubfn-model | 0.138 | 0.125 | 0.122 | 0.131 [0.129-0.133] | 0.074 | 0.038 |
+| small | run-body-inventory | 0.140 | 0.123 | 0.123 | 0.129 [0.128-0.132] | 0.074 | 0.037 |
+| small | test-body-inventory | 0.143 | 0.135 | 0.138 | | | |
+| small | cold-obj | 0.140 | 0.122 | 0.122 | | | |
+
+- Through the daemon, a body edit on cli builds in 0.670 s, 0.22 s under the
+  cold build. The child's emit_s falls from 0.698 to 0.476: the front end is
+  gone, and mono, the analyses, the unit headers and the reuse hashes stay.
+- The front end of a cold cli build is about 0.39 s, so 0.50-0.53 s was the
+  estimate for this design. A strace of the daemon and a client shows where
+  some of the rest goes: the client hashes the compiler and its env for the
+  identity (about 15 ms), the child hashes the compiler again for the dev
+  archive check (about 11 ms), and the child's exit takes about 12 ms. The
+  child's emit, with no subprocess, takes about 0.29 s, near the cold emit
+  stages that remain.
+- A small program gains nothing: its front end is a few ms, and the daemon
+  round trip and fork cost more. Each small daemon row is 0.005-0.009 s over
+  the cold row.
+- Without a daemon, each row is within the spread of its before row, or
+  0.003 s from it.
+- The daemon serves one build at a time; a second client waits for it.
 
 ## Blockers before the default flipped
 
