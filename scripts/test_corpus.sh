@@ -21,7 +21,7 @@ fail=0
 
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std" "$R/src"
-cp scripts/corpus.sh scripts/corpus_one.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh "$R/scripts/"
+cp scripts/corpus.sh scripts/corpus_one.sh scripts/default_jobs.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh "$R/scripts/"
 : > "$R/build/gc_unity.c"
 # corpus.sh takes the compiler archive roots from the compiler binary's imports.
 printf 'import std.fs\nimport lexer.{Lex}\nimport cg\n\nfn main() {}\n' > "$R/src/blinkc_main.bl"

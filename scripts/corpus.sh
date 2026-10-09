@@ -11,7 +11,7 @@
 #
 # Env:
 #   CORPUS_COMPILER  dir holding blink/blinkc/libblink_std.* (default build/gen1)
-#   CORPUS_JOBS      parallel workers (default: nproc/2, minimum 1)
+#   CORPUS_JOBS      parallel workers (default: scripts/default_jobs.sh)
 #   CORPUS_OUT       output JSON (default build/corpus.json)
 #   CORPUS_PRELUDE_LIB  lib/ root each sandbox exposes as the prelude, passed
 #                    through to corpus_one.sh (default: the compiler's own)
@@ -70,11 +70,7 @@ case "$per_module" in
     0|1) ;;
     *) echo "corpus: CORPUS_PER_MODULE must be 0 or 1, got '$per_module'" >&2; exit 2 ;;
 esac
-# Half the cores by default: the sweep forks timeout -> blink -> cc per file,
-# so a full-width run saturates the machine and starves everything else.
-default_jobs=$(( $(nproc 2>/dev/null || echo 8) / 2 ))
-[ "$default_jobs" -lt 1 ] && default_jobs=1
-jobs="${CORPUS_JOBS:-$default_jobs}"
+jobs="${CORPUS_JOBS:-$(./scripts/default_jobs.sh)}"
 
 # Boehm sizes its marker pool from the machine, not from this worker count, so
 # every worker starts ~one marker per core and the sweep oversubscribes by that
