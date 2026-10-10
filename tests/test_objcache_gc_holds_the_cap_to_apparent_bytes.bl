@@ -1,0 +1,58 @@
+// The object cache evicts its oldest entries once its files pass the cap. A build counts the
+// bytes each file holds in process instead of asking du for the blocks the tree takes, so a
+// build starts no du. The cap only starts eviction and never changes what a build makes, so a
+// file's bytes stand in for its blocks: a sparse file counts at its full length.
+
+import build_objcache
+
+let DIR = "build/objcache_gc_apparent_bytes_probe"
+
+fn entry(key: Str, kib: Int, age: Str) {
+    shell_exec("head -c {kib * 1024} /dev/zero > {DIR}/{key}.o && echo '1 mod ' > {DIR}/{key}.meta && touch -d '{age}' {DIR}/{key}.meta")
+}
+
+fn gc_with_cap(mb: Int) ! IO {
+    env.set_var("BLINK_CACHE_DIR", DIR)
+    env.set_var("BLINK_CACHE_SIZE_MB", "{mb}")
+    build_objcache.maybe_gc()
+    env.remove_var("BLINK_CACHE_SIZE_MB")
+    env.remove_var("BLINK_CACHE_DIR")
+}
+
+test "a sparse object counts at its full length" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/tmp")
+    shell_exec("truncate -s 2M {DIR}/aaaaaaaaaaaaaaaa.o && echo '1 mod ' > {DIR}/aaaaaaaaaaaaaaaa.meta")
+    gc_with_cap(1)
+    assert_eq(file_exists("{DIR}/aaaaaaaaaaaaaaaa.o"), 0)
+    assert_eq(file_exists("{DIR}/aaaaaaaaaaaaaaaa.meta"), 0)
+}
+
+test "eviction drops the oldest entries until the bytes fit the cap" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/tmp")
+    entry("1111111111111111", 400, "3 hours ago")
+    entry("2222222222222222", 400, "2 hours ago")
+    entry("3333333333333333", 400, "1 hour ago")
+    gc_with_cap(1)
+    assert_eq(file_exists("{DIR}/1111111111111111.o"), 0)
+    assert_eq(file_exists("{DIR}/2222222222222222.o"), 1)
+    assert_eq(file_exists("{DIR}/3333333333333333.o"), 1)
+}
+
+test "the files under tmp count toward the cap" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/tmp/unit.abcdef")
+    entry("1111111111111111", 400, "2 hours ago")
+    entry("2222222222222222", 400, "1 hour ago")
+    shell_exec("head -c 307200 /dev/zero > {DIR}/tmp/unit.abcdef/x.c")
+    gc_with_cap(1)
+    assert_eq(file_exists("{DIR}/1111111111111111.o"), 0)
+    assert_eq(file_exists("{DIR}/2222222222222222.o"), 1)
+}
+
+test "a cache under its cap keeps every entry" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/tmp")
+    entry("1111111111111111", 400, "2 hours ago")
+    entry("2222222222222222", 400, "1 hour ago")
+    gc_with_cap(1)
+    assert_eq(file_exists("{DIR}/1111111111111111.o"), 1)
+    assert_eq(file_exists("{DIR}/2222222222222222.o"), 1)
+}

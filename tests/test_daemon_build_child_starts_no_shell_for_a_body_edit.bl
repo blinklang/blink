@@ -1,6 +1,6 @@
 // A body edit served by the daemon pays for each process its build child starts. The child
-// makes its directories, hashes its units, keys and stores its objects and swaps its units
-// directory in process, and starts cc without a shell, so it runs no shell and almost no
+// makes its directories, hashes its units, keys, stores and counts its objects and swaps its
+// units directory in process, and starts cc without a shell, so it runs no shell and no
 // program but the C toolchain. Its output stays what a cold build gives.
 // The runtime runs a shell command through /bin/sh by its full path, so a shim on PATH can
 // not see it; the daemon runs under strace, and without strace the count is not held.
@@ -101,11 +101,10 @@ fn output_differ(a_tree: Str, b_tree: Str) -> Str {
 }
 
 // Each program a line of the strace log from `from` on started, by its file name, but the
-// C toolchain's and du, which a build still starts: the cache is held to the blocks its
-// files take, and the FFI cannot read a stat.
+// C toolchain's.
 fn unexpected_execs(tree: Str, from: Int) -> Str {
     let toolchain = "cc|gcc|c99|clang|ccache|zig|cpp|cc1|as|ld|ld.bfd|ld.gold|ld.lld|collect2|lto-wrapper|lto1"
-    sh("tail -n +{from + 1} {tree}/exec.log | sed -n 's/^[0-9]* *execve(\"\\([^\"]*\\)\".*/\\1/p' | awk -F/ '\{print $NF}' | grep -vxE '{toolchain}|du' | sort | uniq -c | tr '\\n' ' '")
+    sh("tail -n +{from + 1} {tree}/exec.log | sed -n 's/^[0-9]* *execve(\"\\([^\"]*\\)\".*/\\1/p' | awk -F/ '\{print $NF}' | grep -vxE '{toolchain}' | sort | uniq -c | tr '\\n' ' '")
 }
 
 test "a daemon build child for a body edit runs only the C toolchain, and its output matches a cold build" {
@@ -121,11 +120,15 @@ test "a daemon build child for a body edit runs only the C toolchain, and its ou
     let pid = start_daemon(warm)
     let mut problems: List[Str] = []
     let mut execs = ""
+    let mut before = -1
     let mut builds = -1
     with cleanup(fn() { stop_daemon(pid) }) {
         assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
         let first = client(warm, "build src/main.bl -o out/app")
         if first.exit_code != 0 { problems.push("first build: {first.out}{first.err_out}") }
+        // The daemon declines the first build when the copied archive was made by another
+        // compiler, and the client then rebuilds it, so only the edit's build is counted.
+        before = served(warm, "builds")
         write_leaf(warm, "edited")
         write_leaf(cold, "edited")
         let from = sh("wc -l < {warm}/exec.log").to_int()
@@ -139,6 +142,6 @@ test "a daemon build child for a body edit runs only the C toolchain, and its ou
     }
     shell_exec("rm -rf {warm} {cold}")
     assert_eq(problems.join("\n"), "")
-    assert_eq(builds, 2)
+    assert_eq(builds, before + 1)
     assert_eq(execs, "")
 }
