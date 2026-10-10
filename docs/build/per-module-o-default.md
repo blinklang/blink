@@ -1411,6 +1411,55 @@ An entry that is in none of these groups makes the build take nothing.
 A source that declares an effect is read by every unit, so an edit there
 emits every unit again. This was so before this change.
 
+#### What `__main__` reads
+
+`emit_module_head` writes `__main__` from the parts below, sorted into
+the same groups.
+
+(a) Reset for each unit:
+
+- `__main__` starts from `begin_unit`, as every unit does;
+- `program_facts` finds the init names before the build emits a unit. It
+  lowers the globals of every module, throws the lowering away, and calls
+  `begin_unit` again. The `__main__` emit therefore lowers no code of
+  another module, and no closure, walker or typedef of that lowering can
+  reach its text.
+
+(b) Named from content:
+
+- the key tables (`kops_table`, from the key type);
+- the effect fields `ue_<root>` and the default ops;
+- the init calls, `__blink_init_globals_<module>`;
+- the C symbol of each test.
+
+(c) Compared or keyed:
+
+- the evidence storage: the vtable typedef, the default and the `ue_`
+  field of each effect. A new or changed effect is an item other than a
+  fn or an import, so the build takes nothing;
+- its own globals and their init fn, from its own source;
+- the init calls. A global of another module that changes between a
+  constant and a run-time initializer adds or removes a call. Its
+  initializer is an item other than a fn, so the build takes nothing, and
+  the `init` lines of the entry key hold the names too;
+- `main`, spawns, tests and key table names: the entry key;
+- a new key type: the types header;
+- the eq and hash of each key table, lowered with the span of the node
+  the table is written from: the unit marks that node's source, and the
+  entry key holds it (`table_source`);
+- the generic private copies it prints: their nodes mark their sources;
+- `cfg`: the inputs text.
+
+A test in an imported module does not reach `__main__`: `blink test`
+builds each file with its own tests as the entry. The test is still an
+item other than a fn, so the build takes nothing.
+
+Some edits emit `__main__` again with the same text. A second Map with a
+key type that a Map in an earlier source already has moves the node the
+table is written from. A body edit in a source that declares an effect
+changes a source the unit reads. Each costs one emit of `__main__`, and
+each build is byte-equal to a cold build.
+
 #### Bench
 
 Through the daemon, settle 1 s, 11 reps, median seconds (min-max). Base
@@ -1454,10 +1503,11 @@ cost 63-69 ms of each body edit through the daemon: 53-59 ms to generate,
 `__main__` could not be taken because its uses list held every source.
 `module_init_fn_names` lowers the globals of every module to find the
 modules with a global set at run time, and throws the lowering away.
-That lowering marked each source as read by the unit. It now stops the
-marks (`ir_sources_pause` and `ir_sources_resume` in `src/ir.bl`). On
-cli the uses list of `__main__` drops to `src/cli.bl` and
-`lib/std/list.bl`.
+That lowering ran in the `__main__` emit and marked each source as read
+by the unit. It now runs in `program_facts`, before any unit, and also
+stops the marks while it runs (`ir_sources_pause` and
+`ir_sources_resume` in `src/ir.bl`). On cli the uses list of `__main__`
+drops to `src/cli.bl` and `lib/std/list.bl`.
 
 `__main__` also reads facts of the whole program that no source span
 carries. The record keeps their sha256 in a line `entry <sha>` (schema
@@ -1481,9 +1531,15 @@ the entry module's tests reach the program, so a new test changes the
 entry source, which `__main__` reads. A new key type changes the types
 header, so the build takes nothing.
 
-The build finds the init names for the key with one function, both when
-it emits `__main__` and when it takes it, so the two keys cannot differ
-by how they were found. That costs about 7 ms on cli.
+`program_facts` finds the init names once, about 7 ms on cli. The
+`__main__` emit calls them and the key holds them from that one list, so
+the two cannot differ by how they were found.
+
+Under `BLINK_EMIT_REUSE_VERIFY=1`, a unit that is not byte-equal to its
+cold emit fails the build with the reason: each source the cold emit
+read that the unit did not mark or, for `__main__` with no such source,
+that the entry key leaves out a fact of the whole program. The error
+also gives the first line that differs.
 
 `hash_place` (27-32 ms) and the types header (about 10 ms) are not cut:
 `hash_place` hashes `runtime.h`, `libblink_std.h` and each unit file the
