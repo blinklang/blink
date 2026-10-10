@@ -1,0 +1,126 @@
+// A build runs cc without sh when sh would only split its command into words. When cc fails,
+// the user must see what a run through sh shows: the same text on the same streams and the
+// same exit code, for a unit compile and for the link, when cc exits nonzero and when a
+// signal ends it. An output path holding `#` puts a shell byte in each cc command, so the
+// same binary builds the same program once through sh and once without it.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/fakebin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"cc_fails_as_through_sh_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    // No header declares the symbol, so cc rejects the unit that calls it.
+    write_file("{tree}/app/src/undeclared.bl", [
+        #"@ffi("blink_symbol_no_header_declares")"#,
+        #"@trusted(audit: "a call cc rejects, to fail a unit compile")"#,
+        #"fn undeclared() -> I32 ! FFI {}"#,
+        #""#,
+        #"fn main() ! FFI {"#,
+        #"    io.println("{undeclared().to_int()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/fine.bl", [
+        #"fn main() {"#,
+        #"    io.println("fine")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    // FAKE_CC picks what the wrapper does in place of cc: fail or kill the link (a run with
+    // no -c), or kill a unit compile (a run with -c). Any other run goes to the real cc.
+    write_file("{tree}/fakebin/cc", [
+        "#!/bin/sh",
+        "link=1",
+        "for a in \"$@\"; do [ \"$a\" = -c ] && link=0; done",
+        "case \"$FAKE_CC:$link\" in",
+        "    link-fails:1) echo \"fake-ld: out line\"; echo \"fake-ld: undefined reference to blink_symbol_nobody_defines\" >&2; exit 1 ;;",
+        "    link-killed:1) echo \"fake-ld: killed\" >&2; kill -9 $$ ;;",
+        "    compile-killed:0) echo \"fake-cc1: killed\" >&2; kill -9 $$ ;;",
+        "esac",
+        "exec {sh("command -v cc")} \"$@\"",
+        "",
+    ].join("\n"))
+    shell_exec("chmod +x {tree}/fakebin/cc")
+}
+
+// What a build shows and how it ends, with the output dir's name and each units dir's random
+// part made the same for both runs.
+type Seen {
+    exit_code: Int
+    out: Str
+    err_out: Str
+    shells: Int
+}
+
+// Builds src in tree to out_dir/app with the wrapper doing what mode says, each run with an
+// object cache of its own so no run reuses another's objects. Under strace, when there is
+// one, it counts the shells the build started.
+fn build(tree: Str, src: Str, out_dir: Str, mode: Str, traced: Bool) -> Seen {
+    let n = sh("ls -d {tree}/oc_* 2>/dev/null | wc -l")
+    let st = "{tree}/exec_{n}.log"
+    let wrap = if traced { "strace -f -qq -e trace=execve -e status=successful -o {st} " } else { "" }
+    let r = process_run("sh", ["-c", "cd {tree}/app && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE CCACHE_DISABLE=1 FAKE_CC={mode} PATH={tree}/fakebin:$PATH BLINK_CACHE_DIR={tree}/oc_{n} {wrap}../build/blink build src/{src} -o '{out_dir}/app'"])
+    shell_exec("mkdir -p {tree}/oc_{n}")
+    let shells = if traced { sh("grep -c 'execve(\"[^\"]*/sh\"' {st}").to_int() } else { -1 }
+    Seen { exit_code: r.exit_code, out: same_names(r.out, out_dir), err_out: same_names(r.err_out, out_dir), shells: shells }
+}
+
+fn same_names(text: Str, out_dir: Str) -> Str {
+    let mut s = text.replace(out_dir, "OUT")
+    let mut from = 0
+    loop {
+        match s.byte_index_of(".units.", from) {
+            Some(at) => {
+                let start = at + 7
+                let mut end = start
+                while end < s.byte_len() && s.byte_at(end) != 47 { end = end + 1 }
+                s = "{s.byte_slice(0, start)}X{s.byte_slice(end, s.byte_len())}"
+                from = start + 1
+            }
+            None => break
+        }
+    }
+    s
+}
+
+test "a failed cc run without sh shows what a run through sh shows, and exits the same" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_cc_fails_as_through_sh_{getpid()}"
+    dev_tree(root, tree)
+    let traced = sh("command -v strace") != ""
+    let mut problems: List[Str] = []
+    let mut seen: List[Str] = []
+    for case in [("undeclared.bl", ""), ("fine.bl", "link-fails"), ("fine.bl", "link-killed"), ("fine.bl", "compile-killed")] {
+        let (src, mode) = case
+        let direct = build(tree, src, "out_", mode, traced)
+        let through_sh = build(tree, src, "out#", mode, traced)
+        let name = "{src} {mode}"
+        seen.push("{name}: exit {direct.exit_code}\n{direct.out}{direct.err_out}")
+        if direct.exit_code == 0 { problems.push("{name}: the build passed") }
+        if direct.exit_code != through_sh.exit_code { problems.push("{name}: exit {direct.exit_code} without sh, {through_sh.exit_code} through sh") }
+        if direct.out != through_sh.out { problems.push("{name}: stdout\n{direct.out}-- through sh --\n{through_sh.out}") }
+        if direct.err_out != through_sh.err_out { problems.push("{name}: stderr\n{direct.err_out}-- through sh --\n{through_sh.err_out}") }
+        if traced && (direct.shells != 0 || through_sh.shells == 0) { problems.push("{name}: {direct.shells} shells without sh, {through_sh.shells} through sh") }
+    }
+    shell_exec("rm -rf {tree}")
+    assert_eq(problems.join("\n"), "")
+    let all = seen.join("\n")
+    assert(all.contains("implicit declaration of function") && all.contains("blink_symbol_no_header_declares"), "the unit's cc error did not reach the user: {all}")
+    assert(all.contains("error: C compilation failed in unit __main__"), "got: {all}")
+    assert(all.contains("fake-ld: out line") && all.contains("fake-ld: undefined reference to blink_symbol_nobody_defines"), "the link's output did not reach the user: {all}")
+    assert(all.contains("error: C compilation failed while linking"), "got: {all}")
+    assert(all.contains("fake-ld: killed") && all.contains("fake-cc1: killed"), "got: {all}")
+}
