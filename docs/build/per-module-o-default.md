@@ -1576,10 +1576,20 @@ hold the full rows. Every C hash check reads 11/11.
 
 On cli the body and fn rows drop by 35-52 ms, which is most of the
 63-69 ms `__main__` emit but not all. One part left is the init names,
-which the take path finds again. small does not change: its `__main__`
-costs 0-1 ms. `test-body-cname` does not change; this bench does not
-split its emit. No row is slower outside its spread. An edit to the
-entry file still emits `__main__`.
+which each build finds, about 7 ms on cli. small does not change: its
+`__main__` costs 0-1 ms. `test-body-cname` does not change; this bench
+does not split its emit. No row is slower outside its spread. An edit to
+the entry file still emits `__main__`.
+
+Finding the init names in `program_facts` instead of in the `__main__`
+emit and the take path does not change an edit build. The same bench ran
+`ab1aed21` (sha256 `e851cf84…`) and `a0b43999` (sha256 `3831bb98…`) in
+turn, four runs. On the body, fn and nochange rows the medians differ by
+22 ms at most, and not in one direction.
+`cold-all` on cli reads 4.995 and 4.992 s for `ab1aed21`, 5.063 and
+5.022 s for `a0b43999`: 30-70 ms slower, outside the spread in one of
+the two runs. small does not change.
+`bench/edit_loop/entry_facts_daemon_settle1_*.tsv` hold the full rows.
 
 ## Blockers before the default flipped
 
