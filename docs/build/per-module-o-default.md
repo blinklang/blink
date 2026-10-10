@@ -1267,6 +1267,56 @@ The cc calls did not change. A new fn costs about 0.03 s more, all of it
 in `emit_s`: the scan reads each unit one byte at a time. The `cold-obj`
 and `cold-all` rows did not change, so the flag costs cc nothing.
 
+A build with no shell. A daemon build child of the small target started 44
+programs past the C toolchain for one body edit (strace): 18 `sh`, 5 `rm`,
+4 `sha256sum`, 3 `mkdir`, 3 `xargs`, 2 `mv`, and `awk`, `cat`, `cut`,
+`date`, `du`, `head`, `mktemp`, `nproc` and `touch` once each. It now hashes its units and keys in
+process (`src/sha256.bl`), makes, removes and renames its directories and
+touches its cache entries in process (`src/build_fs.bl`), and starts `cc` and
+the link with no `sh` when the command holds no byte `sh` would read as more
+than a word break. It still starts `du` (the cache is held to
+the blocks its files take, and the FFI cannot read a `stat`) and `ln` (the
+FFI cannot bind `link(2)`; this edit did not start it). A file over 1 MiB is hashed by `sha256sum`, run
+with no shell. The keys are the same bytes `sha256sum` gave, so a cache on
+disk still hits. The cache GC, past its cap, still lists by age in `sh`.
+
+`task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 11 reps, under
+`blink-gates.slice`, on the `82c21d3a` tree, alternating the gen1 `blink`
+built from `90a4d660` (before, sha256 `8c19d135eb12dd4d`) and from
+`82c21d3a` (after, sha256 `d980d20f054d2320`): before, after, before, after,
+per target. Median wall seconds [min-max] over the 22 builds of both runs
+of a binary; `emit` is the change in the median `emit_s`.
+`no_shell_daemon_settle1_<target>_run<n>_<sha>.tsv` hold the rows. Load1 was
+at most 3.05.
+
+| target | case | before | after | change | emit |
+|---|---|---|---|---|---|
+| cli | nochange | 0.1780 [0.171-0.190] | 0.1440 [0.137-0.154] | -34.0 ms | -33.0 ms |
+| cli | body-cname | 0.5460 [0.521-0.591] | 0.4985 [0.461-0.528] | -47.5 ms | -46.0 ms |
+| cli | body-typecheck | 0.6050 [0.578-0.626] | 0.5340 [0.513-0.551] | -71.0 ms | -72.0 ms |
+| cli | pubfn-cname | 1.0090 [0.987-1.043] | 0.9275 [0.900-0.954] | -81.5 ms | -81.5 ms |
+| cli | privfn-cname | 1.0110 [0.992-1.043] | 0.9270 [0.913-0.951] | -84.0 ms | -86.0 ms |
+| cli | pubfn-typecheck | 0.9080 [0.886-0.936] | 0.8210 [0.797-0.856] | -87.0 ms | -89.0 ms |
+| cli | privfn-typecheck | 0.9375 [0.896-0.962] | 0.8365 [0.810-0.857] | -101.0 ms | -100.0 ms |
+| cli | run-body-cname | 0.6030 [0.587-1.060] | 0.5215 [0.503-0.946] | -81.5 ms | -80.0 ms |
+| cli | test-body-cname | 0.4860 [0.480-0.493] | 0.4570 [0.450-0.464] | -29.0 ms | -30.0 ms |
+| cli | cold-obj | 2.3705 [2.351-2.554] | 2.2475 [2.229-2.452] | -123.0 ms | -117.0 ms |
+| cli | cold-all | 4.9980 [4.975-5.027] | 4.9055 [4.876-4.923] | -92.5 ms | -83.5 ms |
+| small | nochange | 0.0600 [0.058-0.062] | 0.0440 [0.041-0.048] | -16.0 ms | -16.5 ms |
+| small | body-inventory | 0.1130 [0.110-0.115] | 0.0900 [0.087-0.093] | -23.0 ms | -23.0 ms |
+| small | pubfn-model | 0.1040 [0.102-0.107] | 0.0810 [0.078-0.085] | -23.0 ms | -24.0 ms |
+| small | privfn-model | 0.1045 [0.100-0.107] | 0.0810 [0.078-0.084] | -23.5 ms | -24.0 ms |
+| small | run-body-inventory | 0.1130 [0.111-0.117] | 0.0910 [0.087-0.094] | -22.0 ms | -22.0 ms |
+| small | test-body-inventory | 0.1350 [0.132-0.138] | 0.1170 [0.114-0.119] | -18.0 ms | -19.0 ms |
+| small | cold-obj | 0.1110 [0.109-0.117] | 0.0860 [0.082-0.094] | -25.0 ms | -24.5 ms |
+
+- Each row is faster, and the time comes out of `emit_s`; the `cc_s` and
+  `link_s` medians and the cc calls did not change. No small row's range
+  overlaps the other binary's.
+- A small body edit drops 22-23 ms, about 40% of its `emit_s`. The cli rows
+  drop 29-123 ms.
+- The C of each build matches the warm C in every row (`c_check`).
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the

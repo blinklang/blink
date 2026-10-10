@@ -106,9 +106,9 @@ LRU-by-mtime is good enough — no need to track real access counts.
 
 ### 5. Atomic writes + concurrency
 
-- Each compile gets a private dir, `tmp/unit.<rand>/` (`mktemp -d`). The
-  build copies the `.c` into it, then hashes and compiles that copy, so
-  the bytes in the key are the bytes compiled. Another build can rewrite
+- Each compile gets a private dir, `tmp/unit.<rand>/`, made `0700` as
+  `mktemp -d` makes it. The build copies the `.c` into it, then hashes
+  and compiles that copy, so the bytes in the key are the bytes compiled. Another build can rewrite
   the original `.c` at any time. A pid is not enough for the name: two
   pid namespaces can share a cache dir.
 - Write the `.o` into that dir, then `rename(2)` it to `<hash>.o`. POSIX
