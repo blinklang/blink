@@ -906,15 +906,21 @@ pub type ModuleHeaders {
 pub type ProgramFacts {
     key_table_nodes: List[Int]
     carrier_tids: List[Int]
+    // The init names the entry unit's shim calls. Finding one lowers another module's
+    // globals, so it runs here, before any unit: the entry unit's emit then lowers no code
+    // but its own, and its key holds the names its text calls.
+    entry_init_fns: List[Str]
 }
 
-pub fn program_facts(program: Int) -> ProgramFacts ! Diag.Report {
+pub fn program_facts(program: Int, cfg: CgConfig) -> ProgramFacts ! Diag.Report {
     begin_unit(program)
-    ProgramFacts { key_table_nodes: cg_derive_key_table_nodes(), carrier_tids: cg_decl_spelled_carrier_tids() }
+    let init_fns = module_init_fn_names(cfg)
+    begin_unit(program)
+    ProgramFacts { key_table_nodes: cg_derive_key_table_nodes(), carrier_tids: cg_decl_spelled_carrier_tids(), entry_init_fns: init_fns }
 }
 
 pub fn generate_module_headers(program: Int, module_key: Str, cfg: CgConfig) -> ModuleHeaders ! Codegen, Diag.Report {
-    let facts = program_facts(program)
+    let facts = program_facts(program, cfg)
     generate_module_headers_with(program, module_key, cfg, facts)
 }
 
@@ -1057,10 +1063,9 @@ fn surface_decls(decls: List[Int], want_surface: Bool) -> List[Int] {
 // A module defines only the globals it owns — two objects defining the same C symbol is
 // a link error, not a codegen detail — and, when at least one of its own globals is not a
 // literal, a non-static init function assigning them, callable from outside this unit. The
-// entry module also gathers every other module's init-fn name here, since every module's
-// registries are already loaded by `begin_unit` above regardless of whose object this is.
+// entry module's shim calls every module's, by the names in facts.
 pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
-    let facts = program_facts(program)
+    let facts = program_facts(program, cfg)
     generate_module_object_with(program, module_key, self_header, cfg, facts)
 }
 
@@ -1101,7 +1106,7 @@ fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: Pro
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
     emit_definitions_of(cfg, module_key, fns, methods, facts.key_table_nodes, true)
-    if module_key == "__main__" { emit_entry(cfg, module_init_fn_names(cfg, module_key, deferred)) }
+    if module_key == "__main__" { emit_entry(cfg, facts.entry_init_fns) }
     if copies_on_demand(cfg, module_key) { emit_named_private_copies(cfg) }
     print_take()
 }
@@ -1277,25 +1282,17 @@ fn hex32(v: Int) -> Str {
 
 // Every module's init-fn name the entry unit's shim must call, in module order (the same
 // first-seen order `cg_reg_modules` yields, which is import order — an imported module is
-// merged ahead of the importing module, so its init call lands first). The entry module's
-// own name comes from `self_deferred`, already computed by the caller; every other
-// module's is answered by lowering that module's own globals here, which is safe and
-// cheap to discard: this only checks whether a name is needed, and never prints.
-//
-// This calls `cg_reg_modules` directly rather than `enumerate_program_modules`: the
-// latter calls `begin_unit`, which resets the print buffer this unit has already written
-// into.
-fn module_init_fn_names(cfg: CgConfig, module_key: Str, self_deferred: List[Int]) -> List[Str] ! Diag.Report {
+// merged ahead of the importing module, so its init call lands first). Each is answered by
+// lowering that module's own globals, which is safe to discard: this only checks whether a
+// name is needed, and never prints. The entry module's globals answer the same Const
+// question here as in its unit's head.
+fn module_init_fn_names(cfg: CgConfig) -> List[Str] ! Diag.Report {
     // The lowering below is thrown away, so the instances it names and the sources it spans
-    // are not this unit's. The entry key holds the names this answers.
+    // are no unit's, even if a unit is being emitted.
     let named = named_instance_rows()
     let track = ir_sources_pause()
     let mut out: List[Str] = []
     for m in cg_reg_modules() {
-        if m == module_key {
-            if self_deferred.len() > 0 { out.push(c_module_init_globals_name(m)) }
-            continue
-        }
         let g = globals_in_scope(cfg, m, false)
         if cg_decl_has_deferred_global(g, lower_global_inits(g)) {
             out.push(c_module_init_globals_name(m))
@@ -1304,15 +1301,6 @@ fn module_init_fn_names(cfg: CgConfig, module_key: Str, self_deferred: List[Int]
     set_named_instance_rows(named)
     ir_sources_resume(track)
     out
-}
-
-// The init names the entry unit's shim calls, found as its emit finds them, for the entry
-// key. A build finds them here whether it emits the unit or takes it, so the key of a build
-// that emits it and of one that takes it come from one function. The entry module is found
-// among the rest: its own globals answer the same Const question there as in its unit's head.
-pub fn entry_unit_init_fns(program: Int, cfg: CgConfig) -> List[Str] ! Diag.Report {
-    begin_unit(program)
-    module_init_fn_names(cfg, "", [])
 }
 
 // The facts the entry unit's text reads that no source span carries, one per line: whether

@@ -48,7 +48,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
-import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts, entry_unit_init_fns}
+import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
 import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
@@ -1677,7 +1677,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     dbg_trace("build.units", "emit")
     let entries_before = diag_entry_count()
     let ice_before = diag_ice_count
-    let facts = program_facts(program)
+    let facts = program_facts(program, cfg)
     let unit_modules = archive_unit_modules(program, cfg)
     let urc = units_bail_on_diag()
     if urc != 0 { return Err(urc) }
@@ -1699,7 +1699,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             match taken {
                 Some(t) => {
                     if units_hold_module(t.units, "__main__") {
-                        taken_entry_key = entry_unit_key(program, cfg, facts, sources, entry_unit_init_fns(program, cfg))
+                        taken_entry_key = entry_unit_key(program, facts, sources)
                         if taken_entry_key != lb.rec.entry_key {
                             dbg_trace("build.units", "skip unit __main__: the facts of the whole program it reads differ")
                             taken = Some(emit_record.without_unit(t, "__main__"))
@@ -1813,7 +1813,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     }
     let mut entry_key = taken_entry_key
     if entry_key == "" && inputs != "" && by_module.contains_key("__main__") {
-        entry_key = entry_unit_key(program, cfg, facts, sources, entry_unit_init_fns(program, cfg))
+        entry_key = entry_unit_key(program, facts, sources)
     }
     if verify {
         let vrc = verify_against_cold_emit(program, modules, cfg, out, dir, chunk_decls)
@@ -1847,7 +1847,7 @@ fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, uni
 }
 
 fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, vdir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO {
-    let facts = program_facts(program)
+    let facts = program_facts(program, cfg)
     let hs = match write_unit_headers(program, modules, cfg, facts, vdir, true, None) {
         Ok(h) => h
         Err(rc) => return rc
@@ -1975,13 +1975,12 @@ fn units_hold_module(units: List[emit_record.EmittedUnit], m: Str) -> Bool {
 
 // The sha of what the entry unit's text reads of the whole program with no source span to key
 // it: the facts entry_unit_facts gives, the init names its shim calls, and the source of the
-// node each key table is written from, whose position the table's lowering spans. init_fns
-// are the names its emit found, or would find.
-fn entry_unit_key(program: Int, cfg: CgConfig, facts: ProgramFacts, sources: UnitSources, init_fns: List[Str]) -> Str ! Diag.Report {
+// node each key table is written from, whose position the table's lowering spans.
+fn entry_unit_key(program: Int, facts: ProgramFacts, sources: UnitSources) -> Str ! Diag.Report {
     // No unit is being emitted, so nothing read here is a unit's.
     ir_track_sources([], [])
     let mut lines = entry_unit_facts(program, facts)
-    for n in init_fns { lines.push("init {n}") }
+    for n in facts.entry_init_fns { lines.push("init {n}") }
     for node in facts.key_table_nodes { lines.push("table_source {source_of_node(sources, node)}") }
     sha256_hex(lines.join("\n"))
 }
@@ -4231,7 +4230,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         exit(1)
     }
 
-    let facts = program_facts(final_program)
+    let facts = program_facts(final_program, mod_cfg)
     let hs = match write_unit_headers(final_program, modules, mod_cfg, facts, out_dir, false, None) {
         Ok(h) => h
         Err(rc) => {
