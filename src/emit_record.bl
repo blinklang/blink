@@ -46,6 +46,22 @@ pub type EmittedUnit {
     // among them. Empty when the build could not tell, and then no later build takes the
     // unit on its own.
     uses: List[Str]
+    // The files cut off the unit, each compiled and cached as a unit is; the head, in
+    // {module}.c, holds the rest. A build emits, or takes, all of a unit's files or none.
+    chunks: List[UnitChunkFile]
+}
+
+pub type UnitChunkFile {
+    stem: Str
+    c_bytes: Int
+    headers: List[Str]
+}
+
+// Every file of u, the head first.
+pub fn unit_files(u: EmittedUnit) -> List[UnitChunkFile] {
+    let mut out = [UnitChunkFile { stem: u.module, c_bytes: u.c_bytes, headers: u.headers }]
+    for c in u.chunks { out.push(c) }
+    out
 }
 
 // The units of a record this build took, and the shas of the files they are in, by the names
@@ -56,7 +72,7 @@ pub type ReusedUnits {
 }
 
 let RECORD_NAME: Str = ".emit-record"
-let RECORD_SCHEMA: Str = "emit-record-4"
+let RECORD_SCHEMA: Str = "emit-record-5"
 let INPUTS_NAME: Str = ".emit-inputs"
 // The last build's inputs text, linked into the new units directory, so the text a build
 // compares is the one whose sha it checked against the record.
@@ -79,7 +95,7 @@ fn add_input(sb: StringBuilder, tag: Str, value: Str) {
 }
 
 // The inputs of the emit of the program the front end last built, as one text.
-pub fn inputs_text(source_path: Str, cfg: CgConfig, strict_mode: Int, compiler_sha: Str, argv0: Str) -> Str {
+pub fn inputs_text(source_path: Str, cfg: CgConfig, strict_mode: Int, compiler_sha: Str, argv0: Str, unit_chunk_decls: Int) -> Str {
     // On a large program the text is megabytes; reserved once, it leaves no garbage for the
     // collector from growing.
     let mut size = 4096
@@ -100,6 +116,7 @@ pub fn inputs_text(source_path: Str, cfg: CgConfig, strict_mode: Int, compiler_s
     add_input(sb, "deterministic", "{cfg.deterministic}")
     add_input(sb, "emit_only_module", cfg.emit_only_module)
     add_input(sb, "user_tu_mode", "{cfg.user_tu_mode}")
+    add_input(sb, "unit_chunk_decls", "{unit_chunk_decls}")
     add_input(sb, "strict", "{strict_mode}")
     add_input(sb, "strict_struct_layout", "{compiler_strict_struct_layout}")
     // A Map lists its keys in no fixed order, and the text must not change between builds.
@@ -197,6 +214,7 @@ pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[S
     sb.write("{RECORD_SCHEMA}\ninputs {inputs.byte_len()} {shas.get(INPUTS_NAME) ?? "-"}\n")
     for u in units {
         sb.write("unit {u.module} {u.c_bytes} {u.headers.join(",")}\n")
+        for c in u.chunks { sb.write("chunk {u.module} {c.stem} {c.c_bytes} {c.headers.join(",")}\n") }
         // A path is the rest of its line, so one that holds a line break cannot be read back,
         // and the unit is then left for a later build to emit.
         let mut whole = true
@@ -259,6 +277,7 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
     }
     let mut units: List[EmittedUnit] = []
     let mut uses: Map[Str, List[Str]] = Map()
+    let mut chunks: Map[Str, List[UnitChunkFile]] = Map()
     let mut files: List[Str] = []
     let mut shas: Map[Str, Str] = Map()
     let mut ended = false
@@ -287,7 +306,13 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
         let kind = parts.get(0).unwrap()
         if kind == "unit" && parts.len() == 4 {
             let hs = parts.get(3).unwrap()
-            units.push(EmittedUnit { module: parts.get(1).unwrap(), c_bytes: parts.get(2).unwrap().to_int(), headers: if hs == "" { [] } else { hs.split(",") }, uses: [] })
+            units.push(EmittedUnit { module: parts.get(1).unwrap(), c_bytes: parts.get(2).unwrap().to_int(), headers: if hs == "" { [] } else { hs.split(",") }, uses: [], chunks: [] })
+        } else if kind == "chunk" && parts.len() == 5 {
+            let m = parts.get(1).unwrap()
+            let hs = parts.get(4).unwrap()
+            let mut cs = chunks.get(m) ?? []
+            cs.push(UnitChunkFile { stem: parts.get(2).unwrap(), c_bytes: parts.get(3).unwrap().to_int(), headers: if hs == "" { [] } else { hs.split(",") } })
+            chunks.insert(m, cs)
         } else if kind == "file" && parts.len() == 3 {
             files.push(parts.get(1).unwrap())
             shas.insert(parts.get(1).unwrap(), parts.get(2).unwrap())
@@ -299,12 +324,15 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
         return None
     }
     let mut with_uses: List[EmittedUnit] = []
-    for u in units {
-        if !shas.contains_key("{u.module}.c") { return None }
-        for h in u.headers {
-            if !shas.contains_key(h) { return None }
+    for u0 in units {
+        let u = EmittedUnit { uses: uses.get(u0.module) ?? [], chunks: chunks.get(u0.module) ?? [], ..u0 }
+        for f in unit_files(u) {
+            if !shas.contains_key("{f.stem}.c") { return None }
+            for h in f.headers {
+                if !shas.contains_key(h) { return None }
+            }
         }
-        with_uses.push(EmittedUnit { uses: uses.get(u.module) ?? [], ..u })
+        with_uses.push(u)
     }
     Some(EmitRecord { inputs_len: head.get(1).unwrap().to_int(), inputs_sha: head.get(2).unwrap(), units: with_uses, files: files, shas: shas })
 }
@@ -450,7 +478,7 @@ pub fn take_units(from_dir: Str, to_dir: Str, inputs: Str, candidates: List[Str]
         }
         if ok {
             taken.push(u)
-            c_names.push("{u.module}.c")
+            for f in unit_files(u) { c_names.push("{f.stem}.c") }
         }
     }
     if taken.len() == 0 { return None }
