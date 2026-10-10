@@ -1664,6 +1664,12 @@ The AI gets structured feedback — result value, type, effects actually perform
 | `blink daemon start` | Start compiler daemon explicitly |
 | `blink daemon status` | Show daemon status and graph stats |
 | `blink daemon stop` | Stop compiler daemon |
+| **Language Reference** | |
+| `blink llms` | Print the index of the language reference (§8.17) |
+| `blink llms --full` | Print the core: the language rules, at most 46,000 bytes |
+| `blink llms --topic <name>` | Print one topic, at most 12 KiB |
+| `blink llms --list` | List topic names with their sizes in bytes |
+| `blink llms --all` | Print the core and every topic |
 | **Evolution** | |
 | `blink migrate` | Apply deprecation fixes, update edition in blink.toml |
 | `blink migrate --dry-run` | Show what `migrate` would change without applying |
@@ -1956,7 +1962,110 @@ The changelog is also exposed in the `llms.txt` header (§8.3) as an edition-spe
 
 ---
 
-### 8.17 Summary
+### 8.17 In-Context Language Reference
+
+An agent writes correct Blink only when the rules it must obey are in its context. The full specification is about 245k tokens, and no agent can hold that. So Blink defines a **core**: a subset of this specification that fits one context budget and is enough to write correct programs. `blink llms --full` prints it.
+
+**Panel vote: 6-0** on every point in this section except the topic cap (5-1, §8.17.2). See [decisions/reference-context-budget.md](../decisions/reference-context-budget.md).
+
+#### 8.17.1 The Core
+
+**One source.** The core is made of marked blocks inside this specification. It is not a second text. This specification is the only normative source. The generator builds the core text and the `blink llms` output from it, and nobody edits that output by hand. If the committed core text is not equal to what the generator prints for the current specification, the build fails.
+
+**Core blocks.** A core block is a marked span of a section:
+
+```
+<!-- core:types.match.exhaustive -->
+Rule text, with its examples as fenced `blink` code.
+<!-- /core -->
+```
+
+- Each block has a **semantic ID**: lowercase words joined by dots. The ID stays the same when sections are renumbered. Each ID is unique in the specification.
+- A block must be correct when it is the only text the reader has. It names what it uses and does not depend on prose outside the block.
+- Examples go inside the block as fenced `blink` code. A block can also hold a derivation line (`e? ≡ match e { ... }`) beside its example.
+- A block states rules. Rationale stays outside core blocks.
+
+**Byte cap.** The generated core is at most **46,000 bytes**. At the measured 2.3 bytes per token, that is about 20k tokens. The cap is in bytes so that the check is the same on each machine and needs no tokenizer. A core over the cap fails the build, and there is no allowlist. Only a panel vote can raise the cap. Each release reports the measured bytes per token. That figure is information, not a check.
+
+**What the core holds.**
+
+- The language: the rules a program must obey, in specification order.
+- The names of the prelude types and traits, and one line for each prelude trait.
+- One pointer line for each topic that holds content outside the core, for example:
+
+  ```
+  FFI: `blink llms --topic ffi`
+  ```
+
+**What the core does not hold.** Method tables, install steps, CLI and build flags, emit modes, the daemon, FFI detail and arena detail. These are topics (§8.17.2).
+
+**Head and tail lists.** The core starts with a **divergence list**: the facts where Blink differs from what a capable model assumes. The core ends with a **common-errors list**. These lists are core blocks too. Each bullet in them cites the ID of the core block that states the rule.
+
+**API-shape divergences.** Sometimes a model guesses the shape of a standard-library method wrong, for example its return type or how to call it. That fact goes in the divergence list as a core block. lib/std gets no marker for it. The block's examples must pin the shape so that a change in lib/std makes them fail: an annotated binding for the type, and an error example for the form that does not compile.
+
+```blink
+fn main() ! IO {
+    let mut m = Map.new[Str, Int]()
+    m.insert("k", 1)
+    let v: Option[Int] = m.remove("k")    // remove returns the old value, not Bool
+    io.println("{v ?? 0}")
+}
+```
+
+```blink
+fn main() {
+    let mut m = Map.new[Str, Int]()
+    m["k"] = 1                            // error[NoIndexOperator] -- intentional-error example
+}
+```
+
+**Closure.** The core is closed under its own references. Each ID or `§` reference in the generated core names a core block, or is written as an explicit `--topic` pointer. Prelude names and keywords count as defined. Words in the prose are not checked.
+
+#### 8.17.2 Topics
+
+All content outside the core is served as topics. `blink llms --topic <name>` prints one topic.
+
+- Each topic is at most **12 KiB** (12,288 bytes), so one topic is one small fetch. (Panel vote: 5-1. Minimalism dissented: add a topic cap only when a topic grows too large.)
+- The index that `blink llms` prints with no flag is at most **6 KiB** (6,144 bytes).
+- Standard-library API topics are generated from the lib/std declarations, the same data that `blink doc` reads. Nobody writes a method table by hand.
+- CLI and build-flag topics are generated from the CLI's command and flag registrations.
+
+A topic name is what an agent would guess: `ffi`, `build`, `cli`, or a type or module name.
+
+#### 8.17.3 `blink llms`
+
+| Command | Prints | Size limit |
+|---------|--------|------------|
+| `blink llms` | The index: what Blink is, the commands below, and the topic names | 6 KiB |
+| `blink llms --full` | The core | 46,000 bytes |
+| `blink llms --topic <name>` | One topic | 12 KiB |
+| `blink llms --list` | Each topic name with its size in bytes | — |
+| `blink llms --all` | The core and every topic | None |
+
+`--full` is the core with a size limit. `blink init` writes `blink llms --full` into a project's agent instructions, so the meaning of `--full` does not change. `--all` makes no size promise. With the sizes from `--list`, an agent can choose what to fetch.
+
+#### 8.17.4 Checks
+
+The build fails unless each of these is true:
+
+1. The core is at most 46,000 bytes, each topic is at most 12 KiB, and the index is at most 6 KiB.
+2. Each `blink` fence in the core and in the topics compiles. An intentional-error example fails with exactly the code that it names.
+3. The committed generated reference is equal to the generator output.
+4. Each ID is unique, and each ID reference resolves.
+5. The core is closed (§8.17.1 *Closure*).
+6. Each diagnostic code in the core is in the diagnostic catalog.
+
+Two properties have no check: that a block is correct alone, and that a rule earns its place in the core. Review enforces them.
+
+#### 8.17.5 Authoring Rules
+
+- **What goes in the core.** Put a rule in the core when a capable model with no Blink knowledge would probably get it wrong. Leave out what such a model gets right, and what it can fetch when a compile error tells it to look.
+- **A closure failure.** The usual fix is a `--topic` pointer, not a larger core. Move a block into the core only when the rule above puts it there.
+- **Rationale labels.** A paragraph either states a rule or explains one. A paragraph that explains a rule has the label `*Rationale.*` and never a label that calls it normative.
+
+---
+
+### 8.18 Summary
 
 The tooling story is not a feature list — it is the thesis of the language:
 
