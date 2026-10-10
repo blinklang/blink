@@ -1,0 +1,144 @@
+// A body edit served by the daemon pays for each process its build child starts. The child
+// makes its directories, hashes its units, keys and stores its objects and swaps its units
+// directory in process, and starts cc without a shell, so it runs no shell and almost no
+// program but the C toolchain. Its output stays what a cold build gives.
+// The runtime runs a shell command through /bin/sh by its full path, so a shim on PATH can
+// not see it; the daemon runs under strace, and without strace the count is not held.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_child_no_shell_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_leaf(tree, "leaf")
+    write_file("{tree}/app/src/main.bl", [
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("main {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+fn write_leaf(tree: Str, word: Str) {
+    write_file("{tree}/app/src/leaf.bl", [
+        #"pub fn leaf_value() -> Str {"#,
+        "    \"{word}\"",
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it serves only a client whose env is its own.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache"
+}
+
+fn client(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. strace logs each program the
+// daemon and its children start; the timeout ends a daemon that nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 strace -f -qq -e trace=execve -e status=successful -o {tree}/exec.log ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+// Stops the daemon and each worker it started, by pid.
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let workers = sh("pgrep -P {pid}").split("\n").join(" ")
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || break; sleep 0.05; done; kill -9 {pid} 2>/dev/null; for w in {workers}; do kill -9 $w 2>/dev/null; done; true")
+}
+
+// A field of `daemon status`, such as "builds", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = client(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// What two trees' last builds left that differs: a C file of the units, or the program.
+fn output_differ(a_tree: Str, b_tree: Str) -> Str {
+    sh("cd {b_tree}/app/out/app.units && for f in *.c *.h; do cmp -s $f {a_tree}/app/out/app.units/$f || echo $f; done; cd {a_tree}/app/out/app.units && for f in *.c *.h; do [ -e {b_tree}/app/out/app.units/$f ] || echo extra:$f; done; cmp -s {a_tree}/app/out/app {b_tree}/app/out/app || echo program").split("\n").join(" ")
+}
+
+// Each program a line of the strace log from `from` on started, by its file name, but the
+// C toolchain's and the two a build may still start: du, since the cache is held to the
+// blocks its files take and the FFI cannot read a stat, and ln, since it cannot bind link(2).
+fn unexpected_execs(tree: Str, from: Int) -> Str {
+    let toolchain = "cc|gcc|c99|clang|ccache|zig|cpp|cc1|as|ld|ld.bfd|ld.gold|ld.lld|collect2|lto-wrapper|lto1"
+    sh("tail -n +{from + 1} {tree}/exec.log | sed -n 's/^[0-9]* *execve(\"\\([^\"]*\\)\".*/\\1/p' | awk -F/ '\{print $NF}' | grep -vxE '{toolchain}|du|ln' | sort | uniq -c | tr '\\n' ' '")
+}
+
+test "a daemon build child for a body edit runs only the C toolchain, and its output matches a cold build" {
+    if sh("command -v strace") == "" {
+        io.println("strace is not on PATH, so the programs the build child starts are not counted")
+        return
+    }
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_child_no_shell_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_child_no_shell_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut execs = ""
+    let mut builds = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        let first = client(warm, "build src/main.bl -o out/app")
+        if first.exit_code != 0 { problems.push("first build: {first.out}{first.err_out}") }
+        write_leaf(warm, "edited")
+        write_leaf(cold, "edited")
+        let from = sh("wc -l < {warm}/exec.log").to_int()
+        let w = client(warm, "build src/main.bl -o out/app")
+        execs = unexpected_execs(warm, from)
+        let c = client(cold, "build src/main.bl -o out/app")
+        if w.exit_code != 0 || c.exit_code != 0 { problems.push("edit build: {w.out}{w.err_out} -- vs --\n{c.out}{c.err_out}") }
+        let o = output_differ(warm, cold)
+        if o != "" { problems.push(o) }
+        builds = served(warm, "builds")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    assert_eq(problems.join("\n"), "")
+    assert_eq(builds, 2)
+    assert_eq(execs, "")
+}

@@ -1,0 +1,96 @@
+// A build makes, removes and renames its directories, touches its cache entries and runs cc
+// through these calls instead of a shell. Each must leave the files as the shell command it
+// replaced left them, or a build would see a different tree.
+
+import build_fs
+
+let DIR = "build/build_fs_calls_probe"
+
+fn fresh() {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}")
+}
+
+fn mode_of(path: Str) -> Str {
+    process_run("sh", ["-c", "stat -c %a {path} 2>/dev/null || stat -f %Lp {path}"]).out.trim()
+}
+
+test "mkdir_p makes each missing directory, and is true for one already there" {
+    fresh()
+    assert(build_fs.mkdir_p("{DIR}/a/b/c"), "mkdir_p failed")
+    assert_eq(is_dir("{DIR}/a/b/c"), 1)
+    assert(build_fs.mkdir_p("{DIR}/a/b"), "mkdir_p of an existing directory failed")
+    write_file("{DIR}/file", "x")
+    assert(!build_fs.mkdir_p("{DIR}/file/sub"), "mkdir_p under a file gave true")
+    assert(!build_fs.mkdir_p(""), "mkdir_p of an empty path gave true")
+}
+
+test "remove_tree removes a tree but never follows a link out of it" {
+    fresh()
+    shell_exec("mkdir -p {DIR}/t/d/e {DIR}/keep && echo k > {DIR}/keep/k && echo x > {DIR}/t/d/e/x && echo .h > {DIR}/t/.hidden && ln -s ../keep {DIR}/t/link")
+    assert(build_fs.remove_tree("{DIR}/t"), "remove_tree failed")
+    assert_eq(file_exists("{DIR}/t"), 0)
+    assert_eq(read_file("{DIR}/keep/k"), "k\n")
+    assert(build_fs.remove_tree("{DIR}/missing"), "remove_tree of a missing path gave false")
+    write_file("{DIR}/one", "1")
+    assert(build_fs.remove_tree("{DIR}/one"), "remove_tree of a file failed")
+    assert_eq(file_exists("{DIR}/one"), 0)
+}
+
+test "rename moves a directory onto a missing name and fails onto a full one" {
+    fresh()
+    shell_exec("mkdir -p {DIR}/from {DIR}/full && echo a > {DIR}/from/a && echo b > {DIR}/full/b")
+    assert(!build_fs.rename("{DIR}/from", "{DIR}/full"), "rename onto a directory with entries gave true")
+    assert(build_fs.rename("{DIR}/from", "{DIR}/to"), "rename failed")
+    assert_eq(read_file("{DIR}/to/a"), "a\n")
+    assert_eq(file_exists("{DIR}/from"), 0)
+}
+
+test "private_dir makes a new directory only its user may enter" {
+    fresh()
+    let a = build_fs.private_dir(DIR, ".units")
+    let b = build_fs.private_dir(DIR, ".units")
+    assert(a.starts_with("{DIR}/.units."), "private_dir named it {a}")
+    assert_eq(a.byte_len(), "{DIR}/.units.".byte_len() + 6)
+    assert(a != b, "private_dir gave one name twice")
+    assert_eq(is_dir(a), 1)
+    assert_eq(mode_of(a), "700")
+    assert_eq(build_fs.private_dir("{DIR}/missing", "x"), "")
+}
+
+test "touch moves the mtime and keeps the bytes" {
+    fresh()
+    write_file("{DIR}/meta", "123 mod \n")
+    shell_exec("touch -d '2001-01-01' {DIR}/meta {DIR}/empty_old 2>/dev/null || touch -t 200101010000 {DIR}/meta {DIR}/empty_old")
+    let before = file_mtime("{DIR}/meta")
+    assert(build_fs.touch("{DIR}/meta"), "touch failed")
+    assert(file_mtime("{DIR}/meta") > before, "touch left the mtime")
+    assert_eq(read_file("{DIR}/meta"), "123 mod \n")
+    let empty_before = file_mtime("{DIR}/empty_old")
+    assert(build_fs.touch("{DIR}/empty_old"), "touch of an empty file failed")
+    assert(file_mtime("{DIR}/empty_old") > empty_before, "touch left an empty file's mtime")
+    assert(build_fs.touch("{DIR}/new"), "touch of a missing file failed")
+    assert_eq(file_exists("{DIR}/new"), 1)
+    assert_eq(build_fs.file_size("{DIR}/meta"), 9)
+    assert_eq(build_fs.file_size("{DIR}/none"), -1)
+}
+
+test "plain_words splits only what sh would split and nothing more" {
+    assert_eq(build_fs.plain_words("cc -pipe -O1  -c a.c -o a.o").join("|"), "cc|-pipe|-O1|-c|a.c|-o|a.o")
+    assert_eq(build_fs.plain_words("cc -ffile-prefix-map=/a=/b x.c").join("|"), "cc|-ffile-prefix-map=/a=/b|x.c")
+    for cmd in ["cc a.c > out", "cc \"a b.c\"", "cc 'a.c'", "cc *.c", "cc $HOME/a.c", "cc a.c; rm x", "cc a.c && ld", "cc a\\ b.c", "CC=1 cc a.c", "cc ~/a.c", "cc a.c # note", "cc \{a,b}.c", "cc a.c\tb.c", "", "   "] {
+        assert_eq(build_fs.plain_words(cmd).len(), 0)
+    }
+}
+
+test "run_program gives the exit code sh would, and -1 for a signal" {
+    assert_eq(build_fs.run_program("true", []), 0)
+    assert_eq(build_fs.run_program("sh", ["-c", "exit 3"]), 3)
+    assert_eq(build_fs.run_program("sh", ["-c", "kill -9 $$"]), -1)
+}
+
+test "find_program finds what execvp runs" {
+    assert(build_fs.find_program("sh") != "", "sh was not found")
+    assert_eq(build_fs.find_program("no-such-program-here-at-all"), "")
+    assert_eq(build_fs.find_program("/bin/sh"), "/bin/sh")
+    assert(build_fs.cpu_count() >= 1, "cpu_count below 1")
+}
