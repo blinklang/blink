@@ -175,7 +175,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ImplBinderUnused | E0909 | Impl type-parameter binder unused in the impl header's type positions | Trait contract | §3.6 |
 | TraitContractArgArity | E0910 | Impl supplies the wrong number of trait type arguments | Trait contract | §3.6 |
 | TraitImplAddsPrecondition | E0912 | An impl method of a trait writes `@requires`; the impl inherits the trait method's `@requires` and may not add to it. The `note:` names the inherited contract; the `help:` names the fixes (move it to the trait, a refinement type in the trait's signature, a free fn) | Trait contract | §3b.2 |
-| TrustOnTraitMethod | E0913 | `@verify(fallback: "trust")` on a trait method declaration; only `"runtime"` may be a trait default | Trait contract | §3b.2 |
+| TrustOnTraitMethod | E0913 | `@verify(fallback: "trust")` on a trait method declaration; only `"runtime"` or `"error"` may be a trait default | Trait contract | §3b.2 |
 | CircularPackageDep | E1002 | Circular package dependency | Modules | §10.5 |
 | PrivateItemAccess | E1003 | Access to private item in another module | Modules | §10.5 |
 | VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |
@@ -214,7 +214,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or a user type with no `Hash` impl, derived or written) | Generic collections | §3.6 |
 | NonDerivableTrait | E1401 | A `@derive(Hash/Eq/Ord)` field's type does not implement the derived trait | Generic collections | §3.6 |
 | NotDerivable | E1402 | A `@derive` argument does not denote a derivable compiler-known trait by identity (a user trait, or a local trait that shadows a prelude trait); help gives `import blink.core.{X as Y}` and `@derive(Y)` | Generic collections | §3.6.1, §10.6 |
-| ContractUnverifiable | V0003 | The solver can neither prove nor disprove a `@requires`/`@ensures`, and the fn has no `@verify(fallback: ...)` (for an impl method, neither its own nor the trait method's default) | Contract verification | §3b.4 |
+| ContractUnverifiable | V0003 | The outcome of a `@requires`/`@ensures` is Unknown, and the effective policy is `@verify(fallback: "error")` (own, or for an impl method the trait method's default), or the predicate is not executable and has no `"trust"`. The message says when no solver ran, and names the trait method when the policy is inherited | Contract verification | §3b.4 |
 
 ---
 
@@ -242,8 +242,21 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |
 | MissingCanonicalHeader | W0812 | `@ffi.struct` header not declared in blink.toml | FFI | §9.2.1 |
 | RestatedInheritedEnsures | W0900 | An impl `@ensures` restates a predicate it already inherits from the trait method | Trait contract | §3b.2 |
+| RedundantVerifyFallback | W0901 | An explicit `@verify(fallback: "runtime")` is the same as the policy without it; autofix removes it. Quiet where it replaces a trait method's `"error"` | Contract verification | §3b.4 |
+| VerifyWithoutContract | W0902 | `@verify` on a fn with no `@requires` and no `@ensures`, own or inherited; autofix removes it | Contract verification | §3b.4 |
 | ShadowedPreludeName | W1010 | A `type`, type alias, `trait` or `effect` declaration takes a compiler-known type name or prelude trait name that is not reserved; it shadows the builtin in its module. The `help:` line names the `import blink.core.{X as Y}` (or `blink.ffi`) escape | Modules | §10.6 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
+
+---
+
+## Info Names
+
+Info diagnostics never fail a build. They are silent in terminal output by default and show in reports and structured output.
+
+| Name | Code | One-line | Category | Spec ref |
+|------|------|----------|----------|----------|
+| ContractProven | V0001 | The solver proved a contract; it has no runtime check | Contract verification | §3b.4 |
+| ContractRuntimeChecked | V0004 | A contract's outcome is Unknown and it has a runtime check; the source is `default`, `explicit` or `inherited(Trait.method)` | Contract verification | §3b.4 |
 
 ---
 
