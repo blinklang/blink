@@ -1471,7 +1471,8 @@ type UnitHeaders {
     // Each module's key for the record: what its headers are a function of besides its own
     // declarations.
     keys: Map[Str, Str]
-    // The module headers linked from the last build, which hash as its record says.
+    // The module headers linked from the last build, which the build checks against its
+    // record when it hashes its units directory.
     kept: Map[Str, Bool]
 }
 
@@ -1683,7 +1684,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     if inputs != "" && sources.tracked {
         last = emit_record.last_build(last_dir, inputs, sources.own)
     }
-    let hs = match write_unit_headers(program, modules, cfg, facts, dir, false, last) {
+    let mut hs = match write_unit_headers(program, modules, cfg, facts, dir, false, last) {
         Ok(h) => h
         Err(rc) => return Err(rc)
     }
@@ -1729,6 +1730,36 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             None => {}
         }
         shas = if placed { build_objcache.unit_file_shas_with(dir, resolve_archive_dir(), extra) } else { None }
+        let headers_held = match last {
+            Some(lb) => match shas {
+                Some(s) => emit_record.kept_headers_hold(lb, hs.kept, s)
+                None => hs.kept.len() == 0
+            }
+            None => true
+        }
+        if !headers_held {
+            // Another build replaced the last units directory after this one read its record,
+            // and every unit declares what the kept headers held. The build writes the headers
+            // and every unit as one that keeps and takes nothing.
+            dbg_trace("build.units", "emit the headers and every unit again")
+            for name in list_dir(dir) {
+                let _ = build_fs.remove_tree("{dir}/{name}")
+            }
+            hs = match write_unit_headers(program, modules, cfg, facts, dir, false, None) {
+                Ok(h) => h
+                Err(rc) => return Err(rc)
+            }
+            by_module = Map()
+            for m in unit_modules {
+                match emit_unit(program, m, cfg, facts, hs, sources, dir, chunk_decls) {
+                    Ok(u) => by_module.insert(m, u)
+                    Err(rc) => return Err(rc)
+                }
+            }
+            write_file("{dir}/{emit_record.inputs_name()}", inputs)
+            taken = None
+            shas = build_objcache.unit_file_shas_with(dir, resolve_archive_dir(), [emit_record.inputs_name()])
+        }
         match taken {
             Some(t) => {
                 let held = match shas {
