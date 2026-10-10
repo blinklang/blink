@@ -1,0 +1,110 @@
+// A split unit reads the line of each panic, assert and trace site from its table of lines,
+// so a line added at the top of the module moves every line below it and still leaves each
+// chunk's C text as it was: the table, big.pos.c, is the one file that changes. A site that
+// wrote its line into the chunk instead would change that chunk too. The build is --debug
+// and --trace, so debug_assert and the arena trace events are in it. BLINK_UNIT_CHUNK_DECLS
+// makes the chunks small, so a small module splits.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// One function for each kind of site that names a line.
+fn sites() -> List[List[Str]] {
+    [
+        ["fn site_none(n: Int) -> Int \{", "    let xs = [n]", "    xs.get(n).unwrap()", "}"],
+        ["fn site_err(n: Int) -> Int \{", "    let r: Result[Int, Str] = if n > 0 \{ Err(\"boom \{n}\") } else \{ Ok(n) }", "    r.unwrap()", "}"],
+        ["fn site_overflow(n: Int) -> Int \{", "    n * 9223372036854775807", "}"],
+        ["fn site_assert(n: Int) -> Int \{", "    assert(n < 0, \"n is not negative\")", "    n", "}"],
+        ["fn site_debug_assert(n: Int) -> Int \{", "    debug_assert(n < 0, \"n is not negative in debug\")", "    n", "}"],
+        ["fn site_send(n: Int) -> Int \{", "    let ch = channel.new[Int](buffer: 2)", "    ch.close()", "    ch.send(n)", "    n", "}"],
+        ["fn site_arena(n: Int) -> Int \{", "    let xs = with arena \{", "        [n, n + 1]", "    }", "    xs.len()", "}"],
+    ]
+}
+
+// The sites sit among padding, so the cut puts them in different chunks.
+fn big_source() -> Str {
+    let mut lines: List[Str] = ["fn head_pad() -> Int \{ 0 }", ""]
+    let all = sites()
+    let mut i = 0
+    while i < 42 {
+        lines.push("fn pad{i}() -> Int \{ {i} }")
+        lines.push("")
+        if i % 6 == 5 && i / 6 < all.len() {
+            for l in all.get(i / 6).unwrap() { lines.push(l) }
+            lines.push("")
+        }
+        i = i + 1
+    }
+    lines.push("pub fn pads() -> Int \{ head_pad() + pad0() + pad41() }")
+    lines.push("")
+    lines.push("pub fn run(case: Str, n: Int) -> Int \{")
+    for c in ["none", "err", "overflow", "assert", "debug_assert", "send", "arena"] {
+        lines.push("    if case == \"{c}\" \{ return site_{c}(n) }")
+    }
+    lines.push("    0")
+    lines.push("}")
+    lines.push("")
+    lines.join("\n")
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"chunk_top_line_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/big.bl", big_source())
+    write_file("{tree}/app/src/main.bl", [
+        #"import big.{run}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let a = env.args()"#,
+        #"    io.println("got {run(a.get(1) ?? "", (a.get(2) ?? "0").to_int())}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn build(tree: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_UNIT_CHUNK_DECLS=2 BLINK_CACHE_DIR={tree}/objcache build/blink build app/src/main.bl -o {tree}/out/app --per-module --debug --trace all"])
+}
+
+// Each C file of big's unit, with a hash of its text.
+fn unit_files(tree: Str) -> List[Str] {
+    sh("cd {tree}/out/app.units && sha256sum big*.c").split("\n")
+}
+
+test "a line added at the top of a split module changes only its table of lines" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_split_top_line_{getpid()}"
+    dev_tree(root, tree)
+    let first = build(tree)
+    let before = unit_files(tree)
+    shell_exec("sed -i '1i // a line added at the top' {tree}/app/src/big.bl")
+    let second = build(tree)
+    let after = unit_files(tree)
+    let send = sh("{tree}/out/app send 1 2>&1")
+    let send_line = sh("grep -n 'ch.send(n)' {tree}/app/src/big.bl | cut -d: -f1")
+    shell_exec("rm -rf {tree}")
+    assert(first.exit_code == 0, "first build failed: {first.out}{first.err_out}")
+    assert(second.exit_code == 0, "second build failed: {second.out}{second.err_out}")
+    assert(before.len() > 4, "big was not cut: {before.join(" ")}")
+    let mut changed: List[Str] = []
+    for f in after {
+        if !before.contains(f) { changed.push(f.split("  ").get(1) ?? f) }
+    }
+    assert_eq(changed.join(" "), "big.pos.c")
+    assert(send.contains("send on a closed channel at app/src/big.bl:{send_line}"), "the panic names another line: {send}")
+}

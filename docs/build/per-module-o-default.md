@@ -97,7 +97,9 @@ cache and link. `--per-module` asks for it by name, and `--no-per-module`
 asks for the one-unit build.
 
 - **Units.** One `.c` per program module, plus the headers below,
-  written to `<output>.units/` next to the binary. The
+  written to `<output>.units/` next to the binary. A module of more than
+  512 decls is cut into files of its own (see "Large units in chunks"
+  below). The
   std modules the archive holds get no unit: the units link
   `libblink_std.a` the same as the monolith user TU does, and the archive
   defines the runtime storage and every non-generic std body. A std module
@@ -1069,6 +1071,100 @@ hold the rows.
 - `nochange` takes the whole emit from the last build and writes no
   header, so it does not change. Nor do the monolith rows, which write no
   module header, or the small rows, whose headers cost a few ms.
+
+### Large units in chunks
+
+A body edit compiles one unit, and the time follows the size of that
+unit. On cli, `typecheck.c` is 2.2 MB and takes cc about 2.4 s, so a
+body edit there took 2.9 s through the daemon where one in `cname.bl`
+took 0.54 s. Now the build cuts the unit of a large module into files
+that cc compiles and caches one at a time (`generate_module_chunks_with`
+in `src/cg.bl`):
+
+- **The cut.** `BLINK_UNIT_CHUNK_DECLS` (default 32, written T here) is
+  the target size of a chunk, in decls (functions and methods). A module
+  of no more than 16·T decls (512) is not cut: cc cannot inline across a
+  cut, and only a module past that size costs seconds of cc on each edit.
+  In a cut module, a chunk ends before a decl whose name hashes (32-bit
+  FNV-1a) to 0 modulo T once the chunk holds T/2 decls (16), and before
+  any decl once it holds 4·T (128). The cut depends on the names near it,
+  not on a count from the start, so a decl added or removed changes its
+  own chunk and seldom the next. `0` cuts nothing. A release build cuts
+  nothing, so cc sees each module whole. The value is an input of the
+  emit record (`unit_chunk_decls`), and each chunk is an obj-cache entry
+  whose key covers its own text. It is for tests and measurement; no CLI
+  flag sets it.
+- **The files.** The head, `<module>.c`, holds the globals, the init
+  function and the first chunk of decls; each other chunk is
+  `<module>.p<hex8>.c`, named by the hash of its first decl. Each chunk
+  is emitted from a clean state, so its text depends only on its own
+  decls. Each file has its own copy of the file-local helpers its bodies
+  need. On cli only `typecheck` is over the bar: a head (47 KB), 16 chunks
+  (15 KB to 333 KB) and `typecheck.pos.c`. `__main__.c` (2.6 MB, 0.70 s
+  of cc) is one file: the cut is by decl count, and `__main__` is under
+  the bar.
+- **Lines.** A panic, an assert or a trace event names a line. In a cut
+  unit each file reads its lines from a table of its own,
+  `__blink_pos_<module>_<suffix>`, which `<module>.pos.c` defines. A line
+  added above a function moves the numbers in the table, not the text of
+  the chunk, so the edit compiles the edited chunk and `pos.c`, which
+  holds only numbers. A column does not need a table: a line added above
+  does not move it. A send on a closed channel formats its message at run
+  time, only when it panics (`blink_channel_send_value_at`). The build
+  writes no `#line`, so `--debug` adds no other line to the text.
+
+What the cut costs and saves:
+
+- A body edit in `typecheck.bl` compiles one chunk (0.06 s of cc, the
+  largest chunk 0.38 s) in place of the whole unit (2.4 s).
+- A decl added to the module changes the private header
+  `typecheck.priv.h`, which every file of the unit and `__main__.c`
+  include, so all 18 recompile. The text of the other chunks does not
+  change: a private fn added in the middle of `typecheck.bl` changed the
+  text of its own chunk, `typecheck.pos.c` and `typecheck.priv.h`. Its
+  name hashed to a cut, so the chunk before it lost a few decls too.
+- Run time: the compiler (`check src/cli.bl`, 7 interleaved reps,
+  `setarch -R`), unsplit against split at the default T, median 419.02 ms
+  against 421.14 ms (+0.5%; instructions +0.1%). A user module of 600
+  one-line fns whose hot loop calls 9 fns that sit in other chunks is the
+  worst case: 659.24 ms against 768.92 ms (+16.6%; instructions 9.10 G
+  against 9.50 G), since cc can no longer inline those calls. A
+  `--release` build does not cut.
+
+`task bench-edit-loop` on the gen1 `blink` of `c58722c2` (before) and of
+`803d7eac` (after), 11 reps, 12 cores, under `blink-gates.slice`,
+alternating before, after, before, after on the `10a3db88` tree. The
+`pubfn-typecheck` and `privfn-typecheck` cases are new: a pub fn, or a
+private fn, appended to `src/typecheck.bl`. The `unit_chunk_*` files in
+`bench/edit_loop/` hold the rows. Median wall seconds of the two runs of
+each binary, with the number of cc calls:
+
+| target | case | before | after | daemon before | daemon after | cc before | cc after |
+|---|---|---|---|---|---|---|---|
+| cli | nochange | | | 0.176 / 0.174 | 0.182 / 0.179 | 0 | 0 |
+| cli | body-cname | | | 0.536 / 0.554 | 0.539 / 0.540 | 1 | 1 |
+| cli | body-typecheck | 3.108 / 3.103 | 0.784 / 0.781 | 2.913 / 2.920 | 0.590 / 0.577 | 1 | 1 |
+| cli | pubfn-cname | | | 1.747 / 1.732 | 1.734 / 1.772 | 14 | 14 |
+| cli | pubfn-typecheck | 3.611 / 3.624 | 2.213 / 2.206 | 3.541 / 3.527 | 2.132 / 2.147 | 21 | 37 |
+| cli | privfn-typecheck | 3.342 / 3.327 | 1.771 / 1.773 | 3.244 / 3.249 | 1.679 / 1.674 | 2 | 18 |
+| cli | run-body-cname | | | 0.579 / 0.591 | 0.597 / 0.579 | 1 | 1 |
+| cli | cold-obj | 3.680 / 3.687 | 2.558 / 2.559 | | | 50 | 67 |
+| cli | cold-all | 6.058 / 6.079 | 4.941 / 4.932 | | | 51 | 68 |
+| small | nochange | | | 0.060 / 0.060 | 0.060 / 0.060 | 0 | 0 |
+| small | body-inventory | | | 0.113 / 0.114 | 0.113 / 0.114 | 1 | 1 |
+| small | pubfn-model | | | 0.114 / 0.113 | 0.113 / 0.114 | 3 | 3 |
+| small | run-body-inventory | | | 0.115 / 0.114 | 0.114 / 0.114 | 1 | 1 |
+| small | cold-obj | 0.121 / 0.121 | 0.122 / 0.121 | | | 5 | 5 |
+
+- A body edit in `typecheck.bl` builds in 0.59 s through the daemon, 2.3
+  s under the before row, and as fast as one in `cname.bl`.
+- A decl added to `typecheck.bl` recompiles the 18 files that include its
+  private header, and still builds 1.4 to 1.6 s faster than before, since
+  the 18 compile at once. Through the daemon it costs 1.09 s more than a
+  body edit.
+- `cold-obj` and `cold-all` gain 1.1 s: the largest unit no longer holds
+  the build up.
+- No other row is slower than before outside its spread.
 
 ## Blockers before the default flipped
 

@@ -47,7 +47,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
-import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, program_facts, enumerate_program_modules, archive_unit_modules}
+import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules}
 import build_unit_headers.{HeaderIndex, index_headers, unit_includes, splice_includes}
 import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
@@ -1533,7 +1533,7 @@ fn emit_reuse_allowed() -> Bool {
 // in last_dir when the emit's inputs are the ones it records.
 // checked is the build the daemon forked this process for, whose checked program it
 // compiles; None in any other process.
-fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, chunk_decls: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
     let front = match checked {
         Some(b) => checked_front_end(b, strict_mode)
         None => {
@@ -1556,7 +1556,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     if emit_reuse_allowed() {
         let sha = process_compiler_sha()
         if sha != "" {
-            inputs = emit_record.inputs_text(source_path, cfg, strict_mode, sha, get_arg(0))
+            inputs = emit_record.inputs_text(source_path, cfg, strict_mode, sha, get_arg(0), chunk_decls)
         }
     }
     let verify = emit_reuse_verify()
@@ -1565,7 +1565,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             Some(r) => {
                 dbg_trace("build.units", "reuse emit")
                 if verify {
-                    let vrc = verify_against_cold_emit(program, modules, cfg, r.units, dir)
+                    let vrc = verify_against_cold_emit(program, modules, cfg, r.units, dir, chunk_decls)
                     if vrc != 0 { return Err(vrc) }
                 }
                 let wrc = units_flush_warnings(strict_mode)
@@ -1607,7 +1607,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     }
     for m in unit_modules {
         if by_module.contains_key(m) { continue }
-        match emit_unit(program, m, cfg, facts, hs, sources, dir) {
+        match emit_unit(program, m, cfg, facts, hs, sources, dir, chunk_decls) {
             Ok(u) => by_module.insert(m, u)
             Err(rc) => return Err(rc)
         }
@@ -1638,8 +1638,8 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                     // record, so what it took may be of two builds. It emits them after all.
                     for u in t.units {
                         dbg_trace("build.units", "emit unit {u.module} again")
-                        shell_exec("rm -f \"{dir}/{u.module}.c\"")
-                        match emit_unit(program, u.module, cfg, facts, hs, sources, dir) {
+                        for f in emit_record.unit_files(u) { shell_exec("rm -f \"{dir}/{f.stem}.c\"") }
+                        match emit_unit(program, u.module, cfg, facts, hs, sources, dir, chunk_decls) {
                             Ok(e) => by_module.insert(u.module, e)
                             Err(rc) => return Err(rc)
                         }
@@ -1659,7 +1659,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
         }
     }
     if verify {
-        let vrc = verify_against_cold_emit(program, modules, cfg, out, dir)
+        let vrc = verify_against_cold_emit(program, modules, cfg, out, dir, chunk_decls)
         if vrc != 0 { return Err(vrc) }
     }
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
@@ -1681,15 +1681,15 @@ fn emit_reuse_verify() -> Bool {
 // not only the units taken: main, a header or a unit lowered beside a taken unit can read what
 // the taken unit's lowering would have set. The files taken are links to the last build's, so
 // nothing is written beside them.
-fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str) -> Int ! Diag.Report, Codegen {
+fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen {
     let vdir = "{dir}/.verify"
     shell_exec("rm -rf \"{vdir}\" && mkdir -p \"{vdir}\"")
-    let rc = verify_cold_files(program, modules, cfg, units, dir, vdir)
+    let rc = verify_cold_files(program, modules, cfg, units, dir, vdir, chunk_decls)
     shell_exec("rm -rf \"{vdir}\"")
     rc
 }
 
-fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, vdir: Str) -> Int ! Diag.Report, Codegen {
+fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, vdir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen {
     let facts = program_facts(program)
     let hs = match write_unit_headers(program, modules, cfg, facts, vdir, true) {
         Ok(h) => h
@@ -1712,18 +1712,32 @@ fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: Lis
         return 1
     }
     let sources = unit_sources(unit_modules, false)
+    let mut cold: List[emit_record.EmittedUnit] = []
     for m in unit_modules {
-        match emit_unit(program, m, cfg, facts, hs, sources, vdir) {
-            Ok(_) => {}
+        match emit_unit(program, m, cfg, facts, hs, sources, vdir, chunk_decls) {
+            Ok(u) => cold.push(u)
             Err(erc) => return erc
         }
     }
-    for m in unit_modules {
-        if read_file("{vdir}/{m}.c") != read_file("{dir}/{m}.c") {
-            io.eprintln("error: emit reuse verify: unit {m} is not the unit a cold emit writes")
+    let mut ui = 0
+    while ui < cold.len() {
+        let mut built_files: List[Str] = []
+        for f in emit_record.unit_files(units.get(ui).unwrap()) { built_files.push(f.stem) }
+        let mut cold_files: List[Str] = []
+        for f in emit_record.unit_files(cold.get(ui).unwrap()) { cold_files.push(f.stem) }
+        let m = cold.get(ui).unwrap().module
+        if built_files.join(",") != cold_files.join(",") {
+            io.eprintln("error: emit reuse verify: unit {m} has the files {built_files.join(",")}, a cold emit {cold_files.join(",")}")
             return 1
         }
-        dbg_trace("build.units", "verify unit {m} same")
+        for f in cold_files {
+            if read_file("{vdir}/{f}.c") != read_file("{dir}/{f}.c") {
+                io.eprintln("error: emit reuse verify: unit {f} is not the unit a cold emit writes")
+                return 1
+            }
+            dbg_trace("build.units", "verify unit {f} same")
+        }
+        ui = ui + 1
     }
     0
 }
@@ -1765,18 +1779,42 @@ fn unit_sources(unit_modules: List[Str], wanted: Bool) -> UnitSources {
     UnitSources { tracked: tracked, firsts: firsts, ends: ends, paths: paths, modules: modules, own: own }
 }
 
-// Emits module m's unit into dir, with the sources its IR spanned.
-fn emit_unit(program: Int, m: Str, cfg: CgConfig, facts: ProgramFacts, hs: UnitHeaders, sources: UnitSources, dir: Str) -> Result[emit_record.EmittedUnit, Int] ! Diag.Report, Codegen {
+// Emits module m's unit into dir, with the sources its IR spanned, cut into chunks as
+// chunk_decls says.
+fn emit_unit(program: Int, m: Str, cfg: CgConfig, facts: ProgramFacts, hs: UnitHeaders, sources: UnitSources, dir: Str, chunk_decls: Int) -> Result[emit_record.EmittedUnit, Int] ! Diag.Report, Codegen {
     // Untracked, the empty ranges keep a unit's emit from marking sources it reads.
     if sources.tracked { ir_track_sources(sources.firsts, sources.ends) } else { ir_track_sources([], []) }
     // Copy-update, so a field added to CgConfig later keeps cfg's value here.
     let obj_cfg = CgConfig { blink_ev_extern_only: if m != "__main__" { 1 } else { 0 }, ..cfg }
-    let raw = generate_module_object_with(program, m, c_module_header_name(m), obj_cfg, facts)
+    let parts = generate_module_chunks_with(program, m, c_module_header_name(m), obj_cfg, facts, chunk_decls)
     let orc = units_bail_on_diag()
     if orc != 0 { return Err(orc) }
-    let (c, headers) = unit_with_includes(raw, m, hs)
-    write_file("{dir}/{m}.c", c)
-    Ok(emit_record.EmittedUnit { module: m, c_bytes: c.byte_len(), headers: headers, uses: unit_uses(m, sources) })
+    let mut files: List[emit_record.UnitChunkFile] = []
+    for part in parts {
+        let stem = if part.suffix == "" { m } else { "{m}.{part.suffix}" }
+        let (c, headers) = if part.plain { (part.c, []) } else { unit_with_includes(part.c, m, hs) }
+        write_file("{dir}/{stem}.c", c)
+        files.push(emit_record.UnitChunkFile { stem: stem, c_bytes: c.byte_len(), headers: headers })
+    }
+    let head = files.get(0).unwrap()
+    let mut chunks: List[emit_record.UnitChunkFile] = []
+    let mut i = 1
+    while i < files.len() {
+        chunks.push(files.get(i).unwrap())
+        i = i + 1
+    }
+    Ok(emit_record.EmittedUnit { module: m, c_bytes: head.c_bytes, headers: head.headers, uses: unit_uses(m, sources), chunks: chunks })
+}
+
+// The mean number of decls in each file a large module's unit is cut into, or 0 to cut
+// none: BLINK_UNIT_CHUNK_DECLS, which tests set low so that a small module is cut, or 32. A
+// release build cuts nothing, so cc sees each module whole, to inline across its functions.
+fn unit_chunk_decls(release_mode: Int) -> Int {
+    if release_mode != 0 { return 0 }
+    let v = env.var("BLINK_UNIT_CHUNK_DECLS") ?? ""
+    let n = v.to_int()
+    if v != "" && n >= 0 && "{n}" == v { return n }
+    32
 }
 
 // The sources module m's unit read: its own, whose every edit can move a line the unit
@@ -1826,7 +1864,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
         io.eprintln("error: cannot make a units directory in {out_dir}")
         return 1
     }
-    let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode, checked) {
+    let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode, unit_chunk_decls(release_mode), checked) {
         Ok(u) => u
         Err(rc) => {
             shell_exec("rm -rf {work}")
@@ -1860,13 +1898,15 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     let mut c_parts: List[Str] = []
     let mut seen: Map[Str, Bool] = Map()
     for u in units {
-        for h in u.headers {
-            if seen.contains_key(h) == 0 {
-                seen.insert(h, true)
-                c_parts.push(read_file("{work}/{h}"))
+        for f in emit_record.unit_files(u) {
+            for h in f.headers {
+                if seen.contains_key(h) == 0 {
+                    seen.insert(h, true)
+                    c_parts.push(read_file("{work}/{h}"))
+                }
             }
+            c_parts.push(read_file("{work}/{f.stem}.c"))
         }
-        c_parts.push(read_file("{work}/{u.module}.c"))
     }
     let c_source = c_parts.join("\n")
     let has_async = detect_async(read_file(source_path))
@@ -1973,6 +2013,11 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     if vrc != 0 {
         return vrc
     }
+    // Each file of a unit compiles to an object of its own, cached on its own.
+    let mut files: List[emit_record.UnitChunkFile] = []
+    for u in units {
+        for f in emit_record.unit_files(u) { files.push(f) }
+    }
     let obj_dir = if target != "" { "{work}/obj-{target}" } else { "{work}/obj" }
     shell_exec("mkdir -p {obj_dir}")
     let use_cache = cg_obj_cache_enabled != 0 && build_objcache.cache_enabled()
@@ -1986,26 +2031,26 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         }
         let mut modules: List[Str] = []
         let mut unit_headers: Map[Str, List[Str]] = Map()
-        for u in units {
-            modules.push(u.module)
-            unit_headers.insert(u.module, u.headers)
+        for u in files {
+            modules.push(u.stem)
+            unit_headers.insert(u.stem, u.headers)
         }
         keys = build_objcache.unit_keys_from(shas.unwrap(), work, modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), cc_opt_flags(debug_mode, release_mode), target)
     }
     let mut objs: Map[Str, Str] = Map()
-    let mut misses: List[emit_record.EmittedUnit] = []
+    let mut misses: List[emit_record.UnitChunkFile] = []
     let mut unit_keys: List[Str] = []
-    for u in units {
-        unit_keys.push(keys.get(u.module) ?? "")
+    for u in files {
+        unit_keys.push(keys.get(u.stem) ?? "")
     }
     let hits = build_objcache.lookup_objs(unit_keys)
     let mut ui = 0
-    for u in units {
+    for u in files {
         let hit = hits.get(ui).unwrap()
         ui = ui + 1
         if hit != "" {
-            dbg_trace("build.units", "hit {u.module}")
-            objs.insert(u.module, hit)
+            dbg_trace("build.units", "hit {u.stem}")
+            objs.insert(u.stem, hit)
         } else {
             misses.push(u)
         }
@@ -2025,8 +2070,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
     let mut cmds: List[Str] = []
     for u in misses {
-        dbg_trace("build.units", "compile {u.module}")
-        cmds.push(cc_command("-c {work}/{u.module}.c -o {obj_dir}/{u.module}.o -ffile-prefix-map={work}={units_dir} {includes}", debug_mode, release_mode, target))
+        dbg_trace("build.units", "compile {u.stem}")
+        cmds.push(cc_command("-c {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir} {includes}", debug_mode, release_mode, target))
     }
     let results = run_unit_compiles(cmds, unit_jobs)
     let mut failed = 0
@@ -2034,7 +2079,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut store_paths: List[Str] = []
     let mut store_modules: List[Str] = []
     for r in results {
-        let m = misses.get(r.idx).unwrap().module
+        let m = misses.get(r.idx).unwrap().stem
         if r.exit_code != 0 {
             io.eprint_raw(r.err_out)
             io.print_raw(r.out)
@@ -2066,8 +2111,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         return 1
     }
     let mut link_objs: List[Str] = []
-    for u in units {
-        link_objs.push(objs.get(u.module) ?? "")
+    for u in files {
+        link_objs.push(objs.get(u.stem) ?? "")
     }
     for o in obj_files {
         link_objs.push(o)
