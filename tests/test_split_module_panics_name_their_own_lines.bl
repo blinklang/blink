@@ -1,0 +1,141 @@
+// A file of a split unit reads its lines from a table rather than holding them as numbers,
+// so that a line added above a function leaves the chunks below it unchanged. A panic must
+// still name the line it was raised on: in the head and in a chunk, for a panic that says
+// a fixed sentence, one that names a value, an overflow and a failed assert. The split
+// program says what the program built without a cut says, and each names its own line.
+// BLINK_UNIT_CHUNK_DECLS makes the chunks small, so a small module splits; 0 cuts nothing.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+type Case {
+    name: Str
+    line: Int
+}
+
+type Source {
+    text: Str
+    cases: List[Case]
+}
+
+// The head holds the first group of functions, so the first case panics in the head and
+// the others, after twelve fillers, panic in chunks.
+fn big_source() -> Source {
+    let mut lines: List[Str] = []
+    let mut cases: List[Case] = []
+    lines.push("fn head_none(n: Int) -> Int \{")
+    lines.push("    let xs = [n]")
+    cases.push(Case { name: "head_none", line: lines.len() + 1 })
+    lines.push("    xs.get(n).unwrap()")
+    lines.push("}")
+    lines.push("")
+    let mut i = 0
+    while i < 12 {
+        lines.push("fn filler{i}(n: Int) -> Int \{")
+        lines.push("    let xs = [n, {i}]")
+        lines.push("    xs.get(1).unwrap() + n * {i + 1}")
+        lines.push("}")
+        lines.push("")
+        i = i + 1
+    }
+    lines.push("fn chunk_none(n: Int) -> Int \{")
+    lines.push("    let xs = [n]")
+    cases.push(Case { name: "chunk_none", line: lines.len() + 1 })
+    lines.push("    xs.get(n).unwrap()")
+    lines.push("}")
+    lines.push("")
+    lines.push("fn chunk_err(n: Int) -> Int \{")
+    lines.push("    let r: Result[Int, Str] = if n > 0 \{ Err(\"boom \{n}\") } else \{ Ok(n) }")
+    cases.push(Case { name: "chunk_err", line: lines.len() + 1 })
+    lines.push("    r.unwrap()")
+    lines.push("}")
+    lines.push("")
+    lines.push("fn chunk_overflow(n: Int) -> Int \{")
+    cases.push(Case { name: "chunk_overflow", line: lines.len() + 1 })
+    lines.push("    n * 9223372036854775807")
+    lines.push("}")
+    lines.push("")
+    lines.push("fn chunk_assert(n: Int) -> Int \{")
+    cases.push(Case { name: "chunk_assert", line: lines.len() + 1 })
+    lines.push("    assert(n < 0, \"n is not negative\")")
+    lines.push("    n")
+    lines.push("}")
+    lines.push("")
+    let mut calls: List[Str] = []
+    i = 0
+    while i < 12 {
+        calls.push("filler{i}(n)")
+        i = i + 1
+    }
+    lines.push("pub fn run(case: Str, n: Int) -> Int \{")
+    for c in cases {
+        lines.push("    if case == \"{c.name}\" \{ return {c.name}(n) }")
+    }
+    lines.push("    {calls.join(" + ")}")
+    lines.push("}")
+    lines.push("")
+    Source { text: lines.join("\n"), cases: cases }
+}
+
+fn dev_tree(root: Str, tree: Str, src: Source) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"chunk_panic_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/big.bl", src.text)
+    write_file("{tree}/app/src/main.bl", [
+        #"import big.{run}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("run {run(env.var("CASE") ?? "", 2)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn build(tree: Str, chunk: Int) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_UNIT_CHUNK_DECLS={chunk} BLINK_CACHE_DIR={tree}/objcache build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+}
+
+fn said(tree: Str, case: Str) -> Str {
+    sh("CASE={case} {tree}/out/app 2>&1")
+}
+
+test "a panic in a split module names its own line, as it does unsplit" {
+    let root = sh("pwd -P")
+    let split = "{root}/.tmp/_chunk_panic_split_{getpid()}"
+    let whole = "{root}/.tmp/_chunk_panic_whole_{getpid()}"
+    let src = big_source()
+    dev_tree(root, split, src)
+    dev_tree(root, whole, src)
+    let s = build(split, 2)
+    let w = build(whole, 0)
+    let pos_tables = sh("ls {split}/out/app.units | grep -c '^big\\.pos\\.c$'").to_int()
+    let mut found: List[Str] = []
+    for c in src.cases {
+        let from_split = said(split, c.name)
+        let from_whole = said(whole, c.name)
+        if from_split != from_whole { found.push("{c.name}: {from_split} vs {from_whole}") }
+        if !from_split.contains("big.bl:{c.line}") { found.push("{c.name} does not name line {c.line}: {from_split}") }
+    }
+    let ran = said(split, "")
+    shell_exec("rm -rf {split} {whole}")
+    assert(s.exit_code == 0, "the split build failed: {s.out}{s.err_out}")
+    assert(w.exit_code == 0, "the whole build failed: {w.out}{w.err_out}")
+    assert_eq(pos_tables, 1)
+    assert_eq(found.join("\n"), "")
+    assert(ran.contains("run 222"), "the program changed: {ran}")
+}
