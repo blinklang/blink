@@ -30,7 +30,7 @@ import layout.{
 }
 import cg_print.{
     print_ev_default_decl, print_ev_storage, print_fn, print_fn_decl, print_guard_open, print_include, print_main_shim, print_reset, print_scope_restore_support,
-    print_take, print_test_fn, print_test_table, print_typedef_blocks,
+    print_take, print_test_fn, print_test_table, print_typedef_blocks, print_extern_const_array,
 }
 import cg_reg.{
     cg_reg_build, cg_reg_entry_point, cg_reg_fn_decls, cg_reg_global_decls, cg_reg_has_main,
@@ -49,9 +49,9 @@ import cg_derive.{
     cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables,
     cg_derive_key_table_nodes, cg_derive_reset,
 }
-import ir.{ir_begin_body, ir_block, ir_note_source, ir_reset, ir_span, ir_verify}
+import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_span, ir_verify}
 import mono.{instances, named_instance_rows, program_spawns, set_named_instance_rows}
-import typecheck.{TYPE_VOID, TyKind, tc_resolve, tc_tid_kind}
+import typecheck.{TYPE_INT, TYPE_VOID, TyKind, tc_resolve, tc_tid_kind}
 import cg_stmt.{
     cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
     lower_global_init,
@@ -1045,18 +1045,20 @@ pub fn generate_module_object(program: Int, module_key: Str, self_header: Str, c
 pub fn generate_module_object_with(program: Int, module_key: Str, self_header: Str, cfg: CgConfig, facts: ProgramFacts) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     let shared = cfg.archive_build_mode != 0
-    emit_module_head(module_key, self_header, cfg, facts, fns_in_scope(cfg, module_key, shared, false), methods_in_scope(cfg, module_key, shared, false))
+    emit_module_head(module_key, self_header, cfg, facts, fns_in_scope(cfg, module_key, shared, false), methods_in_scope(cfg, module_key, shared, false), "")
 }
 
 // The file of a module's unit that holds all of the unit but the bodies of the functions
 // cut off into chunks.
-fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: ProgramFacts, fns: List[Int], methods: List[Int]) -> Str ! Codegen, Diag.Report {
+// pos_sym names the table its lines are read from, or is "" to write them as numbers.
+fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: ProgramFacts, fns: List[Int], methods: List[Int], pos_sym: Str) -> Str ! Codegen, Diag.Report {
     cg_promote_set_trace(cfg.trace_codegen != 0)
     // The entry module's object defines the runtime's storage and bodies, the way it owns
     // __blink_ev; every other object declares them. A unit that links the archive leaves
     // them to the archive, which already defines them.
     let define_storage = defines_runtime_storage(cfg) || (module_key == "__main__" && cfg.user_tu_mode == 0)
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, define_storage, false, "", self_header, module_key != "__main__")
+    declare_pos_table(pos_sym)
     cg_decl_emit_ev(ev_storage(cfg))
     let own_globals = globals_in_scope(cfg, module_key, false)
     let inits = lower_global_inits(own_globals)
@@ -1087,6 +1089,13 @@ fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: Pro
 pub type UnitChunk {
     suffix: Str
     c: Str
+    // A file that includes no header: the table of a split unit's lines.
+    plain: Bool
+}
+
+type PosTable {
+    sym: Str
+    lines: List[Int]
 }
 
 // A module's unit as one head and the chunks cut off it. A body edit then changes the C of
@@ -1107,7 +1116,9 @@ pub fn generate_module_chunks_with(program: Int, module_key: Str, self_header: S
     }
     for m in methods { decls.push(m) }
     let groups = if module_key == "" || shared { [decls] } else { chunk_groups(decls, chunk_decls) }
+    let split = groups.len() > 1
     let mut out: List[UnitChunk] = []
+    let mut tables: List[PosTable] = []
     let mut taken: Map[Str, Bool] = Map()
     let mut gi = 0
     while gi < groups.len() {
@@ -1118,7 +1129,11 @@ pub fn generate_module_chunks_with(program: Int, module_key: Str, self_header: S
             if is_fn.contains_key(d) { g_fns.push(d) } else { g_methods.push(d) }
         }
         if gi == 0 {
-            out.push(UnitChunk { suffix: "", c: emit_module_head(module_key, self_header, cfg, facts, g_fns, g_methods) })
+            let sym = if split { pos_table_name(module_key, "head") } else { "" }
+            ir_pos_begin(sym)
+            out.push(UnitChunk { suffix: "", c: emit_module_head(module_key, self_header, cfg, facts, g_fns, g_methods, sym), plain: false })
+            let lines = ir_pos_take()
+            if split { tables.push(PosTable { sym: sym, lines: lines }) }
         } else {
             reset_unit_state()
             // Two groups whose first decls hash alike are told apart in decl order.
@@ -1130,9 +1145,39 @@ pub fn generate_module_chunks_with(program: Int, module_key: Str, self_header: S
                 n = n + 1
             }
             taken.insert(suffix, true)
-            out.push(UnitChunk { suffix: suffix, c: emit_module_chunk(module_key, self_header, cfg, g_fns, g_methods) })
+            let sym = pos_table_name(module_key, suffix)
+            ir_pos_begin(sym)
+            out.push(UnitChunk { suffix: suffix, c: emit_module_chunk(module_key, self_header, cfg, g_fns, g_methods, sym), plain: false })
+            tables.push(PosTable { sym: sym, lines: ir_pos_take() })
         }
         gi = gi + 1
+    }
+    if split { out.push(UnitChunk { suffix: "pos", c: pos_tables_text(tables), plain: true }) }
+    out
+}
+
+// The C name of the table of lines a file of module_key's unit reads. A suffix holds no
+// underscore, so the last one in the name parts it from the module key.
+fn pos_table_name(module_key: Str, suffix: Str) -> Str {
+    "__blink_pos_{module_key}_{suffix}"
+}
+
+fn declare_pos_table(sym: Str) {
+    if sym != "" { print_extern_const_array(layout_of(TYPE_INT, Position.Local).c_spelling, sym) }
+}
+
+// The file that defines a split unit's tables. It holds numbers alone, so it compiles in
+// next to no time, and it is the one file whose text a line added to the module changes
+// outside the edited function's chunk. C has no empty array, so a file that reads no line
+// still gets an entry.
+fn pos_tables_text(tables: List[PosTable]) -> Str {
+    let spelling = layout_of(TYPE_INT, Position.Local).c_spelling
+    let mut out = "#include <stdint.h>\n"
+    for t in tables {
+        let mut nums: List[Str] = []
+        for l in t.lines { nums.push("{l}") }
+        if nums.len() == 0 { nums.push("0") }
+        out = "{out}const {spelling} {t.sym}[] = \{ {nums.join(", ")} };\n"
     }
     out
 }
@@ -1140,9 +1185,10 @@ pub fn generate_module_chunks_with(program: Int, module_key: Str, self_header: S
 // A chunk declares what the head defines: the module's globals, its init function, the
 // evidence vector and the native shims. It defines its own functions, and its own copy of
 // each file-local helper they need.
-fn emit_module_chunk(module_key: Str, self_header: Str, cfg: CgConfig, fns: List[Int], methods: List[Int]) -> Str ! Codegen, Diag.Report {
+fn emit_module_chunk(module_key: Str, self_header: Str, cfg: CgConfig, fns: List[Int], methods: List[Int], pos_sym: Str) -> Str ! Codegen, Diag.Report {
     cg_promote_set_trace(cfg.trace_codegen != 0)
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, "", self_header, true)
+    declare_pos_table(pos_sym)
     cg_decl_emit_ev("extern ")
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
