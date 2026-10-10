@@ -1,0 +1,156 @@
+// A per-module build cuts a large module's unit into chunks, and each chunk holds the
+// declaration of each symbol it names, not the module's whole headers. So a function added
+// to the module, pub or private, compiles again only the chunks whose C changed (at most two,
+// see test_module_chunk_cut_is_stable_when_a_fn_is_added.bl), and no other chunk or unit.
+// BLINK_UNIT_CHUNK_DECLS makes the chunks small, so a small module splits.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// Functions with no call that can panic, so no C text carries a source position and only
+// the cut decides which chunk changes.
+fn big_source() -> Str {
+    let mut lines: List[Str] = []
+    let mut i = 0
+    while i < 24 {
+        lines.push("fn part{i}(s: Str) -> Str \{")
+        lines.push("    \"{i}:\{s}\"")
+        lines.push("}")
+        lines.push("")
+        i = i + 1
+    }
+    let mut calls: List[Str] = []
+    i = 0
+    while i < 24 {
+        calls.push("part{i}(s)")
+        i = i + 1
+    }
+    lines.push("pub fn total(s: Str) -> Str \{")
+    lines.push("    [{calls.join(", ")}].join(\",\")")
+    lines.push("}")
+    lines.push("")
+    // Padding lifts the module over the split bar of sixteen times BLINK_UNIT_CHUNK_DECLS decls.
+    let mut pads: List[Str] = []
+    i = 0
+    while i < 24 {
+        lines.push("fn pad{i}() -> Int \{ 0 }")
+        lines.push("")
+        pads.push("pad{i}()")
+        i = i + 1
+    }
+    lines.push("pub fn pads() -> Int \{ {pads.join(" + ")} }")
+    lines.push("")
+    lines.join("\n")
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"chunk_fn_added_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/big.bl", big_source())
+    write_file("{tree}/app/src/main.bl", [
+        #"import big.{total}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(total("x"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_UNIT_CHUNK_DECLS=2 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// Each C file of the large module in the last build's units directory, as "name sha".
+fn chunk_files(tree: Str) -> List[Str] {
+    sh("cd {tree}/out/app.units && sha256sum big.c big.p[0-9a-f]*.c 2>/dev/null | awk '\{print $2, $1}' | sort").split("\n").filter(fn(l) { l != "" })
+}
+
+fn sorted(xs: List[Str]) -> List[Str] {
+    let mut out = xs
+    let mut i = 1
+    while i < out.len() {
+        let cur = out.get(i).unwrap()
+        let mut j = i
+        while j > 0 && out.get(j - 1).unwrap() > cur {
+            out.set(j, out.get(j - 1).unwrap())
+            j = j - 1
+        }
+        out.set(j, cur)
+        i = i + 1
+    }
+    out
+}
+
+// The units a build compiled, read from its build.units trace, sorted.
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    sorted(out)
+}
+
+fn build_units(tree: Str) -> List[Str] {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    units_compiled(r)
+}
+
+// The units of the files in after whose C is not in before, sorted.
+fn changed_units(before: List[Str], after: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    for f in after {
+        if !before.contains(f) {
+            let name = f.split(" ").get(0).unwrap()
+            out.push(name.byte_slice(0, name.byte_len() - 2))
+        }
+    }
+    sorted(out)
+}
+
+// What the build after sed_edit on big.bl compiled besides the line table, and the units
+// whose C the edit changed.
+fn after_edit(tree: Str, sed_edit: Str) -> (Str, Str) {
+    let before = chunk_files(tree)
+    let text = read_file("{tree}/app/src/big.bl")
+    shell_exec("sed -i \"{sed_edit}\" {tree}/app/src/big.bl")
+    assert(read_file("{tree}/app/src/big.bl") != text, "the edit `{sed_edit}` did not change big.bl")
+    let compiled = build_units(tree).filter(fn(u) { u != "big.pos" })
+    (compiled.join(","), changed_units(before, chunk_files(tree)).join(","))
+}
+
+test "a function added to a large module recompiles only the chunks whose C changed" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_chunk_fn_added_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build_units(tree)
+    let (priv_compiled, priv_changed) = after_edit(tree, "/^fn part12(/i\\\\fn added_priv(s: Str) -> Str \{ s \}\\n")
+    let (pub_compiled, pub_changed) = after_edit(tree, "/^fn part5(/i\\\\pub fn added_pub(s: Str) -> Str \{ s \}\\n")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(cold.filter(fn(u) { u.starts_with("big.p") }).len() > 3, "the large module was not cut into chunks: {cold.join(",")}")
+    assert(priv_changed != "", "a private fn changed no chunk")
+    assert_eq(priv_compiled, priv_changed)
+    assert(pub_changed != "", "a pub fn changed no chunk")
+    assert_eq(pub_compiled, pub_changed)
+    assert(out.starts_with("0:x,1:x"), "the program changed: {out}")
+}
