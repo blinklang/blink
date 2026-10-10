@@ -80,9 +80,19 @@ wait "$cli_pid" || fail=1
 [ "$fail" -eq 0 ] || exit 1
 
 . scripts/link_opt.sh
+# Each binary is one C unit, and cc spends about 10 s on cli.c on one core while the
+# gate waits on it. Link-time optimization splits the unit into partitions that cc
+# optimizes at once, at the same -O level; a cc that does not take the flag links
+# as before.
+lto=""
+lto_probe=$(mktemp -d)
+lto_jobs=$(./scripts/default_jobs.sh)
+printf 'int main(void) { return 0; }\n' > "$lto_probe/p.c"
+cc -flto="$lto_jobs" -o "$lto_probe/p" "$lto_probe/p.c" > /dev/null 2>&1 && lto="-flto=$lto_jobs"
+rm -rf "$lto_probe"
 # link_bin <binary> <c file>
 link_bin() {
-    if ! cc $BLINK_GEN1_LINK_OPT -o "$out/bin/$1" "$out/$2" -I"$out/share/blink" "$archive_a" \
+    if ! cc $BLINK_GEN1_LINK_OPT $lto -o "$out/bin/$1" "$out/$2" -I"$out/share/blink" "$archive_a" \
             -lm -lgc -pthread -Wl,--gc-sections > "$out/link-$1.log" 2>&1; then
         echo "gen1: FAIL cc could not link $out/bin/$1; see $out/link-$1.log"
         head -20 "$out/link-$1.log"
