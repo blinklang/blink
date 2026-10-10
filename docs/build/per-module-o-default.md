@@ -507,8 +507,10 @@ of those shas hold the rows.
 `blink build` and `blink run` ask the project's daemon to build. The daemon
 serves any entry file of the project, from any directory of it (see "Any
 entry of the project" below). It builds only when the client's identity (its
-binary as typed, the compiler's sha256 and its env but `PWD`) and front-end
-settings (`--strict-struct-layout`, `BLINK_TRACE`, emit reuse) are its own.
+binary as typed, its compiler and its env but `PWD`) and front-end settings
+(`--strict-struct-layout`, `BLINK_TRACE`, emit reuse) are its own (see
+"Identity with no shell" below). The daemon serves only its own user (see
+"Closed to other users" below).
 The worker of the entry rechecks if an input changed, then forks a child
 that builds from the program it checked: the child skips the front end and
 runs mono, the analyses, emit, unit reuse, cc and link. The worker sends the
@@ -665,6 +667,74 @@ wall seconds [min-max]. `per_module_daemon_settle1_2037f4d5.tsv` and
   run-body-cname 0.6130 [0.600-0.995] and 0.6200 [0.576-0.988].
 - The daemon spends no more CPU in a build: over 5 builds of `src/cli.bl` its
   own CPU time is 221 and 220 ticks (of 10 ms) before, and 220 and 221 after.
+
+Identity with no shell. The client named its compiler and env to the daemon
+by a `sha256sum` in `sh` (about 7 ms a build or run), and each build child
+hashed the compiler again in `sh` (about 5 ms). On Linux x86_64 and aarch64
+the client now reads both from `/proc` and starts no process:
+
+- The compiler is the device and inode that `/proc/self/maps` gives for the
+  image mapped at offset 0 from its path, with the size and mtime of
+  `/proc/self/exe`. The device and inode alone tell a changed compiler only
+  because the kernel refuses a write to a file a process runs (`ETXTBSY`):
+  the daemon runs its compiler as long as it lives, so a rebuild or a copy
+  (`cp -p` too) reaches its path only as a new inode. The size and mtime are
+  kept for a file system that does not refuse the write.
+- The env goes whole, not hashed: each variable but `_`, `SHLVL`, `OLDPWD`
+  and `PWD` as `<length>\n<variable>\n`, sorted. The length keeps a value
+  that holds a newline from standing for two variables. The env goes only
+  to a daemon of the client's own user (see below), and the daemon only
+  compares it; it does not log, store or send it back.
+- The daemon hashes its compiler once at start, so each build child, a fork
+  of it, has the hash. The daemon builds only for a client whose compiler is
+  its own, so it is the hash the child took before.
+
+Elsewhere, or when `/proc` cannot say, the client hashes both in `sh` as
+before. A strace of 3 client builds and 4 build turns of the small target
+shows 9 `execve` per client before (the client; one `sh`, found on the 4th
+`PATH` entry; two `sha256sum`, `env` and `sort`) and 1 after; the
+daemon tree ran the compiler hash in `sh` 4 times (once per build) before
+and once (at start) after.
+
+`task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 11 reps, under
+`blink-gates.slice`, on the `dc552e4d` tree, alternating the gen1 `blink`
+built from `dc552e4d` (before) and from `884ce827` (after): before, after,
+before, after, per target. Median wall seconds [min-max] over the 22 builds
+of both runs of a binary. `daemon_identity_in_process_<target>_run<n>_<sha>.tsv`
+hold the rows. Load1 was at most 2.41.
+
+| target | case | before | after | change |
+|---|---|---|---|---|
+| cli | nochange | 0.1860 [0.180-0.198] | 0.1740 [0.166-0.187] | -12.0 ms |
+| cli | body-cname | 0.5480 [0.520-0.585] | 0.5415 [0.496-0.570] | -6.5 ms |
+| cli | body-typecheck | 2.9140 [2.888-2.936] | 2.9175 [2.891-2.939] | +3.5 ms |
+| cli | pubfn-cname | 1.7140 [1.676-1.733] | 1.6930 [1.660-1.732] | -21.0 ms |
+| cli | run-body-cname | 0.5925 [0.577-0.974] | 0.5795 [0.546-1.001] | -13.0 ms |
+| small | nochange | 0.0730 [0.070-0.075] | 0.0610 [0.059-0.062] | -12.0 ms |
+| small | body-inventory | 0.1255 [0.122-0.129] | 0.1140 [0.112-0.117] | -11.5 ms |
+| small | pubfn-model | 0.1265 [0.125-0.129] | 0.1140 [0.112-0.117] | -12.5 ms |
+| small | run-body-inventory | 0.1260 [0.124-0.130] | 0.1140 [0.112-0.118] | -12.0 ms |
+
+- Each small row is 11.5-12.5 ms faster, the 7 ms of the client's shell and
+  the 5 ms of the child's; each run's small medians do not overlap the other
+  binary's.
+- No row is slower beyond its spread. body-typecheck is 3.5 ms slower at the
+  median, inside a 48 ms range that both binaries share; the other cli rows
+  move by less than their spread.
+
+Closed to other users. A client sends the daemon its env, and the daemon
+builds and runs what it is sent, so no other user may reach its socket. The
+daemon makes `.blink/` and each worker directory `0700`, also one that
+existed before with a looser mode, and each socket `0600`, and does not start
+when it cannot. Only the daemon uses the project's `.blink/`, so a group that
+shares a project loses nothing by it. On Linux x86_64 and aarch64, where the
+`SOL_SOCKET` and `SO_PEERCRED` values were checked against the C headers, the
+daemon also asks the kernel for the uid at the other end of each connection
+it accepts and closes one of another user unread, and the client sends a
+request (with its env) only to a socket whose peer is its own user. The FFI
+cannot read a C macro, so on another arch the peer check is off, the client
+sends hashes in place of its env, and the closed directory alone keeps others
+out.
 
 ### Any entry of the project
 
