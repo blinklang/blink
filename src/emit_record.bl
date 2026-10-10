@@ -94,10 +94,11 @@ pub type ReusedUnits {
     // headers, as the record holds them.
     order: Str
     header_keys: Map[Str, Str]
+    entry_key: Str
 }
 
 let RECORD_NAME: Str = ".emit-record"
-let RECORD_SCHEMA: Str = "emit-record-7"
+let RECORD_SCHEMA: Str = "emit-record-8"
 let INPUTS_NAME: Str = ".emit-inputs"
 // The last build's inputs text, linked into the new units directory, so the text a build
 // compares is the one whose sha it checked against the record.
@@ -230,7 +231,7 @@ fn parse_inputs(text: Str) -> Option[InputFields] {
 // text beside it. A build that reused units, or hashed the text, already holds it in dir.
 // False when the record was not written whole, and then no record is left in dir. A short
 // inputs text is never taken, since a build compares all of it.
-pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[Str, Str], order: Str, header_keys: Map[Str, Str]) -> Bool {
+pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[Str, Str], order: Str, header_keys: Map[Str, Str], entry_key: Str) -> Bool {
     let inputs_path = "{dir}/{INPUTS_NAME}"
     if file_exists(inputs_path) != 1 {
         write_file(inputs_path, inputs)
@@ -238,6 +239,9 @@ pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[S
     let sb = StringBuilder.new()
     sb.write("{RECORD_SCHEMA}\ninputs {inputs.byte_len()} {shas.get(INPUTS_NAME) ?? "-"}\n")
     sb.write("order {order}\n")
+    if entry_key != "" && !entry_key.contains(" ") && !entry_key.contains("\n") {
+        sb.write("entry {entry_key}\n")
+    }
     let mut keyed: List[Str] = []
     for m in header_keys.keys() { keyed.push(m) }
     for m in build_objcache.sorted_strs(keyed) {
@@ -294,6 +298,9 @@ pub type EmitRecord {
     shas: Map[Str, Str]
     order: Str
     header_keys: Map[Str, Str]
+    // The key of the facts the entry unit read that no source span carries, or "" when the
+    // record holds none, and then no build takes the entry unit.
+    entry_key: Str
 }
 
 // The record in dir when it is whole. Only the inputs text beside it can show which inputs
@@ -318,6 +325,7 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
     let mut shas: Map[Str, Str] = Map()
     let mut order: Option[Str] = None
     let mut header_keys: Map[Str, Str] = Map()
+    let mut entry_key = ""
     let mut ended = false
     let mut i = 2
     while i < lines.len() {
@@ -361,6 +369,8 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
             shas.insert(parts.get(1).unwrap(), parts.get(2).unwrap())
         } else if kind == "hkey" && parts.len() == 3 {
             header_keys.insert(parts.get(1).unwrap(), parts.get(2).unwrap())
+        } else if kind == "entry" && parts.len() == 2 && entry_key == "" {
+            entry_key = parts.get(1).unwrap()
         } else {
             return None
         }
@@ -383,7 +393,7 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
         }
         with_uses.push(u)
     }
-    Some(EmitRecord { inputs_len: head.get(1).unwrap().to_int(), inputs_sha: head.get(2).unwrap(), units: with_uses, files: files, shas: shas, order: order_text, header_keys: header_keys })
+    Some(EmitRecord { inputs_len: head.get(1).unwrap().to_int(), inputs_sha: head.get(2).unwrap(), units: with_uses, files: files, shas: shas, order: order_text, header_keys: header_keys, entry_key: entry_key })
 }
 
 // Puts each of names from from_dir into to_dir, by a hard link or else by a copy. False when
@@ -458,7 +468,7 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
         for n in names { fs_remove("{to_dir}/{n}") }
         return None
     }
-    Some(ReusedUnits { units: rec.units, shas: shas, order: rec.order, header_keys: rec.header_keys })
+    Some(ReusedUnits { units: rec.units, shas: shas, order: rec.order, header_keys: rec.header_keys, entry_key: rec.entry_key })
 }
 
 // The units a build takes from the last build's record while it emits the rest, what the
@@ -473,6 +483,29 @@ pub type TakenUnits {
     // The files written beside the units only so that the build hashes what it compared. The
     // build removes them once it has.
     extras: List[Str]
+}
+
+// taken without unit m. The files written beside the units stay, so the build still removes
+// them.
+pub fn without_unit(taken: TakenUnits, m: Str) -> TakenUnits {
+    let mut units: List[EmittedUnit] = []
+    let mut gone: Map[Str, Bool] = Map()
+    for u in taken.units {
+        if u.module == m {
+            for f in unit_files(u) { gone.insert("{f.stem}.c", true) }
+        } else {
+            units.push(u)
+        }
+    }
+    let mut c_names: List[Str] = []
+    for c in taken.c_names {
+        if !gone.contains_key(c) { c_names.push(c) }
+    }
+    let mut shas: Map[Str, Str] = Map()
+    for name in taken.shas.keys() {
+        if !gone.contains_key(name) { shas.insert(name, taken.shas.get(name) ?? "-") }
+    }
+    TakenUnits { units: units, shas: shas, c_names: c_names, ..taken }
 }
 
 // Puts the files of the units taken into the units directory. False when it could not.

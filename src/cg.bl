@@ -46,10 +46,10 @@ import cg_decl.{
     cg_decl_spelled_carrier_tids, CgDeclMarks, cg_decl_marks, cg_decl_start_from,
 }
 import cg_derive.{
-    cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables,
+    cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables, cg_derive_key_table_names,
     cg_derive_key_table_nodes, cg_derive_reset,
 }
-import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_span, ir_verify}
+import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify}
 import mono.{instances, named_instance_rows, program_spawns, set_named_instance_rows}
 import typecheck.{TYPE_INT, TYPE_VOID, TyKind, tc_resolve, tc_tid_kind}
 import cg_stmt.{
@@ -1286,8 +1286,10 @@ fn hex32(v: Int) -> Str {
 // latter calls `begin_unit`, which resets the print buffer this unit has already written
 // into.
 fn module_init_fn_names(cfg: CgConfig, module_key: Str, self_deferred: List[Int]) -> List[Str] ! Diag.Report {
-    // The lowering below is thrown away, so the instances it names are not this unit's.
+    // The lowering below is thrown away, so the instances it names and the sources it spans
+    // are not this unit's. The entry key holds the names this answers.
     let named = named_instance_rows()
+    let track = ir_sources_pause()
     let mut out: List[Str] = []
     for m in cg_reg_modules() {
         if m == module_key {
@@ -1300,6 +1302,31 @@ fn module_init_fn_names(cfg: CgConfig, module_key: Str, self_deferred: List[Int]
         }
     }
     set_named_instance_rows(named)
+    ir_sources_resume(track)
+    out
+}
+
+// The init names the entry unit's shim calls, found as its emit finds them, for the entry
+// key. A build finds them here whether it emits the unit or takes it, so the key of a build
+// that emits it and of one that takes it come from one function. The entry module is found
+// among the rest: its own globals answer the same Const question there as in its unit's head.
+pub fn entry_unit_init_fns(program: Int, cfg: CgConfig) -> List[Str] ! Diag.Report {
+    begin_unit(program)
+    module_init_fn_names(cfg, "", [])
+}
+
+// The facts the entry unit's text reads that no source span carries, one per line: whether
+// a main and a spawn exist, each test's C symbol and name, and the name of each key table, in
+// the order the unit writes them. The caller adds the init names and the source of each key
+// table's node. A build takes the entry unit only when these are the last build's.
+pub fn entry_unit_facts(program: Int, facts: ProgramFacts) -> List[Str] ! Diag.Report {
+    begin_unit(program)
+    let mut out = ["main {cg_reg_has_main()}", "spawns {program_spawns()}"]
+    for t in cg_reg_test_decls() {
+        let name = node_str_val(t)
+        out.push("test {c_test_fn_name(t)} {name.byte_len()} {name}")
+    }
+    for name in cg_derive_key_table_names(facts.key_table_nodes) { out.push("table {name}") }
     out
 }
 
