@@ -284,10 +284,17 @@ symbol its C text names (`unit_declarations` in
 `<m>.priv.h`, then those of the other headers in module order, each
 header in its own line order, each line once. The build reads the
 declarations from each header it wrote, and scans each unit for their
-names. A header that has a line the build cannot read (any line other
-than its guard, its include of `blink.types.h` and one-line
-declarations), or a name without `blink` in it, goes into every unit as
-an include of the whole header.
+names. The scan reads whole C identifiers in code: it skips strings,
+character constants and comments, and `blink_lib_tally` does not match
+inside `blink_lib_tally_all`. A use by address and a read of a global
+count as a call does. A header that has a line the build cannot read
+(any line other than its guard, its include of `blink.types.h` and
+one-line declarations), or a name without `blink` in it, goes into every
+unit as an include of the whole header. A unit with no include of its
+own header gets no copy, and its key takes every header.
+`BLINK_TRACE_CHANNELS=build.unit_headers` prints a line for each unit
+that takes a whole header, with the reason. A cold build of `src/cli.bl`
+prints none.
 
 Why a copy and not an include: the object cache keys a unit on the
 bytes cc compiles, the unit and each header it includes. A module
@@ -312,10 +319,13 @@ needs no header for that.
 
 Why no unit can get a wrong or missing declaration: every header comes
 from the same front end and registries that emit the unit, so a
-declaration agrees with its definition. A missing header is a cc error:
-C rejects a call to an undeclared function and a read of an undeclared
-name. The scan can only include too much: a word that looks like a
-symbol costs one declaration more.
+declaration agrees with its definition. A missing declaration is a cc
+error: C rejects a read of an undeclared name, and each unit compiles
+with `-Werror=implicit-function-declaration`, which the object key also
+covers. gcc 14 and later, clang 16 and later and `zig cc` reject a call
+to an undeclared function by default. gcc before 14 and clang before 16
+only warn and then guess an `int` return, so without the flag such a
+miss would link and run wrong.
 
 What recompiles:
 
