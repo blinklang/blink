@@ -22,9 +22,25 @@
 // point where it crosses into such a node (lower_fn, cc_forwarded_binding,
 // unit_uses_async_scope, ir_line and ir_col); the node getters do not track reads, so a new
 // crossing must mark its source too. The record lists, for each unit, the sources it read, and a
-// build takes a unit when all of the rest is byte-equal to the last build's, every interface
-// among it, and every source the unit read holds the same text. The entry unit reads every
-// module's globals, so a build always emits it.
+// build takes a unit when all of the rest is byte-equal to the last build's, and every source
+// the unit read holds the same text. The entry unit reads every module's globals, so a build
+// always emits it.
+//
+// An interface may differ too, when only its plain fn items (no annotation) and its imports
+// differ. Blink has no wildcard import, and a fn is found only by its name, so a fn an edit
+// added, removed or changed can reach a unit's emit only through a source the unit read that
+// holds the fn's name as a word; such a unit is emitted. What else the edit changes of the C a
+// unit compiles is in the headers: the declaration lines the unit copies, and the types
+// header. A unit is taken when the types header is byte-equal, its own module's headers are,
+// it includes no changed header whole, and its files name no symbol whose declaration line an
+// edited header added, removed, changed or moved. An import changes only how its own module
+// resolves names, and that module's text changed, so its unit is emitted.
+//
+// Module m's headers are a function of m's declarations, the types header (which sets the
+// typedef marks every header starts from) and the names of the instances m's generics have.
+// A build that may take units keeps m's headers from the last build, by a link, when m's
+// sources have the same interfaces and name no edited fn, and the types header and m's
+// instance names, as one key, are what the record holds for m.
 //
 // A build writes its record into its private units directory only after its link succeeds,
 // and that directory replaces the last one only after the record is in it. A build stopped
@@ -33,6 +49,10 @@
 // again.
 
 import compiler.{loaded_inputs, import_map_paths, import_map_modules, import_map_source_modules, import_map_qualifiers, compiler_strict_struct_layout}
+import ast.{dbg_trace}
+import parser.{ITEM_MARK}
+import build_unit_headers.{index_headers}
+import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import diagnostics.{lint_override_lines}
 import cg.{CgConfig}
 import build_objcache
@@ -70,10 +90,14 @@ pub fn unit_files(u: EmittedUnit) -> List[UnitChunkFile] {
 pub type ReusedUnits {
     units: List[EmittedUnit]
     shas: Map[Str, Str]
+    // The module headers in the order the units include them, and the key of each module's
+    // headers, as the record holds them.
+    order: Str
+    header_keys: Map[Str, Str]
 }
 
 let RECORD_NAME: Str = ".emit-record"
-let RECORD_SCHEMA: Str = "emit-record-6"
+let RECORD_SCHEMA: Str = "emit-record-7"
 let INPUTS_NAME: Str = ".emit-inputs"
 // The last build's inputs text, linked into the new units directory, so the text a build
 // compares is the one whose sha it checked against the record.
@@ -206,13 +230,22 @@ fn parse_inputs(text: Str) -> Option[InputFields] {
 // text beside it. A build that reused units, or hashed the text, already holds it in dir.
 // False when the record was not written whole, and then no record is left in dir. A short
 // inputs text is never taken, since a build compares all of it.
-pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[Str, Str]) -> Bool {
+pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[Str, Str], order: Str, header_keys: Map[Str, Str]) -> Bool {
     let inputs_path = "{dir}/{INPUTS_NAME}"
     if file_exists(inputs_path) != 1 {
         write_file(inputs_path, inputs)
     }
     let sb = StringBuilder.new()
     sb.write("{RECORD_SCHEMA}\ninputs {inputs.byte_len()} {shas.get(INPUTS_NAME) ?? "-"}\n")
+    sb.write("order {order}\n")
+    let mut keyed: List[Str] = []
+    for m in header_keys.keys() { keyed.push(m) }
+    for m in build_objcache.sorted_strs(keyed) {
+        // A module key is one word, so one that is not is left out, and its headers are
+        // generated again.
+        if m.contains(" ") || m.contains("\n") { continue }
+        sb.write("hkey {m} {header_keys.get(m) ?? ""}\n")
+    }
     for u in units {
         sb.write("unit {u.module} {u.c_bytes} {u.headers.join(",")}\n")
         for c in u.chunks { sb.write("chunk {u.module} {c.stem} {c.c_bytes} {c.headers.join(",")}\n") }
@@ -252,13 +285,15 @@ pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[S
     false
 }
 
-type EmitRecord {
+pub type EmitRecord {
     inputs_len: Int
     // The sha of the inputs text beside the record, or "-" when the build did not hash it.
     inputs_sha: Str
     units: List[EmittedUnit]
     files: List[Str]
     shas: Map[Str, Str]
+    order: Str
+    header_keys: Map[Str, Str]
 }
 
 // The record in dir when it is whole. Only the inputs text beside it can show which inputs
@@ -281,6 +316,8 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
     let mut chunks: Map[Str, List[UnitChunkFile]] = Map()
     let mut files: List[Str] = []
     let mut shas: Map[Str, Str] = Map()
+    let mut order: Option[Str] = None
+    let mut header_keys: Map[Str, Str] = Map()
     let mut ended = false
     let mut i = 2
     while i < lines.len() {
@@ -303,6 +340,11 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
             uses.insert(m, ps)
             continue
         }
+        if line.starts_with("order ") {
+            if order.is_some() { return None }
+            order = Some(line.byte_slice(6, line.byte_len()))
+            continue
+        }
         let parts = line.split(" ")
         let kind = parts.get(0).unwrap()
         if kind == "unit" && parts.len() == 4 {
@@ -317,12 +359,18 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
         } else if kind == "file" && parts.len() == 3 {
             files.push(parts.get(1).unwrap())
             shas.insert(parts.get(1).unwrap(), parts.get(2).unwrap())
+        } else if kind == "hkey" && parts.len() == 3 {
+            header_keys.insert(parts.get(1).unwrap(), parts.get(2).unwrap())
         } else {
             return None
         }
     }
     if !ended || units.len() == 0 || files.len() == 0 {
         return None
+    }
+    let order_text = match order {
+        Some(o) => o
+        None => return None
     }
     let mut with_uses: List[EmittedUnit] = []
     for u0 in units {
@@ -335,7 +383,7 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
         }
         with_uses.push(u)
     }
-    Some(EmitRecord { inputs_len: head.get(1).unwrap().to_int(), inputs_sha: head.get(2).unwrap(), units: with_uses, files: files, shas: shas })
+    Some(EmitRecord { inputs_len: head.get(1).unwrap().to_int(), inputs_sha: head.get(2).unwrap(), units: with_uses, files: files, shas: shas, order: order_text, header_keys: header_keys })
 }
 
 // Puts each of names from from_dir into to_dir, by a hard link or else by a copy. False when
@@ -410,7 +458,7 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
         for n in names { fs_remove("{to_dir}/{n}") }
         return None
     }
-    Some(ReusedUnits { units: rec.units, shas: shas })
+    Some(ReusedUnits { units: rec.units, shas: shas, order: rec.order, header_keys: rec.header_keys })
 }
 
 // The units a build takes from the last build's record while it emits the rest, what the
@@ -422,6 +470,9 @@ pub type TakenUnits {
     from_dir: Str
     to_dir: Str
     c_names: List[Str]
+    // The files written beside the units only so that the build hashes what it compared. The
+    // build removes them once it has.
+    extras: List[Str]
 }
 
 // Puts the files of the units taken into the units directory. False when it could not.
@@ -429,88 +480,64 @@ pub fn place_taken(taken: TakenUnits) -> Bool ! IO {
     link_or_copy(taken.from_dir, taken.to_dir, taken.c_names)
 }
 
-// The units of the record in from_dir, among candidates, that this build can take: the
-// inputs other than the texts of the files in own (the sources of the program's modules)
-// match the last build's, the headers in to_dir that names and texts give match the last
-// build's, and every source each unit spanned holds the same text. The last build's inputs
-// text, as the build read it, goes into to_dir as last_inputs_name(). The build runs
-// place_taken on what it takes before it hashes to_dir, and checks in taken_units_hold that
-// the files it took, the inputs text it read, and the headers it compared hash as the
-// record says, so all a build compares is of one record. Nothing goes into to_dir before
-// a unit is chosen, so a unit the build emits is never written through a link. None, with
-// nothing written, when no unit can be taken.
-pub fn take_units(from_dir: Str, to_dir: Str, inputs: Str, candidates: List[Str], own: Map[Str, Bool], names: List[Str], texts: List[Str]) -> Option[TakenUnits] {
+// How a build's inputs differ from the last build's.
+pub type InputsDelta {
+    // The text of each loaded source in the two inputs texts, by its path.
+    texts_old: Map[Str, Str]
+    texts_new: Map[Str, Str]
+    // The name of each fn an edit added, removed or changed, once.
+    fn_names: List[Str]
+    // Each source of the program's modules whose interface text differs.
+    changed_interfaces: Map[Str, Bool]
+}
+
+// The last build, as a build that may take its units or headers compares it.
+pub type LastBuild {
+    from_dir: Str
+    rec: EmitRecord
+    // The inputs text beside the record, as this build read it.
+    last_text: Str
+    delta: InputsDelta
+    // Each loaded source whose old or new text holds the name of an edited fn as a word.
+    hits: Map[Str, Bool]
+}
+
+// The record in from_dir, when this build's inputs differ from the ones it records only in
+// the texts of the files own names, and in the plain fns and the imports of their interfaces.
+// None when there is no whole record, it names no sha of its inputs, or the inputs differ
+// anywhere else.
+pub fn last_build(from_dir: Str, inputs: Str, own: Map[Str, Bool]) -> Option[LastBuild] {
     let rec = match read_record(from_dir) {
         Some(r) => r
         None => return None
     }
     if rec.inputs_sha == "-" { return None }
-    let mut want: Map[Str, Bool] = Map()
-    for m in candidates { want.insert(m, true) }
-    let mut any = false
-    for u in rec.units {
-        if want.contains_key(u.module) && u.uses.len() > 0 { any = true }
-    }
-    if !any { return None }
-    // The headers are what every unit reads of the modules it does not lower, so all of them
-    // must be the last build's, and no more of them.
-    let mut rec_headers = 0
-    for f in rec.files {
-        if f.ends_with(".h") { rec_headers = rec_headers + 1 }
-    }
-    if rec_headers != names.len() { return None }
-    let mut i = 0
-    while i < names.len() {
-        let name = names.get(i).unwrap()
-        if !rec.shas.contains_key(name) { return None }
-        let path = "{from_dir}/{name}"
-        if file_exists(path) != 1 || read_file(path) != texts.get(i).unwrap() { return None }
-        i = i + 1
-    }
     let last_inputs = "{from_dir}/{INPUTS_NAME}"
     if file_exists(last_inputs) != 1 { return None }
     let last_text = read_file(last_inputs)
-    let both = match texts_if_same_but_own(last_text, inputs, own) {
-        Some(t) => t
-        None => return None
-    }
-    let texts_old = both.old
-    let texts_new = both.new
-    let mut taken: List[EmittedUnit] = []
-    let mut c_names: List[Str] = []
-    for u in rec.units {
-        if !want.contains_key(u.module) || u.uses.len() == 0 { continue }
-        let mut ok = true
-        for p in u.uses {
-            // A source no longer loaded has no text to match; one the other inputs hold
-            // already matched with them.
-            if !texts_new.contains_key(p) || texts_new.get(p) != texts_old.get(p) { ok = false }
-        }
-        if ok {
-            taken.push(u)
-            for f in unit_files(u) { c_names.push("{f.stem}.c") }
+    let delta = match inputs_delta(last_text, inputs, own) {
+        Some(d) => d
+        None => {
+            dbg_trace("build.units", "skip units: the inputs differ beyond fns and imports")
+            return None
         }
     }
-    if taken.len() == 0 { return None }
-    // Written, not linked: these are the bytes the build compared, whatever from_dir holds by
-    // the time it hashes them.
-    write_file("{to_dir}/{LAST_INPUTS_NAME}", last_text)
-    let mut shas: Map[Str, Str] = Map()
-    for c in c_names { shas.insert(c, rec.shas.get(c) ?? "-") }
-    for name in names { shas.insert(name, rec.shas.get(name) ?? "-") }
-    shas.insert(LAST_INPUTS_NAME, rec.inputs_sha)
-    Some(TakenUnits { units: taken, shas: shas, from_dir: from_dir, to_dir: to_dir, c_names: c_names })
+    let mut hits: Map[Str, Bool] = Map()
+    if delta.fn_names.len() > 0 {
+        dbg_trace("build.units", "edited fns: {delta.fn_names.join(",")}")
+        for p in delta.texts_new.keys() {
+            if names_any(delta.texts_new.get(p) ?? "", delta.fn_names) || names_any(delta.texts_old.get(p) ?? "", delta.fn_names) {
+                hits.insert(p, true)
+            }
+        }
+    }
+    Some(LastBuild { from_dir: from_dir, rec: rec, last_text: last_text, delta: delta, hits: hits })
 }
 
-// The text of each loaded source in two inputs texts, by its path.
-type SourceTexts {
-    old: Map[Str, Str]
-    new: Map[Str, Str]
-}
-
-// The source texts of old_text and new_text when their fields are the same but for the text
-// of each file own names. None when they differ anywhere else, or one is not whole.
-fn texts_if_same_but_own(old_text: Str, new_text: Str, own: Map[Str, Bool]) -> Option[SourceTexts] {
+// The delta of new_text from old_text when their fields are the same but for the text of
+// each file own names and the plain fn and import items of its interface. None when they
+// differ anywhere else, or one is not whole.
+fn inputs_delta(old_text: Str, new_text: Str, own: Map[Str, Bool]) -> Option[InputsDelta] {
     let o = match parse_inputs(old_text) {
         Some(f) => f
         None => return None
@@ -522,23 +549,404 @@ fn texts_if_same_but_own(old_text: Str, new_text: Str, own: Map[Str, Bool]) -> O
     if o.tags.len() != n.tags.len() { return None }
     let mut texts_old: Map[Str, Str] = Map()
     let mut texts_new: Map[Str, Str] = Map()
+    let mut names: List[Str] = []
+    let mut named: Map[Str, Bool] = Map()
+    let mut changed: Map[Str, Bool] = Map()
     let mut i = 0
     while i < n.tags.len() {
         let tag = n.tags.get(i).unwrap()
         if o.tags.get(i).unwrap() != tag { return None }
+        let ov = o.values.get(i).unwrap()
+        let nv = n.values.get(i).unwrap()
+        // The file field before a text, and two before an interface, already matched, so both
+        // values are of one path.
         let is_text = tag == "text" && i > 0 && n.tags.get(i - 1).unwrap() == "file"
+        let is_interface = tag == "interface" && i > 1 && n.tags.get(i - 2).unwrap() == "file"
         let mut skip = false
         if is_text {
-            // The file field before it already matched, so both texts are of one path.
             let path = n.values.get(i - 1).unwrap()
-            texts_old.insert(path, o.values.get(i).unwrap())
-            texts_new.insert(path, n.values.get(i).unwrap())
+            texts_old.insert(path, ov)
+            texts_new.insert(path, nv)
             skip = own.contains_key(path)
         }
-        if !skip && o.values.get(i).unwrap() != n.values.get(i).unwrap() { return None }
+        if !skip && ov != nv {
+            if !is_interface { return None }
+            let path = n.values.get(i - 2).unwrap()
+            if !own.contains_key(path) { return None }
+            changed.insert(path, true)
+            match edited_fns(ov, nv) {
+                Some(fs) => {
+                    for f in fs {
+                        if !named.contains_key(f) {
+                            named.insert(f, true)
+                            names.push(f)
+                        }
+                    }
+                }
+                None => return None
+            }
+        }
         i = i + 1
     }
-    Some(SourceTexts { old: texts_old, new: texts_new })
+    Some(InputsDelta { texts_old: texts_old, texts_new: texts_new, fn_names: names, changed_interfaces: changed })
+}
+
+// One top-level item of an interface text: the kind its mark gives, and its tokens.
+type InterfaceItem {
+    kind: Str
+    text: Str
+}
+
+// The names of the fns whose items differ between two interface texts of one source, taken
+// as two multisets of items, so a moved item is not an edit. None when an item that differs
+// is not a plain fn or an import, or a text is not whole.
+fn edited_fns(old_text: Str, new_text: Str) -> Option[List[Str]] {
+    let o = match interface_items(old_text) {
+        Some(items) => items
+        None => return None
+    }
+    let n = match interface_items(new_text) {
+        Some(items) => items
+        None => return None
+    }
+    let mut count: Map[Str, Int] = Map()
+    for it in o { count.insert(it.text, (count.get(it.text) ?? 0) + 1) }
+    for it in n { count.insert(it.text, (count.get(it.text) ?? 0) - 1) }
+    let mut all: List[InterfaceItem] = []
+    for it in o { all.push(it) }
+    for it in n { all.push(it) }
+    let mut out: List[Str] = []
+    for it in all {
+        if (count.get(it.text) ?? 0) == 0 { continue }
+        if it.kind.starts_with("fn ") {
+            out.push(it.kind.byte_slice(3, it.kind.byte_len()))
+        } else if it.kind != "import" {
+            dbg_trace("build.units", "skip units: an item of kind {it.kind} differs")
+            return None
+        }
+    }
+    Some(out)
+}
+
+// The items of an interface text, cut at each item mark the parser wrote, with the tokens
+// before the first mark as one item of kind "lead". A comment changes no item, so its tokens
+// are left out, and the line break it stood on with it.
+fn interface_items(text: Str) -> Option[List[InterfaceItem]] {
+    let mut out: List[InterfaceItem] = []
+    let mut kind = "lead"
+    let mut sb = StringBuilder.new()
+    let mut last_newline = false
+    let n = text.byte_len()
+    let mut pos = 0
+    while pos < n {
+        let c1 = match text.byte_index_of(":", pos) {
+            Some(c) => c
+            None => return None
+        }
+        let klen_word = text.byte_slice(pos, c1)
+        let klen = klen_word.to_int()
+        if klen < 0 || "{klen}" != klen_word { return None }
+        let kstart = c1 + 1
+        let kend = kstart + klen
+        if kend > n { return None }
+        let c2 = match text.byte_index_of(":", kend) {
+            Some(c) => c
+            None => return None
+        }
+        let vlen_word = text.byte_slice(kend, c2)
+        let vlen = vlen_word.to_int()
+        if vlen < 0 || "{vlen}" != vlen_word { return None }
+        let end = c2 + 1 + vlen
+        if end > n { return None }
+        let k = text.byte_slice(kstart, kend)
+        if k == ITEM_MARK {
+            out.push(InterfaceItem { kind: kind, text: sb.to_str() })
+            kind = text.byte_slice(c2 + 1, end)
+            sb = StringBuilder.new()
+            last_newline = false
+            sb.write(text.byte_slice(pos, end))
+        } else if k != "COMMENT" && k != "DOC_COMMENT" && !(k == "NEWLINE" && last_newline) {
+            last_newline = k == "NEWLINE"
+            sb.write(text.byte_slice(pos, end))
+        }
+        pos = end
+    }
+    out.push(InterfaceItem { kind: kind, text: sb.to_str() })
+    Some(out)
+}
+
+fn is_name_byte(b: U8) -> Bool {
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+// Whether text holds one of names as a whole word. A match inside a string or a comment
+// counts too, which costs only an emit.
+pub fn names_any(text: Str, names: List[Str]) -> Bool {
+    let n = text.byte_len()
+    for name in names {
+        if name == "" { continue }
+        let mut from = 0
+        while from < n {
+            match text.byte_index_of(name, from) {
+                Some(at) => {
+                    let end = at + name.byte_len()
+                    let starts = at == 0 || !is_name_byte(text.byte_at(at - 1))
+                    let ends = end >= n || !is_name_byte(text.byte_at(end))
+                    if starts && ends { return true }
+                    // A name ends at a whole character, so `end` starts one.
+                    from = end
+                }
+                None => from = n
+            }
+        }
+    }
+    false
+}
+
+// The names whose declaration line differs between two texts of one module header: each on
+// a line one text has and the other lacks, or every name when the lines both have stand in
+// another order. None when a text holds a line the scan cannot read, since every unit
+// includes such a header whole.
+fn changed_declarations(name: Str, old_text: Str, new_text: Str, types: Str) -> Option[List[Str]] {
+    let od = match index_headers([name], [old_text], types).decls.get(name) {
+        Some(ds) => ds
+        None => return None
+    }
+    let nd = match index_headers([name], [new_text], types).decls.get(name) {
+        Some(ds) => ds
+        None => return None
+    }
+    let mut in_old: Map[Str, Bool] = Map()
+    for d in od { in_old.insert(d.line, true) }
+    let mut in_new: Map[Str, Bool] = Map()
+    for d in nd { in_new.insert(d.line, true) }
+    let mut out: List[Str] = []
+    let mut common_old: List[Str] = []
+    for d in od {
+        if in_new.contains_key(d.line) { common_old.push(d.line) } else { out.push(d.name) }
+    }
+    let mut common_new: List[Str] = []
+    for d in nd {
+        if in_old.contains_key(d.line) { common_new.push(d.line) } else { out.push(d.name) }
+    }
+    // A unit copies the lines it uses in the header's order, so a move changes it too.
+    if common_old.join("\n") != common_new.join("\n") {
+        for d in od { out.push(d.name) }
+        for d in nd { out.push(d.name) }
+    }
+    Some(out)
+}
+
+// Past this many changed declarations, scanning every taken unit for each costs more than
+// it saves, so the build takes nothing.
+let MAX_CHANGED_SYMBOLS: Int = 64
+
+// The prefix of the copy of a changed header's last text that a build hashes, so that the
+// text it compared is the one its record names.
+let LAST_HEADER_PREFIX: Str = ".emit-last-"
+
+// The units of the last build, among candidates, that this build can take. The inputs differ
+// from the last build's at most as lb says. names and texts are the headers this build wrote
+// into to_dir, the types header first, and same names those it linked from the last build
+// as the record says they hash. The types header and the order of the module headers are the
+// last build's. A unit is taken when every source it read holds the same text and none
+// names an edited fn, its own module's headers are the last build's, and it includes no
+// changed header whole, and its files in from_dir name no symbol whose declaration line a
+// changed header added, removed or moved. The last build's inputs text, as the build read
+// it, goes into to_dir as last_inputs_name(), with a copy of each changed header's last
+// text. The build runs
+// place_taken on what it takes before it hashes to_dir, and checks in taken_units_hold that
+// the files it took, the texts it read, and the headers it compared hash as the record says,
+// so all a build compares is of one record. Nothing goes into to_dir before a unit is
+// chosen, so a unit the build emits is never written through a link. None, with nothing
+// written, when no unit can be taken.
+pub fn take_units(lb: LastBuild, to_dir: Str, candidates: List[Str], names: List[Str], texts: List[Str], order: List[Str], same: Map[Str, Bool]) -> Option[TakenUnits] {
+    let rec = lb.rec
+    let from_dir = lb.from_dir
+    let mut want: Map[Str, Bool] = Map()
+    for m in candidates { want.insert(m, true) }
+    let mut any = false
+    for u in rec.units {
+        if want.contains_key(u.module) && u.uses.len() > 0 { any = true }
+    }
+    if !any { return None }
+    if rec.order != order.join(",") {
+        dbg_trace("build.units", "skip units: the module headers differ in name or order")
+        return None
+    }
+    // The headers are what every unit reads of the modules it does not lower, so this build
+    // must have the last build's headers, and no more of them.
+    let mut rec_headers = 0
+    for f in rec.files {
+        if f.ends_with(".h") { rec_headers = rec_headers + 1 }
+    }
+    if rec_headers != names.len() { return None }
+    let types = c_program_types_header_name()
+    let mut changed: Map[Str, Bool] = Map()
+    let mut changed_names: List[Str] = []
+    let mut old_texts: List[Str] = []
+    let mut symbols: List[Str] = []
+    let mut seen_symbol: Map[Str, Bool] = Map()
+    let mut i = 0
+    while i < names.len() {
+        let name = names.get(i).unwrap()
+        i = i + 1
+        if !rec.shas.contains_key(name) { return None }
+        if same.contains_key(name) { continue }
+        let path = "{from_dir}/{name}"
+        if file_exists(path) != 1 { return None }
+        let old = read_file(path)
+        let text = texts.get(i - 1).unwrap()
+        if old == text { continue }
+        if name == types {
+            dbg_trace("build.units", "skip units: the types header differs")
+            return None
+        }
+        let ds = match changed_declarations(name, old, text, types) {
+            Some(d) => d
+            None => {
+                dbg_trace("build.units", "skip units: every unit includes {name} whole")
+                return None
+            }
+        }
+        for d in ds {
+            if !seen_symbol.contains_key(d) {
+                seen_symbol.insert(d, true)
+                symbols.push(d)
+            }
+        }
+        changed.insert(name, true)
+        changed_names.push(name)
+        old_texts.push(old)
+    }
+    if symbols.len() > MAX_CHANGED_SYMBOLS {
+        dbg_trace("build.units", "skip units: {symbols.len()} declarations changed")
+        return None
+    }
+    let mut taken: List[EmittedUnit] = []
+    let mut c_names: List[Str] = []
+    for u in rec.units {
+        if !want.contains_key(u.module) { continue }
+        let mut why = unit_kept_from(lb, u, changed)
+        // The files are scanned where they are, before any is placed; if from_dir changes
+        // after, what the build places does not hash as the record says, and it is emitted.
+        if why == "" && symbols.len() > 0 && unit_names_any(from_dir, u, symbols) {
+            why = "it names a changed declaration"
+        }
+        if why != "" {
+            dbg_trace("build.units", "skip unit {u.module}: {why}")
+            continue
+        }
+        taken.push(u)
+        for f in unit_files(u) { c_names.push("{f.stem}.c") }
+    }
+    if taken.len() == 0 { return None }
+    // Written, not linked: these are the bytes the build compared, whatever from_dir holds by
+    // the time it hashes them.
+    write_file("{to_dir}/{LAST_INPUTS_NAME}", lb.last_text)
+    let mut extras = [LAST_INPUTS_NAME]
+    let mut shas: Map[Str, Str] = Map()
+    for c in c_names { shas.insert(c, rec.shas.get(c) ?? "-") }
+    for name in names {
+        if !changed.contains_key(name) { shas.insert(name, rec.shas.get(name) ?? "-") }
+    }
+    let mut j = 0
+    while j < changed_names.len() {
+        let name = changed_names.get(j).unwrap()
+        let copy = "{LAST_HEADER_PREFIX}{name}"
+        write_file("{to_dir}/{copy}", old_texts.get(j).unwrap())
+        extras.push(copy)
+        shas.insert(copy, rec.shas.get(name) ?? "-")
+        j = j + 1
+    }
+    shas.insert(LAST_INPUTS_NAME, rec.inputs_sha)
+    Some(TakenUnits { units: taken, shas: shas, from_dir: from_dir, to_dir: to_dir, c_names: c_names, extras: extras })
+}
+
+// Why unit u of the last build cannot be taken, or "" when it can as far as the sources it
+// read and the headers it includes go.
+fn unit_kept_from(lb: LastBuild, u: EmittedUnit, changed: Map[Str, Bool]) -> Str {
+    if u.uses.len() == 0 { return "the record lists no source it read" }
+    for p in u.uses {
+        // A source no longer loaded has no text to match; one the other inputs hold already
+        // matched with them.
+        if !lb.delta.texts_new.contains_key(p) || lb.delta.texts_new.get(p) != lb.delta.texts_old.get(p) {
+            return "{p} changed"
+        }
+        if lb.hits.contains_key(p) { return "{p} names an edited fn" }
+    }
+    // A module's own headers hold its instances, whose bodies its unit writes.
+    if changed.contains_key(c_module_header_name(u.module)) || changed.contains_key(c_module_private_header_name(u.module)) {
+        return "its own header changed"
+    }
+    for f in unit_files(u) {
+        for h in f.headers {
+            if changed.contains_key(h) { return "it includes {h} whole" }
+        }
+    }
+    ""
+}
+
+// Whether a file of unit u in dir names one of symbols.
+fn unit_names_any(dir: Str, u: EmittedUnit, symbols: List[Str]) -> Bool {
+    for f in unit_files(u) {
+        if names_any(read_file("{dir}/{f.stem}.c"), symbols) { return true }
+    }
+    false
+}
+
+// Whether module m's headers may be the last build's without being generated: no source of m
+// changed its interface or names an edited fn, and key, which covers the types header and the
+// instances of m's generics, is the one the record holds for m.
+pub fn headers_unchanged(lb: LastBuild, m: Str, key: Str) -> Bool {
+    if (lb.rec.header_keys.get(m) ?? "") != key { return false }
+    let paths = loaded_inputs.source_paths
+    let modules = loaded_inputs.source_modules
+    let mut i = 0
+    while i < paths.len() && i < modules.len() {
+        if modules.get(i).unwrap() == m {
+            let p = paths.get(i).unwrap()
+            if lb.delta.changed_interfaces.contains_key(p) || lb.hits.contains_key(p) { return false }
+        }
+        i = i + 1
+    }
+    true
+}
+
+// The texts of names, put into to_dir from the last build's units directory, where each hashes
+// as the record says. None, with none of them left in to_dir, when one does not.
+pub fn link_last_files(lb: LastBuild, to_dir: Str, names: List[Str]) -> Option[List[Str]] ! IO {
+    for n in names {
+        if !lb.rec.shas.contains_key(n) { return None }
+    }
+    let mut ok = link_or_copy(lb.from_dir, to_dir, names)
+    if ok {
+        let shas = build_objcache.file_shas(to_dir, names)
+        for n in names {
+            if (shas.get(n) ?? "") != (lb.rec.shas.get(n) ?? "-") { ok = false }
+        }
+    }
+    if !ok {
+        for n in names { fs_remove("{to_dir}/{n}") }
+        return None
+    }
+    let mut texts: List[Str] = []
+    for n in names { texts.push(read_file("{to_dir}/{n}")) }
+    Some(texts)
+}
+
+// Puts text into to_dir as name: a link to the file of the last units directory when that
+// holds the same bytes, so a header whose text did not change keeps the last build's file,
+// and else a file of its own.
+pub fn keep_or_write(from_dir: Str, to_dir: Str, name: Str, text: Str) ! IO {
+    let old = "{from_dir}/{name}"
+    let path = "{to_dir}/{name}"
+    if from_dir != "" && file_exists(old) == 1 && read_file(old) == text && build_fs.hard_link(old, path) {
+        // Another build can replace from_dir between the read and the link.
+        if read_file(path) == text { return }
+        fs_remove(path)
+    }
+    write_file(path, text)
 }
 
 // Whether every file of taken hashes, in shas, as the record it came from says.
