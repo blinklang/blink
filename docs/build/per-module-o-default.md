@@ -277,10 +277,33 @@ The build writes three kinds of header:
   init function, and the signatures of the generic instances its unit
   defines.
 
-Unit `m` includes `<m>.h`, `<m>.priv.h`, and the header of each symbol
-its C text names. The build reads the declared names from each header it
-wrote, and scans each unit for them. A header that has a line the build
-cannot read, or a name without `blink` in it, goes into every unit.
+Unit `m` includes `blink.types.h` and no module header. In place of
+the module headers, the unit holds a copy of the declaration of each
+symbol its C text names (`unit_declarations` in
+`src/build_unit_headers.bl`): first the lines of `<m>.h` and
+`<m>.priv.h`, then those of the other headers in module order, each
+header in its own line order, each line once. The build reads the
+declarations from each header it wrote, and scans each unit for their
+names. The scan reads whole C identifiers in code: it skips strings,
+character constants and comments, and `blink_lib_tally` does not match
+inside `blink_lib_tally_all`. A use by address and a read of a global
+count as a call does. A header that has a line the build cannot read
+(any line other than its guard, its include of `blink.types.h` and
+one-line declarations), or a name without `blink` in it, goes into every
+unit as an include of the whole header. A unit with no include of its
+own header gets no copy, and its key takes every header.
+`BLINK_TRACE_CHANNELS=build.unit_headers` prints a line for each unit
+that takes a whole header, with the reason. A cold build of `src/cli.bl`
+prints none.
+
+Why a copy and not an include: the object cache keys a unit on the
+bytes cc compiles, the unit and each header it includes. A module
+header holds each declaration of its module, so a new pub fn changed the
+key of each unit that included the header, and each one recompiled. With
+the copy, the key of a unit changes only when a declaration it uses
+changes. The build still writes the module headers: the emit record
+compares them to decide if it can keep the last build's units, and a
+header that the scan cannot read is still included.
 
 Why every type is in one header: a unit can hold a type by value that it
 got through a module it does not import (`pc` holds `pb.Seg`, which holds
@@ -296,22 +319,27 @@ needs no header for that.
 
 Why no unit can get a wrong or missing declaration: every header comes
 from the same front end and registries that emit the unit, so a
-declaration agrees with its definition. A missing header is a cc error:
-C rejects a call to an undeclared function and a read of an undeclared
-name. The scan can only include too much: a word that looks like a
-symbol costs one header more.
+declaration agrees with its definition. A missing declaration is a cc
+error: C rejects a read of an undeclared name, and each unit compiles
+with `-Werror=implicit-function-declaration`, which the object key also
+covers. gcc 14 and later, clang 16 and later and `zig cc` reject a call
+to an undeclared function by default. gcc before 14 and clang before 16
+only warn and then guess an `int` return, so without the flag such a
+miss would link and run wrong.
 
 What recompiles:
 
 - A private-body edit changes one unit and no header.
-- A new private function or global changes `<m>.priv.h`, which only
-  units that name a private symbol of `m` include (usually `m` alone).
-- A pub signature edit or a new pub function changes `<m>.h`, which
-  recompiles `m` and the units that name a symbol of `m`.
+- A new private or pub function or global adds a declaration that no
+  other unit names yet, so it recompiles only the unit (or, in a cut
+  module, the chunks) whose text changed.
+- A pub signature edit changes one declaration, which recompiles `m`
+  and each unit that names that function.
 - A new type, a new generic struct instance, or a new carrier changes
   `blink.types.h`, which recompiles every unit.
-- A new instance of a generic changes the `<m>.priv.h` of the module
-  that declares the generic.
+- A new instance of a generic adds a line to the `<m>.priv.h` of the
+  module that declares the generic, which recompiles the units that name
+  the instance.
 
 `src/cli.bl` has 49 units and 131 headers (0.45 MB of headers, from 7.3 MB
 when every unit included every header).
@@ -1117,9 +1145,11 @@ What the cut costs and saves:
 
 - A body edit in `typecheck.bl` compiles one chunk (0.06 s of cc, the
   largest chunk 0.38 s) in place of the whole unit (2.4 s).
-- A decl added to the module changes the private header
+- A decl added to the module changed the private header
   `typecheck.priv.h`, which every file of the unit and `__main__.c`
-  include, so all 18 recompile. The text of the other chunks does not
+  included, so all 18 recompiled. Now each chunk holds only the
+  declarations it names (see "Unit headers"), so only the chunks whose
+  text changed recompile (see the bench below). The text of the other chunks does not
   change: a private fn added in the middle of `typecheck.bl` changed the
   text of its own chunk, `typecheck.pos.c` and `typecheck.priv.h`. Its
   name hashed to a cut, so the chunk before it lost a few decls too.
@@ -1165,6 +1195,77 @@ each binary, with the number of cc calls:
 - `cold-obj` and `cold-all` gain 1.1 s: the largest unit no longer holds
   the build up.
 - No other row is slower than before outside its spread.
+
+### Declarations in the unit
+
+Each unit holds the declarations it names in place of the module headers
+(see "Unit headers"). `task bench-edit-loop` on the gen1 `blink` of
+`4e9da0b8` (before, sha256 `e1f24e5e510510b6`) and of `6735be43` (after,
+sha256 `97ea08fea26351de`), 11 reps, 12 cores, under
+`blink-gates.slice`, before then after for each target and mode, on the
+`6735be43` tree. The `inline_decls_*` files in `bench/edit_loop/` hold
+the rows. Median wall seconds, with the number of cc calls:
+
+| target | case | before | after | daemon before | daemon after | cc before | cc after |
+|---|---|---|---|---|---|---|---|
+| cli | nochange | 0.533 | 0.531 | 0.170 | 0.180 | 0 | 0 |
+| cli | body-cname | 0.802 | 0.798 | 0.549 | 0.536 | 1 | 1 |
+| cli | body-typecheck | 0.786 | 0.786 | 0.585 | 0.575 | 1 | 1 |
+| cli | pubfn-cname | 1.874 | 1.107 | 1.754 | 0.985 | 14 | 1 |
+| cli | privfn-cname | 1.631 | 1.109 | 1.490 | 0.974 | 2 | 1 |
+| cli | pubfn-typecheck | 2.213 | 0.996 | 2.161 | 0.880 | 37 | 1 |
+| cli | privfn-typecheck | 1.771 | 1.000 | 1.720 | 0.884 | 18 | 1 |
+| cli | run-body-cname | 0.806 | 0.803 | 0.588 | 0.577 | 1 | 1 |
+| cli | test-body-cname | 0.487 | 0.483 | 0.488 | 0.485 | 1 | 1 |
+| cli | cold-obj | 2.552 | 2.560 | 2.304 | 2.308 | 67 | 67 |
+| cli | cold-all | 4.943 | 4.940 | 4.955 | 4.960 | 68 | 68 |
+| small | nochange | 0.070 | 0.071 | 0.060 | 0.060 | 0 | 0 |
+| small | body-inventory | 0.119 | 0.119 | 0.112 | 0.114 | 1 | 1 |
+| small | pubfn-model | 0.121 | 0.111 | 0.111 | 0.103 | 3 | 1 |
+| small | privfn-model | 0.112 | 0.110 | 0.103 | 0.104 | 1 | 1 |
+| small | run-body-inventory | 0.120 | 0.121 | 0.112 | 0.113 | 1 | 1 |
+| small | test-body-inventory | 0.133 | 0.133 | 0.136 | 0.135 | 1 | 1 |
+| small | cold-obj | 0.121 | 0.121 | 0.110 | 0.111 | 5 | 5 |
+
+- A new fn, pub or private, compiles one file: the unit, or in a cut
+  module the chunk, whose text changed.
+- Through the daemon a new fn still costs about 0.45 s (cname) and 0.3 s
+  (typecheck) more than a body edit. All of it is emit (`emit_s` 0.79 s
+  against 0.34 s and 0.47 s): a changed module header stops the build
+  from keeping the last build's units, so it emits each unit again. The
+  cc time is the same as a body edit's.
+- No other row is slower than before outside its spread.
+
+The scan that reads whole identifiers outside strings and comments, and the
+`-Werror=implicit-function-declaration` flag, came after. The gen1 `blink`
+of `d4dd6cb4` (sha256 `8c19d135eb12dd4d`), same reps and slice, on the
+`d4dd6cb4` tree, in its own run after the one above; the `run3_d4dd6cb4`
+files hold the rows. Median wall seconds against `6735be43`:
+
+| target | case | 6735be43 | d4dd6cb4 | daemon 6735be43 | daemon d4dd6cb4 | cc |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.531 | 0.530 | 0.180 | 0.175 | 0 |
+| cli | body-cname | 0.798 | 0.801 | 0.536 | 0.559 | 1 |
+| cli | body-typecheck | 0.786 | 0.795 | 0.575 | 0.591 | 1 |
+| cli | pubfn-cname | 1.107 | 1.120 | 0.985 | 0.990 | 1 |
+| cli | privfn-cname | 1.109 | 1.125 | 0.974 | 1.006 | 1 |
+| cli | pubfn-typecheck | 0.996 | 1.026 | 0.880 | 0.908 | 1 |
+| cli | privfn-typecheck | 1.000 | 1.029 | 0.884 | 0.914 | 1 |
+| cli | run-body-cname | 0.803 | 0.807 | 0.577 | 0.584 | 1 |
+| cli | test-body-cname | 0.483 | 0.485 | 0.485 | 0.487 | 1 |
+| cli | cold-obj | 2.560 | 2.558 | 2.308 | 2.313 | 67 |
+| cli | cold-all | 4.940 | 4.950 | 4.960 | 4.959 | 68 |
+| small | nochange | 0.071 | 0.072 | 0.060 | 0.061 | 0 |
+| small | body-inventory | 0.119 | 0.119 | 0.114 | 0.113 | 1 |
+| small | pubfn-model | 0.111 | 0.111 | 0.103 | 0.105 | 1 |
+| small | privfn-model | 0.110 | 0.112 | 0.104 | 0.105 | 1 |
+| small | run-body-inventory | 0.121 | 0.120 | 0.113 | 0.113 | 1 |
+| small | test-body-inventory | 0.133 | 0.135 | 0.135 | 0.134 | 1 |
+| small | cold-obj | 0.121 | 0.120 | 0.111 | 0.110 | 5 |
+
+The cc calls did not change. A new fn costs about 0.03 s more, all of it
+in `emit_s`: the scan reads each unit one byte at a time. The `cold-obj`
+and `cold-all` rows did not change, so the flag costs cc nothing.
 
 ## Blockers before the default flipped
 

@@ -1,0 +1,88 @@
+// A per-module unit holds the declaration of each program symbol its C names, and the object
+// cache keys the unit on those lines. A name counts only as a whole C identifier in code: a
+// shorter name inside a longer one, or a name in a string, a character constant or a comment,
+// names nothing. A use by address or a read of a global names its symbol as a call does. A
+// header the scan cannot read line by line is included whole, and a unit with no include of
+// its own header gets no splice.
+
+import build_unit_headers.{HeaderIndex, UnitDecls, index_headers, unit_declarations, splice_declarations}
+
+fn lib_header() -> Str {
+    [
+        "#ifndef BLINK_MOD_lib_H",
+        "#define BLINK_MOD_lib_H",
+        "#include \"blink.types.h\"",
+        "extern int64_t blink_lib_count;",
+        "int64_t blink_lib_tally(int64_t n);",
+        "int64_t blink_lib_tally_all(int64_t n);",
+        "void blink_lib_bump(void);",
+        "#endif",
+        "",
+    ].join("\n")
+}
+
+fn index_of(names: List[Str], texts: List[Str]) -> HeaderIndex {
+    index_headers(names, texts, "blink.types.h")
+}
+
+fn lines_for(c: Str) -> List[Str] {
+    let idx = index_of(["lib.h"], [lib_header()])
+    unit_declarations(c, ["user.h", "user.priv.h"], idx, ["lib.h"]).lines
+}
+
+test "a use of the longer of two names that share a prefix declares only the longer" {
+    let lines = lines_for("int64_t f(void) \{ return blink_lib_tally_all(1); }\n")
+    assert_eq(lines.join("\n"), "int64_t blink_lib_tally_all(int64_t n);")
+}
+
+test "a name inside a string or a character constant declares nothing" {
+    let c = [
+        "const char* a = \"blink_lib_tally\";",
+        "const char* b = \"say \\\"blink_lib_bump\\\" \\\\\";",
+        "char q = '\"'; char e = '\\'';",
+        "int64_t f(void) \{ return blink_lib_tally_all(1); }",
+        "",
+    ].join("\n")
+    assert_eq(lines_for(c).join("\n"), "int64_t blink_lib_tally_all(int64_t n);")
+}
+
+test "a name inside a comment declares nothing" {
+    let c = [
+        "// calls blink_lib_tally",
+        "/* and blink_lib_bump,",
+        "   over two lines */",
+        "int64_t f(void) \{ return blink_lib_tally_all(1); }",
+        "",
+    ].join("\n")
+    assert_eq(lines_for(c).join("\n"), "int64_t blink_lib_tally_all(int64_t n);")
+}
+
+test "a name taken by address and a global read each declare their symbol" {
+    let c = [
+        "void* p = (void*)&blink_lib_bump;",
+        "int64_t (*g)(int64_t) = blink_lib_tally;",
+        "int64_t h(void) \{ return blink_lib_count + 1; }",
+        "",
+    ].join("\n")
+    assert_eq(lines_for(c).join("\n"), [
+        "extern int64_t blink_lib_count;",
+        "int64_t blink_lib_tally(int64_t n);",
+        "void blink_lib_bump(void);",
+    ].join("\n"))
+}
+
+test "a header with a macro or a name the scan cannot read is included whole" {
+    let macro_h = "#ifndef BLINK_MOD_m_H\n#define BLINK_MOD_m_H\n#define BLINK_M_SIZE 4\nint64_t blink_m_f(void);\n#endif\n"
+    let foreign_h = "#ifndef BLINK_MOD_n_H\n#define BLINK_MOD_n_H\nint strlen_like(const char* s);\n#endif\n"
+    let idx = index_of(["lib.h", "m.h", "n.h"], [lib_header(), macro_h, foreign_h])
+    let d = unit_declarations("int64_t f(void) \{ return blink_lib_tally(1); }\n", ["user.h", "user.priv.h"], idx, ["lib.h", "m.h", "n.h"])
+    assert_eq(d.whole.join(","), "m.h,n.h")
+    assert_eq(d.lines.join("\n"), "int64_t blink_lib_tally(int64_t n);")
+    let spliced = splice_declarations("#include \"user.h\"\nint x;\n", "user.h", "blink.types.h", d).unwrap()
+    assert_eq(spliced, "#include \"blink.types.h\"\n#include \"m.h\"\n#include \"n.h\"\nint64_t blink_lib_tally(int64_t n);\nint x;\n")
+}
+
+test "a unit with no include of its own header gets no splice" {
+    let d = UnitDecls { whole: [], lines: ["void blink_lib_bump(void);"] }
+    assert(splice_declarations("#include \"other.h\"\nint x;\n", "user.h", "blink.types.h", d).is_none(), "a unit without its own include was spliced")
+}
