@@ -282,7 +282,6 @@ impl Stack for IntStack {
 
     // Inherits `@requires(self.size() > 0)` and the trait's `@ensures`.
     @ensures(result.items.len() == self.items.len() - 1)    // OK: an impl may add @ensures
-    @verify(fallback: "runtime")
     fn drop_top(self) -> IntStack {
         IntStack { items: self.items.drop_last() }
     }
@@ -330,38 +329,37 @@ trait Buffer {
 
 impl Buffer for Ring {
     // `n` binds to `count` by position: the inherited @requires is `count >= 0`.
-    @verify(fallback: "runtime")
     fn take(self, count: Int) -> List[Int] {
         self.items.take(count)
     }
 }
 ```
 
-**`@verify` on trait methods.** A trait method declaration may carry `@verify`, with `fallback: "runtime"` only. It is the default policy for every impl body of that method that has no `@verify` of its own. `@verify(fallback: "trust")` on a trait method declaration is a compile error (`error[TrustOnTraitMethod]`, E0913): a trust decision covers one body, and a trait author cannot see the bodies of downstream impls.
+**`@verify` on trait methods.** A trait method declaration may carry `@verify` with `fallback: "error"` or `fallback: "runtime"`. It is the default policy for every impl body of that method that has no `@verify` of its own. `@verify(fallback: "trust")` on a trait method declaration is a compile error (`error[TrustOnTraitMethod]`, E0913): a trust decision covers one body, and a trait author cannot see the bodies of downstream impls.
 
 - An impl method's own `@verify` (`"trust"` included) replaces the trait's default as a whole. The two never merge.
 - The default resolves at elaboration, before verification. It also applies to an open-default body and to each override of it.
 - A fallback applies only when the outcome is Unknown (§3b.4). A Proven contract costs nothing, so a trait default never adds a check that the solver can remove.
-- An inherited `"runtime"` check follows the same build-mode rule as any other runtime fallback (§3b.4 *Option 2*). The verification report lists the inherited runtime checks for each impl.
+- With no `@verify` on the trait method or the impl, an Unknown outcome gets a runtime check, as for any other function (§3b.4). An inherited runtime check runs in every build. The verification report lists the inherited runtime checks for each impl.
 
-With the trait default, a trait author can add a contract to a published trait without forcing a `@verify` into every downstream impl.
+With `"error"`, a trait author can demand a proof from every impl. Adding `"error"` to a method of a published trait is a breaking change: an impl that compiled with a runtime check may now get V0003.
 
 ```blink
 trait Score {
     @ensures(result >= 0 && result <= 100)
-    @verify(fallback: "runtime")              // default for every impl body
+    @verify(fallback: "error")                // default for every impl body
     fn score(self) -> Int
 }
 
 impl Score for Exam {
-    // No @verify: the trait's "runtime" default applies to this body.
+    // No @verify: the trait's "error" default applies to this body.
     fn score(self) -> Int {
         self.correct * 100 / self.total
     }
 }
 
 impl Score for Model {
-    @verify(fallback: "trust")                // replaces the trait default for this body
+    @verify(fallback: "runtime")              // replaces the trait default; not redundant (no W0901)
     fn score(self) -> Int {
         self.eval_score()
     }
@@ -374,18 +372,19 @@ trait Shape {
 }
 ```
 
-If no `@verify` applies and the outcome is Unknown, the error is V0003 at the impl method. The message says that the contract comes from the trait and names the impl method as the place for `@verify`. For example, with a trait method `Gauge.level` that has `@ensures(result >= 0)` and no `@verify`:
+If the effective policy is `"error"` and the outcome is Unknown, the error is V0003 at the impl method. The message names the trait method that sets the default, and names the impl method as the place for `@verify`. For example, with a trait method `Gauge.level` that has `@ensures(result >= 0)` and `@verify(fallback: "error")`:
 
 ```
 error[V0003]: contract unverifiable
  --> tank.bl:9:5
   |
 9 |     fn level(self) -> Int {
-  |     ^^^^^^^^ solver returned unknown
+  |     ^^^^^^^^ outcome unknown
   |
   = note: `@ensures(result >= 0)` is inherited from `Gauge.level`
-  = help: add `@verify(fallback: "runtime")` to this impl method, or to `Gauge.level`
-          to set a default for every impl
+  = note: `@verify(fallback: "error")` is inherited from `Gauge.level` and requires a proof
+  = note: no solver ran; this compiler cannot prove contracts
+  = help: add `@verify(fallback: "runtime")` to this impl method to check the contract at runtime
 ```
 
 **Default methods.** A trait default body is verified once against the trait's contract, generically over `Self` (the default body is parametric in `Self`, §3.6 *Operations on `Self` in a Default Body*). Its monomorphized copies use that result. An open default's override inherits the same contract and must discharge it in its own body. A `final` default fixes both its body and its contract.
@@ -515,42 +514,85 @@ error[V0002]: contract violation
 
 This is a real bug caught at compile time with a concrete failing input. The error message tells the developer (or AI) exactly what went wrong and suggests a fix. This is strictly better than a test failure -- it proves the bug exists for a specific input rather than hoping the test suite happened to exercise it.
 
-#### Unknown (Configurable Fallback)
+#### Unknown (Runtime Check by Default)
 
-The solver can't determine whether the contract holds or not. The predicate is beyond what the SMT theories can decide, or the solver times out. By default, this is a compile error:
+The solver cannot determine whether the contract holds. The predicate is beyond what the SMT theories can decide, the solver times out, or no solver ran. By default, the compiler inserts a runtime check:
 
-```
-error[V0003]: contract unverifiable
- --> crypto.bl:8:1
-  |
- 8| @ensures(result.is_valid_signature())
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ solver returned unknown
-  |
-  = note: the SMT solver could not prove or disprove this contract
-  = help: options:
-  |   1. Simplify the contract predicate
-  |   2. Add @verify(fallback: "runtime") to insert a runtime check
-  |   3. Add @verify(fallback: "trust") to accept without verification
-```
-
-The developer has three options:
-
-**Option 1: Simplify the contract.** Rewrite the predicate to use operations the solver understands. This is the best outcome -- it means the contract is now provable.
-
-**Option 2: Runtime fallback.** Add `@verify(fallback: "runtime")` to insert a runtime check. The contract becomes an assertion that runs in debug builds (and optionally in release builds).
-
-A function's own `@verify` governs its whole contract, `@requires` included. A runtime `@requires` check runs at the function's entry, so every caller gets it. A caller never writes `@verify` for a callee's contract:
+- A `@requires` check runs at the function's entry, before the body. Every caller gets it.
+- An `@ensures` check runs at each exit of the function, after `result` is known. Each `old(expr)` in the clause is evaluated once at entry and kept for the exit check.
+- A failed check panics. At a system boundary (§9.2), a failed `@requires` check raises `validation.contract_violation(...)` in place of a panic (§4.4.2).
 
 ```blink
-@ensures(result.is_valid_signature())
-@verify(fallback: "runtime")
-fn sign(data: Str, key: PrivateKey) -> Signature ! Crypto {
-    // If the solver can't prove the postcondition, a runtime assertion
-    // checks it after every call. Fails fast if the contract is violated.
+@requires(amount > 0)
+@ensures(result.balance == old(self.balance) - amount)
+fn withdraw(self: Account, amount: Int) -> Account {
+    Account { balance: self.balance - amount, ..self }
+}
+// No @verify: if the outcome is Unknown, both clauses are checked at runtime.
+```
+
+The default needs no annotation. A function's own `@verify` governs its whole contract, `@requires` included. A caller never writes `@verify` for a callee's contract.
+
+**Every build has the check.** A runtime contract check runs in every build mode, release included. No build flag, profile or `blink.toml` setting removes it. The only way to remove the check from one function is `@verify(fallback: "trust")` on that function. This rule follows from modular verification (§3b.3): a caller's proof assumes the callee's `@ensures`, so a build that removed the check would turn each callee contract into a trust that no reviewer can see.
+
+**Cost.** A passing check costs the predicate and one predicted branch. The compiler formats the failure message only on the failure path, which it never inlines into the function. The verification report (`blink verify`) shows a cost class for each runtime check: `O(1)`, `calls a function`, or `walks a collection`. It also lists the `old()` snapshots that the check copies at entry.
+
+**Failure message.** A failed runtime check prints:
+
+- the contract text and its clause kind (`@requires` or `@ensures`)
+- the function, and the span of the clause
+- the value of each free variable of the predicate, with each value cut to a fixed length
+- the caller
+
+```
+panic: contract violated: @requires(amount > 0)
+  --> account.bl:4:1  in withdraw
+   = amount = -5
+   = called from transfer_all at account.bl:45:9
+```
+
+**Predicates that cannot run.** The runtime default applies to an executable predicate. A non-executable predicate whose outcome is Unknown is V0003 unless it has `@verify(fallback: "trust")`. A predicate is executable when the compiler can evaluate it as code: it is pure, it terminates, and it reads only finite values that the program holds. Each predicate form in this section is executable. The rule governs a form that is not, for example a quantifier over all of `Int` (a domain too large to walk), or a reference to a value that exists only for the proof and that the program does not hold.
+
+**The default is visible.** Each contract that gets a runtime check has the info diagnostic `info[V0004]: contract checked at runtime`. V0004 is silent by default. It shows in the verification report and in `blink query`, with its source: `default`, `explicit`, or `inherited(Trait.method)`.
+
+#### `@verify` Fallback Values
+
+`@verify(fallback: ...)` sets what happens when the outcome is Unknown. It has no effect on a Proven or Disproven outcome.
+
+| Value | When the outcome is Unknown |
+|---|---|
+| (no `@verify`) | Runtime check (the default) |
+| `"runtime"` | Runtime check. Legal, but the same as the default unless it replaces a trait method's `"error"` |
+| `"error"` | Compile error V0003. The contract must be proven |
+| `"trust"` | No check. The compiler accepts the contract without proof |
+
+**`"error"`: the contract must be proven.** Use it where a runtime check is not acceptable, for example in a hot loop or where a panic must not occur:
+
+```blink
+@requires(i >= 0 && i < xs.len())
+@verify(fallback: "error")
+fn read_at(xs: List[Int], i: Int) -> Int {
+    xs.get(i).unwrap()
 }
 ```
 
-**Option 3: Trust.** Add `@verify(fallback: "trust")` to accept the contract as documentation. The compiler takes the developer's word that it holds. This is an escape hatch for contracts that describe behavior the solver fundamentally cannot reason about (cryptographic properties, probabilistic guarantees, etc.):
+Until the compiler has a solver, every outcome is Unknown, so a contract with `"error"` always gets V0003.
+
+```
+error[V0003]: contract unverifiable
+ --> read.bl:1:1
+  |
+ 1| @requires(i >= 0 && i < xs.len())
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ outcome unknown
+  |
+  = note: `@verify(fallback: "error")` requires a proof
+  = note: no solver ran; this compiler cannot prove contracts
+  = help: remove `@verify(fallback: "error")` to check the contract at runtime
+```
+
+When a solver ran and returned unknown, the second note says so, and the help also offers to simplify the predicate. The help never offers to simplify when no solver ran.
+
+**`"trust"`: accept without proof.** The compiler takes the developer's word that the contract holds and inserts no check. Use it for a contract that describes behavior no solver or runtime check can confirm (cryptographic properties, probabilistic guarantees), or for a predicate that is not executable:
 
 ```blink
 @ensures(result.entropy() >= 256)
@@ -561,9 +603,20 @@ fn generate_key() -> PrivateKey ! Crypto {
 }
 ```
 
-#### Why Default to Error on Unknown
+Code reviewers and AI agents can search for `@verify(fallback: "trust")` to find each gap in the verification chain. The verification report also marks each Proven contract whose proof assumes a callee's `"trust"` contract, for example `proven (assumes: crypto.generate_key @ensures, trust)`. When the solver cannot list the callee contracts that a proof used, the report says `dependencies unknown`.
 
-The safe default is to reject code the compiler can't verify. This ensures that `@ensures` and `@requires` are not treated as comments -- if you write a contract, the compiler holds you to it. The `@verify(fallback: ...)` annotation is an explicit, visible, auditable acknowledgment that verification is relaxed for this specific contract. Code reviewers and AI agents can search for `@verify(fallback: "trust")` to find every place where the verification chain has a gap.
+**Diagnostics.**
+
+- An explicit `@verify(fallback: "runtime")` that is the same as the policy without it gets `warning[RedundantVerifyFallback]` (W0901), with an autofix that removes it. The compiler resolves the trait method's default before it decides. A `"runtime"` that replaces a trait method's `"error"` is not redundant and gets no warning.
+- `@verify` on a function that has no `@requires` and no `@ensures` (own or inherited) gets `warning[VerifyWithoutContract]` (W0902), with an autofix that removes it.
+
+**No project-wide policy.** The policy for a function comes only from its own `@verify`, its trait method's `@verify` (§3b.2), and the default. There is no module-level or `blink.toml` default. To make CI reject runtime checks or trusts, run `blink verify --deny runtime,trust`. It exits non-zero when a contract has one of the named outcomes, and it does not change what a contract means.
+
+#### Why Default to a Runtime Check
+
+Principle 4 (§1.2) says the compiler proves what it can and checks the rest at runtime. A runtime check is the "check the rest" part. It keeps each contract sound: a caller may assume a callee's `@ensures`, because the program stops before a false `@ensures` reaches the caller.
+
+A default of "error on Unknown" fails this goal while no solver exists, and is weak after one exists. Each contract needs an annotation, so the easy path is to add `@verify(fallback: "trust")`, which removes the check. A runtime default makes the safe path the short path. The annotation is needed only to demand a proof (`"error"`) or to remove the check (`"trust"`), and both are visible and searchable.
 
 #### Verification Summary
 
@@ -571,9 +624,10 @@ The safe default is to reject code the compiler can't verify. This ensures that 
 |---|---|---|---|
 | **Proven** | SMT proved the contract | Zero | None needed |
 | **Disproven** | SMT found a counterexample | N/A (won't compile) | Fix the bug |
-| **Unknown** (default) | SMT can't decide | N/A (won't compile) | Simplify, add fallback, or trust |
-| **Unknown** + `runtime` | Runtime assertion inserted | Assertion cost | Monitor for violations |
-| **Unknown** + `trust` | Accepted on faith | Zero | Document why, audit manually |
+| **Unknown** (default) | Runtime check inserted (V0004) | Check cost, every build | None needed; see the report for cost |
+| **Unknown** + `"error"` | Proof required | N/A (won't compile, V0003) | Simplify the predicate, or remove `"error"` |
+| **Unknown** + `"trust"` | Accepted without proof | Zero | Document why, audit manually |
+| **Unknown**, not executable | No check can run | N/A (won't compile, V0003) | Add `"trust"`, or rewrite the predicate |
 
 ---
 
