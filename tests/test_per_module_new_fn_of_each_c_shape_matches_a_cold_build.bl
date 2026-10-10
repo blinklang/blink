@@ -1,0 +1,188 @@
+// A new fn whose C needs more than a call (a string literal, a closure, a list of a new tuple
+// type, a new instance of a generic at a type the program already spells, a new tuple type, a
+// handler for an effect) reaches the program through the units its edit takes or emits again.
+// After each such edit, a per-module build that takes units from the last build writes the
+// units and headers a cold build writes, byte for byte, passes BLINK_EMIT_REUSE_VERIFY, and
+// takes the units the edit cannot reach.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"fn_shape_app\"\nversion = \"0.1.0\"\n")
+    // Every unit reads the module that declares an effect, so the effect has a module of its
+    // own, which no edit below touches.
+    write_file("{tree}/app/src/note.bl", [
+        #"pub effect Note {"#,
+        #"    effect Say {"#,
+        #"        fn note(s: Str) -> Str"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"pub fn noted(s: Str) -> Str ! Note.Say {"#,
+        #"    note.note(s)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub fn pair_left[T](a: T, b: T) -> T {"#,
+        #"    a"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{pair_left, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    tag("mid {pair_left(2, 9)} {pair_left("s", "t")}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn other() -> Str {"#,
+        #"    tag("other")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #"import note.{Note, noted}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import other.{other}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {other()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both and the module filters.
+fn build_into(tree: Str, out: Str, warm: Bool) -> ProcessResult {
+    let v = if warm { "BLINK_EMIT_REUSE_VERIFY=1 BLINK_TRACE_CHANNELS=build.units " } else { "" }
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE {v}BLINK_CACHE_DIR={tree}/objcache build/blink build app/src/main.bl -o {tree}/{out}/app --per-module"])
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+fn reused_units(r: ProcessResult) -> Str {
+    let lines = "{r.out}\n{r.err_out}"
+    let mut out: List[Str] = []
+    for m in ["base", "mid", "other", "leaf", "note"] {
+        if lines.contains("[dbg:build.units] reuse unit {m}") { out.push(m) }
+    }
+    out.join(",")
+}
+
+// Builds the tree, makes the edit, and builds it again warm into out/ and cold into a fresh
+// cold/. Gives what differs between the two units directories, what each binary prints, and
+// the units the warm build took, as one line.
+fn after_edit(label: Str, change: fn(Str)) -> Str {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_fn_shape_{label}_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "out", true)
+    change(tree)
+    let warm = build_into(tree, "out", true)
+    let _cold = build_into(tree, "cold", false)
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    let warm_out = sh("{tree}/out/app")
+    let cold_out = sh("{tree}/cold/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq("{label} differs: {differ.split("\n").join(" ")}", "{label} differs: ")
+    assert_eq("{label} prints: {warm_out}", "{label} prints: {cold_out}")
+    "{warm_out} | took {reused_units(warm)}"
+}
+
+test "a new fn that holds a string literal matches a cold build" {
+    let got = after_edit("string", fn(tree: Str) {
+        append(tree, "base.bl", "pub fn base_text() -> Str \{\n    \"text from base\"\n}\n")
+        edit(tree, "other.bl", #"s/import base.{tag}/import base.{base_text, tag}/; s/tag("other")/tag("other {base_text()}")/"#)
+    })
+    assert_eq(got, "[main] [mid 2 s] [other text from base] [leaf] | took mid,leaf,note")
+}
+
+test "a new fn that holds a closure matches a cold build" {
+    let got = after_edit("closure", fn(tree: Str) {
+        append(tree, "leaf.bl", "pub fn leaf_tripled(n: Int) -> Int \{\n    let f = fn(x: Int) -> Int \{ x * 3 }\n    f(n)\n}\n")
+        edit(tree, "main.bl", #"s/import leaf.{leaf_value}/import leaf.{leaf_tripled, leaf_value}/; s/{leaf_value()}/{leaf_value()} {leaf_tripled(5)}/"#)
+    })
+    assert_eq(got, "[main] [mid 2 s] [other] [leaf] 15 | took base,mid,other,note")
+}
+
+test "a new fn that returns a list of a new tuple type matches a cold build" {
+    let got = after_edit("tuple_list", fn(tree: Str) {
+        append(tree, "leaf.bl", "pub fn leaf_rows() -> List[(Int, Bool)] \{\n    [(1, true), (2, false)]\n}\n")
+        edit(tree, "main.bl", #"s/import leaf.{leaf_value}/import leaf.{leaf_rows, leaf_value}/; s/{leaf_value()}/{leaf_value()} {leaf_rows().len()}/"#)
+    })
+    // The tuple is new to the types header, which every unit includes, so nothing is taken.
+    assert_eq(got, "[main] [mid 2 s] [other] [leaf] 2 | took ")
+}
+
+test "a new instance of a generic at a type the program already spells matches a cold build" {
+    let got = after_edit("instance", fn(tree: Str) {
+        append(tree, "other.bl", "pub fn other_left() -> Bool \{\n    pair_left(true, false)\n}\n")
+        edit(tree, "other.bl", #"s/import base.{tag}/import base.{pair_left, tag}/; s/tag("other")/tag("other {other_left()}")/"#)
+    })
+    // base homes the new instance, so its own header changes and its unit is emitted.
+    assert_eq(got, "[main] [mid 2 s] [other true] [leaf] | took mid,leaf,note")
+}
+
+test "a new fn that returns a new tuple type matches a cold build" {
+    let got = after_edit("tuple", fn(tree: Str) {
+        append(tree, "mid.bl", "pub fn mid_pair() -> (Bool, Int) \{\n    (true, 4)\n}\n")
+        edit(tree, "main.bl", #"s/import mid.{mid_value}/import mid.{mid_pair, mid_value}/; s/{mid_value()}/{mid_value()} {mid_pair().1}/"#)
+    })
+    // As with the list: a new tuple type changes the types header.
+    assert_eq(got, "[main] [mid 2 s] 4 [other] [leaf] | took ")
+}
+
+test "a new fn that handles an effect matches a cold build" {
+    let got = after_edit("handler", fn(tree: Str) {
+        append(tree, "leaf.bl", "pub fn leaf_noted() -> Str \{\n    let mut out = \"\"\n    with handler Note \{\n        fn note(s: Str) -> Str \{ \"<\{s}>\" }\n    } \{\n        out = noted(\"n\")\n    }\n    out\n}\n")
+        edit(tree, "main.bl", #"s/import leaf.{leaf_value}/import leaf.{leaf_noted, leaf_value}/; s/{leaf_value()}/{leaf_value()} {leaf_noted()}/"#)
+    })
+    assert_eq(got, "[main] [mid 2 s] [other] [leaf] <n> | took base,mid,other,note")
+}
