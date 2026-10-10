@@ -97,6 +97,13 @@ The "minimal blast radius" row is the entire reason for the per-module
 - Trigger: opportunistic, end of run. Any `blink build`/`run`/`test`
   invocation that *added* an entry checks total size; if over cap,
   evict by oldest `.meta` mtime until under cap. No daemon, no cron.
+- Size: the apparent bytes of every file under the cache dir (`*.o`,
+  `*.meta`, and what sits under `tmp/`), summed in process. The cap is
+  compared in bytes (`BLINK_CACHE_SIZE_MB * 1024 * 1024`). This differs
+  from `du`, which counted the blocks a file takes: a sparse file counts
+  at its full length, and a small file at its length, not at a block. The
+  cap only starts an eviction and never changes what a build writes, so
+  either measure holds it; this one starts no program in a build.
 - mtime is touched on cache *hit* (not just store) so hot stdlib `.o`s
   don't get evicted under churn from rare modules.
 - Manual: `blink cache info`, `blink cache clean`,

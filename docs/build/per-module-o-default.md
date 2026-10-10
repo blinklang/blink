@@ -1274,13 +1274,15 @@ programs past the C toolchain for one body edit (strace): 18 `sh`, 5 `rm`,
 hashes its units and keys in process (`src/sha256.bl`), makes, removes and renames its directories and
 touches its cache entries in process (`src/build_fs.bl`), and starts `cc` and
 the link with no `sh` when the command holds no byte `sh` would read as more
-than a word break. It still starts `du`: the cache is held to the blocks
-its files take, and the FFI cannot read a `stat`. A file over 1 MiB is
+than a word break. It sums the cache's size in process too, from the
+apparent bytes of its files, where `du` gave the blocks they take (see
+`per-module-o-cache.md`). A file over 1 MiB is
 hashed by `sha256sum`, run with no shell. The keys are the same bytes
 `sha256sum` gave, so a cache on disk still hits. The cache GC, past its cap,
 still lists by age in `sh`. The `82c21d3a` binary below linked the units it
 took from a record with one `ln`; the build now makes each link with
-`link(2)`.
+`link(2)`. The table below was measured before the `du` went; that change
+took one more exec off the child.
 
 `task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 11 reps, under
 `blink-gates.slice`, on the `82c21d3a` tree, alternating the gen1 `blink`
