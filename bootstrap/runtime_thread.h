@@ -283,25 +283,45 @@ BLINK_RT_FN blink_channel* blink_channel_new_sized(int64_t capacity, int64_t ele
 }
 #endif
 
-/* A send on a closed channel is a bug in the program, so it panics with the text codegen
-   wrote at the call site, which names the send's source location. */
-BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic);
+/* 1 once value is in the channel, 0 when the channel is closed and nothing was sent. */
+BLINK_RT_FN int blink_channel_send_open(blink_channel* ch, const void* value);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic) {
+BLINK_RT_FN int blink_channel_send_open(blink_channel* ch, const void* value) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count >= ch->capacity && !ch->closed) {
         pthread_cond_wait(&ch->send_cond, &ch->mutex);
     }
     if (ch->closed) {
         pthread_mutex_unlock(&ch->mutex);
-        __blink_panic_dispatch(closed_panic);
-        return;
+        return 0;
     }
     if (ch->elem_size > 0) memcpy(ch->slots + ch->tail * ch->elem_size, value, (size_t)ch->elem_size);
     ch->tail = (ch->tail + 1) % ch->capacity;
     ch->count++;
     pthread_cond_signal(&ch->recv_cond);
     pthread_mutex_unlock(&ch->mutex);
+    return 1;
+}
+#endif
+
+/* A send on a closed channel is a bug in the program, so it panics with the text codegen
+   wrote at the call site, which names the send's source location. */
+BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic) {
+    if (!blink_channel_send_open(ch, value)) __blink_panic_dispatch(closed_panic);
+}
+#endif
+
+/* The same send where the line is known only when the program runs, read from the table of
+   a split unit. The sentence is built only when the send panics, so a send that succeeds
+   does not pay for it. */
+BLINK_RT_FN void blink_channel_send_value_at(blink_channel* ch, const void* value, const char* closed_format,
+                                             const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_channel_send_value_at(blink_channel* ch, const void* value, const char* closed_format,
+                                             const char* file, int64_t line) {
+    if (!blink_channel_send_open(ch, value)) __blink_panic_dispatch(blink_str_format(closed_format, file, line));
 }
 #endif
 
