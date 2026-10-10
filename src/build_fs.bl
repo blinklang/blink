@@ -1,0 +1,302 @@
+// The file work of a build, done in process. A daemon-served edit runs in a child the daemon
+// forks, and each shell it started for a mkdir, a rename or a hash cost more than the work.
+// Each call does what the shell command it replaces did, so a build sees the same files.
+// A libc call is bound here only when the prototype the FFI writes matches the one its header
+// gives: a Str parameter is written const char*, but no Blink type is written char* or a
+// pointer to a C struct, so utimes(2) cannot be bound.
+
+import std.libc.{getentropy_bytes, read_bytes, write_bytes}
+
+// The errno values the calls below test, the same on Linux and macOS but ENOTEMPTY.
+let BFS_ENOENT = 2
+let BFS_EEXIST = 17
+let BFS_ENOTEMPTY_LINUX = 39
+let BFS_ENOTEMPTY_MACOS = 66
+
+// mkdir -p: each missing directory of path, made with mode 0777 less the umask. True when path
+// is a directory at the end, which a directory another process made first also gives.
+pub fn mkdir_p(path: Str) -> Bool ! IO {
+    if path == "" { return false }
+    if is_dir(path) == 1 { return true }
+    let mut prefix = if path.starts_with("/") { "/" } else { "" }
+    for part in path.split("/") {
+        if part == "" { continue }
+        prefix = if prefix == "" || prefix == "/" { "{prefix}{part}" } else { "{prefix}/{part}" }
+        if is_dir(prefix) == 1 { continue }
+        with ffi.scope() as scope {
+            // 511 is 0777.
+            let _ = bfs_mkdir(scope.cstr(prefix), 511.to_u32())
+        }
+    }
+    is_dir(path) == 1
+}
+
+// rm -rf: path and all under it. A link is removed, never followed. True when path is gone.
+pub fn remove_tree(path: Str) -> Bool ! IO {
+    if path == "" { return false }
+    let mut rc = 0
+    let mut err = 0
+    with ffi.scope() as scope {
+        rc = bfs_unlink(scope.cstr(path)).to_int()
+        if rc != 0 { err = bfs_errno() }
+    }
+    if rc == 0 || err == BFS_ENOENT { return true }
+    let e = rmdir_errno(path)
+    if e == 0 || e == BFS_ENOENT { return true }
+    // Only a directory with entries fails rmdir with these, so the walk below never reads
+    // through a link.
+    if e != BFS_ENOTEMPTY_LINUX && e != BFS_ENOTEMPTY_MACOS && e != BFS_EEXIST { return false }
+    for name in list_dir(path) {
+        let _ = remove_tree("{path}/{name}")
+    }
+    let again = rmdir_errno(path)
+    again == 0 || again == BFS_ENOENT
+}
+
+// 0 when rmdir(2) removed path, else its errno, or -1 when it set none.
+fn rmdir_errno(path: Str) -> Int ! IO {
+    let mut e = 0
+    with ffi.scope() as scope {
+        if bfs_rmdir(scope.cstr(path)).to_int() != 0 {
+            e = bfs_errno()
+            if e == 0 { e = -1 }
+        }
+    }
+    e
+}
+
+// mv -f within one filesystem. False when rename(2) fails; mv would copy across
+// filesystems, so a caller whose paths may cross one falls back to it.
+pub fn rename(from: Str, to: Str) -> Bool ! IO {
+    let mut rc = -1
+    with ffi.scope() as scope {
+        rc = bfs_rename(scope.cstr(from), scope.cstr(to)).to_int()
+    }
+    rc == 0
+}
+
+let BFS_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// mktemp -d {parent}/{prefix}.XXXXXX: a new directory only its user may enter, named by six
+// random characters. "" when none can be made.
+pub fn private_dir(parent: Str, prefix: Str) -> Str ! IO {
+    let mut tries = 0
+    while tries < 100 {
+        tries = tries + 1
+        let bytes = match getentropy_bytes(6) {
+            Ok(b) => b
+            Err(_) => return ""
+        }
+        let mut name = StringBuilder.new()
+        for b in bytes {
+            let c = b.to_int() % 62
+            name.write(BFS_NAME_CHARS.byte_slice(c, c + 1))
+        }
+        let path = "{parent}/{prefix}.{name.to_str()}"
+        let mut rc = -1
+        let mut err = 0
+        with ffi.scope() as scope {
+            // 448 is 0700, as mktemp makes it.
+            rc = bfs_mkdir(scope.cstr(path), 448.to_u32()).to_int()
+            if rc != 0 { err = bfs_errno() }
+        }
+        if rc == 0 { return path }
+        if err != BFS_EEXIST { return "" }
+    }
+    ""
+}
+
+// touch on a file: its mtime becomes now and its bytes stay. The first byte is written back
+// over itself, as the FFI cannot bind utimes(2). A missing file is made empty, as touch makes
+// it; an empty one is written empty again.
+pub fn touch(path: Str) -> Bool ! IO {
+    let mut fd = -1
+    let mut err = 0
+    with ffi.scope() as scope {
+        // 2 is O_RDWR on Linux and macOS.
+        fd = bfs_open(scope.cstr(path), 2.to_i32()).to_int()
+        if fd < 0 { err = bfs_errno() }
+    }
+    if fd < 0 {
+        if err != BFS_ENOENT { return false }
+        write_file(path, "")
+        return file_exists(path) == 1
+    }
+    let mut ok = false
+    let mut empty = false
+    match read_bytes(fd, 1) {
+        Ok(b) => {
+            if b.len() == 0 {
+                empty = true
+            } else if bfs_lseek(fd.to_i32(), 0, 0.to_i32()) == 0 {
+                ok = match write_bytes(fd, b) {
+                    Ok(n) => n == 1
+                    Err(_) => false
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    let _ = bfs_close(fd.to_i32())
+    if empty {
+        // There is no byte to write back; truncating an empty file moves its mtime.
+        write_file(path, "")
+        ok = true
+    }
+    ok
+}
+
+// ln: a hard link at to for the file at from. False when link(2) fails, as it does across
+// filesystems or on one with no hard links.
+pub fn hard_link(from: Str, to: Str) -> Bool ! IO {
+    bfs_link(from, to).to_int() == 0
+}
+
+// The size of the file at path in bytes, or -1 when it cannot be opened.
+pub fn file_size(path: Str) -> Int ! IO {
+    let mut size = -1
+    with ffi.scope() as scope {
+        let fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+        if fd >= 0 {
+            // 2 is SEEK_END on Linux and macOS.
+            size = bfs_lseek(fd.to_i32(), 0, 2.to_i32())
+            let _ = bfs_close(fd.to_i32())
+        }
+    }
+    size
+}
+
+// The path execvp runs for name, or "" when it finds none. An empty PATH entry is the working
+// directory, and an unset PATH is the one glibc's execvp searches.
+pub fn find_program(name: Str) -> Str ! IO {
+    if name == "" { return "" }
+    if name.contains("/") {
+        return if is_executable(name) { name } else { "" }
+    }
+    let path = env.var("PATH") ?? "/bin:/usr/bin"
+    for d in path.split(":") {
+        let candidate = if d == "" { name } else { "{d}/{name}" }
+        if is_executable(candidate) {
+            return if d == "" { "./{name}" } else { candidate }
+        }
+    }
+    ""
+}
+
+fn is_executable(path: Str) -> Bool ! IO {
+    if is_dir(path) == 1 { return false }
+    let mut rc = -1
+    with ffi.scope() as scope {
+        // 1 is X_OK on Linux and macOS.
+        rc = bfs_access(scope.cstr(path), 1.to_i32()).to_int()
+    }
+    rc == 0
+}
+
+// The CPUs this process may run on, as nproc counts them. A daemon worker asks once, before
+// it forks a build child, so no child starts nproc; a change to the worker's CPU affinity
+// while the daemon lives is not seen.
+let mut bfs_cpu_count: Int = 0
+
+pub fn cpu_count() -> Int ! IO {
+    if bfs_cpu_count <= 0 {
+        let mut n = 0
+        if find_program("nproc") != "" { n = process_run("nproc", []).out.trim().to_int() }
+        if n <= 0 && find_program("getconf") != "" { n = process_run("getconf", ["_NPROCESSORS_ONLN"]).out.trim().to_int() }
+        bfs_cpu_count = if n > 0 { n } else { 1 }
+    }
+    bfs_cpu_count
+}
+
+// The bytes sh reads as more than a part of a word: quotes and escapes, globs, expansions,
+// redirects, lists, comments, braces bash expands, and any space but the one between words.
+let BFS_SHELL_BYTES = "|&;<>()$`\\\"'*?[]#~\{}!\t\n\r"
+
+// The words sh would split cmd into, when sh would do no more than split it at spaces, or []
+// when it would do more, so only sh may run it. A first word holding `=` is an assignment.
+pub fn plain_words(cmd: Str) -> List[Str] {
+    for c in cmd {
+        if BFS_SHELL_BYTES.contains(c.to_str()) { return [] }
+    }
+    let mut words: List[Str] = []
+    for w in cmd.split(" ") {
+        if w != "" { words.push(w) }
+    }
+    if words.len() == 0 || words[0].contains("=") { return [] }
+    words
+}
+
+// Runs program with args as sh runs a command: on this process's stdin, stdout and stderr,
+// which a captured run would turn into pipes and so take a compiler's colors away. Its exit
+// code, or -1 when a signal ended it or it could not start, as shell_exec gives.
+pub fn run_program(program: Str, args: List[Str]) -> Int ! IO {
+    let pid = bfs_fork().to_int()
+    if pid == 0 {
+        process_exec(program, args)
+    }
+    if pid < 0 { return -1 }
+    let mut status = -1
+    with ffi.scope() as scope {
+        let cell = scope.alloc[I32]()
+        loop {
+            let r = bfs_waitpid(pid.to_i32(), cell, 0.to_i32()).to_int()
+            if r == pid {
+                status = cell.deref().to_int()
+                break
+            }
+            // EINTR is 4 on Linux and macOS.
+            if r > 0 || bfs_errno() != 4 { break }
+        }
+    }
+    if status < 0 || (status & 127) != 0 { return -1 }
+    (status >> 8) & 255
+}
+
+// An @ffi function's C name has no module part, so these carry the module in their own names.
+@ffi("mkdir", header: "sys/stat.h")
+@trusted(audit: "Wraps mkdir(2). path is a NUL-terminated copy from ffi.scope(); mode is 0777 or 0700.")
+fn bfs_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
+
+@ffi("unlink", header: "unistd.h")
+@trusted(audit: "Wraps unlink(2). path is a NUL-terminated copy from ffi.scope().")
+fn bfs_unlink(path: Ptr[U8]) -> I32 ! FFI {}
+
+@ffi("rmdir", header: "unistd.h")
+@trusted(audit: "Wraps rmdir(2). path is a NUL-terminated copy from ffi.scope().")
+fn bfs_rmdir(path: Ptr[U8]) -> I32 ! FFI {}
+
+@ffi("rename", header: "stdio.h")
+@trusted(audit: "Wraps rename(2). Both paths are NUL-terminated copies from ffi.scope().")
+fn bfs_rename(from: Ptr[U8], to: Ptr[U8]) -> I32 ! FFI {}
+
+@ffi("link", header: "unistd.h")
+@trusted(audit: "Wraps link(2). A Str is NUL-terminated and holds no NUL, so each path reaches C whole.")
+fn bfs_link(from: Str, to: Str) -> I32 ! FFI {}
+
+@ffi("open", header: "fcntl.h")
+@trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY or O_RDWR, 0 and 2 on every host.")
+fn bfs_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "Wraps close(2) on a descriptor bfs_open returned.")
+fn bfs_close(fd: I32) -> I32 ! FFI {}
+
+@ffi("lseek", header: "unistd.h")
+@trusted(audit: "Wraps lseek(2). fd is one bfs_open returned; whence is SEEK_SET or SEEK_END, 0 and 2 on every host.")
+fn bfs_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FFI {}
+
+@ffi("access", header: "unistd.h")
+@trusted(audit: "Wraps access(2). path is a NUL-terminated copy from ffi.scope(); mode is X_OK, 1 on every host.")
+fn bfs_access(path: Ptr[U8], mode: I32) -> I32 ! FFI {}
+
+@ffi("blink_errno_get")
+@trusted(audit: "Wraps the runtime blink_errno_get(), which returns errno. Read right after the failed call.")
+fn bfs_errno() -> Int ! FFI {}
+
+@ffi("fork", header: "unistd.h")
+@trusted(audit: "Wraps fork(2). The child only execs, as the runtime's own process calls do after their fork.")
+fn bfs_fork() -> I32 ! FFI {}
+
+@ffi("waitpid", header: "sys/wait.h")
+@trusted(audit: "Wraps waitpid(2) on a child bfs_fork made. status is one I32 cell from ffi.scope(); options is 0, so it blocks.")
+fn bfs_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}

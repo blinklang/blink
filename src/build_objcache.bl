@@ -13,7 +13,9 @@
 // Stores rename(2) into place. Two parallel jobs racing on the same
 // key both compile and both rename — content is byte-identical.
 
-import std_cache_key.{sha256_of_manifest, sha256_of_file_first, SHA256SUM_SH}
+import build_fs
+import sha256.{sha256_hex, sha256_file_hex}
+import std_cache_key.{sha256_of_manifest, sha256_of_file_first, IN_PROCESS_HASH_BYTES}
 
 pub fn obj_cache_dir() -> Str {
     let override_val = env.var("BLINK_CACHE_DIR") ?? ""
@@ -37,9 +39,8 @@ fn cache_size_cap_mb() -> Int {
     v.to_int()
 }
 
-pub fn ensure_dir() {
-    let dir = obj_cache_dir()
-    shell_exec("mkdir -p {dir}/tmp")
+pub fn ensure_dir() ! IO {
+    let _ = build_fs.mkdir_p("{obj_cache_dir()}/tmp")
 }
 
 // Per-process counter so each call to make_staging_path is unique even
@@ -58,13 +59,9 @@ pub fn make_staging_path(label: Str) -> Str {
 // A directory no other build writes, under tmp/ so a rename out of it stays on one
 // filesystem. A pid and a counter are not enough: two pid namespaces can share a cache
 // dir. "" when it cannot be made.
-pub fn make_private_dir() -> Str {
+pub fn make_private_dir() -> Str ! IO {
     ensure_dir()
-    let r = process_run("sh", ["-c", "mktemp -d {obj_cache_dir()}/tmp/unit.XXXXXX"])
-    if r.exit_code != 0 {
-        return ""
-    }
-    r.out.trim()
+    build_fs.private_dir("{obj_cache_dir()}/tmp", "unit")
 }
 
 fn cc_identity() -> Str {
@@ -126,28 +123,23 @@ pub fn compute_obj_key(
 
 // "<path>=<sha256>" for each header in dirs. None when one cannot be hashed, so a header
 // the unit may read never drops out of the key.
-fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] {
+fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
     let mut lines: List[Str] = []
-    if dirs.len() == 0 {
-        return Some(lines)
-    }
-    let mut cmd = StringBuilder.new()
-    cmd.write(SHA256SUM_SH)
-    cmd.write("for d in")
+    let mut paths: List[Str] = []
     for d in dirs {
-        cmd.write(" \"{d}\"")
-    }
-    cmd.write("; do for f in \"$d\"/*.h; do [ -e \"$f\" ] || continue; sha256sum \"$f\" || exit 1; done; done")
-    let r = process_run("sh", ["-c", cmd.to_str()])
-    if r.exit_code != 0 {
-        return None
-    }
-    for line in r.out.lines() {
-        // sha256sum prints "<64 hex>  <path>".
-        if line.byte_len() < 67 {
-            continue
+        for name in list_dir(d) {
+            // What the glob "$d"/*.h names: no dotfile, and only what exists past a link.
+            if name.starts_with(".") || !name.ends_with(".h") { continue }
+            let path = "{d}/{name}"
+            if file_exists(path) == 1 { paths.push(path) }
         }
-        lines.push("{line.byte_slice(66, line.byte_len())}={line.byte_slice(0, 64)}")
+    }
+    let shas = hash_files(paths)
+    for path in paths {
+        match shas.get(path) {
+            Some(sha) => lines.push("{path}={sha}")
+            None => return None
+        }
     }
     Some(lines)
 }
@@ -166,7 +158,7 @@ pub fn user_unit_key(
     cc_id: Str,
     flags: List[Str],
     target: Str,
-) -> Str {
+) -> Str ! IO {
     if blinkc_sha == "" || cc_id == "" {
         return ""
     }
@@ -198,10 +190,6 @@ pub fn user_unit_key(
     compute_obj_key(module_key, src_sha, headers, runtime_sha, blinkc_sha, cc_id, flags, target)
 }
 
-// Put first in an sh command that runs `$H` on a list of files. xargs cannot run the shell
-// function SHA256SUM_SH defines, so the fallback is a command line in a variable.
-let SHA256_H_SH: Str = "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; else H=\"shasum -a 256\"; fi; "
-
 pub fn sorted_strs(xs: List[Str]) -> List[Str] {
     let mut out: List[Str] = []
     for x in xs {
@@ -216,16 +204,36 @@ pub fn sorted_strs(xs: List[Str]) -> List[Str] {
     out
 }
 
-// "<name>" -> sha for every file sha256sum printed, where a name is what the script passed it.
-// A file it could not read prints no sha line, so it is absent here.
-fn sha_by_name(out: Str) -> Map[Str, Str] {
+// The sha of each file in paths, by its path; a file that cannot be read is absent. Files
+// that together hold more than IN_PROCESS_HASH_BYTES go to sha256sum, one exec per run of
+// paths that fits an exec argument list, since past that it hashes faster than this process
+// does; the rest, and any file sha256sum did not answer for, are hashed in process.
+fn hash_files(paths: List[Str]) -> Map[Str, Str] ! IO {
     let mut m: Map[Str, Str] = Map()
-    for line in out.lines() {
-        // sha256sum prints "<64 hex>  <name>".
-        if line.byte_len() < 67 || line.starts_with("! ") {
-            continue
+    let mut total = 0
+    for p in paths {
+        let n = build_fs.file_size(p)
+        if n > 0 { total = total + n }
+    }
+    if total > IN_PROCESS_HASH_BYTES && build_fs.find_program("sha256sum") != "" {
+        for run in exec_sized_batches(paths) {
+            let mut args = ["--"]
+            for p in run { args.push(p) }
+            let r = process_run("sha256sum", args)
+            for line in r.out.lines() {
+                // sha256sum prints "<64 hex>  <name>", and starts the line with a backslash
+                // when it had to escape the name, which then misses below.
+                if line.byte_len() < 67 || line.starts_with("\\") { continue }
+                m.insert(line.byte_slice(66, line.byte_len()), line.byte_slice(0, 64))
+            }
         }
-        m.insert(line.byte_slice(66, line.byte_len()), line.byte_slice(0, 64))
+    }
+    for p in paths {
+        if m.contains_key(p) { continue }
+        match sha256_file_hex(p) {
+            Some(sha) => m.insert(p, sha)
+            None => {}
+        }
     }
     m
 }
@@ -250,65 +258,82 @@ pub fn unit_keys(
     cc_id: Str,
     flags: List[Str],
     target: Str,
-) -> Map[Str, Str] {
+) -> Map[Str, Str] ! IO {
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
         return Map()
     }
     match unit_file_shas(dir, arc_dir) {
-        Some(shas) => unit_keys_from(shas, dir, modules, unit_headers, arc_dir, vendored_include_dirs, blinkc_sha, cc_id, flags, target)
+        Some(shas) => unit_keys_from(shas, modules, unit_headers, arc_dir, vendored_include_dirs, blinkc_sha, cc_id, flags, target)
         None => Map()
     }
 }
 
 // The sha of each file a unit key covers: the archive's runtime.h, libblink_std.h and .gch,
 // by their path, and every .h and .c in dir, by their name in dir. A file that could not be
-// read is absent. One exec for every file: xargs keeps the list inside the exec argument
-// limit. None when the hashing could not run.
-pub fn unit_file_shas(dir: Str, arc_dir: Str) -> Option[Map[Str, Str]] {
+// read is absent. None when dir is not a directory.
+pub fn unit_file_shas(dir: Str, arc_dir: Str) -> Option[Map[Str, Str]] ! IO {
     unit_file_shas_with(dir, arc_dir, [])
 }
 
 // unit_file_shas, and the sha of each file in dir that extra names, by that name.
-pub fn unit_file_shas_with(dir: Str, arc_dir: Str, extra: List[Str]) -> Option[Map[Str, Str]] {
-    unit_file_shas_after("", dir, arc_dir, extra)
-}
-
-// unit_file_shas_with once the shell command before, when there is one, put its files in dir:
-// one exec for both. None when before fails.
-pub fn unit_file_shas_after(before: Str, dir: Str, arc_dir: Str, extra: List[Str]) -> Option[Map[Str, Str]] {
-    let runtime_h = "{arc_dir}/runtime.h"
-    let archive_h = "{arc_dir}/libblink_std.h"
-    let pch = "{arc_dir}/libblink_std.h.gch"
-    let mut cmd = StringBuilder.new()
-    if before != "" { cmd.write("\{ {before}; \} || exit 1; ") }
-    cmd.write(SHA256_H_SH)
-    cmd.write("for f in \"{runtime_h}\" \"{archive_h}\" \"{pch}\"; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; ")
-    let mut extra_list = ""
-    for f in extra { extra_list = "{extra_list} \"{f}\"" }
-    cmd.write("cd \"{dir}\" || exit 1; for f in *.h *.c{extra_list}; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; exit 0")
-    let r = process_run("sh", ["-c", cmd.to_str()])
-    if r.exit_code != 0 {
+pub fn unit_file_shas_with(dir: Str, arc_dir: Str, extra: List[Str]) -> Option[Map[Str, Str]] ! IO {
+    if is_dir(dir) != 1 {
         return None
     }
-    Some(sha_by_name(r.out))
+    let mut paths: List[Str] = []
+    for f in ["{arc_dir}/runtime.h", "{arc_dir}/libblink_std.h", "{arc_dir}/libblink_std.h.gch"] {
+        if file_exists(f) == 1 { paths.push(f) }
+    }
+    let arc_count = paths.len()
+    let mut names: List[Str] = []
+    for name in list_dir(dir) {
+        // What the glob *.h *.c names: no dotfile.
+        if name.starts_with(".") || !(name.ends_with(".h") || name.ends_with(".c")) { continue }
+        names.push(name)
+    }
+    for name in extra { names.push(name) }
+    for name in names {
+        if file_exists("{dir}/{name}") == 1 { paths.push("{dir}/{name}") }
+    }
+    let shas = hash_files(paths)
+    let mut m: Map[Str, Str] = Map()
+    let mut i = 0
+    while i < paths.len() {
+        let p = paths.get(i).unwrap()
+        match shas.get(p) {
+            Some(sha) => {
+                let key = if i < arc_count { p } else { p.byte_slice(dir.byte_len() + 1, p.byte_len()) }
+                m.insert(key, sha)
+            }
+            None => {}
+        }
+        i = i + 1
+    }
+    Some(m)
 }
 
 // The sha of each file in dir that names lists, by that name. A file that could not be read
 // is absent.
-pub fn file_shas(dir: Str, names: List[Str]) -> Map[Str, Str] {
-    let mut list = ""
-    for f in names { list = "{list} \"{f}\"" }
-    let r = process_run("sh", ["-c", "{SHA256_H_SH}cd \"{dir}\" || exit 1; $H{list} 2>/dev/null; exit 0"])
-    if r.exit_code != 0 {
-        return Map()
+pub fn file_shas(dir: Str, names: List[Str]) -> Map[Str, Str] ! IO {
+    let mut m: Map[Str, Str] = Map()
+    if is_dir(dir) != 1 {
+        return m
     }
-    sha_by_name(r.out)
+    let mut paths: List[Str] = []
+    for n in names { paths.push("{dir}/{n}") }
+    let shas = hash_files(paths)
+    for n in names {
+        match shas.get("{dir}/{n}") {
+            Some(sha) => m.insert(n, sha)
+            None => {}
+        }
+    }
+    m
 }
 
 // unit_keys over shas unit_file_shas answered for dir and arc_dir.
 pub fn unit_keys_from(
     shas: Map[Str, Str],
-    dir: Str,
     modules: List[Str],
     unit_headers: Map[Str, List[Str]],
     arc_dir: Str,
@@ -317,7 +342,7 @@ pub fn unit_keys_from(
     cc_id: Str,
     flags: List[Str],
     target: Str,
-) -> Map[Str, Str] {
+) -> Map[Str, Str] ! IO {
     let mut keys: Map[Str, Str] = Map()
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
         return keys
@@ -361,8 +386,6 @@ pub fn unit_keys_from(
     if shared_sha == "" {
         return keys
     }
-    let mut keyed: List[Str] = []
-    let mut manifests: List[Str] = []
     for m in modules {
         let src_sha = shas.get("{m}.c") ?? ""
         if src_sha == "" { continue }
@@ -379,49 +402,27 @@ pub fn unit_keys_from(
             text = "{text}\nunit:{name}={sha}"
         }
         if !readable { continue }
-        keyed.push(m)
-        manifests.push(text)
-    }
-    // The manifests go through files so one sha256sum hashes them all. A file that does not
-    // read back as written would hash other bytes, so its unit gets no key.
-    let mut written: List[Bool] = []
-    let mut i = 0
-    while i < manifests.len() {
-        let body = "{manifests.get(i).unwrap()}\n"
-        // A dotted name no unit or header has, so the hash of the units above cannot see it.
-        let path = "{dir}/.key.{i}"
-        write_file(path, body)
-        written.push(file_exists(path) == 1 && read_file(path) == body)
-        i = i + 1
-    }
-    // dir may be relative, so the cd stays in a subshell.
-    let h = process_run("sh", ["-c", "{SHA256_H_SH}(cd \"{dir}\" && for f in .key.*; do [ -e \"$f\" ] && printf '%s\\0' \"$f\"; done | xargs -0 -r $H 2>/dev/null; rm -f .key.*); exit 0"])
-    if h.exit_code != 0 {
-        return keys
-    }
-    let digests = sha_by_name(h.out)
-    i = 0
-    while i < keyed.len() {
-        let d = digests.get(".key.{i}") ?? ""
-        if written.get(i).unwrap() && d.byte_len() == 64 {
-            keys.insert(keyed.get(i).unwrap(), d.byte_slice(0, 16))
-        }
-        i = i + 1
+        // The bytes sha256sum hashed when the manifest went through a file: the text and a
+        // newline.
+        keys.insert(m, sha256_hex("{text}\n").byte_slice(0, 16))
     }
     keys
 }
 
-// Linux caps one exec argument at 128 KiB, and an `sh -c` script is one argument.
+// Linux caps one exec argument at 128 KiB. The keys on disk were made when each run of
+// digest_of_lines went to sha256sum as one `sh -c` argument, so the runs keep that size, and
+// it bounds the paths hash_files gives one sha256sum.
 let EXEC_ARG_BUDGET: Int = 65536
 
-// texts in order, split into runs whose total size stays under EXEC_ARG_BUDGET, so a script
-// built from one run fits in one exec argument. A text over the budget gets a run of its own.
+// texts in order, split into runs whose total size stays under EXEC_ARG_BUDGET. A text over
+// the budget gets a run of its own.
 fn exec_sized_batches(texts: List[Str]) -> List[List[Str]] {
     let mut out: List[List[Str]] = []
     let mut cur: List[Str] = []
     let mut size = 0
     for t in texts {
-        // The heredoc and pipe around each text add about 100 bytes.
+        // The 128 stood for the heredoc and pipe the script put around each text; a key
+        // depends on where a run ends, so it stays.
         let n = t.byte_len() + 128
         if cur.len() > 0 && size + n > EXEC_ARG_BUDGET {
             out.push(cur)
@@ -438,7 +439,8 @@ fn exec_sized_batches(texts: List[Str]) -> List[List[Str]] {
 }
 
 // The 16-hex digest of lines. Lines past one exec argument's worth are hashed a run at a
-// time, and the run digests hashed again. "" when a hash fails.
+// time, and the run digests hashed again: each run once went to sha256sum in a script of its
+// own, and the keys on disk were made that way. "" when a hash fails.
 fn digest_of_lines(lines: List[Str]) -> Str {
     let mut parts: List[Str] = []
     for run in exec_sized_batches(lines) {
@@ -464,7 +466,7 @@ pub fn key_from_text(text: Str) -> Str {
 
 // Look up by key. On hit, touches .meta mtime and returns the .o path.
 // On miss, returns "".
-pub fn lookup_obj(key: Str) -> Str {
+pub fn lookup_obj(key: Str) -> Str ! IO {
     if !cache_enabled() {
         return ""
     }
@@ -473,14 +475,12 @@ pub fn lookup_obj(key: Str) -> Str {
     if file_exists(obj) == 0 {
         return ""
     }
-    let meta = "{dir}/{key}.meta"
-    shell_exec("touch {meta} 2>/dev/null || true")
+    let _ = build_fs.touch("{dir}/{key}.meta")
     obj
 }
 
-// lookup_obj for each key, in order, with every hit's .meta touched by one exec per run of
-// paths that fits an exec argument rather than one per hit. "" for an empty key.
-pub fn lookup_objs(keys: List[Str]) -> List[Str] {
+// lookup_obj for each key, in order. "" for an empty key.
+pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO {
     let mut out: List[Str] = []
     if !cache_enabled() {
         for _k in keys {
@@ -489,7 +489,6 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] {
         return out
     }
     let dir = obj_cache_dir()
-    let mut metas: List[Str] = []
     for key in keys {
         let obj = "{dir}/{key}.o"
         if key == "" || file_exists(obj) == 0 {
@@ -497,10 +496,7 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] {
             continue
         }
         out.push(obj)
-        metas.push("'{dir}/{key}.meta'")
-    }
-    for run in exec_sized_batches(metas) {
-        shell_exec("touch {run.join(" ")} 2>/dev/null || true")
+        let _ = build_fs.touch("{dir}/{key}.meta")
     }
     out
 }
@@ -510,27 +506,29 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] {
 // obj at obj_tmp_path; we rename it (so the temp path is consumed).
 // Returns true iff a new entry was installed (signal for maybe_gc); on
 // false the caller must not link <key>.o.
-pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool {
+pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO {
     if !cache_enabled() {
         return false
     }
     ensure_dir()
     let dir = obj_cache_dir()
-    let final_obj = "{dir}/{key}.o"
-    if shell_exec("mv -f {obj_tmp_path} {final_obj}") != 0 {
+    if !move_obj(obj_tmp_path, "{dir}/{key}.o") {
         return false
     }
-    let now_res = process_run("sh", ["-c", "date +%s"])
-    let now = now_res.out.trim()
+    let now = time.read().to_unix_secs()
     let meta_path = "{dir}/{key}.meta"
     write_file(meta_path, "{now} {module_key} {src_sha}\n")
     true
 }
 
-// store for each (key, obj_tmp_path, module_key), in order, with the moves of a run of
-// entries that fits an exec argument made by one exec rather than three execs per entry.
-// The answer for each entry is what store would answer for it.
-pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] {
+// mv -f: rename(2), and mv where that fails, as it copies across filesystems.
+fn move_obj(from: Str, to: Str) -> Bool ! IO {
+    build_fs.rename(from, to) || shell_exec("mv -f '{from}' '{to}'") == 0
+}
+
+// store for each (key, obj_tmp_path, module_key), in order. The answer for each entry is what
+// store would answer for it.
+pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -539,28 +537,11 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
         return out
     }
     let dir = obj_cache_dir()
-    let mut moves: List[Str] = []
+    ensure_dir()
+    let now = time.read().to_unix_secs()
     let mut i = 0
     while i < keys.len() {
-        moves.push("mv -f '{obj_tmp_paths.get(i).unwrap()}' '{dir}/{keys.get(i).unwrap()}.o' && echo 'moved {i}'")
-        i = i + 1
-    }
-    let mut moved: Map[Int, Bool] = Map()
-    let mut now = ""
-    for run in exec_sized_batches(moves) {
-        let r = process_run("sh", ["-c", "mkdir -p '{dir}/tmp'; date +%s; {run.join("; ")}; exit 0"])
-        for line in r.out.split("\n") {
-            let t = line.trim()
-            if t.starts_with("moved ") {
-                moved.insert(t.byte_slice(6, t.byte_len()).to_int(), true)
-            } else if now == "" && t != "" {
-                now = t
-            }
-        }
-    }
-    i = 0
-    while i < keys.len() {
-        if moved.contains_key(i) != 0 {
+        if move_obj(obj_tmp_paths.get(i).unwrap(), "{dir}/{keys.get(i).unwrap()}.o") {
             write_file("{dir}/{keys.get(i).unwrap()}.meta", "{now} {module_keys.get(i).unwrap()} \n")
             out.set(i, true)
         }
@@ -569,19 +550,30 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
     out
 }
 
-fn cache_total_kb(dir: Str) -> Int {
-    if file_exists(dir) == 0 {
-        return 0
-    }
-    let res = process_run("sh", ["-c", "du -sk {dir} 2>/dev/null | awk '\{print $1}'"])
-    let v = res.out.trim()
-    if v == "" { 0 } else { v.to_int() }
+// The apparent bytes of the files under dir. du would count the blocks they take, which can
+// differ; the cap only starts an eviction and never changes what a build writes, so either
+// unit holds it, and this one starts no program.
+fn cache_total_bytes(dir: Str) -> Int ! IO {
+    tree_bytes(dir, 0)
 }
 
-fn file_kb(path: Str) -> Int {
-    let res = process_run("sh", ["-c", "du -sk {path} 2>/dev/null | awk '\{print $1}'"])
-    let v = res.out.trim()
-    if v == "" { 0 } else { v.to_int() }
+// The cache keeps its files at most two levels down (tmp/unit.<rand>/<file>). is_dir follows
+// a link, so the depth bound ends a walk that a link to a parent would never end.
+let CACHE_WALK_DEPTH: Int = 4
+
+fn tree_bytes(path: Str, depth: Int) -> Int ! IO {
+    if is_dir(path) != 1 {
+        let n = build_fs.file_size(path)
+        return if n < 0 { 0 } else { n }
+    }
+    if depth >= CACHE_WALK_DEPTH {
+        return 0
+    }
+    let mut total = 0
+    for name in list_dir(path) {
+        total = total + tree_bytes("{path}/{name}", depth + 1)
+    }
+    total
 }
 
 fn cache_entry_count(dir: Str) -> Int {
@@ -599,14 +591,14 @@ fn cache_entry_count(dir: Str) -> Int {
 
 // Opportunistic LRU eviction by .meta mtime until total <= cap_mb.
 // Caller invokes this once at end of a build that stored anything.
-pub fn maybe_gc() {
+pub fn maybe_gc() ! IO {
     if !cache_enabled() {
         return
     }
     let dir = obj_cache_dir()
-    let cap_kb = cache_size_cap_mb() * 1024
-    let mut total_kb = cache_total_kb(dir)
-    if total_kb <= cap_kb {
+    let cap_bytes = cache_size_cap_mb() * 1024 * 1024
+    let mut total = cache_total_bytes(dir)
+    if total <= cap_bytes {
         return
     }
     let listing = process_run("sh", ["-c", "ls -1tr {dir}/*.meta 2>/dev/null"])
@@ -614,22 +606,23 @@ pub fn maybe_gc() {
     let mut idx = 0
     // Subtract per-entry size as we evict — re-walking the tree per
     // delete is O(N²) on big caches.
-    while idx < lines.len() && total_kb > cap_kb {
+    while idx < lines.len() && total > cap_bytes {
         let meta_path = lines.get(idx).unwrap().trim()
         if meta_path != "" {
             let obj_path = meta_path.replace(".meta", ".o")
-            let freed = file_kb(obj_path) + file_kb(meta_path)
-            shell_exec("rm -f {obj_path} {meta_path}")
-            total_kb = total_kb - freed
+            let freed = tree_bytes(obj_path, 0) + tree_bytes(meta_path, 0)
+            fs_remove(obj_path)
+            fs_remove(meta_path)
+            total = total - freed
         }
         idx = idx + 1
     }
 }
 
-pub fn cmd_info() -> Int {
+pub fn cmd_info() -> Int ! IO {
     let dir = obj_cache_dir()
     let count = cache_entry_count(dir)
-    let total_kb = cache_total_kb(dir)
+    let total_kb = cache_total_bytes(dir) / 1024
     let total_mb = total_kb / 1024
     io.println("blink object cache")
     io.println("  location: {dir}")
@@ -681,7 +674,7 @@ pub fn cmd_clean(older_than: Str) -> Int {
 
 // Hidden sub-subcommands used by tests to drive the cache directly.
 // Return 0/1 so the test can assert exit codes.
-pub fn cmd_internal_lookup(key: Str) -> Int {
+pub fn cmd_internal_lookup(key: Str) -> Int ! IO {
     let p = lookup_obj(key)
     if p == "" {
         return 1
@@ -690,7 +683,7 @@ pub fn cmd_internal_lookup(key: Str) -> Int {
     0
 }
 
-pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int {
+pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO {
     if file_exists(src_obj) == 0 {
         io.eprintln("error: source obj does not exist: {src_obj}")
         return 1
@@ -702,7 +695,7 @@ pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str)
     0
 }
 
-pub fn cmd_internal_gc() -> Int {
+pub fn cmd_internal_gc() -> Int ! IO {
     maybe_gc()
     0
 }

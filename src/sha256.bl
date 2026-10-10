@@ -1,0 +1,164 @@
+// SHA-256 (FIPS 180-4) in process, so a build need not start sha256sum for a few small files.
+// Every cache key on disk was made from sha256sum's hex digest, so this must give the same
+// lowercase hex for the same bytes.
+
+import std.libc.{read_bytes}
+
+let SHA256_K: List[Int] = [
+    1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+    3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+    3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+    2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+    666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+    2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+    430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+    1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298,
+]
+
+// 2^32 - 1: Int is 64 bits wide, so each 32-bit word is kept in range by a mask.
+let SHA256_MASK = 4294967295
+
+pub fn sha256_hex(s: Str) -> Str {
+    sha256_bytes_hex(Bytes.from_str(s))
+}
+
+pub fn sha256_bytes_hex(data: Bytes) -> Str {
+    let mut h = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+    let mut w: List[Int] = []
+    while w.len() < 64 { w.push(0) }
+    let n = data.len()
+    let full = n - n % 64
+    let mut off = 0
+    while off < full {
+        sha256_block(h, w, data, off)
+        off = off + 64
+    }
+    let mut tail = data.slice(full, n)
+    tail.push(128)
+    while tail.len() % 64 != 56 { tail.push(0) }
+    let bits = n * 8
+    let mut shift = 56
+    while shift >= 0 {
+        tail.push((bits / sha256_pow2(shift)) & 255)
+        shift = shift - 8
+    }
+    off = 0
+    while off < tail.len() {
+        sha256_block(h, w, tail, off)
+        off = off + 64
+    }
+    let digits = "0123456789abcdef"
+    let mut out = StringBuilder.new()
+    for v in h {
+        let mut k = 28
+        while k >= 0 {
+            let d = (v / sha256_pow2(k)) & 15
+            out.write(digits.byte_slice(d, d + 1))
+            k = k - 4
+        }
+    }
+    out.to_str()
+}
+
+// The digest of the file's bytes, or None when it cannot be opened or read.
+pub fn sha256_file_hex(path: Str) -> Option[Str] ! IO {
+    match sha256_read_all(path) {
+        Some(b) => Some(sha256_bytes_hex(b))
+        None => None
+    }
+}
+
+@ffi("open", header: "fcntl.h")
+@trusted(audit: "Wraps open(2) with no mode. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY, 0 on every host.")
+fn sha256_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "Wraps close(2) on a descriptor sha256_open returned.")
+fn sha256_close(fd: I32) -> I32 ! FFI {}
+
+// The whole file as bytes: a Str read would stop at the first NUL byte.
+fn sha256_read_all(path: Str) -> Option[Bytes] ! IO {
+    let mut file = -1
+    with ffi.scope() as scope {
+        file = sha256_open(scope.cstr(path), 0.to_i32()).to_int()
+    }
+    if file < 0 {
+        return None
+    }
+    let mut all = Bytes.new()
+    loop {
+        match read_bytes(file, 1048576) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                all = all.concat(b)
+            }
+            Err(_) => {
+                let _ = sha256_close(file.to_i32())
+                return None
+            }
+        }
+    }
+    let _ = sha256_close(file.to_i32())
+    Some(all)
+}
+
+fn sha256_pow2(n: Int) -> Int {
+    let mut r = 1
+    let mut i = 0
+    while i < n {
+        r = r * 2
+        i = i + 1
+    }
+    r
+}
+
+fn sha256_block(h: List[Int], w: List[Int], data: Bytes, off: Int) {
+    let mut t = 0
+    while t < 16 {
+        let p = off + t * 4
+        w.set(t, (data.get(p).unwrap() << 24) | (data.get(p + 1).unwrap() << 16) | (data.get(p + 2).unwrap() << 8) | data.get(p + 3).unwrap())
+        t = t + 1
+    }
+    while t < 64 {
+        let x = w[t - 15]
+        let y = w[t - 2]
+        let s0 = (((x >> 7) | (x << 25)) & SHA256_MASK) ^ (((x >> 18) | (x << 14)) & SHA256_MASK) ^ (x >> 3)
+        let s1 = (((y >> 17) | (y << 15)) & SHA256_MASK) ^ (((y >> 19) | (y << 13)) & SHA256_MASK) ^ (y >> 10)
+        w.set(t, (w[t - 16] + s0 + w[t - 7] + s1) & SHA256_MASK)
+        t = t + 1
+    }
+    let mut a = h[0]
+    let mut b = h[1]
+    let mut c = h[2]
+    let mut d = h[3]
+    let mut e = h[4]
+    let mut f = h[5]
+    let mut g = h[6]
+    let mut hh = h[7]
+    let mut r = 0
+    while r < 64 {
+        let s1 = (((e >> 6) | (e << 26)) & SHA256_MASK) ^ (((e >> 11) | (e << 21)) & SHA256_MASK) ^ (((e >> 25) | (e << 7)) & SHA256_MASK)
+        let ch = (e & f) ^ ((e ^ SHA256_MASK) & g)
+        let t1 = (hh + s1 + ch + SHA256_K[r] + w[r]) & SHA256_MASK
+        let s0 = (((a >> 2) | (a << 30)) & SHA256_MASK) ^ (((a >> 13) | (a << 19)) & SHA256_MASK) ^ (((a >> 22) | (a << 10)) & SHA256_MASK)
+        let maj = (a & b) ^ (a & c) ^ (b & c)
+        let t2 = (s0 + maj) & SHA256_MASK
+        hh = g
+        g = f
+        f = e
+        e = (d + t1) & SHA256_MASK
+        d = c
+        c = b
+        b = a
+        a = (t1 + t2) & SHA256_MASK
+        r = r + 1
+    }
+    h.set(0, (h[0] + a) & SHA256_MASK)
+    h.set(1, (h[1] + b) & SHA256_MASK)
+    h.set(2, (h[2] + c) & SHA256_MASK)
+    h.set(3, (h[3] + d) & SHA256_MASK)
+    h.set(4, (h[4] + e) & SHA256_MASK)
+    h.set(5, (h[5] + f) & SHA256_MASK)
+    h.set(6, (h[6] + g) & SHA256_MASK)
+    h.set(7, (h[7] + hh) & SHA256_MASK)
+}

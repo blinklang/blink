@@ -58,6 +58,7 @@ import stdlib_native_deps.{
     stdlib_native_dep_header_dir, stdlib_native_dep_compile_defs, stdlib_native_dep_link_flag_dynamic,
     peeled_module_keys,
 }
+import build_fs
 import build_objcache
 import emit_record
 import std_cache_key.{SHA256SUM_SH, archive_compiler_path, sha256_of_file_first}
@@ -175,8 +176,8 @@ fn extract_embedded_gc() -> Str {
 let mut cli_trace_codegen: Int = 0
 let mut cli_deterministic: Int = 0
 
-let mut ccache_checked: Int = 0
-let mut ccache_available: Int = 0
+// -1 until has_ccache looks for ccache, then 1 when it found it and 0 when not.
+let mut ccache_state: Int = -1
 let mut install_root_cached: Str = "<unset>"
 
 fn strip_extension(filename: Str) -> Str {
@@ -688,21 +689,48 @@ fn resolve_target_triple(alias: Str) -> Str {
     return alias
 }
 
-fn has_ccache() -> Int {
-    if ccache_checked == 0 {
-        ccache_checked = 1
-        if shell_exec("command -v ccache >/dev/null 2>&1") == 0 {
-            ccache_available = 1
-        }
+fn has_ccache() -> Int ! IO {
+    if ccache_state < 0 {
+        ccache_state = if build_fs.find_program("ccache") != "" { 1 } else { 0 }
     }
-    ccache_available
+    ccache_state
 }
 
-pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
-    shell_exec(cc_command(args, debug_mode, release_mode, target))
+pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO {
+    run_command(cc_command(args, debug_mode, release_mode, target))
 }
 
-fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str {
+// Runs cmd as shell_exec does, but without a shell when sh would only split it into words:
+// a build runs cc once per unit and once to link, and each sh costs as much as a small unit.
+fn run_command(cmd: Str) -> Int ! IO {
+    let words = build_fs.plain_words(cmd)
+    if words.len() > 0 && build_fs.find_program(words[0]) != "" {
+        return build_fs.run_program(words[0], words_after_first(words))
+    }
+    shell_exec(cmd)
+}
+
+// Starts cmd as process_spawn("sh", ["-c", cmd]) does, without the shell when run_command
+// would run it without one.
+fn spawn_command(cmd: Str) -> Int ! IO {
+    let words = build_fs.plain_words(cmd)
+    if words.len() > 0 && build_fs.find_program(words[0]) != "" {
+        return process_spawn(words[0], words_after_first(words))
+    }
+    process_spawn("sh", ["-c", cmd])
+}
+
+fn words_after_first(words: List[Str]) -> List[Str] {
+    let mut rest: List[Str] = []
+    let mut i = 1
+    while i < words.len() {
+        rest.push(words[i])
+        i = i + 1
+    }
+    rest
+}
+
+fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str ! IO {
     let mut compiler = "cc"
     let mut pipe = "-pipe "
     if target != "" {
@@ -742,7 +770,7 @@ fn unit_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
     flags
 }
 
-fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
+fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO {
     let src_mt = file_mtime(c_path)
     let obj_mt = file_mtime(o_path)
     if obj_mt >= src_mt && src_mt != -1 {
@@ -793,7 +821,7 @@ fn resolve_native_dep_source(name: Str) -> Str {
     ""
 }
 
-fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str) -> List[Str] {
+fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str) -> List[Str] ! IO {
     let mut objects: List[Str] = []
     let mut did_mkdir = 0
 
@@ -940,7 +968,7 @@ let mut cached_cc_id: Str = ""
 // "<target>\n" once cached_cc_id holds that target's identity; "" before the first call.
 let mut cached_cc_id_for: Str = ""
 
-pub fn process_compiler_sha() -> Str {
+pub fn process_compiler_sha() -> Str ! IO {
     if cached_compiler_sha_init == 0 {
         cached_compiler_sha = sha256_of_file_first(archive_compiler_path())
         cached_compiler_sha_init = 1
@@ -950,15 +978,18 @@ pub fn process_compiler_sha() -> Str {
 
 // The compiler run_cc runs for target: a cross build runs zig, whose clang line does not
 // move with every zig release, so the zig version is part of it.
-fn process_cc_id(target: Str) -> Str {
+fn process_cc_id(target: Str) -> Str ! IO {
     if cached_cc_id_for != "{target}\n" {
-        let cmd = if target == "" {
-            "cc --version 2>&1 | head -1"
+        if target == "" {
+            // The first line `cc --version 2>&1 | head -1` gave, which every cached key holds:
+            // the version goes to stdout, and only a cc that fails to give one writes stderr.
+            let r = process_run("cc", ["--version"])
+            let text = if r.out != "" { r.out } else { r.err_out }
+            cached_cc_id = text.split("\n")[0].trim()
         } else {
-            "zig version && zig cc -target {target} --version 2>&1 | head -1"
+            let r = process_run("sh", ["-c", "zig version && zig cc -target {target} --version 2>&1 | head -1"])
+            cached_cc_id = if r.exit_code == 0 { r.out.trim().replace("\n", " ") } else { "" }
         }
-        let r = process_run("sh", ["-c", cmd])
-        cached_cc_id = if r.exit_code == 0 { r.out.trim().replace("\n", " ") } else { "" }
         cached_cc_id_for = "{target}\n"
     }
     cached_cc_id
@@ -969,7 +1000,7 @@ fn process_cc_id(target: Str) -> Str {
 // trigger a full-tree size walk.
 let mut cache_did_store: Int = 0
 
-fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str {
+fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
     cache_did_store = 0
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() {
         return ""
@@ -982,11 +1013,11 @@ fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target:
         return ""
     }
     let obj = cache_compile_snapshot(c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags)
-    shell_exec("rm -rf {snap_dir}")
+    let _ = build_fs.remove_tree(snap_dir)
     obj
 }
 
-fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str {
+fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
     let snap = "{snap_dir}/{path_basename(c_path)}"
     if shell_exec("cp {c_path} {snap}") != 0 {
         return ""
@@ -1030,7 +1061,7 @@ fn sha8(sha: Str) -> Str {
 // is not recomputed on each run: it costs tens of ms, and the compiler SHA is already
 // memoized for the obj cache. An installed archive is never rebuilt;
 // verify_installed_archive checks it instead.
-fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
     if dev_archive_current() {
         return 0
     }
@@ -1043,7 +1074,7 @@ fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, 
 }
 
 // Whether ensure_dev_archive would leave the archive as it is.
-fn dev_archive_current() -> Bool {
+fn dev_archive_current() -> Bool ! IO {
     let arc_dir = resolve_archive_dir()
     if arc_dir.ends_with("share/blink") {
         return true
@@ -1083,7 +1114,7 @@ fn dev_archive_current() -> Bool {
 // Returns 0 when the link may proceed (dev archive, or matching installed
 // stamp), 1 when an installed archive is incompatible or unstamped (a
 // diagnostic is emitted and the caller must not produce a binary).
-fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report {
+fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO {
     if !arc_dir.ends_with("share/blink") {
         return 0
     }
@@ -1110,7 +1141,7 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report {
     1
 }
 
-fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report {
+fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report, IO {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -1255,8 +1286,8 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
     0
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
-    shell_exec("rm -f {output_path}")
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+    fs_remove(output_path)
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
     if emit_mode != "c" {
@@ -1339,7 +1370,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
-        shell_exec("rm -f {out}")
+        fs_remove(out)
         let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive)
         if lrc != 0 {
             return lrc
@@ -1416,12 +1447,6 @@ fn per_module_from_env() -> Bool {
     io.eprintln("error: BLINK_PER_MODULE must be 0 or 1, got '{raw}'")
     exit(1)
     false
-}
-
-fn cpu_count() -> Int {
-    let r = process_run("sh", ["-c", "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null"])
-    let n = r.out.trim().to_int()
-    if n > 0 { n } else { 1 }
 }
 
 // Why a --per-module build falls back to one unit, or "" when it does not.
@@ -1558,7 +1583,7 @@ fn emit_reuse_allowed() -> Bool {
 // in last_dir when the emit's inputs are the ones it records.
 // checked is the build the daemon forked this process for, whose checked program it
 // compiles; None in any other process.
-fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, chunk_decls: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, chunk_decls: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
     let front = match checked {
         Some(b) => checked_front_end(b, strict_mode)
         None => {
@@ -1643,15 +1668,15 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
         write_file("{dir}/{emit_record.inputs_name()}", inputs)
         let last = emit_record.last_inputs_name()
         let mut extra = [emit_record.inputs_name()]
-        let mut link = ""
+        let mut placed = true
         match taken {
             Some(t) => {
                 extra.push(last)
-                link = t.link
+                placed = emit_record.place_taken(t)
             }
             None => {}
         }
-        shas = build_objcache.unit_file_shas_after(link, dir, resolve_archive_dir(), extra)
+        shas = if placed { build_objcache.unit_file_shas_with(dir, resolve_archive_dir(), extra) } else { None }
         match taken {
             Some(t) => {
                 let held = match shas {
@@ -1663,7 +1688,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                     // record, so what it took may be of two builds. It emits them after all.
                     for u in t.units {
                         dbg_trace("build.units", "emit unit {u.module} again")
-                        for f in emit_record.unit_files(u) { shell_exec("rm -f \"{dir}/{f.stem}.c\"") }
+                        for f in emit_record.unit_files(u) { fs_remove("{dir}/{f.stem}.c") }
                         match emit_unit(program, u.module, cfg, facts, hs, sources, dir, chunk_decls) {
                             Ok(e) => by_module.insert(u.module, e)
                             Err(rc) => return Err(rc)
@@ -1874,7 +1899,7 @@ fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
     0
 }
 
-fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen {
+fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" {
         out_dir = "."
@@ -1883,16 +1908,15 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     // The units are written into a directory no other build writes, so the bytes a key
     // hashes are the bytes cc compiles. It replaces units_dir once the build is done, and
     // the objects carry units_dir's path through -ffile-prefix-map.
-    let mk = process_run("sh", ["-c", "mktemp -d {out_dir}/.units.XXXXXX"])
-    let work = mk.out.trim()
-    if mk.exit_code != 0 || work == "" {
+    let work = build_fs.private_dir(out_dir, ".units")
+    if work == "" {
         io.eprintln("error: cannot make a units directory in {out_dir}")
         return 1
     }
     let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode, unit_chunk_decls(release_mode), checked) {
         Ok(u) => u
         Err(rc) => {
-            shell_exec("rm -rf {work}")
+            let _ = build_fs.remove_tree(work)
             return rc
         }
     }
@@ -1912,11 +1936,17 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
             None => {}
         }
     }
-    shell_exec("rm -rf {units_dir} && mv {work} {units_dir}")
+    // rename(2) fails, where mv would move work into it, when another build made units_dir
+    // again after the remove; this build then tries once more and else leaves units_dir be.
+    if !(build_fs.remove_tree(units_dir) && build_fs.rename(work, units_dir)) {
+        if !(build_fs.remove_tree(units_dir) && build_fs.rename(work, units_dir)) {
+            let _ = build_fs.remove_tree(work)
+        }
+    }
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report, IO {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -1969,7 +1999,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
-        shell_exec("rm -f {out}")
+        fs_remove(out)
         let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs)
         if lrc != 0 {
             return lrc
@@ -1997,7 +2027,7 @@ type UnitCompile {
     err_out: Str
 }
 
-// Runs each command under sh with at most `unit_jobs` at a time (the CPU count for -1),
+// Runs each command as sh would with at most `unit_jobs` at a time (the CPU count for -1),
 // starting them in list order.
 // Answers one result per command, indexed by its place in the list.
 // The children are started and reaped from this thread rather than from async tasks: the
@@ -2005,16 +2035,16 @@ type UnitCompile {
 // never run more than four at once. Children are reaped in start order with no wait for
 // whichever ends first, so a child that ends early holds its slot until those started
 // before it are reaped.
-fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] {
+fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] ! IO {
     let n = cmds.len()
     let mut by_idx: List[UnitCompile] = []
     if n == 0 { return by_idx }
-    let jobs = if unit_jobs > 0 { unit_jobs } else { cpu_count() }
+    let jobs = if unit_jobs > 0 { unit_jobs } else { build_fs.cpu_count() }
     process_install_signal_forwarding()
     let mut pids: List[Int] = []
     let mut started = 0
     while started < n && started < jobs {
-        pids.push(process_spawn("sh", ["-c", cmds.get(started).unwrap()]))
+        pids.push(spawn_command(cmds.get(started).unwrap()))
         started = started + 1
     }
     let mut idx = 0
@@ -2022,7 +2052,7 @@ fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] {
         let r = process_pid_wait(pids.get(idx).unwrap())
         by_idx.push(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out })
         if started < n {
-            pids.push(process_spawn("sh", ["-c", cmds.get(started).unwrap()]))
+            pids.push(spawn_command(cmds.get(started).unwrap()))
             started = started + 1
         }
         idx = idx + 1
@@ -2032,7 +2062,7 @@ fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] {
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
 // against the archive.
-fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report {
+fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report, IO {
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
     if vrc != 0 {
@@ -2044,7 +2074,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         for f in emit_record.unit_files(u) { files.push(f) }
     }
     let obj_dir = if target != "" { "{work}/obj-{target}" } else { "{work}/obj" }
-    shell_exec("mkdir -p {obj_dir}")
+    let _ = build_fs.mkdir_p(obj_dir)
     let use_cache = cg_obj_cache_enabled != 0 && build_objcache.cache_enabled()
     let mut keys: Map[Str, Str] = Map()
     if use_cache && shas.is_some() {
@@ -2060,7 +2090,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
             modules.push(u.stem)
             unit_headers.insert(u.stem, u.headers)
         }
-        keys = build_objcache.unit_keys_from(shas.unwrap(), work, modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), unit_key_flags(debug_mode, release_mode), target)
+        keys = build_objcache.unit_keys_from(shas.unwrap(), modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), unit_key_flags(debug_mode, release_mode), target)
     }
     let mut objs: Map[Str, Str] = Map()
     let mut misses: List[emit_record.UnitChunkFile] = []
@@ -3194,7 +3224,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 
 // The build `blink build` runs in its own process, or in a child of the daemon, which passes
 // the build it forked the child for as checked.
-fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -3265,7 +3295,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
     if out_dir == "" {
         out_dir = "."
     }
-    shell_exec("mkdir -p {out_dir}")
+    let _ = build_fs.mkdir_p(out_dir)
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     ensure_deps_resolved()
@@ -3309,7 +3339,7 @@ fn run_output_path(a: Args) -> Str {
 // The build `blink run` runs in its own process, or in a child of the daemon, which passes
 // checked as build_here's does: the path of the program it built, or None when it names no
 // source.
-fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Option[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Option[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.println("error: no source file specified")
@@ -3340,7 +3370,7 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Option
     if out_dir == "" {
         out_dir = "."
     }
-    shell_exec("mkdir -p {out_dir}")
+    let _ = build_fs.mkdir_p(out_dir)
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     if run_traces(a) {
@@ -3387,7 +3417,7 @@ type TestFileResult {
     err_out: Str
 }
 
-fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
     apply_cache_flag(a)
     let json_output = if args_has(a, "json") { 1 } else { 0 }
@@ -3943,7 +3973,7 @@ fn build_through_daemon(a: Args, command: Str) -> Bool ! IO {
 // A build that would first resolve dependencies or rebuild the stdlib archive declines, since
 // the client's cold build reads what those write, and the archive's own front end would undo
 // the checked program.
-fn build_in_daemon_child(b: DaemonBuild) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn build_in_daemon_child(b: DaemonBuild) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let p = cli_parser()
     let a = parse_argv(p, b.argv)
     let command = args_command(a)
