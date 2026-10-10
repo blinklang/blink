@@ -1,6 +1,9 @@
 // The key the stdlib archive cache is stored under. It lives apart from build_stdlib
 // so a test can import it: build_stdlib imports cli, whose fn main no test can link.
 
+import build_fs
+import sha256.{sha256_hex, sha256_file_hex}
+
 // The archive's C is emitted in process, so the binary to hash is the running one, not a
 // build/blinkc beside it: a compiler rebuild need not touch that file, and an installed
 // tree has none. "" when the host does not say; a guess from argv[0] could hash a binary
@@ -20,28 +23,33 @@ fn runtime_exe_path() -> Str ! FFI {}
 // is the same on either host.
 pub let SHA256SUM_SH: Str = "command -v sha256sum >/dev/null 2>&1 || sha256sum() \{ shasum -a 256 \"$@\"; \}; "
 
-pub fn sha256_of_file_first(path: Str) -> Str {
+// A file this size or smaller is hashed in process: below it, starting sha256sum costs more
+// than the hashing does.
+pub let IN_PROCESS_HASH_BYTES: Int = 1048576
+
+pub fn sha256_of_file_first(path: Str) -> Str ! IO {
     if path == "" || file_exists(path) == 0 {
         return ""
+    }
+    let size = build_fs.file_size(path)
+    if size >= 0 && size <= IN_PROCESS_HASH_BYTES {
+        return sha256_file_hex(path) ?? ""
+    }
+    if build_fs.find_program("sha256sum") != "" {
+        let r = process_run("sha256sum", ["--", path])
+        // A name sha256sum had to escape starts its line with a backslash.
+        let at = if r.out.starts_with("\\") { 1 } else { 0 }
+        return if r.exit_code == 0 && r.out.byte_len() >= at + 64 { r.out.byte_slice(at, at + 64) } else { "" }
     }
     let r = process_run("sh", ["-c", "{SHA256SUM_SH}sha256sum {path} 2>/dev/null | awk '\{print $1}'"])
     r.out.trim()
 }
 
-// Hash a heredoc-fed manifest text + extra `sha256sum` lines into a
-// 16-hex digest. Shared between the stdlib-archive cache and the object cache.
+// The 16-hex digest of a manifest text, ended by a newline when it has none. The keys on disk
+// were made by feeding the text to sha256sum through a heredoc, which adds that newline.
 pub fn sha256_of_manifest(text: Str) -> Str {
-    let mut cmd = StringBuilder.new()
-    cmd.write(SHA256SUM_SH)
-    cmd.write("(cat <<'__BLINK_MANIFEST_EOF__'\n")
-    cmd.write(text)
-    if !text.ends_with("\n") {
-        cmd.write("\n")
-    }
-    cmd.write("__BLINK_MANIFEST_EOF__\n")
-    cmd.write(") | sha256sum | cut -c1-16")
-    let res = process_run("sh", ["-c", cmd.to_str()])
-    res.out.trim()
+    let body = if text.ends_with("\n") { text } else { "{text}\n" }
+    sha256_hex(body).byte_slice(0, 16)
 }
 
 // "" when the compiler binary is missing: a key without it would match an archive that any

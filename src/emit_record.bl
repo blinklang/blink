@@ -36,6 +36,7 @@ import compiler.{loaded_inputs, import_map_paths, import_map_modules, import_map
 import diagnostics.{lint_override_lines}
 import cg.{CgConfig}
 import build_objcache
+import build_fs
 
 pub type EmittedUnit {
     module: Str
@@ -337,20 +338,30 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
     Some(EmitRecord { inputs_len: head.get(1).unwrap().to_int(), inputs_sha: head.get(2).unwrap(), units: with_uses, files: files, shas: shas })
 }
 
-// A shell command that links (or copies) each of names from from_dir into to_dir, and fails
-// when it could do neither.
-fn link_command(from_dir: Str, to_dir: Str, names: List[Str]) -> Str {
-    let mut srcs: List[Str] = []
-    let mut dsts: List[Str] = []
-    for n in names {
-        srcs.push("\"{from_dir}/{n}\"")
-        dsts.push("\"{to_dir}/{n}\"")
-    }
-    let src_list = srcs.join(" ")
+// Puts each of names from from_dir into to_dir, by a hard link or else by a copy. False when
+// it could do neither.
+fn link_or_copy(from_dir: Str, to_dir: Str, names: List[Str]) -> Bool ! IO {
     // A build never writes a file in a units directory once it replaced the last one, so
-    // a hard link shares bytes that no longer change. The copy is for a filesystem
-    // without hard links; it removes any link made first, since cp would write through it.
-    "\{ ln {src_list} \"{to_dir}/\"; \} 2>/dev/null || \{ rm -f {dsts.join(" ")}; cp {src_list} \"{to_dir}/\" || exit 1; \}"
+    // a hard link shares bytes that no longer change. The FFI cannot bind link(2), so one ln
+    // makes every link.
+    if build_fs.find_program("ln") != "" {
+        let mut args = ["--"]
+        for n in names { args.push("{from_dir}/{n}") }
+        args.push("{to_dir}/")
+        if process_run("ln", args).exit_code == 0 { return true }
+    }
+    // The copy is for a filesystem without hard links; it removes any link made first, since
+    // a write would go through it. The files are C text, which holds no NUL byte, and the
+    // caller hashes each where it lands.
+    for n in names { fs_remove("{to_dir}/{n}") }
+    for n in names {
+        let src = "{from_dir}/{n}"
+        let dst = "{to_dir}/{n}"
+        if file_exists(src) != 1 { return false }
+        write_file(dst, read_file(src))
+        if file_exists(dst) != 1 { return false }
+    }
+    true
 }
 
 // The units of the record in from_dir whose inputs are `inputs`, with their files and the
@@ -358,7 +369,7 @@ fn link_command(from_dir: Str, to_dir: Str, names: List[Str]) -> Str {
 // must hash as the record says, and the inputs text is compared where it lands, so a file
 // edited or replaced since the record was written is never taken. None, with to_dir left
 // empty, when there is no such record or a file differs.
-pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[ReusedUnits] {
+pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[ReusedUnits] ! IO {
     let rec = match read_record(from_dir) {
         Some(r) => r
         None => return None
@@ -372,19 +383,10 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
     if file_exists(last_inputs) != 1 || read_file(last_inputs) != inputs {
         return None
     }
-    let mut srcs: List[Str] = []
-    let mut dsts: List[Str] = []
-    for f in rec.files {
-        srcs.push("\"{from_dir}/{f}\"")
-        dsts.push("\"{to_dir}/{f}\"")
-    }
-    srcs.push("\"{from_dir}/{INPUTS_NAME}\"")
-    dsts.push("\"{to_dir}/{INPUTS_NAME}\"")
-    let src_list = srcs.join(" ")
-    let dst_list = dsts.join(" ")
-    // One cp for every file; link_command says why a link.
-    let cp = process_run("sh", ["-c", "cp -l {src_list} \"{to_dir}/\" 2>/dev/null || \{ rm -f {dst_list}; cp {src_list} \"{to_dir}/\"; \}"])
-    let mut ok = cp.exit_code == 0
+    let mut names: List[Str] = []
+    for f in rec.files { names.push(f) }
+    names.push(INPUTS_NAME)
+    let mut ok = link_or_copy(from_dir, to_dir, names)
     let mut shas: Map[Str, Str] = Map()
     if ok {
         match build_objcache.unit_file_shas_with(to_dir, arc_dir, [INPUTS_NAME]) {
@@ -404,27 +406,34 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
         ok = file_exists(path) == 1 && read_file(path) == inputs
     }
     if !ok {
-        shell_exec("rm -f {dst_list}")
+        for n in names { fs_remove("{to_dir}/{n}") }
         return None
     }
     Some(ReusedUnits { units: rec.units, shas: shas })
 }
 
 // The units a build takes from the last build's record while it emits the rest, what the
-// files it took must hash as once they are in its units directory, and the shell command
-// that puts the units' files there.
+// files it took must hash as once they are in its units directory, and where place_taken
+// puts the units' files from.
 pub type TakenUnits {
     units: List[EmittedUnit]
     shas: Map[Str, Str]
-    link: Str
+    from_dir: Str
+    to_dir: Str
+    c_names: List[Str]
+}
+
+// Puts the files of the units taken into the units directory. False when it could not.
+pub fn place_taken(taken: TakenUnits) -> Bool ! IO {
+    link_or_copy(taken.from_dir, taken.to_dir, taken.c_names)
 }
 
 // The units of the record in from_dir, among candidates, that this build can take: the
 // inputs other than the texts of the files in own (the sources of the program's modules)
 // match the last build's, the headers in to_dir that names and texts give match the last
 // build's, and every source each unit spanned holds the same text. The last build's inputs
-// text, as the build read it, goes into to_dir as last_inputs_name(). The build runs the
-// link command of what it takes before it hashes to_dir, and checks in taken_units_hold that
+// text, as the build read it, goes into to_dir as last_inputs_name(). The build runs
+// place_taken on what it takes before it hashes to_dir, and checks in taken_units_hold that
 // the files it took, the inputs text it read, and the headers it compared hash as the
 // record says, so all a build compares is of one record. Nothing goes into to_dir before
 // a unit is chosen, so a unit the build emits is never written through a link. None, with
@@ -489,7 +498,7 @@ pub fn take_units(from_dir: Str, to_dir: Str, inputs: Str, candidates: List[Str]
     for c in c_names { shas.insert(c, rec.shas.get(c) ?? "-") }
     for name in names { shas.insert(name, rec.shas.get(name) ?? "-") }
     shas.insert(LAST_INPUTS_NAME, rec.inputs_sha)
-    Some(TakenUnits { units: taken, shas: shas, link: link_command(from_dir, to_dir, c_names) })
+    Some(TakenUnits { units: taken, shas: shas, from_dir: from_dir, to_dir: to_dir, c_names: c_names })
 }
 
 // The text of each loaded source in two inputs texts, by its path.
