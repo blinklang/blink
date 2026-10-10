@@ -728,6 +728,20 @@ fn cc_opt_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
     ["-O1"]
 }
 
+// Flags each per-module unit compiles with, on top of cc_opt_flags. A unit holds only the
+// declarations its scan found, so a missed one must stop the build: gcc before 14 only warns
+// on a call to an undeclared function and then guesses an int return.
+fn unit_cc_flags() -> List[Str] {
+    ["-Werror=implicit-function-declaration"]
+}
+
+// The flags a unit's object is keyed on: the ones its compile passes.
+fn unit_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
+    let mut flags = cc_opt_flags(debug_mode, release_mode)
+    for f in unit_cc_flags() { flags.push(f) }
+    flags
+}
+
 fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int {
     let src_mt = file_mtime(c_path)
     let obj_mt = file_mtime(o_path)
@@ -1476,12 +1490,18 @@ fn unit_with_includes(c: Str, m: Str, hs: UnitHeaders) -> (Str, List[Str]) {
     match splice_declarations(c, own, types, d) {
         Some(text) => {
             let mut all = [types]
-            for h in d.whole { all.push(h) }
+            for h in d.whole {
+                dbg_trace("build.unit_headers", "whole {m}: {h}: {hs.index.why.get(h) ?? ""}")
+                all.push(h)
+            }
             (text, all)
         }
         // A unit with no include of its own header is not one the emitter wrote, so its key
         // takes every header: a header too many costs a recompile, one too few a stale object.
-        None => (c, hs.files)
+        None => {
+            dbg_trace("build.unit_headers", "whole {m}: every header: no include of {own}")
+            (c, hs.files)
+        }
     }
 }
 
@@ -2040,7 +2060,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
             modules.push(u.stem)
             unit_headers.insert(u.stem, u.headers)
         }
-        keys = build_objcache.unit_keys_from(shas.unwrap(), work, modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), cc_opt_flags(debug_mode, release_mode), target)
+        keys = build_objcache.unit_keys_from(shas.unwrap(), work, modules, unit_headers, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), unit_key_flags(debug_mode, release_mode), target)
     }
     let mut objs: Map[Str, Str] = Map()
     let mut misses: List[emit_record.UnitChunkFile] = []
@@ -2076,7 +2096,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut cmds: List[Str] = []
     for u in misses {
         dbg_trace("build.units", "compile {u.stem}")
-        cmds.push(cc_command("-c {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir} {includes}", debug_mode, release_mode, target))
+        cmds.push(cc_command("-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir} {includes}", debug_mode, release_mode, target))
     }
     let results = run_unit_compiles(cmds, unit_jobs)
     let mut failed = 0
