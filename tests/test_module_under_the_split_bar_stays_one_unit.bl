@@ -1,0 +1,76 @@
+// A chunk boundary costs the program speed: cc can not inline a call from one chunk into a
+// function of another. So a build cuts only a module of more than sixteen times
+// BLINK_UNIT_CHUNK_DECLS decls, the size where one cc on the whole unit takes seconds. A
+// module under the bar is one unit, and one over it is cut.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// count private functions and the pub fn that calls them all.
+fn module_source(name: Str, count: Int) -> Str {
+    let mut lines: List[Str] = []
+    let mut calls: List[Str] = []
+    let mut i = 0
+    while i < count {
+        lines.push("fn {name}{i}(n: Int) -> Int \{ n + {i} }")
+        lines.push("")
+        calls.push("{name}{i}(n)")
+        i = i + 1
+    }
+    lines.push("pub fn {name}_total(n: Int) -> Int \{")
+    lines.push("    {calls.join(" + ")}")
+    lines.push("}")
+    lines.push("")
+    lines.join("\n")
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"split_bar_app\"\nversion = \"0.1.0\"\n")
+    // At BLINK_UNIT_CHUNK_DECLS=2 the bar is 32 decls: under has 21, over has 41.
+    write_file("{tree}/app/src/under.bl", module_source("under", 20))
+    write_file("{tree}/app/src/over.bl", module_source("over", 40))
+    write_file("{tree}/app/src/main.bl", [
+        #"import under.{under_total}"#,
+        #"import over.{over_total}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("total {under_total(1) + over_total(1)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn build(tree: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_UNIT_CHUNK_DECLS=2 BLINK_CACHE_DIR={tree}/objcache build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+}
+
+test "a module under the split bar is one unit, and one over it is cut" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_split_bar_{getpid()}"
+    dev_tree(root, tree)
+    let r = build(tree)
+    let under = sh("ls {tree}/out/app.units | grep -c '^under\\..*c$'").to_int()
+    let over = sh("ls {tree}/out/app.units | grep -c '^over\\..*c$'").to_int()
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    assert_eq(under, 1)
+    assert(over > 2, "the module over the bar was not cut: {over} files")
+    assert(out.contains("total 1030"), "the program changed: {out}")
+}
