@@ -216,14 +216,18 @@ tasks:
         export GC_MARKERS=1
         printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > .tmp/fmt_skip.txt
 
-        golden_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
-        idem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
+        # Under blink-gates.slice the slice already holds memory below this cap,
+        # and a scope of its own would move the work out of the slice's CPU cap.
+        scope="systemd-run --user --scope -p MemoryMax=50G --quiet"
+        grep -q '/blink-gates.slice/' /proc/self/cgroup && scope=""
+        golden_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
+        idem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
         # The semantic pass compiles and RUNS every formatted test. Those
         # binaries call the relative build/blink and build/blinkc, which only
         # a release build provides, so the rewrite gate skips this pass.
         sem_results=""
         if [ "{{.FMT_SEMANTIC}}" = 1 ]; then
-          sem_results=$(systemd-run --user --scope -p MemoryMax=50G --quiet parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
+          sem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
         fi
 
         all_results=$(printf '%s\n%s\n%s' "$golden_results" "$idem_results" "$sem_results")
@@ -698,8 +702,19 @@ tasks:
     internal: true
     silent: true
     cmds:
+      - task: gen1
+      - task: __ci-corpus-and-fmt
+
+  # The formatter goldens read gen1's blinkc and write only .tmp/, so they run
+  # while the corpus builds its compiler archive on one core, not after the sweep.
+  __ci-corpus-and-fmt:
+    internal: true
+    silent: true
+    deps:
       - task: corpus
         vars: { CORPUS_LINT: "0", CORPUS_PM_SLICE: scripts/corpus_per_module_slice.txt }
+      - task: __fmt-goldens
+        vars: { FMT_BLINKC: "{{.BUILD_DIR}}/gen1/blinkc", FMT_SEMANTIC: "0" }
 
   # One dep, not seven: run_together.sh prints each one's output whole.
   __gate-selftests:
@@ -728,7 +743,7 @@ tasks:
   #       every file of the per-module slice passes per-module in the same
   #       sweep (corpus-per-module-slice-check). The corpus starts once gen1
   #       is built, beside the rest of (b)
-  #   (d) formatter goldens with the gen1 compiler
+  #   (d) formatter goldens with the gen1 compiler, beside the corpus
   #   (e) every typecheck-suite and rewrite-suite file passed in that corpus
   #       run. The corpus already runs each of them under gen1, so ci does not
   #       run them again under gen0; ci-fast still does, as it has no full corpus
@@ -741,8 +756,6 @@ tasks:
       - task: __ci-corpus-ratchet-and-selftests
       - task: corpus-check
       - task: corpus-per-module-slice-check
-      - task: __fmt-goldens
-        vars: { FMT_BLINKC: "{{.BUILD_DIR}}/gen1/blinkc", FMT_SEMANTIC: "0" }
       - task: suites-in-corpus
 
   # The branch gate. Same steps as ci, minus the whole-tree corpus: on a
