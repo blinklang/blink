@@ -1664,9 +1664,9 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 **Rules:**
 - Qualified access works for functions (`auth.login()`), types (`auth.Token`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`.
 - Only the leaf module name is used as qualifier. `import std.num` enables `num.parse_int()`, not `std.num.parse_int()`. For modules with the same leaf name, use aliases: `import legacy.auth as legacy_auth`.
-- Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works.
-- A whole-module import binds only its qualifier. If `import foo` and `import bar` both export `helper`, nothing collides: call `foo.helper()` or `bar.helper()`. Two imports that bind one name, bare name or qualifier, are E1005 (*Imported Names*, §10.5).
-- Local definitions shadow module names: if `let auth = 5` exists, `auth.login()` is a method call on the integer, not a module-qualified call.
+- Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works. So a selective import binds its qualifier too: `import auth.{login}` binds `login` and `auth`.
+- A whole-module import binds only its qualifier. If `import foo` and `import bar` both export `helper`, nothing collides: call `foo.helper()` or `bar.helper()`. Two imports that bind one name, bare name or qualifier, are E1005 (*Imported Names*, §10.5). A module-level declaration that takes a qualifier's name is E1012 (*Imported and Declared Names*, §10.5).
+- A local binding hides a module qualifier for its scope. If `let auth = 5` is in scope, `auth.login()` is a method call on the integer, not a module-qualified call. Inside that scope `auth.y` resolves against the local binding only. There is no fallback to the qualifier, also when the local's type has no member `y`. Every local binding form in §2.2 *Local bindings* hides a qualifier this way. This is a shadow between nested scopes (§10.6 *Shadowing Rules*), so it is legal and gets no warning at the binding. A diagnostic that a hidden qualifier causes names the hidden module (§10.6 *Diagnostics that involve a shadowing name*).
 
 **No wildcard imports.** `import auth.*` does not exist. Every name in scope is explicitly imported. This is non-negotiable for locality of reasoning — an AI reading a file can determine every available name from the import block alone.
 
@@ -2079,7 +2079,7 @@ import codegen_common.{emit_line, CT_INT, CT_STRING, c_fn_name}
 
 #### Imported and Declared Names
 
-A selective import binds each listed name in module scope, and module scope is one flat namespace (§2.12.1, §10.6 *Shadowing Rules*). So a module may not both import a name and declare it. A module-level declaration of a name that a selective import binds is a compile error, `DuplicateSymbol` (E1012). The rule covers every declaration kind in both namespaces: `type`, type alias, `trait`, `effect`, `fn` and module-level `let`. It applies to `import` and `pub import` alike, and to every visibility of the declaration.
+An import binds names in module scope: a selective import binds each listed name, and every import binds its qualifier (§10.1 *Qualified Access*). Module scope is one flat namespace (§2.12.1, §10.6 *Shadowing Rules*). So a module may not both import a name and declare it. A module-level declaration of a name that an import binds is a compile error, `DuplicateSymbol` (E1012). The rule covers every declaration kind in both namespaces: `type`, type alias, `trait`, `effect`, `fn`, `const`, and module-level `let` and `let mut`. A qualifier collides in both namespaces, because `X.y` can be qualified access, access through a type (§2.12.3), or a method call on a value. The rule applies to `import` and `pub import` alike, and to every visibility of the declaration.
 
 ```blink
 import alpha.{Point}
@@ -2114,9 +2114,40 @@ import alpha.{Point as AlphaPoint}
 type Point { b: Int }    // OK: the import binds `AlphaPoint`, not `Point`
 ```
 
-A whole-module import (`import alpha`) binds no bare name, so it never collides with a declaration.
+**Fix.** For a listed name in a plain `import`, the fix "drop the name from the import list" is machine-applicable (§8.6): every bare use of the name then means the local declaration. When the edit empties the list, the fix rewrites the line to `import alpha`, because a selective import also gives qualified access (§10.1 *Qualified Access*). It deletes the line only when no name in the file resolves through the `alpha` qualifier; the check uses name resolution, not text search. For `pub import`, the same edit changes the module's public API, so the fix is a suggestion only. On that import entry, E1012 replaces W0602 (unused import): one mistake gives one diagnostic.
 
-**Fix.** For a plain `import`, the fix "drop the name from the import list" is machine-applicable (§8.6): every bare use of the name then means the local declaration. When the edit empties the list, the fix rewrites the line to `import alpha`, because a selective import also gives qualified access (§10.1 *Qualified Access*). It deletes the line only when no name in the file resolves through the `alpha` qualifier; the check uses name resolution, not text search. For `pub import`, the same edit changes the module's public API, so the fix is a suggestion only. On that import entry, E1012 replaces W0602 (unused import): one mistake gives one diagnostic.
+A qualifier collides the same way. A whole-module import binds its qualifier, the leaf name or the name after `as`. A selective import binds its qualifier too, because it also gives qualified access (§10.1 *Qualified Access*):
+
+```blink
+import alpha
+import beta as b
+import gamma.{Point}
+
+type alpha { x: Int }    // error[E1012]: `alpha` is both a module qualifier and a declaration
+fn b() -> Int { 1 }      // error[E1012]: the import binds the qualifier `b`
+let gamma = 3            // error[E1012]: the selective import binds the qualifier `gamma`
+```
+
+The name after `as` has no case rule: `import alpha as Alpha` together with `type Alpha` is E1012 like any other pair.
+
+The primary span of E1012 is on the declaration, and the import entry has a label. When the colliding entry is a selective import, the label says that the import binds the qualifier:
+
+```
+error[E1012]: `gamma` is both a module qualifier and a declaration in module `main`
+ --> src/main.bl:7:5
+  |
+3 | import gamma.{Point}
+  |        ----- this import also binds the qualifier `gamma`
+7 | let gamma = 3
+  |     ^^^^^ also declared here
+  |
+  = help: import the module under another name: import gamma as gamma_mod
+          or rename the declaration
+```
+
+When several import entries collide with one declaration, each entry gets its own E1012.
+
+**Fix for a qualifier.** Renaming the module with `as` or renaming the declaration changes what `alpha.y` means at each use, so the fix is a suggestion only (§8.6). On the colliding entry, E1012 replaces W0602. A use of the name that fails only because of the collision is not reported either: one mistake gives one diagnostic. Which binding the compiler uses to continue after the error is not specified.
 
 #### Imported Names
 
@@ -2193,7 +2224,7 @@ When the entry names a type whose methods the file calls, the note says that the
 | E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
 | E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
 | E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar |
-| E1012 | Duplicate symbol | A module-level declaration takes a name that a selective import (`import` or `pub import`) binds |
+| E1012 | Duplicate symbol | A module-level declaration takes a name that an import (`import` or `pub import`) binds: a listed name or a qualifier |
 | E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
 | E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |
 | E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), or two members of one `T.` namespace in a package share a name (§2.12.3) |
@@ -2375,13 +2406,17 @@ warning[W1010]: name shadows compiler-known type
 
 The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. It also covers such a name that another module declares and this module imports (`import geo.{Handler}`). Local bindings (`let`) live in the value namespace and are not type declarations.
 
-**Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or selective imports, are a duplicate, never a shadow. One rule covers every pair, and the code tells which pair collided: two selective imports are E1005 (`AmbiguousImport`), a selective import and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. The rule in §10.1 *Qualified Access* that a local definition hides a module qualifier (`let auth = 5` makes `auth.login()` a method call) is a different layer, and this rule does not change it.
+**Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or imports, are a duplicate, never a shadow. A module qualifier is in both namespaces. One rule covers every pair, and the code tells which pair collided: two imports are E1005 (`AmbiguousImport`), an import entry and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. A local binding that hides a module qualifier (`let auth = 5` makes `auth.login()` a method call, §10.1 *Qualified Access*) is a shadow between nested scopes, so it is legal.
 
 **Diagnostics that involve a shadowing name.** The escape must be visible where the error is, not only at the declaration. So:
 
 1. The W1010 `help:` line names the aliased-import fix: `import blink.core.{X as Y}`, or `import blink.ffi.{X as Y}` for `Ptr` and `Buf`.
 2. Every diagnostic whose subject is a name that shadows a compiler-known type — type-argument arity (E0303), type mismatch (E0300), missing method, and any other — adds a `note:` that gives the shadowing declaration's location and the builtin's home, and repeats the `help:` line from (1).
 3. When two different types with the same name appear in one diagnostic, each prints as `Name (module)`. Hover in the language server uses the same form.
+4. When a local binding hides a module qualifier (§10.1 *Qualified Access*):
+   - A diagnostic at `q.y` whose cause is that `y` does not resolve on the local `q` adds a `note:` that gives the location of the local binding and names the hidden module and its import. The note appears only when the hidden module has a `pub` item named `y`.
+   - The W0602 that the import gets because every `q.y` in the file resolves to a local adds a `note:` that gives the location of the first hiding binding in source order.
+   - When a `q.y` diagnostic with the note from the first point fires, the import gets no W0602: one mistake gives one diagnostic.
 
 ```blink
 type Handler {

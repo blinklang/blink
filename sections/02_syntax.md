@@ -60,6 +60,16 @@ All decided through independent design and cross-team voting. None are revisitab
 | Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()`, `todo()` and `unreachable()` diverge. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
 | Spread/rest operator | `..` | General spread/rest sigil. Patterns: `{ name, .. }`, `[first, ..]` (ignore rest). Construction: `{ field: val, ..source }` (copy rest), `[..list1, ..list2]` (list spread). See [2.16](#216-spread--rest-operator-). |
 
+**Local bindings.** These forms bind a name in a local scope:
+
+- a parameter of a named function or of a closure (§2.8);
+- `let` and `let mut`, and each name in a destructuring `let` pattern;
+- each name in a `match` arm pattern;
+- each name in a `for` loop pattern (§2.10);
+- the name after `as` in `with expr as name { }`.
+
+A local binding hides a module qualifier of the same name for its scope (§10.1 *Qualified Access*).
+
 ### 2.3 Contested: Braces vs Indentation
 
 **Winner: braces (5-0)**
@@ -798,7 +808,7 @@ Module-level `let` and `let mut` declare module-scoped bindings. These follow di
 
 Blink has no function overloading, so two `fn` declarations of one name are an error whatever their signatures. Neither one wins.
 
-The compiler reports `DuplicateModuleBinding` (E1016). Two other codes report the same rule for other pairs: `AmbiguousImport` (E1005) when two selective imports bind one name, and `DuplicateSymbol` (E1012) when a selective import and a declaration bind one name (§10.5 *Imported and Declared Names*). The code tells which pair collided; the rule is the same.
+The compiler reports `DuplicateModuleBinding` (E1016). Two other codes report the same rule for other pairs: `AmbiguousImport` (E1005) when two imports bind one name, and `DuplicateSymbol` (E1012) when an import and a declaration bind one name (§10.5 *Imported and Declared Names*). The code tells which pair collided; the rule is the same.
 
 ```blink
 // Valid — each name is unique in its namespace

@@ -40,7 +40,8 @@ nothing to type).
 but a *declaration* of a qualifier name (`import db` + `type db`, `fn db`, module `let db`) stays
 legal under the earlier E1012 decision. Minimalism's Q3.2 vote was conditional on this record naming
 a follow-up `type:spec` ticket for that pair; Systems, PLT, DevOps and AI/ML asked for the same
-ticket. It is filed.
+ticket. It is filed, and it is now settled: see
+[Module Qualifier and Module-Level Declaration](module-qualifier-declaration-collision.md).
 
 **Tooling note (agreed in Phase B, not voted).** `blink fmt` does not remove duplicate imports,
 because the check needs name resolution. The W0602 delete belongs to `blink fix` and the LSP.
