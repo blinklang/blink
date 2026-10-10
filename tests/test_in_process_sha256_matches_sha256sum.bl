@@ -1,0 +1,68 @@
+// A build hashes small files and its cache-key texts in process instead of starting
+// sha256sum. Every key on disk was made from sha256sum's hex digest, so the in-process digest
+// must be the same hex on every input: the FIPS vectors, each length around the padding edges,
+// bytes past 127 and NUL bytes, and a file of more than one block run.
+
+import sha256.{sha256_hex, sha256_bytes_hex, sha256_file_hex}
+
+let DIR = "build/in_process_sha256_probe"
+
+fn sha256sum_of(path: Str) -> Str {
+    process_run("sh", ["-c", "sha256sum < {path} | cut -c1-64"]).out.trim()
+}
+
+fn have_sha256sum() -> Bool {
+    shell_exec("command -v sha256sum >/dev/null 2>&1") == 0
+}
+
+test "the FIPS 180-4 vectors give their published digests" {
+    assert_eq(sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_eq(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    assert_eq(sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    assert_eq(sha256_hex("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"), "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1")
+}
+
+test "each length from 0 to 130 bytes matches sha256sum" {
+    if !have_sha256sum() { return }
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}")
+    let mut text = ""
+    let mut n = 0
+    let mut wrong: List[Str] = []
+    while n <= 130 {
+        write_file("{DIR}/len.txt", text)
+        let mine = sha256_hex(text)
+        let theirs = sha256sum_of("{DIR}/len.txt")
+        if mine != theirs { wrong.push("{n}: {mine} vs {theirs}") }
+        text = "{text}{(n % 10)}"
+        n = n + 1
+    }
+    assert_eq(wrong.join("\n"), "")
+}
+
+test "bytes past 127 and NUL bytes in a file match sha256sum" {
+    if !have_sha256sum() { return }
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}")
+    // Every byte value, three times over, with NULs a Str read would stop at.
+    shell_exec("for i in 1 2 3; do for b in $(seq 0 255); do printf \"\\\\$(printf %o $b)\"; done; done > {DIR}/all_bytes.bin")
+    let mut b = Bytes.new()
+    let mut i = 0
+    while i < 768 {
+        b.push(i % 256)
+        i = i + 1
+    }
+    let theirs = sha256sum_of("{DIR}/all_bytes.bin")
+    assert_eq(sha256_bytes_hex(b), theirs)
+    assert_eq(sha256_file_hex("{DIR}/all_bytes.bin") ?? "unread", theirs)
+}
+
+test "a file of more than a megabyte matches sha256sum" {
+    if !have_sha256sum() { return }
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}")
+    shell_exec("head -c 1500007 /dev/urandom > {DIR}/large.bin")
+    assert_eq(sha256_file_hex("{DIR}/large.bin") ?? "unread", sha256sum_of("{DIR}/large.bin"))
+}
+
+test "a file that cannot be read has no digest" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}")
+    assert((sha256_file_hex("{DIR}/missing.bin")).is_none(), "a missing file gave a digest")
+}
