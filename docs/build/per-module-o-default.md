@@ -1270,15 +1270,17 @@ and `cold-all` rows did not change, so the flag costs cc nothing.
 A build with no shell. A daemon build child of the small target started 44
 programs past the C toolchain for one body edit (strace): 18 `sh`, 5 `rm`,
 4 `sha256sum`, 3 `mkdir`, 3 `xargs`, 2 `mv`, and `awk`, `cat`, `cut`,
-`date`, `du`, `head`, `mktemp`, `nproc` and `touch` once each. It now hashes its units and keys in
-process (`src/sha256.bl`), makes, removes and renames its directories and
+`date`, `du`, `head`, `mktemp`, `nproc` and `touch` once each. It now
+hashes its units and keys in process (`src/sha256.bl`), makes, removes and renames its directories and
 touches its cache entries in process (`src/build_fs.bl`), and starts `cc` and
 the link with no `sh` when the command holds no byte `sh` would read as more
-than a word break. It still starts `du` (the cache is held to
-the blocks its files take, and the FFI cannot read a `stat`) and `ln` (the
-FFI cannot bind `link(2)`; this edit did not start it). A file over 1 MiB is hashed by `sha256sum`, run
-with no shell. The keys are the same bytes `sha256sum` gave, so a cache on
-disk still hits. The cache GC, past its cap, still lists by age in `sh`.
+than a word break. It still starts `du`: the cache is held to the blocks
+its files take, and the FFI cannot read a `stat`. A file over 1 MiB is
+hashed by `sha256sum`, run with no shell. The keys are the same bytes
+`sha256sum` gave, so a cache on disk still hits. The cache GC, past its cap,
+still lists by age in `sh`. The `82c21d3a` binary below linked the units it
+took from a record with one `ln`; the build now makes each link with
+`link(2)`.
 
 `task bench-edit-loop` with `BENCH_DAEMON=1 BENCH_SETTLE=1`, 11 reps, under
 `blink-gates.slice`, on the `82c21d3a` tree, alternating the gen1 `blink`
