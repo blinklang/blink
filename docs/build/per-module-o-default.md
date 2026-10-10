@@ -1236,6 +1236,37 @@ the rows. Median wall seconds, with the number of cc calls:
   cc time is the same as a body edit's.
 - No other row is slower than before outside its spread.
 
+The scan that reads whole identifiers outside strings and comments, and the
+`-Werror=implicit-function-declaration` flag, came after. The gen1 `blink`
+of `d4dd6cb4` (sha256 `8c19d135eb12dd4d`), same reps and slice, on the
+`d4dd6cb4` tree, in its own run after the one above; the `run3_d4dd6cb4`
+files hold the rows. Median wall seconds against `6735be43`:
+
+| target | case | 6735be43 | d4dd6cb4 | daemon 6735be43 | daemon d4dd6cb4 | cc |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.531 | 0.530 | 0.180 | 0.175 | 0 |
+| cli | body-cname | 0.798 | 0.801 | 0.536 | 0.559 | 1 |
+| cli | body-typecheck | 0.786 | 0.795 | 0.575 | 0.591 | 1 |
+| cli | pubfn-cname | 1.107 | 1.120 | 0.985 | 0.990 | 1 |
+| cli | privfn-cname | 1.109 | 1.125 | 0.974 | 1.006 | 1 |
+| cli | pubfn-typecheck | 0.996 | 1.026 | 0.880 | 0.908 | 1 |
+| cli | privfn-typecheck | 1.000 | 1.029 | 0.884 | 0.914 | 1 |
+| cli | run-body-cname | 0.803 | 0.807 | 0.577 | 0.584 | 1 |
+| cli | test-body-cname | 0.483 | 0.485 | 0.485 | 0.487 | 1 |
+| cli | cold-obj | 2.560 | 2.558 | 2.308 | 2.313 | 67 |
+| cli | cold-all | 4.940 | 4.950 | 4.960 | 4.959 | 68 |
+| small | nochange | 0.071 | 0.072 | 0.060 | 0.061 | 0 |
+| small | body-inventory | 0.119 | 0.119 | 0.114 | 0.113 | 1 |
+| small | pubfn-model | 0.111 | 0.111 | 0.103 | 0.105 | 1 |
+| small | privfn-model | 0.110 | 0.112 | 0.104 | 0.105 | 1 |
+| small | run-body-inventory | 0.121 | 0.120 | 0.113 | 0.113 | 1 |
+| small | test-body-inventory | 0.133 | 0.135 | 0.135 | 0.134 | 1 |
+| small | cold-obj | 0.121 | 0.120 | 0.111 | 0.110 | 5 |
+
+The cc calls did not change. A new fn costs about 0.03 s more, all of it
+in `emit_s`: the scan reads each unit one byte at a time. The `cold-obj`
+and `cold-all` rows did not change, so the flag costs cc nothing.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
