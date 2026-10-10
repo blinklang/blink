@@ -34,7 +34,7 @@ listen(70000)        // COMPILE ERROR: 70000 does not satisfy (self <= 65535)
 // When the value is dynamic, the compiler inserts a check at the boundary
 fn start_server(config: Config) ! Net {
     let port = config.port      // port is Int, not Port
-    listen(port)                // COMPILE ERROR: cannot prove config.port satisfies Port
+    listen(port)                // COMPILE ERROR (V0002): counterexample config.port = 0 does not satisfy Port
 }
 
 // Fix: validate at the boundary
@@ -123,7 +123,7 @@ The `@requires` clause is a promise by the caller: "I guarantee this condition h
 
 ```blink
 fn example(items: List[Str]) {
-    get_unchecked(items, 0)     // COMPILE ERROR: cannot prove 0 < items.len()
+    get_unchecked(items, 0)     // COMPILE ERROR (V0002): counterexample items = [] violates 0 < items.len()
 }
 
 fn safe_example(items: NonEmpty[Str]) {

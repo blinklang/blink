@@ -255,6 +255,7 @@ Info diagnostics never fail a build. They are silent in terminal output by defau
 
 | Name | Code | One-line | Category | Spec ref |
 |------|------|----------|----------|----------|
+| ContractProven | V0001 | The solver proved a contract; it has no runtime check | Contract verification | §3b.4 |
 | ContractRuntimeChecked | V0004 | A contract's outcome is Unknown and it has a runtime check; the source is `default`, `explicit` or `inherited(Trait.method)` | Contract verification | §3b.4 |
 
 ---

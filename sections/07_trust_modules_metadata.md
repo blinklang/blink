@@ -1500,7 +1500,7 @@ At these boundaries, `@requires` violations are routed through the `Validation` 
 
 Users can swap the validation handler via `with custom_handler { server.serve() }` to customize the response format (422, JSON:API, localized messages) without modifying handler code.
 
-For internal function calls (Blink calling Blink), the compiler still attempts static proof. If it can prove the caller always satisfies the callee's `@requires`, no runtime check is emitted. If it cannot prove it, a warning is emitted and a runtime assertion is inserted — same as the standard contract behavior described in the contracts section.
+For internal function calls (Blink calling Blink), the compiler still attempts static proof. If it can prove the caller always satisfies the callee's `@requires`, no runtime check is emitted. If the outcome is Unknown, the callee gets the default runtime check at its entry (§3b.4).
 
 ### 9.3 Injection Safety — `Template[C]` Parameterized Queries
 
