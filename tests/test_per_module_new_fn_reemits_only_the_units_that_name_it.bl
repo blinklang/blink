@@ -1,0 +1,124 @@
+// A new fn changes the interface of its module and adds a declaration to its header, but a
+// unit of another module reads neither unless its sources name the fn. So after a new pub fn
+// in the module every module imports, or a new private fn in a leaf module, a per-module
+// build emits only the unit of the edited module and the entry unit, and takes the rest from
+// the last build. A new fn that another module's edit starts to call re-emits that module's
+// unit too. Each build runs with BLINK_EMIT_REUSE_VERIFY=1, so every header and unit it
+// writes or takes is byte-equal to a cold emit, and the binary prints what the program says.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"new_fn_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub fn pair_left[T](a: T, b: T) -> T {"#,
+        #"    a"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{pair_left, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    tag("mid {pair_left(2, 9)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn other() -> Str {"#,
+        #"    tag("other")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import other.{other}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {other()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both and the module filters.
+fn build(tree: Str) -> ProcessResult {
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace, in
+// name order.
+fn reused_units(r: ProcessResult) -> Str {
+    let lines = "{r.out}\n{r.err_out}".split("\n")
+    let mut out: List[Str] = []
+    for m in ["base", "leaf", "mid", "other"] {
+        if lines.contains("[dbg:build.units] reuse unit {m}") { out.push(m) }
+    }
+    out.join(",")
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+test "a new fn re-emits only the units whose sources name it or changed" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_new_fn_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build(tree)
+    append(tree, "base.bl", "pub fn added_pub() -> Int \{\n    1\n}\n")
+    let new_pub = reused_units(build(tree))
+    append(tree, "leaf.bl", "fn added_private() -> Int \{\n    2\n}\n")
+    let new_private = reused_units(build(tree))
+    append(tree, "base.bl", "pub fn added_called() -> Str \{\n    \"c\"\n}\n")
+    edit(tree, "mid.bl", #"s/import base.{pair_left, tag}/import base.{added_called, pair_left, tag}/; s/"mid /"mid {added_called()} /"#)
+    let new_called = reused_units(build(tree))
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq("new pub fn in base: {new_pub}", "new pub fn in base: leaf,mid,other")
+    assert_eq("new private fn in leaf: {new_private}", "new private fn in leaf: base,mid,other")
+    assert_eq("new fn in base that mid calls: {new_called}", "new fn in base that mid calls: leaf,other")
+    assert_eq(out, "[main] [mid c 2] [other] [leaf]")
+}

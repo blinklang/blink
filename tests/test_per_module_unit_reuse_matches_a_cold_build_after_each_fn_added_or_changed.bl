@@ -1,0 +1,148 @@
+// A per-module build that takes some units from the last build and keeps some of its headers
+// writes, after each edit that adds, moves, removes or changes a fn, the units and headers a
+// cold build of the same program writes, byte for byte, and the binaries print the same. The
+// edits cover the cases where a new fn reaches a unit that does not name it: a new tuple type
+// in the types header, a new instance of a generic another module homes, a name a string
+// holds, a new fn that a module's edit starts to call in the same build, and a new type, which
+// changes what is not a fn.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"fn_edit_cold_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub fn pair_left[T](a: T, b: T) -> T {"#,
+        #"    a"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{pair_left, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    tag("mid {pair_left(2, 9)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn other() -> Str {"#,
+        #"    tag("other")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import other.{other}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {other()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both and the module filters.
+fn build_into(tree: Str, out: Str, verify: Bool) -> ProcessResult {
+    let v = if verify { "BLINK_EMIT_REUSE_VERIFY=1 " } else { "" }
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE {v}BLINK_CACHE_DIR={tree}/objcache build/blink build app/src/main.bl -o {tree}/{out}/app --per-module"])
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+type Step {
+    what: Str
+    differ: Str
+    warm_out: Str
+    cold_out: Str
+}
+
+// The warm build into out/ against a cold build into a fresh cold/, by the files of their
+// units directories and by what their binaries print.
+fn warm_and_cold(tree: Str, what: Str) -> Step {
+    let _warm = build_into(tree, "out", true)
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, "cold", false)
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    Step { what: what, differ: differ.split("\n").join(" "), warm_out: sh("{tree}/out/app"), cold_out: sh("{tree}/cold/app") }
+}
+
+test "units and headers match a cold build after each fn added, moved, removed or changed" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_fn_edit_cold_{getpid()}"
+    dev_tree(root, tree)
+    let mut steps: List[Step] = []
+    steps.push(warm_and_cold(tree, "first build"))
+    append(tree, "base.bl", "pub fn added_last() -> Int \{\n    1\n}\n")
+    steps.push(warm_and_cold(tree, "pub fn appended to base"))
+    write_file("{tree}/app/src/base.bl", "pub fn added_first() -> Int \{\n    0\n}\n\n{read_file("{tree}/app/src/base.bl")}")
+    steps.push(warm_and_cold(tree, "pub fn put first in base, which moves every other fn"))
+    append(tree, "base.bl", "pub fn added_called() -> Str \{\n    \"c\"\n}\n")
+    edit(tree, "other.bl", #"s/import base.{tag}/import base.{added_called, tag}/; s/tag("other")/tag("other {added_called()}")/"#)
+    steps.push(warm_and_cold(tree, "new fn in base and its first call in other"))
+    append(tree, "leaf.bl", "pub fn leaf_pair() -> (Int, Str, Bool) \{\n    (1, \"p\", true)\n}\n")
+    edit(tree, "main.bl", #"s/import leaf.{leaf_value}/import leaf.{leaf_pair, leaf_value}/; s/{leaf_value()}/{leaf_value()} {leaf_pair().1}/"#)
+    steps.push(warm_and_cold(tree, "new fn in leaf that returns a new tuple type"))
+    append(tree, "base.bl", "pub fn wrap_twice[T](a: T) -> List[T] \{\n    [a, a]\n}\n")
+    edit(tree, "mid.bl", #"s/import base.{pair_left, tag}/import base.{pair_left, tag, wrap_twice}/; s/"mid /"mid {wrap_twice(7.5).len()} /"#)
+    steps.push(warm_and_cold(tree, "new generic fn in base and its first instance from mid"))
+    edit(tree, "base.bl", #"/^pub fn added_last() -> Int {$/,/^}$/d"#)
+    steps.push(warm_and_cold(tree, "fn removed from base"))
+    append(tree, "base.bl", "fn other_value() -> Int \{\n    4\n}\n")
+    edit(tree, "leaf.bl", #"s/tag("leaf")/tag("leaf other_value")/"#)
+    steps.push(warm_and_cold(tree, "private fn named like a word a string in leaf holds"))
+    append(tree, "base.bl", "pub type Added \{\n    n: Int\n}\n\npub fn added_n() -> Int \{\n    Added \{ n: 6 }.n\n}\n")
+    steps.push(warm_and_cold(tree, "new type in base"))
+    edit(tree, "base.bl", #"s/    "\[{s}\]"/    "<{s}>"/"#)
+    steps.push(warm_and_cold(tree, "body of a fn every module calls"))
+    shell_exec("rm -rf {tree}")
+    for s in steps {
+        assert_eq("{s.what}: {s.differ}", "{s.what}: ")
+        assert_eq("{s.what}: {s.warm_out}", "{s.what}: {s.cold_out}")
+    }
+    assert_eq(steps.get(0).unwrap().warm_out, "[main] [mid 2] [other] [leaf]")
+    assert_eq(steps.get(steps.len() - 1).unwrap().warm_out, "<main> <mid 2 2> <other c> <leaf other_value> p")
+}
