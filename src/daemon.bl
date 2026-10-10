@@ -8,6 +8,7 @@ import parser.{Parse, parser_want_interface_text}
 import typecheck.{TypeCheck}
 import std.libc.{Pollfd, poll, read_bytes}
 import check_pipeline.{FrontEndReport, check_source_reporting, checked_inputs_changed, checked_inputs_reset, checked_probes_changed, checked_input_files, check_exit_code, check_status_line}
+import build_objcache.{sorted_strs}
 
 effect Daemon {
     effect Serve
@@ -299,6 +300,126 @@ fn daemon_accept_own(fd: Int, timeout_ms: Int) -> Int ! IO {
         return -1
     }
     client_fd
+}
+
+// The compiler this process runs and the environment it runs under, as /proc names them, for
+// the daemon to compare with its own; None where /proc can not say, or where the peer check is
+// not supported, and the caller hashes them in a shell instead. It starts no process, as a
+// client pays for each one on every build.
+//
+// The compiler is the device and inode its image is mapped from, with the size and mtime of
+// that inode. The device and inode alone tell a changed compiler only because the kernel
+// refuses a write to a file a process runs (ETXTBSY): the daemon runs its compiler for as long
+// as it lives, so a rebuild or a copy reaches the daemon's path only as another inode,
+// whatever its size and mtime, and the kernel gives that inode number to no other file while
+// the daemon holds it. The size and mtime are kept for a file system that does not refuse the
+// write.
+//
+// The environment goes whole, not hashed, as the runtime has no hash safe from collisions. It
+// goes only where the peer check is supported, as the client then sends it to no other user's
+// daemon (daemon_send), and the daemon only compares it. Each variable is one record after its
+// length, so no value can stand for two variables, and the records are sorted, as a shell
+// lists them in an order that changes as it sets them. /proc holds the environment the process
+// started with; nothing before this call changes it.
+pub fn daemon_proc_identity(compiler: Str) -> Option[Str] ! IO {
+    if !daemon_peer_check_supported() { return None }
+    let image = match daemon_mapped_image(compiler) {
+        Some(s) => s
+        None => return None
+    }
+    let environ = match daemon_read_all("/proc/self/environ") {
+        Some(b) => b
+        None => return None
+    }
+    let mut vars: List[Str] = []
+    let n = environ.len()
+    let mut start = 0
+    let mut i = 0
+    while i <= n {
+        if i == n || environ.get(i).unwrap() == 0 {
+            if i > start {
+                match environ.slice(start, i).to_str() {
+                    Ok(v) => {
+                        if !daemon_shell_own_var(v) { vars.push(v) }
+                    }
+                    Err(_) => return None
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    let mut sb = StringBuilder.new()
+    sb.write("{image} {daemon_file_size("/proc/self/exe")} {file_mtime("/proc/self/exe")}\n")
+    for v in sorted_strs(vars) {
+        sb.write("{v.byte_len()}\n{v}\n")
+    }
+    Some(sb.to_str())
+}
+
+// A shell keeps these for itself, as the command it ran, how deep it runs and the directory it
+// was in, so two shells differ in them, and a build reads none of them. PWD differs in each
+// directory of a project; a build request carries it, and the daemon's build sets it.
+fn daemon_shell_own_var(v: Str) -> Bool {
+    v.starts_with("_=") || v.starts_with("SHLVL=") || v.starts_with("OLDPWD=") || v.starts_with("PWD=")
+}
+
+// "<dev> <inode>" of the file mapped at offset 0 from path, from /proc/self/maps.
+fn daemon_mapped_image(path: Str) -> Option[Str] ! IO {
+    let maps = match daemon_read_all("/proc/self/maps") {
+        Some(b) => b
+        None => return None
+    }
+    let text = match maps.to_str() {
+        Ok(t) => t
+        Err(_) => return None
+    }
+    // Each line is "<address> <perms> <offset> <dev> <inode>", then spaces and the path, which
+    // may itself hold a space.
+    for line in text.lines() {
+        let mut fields: List[Str] = []
+        let mut rest = line
+        while fields.len() < 5 {
+            rest = rest.trim_left()
+            match rest.byte_index_of(" ", 0) {
+                Some(at) => {
+                    fields.push(rest.byte_slice(0, at))
+                    rest = rest.byte_slice(at + 1, rest.byte_len())
+                }
+                None => break
+            }
+        }
+        if fields.len() == 5 && fields.get(2).unwrap() == "00000000" && rest.trim_left() == path {
+            return Some("{fields.get(3).unwrap()} {fields.get(4).unwrap()}")
+        }
+    }
+    None
+}
+
+// The whole of a file whose size stat does not give, as for a file under /proc.
+fn daemon_read_all(path: Str) -> Option[Bytes] ! IO {
+    let mut file = -1
+    with ffi.scope() as scope {
+        file = daemon_open(scope.cstr(path), 0.to_i32()).to_int()
+    }
+    if file < 0 {
+        return None
+    }
+    let mut all = Bytes.new()
+    loop {
+        match read_bytes(file, 65536) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                all = all.concat(b)
+            }
+            Err(_) => {
+                unix_socket_close(file)
+                return None
+            }
+        }
+    }
+    unix_socket_close(file)
+    Some(all)
 }
 
 fn daemon_not_served(why: Str) -> Str {

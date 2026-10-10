@@ -73,7 +73,7 @@ import diagnostics.{
     embedded_inner_key,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
 }
-import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send}
+import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send, daemon_proc_identity}
 import docgen.{generate_doc}
 import lsp.{lsp_start}
 import comment_attach.{attach_comments_pass}
@@ -3780,13 +3780,18 @@ fn daemon_may_build(a: Args) -> Bool {
 // and the directory it was in, so two shells differ in them, and a build reads none of them.
 // PWD is left out as each directory of a project has its own; the request carries it, and
 // the daemon's build sets it.
-// The variables are sorted, since a shell lists them in an order that changes as it sets
+// Where /proc names both (daemon_proc_identity), no process starts. Elsewhere one shell hashes
+// both. The variables are sorted, since a shell lists them in an order that changes as it sets
 // them, and a build reads no order. They are sorted as NUL-ended records, as a value may hold
 // a newline; an env without -0 lists them unsorted, so the order then counts, and a client in
-// another order builds cold. One shell hashes both, as each process costs a build its start.
-fn daemon_identity() -> Str {
-    let unset = "-u _ -u SHLVL -u OLDPWD -u PWD"
+// another order builds cold.
+fn daemon_identity() -> Str ! IO {
     let compiler = archive_compiler_path()
+    match daemon_proc_identity(compiler) {
+        Some(id) => return "{get_arg(0)}\n{compiler}\n{id}"
+        None => {}
+    }
+    let unset = "-u _ -u SHLVL -u OLDPWD -u PWD"
     let hashes = process_run("sh", ["-c", "{SHA256SUM_SH}sha256sum '{compiler}' 2>/dev/null; \{ env -0 {unset} 2>/dev/null || env {unset}; } | LC_ALL=C sort -z | sha256sum"]).out.trim()
     "{get_arg(0)}\n{compiler}\n{hashes}"
 }
@@ -4869,6 +4874,9 @@ fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, IO, Lex.Tokenize, Pa
         }
     }
     io.println("Daemon starting on {daemon_socket_path()}")
+    // Each build child is a fork of the daemon and keys its objects by this hash. The daemon
+    // builds only for a client that runs this compiler, so no child needs to hash it again.
+    let _ = process_compiler_sha()
     // The daemon checks with the settings a build with no flags applies.
     match daemon_start(daemon_source, daemon_identity(), front_settings(false), emit_reuse_allowed(), max_entries) {
         Some(b) => build_in_daemon_child(b)
