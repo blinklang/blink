@@ -1,0 +1,176 @@
+// The daemon builds only for a client that runs its own compiler. A compiler rebuilt at the same
+// path, or copied there with `cp -p`, can have the same size and the same mtime as the one the
+// daemon runs, and still differ in its bytes. Such a client builds cold, and gets what a cold
+// build gives.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp -p {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_same_stat_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/main.bl", [
+        #"fn main() {"#,
+        #"    io.println("main")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it serves only a client whose env is its own.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache"
+}
+
+fn client(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+// Stops the daemon and each worker it started, by pid.
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let workers = sh("pgrep -P {pid}").split("\n").join(" ")
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || break; sleep 0.05; done; kill -9 {pid} 2>/dev/null; for w in {workers}; do kill -9 $w 2>/dev/null; done; true")
+}
+
+// A field of `daemon status`, such as "builds", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = client(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// What a command printed, with its tree's path and a build's private units directory's random
+// name spelled the same in every tree.
+fn plain(tree: Str, s: Str) -> Str {
+    let t = s.replace(tree, "TREE")
+    let mut out = ""
+    let mut rest = t
+    loop {
+        match rest.byte_index_of(".units.", 0) {
+            Some(at) => {
+                let end = if at + 13 <= rest.byte_len() { at + 13 } else { rest.byte_len() }
+                out = "{out}{rest.byte_slice(0, at)}.units.XXXXXX"
+                rest = rest.byte_slice(end, rest.byte_len())
+            }
+            None => break
+        }
+    }
+    "{out}{rest}"
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{a.out}{a.err_out}\n-- vs --\n{b.out}{b.err_out}" }
+    if plain(a_tree, a.out) != plain(b_tree, b.out) { return "stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if plain(a_tree, a.err_out) != plain(b_tree, b.err_out) { return "stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// What two trees' last builds left that differs: a C file of the units, or the program.
+fn output_differ(a_tree: Str, b_tree: Str) -> Str {
+    sh("cd {b_tree}/app/out/app.units && for f in *.c *.h; do cmp -s $f {a_tree}/app/out/app.units/$f || echo $f; done; cd {a_tree}/app/out/app.units && for f in *.c *.h; do [ -e {b_tree}/app/out/app.units/$f ] || echo extra:$f; done; cmp -s {a_tree}/app/out/app {b_tree}/app/out/app || echo program").split("\n").join(" ")
+}
+
+fn build(tree: Str) -> ProcessResult {
+    client(tree, "build src/main.bl -o out/app")
+}
+
+// Writes build/blink.new: the compiler the daemon started with, build/blink.orig, with one byte
+// of its .comment note set to `mark`, so it runs the same and has the same size and mtime.
+fn changed_copy(tree: Str, mark: Str) -> Str {
+    let b = "{tree}/build"
+    sh("cp {b}/blink.orig {b}/blink.new && at=$(grep -boa 'GCC: (' {b}/blink.orig | head -1 | cut -d: -f1) && [ -n \"$at\" ] && printf {mark} | dd of={b}/blink.new bs=1 seek=$at conv=notrunc status=none && touch -r {b}/blink.orig {b}/blink.new && echo ok")
+}
+
+// "same" when two files have the same size and mtime, to the nanosecond, and differ in bytes.
+fn same_stat_other_bytes(a: Str, b: Str) -> Str {
+    sh("[ \"$(stat -c '%s %y' {a})\" = \"$(stat -c '%s %y' {b})\" ] && ! cmp -s {a} {b} && echo same")
+}
+
+test "a compiler with the size and mtime of the daemon's own builds cold" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_same_stat_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_same_stat_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    for t in [warm, cold] { shell_exec("cp -p {t}/build/blink {t}/build/blink.orig") }
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut builds: List[Str] = []
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        let d = differ(warm, build(warm), cold, build(cold))
+        if d != "" { problems.push("same: {d}") }
+        builds.push("same={served(warm, "builds")}")
+        // A rebuild writes a new file and renames it over the old one, as a linker or an
+        // install does, since a running binary can not be written.
+        for t in [warm, cold] {
+            assert_eq(changed_copy(t, "H"), "ok")
+            assert_eq(same_stat_other_bytes("{t}/build/blink.new", "{t}/build/blink.orig"), "same")
+            shell_exec("mv {t}/build/blink.new {t}/build/blink")
+        }
+        let r = differ(warm, build(warm), cold, build(cold))
+        if r != "" { problems.push("rebuilt: {r}") }
+        let ro = output_differ(warm, cold)
+        if ro != "" { problems.push("rebuilt: {ro}") }
+        builds.push("rebuilt={served(warm, "builds")}")
+        // `cp -p` keeps the mtime. Where the running binary can not be written, it writes a
+        // new file in its place.
+        for t in [warm, cold] {
+            assert_eq(changed_copy(t, "J"), "ok")
+            assert_eq(same_stat_other_bytes("{t}/build/blink.new", "{t}/build/blink.orig"), "same")
+            shell_exec("cp -p {t}/build/blink.new {t}/build/blink 2>/dev/null || cp -p --remove-destination {t}/build/blink.new {t}/build/blink")
+            assert_eq(same_stat_other_bytes("{t}/build/blink", "{t}/build/blink.orig"), "same")
+        }
+        let c = differ(warm, build(warm), cold, build(cold))
+        if c != "" { problems.push("copied with cp -p: {c}") }
+        let co = output_differ(warm, cold)
+        if co != "" { problems.push("copied with cp -p: {co}") }
+        builds.push("copied with cp -p={served(warm, "builds")}")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    assert_eq(problems.join("\n"), "")
+    assert_eq(builds.join(", "), "same=1, rebuilt=1, copied with cp -p=1")
+}
