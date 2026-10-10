@@ -40,6 +40,7 @@
 #   nochange             (c) rebuild with no edit
 #   body-<module>        (a) private-body edit: one line added to a private fn
 #   pubfn-<module>       (b) a new pub fn added at the end of a module
+#   privfn-<module>      a new private fn added at the end of a module
 #   run-body-<module>    `blink run` after the (a) edit
 #   test-body-<module>   `blink test <one test file>` after the (a) edit (debug build)
 #   cold-obj             (d) obj cache cleared; std archive kept
@@ -136,7 +137,7 @@ export PATH="$work/.bench/bin:$PATH"
 # Target table: tgt_<field>_<target>. warm() checks each file and fn, so a rename fails loudly.
 tgt_dir_cli=.;                 tgt_src_cli=src/cli.bl;  tgt_test_cli=tests/test_cname_mono_types.bl
 tgt_body_cli="src/cname.bl:strip_blink src/typecheck.bl:tc_variant_enum_decl_node"
-tgt_pub_cli=src/cname.bl
+tgt_pub_cli="src/cname.bl src/typecheck.bl"
 tgt_coldall_cli=1
 # The compiler tests compile probes in process, and the probe finds lib/std through
 # BLINK_ROOT, as under task ci. It names the same root blink finds from its own path.
@@ -220,6 +221,7 @@ edit_body() {
     sed -i "/^fn $fn(/a\\    let _bench_edit = \"$nonce\"" "$f"
 }
 edit_pub() { printf '\npub fn bench_added_%s() -> Int { 1 }\n' "$2" >> "$1"; }
+edit_priv() { printf '\nfn bench_added_%s() -> Int { 1 }\n' "$2" >> "$1"; }
 
 # rep <target> <case> <rep> <c file> <kind> [file fn]: one timed run, appended to $raw.
 rep() {
@@ -230,6 +232,7 @@ rep() {
     case "$kind" in
         body|run|test) edit_body "$dir/$efile" "$efn" "$nonce" ;;
         pub) edit_pub "$dir/$efile" "$nonce" ;;
+        priv) edit_priv "$dir/$efile" "$nonce" ;;
         cold-obj) rm -rf "$dir/build/obj-cache" ;;
         cold-all)
             rm -rf "$dir/build/obj-cache"
@@ -285,7 +288,7 @@ c_sha() {
 # warm <target>: build, run and test once so every later case starts warm; sets base shas.
 warm() {
     local target=$1 dir=$work/$(tv dir "$1") f
-    for f in $(tv body "$target") "$(tv pub "$target"):-"; do
+    for f in $(tv body "$target") $(tv pub "$target"); do
         f=${f%%:*}
         [ -f "$dir/$f" ] || die "$target: no file $f"
         cp "$dir/$f" "$work/.bench/orig/$target-$(stem "$f").bl"
@@ -364,8 +367,10 @@ for target in ${BENCH_TARGETS:-cli small}; do
         f=${spec%%:*} fn=${spec#*:}
         run_case "$target" "body-$(modname "$f")" body "$bc" changed "$base_build" "$f" "$fn"
     done
-    pf=$(tv pub "$target")
-    run_case "$target" "pubfn-$(modname "$pf")" pub "$bc" changed "$base_build" "$pf"
+    for pf in $(tv pub "$target"); do
+        run_case "$target" "pubfn-$(modname "$pf")" pub "$bc" changed "$base_build" "$pf"
+        run_case "$target" "privfn-$(modname "$pf")" priv "$bc" changed "$base_build" "$pf"
+    done
     first=$(tv body "$target" | cut -d' ' -f1)
     f=${first%%:*} fn=${first#*:}
     run_case "$target" "run-body-$(modname "$f")" run "$bc" changed "$base_build" "$f" "$fn"
