@@ -22,7 +22,7 @@ b.insert(1, "x")
 |---|---|---|
 | Q1 Map entry order | Sort entries by `key.debug()` text (UTF-8 bytes); on equal key text, by `value.debug()` text. No `Ord` bound | 6-0 |
 | Q2 Debug/Eq law | Unchecked contract like `Hash`/`Eq`: `a == b` must give `a.debug() == b.debug()`; derived `Debug` obeys it when `Eq` is also derived; a hand `impl` of either must keep them in agreement | 6-0 |
-| Q3 Float zero sign | Named as the one built-in exception: `-0.0 == 0.0` but they may render differently. Float output does not change | 6-0 |
+| Q3 Float zero sign | Named as the one built-in exception: `-0.0 == 0.0` but they may render differently. Float output does not change. *Superseded by [Float Text Form](float-display-form.md): `-0.0` renders as `0.0`, so no built-in exception remains* | 6-0 |
 | Q4 Iteration | `keys()`, `values()` and `for` keep iteration order; only `debug()` sorts | 6-0 |
 | Q5 Example | `Map[Int, Str]` example `{1: "a", 10: "c", 2: "b"}` beside Set `{1, 10, 2}` | 6-0 |
 | Q6 Layout | One shared *Set and Map order* paragraph that points back to the law | 6-0 |

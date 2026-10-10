@@ -282,6 +282,8 @@ let vowels = "hello".chars().filter(fn(c) { "aeiou".contains("{c}") }).collect()
 
 `parse_int` and `parse_float` are methods on `Str` rather than standalone functions. They give a discoverable, grep-able API surface.
 
+`parse_float` accepts every text that `Float.display()` can produce, including `NaN`, `inf` and `-inf`. It rounds to nearest, ties to even, so `x.display().parse_float() == Ok(x)` for every `Float` (§3.6 *Float Text Form*). The decimal mark is always `.`, and the result does not depend on the locale.
+
 ```blink
 let port = "8080".parse_int()?                      // Ok(8080)
 let rate = "3.14".parse_float()?                     // Ok(3.14)
@@ -3584,10 +3586,9 @@ impl Eq for Tag {
 ```
 
 The `Set` and `Map` debug order (*Container Debug Rendering*) depends on this law: when it holds for
-the elements, keys and values, equal containers render the same text. `Float` is the one built-in
-exception. `-0.0 == 0.0` is true, but the two may render differently, so a `Map[Int, Float]` that
-maps 1 to `0.0` equals one that maps 1 to `-0.0`, but their `debug()` texts may differ. Only this
-case lets a value that holds a `Float` break the law.
+the elements, keys and values, equal containers render the same text. Every built-in type obeys the
+law. `Float` renders `-0.0` as `0.0` and every NaN as `NaN` (§3.6 *Float Text Form*), so two
+`Float` values that `==` calls equal render the same text.
 
 `Result.unwrap` and `Result.unwrap_err` also require `Debug` on the arm they panic on, and their
 panic text ends with that payload's `debug()` (§7.5). A change to a type's `Debug` format therefore
@@ -3833,6 +3834,55 @@ let q: Template[DB] = "SELECT * FROM users WHERE id = {id} AND name = {name}"
 The set of types valid as Template values is compiler-known: `Int` and the narrower integers `I8`, `I16`, `I32`, `U8`, `U16`, `U32` (widened to `Int`), `Float` and `F32` (widened to `Float`), `Bool`, `Str`, `Bytes`, and `Option[T]` where `T` is one of these (`None` becomes `TemplateValue.Null`). `Option[Option[T]]` is not valid. Any other type in a Template interpolation is `error[TemplateHoleType]` at typecheck, with repairs that keep the value a parameter (§3b.5 *Template Values*). The `Raw(expr)` marker type bypasses decomposition for a specific interpolation (see §3b.5).
 
 This separation is critical: calling `Display.display()` first and then decomposing the resulting `Str` would defeat `Template[C]`'s injection safety by losing type information and forcing all values through string round-tripping.
+
+##### Float Text Form
+
+`Float.display()` returns the text below, and `Float.debug()` returns the same text (§3.6.1 *Scalar debug-forms*). The spec fixes the output, not the algorithm. Ryu, Schubfach and Dragonbox all compute these digits.
+
+1. **NaN.** Every NaN renders as `NaN`. The text does not show the sign or the payload bits.
+2. **Infinity.** Positive infinity renders as `inf`, and negative infinity renders as `-inf`.
+3. **Zero.** `0.0` and `-0.0` both render as `0.0`.
+4. **Digits.** For any other finite `x`, choose digits d₁…dₙ (d₁ ≠ 0, dₙ ≠ 0) and an integer k so that the decimal value is d₁.d₂…dₙ × 10ᵏ:
+   - n is the smallest count for which an n-digit decimal converts back to `x` under IEEE 754 binary64 round-to-nearest, ties-to-even.
+   - If more than one n-digit decimal converts back to `x`, take the one nearest the exact value of `x`.
+   - If two are equally near, take the one whose last digit is even.
+5. **Layout.** Write `-` first when `x < 0`. Then:
+   - When −4 ≤ k < 16, write the digits in plain form, with the decimal point placed by k. Add zeros so there is at least one digit on each side of `.`. Write no trailing zeros after `.`, except the one `0` that an integer value needs (`1.0`, `100.0`).
+   - When k < −4 or k ≥ 16, write d₁, then `.`, then d₂…dₙ (or `0` when n is 1), then `e`, then `-` when k < 0, then the magnitude of k in decimal. The exponent has no `+` and no leading zeros (`1.0e16`, `1.5e-7`, `5.0e-324`).
+6. **Fixed characters.** The decimal mark is always `.`, and the text has no digit grouping. The output depends on neither the locale nor the C library.
+
+Every finite output matches `-? DIGITS '.' DIGITS ('e' '-'? DIGITS)?`. It always contains `.`, so a `Float` never renders as text that reads as an `Int`. This keeps `[1.0, 2.0].debug()` apart from `[1, 2].debug()`, and keeps a `Float` written as a JSON number a `JsonValue.Float` when `json.parse` reads it back (§3.6.2).
+
+```blink
+fn main() {
+    let big = 10000000000000000.0
+    let tiny = 0.00001
+    io.println(0.1.display())                // 0.1
+    io.println((0.1 + 0.2).display())        // 0.30000000000000004
+    io.println(1.0.display())                // 1.0
+    io.println((1.0 / 3.0).display())        // 0.3333333333333333
+    io.println(123456789.0.display())        // 123456789.0
+    io.println(9007199254740993.0.display()) // 9007199254740992.0
+    io.println(big.display())                // 1.0e16
+    io.println(0.0001.display())             // 0.0001
+    io.println(tiny.display())               // 1.0e-5
+    io.println((-0.0).display())             // 0.0
+    io.println((0.0 / 0.0).display())        // NaN
+    io.println((-1.0 / 0.0).display())       // -inf
+    io.println([1.0, 2.5].debug())           // [1.0, 2.5]
+}
+```
+
+**Laws.** For all `x` and `y` of type `Float`:
+
+- **Round trip.** `x.display().parse_float() == Ok(x)`, with `==` as in *Float Total Ordering*. This holds for NaN and for `-0.0` too.
+- **One text per value.** `x == y` exactly when `x.display() == y.display()`.
+
+The text does not show the sign of zero or the bits of a NaN, because no `Float` equality tells those values apart. To test the sign of zero, use `1.0 / x < 0.0`.
+
+**One form everywhere.** Every place that Blink, its standard library or the `blink` toolchain writes a finite `Float` as decimal text uses this form, unless this spec names a different form for that place. Such places include `display()`, `debug()`, string interpolation, power-assert values (§2.20), JSON number output (§3.6.2) and test-runner output (§8.10). A form that is not decimal text, such as a bit pattern, is outside this rule. How JSON encodes NaN and the infinities belongs to §3.6.2, not to this rule.
+
+**F32.** Whenever an `F32` renders as text, it uses the same rules, with the digits chosen for IEEE 754 binary32 in place of binary64. An `F32` that holds `0.1` renders as `0.1`. The same value widened to `Float` renders as `0.10000000149011612`, because it is a different `Float`. This rule does not add `F32` to the built-in `Display` impls.
 
 ##### Product Type Codegen (Structs)
 
