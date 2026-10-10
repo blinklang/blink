@@ -1,0 +1,94 @@
+// A client tells the daemon the environment it runs under, which can hold tokens and keys, and
+// the daemon builds and runs what a client asks. So no other user may reach a daemon socket,
+// whatever the umask the daemon starts under, and a .blink/ left open by an older daemon is
+// closed when a new one starts.
+
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn project(tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/src")
+    write_file("{tree}/blink.toml", "[package]\nname = \"daemon_closed_dir_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/src/main.bl", [
+        #"fn main() {"#,
+        #"    io.println("main")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The pid of a daemon started under umask in tree, once its own socket and its first worker's
+// are up, or -1. The timeout ends a daemon that nothing stopped.
+fn start_daemon(root: Str, tree: Str, umask: Str) -> Int {
+    shell_exec("cd {tree} && (umask {umask}; env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE timeout 300 {root}/build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/.blink/daemon.sock ] && ls {tree}/.blink/w*/daemon.sock >/dev/null 2>&1 && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+// Stops the daemon and each worker it started, by pid.
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let workers = sh("pgrep -P {pid}").split("\n").join(" ")
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || break; sleep 0.05; done; kill -9 {pid} 2>/dev/null; for w in {workers}; do kill -9 $w 2>/dev/null; done; true")
+}
+
+// Each directory under .blink/ that is not 700, and each socket that its group or others may
+// use, by mode and name relative to tree.
+fn open_to_others(tree: Str) -> Str {
+    let lines = sh("cd {tree} && stat -c '%F %a %n' .blink .blink/w* .blink/daemon.sock .blink/w*/daemon.sock 2>&1")
+    let mut open: List[Str] = []
+    for line in lines.split("\n") {
+        let dir = line.starts_with("directory ")
+        let sock = line.starts_with("socket ")
+        if dir {
+            if !line.starts_with("directory 700 ") { open.push(line) }
+        } else if sock {
+            let mode = line.byte_slice(7, line.byte_len()).split(" ").get(0).unwrap()
+            if !mode.ends_with("00") { open.push(line) }
+        } else {
+            open.push(line)
+        }
+    }
+    open.join(" | ")
+}
+
+test "under umask 000 the daemon's directories and sockets are its user's alone" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_daemon_closed_umask_{getpid()}"
+    project(tree)
+    let pid = start_daemon(root, tree, "000")
+    let mut open = "not checked"
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        open = open_to_others(tree)
+    }
+    shell_exec("rm -rf {tree}")
+    assert_eq(open, "")
+}
+
+test "a .blink made open to its group before is closed when the daemon starts" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_daemon_closed_old_dir_{getpid()}"
+    project(tree)
+    shell_exec("mkdir -m 775 {tree}/.blink")
+    assert_eq(sh("stat -c %a {tree}/.blink"), "775")
+    let pid = start_daemon(root, tree, "002")
+    let mut open = "not checked"
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        open = open_to_others(tree)
+    }
+    shell_exec("rm -rf {tree}")
+    assert_eq(open, "")
+}

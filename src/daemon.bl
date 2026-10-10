@@ -6,8 +6,9 @@ import std.path.{path_join, path_dirname}
 import lexer.{Lex}
 import parser.{Parse, parser_want_interface_text}
 import typecheck.{TypeCheck}
-import std.libc.{Pollfd, poll}
+import std.libc.{Pollfd, poll, read_bytes}
 import check_pipeline.{FrontEndReport, check_source_reporting, checked_inputs_changed, checked_inputs_reset, checked_probes_changed, checked_input_files, check_exit_code, check_status_line}
+import build_objcache.{sorted_strs}
 
 effect Daemon {
     effect Serve
@@ -150,10 +151,12 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
     let stats = if checked_inputs_changed(daemon_source_path) { [] } else { taken }
     si_reset()
     si_build(program, daemon_source_path, "main")
-    // Each check leaves its whole working set as garbage, and the GC, sized by a few early
-    // collections, may grow the heap rather than collect it. Every build child is a fork of
-    // this heap, and pays for the garbage it carries: a collection here, where the check is
-    // all that stays live, keeps each fork as small as the program it builds.
+    // Each check leaves its whole working set as garbage. Whether libgc collects it or grows
+    // the heap instead is not stable: it turns on how much the last collections freed, so
+    // the same edit can leave a small heap or a large one. Every build child is a fork of
+    // this heap, and pays for the garbage it carries, so the worker forces the collection
+    // here, where the check is all that stays live, and each fork is as small as the
+    // program it builds.
     daemon_gc_collect()
     DaemonCheck {
         human: diag_render(0),
@@ -192,6 +195,231 @@ fn daemon_file_size(path: Str) -> Int ! IO {
         }
     }
     size
+}
+
+// ── Access ──────────────────────────────────────────────────────────
+
+// A client sends the daemon the environment it runs under, and the daemon builds and runs
+// what a client asks, so each daemon directory and socket is its user's alone, whatever the
+// umask. An existing directory is closed too, as an older daemon may have made it open to
+// its group. Only the daemon uses .blink/, so closing it takes nothing from anyone. False
+// when the directory is not the user's to close.
+fn daemon_private_dir(path: Str) -> Bool ! IO {
+    let mut ok = false
+    with ffi.scope() as scope {
+        let p = scope.cstr(path)
+        // 448 is 0700. An existing directory makes mkdir fail; the chmod decides.
+        let _ = daemon_mkdir(p, 448.to_u32())
+        ok = daemon_chmod(p, 448.to_u32()).to_int() == 0
+    }
+    ok
+}
+
+// A socket listening at path that only its user may connect to: 384 is 0600. The directory
+// it is in is closed already; this closes the socket where a directory can not be.
+fn daemon_listen_private(path: Str) -> Int ! IO {
+    let fd = unix_socket_listen(path)
+    if fd < 0 { return fd }
+    let mut ok = false
+    with ffi.scope() as scope {
+        ok = daemon_chmod(scope.cstr(path), 384.to_u32()).to_int() == 0
+    }
+    if !ok {
+        unix_socket_close(fd)
+        return -1
+    }
+    fd
+}
+
+// Whether SOL_SOCKET is 1 and SO_PEERCRED is 17 here. The FFI can not read a C macro, and the
+// values differ by arch: SO_PEERCRED is 21 on powerpc and 18 on mips. They were checked
+// against the C headers for x86_64 and aarch64 Linux. The arch is the one this binary is built
+// for, from its ELF header, which /proc/self/exe holds on every Linux; a 32-bit build on a
+// 64-bit kernel has its own. It is read on each ask, an open and a read of 20 bytes, and not
+// kept in a module-level `let mut`, as scripts/ratchet.sh holds their count from going up.
+fn daemon_peer_check_supported() -> Bool ! IO {
+    let mut file = -1
+    with ffi.scope() as scope {
+        file = daemon_open(scope.cstr("/proc/self/exe"), 0.to_i32()).to_int()
+    }
+    if file < 0 { return false }
+    let mut known = false
+    match read_bytes(file, 20) {
+        Ok(h) => {
+            // "\x7fELF", 64-bit, little-endian, then e_machine at 18: 62 is x86_64, 183 aarch64.
+            if h.len() == 20 && h.get(0).unwrap() == 127 && h.get(1).unwrap() == 69 && h.get(2).unwrap() == 76 && h.get(3).unwrap() == 70 && h.get(4).unwrap() == 2 && h.get(5).unwrap() == 1 {
+                let machine = h.get(18).unwrap() + h.get(19).unwrap() * 256
+                known = machine == 62 || machine == 183
+            }
+        }
+        Err(_) => {}
+    }
+    unix_socket_close(file)
+    known
+}
+
+// The uid of the process at the other end of a Unix socket, or None where the peer check is
+// not supported or the kernel did not say. struct ucred is pid, uid and gid, 4 bytes each, on
+// every Linux; the length the kernel gives back is checked all the same. The uid is read
+// little-endian, as the check is supported only on little-endian arches.
+pub fn daemon_peer_uid(fd: Int) -> Option[Int] ! IO {
+    if !daemon_peer_check_supported() { return None }
+    let cred = Bytes.zeroed(12)
+    let mut rc = -1
+    let mut len = 0
+    with ffi.scope() as scope {
+        let len_cell = scope.alloc[U32]()
+        len_cell.write(12.to_u32())
+        rc = cred.with_ptr(fn(p) -> I32 { daemon_getsockopt(fd.to_i32(), 1.to_i32(), 17.to_i32(), p, len_cell) }).to_int()
+        len = len_cell.deref().to_int()
+    }
+    if rc != 0 || len != 12 { return None }
+    Some(cred.get(4).unwrap() + cred.get(5).unwrap() * 256 + cred.get(6).unwrap() * 65536 + cred.get(7).unwrap() * 16777216)
+}
+
+pub fn daemon_own_uid() -> Int {
+    daemon_getuid().to_int()
+}
+
+// Whether the daemon may serve a connection: one from its own user, or any where the peer
+// check is not supported, as there only the closed directory keeps others out.
+fn daemon_peer_allowed(fd: Int) -> Bool ! IO {
+    if !daemon_peer_check_supported() { return true }
+    match daemon_peer_uid(fd) {
+        Some(uid) => uid == daemon_own_uid()
+        None => false
+    }
+}
+
+// A connection accepted on fd within timeout_ms that the daemon may serve, or -1. Another
+// user's connection is closed unread.
+fn daemon_accept_own(fd: Int, timeout_ms: Int) -> Int ! IO {
+    let client_fd = unix_socket_accept_timeout(fd, timeout_ms)
+    if client_fd >= 0 && !daemon_peer_allowed(client_fd) {
+        unix_socket_close(client_fd)
+        return -1
+    }
+    client_fd
+}
+
+// The compiler this process runs and the environment it runs under, as /proc names them, for
+// the daemon to compare with its own; None where /proc can not say, or where the peer check is
+// not supported, and the caller hashes them in a shell instead. It starts no process, as a
+// client pays for each one on every build.
+//
+// The compiler is the device and inode its image is mapped from, with the size and mtime of
+// that inode. The device and inode alone tell a changed compiler only because the kernel
+// refuses a write to a file a process runs (ETXTBSY): the daemon runs its compiler for as long
+// as it lives, so a rebuild or a copy reaches the daemon's path only as another inode,
+// whatever its size and mtime, and the kernel gives that inode number to no other file while
+// the daemon holds it. The size and mtime are kept for a file system that does not refuse the
+// write.
+//
+// The environment goes whole, not hashed, as the runtime has no hash safe from collisions. It
+// goes only where the peer check is supported, as the client then sends it to no other user's
+// daemon (daemon_send), and the daemon only compares it. Each variable is one record after its
+// length, so no value can stand for two variables, and the records are sorted, as a shell
+// lists them in an order that changes as it sets them. /proc holds the environment the process
+// started with; nothing before this call changes it.
+pub fn daemon_proc_identity(compiler: Str) -> Option[Str] ! IO {
+    if !daemon_peer_check_supported() { return None }
+    let image = match daemon_mapped_image(compiler) {
+        Some(s) => s
+        None => return None
+    }
+    let environ = match daemon_read_all("/proc/self/environ") {
+        Some(b) => b
+        None => return None
+    }
+    let mut vars: List[Str] = []
+    let n = environ.len()
+    let mut start = 0
+    let mut i = 0
+    while i <= n {
+        if i == n || environ.get(i).unwrap() == 0 {
+            if i > start {
+                match environ.slice(start, i).to_str() {
+                    Ok(v) => {
+                        if !daemon_shell_own_var(v) { vars.push(v) }
+                    }
+                    Err(_) => return None
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    let mut sb = StringBuilder.new()
+    sb.write("{image} {daemon_file_size("/proc/self/exe")} {file_mtime("/proc/self/exe")}\n")
+    for v in sorted_strs(vars) {
+        sb.write("{v.byte_len()}\n{v}\n")
+    }
+    Some(sb.to_str())
+}
+
+// A shell keeps these for itself, as the command it ran, how deep it runs and the directory it
+// was in, so two shells differ in them, and a build reads none of them. PWD differs in each
+// directory of a project; a build request carries it, and the daemon's build sets it.
+fn daemon_shell_own_var(v: Str) -> Bool {
+    v.starts_with("_=") || v.starts_with("SHLVL=") || v.starts_with("OLDPWD=") || v.starts_with("PWD=")
+}
+
+// "<dev> <inode>" of the file mapped at offset 0 from path, from /proc/self/maps.
+fn daemon_mapped_image(path: Str) -> Option[Str] ! IO {
+    let maps = match daemon_read_all("/proc/self/maps") {
+        Some(b) => b
+        None => return None
+    }
+    let text = match maps.to_str() {
+        Ok(t) => t
+        Err(_) => return None
+    }
+    // Each line is "<address> <perms> <offset> <dev> <inode>", then spaces and the path, which
+    // may itself hold a space.
+    for line in text.lines() {
+        let mut fields: List[Str] = []
+        let mut rest = line
+        while fields.len() < 5 {
+            rest = rest.trim_left()
+            match rest.byte_index_of(" ", 0) {
+                Some(at) => {
+                    fields.push(rest.byte_slice(0, at))
+                    rest = rest.byte_slice(at + 1, rest.byte_len())
+                }
+                None => break
+            }
+        }
+        if fields.len() == 5 && fields.get(2).unwrap() == "00000000" && rest.trim_left() == path {
+            return Some("{fields.get(3).unwrap()} {fields.get(4).unwrap()}")
+        }
+    }
+    None
+}
+
+// The whole of a file whose size stat does not give, as for a file under /proc.
+fn daemon_read_all(path: Str) -> Option[Bytes] ! IO {
+    let mut file = -1
+    with ffi.scope() as scope {
+        file = daemon_open(scope.cstr(path), 0.to_i32()).to_int()
+    }
+    if file < 0 {
+        return None
+    }
+    let mut all = Bytes.new()
+    loop {
+        match read_bytes(file, 65536) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                all = all.concat(b)
+            }
+            Err(_) => {
+                unix_socket_close(file)
+                return None
+            }
+        }
+    }
+    unix_socket_close(file)
+    Some(all)
 }
 
 fn daemon_not_served(why: Str) -> Str {
@@ -289,6 +517,22 @@ fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
 @ffi("open", header: "fcntl.h")
 @trusted(audit: "Wraps open(2) with no mode. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY or O_WRONLY, 0 and 1 on every host.")
 fn daemon_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+
+@ffi("mkdir", header: "sys/stat.h")
+@trusted(audit: "Wraps mkdir(2). path is a NUL-terminated copy from ffi.scope(); mode is 0700.")
+fn daemon_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
+
+@ffi("chmod", header: "sys/stat.h")
+@trusted(audit: "Wraps chmod(2). path is a NUL-terminated copy from ffi.scope(); mode is 0700 or 0600.")
+fn daemon_chmod(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
+
+@ffi("getsockopt", header: "sys/socket.h")
+@trusted(audit: "Wraps getsockopt(2) for SO_PEERCRED only, on an arch whose SOL_SOCKET and SO_PEERCRED values were checked. value is a 12-byte Bytes buffer pinned by with_ptr, the size of struct ucred; len is one U32 cell that holds 12.")
+fn daemon_getsockopt(fd: I32, level: I32, name: I32, value: Ptr[U8], len: Ptr[U32]) -> I32 ! FFI {}
+
+@ffi("getuid", header: "unistd.h")
+@trusted(audit: "Wraps getuid(2). It takes nothing and can not fail.")
+fn daemon_getuid() -> U32 ! FFI {}
 
 @ffi("lseek", header: "unistd.h")
 @trusted(audit: "Wraps lseek(2). fd is one daemon_open returned; whence is fixed to SEEK_END, 2 on every host.")
@@ -716,11 +960,11 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
                     }
                 }
                 if builds.child.is_some() {
-                    client_fd = unix_socket_accept_timeout(daemon_socket_fd, 1)
+                    client_fd = daemon_accept_own(daemon_socket_fd, 1)
                 }
             }
             None => {
-                client_fd = unix_socket_accept_timeout(daemon_socket_fd, 500)
+                client_fd = daemon_accept_own(daemon_socket_fd, 500)
                 if client_fd < 0 {
                     daemon_recheck_if_changed()
                 }
@@ -899,8 +1143,10 @@ fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, c
     let name = "w{router}-{r.next}"
     r.next = r.next + 1
     let dir = path_join(daemon_dir(), name)
-    shell_exec("mkdir -p {dir}")
-    let fd = unix_socket_listen(path_join(dir, "daemon.sock"))
+    if !daemon_private_dir(dir) {
+        return (r, None, "the daemon could not make {dir} private to its user")
+    }
+    let fd = daemon_listen_private(path_join(dir, "daemon.sock"))
     let chan = if fd >= 0 { unix_socket_connect(path_join(dir, "daemon.sock")) } else { -1 }
     if chan < 0 {
         if fd >= 0 { unix_socket_close(fd) }
@@ -1283,7 +1529,7 @@ fn daemon_route_wait(route: DaemonRoute, wait: Int) -> (DaemonRoute, Int) ! IO {
     if polled.get(0).unwrap().revents.to_int() == 0 {
         return (r, -1)
     }
-    (r, unix_socket_accept_timeout(daemon_socket_fd, 0))
+    (r, daemon_accept_own(daemon_socket_fd, 0))
 }
 
 // Holds the stop and sends it to the workers. The router replies to it once it has reaped
@@ -1451,11 +1697,13 @@ pub fn daemon_socket_path() -> Str {
 
 // Sends request on fd, a connection to the project's daemon, closes fd, and returns the reply,
 // or "" when none came. The router replies to a check, build or query with the name of the
-// worker that serves its entry, and the request goes there once. A worker that is gone by
-// then, or a second redirect, gives "", and the client runs cold.
-pub fn daemon_send(fd: Int, request: Str) -> Str {
+// worker that serves its entry, and the request goes there once. A socket another user
+// listens on, a worker that is gone by then, or a second redirect gives "", and the client
+// runs cold.
+pub fn daemon_send(fd: Int, request: Str) -> Str ! IO {
     let line = request.concat("\n")
-    if socket_write(fd, line) < 0 {
+    // A request carries the client's environment, so a socket another user listens on gets none.
+    if !daemon_peer_allowed(fd) || socket_write(fd, line) < 0 {
         unix_socket_close(fd)
         return ""
     }
@@ -1469,7 +1717,7 @@ pub fn daemon_send(fd: Int, request: Str) -> Str {
     if worker_fd < 0 {
         return ""
     }
-    if socket_write(worker_fd, line) < 0 {
+    if !daemon_peer_allowed(worker_fd) || socket_write(worker_fd, line) < 0 {
         unix_socket_close(worker_fd)
         return ""
     }
@@ -1502,7 +1750,10 @@ pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: B
     daemon_start_time = time_ms()
 
     let blink_dir = daemon_dir()
-    shell_exec("mkdir -p {blink_dir}")
+    if !daemon_private_dir(blink_dir) {
+        io.eprintln("daemon: could not make {blink_dir} private to its user")
+        return None
+    }
 
     // Write PID file
     daemon_pid_path = path_join(blink_dir, "daemon.pid")
@@ -1511,7 +1762,7 @@ pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: B
 
     // Create Unix socket
     daemon_sock_path = daemon_socket_path()
-    daemon_socket_fd = unix_socket_listen(daemon_sock_path)
+    daemon_socket_fd = daemon_listen_private(daemon_sock_path)
     if daemon_socket_fd < 0 {
         io.eprintln("daemon: failed to create socket at {daemon_sock_path}")
         return None
