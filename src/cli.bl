@@ -48,7 +48,7 @@ import compiler.{
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc,
 }
-import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names}
+import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
 import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
@@ -1611,6 +1611,8 @@ type CompiledUnits {
     // header key, for the record.
     order: Str
     header_keys: Map[Str, Str]
+    // The key of the facts the entry unit read that no source span carries, for the record.
+    entry_key: Str
 }
 
 // A build reuses or records units only when the emit would print nothing: no trace but the
@@ -1667,7 +1669,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 }
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
-                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys })
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key })
             }
             None => {}
         }
@@ -1675,7 +1677,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     dbg_trace("build.units", "emit")
     let entries_before = diag_entry_count()
     let ice_before = diag_ice_count
-    let facts = program_facts(program)
+    let facts = program_facts(program, cfg)
     let unit_modules = archive_unit_modules(program, cfg)
     let urc = units_bail_on_diag()
     if urc != 0 { return Err(urc) }
@@ -1689,13 +1691,24 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
         Err(rc) => return Err(rc)
     }
     let mut taken: Option[emit_record.TakenUnits] = None
+    // The entry key of this build when it took the entry unit, which it then does not emit.
+    let mut taken_entry_key = ""
     match last {
         Some(lb) => {
-            let mut candidates: List[Str] = []
-            for m in unit_modules {
-                if m != "__main__" { candidates.push(m) }
+            taken = emit_record.take_units(lb, dir, unit_modules, hs.files, hs.texts, hs.order, hs.kept)
+            match taken {
+                Some(t) => {
+                    if units_hold_module(t.units, "__main__") {
+                        taken_entry_key = entry_unit_key(program, facts, sources)
+                        if taken_entry_key != lb.rec.entry_key {
+                            dbg_trace("build.units", "skip unit __main__: the facts of the whole program it reads differ")
+                            taken = Some(emit_record.without_unit(t, "__main__"))
+                            taken_entry_key = ""
+                        }
+                    }
+                }
+                None => {}
             }
-            taken = emit_record.take_units(lb, dir, candidates, hs.files, hs.texts, hs.order, hs.kept)
         }
         None => {}
     }
@@ -1750,6 +1763,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 Err(rc) => return Err(rc)
             }
             by_module = Map()
+            taken_entry_key = ""
             for m in unit_modules {
                 match emit_unit(program, m, cfg, facts, hs, sources, dir, chunk_decls) {
                     Ok(u) => by_module.insert(m, u)
@@ -1769,6 +1783,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 if !held {
                     // Another build replaced the last units directory after this one read its
                     // record, so what it took may be of two builds. It emits them after all.
+                    taken_entry_key = ""
                     for u in t.units {
                         dbg_trace("build.units", "emit unit {u.module} again")
                         for f in emit_record.unit_files(u) { fs_remove("{dir}/{f.stem}.c") }
@@ -1796,6 +1811,10 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             None => {}
         }
     }
+    let mut entry_key = taken_entry_key
+    if entry_key == "" && inputs != "" && by_module.contains_key("__main__") {
+        entry_key = entry_unit_key(program, facts, sources)
+    }
     if verify {
         let vrc = verify_against_cold_emit(program, modules, cfg, out, dir, chunk_decls)
         if vrc != 0 { return Err(vrc) }
@@ -1803,7 +1822,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys })
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key })
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
@@ -1828,7 +1847,7 @@ fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, uni
 }
 
 fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, vdir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO {
-    let facts = program_facts(program)
+    let facts = program_facts(program, cfg)
     let hs = match write_unit_headers(program, modules, cfg, facts, vdir, true, None) {
         Ok(h) => h
         Err(rc) => return rc
@@ -1869,8 +1888,11 @@ fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: Lis
             return 1
         }
         for f in cold_files {
-            if read_file("{vdir}/{f}.c") != read_file("{dir}/{f}.c") {
-                io.eprintln("error: emit reuse verify: unit {f} is not the unit a cold emit writes")
+            let cold_text = read_file("{vdir}/{f}.c")
+            let built_text = read_file("{dir}/{f}.c")
+            if cold_text != built_text {
+                let why = emit_record.verify_differ_reason(m, units.get(ui).unwrap().uses, cold.get(ui).unwrap().uses, built_text, cold_text)
+                io.eprintln("error: emit reuse verify: unit {f} is not the unit a cold emit writes: {why}")
                 return 1
             }
             dbg_trace("build.units", "verify unit {f} same")
@@ -1942,6 +1964,35 @@ fn emit_unit(program: Int, m: Str, cfg: CgConfig, facts: ProgramFacts, hs: UnitH
         i = i + 1
     }
     Ok(emit_record.EmittedUnit { module: m, c_bytes: head.c_bytes, headers: head.headers, uses: unit_uses(m, sources), chunks: chunks })
+}
+
+fn units_hold_module(units: List[emit_record.EmittedUnit], m: Str) -> Bool {
+    for u in units {
+        if u.module == m { return true }
+    }
+    false
+}
+
+// The sha of what the entry unit's text reads of the whole program with no source span to key
+// it: the facts entry_unit_facts gives, the init names its shim calls, and the source of the
+// node each key table is written from, whose position the table's lowering spans.
+fn entry_unit_key(program: Int, facts: ProgramFacts, sources: UnitSources) -> Str ! Diag.Report {
+    // No unit is being emitted, so nothing read here is a unit's.
+    ir_track_sources([], [])
+    let mut lines = entry_unit_facts(program, facts)
+    for n in facts.entry_init_fns { lines.push("init {n}") }
+    for node in facts.key_table_nodes { lines.push("table_source {source_of_node(sources, node)}") }
+    sha256_hex(lines.join("\n"))
+}
+
+// The path of the source whose node range holds node, or "-".
+fn source_of_node(sources: UnitSources, node: Int) -> Str {
+    let mut i = 0
+    while i < sources.paths.len() {
+        if node >= sources.firsts[i] && node < sources.ends[i] { return sources.paths[i] }
+        i = i + 1
+    }
+    "-"
 }
 
 // The mean number of decls in each file a large module's unit is cut into, or 0 to cut
@@ -2019,7 +2070,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
         match shas {
             Some(s) => {
-                let _ = emit_record.write_record(work, compiled.inputs, compiled.units, s, compiled.order, compiled.header_keys)
+                let _ = emit_record.write_record(work, compiled.inputs, compiled.units, s, compiled.order, compiled.header_keys, compiled.entry_key)
             }
             None => {}
         }
@@ -4179,7 +4230,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         exit(1)
     }
 
-    let facts = program_facts(final_program)
+    let facts = program_facts(final_program, mod_cfg)
     let hs = match write_unit_headers(final_program, modules, mod_cfg, facts, out_dir, false, None) {
         Ok(h) => h
         Err(rc) => {

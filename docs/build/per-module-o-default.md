@@ -219,7 +219,7 @@ asks for the one-unit build.
   unit costs no extra process, and a unit the build emits is never linked
   to the last build's file. Each taken unit, and the copied text, is
   hashed against the record. When one differs, the build emits every
-  taken unit again. The `__main__` unit and the other units are emitted.
+  taken unit again. Each unit the build does not take is emitted.
   The trace prints `reuse unit <module>` for each unit taken.
 - **Reuse verify.** `BLINK_EMIT_REUSE_VERIFY=1` makes each per-module
   build, also one that takes nothing from the last build, emit the whole
@@ -1402,13 +1402,63 @@ groups:
   build compares byte for byte. A new tuple type therefore makes the
   build take nothing;
 - the preamble marks come from the same walk as the types header;
-- `program_spawns`, the test table and every key table reach only
-  `__main__`, which the build emits each time.
+- `program_spawns`, the test table, every key table and the init calls
+  reach only `__main__`. The build takes `__main__` only when its entry
+  key is the last build's (see "The entry unit across an edit").
 
 An entry that is in none of these groups makes the build take nothing.
 
 A source that declares an effect is read by every unit, so an edit there
 emits every unit again. This was so before this change.
+
+#### What `__main__` reads
+
+`emit_module_head` writes `__main__` from the parts below, sorted into
+the same groups.
+
+(a) Reset for each unit:
+
+- `__main__` starts from `begin_unit`, as every unit does;
+- `program_facts` finds the init names before the build emits a unit. It
+  lowers the globals of every module, throws the lowering away, and calls
+  `begin_unit` again. The `__main__` emit therefore lowers no code of
+  another module, and no closure, walker or typedef of that lowering can
+  reach its text.
+
+(b) Named from content:
+
+- the key tables (`kops_table`, from the key type);
+- the effect fields `ue_<root>` and the default ops;
+- the init calls, `__blink_init_globals_<module>`;
+- the C symbol of each test.
+
+(c) Compared or keyed:
+
+- the evidence storage: the vtable typedef, the default and the `ue_`
+  field of each effect. A new or changed effect is an item other than a
+  fn or an import, so the build takes nothing;
+- its own globals and their init fn, from its own source;
+- the init calls. A global of another module that changes between a
+  constant and a run-time initializer adds or removes a call. Its
+  initializer is an item other than a fn, so the build takes nothing, and
+  the `init` lines of the entry key hold the names too;
+- `main`, spawns, tests and key table names: the entry key;
+- a new key type: the types header;
+- the eq and hash of each key table, lowered with the span of the node
+  the table is written from: the unit marks that node's source, and the
+  entry key holds it (`table_source`);
+- the generic private copies it prints: their nodes mark their sources;
+- `cfg`: the inputs text.
+
+A test in an imported module does not reach `__main__`: `blink test`
+builds each file with its own tests as the entry. The test is still an
+item other than a fn, so the build takes nothing.
+
+Some edits emit `__main__` again with the same text. A second Map with a
+key type that a Map in an earlier source already has moves the node the
+table is written from. A body edit in a source that declares an effect
+changes a source the unit reads. Each costs one emit of `__main__`, and
+each build is byte-equal to a cold build.
 
 #### Bench
 
@@ -1443,6 +1493,103 @@ A new fn now costs about what a body edit costs: on cli the four fn rows
 drop from 0.82-0.94 s to 0.49-0.52 s. The body rows drop by 19-35 ms,
 about the time the headers took: 47-51 ms before, 21-28 ms now. No row is
 slower outside its spread.
+
+### The entry unit across an edit
+
+Before this change, the build emitted `__main__` each time. On cli that
+cost 63-69 ms of each body edit through the daemon: 53-59 ms to generate,
+9 ms to splice, 1 ms to write a 2.66 MB file.
+
+`__main__` could not be taken because its uses list held every source.
+`module_init_fn_names` lowers the globals of every module to find the
+modules with a global set at run time, and throws the lowering away.
+That lowering ran in the `__main__` emit and marked each source as read
+by the unit. It now runs in `program_facts`, before any unit, and also
+stops the marks while it runs (`ir_sources_pause` and
+`ir_sources_resume` in `src/ir.bl`). On cli the uses list of `__main__`
+drops to `src/cli.bl` and `lib/std/list.bl`.
+
+`__main__` also reads facts of the whole program that no source span
+carries. The record keeps their sha256 in a line `entry <sha>` (schema
+`emit-record-8`). The key is made of these lines, in order:
+
+- `main <bool>` and `spawns <bool>` (`program_spawns`);
+- `test <C symbol> <length> <name>` for each test;
+- `table <name>` for each key table;
+- `init <name>` for each init call of the shim;
+- `table_source <path>` for the source of the node each key table is
+  written from.
+
+`take_units` checks `__main__` as it checks any unit. When it takes
+`__main__`, the build makes the key again and drops the unit unless the
+key is the record's. The trace then prints `skip unit __main__: the facts
+of the whole program it reads differ`. A record with no entry line keeps
+`__main__` from being taken.
+
+Other checks also catch a change to the `test` and `table` lines. Only
+the entry module's tests reach the program, so a new test changes the
+entry source, which `__main__` reads. A new key type changes the types
+header, so the build takes nothing.
+
+`program_facts` finds the init names once, about 7 ms on cli. The
+`__main__` emit calls them and the key holds them from that one list, so
+the two cannot differ by how they were found.
+
+Under `BLINK_EMIT_REUSE_VERIFY=1`, a unit that is not byte-equal to its
+cold emit fails the build with the reason: each source the cold emit
+read that the unit did not mark or, for `__main__` with no such source,
+that the entry key leaves out a fact of the whole program. The error
+also gives the first line that differs.
+
+`hash_place` (27-32 ms) and the types header (about 10 ms) are not cut:
+`hash_place` hashes `runtime.h`, `libblink_std.h` and each unit file the
+link needs, and a taken file is checked against the record.
+
+#### Bench
+
+Through the daemon, settle 1 s, 11 reps, median seconds (min-max). Base
+and the change ran in turn: base, change, base, change. Base is gen1 of
+`5ec0de2e` (sha256 `4d9d9460…`), the change is gen1 of `ab1aed21`
+(sha256 `e851cf84…`). `bench/edit_loop/unit_entry_daemon_settle1_*.tsv`
+hold the full rows. Every C hash check reads 11/11.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.142 (0.136-0.155) | 0.140 (0.136-0.149) | 0.139 (0.135-0.154) | 0.143 (0.138-0.154) |
+| cli | body-cname | 0.459 (0.447-0.474) | 0.418 (0.400-0.434) | 0.458 (0.431-0.483) | 0.414 (0.397-0.425) |
+| cli | body-typecheck | 0.494 (0.473-0.503) | 0.453 (0.447-0.464) | 0.494 (0.480-0.505) | 0.452 (0.436-0.459) |
+| cli | pubfn-cname | 0.496 (0.482-0.602) | 0.446 (0.429-0.565) | 0.481 (0.473-0.599) | 0.439 (0.429-0.561) |
+| cli | privfn-cname | 0.492 (0.483-0.502) | 0.440 (0.427-0.451) | 0.485 (0.465-0.503) | 0.445 (0.431-0.462) |
+| cli | pubfn-typecheck | 0.520 (0.510-0.533) | 0.469 (0.460-0.482) | 0.508 (0.501-0.529) | 0.470 (0.451-0.485) |
+| cli | privfn-typecheck | 0.520 (0.499-0.529) | 0.471 (0.457-0.484) | 0.509 (0.502-0.519) | 0.469 (0.459-0.484) |
+| cli | run-body-cname | 0.481 (0.471-0.626) | 0.446 (0.422-0.578) | 0.478 (0.464-0.624) | 0.426 (0.416-0.583) |
+| cli | test-body-cname | 0.449 (0.442-0.454) | 0.452 (0.442-0.455) | 0.448 (0.445-0.458) | 0.448 (0.443-0.463) |
+| cli | cold-obj | 2.265 (2.247-2.416) | 2.275 (2.253-2.375) | 2.245 (2.236-2.407) | 2.259 (2.228-2.334) |
+| cli | cold-all | 4.948 (4.932-4.960) | 4.940 (4.918-4.952) | 4.921 (4.914-4.954) | 4.950 (4.931-4.989) |
+| small | nochange | 0.044 (0.043-0.046) | 0.045 (0.042-0.046) | 0.044 (0.042-0.046) | 0.043 (0.041-0.045) |
+| small | body-inventory | 0.086 (0.085-0.089) | 0.087 (0.084-0.090) | 0.085 (0.084-0.087) | 0.086 (0.084-0.088) |
+| small | pubfn-model | 0.077 (0.075-0.081) | 0.077 (0.076-0.079) | 0.079 (0.076-0.082) | 0.080 (0.077-0.081) |
+| small | privfn-model | 0.078 (0.076-0.080) | 0.078 (0.076-0.081) | 0.078 (0.076-0.080) | 0.078 (0.077-0.080) |
+| small | run-body-inventory | 0.088 (0.086-0.090) | 0.087 (0.085-0.090) | 0.086 (0.084-0.089) | 0.088 (0.084-0.091) |
+| small | test-body-inventory | 0.114 (0.112-0.119) | 0.113 (0.110-0.117) | 0.114 (0.112-0.116) | 0.114 (0.111-0.117) |
+| small | cold-obj | 0.083 (0.080-0.086) | 0.084 (0.081-0.087) | 0.084 (0.079-0.089) | 0.082 (0.079-0.083) |
+
+On cli the body and fn rows drop by 35-52 ms, which is most of the
+63-69 ms `__main__` emit but not all. One part left is the init names,
+which each build finds, about 7 ms on cli. small does not change: its
+`__main__` costs 0-1 ms. `test-body-cname` does not change; this bench
+does not split its emit. No row is slower outside its spread. An edit to
+the entry file still emits `__main__`.
+
+Finding the init names in `program_facts` instead of in the `__main__`
+emit and the take path does not change an edit build. The same bench ran
+`ab1aed21` (sha256 `e851cf84…`) and `a0b43999` (sha256 `3831bb98…`) in
+turn, four runs. On the body, fn and nochange rows the medians differ by
+22 ms at most, and not in one direction.
+`cold-all` on cli reads 4.995 and 4.992 s for `ab1aed21`, 5.063 and
+5.022 s for `a0b43999`: 30-70 ms slower, outside the spread in one of
+the two runs. small does not change.
+`bench/edit_loop/entry_facts_daemon_settle1_*.tsv` hold the full rows.
 
 ## Blockers before the default flipped
 

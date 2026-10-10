@@ -1,0 +1,114 @@
+// The entry unit reads facts of the whole program that no source span carries: whether any
+// body spawns a task, the test table, the key table of each tuple a Map or Set keys on, and
+// the init calls of the modules with a global set at run time. A per-module build that takes
+// the entry unit from the last build must see each of these change, so an edit that adds a
+// spawn, a new tuple-keyed Map or a new tuple-keyed Set to a body in another module, a test
+// to the entry file, or a line to the entry file's main emits the entry unit again. A plain
+// body edit in between shows the build takes it otherwise. Each build runs with
+// BLINK_EMIT_REUSE_VERIFY=1, so every unit it writes or takes is byte-equal to a cold emit,
+// and the binary prints what the program says.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"entry_fact_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub let NAMES: List[Str] = ["a", "b"]"#,
+        #""#,
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s} {NAMES.len()}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both and the module filters.
+fn build(tree: Str) -> ProcessResult {
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+fn took_entry(r: ProcessResult) -> Bool {
+    "{r.out}\n{r.err_out}".split("\n").contains("[dbg:build.units] reuse unit __main__")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+fn step(tree: Str, name: Str) -> Str {
+    let took = took_entry(build(tree))
+    "{name} {took} {sh("{tree}/out/app").replace("\n", "|")}"
+}
+
+test "an edit that changes a fact of the whole program emits the entry unit again" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_entry_fact_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build(tree)
+    let mut seen: List[Str] = []
+    edit(tree, "leaf.bl", #"s/tag("leaf")/tag("leaf {async.spawn(fn() -> Int { 41 + 1 }).await}")/"#)
+    seen.push(step(tree, "spawn"))
+    edit(tree, "leaf.bl", #"s/tag("leaf /tag("leaf: /"#)
+    seen.push(step(tree, "plain body"))
+    edit(tree, "leaf.bl", #"s/tag("leaf: /tag("leaf {pairs()} /"#)
+    append(tree, "leaf.bl", "fn pairs() -> Int \{\n    let mut m: Map[(Int, Str), Int] = Map()\n    m.insert((1, \"x\"), 3)\n    m.len()\n}\n")
+    seen.push(step(tree, "tuple-keyed map"))
+    edit(tree, "leaf.bl", #"s/^    m.len()$/    let mut s: Set[(Str, Bool)] = Set()\n    s.insert(("y", true))\n    m.len() + s.len()/"#)
+    seen.push(step(tree, "tuple-keyed set"))
+    append(tree, "main.bl", "test \"main tag\" \{\n    assert_eq(tag(\"t\"), \"[t 2]\")\n}\n")
+    seen.push(step(tree, "test"))
+    edit(tree, "main.bl", #"s/^fn main() {$/fn main() {\n    io.println("start")/"#)
+    seen.push(step(tree, "entry body"))
+    shell_exec("rm -rf {tree}")
+    assert_eq(seen.join("\n"), [
+        "spawn false [main 2] [leaf 42 2]",
+        "plain body true [main 2] [leaf: 42 2]",
+        "tuple-keyed map false [main 2] [leaf 1 42 2]",
+        "tuple-keyed set false [main 2] [leaf 2 42 2]",
+        "test false [main 2] [leaf 2 42 2]",
+        "entry body false start|[main 2] [leaf 2 42 2]",
+    ].join("\n"))
+}
