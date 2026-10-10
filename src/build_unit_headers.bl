@@ -1,62 +1,92 @@
-// build_unit_headers.bl: which program headers each unit of the per-module build includes.
+// build_unit_headers.bl: which program declarations each unit of the per-module build holds.
 //
-// A unit includes a module's header when its text names a symbol that header declares, and
-// no other. Its imports do not answer this. A module imported for a type alone needs no
-// header, since every type is in the types header that every module header includes. And a
-// unit names symbols of modules it never imports: a method of a type it got through another
-// module, the init function of every module from the entry unit, an instance it calls of a
-// generic declared elsewhere.
+// A unit holds the declaration of each symbol its text names, and no other, written into the
+// unit itself in place of the module headers. Its imports do not answer this. A module
+// imported for a type alone needs no declaration, since every type is in the types header that
+// every unit includes. And a unit names symbols of modules it never imports: a method of a type
+// it got through another module, the init function of every module from the entry unit, an
+// instance it calls of a generic declared elsewhere.
 //
-// Leaving a header out can never compile to wrong code: C rejects a call to an undeclared
-// function and a read of an undeclared name, so a missed header is a build error. The scan
-// can only err the other way, on a name that merely looks like a symbol, and that costs no
-// more than one header too many.
+// The declarations are written into the unit, not included from the module headers, because
+// the object cache keys a unit on the bytes it compiles. A header holds every declaration of a
+// module, so an added pub fn would change the key of every unit that includes it. A unit's own
+// declarations, so the C a unit compiles changes only when a declaration it uses changes.
+//
+// Leaving a declaration out can never compile to wrong code: C rejects a call to an undeclared
+// function and a read of an undeclared name, so a missed declaration is a build error. The scan
+// can only err the other way, on a name that merely looks like a symbol, and that costs no more
+// than one declaration too many.
 
 pub type HeaderIndex {
     // Every header that declares a symbol, by the symbol.
     by_symbol: Map[Str, List[Str]]
-    // The headers a scan cannot vouch for, which every unit includes.
+    // The headers a scan cannot vouch for, which every unit includes whole.
     always: List[Str]
+    // Each other header's declarations, in the order the header has them.
+    decls: Map[Str, List[Decl]]
+}
+
+pub type Decl {
+    name: Str
+    line: Str
+}
+
+// What a unit holds of the module headers: an include of each header in `whole`, then each
+// line of `lines`.
+pub type UnitDecls {
+    whole: List[Str]
+    lines: List[Str]
 }
 
 // Every program symbol has this in its name, so the scan looks only at the words that do. A
 // header that declares a name without it is put in `always`.
 fn symbol_mark() -> Str { "blink" }
 
-// The index of `texts`, the headers named by `names` at the same position.
-pub fn index_headers(names: List[Str], texts: List[Str]) -> HeaderIndex {
+// The index of `texts`, the headers named by `names` at the same position. `types` is the
+// types header, the one include a header may hold and still be read line by line.
+pub fn index_headers(names: List[Str], texts: List[Str], types: Str) -> HeaderIndex {
     let mut by_symbol: Map[Str, List[Str]] = Map()
     let mut always: List[Str] = []
+    let mut decls: Map[Str, List[Decl]] = Map()
     let mut i = 0
     while i < names.len() {
         let name = names.get(i).unwrap()
-        match declared_names(texts.get(i).unwrap()) {
-            Some(syms) => {
+        match declared(texts.get(i).unwrap(), types) {
+            Some(ds) => {
                 let mut readable = true
-                for s in syms {
-                    if !s.contains(symbol_mark()) {
+                for d in ds {
+                    if !d.name.contains(symbol_mark()) {
                         readable = false
                         continue
                     }
-                    let mut hs = by_symbol.get(s) ?? []
+                    let mut hs = by_symbol.get(d.name) ?? []
                     hs.push(name)
-                    by_symbol.insert(s, hs)
+                    by_symbol.insert(d.name, hs)
                 }
-                if !readable { always.push(name) }
+                if readable {
+                    decls.insert(name, ds)
+                } else {
+                    always.push(name)
+                }
             }
             None => always.push(name)
         }
         i = i + 1
     }
-    HeaderIndex { by_symbol: by_symbol, always: always }
+    HeaderIndex { by_symbol: by_symbol, always: always, decls: decls }
 }
 
-// The names a module header declares, or None if it holds a line that is not a guard, an
-// include or a one-line declaration, and so might declare a name this reader cannot see.
-fn declared_names(text: Str) -> Option[List[Str]] {
-    let mut out: List[Str] = []
+// The declarations of a module header, or None if it holds a line that is not its guard, an
+// include of `types` or a one-line declaration. Such a line might declare a name this reader
+// cannot see, or a macro a unit needs, so that header is included whole.
+fn declared(text: Str, types: Str) -> Option[List[Decl]] {
+    let mut out: List[Decl] = []
     for line in text.lines() {
-        if line == "" || line.starts_with("#") { continue }
+        if line == "" { continue }
+        if line.starts_with("#") {
+            if !is_guard_line(line, types) { return None }
+            continue
+        }
         if !line.ends_with(";") || line.starts_with(" ") || line.starts_with("typedef") || line.starts_with("struct") || line.starts_with("union") || line.starts_with("enum") || line.starts_with("}") {
             return None
         }
@@ -67,9 +97,19 @@ fn declared_names(text: Str) -> Option[List[Str]] {
         }
         let name = last_word(head)
         if name == "" { return None }
-        out.push(name)
+        out.push(Decl { name: name, line: line })
     }
     Some(out)
+}
+
+// A line of the include guard, or the include of the types header. A `#define` with a value
+// is a macro, not a guard.
+fn is_guard_line(line: Str, types: Str) -> Bool {
+    if line == "#endif" || line == "#include \"{types}\"" { return true }
+    let words = line.split(" ").filter(fn(w) { w != "" })
+    if words.len() != 2 { return false }
+    let kw = words.get(0).unwrap()
+    kw == "#ifndef" || kw == "#define"
 }
 
 fn is_word_byte(b: U8) -> Bool {
@@ -84,11 +124,9 @@ fn last_word(s: Str) -> Str {
     s.byte_slice(start, end)
 }
 
-// The headers `c` includes besides `own`, in the order of `order`: those that declare a
-// word of `c`, and every header in `always`.
-pub fn unit_includes(c: Str, own: List[Str], idx: HeaderIndex, order: List[Str]) -> List[Str] {
-    let mut wanted: Map[Str, Int] = Map()
-    for h in idx.always { wanted.insert(h, 1) }
+// The words of `c` that some header declares.
+fn named_symbols(c: Str, idx: HeaderIndex) -> Map[Str, Bool] {
+    let mut out: Map[Str, Bool] = Map()
     let mark = symbol_mark()
     let n = c.byte_len()
     let mut pos = 0
@@ -100,37 +138,64 @@ pub fn unit_includes(c: Str, own: List[Str], idx: HeaderIndex, order: List[Str])
                 while start > 0 && is_word_byte(c.byte_at(start - 1)) { start = start - 1 }
                 let mut end = at + mark.byte_len()
                 while end < n && is_word_byte(c.byte_at(end)) { end = end + 1 }
-                match idx.by_symbol.get(c.byte_slice(start, end)) {
-                    Some(hs) => {
-                        for h in hs { wanted.insert(h, 1) }
-                    }
-                    None => {}
-                }
+                let word = c.byte_slice(start, end)
+                if idx.by_symbol.contains_key(word) { out.insert(word, true) }
                 pos = end
             }
             None => scanning = false
         }
     }
-    for h in own { wanted.remove(h) }
-    let mut out: List[Str] = []
-    for h in order {
-        if wanted.contains_key(h) { out.push(h) }
-    }
     out
 }
 
-// `c` with an include of each of `headers` after its include of `after`, which every unit
-// has, ahead of anything the unit declares or defines.
-pub fn splice_includes(c: Str, after: Str, headers: List[Str]) -> Str {
-    if headers.len() == 0 { return c }
-    let line = "#include \"{after}\"\n"
+// What `c` holds of the headers: every header in `always` whole, and the declaration of each
+// word of `c` that a readable header declares. The headers of `own` come first, then the rest
+// in the order of `order`, each in its own order, so the same uses give the same bytes. A
+// declaration two headers both hold is written once.
+pub fn unit_declarations(c: Str, own: List[Str], idx: HeaderIndex, order: List[Str]) -> UnitDecls {
+    let used = named_symbols(c, idx)
+    let mut seq: List[Str] = []
+    for h in own { seq.push(h) }
+    for h in order {
+        if !own.contains(h) { seq.push(h) }
+    }
+    let mut whole: List[Str] = []
+    let mut lines: List[Str] = []
+    let mut seen: Set[Str] = Set()
+    for h in seq {
+        match idx.decls.get(h) {
+            Some(ds) => {
+                for d in ds {
+                    if used.contains_key(d.name) && !seen.contains(d.line) {
+                        seen.insert(d.line)
+                        lines.push(d.line)
+                    }
+                }
+            }
+            None => {
+                if idx.always.contains(h) { whole.push(h) }
+            }
+        }
+    }
+    UnitDecls { whole: whole, lines: lines }
+}
+
+// `c` with its include of `own` replaced by an include of `types`, an include of each header
+// of `d.whole`, and the lines of `d.lines`, or None if `c` has no include of `own`.
+pub fn splice_declarations(c: Str, own: Str, types: Str, d: UnitDecls) -> Option[Str] {
+    let line = "#include \"{own}\"\n"
     let at = match c.byte_index_of(line, 0) {
-        Some(p) => p + line.byte_len()
-        None => return c
+        Some(p) => p
+        None => return None
     }
     let mut sb = StringBuilder.new()
     sb.write(c.byte_slice(0, at))
-    for h in headers { sb.write("#include \"{h}\"\n") }
-    sb.write(c.byte_slice(at, c.byte_len()))
-    sb.to_str()
+    sb.write("#include \"{types}\"\n")
+    for h in d.whole { sb.write("#include \"{h}\"\n") }
+    for l in d.lines {
+        sb.write(l)
+        sb.write("\n")
+    }
+    sb.write(c.byte_slice(at + line.byte_len(), c.byte_len()))
+    Some(sb.to_str())
 }
