@@ -1321,6 +1321,90 @@ at most 3.05.
   drop 29-123 ms.
 - The C of each build matches the warm C in every row (`c_check`).
 
+### Units and headers kept across a fn edit
+
+Before this change, a changed module header stopped the build from taking
+any unit of the last build, and every header was written again. A new
+fn on cli emitted all 52 units (0.45 s of emit) and wrote 0.05 s of
+headers that had the same text as before. Now a build takes each unit
+that the edit cannot reach and keeps each header whose inputs did not
+change.
+
+The delta (`src/emit_record.bl`):
+
+- Each top-level item in a source's interface text starts with a mark of
+  its kind: `fn <name>`, `import` or `other`. The build compares the old
+  and new items of each source as a multiset, with comments dropped.
+- A changed plain fn adds its name to the edited names. A changed
+  `import` adds nothing. A change to any other item, or to a field of the
+  inputs that is not the sources' own, makes the build take nothing.
+- The hit sources are those whose old or new text names an edited fn as
+  a whole word.
+- The types header must have the same text, and the module headers must
+  come in the same order. Each changed module header gives the names it
+  declares that were added or removed. Past 64 such names the build takes
+  nothing.
+- A unit is taken only when the texts of the sources it reads are the
+  same, none of them is a hit, its own headers have the same text, it
+  includes no changed header whole, and its C names none of the changed
+  names. Its files are then linked in and their sha256 checked against the
+  record.
+- A module's headers are kept when the key of its inputs is the same and
+  none of its sources changed or is a hit. The key is the sha256 of the
+  types header and the C names of the instances the module homes, in
+  order. A header with the same text as the last one is linked, not
+  written, so its inode and mtime do not change.
+
+#### Program-wide numbering
+
+A unit's C reads tables and counters that the whole program shares. A
+new fn can move an entry in such a table. Each one is in one of these
+groups:
+
+(a) Reset for each unit. `begin_unit` calls `reset_unit_state`, and
+`cg_reg_build` makes the registry again:
+
+- `c_mint_seq`, the counter in each closure and fn-value symbol;
+- the emit temp counter and the print state (`materialized`,
+  `guard_support_done`);
+- the effect thunks, the derive and tuple-method marks, the promote
+  state, the typedef and vtable state, the foreign declarations and the
+  layout state.
+
+(b) Named from content, so a fn-only delta cannot move a name:
+
+- the instance and type names (`c_mono_fn_name`, `c_poly_method_name`,
+  `c_mono_type_c_name`, `c_typedef_name`, `c_values_eq_name`, the closure
+  walker names) come from the spelling of the types;
+- an effect's field is `ue_<root>` and its default op is named from the
+  root and the op;
+- a key table has the name `layout` gives the key type (`kops_table`).
+  Only `__main__` defines the tables, and other units declare them by that
+  name;
+- string literals are written in the unit that uses them;
+- no tid or node id reaches the C text, and private copies are sorted by
+  C name;
+- the order of `reg_fns` and `mono_table` moves when a fn is added in
+  another module, but the order of the entries of one module does not.
+
+(c) A shift changes a text the build compares:
+
+- the order of the instance table reaches the module's headers and its
+  unit. The header key holds the instance names in order, and a unit is
+  taken only when its own headers have the same text;
+- the carrier typedefs, the effect-vector typedef, the derive
+  declarations and the tuple types are in the types header, which the
+  build compares byte for byte. A new tuple type therefore makes the
+  build take nothing;
+- the preamble marks come from the same walk as the types header;
+- `program_spawns`, the test table and every key table reach only
+  `__main__`, which the build emits each time.
+
+An entry that is in none of these groups makes the build take nothing.
+
+A source that declares an effect is read by every unit, so an edit there
+emits every unit again. This was so before this change.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
