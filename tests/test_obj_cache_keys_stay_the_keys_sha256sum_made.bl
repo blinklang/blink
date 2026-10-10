@@ -1,0 +1,58 @@
+// The object cache finds an object by a key hashed from its inputs. The keys were made by
+// sha256sum, and the cache on a user's disk holds objects stored under them, so a build that
+// hashes in process must make the very same keys: a new key for the same inputs would miss
+// every object a build stored before. Each expected key below is what sha256sum made.
+
+import build_objcache.{key_from_text, unit_file_shas, unit_keys_from}
+
+let DIR = "build/obj_cache_keys_probe"
+
+fn fixture() {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/units {DIR}/arc {DIR}/vendor")
+    write_file("{DIR}/arc/runtime.h", "/* runtime */\n#define BLINK_RT 1\n")
+    write_file("{DIR}/arc/libblink_std.h", "#include \"runtime.h\"\nint blink_std(void);\n")
+    write_file("{DIR}/vendor/dep.h", "int dep(void);\n")
+    write_file("{DIR}/units/__types.h", "typedef long blink_int;\n")
+    write_file("{DIR}/units/leaf.h", "const char* leaf_value(void);\n")
+    write_file("{DIR}/units/leaf.c", "#include \"leaf.h\"\nconst char* leaf_value(void) \{ return \"leaf\"; }\n")
+    write_file("{DIR}/units/__main__.c", "#include \"leaf.h\"\nint main(void) \{ return 0; }\n")
+}
+
+fn keys_of(flags: List[Str]) -> Str {
+    let shas = unit_file_shas("{DIR}/units", "{DIR}/arc") ?? Map()
+    let mut heads: Map[Str, List[Str]] = Map()
+    heads.insert("leaf", ["__types.h", "leaf.h"])
+    heads.insert("__main__", ["__types.h", "leaf.h"])
+    let keys = unit_keys_from(shas, "{DIR}/units", ["leaf", "__main__"], heads, "{DIR}/arc", ["{DIR}/vendor"], "compilersha", "cc (GCC) 15.2.1", flags, "")
+    "leaf={keys.get("leaf") ?? "none"} __main__={keys.get("__main__") ?? "none"}"
+}
+
+test "a manifest text keeps the key sha256sum gave it" {
+    assert_eq(key_from_text(""), "01ba4719c80b6fe9")
+    assert_eq(key_from_text("schema:1\nmod:a\n"), "c5d511698750b9bf")
+    assert_eq(key_from_text("no newline at the end"), "f92fae78505a86b3")
+}
+
+test "the hash of each unit file is the one sha256sum gave" {
+    fixture()
+    let shas = unit_file_shas("{DIR}/units", "{DIR}/arc") ?? Map()
+    assert_eq(shas.get("leaf.c") ?? "none", "ea120863b925c19158295ec131b5dfe7b23b982ce8b692f5b6667c900ad0e647")
+    assert_eq(shas.get("{DIR}/arc/runtime.h") ?? "none", "1afaac2e9593a5cd19ef1f3461689c34576313ea0a0d0d667f8685dfc2b1e444")
+    assert_eq(shas.len(), 6)
+}
+
+test "each unit keeps the key sha256sum gave it" {
+    fixture()
+    assert_eq(keys_of(["-O1", "-Werror=implicit-function-declaration"]), "leaf=e58b14c27ffba74a __main__=074928a4491681ff")
+}
+
+test "the shared inputs keep their key when they run past one exec argument" {
+    fixture()
+    let mut flags: List[Str] = []
+    let mut i = 0
+    while i < 2000 {
+        flags.push("-DFLAG_NUMBER_{i}_PADDED_TO_MAKE_THE_SHARED_LINES_LONG=1")
+        i = i + 1
+    }
+    assert_eq(keys_of(flags), "leaf=adead38c8e1f89f4 __main__=278db474a8e897a9")
+}
