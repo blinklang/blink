@@ -1,0 +1,97 @@
+// A per-module build cuts a large module's unit into chunks of functions. The cut must not
+// move when a function is added: a new function changes the chunk it lands in, and at most
+// the one after it, and every other chunk keeps its C byte for byte, so the object cache
+// still answers for it. BLINK_UNIT_CHUNK_DECLS makes the chunks small, so a small module
+// splits.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// Functions with no call that can panic, so no C text carries a source position and only
+// the cut decides which chunk changes.
+fn big_source() -> Str {
+    let mut lines: List[Str] = []
+    let mut i = 0
+    while i < 24 {
+        lines.push("fn part{i}(s: Str) -> Str \{")
+        lines.push("    \"{i}:\{s}\"")
+        lines.push("}")
+        lines.push("")
+        i = i + 1
+    }
+    let mut calls: List[Str] = []
+    i = 0
+    while i < 24 {
+        calls.push("part{i}(s)")
+        i = i + 1
+    }
+    lines.push("pub fn total(s: Str) -> Str \{")
+    lines.push("    [{calls.join(", ")}].join(\",\")")
+    lines.push("}")
+    lines.push("")
+    lines.join("\n")
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"chunk_cut_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/big.bl", big_source())
+    write_file("{tree}/app/src/main.bl", [
+        #"import big.{total}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(total("x"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_UNIT_CHUNK_DECLS=2 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// Each C file of the large module in the last build's units directory, as "name sha".
+fn chunk_files(tree: Str) -> List[Str] {
+    sh("cd {tree}/out/app.units && sha256sum big.c big.p*.c 2>/dev/null | awk '\{print $2, $1}' | sort").split("\n").filter(fn(l) { l != "" })
+}
+
+fn build(tree: Str) {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+}
+
+test "adding a function to a large module changes at most two of its chunks" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_chunk_cut_stable_{getpid()}"
+    dev_tree(root, tree)
+    build(tree)
+    let before = chunk_files(tree)
+    shell_exec("sed -i \"/^fn part12(/i\\\\pub fn added(s: Str) -> Str \{ s \}\\n\" {tree}/app/src/big.bl")
+    let src = read_file("{tree}/app/src/big.bl")
+    build(tree)
+    let after = chunk_files(tree)
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(src.contains("pub fn added("), "the edit did not add the function")
+    assert(before.len() > 3, "the large module was not cut into chunks: {before.join(" ")}")
+    let kept = before.filter(fn(f) { after.contains(f) })
+    let changed = after.filter(fn(f) { !before.contains(f) })
+    assert(kept.len() >= before.len() - 2, "the cut moved: before {before.join(" ")} after {after.join(" ")}")
+    assert(changed.len() <= 2, "more than two chunks changed: {changed.join(" ")}")
+    assert(out.starts_with("0:x,1:x"), "the program changed: {out}")
+}

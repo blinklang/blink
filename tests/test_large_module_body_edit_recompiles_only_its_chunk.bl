@@ -1,0 +1,122 @@
+// A per-module build cuts a large module's unit into chunks of functions, so a body edit
+// in one function compiles that function's chunk again and takes every other chunk from
+// the object cache. An edit that adds a line moves the line of every function below it,
+// and the C of those functions must not carry that line, or each of their chunks compiles
+// again too. BLINK_UNIT_CHUNK_DECLS makes the chunks small, so a small module splits.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// Twelve private functions, each with a call that can panic, so each one's C names a
+// source position.
+fn big_source() -> Str {
+    let mut lines: List[Str] = []
+    let mut i = 0
+    while i < 12 {
+        lines.push("fn part{i}(n: Int) -> Int \{")
+        lines.push("    let xs = [n, {i}]")
+        lines.push("    xs.get(1).unwrap() + n * {i + 1}")
+        lines.push("}")
+        lines.push("")
+        i = i + 1
+    }
+    let mut calls: List[Str] = []
+    i = 0
+    while i < 12 {
+        calls.push("part{i}(n)")
+        i = i + 1
+    }
+    lines.push("pub fn total(n: Int) -> Int \{")
+    lines.push("    {calls.join(" + ")}")
+    lines.push("}")
+    lines.push("")
+    lines.join("\n")
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"chunk_edit_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/big.bl", big_source())
+    write_file("{tree}/app/src/main.bl", [
+        #"import big.{total}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("total {total(2)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_UNIT_CHUNK_DECLS=2 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// The units a build compiled, read from its build.units trace, sorted.
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    let mut i = 1
+    while i < out.len() {
+        let cur = out.get(i).unwrap()
+        let mut j = i
+        while j > 0 && out.get(j - 1).unwrap() > cur {
+            out.set(j, out.get(j - 1).unwrap())
+            j = j - 1
+        }
+        out.set(j, cur)
+        i = i + 1
+    }
+    out
+}
+
+fn of_big(units: List[Str]) -> List[Str] {
+    units.filter(fn(u) { u == "big" || u.starts_with("big.") })
+}
+
+fn build_units(tree: Str) -> List[Str] {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    units_compiled(r)
+}
+
+test "a body edit in one function of a large module recompiles only its chunk" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_chunk_body_edit_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build_units(tree)
+    let same_lines = "s/n \\* 8$/n * 80/"
+    shell_exec("sed -i \"{same_lines}\" {tree}/app/src/big.bl")
+    let edited = build_units(tree)
+    let out_edited = sh("{tree}/out/app")
+    shell_exec("sed -i \"/^fn part3(/a\\\\    let _pad = 1\" {tree}/app/src/big.bl")
+    let added = build_units(tree)
+    let out_added = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(of_big(cold).len() > 2, "the large module was not cut into chunks: {cold.join(",")}")
+    assert_eq(of_big(edited).len(), 1)
+    assert_eq(edited.len(), 1)
+    assert(out_edited.contains("total 366"), "the edit did not reach the binary: {out_edited}")
+    assert_eq(of_big(added).len(), 1)
+    assert_eq(added.len(), 1)
+    assert(out_added.contains("total 366"), "the program changed: {out_added}")
+}
