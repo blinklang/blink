@@ -1865,6 +1865,109 @@ on cli with an effect that has an operation: `Probe` (above) added to
 The change brings this edit to what `body-cname` costs with no effect,
 0.410-0.411 s.
 
+### A PCH of the archive header
+
+Each unit includes `libblink_std.h`, the stdlib archive header, which
+includes `runtime.h`. Measured before this change with gcc 16 at `-O1`,
+one compile at a time: a cli unit that holds only its prologue compiles
+in 22.6 ms, and 10.7 ms with a PCH of the header. The `cname` unit
+compiles in 148.6 ms, and 137.4 ms with the PCH. So each compile spends
+about 12 ms in the header, the same on small. Each object built with the
+PCH is byte-equal to the one built without it, at `-O1` and with
+`--debug`. The PCH builds in about 50 ms and is 7.2 MB.
+
+The build now keeps a PCH of the archive header in the obj cache:
+`<key>.pch/` holds copies of `libblink_std.h` and `runtime.h` and the
+`libblink_std.h.gch` built from them. A unit that it serves compiles
+with `-I<key>.pch` before `-I<arc_dir>`, so gcc finds the `.gch` beside
+the copy, and with `-ffile-prefix-map=<key>.pch=<arc_dir>`, so the debug
+info names the archive dir as a compile without the PCH does.
+
+- gcc takes a `.gch` only when the unit defines, before the include, the
+  macros the PCH was built with. The prologue of a unit is a `#define`
+  line for each native-dep gate it reads, then
+  `BLINK_USE_EXTERN_RUNTIME_STORAGE` and the include. The build reads
+  that prologue from each unit to compile and builds one PCH for the set
+  of macros most of those units define. The rest read the header. On cli
+  68 of 69 units read the PCH; `typecheck.pos` includes no archive
+  header. In a program with a sqlite store, the units that read the gate
+  get a PCH under that gate, and `__main__`, which defines other macros,
+  reads the header.
+- The key holds the header and `runtime.h` shas, the cc id, the archive
+  dir, every flag, those macros, each include flag, and the sha of each
+  header in each include dir (`build_objcache.pch_key`). The build hashes
+  those headers once, for the obj keys and the PCH key both.
+- On a miss the build stages the copies in a private dir, builds the
+  `.gch` there in a slot of its own while the units compile, and renames
+  the dir into place. A unit that starts after it is in place reads it.
+  When every unit starts before it ends, no unit of this build reads it,
+  so the build waits for it after the link.
+- gcc reads the header beside a `.gch` it cannot take, so a stale or
+  wrong PCH costs only time. A `.gch` cut short stops gcc instead, so a
+  unit that fails with the PCH compiles once more without it, and the
+  build drops the PCH when that compile passes.
+- No PCH for a cross build, for clang (it reads a PCH only through
+  `-include-pch`), under ccache, or when a `libblink_std.h.gch` sits
+  beside the archive header already.
+- The obj key of a unit does not change, since its object does not.
+- GC and `blink cache clean` treat a `.pch` dir as one entry, with its
+  `.meta`.
+
+As with the obj key, system headers (`gc.h`, libc) are not in the key;
+gcc checks the `.gch` against the compiler that reads it.
+
+cli finds `BLINK_USE_SQLITE` in its own C (a string literal in
+`stdlib_native_deps.bl` holds it), so it builds with
+`-I lib/native/sqlite3` although no unit defines the gate. A first cut
+gave no PCH to a build with an include dir, so cli got none. The key now
+holds the include dirs and their headers in its place.
+
+#### Bench
+
+Through the daemon, settle 1 s, 11 reps, median seconds (min-max). Base
+and the change ran in turn: base, change, base, change. Base is gen1 of
+main `34dd97f4` (sha256 `7256272c…`), the change is gen1 of `100ca7fd`
+(sha256 `8c36b275…`). Both ran on tree `e2af9223`.
+`bench/edit_loop/archive_pch_daemon_settle1_*.tsv` hold the full rows.
+Every C hash check reads 11/11. The bench counts the PCH build as a cc
+call, so `cold-obj` reads one call more for the change.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.143 (0.136-0.147) | 0.142 (0.134-0.150) | 0.143 (0.139-0.152) | 0.141 (0.136-0.154) |
+| cli | body-cname | 0.419 (0.393-0.431) | 0.401 (0.382-0.407) | 0.412 (0.396-0.425) | 0.397 (0.383-0.416) |
+| cli | body-typecheck | 0.446 (0.441-0.454) | 0.427 (0.413-0.441) | 0.440 (0.438-0.451) | 0.433 (0.424-0.440) |
+| cli | pubfn-cname | 0.451 (0.440-0.563) | 0.435 (0.414-0.537) | 0.444 (0.436-0.550) | 0.429 (0.414-0.555) |
+| cli | privfn-cname | 0.441 (0.429-0.455) | 0.426 (0.412-0.445) | 0.450 (0.440-0.463) | 0.423 (0.406-0.441) |
+| cli | pubfn-typecheck | 0.462 (0.445-0.475) | 0.445 (0.435-0.452) | 0.477 (0.463-0.481) | 0.444 (0.434-0.456) |
+| cli | privfn-typecheck | 0.461 (0.447-0.475) | 0.445 (0.433-0.460) | 0.472 (0.463-0.489) | 0.452 (0.441-0.468) |
+| cli | testblock-cname | 0.264 (0.261-0.421) | 0.262 (0.251-0.403) | 0.277 (0.267-0.420) | 0.277 (0.267-0.413) |
+| cli | global-cname | 0.438 (0.428-0.444) | 0.414 (0.409-0.418) | 0.448 (0.437-0.455) | 0.424 (0.413-0.441) |
+| cli | run-body-cname | 0.439 (0.433-0.444) | 0.406 (0.393-0.412) | 0.442 (0.425-0.446) | 0.414 (0.407-0.423) |
+| cli | test-body-cname | 0.451 (0.443-0.456) | 0.440 (0.436-0.450) | 0.449 (0.443-0.456) | 0.438 (0.434-0.445) |
+| cli | cold-obj | 2.260 (2.241-2.370) | 2.212 (2.200-2.320) | 2.293 (2.271-2.364) | 2.204 (2.190-2.296) |
+| cli | cold-all | 4.947 (4.930-4.964) | 4.884 (4.864-4.913) | 4.953 (4.931-4.971) | 4.895 (4.863-4.907) |
+| small | nochange | 0.044 (0.042-0.047) | 0.045 (0.041-0.046) | 0.044 (0.042-0.046) | 0.044 (0.042-0.047) |
+| small | body-inventory | 0.087 (0.085-0.088) | 0.075 (0.073-0.077) | 0.087 (0.086-0.090) | 0.075 (0.073-0.077) |
+| small | body-audit | 0.076 (0.074-0.079) | 0.064 (0.062-0.066) | 0.075 (0.074-0.079) | 0.063 (0.062-0.065) |
+| small | pubfn-model | 0.080 (0.077-0.081) | 0.069 (0.067-0.071) | 0.080 (0.076-0.081) | 0.068 (0.066-0.068) |
+| small | privfn-model | 0.079 (0.077-0.082) | 0.068 (0.067-0.070) | 0.081 (0.079-0.082) | 0.068 (0.066-0.069) |
+| small | testblock-model | 0.048 (0.046-0.048) | 0.048 (0.047-0.050) | 0.047 (0.046-0.049) | 0.048 (0.045-0.048) |
+| small | run-body-inventory | 0.088 (0.086-0.090) | 0.076 (0.074-0.079) | 0.089 (0.086-0.090) | 0.076 (0.074-0.077) |
+| small | test-body-inventory | 0.113 (0.111-0.118) | 0.102 (0.098-0.104) | 0.114 (0.110-0.116) | 0.102 (0.098-0.105) |
+| small | cold-obj | 0.084 (0.082-0.088) | 0.090 (0.087-0.096) | 0.085 (0.083-0.092) | 0.088 (0.087-0.094) |
+
+Each row with a unit to compile is faster on both targets, and each row
+without one is the same. A cli unit compile (`cc_s`) drops from 0.150 s
+to 0.140 s, and by 11 ms on the typecheck rows (0.046 s to 0.035 s): the
+header share. `cold-obj` on cli drops 50-90 ms. A small edit drops about
+12 ms of 75-114 ms.
+
+`cold-obj` on small reads 3-6 ms slower: it builds the PCH, which takes
+about as long as its six units and the link together. Each base run has
+a max of 0.088 or 0.092 s and each change run a min of 0.087 s, so the
+spreads overlap. The first edit after it saves 12 ms.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
