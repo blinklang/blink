@@ -131,11 +131,12 @@ asks for the one-unit build.
   starts first. The build starts and reaps the cc children from its own
   thread. Before, each compile waited in an async task, and the async
   pool has four threads (`blink_threadpool_init(4)`), so at most four cc
-  ran at once whatever `--jobs` said. The build reaps children in start
-  order, not whichever ends first, so a child that ends early holds its
-  slot until those started before it end. A child that writes more than
-  a pipe buffer of output before its turn waits for its turn: no
-  deadlock, but its slot stays idle.
+  ran at once whatever `--jobs` said. The build reaps whichever child
+  ends first and starts the next unit in its slot. Each child writes its
+  output to files in the obj dir, so no child waits on a full pipe. The
+  build prints the output and the error lines in unit order, not in the
+  order the children end. "Units that end out of order" below gives the
+  design.
 - **Object cache.** One entry per unit. The key covers the unit `.c`,
   every header it includes (the unit headers it names, `runtime.h`,
   `libblink_std.h`, its `.gch`, vendored headers), the compiler, the cc
@@ -2123,6 +2124,121 @@ Without the daemon:
 Each change row is inside the spread of the base rows beside it. The
 holds cost no time a run can show: a hard link per object, and one dir
 to remove after the link.
+
+### Units that end out of order
+
+The build reaped unit compiles in start order. The largest unit starts
+first, but its compile does not always end last: on a cold build of
+`src/cli.bl`, 69 units in 12 slots, a trace showed 9.3-9.8 slot-seconds
+of idle slots. A slot was idle when its child had ended and an older
+child had not. The cc wall was 2.02-2.05 s, and a replay of the trace
+that reaps whichever child ends first gave 1.21-1.24 s, the time of
+`parser.c`, the second unit to start. A program of 6 units, such as the
+small bench target, had no idle slot.
+
+Now each unit child, and the PCH compile:
+
+- writes its stdout and stderr to `<place>.cc-out` and `<place>.cc-err`
+  in the obj dir. The build reads and removes them when it reaps the
+  child, whether cc passed, failed or died of a signal;
+- holds the write end of a pipe of its own, and no other descriptor of
+  the build but its stdin. The build sets `FD_CLOEXEC` on each read end
+  it keeps, so a unit started later does not inherit the pipe of a unit
+  or of the PCH compile that runs beside it.
+
+The build polls the read ends of its units with a timeout of 50 ms.
+After each wake it checks each unit it has not reaped with
+`waitpid(pid, WNOHANG)`, and reaps each one that has ended. A read end
+that reports `POLLHUP` or input is closed at once, and while a unit's
+read end is closed but the unit has not been seen to end, the timeout is
+1 ms: the kernel closes a process's descriptors a little before its
+parent can reap it. A process that cc leaves running, and that holds the
+write end, does not hold up the build: the unit ends, and the next sweep
+finds it within 50 ms. The sweep costs at most 20 wakeups a second, each
+one `poll` and one `waitpid` per running unit. The build waits on no pid
+but those of its own units, so it reaps no other child of the process.
+If `poll(2)` fails for a reason other than `EINTR`, the build waits on
+the oldest unit it has not reaped. Output and error lines print in unit
+order, as before.
+
+No step reads a unit's object before the build has reaped that unit.
+The link, the object cache store and the cache holds run after the last
+unit is reaped. The PCH compile writes to a staged dir, and the build
+holds and stores the `.gch` only after it has reaped the PCH compile; a
+unit uses the PCH only when it starts after that.
+
+Each build compiles in a dir of its own, `.units.<random>` in the out dir,
+and renames it to `<stem>.units` at the end. If blink is killed while cc
+runs, the cc children run to their end, but they write only into the
+dir of the killed build, which no later build reads.
+
+Changes a user can see:
+
+- The unit children are not in the runtime's table of children, so a
+  `SIGTERM` sent to the blink pid alone does not reach cc. `^C`, a kill
+  of the process group (which the daemon uses) and `timeout` still
+  reach them.
+- If `exec` fails, the unit's error output holds an `execvp:` line.
+
+The runtime has no call that spawns a child with its output in a file,
+so `src/build_fs.bl` forks and execs through libc.
+
+#### Bench
+
+Through the daemon, settle 1 s, then without the daemon for the cold
+cases; 11 reps, median seconds (min-max). Base and the change ran in
+turn: base, change, base, change. Base is gen1 of `86b69192` (sha256
+`01f96a4e…`), the change is gen1 of `10097874` (sha256 `9295bba6…`), both
+from `task gen1`. Both ran on tree `10097874`; the one file not yet
+committed was this doc. `bench/edit_loop/unit_wait_any_*.tsv` hold the
+full rows. Every C hash check reads 11/11.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.163 (0.153-0.172) | 0.163 (0.154-0.173) | 0.162 (0.153-0.174) | 0.163 (0.160-0.170) |
+| cli | body-cname | 0.440 (0.412-0.446) | 0.428 (0.423-0.440) | 0.436 (0.420-0.454) | 0.426 (0.415-0.441) |
+| cli | body-typecheck | 0.463 (0.454-0.472) | 0.468 (0.459-0.485) | 0.467 (0.456-0.478) | 0.456 (0.441-0.471) |
+| cli | pubfn-cname | 0.466 (0.455-0.568) | 0.466 (0.457-0.575) | 0.476 (0.469-0.580) | 0.457 (0.446-0.578) |
+| cli | privfn-cname | 0.470 (0.456-0.483) | 0.474 (0.466-0.491) | 0.478 (0.467-0.490) | 0.462 (0.452-0.471) |
+| cli | pubfn-typecheck | 0.487 (0.477-0.496) | 0.496 (0.489-0.511) | 0.498 (0.480-0.507) | 0.483 (0.466-0.496) |
+| cli | privfn-typecheck | 0.488 (0.474-0.502) | 0.492 (0.479-0.501) | 0.488 (0.476-0.508) | 0.489 (0.478-0.503) |
+| cli | testblock-cname | 0.307 (0.297-0.438) | 0.306 (0.299-0.440) | 0.306 (0.298-0.451) | 0.304 (0.297-0.441) |
+| cli | global-cname | 0.466 (0.458-0.476) | 0.465 (0.454-0.474) | 0.470 (0.459-0.475) | 0.466 (0.445-0.475) |
+| cli | run-body-cname | 0.458 (0.444-0.467) | 0.456 (0.447-0.470) | 0.465 (0.458-0.473) | 0.463 (0.441-0.473) |
+| cli | test-body-cname | 0.483 (0.470-0.495) | 0.483 (0.475-0.499) | 0.480 (0.471-0.494) | 0.477 (0.472-0.496) |
+| cli | cold-obj | 2.361 (2.338-2.462) | 1.628 (1.620-1.714) | 2.358 (2.328-2.437) | 1.633 (1.618-1.731) |
+| cli | cold-all | 5.145 (5.117-5.176) | 4.487 (4.465-4.522) | 5.140 (5.130-5.158) | 4.463 (4.448-4.504) |
+| small | nochange | 0.044 (0.042-0.047) | 0.045 (0.043-0.046) | 0.045 (0.043-0.047) | 0.044 (0.043-0.047) |
+| small | body-inventory | 0.076 (0.074-0.090) | 0.075 (0.073-0.092) | 0.076 (0.074-0.091) | 0.076 (0.074-0.089) |
+| small | body-audit | 0.064 (0.063-0.066) | 0.065 (0.063-0.068) | 0.064 (0.062-0.065) | 0.066 (0.064-0.067) |
+| small | pubfn-model | 0.067 (0.065-0.068) | 0.068 (0.066-0.070) | 0.068 (0.065-0.070) | 0.068 (0.065-0.070) |
+| small | privfn-model | 0.067 (0.065-0.070) | 0.068 (0.067-0.069) | 0.068 (0.066-0.070) | 0.068 (0.066-0.071) |
+| small | testblock-model | 0.048 (0.045-0.050) | 0.048 (0.046-0.049) | 0.048 (0.046-0.049) | 0.047 (0.045-0.048) |
+| small | run-body-inventory | 0.077 (0.075-0.078) | 0.077 (0.076-0.079) | 0.075 (0.074-0.077) | 0.076 (0.074-0.079) |
+| small | test-body-inventory | 0.102 (0.099-0.114) | 0.104 (0.102-0.119) | 0.103 (0.100-0.115) | 0.103 (0.100-0.118) |
+| small | cold-obj | 0.089 (0.087-0.091) | 0.090 (0.087-0.093) | 0.087 (0.084-0.091) | 0.089 (0.087-0.091) |
+
+Without the daemon:
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | cold-obj | 2.584 (2.559-2.606) | 1.932 (1.902-1.939) | 2.580 (2.557-2.621) | 1.927 (1.918-1.955) |
+| cli | cold-all | 4.964 (4.931-5.002) | 4.308 (4.298-4.345) | 4.988 (4.954-4.998) | 4.331 (4.313-4.350) |
+| small | cold-obj | 0.102 (0.100-0.105) | 0.103 (0.101-0.108) | 0.101 (0.101-0.104) | 0.102 (0.101-0.105) |
+
+On cli the cold rows drop by 0.65-0.73 s, and the cc time drops by
+about the same: cold-obj through the daemon 2.10-2.11 s to 1.39-1.40 s,
+without it 2.01-2.02 s to 1.36-1.37 s (the `cc_s` column). Each other
+change row is inside the spread of the base rows beside it.
+
+The cc time does not reach the 1.21-1.24 s of the replay. A trace of 5
+cold-obj builds of cli per binary, each `cc` timed with its CPU, shows
+why. With the change, the cc time is the time of `parser.c` alone, to
+within 8 ms: 1.36-1.40 s. With base, `parser.c` took 1.21-1.23 s. Each
+slot now stays busy while `parser.c` compiles, and the CPU of all 69
+units rises from 14.1 s to 14.8-15.0 s, so each compile runs a little
+slower. No order of the units can end the build before its longest
+unit ends.
 
 ## Blockers before the default flipped
 
