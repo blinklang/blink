@@ -1410,8 +1410,9 @@ groups:
 
 An entry that is in none of these groups makes the build take nothing.
 
-A source that declares an effect is read by every unit, so an edit there
-emits every unit again. This was so before this change.
+A source that declares an effect with an operation was read by every
+unit, so an edit there emitted every unit again. "Units kept across a
+body edit beside an effect" removes that.
 
 #### What `__main__` reads
 
@@ -1438,7 +1439,8 @@ the same groups.
 
 - the evidence storage: the vtable typedef, the default and the `ue_`
   field of each effect. A new or changed effect is an item other than a
-  fn or an import, so the build takes nothing;
+  fn or an import, so the build takes nothing. The vtable typedef is in
+  the types header, and the default bodies mark no source;
 - its own globals and their init fn, from its own source;
 - the init calls. A global of another module that changes between a
   constant and a run-time initializer adds or removes a call. The `init`
@@ -1456,11 +1458,10 @@ A test in an imported module does not reach `__main__`: `blink test`
 builds each file with its own tests as the entry. The build takes
 `__main__` and each unit the test does not reach.
 
-Some edits emit `__main__` again with the same text. A second Map with a
+One edit emits `__main__` again with the same text. A second Map with a
 key type that a Map in an earlier source already has moves the node the
-table is written from. A body edit in a source that declares an effect
-changes a source the unit reads. Each costs one emit of `__main__`, and
-each build is byte-equal to a cold build.
+table is written from. This costs one emit of `__main__`, and the build
+is byte-equal to a cold build.
 
 #### Bench
 
@@ -1746,6 +1747,123 @@ slower. The two rows ran again in turn, four runs
 change; `test-body-cname` 0.450 and 0.448 s for base, 0.452 and 0.452 s
 for the change. Each pair is inside the other's spread, so neither row
 is slower.
+
+### Units kept across a body edit beside an effect
+
+Before this change, a body edit in a source that declares an effect with
+an operation made the build take no unit. Each unit calls
+`emit_module_head`, which prints the default body of each operation
+(`default_op_body`). That lowering used the span of the operation, so it
+marked the declaring source as read by every unit, although the C it
+prints holds no position.
+
+`emit_effect_vtable` now stops the marks while it prints the default
+bodies (`ir_sources_pause` and `ir_sources_resume`). Their C comes from
+the names and types of the operations. Two checks still key them:
+
+- the vtable typedef holds each operation's name, return and parameters,
+  and it is in the types header, which must be byte-equal for any take;
+- an effect is an item of kind `other`, so an edit that adds, removes or
+  changes an effect or an operation takes no unit.
+
+A handler is code in a fn body, so its unit marks its own source as for
+any other body.
+
+Measured before this change:
+
+- cli as checked in has no effect with an operation, so a body edit
+  takes the units it does not reach.
+- cli with `effect Probe { effect Ping { fn ping() -> Int } }` added to
+  `src/cname.bl`: a body edit in `cname.bl` takes no unit. Through the
+  daemon it costs 0.906 s (0.850-0.955), against 0.444 s (0.431-0.847)
+  with no such effect.
+- small with `audit.bl` (below): a body edit in `audit.bl` takes no unit;
+  with this change it takes 5 of 6, all but `audit`.
+
+A sweep on cli through the daemon under `BLINK_EMIT_REUSE_VERIFY=1` ran
+16 edits, each served by the daemon and each byte-equal to a cold emit:
+an effect with an operation added to `src/diagnostics.bl`; a body edit
+and its undo in `diagnostics.bl`, `lexer.bl`, `cg_decl.bl` and
+`typecheck.bl`; an operation added, its signature changed and undone; a
+handler added in a body of `diagnostics.bl`, its body changed, and
+removed; the operation and the effect removed. Each step that touches
+the effect or an operation took no unit (1.9-4.2 s). Each body edit and
+each handler step took 51 units (1.42-1.65 s).
+
+Three mutants check the tests:
+
+- The item-kind rule lets `other` through. Every test stays green: the
+  types header differs, so the build takes nothing.
+- The same, and the types header compare always matches. The
+  emits-again test and the entry-unit test fail on their took lists
+  (`effect added: took __main__,eff,user`). The build still writes the
+  cold output: the check after the take finds the headers changed and
+  emits each unit again. `BLINK_EMIT_REUSE_VERIFY` stays green.
+- The build takes every unit. Verify fails: unit `eff` is not the one a
+  cold emit writes.
+
+The binary from before this change is the mutant that takes too little.
+Verify stays green, and the took list of the new tests fails.
+
+`bench/edit_loop/src/audit.bl` gives the small target an effect with an
+operation and a private fn beside it; `body-audit` edits that fn.
+`src/main.bl` handles the effect with a handler that drops each note, so
+the output does not change. Every small row now builds one more unit.
+
+#### Bench
+
+Through the daemon, settle 1 s, 11 reps, median seconds (min-max). Base
+and the change ran in turn: base, change, base, change. Base is gen1 of
+`d82b0e5f` (sha256 `f9944d7d…`), the change is gen1 of `c374ccb2`
+(sha256 `7256272c…`). Both ran on tree `4f30afea`.
+`bench/edit_loop/effect_evidence_daemon_settle1_*.tsv` hold the full
+rows. Every C hash check reads 11/11.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.142 (0.137-0.151) | 0.141 (0.137-0.149) | 0.142 (0.133-0.154) | 0.142 (0.137-0.151) |
+| cli | body-cname | 0.410 (0.396-0.428) | 0.410 (0.394-0.426) | 0.411 (0.396-0.424) | 0.411 (0.397-0.439) |
+| cli | body-typecheck | 0.450 (0.433-0.458) | 0.453 (0.438-0.459) | 0.445 (0.434-0.459) | 0.443 (0.432-0.452) |
+| cli | pubfn-cname | 0.438 (0.430-0.563) | 0.435 (0.430-0.571) | 0.448 (0.437-0.558) | 0.444 (0.440-0.560) |
+| cli | privfn-cname | 0.442 (0.432-0.445) | 0.441 (0.435-0.455) | 0.448 (0.442-0.459) | 0.447 (0.438-0.451) |
+| cli | pubfn-typecheck | 0.462 (0.444-0.471) | 0.470 (0.453-0.483) | 0.474 (0.461-0.479) | 0.467 (0.461-0.474) |
+| cli | privfn-typecheck | 0.468 (0.450-0.479) | 0.477 (0.469-0.486) | 0.480 (0.453-0.498) | 0.465 (0.445-0.475) |
+| cli | testblock-cname | 0.273 (0.261-0.405) | 0.277 (0.267-0.426) | 0.273 (0.265-0.420) | 0.266 (0.251-0.403) |
+| cli | global-cname | 0.433 (0.422-0.450) | 0.441 (0.421-0.447) | 0.448 (0.427-0.462) | 0.426 (0.419-0.445) |
+| cli | run-body-cname | 0.438 (0.416-0.444) | 0.433 (0.425-0.438) | 0.444 (0.431-0.461) | 0.431 (0.419-0.442) |
+| cli | test-body-cname | 0.454 (0.449-0.463) | 0.451 (0.447-0.460) | 0.453 (0.448-0.461) | 0.453 (0.447-0.458) |
+| cli | cold-obj | 2.259 (2.237-2.375) | 2.278 (2.264-2.369) | 2.283 (2.268-2.382) | 2.271 (2.256-2.379) |
+| cli | cold-all | 4.958 (4.931-4.981) | 5.006 (4.916-6.298) | 4.969 (4.948-5.031) | 4.976 (4.951-5.012) |
+| small | nochange | 0.045 (0.044-0.047) | 0.048 (0.046-0.050) | 0.046 (0.045-0.047) | 0.042 (0.041-0.045) |
+| small | body-inventory | 0.093 (0.090-0.095) | 0.094 (0.092-0.097) | 0.093 (0.091-0.098) | 0.087 (0.085-0.090) |
+| small | body-audit | 0.084 (0.081-0.085) | 0.082 (0.081-0.086) | 0.085 (0.083-0.086) | 0.077 (0.074-0.080) |
+| small | pubfn-model | 0.087 (0.085-0.088) | 0.086 (0.084-0.087) | 0.088 (0.082-0.096) | 0.080 (0.079-0.084) |
+| small | privfn-model | 0.086 (0.084-0.087) | 0.086 (0.083-0.089) | 0.086 (0.081-0.091) | 0.081 (0.080-0.082) |
+| small | testblock-model | 0.050 (0.049-0.051) | 0.050 (0.049-0.053) | 0.052 (0.049-0.053) | 0.047 (0.045-0.051) |
+| small | run-body-inventory | 0.094 (0.092-0.095) | 0.094 (0.093-0.096) | 0.095 (0.093-0.098) | 0.087 (0.086-0.089) |
+| small | test-body-inventory | 0.122 (0.119-0.125) | 0.122 (0.120-0.124) | 0.121 (0.119-0.123) | 0.114 (0.113-0.118) |
+| small | cold-obj | 0.090 (0.089-0.093) | 0.089 (0.088-0.098) | 0.090 (0.088-0.094) | 0.085 (0.083-0.089) |
+
+cli has no effect with an operation, so no cli row changes, and none is
+slower outside its spread. On small, `body-audit` saves the emit of five
+units, about 2 ms, which is inside the spread in run 2. Run 4 reads 5-8%
+faster on every small row, `nochange` too, so the machine, not the
+change, moved that run. `nochange` in run 2 reads 2-3 ms slower than
+both base runs, outside the spread; it takes no effect path, and run 4
+reads faster than both.
+
+On small the obj cache already skips the C compile of each unit whose C
+did not change, so the take saves only emit time there. The saving shows
+on cli with an effect that has an operation: `Probe` (above) added to
+`src/cname.bl`, a body edit of `strip_blink` through the daemon, settle
+1 s, 11 reps, the same two binaries in turn:
+
+| case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|
+| body-cname with `Probe` | 0.867 (0.812-0.896) | 0.417 (0.398-0.435) | 0.879 (0.819-0.898) | 0.415 (0.398-0.429) |
+
+The change brings this edit to what `body-cname` costs with no effect,
+0.410-0.411 s.
 
 ## Blockers before the default flipped
 

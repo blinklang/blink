@@ -34,7 +34,8 @@
 #
 # Targets:
 #   cli    src/cli.bl, built from the scratch root (the compiler)
-#   small  bench/edit_loop/src/main.bl, built from bench/edit_loop (6 modules, std.json)
+#   small  bench/edit_loop/src/main.bl, built from bench/edit_loop (7 modules, std.json, one
+#          effect with an operation)
 #
 # Cases (each row says the file it edits):
 #   nochange             (c) rebuild with no edit
@@ -149,7 +150,7 @@ tgt_coldall_cli=1
 # BLINK_ROOT, as under task ci. It names the same root blink finds from its own path.
 tgt_env_cli=BLINK_ROOT=$work
 tgt_dir_small=bench/edit_loop; tgt_src_small=src/main.bl; tgt_test_small=src/inventory_test.bl
-tgt_body_small="src/inventory.bl:restock_amount"
+tgt_body_small="src/inventory.bl:restock_amount src/audit.bl:audit_line"
 tgt_pub_small=src/model.bl
 tgt_testblock_small=src/model.bl
 

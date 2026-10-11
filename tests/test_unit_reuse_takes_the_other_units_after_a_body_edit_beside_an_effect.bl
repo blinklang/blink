@@ -1,0 +1,169 @@
+// Every unit writes a default body for each operation of each declared effect. The C of that
+// body is spelled from the operation's signature alone, which an edit to a fn body cannot
+// change. So a body edit in a source that declares an effect, in one that performs it, or in
+// a handler must emit again only the unit whose C changed, and take the rest. Each build runs
+// with BLINK_EMIT_REUSE_VERIFY=1, so every unit it writes or takes is byte-equal to a cold
+// emit, and after each edit the units and the output equal those of a build with no last build.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"effect_body_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/eff.bl", [
+        #"pub effect Metrics {"#,
+        #"    effect Emit {"#,
+        #"        fn counter(name: Str, value: Int)"#,
+        #"    }"#,
+        #"    effect Query {"#,
+        #"        fn get_counter(name: Str) -> Int"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"pub fn record(name: Str, val: Int) ! Metrics.Emit {"#,
+        #"    metrics.counter(name, val)"#,
+        #"}"#,
+        #""#,
+        #"pub fn label(n: Int) -> Str {"#,
+        #"    "eff {n}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/user.bl", [
+        #"import eff.{Metrics, record}"#,
+        #""#,
+        #"pub fn work(n: Int) -> Int ! Metrics {"#,
+        #"    record("work", n)"#,
+        #"    metrics.get_counter("work") + n"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"pub fn plain(n: Int) -> Str {"#,
+        #"    "plain {n}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    // Each call has its own statement, so what the binary prints does not rest on the order
+    // in which the holes of one string run.
+    write_file("{tree}/app/src/main.bl", [
+        #"import eff.{Metrics, label}"#,
+        #"import user.{work}"#,
+        #"import other.{plain}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    with handler Metrics {"#,
+        #"        fn counter(name: Str, value: Int) {"#,
+        #"            io.println("counter {name} {value}")"#,
+        #"        }"#,
+        #"        fn get_counter(_name: Str) -> Int { 40 }"#,
+        #"    } {"#,
+        #"        let w = work(2)"#,
+        #"        let l = label(1)"#,
+        #"        let p = plain(3)"#,
+        #"        io.println("{w} {l} {p}")"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    blink_in(tree, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            // Sorted, so the build's unit order does not reach the assertion.
+            let name = line.byte_slice(29, line.byte_len())
+            out.push(name)
+            let mut at = out.len() - 1
+            while at > 0 && out.get(at - 1).unwrap() > name {
+                out.set(at, out.get(at - 1).unwrap())
+                at = at - 1
+            }
+            out.set(at, name)
+        }
+    }
+    out
+}
+
+// The lines of a failed build that say why, so a verify failure names the unit it found.
+fn why_failed(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if !line.starts_with("[dbg:") && line.trim() != "" { out.push(line.trim()) }
+    }
+    out.join(" | ")
+}
+
+// One edit's result: the units the build took, the units whose C differs from the last
+// build's, the C files and headers that differ from a build with none to take, and whether
+// the two binaries print the same.
+fn warm_and_cold(tree: Str, what: Str) -> Str {
+    shell_exec("rm -rf {tree}/last && cp -r {tree}/out/app.units {tree}/last")
+    let warm = build_into(tree, "out")
+    if warm.exit_code != 0 { return "{what}: warm build failed: {why_failed(warm)}" }
+    let changed = sh("cd {tree} && for f in out/app.units/*.c; do b=$(basename $f .c); cmp -s $f last/$b.c || echo $b; done | LC_ALL=C sort")
+    shell_exec("rm -rf {tree}/cold")
+    let cold = build_into(tree, "cold")
+    if cold.exit_code != 0 { return "{what}: cold build failed: {why_failed(cold)}" }
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    let warm_out = sh("{tree}/out/app")
+    let same_out = warm_out == sh("{tree}/cold/app")
+    "{what}: took {reused_units(warm).join(",")}; C changed [{changed.split("\n").join(" ")}]; differ from cold [{differ.split("\n").join(" ")}]; prints {warm_out.split("\n").join(" / ")}, same as cold {same_out}"
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+test "a body edit beside, in a user of, or in a handler of an effect takes every other unit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_effect_body_unit_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let first = build_into(tree, "out")
+    assert(first.exit_code == 0, "first build failed: {why_failed(first)}")
+    let mut seen: List[Str] = []
+    edit(tree, "eff.bl", #"s/"eff {n}"/"eff2 {n}"/"#)
+    seen.push(warm_and_cold(tree, "body edit in the source that declares the effect"))
+    edit(tree, "user.bl", "s/+ n$/+ n + 1/")
+    seen.push(warm_and_cold(tree, "body edit in a source that performs it"))
+    edit(tree, "main.bl", #"s/{ 40 }/{ 41 }/"#)
+    seen.push(warm_and_cold(tree, "handler body edit"))
+    edit(tree, "other.bl", #"s/plain {n}/plain2 {n}/"#)
+    seen.push(warm_and_cold(tree, "body edit in a source that does neither"))
+    shell_exec("rm -rf {tree}")
+    assert_eq(seen.join("\n"), [
+        "body edit in the source that declares the effect: took __main__,other,user; C changed [eff]; differ from cold []; prints counter work 2 / 42 eff2 1 plain 3, same as cold true",
+        "body edit in a source that performs it: took __main__,eff,other; C changed [user]; differ from cold []; prints counter work 2 / 43 eff2 1 plain 3, same as cold true",
+        "handler body edit: took eff,other,user; C changed [__main__]; differ from cold []; prints counter work 2 / 44 eff2 1 plain 3, same as cold true",
+        "body edit in a source that does neither: took __main__,eff,user; C changed [other]; differ from cold []; prints counter work 2 / 44 eff2 1 plain2 3, same as cold true",
+    ].join("\n"))
+}
