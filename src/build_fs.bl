@@ -5,7 +5,8 @@
 // gives: a Str parameter is written const char*, but no Blink type is written char* or a
 // pointer to a C struct, so utimes(2) cannot be bound.
 
-import std.libc.{getentropy_bytes, read_bytes, write_bytes}
+import std.libc.{getentropy_bytes, read_bytes, write_bytes, poll, Pollfd, POLL_EVT_IN}
+import std.process.{ProcessResult}
 
 // The errno values the calls below test, the same on Linux and macOS but ENOTEMPTY.
 let BFS_ENOENT = 2
@@ -306,6 +307,140 @@ pub fn run_program(program: Str, args: List[Str]) -> Int ! IO {
     (status >> 8) & 255
 }
 
+// A child spawn_to_files started. live is the read end of a pipe whose write end only the
+// child and the processes it starts hold, so the pipe hangs up once they have all ended, as
+// the pipes of a captured run reach their end. A pid of -1 is a child that could not start.
+pub type FileChild {
+    pid: Int
+    live: Int
+    out_path: Str
+    err_path: Str
+}
+
+// Starts program with args, its stdout and stderr written to out_path and err_path and its
+// stdin this process's own. Files, not pipes: a pipe this process does not drain while it
+// waits for another child fills, and its child stops.
+pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: Str) -> FileChild ! IO {
+    // open() here never creates.
+    write_file(out_path, "")
+    write_file(err_path, "")
+    let mut out_fd = -1
+    let mut err_fd = -1
+    let mut live = -1
+    let mut live_w = -1
+    with ffi.scope() as scope {
+        out_fd = bfs_open(scope.cstr(out_path), 1.to_i32()).to_int()
+        err_fd = bfs_open(scope.cstr(err_path), 1.to_i32()).to_int()
+        let ends = scope.alloc_n[I32](2)
+        if bfs_pipe(ends).to_int() == 0 {
+            let pair = scope.alloc[BfsIntPair]()
+            let _ = bfs_memcpy(pair, ends, 8.to_u64())
+            let both = pair.deref()
+            live = both.l_onoff.to_int()
+            live_w = both.l_linger.to_int()
+        }
+    }
+    let mut pid = -1
+    if out_fd >= 0 && err_fd >= 0 && live >= 0 {
+        pid = bfs_fork().to_int()
+        if pid == 0 {
+            let _ = bfs_dup2(out_fd.to_i32(), 1.to_i32())
+            let _ = bfs_dup2(err_fd.to_i32(), 2.to_i32())
+            // With stdout or stderr closed, open() can hand out 1 or 2 itself.
+            if out_fd > 2 { let _ = bfs_close(out_fd.to_i32()) }
+            if err_fd > 2 { let _ = bfs_close(err_fd.to_i32()) }
+            let _ = bfs_close(live.to_i32())
+            process_exec(program, args)
+        }
+    }
+    // Before the next spawn: a later child that inherits live_w would hold this pipe open.
+    for fd in [out_fd, err_fd, live_w] {
+        if fd >= 0 { let _ = bfs_close(fd.to_i32()) }
+    }
+    if pid < 0 && live >= 0 {
+        let _ = bfs_close(live.to_i32())
+    }
+    FileChild { pid: pid, live: if pid < 0 { -1 } else { live }, out_path: out_path, err_path: err_path }
+}
+
+// Blocks until at least one child with a live pipe has ended and answers the places of all
+// that have, or [] when poll fails for more than a signal, so the caller waits on a pid.
+pub fn ended_children(children: List[FileChild]) -> List[Int] ! IO {
+    let mut fds: List[Pollfd] = []
+    let mut places: List[Int] = []
+    let mut i = 0
+    while i < children.len() {
+        let c = children.get(i).unwrap()
+        if c.live >= 0 {
+            fds.push(Pollfd { fd: c.live.to_i32(), events: POLL_EVT_IN.to_i16(), revents: 0.to_i16() })
+            places.push(i)
+        }
+        i = i + 1
+    }
+    let mut ended: List[Int] = []
+    if fds.len() == 0 { return ended }
+    loop {
+        match poll(fds, -1) {
+            Ok(got) => {
+                let mut j = 0
+                while j < got.len() {
+                    // No one writes to the pipe, so any event is its end: a hang-up, or a
+                    // read of nothing where a host reports no hang-up for a pipe.
+                    if got.get(j).unwrap().revents.to_int() != 0 {
+                        ended.push(places.get(j).unwrap())
+                    }
+                    j = j + 1
+                }
+                if ended.len() > 0 { return ended }
+            }
+            Err(_) => {
+                // EINTR is 4 on Linux and macOS: the signal forwarding handler ran.
+                if bfs_errno() != 4 { return ended }
+            }
+        }
+    }
+    ended
+}
+
+// Waits for child to end and answers its exit code (128 plus the signal that ended it, as a
+// captured run gives) and its output, then removes its output files.
+pub fn reap_to_files(child: FileChild) -> ProcessResult ! IO {
+    if child.live >= 0 {
+        let _ = bfs_close(child.live.to_i32())
+    }
+    let mut exit_code = -1
+    let mut err_note = ""
+    if child.pid > 0 {
+        let mut status = -1
+        with ffi.scope() as scope {
+            let cell = scope.alloc[I32]()
+            loop {
+                let r = bfs_waitpid(child.pid.to_i32(), cell, 0.to_i32()).to_int()
+                if r == child.pid {
+                    status = cell.deref().to_int()
+                    break
+                }
+                // EINTR is 4 on Linux and macOS.
+                if r > 0 || bfs_errno() != 4 { break }
+            }
+        }
+        if status >= 0 {
+            if (status & 127) == 0 {
+                exit_code = (status >> 8) & 255
+            } else if (status & 127) != 127 {
+                exit_code = 128 + (status & 127)
+            }
+        }
+    } else {
+        err_note = "fork() failed"
+    }
+    let out = read_file(child.out_path)
+    let err_out = read_file(child.err_path)
+    fs_remove(child.out_path)
+    fs_remove(child.err_path)
+    ProcessResult { out: out, err_out: "{err_out}{err_note}", exit_code: exit_code }
+}
+
 // An @ffi function's C name has no module part, so these carry the module in their own names.
 @ffi("mkdir", header: "sys/stat.h")
 @trusted(audit: "Wraps mkdir(2). path is a NUL-terminated copy from ffi.scope(); mode is 0777 or 0700.")
@@ -354,3 +489,23 @@ fn bfs_fork() -> I32 ! FFI {}
 @ffi("waitpid", header: "sys/wait.h")
 @trusted(audit: "Wraps waitpid(2) on a child bfs_fork made. status is one I32 cell from ffi.scope(); options is 0, so it blocks.")
 fn bfs_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
+
+@ffi("pipe", header: "unistd.h")
+@trusted(audit: "Wraps pipe(2). fds is a two-I32 buffer from ffi.scope(); int is 32 bits on every host.")
+fn bfs_pipe(fds: Ptr[I32]) -> I32 ! FFI {}
+
+@ffi("dup2", header: "unistd.h")
+@trusted(audit: "Wraps dup2(2) in a child bfs_fork made, on descriptors bfs_open returned, before it execs.")
+fn bfs_dup2(from: I32, to: I32) -> I32 ! FFI {}
+
+// struct linger is two ints, so the two descriptors pipe(2) writes are read through it. A
+// Ptr[I32] has no offset, so the second cannot be read in place.
+@ffi.struct(header: "sys/socket.h", name: "linger")
+type BfsIntPair {
+    l_onoff: I32,
+    l_linger: I32,
+}
+
+@ffi("memcpy", header: "string.h")
+@trusted(audit: "Wraps memcpy(3). dst is one BfsIntPair cell and src the two-I32 region bfs_pipe filled, both from ffi.scope(); n is 8, the size of each.")
+fn bfs_memcpy(dst: Ptr[BfsIntPair], src: Ptr[I32], n: U64) -> Ptr[Void] ! FFI {}

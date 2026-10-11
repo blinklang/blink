@@ -721,6 +721,17 @@ fn spawn_command(cmd: Str) -> Int ! IO {
     process_spawn("sh", ["-c", cmd])
 }
 
+// spawn_command for a unit compile, its output written to files in dir named for its place.
+fn spawn_unit(cmd: Str, dir: Str, place: Int) -> build_fs.FileChild ! IO {
+    let out_path = "{dir}/{place}.cc-out"
+    let err_path = "{dir}/{place}.cc-err"
+    let words = build_fs.plain_words(cmd)
+    if words.len() > 0 && build_fs.find_program(words[0]) != "" {
+        return build_fs.spawn_to_files(words[0], words_after_first(words), out_path, err_path)
+    }
+    build_fs.spawn_to_files("sh", ["-c", cmd], out_path, err_path)
+}
+
 fn words_after_first(words: List[Str]) -> List[Str] {
     let mut rest: List[Str] = []
     let mut i = 1
@@ -2222,10 +2233,12 @@ fn finish_pch(run: UnitRun) -> Bool ! IO {
 // Answers one result per unit, indexed by its place in the list.
 // The children are started and reaped from this thread rather than from async tasks: the
 // async pool has four threads and a task that waits on a child holds one, so tasks could
-// never run more than four at once. Children are reaped in start order with no wait for
-// whichever ends first, so a child that ends early holds its slot until those started
-// before it are reaped.
-fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int) -> UnitRun ! IO {
+// never run more than four at once. Whichever unit ends first frees its slot for the next
+// one, so a unit that ends early does not wait on a long one started before it. A unit
+// writes its output to files in io_dir, which a slow reap cannot fill as it can a pipe.
+// Only the units are waited on by pid, so no child another part of this process started is
+// reaped here.
+fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int, io_dir: Str) -> UnitRun ! IO {
     let n = plain.len()
     let mut by_idx: List[UnitCompile] = []
     if n == 0 { return UnitRun { results: by_idx, pch_stored: false, pch: no_pch_job(), pch_pid: -1 } }
@@ -2240,12 +2253,12 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
         pch_pid = spawn_command(pch.cmd)
     }
     let slots = if pch_pid >= 0 && jobs > 1 { jobs - 1 } else { jobs }
-    let mut pids: List[Int] = []
+    let mut units: List[build_fs.FileChild] = []
     let mut used: List[Bool] = []
     let mut started = 0
     while started < n && started < slots {
         let reads_pch = ready && with_pch.get(started).unwrap() != ""
-        pids.push(spawn_command(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+        units.push(spawn_unit(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }, io_dir, started))
         used.push(reads_pch)
         started = started + 1
     }
@@ -2260,23 +2273,44 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
         }
         if started < n && slots < jobs {
             let reads_pch = ready && with_pch.get(started).unwrap() != ""
-            pids.push(spawn_command(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+            units.push(spawn_unit(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }, io_dir, started))
             used.push(reads_pch)
             started = started + 1
         }
         pch_pid = -1
     }
-    let mut idx = 0
-    while idx < n {
-        let r = process_pid_wait(pids.get(idx).unwrap())
-        by_idx.push(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out, used_pch: used.get(idx).unwrap() })
-        if started < n {
-            let reads_pch = ready && with_pch.get(started).unwrap() != ""
-            pids.push(spawn_command(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
-            used.push(reads_pch)
-            started = started + 1
+    let mut ends: List[Option[UnitCompile]] = []
+    for _ in units {
+        ends.push(None)
+    }
+    let mut reaped = 0
+    while reaped < n {
+        let mut ended = build_fs.ended_children(units)
+        if ended.len() == 0 {
+            // poll failed, or no unit has a pipe: wait on the first unit not yet reaped.
+            let mut first = 0
+            while ends.get(first).unwrap().is_some() {
+                first = first + 1
+            }
+            ended = [first]
         }
-        idx = idx + 1
+        for idx in ended {
+            let u = units.get(idx).unwrap()
+            let r = build_fs.reap_to_files(u)
+            units.set(idx, build_fs.FileChild { pid: -1, live: -1, out_path: u.out_path, err_path: u.err_path })
+            ends.set(idx, Some(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out, used_pch: used.get(idx).unwrap() }))
+            reaped = reaped + 1
+            if started < n {
+                let reads_pch = ready && with_pch.get(started).unwrap() != ""
+                units.push(spawn_unit(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }, io_dir, started))
+                used.push(reads_pch)
+                ends.push(None)
+                started = started + 1
+            }
+        }
+    }
+    for e in ends {
+        by_idx.push(e.unwrap())
     }
     UnitRun { results: by_idx, pch_stored: stored, pch: pch, pch_pid: pch_pid }
 }
@@ -2467,7 +2501,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     if build_objcache.dev_evict_at("compile") {
         dbg_trace("build.units", "dev evict compile")
     }
-    let run = run_unit_compiles(cmds, pch_cmds, pch_ready, pch, unit_jobs)
+    let run = run_unit_compiles(cmds, pch_cmds, pch_ready, pch, unit_jobs, obj_dir)
     let mut results = run.results
     // gcc stops on a .gch cut short, where it reads the header beside any other .gch it cannot
     // take. So a unit that failed with the PCH compiles once more without it, and the PCH goes
@@ -2481,7 +2515,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         }
     }
     let mut dropped = false
-    for a in run_unit_compiles(retry_cmds, retry_cmds, false, no_pch_job(), unit_jobs).results {
+    for a in run_unit_compiles(retry_cmds, retry_cmds, false, no_pch_job(), unit_jobs, obj_dir).results {
         let idx = retry_idx.get(a.idx).unwrap()
         dbg_trace("build.units", "pch fallback {misses.get(idx).unwrap().stem} exit {a.exit_code}")
         if a.exit_code == 0 && !dropped {
