@@ -58,7 +58,8 @@
 #
 # Split. A `cc` wrapper first on PATH logs each cc call. cc_s is the time at least one
 # `cc -c` call ran (the units, which run in parallel, so their overlap counts once, and the
-# std monolith in cold-all; with --no-per-module the user unit), link_s sums the other calls but
+# std monolith in cold-all; with --no-per-module the user unit) or a PCH build of the archive
+# header ran beside them, and is in cc_calls; link_s sums the other calls but
 # `cc --version`, and emit_s = wall - cc_s - link_s: front end, codegen, cache hashing
 # and process start. Each split column is its own median, so they need not add up to
 # median_s. The wrapper costs a few ms per call. No trace in blink gives this split.
@@ -129,7 +130,7 @@ t1=\$EPOCHREALTIME
 kind=link
 for a in "\$@"; do
     case "\$a" in
-        -c) kind=cc ;;
+        -c|c-header) kind=cc ;;
         --version) kind=id; break ;;
     esac
 done

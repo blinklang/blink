@@ -1,0 +1,130 @@
+// gcc stops with an error on a PCH cut short, and warns and reads the header on one it
+// rejects. Neither may fail a build: a unit that failed with the PCH compiles again
+// without it.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs the real cc
+// with -H on each compile, so its log names the PCH a unit read ("! <path>.gch"). Each
+// compile logs to a file of its own: gcc writes -H lines in pieces, which parallel compiles
+// would interleave in one file.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) exec {real_cc} \"$@\" -H 2>\"$(mktemp {tree}/cc_h/XXXXXX)\" ;; esac\nexec {real_cc} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    // A program's first build makes no PCH, so the tree starts with one build behind it.
+    edit_main(tree, 0)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with its own object cache, the -H cc and the unit trace. The corpus
+// exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the
+// run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_ok(tree: Str, flags: Str) {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+}
+
+// The compiles of the last build that read a PCH from the object cache.
+fn pch_reads(tree: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! {tree}/objcache/[0-9a-f]*\\.pch/libblink_std\\.h\\.gch$'").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+// build_ok, answering what the build printed.
+fn build_out(tree: Str, flags: Str) -> Str {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    "{r.out}{r.err_out}"
+}
+
+fn the_gch(tree: Str, dir: Str) -> Str {
+    "{tree}/objcache/{dir}/libblink_std.h.gch"
+}
+
+test "a truncated, garbage or mismatched archive header PCH falls back to the header" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_pch_fallback_{getpid()}"
+    dev_tree(root, tree)
+    build_ok(tree, "")
+    let dirs = pch_dirs(tree)
+    assert(dirs.len() == 1, "the first build made {dirs.len()} PCH dirs")
+    let dir = dirs.get(0).unwrap()
+    edit_main(tree, 2)
+    build_ok(tree, "")
+    let warm_reads = pch_reads(tree)
+
+    shell_exec("head -c 100000 {the_gch(tree, dir)} > {tree}/cut && mv {tree}/cut {the_gch(tree, dir)}")
+    edit_main(tree, 3)
+    let truncated_out = build_out(tree, "")
+    let truncated = sh("{tree}/out/app")
+    let dirs_after_cut = pch_dirs(tree).len()
+    edit_main(tree, 13)
+    build_ok(tree, "")
+    let remade_bytes = sh("wc -c < {the_gch(tree, dir)}").to_int()
+
+    shell_exec("mkdir -p {tree}/objcache/{dir} && printf garbage > {the_gch(tree, dir)}")
+    edit_main(tree, 4)
+    build_ok(tree, "")
+    let garbage_reads = pch_reads(tree)
+    let garbage = sh("{tree}/out/app")
+
+    // A PCH of the same header built for a debug build, under the key of the default one.
+    edit_main(tree, 5)
+    build_ok(tree, "--debug")
+    let mut debug_dir = ""
+    for d in pch_dirs(tree) {
+        if d != dir { debug_dir = d }
+    }
+    shell_exec("mkdir -p {tree}/objcache/{dir} && cp {the_gch(tree, debug_dir)} {the_gch(tree, dir)}")
+    edit_main(tree, 6)
+    build_ok(tree, "")
+    let mismatched_reads = pch_reads(tree)
+    let mismatched = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(warm_reads >= 1, "the warm build read no PCH, so the fallback cases prove nothing")
+    // gcc stops on the cut .gch, so the unit compiles again without it.
+    assert(truncated_out.contains("pch fallback __main__ exit 0"), "no fallback compile: {truncated_out}")
+    assert_eq(truncated, "sum 44")
+    // The fallback compile passed, so the build dropped the cut PCH, and the next build made
+    // it again under the same key.
+    assert_eq(dirs_after_cut, 0)
+    assert(remade_bytes > 1000000, "the next build made a .gch of {remade_bytes} bytes")
+    assert_eq(garbage_reads, 0)
+    assert_eq(garbage, "sum 45")
+    assert(debug_dir != "", "the debug build made no PCH of its own")
+    assert_eq(mismatched_reads, 0)
+    assert_eq(mismatched, "sum 47")
+}

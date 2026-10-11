@@ -6,6 +6,7 @@
 //
 //   <16-hex>.o                — the cached object
 //   <16-hex>.meta             — "<unix-mtime> <module_key> <src_sha>"
+//   <16-hex>.pch/             — a PCH of the archive header (see pch_key)
 //   tmp/unit.<rand>/          — a build's private C snapshot and staged .o
 //   tmp/<label>.<pid>.<n>.o   — `blink cache __store` staging
 //
@@ -122,8 +123,9 @@ pub fn compute_obj_key(
 }
 
 // "<path>=<sha256>" for each header in dirs. None when one cannot be hashed, so a header
-// the unit may read never drops out of the key.
-fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
+// the unit may read never drops out of the key. A build hashes them once for every key it
+// makes: a vendored header can be large (sqlite3.h is 680 KB).
+pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
     let mut lines: List[Str] = []
     let mut paths: List[Str] = []
     for d in dirs {
@@ -343,6 +345,24 @@ pub fn unit_keys_from(
     flags: List[Str],
     target: Str,
 ) -> Map[Str, Str] ! IO {
+    match header_lines_in(vendored_include_dirs) {
+        Some(lines) => unit_keys_with_headers(shas, modules, unit_headers, arc_dir, lines, blinkc_sha, cc_id, flags, target)
+        None => Map()
+    }
+}
+
+// unit_keys_from over the lines header_lines_in answered for the vendored include dirs.
+pub fn unit_keys_with_headers(
+    shas: Map[Str, Str],
+    modules: List[Str],
+    unit_headers: Map[Str, List[Str]],
+    arc_dir: Str,
+    vendored_headers: List[Str],
+    blinkc_sha: Str,
+    cc_id: Str,
+    flags: List[Str],
+    target: Str,
+) -> Map[Str, Str] ! IO {
     let mut keys: Map[Str, Str] = Map()
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
         return keys
@@ -363,15 +383,8 @@ pub fn unit_keys_from(
         }
         headers.push("libblink_std.h.gch={pch_sha}")
     }
-    match header_lines_in(vendored_include_dirs) {
-        Some(lines) => {
-            for line in lines {
-                headers.push(line)
-            }
-        }
-        None => {
-            return keys
-        }
+    for line in vendored_headers {
+        headers.push(line)
     }
     // The inputs every unit shares go into one digest that each unit's manifest names. Put
     // in full in every manifest, the header list grows with units times headers.
@@ -550,6 +563,89 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
     out
 }
 
+// A unit spends most of a small compile parsing the archive header, so a gcc build keeps a
+// PCH of it here: <key>.pch/ holds copies of libblink_std.h and runtime.h and the .gch built
+// from them, and <key>.meta its mtime for the LRU. The key covers what gcc needs to take the
+// .gch: the header bytes, the compiler, every flag, the macros a unit defines before the
+// header, each include dir and the headers in it (vendored_headers, as header_lines_in
+// answers them for those dirs), and the archive dir the debug info names in place of the PCH
+// dir. gcc checks the rest itself and reads the header copy beside a .gch it rejects, so a
+// unit's object, and its key, do not depend on the PCH.
+pub fn pch_key(archive_sha: Str, runtime_sha: Str, cc_id: Str, arc_dir: Str, flags: List[Str], defines: List[Str], include_flags: List[Str], vendored_headers: List[Str]) -> Str {
+    if archive_sha == "" || runtime_sha == "" || cc_id == "" {
+        return ""
+    }
+    let mut lines = ["schema:pch-1", "libblink_std.h={archive_sha}", "runtime.h={runtime_sha}", "cc_id:{cc_id}", "arc_dir:{arc_dir}"]
+    for f in sorted_strs(flags) {
+        lines.push("flag:{f}")
+    }
+    for d in defines {
+        lines.push("define:{d}")
+    }
+    for f in include_flags {
+        lines.push("include:{f}")
+    }
+    // A vendored header the archive header pulls in under a gate is part of the PCH.
+    for h in sorted_strs(vendored_headers) {
+        lines.push("import:{h}")
+    }
+    digest_of_lines(lines)
+}
+
+pub fn pch_dir(key: Str) -> Str {
+    "{obj_cache_dir()}/{key}.pch"
+}
+
+// The PCH dir for key when its .gch is in place, and its entry marked as used; "" when not.
+pub fn lookup_pch(key: Str) -> Str ! IO {
+    if !cache_enabled() || key == "" {
+        return ""
+    }
+    let dir = pch_dir(key)
+    if file_exists("{dir}/libblink_std.h.gch") == 0 {
+        return ""
+    }
+    let _ = build_fs.touch("{obj_cache_dir()}/{key}.meta")
+    dir
+}
+
+// A private dir that holds copies of the archive's libblink_std.h and runtime.h, for a PCH
+// build to write its .gch beside; "" when the copies do not hash to the shas the key was
+// made from, as when the archive changed after the build hashed it.
+pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO {
+    let dir = make_private_dir()
+    if dir == "" {
+        return ""
+    }
+    for pair in [("libblink_std.h", archive_sha), ("runtime.h", runtime_sha)] {
+        let (name, sha) = pair
+        write_file("{dir}/{name}", read_file("{arc_dir}/{name}"))
+        if (sha256_file_hex("{dir}/{name}") ?? "") != sha {
+            let _ = build_fs.remove_tree(dir)
+            return ""
+        }
+    }
+    dir
+}
+
+// Installs the staged dir as the PCH for key. False when another build installed it first, or
+// the rename failed; the staged dir is gone either way.
+pub fn store_pch(key: Str, staged: Str) -> Bool ! IO {
+    let dir = pch_dir(key)
+    if build_fs.rename(staged, dir) {
+        write_file("{obj_cache_dir()}/{key}.meta", "{time.read().to_unix_secs()} pch \n")
+        return true
+    }
+    let _ = build_fs.remove_tree(staged)
+    false
+}
+
+// Drops the PCH for key, as when a unit that read it failed and compiled without it.
+pub fn drop_pch(key: Str) ! IO {
+    let _ = build_fs.remove_tree(pch_dir(key))
+    fs_remove("{obj_cache_dir()}/{key}.meta")
+}
+
 // The apparent bytes of the files under dir. du would count the blocks they take, which can
 // differ; the cap only starts an eviction and never changes what a build writes, so either
 // unit holds it, and this one starts no program.
@@ -610,8 +706,10 @@ pub fn maybe_gc() ! IO {
         let meta_path = lines.get(idx).unwrap().trim()
         if meta_path != "" {
             let obj_path = meta_path.replace(".meta", ".o")
-            let freed = tree_bytes(obj_path, 0) + tree_bytes(meta_path, 0)
+            let pch_path = meta_path.replace(".meta", ".pch")
+            let freed = tree_bytes(obj_path, 0) + tree_bytes(meta_path, 0) + tree_bytes(pch_path, 0)
             fs_remove(obj_path)
+            let _ = build_fs.remove_tree(pch_path)
             fs_remove(meta_path)
             total = total - freed
         }
@@ -638,7 +736,7 @@ pub fn cmd_clean(older_than: Str) -> Int {
         return 0
     }
     if older_than == "" {
-        shell_exec("rm -rf {dir}/*.o {dir}/*.meta 2>/dev/null")
+        shell_exec("rm -rf {dir}/*.o {dir}/*.pch {dir}/*.meta 2>/dev/null")
         return 0
     }
     // older_than format: "Nd" / "Nh" / "Nm". Convert to find -mtime / -mmin.
@@ -665,7 +763,8 @@ pub fn cmd_clean(older_than: Str) -> Int {
         let meta = lines.get(i).unwrap().trim()
         if meta != "" {
             let obj = meta.replace(".meta", ".o")
-            shell_exec("rm -f {meta} {obj}")
+            let pch = meta.replace(".meta", ".pch")
+            shell_exec("rm -rf {meta} {obj} {pch}")
         }
         i = i + 1
     }

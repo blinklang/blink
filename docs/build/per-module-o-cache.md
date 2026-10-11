@@ -160,6 +160,19 @@ Without that policy, two cached `.o`s could carry conflicting external
 copies of the same mono. With it, cached `.o`s compose under `cc`'s
 linker exactly as freshly-built ones do.
 
+### 8. A PCH of the archive header
+
+The cache also holds a gcc PCH of `libblink_std.h`: `<key>.pch/` holds
+copies of `libblink_std.h` and `runtime.h` and the `.gch`, with
+`<key>.meta` for the LRU. GC and `blink cache clean` treat the dir as one
+entry, and its bytes count toward the cap. A program's first build makes
+no PCH. The key holds what gcc needs to take the `.gch`: both header
+shas, the cc id, the archive dir, every flag, the macros a unit defines
+before the include, each include flag and the sha of each header in each
+include dir. It is not part of a unit's obj key, since an object built
+with the PCH is byte-equal to one built without it. See "A PCH of the
+archive header" in `per-module-o-default.md`.
+
 ## Out of scope
 
 - Caching the blinkc front-end (lex/parse/typecheck). Front-end cost is

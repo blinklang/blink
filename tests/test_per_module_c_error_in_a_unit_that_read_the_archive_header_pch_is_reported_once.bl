@@ -1,0 +1,81 @@
+// A unit that read the PCH and failed compiles once more without it, since gcc stops on a
+// .gch cut short. When the unit holds a real C error, both compiles report it, and the build
+// must print it once: the report of the compile that ran last.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs the real cc.
+// While {tree}/break exists, it compiles the entry unit with a header that holds a C error.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    write_file("{tree}/bad.h", "int injected_c_error = ;\n")
+    write_file("{tree}/bin/cc", "#!/bin/sh\nif [ -f {tree}/break ]; then case \" $* \" in *__main__.c*) set -- \"$@\" -include {tree}/bad.h ;; esac; fi\nexec {real_cc} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with its own object cache, the -H cc and the unit trace. The corpus
+// exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the
+// run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_ok(tree: Str, flags: Str) {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+fn count_of(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+test "a C error in a unit that read the archive header PCH is reported once" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_pch_c_error_{getpid()}"
+    dev_tree(root, tree)
+    build_ok(tree, "")
+    edit_main(tree, 2)
+    build_ok(tree, "")
+    let dirs = pch_dirs(tree)
+    shell_exec("touch {tree}/break")
+    edit_main(tree, 3)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    let out = "{r.out}{r.err_out}"
+    let dirs_after = pch_dirs(tree)
+    shell_exec("rm -rf {tree}")
+    assert_eq(dirs.len(), 1)
+    assert(r.exit_code != 0, "the build passed: {out}")
+    // Both compiles ran, the one with the PCH and the one without it.
+    assert(out.contains("pch fallback __main__ exit 1"), "no fallback compile: {out}")
+    assert_eq(count_of(out, "error: expected expression"), 1)
+    // The compile without the PCH failed too, so the PCH was not at fault and stays.
+    assert_eq(dirs_after.len(), 1)
+}

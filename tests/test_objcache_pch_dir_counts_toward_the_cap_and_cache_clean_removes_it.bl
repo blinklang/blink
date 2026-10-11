@@ -1,0 +1,75 @@
+// A PCH of the archive header lives in the object cache as <key>.pch/ beside <key>.meta. Its
+// bytes count toward the cap, eviction takes it by the age of its meta like an object, and
+// both forms of `blink cache clean` remove it.
+
+import build_objcache
+import std.process.{ProcessResult}
+
+let DIR = "build/objcache_pch_dir_gc_probe"
+
+fn obj_entry(dir: Str, key: Str, kib: Int, age: Str) {
+    shell_exec("head -c {kib * 1024} /dev/zero > {dir}/{key}.o && echo '1 mod ' > {dir}/{key}.meta && touch -d '{age}' {dir}/{key}.meta")
+}
+
+fn pch_entry(dir: Str, key: Str, kib: Int, age: Str) {
+    shell_exec("mkdir -p {dir}/{key}.pch && head -c {kib * 1024} /dev/zero > {dir}/{key}.pch/libblink_std.h.gch && echo x > {dir}/{key}.pch/libblink_std.h && echo '1 pch ' > {dir}/{key}.meta && touch -d '{age}' {dir}/{key}.meta")
+}
+
+fn gc_with_cap(mb: Int) ! IO {
+    env.set_var("BLINK_CACHE_DIR", DIR)
+    env.set_var("BLINK_CACHE_SIZE_MB", "{mb}")
+    build_objcache.maybe_gc()
+    env.remove_var("BLINK_CACHE_SIZE_MB")
+    env.remove_var("BLINK_CACHE_DIR")
+}
+
+fn in_cache(dir: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "BLINK_CACHE_DIR={dir} build/blink cache {args}"])
+}
+
+test "the bytes of a PCH dir count toward the cap" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/tmp")
+    obj_entry(DIR, "1111111111111111", 400, "2 hours ago")
+    pch_entry(DIR, "aaaaaaaaaaaaaaaa", 800, "1 hour ago")
+    gc_with_cap(1)
+    // The object alone is under the cap; only the PCH bytes push the cache past it.
+    assert_eq(file_exists("{DIR}/1111111111111111.o"), 0)
+    assert_eq(file_exists("{DIR}/aaaaaaaaaaaaaaaa.pch/libblink_std.h.gch"), 1)
+    assert_eq(file_exists("{DIR}/aaaaaaaaaaaaaaaa.meta"), 1)
+}
+
+test "eviction removes the oldest PCH dir with its meta" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/tmp")
+    pch_entry(DIR, "aaaaaaaaaaaaaaaa", 800, "3 hours ago")
+    obj_entry(DIR, "1111111111111111", 400, "1 hour ago")
+    gc_with_cap(1)
+    assert_eq(file_exists("{DIR}/aaaaaaaaaaaaaaaa.pch"), 0)
+    assert_eq(file_exists("{DIR}/aaaaaaaaaaaaaaaa.meta"), 0)
+    assert_eq(file_exists("{DIR}/1111111111111111.o"), 1)
+}
+
+test "cache clean removes every PCH dir" {
+    let scratch = process_run("sh", ["-c", "mktemp -d"]).out.trim()
+    pch_entry(scratch, "aaaaaaaaaaaaaaaa", 4, "1 hour ago")
+    obj_entry(scratch, "1111111111111111", 4, "1 hour ago")
+    let r = in_cache(scratch, "clean")
+    let pch_left = file_exists("{scratch}/aaaaaaaaaaaaaaaa.pch")
+    let meta_left = file_exists("{scratch}/aaaaaaaaaaaaaaaa.meta")
+    shell_exec("rm -rf {scratch}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(pch_left, 0)
+    assert_eq(meta_left, 0)
+}
+
+test "cache clean --older-than removes an old PCH dir and keeps a new one" {
+    let scratch = process_run("sh", ["-c", "mktemp -d"]).out.trim()
+    pch_entry(scratch, "aaaaaaaaaaaaaaaa", 4, "3 days ago")
+    pch_entry(scratch, "bbbbbbbbbbbbbbbb", 4, "1 hour ago")
+    let r = in_cache(scratch, "clean --older-than 1d")
+    let old_left = file_exists("{scratch}/aaaaaaaaaaaaaaaa.pch")
+    let new_left = file_exists("{scratch}/bbbbbbbbbbbbbbbb.pch/libblink_std.h.gch")
+    shell_exec("rm -rf {scratch}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(old_left, 0)
+    assert_eq(new_left, 1)
+}

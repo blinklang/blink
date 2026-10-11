@@ -1,0 +1,110 @@
+// A unit under a native dep gate reads the dep's header through the PCH, so the PCH key
+// holds the hash of each header in the dep's include dir. An edit to that header makes a new
+// PCH under a new key; the old one, built from the old header, is never read again.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program whose store module uses sqlite, and a cc first on PATH that runs the real cc
+// with -H on each compile, so its log names the PCH a unit read ("! <path>.gch"). Each
+// compile logs to a file of its own: gcc writes -H lines in pieces, which parallel compiles
+// would interleave in one file.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin {tree}/.tmp")
+    // The build skips compiling sqlite3 when .tmp holds an object no older than its source. The
+    // corpus puts one in each sandbox; a copy with its mtime spares each tree that compile.
+    shell_exec("for o in {root}/.tmp/*.o; do [ -f \"$o\" ] && cp -p \"$o\" {tree}/.tmp/; done; true")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    // The tree gets its own copy of the sqlite sources, so the test can edit the header. The
+    // copy keeps the mtimes, so the object in .tmp stays newer than its source.
+    shell_exec("mkdir -p {tree}/lib/native && ln -s {root}/lib/std {tree}/lib/std && ln -s {root}/lib/pkg {tree}/lib/pkg")
+    shell_exec("cp -rp {root}/lib/native/sqlite3 {tree}/lib/native/sqlite3")
+    shell_exec("ln -s {tree}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) exec {real_cc} \"$@\" -H 2>\"$(mktemp {tree}/cc_h/XXXXXX)\" ;; esac\nexec {real_cc} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_store_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/main.bl", [
+        #"import store.{stored_names}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("stored {stored_names()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    // A program's first build makes no PCH, so the tree starts with one build behind it.
+    edit_store(tree, 0)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    edit_store(tree, 1)
+}
+
+fn edit_store(tree: Str, n: Int) {
+    write_file("{tree}/app/src/store.bl", [
+        #"import std.db_sqlite.{sqlite_open, sqlite_handler}"#,
+        #""#,
+        #"pub fn stored_names() -> Str {"#,
+        #"    let handle = sqlite_open(":memory:")"#,
+        #"    with sqlite_handler(handle) {"#,
+        #"        db.exec("CREATE TABLE t (name TEXT)").unwrap()"#,
+        "        db.exec(\"INSERT INTO t VALUES ('kept {n}')\").unwrap()",
+        #"        let rows = db.query("SELECT name FROM t").unwrap()"#,
+        #"        rows.get(0).unwrap().get("name").unwrap()"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with its own object cache, the -H cc and the unit trace. The corpus
+// exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the
+// run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_out(tree: Str, flags: Str) -> Str {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    "{r.out}{r.err_out}"
+}
+
+// The compiles of the last build that read a PCH from the object cache.
+fn pch_reads(tree: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! {tree}/objcache/[0-9a-f]*\\.pch/libblink_std\\.h\\.gch$'").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+test "an edit to a vendored header gives the archive header PCH a new key" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_pch_vendored_header_{getpid()}"
+    dev_tree(root, tree)
+    edit_store(tree, 2)
+    let _ = build_out(tree, "")
+    let before = pch_dirs(tree)
+    shell_exec("printf '\\n/* edited */\\n' >> {tree}/lib/native/sqlite3/sqlite3.h")
+    edit_store(tree, 3)
+    let edited = build_out(tree, "")
+    let after = pch_dirs(tree)
+    let edited_run = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(before.len(), 1)
+    assert_eq(after.len(), 2)
+    assert(edited.contains("pch build"), "the build after the header edit made no PCH: {edited}")
+    assert_eq(edited_run, "stored kept 3")
+}
