@@ -275,14 +275,17 @@ BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args)
 BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args) {
     int64_t h = blink_pid_table_alloc();
     if (h < 0) return -1;
-    /* Dev knob: BLINK_DEV_PID_CLAIM_DELAY_US=<n> sleeps n microseconds after the slot is
-     * taken, so a test can make concurrent spawns ask for slots while this one fills its own. */
-    const char* claim_delay = getenv("BLINK_DEV_PID_CLAIM_DELAY_US");
-    if (claim_delay && *claim_delay) {
-        long us = atol(claim_delay);
+#ifdef BLINK_DEV_PID_CLAIM_DELAY_US
+    /* Dev knob: cc -DBLINK_DEV_PID_CLAIM_DELAY_US=<n> sleeps n microseconds after the slot is
+     * taken, so a test can make concurrent spawns ask for slots while this one fills its own.
+     * A cc define and not an env var, as no binary blink builds should carry it: these bodies
+     * live in the std archive, so only a standalone runtime.h build compiled with it has it. */
+    {
+        long us = (long)(BLINK_DEV_PID_CLAIM_DELAY_US);
         struct timespec ts = { us / 1000000, (us % 1000000) * 1000 };
         nanosleep(&ts, NULL);
     }
+#endif
     blink_pid_slot* slot = &blink_pid_table[h];
 
     int out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
