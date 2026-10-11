@@ -1,0 +1,80 @@
+// A per-module build runs at most --jobs unit compiles at once. When a unit ends, the next
+// unit starts in its slot, even while a unit that started before it still compiles.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of five units: big, the largest, so it starts first, and
+// __main__, a, b and c. A cc first on PATH holds the compile of big until the other four
+// compiles have ended, and gives up after 20 s, leaving timed_out. With two slots, the other
+// four can end first only if each one that ends frees its slot while big still compiles.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin {tree}/done")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    let script = [
+        "#!/bin/sh",
+        "case \" $* \" in *\" -c \"*) ;; *) exec {real_cc} \"$@\" ;; esac",
+        "for a in \"$@\"; do case \"$a\" in *.c) unit=$(basename \"$a\" .c) ;; esac; done",
+        "if [ \"$unit\" = big ]; then",
+        "    n=0",
+        "    while [ $(ls {tree}/done | wc -l) -lt 4 ]; do",
+        "        n=$((n + 1))",
+        "        if [ $n -ge 400 ]; then touch {tree}/timed_out; break; fi",
+        "        sleep 0.05",
+        "    done",
+        "fi",
+        "{real_cc} \"$@\"",
+        "rc=$?",
+        "touch {tree}/done/$unit",
+        "exit $rc",
+    ]
+    write_file("{tree}/bin/cc", "{script.join("\n")}\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"slot_app\"\nversion = \"0.1.0\"\n")
+    let mut big: List[Str] = []
+    let mut i = 1
+    while i <= 60 {
+        big.push("pub fn big_{i}(x: Int) -> Int \{\n    let mut s = x\n    for j in 0..{i} \{ s = s + j * {i} \}\n    s\n\}\n")
+        i = i + 1
+    }
+    write_file("{tree}/app/src/big.bl", big.join("\n"))
+    for m in ["a", "b", "c"] {
+        write_file("{tree}/app/src/{m}.bl", "pub fn {m}_value() -> Int \{\n    1\n\}\n")
+    }
+    write_file("{tree}/app/src/main.bl", "import big.\{big_1\}\nimport a.\{a_value\}\nimport b.\{b_value\}\nimport c.\{c_value\}\n\nfn main() \{\n    io.println(\"sum \{big_1(1) + a_value() + b_value() + c_value()\}\")\n\}\n")
+}
+
+// Runs blink in the tree with its own object cache and the holding cc. The corpus exports
+// BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the run drops
+// them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_JOBS PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_ARCHIVE_PCH=0 BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+test "a unit that ends early frees its slot for the next unit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_unit_slot_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module --jobs 2")
+    let timed_out = file_exists("{tree}/timed_out") == 1
+    let done = sh("ls {tree}/done | LC_ALL=C sort | tr '\\n' ' '")
+    let run = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    assert_eq(done, "__main__ a b big c")
+    assert(!timed_out, "big held its slot until the 20 s limit: the other units waited for it")
+    assert_eq(run, "sum 4")
+}
