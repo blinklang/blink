@@ -1982,6 +1982,69 @@ about as long as its six units and the link together. Each base run has
 a max of 0.088 or 0.092 s and each change run a min of 0.087 s, so the
 spreads overlap. The first edit after it saves 12 ms.
 
+### Holds against a concurrent GC
+
+Two builds that share an obj cache can race: the GC of one can remove an
+entry the other found or stored and has not linked yet, and that link
+fails. Two loops of 100 builds, one cache, a cap of 0 MB: 24 of 200
+builds failed with `ld: cannot find <cache>/<key>.o`. A build now links
+only names in a private dir of its own, and its units read the archive
+header PCH from there too. Section 5 of `per-module-o-cache.md` gives the
+design. After the change the same loops, 150 builds each, ran with no
+failure, and each build printed the right output.
+
+A first cut tried a hard link for each unit and then a `cp` when the link
+failed. A miss has no object to link, so each missed unit ran a `cp` that
+failed: 69 processes and 0.85 s more on a cold build of cli. The hold now
+copies only an object that is there.
+
+#### Bench
+
+Through the daemon, settle 1 s, then without the daemon for the cold
+cases; 11 reps, median seconds (min-max). Base and the change ran in
+turn: base, change, base, change. Base is gen1 of `d8eb38b8` (sha256
+`8b2d8683…`), the change is gen1 of `bc65dc05` (sha256 `d379e7f8…`), both
+from `task gen1`. Both ran on tree `bc65dc05`.
+`bench/edit_loop/objcache_hold_*.tsv` hold the full rows. Every C hash
+check reads 11/11.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.163 (0.157-0.175) | 0.168 (0.161-0.177) | 0.167 (0.160-0.175) | 0.170 (0.163-0.183) |
+| cli | body-cname | 0.433 (0.421-0.440) | 0.433 (0.423-0.444) | 0.431 (0.419-0.444) | 0.426 (0.409-0.440) |
+| cli | body-typecheck | 0.458 (0.449-0.469) | 0.462 (0.439-0.467) | 0.458 (0.445-0.470) | 0.460 (0.443-0.471) |
+| cli | pubfn-cname | 0.469 (0.462-0.578) | 0.466 (0.462-0.587) | 0.462 (0.454-0.570) | 0.471 (0.460-0.587) |
+| cli | privfn-cname | 0.473 (0.461-0.482) | 0.468 (0.462-0.488) | 0.457 (0.450-0.485) | 0.469 (0.461-0.479) |
+| cli | pubfn-typecheck | 0.486 (0.476-0.500) | 0.484 (0.480-0.497) | 0.471 (0.456-0.492) | 0.483 (0.473-0.491) |
+| cli | privfn-typecheck | 0.485 (0.470-0.495) | 0.490 (0.469-0.509) | 0.484 (0.473-0.498) | 0.483 (0.469-0.494) |
+| cli | testblock-cname | 0.305 (0.294-0.439) | 0.305 (0.289-0.444) | 0.298 (0.282-0.423) | 0.302 (0.294-0.433) |
+| cli | global-cname | 0.462 (0.450-0.476) | 0.466 (0.454-0.473) | 0.452 (0.434-0.464) | 0.458 (0.449-0.466) |
+| cli | run-body-cname | 0.467 (0.454-0.479) | 0.460 (0.442-0.471) | 0.456 (0.446-0.469) | 0.465 (0.454-0.477) |
+| cli | test-body-cname | 0.481 (0.468-0.500) | 0.478 (0.473-0.503) | 0.477 (0.471-0.500) | 0.480 (0.473-0.487) |
+| cli | cold-obj | 2.375 (2.346-2.455) | 2.361 (2.340-2.419) | 2.362 (2.338-2.465) | 2.355 (2.327-2.420) |
+| cli | cold-all | 5.150 (5.124-5.174) | 5.160 (5.136-5.177) | 5.152 (5.137-5.173) | 5.155 (5.137-5.174) |
+| small | nochange | 0.044 (0.042-0.046) | 0.042 (0.041-0.046) | 0.043 (0.043-0.046) | 0.043 (0.042-0.044) |
+| small | body-inventory | 0.075 (0.071-0.088) | 0.074 (0.073-0.091) | 0.075 (0.072-0.093) | 0.075 (0.073-0.092) |
+| small | body-audit | 0.063 (0.061-0.066) | 0.065 (0.063-0.067) | 0.065 (0.062-0.067) | 0.064 (0.063-0.066) |
+| small | pubfn-model | 0.068 (0.066-0.070) | 0.068 (0.067-0.071) | 0.067 (0.065-0.070) | 0.067 (0.066-0.068) |
+| small | privfn-model | 0.067 (0.066-0.069) | 0.067 (0.065-0.069) | 0.067 (0.066-0.068) | 0.067 (0.065-0.069) |
+| small | testblock-model | 0.047 (0.046-0.049) | 0.047 (0.046-0.048) | 0.047 (0.046-0.048) | 0.047 (0.046-0.048) |
+| small | run-body-inventory | 0.076 (0.073-0.077) | 0.076 (0.075-0.077) | 0.076 (0.074-0.079) | 0.077 (0.075-0.078) |
+| small | test-body-inventory | 0.103 (0.100-0.117) | 0.102 (0.100-0.119) | 0.102 (0.101-0.115) | 0.103 (0.101-0.117) |
+| small | cold-obj | 0.090 (0.086-0.093) | 0.087 (0.086-0.090) | 0.089 (0.087-0.093) | 0.090 (0.087-0.095) |
+
+Without the daemon:
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | cold-obj | 2.611 (2.594-2.626) | 2.618 (2.600-2.634) | 2.613 (2.595-2.626) | 2.614 (2.580-2.633) |
+| cli | cold-all | 5.025 (4.998-5.055) | 5.017 (5.006-5.064) | 5.013 (4.996-5.039) | 5.018 (4.999-5.043) |
+| small | cold-obj | 0.102 (0.100-0.106) | 0.102 (0.097-0.105) | 0.103 (0.100-0.106) | 0.103 (0.100-0.105) |
+
+Each change row is inside the spread of the base rows beside it. The
+holds cost no time a run can show: a hard link per object, and one dir
+to remove after the link.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
