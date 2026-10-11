@@ -1333,13 +1333,15 @@ change.
 The delta (`src/emit_record.bl`):
 
 - Each top-level item in a source's interface text starts with a mark of
-  its kind: `fn <name>`, `import` or `other`. The build compares the old
-  and new items of each source as a multiset, with comments dropped.
-- A changed plain fn adds its name to the edited names. A changed
-  `import` adds nothing. A change to any other item, or to a field of the
-  inputs that is not the sources' own, makes the build take nothing.
-- The hit sources are those whose old or new text names an edited fn as
-  a whole word.
+  its kind: `fn <name>`, `let <name>`, `const <name>`, `test`, `import`
+  or `other`. The build compares the old and new items of each source as
+  a multiset, with comments dropped.
+- A changed plain fn, global or const adds its name to the edited names.
+  A changed `import` or `test` adds nothing. A change to any other item,
+  or to a field of the inputs that is not the sources' own, makes the
+  build take nothing.
+- The hit sources are those whose old or new text names an edited name
+  as a whole word.
 - The types header must have the same text, and the module headers must
   come in the same order. Each changed module header gives the names it
   declares that were added or removed. Past 64 such names the build takes
@@ -1439,9 +1441,9 @@ the same groups.
   fn or an import, so the build takes nothing;
 - its own globals and their init fn, from its own source;
 - the init calls. A global of another module that changes between a
-  constant and a run-time initializer adds or removes a call. Its
-  initializer is an item other than a fn, so the build takes nothing, and
-  the `init` lines of the entry key hold the names too;
+  constant and a run-time initializer adds or removes a call. The `init`
+  lines of the entry key hold the names, so the build emits `__main__`
+  again;
 - `main`, spawns, tests and key table names: the entry key;
 - a new key type: the types header;
 - the eq and hash of each key table, lowered with the span of the node
@@ -1451,8 +1453,8 @@ the same groups.
 - `cfg`: the inputs text.
 
 A test in an imported module does not reach `__main__`: `blink test`
-builds each file with its own tests as the entry. The test is still an
-item other than a fn, so the build takes nothing.
+builds each file with its own tests as the entry. The build takes
+`__main__` and each unit the test does not reach.
 
 Some edits emit `__main__` again with the same text. A second Map with a
 key type that a Map in an earlier source already has moves the node the
@@ -1590,6 +1592,63 @@ turn, four runs. On the body, fn and nochange rows the medians differ by
 5.022 s for `a0b43999`: 30-70 ms slower, outside the spread in one of
 the two runs. small does not change.
 `bench/edit_loop/entry_facts_daemon_settle1_*.tsv` hold the full rows.
+
+### Units kept across a global, const or test edit
+
+Before this change, an edit in a module other than the entry that added,
+removed or changed a global, a const or a test block made the build take
+no unit: each was an item of kind `other`. On cli the build then emitted
+all 69 units for a test block whose C reaches no unit.
+
+Each kind, added once to `src/cname.bl` on cli under
+`BLINK_EMIT_REUSE_VERIFY=1`: the units whose C changed against the last
+build, and the median of 5 edits through the daemon, settle 1 s, with
+the gen1 from before this change.
+
+| kind | units changed | headers changed | median s |
+|---|---|---|---|
+| nochange | - | - | 0.139 |
+| test block | 0 | 0 | 0.718 |
+| constant global | 1 (`cname`) | `cname.priv.h` | 0.913 |
+| run-time global | 1 (`cname`) | `cname.priv.h` | 0.942 |
+| pub constant global | 1 (`cname`) | `cname.h` | 0.936 |
+| global value changed | 1 (`cname`) | 0 | 0.774 |
+| global made run-time | 1 (`cname`) | 0 | 0.785 |
+| const | 1 (`cname`) | `cname.priv.h` | 0.975 |
+| type | 14 | `blink.types.h` | 2.961 |
+| alias | 14 | 0 | 0.808 |
+| effect | 68 | `blink.types.h` | 3.091 |
+| trait | 0 | 0 | 0.831 |
+| impl | 15 | `blink.types.h`, `cname.h` | 3.050 |
+| annotated fn | 1 (`cname`) | `cname.priv.h` | 1.009 |
+| new private fn | 1 (`cname`) | `cname.priv.h` | 0.459 |
+
+The alias changes 14 units only by the order of their extern lines.
+
+A global or const reaches the C of other units by its name alone:
+
+- `cg_decl_emit_globals` prints a constant initializer on the line that
+  defines the global, in the unit of its module. Any other initializer
+  goes into `__blink_init_globals_<module>`, in the same unit.
+- Another unit refers to the global by its C name (`ir_global_ref`), and
+  its declaration line is in the module's header.
+- A const folds into each use, and each use names it.
+- The entry unit calls each init fn. Its key holds the `init` lines, so
+  a global made run-time or constant again emits `__main__` again.
+- The init calls run in module order. Only an import changes that order,
+  and a new import changes the inputs of import resolution, so the build
+  takes no unit.
+
+A test block of a module other than the entry is not in the program the
+build makes, so it adds no name and changes no unit.
+
+The parser marks a plain global or const with its keyword and name. A
+global with an annotation, or one that destructures or binds `_`, stays
+`other`. Types, aliases, effects, traits, impls and annotated fns stay
+`other`, so the build takes nothing after an edit to one. A type or an
+effect changes the types header; an impl changes the module header; an
+alias or a trait changes no header, but no rule yet shows which units
+it reaches.
 
 ## Blockers before the default flipped
 
