@@ -41,17 +41,20 @@ a self-test that fails at 25 s, ci exits at 25.2 s, and no corpus process is lef
 
 ### Link-time optimization: cores, memory, and who gets it
 
-The blinkc and cli links run at the same time, so they share the job count from
-scripts/default_jobs.sh: blinkc takes a third, cli the rest. Under the slice that count is 12,
-the slice CPU cap, so the links ask for `-flto=4` and `-flto=8`, 12 jobs in all. Outside a slice
-it is half of nproc. Both links together peak at 640 MiB (memory.peak of their scope); one
-process peaks at 340 MB (cli) and 287 MB (blinkc).
+Each link runs `-flto=<default_jobs>`. scripts/default_jobs.sh gives the slice CPU cap under a
+slice (12 here), and half of nproc outside one. The blinkc and cli links run at the same time,
+so up to 24 jobs run for about 4 s, and the slice holds their CPU to its 12 cores. Both links
+together peak at 640 MiB (memory.peak of their scope); one cc process peaks at 340 MB (cli) and
+287 MB (blinkc).
 
-| Links | Wall of both |
-|---|---|
-| 12 + 12 jobs | 3.8 s |
-| 4 + 8 jobs | 4.0 s |
-| no link-time optimization | 10.7 s (cli alone) |
+| Links | Wall of both, alone in the slice | gen1 built, in ci |
+|---|---|---|
+| 12 + 12 jobs | 3.8 s | 7.6 s |
+| 4 + 8 jobs (12 in all) | 4.0 s | 9.4 s |
+| no link-time optimization | 10.7 s (cli alone) | 13.3 s |
+
+In ci the gate self-tests run on the same cores, so a split count gives the links a smaller
+share. The 12 + 12 links make byte-equal binaries to the 4 + 8 links.
 
 Only scripts/gen1.sh links this way, so only build/gen1 changes: the gate compiler of `task ci`,
 `task corpus`, `task corpus-per-module` (and so `task ci-release`), the rewrite suite, and the
