@@ -1,0 +1,84 @@
+// A build holds each object it links by a hard link, and copies one only where the
+// filesystem makes no link. A miss has no object in the cache to hold, so it must not start
+// a copy either: a process per unit costs more than the compile of a small unit. A cp shim
+// first on PATH logs each call.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/out {tree}/shim")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cp = sh("command -v cp")
+    write_file("{tree}/shim/cp", "#!/bin/sh\necho \"cp $*\" >> {tree}/cp.log\nexec {real_cp} \"$@\"\n")
+    shell_exec("chmod +x {tree}/shim/cp")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"hold_no_cp_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with the object cache at cache, the cp shim first on PATH and the
+// unit trace. The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the
+// build one unit, so the run drops them.
+fn build(tree: Str, cache: Str, mode: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_OBJCACHE_EVICT PATH={tree}/shim:$PATH BLINK_CACHE_DIR={tree}/{cache} BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app {mode}"])
+}
+
+// The one-unit build copies its C into a snapshot dir by cp, so only a copy of an object
+// counts.
+fn cp_calls(tree: Str) -> Str {
+    sh("grep -E '[.]o( |$)' {tree}/cp.log 2>/dev/null")
+}
+
+test "a per-module build copies no object on a cold build or a later one" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_hold_no_cp_pm_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build(tree, "cache", "--per-module")
+    let cold_cp = cp_calls(tree)
+    edit_main(tree, 2)
+    let warm = build(tree, "cache", "--per-module")
+    let warm_cp = cp_calls(tree)
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(cold.exit_code == 0, "cold build failed: {cold.out}{cold.err_out}")
+    assert(warm.exit_code == 0, "warm build failed: {warm.out}{warm.err_out}")
+    // part came from the cache, so the warm build held a hit and stored a miss.
+    assert(warm.err_out.contains("hit part"), "part was not a hit: {warm.err_out}")
+    assert_eq(cold_cp, "")
+    assert_eq(warm_cp, "")
+    assert_eq(out, "sum 43")
+}
+
+test "a one-unit build copies no object on a cold build or a later one" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_hold_no_cp_one_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build(tree, "cache", "--no-per-module")
+    let cold_cp = cp_calls(tree)
+    let again = build(tree, "cache", "--no-per-module")
+    let again_cp = cp_calls(tree)
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(cold.exit_code == 0, "cold build failed: {cold.out}{cold.err_out}")
+    assert(again.exit_code == 0, "second build failed: {again.out}{again.err_out}")
+    assert_eq(cold_cp, "")
+    assert_eq(again_cp, "")
+    assert_eq(out, "sum 42")
+}

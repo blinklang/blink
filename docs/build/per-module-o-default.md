@@ -148,9 +148,11 @@ asks for the one-unit build.
   hashes run in batches that fit one exec argument (Linux caps one at
   128 KiB). With the full header list in each unit's manifest, the 48
   units of `src/cli.bl` passed that cap, and every unit missed. A miss
-  compiles to a temp object, and one exec per batch moves each new object
-  into the cache. The build links the cached object for each move that
-  worked, and the temp object for each move that failed.
+  compiles to an object in the build's own dir, the build links that
+  object, and the cache gets a hard link (or a copy) of it. A hit is
+  hard-linked into the build's hold dir, and the build links that name.
+  So the GC of another build cannot remove an object this build is about
+  to link (section 5 of `per-module-o-cache.md`).
 - **Emit reuse.** The front end always runs, so each build loads its files
   and reports their errors. Then the build writes its emit inputs as one
   text: the compiler sha, `argv[0]`, the cwd, the entry path, the codegen
@@ -1878,10 +1880,13 @@ PCH is byte-equal to the one built without it, at `-O1` and with
 
 The build now keeps a PCH of the archive header in the obj cache:
 `<key>.pch/` holds copies of `libblink_std.h` and `runtime.h` and the
-`libblink_std.h.gch` built from them. A unit that it serves compiles
-with `-I<key>.pch` before `-I<arc_dir>`, so gcc finds the `.gch` beside
-the copy, and with `-ffile-prefix-map=<key>.pch=<arc_dir>`, so the debug
-info names the archive dir as a compile without the PCH does.
+`libblink_std.h.gch` built from them. The build holds links (or copies)
+of the three files in `<hold>/pch/`, in its hold dir under the cache's
+`tmp/`: the GC of another build can remove `<key>.pch/` while the units
+compile. A unit that it serves compiles with `-I<hold>/pch` before
+`-I<arc_dir>`, so gcc finds the `.gch` beside the copy, and with
+`-ffile-prefix-map=<hold>/pch=<arc_dir>`, so the debug info names the
+archive dir as a compile without the PCH does.
 
 - gcc takes a `.gch` only when the unit defines, before the include, the
   macros the PCH was built with. The prologue of a unit is a `#define`
@@ -1898,8 +1903,9 @@ info names the archive dir as a compile without the PCH does.
   header in each include dir (`build_objcache.pch_key`). The build hashes
   those headers once, for the obj keys and the PCH key both.
 - On a miss the build stages the copies in a private dir, builds the
-  `.gch` there in a slot of its own while the units compile, and renames
-  the dir into place. A unit that starts after it is in place reads it.
+  `.gch` there in a slot of its own while the units compile, holds its
+  files, and renames the dir into place. A unit that starts after that
+  reads the held files.
   When every unit starts before it ends, no unit of this build reads it,
   so the build waits for it after the link.
 - gcc reads the header beside a `.gch` it cannot take, so a stale or
@@ -2053,6 +2059,70 @@ The 10 tests are kept: each covers a case the PCH can get wrong (race,
 bad `.gch`, byte-equal objects at `-O1` and `-g`, one error per unit,
 GC, the key), and each goes red on its own mutant. The race test came
 after these walls and adds about 0.3 s of CPU.
+
+### Holds against a concurrent GC
+
+Two builds that share an obj cache can race: the GC of one can remove an
+entry the other found or stored and has not linked yet, and that link
+fails. Two loops of 100 builds, one cache, a cap of 0 MB: 24 of 200
+builds failed with `ld: cannot find <cache>/<key>.o`. A build now links
+only names in a private dir of its own, and its units read the archive
+header PCH from there too. Section 5 of `per-module-o-cache.md` gives the
+design. After the change the same loops, 150 builds each, ran with no
+failure, and each build printed the right output.
+
+A first cut tried a hard link for each unit and then a `cp` when the link
+failed. A miss has no object to link, so each missed unit ran a `cp` that
+failed: 69 processes and 0.85 s more on a cold build of cli. The hold now
+copies with `read(2)` and `write(2)` in its own process, and a miss ends
+at the failed `open(2)` of the object it does not have.
+
+#### Bench
+
+Through the daemon, settle 1 s, then without the daemon for the cold
+cases; 11 reps, median seconds (min-max). Base and the change ran in
+turn: base, change, base, change. Base is gen1 of `d8eb38b8` (sha256
+`8b2d8683…`), the change is gen1 of `bc65dc05` (sha256 `d379e7f8…`), both
+from `task gen1`. Both ran on tree `bc65dc05`.
+`bench/edit_loop/objcache_hold_*.tsv` hold the full rows. Every C hash
+check reads 11/11.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.163 (0.157-0.175) | 0.168 (0.161-0.177) | 0.167 (0.160-0.175) | 0.170 (0.163-0.183) |
+| cli | body-cname | 0.433 (0.421-0.440) | 0.433 (0.423-0.444) | 0.431 (0.419-0.444) | 0.426 (0.409-0.440) |
+| cli | body-typecheck | 0.458 (0.449-0.469) | 0.462 (0.439-0.467) | 0.458 (0.445-0.470) | 0.460 (0.443-0.471) |
+| cli | pubfn-cname | 0.469 (0.462-0.578) | 0.466 (0.462-0.587) | 0.462 (0.454-0.570) | 0.471 (0.460-0.587) |
+| cli | privfn-cname | 0.473 (0.461-0.482) | 0.468 (0.462-0.488) | 0.457 (0.450-0.485) | 0.469 (0.461-0.479) |
+| cli | pubfn-typecheck | 0.486 (0.476-0.500) | 0.484 (0.480-0.497) | 0.471 (0.456-0.492) | 0.483 (0.473-0.491) |
+| cli | privfn-typecheck | 0.485 (0.470-0.495) | 0.490 (0.469-0.509) | 0.484 (0.473-0.498) | 0.483 (0.469-0.494) |
+| cli | testblock-cname | 0.305 (0.294-0.439) | 0.305 (0.289-0.444) | 0.298 (0.282-0.423) | 0.302 (0.294-0.433) |
+| cli | global-cname | 0.462 (0.450-0.476) | 0.466 (0.454-0.473) | 0.452 (0.434-0.464) | 0.458 (0.449-0.466) |
+| cli | run-body-cname | 0.467 (0.454-0.479) | 0.460 (0.442-0.471) | 0.456 (0.446-0.469) | 0.465 (0.454-0.477) |
+| cli | test-body-cname | 0.481 (0.468-0.500) | 0.478 (0.473-0.503) | 0.477 (0.471-0.500) | 0.480 (0.473-0.487) |
+| cli | cold-obj | 2.375 (2.346-2.455) | 2.361 (2.340-2.419) | 2.362 (2.338-2.465) | 2.355 (2.327-2.420) |
+| cli | cold-all | 5.150 (5.124-5.174) | 5.160 (5.136-5.177) | 5.152 (5.137-5.173) | 5.155 (5.137-5.174) |
+| small | nochange | 0.044 (0.042-0.046) | 0.042 (0.041-0.046) | 0.043 (0.043-0.046) | 0.043 (0.042-0.044) |
+| small | body-inventory | 0.075 (0.071-0.088) | 0.074 (0.073-0.091) | 0.075 (0.072-0.093) | 0.075 (0.073-0.092) |
+| small | body-audit | 0.063 (0.061-0.066) | 0.065 (0.063-0.067) | 0.065 (0.062-0.067) | 0.064 (0.063-0.066) |
+| small | pubfn-model | 0.068 (0.066-0.070) | 0.068 (0.067-0.071) | 0.067 (0.065-0.070) | 0.067 (0.066-0.068) |
+| small | privfn-model | 0.067 (0.066-0.069) | 0.067 (0.065-0.069) | 0.067 (0.066-0.068) | 0.067 (0.065-0.069) |
+| small | testblock-model | 0.047 (0.046-0.049) | 0.047 (0.046-0.048) | 0.047 (0.046-0.048) | 0.047 (0.046-0.048) |
+| small | run-body-inventory | 0.076 (0.073-0.077) | 0.076 (0.075-0.077) | 0.076 (0.074-0.079) | 0.077 (0.075-0.078) |
+| small | test-body-inventory | 0.103 (0.100-0.117) | 0.102 (0.100-0.119) | 0.102 (0.101-0.115) | 0.103 (0.101-0.117) |
+| small | cold-obj | 0.090 (0.086-0.093) | 0.087 (0.086-0.090) | 0.089 (0.087-0.093) | 0.090 (0.087-0.095) |
+
+Without the daemon:
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | cold-obj | 2.611 (2.594-2.626) | 2.618 (2.600-2.634) | 2.613 (2.595-2.626) | 2.614 (2.580-2.633) |
+| cli | cold-all | 5.025 (4.998-5.055) | 5.017 (5.006-5.064) | 5.013 (4.996-5.039) | 5.018 (4.999-5.043) |
+| small | cold-obj | 0.102 (0.100-0.106) | 0.102 (0.097-0.105) | 0.103 (0.100-0.106) | 0.103 (0.100-0.105) |
+
+Each change row is inside the spread of the base rows beside it. The
+holds cost no time a run can show: a hard link per object, and one dir
+to remove after the link.
 
 ## Blockers before the default flipped
 

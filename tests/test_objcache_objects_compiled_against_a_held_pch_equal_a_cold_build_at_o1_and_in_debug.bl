@@ -1,0 +1,108 @@
+// A build that finds the archive header PCH holds it, and its units read the held files, so
+// another build's GC can remove the cache entry while they compile. The hold path is not the
+// cache path, so each object and the binary must still be the bytes a cold build with no PCH
+// makes, at the default level and in a debug build, whose debug info names the header.
+// BLINK_DEV_OBJCACHE_EVICT=compile empties the cache after the lookups, so the units compile
+// against the held PCH with no entry left.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs the real cc
+// with -H on each compile, so its log names the PCH a unit read ("! <path>.gch"). Each
+// compile logs to a file of its own: gcc writes -H lines in pieces, which parallel compiles
+// would interleave in one file.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin {tree}/out")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) exec {real_cc} \"$@\" -H 2>\"$(mktemp {tree}/cc_h/XXXXXX)\" ;; esac\nexec {real_cc} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"held_pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with the object cache at cache, the -H cc, the unit trace and the
+// variables in envs. The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make
+// the build one unit, so the run drops them.
+fn build(tree: Str, cache: Str, envs: Str, flags: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_OBJCACHE_EVICT -u BLINK_DEV_OBJCACHE_HOLD -u BLINK_ARCHIVE_PCH PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/{cache} BLINK_TRACE_CHANNELS=build.units {envs} build/blink build app/src/main.bl -o {tree}/out/app --per-module {flags}"])
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    r
+}
+
+// The compiles of the last build that read the PCH from its hold dir.
+fn held_reads(tree: Str, cache: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! {tree}/{cache}/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.gch$'").to_int()
+}
+
+// The compiles of the last build that read any PCH.
+fn any_reads(tree: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! .*\\.gch$'").to_int()
+}
+
+fn objects(tree: Str, cache: Str) -> Str {
+    sh("cd {tree}/{cache} && sha256sum *.o")
+}
+
+fn binary_sha(tree: Str) -> Str {
+    sh("sha256sum < {tree}/out/app")
+}
+
+fn held_equals_cold(root: Str, flags: Str, label: Str) {
+    let tree = "{root}/.tmp/_held_pch_equal_{label}_{getpid()}"
+    dev_tree(root, tree)
+    // A program's first build makes no PCH, and the second makes one.
+    edit_main(tree, 0)
+    let _ = build(tree, "cache", "", flags)
+    edit_main(tree, 1)
+    let _ = build(tree, "cache", "", flags)
+    let pch_dirs = sh("ls -d {tree}/cache/*.pch 2>/dev/null | wc -l")
+    // No object left to hit, so each unit compiles against the held PCH.
+    shell_exec("rm -f {tree}/cache/*.o {tree}/cache/*.meta")
+    edit_main(tree, 2)
+    let raced = build(tree, "cache", "BLINK_DEV_OBJCACHE_EVICT=compile", flags)
+    let reads = held_reads(tree, "cache")
+    let raced_objs = objects(tree, "cache")
+    let raced_bin = binary_sha(tree)
+    let raced_out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}/out/app.units {tree}/out/app")
+    let _ = build(tree, "cold-cache", "BLINK_ARCHIVE_PCH=0", flags)
+    let cold_reads = any_reads(tree)
+    let cold_objs = objects(tree, "cold-cache")
+    let cold_bin = binary_sha(tree)
+    shell_exec("rm -rf {tree}")
+    assert_eq(pch_dirs, "1")
+    assert(raced.err_out.contains("dev evict compile"), "{label}: no eviction ran: {raced.err_out}")
+    assert(reads >= 2, "{label}: {reads} units read the held PCH")
+    assert_eq(cold_reads, 0)
+    assert(raced_objs.split("\n").len() >= 2, "{label}: objects {raced_objs}")
+    assert_eq(raced_objs, cold_objs)
+    assert_eq(raced_bin, cold_bin)
+    assert_eq(raced_out, "sum 43")
+}
+
+test "objects compiled against a held PCH after its entry is evicted equal a cold build's at -O1" {
+    held_equals_cold(sh("pwd -P"), "", "o1")
+}
+
+test "objects compiled against a held PCH after its entry is evicted equal a cold build's in debug" {
+    held_equals_cold(sh("pwd -P"), "--debug", "debug")
+}

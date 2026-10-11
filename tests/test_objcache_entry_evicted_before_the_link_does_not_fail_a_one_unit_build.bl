@@ -1,0 +1,78 @@
+// Two builds can share one object cache, and the GC of one can delete an object the other has
+// just taken from the cache, or just stored there, and not yet linked. A build of the program
+// as one C unit must still link, and link the bytes a cold build links.
+// BLINK_DEV_OBJCACHE_EVICT=link empties the cache just before the link, as such a GC would, so
+// the race happens on every run.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/out")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"evict_link_one_unit_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + 1\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with the object cache at cache and the unit trace. The corpus exports
+// BLINK_COMPILER_ARCHIVE, which keeps a one-unit build out of the cache, so the run drops it.
+fn build(tree: Str, cache: Str, env_extra: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_OBJCACHE_EVICT BLINK_CACHE_DIR={tree}/{cache} BLINK_TRACE_CHANNELS=build.units {env_extra} build/blink build app/src/main.bl -o {tree}/out/app --no-per-module"])
+}
+
+test "a one-unit build links after its cached object is evicted, and links what a cold build links" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_evict_link_hit_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build(tree, "cold-cache", "")
+    shell_exec("cp {tree}/out/app {tree}/cold.bin")
+    shell_exec("rm -f {tree}/out/app")
+    // The cache holds the object of this source, so the next build takes it from there.
+    let warm = build(tree, "cache", "")
+    let held = sh("ls {tree}/cache/*.o 2>/dev/null | wc -l")
+    let raced = build(tree, "cache", "BLINK_DEV_OBJCACHE_EVICT=link")
+    let same = sh("cmp -s {tree}/cold.bin {tree}/out/app && echo same")
+    let out = sh("{tree}/out/app")
+    let left = sh("ls {tree}/cache/*.o 2>/dev/null | wc -l")
+    shell_exec("rm -rf {tree}")
+    assert(cold.exit_code == 0, "cold build failed: {cold.out}{cold.err_out}")
+    assert(warm.exit_code == 0, "warm build failed: {warm.out}{warm.err_out}")
+    assert_eq(held, "1")
+    assert(raced.err_out.contains("dev evict link"), "no eviction ran: {raced.err_out}")
+    assert(raced.exit_code == 0, "the build failed after the eviction: {raced.out}{raced.err_out}")
+    assert_eq(same, "same")
+    assert_eq(out, "sum 42")
+    assert_eq(left, "0")
+}
+
+test "a one-unit build links after the object it just stored is evicted, and links what a cold build links" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_evict_link_store_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build(tree, "cold-cache", "")
+    shell_exec("cp {tree}/out/app {tree}/cold.bin")
+    shell_exec("rm -f {tree}/out/app")
+    // An empty cache: the build compiles and stores, and the eviction takes what it stored.
+    let raced = build(tree, "cache", "BLINK_DEV_OBJCACHE_EVICT=link")
+    let same = sh("cmp -s {tree}/cold.bin {tree}/out/app && echo same")
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(cold.exit_code == 0, "cold build failed: {cold.out}{cold.err_out}")
+    assert(raced.err_out.contains("dev evict link"), "no eviction ran: {raced.err_out}")
+    assert(raced.exit_code == 0, "the build failed after the eviction: {raced.out}{raced.err_out}")
+    assert_eq(same, "same")
+    assert_eq(out, "sum 42")
+}

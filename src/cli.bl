@@ -1001,6 +1001,8 @@ fn process_cc_id(target: Str) -> Str ! IO {
 // trigger a full-tree size walk.
 let mut cache_did_store: Int = 0
 
+// The object answered sits in a private dir, which the caller removes after its link: the GC
+// of another build can remove the cache entry before then.
 fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
     cache_did_store = 0
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() {
@@ -1014,7 +1016,9 @@ fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target:
         return ""
     }
     let obj = cache_compile_snapshot(c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags)
-    let _ = build_fs.remove_tree(snap_dir)
+    if obj == "" {
+        let _ = build_fs.remove_tree(snap_dir)
+    }
     obj
 }
 
@@ -1034,7 +1038,7 @@ fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_m
     if key == "" {
         return ""
     }
-    let hit = build_objcache.lookup_obj(key)
+    let hit = build_objcache.hold_objs([key], snap_dir).get(0).unwrap()
     if hit != "" {
         return hit
     }
@@ -1045,11 +1049,10 @@ fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_m
     if rc != 0 {
         return ""
     }
-    if !build_objcache.store(key, staging, c_path, sha256_of_file_first(snap)) {
-        return ""
+    if build_objcache.install(key, staging, c_path, sha256_of_file_first(snap)) {
+        cache_did_store = 1
     }
-    cache_did_store = 1
-    "{build_objcache.obj_cache_dir()}/{key}.o"
+    staging
 }
 
 fn sha8(sha: Str) -> Str {
@@ -1181,7 +1184,13 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     // rebuilds, so a unit that reads it is never cached.
     let cached_o = if compiler_archive != "" { "" } else { cache_compile_user_c(c_path, debug_mode, release_mode, target, arc_dir, include_flags) }
     let compile_input = if cached_o != "" { cached_o } else { c_path }
+    if build_objcache.dev_evict_at("link") {
+        dbg_trace("build.units", "dev evict link")
+    }
     let rc = run_cc("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
+    if cached_o != "" {
+        let _ = build_fs.remove_tree(path_dirname(cached_o))
+    }
     if rc != 0 {
         io.println("error: C compilation failed")
         return rc
@@ -2168,11 +2177,12 @@ type UnitCompile {
 }
 
 // A PCH build for run_unit_compiles: cmd writes the .gch into the staged dir, which becomes
-// the PCH for key when cmd ends well. An empty cmd builds none.
+// the PCH for key when cmd ends well. The units read it from hold. An empty cmd builds none.
 type PchJob {
     cmd: Str
     key: Str
     staged: Str
+    hold: Str
 }
 
 // pch_pid is a PCH build still running when every unit had started without it; the caller
@@ -2185,7 +2195,7 @@ type UnitRun {
 }
 
 fn no_pch_job() -> PchJob {
-    PchJob { cmd: "", key: "", staged: "" }
+    PchJob { cmd: "", key: "", staged: "", hold: "" }
 }
 
 // Waits for the PCH build run left running and installs its PCH. Answers whether this or run
@@ -2242,9 +2252,9 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
     if pch_pid >= 0 && started < n {
         let r = process_pid_wait(pch_pid)
         if r.exit_code == 0 {
+            // Held before the store: once stored, the GC of another build can remove it.
+            ready = build_objcache.hold_pch(pch.staged, pch.hold)
             stored = build_objcache.store_pch(pch.key, pch.staged)
-            // Another build may have installed the same PCH first.
-            ready = stored || build_objcache.lookup_pch(pch.key) != ""
         } else {
             let _ = build_fs.remove_tree(pch.staged)
         }
@@ -2355,7 +2365,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     for u in files {
         unit_keys.push(keys.get(u.stem) ?? "")
     }
-    let hits = build_objcache.lookup_objs(unit_keys)
+    let hold = if keys.len() > 0 { build_objcache.make_hold_dir() } else { "" }
+    let hits = build_objcache.hold_objs(unit_keys, hold)
     let mut ui = 0
     for u in files {
         let hit = hits.get(ui).unwrap()
@@ -2408,6 +2419,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         }
     }
     let mut pch_key = ""
+    // The units read the PCH from here, never from the cache.
+    let mut pch_hold = ""
     let mut pch_ready = false
     let mut pch = no_pch_job()
     if pch_prefix != "" {
@@ -2419,8 +2432,10 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
             if part != "" { include_list.push(part) }
         }
         pch_key = build_objcache.pch_key(archive_sha, runtime_sha, process_cc_id(target), arc_dir, unit_key_flags(debug_mode, release_mode), pch_defines, include_list, vendored_headers ?? [])
-        if pch_key != "" {
-            pch_ready = build_objcache.lookup_pch(pch_key) != ""
+        if pch_key != "" && hold != "" {
+            pch_hold = "{hold}/pch"
+            let found = build_objcache.lookup_pch(pch_key)
+            pch_ready = found != "" && build_objcache.hold_pch(found, pch_hold)
             // A program's first build makes no PCH: a one-off build (a test, a CI job) would
             // pay for one that no later build reads. units_dir holds the last build of this
             // program, so the first edit after it builds the PCH while its units compile.
@@ -2430,12 +2445,11 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
                     // The debug info names the archive dir, as a unit's without the PCH does,
                     // and the header finds each file it includes where a unit's compile does.
                     let cmd = cc_command("{unit_cc_flags().join(" ")} {pch_defines.join(" ")} -ffile-prefix-map={staged}={arc_dir} -x c-header {staged}/libblink_std.h -o {staged}/libblink_std.h.gch -I{staged} {includes}", debug_mode, release_mode, target)
-                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged }
+                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged, hold: pch_hold }
                 }
             }
         }
     }
-    let pch_dir = if pch_key != "" { build_objcache.pch_dir(pch_key) } else { "" }
     let mut cmds: List[Str] = []
     let mut pch_cmds: List[Str] = []
     let mut mi = 0
@@ -2443,12 +2457,15 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         dbg_trace("build.units", "compile {u.stem}")
         let line = "-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir}"
         cmds.push(cc_command("{line} {includes}", debug_mode, release_mode, target))
-        if pch_key != "" && prefixes.get(mi).unwrap() == pch_prefix {
-            pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_dir}={arc_dir} -I{pch_dir} {includes}", debug_mode, release_mode, target))
+        if pch_hold != "" && prefixes.get(mi).unwrap() == pch_prefix {
+            pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_hold}={arc_dir} -I{pch_hold} {includes}", debug_mode, release_mode, target))
         } else {
             pch_cmds.push("")
         }
         mi = mi + 1
+    }
+    if build_objcache.dev_evict_at("compile") {
+        dbg_trace("build.units", "dev evict compile")
     }
     let run = run_unit_compiles(cmds, pch_cmds, pch_ready, pch, unit_jobs)
     let mut results = run.results
@@ -2500,17 +2517,14 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     }
     // Stored before the failure check, so a unit that compiled is not compiled again next time.
     let mut stored = false
-    let installed = build_objcache.store_objs(store_keys, store_paths, store_modules)
-    let mut si = 0
-    while si < store_keys.len() {
-        if installed.get(si).unwrap() {
-            objs.insert(store_modules.get(si).unwrap(), "{build_objcache.obj_cache_dir()}/{store_keys.get(si).unwrap()}.o")
-            stored = true
-        }
-        si = si + 1
+    // The build links its own objects; the cache gets a link or a copy of each.
+    let installed = build_objcache.install_objs(store_keys, store_paths, store_modules)
+    for ok in installed {
+        if ok { stored = true }
     }
     if failed > 0 {
         let _ = finish_pch(run)
+        drop_link_holds(hold, store_paths, installed)
         return 1
     }
     let mut link_objs: List[Str] = []
@@ -2522,10 +2536,14 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     }
     let incl = if include_flags != "" { " {include_flags}" } else { "" }
     let effective_link_flags = if link_flags.contains("-pthread") { link_flags } else { "{link_flags} -pthread" }
+    if build_objcache.dev_evict_at("link") {
+        dbg_trace("build.units", "dev evict link")
+    }
     let rc = run_cc("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target)
     if finish_pch(run) {
         stored = true
     }
+    drop_link_holds(hold, store_paths, installed)
     if rc != 0 {
         io.println("error: C compilation failed while linking {out}")
         return rc
@@ -2534,6 +2552,22 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         build_objcache.maybe_gc()
     }
     0
+}
+
+// Removes the objects link_units held for its link: the hold dir of its cache hits, and each
+// object it compiled that the cache now holds, which the units dir need not keep. Before the
+// GC, so it does not count them.
+fn drop_link_holds(hold: Str, compiled: List[Str], installed: List[Bool]) ! IO {
+    if hold != "" {
+        let _ = build_fs.remove_tree(hold)
+    }
+    let mut i = 0
+    while i < compiled.len() {
+        if installed.get(i).unwrap() {
+            fs_remove(compiled.get(i).unwrap())
+        }
+        i = i + 1
+    }
 }
 
 fn find_section_end(content: Str, section: Str) -> Int {

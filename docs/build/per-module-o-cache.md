@@ -63,7 +63,10 @@ Layout:
 build/obj-cache/
   <16-hex>.o
   <16-hex>.meta    # one-line: "<unix-mtime> <module_key> <src_sha>"
+  <16-hex>.pch/    # a PCH of the archive header (section 8)
   tmp/             # atomic-write staging (rename into ../)
+  tmp/unit.<rand>/ # a one-unit build's C snapshot, its object, its hold
+  tmp/hold.<rand>/ # a per-module build's holds (section 5)
 ```
 
 Per-repo, not XDG: `build/` is gitignored, easy to wipe, no shared-host
@@ -130,6 +133,42 @@ LRU-by-mtime is good enough — no need to track real access counts.
 - Two parallel `blink test` runs that miss on the same key both compile
   and both rename — last write wins, content is byte-identical, no
   corruption. No file locks needed.
+- A build links its objects some time after it finds or stores them, and
+  the GC of another build that shares the cache can remove an entry in
+  between. Measured before the fix: two loops of 100 builds each, one
+  cache, a cap of 0 MB, 24 of 200 builds failed with
+  `ld: cannot find <cache>/<key>.o`. So a build never links a name in
+  the cache:
+  - A hit is hard-linked into a private dir, `tmp/hold.<rand>/` (the
+    one-unit path uses its `tmp/unit.<rand>/`), and the build links that
+    name. A GC that removes the entry removes only the cache name. Where
+    the filesystem makes no hard link, the build copies the object with
+    `read(2)` and `write(2)` in its own process, as a `cp` per object
+    costs more than the compile of a small unit. When the object is gone
+    before the link or copy, or the copy fails, the unit is a miss. The
+    `.meta` is touched after the hold.
+  - A miss links the object the build compiled. The cache gets a hard
+    link (or a copy) of it, under a staged name in `tmp/` and then
+    `rename(2)`, so no build finds a part-made object under the key.
+  - The units read the archive header PCH from the same hold dir (section
+    8).
+  - The build removes the hold dir, and each compiled object the cache
+    now holds, after the link and before its own GC, so the GC does not
+    count them. While a build runs, a held object counts twice toward the
+    cap, once by each name: the cap only starts an eviction, so this can
+    make one evict a little early.
+  - A build also removes its hold dir when a unit fails to compile and
+    when its link fails. A daemon build runs the same path in its child.
+  - A build that is killed leaves its `tmp/` dir. Nothing reaps one yet.
+  - Dev knob: `BLINK_DEV_OBJCACHE_EVICT=compile` empties the cache, as
+    `blink cache clean` does, after the build's lookups and before its
+    units compile; `=link` does it just before the link. It stands in for
+    the GC of another build at that point, so a test makes the race on
+    every run.
+  - Dev knob: `BLINK_DEV_OBJCACHE_HOLD=copy` makes each hard link of a
+    hold fail, as on a filesystem with no hard links, so the build takes
+    the copy; `=none` makes each copy fail too, so each hit turns into a
+    miss. A test runs each path on every run.
 
 ### 6. Bootstrap protocol impact
 
@@ -170,8 +209,11 @@ no PCH. The key holds what gcc needs to take the `.gch`: both header
 shas, the cc id, the archive dir, every flag, the macros a unit defines
 before the include, each include flag and the sha of each header in each
 include dir. It is not part of a unit's obj key, since an object built
-with the PCH is byte-equal to one built without it. See "A PCH of the
-archive header" in `per-module-o-default.md`.
+with the PCH is byte-equal to one built without it. A build's units read
+it from links (or copies) of its three files in the build's hold dir,
+made when the build finds it or before the build stores the one it made,
+so the GC of another build cannot take it away while they compile. See
+"A PCH of the archive header" in `per-module-o-default.md`.
 
 ## Out of scope
 

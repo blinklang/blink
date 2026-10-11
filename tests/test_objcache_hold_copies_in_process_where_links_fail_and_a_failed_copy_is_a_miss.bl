@@ -1,0 +1,99 @@
+// A build holds each cache hit by a hard link, and where the filesystem makes no link it
+// copies the object in its own process. A hold that can neither link nor copy must not fail
+// the build: the unit misses and compiles. BLINK_DEV_OBJCACHE_HOLD=copy fails each link, and
+// =none each copy too, so each path runs every time. A cp shim first on PATH logs each call.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/out {tree}/shim")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cp = sh("command -v cp")
+    write_file("{tree}/shim/cp", "#!/bin/sh\necho \"cp $*\" >> {tree}/cp.log\nexec {real_cp} \"$@\"\n")
+    shell_exec("chmod +x {tree}/shim/cp")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"hold_copy_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with the object cache at cache, the cp shim first on PATH, the unit
+// trace and the variables in envs. The corpus exports BLINK_COMPILER_ARCHIVE and module
+// filters, which make the build one unit, so the run drops them.
+fn build(tree: Str, cache: Str, envs: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_OBJCACHE_EVICT -u BLINK_DEV_OBJCACHE_HOLD PATH={tree}/shim:$PATH BLINK_CACHE_DIR={tree}/{cache} BLINK_TRACE_CHANNELS=build.units {envs} build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+}
+
+// The cp calls that copied an object.
+fn cp_calls(tree: Str) -> Str {
+    sh("grep -E '[.]o( |$)' {tree}/cp.log 2>/dev/null")
+}
+
+// What a cold build of the same source in a cache of its own links.
+fn cold_binary(tree: Str) -> Str {
+    let r = build(tree, "cold-cache", "")
+    assert(r.exit_code == 0, "cold build failed: {r.out}{r.err_out}")
+    sh("sha256sum < {tree}/out/app")
+}
+
+test "a build where hard links fail copies each hit in its own process and links a cold build's binary" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_hold_copy_{getpid()}"
+    dev_tree(root, tree)
+    let first = build(tree, "cache", "BLINK_DEV_OBJCACHE_HOLD=copy")
+    edit_main(tree, 2)
+    let warm = build(tree, "cache", "BLINK_DEV_OBJCACHE_HOLD=copy")
+    let warm_bin = sh("sha256sum < {tree}/out/app")
+    let out = sh("{tree}/out/app")
+    let copied = cp_calls(tree)
+    let tmp_left = sh("ls -A {tree}/cache/tmp")
+    let cold_bin = cold_binary(tree)
+    shell_exec("rm -rf {tree}")
+    assert(first.exit_code == 0, "first build failed: {first.out}{first.err_out}")
+    assert(warm.exit_code == 0, "warm build failed: {warm.out}{warm.err_out}")
+    assert(warm.err_out.contains("hit part"), "part was not a hit: {warm.err_out}")
+    assert(!warm.err_out.contains("compile part"), "part compiled again: {warm.err_out}")
+    assert_eq(copied, "")
+    assert_eq(tmp_left, "")
+    assert_eq(warm_bin, cold_bin)
+    assert_eq(out, "sum 43")
+}
+
+test "a build whose holds can neither link nor copy compiles each unit and links a cold build's binary" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_hold_none_{getpid()}"
+    dev_tree(root, tree)
+    let first = build(tree, "cache", "")
+    edit_main(tree, 2)
+    let warm = build(tree, "cache", "BLINK_DEV_OBJCACHE_HOLD=none")
+    let warm_bin = sh("sha256sum < {tree}/out/app")
+    let out = sh("{tree}/out/app")
+    let copied = cp_calls(tree)
+    let tmp_left = sh("ls -A {tree}/cache/tmp")
+    let cold_bin = cold_binary(tree)
+    shell_exec("rm -rf {tree}")
+    assert(first.exit_code == 0, "first build failed: {first.out}{first.err_out}")
+    assert(warm.exit_code == 0, "warm build failed: {warm.out}{warm.err_out}")
+    assert(!warm.err_out.contains("hit part"), "part was a hit with no hold: {warm.err_out}")
+    assert(warm.err_out.contains("compile part"), "part did not compile: {warm.err_out}")
+    assert_eq(copied, "")
+    assert_eq(tmp_left, "")
+    assert_eq(warm_bin, cold_bin)
+    assert_eq(out, "sum 43")
+}
