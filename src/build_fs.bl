@@ -152,6 +152,60 @@ pub fn hard_link(from: Str, to: Str) -> Bool ! IO {
     bfs_link(from, to).to_int() == 0
 }
 
+// cp: a new file at to with the bytes of the file at from, read and written in this process,
+// as a process per file costs more than a small unit's compile. False, with to removed, when
+// from cannot be read or to cannot be written.
+pub fn copy_file(from: Str, to: Str) -> Bool ! IO {
+    let mut src = -1
+    with ffi.scope() as scope {
+        src = bfs_open(scope.cstr(from), 0.to_i32()).to_int()
+    }
+    if src < 0 { return false }
+    write_file(to, "")
+    let mut dst = -1
+    with ffi.scope() as scope {
+        // 1 is O_WRONLY on Linux and macOS.
+        dst = bfs_open(scope.cstr(to), 1.to_i32()).to_int()
+    }
+    let mut ok = dst >= 0
+    let mut done = false
+    while ok && !done {
+        match read_bytes(src, 65536) {
+            Ok(b) => {
+                if b.len() == 0 {
+                    done = true
+                } else {
+                    ok = write_all(dst, b)
+                }
+            }
+            Err(_) => { ok = false }
+        }
+    }
+    let _ = bfs_close(src.to_i32())
+    if dst >= 0 {
+        let _ = bfs_close(dst.to_i32())
+    }
+    if !ok {
+        let _ = remove_tree(to)
+    }
+    ok
+}
+
+// write(2) until all of data is written, as a write may take only part of it.
+fn write_all(fd: Int, data: Bytes) -> Bool ! IO {
+    let mut rest = data
+    while rest.len() > 0 {
+        match write_bytes(fd, rest) {
+            Ok(n) => {
+                if n <= 0 { return false }
+                rest = rest.slice(n, rest.len())
+            }
+            Err(_) => { return false }
+        }
+    }
+    true
+}
+
 // The size of the file at path in bytes, or -1 when it cannot be opened.
 pub fn file_size(path: Str) -> Int ! IO {
     let mut size = -1
@@ -274,7 +328,7 @@ fn bfs_rename(from: Ptr[U8], to: Ptr[U8]) -> I32 ! FFI {}
 fn bfs_link(from: Str, to: Str) -> I32 ! FFI {}
 
 @ffi("open", header: "fcntl.h")
-@trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY or O_RDWR, 0 and 2 on every host.")
+@trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY, O_WRONLY or O_RDWR, 0, 1 and 2 on every host.")
 fn bfs_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
 
 @ffi("close", header: "unistd.h")
