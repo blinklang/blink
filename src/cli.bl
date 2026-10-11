@@ -2186,7 +2186,8 @@ fn no_pch_job() -> PchJob {
 
 // Runs each unit command as sh would with at most `unit_jobs` at a time (the CPU count for
 // -1), starting them in list order. A unit runs with_pch[i] when pch_ready, or when it starts
-// after the PCH build ended and installed its PCH, and plain[i] otherwise. The PCH build
+// after the PCH build ended and installed its PCH, and plain[i] otherwise or when with_pch[i]
+// is empty. The PCH build
 // starts first in a slot of its own, so the units that start before it ends do not wait.
 // Answers one result per unit, indexed by its place in the list.
 // The children are started and reaped from this thread rather than from async tasks: the
@@ -2212,8 +2213,9 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
     let mut used: List[Bool] = []
     let mut started = 0
     while started < n && started < slots {
-        pids.push(spawn_command(if ready { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
-        used.push(ready)
+        let reads_pch = ready && with_pch.get(started).unwrap() != ""
+        pids.push(spawn_command(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+        used.push(reads_pch)
         started = started + 1
     }
     if pch_pid >= 0 {
@@ -2226,8 +2228,9 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
             let _ = build_fs.remove_tree(pch.staged)
         }
         if started < n && slots < jobs {
-            pids.push(spawn_command(if ready { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
-            used.push(ready)
+            let reads_pch = ready && with_pch.get(started).unwrap() != ""
+            pids.push(spawn_command(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+            used.push(reads_pch)
             started = started + 1
         }
     }
@@ -2236,8 +2239,9 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
         let r = process_pid_wait(pids.get(idx).unwrap())
         by_idx.push(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out, used_pch: used.get(idx).unwrap() })
         if started < n {
-            pids.push(spawn_command(if ready { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
-            used.push(ready)
+            let reads_pch = ready && with_pch.get(started).unwrap() != ""
+            pids.push(spawn_command(if reads_pch { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+            used.push(reads_pch)
             started = started + 1
         }
         idx = idx + 1
@@ -2245,23 +2249,32 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
     UnitRun { results: by_idx, pch_stored: stored }
 }
 
-// Every unit defines this before it includes the archive header, so the PCH is built with it.
-let ARCHIVE_PCH_DEFINE: Str = "-DBLINK_USE_EXTERN_RUNTIME_STORAGE=1"
-
-// The flags a PCH of the archive header is built and keyed with: gcc takes a .gch only when
-// the flags that shape it match the unit's.
-fn archive_pch_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
-    let mut flags = unit_key_flags(debug_mode, release_mode)
-    flags.push(ARCHIVE_PCH_DEFINE)
-    flags
+// The macros the unit at c_path defines before it includes the archive header, as -D flags
+// in its order, or None when anything else comes first. gcc takes a PCH only for a unit that
+// defines the macros it was built with. The prologue is a line per gate the unit reads, so
+// the head of the file holds it.
+fn archive_header_prefix(c_path: Str) -> Option[List[Str]] ! IO {
+    let text = read_file(c_path)
+    let head = text.byte_slice(0, if text.byte_len() < 4096 { text.byte_len() } else { 4096 })
+    let mut defines: List[Str] = []
+    for line in head.split("\n") {
+        if line == "#include \"libblink_std.h\"" {
+            return Some(defines)
+        }
+        let parts = line.split(" ")
+        if parts.len() != 3 || parts.get(0).unwrap() != "#define" {
+            return None
+        }
+        defines.push("-D{parts.get(1).unwrap()}={parts.get(2).unwrap()}")
+    }
+    None
 }
 
 // A PCH of the archive header serves only a plain gcc compile. clang and zig cc read a PCH
-// only through -include-pch, ccache needs settings of its own to pass one, a vendored include
-// dir could answer a system include the PCH resolved elsewhere, and a .gch beside the archive
-// header already serves every unit.
-fn archive_pch_eligible(target: Str, include_flags: Str, arc_dir: Str) -> Bool ! IO {
-    if target != "" || include_flags != "" || has_ccache() != 0 {
+// only through -include-pch, ccache needs settings of its own to pass one, and a .gch beside
+// the archive header already serves every unit.
+fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO {
+    if target != "" || has_ccache() != 0 {
         return false
     }
     if file_exists("{arc_dir}/libblink_std.h.gch") == 1 {
@@ -2332,35 +2345,73 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         misses.set(j, cur)
         i = i + 1
     }
+    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
+    // One PCH serves the units that define one set of macros before the archive header: the
+    // set most of the units to compile define. The rest read the header.
+    let mut prefixes: List[Str] = []
+    let mut pch_prefix = ""
+    let mut pch_defines: List[Str] = []
+    if misses.len() > 0 && keys.len() > 0 && archive_pch_eligible(target, arc_dir) {
+        let mut counts: Map[Str, Int] = Map()
+        let mut best = 0
+        for u in misses {
+            // "" for a unit no PCH can serve; the "D" keeps a unit that defines nothing apart.
+            let prefix = match archive_header_prefix("{work}/{u.stem}.c") {
+                Some(defines) => {
+                    let p = "D {defines.join(" ")}"
+                    let c = (counts.get(p) ?? 0) + 1
+                    counts.insert(p, c)
+                    if c > best {
+                        best = c
+                        pch_prefix = p
+                        pch_defines = defines
+                    }
+                    p
+                }
+                None => ""
+            }
+            prefixes.push(prefix)
+        }
+    }
     let mut pch_key = ""
     let mut pch_ready = false
     let mut pch = no_pch_job()
-    if misses.len() > 0 && keys.len() > 0 && archive_pch_eligible(target, include_flags, arc_dir) {
+    if pch_prefix != "" {
         let s = shas.unwrap()
         let archive_sha = s.get("{arc_dir}/libblink_std.h") ?? ""
         let runtime_sha = s.get("{arc_dir}/runtime.h") ?? ""
-        pch_key = build_objcache.pch_key(archive_sha, runtime_sha, process_cc_id(target), arc_dir, archive_pch_key_flags(debug_mode, release_mode))
+        let mut include_list: List[Str] = []
+        for part in include_flags.split(" ") {
+            if part != "" { include_list.push(part) }
+        }
+        pch_key = build_objcache.pch_key(archive_sha, runtime_sha, process_cc_id(target), arc_dir, unit_key_flags(debug_mode, release_mode), pch_defines, include_list)
         if pch_key != "" {
             pch_ready = build_objcache.lookup_pch(pch_key) != ""
             if !pch_ready {
                 let staged = build_objcache.stage_pch(arc_dir, archive_sha, runtime_sha)
                 if staged != "" {
-                    // The debug info names the archive dir, as a unit's without the PCH does.
-                    let cmd = cc_command("{unit_cc_flags().join(" ")} {ARCHIVE_PCH_DEFINE} -ffile-prefix-map={staged}={arc_dir} -x c-header {staged}/libblink_std.h -o {staged}/libblink_std.h.gch", debug_mode, release_mode, target)
+                    // The debug info names the archive dir, as a unit's without the PCH does,
+                    // and the header finds each file it includes where a unit's compile does.
+                    let cmd = cc_command("{unit_cc_flags().join(" ")} {pch_defines.join(" ")} -ffile-prefix-map={staged}={arc_dir} -x c-header {staged}/libblink_std.h -o {staged}/libblink_std.h.gch -I{staged} {includes}", debug_mode, release_mode, target)
                     pch = PchJob { cmd: cmd, key: pch_key, staged: staged }
                 }
             }
         }
     }
-    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
     let pch_dir = if pch_key != "" { build_objcache.pch_dir(pch_key) } else { "" }
     let mut cmds: List[Str] = []
     let mut pch_cmds: List[Str] = []
+    let mut mi = 0
     for u in misses {
         dbg_trace("build.units", "compile {u.stem}")
         let line = "-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir}"
         cmds.push(cc_command("{line} {includes}", debug_mode, release_mode, target))
-        pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_dir}={arc_dir} -I{pch_dir} {includes}", debug_mode, release_mode, target))
+        if pch_key != "" && prefixes.get(mi).unwrap() == pch_prefix {
+            pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_dir}={arc_dir} -I{pch_dir} {includes}", debug_mode, release_mode, target))
+        } else {
+            pch_cmds.push("")
+        }
+        mi = mi + 1
     }
     let run = run_unit_compiles(cmds, pch_cmds, pch_ready, pch, unit_jobs)
     let mut results = run.results

@@ -1,0 +1,106 @@
+// A unit of a program that uses a native dep defines the dep's gate before it includes the
+// archive header, which gcc then reads with that dep's header in it. gcc takes a PCH only
+// when the macros defined before the include match those it was built with, so the build
+// keeps a PCH for the gate a unit defines, and a unit that defines another set (the entry
+// unit, which also holds the dep's shims) reads the header itself.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program whose store module uses sqlite, and a cc first on PATH that runs the real cc
+// with -H on each compile, so its log names the PCH a unit read ("! <path>.gch"). Each
+// compile logs to a file of its own: gcc writes -H lines in pieces, which parallel compiles
+// would interleave in one file.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) exec {real_cc} \"$@\" -H 2>\"$(mktemp {tree}/cc_h/XXXXXX)\" ;; esac\nexec {real_cc} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_store_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/main.bl", [
+        #"import store.{stored_names}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("stored {stored_names()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    edit_store(tree, 1)
+}
+
+fn edit_store(tree: Str, n: Int) {
+    write_file("{tree}/app/src/store.bl", [
+        #"import std.db_sqlite.{sqlite_open, sqlite_handler}"#,
+        #""#,
+        #"pub fn stored_names() -> Str {"#,
+        #"    let handle = sqlite_open(":memory:")"#,
+        #"    with sqlite_handler(handle) {"#,
+        #"        db.exec("CREATE TABLE t (name TEXT)").unwrap()"#,
+        "        db.exec(\"INSERT INTO t VALUES ('kept {n}')\").unwrap()",
+        #"        let rows = db.query("SELECT name FROM t").unwrap()"#,
+        #"        rows.get(0).unwrap().get("name").unwrap()"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with its own object cache, the -H cc and the unit trace. The corpus
+// exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the
+// run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_out(tree: Str, flags: Str) -> Str {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    "{r.out}{r.err_out}"
+}
+
+// The compiles of the last build that read a PCH from the object cache.
+fn pch_reads(tree: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! {tree}/objcache/[0-9a-f]*\\.pch/libblink_std\\.h\\.gch$'").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+test "a unit under a native dep gate reads a PCH built under that gate" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_pch_gated_{getpid()}"
+    dev_tree(root, tree)
+    let _ = build_out(tree, "")
+    edit_store(tree, 2)
+    let edited = build_out(tree, "")
+    let edited_reads = pch_reads(tree)
+    let edited_run = sh("{tree}/out/app")
+    shell_exec("rm -f {tree}/objcache/*.o {tree}/objcache/*.meta")
+    let cold = build_out(tree, "")
+    let cold_run = sh("{tree}/out/app")
+    let dirs = pch_dirs(tree)
+    shell_exec("rm -rf {tree}")
+    assert(edited.contains("pch use store"), "the edited unit read no PCH: {edited}")
+    assert(edited_reads >= 1, "no compile read the PCH")
+    assert_eq(edited_run, "stored kept 2")
+    assert(cold.contains("pch use std_db_sqlite"), "the std db units read no PCH: {cold}")
+    assert(!cold.contains("pch use __main__"), "the entry unit read a PCH built under other macros")
+    assert_eq(cold_run, "stored kept 2")
+    assert_eq(dirs.len(), 1)
+}
