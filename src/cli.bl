@@ -2175,13 +2175,31 @@ type PchJob {
     staged: Str
 }
 
+// pch_pid is a PCH build still running when every unit had started without it; the caller
+// ends it with finish_pch.
 type UnitRun {
     results: List[UnitCompile]
     pch_stored: Bool
+    pch: PchJob
+    pch_pid: Int
 }
 
 fn no_pch_job() -> PchJob {
     PchJob { cmd: "", key: "", staged: "" }
+}
+
+// Waits for the PCH build run left running and installs its PCH. Answers whether this or run
+// installed one.
+fn finish_pch(run: UnitRun) -> Bool ! IO {
+    if run.pch_pid < 0 {
+        return run.pch_stored
+    }
+    let r = process_pid_wait(run.pch_pid)
+    if r.exit_code == 0 {
+        return build_objcache.store_pch(run.pch.key, run.pch.staged)
+    }
+    let _ = build_fs.remove_tree(run.pch.staged)
+    false
 }
 
 // Runs each unit command as sh would with at most `unit_jobs` at a time (the CPU count for
@@ -2189,6 +2207,8 @@ fn no_pch_job() -> PchJob {
 // after the PCH build ended and installed its PCH, and plain[i] otherwise or when with_pch[i]
 // is empty. The PCH build
 // starts first in a slot of its own, so the units that start before it ends do not wait.
+// When every unit starts before it ends, no unit of this build reads it, so it runs on past
+// the units and the caller ends it after its link: a small build need not wait for it.
 // Answers one result per unit, indexed by its place in the list.
 // The children are started and reaped from this thread rather than from async tasks: the
 // async pool has four threads and a task that waits on a child holds one, so tasks could
@@ -2198,7 +2218,7 @@ fn no_pch_job() -> PchJob {
 fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int) -> UnitRun ! IO {
     let n = plain.len()
     let mut by_idx: List[UnitCompile] = []
-    if n == 0 { return UnitRun { results: by_idx, pch_stored: false } }
+    if n == 0 { return UnitRun { results: by_idx, pch_stored: false, pch: no_pch_job(), pch_pid: -1 } }
     let jobs = if unit_jobs > 0 { unit_jobs } else { build_fs.cpu_count() }
     process_install_signal_forwarding()
     let mut ready = pch_ready
@@ -2218,7 +2238,7 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
         used.push(reads_pch)
         started = started + 1
     }
-    if pch_pid >= 0 {
+    if pch_pid >= 0 && started < n {
         let r = process_pid_wait(pch_pid)
         if r.exit_code == 0 {
             stored = build_objcache.store_pch(pch.key, pch.staged)
@@ -2233,6 +2253,7 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
             used.push(reads_pch)
             started = started + 1
         }
+        pch_pid = -1
     }
     let mut idx = 0
     while idx < n {
@@ -2246,7 +2267,7 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
         }
         idx = idx + 1
     }
-    UnitRun { results: by_idx, pch_stored: stored }
+    UnitRun { results: by_idx, pch_stored: stored, pch: pch, pch_pid: pch_pid }
 }
 
 // The macros the unit at c_path defines before it includes the archive header, as -D flags
@@ -2470,7 +2491,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         }
     }
     // Stored before the failure check, so a unit that compiled is not compiled again next time.
-    let mut stored = run.pch_stored
+    let mut stored = false
     let installed = build_objcache.store_objs(store_keys, store_paths, store_modules)
     let mut si = 0
     while si < store_keys.len() {
@@ -2481,6 +2502,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         si = si + 1
     }
     if failed > 0 {
+        let _ = finish_pch(run)
         return 1
     }
     let mut link_objs: List[Str] = []
@@ -2493,6 +2515,9 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let incl = if include_flags != "" { " {include_flags}" } else { "" }
     let effective_link_flags = if link_flags.contains("-pthread") { link_flags } else { "{link_flags} -pthread" }
     let rc = run_cc("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target)
+    if finish_pch(run) {
+        stored = true
+    }
     if rc != 0 {
         io.println("error: C compilation failed while linking {out}")
         return rc
