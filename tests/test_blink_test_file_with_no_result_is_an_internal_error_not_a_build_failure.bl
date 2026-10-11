@@ -1,0 +1,40 @@
+// `blink test` over a dir must never call a file "build failed" unless its build failed. A
+// file whose task handed back no result is the runner's own fault: it gets an internal error
+// of its own, does not count as a build error, and still fails the run.
+//
+// BLINK_DEV_TEST_DROP_RESULT=<file> makes the task for that file end without its result.
+// Fixture basenames must be unique per worker: `blink test` writes each binary to build/<basename>.
+
+fn run_dropping(scratch: Str, dropped: Str, flag: Str) -> Str {
+    let r = process_run("sh", ["-c", "BLINK_DEV_TEST_DROP_RESULT={dropped} build/blink test {flag} {scratch} 2>&1; echo \"exit=$?\""])
+    r.out
+}
+
+test "a file with no result is an internal error, not a build failure" {
+    let scratch = ".tmp/_test_no_result_{getpid()}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let mut gi = 0
+    while gi < 3 {
+        write_file("{scratch}/no_result_good_{gi}_{getpid()}.bl", "test \"good_{gi}\" \{\n    assert(1 + 1 == 2)\n}\n")
+        gi = gi + 1
+    }
+    let dropped = "{scratch}/no_result_good_1_{getpid()}.bl"
+
+    let json = run_dropping(scratch, dropped, "--json")
+    let jdiag = "captured:\n{json}"
+    assert(json.contains("\{\"file\":\"{dropped}\",\"error\":\"internal error: blink test got no result for this file\"}"), "expected an internal error for the dropped file; {jdiag}")
+    assert(!json.contains("build failed"), "a file with no result must not read as build failed; {jdiag}")
+    assert(json.contains("\"files_passed\":2"), "expected the other two files to pass; {jdiag}")
+    assert(json.contains("\"build_errors\":0"), "a file with no result is not a build error; {jdiag}")
+    assert(json.contains("exit=1"), "a file with no result must fail the run; {jdiag}")
+
+    let text = run_dropping(scratch, dropped, "--quiet")
+    let tdiag = "captured:\n{text}"
+    assert(text.contains("--- {dropped} ---\n  INTERNAL ERROR: blink test got no result for this file"), "expected an internal error for the dropped file; {tdiag}")
+    assert(!text.contains("BUILD FAILED"), "a file with no result must not read as BUILD FAILED; {tdiag}")
+    assert(text.contains("3 test files: 2 passed, 0 failed, 0 build errors, 1 internal error"), "expected the summary to count the internal error apart; {tdiag}")
+    assert(text.contains("exit=1"), "a file with no result must fail the run; {tdiag}")
+
+    shell_exec("rm -rf {scratch}")
+}

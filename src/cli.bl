@@ -3855,10 +3855,17 @@ fn run_built(a: Args, output_path: Str) {
 // (E0650), so the tasks send their results and the caller files them by index.
 type TestFileResult {
     idx: Int
+    built: Bool
     exit_code: Int
     out: Str
     err_out: Str
 }
+
+// Where one test file stands after the run. A file starts pending, so a task that never
+// handed back a result can not be mistaken for a build that failed.
+let TEST_FILE_PENDING = 0
+let TEST_FILE_BUILD_FAILED = 1
+let TEST_FILE_RAN = 2
 
 fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
@@ -4023,12 +4030,14 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         fi = fi + 1
     }
 
+    let mut states: List[Int] = []
     let mut exit_codes: List[Int] = []
     let mut outputs: List[Str] = []
     let mut errors: List[Str] = []
     let mut pi = 0
     while pi < file_count {
-        exit_codes.push(-1)
+        states.push(TEST_FILE_PENDING)
+        exit_codes.push(0)
         outputs.push("")
         errors.push("")
         pi = pi + 1
@@ -4052,6 +4061,10 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     // problem.
     process_install_signal_forwarding()
 
+    // Dev knob: BLINK_DEV_TEST_DROP_RESULT=<test file> ends that file's task without its
+    // result, so a test can check how the runner reports a result it never got.
+    let drop_result = env.var("BLINK_DEV_TEST_DROP_RESULT") ?? ""
+
     async.scope {
         let mut si = 0
         while si < file_count {
@@ -4059,8 +4072,13 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             let bcmd = build_args.get(si).unwrap()
             let rcmd = run_args.get(si).unwrap()
             let bin_path = output_bins.get(si).unwrap()
+            let drop_this = test_files.get(si).unwrap() == drop_result
             async.spawn(fn() {
                 sem.recv()
+                if drop_this {
+                    sem.send(1)
+                    return 0
+                }
                 let bpid = process_spawn(blink_bin, bcmd)
                 let br = process_pid_wait(bpid)
                 if br.exit_code != 0 || !file_exists(bin_path) {
@@ -4072,7 +4090,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                             err_text = br.err_out
                         }
                     }
-                    results.send(TestFileResult { idx: idx, exit_code: -1, out: "", err_out: err_text })
+                    results.send(TestFileResult { idx: idx, built: false, exit_code: br.exit_code, out: "", err_out: err_text })
                     if dots != 0 {
                         // One recv through a loop that stops after it: that spelling reads the
                         // same whether the pinned compiler types recv as the element or as an
@@ -4093,7 +4111,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 }
                 let rpid = process_spawn(bin_path, rcmd)
                 let rr = process_pid_wait(rpid)
-                results.send(TestFileResult { idx: idx, exit_code: rr.exit_code, out: rr.out, err_out: rr.err_out })
+                results.send(TestFileResult { idx: idx, built: true, exit_code: rr.exit_code, out: rr.out, err_out: rr.err_out })
                 if dots != 0 {
                     for col in dot_ch {
                         if rr.exit_code != 0 {
@@ -4117,13 +4135,13 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         }
     }
 
-    let mut received = 0
+    // Every task has ended once the scope does, so whatever was sent is buffered.
+    results.close()
     for r in results {
+        states.set(r.idx, if r.built { TEST_FILE_RAN } else { TEST_FILE_BUILD_FAILED })
         exit_codes.set(r.idx, r.exit_code)
         outputs.set(r.idx, r.out)
         errors.set(r.idx, r.err_out)
-        received = received + 1
-        if received == file_count { break }
     }
 
     if dots != 0 {
@@ -4133,6 +4151,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let mut total_passed = 0
     let mut total_failed = 0
     let mut total_errors = 0
+    let mut total_lost = 0
 
     if json_output != 0 {
         io.println("\{\"files\":[")
@@ -4142,8 +4161,22 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let mut json_first = 1
     while ri < file_count {
         let tf = test_files.get(ri).unwrap()
+        let state = states.get(ri).unwrap()
         let ec = exit_codes.get(ri).unwrap()
-        if ec == -1 {
+        if state == TEST_FILE_PENDING {
+            total_lost = total_lost + 1
+            if json_output != 0 {
+                if json_first == 0 {
+                    io.println(",")
+                }
+                json_first = 0
+                io.println("\{\"file\":\"{tf}\",\"error\":\"internal error: blink test got no result for this file\"}")
+            } else {
+                io.println("--- {tf} ---")
+                io.println("  INTERNAL ERROR: blink test got no result for this file")
+                io.println("")
+            }
+        } else if state == TEST_FILE_BUILD_FAILED {
             total_errors = total_errors + 1
             if json_output != 0 {
                 if json_first == 0 {
@@ -4208,10 +4241,16 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         if quiet == 0 && dots == 0 {
             io.println("========================================")
         }
-        io.println("{file_count} test files: {total_passed} passed, {total_failed} failed, {total_errors} build errors")
+        let mut lost_clause = ""
+        if total_lost == 1 {
+            lost_clause = ", 1 internal error"
+        } else if total_lost > 1 {
+            lost_clause = ", {total_lost} internal errors"
+        }
+        io.println("{file_count} test files: {total_passed} passed, {total_failed} failed, {total_errors} build errors{lost_clause}")
     }
 
-    if total_failed > 0 || total_errors > 0 {
+    if total_failed > 0 || total_errors > 0 || total_lost > 0 {
         exit(1)
     }
 }
