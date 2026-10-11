@@ -82,6 +82,23 @@ BLINK_TEST_STORAGE int __blink_test_case_record_count;
 BLINK_TEST_STORAGE int __blink_test_skipped;
 BLINK_TEST_STORAGE char __blink_test_skip_reason[256];
 
+/* Units read only these declarations, and the unit that defines the runtime storage
+ * holds the bodies, so an -O0 unit does not compile a copy of each one. */
+BLINK_RT_FN void __blink_assert_fail(const char* msg, int line);
+BLINK_RT_FN void blink_set_case_label(const char* s);
+BLINK_RT_FN void blink_record_case(const char* label, int64_t status);
+BLINK_RT_FN void __blink_assert_fail_eq(const char* msg, const char* expected, const char* actual, int line);
+BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion, const char* intro, const char* file, int line, int col, const char* user_msg);
+BLINK_RT_FN void __blink_test_set_propagate(const char* message, const char* error_type, const char* file, int line, int col);
+BLINK_RT_FN void __blink_test_set_skipped(const char* reason);
+BLINK_RT_FN void __blink_assert_panics_returned(const char* file, int line, int col);
+BLINK_RT_FN void __blink_assert_panics_mismatch(const char* expected, const char* actual, const char* file, int line, int col);
+BLINK_RT_FN int64_t __blink_test_is_failed(void);
+BLINK_RT_FN int64_t __blink_test_is_skipped(void);
+BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv);
+
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+
 /* Spec §2.20: an assertion failure panics. Outside a test run there is no
  * per-test frame to longjmp to, so the failure is an uncaught panic. The
  * runner's panic hook is the marker for a test run. Renders the recorded
@@ -111,7 +128,7 @@ BLINK_UNUSED static void __blink_assert_fail_uncaught(void) {
     __blink_panic_dispatch(buf);
 }
 
-BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
+BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
     __blink_test_failed = 1;
     if (msg) {
         strncpy(__blink_test_fail_msg, msg, sizeof(__blink_test_fail_msg) - 1);
@@ -140,14 +157,14 @@ BLINK_UNUSED static void __blink_assert_fail(const char* msg, int line) {
     } \
 } while (0)
 
-BLINK_UNUSED static void blink_set_case_label(const char* s) {
+BLINK_RT_FN void blink_set_case_label(const char* s) {
     BLINK_COPY_OR_EMPTY(__blink_test_case_label, s);
 }
 
 /* Append a finished for_each case record (br afazzf). status: 0=pass 1=fail
  * 2=skip. Count keeps incrementing past the cap so the JSON helper can emit an
  * accurate overflow marker for the dropped remainder. */
-BLINK_UNUSED static void blink_record_case(const char* label, int64_t status) {
+BLINK_RT_FN void blink_record_case(const char* label, int64_t status) {
     if (__blink_test_case_records == NULL) return;
     if (__blink_test_case_record_count < BLINK_TEST_CASE_MAX) {
         blink_test_case_record* r = &__blink_test_case_records[__blink_test_case_record_count];
@@ -159,10 +176,10 @@ BLINK_UNUSED static void blink_record_case(const char* label, int64_t status) {
 
 /* assert_eq failure: like __blink_assert_fail but also records the separately
  * rendered expected (RHS) and actual (LHS) operands for spec §8.10 JSON. */
-BLINK_UNUSED static void __blink_assert_fail_eq(const char* msg,
-                                                const char* expected,
-                                                const char* actual,
-                                                int line) {
+BLINK_RT_FN void __blink_assert_fail_eq(const char* msg,
+                                        const char* expected,
+                                        const char* actual,
+                                        int line) {
     __blink_test_failed = 1;
     BLINK_COPY_OR_EMPTY(__blink_test_fail_msg, msg);
     __blink_test_fail_line = line;
@@ -177,11 +194,11 @@ BLINK_UNUSED static void __blink_assert_fail_eq(const char* msg,
     longjmp(__blink_test_jmp, 1);
 }
 
-BLINK_UNUSED static void __blink_assert_fail_intro(const char* assertion,
-                                                    const char* intro,
-                                                    const char* file,
-                                                    int line, int col,
-                                                    const char* user_msg) {
+BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion,
+                                           const char* intro,
+                                           const char* file,
+                                           int line, int col,
+                                           const char* user_msg) {
     __blink_test_failed = 1;
     if (assertion && assertion[0]) {
         snprintf(__blink_test_fail_msg, sizeof(__blink_test_fail_msg),
@@ -204,10 +221,10 @@ BLINK_UNUSED static void __blink_assert_fail_intro(const char* assertion,
 
 /* Spec §2.20: ?-in-test propagation. No longjmp — caller emits `return;`
  * so cleanup destructors run for in-scope `with` bindings. */
-BLINK_UNUSED static void __blink_test_set_propagate(const char* message,
-                                                    const char* error_type,
-                                                    const char* file,
-                                                    int line, int col) {
+BLINK_RT_FN void __blink_test_set_propagate(const char* message,
+                                            const char* error_type,
+                                            const char* file,
+                                            int line, int col) {
     __blink_test_failed = 1;
     __blink_test_fail_cause = "propagated_error";
     BLINK_COPY_OR_EMPTY(__blink_test_fail_error_message, message);
@@ -227,7 +244,7 @@ BLINK_UNUSED static void __blink_test_set_propagate(const char* message,
 }
 
 /* No longjmp — caller emits `return;` so cleanup destructors run. */
-BLINK_UNUSED static void __blink_test_set_skipped(const char* reason) {
+BLINK_RT_FN void __blink_test_set_skipped(const char* reason) {
     __blink_test_skipped = 1;
     BLINK_COPY_OR_EMPTY(__blink_test_skip_reason, reason);
 }
@@ -237,7 +254,7 @@ BLINK_UNUSED static void __blink_test_set_skipped(const char* reason) {
  * with zero new runner code, and longjmp to the per-test runner frame. */
 
 /* E0831 — the block returned normally instead of panicking. */
-BLINK_UNUSED static void __blink_assert_panics_returned(const char* file, int line, int col) {
+BLINK_RT_FN void __blink_assert_panics_returned(const char* file, int line, int col) {
     __blink_assert_fail_intro(
         "assert_panics: expected the block to panic, but it returned normally",
         "", file, line, col, "");
@@ -245,10 +262,10 @@ BLINK_UNUSED static void __blink_assert_panics_returned(const char* file, int li
 
 /* E0832 — the block panicked but the message lacked the matching substring.
  * Renders the expected substring + the FULL actual panic message + origin. */
-BLINK_UNUSED static void __blink_assert_panics_mismatch(const char* expected,
-                                                        const char* actual,
-                                                        const char* file,
-                                                        int line, int col) {
+BLINK_RT_FN void __blink_assert_panics_mismatch(const char* expected,
+                                                const char* actual,
+                                                const char* file,
+                                                int line, int col) {
     char __intro[BLINK_PA_INTRO_BUF_SIZE];
     snprintf(__intro, sizeof(__intro),
              "  expected panic message to contain: %s\n  actual panic message: %s",
@@ -284,8 +301,8 @@ BLINK_UNUSED static void __blink_test_panic_handler(const char* msg) {
 /* Polled by std.testing.for_each between case-body iterations so that a
  * failing/skipped case stops the loop instead of running every remaining
  * case under a poisoned global state. int64_t signature matches Blink Int. */
-BLINK_UNUSED static int64_t __blink_test_is_failed(void) { return (int64_t)__blink_test_failed; }
-BLINK_UNUSED static int64_t __blink_test_is_skipped(void) { return (int64_t)__blink_test_skipped; }
+BLINK_RT_FN int64_t __blink_test_is_failed(void) { return (int64_t)__blink_test_failed; }
+BLINK_RT_FN int64_t __blink_test_is_skipped(void) { return (int64_t)__blink_test_skipped; }
 
 /* JSON-escape a string into a static buffer. Each call overwrites the previous
  * result, so callers must consume the output before invoking again. */
@@ -394,7 +411,7 @@ BLINK_UNUSED static void __blink_test_print_case_records_json(void) {
     printf("]");
 }
 
-BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv) {
+BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv) {
     const char* filter = NULL;
     const char* tags_filter = NULL;
     int json_output = 0;
@@ -640,5 +657,7 @@ BLINK_UNUSED static void blink_test_run(const blink_test_entry* tests, int count
     }
     if (fail > 0) exit(1);
 }
+
+#endif /* BLINK_RUNTIME_DECLS_ONLY */
 
 #endif

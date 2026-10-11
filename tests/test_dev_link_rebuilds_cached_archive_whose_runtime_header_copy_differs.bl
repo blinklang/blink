@@ -1,0 +1,46 @@
+// A dev build/ links its archive from std-cache/<key>/, beside the copy of runtime.h the
+// archive was compiled against. After a runtime header edit reflattens build/runtime.h, that
+// copy holds the old bytes, and `blink build` must rebuild the archive rather than link it.
+// The stale archive here is empty, its stamp names this compiler and the old copy, so
+// linking it fails.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+test "blink build rebuilds a cached dev archive whose runtime.h copy differs" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_dev_archive_runtime_copy_{getpid()}"
+    let blink = sh("readlink -f build/blink")
+    let arc = sh("dirname \"$(readlink -f build/libblink_std.h)\"")
+    let entry = "{tree}/build/std-cache/0000000000000000"
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {entry}")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {blink} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    shell_exec("cp -L {root}/build/runtime.h {tree}/build/runtime.h")
+    shell_exec("cp -L {root}/build/runtime.h {entry}/runtime.h")
+    write_file("{tree}/old_line", "/* a runtime header from before the edit */\n")
+    shell_exec("cat {tree}/old_line >> {entry}/runtime.h")
+    shell_exec("cp -L {arc}/libblink_std.h {arc}/skip_modules.txt {entry}/")
+    shell_exec("ar rc {entry}/libblink_std.a")
+    let old_sha = sh("sha256sum {entry}/runtime.h | cut -d' ' -f1")
+    let compiler_sha = sh("sha256sum {tree}/build/blink | cut -d' ' -f1")
+    let header_sha = sh("sha256sum {entry}/libblink_std.h | cut -d' ' -f1")
+    write_file("{entry}/.archive-id", "{old_sha}|{header_sha}|{compiler_sha}|other\n")
+    for f in ["libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("ln -s std-cache/0000000000000000/{f} {tree}/build/{f}")
+    }
+    write_file("{tree}/hello.bl", "fn main() \{\n    io.println(\"hello from a fresh archive\")\n\}\n")
+
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE BLINK_CACHE_DIR= build/blink build hello.bl -o {tree}/hello 2>&1"])
+    let out = sh("{tree}/hello")
+    let stamped = sh("cut -d'|' -f1 {tree}/build/.archive-id")
+    let runtime_sha = sh("sha256sum {tree}/build/runtime.h | cut -d' ' -f1")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "build linked the archive built against another runtime.h: {r.out}")
+    assert_eq(out, "hello from a fresh archive")
+    assert_eq(stamped, runtime_sha)
+}

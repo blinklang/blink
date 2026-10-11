@@ -26,6 +26,7 @@ static volatile pid_t blink_child_pid = 0;
 static volatile sig_atomic_t blink_got_sigint = 0;
 #endif
 
+#ifndef BLINK_RUNTIME_DECLS_ONLY
 static void blink_sigint_handler(int sig) {
     (void)sig;
     blink_got_sigint = 1;
@@ -87,6 +88,7 @@ static void blink_drain_two_fds(int fd_a, int fd_b, char** out_a, char** out_b) 
     *out_a = fd_a >= 0 ? (char*)blink_str_from_bytes(buf_a, len_a) : (char*)BLINK_STR_EMPTY;
     *out_b = fd_b >= 0 ? (char*)blink_str_from_bytes(buf_b, len_b) : (char*)BLINK_STR_EMPTY;
 }
+#endif
 
 BLINK_RT_FN void blink_process_exec(const char* cmd, const blink_list* args);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -228,6 +230,7 @@ static int64_t blink_pid_table_len = 0;
 static pthread_mutex_t blink_pid_table_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+#ifndef BLINK_RUNTIME_DECLS_ONLY
 static int64_t blink_pid_table_alloc(void) {
     pthread_mutex_lock(&blink_pid_table_mu);
     /* Recycle reaped slots before growing — keeps long-running parents
@@ -251,6 +254,7 @@ static blink_pid_slot* blink_pid_table_get(int64_t h) {
     if (h < 0 || h >= blink_pid_table_len) return NULL;
     return &blink_pid_table[h];
 }
+#endif
 
 BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -338,12 +342,14 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
 }
 #endif
 
+#ifndef BLINK_RUNTIME_DECLS_ONLY
 static int64_t blink_pid_dispatch_signal(int64_t handle, int sig) {
     blink_pid_slot* slot = blink_pid_table_get(handle);
     if (!slot || slot->reaped || slot->pid <= 0) return -1;
     if (kill(slot->pid, sig) < 0) return -1;
     return 0;
 }
+#endif
 
 // kill() with sig=0 is the POSIX existence check; we override that to SIGKILL
 // so callers don't need a separate "force-kill" entry point.
@@ -377,6 +383,7 @@ BLINK_RT_FN int64_t blink_process_pid_send_signal(int64_t handle, int64_t sig) {
 static volatile sig_atomic_t blink_process_signal_installed = 0;
 #endif
 
+#ifndef BLINK_RUNTIME_DECLS_ONLY
 static void blink_process_forward_signal(int sig) {
     /* Async-signal-safe: only kill() and write() to a known table.
      * Cannot acquire a mutex here, so accept the small race where a
@@ -396,6 +403,7 @@ static void blink_process_forward_signal(int sig) {
     sigaction(sig, &dfl, NULL);
     raise(sig);
 }
+#endif
 
 BLINK_RT_FN void blink_process_install_signal_forwarding(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY

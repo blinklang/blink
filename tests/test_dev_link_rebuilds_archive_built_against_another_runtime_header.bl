@@ -1,0 +1,40 @@
+// A dev tree's build/runtime.h can change while the compiler stays the same: a runtime
+// header edit reflattens it in place. `blink build` must not link the archive built against
+// the old header: a unit compiled against the new one names functions the old archive
+// keeps static, or reads structs at the old offsets. The stale archive here is empty and
+// stamped by this compiler, so only the runtime.h sha in its stamp says it is stale, and
+// linking it fails.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+test "blink build rebuilds a dev archive built against another runtime.h" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_dev_archive_runtime_{getpid()}"
+    let blink = sh("readlink -f build/blink")
+    let arc = sh("dirname \"$(readlink -f build/libblink_std.h)\"")
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {blink} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    shell_exec("cp -L {root}/build/runtime.h {tree}/build/runtime.h")
+    shell_exec("cp -L {arc}/libblink_std.h {arc}/skip_modules.txt {tree}/build/")
+    shell_exec("ar rc {tree}/build/libblink_std.a")
+    let zeros = "0000000000000000000000000000000000000000000000000000000000000000"
+    let compiler_sha = sh("sha256sum {tree}/build/blink | cut -d' ' -f1")
+    let header_sha = sh("sha256sum {tree}/build/libblink_std.h | cut -d' ' -f1")
+    write_file("{tree}/build/.archive-id", "{zeros}|{header_sha}|{compiler_sha}|other\n")
+    write_file("{tree}/hello.bl", "fn main() \{\n    io.println(\"hello from a fresh archive\")\n\}\n")
+
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE BLINK_CACHE_DIR= build/blink build hello.bl -o {tree}/hello 2>&1"])
+    let out = sh("{tree}/hello")
+    let stamped = sh("cut -d'|' -f1 {tree}/build/.archive-id")
+    let runtime_sha = sh("sha256sum {tree}/build/runtime.h | cut -d' ' -f1")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "build linked the archive built against another runtime.h: {r.out}")
+    assert_eq(out, "hello from a fresh archive")
+    assert_eq(stamped, runtime_sha)
+}

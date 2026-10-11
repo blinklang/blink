@@ -1,0 +1,83 @@
+// A debug build whose units call the runtime of the test and process headers, and that takes
+// one unit from the object cache after an edit, links the same binary as a build with an
+// empty cache, and the binary runs the same.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"debug_cold_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", [
+        #"pub fn run_child() -> Str {"#,
+        #"    let r = process_run("sh", ["-c", "printf out; printf err >&2; exit 3"])"#,
+        #"    "{r.out} {r.err_out} {r.exit_code}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", [
+        #"import part.{run_child}"#,
+        #""#,
+        #"fn main() {"#,
+        "    let n = {n}",
+        #"    assert(n > 0, "n is {n}")"#,
+        #"    io.println("child {run_child()} n {n}")"#,
+        #"    assert_eq(n, 1)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_debug(tree: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module --debug")
+    assert(r.exit_code == 0, "debug build failed: {r.out}{r.err_out}")
+    r
+}
+
+// The binary's sha, and what it prints with its exit code.
+fn result(tree: Str) -> (Str, Str) {
+    let r = process_run("{tree}/out/app", [])
+    (sh("sha256sum < {tree}/out/app"), "{r.out.trim()} | {r.err_out.trim()} | {r.exit_code}")
+}
+
+test "a debug build that takes a cached unit equals a cold build" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_debug_runtime_cold_equal_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_debug(tree)
+    edit_main(tree, 2)
+    let warm = build_debug(tree)
+    let (warm_sha, warm_run) = result(tree)
+    shell_exec("rm -rf {tree}/objcache {tree}/out")
+    let _cold = build_debug(tree)
+    let (cold_sha, cold_run) = result(tree)
+    shell_exec("rm -rf {tree}")
+    // part's unit comes from the cache: the edit touched only main.bl.
+    assert("{warm.out}{warm.err_out}".contains("[dbg:build.units] reuse unit part"), "no unit taken: {warm.out}{warm.err_out}")
+    assert_eq(warm_sha, cold_sha)
+    assert_eq(warm_run, cold_run)
+    assert_eq(cold_run, "child out err 3 n 2 | ASSERT_EQ FAILED: 2 != 1 (line 7) | 1")
+}

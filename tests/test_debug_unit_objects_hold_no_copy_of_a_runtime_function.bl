@@ -1,0 +1,90 @@
+// A debug build compiles each unit at -O0, where gcc emits every static function a header
+// defines. The runtime functions of the test and process headers live once, in the unit that
+// defines the runtime storage, so no unit object of a debug build holds a copy of its own,
+// and a unit that asserts calls that one copy.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// The functions of runtime_test.h and runtime_process.h, which no unit object may define.
+fn runtime_fns() -> List[Str] {
+    [
+        "__blink_assert_fail", "__blink_assert_fail_eq", "__blink_assert_fail_intro",
+        "__blink_assert_fail_uncaught", "__blink_assert_panics_mismatch",
+        "__blink_assert_panics_returned", "__blink_test_has_tag", "__blink_test_is_failed",
+        "__blink_test_is_skipped", "__blink_test_json_escape", "__blink_test_panic_handler",
+        "__blink_test_print_case_records_json", "__blink_test_print_cleanup_warnings_human",
+        "__blink_test_print_cleanup_warnings_json", "__blink_test_print_tags_json",
+        "__blink_test_set_propagate", "__blink_test_set_skipped", "blink_record_case",
+        "blink_set_case_label", "blink_test_run", "blink_drain_two_fds",
+        "blink_pid_dispatch_signal", "blink_pid_table_alloc", "blink_pid_table_get",
+        "blink_process_build_argv", "blink_process_forward_signal", "blink_pump_fd",
+        "blink_sigint_handler",
+    ]
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"debug_unit_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    write_file("{tree}/app/src/main.bl", [
+        #"import part.{value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let n = value() + 1"#,
+        #"    assert(n == 42, "n is {n}")"#,
+        #"    io.println("sum {n}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+test "no unit object of a debug build defines a runtime function" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_debug_unit_no_runtime_copy_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module --debug")
+    assert(r.exit_code == 0, "debug build failed: {r.out}{r.err_out}")
+    let objs = sh("cd {tree}/objcache && ls *.o").split("\n")
+    let fns = runtime_fns()
+    let mut copies: List[Str] = []
+    let mut callers = 0
+    for o in objs {
+        for line in sh("nm --defined-only {tree}/objcache/{o}").split("\n") {
+            let parts = line.split(" ")
+            if fns.contains(parts.get(parts.len() - 1).unwrap()) {
+                copies.push("{o}: {line}")
+            }
+        }
+        for line in sh("nm --undefined-only {tree}/objcache/{o}").split("\n") {
+            if line.ends_with(" U __blink_assert_fail_intro") {
+                callers = callers + 1
+            }
+        }
+    }
+    let out = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(objs.len() >= 2, "objects: {objs.join(" ")}")
+    assert_eq(copies.join("\n"), "")
+    assert_eq(callers, 1)
+    assert_eq(out, "sum 42")
+}

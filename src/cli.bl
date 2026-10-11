@@ -1062,8 +1062,9 @@ fn sha8(sha: Str) -> Str {
 }
 
 // A dev archive's links can point at an archive another compiler built (build-cli
-// links a new blink against the old blink's archive), so before a link a dev compiler
-// checks the stamp's compiler SHA and rebuilds on a mismatch. The full std-cache key
+// links a new blink against the old blink's archive), or one built against another
+// runtime.h, so before a link a dev compiler checks the stamp's compiler SHA and the
+// runtime.h the archive was built against, and rebuilds on a mismatch. The full std-cache key
 // is not recomputed on each run: it costs tens of ms, and the compiler SHA is already
 // memoized for the obj cache. An installed archive is never rebuilt;
 // verify_installed_archive checks it instead.
@@ -1089,11 +1090,32 @@ fn dev_archive_current() -> Bool ! IO {
     let cur_bc_sha = process_compiler_sha()
     if cur_bc_sha != "" && file_exists(stamp_path) == 1 && file_exists(path_join(arc_dir, "libblink_std.a")) == 1 {
         let parts = read_file(stamp_path).trim().split("|")
+        // A runtime header edit reflattens build/runtime.h under the same compiler, and the
+        // units compile against the new header, so the archive must be built against it too.
         if parts.len() > 2 && parts.get(2).unwrap() == cur_bc_sha {
-            return true
+            return dev_archive_runtime_h_current(arc_dir, parts.get(0).unwrap())
         }
     }
     false
+}
+
+// Whether the dev archive was built against the runtime.h a build compiles against. A
+// std-cache entry keeps a copy of the runtime.h its archive compiled, and reading both is
+// cheaper than hashing one: the sha costs about 2 ms, and this runs on each build. An archive
+// with no such copy apart from the live header is checked by its stamp's runtime.h sha.
+fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO {
+    let rt = resolve_runtime_h()
+    match build_fs.real_path(path_join(arc_dir, "libblink_std.a")) {
+        Some(archive) => {
+            let copy = path_join(path_dirname(archive), "runtime.h")
+            let live = build_fs.real_path(rt) ?? rt
+            if copy != live && file_exists(copy) == 1 {
+                return build_fs.same_bytes(copy, rt)
+            }
+        }
+        None => {}
+    }
+    stamp_rt_sha == sha256_of_file_first(rt)
 }
 
 // Reject a stale *installed* stdlib archive before it can be linked into a
