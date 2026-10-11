@@ -1909,9 +1909,17 @@ info names the archive dir as a compile without the PCH does.
 - No PCH for a cross build, for clang (it reads a PCH only through
   `-include-pch`), under ccache, or when a `libblink_std.h.gch` sits
   beside the archive header already.
+- A program's first build makes no PCH. A one-off build (a test, a CI
+  job) would pay for a PCH that no later build reads. The build makes one
+  only when `<out_dir>/<name>.units/` is there: each build that reaches
+  the link leaves it, so it shows that this program was built before.
+  The first edit after a cold build makes the PCH, and the edits after it
+  read it.
 - The obj key of a unit does not change, since its object does not.
 - GC and `blink cache clean` treat a `.pch` dir as one entry, with its
-  `.meta`.
+  `.meta`. Its bytes count toward the cap.
+- Dev knob: `BLINK_ARCHIVE_PCH=0` turns the PCH off. The byte-equal tests
+  use it to build objects with no PCH in the cache at all.
 
 As with the obj key, system headers (`gc.h`, libc) are not in the key;
 gcc checks the `.gch` against the compiler that reads it.

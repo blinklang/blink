@@ -165,7 +165,8 @@ linker exactly as freshly-built ones do.
 The cache also holds a gcc PCH of `libblink_std.h`: `<key>.pch/` holds
 copies of `libblink_std.h` and `runtime.h` and the `.gch`, with
 `<key>.meta` for the LRU. GC and `blink cache clean` treat the dir as one
-entry. The key holds what gcc needs to take the `.gch`: both header
+entry, and its bytes count toward the cap. A program's first build makes
+no PCH. The key holds what gcc needs to take the `.gch`: both header
 shas, the cc id, the archive dir, every flag, the macros a unit defines
 before the include, each include flag and the sha of each header in each
 include dir. It is not part of a unit's obj key, since an object built
