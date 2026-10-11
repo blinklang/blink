@@ -221,6 +221,58 @@ pub fn file_size(path: Str) -> Int ! IO {
     size
 }
 
+// The path with each symbolic link resolved, or None when realpath(3) cannot resolve it, such
+// as a missing file.
+pub fn real_path(path: Str) -> Option[Str] {
+    let mut real: Option[Str] = None
+    with ffi.scope() as scope {
+        let buf = scope.alloc_n[U8](4096)
+        if !bfs_realpath(scope.cstr(path), buf).is_null() {
+            real = buf.to_str()
+        }
+    }
+    real
+}
+
+// Whether the files at a and b hold the same bytes. False when either cannot be read.
+pub fn same_bytes(a: Str, b: Str) -> Bool ! IO {
+    match read_all(a) {
+        Some(x) => {
+            match read_all(b) {
+                Some(y) => x == y
+                None => false
+            }
+        }
+        None => false
+    }
+}
+
+// The whole file as bytes: a Str read would stop at the first NUL byte.
+fn read_all(path: Str) -> Option[Bytes] ! IO {
+    let mut fd = -1
+    with ffi.scope() as scope {
+        fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+    }
+    if fd < 0 { return None }
+    let mut all = Bytes.new()
+    let mut ok = true
+    let mut done = false
+    while ok && !done {
+        match read_bytes(fd, 1048576) {
+            Ok(b) => {
+                if b.len() == 0 {
+                    done = true
+                } else {
+                    all = all.concat(b)
+                }
+            }
+            Err(_) => { ok = false }
+        }
+    }
+    let _ = bfs_close(fd.to_i32())
+    if ok { Some(all) } else { None }
+}
+
 // The path execvp runs for name, or "" when it finds none. An empty PATH entry is the working
 // directory, and an unset PATH is the one glibc's execvp searches.
 pub fn find_program(name: Str) -> Str ! IO {
@@ -539,6 +591,10 @@ fn bfs_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
 @ffi("close", header: "unistd.h")
 @trusted(audit: "Wraps close(2) on a descriptor bfs_open returned.")
 fn bfs_close(fd: I32) -> I32 ! FFI {}
+
+@ffi("realpath", header: "stdlib.h")
+@trusted(audit: "Wraps realpath(3). path is a NUL-terminated copy from ffi.scope(); resolved is a 4096-byte buffer from ffi.scope(), PATH_MAX or more on every host, which realpath fills on success.")
+fn bfs_realpath(path: Ptr[U8], resolved: Ptr[U8]) -> Ptr[U8] ! FFI {}
 
 @ffi("lseek", header: "unistd.h")
 @trusted(audit: "Wraps lseek(2). fd is one bfs_open returned; whence is SEEK_SET or SEEK_END, 0 and 2 on every host.")
