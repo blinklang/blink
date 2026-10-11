@@ -944,6 +944,6 @@ W0734 is diagnostic only. It has no effect on which method a call runs. A releas
 
 **Operator desugaring** (§3.6): `a + b` desugars to `Add.add(a, b)` — a qualified trait call, not dot syntax. Operators bypass method resolution entirely.
 
-**String interpolation** (§3.6.1): `"{value}"` requires `T: Display`, checked at compile time. In `Template[C]` context, Display is not invoked — interpolation produces parameterized placeholders instead. See §3.6 Display Format Protocol.
+**String interpolation** (§3.6.1): `"{value}"` requires `T: Display`, checked at compile time. In a template literal `t"..."` (§2.4.3), Display is not invoked — each hole becomes a typed value instead (§3b.5). See §3.6 Display Format Protocol.
 
 **`self` in trait methods**: Inside an `impl Trait for Foo` block, `self` has type `Foo`. Field access on `self` uses `self.field`. Method calls on `self` use `self.method()` with normal trait lookup.

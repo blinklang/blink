@@ -711,7 +711,7 @@ type Option[T] {
 
 ```blink
 fn find_user(id: Int) -> Option[User] ! DB {
-    db.query_one("SELECT * FROM users WHERE id = {id}")
+    db.query_one(t"SELECT * FROM users WHERE id = {id}")
 }
 ```
 

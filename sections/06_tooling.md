@@ -133,7 +133,7 @@ The first line of a `///` doc comment serves as the intent declaration — it ca
 ```blink
 /// Validate user credentials against stored hash, returning the user on success
 fn verify_creds(email: Str, pwd: Str) -> Result[User, AuthError] ! DB {
-    let user = db.query_one("SELECT * FROM users WHERE email = {email}")
+    let user = db.query_one(t"SELECT * FROM users WHERE email = {email}")
         ?? return Err(NotFound)
     if user.locked {
         return Err(Locked)
@@ -315,7 +315,7 @@ AI agents frequently generate multiple valid solutions to a problem. In current 
 ```blink
 /// Validate user credentials against stored hash
 fn verify_creds(email: Str, pwd: Str) -> Result[User, AuthError] ! DB {
-    let user = db.query_one("SELECT * FROM users WHERE email = {email}")
+    let user = db.query_one(t"SELECT * FROM users WHERE email = {email}")
         ?? return Err(NotFound)
     if !crypto.verify(pwd, user.hash) {
         return Err(BadCreds)
@@ -330,7 +330,7 @@ fn verify_creds(email: Str, pwd: Str) -> Result[User, AuthError] ! DB, Cache {
     let user = match cached {
         Some(u) => u
         None => {
-            let u = db.query_one("SELECT * FROM users WHERE email = {email}")
+            let u = db.query_one(t"SELECT * FROM users WHERE email = {email}")
                 ?? return Err(NotFound)
             cache.set("user:{email}", u, ttl: 300)
             u
@@ -710,9 +710,9 @@ import std.testing.{capture_log}
 
 fn process_order(id: Int) -> Result[Receipt, OrderError] ! DB.Read, DB.Write, IO.Log {
     io.log("Processing order {id}")
-    let order = db.read("SELECT * FROM orders WHERE id = {id}")?
+    let order = db.read(t"SELECT * FROM orders WHERE id = {id}")?
     let receipt = Receipt { order_id: id, total: order.total }
-    db.write("INSERT INTO receipts ...", receipt)?
+    db.write(t"INSERT INTO receipts ...", receipt)?
     Ok(receipt)
 }
 

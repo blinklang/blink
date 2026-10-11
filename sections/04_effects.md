@@ -76,19 +76,19 @@ fn read_config(path: Str) -> Result[Config, FsError] ! FS.Read {
 
 // Multiple fine-grained effects
 fn process_order(id: Int) -> Result[Receipt, OrderError] ! DB.Read, DB.Write, IO.Log {
-    let order = db.query_one("SELECT * FROM orders WHERE id = {id}")?
+    let order = db.query_one(t"SELECT * FROM orders WHERE id = {id}")?
     io.log("Processing order {id}")
     let receipt = Receipt { order_id: id, total: order.total }
-    db.execute("INSERT INTO receipts ...")?
+    db.execute(t"INSERT INTO receipts ...")?
     Ok(receipt)
 }
 
 // Parent effect grants all children
 fn dangerous_migration() ! DB {
     // DB grants DB.Read and DB.Write -- the whole tree
-    db.exec("DROP TABLE legacy_data")?
-    db.exec("INSERT INTO migrations ...")?
-    db.query("SELECT count(*) FROM migrations")?
+    db.exec(t"DROP TABLE legacy_data")?
+    db.exec(t"INSERT INTO migrations ...")?
+    db.query(t"SELECT count(*) FROM migrations")?
 }
 ```
 
@@ -216,7 +216,7 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
     io.print("Starting...")          // IO.Print handle (no newline)
     io.println("Done!")              // IO.Print handle (with newline)
     let data = fs.read("input.txt")? // FS.Read handle
-    let rows = db.query("SELECT *..")? // DB.Read handle — string literal auto-parameterized to Template[DB]
+    let rows = db.query(t"SELECT *..")? // DB.Read handle — t"..." builds a Template[DB]
     let resp = net.get(url)?          // Net.Connect handle
     let hash = crypto.hash(data)     // Crypto.Hash handle
 }
@@ -888,15 +888,15 @@ The mock lists all eight operations at one level. A handler for an effect with c
 ```blink
 fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[(), DBError] ! DB.Write {
     with db.transaction() {
-        let from = db.query_one("SELECT balance FROM accounts WHERE id = {from_id}")?
-        let to_acct = db.query_one("SELECT balance FROM accounts WHERE id = {to_id}")?
+        let from = db.query_one(t"SELECT balance FROM accounts WHERE id = {from_id}")?
+        let to_acct = db.query_one(t"SELECT balance FROM accounts WHERE id = {to_id}")?
 
         if from.get_int("balance").unwrap() < amount {
             return Err(DBError.ExecError("insufficient funds"))
         }
 
-        db.execute("UPDATE accounts SET balance = balance - {amount} WHERE id = {from_id}")?
-        db.execute("UPDATE accounts SET balance = balance + {amount} WHERE id = {to_id}")?
+        db.execute(t"UPDATE accounts SET balance = balance - {amount} WHERE id = {from_id}")?
+        db.execute(t"UPDATE accounts SET balance = balance + {amount} WHERE id = {to_id}")?
         Ok(())
     }
 }
@@ -1399,7 +1399,7 @@ Effects propagate upward through the call graph. If function A calls function B,
 
 ```blink
 fn check_inventory(item_id: Int) -> Result[Int, DBError] ! DB.Read {
-    db.query_one("SELECT quantity FROM inventory WHERE id = {item_id}")?
+    db.query_one(t"SELECT quantity FROM inventory WHERE id = {item_id}")?
 }
 
 fn log_check(item_id: Int) ! DB.Read, IO.Log {
@@ -1440,7 +1440,7 @@ But a function declaring a child effect does NOT satisfy a callee requiring the 
 
 ```blink
 fn write_task() ! DB.Write {
-    db.exec("ALTER TABLE ...")?
+    db.exec(t"ALTER TABLE ...")?
 }
 
 fn read_only_caller() ! DB.Read {
@@ -1477,14 +1477,14 @@ This is the one normative statement of these rules. §9.1 (*The Effect Row*, *`@
 fn main() {
     io.print("Hello, world!")
     let data = fs.read("config.toml")
-    let rows = db.query("SELECT * FROM users")?
+    let rows = db.query(t"SELECT * FROM users")?
 }
 
 // Also valid -- explicit annotation, but unnecessary
 fn main() ! IO.Print, FS.Read, DB.Read {
     io.print("Hello, world!")
     let data = fs.read("config.toml")
-    let rows = db.query("SELECT * FROM users")?
+    let rows = db.query(t"SELECT * FROM users")?
 }
 ```
 
@@ -1559,10 +1559,10 @@ The most common use case. Replace real effects with test doubles:
 
 ```blink
 fn process_order(id: Int) -> Result[Receipt, OrderError] ! DB.Read, DB.Write, IO.Log {
-    let order = db.query_one("SELECT * FROM orders WHERE id = {id}")?
+    let order = db.query_one(t"SELECT * FROM orders WHERE id = {id}")?
     io.log("Processing order {id}")
     let receipt = Receipt { order_id: id, total: order.total }
-    db.execute("INSERT INTO receipts ...")?
+    db.execute(t"INSERT INTO receipts ...")?
     Ok(receipt)
 }
 
@@ -1860,7 +1860,7 @@ This is the same behavior as `async.scope { }` — the block runs in the caller'
 ```blink
 // With binding — Context is meaningful
 with db.transaction() as tx {
-    db.execute("INSERT INTO orders ...")?
+    db.execute(t"INSERT INTO orders ...")?
 }
 
 // Without binding — Context is ()
@@ -1870,7 +1870,7 @@ with metrics.timer("request_duration") {
 
 // As an expression
 let result = with db.transaction() {
-    db.query_one("SELECT count(*) FROM users")?
+    db.query_one(t"SELECT count(*) FROM users")?
 }
 ```
 
@@ -1901,7 +1901,7 @@ impl BlockHandler for Timer {
 
 // Usage
 with timer("db_query") {
-    db.query("SELECT * FROM large_table")?
+    db.query(t"SELECT * FROM large_table")?
 }
 ```
 
@@ -1939,7 +1939,7 @@ pub fn connect(path: Str) -> Result[Connection, DBError] {
 
 // Usage
 with db.connect(":memory:")? {
-    db.exec("CREATE TABLE users (name TEXT)")?
+    db.exec(t"CREATE TABLE users (name TEXT)")?
 }
 ```
 
@@ -2084,7 +2084,7 @@ A `Handler[E]` where `E` is a parent effect can be used where a `Handler[E.Sub]`
 ```blink
 fn read_only_test(h: Handler[DB.Read]) ! DB.Read {
     with h {
-        let rows = db.query("SELECT * FROM users")?
+        let rows = db.query(t"SELECT * FROM users")?
     }
 }
 
@@ -2232,15 +2232,15 @@ Modules can declare a hard ceiling on the effects any function inside them may u
 module inventory
 
 fn check_stock(item_id: Int) -> Result[Int, DBError] ! DB.Read {
-    db.query_one("SELECT quantity FROM inventory WHERE id = {item_id}")?
+    db.query_one(t"SELECT quantity FROM inventory WHERE id = {item_id}")?
 }
 
 fn update_stock(item_id: Int, delta: Int) -> Result[(), DBError] ! DB.Write {
-    db.exec("UPDATE inventory SET quantity = quantity + {delta} WHERE id = {item_id}")?
+    db.exec(t"UPDATE inventory SET quantity = quantity + {delta} WHERE id = {item_id}")?
 }
 
 fn drop_table() -> Result[(), DBError] ! DB.Write {
-    db.exec("DROP TABLE inventory")?
+    db.exec(t"DROP TABLE inventory")?
     // This works if the module's capability budget includes DB.Write
 }
 ```
@@ -2249,7 +2249,7 @@ fn drop_table() -> Result[(), DBError] ! DB.Write {
 error[CapabilityBudgetExceeded]: capability budget exceeded
  --> inventory.bl:12:5
   |
-12|     db.exec("DROP TABLE inventory")
+12|     db.exec(t"DROP TABLE inventory")
   |     ^^^^^^^^ requires `DB.Write`
   |
   = note: module `inventory` declares capabilities `DB.Read`
@@ -2800,7 +2800,7 @@ fn validate(order: Order) -> Result[Order, OrderError] {
 
 fn check_inventory(order: Order) -> Result[(), OrderError] ! DB.Read {
     for item in order.items {
-        let stock = db.query_one("SELECT quantity FROM inventory WHERE id = {item.id}")?
+        let stock = db.query_one(t"SELECT quantity FROM inventory WHERE id = {item.id}")?
         if stock < item.quantity {
             return Err(OrderError.InsufficientStock(item.id, stock))
         }
@@ -2810,7 +2810,7 @@ fn check_inventory(order: Order) -> Result[(), OrderError] ! DB.Read {
 
 fn reserve_stock(order: Order) -> Result[(), DBError] ! DB.Write {
     for item in order.items {
-        db.exec("UPDATE inventory SET quantity = quantity - {item.quantity} WHERE id = {item.id}")?
+        db.exec(t"UPDATE inventory SET quantity = quantity - {item.quantity} WHERE id = {item.id}")?
     }
 }
 
@@ -2924,7 +2924,7 @@ fn with_logging(f: fn(Str) -> () ! IO.Log) ! IO.Log {
 
 // Function type with multiple effects
 fn transform(f: fn(Row) -> Row ! DB.Read, IO.Log) -> List[Row] ! DB.Read, IO.Log {
-    let rows = db.query("SELECT * FROM data")?
+    let rows = db.query(t"SELECT * FROM data")?
     rows.map(fn(r) { f(r) })
 }
 ```
@@ -2996,7 +2996,7 @@ fn process_items(items: List[Item]) ! DB.Read, IO.Log {
     items.into_iter()
         .filter(fn(item) { item.is_active() })          // pure callback: _ = (nothing)
         .map(fn(item) {
-            let price = db.query_one("SELECT ...")?       // _ = DB.Read
+            let price = db.query_one(t"SELECT ...")?       // _ = DB.Read
             io.log("Processing {item.id}")               // _ = IO.Log
             item.with_price(price)
         })
@@ -3043,11 +3043,11 @@ Here `! IO.Log, _` means: this function always requires `IO.Log` (for its own lo
 
 ```blink
 fn caller() ! DB.Read {
-    items.map(fn(x) { db.query("...") })  // OK: _ resolves to DB.Read, caller has it
+    items.map(fn(x) { db.query(t"...") })  // OK: _ resolves to DB.Read, caller has it
 }
 
 fn bad_caller() {
-    items.map(fn(x) { db.query("...") })  // ERROR E0500: missing DB.Read
+    items.map(fn(x) { db.query(t"...") })  // ERROR E0500: missing DB.Read
 }
 ```
 
@@ -3056,7 +3056,7 @@ fn bad_caller() {
 ```blink
 test "map with mock DB" {
     with mock_db() {
-        let results = items.map(fn(x) { db.query("...") })
+        let results = items.map(fn(x) { db.query(t"...") })
         // handler intercepts DB.Read flowing through map's _
     }
 }
