@@ -1,0 +1,152 @@
+// A per-module unit holds the declaration of each symbol of another module its C names, and the
+// object cache keys the unit on those lines. A read of a global and a fn passed as a value name
+// their symbols as a call does, so a changed type of either changes the declaration the user
+// unit holds: that unit compiles again, and the binary sees the new type. Each build runs with
+// BLINK_EMIT_REUSE_VERIFY=1, so every unit it writes or takes is byte-equal to a cold emit.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"value_type_change_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/lib.bl", [
+        #"pub let mut counter: Int = 0"#,
+        #""#,
+        #"pub fn bump() {"#,
+        #"    counter = counter + 1"#,
+        #"}"#,
+        #""#,
+        #"pub fn helper(n: Int) -> Int {"#,
+        #"    n + 40"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/reader.bl", [
+        #"import lib.{counter}"#,
+        #""#,
+        #"pub fn read_count() -> Str {"#,
+        #"    counter.display()"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/passer.bl", [
+        #"import lib.{helper}"#,
+        #""#,
+        #"fn apply[T: Display](f: fn(Int) -> T, x: Int) -> Str {"#,
+        #"    f(x).display()"#,
+        #"}"#,
+        #""#,
+        #"pub fn pass_helper() -> Str {"#,
+        #"    apply(helper, 2)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import lib.{bump}"#,
+        #"import passer.{pass_helper}"#,
+        #"import reader.{read_count}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    bump()"#,
+        #"    io.println("values {read_count()} {pass_helper()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// The units a build compiled, read from its build.units trace, sorted.
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    let mut i = 1
+    while i < out.len() {
+        let cur = out.get(i).unwrap()
+        let mut j = i
+        while j > 0 && out.get(j - 1).unwrap() > cur {
+            out.set(j, out.get(j - 1).unwrap())
+            j = j - 1
+        }
+        out.set(j, cur)
+        i = i + 1
+    }
+    out
+}
+
+fn build_units(tree: Str) -> List[Str] {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    units_compiled(r)
+}
+
+test "a changed type of a global another unit reads recompiles that unit, and the binary reads the new type" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_global_type_change_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build_units(tree)
+    let out_cold = sh("{tree}/out/app")
+    let reader_cold = read_file("{tree}/out/app.units/reader.c")
+    let lib = "{tree}/app/src/lib.bl"
+    write_file(lib, read_file(lib).replace("counter: Int = 0", "counter: Str = \"\"").replace("counter = counter + 1", "counter = \"\{counter}x\""))
+    let lib_text = read_file(lib)
+    let changed = build_units(tree)
+    let out_changed = sh("{tree}/out/app")
+    let reader_changed = read_file("{tree}/out/app.units/reader.c")
+    shell_exec("rm -rf {tree}")
+    assert(lib_text.contains("counter: Str"), "the edit did not apply: {lib_text}")
+    assert(cold.contains("reader"), "the cold build did not compile the reader unit: {cold.join(",")}")
+    assert(reader_cold.contains("extern int64_t blink_lib_counter;"), "reader.c does not declare the Int global:\n{reader_cold}")
+    assert(!reader_changed.contains("extern int64_t blink_lib_counter;"), "reader.c still declares the global as Int:\n{reader_changed}")
+    assert(reader_changed.contains(" blink_lib_counter;"), "reader.c does not declare the global:\n{reader_changed}")
+    assert_eq(changed.join(","), "lib,reader")
+    assert_eq(out_cold, "values 1 42")
+    assert_eq(out_changed, "values x 42")
+}
+
+test "a changed type of a fn another unit passes as a value recompiles that unit, and the binary calls the new type" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_fn_value_type_change_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build_units(tree)
+    let out_cold = sh("{tree}/out/app")
+    let passer_cold = read_file("{tree}/out/app.units/passer.c")
+    let lib = "{tree}/app/src/lib.bl"
+    write_file(lib, read_file(lib).replace("helper(n: Int) -> Int \{\n    n + 40", "helper(n: Int) -> Str \{\n    \"h\{n}\""))
+    let lib_text = read_file(lib)
+    let changed = build_units(tree)
+    let out_changed = sh("{tree}/out/app")
+    let passer_changed = read_file("{tree}/out/app.units/passer.c")
+    shell_exec("rm -rf {tree}")
+    assert(lib_text.contains("-> Str"), "the edit did not apply: {lib_text}")
+    assert(cold.contains("passer"), "the cold build did not compile the passer unit: {cold.join(",")}")
+    assert(passer_cold.contains("int64_t blink_lib_helper(int64_t n);"), "passer.c does not declare the Int fn:\n{passer_cold}")
+    assert(!passer_changed.contains("int64_t blink_lib_helper(int64_t n);"), "passer.c still declares the fn as returning Int:\n{passer_changed}")
+    assert(passer_changed.contains(" blink_lib_helper(int64_t n);"), "passer.c does not declare the fn:\n{passer_changed}")
+    assert_eq(changed.join(","), "lib,passer")
+    assert_eq(out_cold, "values 1 42")
+    assert_eq(out_changed, "values 1 h2")
+}
