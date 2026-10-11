@@ -134,7 +134,57 @@ done
 list=$(mktemp)
 slice_list=$(mktemp)
 rows=$(mktemp)
-trap 'rm -f "$list" "$slice_list" "$rows"' EXIT
+sweep_out=$(mktemp)
+trap 'rm -f "$list" "$slice_list" "$rows" "$sweep_out"' EXIT
+
+# A ci step that fails beside the corpus makes task stop it with INT, then kill it
+# about 2 s later; the builds and the sweep below would run on to the end with no
+# one to read them. Each heavy step runs in the background, so a trapped signal
+# runs the handler at once and not after the step ends. The handler stops each
+# tree before it reads it again, so no process forks a child it misses; it walks
+# parent links and not process groups, because timeout puts each row in a group
+# of its own. Bash starts a background step with INT and QUIT ignored, and every
+# process under it inherits that, so each step resets them first: a row sees the
+# signals it saw when the sweep ran in the foreground.
+running=()
+# tree <pid>...: the pids and all their descendants, from one ps. task kills this
+# script 2 s after its INT, so a ps per process is too slow for a full sweep.
+tree() {
+    ps -e -o pid=,ppid= | awk -v roots="$*" '
+        { kids[$2] = kids[$2] " " $1 }
+        END {
+            n = split(roots, q, " ")
+            for (i = 1; i <= n; i++) {
+                print q[i]
+                m = split(kids[q[i]], c, " ")
+                for (j = 1; j <= m; j++) q[++n] = c[j]
+            }
+        }'
+}
+stop_running() {
+    trap - TERM INT
+    local seen="" now p mine=()
+    # A step that ended has a pid the system may give to another process.
+    for p in "${running[@]}"; do
+        [ "$(ps -o ppid= -p "$p" | tr -d ' ')" = "$$" ] && mine+=("$p")
+    done
+    # A daemon a row starts leaves the tree when it detaches. Each row runs in its
+    # own dir under build/corpus/work, so its working dir finds it.
+    mine+=($(find /proc/[0-9]*/cwd -maxdepth 0 -lname "$(pwd)/build/corpus/work/*" 2>/dev/null \
+        | awk -F/ '{ print $3 }'))
+    for _ in 1 2 3 4 5; do
+        now=$(tree "${mine[@]}")
+        [ -n "$now" ] || break
+        kill -STOP $now 2>/dev/null
+        [ "$now" = "$seen" ] && break
+        seen=$now
+    done
+    [ -n "$seen" ] && kill -KILL $seen 2>/dev/null
+    echo "corpus: stopped by signal, $(echo $seen | wc -w) process(es) killed" >&2
+    exit "$1"
+}
+trap 'stop_running 130' INT
+trap 'stop_running 143' TERM
 if [ -n "$only" ]; then
     # The sandbox and the result record are keyed on the basename, so a
     # file listed twice would run twice in the same directory.
@@ -208,8 +258,9 @@ native_pids=()
 for d in lib/native/*/; do
     name=$(basename "$d")
     [ -f "$d$name.c" ] || continue
-    cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c" &
+    (trap - INT QUIT; exec cc -pipe -O0 -c -o "build/corpus/native/$name.o" "$d$name.c") &
     native_pids+=("$!")
+    running+=("$!")
 done
 
 # Each row's unit includes libblink_std.h first, and reading it is about a
@@ -227,6 +278,7 @@ if [ -n "$pch_key" ]; then
     ln -s "$(sed -n 2p <<< "$pch_key")" "$pch_dir/libblink_std.h"
     ln -s "$(sed -n 3p <<< "$pch_key")" "$pch_dir/runtime.h"
     (
+        trap - INT QUIT
         if ! cc -pipe -O0 -DBLINK_DEBUG -pthread -DBLINK_USE_EXTERN_RUNTIME_STORAGE=1 -x c-header \
                 -o "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h" > build/corpus/pch.log 2>&1 \
                 || ! mv "$pch_dir/libblink_std.h.gch.tmp" "$pch_dir/libblink_std.h.gch"; then
@@ -234,6 +286,7 @@ if [ -n "$pch_key" ]; then
         fi
     ) &
     pch_pid=$!
+    running+=("$pch_pid")
 fi
 
 # The roots are the modules the compiler binary imports plus the test helpers
@@ -247,10 +300,14 @@ if [ "${CORPUS_COMPILER_ARCHIVE:-1}" = 0 ] || [ "$per_module" = 1 ]; then
     unset BLINK_COMPILER_ARCHIVE
 else
     roots=$(sed -n 's/^import \([a-z_][a-z_0-9]*\).*/\1/p' src/blinkc_main.bl | grep -vx std | sort -u)
-    if ! (unset BLINK_ROOT BLINK_COMPILER_ARCHIVE; PATH="$(pwd)/build/corpus/cc:$PATH" \
-            "$comp/blink" __build-compiler-archive "$carchive" \
-            $roots cg_test_helpers lower_test_helpers cname_test_helpers) > build/corpus/compiler_archive.log 2>&1 \
-            || [ ! -f "$carchive/libblink_compiler.a" ]; then
+    (trap - INT QUIT; unset BLINK_ROOT BLINK_COMPILER_ARCHIVE; PATH="$(pwd)/build/corpus/cc:$PATH" \
+        exec "$comp/blink" __build-compiler-archive "$carchive" \
+        $roots cg_test_helpers lower_test_helpers cname_test_helpers) > build/corpus/compiler_archive.log 2>&1 &
+    archive_pid=$!
+    running+=("$archive_pid")
+    wait "$archive_pid"
+    archive_rc=$?
+    if [ "$archive_rc" -ne 0 ] || [ ! -f "$carchive/libblink_compiler.a" ]; then
         echo "corpus: ERROR the compiler archive did not build, see build/corpus/compiler_archive.log" >&2
         tail -20 build/corpus/compiler_archive.log >&2
         exit 2
@@ -297,9 +354,12 @@ run_rows() {
 export -f run_rows
 export CORPUS_COMP="$comp" CORPUS_RESULTS="$results"
 start=$(date +%s)
-"${perf_cmd[@]}" env PARALLEL_SHELL=bash parallel -j "$jobs" --halt never --line-buffer --colsep ' ' \
-    run_rows {1} {2} {3} :::: "$rows" \
-    | awk '{ n[$1]++ } END { for (k in n) printf "corpus: %s %d\n", k, n[k] }'
+(trap - INT QUIT; exec "${perf_cmd[@]}" env PARALLEL_SHELL=bash parallel -j "$jobs" --halt never \
+    --line-buffer --colsep ' ' run_rows {1} {2} {3} :::: "$rows") > "$sweep_out" &
+sweep_pid=$!
+running=("$sweep_pid")
+wait "$sweep_pid"
+awk '{ n[$1]++ } END { for (k in n) printf "corpus: %s %d\n", k, n[k] }' "$sweep_out"
 end=$(date +%s)
 
 # Each field reads null unless perf wrote a plain number for it; a counter
