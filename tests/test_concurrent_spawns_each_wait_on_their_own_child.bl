@@ -1,0 +1,65 @@
+// Spawns that run at once must each get their own pid slot. The runtime recycles the slot of
+// a reaped child, and once handed the same recycled slot to two spawns: one wait then
+// returned the other child's output, or a result before its own child had exited. That is how
+// `blink test` over a dir reported a good file as "build failed".
+//
+// BLINK_DEV_PID_CLAIM_DELAY_US holds each spawn between taking its slot and filling it, so
+// every task below asks for a slot while the others are still in that window. No task waits
+// until all have spawned, and the waits run one at a time, so a slot that two spawns share
+// holds only the last child and hands its result to every task.
+
+import std.process
+
+test "spawns that take recycled pid slots at once each wait on their own child" {
+    // Reaped slots for the spawns below to recycle.
+    let mut pi = 0
+    while pi < 2 {
+        let _ = process.spawn("true", []).wait()
+        pi = pi + 1
+    }
+
+    // No more tasks than the async pool runs at once (4), or a task held at go would keep a
+    // later one from ever spawning.
+    let n = 4
+    let spawned = channel.new[Int](buffer: n)
+    let go = channel.new[Int](buffer: n)
+    let results = channel.new[Str](buffer: n)
+    let mut lines: List[Str] = []
+    env.set_var("BLINK_DEV_PID_CLAIM_DELAY_US", "100000")
+    async.scope {
+        let mut ti = 0
+        while ti < n {
+            let tag = "child_{ti}"
+            async.spawn(fn() {
+                let pid = process.spawn("echo", [tag])
+                spawned.send(1)
+                go.recv()
+                let r = pid.wait()
+                results.send("{tag}={r.out.trim()}:{r.exit_code}")
+                0
+            })
+            ti = ti + 1
+        }
+        let mut si = 0
+        while si < n {
+            spawned.recv()
+            si = si + 1
+        }
+        let mut gi = 0
+        while gi < n {
+            go.send(1)
+            for line in results {
+                lines.push(line)
+                break
+            }
+            gi = gi + 1
+        }
+    }
+    env.remove_var("BLINK_DEV_PID_CLAIM_DELAY_US")
+
+    assert_eq(lines.len(), n)
+    for line in lines {
+        let parts = line.split("=")
+        assert_eq(parts.get(1).unwrap(), "{parts.get(0).unwrap()}:0", "a wait returned another child's result: {line}")
+    }
+}
