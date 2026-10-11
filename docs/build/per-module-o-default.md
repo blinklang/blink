@@ -1976,6 +1976,84 @@ about as long as its six units and the link together. Each base run has
 a max of 0.088 or 0.092 s and each change run a min of 0.087 s, so the
 spreads overlap. The first edit after it saves 12 ms.
 
+#### Bench of the lazy PCH
+
+The same bench with the first-build rule in place. Base is gen1 of main
+`34dd97f4` (sha256 `7256272c…`), the change is gen1 of `95fff446`
+(sha256 `8b2d8683…`). Both ran on tree `95fff446`. Every C hash check
+reads 11/11.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| small | nochange | 0.044 (0.042-0.045) | 0.045 (0.043-0.046) | 0.045 (0.043-0.046) | 0.044 (0.043-0.045) |
+| small | body-inventory | 0.087 (0.085-0.089) | 0.075 (0.073-0.093) | 0.087 (0.086-0.090) | 0.075 (0.074-0.091) |
+| small | body-audit | 0.075 (0.074-0.077) | 0.064 (0.061-0.065) | 0.075 (0.072-0.076) | 0.064 (0.063-0.066) |
+| small | pubfn-model | 0.079 (0.077-0.080) | 0.067 (0.066-0.070) | 0.079 (0.077-0.080) | 0.067 (0.065-0.069) |
+| small | privfn-model | 0.081 (0.076-0.083) | 0.066 (0.065-0.069) | 0.081 (0.077-0.082) | 0.066 (0.064-0.068) |
+| small | testblock-model | 0.047 (0.044-0.049) | 0.047 (0.045-0.048) | 0.047 (0.045-0.048) | 0.046 (0.044-0.049) |
+| small | run-body-inventory | 0.087 (0.086-0.092) | 0.076 (0.074-0.078) | 0.086 (0.084-0.089) | 0.076 (0.073-0.078) |
+| small | test-body-inventory | 0.115 (0.112-0.117) | 0.102 (0.100-0.114) | 0.113 (0.111-0.117) | 0.102 (0.100-0.120) |
+| small | cold-obj | 0.085 (0.082-0.088) | 0.090 (0.087-0.092) | 0.083 (0.081-0.088) | 0.087 (0.085-0.091) |
+| cli | body-cname | 0.445 (0.425-0.457) | 0.439 (0.424-0.448) | 0.448 (0.429-0.458) | 0.432 (0.423-0.444) |
+| cli | cold-obj | 2.394 (2.381-2.754) | 2.345 (2.312-2.425) | 2.396 (2.361-2.491) | 2.370 (2.336-2.433) |
+| cli | cold-all | 5.202 (5.182-5.246) | 5.146 (5.106-5.166) | 5.196 (5.181-5.220) | 5.146 (5.126-5.162) |
+
+The other cli rows read the same or 1-4% faster.
+
+The warm build of the bench is the program's first build, so it makes
+no PCH. The first timed edit makes it, and each edit after that reads it.
+`body-inventory` on small, each rep in turn:
+
+- change run 2: 0.093, then 0.073-0.078 (median of reps 2-11 0.074)
+- change run 4: 0.091, then 0.074-0.077 (median 0.075)
+- base runs 1 and 3: 0.085-0.090 on every rep (median 0.087)
+
+So the first edit pays about 5 ms once, and each later edit saves about
+12 ms.
+
+`cold-obj` on small reads about 4 ms slower in each change run, with the
+eager PCH and the lazy one alike. The case clears the obj cache, which
+holds the PCH, but not `<name>.units/`, so the build takes the program
+as built before and makes the PCH again in each rep. Each rep of change
+run 2 reads 0.087-0.092 and of base run 3 0.081-0.088; the spreads
+overlap. A real cleared cache costs this once.
+
+#### Cost in `task ci`
+
+Measured in a scratch clone where `main..HEAD` is empty on both sides:
+base is `34dd97f4`, the change is a `--no-ff` merge of `95fff446` into
+it. Four `task ci` walls each, in turn, all exit 0:
+
+- base: 118.02, 117.74, 117.63, 117.79 s
+- change: 121.75, 121.81, 121.97, 122.08 s
+
+The change is 4.1 s slower, past a spread of about 0.4 s. Each step up
+to the corpus takes the same time on both sides (ratchet 0.56 s,
+lint_codegen 8.0-8.1 s, corpus start at 14.0 s). The whole 4.1 s is in
+the corpus phase: 103-104 s against 107-108 s.
+
+Split of the corpus and per-module slice reports of one base run and one
+change run:
+
+- New tests: the change adds 10 PCH test files (2142 to 2152 corpus
+  files, 190 to 200 slice rows). They sum to 14.3 s in the corpus and
+  17.5 s in the slice, about 32 s, which is about 2.7 s of wall on 12
+  workers. The longest are the gated byte-equal test (3.1 s corpus,
+  5.0 s slice) and the plain one (2.3 s).
+- The product: no step outside the corpus is slower, and a test build is
+  the program's first build, so it makes no PCH.
+- Drift on the common files, UNPROVEN: the files on both sides sum to
+  865.0 s against 877.1 s in the corpus and 238.3 s against 244.8 s in
+  the slice, about 1.3% more. That covers the rest of the 4.1 s. It was
+  not measured with the PCH off, nor against a second base run, so it
+  can be noise or a cost of the change. A test that builds a program
+  twice makes a PCH on the second build, so a cost there is possible.
+
+The 10 tests are kept: each covers a case the PCH can get wrong (race,
+bad `.gch`, byte-equal objects at `-O1` and `-g`, one error per unit,
+GC, the key), and each goes red on its own mutant. The race test came
+after these walls and adds about 0.3 s of CPU.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
