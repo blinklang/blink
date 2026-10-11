@@ -2177,11 +2177,12 @@ type UnitCompile {
 }
 
 // A PCH build for run_unit_compiles: cmd writes the .gch into the staged dir, which becomes
-// the PCH for key when cmd ends well. An empty cmd builds none.
+// the PCH for key when cmd ends well. The units read it from hold. An empty cmd builds none.
 type PchJob {
     cmd: Str
     key: Str
     staged: Str
+    hold: Str
 }
 
 // pch_pid is a PCH build still running when every unit had started without it; the caller
@@ -2194,7 +2195,7 @@ type UnitRun {
 }
 
 fn no_pch_job() -> PchJob {
-    PchJob { cmd: "", key: "", staged: "" }
+    PchJob { cmd: "", key: "", staged: "", hold: "" }
 }
 
 // Waits for the PCH build run left running and installs its PCH. Answers whether this or run
@@ -2251,9 +2252,9 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
     if pch_pid >= 0 && started < n {
         let r = process_pid_wait(pch_pid)
         if r.exit_code == 0 {
+            // Held before the store: once stored, the GC of another build can remove it.
+            ready = build_objcache.hold_pch(pch.staged, pch.hold)
             stored = build_objcache.store_pch(pch.key, pch.staged)
-            // Another build may have installed the same PCH first.
-            ready = stored || build_objcache.lookup_pch(pch.key) != ""
         } else {
             let _ = build_fs.remove_tree(pch.staged)
         }
@@ -2418,6 +2419,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         }
     }
     let mut pch_key = ""
+    // The units read the PCH from here, never from the cache.
+    let mut pch_hold = ""
     let mut pch_ready = false
     let mut pch = no_pch_job()
     if pch_prefix != "" {
@@ -2429,8 +2432,10 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
             if part != "" { include_list.push(part) }
         }
         pch_key = build_objcache.pch_key(archive_sha, runtime_sha, process_cc_id(target), arc_dir, unit_key_flags(debug_mode, release_mode), pch_defines, include_list, vendored_headers ?? [])
-        if pch_key != "" {
-            pch_ready = build_objcache.lookup_pch(pch_key) != ""
+        if pch_key != "" && hold != "" {
+            pch_hold = "{hold}/pch"
+            let found = build_objcache.lookup_pch(pch_key)
+            pch_ready = found != "" && build_objcache.hold_pch(found, pch_hold)
             // A program's first build makes no PCH: a one-off build (a test, a CI job) would
             // pay for one that no later build reads. units_dir holds the last build of this
             // program, so the first edit after it builds the PCH while its units compile.
@@ -2440,12 +2445,11 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
                     // The debug info names the archive dir, as a unit's without the PCH does,
                     // and the header finds each file it includes where a unit's compile does.
                     let cmd = cc_command("{unit_cc_flags().join(" ")} {pch_defines.join(" ")} -ffile-prefix-map={staged}={arc_dir} -x c-header {staged}/libblink_std.h -o {staged}/libblink_std.h.gch -I{staged} {includes}", debug_mode, release_mode, target)
-                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged }
+                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged, hold: pch_hold }
                 }
             }
         }
     }
-    let pch_dir = if pch_key != "" { build_objcache.pch_dir(pch_key) } else { "" }
     let mut cmds: List[Str] = []
     let mut pch_cmds: List[Str] = []
     let mut mi = 0
@@ -2453,8 +2457,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         dbg_trace("build.units", "compile {u.stem}")
         let line = "-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir}"
         cmds.push(cc_command("{line} {includes}", debug_mode, release_mode, target))
-        if pch_key != "" && prefixes.get(mi).unwrap() == pch_prefix {
-            pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_dir}={arc_dir} -I{pch_dir} {includes}", debug_mode, release_mode, target))
+        if pch_hold != "" && prefixes.get(mi).unwrap() == pch_prefix {
+            pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_hold}={arc_dir} -I{pch_hold} {includes}", debug_mode, release_mode, target))
         } else {
             pch_cmds.push("")
         }
