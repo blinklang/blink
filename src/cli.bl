@@ -1001,6 +1001,8 @@ fn process_cc_id(target: Str) -> Str ! IO {
 // trigger a full-tree size walk.
 let mut cache_did_store: Int = 0
 
+// The object answered sits in a private dir, which the caller removes after its link: the GC
+// of another build can remove the cache entry before then.
 fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
     cache_did_store = 0
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() {
@@ -1014,7 +1016,9 @@ fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target:
         return ""
     }
     let obj = cache_compile_snapshot(c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags)
-    let _ = build_fs.remove_tree(snap_dir)
+    if obj == "" {
+        let _ = build_fs.remove_tree(snap_dir)
+    }
     obj
 }
 
@@ -1034,7 +1038,7 @@ fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_m
     if key == "" {
         return ""
     }
-    let hit = build_objcache.lookup_obj(key)
+    let hit = build_objcache.hold_objs([key], snap_dir).get(0).unwrap()
     if hit != "" {
         return hit
     }
@@ -1045,11 +1049,10 @@ fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_m
     if rc != 0 {
         return ""
     }
-    if !build_objcache.store(key, staging, c_path, sha256_of_file_first(snap)) {
-        return ""
+    if build_objcache.install(key, staging, c_path, sha256_of_file_first(snap)) {
+        cache_did_store = 1
     }
-    cache_did_store = 1
-    "{build_objcache.obj_cache_dir()}/{key}.o"
+    staging
 }
 
 fn sha8(sha: Str) -> Str {
@@ -1185,6 +1188,9 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
         dbg_trace("build.units", "dev evict link")
     }
     let rc = run_cc("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
+    if cached_o != "" {
+        let _ = build_fs.remove_tree(path_dirname(cached_o))
+    }
     if rc != 0 {
         io.println("error: C compilation failed")
         return rc
@@ -2358,7 +2364,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     for u in files {
         unit_keys.push(keys.get(u.stem) ?? "")
     }
-    let hits = build_objcache.lookup_objs(unit_keys)
+    let hold = if keys.len() > 0 { build_objcache.make_hold_dir() } else { "" }
+    let hits = build_objcache.hold_objs(unit_keys, hold)
     let mut ui = 0
     for u in files {
         let hit = hits.get(ui).unwrap()
@@ -2506,17 +2513,14 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     }
     // Stored before the failure check, so a unit that compiled is not compiled again next time.
     let mut stored = false
-    let installed = build_objcache.store_objs(store_keys, store_paths, store_modules)
-    let mut si = 0
-    while si < store_keys.len() {
-        if installed.get(si).unwrap() {
-            objs.insert(store_modules.get(si).unwrap(), "{build_objcache.obj_cache_dir()}/{store_keys.get(si).unwrap()}.o")
-            stored = true
-        }
-        si = si + 1
+    // The build links its own objects; the cache gets a link or a copy of each.
+    let installed = build_objcache.install_objs(store_keys, store_paths, store_modules)
+    for ok in installed {
+        if ok { stored = true }
     }
     if failed > 0 {
         let _ = finish_pch(run)
+        drop_link_holds(hold, store_paths, installed)
         return 1
     }
     let mut link_objs: List[Str] = []
@@ -2535,6 +2539,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     if finish_pch(run) {
         stored = true
     }
+    drop_link_holds(hold, store_paths, installed)
     if rc != 0 {
         io.println("error: C compilation failed while linking {out}")
         return rc
@@ -2543,6 +2548,22 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         build_objcache.maybe_gc()
     }
     0
+}
+
+// Removes the objects link_units held for its link: the hold dir of its cache hits, and each
+// object it compiled that the cache now holds, which the units dir need not keep. Before the
+// GC, so it does not count them.
+fn drop_link_holds(hold: Str, compiled: List[Str], installed: List[Bool]) ! IO {
+    if hold != "" {
+        let _ = build_fs.remove_tree(hold)
+    }
+    let mut i = 0
+    while i < compiled.len() {
+        if installed.get(i).unwrap() {
+            fs_remove(compiled.get(i).unwrap())
+        }
+        i = i + 1
+    }
 }
 
 fn find_section_end(content: Str, section: Str) -> Int {

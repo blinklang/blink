@@ -514,6 +514,87 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO {
     out
 }
 
+// A build links an object some time after it finds or stores it here, and the GC of another
+// build can remove the entry in between. So the build links a name of its own for the bytes,
+// in a dir under tmp/ that no GC removes, and removes that dir after its link. "" when none
+// can be made.
+pub fn make_hold_dir() -> Str ! IO {
+    ensure_dir()
+    build_fs.private_dir("{obj_cache_dir()}/tmp", "hold")
+}
+
+// A hard link at to for the file at from, or a copy where the filesystem makes no link. False
+// when from is gone.
+fn hold_file(from: Str, to: Str) -> Bool ! IO {
+    if build_fs.hard_link(from, to) {
+        return true
+    }
+    process_run("cp", [from, to]).exit_code == 0
+}
+
+// lookup_obj for each key, in order, that answers a name in hold for each hit: what the
+// build links stays there after the GC of another build removes the entry. "" for an empty
+// key, a miss, or no hold dir.
+pub fn hold_objs(keys: List[Str], hold: Str) -> List[Str] ! IO {
+    let mut out: List[Str] = []
+    let dir = obj_cache_dir()
+    for key in keys {
+        let held = "{hold}/{key}.o"
+        if !cache_enabled() || hold == "" || key == "" || !hold_file("{dir}/{key}.o", held) {
+            out.push("")
+            continue
+        }
+        out.push(held)
+        // After the hold: an entry the GC removed in between leaves only an empty .meta, which
+        // the next GC removes.
+        let _ = build_fs.touch("{dir}/{key}.meta")
+    }
+    out
+}
+
+// store, but installs a link or a copy of obj_path and leaves obj_path in place, so the build
+// links its own bytes whatever the GC of another build removes. Answers whether the object is
+// now in the cache.
+pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO {
+    if !cache_enabled() {
+        return false
+    }
+    ensure_dir()
+    install_at(obj_cache_dir(), key, obj_path, "{time.read().to_unix_secs()} {module_key} {src_sha}\n")
+}
+
+// install for each (key, obj_path, module_key), in order.
+pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO {
+    let mut out: List[Bool] = []
+    for _k in keys {
+        out.push(false)
+    }
+    if !cache_enabled() || keys.len() == 0 {
+        return out
+    }
+    let dir = obj_cache_dir()
+    ensure_dir()
+    let now = time.read().to_unix_secs()
+    let mut i = 0
+    while i < keys.len() {
+        let m = module_keys.get(i).unwrap()
+        out.set(i, install_at(dir, keys.get(i).unwrap(), obj_paths.get(i).unwrap(), "{now} {m} \n"))
+        i = i + 1
+    }
+    out
+}
+
+fn install_at(dir: Str, key: Str, obj_path: Str, meta: Str) -> Bool ! IO {
+    // A staged name, so no build links a part-made copy under the key.
+    let staging = make_staging_path("install")
+    if hold_file(obj_path, staging) && build_fs.rename(staging, "{dir}/{key}.o") {
+        write_file("{dir}/{key}.meta", meta)
+        return true
+    }
+    fs_remove(staging)
+    false
+}
+
 // Atomically install obj_tmp_path as <key>.o under the cache, plus
 // write the .meta sidecar. Caller is responsible for putting a fresh
 // obj at obj_tmp_path; we rename it (so the temp path is consumed).

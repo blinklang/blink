@@ -1,0 +1,70 @@
+// Two builds can share one object cache, and the GC of one can delete an object the other has
+// just taken from the cache and not yet linked. That build must still link, and link the bytes
+// a cold build links. BLINK_DEV_OBJCACHE_EVICT=link empties the cache just before the link, as
+// such a GC would, so the race happens on every run.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/out")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"evict_link_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with the object cache at cache and the unit trace. The corpus exports
+// BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the run drops
+// them.
+fn blink_in(tree: Str, cache: Str, env_extra: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_OBJCACHE_EVICT BLINK_CACHE_DIR={tree}/{cache} BLINK_TRACE_CHANNELS=build.units {env_extra} build/blink {args}"])
+}
+
+fn build(tree: Str, cache: Str, env_extra: Str) -> ProcessResult {
+    blink_in(tree, cache, env_extra, "build app/src/main.bl -o {tree}/out/app --per-module")
+}
+
+test "a per-module build links after its cached objects are evicted, and links what a cold build links" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_evict_link_pm_{getpid()}"
+    dev_tree(root, tree)
+    // The cold build: an empty cache and no last build of the program.
+    let cold = build(tree, "cold-cache", "")
+    shell_exec("cp {tree}/out/app {tree}/cold.bin")
+    shell_exec("rm -rf {tree}/out/app.units {tree}/out/app")
+    // The cache holds part's object, and main's object from another source.
+    edit_main(tree, 0)
+    let warm = build(tree, "cache", "")
+    edit_main(tree, 1)
+    let raced = build(tree, "cache", "BLINK_DEV_OBJCACHE_EVICT=link")
+    let same = sh("cmp -s {tree}/cold.bin {tree}/out/app && echo same")
+    let out = sh("{tree}/out/app")
+    let left = sh("ls {tree}/cache/*.o 2>/dev/null | wc -l")
+    shell_exec("rm -rf {tree}")
+    assert(cold.exit_code == 0, "cold build failed: {cold.out}{cold.err_out}")
+    assert(warm.exit_code == 0, "warm build failed: {warm.out}{warm.err_out}")
+    // part came from the cache, and the cache was empty when the link ran.
+    assert(raced.err_out.contains("hit part"), "part was not a hit: {raced.err_out}")
+    assert(raced.err_out.contains("dev evict link"), "no eviction ran: {raced.err_out}")
+    assert(raced.exit_code == 0, "the build failed after the eviction: {raced.out}{raced.err_out}")
+    assert_eq(same, "same")
+    assert_eq(out, "sum 42")
+    assert_eq(left, "0")
+}
