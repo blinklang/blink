@@ -22,18 +22,43 @@ The sweep is the largest part, and it keeps all 12 cores busy. A cut in the swee
 CPU work: 12 CPU-seconds give one second of wall. Before the sweep, one core did the work and the
 others were idle, so the cuts went there:
 
-1. gen1 links with `-flto=<jobs>` at the same `-O1` (scripts/gen1.sh). cc splits the one C
-   unit into partitions and optimizes them at the same time. The cli.c link took 10.7 s alone
-   and now takes 3.3 s. The corpus CPU time did not go up, so gen1 is not slower. A cc that does
-   not accept the flag links as before.
+1. gen1 links with link-time optimization at the same `-O1` (scripts/gen1.sh). cc splits the
+   one C unit into partitions and optimizes them at the same time. The cli.c link took 10.7 s
+   alone and now takes about 3.9 s. The corpus CPU time did not go up, so gen1 is not slower. A
+   cc that does not accept the flag links as before.
 2. ci starts the corpus when gen1 is built. It does not wait for the gate self-tests, because
    the corpus reads nothing that they write.
 3. The formatter goldens run beside the corpus, while one core builds the compiler archive. They
    do not run after the sweep. Under blink-gates.slice they now run in the slice. Before, their
    own `systemd-run --scope` moved them out of the slice and its CPU cap.
 
-A failing self-test or formatter golden still fails ci. ci now finds it at the end of the
-sweep, and not before the sweep starts.
+A failing self-test or formatter golden still fails ci, and fails it at once: the two ci tasks
+that hold the corpus set `failfast`. task then sends INT to scripts/corpus.sh and kills it 2 s
+later. corpus.sh runs each heavy step in the background, so its handler runs at once. The
+handler stops every process under those steps, and every process whose working dir is in
+build/corpus/work (a daemon that a row starts leaves the process tree). Then it kills them. With
+a self-test that fails at 25 s, ci exits at 25.2 s, and no corpus process is left.
+
+### Link-time optimization: cores, memory, and who gets it
+
+The blinkc and cli links run at the same time, so they share the job count from
+scripts/default_jobs.sh: blinkc takes a third, cli the rest. Under the slice that count is 12,
+the slice CPU cap, so the links ask for `-flto=4` and `-flto=8`, 12 jobs in all. Outside a slice
+it is half of nproc. Both links together peak at 640 MiB (memory.peak of their scope); one
+process peaks at 340 MB (cli) and 287 MB (blinkc).
+
+| Links | Wall of both |
+|---|---|
+| 12 + 12 jobs | 3.8 s |
+| 4 + 8 jobs | 4.0 s |
+| no link-time optimization | 10.7 s (cli alone) |
+
+Only scripts/gen1.sh links this way, so only build/gen1 changes: the gate compiler of `task ci`,
+`task corpus`, `task corpus-per-module` (and so `task ci-release`), the rewrite suite, and the
+default binary of scripts/bench_edit_loop.sh. `task regen`, `task build-cli`, `task
+build-binaries` and `task release` link with bootstrap/bootstrap.sh and scripts/link_opt.sh, and
+do not change. gen1 with and without it emits byte-equal C for src/cli.bl, src/blinkc_main.bl
+and 20 corpus files.
 
 ## Median of 3, alternating runs
 
