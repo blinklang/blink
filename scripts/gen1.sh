@@ -83,24 +83,30 @@ wait "$cli_pid" || fail=1
 # Each binary is one C unit, and cc spends about 10 s on cli.c on one core while the
 # gate waits on it. Link-time optimization splits the unit into partitions that cc
 # optimizes at once, at the same -O level; a cc that does not take the flag links
-# as before.
-lto=""
-lto_probe=$(mktemp -d)
+# as before. The two links run at once, so they share the job count: together they
+# never ask for more cores than default_jobs gives (the slice cap under a gate).
+# cli.c is the larger unit and takes two thirds.
+lto=0
 lto_jobs=$(./scripts/default_jobs.sh)
+blinkc_lto_jobs=$((lto_jobs / 3)); [ "$blinkc_lto_jobs" -ge 1 ] || blinkc_lto_jobs=1
+cli_lto_jobs=$((lto_jobs - blinkc_lto_jobs)); [ "$cli_lto_jobs" -ge 1 ] || cli_lto_jobs=1
+lto_probe=$(mktemp -d)
 printf 'int main(void) { return 0; }\n' > "$lto_probe/p.c"
-cc -flto="$lto_jobs" -o "$lto_probe/p" "$lto_probe/p.c" > /dev/null 2>&1 && lto="-flto=$lto_jobs"
+cc -flto=2 -o "$lto_probe/p" "$lto_probe/p.c" > /dev/null 2>&1 && lto=1
 rm -rf "$lto_probe"
-# link_bin <binary> <c file>
+# link_bin <binary> <c file> <lto jobs>
 link_bin() {
-    if ! cc $BLINK_GEN1_LINK_OPT $lto -o "$out/bin/$1" "$out/$2" -I"$out/share/blink" "$archive_a" \
+    flto=""
+    [ "$lto" -eq 1 ] && flto="-flto=$3"
+    if ! cc $BLINK_GEN1_LINK_OPT $flto -o "$out/bin/$1" "$out/$2" -I"$out/share/blink" "$archive_a" \
             -lm -lgc -pthread -Wl,--gc-sections > "$out/link-$1.log" 2>&1; then
         echo "gen1: FAIL cc could not link $out/bin/$1; see $out/link-$1.log"
         head -20 "$out/link-$1.log"
         exit 1
     fi
 }
-link_bin blinkc blinkc.c & blinkc_pid=$!
-link_bin blink cli.c & cli_pid=$!
+link_bin blinkc blinkc.c "$blinkc_lto_jobs" & blinkc_pid=$!
+link_bin blink cli.c "$cli_lto_jobs" & cli_pid=$!
 fail=0
 wait "$blinkc_pid" || fail=1
 wait "$cli_pid" || fail=1
