@@ -1,0 +1,89 @@
+// A unit compile writes its stdout and stderr to files beside its object, which the build
+// reads and removes when it reaps the compile. None may outlive the build: after a build
+// that links, a unit that fails to compile, a unit whose cc a signal kills, and a link that
+// fails. A cc first on PATH fails the compile of a while fail_compile exists, kills itself
+// on the compile of a while kill_compile exists, and fails the link while fail_link exists.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    let script = [
+        "#!/bin/sh",
+        "case \" $* \" in",
+        "    *\" -c \"*) ;;",
+        "    *libblink_std.a*) [ -e {tree}/fail_link ] && exit 1; exec {real_cc} \"$@\" ;;",
+        "    *) exec {real_cc} \"$@\" ;;",
+        "esac",
+        "for a in \"$@\"; do case \"$a\" in *.c) unit=$(basename \"$a\" .c) ;; esac; done",
+        "if [ \"$unit\" = a ] && [ -e {tree}/fail_compile ]; then echo \"a failed\"; exit 1; fi",
+        "if [ \"$unit\" = a ] && [ -e {tree}/kill_compile ]; then kill -9 $$; fi",
+        "exec {real_cc} \"$@\"",
+    ]
+    write_file("{tree}/bin/cc", "{script.join("\n")}\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"io_files_app\"\nversion = \"0.1.0\"\n")
+    for m in ["a", "b", "c"] {
+        write_file("{tree}/app/src/{m}.bl", "pub fn {m}_value() -> Int \{\n    1\n\}\n")
+    }
+    write_file("{tree}/app/src/main.bl", "import a.\{a_value\}\nimport b.\{b_value\}\nimport c.\{c_value\}\n\nfn main() \{\n    io.println(\"sum \{a_value() + b_value() + c_value()\}\")\n\}\n")
+}
+
+// A cold build with the marker file set, if any. The corpus exports BLINK_COMPILER_ARCHIVE
+// and module filters, which make the build one unit, so the run drops them.
+fn build(tree: Str, marker: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/objcache {tree}/out")
+    if marker != "" { shell_exec("touch {tree}/{marker}") }
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_JOBS PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_ARCHIVE_PCH=0 build/blink build app/src/main.bl -o {tree}/out/app --per-module --jobs 2"])
+    if marker != "" { shell_exec("rm -f {tree}/{marker}") }
+    r
+}
+
+// The unit output files and the unit dirs the build left: only out/app.units may remain.
+fn left(tree: Str) -> Str {
+    sh("cd {tree}/out && find . -name '*.cc-out' -o -name '*.cc-err' -o -name '.units.*' -prune | LC_ALL=C sort | tr '\\n' ' '")
+}
+
+test "a build removes its unit output files after a link, a failed compile, a killed compile and a failed link" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_unit_io_files_{getpid()}"
+    dev_tree(root, tree)
+    let ok = build(tree, "")
+    let ok_left = left(tree)
+    let ok_dir = sh("[ -d {tree}/out/app.units/obj ] && echo yes")
+    let bad = build(tree, "fail_compile")
+    let bad_left = left(tree)
+    let killed = build(tree, "kill_compile")
+    let killed_left = left(tree)
+    let bad_link = build(tree, "fail_link")
+    let link_left = left(tree)
+    shell_exec("rm -rf {tree}")
+    assert(ok.exit_code == 0, "the build failed: {ok.out}{ok.err_out}")
+    assert(ok_dir == "yes", "the build left no obj dir, so the test reads the wrong dir")
+    assert_eq(ok_left, "")
+    assert(bad.exit_code != 0, "the build passed with a unit that failed to compile")
+    assert(bad.out.contains("a failed"), "the output of a was lost: {bad.out}")
+    assert(bad.out.contains("C compilation failed in unit a"), "no unit failed: {bad.out}")
+    assert_eq(bad_left, "")
+    assert(killed.exit_code != 0, "the build passed with a unit whose cc was killed")
+    assert(killed.out.contains("C compilation failed in unit a"), "no unit failed: {killed.out}")
+    assert_eq(killed_left, "")
+    assert(bad_link.exit_code != 0, "the build passed with a link that failed")
+    assert(bad_link.out.contains("failed while linking"), "the link did not fail: {bad_link.out}")
+    assert_eq(link_left, "")
+}

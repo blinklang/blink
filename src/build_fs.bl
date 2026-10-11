@@ -309,10 +309,13 @@ pub fn run_program(program: Str, args: List[Str]) -> Int ! IO {
 
 // A child spawn_to_files started. live is the read end of a pipe whose write end only the
 // child and the processes it starts hold, so the pipe hangs up once they have all ended, as
-// the pipes of a captured run reach their end. A pid of -1 is a child that could not start.
+// the pipes of a captured run reach their end; -1 once it has. status is the wait status
+// waitpid gave for the child, -1 while no wait has seen it end, or -2 when waitpid failed. A
+// pid of -1 is a child that could not start, or one the caller has reaped.
 pub type FileChild {
     pid: Int
     live: Int
+    status: Int
     out_path: Str
     err_path: Str
 }
@@ -340,6 +343,14 @@ pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: St
             live_w = both.l_linger.to_int()
         }
     }
+    // This process holds live while later children start, and a child that held it would
+    // keep the pipe of another open. F_SETFD and FD_CLOEXEC are 2 and 1 on Linux and macOS.
+    if live >= 0 && bfs_fcntl(live.to_i32(), 2.to_i32(), 1.to_i32()).to_int() != 0 {
+        let _ = bfs_close(live.to_i32())
+        let _ = bfs_close(live_w.to_i32())
+        live = -1
+        live_w = -1
+    }
     let mut pid = -1
     if out_fd >= 0 && err_fd >= 0 && live >= 0 {
         pid = bfs_fork().to_int()
@@ -360,50 +371,121 @@ pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: St
     if pid < 0 && live >= 0 {
         let _ = bfs_close(live.to_i32())
     }
-    FileChild { pid: pid, live: if pid < 0 { -1 } else { live }, out_path: out_path, err_path: err_path }
+    FileChild { pid: pid, live: if pid < 0 { -1 } else { live }, status: -1, out_path: out_path, err_path: err_path }
 }
 
-// Blocks until at least one child with a live pipe has ended and answers the places of all
-// that have, or [] when poll fails for more than a signal, so the caller waits on a pid.
-pub fn ended_children(children: List[FileChild]) -> List[Int] ! IO {
-    let mut fds: List[Pollfd] = []
-    let mut places: List[Int] = []
-    let mut i = 0
-    while i < children.len() {
-        let c = children.get(i).unwrap()
-        if c.live >= 0 {
-            fds.push(Pollfd { fd: c.live.to_i32(), events: POLL_EVT_IN.to_i16(), revents: 0.to_i16() })
-            places.push(i)
-        }
-        i = i + 1
-    }
-    let mut ended: List[Int] = []
-    if fds.len() == 0 { return ended }
+// The longest wait_children waits between two waitpid sweeps. A process a child started can
+// hold its pipe open after the child ends, and then only a sweep finds the end.
+let BFS_SWEEP_MS = 50
+
+// Waits until at least one running child has ended and answers children with what it found:
+// each pipe that hung up closed, and each child that ended with its status. A pipe hangs up
+// as the child ends, a moment before waitpid can see it, so a sweep follows each wake, and a
+// child whose pipe hung up but that no sweep has seen end is swept again a millisecond later.
+// When poll fails for more than a signal, it waits on the first running child. Answers
+// children as they were when none runs.
+pub fn wait_children(children: List[FileChild]) -> List[FileChild] ! IO {
+    let mut kids: List[FileChild] = []
+    for c in children { kids.push(c) }
     loop {
-        match poll(fds, -1) {
-            Ok(got) => {
-                let mut j = 0
-                while j < got.len() {
-                    // No one writes to the pipe, so any event is its end: a hang-up, or a
-                    // read of nothing where a host reports no hang-up for a pipe.
-                    if got.get(j).unwrap().revents.to_int() != 0 {
-                        ended.push(places.get(j).unwrap())
-                    }
-                    j = j + 1
+        let mut fds: List[Pollfd] = []
+        let mut places: List[Int] = []
+        let mut running = 0
+        let mut hung_up = false
+        let mut i = 0
+        while i < kids.len() {
+            let c = kids.get(i).unwrap()
+            if c.pid > 0 && c.status == -1 {
+                running = running + 1
+                if c.live >= 0 {
+                    fds.push(Pollfd { fd: c.live.to_i32(), events: POLL_EVT_IN.to_i16(), revents: 0.to_i16() })
+                    places.push(i)
+                } else {
+                    hung_up = true
                 }
-                if ended.len() > 0 { return ended }
             }
-            Err(_) => {
-                // EINTR is 4 on Linux and macOS: the signal forwarding handler ran.
-                if bfs_errno() != 4 { return ended }
+            i = i + 1
+        }
+        if running == 0 { return kids }
+        let wait_ms = if hung_up { 1 } else { BFS_SWEEP_MS }
+        if fds.len() == 0 {
+            // poll skips a negative fd, so this only waits out wait_ms.
+            let _ = poll([Pollfd { fd: (-1).to_i32(), events: 0.to_i16(), revents: 0.to_i16() }], wait_ms)
+        } else {
+            match poll(fds, wait_ms) {
+                Ok(got) => {
+                    let mut j = 0
+                    while j < got.len() {
+                        // No one writes to the pipe, so any event is its end: a hang-up, or a
+                        // read of nothing where a host reports no hang-up for a pipe.
+                        if got.get(j).unwrap().revents.to_int() != 0 {
+                            let at = places.get(j).unwrap()
+                            let c = kids.get(at).unwrap()
+                            let _ = bfs_close(c.live.to_i32())
+                            kids.set(at, FileChild { live: -1, ..c })
+                        }
+                        j = j + 1
+                    }
+                }
+                Err(_) => {
+                    // EINTR is 4 on Linux and macOS: a signal handler ran.
+                    if bfs_errno() != 4 {
+                        let mut k = 0
+                        while kids.get(k).unwrap().pid <= 0 || kids.get(k).unwrap().status != -1 {
+                            k = k + 1
+                        }
+                        let c = kids.get(k).unwrap()
+                        kids.set(k, FileChild { status: wait_status(c.pid, 0), ..c })
+                        return kids
+                    }
+                }
             }
         }
+        let mut ended = false
+        let mut k = 0
+        while k < kids.len() {
+            let c = kids.get(k).unwrap()
+            if c.pid > 0 && c.status == -1 {
+                // WNOHANG is 1 on Linux and macOS.
+                let s = wait_status(c.pid, 1)
+                if s != -1 {
+                    kids.set(k, FileChild { status: s, ..c })
+                    ended = true
+                }
+            }
+            k = k + 1
+        }
+        if ended { return kids }
     }
-    ended
+    kids
 }
 
-// Waits for child to end and answers its exit code (128 plus the signal that ended it, as a
-// captured run gives) and its output, then removes its output files.
+// The wait status of child pid once waitpid with options sees it end, -1 when WNOHANG finds
+// it running, or -2 when waitpid fails for more than a signal.
+fn wait_status(pid: Int, options: Int) -> Int ! IO {
+    let mut status = -2
+    with ffi.scope() as scope {
+        let cell = scope.alloc[I32]()
+        loop {
+            let r = bfs_waitpid(pid.to_i32(), cell, options.to_i32()).to_int()
+            if r == pid {
+                status = cell.deref().to_int()
+                break
+            }
+            if r == 0 {
+                status = -1
+                break
+            }
+            // EINTR is 4 on Linux and macOS.
+            if r > 0 || bfs_errno() != 4 { break }
+        }
+    }
+    status
+}
+
+// Waits for child to end, unless wait_children saw it end, and answers its exit code (128
+// plus the signal that ended it, as a captured run gives) and its output, then removes its
+// output files.
 pub fn reap_to_files(child: FileChild) -> ProcessResult ! IO {
     if child.live >= 0 {
         let _ = bfs_close(child.live.to_i32())
@@ -411,19 +493,7 @@ pub fn reap_to_files(child: FileChild) -> ProcessResult ! IO {
     let mut exit_code = -1
     let mut err_note = ""
     if child.pid > 0 {
-        let mut status = -1
-        with ffi.scope() as scope {
-            let cell = scope.alloc[I32]()
-            loop {
-                let r = bfs_waitpid(child.pid.to_i32(), cell, 0.to_i32()).to_int()
-                if r == child.pid {
-                    status = cell.deref().to_int()
-                    break
-                }
-                // EINTR is 4 on Linux and macOS.
-                if r > 0 || bfs_errno() != 4 { break }
-            }
-        }
+        let status = if child.status == -1 { wait_status(child.pid, 0) } else { child.status }
         if status >= 0 {
             if (status & 127) == 0 {
                 exit_code = (status >> 8) & 255
@@ -487,12 +557,16 @@ fn bfs_errno() -> Int ! FFI {}
 fn bfs_fork() -> I32 ! FFI {}
 
 @ffi("waitpid", header: "sys/wait.h")
-@trusted(audit: "Wraps waitpid(2) on a child bfs_fork made. status is one I32 cell from ffi.scope(); options is 0, so it blocks.")
+@trusted(audit: "Wraps waitpid(2) on a child bfs_fork made. status is one I32 cell from ffi.scope(); options is 0, so it blocks, or WNOHANG, 1 on Linux and macOS.")
 fn bfs_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
 
 @ffi("pipe", header: "unistd.h")
 @trusted(audit: "Wraps pipe(2). fds is a two-I32 buffer from ffi.scope(); int is 32 bits on every host.")
 fn bfs_pipe(fds: Ptr[I32]) -> I32 ! FFI {}
+
+@ffi("fcntl", header: "fcntl.h")
+@trusted(audit: "Wraps fcntl(2) with F_SETFD and FD_CLOEXEC, 2 and 1 on Linux and macOS, on a descriptor bfs_pipe made. The third argument is an int, as F_SETFD takes.")
+fn bfs_fcntl(fd: I32, cmd: I32, arg: I32) -> I32 ! FFI {}
 
 @ffi("dup2", header: "unistd.h")
 @trusted(audit: "Wraps dup2(2) in a child bfs_fork made, on descriptors bfs_open returned, before it execs.")
