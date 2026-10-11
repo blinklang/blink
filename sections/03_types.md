@@ -930,13 +930,13 @@ import std.uuid.UUID
 
 fn create_user(name: Str) -> User ! DB.Write, Rand {
     let id = UUID.random()      // requires ! Rand
-    db.write("INSERT INTO users (id, name) VALUES ({id}, {name})")
+    db.write(t"INSERT INTO users (id, name) VALUES ({id}, {name})")
     User { id: id, name: name }
 }
 
 fn lookup(raw_id: Str) -> Result[User, AppError] ! DB.Read {
     let id = UUID.parse(raw_id)?    // validates format
-    db.read("SELECT * FROM users WHERE id = {id}")
+    db.read(t"SELECT * FROM users WHERE id = {id}")
 }
 ```
 
@@ -1128,7 +1128,7 @@ fn add(a: Int, b: Int) -> Int {
 }
 
 fn find_user(id: Int) -> Option[User] ! DB {
-    db.query_one("SELECT * FROM users WHERE id = {id}")
+    db.query_one(t"SELECT * FROM users WHERE id = {id}")
 }
 
 // Everything inside a function body: inferred
@@ -2011,7 +2011,7 @@ error[TypeError]: mismatched types
 
 `Handler` in `use_it` is the module's own struct (it shadows the compiler-known `Handler[E]`, §10.6 *Shadowing Rules*), so `use_it(5)` is an ordinary type mismatch. It is never a type variable that accepts `5`.
 
-**Hygiene.** Syntax that the compiler expands, and types the compiler inserts, refer to the compiler-known type **by identity**, never by the name that is in scope at the use site. This covers `T?` and `??` (`Option`), `?` (`Result`/`Option`), `for` (`IntoIterator`/`Iterator`), `..`/`..=` (`Range`), `==`/`<` and the other operators (their traits), `with` (`Handler`, `Closeable`), `async.spawn` (`Handle`), `Template[C]` coercion, literals (`Int`, `Float`, `Str`, `Char`, `Bool`), and every other desugaring in this spec. A trait name that the user writes (a bound, an `impl`, a supertrait clause, a `@derive` argument) is not a desugaring and resolves by scope (§10.6 *Shadowing a Prelude Trait*). A module that declares its own `Option` still gets the builtin `Option` from `x?`:
+**Hygiene.** Syntax that the compiler expands, and types the compiler inserts, refer to the compiler-known type **by identity**, never by the name that is in scope at the use site. This covers `T?` and `??` (`Option`), `?` (`Result`/`Option`), `for` (`IntoIterator`/`Iterator`), `..`/`..=` (`Range`), `==`/`<` and the other operators (their traits), `with` (`Handler`, `Closeable`), `async.spawn` (`Handle`), template literals (`Template[C]`), literals (`Int`, `Float`, `Str`, `Char`, `Bool`), and every other desugaring in this spec. A trait name that the user writes (a bound, an `impl`, a supertrait clause, a `@derive` argument) is not a desugaring and resolves by scope (§10.6 *Shadowing a Prelude Trait*). A module that declares its own `Option` still gets the builtin `Option` from `x?`:
 
 ```blink
 type Option {
@@ -3824,17 +3824,17 @@ let msg = "at {p}"
 // msg is "at Point { x: 1.0, y: 2.5 }"
 ```
 
-**Template[C] context: Display not invoked.** In `Template[C]` typed strings (§3b.5), interpolation has different semantics — `{expr}` is decomposed into the `values` list as a typed value, not concatenated via Display. Display is **not** invoked in Template context:
+**Template literals: Display not invoked.** In a template literal `t"..."` (§2.4.3, §3b.5), interpolation has different semantics — `{expr}` is decomposed into the `values` list as a typed value, not concatenated via Display. Display is **not** invoked in a template literal:
 
 ```blink
 let id = 42
 let name = "Alice"
 
-// Normal Str context — Display invoked:
+// Plain literal, a Str — Display invoked:
 let msg = "user {id}: {name}"           // "user 42: Alice"
 
-// Template[DB] context — Display NOT invoked:
-let q: Template[DB] = "SELECT * FROM users WHERE id = {id} AND name = {name}"
+// Template literal — Display NOT invoked:
+let q: Template[DB] = t"SELECT * FROM users WHERE id = {id} AND name = {name}"
 // q.parts()  == ["SELECT * FROM users WHERE id = ", " AND name = ", ""]
 // q.values() == [TemplateValue.Int(42), TemplateValue.Str("Alice")]   ← typed values, not strings
 ```
@@ -4496,7 +4496,7 @@ There is no `null`, `nil`, or `None`-as-implicit-value: no value belongs to ever
 ```blink
 // This function might not find a user. The type says so.
 fn find_user(id: Int) -> Option[User] ! DB {
-    db.query_one("SELECT * FROM users WHERE id = {id}")
+    db.query_one(t"SELECT * FROM users WHERE id = {id}")
 }
 
 // The caller MUST handle the absence. The compiler enforces this.

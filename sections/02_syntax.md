@@ -37,8 +37,8 @@ All decided through independent design and cross-team voting. None are revisitab
 | Entry point | `fn main()` | Convention-based. Compiler looks for `main`. No decorator, no annotation, no magic. |
 | Blocks | `{ }` braces | Unambiguous nesting. LLMs produce brace errors far less often than indentation errors. Enables incremental parsing of broken code. See [2.3](#23-contested-braces-vs-indentation). |
 | Statement terminator | Newline | No semicolons. Canonical formatting makes them redundant. Saves 1 token per line across every file. See [2.5](#25-contested-no-semicolons). |
-| String delimiter | `"double quotes"` only | One string syntax. No single quotes, no backticks, no raw strings. Zero style debates. |
-| String interpolation | `"Hello, {name}!"` | Universal — every string supports `{expr}`. No `f"..."` prefix needed. Literal brace via `\{`. See [2.4](#24-contested-universal-interpolation). |
+| String delimiter | `"double quotes"` only | One string syntax. No single quotes, no backticks, no raw strings. Zero style debates. A prefix (`#`, `t`) changes how the content is read, never the delimiter. See [2.4.3](#243-template-literals-t). |
+| String interpolation | `"Hello, {name}!"` | Universal — every string supports `{expr}`. No `f"..."` prefix needed. Literal brace via `\{`. A `t` prefix makes a template literal (§2.4.3). See [2.4](#24-contested-universal-interpolation). |
 | Bindings | `let` / `let mut` | Immutable by default. `let mut` is a deliberate speed bump that says "this will change." `:=` was rejected 5-0 — it's ambiguous about mutability. Parameters follow the same rule: `mut name: T` (§3.6 *Mutable Parameters*). |
 | Pattern matching | `match val { P => e }` | Expression-based. `=>` for arms (not `->`, which means return type). |
 | Match arm separator | Newline | No commas between arms. Consistent with the newline-terminated philosophy. |
@@ -159,7 +159,7 @@ Each malformed escape is a lexer error in both literal kinds. Each error kind ha
 | `\x1b` | Blink has no `\x` escape | write `\u{1b}` |
 | `"\u{0}"` | a `Str` cannot hold NUL | use `Bytes` for data that contains NUL |
 
-**Context-sensitive interpolation.** When an interpolated string literal appears where `Template[C]` is expected (e.g., `db.query_one("SELECT * FROM users WHERE id = {id}")`), the compiler extracts `{expr}` as bound parameters instead of concatenating. The *receiving type* determines behavior: `{id}` in a `Str` context is concatenation, `{id}` in a `Template[DB]` context is parameterization. No new string syntax is needed — the same `"..."` literal does the right thing based on where it appears. See section 3.12 for details.
+**Template literals.** A `t` before a string literal makes a template literal: in `db.query_one(t"SELECT * FROM users WHERE id = {id}")`, the compiler keeps `{id}` apart from the text as a bound value and does not concatenate it. A plain `"..."` literal is always a `Str`, whatever type the site expects. See §2.4.3 and §3b.5.
 
 **Backticks are literal.** Backtick characters (`` ` ``) have **no special meaning** inside `"..."` or `#"..."#`. They are ordinary characters, even when used in markdown-style code spans inside test names or docstrings. Interpolation rules apply uniformly — a `{` inside a backtick-quoted region of a string still triggers interpolation. For strings that contain code snippets with literal `{` characters, write either:
 
@@ -281,6 +281,55 @@ When to use which string form:
 - **`#embed("path")`**: large text blobs — templates, documentation, SQL schemas
 
 **Panel vote: 5-0** for extended delimiter strings. Parametric extension of existing string syntax (same `"` delimiter, same `Str` type), not a second string syntax. Locked "one string syntax" decision preserved. See [DECISIONS.md](../DECISIONS.md).
+
+#### 2.4.3 Template Literals (`t"..."`)
+
+A `t` prefix on a string literal makes a **template literal**. The compiler keeps its text and its holes apart: each `{expr}` becomes a value that the receiver binds as a parameter, and never text that the compiler concatenates. Database, shell and HTML APIs take a `Template[C]` (§3b.5), so their arguments are template literals:
+
+```blink
+fn get_user(id: Int) -> User? ! DB.Read {
+    db.query_one(t"SELECT * FROM users WHERE id = {id}")
+}
+```
+
+**One delimiter, optional prefixes.** Blink has one string delimiter, `"`. A prefix changes how the compiler reads the content, never the delimiter: `#` changes which characters are literal (§2.4.2), and `t` changes what the literal builds. Each new prefix needs a panel vote. There is no tag for each context, such as `sql"..."` or `html"..."`: the type `Template[C]` gives the context, not the literal.
+
+**`t` composes with every literal form.** It also goes before an extended delimiter, at depths 1 to 3:
+
+| Form | Hole | Literal `{` |
+|------|------|-------------|
+| `t"..."` | `{expr}` | `\{` |
+| `t#"..."#` | `#{expr}` | `{` |
+| `t##"..."##` | `##{expr}` | `{` |
+| `t###"..."###` | `###{expr}` | `{` |
+
+```blink
+fn active_docs(owner: Int) -> List[Row] ! DB.Read {
+    db.query(t#"SELECT * FROM docs WHERE meta @> '{"active": true}' AND owner = #{owner}"#)
+}
+```
+
+Rules:
+- The `t` must come directly before the `"` or the first `#`, with no space between. A `t` followed by anything else is an ordinary identifier.
+- Escapes, holes, line breaks and delimiter depth follow the same rules as the form without `t` (§2.4, §2.4.2).
+- W1111 fires inside `t#"..."#` as it does inside `#"..."#`: there, `{owner}` is literal text, and only `#{owner}` is a hole.
+
+**Type.** A template literal has type `Template[α]`, where α is a new type variable. The type that the site expects solves α, by the same bidirectional check as for any other expression. A later use in the same definition can also solve it, as for `[]` and `None` (§3.4 *Under-Determined Types*):
+
+```blink
+fn get_user(id: Int) -> User? ! DB.Read {
+    let q = t"SELECT * FROM users WHERE id = {id}"   // Template[α]
+    db.query_one(q)                                  // α = DB
+}
+```
+
+If α is not solved at the end of inference for the definition, the literal is `error[CannotInferType]` (E0301), and the span points at the `t"..."` literal. Each hole must have a Template value type, or be a `Raw[T]`, which folds its text into the parts and raises `RawBypassesParam` (§3b.5).
+
+**A plain literal is always a `Str`.** A `"..."` literal never becomes a template, whatever type the site expects. A plain literal where `Template[C]` is expected, and a template literal where `Str` is expected, are each `error[TemplateMismatch]` (E0310). The `help:` adds or removes the `t`, and a tool can apply it (§3b.5 *Compile Errors for `Str` and `Template` Mismatch*).
+
+A forgotten `t` is a compile error, not a silent bug. That is the difference from the `f"..."` prefix that §2.4 rejects: there, a missing `f` compiles and gives the wrong output with no error.
+
+**Panel vote: 6-0** on all nine questions. See [DECISIONS.md](../DECISIONS.md) and the [rationale](../decisions/template-literal-prefix.md).
 
 ### 2.5 Contested: No Semicolons
 
@@ -2435,7 +2484,7 @@ These follow from the rule. They are not extra rules.
 - **Call:** the callee, when it is an expression, then the receiver of a method call, then the arguments as written. Keyword arguments run in written order, not declaration order, and bind to their parameters after all of them are evaluated. Omitted keyword arguments take const defaults (§2.21), so their placement cannot be observed.
 - **Operator:** left operand, then right operand, then the trait method. `x + y` is `Add.add(x, y)` (§2.19), so the call rule covers it.
 - **Literal:** list elements and spreads (§2.16), tuple elements, struct-literal fields and variant payloads, as written. Struct-literal fields run in written order, not declaration order.
-- **Interpolation:** holes left to right. Each hole's value is appended before the next hole starts. In a `Template[C]` context (§3c) the values list is built in the same order.
+- **Interpolation:** holes left to right. Each hole's value is appended before the next hole starts. In a template literal `t"..."` (§2.4.3) the values list is built in the same order.
 - **`with` items:** left to right, as §4.7 *Disambiguation rules* states.
 - **Assignment `place = rhs`:** see *Assignment places* below.
 

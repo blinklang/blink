@@ -633,36 +633,35 @@ A default of "error on Unknown" fails this goal while no solver exists, and is w
 
 ### 3b.5 Context-Sensitive Template Types
 
-Blink's universal string interpolation (`"Hello, {name}!"`) is safe for display strings — but dangerous when interpolated strings flow to injection-sensitive contexts like databases, shells, or HTML templates. The `Template[C]` type makes the obvious code the safe code without changing developer syntax.
+Blink's universal string interpolation (`"Hello, {name}!"`) is safe for display strings — but dangerous when interpolated strings flow to injection-sensitive contexts like databases, shells, or HTML templates. The template literal `t"..."` (§2.4.3) keeps the values apart from the text, and the `Template[C]` type makes sure that only a template reaches such a context, never a `Str`.
 
 #### The Problem
 
 ```blink
 fn get_user(id: Int) -> User? ! DB.Read {
-    // Looks like string interpolation — but this goes to a database
-    db.query_one("SELECT * FROM users WHERE id = {id}")
+    db.query_one(t"SELECT * FROM users WHERE id = {id}")
 }
 ```
 
-In most languages, this is textbook SQL injection. In Blink, it's safe — because `db.query_one` accepts `Template[DB]`, not `Str`.
+In most languages, interpolation into a query is textbook SQL injection. In Blink, it is safe: `t"..."` keeps `{id}` apart from the text, and `db.query_one` accepts `Template[DB]`, not `Str`. A string built by concatenation is a `Str`, so it cannot reach the database.
 
 #### How `Template[C]` Works
 
-`Template[C]` is a compiler-known **opaque** type parameterized by a phantom type `C` that identifies the injection context (DB, Shell, HTML, etc.). When an interpolated string literal appears where `Template[C]` is expected, the compiler **decomposes** the string into literal parts and interpolated values instead of concatenating them.
+`Template[C]` is a compiler-known **opaque** type parameterized by a phantom type `C` that identifies the injection context (DB, Shell, HTML, etc.). A template literal `t"..."` (§2.4.3) builds one: the compiler **decomposes** the literal into literal parts and interpolated values instead of concatenating them.
 
 ```blink
 // What the developer writes:
-db.query_one("SELECT * FROM users WHERE id = {id}")
+db.query_one(t"SELECT * FROM users WHERE id = {id}")
 
 // What the handler observes, for id = 42:
 //   t.parts()  == ["SELECT * FROM users WHERE id = ", ""]
 //   t.values() == [TemplateValue.Int(42)]
 
-// The second interpolation in the same function is Str context — normal concat:
+// A plain literal is a Str — normal concatenation:
 Err(ApiError.NotFound("User {id} not found"))
 ```
 
-The *receiving type* determines the behavior. The same `{id}` syntax means decomposition in a `Template[DB]` context and concatenation in a `Str` context.
+The prefix decides what a literal builds: `t"..."` decomposes, and `"..."` concatenates. The parameter type decides what a site accepts: a `Template[DB]` parameter rejects a `Str`, and a `Str` parameter rejects a template. The safety comes from the parameter type, not from the `t`. A wrapper such as `fn run(sql: Str)` gives the safety up, whatever literal its callers write.
 
 **Handler reassembly.** The handler — not the compiler — decides how to reassemble the template. Each database, shell, or HTML handler owns its dialect-specific parameterization syntax:
 
@@ -677,7 +676,7 @@ This separation of concerns means the compiler never encodes dialect knowledge. 
 
 #### The `Template[C]` Surface (normative)
 
-`Template[C]` has **no fields and no constructor**. Only two things build one: the coercion of an interpolated string literal at a site that expects `Template[C]`, and the folding of a `Raw[T]` into that literal's parts (see *`Raw(expr)` — The Escape Hatch* below). A handler reads a template through two methods:
+`Template[C]` has **no fields and no constructor**. Only a template literal `t"..."` builds one (§2.4.3). A `Raw[T]` hole in that literal folds its text into the parts (see *`Raw(expr)` — The Escape Hatch* below). **Every part of a `Template[C]` is literal source text, or text folded in from a `Raw[T]`.** To bind, return, store or pass a template keeps this true, so these need no further rule. A handler reads a template through two methods:
 
 | Method | Signature | Returns |
 |---|---|---|
@@ -698,7 +697,7 @@ fn log_it(t: Template[Ctx]) -> Int {
 }
 ```
 
-This rule is what makes the literal coercion the only way to put text into the parts. Without it, any function that receives a template could push text into the parts, with no `Raw` and no `RawBypassesParam`. *(Non-normative: an implementation may share storage between the template and the returned list until the first write, provided no program can observe the sharing.)*
+This rule is what makes the template literal the only way to put text into the parts. Without it, any function that receives a template could push text into the parts, with no `Raw` and no `RawBypassesParam`. *(Non-normative: an implementation may share storage between the template and the returned list until the first write, provided no program can observe the sharing.)*
 
 The values follow the same rule. No Template value type is a shared cell (§3.6 *Shared cells*), so a write through another name, such as a `set_*` call on a `Bytes` that was a hole, does not change the template.
 
@@ -741,7 +740,7 @@ type TemplateValue {
 
 It is the same for every context `C`. To add a variant is a language change, because every handler's exhaustive `match` must then change (E0004 names each site). A handler names each variant; a `_` arm hides the next language change from E0004. A context with no use for a kind still names its arm and rejects the value there, for example with an `Err` that names the kind.
 
-Each interpolation hole in a `Template[C]` literal becomes one value, by the hole's static type:
+Each interpolation hole in a template literal becomes one value, by the hole's static type:
 
 | Hole type | Value |
 |---|---|
@@ -765,10 +764,10 @@ A `help:` line never offers `Raw(...)`. `Raw` is an audited bypass, not a repair
 
 ```
 error[TemplateHoleType]: `Point` cannot be a Template value
- --> geo.bl:4:44
+ --> geo.bl:4:43
   |
-4 |     db.execute("INSERT INTO pts VALUES ({p})")
-  |                                          ^ `Point` is not a Template value type
+4 |     db.execute(t"INSERT INTO pts VALUES ({p})")
+  |                                           ^ `Point` is not a Template value type
   |
   = note: Template values are Int, Float, Bool, Str, Bytes, the narrower
           integers, F32, and Option of these
@@ -796,33 +795,63 @@ Four rules limit this type:
 
 *(Non-normative: a later lint may warn on an effect's type written in a position that holds values, such as `Map[Str, DB]`. Such a lint warns at the written annotation only, never through a generic binder, and is never an error.)*
 
-**`C` comes from the expected parameter type.** At the coercion, the literal takes `C` from the type the site expects, by the same bidirectional check as any other expression. `C` is never inferred from the effects in the enclosing signature.
+**`C` comes from how the template is used.** A template literal has type `Template[α]`, where α is a new type variable (§2.4.3). The type that the site expects solves α, by the same bidirectional check as for any other expression. A later use in the same definition can also solve it, as for `[]` and `None` (§3.4 *Under-Determined Types*). `C` is never inferred from the effects in the enclosing signature. If α is not solved at the end of inference for the definition, the literal is `error[CannotInferType]` (E0301), and the span points at the `t"..."` literal. If two uses need different contexts, the error is at the second use, and a `note:` names the use that set `C`.
 
-**`C` may be a type parameter.** `fn log_query[C](t: Template[C]) -> Int` is ordinary generic code and accepts a template of any context. A literal whose expected type is `Template[C]` with `C` still unbound is under-determined: `error[CannotInferType]` (E0301, §3.4), whose `help:` names the explicit type argument, for example `log_query[DB]("...")`. *(Non-normative: each `C` is its own instantiation, as §3.4 *Explicit Type Application* (no erasure) requires. Every `Template[C]` has the same runtime layout, so the generated bodies for two contexts can be identical, and an implementation may merge identical bodies, as a linker may fold identical functions. No program can observe the merge, and the language does not require it.)*
+**`C` may be a type parameter.** `fn log_query[C](t: Template[C]) -> Int` is ordinary generic code and accepts a template of any context. A template literal passed to it with no other use that sets `C` is under-determined: `error[CannotInferType]` (E0301, §3.4), whose `help:` names the explicit type argument, for example `log_query[DB](t"...")`. *(Non-normative: each `C` is its own instantiation, as §3.4 *Explicit Type Application* (no erasure) requires. Every `Template[C]` has the same runtime layout, so the generated bodies for two contexts can be identical, and an implementation may merge identical bodies, as a linker may fold identical functions. No program can observe the merge, and the language does not require it.)*
 
 **An unknown name is an error.** `Template[Usr]` with no declaration named `Usr` is `error[UnknownType]` (E0507), as in every other type annotation (§3.4 *Type Name Resolution*). It never becomes a type variable.
 
-#### Compile Errors for `Str` → `Template` Mismatch
+#### Compile Errors for `Str` and `Template` Mismatch
 
-A pre-built `Str` variable cannot be passed where `Template[C]` is expected. This prevents laundering tainted data through a string variable:
+`Str` and `Template[C]` are different types, and neither converts to the other. A `Str` where `Template[C]` is expected is `error[TemplateMismatch]` (E0310), and so is a template where `Str` is expected. This stops tainted data from passing through a string variable: a `Str` has no holes, because its values were concatenated when it was built, and nothing can get them back.
+
+For a plain literal, the `help:` adds the `t`. It points at the literal, and a tool can apply it:
+
+```
+error[TemplateMismatch]: expected `Template[DB]`, found `Str`
+ --> user.bl:2:18
+  |
+2 |     db.query_one("SELECT * FROM users WHERE id = {id}")
+  |                  ^ a plain string literal is a `Str`
+  |
+  = note: only a template literal `t"..."` builds a `Template[C]`
+  = help: add the `t` prefix: `t"SELECT * FROM users WHERE id = {id}"`
+```
+
+For a `Str` value, no change at the call is a fix, because the text was built before the call:
 
 ```blink
-let q: Str = "SELECT * FROM users WHERE id = {id}"
-db.query_one(q)  // COMPILE ERROR: expected Template[DB], got Str
+// intentional-error example
+fn get_user(id: Int) -> User? ! DB.Read {
+    let q = "SELECT * FROM users WHERE id = {id}"   // Str: {id} is concatenated
+    db.query_one(q)                                  // error[TemplateMismatch]
+}
 ```
 
 ```
-error[E0310]: type mismatch
- --> user.bl:5:18
+error[TemplateMismatch]: expected `Template[DB]`, found `Str`
+ --> user.bl:3:18
   |
-5 |     db.query_one(q)
+3 |     db.query_one(q)
   |                  ^ expected `Template[DB]`, found `Str`
   |
-  = note: string variables cannot be implicitly converted to Template
-  = hint: pass the string literal directly, or wrap values in Raw() for dynamic SQL
+  = note: a `Str` has no holes; its values were concatenated when it was built
+  = help: build it as a template literal: `let q = t"SELECT ..."`
 ```
 
-This is intentional. The auto-decomposition only works on string *literals* at the call site, where the compiler can see the template structure. A `Str` variable is opaque — the compiler cannot extract parts from it.
+In the other direction, the `help:` removes the `t`, and a tool can apply it:
+
+```
+error[TemplateMismatch]: expected `Str`, found a template literal
+ --> greet.bl:2:16
+  |
+2 |     io.println(t"Hello, {name}!")
+  |                ^ a `t"..."` literal builds a `Template`, not a `Str`
+  |
+  = help: remove the `t` prefix: `"Hello, {name}!"`
+```
+
+As for `TemplateHoleType`, no `help:` line offers `Raw(...)`.
 
 #### `Raw(expr)` — The Escape Hatch
 
@@ -830,16 +859,18 @@ For dynamic SQL (table names, column lists, generated clauses), wrapping an inte
 
 `Raw[T]` is a **real marker type**, not a spelling the compiler matches. `Raw(expr)` constructs a `Raw[T]` from a `T`, and the type carries the marker wherever the value goes:
 
-- `Raw[T]` implements **no `Display`**. The only thing that consumes it is a `Template[C]` coercion, which concatenates the wrapped value into the adjacent literal segment.
-- The marker survives a binding. `let t = Raw(table)` has type `Raw[Str]`, and interpolating `t` into a template is the same bypass as writing `Raw(table)` inline — with the same audit obligation.
+- `Raw[T]` implements **no `Display`**. The only thing that consumes it is a hole of a template literal `t"..."`, which concatenates the wrapped value into the adjacent literal segment.
+- The marker survives a binding. `let r = Raw(table)` has type `Raw[Str]`, and `{r}` in a template literal is the same bypass as writing `Raw(table)` inline — with the same audit obligation.
 - Nothing strips it implicitly. A `Raw[T]` is not a `T`, and there is no coercion from one to the other.
+
+**This is a typing rule, not a rule on the source text.** In a template literal, each hole has a Template value type or a `Raw[T]` of one. A `Raw[T]` hole folds and raises `RawBypassesParam`, whether the `Raw(...)` call is in the hole or the value came through a binding, a return or a generic call. A `Raw[T]` in any other position, including a hole of a plain `"..."` literal, is `error[RawOutsideTemplate]` (E0530, below).
 
 **A `Raw[Bytes]` cannot fold.** The parts are `List[Str]`, and a `Bytes` value has no lossless map into a `Str`. So `{Raw(b)}` with `b: Bytes` is `error[TemplateHoleType]` (E0534), and its `help:` sends the value as a parameter:
 
 ```blink
 // intentional-error example
 fn store(img: Bytes) -> Result[Int, DBError] ! DB.Write {
-    db.execute("INSERT INTO imgs VALUES ({Raw(img)})")   // error[TemplateHoleType]: a `Raw[Bytes]`
+    db.execute(t"INSERT INTO imgs VALUES ({Raw(img)})")   // error[TemplateHoleType]: a `Raw[Bytes]`
                                                          //   cannot fold into the parts
                                                          // help: send it as a parameter: `{img}`
 }
@@ -848,7 +879,7 @@ fn store(img: Bytes) -> Result[Int, DBError] ! DB.Write {
 ```blink
 fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
     // Only table is concatenated into parts; id is a separate value
-    db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
+    db.query_one(t"SELECT * FROM {Raw(table)} WHERE id = {id}")
     // For table = "users", the handler observes:
     //   parts()  == ["SELECT * FROM users WHERE id = ", ""]
     //   values() == [TemplateValue.Int(id)]
@@ -856,17 +887,17 @@ fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
 }
 
 // Fully dynamic (all raw) — still works, just verbose
-db.query_one("{Raw(whole_query)}")
+db.query_one(t"{Raw(whole_query)}")
 ```
 
-**The audit warning fires where the bypass happens.** A `Raw[T]` folded into a `Template[C]` is the un-parameterized interpolation, and that coercion — and only that coercion — raises `RawBypassesParam`:
+**The audit warning fires where the bypass happens.** A `Raw[T]` folded into a `Template[C]` is the un-parameterized interpolation, and that fold — and only that fold — raises `RawBypassesParam`:
 
 ```
 warning[RawBypassesParam]: Raw() bypasses parameterization
- --> report.bl:3:42
+ --> report.bl:3:35
   |
-3 |     db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
-  |                                  ^^^^^^^^^^ concatenated into the query text, not parameterized
+3 |     db.query_one(t"SELECT * FROM {Raw(table)} WHERE id = {id}")
+  |                                   ^^^^^^^^^^ concatenated into the query text, not parameterized
   |
   = help: if `table` comes from user input, parameterize it instead: `{table}`
   = help: only if no parameterized form exists, record the review: add
@@ -887,7 +918,7 @@ The warning does **not** fire on an ordinary interpolated string, because an ord
 fn log_table(table: Str) ! IO {
     io.println("scanning {Raw(table)}")   // error[RawOutsideTemplate]: a `Raw[T]` reached a
                                           //   position that does not consume it -- only a
-                                          //   `Template[C]` coercion does
+                                          //   hole of a `t"..."` literal does
                                           // help: drop the wrapper: `"scanning {table}"`
 }
 ```
@@ -906,23 +937,23 @@ The phantom type `C` in `Template[C]` enables the same mechanism for other injec
 ```blink
 // Shell injection protection (future)
 fn shell(cmd: Template[Shell]) -> Result[Output, ShellError]
-process.shell("ls -la {path}")  // path is decomposed, handler quotes/escapes
+process.shell(t"ls -la {path}")  // path is decomposed, handler quotes/escapes
 
 // HTML/XSS protection (future)
 fn render(template: Template[HTML]) -> SafeHtml
-html.render("<div>{user_content}</div>")  // handler entity-escapes
+html.render(t"<div>{user_content}</div>")  // handler entity-escapes
 
 // LDAP injection protection (future)
 fn search(filter: Template[LDAP]) -> Result[List[Entry], LDAPError]
 ```
 
-Each context defines its own reassembly strategy. The developer writes the same interpolation syntax everywhere — the receiving type ensures safety, and the handler decides how to make it safe.
+Each context defines its own reassembly strategy. The developer writes the same template literal everywhere — the parameter type ensures safety, and the handler decides how to make it safe.
 
 #### Design Rationale
 
 **Why not taint tracking:** Full information flow tracking (Section 9.3) requires tracking provenance on every value through inference, generics, and closures. `Template[C]` with `Raw[T]` achieves 95% of the safety at the type boundary with minimal type system extension — two compiler-known types that enable per-interpolation safety control.
 
-**Why not a new string syntax:** Adding `sql"..."` or `q"..."` prefixes violates the "one string syntax" principle (Section 2.2). The receiving type determines behavior, not a prefix on the literal.
+**Why a `t` prefix, and not a tag for each context:** `t` is a prefix on the one delimiter, as `#` is (§2.4.2). It adds no delimiter, so the "one string syntax" decision (§2.2) holds. A tag for each context, such as `sql"..."` or `html"..."`, would repeat what the phantom type `C` already says, and each new context would need a new tag. The `t` says only "keep the holes apart", and the type says where the template can go. An earlier rule had no prefix: a plain literal became a template when the site expected `Template[C]`. That rule was an implicit conversion, which Blink rejects elsewhere, and it worked only for a literal written directly as an argument. With `t`, a template is an ordinary expression that you can bind, return and pass, and the literal alone shows whether a hole is a value or text. A forgotten `t` is a compile error with a one-character fix (E0310). Python 3.14 uses the same spelling, `t"..."`, for the same meaning. (Panel vote: 6-0. See [Template literal prefix rationale](../decisions/template-literal-prefix.md).)
 
 **Why phantom types:** `Template[DB]` and `Template[Shell]` are distinct types. You cannot pass a `Template[Shell]` to a function expecting `Template[DB]`. The phantom parameter prevents cross-context confusion at compile time.
 
@@ -930,7 +961,7 @@ Each context defines its own reassembly strategy. The developer writes the same 
 
 **Why decomposed (not phantom-only):** Handlers need to read `parts()` and `values()` at runtime to reassemble the template with their dialect-specific syntax. A phantom over a plain string would leave handlers with an opaque string they cannot decompose.
 
-**Why opaque (not a struct with fields):** A `values` field would need a type for "any interpolated value", and Blink has no surface top type (§3.4 *Under-Determined Types*). The closed `TemplateValue` enum is the type instead: it keeps each value's kind, so an `Int` reaches the driver as an integer, and a handler's `match` over it is exhaustive. Public fields would also let code build a template without the literal coercion, which is the one construction path the injection rule depends on.
+**Why opaque (not a struct with fields):** A `values` field would need a type for "any interpolated value", and Blink has no surface top type (§3.4 *Under-Determined Types*). The closed `TemplateValue` enum is the type instead: it keeps each value's kind, so an `Int` reaches the driver as an integer, and a handler's `match` over it is exhaustive. Public fields would also let code build a template without a template literal, which is the one construction path the injection rule depends on.
 
 **Why a `Bytes` variant:** A `Str` must be valid UTF-8 and a `Bytes` need not be, so no existing variant carries a binary value without loss. Database drivers bind a BLOB as its own kind (`sqlite3_bind_blob`, libpq binary parameters). Without the variant, the repair users find, `{b.to_hex()}`, compiles and stores text in a BLOB column. A context with no use for bytes, such as Shell or HTML, rejects them in a named arm.
 
@@ -940,7 +971,7 @@ Each context defines its own reassembly strategy. The developer writes the same 
 
 | Language | Type | Decomposition | Reassembly |
 |----------|------|---------------|------------|
-| Python 3.14 | `Template` | `.args` alternating `(str, Interpolation)` | Handler walks args |
+| Python 3.14 | `Template` (`t"..."`) | `.args` alternating `(str, Interpolation)` | Handler walks args |
 | C# | `FormattableString` | `.Format` + `.GetArguments()` | Handler reads format + args |
 | JavaScript | Tagged template | `strings[]` + `values[]` | Tag function zips them |
-| **Blink** | **`Template[C]`** | **`parts()` + `values()`** | **Handler matches `TemplateValue`** |
+| **Blink** | **`Template[C]` (`t"..."`)** | **`parts()` + `values()`** | **Handler matches `TemplateValue`** |

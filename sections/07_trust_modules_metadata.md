@@ -201,7 +201,7 @@ pub fn fetch_table(table: Str) -> Result[List[Row], DBError] ! DB.Read {
     if !REPORT_TABLES.contains(table) {
         return Err(DBError.PermissionDenied("unknown table {table}"))
     }
-    db.query("SELECT * FROM {Raw(table)}")
+    db.query(t"SELECT * FROM {Raw(table)}")
 }
 ```
 
@@ -232,10 +232,10 @@ error[AuditRecordNotFound]: no audit record `DB-003`
 
 ```
 warning[RawBypassesParam]: Raw() bypasses parameterization
- --> report.bl:5:30
+ --> report.bl:5:31
   |
-5 |     db.query("SELECT * FROM {Raw(table)}")
-  |                              ^^^^^^^^^^ concatenated into the query text, not parameterized
+5 |     db.query(t"SELECT * FROM {Raw(table)}")
+  |                               ^^^^^^^^^^ concatenated into the query text, not parameterized
   |
   = note: `report.fetch_table` changed since audit record `RPT-002` was pinned
   = help: re-read the claim in `RPT-002`; if it still holds, run `blink audit pin RPT-002 report.fetch_table`
@@ -1508,30 +1508,30 @@ For internal function calls (Blink calling Blink), the compiler still attempts s
 
 Blink's universal string interpolation creates an injection risk when interpolated strings flow to databases, shells, or HTML renderers. The `Template[C]` type solves this at the type boundary without taint tracking.
 
-**v1 mechanism:** Effect handle methods that execute interpreted strings accept `Template[C]` instead of `Str`. When an interpolated string literal appears where `Template[C]` is expected, the compiler decomposes it into literal parts and typed values — `{expr}` becomes a value the handler binds as a parameter, not string concatenation (§3b.5).
+**v1 mechanism:** Effect handle methods that execute interpreted strings accept `Template[C]` instead of `Str`. A template literal `t"..."` (§2.4.3) builds a `Template[C]`: the compiler decomposes it into literal parts and typed values — `{expr}` becomes a value the handler binds as a parameter, not string concatenation (§3b.5).
 
 ```blink
-// Developer writes this — identical to a normal interpolated string:
+// Developer writes a template literal — a normal interpolated string with a `t` prefix:
 fn get_user(id: Int) -> User? ! DB.Read {
-    db.query_one("SELECT * FROM users WHERE id = {id}")
+    db.query_one(t"SELECT * FROM users WHERE id = {id}")
     // The handler receives parts ["SELECT * FROM users WHERE id = ", ""] and values [TemplateValue.Int(id)]
 }
 
 // Str → Template is a compile error:
 let q: Str = "SELECT * FROM users WHERE id = {id}"
-db.query_one(q)  // ERROR: expected Template[DB], got Str
+db.query_one(q)  // error[TemplateMismatch]: expected Template[DB], found Str
 ```
 
-**Escape hatch:** `Raw(expr)` constructs a value of the marker type `Raw[T]`, which bypasses parameterization for a single interpolated expression within a `Template[C]` string. Folding a `Raw[T]` into a template raises `RawBypassesParam`, an audit-gated warning: `@trusted(audit: K)` is its only suppression channel (see §9.1, *Audit-Gated Diagnostics*). See §3b.5 for the type rules.
+**Escape hatch:** `Raw(expr)` constructs a value of the marker type `Raw[T]`, which bypasses parameterization for a single hole of a template literal. Folding a `Raw[T]` into a template raises `RawBypassesParam`, an audit-gated warning: `@trusted(audit: K)` is its only suppression channel (see §9.1, *Audit-Gated Diagnostics*). See §3b.5 for the type rules.
 
 ```blink
 // Auditable escape hatch for dynamic SQL:
-db.query_one("SELECT * FROM {Raw(table)} WHERE id = {id}")
+db.query_one(t"SELECT * FROM {Raw(table)} WHERE id = {id}")
 // WARNING: Raw() bypasses parameterization for {Raw(table)}
 // Note: {id} is still safely parameterized
 ```
 
-**Extensibility:** The phantom type `C` in `Template[C]` enables the same mechanism for shell commands (`Template[Shell]`), HTML templates (`Template[HTML]`), and other injection contexts. See section 3.12 for the full type specification.
+**Extensibility:** The phantom type `C` in `Template[C]` enables the same mechanism for shell commands (`Template[Shell]`), HTML templates (`Template[HTML]`), and other injection contexts. See §3b.5 for the full type specification.
 
 See [DECISIONS.md](../DECISIONS.md) for the full deliberation record.
 
