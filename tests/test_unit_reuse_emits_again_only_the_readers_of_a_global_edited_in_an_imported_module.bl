@@ -1,0 +1,172 @@
+// A unit prints a global of another module only by its C name, and only the unit of the module
+// that defines it lowers its initializer. A run-time initializer is called from the entry
+// unit, in module order. So after an edit to a global or a const in a module other than the
+// entry, a per-module build emits again the defining module's unit, the units whose sources
+// name it, and the entry unit when the set or order of init calls changes, and takes every
+// other unit from the last build. The edits: a global made run-time and constant again, a
+// constant global added, changed and removed, a run-time global added, a const added, and an
+// import that moves a module's init ahead of another's, whose initializer reads the first's
+// global; that edit takes no unit, since a new import changes how the build resolves
+// imports. Each build runs with BLINK_EMIT_REUSE_VERIFY=1, so every unit it writes or takes is
+// byte-equal to a cold emit, and after each edit the units and the output equal those of a
+// build with no last build.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"global_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub let LIMIT: Int = 5"#,
+        #""#,
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{LIMIT, tag}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    tag("mid {LIMIT}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn other() -> Str {"#,
+        #"    tag("other")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub let WORDS: List[Str] = "a b".split(" ")"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf {WORDS.len()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import other.{other}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {other()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            // Sorted, so the build's unit order does not reach the assertion.
+            let name = line.byte_slice(29, line.byte_len())
+            out.push(name)
+            let mut at = out.len() - 1
+            while at > 0 && out.get(at - 1).unwrap() > name {
+                out.set(at, out.get(at - 1).unwrap())
+                at = at - 1
+            }
+            out.set(at, name)
+        }
+    }
+    out
+}
+
+// One edit's result: the units the build took, the C files and headers that differ from a
+// build with none to take, and whether the two binaries print the same.
+fn warm_and_cold(tree: Str, what: Str) -> Str {
+    let warm = build_into(tree, "out")
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, "cold")
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    let warm_out = sh("{tree}/out/app")
+    let same_out = warm_out == sh("{tree}/cold/app")
+    "{what}: took {reused_units(warm).join(",")}; differ [{differ.split("\n").join(" ")}]; prints {warm_out}, same as cold {same_out}"
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+test "an edit to a global of an imported module emits again only the units that print it" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_global_unit_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "out")
+    let mut seen: List[Str] = []
+    edit(tree, "base.bl", "s/LIMIT: Int = 5/LIMIT: Int = [5, 6].len() + 3/")
+    seen.push(warm_and_cold(tree, "global made run-time"))
+    edit(tree, "base.bl", "s/LIMIT: Int = \\[5, 6\\].len() + 3/LIMIT: Int = 5/")
+    seen.push(warm_and_cold(tree, "global made constant again"))
+    append(tree, "other.bl", "\npub let OTHER_K: Int = 4\n")
+    seen.push(warm_and_cold(tree, "constant global added"))
+    append(tree, "other.bl", "\npub let OTHER_W: List[Str] = \"x y z\".split(\" \")\n")
+    seen.push(warm_and_cold(tree, "run-time global added"))
+    append(tree, "leaf.bl", "\nconst LEAF_K: Int = 2\n")
+    seen.push(warm_and_cold(tree, "const added"))
+    edit(tree, "other.bl", "s/OTHER_K: Int = 4/OTHER_K: Int = 9/")
+    seen.push(warm_and_cold(tree, "constant global changed"))
+    // other now imports leaf, so leaf's init runs ahead of other's, which reads WORDS. Init
+    // order is module order, which only an import changes, and a new import changes how the
+    // build resolves imports, after which it takes no unit.
+    edit(tree, "other.bl", #"1i\import leaf.{WORDS}"#)
+    edit(tree, "other.bl", #"s/"x y z".split(" ")/"{WORDS.len()} z".split(" ")/; s/tag("other")/tag("other {OTHER_W.get(0).unwrap()}")/"#)
+    seen.push(warm_and_cold(tree, "init order changed"))
+    edit(tree, "other.bl", "/OTHER_K/d")
+    seen.push(warm_and_cold(tree, "constant global removed"))
+    shell_exec("rm -rf {tree}")
+    assert_eq(seen.join("\n"), [
+        "global made run-time: took leaf,other; differ []; prints [main] [mid 5] [other] [leaf 2], same as cold true",
+        "global made constant again: took leaf,other; differ []; prints [main] [mid 5] [other] [leaf 2], same as cold true",
+        "constant global added: took __main__,base,leaf,mid; differ []; prints [main] [mid 5] [other] [leaf 2], same as cold true",
+        "run-time global added: took base,leaf,mid; differ []; prints [main] [mid 5] [other] [leaf 2], same as cold true",
+        "const added: took __main__,base,mid,other; differ []; prints [main] [mid 5] [other] [leaf 2], same as cold true",
+        "constant global changed: took __main__,base,leaf,mid; differ []; prints [main] [mid 5] [other] [leaf 2], same as cold true",
+        "init order changed: took ; differ []; prints [main] [mid 5] [other 2] [leaf 2], same as cold true",
+        "constant global removed: took __main__,base,leaf,mid; differ []; prints [main] [mid 5] [other 2] [leaf 2], same as cold true",
+    ].join("\n"))
+}
