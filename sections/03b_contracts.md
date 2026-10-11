@@ -904,9 +904,9 @@ fn log_table(table: Str) ! IO {
 The phantom type `C` in `Template[C]` enables the same mechanism for other injection contexts:
 
 ```blink
-// Shell injection protection
-fn run(cmd: Template[Shell]) -> Result[Output, ShellError]
-process.run("ls -la {path}")  // path is decomposed, handler quotes/escapes
+// Shell injection protection (future)
+fn shell(cmd: Template[Shell]) -> Result[Output, ShellError]
+process.shell("ls -la {path}")  // path is decomposed, handler quotes/escapes
 
 // HTML/XSS protection (future)
 fn render(template: Template[HTML]) -> SafeHtml
