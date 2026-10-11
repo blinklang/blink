@@ -2240,6 +2240,161 @@ units rises from 14.1 s to 14.8-15.0 s, so each compile runs a little
 slower. No order of the units can end the build before its longest
 unit ends.
 
+### Runtime bodies out of each debug unit
+
+At `-O0` gcc emits each plain `static` function that a unit sees, used
+or not. `runtime.h` defined the assert and test-runner functions of
+`runtime_test.h` and the helpers of `runtime_process.h` as
+`BLINK_UNUSED static`, so each unit of a `--debug` build, and of each
+`blink test` build, compiled its own copy. A replay of the cc commands
+of a cold `--debug` build, with and without those bodies, one compile at
+a time: on cli the 69 units took 7.68 s of compile time, and 6.16 s
+without them, 20-30 ms and about 45 KB of object less per unit; on small
+the 6 units took 0.31 s, and 0.17 s without them.
+
+Now the twelve entry points of `runtime_test.h` are `BLINK_RT_FN`, with
+a prototype before the `BLINK_RUNTIME_DECLS_ONLY` guard, and every body
+of `runtime_test.h` and each static helper of `runtime_process.h` is
+inside the guard. `BLINK_RT_FN` is empty when the unit reads the runtime
+storage as extern, else `BLINK_UNUSED static`. So a unit compiles only
+the declarations, and the unit that defines the runtime storage holds
+the bodies: `monolith.o` of the archive, or `__main__` when the build
+links no archive. A build that does not split into units sees the
+bodies as before.
+
+Two changes a user can see:
+
+- A user C function, in an `@ffi` header or a vendored source, with the
+  name of one of these twelve functions was an error at compile time.
+  Now it is an error at link time, as it was already for the other
+  `BLINK_RT_FN` names, such as `blink_alloc_atomic`.
+- The archive is always built at `-O2`, also for `--debug`. A debugger
+  now steps into the assert and test-runner code of `monolith.o`, which
+  is optimized. Before, each unit held an `-O0` copy. This is a known
+  trade.
+
+#### The archive and its runtime.h
+
+A dev `build/` must link an archive built against the same `runtime.h`,
+because a unit now calls the runtime functions that the archive
+defines. The archive stamp already held the sha of `runtime.h`, but
+`ensure_dev_archive` did not read it, so after a runtime header edit
+the build linked the old archive and failed on an undefined symbol.
+Now, when the stamp names this compiler, the archive is current only
+when its `runtime.h` is the one the build reads:
+
+- When `libblink_std.a` resolves into a `std-cache/<key>/` dir that
+  holds a copy of `runtime.h`, the build compares the bytes of that copy
+  with the live `runtime.h` (0.1 ms).
+- Else it compares the stamp's sha with a sha of the live `runtime.h`.
+  A sha of the 284 KB file costs about 2 ms, which the first form of
+  this change paid on each build, twice through the daemon.
+
+`build_fs.real_path` replaces the realpath call of the daemon, so both
+the daemon and the archive check use it.
+
+#### Bench
+
+Through the daemon, settle 1 s, then without the daemon for the cold
+cases, then with `--debug` and without the daemon; 11 reps, median
+seconds (min-max), and the `cc_s` medians of each run. Base and the
+change ran in turn: base, change, base, change. Base is gen1 of
+`e194f4aa` (sha256 `9295bba6…`), run on tree `e194f4aa`; the change is
+gen1 of `ea6f6079` (sha256 `26eca40a…`), run on tree `ea6f6079`. Each
+tree compiles its own `src/cli.bl`. `bench/edit_loop/unit_rt_statics_*.tsv`
+hold the full rows. Every C hash check reads 11/11.
+
+`blink test` always builds at `-O0` and takes no `--debug` flag, so the
+`test-body` rows of the daemon table are debug builds, and the
+`--debug` table has no `test-body` rows.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 | cc_s 1/2/3/4 |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.166 (0.155-0.177) | 0.174 (0.165-0.180) | 0.171 (0.161-0.184) | 0.173 (0.162-0.184) | 0.000/0.000/0.000/0.000 |
+| cli | body-cname | 0.433 (0.421-0.442) | 0.445 (0.432-0.456) | 0.428 (0.419-0.445) | 0.440 (0.429-0.459) | 0.144/0.145/0.143/0.145 |
+| cli | body-typecheck | 0.452 (0.444-0.468) | 0.484 (0.462-0.490) | 0.461 (0.456-0.474) | 0.473 (0.454-0.482) | 0.050/0.050/0.051/0.049 |
+| cli | pubfn-cname | 0.469 (0.458-0.573) | 0.486 (0.464-0.593) | 0.470 (0.450-0.592) | 0.479 (0.473-0.591) | 0.144/0.145/0.143/0.145 |
+| cli | privfn-cname | 0.465 (0.451-0.479) | 0.483 (0.466-0.498) | 0.480 (0.467-0.484) | 0.473 (0.469-0.490) | 0.144/0.145/0.143/0.144 |
+| cli | pubfn-typecheck | 0.481 (0.474-0.492) | 0.496 (0.486-0.509) | 0.486 (0.475-0.504) | 0.493 (0.480-0.503) | 0.035/0.035/0.036/0.036 |
+| cli | privfn-typecheck | 0.488 (0.481-0.496) | 0.492 (0.483-0.498) | 0.492 (0.481-0.500) | 0.497 (0.478-0.508) | 0.036/0.036/0.036/0.036 |
+| cli | testblock-cname | 0.313 (0.297-0.444) | 0.307 (0.292-0.446) | 0.310 (0.302-0.439) | 0.303 (0.285-0.437) | 0.000/0.000/0.000/0.000 |
+| cli | global-cname | 0.470 (0.450-0.478) | 0.479 (0.460-0.492) | 0.474 (0.463-0.481) | 0.468 (0.462-0.482) | 0.144/0.143/0.144/0.144 |
+| cli | run-body-cname | 0.464 (0.452-0.473) | 0.472 (0.457-0.480) | 0.464 (0.449-0.471) | 0.460 (0.444-0.471) | 0.144/0.143/0.143/0.143 |
+| cli | test-body-cname | 0.481 (0.476-0.498) | 0.458 (0.447-0.470) | 0.479 (0.475-0.500) | 0.456 (0.450-0.469) | 0.095/0.075/0.095/0.073 |
+| cli | cold-obj | 1.644 (1.621-1.728) | 1.644 (1.623-1.710) | 1.618 (1.598-1.732) | 1.656 (1.628-1.765) | 1.396/1.392/1.390/1.413 |
+| cli | cold-all | 4.479 (4.455-4.517) | 4.564 (4.553-4.589) | 4.488 (4.450-4.519) | 4.543 (4.532-4.579) | 3.751/3.825/3.760/3.813 |
+| small | nochange | 0.045 (0.041-0.045) | 0.046 (0.042-0.048) | 0.042 (0.041-0.045) | 0.044 (0.042-0.047) | 0.000/0.000/0.000/0.000 |
+| small | body-inventory | 0.075 (0.074-0.089) | 0.078 (0.076-0.088) | 0.075 (0.073-0.090) | 0.078 (0.075-0.093) | 0.026/0.026/0.026/0.026 |
+| small | body-audit | 0.064 (0.063-0.068) | 0.067 (0.064-0.068) | 0.065 (0.062-0.070) | 0.065 (0.063-0.069) | 0.015/0.015/0.015/0.015 |
+| small | pubfn-model | 0.068 (0.066-0.070) | 0.070 (0.067-0.071) | 0.067 (0.066-0.070) | 0.069 (0.067-0.071) | 0.018/0.018/0.017/0.018 |
+| small | privfn-model | 0.068 (0.066-0.071) | 0.069 (0.066-0.070) | 0.068 (0.067-0.072) | 0.069 (0.067-0.071) | 0.018/0.018/0.018/0.018 |
+| small | testblock-model | 0.047 (0.046-0.049) | 0.049 (0.046-0.051) | 0.048 (0.047-0.049) | 0.048 (0.047-0.049) | 0.000/0.000/0.000/0.000 |
+| small | run-body-inventory | 0.077 (0.075-0.079) | 0.079 (0.077-0.080) | 0.077 (0.074-0.078) | 0.079 (0.077-0.080) | 0.026/0.026/0.026/0.026 |
+| small | test-body-inventory | 0.104 (0.099-0.122) | 0.080 (0.078-0.098) | 0.102 (0.100-0.121) | 0.081 (0.078-0.095) | 0.042/0.021/0.042/0.021 |
+| small | cold-obj | 0.089 (0.086-0.093) | 0.090 (0.089-0.092) | 0.090 (0.085-0.093) | 0.091 (0.088-0.093) | 0.060/0.055/0.057/0.056 |
+
+Without the daemon:
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 | cc_s 1/2/3/4 |
+|---|---|---|---|---|---|---|
+| cli | cold-obj | 1.940 (1.923-1.969) | 1.953 (1.925-1.966) | 1.954 (1.917-2.005) | 1.945 (1.921-1.986) | 1.365/1.373/1.382/1.371 |
+| cli | cold-all | 4.337 (4.298-4.377) | 4.417 (4.387-4.447) | 4.367 (4.302-4.411) | 4.418 (4.389-4.459) | 3.678/3.759/3.705/3.764 |
+| small | cold-obj | 0.103 (0.100-0.108) | 0.101 (0.098-0.103) | 0.103 (0.102-0.106) | 0.100 (0.096-0.104) | 0.058/0.055/0.060/0.054 |
+
+With `--debug`, without the daemon:
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 | cc_s 1/2/3/4 |
+|---|---|---|---|---|---|---|
+| cli | nochange | 0.591 (0.577-0.628) | 0.586 (0.574-0.598) | 0.589 (0.583-0.605) | 0.586 (0.576-0.600) | 0.000/0.000/0.000/0.000 |
+| cli | body-cname | 0.772 (0.766-0.795) | 0.740 (0.723-0.747) | 0.770 (0.755-0.802) | 0.737 (0.726-0.760) | 0.098/0.076/0.097/0.076 |
+| cli | body-typecheck | 0.810 (0.791-0.831) | 0.779 (0.766-0.798) | 0.825 (0.808-0.855) | 0.784 (0.767-0.800) | 0.058/0.037/0.058/0.037 |
+| cli | pubfn-cname | 0.776 (0.771-0.855) | 0.751 (0.730-0.826) | 0.783 (0.765-0.858) | 0.750 (0.734-0.838) | 0.098/0.076/0.098/0.076 |
+| cli | privfn-cname | 0.777 (0.773-0.794) | 0.756 (0.737-0.770) | 0.774 (0.763-0.798) | 0.748 (0.725-0.756) | 0.099/0.076/0.097/0.077 |
+| cli | pubfn-typecheck | 0.831 (0.817-0.849) | 0.795 (0.779-0.811) | 0.833 (0.810-0.849) | 0.803 (0.781-0.812) | 0.050/0.029/0.050/0.029 |
+| cli | privfn-typecheck | 0.829 (0.816-0.845) | 0.792 (0.782-0.805) | 0.827 (0.813-0.844) | 0.797 (0.779-0.823) | 0.051/0.028/0.051/0.028 |
+| cli | testblock-cname | 0.663 (0.653-0.755) | 0.655 (0.644-0.748) | 0.667 (0.653-0.775) | 0.652 (0.642-0.752) | 0.000/0.000/0.000/0.000 |
+| cli | global-cname | 0.770 (0.761-0.782) | 0.749 (0.731-0.772) | 0.773 (0.765-0.791) | 0.741 (0.721-0.767) | 0.097/0.075/0.098/0.076 |
+| cli | run-body-cname | 0.780 (0.766-0.816) | 0.747 (0.733-0.767) | 0.768 (0.742-0.782) | 0.739 (0.724-0.757) | 0.097/0.076/0.098/0.076 |
+| cli | cold-obj | 1.526 (1.509-1.583) | 1.343 (1.319-1.412) | 1.526 (1.510-1.570) | 1.342 (1.328-1.413) | 0.905/0.727/0.910/0.730 |
+| cli | cold-all | 3.936 (3.901-3.957) | 3.814 (3.790-3.837) | 3.930 (3.900-3.966) | 3.813 (3.779-3.837) | 3.229/3.124/3.228/3.130 |
+| small | nochange | 0.057 (0.054-0.059) | 0.055 (0.053-0.058) | 0.058 (0.056-0.060) | 0.054 (0.053-0.057) | 0.000/0.000/0.000/0.000 |
+| small | body-inventory | 0.105 (0.101-0.118) | 0.088 (0.080-0.102) | 0.106 (0.102-0.117) | 0.081 (0.079-0.100) | 0.042/0.021/0.043/0.020 |
+| small | body-audit | 0.100 (0.097-0.103) | 0.077 (0.076-0.080) | 0.100 (0.096-0.103) | 0.078 (0.074-0.079) | 0.038/0.016/0.039/0.017 |
+| small | pubfn-model | 0.105 (0.099-0.107) | 0.078 (0.077-0.079) | 0.105 (0.101-0.110) | 0.079 (0.078-0.084) | 0.040/0.018/0.040/0.018 |
+| small | privfn-model | 0.102 (0.099-0.108) | 0.079 (0.077-0.081) | 0.102 (0.100-0.104) | 0.080 (0.077-0.086) | 0.039/0.017/0.040/0.018 |
+| small | testblock-model | 0.059 (0.057-0.061) | 0.058 (0.057-0.060) | 0.058 (0.056-0.062) | 0.058 (0.054-0.064) | 0.000/0.000/0.000/0.000 |
+| small | run-body-inventory | 0.106 (0.104-0.108) | 0.083 (0.081-0.089) | 0.106 (0.103-0.108) | 0.083 (0.081-0.085) | 0.042/0.021/0.043/0.021 |
+| small | cold-obj | 0.125 (0.122-0.128) | 0.101 (0.096-0.117) | 0.125 (0.123-0.131) | 0.102 (0.098-0.105) | 0.067/0.060/0.066/0.061 |
+
+Each debug edit row that compiles a unit drops by 21-22 ms of cc time,
+which is the share the replay measured; cli `--debug` edit rows drop by
+21-41 ms, small ones by 17-27 ms. The `--debug` cli cold-obj drops by
+0.18 s, as its cc time does, and small cold-obj by 24 ms. Each
+`test-body` row through the daemon drops by 21-24 ms. Rows that compile
+no unit do not move.
+
+Two sets of rows are slower beyond their spread:
+
+- cli cold-all, 50-85 ms, with and without the daemon. Each cold-all
+  builds the archive. `monolith.o` now holds the twelve bodies as
+  extern functions, where before they were unused statics that gcc
+  dropped. The same `monolith.c` at `-O2`, 7 compiles with each header
+  in turn: 2.31-2.34 s with the base `runtime.h`, 2.38-2.40 s with the
+  new one, and 27 KB more object. A dev or installed archive is built
+  once per compiler and runtime, so an edit loop does not pay this.
+- cli edit rows through the daemon, 5-32 ms. Two more runs swap binary
+  and tree. The base binary on tree `ea6f6079` gave body-cname 0.445
+  (0.416-0.451) and body-typecheck 0.474 (0.464-0.488); the change
+  binary on tree `e194f4aa` gave 0.439 (0.429-0.448) and 0.470
+  (0.461-0.481). Each lands between base and change, so the swap does
+  not show whether the binary or the larger tree costs the time, and
+  the other cli edit rows of the two runs move up to 18 ms either way.
+  The small rows, whose tree is the same, do not move beyond their
+  spread. Cold-all follows the tree: 4.560
+  (4.546-4.583) for the base binary on the new tree, 4.473
+  (4.451-4.504) for the change binary on the base tree.
+  `bench/edit_loop/unit_rt_statics_cross_*.tsv` hold these two runs.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
