@@ -148,9 +148,11 @@ asks for the one-unit build.
   hashes run in batches that fit one exec argument (Linux caps one at
   128 KiB). With the full header list in each unit's manifest, the 48
   units of `src/cli.bl` passed that cap, and every unit missed. A miss
-  compiles to a temp object, and one exec per batch moves each new object
-  into the cache. The build links the cached object for each move that
-  worked, and the temp object for each move that failed.
+  compiles to an object in the build's own dir, the build links that
+  object, and the cache gets a hard link (or a copy) of it. A hit is
+  hard-linked into the build's hold dir, and the build links that name.
+  So the GC of another build cannot remove an object this build is about
+  to link (section 5 of `per-module-o-cache.md`).
 - **Emit reuse.** The front end always runs, so each build loads its files
   and reports their errors. Then the build writes its emit inputs as one
   text: the compiler sha, `argv[0]`, the cwd, the entry path, the codegen
@@ -1878,10 +1880,13 @@ PCH is byte-equal to the one built without it, at `-O1` and with
 
 The build now keeps a PCH of the archive header in the obj cache:
 `<key>.pch/` holds copies of `libblink_std.h` and `runtime.h` and the
-`libblink_std.h.gch` built from them. A unit that it serves compiles
-with `-I<key>.pch` before `-I<arc_dir>`, so gcc finds the `.gch` beside
-the copy, and with `-ffile-prefix-map=<key>.pch=<arc_dir>`, so the debug
-info names the archive dir as a compile without the PCH does.
+`libblink_std.h.gch` built from them. The build holds links (or copies)
+of the three files in `<hold>/pch/`, in its hold dir under the cache's
+`tmp/`: the GC of another build can remove `<key>.pch/` while the units
+compile. A unit that it serves compiles with `-I<hold>/pch` before
+`-I<arc_dir>`, so gcc finds the `.gch` beside the copy, and with
+`-ffile-prefix-map=<hold>/pch=<arc_dir>`, so the debug info names the
+archive dir as a compile without the PCH does.
 
 - gcc takes a `.gch` only when the unit defines, before the include, the
   macros the PCH was built with. The prologue of a unit is a `#define`
@@ -1898,8 +1903,9 @@ info names the archive dir as a compile without the PCH does.
   header in each include dir (`build_objcache.pch_key`). The build hashes
   those headers once, for the obj keys and the PCH key both.
 - On a miss the build stages the copies in a private dir, builds the
-  `.gch` there in a slot of its own while the units compile, and renames
-  the dir into place. A unit that starts after it is in place reads it.
+  `.gch` there in a slot of its own while the units compile, holds its
+  files, and renames the dir into place. A unit that starts after that
+  reads the held files.
   When every unit starts before it ends, no unit of this build reads it,
   so the build waits for it after the link.
 - gcc reads the header beside a `.gch` it cannot take, so a stale or
