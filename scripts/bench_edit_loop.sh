@@ -41,6 +41,10 @@
 #   body-<module>        (a) private-body edit: one line added to a private fn
 #   pubfn-<module>       (b) a new pub fn added at the end of a module
 #   privfn-<module>      a new private fn added at the end of a module
+#   testblock-<module>   a test block added at the end of a module that is not the entry. No
+#                        unit prints it, so the C is the warm C
+#   global-<module>      a new value for the Int literal that initializes a global of a module
+#                        that is not the entry (cli only: no such module of small has one)
 #   run-body-<module>    `blink run` after the (a) edit
 #   test-body-<module>   `blink test <one test file>` after the (a) edit (debug build)
 #   cold-obj             (d) obj cache cleared; std archive kept
@@ -138,6 +142,8 @@ export PATH="$work/.bench/bin:$PATH"
 tgt_dir_cli=.;                 tgt_src_cli=src/cli.bl;  tgt_test_cli=tests/test_cname_mono_types.bl
 tgt_body_cli="src/cname.bl:strip_blink src/typecheck.bl:tc_variant_enum_decl_node"
 tgt_pub_cli="src/cname.bl src/typecheck.bl"
+tgt_testblock_cli=src/cname.bl
+tgt_global_cli=src/cname.bl:c_mint_seq
 tgt_coldall_cli=1
 # The compiler tests compile probes in process, and the probe finds lib/std through
 # BLINK_ROOT, as under task ci. It names the same root blink finds from its own path.
@@ -145,6 +151,7 @@ tgt_env_cli=BLINK_ROOT=$work
 tgt_dir_small=bench/edit_loop; tgt_src_small=src/main.bl; tgt_test_small=src/inventory_test.bl
 tgt_body_small="src/inventory.bl:restock_amount"
 tgt_pub_small=src/model.bl
+tgt_testblock_small=src/model.bl
 
 tv() { local v="tgt_$1_$2"; echo "${!v-}"; }
 modname() { basename "$1" .bl; }
@@ -222,6 +229,13 @@ edit_body() {
 }
 edit_pub() { printf '\npub fn bench_added_%s() -> Int { 1 }\n' "$2" >> "$1"; }
 edit_priv() { printf '\nfn bench_added_%s() -> Int { 1 }\n' "$2" >> "$1"; }
+edit_test() { printf '\ntest "bench added %s" {\n    assert_eq(1, 1)\n}\n' "$2" >> "$1"; }
+# The new value comes from the nonce, so each run's C differs from every other run's.
+edit_global() {
+    local f=$1 name=$2 n
+    n=1$(printf '%s' "$3" | tr -cd 0-9 | tail -c 9)
+    sed -i "s/^\(\(pub \)\?let \(mut \)\?$name: Int = \)[0-9]*$/\1$n/" "$f"
+}
 
 # rep <target> <case> <rep> <c file> <kind> [file fn]: one timed run, appended to $raw.
 rep() {
@@ -233,6 +247,8 @@ rep() {
         body|run|test) edit_body "$dir/$efile" "$efn" "$nonce" ;;
         pub) edit_pub "$dir/$efile" "$nonce" ;;
         priv) edit_priv "$dir/$efile" "$nonce" ;;
+        testblock) edit_test "$dir/$efile" "$nonce" ;;
+        global) edit_global "$dir/$efile" "$efn" "$nonce" ;;
         cold-obj) rm -rf "$dir/build/obj-cache" ;;
         cold-all)
             rm -rf "$dir/build/obj-cache"
@@ -288,13 +304,17 @@ c_sha() {
 # warm <target>: build, run and test once so every later case starts warm; sets base shas.
 warm() {
     local target=$1 dir=$work/$(tv dir "$1") f
-    for f in $(tv body "$target") $(tv pub "$target"); do
+    for f in $(tv body "$target") $(tv pub "$target") $(tv testblock "$target") $(tv global "$target"); do
         f=${f%%:*}
         [ -f "$dir/$f" ] || die "$target: no file $f"
         cp "$dir/$f" "$work/.bench/orig/$target-$(stem "$f").bl"
     done
     for f in $(tv body "$target"); do
         [ "$(grep -c "^fn ${f#*:}(" "$dir/${f%%:*}")" = 1 ] || die "$target: need one private fn ${f#*:} in ${f%%:*}"
+    done
+    for f in $(tv global "$target"); do
+        [ "$(grep -c "^\(pub \)\?let \(mut \)\?${f#*:}: Int = [0-9]*$" "$dir/${f%%:*}")" = 1 ] \
+            || die "$target: need one global ${f#*:} with an Int literal in ${f%%:*}"
     done
     run_blink "$target" "$work/.bench/logs/$target-warm-build.log" build "$(tv src "$target")" ${BENCH_FLAGS:-}
     [ "$rc" = 0 ] || die "$target warm build exited $rc"
@@ -370,6 +390,13 @@ for target in ${BENCH_TARGETS:-cli small}; do
     for pf in $(tv pub "$target"); do
         run_case "$target" "pubfn-$(modname "$pf")" pub "$bc" changed "$base_build" "$pf"
         run_case "$target" "privfn-$(modname "$pf")" priv "$bc" changed "$base_build" "$pf"
+    done
+    for tf in $(tv testblock "$target"); do
+        run_case "$target" "testblock-$(modname "$tf")" testblock "$bc" same "$base_build" "$tf"
+    done
+    for spec in $(tv global "$target"); do
+        f=${spec%%:*} fn=${spec#*:}
+        run_case "$target" "global-$(modname "$f")" global "$bc" changed "$base_build" "$f" "$fn"
     done
     first=$(tv body "$target" | cut -d' ' -f1)
     f=${first%%:*} fn=${first#*:}
