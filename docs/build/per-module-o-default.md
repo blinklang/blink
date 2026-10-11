@@ -1996,7 +1996,8 @@ failure, and each build printed the right output.
 A first cut tried a hard link for each unit and then a `cp` when the link
 failed. A miss has no object to link, so each missed unit ran a `cp` that
 failed: 69 processes and 0.85 s more on a cold build of cli. The hold now
-copies only an object that is there.
+copies with `read(2)` and `write(2)` in its own process, and a miss ends
+at the failed `open(2)` of the object it does not have.
 
 #### Bench
 

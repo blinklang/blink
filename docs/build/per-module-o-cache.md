@@ -142,8 +142,10 @@ LRU-by-mtime is good enough — no need to track real access counts.
   - A hit is hard-linked into a private dir, `tmp/hold.<rand>/` (the
     one-unit path uses its `tmp/unit.<rand>/`), and the build links that
     name. A GC that removes the entry removes only the cache name. Where
-    the filesystem makes no hard link, the build copies the object; when
-    the object is gone before the link or copy, the unit is a miss. The
+    the filesystem makes no hard link, the build copies the object with
+    `read(2)` and `write(2)` in its own process, as a `cp` per object
+    costs more than the compile of a small unit. When the object is gone
+    before the link or copy, or the copy fails, the unit is a miss. The
     `.meta` is touched after the hold.
   - A miss links the object the build compiled. The cache gets a hard
     link (or a copy) of it, under a staged name in `tmp/` and then
@@ -155,12 +157,18 @@ LRU-by-mtime is good enough — no need to track real access counts.
     count them. While a build runs, a held object counts twice toward the
     cap, once by each name: the cap only starts an eviction, so this can
     make one evict a little early.
+  - A build also removes its hold dir when a unit fails to compile and
+    when its link fails. A daemon build runs the same path in its child.
   - A build that is killed leaves its `tmp/` dir. Nothing reaps one yet.
   - Dev knob: `BLINK_DEV_OBJCACHE_EVICT=compile` empties the cache, as
     `blink cache clean` does, after the build's lookups and before its
     units compile; `=link` does it just before the link. It stands in for
     the GC of another build at that point, so a test makes the race on
     every run.
+  - Dev knob: `BLINK_DEV_OBJCACHE_HOLD=copy` makes each hard link of a
+    hold fail, as on a filesystem with no hard links, so the build takes
+    the copy; `=none` makes each copy fail too, so each hit turns into a
+    miss. A test runs each path on every run.
 
 ### 6. Bootstrap protocol impact
 
