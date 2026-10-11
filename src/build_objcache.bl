@@ -123,8 +123,9 @@ pub fn compute_obj_key(
 }
 
 // "<path>=<sha256>" for each header in dirs. None when one cannot be hashed, so a header
-// the unit may read never drops out of the key.
-fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
+// the unit may read never drops out of the key. A build hashes them once for every key it
+// makes: a vendored header can be large (sqlite3.h is 680 KB).
+pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
     let mut lines: List[Str] = []
     let mut paths: List[Str] = []
     for d in dirs {
@@ -344,6 +345,24 @@ pub fn unit_keys_from(
     flags: List[Str],
     target: Str,
 ) -> Map[Str, Str] ! IO {
+    match header_lines_in(vendored_include_dirs) {
+        Some(lines) => unit_keys_with_headers(shas, modules, unit_headers, arc_dir, lines, blinkc_sha, cc_id, flags, target)
+        None => Map()
+    }
+}
+
+// unit_keys_from over the lines header_lines_in answered for the vendored include dirs.
+pub fn unit_keys_with_headers(
+    shas: Map[Str, Str],
+    modules: List[Str],
+    unit_headers: Map[Str, List[Str]],
+    arc_dir: Str,
+    vendored_headers: List[Str],
+    blinkc_sha: Str,
+    cc_id: Str,
+    flags: List[Str],
+    target: Str,
+) -> Map[Str, Str] ! IO {
     let mut keys: Map[Str, Str] = Map()
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
         return keys
@@ -364,15 +383,8 @@ pub fn unit_keys_from(
         }
         headers.push("libblink_std.h.gch={pch_sha}")
     }
-    match header_lines_in(vendored_include_dirs) {
-        Some(lines) => {
-            for line in lines {
-                headers.push(line)
-            }
-        }
-        None => {
-            return keys
-        }
+    for line in vendored_headers {
+        headers.push(line)
     }
     // The inputs every unit shares go into one digest that each unit's manifest names. Put
     // in full in every manifest, the header list grows with units times headers.
@@ -555,10 +567,11 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
 // PCH of it here: <key>.pch/ holds copies of libblink_std.h and runtime.h and the .gch built
 // from them, and <key>.meta its mtime for the LRU. The key covers what gcc needs to take the
 // .gch: the header bytes, the compiler, every flag, the macros a unit defines before the
-// header, each include dir and the headers in it, and the archive dir the debug info names in
-// place of the PCH dir. gcc checks the rest itself and reads the header copy
-// beside a .gch it rejects, so a unit's object, and its key, do not depend on the PCH.
-pub fn pch_key(archive_sha: Str, runtime_sha: Str, cc_id: Str, arc_dir: Str, flags: List[Str], defines: List[Str], include_flags: List[Str]) -> Str ! IO {
+// header, each include dir and the headers in it (vendored_headers, as header_lines_in
+// answers them for those dirs), and the archive dir the debug info names in place of the PCH
+// dir. gcc checks the rest itself and reads the header copy beside a .gch it rejects, so a
+// unit's object, and its key, do not depend on the PCH.
+pub fn pch_key(archive_sha: Str, runtime_sha: Str, cc_id: Str, arc_dir: Str, flags: List[Str], defines: List[Str], include_flags: List[Str], vendored_headers: List[Str]) -> Str {
     if archive_sha == "" || runtime_sha == "" || cc_id == "" {
         return ""
     }
@@ -569,17 +582,12 @@ pub fn pch_key(archive_sha: Str, runtime_sha: Str, cc_id: Str, arc_dir: Str, fla
     for d in defines {
         lines.push("define:{d}")
     }
-    // A vendored header the archive header pulls in under a gate is part of the PCH.
-    let mut dirs: List[Str] = []
     for f in include_flags {
         lines.push("include:{f}")
-        if f.starts_with("-I") { dirs.push(f.byte_slice(2, f.byte_len())) }
     }
-    match header_lines_in(dirs) {
-        Some(headers) => {
-            for h in sorted_strs(headers) { lines.push("import:{h}") }
-        }
-        None => return ""
+    // A vendored header the archive header pulls in under a gate is part of the PCH.
+    for h in sorted_strs(vendored_headers) {
+        lines.push("import:{h}")
     }
     digest_of_lines(lines)
 }
