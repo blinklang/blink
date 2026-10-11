@@ -1650,6 +1650,58 @@ effect changes the types header; an impl changes the module header; an
 alias or a trait changes no header, but no rule yet shows which units
 it reaches.
 
+#### Bench
+
+Through the daemon, settle 1 s, 11 reps, median seconds (min-max). Base
+and the change ran in turn: base, change, base, change. Base is gen1 of
+`3f228972` (sha256 `ee3770a4…`), the change is gen1 of `dfddc799`
+(sha256 `f9944d7d…`), each built by `task gen1` with the same `-flto`.
+`bench/edit_loop/global_test_items_daemon_settle1_*.tsv` hold the full
+rows. Every C hash check reads 11/11.
+
+`testblock-<module>` adds a test block to the end of the module, so its C
+is the warm C. `global-cname` gives `c_mint_seq` a new Int literal on each
+run.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.145 (0.138-0.150) | 0.143 (0.138-0.147) | 0.141 (0.135-0.150) | 0.137 (0.134-0.150) |
+| cli | body-cname | 0.415 (0.392-0.420) | 0.411 (0.398-0.419) | 0.414 (0.391-0.427) | 0.412 (0.392-0.423) |
+| cli | body-typecheck | 0.447 (0.436-0.463) | 0.445 (0.426-0.449) | 0.445 (0.430-0.461) | 0.445 (0.431-0.461) |
+| cli | pubfn-cname | 0.441 (0.438-0.557) | 0.441 (0.433-0.542) | 0.439 (0.432-0.572) | 0.442 (0.430-0.550) |
+| cli | privfn-cname | 0.446 (0.432-0.458) | 0.442 (0.436-0.450) | 0.450 (0.443-0.460) | 0.443 (0.427-0.459) |
+| cli | pubfn-typecheck | 0.464 (0.453-0.471) | 0.467 (0.457-0.483) | 0.469 (0.462-0.476) | 0.464 (0.450-0.485) |
+| cli | privfn-typecheck | 0.466 (0.457-0.475) | 0.468 (0.462-0.480) | 0.471 (0.460-0.475) | 0.468 (0.451-0.477) |
+| cli | testblock-cname | 0.792 (0.774-0.801) | 0.277 (0.266-0.417) | 0.798 (0.788-0.814) | 0.264 (0.254-0.394) |
+| cli | global-cname | 0.952 (0.939-0.962) | 0.436 (0.423-0.455) | 0.973 (0.946-1.001) | 0.436 (0.427-0.442) |
+| cli | run-body-cname | 0.439 (0.427-0.948) | 0.433 (0.426-0.444) | 0.445 (0.434-0.990) | 0.428 (0.419-0.433) |
+| cli | test-body-cname | 0.454 (0.443-0.472) | 0.466 (0.461-0.472) | 0.461 (0.454-0.480) | 0.474 (0.456-0.483) |
+| cli | cold-obj | 2.279 (2.267-2.386) | 2.298 (2.294-2.414) | 2.310 (2.298-2.383) | 2.290 (2.275-2.395) |
+| cli | cold-all | 5.054 (5.029-5.083) | 5.112 (5.091-5.122) | 5.073 (5.058-5.096) | 5.102 (5.069-5.134) |
+| small | nochange | 0.044 (0.043-0.045) | 0.044 (0.042-0.046) | 0.043 (0.041-0.044) | 0.043 (0.042-0.045) |
+| small | body-inventory | 0.087 (0.084-0.089) | 0.087 (0.085-0.088) | 0.086 (0.082-0.087) | 0.086 (0.084-0.087) |
+| small | pubfn-model | 0.078 (0.076-0.082) | 0.079 (0.075-0.081) | 0.078 (0.077-0.080) | 0.078 (0.077-0.081) |
+| small | privfn-model | 0.077 (0.076-0.080) | 0.079 (0.075-0.081) | 0.079 (0.076-0.080) | 0.078 (0.076-0.081) |
+| small | testblock-model | 0.048 (0.047-0.050) | 0.046 (0.044-0.048) | 0.048 (0.046-0.049) | 0.047 (0.045-0.050) |
+| small | run-body-inventory | 0.085 (0.084-0.091) | 0.086 (0.084-0.089) | 0.088 (0.085-0.090) | 0.087 (0.085-0.089) |
+| small | test-body-inventory | 0.113 (0.111-0.116) | 0.114 (0.110-0.117) | 0.113 (0.110-0.118) | 0.113 (0.110-0.120) |
+| small | cold-obj | 0.083 (0.079-0.087) | 0.083 (0.081-0.088) | 0.083 (0.081-0.088) | 0.082 (0.080-0.087) |
+
+On cli a test block now costs less than a body edit, since no unit
+changes: 0.79-0.80 s drops to 0.26-0.28 s. A new global value costs
+what a body edit costs: 0.95-0.97 s drops to 0.44 s. On small the test
+block row does not change outside its spread: 0.046-0.048 s, near the
+0.043-0.044 s of a build with no edit.
+
+In these four runs `cold-all` on cli reads 30-58 ms slower with the
+change, outside the spread in run 2, and `test-body-cname` 5-20 ms
+slower. The two rows ran again in turn, four runs
+(`bench/edit_loop/global_test_items_recheck_daemon_settle1_*.tsv`):
+`cold-all` reads 4.990 and 5.004 s for base, 5.014 and 4.995 s for the
+change; `test-body-cname` 0.450 and 0.448 s for base, 0.452 and 0.452 s
+for the change. Each pair is inside the other's spread, so neither row
+is slower.
+
 ## Blockers before the default flipped
 
 None from the edit-loop bench: `nochange` on cli is faster than the
