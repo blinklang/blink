@@ -68,7 +68,14 @@ and 20 corpus files.
 | Commit | Runs | Median |
 |---|---|---|
 | 20d86b8d (base) | 122.59, 122.77, 122.94 | 122.77 |
-| after the cuts | 113.86, 114.03, 114.33, 114.57 | 114.18 |
+| 5a50a05b (cuts 1 to 3) | 113.86, 114.03, 114.33, 114.57 | 114.18 |
+| 20d86b8d (base), second set | 124.07, 123.68, 123.39 | 123.68 |
+| 0a79aca8 (cuts and the fail-fast trap) | 117.78, 117.56, 117.44 | 117.56 |
+
+The second set ran at start loads 2.3 to 3.0. At 0a79aca8 the branch holds 8 commits, and
+scripts/ratchet.sh computes its rows once for each commit in main..HEAD, so the gate
+self-tests end about 3 s later than at 5a50a05b (16.8 s against 13.7 s). On main that cost
+is gone.
 
 ## What grew since the 117.6 s baseline
 
