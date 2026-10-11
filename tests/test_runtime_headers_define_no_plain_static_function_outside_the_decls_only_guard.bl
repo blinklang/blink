@@ -1,0 +1,96 @@
+// A unit includes the runtime headers with BLINK_RUNTIME_DECLS_ONLY set, and at -O0 gcc emits
+// every plain static function the unit sees, used or not. So a plain static function body
+// belongs inside an `#ifndef BLINK_RUNTIME_DECLS_ONLY` block, where only the unit that
+// defines the runtime storage compiles it; a static inline one gcc drops when unused. The test
+// runtime's entry points, which a unit calls, are declared outside the block and defined
+// inside it with BLINK_RT_FN, so the unit links the one copy.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// The plain static function definitions of a header outside each DECLS_ONLY block, as
+// "<file>:<line>: <text>". A conditional opened inside a block is in it until its #endif.
+fn statics_outside_guard(path: Str) -> List[Str] {
+    let lines = read_file(path).split("\n")
+    let mut stack: List[Bool] = []
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines.get(i).unwrap()
+        let t = line.trim()
+        let guarded = stack.contains(true)
+        if t.starts_with("#if") {
+            stack.push(t == "#ifndef BLINK_RUNTIME_DECLS_ONLY")
+        } else if t.starts_with("#endif") {
+            let _ = stack.pop()
+        } else if !guarded && is_static_fn_def(line) {
+            out.push("{path}:{i + 1}: {t}")
+        }
+        i = i + 1
+    }
+    out
+}
+
+// A line that opens a static, non-inline function body at file scope.
+fn is_static_fn_def(line: Str) -> Bool {
+    let starts = line.starts_with("static ") || line.starts_with("BLINK_UNUSED static ")
+    starts && !line.contains(" inline ") && line.contains("(") && !line.trim().ends_with(";")
+}
+
+// The names test units call, from lib/std/testing.bl and the codegen.
+fn entry_points() -> List[Str] {
+    [
+        "__blink_assert_fail", "blink_set_case_label", "blink_record_case",
+        "__blink_assert_fail_eq", "__blink_assert_fail_intro", "__blink_test_set_propagate",
+        "__blink_test_set_skipped", "__blink_assert_panics_returned",
+        "__blink_assert_panics_mismatch", "__blink_test_is_failed", "__blink_test_is_skipped",
+        "blink_test_run",
+    ]
+}
+
+test "no runtime header defines a plain static function outside the decls-only guard" {
+    let mut found: List[Str] = []
+    for path in sh("ls bootstrap/runtime*.h").split("\n") {
+        for s in statics_outside_guard(path) {
+            found.push(s)
+        }
+    }
+    assert_eq(found.join("\n"), "")
+}
+
+// Whether a line of text starts with BLINK_RT_FN and names fn_name, as a prototype (the line
+// ends with ";") or as a definition.
+fn has_rt_fn_line(text: Str, fn_name: Str, prototype: Bool) -> Bool {
+    let needle = " {fn_name}("
+    for l in text.split("\n") {
+        if l.starts_with("BLINK_RT_FN ") && l.contains(needle) && l.ends_with(";") == prototype {
+            return true
+        }
+    }
+    false
+}
+
+test "each test runtime entry point is declared before the guard and defined in it" {
+    let header = read_file("bootstrap/runtime_test.h")
+    let guard = "#ifndef BLINK_RUNTIME_DECLS_ONLY"
+    assert(header.contains(guard), "no guard in runtime_test.h")
+    let parts = header.split(guard)
+    let decls = parts.get(0).unwrap()
+    let rest = parts.slice(1, parts.len()).join(guard)
+    let mut wrong: List[Str] = []
+    for name in entry_points() {
+        if !has_rt_fn_line(decls, name, true) {
+            wrong.push("{name}: no BLINK_RT_FN prototype before the guard")
+        }
+        if !has_rt_fn_line(rest, name, false) {
+            wrong.push("{name}: no BLINK_RT_FN definition in the guard")
+        }
+        let static_void = "static void {name}("
+        let static_int = "static int64_t {name}("
+        if header.contains(static_void) || header.contains(static_int) {
+            wrong.push("{name}: defined static")
+        }
+    }
+    assert_eq(wrong.join("\n"), "")
+}
