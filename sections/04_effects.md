@@ -8,7 +8,7 @@ Every side effect a function can perform -- printing, reading a database, openin
 
 The consequences are structural:
 
-- A function with no `!` in its signature **cannot** perform side effects. The compiler proves it. (It may still read or write module-level `let mut` bindings, which are tracked separately by mutation analysis — see §4.16.)
+- A function with no `!` in its signature **cannot** perform side effects. The compiler proves it, and no built-in free function is an exception (§4.4 *Every side effect has a row*). (It may still read or write module-level `let mut` bindings, which are tracked separately by mutation analysis — see §4.16.)
 - A function declaring `! DB.Read` can query a database but **cannot** write to it, delete from it, or administer it. The compiler proves it.
 - A package declaring `capabilities(Net.Connect)` in its manifest **cannot** open a listening socket. The compiler proves it.
 - An effect handler can attenuate capabilities -- handing a function a `Net.Connect` that only permits connections to a specific allowlist. The runtime enforces it.
@@ -124,7 +124,7 @@ Effects are declared as hierarchical trees. A parent effect grants all of its ch
 
 ```blink
 effect FS {
-    effect Read       // read file contents, list directories
+    effect Read       // read file contents, list directories, read file metadata
     effect Write      // create files, write contents, rename
     effect Delete     // remove files and directories
     effect Watch      // watch for filesystem changes
@@ -153,7 +153,7 @@ effect Env {
 }
 
 effect Time {
-    effect Read       // get current time
+    effect Read       // read the wall clock and the monotonic clock
     effect Sleep      // sleep / delay execution
 }
 
@@ -177,7 +177,7 @@ effect Process {
 
 | Declaration | What you can use |
 |---|---|
-| `! FS.Read` | `fs.read(...)`, `fs.list_dir(...)` -- read-only FS operations |
+| `! FS.Read` | `fs.read(...)`, `fs.list_dir(...)`, `fs.stat(...)` -- read-only FS operations |
 | `! FS.Read, FS.Write` | Read and write, but not delete or watch |
 | `! FS` | All FS operations: read, write, delete, watch |
 | `! DB.Read` | Read-only database queries: `db.query(...)`, `db.query_one(...)` |
@@ -263,16 +263,16 @@ The wrapper selects the operation; it does not add the newline to `msg`. A handl
 | Effect | Handle | Operations |
 |---|---|---|
 | `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)` |
-| `FS` / `FS.*` | `fs` | `fs.read(...)`, `fs.write(...)`, `fs.delete(...)`, `fs.watch(...)` |
+| `FS` / `FS.*` | `fs` | `fs.read(...)`, `fs.write(...)`, `fs.list_dir(...)`, `fs.stat(...)`, `fs.delete(...)`, `fs.watch(...)` (§4.4.5) |
 | `DB` / `DB.*` | `db` | `db.query(...)`, `db.query_one(...)`, `db.exec(...)`, `db.execute(...)`, `db.prepare(...)`, `db.begin()`, `db.commit()`, `db.rollback()` |
 | `Net` / `Net.*` | `net` | `net.request(...)`, `net.get(...)`, `net.post(...)`, `net.listen(...)`, `net.dns(...)` |
-| `Env` / `Env.*` | `env` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()`, `env.set_var(...)`, `env.remove_var(...)`, `env.exit(...)` |
-| `Time` / `Time.*` | `time` | `time.read() -> Instant`, `time.sleep(Duration)` |
+| `Env` / `Env.*` | `env` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()`, `env.pid()`, `env.set_var(...)`, `env.remove_var(...)`, `env.exit(...)` (§4.4.3) |
+| `Time` / `Time.*` | `time` | `time.read() -> Instant` (wall clock), `time.monotonic() -> Monotonic`, `time.sleep(Duration)` (§3.2.3) |
 | `Rand` | `rand` | `rand.int(Range[Int])`, `rand.float()`, `rand.bytes(Int)` (§4.4.7) |
 | `Crypto` / `Crypto.*` | `crypto` | `crypto.hash(...)`, `crypto.sign(...)`, `crypto.encrypt(...)`, `crypto.decrypt(...)` |
-| `Process` / `Process.*` | `process` | `process.spawn(...)`, `process.signal(...)` |
+| `Process` / `Process.*` | `process` | `process.run(...)`, `process.spawn(...)`, `process.wait(...)`, `process.signal(...)`, `process.exec(...)` (§4.4.8) |
 
-The handle is always the lowercase form of the top-level effect name. Sub-effects do not create separate handles -- they control which *methods* on the handle are available. Declaring `! FS.Read` gives you the `fs` handle, but only `fs.read(...)` and `fs.list_dir(...)` compile. Calling `fs.write(...)` with only `FS.Read` declared is a compile error:
+The handle is always the lowercase form of the top-level effect name. Sub-effects do not create separate handles -- they control which *methods* on the handle are available. Declaring `! FS.Read` gives you the `fs` handle, but only `fs.read(...)`, `fs.list_dir(...)` and `fs.stat(...)` compile. Calling `fs.write(...)` with only `FS.Read` declared is a compile error:
 
 ```blink
 fn read_only() ! FS.Read {
@@ -300,6 +300,52 @@ error[UndeclaredEffect]: insufficient effect capability
 When you read `fs.read(path)`, you know two things immediately: (1) this is a filesystem read, and (2) the enclosing function must declare `! FS.Read`. The handle is a visual anchor that traces directly back to the capability in the signature. An AI reading the function body can verify effect correctness locally -- no import resolution, no global namespace lookup.
 
 Handles also enable the handler mechanism (section 4.7). Because all effect operations route through a handle object, swapping the implementation behind the handle is straightforward. The handle is simultaneously a namespace, a capability proof, and a dispatch point.
+
+**Every side effect has a row.** Three rules make the §4.1 claim ("a function with no `!` cannot perform side effects") true for the whole language, the stdlib included:
+
+1. No compiler-known free function performs a side effect.
+2. Every stdlib function and method declares a row that is a sound upper bound on its observable effects. An empty row means that the function is pure, or that it diverges with result type `Never`.
+3. An operation that consumes a value that a handle op made is a handle op of the same effect. The handler that made the value answers the operation. Under a mock `Process` handler, `process.spawn` returns a mock `Child`, and `process.wait(child)` goes to the same mock, never to the real runtime (§4.4.8).
+
+Rule 2 permits a second tier: a std function or method that has a row but is not a handle op, such as `udp_bind` and `unix_listen` (§4.4.6). Rule 3 permits this only when no handle op made the value that the function consumes. The effect row gates a second-tier function as it gates a handle op, but no handler can intercept it (§4.10).
+
+**Removed free functions.** Earlier versions of Blink had free functions that performed side effects. Rule 1 removes them. A call to one of these names gives the usual undefined-function error (E0504), with a fix that names the replacement and its effect. The compiler keeps the table below for good. It looks in the table only when name lookup fails, so a program that declares its own `fn read_file` still compiles and calls that function.
+
+| Removed name | Replacement | Effect |
+|---|---|---|
+| `read_file(p)` | `fs.read(p)` | `FS.Read` |
+| `write_file(p, s)` | `fs.write(p, s)` | `FS.Write` |
+| `list_dir(p)` | `fs.list_dir(p)` | `FS.Read` |
+| `fs_remove(p)` | `fs.delete(p)` | `FS.Delete` |
+| `file_exists(p)`, `is_dir(p)`, `file_mtime(p)` | `fs.stat(p)` (§4.4.5) | `FS.Read` |
+| `exit(c)` | `env.exit(c)` | `Env.Exit` |
+| `arg_count()`, `get_arg(i)` | `env.args()` | `Env.Read` |
+| `getpid()` | `env.pid()` | `Env.Read` |
+| `time_ms()` | `time.monotonic()` to measure elapsed time; `time.read().to_unix_ms()` for a timestamp (§3.2.3) | `Time.Read` |
+| `shell_exec(cmd)` | `process.run("sh", ["-c", cmd])` | `Process.Spawn` |
+| `process_run(cmd, args)` | `process.run(cmd, args)` | `Process.Spawn` |
+| `process_run_with_stdin(cmd, args, input)` | `process.run(cmd, args, stdin: Some(input))` | `Process.Spawn` |
+| `process_spawn(cmd, args)` | `process.spawn(cmd, args)` | `Process.Spawn` |
+| `process_pid_wait(pid)` | `process.wait(child)` | `Process.Spawn` |
+| `process_pid_kill(pid, sig)`, `process_pid_send_signal(pid, sig)` | `process.signal(child, sig)` | `Process.Signal` |
+| `process_exec(cmd, args)` | `process.exec(cmd, args)` | `Process.Spawn`, `Env.Exit` |
+| `unix_socket_listen(p)`, `unix_socket_accept(l)` | `unix_listen(p)`, `listener.accept()` in `std.net` (§4.4.6) | `Net.Listen` |
+| `unix_socket_connect(p)` | `unix_connect(p)` in `std.net` (§4.4.6) | `Net.Connect` |
+| `socket_read_line(s)`, `socket_write(s, x)`, `unix_socket_close(s)` | `stream.read_line()`, `stream.write(x)`, `stream.close()` on `UnixStream` (§4.4.6) | §4.4.6 |
+
+```
+error[UndefinedFunction]: undefined function `read_file`
+ --> build.bl:4:16
+  |
+4 |     let text = read_file(path)
+  |                ^^^^^^^^^ not found in this scope
+  |
+  = note: `read_file` is not a built-in function; file reads go through the `fs` handle
+  = fix: fs.read(path)
+  = help: `fs.read` needs `FS.Read` in the effect row and returns `Result[Str, FsError]`
+```
+
+In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count` and `get_arg` change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable.
 
 ---
 
@@ -726,7 +772,7 @@ server.get("/static/*", static_files("./public"))
 
 #### 4.4.3 Env Operations
 
-The `Env` effect provides access to the process environment: command-line arguments, environment variables, working directory, and process exit. Operations are split between `Env.Read` (observation), `Env.Write` (mutation) and `Env.Exit` (process termination).
+The `Env` effect provides access to the process environment: command-line arguments, environment variables, working directory, process ID, and process exit. Operations are split between `Env.Read` (observation), `Env.Write` (mutation) and `Env.Exit` (process termination).
 
 ```blink
 effect Env {
@@ -743,6 +789,9 @@ effect Env {
 
         /// Current working directory.
         fn cwd() -> Str
+
+        /// The operating-system process ID of this process.
+        fn pid() -> Int
     }
 
     effect Write {
@@ -765,7 +814,7 @@ effect Env {
 
 | Declaration | Available operations |
 |---|---|
-| `! Env.Read` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()` |
+| `! Env.Read` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()`, `env.pid()` |
 | `! Env.Write` | `env.set_var(...)`, `env.remove_var(...)` |
 | `! Env.Exit` | `env.exit(...)` |
 | `! Env` | All of the above |
@@ -809,6 +858,7 @@ test "CLI exits with 1 on missing args" {
         fn var(name: Str) -> Option[Str] { None }
         fn vars() -> Map[Str, Str] { Map.new() }
         fn cwd() -> Str { "/tmp" }
+        fn pid() -> Int { 4242 }
         fn set_var(name: Str, value: Str) { }
         fn remove_var(name: Str) { }
         fn exit(code: Int) -> Never {
@@ -823,7 +873,7 @@ test "CLI exits with 1 on missing args" {
 }
 ```
 
-The mock lists all seven operations at one level. A handler for an effect with children gives every operation of the tree, whichever child declares it (§4.12 *Leaf effects and effect trees*).
+The mock lists all eight operations at one level. A handler for an effect with children gives every operation of the tree, whichever child declares it (§4.12 *Leaf effects and effect trees*).
 
 **`env.vars()` returns a snapshot:** The returned `Map[Str, Str]` is a copy of the environment at the time of the call. Subsequent `env.set_var()` or `env.remove_var()` calls do not affect previously returned maps. This ensures deterministic behavior in concurrent code.
 
@@ -880,9 +930,10 @@ The `fs` handle is in scope when a function declares `! FS` or one of its sub-ef
 | `fs.read` | `fs.read(path: Str) -> Result[Str, FsError]` | `FS.Read` |
 | `fs.write` | `fs.write(path: Str, content: Str) -> Result[(), FsError]` | `FS.Write` |
 | `fs.list_dir` | `fs.list_dir(path: Str) -> Result[List[Str], FsError]` | `FS.Read` |
+| `fs.stat` | `fs.stat(path: Str) -> Result[FileInfo, FsError]` | `FS.Read` |
 | `fs.delete` | `fs.delete(path: Str) -> Result[(), FsError]` | `FS.Delete` |
 
-Directory listing is a read, so `fs.list_dir` needs only `FS.Read` — there is no `FS.List` sub-effect.
+Directory listing and file metadata are reads, so `fs.list_dir` and `fs.stat` need only `FS.Read` — there is no `FS.List` or `FS.Stat` sub-effect.
 
 ```blink
 fn load(path: Str) -> Result[Config, FsError] ! FS.Read {
@@ -898,6 +949,7 @@ pub type FsOp {
     Read
     Write
     ListDir
+    Stat
     Delete
 }
 
@@ -936,13 +988,56 @@ fn read_cache(cache_path: Str) -> Result[Option[Str], FsError] ! FS.Read {
 }
 ```
 
+**File metadata: `fs.stat`.** `fs.stat` returns the metadata of the file at `path`. It follows symbolic links.
+
+```blink
+@derive(Eq)
+pub type FileKind {
+    File
+    Dir
+    Other
+}
+
+pub type FileInfo {
+    kind: FileKind
+    size: Int        // length in bytes
+    mtime: Instant   // time of the last change to the contents (wall clock, §3.2.3)
+}
+```
+
+**Existence is a `not_found()` match on `fs.stat`.** Blink has no `fs.exists`. To ask whether a path exists, match the result of `fs.stat`:
+
+```blink
+import std.fs.{FsError, FileKind}
+
+fn is_stale(src: Str, out: Str) -> Result[Bool, FsError] ! FS.Read {
+    let src_info = fs.stat(src)?
+    match fs.stat(out) {
+        Ok(out_info) => Ok(out_info.mtime < src_info.mtime)
+        Err(e) => {
+            if e.not_found() {
+                Ok(true)          // no output yet, so it is stale
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn is_dir(path: Str) -> Result[Bool, FsError] ! FS.Read {
+    Ok(fs.stat(path)?.kind == FileKind.Dir)
+}
+```
+
+Do not use `fs.stat(p).is_ok()` as an existence test. It reads every error as "absent", so a path that the program may not read (`EACCES`) looks like a path that does not exist.
+
 **Propagation is exact.** `?` on an `fs` call propagates `FsError` unchanged; it does not convert to the enclosing function's error type. A function that reads a file and returns a different error type must adapt with `.map_err(...)` — there is no implicit `.into()` (see error propagation, §3c).
 
-`FsError` and `FsOp` live in `std.fs` and are named with `import std.fs` — the same way `net.request`'s `NetError` is named with `import std.net`. The `fs` operation handle needs no import (it comes from the `! FS` effect on the signature), but the error *type* a caller matches on does.
+`FsError`, `FsOp`, `FileInfo` and `FileKind` live in `std.fs` and are named with `import std.fs` — the same way `net.request`'s `NetError` is named with `import std.net`. The `fs` operation handle needs no import (it comes from the `! FS` effect on the signature), but the error *type* a caller matches on does.
 
-**No file handles in v1.** The `fs` surface is exactly the four path-taking operations above. There is no `fs.open`, no `fs.create`, and no handle-taking read — a read is `fs.read(path)`, never `fs.read(handle)`. Streaming and incremental access are a post-v1 addition and will arrive as *methods on a file handle* (`file.read_line()`, `file.write_line(...)`), not as overloads of `fs.read` — Blink has no function overloading. Examples in §4.7 (*Scoped resources: `with...as`*) that open a `Closeable` file handle with `with ... as` illustrate the scoped-resource mechanism against that planned handle API; they are marked there as post-v1.
+**No file handles in v1.** The `fs` surface is exactly the five path-taking operations above. There is no `fs.open`, no `fs.create`, and no handle-taking read — a read is `fs.read(path)`, never `fs.read(handle)`. Streaming and incremental access are a post-v1 addition and will arrive as *methods on a file handle* (`file.read_line()`, `file.write_line(...)`), not as overloads of `fs.read` — Blink has no function overloading. Examples in §4.7 (*Scoped resources: `with...as`*) that open a `Closeable` file handle with `with ... as` illustrate the scoped-resource mechanism against that planned handle API; they are marked there as post-v1.
 
-#### 4.4.6 Datagram Sockets (UDP)
+#### 4.4.6 Sockets in `std.net`: UDP and Unix-Domain
 
 Decided by panel deliberation [`udp-gate-sockaddr-flags`](../decisions/udp-gate-sockaddr-flags.md). `std.net` gives UDP a socket type built on `libc.recvfrom_bytes` and `libc.sendto_bytes` (§9.1.3.4).
 
@@ -995,6 +1090,50 @@ fn echo_once() -> Result[(), NetError] ! Net.Listen, Net.Connect {
     let (data, peer) = sock.recv_from(max: 512)?
     sock.send_to(data, peer)?
     sock.close()
+    Ok(())
+}
+```
+
+##### Unix-domain stream sockets
+
+`std.net` gives Unix-domain stream sockets the same second-tier shape as UDP: std functions and methods with rows, not `net` handle ops (§4.4 *Every side effect has a row*).
+
+```blink
+pub fn unix_listen(path: Str) -> Result[UnixListener, NetError]    // ! Net.Listen
+pub fn unix_connect(path: Str) -> Result[UnixStream, NetError]     // ! Net.Connect
+
+pub trait UnixListenerOps {
+    fn accept(self) -> Result[UnixStream, NetError]                // ! Net.Listen
+    fn close(self)
+}
+
+pub trait UnixStreamOps {
+    fn read_line(self) -> Result[Option[Str], NetError]
+    fn write(self, data: Str) -> Result[(), NetError]
+    fn close(self)
+}
+```
+
+- `unix_listen` creates a socket node at `path` and listens on it. It needs `Net.Listen` only. A sandbox that denies `FS.Write` but grants `Net.Listen` therefore still lets code create a socket node in any directory that the process can write to.
+- `unix_listen` never removes a file. If `path` already exists, it returns `Err(NetError.Os(op: "bind", code: ...))` with the code `EADDRINUSE`. To replace a stale socket node, the caller deletes it first with `fs.delete(path)`, which needs `FS.Delete`.
+- `accept` blocks until a client connects, then returns the stream to that client.
+- `read_line` returns the next line without its line terminator, or `None` at end of stream.
+- `write` sends all of `data` or returns an error.
+
+Rule 2 (§4.4) requires a row on every method of an open socket. The rows of `recv_from`, `local_addr`, `set_timeout` and `close` on `UdpSocket`, and of `read_line`, `write` and `close` here, are not yet given.
+
+```blink
+import std.net.{NetError, unix_listen}
+
+fn serve_once(path: Str) -> Result[(), NetError] ! Net.Listen {
+    let listener = unix_listen(path)?
+    let conn = listener.accept()?
+    match conn.read_line()? {
+        Some(line) => conn.write("echo: {line}\n")?
+        None => ()
+    }
+    conn.close()
+    listener.close()
     Ok(())
 }
 ```
@@ -1114,6 +1253,143 @@ error[TypeError]: mismatched types
   = note: expected `Range[Int]`, found `Int`
   = fix: rand.int(0..10)
 ```
+
+#### 4.4.8 Process Operations
+
+The `process` handle is in scope when a function declares `! Process` or one of its sub-effects. `Process.Spawn` runs other programs, waits for them, and replaces this program with another one. `Process.Signal` sends signals to child processes.
+
+```blink
+effect Process {
+    effect Spawn {
+        /// Run cmd with args, wait for it to exit, and return what it wrote.
+        fn run(cmd: Str, args: List[Str], -- stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]
+
+        /// Start cmd with args and return at once.
+        fn spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError]
+
+        /// Wait for a child that spawn started to exit, and return what it wrote.
+        fn wait(child: Child) -> Result[ProcessResult, ProcessError]
+
+        /// Replace this program with cmd. Returns only if cmd cannot start.
+        /// A call also needs Env.Exit (see below).
+        fn exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError]
+    }
+
+    effect Signal {
+        /// Send signal number sig to a child that spawn started.
+        fn signal(child: Child, sig: Int) -> Result[(), ProcessError]
+    }
+}
+```
+
+| Operation | Signature | Effect |
+|---|---|---|
+| `process.run` | `process.run(cmd: Str, args: List[Str], -- stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
+| `process.spawn` | `process.spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError]` | `Process.Spawn` |
+| `process.wait` | `process.wait(child: Child) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
+| `process.exec` | `process.exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError]` | `Process.Spawn`, `Env.Exit` |
+| `process.signal` | `process.signal(child: Child, sig: Int) -> Result[(), ProcessError]` | `Process.Signal` |
+
+**`cmd` is a program, not a command line.** `process.run("git", ["status", "--short"])` runs `git` with two arguments. No shell reads the arguments, so a space or a `$` in an argument is not special. Blink has no shell op. To run a shell command line, run the shell:
+
+```blink
+fn disk_usage(dir: Str) -> Result[Str, ProcessError] ! Process.Spawn {
+    let r = process.run("sh", ["-c", "du -sh {dir}"])?
+    Ok(r.out)
+}
+```
+
+The shell reads `dir` here, so a `dir` from user input can inject commands. Prefer a program and an argument list.
+
+**A non-zero exit is data.** The types live in `std.process`:
+
+```blink
+pub type ProcessResult {
+    out: Str          // everything the child wrote to standard output
+    err_out: Str      // everything the child wrote to standard error
+    exit_code: Int
+}
+
+pub type ProcessOp {
+    Run
+    Spawn
+    Wait
+    Exec
+    Signal
+}
+
+pub type ProcessError {
+    op: ProcessOp
+    cmd: Str
+    code: Errno
+}
+
+pub opaque type Child
+```
+
+`process.run` and `process.wait` return `Ok` when the child ran to the end, whatever its exit code. `Err` means that the operation itself failed: the program was not found or could not start, the wait failed, or the signal could not be sent. `ProcessError` has the shape of `FsError` (§4.4.5): the operation, the command, and the `Errno`. Its `Display` follows the same convention, `op cmd: message`, for example `run gti: No such file or directory`.
+
+```blink
+import std.process.{ProcessError}
+
+fn build(target: Str) -> Result[Bool, ProcessError] ! Process.Spawn, IO.Print {
+    let r = process.run("make", [target])?
+    if r.exit_code != 0 {
+        io.println(r.err_out)
+    }
+    Ok(r.exit_code == 0)
+}
+```
+
+**Standard input.** With `stdin: None`, the default, the child reads its standard input from the null device, so its first read sees end of input. A child never starts with its standard input closed. With `stdin: Some(s)`, the child reads `s` and then end of input. `process.spawn` gives the child the null device as standard input.
+
+```blink
+fn word_count(text: Str) -> Result[Str, ProcessError] ! Process.Spawn {
+    let r = process.run("wc", ["-w"], stdin: Some(text))?
+    Ok(r.out.trim())
+}
+```
+
+**`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. `process.wait` on a child that already exited returns the same `ProcessResult` again. The signal numbers are constants in `std.process` (`SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`).
+
+```blink
+import std.process.{ProcessResult, ProcessError, SIGTERM}
+import std.time.{Duration}
+
+fn run_with_deadline(cmd: Str, args: List[Str], limit: Duration) -> Result[ProcessResult, ProcessError] ! Process, Time.Sleep {
+    let child = process.spawn(cmd, args)?
+    time.sleep(limit)
+    let _ = process.signal(child, SIGTERM)   // an Err here means the child already exited
+    process.wait(child)
+}
+```
+
+**`process.exec` ends this program.** On success, the operating system replaces this program with `cmd`, so the call does not return. The result type is `Result[Never, ProcessError]`: `process.exec(cmd, args)?` has type `Never`, and the code after it is unreachable. Because a successful call ends the program, a call to `process.exec` needs `Env.Exit` as well as `Process.Spawn`. A function that cannot call `env.exit` cannot end the program through `process.exec`.
+
+```blink
+fn launch(tool: Str, args: List[Str]) ! Process.Spawn, Env.Exit, IO {
+    let e = process.exec(tool, args).unwrap_err()   // exec returns only on failure
+    io.eprintln("{e}")
+    env.exit(127)
+}
+```
+
+**Mock handlers.** A `handler Process` replaces every operation, so a test can run code that starts programs without starting any. Operations that the mock leaves out delegate to the enclosing handler (§4.7.1).
+
+```blink
+test "build reports a failed make" {
+    let mock = handler Process {
+        fn run(cmd: Str, args: List[Str], stdin: Option[Str]) -> Result[ProcessResult, ProcessError] {
+            Ok(ProcessResult { out: "", err_out: "no rule for target", exit_code: 2 })
+        }
+    }
+    with mock {
+        assert_eq(build("all"), Ok(false))
+    }
+}
+```
+
+A handler implements `run` with all three parameters. The default value of `stdin` applies at the call site only.
 
 ---
 
@@ -2102,6 +2378,8 @@ fn sandbox_plugin(plugin: Plugin) ! FS.Read, Net.Connect, IO.Log, Time.Read {
 ```
 
 The plugin receives handles that look identical to unrestricted ones. It calls `fs.read(...)`, `net.get(...)`, `time.read()` through the same interface. It has no mechanism to detect or bypass the attenuation. This is the ocap principle: capabilities are unforgeable and can only be attenuated, never amplified.
+
+**Second-tier functions are gated, not virtualized.** A std function or method that has a row but is not a handle op, such as `udp_bind` or `unix_listen` (§4.4.6), needs its effect like any handle op, so a sandbox can deny it by not granting that effect. But no handler can intercept it. Under `with restricted_net(...)`, a call to `udp_bind` still binds a real socket. To restrict such a function, deny the effect.
 
 **Attenuation is compositional:**
 

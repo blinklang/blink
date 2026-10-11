@@ -711,15 +711,17 @@ Beyond the built-in primitives (§3.2) and collections (§3.2.2), Blink's standa
 
 ##### Instant and Duration (`std.time`, Tier 2)
 
-`time.read()` returns `Instant` — an opaque, nanosecond-precision point in time. `time.sleep()` accepts `Duration` — a typed time span with named constructors that encode units.
+`time.read()` reads the wall clock and returns `Instant` — an opaque, nanosecond-precision point in time. `time.monotonic()` reads the monotonic clock and returns `Monotonic`. `time.sleep()` accepts `Duration` — a typed time span with named constructors that encode units.
+
+**Two clocks.** The wall clock gives the time of day. Another program or an administrator can set it, so it can jump forward or back. The monotonic clock never goes back and does not follow such changes, but its readings have no relation to the date. Use `time.read()` for a timestamp, and `time.monotonic()` to measure elapsed time. Both need `Time.Read`.
 
 ```blink
 import std.time.{Instant, Duration}
 
 fn measure_latency() -> Duration ! Time.Read {
-    let start = time.read()         // returns Instant
+    let start = time.monotonic()    // returns Monotonic
     do_work()
-    start.elapsed()                 // returns Duration
+    time.monotonic().since(start)   // returns Duration
 }
 
 fn retry_with_backoff(attempt: Int) ! Time.Sleep {
@@ -747,6 +749,12 @@ fn format_log() -> Str ! Time.Read {
 Instant implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. Does NOT implement arithmetic traits (sealed to built-in numerics). Use `.since()` and `.add()` named methods.
 
 Instant's `Display` writes RFC 9557 in UTC with a `Z` offset: `2026-02-14T12:00:00Z`. A zero fraction of a second is left out. Any other fraction is written without trailing zeros: `2026-02-14T12:00:00.5Z`, `2026-02-14T12:00:00.000000001Z`. An instant before the epoch rounds down to the earlier second: 500 ms before the epoch is `1969-12-31T23:59:59.5Z`. `to_rfc3339` does not change: it always drops the fraction.
+
+**Monotonic** is an opaque type, declared `pub opaque type Monotonic` in `std.time`. Code builds a `Monotonic` only through `time.monotonic()`. It has no epoch, no `Display`, and no conversion to or from `Instant`, so a monotonic reading cannot be mixed with a wall-clock time.
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `since` | `fn(self, earlier: Monotonic) -> Duration` | Time from `earlier` to this reading; never negative when `earlier` was read first |
 
 **Duration** is a typed time span. Named constructors enforce units at construction — no ambiguity between seconds and milliseconds.
 
