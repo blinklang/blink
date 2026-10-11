@@ -1632,15 +1632,60 @@ A global or const reaches the C of other units by its name alone:
   goes into `__blink_init_globals_<module>`, in the same unit.
 - Another unit refers to the global by its C name (`ir_global_ref`), and
   its declaration line is in the module's header.
-- A const folds into each use, and each use names it.
+- A const is a C global of its module's unit too (`int64_t blink_base_K
+  = 3;`). No reader unit prints its value; each prints its C name. The
+  name check still marks a const, so a fold added later, as spec 2.21
+  allows in a range pattern bound or a default, keeps its readers.
 - The entry unit calls each init fn. Its key holds the `init` lines, so
   a global made run-time or constant again emits `__main__` again.
 - The init calls run in module order. Only an import changes that order,
   and a new import changes the inputs of import resolution, so the build
   takes no unit.
 
+A reader can name a global or const in a way other than the bare word of
+its declaration. Each shape that builds today, and why its unit is kept:
+
+| shape | why the reader is emitted again |
+|---|---|
+| qualified (`base.G`) | its source names `G` |
+| selective import from a `pub import` facade | its source names `G` |
+| string interpolation (`"{G}"`) | the word check reads the whole text |
+| another const (`pub const KC = K + 1`) | its source names `K`; `KC`'s readers read `KC`'s C global |
+| a generic body that reads `G` | the instance is base's: base's unit writes its body |
+| keyword default, struct field default | the caller's C holds the folded literal; the caller reads `base.bl`, which changed |
+
+A renamed selective import of a global, a qualified read through a
+facade, a default that names a const from another module, and a range
+pattern bound that names a const each fail to compile today. Each has a
+bug, and a chore adds the shape to
+`test_unit_reuse_emits_again_the_units_that_read_an_edited_global_or_const_by_any_name.bl`
+once it builds. `import m as x` is in the spec, but the parser does not
+take it yet.
+
+A global whose initializer makes a new instance of a generic of another
+module (`pub let GI = count([1.5])` in `gen`) lands the instance in the
+generic's module: `base.priv.h` declares it and `base.c` writes its body.
+The build sees the header change and emits `base` again.
+
 A test block of a module other than the entry is not in the program the
-build makes, so it adds no name and changes no unit.
+build makes, so it adds no name and changes no unit. `src/compiler.bl`
+merges only the entry's test captures into the program; `mono` and
+`cg_reg` read tests only from the program's captures. So a non-entry test
+cannot add an instance, lower a private fn it alone calls, or move a
+counter: `c_mint_seq`, which numbers closures and fn values, restarts for
+each unit (`src/cname.bl`), and a string literal is written in the unit
+that uses it. A test does move the lines below it, and panic text names
+a source line, so the unit of the module that holds the test is always
+emitted again.
+
+Two mutants of `src/emit_record.bl` check the tests:
+
+- A let or const edit adds no name. The any-name test and the readers
+  test fail on their took lists. `BLINK_EMIT_REUSE_VERIFY` stays green,
+  since no reader prints a value; the name check guards a future fold.
+- A test-only edit takes every unit, its own too. Verify fails: the
+  unit of `leaf` is not the cold one, at the panic line a test above its
+  code moves.
 
 The parser marks a plain global or const with its keyword and name. A
 global with an annotation, or one that destructures or binds `_`, stays

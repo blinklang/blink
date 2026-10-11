@@ -1,7 +1,10 @@
 // A test block of a module other than the entry is not part of the program a build makes, so a
 // per-module build that adds or removes one emits only the unit of the module that holds it,
 // and takes every other unit from the last build. The test body calls a generic and holds a
-// lambda, which a build that lowered it would print. Each build runs with
+// lambda, which a build that lowered it would print, and another is the only caller of a private
+// fn of its module, which no unit may lower on its account. A test added above a module's code
+// moves the source line in that unit's panic text, so the build must still emit the unit of the
+// module that holds the test. Each build runs with
 // BLINK_EMIT_REUSE_VERIFY=1, so every unit it writes or takes is byte-equal to a cold emit, and
 // after each edit the units and the output equal those of a build with no last build.
 
@@ -41,12 +44,16 @@ fn dev_tree(root: Str, tree: Str) {
         #"    tag("mid")"#,
         #"}"#,
         #""#,
+        #"fn mid_twice(n: Int) -> Int {"#,
+        #"    n * 2"#,
+        #"}"#,
+        #""#,
     ].join("\n"))
     write_file("{tree}/app/src/leaf.bl", [
         #"import base.{pair_left, tag}"#,
         #""#,
         #"pub fn leaf_value() -> Str {"#,
-        #"    tag(pair_left("leaf", "x"))"#,
+        #"    tag(pair_left(["leaf"].get(0).unwrap(), "x"))"#,
         #"}"#,
         #""#,
     ].join("\n"))
@@ -123,6 +130,17 @@ test "a test block added to or removed from an imported module emits only that m
     seen.push(warm_and_cold(tree, "test added to leaf"))
     write_file("{tree}/app/src/leaf.bl", leaf_before)
     seen.push(warm_and_cold(tree, "test removed from leaf"))
+    // Above leaf_value, the test moves the line its unwrap panic names, so leaf's C changes.
+    write_file("{tree}/app/src/leaf.bl", leaf_before.replace("import base.\{pair_left, tag}\n", "import base.\{pair_left, tag}\n{probe}"))
+    seen.push(warm_and_cold(tree, "test added above the code of leaf"))
+    write_file("{tree}/app/src/leaf.bl", leaf_before)
+    seen.push(warm_and_cold(tree, "test removed from above the code of leaf"))
+    // The test is the only user of mid_twice, so no build of the program lowers it.
+    let mid_before = read_file("{tree}/app/src/mid.bl")
+    append(tree, "mid.bl", "\ntest \"twice\" \{\n    assert_eq(mid_twice(2), 4)\n}\n")
+    seen.push(warm_and_cold(tree, "test that alone calls a private fn added to mid"))
+    write_file("{tree}/app/src/mid.bl", mid_before)
+    seen.push(warm_and_cold(tree, "test that alone calls a private fn removed from mid"))
     // base is imported by every module.
     append(tree, "base.bl", probe)
     seen.push(warm_and_cold(tree, "test added to base"))
@@ -132,6 +150,10 @@ test "a test block added to or removed from an imported module emits only that m
     assert_eq(seen.join("\n"), [
         "test added to leaf: took __main__,base,mid; differ []; prints [main] [mid] [leaf], same as cold true",
         "test removed from leaf: took __main__,base,mid; differ []; prints [main] [mid] [leaf], same as cold true",
+        "test added above the code of leaf: took __main__,base,mid; differ []; prints [main] [mid] [leaf], same as cold true",
+        "test removed from above the code of leaf: took __main__,base,mid; differ []; prints [main] [mid] [leaf], same as cold true",
+        "test that alone calls a private fn added to mid: took __main__,base,leaf; differ []; prints [main] [mid] [leaf], same as cold true",
+        "test that alone calls a private fn removed from mid: took __main__,base,leaf; differ []; prints [main] [mid] [leaf], same as cold true",
         "test added to base: took __main__,leaf,mid; differ []; prints [main] [mid] [leaf], same as cold true",
         "test removed from base: took __main__,leaf,mid; differ []; prints [main] [mid] [leaf], same as cold true",
     ].join("\n"))

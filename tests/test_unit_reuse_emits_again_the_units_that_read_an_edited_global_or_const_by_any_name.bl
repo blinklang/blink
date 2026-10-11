@@ -1,0 +1,216 @@
+// A unit can read a global or const of another module by a name that is not the bare word of
+// its declaration: through a qualified path, a re-export, a string interpolation, another
+// const that reads it, or a generic body that another unit instantiates. A keyword argument
+// default and a struct field default reach the caller's C with no name at all. A global whose
+// initializer makes a new instance of a generic must land that instance in the generic's
+// module. After an edit to such a global or
+// const, a per-module build must emit again every unit whose C prints its value or its C name,
+// and may take only the others. Each build runs with BLINK_EMIT_REUSE_VERIFY=1, so every unit
+// it writes or takes is byte-equal to a cold emit, and after each edit the units and the output
+// equal those of a build with no last build.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"any_name_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub const K: Int = 3"#,
+        #"pub let G: Int = 5"#,
+        #""#,
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub fn wait(-- n: Int = 7) -> Int {"#,
+        #"    n"#,
+        #"}"#,
+        #""#,
+        #"pub type Cfg {"#,
+        #"    n: Int = 9"#,
+        #"}"#,
+        #""#,
+        #"pub fn count[T](xs: List[T]) -> Int {"#,
+        #"    xs.len() + G"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/qual.bl", [
+        #"import base"#,
+        #""#,
+        #"pub fn qual_value() -> Str {"#,
+        #"    base.tag("qual {base.G} {base.K}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/facade.bl", [
+        #"pub import base.{G, K}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/viafacade.bl", [
+        #"import facade.{G, K}"#,
+        #""#,
+        #"pub fn facade_value() -> Str {"#,
+        #"    "facade {G} {K}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/dflt.bl", [
+        #"import base.{wait, Cfg}"#,
+        #""#,
+        #"pub fn dflt_value() -> Str {"#,
+        #"    let c = Cfg {}"#,
+        #"    "dflt {wait()} {c.n}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/chain.bl", [
+        #"import base.{K}"#,
+        #""#,
+        #"pub const KC: Int = K + 1"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/chainuser.bl", [
+        #"import chain.{KC}"#,
+        #""#,
+        #"pub fn chain_value() -> Str {"#,
+        #"    "chain {KC}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/gen.bl", [
+        #"import base.{count}"#,
+        #""#,
+        #"pub fn gen_value() -> Str {"#,
+        #"    "gen {count([true])}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import qual.{qual_value}"#,
+        #"import viafacade.{facade_value}"#,
+        #"import dflt.{dflt_value}"#,
+        #"import chainuser.{chain_value}"#,
+        #"import gen.{gen_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{qual_value()} {facade_value()} {dflt_value()} {chain_value()} {gen_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    blink_in(tree, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            // Sorted, so the build's unit order does not reach the assertion.
+            let name = line.byte_slice(29, line.byte_len())
+            out.push(name)
+            let mut at = out.len() - 1
+            while at > 0 && out.get(at - 1).unwrap() > name {
+                out.set(at, out.get(at - 1).unwrap())
+                at = at - 1
+            }
+            out.set(at, name)
+        }
+    }
+    out
+}
+
+// The lines of a failed build that say why, so a verify failure names the unit it found.
+fn why_failed(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if !line.starts_with("[dbg:") && line.trim() != "" { out.push(line.trim()) }
+    }
+    out.join(" | ")
+}
+
+// One edit's result: the units the build took, the C files and headers that differ from a
+// build with none to take, and whether the two binaries print the same.
+fn warm_and_cold(tree: Str, what: Str) -> Str {
+    let warm = build_into(tree, "out")
+    if warm.exit_code != 0 { return "{what}: warm build failed: {why_failed(warm)}" }
+    shell_exec("rm -rf {tree}/cold")
+    let cold = build_into(tree, "cold")
+    if cold.exit_code != 0 { return "{what}: cold build failed: {why_failed(cold)}" }
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    let warm_out = sh("{tree}/out/app")
+    let same_out = warm_out == sh("{tree}/cold/app")
+    "{what}: took {reused_units(warm).join(",")}; differ [{differ.split("\n").join(" ")}]; prints {warm_out}, same as cold {same_out}"
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+test "an edit to a global or const emits again every unit that reads it, by whatever name" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_any_name_unit_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let first = build_into(tree, "out")
+    assert(first.exit_code == 0, "first build failed: {why_failed(first)}")
+    let mut seen: List[Str] = []
+    edit(tree, "base.bl", "s/K: Int = 3/K: Int = 4/")
+    seen.push(warm_and_cold(tree, "const changed"))
+    edit(tree, "base.bl", "s/G: Int = 5/G: Int = 6/")
+    seen.push(warm_and_cold(tree, "constant global changed"))
+    edit(tree, "base.bl", "s/G: Int = 6/G: Int = [5, 6].len() + 4/")
+    seen.push(warm_and_cold(tree, "global made run-time"))
+    append(tree, "gen.bl", "\npub let GI: Int = count([1.5, 2.5])\n")
+    seen.push(warm_and_cold(tree, "global added whose initializer makes a new instance"))
+    edit(tree, "gen.bl", "s/count(\\[1.5, 2.5\\])/count([1.5])/")
+    seen.push(warm_and_cold(tree, "that initializer changed"))
+    edit(tree, "base.bl", "s/n: Int = 7)/n: Int = 8)/")
+    seen.push(warm_and_cold(tree, "keyword default changed"))
+    edit(tree, "base.bl", "s/n: Int = 9$/n: Int = 10/")
+    seen.push(warm_and_cold(tree, "struct field default changed"))
+    shell_exec("rm -rf {tree}")
+    // qual, facade and viafacade name K or G, and dflt reads base.bl for the defaults it
+    // copies, so each edit to base emits them again. count[Bool] and count[Float] are base's
+    // instances: base's unit writes their bodies, and its private header declares them, so
+    // gen is taken across an edit to G, and a new instance emits base again.
+    assert_eq(seen.join("\n"), [
+        "const changed: took __main__,chainuser,gen; differ []; prints [qual 5 4] facade 5 4 dflt 7 9 chain 5 gen 6, same as cold true",
+        "constant global changed: took __main__,chain,chainuser,gen; differ []; prints [qual 6 4] facade 6 4 dflt 7 9 chain 5 gen 7, same as cold true",
+        "global made run-time: took chain,chainuser,gen; differ []; prints [qual 6 4] facade 6 4 dflt 7 9 chain 5 gen 7, same as cold true",
+        "global added whose initializer makes a new instance: took chain,chainuser,dflt,qual,viafacade; differ []; prints [qual 6 4] facade 6 4 dflt 7 9 chain 5 gen 7, same as cold true",
+        "that initializer changed: took __main__,base,chain,chainuser,dflt,qual,viafacade; differ []; prints [qual 6 4] facade 6 4 dflt 7 9 chain 5 gen 7, same as cold true",
+        "keyword default changed: took __main__,chain,chainuser,gen,qual,viafacade; differ []; prints [qual 6 4] facade 6 4 dflt 8 9 chain 5 gen 7, same as cold true",
+        "struct field default changed: took ; differ []; prints [qual 6 4] facade 6 4 dflt 8 10 chain 5 gen 7, same as cold true",
+    ].join("\n"))
+}
