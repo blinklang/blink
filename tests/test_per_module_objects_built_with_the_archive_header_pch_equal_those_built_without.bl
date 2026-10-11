@@ -1,0 +1,94 @@
+// The PCH of the archive header only saves its parse: each object a unit compiles with it
+// must be the bytes it compiles to without it, at the default level and in a debug build,
+// whose debug info names the header. The object key leaves the PCH out on that ground.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs the real cc
+// with -H on each compile, so its log names the PCH a unit read ("! <path>.gch"). Each
+// compile logs to a file of its own: gcc writes -H lines in pieces, which parallel compiles
+// would interleave in one file.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real_cc = sh("command -v cc")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) exec {real_cc} \"$@\" -H 2>\"$(mktemp {tree}/cc_h/XXXXXX)\" ;; esac\nexec {real_cc} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with its own object cache, the -H cc and the unit trace. The corpus
+// exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the
+// run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_ok(tree: Str, flags: Str) {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+}
+
+// The compiles of the last build that read a PCH from the object cache.
+fn pch_reads(tree: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! {tree}/objcache/[0-9a-f]*\\.pch/libblink_std\\.h\\.gch$'").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+// The objects in the cache after a build with no cached object, by key, as "<sha>  <key>.o"
+// lines, and how many units read the PCH.
+fn objects_built(tree: Str, flags: Str, n: Int) -> (Str, Int) {
+    shell_exec("rm -f {tree}/objcache/*.o {tree}/objcache/*.meta")
+    edit_main(tree, n)
+    build_ok(tree, flags)
+    (sh("cd {tree}/objcache && sha256sum *.o"), pch_reads(tree))
+}
+
+fn with_and_without(root: Str, flags: Str, label: Str) {
+    let tree = "{root}/.tmp/_pch_equal_{label}_{getpid()}"
+    dev_tree(root, tree)
+    // Leaves the PCH in the cache for the next build.
+    build_ok(tree, flags)
+    let (pch_objs, pch_reads_n) = objects_built(tree, flags, 2)
+    let dirs = pch_dirs(tree)
+    assert(dirs.len() == 1, "{label}: the builds made {dirs.len()} PCH dirs")
+    let dir = dirs.get(0).unwrap()
+    // gcc warns on a file too short to be a PCH and reads the header copy beside it.
+    shell_exec("printf garbage > {tree}/objcache/{dir}/libblink_std.h.gch")
+    let (plain_objs, plain_reads_n) = objects_built(tree, flags, 2)
+    shell_exec("rm -rf {tree}")
+    assert(pch_reads_n >= 2, "{label}: {pch_reads_n} units read the PCH")
+    assert_eq(plain_reads_n, 0)
+    assert(pch_objs.split("\n").len() >= 2, "{label}: objects {pch_objs}")
+    assert_eq(pch_objs, plain_objs)
+}
+
+test "objects built with the archive header PCH equal those built without it" {
+    let root = sh("pwd -P")
+    with_and_without(root, "", "default")
+    with_and_without(root, "--debug", "debug")
+}

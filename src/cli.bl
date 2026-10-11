@@ -2164,39 +2164,110 @@ type UnitCompile {
     exit_code: Int
     out: Str
     err_out: Str
+    used_pch: Bool
 }
 
-// Runs each command as sh would with at most `unit_jobs` at a time (the CPU count for -1),
-// starting them in list order.
-// Answers one result per command, indexed by its place in the list.
+// A PCH build for run_unit_compiles: cmd writes the .gch into the staged dir, which becomes
+// the PCH for key when cmd ends well. An empty cmd builds none.
+type PchJob {
+    cmd: Str
+    key: Str
+    staged: Str
+}
+
+type UnitRun {
+    results: List[UnitCompile]
+    pch_stored: Bool
+}
+
+fn no_pch_job() -> PchJob {
+    PchJob { cmd: "", key: "", staged: "" }
+}
+
+// Runs each unit command as sh would with at most `unit_jobs` at a time (the CPU count for
+// -1), starting them in list order. A unit runs with_pch[i] when pch_ready, or when it starts
+// after the PCH build ended and installed its PCH, and plain[i] otherwise. The PCH build
+// starts first in a slot of its own, so the units that start before it ends do not wait.
+// Answers one result per unit, indexed by its place in the list.
 // The children are started and reaped from this thread rather than from async tasks: the
 // async pool has four threads and a task that waits on a child holds one, so tasks could
 // never run more than four at once. Children are reaped in start order with no wait for
 // whichever ends first, so a child that ends early holds its slot until those started
 // before it are reaped.
-fn run_unit_compiles(cmds: List[Str], unit_jobs: Int) -> List[UnitCompile] ! IO {
-    let n = cmds.len()
+fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int) -> UnitRun ! IO {
+    let n = plain.len()
     let mut by_idx: List[UnitCompile] = []
-    if n == 0 { return by_idx }
+    if n == 0 { return UnitRun { results: by_idx, pch_stored: false } }
     let jobs = if unit_jobs > 0 { unit_jobs } else { build_fs.cpu_count() }
     process_install_signal_forwarding()
+    let mut ready = pch_ready
+    let mut stored = false
+    let mut pch_pid = -1
+    if pch.cmd != "" {
+        dbg_trace("build.units", "pch build {pch.key}")
+        pch_pid = spawn_command(pch.cmd)
+    }
+    let slots = if pch_pid >= 0 && jobs > 1 { jobs - 1 } else { jobs }
     let mut pids: List[Int] = []
+    let mut used: List[Bool] = []
     let mut started = 0
-    while started < n && started < jobs {
-        pids.push(spawn_command(cmds.get(started).unwrap()))
+    while started < n && started < slots {
+        pids.push(spawn_command(if ready { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+        used.push(ready)
         started = started + 1
+    }
+    if pch_pid >= 0 {
+        let r = process_pid_wait(pch_pid)
+        if r.exit_code == 0 {
+            stored = build_objcache.store_pch(pch.key, pch.staged)
+            // Another build may have installed the same PCH first.
+            ready = stored || build_objcache.lookup_pch(pch.key) != ""
+        } else {
+            let _ = build_fs.remove_tree(pch.staged)
+        }
+        if started < n && slots < jobs {
+            pids.push(spawn_command(if ready { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+            used.push(ready)
+            started = started + 1
+        }
     }
     let mut idx = 0
     while idx < n {
         let r = process_pid_wait(pids.get(idx).unwrap())
-        by_idx.push(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out })
+        by_idx.push(UnitCompile { idx: idx, exit_code: r.exit_code, out: r.out, err_out: r.err_out, used_pch: used.get(idx).unwrap() })
         if started < n {
-            pids.push(spawn_command(cmds.get(started).unwrap()))
+            pids.push(spawn_command(if ready { with_pch.get(started).unwrap() } else { plain.get(started).unwrap() }))
+            used.push(ready)
             started = started + 1
         }
         idx = idx + 1
     }
-    by_idx
+    UnitRun { results: by_idx, pch_stored: stored }
+}
+
+// Every unit defines this before it includes the archive header, so the PCH is built with it.
+let ARCHIVE_PCH_DEFINE: Str = "-DBLINK_USE_EXTERN_RUNTIME_STORAGE=1"
+
+// The flags a PCH of the archive header is built and keyed with: gcc takes a .gch only when
+// the flags that shape it match the unit's.
+fn archive_pch_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
+    let mut flags = unit_key_flags(debug_mode, release_mode)
+    flags.push(ARCHIVE_PCH_DEFINE)
+    flags
+}
+
+// A PCH of the archive header serves only a plain gcc compile. clang and zig cc read a PCH
+// only through -include-pch, ccache needs settings of its own to pass one, a vendored include
+// dir could answer a system include the PCH resolved elsewhere, and a .gch beside the archive
+// header already serves every unit.
+fn archive_pch_eligible(target: Str, include_flags: Str, arc_dir: Str) -> Bool ! IO {
+    if target != "" || include_flags != "" || has_ccache() != 0 {
+        return false
+    }
+    if file_exists("{arc_dir}/libblink_std.h.gch") == 1 {
+        return false
+    }
+    !process_cc_id(target).contains("clang")
 }
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
@@ -2261,19 +2332,68 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         misses.set(j, cur)
         i = i + 1
     }
+    let mut pch_key = ""
+    let mut pch_ready = false
+    let mut pch = no_pch_job()
+    if misses.len() > 0 && keys.len() > 0 && archive_pch_eligible(target, include_flags, arc_dir) {
+        let s = shas.unwrap()
+        let archive_sha = s.get("{arc_dir}/libblink_std.h") ?? ""
+        let runtime_sha = s.get("{arc_dir}/runtime.h") ?? ""
+        pch_key = build_objcache.pch_key(archive_sha, runtime_sha, process_cc_id(target), arc_dir, archive_pch_key_flags(debug_mode, release_mode))
+        if pch_key != "" {
+            pch_ready = build_objcache.lookup_pch(pch_key) != ""
+            if !pch_ready {
+                let staged = build_objcache.stage_pch(arc_dir, archive_sha, runtime_sha)
+                if staged != "" {
+                    // The debug info names the archive dir, as a unit's without the PCH does.
+                    let cmd = cc_command("{unit_cc_flags().join(" ")} {ARCHIVE_PCH_DEFINE} -ffile-prefix-map={staged}={arc_dir} -x c-header {staged}/libblink_std.h -o {staged}/libblink_std.h.gch", debug_mode, release_mode, target)
+                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged }
+                }
+            }
+        }
+    }
     let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
+    let pch_dir = if pch_key != "" { build_objcache.pch_dir(pch_key) } else { "" }
     let mut cmds: List[Str] = []
+    let mut pch_cmds: List[Str] = []
     for u in misses {
         dbg_trace("build.units", "compile {u.stem}")
-        cmds.push(cc_command("-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir} {includes}", debug_mode, release_mode, target))
+        let line = "-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir}"
+        cmds.push(cc_command("{line} {includes}", debug_mode, release_mode, target))
+        pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_dir}={arc_dir} -I{pch_dir} {includes}", debug_mode, release_mode, target))
     }
-    let results = run_unit_compiles(cmds, unit_jobs)
+    let run = run_unit_compiles(cmds, pch_cmds, pch_ready, pch, unit_jobs)
+    let mut results = run.results
+    // gcc stops on a .gch cut short, where it reads the header beside any other .gch it cannot
+    // take. So a unit that failed with the PCH compiles once more without it, and the PCH goes
+    // when that compile ends well.
+    let mut retry_idx: List[Int] = []
+    let mut retry_cmds: List[Str] = []
+    for r in results {
+        if r.exit_code != 0 && r.used_pch {
+            retry_idx.push(r.idx)
+            retry_cmds.push(cmds.get(r.idx).unwrap())
+        }
+    }
+    let mut dropped = false
+    for a in run_unit_compiles(retry_cmds, retry_cmds, false, no_pch_job(), unit_jobs).results {
+        let idx = retry_idx.get(a.idx).unwrap()
+        dbg_trace("build.units", "pch fallback {misses.get(idx).unwrap().stem} exit {a.exit_code}")
+        if a.exit_code == 0 && !dropped {
+            build_objcache.drop_pch(pch_key)
+            dropped = true
+        }
+        results.set(idx, UnitCompile { idx: idx, exit_code: a.exit_code, out: a.out, err_out: a.err_out, used_pch: false })
+    }
     let mut failed = 0
     let mut store_keys: List[Str] = []
     let mut store_paths: List[Str] = []
     let mut store_modules: List[Str] = []
     for r in results {
         let m = misses.get(r.idx).unwrap().stem
+        if r.used_pch {
+            dbg_trace("build.units", "pch use {m}")
+        }
         if r.exit_code != 0 {
             io.eprint_raw(r.err_out)
             io.print_raw(r.out)
@@ -2291,7 +2411,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         }
     }
     // Stored before the failure check, so a unit that compiled is not compiled again next time.
-    let mut stored = false
+    let mut stored = run.pch_stored
     let installed = build_objcache.store_objs(store_keys, store_paths, store_modules)
     let mut si = 0
     while si < store_keys.len() {
