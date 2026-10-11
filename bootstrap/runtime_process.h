@@ -200,6 +200,8 @@ BLINK_RT_FN blink_ProcessResult blink_process_run(const char* cmd, const blink_l
  * table). The handle owns the OS pid plus stdout/stderr read fds.
  * blink_process_pid_wait drains the pipes, reaps the child, and caches
  * the ProcessResult so a second wait is idempotent.
+ * A slot is claimed and freed only under blink_pid_table_mu, and it is free
+ * only once its owner has waited: two spawns at once must never share one.
  * blink_process_pid_kill / send_signal forward the signal to the live
  * child by handle. Returns 0 on success, -1 if the pid is invalid or
  * already reaped.
@@ -209,6 +211,7 @@ typedef struct {
     int out_fd;
     int err_fd;
     int reaped;
+    int free;
     blink_ProcessResult cached;
 } blink_pid_slot;
 
@@ -233,19 +236,30 @@ static pthread_mutex_t blink_pid_table_mu = PTHREAD_MUTEX_INITIALIZER;
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 static int64_t blink_pid_table_alloc(void) {
     pthread_mutex_lock(&blink_pid_table_mu);
-    /* Recycle reaped slots before growing — keeps long-running parents
+    /* Recycle freed slots before growing — keeps long-running parents
      * (cmd_test orchestrates 720+ spawns) from exhausting the table. */
+    int64_t h = -1;
     for (int64_t i = 0; i < blink_pid_table_len; i++) {
-        if (blink_pid_table[i].reaped && blink_pid_table[i].out_fd < 0 && blink_pid_table[i].err_fd < 0) {
-            pthread_mutex_unlock(&blink_pid_table_mu);
-            return i;
+        if (blink_pid_table[i].free) {
+            h = i;
+            break;
         }
     }
-    if (blink_pid_table_len >= BLINK_PID_TABLE_CAP) {
-        pthread_mutex_unlock(&blink_pid_table_mu);
-        return -1;
+    if (h < 0 && blink_pid_table_len < BLINK_PID_TABLE_CAP) {
+        h = blink_pid_table_len++;
     }
-    int64_t h = blink_pid_table_len++;
+    if (h >= 0) {
+        /* Claimed before the unlock, so no other spawn can take it. */
+        blink_pid_slot* slot = &blink_pid_table[h];
+        slot->free = 0;
+        slot->pid = -1;
+        slot->out_fd = -1;
+        slot->err_fd = -1;
+        slot->reaped = 0;
+        slot->cached.out = BLINK_STR_EMPTY;
+        slot->cached.err_out = BLINK_STR_EMPTY;
+        slot->cached.exit_code = -1;
+    }
     pthread_mutex_unlock(&blink_pid_table_mu);
     return h;
 }
@@ -261,14 +275,18 @@ BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args)
 BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args) {
     int64_t h = blink_pid_table_alloc();
     if (h < 0) return -1;
+#ifdef BLINK_DEV_PID_CLAIM_DELAY_US
+    /* Dev knob: cc -DBLINK_DEV_PID_CLAIM_DELAY_US=<n> sleeps n microseconds after the slot is
+     * taken, so a test can make concurrent spawns ask for slots while this one fills its own.
+     * A cc define and not an env var, as no binary blink builds should carry it: these bodies
+     * live in the std archive, so only a standalone runtime.h build compiled with it has it. */
+    {
+        long us = (long)(BLINK_DEV_PID_CLAIM_DELAY_US);
+        struct timespec ts = { us / 1000000, (us % 1000000) * 1000 };
+        nanosleep(&ts, NULL);
+    }
+#endif
     blink_pid_slot* slot = &blink_pid_table[h];
-    slot->pid = -1;
-    slot->out_fd = -1;
-    slot->err_fd = -1;
-    slot->reaped = 0;
-    slot->cached.out = BLINK_STR_EMPTY;
-    slot->cached.err_out = BLINK_STR_EMPTY;
-    slot->cached.exit_code = -1;
 
     int out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
     if (pipe(out_pipe) < 0 || pipe(err_pipe) < 0) {
@@ -313,32 +331,38 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
         blink_ProcessResult r = { BLINK_STR_EMPTY, blink_str_from_cstr_gc("invalid pid handle"), -1 };
         return r;
     }
-    if (slot->reaped) return slot->cached;
-
-    /* Drain stdout + stderr concurrently — sequential draining deadlocks
-     * when the child fills the not-yet-read pipe (see blink_drain_two_fds). */
-    char* out = (char*)"";
-    char* err = (char*)"";
-    blink_drain_two_fds(slot->out_fd, slot->err_fd, &out, &err);
-    slot->out_fd = -1;
-    slot->err_fd = -1;
-    int status = 0;
-    int64_t exit_code = -1;
-    if (slot->pid > 0) {
-        while (waitpid(slot->pid, &status, 0) < 0) {
-            if (errno != EINTR) break;
+    if (!slot->reaped) {
+        /* Drain stdout + stderr concurrently — sequential draining deadlocks
+         * when the child fills the not-yet-read pipe (see blink_drain_two_fds). */
+        char* out = (char*)"";
+        char* err = (char*)"";
+        blink_drain_two_fds(slot->out_fd, slot->err_fd, &out, &err);
+        slot->out_fd = -1;
+        slot->err_fd = -1;
+        int status = 0;
+        int64_t exit_code = -1;
+        if (slot->pid > 0) {
+            while (waitpid(slot->pid, &status, 0) < 0) {
+                if (errno != EINTR) break;
+            }
+            if (WIFEXITED(status)) {
+                exit_code = (int64_t)WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                exit_code = 128 + (int64_t)WTERMSIG(status);
+            }
         }
-        if (WIFEXITED(status)) {
-            exit_code = (int64_t)WEXITSTATUS(status);
-        } else if (WIFSIGNALED(status)) {
-            exit_code = 128 + (int64_t)WTERMSIG(status);
-        }
+        slot->cached.out = out;
+        slot->cached.err_out = err;
+        slot->cached.exit_code = exit_code;
+        slot->reaped = 1;
     }
-    slot->cached.out = out;
-    slot->cached.err_out = err;
-    slot->cached.exit_code = exit_code;
-    slot->reaped = 1;
-    return slot->cached;
+    /* Copied out before the slot is freed, as a spawn may refill it at once. A spawn
+     * that failed is reaped from the start, but stays its owner's until this wait. */
+    blink_ProcessResult result = slot->cached;
+    pthread_mutex_lock(&blink_pid_table_mu);
+    slot->free = 1;
+    pthread_mutex_unlock(&blink_pid_table_mu);
+    return result;
 }
 #endif
 

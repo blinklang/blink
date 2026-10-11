@@ -1,0 +1,89 @@
+// Spawns that run at once must each get their own pid slot. The runtime recycles the slot of
+// a reaped child, and once handed the same recycled slot to two spawns: one wait then
+// returned the other child's output, or a result before its own child had exited. That is how
+// `blink test` over a dir reported a good file as "build failed".
+//
+// cc -DBLINK_DEV_PID_CLAIM_DELAY_US holds each spawn between taking its slot and filling it, so
+// every task below asks for a slot while the others are still in that window. No task waits
+// until all have spawned, and the waits run one at a time, so a slot that two spawns share
+// holds only the last child and hands its result to every task.
+//
+// The knob is a cc define that no binary blink builds carries: spawn's body lives in the std
+// archive. So the program is built standalone (blinkc to C that includes runtime.h) and the
+// test runs cc on it itself.
+
+fn spawn_race_program() -> Str {
+    [
+        #"import std.process"#,
+        #""#,
+        #"fn main() {"#,
+        // Reaped slots for the spawns below to recycle.
+        #"    let mut pi = 0"#,
+        #"    while pi < 2 {"#,
+        #"        let _ = process.spawn("true", []).wait()"#,
+        #"        pi = pi + 1"#,
+        #"    }"#,
+        // No more tasks than the async pool runs at once (4), or a task held at go would keep
+        // a later one from ever spawning.
+        #"    let n = 4"#,
+        #"    let spawned = channel.new[Int](buffer: n)"#,
+        #"    let go = channel.new[Int](buffer: n)"#,
+        #"    let results = channel.new[Str](buffer: n)"#,
+        #"    async.scope {"#,
+        #"        let mut ti = 0"#,
+        #"        while ti < n {"#,
+        #"            let tag = "child_{ti}""#,
+        #"            async.spawn(fn() {"#,
+        #"                let pid = process.spawn("echo", [tag])"#,
+        #"                spawned.send(1)"#,
+        #"                go.recv()"#,
+        #"                let r = pid.wait()"#,
+        #"                results.send("{tag}={r.out.trim()}:{r.exit_code}")"#,
+        #"                0"#,
+        #"            })"#,
+        #"            ti = ti + 1"#,
+        #"        }"#,
+        #"        let mut si = 0"#,
+        #"        while si < n {"#,
+        #"            spawned.recv()"#,
+        #"            si = si + 1"#,
+        #"        }"#,
+        #"        let mut gi = 0"#,
+        #"        while gi < n {"#,
+        #"            go.send(1)"#,
+        #"            for line in results {"#,
+        #"                io.println(line)"#,
+        #"                break"#,
+        #"            }"#,
+        #"            gi = gi + 1"#,
+        #"        }"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n")
+}
+
+test "spawns that take recycled pid slots at once each wait on their own child" {
+    let dir = ".tmp/_spawn_claim_{getpid()}"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+    let src = "{dir}/spawn_claim_race.bl"
+    let c_path = "{dir}/spawn_claim_race.c"
+    let bin = "{dir}/spawn_claim_race"
+    write_file(src, spawn_race_program())
+
+    let emit = process_run("build/blinkc", [src, c_path])
+    assert_eq(emit.exit_code, 0, "blinkc failed:\n{emit.out}{emit.err_out}")
+    let cc = process_run("cc", ["-O1", "-w", "-DBLINK_DEV_PID_CLAIM_DELAY_US=100000", "-Ibootstrap", "-o", bin, c_path, "-lm", "-lgc", "-pthread"])
+    assert_eq(cc.exit_code, 0, "cc failed:\n{cc.out}{cc.err_out}")
+
+    let run = process_run(bin, [])
+    assert_eq(run.exit_code, 0, "the race program failed:\n{run.out}{run.err_out}")
+    let lines = run.out.trim().split("\n")
+    assert_eq(lines.len(), 4, "captured:\n{run.out}")
+    for line in lines {
+        let parts = line.split("=")
+        assert_eq(parts.get(1).unwrap(), "{parts.get(0).unwrap()}:0", "a wait returned another child's result: {line}")
+    }
+    shell_exec("rm -rf {dir}")
+}
