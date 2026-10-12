@@ -1,0 +1,65 @@
+// A one-unit build scans its C for the native deps and the archives the link needs, and cc
+// compiles that C. Another build that writes the same C path can rewrite it between the
+// two, and the link then takes flags from other bytes than the object: a missing native dep
+// fails the link, and an extra one links the other program. The test makes the rewrite happen
+// every time: a `cc` and a `cp` first on PATH write another program's C over the build's C
+// path the first time either reads it, then run the real tool. The build runs with the
+// object cache off and on, since each compiles from its own copy of the C.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+let HELLO_SRC = "fn main() ! IO \{\n    io.println(\"the program this build emitted\")\n}\n"
+let DB_SRC = "import std.db_sqlite.\{sqlite_open, sqlite_close}\n\nfn main() ! IO \{\n    let h = sqlite_open(\":memory:\")\n    io.println(\"the program this build emitted, with sqlite\")\n    sqlite_close(h)\n}\n"
+
+// Emits other_src to {base}/other/prog.c, the bytes the rewrite puts over the build's C.
+fn setup(base: Str, blink_root: Str, own_src: Str, other_src: Str) -> Str {
+    shell_exec("rm -rf {base}")
+    shell_exec("mkdir -p {base}/bin {base}/other")
+    let fake = "#!/bin/sh\nhit=0\nfor a in \"$@\"; do\n    case \"$a\" in */prog.c|prog.c) hit=1 ;; esac\ndone\nif [ $hit = 1 ] && [ ! -e \"$REWRITE_MARK\" ]; then\n    cat \"$REWRITE_FROM\" > \"$REWRITE_C\"\n    touch \"$REWRITE_MARK\"\nfi\ncase \"$0\" in */cp) exec \"$REAL_CP\" \"$@\" ;; esac\nexec \"$REAL_CC\" \"$@\"\n"
+    write_file("{base}/bin/cc", fake)
+    write_file("{base}/bin/cp", fake)
+    // A host ccache would call the real cc by its own path, past the one above.
+    write_file("{base}/bin/ccache", "#!/bin/sh\nshift\nexec cc \"$@\"\n")
+    shell_exec("chmod +x {base}/bin/cc {base}/bin/cp {base}/bin/ccache")
+    write_file("{base}/own.bl", own_src)
+    write_file("{base}/other.bl", other_src)
+    let emit = process_run("sh", ["-c", "cd {base} && env -u BLINK_COMPILER_ARCHIVE {blink_root}/build/blink build other.bl --emit c --no-per-module --output other/prog 2>&1"])
+    assert(emit.exit_code == 0, "emitting the other program failed:\n{emit.out}")
+    "{base}/other/prog.c"
+}
+
+fn build(base: Str, blink_root: Str, cache_flag: Str) -> ProcessResult {
+    shell_exec("rm -f {base}/rewritten {base}/prog")
+    let env_vars = "PATH={base}/bin:$PATH REAL_CC={sh("command -v cc")} REAL_CP={sh("command -v cp")} REWRITE_C={base}/prog.c REWRITE_FROM={base}/other/prog.c REWRITE_MARK={base}/rewritten BLINK_CACHE_DIR={base}/objcache"
+    process_run("sh", ["-c", "cd {base} && env -u BLINK_COMPILER_ARCHIVE {env_vars} {blink_root}/build/blink build own.bl --output prog --no-per-module {cache_flag} 2>&1"])
+}
+
+test "a C file rewritten with a native dep after the emit does not change the link" {
+    let blink_root = sh("pwd -P")
+    let base = "{blink_root}/.tmp/_one_unit_link_bytes_dep_{getpid()}"
+    let _ = setup(base, blink_root, HELLO_SRC, DB_SRC)
+    for cache_flag in ["--no-cache", ""] {
+        let r = build(base, blink_root, cache_flag)
+        assert_eq(file_exists("{base}/rewritten"), 1)
+        assert(r.exit_code == 0, "the build whose C was rewritten failed ({cache_flag}):\n{r.out}")
+        assert_eq(sh("{base}/prog"), "the program this build emitted")
+    }
+    shell_exec("rm -rf {base}")
+}
+
+test "a C file rewritten without the native dep after the emit does not change the binary" {
+    let blink_root = sh("pwd -P")
+    let base = "{blink_root}/.tmp/_one_unit_link_bytes_nodep_{getpid()}"
+    let _ = setup(base, blink_root, DB_SRC, HELLO_SRC)
+    for cache_flag in ["--no-cache", ""] {
+        let r = build(base, blink_root, cache_flag)
+        assert_eq(file_exists("{base}/rewritten"), 1)
+        assert(r.exit_code == 0, "the build whose C was rewritten failed ({cache_flag}):\n{r.out}")
+        assert_eq(sh("{base}/prog"), "the program this build emitted, with sqlite")
+    }
+    shell_exec("rm -rf {base}")
+}
