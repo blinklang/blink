@@ -1,0 +1,65 @@
+// `blink test` builds its program with debug info, so the key of each unit object holds the
+// paths that debug info records: the compile dir, the dir of the C and the archive dir. The
+// same test run again from the same dir gives the same paths, so it takes every object from
+// the cache, and after a body edit it compiles only the unit edited.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/app/tests")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"test_again_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every run.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    write_file("{tree}/app/tests/test_part_value.bl", "import part.\{value\}\n\ntest \"value\" \{\n    assert_eq(value() + 1, 42)\n\}\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit,
+// so the run drops them.
+fn blink_test(tree: Str, cache: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units ../build/blink test tests/test_part_value.bl"])
+}
+
+// The units a run compiled, in the order it compiled them.
+fn compiled(r: ProcessResult) -> List[Str] {
+    let mut units: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") {
+            units.push(line.byte_slice("[dbg:build.units] compile ".byte_len(), line.byte_len()))
+        }
+    }
+    units
+}
+
+test "blink test run again from the same dir compiles only the units it changed" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_test_again_{getpid()}"
+    let cache = "{tree}/objcache"
+    dev_tree(root, tree)
+    let first = blink_test(tree, cache)
+    let again = blink_test(tree, cache)
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    40 + 1\n\}\n")
+    let edited = blink_test(tree, cache)
+    shell_exec("rm -rf {tree}")
+
+    assert(first.exit_code == 0, "test failed: {first.out}{first.err_out}")
+    assert(again.exit_code == 0, "test failed: {again.out}{again.err_out}")
+    assert(edited.exit_code == 0, "test failed: {edited.out}{edited.err_out}")
+    assert_eq(compiled(first).len(), 2)
+    assert_eq(compiled(again).len(), 0)
+    assert_eq(compiled(edited).join(" "), "part")
+}
