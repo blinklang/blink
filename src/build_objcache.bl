@@ -143,11 +143,27 @@ pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
     Some(lines)
 }
 
+// The dir cc records as a debug object's compile dir, read as gcc and clang read it: $PWD
+// when it is absolute and names the cwd, else the cwd. cc inherits this process's PWD, and an
+// sh between them keeps a PWD that names the cwd and replaces one that does not with the cwd,
+// so cc reads the same answer. gcc and clang compare by inode, so a stale PWD that names the
+// cwd through another mount of it is recorded where this answers the cwd; both name the same
+// dir. "" when the cwd cannot be read.
+pub fn compile_dir() -> Str ! IO {
+    let cwd = env.cwd()
+    if cwd == "" {
+        return ""
+    }
+    let pwd = env.var("PWD") ?? ""
+    if pwd.starts_with("/") && (build_fs.real_path(pwd) ?? "") == cwd { pwd } else { cwd }
+}
+
 // The key of a user unit compiled from the C at src_path. The unit includes
 // libblink_std.h from arc_dir, which includes the runtime.h beside it; cc reads a
 // libblink_std.h.gch there in place of the header; a vendored dependency's headers come
-// from its include dir. Each shapes the object, so each is in the key. "" when an input
-// cannot be read: a key without it would match an object built from other headers.
+// from its include dir. Each shapes the object, so each is in the key, and so is each path
+// the object records (recorded_paths). "" when an input cannot be read: a key without it
+// would match an object built from other headers.
 pub fn user_unit_key(
     src_path: Str,
     module_key: Str,
@@ -157,6 +173,7 @@ pub fn user_unit_key(
     cc_id: Str,
     flags: List[Str],
     target: Str,
+    recorded_paths: List[Str],
 ) -> Str ! IO {
     if blinkc_sha == "" || cc_id == "" {
         return ""
@@ -185,6 +202,10 @@ pub fn user_unit_key(
         None => {
             return ""
         }
+    }
+    // As import lines, so a level that records no path keeps the keys it had.
+    for p in recorded_paths {
+        headers.push("path:{p}")
     }
     compute_obj_key(module_key, src_sha, headers, runtime_sha, blinkc_sha, cc_id, flags, target)
 }
@@ -343,12 +364,13 @@ pub fn unit_keys_from(
     target: Str,
 ) -> Map[Str, Str] ! IO {
     match header_lines_in(vendored_include_dirs) {
-        Some(lines) => unit_keys_with_headers(shas, modules, unit_headers, arc_dir, lines, blinkc_sha, cc_id, flags, target)
+        Some(lines) => unit_keys_with_headers(shas, modules, unit_headers, arc_dir, lines, blinkc_sha, cc_id, flags, target, [])
         None => Map()
     }
 }
 
-// unit_keys_from over the lines header_lines_in answered for the vendored include dirs.
+// unit_keys_from over the lines header_lines_in answered for the vendored include dirs, with
+// each path the objects record (recorded_paths) in every key.
 pub fn unit_keys_with_headers(
     shas: Map[Str, Str],
     modules: List[Str],
@@ -359,6 +381,7 @@ pub fn unit_keys_with_headers(
     cc_id: Str,
     flags: List[Str],
     target: Str,
+    recorded_paths: List[Str],
 ) -> Map[Str, Str] ! IO {
     let mut keys: Map[Str, Str] = Map()
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
@@ -391,6 +414,10 @@ pub fn unit_keys_with_headers(
     }
     for f in sorted_strs(flags) {
         shared.push("flag:{f}")
+    }
+    // Only when there are any, so a level that records no path keeps the keys it had.
+    for p in recorded_paths {
+        shared.push("path:{p}")
     }
     let shared_sha = digest_of_lines(shared)
     if shared_sha == "" {

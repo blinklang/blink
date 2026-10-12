@@ -1,0 +1,61 @@
+// An object built at the default level or with --release records no path, so its key holds
+// none, and a build keys it as builds did before debug keys held the paths their objects
+// record: the cache on a user's disk and other trees with the same headers still serve it.
+// Each expected key below is what the keys made before paths were keyed. A debug key holds
+// the paths, so the same inputs with a path give another key.
+
+import build_objcache.{header_lines_in, unit_file_shas, unit_keys_with_headers, user_unit_key}
+
+let DIR = "build/obj_cache_keys_no_path_probe"
+
+fn fixture() {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}/units {DIR}/arc {DIR}/vendor")
+    write_file("{DIR}/arc/runtime.h", "/* runtime */\n#define BLINK_RT 1\n")
+    write_file("{DIR}/arc/libblink_std.h", "#include \"runtime.h\"\nint blink_std(void);\n")
+    write_file("{DIR}/vendor/dep.h", "int dep(void);\n")
+    write_file("{DIR}/units/__types.h", "typedef long blink_int;\n")
+    write_file("{DIR}/units/leaf.h", "const char* leaf_value(void);\n")
+    write_file("{DIR}/units/leaf.c", "#include \"leaf.h\"\nconst char* leaf_value(void) \{ return \"leaf\"; }\n")
+    write_file("{DIR}/units/__main__.c", "#include \"leaf.h\"\nint main(void) \{ return 0; }\n")
+    write_file("{DIR}/one.c", "int main(void) \{ return 0; }\n")
+}
+
+fn unit_keys(flags: List[Str], paths: List[Str]) -> Str ! IO {
+    let shas = unit_file_shas("{DIR}/units", "{DIR}/arc") ?? Map()
+    let mut heads: Map[Str, List[Str]] = Map()
+    heads.insert("leaf", ["__types.h", "leaf.h"])
+    heads.insert("__main__", ["__types.h", "leaf.h"])
+    let lines = header_lines_in(["{DIR}/vendor"]) ?? []
+    let keys = unit_keys_with_headers(shas, ["leaf", "__main__"], heads, "{DIR}/arc", lines, "compilersha", "cc (GCC) 15.2.1", flags, "", paths)
+    "leaf={keys.get("leaf") ?? "none"} __main__={keys.get("__main__") ?? "none"}"
+}
+
+fn one_unit_key(flags: List[Str], paths: List[Str]) -> Str ! IO {
+    user_unit_key("{DIR}/one.c", "build/one.c", "{DIR}/arc", ["{DIR}/vendor"], "compilersha", "cc (GCC) 15.2.1", flags, "", paths)
+}
+
+test "default and release unit keys are the keys made before paths were keyed" {
+    fixture()
+    let default_keys = unit_keys(["-O1", "-Werror=implicit-function-declaration"], [])
+    let release_keys = unit_keys(["-O2", "-Werror=implicit-function-declaration"], [])
+    let debug_flags = ["-g", "-O0", "-DBLINK_DEBUG", "-Werror=implicit-function-declaration"]
+    let debug_no_path = unit_keys(debug_flags, [])
+    let debug_keys = unit_keys(debug_flags, ["comp_dir:/w", "c_dir:out/app.units", "arc_dir:/a/build"])
+    shell_exec("rm -rf {DIR}")
+    assert_eq(default_keys, "leaf=6a55a45035bb28ba __main__=9c7e84db9e2da69c")
+    assert_eq(release_keys, "leaf=44f7630bf5e42a80 __main__=b8fd16c92f2025d3")
+    assert(debug_keys != debug_no_path, "a debug key with paths is the key without them")
+}
+
+test "default and release one-unit keys are the keys made before paths were keyed" {
+    fixture()
+    let default_key = one_unit_key(["-O1"], [])
+    let release_key = one_unit_key(["-O2"], [])
+    let debug_flags = ["-g", "-O0", "-DBLINK_DEBUG"]
+    let debug_no_path = one_unit_key(debug_flags, [])
+    let debug_key = one_unit_key(debug_flags, ["comp_dir:/w", "c_dir:out", "arc_dir:/a/build"])
+    shell_exec("rm -rf {DIR}")
+    assert_eq(default_key, "f587b6ae72031040")
+    assert_eq(release_key, "f6430640f87f0861")
+    assert(debug_key != debug_no_path, "a debug key with paths is the key without them")
+}

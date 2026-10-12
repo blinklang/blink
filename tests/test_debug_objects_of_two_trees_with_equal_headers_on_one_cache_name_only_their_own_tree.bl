@@ -1,0 +1,308 @@
+// A debug object records the paths of the tree it was compiled in: the compile dir, the
+// units dir and the archive dir. Two trees whose headers are byte-equal, on one object cache,
+// must each compile their own debug objects, so a debugger in either tree finds its own
+// sources. At the default level an object records no path, so the second tree takes the
+// first tree's objects and compiles none.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs cc_path.
+fn dev_tree(root: Str, tree: Str, cc_path: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/bin/cc", "#!/bin/sh\nexec {cc_path} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"dbg_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + 1\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with the shared object cache, the tree's cc and the unit trace. The
+// corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so
+// the run drops them.
+fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn compiles(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+// How many of the cache's objects have debug info that names text. readelf reads the debug
+// sections gcc compresses, where grep -a finds nothing.
+fn objects_naming(cache: Str, text: Str) -> Int {
+    sh("for o in {cache}/*.o; do readelf --debug-dump=info,line \"$o\" 2>/dev/null | grep -q -F '{text}' && echo \"$o\"; done | wc -l").to_int()
+}
+
+// How many of the cache's objects have debug info that names both texts.
+fn objects_naming_both(cache: Str, first: Str, second: Str) -> Int {
+    sh("for o in {cache}/*.o; do d=$(readelf --debug-dump=info,line \"$o\" 2>/dev/null); echo \"$d\" | grep -q -F '{first}' && echo \"$d\" | grep -q -F '{second}' && echo \"$o\"; done | wc -l").to_int()
+}
+
+// How many of the cache's objects hold text in their bytes once the debug sections gcc
+// compresses are decompressed.
+fn objects_holding(cache: Str, text: Str) -> Int {
+    sh("for o in {cache}/*.o; do objcopy --decompress-debug-sections \"$o\" {cache}/plain.tmp && grep -q -a -F '{text}' {cache}/plain.tmp && echo \"$o\"; rm -f {cache}/plain.tmp; done | wc -l").to_int()
+}
+
+// How many of the cache's objects record dir as their compile dir.
+fn objects_compiled_in(cache: Str, dir: Str) -> Int {
+    sh("for o in {cache}/*.o; do readelf --debug-dump=info \"$o\" 2>/dev/null | sed -n 's/.*DW_AT_comp_dir.*: //p' | head -1 | grep -q -x -F '{dir}' && echo \"$o\"; done | wc -l").to_int()
+}
+
+fn object_count(cache: Str) -> Int {
+    sh("ls {cache}/*.o 2>/dev/null | wc -l").to_int()
+}
+
+// How many times the debug info of the binary at path names text.
+fn binary_names(path: Str, text: Str) -> Int {
+    sh("readelf --debug-dump=info,line {path} 2>/dev/null | grep -c -F '{text}'").to_int()
+}
+
+// The two trees, under cc: per-module and one-unit debug builds, then default builds.
+fn check_two_trees(cc_name: Str) {
+    let cc_path = sh("command -v {cc_name}")
+    if cc_path == "" {
+        io.println("skip {cc_name}: no {cc_name} on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tag = "_dbg_two_trees_{cc_name}_{getpid()}"
+    let cache = "{root}/.tmp/{tag}_cache"
+    let tree_a = "{root}/.tmp/{tag}_a"
+    let tree_b = "{root}/.tmp/{tag}_b"
+    shell_exec("rm -rf {cache}")
+    dev_tree(root, tree_a, cc_path)
+    dev_tree(root, tree_b, cc_path)
+    let same_headers = sh("cmp {tree_a}/build/libblink_std.h {tree_b}/build/libblink_std.h && cmp {tree_a}/build/runtime.h {tree_b}/build/runtime.h && echo same")
+
+    let ra = blink_in(tree_a, cache, "build app/src/main.bl -o out/app --per-module --debug")
+    assert(ra.exit_code == 0, "build failed: {ra.out}{ra.err_out}")
+    let rb = blink_in(tree_b, cache, "build app/src/main.bl -o out/app --per-module --debug")
+    assert(rb.exit_code == 0, "build failed: {rb.out}{rb.err_out}")
+    let debug_objects = object_count(cache)
+    let objects_a = objects_naming(cache, "{tag}_a")
+    let objects_b = objects_naming(cache, "{tag}_b")
+    let objects_both = objects_naming_both(cache, "{tag}_a", "{tag}_b")
+    let objects_both_a = objects_naming_both(cache, "{tag}_a", "{tag}_a")
+    let a_bin_names_a = binary_names("{tree_a}/out/app", "{tag}_a")
+    let a_bin_names_b = binary_names("{tree_a}/out/app", "{tag}_b")
+    let b_bin_names_a = binary_names("{tree_b}/out/app", "{tag}_a")
+    let b_bin_names_b = binary_names("{tree_b}/out/app", "{tag}_b")
+
+    // The one-unit build keys its object on its own.
+    shell_exec("rm -rf {cache}")
+    let oa = blink_in(tree_a, cache, "build app/src/main.bl -o out/one --no-per-module --debug")
+    assert(oa.exit_code == 0, "build failed: {oa.out}{oa.err_out}")
+    let ob = blink_in(tree_b, cache, "build app/src/main.bl -o out/one --no-per-module --debug")
+    assert(ob.exit_code == 0, "build failed: {ob.out}{ob.err_out}")
+    let one_unit_objects = object_count(cache)
+    let one_a_names_a = binary_names("{tree_a}/out/one", "{tag}_a")
+    let one_b_names_a = binary_names("{tree_b}/out/one", "{tag}_a")
+    let one_b_names_b = binary_names("{tree_b}/out/one", "{tag}_b")
+
+    shell_exec("rm -rf {cache}")
+    let da = blink_in(tree_a, cache, "build app/src/main.bl -o out/app --per-module")
+    assert(da.exit_code == 0, "build failed: {da.out}{da.err_out}")
+    let db = blink_in(tree_b, cache, "build app/src/main.bl -o out/app --per-module")
+    assert(db.exit_code == 0, "build failed: {db.out}{db.err_out}")
+    let default_objects = object_count(cache)
+    let default_naming = objects_holding(cache, tag)
+    let default_naming_source = objects_holding(cache, "app/src/main.bl")
+    let db_run = sh("{tree_b}/out/app")
+    shell_exec("rm -rf {tree_a} {tree_b} {cache}")
+
+    assert_eq(same_headers, "same")
+    assert_eq(compiles(ra), 2)
+    assert_eq(compiles(rb), 2)
+    assert_eq(debug_objects, 4)
+    assert_eq(objects_a, 2)
+    assert_eq(objects_b, 2)
+    assert_eq(objects_both, 0)
+    // With tree A as both texts, the count of both is the count of objects that name A.
+    assert_eq(objects_both_a, objects_a)
+    assert(a_bin_names_a >= 1, "the debug info of tree A's binary does not name tree A")
+    assert_eq(a_bin_names_b, 0)
+    assert_eq(b_bin_names_a, 0)
+    assert(b_bin_names_b >= 1, "the debug info of tree B's binary does not name tree B")
+    assert_eq(one_unit_objects, 2)
+    assert(one_a_names_a >= 1, "the debug info of tree A's one-unit binary does not name tree A")
+    assert_eq(one_b_names_a, 0)
+    assert(one_b_names_b >= 1, "the debug info of tree B's one-unit binary does not name tree B")
+    assert_eq(compiles(da), 2)
+    assert_eq(compiles(db), 0)
+    assert_eq(default_objects, 2)
+    assert_eq(default_naming, 0)
+    // The overflow panic of main names its source, so the search above reads the strings.
+    assert_eq(default_naming_source, 1)
+    assert_eq(db_run, "sum 42")
+}
+
+// The daemon serves only a client whose env is its own, so it starts under the env the
+// client builds with.
+fn env_of(tree: Str, cache: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units"
+}
+
+// The pid of the daemon serving app/src/main.bl in tree, started in {tree}/app, or -1. The
+// timeout ends a daemon that nothing stopped.
+fn start_daemon(tree: Str, cache: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree, cache)} timeout 300 {tree}/build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A debug build sent to the daemon from dir, which cd enters by the path given, so PWD names
+// dir even where dir is a link. Each build of a tree writes the same output, so the client's
+// dir is the one input its builds differ in.
+fn daemon_build(tree: Str, cache: Str, dir: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {dir} && {env_of(tree, cache)} {tree}/build/blink build {tree}/app/src/main.bl -o {tree}/out/app --per-module --debug"])
+}
+
+// The builds the daemon of tree served, or -1.
+fn served_builds(tree: Str, cache: Str) -> Int {
+    let out = process_run("sh", ["-c", "cd {tree}/app && {env_of(tree, cache)} {tree}/build/blink daemon status"]).out
+    let key = "\"builds\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            n.to_int()
+        }
+        None => -1
+    }
+}
+
+type DaemonTree {
+    pid: Int
+    from_src: ProcessResult
+    from_link: ProcessResult
+    builds: Int
+}
+
+// Two debug builds of tree through its own daemon, which runs in {tree}/app: one from
+// {tree}/app/src and one from {tree}/link, a link to it.
+fn daemon_tree(tree: Str, cache: Str) -> DaemonTree {
+    shell_exec("ln -s {tree}/app/src {tree}/link")
+    let pid = start_daemon(tree, cache)
+    let none = ProcessResult { out: "", err_out: "", exit_code: -1 }
+    let mut t = DaemonTree { pid: pid, from_src: none, from_link: none, builds: -1 }
+    with cleanup(fn() { stop_daemon(pid) }) {
+        if pid > 0 {
+            let s = daemon_build(tree, cache, "{tree}/app/src")
+            let l = daemon_build(tree, cache, "{tree}/link")
+            t = DaemonTree { pid: pid, from_src: s, from_link: l, builds: served_builds(tree, cache) }
+        }
+    }
+    t
+}
+
+// Two trees, each with a daemon, on one cache: each debug object names only the tree of the
+// client that asked for it, and records the client's dir as its compile dir, never the
+// daemon's.
+fn check_two_trees_through_daemons(cc_name: Str) {
+    let cc_path = sh("command -v {cc_name}")
+    if cc_path == "" {
+        io.println("skip {cc_name}: no {cc_name} on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tag = "_dbg_daemon_trees_{cc_name}_{getpid()}"
+    let cache = "{root}/.tmp/{tag}_cache"
+    let tree_a = "{root}/.tmp/{tag}_a"
+    let tree_b = "{root}/.tmp/{tag}_b"
+    shell_exec("rm -rf {cache}")
+    dev_tree(root, tree_a, cc_path)
+    dev_tree(root, tree_b, cc_path)
+    let a = daemon_tree(tree_a, cache)
+    let a_log = read_file("{tree_a}/daemon.log")
+    let b = daemon_tree(tree_b, cache)
+    let b_log = read_file("{tree_b}/daemon.log")
+    let objects = object_count(cache)
+    let objects_a = objects_naming(cache, "{tag}_a")
+    let objects_b = objects_naming(cache, "{tag}_b")
+    let objects_both = objects_naming_both(cache, "{tag}_a", "{tag}_b")
+    let objects_both_a = objects_naming_both(cache, "{tag}_a", "{tag}_a")
+    let a_src = objects_compiled_in(cache, "{tree_a}/app/src")
+    let a_link = objects_compiled_in(cache, "{tree_a}/link")
+    let b_src = objects_compiled_in(cache, "{tree_b}/app/src")
+    let b_link = objects_compiled_in(cache, "{tree_b}/link")
+    let in_daemon_dir = objects_compiled_in(cache, "{tree_a}/app") + objects_compiled_in(cache, "{tree_b}/app")
+    let b_runs = sh("{tree_b}/out/app")
+    shell_exec("rm -rf {tree_a} {tree_b} {cache}")
+
+    assert(a.pid > 0, "the daemon of tree A did not start: {a_log}")
+    assert(b.pid > 0, "the daemon of tree B did not start: {b_log}")
+    assert(a.from_src.exit_code == 0, "build failed: {a.from_src.out}{a.from_src.err_out}")
+    assert(a.from_link.exit_code == 0, "build failed: {a.from_link.out}{a.from_link.err_out}")
+    assert(b.from_src.exit_code == 0, "build failed: {b.from_src.out}{b.from_src.err_out}")
+    assert(b.from_link.exit_code == 0, "build failed: {b.from_link.out}{b.from_link.err_out}")
+    assert_eq(a.builds, 2)
+    assert_eq(b.builds, 2)
+    assert_eq(compiles(a.from_src), 2)
+    assert_eq(compiles(a.from_link), 2)
+    assert_eq(compiles(b.from_src), 2)
+    assert_eq(compiles(b.from_link), 2)
+    assert_eq(objects, 8)
+    assert_eq(objects_a, 4)
+    assert_eq(objects_b, 4)
+    assert_eq(objects_both, 0)
+    // With tree A as both texts, the count of both is the count of objects that name A.
+    assert_eq(objects_both_a, objects_a)
+    assert_eq(a_src, 2)
+    assert_eq(a_link, 2)
+    assert_eq(b_src, 2)
+    assert_eq(b_link, 2)
+    assert_eq(in_daemon_dir, 0)
+    assert_eq(b_runs, "sum 42")
+}
+
+test "gcc debug objects of two trees with equal headers on one cache name only their own tree" {
+    check_two_trees("gcc")
+}
+
+test "clang debug objects of two trees with equal headers on one cache name only their own tree" {
+    check_two_trees("clang")
+}
+
+test "gcc debug objects built through each tree's daemon name only the client's tree and dir" {
+    check_two_trees_through_daemons("gcc")
+}
+
+test "clang debug objects built through each tree's daemon name only the client's tree and dir" {
+    check_two_trees_through_daemons("clang")
+}

@@ -1,0 +1,116 @@
+// A debug object's debug info names the archive dir, the compile dir and the units dir, so
+// its key must hold each. Two debug builds that differ in only one of them must not share an
+// object: each compiles its own, and its debug info names its own path and not the other's.
+// gcc takes the compile dir from $PWD when that names the cwd, so a cwd reached through a
+// link is a path of its own.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// An archive dir with a blink in it, as a dev tree's build/ holds them.
+fn archive_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+}
+
+// A dir to build in, with a program of two modules.
+fn work_dir(dir: Str) {
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}/app/src")
+    write_file("{dir}/app/blink.toml", "[package]\nname = \"dbg_app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    write_file("{dir}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + 1\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// A debug build of the program in dir, by the blink of tree, with the shared object cache and
+// the unit trace. `cd` sets PWD to dir as given, as a shell does. The corpus exports
+// BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the run drops
+// them.
+fn build_in(dir: Str, tree: Str, cache: Str, bin: Str, out: Str) -> ProcessResult {
+    let r = process_run("sh", ["-c", "cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={bin}:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units {tree}/build/blink build app/src/main.bl -o {out} --per-module --debug"])
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    r
+}
+
+fn compiles(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+// How many of the cache's objects have debug info that names text. readelf reads the debug
+// sections gcc compresses, where grep -a finds nothing.
+fn objects_naming(cache: Str, text: Str) -> Int {
+    sh("for o in {cache}/*.o; do readelf --debug-dump=info,line \"$o\" 2>/dev/null | grep -q -F '{text}' && echo \"$o\"; done | wc -l").to_int()
+}
+
+// The second of two debug builds that differ in one path: how many units it compiled, how many
+// objects name the first build's path, and how many name its own.
+type Pair { second_compiles: Int, naming_first: Int, naming_second: Int }
+
+// Each build is (the dir it runs in, the tree whose blink runs it, its -o).
+fn pair(cache: Str, bin: Str, first: (Str, Str, Str), second: (Str, Str, Str), first_text: Str, second_text: Str) -> Pair {
+    shell_exec("rm -rf {cache}")
+    let (dir1, tree1, out1) = first
+    let (dir2, tree2, out2) = second
+    let _ = build_in(dir1, tree1, cache, bin, out1)
+    let r = build_in(dir2, tree2, cache, bin, out2)
+    Pair { second_compiles: compiles(r), naming_first: objects_naming(cache, first_text), naming_second: objects_naming(cache, second_text) }
+}
+
+test "a debug object key holds the archive dir, the compile dir and the units dir" {
+    let gcc = sh("command -v gcc")
+    if gcc == "" {
+        io.println("skip: no gcc on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tag = "_dbg_key_paths_{getpid()}"
+    let base = "{root}/.tmp/{tag}"
+    let cache = "{base}/cache"
+    let tree_a = "{base}/arc_one"
+    let tree_b = "{base}/arc_two"
+    let w1 = "{base}/work_one"
+    let w2 = "{base}/work_two"
+    let bin = "{base}/bin"
+    archive_tree(root, tree_a)
+    archive_tree(root, tree_b)
+    work_dir(w1)
+    work_dir(w2)
+    shell_exec("mkdir -p {bin} && ln -sfn {w1} {base}/work_link")
+    write_file("{bin}/cc", "#!/bin/sh\nexec {gcc} \"$@\"\n")
+    shell_exec("chmod +x {bin}/cc")
+
+    let arc = pair(cache, bin, (w1, tree_a, "out/app"), (w1, tree_b, "out/app"), "arc_one/build", "arc_two/build")
+    let comp = pair(cache, bin, (w1, tree_a, "out/app"), (w2, tree_a, "out/app"), "work_one", "work_two")
+    let units = pair(cache, bin, (w1, tree_a, "out/app"), (w1, tree_a, "out/other"), "out/app.units", "out/other.units")
+    let link = pair(cache, bin, (w1, tree_a, "out/app"), ("{base}/work_link", tree_a, "out/app"), w1, "{base}/work_link")
+    shell_exec("rm -rf {base}")
+
+    assert_eq(arc.second_compiles, 2)
+    assert_eq(arc.naming_first, 2)
+    assert_eq(arc.naming_second, 2)
+    assert_eq(comp.second_compiles, 2)
+    assert_eq(comp.naming_first, 2)
+    assert_eq(comp.naming_second, 2)
+    assert_eq(units.second_compiles, 2)
+    assert_eq(units.naming_first, 2)
+    assert_eq(units.naming_second, 2)
+    assert_eq(link.second_compiles, 2)
+    assert_eq(link.naming_first, 2)
+    assert_eq(link.naming_second, 2)
+}
