@@ -1,0 +1,114 @@
+// gcc and clang each keep a PCH of the archive header in the obj cache, and neither can read
+// the other's. Builds of one program with one cache that switch cc between gcc and clang
+// must each read only a PCH their own compiler built, under a key of its own.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs gcc or clang as
+// BLINK_TEST_CC says. Each compile writes its arguments and its -H output to a file of its
+// own: gcc names a .gch it read ("! <path>.gch"), and clang lists no archive header when it
+// read its PCH.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/bin/cc", "#!/bin/sh\nreal=$(command -v $BLINK_TEST_CC)\ncase \" $* \" in *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec $real \"$@\" -H 2>>\"$f\" ;; esac\nexec $real \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Edits the entry module and builds with cc as the compiler named, answering what the build
+// printed. The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the
+// build one unit, so the run drops them.
+fn build_with(tree: Str, cc: Str, n: Int) -> Str {
+    edit_main(tree, n)
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_TEST_CC={cc} BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+    assert(r.exit_code == 0, "{cc} build failed: {r.out}{r.err_out}")
+    assert_eq(sh("{tree}/out/app"), "sum {41 + n}")
+    "{r.out}{r.err_out}"
+}
+
+// The compiles of the last build that read a clang PCH held under the cache's tmp/.
+fn clang_reads(tree: Str) -> Int {
+    sh("grep -l '^ARGS .* -include-pch {tree}/objcache/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.pch' {tree}/cc_h/* | xargs -r grep -L -e 'libblink_std\\.h$' -e 'error:' | wc -l").to_int()
+}
+
+// The compiles of the last build that read a gcc PCH held under the cache's tmp/.
+fn gcc_reads(tree: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! {tree}/objcache/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.gch$'").to_int()
+}
+
+// The compiles of the last build that named a clang PCH on their command line.
+fn include_pch_args(tree: Str) -> Int {
+    sh("grep -l -e '-include-pch' {tree}/cc_h/* | wc -l").to_int()
+}
+
+// The compiles of the last build that took any .gch, gcc's or another's.
+fn gch_taken(tree: Str) -> Int {
+    sh("cat {tree}/cc_h/* | grep -c '^! .*\\.gch$'").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+test "gcc and clang builds on one cache each read only their own archive header PCH" {
+    if sh("command -v clang") == "" || sh("command -v gcc") == "" {
+        io.println("skip: needs both gcc and clang on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_pch_gcc_clang_{getpid()}"
+    dev_tree(root, tree)
+    let _ = build_with(tree, "gcc", 1)
+    let _ = build_with(tree, "gcc", 2)
+    let _ = build_with(tree, "gcc", 3)
+    let gcc_warm = gcc_reads(tree)
+    let gcc_dirs = pch_dirs(tree).len()
+    // The first clang build finds the gcc PCH under no key of its own, so it makes one.
+    let clang_first = build_with(tree, "clang", 4)
+    let clang_first_args = include_pch_args(tree)
+    let clang_first_gch = gch_taken(tree)
+    let clang_out = build_with(tree, "clang", 5)
+    let clang_warm = clang_reads(tree)
+    let clang_gch = gch_taken(tree)
+    let both_dirs = pch_dirs(tree)
+    let mut dir_files: List[Str] = []
+    for d in both_dirs {
+        dir_files.push(sh("ls {tree}/objcache/{d} | tr '\\n' ' '"))
+    }
+    let gcc_again_out = build_with(tree, "gcc", 6)
+    let gcc_again = gcc_reads(tree)
+    let gcc_again_args = include_pch_args(tree)
+    shell_exec("rm -rf {tree}")
+    assert(gcc_warm >= 1, "the warm gcc build read no PCH, so the rest proves nothing")
+    assert_eq(gcc_dirs, 1)
+    assert(clang_first.contains("pch build"), "the first clang edit built no PCH: {clang_first}")
+    assert_eq(clang_first_args, 0)
+    assert_eq(clang_first_gch, 0)
+    assert(clang_warm >= 1, "the warm clang build read no PCH of its own: {clang_out}")
+    assert_eq(clang_gch, 0)
+    assert(both_dirs.len() == 2, "gcc and clang left {both_dirs.len()} PCH dirs: {dir_files.join(", ")}")
+    assert(dir_files.contains("libblink_std.h.pch"), "no dir holds a clang PCH: {dir_files.join(", ")}")
+    assert(gcc_again >= 1, "gcc read no PCH after the clang builds: {gcc_again_out}")
+    assert_eq(gcc_again_args, 0)
+}

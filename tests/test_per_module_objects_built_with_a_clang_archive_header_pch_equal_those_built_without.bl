@@ -1,0 +1,116 @@
+// clang reads a PCH of the archive header only through -include-pch, and records in it the
+// path of each header it was built from. Each object a unit compiles with it must be the
+// bytes it compiles to without it, at the default level, at -O2 and in a debug build, whose
+// debug info must name the archive dir, not the dir the build holds the PCH in.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs clang. Each
+// compile writes its arguments and its -H output to a file of its own, so a unit that read
+// the PCH shows -include-pch and no line for the archive header.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let clang = sh("command -v clang")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    // A program's first build makes no PCH, so the tree starts with one build behind it.
+    edit_main(tree, 0)
+    let r = blink_in(tree, "", "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    edit_main(tree, 1)
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with its own object cache, the clang cc and the unit trace, and the
+// variables in envs ("NAME=value ...") set. The corpus exports BLINK_COMPILER_ARCHIVE and
+// module filters, which make the build one unit, so the run drops them.
+fn blink_in(tree: Str, envs: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {envs} build/blink {args}"])
+}
+
+// The compiles of the last build that read a PCH the build held under the cache's tmp/:
+// clang took it and so lists no archive header among the files it opened.
+fn pch_reads(tree: Str) -> Int {
+    sh("grep -l '^ARGS .* -include-pch {tree}/objcache/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.pch' {tree}/cc_h/* | xargs -r grep -L -e 'libblink_std\\.h$' -e 'error:' | wc -l").to_int()
+}
+
+// The compiles of the last build that named any PCH.
+fn pch_named(tree: Str) -> Int {
+    sh("grep -l -e '-include-pch' -e '\\.gch' {tree}/cc_h/* | wc -l").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+// The objects in the cache after a build with no cached object, by key, as "<sha>  <key>.o"
+// lines, how many units read the PCH, and how many named one.
+fn objects_built(tree: Str, envs: Str, flags: Str, n: Int) -> (Str, Int, Int) {
+    shell_exec("rm -f {tree}/objcache/*.o {tree}/objcache/*.meta")
+    edit_main(tree, n)
+    let r = blink_in(tree, envs, "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    (sh("cd {tree}/objcache && sha256sum *.o"), pch_reads(tree), pch_named(tree))
+}
+
+fn binary_sha(tree: Str) -> Str {
+    sh("sha256sum < {tree}/out/app")
+}
+
+fn with_and_without(root: Str, flags: Str, label: Str) {
+    let tree = "{root}/.tmp/_clang_pch_equal_{label}_{getpid()}"
+    dev_tree(root, tree)
+    // Leaves the PCH in the cache for the next build.
+    let r = blink_in(tree, "", "build app/src/main.bl -o {tree}/out/app --per-module {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    let (pch_objs, pch_reads_n, _) = objects_built(tree, "", flags, 2)
+    let pch_bin = binary_sha(tree)
+    let dirs = pch_dirs(tree)
+    // The debug info of an object built with the PCH names the archive header where a plain
+    // compile would, and no dir of the cache.
+    let pch_names_cache = sh("grep -c -a 'objcache' {tree}/objcache/*.o | grep -v ':0$' | wc -l").to_int()
+    // With the PCH off, no unit names a PCH, so its objects are those of a build that never
+    // had one.
+    let (off_objs, _, off_named) = objects_built(tree, "BLINK_ARCHIVE_PCH=0", flags, 2)
+    let off_bin = binary_sha(tree)
+    shell_exec("rm -rf {tree}")
+    assert(dirs.len() == 1, "{label}: the builds made {dirs.len()} PCH dirs")
+    assert(pch_reads_n >= 2, "{label}: {pch_reads_n} units read the PCH")
+    assert_eq(pch_names_cache, 0)
+    assert(pch_objs.split("\n").len() >= 2, "{label}: objects {pch_objs}")
+    assert_eq(off_named, 0)
+    assert_eq(pch_objs, off_objs)
+    assert_eq(pch_bin, off_bin)
+}
+
+test "objects built with a clang archive header PCH equal those built without it" {
+    if sh("command -v clang") == "" {
+        io.println("skip: no clang on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    with_and_without(root, "", "default")
+    with_and_without(root, "--release", "release")
+    with_and_without(root, "--debug", "debug")
+}

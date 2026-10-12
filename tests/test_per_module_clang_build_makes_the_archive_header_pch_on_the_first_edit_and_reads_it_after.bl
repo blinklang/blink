@@ -1,0 +1,109 @@
+// With clang as cc, a program's first build makes no PCH of the archive header, the first
+// edit after it makes one, and each edit after that reads it through -include-pch. clang
+// records the headers it built the PCH from; a header with the same bytes and a new mtime,
+// as a reinstall of the archive leaves, must not stop a unit from reading it.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs clang. Each
+// compile writes its arguments and its -H output to a file of its own, so a unit that read
+// the PCH shows -include-pch and no line for the archive header.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let clang = sh("command -v clang")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with its own object cache, the clang cc and the unit trace. The
+// corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit,
+// so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// Edits the entry module and builds, answering what the build printed.
+fn edit_and_build(tree: Str, n: Int) -> Str {
+    edit_main(tree, n)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    "{r.out}{r.err_out}"
+}
+
+// The compiles of the last build that read a PCH the build held under the cache's tmp/:
+// clang took it and so lists no archive header among the files it opened.
+fn pch_reads(tree: Str) -> Int {
+    sh("grep -l '^ARGS .* -include-pch {tree}/objcache/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.pch' {tree}/cc_h/* | xargs -r grep -L -e 'libblink_std\\.h$' -e 'error:' | wc -l").to_int()
+}
+
+// The compiles of the last build that named any PCH.
+fn pch_named(tree: Str) -> Int {
+    sh("grep -l -e '-include-pch' -e '\\.gch' {tree}/cc_h/* | wc -l").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+test "a clang build makes the archive header PCH on the first edit and reads it after" {
+    if sh("command -v clang") == "" {
+        io.println("skip: no clang on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_clang_pch_edit_{getpid()}"
+    dev_tree(root, tree)
+    let first_out = edit_and_build(tree, 1)
+    let first_dirs = pch_dirs(tree).len()
+    let first_named = pch_named(tree)
+    let second_out = edit_and_build(tree, 2)
+    let dirs = pch_dirs(tree)
+    let second_reads = pch_reads(tree)
+    let third_out = edit_and_build(tree, 3)
+    let third_reads = pch_reads(tree)
+    let third = sh("{tree}/out/app")
+    let pch_files = if dirs.len() == 1 { sh("ls {tree}/objcache/{dirs.get(0).unwrap()}") } else { "" }
+    // The same bytes with a later mtime.
+    shell_exec("touch -d '+1 hour' {tree}/build/runtime.h {tree}/build/libblink_std.h")
+    let touched_out = edit_and_build(tree, 4)
+    let touched_reads = pch_reads(tree)
+    let touched = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(first_dirs, 0)
+    assert_eq(first_named, 0)
+    assert(!first_out.contains("pch build"), "the first build built a PCH: {first_out}")
+    assert(second_out.contains("pch build"), "the first edit built no PCH: {second_out}")
+    assert(dirs.len() == 1, "the builds made {dirs.len()} PCH dirs")
+    // The units of the first edit start before its PCH is in place.
+    assert_eq(second_reads, 0)
+    // Only the PCH: clang reads the headers it was built from in the archive dir.
+    assert_eq(pch_files, "libblink_std.h.pch")
+    assert(third_reads >= 1, "the second edit read no PCH: {third_out}")
+    assert(third_out.contains("pch use __main__"), "no pch use trace: {third_out}")
+    assert_eq(third, "sum 44")
+    assert(touched_reads >= 1, "a header with a new mtime stopped the PCH: {touched_out}")
+    assert(!touched_out.contains("pch fallback"), "a header with a new mtime made a unit fall back: {touched_out}")
+    assert_eq(touched, "sum 45")
+}
