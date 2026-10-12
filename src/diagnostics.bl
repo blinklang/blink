@@ -409,11 +409,22 @@ pub let mut diag_source_file: Str = ""
 pub let mut diag_count: Int = 0
 pub let mut diag_warn_count: Int = 0
 pub let mut diag_ice_count: Int = 0
-// How many internal errors were RENDERED, which is what the summary line reports. It
-// differs from diag_ice_count whenever one fault is reported more than once: the count a
-// caller reads to decide whether a result is usable must move on every report, and a
-// reader must still be shown the fault once.
-let mut diag_ice_rendered: Int = 0
+type DiagIceState {
+    // How many internal errors were RENDERED, which is what the summary line reports. It
+    // differs from diag_ice_count whenever one fault is reported more than once: the count a
+    // caller reads to decide whether a result is usable must move on every report, and a
+    // reader must still be shown the fault once.
+    rendered: Int
+    // The line a command prints on stdout when diag_ice_abort stops the compiler, or "".
+    abort_status_line: Str
+}
+let mut diag_ice_state: DiagIceState = DiagIceState { rendered: 0, abort_status_line: "" }
+
+// `blink check` sets its status line here, so a check --json that stops on an internal error
+// still ends with one.
+pub fn diag_set_abort_status_line(line: Str) {
+    diag_ice_state.abort_status_line = line
+}
 pub let mut diag_module_files: Map[Str, Str] = Map()
 
 pub fn diag_register_file_range(start: Int, end: Int, path: Str) {
@@ -604,7 +615,7 @@ pub fn diag_truncate(n: Int) {
             diag_warn_count = diag_warn_count - 1
         } else if d.severity == "ice" {
             diag_ice_count = diag_ice_count - 1
-            diag_ice_rendered = diag_ice_rendered - 1
+            diag_ice_state.rendered = diag_ice_state.rendered - 1
         }
     }
 }
@@ -705,6 +716,21 @@ pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: S
     diag_emit("ice", name, code, message, line, col, help)
 }
 
+const ICE_REPORT_NOTE = "This is a compiler bug. Please report it at https://github.com/blinklang/blink/issues"
+
+// An internal error for a stage whose own state can not hold what comes next, so it can not
+// record the fault and go on as diag_ice does. It prints what was reported so far, then the
+// fault, and exits 101 as any internal error does.
+pub fn diag_ice_abort(message: Str) {
+    io.eprint(diag_render(diag_format))
+    io.eprintln("internal compiler error: {message}")
+    io.eprintln("  note: {ICE_REPORT_NOTE}")
+    if diag_ice_state.abort_status_line != "" {
+        io.println(diag_ice_state.abort_status_line)
+    }
+    exit(101)
+}
+
 // An internal error is raised when a stage's own invariants have already failed, so the
 // node id it carries comes out of that same broken state and is the one argument least
 // able to be trusted. Reading a span from an id the pool cannot index ends the process
@@ -770,11 +796,11 @@ fn diag_emit_range_notes(severity: Str, name: Str, code: Str, message: Str, line
     } else if effective_severity == "warning" {
         diag_warn_count = diag_warn_count + 1
     } else if effective_severity == "ice" {
-        diag_ice_rendered = diag_ice_rendered + 1
+        diag_ice_state.rendered = diag_ice_state.rendered + 1
     }
 }
 
-pub fn diag_ice_rendered_count() -> Int { diag_ice_rendered }
+pub fn diag_ice_rendered_count() -> Int { diag_ice_state.rendered }
 
 // ── JSON string escaping ─────────────────────────────────────────────
 
@@ -833,8 +859,8 @@ pub fn diag_render(format: Int) -> Str {
         // The summary counts what was printed, not what was reported: a repeat is dropped
         // from the listing above, so counting reports here would name a number the reader
         // can not find.
-        if diag_ice_rendered > 0 {
-            sb.write("{diag_ice_rendered} internal compiler error(s)\n")
+        if diag_ice_state.rendered > 0 {
+            sb.write("{diag_ice_state.rendered} internal compiler error(s)\n")
         }
         if diag_count > 0 {
             sb.write("{diag_count} error(s) found\n")
@@ -965,7 +991,7 @@ fn diag_human_text(idx: Int) -> Str {
         if d.help != "" {
             sb.write(diag_help_text(d.help))
         }
-        sb.write("  note: This is a compiler bug. Please report it at https://github.com/blinklang/blink/issues\n")
+        sb.write("  note: {ICE_REPORT_NOTE}\n")
     } else if d.help != "" {
         sb.write(diag_help_text(d.help))
     }
@@ -982,7 +1008,8 @@ pub fn diag_reset() {
     diag_count = 0
     diag_warn_count = 0
     diag_ice_count = 0
-    diag_ice_rendered = 0
+    // The abort line belongs to the command, which sets it before the compile that resets here.
+    diag_ice_state = DiagIceState { rendered: 0, abort_status_line: diag_ice_state.abort_status_line }
     diag_module_files.clear()
     file_ranges.clear()
     lint_overrides.clear()
