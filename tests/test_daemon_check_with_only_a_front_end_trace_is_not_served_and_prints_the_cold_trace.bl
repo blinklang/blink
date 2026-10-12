@@ -1,0 +1,69 @@
+// --blink-trace makes the front end print what it does, so the daemon's checked program, made
+// with no trace, can not answer a traced check. A check whose only difference from the daemon
+// is the trace is not served: the daemon's checks count does not move, and the client prints
+// the trace a cold check prints.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/daemon_check_trace_only"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn check(flags: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 60 $B check {flags} main.bl")
+}
+
+// The pid of a daemon serving main.bl, or -1. The timeout ends a daemon that nothing stopped.
+fn start_daemon() -> Int {
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && rm -rf .blink && (timeout 120 $B daemon start main.bl > daemon.log 2>&1 &); for i in $(seq 1 400); do if [ -S .blink/daemon.sock ]; then cat .blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f .blink/daemon.pid ] && kill $(cat .blink/daemon.pid); exit 1")
+    if r.exit_code != 0 { return -1 }
+    r.out.trim().to_int()
+}
+
+fn stop_daemon(pid: Int) {
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// The checks the daemon's workers served, from `daemon status`, or -1 when status names none.
+fn checks_served() -> Int {
+    let out = sh("B=$(pwd)/build/blink; cd {DIR} && $B daemon status").out
+    let key = "\"checks\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut end = 0
+            while end < rest.byte_len() && rest.byte_at(end) >= 48 && rest.byte_at(end) <= 57 {
+                end = end + 1
+            }
+            if end == 0 { return -1 }
+            rest.byte_slice(0, end).to_int()
+        }
+        None => -1
+    }
+}
+
+test "a check whose only front-end setting is a trace is not served and prints the cold trace" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"daemon_check_trace_only\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check here.
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{DIR}/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    let cold = check("--blink-trace parse")
+    // A trace that printed nothing could not tell a served check from a cold one.
+    assert(cold.err_out.contains("[trace:parse]"), "the cold check printed no trace: {cold.err_out}")
+
+    let pid = start_daemon()
+    assert(pid > 0, "the daemon did not start")
+    let before = checks_served()
+    let warm = check("--blink-trace parse")
+    let after = checks_served()
+    stop_daemon(pid)
+
+    assert(before >= 0, "the daemon status named no checks count")
+    assert_eq(warm.out, cold.out)
+    assert_eq(warm.err_out, cold.err_out)
+    assert_eq(warm.exit_code, cold.exit_code)
+    assert_eq(after, before)
+}
