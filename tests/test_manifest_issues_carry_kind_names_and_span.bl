@@ -1,0 +1,130 @@
+// manifest_load records each blink.toml issue with its kind, the names its message needs and the
+// span the spec names (§8.9.8): the value token for an invalid lint level, the [header] for an
+// unknown section. The compiler maps the kind to a code; this test reads the record only.
+
+import pkg.manifest.{manifest_load, manifest_print_warnings, manifest_issues, ManifestIssue, ManifestIssueKind}
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+let PACKAGE: Str = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n"
+
+fn load(toml: Str) -> Int {
+    manifest_print_warnings = false
+    let dir = sh("mktemp -d /tmp/blink_manifest_issues.XXXXXX").out.trim()
+    write_file("{dir}/blink.toml", toml)
+    let rc = manifest_load("{dir}/blink.toml")
+    let _ = sh("rm -rf {dir}")
+    rc
+}
+
+fn only_issue() -> ManifestIssue {
+    assert_eq(manifest_issues.len(), 1)
+    manifest_issues.get(0).unwrap()
+}
+
+fn assert_at(issue: ManifestIssue, line: Int, col: Int, end_col: Int) {
+    assert_eq(issue.line, line)
+    assert_eq(issue.col, col)
+    assert_eq(issue.end_col, end_col)
+}
+
+test "an unknown section after comments and blank lines points at its header" {
+    assert_eq(load("# top\n\n{PACKAGE}\n# deps\n\n[dependecies]\nlocal/utils = \{ path = \"../utils\" \}\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestSection)
+    assert_eq(issue.section, "dependecies")
+    assert_at(issue, 9, 1, 14)
+}
+
+test "an unknown section names the closest defined section" {
+    assert_eq(load("{PACKAGE}[dependecies]\nx = 1\n"), 0)
+    assert_eq(only_issue().suggestion, Some("dependencies"))
+    assert_eq(load("{PACKAGE}[lint]\nW0703 = \"off\"\n"), 0)
+    assert_eq(only_issue().suggestion, Some("lints"))
+}
+
+test "an unknown section far from every defined name has no suggestion" {
+    assert_eq(load("{PACKAGE}[tooling]\nx = 1\n"), 0)
+    let issue = only_issue()
+    assert_eq(issue.section, "tooling")
+    assert_eq(issue.suggestion, None)
+}
+
+test "an unknown section with no keys is still an issue" {
+    assert_eq(load("{PACKAGE}\n  [bogus]\n"), 0)
+    let issue = only_issue()
+    assert_eq(issue.section, "bogus")
+    assert_at(issue, 5, 3, 10)
+}
+
+test "an unknown section named by several headers is one issue, at the first header" {
+    assert_eq(load("{PACKAGE}[bogus]\nx = 1\n[bogus.sub]\ny = 2\n[[bogus]]\nz = 3\n"), 0)
+    let issue = only_issue()
+    assert_eq(issue.section, "bogus")
+    assert_at(issue, 4, 1, 8)
+}
+
+test "an unknown top-level key with no header points at the key" {
+    assert_eq(load("stray = 1\n{PACKAGE}"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestSection)
+    assert_eq(issue.section, "stray")
+    assert_at(issue, 1, 1, 6)
+}
+
+test "an invalid lint level on an indented key points at the value, quotes included" {
+    assert_eq(load("{PACKAGE}\n[lints]\n    W0703 = \"loud\"\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.InvalidLintLevel)
+    assert_eq(issue.section, "lints")
+    assert_eq(issue.key, "W0703")
+    assert_eq(issue.level, "loud")
+    assert_at(issue, 6, 13, 19)
+}
+
+test "a CRLF manifest gives the same lines and columns" {
+    assert_eq(load("{PACKAGE}\n[lints]\n    W0703 = \"loud\"\n\n[dependecies]\n".replace("\n", "\r\n")), 0)
+    assert_eq(manifest_issues.len(), 2)
+    let lint = manifest_issues.get(0).unwrap()
+    assert(lint.kind == ManifestIssueKind.InvalidLintLevel)
+    assert_at(lint, 6, 13, 19)
+    let section = manifest_issues.get(1).unwrap()
+    assert(section.kind == ManifestIssueKind.UnknownManifestSection)
+    assert_at(section, 8, 1, 14)
+}
+
+test "an invalid lint level is recorded once, and a second load does not add it again" {
+    let toml = "{PACKAGE}[lints]\nW0703 = \"loud\"\n"
+    assert_eq(load(toml), 0)
+    assert_eq(manifest_issues.len(), 1)
+    assert_eq(load(toml), 0)
+    assert_eq(manifest_issues.len(), 1)
+}
+
+test "a lint level that is not a string is one issue that names the token as written" {
+    assert_eq(load("{PACKAGE}[lints]\nW0703 = [\"a\"]\nW0704 = true\n"), 0)
+    assert_eq(manifest_issues.len(), 2)
+    let arr = manifest_issues.get(0).unwrap()
+    assert_eq(arr.key, "W0703")
+    assert_eq(arr.level, "[\"a\"]")
+    assert_at(arr, 5, 9, 14)
+    let b = manifest_issues.get(1).unwrap()
+    assert_eq(b.key, "W0704")
+    assert_eq(b.level, "true")
+}
+
+test "a valid manifest has no issue" {
+    assert_eq(load("# c\n{PACKAGE}\n[dependencies]\n\n[lints]\nW0703 = \"off\"\nW0704 = \"warn\"\nW0705 = \"error\"\n"), 0)
+    assert_eq(manifest_issues.len(), 0)
+}
+
+test "issues come in source order" {
+    assert_eq(load("{PACKAGE}[zeta]\n[lints]\nW0703 = \"loud\"\n[alpha]\n"), 0)
+    assert_eq(manifest_issues.len(), 3)
+    assert_eq(manifest_issues.get(0).unwrap().section, "zeta")
+    assert(manifest_issues.get(1).unwrap().kind == ManifestIssueKind.InvalidLintLevel)
+    assert_eq(manifest_issues.get(2).unwrap().section, "alpha")
+}
