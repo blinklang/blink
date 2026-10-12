@@ -1,6 +1,6 @@
 import ast.{NodeKind, trace, trace_mode}
 import lexer.{Lex, lex}
-import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of, parsed_interface_text}
+import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of, parsed_interface_text, parsed_interface_parts, interface_text_of, parser_interface_text_deferred}
 import typecheck.{clear_module_imports, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_get_symbol_module, tc_set_prelude_modules}
 import diagnostics.{
     Diag, diag_register_file_range, lint_set_override, diag_normalize_path,
@@ -1071,6 +1071,9 @@ pub type LoadedInputs {
     // Parallel to source_paths: each source but for its fn bodies, as the parser gives it. A
     // unit that read no body or position of a source keys on this text alone.
     source_interfaces: List[Str]
+    // Parallel to source_paths while the loader defers the interface texts: what each text is
+    // written from, until fill_source_interfaces writes it. Empty otherwise.
+    interface_parts: List[List[Str]]
     // Each manifest and lockfile the loader read, and its text.
     config_paths: List[Str]
     config_texts: List[Str]
@@ -1088,7 +1091,7 @@ pub type LoadedInputs {
 }
 
 fn loaded_inputs_empty() -> LoadedInputs {
-    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map() }
+    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], interface_parts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map() }
 }
 
 pub let mut loaded_inputs: LoadedInputs = loaded_inputs_empty()
@@ -1291,7 +1294,23 @@ fn record_source_nodes(module: Str, first_node: Int) {
     // An embedded source comes with the compiler, which the inputs name by its sha, so its
     // interface could tell a build nothing the inputs do not.
     let path = loaded_inputs.source_paths.get(loaded_inputs.source_paths.len() - 1) ?? ""
-    loaded_inputs.source_interfaces.push(parsed_interface_text(!path.starts_with("<embedded:")))
+    let wanted = !path.starts_with("<embedded:")
+    if parser_interface_text_deferred() {
+        loaded_inputs.source_interfaces.push("")
+        loaded_inputs.interface_parts.push(parsed_interface_parts(wanted))
+    } else {
+        loaded_inputs.source_interfaces.push(parsed_interface_text(wanted))
+    }
+}
+
+// Writes each interface text the loader deferred.
+pub fn fill_source_interfaces() {
+    let mut i = 0
+    while i < loaded_inputs.interface_parts.len() && i < loaded_inputs.source_interfaces.len() {
+        loaded_inputs.source_interfaces.set(i, interface_text_of(loaded_inputs.interface_parts.get(i).unwrap()))
+        i = i + 1
+    }
+    loaded_inputs.interface_parts = []
 }
 
 fn is_file_loaded(path: Str) -> Int {
