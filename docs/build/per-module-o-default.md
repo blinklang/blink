@@ -2176,10 +2176,16 @@ share objects. The test of two trees shows it: tree B compiles no unit
 at the default level.
 
 gcc and clang both take the compile dir from `$PWD` when it is absolute
-and names the cwd, else from `getcwd`. A cwd reached through a link is
-then a dir of its own. `build_objcache.compile_dir` reads the dir the
-same way and sets `PWD` to it, so each cc the build starts records the
-dir the key holds.
+and names the cwd (they compare inodes), else from `getcwd`. A cwd
+reached through a link is then a dir of its own. cc inherits the `PWD`
+of blink, and an `sh` between them keeps a `PWD` that names the cwd and
+replaces one that does not. `build_objcache.compile_dir` reads the dir
+the same way, so the key holds the dir each cc records. Blink sets no
+`PWD`. Under the daemon, the child that runs a build takes the cwd and
+`PWD` of the client first, so the key and the objects name the dir of
+the client, not of the daemon. `compile_dir` compares by realpath, not
+by inode: a stale `PWD` that names the cwd through another mount of it
+is recorded by cc while the key holds the cwd. Both name the same dir.
 
 The PCH key holds the archive dir and no compile dir. A PCH built in
 one compile dir and read from another, with the same archive dir, gives
