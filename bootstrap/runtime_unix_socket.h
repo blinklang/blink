@@ -115,6 +115,46 @@ BLINK_RT_FN void blink_unix_socket_close(int64_t fd) {
 }
 #endif
 
+/* The uid of the process at the other end of the Unix socket fd, from the kernel. -1 when
+   the call fails (fd is no live socket), which a caller must take as a refusal. -2 where this
+   platform has no such call; that is decided before fd is looked at, so a call on -1 tells
+   whether the check is supported here. The platform macros of the target choose the call, so
+   no arch table or file read is needed.
+   Linux: glibc gives SO_PEERCRED and struct ucred only past _POSIX_C_SOURCE, which
+   runtime_core.h may set alone, so SO_PEERCRED comes from the kernel header, which has the
+   value for each arch, and a struct of the same fixed layout (pid, uid, gid) stands in for
+   struct ucred. macOS and the BSDs hide getpeereid under _POSIX_C_SOURCE, so it is declared
+   here as their headers do. */
+#if defined(__linux__) && !defined(SO_PEERCRED)
+#include <asm/socket.h>
+#endif
+#if !defined(__linux__) && (defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) \
+    || defined(__NetBSD__) || defined(__DragonFly__))
+#define BLINK_PEER_UID_GETPEEREID 1
+int getpeereid(int, uid_t*, gid_t*);
+#endif
+
+BLINK_RT_FN int64_t blink_unix_socket_peer_uid(int64_t fd);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_socket_peer_uid(int64_t fd) {
+#if defined(__linux__)
+    struct { pid_t pid; uid_t uid; gid_t gid; } cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt((int)fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return -1;
+    if (len != sizeof(cred)) return -1;
+    return (int64_t)cred.uid;
+#elif defined(BLINK_PEER_UID_GETPEEREID)
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid((int)fd, &uid, &gid) != 0) return -1;
+    return (int64_t)uid;
+#else
+    (void)fd;
+    return -2;
+#endif
+}
+#endif
+
 /* One line, without its newline, however long. Bytes are peeked first and only those up
    to the newline consumed, so what follows the line stays for the next read. At end of
    input or on an error the line ends where the bytes did; with none read it is empty. */

@@ -1,0 +1,66 @@
+// The runtime tells which user is at the other end of a Unix socket, from the kernel, where
+// the platform has a call for it (SO_PEERCRED on Linux, getpeereid on macOS and the BSDs). The
+// daemon refuses a peer when the call fails, so a descriptor that is no live socket must give
+// the "failed" value, never a uid and never "not supported". This suite runs on Linux, where
+// the call is supported whatever the arch.
+
+@ffi("blink_unix_socket_peer_uid")
+@trusted(audit: "Wraps the runtime blink_unix_socket_peer_uid(), which reads only the peer credentials of fd.")
+fn peer_uid(fd: Int) -> Int ! FFI {}
+
+@ffi("open", header: "fcntl.h")
+@trusted(audit: "Wraps open(2) read-only. path is a NUL-terminated copy from ffi.scope().")
+fn c_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+
+let FAILED = -1
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+test "both ends of a connection this process made to itself name its own user" {
+    let me = sh("id -u")
+    let dir = sh("mktemp -d")
+    let path = "{dir}/peer.sock"
+    let listener = unix_socket_listen(path)
+    let client = unix_socket_connect(path)
+    let server = unix_socket_accept_timeout(listener, 1000)
+    let ok = listener >= 0 && client >= 0 && server >= 0
+    let from_server = peer_uid(server)
+    let from_client = peer_uid(client)
+    unix_socket_close(server)
+    unix_socket_close(client)
+    unix_socket_close(listener)
+    let _ = sh("rm -rf '{dir}'")
+    assert(ok, "the socket connection failed")
+    assert_eq("{from_server}", me)
+    assert_eq("{from_client}", me)
+}
+
+test "a descriptor that is no socket gives the failed value" {
+    assert_eq(peer_uid(-1), FAILED)
+    let mut file = -1
+    with ffi.scope() as scope {
+        file = c_open(scope.cstr("/dev/null"), 0.to_i32()).to_int()
+    }
+    assert(file >= 0, "open /dev/null failed")
+    let got = peer_uid(file)
+    unix_socket_close(file)
+    assert_eq(got, FAILED)
+}
+
+test "a socket that was closed gives the failed value" {
+    let dir = sh("mktemp -d")
+    let path = "{dir}/peer.sock"
+    let listener = unix_socket_listen(path)
+    let client = unix_socket_connect(path)
+    let server = unix_socket_accept_timeout(listener, 1000)
+    let ok = listener >= 0 && client >= 0 && server >= 0
+    unix_socket_close(server)
+    let got = peer_uid(server)
+    unix_socket_close(client)
+    unix_socket_close(listener)
+    let _ = sh("rm -rf '{dir}'")
+    assert(ok, "the socket connection failed")
+    assert_eq(got, FAILED)
+}
