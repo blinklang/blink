@@ -1,0 +1,48 @@
+// The [lints] table of blink.toml sets the level of W1000 (a local module shadows a
+// dependency) as it does for any other warning, keyed by the code or by the name. The fixture
+// lives under a fresh temporary directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A path dependency mylib and a local src/mylib.bl that shadows it; `lints` is the body of the
+// app's [lints] table.
+fn setup(dir: Str, lints: Str) {
+    let _ = sh("rm -rf {dir}; mkdir -p {dir}/src {dir}/dep/src")
+    write_file("{dir}/dep/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/dep/src/mylib.bl", "pub fn greet() -> Str \{ \"dep\" }\n")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[lints]\n{lints}\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n\n[[package]]\nname = \"mylib\"\nversion = \"0.1.0\"\nsource = \"path:{dir}/dep\"\nhash = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\n")
+    write_file("{dir}/src/mylib.bl", "pub fn greet() -> Str \{ \"local\" }\n")
+    write_file("{dir}/src/main.bl", "import mylib\n\nfn main() \{\n    io.println(mylib.greet())\n}\n")
+}
+
+fn check_with(lints: Str, tag: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_lints_w1000_{tag}.XXXXXX").out.trim()
+    setup(dir, lints)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && $B check --json src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+test "W1000 = off silences the shadowed-dependency warning" {
+    let r = check_with("W1000 = \"off\"", "off")
+    assert_eq(r.exit_code, 0)
+    assert(!r.err_out.contains("W1000"))
+    assert(!r.out.contains("shadows"))
+}
+
+test "W1000 = error makes the shadowed-dependency warning an error" {
+    let r = check_with("W1000 = \"error\"", "code_error")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("\"severity\":\"error\",\"name\":\"ShadowedDependency\",\"code\":\"W1000\""))
+}
+
+test "the name ShadowedDependency keys the same level as W1000" {
+    let r = check_with("ShadowedDependency = \"error\"", "name_error")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("\"severity\":\"error\",\"name\":\"ShadowedDependency\",\"code\":\"W1000\""))
+}

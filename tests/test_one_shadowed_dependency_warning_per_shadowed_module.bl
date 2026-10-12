@@ -1,0 +1,54 @@
+// A local module that shadows a dependency gets one W1000 per check, however many files
+// import it: the loader resolves the import once per importing file, and the warning points
+// at the shadowing file, so a second report would repeat the first. The fixture lives under a
+// fresh temporary directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A path dependency mylib, a local src/mylib.bl that shadows it, and two files that import it:
+// main.bl and helper.bl, which main.bl also imports.
+fn setup(dir: Str) {
+    let _ = sh("rm -rf {dir}; mkdir -p {dir}/src {dir}/dep/src")
+    write_file("{dir}/dep/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/dep/src/mylib.bl", "pub fn greet() -> Str \{ \"dep\" }\n")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n\n[[package]]\nname = \"mylib\"\nversion = \"0.1.0\"\nsource = \"path:{dir}/dep\"\nhash = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\n")
+    write_file("{dir}/src/mylib.bl", "pub fn greet() -> Str \{ \"local\" }\n")
+    write_file("{dir}/src/helper.bl", "import mylib\n\npub fn twice() -> Str \{\n    mylib.greet().concat(mylib.greet())\n}\n")
+    write_file("{dir}/src/main.bl", "import mylib\nimport helper\n\nfn main() \{\n    io.println(mylib.greet())\n    io.println(helper.twice())\n}\n")
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut at = 0
+    while true {
+        match text.byte_index_of(needle, at) {
+            Some(i) => {
+                n = n + 1
+                at = i + needle.byte_len()
+            }
+            None => { return n }
+        }
+    }
+    n
+}
+
+test "two files that import one shadowed module give one W1000" {
+    let dir = sh("mktemp -d /tmp/blink_once_w1000.XXXXXX").out.trim()
+    setup(dir)
+    let json = sh("B=$(pwd)/build/blink; cd {dir} && $B check --json src/main.bl")
+    let human = sh("B=$(pwd)/build/blink; cd {dir} && $B check src/main.bl")
+    let _ = sh("rm -rf {dir}")
+
+    if json.exit_code != 0 || count_of(json.err_out, "\"code\":\"W1000\"") != 1 {
+        io.eprintln("json (exit {json.exit_code}):\n{json.out}\n--stderr--\n{json.err_out}")
+    }
+    assert_eq(json.exit_code, 0)
+    assert_eq(count_of(json.err_out, "\"code\":\"W1000\""), 1)
+    assert_eq(count_of(human.err_out, "local module shadows dependency"), 1)
+    assert_eq(count_of(human.out, "shadows"), 0)
+}
