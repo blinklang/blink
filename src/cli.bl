@@ -67,8 +67,8 @@ import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
-import symbol_index.{collect_effects, si_build, si_reset}
-import query.{query_filtered_layer}
+import symbol_index.{collect_effects}
+import query.{query_index_source, query_answer}
 import diagnostics.{
     Diag, diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
@@ -5232,6 +5232,44 @@ fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
     io.println(result)
 }
 
+// The query asks the project's daemon, which answers from the index a cold query of the file
+// as it is now would build, for a client with its compiler, environment and settings.
+// Anything else, and a reply the client can not read, falls back to a cold query: the daemon
+// may make a query faster, never different. True when the daemon's answer was printed.
+fn query_through_daemon(a: Args, source_path: Str) -> Bool ! IO {
+    let sock = daemon_socket_path()
+    if !file_exists(sock) {
+        return false
+    }
+    let fd = unix_socket_connect(sock)
+    if fd < 0 {
+        return false
+    }
+    // A query reads no flag that the front end reads, so it names the settings of none.
+    let req = daemon_front_request("query", front_settings(false))
+    json_set(req, "cwd", json_new_str(env.cwd()))
+    json_set(req, "path", json_new_str(source_path))
+    json_set(req, "layer", json_new_str(args_get(a, "layer")))
+    json_set(req, "pub", json_new_int(if args_has(a, "pub") { 1 } else { 0 }))
+    json_set(req, "pure", json_new_int(if args_has(a, "pure") { 1 } else { 0 }))
+    json_set(req, "effect", json_new_str(args_get(a, "effect")))
+    json_set(req, "module", json_new_str(args_get(a, "module")))
+    json_set(req, "fn", json_new_str(args_get(a, "fn")))
+    let reply = daemon_send(fd, json_encode(req))
+    json_clear()
+    let root = json_parse(reply)
+    if root < 0 || json_as_int(json_get(root, "served")) != 1 {
+        return false
+    }
+    io.eprint(json_as_str(json_get(root, "stderr")))
+    io.print(json_as_str(json_get(root, "stdout")))
+    let code = json_as_int(json_get(root, "exit"))
+    if code != 0 {
+        exit(code)
+    }
+    true
+}
+
 fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, IO {
     let source_path = args_positional(a, 0)
     if source_path == "" {
@@ -5240,67 +5278,15 @@ fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, IO {
         exit(1)
     }
     check_file_exists(source_path)
-    let mut query_layer = args_get(a, "layer")
-    let query_effect = args_get(a, "effect")
-    let query_module = args_get(a, "module")
-    let query_fn = args_get(a, "fn")
-    let query_pub = if args_has(a, "pub") { 1 } else { 0 }
-    let query_pure = if args_has(a, "pure") { 1 } else { 0 }
-    if query_layer == "" {
-        query_layer = "signature"
+    if query_through_daemon(a, source_path) {
+        return
     }
-    let sock_path = daemon_socket_path()
-    let sock_fd = if file_exists(sock_path) { unix_socket_connect(sock_path) } else { -1 }
-    if sock_fd >= 0 {
-        // A query reads no flag that the front end reads, so it names the settings of none.
-        let req = daemon_front_request("query", front_settings(false))
-        if query_fn != "" {
-            json_set(req, "query_type", json_new_str("fn"))
-            json_set(req, "name", json_new_str(query_fn))
-        } else if query_effect != "" {
-            json_set(req, "query_type", json_new_str("effect"))
-            json_set(req, "effect", json_new_str(query_effect))
-        } else if query_pure != 0 {
-            json_set(req, "query_type", json_new_str("pub_pure"))
-        } else {
-            let mod_name = if query_module != "" { query_module } else { strip_extension(path_basename(source_path)) }
-            json_set(req, "query_type", json_new_str("signature"))
-            json_set(req, "module", json_new_str(mod_name))
-        }
-        let response = daemon_send(sock_fd, json_encode(req))
-        // A daemon that took no request, gave no answer or did not serve this client leaves
-        // the query to run cold. An answer names no "served".
-        json_clear()
-        let root = json_parse(response)
-        let declined = root >= 0 && json_get(root, "served") >= 0 && json_as_int(json_get(root, "served")) != 1
-        if response != "" && !declined {
-            io.println(response)
-            return
-        }
-    }
-    let source = read_file(source_path)
-    lex(source)
-    pos = 0
-    diag_source_file = source_path
-    let first_node = node_count()
-    let program = parse_program()
-    attach_comments_pass(program, first_node)
-
-    if diag_count > 0 {
+    if !query_index_source(source_path, read_file(source_path)) {
         diag_flush()
         io.println("error: parse failed, cannot query")
         exit(1)
     }
-
-    let module_name = strip_extension(path_basename(source_path))
-    si_reset()
-    si_build(program, source_path, module_name)
-
-    let vis = if query_pub != 0 { 1 } else { -1 }
-    let mod_f = if query_module != "" { query_module } else if query_fn == "" { module_name } else { "" }
-    let result = query_filtered_layer(query_layer, vis, mod_f, query_effect, query_pure, query_fn)
-
-    io.println(result)
+    io.println(query_answer(source_path, args_get(a, "layer"), args_has(a, "pub"), args_has(a, "pure"), args_get(a, "effect"), args_get(a, "module"), args_get(a, "fn")))
 }
 
 fn is_std_add_pkg(name: Str) -> Int {

@@ -1,6 +1,7 @@
-import symbol_index.{si_build, si_reset, si_sym_count, si_file_count}
-import query.{query_dispatch}
-import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render}
+import symbol_index.{si_reset, si_sym_count, si_file_count}
+import query.{query_index_source, query_answer}
+import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render, diag_reset}
+import compiler.{reset_compiler_state}
 import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int, json_at, json_len}
 import std.path.{path_join, path_dirname}
 import lexer.{Lex}
@@ -51,6 +52,7 @@ type DaemonOrigin {
     // Whether its checks parse for the interface texts a build that may take units compares.
     interface_text: Bool
     builds: Int
+    queries: Int
     // In a worker: the router's pid, and the directory, absolute since the worker changes its
     // working directory, that holds the worker's socket and the files its checks and builds
     // print to. In the router, 0 and "".
@@ -63,7 +65,7 @@ type DaemonOrigin {
     chan: Int
 }
 
-let mut daemon_origin: DaemonOrigin = DaemonOrigin { cwd: "", identity: "", settings: "", interface_text: false, builds: 0, router: 0, files: "", chan: -1 }
+let mut daemon_origin: DaemonOrigin = DaemonOrigin { cwd: "", identity: "", settings: "", interface_text: false, builds: 0, queries: 0, router: 0, files: "", chan: -1 }
 
 // The findings of a check, rendered both ways a client can ask for, since the diagnostics
 // themselves do not outlive the next check.
@@ -85,10 +87,23 @@ type DaemonCheck {
     // The mtime and size of each file the check read, from just after it. The poll compares
     // bytes only once one of them moves. Empty when an edit landed during the check.
     stats: List[Int]
+    // The index a cold query of the entry would build; None when that query prints errors.
+    query: Option[DaemonQueryIndex]
 }
 
 // The last check, which holds until an input changes.
 let mut daemon_last: Option[DaemonCheck] = None
+
+// The symbol index a cold `blink query` of the entry would build, from the bytes it was built
+// from, with what its lex printed itself. A query of the entry is answered from it only while
+// the file holds those bytes and the client names it as cwd and path did.
+type DaemonQueryIndex {
+    cwd: Str
+    path: Str
+    text: Str
+    out: Str
+    err: Str
+}
 
 // A build child the daemon forked and has not reaped, and what it owes the client: the files
 // the child prints to and the connection the reply goes to. wake is the read end of a pipe
@@ -140,6 +155,7 @@ fn daemon_extract_type(request: Str) -> Option[Str] {
 // Each check sees the whole program: mono and the mutation passes judge across functions,
 // so a recheck of only the changed functions could miss what an edit broke elsewhere.
 fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    let query = daemon_index_entry()
     let out_path = path_join(daemon_origin.files, "check.out")
     let err_path = path_join(daemon_origin.files, "check.err")
     let saved = capture_output(out_path, err_path)
@@ -153,8 +169,6 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
     // poll to see. The bytes show it, so one compare here closes that gap.
     let taken = daemon_input_stats()
     let stats = if checked_inputs_changed(daemon_source_path) { [] } else { taken }
-    si_reset()
-    si_build(program, daemon_source_path, "main")
     // Each check leaves its whole working set as garbage. Whether libgc collects it or grows
     // the heap instead is not stable: it turns on how much the last collections freed, so
     // the same edit can leave a small heap or a large one. Every build child is a fork of
@@ -174,7 +188,30 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
         err: err,
         captured: captured,
         stats: stats,
+        query: query,
     }
+}
+
+// Builds the index a cold query of the entry builds, from the same code, before the check.
+// It must come before a check, never on its own: its resets drop the program the last check
+// holds, which a build compiles, and the check after it builds that program again. The resets
+// are the ones the check makes first, so the parse starts from a cold query's state. None
+// when the lex or the parse reported an error, or the daemon could not capture what they
+// printed: a query then runs cold and prints the errors itself.
+fn daemon_index_entry() -> Option[DaemonQueryIndex] ! IO, Lex.Tokenize, Parse, Diag.Report {
+    reset_compiler_state()
+    diag_reset()
+    let text = read_file(daemon_source_path)
+    let out_path = path_join(daemon_origin.files, "query.out")
+    let err_path = path_join(daemon_origin.files, "query.err")
+    let saved = capture_output(out_path, err_path)
+    let indexed = query_index_source(daemon_source_path, text)
+    let captured = restore_output(saved)
+    if !indexed || !captured {
+        si_reset()
+        return None
+    }
+    Some(DaemonQueryIndex { cwd: daemon_origin.cwd, path: daemon_source_path, text: text, out: read_file(out_path), err: read_file(err_path) })
 }
 
 // The mtime and size of each file the last check read, -1 for one it can not stat or open.
@@ -879,13 +916,46 @@ fn daemon_after_child(builds: DaemonBuilds) -> DaemonBuilds {
 
 // ── Handle: query ───────────────────────────────────────────────────
 
-fn daemon_handle_query(request: Str) -> Str {
+// The reply carries what a cold `blink query` would print and the code it would exit with.
+// The worker answers only from an index of the bytes the file holds now, built for the
+// client's spelling of it from the client's directory; it neither rechecks nor changes its
+// spelling for a query, since a cold query costs less than a check. The poll rechecks an
+// edited entry, which builds the index again.
+fn daemon_handle_query(request: Str) -> Str ! IO {
     json_clear()
-    let differs = daemon_client_differs(json_parse(request))
+    let root = json_parse(request)
+    let differs = daemon_client_differs(root)
     if differs != "" {
         return daemon_not_served(differs)
     }
-    query_dispatch(request)
+    let cwd = json_as_str(json_get(root, "cwd"))
+    let path = json_as_str(json_get(root, "path"))
+    let c = match daemon_last {
+        Some(c) => c
+        None => return daemon_not_served("the daemon holds no index of {path}")
+    }
+    let q = match c.query {
+        Some(q) => q
+        None => return daemon_not_served("the daemon holds no index of {path}")
+    }
+    if q.cwd != cwd || q.path != path {
+        return daemon_not_served("the daemon indexed {q.path} from {q.cwd}")
+    }
+    if file_exists(path) != 1 || read_file(path) != q.text {
+        // An edit that moved no stat would leave the poll blind to it, and every query cold.
+        daemon_last = Some(DaemonCheck { stats: [], ..c })
+        return daemon_not_served("{path} changed since the daemon indexed it")
+    }
+    let answer = query_answer(path, json_as_str(json_get(root, "layer")), json_as_int(json_get(root, "pub")) == 1, json_as_int(json_get(root, "pure")) == 1, json_as_str(json_get(root, "effect")), json_as_str(json_get(root, "module")), json_as_str(json_get(root, "fn")))
+    daemon_origin = DaemonOrigin { queries: daemon_origin.queries + 1, ..daemon_origin }
+    json_clear()
+    let reply = json_new_object()
+    json_set(reply, "ok", json_new_bool(1))
+    json_set(reply, "served", json_new_int(1))
+    json_set(reply, "exit", json_new_int(0))
+    json_set(reply, "stdout", json_new_str(q.out.concat(answer).concat("\n")))
+    json_set(reply, "stderr", json_new_str(q.err))
+    json_encode(reply)
 }
 
 // ── Handle: status ──────────────────────────────────────────────────
@@ -896,11 +966,12 @@ fn daemon_handle_status(builds: DaemonBuilds) -> Str {
     let sym_count = si_sym_count
     let file_count = si_file_count
     let checks = daemon_check_count
+    let queries = daemon_origin.queries
     let served = daemon_origin.builds
     let building = if builds.child.is_some() { 1 } else { 0 }
     let queued = builds.queue.len()
     let stopping = if builds.stops.len() > 0 { 1 } else { 0 }
-    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{sym_count},\"files\":{file_count},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"builds\":{served},\"checks\":{checks}}"
+    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{sym_count},\"files\":{file_count},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"queries\":{queries},\"builds\":{served},\"checks\":{checks}}"
 }
 
 // ── Handle: stop ────────────────────────────────────────────────────
@@ -908,7 +979,7 @@ fn daemon_handle_status(builds: DaemonBuilds) -> Str {
 // The counts go to the router, which adds them to its status once this worker is gone.
 fn daemon_handle_stop() -> Str {
     daemon_running = 0
-    "\{\"ok\":true,\"message\":\"daemon stopping\",\"builds\":{daemon_origin.builds},\"checks\":{daemon_check_count}}"
+    "\{\"ok\":true,\"message\":\"daemon stopping\",\"queries\":{daemon_origin.queries},\"builds\":{daemon_origin.builds},\"checks\":{daemon_check_count}}"
 }
 
 // ── Event loop ──────────────────────────────────────────────────────
@@ -1119,6 +1190,7 @@ type DaemonRoute {
     root: Str
     retired_checks: Int
     retired_builds: Int
+    retired_queries: Int
     stops: List[Int]
     held: List[Int]
     turn: Str
@@ -1286,6 +1358,7 @@ fn daemon_make_room(route: DaemonRoute) -> DaemonRoute ! IO {
         if counts >= 0 {
             r.retired_checks = r.retired_checks + json_as_int(json_get(counts, "checks"))
             r.retired_builds = r.retired_builds + json_as_int(json_get(counts, "builds"))
+            r.retired_queries = r.retired_queries + json_as_int(json_get(counts, "queries"))
         }
         r.ended.push(e)
         r.entries = r.entries.filter(fn(x) { x.name != e.name })
@@ -1293,12 +1366,11 @@ fn daemon_make_room(route: DaemonRoute) -> DaemonRoute ! IO {
     r
 }
 
-// Sends a check, build or query to the worker of its entry, forked first if none serves it.
-// A query reads the symbols of the entry the daemon started on.
+// Sends a check, build or query to the worker of its entry, forked first for a check or build
+// if none serves it. A query never forks one: a worker's first check costs more than the cold
+// query the client runs when no worker serves the file.
 fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_fd: Int) -> (DaemonRoute, RouteTurn) ! IO {
     let mut r = route
-    let mut cwd = r.home_cwd
-    let mut path = r.home_path
     json_clear()
     let root = json_parse(request)
     // The worker checks the same, but a client it would not serve must not cost a worker.
@@ -1306,10 +1378,8 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
     if differs != "" {
         return (r, RouteTurn.Answer(daemon_not_served(differs)))
     }
-    if req_type != "query" {
-        cwd = json_as_str(json_get(root, "cwd"))
-        path = json_as_str(json_get(root, "path"))
-    }
+    let cwd = json_as_str(json_get(root, "cwd"))
+    let path = json_as_str(json_get(root, "path"))
     let key = daemon_entry_key(cwd, path)
     // A file outside the project root may belong to another project, with a blink.toml of its
     // own, so the daemon leaves it to a cold check or build. Both sides are real paths, so a
@@ -1334,6 +1404,9 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
     if found != "" {
         return (r, RouteTurn.Redirect(found))
     }
+    if req_type == "query" {
+        return (r, RouteTurn.Answer(daemon_not_served("no worker of the daemon checks {path}")))
+    }
     // The loader exits on a missing entry file, which would end the worker on its first check.
     if file_exists(key) != 1 {
         return (r, RouteTurn.Answer(daemon_not_served("source file not found: {path}")))
@@ -1354,7 +1427,7 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
 }
 
 // The daemon's status: the router's own fields, and the sum of its workers' counts, with the
-// symbols and files of the home worker, which a query reads. entries counts the workers that
+// symbols and files of the home worker's query index. entries counts the workers that
 // serve.
 fn daemon_route_status(r: DaemonRoute) -> Str {
     let uptime = time_ms() - daemon_start_time
@@ -1364,6 +1437,7 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
     let mut queued = 0
     let mut served = r.retired_builds
     let mut checks = r.retired_checks
+    let mut queries = r.retired_queries
     for e in r.entries {
         let reply = daemon_ask_worker(e.name, "\{\"type\":\"status\"}")
         json_clear()
@@ -1373,6 +1447,7 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
             queued = queued + json_as_int(json_get(root, "queued"))
             served = served + json_as_int(json_get(root, "builds"))
             checks = checks + json_as_int(json_get(root, "checks"))
+            queries = queries + json_as_int(json_get(root, "queries"))
             if e.home {
                 symbols = json_as_int(json_get(root, "symbols"))
                 files = json_as_int(json_get(root, "files"))
@@ -1381,7 +1456,7 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
     }
     let stopping = if r.stops.len() > 0 { 1 } else { 0 }
     let entries = r.entries.len()
-    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{symbols},\"files\":{files},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"entries\":{entries},\"builds\":{served},\"checks\":{checks}}"
+    "\{\"ok\":true,\"uptime_ms\":{uptime},\"symbols\":{symbols},\"files\":{files},\"building\":{building},\"queued\":{queued},\"stopping\":{stopping},\"entries\":{entries},\"queries\":{queries},\"builds\":{served},\"checks\":{checks}}"
 }
 
 // Reaps each worker that ended, and removes its files, once no process of its group is left.
@@ -1609,7 +1684,7 @@ fn daemon_stop_workers(route: DaemonRoute) -> DaemonRoute {
 // ended has yet to be reaped, the wait is 1 ms at most, so the stop ends as soon as the last
 // of them does.
 fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
-    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, stops: [], held: [], turn: "", waiting: [], told: [] }
+    let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, retired_queries: 0, stops: [], held: [], turn: "", waiting: [], told: [] }
     // The home worker checks the entry at once, so the first request finds it checked.
     let home_key = daemon_entry_key(r.home_cwd, r.home_path)
     let (first, home, why) = daemon_spawn(r, home_key, r.home_cwd, r.home_path, true, -1)
@@ -1784,7 +1859,7 @@ fn daemon_worker_of(reply: Str) -> Str {
 // max_entries is how many entry files the daemon keeps checked at once, each in a worker.
 pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     daemon_source_path = source
-    daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0, router: 0, files: "", chan: -1 }
+    daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0, queries: 0, router: 0, files: "", chan: -1 }
     daemon_start_time = time_ms()
 
     let blink_dir = daemon_dir()

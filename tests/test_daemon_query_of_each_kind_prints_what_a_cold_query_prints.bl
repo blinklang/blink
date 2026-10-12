@@ -1,0 +1,117 @@
+// The daemon may make a query faster, never different. For each kind of query the CLI sends
+// (by name, by effect, pure, and the signatures of a module), and for the flags that shape
+// one, a query through the daemon prints on stdout and stderr and exits as a cold query of the
+// same file does, and the daemon answers each itself. The escape `\q` makes the lexer print a
+// warning on stderr, which a cold query prints too.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/daemon_query_each_kind"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn query(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 60 $B query {args}")
+}
+
+// The pid of a daemon serving src/main.bl, or -1. The timeout ends a daemon that nothing
+// stopped.
+fn start_daemon() -> Int {
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && rm -rf .blink && (timeout 120 $B daemon start src/main.bl > daemon.log 2>&1 &); for i in $(seq 1 400); do if [ -S .blink/daemon.sock ]; then cat .blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f .blink/daemon.pid ] && kill $(cat .blink/daemon.pid); exit 1")
+    if r.exit_code != 0 { return -1 }
+    r.out.trim().to_int()
+}
+
+fn stop_daemon(pid: Int) {
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "queries", or -1 when the status has none.
+fn status_field(field: Str) -> Int {
+    let out = sh("B=$(pwd)/build/blink; cd {DIR} && timeout 60 $B daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+fn differ(args: Str, warm: ProcessResult, cold: ProcessResult) -> Str {
+    if warm.exit_code != cold.exit_code { return "{args}: exit {warm.exit_code} vs {cold.exit_code}" }
+    if warm.out != cold.out { return "{args}: stdout\n{warm.out}-- vs --\n{cold.out}" }
+    if warm.err_out != cold.err_out { return "{args}: stderr\n{warm.err_out}-- vs --\n{cold.err_out}" }
+    ""
+}
+
+test "a query of each kind through the daemon prints what a cold query prints and the daemon serves it" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}/src")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"daemon_query_each_kind\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every query here.
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{DIR}/src/base.bl", "pub fn tag(s: Str) -> Str \{\n    \"[\{s}]\"\n}\n")
+    write_file("{DIR}/src/main.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"/// Adds one."#,
+        #"pub fn f(x: Int) -> Int {"#,
+        #"    x + 1"#,
+        #"}"#,
+        #""#,
+        #"fn g() ! IO {"#,
+        #"    io.println(tag("g\q"))"#,
+        #"}"#,
+        #""#,
+        #"pub fn loud() ! IO {"#,
+        #"    io.println("loud")"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{f(1)}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    let cases = [
+        "src/main.bl --fn f",
+        "src/main.bl --fn f,g",
+        "src/main.bl --fn g --layer full",
+        "src/main.bl --effect IO",
+        "src/main.bl --effect IO --pub",
+        "src/main.bl --pure",
+        "src/main.bl --pub --pure",
+        "src/main.bl",
+        "src/main.bl --layer intent",
+        "src/main.bl --layer contract",
+        "src/main.bl --module base",
+    ]
+    let mut colds: List[ProcessResult] = []
+    for c in cases { colds.push(query(c)) }
+    assert(colds.get(0).unwrap().out.contains("\"name\":\"f\""), "the cold query found no f: {colds.get(0).unwrap().out}")
+    assert(colds.get(0).unwrap().err_out.contains("unknown escape"), "the cold query printed no lexer warning: {colds.get(0).unwrap().err_out}")
+
+    let pid = start_daemon()
+    assert(pid > 0, "the daemon did not start")
+    let before = status_field("queries")
+    let mut problems: List[Str] = []
+    let mut i = 0
+    for c in cases {
+        let d = differ(c, query(c), colds.get(i).unwrap())
+        if d != "" { problems.push(d) }
+        i = i + 1
+    }
+    let after = status_field("queries")
+    stop_daemon(pid)
+    let _ = sh("rm -rf {DIR}")
+
+    assert_eq(problems.join("\n"), "")
+    assert_eq("{before} -> {after}", "0 -> {cases.len()}")
+}
