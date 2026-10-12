@@ -421,7 +421,8 @@ type LexCutoff {
     col: Int
 }
 
-// What diag_record drops instead of recording. Reset per compile in diag_reset.
+// What diag_record drops instead of recording, and what diag_flush does not print again.
+// Reset per compile in diag_reset.
 type DiagFilter {
     // Dedup byte-identical diagnostics. The two full passes over a fn body
     // (nr + tc) both call infer_type, which emits, so a single erroring node fires
@@ -429,12 +430,15 @@ type DiagFilter {
     // genuinely distinct diagnostics on the same node survive.
     seen: Map[Str, Int]
     lex_cutoffs: List[LexCutoff]
+    // How many entries diag_flush has printed. A build flushes after its front end and again
+    // after its back end, and each entry must print once.
+    flushed: Int
 }
 
 pub let mut diag_entries: List[DiagEntry] = []
 let mut file_ranges: List[FileRange] = []
 let mut source_lines_cache: Map[Str, List[Str]] = Map()
-let mut diag_filter: DiagFilter = DiagFilter { seen: Map(), lex_cutoffs: [] }
+let mut diag_filter: DiagFilter = DiagFilter { seen: Map(), lex_cutoffs: [], flushed: 0 }
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -663,6 +667,7 @@ pub fn diag_entry_count() -> Int {
 // back one count and leaves any suppressed repeat counted. The parser collapses parse
 // cascades, which are errors, so nothing rolls back an internal error today.
 pub fn diag_truncate(n: Int) {
+    if diag_filter.flushed > n { diag_filter.flushed = n }
     while diag_entries.len() > n {
         let d = diag_entries.pop().unwrap()
         // Drop the dedup key too, so diag_filter.seen mirrors diag_entries —
@@ -806,7 +811,7 @@ pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: S
 // all that was reported in the run's format, and exits 101 as any internal error does.
 pub fn diag_ice_abort(name: Str, code: Str, message: Str) {
     diag_record("ice", name, code, message, 0, 0, 0, 0, "", [])
-    io.eprint(diag_render(diag_format))
+    io.eprint(diag_unflushed(diag_format))
     io.print(diag_ice_state.abort_stdout)
     if diag_ice_state.abort_lsp_uri != "" {
         io.print(lsp_abort_frames(diag_ice_state.abort_lsp_uri, diag_ice_state.abort_lsp_request, name, code, message))
@@ -934,14 +939,35 @@ pub fn json_escape(s: Str) -> Str {
 // ── Flush: emit all diagnostics ──────────────────────────────────────
 
 pub fn diag_flush() ! Diag.Report {
-    io.eprint(diag_render(diag_format))
+    let text = diag_unflushed(diag_format)
+    diag_filter.flushed = diag_entries.len()
+    io.eprint(text)
 }
 
-// What diag_flush prints, as text: the daemon renders a check for a client to print, and the
-// two must give the same bytes. `format` is 1 for JSON lines, 0 for the human form.
+// Marks the first n entries printed, for a caller that printed them as rendered text.
+pub fn diag_mark_flushed(n: Int) {
+    diag_filter.flushed = n
+}
+
+// What the next diag_flush prints. `format` is 1 for JSON lines, 0 for the human form.
+pub fn diag_unflushed(format: Int) -> Str {
+    diag_render_from(diag_filter.flushed, format)
+}
+
+// Every entry as diag_flush prints it, as text: the daemon renders a check for a client to
+// print, and the two must give the same bytes. `format` is 1 for JSON lines, 0 for the human
+// form.
 pub fn diag_render(format: Int) -> Str {
+    diag_render_from(0, format)
+}
+
+// The entries from index `from` on, and the summary when there are any.
+fn diag_render_from(from: Int, format: Int) -> Str {
+    if from >= diag_entries.len() {
+        return ""
+    }
     let mut sb = StringBuilder.new()
-    let mut i = 0
+    let mut i = from
     while i < diag_entries.len() {
         if format == 1 {
             sb.write(diag_json_line(i))
@@ -1114,7 +1140,7 @@ pub fn diag_reset() {
     diag_allow_set.clear()
     diag_allow_stack.clear()
     source_lines_cache.clear()
-    diag_filter = DiagFilter { seen: Map(), lex_cutoffs: [] }
+    diag_filter = DiagFilter { seen: Map(), lex_cutoffs: [], flushed: 0 }
 }
 
 // ── Error catalog ─────────────────────────────────────────────────
