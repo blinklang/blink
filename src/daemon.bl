@@ -232,64 +232,37 @@ fn daemon_listen_private(path: Str) -> Int ! IO {
     fd
 }
 
-// Whether SOL_SOCKET is 1 and SO_PEERCRED is 17 here. The FFI can not read a C macro, and the
-// values differ by arch: SO_PEERCRED is 21 on powerpc and 18 on mips. They were checked
-// against the C headers for x86_64 and aarch64 Linux. The arch is the one this binary is built
-// for, from its ELF header, which /proc/self/exe holds on every Linux; a 32-bit build on a
-// 64-bit kernel has its own. It is read on each ask, an open and a read of 20 bytes, and not
-// kept in a module-level `let mut`, as scripts/ratchet.sh holds their count from going up.
-fn daemon_peer_check_supported() -> Bool ! IO {
-    let mut file = -1
-    with ffi.scope() as scope {
-        file = daemon_open(scope.cstr("/proc/self/exe"), 0.to_i32()).to_int()
-    }
-    if file < 0 { return false }
-    let mut known = false
-    match read_bytes(file, 20) {
-        Ok(h) => {
-            // "\x7fELF", 64-bit, little-endian, then e_machine at 18: 62 is x86_64, 183 aarch64.
-            if h.len() == 20 && h.get(0).unwrap() == 127 && h.get(1).unwrap() == 69 && h.get(2).unwrap() == 76 && h.get(3).unwrap() == 70 && h.get(4).unwrap() == 2 && h.get(5).unwrap() == 1 {
-                let machine = h.get(18).unwrap() + h.get(19).unwrap() * 256
-                known = machine == 62 || machine == 183
-            }
-        }
-        Err(_) => {}
-    }
-    unix_socket_close(file)
-    known
+// What daemon_socket_peer_uid gives where the platform has no call for the peer's uid.
+let DAEMON_PEER_UNSUPPORTED = -2
+
+// Whether this platform can name the user at the other end of a Unix socket. The runtime
+// decides "not supported" before it looks at the fd, so on -1, which is no socket, it gives -2
+// where the check is not supported and -1 (the call failed) where it is.
+pub fn daemon_peer_check_supported() -> Bool ! IO {
+    daemon_socket_peer_uid(-1) != DAEMON_PEER_UNSUPPORTED
 }
 
 // The uid of the process at the other end of a Unix socket, or None where the peer check is
-// not supported or the kernel did not say. struct ucred is pid, uid and gid, 4 bytes each, on
-// every Linux; the length the kernel gives back is checked all the same. The uid is read
-// little-endian, as the check is supported only on little-endian arches.
+// not supported or the kernel did not say.
 pub fn daemon_peer_uid(fd: Int) -> Option[Int] ! IO {
-    if !daemon_peer_check_supported() { return None }
-    let cred = Bytes.zeroed(12)
-    let mut rc = -1
-    let mut len = 0
-    with ffi.scope() as scope {
-        let len_cell = scope.alloc[U32]()
-        len_cell.write(12.to_u32())
-        rc = cred.with_ptr(fn(p) -> I32 { daemon_getsockopt(fd.to_i32(), 1.to_i32(), 17.to_i32(), p, len_cell) }).to_int()
-        len = len_cell.deref().to_int()
-    }
-    if rc != 0 || len != 12 { return None }
-    Some(cred.get(4).unwrap() + cred.get(5).unwrap() * 256 + cred.get(6).unwrap() * 65536 + cred.get(7).unwrap() * 16777216)
+    let uid = daemon_socket_peer_uid(fd)
+    if uid < 0 { None } else { Some(uid) }
 }
 
 pub fn daemon_own_uid() -> Int {
     daemon_getuid().to_int()
 }
 
-// Whether the daemon may serve a connection: one from its own user, or any where the peer
-// check is not supported, as there only the closed directory keeps others out.
+// Whether a peer the runtime named as uid may be served: one of the daemon's own user, or any
+// where the platform has no peer check, as there only the closed directory keeps others out.
+// A call that failed refuses the peer, as then nobody can say who it is.
+pub fn daemon_peer_uid_allowed(uid: Int, own: Int) -> Bool {
+    if uid == DAEMON_PEER_UNSUPPORTED { return true }
+    uid >= 0 && uid == own
+}
+
 fn daemon_peer_allowed(fd: Int) -> Bool ! IO {
-    if !daemon_peer_check_supported() { return true }
-    match daemon_peer_uid(fd) {
-        Some(uid) => uid == daemon_own_uid()
-        None => false
-    }
+    daemon_peer_uid_allowed(daemon_socket_peer_uid(fd), daemon_own_uid())
 }
 
 // A connection accepted on fd within timeout_ms that the daemon may serve, or -1. Another
@@ -527,9 +500,11 @@ fn daemon_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
 @trusted(audit: "Wraps chmod(2). path is a NUL-terminated copy from ffi.scope(); mode is 0700 or 0600.")
 fn daemon_chmod(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
 
-@ffi("getsockopt", header: "sys/socket.h")
-@trusted(audit: "Wraps getsockopt(2) for SO_PEERCRED only, on an arch whose SOL_SOCKET and SO_PEERCRED values were checked. value is a 12-byte Bytes buffer pinned by with_ptr, the size of struct ucred; len is one U32 cell that holds 12.")
-fn daemon_getsockopt(fd: I32, level: I32, name: I32, value: Ptr[U8], len: Ptr[U32]) -> I32 ! FFI {}
+// The uid at the other end of the Unix socket fd; -1 when the call failed, which refuses the
+// peer, and -2 where the platform has no such call (daemon_peer_check_supported).
+@ffi("blink_unix_socket_peer_uid")
+@trusted(audit: "Wraps the runtime blink_unix_socket_peer_uid(), which reads only the peer credentials of fd: SO_PEERCRED on Linux, getpeereid(2) on macOS and the BSDs.")
+fn daemon_socket_peer_uid(fd: Int) -> Int ! FFI {}
 
 @ffi("getuid", header: "unistd.h")
 @trusted(audit: "Wraps getuid(2). It takes nothing and can not fail.")
