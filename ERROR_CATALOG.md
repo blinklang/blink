@@ -51,6 +51,8 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | E08xx | FFI |
 | E09xx | Module capabilities / trait contracts |
 | E10xx | Module resolution / imports |
+| W10xx | Modules / manifest |
+| E11xx | Parser / lexer |
 | E13xx | Refinement contracts (predicate sublanguage) |
 | E14xx | Generic collections / Hash + Eq bounds |
 | V00xx | Contract verification outcomes |
@@ -165,6 +167,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
 | UnknownDiagnosticName | E0842 | An `@allow` argument or `[lints]` key that does not identify a live diagnostic: a misspelled name, a retired name or code, or a code given to `@allow`. Refused, not ignored. No `@allow` or `[lints]` entry suppresses it. The `help:` line removes a retired entry, names the diagnostic for a code, or suggests the one nearest live name (see *Conventions*) | Linting | §4.16.8 |
+| InvalidLintLevel | E0843 | A `[lints]` value that is not `"off"`, `"warn"` or `"error"`. Refused, not ignored: no `@allow`, `[lints]` entry or `--strict` changes it. Span on the value token; help lists the valid levels | Linting | §4.16.8 |
 | FfiOffsetUnknownStride | E0838 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
 | NonHandlerWithItem | E0839 | A `with` item without `as` is neither a `Handler[E]` nor a `BlockHandler` | Effects | §4.7 |
 | TraitContractMissingMethod | E0900 | Trait contract: required method not implemented | Trait contract | §3.6 |
@@ -203,6 +206,21 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | MutFieldNotSupported | E1109 | `mut` keyword on struct field declaration | Parser | §2 |
 | UnexpectedAnnotation | E1110 | Annotation used in unsupported position | Parser | §2 |
 | UnknownIntrinsic | E1111 | Unknown compile-time intrinsic (`#name`) | Parser | §2.20 |
+| UnknownDerive | E1112 | `@derive` names a trait the compiler does not synthesize | Parser | §3.6.1 |
+| UnexpectedCharacter | E1113 | The lexer found a character that starts no token | Lexer | §2 |
+| EmptyUnicodeEscape | E1114 | `\u{}` with no hex digits | Lexer | §2.4 |
+| UnicodeEscapeTooLong | E1115 | `\u{...}` with more than 6 hex digits | Lexer | §2.4 |
+| InvalidUnicodeEscapeDigit | E1116 | A character in `\u{...}` that is not a hex digit | Lexer | §2.4 |
+| UnterminatedUnicodeEscape | E1117 | `\u{` with no closing `}` | Lexer | §2.4 |
+| SurrogateEscape | E1118 | `\u{...}` names a surrogate code point (0xD800–0xDFFF) | Lexer | §2.4 |
+| UnicodeEscapeOutOfRange | E1119 | `\u{...}` names a value above 0x10FFFF | Lexer | §2.4 |
+| UnicodeEscapeNeedsBraces | E1120 | `\uXXXX` or `\UXXXXXXXX` without braces; help writes `\u{...}` | Lexer | §2.4 |
+| HexEscapeNotSupported | E1121 | `\x..` escape; help writes `\u{..}` | Lexer | §2.4 |
+| NulInStr | E1122 | `"\0"` or `"\u{0}"`: a `Str` cannot hold NUL; help names `Bytes` | Lexer | §2.4 |
+| UnknownEscape | E1123 | An escape that is not valid in its literal kind (string or char). Help lists the valid escapes. Where the escape has a known meaning in another language, the help gives the Blink fix first: `\e` `\a` `\v` → `\u{..}`; `"\'"` and `'\"'` → the plain quote; regex letters such as `\d` `\w` `\s` → raw string `#"..."#` | Lexer | §2.4 |
+| EmptyCharLiteral | E1124 | `''` holds no character; help shows `' '` and notes that an empty `Str` is `""` | Lexer | §2.4 |
+| MultiCharLiteral | E1125 | A char literal holds two or more scalar values (closed, or open to the end of the line); help shows the double-quoted `Str` | Lexer | §2.4 |
+| UnterminatedLiteral | E1126 | A char, string, template or raw-string literal with no closer. Primary span on the opening delimiter, `note:` at the end of the line (char) or file (string); help names the exact closer, `#` count included | Lexer | §2.4 |
 | ModuleNotFound | E1200 | Import statement referenced a module that could not be found | Modules | §10.1 |
 | InvalidStringBackedEnum | E1201 | String-backed enum variant value is not a string literal | Type checking | §3 |
 | ContractPredicateNotDecidable | E1300 | Contract predicate uses construct outside SMT-decidable subset | Refinement contracts | §3b |
@@ -249,6 +267,8 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | RestatedInheritedEnsures | W0900 | An impl `@ensures` restates a predicate it already inherits from the trait method | Trait contract | §3b.2 |
 | RedundantVerifyFallback | W0901 | An explicit `@verify(fallback: "runtime")` is the same as the policy without it; autofix removes it. Quiet where it replaces a trait method's `"error"` | Contract verification | §3b.4 |
 | VerifyWithoutContract | W0902 | `@verify` on a fn with no `@requires` and no `@ensures`, own or inherited; autofix removes it | Contract verification | §3b.4 |
+| ShadowedDependency | W1000 | An import matches both a module in the local `src/` and a dependency; the local module wins | Modules | §10.5 |
+| UnknownManifestSection | W1001 | A top-level `blink.toml` section that the spec does not define. Span on the `[header]`; help offers the nearest defined section. Promotable by `--strict` and `[lints]`. E1200 and E1052 add a `note:` that points at it when both fire in one build | Manifest | §8.9.8 |
 | ShadowedPreludeName | W1010 | A `type`, type alias, `trait` or `effect` declaration takes a compiler-known type name or prelude trait name that is not reserved; it shadows the builtin in its module. The `help:` line names the `import blink.core.{X as Y}` (or `blink.ffi`) escape | Modules | §10.6 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
 

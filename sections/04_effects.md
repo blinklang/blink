@@ -3425,6 +3425,8 @@ fn parse_fast() -> Node {
 
 ERROR_CATALOG.md *Conventions* gives the `help:` line for each case and what `blink explain` prints for a retired or unknown name.
 
+**Invalid levels.** Each `[lints]` value must be one of the three levels above. Any other value, such as `W0551 = "loud"` or `W0551 = "warning"`, is the error `InvalidLintLevel` (E0843). Like E0842, it is refused, not ignored: no `@allow`, `[lints]` entry or `--strict` setting changes it. The span is the value token, quotes included (§8.9.8), and the help line lists the valid levels.
+
 #### 4.16.9 No Runtime Effect
 
 `State` and write sets change no program behavior. They produce only diagnostics and tooling data, and `State` adds nothing to the generated code.
