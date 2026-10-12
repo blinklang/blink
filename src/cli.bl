@@ -546,6 +546,17 @@ fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Dia
 }
 
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+    match compile_to_text(source_path, format_flag, debug_mode, strict_mode) {
+        Ok(text) => {
+            write_file(c_path, text)
+            0
+        }
+        Err(rc) => rc
+    }
+}
+
+// The C (or, under --format blink, the formatted source) do_compile writes.
+fn compile_to_text(source_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     if format_flag == "blink" {
         reset_compiler_state()
         diag_reset()
@@ -561,19 +572,18 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
         attach_comments_pass(program, first_node)
         if diag_ice_count > 0 {
             diag_flush()
-            return 101
+            return Err(101)
         }
         if diag_count > 0 {
             diag_flush()
-            return 1
+            return Err(1)
         }
         let fmt_output = format(program)
-        write_file(c_path, fmt_output)
-        return 0
+        return Ok(fmt_output)
     }
     let final_program = match compile_front_end(source_path, strict_mode) {
         Ok(p) => p
-        Err(rc) => return rc
+        Err(rc) => return Err(rc)
     }
 
     let skip_raw = env.var("BLINK_SKIP_MODULES") ?? ""
@@ -616,21 +626,20 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
 
     if diag_ice_count > 0 {
         diag_flush()
-        return 101
+        return Err(101)
     }
     if diag_count > 0 {
         diag_flush()
-        return 1
+        return Err(1)
     }
     if diag_warn_count > 0 {
         diag_flush()
         if strict_mode != 0 {
-            return 1
+            return Err(1)
         }
     }
 
-    write_file(c_path, c_output)
-    return 0
+    Ok(c_output)
 }
 
 // Whether the compiler archive's evidence vector has a slot for every effect `program`
@@ -1023,37 +1032,15 @@ fn process_cc_id(target: Str) -> Str ! IO {
     cached_cc_id
 }
 
-// Sentinel set by cache_compile_user_c when it actually stored a new
+// Sentinel set by cache_compile_snapshot when it actually stored a new
 // entry. Caller checks this to gate maybe_gc — cache hits should not
 // trigger a full-tree size walk.
 let mut cache_did_store: Int = 0
 
-// The object answered sits in a private dir, which the caller removes after its link: the GC
-// of another build can remove the cache entry before then.
-fn cache_compile_user_c(c_path: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
-    cache_did_store = 0
-    if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() {
-        return ""
-    }
-    // Another build that writes the same C path can rewrite it at any time, so the key
-    // and the compile both read one private copy: a second read of c_path could compile
-    // other bytes than the ones hashed and store that object under the key.
-    let snap_dir = build_objcache.make_private_dir()
-    if snap_dir == "" {
-        return ""
-    }
-    let obj = cache_compile_snapshot(c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags)
-    if obj == "" {
-        let _ = build_fs.remove_tree(snap_dir)
-    }
-    obj
-}
-
-fn cache_compile_snapshot(c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
-    let snap = "{snap_dir}/{path_basename(c_path)}"
-    if shell_exec("cp {c_path} {snap}") != 0 {
-        return ""
-    }
+// The object answered sits in snap_dir, which the caller removes after its link: the GC of
+// another build can remove the cache entry before then. The key and the compile both read
+// snap, the private copy of the C the build emitted.
+fn cache_compile_snapshot(snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
     let mut vendored_dirs: List[Str] = []
     for part in include_flags.split(" ") {
         if part.starts_with("-I") {
@@ -1194,7 +1181,7 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO {
     1
 }
 
-fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report, IO {
+fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report, IO {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -1231,15 +1218,26 @@ fn do_link_target(out: Str, c_path: Str, link_flags: Str, obj_files: List[Str], 
     // would never have produced the .o at all.
     // The object key does not cover the compiler archive header, which each corpus run
     // rebuilds, so a unit that reads it is never cached.
-    let cached_o = if compiler_archive != "" { "" } else { cache_compile_user_c(c_path, debug_mode, release_mode, target, arc_dir, include_flags) }
-    let compile_input = if cached_o != "" { cached_o } else { c_path }
+    cache_did_store = 0
+    let use_cache = compiler_archive == "" && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled()
+    // The cache links in an object staged in its own tmp dir, so a cached compile reads its
+    // copy of the C there.
+    let cache_dir = if use_cache { build_objcache.make_private_dir() } else { "" }
+    let snap_dir = if cache_dir != "" { cache_dir } else { build_fs.private_dir(path_dirname(c_path), ".unit") }
+    if snap_dir == "" {
+        io.eprintln("error: cannot make a private directory beside {c_path}")
+        return 1
+    }
+    let snap = "{snap_dir}/{path_basename(c_path)}"
+    write_file(snap, c_source)
+    let cached_o = if cache_dir != "" { cache_compile_snapshot(snap, c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags) } else { "" }
+    // The map gives the binary the __FILE__ and debug paths a compile of c_path gives.
+    let compile_input = if cached_o != "" { cached_o } else { "{snap} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}" }
     if build_objcache.dev_evict_at("link") {
         dbg_trace("build.units", "dev evict link")
     }
     let rc = run_cc("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
-    if cached_o != "" {
-        let _ = build_fs.remove_tree(path_dirname(cached_o))
-    }
+    let _ = build_fs.remove_tree(snap_dir)
     if rc != 0 {
         io.println("error: C compilation failed")
         return rc
@@ -1376,17 +1374,20 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         }
         None => {}
     }
-    let rc = do_compile(source_path, c_path, format_flag, debug_mode, strict_mode)
-    if rc != 0 {
-        return rc
+    // The link flags come from this text and the compile reads a private copy of it: another
+    // build that writes c_path can rewrite it at any time, and a second read of c_path could
+    // link the object of one program with the native deps of another.
+    let c_source = match compile_to_text(source_path, format_flag, debug_mode, strict_mode) {
+        Ok(text) => text
+        Err(rc) => return rc
     }
+    write_file(c_path, c_source)
 
     if emit_mode == "c" {
         return 0
     }
 
     let source = read_file(source_path)
-    let c_source = read_file(c_path)
     let has_async = detect_async(source)
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
@@ -1405,7 +1406,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, target)
         let inc_flags = resolve_vendored_includes(used_deps, target)
-        let lrc = do_link_target(output_path, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive)
+        let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive)
         if lrc != 0 {
             return lrc
         }
@@ -1430,7 +1431,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
         let out = "{output_path}-{alias}"
         fs_remove(out)
-        let lrc = do_link_target(out, c_path, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive)
+        let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive)
         if lrc != 0 {
             return lrc
         }
