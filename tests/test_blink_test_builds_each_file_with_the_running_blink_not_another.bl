@@ -1,0 +1,44 @@
+// `blink test` builds each test file in a child process, and that child must be the blink
+// that runs the command: another blink can build with a compiler and stdlib other than the
+// ones that typechecked the file. A `blink` first on PATH, or a build/blink in the project,
+// can be any program. Each fake here writes a marker and fails.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A project with one passing test file, and a fake blink at {dir}/fake/blink.
+fn project() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_test_worker_bin.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests {dir}/fake")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/tests/test_one.bl", "test \"one\" \{\n    assert(1 == 1)\n}\n")
+    write_file("{dir}/fake/blink", "#!/bin/sh\ntouch {dir}/marker\nexit 1\n")
+    let _ = sh("chmod +x {dir}/fake/blink")
+    dir
+}
+
+test "blink test does not build with a blink that is first on PATH" {
+    let dir = project()
+    let r = sh("B=$(readlink -f build/blink); cd {dir} && env -u BLINK_BIN -u BLINK_PER_MODULE PATH={dir}/fake:$PATH $B test tests")
+    let used_fake = sh("test -e {dir}/marker").exit_code == 0
+    let _ = sh("rm -rf {dir}")
+
+    assert(!used_fake, "a build worker ran the blink on PATH:\n{r.out}{r.err_out}")
+    assert_eq(r.exit_code, 0)
+}
+
+test "blink test does not build with a build/blink in the project" {
+    let dir = project()
+    let _ = sh("mkdir -p {dir}/build && cp {dir}/fake/blink {dir}/build/blink")
+    let r = sh("B=$(readlink -f build/blink); cd {dir} && env -u BLINK_BIN -u BLINK_PER_MODULE $B test tests")
+    let used_fake = sh("test -e {dir}/marker").exit_code == 0
+    let _ = sh("rm -rf {dir}")
+
+    assert(!used_fake, "a build worker ran the project's build/blink:\n{r.out}{r.err_out}")
+    assert_eq(r.exit_code, 0)
+}
