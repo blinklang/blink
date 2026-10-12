@@ -44,6 +44,10 @@
 #   privfn-<module>      a new private fn added at the end of a module
 #   testblock-<module>   a test block added at the end of a module that is not the entry. No
 #                        unit prints it, so the C is the warm C
+#   trait-<module>       a trait added at the end of a module that is not the entry. A trait
+#                        prints no C, so the C is the warm C
+#   annfn-<module>       a new private fn under @deprecated added at the end of a module that
+#                        is not the entry
 #   global-<module>      a new value for the Int literal that initializes a global of a module
 #                        that is not the entry (cli only: no such module of small has one)
 #   run-body-<module>    `blink run` after the (a) edit
@@ -231,6 +235,8 @@ edit_body() {
 }
 edit_pub() { printf '\npub fn bench_added_%s() -> Int { 1 }\n' "$2" >> "$1"; }
 edit_priv() { printf '\nfn bench_added_%s() -> Int { 1 }\n' "$2" >> "$1"; }
+edit_trait() { printf '\ntrait BenchAdded%s {\n    fn bench_probe(self) -> Int\n}\n' "$2" >> "$1"; }
+edit_annfn() { printf '\n@deprecated("bench")\nfn bench_added_%s() -> Int { 1 }\n' "$2" >> "$1"; }
 edit_test() { printf '\ntest "bench added %s" {\n    assert_eq(1, 1)\n}\n' "$2" >> "$1"; }
 # The new value comes from the nonce, so each run's C differs from every other run's.
 edit_global() {
@@ -250,6 +256,8 @@ rep() {
         pub) edit_pub "$dir/$efile" "$nonce" ;;
         priv) edit_priv "$dir/$efile" "$nonce" ;;
         testblock) edit_test "$dir/$efile" "$nonce" ;;
+        trait) edit_trait "$dir/$efile" "$nonce" ;;
+        annfn) edit_annfn "$dir/$efile" "$nonce" ;;
         global) edit_global "$dir/$efile" "$efn" "$nonce" ;;
         cold-obj) rm -rf "$dir/build/obj-cache" ;;
         cold-all)
@@ -395,6 +403,8 @@ for target in ${BENCH_TARGETS:-cli small}; do
     done
     for tf in $(tv testblock "$target"); do
         run_case "$target" "testblock-$(modname "$tf")" testblock "$bc" same "$base_build" "$tf"
+        run_case "$target" "trait-$(modname "$tf")" trait "$bc" same "$base_build" "$tf"
+        run_case "$target" "annfn-$(modname "$tf")" annfn "$bc" changed "$base_build" "$tf"
     done
     for spec in $(tv global "$target"); do
         f=${spec%%:*} fn=${spec#*:}
