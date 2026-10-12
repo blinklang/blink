@@ -2144,6 +2144,48 @@ order, is no slower on any row: no median of a change run is above the max of
 a base run. Its rows are in `bench/edit_loop/clang_archive_pch_gcc_*.tsv`,
 and the clang rows in `bench/edit_loop/clang_archive_pch_daemon_*.tsv`.
 
+### Paths a debug object records
+
+An object is correct in the cache only when its bytes follow from its
+key. A unit compiled with `--debug` (`-g -O0 -DBLINK_DEBUG`) records
+paths in its debug info. Two trees whose headers are byte-equal gave
+equal keys, so tree B took tree A's objects, and a debugger in B opened
+A's files. Found with `readelf --debug-dump=info,line` (gcc compresses
+its debug sections, so `grep -a` finds nothing), gcc 16.2.1 and clang
+23.1.1, per-module and one-unit, `-o` relative and absolute:
+
+| path | from | `--debug` | default, `--release` |
+|---|---|---|---|
+| compile dir (`DW_AT_comp_dir`) | the cwd of cc | yes | no |
+| unit name and a line-table dir | `-ffile-prefix-map=<work>=<units_dir>` (one unit: the dir of the C path) | yes | no |
+| archive dir | `-I<arc_dir>` (clang names it from the compile dir when it is under it) | yes | no |
+| vendored include dirs | `-I` | yes | no |
+| `/usr/include` | the system headers | yes | no |
+| `app/src/main.bl` | panic and assert text in the C | yes | yes |
+
+The work and hold dirs are mapped away. Panic text and `__FILE__` in
+the C are in the source sha. The vendored include dirs were already in
+the key as `<dir>=<sha>` lines, and `cc --version` covers `/usr/include`.
+
+So at `--debug` the key also holds the compile dir, the dir the C is
+named under and the archive dir (`recorded_paths` in `cli.bl`). They
+are not mapped away: a debugger in the tree needs them to find the
+source. At the other levels an object records none of them and its key
+does not change, so worktrees and CI trees with equal headers still
+share objects. The test of two trees shows it: tree B compiles no unit
+at the default level.
+
+gcc and clang both take the compile dir from `$PWD` when it is absolute
+and names the cwd, else from `getcwd`. A cwd reached through a link is
+then a dir of its own. `build_objcache.compile_dir` reads the dir the
+same way and sets `PWD` to it, so each cc the build starts records the
+dir the key holds.
+
+The PCH key holds the archive dir and no compile dir. A PCH built in
+one compile dir and read from another, with the same archive dir, gives
+objects byte-equal to those built without it, with gcc and clang. The
+unit key holds the compile dir, so the object of each tree is its own.
+
 ### Holds against a concurrent GC
 
 Two builds that share an obj cache can race: the GC of one can remove an
