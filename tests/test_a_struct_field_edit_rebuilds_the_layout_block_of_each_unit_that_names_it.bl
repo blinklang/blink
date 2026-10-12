@@ -1,0 +1,130 @@
+// A module-level global that holds a struct puts the struct's guarded GC layout function in the
+// entry module's private header, and a unit that names the function holds a copy of that
+// block. Adding a pointer field to the struct changes the block. A build that follows, with
+// the same units directory and object cache, must not link an object compiled from the old
+// block: the collector would scan the old words of each copy, miss the new field, and free
+// what it points at. The program fills the global, forces full collections while it allocates
+// garbage, then reads every new field back.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn shapes_source(with_tag: Bool) -> Str {
+    let field = if with_tag { "\n    tag: Str" } else { "" }
+    let init = if with_tag { ", tag: \"tag-\{n}-\{n * 7}\"" } else { "" }
+    let text = if with_tag { "\"\{p.x} \{p.y} \{p.tag}\"" } else { "\"\{p.x} \{p.y}\"" }
+    [
+        "pub type Point \{",
+        "    x: Int",
+        "    y: Int{field}",
+        "}",
+        "",
+        "pub fn make_point(n: Int) -> Point \{",
+        "    Point \{ x: n, y: n * 2{init} }",
+        "}",
+        "",
+        "pub fn point_text(p: Point) -> Str \{",
+        "    {text}",
+        "}",
+        "",
+    ].join("\n")
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"layout_edit_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/shapes.bl", shapes_source(false))
+    write_file("{tree}/app/src/main.bl", [
+        #"import shapes.{Point, make_point, point_text}"#,
+        #""#,
+        #"@ffi("GC_gcollect", header: "gc.h")"#,
+        #"@trusted(audit: "TEST-GC-COLLECT: force a full collection so lost fields show")"#,
+        #"fn t_gc_collect() -> Void ! FFI {}"#,
+        #""#,
+        #"let GRID: List[List[Point]] = [[make_point(1), make_point(2)], [make_point(3)]]"#,
+        #""#,
+        #"fn churn() {"#,
+        #"    let mut i = 0"#,
+        #"    while i < 4 {"#,
+        #"        let sb = StringBuilder.new()"#,
+        #"        let mut j = 0"#,
+        #"        while j < 20000 {"#,
+        #"            sb.write("garbage {j} ")"#,
+        #"            j += 1"#,
+        #"        }"#,
+        #"        let _ = sb.to_str().split(" ")"#,
+        #"        t_gc_collect()"#,
+        #"        i += 1"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    churn()"#,
+        #"    let mut parts: List[Str] = []"#,
+        #"    for row in GRID {"#,
+        #"        for p in row { parts.push(point_text(p)) }"#,
+        #"    }"#,
+        #"    io.println(parts.join(", "))"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// The units a build compiled, read from its build.units trace, in trace order.
+fn units_compiled(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let mark = "[dbg:build.units] compile "
+        if line.starts_with(mark) {
+            out.push(line.byte_slice(mark.byte_len(), line.byte_len()).trim())
+        }
+    }
+    out
+}
+
+fn build_app(tree: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+test "a pointer field added to a struct reaches the layout of every unit without a clean" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_layout_edit_{getpid()}"
+    dev_tree(root, tree)
+    let _ = build_app(tree)
+    let out_cold = sh("{tree}/out/app")
+    let main_c_cold = read_file("{tree}/out/app.units/__main__.c")
+    write_file("{tree}/app/src/shapes.bl", shapes_source(true))
+    let edited = build_app(tree)
+    let out_edited = sh("{tree}/out/app")
+    let main_c_edited = read_file("{tree}/out/app.units/__main__.c")
+    let main_bl = read_file("{tree}/app/src/main.bl")
+    shell_exec("rm -rf {tree}")
+    assert(!main_bl.contains("tag"), "the edit touched main.bl: {main_bl}")
+    assert_eq(out_cold, "1 2, 2 4, 3 6")
+    assert(main_c_cold.contains("blink_gc_layout_shapes_Point()"), "__main__.c does not name the layout fn:\n{main_c_cold}")
+    assert(!main_c_cold.contains("offsetof(blink_shapes_Point, tag)"), "the cold layout already has the field:\n{main_c_cold}")
+    assert(main_c_edited.contains("offsetof(blink_shapes_Point, tag)"), "__main__.c holds the old layout block:\n{main_c_edited}")
+    assert(units_compiled(edited).contains("__main__"), "the edited build linked the old __main__ object: {edited.err_out}")
+    assert_eq(out_edited, "1 2 tag-1-7, 2 4 tag-2-14, 3 6 tag-3-21")
+}

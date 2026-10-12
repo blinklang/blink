@@ -4,7 +4,7 @@
 // gets nothing of it. A guarded block of any other shape, or one with no end, is a header the
 // scan cannot read, so it is included whole.
 
-import build_unit_headers.{HeaderIndex, index_headers, unit_declarations}
+import build_unit_headers.{HeaderIndex, Decl, index_headers, unit_declarations}
 import cname.{c_gc_layout_head}
 
 fn layout_block(name: Str) -> Str {
@@ -80,6 +80,72 @@ test "a guarded block of any other shape makes the header whole" {
     }
 }
 
+fn guarded(ifndef: Str, define: Str, head: Str, body: List[Str]) -> Str {
+    let mut lines = ["#ifndef BLINK_TD_{ifndef}", "#define BLINK_TD_{define}", "static BLINK_UNUSED GC_descr {head}(void) \{"]
+    for l in body { lines.push(l) }
+    lines.join("\n")
+}
+
+// The lines of the declarations of `ds` named `name`, or, when `named` is false, of the others.
+fn lines_of(ds: List[Decl], name: Str, named: Bool) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in ds {
+        if (d.name == name) == named { out.push(d.line) }
+    }
+    out
+}
+
+let CELL_LINE: Str = "    static blink_gc_descr_cell cell;"
+let RETURN_LINE: Str = "    return blink_gc_descr_get(&cell, (int64_t)sizeof(blink_Point), NULL, 0);"
+let P: Str = "blink_gc_layout_Point"
+
+test "a guarded block whose guard and head name differ makes the header whole" {
+    let rows = [
+        guarded(P, "blink_gc_layout_Pair", P, [CELL_LINE, RETURN_LINE, "}", "#endif"]),
+        guarded("blink_gc_layout_Pair", P, P, [CELL_LINE, RETURN_LINE, "}", "#endif"]),
+        guarded(P, P, "blink_gc_layout_Pair", [CELL_LINE, RETURN_LINE, "}", "#endif"]),
+    ]
+    for body in rows {
+        assert_eq(index_of(priv_header(body)).always.join(","), "__main__.priv.h")
+    }
+}
+
+test "a guarded block nested in a layout block makes the header whole" {
+    let rows = [
+        guarded(P, P, P, [CELL_LINE, "    #ifndef BLINK_TD_blink_u_inner", "    #define BLINK_TD_blink_u_inner", "    #endif", RETURN_LINE, "}", "#endif"]),
+        guarded(P, P, P, [CELL_LINE, "#ifndef BLINK_TD_blink_u_inner", "#define BLINK_TD_blink_u_inner", "#endif", RETURN_LINE, "}", "#endif"]),
+    ]
+    for body in rows {
+        assert_eq(index_of(priv_header(body)).always.join(","), "__main__.priv.h")
+    }
+}
+
+test "a second define or definition before a layout block's end makes the header whole" {
+    let rows = [
+        guarded(P, P, P, [CELL_LINE, RETURN_LINE, "}", "#define BLINK_TD_blink_u_other", "#endif"]),
+        guarded(P, P, P, [CELL_LINE, "    #define BLINK_U_LIMIT 4", RETURN_LINE, "}", "#endif"]),
+        guarded(P, P, P, [CELL_LINE, RETURN_LINE, "}", "static int64_t blink_u_more(void) \{ return 1; }", "#endif"]),
+        guarded(P, P, P, [CELL_LINE, "    static int64_t blink_u_more(void) \{ return 1; }", RETURN_LINE, "}", "#endif"]),
+        guarded(P, P, P, [CELL_LINE, RETURN_LINE, "}", "static BLINK_UNUSED GC_descr {P}(void) \{", CELL_LINE, RETURN_LINE, "}", "#endif"]),
+    ]
+    for body in rows {
+        assert_eq(index_of(priv_header(body)).always.join(","), "__main__.priv.h")
+    }
+}
+
+// The scan reads what the emitter writes for a struct with pointer fields too: a spans table
+// between the cell and the return.
+test "a layout block with a spans table is one declaration" {
+    let spans = "    static const int64_t spans[] = \{ offsetof(blink_Point, tag), sizeof(((blink_Point*)0)->tag) };"
+    let ret = "    return blink_gc_descr_get(&cell, (int64_t)sizeof(blink_Point), spans, 1);"
+    let block = guarded(P, P, P, [CELL_LINE, spans, ret, "}", "#endif"])
+    let idx = index_of(priv_header(block))
+    assert_eq(idx.always.len(), 0)
+    let ds = idx.decls.get("__main__.priv.h").unwrap()
+    let named = lines_of(ds, P, true)
+    assert_eq(named.join("|"), block)
+}
+
 // The blocks above spell the head out, so they read what the emitter writes only while the
 // head the scan and the emitter share is this line.
 test "the head the scan reads is the layout function's first line" {
@@ -95,4 +161,25 @@ test "a guarded block with no end makes the header whole" {
     ].join("\n")
     let idx = index_headers(["__main__.priv.h"], ["#ifndef BLINK_MODPRIV___main___H\n#define BLINK_MODPRIV___main___H\n{open}\n"], "blink.types.h")
     assert_eq(idx.always.join(","), "__main__.priv.h")
+}
+
+// A build that takes units compares each changed header's declarations, from index_headers
+// on its last and its new text, by line. A layout block whose body changed must read as the
+// one name it declares with a different line, so a unit that names it is not taken.
+test "a layout block whose body changed reads as its one name with a new line" {
+    let old_block = guarded(P, P, P, [CELL_LINE, RETURN_LINE, "}", "#endif"])
+    let spans = "    static const int64_t spans[] = \{ offsetof(blink_Point, tag), sizeof(((blink_Point*)0)->tag) };"
+    let ret = "    return blink_gc_descr_get(&cell, (int64_t)sizeof(blink_Point), spans, 1);"
+    let new_block = guarded(P, P, P, [CELL_LINE, spans, ret, "}", "#endif"])
+    let od = index_of(priv_header(old_block)).decls.get("__main__.priv.h").unwrap()
+    let nd = index_of(priv_header(new_block)).decls.get("__main__.priv.h").unwrap()
+    let old_named: List[Decl] = od.filter(fn(d) { d.name == P })
+    let new_named: List[Decl] = nd.filter(fn(d) { d.name == P })
+    assert_eq(old_named.len(), 1)
+    assert_eq(new_named.len(), 1)
+    assert_eq(old_named.get(0).unwrap().line, old_block)
+    assert_eq(new_named.get(0).unwrap().line, new_block)
+    let other_old = lines_of(od, P, false)
+    let other_new = lines_of(nd, P, false)
+    assert_eq(other_old.join("\n"), other_new.join("\n"))
 }
