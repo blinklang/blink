@@ -1,6 +1,7 @@
 import std.json.{json_parse, json_get, json_as_str, json_as_int, json_as_bool, json_type, json_clear, JSON_BOOL, JSON_INT}
 import std.num.{parse_int}
-import diagnostics.{Diag, DiagEntry, diag_entries, diag_count, json_escape}
+import diagnostics.{Diag, DiagEntry, diag_entries, diag_count, json_escape, diag_set_abort_lsp}
+import lsp_protocol.{lsp_frame, lsp_to_zero_based, lsp_end_line, lsp_end_col, lsp_build_diagnostics_json}
 import compiler.{compile_to_program}
 import lexer.{Lex, lex, token_count, token_at, tokens}
 import typecheck.{TypeCheck, tc_hints, HintEntry}
@@ -57,9 +58,7 @@ fn lsp_read_message() -> Str ! IO {
 }
 
 fn lsp_write_message(body: Str) ! IO {
-    let len = body.byte_len()
-    io.write("Content-Length: {len}\r\n\r\n")
-    io.write(body)
+    io.write(lsp_frame(body))
 }
 
 fn lsp_send_response_int(id: Int, result_json: Str) ! IO {
@@ -92,65 +91,6 @@ fn lsp_uri_to_path(uri: Str) -> Str {
         return uri.byte_slice(7, uri.byte_len())
     }
     uri
-}
-
-fn lsp_severity(sev: Str) -> Int {
-    if sev == "ice" {
-        return 1
-    }
-    if sev == "error" {
-        return 1
-    }
-    if sev == "warning" {
-        return 2
-    }
-    3
-}
-
-fn lsp_to_zero_based(n: Int) -> Int {
-    if n > 0 {
-        return n - 1
-    }
-    0
-}
-
-fn lsp_end_line(d: DiagEntry, fallback_line: Int) -> Int {
-    if d.end_line > 0 { lsp_to_zero_based(d.end_line) } else { fallback_line }
-}
-
-fn lsp_end_col(d: DiagEntry, fallback_col: Int) -> Int {
-    if d.end_line > 0 { lsp_to_zero_based(d.end_col) }
-    else if d.end_col > d.col { lsp_to_zero_based(d.end_col) }
-    else { fallback_col }
-}
-
-fn lsp_build_diagnostics_json(uri: Str, diags: List[DiagEntry]) -> Str {
-    let mut sb = StringBuilder.new()
-    let diag_hdr = "\{\"uri\":\""
-    let diag_mid = "\",\"diagnostics\":["
-    sb.write(diag_hdr)
-    sb.write(uri)
-    sb.write(diag_mid)
-    let mut i = 0
-    while i < diags.len() {
-        let d = diags.get(i).unwrap()
-        if i > 0 {
-            sb.write(",")
-        }
-        let sev = lsp_severity(d.severity)
-        let line = lsp_to_zero_based(d.line)
-        let col = lsp_to_zero_based(d.col)
-        let end_line = lsp_end_line(d, line)
-        let end_col = lsp_end_col(d, col)
-        let code = json_escape(d.code)
-        let msg = json_escape(d.message)
-        let entry = "\{\"range\":\{\"start\":\{\"line\":{line},\"character\":{col}\},\"end\":\{\"line\":{end_line},\"character\":{end_col}\}\},\"severity\":{sev},\"code\":\"{code}\",\"source\":\"blink\",\"message\":\"{msg}\"\}"
-        sb.write(entry)
-        i = i + 1
-    }
-    let diag_end = "]\}"
-    sb.write(diag_end)
-    sb.to_str()
 }
 
 fn lsp_publish_diagnostics(uri: Str) ! IO {
@@ -220,7 +160,9 @@ fn lsp_handle_did_open_or_save(root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build
     if uri == "" {
         return
     }
+    diag_set_abort_lsp(uri, None)
     lsp_check_and_publish(uri, lsp_uri_to_path(uri))
+    diag_set_abort_lsp("", None)
 }
 
 fn lsp_handle_did_close(root: Int) ! IO {
@@ -703,6 +645,12 @@ fn lsp_handle_formatting(id: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Bu
         lsp_send_response_int(id, "[]")
         return
     }
+    diag_set_abort_lsp(uri, Some(id))
+    lsp_format_document(id, uri)
+    diag_set_abort_lsp("", None)
+}
+
+fn lsp_format_document(id: Int, uri: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
     let path = lsp_uri_to_path(uri)
     let source = read_file(path)
     if source == "" {

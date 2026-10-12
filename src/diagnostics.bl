@@ -1,3 +1,4 @@
+import lsp_protocol.{lsp_abort_frames}
 import parser.{node_args, node_name, node_module, node_line, node_col, node_count, sublist_length, sublist_get, get_annotation}
 
 effect Diag {
@@ -421,15 +422,28 @@ type DiagIceState {
     // caller reads to decide whether a result is usable must move on every report, and a
     // reader must still be shown the fault once.
     rendered: Int
-    // The line a command prints on stdout when diag_ice_abort stops the compiler, or "".
-    abort_status_line: Str
+    // What a command prints on stdout when diag_ice_abort stops the compiler, byte for byte,
+    // or "".
+    abort_stdout: Str
+    // The document and the open request of the language server check in progress, or "" and
+    // None. diag_ice_abort writes their frames from the fault itself.
+    abort_lsp_uri: Str
+    abort_lsp_request: Option[Int]
 }
-let mut diag_ice_state: DiagIceState = DiagIceState { rendered: 0, abort_status_line: "" }
+let mut diag_ice_state: DiagIceState = DiagIceState { rendered: 0, abort_stdout: "", abort_lsp_uri: "", abort_lsp_request: None }
 
 // `blink check` sets its status line here, so a check --json that stops on an internal error
 // still ends with one.
 pub fn diag_set_abort_status_line(line: Str) {
-    diag_ice_state.abort_status_line = line
+    let text = if line == "" { "" } else { line.concat("\n") }
+    diag_ice_state.abort_stdout = text
+}
+
+// The language server names the check it starts here, and clears it with "" and None when the
+// check ends, so an editor learns of the internal error that ends the server.
+pub fn diag_set_abort_lsp(uri: Str, request_id: Option[Int]) {
+    diag_ice_state.abort_lsp_uri = uri
+    diag_ice_state.abort_lsp_request = request_id
 }
 pub let mut diag_module_files: Map[Str, Str] = Map()
 
@@ -728,8 +742,9 @@ pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: S
 pub fn diag_ice_abort(name: Str, code: Str, message: Str) {
     diag_record("ice", name, code, message, 0, 0, 0, 0, "", [])
     io.eprint(diag_render(diag_format))
-    if diag_ice_state.abort_status_line != "" {
-        io.println(diag_ice_state.abort_status_line)
+    io.print(diag_ice_state.abort_stdout)
+    if diag_ice_state.abort_lsp_uri != "" {
+        io.print(lsp_abort_frames(diag_ice_state.abort_lsp_uri, diag_ice_state.abort_lsp_request, name, code, message))
     }
     exit(101)
 }
@@ -1019,8 +1034,11 @@ pub fn diag_reset() {
     diag_count = 0
     diag_warn_count = 0
     diag_ice_count = 0
-    // The abort line belongs to the command, which sets it before the compile that resets here.
-    diag_ice_state = DiagIceState { rendered: 0, abort_status_line: diag_ice_state.abort_status_line }
+    // The abort output belongs to the command, which sets it before the compile that resets here.
+    diag_ice_state = DiagIceState {
+        rendered: 0, abort_stdout: diag_ice_state.abort_stdout,
+        abort_lsp_uri: diag_ice_state.abort_lsp_uri, abort_lsp_request: diag_ice_state.abort_lsp_request,
+    }
     diag_module_files.clear()
     file_ranges.clear()
     lint_overrides.clear()
