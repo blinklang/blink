@@ -64,9 +64,10 @@ build/obj-cache/
   <16-hex>.o
   <16-hex>.meta    # one-line: "<unix-mtime> <module_key> <src_sha>"
   <16-hex>.pch/    # a PCH of the archive header (section 8)
-  tmp/             # atomic-write staging (rename into ../)
-  tmp/unit.<rand>/ # a one-unit build's C snapshot, its object, its hold
-  tmp/hold.<rand>/ # a per-module build's holds (section 5)
+  tmp/unit.<rand>/  # a one-unit build's C snapshot, its object, its hold;
+                    # or a staged PCH
+  tmp/hold.<rand>/  # a per-module build's holds (section 5)
+  tmp/stage.<rand>/ # objects on their way into the cache (rename into ../)
 ```
 
 Per-repo, not XDG: `build/` is gitignored, easy to wipe, no shared-host
@@ -148,7 +149,7 @@ LRU-by-mtime is good enough — no need to track real access counts.
     before the link or copy, or the copy fails, the unit is a miss. The
     `.meta` is touched after the hold.
   - A miss links the object the build compiled. The cache gets a hard
-    link (or a copy) of it, under a staged name in `tmp/` and then
+    link (or a copy) of it, under a staged name in `tmp/stage.<rand>/` and then
     `rename(2)`, so no build finds a part-made object under the key.
   - The units read the archive header PCH from the same hold dir (section
     8).
@@ -159,7 +160,20 @@ LRU-by-mtime is good enough — no need to track real access counts.
     make one evict a little early.
   - A build also removes its hold dir when a unit fails to compile and
     when its link fails. A daemon build runs the same path in its child.
-  - A build that is killed leaves its `tmp/` dir. Nothing reaps one yet.
+  - A build that is killed leaves its `tmp/` dir, and the next build that
+    makes a `tmp/` dir removes it. Each such dir holds a mark,
+    `.blink-live`, and its build holds a `flock(2)` on the dir, which the
+    kernel drops when the build dies. No cc the build starts gets the lock,
+    so a cc that outlives a build killed with `SIGTERM` does not pin the
+    dir; the reap makes that cc fail to write its object. The build takes the lock before it
+    writes the mark. A build removes a dir of `tmp/` only when the dir has
+    the mark and the build can take the lock, and it holds the lock while
+    it removes the dir. So it never removes the dir of a live build. A dir
+    with no mark, as an older compiler makes, stays. The `.unit.<rand>`
+    and `.units.<rand>` dirs beside an output, and the staging dir of a
+    stdlib archive build (`std-cache/tmp.<rand>`), work the same way. A
+    build drops the mark and the lock of a dir just before it renames the
+    dir to its final name.
   - Dev knob: `BLINK_DEV_OBJCACHE_EVICT=compile` empties the cache, as
     `blink cache clean` does, after the build's lookups and before its
     units compile; `=link` does it just before the link. It stands in for

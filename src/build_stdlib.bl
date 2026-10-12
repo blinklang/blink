@@ -257,10 +257,15 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
         return 0
     }
     // Built aside and renamed into place, so a concurrent build of the same key never
-    // reads a half-written entry.
-    let cache_dir = "{final_dir}.tmp-{getpid()}"
-    shell_exec("rm -rf {cache_dir}")
-    shell_exec("mkdir -p {cache_dir}")
+    // reads a half-written entry. A build that stops before the rename, killed or failed,
+    // leaves its dir, which a later archive build reaps.
+    let _ = build_fs.mkdir_p("{build_dir}/std-cache")
+    build_fs.reap_dead("{build_dir}/std-cache", ["tmp"])
+    let cache_dir = build_fs.private_dir("{build_dir}/std-cache", "tmp")
+    if cache_dir == "" {
+        io.eprintln("error: cannot make a staging directory in {build_dir}/std-cache")
+        return 1
+    }
 
     let entry_bl = "{cache_dir}/__archive_main.bl"
     write_file(entry_bl, synthesize_entry_source(modules))
@@ -320,8 +325,11 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h")
     write_file("{cache_dir}/.stamp", "")
     if force_rebuild { shell_exec("rm -rf {final_dir}") }
-    // A concurrent build of the same key that renamed first wins; its entry is as good.
-    shell_exec("if [ -e {final_dir} ]; then rm -rf {cache_dir}; else mv {cache_dir} {final_dir}; fi")
+    // Under its key the dir is no longer one a reaper may take.
+    build_fs.unmark(cache_dir)
+    // A concurrent build of the same key that renamed first wins; its entry is as good. The
+    // entry takes the mode mkdir -p gave it before the staging dir was private.
+    shell_exec("if [ -e {final_dir} ]; then rm -rf {cache_dir}; else chmod 755 {cache_dir}; mv {cache_dir} {final_dir}; fi")
     relink_archive(build_dir, "std-cache/{hash}")
     0
 }

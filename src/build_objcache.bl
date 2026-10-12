@@ -7,8 +7,12 @@
 //   <16-hex>.o                — the cached object
 //   <16-hex>.meta             — "<unix-mtime> <module_key> <src_sha>"
 //   <16-hex>.pch/             — a PCH of the archive header (see pch_key)
-//   tmp/unit.<rand>/          — a build's private C snapshot and staged .o
-//   tmp/<label>.<pid>.<n>.o   — `blink cache __store` staging
+//   tmp/unit.<rand>/          — a build's private C snapshot and staged .o, or a staged PCH
+//   tmp/hold.<rand>/          — a build's links to the objects it links (make_hold_dir)
+//   tmp/stage.<rand>/         — objects on their way into the cache (install_objs, __store)
+//
+// A build removes each tmp/ dir it makes; the first one it makes also removes those a killed
+// build left (build_fs.reap_dead).
 //
 // Hits touch .meta mtime so LRU-by-mtime survives stdlib re-reads.
 // Stores rename(2) into place. Two parallel jobs racing on the same
@@ -44,25 +48,18 @@ pub fn ensure_dir() ! IO {
     let _ = build_fs.mkdir_p("{obj_cache_dir()}/tmp")
 }
 
-// Per-process counter so each call to make_staging_path is unique even
-// when invoked back-to-back inside the same build.
-let mut stage_counter: Int = 0
-
-// Produce a per-process unique staging path under tmp/. The header
-// comment promises tmp/<pid>.<rand>.o atomicity — parallel jobs that
-// hit the same key must not collide on the staging file.
-pub fn make_staging_path(label: Str) -> Str {
-    stage_counter = stage_counter + 1
-    let pid = getpid()
-    "{obj_cache_dir()}/tmp/{label}.{pid}.{stage_counter}.o"
-}
-
-// A directory no other build writes, under tmp/ so a rename out of it stays on one
+// A dir of prefix no other build writes, under tmp/ so a rename out of it stays on one
 // filesystem. A pid and a counter are not enough: two pid namespaces can share a cache
 // dir. "" when it cannot be made.
-pub fn make_private_dir() -> Str ! IO {
+fn make_tmp_dir(prefix: Str) -> Str ! IO {
     ensure_dir()
-    build_fs.private_dir("{obj_cache_dir()}/tmp", "unit")
+    let tmp = "{obj_cache_dir()}/tmp"
+    build_fs.reap_dead(tmp, ["unit", "hold", "stage"])
+    build_fs.private_dir(tmp, prefix)
+}
+
+pub fn make_private_dir() -> Str ! IO {
+    make_tmp_dir("unit")
 }
 
 fn cc_identity() -> Str {
@@ -519,8 +516,7 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO {
 // in a dir under tmp/ that no GC removes, and removes that dir after its link. "" when none
 // can be made.
 pub fn make_hold_dir() -> Str ! IO {
-    ensure_dir()
-    build_fs.private_dir("{obj_cache_dir()}/tmp", "hold")
+    make_tmp_dir("hold")
 }
 
 // A hard link at to for the file at from, or a copy where the filesystem makes no link. False
@@ -565,8 +561,10 @@ pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str) -> Bool !
     if !cache_enabled() {
         return false
     }
-    ensure_dir()
-    install_at(obj_cache_dir(), key, obj_path, "{time.read().to_unix_secs()} {module_key} {src_sha}\n")
+    let stage = make_tmp_dir("stage")
+    let ok = install_at(obj_cache_dir(), stage, key, obj_path, "{time.read().to_unix_secs()} {module_key} {src_sha}\n")
+    let _ = build_fs.remove_tree(stage)
+    ok
 }
 
 // install for each (key, obj_path, module_key), in order.
@@ -579,20 +577,25 @@ pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str
         return out
     }
     let dir = obj_cache_dir()
-    ensure_dir()
+    let stage = make_tmp_dir("stage")
     let now = time.read().to_unix_secs()
     let mut i = 0
     while i < keys.len() {
         let m = module_keys.get(i).unwrap()
-        out.set(i, install_at(dir, keys.get(i).unwrap(), obj_paths.get(i).unwrap(), "{now} {m} \n"))
+        out.set(i, install_at(dir, stage, keys.get(i).unwrap(), obj_paths.get(i).unwrap(), "{now} {m} \n"))
         i = i + 1
     }
+    let _ = build_fs.remove_tree(stage)
     out
 }
 
-fn install_at(dir: Str, key: Str, obj_path: Str, meta: Str) -> Bool ! IO {
-    // A staged name, so no build links a part-made copy under the key.
-    let staging = make_staging_path("install")
+// A staged name in stage, so no build links a part-made copy under the key. False with no
+// stage dir.
+fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool ! IO {
+    if stage == "" {
+        return false
+    }
+    let staging = "{stage}/{key}.o"
     if hold_file(obj_path, staging) && build_fs.rename(staging, "{dir}/{key}.o") {
         write_file("{dir}/{key}.meta", meta)
         return true
@@ -735,6 +738,8 @@ pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO {
 // the rename failed; the staged dir is gone either way.
 pub fn store_pch(key: Str, staged: Str) -> Bool ! IO {
     let dir = pch_dir(key)
+    // Under its key the dir is no longer one a reaper may take.
+    build_fs.unmark(staged)
     if build_fs.rename(staged, dir) {
         write_file("{obj_cache_dir()}/{key}.meta", "{time.read().to_unix_secs()} pch \n")
         return true
@@ -902,10 +907,15 @@ pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str)
         io.eprintln("error: source obj does not exist: {src_obj}")
         return 1
     }
-    ensure_dir()
-    let staging = make_staging_path(module_key)
+    let stage = make_tmp_dir("stage")
+    if stage == "" {
+        io.eprintln("error: cannot make a staging directory in {obj_cache_dir()}/tmp")
+        return 1
+    }
+    let staging = "{stage}/{key}.o"
     shell_exec("cp {src_obj} {staging}")
     store(key, staging, module_key, src_sha)
+    let _ = build_fs.remove_tree(stage)
     0
 }
 
