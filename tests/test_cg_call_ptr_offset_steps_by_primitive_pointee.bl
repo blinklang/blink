@@ -1,0 +1,89 @@
+// `p.offset(i)` over a primitive pointee is C pointer arithmetic on the receiver's own C
+// type, so C steps by `sizeof` the pointee: `int32_t* + i` moves four bytes a cell. A byte
+// offset, or arithmetic on a pointer spelled as one word, would compute an address C never
+// meant. The step is right exactly when the arithmetic is a `+` spelled at the pointee's
+// own pointer type, so that is what each row pins.
+import lower_test_helpers.{probe_but, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies, assert_ice_saying}
+import parser.{node_count, node_kind, node_name}
+import ast.{NodeKind, nk_of}
+import layout.{binder_scope_push, bind_binder, tid_of_node}
+import ir.{IrKind, ir_c_name, ir_c_spelling}
+import cg_call.{lower_call}
+import std.io
+
+// `void_step` is refused by the front end on purpose (C has no `sizeof(void)`); the stage's
+// own backstop for it is the last row.
+fn probe_steps() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe_but("cg_call_ptr_offset_primitive", src_steps(), "FfiOffsetUnknownStride")
+    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+}
+
+fn with_resource_of(name: Str) -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if nk_of(node_kind(i)) == NodeKind.WithResource && node_name(i) == name { return i }
+        i = i + 1
+    }
+    io.println("FAIL: probe binds no resource named '{name}'")
+    assert(false)
+    -1
+}
+
+fn src_steps() -> Str {
+    #"@trusted(audit: "cg-call-ptr-offset-primitive-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let ints: Ptr[I32] = scope.alloc_n(4)
+        let int_step = ints.offset(2)
+        let bytes: Ptr[U8] = scope.alloc_n(4)
+        let byte_step = bytes.offset(2)
+        let wides: Ptr[Int] = scope.alloc_n(4)
+        let wide_step = wides.offset(2)
+        let reals: Ptr[Float] = scope.alloc_n(4)
+        let real_step = reals.offset(2)
+        let ptrs: Ptr[Ptr[I32]] = scope.alloc_n(4)
+        let ptr_step = ptrs.offset(2)
+        let blank: Ptr[Void] = null_ptr[Void]()
+        let void_step = blank.offset(1)
+    }
+}
+
+fn main() { go() }
+"#
+}
+
+fn assert_steps_at(name: Str, spelling: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    probe_steps()
+    let id = lower_call(rhs_of(name))
+    assert_kind("{name} kind", id, IrKind.Binary)
+    assert_eq_str("{name} operator", ir_c_name(id), "+")
+    assert_shape("{name} shape", id, "Binary(VarRef, Const)")
+    assert_eq_str("{name} spelling", ir_c_spelling(id), spelling)
+    assert_verifies("{name} verify", id)
+}
+
+test "an I32 offset is arithmetic on int32_t*" {
+    assert_steps_at("int_step", "int32_t*")
+}
+
+test "a U8 offset is arithmetic on uint8_t*" {
+    assert_steps_at("byte_step", "uint8_t*")
+}
+
+test "an Int offset is arithmetic on int64_t*" {
+    assert_steps_at("wide_step", "int64_t*")
+}
+
+test "a Float offset is arithmetic on double*" {
+    assert_steps_at("real_step", "double*")
+}
+
+test "a pointer offset is arithmetic on a pointer to the pointer" {
+    assert_steps_at("ptr_step", "int32_t**")
+}
+
+test "a Void offset that reaches the stage is refused, not stepped by a byte" {
+    probe_steps()
+    assert_ice_saying("void stride", lower_call(rhs_of("void_step")), "PointerStrideUnknown",
+        "no foreign header lays out")
+}

@@ -9350,6 +9350,26 @@ fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
     0
 }
 
+// Does `p.offset(i)` have a stride? The spec maps it to C's `ptr + i` over any `alloc_n`
+// region, so C steps by `sizeof` the pointee, and every pointee C gives a size has one: the
+// sized integers, `Int`, `Float`, a pointer and an `@ffi.struct`. `Void` has no `sizeof`,
+// an `@ffi.opaque` step is a question the spec has not settled, and a type parameter has no
+// C type until an instance names one. Codegen asks this same question before it emits the
+// arithmetic, so the two passes cannot disagree on which steps exist.
+pub fn tc_ptr_offset_stride_known(ptr_tid: Int) -> Int {
+    let pt = tc_resolve(ptr_tid)
+    if pt < 0 || pt >= ty_pool.len() { return 0 }
+    if type_kind(pt) != TyKind.Ptr { return 0 }
+    let pointee = tc_resolve(ty_pool.get(pt).unwrap().inner1)
+    if pointee < 0 || pointee >= ty_pool.len() { return 0 }
+    let k = type_kind(pointee)
+    if k == TyKind.Ptr || k == TyKind.Int || k == TyKind.Float { return 1 }
+    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return 1 }
+    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return 1 }
+    if ffi_struct_type_set.contains_key(pointee) != 0 { return 1 }
+    0
+}
+
 // Does this node denote an `FfiScope`? Read out of the memo, and out of the scope for a name
 // the memo has not reached, because the question is asked in the middle of the walk that
 // fills the memo and re-inferring here would re-report whatever the node already reported.
@@ -19029,17 +19049,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // let compare and laundered a sized-int pointee (Ptr[U8]) into an Int
             // binding; the honest form is `p.deref().to_int()`.
             if method == "deref" { return ty_pool.get(obj_t).unwrap().inner1 }
-            // Pointer arithmetic, so the pointee is PRESERVED — `obj_t` itself, not its child.
-            // Absent from the spec's operations table but defined by codegen
-            // (codegen_methods.bl:4812), described by the E0813/E0838 diagnostics, and
-            // load-bearing at lib/std/libc.bl:52,:68.
+            // Pointer arithmetic, so the pointee is PRESERVED — `obj_t` itself, not its child
+            // (sections/07_trust_modules_metadata.md:481).
             if method == "offset" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "Ptr")
-                // The step is `sizeof` the pointee's C typedef, and only an `@ffi.struct`
-                // pointee has one. Both rules are reported HERE, at the site that types the
-                // method: codegen reported the stride rule as an ICE, which named a program
-                // the user wrote wrong an internal compiler error.
-                if tc_ptr_ffi_struct_pointee(obj_t) == 0 {
+                // Both rules are reported HERE, at the site that types the method: codegen
+                // reported the stride rule as an ICE, which named a program the user wrote
+                // wrong an internal compiler error.
+                if tc_ptr_offset_stride_known(obj_t) == 0 {
                     diag_error_at("FfiOffsetUnknownStride", FFI_OFFSET_UNKNOWN_STRIDE,
                         "`offset` needs a pointee whose size is known at compile time, and {type_to_str(obj_t)} does not point at an `@ffi.struct`",
                         node,
