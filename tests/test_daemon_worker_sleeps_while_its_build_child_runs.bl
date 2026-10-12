@@ -1,0 +1,180 @@
+// While a build child runs, the daemon sleeps until a client connects or the child ends, as it
+// does with no build: it does not wake on a short timer to ask whether the child ended. The
+// build here holds in its cc, and the test counts the times the worker slept and woke, which
+// Linux gives in /proc as its voluntary context switches, over two seconds of that hold.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup, skip}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str, name: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // The daemon listens at the project root, so each tree is a project of its own.
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it serves only a client whose env is its own.
+// The cc first on PATH is the tree's, which holds a compile while cc.hold exists.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache PATH={tree}/ccwrap:$PATH"
+}
+
+// A cc that tells the test it started and then waits while cc.hold exists, then runs the
+// real cc. A build whose cc is held can not end, so whatever the test sees meanwhile it sees
+// while that build runs.
+fn hold_cc(tree: Str) {
+    let real = sh("command -v cc")
+    shell_exec("mkdir -p {tree}/ccwrap")
+    write_file("{tree}/ccwrap/cc", "#!/bin/sh\nif [ -e {tree}/cc.hold ]; then\n    touch {tree}/cc.started\n    while [ -e {tree}/cc.hold ]; do sleep 0.05; done\nfi\nexec {real} \"$@\"\n")
+    shell_exec("chmod +x {tree}/ccwrap/cc")
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} ../build/blink {args}"])
+}
+
+// Starts the command in tree in the background. Its stdout, stderr and exit code land in
+// tree/<tag>.out, .err and .rc, and the pid of the blink process in tree/<tag>.pid: the shell
+// that writes it execs env, which execs blink.
+fn blink_bg(tree: Str, args: Str, tag: Str) {
+    shell_exec("cd {tree}/app && (sh -c 'echo $$ > {tree}/{tag}.pid; exec {env_of(tree)} ../build/blink {args}' > {tree}/{tag}.out 2> {tree}/{tag}.err; echo $? > {tree}/{tag}.rc.tmp; mv {tree}/{tag}.rc.tmp {tree}/{tag}.rc) > /dev/null 2>&1 &")
+}
+
+// Whether path exists within secs seconds.
+fn appears(path: Str, secs: Int) -> Bool {
+    process_run("sh", ["-c", "for i in $(seq 1 {secs * 20}); do [ -e {path} ] && exit 0; sleep 0.05; done; exit 1"]).exit_code == 0
+}
+
+// What a command started by blink_bg ended with; exit -1 when it has not ended in 300 s.
+fn bg_result(tree: Str, tag: Str) -> ProcessResult {
+    if !appears("{tree}/{tag}.rc", 300) {
+        return ProcessResult { out: "", err_out: "", exit_code: -1 }
+    }
+    ProcessResult { out: read_file("{tree}/{tag}.out"), err_out: read_file("{tree}/{tag}.err"), exit_code: sh("cat {tree}/{tag}.rc").to_int() }
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// The children of pid, space-separated, or "".
+fn children(pid: Int) -> Str {
+    sh("ps -o pid= --ppid {pid} | tr -s ' \\n' ' '")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+
+// The times pid slept and woke, as /proc counts them, or -1 where /proc does not say.
+fn sleeps(pid: Int) -> Int {
+    let n = sh("awk '/^voluntary_ctxt_switches:/ \{print $2}' /proc/{pid}/status 2>/dev/null")
+    if n == "" { -1 } else { n.to_int() }
+}
+
+fn build(tree: Str) -> ProcessResult {
+    blink_in(tree, "build src/main.bl -o out/app")
+}
+
+test "a worker whose build child runs sleeps until the child ends, with no wake each millisecond" {
+    if file_exists("/proc/self/status") != 1 {
+        skip("this system has no /proc/self/status to count the times a process slept and woke")
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_daemon_sleeps_mid_build_{getpid()}"
+    dev_tree(root, tree, "daemon_sleeps_app")
+    hold_cc(tree)
+    let pid = start_daemon(tree)
+    let mut held = false
+    let mut worker = ""
+    let mut before = -1
+    let mut after = -1
+    let mut running = false
+    let mut b1 = ProcessResult { out: "", err_out: "", exit_code: -1 }
+    with cleanup(fn() {
+        shell_exec("rm -f {tree}/cc.hold")
+        stop_daemon(pid)
+    }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        let _w0 = build(tree)
+        edit(tree, "leaf.bl", #"s/"leaf"/"lea2"/"#)
+        shell_exec("touch {tree}/cc.hold")
+        blink_bg(tree, "build src/main.bl -o out/app", "b1")
+        held = appears("{tree}/cc.started", 120)
+        worker = children(pid).trim()
+        if worker != "" && !worker.contains(" ") {
+            before = sleeps(worker.to_int())
+            shell_exec("sleep 2")
+            after = sleeps(worker.to_int())
+        }
+        running = file_exists("{tree}/b1.rc") != 1
+        shell_exec("rm -f {tree}/cc.hold")
+        b1 = bg_result(tree, "b1")
+    }
+    shell_exec("rm -rf {tree}")
+    assert(held, "no cc started in the build through the daemon")
+    assert(worker != "" && !worker.contains(" "), "the daemon had not one worker while the build ran: '{worker}'")
+    assert(before >= 0 && after >= before, "/proc gave no count for the worker: {before} then {after}")
+    assert(running, "the build ended while its cc was held")
+    // A 1 ms timer wakes it about 2000 times in two seconds (1901 measured). A worker that
+    // sleeps until a client or its child's end wakes a handful of times, so 200 is far from both.
+    assert(after - before < 200, "the worker woke {after - before} times in two seconds of a build")
+    assert_eq(b1.exit_code, 0)
+}

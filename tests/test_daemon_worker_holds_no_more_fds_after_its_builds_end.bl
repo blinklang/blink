@@ -1,0 +1,221 @@
+// Each build the daemon runs in a child gives the worker a pipe to learn that the child ended.
+// The worker must close it however the child ends: a build that ends, a build whose client
+// dropped while it ran, and a build child something killed. The test counts the worker's open
+// fds, which Linux lists in /proc, before and after builds of each kind.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup, skip}
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str, name: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // The daemon listens at the project root, so each tree is a project of its own.
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon starts under
+// the same env, since it serves only a client whose env is its own.
+// The cc first on PATH is the tree's, which holds a compile while cc.hold exists.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache PATH={tree}/ccwrap:$PATH"
+}
+
+// A cc that tells the test it started and then waits while cc.hold exists, then runs the
+// real cc. A build whose cc is held can not end, so whatever the test sees meanwhile it sees
+// while that build runs.
+fn hold_cc(tree: Str) {
+    let real = sh("command -v cc")
+    shell_exec("mkdir -p {tree}/ccwrap")
+    write_file("{tree}/ccwrap/cc", "#!/bin/sh\nif [ -e {tree}/cc.hold ]; then\n    touch {tree}/cc.started\n    while [ -e {tree}/cc.hold ]; do sleep 0.05; done\nfi\nexec {real} \"$@\"\n")
+    shell_exec("chmod +x {tree}/ccwrap/cc")
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} ../build/blink {args}"])
+}
+
+// Starts the command in tree in the background. Its stdout, stderr and exit code land in
+// tree/<tag>.out, .err and .rc, and the pid of the blink process in tree/<tag>.pid: the shell
+// that writes it execs env, which execs blink.
+fn blink_bg(tree: Str, args: Str, tag: Str) {
+    shell_exec("cd {tree}/app && (sh -c 'echo $$ > {tree}/{tag}.pid; exec {env_of(tree)} ../build/blink {args}' > {tree}/{tag}.out 2> {tree}/{tag}.err; echo $? > {tree}/{tag}.rc.tmp; mv {tree}/{tag}.rc.tmp {tree}/{tag}.rc) > /dev/null 2>&1 &")
+}
+
+// Whether path exists within secs seconds.
+fn appears(path: Str, secs: Int) -> Bool {
+    process_run("sh", ["-c", "for i in $(seq 1 {secs * 20}); do [ -e {path} ] && exit 0; sleep 0.05; done; exit 1"]).exit_code == 0
+}
+
+// What a command started by blink_bg ended with; exit -1 when it has not ended in 300 s.
+fn bg_result(tree: Str, tag: Str) -> ProcessResult {
+    if !appears("{tree}/{tag}.rc", 300) {
+        return ProcessResult { out: "", err_out: "", exit_code: -1 }
+    }
+    ProcessResult { out: read_file("{tree}/{tag}.out"), err_out: read_file("{tree}/{tag}.err"), exit_code: sh("cat {tree}/{tag}.rc").to_int() }
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// The children of pid, space-separated, or "".
+fn children(pid: Int) -> Str {
+    sh("ps -o pid= --ppid {pid} | tr -s ' \\n' ' '")
+}
+
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn build(tree: Str) -> ProcessResult {
+    blink_in(tree, "build src/main.bl -o out/app")
+}
+
+// The fds pid holds open, as /proc lists them, or -1 where /proc does not say. The wait lets
+// the worker finish with the request it just replied to.
+fn fds(pid: Int) -> Int {
+    shell_exec("sleep 0.3")
+    let n = sh("[ -d /proc/{pid}/fd ] && ls /proc/{pid}/fd | wc -l")
+    if n == "" { -1 } else { n.to_int() }
+}
+
+// Whether pid has no children within secs seconds.
+fn childless(pid: Int, secs: Int) -> Bool {
+    process_run("sh", ["-c", "for i in $(seq 1 {secs * 20}); do [ -z \"$(ps -o pid= --ppid {pid})\" ] && exit 0; sleep 0.05; done; exit 1"]).exit_code == 0
+}
+
+// Starts a build in the background whose cc holds, and gives whether its cc started.
+fn held_build(tree: Str, tag: Str) -> Bool {
+    shell_exec("rm -f {tree}/cc.started")
+    shell_exec("touch {tree}/cc.hold")
+    blink_bg(tree, "build src/main.bl -o out/app", tag)
+    appears("{tree}/cc.started", 120)
+}
+
+test "a worker holds no more fds after builds that end, whose client drops, or whose child is killed" {
+    if file_exists("/proc/self/fd") != 1 {
+        skip("this system has no /proc/self/fd to count a process's open fds")
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_daemon_fds_after_builds_{getpid()}"
+    dev_tree(root, tree, "daemon_fds_app")
+    hold_cc(tree)
+    let pid = start_daemon(tree)
+    let mut worker = ""
+    let mut before = -1
+    let mut after = -1
+    let mut ended: List[Int] = []
+    let mut dropped_held = false
+    let mut dropped_settled = false
+    let mut killed_held = false
+    let mut killed_child = ""
+    let mut killed_settled = false
+    let mut last = ProcessResult { out: "", err_out: "", exit_code: -1 }
+    let mut worker_after = ""
+    with cleanup(fn() {
+        shell_exec("rm -f {tree}/cc.hold")
+        stop_daemon(pid)
+    }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        let _w0 = build(tree)
+        worker = children(pid).trim()
+        if worker != "" && !worker.contains(" ") {
+            before = fds(worker.to_int())
+            for v in ["lea1", "lea2", "lea3"] {
+                edit(tree, "leaf.bl", "s/\"lea[f0-9]\"/\"{v}\"/")
+                ended.push(build(tree).exit_code)
+            }
+            edit(tree, "leaf.bl", #"s/"lea3"/"lea4"/"#)
+            dropped_held = held_build(tree, "b1")
+            shell_exec("kill -KILL $(cat {tree}/b1.pid)")
+            let _ = bg_result(tree, "b1")
+            shell_exec("rm -f {tree}/cc.hold")
+            // The build runs on to its end with no one to reply to.
+            dropped_settled = childless(worker.to_int(), 120)
+            edit(tree, "leaf.bl", #"s/"lea4"/"lea5"/"#)
+            killed_held = held_build(tree, "b2")
+            killed_child = children(worker.to_int()).trim()
+            if killed_child != "" && !killed_child.contains(" ") {
+                shell_exec("kill -KILL {killed_child}")
+            }
+            killed_settled = childless(worker.to_int(), 120)
+            shell_exec("rm -f {tree}/cc.hold")
+            let _ = bg_result(tree, "b2")
+            edit(tree, "leaf.bl", #"s/"lea5"/"lea6"/"#)
+            last = build(tree)
+            worker_after = children(pid).trim()
+            after = fds(worker.to_int())
+        }
+    }
+    shell_exec("rm -rf {tree}")
+    assert(worker != "" && !worker.contains(" "), "the daemon had not one worker after a build: '{worker}'")
+    assert_eq(ended, [0, 0, 0])
+    assert(dropped_held, "no cc started in the build whose client dropped")
+    assert(dropped_settled, "the build whose client dropped never ended")
+    assert(killed_held, "no cc started in the build whose child was killed")
+    assert(killed_child != "" && !killed_child.contains(" "), "the worker had not one build child to kill: '{killed_child}'")
+    assert(killed_settled, "the worker did not reap its killed build child")
+    assert_eq(last.exit_code, 0)
+    assert_eq(worker_after, worker)
+    assert(before > 0, "/proc gave no fd count for the worker")
+    assert_eq(after, before)
+}
