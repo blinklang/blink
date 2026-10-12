@@ -1,11 +1,11 @@
 import symbol_index.{si_reset, si_sym_count, si_file_count}
 import query.{query_index_source, query_answer}
 import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render, diag_reset}
-import compiler.{reset_compiler_state}
+import compiler.{reset_compiler_state, fill_source_interfaces}
 import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int, json_at, json_len}
 import std.path.{path_join, path_dirname}
 import lexer.{Lex}
-import parser.{Parse, parser_want_interface_text}
+import parser.{Parse, parser_want_interface_text, parser_defer_interface_text}
 import typecheck.{TypeCheck}
 import std.libc.{Pollfd, poll, read_bytes}
 import check_pipeline.{FrontEndReport, check_source_reporting, checked_inputs_changed, checked_inputs_reset, checked_probes_changed, checked_input_files, check_exit_code, check_status_line}
@@ -72,6 +72,9 @@ let mut daemon_origin: DaemonOrigin = DaemonOrigin { cwd: "", identity: "", sett
 type DaemonCheck {
     human: Str
     json: Str
+    // The format (as diag_render takes it) the check has yet to render until it settles
+    // (daemon_settle_check); -1 once it has settled.
+    unrendered: Int
     errors: Int
     warnings: Int
     ices: Int
@@ -155,30 +158,30 @@ fn daemon_extract_type(request: Str) -> Option[Str] {
 // Each check sees the whole program: mono and the mutation passes judge across functions,
 // so a recheck of only the changed functions could miss what an edit broke elsewhere.
 fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+    daemon_settle_check(daemon_run_check(0))
+}
+
+// A check with its findings rendered in one format, and without what only a later request
+// reads: the other format, the interface texts, the stats and the forced collection. A check
+// request is answered from it, and daemon_settle_check adds the rest once the reply is sent,
+// before the worker serves anything else.
+fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     let query = daemon_index_entry()
     let out_path = path_join(daemon_origin.files, "check.out")
     let err_path = path_join(daemon_origin.files, "check.err")
     let saved = capture_output(out_path, err_path)
     parser_want_interface_text(daemon_origin.interface_text)
+    parser_defer_interface_text(true)
     let (program, front) = check_source_reporting(daemon_source_path)
+    parser_defer_interface_text(false)
     parser_want_interface_text(false)
     let captured = restore_output(saved)
     let out = if captured { read_file(out_path) } else { "" }
     let err = if captured { read_file(err_path) } else { "" }
-    // An edit after the loader read a file and before this stat leaves no stat change for a
-    // poll to see. The bytes show it, so one compare here closes that gap.
-    let taken = daemon_input_stats()
-    let stats = if checked_inputs_changed(daemon_source_path) { [] } else { taken }
-    // Each check leaves its whole working set as garbage. Whether libgc collects it or grows
-    // the heap instead is not stable: it turns on how much the last collections freed, so
-    // the same edit can leave a small heap or a large one. Every build child is a fork of
-    // this heap, and pays for the garbage it carries, so the worker forces the collection
-    // here, where the check is all that stays live, and each fork is as small as the
-    // program it builds.
-    daemon_gc_collect()
     DaemonCheck {
-        human: diag_render(0),
-        json: diag_render(1),
+        human: if format == 0 { diag_render(0) } else { "" },
+        json: if format == 1 { diag_render(1) } else { "" },
+        unrendered: if format == 0 { 1 } else { 0 },
         errors: diag_count,
         warnings: diag_warn_count,
         ices: diag_ice_count,
@@ -187,8 +190,40 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
         out: out,
         err: err,
         captured: captured,
-        stats: stats,
+        stats: [],
         query: query,
+    }
+}
+
+// The check daemon_run_check gave, with what it put off. It must come before the next check,
+// which drops the diagnostics and the loaded inputs.
+fn daemon_settle_check(c: DaemonCheck) -> DaemonCheck ! IO {
+    fill_source_interfaces()
+    // An edit after the loader read a file and before this stat leaves no stat change for a
+    // poll to see. The bytes show it, so one compare here closes that gap.
+    let taken = daemon_input_stats()
+    let stats = if checked_inputs_changed(daemon_source_path) { [] } else { taken }
+    let human = if c.unrendered == 0 { diag_render(0) } else { c.human }
+    let json = if c.unrendered == 1 { diag_render(1) } else { c.json }
+    // Each check leaves its whole working set as garbage. Whether libgc collects it or grows
+    // the heap instead is not stable: it turns on how much the last collections freed, so
+    // the same edit can leave a small heap or a large one. Every build child is a fork of
+    // this heap, and pays for the garbage it carries, so the worker forces the collection
+    // here, where the check is all that stays live, and each fork is as small as the
+    // program it builds.
+    daemon_gc_collect()
+    DaemonCheck { human: human, json: json, unrendered: -1, stats: stats, ..c }
+}
+
+// Settles the check a check request left unsettled, once its reply is sent.
+fn daemon_settle_last() ! IO {
+    match daemon_last {
+        Some(c) => {
+            if c.unrendered >= 0 {
+                daemon_last = Some(daemon_settle_check(c))
+            }
+        }
+        None => {}
     }
 }
 
@@ -508,7 +543,8 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Pa
     daemon_check_count = daemon_check_count + 1
     let mut changed = 0
     if daemon_last.is_none() || checked_inputs_changed(daemon_source_path) {
-        daemon_last = Some(daemon_check_program())
+        // The reply needs only the findings, so the rest waits until it is sent.
+        daemon_last = Some(daemon_run_check(diag_json))
         changed = 1
     }
     let c = daemon_last.unwrap()
@@ -1137,6 +1173,7 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
         if !held {
             daemon_reply(client_fd, response)
         }
+        daemon_settle_last()
     }
     None
 }
