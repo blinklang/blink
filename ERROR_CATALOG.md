@@ -90,7 +90,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | NoConversionImpl | E0312 | A conversion has no impl: `x.into()` and `T.from(x)` need `impl From[S] for T`, `T.try_from(x)` needs `impl TryFrom[S] for T`, with S the source's type (an alias is the type it names). Every type converts to itself. Repair: declare the impl, or use the named conversion (`.to_float()`, `.truncate()`, `.to_int_checked()`, `try_from`, `.to_string()`) | Type checking | §3c |
 | NoIndexOperator | E0313 | A postfix `[...]` holds a value (`xs[1]`, `m["k"]`, `fns[0](x)`). Blink has no index operator. Decided by the bracket contents at name resolution, whether or not a call follows. Repair: `.get()` (returns `Option`), or `.0` for a tuple; no machine fix when a call follows. A store `xs[i] = v` is the same error: repair `.set(i, v)` (List, Bytes) or `.insert(k, v)` (Map), never `.insert` for a List | Name resolution | §3.4, §2.22 |
 | TypeArgsWithoutCall | E0314 | A well-formed type-argument list with no call `(` or literal `{` after it (`let f = identity[Int]`). First help: remove the brackets when an expected type fixes the same arguments; annotate the binding when there is no expected type; no machine fix when they conflict | Type checking | §3.4 |
-| UndeclaredEffect | E0500 | Callee requires effect not declared by caller. The declared row of an `@ffi` callee counts like any other row | Effects | §4.5 |
+| UndeclaredEffect | E0500 | Callee requires effect not declared by caller. The declared row of an `@ffi` callee counts like any other row. Not for `State`: E0552 covers it | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | QuestionMarkInvalidOperand | E0502 | `?` operator used on non-Result, non-Option type | Type checking | §3c.2 |
 | UndefinedFunction | E0504 | Call to undefined function | Name resolution | §6.3 |
@@ -212,7 +212,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ResultOutsideEnsures | E1304 | `result` referenced outside an `@ensures` predicate | Refinement contracts | §3b |
 | OldOutsideEnsures | E1305 | `old(_)` referenced outside an `@ensures` predicate | Refinement contracts | §3b |
 | AssignmentInPredicate | E1306 | Predicate contains an assignment | Refinement contracts | §3b |
-| ImpureBodyForPureAnnotation | E1307 | `@pure` function body contains a non-pure construct | Refinement contracts | §3b |
+| ImpureBodyForPureAnnotation | E1307 | `@pure` function has a non-empty effective row, `State` included | Refinement contracts | §3b.2, §4.16.3 |
 | ModifiesArgNotSimplePath | E1308 | `@modifies` argument is not a simple path | Refinement contracts | §3b |
 | RecursiveContractPredicate | E1309 | A contract predicate of fn `f` calls `f`, directly or through a cycle of contract predicates (body calls are not edges); the diagnostic prints the cycle | Refinement contracts | §3b.2 |
 | MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or a user type with no `Hash` impl, derived or written) | Generic collections | §3.6 |

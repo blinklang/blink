@@ -554,8 +554,6 @@ Six panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML, minimalism) d
 
 #### Phase A.5 — Option-space after the moderator's mechanical dedupe
 
-> Full Phase A texts: panel/A_sys.md, A_web.md, A_plt.md, A_devops.md, A_aiml.md, A_min.md. Read all six before replying.
->
 > **Options (grouped mechanically; proposer attribution)**
 >
 > **Opt-1 — Writer effect bound to each binding, required on every writer** (Sys S1, favoured)
@@ -994,14 +992,13 @@ One round. Each panelist replied to the deduped option-space and to the other fi
 
 The ballot (moderator text, every option taken from a panelist's Phase A or Phase B text):
 
-> Post-debate option-space. Every option below comes from a panelist's Phase A or Phase B text (panel/A_*.md, panel/B1_*.md). Vote on each question independently. Do not message other panelists.
+> Post-debate option-space. Every option below comes from a panelist's Phase A or Phase B text. Vote on each question independently. Do not message other panelists.
 >
 > For each question give:
 > 1. **Vote** — the option label.
 > 2. **Reasoning** — 2–4 sentences from your domain.
 > 3. **Concern** — one sentence on what could go wrong with the option you expect to win, from your seat.
 >
-> Write your ballot to panel/C_<yourname>.md, then send team-lead a one-line "voted" message.
 >
 > **Q1 — Mechanism**
 >

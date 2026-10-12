@@ -8,7 +8,7 @@ Every side effect a function can perform -- printing, reading a database, openin
 
 The consequences are structural:
 
-- A function with no `!` in its signature **cannot** perform side effects. The compiler proves it, and no built-in free function is an exception (§4.4 *Every side effect has a row*). The one effect that can be in a row with no `!` is `State`. The compiler adds it to a private function or a closure that reads or writes a module-level `let mut` binding, and the body shows the access. A `pub` function must declare it (§4.16).
+- A function with no `!` in its signature **cannot** perform side effects. The compiler proves it, and no built-in free function is an exception (§4.4 *Every side effect has a row*). One exception: a private function or a closure with no `!` can still have `State` in its effective row. The compiler adds `State` when the body reads or writes a module-level `let mut` binding, and the body shows the access. A `pub` function must declare it (§4.16).
 - A function declaring `! DB.Read` can query a database but **cannot** write to it, delete from it, or administer it. The compiler proves it.
 - A package declaring `capabilities(Net.Connect)` in its manifest **cannot** open a listening socket. The compiler proves it.
 - An effect handler can attenuate capabilities -- handing a function a `Net.Connect` that only permits connections to a specific allowlist. The runtime enforces it.
@@ -3155,7 +3155,7 @@ Every rule that checks a row checks the effective row:
 - **Calls (§4.5).** A call puts the callee's effective row into the caller's row.
 - **Function values (§4.15.1).** The type of a function value carries its effective row. A closure literal whose body touches module state has a type with `! State`. The usual row checks then apply where the value goes. For example, a closure that reads `count` cannot be passed where `fn() -> Int` is expected; the parameter type must be `fn() -> Int ! State` or `fn() -> Int ! _`.
 - **Trait impls (§4.5).** `TraitContractEffectMismatch` (E0904) compares the impl method's effective row with the trait method's row. A trait method with no `!` cannot have an impl that touches module state (§4.16.6).
-- **`@pure` (§3b).** A `@pure` function has an empty effective row (§4.16.3).
+- **`@pure` (§3b.2).** A `@pure` function has an empty effective row (§4.16.3).
 
 #### 4.16.2 What Puts `State` in a Row
 
@@ -3189,7 +3189,7 @@ warning[ModuleLetMutNeverWritten]: module-level `let mut` `limit` is never writt
 
 A function whose effective row is empty is **pure**: its result depends only on its arguments. It performs no side effects and touches no module state. A function that only reads module state is not pure; its row has `State`.
 
-`@pure` (§3b) asks the compiler to prove that a function is pure. A `@pure` function whose effective row is not empty, `State` included, is `ImpureBodyForPureAnnotation` (E1307).
+`@pure` (§3b.2) asks the compiler to prove that a function is pure. A `@pure` function whose effective row is not empty, `State` included, is `ImpureBodyForPureAnnotation` (E1307).
 
 ```blink
 let mut pos = 0
