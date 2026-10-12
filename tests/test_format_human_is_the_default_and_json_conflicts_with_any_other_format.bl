@@ -1,0 +1,101 @@
+// `--format human` names the default format, so a script whose stdout is not a terminal can
+// still ask for it: it prints the same bytes as the command with no --format. `--json` is the
+// short form of `--format json`, so `--json` with another --format value asks for two formats
+// at once. blink can not know which one the user wants, so that is a usage error: the command
+// says so on stderr, exits 1 and does nothing else. `--json --format json` asks for one format
+// and prints what `--json` prints. The commands run in a fresh temporary directory, since the
+// test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+let MESSY = "fn main()   \{\n  io.println(\"hi\")\n}\n"
+
+fn scratch() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_format_human.XXXXXX").out.trim()
+    write_file("{dir}/ok.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/err.bl", "fn main() \{\n    let x: Int = \"s\"\n    io.println(\"\{x}\")\n}\n")
+    write_file("{dir}/warn.bl", "fn main() \{\n    let x = 1\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/messy.bl", MESSY)
+    dir
+}
+
+fn run_in(dir: Str, cmd: Str) -> ProcessResult {
+    sh("R=$(pwd); cd {dir} && timeout 120 {cmd}")
+}
+
+// The first difference between two results, or "".
+fn differ(label: Str, a: ProcessResult, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "{label}: exit {a.exit_code} vs {b.exit_code}" }
+    if a.out != b.out { return "{label}: stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if a.err_out != b.err_out { return "{label}: stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// What is wrong with the result of a conflicting --json and --format, or "".
+fn rejected(label: Str, r: ProcessResult, out: Str, text: Str) -> Str {
+    if r.exit_code != 1 { return "`{label}` exited {r.exit_code}, not 1\nstdout:\n{r.out}\nstderr:\n{r.err_out}" }
+    if r.out != out { return "`{label}` stdout is not `{out}`:\n{r.out}" }
+    if !r.err_out.contains(text) { return "`{label}` stderr has no `{text}`:\n{r.err_out}" }
+    if r.err_out.contains("E0300") || r.err_out.contains("TypeError") { return "`{label}` checked the file:\n{r.err_out}" }
+    ""
+}
+
+test "--format human prints what the command prints with no --format, on check, build, fmt and blinkc" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for file in ["ok.bl", "err.bl", "warn.bl"] {
+        wrong.push(differ("check {file}", run_in(dir, "$R/build/blink check --format human {file}"), run_in(dir, "$R/build/blink check {file}")))
+    }
+    for file in ["ok.bl", "err.bl"] {
+        wrong.push(differ("build {file}", run_in(dir, "$R/build/blink build --format human {file} -o out"), run_in(dir, "$R/build/blink build {file} -o out")))
+        wrong.push(differ("blinkc {file}", run_in(dir, "$R/build/blinkc {file} out.c --format human"), run_in(dir, "$R/build/blinkc {file} out.c")))
+    }
+    for file in ["ok.bl", "messy.bl"] {
+        wrong.push(differ("fmt --check {file}", run_in(dir, "$R/build/blink fmt --check --format human {file}"), run_in(dir, "$R/build/blink fmt --check {file}")))
+    }
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "--json with a --format other than json exits 1 with the conflict and runs nothing" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    let failed = "\{\"status\":\"error\",\"file\":\"err.bl\"}\n"
+    wrong.push(rejected("check --json --format human err.bl", run_in(dir, "$R/build/blink check --json --format human err.bl"), failed, "error: --json conflicts with --format human"))
+    wrong.push(rejected("check --format human --json err.bl", run_in(dir, "$R/build/blink check --format human --json err.bl"), failed, "error: --json conflicts with --format human"))
+    wrong.push(rejected("build --json --format human err.bl", run_in(dir, "$R/build/blink build --json --format human err.bl -o out"), "", "error: --json conflicts with --format human"))
+    wrong.push(rejected("build --json --format blink err.bl", run_in(dir, "$R/build/blink build --json --format blink err.bl -o out"), "", "error: --json conflicts with --format blink"))
+    wrong.push(rejected("fmt --json --format human messy.bl", run_in(dir, "$R/build/blink fmt --json --format human messy.bl"), "", "error: --json conflicts with --format human"))
+    wrong.push(rejected("fmt --check --json --format human messy.bl", run_in(dir, "$R/build/blink fmt --check --json --format human messy.bl"), "", "error: --json conflicts with --format human"))
+    wrong.push(rejected("blinkc --json --format human", run_in(dir, "$R/build/blinkc err.bl out.c --json --format human"), "", "error: --json conflicts with --format human"))
+    wrong.push(rejected("blinkc --format human --json", run_in(dir, "$R/build/blinkc err.bl out.c --format human --json"), "", "error: --json conflicts with --format human"))
+    let built = sh("ls {dir}").out
+    let messy_after = read_file("{dir}/messy.bl")
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(built.trim(), "err.bl\nmessy.bl\nok.bl\nwarn.bl")
+    assert_eq(messy_after, MESSY)
+}
+
+test "--json --format json prints what --json prints" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for file in ["ok.bl", "err.bl", "warn.bl"] {
+        wrong.push(differ("check {file}", run_in(dir, "$R/build/blink check --json --format json {file}"), run_in(dir, "$R/build/blink check --json {file}")))
+    }
+    for file in ["ok.bl", "err.bl"] {
+        wrong.push(differ("build {file}", run_in(dir, "$R/build/blink build --json --format json {file} -o out"), run_in(dir, "$R/build/blink build --json {file} -o out")))
+    }
+    for file in ["ok.bl", "messy.bl"] {
+        wrong.push(differ("fmt --check {file}", run_in(dir, "$R/build/blink fmt --check --json --format json {file}"), run_in(dir, "$R/build/blink fmt --check --json {file}")))
+    }
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
