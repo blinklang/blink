@@ -1693,11 +1693,12 @@ Two mutants of `src/emit_record.bl` check the tests:
 
 The parser marks a plain global or const with its keyword and name. A
 global with an annotation, or one that destructures or binds `_`, stays
-`other`. Types, aliases, effects, traits, impls and annotated fns stay
-`other`, so the build takes nothing after an edit to one. A type or an
-effect changes the types header; an impl changes the module header; an
-alias or a trait changes no header, but no rule yet shows which units
-it reaches.
+`other`. Types, aliases, effects and impls stay `other`, so the build
+takes nothing after an edit to one. A type or an effect changes the
+types header; an impl changes the module header; an alias changes no
+header, but no rule yet shows which units it reaches. Traits and
+annotated fns take units since a later change ("Units kept across a
+trait or annotated fn edit").
 
 #### Bench
 
@@ -2394,6 +2395,220 @@ Two sets of rows are slower beyond their spread:
   (4.546-4.583) for the base binary on the new tree, 4.473
   (4.451-4.504) for the change binary on the base tree.
   `bench/edit_loop/unit_rt_statics_cross_*.tsv` hold these two runs.
+
+### Units kept across a trait or annotated fn edit
+
+Before this change, an edit in a module other than the entry that added,
+removed or changed a trait, or a fn with an annotation, made the build
+take no unit: each was an item of kind `other`. Each kind, added once to
+`src/cname.bl` on cli under `BLINK_EMIT_REUSE_VERIFY=1`, with the gen1
+from before this change (sha256 `cb965d31…`): every one took 0 of 69
+units, and the median of 5 edits through the daemon, settle 1 s, was
+0.82-0.97 s. A private body edit took 51 units and cost 0.438 s.
+
+| kind | units changed | headers changed | median s |
+|---|---|---|---|
+| nochange | - | - | 0.149 |
+| fn under `@allow`, `@deprecated`, `@trusted` or `@pure` | 1 (`cname`) | `cname.priv.h` | 0.890-0.919 |
+| fn under `@requires`, `@ensures` or `@verify` | 1 (`cname`) | `cname.priv.h` | 0.943-0.953 |
+| fn under `@src`, `@modifies`, `@tags` or `@inline` | 1 (`cname`) | `cname.priv.h` | 0.957-0.966 |
+| fn under `@ffi` | 1 (`cname`) | `cname.priv.h` | 0.963 |
+| pub fn under `@allow` | 1 (`cname`) | `cname.h` | 0.963 |
+| annotation added to a fn that exists | 1 (`cname`) | 0 | 0.827-0.830 |
+| trait, any shape below | 0 | 0 | 0.821-0.851 |
+| body edit | 1 (`cname`) | `cname.priv.h` | 0.438 |
+
+An `@ffi` binding over a symbol a native dependency gates changes 68
+units and `blink.types.h`, since the gates reach every unit. `@where` on
+a fn does not parse today.
+
+#### Annotated fns
+
+The parser marks a fn with its name and the name of each annotation over
+it (`fn <name> @<a>...`), and marks each annotation's own item
+`ann <a> fn <name>`. So an edit to an annotation's arguments alone is an
+edit of the fn's name, as is an annotation added or removed. The build
+then emits again each unit whose sources name the fn, as for a fn with no
+annotation, but only when each annotation over the fn is one that acts
+inside the fn or at the calls that name it (`annotation_is_local` in
+`src/emit_record.bl`). Any other takes no unit.
+
+| annotation | takes units | why |
+|---|---|---|
+| `@allow` | yes | changes which warnings show; prints no C |
+| `@deprecated` | yes | a warning at each call, which names the fn; prints no C |
+| `@trusted` | yes | an audit check; prints no C |
+| `@pure` | yes | a check of the fn's body; prints no C |
+| `@modifies` | yes | reserved for a solver; read by no stage today |
+| `@requires`, `@ensures` | yes | the checks print in the fn's own body (below) |
+| `@verify` | yes | only `contract_runtime` reads it, for the fn's own body |
+| `@src` | yes | read by no stage after the parser |
+| `@ffi` | yes | changes the fn's own wrapper and each call that names the fn; a gated symbol changes `blink.types.h`, and that takes no unit |
+| `@tags` | no | `src/cg.bl` writes the test table of the entry unit from it |
+| `@expect_panic` | no | the parser rewrites the body of the test that holds it |
+| `@where` | no | does not parse on a fn today |
+| `@invariant` | no | no rule yet shows where its checks print |
+| `@derive`, `@ffi.opaque`, `@ffi.struct` | no | type annotations; their items are types, which stay `other` |
+| any other | no | a new reader could reach any unit |
+
+`@requires` and `@ensures` print no C outside the fn they are on, in
+any mode:
+
+- `src/cg_stmt.bl` alone lowers them. `contract_entry` runs from the
+  lowering of the fn's own body and prints the `@requires` checks and
+  the `old(e)` snapshots. `cs_exit_ensures` holds the `@ensures`
+  predicates, and the exit checks print at that body's returns.
+- `contract_runtime` decides whether the checks print. It reads only
+  `@verify(fallback: ...)` of the same fn.
+- `CgConfig` has no contract flag. `--debug` sets `-g -O0` and the
+  `debug_assert` bodies; `--release` sets `-O2`. No flag changes where a
+  contract prints, and any flag change already takes no unit.
+- `mono` walks the predicates (`src/mono.bl`) inside the fn's own
+  instance. An instance of a generic of another module that a predicate
+  makes lands in that generic's unit and adds a line to its header; the
+  build sees the header change and emits that unit again.
+- No caller reads them. Codegen reads by name only `@ffi`,
+  `@ffi.opaque`, `@ffi.struct` and `@verify`
+  (`rg 'get_annotation\(' src/cg*.bl src/mono.bl src/layout.bl
+  src/cname.bl src/ir.bl`). `cc_forwarded_binding` declines when an
+  impl method has an annotation, and an impl is an item of kind `other`.
+
+`@ffi` reaches callers by name. `c_fn_decl_name` gives an `@ffi` fn the C
+name `blink_<name>`, and `c_ffi_symbol` reads the symbol for the fn's own
+wrapper. A call names the fn's Blink name, so a unit with such a call
+names the fn in its source and is emitted again.
+
+Warnings and errors on the take path match a cold build. Typecheck runs
+on the whole program on every build, and a taken unit repeats the
+warnings of its last emit. The annotated fn test checks the warnings of
+each warm build against a cold build: `@deprecated` added in one module
+with its warning at a call in another, `@trusted` removed from a pub
+`@ffi` fn (refused: `PubFFI`), a private `@ffi` fn with no `@trusted`
+(`UnauditedFFI`), and a `@pure` fn that calls a fn of another module
+that is not pure (refused: `ImpureBodyForPureAnnotation`).
+
+#### Traits
+
+The parser marks a trait with no annotation over it, and none on a
+method, with its name, its methods' names and its associated types'
+names. A trait prints no C. It reaches a unit through an impl of it, a
+bound that names it, and a call of one of its methods, and a source that
+does one of these writes one of the names. So an edit to such a trait is
+an edit of each of those names. A trait with an annotation stays
+`other`, since an annotation can change what the trait lowers to.
+
+A trait the compiler reads by name takes no unit. A unit can dispatch
+through such a trait from a source that never writes its name: `==`
+reads `Eq`, interpolation reads `Display`, `+` reads `Add`, `with` reads
+`Closeable`. `tc_builtin_trait_names` in typecheck gives the names:
+every trait of a prelude module, and a list for the std traits it reads
+by name outside the prelude (`From`, `TryFrom`, `Into`, `IntoIterator`,
+`Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Serialize`, `Iterator`). A
+user trait with one of these names takes no unit either.
+
+`test_a_trait_name_the_compiler_reads_is_on_the_list_whose_edit_takes_no_unit.bl`
+reads the compiler's sources and fails when a source reads a trait by a
+name on neither list: a string literal equal to a std trait, a literal
+compared with a binding whose name holds `trait`, or a name pushed onto
+`tc_trait_names`. A name built at run time is not seen, so the check is a
+lower bound. Four mutants turn it red: `Add` or `Serialize` dropped from
+the list, a std trait literal (`FloatPure`) added to `src/cg_call.bl`,
+and `trait_name == "Default"` added there.
+
+An edit to the body of a default method changes no interface text, so
+the build treats it as a body edit. No impl falls back to a default body
+today.
+
+#### Sweep
+
+Through the daemon on cli under `BLINK_EMIT_REUSE_VERIFY=1`, each kind
+was added at the end of `src/cname.bl`, `src/ir.bl` and
+`src/diagnostics.bl`, then changed, then undone, and each build checked
+against a cold emit. Of 239 builds, each served by the daemon, 238 were
+byte-equal to a cold emit. The one that failed was a default method added
+to a trait that an impl implements: typecheck refuses it, since no impl
+falls back to a default method yet. The first pass added the annotation
+to an existing fn only in `cname.bl`; a second pass added it in `ir.bl`
+and `diagnostics.bl`.
+
+| kind | change | units taken |
+|---|---|---|
+| fn under `@allow`, `@deprecated`, `@trusted`, `@pure`, `@requires`, `@ensures`, `@verify(fallback: "trust")`, `@src`, `@modifies`, `@ffi` (one with a header of its own too) | an argument | 51 |
+| pub fn under `@allow` | an argument | 51 |
+| `@allow` or `@deprecated` added to the first pub fn | an argument | 49 (`cname`), 50 (`ir`), 42 (`diagnostics`) |
+| trait, pub trait, trait with a supertrait, trait and a generic fn bound by it | a method parameter; the supertrait | 42-43 |
+| trait with a default method | the default body | 34; 51 for the body edit |
+| generic trait, trait with an associated type | a method parameter; the type's name | 6 |
+| fn under `@tags` or `@inline` | an argument | 0 |
+| trait under `@deprecated`, trait named `Debug` | a method parameter | 0 |
+
+A trait method named `get` takes 6 units: most sources write `get`. A
+trait that another module implements and a third calls through a bound
+(`ProbeImpl` in `diagnostics.bl`, an impl in `cname.bl`, a generic call
+in `emit_record.bl`) took 41 units after a method parameter rename and
+after a supertrait added, and emitted the three units again each time.
+
+Four mutants of the change check the tests. `BLINK_EMIT_REUSE_VERIFY`
+stays green under each, and a took list fails:
+
+- every annotation counted local: the annotated fn test fails;
+- the builtin trait list empty: the trait test fails;
+- a trait edit adds no name: the trait test fails;
+- an annotated fn adds no name: the annotated fn test fails.
+
+#### Bench
+
+Through the daemon, settle 1 s, 11 reps, median seconds (min-max). Base
+and the change ran in turn: base, change, base, change. Base is gen1 of
+`edcc77ef` (sha256 `cb965d31…`), the change is gen1 of `b9c0c51b`
+(sha256 `187d257a…`), each built by `task gen1`.
+`bench/edit_loop/trait_annotated_fn_daemon_settle1_*.tsv` hold the full
+rows. Every C hash check reads 11/11.
+
+`trait-<module>` adds a trait with one method to the end of the module,
+so its C is the warm C. `annfn-<module>` adds a private fn under
+`@deprecated` to the end of the module.
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.144 (0.139-0.161) | 0.149 (0.145-0.160) | 0.145 (0.139-0.156) | 0.149 (0.141-0.158) |
+| cli | body-cname | 0.412 (0.400-0.424) | 0.410 (0.397-0.416) | 0.412 (0.389-0.425) | 0.406 (0.395-0.417) |
+| cli | body-typecheck | 0.446 (0.430-0.468) | 0.434 (0.420-0.463) | 0.444 (0.436-0.465) | 0.443 (0.428-0.451) |
+| cli | pubfn-cname | 0.444 (0.433-0.547) | 0.446 (0.438-0.557) | 0.444 (0.437-0.561) | 0.437 (0.433-0.554) |
+| cli | privfn-cname | 0.453 (0.442-0.474) | 0.448 (0.438-0.454) | 0.451 (0.443-0.456) | 0.442 (0.433-0.452) |
+| cli | pubfn-typecheck | 0.471 (0.452-0.483) | 0.464 (0.442-0.478) | 0.467 (0.456-0.478) | 0.450 (0.441-0.470) |
+| cli | privfn-typecheck | 0.472 (0.457-0.481) | 0.465 (0.458-0.474) | 0.471 (0.459-0.481) | 0.458 (0.450-0.475) |
+| cli | testblock-cname | 0.291 (0.274-0.432) | 0.279 (0.274-0.421) | 0.287 (0.277-0.417) | 0.298 (0.278-0.432) |
+| cli | trait-cname | 0.832 (0.817-0.841) | 0.275 (0.266-0.282) | 0.821 (0.813-0.835) | 0.296 (0.290-0.303) |
+| cli | annfn-cname | 0.998 (0.986-1.015) | 0.432 (0.424-0.442) | 0.988 (0.979-1.024) | 0.464 (0.457-0.468) |
+| cli | global-cname | 0.455 (0.441-1.004) | 0.441 (0.433-0.456) | 0.455 (0.437-0.998) | 0.456 (0.446-0.466) |
+| cli | run-body-cname | 0.446 (0.434-0.456) | 0.445 (0.438-0.457) | 0.433 (0.428-0.452) | 0.450 (0.432-0.457) |
+| cli | test-body-cname | 0.450 (0.437-0.470) | 0.452 (0.446-0.470) | 0.452 (0.443-0.475) | 0.457 (0.445-0.468) |
+| cli | cold-obj | 1.614 (1.577-1.719) | 1.613 (1.589-1.698) | 1.604 (1.569-1.686) | 1.616 (1.592-1.702) |
+| cli | cold-all | 4.548 (4.520-4.584) | 4.553 (4.529-4.578) | 4.561 (4.535-4.594) | 4.579 (4.560-4.606) |
+| small | nochange | 0.046 (0.043-0.047) | 0.043 (0.042-0.045) | 0.044 (0.042-0.045) | 0.044 (0.042-0.047) |
+| small | body-inventory | 0.078 (0.075-0.091) | 0.077 (0.075-0.092) | 0.078 (0.074-0.093) | 0.079 (0.076-0.091) |
+| small | body-audit | 0.066 (0.064-0.070) | 0.066 (0.063-0.069) | 0.065 (0.064-0.068) | 0.067 (0.064-0.068) |
+| small | pubfn-model | 0.070 (0.068-0.072) | 0.069 (0.067-0.073) | 0.069 (0.068-0.072) | 0.069 (0.068-0.072) |
+| small | privfn-model | 0.069 (0.067-0.074) | 0.069 (0.067-0.071) | 0.070 (0.067-0.072) | 0.068 (0.066-0.074) |
+| small | testblock-model | 0.048 (0.045-0.050) | 0.049 (0.047-0.050) | 0.048 (0.047-0.050) | 0.049 (0.047-0.051) |
+| small | trait-model | 0.053 (0.051-0.055) | 0.049 (0.047-0.051) | 0.053 (0.050-0.054) | 0.048 (0.046-0.051) |
+| small | annfn-model | 0.074 (0.070-0.078) | 0.070 (0.068-0.073) | 0.073 (0.071-0.076) | 0.069 (0.067-0.072) |
+| small | run-body-inventory | 0.080 (0.077-0.082) | 0.079 (0.076-0.082) | 0.079 (0.077-0.083) | 0.078 (0.075-0.080) |
+| small | test-body-inventory | 0.081 (0.077-0.097) | 0.080 (0.078-0.100) | 0.080 (0.078-0.101) | 0.081 (0.079-0.099) |
+| small | cold-obj | 0.089 (0.086-0.094) | 0.091 (0.089-0.096) | 0.091 (0.090-0.094) | 0.091 (0.090-0.093) |
+
+On cli a new trait now costs less than a body edit, since no unit
+changes: 0.82-0.83 s drops to 0.28-0.30 s. A new annotated fn costs what
+a new private fn costs: 0.99-1.00 s drops to 0.43-0.46 s. On small the
+trait row drops from 0.053 s to 0.048-0.049 s, below the base spread in
+both pairs. The annotated fn row drops by 4 ms, below the base spread in
+run 4 only.
+
+No row reads slower than the base run before it, outside its spread. In
+run 4, `privfn-cname`, `pubfn-typecheck` and `privfn-typecheck` on cli
+read 8-17 ms faster than base run 3, below its spread. Run 2 does not
+show this, so the change does not explain it.
 
 ## Blockers before the default flipped
 
