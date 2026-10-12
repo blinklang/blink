@@ -399,6 +399,21 @@ fn daemon_read_all(path: Str) -> Option[Bytes] ! IO {
     Some(all)
 }
 
+// Why the daemon does not serve the client whose request root names this identity and these
+// settings, or "" when it does. A check, build or query runs the front end, so the daemon
+// answers only a client that runs its compiler under its environment and sets what the front
+// end reads as it does: anything else may answer otherwise. A client that names none is from
+// before requests named them, and runs cold.
+fn daemon_client_differs(root: Int) -> Str {
+    if json_as_str(json_get(root, "identity")) != daemon_origin.identity {
+        return "the client runs another compiler or environment than the daemon"
+    }
+    if json_as_str(json_get(root, "settings")) != daemon_origin.settings {
+        return "the client sets what the front end reads otherwise than the daemon"
+    }
+    ""
+}
+
 fn daemon_not_served(why: Str) -> Str {
     json_clear()
     let reply = json_new_object()
@@ -441,6 +456,10 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Pa
     let json_status = json_as_int(json_get(root, "json"))
     let diag_json = json_as_int(json_get(root, "diag_json"))
     let strict = json_as_int(json_get(root, "strict"))
+    let differs = daemon_client_differs(root)
+    if differs != "" {
+        return daemon_not_served(differs)
+    }
     if !daemon_enter(cwd, path) {
         return daemon_not_served("the daemon could not change to {cwd}")
     }
@@ -672,8 +691,7 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
     let root = json_parse(request)
     let cwd = json_as_str(json_get(root, "cwd"))
     let path = json_as_str(json_get(root, "path"))
-    let identity = json_as_str(json_get(root, "identity"))
-    let settings = json_as_str(json_get(root, "settings"))
+    let differs = daemon_client_differs(root)
     let pwd = json_as_str(json_get(root, "pwd"))
     let pwd_set = json_as_int(json_get(root, "pwd_set")) == 1
     let argv_node = json_get(root, "argv")
@@ -683,11 +701,11 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
         argv.push(json_as_str(json_at(argv_node, i)))
         i = i + 1
     }
-    if identity != daemon_origin.identity || argv.len() < 2 {
-        return BuildTurn.Reply(daemon_not_served("the client runs another compiler or environment than the daemon"))
+    if differs != "" {
+        return BuildTurn.Reply(daemon_not_served(differs))
     }
-    if settings != daemon_origin.settings {
-        return BuildTurn.Reply(daemon_not_served("the client sets what the front end reads otherwise than the daemon"))
+    if argv.len() < 2 {
+        return BuildTurn.Reply(daemon_not_served("the client sent no command line to build"))
     }
     if !daemon_enter(cwd, path) {
         return BuildTurn.Reply(daemon_not_served("the daemon could not change to {cwd}"))
@@ -862,6 +880,11 @@ fn daemon_after_child(builds: DaemonBuilds) -> DaemonBuilds {
 // ── Handle: query ───────────────────────────────────────────────────
 
 fn daemon_handle_query(request: Str) -> Str {
+    json_clear()
+    let differs = daemon_client_differs(json_parse(request))
+    if differs != "" {
+        return daemon_not_served(differs)
+    }
     query_dispatch(request)
 }
 
@@ -1276,20 +1299,16 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
     let mut r = route
     let mut cwd = r.home_cwd
     let mut path = r.home_path
+    json_clear()
+    let root = json_parse(request)
+    // The worker checks the same, but a client it would not serve must not cost a worker.
+    let differs = daemon_client_differs(root)
+    if differs != "" {
+        return (r, RouteTurn.Answer(daemon_not_served(differs)))
+    }
     if req_type != "query" {
-        json_clear()
-        let root = json_parse(request)
         cwd = json_as_str(json_get(root, "cwd"))
         path = json_as_str(json_get(root, "path"))
-        // The worker checks the same, but a client it would not serve must not cost a worker.
-        if req_type == "build" {
-            if json_as_str(json_get(root, "identity")) != daemon_origin.identity {
-                return (r, RouteTurn.Answer(daemon_not_served("the client runs another compiler or environment than the daemon")))
-            }
-            if json_as_str(json_get(root, "settings")) != daemon_origin.settings {
-                return (r, RouteTurn.Answer(daemon_not_served("the client sets what the front end reads otherwise than the daemon")))
-            }
-        }
     }
     let key = daemon_entry_key(cwd, path)
     // A file outside the project root may belong to another project, with a blink.toml of its

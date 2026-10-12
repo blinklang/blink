@@ -4345,12 +4345,8 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if format_flag != "" {
         diag_format = 1
     }
-    // The daemon checks with no trace and with the default layout rule, so a check that
-    // asks for either runs cold.
-    if trace_mode == "" && strict_struct_layout_flag == 0 {
-        if check_through_daemon(source_path, json_output, diag_format, strict_flag) {
-            return
-        }
+    if check_through_daemon(source_path, json_output, diag_format, strict_flag, strict_struct_layout_flag == 1) {
+        return
     }
     diag_set_abort_status_line(check_status_line(source_path, json_output, strict_flag, 1, 0, 0))
     let _ = check_source(source_path)
@@ -4376,10 +4372,12 @@ fn check_failed_status_line(source_path: Str) -> Str {
 }
 
 // The check asks the project's daemon, which checks the entry as this client spells it from
-// this directory, since a diagnostic spells its file relative to both. A reply the client
-// can not read falls back to a cold check: the daemon may make a check faster, never
-// different. True when the daemon's answer was printed.
-fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, strict: Int) -> Bool ! IO {
+// this directory, since a diagnostic spells its file relative to both. The daemon serves only
+// a client with its compiler, environment and front-end settings; anything else, and a reply
+// the client can not read, falls back to a cold check: the daemon may make a check faster,
+// never different. Called once the command's flags are applied. True when the daemon's
+// answer was printed.
+fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, strict: Int, strict_struct_layout: Bool) -> Bool ! IO {
     let sock = daemon_socket_path()
     if !file_exists(sock) {
         return false
@@ -4388,9 +4386,7 @@ fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, stri
     if fd < 0 {
         return false
     }
-    json_clear()
-    let req = json_new_object()
-    json_set(req, "type", json_new_str("check"))
+    let req = daemon_front_request("check", front_settings(strict_struct_layout))
     json_set(req, "cwd", json_new_str(env.cwd()))
     json_set(req, "path", json_new_str(source_path))
     json_set(req, "json", json_new_int(json_status))
@@ -4468,6 +4464,19 @@ fn front_settings(strict_struct_layout: Bool) -> Str {
     "strict_struct_layout={strict_struct_layout}\nblink_trace={trace_mode}\ninterface_text={emit_reuse_allowed()}"
 }
 
+// A request for a daemon answer that runs the front end. It names the client's identity and
+// front-end settings, so the daemon serves only a client whose cold run would read the same.
+// Called after the connect, so a socket no daemon serves costs the client no hashing.
+fn daemon_front_request(kind: Str, settings: Str) -> Int ! IO {
+    let identity = daemon_identity()
+    json_clear()
+    let req = json_new_object()
+    json_set(req, "type", json_new_str(kind))
+    json_set(req, "identity", json_new_str(identity))
+    json_set(req, "settings", json_new_str(settings))
+    req
+}
+
 // A build or run asks the project's daemon to run the build, which it does in a child that
 // runs this command line from the program the daemon checked. The daemon serves any entry
 // of the project, from any directory, for a client with its compiler, environment and
@@ -4494,15 +4503,9 @@ fn build_through_daemon(a: Args, command: Str) -> Bool ! IO {
     if fd < 0 {
         return false
     }
-    // After the connect, so a socket no daemon serves costs a build no hashing.
-    let identity = daemon_identity()
-    json_clear()
-    let req = json_new_object()
-    json_set(req, "type", json_new_str("build"))
+    let req = daemon_front_request("build", settings)
     json_set(req, "cwd", json_new_str(env.cwd()))
     json_set(req, "path", json_new_str(args_positional(a, 0)))
-    json_set(req, "identity", json_new_str(identity))
-    json_set(req, "settings", json_new_str(settings))
     let argv = json_new_array()
     let mut i = 0
     while i < arg_count() {
@@ -5249,28 +5252,28 @@ fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, IO {
     let sock_path = daemon_socket_path()
     let sock_fd = if file_exists(sock_path) { unix_socket_connect(sock_path) } else { -1 }
     if sock_fd >= 0 {
-        let mut request = ""
+        // A query reads no flag that the front end reads, so it names the settings of none.
+        let req = daemon_front_request("query", front_settings(false))
         if query_fn != "" {
-            request = "\{\"type\":\"query\",\"query_type\":\"fn\",\"name\":\"{query_fn}\"}"
+            json_set(req, "query_type", json_new_str("fn"))
+            json_set(req, "name", json_new_str(query_fn))
         } else if query_effect != "" {
-            request = "\{\"type\":\"query\",\"query_type\":\"effect\",\"effect\":\"{query_effect}\"}"
-        } else if query_pub != 0 && query_pure != 0 {
-            request = "\{\"type\":\"query\",\"query_type\":\"pub_pure\"}"
-        } else if query_pub != 0 {
-            let mod_name = if query_module != "" { query_module } else { strip_extension(path_basename(source_path)) }
-            request = "\{\"type\":\"query\",\"query_type\":\"signature\",\"module\":\"{mod_name}\"}"
+            json_set(req, "query_type", json_new_str("effect"))
+            json_set(req, "effect", json_new_str(query_effect))
         } else if query_pure != 0 {
-            request = "\{\"type\":\"query\",\"query_type\":\"pub_pure\"}"
-        } else if query_layer == "signature" {
-            let mod_name = if query_module != "" { query_module } else { strip_extension(path_basename(source_path)) }
-            request = "\{\"type\":\"query\",\"query_type\":\"signature\",\"module\":\"{mod_name}\"}"
+            json_set(req, "query_type", json_new_str("pub_pure"))
         } else {
             let mod_name = if query_module != "" { query_module } else { strip_extension(path_basename(source_path)) }
-            request = "\{\"type\":\"query\",\"query_type\":\"signature\",\"module\":\"{mod_name}\"}"
+            json_set(req, "query_type", json_new_str("signature"))
+            json_set(req, "module", json_new_str(mod_name))
         }
-        let response = daemon_send(sock_fd, request)
-        // A daemon that took no request or gave no answer leaves the query to run cold.
-        if response != "" {
+        let response = daemon_send(sock_fd, json_encode(req))
+        // A daemon that took no request, gave no answer or did not serve this client leaves
+        // the query to run cold. An answer names no "served".
+        json_clear()
+        let root = json_parse(response)
+        let declined = root >= 0 && json_get(root, "served") >= 0 && json_as_int(json_get(root, "served")) != 1
+        if response != "" && !declined {
             io.println(response)
             return
         }
@@ -5825,6 +5828,13 @@ fn main() {
             hi = hi + 1
         }
         cmd_emit_archive_header(hidden_args)
+        return
+    }
+
+    // A test that speaks the daemon's protocol itself sends the fields a check with no flags
+    // names, as only this compiler under this environment can spell them.
+    if arg_count() == 2 && get_arg(1) == "__daemon-front-fields" {
+        io.println(json_encode(daemon_front_request("check", front_settings(false))))
         return
     }
 
