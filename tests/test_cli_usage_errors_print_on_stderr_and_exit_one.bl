@@ -1,0 +1,126 @@
+// A command line blink can not act on is a usage error: an unknown option, an option with no
+// value, an unknown command, or a command that needs an argument and got none. Each prints on
+// stderr and exits 1, so a script or a test sees the failure, and stdout stays empty. Under
+// check --json the status line still goes to stdout. Help and the version are not errors: they
+// print on stdout and exit 0. The commands run in a fresh temporary directory, since the test
+// tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn scratch() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_usage_errors.XXXXXX").out.trim()
+    write_file("{dir}/x.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    dir
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && $B {args}")
+}
+
+// What is wrong with the result of a usage error, or "".
+fn usage_error_for(r: ProcessResult, args: Str, text: Str) -> Str {
+    if r.exit_code != 1 { return "`{args}` exited {r.exit_code}, not 1" }
+    if r.out != "" { return "`{args}` printed on stdout:\n{r.out}" }
+    if !r.err_out.contains(text) { return "`{args}` stderr has no `{text}`:\n{r.err_out}" }
+    ""
+}
+
+fn assert_usage_errors(cases: List[(Str, Str)]) {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for c in cases {
+        let (args, text) = c
+        let why = usage_error_for(blink_in(dir, args), args, text)
+        if why != "" { wrong.push(why) }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(wrong.join("\n"), "")
+}
+
+test "an unknown option is a usage error for every command" {
+    assert_usage_errors([
+        ("--bogus", "error: unknown option '--bogus'"),
+        ("build --bogus x.bl", "error: unknown option '--bogus'"),
+        ("run --bogus x.bl", "error: unknown option '--bogus'"),
+        ("check --bogus x.bl", "error: unknown option '--bogus'"),
+        ("test x.bl --bogus", "error: unknown option '--bogus'"),
+        ("fmt --bogus x.bl", "error: unknown option '--bogus'"),
+        ("query --bogus x.bl", "error: unknown option '--bogus'"),
+        ("doc --bogus std.args", "error: unknown option '--bogus'"),
+        // The parser stops at the bad option, so a --json after it does not count.
+        ("check --bogus --json x.bl", "error: unknown option '--bogus'"),
+    ])
+}
+
+test "an option with no value is a usage error" {
+    assert_usage_errors([
+        ("build x.bl -o", "error: option '-o' requires a value"),
+        ("run x.bl --output", "error: option '--output' requires a value"),
+        ("check x.bl --format", "error: option '--format' requires a value"),
+    ])
+}
+
+test "an unknown command is a usage error" {
+    assert_usage_errors([
+        ("bogus", "error: unknown command 'bogus'"),
+        ("daemon bogus", "error: unknown command"),
+        ("cache bogus", "usage: blink cache"),
+    ])
+}
+
+test "a command with no argument it needs is a usage error" {
+    assert_usage_errors([
+        ("build", "error: no source file specified"),
+        ("run", "error: no source file specified"),
+        ("check", "error: no source file specified"),
+        ("query", "error: no source file specified"),
+        ("ast", "error: no source file specified"),
+        ("doc", "error: blink doc requires a module name"),
+        ("add", "error: blink add requires a package name"),
+        ("add somepkg", "error: blink add requires --path or --git"),
+        ("remove", "error: blink remove requires a package name"),
+        ("explain", "usage: blink explain <code>"),
+        ("daemon", "error: daemon requires a subcommand"),
+        ("daemon start", "error: daemon start needs the entry file"),
+        ("shim", "error: shim requires a subcommand"),
+        ("shim init", "error: blink shim init requires a name"),
+        ("build --emit per-module-dir x.bl", "error: --emit per-module-dir requires an output directory"),
+    ])
+}
+
+test "the help a usage error prints goes to stderr with it" {
+    let dir = scratch()
+    let r = blink_in(dir, "build")
+    let _ = sh("rm -rf {dir}")
+    assert(r.err_out.contains("Usage: blink build"), "no help on stderr:\n{r.err_out}")
+}
+
+test "a usage error under check --json keeps the status line on stdout and exits 1" {
+    let dir = scratch()
+    let unknown = blink_in(dir, "check --json --bogus x.bl")
+    let no_file = blink_in(dir, "check --json")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(unknown.exit_code, 1)
+    assert_eq(unknown.out.trim(), "\{\"status\":\"error\",\"file\":\"\"}")
+    assert(unknown.err_out.contains("error: unknown option '--bogus'"))
+    assert_eq(no_file.exit_code, 1)
+    assert_eq(no_file.out.trim(), "\{\"status\":\"error\",\"file\":\"\"}")
+    assert(no_file.err_out.contains("error: no source file specified"))
+}
+
+test "help and the version print on stdout and exit 0" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for args in ["--help", "-h", "--version", "build --help", "check -h", ""] {
+        let r = blink_in(dir, args)
+        if r.exit_code != 0 { wrong.push("`{args}` exited {r.exit_code}") }
+        if r.out == "" { wrong.push("`{args}` printed nothing on stdout") }
+        if r.err_out != "" { wrong.push("`{args}` printed on stderr:\n{r.err_out}") }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(wrong.join("\n"), "")
+}

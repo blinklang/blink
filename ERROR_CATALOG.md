@@ -72,6 +72,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | MisplacedIrKindAtPrint | I0003 | An IR node of the wrong class reached the C printer — a statement where a value is required, or the reverse |
 | CodegenStageNotBuilt | I0004 | A code-generation stage this build does not contain was reached |
 | PoisonedIrAtSeam | I0005 | A negative IR node id was handed to a producer that must embed it — the caller ignored a stop it had already been told about |
+| ParserInternalLimit | I0012 | The parser's node pool or sublist stack met a state it can not hold — a limit of its layout, or a call out of order or out of bounds; the compiler stops |
 
 ---
 

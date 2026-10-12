@@ -1,0 +1,147 @@
+// When the parser's node pool or sublist stack meets a state it can not hold, the compiler stops
+// on the spot, and that stop is a compiler bug: an internal compiler error. It says so on
+// stderr, exits 101 as any internal compiler error does, and keeps stdout for the command's own
+// output. The fault is a diagnostic like any internal error, I0012 ParserInternalLimit, so it
+// renders in the format the run asked for. A check that set the line it prints on an internal
+// error gets that line on stdout, so check --json still ends with {"status":"ice",...}. No
+// source program reaches these limits, so each probe drives the parser's own functions in a
+// child run of this binary.
+
+import std.process.{ProcessResult}
+import parser.{node_push, node_kind, new_sublist, sublist_push, finalize_sublist, sublist_get}
+import ast.{AstNode}
+import diagnostics.{diag_set_abort_status_line, diag_reset, diag_format}
+import check_pipeline.{check_status_line}
+
+fn probe(which: Str) -> ProcessResult {
+    let exe = process_run("readlink", ["-f", "/proc/{getpid()}/exe"]).out.trim_right()
+    process_run("sh", ["-c", "PARSER_LIMIT_PROBE={which} {exe}"])
+}
+
+// What is wrong with how probe `which` stopped, or "".
+fn ice_stop_error(which: Str, want: Str, stdout: Str) -> Str {
+    let r = probe(which)
+    if r.exit_code != 101 { return "{which}: exit {r.exit_code}, not 101; stdout: {r.out} stderr: {r.err_out}" }
+    if r.out != stdout { return "{which}: stdout is `{r.out}`, not `{stdout}`" }
+    if !r.err_out.contains("internal compiler error[ParserInternalLimit]: {want}\n") { return "{which}: stderr has no `{want}`: {r.err_out}" }
+    let notes = r.err_out.split("This is a compiler bug").len() - 1
+    if notes != 1 { return "{which}: stderr says it is a compiler bug {notes} times, not once: {r.err_out}" }
+    ""
+}
+
+test "a push to a sublist with none open stops as an internal compiler error" {
+    assert_eq(ice_stop_error("push_none_open", "sublist_push() called with no open sublist", ""), "")
+}
+
+test "a finalize with no sublist open stops as an internal compiler error" {
+    assert_eq(ice_stop_error("finalize_none_open", "finalize_sublist() called with no open sublist", ""), "")
+}
+
+test "a finalize of a sublist that is not the newest open one stops as an internal compiler error" {
+    assert_eq(ice_stop_error("finalize_not_top", "finalize_sublist(0) but top of stack is 1", ""), "")
+}
+
+test "a sublist read out of bounds stops as an internal compiler error" {
+    assert_eq(ice_stop_error("sublist_get_past_end", "sublist_get(0, 5) out of bounds; sublist length is 1", ""), "")
+}
+
+test "a node id out of bounds stops as an internal compiler error" {
+    assert_eq(ice_stop_error("node_kind_past_end", "parser: node_kind(9) out of bounds; nodes.len()=1", ""), "")
+}
+
+test "a node pool past its shape limit stops as an internal compiler error" {
+    assert_eq(ice_stop_error("too_many_shapes", "the node pool has more than 65536 shapes; head packs at most that", ""), "")
+}
+
+test "under json diagnostics the stop is an I0012 internal error row" {
+    let r = probe("push_none_open_format_json")
+    assert_eq(r.exit_code, 101)
+    assert_eq(r.out, "")
+    let row = "\{\"severity\":\"ice\",\"name\":\"ParserInternalLimit\",\"code\":\"I0012\",\"message\":\"sublist_push() called with no open sublist\""
+    assert(r.err_out.starts_with(row), "stderr has no I0012 row: {r.err_out}")
+    assert(r.err_out.trim().split("\n").len() == 1, "stderr is not the one row: {r.err_out}")
+}
+
+test "a check --json that stops on an internal limit prints the ice status line on stdout" {
+    let line = check_status_line("main.bl", 1, 0, 1, 0, 0)
+    assert_eq(line, "\{\"status\":\"ice\",\"file\":\"main.bl\"}")
+    assert_eq(ice_stop_error("push_none_open_json", "sublist_push() called with no open sublist", "{line}\n"), "")
+}
+
+test "the check status line outlives the diagnostics reset that each compile starts with" {
+    let line = check_status_line("main.bl", 1, 0, 1, 0, 0)
+    assert_eq(ice_stop_error("push_none_open_json_after_reset", "sublist_push() called with no open sublist", "{line}\n"), "")
+}
+
+test "a plain check that stops on an internal limit prints its internal error line on stdout" {
+    let line = check_status_line("main.bl", 0, 0, 1, 0, 0)
+    assert_eq(line, "error: internal compiler error")
+    assert_eq(ice_stop_error("push_none_open_text", "sublist_push() called with no open sublist", "{line}\n"), "")
+}
+
+// A node with a field set for each set bit of `bits`, so each value of `bits` below 2^17 gives
+// the pool a shape of its own.
+fn node_with_fields(bits: Int) -> AstNode {
+    let mut n = AstNode { kind: 1000 }
+    if (bits & 1) != 0 { n.str_val = "x" }
+    if (bits & 2) != 0 { n.name = "x" }
+    if (bits & 4) != 0 { n.op = "x" }
+    if (bits & 8) != 0 { n.var_name = "x" }
+    if (bits & 16) != 0 { n.module = "x" }
+    if (bits & 32) != 0 { n.method = "x" }
+    if (bits & 64) != 0 { n.return_type = "x" }
+    if (bits & 128) != 0 { n.type_name = "x" }
+    if (bits & 256) != 0 { n.trait_name = "x" }
+    if (bits & 512) != 0 { n.leading_comments = "x" }
+    if (bits & 1024) != 0 { n.trailing_comments = "x" }
+    if (bits & 2048) != 0 { n.doc_comment = "x" }
+    if (bits & 4096) != 0 { n.int_val = 1 }
+    if (bits & 8192) != 0 { n.is_mut = 1 }
+    if (bits & 16384) != 0 { n.is_pub = 1 }
+    if (bits & 32768) != 0 { n.is_const = 1 }
+    if (bits & 65536) != 0 { n.inclusive = 1 }
+    n
+}
+
+fn main() ! Parse.Build {
+    let which = env.var("PARSER_LIMIT_PROBE") ?? ""
+    if which == "" { return }
+    if which == "push_none_open_json" {
+        diag_set_abort_status_line(check_status_line("main.bl", 1, 0, 1, 0, 0))
+    }
+    if which == "push_none_open_text" {
+        diag_set_abort_status_line(check_status_line("main.bl", 0, 0, 1, 0, 0))
+    }
+    if which == "push_none_open_json_after_reset" {
+        diag_set_abort_status_line(check_status_line("main.bl", 1, 0, 1, 0, 0))
+        diag_reset()
+    }
+    if which == "push_none_open_format_json" {
+        diag_format = 1
+    }
+    if which.starts_with("push_none_open") { sublist_push(0, 1) }
+    if which == "finalize_none_open" { finalize_sublist(0) }
+    if which == "finalize_not_top" {
+        let _ = new_sublist()
+        let _ = new_sublist()
+        finalize_sublist(0)
+    }
+    if which == "sublist_get_past_end" {
+        let sl = new_sublist()
+        sublist_push(sl, 7)
+        finalize_sublist(sl)
+        io.eprintln("{sublist_get(sl, 5)}")
+    }
+    if which == "node_kind_past_end" {
+        node_push(AstNode {})
+        io.eprintln("{node_kind(9)}")
+    }
+    if which == "too_many_shapes" {
+        let mut bits = 0
+        while bits < 131072 {
+            node_push(node_with_fields(bits))
+            bits = bits + 1
+        }
+    }
+    io.eprintln("FAIL: {which} did not stop")
+}
