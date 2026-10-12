@@ -1,0 +1,38 @@
+// One `blink test` command can compile test files of two projects, each with its own blink.toml.
+// Printing each warning once for the command must not drop the warning of the second manifest.
+
+import std.process.{ProcessResult}
+
+let LOUD_WARNING = "warning: unknown lint level 'loud' for 'W0703' in [lints] (expected off, warn, or error)"
+let QUIET_WARNING = "warning: unknown lint level 'quiet' for 'W0704' in [lints] (expected off, warn, or error)"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+fn write_project(dir: Str, name: Str, lint: Str, level: Str) {
+    let _ = sh("mkdir -p {dir}/{name}/src {dir}/{name}/tests")
+    write_file("{dir}/{name}/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[lints]\n{lint} = \"{level}\"\n")
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/{name}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/{name}/tests/test_{name}.bl", "test \"{name}\" \{\n    assert(1 == 1)\n}\n")
+}
+
+test "blink test over two projects prints the manifest warning of each project once" {
+    let dir = sh("mktemp -d /tmp/blink_test_two_project_warnings.XXXXXX").out.trim()
+    write_project(dir, "one", "W0703", "loud")
+    write_project(dir, "two", "W0704", "quiet")
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test .")
+    let _ = sh("rm -rf {dir}")
+
+    assert_eq(r.exit_code, 0)
+    assert_eq(count(r.err_out, LOUD_WARNING), 1)
+    assert_eq(count(r.err_out, QUIET_WARNING), 1)
+    assert(!r.out.contains(LOUD_WARNING))
+    assert(!r.out.contains(QUIET_WARNING))
+}

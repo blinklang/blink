@@ -20,7 +20,7 @@ import pkg.manifest.{
     manifest_name,
     manifest_native_dep_type, manifest_native_dep_link, manifest_native_dep_count,
     manifest_native_dep_name_at, manifest_native_dep_path, manifest_has_native_dep,
-    validate_package_name,
+    validate_package_name, manifest_print_warnings, manifest_warnings,
 }
 import pkg.resolver.{resolve_and_lock}
 import lexer.{Lex, lex}
@@ -449,7 +449,13 @@ fn deps_unresolved() -> Bool {
 fn ensure_deps_resolved() {
     if deps_unresolved() {
         io.eprintln("resolving dependencies...")
+        // The compile that follows loads blink.toml again and reports its warnings once. The
+        // warnings of a dependency's manifest go unreported, as in a check with a lock, which
+        // never loads those manifests; printed here they would break `check --json` stdout.
+        let print_was = manifest_print_warnings
+        manifest_print_warnings = false
         let rc = resolve_and_lock(".", blink_cli_version)
+        manifest_print_warnings = print_was
         if rc != 0 {
             io.eprintln("error: dependency resolution failed")
             exit(1)
@@ -3867,6 +3873,31 @@ let TEST_FILE_PENDING = 0
 let TEST_FILE_BUILD_FAILED = 1
 let TEST_FILE_RAN = 2
 
+// The lines of text that are not in drop. The build worker of `blink test` loads blink.toml
+// again, so its stderr holds the manifest warnings that the command printed already.
+fn drop_lines_in(text: Str, drop: Set[Str]) -> Str {
+    if drop.is_empty() {
+        return text
+    }
+    let mut kept: List[Str] = []
+    let mut dropped = false
+    for line in text.lines() {
+        if drop.contains(line) {
+            dropped = true
+        } else {
+            kept.push(line)
+        }
+    }
+    if !dropped {
+        return text
+    }
+    let joined = kept.join("\n")
+    if joined != "" && text.ends_with("\n") {
+        return "{joined}\n"
+    }
+    joined
+}
+
 fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
     apply_cache_flag(a)
@@ -3954,10 +3985,29 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         diag_format = 1
     }
     let mut tc_failed_files = 0
+    let mut manifest_warned: Set[Str] = Set()
     let mut tci = 0
     while tci < file_count {
         let tcf = test_files.get(tci).unwrap()
+        // Each compile loads the blink.toml of its file. The command prints each warning once,
+        // so a later compile prints only what no earlier one did, as when the files belong to
+        // two projects. The first prints from inside, so an exit there still shows them.
+        let print_was = manifest_print_warnings
+        if tci > 0 {
+            manifest_print_warnings = false
+        }
+        // A compile that finds no blink.toml leaves the list empty, not as the last load left it.
+        manifest_clear()
         let prog = compile_to_program(tcf, 1)
+        manifest_print_warnings = print_was
+        for w in manifest_warnings {
+            if !manifest_warned.contains(w) {
+                if tci > 0 && print_was {
+                    io.eprintln(w)
+                }
+                manifest_warned.insert(w)
+            }
+        }
         check_types(prog)
         check_unused_imports()
         if diag_ice_count > 0 || diag_count > 0 {
@@ -3975,6 +4025,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         exit(1)
     }
     diag_flush()
+    let printed_warnings = manifest_warned
 
     let blink_bin = resolve_blink_bin()
 
@@ -4083,11 +4134,12 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 let br = process_pid_wait(bpid)
                 if br.exit_code != 0 || !file_exists(bin_path) {
                     let mut err_text = br.out
-                    if br.err_out != "" {
+                    let build_err = drop_lines_in(br.err_out, printed_warnings)
+                    if build_err != "" {
                         if err_text != "" {
-                            err_text = "{err_text}\n{br.err_out}"
+                            err_text = "{err_text}\n{build_err}"
                         } else {
-                            err_text = br.err_out
+                            err_text = build_err
                         }
                     }
                     results.send(TestFileResult { idx: idx, built: false, exit_code: br.exit_code, out: "", err_out: err_text })
