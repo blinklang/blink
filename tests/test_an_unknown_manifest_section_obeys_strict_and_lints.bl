@@ -1,0 +1,68 @@
+// W1001 is a warning, so `--strict` and a `[lints]` entry change it as they change any warning
+// (§8.9.8). The [lints] entry sits in the same blink.toml as the section it reports on, so its
+// level must be in force before the manifest issues are reported. The fixture lives under a
+// fresh temporary directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn check(toml: Str, args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_unknown_section_control.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", toml)
+    // A lock no older than blink.toml keeps dependency resolution out of the check.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && $B check --json {args} src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// The severity of each W1001 row on stderr.
+fn w1001_severities(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in r.err_out.lines() {
+        json_clear()
+        let row = json_parse(line)
+        if row >= 0 && json_as_str(json_get(row, "code")) == "W1001" {
+            out.push(json_as_str(json_get(row, "severity")))
+        }
+    }
+    out
+}
+
+test "an unknown section alone leaves the check passing" {
+    let r = check("{PACKAGE}[bogus]\nx = 1\n", "")
+    assert_eq(r.exit_code, 0, r.err_out)
+    assert_eq(w1001_severities(r), ["warning"])
+}
+
+test "--strict fails the check on an unknown section" {
+    let r = check("{PACKAGE}[bogus]\nx = 1\n", "--strict")
+    assert_eq(r.exit_code, 1, r.err_out)
+    assert_eq(w1001_severities(r), ["warning"])
+}
+
+test "a [lints] entry by code makes an unknown section an error" {
+    let r = check("{PACKAGE}[lints]\nW1001 = \"error\"\n\n[bogus]\nx = 1\n", "")
+    assert_eq(r.exit_code, 1, r.err_out)
+    assert_eq(w1001_severities(r), ["error"])
+}
+
+test "a [lints] entry by name turns an unknown section off" {
+    let r = check("{PACKAGE}[lints]\nUnknownManifestSection = \"off\"\n\n[bogus]\nx = 1\n", "")
+    assert_eq(r.exit_code, 0, r.err_out)
+    assert_eq(r.err_out, "")
+}
+
+test "a [lints] entry that turns W1001 off holds for a section above it" {
+    let r = check("{PACKAGE}[bogus]\nx = 1\n\n[lints]\nW1001 = \"off\"\n", "--strict")
+    assert_eq(r.exit_code, 0, r.err_out)
+    assert_eq(r.err_out, "")
+}

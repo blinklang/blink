@@ -1,0 +1,59 @@
+// `blink test` reports the blink.toml issues itself, then builds each test file in a
+// `blink build` worker that loads the manifest again. The command sets BLINK_MANIFEST_REPORTED
+// for the worker alone, and a build under it reports no blink.toml row. A build without it
+// reports each row once.
+
+import std.process.{ProcessResult}
+
+let SECTION_ROW = "warning[UnknownManifestSection]: unknown section `[bogus]` in blink.toml"
+let LEVEL_ROW = "error[InvalidLintLevel]: invalid lint level `loud` for `W0703`"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+// Runs `blink build src/main.bl` in a project whose blink.toml has the manifest given, with
+// env_prefix in front of the command.
+fn build_in(manifest: Str, env_prefix: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_worker_manifest.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", manifest)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE {env_prefix} $B build src/main.bl -o {dir}/main")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+let SECTION_MANIFEST = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[bogus]\nx = 1\n"
+let LEVEL_MANIFEST = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[lints]\nW0703 = \"loud\"\n"
+
+test "a build worker prints no unknown section row" {
+    let r = build_in(SECTION_MANIFEST, "BLINK_MANIFEST_REPORTED=1")
+    assert_eq(r.exit_code, 0)
+    assert_eq(count(r.err_out, SECTION_ROW), 0)
+    assert_eq(count(r.out, SECTION_ROW), 0)
+}
+
+test "a build worker prints no invalid lint level row" {
+    let r = build_in(LEVEL_MANIFEST, "BLINK_MANIFEST_REPORTED=1")
+    assert_eq(count(r.err_out, LEVEL_ROW), 0)
+    assert_eq(count(r.out, LEVEL_ROW), 0)
+}
+
+test "a build without the variable prints the unknown section row once" {
+    let r = build_in(SECTION_MANIFEST, "")
+    assert_eq(r.exit_code, 0)
+    assert_eq(count(r.err_out, SECTION_ROW), 1)
+}
+
+test "a build without the variable prints the invalid lint level row once" {
+    let r = build_in(LEVEL_MANIFEST, "")
+    assert_eq(r.exit_code, 1)
+    assert_eq(count(r.err_out, LEVEL_ROW), 1)
+}

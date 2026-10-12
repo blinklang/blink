@@ -20,7 +20,7 @@ import pkg.manifest.{
     manifest_name,
     manifest_native_dep_type, manifest_native_dep_link, manifest_native_dep_count,
     manifest_native_dep_name_at, manifest_native_dep_path, manifest_has_native_dep,
-    validate_package_name, manifest_print_warnings, manifest_warnings,
+    validate_package_name,
 }
 import pkg.resolver.{resolve_and_lock}
 import lexer.{Lex, lex}
@@ -46,7 +46,7 @@ import compiler.{
     find_src_root, check_unused_imports, check_file_exists,
     loaded_inputs, import_map_nodes, embedded_get_source,
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
-    set_strict_struct_layout, tune_compiler_gc,
+    set_strict_struct_layout, tune_compiler_gc, apply_manifest_lints, quiet_manifest_lib,
 }
 import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
@@ -70,7 +70,8 @@ import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import diagnostics.{
-    Diag, diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_reset, diag_entry_count,
+    Diag, DiagEntry, diag_entries, diag_prepend,
+    diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
@@ -462,13 +463,10 @@ fn ensure_deps_resolved() {
 fn deps_resolved() -> Bool {
     if deps_unresolved() {
         io.eprintln("resolving dependencies...")
-        // The compile that follows loads blink.toml again and reports its warnings once. The
-        // warnings of a dependency's manifest go unreported, as in a check with a lock, which
-        // never loads those manifests; printed here they would break `check --json` stdout.
-        let print_was = manifest_print_warnings
-        manifest_print_warnings = false
+        // The compile that follows loads blink.toml again and reports its issues once. Those
+        // of a dependency's manifest go unreported, as in a check with a lock, which never
+        // loads those manifests.
         let rc = resolve_and_lock(".", blink_cli_version)
-        manifest_print_warnings = print_was
         if rc != 0 {
             io.eprintln("error: dependency resolution failed")
             return false
@@ -520,16 +518,21 @@ fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Dia
     io.print(b.out)
     io.eprint(b.err)
     let f = b.front
+    // The sink still holds what the front end reported, and the back end flushes it again
+    // unless the mark says it was printed.
     if f.ices > 0 {
         io.eprint(f.human)
+        diag_mark_flushed(f.entries)
         return Err(101)
     }
     if f.errors > 0 {
         io.eprint(f.human)
+        diag_mark_flushed(f.entries)
         return Err(1)
     }
     if f.warnings > 0 {
         io.eprint(f.human)
+        diag_mark_flushed(f.entries)
         if strict_mode != 0 {
             return Err(1)
         }
@@ -1289,7 +1292,7 @@ fn validate_cross_target_deps(target: Str) -> Int ! Diag.Report {
     0
 }
 
-fn stamp_blink_version() {
+fn stamp_blink_version() ! Diag.Report {
     let manifest = resolve_manifest_path()
     if manifest == "" {
         return
@@ -1299,6 +1302,7 @@ fn stamp_blink_version() {
     if rc != 0 {
         return
     }
+    report_manifest_diagnostics(manifest)
     if manifest_blink_version == blink_cli_version {
         return
     }
@@ -3884,29 +3888,12 @@ let TEST_FILE_PENDING = 0
 let TEST_FILE_BUILD_FAILED = 1
 let TEST_FILE_RAN = 2
 
-// The lines of text that are not in drop. The build worker of `blink test` loads blink.toml
-// again, so its stderr holds the manifest warnings that the command printed already.
-fn drop_lines_in(text: Str, drop: Set[Str]) -> Str {
-    if drop.is_empty() {
-        return text
-    }
-    let mut kept: List[Str] = []
-    let mut dropped = false
-    for line in text.lines() {
-        if drop.contains(line) {
-            dropped = true
-        } else {
-            kept.push(line)
-        }
-    }
-    if !dropped {
-        return text
-    }
-    let joined = kept.join("\n")
-    if joined != "" && text.ends_with("\n") {
-        return "{joined}\n"
-    }
-    joined
+// add, remove, update and shim init load blink.toml without a compile, so they report its
+// issues here as a compile would. Each goes on after: an issue there stops the next compile.
+fn report_manifest_diagnostics(manifest: Str) ! Diag.Report {
+    diag_reset()
+    apply_manifest_lints(manifest)
+    diag_flush()
 }
 
 fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
@@ -3996,36 +3983,25 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         diag_format = 1
     }
     let mut tc_failed_files = 0
-    let mut manifest_warned: Set[Str] = Set()
+    // Each compile resets the sink, so the command keeps what every file reported and prints
+    // it once at the end. That covers blink.toml too: each compile loads the manifest of its
+    // file, and the files may belong to two projects.
+    let mut reported: List[DiagEntry] = []
     let mut tci = 0
     while tci < file_count {
         let tcf = test_files.get(tci).unwrap()
-        // Each compile loads the blink.toml of its file. The command prints each warning once,
-        // so a later compile prints only what no earlier one did, as when the files belong to
-        // two projects. The first prints from inside, so an exit there still shows them.
-        let print_was = manifest_print_warnings
-        if tci > 0 {
-            manifest_print_warnings = false
-        }
-        // A compile that finds no blink.toml leaves the list empty, not as the last load left it.
-        manifest_clear()
         let prog = compile_to_program(tcf, 1)
-        manifest_print_warnings = print_was
-        for w in manifest_warnings {
-            if !manifest_warned.contains(w) {
-                if tci > 0 && print_was {
-                    io.eprintln(w)
-                }
-                manifest_warned.insert(w)
-            }
-        }
         check_types(prog)
         check_unused_imports()
         if diag_ice_count > 0 || diag_count > 0 {
             tc_failed_files = tc_failed_files + 1
         }
+        for d in diag_entries {
+            reported.push(d)
+        }
         tci = tci + 1
     }
+    diag_prepend(reported)
     if tc_failed_files > 0 {
         diag_flush()
         if json_output != 0 {
@@ -4036,7 +4012,6 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         exit(1)
     }
     diag_flush()
-    let printed_warnings = manifest_warned
 
     let blink_bin = resolve_blink_bin()
 
@@ -4056,7 +4031,12 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         let tf_out = "{build_dir}/{tf_base}"
         output_bins.push(tf_out)
 
-        let mut ba: List[Str] = ["build", tf, "-o", tf_out, "--debug"]
+        // The build worker loads blink.toml again. The command reported its issues above, so
+        // the worker runs under /usr/bin/env with BLINK_MANIFEST_REPORTED set, which keeps them
+        // out of its output. Only the worker gets the variable: the test binaries that the
+        // command runs do not. The absolute path keeps a PATH with no `env` from breaking
+        // the command.
+        let mut ba: List[Str] = ["BLINK_MANIFEST_REPORTED=1", blink_bin, "build", tf, "-o", tf_out, "--debug"]
         // Without --jobs the child reads BLINK_JOBS itself, and without a path flag it reads
         // BLINK_PER_MODULE, from the same environment.
         if args_has(a, "per-module") {
@@ -4141,11 +4121,11 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     sem.send(1)
                     return 0
                 }
-                let bpid = process_spawn(blink_bin, bcmd)
+                let bpid = process_spawn("/usr/bin/env", bcmd)
                 let br = process_pid_wait(bpid)
                 if br.exit_code != 0 || !file_exists(bin_path) {
                     let mut err_text = br.out
-                    let build_err = drop_lines_in(br.err_out, printed_warnings)
+                    let build_err = br.err_out
                     if build_err != "" {
                         if err_text != "" {
                             err_text = "{err_text}\n{build_err}"
@@ -5296,7 +5276,7 @@ fn is_std_add_pkg(name: Str) -> Int {
     0
 }
 
-fn cmd_add(_p: ArgParser, a: Args) {
+fn cmd_add(_p: ArgParser, a: Args) ! Diag.Report {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.eprintln("error: blink add requires a package name")
@@ -5328,6 +5308,7 @@ fn cmd_add(_p: ArgParser, a: Args) {
     if load_rc != 0 {
         exit(1)
     }
+    report_manifest_diagnostics(manifest)
 
     if manifest_name == pkg_name {
         io.println("error: cannot add package '{pkg_name}' as a dependency of itself")
@@ -5359,7 +5340,7 @@ fn cmd_add(_p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_remove(_p: ArgParser, a: Args) {
+fn cmd_remove(_p: ArgParser, a: Args) ! Diag.Report {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.eprintln("error: blink remove requires a package name")
@@ -5379,6 +5360,7 @@ fn cmd_remove(_p: ArgParser, a: Args) {
     if load_rc != 0 {
         return
     }
+    report_manifest_diagnostics(manifest)
 
     if manifest_has_dep(pkg_name) == 0 {
         io.println("error: dependency '{pkg_name}' not found in {manifest}")
@@ -5398,7 +5380,7 @@ fn cmd_remove(_p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_update(_p: ArgParser, a: Args) {
+fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report {
     let source_path = args_positional(a, 0)
     let manifest = resolve_manifest_path()
     if manifest == "" {
@@ -5600,7 +5582,7 @@ fn shim_wrapper_template(name: Str) -> Str {
     "// @trusted wrapper for the `{name}` shim. Spec: §9.1.3 γ-doctrine.\n// The raw @ffi binding is private; only the safe wrapper is `pub`.\n// TODO: review the binding and replace audit:\"TODO\" with a real audit ID.\n\n@ffi(\"{name}\", \"blink_{name}_hello\")\n@trusted(audit: \"TODO\")\nfn raw_{name}_hello() -> Int ! FFI \{\}\n\n// TODO: replace this stub with a real safe wrapper.\npub fn {name}_hello() -> Int ! FFI \{\n    raw_{name}_hello()\n\}\n"
 }
 
-fn cmd_shim_init(_p: ArgParser, a: Args) {
+fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report {
     let name = args_positional(a, 0)
     if name == "" {
         io.eprintln("error: blink shim init requires a name")
@@ -5632,6 +5614,7 @@ fn cmd_shim_init(_p: ArgParser, a: Args) {
     if load_rc != 0 {
         exit(1)
     }
+    report_manifest_diagnostics(manifest)
     if manifest_has_native_dep(name) == 1 {
         io.println("error: native dependency '{name}' already declared in {manifest}")
         exit(1)
@@ -5805,6 +5788,7 @@ fn main() {
     // channel names, or "all". Empty = off (zero cost). Set once here so every
     // command path (build/run/check + hidden archive/per-module emitters) sees it.
     dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
+    quiet_manifest_lib()
 
     if arg_count() >= 2 && get_arg(1) == "__emit-archive-header" {
         let mut hidden_args: List[Str] = []

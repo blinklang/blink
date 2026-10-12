@@ -1,0 +1,52 @@
+// `blink test` typechecks each test file in its own compile before it builds any, and each
+// compile resets the diagnostics. The command must still print what every file reported, not
+// only the last one. The fixture lives under a fresh temporary directory, since the test tree
+// itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+// Runs `blink test tests` over the files given as (name, source) pairs.
+fn blink_test(files: List[(Str, Str)]) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_every_file_diag.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    for (name, source) in files {
+        write_file("{dir}/tests/{name}", source)
+    }
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test tests")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+test "blink test prints the warnings of each test file once" {
+    let r = blink_test([
+        ("test_one.bl", "test \"one\" \{\n    let spare_one = 1\n    assert(1 == 1)\n}\n"),
+        ("test_two.bl", "test \"two\" \{\n    let spare_two = 2\n    assert(2 == 2)\n}\n"),
+    ])
+    assert_eq(r.exit_code, 0)
+    assert_eq(count(r.err_out, "variable `spare_one` is never read"), 1)
+    assert_eq(count(r.err_out, "variable `spare_two` is never read"), 1)
+}
+
+test "blink test prints the error of each test file" {
+    let r = blink_test([
+        ("test_one.bl", "test \"one\" \{\n    let n: Int = \"one\"\n    assert(n == 1)\n}\n"),
+        ("test_two.bl", "test \"two\" \{\n    let n: Int = \"two\"\n    assert(n == 2)\n}\n"),
+    ])
+    assert_eq(r.exit_code, 1)
+    assert_eq(count(r.err_out, "tests/test_one.bl:2:"), 1)
+    assert_eq(count(r.err_out, "tests/test_two.bl:2:"), 1)
+    assert(r.err_out.contains("2 test file(s) failed to compile"))
+    assert_eq(count(r.err_out, "2 error(s) found"), 1)
+}

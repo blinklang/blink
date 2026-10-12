@@ -1,0 +1,61 @@
+// An invalid lint level is refused, not ignored (§4.16.8): no `@allow`, `[lints]` entry or
+// `--strict` changes E0843. A setting that could turn it off would let a typo in [lints] hide
+// the error that reports the typo. The fixture lives under a fresh temporary directory, since
+// the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+let MAIN = "fn main() \{\n    io.println(\"hi\")\n}\n"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn check(toml: Str, main: Str, args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_invalid_lint_level_fixed.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", toml)
+    // A lock no older than blink.toml keeps dependency resolution out of the check.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/src/main.bl", main)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && $B check --json {args} src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// The severity of each E0843 row on stderr.
+fn e0843_severities(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in r.err_out.lines() {
+        json_clear()
+        let row = json_parse(line)
+        if row >= 0 && json_as_str(json_get(row, "code")) == "E0843" {
+            out.push(json_as_str(json_get(row, "severity")))
+        }
+    }
+    out
+}
+
+fn assert_still_an_error(r: ProcessResult) {
+    assert_eq(r.exit_code, 1, "stderr:\n{r.err_out}")
+    assert_eq(e0843_severities(r), ["error"])
+}
+
+test "a [lints] entry that turns InvalidLintLevel off leaves E0843 an error" {
+    assert_still_an_error(check("{PACKAGE}[lints]\nInvalidLintLevel = \"off\"\nW0703 = \"loud\"\n", MAIN, ""))
+}
+
+test "a [lints] entry that sets E0843 to warn leaves it an error" {
+    assert_still_an_error(check("{PACKAGE}[lints]\nE0843 = \"warn\"\nW0703 = \"loud\"\n", MAIN, ""))
+}
+
+test "@allow(InvalidLintLevel) leaves E0843 an error" {
+    let main = "@allow(InvalidLintLevel)\nfn main() \{\n    io.println(\"hi\")\n}\n"
+    assert_still_an_error(check("{PACKAGE}[lints]\nW0703 = \"loud\"\n", main, ""))
+}
+
+test "--strict leaves E0843 one error" {
+    assert_still_an_error(check("{PACKAGE}[lints]\nW0703 = \"loud\"\n", MAIN, "--strict"))
+}

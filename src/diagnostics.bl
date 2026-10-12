@@ -133,6 +133,9 @@ pub const TRUSTED_REQUIRES_AUDIT            = "E0836"
 // compiler SHA | version); do_link_target verifies the two header SHAs and the
 // compiler SHA before producing a binary.
 pub const INCOMPATIBLE_STDLIB_ARCHIVE = "E0840"
+// A [lints] value that is not a level. A setting that could silence it could hide the very
+// typo it reports, so nothing changes its severity (spec §4.16.8).
+pub const INVALID_LINT_LEVEL = "E0843"
 
 // E0900–E0906 — trait contract (one short-name spans 7 codes)
 pub const TRAIT_CONTRACT_900 = "E0900"
@@ -236,6 +239,7 @@ pub const UNAUDITED_FFI           = "W0800"
 pub const AUDIT_GATED_SUPPRESSION = "E0837"
 pub const MISSING_CANONICAL_HEADER = "W0812"
 pub const SHADOWED_DEPENDENCY     = "W1000"
+pub const UNKNOWN_MANIFEST_SECTION = "W1001"
 pub const SHADOWED_PRELUDE_NAME   = "W1010"
 pub const DEPRECATED_USAGE        = "W2000"
 
@@ -421,7 +425,8 @@ type LexCutoff {
     col: Int
 }
 
-// What diag_record drops instead of recording. Reset per compile in diag_reset.
+// What diag_record drops instead of recording, and what diag_flush does not print again.
+// Reset per compile in diag_reset.
 type DiagFilter {
     // Dedup byte-identical diagnostics. The two full passes over a fn body
     // (nr + tc) both call infer_type, which emits, so a single erroring node fires
@@ -429,12 +434,15 @@ type DiagFilter {
     // genuinely distinct diagnostics on the same node survive.
     seen: Map[Str, Int]
     lex_cutoffs: List[LexCutoff]
+    // How many entries diag_flush has printed. A build flushes after its front end and again
+    // after its back end, and each entry must print once.
+    flushed: Int
 }
 
 pub let mut diag_entries: List[DiagEntry] = []
 let mut file_ranges: List[FileRange] = []
 let mut source_lines_cache: Map[Str, List[Str]] = Map()
-let mut diag_filter: DiagFilter = DiagFilter { seen: Map(), lex_cutoffs: [] }
+let mut diag_filter: DiagFilter = DiagFilter { seen: Map(), lex_cutoffs: [], flushed: 0 }
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -578,6 +586,7 @@ pub fn diag_is_lexer_code(code: Str) -> Bool {
 
 fn lint_apply_override(severity: Str, name: Str, code: Str) -> Str {
     if diag_is_lexer_code(code) { return severity }
+    if code == INVALID_LINT_LEVEL { return severity }
     // Neither channel records anything, so neither reaches an audit-gated diagnostic. Both
     // write sites refuse one outright; this is the second half of the same rule, so a name
     // that arrives here by some other route still fails to silence it.
@@ -663,6 +672,7 @@ pub fn diag_entry_count() -> Int {
 // back one count and leaves any suppressed repeat counted. The parser collapses parse
 // cascades, which are errors, so nothing rolls back an internal error today.
 pub fn diag_truncate(n: Int) {
+    if diag_filter.flushed > n { diag_filter.flushed = n }
     while diag_entries.len() > n {
         let d = diag_entries.pop().unwrap()
         // Drop the dedup key too, so diag_filter.seen mirrors diag_entries —
@@ -715,6 +725,10 @@ fn diag_past_cutoff(severity: Str, code: Str, line: Int, col: Int) -> Bool {
 
 pub fn diag_error_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.Report {
     diag_emit("error", name, code, message, 0, 0, help)
+}
+
+pub fn diag_error_no_loc_notes(name: Str, code: Str, message: Str, help: Str, notes: List[Str]) ! Diag.Report {
+    diag_emit_range_notes("error", name, code, message, 0, 0, 0, 0, help, notes)
 }
 
 pub fn diag_file_for_node(node_id: Int) -> Str {
@@ -784,6 +798,16 @@ pub fn diag_warn_in_file_notes(name: Str, code: Str, message: Str, file: Str, li
     diag_source_file = saved_file
 }
 
+// A diagnostic in a file the compiler reads but does not parse as Blink, such as blink.toml,
+// at a span the caller read from that file.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn diag_emit_in_file(severity: Str, name: Str, code: Str, message: Str, file: Str, line: Int, col: Int, end_line: Int, end_col: Int, help: Str) ! Diag.Report {
+    let saved_file = diag_source_file
+    diag_source_file = file
+    diag_emit_range_notes(severity, name, code, message, line, col, end_line, end_col, help, [])
+    diag_source_file = saved_file
+}
+
 // Error with secondary blame span(s) carried in `notes`: the primary caret sits
 // at `node_id` (the binding), and each note points the reader at a
 // contributing sub-expression (e.g. the empty `Map()` whose element is open).
@@ -806,7 +830,7 @@ pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: S
 // all that was reported in the run's format, and exits 101 as any internal error does.
 pub fn diag_ice_abort(name: Str, code: Str, message: Str) {
     diag_record("ice", name, code, message, 0, 0, 0, 0, "", [])
-    io.eprint(diag_render(diag_format))
+    io.eprint(diag_unflushed(diag_format))
     io.print(diag_ice_state.abort_stdout)
     if diag_ice_state.abort_lsp_uri != "" {
         io.print(lsp_abort_frames(diag_ice_state.abort_lsp_uri, diag_ice_state.abort_lsp_request, name, code, message))
@@ -934,14 +958,35 @@ pub fn json_escape(s: Str) -> Str {
 // ── Flush: emit all diagnostics ──────────────────────────────────────
 
 pub fn diag_flush() ! Diag.Report {
-    io.eprint(diag_render(diag_format))
+    let text = diag_unflushed(diag_format)
+    diag_filter.flushed = diag_entries.len()
+    io.eprint(text)
 }
 
-// What diag_flush prints, as text: the daemon renders a check for a client to print, and the
-// two must give the same bytes. `format` is 1 for JSON lines, 0 for the human form.
+// Marks the first n entries printed, for a caller that printed them as rendered text.
+pub fn diag_mark_flushed(n: Int) {
+    diag_filter.flushed = n
+}
+
+// What the next diag_flush prints. `format` is 1 for JSON lines, 0 for the human form.
+pub fn diag_unflushed(format: Int) -> Str {
+    diag_render_from(diag_filter.flushed, format)
+}
+
+// Every entry as diag_flush prints it, as text: the daemon renders a check for a client to
+// print, and the two must give the same bytes. `format` is 1 for JSON lines, 0 for the human
+// form.
 pub fn diag_render(format: Int) -> Str {
+    diag_render_from(0, format)
+}
+
+// The entries from index `from` on, and the summary when there are any.
+fn diag_render_from(from: Int, format: Int) -> Str {
+    if from >= diag_entries.len() {
+        return ""
+    }
     let mut sb = StringBuilder.new()
-    let mut i = 0
+    let mut i = from
     while i < diag_entries.len() {
         if format == 1 {
             sb.write(diag_json_line(i))
@@ -1096,6 +1141,33 @@ fn diag_human_text(idx: Int) -> Str {
     sb.to_str()
 }
 
+// Puts entries that earlier compiles of the same command reported before the current ones.
+// Each compile resets the sink, so a command that compiles several files and flushes once
+// keeps them this way. A repeat is dropped, as diag_record drops one: a module that two of
+// the files import reports its warning once.
+pub fn diag_prepend(entries: List[DiagEntry]) {
+    let mut out: List[DiagEntry] = []
+    for d in entries {
+        let dkey = "{d.severity}|{d.code}|{d.file}|{d.line}|{d.col}|{d.message}"
+        if diag_filter.seen.contains_key(dkey) == 0 {
+            diag_filter.seen.insert(dkey, 1)
+            out.push(d)
+            if d.severity == "error" {
+                diag_count = diag_count + 1
+            } else if d.severity == "warning" {
+                diag_warn_count = diag_warn_count + 1
+            } else if d.severity == "ice" {
+                diag_ice_count = diag_ice_count + 1
+                diag_ice_state.rendered = diag_ice_state.rendered + 1
+            }
+        }
+    }
+    for d in diag_entries {
+        out.push(d)
+    }
+    diag_entries = out
+}
+
 // ── Reset ────────────────────────────────────────────────────────────
 
 pub fn diag_reset() {
@@ -1114,7 +1186,7 @@ pub fn diag_reset() {
     diag_allow_set.clear()
     diag_allow_stack.clear()
     source_lines_cache.clear()
-    diag_filter = DiagFilter { seen: Map(), lex_cutoffs: [] }
+    diag_filter = DiagFilter { seen: Map(), lex_cutoffs: [], flushed: 0 }
 }
 
 // ── Error catalog ─────────────────────────────────────────────────
@@ -1375,6 +1447,9 @@ pub fn diag_explain(code: Str) -> Str {
     if code == SHADOWED_DEPENDENCY {
         return "W1000 -- ShadowedDependency\n\nAn import matches both a module in the local src/ and a dependency.\nThe local module wins (sections/07 §10.5). This lets a package wrap a\ndependency without a change to the imports that use it, but a reader\nwho expects the library gets the local file.\n\n  // src/http.bl exists, and blink.toml declares a dependency `http`\n  import http                  // W1000 -- resolves to src/http.bl\n\nFix: if the shadow is not intended, rename the local module. To keep\nthe shadow without the warning, set `W1000 = \"off\"` in [lints]."
     }
+    if code == UNKNOWN_MANIFEST_SECTION {
+        return "W1001 -- UnknownManifestSection\n\nblink.toml has a top-level section that the spec does not define\n(sections/06 §8.9.8). blink ignores it, so a misspelled section loses\nwhat is in it: the dependencies under `[dependecies]` are not loaded,\nand the import of one fails with ModuleNotFound (E1200), which then\nnotes the unknown section.\n\n  [dependecies]                # W1001 -- did you mean `[dependencies]`?\n  local/utils = \{ path = \"../utils\" \}\n\nIt is a warning, so a manifest written for a newer toolchain still\nbuilds. --strict and a [lints] entry can make it an error.\n\nFix: correct the section name. To keep a section that this toolchain\ndoes not know without the warning, set `W1001 = \"off\"` in [lints]."
+    }
     if code == SHADOWED_PRELUDE_NAME {
         return "W1010 -- ShadowedPreludeName\n\nA module-level definition has the name of a prelude trait. Shadowing\nis allowed, and the definition wins in its own module, but a reader\nexpects `Eq`, `Ord` or `Hash` to mean the prelude trait that the\noperators, `@derive` and `Map` keys use.\n\n  trait Eq \{                     // W1010 -- shadows prelude trait `Eq`\n      fn eq(self, other: Self) -> Bool\n  \}\n\nFix: use a different name. To give a type the prelude trait, write\nthe impl with no trait declaration of your own.\n\n  impl Eq for Point \{             // OK -- the prelude Eq\n      fn eq(self, other: Point) -> Bool \{ self.x == other.x \}\n  \}"
     }
@@ -1446,6 +1521,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == FFI_OFFSET_UNKNOWN_STRIDE {
         return "E0838 -- FfiOffsetUnknownStride\n\nPtr.offset(i) steps by the size of the pointer's element type, so\nthat size must be known at compile time. A sized integer, Int,\nFloat, a Ptr, or an @ffi.struct has one. Void, an @ffi.opaque\nhandle, and a type parameter do not.\n\nFix: point at a type with a size, such as Ptr[I32] or a Ptr[T]\nwhere T is annotated @ffi.struct.\n\n  @ffi.struct(header: \"poll.h\", name: \"pollfd\")\n  pub type Pollfd \{ fd: I32, events: I16, revents: I16 \}\n  let p: Ptr[Pollfd] = scope.alloc_n(8)\n  let q = p.offset(3)   // OK -- stride = sizeof(pollfd)"
+    }
+    if code == INVALID_LINT_LEVEL {
+        return "E0843 -- InvalidLintLevel\n\nA [lints] value in blink.toml is not one of the three levels:\n\"off\", \"warn\" or \"error\" (sections/04 §4.16.8).\n\n  [lints]\n  W0551 = \"loud\"              # E0843 -- invalid lint level `loud`\n  W0601 = \"warning\"           # E0843 -- the level is \"warn\"\n\nThe error is refused, not ignored: no @allow, [lints] entry or\n--strict changes it. A setting that silenced it could hide the very\ntypo it reports, and the lint it names would keep its default level\nwith no sign that the line did nothing.\n\nFix: write one of the three levels.\n\n  [lints]\n  W0551 = \"off\"              # OK"
     }
     if code == INCOMPATIBLE_STDLIB_ARCHIVE {
         return "E0840 -- IncompatibleStdlibArchive\n\nThe installed stdlib archive (libblink_std.a in\n<prefix>/share/blink/) was built by a different blink toolchain\nthan the one now linking your program. The archive and the freshly\nemitted C disagree on struct layout / runtime ABI; linking them\nwould produce a binary that reads boxed values at the wrong offsets\nand corrupts memory at runtime (dangling reads, SIGSEGV).\n\nThe archive carries a `.archive-id` stamp (runtime.h SHA |\nlibblink_std.h SHA | compiler SHA | version). runtime.h and\nlibblink_std.h together define every struct layout the user TU\nshares with the archive. The compiler SHA names the blink binary\nthat emitted the archive's function bodies, which can change while\nboth headers stay the same. When the headers or the running blink\nbinary do not match the stamp, the link is rejected before a binary\nis produced.\n\nFix: reinstall the stdlib so the archive matches the compiler:\n\n  task install\n\nOr rebuild against the current toolchain. If you see this from a\nrelease tarball, the tarball's bin/ and share/blink/ are mismatched\n-- reinstall a consistent release."
