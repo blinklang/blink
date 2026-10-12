@@ -3696,7 +3696,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
     let format_flag = output_format(a)
-    let bad_format = unknown_format(format_flag, build_formats())
+    let bad_format = format_usage_error(a, build_formats())
     if bad_format != "" {
         io.eprintln(bad_format)
         exit(1)
@@ -4307,7 +4307,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO {
     let source_path = args_positional(a, 0)
     let json_output = if json_requested(a) { 1 } else { 0 }
-    let bad_format = unknown_format(output_format(a), ["json"])
+    let bad_format = format_usage_error(a, report_formats())
     if bad_format != "" {
         io.eprintln(bad_format)
         check_failed_exit(source_path, json_output)
@@ -4354,9 +4354,13 @@ fn check_failed_exit(source_path: Str, json_status: Int) {
     exit(1)
 }
 
-// The format a command prints in: the --format value, or json under --json, its short form.
+// The format a command prints in: json under --format json or --json, its short form, and ""
+// for the default, which --format human names.
 fn output_format(a: Args) -> Str {
     let format_flag = args_get(a, "format")
+    if format_flag == "human" {
+        return ""
+    }
     if format_flag == "" && args_has(a, "json") {
         return "json"
     }
@@ -4368,17 +4372,40 @@ fn json_requested(a: Args) -> Bool {
     args_has(a, "json") || args_get(a, "format") == "json"
 }
 
-// blink formats the source in place of compiling it.
-fn build_formats() -> List[Str] {
-    ["json", "blink"]
+// human names the default, so a caller whose stdout is not a terminal can still ask for it.
+fn report_formats() -> List[Str] {
+    ["json", "human"]
 }
 
-// The usage error for a --format value the command does not take, or "" when it takes it.
-fn unknown_format(format_flag: Str, valid: List[Str]) -> Str {
-    if format_flag == "" || valid.contains(format_flag) {
+// blink formats the source in place of compiling it.
+fn build_formats() -> List[Str] {
+    ["json", "human", "blink"]
+}
+
+// The usage error for a --format value the command does not take, or for --json beside another
+// format, which asks for two at once; "" when there is none. An unknown value is named first:
+// it is wrong whatever --json asks for.
+fn format_usage_error(a: Args, valid: List[Str]) -> Str {
+    let format_flag = args_get(a, "format")
+    if format_flag == "" {
         return ""
     }
-    "error: --format must be {valid.join(" or ")}, got '{format_flag}'"
+    if !valid.contains(format_flag) {
+        return "error: --format must be {or_list(valid)}, got '{format_flag}'"
+    }
+    if args_has(a, "json") && format_flag != "json" {
+        return "error: --json conflicts with --format {format_flag}"
+    }
+    ""
+}
+
+// "a", "a or b", "a, b or c".
+fn or_list(items: List[Str]) -> Str {
+    if items.len() < 2 {
+        return items.join("")
+    }
+    let last = items.len() - 1
+    "{items.slice(0, last).join(", ")} or {items.get(last).unwrap()}"
 }
 
 fn check_failed_status_line(source_path: Str) -> Str {
@@ -4441,11 +4468,10 @@ fn daemon_may_build(a: Args) -> Bool {
     if off || (!on && by_env == "0") {
         return false
     }
-    let format_flag = output_format(a)
-    if unknown_format(format_flag, build_formats()) != "" {
+    if format_usage_error(a, build_formats()) != "" {
         return false
     }
-    per_module_fallback_reason("", format_flag) == ""
+    per_module_fallback_reason("", output_format(a)) == ""
 }
 
 // The compiler binary and the environment, which a build reads besides its sources and its
@@ -4746,7 +4772,7 @@ fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
 
 fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
-    let bad_format = unknown_format(output_format(a), ["json"])
+    let bad_format = format_usage_error(a, report_formats())
     if bad_format != "" {
         io.eprintln(bad_format)
         exit(1)
@@ -5773,9 +5799,9 @@ fn cli_parser() -> ArgParser {
     p = command_add_option(p, "run", "--target", "-T", "Target triple (e.g. linux, macos-arm64)")
     p = command_add_option(p, "build", "--emit", "-e", "Output format: binary (default), c, or per-module-dir (emit one .c/.h per module into <outdir>)")
 
-    p = command_add_option(p, "build", "--format", "-f", "Output format: json (same as --json) or blink (format the source)")
-    p = command_add_option(p, "check", "--format", "-f", "Output format: json (same as --json)")
-    p = command_add_option(p, "fmt", "--format", "-f", "Output format: json (same as --json)")
+    p = command_add_option(p, "build", "--format", "-f", "Output format: json (same as --json), human (the default) or blink (format the source)")
+    p = command_add_option(p, "check", "--format", "-f", "Output format: json (same as --json) or human (the default)")
+    p = command_add_option(p, "fmt", "--format", "-f", "Output format: json (same as --json) or human (the default)")
 
     p = command_add_option(p, "build", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
     p = command_add_option(p, "run", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
