@@ -617,6 +617,7 @@ Same logic applies to arena-allocated values — closures capturing arena bindin
 - `let mut` captures: mutations visible across closure boundary
 - No explicit capture syntax (no `move`, no capture lists)
 - `async.spawn` closures: immutable captures only. `let mut` captures are compile error E0650
+- A function value passed to `async.spawn` whose row contains `State`, closure or named function, is compile error E0651 (§4.16.6)
 - `async.spawn` freezes each shared cell its captures reach until the spawner joins the task; a write to a frozen cell panics
 - A handler in force at an `async.spawn` site whose captures reach a shared cell is homed: its ops run on the task that ran its `with`
 - `Closeable`/arena captures: existing escape rules (E0601/E0700) apply transitively through closures
@@ -900,7 +901,7 @@ let mut connection_count = 0
 
 // INVALID — compile error E1013
 pub let mut shared_counter = 0  // error[PubLetMutForbidden]: `pub let mut` is forbidden
-                                // help: expose mutable state through functions with effect tracking
+                                // help: expose mutable state through functions that declare `! State` (§4.16)
 ```
 
 **Function-local shadowing is unaffected.** Within function bodies, `let` shadowing remains allowed (§2.2). This distinction reflects different scoping models: function bodies use sequential lexical scoping (each `let` opens a new scope), while modules use a flat namespace (all bindings coexist).
@@ -1534,7 +1535,7 @@ test "description string" { body }
 
 #### Effect Model: Pure by Default
 
-Test blocks have **no implicit effects**. A test that calls an effectful function without a handler is a compile error — the same rule as any other function with an empty effect row. Effect handlers within the body introduce effects locally.
+Test blocks have **no implicit effects**, with one exception: like `main`, a test block holds `State` (§4.16.1), so it can read and write module-level `let mut` bindings. A test that calls an effectful function without a handler is a compile error — the same rule as any other function with an empty effect row. Effect handlers within the body introduce effects locally.
 
 ```blink
 // Pure test — no effects needed
@@ -1576,7 +1577,7 @@ error[UnhandledEffect]: unhandled effect `Net` in test "fetch data"
 
 This is `UnhandledEffect` (E0539). `main` is the other root, and the same code reports a user-declared effect that `main` does not discharge (§4.6 *Unhandled user effects*).
 
-Pure-by-default enables the compiler to safely parallelize test execution — tests with no effect handlers are guaranteed side-effect-free.
+Pure-by-default enables the compiler to safely parallelize test execution — a test whose row is empty, with no effect handlers and no `State`, is guaranteed side-effect-free.
 
 **Panel vote: 5-0 unanimous** for pure by default. See [DECISIONS.md](../DECISIONS.md).
 

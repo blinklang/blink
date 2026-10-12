@@ -2,6 +2,8 @@
 
 # Non-Local Mutable State — Design Rationale
 
+> **Superseded in part** by [Module-Level State Effect](module-state-effect.md): a function that reads or writes a module-level `let mut` now has the built-in effect `State` in its row. Round 1 and the write-set analysis stay; "writes only" and "not an effect" in Round 2 do not.
+
 ### Round 1: Panel Deliberation (5 experts)
 
 Five panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML) voted independently on 3 questions. The question arose from a real bug: the Blink compiler's `skip_newlines()` mutates module-level `pos` and `pending_comments` without declaring any effect — it looks pure but isn't. Speculative lookahead called it, collected comments as a side effect, then backtracked `pos` without undoing the comment collection. This caused three separate bugs. The broader question: should mutation of state outside the scope where it was created require tracking?
