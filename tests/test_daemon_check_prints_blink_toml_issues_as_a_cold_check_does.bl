@@ -1,0 +1,124 @@
+// A check through the daemon prints the blink.toml diagnostics as a cold check does: E0843 and
+// W1001 once each, with their blink.toml spans and help, and the E1200 note that points at
+// the unknown section, in the same bytes and with the same exit. The daemon's worker loads the
+// manifest in its own process, so these reach the client only through the reply, and a check
+// the daemon answers again from its last result must carry them too.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_manifest_codes_app\"\nversion = \"0.1.0\"\n\n[lints]\nW0703 = \"loud\"\n\n[dependecies]\nlocal/utils = \{ path = \"../utils\" \}\n")
+    // A lock no older than blink.toml keeps dependency resolution out of the client.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/main.bl", "import local.utils\n\nfn main() \{\n    io.println(\"hi\")\n}\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the run drops
+// both, and the module filters, and the daemon starts under the same env.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "checks", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+// What is wrong with one check's output, or "".
+fn reported(label: Str, r: ProcessResult) -> Str {
+    let mut wrong: List[Str] = []
+    if r.exit_code != 1 { wrong.push("{label}: exit {r.exit_code}") }
+    for part in ["InvalidLintLevel", "UnknownManifestSection", "ModuleNotFound", "the unknown section at blink.toml:8:1", "did you mean `[dependencies]`?"] {
+        if count(r.err_out, part) != 1 { wrong.push("{label}: stderr has `{part}` {count(r.err_out, part)} times") }
+        if r.out.contains(part) { wrong.push("{label}: stdout has `{part}`") }
+    }
+    wrong.join("\n")
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(label: Str, a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "{label}: exit {a.exit_code} vs {b.exit_code}" }
+    if a.out.replace(a_tree, "TREE") != b.out.replace(b_tree, "TREE") { return "{label}: stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if a.err_out.replace(a_tree, "TREE") != b.err_out.replace(b_tree, "TREE") { return "{label}: stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+test "a daemon check prints the blink.toml diagnostics as a cold check does" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_manifest_codes_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_manifest_codes_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut checks = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        // The second plain check finds no input changed, so the daemon gives its last answer.
+        for args in ["check src/main.bl", "check src/main.bl", "check --json src/main.bl"] {
+            let w = blink_in(warm, args)
+            let c = blink_in(cold, args)
+            problems.push(reported("warm {args}", w))
+            problems.push(reported("cold {args}", c))
+            problems.push(differ(args, warm, w, cold, c))
+        }
+        checks = served(warm, "checks")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(checks, 3)
+}

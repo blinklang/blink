@@ -7,12 +7,14 @@ import diagnostics.{
     diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset,
     diag_source_file, diag_module_files, embedded_inner_key,
     diag_error_at, diag_file_for_node, diag_warn_in_file_notes, SHADOWED_DEPENDENCY,
+    diag_emit_in_file, diag_error_no_loc_notes, diag_entries,
+    INVALID_LINT_LEVEL, UNKNOWN_MANIFEST_SECTION,
     CIRCULAR_DEPENDENCY, VERSION_CONFLICT, INVALID_MODULE_ANNOTATION,
     PACKAGE_ENTRY_NOT_FOUND, ORPHAN_FILE, MODULE_NOT_FOUND, UNUSED_IMPORT,
     FILE_NOT_FOUND,
 }
 import pkg.lockfile.{lockfile_load, lockfile_clear, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
-import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels, manifest_warnings, manifest_print_warnings}
+import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels, manifest_print_warnings, manifest_issues, ManifestIssueKind}
 import std.path.{path_join, path_dirname, path_parent, path_basename, path_stem}
 import std.toml.{toml_read_value}
 import comment_attach.{attach_comments_pass}
@@ -134,31 +136,74 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report {
     if probe_file(manifest_path) {
         manifest_clear()
         note_config_file(manifest_path)
-        // The one place a compile reports manifest warnings, once, on stderr: stdout carries
-        // the `check --json` status line and the LSP frames. Dependency resolution may load
-        // this manifest earlier in the same compile with the print off. A caller that turned
-        // the print off, such as a command that compiles several files, gets no print here.
-        // The flag goes back as it was, so a later add, remove or update in a daemon or LSP
-        // process still prints.
+        // The compile reports the issues of this load through diag, so the lib must not print
+        // them too. The flag goes back as it was for a caller that still relies on the lib.
         let print_was = manifest_print_warnings
         manifest_print_warnings = false
         let load_rc = manifest_load(manifest_path)
         manifest_print_warnings = print_was
-        if print_was {
-            for w in manifest_warnings {
-                io.eprintln(w)
-            }
-        }
         if load_rc == 0 {
-            let mut i = 0
-            while i < lint_names.len() {
-                lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
-                i = i + 1
-            }
+            apply_manifest_lints(manifest_path)
         }
     }
     if compiler_strict_struct_layout != 0 {
         lint_set_override("MissingCanonicalHeader", "error")
+    }
+}
+
+// Each command reports blink.toml issues through diag, on stderr. The lib would print them as
+// well, on stdout, which carries the `check --json` status line and the LSP frames, so each
+// binary turns that print off at its start.
+pub fn quiet_manifest_lib() {
+    manifest_print_warnings = false
+}
+
+// The notes E1200 adds for each unknown section that W1001 reported in this compile: the
+// dependencies of a misspelled [dependencies] are not loaded, so the import of one fails far
+// from the cause (spec §8.9.8). A W1001 that [lints] turned off is not in the sink, so it
+// adds no note.
+fn unknown_section_notes() -> List[Str] {
+    let mut notes: List[Str] = []
+    for d in diag_entries {
+        if d.code == UNKNOWN_MANIFEST_SECTION {
+            notes.push("blink does not load the dependencies under the unknown section at {d.file}:{d.line}:{d.col}")
+        }
+    }
+    notes
+}
+
+// Sets the [lints] levels of the manifest that the last manifest_load read from path, then
+// reports its issues. The levels go first, so a [lints] entry governs W1001 whatever the order
+// of the sections.
+pub fn apply_manifest_lints(path: Str) ! Diag.Report {
+    let mut i = 0
+    while i < lint_names.len() {
+        lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
+        i = i + 1
+    }
+    // The build workers of `blink test` load the manifest again after the command reported it.
+    if (env.var("BLINK_MANIFEST_REPORTED") ?? "") == "1" {
+        return
+    }
+    let file = if path.starts_with("./") { path.byte_slice(2, path.byte_len()) } else { path }
+    for issue in manifest_issues {
+        match issue.kind {
+            ManifestIssueKind.InvalidLintLevel => {
+                diag_emit_in_file("error", "InvalidLintLevel", INVALID_LINT_LEVEL,
+                    "invalid lint level `{issue.level}` for `{issue.key}`",
+                    file, issue.line, issue.col, issue.end_line, issue.end_col,
+                    "a lint level is one of \"off\", \"warn\" or \"error\"")
+            }
+            ManifestIssueKind.UnknownManifestSection => {
+                let help = match issue.suggestion {
+                    Some(s) => "did you mean `[{s}]`?"
+                    None => ""
+                }
+                diag_emit_in_file("warning", "UnknownManifestSection", UNKNOWN_MANIFEST_SECTION,
+                    "unknown section `[{issue.section}]` in blink.toml",
+                    file, issue.line, issue.col, issue.end_line, issue.end_col, help)
+            }
+        }
     }
 }
 
@@ -806,9 +851,9 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
 
     let npkgs = lockfile_pkg_count()
     if npkgs > 0 {
-        diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "module not found: {dotted_path} (looked at: {full_bl}, checked {npkgs} lockfile packages)", "")
+        diag_error_no_loc_notes("ModuleNotFound", MODULE_NOT_FOUND, "module not found: {dotted_path} (looked at: {full_bl}, checked {npkgs} lockfile packages)", "", unknown_section_notes())
     } else {
-        diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "module not found: {dotted_path} (looked at: {full_bl}; no dependencies - run `blink add` to add packages)", "")
+        diag_error_no_loc_notes("ModuleNotFound", MODULE_NOT_FOUND, "module not found: {dotted_path} (looked at: {full_bl}; no dependencies - run `blink add` to add packages)", "", unknown_section_notes())
     }
     ""
 }

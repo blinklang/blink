@@ -1,0 +1,55 @@
+// Each command reports a blink.toml issue once, on stderr: check, build and run in both build
+// shapes, and test over a dir of two test files. Build and run report the front end's warnings
+// before the back end runs and flush again after it, and test compiles each file on its own,
+// so each of them has a second chance to print what it printed already. The fixture lives
+// under a fresh temporary directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+let CODE = "UnknownManifestSection"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+fn fixture() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_toml_issue_once.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[bogus]\nx = 1\n")
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/tests/test_one.bl", "test \"one\" \{\n    assert(1 == 1)\n}\n")
+    write_file("{dir}/tests/test_two.bl", "test \"two\" \{\n    assert(2 == 2)\n}\n")
+    dir
+}
+
+// What is wrong with one command's output, or "".
+fn once(dir: Str, env_args: Str, args: Str) -> Str {
+    // BLINK_BIN makes the build workers of `blink test` the compiler under test.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE {env_args} BLINK_BIN=$B $B {args}")
+    if r.exit_code != 0 { return "{env_args} blink {args}: exit {r.exit_code}\n{r.err_out}" }
+    let n = count(r.err_out, CODE)
+    if n != 1 { return "{env_args} blink {args}: {CODE} {n} times on stderr:\n{r.err_out}" }
+    if r.out.contains(CODE) { return "{env_args} blink {args}: {CODE} on stdout:\n{r.out}" }
+    ""
+}
+
+test "each command reports a blink.toml issue once on stderr" {
+    let dir = fixture()
+    let mut problems: List[Str] = []
+    problems.push(once(dir, "", "check src/main.bl"))
+    problems.push(once(dir, "", "check --json src/main.bl"))
+    for shape in ["BLINK_PER_MODULE=0", "BLINK_PER_MODULE=1"] {
+        problems.push(once(dir, shape, "build src/main.bl"))
+        problems.push(once(dir, shape, "run src/main.bl"))
+    }
+    problems.push(once(dir, "", "test tests"))
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+}
