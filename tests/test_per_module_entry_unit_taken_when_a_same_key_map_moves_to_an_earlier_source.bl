@@ -1,0 +1,105 @@
+// The entry unit defines every tuple key table, and each table's text is spelled from its
+// tuple type alone. A second Map with the same tuple key type in an earlier source moves the
+// node the table is written from, but not one byte of the table, so a per-module build takes
+// the entry unit. Each build runs with BLINK_EMIT_REUSE_VERIFY=1, so a unit it takes is
+// byte-equal to a cold emit.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"same_key_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf {pairs()}")"#,
+        #"}"#,
+        #""#,
+        #"fn pairs() -> Int {"#,
+        #"    let mut m: Map[(Int, Str), Int] = Map()"#,
+        #"    m.insert((1, "x"), 3)"#,
+        #"    m.len()"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both and the module filters.
+fn build(tree: Str) -> ProcessResult {
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+fn took_entry(r: ProcessResult) -> Bool {
+    "{r.out}\n{r.err_out}".split("\n").contains("[dbg:build.units] reuse unit __main__")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+// Whether the build took the entry unit, and whether its text is the last build's.
+fn step(tree: Str, name: Str) -> Str {
+    let unit = "{tree}/out/app.units/__main__.c"
+    let before = read_file(unit)
+    let took = took_entry(build(tree))
+    let text = if read_file(unit) == before { "same" } else { "changed" }
+    "{name}: took {took}, text {text}"
+}
+
+test "a Map with the same tuple key type in an earlier source leaves the entry unit to be taken" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_same_key_earlier_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build(tree)
+    let mut seen: List[Str] = []
+    edit(tree, "base.bl", #"s/"\[{s}\]"/"[{s} {more()}]"/"#)
+    append(tree, "base.bl", "\nfn more() -> Int \{\n    let mut m: Map[(Int, Str), Bool] = Map()\n    m.insert((3, \"z\"), true)\n    m.len()\n}\n")
+    seen.push(step(tree, "same key in an earlier source"))
+    seen.push(sh("{tree}/out/app"))
+    shell_exec("rm -rf {tree}")
+    assert_eq(seen.join("\n"), [
+        "same key in an earlier source: took true, text same",
+        "[main 1] [leaf 1 1]",
+    ].join("\n"))
+}
