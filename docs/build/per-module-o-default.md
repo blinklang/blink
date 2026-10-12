@@ -760,14 +760,18 @@ builds and runs what it is sent, so no other user may reach its socket. The
 daemon makes `.blink/` and each worker directory `0700`, also one that
 existed before with a looser mode, and each socket `0600`, and does not start
 when it cannot. Only the daemon uses the project's `.blink/`, so a group that
-shares a project loses nothing by it. On Linux x86_64 and aarch64, where the
-`SOL_SOCKET` and `SO_PEERCRED` values were checked against the C headers, the
-daemon also asks the kernel for the uid at the other end of each connection
-it accepts and closes one of another user unread, and the client sends a
-request (with its env) only to a socket whose peer is its own user. The FFI
-cannot read a C macro, so on another arch the peer check is off, the client
-sends hashes in place of its env, and the closed directory alone keeps others
-out.
+shares a project loses nothing by it. The daemon also asks the kernel for the
+uid at the other end of each connection it accepts and closes one of another
+user unread, and the client sends a request (with its env) only to a socket,
+router or worker, whose peer is its own user. The runtime helper
+`blink_unix_socket_peer_uid` asks with `SO_PEERCRED` on Linux, any arch, and
+with `getpeereid` on macOS, FreeBSD, OpenBSD, NetBSD and DragonFly; the C
+compiler picks the call from the target's platform macros. When the call
+fails, the daemon and the client refuse that peer. On any other platform the
+helper says the check is not supported: the daemon then serves each
+connection and the client sends to each socket, so the closed directory alone
+keeps others out there. The client sends its env, not hashes, only where the
+check is supported and /proc names its compiler and env, so on Linux.
 
 ### Any entry of the project
 
