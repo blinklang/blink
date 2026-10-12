@@ -2618,3 +2618,51 @@ show this, so the change does not explain it.
 
 None from the edit-loop bench: `nochange` on cli is faster than the
 monolith, and no per-module case is slower than before outside its spread.
+
+## Exit criteria on main 85653d77
+
+Measured 2026-10-12 on main 85653d77 (gen0 selfhost-15) with the gen1
+blink of that tree (sha256 c7c8201a687cb03d...), gcc 16.2.1, all runs in
+blink-gates.slice (12 CPUs) after the load fell below 3. Each bench row is a
+median of 5. (1)-(5) come from `scripts/bench_edit_loop.sh build/gen1/bin/blink`,
+once with no daemon and once with `BENCH_DAEMON=1 BENCH_SETTLE=1`.
+
+(6) is the dqg2d4 job: each build of src/cli.bl runs
+`setarch -R <bin> build --emit c src/blinkc_main.bl`, under `perf stat -e
+cycles:u,instructions:u` and `/usr/bin/time -f %M`, with the 4 binaries
+alternating 5 times per set and 3 sets. The default -O1 build made 69 units: 52
+modules plus 17 typecheck split units (typecheck.p<hex8>.c and
+typecheck.pos.c). `--release` splits nothing and made 52. The emitted C was
+byte-equal in each run. The main-thread set uses `perf stat -i` and no time
+wrapper.
+
+| criterion | bar | value | result | file |
+|---|---|---|---|---|
+| (1) cli private-body edit | <= 1.0 s | 0.733 s, daemon 0.412 s | pass | exit_criteria_85653d77.tsv, exit_criteria_daemon_settle1_85653d77.tsv |
+| (2) cli new pub fn | <= 2.0 s | 0.739 s, daemon 0.440 s | pass | same |
+| (3) small body / pub fn edit | <= 0.3 s | 0.088 / 0.079 s, daemon 0.082 / 0.072 s | pass | same |
+| (4) cli `blink test` after a body edit | order of (1) | 0.416 s, daemon 0.457 s | pass | same |
+| (5) cli cold build | <= 6.0 s | cold-all 4.380 s, daemon 4.570 s | pass | same |
+| (5) cli no-change build | <= 0.8 s | 0.516 s, daemon 0.149 s | pass | same |
+| (6) output speed -O1, cycles:u | <= +3% | +0.65, +0.66, +2.25% per set; +1.26% pooled; main thread +1.98% | pass | exit_criteria_output_speed_run{1,2,3}_85653d77.tsv, exit_criteria_output_speed_main_thread_85653d77.tsv |
+| (6) output speed -O2, cycles:u | <= +3% | +2.54, +3.87, +1.33% per set; +2.54% pooled (paired +2.59%); main thread +1.74% | pass on pooled, one set of 5 over | same |
+| (6) instructions:u, -O1 / -O2 | - | +0.40 / +1.45% pooled | - | same |
+| (6) maxRSS, -O1 / -O2 | - | -0.04 / -0.25% pooled | - | same |
+| (7) `task ci` wall, median of 3 | <= 117.6 s | 117.69 s (117.69, 117.56, 117.91) | miss by 0.09 s | gate logs |
+| (7) per-module invariants | green | `task ci-per-module-checks` exit 0 | pass | gate log |
+| (8) open P1/P2 obj-cache or daemon correctness bug | none | none gives wrong C or a wrong program | pass | br sweep |
+
+The spread of cycles:u within one set is 2-4%, so one set can read over the
+bar when the pooled median does not. Instructions:u match dqg2d4 (+0.43 /
++1.42%).
+
+The (7) miss comes from the corpus, not the build: since ee06e160 (113.65 s)
+the corpus grew from 2136 to 2195 files and the per-module slice from 184 to
+224 rows. The corpus sweep takes 103-104 s of the wall.
+
+For (8), two open P2 bugs make a daemon check print less than a cold check: a
+W1000 printed to stdout, and an unknown-escape warning from the lexer. Neither
+goes through the diagnostics, and the daemon C is not changed by either. Two
+open P2 cache bugs give no wrong output: `blink test --no-cache` still uses the
+obj cache in its parallel workers, and a vendored native-dep object is reused
+across build modes.
