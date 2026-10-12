@@ -1,0 +1,119 @@
+// The entry unit defines every tuple key table, keyed by the table's name alone. A struct or
+// enum element is compared and hashed by a call to its own derived method, which its module's
+// unit defines, and a nested tuple element by a method spelled from its type. So a field or a
+// variant added in the element's module leaves the table name and the entry unit's text as
+// they were, and the build must still be correct. Such an edit also changes the types header,
+// so the build takes no unit; the text check still holds if a later build takes units past a
+// header change. Each build runs with
+// BLINK_EMIT_REUSE_VERIFY=1, so a unit it took against a stale key fails the build, and the
+// program's output shows the new field in use.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"key_element_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/shapes.bl", [
+        #"@derive(Eq, Hash)"#,
+        #"pub type Point { x: Int, y: Int }"#,
+        #""#,
+        #"@derive(Eq, Hash)"#,
+        #"pub type Kind { Circle { r: Int } Square { s: Int } }"#,
+        #""#,
+        #"pub fn point(a: Int, b: Int) -> Point {"#,
+        #"    Point { x: a, y: a }"#,
+        #"}"#,
+        #""#,
+        #"pub fn kind(a: Int) -> Kind {"#,
+        #"    if a > 5 { Square { s: 1 } } else { Circle { r: a } }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import shapes.{point, kind}"#,
+        #""#,
+        #"pub fn counts() -> Str {"#,
+        #"    let mut ps: Map[(shapes.Point, Int), Int] = Map()"#,
+        #"    ps.insert((point(1, 1), 2), 3)"#,
+        #"    ps.insert((point(1, 9), 2), 4)"#,
+        #"    let mut ks: Map[(shapes.Kind, Int), Int] = Map()"#,
+        #"    ks.insert((kind(1), 2), 3)"#,
+        #"    ks.insert((kind(200), 2), 3)"#,
+        #"    ks.insert((kind(300), 2), 3)"#,
+        #"    let mut ns: Map[((shapes.Point, Str), Int), Int] = Map()"#,
+        #"    ns.insert(((point(1, 1), "a"), 2), 3)"#,
+        #"    ns.insert(((point(1, 9), "a"), 2), 5)"#,
+        #"    "{ps.len()} {ks.len()} {ns.len()}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import leaf.{counts}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(counts())"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both and the module filters.
+fn build(tree: Str) -> ProcessResult {
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+fn took_entry(r: ProcessResult) -> Bool {
+    "{r.out}\n{r.err_out}".split("\n").contains("[dbg:build.units] reuse unit __main__")
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+// Whether the build took the entry unit, whether its text is the last build's, and what the
+// program prints.
+fn step(tree: Str, name: Str) -> Str {
+    let unit = "{tree}/out/app.units/__main__.c"
+    let before = read_file(unit)
+    let took = took_entry(build(tree))
+    let text = if read_file(unit) == before { "same" } else { "changed" }
+    "{name}: took {took}, text {text}, prints {sh("{tree}/out/app")}"
+}
+
+test "a field or a variant added to a key element's type leaves the entry unit's text as it was" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_key_element_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build(tree)
+    let mut seen = ["first build: prints {sh("{tree}/out/app")}"]
+    edit(tree, "shapes.bl", "s/x: Int, y: Int }/x: Int, y: Int, z: Int }/; s/x: a, y: a }/x: a, y: a, z: b }/")
+    seen.push(step(tree, "a field in the struct element"))
+    edit(tree, "shapes.bl", "s/Square \{ s: Int } }/Square \{ s: Int } Tri \{ t: Int } }/; s/if a > 5 /if a > 250 \{ Tri \{ t: a } } else if a > 5 /")
+    seen.push(step(tree, "a variant in the enum element"))
+    shell_exec("rm -rf {tree}")
+    assert_eq(seen.join("\n"), [
+        "first build: prints 1 2 1",
+        "a field in the struct element: took false, text same, prints 2 2 2",
+        "a variant in the enum element: took false, text same, prints 2 3 2",
+    ].join("\n"))
+}
