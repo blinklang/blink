@@ -1,0 +1,56 @@
+// manifest_load always collects its warnings in manifest_warnings. It prints them only while
+// manifest_print_warnings is on, so a caller that loads the manifest more than once in one command
+// can report them once itself. The probe program runs in a child process because the warnings print
+// to stdout, and the child compiles this tree's pkg.manifest.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+let MANIFEST: Str = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n\n[lints]\nW0600 = \"loud\"\n\n[extras]\nkey = \"v\"\n"
+let LINT_WARNING: Str = "warning: unknown lint level 'loud' for 'W0600' in [lints] (expected off, warn, or error)"
+let SECTION_WARNING: Str = "warning: unknown section 'extras' in manifest"
+
+fn run_probe(name: Str, body: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_manifest_print_flag.XXXXXX").out.trim()
+    write_file("{dir}/probe.toml", MANIFEST)
+    write_file("{dir}/{name}.bl", "import pkg.manifest.\{manifest_load, manifest_warnings, manifest_print_warnings}\n\nfn main() \{\n{body}}\n")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && $B run {name}.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn count(hay: Str, needle: Str) -> Int {
+    hay.split(needle).len() - 1
+}
+
+test "a manifest_load with the print flag off prints nothing and collects both warnings" {
+    let r = run_probe("manifest_flag_off", "    manifest_print_warnings = false\n    let rc = manifest_load(\"probe.toml\")\n    io.println(\"rc=\{rc} n=\{manifest_warnings.len()}\")\n    for w in manifest_warnings \{\n        io.println(\"collected: \{w}\")\n    }\n")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc=0 n=2"))
+    assert_eq(count(r.out, "collected: {LINT_WARNING}"), 1)
+    assert_eq(count(r.out, "collected: {SECTION_WARNING}"), 1)
+    assert_eq(count("{r.out}{r.err_out}", LINT_WARNING), 1)
+    assert_eq(count("{r.out}{r.err_out}", SECTION_WARNING), 1)
+}
+
+test "a manifest_load with the print flag on, the default, prints each warning and collects it" {
+    let r = run_probe("manifest_flag_on", "    let rc = manifest_load(\"probe.toml\")\n    io.println(\"rc=\{rc} n=\{manifest_warnings.len()}\")\n")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("rc=0 n=2"))
+    assert_eq(count(r.out, LINT_WARNING), 1)
+    assert_eq(count(r.out, SECTION_WARNING), 1)
+}
+
+test "each manifest_load in one process starts a fresh list and finds the unknown section again" {
+    let r = run_probe("manifest_flag_reload", "    manifest_print_warnings = false\n    let _ = manifest_load(\"probe.toml\")\n    let _ = manifest_load(\"probe.toml\")\n    io.println(\"n=\{manifest_warnings.len()}\")\n    for w in manifest_warnings \{\n        io.println(\"collected: \{w}\")\n    }\n    manifest_print_warnings = true\n    let _ = manifest_load(\"probe.toml\")\n")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("n=2"))
+    assert_eq(count(r.out, "collected: {SECTION_WARNING}"), 1)
+    assert_eq(count(r.out, "collected: {LINT_WARNING}"), 1)
+    // The third load, with the flag back on, prints both warnings again.
+    assert_eq(count(r.out, SECTION_WARNING), 2)
+    assert_eq(count(r.out, LINT_WARNING), 2)
+}
