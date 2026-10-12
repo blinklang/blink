@@ -1,0 +1,102 @@
+// clang takes a PCH whose headers kept their size but not their bytes without an error. A
+// PCH built while a header changed holds bytes its key does not name, so the build must not
+// store it: once the header is back to the bytes of the key, a unit that read that PCH would
+// compile what the header no longer says.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs clang. Each
+// compile writes its arguments and its -H output to a file of its own, so a unit that read
+// the PCH shows -include-pch and no line for the archive header. While the file swap exists,
+// the next PCH build first writes runtime.h.swapped over the archive dir's runtime.h.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let clang = sh("command -v clang")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" c-header \"*) if [ -e {tree}/swap ]; then rm -f {tree}/swap; cat {tree}/runtime.h.swapped > {tree}/build/runtime.h; fi; exec {clang} \"$@\" ;; *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    // A program's first build makes no PCH, so the tree starts with one build behind it.
+    let _ = build_at(tree, "", 0)
+}
+
+// Edits the entry module and builds a debug build in the tree with its own object cache, the
+// clang cc, the unit trace and the variables in envs set, answering what the build printed.
+// The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one
+// unit, so the run drops them.
+fn build_at(tree: Str, envs: Str, n: Int) -> Str {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {envs} build/blink build app/src/main.bl -o {tree}/out/app --per-module --debug"])
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    "{r.out}{r.err_out}"
+}
+
+// The compiles of the last build that read a PCH the build held under the cache's tmp/.
+fn pch_reads(tree: Str) -> Int {
+    sh("grep -l '^ARGS .* -include-pch {tree}/objcache/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.pch' {tree}/cc_h/* | xargs -r grep -L -e 'libblink_std\\.h$' -e 'error:' | wc -l").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+// The objects a build compiles with no cached object, as "<sha>  <key>.o" lines.
+fn objects_built(tree: Str, envs: Str, n: Int) -> (Str, Int) {
+    shell_exec("rm -f {tree}/objcache/*.o {tree}/objcache/*.meta")
+    let _ = build_at(tree, envs, n)
+    (sh("cd {tree}/objcache && sha256sum *.o"), pch_reads(tree))
+}
+
+test "a clang archive header PCH built while a header changed is not stored" {
+    if sh("command -v clang") == "" {
+        io.println("skip: no clang on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_clang_pch_header_changed_{getpid()}"
+    dev_tree(root, tree)
+    // The same size, and each static the header marks unused is kept in the object. clang
+    // takes the offsets in a PCH from the header on disk, so a change that keeps every token
+    // where it was, such as a moved newline, would not show in an object.
+    shell_exec("cp {tree}/build/runtime.h {tree}/runtime.h.orig")
+    shell_exec("sed 's/^#define BLINK_UNUSED __attribute__((unused))$/#define BLINK_UNUSED __attribute__((used))  /' {tree}/runtime.h.orig > {tree}/runtime.h.swapped")
+    let same_size = sh("wc -c < {tree}/runtime.h.orig") == sh("wc -c < {tree}/runtime.h.swapped")
+    let differ = sh("cmp -s {tree}/runtime.h.orig {tree}/runtime.h.swapped || echo differ")
+
+    shell_exec("touch {tree}/swap")
+    let changed_out = build_at(tree, "", 1)
+    let swapped = sh("[ -e {tree}/swap ] || echo swapped")
+    let stored = pch_dirs(tree).len()
+    shell_exec("cat {tree}/runtime.h.orig > {tree}/build/runtime.h")
+
+    // The headers hold the bytes of the key again. A PCH stored by the build that saw them
+    // change would serve this build and the next; a good one is built here if none was.
+    let _ = build_at(tree, "", 2)
+    let (pch_objs, reads) = objects_built(tree, "", 3)
+    let (off_objs, _) = objects_built(tree, "BLINK_ARCHIVE_PCH=0", 3)
+    shell_exec("rm -rf {tree}")
+
+    assert(same_size, "the changed runtime.h has another size")
+    assert_eq(differ, "differ")
+    assert(changed_out.contains("pch build"), "the build with the change built no PCH: {changed_out}")
+    assert_eq(swapped, "swapped")
+    assert(reads >= 1, "no unit read the PCH after the header came back")
+    assert_eq(pch_objs, off_objs)
+    assert_eq(stored, 0)
+}

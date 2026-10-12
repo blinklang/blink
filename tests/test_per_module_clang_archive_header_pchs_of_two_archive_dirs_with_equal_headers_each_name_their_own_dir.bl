@@ -1,0 +1,117 @@
+// clang records in a PCH the path of each header it was built from, and the debug info of a
+// unit that reads it names those paths. Two archive dirs that hold the same header bytes, on
+// one object cache, must each get a PCH of their own: a debug build from either dir must
+// name only its own dir, and its objects must be the bytes it builds without a PCH.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs clang. Each
+// compile writes its arguments and its -H output to a file of its own, so a unit that read
+// the PCH shows -include-pch and no line for the archive header.
+fn dev_tree(root: Str, tree: Str, cache: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let clang = sh("command -v clang")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    // A program's first build makes no PCH, so the tree starts with one build behind it.
+    edit_main(tree, 0)
+    let r = blink_in(tree, cache, "", "build app/src/main.bl -o {tree}/out/app --per-module --debug")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Runs blink in the tree with the shared object cache, the clang cc and the unit trace, and
+// the variables in envs ("NAME=value ...") set. The corpus exports BLINK_COMPILER_ARCHIVE
+// and module filters, which make the build one unit, so the run drops them.
+fn blink_in(tree: Str, cache: Str, envs: Str, args: Str) -> ProcessResult {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units {envs} build/blink {args}"])
+}
+
+// The compiles of the last build in tree that read a PCH the build held under the cache's
+// tmp/: clang took it and so lists no archive header among the files it opened.
+fn pch_reads(tree: Str, cache: Str) -> Int {
+    sh("grep -l '^ARGS .* -include-pch {cache}/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.pch' {tree}/cc_h/* | xargs -r grep -L -e 'libblink_std\\.h$' -e 'error:' | wc -l").to_int()
+}
+
+fn pch_dirs(cache: Str) -> List[Str] {
+    let out = sh("cd {cache} && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+// The objects a debug build in tree compiles with no cached object, as "<sha>  <key>.o"
+// lines, how many units read the PCH, and how many objects hold the text dir. clang names a
+// header under the dir it compiles in by its path from there, so an object names its own
+// archive dir through the tree's path, and another tree's as "<tree name>/build/<header>"
+// from the dir the two trees share.
+fn objects_built(tree: Str, cache: Str, envs: Str, n: Int, dir: Str) -> (Str, Int, Int) {
+    shell_exec("rm -f {cache}/*.o {cache}/*.meta")
+    edit_main(tree, n)
+    let r = blink_in(tree, cache, envs, "build app/src/main.bl -o {tree}/out/app --per-module --debug")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    let names = sh("grep -c -a -F '{dir}' {cache}/*.o | grep -v ':0$' | wc -l").to_int()
+    (sh("cd {cache} && sha256sum *.o"), pch_reads(tree, cache), names)
+}
+
+test "clang archive header PCHs of two archive dirs with equal headers each name their own dir" {
+    if sh("command -v clang") == "" {
+        io.println("skip: no clang on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let cache = "{root}/.tmp/_clang_pch_two_dirs_cache_{getpid()}"
+    let tree_a = "{root}/.tmp/_clang_pch_two_dirs_a_{getpid()}"
+    let tree_b = "{root}/.tmp/_clang_pch_two_dirs_b_{getpid()}"
+    shell_exec("rm -rf {cache}")
+    dev_tree(root, tree_a, cache)
+    dev_tree(root, tree_b, cache)
+    let same_headers = sh("cmp {tree_a}/build/libblink_std.h {tree_b}/build/libblink_std.h && cmp {tree_a}/build/runtime.h {tree_b}/build/runtime.h && echo same")
+    // Each tree's first edit makes the PCH of its own archive dir, A's first. B's source
+    // differs from A's: the key of a unit names no archive dir, so B would take A's objects
+    // and compile none.
+    edit_main(tree_a, 1)
+    let ra = blink_in(tree_a, cache, "", "build app/src/main.bl -o {tree_a}/out/app --per-module --debug")
+    assert(ra.exit_code == 0, "build failed: {ra.out}{ra.err_out}")
+    edit_main(tree_b, 101)
+    let rb = blink_in(tree_b, cache, "", "build app/src/main.bl -o {tree_b}/out/app --per-module --debug")
+    assert(rb.exit_code == 0, "build failed: {rb.out}{rb.err_out}")
+    let dirs = pch_dirs(cache)
+
+    let (b_objs, b_reads, b_names_a) = objects_built(tree_b, cache, "", 102, "_clang_pch_two_dirs_a_{getpid()}/build/")
+    let (_, _, b_names_b) = objects_built(tree_b, cache, "", 102, "{tree_b}")
+    let (b_off_objs, _, _) = objects_built(tree_b, cache, "BLINK_ARCHIVE_PCH=0", 102, "{tree_b}/")
+    let (a_objs, a_reads, a_names_b) = objects_built(tree_a, cache, "", 2, "_clang_pch_two_dirs_b_{getpid()}/build/")
+    let (_, _, a_names_a) = objects_built(tree_a, cache, "", 2, "{tree_a}")
+    let (a_off_objs, _, _) = objects_built(tree_a, cache, "BLINK_ARCHIVE_PCH=0", 2, "{tree_a}/")
+    shell_exec("rm -rf {tree_a} {tree_b} {cache}")
+
+    assert_eq(same_headers, "same")
+    assert_eq(b_names_a, 0)
+    assert_eq(a_names_b, 0)
+    assert(b_names_b >= 1, "no object of the build from B names its archive dir")
+    assert(a_names_a >= 1, "no object of the build from A names its archive dir")
+    assert_eq(b_objs, b_off_objs)
+    assert_eq(a_objs, a_off_objs)
+    assert(b_reads >= 1, "no unit of the build from B read a PCH")
+    assert(a_reads >= 1, "no unit of the build from A read a PCH")
+    assert(dirs.len() == 2, "two archive dirs made {dirs.len()} PCH dirs")
+}
