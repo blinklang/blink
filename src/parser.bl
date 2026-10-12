@@ -168,6 +168,9 @@ let mut annotations: PendingAnnotations = PendingAnnotations { item: [], program
 // alone.
 type FnBodies {
     wanted: Bool
+    // Whether the loader keeps what each interface text is written from, for a caller to
+    // write later, in place of the text.
+    deferred: Bool
     depth: Int
     tok_firsts: List[Int]
     tok_lasts: List[Int]
@@ -184,7 +187,7 @@ type FnBodies {
     item_kinds: List[Str]
 }
 
-let mut fn_bodies: FnBodies = FnBodies { wanted: false, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
+let mut fn_bodies: FnBodies = FnBodies { wanted: false, deferred: false, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
 
 // `@expect_panic` desugars to a real AssertPanics node during parse so the
 // compile path gets all the assert_panics machinery for free. The FORMAT path
@@ -212,7 +215,7 @@ pub fn parser_reset() {
     sublists = SublistPool { arena: [], start: [], len: [], open: [], scratch: [] }
     annotations = PendingAnnotations { item: [], program: [] }
     // The build sets wanted before the front end, which resets the parser first.
-    fn_bodies = FnBodies { wanted: fn_bodies.wanted, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
+    fn_bodies = FnBodies { wanted: fn_bodies.wanted, deferred: fn_bodies.deferred, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
     source_module_for_node.clear()
     pos = 0
     parse_desugar_enabled = 1
@@ -1220,6 +1223,17 @@ pub fn parser_want_interface_text(on: Bool) {
     fn_bodies.wanted = on
 }
 
+// Whether the loader leaves each source interface text "" until fill_source_interfaces, so a
+// daemon can answer a check before it pays for writing them. Only a build reads them, and the
+// daemon fills them before it forks one.
+pub fn parser_defer_interface_text(on: Bool) {
+    fn_bodies.deferred = on
+}
+
+pub fn parser_interface_text_deferred() -> Bool {
+    fn_bodies.deferred
+}
+
 // The tokens of the source parsed last, but for those inside a fn body: what other modules
 // see of it. Each token is its kind's name and its text, each after its length, so no two
 // token lists give one text. Positions are left out: emit marks the source of each position
@@ -1227,11 +1241,18 @@ pub fn parser_want_interface_text(on: Bool) {
 // no token kind is named, whose text is the item's kind. "" when not wanted here or by the
 // build.
 pub fn parsed_interface_text(wanted: Bool) -> Str {
+    interface_text_of(parsed_interface_parts(wanted))
+}
+
+// The tokens parsed_interface_text writes, as each one's kind name and then its text, not yet
+// written out. Most of what the text costs is writing it, which a caller can so put off, as a
+// daemon does until it has answered a check. Empty when not wanted here or by the build.
+pub fn parsed_interface_parts(wanted: Bool) -> List[Str] {
+    let mut parts: List[Str] = []
     if !wanted || !fn_bodies.wanted {
         clear_fn_bodies()
-        return ""
+        return parts
     }
-    let sb = StringBuilder.new()
     let n = tokens.kinds.len()
     let b = fn_bodies
     let mut r = 0
@@ -1239,9 +1260,8 @@ pub fn parsed_interface_text(wanted: Bool) -> Str {
     let mut i = 0
     while i < n {
         if q < b.item_firsts.len() && i == b.item_firsts[q] {
-            let v = b.item_kinds[q]
-            sb.write("{ITEM_MARK.byte_len()}:{ITEM_MARK}{v.byte_len()}:")
-            sb.write(v)
+            parts.push(ITEM_MARK)
+            parts.push(b.item_kinds[q])
             q = q + 1
         }
         if r < b.tok_firsts.len() && i > b.tok_firsts[r] {
@@ -1250,20 +1270,31 @@ pub fn parsed_interface_text(wanted: Bool) -> Str {
             r = r + 1
             continue
         }
-        let k = token_kind_name(tokens.kinds[i])
-        let v = tokens.values[i]
-        sb.write("{k.byte_len()}:{k}{v.byte_len()}:")
-        sb.write(v)
+        parts.push(token_kind_name(tokens.kinds[i]))
+        parts.push(tokens.values[i])
         i = i + 1
     }
     // The end of the source can lie past the last token the lexer kept.
     while q < b.item_firsts.len() {
-        let v = b.item_kinds[q]
-        sb.write("{ITEM_MARK.byte_len()}:{ITEM_MARK}{v.byte_len()}:")
-        sb.write(v)
+        parts.push(ITEM_MARK)
+        parts.push(b.item_kinds[q])
         q = q + 1
     }
     clear_fn_bodies()
+    parts
+}
+
+// The interface text of what parsed_interface_parts gave.
+pub fn interface_text_of(parts: List[Str]) -> Str {
+    let sb = StringBuilder.new()
+    let mut i = 0
+    while i + 1 < parts.len() {
+        let k = parts[i]
+        let v = parts[i + 1]
+        sb.write("{k.byte_len()}:{k}{v.byte_len()}:")
+        sb.write(v)
+        i = i + 2
+    }
     sb.to_str()
 }
 
