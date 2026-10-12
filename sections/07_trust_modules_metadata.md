@@ -1738,7 +1738,7 @@ type PasswordHash {
 }
 ```
 
-**`pub let` exports immutable module-level bindings.** A module-level `let` (without `mut`) marked `pub` is importable by other modules as a read-only value. `pub let mut` is a compile error (E1013, not yet enforced) — mutable state must be accessed through functions, with mutation tracked by the compiler's write-set analysis (§4.16). See §2.12.1 for full rules on module-level bindings.
+**`pub let` exports immutable module-level bindings.** A module-level `let` (without `mut`) marked `pub` is importable by other modules as a read-only value. `pub let mut` is a compile error (E1013, not yet enforced) — mutable state must be accessed through functions, which declare `! State` (§4.16). See §2.12.1 for full rules on module-level bindings.
 
 There is no `pub(crate)`, no `protected`, no `internal`, no `friend`. Two levels: private and public. This is a deliberate constraint.
 

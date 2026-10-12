@@ -90,7 +90,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | NoConversionImpl | E0312 | A conversion has no impl: `x.into()` and `T.from(x)` need `impl From[S] for T`, `T.try_from(x)` needs `impl TryFrom[S] for T`, with S the source's type (an alias is the type it names). Every type converts to itself. Repair: declare the impl, or use the named conversion (`.to_float()`, `.truncate()`, `.to_int_checked()`, `try_from`, `.to_string()`) | Type checking | §3c |
 | NoIndexOperator | E0313 | A postfix `[...]` holds a value (`xs[1]`, `m["k"]`, `fns[0](x)`). Blink has no index operator. Decided by the bracket contents at name resolution, whether or not a call follows. Repair: `.get()` (returns `Option`), or `.0` for a tuple; no machine fix when a call follows. A store `xs[i] = v` is the same error: repair `.set(i, v)` (List, Bytes) or `.insert(k, v)` (Map), never `.insert` for a List | Name resolution | §3.4, §2.22 |
 | TypeArgsWithoutCall | E0314 | A well-formed type-argument list with no call `(` or literal `{` after it (`let f = identity[Int]`). First help: remove the brackets when an expected type fixes the same arguments; annotate the binding when there is no expected type; no machine fix when they conflict | Type checking | §3.4 |
-| UndeclaredEffect | E0500 | Callee requires effect not declared by caller. The declared row of an `@ffi` callee counts like any other row | Effects | §4.5 |
+| UndeclaredEffect | E0500 | Callee requires effect not declared by caller. The declared row of an `@ffi` callee counts like any other row. Not for `State`: E0552 covers it | Effects | §4.5 |
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | QuestionMarkInvalidOperand | E0502 | `?` operator used on non-Result, non-Option type | Type checking | §3c.2 |
 | UndefinedFunction | E0504 | Call to undefined function | Name resolution | §6.3 |
@@ -119,13 +119,16 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | SubEffectAsType | E0536 | A sub-effect is written as a type (`Template[DB.Read]`); only a top-level effect gives a type | Type checking | §3b.5 |
 | JsonTextForValue | E0537 | A `Str` is passed to a `from_json` that takes `JsonValue`, or `to_json()`'s result is used as a `Str`; the fix names `json.decode[T]` / `json.encode` | Type checking | §3.6.2 |
 | UnknownEffect | E0538 | An effect row names an effect that is neither built-in nor declared. For `FFI` the help says a foreign call is not an effect and points to §9.1. When the name before the dot is a leaf effect, a note lists its operations and the help names the whole effect. No machine-applicable fix | Effects | §4.3, §4.12 |
-| UnhandledEffect | E0539 | An effect reaches a root with no `with` that discharges it: a user-declared effect in `main`, or any effect in a test block. The header names the root (in `main`, or in test "..."); in `main` the help says user-declared effects have no root handler | Effects | §4.6, §2.20 |
+| UnhandledEffect | E0539 | An effect reaches a root with no `with` that discharges it: a user-declared effect in `main`, or any effect but `State` in a test block. It never fires for `State`, which the roots hold (§4.16.1). The header names the root (in `main`, or in test "..."); in `main` the help says user-declared effects have no root handler | Effects | §4.6, §2.20 |
 | MixedEffectBody | E0541 | An effect body declares both operations and sub-effects; a body holds one or the other. The fix moves the operations into a new sub-effect with a placeholder name, never up to the parent | Parser | §4.12 |
 | EffectNestingTooDeep | E0542 | A sub-effect declares a sub-effect; in v1 an effect tree has the top-level effect and one level of sub-effects | Parser | §4.12 |
 | DuplicateEffectOp | E0543 | Two nodes of one top-level effect tree declare operations with the same name. The message names both declarations (`Metrics.Emit.get`, `Metrics.Query.get`) | Effects | §4.12 |
 | DefaultOutsideHandlerOp | E0544 | `default` used outside the body of a handler operation, with no local binding named `default` in scope. A closure body is not an operation body, even when the closure is written inside one; there the message names the closure, the first help line says to call `default` in the operation body itself, and the second says a closure that runs while the operation runs can call through the handle (`audit.record(l)`). Outside any operation, the help shows the call through the effect's handle, built from the call (`audit.record("x")`), or says in words to call through the handle or move the call into a handler operation. No machine-applicable fix. A `default` binding in scope makes `default.x` ordinary member access (E0505 for a missing member) | Effects | §4.7.1 |
+| StateNotHandleable | E0545 | A `handler State { ... }`, or a `with` that names `State`. `State` has no operations and no handler; the roots hold it | Effects | §4.16.1 |
+| UndeclaredModuleState | E0552 | A boundary function (`pub fn`, `pub` method, trait impl method) touches module state, through its body or a call, and its row does not name `State`. One `note:` per binding: its name, read or written, the access location, and the call it goes through. Machine-applicable fix: add `State` to the row. E0500 does not fire for `State` | Effects | §4.16.1 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
 | MutableCaptureInSpawn | E0650 | A closure passed to `async.spawn` captures a `let mut` binding | Closures | §2.8 |
+| SpawnTouchesModuleState | E0651 | A function value passed to `async.spawn`, closure literal or named function, whose effective row contains `State`. The help says to pass the data in, return it from the task, or use a `Channel` | Closures | §4.16.6, §2.8 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
 | ArenaTypeContainsCycle | E0701 | Type crossing `with arena { }` boundary contains a cycle | Arena | §5.2 |
 | ArenaClosureTailUnsupported | E0702 | Closure-typed arena tail cannot be promoted (umbrella) | Arena | §5.2 |
@@ -209,7 +212,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | ResultOutsideEnsures | E1304 | `result` referenced outside an `@ensures` predicate | Refinement contracts | §3b |
 | OldOutsideEnsures | E1305 | `old(_)` referenced outside an `@ensures` predicate | Refinement contracts | §3b |
 | AssignmentInPredicate | E1306 | Predicate contains an assignment | Refinement contracts | §3b |
-| ImpureBodyForPureAnnotation | E1307 | `@pure` function body contains a non-pure construct | Refinement contracts | §3b |
+| ImpureBodyForPureAnnotation | E1307 | `@pure` function has a non-empty effective row, `State` included | Refinement contracts | §3b.2, §4.16.3 |
 | ModifiesArgNotSimplePath | E1308 | `@modifies` argument is not a simple path | Refinement contracts | §3b |
 | RecursiveContractPredicate | E1309 | A contract predicate of fn `f` calls `f`, directly or through a cycle of contract predicates (body calls are not edges); the diagnostic prints the cycle | Refinement contracts | §3b.2 |
 | MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or a user type with no `Hash` impl, derived or written) | Generic collections | §3.6 |
@@ -227,6 +230,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | UnknownMethod | W0501 | Method name resolves to nothing and the receiver's type is not known at the call | Method resolution | §3c.4 |
 | IncompleteStateRestore | W0550 | Speculative lookahead saves some but not all written bindings | Mutation analysis | §4.16 |
 | UnrestoredMutation | W0551 | Function writes module-level state without restoring it in a speculative context | Mutation analysis | §4.16 |
+| ModuleLetMutNeverWritten | W0552 | A module-level `let mut` that no code in its module writes; its readers carry `State` for no reason. Machine-applicable fix: declare it with `let` | Mutation analysis | §4.16.2 |
 | UnusedVariable | W0600 | Variable declared but never read | Linting | §6 |
 | SetButNotRead | W0601 | Variable assigned but value never read | Linting | §6 |
 | UnusedImport | W0602 | Module imported but no symbols referenced | Linting | §6 |

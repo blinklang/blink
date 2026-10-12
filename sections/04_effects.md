@@ -8,7 +8,7 @@ Every side effect a function can perform -- printing, reading a database, openin
 
 The consequences are structural:
 
-- A function with no `!` in its signature **cannot** perform side effects. The compiler proves it, and no built-in free function is an exception (§4.4 *Every side effect has a row*). (It may still read or write module-level `let mut` bindings, which are tracked separately by mutation analysis — see §4.16.)
+- A function with no `!` in its signature **cannot** perform side effects. The compiler proves it, and no built-in free function is an exception (§4.4 *Every side effect has a row*). One exception: a private function or a closure with no `!` can still have `State` in its effective row. The compiler adds `State` when the body reads or writes a module-level `let mut` binding, and the body shows the access. A `pub` function must declare it (§4.16).
 - A function declaring `! DB.Read` can query a database but **cannot** write to it, delete from it, or administer it. The compiler proves it.
 - A package declaring `capabilities(Net.Connect)` in its manifest **cannot** open a listening socket. The compiler proves it.
 - An effect handler can attenuate capabilities -- handing a function a `Net.Connect` that only permits connections to a specific allowlist. The runtime enforces it.
@@ -170,6 +170,8 @@ effect Process {
     effect Spawn      // spawn child processes
     effect Signal     // send signals to processes
 }
+
+effect State          // reads or writes module-level `let mut` (leaf effect: no operations, no handler, §4.16)
 
 ```
 
@@ -1470,7 +1472,7 @@ This is the one normative statement of these rules. §9.1 (*The Effect Row*, *`@
 
 ### 4.6 Effects on `main`
 
-`main` is the root of the capability tree. It implicitly holds all effects. The root has a handler for each built-in effect (§4.3), and those are the capabilities `main` holds. A user-declared effect has no root handler (§4.12): `main` must discharge it with `with`, or the program does not compile (see *Unhandled user effects* below).
+`main` is the root of the capability tree. It implicitly holds all effects. The root has a handler for each built-in effect (§4.3) except `State`, and those are the capabilities `main` holds. `main` also holds `State`, which has no handler (§4.16.1). A user-declared effect has no root handler (§4.12): `main` must discharge it with `with`, or the program does not compile (see *Unhandled user effects* below).
 
 ```blink
 // Valid -- main implicitly has all effects
@@ -2407,7 +2409,7 @@ The effect system replaces several ad-hoc features that exist as separate mechan
 | Dependency injection | Effect handlers | `with postgres_handler(config) { ... }` replaces constructor injection, service locators, DI containers. |
 | Mocking / test doubles | Test handlers | `with mock_db(fixtures) { ... }` replaces mockito, unittest.mock, testdouble. |
 | IO monads (Haskell) | `! IO.*` effects | Same purity tracking without monadic syntax (`>>=`, `do` notation). Effects compose with `,`, not monad transformers. |
-| Global mutable state | Mutation analysis (§4.16) | Module-level `let mut` mutation tracked by compiler write-set inference. Cross-module statefulness via user-defined effects (§4.12). |
+| Global mutable state | The `State` effect (§4.16) | A function that reads or writes a module-level `let mut` has `State` in its row: declared on `pub` functions, inferred on private ones. Write sets name the bindings each function writes. |
 | `synchronized` / locks | `! Sync` effect (future) | Shared mutable state as an explicit effect, not an invisible side channel. |
 | Sandbox / permissions | Capability attenuation | `with restricted_net(allowlist) { ... }` replaces OS-level sandboxing, seccomp, AppArmor for application-level policy. |
 | Feature flags | Handler selection | `with feature_handler(flags) { ... }` routes effect operations based on runtime configuration. |
@@ -2574,7 +2576,7 @@ Only the declaration changes. Functions can then narrow their rows to `! Store.R
 
 **Standard library handlers:**
 
-The standard library ships default handlers for built-in effects (real filesystem, real network, real database drivers). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible. A user-defined effect that reaches `main` or a test block with no `with` that discharges it is `UnhandledEffect` (E0539, §4.6 *Unhandled user effects*). No operation answers a default value: an operation that finds no handler at run time panics (§4.7.1 *Completeness and auto-delegation*).
+The standard library ships default handlers for built-in effects (real filesystem, real network, real database drivers). `State` is the exception: it has no handler, and the roots hold it (§4.16.1). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible. A user-defined effect that reaches `main` or a test block with no `with` that discharges it is `UnhandledEffect` (E0539, §4.6 *Unhandled user effects*). No operation answers a default value: an operation that finds no handler at run time panics (§4.7.1 *Completeness and auto-delegation*).
 
 ```blink
 fn main() {
@@ -3064,7 +3066,7 @@ test "map with mock DB" {
 
 **Closures (§2.8):** Closures used as effectful callbacks follow the same capture rules. Effect annotations on the closure type describe what the closure *body* does, not what it captures.
 
-**async.spawn (§4.13):** `async.spawn` takes `fn() -> T ! _` — the spawned task inherits whatever effects the closure declares. The existing E0650 restriction on `let mut` captures still applies, and so does the freeze of the shared cells its captures reach (§2.8 *Shared cells in a spawned task*). A handler in force at the spawn site whose captures reach a shared cell is homed (§2.8 *Handlers in a spawned task*).
+**async.spawn (§4.13):** `async.spawn` takes `fn() -> T ! _` — the spawned task inherits whatever effects the closure declares. The existing E0650 restriction on `let mut` captures still applies, and so does the freeze of the shared cells its captures reach (§2.8 *Shared cells in a spawned task*). A handler in force at the spawn site whose captures reach a shared cell is homed (§2.8 *Handlers in a spawned task*). A function value whose row contains `State` cannot be spawned (E0651, §4.16.6).
 
 #### 4.15.5 What Is Deferred to v2
 
@@ -3082,93 +3084,152 @@ Named variables enable: distinguishing effect sets from different callbacks, con
 
 ---
 
-### 4.16 Module-Level Mutation Analysis
+### 4.16 Module-Level State
 
-Module-level `let mut` bindings are a real and necessary feature. But untracked mutation of these bindings is a common source of bugs. For example, speculative lookahead can save and restore `pos` but not `pending_comments`, because nothing shows which state each function touches.
+A module can hold mutable state in module-level `let mut` bindings. Each function that reads or writes such a binding shows it in its row with the built-in effect `State`. The compiler also computes the **write set** of each function: the bindings it writes. Diagnostics and tools use the write set.
 
-Blink addresses this with a **two-tier model**: automatic compiler analysis (intra-module) and opt-in user-defined effects (cross-module).
+```blink
+let mut count = 0
 
-#### 4.16.1 Tier 1: Compiler Write-Set Inference
+fn bump() {                          // private: `State` is inferred
+    count = count + 1
+}
 
-The compiler performs **mutation analysis** on every function in a module. For each function, it computes the **write set**: which module-level `let mut` bindings the function (or its callees within the module) writes to.
-
-**Key properties:**
-
-- **Fully inferred** — no annotations in signatures. Functions look clean.
-- **Writes only** — reading a `let mut` binding is free, not tracked as mutation.
-- **Includes method calls** — `list.push(x)` on a module-level `let mut` binding counts as a write.
-- **Transitive within module** — if `fn a()` calls `fn b()` which writes `pos`, then `a`'s write set includes `pos`.
-- **No runtime effect** — the analysis changes no program behavior.
-- **Not an effect** — this is a compiler analysis like type inference, not a declared effect. No `!` annotations needed.
-
-Example of write sets:
-
-```
-advance()               → writes {pos}
-skip_newlines()         → writes {pos, pending_comments}
-at()                    → writes {}  (reads pos, but reads are free)
-looks_like_struct_lit() → writes {pos, pending_comments}
+pub fn next_id() -> Int ! State {    // public: `State` is declared
+    bump()
+    count
+}
 ```
 
-The analysis enables rich diagnostics. The compiler can now detect when a save/restore pattern misses a binding:
+#### 4.16.1 The `State` Effect
+
+`State` is a built-in leaf effect (§4.3). A function's row contains `State` when the function touches module state:
+
+- its body reads or writes a module-level `let mut` binding of its module (§4.16.2), or
+- it calls a function whose row contains `State`, in any module, through a direct call, a function value, a trait method or a `! _` row (§4.15.2).
+
+`State` is not like the other effects:
+
+- **No operations and no handler.** `State` has no handle and no operations. A `handler State { ... }`, or a `with` that names `State`, is `StateNotHandleable` (E0545). Nothing discharges `State`: it stays in the row of every caller up to the root.
+- **The roots hold it.** `main` (§4.6) and each test block (§2.20) hold `State`. `UnhandledEffect` (E0539) never fires for `State`.
+- **Not a capability.** Module capability budgets (§4.8, §4.9) ignore `State`. Module state stays inside its module and does not cross a trust boundary, so a package that declares `capabilities = []` can still use module-level `let mut`.
+- **No run-time cost.** `State` changes no generated code (§4.16.9).
+
+**Declared at the boundary, inferred inside.** A function at the module boundary must write `State` in its row when it touches module state. The boundary functions are:
+
+- each `pub fn`,
+- each `pub` method,
+- each method in a trait `impl`.
+
+A boundary function whose body touches module state, and whose row does not name `State`, is `UndeclaredModuleState` (E0552). This is also the code when the only cause is a call to a function that declares `State`; E0500 does not fire for `State`. The diagnostic has one `note:` line for each binding the function touches. The note names the binding, says whether it is read or written, and gives the location of the access. When the access is in a callee, the note also names the call. The fix adds `State` to the row, and it is machine-applicable (§8.6).
+
+```blink
+let mut count = 0
+
+fn bump() {
+    count = count + 1
+}
+
+pub fn next_id() -> Int {
+    bump()
+    count
+}
+```
 
 ```
-warning[IncompleteStateRestore]: speculative lookahead may leave stale state
- --> parser.bl:42:5
+error[UndeclaredModuleState]: `next_id` touches module state but does not declare `State`
+ --> src/ids.bl:7:8
   |
-42 |     let saved = pos
-  |         ^^^^^ saves `pos` before calling `skip_newlines`
+7 | pub fn next_id() -> Int {
+  |        ^^^^^^^ a public function declares `State` in its row
   |
-  = note: `skip_newlines` writes {pos, pending_comments}
-  = note: only `pos` is restored after the call
-  = help: also save and restore `pending_comments`, or use a
-          non-mutating alternative
+  = note: writes `count` at src/ids.bl:4:5, through the call to `bump` at src/ids.bl:8:5
+  = note: reads `count` at src/ids.bl:9:5
+  = help: add `State` to the row: `pub fn next_id() -> Int ! State`
 ```
 
-The LSP shows inferred write sets on hover — developers and AI can see which globals a function touches without reading its body.
+A private function or a closure does not need to write `State`. The compiler adds it to the function's **effective row**: the declared row, plus `State` when the function touches module state. A private function can write `State` in its row; the effective row is the same.
 
-#### 4.16.2 What Counts as a Write
+Every rule that checks a row checks the effective row:
 
-| Access | Tracked as write? | Rationale |
-|--------|-------------------|-----------|
-| Assign to module-level `let mut` (`pos = pos + 1`) | **Yes** | Direct mutation |
-| Mutating method call on module-level `let mut` (`tokens.push(t)`) | **Yes** | Mutation through method |
-| Read module-level `let mut` (`return pos`) | No | Reads are free — no state corruption risk |
-| Read module-level `let` (immutable) | No | Immutable — equivalent to a constant |
-| Read/write function-local `let mut` | No | Contained within function scope |
-| Mutate collection received as parameter | No | The parameter must be declared `mut`, so the signature shows it (§3.6 *Mutable Parameters*) |
-| Mutate captured `let mut` in closure | No | Lexically scoped — visible within enclosing function body |
+- **Calls (§4.5).** A call puts the callee's effective row into the caller's row.
+- **Function values (§4.15.1).** The type of a function value carries its effective row. A closure literal whose body touches module state has a type with `! State`. The usual row checks then apply where the value goes. For example, a closure that reads `count` cannot be passed where `fn() -> Int` is expected; the parameter type must be `fn() -> Int ! State` or `fn() -> Int ! _`.
+- **Trait impls (§4.5).** `TraitContractEffectMismatch` (E0904) compares the impl method's effective row with the trait method's row. A trait method with no `!` cannot have an impl that touches module state (§4.16.6).
+- **`@pure` (§3b.2).** A `@pure` function has an empty effective row (§4.16.3).
 
-#### 4.16.3 Purity and Non-Mutating Functions
+#### 4.16.2 What Puts `State` in a Row
 
-A function with no `!` and an empty write set is **non-mutating** — it does not write to any module-level `let mut` bindings. This is weaker than full referential transparency because the function may still *read* mutable state and thus return different values on different calls.
+| Access | `State` in the row? | In the write set? | Rationale |
+|--------|---------------------|-------------------|-----------|
+| Assign to module-level `let mut` (`pos = pos + 1`) | **Yes** | **Yes** | Direct mutation |
+| Mutating method call on module-level `let mut` (`tokens.push(t)`) | **Yes** | **Yes** | Mutation through a method |
+| Read module-level `let mut` (`return pos`) | **Yes** | No | The result depends on state that a call can change |
+| Call a function whose row contains `State` | **Yes** | The callee's write set, if the callee is in this module | `State` propagates like any effect; write sets do not cross modules (§4.16.4) |
+| Read module-level `let` (immutable) or `const` | No | No | Immutable — equal to a constant |
+| Read/write function-local `let mut` | No | No | Contained within function scope |
+| Mutate collection received as parameter | No | No | The parameter must be declared `mut`, so the signature shows it (§3.6 *Mutable Parameters*) |
+| Mutate captured function-local `let mut` in closure | No | No | Lexically scoped — visible within enclosing function body |
 
-Truly pure functions — those that neither read nor write module-level mutable state, with output depending only on inputs — have no annotation. The language has no syntax to mark a function as pure in this sense.
+A read counts because the module can change the binding between two calls. The write set counts writes only, because W0550 and W0551 (§4.16.7) need to know which bindings a function can change.
+
+**A `let mut` that nothing writes.** A module-level `let mut` that no code in its module writes is `ModuleLetMutNeverWritten` (W0552). Its readers have `State` in their rows for no reason. The `help:` line says to declare it with `let`, and that fix is machine-applicable (§8.6). Set its level with `W0552` under `[lints]` (§4.16.8). Since `pub let mut` is forbidden (E1013, §2.12.1), only code in the binding's module can write it, so the check is exact.
+
+```
+warning[ModuleLetMutNeverWritten]: module-level `let mut` `limit` is never written
+ --> src/config.bl:1:9
+  |
+1 | let mut limit = load_limit()
+  |         ^^^^^ no code in this module writes `limit`
+  |
+  = note: each function that reads `limit` has `State` in its row
+  = help: declare it with `let`: `let limit = load_limit()`
+```
+
+#### 4.16.3 Purity
+
+A function whose effective row is empty is **pure**: its result depends only on its arguments. It performs no side effects and touches no module state. A function that only reads module state is not pure; its row has `State`.
+
+`@pure` (§3b.2) asks the compiler to prove that a function is pure. A `@pure` function whose effective row is not empty, `State` included, is `ImpureBodyForPureAnnotation` (E1307).
 
 ```blink
 let mut pos = 0
 
-// Non-mutating, but NOT pure — reads `pos`, return value depends on call order
+// Effective row: State — reads `pos`, so the result depends on call order
 fn current_pos() -> Int {
     pos
 }
 
-// Pure — output depends only on inputs, no module state access
+// Pure — empty effective row
 fn add(a: Int, b: Int) -> Int {
     a + b
 }
 
-// Mutating — writes {pos}
+// Effective row: State — writes {pos}
 fn advance() {
     pos = pos + 1
 }
 ```
 
-Note that `advance()` has **no `!` annotation**. Module-level mutation is tracked by the compiler's write-set analysis, not by the effect system. The function signature stays clean.
+The three functions are private, so their signatures do not write `State`. A `pub` version of `current_pos` or `advance` declares `! State`.
 
-#### 4.16.4 Transitive Tracking
+#### 4.16.4 Write Sets
 
-Write sets are computed transitively within a module. If `fn a()` calls `fn b()` which calls `fn c()` which writes `pos`, then all three have `pos` in their write sets.
+The compiler computes the write set of each function in a module: the module-level `let mut` bindings that the function, or a callee in the same module, writes. `State` says that a function touches module state. The write set says which bindings it writes.
+
+**Properties:**
+
+- **Inferred** — no signature shows a write set.
+- **Writes only** — a read does not add to the write set.
+- **Includes method calls** — `list.push(x)` on a module-level `let mut` binding is a write.
+- **Transitive within the module** — if `fn a()` calls `fn b()`, which writes `pos`, then `pos` is in the write set of `a`.
+- **Closures** — a write in a closure counts in the write set of the enclosing function.
+
+```
+advance()               → writes {pos}
+skip_newlines()         → writes {pos, pending_comments}
+at()                    → writes {}  (reads pos, so its row has State)
+looks_like_struct_lit() → writes {pos, pending_comments}
+```
 
 ```blink
 let mut pos = 0
@@ -3198,13 +3259,28 @@ fn looks_like_struct_lit() -> Bool {     // writes {pos, pending_comments}
 }
 ```
 
-The compiler knows `looks_like_struct_lit` writes `{pos, pending_comments}` transitively through `skip_newlines`. It can verify that both are saved and restored.
+The compiler knows that `looks_like_struct_lit` writes `{pos, pending_comments}` through `skip_newlines`, so it can check that both are saved and restored. When a save/restore pattern misses a binding, it reports W0550 (§4.16.7):
 
-Cross-module calls are **not** transitively tracked. A call to an imported function is opaque — the compiler does not look inside it. This keeps compilation modular and avoids coupling internal implementation details across module boundaries.
+```
+warning[IncompleteStateRestore]: speculative lookahead may leave stale state
+ --> parser.bl:42:5
+  |
+42 |     let saved = pos
+  |         ^^^^^ saves `pos` before calling `skip_newlines`
+  |
+  = note: `skip_newlines` writes {pos, pending_comments}
+  = note: only `pos` is restored after the call
+  = help: also save and restore `pending_comments`, or use a
+          non-mutating alternative
+```
 
-#### 4.16.5 Tier 2: User-Defined Effects for Cross-Module State
+**Write sets do not cross modules.** The compiler does not look inside a function from another module, so a call to it adds nothing to the write set. `State` still crosses modules: the callee's row declares it, and the caller's row gets it (§4.16.1).
 
-If a module author wants callers to know about statefulness, they use **user-defined effects** (§4.12):
+**Tooling (not normative).** `blink query --fn` (§8.3), `blink doc` and the LSP show the write set of a function on hover and as an inlay hint, next to its row.
+
+#### 4.16.5 User-Defined Effects as Labels
+
+`State` says only that a function touches module state. A module can also tell its callers what kind of change a call makes with a **user-defined effect** (§4.12). This label is optional, and it does not take the place of `State`: a boundary function that touches module state declares `State` as well.
 
 ```blink
 effect Parse {
@@ -3212,32 +3288,63 @@ effect Parse {
     effect Reset
 }
 
-pub fn next_token() -> Token ! Parse.Advance {
+pub fn next_token() -> Token ! Parse.Advance, State {
     pos = pos + 1
     // ...
 }
 
-pub fn reset(saved: ParserState) ! Parse.Reset {
+pub fn reset(saved: ParserState) ! Parse.Reset, State {
     pos = saved.pos
     pending_comments = saved.comments
 }
 ```
 
-Callers see `! Parse.Advance` in the signature and know the call changes parser state. This is opt-in — most modules with private mutable state don't need it because the state is encapsulated behind the public API. User-defined effects follow all the same rules as built-in effects: hierarchical, handle-based, handler-swappable, testable.
+Callers see `! Parse.Advance` and know that the call moves the parser. A user-defined effect follows all the rules of §4.12: it is hierarchical, and a root must discharge it with `with` (§4.6 *Unhandled user effects*).
 
 #### 4.16.6 Interaction with Existing Features
 
-**Not an effect.** Mutation analysis is orthogonal to the effect system. A function can have an empty write set and still declare `! IO.Log`. A function can write to module globals and still have no `!` in its signature. The two systems track different things: effects track capability usage (IO, DB, Net), mutation analysis tracks internal state changes.
+**Trait impls (§4.5, §3.6).** A trait impl method is a boundary function, and E0904 checks its effective row. So a method that touches module state can implement only a trait method whose row contains `State`. A `Display.fmt`, `Eq.eq`, `Hash.hash` or `Ord.cmp` impl that reads or writes a module-level `let mut`, for example to cache a result, is `TraitContractEffectMismatch` (E0904). Hold the cache in a value that the caller passes in.
 
-**Module capability budgets (§4.8, §4.9):** Mutation analysis does not participate in capability budgets. Module-level mutable state is internal to a module and does not cross trust boundaries. A package declaring `capabilities = []` (pure computation) can still use module-level `let mut` bindings — the state is encapsulated.
+**`async.spawn` (§4.13, §2.8).** Two tasks that touch one module-level `let mut` race. A function value passed to `async.spawn` whose effective row contains `State` is `SpawnTouchesModuleState` (E0651). The rule covers a closure literal and a named function alike. The `help:` line says to pass the data in, return it from the task, or use a `Channel` (§4.13).
 
-**`main` (§4.6):** `main` is not special for mutation analysis. It has a write set like any other function, computed transitively from what it calls.
+```blink
+let mut items: List[Int] = List.new()
 
-**Closures:** If a closure writes to a module-level `let mut` binding, the write is attributed to the enclosing function's write set. Closures that only capture function-local `let mut` are not tracked.
+fn add(n: Int) {
+    items.push(n)
+}
+
+fn main() {
+    async.scope {
+        let task = async.spawn(fn() { add(1) })
+        add(2)
+        task.await
+    }
+}
+```
+
+```
+error[SpawnTouchesModuleState]: spawned task touches module state
+ --> src/app.bl:9:32
+  |
+9 |         let task = async.spawn(fn() { add(1) })
+  |                                ^^^^^^^^^^^^^^^ the row of this function contains `State`
+  |
+  = note: writes `items` at src/app.bl:4:5, through the call to `add` at src/app.bl:9:39
+  = help: pass the data in, return it from the task, or use a `Channel`
+```
+
+**`main` and test blocks (§4.6, §2.20).** Both hold `State`, so they can touch module state with no `with`. A test whose row has `State` is not free of side effects (§2.20).
+
+**Module capability budgets (§4.8, §4.9).** Budgets ignore `State` (§4.16.1).
+
+**Iterator adapters (§3c.1).** A v1 adapter closure is pure (§3c.1), so a closure whose row has `State` cannot be an adapter closure. Use a `for` loop, or a `List` method that takes `! _` (§4.15.2).
+
+**Closures (§2.8).** A closure's own effective row carries `State` when its body touches module state. The enclosing function gets `State` only when it calls the closure, or passes it to a callee whose row forwards it with `_`. A closure that captures only function-local `let mut` bindings does not get `State`.
 
 #### 4.16.7 Diagnostic Precision: W0550 and W0551
 
-The mutation analysis produces two warnings related to save/restore patterns in speculative code (lookahead, backtracking):
+The write-set analysis (§4.16.4) produces two warnings related to save/restore patterns in speculative code (lookahead, backtracking):
 
 **W0550 (IncompleteStateRestore):** Fires when a function saves SOME module-level `let mut` bindings before a call, but the callee's write set includes additional bindings that are not saved or restored. This is the high-value diagnostic — it catches exactly the speculative-lookahead bugs that motivated the analysis.
 
@@ -3278,7 +3385,7 @@ fn compile_module(path: Str) -> Result[Module, CompileError] ! IO {
 
 #### 4.16.8 Warning Suppression
 
-Mutation analysis warnings can be suppressed at two levels:
+Write-set warnings can be suppressed at two levels:
 
 **Per-function: `@allow(WarningName)`**
 
@@ -3320,4 +3427,4 @@ ERROR_CATALOG.md *Conventions* gives the `help:` line for each case and what `bl
 
 #### 4.16.9 No Runtime Effect
 
-Mutation analysis changes no program behavior. It only produces diagnostics and tooling data.
+`State` and write sets change no program behavior. They produce only diagnostics and tooling data, and `State` adds nothing to the generated code.

@@ -2,6 +2,8 @@
 
 # Display.fmt Has No Effect Row; Impls May Not Widen a Trait Method's Row — Design Rationale
 
+> **Q5 superseded** by [Module-Level State Effect](module-state-effect.md): a trait impl method that reads or writes a module-level `let mut` has `State` in its effective row, so for a trait method without `State` it is E0904.
+
 **Gap:** the Display trait shape (see [display-trait-shape.md](display-trait-shape.md), locked point 4) declared `fn fmt(self, sb: StringBuilder) ! StringBuilderPure` and §3 said `fmt` "is declared with the `StringBuilderPure` effect (§4.x)". §4 never defined that effect. The only declaration of the name was an unused `pub trait StringBuilderPure` in `lib/std/sb.bl`, whose `write_char(self, ch: Char)` had drifted from the sealed `StringBuildOps` surface. `lib/std/traits.bl` declared `fmt` with no row and a comment that the naming was "still open".
 
 **Fact surfaced during deliberation:** §3.6 and §4.5 stated the rule `R_o ⊆ R_d` only for overrides of open default methods. With gen1 (current src), this program passed `blink check` with no diagnostic, so an impl of a required method could widen the trait's row:

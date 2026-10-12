@@ -110,6 +110,8 @@ Three annotation forms:
 
 Contracts attach to functions, to methods in `impl` blocks, and to trait method declarations. A trait method's contract binds every impl of that method; see *Contracts on Trait Methods* below.
 
+**`@pure`.** `@pure` on a function says that the function is pure: its effective row is empty (§4.16.3). It performs no side effects and does not read or write module-level `let mut` bindings. The compiler checks the body. A `@pure` function whose effective row is not empty is `ImpureBodyForPureAnnotation` (E1307). A contract predicate can call only a `@pure` function (`ImpureCallInPredicate`, E1302).
+
 #### Preconditions with `@requires`
 
 ```blink
