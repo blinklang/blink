@@ -205,7 +205,7 @@ match args {
     [] => show_help()
     ["build"] => build()
     ["daemon", sub] => handle_sub(sub)
-    [cmd, ...] => io.println("unknown: {cmd}")  // ... = rest wildcard (no binding)
+    [cmd, ..] => io.println("unknown: {cmd}")  // .. = rest wildcard (no binding)
 }
 
 // Control flow
@@ -941,7 +941,7 @@ write_file("out.txt", output)
 
 // Map usage
 let mut scores: Map[Str, Int] = Map()
-scores["alice"] = 95
+scores.insert("alice", 95)
 match scores.get("alice") {
     Some(s) => io.println("Score: {s}")
     None => io.println("No score")
