@@ -28,19 +28,25 @@
 // of each module with a run-time global, in module order. The record keeps their sha, and a
 // build takes the entry unit only when they are the last build's.
 //
-// An interface may differ too, when only its imports and its items with no annotation that
-// are a fn, a global or const binding one name, or a test block differ. Blink has no wildcard
-// import, and a fn or a global is found only by its name, so one an edit added, removed or
-// changed can reach a unit's emit only through a source the unit read that holds its name as
-// a word; such a unit is emitted. A unit prints another module's global only by its C name,
-// and only the unit of the module that defines it lowers its initializer; whether it runs at
-// start, and in what order, is in the entry unit's facts. A test block is in the program only
-// when its module is the entry, whose tests the entry unit's facts list, so it adds no name.
-// A type, an alias, a trait, an impl, an effect or an annotated item still takes no unit: a
-// type, an impl and an effect change the types header, an alias reorders declarations in the
-// C of units that name nothing of it while no header changes, a trait or an impl reaches a
-// unit through an operator or interpolation that names nothing, and an annotation can change
-// what its item lowers to. What else the edit changes of the C a unit compiles is in the
+// An interface may differ too, when only its imports and its items that are a fn under
+// annotations that stay local, a trait with no annotation, a global or const with no
+// annotation binding one name, or a test block differ. Blink has no wildcard import, and a fn
+// or a global is found only by its name, so one an edit added, removed or changed can reach a
+// unit's emit only through a source the unit read that holds its name as a word; such a unit
+// is emitted. An annotation stays local when it changes only checks, the fn's own body, or the
+// calls that name the fn (annotation_is_local). A trait prints no C; it reaches a unit through
+// its impls and the bounds that name it, and through calls of its methods by name, so its own
+// name and its methods' and associated types' names are its edited names. The traits the
+// compiler reads by name from sources that never write it (Display for an interpolation, Eq
+// for `==`, Closeable for `with`) take no unit. A unit prints another module's global only by
+// its C name, and only the unit of the module that defines it lowers its initializer; whether
+// it runs at start, and in what order, is in the entry unit's facts. A test block is in the
+// program only when its module is the entry, whose tests the entry unit's facts list, so it
+// adds no name. A type, an alias, an impl, an effect, any other annotation, or an annotated
+// item that is not a fn still takes no unit: a type, an impl and an effect change the types
+// header, an alias reorders declarations in the C of units that name nothing of it while no
+// header changes, an impl reaches a unit through an operator or interpolation that names
+// nothing, and an annotation can change what its item lowers to. What else the edit changes of the C a unit compiles is in the
 // headers: the declaration lines the unit copies, and the types header. A unit is taken when
 // the types header is byte-equal, its own module's headers are, it includes no changed header
 // whole, and its files name no symbol whose declaration line an edited header added, removed,
@@ -548,11 +554,11 @@ pub type LastBuild {
 }
 
 // The record in from_dir, when this build's inputs differ from the ones it records only in
-// the texts of the files own names, and in the plain fns, globals, consts, tests and imports
-// of their interfaces.
+// the texts of the files own names, and in the items of their interfaces edited_names reads.
+// builtin_traits are the trait names the compiler reads without a source writing them.
 // None when there is no whole record, it names no sha of its inputs, or the inputs differ
 // anywhere else.
-pub fn last_build(from_dir: Str, inputs: Str, own: Map[Str, Bool]) -> Option[LastBuild] {
+pub fn last_build(from_dir: Str, inputs: Str, own: Map[Str, Bool], builtin_traits: List[Str]) -> Option[LastBuild] {
     let rec = match read_record(from_dir) {
         Some(r) => r
         None => return None
@@ -561,7 +567,7 @@ pub fn last_build(from_dir: Str, inputs: Str, own: Map[Str, Bool]) -> Option[Las
     let last_inputs = "{from_dir}/{INPUTS_NAME}"
     if file_exists(last_inputs) != 1 { return None }
     let last_text = read_file(last_inputs)
-    let delta = match inputs_delta(last_text, inputs, own) {
+    let delta = match inputs_delta(last_text, inputs, own, builtin_traits) {
         Some(d) => d
         None => {
             dbg_trace("build.units", "skip units: the inputs differ beyond plain items and imports")
@@ -581,9 +587,9 @@ pub fn last_build(from_dir: Str, inputs: Str, own: Map[Str, Bool]) -> Option[Las
 }
 
 // The delta of new_text from old_text when their fields are the same but for the text of
-// each file own names and the plain fn, global, const, test and import items of its
-// interface. None when they differ anywhere else, or one is not whole.
-fn inputs_delta(old_text: Str, new_text: Str, own: Map[Str, Bool]) -> Option[InputsDelta] {
+// each file own names and the items of its interface edited_names reads. None when they
+// differ anywhere else, or one is not whole.
+fn inputs_delta(old_text: Str, new_text: Str, own: Map[Str, Bool], builtin_traits: List[Str]) -> Option[InputsDelta] {
     let o = match parse_inputs(old_text) {
         Some(f) => f
         None => return None
@@ -620,7 +626,7 @@ fn inputs_delta(old_text: Str, new_text: Str, own: Map[Str, Bool]) -> Option[Inp
             let path = n.values.get(i - 2).unwrap()
             if !own.contains_key(path) { return None }
             changed.insert(path, true)
-            match edited_names(ov, nv) {
+            match edited_names(ov, nv, builtin_traits) {
                 Some(fs) => {
                     for f in fs {
                         if !named.contains_key(f) {
@@ -643,12 +649,14 @@ type InterfaceItem {
     text: Str
 }
 
-// The names of the fns, globals and consts whose items differ between two interface texts of
-// one source, taken as two multisets of items, so a moved item is not an edit. A test block
+// The names of the fns, traits, globals and consts whose items differ between two interface
+// texts of one source, taken as two multisets of items, so a moved item is not an edit. A
+// trait gives its own name and the names of its methods and associated types. A test block
 // adds no name: it is not in the program a build makes unless its module is the entry, whose
-// tests the entry unit's facts list. None when an item that differs is not a plain fn, global,
-// const, test or import, or a text is not whole.
-fn edited_names(old_text: Str, new_text: Str) -> Option[List[Str]] {
+// tests the entry unit's facts list. None when an item that differs is not a fn under local
+// annotations, a trait the compiler does not read by name, a global, const, test or import,
+// or a text is not whole.
+fn edited_names(old_text: Str, new_text: Str, builtin_traits: List[Str]) -> Option[List[Str]] {
     let o = match interface_items(old_text) {
         Some(items) => items
         None => return None
@@ -666,15 +674,47 @@ fn edited_names(old_text: Str, new_text: Str) -> Option[List[Str]] {
     let mut out: List[Str] = []
     for it in all {
         if (count.get(it.text) ?? 0) == 0 { continue }
-        if it.kind.starts_with("fn ") || it.kind.starts_with("let ") || it.kind.starts_with("const ") {
-            let name_at = (it.kind.byte_index_of(" ", 0) ?? 0) + 1
-            out.push(it.kind.byte_slice(name_at, it.kind.byte_len()))
+        let words = it.kind.split(" ")
+        let head = words.get(0) ?? ""
+        if head == "fn" || head == "ann" {
+            // "fn <name> @<annotation>..." or "ann <annotation> fn <name>".
+            let name = if head == "fn" { words.get(1) ?? "" } else { words.get(3) ?? "" }
+            let anns = if head == "fn" { words.slice(2, words.len()) } else { [words.get(1) ?? ""] }
+            for a in anns {
+                let ann = if a.starts_with("@") { a.byte_slice(1, a.byte_len()) } else { a }
+                if !annotation_is_local(ann) {
+                    dbg_trace("build.units", "skip units: fn {name} differs under @{ann}")
+                    return None
+                }
+            }
+            out.push(name)
+        } else if head == "trait" {
+            let name = words.get(1) ?? ""
+            if builtin_traits.contains(name) {
+                dbg_trace("build.units", "skip units: trait {name} differs, which the compiler reads by name")
+                return None
+            }
+            for w in words.slice(1, words.len()) { out.push(w) }
+        } else if head == "let" || head == "const" {
+            out.push(words.get(1) ?? "")
         } else if it.kind != "import" && it.kind != "test" {
             dbg_trace("build.units", "skip units: an item of kind {it.kind} differs")
             return None
         }
     }
     Some(out)
+}
+
+// Whether an annotation on a fn reaches no unit but the fn's own and those that name the fn.
+// @allow, @deprecated, @trusted, @pure and @modifies change checks and warnings, and print no
+// C. @requires, @ensures and @verify print their checks in the fn's own body. @src prints
+// nothing. @ffi changes the fn's own wrapper and how a call that names the fn is lowered; a
+// binding over a native dependency's symbol changes the gates every unit reads, which reach
+// the types header, so that edit takes no unit through the header check. The rest stay
+// out: @tags feeds the test table of the entry unit, @expect_panic rewrites the body of the
+// test that holds it, and an annotation not listed here may gain a reader anywhere.
+fn annotation_is_local(name: Str) -> Bool {
+    name == "allow" || name == "deprecated" || name == "trusted" || name == "pure" || name == "modifies" || name == "requires" || name == "ensures" || name == "verify" || name == "src" || name == "ffi"
 }
 
 // The items of an interface text, cut at each item mark the parser wrote, with the tokens

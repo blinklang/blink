@@ -1,0 +1,255 @@
+// An annotation on a fn reaches other units through the fn's name or not at all, for the
+// annotations a build can keep local: @allow, @deprecated, @trusted and @pure change only
+// checks and warnings, @requires, @ensures and @verify print checks in the fn's own body, @src
+// and @modifies print nothing, and @ffi changes the fn's own wrapper and the calls that name
+// it. So after such an edit in a module other than the entry, a per-module build emits again
+// the defining module's unit and the units whose sources name the fn, and takes every other
+// unit from the last build. An annotation the build cannot prove local (here @tags, which
+// feeds the test table, and @inline, which nothing reads yet) takes no unit. Each build runs
+// with BLINK_EMIT_REUSE_VERIFY=1, so every unit it writes or takes is byte-equal to a cold
+// emit, and after each edit the units, the warnings and the output equal those of a build with
+// no last build. Typecheck runs on the whole program whatever the build takes, so a warning or
+// an error an annotation causes in another module shows on the build that takes units.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"annotated_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/base.bl", [
+        #"pub fn tag(s: Str) -> Str {"#,
+        #"    "[{s}]""#,
+        #"}"#,
+        #""#,
+        #"pub fn lim(x: Int) -> Int {"#,
+        #"    x + 1"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/nat.bl", [
+        #"@ffi("labs")"#,
+        #"@trusted(audit: "test")"#,
+        #"pub fn abs_of(x: Int) -> Int ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/mid.bl", [
+        #"import base.{lim, tag}"#,
+        #"import nat.{abs_of}"#,
+        #""#,
+        #"pub fn mid_value() -> Str {"#,
+        #"    tag("mid {lim(abs_of(-4))}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn other() -> Str {"#,
+        #"    tag("other")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"import base.{tag}"#,
+        #""#,
+        #"pub fn leaf_value() -> Str {"#,
+        #"    tag("leaf")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import base.{tag}"#,
+        #"import mid.{mid_value}"#,
+        #"import other.{other}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{tag("main")} {mid_value()} {other()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            // Sorted, so the build's unit order does not reach the assertion.
+            let name = line.byte_slice(29, line.byte_len())
+            out.push(name)
+            let mut at = out.len() - 1
+            while at > 0 && out.get(at - 1).unwrap() > name {
+                out.set(at, out.get(at - 1).unwrap())
+                at = at - 1
+            }
+            out.set(at, name)
+        }
+    }
+    out
+}
+
+// Each diagnostic of a build as `<name>@<file>:<line>`, in the order the build printed them.
+// `blink build` prints each warning twice today, so a repeat is dropped: which warnings show
+// is what this test checks, not how often.
+fn diagnostics(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut name = ""
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        let text = line.trim()
+        if line.starts_with("warning[") || line.starts_with("error[") {
+            name = line.split("[").get(1).unwrap().split("]").get(0).unwrap()
+        } else if name != "" && text.starts_with("--> ") {
+            let path = text.byte_slice(4, text.byte_len()).split("/")
+            let place = path.get(path.len() - 1).unwrap().split(":")
+            let seen = "{name}@{place.get(0).unwrap()}:{place.get(1).unwrap()}"
+            if !out.contains(seen) { out.push(seen) }
+            name = ""
+        }
+    }
+    out
+}
+
+// One edit's result: the units the build took, the C files and headers that differ from a
+// build with none to take, the warnings, and whether the two builds warn and print the same.
+fn warm_and_cold(tree: Str, what: Str) -> Str {
+    let warm = build_into(tree, "out")
+    shell_exec("rm -rf {tree}/cold")
+    let cold = build_into(tree, "cold")
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    let warns = diagnostics(warm)
+    let same_warns = warns == diagnostics(cold)
+    let warm_out = sh("{tree}/out/app")
+    let same_out = warm_out == sh("{tree}/cold/app")
+    // A source equal to the last build's takes its whole emit, which names no unit.
+    let took = if "{warm.out}\n{warm.err_out}".contains("[dbg:build.units] reuse emit\n") { "the last emit" } else { reused_units(warm).join(",") }
+    "{what}: took {took}; differ [{differ.split("\n").join(" ")}]; warns [{warns.join(" ")}], same as cold {same_warns}; prints {warm_out}, same as cold {same_out}"
+}
+
+// An edit the build refuses: the errors it reports.
+fn refused(tree: Str, what: Str) -> Str {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code != 0, "the build after `{what}` passed: {r.out}{r.err_out}")
+    "{what}: refused with [{diagnostics(r).join(" ")}]"
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+test "an annotation edit on a fn of an imported module emits again only the units that name the fn" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_annotated_unit_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "out")
+    let mut seen: List[Str] = []
+    edit(tree, "base.bl", #"/^pub fn lim/i\@deprecated("probe")"#)
+    seen.push(warm_and_cold(tree, "deprecated added"))
+    edit(tree, "base.bl", #"s/@deprecated("probe")/@requires(x > 0)\n@verify(fallback: "runtime")/"#)
+    seen.push(warm_and_cold(tree, "requires in place of deprecated"))
+    edit(tree, "base.bl", "s/@requires(x > 0)/@requires(x > -1)\\n@ensures(result > 0)/")
+    seen.push(warm_and_cold(tree, "requires changed and ensures added"))
+    edit(tree, "base.bl", "/^@requires/d; /^@ensures/d; /^@verify/d")
+    seen.push(warm_and_cold(tree, "contracts removed"))
+    append(tree, "other.bl", [
+        #""#,
+        #"@allow(UnusedVariable)"#,
+        #"@trusted(audit: "test")"#,
+        #"@pure"#,
+        #"@src(probe)"#,
+        #"@modifies(x)"#,
+        #"fn other_unused(x: Int) -> Int {"#,
+        #"    let y = 1"#,
+        #"    x + 1"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    seen.push(warm_and_cold(tree, "fn added with five local annotations"))
+    edit(tree, "other.bl", "s/@allow(UnusedVariable)/@deprecated(\"probe\")/")
+    seen.push(warm_and_cold(tree, "one annotation swapped for another"))
+    edit(tree, "nat.bl", "s/@ffi(\"labs\")/@ffi(\"llabs\")/")
+    seen.push(warm_and_cold(tree, "ffi symbol changed"))
+    edit(tree, "leaf.bl", #"/^pub fn leaf_value/i\@tags(slow)"#)
+    seen.push(warm_and_cold(tree, "tags added"))
+    edit(tree, "leaf.bl", "s/^@tags(slow)$/@inline/")
+    seen.push(warm_and_cold(tree, "an annotation nothing reads in place of tags"))
+    edit(tree, "leaf.bl", "/^@inline$/d")
+    seen.push(warm_and_cold(tree, "annotation removed"))
+    edit(tree, "nat.bl", "/^@trusted/d")
+    seen.push(refused(tree, "trusted removed from the pub ffi fn"))
+    edit(tree, "nat.bl", #"/^pub fn abs_of/i\@trusted(audit: "test")"#)
+    seen.push(warm_and_cold(tree, "trusted put back, so every source is the last build source"))
+    append(tree, "other.bl", [
+        #""#,
+        #"@ffi("labs")"#,
+        #"fn other_abs(x: Int) -> Int ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    seen.push(warm_and_cold(tree, "private ffi fn added with no trusted"))
+    edit(tree, "other.bl", #"/^fn other_abs/i\@trusted(audit: "test")"#)
+    seen.push(warm_and_cold(tree, "trusted added to it"))
+    append(tree, "mid.bl", [
+        #""#,
+        #"@pure"#,
+        #"fn mid_pure(x: Int) -> Int {"#,
+        #"    lim(x)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    seen.push(refused(tree, "pure fn added that calls a fn of another module that is not pure"))
+    edit(tree, "base.bl", #"/^pub fn lim/i\@pure"#)
+    seen.push(warm_and_cold(tree, "pure added to that fn"))
+    shell_exec("rm -rf {tree}")
+    assert_eq(seen.join("\n"), [
+        "deprecated added: took __main__,leaf,nat,other; differ []; warns [DeprecatedUsage@mid.bl:5], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "requires in place of deprecated: took __main__,leaf,nat,other; differ []; warns [], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "requires changed and ensures added: took __main__,leaf,nat,other; differ []; warns [], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "contracts removed: took __main__,leaf,nat,other; differ []; warns [], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "fn added with five local annotations: took __main__,base,leaf,mid,nat; differ []; warns [], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "one annotation swapped for another: took __main__,base,leaf,mid,nat; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "ffi symbol changed: took __main__,base,leaf,other; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "tags added: took ; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "an annotation nothing reads in place of tags: took ; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "annotation removed: took ; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "trusted removed from the pub ffi fn: refused with [PubFFI@nat.bl:1 UnauditedFFI@nat.bl:1 UnusedVariable@other.bl:13]",
+        "trusted put back, so every source is the last build source: took the last emit; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "private ffi fn added with no trusted: took __main__,base,leaf,mid,nat; differ []; warns [UnauditedFFI@other.bl:17 UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "trusted added to it: took __main__,base,leaf,mid,nat; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+        "pure fn added that calls a fn of another module that is not pure: refused with [ImpureBodyForPureAnnotation@mid.bl:8 UnusedVariable@other.bl:13]",
+        "pure added to that fn: took __main__,leaf,nat,other; differ []; warns [UnusedVariable@other.bl:13], same as cold true; prints [main] [mid 5] [other] [leaf], same as cold true",
+    ].join("\n"))
+}
