@@ -1,0 +1,70 @@
+// A debug build keys its objects on the compile dir, which it reads from PWD and the cwd as
+// cc does. It only reads PWD: the program `blink run --debug` starts gets the PWD the parent
+// gave blink, or none when the parent gave none, never a PWD the build chose.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"run_pwd_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every run.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/part.bl", "pub fn label() -> Str \{\n    \"pwd\"\n\}\n")
+    write_file("{tree}/app/src/main.bl", "import part.\{label\}\n\nfn main() \{\n    io.println(\"\{label()\}: \{env.var(\"PWD\") ?? \"-\"\}\")\n\}\n")
+    shell_exec("ln -s {tree}/app {tree}/link")
+}
+
+// A cold `blink run --debug` in dir, started with no shell between, so PWD is what pwd_env
+// says: "-u PWD" for none, or "PWD=<dir>". The corpus exports BLINK_COMPILER_ARCHIVE and
+// module filters, which make the build one unit, so the run drops them.
+fn run_in(tree: Str, dir: Str, pwd_env: Str) -> ProcessResult {
+    let args = ["-C", dir, "-u", "BLINK_ROOT", "-u", "BLINK_COMPILER_ARCHIVE", "-u", "BLINK_PER_MODULE", "-u", "BLINK_SKIP_MODULES", "-u", "BLINK_ONLY_MODULE"]
+    let pwd_args = if pwd_env == "-u PWD" { ["-u", "PWD"] } else { [pwd_env] }
+    process_run("env", args.append(pwd_args).append(["BLINK_CACHE_DIR={tree}/objcache", "BLINK_TRACE_CHANNELS=build.units", "{tree}/build/blink", "run", "src/main.bl", "--debug"]))
+}
+
+fn printed(r: ProcessResult) -> Str {
+    let lines: List[Str] = r.out.lines().filter(fn(l) { l.starts_with("pwd: ") })
+    lines.join("\n")
+}
+
+fn compiles(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+test "blink run --debug passes the program the PWD its parent gave, or none" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_run_debug_pwd_{getpid()}"
+    dev_tree(root, tree)
+    let unset = run_in(tree, "{tree}/app", "-u PWD")
+    let stale = run_in(tree, "{tree}/app", "PWD={tree}")
+    let linked = run_in(tree, "{tree}/link", "PWD={tree}/link")
+    shell_exec("rm -rf {tree}")
+
+    assert(unset.exit_code == 0, "run failed: {unset.out}{unset.err_out}")
+    assert(stale.exit_code == 0, "run failed: {stale.out}{stale.err_out}")
+    assert(linked.exit_code == 0, "run failed: {linked.out}{linked.err_out}")
+    // The first run compiles each unit, so its key read the compile dir.
+    assert_eq(compiles(unset), 2)
+    assert_eq(printed(unset), "pwd: -")
+    assert_eq(printed(stale), "pwd: {tree}")
+    assert_eq(printed(linked), "pwd: {tree}/link")
+}
