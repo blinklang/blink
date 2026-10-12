@@ -1,0 +1,34 @@
+// spawn_to_files hands the parent the read end of a pipe whose write end only the child holds.
+// Both ends come from one pipe(2) call, so a descriptor read from the wrong slot leaves the
+// parent with a closed descriptor or the write end.
+
+import build_fs
+import std.libc.{poll, read_bytes, Pollfd, POLL_EVT_IN}
+
+let DIR = "build/build_fs_spawn_live_probe"
+
+fn events_on(fd: Int, wait_ms: Int) -> Int ! IO {
+    match poll([Pollfd { fd: fd.to_i32(), events: POLL_EVT_IN.to_i16(), revents: 0.to_i16() }], wait_ms) {
+        Ok(got) => got.get(0).unwrap().revents.to_int()
+        // -1 is never a revents mask, so a failed poll fails both checks.
+        Err(_) => -1
+    }
+}
+
+test "the live pipe stays quiet while the child runs and hangs up once it ends" {
+    shell_exec("rm -rf {DIR} && mkdir -p {DIR}")
+    let kid = build_fs.spawn_to_files("sh", ["-c", "echo out; echo err >&2; sleep 0.3"], "{DIR}/k.out", "{DIR}/k.err")
+    assert(kid.pid > 0, "the child did not start")
+    assert(kid.live >= 0, "the child has no live pipe")
+    assert_eq(events_on(kid.live, 0), 0)
+    assert(events_on(kid.live, 10000) > 0, "the live pipe did not hang up after the child ended")
+    // A hang-up on the write end looks the same to poll, so only a read tells the two ends apart.
+    match read_bytes(kid.live, 16) {
+        Ok(got) => assert_eq(got.len(), 0)
+        Err(_) => assert(false, "the live descriptor is not the read end of the pipe")
+    }
+    let res = build_fs.reap_to_files(kid)
+    assert_eq(res.exit_code, 0)
+    assert_eq(res.out, "out\n")
+    assert_eq(res.err_out, "err\n")
+}
