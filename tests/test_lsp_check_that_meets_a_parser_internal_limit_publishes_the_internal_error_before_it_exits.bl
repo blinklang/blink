@@ -1,0 +1,89 @@
+// The language server runs the front end in its own process, so a parser internal limit, which
+// stops the compiler on the spot, ends the server with exit 101 as it ends a cold check. The
+// editor must still learn why: before it exits, the server publishes the internal error for
+// the document it was checking, and answers a format request it was serving with an internal
+// error, each as a whole frame, so stdout holds frames and nothing else. No source program
+// reaches a limit, so the dev knob BLINK_DEV_PARSER_LIMIT makes the parse of a file that holds
+// the named identifier stop as a limit does.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/lsp_parser_limit"
+
+fn fault_src() -> Str {
+    "fn main() \{\n    let parser_limit_probe_ident = 1\n    io.println(\"\{parser_limit_probe_ident}\")\n}\n"
+}
+
+fn lsp_msg(body: Str) -> Str {
+    let len = body.byte_len()
+    "Content-Length: {len}\r\n\r\n{body}"
+}
+
+// The bodies of the frames in out, in order, or Err with what in out is not a frame.
+fn frames(out: Str) -> Result[List[Str], Str] {
+    let mut bodies: List[Str] = []
+    let mut at = 0
+    while at < out.byte_len() {
+        let rest = out.byte_slice(at, out.byte_len())
+        if !rest.starts_with("Content-Length: ") { return Err("not a frame at byte {at}: `{rest}`") }
+        let end = match rest.byte_index_of("\r\n\r\n", 0) {
+            Some(i) => i
+            None => { return Err("a header with no end at byte {at}") }
+        }
+        let len = rest.byte_slice(16, end).to_int()
+        let start = end + 4
+        if start + len > rest.byte_len() { return Err("a frame cut short at byte {at}") }
+        bodies.push(rest.byte_slice(start, start + len))
+        at = at + start + len
+    }
+    Ok(bodies)
+}
+
+fn run_lsp(name: Str, requests: List[Str]) -> ProcessResult {
+    let mut input = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    input = input.concat(lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}"))
+    for r in requests { input = input.concat(lsp_msg(r)) }
+    input = input.concat(lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"shutdown\",\"params\":null\}"))
+    input = input.concat(lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}"))
+    write_file("{DIR}/{name}.bin", input)
+    process_run("sh", ["-c", "BLINK_DEV_PARSER_LIMIT=parser_limit_probe_ident timeout 20 build/blink lsp < {DIR}/{name}.bin"])
+}
+
+fn setup() -> Str {
+    let _ = process_run("sh", ["-c", "rm -rf {DIR}; mkdir -p {DIR}"])
+    write_file("{DIR}/main.bl", fault_src())
+    let abs = process_run("sh", ["-c", "cd {DIR} && pwd"]).out.trim()
+    "file://{abs}/main.bl"
+}
+
+test "an lsp check that meets a parser internal limit publishes the internal error and exits 101" {
+    let uri = setup()
+    let r = run_lsp("open", ["\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}"])
+    assert_eq(r.exit_code, 101)
+    assert(r.err_out.contains("internal compiler error[ParserInternalLimit]"), "stderr: {r.err_out}")
+    match frames(r.out) {
+        Ok(bodies) => {
+            assert_eq(bodies.len(), 2)
+            let published = bodies[1]
+            assert(published.contains("\"method\":\"textDocument/publishDiagnostics\""), "second frame: {published}")
+            assert(published.contains("\"uri\":\"{uri}\""), "second frame: {published}")
+            assert(published.contains("\"severity\":1") && published.contains("internal compiler error"), "second frame: {published}")
+        }
+        Err(e) => assert(false, "{e}\nstdout: {r.out}")
+    }
+}
+
+test "an lsp format request that meets a parser internal limit is answered with an internal error" {
+    let uri = setup()
+    let r = run_lsp("format", ["\{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/formatting\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\"\},\"options\":\{\"tabSize\":4,\"insertSpaces\":true\}\}\}"])
+    assert_eq(r.exit_code, 101)
+    match frames(r.out) {
+        Ok(bodies) => {
+            let answered = bodies.filter(fn(b) { b.contains("\"id\":7,\"error\":\{\"code\":-32603,") })
+            assert_eq(answered.len(), 1)
+            let published = bodies.filter(fn(b) { b.contains("\"method\":\"textDocument/publishDiagnostics\"") && b.contains("internal compiler error") })
+            assert_eq(published.len(), 1)
+        }
+        Err(e) => assert(false, "{e}\nstdout: {r.out}")
+    }
+}

@@ -1,6 +1,6 @@
 import std.json.{json_parse, json_get, json_as_str, json_as_int, json_as_bool, json_type, json_clear, JSON_BOOL, JSON_INT}
 import std.num.{parse_int}
-import diagnostics.{Diag, DiagEntry, diag_entries, diag_count, json_escape}
+import diagnostics.{Diag, DiagEntry, diag_entries, diag_count, json_escape, diag_set_abort_stdout}
 import compiler.{compile_to_program}
 import lexer.{Lex, lex, token_count, token_at, tokens}
 import typecheck.{TypeCheck, tc_hints, HintEntry}
@@ -56,10 +56,13 @@ fn lsp_read_message() -> Str ! IO {
     }
 }
 
-fn lsp_write_message(body: Str) ! IO {
+fn lsp_frame(body: Str) -> Str {
     let len = body.byte_len()
-    io.write("Content-Length: {len}\r\n\r\n")
-    io.write(body)
+    "Content-Length: {len}\r\n\r\n{body}"
+}
+
+fn lsp_write_message(body: Str) ! IO {
+    io.write(lsp_frame(body))
 }
 
 fn lsp_send_response_int(id: Int, result_json: Str) ! IO {
@@ -215,12 +218,32 @@ fn lsp_extract_document_uri(root: Int) -> Str {
     json_as_str(uri_node)
 }
 
+// A parser internal limit ends the server in the middle of a check, with exit 101 as it ends a
+// cold check, since the front end can not go on after it. These frames go out just before that
+// exit, so the editor shows the internal error on the document it asked about and gets an
+// answer to the request it waits on, not a server that went quiet. The fault itself goes to
+// the server's log on stderr.
+fn lsp_abort_frames(uri: Str, request_id: Option[Int]) -> Str {
+    let ice = DiagEntry {
+        severity: "ice", name: "", code: "", file: lsp_uri_to_path(uri), line: 0, col: 0, help: "",
+        message: "internal compiler error: the check stopped, so blink-lsp ends; the server log holds the fault",
+        end_line: 0, end_col: 0, fix_action: "", fix_text: "", notes: [],
+    }
+    let published = lsp_frame("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{lsp_build_diagnostics_json(uri, [ice])}\}")
+    match request_id {
+        Some(id) => published.concat(lsp_frame("\{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":\{\"code\":-32603,\"message\":\"internal compiler error\"\}\}"))
+        None => published
+    }
+}
+
 fn lsp_handle_did_open_or_save(root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
         return
     }
+    diag_set_abort_stdout(lsp_abort_frames(uri, None))
     lsp_check_and_publish(uri, lsp_uri_to_path(uri))
+    diag_set_abort_stdout("")
 }
 
 fn lsp_handle_did_close(root: Int) ! IO {
@@ -703,6 +726,12 @@ fn lsp_handle_formatting(id: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Bu
         lsp_send_response_int(id, "[]")
         return
     }
+    diag_set_abort_stdout(lsp_abort_frames(uri, Some(id)))
+    lsp_format_document(id, uri)
+    diag_set_abort_stdout("")
+}
+
+fn lsp_format_document(id: Int, uri: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
     let path = lsp_uri_to_path(uri)
     let source = read_file(path)
     if source == "" {
