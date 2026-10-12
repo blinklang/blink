@@ -76,9 +76,12 @@ echo "Self-compiling blinkc (Gen 2)..."
 ARCH_CHECK_DIR="$BUILD_DIR/.archive-check"
 mkdir -p "$ARCH_CHECK_DIR"
 ar p "$BUILD_DIR/libblink_std.a" monolith.o > "$ARCH_CHECK_DIR/mono_gen1.o"
+# An archive built before the test runtime had a member of its own has none.
+ar p "$BUILD_DIR/libblink_std.a" runtime_test.o > "$ARCH_CHECK_DIR/rt_test_gen1.o" 2>/dev/null || true
 
 BLINK_FORCE_STDLIB_REBUILD=1 "$GEN0_BLINK" __build-stdlib-archive
 ar p "$BUILD_DIR/libblink_std.a" monolith.o > "$ARCH_CHECK_DIR/mono_gen2.o"
+ar p "$BUILD_DIR/libblink_std.a" runtime_test.o > "$ARCH_CHECK_DIR/rt_test_gen2.o" 2>/dev/null || true
 
 fail=0
 if ! diff -q "$BUILD_DIR/blinkc_gen1.c" "$BUILD_DIR/blinkc_gen2.c" > /dev/null 2>&1; then
@@ -87,6 +90,10 @@ if ! diff -q "$BUILD_DIR/blinkc_gen1.c" "$BUILD_DIR/blinkc_gen2.c" > /dev/null 2
 fi
 if ! cmp -s "$ARCH_CHECK_DIR/mono_gen1.o" "$ARCH_CHECK_DIR/mono_gen2.o"; then
     echo "  libblink_std.a:monolith.o not deterministic" >&2
+    fail=1
+fi
+if ! cmp -s "$ARCH_CHECK_DIR/rt_test_gen1.o" "$ARCH_CHECK_DIR/rt_test_gen2.o"; then
+    echo "  libblink_std.a:runtime_test.o not deterministic" >&2
     fail=1
 fi
 if [ "$fail" -ne 0 ]; then
