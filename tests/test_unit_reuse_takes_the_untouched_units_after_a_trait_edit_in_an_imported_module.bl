@@ -1,0 +1,202 @@
+// A trait prints no C of its own. Its name reaches the C of the impls of it and of the generic
+// fns bound by it, and its method names reach every call that dispatches through them, and
+// each of those units names the trait or the method in its source. So after an edit to a
+// trait in a module other than the entry, a per-module build emits again the units whose
+// sources name the trait or one of its methods, and takes every other unit from the last
+// build. A trait named like a prelude trait takes no unit, since codegen dispatches the
+// prelude traits by name from sources that never write it, and so does a trait under an
+// annotation. Each build runs with BLINK_EMIT_REUSE_VERIFY=1, so every unit it writes or takes
+// is byte-equal to a cold emit, and after each edit the units and the output equal those of a
+// build with no last build.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"trait_reuse_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/shape.bl", [
+        #"pub trait Area {"#,
+        #"    fn area(self) -> Int"#,
+        #"    fn scaled(self, k: Int) -> Int"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/sq.bl", [
+        #"import shape.{Area}"#,
+        #""#,
+        #"@derive(Eq)"#,
+        #"pub type Sq {"#,
+        #"    side: Int"#,
+        #"}"#,
+        #""#,
+        #"impl Area for Sq {"#,
+        #"    fn area(self) -> Int {"#,
+        #"        self.side * self.side"#,
+        #"    }"#,
+        #""#,
+        #"    fn scaled(self, k: Int) -> Int {"#,
+        #"        self.area() * k"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/sum.bl", [
+        #"import shape.{Area}"#,
+        #""#,
+        #"pub fn total[T: Area](x: T) -> Int {"#,
+        #"    x.scaled(2)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/other.bl", [
+        #"pub fn other() -> Str {"#,
+        #"    "other""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/leaf.bl", [
+        #"pub fn leaf_value() -> Str {"#,
+        #"    "leaf""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import sq.{Sq}"#,
+        #"import sum.{total}"#,
+        #"import other.{other}"#,
+        #"import leaf.{leaf_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let s = Sq { side: 3 }"#,
+        #"    io.println("{total(s)} {other()} {leaf_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_EMIT_REUSE_VERIFY=1 BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn build_into(tree: Str, out: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/{out}/app --per-module")
+    assert(r.exit_code == 0, "per-module build into {out} failed: {r.out}{r.err_out}")
+    r
+}
+
+// The modules whose units the build took from the last build, from its build.units trace.
+fn reused_units(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] reuse unit ") {
+            // Sorted, so the build's unit order does not reach the assertion.
+            let name = line.byte_slice(29, line.byte_len())
+            out.push(name)
+            let mut at = out.len() - 1
+            while at > 0 && out.get(at - 1).unwrap() > name {
+                out.set(at, out.get(at - 1).unwrap())
+                at = at - 1
+            }
+            out.set(at, name)
+        }
+    }
+    out
+}
+
+// One edit's result: the units the build took, the C files and headers that differ from a
+// build with none to take, and whether the two binaries print the same.
+fn warm_and_cold(tree: Str, what: Str) -> Str {
+    let warm = build_into(tree, "out")
+    shell_exec("rm -rf {tree}/cold")
+    let _cold = build_into(tree, "cold")
+    let differ = sh("cd {tree} && for f in cold/app.units/*.c cold/app.units/*.h; do b=$(basename $f); cmp -s $f out/app.units/$b || echo $b; done; for f in out/app.units/*.c out/app.units/*.h; do [ -e cold/app.units/$(basename $f) ] || echo extra:$(basename $f); done")
+    let warm_out = sh("{tree}/out/app")
+    let same_out = warm_out == sh("{tree}/cold/app")
+    "{what}: took {reused_units(warm).join(",")}; differ [{differ.split("\n").join(" ")}]; prints {warm_out}, same as cold {same_out}"
+}
+
+fn edit(tree: Str, file: Str, sed: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    shell_exec("sed -i '{sed}' {path}")
+    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+}
+
+fn append(tree: Str, file: Str, text: Str) {
+    let path = "{tree}/app/src/{file}"
+    write_file(path, "{read_file(path)}{text}")
+}
+
+
+test "a trait edit in an imported module emits again only the units that name the trait or its methods" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_trait_unit_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let _first = build_into(tree, "out")
+    let mut seen: List[Str] = []
+    append(tree, "shape.bl", [
+        #""#,
+        #"pub trait Perim {"#,
+        #"    fn perim(self) -> Int"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    seen.push(warm_and_cold(tree, "trait added"))
+    edit(tree, "shape.bl", "s/fn perim(self) -> Int/fn perim(self, unit: Int) -> Int/")
+    seen.push(warm_and_cold(tree, "method signature of an unused trait changed"))
+    edit(tree, "shape.bl", "s/fn scaled(self, k: Int)/fn scaled(self, factor: Int)/")
+    seen.push(warm_and_cold(tree, "method signature of an implemented and called trait changed"))
+    edit(tree, "shape.bl", #"s/^pub trait Area {/pub trait Area: Eq {/"#)
+    seen.push(warm_and_cold(tree, "supertrait added"))
+    edit(tree, "shape.bl", #"s/^pub trait Area: Eq {/pub trait Area {/"#)
+    seen.push(warm_and_cold(tree, "supertrait removed"))
+    edit(tree, "shape.bl", #"/^pub trait Perim/,/^}/d"#)
+    seen.push(warm_and_cold(tree, "trait removed"))
+    append(tree, "leaf.bl", [
+        #""#,
+        #"trait Debug {"#,
+        #"    fn debug(self) -> Str"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    seen.push(warm_and_cold(tree, "trait named like a prelude trait added"))
+    edit(tree, "leaf.bl", #"/^trait Debug/,/^}/d"#)
+    seen.push(warm_and_cold(tree, "trait named like a prelude trait removed"))
+    append(tree, "leaf.bl", [
+        #""#,
+        #"@deprecated("probe")"#,
+        #"trait Old {"#,
+        #"    fn old(self) -> Int"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    seen.push(warm_and_cold(tree, "trait under an annotation added"))
+    shell_exec("rm -rf {tree}")
+    assert_eq(seen.join("\n"), [
+        "trait added: took __main__,leaf,other,sq,sum; differ []; prints 18 other leaf, same as cold true",
+        "method signature of an unused trait changed: took __main__,leaf,other,sq,sum; differ []; prints 18 other leaf, same as cold true",
+        "method signature of an implemented and called trait changed: took __main__,leaf,other; differ []; prints 18 other leaf, same as cold true",
+        "supertrait added: took __main__,leaf,other; differ []; prints 18 other leaf, same as cold true",
+        "supertrait removed: took __main__,leaf,other; differ []; prints 18 other leaf, same as cold true",
+        "trait removed: took __main__,leaf,other,sq,sum; differ []; prints 18 other leaf, same as cold true",
+        "trait named like a prelude trait added: took ; differ []; prints 18 other leaf, same as cold true",
+        "trait named like a prelude trait removed: took ; differ []; prints 18 other leaf, same as cold true",
+        "trait under an annotation added: took ; differ []; prints 18 other leaf, same as cold true",
+    ].join("\n"))
+}

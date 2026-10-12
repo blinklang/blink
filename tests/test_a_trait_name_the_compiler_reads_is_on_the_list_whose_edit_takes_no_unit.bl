@@ -1,0 +1,144 @@
+// A per-module build takes the units an edited trait cannot reach: those whose sources name
+// neither the trait nor its methods. A trait the compiler reads by name breaks that rule, since
+// a unit can dispatch through it without writing it (`==` reads Eq, interpolation reads
+// Display, `+` reads Add). So a trait with such a name takes no unit when it is edited, and
+// typecheck holds the names: every trait of a prelude module, and the list that
+// `tc_builtin_trait_names` starts from. This test reads the compiler's sources and fails when
+// a source reads a trait by a name that is on neither, so a new name read cannot reach the
+// build's reuse path unseen. It reads three shapes: a string literal equal to a trait the standard library
+// declares, a literal compared with a binding whose name holds `trait`, and a name registered
+// with `tc_trait_names.push`. A name built at run time is not seen, so the check is a lower
+// bound.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// The string literals of a line. A quote inside an interpolation can shift the pairing, and
+// then a literal is missed, never made up from code: a name must also pass the checks below.
+fn literals(line: Str) -> List[Str] {
+    let parts = line.split("\"")
+    let mut out: List[Str] = []
+    let mut i = 1
+    while i < parts.len() {
+        out.push(parts.get(i).unwrap())
+        i = i + 2
+    }
+    out
+}
+
+fn is_type_like(s: Str) -> Bool {
+    let mut i = 0
+    while i < s.byte_len() {
+        let b = s.byte_at(i).to_int()
+        let upper = b >= 65 && b <= 90
+        let ok = upper || (i > 0 && ((b >= 97 && b <= 122) || (b >= 48 && b <= 57)))
+        if !ok { return false }
+        i = i + 1
+    }
+    s.byte_len() > 0
+}
+
+// The literals of a line compared with a binding whose name holds `trait`, as in
+// `trait_name == "Eq"`.
+fn trait_compares(line: Str) -> List[Str] {
+    let parts = line.split(" == \"")
+    let mut out: List[Str] = []
+    let mut i = 1
+    while i < parts.len() {
+        let left = parts.get(i - 1).unwrap().split(" ")
+        let word = left.get(left.len() - 1).unwrap().split("(")
+        if word.get(word.len() - 1).unwrap().contains("trait") {
+            out.push(parts.get(i).unwrap().split("\"").get(0).unwrap())
+        }
+        i = i + 1
+    }
+    out
+}
+
+// The names a `trait` line of a source declares.
+fn declared_traits(path: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in read_file(path).split("\n") {
+        let text = line.trim()
+        let rest = if text.starts_with("pub trait ") { text.byte_slice(10, text.byte_len()) } else if text.starts_with("trait ") { text.byte_slice(6, text.byte_len()) } else { "" }
+        if rest != "" {
+            let name = rest.split(" ").get(0).unwrap().split("[").get(0).unwrap().split(":").get(0).unwrap()
+            out.push(name)
+        }
+    }
+    out
+}
+
+// The list `tc_builtin_trait_names` starts from, from its one source line.
+fn pushed_list() -> List[Str] {
+    let mut out: List[Str] = []
+    let mut in_fn = false
+    for line in read_file("src/typecheck.bl").split("\n") {
+        if line.starts_with("pub fn tc_builtin_trait_names(") { in_fn = true }
+        if in_fn && line.contains("let mut names: List[Str] = [") {
+            out = literals(line)
+            in_fn = false
+        }
+    }
+    out
+}
+
+// The prelude modules, from `prelude_module_list` in src/compiler.bl.
+fn prelude_files() -> List[Str] {
+    let lines = read_file("src/compiler.bl").split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().starts_with("pub fn prelude_module_list()") {
+            let mut out: List[Str] = []
+            for m in literals(lines.get(i + 1).unwrap()) {
+                out.push("lib/{m.replace(".", "/")}.bl")
+            }
+            return out
+        }
+        i = i + 1
+    }
+    []
+}
+
+test "every trait name the compiler reads is a prelude trait or on the typecheck list" {
+    let pushed = pushed_list()
+    assert(pushed.len() > 0, "src/typecheck.bl has no `let mut names: List[Str] = [...]` line in tc_builtin_trait_names")
+    let mut on_list: List[Str] = []
+    for name in pushed { on_list.push(name) }
+    let preludes = prelude_files()
+    assert(preludes.len() > 0, "src/compiler.bl has no prelude_module_list")
+    for path in preludes {
+        if sh("[ -e {path} ] && echo yes") == "yes" {
+            for name in declared_traits(path) { on_list.push(name) }
+        }
+    }
+    let mut std_traits: List[Str] = []
+    for path in sh("ls lib/std/*.bl").split("\n") {
+        for name in declared_traits(path) { std_traits.push(name) }
+    }
+    let mut missing: List[Str] = []
+    for path in sh("ls src/*.bl").split("\n") {
+        let lines = read_file(path).split("\n")
+        let mut n = 0
+        while n < lines.len() {
+            let line = lines.get(n).unwrap()
+            n = n + 1
+            let mut read: List[Str] = []
+            for lit in literals(line) {
+                if std_traits.contains(lit) { read.push(lit) }
+            }
+            for lit in trait_compares(line) {
+                if is_type_like(lit) { read.push(lit) }
+            }
+            if line.contains("tc_trait_names.push(\"") {
+                read.push(line.split("tc_trait_names.push(\"").get(1).unwrap().split("\"").get(0).unwrap())
+            }
+            for name in read {
+                let at = "{name} at {path}:{n}"
+                if !on_list.contains(name) && !missing.contains(at) { missing.push(at) }
+            }
+        }
+    }
+    assert_eq(missing.join("\n"), "")
+}
