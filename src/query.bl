@@ -1,6 +1,10 @@
-import symbol_index.{si_sym_name, si_sym_kind, si_sym_module, si_sym_sig, si_sym_effects, si_sym_vis, si_sym_intent, si_sym_doc, si_sym_requires, si_sym_ensures, si_sym_end_line, si_sym_col, si_sym_end_col, si_sym_line, si_sym_file, si_sym_count, si_find_sym, si_symbol_at, SK_FN, VIS_PUB, sym_kind_name}
-import std.json.{json_clear, json_encode, json_new_array, json_new_int, json_new_object, json_new_str, json_push, json_set, json_parse, json_get, json_as_str}
-import std.num.{parse_int}
+import symbol_index.{si_sym_name, si_sym_kind, si_sym_module, si_sym_sig, si_sym_effects, si_sym_vis, si_sym_intent, si_sym_doc, si_sym_requires, si_sym_ensures, si_sym_end_line, si_sym_col, si_sym_end_col, si_sym_line, si_sym_file, si_sym_count, si_reset, si_build, SK_FN, VIS_PUB, sym_kind_name}
+import std.json.{json_clear, json_encode, json_new_array, json_new_int, json_new_object, json_new_str, json_push, json_set}
+import std.path.{path_basename}
+import lexer.{Lex, lex}
+import parser.{Parse, pos, parse_program, node_count}
+import comment_attach.{attach_comments_pass}
+import diagnostics.{Diag, diag_count, diag_source_file}
 
 // query.bl — Query engine for the symbol index
 //
@@ -103,85 +107,6 @@ fn effects_contain(effects: Str, target: Str) -> Int {
         i = i + 1
     }
     0
-}
-
-// ── Query: list fn signatures in a module ────────────────────────────
-
-fn query_by_signature(module: Str) -> Str {
-    let mut items = ""
-    let mut _first = 1
-    let mut i = 0
-    while i < si_sym_count {
-        if si_sym_module.get(i).unwrap() == module && si_sym_kind.get(i).unwrap() == SK_FN {
-            if _first == 0 {
-                items = items.concat(",")
-            }
-            items = items.concat(symbol_to_json(i))
-            _first = 0
-        }
-        i = i + 1
-    }
-    wrap_results(items)
-}
-
-// ── Query: find fns with a matching effect ───────────────────────────
-
-fn query_by_effect(effect_name: Str) -> Str {
-    let mut items = ""
-    let mut _first = 1
-    let mut i = 0
-    while i < si_sym_count {
-        if si_sym_kind.get(i).unwrap() == SK_FN {
-            if effects_contain(si_sym_effects.get(i).unwrap(), effect_name) == 1 {
-                if _first == 0 {
-                    items = items.concat(",")
-                }
-                items = items.concat(symbol_to_json(i))
-                _first = 0
-            }
-        }
-        i = i + 1
-    }
-    wrap_results(items)
-}
-
-// ── Query: public functions with no effects (pure) ───────────────────
-
-fn query_pub_pure() -> Str {
-    let mut items = ""
-    let mut _first = 1
-    let mut i = 0
-    while i < si_sym_count {
-        if si_sym_kind.get(i).unwrap() == SK_FN && si_sym_vis.get(i).unwrap() == VIS_PUB && si_sym_effects.get(i).unwrap() == "" {
-            if _first == 0 {
-                items = items.concat(",")
-            }
-            items = items.concat(symbol_to_json(i))
-            _first = 0
-        }
-        i = i + 1
-    }
-    wrap_results(items)
-}
-
-// ── Query: lookup specific function by name ──────────────────────────
-
-fn query_by_name(name: Str) -> Str {
-    let names = name.split(",")
-    let mut items = ""
-    let mut i = 0
-    while i < names.len() {
-        let n = names.get(i).unwrap().trim()
-        let idx = si_find_sym(n)
-        if idx >= 0 {
-            if items != "" {
-                items = items.concat(",")
-            }
-            items = items.concat(symbol_to_json(idx))
-        }
-        i = i + 1
-    }
-    wrap_results(items)
 }
 
 // ── Composable query: apply all filters in a single pass ─────────────
@@ -391,71 +316,45 @@ pub fn query_filtered_layer(layer: Str, vis_filter: Int, module_filter: Str, eff
     wrap_results(items)
 }
 
-// ── Dispatch: parse JSON request, route to filter fn ─────────────────
-//
-// Request format:
-//   {"type":"signature","module":"main"}
-//   {"type":"effect","effect":"IO"}
-//   {"type":"pub_pure"}
-//   {"type":"fn","name":"foo"}
+// ── The query `blink query` runs ─────────────────────────────────────
 
-fn query_at_position(file: Str, line: Int, col: Int) -> Str {
-    let idx = si_symbol_at(file, line, col)
-    if idx < 0 {
-        return wrap_results("")
+// The module a query names a file by: its file name without the extension.
+pub fn query_module_of(source_path: Str) -> Str {
+    let name = path_basename(source_path)
+    if name.ends_with(".bl") {
+        return name.byte_slice(0, name.byte_len() - 3)
     }
-    wrap_results(symbol_to_json(idx))
+    if name.ends_with(".pact") {
+        return name.byte_slice(0, name.byte_len() - 5)
+    }
+    name
 }
 
-pub fn query_dispatch(request: Str) -> Str {
-    json_clear()
-    let root = json_parse(request)
-    if root < 0 {
-        return "\{\"error\":\"invalid JSON request\"}"
+// Indexes the symbols of source, the text of source_path, on its own: a query reads no
+// import. A cold query and the daemon both index through here, so the daemon answers from
+// the index a cold query builds. False when the lex or the parse reported an error; the
+// index is then left as it was.
+pub fn query_index_source(source_path: Str, source: Str) -> Bool ! Lex.Tokenize, Parse, Diag.Report {
+    lex(source)
+    pos = 0
+    diag_source_file = source_path
+    let first_node = node_count()
+    let program = parse_program()
+    attach_comments_pass(program, first_node)
+    if diag_count > 0 {
+        return false
     }
+    si_reset()
+    si_build(program, source_path, query_module_of(source_path))
+    true
+}
 
-    let qtype = json_as_str(json_get(root, "type"))
-    if qtype == "" {
-        return "\{\"error\":\"missing 'type' field\"}"
-    }
-
-    if qtype == "signature" {
-        let module = json_as_str(json_get(root, "module"))
-        if module == "" {
-            return "\{\"error\":\"missing 'module' field for signature query\"}"
-        }
-        return query_by_signature(module)
-    }
-
-    if qtype == "effect" {
-        let eff_name = json_as_str(json_get(root, "effect"))
-        if eff_name == "" {
-            return "\{\"error\":\"missing 'effect' field for effect query\"}"
-        }
-        return query_by_effect(eff_name)
-    }
-
-    if qtype == "pub_pure" {
-        return query_pub_pure()
-    }
-
-    if qtype == "fn" {
-        let name = json_as_str(json_get(root, "name"))
-        if name == "" {
-            return "\{\"error\":\"missing 'name' field for fn query\"}"
-        }
-        return query_by_name(name)
-    }
-
-    if qtype == "at_position" {
-        let file = json_as_str(json_get(root, "file"))
-        let line_str = json_as_str(json_get(root, "line"))
-        let col_str = json_as_str(json_get(root, "col"))
-        if file == "" || line_str == "" || col_str == "" {
-            return "\{\"error\":\"missing file, line, or col for at_position query\"}"
-        }
-        return query_at_position(file, parse_int(line_str), parse_int(col_str))
-    }
-
-    "\{\"error\":\"unknown query type: {qtype}\"}"
+// What `blink query` prints for its flags, from the index of source_path. Without --module
+// a query lists the file's own module, but a lookup by name looks in each.
+pub fn query_answer(source_path: Str, layer: Str, pub_only: Bool, pure_only: Bool, effect_name: Str, module: Str, fn_name: Str) -> Str {
+    let lay = if layer == "" { "signature" } else { layer }
+    let vis = if pub_only { VIS_PUB } else { -1 }
+    let mod_f = if module != "" { module } else if fn_name == "" { query_module_of(source_path) } else { "" }
+    let pure = if pure_only { 1 } else { 0 }
+    query_filtered_layer(lay, vis, mod_f, effect_name, pure, fn_name)
 }
