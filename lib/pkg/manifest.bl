@@ -3,7 +3,7 @@
 // Loads, parses, and validates blink.toml project manifests.
 // Uses std.toml for parsing and stores results in parallel arrays.
 
-import std.toml.{toml_keys, toml_types, toml_values, toml_has, toml_get, toml_get_int, toml_get_array_len, toml_get_array_item, toml_clear, toml_parse}
+import std.toml.{toml_keys, toml_types, toml_values, toml_has, toml_get, toml_get_int, toml_get_array_len, toml_get_array_item, toml_clear, toml_parse, toml_key_spans, toml_value_spans, toml_headers, toml_header_spans, TomlSpan, TOML_STRING, TOML_ARRAY, TOML_INLINE_TABLE}
 
 // ── Package metadata ─────────────────────────────────────────────
 pub let mut manifest_name: Str = ""
@@ -40,6 +40,32 @@ pub let mut lint_levels: List[Str] = []
 pub let mut manifest_warnings: List[Str] = []
 pub let mut manifest_print_warnings = true
 
+// ── Issues from the last load ───────────────────────────────────
+// The compiler maps each kind to its diagnostic code. The span is the token the spec names
+// (§8.9.8): the value token for a bad value, the [header] for a bad section.
+@derive(Eq, Debug)
+pub type ManifestIssueKind {
+    InvalidLintLevel
+    UnknownManifestSection
+}
+
+pub type ManifestIssue {
+    kind: ManifestIssueKind
+    section: Str
+    // The lint name, for InvalidLintLevel; "" otherwise.
+    key: Str
+    // The level as written: the string for a string value, else the value token.
+    level: Str
+    // The closest defined section, for UnknownManifestSection.
+    suggestion: Option[Str]
+    line: Int
+    col: Int
+    end_line: Int
+    end_col: Int
+}
+
+pub let mut manifest_issues: List[ManifestIssue] = []
+
 // ── Native dependencies: parallel arrays ────────────────────────
 pub let mut native_dep_names: List[Str] = []
 pub let mut native_dep_types: List[Str] = []
@@ -75,6 +101,7 @@ pub fn manifest_clear() {
     lint_names = []
     lint_levels = []
     manifest_warnings = []
+    manifest_issues = []
     native_dep_names = []
     native_dep_types = []
     native_dep_paths = []
@@ -552,6 +579,171 @@ fn check_unknown_sections() {
     }
 }
 
+// ── Issues ───────────────────────────────────────────────────────
+
+fn make_issue(kind: ManifestIssueKind, section: Str, key: Str, level: Str, suggestion: Option[Str], span: TomlSpan) -> ManifestIssue {
+    ManifestIssue { kind: kind, section: section, key: key, level: level, suggestion: suggestion, line: span.line, col: span.col, end_line: span.end_line, end_col: span.end_col }
+}
+
+// The name before the first `.` or `[`: `bogus` for `bogus.x` and for `bogus[0].x`.
+fn top_segment(name: Str) -> Str {
+    let mut j = 0
+    while j < name.byte_len() {
+        let c = name.byte_at(j)
+        if c == 46 || c == 91 { // '.' '['
+            return name.byte_slice(0, j)
+        }
+        j = j + 1
+    }
+    name
+}
+
+fn entry_type(key: Str) -> Int {
+    let mut i = 0
+    while i < toml_keys.len() {
+        if toml_keys.get(i).unwrap() == key {
+            return toml_types.get(i).unwrap()
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// An array item or inline-table field belongs to the entry of its array or table, which carries
+// the issue, so one bad value gives one issue.
+fn is_nested_entry(key: Str) -> Bool {
+    let mut j = 0
+    while j < key.byte_len() {
+        let c = key.byte_at(j)
+        if c == 46 || c == 91 { // '.' '['
+            let t = entry_type(key.byte_slice(0, j))
+            if t == TOML_ARRAY || t == TOML_INLINE_TABLE {
+                return true
+            }
+        }
+        j = j + 1
+    }
+    false
+}
+
+fn collect_lint_issues(content: Str) {
+    let prefix = "lints."
+    let mut i = 0
+    while i < toml_keys.len() {
+        let key = toml_keys.get(i).unwrap()
+        if key.starts_with(prefix) && !is_nested_entry(key) {
+            let vtype = toml_types.get(i).unwrap()
+            let val = toml_values.get(i).unwrap()
+            let valid = vtype == TOML_STRING && (val == "off" || val == "warn" || val == "error")
+            if !valid {
+                let span = toml_value_spans.get(i).unwrap()
+                let level = if vtype == TOML_STRING { val } else { content.byte_slice(span.start_byte, span.end_byte) }
+                let name = key.byte_slice(prefix.byte_len(), key.byte_len())
+                manifest_issues.push(make_issue(ManifestIssueKind.InvalidLintLevel, "lints", name, level, None, span))
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Iterative two-row Levenshtein distance over bytes.
+fn edit_distance(a: Str, b: Str) -> Int {
+    let alen = a.byte_len()
+    let blen = b.byte_len()
+    if alen == 0 { return blen }
+    if blen == 0 { return alen }
+    let mut prev: List[Int] = []
+    let mut j = 0
+    while j <= blen {
+        prev.push(j)
+        j = j + 1
+    }
+    let mut i = 0
+    while i < alen {
+        let mut curr: List[Int] = [i + 1]
+        let mut k = 0
+        while k < blen {
+            let cost = if a.byte_at(i) == b.byte_at(k) { 0 } else { 1 }
+            let mut best = prev.get(k + 1).unwrap() + 1
+            let ins = curr.get(k).unwrap() + 1
+            let sub = prev.get(k).unwrap() + cost
+            if ins < best { best = ins }
+            if sub < best { best = sub }
+            curr.push(best)
+            k = k + 1
+        }
+        prev = curr
+        i = i + 1
+    }
+    prev.get(blen).unwrap()
+}
+
+// The threshold of the compiler's other did-you-mean helps, max(1, len / 3) edits: a typo
+// gets a suggestion and an unrelated name does not. A tie goes to the first defined section.
+fn closest_section(name: Str) -> Option[Str] {
+    let mut best_dist = -1
+    let mut best = ""
+    for known in known_sections {
+        let d = edit_distance(name, known)
+        if best_dist == -1 || d < best_dist {
+            best_dist = d
+            best = known
+        }
+    }
+    let mut threshold = name.byte_len() / 3
+    if threshold < 1 { threshold = 1 }
+    if best_dist == -1 || best_dist > threshold { return None }
+    Some(best)
+}
+
+// One issue per unknown section, at its first [header]. A section that only a top-level key
+// names has no header, so the issue points at that key.
+fn collect_section_issues() {
+    let mut seen: List[Str] = []
+    let mut h = 0
+    while h < toml_headers.len() {
+        let section = top_segment(toml_headers.get(h).unwrap())
+        if is_known_section(section) == 0 && !seen.contains(section) {
+            seen.push(section)
+            manifest_issues.push(make_issue(ManifestIssueKind.UnknownManifestSection, section, "", "", closest_section(section), toml_header_spans.get(h).unwrap()))
+        }
+        h = h + 1
+    }
+    let mut i = 0
+    while i < toml_keys.len() {
+        let section = top_segment(toml_keys.get(i).unwrap())
+        if is_known_section(section) == 0 && !seen.contains(section) {
+            seen.push(section)
+            manifest_issues.push(make_issue(ManifestIssueKind.UnknownManifestSection, section, "", "", closest_section(section), toml_key_spans.get(i).unwrap()))
+        }
+        i = i + 1
+    }
+}
+
+fn issue_before(a: ManifestIssue, b: ManifestIssue) -> Bool {
+    a.line < b.line || (a.line == b.line && a.col < b.col)
+}
+
+fn sort_issues() {
+    let mut i = 1
+    while i < manifest_issues.len() {
+        let cur = manifest_issues.get(i).unwrap()
+        let mut j = i
+        while j > 0 && issue_before(cur, manifest_issues.get(j - 1).unwrap()) {
+            manifest_issues.set(j, manifest_issues.get(j - 1).unwrap())
+            j = j - 1
+        }
+        manifest_issues.set(j, cur)
+        i = i + 1
+    }
+}
+
+fn collect_manifest_issues(content: Str) {
+    collect_lint_issues(content)
+    collect_section_issues()
+    sort_issues()
+}
+
 // ── Main load function ───────────────────────────────────────────
 
 pub fn manifest_load(path: Str) -> Int {
@@ -590,6 +782,7 @@ pub fn manifest_load(path: Str) -> Int {
     load_lints()
     load_native_deps()
     check_unknown_sections()
+    collect_manifest_issues(content)
 
     0
 }

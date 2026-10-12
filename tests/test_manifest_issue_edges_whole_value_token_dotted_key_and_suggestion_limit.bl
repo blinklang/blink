@@ -1,0 +1,75 @@
+// Edge cases of the manifest issue record: a lint value that is an inline table is one issue that
+// spans the whole value token, a top-level dotted key that makes an unknown section points at the
+// key, and the did-you-mean takes a section at most max(1, len / 3) edits away.
+
+import pkg.manifest.{manifest_load, manifest_print_warnings, manifest_issues, ManifestIssue, ManifestIssueKind}
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+let PACKAGE: Str = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n"
+
+fn load(toml: Str) -> Int {
+    manifest_print_warnings = false
+    let dir = sh("mktemp -d /tmp/blink_manifest_issue_edges.XXXXXX").out.trim()
+    write_file("{dir}/blink.toml", toml)
+    let rc = manifest_load("{dir}/blink.toml")
+    let _ = sh("rm -rf {dir}")
+    rc
+}
+
+fn only_issue() -> ManifestIssue {
+    assert_eq(manifest_issues.len(), 1)
+    manifest_issues.get(0).unwrap()
+}
+
+fn assert_at(issue: ManifestIssue, line: Int, col: Int, end_line: Int, end_col: Int) {
+    assert_eq(issue.line, line)
+    assert_eq(issue.col, col)
+    assert_eq(issue.end_line, end_line)
+    assert_eq(issue.end_col, end_col)
+}
+
+test "a lint level that is an inline table is one issue that spans from its brace to its brace" {
+    assert_eq(load("{PACKAGE}[lints]\nW0703 = \{ a = 1 \}\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.InvalidLintLevel)
+    assert_eq(issue.key, "W0703")
+    assert_eq(issue.level, "\{ a = 1 \}")
+    assert_at(issue, 5, 9, 5, 18)
+}
+
+test "a lint level that is an array is one issue that spans from its bracket to its bracket" {
+    assert_eq(load("{PACKAGE}[lints]\nW0703 = [\"a\", \"b\"]\n"), 0)
+    let issue = only_issue()
+    assert_eq(issue.level, "[\"a\", \"b\"]")
+    assert_at(issue, 5, 9, 5, 19)
+}
+
+test "a top-level dotted key that makes an unknown section points at the whole key" {
+    assert_eq(load("bogus.x = 1\n{PACKAGE}"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestSection)
+    assert_eq(issue.section, "bogus")
+    assert_at(issue, 1, 1, 1, 8)
+}
+
+test "a section at the suggestion limit names the defined section" {
+    // "lintsxx" has 7 bytes, so the limit is 7 / 3 = 2; deleting "xx" gives "lints": distance 2.
+    assert_eq(load("{PACKAGE}[lintsxx]\n"), 0)
+    assert_eq(only_issue().suggestion, Some("lints"))
+}
+
+test "a section one edit past the suggestion limit has no suggestion" {
+    // "lintsxxx" has 8 bytes, so the limit is 8 / 3 = 2; deleting "xxx" gives "lints": distance 3.
+    assert_eq(load("{PACKAGE}[lintsxxx]\n"), 0)
+    assert_eq(only_issue().suggestion, None)
+}
+
+test "a short section name may still be one edit from a defined section" {
+    // "lint" has 4 bytes, so the limit is 4 / 3 = 1; adding "s" gives "lints": distance 1.
+    assert_eq(load("{PACKAGE}[lint]\n"), 0)
+    assert_eq(only_issue().suggestion, Some("lints"))
+}
