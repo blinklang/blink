@@ -1,8 +1,9 @@
-// A per-module unit holds a copy of the declarations it names, but a header with a line the
+// A per-module unit holds a copy of the declarations it names, and a header with a line the
 // scan cannot read goes into every unit whole, and into each unit's object key. A module-level
-// global that holds a struct puts a static GC layout function in the entry module's private
-// header, so every unit includes that header, the build says so on its build.unit_headers
-// trace, and a private fn added to the entry module recompiles the other unit as well.
+// global that holds a struct puts a guarded static GC layout function in the entry module's
+// private header. The scan reads that block as one declaration, so no unit includes that
+// header whole, the build's build.unit_headers trace names none, and a private fn added to
+// the entry module recompiles the entry unit alone.
 
 import std.process.{ProcessResult}
 
@@ -37,10 +38,19 @@ fn dev_tree(root: Str, tree: Str) {
         #"    y: Int"#,
         #"}"#,
         #""#,
+        #"type Cell {"#,
+        #"    a: Int"#,
+        #"    b: Str"#,
+        #"}"#,
+        #""#,
         #"let GRID: List[List[Point]] = [[Point { x: 11, y: 22 }]]"#,
         #""#,
+        #"fn cell_text(c: Cell) -> Str {"#,
+        #"    "{c.a} {c.b}""#,
+        #"}"#,
+        #""#,
         #"fn main() {"#,
-        #"    io.println("values {GRID.get(0).unwrap().get(0).unwrap().y} {lib_value()}")"#,
+        #"    io.println("values {GRID.get(0).unwrap().get(0).unwrap().y} {lib_value()} {cell_text(Cell { a: 1, b: "c" })}")"#,
         #"}"#,
         #""#,
     ].join("\n"))
@@ -116,14 +126,43 @@ test "a header the scan cannot read goes into every unit whole and into its key"
     let main_text = read_file(main_c)
     let added = build_app(tree)
     let out_added = sh("{tree}/out/app")
+    // A global of a struct the program already has adds a layout block to the entry module's
+    // private header and leaves the types header as it was. Only the entry unit names it.
+    let types_before = read_file("{tree}/out/app.units/blink.types.h")
+    write_file(main_c, "{read_file(main_c)}\nlet CELLS: List[List[Cell]] = [[Cell \{ a: 4, b: \"held\" }]]\n")
+    let held = build_app(tree)
+    let types_held = read_file("{tree}/out/app.units/blink.types.h")
+    let priv_held = read_file("{tree}/out/app.units/__main__.priv.h")
+    let main_c_held = read_file("{tree}/out/app.units/__main__.c")
+    let lib_c_held = read_file("{tree}/out/app.units/lib.c")
+    // A pointer field changes Point's layout block. It changes the types header too, which
+    // every unit's key covers, so every unit compiles; the block itself reaches only the unit
+    // that names it.
+    write_file(main_c, read_file(main_c).replace("    y: Int\n", "    y: Int\n    tag: Str\n").replace("Point \{ x: 11, y: 22 }", "Point \{ x: 11, y: 22, tag: \"t\" }"))
+    let field = build_app(tree)
+    let out_field = sh("{tree}/out/app")
+    let main_c_field = read_file("{tree}/out/app.units/__main__.c")
+    let lib_c_field = read_file("{tree}/out/app.units/lib.c")
+    let field_text = read_file(main_c)
     shell_exec("rm -rf {tree}")
     assert(main_text.contains("helper_added"), "the edit did not apply: {main_text}")
     let whole = whole_headers(cold)
-    assert_eq(whole.len(), 2)
-    assert(whole.get(0).unwrap().starts_with("__main__: __main__.priv.h: a line the scan cannot read: static "), "unexpected trace: {whole.join("\n")}")
-    assert(whole.get(1).unwrap().starts_with("lib: __main__.priv.h: a line the scan cannot read: static "), "unexpected trace: {whole.join("\n")}")
-    assert(lib_c.contains("#include \"__main__.priv.h\""), "lib.c does not include the whole header:\n{lib_c}")
-    assert_eq(units_compiled(added).join(","), "__main__,lib")
-    assert_eq(out_cold, "values 22 7")
-    assert_eq(out_added, "values 22 7")
+    assert_eq(whole.join("\n"), "")
+    assert(!lib_c.contains("#include \"__main__.priv.h\""), "lib.c includes the whole header:\n{lib_c}")
+    assert_eq(units_compiled(added).join(","), "__main__")
+    assert_eq(out_cold, "values 22 7 1 c")
+    assert_eq(out_added, "values 22 7 1 c")
+
+    assert(types_held == types_before, "a global of a declared struct changed the types header")
+    assert(priv_held.contains("static BLINK_UNUSED GC_descr blink_gc_layout_Cell(void) \{"), "no Cell layout block in __main__.priv.h:\n{priv_held}")
+    assert(main_c_held.contains("blink_gc_layout_Cell()"), "__main__.c does not name the Cell layout fn:\n{main_c_held}")
+    assert_eq(lib_c_held, lib_c)
+    assert_eq(units_compiled(held).join(","), "__main__")
+    assert_eq(whole_headers(held).join("\n"), "")
+
+    assert(field_text.contains("tag: Str"), "the field edit did not apply: {field_text}")
+    assert(main_c_field.contains("offsetof(blink_Point, tag)"), "__main__.c lacks the new layout span:\n{main_c_field}")
+    assert_eq(lib_c_field, lib_c)
+    assert_eq(units_compiled(field).join(","), "__main__,lib")
+    assert_eq(out_field, "values 22 7 1 c")
 }
