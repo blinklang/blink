@@ -560,6 +560,31 @@ The `blink.toml` schema is **forward-compatible**: adding `version = "1.0"` regi
 
 Import paths follow the `org/name` structure: `import std.http` maps to the `std/http` package. Local modules shadow dependencies with the same path, with compiler warning W1000 (§10.5).
 
+#### 8.9.8 Manifest Diagnostics
+
+**Positions.** Each diagnostic about `blink.toml` gives a line and a column in `blink.toml`. The span depends on what is wrong:
+
+| Fault | Span |
+|-------|------|
+| A bad value | the value token, quotes included |
+| A bad key | the key |
+| A bad section | the `[header]` |
+
+There is no fallback position: every manifest diagnostic points at the token at fault.
+
+**Unknown sections.** A top-level section that this specification does not define is the warning `UnknownManifestSection` (W1001). §8.9.3 defines most sections, and §4.16.8 defines `[lints]`. The span is the `[header]`. When a defined section name is close to the unknown one, the help line offers it:
+
+```toml
+[dependecies]                # warning[UnknownManifestSection]: help: did you mean `[dependencies]`?
+local/utils = { path = "../utils" }
+```
+
+W1001 is a warning, so a manifest written for a newer toolchain still builds (§8.9.7). `--strict` and a `[lints]` entry can make it an error, as for any warning.
+
+A misspelled section often causes a second error later: the compiler does not see the dependencies in it. When W1001 fired in the same build, `ModuleNotFound` (E1200) and `PackageNotDeclared` (E1052) each add a `note:` that points at the unknown section.
+
+Unknown keys inside a defined section are not yet specified.
+
 ---
 
 ### 8.10 Built-in Test Runner

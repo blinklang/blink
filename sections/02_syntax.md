@@ -126,7 +126,16 @@ Holes evaluate left to right, and each hole's value is appended before the next 
 | `\u{H}` | the Unicode scalar value with hex code `H` (see *Unicode escapes* below) |
 | `\'` | literal `'` |
 
-A char literal must contain exactly one Unicode scalar value, written as one raw UTF-8 character (`'é'`, `'😀'`) or as one escape. `''` (empty) and `'ab'` (multi-char) are lexer errors. Surrogate code points (0xD800–0xDFFF) are rejected.
+A char literal must contain exactly one Unicode scalar value, written as one raw UTF-8 character (`'é'`, `'😀'`) or as one escape. Surrogate code points (0xD800–0xDFFF) are rejected. A char literal cannot span lines: its text runs from the opening `'` to the next `'` on the same line, or to the end of the line if there is none. The lexer counts the scalar values in that text:
+
+| Text | Code | Help |
+|------|------|------|
+| `''` | `EmptyCharLiteral` (E1124) | write one character between the quotes, such as `' '`; an empty `Str` is `""` |
+| `'ab'` | `MultiCharLiteral` (E1125) | a char literal holds one character; use double quotes for a `Str`: `"ab"` |
+| `'hello` with no closing `'` on the line | `MultiCharLiteral` (E1125) | same as above |
+| `'` or `'a` with no closing `'` on the line | `UnterminatedLiteral` (E1126) | close the literal with `'` |
+
+The span covers the literal's text, from the opening quote. `UnterminatedLiteral` follows the rule for unclosed literals below.
 
 **Unicode escapes (`\u{H}`).** Both `"..."` and `'...'` accept `\u{H}`, which produces the Unicode scalar value with hex code `H`:
 
@@ -145,19 +154,26 @@ let zwsp = "a\u{200b}b"           // three scalars
 - `\u{H}` is the only numeric escape. `\x..`, `\uXXXX` (no braces) and `\UXXXXXXXX` are errors in both literal kinds.
 - `blink fmt` keeps the author's spelling of `H`. Debug output always uses one spelling: lowercase hex, no leading zeros (§3.6, *Scalar debug-forms*).
 
-Each malformed escape is a lexer error in both literal kinds. Each error kind has its own registered code in the syntax diagnostic family (next to E1113). Its span covers the escape itself, not the start of the literal, and its help line shows the fix:
+Each malformed escape is a lexer error in both literal kinds. Each error kind has its own registered code in the syntax diagnostic family. Its span covers the escape itself, not the start of the literal, and its help line shows the fix:
 
-| Source | Error | Help |
-|--------|-------|------|
-| `\u{}` | empty Unicode escape | write 1 to 6 hex digits: `\u{41}` |
-| `\u{1234567}` | more than 6 hex digits | write at most 6 hex digits |
-| `\u{12g}` | `g` is not a hex digit | use only `0-9`, `a-f`, `A-F` |
-| `\u{41` | unterminated Unicode escape | close the escape with `}`: `\u{41}` |
-| `\u{d800}` | surrogate code point is not a Unicode scalar value | surrogates 0xD800–0xDFFF cannot appear in a `Char` or `Str` |
-| `\u{110000}` | value is above 0x10FFFF | the largest Unicode scalar value is `\u{10ffff}` |
-| `\u0041`, `\U0001F600` | Unicode escape needs braces | write `\u{41}`, `\u{1f600}` |
-| `\x1b` | Blink has no `\x` escape | write `\u{1b}` |
-| `"\u{0}"` | a `Str` cannot hold NUL | use `Bytes` for data that contains NUL |
+| Source | Code | Error | Help |
+|--------|------|-------|------|
+| `\u{}` | `EmptyUnicodeEscape` (E1114) | empty Unicode escape | write 1 to 6 hex digits: `\u{41}` |
+| `\u{1234567}` | `UnicodeEscapeTooLong` (E1115) | more than 6 hex digits | write at most 6 hex digits |
+| `\u{12g}` | `InvalidUnicodeEscapeDigit` (E1116) | `g` is not a hex digit | use only `0-9`, `a-f`, `A-F` |
+| `\u{41` | `UnterminatedUnicodeEscape` (E1117) | unterminated Unicode escape | close the escape with `}`: `\u{41}` |
+| `\u{d800}` | `SurrogateEscape` (E1118) | surrogate code point is not a Unicode scalar value | surrogates 0xD800–0xDFFF cannot appear in a `Char` or `Str` |
+| `\u{110000}` | `UnicodeEscapeOutOfRange` (E1119) | value is above 0x10FFFF | the largest Unicode scalar value is `\u{10ffff}` |
+| `\u0041`, `\U0001F600` | `UnicodeEscapeNeedsBraces` (E1120) | Unicode escape needs braces | write `\u{41}`, `\u{1f600}` |
+| `\x1b` | `HexEscapeNotSupported` (E1121) | Blink has no `\x` escape | write `\u{1b}` |
+| `"\u{0}"`, `"\0"` | `NulInStr` (E1122) | a `Str` cannot hold NUL | use `Bytes` for data that contains NUL |
+| `"\q"`, `'\"'`, `"\'"` | `UnknownEscape` (E1123) | the escape is not valid in this literal kind | see below |
+
+An escape that is not in the escape table for its literal kind, and that no other row covers, is `UnknownEscape`. One code serves both literal kinds. The help line lists the valid escapes for that literal kind. Where the escape has a known meaning in another language, the help gives the Blink fix first. For example, `"\d"` gets the raw string `#"\d"#`, `"\e"` gets `\u{1b}`, and `"\'"` gets a plain `'`. These examples are not normative: ERROR_CATALOG.md and `blink explain` list the cases covered, and the implementation sets the wording.
+
+**Unclosed literals.** A `"..."`, `t"..."` or `#"..."#` literal with no closer before the end of the file is `UnterminatedLiteral` (E1126). The char-literal rule above uses the same code. One code serves every literal kind. The lexer reports it, and the parser does not report an error at the end of the file for it. The primary span is the opening delimiter, with its `t` or `#` prefix. A `note:` marks where the literal ran out: the end of the file for a string, the end of the line for a char. The help line names the exact closer to write: `'`, `"`, or `"` followed by as many `#` as the opening delimiter has.
+
+**Recovery.** No `@allow`, `[lints]` entry or `--strict` setting suppresses or demotes a lexer error. After an error the lexer still emits the literal's token: it drops a malformed escape, and a bad char literal becomes U+FFFD. Then it keeps lexing, so one run reports every lexer error in the file, and the compiler exits non-zero. Recovery must not cause a follow-on diagnostic: one bad literal gives exactly one diagnostic, and a dropped escape or a U+FFFD `Char` never causes a type error. Errors elsewhere in the file are still reported.
 
 **Template literals.** A `t` before a string literal makes a template literal: in `db.query_one(t"SELECT * FROM users WHERE id = {id}")`, the compiler keeps `{id}` apart from the text as a bound value and does not concatenate it. A plain `"..."` literal is always a `Str`, whatever type the site expects. See §2.4.3 and §3b.5.
 
