@@ -1,0 +1,74 @@
+// The LSP speaks over stdout, so a byte on stdout outside a Content-Length frame breaks the
+// client's stream. A local module that shadows a dependency gives a warning while the LSP loads
+// the imports; it must reach the client as a published W1000 row inside a frame, never as text on
+// stdout. The fixture lives under a fresh temporary directory, since the test tree itself sits
+// inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn setup(dir: Str) {
+    let _ = sh("rm -rf {dir}; mkdir -p {dir}/src {dir}/dep/src")
+    write_file("{dir}/dep/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/dep/src/mylib.bl", "pub fn greet() -> Str \{ \"dep\" }\n")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n\n[[package]]\nname = \"mylib\"\nversion = \"0.1.0\"\nsource = \"path:{dir}/dep\"\nhash = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\n")
+    write_file("{dir}/src/mylib.bl", "pub fn greet() -> Str \{ \"local\" }\n")
+    write_file("{dir}/src/main.bl", "import mylib\n\nfn main() \{\n    io.println(mylib.greet())\n}\n")
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+// The LSP stdout of: initialize, open src/main.bl, wait for its diagnostics, shut down.
+fn via_lsp(dir: Str) -> Str {
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let open = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://src/main.bl\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    write_file("{dir}/open.bin", init.concat(open))
+    write_file("{dir}/end.bin", shutdown.concat(exit_msg))
+    let _ = sh("B=$(pwd)/build/blink; cd {dir} && ( cat open.bin; for i in $(seq 1 400); do grep -q published lsp.err 2>/dev/null && break; sleep 0.05; done; cat end.bin ) | timeout 60 $B lsp > lsp.out 2> lsp.err")
+    read_file("{dir}/lsp.out")
+}
+
+// The frame bodies in out, in order, or None if any byte falls outside a frame.
+fn frames(out: Str) -> Option[List[Str]] {
+    let head = "Content-Length: "
+    let mut bodies: List[Str] = []
+    let mut at = 0
+    while at < out.byte_len() {
+        if !out.byte_slice(at, out.byte_len()).starts_with(head) { return None }
+        let len_start = at + head.byte_len()
+        let len_end = out.byte_index_of("\r\n\r\n", len_start)?
+        let n = out.byte_slice(len_start, len_end).to_int()
+        let body_start = len_end + 4
+        if body_start + n > out.byte_len() { return None }
+        bodies.push(out.byte_slice(body_start, body_start + n))
+        at = body_start + n
+    }
+    Some(bodies)
+}
+
+test "the lsp writes only frames on stdout and publishes W1000 when a local module shadows a dependency" {
+    let dir = sh("mktemp -d /tmp/blink_lsp_frames_w1000.XXXXXX").out.trim()
+    setup(dir)
+    let out = via_lsp(dir)
+    let _ = sh("rm -rf {dir}")
+
+    let bodies = frames(out)
+    if bodies.is_none() { io.eprintln("lsp stdout is not a run of frames:\n{out}") }
+    assert(bodies.is_some())
+    let mut published = 0
+    for b in bodies ?? [] {
+        if b.contains("textDocument/publishDiagnostics") && b.contains("\"code\":\"W1000\"") {
+            published = published + 1
+        }
+    }
+    assert_eq(published, 1)
+    assert(!out.contains("warning[W1000]"))
+}
