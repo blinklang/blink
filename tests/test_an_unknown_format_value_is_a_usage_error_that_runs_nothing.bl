@@ -1,0 +1,56 @@
+// A `--format` value the command does not know is a usage error: the command prints on stderr
+// what the valid values are, exits 1, and does nothing else. It checks, builds and formats
+// nothing, so no diagnostic of the file shows up and no file is written. Under `check --json`
+// the JSON status line still goes to stdout, as for every check that fails before it checks.
+// The commands run in a fresh temporary directory, since the test tree itself sits inside a
+// project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+let MESSY = "fn main()   \{\n  io.println(\"hi\")\n}\n"
+
+fn scratch() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_unknown_format.XXXXXX").out.trim()
+    write_file("{dir}/ok.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/err.bl", "fn main() \{\n    let x: Int = \"s\"\n    io.println(\"\{x}\")\n}\n")
+    write_file("{dir}/messy.bl", MESSY)
+    dir
+}
+
+fn run_in(dir: Str, cmd: Str) -> ProcessResult {
+    sh("R=$(pwd); cd {dir} && timeout 120 {cmd}")
+}
+
+// What is wrong with the result of an unknown --format value, or "".
+fn rejected(label: Str, r: ProcessResult, out: Str, text: Str) -> Str {
+    if r.exit_code != 1 { return "`{label}` exited {r.exit_code}, not 1\nstdout:\n{r.out}\nstderr:\n{r.err_out}" }
+    if r.out != out { return "`{label}` stdout is not `{out}`:\n{r.out}" }
+    if !r.err_out.contains(text) { return "`{label}` stderr has no `{text}`:\n{r.err_out}" }
+    if r.err_out.contains("E0300") || r.err_out.contains("TypeError") { return "`{label}` checked the file:\n{r.err_out}" }
+    ""
+}
+
+test "an unknown --format value on check, build, fmt and blinkc exits 1 with the valid values" {
+    let dir = scratch()
+    let check_msg = "error: --format must be json, got 'xyz'"
+    let mut wrong: List[Str] = []
+    wrong.push(rejected("check --format xyz err.bl", run_in(dir, "$R/build/blink check --format xyz err.bl"), "", check_msg))
+    wrong.push(rejected("check --format human ok.bl", run_in(dir, "$R/build/blink check --format human ok.bl"), "", "error: --format must be json, got 'human'"))
+    wrong.push(rejected("check err.bl --format xyz", run_in(dir, "$R/build/blink check err.bl --format xyz"), "", check_msg))
+    wrong.push(rejected("check --json --format xyz err.bl", run_in(dir, "$R/build/blink check --json --format xyz err.bl"), "\{\"status\":\"error\",\"file\":\"err.bl\"}\n", check_msg))
+    wrong.push(rejected("build --format xyz err.bl", run_in(dir, "$R/build/blink build --format xyz err.bl -o out"), "", "error: --format must be json or blink, got 'xyz'"))
+    wrong.push(rejected("fmt --format xyz messy.bl", run_in(dir, "$R/build/blink fmt --format xyz messy.bl"), "", check_msg))
+    wrong.push(rejected("fmt --check --format xyz messy.bl", run_in(dir, "$R/build/blink fmt --check --format xyz messy.bl"), "", check_msg))
+    wrong.push(rejected("blinkc --format xyz", run_in(dir, "$R/build/blinkc err.bl out.c --format xyz"), "", check_msg))
+    let built = sh("ls {dir}").out
+    let messy_after = read_file("{dir}/messy.bl")
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(built.trim(), "err.bl\nmessy.bl\nok.bl")
+    assert_eq(messy_after, MESSY)
+}

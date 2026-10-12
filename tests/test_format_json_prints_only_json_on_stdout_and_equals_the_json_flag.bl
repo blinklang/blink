@@ -1,0 +1,122 @@
+// `--format json` is the machine-readable form of a command, and `--json` is its short form:
+// the two give the same bytes on stdout and stderr and the same exit code. Each line on stdout
+// is a JSON object, so a tool can parse stdout line by line; `blink check` gives its status
+// row there for a clean file, a file with an error, and a file with only a warning. The
+// commands run in a fresh temporary directory, since the test tree itself sits inside a
+// project.
+
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn scratch() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_format_json.XXXXXX").out.trim()
+    write_file("{dir}/ok.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/err.bl", "fn main() \{\n    let x: Int = \"s\"\n    io.println(\"\{x}\")\n}\n")
+    write_file("{dir}/warn.bl", "fn main() \{\n    let x = 1\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/messy.bl", "fn main()   \{\n  io.println(\"hi\")\n}\n")
+    dir
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+// What on text is not a JSON object per line, or "".
+fn not_json_lines(label: Str, text: Str) -> Str {
+    for line in text.split("\n") {
+        if line == "" { continue }
+        json_clear()
+        if !line.starts_with("\{") || !line.ends_with("}") || json_parse(line) < 0 {
+            return "{label}: a line is not JSON: `{line}`\nall:\n{text}"
+        }
+    }
+    ""
+}
+
+// The status of the one line on stdout that has a "status" field and names file, or "".
+fn status_row(out: Str, file: Str) -> Str {
+    let mut found = ""
+    for line in out.split("\n") {
+        if line == "" { continue }
+        json_clear()
+        let root = json_parse(line)
+        if root < 0 { continue }
+        let status = json_as_str(json_get(root, "status"))
+        if status != "" && json_as_str(json_get(root, "file")) == file {
+            found = status
+        }
+    }
+    found
+}
+
+// The first difference between two results, or "".
+fn differ(label: Str, a: ProcessResult, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "{label}: exit {a.exit_code} vs {b.exit_code}" }
+    if a.out != b.out { return "{label}: stdout:\n{a.out}\n-- vs --json --\n{b.out}" }
+    if a.err_out != b.err_out { return "{label}: stderr:\n{a.err_out}\n-- vs --json --\n{b.err_out}" }
+    ""
+}
+
+test "check --format json prints the status row as JSON for a clean file, an error and a warning" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for c in [("ok.bl", "ok", 0), ("err.bl", "error", 1), ("warn.bl", "ok", 0)] {
+        let (file, want, code) = c
+        let r = blink_in(dir, "check --format json {file}")
+        if r.exit_code != code { wrong.push("check {file}: exit {r.exit_code}, not {code}") }
+        wrong.push(not_json_lines("check {file} stdout", r.out))
+        wrong.push(not_json_lines("check {file} stderr", r.err_out))
+        let got = status_row(r.out, file)
+        if got != want { wrong.push("check {file}: status row `{got}`, not `{want}`; stdout:\n{r.out}") }
+    }
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "check --format json and check --json print the same bytes" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for file in ["ok.bl", "err.bl", "warn.bl"] {
+        let f = blink_in(dir, "check --format json {file}")
+        let j = blink_in(dir, "check --json {file}")
+        wrong.push(differ("check {file}", f, j))
+    }
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "build --format json and build --json print the same bytes and only JSON on stdout" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for file in ["ok.bl", "err.bl"] {
+        let f = blink_in(dir, "build --format json {file} -o out")
+        let j = blink_in(dir, "build --json {file} -o out")
+        wrong.push(differ("build {file}", f, j))
+        wrong.push(not_json_lines("build {file} stdout", f.out))
+        if f.out == "" { wrong.push("build {file}: no status row on stdout") }
+    }
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "fmt --check --format json and fmt --check --json print the same bytes and only JSON on stdout" {
+    let dir = scratch()
+    let mut wrong: List[Str] = []
+    for file in ["ok.bl", "messy.bl"] {
+        let f = blink_in(dir, "fmt --check --format json {file}")
+        let j = blink_in(dir, "fmt --check --json {file}")
+        wrong.push(differ("fmt --check {file}", f, j))
+        wrong.push(not_json_lines("fmt --check {file} stdout", f.out))
+        if f.out == "" { wrong.push("fmt --check {file}: nothing on stdout") }
+    }
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
