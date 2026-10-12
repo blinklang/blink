@@ -1,0 +1,194 @@
+// `p.offset(i)` on an `alloc_n` region steps by the pointee for every pointee C gives a size:
+// the sized integers, `Int`, `Float` and a pointer (sections/07_trust_modules_metadata.md:481,
+// :1037-1039). Each row writes every cell through an offset pointer and reads each back, so
+// a step of the wrong width lands two cells on one address and a read sees the other's value.
+// The address rows pin the step itself: one cell is `sizeof` the C pointee, not one byte.
+
+@ffi("pipe", header: "unistd.h")
+@trusted(audit: "Wraps pipe(2) on a two-cell alloc_n region.")
+fn ptr_offset_pipe(fds: Ptr[I32]) -> I32 ! FFI {}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "Closes a descriptor that pipe(2) opened.")
+fn ptr_offset_close(fd: I32) -> I32 ! FFI {}
+
+@trusted(audit: "test: walk an I32 region")
+fn walk_i32() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[I32](4)
+        let mut i = 0
+        while i < 4 {
+            p.offset(i).write((100 + i).to_i32())
+            i = i + 1
+        }
+        let mut sum = 0
+        i = 0
+        while i < 4 {
+            sum = sum * 1000 + p.offset(i).deref().to_int()
+            i = i + 1
+        }
+        sum
+    }
+}
+
+@trusted(audit: "test: step width of an I32 region")
+fn step_i32() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[I32](3)
+        p.offset(2).addr() - p.addr()
+    }
+}
+
+@trusted(audit: "test: walk a U8 region")
+fn walk_u8() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[U8](3)
+        p.offset(0).write(7.to_u8())
+        p.offset(1).write(200.to_u8())
+        p.offset(2).write(9.to_u8())
+        p.deref().to_int() * 1000000 + p.offset(1).deref().to_int() * 1000 + p.offset(2).deref().to_int()
+    }
+}
+
+@trusted(audit: "test: step width of a U8 region")
+fn step_u8() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[U8](3)
+        p.offset(2).addr() - p.addr()
+    }
+}
+
+@trusted(audit: "test: walk an I16 region")
+fn walk_i16() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[I16](2)
+        p.offset(0).write((-3).to_i16())
+        p.offset(1).write((30000).to_i16())
+        p.deref().to_int() + p.offset(1).deref().to_int()
+    }
+}
+
+@trusted(audit: "test: step width of a U16 region")
+fn step_u16() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[U16](3)
+        p.offset(2).addr() - p.addr()
+    }
+}
+
+@trusted(audit: "test: walk a U32 region")
+fn walk_u32() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[U32](2)
+        p.offset(1).write(4000000000.to_u32())
+        p.offset(0).write(1.to_u32())
+        p.deref().to_int() + p.offset(1).deref().to_int()
+    }
+}
+
+@trusted(audit: "test: walk a U64 region")
+fn walk_u64() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[U64](2)
+        p.offset(1).write(5.to_u64())
+        p.offset(0).write(6.to_u64())
+        p.offset(1).addr() - p.addr() + p.deref().to_int() * 100 + p.offset(1).deref().to_int() * 10
+    }
+}
+
+@trusted(audit: "test: walk an Int region")
+fn walk_int() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[Int](3)
+        p.offset(2).write(-9)
+        p.offset(1).write(1 << 40)
+        p.offset(0).write(5)
+        p.deref() + p.offset(1).deref() + p.offset(2).deref()
+    }
+}
+
+@trusted(audit: "test: walk a Float region")
+fn walk_float() -> Float ! FFI {
+    with ffi.scope() as scope {
+        let p = scope.alloc_n[Float](2)
+        p.offset(1).write(2.25)
+        p.offset(0).write(0.5)
+        p.deref() + p.offset(1).deref() * 10.0
+    }
+}
+
+@trusted(audit: "test: walk a region of pointers")
+fn walk_ptr() -> Int ! FFI {
+    with ffi.scope() as scope {
+        let cells = scope.alloc_n[I32](2)
+        cells.write((11).to_i32())
+        cells.offset(1).write((22).to_i32())
+        let ptrs = scope.alloc_n[Ptr[I32]](2)
+        ptrs.offset(0).write(cells.offset(1))
+        ptrs.offset(1).write(cells)
+        let width = ptrs.offset(1).addr() - ptrs.addr()
+        width * 10000 + ptrs.deref().deref().to_int() * 100 + ptrs.offset(1).deref().deref().to_int()
+    }
+}
+
+@trusted(audit: "test: read both descriptors pipe(2) fills")
+fn pipe_ends_differ() -> Bool ! FFI {
+    with ffi.scope() as scope {
+        let fds = scope.alloc_n[I32](2)
+        if ptr_offset_pipe(fds).to_int() != 0 { return false }
+        let r = fds.deref()
+        let w = fds.offset(1).deref()
+        let ok = r.to_int() >= 0 && w.to_int() >= 0 && r.to_int() != w.to_int()
+        let _ = ptr_offset_close(r)
+        let _ = ptr_offset_close(w)
+        ok
+    }
+}
+
+test "an I32 region is written and read cell by cell through offset" {
+    assert_eq(walk_i32(), 100101102103)
+}
+
+test "an I32 offset steps by four bytes a cell" {
+    assert_eq(step_i32(), 8)
+}
+
+test "a U8 region keeps each cell apart" {
+    assert_eq(walk_u8(), 7200009)
+}
+
+test "a U8 offset steps by one byte a cell" {
+    assert_eq(step_u8(), 2)
+}
+
+test "an I16 region keeps sign and each cell apart" {
+    assert_eq(walk_i16(), 29997)
+}
+
+test "a U16 offset steps by two bytes a cell" {
+    assert_eq(step_u16(), 4)
+}
+
+test "a U32 region holds values past the I32 range in each cell" {
+    assert_eq(walk_u32(), 4000000001)
+}
+
+test "a U64 offset steps by eight bytes and keeps each cell apart" {
+    assert_eq(walk_u64(), 8 + 600 + 50)
+}
+
+test "an Int region keeps full width in each cell" {
+    assert_eq(walk_int(), 5 + (1 << 40) - 9)
+}
+
+test "a Float region keeps each cell apart" {
+    assert_eq(walk_float(), 23.0)
+}
+
+test "a region of pointers steps by a pointer and each cell reads back its own target" {
+    assert_eq(walk_ptr(), 8 * 10000 + 22 * 100 + 11)
+}
+
+test "both descriptors pipe(2) writes are read through offset" {
+    assert(pipe_ends_differ())
+}

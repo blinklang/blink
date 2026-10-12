@@ -1,0 +1,92 @@
+// Which pointees give `Ptr.offset(i)` a stride. The spec writes `offset` over any `Ptr[T]`
+// of an `alloc_n` region with the C mapping `ptr + i` (sections/07_trust_modules_metadata.md:481,
+// :1037-1039), so every pointee C gives a size steps by it: the sized integers, `Int`,
+// `Float`, a pointer, and an `@ffi.struct`. E0838 stays for the pointees with no size the
+// spec fixes for a step: `Void` (C has no `sizeof(void)`), an `@ffi.opaque` handle, and a
+// type parameter, which has no C type until an instance names one.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PROBE = "build/tc_ptr_offset_stride_kind_probe.bl"
+
+let POLLFD = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\ntype Pollfd \{ fd: I32, events: I16, revents: I16 }\n"
+
+fn compile_probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    write_file(PROBE, src)
+    diag_reset()
+    let program = compile_to_program(PROBE, 0)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", PROBE])
+}
+
+fn error_lines() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name} {d.code}: {d.message}") }
+    }
+    out
+}
+
+fn count_stride_errors() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == "FfiOffsetUnknownStride" && d.code == "E0838" { n = n + 1 }
+    }
+    n
+}
+
+// Failures report on stderr: a failing assert aborts and drops buffered stdout.
+fn assert_steps(pointee: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("{POLLFD}@trusted(audit: \"probe\")\nfn main() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[{pointee}] = scope.alloc_n(3)\n let c = p.offset(1)\n let _n = c.is_null()\n } }\n")
+    let errs = error_lines()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: offset over Ptr[{pointee}]: unexpected diagnostics:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn assert_stride_rejected(label: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe(src)
+    let n = count_stride_errors()
+    if n != 1 {
+        io.eprintln("FAIL: {label}: want exactly one E0838 FfiOffsetUnknownStride, got:")
+        for e in error_lines() { io.eprintln("  {e}") }
+    }
+    assert(n == 1)
+}
+
+test "every sized integer pointee has a stride" {
+    for k in ["I8", "I16", "I32", "U8", "U16", "U32", "U64"] { assert_steps(k) }
+}
+
+test "an Int and a Float pointee have a stride" {
+    assert_steps("Int")
+    assert_steps("Float")
+}
+
+test "a pointer pointee has a stride" {
+    assert_steps("Ptr[I32]")
+    assert_steps("Ptr[Void]")
+}
+
+test "an @ffi.struct pointee still has a stride" {
+    assert_steps("Pollfd")
+}
+
+test "a Void pointee has no stride" {
+    assert_stride_rejected("offset over Ptr[Void]",
+        "@trusted(audit: \"probe\")\nfn main() ! FFI \{\n let p: Ptr[Void] = null_ptr[Void]()\n let _c = p.offset(1)\n }\n")
+}
+
+test "an @ffi.opaque pointee has no stride" {
+    assert_stride_rejected("offset over Ptr[CFile]",
+        "@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n@trusted(audit: \"probe\")\nfn main() ! FFI \{ with ffi.scope() as scope \{\n let p: Ptr[CFile] = scope.alloc_n(2)\n let _c = p.offset(1)\n } }\n")
+}
+
+test "a type parameter pointee has no stride" {
+    assert_stride_rejected("offset over Ptr[T]",
+        "@trusted(audit: \"probe\")\nfn step[T](p: Ptr[T]) -> Ptr[T] ! FFI \{ p.offset(1) }\nfn main() \{ }\n")
+}
