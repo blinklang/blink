@@ -1,5 +1,5 @@
 import tokens.{Token, TokenKind, keyword_lookup}
-import diagnostics.{Diag, diag_error_range, UNEXPECTED_CHARACTER}
+import diagnostics.{Diag, diag_error_range, diag_error_span_notes, diag_cut_after, UNEXPECTED_CHARACTER, EMPTY_UNICODE_ESCAPE, UNICODE_ESCAPE_TOO_LONG, INVALID_UNICODE_ESCAPE_DIGIT, UNTERMINATED_UNICODE_ESCAPE, SURROGATE_ESCAPE, UNICODE_ESCAPE_OUT_OF_RANGE, UNICODE_ESCAPE_NEEDS_BRACES, HEX_ESCAPE_NOT_SUPPORTED, NUL_IN_STR, UNKNOWN_ESCAPE, EMPTY_CHAR_LITERAL, MULTI_CHAR_LITERAL, UNTERMINATED_LITERAL}
 import std.str.{str_from_code_point}
 import ast.{trace, trace_mode}
 
@@ -65,6 +65,19 @@ let CH_BACKSPACE = 8
 let CH_FORMFEED = 12
 let CH_CARET = 94
 let CH_TILDE = 126
+let CH_DOLLAR = 36
+let CH_D = 68
+let CH_F = 70
+let CH_S = 83
+let CH_U = 85
+let CH_W = 87
+let CH_d = 100
+let CH_e = 101
+let CH_s = 115
+let CH_u = 117
+let CH_v = 118
+let CH_w = 119
+let CH_x = 120
 
 // ── Character classification ─────────────────────────────────────────
 
@@ -123,18 +136,26 @@ fn char_text(source: Str, pos: Int, end: Int) -> Str {
     "\\x".concat(digits.byte_slice(b / 16, b / 16 + 1)).concat(digits.byte_slice(b % 16, b % 16 + 1))
 }
 
-// ` (U+XXXX)` for a multi-byte character at pos..end, so a diagnostic names a character that
-// may not render; empty for ASCII and for a byte that is not UTF-8.
-fn codepoint_label(source: Str, pos: Int, end: Int) -> Str {
+// The scalar value of the character at pos..end, which codepoint_end bounded. A byte that is
+// not UTF-8 decodes to itself.
+fn decode_codepoint(source: Str, pos: Int, end: Int) -> Int {
     let w = end - pos
-    if w < 2 { return "" }
     let b = source.byte_at(pos).to_int()
+    if w < 2 { return b }
     let mut cp = if w == 2 { b % 32 } else if w == 3 { b % 16 } else { b % 8 }
     let mut k = 1
     while k < w {
         cp = cp * 64 + source.byte_at(pos + k).to_int() % 64
         k = k + 1
     }
+    cp
+}
+
+// ` (U+XXXX)` for a multi-byte character at pos..end, so a diagnostic names a character that
+// may not render; empty for ASCII and for a byte that is not UTF-8.
+fn codepoint_label(source: Str, pos: Int, end: Int) -> Str {
+    if end - pos < 2 { return "" }
+    let mut cp = decode_codepoint(source, pos, end)
     let digits = "0123456789ABCDEF"
     let mut hex = ""
     while cp > 0 || hex.len() < 4 {
@@ -146,6 +167,215 @@ fn codepoint_label(source: Str, pos: Int, end: Int) -> Str {
 
 fn peek_at(source: Str, source_len: Int, scan_pos: Int, offset: Int) -> Int {
     peek(source, source_len, scan_pos + offset)
+}
+
+// ── Escapes ──────────────────────────────────────────────────────────
+
+// One backslash escape in a string or char literal. A malformed escape still has an end, so
+// the lexer reports it and goes on after it (sections/02_syntax.md §2.4, "Recovery").
+type Escape {
+    // Offset just past the escape. For an error, the span of the escape ends here too.
+    end: Int
+    // The scalar value the escape writes, or -1 when it writes nothing.
+    cp: Int
+    // All four are "" for a valid escape.
+    name: Str
+    code: Str
+    message: Str
+    help: Str
+}
+
+fn escape_ok(end: Int, cp: Int) -> Escape {
+    Escape { end: end, cp: cp, name: "", code: "", message: "", help: "" }
+}
+
+fn escape_error(end: Int, cp: Int, name: Str, code: Str, message: Str, help: Str) -> Escape {
+    Escape { end: end, cp: cp, name: name, code: code, message: message, help: help }
+}
+
+fn is_hex(c: Int) -> Bool {
+    is_digit(c) || (c >= CH_a && c <= CH_f) || (c >= CH_A && c <= CH_F)
+}
+
+fn hex_value(c: Int) -> Int {
+    if is_digit(c) { return c - CH_0 }
+    if c >= CH_a { return c - CH_a + 10 }
+    c - CH_A + 10
+}
+
+// The one spelling a help writes for the hex digits an author gave: lowercase, no leading zeros.
+fn hex_spelling(digits: Str) -> Str {
+    let mut sb = StringBuilder.new()
+    let mut i = 0
+    while i < digits.byte_len() {
+        let c = digits.byte_at(i).to_int()
+        if sb.len() > 0 || c != CH_0 {
+            sb.write(if c >= CH_A && c <= CH_F { str_from_code_point(c + 32) } else { digits.byte_slice(i, i + 1) })
+        }
+        i = i + 1
+    }
+    if sb.len() == 0 { "0" } else { sb.to_str() }
+}
+
+// The escape at pos, a backslash with at least one character before limit after it. A
+// numeric escape reads no further than limit, which is the end of a char literal's text.
+fn scan_escape(source: Str, source_len: Int, pos: Int, limit: Int, in_char: Bool) -> Escape {
+    let esc = peek(source, source_len, pos + 1)
+    if esc == CH_n { return escape_ok(pos + 2, 10) }
+    if esc == CH_r { return escape_ok(pos + 2, 13) }
+    if esc == CH_t { return escape_ok(pos + 2, 9) }
+    if esc == CH_BACKSLASH { return escape_ok(pos + 2, 92) }
+    if esc == CH_b { return escape_ok(pos + 2, CH_BACKSPACE) }
+    if esc == CH_f { return escape_ok(pos + 2, CH_FORMFEED) }
+    if in_char {
+        if esc == CH_SQUOTE { return escape_ok(pos + 2, CH_SQUOTE) }
+        if esc == CH_0 { return escape_ok(pos + 2, 0) }
+    } else {
+        if esc == CH_DQUOTE { return escape_ok(pos + 2, CH_DQUOTE) }
+        if esc == CH_LBRACE { return escape_ok(pos + 2, CH_LBRACE) }
+        if esc == CH_RBRACE { return escape_ok(pos + 2, CH_RBRACE) }
+    }
+    if esc == CH_u && peek(source, source_len, pos + 2) == CH_LBRACE {
+        return scan_unicode_escape(source, source_len, pos, limit, in_char)
+    }
+    if esc == CH_u || esc == CH_U || esc == CH_x {
+        let max = if esc == CH_u { 4 } else if esc == CH_U { 8 } else { 2 }
+        let mut end = pos + 2
+        while end < limit && end - pos - 2 < max && is_hex(peek(source, source_len, end)) {
+            end = end + 1
+        }
+        let digits = source.byte_slice(pos + 2, end)
+        let fix = if digits == "" { "`\\u\{H\}` with 1 to 6 hex digits, such as `\\u\{41\}`" } else { "`\\u\{{hex_spelling(digits)}\}`" }
+        if esc == CH_x {
+            return escape_error(end, -1, "HexEscapeNotSupported", HEX_ESCAPE_NOT_SUPPORTED, "Blink has no `\\x` escape", "write {fix}")
+        }
+        return escape_error(end, -1, "UnicodeEscapeNeedsBraces", UNICODE_ESCAPE_NEEDS_BRACES, "Unicode escape needs braces", "write {fix}")
+    }
+    if esc == CH_0 {
+        return escape_error(pos + 2, -1, "NulInStr", NUL_IN_STR, "a `Str` cannot hold NUL", "use `Bytes` for data that contains NUL")
+    }
+    // Recovery drops the whole malformed escape, the escaped character with its backslash.
+    let esc_end = codepoint_end(source, source_len, pos + 1)
+    let text = char_text(source, pos + 1, esc_end)
+    let kind = if in_char { "char" } else { "string" }
+    escape_error(esc_end, -1, "UnknownEscape", UNKNOWN_ESCAPE,
+        "unknown escape sequence '\\{text}'{codepoint_label(source, pos + 1, esc_end)} in a {kind} literal",
+        unknown_escape_help(esc, in_char, text))
+}
+
+// `\u{H}`, with pos at the backslash and `{` two characters after it. The text between the
+// braces ends at the first character that cannot be part of it, so a missing `}` costs no
+// more than the digits before that point.
+fn scan_unicode_escape(source: Str, source_len: Int, pos: Int, limit: Int, in_char: Bool) -> Escape {
+    let start = pos + 3
+    let mut end = start
+    while end < limit {
+        let c = peek(source, source_len, end)
+        if c == CH_RBRACE || c == CH_LBRACE || c == CH_DQUOTE || c == CH_SQUOTE || c == CH_BACKSLASH || c == CH_NEWLINE || is_whitespace(c) {
+            break
+        }
+        end = codepoint_end(source, source_len, end)
+    }
+    let closed = end < limit && peek(source, source_len, end) == CH_RBRACE
+    let span_end = if closed { end + 1 } else { end }
+    let mut q = start
+    while q < end && is_hex(peek(source, source_len, q)) {
+        q = q + 1
+    }
+    if q < end {
+        let bad = char_text(source, q, codepoint_end(source, source_len, q))
+        return escape_error(span_end, -1, "InvalidUnicodeEscapeDigit", INVALID_UNICODE_ESCAPE_DIGIT, "`{bad}` is not a hex digit", "use only `0-9`, `a-f`, `A-F`")
+    }
+    let digits = source.byte_slice(start, end)
+    if !closed {
+        let fix = if digits == "" { "41" } else { digits }
+        return escape_error(span_end, -1, "UnterminatedUnicodeEscape", UNTERMINATED_UNICODE_ESCAPE, "unterminated Unicode escape", "close the escape with `\}`: `\\u\{{fix}\}`")
+    }
+    if digits == "" {
+        return escape_error(span_end, -1, "EmptyUnicodeEscape", EMPTY_UNICODE_ESCAPE, "empty Unicode escape", "write 1 to 6 hex digits: `\\u\{41\}`")
+    }
+    if digits.byte_len() > 6 {
+        return escape_error(span_end, -1, "UnicodeEscapeTooLong", UNICODE_ESCAPE_TOO_LONG, "more than 6 hex digits", "write at most 6 hex digits")
+    }
+    let mut value = 0
+    let mut i = 0
+    while i < digits.byte_len() {
+        value = value * 16 + hex_value(digits.byte_at(i).to_int())
+        i = i + 1
+    }
+    if value >= 55296 && value <= 57343 {
+        return escape_error(span_end, -1, "SurrogateEscape", SURROGATE_ESCAPE, "surrogate code point is not a Unicode scalar value", "surrogates 0xD800–0xDFFF cannot appear in a `Char` or `Str`")
+    }
+    if value > 1114111 {
+        return escape_error(span_end, -1, "UnicodeEscapeOutOfRange", UNICODE_ESCAPE_OUT_OF_RANGE, "value is above 0x10FFFF", "the largest Unicode scalar value is `\\u\{10ffff\}`")
+    }
+    if value == 0 && !in_char {
+        return escape_error(span_end, -1, "NulInStr", NUL_IN_STR, "a `Str` cannot hold NUL", "use `Bytes` for data that contains NUL")
+    }
+    escape_ok(span_end, value)
+}
+
+// The help for an unknown escape. Where the escape means something in another language, the
+// Blink fix comes first, on a line of its own; the valid escapes for the literal kind follow.
+fn unknown_escape_help(esc: Int, in_char: Bool, text: Str) -> Str {
+    let valid = if in_char {
+        "valid escapes in a char literal: \\n \\r \\t \\\\ \\b \\f \\0 \\u\{H\} \\'"
+    } else {
+        "valid escapes in a string literal: \\n \\r \\t \\\\ \\b \\f \\u\{H\} \\\" \\\{ \\\}"
+    }
+    let first = if esc == CH_e {
+        "write `\\u\{1b\}` for ESC"
+    } else if esc == CH_a {
+        "write `\\u\{7\}` for BEL"
+    } else if esc == CH_v {
+        "write `\\u\{b\}` for a vertical tab"
+    } else if !in_char && esc == CH_SQUOTE {
+        "write a plain `'`: a string literal needs no escape for it"
+    } else if in_char && esc == CH_DQUOTE {
+        "write a plain `\"`: `'\"'`"
+    } else if !in_char && is_regex_escape(esc) {
+        "for a regex, use a raw string, where `\\` is literal: `#\"\\{text}\"#`"
+    } else {
+        ""
+    }
+    if first == "" { valid } else { "{first}\n{valid}" }
+}
+
+// A letter or symbol that a backslash escapes in a regex and not in a Blink string.
+fn is_regex_escape(c: Int) -> Bool {
+    if c == CH_d || c == CH_D || c == CH_w || c == CH_W || c == CH_s || c == CH_S { return true }
+    if c == CH_DOT || c == CH_LPAREN || c == CH_RPAREN || c == CH_LBRACKET || c == CH_RBRACKET { return true }
+    c == CH_PLUS || c == CH_STAR || c == CH_QUESTION || c == CH_PIPE || c == CH_CARET || c == CH_DOLLAR
+}
+
+// The text of a char literal written as a Str literal, for the MultiCharLiteral help: a quote
+// the Str would end at, or a brace it would read as interpolation, gets its backslash, and
+// `\'`, which a Str does not accept, loses its own.
+fn char_text_as_str(text: Str) -> Str {
+    let mut sb = StringBuilder.new()
+    sb.write("\"")
+    let mut i = 0
+    while i < text.byte_len() {
+        let c = text.byte_at(i).to_int()
+        if c == CH_BACKSLASH && i + 1 < text.byte_len() {
+            let n = text.byte_at(i + 1).to_int()
+            if n == CH_SQUOTE { sb.write("'") } else { sb.write(text.byte_slice(i, i + 2)) }
+            i = i + 2
+            continue
+        }
+        if c == CH_DQUOTE {
+            sb.write("\\\"")
+        } else if c == CH_LBRACE {
+            sb.write("\\\{")
+        } else if c == CH_RBRACE {
+            sb.write("\\}")
+        } else {
+            sb.write(text.byte_slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    sb.write("\"")
+    sb.to_str()
 }
 
 // ── Lexer output: module-level columns ────────────────────────────────
@@ -203,6 +433,11 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
     let mut mode_stack: List[Int] = []
     let mut brace_depth_stack: List[Int] = []
     let mut string_depth_stack: List[Int] = []
+    // Where each open string's delimiter starts, prefix included, and how wide it is, for the
+    // UnterminatedLiteral span when the file ends inside the string.
+    let mut string_open_lines: List[Int] = []
+    let mut string_open_cols: List[Int] = []
+    let mut string_open_widths: List[Int] = []
     mode_stack.push(MODE_NORMAL)
     brace_depth_stack.push(0)
 
@@ -305,66 +540,94 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                 let t_col = col
                 scan_pos = scan_pos + 1
                 col = col + 1
+                // `t"` lexes as the identifier `t` right before the quote; the span of an
+                // unclosed template starts at the `t`.
+                let n_tok = tokens.kinds.len()
+                let templ = n_tok > 0 && tokens.kinds.get(n_tok - 1).unwrap() == TokenKind.Ident && tokens.values.get(n_tok - 1).unwrap() == "t" && tokens.lines.get(n_tok - 1).unwrap() == t_line && tokens.end_cols.get(n_tok - 1).unwrap() == t_col
                 push_tok(TokenKind.StringStart, "\"", t_line, t_col, col)
                 _last_kind = TokenKind.StringStart
                 mode_stack.push(MODE_STRING)
                 brace_depth_stack.push(0)
                 string_depth_stack.push(0)
+                string_open_lines.push(t_line)
+                string_open_cols.push(if templ { t_col - 1 } else { t_col })
+                string_open_widths.push(if templ { 2 } else { 1 })
                 string_buf.clear()
                 continue
             }
 
-            // Char literal: 'x'
+            // Char literal: 'x'. It cannot span lines: its text runs to the next `'` on the
+            // line, or to the end of the line, and the lexer counts the scalars in that text
+            // before it reads any of them (sections/02_syntax.md §2.4). Every outcome is one
+            // CharLit token, U+FFFD after an error, so the parser sees an expression either way.
             if ch == CH_SQUOTE {
                 let t_line = line
                 let t_col = col
-                scan_pos = scan_pos + 1
-                col = col + 1
-                if scan_pos >= source_len {
-                    io.eprintln("lexer error: unterminated char literal at line {t_line} col {t_col}")
-                    continue
+                let open = scan_pos
+                let mut text_end = scan_pos + 1
+                let mut closed = false
+                while text_end < source_len {
+                    let c = peek(source, source_len, text_end)
+                    if c == CH_NEWLINE { break }
+                    if c == CH_SQUOTE {
+                        closed = true
+                        break
+                    }
+                    if c == CH_BACKSLASH && text_end + 1 < source_len && peek(source, source_len, text_end + 1) != CH_NEWLINE {
+                        text_end = text_end + 2
+                    } else {
+                        text_end = text_end + 1
+                    }
                 }
-                let mut codepoint = 0
-                let ch2 = peek(source, source_len, scan_pos)
-                if ch2 == CH_BACKSLASH {
-                    scan_pos = scan_pos + 1
-                    col = col + 1
-                    if scan_pos >= source_len {
-                        io.eprintln("lexer error: unterminated char escape at line {t_line} col {t_col}")
-                        continue
+                let lit_end = if closed { text_end + 1 } else { text_end }
+                let end_col = t_col + lit_end - open
+                let mut count = 0
+                let mut first = escape_ok(open + 1, -1)
+                let mut first_pos = open + 1
+                let mut q = open + 1
+                while q < text_end {
+                    let e = if peek(source, source_len, q) == CH_BACKSLASH && q + 1 < text_end {
+                        scan_escape(source, source_len, q, text_end, true)
+                    } else {
+                        let qe = codepoint_end(source, source_len, q)
+                        let raw = if qe - q > 1 || peek(source, source_len, q) < 128 { decode_codepoint(source, q, qe) } else { -1 }
+                        escape_ok(qe, raw)
                     }
-                    let esc = peek(source, source_len, scan_pos)
-                    scan_pos = scan_pos + 1
-                    col = col + 1
-                    if esc == CH_n { codepoint = 10 }
-                    else if esc == CH_r { codepoint = 13 }
-                    else if esc == CH_t { codepoint = 9 }
-                    else if esc == CH_BACKSLASH { codepoint = 92 }
-                    else if esc == CH_b { codepoint = CH_BACKSPACE }
-                    else if esc == CH_f { codepoint = CH_FORMFEED }
-                    else if esc == CH_0 { codepoint = 0 }
-                    else if esc == CH_SQUOTE { codepoint = 39 }
-                    else {
-                        let esc_end = codepoint_end(source, source_len, scan_pos - 1)
-                        let esc_ch = char_text(source, scan_pos - 1, esc_end)
-                        let esc_label = codepoint_label(source, scan_pos - 1, esc_end)
-                        col = col + esc_end - scan_pos
-                        scan_pos = esc_end
-                        io.eprintln("lexer error: unknown char escape '\\{esc_ch}'{esc_label} at line {t_line} col {t_col}")
-                        codepoint = esc
+                    if count == 0 {
+                        first = e
+                        first_pos = q
                     }
+                    count = count + 1
+                    q = e.end
+                }
+                let mut value = 65533
+                if closed && count == 0 {
+                    diag_error_span_notes("EmptyCharLiteral", EMPTY_CHAR_LITERAL, "empty char literal", t_line, t_col, end_col,
+                        "write one character between the quotes, such as `' '` or `'\\''`; an empty `Str` is `\"\"`", [])
+                } else if count >= 2 {
+                    let message = if closed { "char literal holds {count} characters" } else { "char literal has no closing `'` on its line, so it holds {count} characters" }
+                    diag_error_span_notes("MultiCharLiteral", MULTI_CHAR_LITERAL, message, t_line, t_col, end_col,
+                        "a char literal holds one character; use double quotes for a `Str`: `{char_text_as_str(source.byte_slice(open + 1, text_end))}`", [])
+                } else if !closed {
+                    diag_error_span_notes("UnterminatedLiteral", UNTERMINATED_LITERAL, "unterminated char literal", t_line, t_col, end_col,
+                        "close the literal with `'`", ["the literal reaches the end of the line at line {t_line}, col {end_col}"])
+                } else if first.code != "" {
+                    let e_col = t_col + first_pos - open
+                    diag_error_span_notes(first.name, first.code, first.message, t_line, e_col, e_col + first.end - first_pos, first.help, [])
+                } else if first.cp < 0 {
+                    let e_col = t_col + first_pos - open
+                    diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{char_text(source, first_pos, first.end)}` in char literal: source text must be UTF-8", t_line, e_col, e_col + 1, "")
                 } else {
-                    codepoint = ch2
-                    scan_pos = scan_pos + 1
-                    col = col + 1
+                    value = first.cp
                 }
-                if scan_pos >= source_len || peek(source, source_len, scan_pos) != CH_SQUOTE {
-                    io.eprintln("lexer error: char literal must contain exactly one character at line {t_line} col {t_col}")
-                    continue
+                // A literal open at the end of the file leaves the code around it unfinished, and
+                // what the parser says about that is the same mistake again.
+                if !closed && text_end >= source_len {
+                    diag_cut_after(t_line, t_col)
                 }
-                scan_pos = scan_pos + 1
-                col = col + 1
-                push_tok(TokenKind.CharLit, "{codepoint}", t_line, t_col, col)
+                scan_pos = lit_end
+                col = end_col
+                push_tok(TokenKind.CharLit, "{value}", t_line, t_col, col)
                 _last_kind = TokenKind.CharLit
                 continue
             }
@@ -783,6 +1046,9 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     mode_stack.push(MODE_STRING)
                     brace_depth_stack.push(0)
                     string_depth_stack.push(hash_count)
+                    string_open_lines.push(t_line)
+                    string_open_cols.push(t_col)
+                    string_open_widths.push(hash_count + 1)
                     string_buf.clear()
                     continue
                 }
@@ -939,6 +1205,9 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     mode_stack.pop()
                     brace_depth_stack.pop()
                     string_depth_stack.pop()
+                    string_open_lines.pop()
+                    string_open_cols.pop()
+                    string_open_widths.pop()
                     continue
                 } else {
                     // Extended string: check for exactly sdepth # chars after "
@@ -960,6 +1229,9 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                         mode_stack.pop()
                         brace_depth_stack.pop()
                         string_depth_stack.pop()
+                        string_open_lines.pop()
+                        string_open_cols.pop()
+                        string_open_widths.pop()
                         continue
                     } else {
                         // Not enough # — literal "
@@ -996,41 +1268,27 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
                     col = col + 1
                     continue
                 }
-                scan_pos = scan_pos + 1
-                col = col + 1
-                if scan_pos >= source_len {
-                    io.eprintln("lexer error: unexpected end of string after backslash")
+                // A backslash that ends the file is part of the unclosed literal, which the end of
+                // the file reports.
+                if scan_pos + 1 >= source_len {
+                    scan_pos = scan_pos + 1
+                    col = col + 1
                     continue
                 }
-                let esc = peek(source, source_len, scan_pos)
-                scan_pos = scan_pos + 1
-                col = col + 1
-                if esc == CH_n {
-                    string_buf.write("\n")
-                } else if esc == CH_r {
-                    string_buf.write("\r")
-                } else if esc == CH_t {
-                    string_buf.write("\t")
-                } else if esc == CH_BACKSLASH {
-                    string_buf.write("\\")
-                } else if esc == CH_b {
-                    string_buf.write(str_from_code_point(8))
-                } else if esc == CH_f {
-                    string_buf.write(str_from_code_point(12))
-                } else if esc == CH_DQUOTE {
-                    string_buf.write("\"")
-                } else if esc == CH_LBRACE {
-                    string_buf.write("\{")
-                } else if esc == CH_RBRACE {
-                    string_buf.write("}")
-                } else {
-                    let esc_end = codepoint_end(source, source_len, scan_pos - 1)
-                    let esc_ch = char_text(source, scan_pos - 1, esc_end)
-                    io.eprintln("warning: unknown escape sequence '\\{esc_ch}'{codepoint_label(source, scan_pos - 1, esc_end)} at line {line} col {col - 2}")
-                    col = col + esc_end - scan_pos
-                    scan_pos = esc_end
-                    string_buf.write("\\")
+                let e = scan_escape(source, source_len, scan_pos, source_len, false)
+                if e.code != "" {
+                    diag_error_span_notes(e.name, e.code, e.message, line, col, col + e.end - scan_pos, e.help, [])
                 }
+                if e.cp >= 0 {
+                    string_buf.write(str_from_code_point(e.cp))
+                }
+                if peek(source, source_len, scan_pos + 1) == CH_NEWLINE {
+                    line = line + 1
+                    col = 1
+                } else {
+                    col = col + e.end - scan_pos
+                }
+                scan_pos = e.end
                 continue
             }
 
@@ -1065,6 +1323,41 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report {
             } else {
                 col = col + 1
             }
+        }
+    }
+
+    // A string still open here ran to the end of the file. The outermost one is the mistake:
+    // any string or hole inside it opened in text the author meant as code. Closing every
+    // frame hands the parser a whole literal, so it has nothing to report at the end of the file.
+    if string_depth_stack.len() > 0 {
+        if _run_start != -1 {
+            string_buf.write(source.byte_slice(_run_start, scan_pos))
+            _run_start = -1
+        }
+        let o_line = string_open_lines.get(0).unwrap()
+        let o_col = string_open_cols.get(0).unwrap()
+        let o_width = string_open_widths.get(0).unwrap()
+        let hashes = string_depth_stack.get(0).unwrap()
+        let kind = if hashes > 0 { "raw string" } else if o_width == 2 { "template" } else { "string" }
+        let mut closer = StringBuilder.new()
+        closer.write("\"")
+        let mut h = 0
+        while h < hashes {
+            closer.write("#")
+            h = h + 1
+        }
+        diag_error_span_notes("UnterminatedLiteral", UNTERMINATED_LITERAL, "unterminated {kind} literal", o_line, o_col, o_col + o_width,
+            "close the literal with `{closer.to_str()}`",["the literal reaches the end of the file at line {line}, col {col}"])
+        diag_cut_after(o_line, o_col)
+        while mode_stack.len() > 1 {
+            if mode_stack.get(mode_stack.len() - 1).unwrap() == MODE_STRING {
+                push_tok(TokenKind.StringPart, string_buf.to_str(), line, col, col)
+                string_buf.clear()
+                push_tok(TokenKind.StringEnd, "\"", line, col, col)
+            } else {
+                push_tok(TokenKind.InterpEnd, "\}", line, col, col)
+            }
+            mode_stack.pop()
         }
     }
 

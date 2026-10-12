@@ -1,0 +1,78 @@
+// A literal with no closer is UnterminatedLiteral (E1126) for every literal kind: "...",
+// t"...", #"..."# at each # count, and '...'. The lexer reports it once; the parser reports
+// nothing at the end of the file for it, so no E1100 follows. The help names the exact closer,
+// # count included, and a note says where the literal ran out: the end of the file for a
+// string, the end of the line for a char (sections/02_syntax.md §2.4, "Unclosed literals").
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/unclosed_literal_each_kind"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+type Case {
+    name: Str
+    src: Str
+    // The help's closer as it reads in a JSON row.
+    closer: Str
+    ran_out: Str
+}
+
+fn str_src(open: Str) -> Str {
+    "fn main() \{\n    let s = {open}abc\n    io.println(s)\n}\n"
+}
+
+fn cases() -> List[Case] {
+    [
+        Case { name: "plain", src: str_src("\""), closer: "\\\"", ran_out: "end of the file" },
+        Case { name: "template", src: str_src("t\""), closer: "\\\"", ran_out: "end of the file" },
+        Case { name: "raw1", src: str_src("#\""), closer: "\\\"#", ran_out: "end of the file" },
+        Case { name: "raw2", src: str_src("##\""), closer: "\\\"##", ran_out: "end of the file" },
+        Case { name: "raw3", src: str_src("###\""), closer: "\\\"###", ran_out: "end of the file" },
+        // A raw string closed with too few # is still open.
+        Case { name: "raw2_closed_by_one", src: str_src("##\"abc\"#"), closer: "\\\"##", ran_out: "end of the file" },
+        Case { name: "char_eol", src: "fn main() \{\n    let c = 'a\n    io.println(\"\{c.to_int()}\")\n}\n", closer: "'", ran_out: "end of the line" },
+        Case { name: "char_bare_eol", src: "fn main() \{\n    let c = '\n    io.println(\"\{c.to_int()}\")\n}\n", closer: "'", ran_out: "end of the line" },
+        Case { name: "char_eof", src: "fn main() \{\n    let c = '", closer: "'", ran_out: "end of the line" },
+    ]
+}
+
+fn problem(c: Case) -> Str {
+    write_file("{DIR}/{c.name}.bl", c.src)
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json {c.name}.bl")
+    let rows = r.err_out.trim().split("\n")
+    let want_help = "\"help\":\"close the literal with `{c.closer}`\""
+    if r.exit_code != 1 { return "{c.name}: exit {r.exit_code}, want 1\n{r.err_out}" }
+    if r.err_out.contains("E1100") { return "{c.name}: the parser reported E1100:\n{r.err_out}" }
+    if r.err_out.trim() == "" || rows.len() != 1 { return "{c.name}: want exactly one row, got:\n{r.err_out}" }
+    let row = rows.get(0).unwrap()
+    if !row.contains("\"code\":\"E1126\"") { return "{c.name}: want E1126 in {row}" }
+    if !row.contains(want_help) { return "{c.name}: want {want_help} in {row}" }
+    if !row.contains("\"notes\":[") || !row.contains(c.ran_out) { return "{c.name}: want a note naming the {c.ran_out} in {row}" }
+    ""
+}
+
+test "an unclosed literal of each kind is one E1126 whose help names its exact closer" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    for c in cases() {
+        let p = problem(c)
+        if p != "" { problems.push(p) }
+    }
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(problems.join("\n"), "")
+}
+
+test "the human form of an unclosed string shows the note and the help" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/raw.bl", str_src("##\""))
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && $B check raw.bl")
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("error[UnterminatedLiteral]"), r.err_out)
+    assert(r.err_out.contains("  note: "), r.err_out)
+    assert(r.err_out.contains("  help: close the literal with `\"##`"), r.err_out)
+    assert(!r.err_out.contains("UnexpectedToken"), r.err_out)
+}

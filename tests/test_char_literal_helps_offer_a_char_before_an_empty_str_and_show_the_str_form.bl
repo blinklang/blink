@@ -1,0 +1,64 @@
+// The helps for a char literal that holds the wrong number of characters. An empty `''` is
+// most often a space or a quote the author meant, so EmptyCharLiteral (E1124) offers `' '` and
+// `'\''` before it mentions the empty Str `""`. MultiCharLiteral (E1125) shows the text as the
+// double-quoted Str, for a closed literal and for one left open to the end of the line
+// (sections/02_syntax.md §2.4, char-literal extent rule).
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/char_literal_helps"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn check_json(name: Str, lit_line: Str) -> ProcessResult {
+    let _ = sh("mkdir -p {DIR}")
+    write_file("{DIR}/{name}.bl", ["fn main() \{", lit_line, #"    io.println("{c.to_int()}")"#, "}", ""].join("\n"))
+    sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json {name}.bl")
+}
+
+// The help field of the only row, or "" when there is not exactly one row with that code.
+fn help_of(r: ProcessResult, code: Str) -> Str {
+    let rows = r.err_out.trim().split("\n")
+    if rows.len() != 1 { return "" }
+    let row = rows.get(0).unwrap()
+    if !row.contains("\"code\":\"{code}\"") { return "" }
+    match row.byte_index_of("\"help\":\"", 0) {
+        Some(at) => {
+            let rest = row.byte_slice(at + 8, row.byte_len())
+            match rest.byte_index_of("\",\"", 0) {
+                Some(end) => rest.byte_slice(0, end)
+                None => rest
+            }
+        }
+        None => ""
+    }
+}
+
+test "the EmptyCharLiteral help offers a char before it mentions the empty Str" {
+    let r = check_json("empty", #"    let c = ''"#)
+    let _ = sh("rm -rf {DIR}")
+    let help = help_of(r, "E1124")
+    assert(help != "", r.err_out)
+    // In the JSON row a quote is \" and a backslash is \\.
+    let space = help.byte_index_of("`' '`", 0) ?? -1
+    let quote = help.byte_index_of(#"`'\\''`"#, 0) ?? -1
+    let empty_str = help.byte_index_of(#"`\"\"`"#, 0) ?? help.byte_len()
+    assert(space >= 0, help)
+    assert(quote >= 0, help)
+    assert(space < empty_str && quote < empty_str, help)
+}
+
+test "the MultiCharLiteral help shows the text as a double-quoted Str" {
+    let r = check_json("closed", #"    let c = 'ab'"#)
+    let help = help_of(r, "E1125")
+    assert(help.contains(#"`\"ab\"`"#), r.err_out)
+}
+
+test "the MultiCharLiteral help for a literal open to the end of the line shows the Str too" {
+    let r = check_json("open", #"    let c = 'hello"#)
+    let _ = sh("rm -rf {DIR}")
+    let help = help_of(r, "E1125")
+    assert(help.contains(#"`\"hello\"`"#), r.err_out)
+}
