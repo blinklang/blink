@@ -2,13 +2,19 @@
 // stops the compiler on the spot, ends the server with exit 101 as it ends a cold check. The
 // editor must still learn why: before it exits, the server publishes the internal error for
 // the document it was checking, and answers a format request it was serving with an internal
-// error, each as a whole frame, so stdout holds frames and nothing else. No source program
+// error, each as a whole frame, so stdout holds frames and nothing else. The directory name
+// holds a non-ASCII letter, so a header that counts characters, not bytes, cuts the frame
+// that carries the uri short. No source program
 // reaches a limit, so the dev knob BLINK_DEV_PARSER_LIMIT makes the parse of a file that holds
 // the named identifier stop as a limit does.
 
 import std.process.{ProcessResult}
 
-let DIR = ".tmp/lsp_parser_limit"
+let DIR = ".tmp/lsp_parser_limit_été"
+
+fn clean_src() -> Str {
+    "fn main() \{\n    io.println(\"hi\")\n}\n"
+}
 
 fn fault_src() -> Str {
     "fn main() \{\n    let parser_limit_probe_ident = 1\n    io.println(\"\{parser_limit_probe_ident}\")\n}\n"
@@ -52,22 +58,39 @@ fn run_lsp(name: Str, requests: List[Str]) -> ProcessResult {
 fn setup() -> Str {
     let _ = process_run("sh", ["-c", "rm -rf {DIR}; mkdir -p {DIR}"])
     write_file("{DIR}/main.bl", fault_src())
+    write_file("{DIR}/clean.bl", clean_src())
     let abs = process_run("sh", ["-c", "cd {DIR} && pwd"]).out.trim()
     "file://{abs}/main.bl"
 }
 
+fn did_open(uri: Str) -> Str {
+    "\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}"
+}
+
+fn formatting(id: Int, uri: Str) -> Str {
+    "\{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"textDocument/formatting\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\"\},\"options\":\{\"tabSize\":4,\"insertSpaces\":true\}\}\}"
+}
+
+fn is_ice_frame(b: Str) -> Bool {
+    b.contains("\"method\":\"textDocument/publishDiagnostics\"") && b.contains("internal compiler error")
+}
+
 test "an lsp check that meets a parser internal limit publishes the internal error and exits 101" {
     let uri = setup()
-    let r = run_lsp("open", ["\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}"])
+    let r = run_lsp("open", [did_open(uri)])
     assert_eq(r.exit_code, 101)
     assert(r.err_out.contains("internal compiler error[ParserInternalLimit]"), "stderr: {r.err_out}")
     match frames(r.out) {
         Ok(bodies) => {
             assert_eq(bodies.len(), 2)
             let published = bodies[1]
+            assert(published.byte_len() > published.len(), "the frame holds no non-ASCII uri: {published}")
+            assert(published.ends_with("]\}\}"), "a frame cut short: {published}")
+            assert(r.out.ends_with("Content-Length: {published.byte_len()}\r\n\r\n{published}"), "stdout: {r.out}")
             assert(published.contains("\"method\":\"textDocument/publishDiagnostics\""), "second frame: {published}")
             assert(published.contains("\"uri\":\"{uri}\""), "second frame: {published}")
-            assert(published.contains("\"severity\":1") && published.contains("internal compiler error"), "second frame: {published}")
+            assert(published.contains("\"severity\":1,\"code\":\"I0012\""), "second frame: {published}")
+            assert(published.contains("internal compiler error[ParserInternalLimit]: BLINK_DEV_PARSER_LIMIT met"), "second frame: {published}")
         }
         Err(e) => assert(false, "{e}\nstdout: {r.out}")
     }
@@ -75,14 +98,36 @@ test "an lsp check that meets a parser internal limit publishes the internal err
 
 test "an lsp format request that meets a parser internal limit is answered with an internal error" {
     let uri = setup()
-    let r = run_lsp("format", ["\{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/formatting\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\"\},\"options\":\{\"tabSize\":4,\"insertSpaces\":true\}\}\}"])
+    let r = run_lsp("format", [formatting(7, uri)])
     assert_eq(r.exit_code, 101)
     match frames(r.out) {
         Ok(bodies) => {
             let answered = bodies.filter(fn(b) { b.contains("\"id\":7,\"error\":\{\"code\":-32603,") })
             assert_eq(answered.len(), 1)
-            let published = bodies.filter(fn(b) { b.contains("\"method\":\"textDocument/publishDiagnostics\"") && b.contains("internal compiler error") })
+            let published = bodies.filter(fn(b) { is_ice_frame(b) && b.contains("\"code\":\"I0012\"") })
             assert_eq(published.len(), 1)
+        }
+        Err(e) => assert(false, "{e}\nstdout: {r.out}")
+    }
+}
+
+// The server forgets each check once it ends, so a fault in a later check reports the document
+// and the request of that check, never those of a clean one before it.
+test "an lsp fault after clean checks names only the document and request of the faulting check" {
+    let uri = setup()
+    let clean_uri = uri.replace("/main.bl", "/clean.bl")
+    let r = run_lsp("after_clean", [did_open(clean_uri), formatting(7, clean_uri), did_open(uri)])
+    assert_eq(r.exit_code, 101)
+    match frames(r.out) {
+        Ok(bodies) => {
+            let ice = bodies.filter(fn(b) { is_ice_frame(b) })
+            assert_eq(ice.len(), 1)
+            assert(ice[0].contains("\"uri\":\"{uri}\""), "ice frame: {ice[0]}")
+            assert(!ice[0].contains(clean_uri), "ice frame: {ice[0]}")
+            let errors = bodies.filter(fn(b) { b.contains("\"error\":") })
+            assert_eq(errors.len(), 0)
+            let formatted = bodies.filter(fn(b) { b.contains("\"id\":7,\"result\":") })
+            assert_eq(formatted.len(), 1)
         }
         Err(e) => assert(false, "{e}\nstdout: {r.out}")
     }
