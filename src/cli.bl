@@ -3694,6 +3694,12 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 // the build it forked the child for as checked.
 fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
+    let format_flag = output_format(a)
+    let bad_format = unknown_format(format_flag, build_formats())
+    if bad_format != "" {
+        io.eprintln(bad_format)
+        exit(1)
+    }
     if source_path == "" {
         io.eprintln("error: no source file specified")
         io.eprintln(generate_command_help(p, "build"))
@@ -3707,7 +3713,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
     let strict_flag = if args_has(a, "strict") { 1 } else { 0 }
     let strict_struct_layout_flag = if args_has(a, "strict-struct-layout") { 1 } else { 0 }
     set_strict_struct_layout(strict_struct_layout_flag)
-    let json_output = if args_has(a, "json") { 1 } else { 0 }
+    let json_output = if json_requested(a) { 1 } else { 0 }
     let emit_flag = args_get(a, "emit")
     let targets = args_get_all(a, "target")
 
@@ -3739,10 +3745,6 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
         return
     }
 
-    let mut format_flag = args_get(a, "format")
-    if json_output != 0 && format_flag == "" {
-        format_flag = "json"
-    }
     if debug_flag != 0 && release_flag != 0 {
         io.eprintln("error: --debug and --release are mutually exclusive")
         exit(1)
@@ -4300,7 +4302,12 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 
 fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO {
     let source_path = args_positional(a, 0)
-    let json_output = if args_has(a, "json") { 1 } else { 0 }
+    let json_output = if json_requested(a) { 1 } else { 0 }
+    let bad_format = unknown_format(output_format(a), ["json"])
+    if bad_format != "" {
+        io.eprintln(bad_format)
+        check_failed_exit(source_path, json_output)
+    }
     if source_path == "" {
         io.eprintln("error: no source file specified")
         io.eprintln(generate_command_help(p, "check"))
@@ -4313,16 +4320,12 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let strict_flag = if args_has(a, "strict") { 1 } else { 0 }
     let strict_struct_layout_flag = if args_has(a, "strict-struct-layout") { 1 } else { 0 }
     set_strict_struct_layout(strict_struct_layout_flag)
-    let mut format_flag = args_get(a, "format")
-    if json_output != 0 && format_flag == "" {
-        format_flag = "json"
-    }
 
     trace_mode = args_get(a, "blink-trace")
     if !deps_resolved() {
         check_failed_exit(source_path, json_output)
     }
-    if format_flag != "" {
+    if json_output != 0 {
         diag_format = 1
     }
     if check_through_daemon(source_path, json_output, diag_format, strict_flag, strict_struct_layout_flag == 1) {
@@ -4345,6 +4348,33 @@ fn check_failed_exit(source_path: Str, json_status: Int) {
         io.println(check_failed_status_line(source_path))
     }
     exit(1)
+}
+
+// The format a command prints in: the --format value, or json under --json, its short form.
+fn output_format(a: Args) -> Str {
+    let format_flag = args_get(a, "format")
+    if format_flag == "" && args_has(a, "json") {
+        return "json"
+    }
+    format_flag
+}
+
+// Whether the command prints only JSON on stdout: under --json, and under --format json.
+fn json_requested(a: Args) -> Bool {
+    args_has(a, "json") || args_get(a, "format") == "json"
+}
+
+// blink formats the source in place of compiling it.
+fn build_formats() -> List[Str] {
+    ["json", "blink"]
+}
+
+// The usage error for a --format value the command does not take, or "" when it takes it.
+fn unknown_format(format_flag: Str, valid: List[Str]) -> Str {
+    if format_flag == "" || valid.contains(format_flag) {
+        return ""
+    }
+    "error: --format must be {valid.join(" or ")}, got '{format_flag}'"
 }
 
 fn check_failed_status_line(source_path: Str) -> Str {
@@ -4407,9 +4437,9 @@ fn daemon_may_build(a: Args) -> Bool {
     if off || (!on && by_env == "0") {
         return false
     }
-    let mut format_flag = args_get(a, "format")
-    if args_has(a, "json") && format_flag == "" {
-        format_flag = "json"
+    let format_flag = output_format(a)
+    if unknown_format(format_flag, build_formats()) != "" {
+        return false
     }
     per_module_fallback_reason("", format_flag) == ""
 }
@@ -4712,7 +4742,12 @@ fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
 
 fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let source_path = args_positional(a, 0)
-    let json_output = if args_has(a, "json") { 1 } else { 0 }
+    let bad_format = unknown_format(output_format(a), ["json"])
+    if bad_format != "" {
+        io.eprintln(bad_format)
+        exit(1)
+    }
+    let json_output = if json_requested(a) { 1 } else { 0 }
     let check_flag = if args_has(a, "check") { 1 } else { 0 }
     if source_path != "" {
         check_file_exists(source_path)
@@ -5734,9 +5769,9 @@ fn cli_parser() -> ArgParser {
     p = command_add_option(p, "run", "--target", "-T", "Target triple (e.g. linux, macos-arm64)")
     p = command_add_option(p, "build", "--emit", "-e", "Output format: binary (default), c, or per-module-dir (emit one .c/.h per module into <outdir>)")
 
-    p = command_add_option(p, "build", "--format", "-f", "Output format")
-    p = command_add_option(p, "check", "--format", "-f", "Output format")
-    p = command_add_option(p, "fmt", "--format", "-f", "Output format")
+    p = command_add_option(p, "build", "--format", "-f", "Output format: json (same as --json) or blink (format the source)")
+    p = command_add_option(p, "check", "--format", "-f", "Output format: json (same as --json)")
+    p = command_add_option(p, "fmt", "--format", "-f", "Output format: json (same as --json)")
 
     p = command_add_option(p, "build", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
     p = command_add_option(p, "run", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
@@ -5918,9 +5953,10 @@ fn main() {
     if err != "" {
         // A command line blink can not act on is a usage error: it exits 1 like any other
         // failing command, with the message on stderr, so a script sees the failure. The
-        // parser stops at the bad argument, so --json counts only when it came first.
+        // parser stops at the bad argument, so --json or --format json counts only when it came
+        // first.
         io.eprintln("error: {err}")
-        if args_command_path(a).join(" ") == "check" && args_has(a, "json") {
+        if args_command_path(a).join(" ") == "check" && json_requested(a) {
             io.println(check_failed_status_line(args_positional(a, 0)))
         }
         exit(1)
