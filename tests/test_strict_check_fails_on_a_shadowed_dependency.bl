@@ -1,0 +1,36 @@
+// `blink check --strict` counts the warning that a local module shadows a dependency (W1000)
+// like any other warning, so the check fails. Without --strict the same check passes. The
+// fixture lives under a fresh temporary directory, since the test tree itself sits inside a
+// project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A path dependency mylib and a local src/mylib.bl that shadows it.
+fn setup(dir: Str) {
+    let _ = sh("rm -rf {dir}; mkdir -p {dir}/src {dir}/dep/src")
+    write_file("{dir}/dep/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/dep/src/mylib.bl", "pub fn greet() -> Str \{ \"dep\" }\n")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n\n[[package]]\nname = \"mylib\"\nversion = \"0.1.0\"\nsource = \"path:{dir}/dep\"\nhash = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\n")
+    write_file("{dir}/src/mylib.bl", "pub fn greet() -> Str \{ \"local\" }\n")
+    write_file("{dir}/src/main.bl", "import mylib\n\nfn main() \{\n    io.println(mylib.greet())\n}\n")
+}
+
+test "a strict check exits 1 on a local module that shadows a dependency" {
+    let dir = sh("mktemp -d /tmp/blink_strict_w1000.XXXXXX").out.trim()
+    setup(dir)
+    let plain = sh("B=$(pwd)/build/blink; cd {dir} && $B check src/main.bl")
+    let strict = sh("B=$(pwd)/build/blink; cd {dir} && $B check --strict src/main.bl")
+    let _ = sh("rm -rf {dir}")
+
+    if strict.exit_code != 1 {
+        io.eprintln("strict (exit {strict.exit_code}):\n{strict.out}\n--stderr--\n{strict.err_out}")
+    }
+    assert_eq(plain.exit_code, 0)
+    assert_eq(strict.exit_code, 1)
+    assert(strict.err_out.contains("local module shadows dependency"))
+}
