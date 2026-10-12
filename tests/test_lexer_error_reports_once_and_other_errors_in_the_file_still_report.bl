@@ -1,0 +1,68 @@
+// A lexer error does not stop the compile: the lexer keeps lexing and the later stages still
+// run, so one check reports every lexer error in the file and the errors elsewhere in it. Each
+// bad literal gives exactly one diagnostic: a dropped escape or a U+FFFD Char causes no type
+// error, and an unclosed string hides only what comes after it (sections/02_syntax.md §2.4,
+// "Recovery").
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/lexer_error_and_other_errors"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn check_json(name: Str, src: Str) -> ProcessResult {
+    let _ = sh("mkdir -p {DIR}")
+    write_file("{DIR}/{name}.bl", src)
+    sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json {name}.bl")
+}
+
+// The code of each row, in order, joined by spaces.
+fn codes(r: ProcessResult) -> Str {
+    let mut out: List[Str] = []
+    for row in r.err_out.trim().split("\n") {
+        match row.byte_index_of("\"code\":\"", 0) {
+            Some(at) => out.push(row.byte_slice(at + 8, at + 13))
+            None => {}
+        }
+    }
+    out.join(" ")
+}
+
+test "each bad escape and bad char literal is one diagnostic and a type error in the same file is still reported" {
+    let r = check_json("mixed", [
+        "fn main() \{",
+        #"    let a = "x\qy""#,
+        #"    let b = '\q'"#,
+        #"    let n: Int = "no""#,
+        #"    let c = 'ab'"#,
+        #"    let d = "\u{12g}\x41""#,
+        #"    io.println("{a}{b.to_int()}{n}{c.to_int()}{d}")"#,
+        "}",
+        "",
+    ].join("\n"))
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(r.exit_code, 1)
+    assert_eq(codes(r), "E1123 E1123 E1125 E1116 E1121 E0300")
+}
+
+test "errors before an unclosed string are reported and nothing after its opening is" {
+    let r = check_json("unclosed", [
+        "fn f() -> Int \{",
+        #"    let n: Int = "no""#,
+        "    n",
+        "}",
+        "",
+        "fn main() \{",
+        #"    let s = "abc"#,
+        "    let m: Int = 2",
+        "    io.println(m)",
+        "    let k: Int = f() + m",
+        "}",
+        "",
+    ].join("\n"))
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(r.exit_code, 1)
+    assert_eq(codes(r), "E1126 E0300")
+}

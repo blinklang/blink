@@ -1,0 +1,92 @@
+// Each lexer error is a diagnostic like any other: `blink check --json` gives one row for it
+// on stderr, with its code and the span the spec names, the check fails, and stdout holds only
+// the status line. One bad literal gives that one row and no other (sections/02_syntax.md §2.4).
+// An escape error spans the escape; a char-literal error spans the literal's text; an unclosed
+// string spans its opening delimiter, prefix included.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/check_json_lexer_rows"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+type Case {
+    name: Str
+    src: Str
+    code: Str
+    line: Int
+    col: Int
+    end_col: Int
+}
+
+// Line 2 holds the literal; line 3 reads the binding so nothing else is reported.
+fn str_case(name: Str, lit_line: Str, code: Str, col: Int, end_col: Int) -> Case {
+    Case { name: name, src: ["fn main() \{", lit_line, "    io.println(s)", "}", ""].join("\n"), code: code, line: 2, col: col, end_col: end_col }
+}
+
+fn char_case(name: Str, lit_line: Str, code: Str, col: Int, end_col: Int) -> Case {
+    Case { name: name, src: ["fn main() \{", lit_line, #"    io.println("{c.to_int()}")"#, "}", ""].join("\n"), code: code, line: 2, col: col, end_col: end_col }
+}
+
+fn cases() -> List[Case] {
+    [
+        // `    let s = "a` puts the backslash of each escape at column 15.
+        str_case("empty_unicode", #"    let s = "a\u{}b""#, "E1114", 15, 19),
+        str_case("unicode_too_long", #"    let s = "a\u{1234567}b""#, "E1115", 15, 26),
+        str_case("unicode_bad_digit", #"    let s = "a\u{12g}b""#, "E1116", 15, 22),
+        str_case("unicode_unterminated", #"    let s = "a\u{41 b""#, "E1117", 15, 20),
+        str_case("surrogate", #"    let s = "a\u{d800}b""#, "E1118", 15, 23),
+        str_case("out_of_range", #"    let s = "a\u{110000}b""#, "E1119", 15, 25),
+        str_case("needs_braces_u", #"    let s = "a\u0041b""#, "E1120", 15, 21),
+        str_case("needs_braces_big_u", #"    let s = "a\U0001F600b""#, "E1120", 15, 25),
+        str_case("hex_escape", #"    let s = "a\x1bb""#, "E1121", 15, 19),
+        str_case("nul_in_str", #"    let s = "a\0b""#, "E1122", 15, 17),
+        str_case("nul_unicode_in_str", #"    let s = "a\u{0}b""#, "E1122", 15, 20),
+        str_case("unknown_escape_str", #"    let s = "a\qb""#, "E1123", 15, 17),
+        str_case("single_quote_escape_str", #"    let s = "a\'b""#, "E1123", 15, 17),
+        char_case("unknown_escape_char", #"    let c = '\q'"#, "E1123", 14, 16),
+        char_case("double_quote_escape_char", #"    let c = '\"'"#, "E1123", 14, 16),
+        char_case("surrogate_char", #"    let c = '\u{dfff}'"#, "E1118", 14, 22),
+        char_case("empty_char", #"    let c = ''"#, "E1124", 13, 15),
+        char_case("multi_char", #"    let c = 'ab'"#, "E1125", 13, 17),
+        char_case("multi_char_open", #"    let c = 'hello"#, "E1125", 13, 19),
+        char_case("char_open_at_eol", #"    let c = 'a"#, "E1126", 13, 15),
+        Case { name: "str_open_at_eof", src: "fn main() \{\n    let s = \"abc\n    io.println(s)\n}\n", code: "E1126", line: 2, col: 13, end_col: 14 },
+        Case { name: "template_open_at_eof", src: "fn main() \{\n    let s = t\"abc\n    io.println(s)\n}\n", code: "E1126", line: 2, col: 13, end_col: 15 },
+        Case { name: "raw_open_at_eof", src: "fn main() \{\n    let s = ##\"abc\"#\n    io.println(s)\n}\n", code: "E1126", line: 2, col: 13, end_col: 16 },
+        Case { name: "str_backslash_at_eof", src: "fn main() \{\n    let s = \"a\\", code: "E1126", line: 2, col: 13, end_col: 14 },
+        Case { name: "char_open_at_eof", src: "fn main() \{\n    let c = '", code: "E1126", line: 2, col: 13, end_col: 14 },
+    ]
+}
+
+// Empty when the check printed what the case expects, else what went wrong.
+fn problem(c: Case) -> Str {
+    write_file("{DIR}/{c.name}.bl", c.src)
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json {c.name}.bl")
+    let rows = r.err_out.trim().split("\n")
+    let want_code = "\"code\":\"{c.code}\""
+    let want_span = "\"line\":{c.line},\"col\":{c.col},\"end_line\":{c.line},\"end_col\":{c.end_col}\}"
+    if r.exit_code != 1 { return "{c.name}: exit {r.exit_code}, want 1\n{r.err_out}" }
+    if r.out.trim().split("\n").len() != 1 || !r.out.contains("\"status\":\"error\"") {
+        return "{c.name}: stdout is not one error status line:\n{r.out}"
+    }
+    if r.err_out.trim() == "" || rows.len() != 1 { return "{c.name}: want exactly one row, got:\n{r.err_out}" }
+    let row = rows.get(0).unwrap()
+    if !row.contains(want_code) { return "{c.name}: want {want_code} in {row}" }
+    if !row.contains("\"severity\":\"error\"") { return "{c.name}: not an error: {row}" }
+    if !row.contains(want_span) { return "{c.name}: want span {want_span} in {row}" }
+    ""
+}
+
+test "check --json gives one error row with the code and span of each lexer error and only the status on stdout" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    for c in cases() {
+        let p = problem(c)
+        if p != "" { problems.push(p) }
+    }
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(problems.join("\n"), "")
+}
