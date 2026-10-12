@@ -91,9 +91,12 @@ type DaemonCheck {
 let mut daemon_last: Option[DaemonCheck] = None
 
 // A build child the daemon forked and has not reaped, and what it owes the client: the files
-// the child prints to and the connection the reply goes to.
+// the child prints to and the connection the reply goes to. wake is the read end of a pipe
+// whose write end only the child holds, which reads its end once the child ends; -1 once it
+// has, or when there is no pipe.
 type DaemonChild {
     pid: Int
+    wake: Int
     client_fd: Int
     out: Str
     err: Str
@@ -709,11 +712,16 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
     let _ = build_fs.cpu_count()
     // The child inherits what stdout holds unflushed, and would print it again.
     io.write("")
+    let (wake, wake_w) = build_fs.exit_pipe()
     let pid = daemon_fork().to_int()
+    // Before the next fork: a later child that held wake_w would keep this pipe open.
+    if pid != 0 && wake_w >= 0 { unix_socket_close(wake_w) }
     if pid < 0 {
+        if wake >= 0 { unix_socket_close(wake) }
         return BuildTurn.Reply(daemon_not_served("the daemon could not fork a build"))
     }
     if pid == 0 {
+        if wake >= 0 { unix_socket_close(wake) }
         // The child keeps no socket, so each client hears from the daemon alone, and a stop
         // that removes the socket file is the daemon's.
         unix_socket_close(client_fd)
@@ -735,12 +743,13 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
         if pwd_set { env.set_var("PWD", pwd) } else { env.remove_var("PWD") }
         return BuildTurn.Child(DaemonBuild { argv: argv, program: c.program, front: c.front, out: c.out, err: c.err, declined: declined })
     }
-    BuildTurn.Started(DaemonChild { pid: pid, client_fd: client_fd, out: out_path, err: err_path, declined: declined })
+    BuildTurn.Started(DaemonChild { pid: pid, wake: wake, client_fd: client_fd, out: out_path, err: err_path, declined: declined })
 }
 
 // Replies to the client of the build child that ended with status, and removes the child's
 // files, whether it built, declined or died.
 fn daemon_end_child(child: DaemonChild, status: Int) ! IO {
+    if child.wake >= 0 { unix_socket_close(child.wake) }
     let out = read_file(child.out)
     let err = read_file(child.err)
     let declined = file_exists(child.declined) == 1
@@ -906,11 +915,46 @@ fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck
     }
 }
 
+// The longest the daemon waits between two reaps of a build child whose pipe has not read its
+// end. Only a process the child started that forked and did not exec holds the pipe past the
+// child, so this bounds a wait nothing should cause, as the idle accept bounds the wait to see
+// the router gone.
+let DAEMON_BUILD_SWEEP_MS = 500
+
+// A connection the daemon may serve, or -1, while its build child runs, and the child as the
+// wait left it. It waits for a client or for the child's pipe to read its end. The pipe reads
+// its end as the child ends, a moment before waitpid can see it, so once it has, or when
+// there is no pipe or poll fails, the accept waits 1 ms at most.
+fn daemon_accept_during_build(child: DaemonChild) -> (DaemonChild, Int) ! IO {
+    if child.wake < 0 {
+        return (child, daemon_accept_own(daemon_socket_fd, 1))
+    }
+    let fds = [
+        Pollfd { fd: daemon_socket_fd.to_i32(), events: 1.to_i16(), revents: 0.to_i16() },
+        Pollfd { fd: child.wake.to_i32(), events: 1.to_i16(), revents: 0.to_i16() },
+    ]
+    match poll(fds, DAEMON_BUILD_SWEEP_MS) {
+        Ok(got) => {
+            let mut c = child
+            // No one writes to the pipe, so any event is its end.
+            if got.get(1).unwrap().revents.to_int() != 0 {
+                unix_socket_close(c.wake)
+                c = DaemonChild { wake: -1, ..c }
+            }
+            if got.get(0).unwrap().revents.to_int() == 0 {
+                return (c, -1)
+            }
+            (c, daemon_accept_own(daemon_socket_fd, 0))
+        }
+        Err(_) => (child, daemon_accept_own(daemon_socket_fd, 1))
+    }
+}
+
 // Returns the build to run in a child forked for one, and None in the daemon once it stops.
-// While a build child runs, the accept waits 1 ms at most and each turn reaps the child if it
-// ended, so the daemon serves other requests meanwhile and its build client waits at most
-// that, plus the one request being served then, past the child's end. The runtime has no wait
-// on both the socket and the child.
+// While a build child runs, the daemon waits for a client or the child's end
+// (daemon_accept_during_build), reaps the child each time it wakes, and serves other requests
+// meanwhile; its build client waits for the one request being served then, past the child's
+// end.
 fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
     let mut builds = DaemonBuilds { child: None, queue: [], stops: [], seq: 0, turn: 0 }
     while daemon_running == 1 {
@@ -936,8 +980,13 @@ fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse,
                         break
                     }
                 }
-                if builds.child.is_some() {
-                    client_fd = daemon_accept_own(daemon_socket_fd, 1)
+                match builds.child {
+                    Some(running) => {
+                        let (c, fd) = daemon_accept_during_build(running)
+                        builds.child = Some(c)
+                        client_fd = fd
+                    }
+                    None => {}
                 }
             }
             None => {
