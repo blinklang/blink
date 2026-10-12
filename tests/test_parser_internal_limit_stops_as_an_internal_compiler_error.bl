@@ -1,14 +1,16 @@
 // When the parser's node pool or sublist stack meets a state it can not hold, the compiler stops
 // on the spot, and that stop is a compiler bug: an internal compiler error. It says so on
 // stderr, exits 101 as any internal compiler error does, and keeps stdout for the command's own
-// output. A check that set the line it prints on an internal error gets that line on stdout, so
-// check --json still ends with {"status":"ice",...}. No source program reaches these limits, so
-// each probe drives the parser's own functions in a child run of this binary.
+// output. The fault is a diagnostic like any internal error, I0012 ParserInternalLimit, so it
+// renders in the format the run asked for. A check that set the line it prints on an internal
+// error gets that line on stdout, so check --json still ends with {"status":"ice",...}. No
+// source program reaches these limits, so each probe drives the parser's own functions in a
+// child run of this binary.
 
 import std.process.{ProcessResult}
 import parser.{node_push, node_kind, new_sublist, sublist_push, finalize_sublist, sublist_get}
 import ast.{AstNode}
-import diagnostics.{diag_set_abort_status_line, diag_reset}
+import diagnostics.{diag_set_abort_status_line, diag_reset, diag_format}
 import check_pipeline.{check_status_line}
 
 fn probe(which: Str) -> ProcessResult {
@@ -21,8 +23,9 @@ fn ice_stop_error(which: Str, want: Str, stdout: Str) -> Str {
     let r = probe(which)
     if r.exit_code != 101 { return "{which}: exit {r.exit_code}, not 101; stdout: {r.out} stderr: {r.err_out}" }
     if r.out != stdout { return "{which}: stdout is `{r.out}`, not `{stdout}`" }
-    if !r.err_out.contains("internal compiler error: {want}") { return "{which}: stderr has no `{want}`: {r.err_out}" }
-    if !r.err_out.contains("This is a compiler bug") { return "{which}: stderr does not say it is a compiler bug: {r.err_out}" }
+    if !r.err_out.contains("internal compiler error[ParserInternalLimit]: {want}\n") { return "{which}: stderr has no `{want}`: {r.err_out}" }
+    let notes = r.err_out.split("This is a compiler bug").len() - 1
+    if notes != 1 { return "{which}: stderr says it is a compiler bug {notes} times, not once: {r.err_out}" }
     ""
 }
 
@@ -48,6 +51,15 @@ test "a node id out of bounds stops as an internal compiler error" {
 
 test "a node pool past its shape limit stops as an internal compiler error" {
     assert_eq(ice_stop_error("too_many_shapes", "the node pool has more than 65536 shapes; head packs at most that", ""), "")
+}
+
+test "under json diagnostics the stop is an I0012 internal error row" {
+    let r = probe("push_none_open_format_json")
+    assert_eq(r.exit_code, 101)
+    assert_eq(r.out, "")
+    let row = "\{\"severity\":\"ice\",\"name\":\"ParserInternalLimit\",\"code\":\"I0012\",\"message\":\"sublist_push() called with no open sublist\""
+    assert(r.err_out.starts_with(row), "stderr has no I0012 row: {r.err_out}")
+    assert(r.err_out.trim().split("\n").len() == 1, "stderr is not the one row: {r.err_out}")
 }
 
 test "a check --json that stops on an internal limit prints the ice status line on stdout" {
@@ -103,6 +115,9 @@ fn main() ! Parse.Build {
     if which == "push_none_open_json_after_reset" {
         diag_set_abort_status_line(check_status_line("main.bl", 1, 0, 1, 0, 0))
         diag_reset()
+    }
+    if which == "push_none_open_format_json" {
+        diag_format = 1
     }
     if which.starts_with("push_none_open") { sublist_push(0, 1) }
     if which == "finalize_none_open" { finalize_sublist(0) }
