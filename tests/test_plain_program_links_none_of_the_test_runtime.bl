@@ -1,0 +1,65 @@
+// The stdlib monolith calls the test runtime, so every link pulls the archive member that
+// holds it. A program that never runs a test or asserts reaches none of it, and the link
+// drops all of it; a test binary built against the same archive still runs its tests.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn test_runtime_fns() -> List[Str] {
+    [
+        "__blink_assert_fail", "blink_set_case_label", "blink_record_case",
+        "__blink_assert_fail_eq", "__blink_assert_fail_intro", "__blink_test_set_propagate",
+        "__blink_test_set_skipped", "__blink_assert_panics_returned",
+        "__blink_assert_panics_mismatch", "__blink_test_is_failed", "__blink_test_is_skipped",
+        "blink_test_run", "__blink_test_panic_handler", "__blink_test_print_case_records_json",
+    ]
+}
+
+fn blink_at(dir: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "env -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink {args} 2>&1"])
+}
+
+test "a program with no test and no assert links no test runtime function" {
+    let root = sh("pwd -P")
+    let dir = "{root}/.tmp/_plain_no_test_runtime_{getpid()}"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+    write_file("{dir}/hello.bl", "fn main() \{\n    io.println(\"hello\")\n\}\n")
+    let r = blink_at(dir, "build {dir}/hello.bl -o {dir}/hello")
+    let out = sh("{dir}/hello")
+    let fns = test_runtime_fns()
+    let mut linked: List[Str] = []
+    for line in sh("nm {dir}/hello").split("\n") {
+        let parts = line.split(" ")
+        let name = parts.get(parts.len() - 1).unwrap()
+        if fns.contains(name) { linked.push(name) }
+    }
+    shell_exec("rm -rf {dir}")
+    assert(r.exit_code == 0, "build failed: {r.out}")
+    assert_eq(out, "hello")
+    assert_eq(linked.join(" "), "")
+}
+
+test "a test binary linked against the archive runs its tests and reports a failure" {
+    let root = sh("pwd -P")
+    let dir = "{root}/.tmp/_test_bin_runs_{getpid()}"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+    write_file("{dir}/tests_of_two.bl", [
+        #"test "one passes" {"#,
+        #"    assert_eq(1 + 1, 2)"#,
+        #"}"#,
+        #""#,
+        #"test "one fails" {"#,
+        #"    assert_eq(2 + 2, 5)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    let r = blink_at(dir, "test {dir}/tests_of_two.bl")
+    shell_exec("rm -rf {dir}")
+    assert(r.exit_code != 0, "a failing test must fail the run: {r.out}")
+    assert(r.out.contains("1 passed, 1 failed"), "runner output: {r.out}")
+}

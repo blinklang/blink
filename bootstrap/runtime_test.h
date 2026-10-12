@@ -82,8 +82,8 @@ BLINK_TEST_STORAGE int __blink_test_case_record_count;
 BLINK_TEST_STORAGE int __blink_test_skipped;
 BLINK_TEST_STORAGE char __blink_test_skip_reason[256];
 
-/* Units read only these declarations, and the unit that defines the runtime storage
- * holds the bodies, so an -O0 unit does not compile a copy of each one. */
+/* Units read only these declarations, and one unit holds the bodies, so an -O0 unit does
+ * not compile a copy of each one. */
 BLINK_RT_FN void __blink_assert_fail(const char* msg, int line);
 BLINK_RT_FN void blink_set_case_label(const char* s);
 BLINK_RT_FN void blink_record_case(const char* label, int64_t status);
@@ -97,7 +97,18 @@ BLINK_RT_FN int64_t __blink_test_is_failed(void);
 BLINK_RT_FN int64_t __blink_test_is_skipped(void);
 BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv);
 
+/* That unit is the one that defines the runtime storage, except in the stdlib archive: it
+ * compiles them in a member of their own, in parallel with its monolith. */
 #ifndef BLINK_RUNTIME_DECLS_ONLY
+#ifndef BLINK_RUNTIME_TEST_BODIES_APART
+#define BLINK_RUNTIME_TEST_BODIES 1
+#endif
+#endif
+#ifdef BLINK_RUNTIME_TEST_BODIES_UNIT
+#define BLINK_RUNTIME_TEST_BODIES 1
+#endif
+
+#ifdef BLINK_RUNTIME_TEST_BODIES
 
 /* Spec §2.20: an assertion failure panics. Outside a test run there is no
  * per-test frame to longjmp to, so the failure is an uncaught panic. The
@@ -658,6 +669,6 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
     if (fail > 0) exit(1);
 }
 
-#endif /* BLINK_RUNTIME_DECLS_ONLY */
+#endif /* BLINK_RUNTIME_TEST_BODIES */
 
 #endif

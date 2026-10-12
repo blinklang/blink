@@ -2,7 +2,8 @@
 //
 // Produces `build/libblink_std.a` (a symlink into a content-hashed
 // `build/std-cache/<hash>/`) plus `libblink_std.h` (extern decls +
-// typedefs) and `monolith.o` (all stdlib bodies). The header is
+// typedefs), `monolith.o` (all stdlib bodies) and `runtime_test.o` (the
+// test runtime's bodies). The header is
 // consumed by the per-module peel loop — when `peeled` is non-empty,
 // each peeled module compiles into its own `.o` that includes
 // `libblink_std.h` and links against the shrunk monolith.
@@ -16,7 +17,8 @@ import compiler.{compile_to_program, check_unused_imports, embedded_keys}
 import cg.{Codegen, CgConfig, generate, generate_archive_header}
 import check_pipeline.{run_build_analyses}
 import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
-import cli.{resolve_install_root, run_cc, process_compiler_sha, blink_cli_version}
+import cli.{resolve_install_root, run_cc, spawn_cc, process_compiler_sha, blink_cli_version}
+import build_fs
 import stdlib_native_deps.{peeled_module_keys, peeled_module_dotted, peeled_module_underscored}
 import std_cache_key.{compute_cache_key, archive_compiler_path, sha256_of_file_first, sha256_of_manifest}
 import std.path.{path_join}
@@ -292,14 +294,28 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     // entirely, so no BLINK_USE_<dep> macros are needed for the archive.
     // The user TU defines those macros itself when codegen emits a peeled
     // module body that references the vendored runtime header.
-    let cc_args = "-c -ffunction-sections -fdata-sections -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
+    //
+    // The test runtime's bodies compile in a member of their own while the monolith
+    // compiles, so they add nothing to the archive build's wall time. The monolith drops
+    // them by a flag on its cc line, not by a line in monolith.c, so a compile of
+    // monolith.c alone still holds every body.
+    write_file("{cache_dir}/runtime_test.c", "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1\n#define BLINK_RUNTIME_TEST_BODIES_UNIT 1\n#include \"runtime.h\"\n")
+    let test_child = spawn_cc("-c -ffunction-sections -fdata-sections -o {cache_dir}/runtime_test.o {cache_dir}/runtime_test.c -I{cache_dir}", 0, 1, "", cache_dir, "runtime_test")
+    let cc_args = "-c -ffunction-sections -fdata-sections -DBLINK_RUNTIME_TEST_BODIES_APART=1 -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
     let rc = run_cc(cc_args, 0, 1, "")
+    let test_res = build_fs.reap_to_files(test_child)
+    if test_res.out != "" { io.print(test_res.out) }
+    if test_res.err_out != "" { io.eprint(test_res.err_out) }
     if rc != 0 {
         io.eprintln("error: cc failed building stdlib monolith (rc={rc})")
         return rc
     }
+    if test_res.exit_code != 0 {
+        io.eprintln("error: cc failed building the stdlib test runtime (rc={test_res.exit_code})")
+        return if test_res.exit_code > 0 { test_res.exit_code } else { 1 }
+    }
 
-    shell_exec("ar rcs {cache_dir}/libblink_std.a {cache_dir}/monolith.o")
+    shell_exec("ar rcs {cache_dir}/libblink_std.a {cache_dir}/monolith.o {cache_dir}/runtime_test.o")
     write_skip_modules_file("{cache_dir}/skip_modules.txt", list_stdlib_module_keys())
     write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h")
     write_file("{cache_dir}/.stamp", "")
