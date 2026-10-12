@@ -50,6 +50,26 @@ pub let mut toml_keys: List[Str] = []
 pub let mut toml_values: List[Str] = []
 pub let mut toml_types: List[Int] = []
 
+/// Where a token sits in the parsed text. Lines and columns count from 1, and a column counts
+/// bytes, as compiler diagnostics do. end_col is the column after the last byte. start_byte and
+/// end_byte are offsets into the text, end exclusive.
+pub type TomlSpan {
+    line: Int
+    col: Int
+    end_line: Int
+    end_col: Int
+    start_byte: Int
+    end_byte: Int
+}
+
+// Parallel to toml_keys. An array item shares its array's key span.
+pub let mut toml_key_spans: List[TomlSpan] = []
+pub let mut toml_value_spans: List[TomlSpan] = []
+
+// Every [name] and [[name]] header in source order, brackets included in the span.
+pub let mut toml_headers: List[Str] = []
+pub let mut toml_header_spans: List[TomlSpan] = []
+
 // ── Array table counters ───────────────────────────────────────────
 // Tracks how many [[name]] entries we've seen for each array table name
 let mut arr_table_names: List[Str] = []
@@ -121,10 +141,17 @@ fn skip_ws_and_newlines(content: Str, offset: Int) -> Int {
 
 // ── Store helpers ──────────────────────────────────────────────────
 
-fn store_entry(key: Str, value: Str, vtype: Int) {
+// Lines and columns are filled in once the parse ends, from one table of line starts.
+fn byte_span(start: Int, end: Int) -> TomlSpan {
+    TomlSpan { line: 0, col: 0, end_line: 0, end_col: 0, start_byte: start, end_byte: end }
+}
+
+fn store_entry(key: Str, value: Str, vtype: Int, key_start: Int, key_end: Int, value_start: Int, value_end: Int) {
     toml_keys.push(key)
     toml_values.push(value)
     toml_types.push(vtype)
+    toml_key_spans.push(byte_span(key_start, key_end))
+    toml_value_spans.push(byte_span(value_start, value_end))
 }
 
 fn find_key_index(key: Str) -> Int {
@@ -295,7 +322,7 @@ fn word_at(s: Str, p: Int, word: Str) -> Bool {
     true
 }
 
-fn parse_array_value(content: Str, offset: Int, full_key: Str) {
+fn parse_array_value(content: Str, offset: Int, full_key: Str, key_start: Int, key_end: Int) {
     let mut p = offset + 1
     let mut count = 0
     p = skip_ws_and_newlines(content, p)
@@ -305,7 +332,7 @@ fn parse_array_value(content: Str, offset: Int, full_key: Str) {
         if peek(content, p) == CH_RBRACKET {
             // trailing comma case
             p = p + 1
-            store_entry(full_key, "{count}", TOML_ARRAY)
+            store_entry(full_key, "{count}", TOML_ARRAY, key_start, key_end, offset, p)
             tmp_pos = p
             return
         }
@@ -314,13 +341,13 @@ fn parse_array_value(content: Str, offset: Int, full_key: Str) {
         if c == CH_DQUOTE {
             parse_quoted_string(content, p)
             let item_key = "{full_key}[{count}]"
-            store_entry(item_key, tmp_str, TOML_STRING)
+            store_entry(item_key, tmp_str, TOML_STRING, key_start, key_end, p, tmp_pos)
             p = tmp_pos
             count = count + 1
         } else if is_digit(c) || c == CH_MINUS || c == CH_PLUS {
             parse_integer(content, p)
             let item_key = "{full_key}[{count}]"
-            store_entry(item_key, tmp_str, TOML_INT)
+            store_entry(item_key, tmp_str, TOML_INT, key_start, key_end, p, tmp_pos)
             p = tmp_pos
             count = count + 1
         } else {
@@ -337,7 +364,7 @@ fn parse_array_value(content: Str, offset: Int, full_key: Str) {
     if p < content.byte_len() && peek(content, p) == CH_RBRACKET {
         p = p + 1
     }
-    store_entry(full_key, "{count}", TOML_ARRAY)
+    store_entry(full_key, "{count}", TOML_ARRAY, key_start, key_end, offset, p)
     tmp_pos = p
 }
 
@@ -356,9 +383,11 @@ fn parse_inline_table(content: Str, offset: Int, prefix: Str) {
             return
         }
 
+        let key_start = p
         parse_dotted_key(content, p)
         let key = tmp_str
         p = tmp_pos
+        let key_end = p
 
         p = toml_skip_ws(content, p)
         if peek(content, p) == CH_EQUALS {
@@ -371,24 +400,24 @@ fn parse_inline_table(content: Str, offset: Int, prefix: Str) {
         let vc = peek(content, p)
         if vc == CH_DQUOTE {
             parse_quoted_string(content, p)
-            store_entry(full_key, tmp_str, TOML_STRING)
+            store_entry(full_key, tmp_str, TOML_STRING, key_start, key_end, p, tmp_pos)
             p = tmp_pos
         } else if vc == CH_LBRACKET {
-            parse_array_value(content, p, full_key)
+            parse_array_value(content, p, full_key, key_start, key_end)
             p = tmp_pos
         } else if vc == CH_LBRACE {
             parse_inline_table(content, p, full_key)
-            store_entry(full_key, "", TOML_INLINE_TABLE)
+            store_entry(full_key, "", TOML_INLINE_TABLE, key_start, key_end, p, tmp_pos)
             p = tmp_pos
         } else if is_digit(vc) || vc == CH_MINUS || vc == CH_PLUS {
             parse_integer(content, p)
-            store_entry(full_key, tmp_str, TOML_INT)
+            store_entry(full_key, tmp_str, TOML_INT, key_start, key_end, p, tmp_pos)
             p = tmp_pos
         } else if word_at(content, p, "true") {
-            store_entry(full_key, "1", TOML_BOOL)
+            store_entry(full_key, "1", TOML_BOOL, key_start, key_end, p, p + 4)
             p = p + 4
         } else if word_at(content, p, "false") {
-            store_entry(full_key, "0", TOML_BOOL)
+            store_entry(full_key, "0", TOML_BOOL, key_start, key_end, p, p + 5)
             p = p + 5
         } else {
             p = p + 1
@@ -408,40 +437,40 @@ fn parse_inline_table(content: Str, offset: Int, prefix: Str) {
 
 // ── Parse a value (string, int, bool, array, inline table) ─────────
 
-fn toml_parse_value(content: Str, offset: Int, full_key: Str) {
+fn toml_parse_value(content: Str, offset: Int, full_key: Str, key_start: Int, key_end: Int) {
     let c = peek(content, offset)
 
     if c == CH_DQUOTE {
         parse_quoted_string(content, offset)
-        store_entry(full_key, tmp_str, TOML_STRING)
+        store_entry(full_key, tmp_str, TOML_STRING, key_start, key_end, offset, tmp_pos)
         return
     }
 
     if c == CH_LBRACKET {
-        parse_array_value(content, offset, full_key)
+        parse_array_value(content, offset, full_key, key_start, key_end)
         return
     }
 
     if c == CH_LBRACE {
         parse_inline_table(content, offset, full_key)
-        store_entry(full_key, "", TOML_INLINE_TABLE)
+        store_entry(full_key, "", TOML_INLINE_TABLE, key_start, key_end, offset, tmp_pos)
         return
     }
 
     if is_digit(c) || c == CH_MINUS || c == CH_PLUS {
         parse_integer(content, offset)
-        store_entry(full_key, tmp_str, TOML_INT)
+        store_entry(full_key, tmp_str, TOML_INT, key_start, key_end, offset, tmp_pos)
         return
     }
 
     if word_at(content, offset, "true") {
-        store_entry(full_key, "1", TOML_BOOL)
+        store_entry(full_key, "1", TOML_BOOL, key_start, key_end, offset, offset + 4)
         tmp_pos = offset + 4
         return
     }
 
     if word_at(content, offset, "false") {
-        store_entry(full_key, "0", TOML_BOOL)
+        store_entry(full_key, "0", TOML_BOOL, key_start, key_end, offset, offset + 5)
         tmp_pos = offset + 5
         return
     }
@@ -493,6 +522,15 @@ fn parse_array_table_header(content: Str, offset: Int) {
 /// Parse a TOML string. Returns 0 on success, -1 on error
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn toml_parse(content: Str) -> Int {
+    let first_entry = toml_key_spans.len()
+    let first_header = toml_header_spans.len()
+    let rc = parse_entries(content)
+    resolve_spans(content, first_entry, first_header)
+    rc
+}
+
+@allow(UnrestoredMutation, IncompleteStateRestore)
+fn parse_entries(content: Str) -> Int {
     let mut cursor = 0
     let mut current_section = ""
     let mut _in_array_table = 0
@@ -526,6 +564,8 @@ pub fn toml_parse(content: Str) -> Int {
         // Array table header [[name]]
         if c == CH_LBRACKET && cursor + 1 < content.byte_len() && peek(content, cursor + 1) == CH_LBRACKET {
             parse_array_table_header(content, cursor)
+            toml_headers.push(tmp_str)
+            toml_header_spans.push(byte_span(cursor, tmp_pos))
             array_table_name = tmp_str
             cursor = tmp_pos
             _in_array_table = 1
@@ -541,6 +581,8 @@ pub fn toml_parse(content: Str) -> Int {
         // Section header [name]
         if c == CH_LBRACKET {
             parse_section_header(content, cursor)
+            toml_headers.push(tmp_str)
+            toml_header_spans.push(byte_span(cursor, tmp_pos))
             current_section = tmp_str
             cursor = tmp_pos
             _in_array_table = 0
@@ -552,9 +594,11 @@ pub fn toml_parse(content: Str) -> Int {
         }
 
         // Key = value pair
+        let key_start = cursor
         parse_dotted_key(content, cursor)
         let key = tmp_str
         cursor = tmp_pos
+        let key_end = cursor
 
         cursor = toml_skip_ws(content, cursor)
         if peek(content, cursor) == CH_EQUALS {
@@ -567,7 +611,7 @@ pub fn toml_parse(content: Str) -> Int {
             full_key = "{current_section}.{key}"
         }
 
-        toml_parse_value(content, cursor, full_key)
+        toml_parse_value(content, cursor, full_key, key_start, key_end)
         cursor = tmp_pos
 
         cursor = skip_to_newline(content, cursor)
@@ -577,6 +621,64 @@ pub fn toml_parse(content: Str) -> Int {
     }
 
     0
+}
+
+// ── Line and column for the spans of one parse ─────────────────
+
+// Lines end at LF only, so the CR of a CRLF line stays on the line it ends and moves no column.
+fn line_starts(content: Str) -> List[Int] {
+    let mut starts: List[Int] = [0]
+    let mut p = 0
+    while p < content.byte_len() {
+        if peek(content, p) == CH_NEWLINE {
+            starts.push(p + 1)
+        }
+        p = p + 1
+    }
+    starts
+}
+
+// The index of the last line that starts at or before the offset.
+fn line_index(starts: List[Int], offset: Int) -> Int {
+    let mut lo = 0
+    let mut hi = starts.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts.get(mid).unwrap() <= offset {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo
+}
+
+fn resolve_span(starts: List[Int], s: TomlSpan) -> TomlSpan {
+    let li = line_index(starts, s.start_byte)
+    let eli = line_index(starts, s.end_byte)
+    TomlSpan {
+        line: li + 1,
+        col: s.start_byte - starts.get(li).unwrap() + 1,
+        end_line: eli + 1,
+        end_col: s.end_byte - starts.get(eli).unwrap() + 1,
+        start_byte: s.start_byte,
+        end_byte: s.end_byte,
+    }
+}
+
+fn resolve_spans(content: Str, first_entry: Int, first_header: Int) {
+    let starts = line_starts(content)
+    let mut i = first_entry
+    while i < toml_key_spans.len() {
+        toml_key_spans.set(i, resolve_span(starts, toml_key_spans.get(i).unwrap()))
+        toml_value_spans.set(i, resolve_span(starts, toml_value_spans.get(i).unwrap()))
+        i = i + 1
+    }
+    let mut h = first_header
+    while h < toml_header_spans.len() {
+        toml_header_spans.set(h, resolve_span(starts, toml_header_spans.get(h).unwrap()))
+        h = h + 1
+    }
 }
 
 // ── Query API ──────────────────────────────────────────────────────
@@ -652,6 +754,10 @@ pub fn toml_clear() -> Int {
     toml_keys = []
     toml_values = []
     toml_types = []
+    toml_key_spans = []
+    toml_value_spans = []
+    toml_headers = []
+    toml_header_spans = []
     arr_table_names = []
     arr_table_counts = []
     tmp_str = ""
@@ -668,6 +774,10 @@ pub fn toml_read_value(content: Str, section: Str, key: Str) -> Option[Str] {
     let saved_keys = toml_keys
     let saved_values = toml_values
     let saved_types = toml_types
+    let saved_key_spans = toml_key_spans
+    let saved_value_spans = toml_value_spans
+    let saved_headers = toml_headers
+    let saved_header_spans = toml_header_spans
     let saved_arr_names = arr_table_names
     let saved_arr_counts = arr_table_counts
     let saved_tmp_str = tmp_str
@@ -682,6 +792,10 @@ pub fn toml_read_value(content: Str, section: Str, key: Str) -> Option[Str] {
     toml_keys = saved_keys
     toml_values = saved_values
     toml_types = saved_types
+    toml_key_spans = saved_key_spans
+    toml_value_spans = saved_value_spans
+    toml_headers = saved_headers
+    toml_header_spans = saved_header_spans
     arr_table_names = saved_arr_names
     arr_table_counts = saved_arr_counts
     tmp_str = saved_tmp_str
