@@ -232,6 +232,9 @@ _Static_assert(BLINK_PID_TABLE_CAP > 0 && BLINK_PID_TABLE_CAP <= (1 << 16),
 
 #define BLINK_PID_KEPT_BYTES (1 << 20)
 
+/* blink_pid_waited is a ring of waited (free) slot indices, oldest wait first. Its first
+ * blink_pid_waited_dropped entries have dropped their results; the rest keep
+ * blink_pid_kept_bytes in all. */
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
     blink_pid_slot blink_pid_table[BLINK_PID_TABLE_CAP];
@@ -255,9 +258,6 @@ _Static_assert(BLINK_PID_TABLE_CAP > 0 && BLINK_PID_TABLE_CAP <= (1 << 16),
 #else
 static blink_pid_slot blink_pid_table[BLINK_PID_TABLE_CAP];
 static int64_t blink_pid_table_len = 0;
-/* Ring of waited (free) slot indices, oldest wait first. Its first
- * blink_pid_waited_dropped entries have dropped their results; the rest keep
- * blink_pid_kept_bytes in all. */
 static int64_t blink_pid_waited[BLINK_PID_TABLE_CAP];
 static int64_t blink_pid_waited_head = 0;
 static int64_t blink_pid_waited_len = 0;
