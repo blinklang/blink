@@ -1,0 +1,146 @@
+// The entry module and two other modules each hold a module-level global of one struct type
+// from a fourth module, so the entry module's private header and each of the three units has
+// the type's guarded GC layout function. A unit that names the function holds its definition
+// ahead of the first call, from its own text and from the copy of the header's block, and the
+// guard keeps it to one definition. No unit includes the entry module's private header whole.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"shared_layout_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/shapes.bl", [
+        #"pub type Point {"#,
+        #"    x: Int"#,
+        #"    y: Int"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/left.bl", [
+        #"import shapes.{Point}"#,
+        #""#,
+        #"let LEFT: List[List[Point]] = [[Point { x: 1, y: 2 }]]"#,
+        #""#,
+        #"pub fn left_sum() -> Int {"#,
+        #"    let p = LEFT.get(0).unwrap().get(0).unwrap()"#,
+        #"    p.x + p.y"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/right.bl", [
+        #"import shapes.{Point}"#,
+        #""#,
+        #"let RIGHT: List[List[Point]] = [[Point { x: 30, y: 40 }]]"#,
+        #""#,
+        #"pub fn right_sum() -> Int {"#,
+        #"    let p = RIGHT.get(0).unwrap().get(0).unwrap()"#,
+        #"    p.x + p.y"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import left.{left_sum}"#,
+        #"import right.{right_sum}"#,
+        #"import shapes.{Point}"#,
+        #""#,
+        #"let MID: List[List[Point]] = [[Point { x: 5, y: 6 }]]"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("sums {left_sum()} {right_sum()} {MID.get(0).unwrap().get(0).unwrap().x}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+fn is_word_byte(b: U8) -> Bool {
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+// Each layout function name `c` holds, once.
+fn layout_names(c: Str) -> List[Str] {
+    let mark = "blink_gc_layout_"
+    let mut out: List[Str] = []
+    let mut from = 0
+    while from < c.byte_len() {
+        match c.byte_index_of(mark, from) {
+            Some(at) => {
+                let mut end = at + mark.byte_len()
+                while end < c.byte_len() && is_word_byte(c.byte_at(end)) { end = end + 1 }
+                let name = c.byte_slice(at, end)
+                if !out.contains(name) { out.push(name) }
+                from = end
+            }
+            None => from = c.byte_len()
+        }
+    }
+    out
+}
+
+fn count_of(text: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut from = 0
+    while from < text.byte_len() {
+        match text.byte_index_of(needle, from) {
+            Some(at) => {
+                n = n + 1
+                from = at + needle.byte_len()
+            }
+            None => from = text.byte_len()
+        }
+    }
+    n
+}
+
+test "each unit that names a GC layout fn defines it ahead of its first call" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_shared_layout_{getpid()}"
+    dev_tree(root, tree)
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    let out = sh("{tree}/out/app")
+    let units = "{tree}/out/app.units"
+    let mut texts: Map[Str, Str] = Map()
+    for m in ["__main__", "left", "right", "shapes"] {
+        texts.insert(m, sh("[ -e {units}/{m}.c ] && cat {units}/{m}.c"))
+    }
+    let main_priv = read_file("{units}/__main__.priv.h")
+    shell_exec("rm -rf {tree}")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    assert_eq(out, "sums 3 70 5")
+    assert_eq(layout_names(main_priv).len(), 1)
+    let mut naming: List[Str] = []
+    for m in ["__main__", "left", "right", "shapes"] {
+        let c = texts.get(m).unwrap()
+        assert(!c.contains("#include \"__main__.priv.h\""), "{m}.c includes __main__.priv.h whole:\n{c}")
+        let names = layout_names(c)
+        if names.len() > 0 { naming.push(m) }
+        for name in names {
+            let head = "static BLINK_UNUSED GC_descr {name}(void) \{"
+            let call = c.byte_index_of("{name}()", 0)
+            let def = c.byte_index_of(head, 0)
+            assert(def.is_some(), "{m}.c names {name} with no definition:\n{c}")
+            assert(call.is_none() || def.unwrap() < call.unwrap(), "{m}.c calls {name} ahead of its definition:\n{c}")
+            assert_eq(count_of(c, "#define BLINK_TD_{name}\n"), count_of(c, head))
+        }
+    }
+    assert_eq(naming.join(","), "__main__,left,right")
+}

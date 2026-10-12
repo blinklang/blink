@@ -1,0 +1,89 @@
+// A module-level global that holds a struct puts a guarded static GC layout function in the
+// entry module's private header. The declaration scan reads that block as one declaration of
+// the function, so a unit that does not name the function neither includes that header nor
+// keys on it, and a private fn added to the entry module recompiles the entry unit alone.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"layout_block_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/lib.bl", [
+        #"pub fn lib_value() -> Int {"#,
+        #"    7"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import lib.{lib_value}"#,
+        #""#,
+        #"type Point {"#,
+        #"    x: Int"#,
+        #"    y: Int"#,
+        #"}"#,
+        #""#,
+        #"let GRID: List[List[Point]] = [[Point { x: 11, y: 22 }]]"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("values {GRID.get(0).unwrap().get(0).unwrap().y} {lib_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+// How many units a build compiled, read from its build.units trace.
+fn compile_count(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+fn build_app(tree: Str) -> ProcessResult {
+    let r = blink_in(tree, "build app/src/main.bl -o {tree}/out/app --per-module")
+    assert(r.exit_code == 0, "per-module build failed: {r.out}{r.err_out}")
+    r
+}
+
+test "a private fn added to an entry module with a struct global recompiles only the entry unit" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_layout_block_{getpid()}"
+    dev_tree(root, tree)
+    let cold = build_app(tree)
+    let out_cold = sh("{tree}/out/app")
+    let priv_h = read_file("{tree}/out/app.units/__main__.priv.h")
+    let main_c = "{tree}/app/src/main.bl"
+    write_file(main_c, "{read_file(main_c)}\nfn helper_added() -> Int \{\n    3\n}\n")
+    let main_text = read_file(main_c)
+    let added = build_app(tree)
+    let out_added = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}")
+    assert(main_text.contains("helper_added"), "the edit did not apply: {main_text}")
+    // The header still holds the block, so the scan, not the emitter, is what this proves.
+    assert(priv_h.contains("blink_gc_layout_Point"), "the private header has no layout block:\n{priv_h}")
+    assert_eq(compile_count(cold), 2)
+    assert_eq(compile_count(added), 1)
+    assert_eq(out_cold, "values 22 7")
+    assert_eq(out_added, "values 22 7")
+}

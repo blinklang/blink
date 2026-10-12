@@ -1,0 +1,98 @@
+// A module header can hold a guarded static GC layout function, the block a module-level
+// global that holds a struct leaves there. The scan reads that block as one declaration of
+// the function: a unit that names the function gets the whole block, and a unit that does not
+// gets nothing of it. A guarded block of any other shape, or one with no end, is a header the
+// scan cannot read, so it is included whole.
+
+import build_unit_headers.{HeaderIndex, index_headers, unit_declarations}
+import cname.{c_gc_layout_head}
+
+fn layout_block(name: Str) -> Str {
+    [
+        "#ifndef BLINK_TD_{name}",
+        "#define BLINK_TD_{name}",
+        "static BLINK_UNUSED GC_descr {name}(void) \{",
+        "    static blink_gc_descr_cell cell;",
+        "    return blink_gc_descr_get(&cell, (int64_t)sizeof(blink_Point), NULL, 0);",
+        "}",
+        "#endif",
+    ].join("\n")
+}
+
+fn priv_header(body: Str) -> Str {
+    [
+        "#ifndef BLINK_MODPRIV___main___H",
+        "#define BLINK_MODPRIV___main___H",
+        "#include \"blink.types.h\"",
+        "extern blink_list* blink_u_GRID;",
+        body,
+        "void blink_main(blink_ev* __ev);",
+        "#endif",
+        "",
+    ].join("\n")
+}
+
+fn index_of(text: Str) -> HeaderIndex {
+    index_headers(["__main__.priv.h"], [text], "blink.types.h")
+}
+
+test "a unit that names a GC layout fn gets its whole guarded block" {
+    let idx = index_of(priv_header(layout_block("blink_gc_layout_Point")))
+    assert_eq(idx.always.len(), 0)
+    let d = unit_declarations("void f(void) \{ blink_alloc_typed(16, blink_gc_layout_Point()); }\n", ["lib.h", "lib.priv.h"], idx, ["__main__.priv.h"])
+    assert_eq(d.whole.len(), 0)
+    assert_eq(d.lines.join("\n"), layout_block("blink_gc_layout_Point"))
+}
+
+test "a unit that does not name a GC layout fn gets nothing of its block" {
+    let idx = index_of(priv_header(layout_block("blink_gc_layout_Point")))
+    let d = unit_declarations("void f(void) \{ blink_main(0); }\n", ["lib.h", "lib.priv.h"], idx, ["__main__.priv.h"])
+    assert_eq(d.whole.len(), 0)
+    assert_eq(d.lines.join("\n"), "void blink_main(blink_ev* __ev);")
+}
+
+test "a guarded block of any other shape makes the header whole" {
+    let typedef_block = [
+        "#ifndef BLINK_TD_blink_Option_Point",
+        "#define BLINK_TD_blink_Option_Point",
+        "typedef struct \{ int tag; blink_Point value; } blink_Option_Point;",
+        "#endif",
+    ].join("\n")
+    let other_fn = [
+        "#ifndef BLINK_TD_blink_gc_layout_Point",
+        "#define BLINK_TD_blink_gc_layout_Point",
+        "static BLINK_UNUSED GC_descr blink_gc_layout_Point(void) \{",
+        "    return blink_u_helper();",
+        "}",
+        "static int64_t blink_u_more(void) \{ return 1; }",
+        "#endif",
+    ].join("\n")
+    let other_guard = [
+        "#ifndef BLINK_TD_blink_gc_layout_Pair",
+        "#define BLINK_TD_blink_gc_layout_Pair",
+        "static BLINK_UNUSED GC_descr blink_gc_layout_Point(void) \{",
+        "}",
+        "#endif",
+    ].join("\n")
+    for body in [typedef_block, other_fn, other_guard] {
+        let idx = index_of(priv_header(body))
+        assert_eq(idx.always.join(","), "__main__.priv.h")
+    }
+}
+
+// The blocks above spell the head out, so they read what the emitter writes only while the
+// head the scan and the emitter share is this line.
+test "the head the scan reads is the layout function's first line" {
+    assert_eq(c_gc_layout_head("blink_gc_layout_Point"), "static BLINK_UNUSED GC_descr blink_gc_layout_Point(void) \{")
+}
+
+test "a guarded block with no end makes the header whole" {
+    let open = [
+        "#ifndef BLINK_TD_blink_gc_layout_Point",
+        "#define BLINK_TD_blink_gc_layout_Point",
+        "static BLINK_UNUSED GC_descr blink_gc_layout_Point(void) \{",
+        "}",
+    ].join("\n")
+    let idx = index_headers(["__main__.priv.h"], ["#ifndef BLINK_MODPRIV___main___H\n#define BLINK_MODPRIV___main___H\n{open}\n"], "blink.types.h")
+    assert_eq(idx.always.join(","), "__main__.priv.h")
+}

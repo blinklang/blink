@@ -18,6 +18,8 @@
 // guesses an int return. So a missed declaration is a build error. The scan reads whole
 // identifiers in code, so a name can match only itself.
 
+import cname.{td_guard_name, td_guard_open_lines, td_guard_close_line, c_gc_layout_head}
+
 pub type HeaderIndex {
     // Every header that declares a symbol, by the symbol.
     by_symbol: Map[Str, List[Str]]
@@ -85,13 +87,25 @@ pub fn index_headers(names: List[Str], texts: List[Str], types: Str) -> HeaderIn
 }
 
 // The declarations of a module header, or the first line that is not its guard, an include of
-// `types` or a one-line declaration. Such a line might declare a name this reader cannot see,
-// or a macro a unit needs, so that header is included whole.
+// `types`, a one-line declaration or a guarded layout function. Such a line might declare a
+// name this reader cannot see, or a macro a unit needs, so that header is included whole.
 fn declared(text: Str, types: Str) -> Result[List[Decl], Str] {
+    let lines = text.lines()
     let mut out: List[Decl] = []
-    for line in text.lines() {
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines.get(i).unwrap()
+        i = i + 1
         if line == "" { continue }
         if line.starts_with("#") {
+            match layout_block(lines, i - 1) {
+                Some(b) => {
+                    out.push(b.decl)
+                    i = b.next
+                    continue
+                }
+                None => {}
+            }
             if !is_guard_line(line, types) { return Err(line) }
             continue
         }
@@ -108,6 +122,36 @@ fn declared(text: Str, types: Str) -> Result[List[Decl], Str] {
         out.push(Decl { name: name, line: line })
     }
     Ok(out)
+}
+
+type LayoutBlock {
+    decl: Decl
+    next: Int
+}
+
+// The guarded layout function that opens at line `at`, as one declaration named by the
+// function with the whole block as its line, and the line past its guard. The emitter's body
+// names only types-header and runtime names, so the block needs no other declaration. Any
+// other guarded block could, so it is not one this reads.
+fn layout_block(lines: List[Str], at: Int) -> Option[LayoutBlock] {
+    let prefix = "#ifndef {td_guard_name("")}"
+    let first = lines.get(at).unwrap()
+    if !first.starts_with(prefix) || at + 2 >= lines.len() { return None }
+    let name = first.byte_slice(prefix.byte_len(), first.byte_len())
+    let open = td_guard_open_lines(name)
+    if first != open.get(0).unwrap() || lines.get(at + 1).unwrap() != open.get(1).unwrap() { return None }
+    if lines.get(at + 2).unwrap() != c_gc_layout_head(name) { return None }
+    // The body is indented; the function's closing brace and then the guard's end close it.
+    let mut j = at + 3
+    while j < lines.len() && lines.get(j).unwrap().starts_with(" ") { j = j + 1 }
+    if j + 1 >= lines.len() || lines.get(j).unwrap() != "}" || lines.get(j + 1).unwrap() != td_guard_close_line() { return None }
+    let mut block: List[Str] = []
+    let mut k = at
+    while k <= j + 1 {
+        block.push(lines.get(k).unwrap())
+        k = k + 1
+    }
+    Some(LayoutBlock { decl: Decl { name: name, line: block.join("\n") }, next: j + 2 })
 }
 
 // A line of the include guard, or the include of the types header. A `#define` with a value
