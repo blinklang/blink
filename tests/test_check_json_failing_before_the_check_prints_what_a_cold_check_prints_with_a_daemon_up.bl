@@ -1,0 +1,100 @@
+// With the project's daemon up, a `check --json` that fails before any check runs (a missing
+// source file, a failed dependency resolve) prints what it prints with no daemon: the same exit
+// code, the one JSON status line on stdout and the human error on stderr. The client finds
+// these failures before it asks the daemon, and the daemon may make a check faster, never
+// different.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // No name, so a dependency resolve fails; the lock keeps the resolve out until it goes.
+    write_file("{tree}/app/blink.toml", "[package]\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the run drops
+// both, and the module filters, and the daemon starts under the same env.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 {tree}/build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(label: Str, a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "{label}: exit {a.exit_code} vs {b.exit_code}" }
+    if a.out.replace(a_tree, "TREE") != b.out.replace(b_tree, "TREE") { return "{label}: stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if a.err_out.replace(a_tree, "TREE") != b.err_out.replace(b_tree, "TREE") { return "{label}: stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// What is wrong with a failed check --json, or "".
+fn failed_with_status(label: Str, r: ProcessResult, file: Str) -> Str {
+    if r.exit_code != 1 { return "{label}: exit {r.exit_code}" }
+    let want = "\{\"status\":\"error\",\"file\":\"{file}\"}\n"
+    if r.out != want { return "{label}: stdout is not `{want}`:\n{r.out}" }
+    ""
+}
+
+test "a check --json that fails before the check prints what a cold check prints with the daemon up" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_json_fail_warm_{getpid()}"
+    let cold = "{root}/.tmp/_json_fail_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        let missing = "check --json src/nope.bl"
+        let w = blink_in(warm, missing)
+        let c = blink_in(cold, missing)
+        problems.push(failed_with_status("warm {missing}", w, "src/nope.bl"))
+        problems.push(differ(missing, warm, w, cold, c))
+        shell_exec("rm -f {warm}/app/blink.lock {cold}/app/blink.lock")
+        let resolve = "check --json src/main.bl"
+        let wr = blink_in(warm, resolve)
+        let cr = blink_in(cold, resolve)
+        problems.push(failed_with_status("warm {resolve}", wr, "src/main.bl"))
+        problems.push(differ(resolve, warm, wr, cold, cr))
+        if !wr.err_out.contains("error: dependency resolution failed") { problems.push("warm {resolve}: stderr:\n{wr.err_out}") }
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+}

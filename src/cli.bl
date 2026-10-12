@@ -4,7 +4,7 @@ import std.args.{
     argparser_new, set_version, add_flag, add_command,
     command_add_flag, command_add_option, command_add_positional,
     argparse, parse_argv, args_has, args_get, args_get_all,
-    args_command, args_positional, args_rest, args_error,
+    args_command, args_command_path, args_positional, args_rest, args_error,
     generate_help, generate_command_help,
 }
 import std.json.{
@@ -452,6 +452,14 @@ fn deps_unresolved() -> Bool {
 }
 
 fn ensure_deps_resolved() {
+    if !deps_resolved() {
+        exit(1)
+    }
+}
+
+// Resolves the dependencies when blink.toml is newer than the lock. False when the resolve
+// failed, with the errors printed on stderr.
+fn deps_resolved() -> Bool {
     if deps_unresolved() {
         io.eprintln("resolving dependencies...")
         // The compile that follows loads blink.toml again and reports its warnings once. The
@@ -463,9 +471,10 @@ fn ensure_deps_resolved() {
         manifest_print_warnings = print_was
         if rc != 0 {
             io.eprintln("error: dependency resolution failed")
-            exit(1)
+            return false
         }
     }
+    true
 }
 
 // Source to a monomorphized program: everything both build shapes share. Err carries the
@@ -4314,13 +4323,22 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 
 fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO {
     let source_path = args_positional(a, 0)
+    let json_output = if args_has(a, "json") { 1 } else { 0 }
     if source_path == "" {
+        if json_output != 0 {
+            io.eprintln("error: no source file specified")
+            io.eprintln(generate_command_help(p, "check"))
+            io.println(check_failed_status_line(""))
+            return
+        }
         io.println("error: no source file specified")
         io.println(generate_command_help(p, "check"))
         return
     }
-    check_file_exists(source_path)
-    let json_output = if args_has(a, "json") { 1 } else { 0 }
+    if !file_exists(source_path) {
+        io.eprintln("error: file not found: {source_path}")
+        check_failed_exit(source_path, json_output)
+    }
     let strict_flag = if args_has(a, "strict") { 1 } else { 0 }
     let strict_struct_layout_flag = if args_has(a, "strict-struct-layout") { 1 } else { 0 }
     set_strict_struct_layout(strict_struct_layout_flag)
@@ -4330,7 +4348,9 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 
     trace_mode = args_get(a, "blink-trace")
-    ensure_deps_resolved()
+    if !deps_resolved() {
+        check_failed_exit(source_path, json_output)
+    }
     if format_flag != "" {
         diag_format = 1
     }
@@ -4348,6 +4368,19 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if code != 0 {
         exit(code)
     }
+}
+
+// A check that fails before it checks anything exits 1; under --json it first prints the
+// status line, so a tool that parses stdout still gets a result.
+fn check_failed_exit(source_path: Str, json_status: Int) {
+    if json_status != 0 {
+        io.println(check_failed_status_line(source_path))
+    }
+    exit(1)
+}
+
+fn check_failed_status_line(source_path: Str) -> Str {
+    check_status_line(source_path, 1, 0, 0, 1, 0)
 }
 
 // The check asks the project's daemon, which checks the entry as this client spells it from
@@ -5909,6 +5942,12 @@ fn main() {
         return
     }
     if err != "" {
+        // The parser stops at the bad argument, so --json counts only when it came first.
+        if args_command_path(a).join(" ") == "check" && args_has(a, "json") {
+            io.eprintln("error: {err}")
+            io.println(check_failed_status_line(args_positional(a, 0)))
+            return
+        }
         io.println("error: {err}")
         return
     }

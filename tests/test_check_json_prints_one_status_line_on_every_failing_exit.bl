@@ -1,0 +1,82 @@
+// `blink check --json` ends every run with one JSON status line on stdout, so a tool that
+// parses it always gets a result: a failed dependency resolve, a missing source file, a missing
+// file argument and a bad command line fail before any check runs, and each still prints the
+// status line. The human text goes to stderr. The fixtures live under a fresh temporary
+// directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn project(manifest: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_json_failing_exit.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", manifest)
+    write_file("{dir}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    dir
+}
+
+fn check_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && $B check {args}")
+}
+
+// What is wrong with the stdout of a failed check --json, or "".
+fn status_error_for(r: ProcessResult, file: Str) -> Str {
+    let lines: List[Str] = r.out.trim().split("\n")
+    if lines.len() != 1 { return "stdout has {lines.len()} lines:\n{r.out}" }
+    json_clear()
+    let root = json_parse(lines.get(0).unwrap())
+    if root < 0 { return "stdout is not JSON: {r.out}" }
+    if json_as_str(json_get(root, "status")) != "error" { return "status is not error: {r.out}" }
+    if json_as_str(json_get(root, "file")) != file { return "file is not `{file}`: {r.out}" }
+    ""
+}
+
+test "check --json prints the error status line when dependency resolution fails" {
+    // No lock, so the check resolves first; the manifest has no name, so the resolve fails.
+    let dir = project("[package]\nversion = \"0.1.0\"\n")
+    let r = check_in(dir, "--json src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.exit_code, 1)
+    assert_eq(status_error_for(r, "src/main.bl"), "")
+    assert(r.err_out.contains("error: dependency resolution failed"))
+}
+
+test "check --json prints the error status line for a missing source file" {
+    let dir = project("[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    let r = check_in(dir, "--json src/nope.bl")
+    let plain = check_in(dir, "src/nope.bl")
+    // A quote in the path must not break the JSON.
+    let quoted = check_in(dir, "--json 'src/a\"b.bl'")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.exit_code, 1)
+    assert_eq(status_error_for(r, "src/nope.bl"), "")
+    assert(r.err_out.contains("error: file not found: src/nope.bl"))
+    assert_eq(plain.exit_code, 1)
+    assert_eq(plain.out, "")
+    assert_eq(quoted.exit_code, 1)
+    assert_eq(status_error_for(quoted, "src/a\"b.bl"), "")
+}
+
+test "check --json prints the error status line when no source file is given" {
+    let dir = project("[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    let r = check_in(dir, "--json")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(status_error_for(r, ""), "")
+    assert(r.err_out.contains("error: no source file specified"))
+}
+
+test "check --json prints the error status line for a bad command line after --json" {
+    let dir = project("[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    let unknown = check_in(dir, "--json --bogus src/main.bl")
+    let no_value = check_in(dir, "src/main.bl --json --format")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(status_error_for(unknown, ""), "")
+    assert(unknown.err_out.contains("error: unknown option '--bogus'"))
+    assert_eq(status_error_for(no_value, "src/main.bl"), "")
+    assert(no_value.err_out.contains("error: option '--format' requires a value"))
+}
