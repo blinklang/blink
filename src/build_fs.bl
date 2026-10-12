@@ -33,8 +33,18 @@ pub fn mkdir_p(path: Str) -> Bool ! IO {
 }
 
 // rm -rf: path and all under it. A link is removed, never followed. True when path is gone.
+// A private dir this process holds live is unlocked once it is gone.
 pub fn remove_tree(path: Str) -> Bool ! IO {
     if path == "" { return false }
+    if live_locks.contains_key(path) {
+        let gone = remove_entries(path)
+        drop_lock(path)
+        return gone
+    }
+    remove_entries(path)
+}
+
+fn remove_entries(path: Str) -> Bool ! IO {
     let mut rc = 0
     let mut err = 0
     with ffi.scope() as scope {
@@ -48,7 +58,7 @@ pub fn remove_tree(path: Str) -> Bool ! IO {
     // through a link.
     if e != BFS_ENOTEMPTY_LINUX && e != BFS_ENOTEMPTY_MACOS && e != BFS_EEXIST { return false }
     for name in list_dir(path) {
-        let _ = remove_tree("{path}/{name}")
+        let _ = remove_entries("{path}/{name}")
     }
     let again = rmdir_errno(path)
     again == 0 || again == BFS_ENOENT
@@ -79,7 +89,8 @@ pub fn rename(from: Str, to: Str) -> Bool ! IO {
 let BFS_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 // mktemp -d {parent}/{prefix}.XXXXXX: a new directory only its user may enter, named by six
-// random characters. "" when none can be made.
+// random characters, which this process holds live (hold_live) until it removes it or calls
+// unmark. "" when none can be made.
 pub fn private_dir(parent: Str, prefix: Str) -> Str ! IO {
     let mut tries = 0
     while tries < 100 {
@@ -101,10 +112,98 @@ pub fn private_dir(parent: Str, prefix: Str) -> Str ! IO {
             rc = bfs_mkdir(scope.cstr(path), 448.to_u32()).to_int()
             if rc != 0 { err = bfs_errno() }
         }
-        if rc == 0 { return path }
+        if rc == 0 {
+            hold_live(path)
+            return path
+        }
         if err != BFS_EEXIST { return "" }
     }
     ""
+}
+
+// A private dir that holds LIVE_MARK is one whose owner holds a flock on it for as long as
+// the owner runs, and the kernel drops that lock when the owner dies, however it dies. So a
+// marked dir whose lock another process can take belongs to a dead build. A dir with no
+// mark, as a compiler from before the mark makes, is never taken for dead: nothing says
+// whether its build still runs.
+let LIVE_MARK = ".blink-live"
+
+// The lock descriptor of each private dir this process holds live, by path.
+let mut live_locks: Map[Str, Int] = Map()
+
+// LOCK_EX and LOCK_NB, 2 and 4 on Linux and macOS.
+let BFS_LOCK_EX_NB = 6
+
+// Whether name is the mark a live private dir holds, which a walk that clears the dir keeps.
+pub fn is_live_mark(name: Str) -> Bool {
+    name == LIVE_MARK
+}
+
+// Locks the new dir at path, then marks it. The mark comes only after the lock, so no reaper
+// can take a marked dir for dead between the two. Where the lock cannot be taken the dir
+// stays unmarked, and no reaper ever removes it.
+fn hold_live(path: Str) ! IO {
+    let mut fd = -1
+    with ffi.scope() as scope {
+        fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+    }
+    if fd < 0 { return }
+    // No child gets a descriptor of the build: a cc that outlives it would pin the dir.
+    if bfs_fcntl(fd.to_i32(), 2.to_i32(), 1.to_i32()).to_int() != 0 || bfs_flock(fd.to_i32(), BFS_LOCK_EX_NB.to_i32()).to_int() != 0 {
+        let _ = bfs_close(fd.to_i32())
+        return
+    }
+    write_file("{path}/{LIVE_MARK}", "")
+    live_locks.insert(path, fd)
+}
+
+// Drops the mark and the lock of a private dir this process holds live, before it renames
+// the dir to a name no reaper looks at. The dir stays.
+pub fn unmark(path: Str) ! IO {
+    match live_locks.get(path) {
+        Some(fd) => {
+            fs_remove("{path}/{LIVE_MARK}")
+            let _ = bfs_close(fd.to_i32())
+            live_locks.remove(path)
+        }
+        None => {}
+    }
+}
+
+fn drop_lock(path: Str) ! IO {
+    match live_locks.get(path) {
+        Some(fd) => {
+            let _ = bfs_close(fd.to_i32())
+            live_locks.remove(path)
+        }
+        None => {}
+    }
+}
+
+// Removes each private dir {parent}/{prefix}.*, for each of prefixes, that a dead build left:
+// one that holds the mark and whose lock this process takes. It holds the lock while it
+// removes the dir.
+pub fn reap_dead(parent: Str, prefixes: List[Str]) ! IO {
+    for name in list_dir(parent) {
+        let mut ours = false
+        for prefix in prefixes {
+            if name.starts_with("{prefix}.") { ours = true }
+        }
+        if !ours { continue }
+        let path = "{parent}/{name}"
+        if live_locks.contains_key(path) || file_exists("{path}/{LIVE_MARK}") == 0 { continue }
+        let mut fd = -1
+        with ffi.scope() as scope {
+            fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+        }
+        if fd < 0 { continue }
+        // The mark is checked again under the lock: a reaper that removed the dir first
+        // leaves none.
+        if bfs_flock(fd.to_i32(), BFS_LOCK_EX_NB.to_i32()).to_int() == 0 && file_exists("{path}/{LIVE_MARK}") == 1 {
+            let _ = remove_tree(path)
+        }
+        let _ = bfs_close(fd.to_i32())
+    }
 }
 
 // touch on a file: its mtime becomes now and its bytes stay. The first byte is written back
@@ -609,7 +708,7 @@ fn bfs_link(from: Str, to: Str) -> I32 ! FFI {}
 fn bfs_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
 
 @ffi("close", header: "unistd.h")
-@trusted(audit: "Wraps close(2) on a descriptor bfs_open returned.")
+@trusted(audit: "Wraps close(2) on a descriptor bfs_open or bfs_pipe returned.")
 fn bfs_close(fd: I32) -> I32 ! FFI {}
 
 @ffi("realpath", header: "stdlib.h")
@@ -641,8 +740,12 @@ fn bfs_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
 fn bfs_pipe(fds: Ptr[I32]) -> I32 ! FFI {}
 
 @ffi("fcntl", header: "fcntl.h")
-@trusted(audit: "Wraps fcntl(2) with F_SETFD and FD_CLOEXEC, 2 and 1 on Linux and macOS, on a descriptor bfs_pipe made. The third argument is an int, as F_SETFD takes.")
+@trusted(audit: "Wraps fcntl(2) with F_SETFD and FD_CLOEXEC, 2 and 1 on Linux and macOS, on a descriptor bfs_pipe or bfs_open made. The third argument is an int, as F_SETFD takes.")
 fn bfs_fcntl(fd: I32, cmd: I32, arg: I32) -> I32 ! FFI {}
+
+@ffi("flock", header: "sys/file.h")
+@trusted(audit: "Wraps flock(2) on a descriptor bfs_open returned. op is LOCK_EX with LOCK_NB, 2 and 4 on Linux and macOS, so it never blocks.")
+fn bfs_flock(fd: I32, op: I32) -> I32 ! FFI {}
 
 @ffi("dup2", header: "unistd.h")
 @trusted(audit: "Wraps dup2(2) in a child bfs_fork made, on descriptors bfs_open returned, before it execs.")

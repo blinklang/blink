@@ -2175,7 +2175,8 @@ unit uses the PCH only when it starts after that.
 Each build compiles in a dir of its own, `.units.<random>` in the out dir,
 and renames it to `<stem>.units` at the end. If blink is killed while cc
 runs, the cc children run to their end, but they write only into the
-dir of the killed build, which no later build reads.
+dir of the killed build, which no later build reads. The next build in
+that out dir removes it (see per-module-o-cache.md, section 5).
 
 Changes a user can see:
 

@@ -1,0 +1,105 @@
+// A one-unit build with no object cache compiles a copy of its C in .unit.<rand> beside the
+// output, and a per-module build writes its units in .units.<rand> there. The build removes
+// the dir itself, but a build killed with SIGKILL cannot, and no cache GC looks beside an
+// output. So the next build of that output must remove each such dir whose build is dead. A
+// cc first on PATH stops a build at one step while hold_<step> exists, and the test then kills
+// the build.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/ccwrap {tree}/app/out")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real = sh("command -v cc")
+    // The step a cc command is: a unit compile or the program link. The held cc names its pid
+    // in held, written whole by a rename.
+    write_file("{tree}/ccwrap/cc", "#!/bin/sh\ncase \" $* \" in\n    *\" -x c-header \"*) step=pch ;;\n    *\" -c \"*) step=compile ;;\n    *libblink_std.a*) step=link ;;\n    *) step=other ;;\nesac\nif [ -e {tree}/hold_$step ]; then\n    echo $$ > {tree}/held.tmp && mv {tree}/held.tmp {tree}/held\n    while [ ! -e {tree}/release ]; do sleep 0.05; done\nfi\nexec {real} \"$@\"\n")
+    shell_exec("chmod +x {tree}/ccwrap/cc")
+    write_file("{tree}/app/main.bl", "fn main() \{\n    io.println(\"app\")\n\}\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE, so the run drops
+// both, and the module filters. cache is the BLINK_CACHE_DIR to build with; "" turns the
+// object cache off.
+fn env_of(tree: Str, cache: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_OBJCACHE_EVICT -u BLINK_DEV_OBJCACHE_HOLD BLINK_CACHE_DIR={cache} PATH={tree}/ccwrap:$PATH"
+}
+
+fn build(tree: Str, cache: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree, cache)} ../build/blink build main.bl -o out/app {args}"])
+}
+
+// Waits up to a minute for pid to be gone.
+fn wait_gone(pid: Str) {
+    shell_exec("for i in $(seq 1 1200); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done")
+}
+
+// Starts a build, kills it with SIGKILL once its cc reaches step, then lets that cc go and
+// waits for it to end. Answers "" when the build reached step, else what it printed.
+fn kill_at(tree: Str, cache: Str, step: Str, args: Str) -> Str {
+    shell_exec("rm -f {tree}/held {tree}/release && touch {tree}/hold_{step}")
+    // env execs blink, so $! is the build's own pid.
+    shell_exec("cd {tree}/app && \{ {env_of(tree, cache)} ../build/blink build main.bl -o out/app {args} > {tree}/killed.log 2>&1 & echo $! > {tree}/blink.pid; \}")
+    let blink = sh("cat {tree}/blink.pid")
+    let reached = process_run("sh", ["-c", "for i in $(seq 1 2400); do [ -e {tree}/held ] && exit 0; kill -0 {blink} 2>/dev/null || exit 1; sleep 0.05; done; exit 1"]).exit_code == 0
+    shell_exec("kill -9 {blink} 2>/dev/null")
+    wait_gone(blink)
+    shell_exec("rm -f {tree}/hold_{step} && touch {tree}/release")
+    if !reached {
+        return "the build never reached {step}: {read_file("{tree}/killed.log")}"
+    }
+    wait_gone(sh("cat {tree}/held"))
+    ""
+}
+
+// The private dirs beside the output.
+fn private_left(tree: Str) -> Str {
+    sh("ls -A {tree}/app/out | grep '^\\.unit' | tr '\\n' ' '").trim()
+}
+
+test "a one-unit build with no cache killed at its link leaves a dir the next build removes" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_reap_beside_unit_{getpid()}"
+    dev_tree(root, tree)
+    let killed = kill_at(tree, "", "link", "--no-per-module")
+    let left = private_left(tree)
+    let next = build(tree, "", "--no-per-module")
+    let after = private_left(tree)
+    let ran = sh("{tree}/app/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(killed, "")
+    assert(left.starts_with(".unit."), "the killed build left no .unit dir, so nothing was tested: {left}")
+    assert(next.exit_code == 0, "the next build failed: {next.out}{next.err_out}")
+    assert_eq(after, "")
+    assert_eq(ran, "app")
+}
+
+test "a per-module build killed at its link leaves a units dir the next build removes" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_reap_beside_units_{getpid()}"
+    dev_tree(root, tree)
+    let killed = kill_at(tree, "{tree}/objcache", "link", "--per-module")
+    let left = private_left(tree)
+    let next = build(tree, "{tree}/objcache", "--per-module")
+    let after = private_left(tree)
+    let ran = sh("{tree}/app/out/app")
+    shell_exec("rm -rf {tree}")
+    assert_eq(killed, "")
+    assert(left.starts_with(".units."), "the killed build left no .units dir, so nothing was tested: {left}")
+    assert(next.exit_code == 0, "the next build failed: {next.out}{next.err_out}")
+    assert_eq(after, "")
+    assert_eq(ran, "app")
+}

@@ -1,0 +1,110 @@
+// A build removes the private dirs that dead builds left, in the object cache's tmp/ and
+// beside its output. It must never remove one that a live build still uses, nor one that a
+// compiler without the reap made, as it cannot tell whether that build is alive. A cc first on
+// PATH holds build A at its link while hold_link exists; build B then runs to its end on the
+// same cache and in the same out dir, and A's dirs must still be there, and A must then build
+// a program that runs.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/ccwrap {tree}/app/out")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let real = sh("command -v cc")
+    // Only the link of out/held_app is held, so B, which links out/other, never waits.
+    write_file("{tree}/ccwrap/cc", "#!/bin/sh\ncase \" $* \" in\n    *\" -c \"*) ;;\n    *\" -o out/held_app \"*libblink_std.a*) if [ -e {tree}/hold_link ]; then touch {tree}/held; while [ ! -e {tree}/release ]; do sleep 0.05; done; fi ;;\nesac\nexec {real} \"$@\"\n")
+    shell_exec("chmod +x {tree}/ccwrap/cc")
+    write_file("{tree}/app/held.bl", "fn main() \{\n    io.println(\"held\")\n\}\n")
+    write_file("{tree}/app/other.bl", "fn main() \{\n    io.println(\"other\")\n\}\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE, so the run drops
+// both, and the module filters. cache is the BLINK_CACHE_DIR to build with; "" turns the
+// object cache off.
+fn env_of(tree: Str, cache: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_OBJCACHE_EVICT -u BLINK_DEV_OBJCACHE_HOLD BLINK_CACHE_DIR={cache} PATH={tree}/ccwrap:$PATH"
+}
+
+// Every private dir in the cache's tmp/ and beside the output, one per line, sorted.
+fn private_dirs(tree: Str) -> Str {
+    sh("cd {tree} && (ls -d objcache/tmp/* 2>/dev/null; ls -A app/out | grep '^\\.unit' | sed 's|^|app/out/|') | sort")
+}
+
+// Dirs as a compiler without the reap leaves them: no build can say whether theirs is alive.
+fn plant_unmarked(tree: Str) {
+    shell_exec("mkdir -p {tree}/objcache/tmp/unit.Unmrkd {tree}/objcache/tmp/hold.Unmrkd {tree}/app/out/.unit.Unmrkd {tree}/app/out/.units.Unmrkd")
+}
+
+type Run {
+    held_before: Str
+    other: ProcessResult
+    held_after: Str
+    held_rc: Str
+    held_ran: Str
+}
+
+// Holds a build of held.bl at its link, runs a build of other.bl to its end, then lets the
+// held build go and waits for it.
+fn run_pair(tree: Str, cache: Str, args: Str) -> Run {
+    plant_unmarked(tree)
+    shell_exec("rm -f {tree}/held {tree}/release {tree}/held_rc && touch {tree}/hold_link")
+    shell_exec("cd {tree}/app && \{ sh -c '{env_of(tree, cache)} ../build/blink build held.bl -o out/held_app {args} > {tree}/held.log 2>&1; echo $? > {tree}/held_rc' & \}")
+    let reached = process_run("sh", ["-c", "for i in $(seq 1 2400); do [ -e {tree}/held ] && exit 0; [ -e {tree}/held_rc ] && exit 1; sleep 0.05; done; exit 1"]).exit_code == 0
+    let before = if reached { private_dirs(tree) } else { "never reached the link: {read_file("{tree}/held.log")}" }
+    let other = process_run("sh", ["-c", "cd {tree}/app && {env_of(tree, cache)} ../build/blink build other.bl -o out/other {args}"])
+    let after = private_dirs(tree)
+    shell_exec("rm -f {tree}/hold_link && touch {tree}/release")
+    shell_exec("for i in $(seq 1 2400); do [ -e {tree}/held_rc ] && exit 0; sleep 0.05; done")
+    Run { held_before: before, other: other, held_after: after, held_rc: sh("cat {tree}/held_rc"), held_ran: sh("{tree}/app/out/held_app") }
+}
+
+fn check(label: Str, r: Run, own: Str) {
+    assert(r.held_before.replace("{own}Unmrkd", "").contains(own), "{label}: the held build had no {own} dir, so nothing was tested: {r.held_before}")
+    assert(r.other.exit_code == 0, "{label}: the other build failed: {r.other.out}{r.other.err_out}")
+    // The other build's own dirs are gone by its end, so what is left is the held build's
+    // and the unmarked ones, as they were.
+    assert_eq(r.held_after, r.held_before)
+    assert_eq(r.held_rc, "0")
+    assert_eq(r.held_ran, "held")
+}
+
+test "a per-module build reaps neither a live build's hold and units dirs nor unmarked dirs" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_reap_live_pm_{getpid()}"
+    dev_tree(root, tree)
+    let r = run_pair(tree, "{tree}/objcache", "--per-module")
+    shell_exec("rm -rf {tree}")
+    check("per-module", r, "objcache/tmp/hold.")
+    assert(r.held_before.replace("app/out/.units.Unmrkd", "").contains("app/out/.units."), "per-module: the held build had no units dir: {r.held_before}")
+}
+
+test "a one-unit build reaps neither a live build's cache unit dir nor unmarked dirs" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_reap_live_unit_{getpid()}"
+    dev_tree(root, tree)
+    let r = run_pair(tree, "{tree}/objcache", "--no-per-module")
+    shell_exec("rm -rf {tree}")
+    check("one-unit", r, "objcache/tmp/unit.")
+}
+
+test "a one-unit build with no cache reaps neither a live build's dir beside the output nor unmarked dirs" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_reap_live_nocache_{getpid()}"
+    dev_tree(root, tree)
+    let r = run_pair(tree, "", "--no-per-module")
+    shell_exec("rm -rf {tree}")
+    check("no cache", r, "app/out/.unit.")
+}

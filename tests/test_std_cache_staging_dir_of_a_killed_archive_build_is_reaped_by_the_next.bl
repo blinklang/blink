@@ -1,0 +1,54 @@
+// A stdlib archive build writes its entry in a staging dir under build/std-cache and renames
+// it into place at its end. A build killed with SIGKILL leaves that dir, and so does one whose
+// cc fails. So the next archive build there must remove each staging dir whose build is dead.
+// A cc first on PATH holds the monolith compile while hold exists.
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn wait_gone(pid: Str) {
+    shell_exec("for i in $(seq 1 1200); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done")
+}
+
+// Whatever std-cache holds but the 16-hex entries a finished build leaves.
+fn staging_left(tree: Str) -> Str {
+    sh("ls -A {tree}/build/std-cache | grep -v '^[0-9a-f]\\\{16\\\}$' | tr '\\n' ' '").trim()
+}
+
+test "an archive build removes the staging dir of a killed archive build" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_reap_std_cache_{getpid()}"
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/ccwrap")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    shell_exec("cp -L {root}/build/runtime.h {tree}/build/runtime.h")
+    let real = sh("command -v cc")
+    write_file("{tree}/ccwrap/cc", "#!/bin/sh\ncase \" $* \" in\n    *monolith.c*) if [ -e {tree}/hold ]; then echo $$ > {tree}/held.tmp && mv {tree}/held.tmp {tree}/held; while [ ! -e {tree}/release ]; do sleep 0.05; done; fi ;;\nesac\nexec {real} \"$@\"\n")
+    shell_exec("chmod +x {tree}/ccwrap/cc")
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_FORCE_STDLIB_REBUILD PATH={tree}/ccwrap:$PATH"
+
+    shell_exec("touch {tree}/hold")
+    // env execs blink, so $! is the build's own pid.
+    shell_exec("cd {tree} && \{ {env_of} build/blink __build-stdlib-archive > {tree}/killed.log 2>&1 & echo $! > {tree}/blink.pid; \}")
+    let blink = sh("cat {tree}/blink.pid")
+    let reached = process_run("sh", ["-c", "for i in $(seq 1 6000); do [ -e {tree}/held ] && exit 0; kill -0 {blink} 2>/dev/null || exit 1; sleep 0.05; done; exit 1"]).exit_code == 0
+    shell_exec("kill -9 {blink} 2>/dev/null")
+    wait_gone(blink)
+    shell_exec("rm -f {tree}/hold && touch {tree}/release")
+    if reached { wait_gone(sh("cat {tree}/held")) }
+    let killed_log = read_file("{tree}/killed.log")
+    let left = staging_left(tree)
+    let next = process_run("sh", ["-c", "cd {tree} && {env_of} build/blink __build-stdlib-archive"])
+    let after = staging_left(tree)
+    let entries = sh("ls -A {tree}/build/std-cache | grep -c '^[0-9a-f]\\\{16\\\}$'")
+    shell_exec("rm -rf {tree}")
+    assert(reached, "the archive build never reached its monolith compile: {killed_log}")
+    assert(left != "", "the killed build left no staging dir, so nothing was tested")
+    assert(next.exit_code == 0, "the next archive build failed: {next.out}{next.err_out}")
+    assert_eq(after, "")
+    assert_eq(entries, "1")
+}
