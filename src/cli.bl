@@ -2226,13 +2226,20 @@ type UnitCompile {
     used_pch: Bool
 }
 
-// A PCH build for run_unit_compiles: cmd writes the .gch into the staged dir, which becomes
-// the PCH for key when cmd ends well. The units read it from hold. An empty cmd builds none.
+// A PCH build for run_unit_compiles: cmd writes the PCH into the staged dir, which becomes
+// the PCH for key when cmd ends well. The units read it from hold, which links the staged
+// files named in files. An empty cmd builds none. A clang PCH is built from the archive
+// headers in arc_dir, which must still hash to archive_sha and runtime_sha when it ends; ""
+// for a gcc one, whose staged copies were hashed before it started.
 type PchJob {
     cmd: Str
     key: Str
     staged: Str
     hold: Str
+    files: List[Str]
+    arc_dir: Str
+    archive_sha: Str
+    runtime_sha: Str
 }
 
 // pch_child is a PCH build still running when every unit had started without it, or one with
@@ -2245,7 +2252,7 @@ type UnitRun {
 }
 
 fn no_pch_job() -> PchJob {
-    PchJob { cmd: "", key: "", staged: "", hold: "" }
+    PchJob { cmd: "", key: "", staged: "", hold: "", files: [], arc_dir: "", archive_sha: "", runtime_sha: "" }
 }
 
 fn no_child() -> build_fs.FileChild {
@@ -2259,11 +2266,15 @@ fn finish_pch(run: UnitRun) -> Bool ! IO {
         return run.pch_stored
     }
     let r = build_fs.reap_to_files(run.pch_child)
-    if r.exit_code == 0 {
+    if r.exit_code == 0 && pch_inputs_unchanged(run.pch) {
         return build_objcache.store_pch(run.pch.key, run.pch.staged)
     }
     let _ = build_fs.remove_tree(run.pch.staged)
     false
+}
+
+fn pch_inputs_unchanged(pch: PchJob) -> Bool ! IO {
+    pch.arc_dir == "" || build_objcache.pch_headers_unchanged(pch.arc_dir, pch.archive_sha, pch.runtime_sha)
 }
 
 // Runs each unit command as sh would with at most `unit_jobs` at a time (the CPU count for
@@ -2312,9 +2323,9 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
     }
     if pch_child.pid > 0 && started < n {
         let r = build_fs.reap_to_files(pch_child)
-        if r.exit_code == 0 {
+        if r.exit_code == 0 && pch_inputs_unchanged(pch) {
             // Held before the store: once stored, the GC of another build can remove it.
-            ready = build_objcache.hold_pch(pch.staged, pch.hold)
+            ready = build_objcache.hold_pch_files(pch.staged, pch.hold, pch.files)
             stored = build_objcache.store_pch(pch.key, pch.staged)
         } else {
             let _ = build_fs.remove_tree(pch.staged)
@@ -2367,7 +2378,9 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
 
 // The macros the unit at c_path defines before it includes the archive header, as -D flags
 // in its order, or None when anything else comes first. gcc takes a PCH only for a unit that
-// defines the macros it was built with. The prologue is a line per gate the unit reads, so
+// defines the macros it was built with. clang reads a PCH before the unit's first line and
+// stops only on a macro the unit defines to another value, so this rule is what keeps a clang
+// unit from reading one built with macros it does not define. The prologue is a line per gate the unit reads, so
 // the head of the file holds it.
 fn archive_header_prefix(c_path: Str) -> Option[List[Str]] ! IO {
     let text = read_file(c_path)
@@ -2386,10 +2399,11 @@ fn archive_header_prefix(c_path: Str) -> Option[List[Str]] ! IO {
     None
 }
 
-// A PCH of the archive header serves only a plain gcc compile. clang and zig cc read a PCH
-// only through -include-pch, ccache needs settings of its own to pass one, and a .gch beside
-// the archive header already serves every unit. BLINK_ARCHIVE_PCH=0 turns it off, so a test
-// can build the same objects with no PCH in the cache.
+// A PCH of the archive header serves a native gcc or clang compile. ccache needs settings of
+// its own to pass one. A cross build would need a PCH per target, and none links yet. A .gch
+// beside the archive header already serves every gcc unit; clang reads no .gch.
+// BLINK_ARCHIVE_PCH=0 turns it off, so a test can build the same objects with no PCH in the
+// cache.
 fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO {
     if (env.var("BLINK_ARCHIVE_PCH") ?? "") == "0" {
         return false
@@ -2397,10 +2411,12 @@ fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO {
     if target != "" || has_ccache() != 0 {
         return false
     }
-    if file_exists("{arc_dir}/libblink_std.h.gch") == 1 {
-        return false
-    }
-    !process_cc_id(target).contains("clang")
+    cc_is_clang() || file_exists("{arc_dir}/libblink_std.h.gch") == 0
+}
+
+// Whether the native cc is clang, which reads a PCH only through -include-pch.
+fn cc_is_clang() -> Bool ! IO {
+    process_cc_id("").contains("clang")
 }
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
@@ -2507,6 +2523,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut pch_hold = ""
     let mut pch_ready = false
     let mut pch = no_pch_job()
+    let clang = pch_prefix != "" && cc_is_clang()
+    let pch_files = if clang { [build_objcache.clang_pch_name()] } else { ["libblink_std.h", "runtime.h", "libblink_std.h.gch"] }
     if pch_prefix != "" {
         let s = shas.unwrap()
         let archive_sha = s.get("{arc_dir}/libblink_std.h") ?? ""
@@ -2518,18 +2536,27 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         pch_key = build_objcache.pch_key(archive_sha, runtime_sha, process_cc_id(target), arc_dir, unit_key_flags(debug_mode, release_mode), pch_defines, include_list, vendored_headers ?? [])
         if pch_key != "" && hold != "" {
             pch_hold = "{hold}/pch"
-            let found = build_objcache.lookup_pch(pch_key)
-            pch_ready = found != "" && build_objcache.hold_pch(found, pch_hold)
+            let found = if clang { build_objcache.lookup_pch_file(pch_key, build_objcache.clang_pch_name()) } else { build_objcache.lookup_pch(pch_key) }
+            pch_ready = found != "" && build_objcache.hold_pch_files(found, pch_hold, pch_files)
             // A program's first build makes no PCH: a one-off build (a test, a CI job) would
             // pay for one that no later build reads. units_dir holds the last build of this
             // program, so the first edit after it builds the PCH while its units compile.
-            if !pch_ready && is_dir(units_dir) == 1 {
+            if !pch_ready && is_dir(units_dir) == 1 && clang {
+                // clang reads the headers again at the paths it built from, so it builds from
+                // the archive dir, where the debug info of a unit without the PCH points too.
+                // Without -fno-pch-timestamp a reinstall of the same header would stop it.
+                let staged = build_objcache.make_private_dir()
+                if staged != "" {
+                    let cmd = cc_command("{unit_cc_flags().join(" ")} {pch_defines.join(" ")} -Xclang -fno-pch-timestamp -x c-header {arc_dir}/libblink_std.h -o {staged}/{build_objcache.clang_pch_name()} {includes}", debug_mode, release_mode, target)
+                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged, hold: pch_hold, files: pch_files, arc_dir: arc_dir, archive_sha: archive_sha, runtime_sha: runtime_sha }
+                }
+            } else if !pch_ready && is_dir(units_dir) == 1 {
                 let staged = build_objcache.stage_pch(arc_dir, archive_sha, runtime_sha)
                 if staged != "" {
                     // The debug info names the archive dir, as a unit's without the PCH does,
                     // and the header finds each file it includes where a unit's compile does.
                     let cmd = cc_command("{unit_cc_flags().join(" ")} {pch_defines.join(" ")} -ffile-prefix-map={staged}={arc_dir} -x c-header {staged}/libblink_std.h -o {staged}/libblink_std.h.gch -I{staged} {includes}", debug_mode, release_mode, target)
-                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged, hold: pch_hold }
+                    pch = PchJob { cmd: cmd, key: pch_key, staged: staged, hold: pch_hold, files: pch_files, arc_dir: "", archive_sha: "", runtime_sha: "" }
                 }
             }
         }
@@ -2541,7 +2568,9 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         dbg_trace("build.units", "compile {u.stem}")
         let line = "-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -ffile-prefix-map={work}={units_dir}"
         cmds.push(cc_command("{line} {includes}", debug_mode, release_mode, target))
-        if pch_hold != "" && prefixes.get(mi).unwrap() == pch_prefix {
+        if pch_hold != "" && prefixes.get(mi).unwrap() == pch_prefix && clang {
+            pch_cmds.push(cc_command("{line} -include-pch {pch_hold}/{build_objcache.clang_pch_name()} {includes}", debug_mode, release_mode, target))
+        } else if pch_hold != "" && prefixes.get(mi).unwrap() == pch_prefix {
             pch_cmds.push(cc_command("{line} -ffile-prefix-map={pch_hold}={arc_dir} -I{pch_hold} {includes}", debug_mode, release_mode, target))
         } else {
             pch_cmds.push("")
@@ -2554,8 +2583,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let run = run_unit_compiles(cmds, pch_cmds, pch_ready, pch, unit_jobs, obj_dir)
     let mut results = run.results
     // gcc stops on a .gch cut short, where it reads the header beside any other .gch it cannot
-    // take. So a unit that failed with the PCH compiles once more without it, and the PCH goes
-    // when that compile ends well.
+    // take; clang stops on any PCH it cannot take. So a unit that failed with the PCH compiles
+    // once more without it, and the PCH goes when that compile ends well.
     let mut retry_idx: List[Int] = []
     let mut retry_cmds: List[Str] = []
     for r in results {

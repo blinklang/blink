@@ -1,0 +1,126 @@
+// clang stops with an error on any PCH it cannot take: one cut short, one that is not a PCH,
+// one built at another -O level. None of them may fail a build: a unit that failed with the
+// PCH compiles again without it, and the build drops the PCH.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs clang. Each
+// compile writes its arguments and its -H output to a file of its own, so a unit that read
+// the PCH shows -include-pch and no line for the archive header.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let clang = sh("command -v clang")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    // A program's first build makes no PCH, so the tree starts with one build behind it.
+    edit_main(tree, 0)
+    let _ = build_out(tree, "")
+}
+
+fn edit_main(tree: Str, n: Int) {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+}
+
+// Builds in the tree with its own object cache, the clang cc and the unit trace, answering
+// what the build printed. The corpus exports BLINK_COMPILER_ARCHIVE and module filters,
+// which make the build one unit, so the run drops them.
+fn build_out(tree: Str, flags: Str) -> Str {
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module {flags}"])
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    "{r.out}{r.err_out}"
+}
+
+// The compiles of the last build that read a PCH the build held under the cache's tmp/.
+fn pch_reads(tree: Str) -> Int {
+    sh("grep -l '^ARGS .* -include-pch {tree}/objcache/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.pch' {tree}/cc_h/* | xargs -r grep -L -e 'libblink_std\\.h$' -e 'error:' | wc -l").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+fn the_pch(tree: Str, dir: Str) -> Str {
+    "{tree}/objcache/{dir}/libblink_std.h.pch"
+}
+
+// Edits, builds, and answers what the build printed, what the program printed and whether
+// the build dropped the PCH in dir.
+fn broken_build(tree: Str, n: Int, dir: Str) -> (Str, Str, Bool) {
+    edit_main(tree, n)
+    let out = build_out(tree, "")
+    (out, sh("{tree}/out/app"), !pch_dirs(tree).contains(dir))
+}
+
+test "a truncated, garbage or mismatched clang archive header PCH falls back to the header" {
+    if sh("command -v clang") == "" {
+        io.println("skip: no clang on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_clang_pch_fallback_{getpid()}"
+    dev_tree(root, tree)
+    edit_main(tree, 1)
+    let _ = build_out(tree, "")
+    let dirs = pch_dirs(tree)
+    assert(dirs.len() == 1, "the first edit made {dirs.len()} PCH dirs")
+    let dir = dirs.get(0).unwrap()
+    edit_main(tree, 2)
+    let _ = build_out(tree, "")
+    let warm_reads = pch_reads(tree)
+
+    shell_exec("head -c 100000 {the_pch(tree, dir)} > {tree}/cut && mv {tree}/cut {the_pch(tree, dir)}")
+    let (cut_out, cut, cut_dropped) = broken_build(tree, 3, dir)
+    edit_main(tree, 13)
+    let _ = build_out(tree, "")
+    let remade_bytes = sh("wc -c < {the_pch(tree, dir)}").to_int()
+
+    shell_exec("mkdir -p {tree}/objcache/{dir} && printf garbage > {the_pch(tree, dir)}")
+    let (garbage_out, garbage, garbage_dropped) = broken_build(tree, 4, dir)
+
+    // A PCH of the same header built for a debug build, under the key of the default one:
+    // clang stops on its other -O level.
+    edit_main(tree, 5)
+    let _ = build_out(tree, "--debug")
+    edit_main(tree, 6)
+    let _ = build_out(tree, "--debug")
+    let mut debug_dir = ""
+    for d in pch_dirs(tree) {
+        if d != dir { debug_dir = d }
+    }
+    if debug_dir != "" {
+        shell_exec("mkdir -p {tree}/objcache/{dir} && cp {the_pch(tree, debug_dir)} {the_pch(tree, dir)}")
+    }
+    let (mismatched_out, mismatched, mismatched_dropped) = broken_build(tree, 7, dir)
+    shell_exec("rm -rf {tree}")
+    assert(warm_reads >= 1, "the warm build read no PCH, so the fallback cases prove nothing")
+    assert(cut_out.contains("pch fallback __main__ exit 0"), "no fallback compile for a cut PCH: {cut_out}")
+    assert_eq(cut, "sum 44")
+    assert(cut_dropped, "the build kept a cut PCH")
+    // The next build made the PCH again under the same key.
+    assert(remade_bytes > 1000000, "the next build made a .pch of {remade_bytes} bytes")
+    assert(garbage_out.contains("pch fallback __main__ exit 0"), "no fallback compile for a garbage PCH: {garbage_out}")
+    assert_eq(garbage, "sum 45")
+    assert(garbage_dropped, "the build kept a garbage PCH")
+    assert(debug_dir != "", "the debug build made no PCH of its own")
+    assert(mismatched_out.contains("pch fallback __main__ exit 0"), "no fallback compile for a debug PCH: {mismatched_out}")
+    assert_eq(mismatched, "sum 48")
+    assert(mismatched_dropped, "the build kept a mismatched PCH")
+}

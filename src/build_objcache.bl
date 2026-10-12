@@ -653,13 +653,16 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
     out
 }
 
-// A unit spends most of a small compile parsing the archive header, so a gcc build keeps a
-// PCH of it here: <key>.pch/ holds copies of libblink_std.h and runtime.h and the .gch built
-// from them, and <key>.meta its mtime for the LRU. The key covers what gcc needs to take the
-// .gch: the header bytes, the compiler, every flag, the macros a unit defines before the
-// header, each include dir and the headers in it (vendored_headers, as header_lines_in
-// answers them for those dirs), and the archive dir the debug info names in place of the PCH
-// dir. gcc checks the rest itself and reads the header copy beside a .gch it rejects, so a
+// A unit spends most of a small compile parsing the archive header, so a build keeps a PCH
+// of it here, and <key>.meta its mtime for the LRU. For gcc, <key>.pch/ holds copies of
+// libblink_std.h and runtime.h and the .gch built from them. For clang it holds only the .pch:
+// clang records the path of each header it read and reads them there again, so the PCH is
+// built from the archive dir itself. The key covers what the compiler needs to take the PCH:
+// the header bytes, the compiler (cc_id, so a gcc and a clang PCH never serve each other),
+// every flag, the macros a unit defines before the header, each include dir and the headers
+// in it (vendored_headers, as header_lines_in answers them for those dirs), and the archive
+// dir the debug info names. gcc checks the rest itself and reads the header copy beside a .gch
+// it rejects; clang stops on one, and the unit compiles again without it. Either way a
 // unit's object, and its key, do not depend on the PCH.
 pub fn pch_key(archive_sha: Str, runtime_sha: Str, cc_id: Str, arc_dir: Str, flags: List[Str], defines: List[Str], include_flags: List[Str], vendored_headers: List[Str]) -> Str {
     if archive_sha == "" || runtime_sha == "" || cc_id == "" {
@@ -686,13 +689,23 @@ pub fn pch_dir(key: Str) -> Str {
     "{obj_cache_dir()}/{key}.pch"
 }
 
+// The file in a PCH dir that clang reads through -include-pch.
+pub fn clang_pch_name() -> Str {
+    "libblink_std.h.pch"
+}
+
 // The PCH dir for key when its .gch is in place, and its entry marked as used; "" when not.
 pub fn lookup_pch(key: Str) -> Str ! IO {
+    lookup_pch_file(key, "libblink_std.h.gch")
+}
+
+// lookup_pch for the PCH file name a compiler reads.
+pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO {
     if !cache_enabled() || key == "" {
         return ""
     }
     let dir = pch_dir(key)
-    if file_exists("{dir}/libblink_std.h.gch") == 0 {
+    if file_exists("{dir}/{name}") == 0 {
         return ""
     }
     let _ = build_fs.touch("{obj_cache_dir()}/{key}.meta")
@@ -703,10 +716,15 @@ pub fn lookup_pch(key: Str) -> Str ! IO {
 // which the units read in place of dir, so the GC of another build can remove the entry while
 // they compile. False, with nothing left in hold, when one cannot be held.
 pub fn hold_pch(dir: Str, hold: Str) -> Bool ! IO {
+    hold_pch_files(dir, hold, ["libblink_std.h", "runtime.h", "libblink_std.h.gch"])
+}
+
+// hold_pch for the files a PCH dir holds for a compiler.
+pub fn hold_pch_files(dir: Str, hold: Str, names: List[Str]) -> Bool ! IO {
     if dir == "" || hold == "" || !build_fs.mkdir_p(hold) {
         return false
     }
-    for name in ["libblink_std.h", "runtime.h", "libblink_std.h.gch"] {
+    for name in names {
         if !hold_file("{dir}/{name}", "{hold}/{name}") {
             let _ = build_fs.remove_tree(hold)
             return false
@@ -732,6 +750,13 @@ pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO {
         }
     }
     dir
+}
+
+// Whether libblink_std.h and runtime.h in arc_dir still hash to the shas a PCH key was made
+// from. clang takes a PCH whose header changed but kept its size, so a PCH built from the
+// archive dir is stored only when its headers did not change while it was built.
+pub fn pch_headers_unchanged(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Bool ! IO {
+    (sha256_file_hex("{arc_dir}/libblink_std.h") ?? "") == archive_sha && (sha256_file_hex("{arc_dir}/runtime.h") ?? "") == runtime_sha
 }
 
 // Installs the staged dir as the PCH for key. False when another build installed it first, or

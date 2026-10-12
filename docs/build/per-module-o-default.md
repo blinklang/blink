@@ -1918,9 +1918,9 @@ archive dir as a compile without the PCH does.
   wrong PCH costs only time. A `.gch` cut short stops gcc instead, so a
   unit that fails with the PCH compiles once more without it, and the
   build drops the PCH when that compile passes.
-- No PCH for a cross build, for clang (it reads a PCH only through
-  `-include-pch`), under ccache, or when a `libblink_std.h.gch` sits
-  beside the archive header already.
+- No PCH for a cross build or under ccache. No gcc PCH when a
+  `libblink_std.h.gch` sits beside the archive header already. clang
+  gets a PCH of its own (see "clang and zig cc" below).
 - A program's first build makes no PCH. A one-off build (a test, a CI
   job) would pay for a PCH that no later build reads. The build makes one
   only when `<out_dir>/<name>.units/` is there: each build that reaches
@@ -2065,6 +2065,84 @@ The 10 tests are kept: each covers a case the PCH can get wrong (race,
 bad `.gch`, byte-equal objects at `-O1` and `-g`, one error per unit,
 GC, the key), and each goes red on its own mutant. The race test came
 after these walls and adds about 0.3 s of CPU.
+
+#### clang and zig cc
+
+clang reads a PCH only through `-include-pch`, never from a `.gch` or
+`.pch` beside a header it includes. Measured with clang 23.1.1 at `-O1`,
+one compile at a time, 5 runs, median ms (min-max):
+
+| unit | plain | with PCH |
+|---|---|---|
+| `cname` | 190.0 (188.3-195.2) | 175.0 (173.5-176.1) |
+| `comment_attach` | 130.9 (130.1-131.4) | 116.0 (115.9-117.4) |
+| `std_cache_key` | 46.5 (45.7-47.5) | 30.7 (30.0-30.9) |
+
+So each clang compile spends about 15 ms in the header. The PCH builds
+in about 40 ms and is 1.3 MB.
+
+clang records the absolute path of each header it read in the PCH, and
+reads them there again when a unit loads it. A PCH built from copies in
+one dir and moved fails with "could not find file", even with
+`-fno-validate-pch`. So the clang PCH is built from
+`<arc_dir>/libblink_std.h` itself, with no copies and no prefix map:
+
+- `<key>.pch/` holds only `libblink_std.h.pch`. The build links it at
+  `<hold>/pch/libblink_std.h.pch`, and a unit it serves compiles with
+  `-include-pch <hold>/pch/libblink_std.h.pch`. A moved or linked `.pch`
+  loads, since clang checks the headers and not the PCH path. The debug
+  info names the archive dir, as a unit compiled without it does.
+- The key is the gcc key. Its cc id (`cc --version`, first line) tells
+  gcc and clang apart, so a `.gch` and a `.pch` never share a dir.
+- The build passes `-Xclang -fno-pch-timestamp`: a reinstall of the same
+  header bytes gives it a new mtime, which would stop clang otherwise.
+- clang takes a header whose bytes changed and size did not. The key
+  holds the header shas, and the build hashes both headers again after
+  the PCH build; it stores the PCH only when they match the key.
+- clang stops with an error on a PCH it cannot take: cut short, not a
+  PCH, another `-O` level, a header of another size or gone, or a macro
+  the unit defines to another value. The retry above covers each: the
+  unit compiles once more without it, and the build drops the PCH.
+- clang loads the PCH before the first line of the unit, and takes it
+  when a unit defines fewer macros than the PCH was built with. The
+  prologue rule that picks the units a PCH serves keeps that from
+  happening.
+- Each object is byte-equal with and without the PCH at `-O1`, `-O2`
+  and `-g -O0 -DBLINK_DEBUG`.
+
+zig cc 0.16 also takes `-include-pch` with a PCH it built for the same
+target (tried with `aarch64-linux-gnu`, `x86_64-linux-musl` and
+`aarch64-macos`). Objects are byte-equal and a unit saves 11-21 ms. A
+cross build still makes no PCH: no cross build links today, since the
+link reads the host `libblink_std.a`. Turning it on needs the target in
+the key and a cross build that links to test it.
+
+##### Bench
+
+Through the daemon, settle 1 s, 11 reps, median seconds (min-max). Base
+and the change ran in turn: base, change, base, change. Base is gen1 of
+main `4cae55ba` (sha256 `7698111126de03a9…`), the change is gen1 of
+`36a780d3` (sha256 `4cc24c5f432231df…`). Both ran on tree `36a780d3`.
+Every C hash check reads 11/11.
+
+With clang 23.1.1 as `cc` (`cc_s` is the median unit compile time):
+
+| target | case | base run 1 | change run 2 | base run 3 | change run 4 |
+|---|---|---|---|---|---|
+| cli | nochange | 0.164 (0.156-0.170) | 0.165 (0.157-0.168) | 0.166 (0.163-0.172) | 0.165 (0.158-0.170) |
+| cli | body-cname | 0.505 (0.483-0.518) | 0.493 (0.467-0.515) | 0.501 (0.486-0.514) | 0.486 (0.470-0.491) |
+| cli | body-cname `cc_s` | 0.212 | 0.200 | 0.212 | 0.198 |
+| small | nochange | 0.061 (0.059-0.066) | 0.061 (0.056-0.064) | 0.061 (0.059-0.063) | 0.060 (0.055-0.063) |
+| small | body-inventory | 0.109 (0.105-0.115) | 0.094 (0.091-0.112) | 0.110 (0.107-0.112) | 0.094 (0.092-0.110) |
+| small | body-inventory `cc_s` | 0.040 | 0.024 | 0.039 | 0.025 |
+
+The `cname` compile drops 12-14 ms of the 15 ms the header takes, and a
+small edit 15 ms of 110 ms.
+
+The full bench with gcc 16.2.1 as `cc`, the same binaries, runs and
+order, is no slower on any row: no median of a change run is above the max of
+a base run. Its rows are in `bench/edit_loop/clang_archive_pch_gcc_*.tsv`,
+and the clang rows in `bench/edit_loop/clang_archive_pch_daemon_*.tsv`.
 
 ### Holds against a concurrent GC
 

@@ -1,0 +1,109 @@
+// A build whose units fell back from a clang PCH they could not take drops it. The next edit
+// must build a good PCH once and read it from then on: no build after the fallback may fail
+// on the PCH and compile its units again.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules, and a cc first on PATH that runs clang. Each
+// compile writes its arguments and its -H output to a file of its own, so a unit that read
+// the PCH shows -include-pch and no line for the archive header.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let clang = sh("command -v clang")
+    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    // A program's first build makes no PCH, so the tree starts with one build behind it.
+    let _ = build_at(tree, 0)
+}
+
+// Edits the entry module and builds in the tree with its own object cache, the clang cc and
+// the unit trace, answering what the build printed. The corpus exports
+// BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the run drops
+// them.
+fn build_at(tree: Str, n: Int) -> Str {
+    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+    shell_exec("rm -rf {tree}/cc_h && mkdir {tree}/cc_h")
+    let r = process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units build/blink build app/src/main.bl -o {tree}/out/app --per-module"])
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    assert_eq(sh("{tree}/out/app"), "sum {41 + n}")
+    "{r.out}{r.err_out}"
+}
+
+// The compiles of the last build that read a PCH the build held under the cache's tmp/.
+fn pch_reads(tree: Str) -> Int {
+    sh("grep -l '^ARGS .* -include-pch {tree}/objcache/tmp/hold\\.[A-Za-z0-9]*/pch/libblink_std\\.h\\.pch' {tree}/cc_h/* | xargs -r grep -L -e 'libblink_std\\.h$' -e 'error:' | wc -l").to_int()
+}
+
+// The compiles of the last build that clang stopped with an error.
+fn failed_compiles(tree: Str) -> Int {
+    sh("grep -l 'error:' {tree}/cc_h/* | wc -l").to_int()
+}
+
+fn pch_dirs(tree: Str) -> List[Str] {
+    let out = sh("cd {tree}/objcache && ls -d *.pch 2>/dev/null")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+test "a clang build after a PCH fallback builds the PCH once and reads it after" {
+    if sh("command -v clang") == "" {
+        io.println("skip: no clang on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_clang_pch_after_fallback_{getpid()}"
+    dev_tree(root, tree)
+    let first = build_at(tree, 1)
+    let dirs = pch_dirs(tree)
+    assert(first.contains("pch build"), "the first edit built no PCH: {first}")
+    assert(dirs.len() == 1, "the first edit made {dirs.len()} PCH dirs")
+    let dir = dirs.get(0).unwrap()
+    shell_exec("printf garbage > {tree}/objcache/{dir}/libblink_std.h.pch")
+    let fell_back = build_at(tree, 2)
+    let dropped = !pch_dirs(tree).contains(dir)
+
+    let next = build_at(tree, 3)
+    let next_failed = failed_compiles(tree)
+    let after = build_at(tree, 4)
+    let after_failed = failed_compiles(tree)
+    let after_reads = pch_reads(tree)
+    let last = build_at(tree, 5)
+    let last_failed = failed_compiles(tree)
+    let last_reads = pch_reads(tree)
+    shell_exec("rm -rf {tree}")
+
+    assert(fell_back.contains("pch fallback __main__ exit 0"), "no fallback for a garbage PCH: {fell_back}")
+    // The edit after the fallback builds the PCH once, and no unit fails on it.
+    assert_eq(count(next, "pch build"), 1)
+    assert_eq(count(next, "pch fallback"), 0)
+    assert_eq(next_failed, 0)
+    // Each edit after that reads the PCH it built, and builds none.
+    assert_eq(count(after, "pch build"), 0)
+    assert_eq(count(after, "pch fallback"), 0)
+    assert_eq(after_failed, 0)
+    assert(after_reads >= 1, "the second edit after the fallback read no PCH: {after}")
+    assert_eq(count(last, "pch build"), 0)
+    assert_eq(count(last, "pch fallback"), 0)
+    assert_eq(last_failed, 0)
+    assert(last_reads >= 1, "the third edit after the fallback read no PCH: {last}")
+    assert(dropped, "the build kept a garbage PCH")
+}
