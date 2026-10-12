@@ -2627,14 +2627,14 @@ blink-gates.slice (12 CPUs) after the load fell below 3. Each bench row is a
 median of 5. (1)-(5) come from `scripts/bench_edit_loop.sh build/gen1/bin/blink`,
 once with no daemon and once with `BENCH_DAEMON=1 BENCH_SETTLE=1`.
 
-(6) is the dqg2d4 job: each build of src/cli.bl runs
+(6) is the output-speed job: each build of src/cli.bl runs
 `setarch -R <bin> build --emit c src/blinkc_main.bl`, under `perf stat -e
 cycles:u,instructions:u` and `/usr/bin/time -f %M`, with the 4 binaries
 alternating 5 times per set and 3 sets. The default -O1 build made 69 units: 52
 modules plus 17 typecheck split units (typecheck.p<hex8>.c and
 typecheck.pos.c). `--release` splits nothing and made 52. The emitted C was
 byte-equal in each run. The main-thread set uses `perf stat -i` and no time
-wrapper.
+wrapper, so its maxrss_kb column reads 0 and is not a measurement.
 
 | criterion | bar | value | result | file |
 |---|---|---|---|---|
@@ -2645,24 +2645,25 @@ wrapper.
 | (5) cli cold build | <= 6.0 s | cold-all 4.380 s, daemon 4.570 s | pass | same |
 | (5) cli no-change build | <= 0.8 s | 0.516 s, daemon 0.149 s | pass | same |
 | (6) output speed -O1, cycles:u | <= +3% | +0.65, +0.66, +2.25% per set; +1.26% pooled; main thread +1.98% | pass | exit_criteria_output_speed_run{1,2,3}_85653d77.tsv, exit_criteria_output_speed_main_thread_85653d77.tsv |
-| (6) output speed -O2, cycles:u | <= +3% | +2.54, +3.87, +1.33% per set; +2.54% pooled (paired +2.59%); main thread +1.74% | pass on pooled, one set of 5 over | same |
+| (6) output speed -O2, cycles:u | <= +3% | +2.54, +3.87, +1.33% per set; +2.54% pooled (paired +2.59%); main thread +1.74% | open: per set of 5, 2 pass and 1 misses; pooled and main thread pass | same |
 | (6) instructions:u, -O1 / -O2 | - | +0.40 / +1.45% pooled | - | same |
 | (6) maxRSS, -O1 / -O2 | - | -0.04 / -0.25% pooled | - | same |
-| (7) `task ci` wall, median of 3 | <= 117.6 s | 117.69 s (117.69, 117.56, 117.91) | miss by 0.09 s | gate logs |
+| (7) `task ci` wall, median of 3 on 85653d77 | <= 117.6 s | 117.69 s (117.69, 117.56, 117.91); be33d1c9 (docs only) 118.18 s | miss by 0.09 s | gate logs |
 | (7) per-module invariants | green | `task ci-per-module-checks` exit 0 | pass | gate log |
-| (8) open P1/P2 obj-cache or daemon correctness bug | none | none gives wrong C or a wrong program | pass | br sweep |
+| (8) open P1/P2 obj-cache or daemon correctness bug | none | no open bug gives wrong C from the daemon or the obj cache; two make a daemon check print less than a cold check | open | br sweep |
 
 The spread of cycles:u within one set is 2-4%, so one set can read over the
-bar when the pooled median does not. Instructions:u match dqg2d4 (+0.43 /
-+1.42%).
+bar when the pooled median does not. Instructions:u match the last
+measurement on 318110b0 (+0.43 / +1.42%).
 
-The (7) miss comes from the corpus, not the build: since ee06e160 (113.65 s)
-the corpus grew from 2136 to 2195 files and the per-module slice from 184 to
-224 rows. The corpus sweep takes 103-104 s of the wall.
+The (7) miss comes from the corpus, not from load: the slowest run started at
+a 1-minute load of 0.38. Since ee06e160 (113.65 s) the corpus grew from 2136
+to 2195 files and the per-module slice from 184 to 224 rows. The corpus sweep
+takes 103-104 s of the wall.
 
 For (8), two open P2 bugs make a daemon check print less than a cold check: a
 W1000 printed to stdout, and an unknown-escape warning from the lexer. Neither
-goes through the diagnostics, and the daemon C is not changed by either. Two
-open P2 cache bugs give no wrong output: `blink test --no-cache` still uses the
-obj cache in its parallel workers, and a vendored native-dep object is reused
-across build modes.
+goes through the diagnostics. The 9 corpus tests that compare a daemon build
+or check with a cold one passed in each gate. Two open P2 cache bugs give no
+wrong output: `blink test --no-cache` still uses the obj cache in its parallel
+workers, and a vendored native-dep object is reused across build modes.
