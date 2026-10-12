@@ -202,12 +202,12 @@ BLINK_RT_FN blink_ProcessResult blink_process_run(const char* cmd, const blink_l
  * the ProcessResult so a second wait is idempotent.
  * A slot is claimed and freed only under blink_pid_table_mu, and it is free
  * only once its owner has waited: two spawns at once must never share one.
- * A waited slot keeps its result. A spawn takes a never-used slot first, then the
- * slot waited longest ago, so a waited handle keeps its result for at least
- * BLINK_PID_TABLE_CAP - 1 - (other children not yet waited at its wait) later
- * spawns. Each claim bumps the slot's gen, so once a slot is reused the old handle
- * names no child: its wait gives an error result and its kill gives -1, never the
- * later child's.
+ * A waited slot keeps its result while the results kept in all waited slots total
+ * at most BLINK_PID_KEPT_BYTES; past that the oldest are dropped, though the newest
+ * is always kept. A spawn takes a never-used slot first, then the slot waited
+ * longest ago. Each claim and each drop bumps the slot's gen, so a handle whose
+ * result was dropped or whose slot was reused names no child: its wait gives an
+ * error result and its kill gives -1, never the later child's.
  * blink_process_pid_kill / send_signal forward the signal to the live
  * child by handle. Returns 0 on success, -1 if the pid is invalid or
  * already reaped.
@@ -219,10 +219,18 @@ typedef struct {
     int reaped;
     int free;
     int64_t gen;
+    int64_t kept_bytes;
     blink_ProcessResult cached;
 } blink_pid_slot;
 
+/* Also the radix of a handle, gen * BLINK_PID_TABLE_CAP + index. A slot's gen grows once
+ * per claim and once per drop, at most twice per spawn, so with this bound a handle
+ * stays below 2^63 for the first 2^50 spawns into that slot. */
 #define BLINK_PID_TABLE_CAP 4096
+_Static_assert(BLINK_PID_TABLE_CAP > 0 && BLINK_PID_TABLE_CAP <= (1 << 16),
+               "a pid handle keeps gen * BLINK_PID_TABLE_CAP below 2^63");
+
+#define BLINK_PID_KEPT_BYTES (1 << 20)
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
@@ -231,6 +239,8 @@ typedef struct {
     int64_t blink_pid_waited[BLINK_PID_TABLE_CAP];
     int64_t blink_pid_waited_head = 0;
     int64_t blink_pid_waited_len = 0;
+    int64_t blink_pid_waited_dropped = 0;
+    int64_t blink_pid_kept_bytes = 0;
     pthread_mutex_t blink_pid_table_mu = PTHREAD_MUTEX_INITIALIZER;
   #else
     extern blink_pid_slot blink_pid_table[BLINK_PID_TABLE_CAP];
@@ -238,15 +248,21 @@ typedef struct {
     extern int64_t blink_pid_waited[BLINK_PID_TABLE_CAP];
     extern int64_t blink_pid_waited_head;
     extern int64_t blink_pid_waited_len;
+    extern int64_t blink_pid_waited_dropped;
+    extern int64_t blink_pid_kept_bytes;
     extern pthread_mutex_t blink_pid_table_mu;
   #endif
 #else
 static blink_pid_slot blink_pid_table[BLINK_PID_TABLE_CAP];
 static int64_t blink_pid_table_len = 0;
-/* Ring of waited (free) slot indices, oldest wait first. */
+/* Ring of waited (free) slot indices, oldest wait first. Its first
+ * blink_pid_waited_dropped entries have dropped their results; the rest keep
+ * blink_pid_kept_bytes in all. */
 static int64_t blink_pid_waited[BLINK_PID_TABLE_CAP];
 static int64_t blink_pid_waited_head = 0;
 static int64_t blink_pid_waited_len = 0;
+static int64_t blink_pid_waited_dropped = 0;
+static int64_t blink_pid_kept_bytes = 0;
 static pthread_mutex_t blink_pid_table_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
@@ -263,6 +279,11 @@ static int64_t blink_pid_table_alloc(void) {
         i = blink_pid_waited[blink_pid_waited_head];
         blink_pid_waited_head = (blink_pid_waited_head + 1) % BLINK_PID_TABLE_CAP;
         blink_pid_waited_len--;
+        if (blink_pid_waited_dropped > 0) {
+            blink_pid_waited_dropped--;
+        } else {
+            blink_pid_kept_bytes -= blink_pid_table[i].kept_bytes;
+        }
     }
     int64_t h = -1;
     if (i >= 0) {
@@ -277,6 +298,7 @@ static int64_t blink_pid_table_alloc(void) {
         slot->cached.out = BLINK_STR_EMPTY;
         slot->cached.err_out = BLINK_STR_EMPTY;
         slot->cached.exit_code = -1;
+        slot->kept_bytes = 0;
         h = slot->gen * BLINK_PID_TABLE_CAP + i;
     }
     pthread_mutex_unlock(&blink_pid_table_mu);
@@ -403,6 +425,21 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
         int64_t tail = (blink_pid_waited_head + blink_pid_waited_len) % BLINK_PID_TABLE_CAP;
         blink_pid_waited[tail] = slot - blink_pid_table;
         blink_pid_waited_len++;
+        slot->kept_bytes = blink_str_len(slot->cached.out) + blink_str_len(slot->cached.err_out);
+        blink_pid_kept_bytes += slot->kept_bytes;
+        /* Kept results stay reachable from this static table, so without a bound a
+         * program that spawns many children with large output keeps them all. */
+        while (blink_pid_kept_bytes > BLINK_PID_KEPT_BYTES
+               && blink_pid_waited_len - blink_pid_waited_dropped > 1) {
+            int64_t at = (blink_pid_waited_head + blink_pid_waited_dropped) % BLINK_PID_TABLE_CAP;
+            blink_pid_slot* old = &blink_pid_table[blink_pid_waited[at]];
+            blink_pid_kept_bytes -= old->kept_bytes;
+            old->kept_bytes = 0;
+            old->cached.out = BLINK_STR_EMPTY;
+            old->cached.err_out = BLINK_STR_EMPTY;
+            old->gen++;
+            blink_pid_waited_dropped++;
+        }
     }
     pthread_mutex_unlock(&blink_pid_table_mu);
     return result;
