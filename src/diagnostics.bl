@@ -202,6 +202,19 @@ pub const UNKNOWN_DERIVE_NAME     = "E1112"
 
 // E1113+ — lexer
 pub const UNEXPECTED_CHARACTER    = "E1113"
+pub const EMPTY_UNICODE_ESCAPE    = "E1114"
+pub const UNICODE_ESCAPE_TOO_LONG = "E1115"
+pub const INVALID_UNICODE_ESCAPE_DIGIT = "E1116"
+pub const UNTERMINATED_UNICODE_ESCAPE = "E1117"
+pub const SURROGATE_ESCAPE        = "E1118"
+pub const UNICODE_ESCAPE_OUT_OF_RANGE = "E1119"
+pub const UNICODE_ESCAPE_NEEDS_BRACES = "E1120"
+pub const HEX_ESCAPE_NOT_SUPPORTED = "E1121"
+pub const NUL_IN_STR              = "E1122"
+pub const UNKNOWN_ESCAPE          = "E1123"
+pub const EMPTY_CHAR_LITERAL      = "E1124"
+pub const MULTI_CHAR_LITERAL      = "E1125"
+pub const UNTERMINATED_LITERAL    = "E1126"
 
 // E1200+ — module resolution / enum value validation
 pub const MODULE_NOT_FOUND           = "E1200"
@@ -399,15 +412,29 @@ type FileRange {
     path: Str
 }
 
+// Where a literal left open to the end of its file starts. Everything the lexer read after it
+// was the literal's text, so what a later stage says about that text is a follow-on of the
+// one lexer error.
+type LexCutoff {
+    file: Str
+    line: Int
+    col: Int
+}
+
+// What diag_record drops instead of recording. Reset per compile in diag_reset.
+type DiagFilter {
+    // Dedup byte-identical diagnostics. The two full passes over a fn body
+    // (nr + tc) both call infer_type, which emits, so a single erroring node fires
+    // twice. Keyed on the full tuple (severity|code|file|line|col|message) so
+    // genuinely distinct diagnostics on the same node survive.
+    seen: Map[Str, Int]
+    lex_cutoffs: List[LexCutoff]
+}
+
 pub let mut diag_entries: List[DiagEntry] = []
 let mut file_ranges: List[FileRange] = []
 let mut source_lines_cache: Map[Str, List[Str]] = Map()
-// Dedup byte-identical diagnostics. The two full passes over a fn body
-// (nr + tc) both call infer_type, which emits, so a single erroring node fires
-// twice. Keyed on the full tuple (severity|code|file|line|col|message) so
-// genuinely distinct diagnostics on the same node survive. Reset per compile in
-// diag_reset.
-let mut diag_seen: Map[Str, Int] = Map()
+let mut diag_filter: DiagFilter = DiagFilter { seen: Map(), lex_cutoffs: [] }
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -537,7 +564,20 @@ pub fn lint_override_lines() -> List[Str] {
     out
 }
 
+// E1113-E1126. The spec lets no setting suppress or demote a lexer error (sections/02_syntax.md
+// §2.4, "Recovery"): the token the lexer recovers with is not the text the author wrote, so a
+// build that went on without the error would compile something else.
+pub fn diag_is_lexer_code(code: Str) -> Bool {
+    if code.byte_len() != 5 || !code.starts_with("E11") { return false }
+    let tens = code.byte_at(3).to_int() - 48
+    let ones = code.byte_at(4).to_int() - 48
+    if tens < 0 || tens > 9 || ones < 0 || ones > 9 { return false }
+    let n = tens * 10 + ones
+    n >= 13 && n <= 26
+}
+
 fn lint_apply_override(severity: Str, name: Str, code: Str) -> Str {
+    if diag_is_lexer_code(code) { return severity }
     // Neither channel records anything, so neither reaches an audit-gated diagnostic. Both
     // write sites refuse one outright; this is the second half of the same rule, so a name
     // that arrives here by some other route still fails to silence it.
@@ -625,10 +665,10 @@ pub fn diag_entry_count() -> Int {
 pub fn diag_truncate(n: Int) {
     while diag_entries.len() > n {
         let d = diag_entries.pop().unwrap()
-        // Drop the dedup key too, so diag_seen mirrors diag_entries —
+        // Drop the dedup key too, so diag_filter.seen mirrors diag_entries —
         // a popped cascade entry must not suppress a later distinct re-emission.
         let dkey = "{d.severity}|{d.code}|{d.file}|{d.line}|{d.col}|{d.message}"
-        diag_seen.remove(dkey)
+        diag_filter.seen.remove(dkey)
         if d.severity == "error" {
             diag_count = diag_count - 1
         } else if d.severity == "warning" {
@@ -646,6 +686,31 @@ pub fn diag_error(name: Str, code: Str, message: Str, line: Int, col: Int, help:
 
 pub fn diag_error_range(name: Str, code: Str, message: Str, line: Int, col: Int, end_col: Int, help: Str) ! Diag.Report {
     diag_emit_range("error", name, code, message, line, col, 0, end_col, help)
+}
+
+// An error whose span ends on its own line, so its row carries end_line and end_col.
+pub fn diag_error_span_notes(name: Str, code: Str, message: Str, line: Int, col: Int, end_col: Int, help: Str, notes: List[Str]) ! Diag.Report {
+    diag_emit_range_notes("error", name, code, message, line, col, line, end_col, help, notes)
+}
+
+// From here on diag_record drops what the other stages report in diag_source_file at or after
+// line:col, and every warning in that file. The lexer calls it for a literal open to the end
+// of the file: the later stages saw the rest of the file as that literal's text, so an error
+// past its start, or an unused binding whose uses it swallowed, would report the same mistake
+// a second time.
+pub fn diag_cut_after(line: Int, col: Int) {
+    diag_filter.lex_cutoffs.push(LexCutoff { file: diag_source_file, line: line, col: col })
+}
+
+fn diag_past_cutoff(severity: Str, code: Str, line: Int, col: Int) -> Bool {
+    if diag_is_lexer_code(code) { return false }
+    for c in diag_filter.lex_cutoffs {
+        if c.file == diag_source_file {
+            if severity == "warning" { return true }
+            if line > c.line || (line == c.line && col >= c.col) { return true }
+        }
+    }
+    false
 }
 
 pub fn diag_error_no_loc(name: Str, code: Str, message: Str, help: Str) ! Diag.Report {
@@ -800,6 +865,10 @@ fn diag_record(effective_severity: Str, name: Str, code: Str, message: Str, line
     if effective_severity == "off" {
         return
     }
+    // An internal error is a fault in the compiler, never a follow-on, so it is always shown.
+    if effective_severity != "ice" && diag_filter.lex_cutoffs.len() > 0 && diag_past_cutoff(effective_severity, code, line, col) {
+        return
+    }
     let dkey = "{effective_severity}|{code}|{diag_source_file}|{line}|{col}|{message}"
     // An internal error counts every time it is reported, before the repeat is dropped.
     // A caller reads the count to decide whether what a stage handed back is usable, and
@@ -807,10 +876,10 @@ fn diag_record(effective_severity: Str, name: Str, code: Str, message: Str, line
     // distinct reports goes flat on the second and the caller accepts a unit with a body
     // missing. Suppressing the repeat stays a rendering rule: the reader still sees it once.
     if effective_severity == "ice" { diag_ice_count = diag_ice_count + 1 }
-    if diag_seen.contains_key(dkey) != 0 {
+    if diag_filter.seen.contains_key(dkey) != 0 {
         return
     }
-    diag_seen.insert(dkey, 1)
+    diag_filter.seen.insert(dkey, 1)
     diag_entries.push(DiagEntry {
         severity: effective_severity, name: name, code: code,
         message: message, file: diag_source_file, line: line,
@@ -1045,7 +1114,8 @@ pub fn diag_reset() {
     diag_allow_set.clear()
     diag_allow_stack.clear()
     source_lines_cache.clear()
-    diag_seen.clear()
+    diag_filter.seen.clear()
+    diag_filter.lex_cutoffs.clear()
 }
 
 // ── Error catalog ─────────────────────────────────────────────────
@@ -1239,6 +1309,45 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == UNEXPECTED_CHARACTER {
         return "E1113 -- UnexpectedCharacter\n\nThe lexer encountered a character it does not recognize as part of\nany Blink token. The most common cause is a stray `;` left over\nfrom another language — Blink uses newlines as statement terminators\nand spec section 2.5 explicitly forbids semicolons.\n\nFix: remove the offending character. If it is `;`, just delete it;\nthe newline that follows already terminates the statement.\n\n  let x = 3;        // E1113 -- delete the `;`\n  let x = 3         // OK"
+    }
+    if code == EMPTY_UNICODE_ESCAPE {
+        return "E1114 -- EmptyUnicodeEscape\n\nA `\\u\{H\}` escape names a Unicode scalar value by its hex code, and\nthis one has no hex digits between the braces.\n\n  let s = \"a\\u\{\}b\"      // E1114\n  let s = \"a\\u\{41\}b\"    // OK -- \"aAb\"\n\nFix: write 1 to 6 hex digits between the braces."
+    }
+    if code == UNICODE_ESCAPE_TOO_LONG {
+        return "E1115 -- UnicodeEscapeTooLong\n\nA `\\u\{H\}` escape takes 1 to 6 hex digits, leading zeros included.\nThe largest Unicode scalar value, 0x10FFFF, needs six.\n\n  let s = \"\\u\{0001F600\}\"   // E1115 -- 8 digits\n  let s = \"\\u\{1F600\}\"      // OK\n\nFix: drop the leading zeros, or write at most 6 hex digits."
+    }
+    if code == INVALID_UNICODE_ESCAPE_DIGIT {
+        return "E1116 -- InvalidUnicodeEscapeDigit\n\nThe text between the braces of a `\\u\{H\}` escape must be hex digits:\n`0-9`, `a-f` or `A-F`. The message names the first character that is\nnot one.\n\n  let s = \"\\u\{12g\}\"    // E1116 -- `g` is not a hex digit\n  let s = \"\\u\{12f\}\"    // OK\n\nFix: write the code point in hex."
+    }
+    if code == UNTERMINATED_UNICODE_ESCAPE {
+        return "E1117 -- UnterminatedUnicodeEscape\n\nA `\\u\{` escape runs until its closing `\}`, and this one has none\nbefore the hex digits end.\n\n  let s = \"\\u\{41 b\"     // E1117\n  let s = \"\\u\{41\} b\"    // OK\n\nFix: close the escape with `\}`."
+    }
+    if code == SURROGATE_ESCAPE {
+        return "E1118 -- SurrogateEscape\n\nA `\\u\{H\}` escape must name a Unicode scalar value. The surrogate code\npoints 0xD800-0xDFFF are not scalar values: UTF-16 uses them in\npairs to encode one character above 0xFFFF, and they cannot appear\non their own in a `Char` or a `Str`.\n\n  let c = '\\u\{d83d\}'      // E1118\n  let c = '\\u\{1f600\}'     // OK -- write the character, not its UTF-16 halves\n\nFix: write the code point of the whole character."
+    }
+    if code == UNICODE_ESCAPE_OUT_OF_RANGE {
+        return "E1119 -- UnicodeEscapeOutOfRange\n\nUnicode ends at 0x10FFFF, so a `\\u\{H\}` escape cannot name a value\nabove it.\n\n  let s = \"\\u\{110000\}\"   // E1119\n  let s = \"\\u\{10ffff\}\"   // OK -- the largest scalar value\n\nFix: check the code point you meant."
+    }
+    if code == UNICODE_ESCAPE_NEEDS_BRACES {
+        return "E1120 -- UnicodeEscapeNeedsBraces\n\nBlink writes a Unicode escape only as `\\u\{H\}`. The forms other\nlanguages use without braces, `\\uXXXX` and `\\UXXXXXXXX`, are errors,\nso their digits can never run into the text that follows.\n\n  let s = \"\\u00e9\"        // E1120\n  let s = \"\\U0001F600\"    // E1120\n  let s = \"\\u\{e9\}\"       // OK\n  let s = \"\\u\{1f600\}\"    // OK\n\nFix: put the hex digits in braces. The help shows the escape to write."
+    }
+    if code == HEX_ESCAPE_NOT_SUPPORTED {
+        return "E1121 -- HexEscapeNotSupported\n\nBlink has no `\\x` escape. In other languages `\\xNN` means a byte in\nsome places and a code point in others; a Blink `Str` holds Unicode\ntext, so its one numeric escape names a code point.\n\n  let esc = \"\\x1b[0m\"      // E1121\n  let esc = \"\\u\{1b\}[0m\"    // OK\n\nFix: write `\\u\{NN\}` with the same hex digits. For raw bytes, use\n`Bytes`."
+    }
+    if code == NUL_IN_STR {
+        return "E1122 -- NulInStr\n\nA `Str` cannot hold NUL (U+0000), so neither `\\0` nor `\\u\{0\}` is\nvalid in a string literal. A char literal can hold it: `'\\0'` and\n`'\\u\{0\}'` are the same `Char`.\n\n  let s = \"a\\0b\"     // E1122\n\nFix: use `Bytes` for data that contains NUL."
+    }
+    if code == UNKNOWN_ESCAPE {
+        return "E1123 -- UnknownEscape\n\nThe escape is not valid in this literal kind. The help lists the\nvalid escapes:\n\n  string:  \\n \\r \\t \\\\ \\b \\f \\u\{H\} \\\" \\\{ \\\}\n  char:    \\n \\r \\t \\\\ \\b \\f \\0 \\u\{H\} \\'\n\nWhere the escape means something in another language, the help gives\nthe Blink fix first:\n\n  \\e \\a \\v              write `\\u\{1b\}`, `\\u\{7\}`, `\\u\{b\}`\n  \"\\'\" (in a string)    write a plain `'`\n  '\\\"' (in a char)      write a plain `\"`: `'\"'`\n  \\d \\w \\s and the other regex classes\n                        use a raw string, where `\\` is literal: `#\"\\d\"#`\n\nThe compile still fails, and the lexer keeps the escaped character in\nthe string so that no other error follows from it.\n\n  let s = \"\\d+\"        // E1123\n  let s = #\"\\d+\"#      // OK"
+    }
+    if code == EMPTY_CHAR_LITERAL {
+        return "E1124 -- EmptyCharLiteral\n\nA char literal holds exactly one character, and `''` holds none. Most\noften the character meant is a space or a quote.\n\n  let c = ''      // E1124\n  let c = ' '     // OK -- a space\n  let c = '\\''    // OK -- a single quote\n  let s = \"\"      // OK -- the empty `Str`\n\nFix: write one character between the quotes, or use `\"\"` for an empty\n`Str`."
+    }
+    if code == MULTI_CHAR_LITERAL {
+        return "E1125 -- MultiCharLiteral\n\nA char literal holds exactly one Unicode scalar value, and this one\nholds more. A char literal cannot span lines: with no closing `'` on\nthe line, its text runs to the end of the line.\n\n  let s = 'ab'      // E1125\n  let s = \"ab\"      // OK -- a `Str`\n\nFix: use double quotes for a `Str`. The help shows the literal in\nthat form."
+    }
+    if code == UNTERMINATED_LITERAL {
+        return "E1126 -- UnterminatedLiteral\n\nA literal has no closer. A string, template or raw string runs to the\nend of the file; a char literal runs to the end of its line. The\nerror points at the opening delimiter, a note says where the literal\nran out, and the help names the exact closer to write: `'`, `\"`, or\n`\"` followed by as many `#` as the opening delimiter has.\n\n  let s = \"abc         // E1126 -- close the literal with `\"`\n  let r = ##\"a\"#b     // E1126 -- close the literal with `\"##`\n  let c = 'a          // E1126 -- close the literal with `'`\n\nNothing past the opening delimiter of an unclosed string is checked,\nbecause all of it was read as the string's text.\n\nFix: add the closer the help names."
     }
     if code == MODULE_NOT_FOUND {
         return "E1200 -- ModuleNotFound\n\nAn import statement referenced a module that could not be found.\n\nCommon causes:\n  - Typo in the module name\n  - Missing file: the module's .bl file does not exist\n  - Incorrect path in the module hierarchy\n\nFix: verify the module name matches a .bl file in your project or\nthe standard library.\n\n  import math       // looks for lib/std/math.bl or src/math.bl\n  import pkg.audit  // looks for lib/pkg/audit.bl"
