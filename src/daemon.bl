@@ -1,7 +1,7 @@
 import symbol_index.{si_reset, si_sym_count, si_file_count}
 import query.{query_index_source, query_answer}
 import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render, diag_reset}
-import compiler.{reset_compiler_state, fill_source_interfaces, loader_keep_sources, loader_reused_sources, loader_load_cold_next}
+import compiler.{reset_compiler_state, fill_source_interfaces, loader_keep_sources, loader_reused_sources, loader_load_cold_next, loader_load_was_cold}
 import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int, json_at, json_len}
 import std.path.{path_join, path_dirname}
 import lexer.{Lex}
@@ -92,9 +92,11 @@ type DaemonCheck {
     // The mtime and size of each file the check read, from just after it. The poll compares
     // bytes only once one of them moves. Empty when an edit landed during the check.
     stats: List[Int]
-    // How many sources the check kept from the check before. A build compiles a program
-    // only a cold load made, so it checks again first when this is not 0.
+    // How many sources the check kept from the check before.
     reused: Int
+    // Whether the check's load started from an empty node pool. A build compiles a program
+    // only such a load made, so it checks again first when this is false.
+    cold: Bool
     // The index a cold query of the entry would build; None when that query prints errors.
     query: Option[DaemonQueryIndex]
 }
@@ -207,6 +209,7 @@ fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse
         captured: captured,
         stats: [],
         reused: reused,
+        cold: loader_load_was_cold(),
         query: query,
     }
 }
@@ -818,9 +821,9 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
     if daemon_last.is_none() || checked_inputs_changed(daemon_source_path) {
         daemon_last = Some(daemon_check_program())
     }
-    // Only a check that parsed every source is known to leave the program a cold build
-    // compiles, node for node, so a build never compiles one that kept nodes.
-    if (daemon_last.unwrap()).reused > 0 {
+    // Only a check whose load started from an empty pool is known to leave the program a
+    // cold build compiles, node for node, so a build never compiles one that undid a load.
+    if !(daemon_last.unwrap()).cold {
         loader_load_cold_next()
         daemon_last = Some(daemon_check_program())
     }
