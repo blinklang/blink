@@ -2049,10 +2049,15 @@ fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: Lis
 
 // The loaded sources, as a unit's emit tells which it read.
 type UnitSources {
-    // The node ranges are in node order and one path per range, so a node names one source.
+    // The node ranges do not overlap and there is one path per range, so a node names one
+    // source.
     tracked: Bool
+    // The ranges in node order, as ir_track_sources takes them, and the load index of each.
+    // A load that kept sources parsed each edited one at the end of the pool, after sources
+    // it loads later.
     firsts: List[Int]
     ends: List[Int]
+    load_index: List[Int]
     paths: List[Str]
     modules: List[Str]
     // The path of each source of a module that has a unit.
@@ -2066,10 +2071,28 @@ fn unit_sources(unit_modules: List[Str], wanted: Bool) -> UnitSources {
     let modules = loaded_inputs.source_modules
     let n = paths.len()
     let mut tracked = wanted && firsts.len() == n && ends.len() == n && modules.len() == n
+    let mut load_index: List[Int] = []
     let mut i = 0
     while tracked && i < n {
-        if ends[i] < firsts[i] || (i > 0 && firsts[i] < ends[i - 1]) { tracked = false }
+        if ends[i] < firsts[i] { tracked = false }
+        // Insertion by first node: a warm load moves a few ranges, so most are in place.
+        load_index.push(i)
+        let mut j = load_index.len() - 1
+        while j > 0 && firsts[load_index[j - 1]] > firsts[i] {
+            load_index.set(j, load_index[j - 1])
+            j = j - 1
+        }
+        load_index.set(j, i)
         i = i + 1
+    }
+    let mut sorted_firsts: List[Int] = []
+    let mut sorted_ends: List[Int] = []
+    if tracked {
+        for k in load_index {
+            if sorted_ends.len() > 0 && firsts[k] < sorted_ends[sorted_ends.len() - 1] { tracked = false }
+            sorted_firsts.push(firsts[k])
+            sorted_ends.push(ends[k])
+        }
     }
     let mut has_unit: Map[Str, Bool] = Map()
     for m in unit_modules { has_unit.insert(m, true) }
@@ -2081,7 +2104,7 @@ fn unit_sources(unit_modules: List[Str], wanted: Bool) -> UnitSources {
             i = i + 1
         }
     }
-    UnitSources { tracked: tracked, firsts: firsts, ends: ends, paths: paths, modules: modules, own: own }
+    UnitSources { tracked: tracked, firsts: sorted_firsts, ends: sorted_ends, load_index: load_index, paths: paths, modules: modules, own: own }
 }
 
 // Emits module m's unit into dir, with the sources its IR spanned, cut into chunks as
@@ -2148,7 +2171,7 @@ fn unit_chunk_decls(release_mode: Int) -> Int {
 fn unit_uses(m: Str, sources: UnitSources) -> List[Str] {
     if !sources.tracked { return [] }
     let mut read: Map[Int, Bool] = Map()
-    for i in ir_sources_read() { read.insert(i, true) }
+    for i in ir_sources_read() { read.insert(sources.load_index[i], true) }
     let mut out: List[Str] = []
     let mut has_own = false
     let mut i = 0
