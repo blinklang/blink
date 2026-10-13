@@ -550,7 +550,8 @@ fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Dia
 }
 
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
-    match compile_to_text(source_path, format_flag, debug_mode, strict_mode) {
+    let text = if format_flag == "blink" { format_to_text(source_path) } else { compile_to_text(source_path, debug_mode, strict_mode) }
+    match text {
         Ok(text) => {
             write_file(c_path, text)
             0
@@ -559,32 +560,32 @@ fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, 
     }
 }
 
-// The C (or, under --format blink, the formatted source) do_compile writes.
-fn compile_to_text(source_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
-    if format_flag == "blink" {
-        reset_compiler_state()
-        diag_reset()
-        diag_source_file = source_path
-        let source = read_file(source_path)
-        lex(source)
-        let first_node = node_count()
-        // Format must round-trip the original `@expect_panic` surface syntax, so
-        // suppress the parse-time desugar (which the compile path relies on).
-        parse_desugar_enabled = 0
-        let program = parse_program()
-        parse_desugar_enabled = 1
-        attach_comments_pass(program, first_node)
-        if diag_ice_count > 0 {
-            diag_flush()
-            return Err(101)
-        }
-        if diag_count > 0 {
-            diag_flush()
-            return Err(1)
-        }
-        let fmt_output = format(program)
-        return Ok(fmt_output)
+// The formatted source `blink fmt` writes.
+fn format_to_text(source_path: Str) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, Format.Emit {
+    reset_compiler_state()
+    diag_reset()
+    diag_source_file = source_path
+    let source = read_file(source_path)
+    lex(source)
+    let first_node = node_count()
+    // Format must round-trip the original `@expect_panic` surface syntax, so
+    // suppress the parse-time desugar (which the compile path relies on).
+    parse_desugar_enabled = 0
+    let program = parse_program()
+    parse_desugar_enabled = 1
+    attach_comments_pass(program, first_node)
+    if diag_ice_count > 0 {
+        diag_flush()
+        return Err(101)
     }
+    if diag_count > 0 {
+        diag_flush()
+        return Err(1)
+    }
+    Ok(format(program))
+}
+
+fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let final_program = match compile_front_end(source_path, strict_mode) {
         Ok(p) => p
         Err(rc) => return Err(rc)
@@ -1428,7 +1429,7 @@ let BUILD_STATUS_HUMAN = 0
 let BUILD_STATUS_JSON = 1
 let BUILD_STATUS_NONE = 2
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     fs_remove(output_path)
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -1439,7 +1440,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         }
     }
     if unit_jobs != 0 {
-        let reason = per_module_fallback_reason(emit_mode, format_flag)
+        let reason = per_module_fallback_reason(emit_mode)
         if reason == "" {
             return do_build_units(source_path, output_path, debug_mode, release_mode, targets, status_mode, strict_mode, unit_jobs, checked)
         }
@@ -1462,7 +1463,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     // The link flags come from this text and the compile reads a private copy of it: another
     // build that writes c_path can rewrite it at any time, and a second read of c_path could
     // link the object of one program with the native deps of another.
-    let c_source = match compile_to_text(source_path, format_flag, debug_mode, strict_mode) {
+    let c_source = match compile_to_text(source_path, debug_mode, strict_mode) {
         Ok(text) => text
         Err(rc) => return rc
     }
@@ -1595,9 +1596,8 @@ fn per_module_from_env() -> Bool {
 }
 
 // Why a --per-module build falls back to one unit, or "" when it does not.
-fn per_module_fallback_reason(emit_mode: Str, format_flag: Str) -> Str {
+fn per_module_fallback_reason(emit_mode: Str) -> Str {
     if emit_mode == "c" { return "--emit c writes one C file" }
-    if format_flag == "blink" { return "--format blink formats the source" }
     if (env.var("BLINK_SKIP_MODULES") ?? "") != "" { return "BLINK_SKIP_MODULES is set" }
     if (env.var("BLINK_ONLY_MODULE") ?? "") != "" { return "BLINK_ONLY_MODULE is set" }
     if compiler_archive_env() != "" { return "BLINK_COMPILER_ARCHIVE is set" }
@@ -3798,8 +3798,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 // the build it forked the child for as checked.
 fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
-    let format_flag = output_format(a)
-    let bad_format = format_usage_error(a, build_formats())
+    let bad_format = build_format_usage_error(a)
     if bad_format != "" {
         io.eprintln(bad_format)
         exit(1)
@@ -3876,7 +3875,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
+    let rc = do_build(source_path, output_path, c_path, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
     if rc == 0 {
         if emit_flag == "c" {
             if json_output != 0 {
@@ -3895,7 +3894,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
 
 fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     // Before the daemon is asked, so a bad value builds nothing on either path.
-    let bad_format = format_usage_error(a, report_formats())
+    let bad_format = build_format_usage_error(a)
     if bad_format != "" {
         io.eprintln(bad_format)
         exit(1)
@@ -3934,7 +3933,6 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
     let strict_struct_layout_flag = if args_has(a, "strict-struct-layout") { 1 } else { 0 }
     set_strict_struct_layout(strict_struct_layout_flag)
     let targets = args_get_all(a, "target")
-    let format_flag = output_format(a)
     let json_output = if json_requested(a) { 1 } else { 0 }
     if json_output != 0 {
         diag_format = 1
@@ -3961,7 +3959,7 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
+    let rc = do_build(source_path, output_path, c_path, debug_flag, release_flag, "", targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
     if rc != 0 {
         if json_output != 0 {
             io.println("\{\"status\":\"error\"}")
@@ -4024,7 +4022,7 @@ fn report_manifest_diagnostics(manifest: Str) ! Diag.Report {
 }
 
 fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
-    let bad_format = format_usage_error(a, report_formats())
+    let bad_format = build_format_usage_error(a)
     if bad_format != "" {
         io.eprintln(bad_format)
         exit(1)
@@ -4047,7 +4045,6 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         num_workers = 1
     }
     let targets = args_get_all(a, "target")
-    let format_flag = output_format(a)
     let unit_jobs = unit_jobs_from_args(a)
 
     ensure_deps_resolved()
@@ -4077,7 +4074,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             diag_format = 1
         }
         let status_mode = if json_output != 0 { BUILD_STATUS_NONE } else { BUILD_STATUS_HUMAN }
-        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, status_mode, 0, unit_jobs, args_has(a, "per-module"), None)
+        let rc = do_build(source_path, output_path, c_path, 1, 0, "", targets, status_mode, 0, unit_jobs, args_has(a, "per-module"), None)
         if rc != 0 {
             exit(1)
         }
@@ -4484,19 +4481,6 @@ fn check_failed_exit(source_path: Str, json_status: Int) {
     exit(1)
 }
 
-// The format a command prints in: json under --format json or --json, its short form, and ""
-// for the default, which --format human names.
-fn output_format(a: Args) -> Str {
-    let format_flag = args_get(a, "format")
-    if format_flag == "human" {
-        return ""
-    }
-    if format_flag == "" && args_has(a, "json") {
-        return "json"
-    }
-    format_flag
-}
-
 // Whether the command prints only JSON on stdout: under --json, and under --format json.
 fn json_requested(a: Args) -> Bool {
     args_has(a, "json") || args_get(a, "format") == "json"
@@ -4507,9 +4491,14 @@ fn report_formats() -> List[Str] {
     ["json", "human"]
 }
 
-// blink formats the source in place of compiling it.
-fn build_formats() -> List[Str] {
-    ["json", "human", "blink"]
+// The usage error for a --format value build, run and test do not take. blink is the source
+// format `blink fmt` writes, not an output format, so its error says where formatting is.
+fn build_format_usage_error(a: Args) -> Str {
+    let bad = format_usage_error(a, report_formats())
+    if bad != "" && args_get(a, "format") == "blink" {
+        return "{bad}\nhint: `blink fmt <file>` formats Blink source; --format sets the output format"
+    }
+    bad
 }
 
 // The usage error for a --format value the command does not take, or for --json beside another
@@ -4598,10 +4587,10 @@ fn daemon_may_build(a: Args) -> Bool {
     if off || (!on && by_env == "0") {
         return false
     }
-    if format_usage_error(a, build_formats()) != "" {
+    if build_format_usage_error(a) != "" {
         return false
     }
-    per_module_fallback_reason("", output_format(a)) == ""
+    per_module_fallback_reason("") == ""
 }
 
 // The compiler binary and the environment, which a build reads besides its sources and its
@@ -5930,7 +5919,7 @@ fn cli_parser() -> ArgParser {
     p = command_add_option(p, "run", "--target", "-T", "Target triple (e.g. linux, macos-arm64)")
     p = command_add_option(p, "build", "--emit", "-e", "Output format: binary (default), c, or per-module-dir (emit one .c/.h per module into <outdir>)")
 
-    p = command_add_option(p, "build", "--format", "-f", "Output format: json (same as --json), human (the default) or blink (format the source)")
+    p = command_add_option(p, "build", "--format", "-f", "Output format: json (same as --json) or human (the default)")
     p = command_add_option(p, "check", "--format", "-f", "Output format: json (same as --json) or human (the default)")
     p = command_add_option(p, "fmt", "--format", "-f", "Output format: json (same as --json) or human (the default)")
     p = command_add_option(p, "run", "--format", "-f", "Output format of the build: json (same as --json) or human (the default)")
