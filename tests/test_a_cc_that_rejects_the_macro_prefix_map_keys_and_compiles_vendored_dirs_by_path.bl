@@ -1,0 +1,137 @@
+// A cc that rejects -fmacro-prefix-map compiles a unit without it, so below --debug a
+// vendored header's __FILE__ keeps its absolute path, and the key keeps the path too: two
+// trees whose vendored dirs hold the same bytes at other paths each compile their own objects,
+// and each names only itself.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program over a native dep whose source sits by an absolute path outside
+// the project, and a cc first on PATH that runs cc_path but fails on -fmacro-prefix-map, as
+// a cc from before the flag does. The header's inline function returns its own __FILE__.
+fn dev_tree(root: Str, tree: Str, cc_path: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin {tree}/vendor/mylib")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/bin/cc", [
+        "#!/bin/sh",
+        "for a in \"$@\"; do",
+        "  case \"$a\" in -fmacro-prefix-map=*) echo \"cc: error: unrecognized command-line option '$a'\" >&2; exit 1;; esac",
+        "done",
+        "exec {cc_path} \"$@\"",
+        "",
+    ].join("\n"))
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/vendor/mylib/mylib.h", [
+        "#ifndef MYLIB_H",
+        "#define MYLIB_H",
+        "#include <stdint.h>",
+        "typedef struct mylib_ctx mylib_ctx;",
+        "int64_t mylib_add(int64_t a, int64_t b);",
+        "static inline uint8_t *mylib_where(void) \{ return (uint8_t *)__FILE__; \}",
+        "#endif",
+        "",
+    ].join("\n"))
+    write_file("{tree}/vendor/mylib/mylib.c", "#include \"mylib.h\"\nint64_t mylib_add(int64_t a, int64_t b) \{ return a + b; \}\n")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"vendored_app\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nmylib = \{ type = \"vendored\", path = \"{tree}/vendor/mylib/mylib.c\", headers = [\"mylib.h\"] \}\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/part.bl", [
+        #"@ffi.opaque(header: "mylib.h", name: "mylib_ctx")"#,
+        #"pub type Ctx"#,
+        #""#,
+        #"@ffi("mylib", "mylib_add", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn add(a: Int, b: Int) -> Int ! FFI {}"#,
+        #""#,
+        #"@ffi("mylib", "mylib_where", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn where_() -> Ptr[U8] ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import part.{add, where_}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("sum {add(40, 2)} {where_().to_str() ?? "-"}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with the shared object cache, the tree's cc and the unit trace. The
+// corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so
+// the run drops them.
+fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn compiles(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+// How many of the cache's objects hold text in their bytes.
+fn objects_holding(cache: Str, text: Str) -> Int {
+    sh("for o in {cache}/*.o; do grep -q -a -F '{text}' \"$o\" && echo \"$o\"; done | wc -l").to_int()
+}
+
+fn check_by_path(cc_name: Str, level: Str) {
+    let cc_path = sh("command -v {cc_name}")
+    if cc_path == "" {
+        io.println("skip {cc_name}: no {cc_name} on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tag = "_vendored_no_map_{cc_name}_{getpid()}"
+    let cache = "{root}/.tmp/{tag}_cache"
+    let tree_a = "{root}/.tmp/{tag}_a"
+    let tree_b = "{root}/.tmp/{tag}_b"
+    dev_tree(root, tree_a, cc_path)
+    dev_tree(root, tree_b, cc_path)
+    shell_exec("rm -rf {cache}")
+    let flags = "build app/src/main.bl -o out/app --per-module {level}"
+    let a = blink_in(tree_a, cache, flags)
+    let b = blink_in(tree_b, cache, flags)
+    let run_a = sh("{tree_a}/out/app")
+    let run_b = sh("{tree_b}/out/app")
+    let names_a = objects_holding(cache, "{tag}_a/vendor")
+    let names_b = objects_holding(cache, "{tag}_b/vendor")
+    shell_exec("rm -rf {tree_a} {tree_b} {cache}")
+
+    assert(a.exit_code == 0, "build failed: {a.out}{a.err_out}")
+    assert(b.exit_code == 0, "build failed: {b.out}{b.err_out}")
+    assert_eq(run_a, "sum 42 {tree_a}/vendor/mylib/mylib.h")
+    assert_eq(run_b, "sum 42 {tree_b}/vendor/mylib/mylib.h")
+    assert_eq(compiles(a), 2)
+    assert_eq(compiles(b), 2)
+    // The unit that calls the header's inline function holds its __FILE__.
+    assert(names_a >= 1, "no object names tree A's vendored dir")
+    assert(names_b >= 1, "no object names tree B's vendored dir")
+}
+
+test "gcc without the macro prefix map keys and compiles vendored dirs by path at the default level" {
+    check_by_path("gcc", "")
+}
+
+test "gcc without the macro prefix map keys and compiles vendored dirs by path at release" {
+    check_by_path("gcc", "--release")
+}
+
+test "clang without the macro prefix map keys and compiles vendored dirs by path at the default level" {
+    check_by_path("clang", "")
+}
