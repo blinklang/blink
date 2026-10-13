@@ -1369,7 +1369,13 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
     0
 }
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+// What a build prints on stdout once it links. `blink test --json` prints none: its stdout is the
+// test binary's record stream, and a status line is not a record.
+let BUILD_STATUS_HUMAN = 0
+let BUILD_STATUS_JSON = 1
+let BUILD_STATUS_NONE = 2
+
+fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     fs_remove(output_path)
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -1382,7 +1388,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
     if unit_jobs != 0 {
         let reason = per_module_fallback_reason(emit_mode, format_flag)
         if reason == "" {
-            return do_build_units(source_path, output_path, debug_mode, release_mode, targets, json_output, strict_mode, unit_jobs, checked)
+            return do_build_units(source_path, output_path, debug_mode, release_mode, targets, status_mode, strict_mode, unit_jobs, checked)
         }
         // BLINK_PER_MODULE alone sets a default, not a request on this command, so its
         // fallback is silent.
@@ -1436,9 +1442,9 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         if lrc != 0 {
             return lrc
         }
-        if json_output != 0 {
+        if status_mode == BUILD_STATUS_JSON {
             io.println("\{\"status\":\"ok\",\"output\":\"{output_path}\"}")
-        } else {
+        } else if status_mode == BUILD_STATUS_HUMAN {
             io.println("built: {output_path}")
         }
         return 0
@@ -1446,7 +1452,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
 
     let first_triple = resolve_target_triple(targets.get(0).unwrap())
     let inc_flags = resolve_vendored_includes(used_deps, first_triple)
-    if json_output != 0 {
+    if status_mode == BUILD_STATUS_JSON {
         io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
     }
     let mut i = 0
@@ -1461,17 +1467,17 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, format_flag: Str, d
         if lrc != 0 {
             return lrc
         }
-        if json_output != 0 {
+        if status_mode == BUILD_STATUS_JSON {
             if i > 0 {
                 io.print_raw(",")
             }
             io.print_raw("\"{out}\"")
-        } else {
+        } else if status_mode == BUILD_STATUS_HUMAN {
             io.println("built: {out}")
         }
         i = i + 1
     }
-    if json_output != 0 {
+    if status_mode == BUILD_STATUS_JSON {
         io.println("]}")
     }
     return 0
@@ -2113,7 +2119,7 @@ fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
     0
 }
 
-fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
+fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" {
         out_dir = "."
@@ -2140,7 +2146,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, shas, debug_mode, release_mode, targets, json_output, unit_jobs)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, shas, debug_mode, release_mode, targets, status_mode, unit_jobs)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -2163,7 +2169,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], json_output: Int, unit_jobs: Int) -> Int ! Diag.Report, IO {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int) -> Int ! Diag.Report, IO {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -2197,16 +2203,16 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         if lrc != 0 {
             return lrc
         }
-        if json_output != 0 {
+        if status_mode == BUILD_STATUS_JSON {
             io.println("\{\"status\":\"ok\",\"output\":\"{output_path}\"}")
-        } else {
+        } else if status_mode == BUILD_STATUS_HUMAN {
             io.println("built: {output_path}")
         }
         return 0
     }
     let first_triple = resolve_target_triple(targets.get(0).unwrap())
     let inc_flags = resolve_vendored_includes(used_deps, first_triple)
-    if json_output != 0 {
+    if status_mode == BUILD_STATUS_JSON {
         io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
     }
     let mut i = 0
@@ -2221,17 +2227,17 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         if lrc != 0 {
             return lrc
         }
-        if json_output != 0 {
+        if status_mode == BUILD_STATUS_JSON {
             if i > 0 {
                 io.print_raw(",")
             }
             io.print_raw("\"{out}\"")
-        } else {
+        } else if status_mode == BUILD_STATUS_HUMAN {
             io.println("built: {out}")
         }
         i = i + 1
     }
-    if json_output != 0 {
+    if status_mode == BUILD_STATUS_JSON {
         io.println("]}")
     }
     0
@@ -4021,17 +4027,10 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         if json_output != 0 {
             diag_format = 1
         }
-        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, json_output, 0, unit_jobs, args_has(a, "per-module"), None)
+        let status_mode = if json_output != 0 { BUILD_STATUS_NONE } else { BUILD_STATUS_HUMAN }
+        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, status_mode, 0, unit_jobs, args_has(a, "per-module"), None)
         if rc != 0 {
-            if json_output != 0 {
-                io.println("\{\"status\":\"error\"}")
-            }
             exit(1)
-        }
-        if json_output != 0 {
-            // The test binary writes to the same stdout, after the status row: io.write
-            // flushes it.
-            io.write("")
         }
         let mut run_cmd = output_path
         if filter_pattern != "" {

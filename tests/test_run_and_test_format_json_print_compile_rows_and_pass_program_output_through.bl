@@ -1,9 +1,10 @@
 // `blink run` and `blink test` print compile diagnostics, so they take `--format json` and its
-// short form `--json` as `blink build` does: each diagnostic goes to stderr as a JSON row, and
-// the compile status goes to stdout as build's status row. The status row is the first line
-// on stdout; after an ok row, everything on stdout belongs to the program (or to the test
-// binary), unchanged. The two flags print the same bytes, and with the project's daemon up a
-// run prints what a cold run prints.
+// short form `--json` as `blink build` does: each diagnostic goes to stderr as a JSON row. A run
+// prints build's status row as the first line on stdout; after an ok row, everything on stdout
+// belongs to the program, unchanged. A test prints no status row: under json its stdout is the
+// test binary's record stream, in which each line is a record, so all of it belongs to the
+// binary. The two flags print the same bytes, and with the project's daemon up a run prints what
+// a cold run prints.
 
 import std.process.{ProcessResult}
 import std.json.{json_clear, json_parse, json_get, json_as_str}
@@ -234,13 +235,13 @@ test "test --format json prints a warning and an error on stderr as JSON rows an
         wrong.push(differ("{name}: --format json vs --json", f, j))
     }
     write_file("{DIR}/main_test.bl", test_err_src())
-    wrong.push(expect("err stdout", blink("test --format json main_test.bl").out, "\{\"status\":\"error\"}\n"))
+    wrong.push(expect("err stdout", blink("test --format json main_test.bl").out, ""))
     let _ = sh("rm -rf {DIR}")
     let found: List[Str] = wrong.filter(fn(w) { w != "" })
     assert_eq(found.join("\n"), "")
 }
 
-test "test --format json prints the status row, then what the test binary prints, unchanged" {
+test "test --format json prints no status row, only what the test binary prints, unchanged" {
     project()
     write_file("{DIR}/main_test.bl", test_ok_src())
     let f = blink("test --format json main_test.bl")
@@ -250,9 +251,36 @@ test "test --format json prints the status row, then what the test binary prints
     let _ = sh("rm -rf {DIR}")
     let mut wrong: List[Str] = []
     if f.exit_code != 0 || direct.exit_code != 0 { wrong.push("exit {f.exit_code} json, {direct.exit_code} binary") }
-    wrong.push(expect("json stdout", untimed(f.out), untimed("\{\"status\":\"ok\",\"output\":\"build/main_test\"}\n{direct.out}")))
+    wrong.push(expect("json stdout", untimed(f.out), untimed(direct.out)))
     wrong.push(expect("json stderr", f.err_out, direct.err_out))
     wrong.push(differ("--format json vs --json", f, j))
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+// The lines of text that a build status prints, in either form.
+fn status_lines(text: Str) -> List[Str] {
+    text.split("\n").filter(fn(line) { line.starts_with("\{\"status\":") || line.contains("\"output\":") || line.contains("\"outputs\":") || line.starts_with("built: ") })
+}
+
+test "test --format json and --json print no build status row on stdout, built or not" {
+    project()
+    let mut wrong: List[Str] = []
+    for c in [("ok", test_ok_src()), ("err", test_err_src())] {
+        let (name, src) = c
+        write_file("{DIR}/main_test.bl", src)
+        let f = blink("test --format json main_test.bl")
+        let j = blink("test --json main_test.bl")
+        let rows = status_lines(f.out)
+        if rows.len() != 0 { wrong.push("{name}: a status row on stdout:\n{f.out}") }
+        wrong.push(differ("{name}: --format json vs --json", f, j))
+        if name == "err" {
+            if f.exit_code != 1 { wrong.push("err: exit {f.exit_code}, not 1") }
+            if row_severity(f.err_out, "TypeError") != "error" { wrong.push("err: no error row named TypeError on stderr:\n{f.err_out}") }
+            wrong.push(not_json_lines("err stderr", f.err_out))
+        }
+    }
+    let _ = sh("rm -rf {DIR}")
     let found: List[Str] = wrong.filter(fn(w) { w != "" })
     assert_eq(found.join("\n"), "")
 }
