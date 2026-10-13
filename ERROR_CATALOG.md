@@ -150,12 +150,15 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | PinnedBytesEscape | E0815 | Pinned Bytes receiver escapes its `with_ptr` closure | FFI | §9.1.1 |
 | BytesPtrCastForbidden | E0817 | Bytes coerced to `Ptr[U8]` outside `with_ptr` | FFI | §9.1.1 |
 | FfiScopeNotWithResource | E0819 | An `FfiScope` value occurs somewhere other than as a `with ... as` resource — bound by `let`, passed, returned, stored, or written as a type argument (its libc arena would never be freed) | FFI | §9.1.1 |
-| MissingNativeDep | E0820 | `@ffi` references undeclared native dependency | FFI | §9.1.2 |
-| NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target | FFI | §9.1.2 |
+| MissingNativeDep | E0820 | `@ffi` references undeclared native dependency. When the name is in the `libs` of another entry, the help names the key that owns it | FFI | §9.1.2 |
+| NativeDepUnavailableCrossTarget | E0821 | Native dependency unavailable for cross-target: a `system` entry with no `link = "dynamic"`, or a `pkg-config` entry with no `libs` | FFI | §9.1.2 |
 | BufOutsideFfiSurface | E0822 | The name `Buf` written outside the `@ffi.fn` / `@ffi.struct` surface — an annotated binding, a parameter or return type, a struct field, or a generic bound | FFI | §9.1.3.2 |
 | CleanupPanickedDuringUnwind | E0824 | `exit(false)`/`close()` panicked during catchable unwind; original panic preserved, cleanup surfaces as warning | Test runner | §4.6.3 |
 | IncompatibleStdlibArchive | E0840 | Installed stdlib archive built by a different toolchain than the linking compiler (ABI/struct-layout mismatch) — rejected at link time | FFI | §9.2.1 |
 | CompilerManagedNativeDep | E0841 | `[native-dependencies]` key names a runtime library (`c`, `m`, `libc`, `libm`) that the compiler already links | FFI | §9.1.2 |
+| NativeDepKeyLibPrefix | E0844 | A `[native-dependencies]` key starts with `lib` and is used as a link name (the entry is not `vendored` and gives no `libs`), so it would link `-llib...`. Span on the key. Two machine-applicable fixes: rename the key and every `@ffi` that names it in one edit, or add `libs` | FFI | §9.1.2 |
+| PkgConfigPackageMissing | E0845 | A `type = "pkg-config"` entry has no `pkg-config` field. The field has no default; the help shows a full entry and never suggests the key as the package name | FFI | §9.1.2 |
+| PkgConfigLookupFailed | E0846 | The `pkg-config` lookup for an entry failed: the tool is missing or has no such package. No fallback to `-l<key>` | FFI | §9.1.2 |
 | SkipOutsideTest | E0827 | `skip()` called outside a `test { ... }` block | Type checking | §2.20 |
 | AssertPanicsBodyReturned | E0831 | `assert_panics` body returned normally instead of panicking | Test runner | §2.20 |
 | AssertPanicsMessageMismatch | E0832 | `assert_panics` panic message did not match expected pattern | Test runner | §2.20 |
