@@ -1,6 +1,7 @@
 # Daemon recheck: reuse the work of modules an edit did not touch
 
-Status: design, not built. The user approves it before any slice starts.
+Status: the user approved the design. Slice 1 is built (see "Slice 1 as built" at the end).
+Slices 2-5 are not.
 
 ## Why
 
@@ -408,3 +409,91 @@ the id work to slice 2, and adds cut-and-reload code that slice 2 then removes.
 
 Recommendation: keep stable ids in slice 1. The id work is the five items above, and the
 slice gives about 96 ms for an edit to any source, the entry included.
+
+## Slice 1 as built
+
+**What a recheck keeps.** The daemon worker keeps the nodes of each source whose bytes did
+not change. `reset_compiler_state` (`src/compiler.bl`) calls `parser_rewind`
+(`src/parser.bl`) in place of `parser_reset`. The rewind undoes every write to a node or
+sublist below the parsed end, newest first. It then cuts the pool back to the parsed end.
+`parse_source` gives a kept source its old nodes, and lexes and parses each other source at
+the end of the pool. Typecheck and the analyses run on the whole program, as a cold check
+runs them.
+
+**Key of a kept source.** Its path, its bytes, and the program annotations that the parses
+before it handed on (a parse reads them). The interface-text flags of the parser must also
+be the same as when the nodes were parsed. A source whose parse reported anything (an
+entry, an ICE or a lex cutoff) is never kept.
+
+**Pub edits.** A pub edit keeps the parse of every other source. Slice 1 keeps only parsed
+nodes, and a parse reads only its own bytes and the annotations handed to it. A pub edit
+cannot change what another source parses to. Typecheck runs on the whole program, so the
+section 3 rule (a changed interface text runs cold) is not needed until slice 2 keeps
+typecheck results.
+
+**Merge order.** `merge_programs` takes the program nodes in load order, and the loader puts
+an edited source's new program node in its old slot. `parser_set_load_order` gives every
+walk over node ids the cold load order. `diag_register_file_range` registers each source's
+new range, so a diagnostic in the edited source names its file.
+
+**Runs cold when:**
+- a parse of this load reported anything. The load after it is cold too;
+- dead nodes outnumber the nodes the kept sources hold;
+- the load read other sources than the last load, or the same ones in another order. The
+  load then runs again with no source kept (`loader_must_redo`), and the daemon drops what
+  the first load printed;
+- a non-source input of the check changed (`checked_non_source_inputs_changed`,
+  `src/check_pipeline.bl`): the entry, a probe answer, a config or an `#embed` file.
+
+**Builds.** A build after a check that kept a source checks again with none kept, so a
+build always compiles the program a cold load gives (`src/daemon.bl`, the build turn).
+
+**Reuse counter.** `blink daemon status` reports `reused`: the number of sources kept,
+summed over the worker's checks.
+
+**In-place writes below the parsed end.** Each one goes through a parser primitive that
+records the old value (`node_replace`, `node_widen`, `node_write_int`, `node_write_str`, and
+the closed-sublist branch of `sublist_add`), so `parser_rewind` undoes it. Line numbers are
+at the slice 1 commit.
+
+| write | where | undone how |
+|---|---|---|
+| keyword-default fill (`sublist_append` on a call's args) | `src/typecheck.bl:4911` | sublist record; the arena is cut back |
+| sealed-ops desugar (`node_set_obj`, `node_set_args`) | `src/typecheck.bl:17439`-`17440` | int records |
+| names set and put back (`node_set_name`) | `src/typecheck.bl:11661`/`11663`, `11906`/`11910`, `23727`/`23729` | str records |
+| module stamp (`node_set_module`) | `src/typecheck.bl:12953`, `12965` | int records; an equal value writes no record |
+| module stamp of top-level decls (`node_set_module`) | `src/compiler.bl:903`-`1034` | int records; an equal value writes no record |
+| merged program node and its lists | `src/compiler.bl:1040`-`1104` | new nodes above the parsed end; the cut drops them |
+| comment attachment | `src/comment_attach.bl:63`-`572` | runs in the parse, before the mark |
+| `verify_comment_attachment` | `src/comment_attach.bl:573`-`637` | a debug path that puts back what it sets |
+
+`node_overwrite` (`src/parser.bl:714`) writes columns directly, but only for a node that is
+not kept. `node_pop` below the parsed end stops the parser (`parser_limit_stop`).
+
+**Tests.**
+- `tests/test_daemon_recheck_that_keeps_parsed_modules_prints_what_a_cold_check_prints.bl`:
+  the edit set of section 5 on `src/cli.bl` with `src/cname.bl`, warm against cold, human
+  and JSON. It asserts `reused > 0`.
+- `tests/test_daemon_recheck_after_a_body_edit_of_a_corpus_file_prints_what_a_cold_check_prints.bl`:
+  a body edit of six corpus files. `BODY_EDIT_ALL=1` runs every `tests/test_*.bl`.
+  In the full run (2303 files, 1718 edited, 8042 checks), every check printed what a cold
+  check printed. Two files kept no source: `test_capabilities.bl` and
+  `test_scoped_budget.bl`. Their entry carries a program annotation, which is handed on to
+  each later parse by node id, so an edit of the entry changes the key of every source.
+
+Mutations that make the first test fail: skip the desugar undo; keep the edited source's old
+`file_ranges` entry; merge in arena order; skip the keyword-default undo.
+
+**Numbers.** m1 (`src/cli.bl`, edits in `src/cname.bl` and `src/cli.bl`), 7 runs each,
+base and slice 1 alternating, gen1 of each, median in s:
+
+| case | base | slice 1 |
+|---|---|---|
+| cold | 0.414 | 0.416 |
+| warm, body edit of `cname` | 0.418 | 0.306 |
+| warm, body edit of `cli` (the entry) | 0.422 | 0.310 |
+| warm, pub edit of `cname` | 0.419 | 0.306 |
+| warm, no change | 0.010 | 0.010 |
+
+A warm edit gains about 110 ms. Section 6 expected 96 ms. The worker's peak RSS after 20
+rechecks is 411 MB, against 363 MB on base: the pool holds the dead ranges and the journal.
