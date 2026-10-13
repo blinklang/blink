@@ -18,6 +18,12 @@ fn dev_tree(root: Str, tree: Str) {
     shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
     shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
     shell_exec("cp -rL {root}/src {tree}/app/src && cp {root}/blink.toml {tree}/app/blink.toml")
+    // What src/ embeds, so the first check is clean and runs the build analyses, which
+    // write to the nodes a recheck keeps.
+    shell_exec("mkdir -p {tree}/app/build {tree}/app/.claude")
+    for p in ["lib", "bootstrap", "CHANGELOG.md", "llms.md", "llms-full.md", "build/gc_unity.c", ".claude/blink-marketplace"] {
+        shell_exec("ln -s {root}/{p} {tree}/app/{p}")
+    }
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
     write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
 }
@@ -170,6 +176,11 @@ test "the cname probe box answers its n" {
 }
 "#
 
+// Called with too few arguments, so the check reports it, and the import it needs is used.
+let SEMVER_PROBE: Str = "\nfn cname_semver_probe() -> Str \{\n    version_to_str(1, 2)\n}\n"
+
+let MISSING_EMBED: Str = "\nlet CNAME_MISSING_EMBED: Str = #embed(\"no_such_file.txt\")\n"
+
 let STRIP_BLINK: Str = "fn strip_blink(c_name: Str) -> Str \{\n"
 let STRIP_EXTENSION: Str = "fn strip_extension(filename: Str) -> Str \{\n"
 
@@ -239,6 +250,30 @@ test "a warm recheck of the compiler after each edit prints what a cold check pr
         problems.push(compare(warm, cold, "an impl added in a module the entry does not import"))
         edit_both(warm, cold, "cli.bl", STRIP_EXTENSION, "{STRIP_EXTENSION}    let _later = 1\n")
         problems.push(compare(warm, cold, "an entry edit with that impl kept"))
+        // A module no source imported before loads in the middle of the load order.
+        edit_both(warm, cold, "cname.bl", "import typecheck.\{\n", "import std.semver.\{version_to_str}\nimport typecheck.\{\n")
+        append_both(warm, cold, "cname.bl", SEMVER_PROBE)
+        problems.push(compare(warm, cold, "an import of a module not loaded before"))
+        problems.push(printed("an import of a module not loaded before", ["expects 3 argument(s), got 2"]))
+        edit_both(warm, cold, "cname.bl", "import std.semver.\{version_to_str}\n", "")
+        edit_both(warm, cold, "cname.bl", SEMVER_PROBE, "")
+        problems.push(compare(warm, cold, "that import removed"))
+        // The check names the file of a node no declaration owns by the node range of its source.
+        append_both(warm, cold, "cname.bl", MISSING_EMBED)
+        problems.push(compare(warm, cold, "an #embed of a missing file"))
+        problems.push(printed("an #embed of a missing file", ["src/cname.bl"]))
+        edit_both(warm, cold, "cname.bl", MISSING_EMBED, "")
+        problems.push(compare(warm, cold, "that #embed removed"))
+        // A manifest edit is no source edit: the kept sources are dropped.
+        for t in [warm, cold] { write_file("{t}/app/blink.toml", "{read_file("{t}/app/blink.toml")}\n[bogus_section]\n") }
+        problems.push(compare(warm, cold, "an unknown manifest section"))
+        problems.push(printed("an unknown manifest section", ["bogus_section"]))
+        append_both(warm, cold, "cname.bl", "\nfn cname_broken_again(\n")
+        problems.push(compare(warm, cold, "a parse error under a manifest that warns"))
+        edit_both(warm, cold, "cname.bl", "\nfn cname_broken_again(\n", "\n")
+        problems.push(compare(warm, cold, "that parse error fixed"))
+        for t in [warm, cold] { shell_exec("cp {root}/blink.toml {t}/app/blink.toml") }
+        problems.push(compare(warm, cold, "the manifest restored"))
         for f in ["cname.bl", "cli.bl", "cg.bl", "mono.bl"] { restore_both(root, warm, cold, f) }
         problems.push(compare(warm, cold, "going back to the first bytes"))
         reused = served(warm, "reused")
