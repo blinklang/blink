@@ -1153,6 +1153,8 @@ The `--seed` flag accepts either a `0x`-prefixed hex literal or a decimal intege
 
 **Per-property sub-seed derivation.** Inside a test that uses `prop_check`, the runner does not pass the suite seed directly to the property's RNG. Instead it derives a stable per-property sub-seed. The sub-seed is a deterministic function of the suite seed and the bare property name. The name has no module prefix, so that moving a test between modules does not invalidate a reproducer. Within a binary, two `prop_check` blocks with the same `test "<name>"` are rejected by the runner — the runner emits a diagnostic listing both locations and exits with non-zero status, because this derivation would otherwise have them silently share a stream.
 
+**Runner `Rand` handler.** The runner installs a seeded `Rand` handler around the body of each `test` block. This handler is the outermost one, so every `with` in the test body nests inside it. Its seed is a deterministic function of the suite seed and the bare test name, derived the same way as a property sub-seed. A `rand.*` call in a test therefore never reaches the OS random source. When no handler of the test answers the call, the runner's stream answers it, and `--seed <suite> --filter '<name>'` replays that stream. A `prop_check` block keeps its own per-property stream for its inputs.
+
 Reordering tests, filtering with `--filter`, or running shards in parallel does **not** perturb any test's sub-seed — every test is reproducible in isolation given `--seed <suite> --filter '<name>'`.
 
 ##### Failure output (the reproduce line)
@@ -1282,7 +1284,7 @@ test "shuffle preserves length" {
 
 ##### The `Rand` effect surface
 
-The `Rand` resolution (§4.4.7, [decisions/random-stdlib-module.md](../decisions/random-stdlib-module.md)) confirms the assumption this design rests on. `Rand` has exactly the ops `int` / `float` / `bytes` and no seed, reseed or fork op. Seeding is a handler-installation concern: `mock_rand(seed).as_handler()` and `--seed`-derived runner handlers both install a deterministic interpretation. A `MockRand` handler implements the three ops and nothing else.
+The `Rand` resolution (§4.4.7, [decisions/random-stdlib-module.md](../decisions/random-stdlib-module.md)) confirms the assumption this design rests on. `Rand` has exactly the ops `int` / `float` / `bytes` and no seed, reseed or fork op. Seeding is a handler-installation concern: `mock_rand(seed).as_handler()` and `--seed`-derived runner handlers both install a deterministic interpretation. A `MockRand` handler implements the three ops and nothing else. A handler for `Rand` that omits an op gets the warning `PartialHandler` (§4.7.1): the omitted op reads the runner's stream, not the mock's seed.
 
 ##### Out of scope
 
@@ -1290,7 +1292,6 @@ The following are intentionally out of scope for this subsection and are tracked
 
 - **Persisted counterexamples** (proptest-regressions-style files). A complementary mechanism to `--seed` for shrinking-stable failure replay across compiler versions.
 - **`--rerun-failed`**. Re-reads the previous run's NDJSON and replays only the failing tests at their recorded sub-seeds. Distinct from `--seed`.
-- **`unseeded_rand_in_test` lint**. Warn when a test installs the real `rand` handler without seeding.
 
 **Panel vote: 6-0** for the `MockRand` controller struct shape, `mock_rand` naming, resolving now (not deferring on `Rand` effect finalization), and the per-property sub-seed derivation. **5-1** for shipping `--seed` (Minimalism dissent: pure-addition without removal, prefers persisted counterexamples as the reproducibility primitive). See [DECISIONS.md](../DECISIONS.md) and [decisions/test-seed-determinism.md](../decisions/test-seed-determinism.md).
 
