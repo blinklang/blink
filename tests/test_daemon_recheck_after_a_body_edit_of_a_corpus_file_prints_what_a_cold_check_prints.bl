@@ -82,12 +82,18 @@ fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
     ""
 }
 
+// The warm tree is asked last, so the edit comes right after a request: the daemon's idle
+// poll waits 500 ms after each request, and a poll that checked the edit first would parse
+// every source and leave the warm check nothing to keep.
 fn compare(warm: Str, cold: Str, file: Str, step: Str) -> Str {
     let mut out: List[Str] = []
-    for args in ["check {file}", "check --format json {file}"] {
-        let d = differ(warm, blink_in(warm, args), cold, blink_in(cold, args))
-        if d != "" { out.push("{file}: after {step}: {args}: {d}") }
-    }
+    let human = "check {file}"
+    let json = "check --format json {file}"
+    let d = differ(warm, blink_in(warm, human), cold, blink_in(cold, human))
+    if d != "" { out.push("{file}: after {step}: {human}: {d}") }
+    let cj = blink_in(cold, json)
+    let dj = differ(warm, blink_in(warm, json), cold, cj)
+    if dj != "" { out.push("{file}: after {step}: {json}: {dj}") }
     out.join("\n")
 }
 
@@ -147,8 +153,16 @@ test "a warm recheck after a body edit of a corpus file prints what a cold check
             edited = edited + 1
             for t in [warm, cold] { write_file("{t}/app/{f}", edit) }
             problems.push(compare(warm, cold, f, "a body edit"))
+            let mut now = served(warm, "reused")
+            // A stall past the poll's wait lets the poll check the edit first; an edit of
+            // other bytes, asked at once, tells that from a check that kept nothing.
+            if now <= reused {
+                let again = edit.replace("_body_edit_probe = 0", "_body_edit_probe = 10")
+                for t in [warm, cold] { write_file("{t}/app/{f}", again) }
+                problems.push(compare(warm, cold, f, "a second body edit"))
+                now = served(warm, "reused")
+            }
             for t in [warm, cold] { write_file("{t}/app/{f}", text) }
-            let now = served(warm, "reused")
             if now <= reused { unreused.push(f) }
             reused = now
         }
