@@ -1,7 +1,7 @@
 import symbol_index.{si_reset, si_sym_count, si_file_count}
 import query.{query_index_source, query_answer}
 import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render, diag_reset}
-import compiler.{reset_compiler_state, fill_source_interfaces, loader_keep_sources, loader_reused_sources, loader_load_cold_next, loader_load_was_cold}
+import compiler.{reset_compiler_state, fill_source_interfaces, loader_keep_sources, loader_keep_sources_for_build, loader_reused_sources, loader_load_cold_next, loader_load_was_cold}
 import std.json.{json_clear, json_new_object, json_new_bool, json_set, json_new_str, json_new_int, json_encode, json_parse, json_get, json_as_str, json_as_int, json_at, json_len}
 import std.path.{path_join, path_dirname}
 import lexer.{Lex}
@@ -95,7 +95,8 @@ type DaemonCheck {
     // How many sources the check kept from the check before.
     reused: Int
     // Whether the check's load started from an empty node pool. A build compiles a program
-    // only such a load made, so it checks again first when this is false.
+    // such a load made, or one a load that kept a source made, and checks again first for
+    // any other.
     cold: Bool
     // The index a cold query of the entry would build; None when that query prints errors.
     query: Option[DaemonQueryIndex]
@@ -819,13 +820,16 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
         return BuildTurn.Reply(daemon_not_served("source file not found: {daemon_source_path}"))
     }
     if daemon_last.is_none() || checked_inputs_changed(daemon_source_path) {
-        // Only the build reads this check, and the build cannot use a load that kept sources.
+        // Only the build reads this check, so it pays for no kept source.
         loader_load_cold_next()
         daemon_last = Some(daemon_check_program())
     }
-    // Only a check whose load started from an empty pool is known to leave the program a
-    // cold build compiles, node for node, so a build never compiles one that undid a load.
-    if !(daemon_last.unwrap()).cold {
+    // A check that kept sources undid the check before it in place and parsed each edited
+    // source at the end of the pool. The build visits that program in load order, so it
+    // compiles what a cold load gives. A load that kept no source yet did not start from an
+    // empty pool is not that case, and checks again cold.
+    let last = daemon_last.unwrap()
+    if !last.cold && last.reused == 0 {
         loader_load_cold_next()
         daemon_last = Some(daemon_check_program())
     }
@@ -870,8 +874,9 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
             exit(1)
         }
         if pwd_set { env.set_var("PWD", pwd) } else { env.remove_var("PWD") }
-        // The build loads nothing again, so it needs no record of what it writes to nodes.
-        loader_keep_sources(false)
+        // The build loads nothing again, so it needs no record of what it writes to nodes. It
+        // still reads the load order, as a check that kept sources left ids out of it.
+        loader_keep_sources_for_build()
         return BuildTurn.Child(DaemonBuild { argv: argv, program: c.program, front: c.front, out: c.out, err: c.err, declined: declined })
     }
     BuildTurn.Started(DaemonChild { pid: pid, wake: wake, client_fd: client_fd, out: out_path, err: err_path, declined: declined })
@@ -1077,8 +1082,8 @@ fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck
         return
     }
     if checked_inputs_changed(daemon_source_path) {
-        // No client waits on this check, and a build compiles only a program a check that
-        // parsed every source gave, so it parses every source and the build checks no more.
+        // No client waits on this check, so it parses every source: that drops the nodes
+        // the kept sources left dead, at a time no request pays for it.
         loader_load_cold_next()
         daemon_last = Some(daemon_check_program())
     } else {
