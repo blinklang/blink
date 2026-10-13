@@ -162,7 +162,7 @@ fn sqlite3_close(db: Ptr[Void]) -> Int ! IO
 | `UnauditedFfi` (W0800) | The author claims this foreign binding matches the C header: types, effect row, memory use |
 | `RawBypassesParam` (W0310) | The author claims this un-parameterized interpolation cannot carry an injection |
 
-**Membership criterion.** A diagnostic belongs on this list **only when silently suppressing it would destroy a record the language promises exists**. That is the whole gate. A diagnostic an author merely finds noisy does not qualify, however strongly; the list is not a place to park warnings someone wants to be unignorable.
+**Membership criterion.** A diagnostic belongs on this list **only when silently suppressing it would destroy a record the language promises exists**. That is the whole gate, and only a warning can meet it: `@allow` and `[lints]` never reach an error (§4.16.8), so an error has no channel to gate. A diagnostic an author merely finds noisy does not qualify, however strongly; the list is not a place to park warnings someone wants to be unignorable.
 
 **The list is closed.** `@trusted(audit: K)` acts only on the diagnostics in the list above (and its §9.1.1 region role). It never suppresses a diagnostic outside the list. To add a diagnostic to the channel, it must meet the membership criterion.
 
@@ -2806,7 +2806,7 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 | `@alt("ID", "desc")` | fn | Marks an alternative implementation. | Tooling (`blink alt list`, `blink alt select`) |
 | `@verify(fallback: "runtime" \| "error" \| "trust")` | fn, trait method | Sets what happens when the solver cannot prove or disprove a contract: a runtime check (the default), compile error V0003, or no check. A trait method takes `"runtime"` or `"error"` only (E0913). See §3b.4. | Static checker |
 | `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time derivation |
-| `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `blink.toml` `[lints]` config. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842). See §4.16.8. | Compiler diagnostic filter |
+| `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `blink.toml` `[lints]` config. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842). A live name that is not a warning name, such as an error name, is `NotAWarningName` (E0847). See §4.16.8. | Compiler diagnostic filter |
 | `@deprecated(since, removal, replacement, fix)` | fn, type | Edition-aware deprecation with structured migration. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). Emits W2000 when current edition < `removal`, E2001 when current edition >= `removal`. Machine-applicable fixes in structured diagnostics when `fix` is `"replace"` or `"inline"`. See §8.16.2. | Compiler warning/error (edition-gated) |
 
 #### Canonical Ordering

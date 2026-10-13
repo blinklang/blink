@@ -3414,7 +3414,28 @@ Valid severity levels: `"off"` (suppress), `"warn"` (default for W0550/W0551), `
 
 **Precedence:** Function-level `@allow` always overrides project-level `blink.toml` configuration. A function annotated with `@allow(UnrestoredMutation)` will not emit W0551 even if `blink.toml` sets `W0551 = "error"`.
 
-**Unknown names.** Each `@allow` argument and each `[lints]` key must identify a live diagnostic. A misspelled name, a retired name or code, or a code given to `@allow` is the error `UnknownDiagnosticName` (E0842). No `@allow` or `[lints]` entry suppresses it, so a typo cannot silently disable a suppression or an `"error"` gate.
+**Only warnings.** `@allow` and `[lints]` reach only the diagnostics listed under *Warning Names* in ERROR_CATALOG.md. The catalog row decides, not the severity in effect: a warning that `--strict`, `--strict-struct-layout` or `"error"` under `[lints]` makes fail the build is still a warning name, so `@allow` reaches it. Any other live name is the error `NotAWarningName` (E0847): a name under *Error Names* (`ContractUnverifiable` V0003 included), a name under *Info Names*, or an internal compiler error. An error means the compiler cannot give the program a meaning, so a suppressed error would reach code generation or run as wrong code. Like E0842, E0847 is refused, not ignored. No `@allow` or `[lints]` entry suppresses it or changes its severity, every level is refused (`"error"` included), and the compiler reports each such argument and key, not only the first. The named error still fires at its own site; E0847 does not replace it.
+
+```blink
+type Color { Red Green Blue }
+
+// intentional-error example
+@allow(NonExhaustiveMatch)   // error[NotAWarningName]: `NonExhaustiveMatch` is an error;
+                             //   `@allow` takes warning names only
+                             // help: remove this argument
+fn name(c: Color) -> Str {
+    match c {                // error[NonExhaustiveMatch]: missing pattern `Blue`
+        Red => "red"
+        Green => "green"
+    }
+}
+```
+
+The first `help:` line says to remove the argument or key. The next line gives the repair from the named error's own help. Some errors have a better repair through their own control: `ContractUnverifiable` (V0003) through `@verify(fallback: ...)` (§3b.4), `CapabilityBudgetExceeded` (E0501) through a wider `@capabilities` (§4.8). ERROR_CATALOG.md *Conventions* records that repair as catalog data. When no repair fits the `@allow` site, the help is generic and a `note:` names `blink explain <Name>`. The help never proposes another `@allow` argument and never proposes a `_ => panic(...)` arm.
+
+**Check order.** The compiler checks for E0842 first, so a name that is not live gets E0842 and nothing else. A live name then gets at most one of `AuditGatedSuppression` (E0837, an audit-gated warning, §9.1) and E0847 (a name not under *Warning Names*). The two sets do not overlap, because the audit-gated list holds warnings only (§9.1), so no order between them is given.
+
+**Unknown names.** Each `@allow` argument and each `[lints]` key must identify a live diagnostic. A misspelled name, a retired name or code, or a code given to `@allow` is the error `UnknownDiagnosticName` (E0842). It is an error, so no `@allow` or `[lints]` entry reaches it (*Only warnings*, above), and a typo cannot silently disable a suppression or an `"error"` gate.
 
 ```blink
 @allow(UnrestoredMutaton)   // error[UnknownDiagnosticName]: help: did you mean `UnrestoredMutation`?
@@ -3425,7 +3446,7 @@ fn parse_fast() -> Node {
 
 ERROR_CATALOG.md *Conventions* gives the `help:` line for each case and what `blink explain` prints for a retired or unknown name.
 
-**Invalid levels.** Each `[lints]` value must be one of the three levels above. Any other value, such as `W0551 = "loud"` or `W0551 = "warning"`, is the error `InvalidLintLevel` (E0843). Like E0842, it is refused, not ignored: no `@allow`, `[lints]` entry or `--strict` setting changes it. The span is the value token, quotes included (§8.9.8), and the help line lists the valid levels.
+**Invalid levels.** Each `[lints]` value must be one of the three levels above. Any other value, such as `W0551 = "loud"` or `W0551 = "warning"`, is the error `InvalidLintLevel` (E0843). Like E0842, it is refused, not ignored. It is an error, so no `@allow` or `[lints]` entry reaches it (*Only warnings*, above), and `--strict` does not change it. The span is the value token, quotes included (§8.9.8), and the help line lists the valid levels.
 
 #### 4.16.9 No Runtime Effect
 

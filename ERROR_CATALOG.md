@@ -24,8 +24,11 @@ error[NonExhaustiveMatch]: non-exhaustive match
 
 - **Names** are PascalCase, stable API. Once published, a name is frozen — never renamed, never reassigned.
 - **Codes** are secondary comblink identifiers (E/W/V + 4 digits). Codes are never reused after retirement.
-- **Suppression** uses names: `@allow(NonExhaustiveMatch)`. `@allow` takes names only.
-- **Each `@allow` argument and each `[lints]` key must identify a live diagnostic** — one listed under *Error Names* or *Warning Names*, not under *Retired Codes*. Any other argument or key is the error `UnknownDiagnosticName` (E0842): a misspelled name, a retired name or code, or a code given to `@allow`. No `@allow` or `[lints]` entry suppresses E0842 or changes its severity. The compiler reports each such argument and key, not only the first. An audit-gated name is `AuditGatedSuppression` (E0837), not E0842.
+- **Suppression** uses names: `@allow(UnusedVariable)`. `@allow` takes names only. Suppress a warning only when the code is correct as written; the usual repair for `UnusedVariable` is to remove or rename the binding.
+- **Only warnings can be suppressed.** `@allow` and `[lints]` reach only names listed under *Warning Names* (§4.16.8). The catalog row decides, not the severity in effect, so a warning promoted to an error is still reachable. Any other live name is the error `NotAWarningName` (E0847). No `@allow` or `[lints]` entry suppresses E0847 or changes its severity, and every level is refused, `"error"` included. The named error still fires at its own site.
+  - **Help:** the first `help:` line says to remove the argument or key. The next line gives the named error's own primary help. Where a row has a better repair through its own control, that repair is catalog data, taken from the same source as the named error's help: `ContractUnverifiable` (V0003) → change `@verify(fallback: ...)`; `CapabilityBudgetExceeded` (E0501) → widen `@capabilities`. When no repair fits the `@allow` site, the help is generic and a `note:` names `blink explain <Name>`. The help never proposes another `@allow` argument and never proposes a `_ => panic(...)` arm.
+  - **Check order:** E0842 is checked first. E0837 and E0847 cover separate name sets, because the audit-gated list holds warnings only (§9.1), so no order between them is given.
+- **Each `@allow` argument and each `[lints]` key must identify a live diagnostic** — one listed under *Error Names*, *Warning Names*, *Info Names* or *Internal Compiler Errors*, not under *Retired Codes*. Any other argument or key is the error `UnknownDiagnosticName` (E0842): a misspelled name, a retired name or code, or a code given to `@allow`. E0842 is an error, so no `@allow` or `[lints]` entry suppresses it or changes its severity. The compiler reports each such argument and key, not only the first. An audit-gated name is `AuditGatedSuppression` (E0837), and a live name that is not a warning name is `NotAWarningName` (E0847), not E0842.
   - **Retired name or code:** the `help:` line says to remove the argument or key. A `note:` lists the *Replaced by* cell of its *Retired Codes* row as information only. The help never proposes a replacement as an `@allow` argument.
   - **Code given to `@allow`:** the `help:` line names the live diagnostic that has that code.
   - **Any other string:** the compiler compares it with the live names after it ignores case, `_` and `-`. If exactly one live name is nearest, and it is near enough, the `help:` line names it. A retired name or a code is never suggested. If two or more live names are equally near, or no live name is near enough, there is no suggestion. The implementation sets how near is near enough. For one compiler version, the same input gives the same suggestion in the compiler, the language server and `blink explain`.
@@ -65,7 +68,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 Internal compiler errors indicate a bug in the compiler itself, not in your code.
 If you encounter one, please report it at https://github.com/blinklang/blink/issues.
 
-ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
+ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so an ICE name in either is `NotAWarningName` (E0847) (§4.16.8).
 
 | Name | Code | One-line |
 |------|------|----------|
@@ -172,6 +175,7 @@ ICE codes use the `I` prefix. They cannot be suppressed with `@allow`.
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
 | UnknownDiagnosticName | E0842 | An `@allow` argument or `[lints]` key that does not identify a live diagnostic: a misspelled name, a retired name or code, or a code given to `@allow`. Refused, not ignored. No `@allow` or `[lints]` entry suppresses it. The `help:` line removes a retired entry, names the diagnostic for a code, or suggests the one nearest live name (see *Conventions*) | Linting | §4.16.8 |
 | InvalidLintLevel | E0843 | A `[lints]` value that is not `"off"`, `"warn"` or `"error"`. Refused, not ignored: no `@allow`, `[lints]` entry or `--strict` changes it. Span on the value token; help lists the valid levels | Linting | §4.16.8 |
+| NotAWarningName | E0847 | An `@allow` argument or `[lints]` key that names a live diagnostic not listed under *Warning Names*: an error, an info diagnostic or an internal compiler error. Refused, not ignored, at every level (`"error"` included). No `@allow` or `[lints]` entry suppresses it. The named error still fires at its own site. The `help:` line removes the entry, then gives the named error's repair (see *Conventions*) | Linting | §4.16.8 |
 | FfiOffsetUnknownStride | E0838 | `Ptr.offset` requires `@ffi.struct` element type | FFI | §9.1.1 |
 | NonHandlerWithItem | E0839 | A `with` item without `as` is neither a `Handler[E]` nor a `BlockHandler` | Effects | §4.7 |
 | TraitContractMissingMethod | E0900 | Trait contract: required method not implemented | Trait contract | §3.6 |
