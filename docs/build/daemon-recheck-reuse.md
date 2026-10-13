@@ -331,3 +331,80 @@ Each slice comes with its own test and must pass `task ci`.
    globals by declaration, not by bare name (this bug is filed).
 5. **Import-closure key.** Only after impls, traits and the bare-name maps stop crossing
    to modules that do not import M.
+
+## 8. Review points
+
+"In the text" means in the interface text: the tokens of a source with the bodies of its
+top-level fns, impl methods and trait methods left out. The parser records a body only at
+depth 0 (`src/parser.bl:3200`-`:3206`). Trait methods (`:3505`) and impl methods go through
+`parse_fn_def` at depth 0, so their bodies are left out too. A lambda body is not recorded,
+so it stays in the text.
+
+**(a) Contracts.** `@requires` and `@ensures` are annotations before the `fn` keyword
+(`src/parser.bl:2234`), so they are in the text. They are read only in the check of the fn
+that carries them: `pv_validate_fn_contracts` (`src/typecheck.bl:9801`),
+`tc_check_contract_verifiable` (`:10127`) and `tc_type_contract_predicates` (`:21455`,
+called from `tc_check_fn` at `:21393`). No call site in N reads a callee's contract. A
+predicate in N that calls a fn of M reads M's `@pure` flag (`tc_fn_is_pure`, `:9608`) and
+M's declared effects (`lookup_fnsig`, `:9586`), by name. Both are in M's text. The key
+catches all of it.
+
+**(b) Consts.** A `const` or module `let` initializer is outside any fn body, so the value
+is in the text, not only the type. The front end folds no values. N reads another const
+only for its `is_const` flag (`tc_name_is_const_binding`, `:21118`) and for an `alloc`
+initializer (`tc_ptr_reads_singleton_alloc`, `:9405`). A module let with no type annotation
+gets its type from its initializer (`tc_infer_global_initializers`, `:23544`). The
+initializer is in the text, so the key catches a change. I did not check whether codegen
+copies const values into other units. A build after a reuse check runs cold (section 3), so
+this does not affect slice 1.
+
+**(c) Impls and coherence.** Only `parse_program` calls `parse_impl_block`
+(`src/parser.bl:2366`), so an impl is always top level and never inside a body. Its header,
+its where bounds and its method signatures are in the text. Only its method bodies are left
+out, and a method body cannot change resolution, because return types and effects are
+declared. An impl added to or removed from M therefore changes M's text, and the
+program-wide key catches it. A key over N's import closure does not: in the test in
+section 2, `impl Sizer for Pt` sits in a module the caller does not import, and the check
+passes with that module and fails with `UnresolvedMethod` without it. That is why section 3
+keys on the text of every source.
+
+**(d) Bodies that other modules read.** The compiler has no `@inline`
+(`rg "@inline" src lib` finds nothing). Typecheck reads a trait default body once, in the
+trait's own module, with `Self` left abstract (`src/typecheck.bl:23726`). N's typecheck
+never reads M's default body. Three passes read bodies across modules: mono (it makes
+instances of generic and default bodies for N's types), the mutation analysis and
+save/restore. A body edit does not change the text, so the key does not catch these.
+Instead, the rule redoes all three for the whole program on each check (section 3). Escape
+reads only callee signature facts. The mutations "skip mono" and "keep the old write sets"
+in section 5 test that this redo is required.
+
+**(e) The node arena.** Slice 1 adds stable ids. What it changes:
+- E's new nodes and sublists go at the end of `columns` and `sublists`.
+- `merge_programs` (`src/compiler.bl:878`) walks the list of per-module program nodes in
+  load order, not in id order. E's new program node goes into E's old slot, so merge visits
+  the modules in cold order.
+- E's new range goes into `file_ranges` (`diag_register_file_range`,
+  `src/diagnostics.bl:485`). The ranges do not overlap, and the lookup at `:742` does not
+  need them sorted.
+- E's entry in `loaded_inputs.source_first_nodes` and `source_end_nodes` is replaced.
+  `unit_sources` (`src/cli.bl:2009`) expects these ranges to increase in load order, and
+  marks the sources untracked when they do not. A build after a reuse check runs cold in
+  slice 1, so no build sees an appended range.
+- The `desugar_sealed_ops_calls` undo, and a cold start when dead nodes outnumber live
+  nodes.
+
+Slice 1 can avoid stable ids by prefix reuse: keep the arena up to the first node of the
+earliest edited source in load order, cut it there, and run the loader again from that
+source. That needs no id change, but it still needs the desugar undo on the kept part. The
+loader parses each source before its imports (`load_module`, `src/compiler.bl:1394` and
+`:1449`), so the entry is source 0. The gain depends on where E loads:
+- an edit to `cname` (source 27 of 71) keeps 50.2% of the tokens: about 48 ms of the
+  97.2 ms load, about 12% of the check;
+- an edit to the entry (`src/cli.bl`, the case in the ticket) keeps nothing.
+
+Slice 2 keeps per-node typecheck results by node id. Those results must stay valid for the
+modules after E as well, so slice 2 needs stable ids in any case. Prefix reuse only moves
+the id work to slice 2, and adds cut-and-reload code that slice 2 then removes.
+
+Recommendation: keep stable ids in slice 1. The id work is the five items above, and the
+slice gives about 96 ms for an edit to any source, the entry included.
