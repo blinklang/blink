@@ -1,0 +1,112 @@
+// The dev knob BLINK_DEV_DAEMON_KEEP_SOURCES=0 makes a daemon load each check cold, so a bench
+// can measure what the kept parses save. With it, a check after an edit of one source reuses
+// no source and prints what the same check prints through a daemon without the knob, which
+// reuses the source the edit did not touch.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn main_text(value: Str) -> Str {
+    "import leaf.\{leaf_value}\n\nfn main() \{\n    let unused_{value} = 1\n    io.println(leaf_value())\n}\n"
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_keep_off_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/leaf.bl", "pub fn leaf_value() -> Str \{\n    \"leaf\"\n}\n")
+    write_file("{tree}/app/src/main.bl", main_text("one"))
+}
+
+// The daemon serves only a client whose env is its own, so both run with the knob as given.
+fn env_of(tree: Str, knob: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_DAEMON_KEEP_SOURCES BLINK_CACHE_DIR={tree}/objcache {knob}"
+}
+
+fn blink_in(tree: Str, knob: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree, knob)} timeout 120 ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str, knob: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree, knob)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "reused", or -1 when the status has none.
+fn served(tree: Str, knob: Str, field: Str) -> Int {
+    let out = blink_in(tree, knob, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// What the check after an edit of src/main.bl prints, and the reused and checks fields of the
+// status after it.
+fn check_after_edit(tree: Str, knob: Str) -> (Str, Int, Int) {
+    let pid = start_daemon(tree, knob)
+    let mut printed = ""
+    let mut reused = -1
+    let mut checks = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        let _ = blink_in(tree, knob, "check src/main.bl")
+        write_file("{tree}/app/src/main.bl", main_text("two"))
+        let r = blink_in(tree, knob, "check src/main.bl")
+        printed = "exit {r.exit_code}\n{r.out}{r.err_out}".replace(tree, "TREE")
+        reused = served(tree, knob, "reused")
+        checks = served(tree, knob, "checks")
+    }
+    (printed, reused, checks)
+}
+
+test "a daemon with keep sources off reuses no parsed source and prints what one with it on prints" {
+    let root = sh("pwd -P")
+    let off = "{root}/.tmp/_daemon_keep_off_{getpid()}"
+    let on = "{root}/.tmp/_daemon_keep_on_{getpid()}"
+    dev_tree(root, off)
+    dev_tree(root, on)
+    let (off_printed, off_reused, off_checks) = check_after_edit(off, "BLINK_DEV_DAEMON_KEEP_SOURCES=0")
+    let (on_printed, on_reused, on_checks) = check_after_edit(on, "")
+    shell_exec("rm -rf {off} {on}")
+    assert(off_printed.contains("unused_two"), "the check printed no warning for the edit:\n{off_printed}")
+    assert_eq(off_printed, on_printed)
+    assert_eq(off_checks, on_checks)
+    assert_eq(off_reused, 0)
+    assert(on_reused > 0, "the daemon without the knob reused no source: reused={on_reused}")
+}
