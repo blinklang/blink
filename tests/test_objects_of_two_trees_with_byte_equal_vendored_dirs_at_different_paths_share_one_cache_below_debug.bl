@@ -1,0 +1,178 @@
+// Two trees whose vendored include dirs hold the same bytes at different absolute paths, on
+// one object cache. Below --debug an object names no vendored dir: a header's __FILE__ reads
+// "<dir name>/<file>" in every tree, so tree B takes tree A's objects and compiles none. At
+// --debug the objects record the dir, so each tree compiles its own and names only itself.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with a program of two modules over a native dep whose manifest names its source
+// by an absolute path outside the project, and a cc first on PATH that runs cc_path. The
+// header's inline function returns its own __FILE__, which the program prints.
+fn dev_tree(root: Str, tree: Str, cc_path: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin {tree}/vendor/mylib")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/bin/cc", "#!/bin/sh\nexec {cc_path} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/vendor/mylib/mylib.h", [
+        "#ifndef MYLIB_H",
+        "#define MYLIB_H",
+        "#include <stdint.h>",
+        "typedef struct mylib_ctx mylib_ctx;",
+        "int64_t mylib_add(int64_t a, int64_t b);",
+        "static inline uint8_t *mylib_where(void) \{ return (uint8_t *)__FILE__; \}",
+        "#endif",
+        "",
+    ].join("\n"))
+    write_file("{tree}/vendor/mylib/mylib.c", "#include \"mylib.h\"\nint64_t mylib_add(int64_t a, int64_t b) \{ return a + b; \}\n")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"vendored_app\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nmylib = \{ type = \"vendored\", path = \"{tree}/vendor/mylib/mylib.c\", headers = [\"mylib.h\"] \}\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/part.bl", [
+        #"@ffi.opaque(header: "mylib.h", name: "mylib_ctx")"#,
+        #"pub type Ctx"#,
+        #""#,
+        #"@ffi("mylib", "mylib_add", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn add(a: Int, b: Int) -> Int ! FFI {}"#,
+        #""#,
+        #"@ffi("mylib", "mylib_where", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn where_() -> Ptr[U8] ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import part.{add, where_}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("sum {add(40, 2)} {where_().to_str() ?? "-"}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with the shared object cache, the tree's cc and the unit trace. The
+// corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so
+// the run drops them.
+fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn compiles(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+// How many of the cache's objects hold text in their bytes once the debug sections gcc
+// compresses are decompressed.
+fn objects_holding(cache: Str, text: Str) -> Int {
+    sh("for o in {cache}/*.o; do objcopy --decompress-debug-sections \"$o\" {cache}/plain.tmp && grep -q -a -F '{text}' {cache}/plain.tmp && echo \"$o\"; rm -f {cache}/plain.tmp; done | wc -l").to_int()
+}
+
+fn object_count(cache: Str) -> Int {
+    sh("ls {cache}/*.o 2>/dev/null | wc -l").to_int()
+}
+
+type Level {
+    a: ProcessResult
+    b: ProcessResult
+    objects: Int
+    // Objects that name tree A's vendored dir, tree B's, and both.
+    vendor_a: Int
+    vendor_b: Int
+    vendor_both: Int
+    // Objects that name either tree at all.
+    any_tree: Int
+    run_a: Str
+    run_b: Str
+}
+
+// One build in each tree at the level flags give, from an empty cache.
+fn build_both(tree_a: Str, tree_b: Str, cache: Str, tag: Str, flags: Str) -> Level {
+    shell_exec("rm -rf {cache}")
+    let a = blink_in(tree_a, cache, "build app/src/main.bl -o out/app --per-module {flags}")
+    let b = blink_in(tree_b, cache, "build app/src/main.bl -o out/app --per-module {flags}")
+    let both = sh("for o in {cache}/*.o; do objcopy --decompress-debug-sections \"$o\" {cache}/plain.tmp && grep -q -a -F '{tag}_a/vendor' {cache}/plain.tmp && grep -q -a -F '{tag}_b/vendor' {cache}/plain.tmp && echo \"$o\"; rm -f {cache}/plain.tmp; done | wc -l").to_int()
+    Level {
+        a: a,
+        b: b,
+        objects: object_count(cache),
+        vendor_a: objects_holding(cache, "{tag}_a/vendor"),
+        vendor_b: objects_holding(cache, "{tag}_b/vendor"),
+        vendor_both: both,
+        any_tree: objects_holding(cache, tag),
+        run_a: sh("{tree_a}/out/app"),
+        run_b: sh("{tree_b}/out/app"),
+    }
+}
+
+fn check_shared(l: Level) {
+    assert(l.a.exit_code == 0, "build failed: {l.a.out}{l.a.err_out}")
+    assert(l.b.exit_code == 0, "build failed: {l.b.out}{l.b.err_out}")
+    assert_eq(compiles(l.a), 2)
+    assert_eq(compiles(l.b), 0)
+    assert_eq(l.objects, 2)
+    assert_eq(l.any_tree, 0)
+    assert_eq(l.run_a, "sum 42 mylib/mylib.h")
+    assert_eq(l.run_b, "sum 42 mylib/mylib.h")
+}
+
+fn check_two_trees(cc_name: Str) {
+    let cc_path = sh("command -v {cc_name}")
+    if cc_path == "" {
+        io.println("skip {cc_name}: no {cc_name} on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tag = "_vendored_two_trees_{cc_name}_{getpid()}"
+    let cache = "{root}/.tmp/{tag}_cache"
+    let tree_a = "{root}/.tmp/{tag}_a"
+    let tree_b = "{root}/.tmp/{tag}_b"
+    dev_tree(root, tree_a, cc_path)
+    dev_tree(root, tree_b, cc_path)
+    let same_vendor = sh("cmp {tree_a}/vendor/mylib/mylib.h {tree_b}/vendor/mylib/mylib.h && echo same")
+    let default_level = build_both(tree_a, tree_b, cache, tag, "")
+    let release_level = build_both(tree_a, tree_b, cache, tag, "--release")
+    let debug_level = build_both(tree_a, tree_b, cache, tag, "--debug")
+    shell_exec("rm -rf {tree_a} {tree_b} {cache}")
+
+    assert_eq(same_vendor, "same")
+    check_shared(default_level)
+    check_shared(release_level)
+
+    let d = debug_level
+    assert(d.a.exit_code == 0, "build failed: {d.a.out}{d.a.err_out}")
+    assert(d.b.exit_code == 0, "build failed: {d.b.out}{d.b.err_out}")
+    assert_eq(compiles(d.a), 2)
+    assert_eq(compiles(d.b), 2)
+    assert_eq(d.objects, 4)
+    // The unit that calls the header's inline function holds its __FILE__.
+    assert(d.vendor_a >= 1, "no debug object names tree A's vendored dir")
+    assert(d.vendor_b >= 1, "no debug object names tree B's vendored dir")
+    assert_eq(d.vendor_both, 0)
+    assert_eq(d.run_a, "sum 42 {tree_a}/vendor/mylib/mylib.h")
+    assert_eq(d.run_b, "sum 42 {tree_b}/vendor/mylib/mylib.h")
+}
+
+test "gcc objects of two trees with byte-equal vendored dirs at different paths share one cache below debug" {
+    check_two_trees("gcc")
+}
+
+test "clang objects of two trees with byte-equal vendored dirs at different paths share one cache below debug" {
+    check_two_trees("clang")
+}
