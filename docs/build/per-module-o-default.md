@@ -571,6 +571,34 @@ then a `blink check` through the daemon takes 0.397 s median wall and 42 ticks
 of daemon CPU with it on, and 0.394 s and 43 ticks with it off (an empty
 `BLINK_CACHE_DIR`), 6 edits each.
 
+A check request gets its reply first; the worker settles that check after the
+reply: it fills the interface texts, takes the stats, compares bytes once and
+forces a GC. So the window between the loader's read and the stats is longer
+than the check itself. An edit in that window leaves stats that match the
+files on disk and findings for the bytes before the edit. Without the byte
+compare the poll would never recheck, and only the next request would see the
+edit (it compares bytes too, so it never replies from the old bytes).
+`tests/test_daemon_poll_rechecks_an_edit_made_between_a_check_reply_and_its_settle.bl`
+makes that edit through `BLINK_DEV_TEST_SETTLE_HOOK`, a shell command the
+settle runs before it takes the stats. It is for tests only, like the other
+`BLINK_DEV_*` knobs. Unset, it costs one getenv per settle, after the reply.
+The test fails at `assert(resettled)` when the settle keeps the stats it took
+and skips the compare: the poll does not recheck in 20 s. Its asserts before
+that one pass in the same run: the next request and a CLI check still report
+the edit, so a missed compare stops only the poll and never gives a stale reply.
+
+Filling the interface texts in the settle must give the bytes a check gave
+when it filled them at once, since a build keys the units it keeps on them.
+`tests/test_cold_build_of_a_fixed_source_records_the_interface_texts_and_unit_keys_it_recorded_before_the_daemon_deferred_them.bl`
+pins the interface texts, the entry and header keys and the unit lines of a
+cold build of a fixed source. The values come from the gen1 of `c36d5574`, the
+tree before the change, and the tip gives the same bytes. The object keys are
+not pinned: they hold the compiler's sha, so no two compilers share them.
+Moving work after the reply did not raise the worker's peak RSS: over 10
+edits and 12 checks of `src/cli.bl` (the `7b440d07` source for all three),
+5 runs each, the worker's VmHWM was 395036-397392 KB on `7b440d07`,
+340804-392824 KB on `a8141363` and 346200-407668 KB on `95e91369`.
+
 While a build child runs, the daemon serves on: a status, check or query gets
 its answer at once, and the daemon does not poll for edits. Each turn it reaps
 the child if it ended (`waitpid` with `WNOHANG`), then waits on its socket for
