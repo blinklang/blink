@@ -590,5 +590,8 @@ At the build-turn fix, gen1 of base and of slice 1, alternating, two rounds, med
 | cold `blink check src/cli.bl` (mean of 12) | 0.420 | 0.426 | |
 | cold `blink check src/compiler.bl` (mean of 12) | 0.165 | 0.167 | |
 
-The check-then-build row is the cold check that slice 3 removes. A rerun of the same
-harness gave the worker peak RSS after 21 checks as 384 MB on slice 1 and 441 MB on base.
+The check-then-build row is the cold check that slice 3 removes. The worker peak RSS
+(VmHWM) after 21 checks of `src/cli.bl` was 384 MB on slice 1 and 441 MB on base in one run
+where the daemon served each check. Two runs where the client checked on its own, and the
+worker checked only through the idle poll, gave 402 and 349 MB on slice 1 and 363 MB on
+base. The runs overlap; the 389 / 362 MB pair above stays the reference.
