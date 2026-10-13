@@ -1,0 +1,258 @@
+// `blink run` and `blink test` print compile diagnostics, so they take `--format json` and its
+// short form `--json` as `blink build` does: each diagnostic goes to stderr as a JSON row, and
+// the compile status goes to stdout as build's status row. The status row is the first line
+// on stdout; after an ok row, everything on stdout belongs to the program (or to the test
+// binary), unchanged. The two flags print the same bytes, and with the project's daemon up a
+// run prints what a cold run prints.
+
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+let DIR = ".tmp/run_test_format_json"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// The program writes to both streams, so a test can see that each passes through.
+fn ok_src() -> Str {
+    "fn main() \{\n    io.println(\"to stdout\")\n    io.eprintln(\"to stderr\")\n}\n"
+}
+
+fn warn_src() -> Str {
+    "fn main() \{\n    let x = 1\n    io.println(\"warned\")\n}\n"
+}
+
+fn err_src() -> Str {
+    "fn main() \{\n    let x: Int = \"s\"\n    io.println(\"\{x}\")\n}\n"
+}
+
+fn test_ok_src() -> Str {
+    "test \"adds\" \{\n    assert_eq(1 + 1, 2)\n}\n"
+}
+
+fn test_warn_src() -> Str {
+    "test \"adds\" \{\n    let x = 1\n    assert_eq(1 + 1, 2)\n}\n"
+}
+
+fn test_err_src() -> Str {
+    "test \"adds\" \{\n    let x: Int = \"s\"\n    assert_eq(x, 1)\n}\n"
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes a
+// build one unit, which the daemon does not serve, so each command drops both, and the module
+// filters. The daemon starts under the same env, since it serves only a client whose env is
+// its own.
+fn env_of() -> Str {
+    "env -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+}
+
+fn blink(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && {env_of()} timeout 120 $B {args}")
+}
+
+// The pid of a daemon serving main.bl, or -1. The timeout ends a daemon that nothing stopped.
+fn start_daemon() -> Int {
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && rm -rf .blink && ({env_of()} timeout 300 $B daemon start main.bl > daemon.log 2>&1 &); for i in $(seq 1 600); do if [ -S .blink/daemon.sock ]; then cat .blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f .blink/daemon.pid ] && kill $(cat .blink/daemon.pid); exit 1")
+    if r.exit_code != 0 { return -1 }
+    r.out.trim().to_int()
+}
+
+fn stop_daemon(pid: Int) {
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// The router's counts from `daemon status`, from "entries" on.
+fn served() -> Str {
+    let out = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of()} $B daemon status").out
+    match out.byte_index_of("\"entries\":", 0) {
+        Some(at) => out.byte_slice(at, out.byte_len()).trim()
+        None => "no status: {out}"
+    }
+}
+
+// What on text is not a JSON object per line, or "".
+fn not_json_lines(label: Str, text: Str) -> Str {
+    for line in text.split("\n") {
+        if line == "" { continue }
+        json_clear()
+        if !line.starts_with("\{") || !line.ends_with("}") || json_parse(line) < 0 {
+            return "{label}: a line is not JSON: `{line}`\nall:\n{text}"
+        }
+    }
+    ""
+}
+
+// The severity of the row on stderr named name, or "".
+fn row_severity(err: Str, name: Str) -> Str {
+    let mut found = ""
+    for line in err.split("\n") {
+        if line == "" { continue }
+        json_clear()
+        let root = json_parse(line)
+        if root < 0 { continue }
+        if json_as_str(json_get(root, "name")) == name {
+            found = json_as_str(json_get(root, "severity"))
+        }
+    }
+    found
+}
+
+// A test binary times each test, so two runs differ only there.
+fn untimed(text: Str) -> Str {
+    let key = "\"duration_ms\":"
+    let parts = text.split(key)
+    let mut out = parts.get(0).unwrap()
+    let mut i = 1
+    while i < parts.len() {
+        let part = parts.get(i).unwrap()
+        let mut at = 0
+        while at < part.byte_len() && "0123456789.e-+".contains(part.byte_slice(at, at + 1)) {
+            at = at + 1
+        }
+        out = "{out}{key}0{part.byte_slice(at, part.byte_len())}"
+        i = i + 1
+    }
+    out
+}
+
+// The first difference between two results, or "".
+fn differ(label: Str, a: ProcessResult, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "{label}: exit {a.exit_code} vs {b.exit_code}" }
+    if untimed(a.out) != untimed(b.out) { return "{label}: stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if untimed(a.err_out) != untimed(b.err_out) { return "{label}: stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+fn expect(label: Str, got: Str, want: Str) -> Str {
+    if got == want { return "" }
+    "{label}:\n{got}\n-- is not --\n{want}"
+}
+
+fn project() {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"run_test_format_json\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+}
+
+// (name, source, the diagnostic's name, its severity, the exit code)
+fn run_cases() -> List[(Str, Str, Str, Str, Int)] {
+    [("warn", warn_src(), "UnusedVariable", "warning", 0), ("err", err_src(), "TypeError", "error", 1)]
+}
+
+fn test_cases() -> List[(Str, Str, Str, Str, Int)] {
+    [("warn", test_warn_src(), "UnusedVariable", "warning", 0), ("err", test_err_src(), "TypeError", "error", 1)]
+}
+
+test "run --format json prints a warning and an error on stderr as JSON rows, the same bytes as --json" {
+    project()
+    let mut wrong: List[Str] = []
+    for c in run_cases() {
+        let (name, src, diag, severity, code) = c
+        write_file("{DIR}/main.bl", src)
+        let f = blink("run --format json main.bl")
+        let j = blink("run --json main.bl")
+        if f.exit_code != code { wrong.push("{name}: exit {f.exit_code}, not {code}") }
+        wrong.push(not_json_lines("{name} stderr", f.err_out))
+        let got = row_severity(f.err_out, diag)
+        if got != severity { wrong.push("{name}: no {severity} row named {diag} on stderr:\n{f.err_out}") }
+        wrong.push(differ("{name}: --format json vs --json", f, j))
+    }
+    write_file("{DIR}/main.bl", warn_src())
+    wrong.push(expect("warn stdout", blink("run --format json main.bl").out, "\{\"status\":\"ok\",\"output\":\"build/main\"}\nwarned\n"))
+    write_file("{DIR}/main.bl", err_src())
+    wrong.push(expect("err stdout", blink("run --format json main.bl").out, "\{\"status\":\"error\"}\n"))
+    let _ = sh("rm -rf {DIR}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "run --format json leaves the program's stdout and stderr as they are, after the status row" {
+    project()
+    write_file("{DIR}/main.bl", ok_src())
+    let human = blink("run main.bl")
+    let f = blink("run --format json main.bl")
+    let j = blink("run --json main.bl")
+    let _ = sh("rm -rf {DIR}")
+    let mut wrong: List[Str] = []
+    if human.exit_code != 0 || f.exit_code != 0 { wrong.push("exit {human.exit_code} human, {f.exit_code} json") }
+    wrong.push(expect("program stdout", human.out, "to stdout\n"))
+    wrong.push(expect("json stdout", f.out, "\{\"status\":\"ok\",\"output\":\"build/main\"}\n{human.out}"))
+    wrong.push(expect("json stderr", f.err_out, human.err_out))
+    wrong.push(expect("program stderr", f.err_out, "to stderr\n"))
+    wrong.push(differ("--format json vs --json", f, j))
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "run --format json through the daemon prints what a cold run prints" {
+    project()
+    let mut cold: List[ProcessResult] = []
+    for c in run_cases() {
+        let (_, src, _, _, _) = c
+        write_file("{DIR}/main.bl", src)
+        cold.push(blink("run --format json main.bl"))
+    }
+
+    let pid = start_daemon()
+    assert(pid > 0, "the daemon did not start")
+    let mut wrong: List[Str] = []
+    let mut i = 0
+    for c in run_cases() {
+        let (name, src, _, _, _) = c
+        write_file("{DIR}/main.bl", src)
+        let warm = blink("run --format json main.bl")
+        let warm_json = blink("run --json main.bl")
+        wrong.push(differ("{name}: daemon --format json vs cold", warm, cold.get(i).unwrap()))
+        wrong.push(differ("{name}: daemon --format json vs daemon --json", warm, warm_json))
+        i = i + 1
+    }
+    let counts = served()
+    stop_daemon(pid)
+    let _ = sh("rm -rf {DIR}")
+
+    // The daemon ran the builds, not a cold build behind it.
+    if !counts.contains("\"builds\":4") { wrong.push("daemon status: {counts}") }
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "test --format json prints a warning and an error on stderr as JSON rows and only JSON on stdout, as --json does" {
+    project()
+    let mut wrong: List[Str] = []
+    for c in test_cases() {
+        let (name, src, diag, severity, code) = c
+        write_file("{DIR}/main_test.bl", src)
+        let f = blink("test --format json main_test.bl")
+        let j = blink("test --json main_test.bl")
+        if f.exit_code != code { wrong.push("{name}: exit {f.exit_code}, not {code}") }
+        wrong.push(not_json_lines("{name} stderr", f.err_out))
+        wrong.push(not_json_lines("{name} stdout", f.out))
+        let got = row_severity(f.err_out, diag)
+        if got != severity { wrong.push("{name}: no {severity} row named {diag} on stderr:\n{f.err_out}") }
+        wrong.push(differ("{name}: --format json vs --json", f, j))
+    }
+    write_file("{DIR}/main_test.bl", test_err_src())
+    wrong.push(expect("err stdout", blink("test --format json main_test.bl").out, "\{\"status\":\"error\"}\n"))
+    let _ = sh("rm -rf {DIR}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
+
+test "test --format json prints the status row, then what the test binary prints, unchanged" {
+    project()
+    write_file("{DIR}/main_test.bl", test_ok_src())
+    let f = blink("test --format json main_test.bl")
+    let j = blink("test --json main_test.bl")
+    // The binary that run left behind, run as blink test runs it.
+    let direct = sh("cd {DIR} && timeout 60 build/main_test --test-json")
+    let _ = sh("rm -rf {DIR}")
+    let mut wrong: List[Str] = []
+    if f.exit_code != 0 || direct.exit_code != 0 { wrong.push("exit {f.exit_code} json, {direct.exit_code} binary") }
+    wrong.push(expect("json stdout", untimed(f.out), untimed("\{\"status\":\"ok\",\"output\":\"build/main_test\"}\n{direct.out}")))
+    wrong.push(expect("json stderr", f.err_out, direct.err_out))
+    wrong.push(differ("--format json vs --json", f, j))
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+}
