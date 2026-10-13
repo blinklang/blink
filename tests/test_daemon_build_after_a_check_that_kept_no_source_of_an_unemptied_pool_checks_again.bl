@@ -1,0 +1,147 @@
+// A build compiles only a program whose load started from an empty node pool. A check whose
+// load undid the last one in place gives the program the same sources, but at other node ids,
+// even when it kept no source. Here the entry declares @capabilities, and every source after it
+// hands that annotation on, so an edit of the entry keeps no source; the build after that check
+// must check once more. A settle hook writes a line for each check the daemon runs.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn main_text(value: Str) -> Str {
+    "@capabilities(IO)\n\nimport leaf.\{leaf_value}\n\nfn main() \{\n    io.println(\"{value} \{leaf_value()}\")\n}\n"
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_unemptied_pool_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/leaf.bl", "pub fn leaf_value() -> Str \{\n    \"leaf\"\n}\n")
+    write_file("{tree}/app/src/main.bl", main_text("one"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon serves only a
+// client whose env is its own, so both run with the hook set. Its marks live outside the app,
+// so they are no input of the check.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_DEV_TEST_SETTLE_HOOK='echo x >> {tree}/settles'"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "reused", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// How many checks the daemon has settled.
+fn settles(tree: Str) -> Int {
+    sh("cat {tree}/settles 2>/dev/null | wc -l").to_int()
+}
+
+// Waits up to 20 s for the settle count to pass `than`; the count it read.
+fn settles_past(tree: Str, than: Int) -> Int {
+    let _ = process_run("sh", ["-c", "for i in $(seq 1 200); do [ $(cat {tree}/settles 2>/dev/null | wc -l) -gt {than} ] && exit 0; sleep 0.1; done; exit 1"])
+    settles(tree)
+}
+
+test "a build after a check that kept no source of an unemptied node pool checks again" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_daemon_unemptied_pool_{getpid()}"
+    dev_tree(root, tree)
+    let pid = start_daemon(tree)
+    let mut started = -1
+    let mut first = process_run("true", [])
+    let mut checked = process_run("true", [])
+    let mut reused_before = -1
+    let mut reused_after = -1
+    let mut before_build = -1
+    let mut built = process_run("true", [])
+    let mut after_build = -1
+    let mut ran = ""
+    let mut builds_before = -1
+    let mut builds = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        // The worker checks when it starts.
+        started = settles_past(tree, 0)
+        first = blink_in(tree, "build src/main.bl -o out/app")
+
+        // The first check kept every source it parsed, so the next load undoes it in place.
+        // A check request just before the edit restarts the poll's wait, so the request after
+        // the edit, not the poll, checks it.
+        let _ = blink_in(tree, "check src/main.bl")
+        let pre = settles(tree)
+        write_file("{tree}/app/src/main.bl", main_text("two"))
+        reused_before = served(tree, "reused")
+        checked = blink_in(tree, "check src/main.bl")
+        // A check request settles after its reply.
+        before_build = settles_past(tree, pre)
+        reused_after = served(tree, "reused")
+        builds_before = served(tree, "builds")
+        built = blink_in(tree, "build src/main.bl -o out/app")
+        after_build = settles(tree)
+        ran = sh("{tree}/app/out/app")
+        builds = served(tree, "builds")
+    }
+    shell_exec("rm -rf {tree}")
+
+    assert(started > 0, "the worker settled no check")
+    assert_eq(first.exit_code, 0)
+    assert_eq(checked.exit_code, 0)
+    assert_eq(built.exit_code, 0)
+    assert_eq(ran, "two leaf")
+    // The check after the edit kept no source, so only the place of its nodes can tell its
+    // program from a cold one.
+    assert_eq(reused_after, reused_before)
+    // The daemon built the program itself, so the settle count is its own.
+    assert_eq(builds, builds_before + 1)
+    assert_eq(after_build, before_build + 1)
+}

@@ -51,6 +51,9 @@
 #   global-<module>      a new value for the Int literal that initializes a global of a module
 #                        that is not the entry (cli only: no such module of small has one)
 #   run-body-<module>    `blink run` after the (a) edit
+#   check-build-body-<module>  `blink check` and then at once `blink build` after the (a) edit,
+#                        as an editor that checks on save and a build that follows; the row
+#                        times both
 #   test-body-<module>   `blink test <one test file>` after the (a) edit (debug build)
 #   cold-obj             (d) obj cache cleared; std archive kept
 #   cold-all             (d) obj cache and std archive cache both cleared. cli only: with
@@ -252,7 +255,7 @@ rep() {
     local log=$work/.bench/logs/$target-$cs-$r.log
     wait_load
     case "$kind" in
-        body|run|test) edit_body "$dir/$efile" "$efn" "$nonce" ;;
+        body|run|test|checkbuild) edit_body "$dir/$efile" "$efn" "$nonce" ;;
         pub) edit_pub "$dir/$efile" "$nonce" ;;
         priv) edit_priv "$dir/$efile" "$nonce" ;;
         testblock) edit_test "$dir/$efile" "$nonce" ;;
@@ -270,8 +273,18 @@ rep() {
         *) args=(build "$(tv src "$target")" ${BENCH_FLAGS:-}) ;;
     esac
     [ "${BENCH_SETTLE:-0}" = 0 ] || sleep "$BENCH_SETTLE"
-    local load=$(load1)
+    local load=$(load1) check_wall=0
+    if [ "$kind" = checkbuild ]; then
+        run_blink "$target" "$log.check" check "$(tv src "$target")"
+        if [ "$rc" != 0 ]; then
+            restore "$target" "$target-$(stem "$efile").bl" "$efile"
+            tail -20 "$log.check" >&2
+            die "$target $cs run $r: blink check exited $rc (log $log.check)"
+        fi
+        check_wall=$wall
+    fi
     run_blink "$target" "$log" "${args[@]}"
+    wall=$(awk -v a="$wall" -v b="$check_wall" 'BEGIN { printf "%.3f", a + b }')
     [ -n "$efile" ] && restore "$target" "$target-$(stem "$efile").bl" "$efile"
     [ "$rc" = 0 ] || { tail -20 "$log" >&2; die "$target $cs run $r: blink ${args[*]} exited $rc (log $log)"; }
     local sha
@@ -413,6 +426,7 @@ for target in ${BENCH_TARGETS:-cli small}; do
     first=$(tv body "$target" | cut -d' ' -f1)
     f=${first%%:*} fn=${first#*:}
     run_case "$target" "run-body-$(modname "$f")" run "$bc" changed "$base_build" "$f" "$fn"
+    run_case "$target" "check-build-body-$(modname "$f")" checkbuild "$bc" changed "$base_build" "$f" "$fn"
     run_case "$target" "test-body-$(modname "$f")" test "$tc" changed "$base_test" "$f" "$fn"
     run_case "$target" cold-obj cold-obj "$bc" same "$base_build"
     [ "$(tv coldall "$target")" = 1 ] && run_case "$target" cold-all cold-all "$bc" same "$base_build"

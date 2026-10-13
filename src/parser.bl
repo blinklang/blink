@@ -1,5 +1,5 @@
 import tokens.{TokenKind, is_keyword, token_kind_name}
-import ast.{NodeKind, AstNode, ChildWalk, node_child_ids_into, node_unclaimed_child, nk_of, nk_is_typed, nk_bridge_gap, node_kind_name, trace, trace_mode}
+import ast.{NodeKind, AstNode, ChildWalk, node_child_ids_into, node_unclaimed_child, nk_of, nk_is_typed, nk_bridge_gap, node_kind_name, trace, trace_mode, dbg_trace}
 import lexer.{tokens}
 import std.path.{path_dirname}
 import diagnostics.{
@@ -204,6 +204,249 @@ pub let mut parse_desugar_enabled: Int = 1
 // stringified.
 pub let mut source_module_for_node: Map[Int, Str] = Map()
 
+// A daemon recheck keeps the nodes of each source whose bytes did not change, so the pool must
+// go back to what the parses wrote before each check. Every write to a node or a closed
+// sublist below `floor`, the node count after the last parse, is recorded here with what it
+// overwrote, and a rewind undoes the records newest first, then drops all that the check
+// pushed past the parsed end. A write at or past `floor` belongs to a parse in progress, or to
+// a node the rewind drops. `floor` stays 0 unless a caller keeps parsed nodes, so a one-shot
+// compile records nothing.
+type NodeJournal {
+    keep: Bool
+    floor: Int
+    sl_floor: Int
+    // One record per write: what (JOURNAL_INT, ...), where, and the old value or values.
+    what: List[Int]
+    at: List[Int]
+    old: List[Int]
+    old2: List[Int]
+    old_str: List[Str]
+    // The parsed end: the length of each Int and Str chunk, of child_slots and of the sublist
+    // arena, and the sublist count, when the last parse ended. Empty before the first.
+    marked: Bool
+    end_ints: List[Int]
+    end_strs: List[Int]
+    end_child_slots: Int
+    end_sublists: Int
+    end_arena: Int
+    // The node ranges of the loaded sources in load order, and where each starts in a load
+    // that parsed every source in that order. Empty while ids are already in that order.
+    order_firsts: List[Int]
+    order_ends: List[Int]
+    order_offsets: List[Int]
+    order_live: Int
+}
+
+let JOURNAL_INT = 0
+let JOURNAL_STR = 1
+let JOURNAL_KIND = 2
+let JOURNAL_CHILD_AT = 3
+let JOURNAL_SUBLIST = 4
+
+fn node_journal_empty(keep: Bool) -> NodeJournal {
+    NodeJournal { keep: keep, floor: 0, sl_floor: 0, what: [], at: [], old: [], old2: [], old_str: [], marked: false, end_ints: [], end_strs: [], end_child_slots: 0, end_sublists: 0, end_arena: 0, order_firsts: [], order_ends: [], order_offsets: [], order_live: 0 }
+}
+
+let mut journal: NodeJournal = node_journal_empty(false)
+
+fn journal_record(what: Int, slot: Int, old: Int, old2: Int, old_str: Str) {
+    journal.what.push(what)
+    journal.at.push(slot)
+    journal.old.push(old)
+    journal.old2.push(old2)
+    journal.old_str.push(old_str)
+}
+
+// Whether the parser keeps what each parse wrote across resets, so parser_rewind can return
+// to it. Turning it off drops what was kept.
+pub fn parser_keep_parsed(on: Bool) {
+    if !on { journal = node_journal_empty(false) }
+    journal.keep = on
+}
+
+pub fn parser_keeps_parsed() -> Bool { journal.keep }
+
+// Whether there is a parsed state to rewind to.
+pub fn parser_has_parsed_end() -> Bool { journal.keep && journal.marked }
+
+// The node count when the last parse ended.
+pub fn parser_parsed_end() -> Int { journal.floor }
+
+// Called once a source's parse and comment attachment are done: what they wrote is now
+// parsed state, and every later write below here is recorded.
+pub fn parser_mark_parsed() {
+    if !journal.keep { return }
+    journal.floor = columns.count
+    journal.sl_floor = sublists.start.len()
+    journal.marked = true
+    journal.end_ints.clear()
+    journal.end_strs.clear()
+    let mut c = 0
+    while c < columns.ints.len() {
+        journal.end_ints.push(columns.ints[c].len())
+        journal.end_strs.push(columns.strs[c].len())
+        c = c + 1
+    }
+    journal.end_child_slots = columns.child_slots.len()
+    journal.end_sublists = sublists.start.len()
+    journal.end_arena = sublists.arena.len()
+}
+
+// Returns the pool to what the parses wrote, as parser_reset returns it to empty. Every
+// record is undone, newest first, before the drop, since a record may name a slot past the
+// parsed end.
+pub fn parser_rewind() {
+    let undone = journal.what.len()
+    let before = columns.count
+    let mut k = journal.what.len() - 1
+    while k >= 0 {
+        let what = journal.what[k]
+        let slot = journal.at[k]
+        if what == JOURNAL_INT {
+            columns.ints[slot >> 32].set(slot & 4294967295, journal.old[k])
+        } else if what == JOURNAL_STR {
+            columns.strs[slot >> 32].set(slot & 4294967295, journal.old_str[k])
+        } else if what == JOURNAL_KIND {
+            columns.kind.set(slot, journal.old[k])
+        } else if what == JOURNAL_CHILD_AT {
+            columns.child_at[slot >> 12].set(slot & 4095, journal.old[k])
+        } else {
+            sublists.start.set(slot, journal.old[k])
+            sublists.len.set(slot, journal.old2[k])
+        }
+        k = k - 1
+    }
+    journal.what.clear()
+    journal.at.clear()
+    journal.old.clear()
+    journal.old2.clear()
+    journal.old_str.clear()
+    let n = journal.floor
+    let chunks = (n + 4095) >> 12
+    while columns.ints.len() > chunks {
+        let _ = columns.ints.pop()
+        let _ = columns.strs.pop()
+        let _ = columns.child_at.pop()
+    }
+    let mut c = 0
+    while c < chunks {
+        node_ints_drop(c, columns.ints[c].len() - journal.end_ints[c])
+        node_strs_drop(c, columns.strs[c].len() - journal.end_strs[c])
+        c = c + 1
+    }
+    if chunks > 0 {
+        let last = chunks - 1
+        let keep = n - (last << 12)
+        while columns.child_at[last].len() > keep {
+            let _ = columns.child_at[last].pop()
+        }
+    }
+    while columns.kind.len() > n {
+        let _ = columns.kind.pop()
+    }
+    columns.count = n
+    node_drop_child_slots_from(journal.end_child_slots)
+    while sublists.start.len() > journal.end_sublists {
+        let _ = sublists.start.pop()
+        let _ = sublists.len.pop()
+    }
+    while sublists.arena.len() > journal.end_arena {
+        let _ = sublists.arena.pop()
+    }
+    sublists.open.clear()
+    journal.sl_floor = journal.end_sublists
+    journal.order_firsts = []
+    journal.order_ends = []
+    journal.order_offsets = []
+    journal.order_live = 0
+    annotations = PendingAnnotations { item: [], program: [] }
+    fn_bodies = FnBodies { wanted: fn_bodies.wanted, deferred: fn_bodies.deferred, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
+    source_module_for_node.clear()
+    pos = 0
+    parse_desugar_enabled = 1
+    dbg_trace("journal", "undo undid {undone} writes, dropped {before - columns.count} nodes; pool {columns.count} nodes, parsed end {journal.floor}")
+}
+
+// The program-level annotations a parse leaves for the parses after it, which put them in
+// their own program's annotations as well; a source that is not parsed again must hand on
+// the ones its parse did.
+pub fn parser_program_annotations() -> List[Int] {
+    let mut out: List[Int] = []
+    for a in annotations.program { out.push(a) }
+    out
+}
+
+pub fn parser_set_program_annotations(anns: List[Int]) {
+    let mut out: List[Int] = []
+    for a in anns { out.push(a) }
+    annotations.program = out
+}
+
+// The node ranges of the loaded sources in load order. A cold load parses them in that order,
+// so a node's id there is where it is in this order; a pass that visits or picks nodes by id
+// asks node_load_rank, so a load that kept nodes visits and picks as a cold one does.
+pub fn parser_set_load_order(firsts: List[Int], ends: List[Int]) {
+    journal.order_firsts = []
+    journal.order_ends = []
+    journal.order_offsets = []
+    let mut live = 0
+    let mut in_order = true
+    let mut i = 0
+    while i < firsts.len() {
+        if firsts[i] != live { in_order = false }
+        journal.order_firsts.push(firsts[i])
+        journal.order_ends.push(ends[i])
+        journal.order_offsets.push(live)
+        live = live + ends[i] - firsts[i]
+        i = i + 1
+    }
+    if !journal.keep || (in_order && live == journal.floor) {
+        journal.order_firsts = []
+        journal.order_ends = []
+        journal.order_offsets = []
+    }
+    journal.order_live = live
+}
+
+// Whether ids are out of load order, so node_load_rank is not the id.
+pub fn parser_load_order_moved() -> Bool { journal.order_firsts.len() > 0 }
+
+// Where node `id` would be in a load that parsed every source in load order: its id there.
+// A node made after the parses comes after them in the same order. -1 for a node no loaded
+// source holds: the old parse of a source parsed again.
+pub fn node_load_rank(id: Int) -> Int {
+    if journal.order_firsts.len() == 0 { return id }
+    if id >= journal.floor { return journal.order_live + id - journal.floor }
+    let mut i = 0
+    while i < journal.order_firsts.len() {
+        if id >= journal.order_firsts[i] && id < journal.order_ends[i] {
+            return journal.order_offsets[i] + id - journal.order_firsts[i]
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// The ranges of parser_set_load_order, then the nodes made after the parses, as [first, end)
+// pairs: every node a cold load would hold, in its order.
+pub fn parser_live_ranges() -> List[Int] {
+    let mut out: List[Int] = []
+    if journal.order_firsts.len() == 0 {
+        out.push(0)
+        out.push(columns.count)
+        return out
+    }
+    let mut i = 0
+    while i < journal.order_firsts.len() {
+        out.push(journal.order_firsts[i])
+        out.push(journal.order_ends[i])
+        i = i + 1
+    }
+    out.push(journal.floor)
+    out.push(columns.count)
+    out
+}
+
 // The path is written relative to the source file that holds the `#embed`, which is the only
 // directory the author can reason about; the stdlib registry writes all of its paths that way.
 pub fn embed_path_of(node: Int) -> Str {
@@ -219,6 +462,7 @@ pub fn parser_reset() {
     source_module_for_node.clear()
     pos = 0
     parse_desugar_enabled = 1
+    journal = node_journal_empty(journal.keep)
 }
 
 pub fn record_source_module(node_id: Int, key: Str) {
@@ -768,6 +1012,9 @@ pub fn node_push(n: AstNode) -> Int {
 pub fn node_pop() {
     if columns.count == 0 { return }
     let id = columns.count - 1
+    if id < journal.floor {
+        parser_limit_stop("node_pop() of node {id}, which a parse made and a rewind keeps")
+    }
     let c = id >> 12
     let h = columns.ints[c][id & 4095]
     let s = h & 65535
@@ -795,12 +1042,16 @@ fn node_replace(id: Int, n: AstNode) {
     let s = h & 65535
     let held = columns.shape_mask[s]
     let m = node_mask(n)
-    if (m & held) == m {
+    let kept = id < journal.floor
+    if (m & held) == m && !kept {
         node_overwrite(n, s, h, c)
     } else {
+        // A kept node takes a new payload, so the rewind restores it with its head word.
+        if kept { journal_record(JOURNAL_INT, (c << 32) | j, h, 0, "") }
         let s2 = node_shape(m | held, n.kind)
         columns.ints[c].set(j, node_store(n, s2, c))
     }
+    if kept && columns.kind[id] != n.kind { journal_record(JOURNAL_KIND, id, columns.kind[id], 0, "") }
     columns.kind.set(id, n.kind)
     // Most setters change a field that is not a child, so a run equal to the old one is
     // dropped again instead of growing the column on every write.
@@ -811,6 +1062,7 @@ fn node_replace(id: Int, n: AstNode) {
     if node_child_runs_equal(old, at) {
         node_drop_child_slots_from(at >> 8)
     } else {
+        if kept { journal_record(JOURNAL_CHILD_AT, id, old, 0, "") }
         columns.child_at[c].set(j, at)
     }
 }
@@ -822,6 +1074,7 @@ fn node_widen(i: Int, bit: Int) {
     let j = i & 4095
     let s = columns.ints[c][j] & 65535
     let s2 = node_shape(columns.shape_mask[s] | bit, columns.kind[i])
+    if i < journal.floor { journal_record(JOURNAL_INT, (c << 32) | j, columns.ints[c][j], 0, "") }
     columns.ints[c].set(j, node_store(node_or_die(i, "node_widen"), s2, c))
 }
 
@@ -838,7 +1091,13 @@ fn node_write_int(i: Int, f: Int, bit: Int, dflt: Int, val: Int) {
         h = columns.ints[c][j]
         o = columns.shape_slot[(h & 65535) * 56 + f]
     }
-    columns.ints[c].set(((h >> 16) & 16777215) + o, val)
+    let k = ((h >> 16) & 16777215) + o
+    if i < journal.floor {
+        let old = columns.ints[c][k]
+        if old == val { return }
+        journal_record(JOURNAL_INT, (c << 32) | k, old, 0, "")
+    }
+    columns.ints[c].set(k, val)
 }
 
 fn node_write_str(i: Int, f: Int, bit: Int, dflt: Str, val: Str) {
@@ -852,7 +1111,13 @@ fn node_write_str(i: Int, f: Int, bit: Int, dflt: Str, val: Str) {
         h = columns.ints[c][j]
         o = columns.shape_slot[(h & 65535) * 56 + f]
     }
-    columns.strs[c].set((h >> 40) + o, val)
+    let k = (h >> 40) + o
+    if i < journal.floor {
+        let old = columns.strs[c][k]
+        if old == val { return }
+        journal_record(JOURNAL_STR, (c << 32) | k, 0, 0, old)
+    }
+    columns.strs[c].set(k, val)
 }
 
 // Field reads for node `i` (checked) through the field's `at` table.
@@ -1046,6 +1311,7 @@ fn sublist_add(sl: Int, node_id: Int) {
         let mut items = sublists.scratch[-2 - s]
         items.push(node_id)
     } else {
+        if sl < journal.sl_floor { journal_record(JOURNAL_SUBLIST, sl, s, n, "") }
         if s + n != sublists.arena.len() {
             let dest = sublists.arena.len()
             let mut k = 0
@@ -1232,6 +1498,10 @@ pub fn parser_defer_interface_text(on: Bool) {
 
 pub fn parser_interface_text_deferred() -> Bool {
     fn_bodies.deferred
+}
+
+pub fn parser_interface_text_wanted() -> Bool {
+    fn_bodies.wanted
 }
 
 // The tokens of the source parsed last, but for those inside a fn body: what other modules

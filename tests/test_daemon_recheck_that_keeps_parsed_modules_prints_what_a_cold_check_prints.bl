@@ -1,0 +1,294 @@
+// A warm daemon check keeps the parsed nodes of each source whose bytes did not change and
+// parses only the edited ones. Over a run of edits to the compiler's own src/cname.bl and
+// src/cli.bl, each warm check must print what a cold check of a twin tree prints, byte for
+// byte, in human and JSON form, and the daemon must say it reused sources, so a fast path
+// that fell back to cold on every check cannot pass unseen.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    shell_exec("cp -rL {root}/src {tree}/app/src && cp {root}/blink.toml {tree}/app/blink.toml")
+    // What src/ embeds, so the first check is clean and runs the build analyses, which
+    // write to the nodes a recheck keeps.
+    shell_exec("mkdir -p {tree}/app/build {tree}/app/.claude")
+    for p in ["lib", "bootstrap", "CHANGELOG.md", "llms.md", "llms-full.md", "build/gc_unity.c", ".claude/blink-marketplace"] {
+        shell_exec("ln -s {root}/{p} {tree}/app/{p}")
+    }
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE and the module
+// filters; the daemon serves only a client whose env is its own, so both drop them.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 {tree}/build/blink {args}"])
+}
+
+// The pid of the daemon started on src/cli.bl in tree, or -1. The timeout ends a daemon
+// that nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 600 {tree}/build/blink daemon start src/cli.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "reused", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    let ao = a.out.replace(a_tree, "TREE")
+    let bo = b.out.replace(b_tree, "TREE")
+    let ae = a.err_out.replace(a_tree, "TREE")
+    let be = b.err_out.replace(b_tree, "TREE")
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{ao}{ae}\n-- vs --\n{bo}{be}" }
+    if ao != bo { return "stdout:\n{ao}\n-- vs --\n{bo}" }
+    if ae != be { return "stderr:\n{ae}\n-- vs --\n{be}" }
+    ""
+}
+
+// The check of src/cli.bl in both trees, in both formats; what differs, or "".
+// What the last warm human check printed, and how many checks the warm tree ran: a step
+// whose edit printed nothing would compare two empty answers and prove nothing, and a check
+// the daemon did not serve would compare two cold checks.
+let mut last_warm: Str = ""
+let mut warm_checks: Int = 0
+
+// The warm tree is asked last, so the next edit comes right after a request: the daemon's
+// idle poll waits 500 ms after each request, and a poll that checked the edit first would
+// parse every source and leave the warm check nothing to keep.
+fn compare(warm: Str, cold: Str, step: Str) -> Str {
+    let mut out: List[Str] = []
+    let human = "check src/cli.bl"
+    let json = "check --format json src/cli.bl"
+    let w = blink_in(warm, human)
+    last_warm = "{w.out}{w.err_out}"
+    let d = differ(warm, w, cold, blink_in(cold, human))
+    if d != "" { out.push("after {step}: {human}: {d}") }
+    let cj = blink_in(cold, json)
+    let wj = blink_in(warm, json)
+    warm_checks = warm_checks + 2
+    let dj = differ(warm, wj, cold, cj)
+    if dj != "" { out.push("after {step}: {json}: {dj}") }
+    out.join("\n")
+}
+
+// "" when the last warm check printed each of `needles`, else what it lacked.
+fn printed(step: Str, needles: List[Str]) -> Str {
+    for n in needles {
+        if !last_warm.contains(n) { return "after {step}: the check did not print `{n}`:\n{last_warm}" }
+    }
+    ""
+}
+
+// Replaces `old`, which must occur once, with `new` in src/<file> of both trees.
+fn edit_both(warm: Str, cold: Str, file: Str, old: Str, new: Str) {
+    for t in [warm, cold] {
+        let path = "{t}/app/src/{file}"
+        let before = read_file(path)
+        assert_eq(before.split(old).len(), 2)
+        write_file(path, before.replace(old, new))
+    }
+}
+
+fn append_both(warm: Str, cold: Str, file: Str, text: Str) {
+    for t in [warm, cold] {
+        let path = "{t}/app/src/{file}"
+        write_file(path, "{read_file(path)}{text}")
+    }
+}
+
+fn restore_both(root: Str, warm: Str, cold: Str, file: Str) {
+    for t in [warm, cold] { shell_exec("cp {root}/src/{file} {t}/app/src/{file}") }
+}
+
+// A trait with a default body, an impl, a test block, a fn whose call leaves a keyword
+// argument for typecheck to fill, which writes into the call's parsed argument list, and
+// sealed ops qualified calls, which the build analyses rewrite in place into method calls.
+let PROBE: Str = #"
+
+trait CnameProbe {
+    fn probe_m(self) -> Int
+    fn probe_n(self) -> Int {
+        self.probe_m() + 1
+    }
+}
+
+type CnameProbeBox {
+    n: Int
+}
+
+impl CnameProbe for CnameProbeBox {
+    fn probe_m(self) -> Int {
+        self.n
+    }
+    fn probe_n(self) -> Int {
+        self.n + 1
+    }
+}
+
+fn cname_probe_pad(s: Str, -- width: Int = 4) -> Int {
+    s.byte_len() + width
+}
+
+fn cname_probe_pad_user() -> Int {
+    cname_probe_pad("x")
+}
+
+fn cname_probe_ops(s: Str) -> Int {
+    StrOps.byte_len(s) + StrOps.byte_len("ab")
+}
+
+test "the cname probe box answers its n" {
+    assert_eq(CnameProbeBox { n: 2 }.probe_m(), 2)
+}
+"#
+
+// Called with too few arguments, so the check reports it, and the import it needs is used.
+let SEMVER_PROBE: Str = "\nfn cname_semver_probe() -> Str \{\n    version_to_str(1, 2)\n}\n"
+
+let MISSING_EMBED: Str = "\nlet CNAME_MISSING_EMBED: Str = #embed(\"no_such_file.txt\")\n"
+
+let STRIP_BLINK: Str = "fn strip_blink(c_name: Str) -> Str \{\n"
+let STRIP_EXTENSION: Str = "fn strip_extension(filename: Str) -> Str \{\n"
+
+test "a warm recheck of the compiler after each edit prints what a cold check prints" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_keep_parsed_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_keep_parsed_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut reused = -1
+    let mut checks = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        problems.push(compare(warm, cold, "the first check"))
+        problems.push(compare(warm, cold, "no change"))
+        edit_both(warm, cold, "cname.bl", STRIP_BLINK, "// A comment no check reads.\n{STRIP_BLINK}")
+        problems.push(compare(warm, cold, "a comment edit"))
+        edit_both(warm, cold, "cli.bl", STRIP_EXTENSION, "{STRIP_EXTENSION}    let spare_local = 1\n")
+        problems.push(compare(warm, cold, "a new local that warns"))
+        problems.push(printed("a new local that warns", ["spare_local", "cli.bl"]))
+        edit_both(warm, cold, "cname.bl", #"c_name.starts_with("blink_")"#, #"c_name.starts_with("blink__")"#)
+        problems.push(compare(warm, cold, "a changed literal"))
+        edit_both(warm, cold, "cname.bl", STRIP_BLINK, "{STRIP_BLINK}    let _minted = c_mint_local(\"w\")\n")
+        problems.push(compare(warm, cold, "a call added to a fn that writes a global"))
+        edit_both(warm, cold, "cname.bl", "    let _minted = c_mint_local(\"w\")\n", "")
+        problems.push(compare(warm, cold, "the call removed"))
+        edit_both(warm, cold, "cname.bl", STRIP_BLINK, "{STRIP_BLINK}    let _bad: Int = \"x\"\n")
+        problems.push(compare(warm, cold, "a new error"))
+        problems.push(printed("a new error", ["error", "cname.bl"]))
+        edit_both(warm, cold, "cname.bl", "    let _bad: Int = \"x\"\n", "")
+        problems.push(compare(warm, cold, "the error fixed"))
+        edit_both(warm, cold, "cli.bl", "    let spare_local = 1\n", "    let _pairs: List[(Int, Bool)] = [(1, true)].map(fn(p) \{ p \})\n")
+        problems.push(compare(warm, cold, "a new instance of a generic"))
+        append_both(warm, cold, "cname.bl", PROBE)
+        problems.push(compare(warm, cold, "a trait, an impl, a test and a keyword default added"))
+        edit_both(warm, cold, "cli.bl", "    let _pairs", "    let _more = 2\n    let _pairs")
+        problems.push(compare(warm, cold, "an edit of the entry alone"))
+        edit_both(warm, cold, "cname.bl", "        self.n + 1\n", "        self.n + 2\n")
+        problems.push(compare(warm, cold, "an impl method body edit"))
+        edit_both(warm, cold, "cname.bl", "        self.probe_m() + 1\n", "        self.probe_m() + 3\n")
+        problems.push(compare(warm, cold, "a trait default body edit"))
+        edit_both(warm, cold, "cname.bl", "CnameProbeBox \{ n: 2 }.probe_m(), 2)", "CnameProbeBox \{ n: 5 }.probe_m(), 5)")
+        problems.push(compare(warm, cold, "a test block edit"))
+        // src/cg.bl loads after src/cname.bl, so the order of the two warnings shows whether
+        // the merged lists follow the load order.
+        edit_both(warm, cold, "cname.bl", STRIP_BLINK, "{STRIP_BLINK}    let spare_in_cname = 1\n")
+        edit_both(warm, cold, "cg.bl", "    reset_unit_state()\n    cg_reg_reset()\n", "    let spare_in_cg = 1\n    reset_unit_state()\n    cg_reg_reset()\n")
+        problems.push(compare(warm, cold, "edits to two modules at once"))
+        problems.push(printed("edits to two modules at once", ["spare_in_cname", "spare_in_cg"]))
+        edit_both(warm, cold, "cname.bl", "    let spare_in_cname = 1\n", "    let spare_in_cname = 2\n")
+        problems.push(compare(warm, cold, "an edit to the first of two modules that warn"))
+        append_both(warm, cold, "cname.bl", "\nfn cname_broken(\n")
+        problems.push(compare(warm, cold, "a parse error"))
+        problems.push(printed("a parse error", ["cname.bl"]))
+        edit_both(warm, cold, "cname.bl", "\nfn cname_broken(\n", "\n")
+        problems.push(compare(warm, cold, "the parse error fixed"))
+        edit_both(warm, cold, "cname.bl", "fn cname_probe_pad_user() -> Int \{", "fn cname_probe_pad_user(_unused: Int) -> Int \{")
+        problems.push(compare(warm, cold, "a private signature edit"))
+        edit_both(warm, cold, "cname.bl", "pub fn c_variant_member_name(variant: Int) -> Str \{ node_name(variant) }", "pub fn c_variant_member_name(member: Int) -> Str \{ node_name(member) }")
+        problems.push(compare(warm, cold, "a pub signature edit"))
+        edit_both(warm, cold, "cli.bl", "    let _more = 2\n", "    let _more = 5.probe_size()\n")
+        problems.push(compare(warm, cold, "a call of a method no impl gives"))
+        problems.push(printed("a call of a method no impl gives", ["probe_size"]))
+        append_both(warm, cold, "mono.bl", "\ntrait MonoProbeSizer \{\n    fn probe_size(self) -> Int\n}\n\nimpl MonoProbeSizer for Int \{\n    fn probe_size(self) -> Int \{\n        1\n    }\n}\n")
+        problems.push(compare(warm, cold, "an impl added in a module the entry does not import"))
+        edit_both(warm, cold, "cli.bl", STRIP_EXTENSION, "{STRIP_EXTENSION}    let _later = 1\n")
+        problems.push(compare(warm, cold, "an entry edit with that impl kept"))
+        // A module no source imported before loads in the middle of the load order.
+        edit_both(warm, cold, "cname.bl", "import typecheck.\{\n", "import std.semver.\{version_to_str}\nimport typecheck.\{\n")
+        append_both(warm, cold, "cname.bl", SEMVER_PROBE)
+        problems.push(compare(warm, cold, "an import of a module not loaded before"))
+        problems.push(printed("an import of a module not loaded before", ["expects 3 argument(s), got 2"]))
+        edit_both(warm, cold, "cname.bl", "import std.semver.\{version_to_str}\n", "")
+        edit_both(warm, cold, "cname.bl", SEMVER_PROBE, "")
+        problems.push(compare(warm, cold, "that import removed"))
+        // The check names the file of a node no declaration owns by the node range of its source.
+        append_both(warm, cold, "cname.bl", MISSING_EMBED)
+        problems.push(compare(warm, cold, "an #embed of a missing file"))
+        problems.push(printed("an #embed of a missing file", ["src/cname.bl"]))
+        edit_both(warm, cold, "cname.bl", MISSING_EMBED, "")
+        problems.push(compare(warm, cold, "that #embed removed"))
+        // A manifest edit is no source edit: the kept sources are dropped.
+        for t in [warm, cold] { write_file("{t}/app/blink.toml", "{read_file("{t}/app/blink.toml")}\n[bogus_section]\n") }
+        problems.push(compare(warm, cold, "an unknown manifest section"))
+        problems.push(printed("an unknown manifest section", ["bogus_section"]))
+        append_both(warm, cold, "cname.bl", "\nfn cname_broken_again(\n")
+        problems.push(compare(warm, cold, "a parse error under a manifest that warns"))
+        edit_both(warm, cold, "cname.bl", "\nfn cname_broken_again(\n", "\n")
+        problems.push(compare(warm, cold, "that parse error fixed"))
+        for t in [warm, cold] { shell_exec("cp {root}/blink.toml {t}/app/blink.toml") }
+        problems.push(compare(warm, cold, "the manifest restored"))
+        for f in ["cname.bl", "cli.bl", "cg.bl", "mono.bl"] { restore_both(root, warm, cold, f) }
+        problems.push(compare(warm, cold, "going back to the first bytes"))
+        reused = served(warm, "reused")
+        checks = served(warm, "checks")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(checks, warm_checks)
+    assert(reused > 0, "the daemon reused no source: reused={reused}")
+}

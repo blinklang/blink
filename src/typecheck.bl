@@ -3,6 +3,7 @@ import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text}
 import parser.{
+    node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
@@ -604,7 +605,8 @@ pub fn tc_conversion_impl_for(trait_name: Str, source: Int, target: Int) -> Int 
         if node_trait_name(im) != trait_name { continue }
         if !tc_tid_same_type(tc_conv_source_tids.get(im) ?? -1, source) { continue }
         if !tc_tid_same_type(tc_impl_recv_tids.get(im) ?? -1, target) { continue }
-        if found < 0 || im < found { found = im }
+        // The impl a cold load parsed first, whatever ids a recheck that kept nodes gave.
+        if found < 0 || node_load_rank(im) < node_load_rank(found) { found = im }
     }
     found
 }
@@ -14192,6 +14194,21 @@ fn tc_unclaimed_call_nodes() -> List[Int] {
         if tc_node_tid.get(n).unwrap() == tc_unclaimed_call_tid() { out.push(n) }
         n = n + 1
     }
+    // In load order, which the ids of a recheck that kept nodes are not.
+    if parser_load_order_moved() {
+        let mut i = 1
+        while i < out.len() {
+            let v = out[i]
+            let r = node_load_rank(v)
+            let mut j = i - 1
+            while j >= 0 && node_load_rank(out[j]) > r {
+                out.set(j + 1, out[j])
+                j = j - 1
+            }
+            out.set(j + 1, v)
+            i = i + 1
+        }
+    }
     out
 }
 
@@ -17386,11 +17403,24 @@ pub fn desugar_sealed_ops_calls(program: Int) ! Diag.Report {
         return
     }
     tc_sealed_ops_rewrite_program = program
-    let mut n = 0
-    while n < tc_sealed_ops_call_marks.len() {
-        if tc_sealed_ops_call_marks.get(n).unwrap() != 0 { tc_rewrite_sealed_ops_call(n) }
-        n = n + 1
+    for n in tc_sealed_ops_calls_in_load_order() { tc_rewrite_sealed_ops_call(n) }
+}
+
+// In load order, which the ids of a recheck that kept nodes are not, so the internal errors
+// of the rewrite come in a cold check's order.
+fn tc_sealed_ops_calls_in_load_order() -> List[Int] {
+    let mut out: List[Int] = []
+    let ranges = parser_live_ranges()
+    let mut r = 0
+    while r + 1 < ranges.len() {
+        let mut n = ranges[r]
+        while n < ranges[r + 1] && n < tc_sealed_ops_call_marks.len() {
+            if tc_sealed_ops_call_marks.get(n).unwrap() != 0 { out.push(n) }
+            n = n + 1
+        }
+        r = r + 2
     }
+    out
 }
 
 // The node keeps its id and span, so its tid stamp and every diagnostic keyed on it stay
@@ -17432,15 +17462,11 @@ fn tc_rewrite_sealed_ops_call(node: Int) ! Diag.Report {
 // build path skipped the rewrite. Asked at mono's entry, which every build path reaches.
 pub fn require_sealed_ops_rewritten(program: Int) ! Diag.Report {
     if tc_sealed_ops_rewrite_program != -1 { return }
-    let mut n = 0
-    while n < tc_sealed_ops_call_marks.len() {
-        if tc_sealed_ops_call_marks.get(n).unwrap() != 0 {
-            diag_ice_at("SealedOpsCallNotRewritten", SEALED_OPS_REWRITE_INVARIANT,
-                "a sealed ops qualified call reached mono without the rewrite to method form", n,
-                "every build path runs desugar_sealed_ops_calls between typecheck and mono")
-            return
-        }
-        n = n + 1
+    let calls = tc_sealed_ops_calls_in_load_order()
+    if calls.len() > 0 {
+        diag_ice_at("SealedOpsCallNotRewritten", SEALED_OPS_REWRITE_INVARIANT,
+            "a sealed ops qualified call reached mono without the rewrite to method form", calls[0],
+            "every build path runs desugar_sealed_ops_calls between typecheck and mono")
     }
 }
 
