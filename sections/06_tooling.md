@@ -28,7 +28,7 @@ Key properties:
 
 **Fine-grained re-checking.** When you change one function, the daemon re-checks that function and the code that depends on it. It does not re-check the whole file.
 
-**The compiler IS the LSP.** There is no separate LSP implementation that reimplements half the compiler and gets the other half wrong. Completions, hover info, go-to-definition, refactoring, and diagnostics all come from the same checks that produce compilation errors. The CLI and the LSP always give the same diagnostics.
+**The compiler IS the LSP.** There is no separate LSP implementation that reimplements half the compiler and gets the other half wrong. Completions, hover info, go-to-definition, refactoring, and diagnostics all come from the same checks that produce compilation errors. The CLI and the LSP always give the same diagnostics. Hover, go-to-definition and `blink query` report the entity that a bare name denotes at a site, by the rules of §3.4 *Values come first*: the same entity that the program uses when it runs.
 
 **Structured JSON output.** Every compiler output — errors, warnings, query results, completions — is structured data with stable schemas. AI agents consume compiler output directly, not through regex parsing of terminal text.
 

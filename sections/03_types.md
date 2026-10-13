@@ -1372,7 +1372,30 @@ The bare form (`NotFound { msg: "x" }`) and the qualified form (`QueryError.NotF
 2. **Hint-directed** — the expected type at the site (a binding annotation, a function return type, a function parameter type, or a `Result`/`Option` carrier such as `Ok`/`Err`/`Some`) names an enum that has a variant `Name`. The hint is consulted *first* among the unqualified rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
 3. **Global-unique** — if no hint applies, `Name` resolves to the one enum variant of that name across the whole program. If the name is not globally unique, see the ambiguity rule below.
 
-Resolution is static.
+Resolution is static. A bare name at a site denotes exactly one entity, and the compiler determines it statically.
+
+**Values come first.** Steps 2 and 3 above apply only when no value binding has the name. At a bare use of `Name`, in an expression or in a call `Name(...)`, the compiler looks in this order, and the first step that finds `Name` decides:
+
+1. a local binding (a `let`, a parameter, a closure parameter or a pattern binder);
+2. a module-scope value: a `let`, `let mut`, `const` or `fn` of the module, or an imported value;
+3. a variant, by the three steps above.
+
+A hint never moves resolution past a binding. A value that step 2 finds is never a variant of the same package or of the prelude, because that pair is E1016 (§2.12.1). So step 2 can hide only a variant of a dependency enum. A local can hide any variant, and gets W1011 (§10.6 *Shadowing Rules*).
+
+```blink
+// package app; package pal declares `pub type Tone { Warm, Cool }`
+import pal.{Tone}
+
+const Warm = 1                    // warning[W1011]: hides variant `Tone.Warm`
+
+fn main() {
+    let t: Tone = Warm            // error[TypeError]: declared type Tone but got Int
+                                  // help: write `Tone.Warm` for the variant
+    let u: Tone = Tone.Warm       // the qualified form always reaches the variant
+}
+```
+
+When a value that hides a variant gives a type error at a site with a hint, the error gets a `help:` line that names the qualified variant, for example `Tone.Warm`. The help appears only when the hint names an enum that has a variant of that name.
 
 **Name collisions** fall into two distinct kinds:
 
@@ -1396,7 +1419,7 @@ Resolution is static.
   }
   ```
 
-No path ever silently picks a winner: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint).
+No path ever silently picks a winner between two constructible names: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint). A value that hides a variant is not such a collision. It is a shadow between scopes, by the order in *Values come first*, and W1011 marks it where §10.6 *Shadowing Rules* says.
 
 A bare struct-style construction with a payload in carrier position resolves through the carrier's expected type:
 
@@ -2095,11 +2118,35 @@ guard         ::= "if" expression
 match_arm     ::= pattern guard? "=>" expression
 ```
 
+`TYPE_NAME` and `IDENT` are both identifiers. The scrutinee type decides whether a bare name is a variant or a binding (*Bare names: variant or binding*, below).
+
 #### Pattern Forms
 
 **Wildcard.** `_` matches any value and discards it.
 
 **Variable binding.** An identifier binds the matched value to a new variable in the arm body.
+
+**Bare names: variant or binding.** A bare name in a pattern (`Red`, or `Red(x)` and `Red { .. }` with a payload) is a variant only when the scrutinee type has a variant of that name. Otherwise a bare name with no payload is a new binding. A bare name with a payload must name a variant of the scrutinee type. The program-wide search of §3.4 (step 3) never runs in a pattern, and no value binding, local or module-scope, changes what a pattern means.
+
+```blink
+type Color { Red, Green }
+
+fn name(c: Color) -> Str {
+    let Red = 5                    // warning[W1011]: hides variant `Color.Red`
+    match c {
+        Red => "red"               // still `Color.Red`: the scrutinee is a Color
+        Green => "green, not {Red}"  // an expression: `Red` is the local, 5
+    }
+}
+
+fn show(n: Int) -> Str {
+    match n {
+        Red => "n is {Red}"        // a new binding: Int has no variant `Red`
+    }
+}
+```
+
+A pattern binder named like a variant gets W1011 only when the scrutinee type has no variant of that name (§10.6 *Shadowing Rules*). In `show` above, the binder `Red` gets W1011; in `name`, the pattern `Red` is the variant and gets nothing.
 
 **Literal.** Integer, float, boolean, and string literals match by value equality.
 

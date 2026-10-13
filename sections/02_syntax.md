@@ -903,6 +903,46 @@ error[E1016]: `f` is declared twice in module `main`
 
 The primary span is on the later declaration in source order, and a label marks the first. N declarations of one name give N-1 diagnostics, each one pointing at the first declaration. The fix is a suggestion only, never machine-applicable: the compiler cannot know which declaration to rename. The program does not compile. To check the rest of the module after the error, the compiler binds the name to the first declaration. This is error recovery only; it does not make the first declaration the winner.
 
+**A value must not take a variant's name.** A variant is not in the value namespace. It lives in the `T.` namespace of its type (§2.12.3), and §3.4 *Variant Construction* resolves its bare spelling. But a bare name has one meaning at each site (§3.4), so a module-scope `let`, `let mut`, `const` or `fn` collides with:
+
+- a variant of any enum that a module of the same package declares, and
+- a variant of any prelude type (§10.6 *Prelude Types*). The variants of a prelude enum count as declared in every module.
+
+The compiler reports this collision as E1016 too. The reach is the package, not the module: a `fn Leaf` in one module and a variant `Leaf` in another module of the package collide. Two enums that each have a variant `Pending` do not collide with each other (§3.4). The check does not cover a variant of a dependency enum. There, a bare use finds the module-scope value first (§3.4), and W1011 marks the value when an import entry names the variant's type (§10.6 *Shadowing Rules*). A local binding with a variant's name is legal, and gets W1011.
+
+```blink
+// src/paint/colors.bl
+type Color { Red, Green }
+
+// src/paint/mix.bl
+fn Red() -> Int { 1 }        // error[E1016]: `Red` collides with variant `Color.Red`
+let Ok = 5                   // error[E1016]: `Ok` collides with variant `Result.Ok`
+```
+
+```
+error[E1016]: `Red` collides with variant `Color.Red` (module `paint.colors`)
+ --> src/paint/mix.bl:1:4
+  |
+1 | fn Red() -> Int { 1 }
+  |    ^^^ module-scope value has the name of a variant
+  |
+  = note: variant `Color.Red` is declared at src/paint/colors.bl:1:14
+  = help: rename the value; a bare `Red` in this package must have one meaning
+```
+
+```
+error[E1016]: `Ok` collides with variant `Result.Ok` (prelude)
+ --> src/paint/mix.bl:2:5
+  |
+2 | let Ok = 5
+  |     ^^ `Ok` is a variant of the prelude type `Result`
+  |
+  = note: the variants of a prelude enum count as declared in every module
+  = help: rename the value
+```
+
+The primary span is always on the value declaration, whatever the source order. The message names the variant's type and the module that declares it, and a `note:` gives the variant's location; when both are in one file, a secondary label marks the variant instead. A prelude variant has no source span, so the message says which prelude type has it. Each value declaration with a variant's name gives one diagnostic. As above, the fix is a suggestion only.
+
 **`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For compile-time constants, prefer `const` (see [2.21](#221-const-declarations)) — `let` at module level is for runtime-initialized values.
 
 **`pub let mut` is forbidden.** Mutable module-level state must not be directly exposed to other modules. The compiler reports `PubLetMutForbidden` (E1013) for `pub let mut`.

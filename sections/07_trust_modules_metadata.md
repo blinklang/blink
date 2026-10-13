@@ -2227,7 +2227,7 @@ When the entry names a type whose methods the file calls, the note says that the
 | E1012 | Duplicate symbol | A module-level declaration takes a name that an import (`import` or `pub import`) binds: a listed name or a qualifier |
 | E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
 | E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |
-| E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), or two members of one `T.` namespace in a package share a name (§2.12.3) |
+| E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), two members of one `T.` namespace in a package share a name (§2.12.3), or a module-level value has the name of a variant of an enum in the same package or of a prelude enum (§2.12.1) |
 
 ```
 error[E1003]: item `Token` is private in module `auth.internal`
@@ -2302,6 +2302,8 @@ All built-in types are in the prelude. They are available in every module withou
 | `Err(E)` | `Result` variant: error |
 | `Ordering` | Comparison result type |
 | `Less`, `Equal`, `Greater` | `Ordering` variants |
+
+The variants in this table count as declared in every module. A module-scope `let`, `let mut`, `const` or `fn` with one of these names is E1016 (§2.12.1). A local binding with one of these names gets W1011 (*Shadowing Rules*). The rule covers every variant of every prelude enum, so a new prelude enum brings its variants under it.
 
 #### Prelude Traits
 
@@ -2407,6 +2409,32 @@ warning[W1010]: name shadows compiler-known type
 The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. It also covers such a name that another module declares and this module imports (`import geo.{Handler}`). Local bindings (`let`) live in the value namespace and are not type declarations.
 
 **Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or imports, are a duplicate, never a shadow. A module qualifier is in both namespaces. One rule covers every pair, and the code tells which pair collided: two imports are E1005 (`AmbiguousImport`), an import entry and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. A local binding that hides a module qualifier (`let auth = 5` makes `auth.login()` a method call, §10.1 *Qualified Access*) is a shadow between nested scopes, so it is legal.
+
+**A binding that hides a variant.** A variant is not a binding, but a bare name finds a value binding before a variant (§3.4 *Values come first*). So a value binding with a variant's name hides the variant in expressions, and only there: a pattern still means the variant (§3.5). The compiler emits `ShadowedVariant` (W1011) at the binding when it hides one of these:
+
+- a variant of an enum in the same package;
+- a variant of a prelude enum;
+- a variant of a dependency enum, when the module imports that enum through an import entry that names it (`import pal.{Tone}`). An import of the whole module (`import pal`) does not count.
+
+W1011 covers two kinds of binding:
+
+- a module-scope `let`, `let mut`, `const` or `fn`. Only the dependency case can occur here, because a value with the name of a variant in the same package or the prelude is E1016 (§2.12.1);
+- a local binding: a `let`, a parameter, a closure parameter or a pattern binder. A pattern binder gets W1011 only when the scrutinee type has no variant of that name, because otherwise the name is the variant (§3.5).
+
+A dependency variant whose type the module does not import never gives W1011.
+
+```
+warning[W1011]: `Red` hides variant `Color.Red` (module `paint.colors`)
+ --> src/paint/mix.bl:4:9
+  |
+4 |     let Red = 5
+  |         ^^^ hides the variant in expressions
+  |
+  = note: `Red` in a pattern still means `Color.Red`
+  = help: rename the local, or write `Color.Red` for the variant
+```
+
+`@allow(ShadowedVariant)` on the enclosing `fn` suppresses W1011, as for other warnings (§11.1). For a module-scope `fn`, put it on that `fn`. A module-scope `let` or `const` has no enclosing `fn`, so the `[lints]` table of `blink.toml` (§4.16.8) controls W1011 there. W1011 is separate from `ShadowedVariable`, which covers one variable that hides another; a variant is not a variable.
 
 **Diagnostics that involve a shadowing name.** The escape must be visible where the error is, not only at the declaration. So:
 
