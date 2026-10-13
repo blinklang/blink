@@ -127,14 +127,17 @@ pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
     header_lines_named(dirs, false)
 }
 
-// header_lines_in, with each dir spelled as vendored_dir_name spells it when by_name: the
-// lines of an object compiled with vendored_dir_maps, which records no other spelling.
+// header_lines_in, with each dir spelled as vendored_dir_spellings spells it when by_name:
+// the lines of an object compiled with vendored_dir_maps, which records no other spelling.
 pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] ! IO {
     let mut lines: List[Str] = []
     let mut paths: List[Str] = []
     let mut spelled: List[Str] = []
+    let spellings = if by_name { vendored_dir_spellings(dirs) } else { dirs }
+    let mut k = 0
     for d in dirs {
-        let spelling = if by_name { vendored_dir_name(d) } else { d }
+        let spelling = spellings.get(k).unwrap()
+        k = k + 1
         for name in list_dir(d) {
             // What the glob "$d"/*.h names: no dotfile, and only what exists past a link.
             if name.starts_with(".") || !name.ends_with(".h") { continue }
@@ -182,18 +185,62 @@ pub fn vendored_dir_name(d: Str) -> Str {
     name
 }
 
-// The cc flags that spell the __FILE__ of a header in each of dirs as vendored_dir_name names
-// the dir. The trailing slash keeps a map from matching a sibling dir whose name starts with
+// The cc flags that spell the __FILE__ of a header in each of dirs as vendored_dir_spellings
+// spells the dir. The trailing slash keeps a map from matching a sibling dir whose name starts with
 // the same name.
 pub fn vendored_dir_maps(dirs: List[Str]) -> List[Str] {
     let mut flags: List[Str] = []
-    for d in dirs {
-        let name = vendored_dir_name(d)
+    let spellings = vendored_dir_spellings(dirs)
+    let mut i = 0
+    while i < dirs.len() {
+        let d = dirs.get(i).unwrap()
+        let name = spellings.get(i).unwrap()
         if name != d {
             flags.push("-fmacro-prefix-map={without_trailing_slash(d)}/={name}/")
         }
+        i = i + 1
     }
     flags
+}
+
+// How each of dirs is spelled in an object below --debug, and so in its key: by
+// vendored_dir_name, except a dir that keeps its path when its name is not its own. Two dirs
+// of one name would spell their headers alike, and their key lines sort together, so trees
+// that swap the headers between them would share a key and not their bytes. A dir inside
+// another gets the map of either one, by the order of the -I flags, which the key does not
+// hold.
+pub fn vendored_dir_spellings(dirs: List[Str]) -> List[Str] {
+    let mut names: List[Str] = []
+    for d in dirs {
+        names.push(vendored_dir_name(d))
+    }
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < dirs.len() {
+        let d = dirs.get(i).unwrap()
+        let name = names.get(i).unwrap()
+        let mut own = name != d
+        let mut j = 0
+        while own && j < dirs.len() {
+            if j != i {
+                let other = dirs.get(j).unwrap()
+                if names.get(j).unwrap() == name || nested(d, other) || nested(other, d) {
+                    own = false
+                }
+            }
+            j = j + 1
+        }
+        out.push(if own { name } else { d })
+        i = i + 1
+    }
+    out
+}
+
+// Whether inner is outer or lies inside it.
+fn nested(inner: Str, outer: Str) -> Bool {
+    let a = without_trailing_slash(inner)
+    let b = without_trailing_slash(outer)
+    a == b || a.starts_with("{b}/")
 }
 
 // The dir cc records as a debug object's compile dir, read as gcc and clang read it: $PWD

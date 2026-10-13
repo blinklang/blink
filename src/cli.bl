@@ -830,18 +830,23 @@ fn vendored_dirs_in(include_flags: Str) -> List[Str] {
     dirs
 }
 
-// The vendored header lines of a unit's key at this level. A debug object's debug info names
-// each vendored dir by its path, so the key does too. Below --debug the unit compiles with
-// vendored_map_flags, and the key names each dir as that spells it.
-fn vendored_header_lines(debug_mode: Int, dirs: List[Str]) -> Option[List[Str]] ! IO {
-    build_objcache.header_lines_named(dirs, debug_mode == 0)
+// Whether a unit compile maps the vendored dirs to their names: below --debug, when one has a
+// name, and when cc takes the map. A debug object's debug info names each dir by its path
+// anyway. A cc that rejects the map compiles without it, and its object then records the path.
+fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool ! IO {
+    debug_mode == 0 && build_objcache.vendored_dir_maps(dirs).len() > 0 && cc_takes_macro_prefix_map(target)
 }
 
-// " <flags>" a unit compile adds at this level so its object names a vendored dir only as its
-// key does (vendored_header_lines). A debug object keeps each path, which its debug info
-// names anyway.
-fn vendored_map_flags(debug_mode: Int, dirs: List[Str]) -> Str {
-    if debug_mode != 0 {
+// The vendored header lines of a unit's key: each dir spelled as the compile's object spells
+// it (vendored_map_flags).
+fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str) -> Option[List[Str]] ! IO {
+    build_objcache.header_lines_named(dirs, vendored_dirs_by_name(debug_mode, dirs, target))
+}
+
+// " <flags>" a unit compile adds so its object names a vendored dir only as its key does
+// (vendored_header_lines).
+fn vendored_map_flags(debug_mode: Int, dirs: List[Str], target: Str) -> Str ! IO {
+    if !vendored_dirs_by_name(debug_mode, dirs, target) {
         return ""
     }
     let mut out = ""
@@ -849,6 +854,22 @@ fn vendored_map_flags(debug_mode: Int, dirs: List[Str]) -> Str {
         out = "{out} {f}"
     }
     out
+}
+
+// "<cc id>\n<1 or 0>": whether the cc of that id took -fmacro-prefix-map; "" before the first
+// probe.
+let mut cached_macro_prefix_map: Str = ""
+
+// Whether the cc run_cc runs for target takes -fmacro-prefix-map (gcc 8 and clang 10 on).
+// Probed once per cc id, and only for a build with an absolute vendored dir.
+fn cc_takes_macro_prefix_map(target: Str) -> Bool ! IO {
+    let id = process_cc_id(target)
+    if !cached_macro_prefix_map.starts_with("{id}\n") {
+        let cmd = cc_command("-fmacro-prefix-map=/blink-probe/=probe/ -E -x c /dev/null -o /dev/null", 0, 0, target)
+        let ok = process_run("sh", ["-c", "{cmd} 2>/dev/null"]).exit_code == 0
+        cached_macro_prefix_map = "{id}\n{if ok { 1 } else { 0 }}"
+    }
+    cached_macro_prefix_map.ends_with("\n1")
 }
 
 // The flags a unit's object is keyed on: the ones its compile passes.
@@ -1050,16 +1071,15 @@ fn apply_cache_flag(a: Args) {
 // compiler_sha and cc_id are constant for the life of this process —
 // memoize so multi-link runs (e.g. `blink test`) don't re-hash a
 // multi-MB compiler + spawn `cc --version` on every link.
+// "" until a hash answers, so a compiler that cannot be read is tried again.
 let mut cached_compiler_sha: Str = ""
-let mut cached_compiler_sha_init: Int = 0
 let mut cached_cc_id: Str = ""
 // "<target>\n" once cached_cc_id holds that target's identity; "" before the first call.
 let mut cached_cc_id_for: Str = ""
 
 pub fn process_compiler_sha() -> Str ! IO {
-    if cached_compiler_sha_init == 0 {
+    if cached_compiler_sha == "" {
         cached_compiler_sha = sha256_of_file_first(archive_compiler_path())
-        cached_compiler_sha_init = 1
     }
     cached_compiler_sha
 }
@@ -1098,7 +1118,7 @@ fn cache_compile_snapshot(snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int
         Some(p) => p
         None => return ""
     }
-    let lines = match vendored_header_lines(debug_mode, vendored_dirs) {
+    let lines = match vendored_header_lines(debug_mode, vendored_dirs, target) {
         Some(l) => l
         None => return ""
     }
@@ -1111,7 +1131,7 @@ fn cache_compile_snapshot(snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int
         return hit
     }
     let staging = "{snap_dir}/unit.o"
-    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}{vendored_map_flags(debug_mode, vendored_dirs)}" } else { "-I{arc_dir}" }
+    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}{vendored_map_flags(debug_mode, vendored_dirs, target)}" } else { "-I{arc_dir}" }
     // The map gives the object the __FILE__ and debug paths a compile of c_path gives.
     let rc = run_cc("-c {snap} -o {staging} -ffile-prefix-map={snap_dir}={path_dirname(c_path)} {includes}", debug_mode, release_mode, target)
     if rc != 0 {
@@ -1244,7 +1264,7 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     if include_flags != "" {
         // The binary's own unit compiles here when the cache does not answer it, and must
         // spell a vendored dir as a cached one does.
-        includes = " {include_flags}{vendored_map_flags(debug_mode, vendored_dirs_in(include_flags))}"
+        includes = " {include_flags}{vendored_map_flags(debug_mode, vendored_dirs_in(include_flags), target)}"
     }
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
@@ -2498,7 +2518,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut vendored_headers: Option[List[Str]] = None
     let vendored_dirs = vendored_dirs_in(include_flags)
     if use_cache && shas.is_some() {
-        vendored_headers = vendored_header_lines(debug_mode, vendored_dirs)
+        vendored_headers = vendored_header_lines(debug_mode, vendored_dirs, target)
         let mut modules: List[Str] = []
         let mut unit_headers: Map[Str, List[Str]] = Map()
         for u in files {
@@ -2544,7 +2564,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         i = i + 1
     }
     // Every compile below, the PCH's too, spells a vendored dir as the keys do.
-    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}{vendored_map_flags(debug_mode, vendored_dirs)}" } else { "-I{arc_dir}" }
+    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}{vendored_map_flags(debug_mode, vendored_dirs, target)}" } else { "-I{arc_dir}" }
     // One PCH serves the units that define one set of macros before the archive header: the
     // set most of the units to compile define. The rest read the header.
     let mut prefixes: List[Str] = []
