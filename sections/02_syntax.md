@@ -1886,6 +1886,8 @@ test "unwrap on empty list panics with the expected message" {
 }
 ```
 
+The literal `10 / 0` in the first test gives no warning: `DivisionByLiteralZero` (W0704, §3.6 *Integer Division*) does not fire inside an `assert_panics` body.
+
 **Form.** The body is a `{ ... }` block, *not* a `fn() { }` closure. It can appear only as the operand of `assert_panics` — it cannot be bound to a variable, passed as a higher-order argument, returned, or stored. This is the same syntactic discipline as the pattern argument of `assert_matches`: the construct is operand-only, so no first-class panic-catching handle ever exists. `assert_panics` itself yields no value (its type is `()`); you cannot write `let x = assert_panics { ... }`. There is no `PanicInfo` binding, no `Result`, no `Bool` — the only observable outcome is whether the surrounding test passes or fails.
 
 **Optional `matching:`.** The optional `matching:` keyword argument takes a `Str` and is a **literal substring test**, not a pattern or regular-expression language. The assertion passes only if the panic message *contains* that substring. Substring (rather than exact) matching is deliberate: panic messages carry a volatile ` at file:line` suffix, and a substring matches the stable part (`"unwrap called on None"`, §7.5) while ignoring the location. There is no anchoring, glob, or regex syntax — `matching:` is a plain substring and will not grow metacharacter semantics. String interpolation in the `matching:` argument follows the standard rules.
@@ -2460,6 +2462,38 @@ fn classify(code: Int) -> Str {
 }
 ```
 
+#### Const Evaluation Must Succeed
+
+The compiler evaluates each const expression in the four contexts above. If an operation in that evaluation would panic at run time, the program does not compile, and the error is `ConstEvalPanic` (E0546). This covers integer `/` and `%` by zero (§3.6, *Integer Division*), signed `MIN / -1`, and integer overflow (§3.2, *Overflow behavior*). The rule is the same in each context, and it also applies inside an `assert_panics` body (§2.20).
+
+```blink
+const SHARDS = 0
+const PER_SHARD = 1024 / SHARDS                // error[ConstEvalPanic]: division by zero
+const TOO_BIG = 9223372036854775807 + 1         // error[ConstEvalPanic]: Int overflow
+
+type Pool {
+    size: Int = 64 % SHARDS                     // error[ConstEvalPanic]: division by zero
+}
+```
+
+The error points at the subexpression that fails. It has one `note:` for each `const` reference that leads to the failing value, so the reader can find the const that holds the 0:
+
+```
+error[ConstEvalPanic]: this const expression panics when the compiler evaluates it
+  --> config.bl:2:19
+   |
+ 2 | const PER_SHARD = 1024 / SHARDS
+   |                   ^^^^^^^^^^^^^ division by zero
+   |
+note: `SHARDS` is 0
+  --> config.bl:1:7
+   |
+ 1 | const SHARDS = 0
+   |       ^^^^^^
+```
+
+Outside the four contexts, the compiler does not evaluate an expression as a const, even when the expression uses only const operations. `let a = 10 / 0` compiles and panics at run time. §3.6 *Integer Division* gives the warning for a literal zero divisor.
+
 #### Visibility
 
 `const` declarations support `pub` for export, same as `let`:
@@ -2505,6 +2539,7 @@ The compiler folds const expressions at compile time. Arithmetic like `1024 * 64
 | `NonConstStructDefault` | E1103 | Struct field default is not a const expression |
 | `NonConstKeywordDefault` | E1104 | Keyword argument default is not a const expression |
 | `NonConstRangeBound` | E1105 | Range pattern bound is not a const expression |
+| `ConstEvalPanic` | E0546 | Evaluation of a const expression would panic: integer `/` or `%` by zero, signed `MIN / -1`, or overflow |
 
 ```
 error[NonConstExpr]: expression is not a compile-time constant

@@ -991,7 +991,7 @@ In `@ffi` signatures, each sized type maps to the C type in the table. (Panel vo
 
 **Overflow behavior:**
 
-Arithmetic overflow is checked by default. An operation that exceeds the type's range panics at runtime with a descriptive message. The compiler also catches overflow in constant expressions at compile time. The remainder `%` never exceeds the range, so for a signed type `MIN % -1` is 0 and does not panic (§3.6, *Integer Division*).
+Arithmetic overflow is checked by default. An operation that exceeds the type's range panics at runtime with a descriptive message. The compiler also catches overflow in constant expressions at compile time. A zero divisor is not overflow: in a const context it is a compile error (§2.21, *Const Evaluation Must Succeed*), and elsewhere it panics at run time (§3.6, *Integer Division*). The remainder `%` never exceeds the range, so for a signed type `MIN % -1` is 0 and does not panic (§3.6, *Integer Division*).
 
 ```blink
 let x: U8 = 255
@@ -3156,6 +3156,28 @@ let m = 7 % z       // RUNTIME PANIC: Int division by zero
 ```
 
 `%` is not the floored modulo of Python. Code that needs a result in `0..n` for a negative `a` must adjust the remainder itself.
+
+**A literal zero divisor.** Outside a const context (§2.21), a divisor that is known to be 0 is not a compile error: the expression compiles and panics at run time. In a const context it is `ConstEvalPanic` (§2.21, *Const Evaluation Must Succeed*).
+
+When the divisor of an integer `/` or `%` is an integer literal with the value 0, the compiler gives the warning `DivisionByLiteralZero` (W0704). The literal can have parentheses around it and a unary `-` before it. The check reads only the divisor as written:
+
+- A `const` reference or a `let` binding with the value 0 does not trigger it.
+- It does no flow analysis, so it also fires in a branch that never runs.
+- It does not fire inside the body of an `assert_panics` block (§2.20). This rule belongs to this warning only; other warnings fire in an `assert_panics` body as they do elsewhere.
+
+```blink
+let a = 10 / 0          // warning[DivisionByLiteralZero]; RUNTIME PANIC: Int division by zero
+let b = 10 % (-0)       // warning[DivisionByLiteralZero]
+
+const PER_PAGE = 0
+
+fn pages(total: Int) -> Int {
+    if PER_PAGE == 0 { return 0 }
+    total / PER_PAGE    // no warning: the divisor is a const reference
+}
+```
+
+Suppress the warning on a function with `@allow(DivisionByLiteralZero)`, or set its level with `W0704` under `[lints]` (§4.16.8).
 
 Traits can have default method implementations (`ne` above). Traits can require other traits (`Hash: Eq` means implementing `Hash` requires implementing `Eq`).
 
