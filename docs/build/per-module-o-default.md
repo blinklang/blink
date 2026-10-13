@@ -242,7 +242,7 @@ asks for the one-unit build.
   builds one unit and `1` or unset takes this path, for the command and for
   every `blink` that the program starts. Any other value is an error, even
   under a flag.
-- **Fallback.** `--emit c`, `--format blink`, `BLINK_SKIP_MODULES`,
+- **Fallback.** `--emit c`, `BLINK_SKIP_MODULES`,
   `BLINK_ONLY_MODULE` and `BLINK_COMPILER_ARCHIVE` build one C unit. When
   `--per-module` asked for the path, the build prints
   `note: --per-module ignored: <reason>`. When the default or
