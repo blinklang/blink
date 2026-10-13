@@ -571,6 +571,19 @@ then a `blink check` through the daemon takes 0.397 s median wall and 42 ticks
 of daemon CPU with it on, and 0.394 s and 43 ticks with it off (an empty
 `BLINK_CACHE_DIR`), 6 edits each.
 
+A check request gets its reply first; the worker settles that check after the
+reply: it fills the interface texts, takes the stats, compares bytes once and
+forces a GC. So the window between the loader's read and the stats is longer
+than the check itself. An edit in that window leaves stats that match the
+files on disk and findings for the bytes before the edit. Without the byte
+compare the poll would never recheck, and only the next request would see the
+edit (it compares bytes too, so it never replies from the old bytes).
+`tests/test_daemon_poll_rechecks_an_edit_made_between_a_check_reply_and_its_settle.bl`
+makes that edit through `BLINK_DEV_TEST_SETTLE_HOOK`, a shell command the
+settle runs before it takes the stats. Unset, it costs one getenv per settle,
+after the reply. The test fails at `assert(resettled)` when the settle keeps
+the stats it took and skips the compare: the poll does not recheck in 20 s.
+
 While a build child runs, the daemon serves on: a status, check or query gets
 its answer at once, and the daemon does not poll for edits. Each turn it reaps
 the child if it ended (`waitpid` with `WNOHANG`), then waits on its socket for

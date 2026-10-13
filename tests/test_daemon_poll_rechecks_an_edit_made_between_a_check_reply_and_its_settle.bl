@@ -1,0 +1,121 @@
+// A daemon replies to a check before it settles that check, and the settle takes the stats the
+// poll compares against. An edit after the loader read a file and before that stat moves no
+// stat the poll can see: the poll would never recheck, and the daemon would hold findings for
+// bytes no file has. The settle compares bytes once to close that gap. The test makes the edit
+// in that window through BLINK_DEV_TEST_SETTLE_HOOK, then shows that the poll rechecks without
+// a request, and that the next check request reports the edit and does not recheck again.
+
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+let DIR = ".tmp/daemon_settle_window"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn abs(dir: Str) -> Str {
+    sh("cd {dir} && pwd -P").out.trim()
+}
+
+// The daemon serves only a client whose environment hashes as its own, so the daemon and each
+// client both run with the hook set.
+fn hook_env() -> Str {
+    "BLINK_DEV_TEST_SETTLE_HOOK='sh {abs(DIR)}/hook/hook.sh'"
+}
+
+fn front_fields() -> Str {
+    let f = sh("B=$(pwd)/build/blink; {hook_env()} $B __daemon-front-fields").out.trim()
+    f.byte_slice(1, f.byte_len() - 1)
+}
+
+// The pid of a daemon serving src/main.bl, or -1. The timeout ends a daemon that nothing stopped.
+fn start_daemon() -> Int {
+    let r = sh("B=$(pwd)/build/blink; E=\"{hook_env()}\"; cd {DIR}/app && rm -rf .blink && (eval \"$E timeout 120 $B daemon start src/main.bl\" > ../daemon.log 2>&1 &); for i in $(seq 1 400); do if [ -S .blink/daemon.sock ]; then cat .blink/daemon.pid; exit 0; fi; sleep 0.05; done; [ -f .blink/daemon.pid ] && kill $(cat .blink/daemon.pid); exit 1")
+    if r.exit_code != 0 { return -1 }
+    r.out.trim().to_int()
+}
+
+fn stop_daemon(pid: Int) {
+    let _ = sh("kill {pid}; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// The socket of the worker that serves req: the router replies to a check with that worker's
+// name, and the request goes there. "" when the router named none.
+fn worker_socket(req: Str) -> Str {
+    let fd = unix_socket_connect("{DIR}/app/.blink/daemon.sock")
+    if fd < 0 { return "" }
+    socket_write(fd, req)
+    let reply = socket_read_line(fd)
+    unix_socket_close(fd)
+    json_clear()
+    let root = json_parse(reply)
+    let name = if root < 0 { "" } else { json_as_str(json_get(root, "worker")) }
+    if name == "" { "" } else { "{DIR}/app/.blink/{name}/daemon.sock" }
+}
+
+// The daemon's raw reply to a check, which shows whether that request rechecked.
+fn ask_daemon() -> Str {
+    let req = "\{{front_fields()},\"cwd\":\"{abs("{DIR}/app")}\",\"path\":\"src/main.bl\",\"json\":0,\"diag_json\":0,\"strict\":0}\n"
+    let fd = unix_socket_connect(worker_socket(req))
+    if fd < 0 { return "no connection" }
+    socket_write(fd, req)
+    let reply = socket_read_line(fd)
+    unix_socket_close(fd)
+    reply
+}
+
+test "a poll rechecks an edit made after the loader read a file and before the settle took its stat" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}/app/src {DIR}/hook")
+    let app = abs("{DIR}/app")
+    let hook = abs("{DIR}/hook")
+    write_file("{DIR}/app/blink.toml", "[package]\nname = \"daemon_settle_window\"\nversion = \"0.1.0\"\n")
+    write_file("{DIR}/app/src/helper.bl", "pub fn label() -> Str \{\n    \"bbbb\"\n}\n")
+    write_file("{DIR}/app/src/main.bl", "import helper.\{label}\n\nfn main() \{\n    io.println(label())\n}\n")
+    // Once armed, the first settle breaks the type of label in the same size, and each later
+    // settle marks that it ran. The worker checks when it starts, so the hook waits for the
+    // arm. The marks live outside the app, so they are no input of the check.
+    write_file("{DIR}/hook/hook.sh", "[ -f {hook}/armed ] || exit 0\nif [ -f {hook}/edited ]; then touch {hook}/resettled; exit 0; fi\nprintf 'pub fn label() -> Str \{\\n    123456\\n}\\n' > {app}/src/helper.bl\ntouch {hook}/edited\n")
+    let pid = start_daemon()
+    let mut first = ""
+    let mut second = ""
+    let mut resettled = false
+    let mut after = ""
+    let mut through_cli = sh("true")
+    if pid > 0 {
+        first = ask_daemon()
+        let _ = sh("touch {hook}/armed")
+        // A same-size edit with its mtime set back moves no stat, so no poll rechecks it and
+        // the next request rechecks it from its byte compare; that check's settle runs the hook.
+        let _ = sh("touch -r {app}/src/helper.bl {hook}/helper.mtime && sed -i s/bbbb/cccc/ {app}/src/helper.bl && touch -r {hook}/helper.mtime {app}/src/helper.bl")
+        second = ask_daemon()
+        // The poll runs each time the accept waits out with no request.
+        resettled = sh("for i in $(seq 1 200); do [ -f {hook}/resettled ] && exit 0; sleep 0.1; done; exit 1").exit_code == 0
+        after = ask_daemon()
+        through_cli = sh("B=$(pwd)/build/blink; cd {DIR}/app && {hook_env()} $B check src/main.bl")
+    }
+    if pid > 0 { stop_daemon(pid) }
+    if !second.contains("\"exit\":0") || !resettled || !after.contains("\"changed\":0") {
+        let log = read_file("{DIR}/daemon.log")
+        io.eprintln("first: {first}\nsecond: {second}\nafter: {after}\ndaemon log: {log}")
+    }
+
+    assert(pid > 0)
+    assert(first.contains("\"served\":1"))
+    assert(first.contains("\"exit\":0"))
+    // The second check read cccc, before its settle ran the hook.
+    assert(second.contains("\"served\":1"))
+    assert(second.contains("\"changed\":1"))
+    assert(second.contains("\"exit\":0"))
+    assert(sh("test -f {hook}/edited").exit_code == 0)
+    // Without the settle's byte compare the poll sees no stat move and never rechecks.
+    assert(resettled)
+    // The poll rechecked the edit, so this request found the check done and holds the error.
+    assert(after.contains("\"served\":1"))
+    assert(after.contains("\"changed\":0"))
+    assert(after.contains("\"exit\":1"))
+    assert(after.contains("does not match function `label` return type Str"))
+    // Whatever the poll did, a request never answers from the bytes before the edit.
+    assert_eq(through_cli.exit_code, 1)
+    assert(through_cli.err_out.contains("does not match function `label` return type Str"))
+}
