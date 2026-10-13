@@ -1,0 +1,275 @@
+// A check through the daemon after an edit parses again only the edited sources, so their
+// nodes sit at the end of the pool, after the sources a cold load parses later. The build
+// after that check compiles the checked program as it is: it checks no second time. It must
+// still write, for every unit, the C, the record and the interface text a cold build of the
+// same tree writes, at the default and with --debug, whichever source the edit was in: one
+// the entry loads first, the entry itself, one loaded later, and a pub edit. A settle hook
+// writes a line for each check the daemon runs.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {tree}/build/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // The daemon listens at the project root, so each tree is a project of its own.
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_reused_check_build_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    // Each module spells carriers and keys a map on a tuple, so the order of their typedefs
+    // and key tables in the C follows the order the sources load in.
+    write_file("{tree}/app/src/early.bl", [
+        #"pub type Tag {"#,
+        #"    name: Str"#,
+        #"    n: Int"#,
+        #"}"#,
+        #""#,
+        #"pub fn tag_of(n: Int) -> Tag {"#,
+        #"    Tag { name: "t{n}", n: n }"#,
+        #"}"#,
+        #""#,
+        #"pub fn split_of(n: Int) -> (Int, Str) {"#,
+        #"    (n, "e{n}")"#,
+        #"}"#,
+        #""#,
+        #"pub fn maybe_of(n: Int) -> Option[Int] {"#,
+        #"    if n > 0 { Some(n) } else { None }"#,
+        #"}"#,
+        #""#,
+        #"pub fn early_keys(xs: List[Int]) -> Int {"#,
+        #"    let mut m: Map[(Int, Int), Int] = Map()"#,
+        #"    for x in xs { m.insert((x, x + 1), x) }"#,
+        #"    m.len()"#,
+        #"}"#,
+        #""#,
+        #"pub fn first_of[T](xs: List[T]) -> Option[T] {"#,
+        #"    xs.get(0)"#,
+        #"}"#,
+        #""#,
+        #"pub fn scaled(n: Int, -- k: Int = 3) -> Int {"#,
+        #"    let f = fn(x: Int) -> Int { x * k }"#,
+        #"    f(n)"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/late.bl", [
+        #"import early.{split_of, maybe_of, first_of, scaled}"#,
+        #""#,
+        #"pub fn late_value() -> Str {"#,
+        #"    let (a, b) = split_of(scaled(2))"#,
+        #"    let r: Result[Int, Str] = if a > 0 { Ok(a) } else { Err(b) }"#,
+        #"    let rv = match r {"#,
+        #"        Ok(v) => v"#,
+        #"        Err(_) => 0"#,
+        #"    }"#,
+        #"    let mut m: Map[(Str, Int), Int] = Map()"#,
+        #"    m.insert((b, a), 1)"#,
+        #"    let f = first_of(["x", "y"]) ?? "none""#,
+        #"    let mo = maybe_of(a) ?? 0"#,
+        #"    "{b} {rv} {m.len()} {f} {mo}""#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import early.{tag_of, early_keys}"#,
+        #"import late.{late_value}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let t = tag_of(4)"#,
+        #"    io.println("{t.name} {early_keys([1, 2, 3])} {late_value()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// a build one unit, so the run drops both, and the module filters. The daemon serves only a
+// client whose env is its own, so both run with the hook set. Its marks live outside the app,
+// so they are no input of the check.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_DEV_TEST_SETTLE_HOOK='echo x >> {tree}/settles'"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+// Ends the daemon and each worker it started, by pid.
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let workers = sh("ps -o pid= --ppid {pid} | tr -s ' \\n' ' '").trim()
+    shell_exec("kill {pid} {workers} 2>/dev/null; for i in $(seq 1 100); do left=''; for p in {pid} {workers}; do kill -0 $p 2>/dev/null && left=1; done; [ -z \"$left\" ] && exit 0; sleep 0.05; done; kill -9 {pid} {workers} 2>/dev/null")
+}
+
+// A field of `daemon status`, such as "reused" (the sources every check so far kept), or -1
+// when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// How many checks the daemon has settled.
+fn settles(tree: Str) -> Int {
+    sh("cat {tree}/settles 2>/dev/null | wc -l").to_int()
+}
+
+// Waits up to 20 s for the settle count to pass `than`; the count it read.
+fn settles_past(tree: Str, than: Int) -> Int {
+    let _ = process_run("sh", ["-c", "for i in $(seq 1 200); do [ $(cat {tree}/settles 2>/dev/null | wc -l) -gt {than} ] && exit 0; sleep 0.1; done; exit 1"])
+    settles(tree)
+}
+
+// What a build printed, with its tree's path and its private units directory's random name
+// spelled the same in every tree.
+fn plain(tree: Str, s: Str) -> Str {
+    let t = s.replace(tree, "TREE")
+    let mut out = ""
+    let mut rest = t
+    loop {
+        match rest.byte_index_of(".units.", 0) {
+            Some(at) => {
+                let end = if at + 13 <= rest.byte_len() { at + 13 } else { rest.byte_len() }
+                out = "{out}{rest.byte_slice(0, at)}.units.XXXXXX"
+                rest = rest.byte_slice(end, rest.byte_len())
+            }
+            None => break
+        }
+    }
+    "{out}{rest}"
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{a.out}{a.err_out}\n-- vs --\n{b.out}{b.err_out}" }
+    if plain(a_tree, a.out) != plain(b_tree, b.out) { return "stdout:\n{a.out}\n-- vs --\n{b.out}" }
+    if plain(a_tree, a.err_out) != plain(b_tree, b.err_out) { return "stderr:\n{a.err_out}\n-- vs --\n{b.err_out}" }
+    ""
+}
+
+// What a file in a tree's out/ holds, with the tree's path spelled the same in every tree.
+// The record names the inputs text by its sha, which the path is part of, so that line goes.
+// Its key line and its uses stay: they decide which unit a later build compiles again.
+fn out_file(tree: Str, name: Str) -> Str {
+    let text = read_file("{tree}/app/out/{name}").replace(tree, "TREE")
+    if !name.ends_with("/.emit-record") { return text }
+    text.split("\n").filter(fn(l) { !l.starts_with("inputs ") }).join("\n")
+}
+
+// The files each tree's out/ holds, by name and then content, that the other's does not.
+fn files_differ(a_tree: Str, b_tree: Str) -> Str {
+    let list = "find . -type f | LC_ALL=C sort"
+    let a = sh("mkdir -p {a_tree}/app/out && cd {a_tree}/app/out && {list}")
+    let b = sh("mkdir -p {b_tree}/app/out && cd {b_tree}/app/out && {list}")
+    if a != b { return "out/ holds\n{a}\n-- vs --\n{b}" }
+    let mut different: List[Str] = []
+    for name in a.split("\n") {
+        if name != "" && out_file(a_tree, name) != out_file(b_tree, name) { different.push(name) }
+    }
+    different.join(" ")
+}
+
+fn edit(tree: Str, file: Str, from: Str, to: Str) {
+    let path = "{tree}/app/src/{file}"
+    let before = read_file(path)
+    write_file(path, before.replace(from, to))
+    assert(read_file(path) != before, "the edit to {from} did not change {file}")
+}
+
+test "a build after a check that reused sources checks no second time and writes what a cold build writes" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_reused_check_build_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_reused_check_build_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let mut problems: List[Str] = []
+    let mut outputs: List[Str] = []
+    let pid = start_daemon(warm)
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        // The worker checks when it starts; a request must not race that check.
+        let _ = settles_past(warm, 0)
+        // A first build gives the warm tree's units something to reuse, as an editor's would.
+        let _ = blink_in(warm, "build src/main.bl -o out/app")
+        let edits = [
+            // A body edit in the source the entry loads first, which spells a new carrier.
+            ("early.bl", "    if n > 0 \{ Some(n) } else \{ None }", "    let spare: Option[(Int, Bool)] = Some((n, true))\n    if n > 0 \{ Some(n) } else \{ Some((spare ?? (0, false)).0) }"),
+            // A pub edit in the same source: its interface text changes.
+            ("early.bl", "pub fn first_of", "pub fn added_early() -> (Bool, Int) \{\n    (true, 1)\n}\n\npub fn first_of"),
+            // A body edit in the entry, which spells a key table of its own.
+            ("main.bl", "    let t = tag_of(4)", "    let t = tag_of(5)\n    let mut seen: Map[(Bool, Int), Int] = Map()\n    seen.insert((true, t.n), 1)"),
+            // A body edit in the source loaded last.
+            ("late.bl", "m.insert((b, a), 1)", "m.insert((b, a + 1), 2)"),
+        ]
+        for (file, from, to) in edits {
+            for t in [warm, cold] { edit(t, file, from, to) }
+            let before_check = settles(warm)
+            let reused_before = served(warm, "reused")
+            let checked = blink_in(warm, "check src/main.bl")
+            if checked.exit_code != 0 { problems.push("check after the edit to {file} failed:\n{checked.out}{checked.err_out}") }
+            // A check request settles after its reply.
+            let before_build = settles_past(warm, before_check)
+            let reused = served(warm, "reused")
+            if reused <= reused_before { problems.push("the check after the edit to {file} reused no source: reused {reused_before} then {reused}") }
+            let builds_before = served(warm, "builds")
+            for args in ["build src/main.bl -o out/app", "build --debug src/main.bl -o out/app_debug"] {
+                // The cold tree's build stays cold: its last units and objects go first.
+                shell_exec("rm -rf {cold}/app/out {cold}/objcache")
+                let d = differ(warm, blink_in(warm, args), cold, blink_in(cold, args))
+                if d != "" { problems.push("`{args}` after the edit to {file}: {d}") }
+            }
+            let after_build = settles(warm)
+            if after_build != before_build { problems.push("the builds after the edit to {file} checked {after_build - before_build} more time(s)") }
+            let builds = served(warm, "builds")
+            if builds != builds_before + 2 { problems.push("the daemon served {builds - builds_before} of the two builds after the edit to {file}") }
+            outputs.push(sh("{warm}/app/out/app"))
+            outputs.push(sh("{warm}/app/out/app_debug"))
+            // The cold tree's out/ holds only its debug build, so the warm tree's default
+            // build is compared alone and then its debug build.
+            shell_exec("rm -rf {cold}/app/out {cold}/objcache")
+            let _ = blink_in(cold, "build src/main.bl -o out/app")
+            let _ = blink_in(cold, "build --debug src/main.bl -o out/app_debug")
+            let f = files_differ(warm, cold)
+            if f != "" { problems.push("out/ after the edit to {file}: {f}") }
+        }
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    assert_eq(problems.join("\n"), "")
+    assert_eq(outputs.join(","), "t4 3 e6 6 1 x 6,t4 3 e6 6 1 x 6,t4 3 e6 6 1 x 6,t4 3 e6 6 1 x 6,t5 3 e6 6 1 x 6,t5 3 e6 6 1 x 6,t5 3 e6 6 1 x 6,t5 3 e6 6 1 x 6")
+}
