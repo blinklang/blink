@@ -19,6 +19,7 @@
 // key both compile and both rename — content is byte-identical.
 
 import build_fs
+import std.path.{path_basename}
 import sha256.{sha256_hex, sha256_file_hex}
 import std_cache_key.{sha256_of_manifest, sha256_of_file_first, IN_PROCESS_HASH_BYTES}
 
@@ -123,24 +124,76 @@ pub fn compute_obj_key(
 // the unit may read never drops out of the key. A build hashes them once for every key it
 // makes: a vendored header can be large (sqlite3.h is 680 KB).
 pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
+    header_lines_named(dirs, false)
+}
+
+// header_lines_in, with each dir spelled as vendored_dir_name spells it when by_name: the
+// lines of an object compiled with vendored_dir_maps, which records no other spelling.
+pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] ! IO {
     let mut lines: List[Str] = []
     let mut paths: List[Str] = []
+    let mut spelled: List[Str] = []
     for d in dirs {
+        let spelling = if by_name { vendored_dir_name(d) } else { d }
         for name in list_dir(d) {
             // What the glob "$d"/*.h names: no dotfile, and only what exists past a link.
             if name.starts_with(".") || !name.ends_with(".h") { continue }
             let path = "{d}/{name}"
-            if file_exists(path) == 1 { paths.push(path) }
+            if file_exists(path) == 1 {
+                paths.push(path)
+                spelled.push("{spelling}/{name}")
+            }
         }
     }
     let shas = hash_files(paths)
-    for path in paths {
-        match shas.get(path) {
-            Some(sha) => lines.push("{path}={sha}")
+    let mut i = 0
+    while i < paths.len() {
+        match shas.get(paths.get(i).unwrap()) {
+            Some(sha) => lines.push("{spelled.get(i).unwrap()}={sha}")
             None => return None
         }
+        i = i + 1
     }
     Some(lines)
+}
+
+fn without_trailing_slash(d: Str) -> Str {
+    let mut end = d.byte_len()
+    while end > 1 && d.byte_at(end - 1) == 47 {
+        end = end - 1
+    }
+    d.byte_slice(0, end)
+}
+
+// The name an absolute vendored include dir goes by in an object below --debug, and so in its
+// key: the dir's own name. Such an object records the dir only through the __FILE__ of a
+// header in it, which vendored_dir_maps spells by this name, so two trees whose dirs hold the
+// same bytes at other paths share it. A relative dir already names no tree. A dir whose name
+// the map cannot spell keeps its path.
+pub fn vendored_dir_name(d: Str) -> Str {
+    let dir = without_trailing_slash(d)
+    if !dir.starts_with("/") || dir.contains("=") {
+        return d
+    }
+    let name = path_basename(dir)
+    if name == "" || name == "." || name == ".." {
+        return d
+    }
+    name
+}
+
+// The cc flags that spell the __FILE__ of a header in each of dirs as vendored_dir_name names
+// the dir. The trailing slash keeps a map from matching a sibling dir whose name starts with
+// the same name.
+pub fn vendored_dir_maps(dirs: List[Str]) -> List[Str] {
+    let mut flags: List[Str] = []
+    for d in dirs {
+        let name = vendored_dir_name(d)
+        if name != d {
+            flags.push("-fmacro-prefix-map={without_trailing_slash(d)}/={name}/")
+        }
+    }
+    flags
 }
 
 // The dir cc records as a debug object's compile dir, read as gcc and clang read it: $PWD
@@ -175,6 +228,24 @@ pub fn user_unit_key(
     target: Str,
     recorded_paths: List[Str],
 ) -> Str ! IO {
+    match header_lines_in(vendored_include_dirs) {
+        Some(lines) => user_unit_key_with_headers(src_path, module_key, arc_dir, lines, blinkc_sha, cc_id, flags, target, recorded_paths)
+        None => ""
+    }
+}
+
+// user_unit_key over the lines header_lines_named answered for the vendored include dirs.
+pub fn user_unit_key_with_headers(
+    src_path: Str,
+    module_key: Str,
+    arc_dir: Str,
+    vendored_headers: List[Str],
+    blinkc_sha: Str,
+    cc_id: Str,
+    flags: List[Str],
+    target: Str,
+    recorded_paths: List[Str],
+) -> Str ! IO {
     if blinkc_sha == "" || cc_id == "" {
         return ""
     }
@@ -193,15 +264,8 @@ pub fn user_unit_key(
         }
         headers.push("libblink_std.h.gch={pch_sha}")
     }
-    match header_lines_in(vendored_include_dirs) {
-        Some(lines) => {
-            for line in lines {
-                headers.push(line)
-            }
-        }
-        None => {
-            return ""
-        }
+    for line in vendored_headers {
+        headers.push(line)
     }
     // As import lines, so a level that records no path keeps the keys it had.
     for p in recorded_paths {
@@ -369,7 +433,7 @@ pub fn unit_keys_from(
     }
 }
 
-// unit_keys_from over the lines header_lines_in answered for the vendored include dirs, with
+// unit_keys_from over the lines header_lines_named answered for the vendored include dirs, with
 // each path the objects record (recorded_paths) in every key.
 pub fn unit_keys_with_headers(
     shas: Map[Str, Str],
@@ -687,7 +751,7 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
 // built from the archive dir itself. The key covers what the compiler needs to take the PCH:
 // the header bytes, the compiler (cc_id, so a gcc and a clang PCH never serve each other),
 // every flag, the macros a unit defines before the header, each include dir and the headers
-// in it (vendored_headers, as header_lines_in answers them for those dirs), and the archive
+// in it (vendored_headers, as header_lines_named answers them for those dirs), and the archive
 // dir the debug info names. gcc checks the rest itself and reads the header copy beside a .gch
 // it rejects; clang stops on one, and the unit compiles again without it. Either way a
 // unit's object, and its key, do not depend on the PCH.

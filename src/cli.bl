@@ -819,6 +819,38 @@ fn recorded_paths(debug_mode: Int, c_dir: Str, arc_dir: Str) -> Option[List[Str]
     Some(["comp_dir:{dir}", "c_dir:{c_dir}", "arc_dir:{arc_dir}"])
 }
 
+// The vendored include dirs include_flags names.
+fn vendored_dirs_in(include_flags: Str) -> List[Str] {
+    let mut dirs: List[Str] = []
+    for part in include_flags.split(" ") {
+        if part.starts_with("-I") {
+            dirs.push(part.byte_slice(2, part.byte_len()))
+        }
+    }
+    dirs
+}
+
+// The vendored header lines of a unit's key at this level. A debug object's debug info names
+// each vendored dir by its path, so the key does too. Below --debug the unit compiles with
+// vendored_map_flags, and the key names each dir as that spells it.
+fn vendored_header_lines(debug_mode: Int, dirs: List[Str]) -> Option[List[Str]] ! IO {
+    build_objcache.header_lines_named(dirs, debug_mode == 0)
+}
+
+// " <flags>" a unit compile adds at this level so its object names a vendored dir only as its
+// key does (vendored_header_lines). A debug object keeps each path, which its debug info
+// names anyway.
+fn vendored_map_flags(debug_mode: Int, dirs: List[Str]) -> Str {
+    if debug_mode != 0 {
+        return ""
+    }
+    let mut out = ""
+    for f in build_objcache.vendored_dir_maps(dirs) {
+        out = "{out} {f}"
+    }
+    out
+}
+
 // The flags a unit's object is keyed on: the ones its compile passes.
 fn unit_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
     let mut flags = cc_opt_flags(debug_mode, release_mode)
@@ -1060,18 +1092,17 @@ let mut cache_did_store: Int = 0
 // another build can remove the cache entry before then. The key and the compile both read
 // snap, the private copy of the C the build emitted.
 fn cache_compile_snapshot(snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
-    let mut vendored_dirs: List[Str] = []
-    for part in include_flags.split(" ") {
-        if part.starts_with("-I") {
-            vendored_dirs.push(part.byte_slice(2, part.byte_len()))
-        }
-    }
+    let vendored_dirs = vendored_dirs_in(include_flags)
     let flags = cc_opt_flags(debug_mode, release_mode)
     let paths = match recorded_paths(debug_mode, path_dirname(c_path), arc_dir) {
         Some(p) => p
         None => return ""
     }
-    let key = build_objcache.user_unit_key(snap, c_path, arc_dir, vendored_dirs, process_compiler_sha(), process_cc_id(target), flags, target, paths)
+    let lines = match vendored_header_lines(debug_mode, vendored_dirs) {
+        Some(l) => l
+        None => return ""
+    }
+    let key = build_objcache.user_unit_key_with_headers(snap, c_path, arc_dir, lines, process_compiler_sha(), process_cc_id(target), flags, target, paths)
     if key == "" {
         return ""
     }
@@ -1080,7 +1111,7 @@ fn cache_compile_snapshot(snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int
         return hit
     }
     let staging = "{snap_dir}/unit.o"
-    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
+    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}{vendored_map_flags(debug_mode, vendored_dirs)}" } else { "-I{arc_dir}" }
     // The map gives the object the __FILE__ and debug paths a compile of c_path gives.
     let rc = run_cc("-c {snap} -o {staging} -ffile-prefix-map={snap_dir}={path_dirname(c_path)} {includes}", debug_mode, release_mode, target)
     if rc != 0 {
@@ -1211,7 +1242,9 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     }
     let mut includes = ""
     if include_flags != "" {
-        includes = " {include_flags}"
+        // The binary's own unit compiles here when the cache does not answer it, and must
+        // spell a vendored dir as a cached one does.
+        includes = " {include_flags}{vendored_map_flags(debug_mode, vendored_dirs_in(include_flags))}"
     }
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
@@ -2463,14 +2496,9 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut keys: Map[Str, Str] = Map()
     // The obj keys and the PCH key share the hashes of the vendored headers.
     let mut vendored_headers: Option[List[Str]] = None
+    let vendored_dirs = vendored_dirs_in(include_flags)
     if use_cache && shas.is_some() {
-        let mut vendored_dirs: List[Str] = []
-        for part in include_flags.split(" ") {
-            if part.starts_with("-I") {
-                vendored_dirs.push(part.byte_slice(2, part.byte_len()))
-            }
-        }
-        vendored_headers = build_objcache.header_lines_in(vendored_dirs)
+        vendored_headers = vendored_header_lines(debug_mode, vendored_dirs)
         let mut modules: List[Str] = []
         let mut unit_headers: Map[Str, List[Str]] = Map()
         for u in files {
@@ -2515,7 +2543,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         misses.set(j, cur)
         i = i + 1
     }
-    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}" } else { "-I{arc_dir}" }
+    // Every compile below, the PCH's too, spells a vendored dir as the keys do.
+    let includes = if include_flags != "" { "-I{arc_dir} {include_flags}{vendored_map_flags(debug_mode, vendored_dirs)}" } else { "-I{arc_dir}" }
     // One PCH serves the units that define one set of macros before the archive header: the
     // set most of the units to compile define. The rest read the header.
     let mut prefixes: List[Str] = []
