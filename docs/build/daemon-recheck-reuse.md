@@ -460,9 +460,19 @@ These places read node order in the build:
   whose lookup is a binary search, and maps each read source back to its load index for the
   unit's `uses`. Before, an edited source's range out of order marked every source
   untracked, so each unit had no `uses` and rebuilt more than a cold build would.
+Rule (d) holds for the build as for a check: the check that the build compiles ran
+`run_build_analyses` (`src/check_pipeline.bl`: the sealed-ops desugar, the mutation
+analysis, save/restore, escape and mono) over the whole program, kept sources included,
+since `check_source_once` runs it on each clean check. The build child runs none of them
+again and writes no node.
 A load that undid the last one in place but kept no source, as when the entry carries a
 program annotation, is still not compiled: the build checks again from an empty pool
-(`src/daemon.bl`, the build turn).
+(`src/daemon.bl`, the build turn). The order is not the reason: that load parses every
+source after the dead range, and `parser_set_load_order` records its ranges as for any load
+that did not start at node 0. The reason is scope. This change compiles only what its
+differential test proves equal, a check that kept a source, and keeps every other case as it
+was. Such a load is rare (in the slice 1 corpus run, 2 of 1718 edited files), and the
+test of that case asserts the cold reload.
 A build that finds its inputs changed loads cold at once (`loader_load_cold_next`), so a
 build right after an edit checks once. The idle poll (`daemon_recheck_if_changed`, on the
 500 ms accept wait, and only when inputs changed) keeps no source. No client waits on it,
@@ -509,7 +519,11 @@ not kept. `node_pop` below the parsed end stops the parser (`parser_limit_stop`)
   a body edit of a module that loads early, a pub edit of it, a body edit of the entry and
   of a module that loads late. After each, a check request keeps sources, then a per-module
   build at default and `--debug` checks no more, and every file in the output dir (C, unit
-  keys, interface text, `.emit-record` but its `inputs` line) equals a cold build's.
+  keys, interface text, `.emit-record` but its `inputs` line) equals a cold build's. The
+  record's `uses` lines are in that compare, so a unit that a warm build marks untracked
+  fails it. A `--no-per-module` build at default and `--debug` runs in the client, since the
+  daemon serves no build of one unit; it must match a cold one too, and the daemon's
+  `builds` count must not grow for it.
 - `tests/test_daemon_recheck_after_edits_to_a_module_that_loads_early_prints_what_a_cold_check_prints.bl`:
   edits to `src/lexer.bl`, the first module of `src/` to load, alone and with `src/cg.bl`.
   The new nodes of the early module come after those of every module that loads after it.
@@ -532,6 +546,19 @@ Mutations that make the first test fail: skip the desugar undo; keep the edited 
 order also makes the early-module test fail. Skip the cut to the parsed end after the undo
 passes every differential test, since the stale nodes are dead and no output reads them; the
 journal trace test fails on it (the pool holds 7137 nodes where the parsed end is 7126).
+
+Mutations that make the reused-check build test fail, each alone:
+- skip the journal undo: the checks keep no source (`reused 0 then 0`) and the builds check
+  again;
+- `cg_decl_spelled_carrier_tids` walks the pool in id order: `blink.types.h` and the
+  `.emit-record` of each unit differ from a cold build's;
+- `cg_derive_key_table_nodes` walks the pool in id order: `__main__.c`, `blink.types.h` and
+  the `.emit-record` differ;
+- keep the edited source's old range in `loaded_inputs`: C compilation fails in unit `early`;
+- the build child drops the load order (`loader_keep_sources(false)` in place of
+  `loader_keep_sources_for_build`): the C and records differ as with an id-order walk;
+- `unit_sources` without the sort (it marks every source untracked): only the
+  `.emit-record` files differ, since their `uses` lines are empty.
 
 **Journal trace.** `BLINK_TRACE_CHANNELS=journal` prints, on each undo, the writes it undid,
 the nodes it dropped and the pool it leaves. A daemon check undoes twice: the index of the
@@ -579,6 +606,42 @@ compares them, or prints one:
 
 The loader also makes a warm load read the same sources in the same order as a cold one, or
 it runs again cold (`end_source_load`, `src/compiler.bl`).
+
+**Walks over node ids on the build path.** Every loop whose bounds come from the pool
+(`node_count()`, `parser_live_ranges()`, a source's node range) in mono, `src/cg*.bl`,
+`src/ir.bl`, layout, cname, `src/build_objcache.bl`, `src/emit_record.bl`, the analyses of
+`run_build_analyses`, the CLI build path and the typecheck the build runs. Found with `rg`
+for `node_count()`, `parser_live_ranges()`, `node_load_rank(`, the source node lists,
+`file_ranges` and `.sort` in those files. Line numbers are at this change. Three verdicts:
+*live ranges* (it walks or ranks in load order), *order does not matter* (and why), *not on
+the build path*.
+
+| site | verdict |
+|---|---|
+| `src/cg_decl.bl:192` `cg_decl_spelled_carrier_tids` | live ranges |
+| `src/cg_derive.bl:1391` `cg_derive_key_table_nodes` | live ranges |
+| `src/cli.bl:2067` `unit_sources`, `:2114` `ir_track_sources`, `:2171` `unit_uses` | live ranges: sorted by node for the lookup, then mapped back to the load index |
+| `src/compiler.bl:235` `check_embed_targets` | live ranges |
+| `src/typecheck.bl:17413` `desugar_sealed_ops_calls` | live ranges |
+| `src/typecheck.bl:609` `tc_conversion_impl_for` | live ranges: lowest `node_load_rank` |
+| `src/typecheck.bl:14193` `tc_unclaimed_call_nodes` | live ranges: walks `tc_node_tid` in id order, then sorts by `node_load_rank` when the order moved; a dead node has no type, so it is never unclaimed |
+| `src/typecheck.bl:4816`, `:11180`-`11188`, `:24689`, `:24739`-`24740`, `:24833`-`24834`, `:24907` | order does not matter: tables sized by the pool and indexed by id; each is filled and read by a walk from the program node, which follows the merged lists in load order |
+| `src/diagnostics.bl:747` file lookup, `:852` `diag_span_readable` | order does not matter: a lookup by id and a bounds check |
+| `src/ir.bl:1439` `verify_enum_new` | order does not matter: a bounds check |
+| `src/compiler.bl:1481`, `:1484`, `:1579` | order does not matter: they mark where a parse starts and ends |
+| `src/cg.bl:493`, `src/cg_eff.bl:1313`, `:1388`, `:1418`, `src/escape.bl:1199`, `:1238` | order does not matter: `while i < end` over the children that `node_push_value_child_ids` gave, so the order is the tree's |
+| `src/emit_record.bl:168`, `:177`, `:264`, `:288` | order does not matter: they sort strings, not ids |
+| `src/cli.bl:570` (`blink fmt`), `:5379`, `:5408` (`blink doc`), `:5662` (`--emit ast`), `src/blinkc_main.bl:120`, `src/comment_attach.bl:573` (`verify_comment_attachment`) | not on the build path: comment attachment for fmt, doc and AST output, and a debug check |
+| `src/lsp.bl:1105`, `src/query.bl:341` | not on the build path |
+| `src/cname_test_helpers.bl:28`, `:40`, `:75`, `src/lower_test_helpers.bl:68`, `:119`, `:134`, `:147` | not on the build path: unit-test helpers |
+
+No other sort of node ids is in those files. The C names that a walk mints come from a
+counter (`c_mint_seq`, `src/cname.bl:36`, cleared by `layout_reset`), not from node ids, so
+they follow the walk order, which the table holds to load order. `Map` and `Set` iteration is no hidden order: the compiler's
+`main` calls `blink_map_init_seed(0)`, which seeds each process from time and pid, and the
+seed goes into every key hash (`bootstrap/runtime_core.h`). An output that read map order
+would differ between two cold runs; the Gen1/Gen2 diff and `ci-per-module-checks` compile
+`src/` twice and compare.
 
 **Numbers.** m1 (`src/cli.bl`, edits in `src/cname.bl` and `src/cli.bl`), 5 runs each,
 base and slice 1 alternating, gen1 of each, median in s:
