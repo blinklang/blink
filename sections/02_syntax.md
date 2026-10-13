@@ -2464,7 +2464,7 @@ fn classify(code: Int) -> Str {
 
 #### Const Evaluation Must Succeed
 
-The compiler evaluates each const expression in the four contexts above. If an operation in that evaluation would panic at run time, the program does not compile, and the error is `ConstEvalPanic` (E0546). This covers integer `/` and `%` by zero (§3.6, *Integer Division*), signed `MIN / -1`, and integer overflow (§3.2, *Overflow behavior*). The rule is the same in each context, and it also applies inside an `assert_panics` body (§2.20).
+The compiler evaluates each const expression in the four contexts above. If an operation in that evaluation would panic at run time, the program does not compile, and the error is `ConstEvalPanic` (E0546). This covers integer `/` and `%` by zero (§3.6, *Integer Division*), signed `MIN / -1`, and integer overflow (§3.2, *Overflow behavior*). The rule is the same in each context. An `assert_panics` body (§2.20) does not change it, because a compile error is not a run-time panic.
 
 ```blink
 const SHARDS = 0
@@ -2492,7 +2492,7 @@ note: `SHARDS` is 0
    |       ^^^^^^
 ```
 
-Outside the four contexts, the compiler does not evaluate an expression as a const, even when the expression uses only const operations. `let a = 10 / 0` compiles and panics at run time. §3.6 *Integer Division* gives the warning for a literal zero divisor.
+Outside the four contexts, a zero divisor is not a compile error: `let a = 10 / 0` compiles and panics at run time. §3.6 *Integer Division* gives the warning for a literal zero divisor.
 
 #### Visibility
 

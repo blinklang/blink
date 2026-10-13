@@ -733,8 +733,8 @@ test "division by zero panics" {
 }
 ```
 
-- §2.21 *Const Evaluation Must Succeed*: `ConstEvalPanic` (E0546) applies in all four const contexts, also inside an `assert_panics` body. The error points at the subexpression that fails and has one `note:` for each `const` reference that leads to the failing value.
-- Outside a const context, the compiler does not evaluate an expression as a const. `let a = 10 / 0` compiles and panics at run time.
+- §2.21 *Const Evaluation Must Succeed*: `ConstEvalPanic` (E0546) applies in all four const contexts. An `assert_panics` body does not change this, because a compile error is not a run-time panic. The error points at the subexpression that fails and has one `note:` for each `const` reference that leads to the failing value.
+- Outside a const context, a zero divisor is not a compile error: `let a = 10 / 0` compiles and panics at run time. Whether other constant expressions in a `let` initializer (such as `let bad: I8 = 127 + 1` in §3.2) are compile errors is a follow-up question.
 - §3.6 *Integer Division*: `DivisionByLiteralZero` (W0704) fires for a literal 0 divisor of an integer `/` or `%`, with optional parentheses and unary `-`.
   - It does not follow `const` references or `let` bindings.
   - It fires in a branch that never runs.
