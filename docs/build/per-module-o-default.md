@@ -580,9 +580,12 @@ compare the poll would never recheck, and only the next request would see the
 edit (it compares bytes too, so it never replies from the old bytes).
 `tests/test_daemon_poll_rechecks_an_edit_made_between_a_check_reply_and_its_settle.bl`
 makes that edit through `BLINK_DEV_TEST_SETTLE_HOOK`, a shell command the
-settle runs before it takes the stats. Unset, it costs one getenv per settle,
-after the reply. The test fails at `assert(resettled)` when the settle keeps
-the stats it took and skips the compare: the poll does not recheck in 20 s.
+settle runs before it takes the stats. It is for tests only, like the other
+`BLINK_DEV_*` knobs. Unset, it costs one getenv per settle, after the reply.
+The test fails at `assert(resettled)` when the settle keeps the stats it took
+and skips the compare: the poll does not recheck in 20 s. Its asserts before
+that one pass in the same run: the next request and a CLI check still report
+the edit, so a missed compare stops only the poll and never gives a stale reply.
 
 Filling the interface texts in the settle must give the bytes a check gave
 when it filled them at once, since a build keys the units it keeps on them.
