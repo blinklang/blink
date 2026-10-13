@@ -2249,12 +2249,41 @@ Below `--debug` each unit compile, the archive header PCH build and the
 one-unit compile take `-fmacro-prefix-map=<dir>/=<name>/` for each
 absolute vendored dir, where `<name>` is the last part of the dir. The
 key spells the dir the same way: `<name>/<header>=<sha>`
-(`build_objcache.header_lines_named`, `vendored_dir_name`,
+(`build_objcache.header_lines_named`, `vendored_dir_spellings`,
 `vendored_dir_maps`). So `__FILE__` reads `mylib/mylib.h` in every
 tree, and the second tree compiles no unit. The trailing slash keeps
 the map off a sibling dir whose name starts with the same name. A dir
 with `=` in it keeps its path in the key and gets no map. A relative
 dir is not changed.
+
+This changes what a program sees. Below `--debug`, `__FILE__` (and
+`__builtin_FILE`) in a header of an absolute vendored dir reads
+`<name>/<file>`, for example `mylib/mylib.h`. At `--debug` it reads the
+absolute path, as before.
+
+A dir keeps its path in the key, and gets no map, when its name is not
+its own:
+
+- Two dirs of one name, such as `/x/a/inc` and `/y/b/inc`. By name,
+  their headers would give the same lines, and the key sorts its lines,
+  so a tree that swaps the headers between the two dirs would get the
+  key of the first tree and other bytes: `#include "pick.h"` takes the
+  file of the first `-I` dir. A relative dir with the same spelling as
+  the name counts too.
+- A dir inside another listed dir. A header in it matches both maps,
+  and which one gcc uses follows the order of the `-I` flags, which the
+  key does not hold.
+
+A cc that rejects `-fmacro-prefix-map` (gcc before 8, clang before 10)
+gets no map: the key keeps the full dir and the object records it
+(`cli.cc_takes_macro_prefix_map`). The build probes cc once per cc id,
+with `cc -fmacro-prefix-map=... -E` on an empty file, and only when a
+build has an absolute vendored dir.
+
+The dep's own `.c` (`compile_vendored_source`, an object in
+`.tmp/<name>.o`) takes no map. It is outside the obj cache, so no key
+is involved; but if that source uses `__FILE__`, a default or release
+binary still holds the tree path through that object.
 
 At `--debug` the key keeps the full dir and the compile takes no map:
 the line table names the dir, and a debugger needs it to find the
@@ -2270,9 +2299,11 @@ it. The PCH key also keeps the raw `-I` flags and the archive dir.
 Known limits, not changed here: the key covers only the `*.h` files at
 the top of each vendored dir, and not the order of the `-I` flags.
 
-`tests/test_objects_of_two_trees_with_byte_equal_vendored_dirs_at_different_paths_share_one_cache_below_debug.bl`
+`tests/test_objects_of_two_trees_with_byte_equal_vendored_dirs_at_different_paths_share_one_cache_below_debug.bl`,
+`tests/test_debug_object_names_the_vendored_dir_it_was_compiled_with.bl`,
+`tests/test_vendored_dirs_of_one_name_keep_their_paths_so_trees_that_swap_their_headers_share_no_object.bl`
 and
-`tests/test_debug_object_names_the_vendored_dir_it_was_compiled_with.bl`
+`tests/test_a_cc_that_rejects_the_macro_prefix_map_keys_and_compiles_vendored_dirs_by_path.bl`
 hold this, with gcc and clang.
 
 ### Holds against a concurrent GC
