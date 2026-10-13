@@ -1,0 +1,134 @@
+// Two absolute vendored dirs of one name, a/inc and b/inc, each with a pick.h of other bytes.
+// Tree B holds tree A's two headers swapped between the dirs. Spelled by name, the two trees'
+// header lines would be equal once sorted, yet each tree takes pick.h from its first dir and
+// so prints another word. Dirs of one name keep their paths in the key, so tree B compiles
+// its own objects and prints what it prints on a cache of its own.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn pick_h(word: Str) -> Str {
+    [
+        "#ifndef PICK_H",
+        "#define PICK_H",
+        "#include <stdint.h>",
+        "typedef struct pick_ctx pick_ctx;",
+        "static inline uint8_t *pick_word(void) \{ return (uint8_t *)\"{word}\"; \}",
+        "#endif",
+        "",
+    ].join("\n")
+}
+
+// A dev tree with a program over two native deps whose sources sit in {tree}/a/inc and
+// {tree}/b/inc, by absolute paths outside the project, with a pick.h in each that answers
+// first_word and second_word.
+fn dev_tree(root: Str, tree: Str, cc_path: Str, first_word: Str, second_word: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin {tree}/a/inc {tree}/b/inc")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/bin/cc", "#!/bin/sh\nexec {cc_path} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    write_file("{tree}/a/inc/pick.h", pick_h(first_word))
+    write_file("{tree}/b/inc/pick.h", pick_h(second_word))
+    write_file("{tree}/a/inc/a.c", "#include <stdint.h>\nint64_t alib_id(void) \{ return 1; \}\n")
+    write_file("{tree}/b/inc/b.c", "#include <stdint.h>\nint64_t blib_id(void) \{ return 2; \}\n")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"vendored_app\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nalib = \{ type = \"vendored\", path = \"{tree}/a/inc/a.c\", headers = [\"pick.h\"] \}\nblib = \{ type = \"vendored\", path = \"{tree}/b/inc/b.c\", headers = [\"pick.h\"] \}\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/part.bl", [
+        #"@ffi.opaque(header: "pick.h", name: "pick_ctx")"#,
+        #"pub type Ctx"#,
+        #""#,
+        #"@ffi("alib", "alib_id", header: "pick.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn alib_id() -> Int ! FFI {}"#,
+        #""#,
+        #"@ffi("blib", "blib_id", header: "pick.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn blib_id() -> Int ! FFI {}"#,
+        #""#,
+        #"@ffi("alib", "pick_word", header: "pick.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn pick_word() -> Ptr[U8] ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import part.{alib_id, blib_id, pick_word}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{alib_id() + blib_id()} {pick_word().to_str() ?? "-"}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Runs blink in the tree with the given object cache, the tree's cc and the unit trace. The
+// corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so
+// the run drops them.
+fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn compiles(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+fn check_swapped(cc_name: Str, level: Str) {
+    let cc_path = sh("command -v {cc_name}")
+    if cc_path == "" {
+        io.println("skip {cc_name}: no {cc_name} on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tag = "_vendored_one_name_{cc_name}_{getpid()}"
+    let shared = "{root}/.tmp/{tag}_shared"
+    let own = "{root}/.tmp/{tag}_own"
+    let tree_a = "{root}/.tmp/{tag}_a"
+    let tree_b = "{root}/.tmp/{tag}_b"
+    dev_tree(root, tree_a, cc_path, "one", "two")
+    dev_tree(root, tree_b, cc_path, "two", "one")
+    let flags = "build app/src/main.bl -o out/app --per-module {level}"
+    shell_exec("rm -rf {shared} {own}")
+    let b_alone = blink_in(tree_b, own, flags)
+    let run_b_alone = sh("{tree_b}/out/app")
+    let a = blink_in(tree_a, shared, flags)
+    let run_a = sh("{tree_a}/out/app")
+    let b = blink_in(tree_b, shared, flags)
+    let run_b = sh("{tree_b}/out/app")
+    shell_exec("rm -rf {tree_a} {tree_b} {shared} {own}")
+
+    assert(b_alone.exit_code == 0, "build failed: {b_alone.out}{b_alone.err_out}")
+    assert(a.exit_code == 0, "build failed: {a.out}{a.err_out}")
+    assert(b.exit_code == 0, "build failed: {b.out}{b.err_out}")
+    // The swap shows: the trees print other words.
+    assert(run_a != run_b_alone, "both trees print {run_a}")
+    assert_eq(run_b, run_b_alone)
+    assert_eq(compiles(b), 2)
+}
+
+test "gcc trees that swap the headers of two vendored dirs of one name share no object at the default level" {
+    check_swapped("gcc", "")
+}
+
+test "gcc trees that swap the headers of two vendored dirs of one name share no object at release" {
+    check_swapped("gcc", "--release")
+}
+
+test "clang trees that swap the headers of two vendored dirs of one name share no object at the default level" {
+    check_swapped("clang", "")
+}

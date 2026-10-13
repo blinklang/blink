@@ -1,0 +1,168 @@
+// A debug object records the vendored include dir it read its headers from. A tree whose
+// manifest moves a native dep to a byte-equal copy at another path must compile its debug
+// objects again, and they name the new dir. Below --debug the object names no vendored dir,
+// so the same move compiles nothing.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn vendored_dir(dir: Str) {
+    shell_exec("mkdir -p {dir}")
+    write_file("{dir}/mylib.h", [
+        "#ifndef MYLIB_H",
+        "#define MYLIB_H",
+        "#include <stdint.h>",
+        "typedef struct mylib_ctx mylib_ctx;",
+        "int64_t mylib_add(int64_t a, int64_t b);",
+        "static inline uint8_t *mylib_where(void) \{ return (uint8_t *)__FILE__; \}",
+        "#endif",
+        "",
+    ].join("\n"))
+    write_file("{dir}/mylib.c", "#include \"mylib.h\"\nint64_t mylib_add(int64_t a, int64_t b) \{ return a + b; \}\n")
+}
+
+// The manifest names the dep's source at dir by its absolute path. The lock is written after
+// it, so no build resolves dependencies.
+fn point_at(tree: Str, dir: Str) {
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"vendored_move\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nmylib = \{ type = \"vendored\", path = \"{dir}/mylib.c\", headers = [\"mylib.h\"] \}\n")
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+}
+
+// A dev tree with a program of two modules over a native dep, two byte-equal copies of the
+// dep, and a cc first on PATH that runs cc_path.
+fn dev_tree(root: Str, tree: Str, cc_path: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/bin")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/bin/cc", "#!/bin/sh\nexec {cc_path} \"$@\"\n")
+    shell_exec("chmod +x {tree}/bin/cc")
+    vendored_dir("{tree}/first/mylib")
+    vendored_dir("{tree}/second/mylib")
+    write_file("{tree}/app/src/part.bl", [
+        #"@ffi.opaque(header: "mylib.h", name: "mylib_ctx")"#,
+        #"pub type Ctx"#,
+        #""#,
+        #"@ffi("mylib", "mylib_add", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn add(a: Int, b: Int) -> Int ! FFI {}"#,
+        #""#,
+        #"@ffi("mylib", "mylib_where", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn where_() -> Ptr[U8] ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{tree}/app/src/main.bl", [
+        #"import part.{add, where_}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("sum {add(40, 2)} {where_().to_str() ?? "-"}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one
+// unit, so the run drops them.
+fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units build/blink {args}"])
+}
+
+fn compiles(r: ProcessResult) -> Int {
+    let mut n = 0
+    for line in "{r.out}\n{r.err_out}".lines() {
+        if line.starts_with("[dbg:build.units] compile ") { n = n + 1 }
+    }
+    n
+}
+
+// How many times the bytes of the file at path hold text, once the debug sections gcc
+// compresses are decompressed.
+fn file_holds(path: Str, text: Str) -> Int {
+    sh("objcopy --decompress-debug-sections {path} {path}.plain && grep -c -a -F '{text}' {path}.plain; rm -f {path}.plain").to_int()
+}
+
+type Move {
+    first: ProcessResult
+    second: ProcessResult
+    run_first: Str
+    run_second: Str
+    // How often the binary of the second build names each dir.
+    names_first: Int
+    names_second: Int
+}
+
+// A build with the dep in first/, then one with it in second/, at the level flags give, from
+// an empty cache.
+fn move_dep(tree: Str, cache: Str, flags: Str) -> Move {
+    shell_exec("rm -rf {cache}")
+    // .tmp holds the dep's own object, reused by mtime alone, which would carry the other dir.
+    shell_exec("rm -rf {tree}/.tmp")
+    point_at(tree, "{tree}/first/mylib")
+    let a = blink_in(tree, cache, "build app/src/main.bl -o out/app --per-module {flags}")
+    let run_a = sh("{tree}/out/app")
+    shell_exec("rm -rf {tree}/.tmp")
+    point_at(tree, "{tree}/second/mylib")
+    let b = blink_in(tree, cache, "build app/src/main.bl -o out/app --per-module {flags}")
+    Move {
+        first: a,
+        second: b,
+        run_first: run_a,
+        run_second: sh("{tree}/out/app"),
+        names_first: file_holds("{tree}/out/app", "{tree}/first/mylib"),
+        names_second: file_holds("{tree}/out/app", "{tree}/second/mylib"),
+    }
+}
+
+fn check_move(cc_name: Str) {
+    let cc_path = sh("command -v {cc_name}")
+    if cc_path == "" {
+        io.println("skip {cc_name}: no {cc_name} on PATH")
+        return
+    }
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_vendored_move_{cc_name}_{getpid()}"
+    let cache = "{tree}/cache"
+    dev_tree(root, tree, cc_path)
+    let debug_move = move_dep(tree, cache, "--debug")
+    let default_move = move_dep(tree, cache, "")
+    shell_exec("rm -rf {tree}")
+
+    let d = debug_move
+    assert(d.first.exit_code == 0, "build failed: {d.first.out}{d.first.err_out}")
+    assert(d.second.exit_code == 0, "build failed: {d.second.out}{d.second.err_out}")
+    assert_eq(compiles(d.first), 2)
+    assert_eq(compiles(d.second), 2)
+    assert_eq(d.run_first, "sum 42 {tree}/first/mylib/mylib.h")
+    assert_eq(d.run_second, "sum 42 {tree}/second/mylib/mylib.h")
+    assert(d.names_second >= 1, "the debug binary does not name the dir it was built with")
+    assert_eq(d.names_first, 0)
+
+    let m = default_move
+    assert(m.first.exit_code == 0, "build failed: {m.first.out}{m.first.err_out}")
+    assert(m.second.exit_code == 0, "build failed: {m.second.out}{m.second.err_out}")
+    assert_eq(compiles(m.first), 2)
+    assert_eq(compiles(m.second), 0)
+    assert_eq(m.run_first, "sum 42 mylib/mylib.h")
+    assert_eq(m.run_second, "sum 42 mylib/mylib.h")
+    assert_eq(m.names_first, 0)
+    assert_eq(m.names_second, 0)
+}
+
+test "gcc debug object names the vendored dir it was compiled with" {
+    check_move("gcc")
+}
+
+test "clang debug object names the vendored dir it was compiled with" {
+    check_move("clang")
+}
