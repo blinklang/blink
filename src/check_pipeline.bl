@@ -1,4 +1,4 @@
-import compiler.{compile_to_program, check_unused_imports, loaded_inputs}
+import compiler.{compile_to_program, check_unused_imports, loaded_inputs, loader_keeps_sources, loader_must_redo, loader_load_cold_next}
 import lexer.{Lex}
 import parser.{Parse}
 import typecheck.{TypeCheck, check_types, desugar_sealed_ops_calls}
@@ -35,10 +35,12 @@ type CheckedInputs {
     // Each path the loader probed, beside whether a file was there.
     probe_paths: List[Str]
     probe_found: List[Bool]
+    // How many of paths are sources; the rest are config and #embed files.
+    sources: Int
 }
 
 fn checked_inputs_empty() -> CheckedInputs {
-    CheckedInputs { source: "", paths: [], texts: [], probe_paths: [], probe_found: [] }
+    CheckedInputs { source: "", paths: [], texts: [], probe_paths: [], probe_found: [], sources: 0 }
 }
 
 let mut checked: CheckedInputs = checked_inputs_empty()
@@ -67,7 +69,28 @@ pub fn check_source(source_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build,
 
 // check_source, and what its front end reported.
 pub fn check_source_reporting(source_path: Str) -> (Int, FrontEndReport) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    // The load after one that must run again parses every source, so it keeps none and
+    // never asks to run again.
+    match check_source_once(source_path) {
+        Some(r) => r
+        None => check_source_reporting(source_path)
+    }
+}
+
+// check_source_reporting, or None when the load kept sources and must run again with none
+// kept. It stops before typecheck then, and a caller that captured what the check printed
+// drops what the load printed, as the load that runs again prints it once more.
+pub fn check_source_once(source_path: Str) -> Option[(Int, FrontEndReport)] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    // A loader that keeps parsed sources keeps them only while the sources alone changed: the
+    // entry, a config, an #embed file or a probe answer may change what a parse or the load
+    // does around it.
+    if loader_keeps_sources() && checked_non_source_inputs_changed(source_path) {
+        loader_load_cold_next()
+    }
     let program = compile_to_program(source_path, 1)
+    if loader_must_redo() {
+        return None
+    }
     check_types(program)
     check_unused_imports()
     let front = FrontEndReport { errors: diag_count, warnings: diag_warn_count, ices: diag_ice_count, human: diag_render(0), json: diag_render(1), entries: diag_entry_count() }
@@ -77,7 +100,7 @@ pub fn check_source_reporting(source_path: Str) -> (Int, FrontEndReport) ! Lex.T
         run_build_analyses(program)
     }
     record_checked_inputs(source_path)
-    (program, front)
+    Some((program, front))
 }
 
 fn record_checked_inputs(source_path: Str) {
@@ -89,6 +112,7 @@ fn record_checked_inputs(source_path: Str) {
         checked.texts.push(loaded_inputs.source_texts.get(i).unwrap())
         i = i + 1
     }
+    checked.sources = checked.paths.len()
     i = 0
     while i < loaded_inputs.config_paths.len() {
         checked.paths.push(loaded_inputs.config_paths.get(i).unwrap())
@@ -124,6 +148,21 @@ pub fn checked_inputs_changed(source_path: Str) -> Bool {
             if file_exists(p) != 1 { return true }
             if read_file(p) != checked.texts.get(i).unwrap() { return true }
         }
+        i = i + 1
+    }
+    false
+}
+
+// Whether anything but the bytes of a source changed since the last check: its entry, a
+// config or #embed file, or a probe answer.
+pub fn checked_non_source_inputs_changed(source_path: Str) -> Bool {
+    if checked.source == "" || checked.source != source_path { return true }
+    if checked_probes_changed() { return true }
+    let mut i = checked.sources
+    while i < checked.paths.len() {
+        let p = checked.paths.get(i).unwrap()
+        if file_exists(p) != 1 { return true }
+        if read_file(p) != checked.texts.get(i).unwrap() { return true }
         i = i + 1
     }
     false

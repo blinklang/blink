@@ -1,13 +1,13 @@
 import ast.{NodeKind, trace, trace_mode}
 import lexer.{Lex, lex}
-import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of, parsed_interface_text, parsed_interface_parts, interface_text_of, parser_interface_text_deferred}
+import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of, parsed_interface_text, parsed_interface_parts, interface_text_of, parser_interface_text_deferred, parser_interface_text_wanted, parser_keeps_parsed, parser_has_parsed_end, parser_parsed_end, parser_mark_parsed, parser_rewind, parser_keep_parsed, parser_program_annotations, parser_set_program_annotations, parser_set_load_order, parser_live_ranges}
 import typecheck.{clear_module_imports, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_get_symbol_module, tc_set_prelude_modules}
 import diagnostics.{
     Diag, diag_register_file_range, lint_set_override, diag_normalize_path,
     diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset,
     diag_source_file, diag_module_files, embedded_inner_key,
     diag_error_at, diag_file_for_node, diag_warn_in_file_notes, SHADOWED_DEPENDENCY,
-    diag_emit_in_file, diag_error_no_loc_notes, diag_entries,
+    diag_emit_in_file, diag_error_no_loc_notes, diag_entries, diag_entry_count, diag_ice_count, diag_cutoff_count,
     INVALID_LINT_LEVEL, UNKNOWN_MANIFEST_SECTION,
     CIRCULAR_DEPENDENCY, VERSION_CONFLICT, INVALID_MODULE_ANNOTATION,
     PACKAGE_ENTRY_NOT_FOUND, ORPHAN_FILE, MODULE_NOT_FOUND, UNUSED_IMPORT,
@@ -230,19 +230,26 @@ pub fn check_file_exists(path: Str) {
 // for its own file. The expression stage embeds the bytes read here. A `blink check` stops
 // before that stage, so without this a check answered ok on a program no build could produce.
 fn check_embed_targets() ! Diag.Report {
-    let mut id = 0
-    while id < node_count() {
-        if node_kind(id) == NodeKind.EmbedExpr {
-            let path = embed_path_of(id)
-            if !probe_file(path) {
-                diag_error_at("FileNotFound", FILE_NOT_FOUND, "#embed file not found: {path}", id,
-                    "the path is read relative to the file that holds the #embed, not the directory the compiler runs in")
-            } else if !loaded_inputs.embed_texts.contains_key(path) {
-                loaded_inputs.embed_paths.push(path)
-                loaded_inputs.embed_texts.insert(path, read_file(path))
+    // In load order, which a recheck that kept nodes does not hold to in node id order, so
+    // the errors and embed_paths read as a cold check's.
+    let ranges = parser_live_ranges()
+    let mut r = 0
+    while r + 1 < ranges.len() {
+        let mut id = ranges[r]
+        while id < ranges[r + 1] {
+            if node_kind(id) == NodeKind.EmbedExpr {
+                let path = embed_path_of(id)
+                if !probe_file(path) {
+                    diag_error_at("FileNotFound", FILE_NOT_FOUND, "#embed file not found: {path}", id,
+                        "the path is read relative to the file that holds the #embed, not the directory the compiler runs in")
+                } else if !loaded_inputs.embed_texts.contains_key(path) {
+                    loaded_inputs.embed_paths.push(path)
+                    loaded_inputs.embed_texts.insert(path, read_file(path))
+                }
             }
+            id = id + 1
         }
-        id = id + 1
+        r = r + 2
     }
 }
 
@@ -260,12 +267,10 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
     let mut program = 0
     let mut imported_programs: List[Int] = []
     with load_phase() {
-        lex(source)
-        let first_node = node_count()
-        program = parse_program()
-        attach_comments_pass(program, first_node)
+        let parsed = parse_source(file_path, source)
+        program = parsed.program
         loaded_inputs.files.push(file_path)
-        record_source_nodes("__main__", first_node)
+        record_source_nodes("__main__", parsed)
 
         reject_empty_module_annotation(program)
 
@@ -276,6 +281,7 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
             inject_prelude(src_root, imported_programs)
         }
     }
+    end_source_load()
     build_reexport_map(imported_programs)
 
     check_embed_targets()
@@ -1169,8 +1175,13 @@ pub fn embedded_keys() -> List[Str] {
     embedded_stdlib.keys()
 }
 
-let mut pkg_edges_from: List[Str] = []
-let mut pkg_edges_to: List[Str] = []
+// The package of each cross-package import and the package it imports, by index.
+type PkgEdges {
+    importers: List[Str]
+    imported: List[Str]
+}
+
+let mut pkg_edges: PkgEdges = PkgEdges { importers: [], imported: [] }
 let mut current_import_file: Str = ""
 let mut current_import_module: Str = "__main__"
 
@@ -1196,9 +1207,9 @@ fn detect_package_cycles() -> Str {
     let mut all_pkgs: Map[Str, Int] = Map()
     let mut adj: Map[Str, List[Str]] = Map()
     let mut i = 0
-    while i < pkg_edges_from.len() {
-        let from = pkg_edges_from.get(i).unwrap()
-        let to = pkg_edges_to.get(i).unwrap()
+    while i < pkg_edges.importers.len() {
+        let from = pkg_edges.importers.get(i).unwrap()
+        let to = pkg_edges.imported.get(i).unwrap()
         all_pkgs.insert(from, 1)
         all_pkgs.insert(to, 1)
         if adj.contains_key(from) == 0 {
@@ -1296,7 +1307,14 @@ fn dfs_detect_cycle(node: Str, adj: Map[Str, List[Str]], visited: Map[Str, Int],
 }
 
 pub fn reset_compiler_state() {
-    parser_reset()
+    let cold = source_keep.cold_next
+    source_keep = SourceKeep { next: kept_sources_empty(), reused: 0, redo: false, dirty: false, cold_next: false, ..source_keep }
+    if !cold && parser_has_parsed_end() && source_keep.kept.paths.len() > 0 && kept_sources_live() * 2 >= parser_parsed_end() {
+        parser_rewind()
+    } else {
+        source_keep.kept = kept_sources_empty()
+        parser_reset()
+    }
     loaded_inputs = loaded_inputs_empty()
     import_map_paths.clear()
     import_map_nodes.clear()
@@ -1309,8 +1327,8 @@ pub fn reset_compiler_state() {
     root_import_qualifiers.clear()
     tc_reexport_source.clear()
     tc_reexport_modules.clear()
-    pkg_edges_from.clear()
-    pkg_edges_to.clear()
+    pkg_edges.importers.clear()
+    pkg_edges.imported.clear()
     current_import_file = ""
     current_import_module = "__main__"
     lockfile_loaded = 0
@@ -1331,21 +1349,185 @@ fn find_module_key(file_path: Str) -> Str {
     ""
 }
 
-// The module and node range of the source pushed last, which the parser has just parsed.
-fn record_source_nodes(module: Str, first_node: Int) {
+// The module and node range of the source pushed last, which the parser has just parsed or
+// the loader kept from the last load.
+fn record_source_nodes(module: Str, parsed: ParsedSource) {
     loaded_inputs.source_modules.push(module)
-    loaded_inputs.source_first_nodes.push(first_node)
-    loaded_inputs.source_end_nodes.push(node_count())
+    loaded_inputs.source_first_nodes.push(parsed.first)
+    loaded_inputs.source_end_nodes.push(parsed.end)
     // An embedded source comes with the compiler, which the inputs name by its sha, so its
     // interface could tell a build nothing the inputs do not.
     let path = loaded_inputs.source_paths.get(loaded_inputs.source_paths.len() - 1) ?? ""
     let wanted = !path.starts_with("<embedded:")
-    if parser_interface_text_deferred() {
-        loaded_inputs.source_interfaces.push("")
-        loaded_inputs.interface_parts.push(parsed_interface_parts(wanted))
+    let deferred = parser_interface_text_deferred()
+    let mut parts: List[Str] = []
+    let mut text = ""
+    if parsed.kept >= 0 {
+        parts = source_keep.kept.parts[parsed.kept]
+        text = source_keep.kept.interfaces[parsed.kept]
+    } else if deferred {
+        parts = parsed_interface_parts(wanted)
     } else {
-        loaded_inputs.source_interfaces.push(parsed_interface_text(wanted))
+        text = parsed_interface_text(wanted)
     }
+    if deferred {
+        loaded_inputs.source_interfaces.push("")
+        loaded_inputs.interface_parts.push(parts)
+    } else {
+        loaded_inputs.source_interfaces.push(text)
+    }
+    if parsed.cacheable {
+        source_keep.next.paths.push(path)
+        source_keep.next.texts.push(loaded_inputs.source_texts.get(loaded_inputs.source_texts.len() - 1) ?? "")
+        source_keep.next.programs.push(parsed.program)
+        source_keep.next.firsts.push(parsed.first)
+        source_keep.next.ends.push(parsed.end)
+        source_keep.next.anns_in.push(parsed.anns_in)
+        source_keep.next.anns_out.push(parsed.anns_out)
+        source_keep.next.parts.push(parts)
+        source_keep.next.interfaces.push(text)
+    }
+}
+
+// A daemon recheck keeps the nodes of each source whose bytes did not change since the last
+// load: the parser rewinds them to what the parse wrote, and the loader parses only the
+// sources that changed, at the end of the pool. A kept source carries what its parse left
+// beyond its nodes: its interface text, and the program-level annotations the parse handed
+// on to the parses after it. A parse reads the ones handed to it, so they are part of its key.
+type KeptSources {
+    paths: List[Str]
+    texts: List[Str]
+    programs: List[Int]
+    firsts: List[Int]
+    ends: List[Int]
+    anns_in: List[List[Int]]
+    anns_out: List[List[Int]]
+    parts: List[List[Str]]
+    interfaces: List[Str]
+    // How the parser was asked for interface texts, which the kept ones were written for.
+    wanted: Bool
+    deferred: Bool
+    // The paths of every source of the load, kept or not, in load order.
+    order: List[Str]
+}
+
+fn kept_sources_empty() -> KeptSources {
+    KeptSources { paths: [], texts: [], programs: [], firsts: [], ends: [], anns_in: [], anns_out: [], parts: [], interfaces: [], wanted: false, deferred: false, order: [] }
+}
+
+// The sources the last load left to keep, and those this load leaves for the next.
+type SourceKeep {
+    kept: KeptSources
+    next: KeptSources
+    // How many sources this load kept, and whether it must run again with none kept.
+    reused: Int
+    redo: Bool
+    // Whether a parse of this load reported anything.
+    dirty: Bool
+    // Whether the next load parses every source. A load that runs again for redo is one; so
+    // is each load after a parse that reported anything, so a source with a parse error never
+    // runs beside kept nodes and a check that keeps failing to parse pays for one load, not two.
+    cold_next: Bool
+}
+
+let mut source_keep: SourceKeep = SourceKeep { kept: kept_sources_empty(), next: kept_sources_empty(), reused: 0, redo: false, dirty: false, cold_next: false }
+
+// One source of a load: its program node, its nodes as [first, end), the index of the kept
+// source it took them from or -1, and whether the next load may keep them.
+type ParsedSource {
+    program: Int
+    first: Int
+    end: Int
+    kept: Int
+    cacheable: Bool
+    anns_in: List[Int]
+    anns_out: List[Int]
+}
+
+fn kept_source_index(path: Str, text: Str, anns_in: List[Int]) -> Int {
+    if !parser_has_parsed_end() { return -1 }
+    if source_keep.kept.wanted != parser_interface_text_wanted() || source_keep.kept.deferred != parser_interface_text_deferred() { return -1 }
+    let mut i = 0
+    while i < source_keep.kept.paths.len() {
+        if source_keep.kept.paths[i] == path {
+            if source_keep.kept.texts[i] != text || source_keep.kept.anns_in[i] != anns_in { return -1 }
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// What the diagnostics hold so far, which only grows: entries, ices and lex cutoffs.
+fn diag_tally() -> List[Int] {
+    [diag_entry_count(), diag_ice_count, diag_cutoff_count()]
+}
+
+fn parse_source(path: Str, source: Str) -> ParsedSource ! Lex.Tokenize, Parse, Diag.Report {
+    let anns_in = parser_program_annotations()
+    let k = kept_source_index(path, source, anns_in)
+    if k >= 0 {
+        source_keep.reused = source_keep.reused + 1
+        parser_set_program_annotations(source_keep.kept.anns_out[k])
+        return ParsedSource { program: source_keep.kept.programs[k], first: source_keep.kept.firsts[k], end: source_keep.kept.ends[k], kept: k, cacheable: true, anns_in: anns_in, anns_out: source_keep.kept.anns_out[k] }
+    }
+    // A source whose parse reported anything is parsed again, so the next load reports it too.
+    let before = diag_tally()
+    lex(source)
+    pos = 0
+    let first = node_count()
+    let program = parse_program()
+    attach_comments_pass(program, first)
+    let end = node_count()
+    parser_mark_parsed()
+    let clean = diag_tally() == before
+    if !clean { source_keep.dirty = true }
+    ParsedSource { program: program, first: first, end: end, kept: -1, cacheable: clean && parser_keeps_parsed(), anns_in: anns_in, anns_out: parser_program_annotations() }
+}
+
+// The sources of this load become the kept ones. A load that kept a source but read other
+// sources, or the same ones in another order, must run again with none kept: the merge and
+// every pass after it read the program in load order, which only a cold load is known to give.
+fn end_source_load() {
+    let mut order: List[Str] = []
+    for p in loaded_inputs.source_paths { order.push(p) }
+    if source_keep.reused > 0 && (order != source_keep.kept.order || source_keep.dirty) {
+        source_keep.redo = true
+    }
+    source_keep.cold_next = source_keep.redo || source_keep.dirty
+    let kept = KeptSources { order: order, wanted: parser_interface_text_wanted(), deferred: parser_interface_text_deferred(), ..source_keep.next }
+    source_keep = SourceKeep { kept: kept, next: kept_sources_empty(), ..source_keep }
+    parser_set_load_order(loaded_inputs.source_first_nodes, loaded_inputs.source_end_nodes)
+}
+
+// Whether the loader keeps parsed sources from one load to the next. Either way it drops
+// what it kept.
+pub fn loader_keep_sources(on: Bool) {
+    parser_keep_parsed(on)
+    source_keep.kept = kept_sources_empty()
+}
+
+// The next load parses every source.
+pub fn loader_load_cold_next() {
+    source_keep.cold_next = true
+}
+
+pub fn loader_keeps_sources() -> Bool { parser_keeps_parsed() }
+
+pub fn loader_reused_sources() -> Int { source_keep.reused }
+
+pub fn loader_must_redo() -> Bool { source_keep.redo }
+
+// The nodes the kept sources hold. The rest below the parsed end are dead, and once they
+// outnumber these, the next load starts again from an empty pool.
+fn kept_sources_live() -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < source_keep.kept.firsts.len() {
+        n = n + source_keep.kept.ends[i] - source_keep.kept.firsts[i]
+        i = i + 1
+    }
+    n
 }
 
 // Writes each interface text the loader deferred.
@@ -1388,13 +1570,10 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
     let display_path = diag_normalize_path(file_path)
     let entry_diag_file = diag_source_file
     diag_source_file = display_path
-    lex(source)
-    pos = 0
-    let first_imp_node = node_count()
-    let imported_prog = parse_program()
+    let parsed = parse_source(file_path, source)
     diag_source_file = entry_diag_file
-    attach_comments_pass(imported_prog, first_imp_node)
-    diag_register_file_range(first_imp_node, node_count(), display_path)
+    let imported_prog = parsed.program
+    diag_register_file_range(parsed.first, parsed.end, display_path)
     let mut mod_key = dots_to_underscores(dotted_path)
     let source_mod_key = mod_key
     let mut qualifier = leaf_module_name(dotted_path)
@@ -1441,7 +1620,7 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
         mod_key = ann_val
     }
     // Before collect_imports, whose loads push sources of their own.
-    record_source_nodes(mod_key, first_imp_node)
+    record_source_nodes(mod_key, parsed)
     let saved_import_file = current_import_file
     let saved_import_module = current_import_module
     current_import_file = file_path
@@ -1476,8 +1655,8 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
         if file_path != "" && is_pseudo == 0 {
             let tgt_pkg = extract_package(file_path, src_root)
             if src_pkg != "" && tgt_pkg != "" && src_pkg != tgt_pkg {
-                pkg_edges_from.push(src_pkg)
-                pkg_edges_to.push(tgt_pkg)
+                pkg_edges.importers.push(src_pkg)
+                pkg_edges.imported.push(tgt_pkg)
             }
             if is_file_loaded(file_path) == 0 {
                 load_module(dotted_path, file_path, src_root, all_programs, imp_node, "import")
