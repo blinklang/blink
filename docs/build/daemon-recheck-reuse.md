@@ -447,6 +447,11 @@ new range, so a diagnostic in the edited source names its file.
 
 **Builds.** A build after a check that kept a source checks again with none kept, so a
 build always compiles the program a cold load gives (`src/daemon.bl`, the build turn).
+The idle poll (`daemon_recheck_if_changed`) keeps no source. No client waits on it, and a
+build after it then uses its check as it is. A poll that kept sources made each build
+through the daemon after an edit pay one more cold check, about 0.45 s on `src/cli.bl`. A
+check request keeps sources, so a check followed at once by a build pays a warm check and
+then a cold one. Slice 3 (build equality) removes that second check.
 
 **Reuse counter.** `blink daemon status` reports `reused`: the number of sources kept,
 summed over the worker's checks.
@@ -480,20 +485,29 @@ not kept. `node_pop` below the parsed end stops the parser (`parser_limit_stop`)
   check printed. Two files kept no source: `test_capabilities.bl` and
   `test_scoped_budget.bl`. Their entry carries a program annotation, which is handed on to
   each later parse by node id, so an edit of the entry changes the key of every source.
+- `tests/test_daemon_build_after_an_idle_recheck_of_an_edit_checks_no_second_time.bl`: a
+  settle hook counts checks. A build after the poll checked an edit checks no more; a build
+  after a check request that kept a source checks once more.
+
+The two warm-against-cold tests ask the warm tree last in each step, so the next edit comes
+within the poll's 500 ms wait and the check request, not the poll, checks it.
 
 Mutations that make the first test fail: skip the desugar undo; keep the edited source's old
 `file_ranges` entry; merge in arena order; skip the keyword-default undo.
 
-**Numbers.** m1 (`src/cli.bl`, edits in `src/cname.bl` and `src/cli.bl`), 7 runs each,
+**Numbers.** m1 (`src/cli.bl`, edits in `src/cname.bl` and `src/cli.bl`), 5 runs each,
 base and slice 1 alternating, gen1 of each, median in s:
 
 | case | base | slice 1 |
 |---|---|---|
-| cold | 0.414 | 0.416 |
-| warm, body edit of `cname` | 0.418 | 0.306 |
-| warm, body edit of `cli` (the entry) | 0.422 | 0.310 |
-| warm, pub edit of `cname` | 0.419 | 0.306 |
+| cold | 0.407 | 0.412 |
+| warm, body edit of `cname` | 0.411 | 0.305 |
+| warm, body edit of `cli` (the entry) | 0.405 | 0.308 |
+| warm, pub edit of `cname` | 0.406 | 0.301 |
 | warm, no change | 0.010 | 0.010 |
 
-A warm edit gains about 110 ms. Section 6 expected 96 ms. The worker's peak RSS after 20
-rechecks is 411 MB, against 363 MB on base: the pool holds the dead ranges and the journal.
+A warm edit gains about 100 ms. Section 6 expected 96 ms. The worker peak RSS after 20
+rechecks is 389 MB, against 362 MB on base: the pool holds the dead ranges and the journal.
+`task bench-edit-loop`, base and slice 1 alternating, plain and with `BENCH_DAEMON=1`: no
+row of slice 1 has its fastest run slower than the slowest run of base. Builds through the
+daemon do not gain, since a build checks with no source kept.
