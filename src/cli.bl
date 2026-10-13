@@ -3839,6 +3839,12 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
 }
 
 fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+    // Before the daemon is asked, so a bad value builds nothing on either path.
+    let bad_format = format_usage_error(a, report_formats())
+    if bad_format != "" {
+        io.eprintln(bad_format)
+        exit(1)
+    }
     if build_through_daemon(a, "run") {
         run_built(a, run_output_path(a))
         return
@@ -3873,7 +3879,11 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
     let strict_struct_layout_flag = if args_has(a, "strict-struct-layout") { 1 } else { 0 }
     set_strict_struct_layout(strict_struct_layout_flag)
     let targets = args_get_all(a, "target")
-    let mut format_flag = args_get(a, "format")
+    let format_flag = output_format(a)
+    let json_output = if json_requested(a) { 1 } else { 0 }
+    if json_output != 0 {
+        diag_format = 1
+    }
     if debug_flag != 0 && release_flag != 0 {
         io.eprintln("error: --debug and --release are mutually exclusive")
         exit(1)
@@ -3896,8 +3906,11 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, 0, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
+    let rc = do_build(source_path, output_path, c_path, format_flag, debug_flag, release_flag, "", targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
     if rc != 0 {
+        if json_output != 0 {
+            io.println("\{\"status\":\"error\"}")
+        }
         exit(1)
     }
     output_path
@@ -3922,6 +3935,11 @@ fn run_built(a: Args, output_path: Str) {
     let trace_limit_val = args_get(a, "trace-limit")
     if trace_limit_val != "" {
         rest.push("--trace-limit={trace_limit_val}")
+    }
+    if json_requested(a) {
+        // exec drops what stdout still buffers, and the status row must come before the
+        // program's first byte: io.write flushes.
+        io.write("")
     }
     process_exec(output_path, rest)
 }
@@ -3951,9 +3969,14 @@ fn report_manifest_diagnostics(manifest: Str) ! Diag.Report {
 }
 
 fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+    let bad_format = format_usage_error(a, report_formats())
+    if bad_format != "" {
+        io.eprintln(bad_format)
+        exit(1)
+    }
     let source_path = args_positional(a, 0)
     apply_cache_flag(a)
-    let json_output = if args_has(a, "json") { 1 } else { 0 }
+    let json_output = if json_requested(a) { 1 } else { 0 }
     let verbose = if args_has(a, "verbose") { 1 } else { 0 }
     let quiet = if args_has(a, "quiet") { 1 } else { 0 }
     let dots = if verbose == 0 && quiet == 0 && json_output == 0 { 1 } else { 0 }
@@ -3969,7 +3992,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         num_workers = 1
     }
     let targets = args_get_all(a, "target")
-    let format_flag = args_get(a, "format")
+    let format_flag = output_format(a)
     let unit_jobs = unit_jobs_from_args(a)
 
     ensure_deps_resolved()
@@ -3995,9 +4018,20 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         shell_exec("mkdir -p build")
         let c_path = "build/{name}.c"
         let output_path = "build/{name}"
-        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, 0, 0, unit_jobs, args_has(a, "per-module"), None)
+        if json_output != 0 {
+            diag_format = 1
+        }
+        let rc = do_build(source_path, output_path, c_path, format_flag, 1, 0, "", targets, json_output, 0, unit_jobs, args_has(a, "per-module"), None)
         if rc != 0 {
+            if json_output != 0 {
+                io.println("\{\"status\":\"error\"}")
+            }
             exit(1)
+        }
+        if json_output != 0 {
+            // The test binary writes to the same stdout, after the status row: io.write
+            // flushes it.
+            io.write("")
         }
         let mut run_cmd = output_path
         if filter_pattern != "" {
@@ -5833,6 +5867,7 @@ fn cli_parser() -> ArgParser {
     p = command_add_flag(p, "build", "--json", "-j", "JSON output")
     p = command_add_flag(p, "check", "--json", "-j", "JSON output")
     p = command_add_flag(p, "test", "--json", "-j", "JSON output")
+    p = command_add_flag(p, "run", "--json", "-j", "JSON output for the build; the program's output is its own")
     p = command_add_flag(p, "test", "--verbose", "-v", "Show all test output (default: summary only)")
     p = command_add_flag(p, "test", "--quiet", "-q", "Summary only (suppress individual PASS lines)")
     p = command_add_flag(p, "fmt", "--json", "-j", "JSON output")
@@ -5850,6 +5885,8 @@ fn cli_parser() -> ArgParser {
     p = command_add_option(p, "build", "--format", "-f", "Output format: json (same as --json), human (the default) or blink (format the source)")
     p = command_add_option(p, "check", "--format", "-f", "Output format: json (same as --json) or human (the default)")
     p = command_add_option(p, "fmt", "--format", "-f", "Output format: json (same as --json) or human (the default)")
+    p = command_add_option(p, "run", "--format", "-f", "Output format of the build: json (same as --json) or human (the default)")
+    p = command_add_option(p, "test", "--format", "-f", "Output format: json (same as --json) or human (the default)")
 
     p = command_add_option(p, "build", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
     p = command_add_option(p, "run", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
