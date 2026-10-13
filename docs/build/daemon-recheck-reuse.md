@@ -194,7 +194,7 @@ undo the `desugar_sealed_ops_calls` rewrite on kept nodes, or the reused nodes a
 parsed nodes. When dead nodes outnumber live nodes, run cold and start the arena again.
 
 **Builds.** Until the build test in section 5 passes for a slice, a build after a reuse
-check runs a cold check first. This is the cost a build has today.
+check runs a cold check first. Slice 1 now passes it; see "Slice 1 as built".
 
 ## 4. The diagnostics rule
 
@@ -356,8 +356,9 @@ only for its `is_const` flag (`tc_name_is_const_binding`, `:21118`) and for an `
 initializer (`tc_ptr_reads_singleton_alloc`, `:9405`). A module let with no type annotation
 gets its type from its initializer (`tc_infer_global_initializers`, `:23544`). The
 initializer is in the text, so the key catches a change. I did not check whether codegen
-copies const values into other units. A build after a reuse check runs cold (section 3), so
-this does not affect slice 1.
+copies const values into other units. A build after a reuse check compiles the program that
+check made, so this is a question for the unit keys, which the build test compares with a
+cold build.
 
 **(c) Impls and coherence.** Only `parse_program` calls `parse_impl_block`
 (`src/parser.bl:2366`), so an impl is always top level and never inside a body. Its header,
@@ -389,8 +390,9 @@ in section 5 test that this redo is required.
   need them sorted.
 - E's entry in `loaded_inputs.source_first_nodes` and `source_end_nodes` is replaced.
   `unit_sources` (`src/cli.bl:2009`) expects these ranges to increase in load order, and
-  marks the sources untracked when they do not. A build after a reuse check runs cold in
-  slice 1, so no build sees an appended range.
+  takes the ranges sorted by node, as `ir_track_sources` needs, with the load index of
+  each, so a build after a reuse check tracks the sources a unit reads as a cold build
+  does.
 - The `desugar_sealed_ops_calls` undo, and a cold start when dead nodes outnumber live
   nodes.
 
@@ -445,20 +447,28 @@ new range, so a diagnostic in the edited source names its file.
 - a non-source input of the check changed (`checked_non_source_inputs_changed`,
   `src/check_pipeline.bl`): the entry, a probe answer, a config or an `#embed` file.
 
-**Builds.** A build compiles only a program whose load started from an empty node pool
-(`loader_load_was_cold`, `src/compiler.bl`). A load that undid the last one in place gives
-the program the same sources at other node ids, even when it kept no source, as when the
-entry carries a program annotation. So a build after any such check checks again from an
-empty pool (`src/daemon.bl`, the build turn).
+**Builds.** A build compiles the program of the last check when that load started from an
+empty node pool (`loader_load_was_cold`, `src/compiler.bl`) or kept a source. A load that
+kept sources undid the last load in place and parsed each edited source at the end of the
+pool, so the program has the cold sources at other node ids, in another id order. The build
+child calls `loader_keep_sources_for_build`: it keeps no source and records no write, but
+keeps the load order, so `node_load_rank` and `parser_live_ranges` still give load order.
+These places read node order in the build:
+- `cg_decl_spelled_carrier_tids` and `cg_derive_key_table_nodes` walk the pool. They walk
+  `parser_live_ranges()`, which skips the dead ranges and gives the live ones in load order;
+- `unit_sources` (`src/cli.bl`) sorts the source ranges by node for `ir_track_sources`,
+  whose lookup is a binary search, and maps each read source back to its load index for the
+  unit's `uses`. Before, an edited source's range out of order marked every source
+  untracked, so each unit had no `uses` and rebuilt more than a cold build would.
+A load that undid the last one in place but kept no source, as when the entry carries a
+program annotation, is still not compiled: the build checks again from an empty pool
+(`src/daemon.bl`, the build turn).
 A build that finds its inputs changed loads cold at once (`loader_load_cold_next`), so a
 build right after an edit checks once. The idle poll (`daemon_recheck_if_changed`, on the
-500 ms accept wait, and only when inputs changed) keeps no source either. No client waits
-on it, and a build after it uses its check as it is. A check request keeps sources, and no
-poll runs after it, since the inputs did not change. So a build after a reused check pays
-one cold check (about 0.45 s on `src/cli.bl`), however long after the check it comes, until
-the next edit. Slice 3 (build equality) lets the build use the reused check and removes
-that cold check. `BLINK_DEV_DAEMON_KEEP_SOURCES=0` turns kept sources off, to measure what
-they save.
+500 ms accept wait, and only when inputs changed) keeps no source. No client waits on it,
+and that drops the dead ranges at no cost to a request. A build after a check request that
+kept sources checks no more. `BLINK_DEV_DAEMON_KEEP_SOURCES=0` turns kept sources off, to
+measure what they save.
 
 **Reuse counter.** `blink daemon status` reports `reused`: the number of sources kept,
 summed over the worker's checks.
@@ -493,8 +503,13 @@ not kept. `node_pop` below the parsed end stops the parser (`parser_limit_stop`)
   `test_scoped_budget.bl`. Their entry carries a program annotation, which is handed on to
   each later parse by node id, so an edit of the entry changes the key of every source.
 - `tests/test_daemon_build_after_an_idle_recheck_of_an_edit_checks_no_second_time.bl`: a
-  settle hook counts checks. A build after the poll checked an edit checks no more; a build
-  after a check request that kept a source checks once more.
+  settle hook counts checks. A build after the poll checked an edit checks no more, and a
+  build after a check request that kept a source checks no more.
+- `tests/test_daemon_build_after_a_reused_check_checks_no_second_time_and_matches_a_cold_build.bl`:
+  a body edit of a module that loads early, a pub edit of it, a body edit of the entry and
+  of a module that loads late. After each, a check request keeps sources, then a per-module
+  build at default and `--debug` checks no more, and every file in the output dir (C, unit
+  keys, interface text, `.emit-record` but its `inputs` line) equals a cold build's.
 - `tests/test_daemon_recheck_after_edits_to_a_module_that_loads_early_prints_what_a_cold_check_prints.bl`:
   edits to `src/lexer.bl`, the first module of `src/` to load, alone and with `src/cg.bl`.
   The new nodes of the early module come after those of every module that loads after it.
@@ -552,6 +567,8 @@ compares them, or prints one:
 | site | how a warm check keeps the cold order |
 |---|---|
 | `check_embed_targets` (`src/compiler.bl:235`) | walks `parser_live_ranges()`, which are in load order |
+| `cg_decl_spelled_carrier_tids`, `cg_derive_key_table_nodes` (`src/cg_decl.bl`, `src/cg_derive.bl`) | walk `parser_live_ranges()`; the build child keeps the load order |
+| `unit_sources` (`src/cli.bl`) | sorts the ranges by node for the lookup, and maps a read source back to its load index |
 | `tc_conversion_impl_for` (`src/typecheck.bl:609`) | picks the lowest `node_load_rank` |
 | `tc_unclaimed_call_nodes` (`src/typecheck.bl:14190`) | sorts by `node_load_rank` when the order moved |
 | `desugar_sealed_ops_calls`, `require_sealed_ops_rewritten` (`src/typecheck.bl`) | walk `parser_live_ranges()`; the rewrite of one call does not depend on another, only the order of their internal errors did |
@@ -577,8 +594,8 @@ base and slice 1 alternating, gen1 of each, median in s:
 A warm edit gains about 100 ms. Section 6 expected 96 ms. The worker peak RSS after 20
 rechecks is 389 MB, against 362 MB on base: the pool holds the dead ranges and the journal.
 `task bench-edit-loop`, base and slice 1 alternating, plain and with `BENCH_DAEMON=1`: no
-row of slice 1 has its fastest run slower than the slowest run of base. Builds through the
-daemon do not gain, since a build checks with no source kept.
+row of slice 1 has its fastest run slower than the slowest run of base. At the slice 1
+commit, builds through the daemon did not gain, since a build checked with no source kept.
 
 At the build-turn fix, gen1 of base and of slice 1, alternating, two rounds, median of 5 (s):
 
@@ -590,8 +607,25 @@ At the build-turn fix, gen1 of base and of slice 1, alternating, two rounds, med
 | cold `blink check src/cli.bl` (mean of 12) | 0.420 | 0.426 | |
 | cold `blink check src/compiler.bl` (mean of 12) | 0.165 | 0.167 | |
 
-The check-then-build row is the cold check that slice 3 removes. The worker peak RSS
-(VmHWM) after 21 checks of `src/cli.bl` was 384 MB on slice 1 and 441 MB on base in one run
-where the daemon served each check. Two runs where the client checked on its own, and the
+The check-then-build row was the cold check that the build ran after a reused check. The
+worker peak RSS (VmHWM) after 21 checks of `src/cli.bl` was 384 MB on slice 1 and 441
+MB on base in one run where the daemon served each check. Two runs where the client checked on its own, and the
 worker checked only through the idle poll, gave 402 and 349 MB on slice 1 and 363 MB on
 base. The runs overlap; the 389 / 362 MB pair above stays the reference.
+
+When the build compiles the reused check, gen1 of base (`2da6acd0`) and of this change
+(`4593ae64`), daemon, `src/cli.bl`, median of 5 [min-max] (s), two rounds alternating:
+
+| row | base | base, keep off | this change |
+|---|---|---|---|
+| body edit of `cname`, build | 0.857 [0.845-0.863] / 0.867 [0.855-0.882] | 0.855 [0.851-0.866] / 0.990 [0.851-1.113] | 0.863 [0.856-0.880] / 0.853 [0.844-0.869] |
+| body edit, check, build at once | 1.208 [1.183-1.234] / 1.225 [1.189-1.255] | 0.873 [0.856-0.884] / 0.866 [0.857-0.876] | 0.787 [0.767-0.799] / 0.770 [0.765-0.792] |
+
+The check-then-build row is now faster than with kept sources off, since the check keeps
+sources and the build checks no more. In a full `task bench-edit-loop`, base and this
+change, daemon and plain, one round, two rows of this change had their fastest run slower
+than the slowest run of base: the plain `privfn-cname` and `trait-cname` of `src/cli.bl`,
+by 2 and 10 ms. Two more rounds of those rows, alternating, overlap. Over 20 cycles of an
+edit to `src/cname.bl`, a check request and a build of `src/cli.bl` through the daemon, the
+worker ran 41 checks on base and 21 on this change, and its peak RSS (VmHWM) was 463 / 472
+MB on base and 327 / 320 MB on this change, in two runs each.
