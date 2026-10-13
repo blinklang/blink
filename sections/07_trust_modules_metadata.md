@@ -9,7 +9,7 @@ Every foreign function binding carries `@ffi`, an explicit effect row and `@trus
 #### `@ffi` — Declaring the Foreign Binding
 
 ```blink
-@ffi("libsodium", "crypto_secretbox_easy")
+@ffi("sodium", "crypto_secretbox_easy")
 @trusted(audit: "SEC-042")
 fn sodium_secretbox(
     ciphertext: Ptr[U8],
@@ -22,7 +22,7 @@ fn sodium_secretbox(
 
 The `@ffi("library", "symbol")` annotation names the shared library and the symbol to link. The compiler does not type-check the foreign function's body — it does not have one. The signature is the developer's claim about what the foreign function expects and returns.
 
-The library argument is a key of `[native-dependencies]` in `blink.toml`, or one of the two runtime libraries: `"c"` (the C library) and `"m"` (the math library). The runtime libraries need no manifest entry (§9.1.2, *Runtime libraries*).
+The library argument is a key of `[native-dependencies]` in `blink.toml`, or one of the two runtime libraries: `"c"` (the C library) and `"m"` (the math library). The runtime libraries need no manifest entry (§9.1.2, *Runtime libraries*). The argument names a key, never a name in the `libs` list of a key: a symbol from any library of an entry uses that entry's key (§9.1.2, *Keys and link names*).
 
 **One-argument form.** `@ffi("symbol")` binds a symbol from the runtime libraries `c` and `m`. It needs no `[native-dependencies]` entry and adds no link flag. An optional `header:` argument names the C header that declares the symbol, and it has the same meaning in both forms:
 
@@ -39,7 +39,7 @@ Outside `lib/std`, prefer the two-argument form. It names the library that suppl
 Because the compiler cannot analyze foreign code, the author **must** write the effect row of an `@ffi` function. It uses the same `!` syntax as every other function (§4.2). The compiler assumes this row — it cannot verify it. This is the one place in Blink where an effect row is not compiler-proven (§4.5, *Proven and assumed rows*).
 
 ```blink
-@ffi("libcurl", "curl_easy_perform")
+@ffi("curl", "curl_easy_perform")
 @trusted(audit: "NET-007")
 fn curl_perform(handle: Ptr[Void]) -> Int ! Net, IO
 ```
@@ -302,7 +302,7 @@ error[E0801]: FFI function cannot be public
 FFI functions cannot carry `@requires` or `@ensures` annotations. The compiler cannot verify contracts against foreign code. The safe wrapper is where contracts belong:
 
 ```blink
-@ffi("zlib", "compress")
+@ffi("z", "compress")
 @trusted(audit: "COMP-001")
 fn raw_compress(dest: Ptr[U8], dest_len: Ptr[U64], src: Ptr[U8], src_len: U64) -> Int ! IO
 
@@ -811,14 +811,17 @@ A program with no `blink.toml` gets the same check as a manifest with an empty `
 
 ```toml
 [native-dependencies]
-# System library — dynamic link, must be installed on target
-libsodium = { type = "system" }
+# System library: links -lsodium
+sodium = { type = "system" }
 
-# Vendored source — compiled alongside generated C
-libpq = { type = "vendored", path = "vendor/libpq.c" }
+# Vendored source: compiled with the generated C, adds no link flag
+pq = { type = "vendored", path = "vendor/libpq.c" }
 
-# pkg-config lookup (host builds only, cross-compile falls back to vendored)
-zlib = { type = "pkg-config", name = "zlib" }
+# pkg-config lookup: the package is "zlib", the link name is "z"
+z = { type = "pkg-config", pkg-config = "zlib" }
+
+# One dependency with two libraries, in link order
+openssl = { type = "pkg-config", pkg-config = "openssl", libs = ["ssl", "crypto"] }
 ```
 
 **Schema:**
@@ -827,8 +830,33 @@ zlib = { type = "pkg-config", name = "zlib" }
 |-------|------|-------------|
 | `type` | `"system"` \| `"vendored"` \| `"pkg-config"` | How to resolve the library |
 | `path` | `Str` (optional) | Path to vendored C source file(s), relative to project root |
-| `name` | `Str` (optional) | pkg-config package name (defaults to dependency key) |
+| `pkg-config` | `Str` | pkg-config package name. Required when `type = "pkg-config"`. It has no default (E0845) |
+| `libs` | `List[Str]` (optional) | Link names (`-l` names) of the dependency, in link order. Defaults to `[key]` |
 | `link` | `"static"` \| `"dynamic"` (optional) | Override default linking strategy |
+| `headers` | `List[Str]` (optional) | C headers that declare the library's types, for the `@ffi.struct` layout check (§9.1.3, *Static layout assertions*) |
+
+#### Keys and link names
+
+The key is the library's link name (the `-l` name), unless `libs` is given. `sodium = { type = "system" }` links `-lsodium`, the same rule that makes `"c"` and `"m"` the names of libc and libm. When an entry gives `libs`, its link names are the names in `libs`, and the key only names the dependency for `@ffi`.
+
+The link names of an entry reach the linker as follows:
+
+| `type` | Host build | Cross-target build |
+|--------|------------|--------------------|
+| `"system"` | `-l<name>` for each link name | E0821, unless `link = "dynamic"` (*Linking Strategy*) |
+| `"pkg-config"` | the output of the host `pkg-config` for the `pkg-config` package | static `lib<name>.a` for each name in `libs`. With no `libs`, E0821 |
+| `"vendored"` | no link flag: the C source is compiled into the program | no link flag |
+
+- A `type = "system"` entry never runs `pkg-config`. Only a `type = "pkg-config"` entry does.
+- A failed `pkg-config` lookup is a compile error at the entry (E0846). That includes a missing `pkg-config` tool and an unknown package. The compiler does not fall back to `-l<key>`.
+- Every declared entry links, whether or not an `@ffi` names it. The link line takes the entries in manifest order, and the names of one entry in `libs` order. A static linker reads the line once, from left to right, so list a library before the libraries it uses: `libs = ["ssl", "crypto"]`, not `["crypto", "ssl"]`.
+- When two entries give the same link flag, the link line keeps only the last copy. Each library then comes after every library that uses it.
+
+`@ffi` names the key. A symbol in any library of an entry uses that entry's key, so `EVP_MD_CTX_new` from libcrypto binds as `@ffi("openssl", "EVP_MD_CTX_new")`. `@ffi("crypto", ...)` is E0820, and the help names the key that owns `crypto`.
+
+Write a dependency that has more than one library as one entry with `libs`, as `openssl` in the example above. Do not write one entry for each library: the entries then repeat the `pkg-config` lookup, and their link order is spread across the manifest.
+
+A key that starts with `lib` is a compile error (E0844) when the key is a link name: the entry is not `vendored` and gives no `libs`. Library files have the `lib` prefix, and `-l` names do not, so `libsodium = { type = "system" }` would link `-llibsodium`, which does not exist. The diagnostic gives two machine-applicable fixes. The first renames the key and every `@ffi` that names it, in one edit. The second adds `libs` and keeps the key. A name in `libs` can start with `lib`, so a library whose `-l` name starts with `lib` stays possible.
 
 **Diagnostic — missing native dependency:**
 
@@ -836,12 +864,12 @@ zlib = { type = "pkg-config", name = "zlib" }
 error[E0820]: @ffi references undeclared native dependency
  --> crypto/sodium.bl:3:1
   |
-3 | @ffi("libsodium", "crypto_secretbox_easy")
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ library "libsodium" not in [native-dependencies]
+3 | @ffi("sodium", "crypto_secretbox_easy")
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ library "sodium" not in [native-dependencies]
   |
   = help: add to blink.toml:
   = help:   [native-dependencies]
-  = help:   libsodium = { type = "system" }
+  = help:   sodium = { type = "system" }
 ```
 
 When the program has no `blink.toml`, the help shows a complete file to create, not a section to add:
@@ -853,7 +881,62 @@ When the program has no `blink.toml`, the help shows a complete file to create, 
   = help:   version = "0.1.0"
   = help:
   = help:   [native-dependencies]
-  = help:   libsodium = { type = "system" }
+  = help:   sodium = { type = "system" }
+```
+
+**Diagnostic — `@ffi` names a library of another entry:**
+
+```
+error[E0820]: @ffi references undeclared native dependency
+ --> crypto/digest.bl:1:1
+  |
+1 | @ffi("crypto", "EVP_MD_CTX_new")
+  |      ^^^^^^^^ library "crypto" not in [native-dependencies]
+  |
+  = note: "crypto" is in the libs of key "openssl"; @ffi names the key
+  = help: replace "crypto" with "openssl"
+```
+
+**Diagnostic — key with a `lib` prefix:**
+
+```
+error[E0844]: native dependency key is not a link name
+ --> blink.toml:5:1
+  |
+5 | libsodium = { type = "system" }
+  | ^^^^^^^^^ links -llibsodium; a link name has no "lib" prefix
+  |
+  = help: rename the key and every @ffi("libsodium", ...): sodium = { type = "system" }
+  = help: or keep the key: libsodium = { type = "system", libs = ["sodium"] }
+```
+
+**Diagnostic — `pkg-config` entry with no package name:**
+
+```
+error[E0845]: pkg-config dependency has no package name
+ --> blink.toml:6:5
+  |
+6 | z = { type = "pkg-config" }
+  |     ^^^^^^^^^^^^^^^^^^^^^^^ no `pkg-config` field
+  |
+  = note: the package name often differs from the key: zlib links -lz
+  = help: name the package: z = { type = "pkg-config", pkg-config = "<package>" }
+  = help: `pkg-config --list-all` lists the installed packages
+```
+
+The help never uses the key as the package name: the key and the package name are often different words.
+
+**Diagnostic — failed `pkg-config` lookup:**
+
+```
+error[E0846]: pkg-config lookup failed
+ --> blink.toml:6:41
+  |
+6 | z = { type = "pkg-config", pkg-config = "zlib" }
+  |                                         ^^^^^^ pkg-config has no package "zlib"
+  |
+  = help: install the package that provides zlib.pc, or set PKG_CONFIG_PATH
+  = help: or declare the library directly: z = { type = "system" }
 ```
 
 #### Runtime libraries
@@ -912,15 +995,29 @@ The compiler uses different linking strategies for host and cross-compilation ta
 error[E0821]: native dependency unavailable for cross-target
  --> blink.toml:8:1
   |
-8 | libsodium = { type = "system" }
-  | ^^^^^^^^^ "libsodium" is system-only but target is aarch64-linux-gnu
+8 | sodium = { type = "system" }
+  | ^^^^^^ "sodium" is system-only but target is aarch64-linux-gnu
   |
   = note: cross-compilation requires vendored source or static archive
-  = help: provide source: libsodium = { type = "vendored", path = "vendor/sodium.c" }
-  = help: or override linking: libsodium = { type = "system", link = "dynamic" }
+  = help: provide source: sodium = { type = "vendored", path = "vendor/sodium.c" }
+  = help: or override linking: sodium = { type = "system", link = "dynamic" }
 ```
 
-The `link = "dynamic"` override forces dynamic linking for a cross-target. This is an explicit opt-in — the user accepts that the target system must have the library installed.
+The `link = "dynamic"` override forces dynamic linking for a cross-target. This is an explicit opt-in — the user accepts that the target system must have the library installed. The entry then links `-l<name>` for each of its link names.
+
+A `type = "pkg-config"` entry links static `lib<name>.a` for each name in its `libs` on a cross target. The host `pkg-config` describes the host, not the target, so the compiler does not run it for a cross target. An entry with no `libs` is E0821, with or without `link = "dynamic"`: only the user knows which libraries the package needs, and in which order. The error comes before the link, and the help gives the `libs` line to add:
+
+```
+error[E0821]: native dependency unavailable for cross-target
+ --> blink.toml:9:1
+  |
+9 | openssl = { type = "pkg-config", pkg-config = "openssl" }
+  | ^^^^^^^ "openssl" has no libs, and pkg-config does not run for target aarch64-linux-gnu
+  |
+  = note: a cross-target build links static lib<name>.a for each name in libs
+  = help: give the link names in link order: openssl = { type = "pkg-config", pkg-config = "openssl", libs = ["<name>", ...] }
+  = help: `pkg-config --static --libs openssl` lists the -l names the package uses on the host
+```
 
 **Compiler-managed deps** follow the same strategy automatically: the toolchain bundles its own dependencies (for example, sqlite3) and builds them from source during cross-compilation, or dynamically links on the host. Users never interact with this.
 
@@ -945,8 +1042,8 @@ Native Dependencies:
     sqlite3           bundled (3.45.0)    OK
     pthreads          system              OK
   user-managed:
-    libsodium         vendored            vendor/sodium.c    OK
-    zlib              pkg-config          host-only          WARNING (no cross-target source)
+    sodium            vendored            vendor/sodium.c    OK
+    z                 pkg-config          host-only          WARNING (no libs for a cross target)
 ```
 
 ### 9.1.3 FFI Struct Construction & Buffer Bridges
