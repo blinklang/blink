@@ -2187,13 +2187,14 @@ its debug sections, so `grep -a` finds nothing), gcc 16.2.1 and clang
 | compile dir (`DW_AT_comp_dir`) | the cwd of cc | yes | no |
 | unit name and a line-table dir | `-ffile-prefix-map=<work>=<units_dir>` (one unit: the dir of the C path) | yes | no |
 | archive dir | `-I<arc_dir>` (clang names it from the compile dir when it is under it) | yes | no |
-| vendored include dirs | `-I` | yes | no |
+| vendored include dirs | `-I` | yes | only through `__FILE__` in a header (see below) |
 | `/usr/include` | the system headers | yes | no |
 | `app/src/main.bl` | panic and assert text in the C | yes | yes |
 
 The work and hold dirs are mapped away. Panic text and `__FILE__` in
-the C are in the source sha. The vendored include dirs were already in
-the key as `<dir>=<sha>` lines, and `cc --version` covers `/usr/include`.
+the C are in the source sha. The key names each vendored header as a
+`<dir>/<name>=<sha>` line ("Vendored include dirs" below gives how it
+spells the dir), and `cc --version` covers `/usr/include`.
 
 So at `--debug` the key also holds the compile dir, the dir the C is
 named under and the archive dir (`recorded_paths` in `cli.bl`). They
@@ -2219,6 +2220,60 @@ The PCH key holds the archive dir and no compile dir. A PCH built in
 one compile dir and read from another, with the same archive dir, gives
 objects byte-equal to those built without it, with gcc and clang. The
 unit key holds the compile dir, so the object of each tree is its own.
+
+### Vendored include dirs
+
+A native dep's include dir is a `-I` on each unit compile: the dir of
+its source. A manifest `path` that is absolute, or a stdlib dep from the
+install (`share/blink/native/<dep>`), gives an absolute dir. A relative
+`path` gives a relative dir, which names no tree.
+
+The key held each header as `<dir>/<name>=<sha>` with the full dir at
+every level, so two trees whose vendored dirs hold the same bytes at
+other paths never shared an object. Two trees, one cache, an absolute
+dir outside the project, gcc 16.2.1 and clang 23.1.1, per-module and
+one-unit (`strings`, `grep -a` after `objcopy
+--decompress-debug-sections`, `readelf --debug-dump=info,line`):
+
+| header | `--debug` | default, `--release` |
+|---|---|---|
+| declarations only | gcc: no; clang: no | no, objects byte-equal |
+| a `static inline` the unit calls | gcc: yes (line table); clang: no when the dir is under the compile dir | no, objects byte-equal |
+| a `static inline` that returns `__FILE__` | yes | yes: the string holds the dir |
+
+So below `--debug` an object records a vendored dir only through
+`__FILE__` (or `__builtin_FILE`) in one of its headers. With a relative
+dir the objects of both trees were byte-equal at every level.
+
+Below `--debug` each unit compile, the archive header PCH build and the
+one-unit compile take `-fmacro-prefix-map=<dir>/=<name>/` for each
+absolute vendored dir, where `<name>` is the last part of the dir. The
+key spells the dir the same way: `<name>/<header>=<sha>`
+(`build_objcache.header_lines_named`, `vendored_dir_name`,
+`vendored_dir_maps`). So `__FILE__` reads `mylib/mylib.h` in every
+tree, and the second tree compiles no unit. The trailing slash keeps
+the map off a sibling dir whose name starts with the same name. A dir
+with `=` in it keeps its path in the key and gets no map. A relative
+dir is not changed.
+
+At `--debug` the key keeps the full dir and the compile takes no map:
+the line table names the dir, and a debugger needs it to find the
+header. A tree that moves a dep to a byte-equal copy at another path
+compiles its debug units again; below `--debug` it compiles none.
+
+The PCH sees the vendored dirs: `libblink_std.h` includes a stdlib
+dep's header (`sqlite3.h`) under a gate. The PCH key takes the same
+header lines as the unit keys, and the PCH builds with the same maps,
+so a header's `__FILE__` in the PCH reads as in a unit built without
+it. The PCH key also keeps the raw `-I` flags and the archive dir.
+
+Known limits, not changed here: the key covers only the `*.h` files at
+the top of each vendored dir, and not the order of the `-I` flags.
+
+`tests/test_objects_of_two_trees_with_byte_equal_vendored_dirs_at_different_paths_share_one_cache_below_debug.bl`
+and
+`tests/test_debug_object_names_the_vendored_dir_it_was_compiled_with.bl`
+hold this, with gcc and clang.
 
 ### Holds against a concurrent GC
 
