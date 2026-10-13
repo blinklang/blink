@@ -1,0 +1,225 @@
+// A warm daemon check keeps the parsed nodes of each source whose bytes did not change and
+// appends the nodes of an edited source at the end of the pool. Edit a module that loads
+// early, and its new nodes come after those of every module that loads after it, so each
+// pass that reads the program by node id would read it out of load order. Over a run of
+// edits to the compiler's own src/lexer.bl, the first module of src/ to load, and
+// src/cg.bl, a late one, each warm check must print what a cold check of a twin tree
+// prints, byte for byte, in human and JSON form.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    shell_exec("cp -rL {root}/src {tree}/app/src && cp {root}/blink.toml {tree}/app/blink.toml")
+    // What src/ embeds, so the first check is clean and runs the build analyses, which
+    // write to the nodes a recheck keeps.
+    shell_exec("mkdir -p {tree}/app/build {tree}/app/.claude")
+    for p in ["lib", "bootstrap", "CHANGELOG.md", "llms.md", "llms-full.md", "build/gc_unity.c", ".claude/blink-marketplace"] {
+        shell_exec("ln -s {root}/{p} {tree}/app/{p}")
+    }
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE and the module
+// filters; the daemon serves only a client whose env is its own, so both drop them.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 {tree}/build/blink {args}"])
+}
+
+// The pid of the daemon started on src/cli.bl in tree, or -1. The timeout ends a daemon
+// that nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 600 {tree}/build/blink daemon start src/cli.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// A field of `daemon status`, such as "reused", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    let ao = a.out.replace(a_tree, "TREE")
+    let bo = b.out.replace(b_tree, "TREE")
+    let ae = a.err_out.replace(a_tree, "TREE")
+    let be = b.err_out.replace(b_tree, "TREE")
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{ao}{ae}\n-- vs --\n{bo}{be}" }
+    if ao != bo { return "stdout:\n{ao}\n-- vs --\n{bo}" }
+    if ae != be { return "stderr:\n{ae}\n-- vs --\n{be}" }
+    ""
+}
+
+// The check of src/cli.bl in both trees, in both formats; what differs, or "".
+// What the last warm human check printed, and how many checks the warm tree ran: a step
+// whose edit printed nothing would compare two empty answers and prove nothing, and a check
+// the daemon did not serve would compare two cold checks.
+let mut last_warm: Str = ""
+let mut warm_checks: Int = 0
+
+// The warm tree is asked last, so the next edit comes right after a request: the daemon's
+// idle poll waits 500 ms after each request, and a poll that checked the edit first would
+// parse every source and leave the warm check nothing to keep.
+fn compare(warm: Str, cold: Str, step: Str) -> Str {
+    let mut out: List[Str] = []
+    let human = "check src/cli.bl"
+    let json = "check --format json src/cli.bl"
+    let w = blink_in(warm, human)
+    last_warm = "{w.out}{w.err_out}"
+    let d = differ(warm, w, cold, blink_in(cold, human))
+    if d != "" { out.push("after {step}: {human}: {d}") }
+    let cj = blink_in(cold, json)
+    let wj = blink_in(warm, json)
+    warm_checks = warm_checks + 2
+    let dj = differ(warm, wj, cold, cj)
+    if dj != "" { out.push("after {step}: {json}: {dj}") }
+    out.join("\n")
+}
+
+// "" when the last warm check printed each of `needles`, else what it lacked.
+fn printed(step: Str, needles: List[Str]) -> Str {
+    for n in needles {
+        if !last_warm.contains(n) { return "after {step}: the check did not print `{n}`:\n{last_warm}" }
+    }
+    ""
+}
+
+// Replaces `old`, which must occur once, with `new` in src/<file> of both trees.
+fn edit_both(warm: Str, cold: Str, file: Str, old: Str, new: Str) {
+    for t in [warm, cold] {
+        let path = "{t}/app/src/{file}"
+        let before = read_file(path)
+        assert_eq(before.split(old).len(), 2)
+        write_file(path, before.replace(old, new))
+    }
+}
+
+fn append_both(warm: Str, cold: Str, file: Str, text: Str) {
+    for t in [warm, cold] {
+        let path = "{t}/app/src/{file}"
+        write_file(path, "{read_file(path)}{text}")
+    }
+}
+
+fn restore_both(root: Str, warm: Str, cold: Str, file: Str) {
+    for t in [warm, cold] { shell_exec("cp {root}/src/{file} {t}/app/src/{file}") }
+}
+
+let IS_WHITESPACE: Str = "fn is_whitespace(c: Int) -> Int \{\n"
+let CG_RESET: Str = "    reset_unit_state()\n    cg_reg_reset()\n"
+
+// A trait with a default body, an impl, a test block, a call that leaves a keyword argument
+// for typecheck to fill and sealed ops qualified calls, so the passes after the parse write
+// into the early module and make nodes for it.
+let LEXER_PROBE: Str = #"
+
+trait LexerProbe {
+    fn probe_m(self) -> Int
+    fn probe_n(self) -> Int {
+        self.probe_m() + 1
+    }
+}
+
+type LexerProbeBox {
+    n: Int
+}
+
+impl LexerProbe for LexerProbeBox {
+    fn probe_m(self) -> Int {
+        self.n
+    }
+}
+
+fn lexer_probe_pad(s: Str, -- width: Int = 4) -> Int {
+    s.byte_len() + width
+}
+
+fn lexer_probe_user() -> Int {
+    lexer_probe_pad("x") + StrOps.byte_len("ab")
+}
+
+test "the lexer probe box answers its n" {
+    assert_eq(LexerProbeBox { n: 2 }.probe_n(), 3)
+}
+"#
+
+test "a warm recheck after edits to a module that loads early prints what a cold check prints" {
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_early_edit_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_early_edit_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut reused = -1
+    let mut checks = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        problems.push(compare(warm, cold, "the first check"))
+        // src/lexer.bl is the first module of src/ to load and src/cg.bl loads long after it,
+        // so the warm nodes of src/lexer.bl come after those of src/cg.bl.
+        edit_both(warm, cold, "lexer.bl", IS_WHITESPACE, "{IS_WHITESPACE}    let spare_in_lexer = 1\n")
+        edit_both(warm, cold, "cg.bl", CG_RESET, "    let spare_in_cg = 1\n{CG_RESET}")
+        problems.push(compare(warm, cold, "edits to an early and a late module at once"))
+        problems.push(printed("edits to an early and a late module at once", ["spare_in_lexer", "spare_in_cg"]))
+        edit_both(warm, cold, "lexer.bl", "    let spare_in_lexer = 1\n", "    let spare_in_lexer = 2\n")
+        problems.push(compare(warm, cold, "an edit of the early module alone"))
+        edit_both(warm, cold, "cg.bl", "    let spare_in_cg = 1\n", "    let spare_in_cg = 2\n")
+        problems.push(compare(warm, cold, "an edit of the late module alone"))
+        edit_both(warm, cold, "lexer.bl", "    let spare_in_lexer = 2\n", "    let _pairs: List[(Int, Bool)] = [(1, true)].map(fn(p) \{ p \})\n    let _bad: Int = \"x\"\n")
+        problems.push(compare(warm, cold, "a new generic instance, a closure and an error in the early module"))
+        problems.push(printed("a new generic instance, a closure and an error in the early module", ["error", "lexer.bl", "spare_in_cg"]))
+        edit_both(warm, cold, "lexer.bl", "    let _bad: Int = \"x\"\n", "")
+        append_both(warm, cold, "lexer.bl", LEXER_PROBE)
+        problems.push(compare(warm, cold, "a trait, an impl and a keyword default added to the early module"))
+        edit_both(warm, cold, "lexer.bl", "        self.probe_m() + 1\n", "        self.probe_m() + 2\n")
+        problems.push(compare(warm, cold, "a trait default body edit in the early module"))
+        for f in ["lexer.bl", "cg.bl"] { restore_both(root, warm, cold, f) }
+        problems.push(compare(warm, cold, "going back to the first bytes"))
+        reused = served(warm, "reused")
+        checks = served(warm, "checks")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(checks, warm_checks)
+    assert(reused > 0, "the daemon reused no source: reused={reused}")
+}
