@@ -1,0 +1,97 @@
+// `--format` picks the output format of a command (json or human). Formatting Blink source is
+// the job of `blink fmt`, so `build`, `run` and `test` refuse `--format blink` as they refuse an
+// unknown value: the same line on stderr, exit 1, and nothing on stdout, also under `--json`. A
+// second line points at `blink fmt`. The command compiles nothing, so no C file, binary or
+// cache dir shows up. `blink fmt` itself still formats. The commands run in a fresh temporary
+// directory, since the test tree itself sits inside a project. Each command has its own test,
+// so a failure names the command.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+let MESSY = "// lead\ntype P \{   x: Int\n  y: Int }\n\nfn add(a: Int,b: Int) -> Int \{  a+b }\n\nfn main()   \{\n  let p = P \{ x: 1, y: 2 }  // tail\n  io.println(\"\{add(p.x,p.y)}\")\n}\n"
+
+let FORMATTED = "// lead\ntype P \{\n    x: Int\n    y: Int\n}\n\nfn add(a: Int, b: Int) -> Int \{\n    a + b\n}\n\nfn main() \{\n    let p = P \{ x: 1, y: 2 } // tail\n    io.println(\"\{add(p.x, p.y)}\")\n}\n"
+
+let REFUSED = "error: --format must be json or human, got 'blink'"
+
+let HINT = "hint: `blink fmt <file>` formats Blink source; --format sets the output format"
+
+fn scratch() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_format_blink.XXXXXX").out.trim()
+    write_file("{dir}/ok.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/ok_test.bl", "test \"one\" \{\n    assert_eq(1, 1)\n}\n")
+    write_file("{dir}/messy.bl", MESSY)
+    dir
+}
+
+fn run_in(dir: Str, cmd: Str) -> ProcessResult {
+    sh("R=$(pwd); cd {dir} && timeout 120 {cmd}")
+}
+
+// What is wrong with the result of a refused --format blink, or "".
+fn refused(label: Str, r: ProcessResult) -> Str {
+    if r.exit_code != 1 { return "`{label}` exited {r.exit_code}, not 1\nstdout:\n{r.out}\nstderr:\n{r.err_out}" }
+    if r.out != "" { return "`{label}` printed on stdout:\n{r.out}" }
+    if r.err_out != "{REFUSED}\n{HINT}\n" { return "`{label}` stderr is not the refusal and the hint:\n{r.err_out}" }
+    ""
+}
+
+// What is wrong with each way of asking `cmd` for --format blink: alone, and beside --json in
+// either order.
+fn refusals(dir: Str, cmd: Str, args: Str) -> List[Str] {
+    let mut wrong: List[Str] = []
+    for flags in ["--format blink", "--json --format blink", "--format blink --json"] {
+        wrong.push(refused("{cmd} {flags} {args}", run_in(dir, "$R/build/blink {cmd} {flags} {args}")))
+    }
+    wrong
+}
+
+test "build refuses --format blink, with or without --json, and compiles nothing" {
+    let dir = scratch()
+    let mut wrong = refusals(dir, "build", "ok.bl -o out")
+    wrong.push(refused("build ok.bl --format blink --emit c", run_in(dir, "$R/build/blink build ok.bl --format blink --emit c -o out")))
+    let built = sh("ls -A {dir}").out
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(built.trim(), "messy.bl\nok.bl\nok_test.bl")
+}
+
+test "run refuses --format blink, with or without --json, and compiles nothing" {
+    let dir = scratch()
+    let wrong = refusals(dir, "run", "ok.bl")
+    let built = sh("ls -A {dir}").out
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(built.trim(), "messy.bl\nok.bl\nok_test.bl")
+}
+
+test "test refuses --format blink, with or without --json, and compiles nothing" {
+    let dir = scratch()
+    let wrong = refusals(dir, "test", "ok_test.bl")
+    let built = sh("ls -A {dir}").out
+    let _ = sh("rm -rf {dir}")
+    let found: List[Str] = wrong.filter(fn(w) { w != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(built.trim(), "messy.bl\nok.bl\nok_test.bl")
+}
+
+test "blink fmt still formats a file and still reports one that would change" {
+    let dir = scratch()
+    let check = run_in(dir, "$R/build/blink fmt --check messy.bl")
+    let fmt = run_in(dir, "$R/build/blink fmt messy.bl")
+    let after = read_file("{dir}/messy.bl")
+    let again = run_in(dir, "$R/build/blink fmt --check messy.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(check.exit_code, 1)
+    assert_eq(check.out, "would reformat: messy.bl\n1 file(s) would be reformatted\n")
+    assert_eq(fmt.exit_code, 0)
+    assert_eq(fmt.out, "formatted: messy.bl\n")
+    assert_eq(after, FORMATTED)
+    assert_eq(again.exit_code, 0)
+}
