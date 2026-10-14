@@ -152,11 +152,13 @@ effect Env {
     effect Exit       // terminate the process
 }
 
+@handle_all            // a handler implements every primitive operation (§4.7.1)
 effect Time {
     effect Read       // read the wall clock and the monotonic clock
     effect Sleep      // sleep / delay execution
 }
 
+@handle_all
 effect Rand           // generate random numbers (leaf effect, operations in §4.4.7)
 
 effect Crypto {
@@ -386,7 +388,7 @@ effect Net {
 }
 ```
 
-**Handler implementors implement `request()` only.** The verb methods are default implementations that construct a `Request` and delegate. A handler overriding `get` directly (e.g., for caching GET responses) can do so — partial handlers auto-delegate unimplemented operations.
+**Handler implementors implement `request()` only.** The verb methods are derived operations (§4.7.1): each one builds a `Request` and calls `net.request`. When a handler omits a verb, the verb's body runs and its `net.request` call reaches that same handler. A handler can also implement a verb directly (e.g., for caching GET responses) and omit `request`; the omitted `request` then goes to the enclosing handler.
 
 ```blink
 // Minimal mock — one method covers all HTTP verbs
@@ -1145,6 +1147,7 @@ fn serve_once(path: Str) -> Result[(), NetError] ! Net.Listen {
 The `Rand` effect gives random values. It is a leaf effect with three operations:
 
 ```blink
+@handle_all
 effect Rand {
     /// A uniform random integer in the closed interval [lo, hi]. The caller makes sure lo <= hi.
     fn int(lo: Int, hi: Int) -> Int
@@ -1181,12 +1184,13 @@ User code calls only the wrappers. `rand.int(lo, hi)` with two `Int` arguments d
 fn always_low() -> Handler[Rand] {
     handler Rand {
         fn int(lo: Int, hi: Int) -> Int { lo }
-        // float and bytes omitted -- auto-delegate to the enclosing handler (§4.7.1)
+        fn float() -> Float { default.float() }
+        fn bytes(n: Int) -> Bytes { default.bytes(n) }
     }
 }
 ```
 
-Under `with always_low() { ... }`, `rand.int(1..=6)` returns 1.
+Under `with always_low() { ... }`, `rand.int(1..=6)` returns 1. `float` and `bytes` forward on purpose to the enclosing handler. `Rand` is marked `@handle_all`, so a handler that omits them gets the warning `PartialHandler` (§4.7.1).
 
 **Empty range.** `rand.int` panics when its range holds no value: `5..5`, `5..2`, or `5..=4`. The panic message names `rand.int` and the range, for example `rand.int: empty range 5..5`. A range with literal ends gets no compile-time check here; it panics at run time like a computed range.
 
@@ -2111,7 +2115,7 @@ error[InsufficientHandlerCoverage]: insufficient handler coverage
 
 #### Completeness and auto-delegation
 
-Handlers may be **partial** — omitted operations automatically delegate to the dynamically enclosing handler. An omitted operation forwards to the enclosing handler as if `default.op(args)` were written:
+Handlers may be **partial**: a handler can omit operations of its effect. An operation that has no body in the effect declaration is a **primitive operation**. An operation that has a body in the effect declaration is a **derived operation** (the `Net.Connect` verbs in §4.4.1 are derived operations over the primitive `request`). An omitted primitive operation forwards to the enclosing handler as if `default.op(args)` were written:
 
 ```blink
 fn logging_db(label: Str) -> Handler[DB] {
@@ -2126,6 +2130,42 @@ fn logging_db(label: Str) -> Handler[DB] {
 ```
 
 The compiler desugars the above as if `write` and `admin` were defined with `default.write(query)` and `default.admin(query)` respectively. Explicit `default.op(args)` remains available for custom delegation logic (e.g., logging before forwarding, as shown for `read` above).
+
+**Derived operations.** A call to an operation goes to the innermost handler of its effect. If that handler implements the operation, its body answers. If the handler omits a derived operation, the body from the effect declaration runs at the call site, with the same handlers in force. The calls that this body makes through the effect's handle therefore reach the same innermost handler. The body does not run as an operation of that handler, so the rule that a handler does not handle its own operations (below) does not apply to it. Only an omitted primitive operation forwards to the enclosing handler.
+
+```blink
+fn mock_net(responses: Map[Str, Str]) -> Handler[Net.Connect] {
+    handler Net.Connect {
+        fn request(req: Request) -> Result[Response, NetError] {
+            match responses.get(req.url) {
+                Some(body) => Ok(Response { status: 200, body: body, headers: Map.new() })
+                None => Err(NetError.ConnectionRefused("mock: no response for {req.url}"))
+            }
+        }
+        // get, post, ... omitted: their bodies run and call this handler's request
+    }
+}
+
+fn logging_get() -> Handler[Net.Connect] {
+    handler Net.Connect {
+        fn get(url: Str) -> Result[Response, NetError] {
+            io.log("GET {url}")
+            default.get(url)
+        }
+        // request omitted: forwards to the enclosing handler
+    }
+}
+
+fn main() ! Net, IO {
+    with logging_get() {
+        with mock_net(Map.new()) {
+            net.get("https://example.com")   // mock_net answers; logging_get does not run
+        }
+    }
+}
+```
+
+In `main`, the innermost `Net.Connect` handler is `mock_net`. It omits `get`, so the `get` body from the effect declaration runs, and its `net.request(...)` reaches `mock_net`. The program does not search the outer handlers for a `get` clause, so `logging_get` does not run. The innermost handler alone decides what a derived operation does.
 
 `default` is a contextual name, not a keyword. In the body of a handler operation, `default.op(args)` delegates to the handler that this operation's handler was installed over. Elsewhere, including in a closure written inside an operation body, an unshadowed use of `default` is a compile error (E0544). A local binding named `default` shadows it.
 
@@ -2193,7 +2233,7 @@ with handler Audit {
 
 When the operation returns or panics, the handler is in force again. A closure that runs after the operation has returned performs its effects with the handlers in force where it is called (§4.15.4). If no outer handler implements the operation, the call panics, as below.
 
-Auto-delegation means a `Handler[DB]` that only overrides `read` is still a complete `Handler[DB]` — the type system does not distinguish partial from total handlers. At runtime, unhandled operations bubble up to the nearest enclosing handler that implements them.
+Auto-delegation means a `Handler[DB]` that only overrides `read` is still a complete `Handler[DB]` — the type system does not distinguish partial from total handlers. At runtime, an omitted primitive operation goes to the nearest enclosing handler that implements it.
 
 When no enclosing handler implements the operation, the operation panics. This happens when a partial handler omits it and no outer handler implements it, or when a handler calls `default.op(args)` with no outer handler. The compile-time check at the roots (§4.6 *Unhandled user effects*, §2.20) does not rule this out, because it sees a partial handler as a complete one:
 
@@ -2218,6 +2258,50 @@ fn main() {
 ```
 
 The operation never returns and never produces a default value, whatever its return type, `-> Never` included. The panic message contains the operation as a program calls it, `<handle>.<op>` (here `cache.put`; handles are described in §4.4). The rest of the message and the source location are not specified, so a test matches on the operation: `assert_panics(matching: "cache.put") { ... }` (§2.20).
+
+#### Whole-handler effects: `@handle_all`
+
+For most effects, a partial handler is correct code: `logging_db` above changes `read` and keeps the enclosing handler for the rest. For some effects, all operations are views of one resource. The three `Rand` operations read one random stream, and the `Time` operations read one clock. A handler that answers some of these operations and forwards the rest mixes two streams or two clocks. Only the author of the effect knows which kind of effect it is, so the author marks it:
+
+```blink
+@handle_all
+effect Dice {
+    fn roll(sides: Int) -> Int
+    fn coin() -> Bool
+}
+```
+
+`@handle_all` attaches to an effect declaration. It covers the sub-effects of the effect too. The stdlib marks `Rand` (§4.4.7) and `Time` (§4.3), and no other effect.
+
+When a handler expression for a marked effect omits a primitive operation of the effect that it handles, the compiler gives the warning `PartialHandler` (W0545). A derived operation never counts, because the effect declaration supplies its body. A handler for a sub-effect counts only the operations of that sub-effect. The warning is about the handler expression, so it fires in all code, not only in tests:
+
+```blink
+fn always_high() -> Handler[Rand] {
+    handler Rand {
+        fn int(lo: Int, hi: Int) -> Int { hi }
+    }
+}
+```
+
+```
+warning[PartialHandler]: handler for `Rand` does not implement `float`, `bytes`
+ --> dice.bl:2:5
+  |
+2 |     handler Rand {
+  |     ^^^^^^^^^^^^ `Rand` is marked `@handle_all`
+  |
+  = note: omitted operations go to the enclosing handler, which reads a different random stream; in a test that is the runner's seeded stream (§8.10.4), not this handler's
+  = help: implement them, or forward on purpose: `fn float() -> Float { default.float() }`
+```
+
+To silence the warning, write the operation. Any body counts: `default.op(args)` to forward on purpose, a constant, or a panic. An explicit `default.op(args)` gives the same program as the omitted operation. `@allow(PartialHandler)` on a function and the `[lints]` table also work (§4.16.8).
+
+The diagnostic carries a machine-applicable fix. The fix adds each missing operation with the exact signature from the effect declaration and the body `default.op(args)`. It uses the operation signature (`fn int(lo: Int, hi: Int) -> Int`), not the stdlib wrapper (`rand.int(r)`). For the handler above, the fix adds:
+
+```blink
+        fn float() -> Float { default.float() }
+        fn bytes(n: Int) -> Bytes { default.bytes(n) }
+```
 
 #### Generic handler parameters
 

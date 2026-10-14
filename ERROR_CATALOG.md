@@ -254,6 +254,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 |------|------|----------|----------|----------|
 | RawBypassesParam | W0310 | A `Raw[T]` was folded into a `Template[C]`, bypassing query parameterization. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | Contracts | §3b.5 |
 | UnknownMethod | W0501 | Method name resolves to nothing and the receiver's type is not known at the call | Method resolution | §3c.4 |
+| PartialHandler | W0545 | A handler expression for an effect marked `@handle_all` (or one of its sub-effects) omits a primitive operation of the effect it handles. Derived operations (with a body in the effect declaration) never count. Fires in all code. Silenced by writing the operation (any body; `default.op(args)` forwards on purpose), `@allow` or `[lints]`. Machine-applicable fix: adds each missing operation with its exact signature and the body `default.op(args)` | Effects | §4.7.1 |
 | IncompleteStateRestore | W0550 | Speculative lookahead saves some but not all written bindings | Mutation analysis | §4.16 |
 | UnrestoredMutation | W0551 | Function writes module-level state without restoring it in a speculative context | Mutation analysis | §4.16 |
 | ModuleLetMutNeverWritten | W0552 | A module-level `let mut` that no code in its module writes; its readers carry `State` for no reason. Machine-applicable fix: declare it with `let` | Mutation analysis | §4.16.2 |
