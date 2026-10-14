@@ -911,11 +911,16 @@ in `src/typecheck.bl`:
    it is private here (`nr_private_access_here`), and the declaration it names
    (`nr_find_bare_decl`). Every table behind an answer is filled before the walk: each
    module's declarations and privates, the import lists, the symbol modules, the re-exports,
-   the namesake types and the prelude modules. Nothing writes them again until the next check.
-   `resolve_names` drops every answer when it starts to fill them. The module is in the key,
-   as the record is the module's own. Scope is not in the key: an answer is read only after
-   the local check, and the private and declaration answers only for a global or unbound
-   name.
+   the namesake types, the type declarations of `Handler` and `Template` and the prelude
+   modules. Nothing writes them again until the next check. `resolve_names` drops every
+   answer when it starts to fill them. The module is in the key, as the record is the module's
+   own. Scope is not in the key: no answer reads scope state, and the import answer is read
+   only after the local check.
+
+The three calls emit nothing and mark nothing. Each diagnostic, each used-import mark and each
+note of the declaration a node names is made by the caller at each node, from the kept answer.
+The only writes under the calls fill the import index and the selected spellings of a module
+record, both built from that module's import list alone.
 
 The state lives in the module record, not in new module globals.
 
@@ -932,8 +937,14 @@ Tests:
   the daemon keeping sources, and once with `BLINK_DEV_DAEMON_KEEP_SOURCES=0`. It fails when
   the answers are kept from the check before, and when the selected spellings are not built
   again after an import list changes.
+- `tests/test_typecheck_a_spelling_read_twice_in_one_module_is_reported_and_marked_at_each_read.bl`:
+  a name not selected and a private name, each read twice in one module, give two errors in
+  source order; an import read twice is used and an unread one is reported; and a second check
+  in one process after the import list stops selecting a name reports the read. It fails when
+  a diagnostic comes only from the first read, when a call does not mark its import used, and
+  when the selected spellings are not built again after an import list changes.
 
-Both pass on base.
+All three pass on base.
 
 Resolve phase, `perf record --call-graph dwarf` over 20 warm rechecks of `src/cli.bl`, base
 (gen1 of 3c41c677) and tip (gen1 of 60c890dc) in one window each, ms for each check:
