@@ -1314,19 +1314,53 @@ BLINK_RT_FN const char* blink_template_get_str(const blink_template* t, int64_t 
 
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b);
 
+BLINK_RT_FN uint64_t blink_kops_mix_u64(uint64_t x);
 BLINK_RT_FN uint64_t blink_map_hash(const char* key);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN uint64_t blink_map_hash(const char* key) {
+static inline uint64_t blink_map_hash_step(uint64_t h, uint64_t w) {
+    h ^= w;
+    h *= 0x9e3779b97f4a7c15ULL;
+    return h ^ (h >> 32);
+}
+static inline uint64_t blink_map_hash_ld64(const char* p) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    return w;
+}
+static inline uint64_t blink_map_hash_ld32(const char* p) {
+    uint32_t w;
+    memcpy(&w, p, 4);
+    return w;
+}
+/* Forced inline: blink_kops_hash_str runs on every Str-keyed map probe, and cc
+   declined to inline a body this size, which left a second call in each probe. */
+static inline __attribute__((always_inline)) uint64_t blink_map_hash_of(const char* key) {
     /* Bounded by the recorded length, the same bytes blink_str_eq compares, so
-       equal Strs hash equal. A Str holds no NUL, so this is the same value a
-       scan to the terminator gives. */
+       equal Strs hash equal. A byte at a time cost a multiply per byte, and map
+       probes of the compiler's own keys (median 9 bytes) spent more time here
+       than in any other runtime function; so this takes a word at a time. Each
+       load stays inside the n bytes: the last word of a long key overlaps the
+       word before it, and a short key is read as two overlapping halves or
+       three bytes. Given n, those loads still see every byte, and n goes into
+       the start value, so keys of different lengths that load the same words
+       still hash apart. The splitmix finish spreads the result into the low
+       bits that pick a bucket. */
     int64_t n = blink_str_len(key);
-    uint64_t h = 14695981039346656037ULL;
-    for (int64_t i = 0; i < n; i++) {
-        h ^= (uint64_t)(unsigned char)key[i];
-        h *= 1099511628211ULL;
+    uint64_t h = (uint64_t)n * 0x9e3779b97f4a7c15ULL;
+    if (n > 8) {
+        int64_t i = 0;
+        for (; i + 8 < n; i += 8) h = blink_map_hash_step(h, blink_map_hash_ld64(key + i));
+        h = blink_map_hash_step(h, blink_map_hash_ld64(key + n - 8));
+    } else if (n >= 4) {
+        h = blink_map_hash_step(h, (blink_map_hash_ld32(key) << 32) | blink_map_hash_ld32(key + n - 4));
+    } else if (n > 0) {
+        const unsigned char* p = (const unsigned char*)key;
+        h = blink_map_hash_step(h, ((uint64_t)p[0] << 16) | ((uint64_t)p[n >> 1] << 8) | p[n - 1]);
     }
-    return h;
+    return blink_kops_mix_u64(h);
+}
+BLINK_RT_FN uint64_t blink_map_hash(const char* key) {
+    return blink_map_hash_of(key);
 }
 #endif
 
@@ -1648,7 +1682,7 @@ BLINK_RT_FN void blink_map_init_seed(int deterministic) {
 BLINK_RT_FN uint64_t blink_kops_hash_str(const void* k);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN uint64_t blink_kops_hash_str(const void* k) {
-    return blink_map_hash((const char*)k) ^ blink_map_seed;
+    return blink_map_hash_of((const char*)k) ^ blink_map_seed;
 }
 #endif
 
