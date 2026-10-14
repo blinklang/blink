@@ -429,8 +429,8 @@ Spec locations: §3.2 (definition and widening example), §3.3 (divergence), §3
 - Remove the `-> ()` (equivalently `-> Void`) parenthetical in §3.3. It conflicts with the ruling
   that `Void` is FFI-only.
 - Fix the two meanings of W0700, then add the unreachable-code lint after a `Never` construct.
-- Decide which prelude trait impls `Never` gets (for example `Display`, so `.unwrap()` works on
-  `Result[T, Never]`).
+- ~~Decide which prelude trait impls `Never` gets (for example `Display`, so `.unwrap()` works on
+  `Result[T, Never]`).~~ Resolved: [never-prelude-trait-impls.md](never-prelude-trait-impls.md).
 - State in the FFI section whether the compiler trusts a foreign function declared `-> Never`.
 - Define `abort`, or replace it in the §4.4.3 handler example. Handler bodies have no defined
   `abort`.

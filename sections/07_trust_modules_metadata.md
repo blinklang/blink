@@ -2459,7 +2459,7 @@ The table below is the **complete** set of compiler-known type names a program c
 | `List[T]`, `Map[K, V]`, `Set[T]` | prelude | §3.2 | shadows, W1010 |
 | `Option[T]`, `Result[T, E]`, `Ordering` | prelude | §3.2, §3.6 | shadows, W1010 |
 | `Iterator[T]` | prelude | §3c.1 | shadows, W1010 |
-| `Never` | prelude | §3.2 | shadows, W1010 |
+| `Never` | prelude | §3.2, §3.6 | shadows, W1010 |
 | `Bytes`, `StringBuilder` | prelude | §3.2.1, §3.2.3 | shadows, W1010 |
 | `Handle[T]`, `Channel[T]` | prelude | §4.13 | shadows, W1010 |
 | `Template[C]`, `Raw[T]`, `TemplateValue` | prelude | §3b.5 | shadows, W1010 |
