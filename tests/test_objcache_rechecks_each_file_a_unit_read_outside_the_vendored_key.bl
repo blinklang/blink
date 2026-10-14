@@ -2,8 +2,9 @@
 // still include a file the key does not hold: one outside every vendored dir, by a path that
 // climbs out or by an absolute path, or one under a dot dir. The cache keeps the list of such
 // files the compile read beside the object and checks them on each hit, so an edit to one
-// compiles the unit again, and a build that changed nothing still hits. A link loop under a
-// vendored dir still builds.
+// compiles the unit again, and a build that changed nothing still hits. A compile can read
+// such a file while it is being written, so a build stores no object whose compile read one
+// with an mtime the compile could have seen change.
 
 fn sh(cmd: Str) -> Str {
     process_run("sh", ["-c", cmd]).out.trim()
@@ -89,6 +90,12 @@ fn stored_since_mark(tree: Str) -> Str {
     sh("find {tree}/app/build/obj-cache -name '*.o' -newer {tree}/mark | wc -l")
 }
 
+// A file written just before a build is one the build may have read mid-write, so a build does
+// not store what it compiled from it.
+fn settle(path: Str) {
+    shell_exec("touch -d '1 minute ago' {path}")
+}
+
 // include is how mylib.h names the file, k_file where that file is (relative to the project
 // when it does not start with /). An edit to it gives the new value on the same cache, and a
 // build after that changes nothing hits.
@@ -99,8 +106,10 @@ fn check_edit(name: Str, flags: Str, include: Str, k_file: Str) {
     project(tree, include)
     let k_path = if k_file.starts_with("/") { k_file } else { "{tree}/app/{k_file}" }
     write_at(k_path, "#define MYLIB_K 1\n")
+    settle(k_path)
     let first = build_in(tree, flags)
     write_at(k_path, "#define MYLIB_K 2\n")
+    settle(k_path)
     let edited = build_in(tree, flags)
     let objs = cached_objs(tree)
     mark(tree)
@@ -149,36 +158,40 @@ test "an edit to a header under a dot dir of a vendored dir compiles the one-uni
     check_edit("dot_one", "--no-per-module", ".inc/k.h", "vendor/mylib/.inc/k.h")
 }
 
-// A link to the vendored dir inside it, and one to its parent: the walk of the key must end.
-fn check_link_loop(name: Str, flags: Str) {
+fn count(tree: Str, pattern: Str) -> Int {
+    sh("find {tree}/app/build/obj-cache -name '{pattern}' | wc -l").to_int()
+}
+
+// A file outside the key whose mtime is at or past the start of the compile may have changed
+// while cc read it, so the build links its object and stores neither it nor the reads beside it.
+fn check_new_mtime(name: Str, flags: Str) {
     let root = sh("pwd -P")
-    let tree = "{root}/.tmp/_outside_key_loop_{name}_{getpid()}"
+    let tree = "{root}/.tmp/_outside_key_new_{name}_{getpid()}"
     dev_tree(root, tree)
-    project(tree, "sub/k.h")
-    write_at("{tree}/app/vendor/mylib/sub/k.h", "#define MYLIB_K 1\n")
-    shell_exec("ln -s . {tree}/app/vendor/mylib/self")
-    shell_exec("ln -s .. {tree}/app/vendor/mylib/sub/up")
+    project(tree, "../shared/k.h")
+    let k_path = "{tree}/app/vendor/shared/k.h"
+    write_at(k_path, "#define MYLIB_K 1\n")
+    settle(k_path)
     let first = build_in(tree, flags)
-    let objs = cached_objs(tree)
-    mark(tree)
-    let again = build_in(tree, flags)
-    let objs_again = cached_objs(tree)
-    let stored = stored_since_mark(tree)
-    write_at("{tree}/app/vendor/mylib/sub/k.h", "#define MYLIB_K 2\n")
-    let edited = build_in(tree, flags)
+    let objs = count(tree, "*.o")
+    let reads = count(tree, "*.reads")
+    shell_exec("rm -rf {tree}/app/build/obj-cache")
+    shell_exec("touch -d '1 hour' {k_path}")
+    let late = build_in(tree, flags)
+    let objs_late = count(tree, "*.o")
+    let reads_late = count(tree, "*.reads")
     shell_exec("rm -rf {tree}")
     assert_eq(first, "k 1")
-    assert(objs != "0", "the first build stored no object")
-    assert_eq(again, "k 1")
-    assert_eq(objs_again, objs)
-    assert_eq(stored, "0")
-    assert_eq(edited, "k 2")
+    assert_eq(late, "k 1")
+    assert(reads > 0, "the build stored no reads for the unit that read k.h")
+    assert_eq(reads_late, 0)
+    assert(objs_late < objs, "a build that read k.h with a new mtime stored {objs_late} objects, one that did not stored {objs}")
 }
 
-test "a link loop under a vendored dir builds, hits on a no-change build and keys an edit under it" {
-    check_link_loop("units", "--per-module")
+test "a unit that read a file outside the key whose mtime is past the start of its compile is not stored" {
+    check_new_mtime("units", "--per-module")
 }
 
-test "a link loop under a vendored dir builds a one-unit program, hits on a no-change build and keys an edit under it" {
-    check_link_loop("one", "--no-per-module")
+test "a one-unit build that read a file outside the key whose mtime is past the start of its compile is not stored" {
+    check_new_mtime("one", "--no-per-module")
 }

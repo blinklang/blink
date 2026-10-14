@@ -846,12 +846,20 @@ pub type ReadScope {
     skip_real: List[Str]
     own_dirs: List[Str]
     own_files: List[Str]
+    // Wall time in ms when the scope was made, before the compile it serves started.
+    since_ms: Int
 }
+
+// How far before since_ms an mtime still counts as written during the compile: some file
+// systems keep mtimes to the second (FAT to two), and the kernel stamps a write from a clock
+// that runs a tick behind the wall clock.
+let READ_MTIME_SLACK_MS: Int = 2000
 
 // The ReadScope of a compile with vendored include dirs dirs, whose key walk skips skip, that
 // reads its own C and headers under own and the archive headers in arc_dir. A dir that does not
-// exist holds nothing a compile reads.
+// exist holds nothing a compile reads. Made before the compile starts.
 pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str) -> ReadScope ! IO {
+    let since_ms = time.read().to_unix_ms()
     let mut real_dirs: List[Str] = []
     for d in dirs {
         real_dirs.push(without_trailing_slash(build_fs.real_path(d) ?? ""))
@@ -875,7 +883,7 @@ pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str
             None => {}
         }
     }
-    ReadScope { dirs: dirs, real_dirs: real_dirs, skip_real: skip_reals(skip), own_dirs: own_dirs, own_files: own_files }
+    ReadScope { dirs: dirs, real_dirs: real_dirs, skip_real: skip_reals(skip), own_dirs: own_dirs, own_files: own_files, since_ms: since_ms }
 }
 
 // The "<sha256> <where>" lines of the files the depfile names that no key line holds, sorted
@@ -905,6 +913,12 @@ pub fn compile_reads(depfile: Str, scope: ReadScope) -> Option[List[Str]] ! IO {
         match shas.get(p) {
             Some(sha) => lines.push("{sha} {read_where(p, scope.dirs)}")
             None => return None
+        }
+        // Checked after the hash: a write cc saw but the hash missed has an mtime at or past
+        // the start, and a write after this check changes the hash the next hit compares.
+        let mt = file_mtime(p)
+        if mt < 0 || mt >= scope.since_ms - READ_MTIME_SLACK_MS {
+            return None
         }
     }
     Some(unique_strs(sorted_strs(lines)))
