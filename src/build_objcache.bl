@@ -7,6 +7,8 @@
 //   <16-hex>.o                — the cached object
 //   <16-hex>.meta             — "<unix-mtime> <module_key> <src_sha>"
 //   <16-hex>.pch/             — a PCH of the archive header (see pch_key)
+//   <16-hex>.reads            — what the compile read that the key does not hold, whose
+//                               object goes by reads_key (see ReadScope)
 //   tmp/unit.<rand>/          — a build's private C snapshot and staged .o, or a staged PCH
 //   tmp/hold.<rand>/          — a build's links to the objects it links (make_hold_dir)
 //   tmp/stage.<rand>/         — objects on their way into the cache (install_objs, __store)
@@ -159,16 +161,7 @@ pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] !
 
 // header_lines_named without the files at the paths in skip.
 fn lines_under(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[Str]] ! IO {
-    // The walk meets each entry under the realpath of its dir, so a skip path is spelled so
-    // too. One whose dir does not exist yet is under no dir the walk lists.
-    let mut skip_real: List[Str] = []
-    for s in skip {
-        let p = without_trailing_slash(s)
-        match build_fs.real_path(path_dirname(p)) {
-            Some(r) => skip_real.push("{without_trailing_slash(r)}/{path_basename(p)}")
-            None => {}
-        }
-    }
+    let skip_real = skip_reals(skip)
     let mut lines: List[Str] = []
     let mut paths: List[Str] = []
     let mut spelled: List[Str] = []
@@ -196,6 +189,20 @@ fn lines_under(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[S
         i = i + 1
     }
     Some(lines)
+}
+
+// The walk meets each entry under the realpath of its dir, so a skip path is spelled so too.
+// One whose dir does not exist yet is under no dir the walk lists.
+fn skip_reals(skip: List[Str]) -> List[Str] ! IO {
+    let mut skip_real: List[Str] = []
+    for s in skip {
+        let p = without_trailing_slash(s)
+        match build_fs.real_path(path_dirname(p)) {
+            Some(r) => skip_real.push("{without_trailing_slash(r)}/{path_basename(p)}")
+            None => {}
+        }
+    }
+    skip_real
 }
 
 // The path relative to root of each file under {root}/{rel}, past each link, but for a dot
@@ -754,14 +761,24 @@ fn hold_file(from: Str, to: Str) -> Bool ! IO {
 }
 
 // lookup_obj for each key, in order, that answers a name in hold for each hit: what the
-// build links stays there after the GC of another build removes the entry. "" for an empty
-// key, a miss, or no hold dir.
-pub fn hold_objs(keys: List[Str], hold: Str) -> List[Str] ! IO {
+// build links stays there after the GC of another build removes the entry. A key whose
+// compile read files the key does not hold (<key>.reads) hits only when each of them, found
+// through dirs, the vendored include dirs of this build, still has the bytes it had. "" for an
+// empty key, a miss, or no hold dir.
+pub fn hold_objs(keys: List[Str], hold: Str, dirs: List[Str]) -> List[Str] ! IO {
     let mut out: List[Str] = []
     let dir = obj_cache_dir()
+    let mut read_keys: List[Int] = []
     for key in keys {
         let held = "{hold}/{key}.o"
-        if !cache_enabled() || hold == "" || key == "" || !hold_file("{dir}/{key}.o", held) {
+        if !cache_enabled() || hold == "" || key == "" {
+            out.push("")
+            continue
+        }
+        if !hold_file("{dir}/{key}.o", held) {
+            if file_exists("{dir}/{key}.reads") == 1 {
+                read_keys.push(out.len())
+            }
             out.push("")
             continue
         }
@@ -770,24 +787,355 @@ pub fn hold_objs(keys: List[Str], hold: Str) -> List[Str] ! IO {
         // the next GC removes.
         let _ = build_fs.touch("{dir}/{key}.meta")
     }
+    if read_keys.len() == 0 {
+        return out
+    }
+    let mut lists: List[List[Str]] = []
+    let mut paths: List[Str] = []
+    for i in read_keys {
+        let lines = read_lines_file("{dir}/{keys.get(i).unwrap()}.reads")
+        for line in lines {
+            paths.push(read_line_path(line, dirs))
+        }
+        lists.push(lines)
+    }
+    // One hash per file for the whole build: units share most of what they read.
+    let shas = hash_files(unique_strs(paths))
+    let mut j = 0
+    while j < read_keys.len() {
+        let i = read_keys.get(j).unwrap()
+        let lines = lists.get(j).unwrap()
+        j = j + 1
+        if lines.len() == 0 || !reads_match(lines, dirs, shas) { continue }
+        // The object goes by a key of the lines it was found by, so an object stored for
+        // other bytes of those files is never held for these.
+        let key = keys.get(i).unwrap()
+        let obj_key = reads_key(key, lines)
+        let held = "{hold}/{obj_key}.o"
+        if obj_key != "" && hold_file("{dir}/{obj_key}.o", held) {
+            out.set(i, held)
+            let _ = build_fs.touch("{dir}/{obj_key}.meta")
+            let _ = build_fs.touch("{dir}/{key}.meta")
+        }
+    }
     out
 }
+
+// What a compile reads that its key does not hold, beside a cached object.
+//
+// A vendored header can include a file under no vendored dir, by a path that climbs out of
+// one or by an absolute path, or one under a dot entry, which the walk of vendored_key_lines
+// leaves out. Its bytes shape the object and are in no key. So each cached compile writes a
+// depfile (cc -MMD), and the files it names that no key line holds are kept, each with its
+// sha, in <key>.reads as "<sha256> <where>" lines. The object then goes under reads_key, a
+// key of the unit key and those lines, and a build holds it only after each file still
+// hashes to its line. A compile that read no such file stores its object under the unit key,
+// as before.
+//
+// <where> names a file as the hitting build must find it: "v<i>:<rest>" for a path cc spelled
+// under the i-th vendored dir, which another tree that shares the key spells under its own
+// dir; "a:<path>" for an absolute path, and "r:<path>" for one relative to the dir cc runs in.
+
+// The files a compile may read whose bytes another key line already holds: dirs the build
+// itself writes the unit into (own_dirs), the archive headers (own_files), and each file the
+// walk of vendored_key_lines hashes under real_dirs. All are realpaths, as are skip_real, the
+// entries the walk passed over.
+pub type ReadScope {
+    dirs: List[Str]
+    real_dirs: List[Str]
+    skip_real: List[Str]
+    own_dirs: List[Str]
+    own_files: List[Str]
+}
+
+// The ReadScope of a compile with vendored include dirs dirs, whose key walk skips skip, that
+// reads its own C and headers under own and the archive headers in arc_dir. A dir that does not
+// exist holds nothing a compile reads.
+pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str) -> ReadScope ! IO {
+    let mut real_dirs: List[Str] = []
+    for d in dirs {
+        real_dirs.push(without_trailing_slash(build_fs.real_path(d) ?? ""))
+    }
+    let mut own_dirs: List[Str] = []
+    for o in own {
+        match build_fs.real_path(o) {
+            Some(r) => own_dirs.push(without_trailing_slash(r))
+            None => {}
+        }
+    }
+    // A build's private dirs in the cache: the unit's C snapshot, a staged PCH, the PCH it holds.
+    match build_fs.real_path("{obj_cache_dir()}/tmp") {
+        Some(r) => own_dirs.push(without_trailing_slash(r))
+        None => {}
+    }
+    let mut own_files: List[Str] = []
+    for name in ["libblink_std.h", "runtime.h", "libblink_std.h.gch"] {
+        match build_fs.real_path("{arc_dir}/{name}") {
+            Some(r) => own_files.push(r)
+            None => {}
+        }
+    }
+    ReadScope { dirs: dirs, real_dirs: real_dirs, skip_real: skip_reals(skip), own_dirs: own_dirs, own_files: own_files }
+}
+
+// The "<sha256> <where>" lines of the files the depfile names that no key line holds, sorted
+// and each once. None when the depfile cannot be read or a file it names can no longer be
+// hashed: the object must not be stored, since a hit could not check that file.
+pub fn compile_reads(depfile: Str, scope: ReadScope) -> Option[List[Str]] ! IO {
+    if file_exists(depfile) == 0 {
+        return None
+    }
+    let named = match depfile_paths(read_file(depfile)) {
+        Some(p) => p
+        None => return None
+    }
+    let mut kept: List[Str] = []
+    for p in unique_strs(named) {
+        let real = match build_fs.real_path(p) {
+            Some(r) => r
+            None => return None
+        }
+        if !keyed_elsewhere(real, scope) {
+            kept.push(p)
+        }
+    }
+    let shas = hash_files(kept)
+    let mut lines: List[Str] = []
+    for p in kept {
+        match shas.get(p) {
+            Some(sha) => lines.push("{sha} {read_where(p, scope.dirs)}")
+            None => return None
+        }
+    }
+    Some(unique_strs(sorted_strs(lines)))
+}
+
+// Whether another key line holds the bytes of the file at the realpath real. The walk keys a
+// file under a vendored dir by each path it takes, and it takes the file's realpath unless an
+// entry on it is a dot entry or one the walk skips. Membership, not a prefix of the dir: a
+// file under a dot dir lies under the vendored dir too.
+fn keyed_elsewhere(real: Str, scope: ReadScope) -> Bool {
+    if scope.own_files.contains(real) {
+        return true
+    }
+    for d in scope.own_dirs {
+        if real.starts_with("{d}/") {
+            return true
+        }
+    }
+    for d in scope.real_dirs {
+        if d == "" || !real.starts_with("{d}/") { continue }
+        let mut at = d
+        let mut walked = true
+        for part in real.byte_slice(d.byte_len() + 1, real.byte_len()).split("/") {
+            at = "{at}/{part}"
+            if part.starts_with(".") || scope.skip_real.contains(at) {
+                walked = false
+                break
+            }
+        }
+        if walked {
+            return true
+        }
+    }
+    false
+}
+
+// How a compile line names the file cc read at p: under the first of dirs, in -I order, that
+// p is spelled under, else by p itself.
+fn read_where(p: Str, dirs: List[Str]) -> Str {
+    let mut i = 0
+    for d in dirs {
+        let prefix = "{without_trailing_slash(d)}/"
+        if p.starts_with(prefix) {
+            return "v{i}:{p.byte_slice(prefix.byte_len(), p.byte_len())}"
+        }
+        i = i + 1
+    }
+    if p.starts_with("/") { "a:{p}" } else { "r:{p}" }
+}
+
+// The path a "<sha256> <where>" line names in a build whose vendored include dirs are dirs; ""
+// when it names a dir this build does not have.
+fn read_line_path(line: Str, dirs: List[Str]) -> Str {
+    if line.byte_len() < 68 {
+        return ""
+    }
+    let loc = line.byte_slice(65, line.byte_len())
+    if loc.starts_with("a:") || loc.starts_with("r:") {
+        return loc.byte_slice(2, loc.byte_len())
+    }
+    if !loc.starts_with("v") {
+        return ""
+    }
+    let colon = loc.index_of(":") ?? -1
+    if colon < 2 {
+        return ""
+    }
+    let i = loc.byte_slice(1, colon).to_int()
+    if i < 0 || i >= dirs.len() {
+        return ""
+    }
+    "{without_trailing_slash(dirs.get(i).unwrap())}/{loc.byte_slice(colon + 1, loc.byte_len())}"
+}
+
+// Whether each of lines names a file that hashes, in shas, to the sha the line holds.
+fn reads_match(lines: List[Str], dirs: List[Str], shas: Map[Str, Str]) -> Bool {
+    for line in lines {
+        let p = read_line_path(line, dirs)
+        if p == "" || (shas.get(p) ?? "") != line.byte_slice(0, 64) {
+            return false
+        }
+    }
+    true
+}
+
+// The key an object goes by when its compile read the files lines name. "" when a hash fails.
+pub fn reads_key(key: Str, lines: List[Str]) -> Str {
+    let mut all = ["schema:reads-1", "key:{key}"]
+    for l in lines {
+        all.push(l)
+    }
+    digest_of_lines(all)
+}
+
+// The lines of a .reads file; none when it cannot be read.
+fn read_lines_file(path: Str) -> List[Str] ! IO {
+    let mut out: List[Str] = []
+    for line in read_file(path).split("\n") {
+        if line != "" {
+            out.push(line)
+        }
+    }
+    out
+}
+
+// The prerequisites of the rule cc -MMD writes, unescaped: cc writes a space in a path as
+// "\ ", a # as "\#" and a $ as "$$", and breaks a long line with a backslash before the
+// newline. None when the text holds no rule.
+pub fn depfile_paths(text: Str) -> Option[List[Str]] {
+    let mut words: List[Str] = []
+    let mut cur = ""
+    let mut start = 0
+    let n = text.byte_len()
+    let mut i = 0
+    while i < n {
+        let c = text.byte_at(i).to_int()
+        let next = if i + 1 < n { text.byte_at(i + 1).to_int() } else { 0 }
+        // "\ " and "\#"
+        if c == 92 && (next == 32 || next == 35) {
+            cur = "{cur}{text.byte_slice(start, i)}{text.byte_slice(i + 1, i + 2)}"
+            i = i + 2
+            start = i
+            continue
+        }
+        // "$$"
+        if c == 36 && next == 36 {
+            cur = "{cur}{text.byte_slice(start, i)}$"
+            i = i + 2
+            start = i
+            continue
+        }
+        let line_break = c == 92 && next == 10
+        if line_break || c == 32 || c == 9 || c == 10 || c == 13 {
+            cur = "{cur}{text.byte_slice(start, i)}"
+            if cur != "" {
+                words.push(cur)
+                cur = ""
+            }
+            i = i + if line_break { 2 } else { 1 }
+            start = i
+            continue
+        }
+        i = i + 1
+    }
+    cur = "{cur}{text.byte_slice(start, n)}"
+    if cur != "" {
+        words.push(cur)
+    }
+    let mut k = 0
+    while k < words.len() {
+        let w = words.get(k).unwrap()
+        k = k + 1
+        if w.ends_with(":") {
+            let mut deps: List[Str] = []
+            while k < words.len() {
+                deps.push(words.get(k).unwrap())
+                k = k + 1
+            }
+            return Some(deps)
+        }
+    }
+    None
+}
+
+// reads with the lines of more, as a unit that read a PCH read what the PCH read.
+pub fn merge_reads(reads: Option[List[Str]], more: List[Str]) -> Option[List[Str]] {
+    match reads {
+        Some(lines) => {
+            let mut all: List[Str] = []
+            for l in lines { all.push(l) }
+            for l in more { all.push(l) }
+            Some(unique_strs(sorted_strs(all)))
+        }
+        None => None
+    }
+}
+
+// xs in order, each once.
+fn unique_strs(xs: List[Str]) -> List[Str] {
+    let mut seen: Map[Str, Bool] = Map()
+    let mut out: List[Str] = []
+    for x in xs {
+        if !seen.contains_key(x) {
+            seen.insert(x, true)
+            out.push(x)
+        }
+    }
+    out
+}
+
+// Whether a PCH this build holds in hold, built by a compile that read the files the lines in
+// its reads file name, may serve its units: each file, found through dirs, still hashes to its
+// line. Its lines when it may (none without a reads file); None when it may not.
+pub fn held_pch_reads(hold: Str, dirs: List[Str]) -> Option[List[Str]] ! IO {
+    let path = "{hold}/{PCH_READS}"
+    if file_exists(path) == 0 {
+        return Some([])
+    }
+    let lines = read_lines_file(path)
+    let mut paths: List[Str] = []
+    for line in lines {
+        paths.push(read_line_path(line, dirs))
+    }
+    if !reads_match(lines, dirs, hash_files(unique_strs(paths))) {
+        return None
+    }
+    Some(lines)
+}
+
+// The file in a PCH dir that holds the lines of what its build read that its key does not
+// hold, as <key>.reads does for an object. A PCH whose build read nothing more has none, so
+// its dir holds what it held before PCHs kept their reads.
+pub let PCH_READS: Str = "reads"
 
 // store, but installs a link or a copy of obj_path and leaves obj_path in place, so the build
 // links its own bytes whatever the GC of another build removes. Answers whether the object is
 // now in the cache.
-pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO {
+// reads holds what the compile read that the key does not (compile_reads); None stores
+// nothing.
+pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str, reads: Option[List[Str]]) -> Bool ! IO {
     if !cache_enabled() {
         return false
     }
     let stage = make_tmp_dir("stage")
-    let ok = install_at(obj_cache_dir(), stage, key, obj_path, "{time.read().to_unix_secs()} {module_key} {src_sha}\n")
+    let ok = install_reads(obj_cache_dir(), stage, key, obj_path, "{time.read().to_unix_secs()} {module_key} {src_sha}\n", reads)
     let _ = build_fs.remove_tree(stage)
     ok
 }
 
-// install for each (key, obj_path, module_key), in order.
-pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO {
+// install for each (key, obj_path, module_key, reads), in order.
+pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str], reads: List[Option[List[Str]]]) -> List[Bool] ! IO {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -801,11 +1149,37 @@ pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str
     let mut i = 0
     while i < keys.len() {
         let m = module_keys.get(i).unwrap()
-        out.set(i, install_at(dir, stage, keys.get(i).unwrap(), obj_paths.get(i).unwrap(), "{now} {m} \n"))
+        out.set(i, install_reads(dir, stage, keys.get(i).unwrap(), obj_paths.get(i).unwrap(), "{now} {m} \n", reads.get(i).unwrap()))
         i = i + 1
     }
     let _ = build_fs.remove_tree(stage)
     out
+}
+
+// install_at under the key reads names, then <key>.reads, so a build that finds the lines
+// finds the object too. An object whose compile read nothing the key does not hold goes
+// under key.
+fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads: Option[List[Str]]) -> Bool ! IO {
+    let lines = match reads {
+        Some(l) => l
+        None => return false
+    }
+    if lines.len() == 0 {
+        return install_at(dir, stage, key, obj_path, meta)
+    }
+    let obj_key = reads_key(key, lines)
+    if stage == "" || obj_key == "" || !install_at(dir, stage, obj_key, obj_path, meta) {
+        return false
+    }
+    let staging = "{stage}/{key}.reads"
+    write_file(staging, "{lines.join("\n")}\n")
+    if !build_fs.rename(staging, "{dir}/{key}.reads") {
+        fs_remove(staging)
+        return false
+    }
+    // The LRU entry of the lines: the GC removes them with it.
+    write_file("{dir}/{key}.meta", meta)
+    true
 }
 
 // A staged name in stage, so no build links a part-made copy under the key. False with no
@@ -887,7 +1261,8 @@ pub fn pch_key(archive_sha: Str, runtime_sha: Str, cc_id: Str, arc_dir: Str, fla
     if archive_sha == "" || runtime_sha == "" || cc_id == "" {
         return ""
     }
-    let mut lines = ["schema:pch-1", "libblink_std.h={archive_sha}", "runtime.h={runtime_sha}", "cc_id:{cc_id}", "arc_dir:{arc_dir}"]
+    // pch-2: a PCH stored under pch-1 kept no reads, so no build could check one.
+    let mut lines = ["schema:pch-2", "libblink_std.h={archive_sha}", "runtime.h={runtime_sha}", "cc_id:{cc_id}", "arc_dir:{arc_dir}"]
     for f in sorted_strs(flags) {
         lines.push("flag:{f}")
     }
@@ -1059,8 +1434,10 @@ pub fn maybe_gc() ! IO {
         if meta_path != "" {
             let obj_path = meta_path.replace(".meta", ".o")
             let pch_path = meta_path.replace(".meta", ".pch")
-            let freed = tree_bytes(obj_path, 0) + tree_bytes(meta_path, 0) + tree_bytes(pch_path, 0)
+            let reads_path = meta_path.replace(".meta", ".reads")
+            let freed = tree_bytes(obj_path, 0) + tree_bytes(meta_path, 0) + tree_bytes(pch_path, 0) + tree_bytes(reads_path, 0)
             fs_remove(obj_path)
+            fs_remove(reads_path)
             let _ = build_fs.remove_tree(pch_path)
             fs_remove(meta_path)
             total = total - freed
@@ -1100,7 +1477,7 @@ pub fn cmd_clean(older_than: Str) -> Int {
         return 0
     }
     if older_than == "" {
-        shell_exec("rm -rf {dir}/*.o {dir}/*.pch {dir}/*.meta 2>/dev/null")
+        shell_exec("rm -rf {dir}/*.o {dir}/*.pch {dir}/*.reads {dir}/*.meta 2>/dev/null")
         return 0
     }
     // older_than format: "Nd" / "Nh" / "Nm". Convert to find -mtime / -mmin.
@@ -1128,7 +1505,8 @@ pub fn cmd_clean(older_than: Str) -> Int {
         if meta != "" {
             let obj = meta.replace(".meta", ".o")
             let pch = meta.replace(".meta", ".pch")
-            shell_exec("rm -rf {meta} {obj} {pch}")
+            let reads = meta.replace(".meta", ".reads")
+            shell_exec("rm -rf {meta} {obj} {pch} {reads}")
         }
         i = i + 1
     }
