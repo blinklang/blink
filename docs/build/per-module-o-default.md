@@ -284,13 +284,18 @@ A tuple key table is defined in `__main__` and declared (`extern const
 blink_kops`) in `blink.types.h`. The table names the key's tuple type,
 so the typedef of that tuple is in `blink.types.h` too, also when no
 expression of the program has the tuple as its own type (an empty
-`Map[(Int, Str), Int]` in a global, a local or the result of a call).
+`Map[(Int, Str), Int]` in a global, a local, the result of a call or
+the instance of a generic fn).
 `program_carrier_tids` in `src/cg.bl` gives one list: the carriers that
 nodes spell, then the key of each table. The types header writes the
 typedefs of that list. Each unit and module header marks the same list
 as written (`ProgramFacts.carrier_tids`), so no unit writes one of these
 typedefs a second time. The one-unit build writes the same list in its
-typedef walk.
+typedef walk. `ensure_typedef_for` only queues a typedef; the pass that
+calls it must drain the queue into its output. If the types header
+ends with a typedef still queued, the build stops with I0013
+(TypedefQueuedNotWritten), which names each tid, instead of writing a
+header that cc rejects in every unit.
 
 Unit `m` includes `blink.types.h` and no module header. In place of
 the module headers, the unit holds a copy of the declaration of each
