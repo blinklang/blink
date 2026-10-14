@@ -2330,10 +2330,11 @@ the order of the dirs (`build_objcache.vendored_key_lines`):
 
 The whole tree costs more than its top-level headers: the sqlite dir
 holds `sqlite3.c` (9.4 MB) beside `sqlite3.h`, 6.8 ms against 2.4 ms
-with `sha256sum`, once per build. A compile with `-MD` would name the
-files a unit read, but only after the compile, and the key must exist
-before it to find a hit. Nor does it name a file `__has_include` looked
-for and did not find, which a later build can add.
+with `sha256sum`, once per build. The depfile of a compile (below)
+names the files a unit read, but only after the compile, and the key
+must exist before it to find a hit. Nor does it name a file
+`__has_include` looked for and did not find, which a later build can
+add. So the walk stays the key, and the depfile only adds to it.
 
 A dir above the project costs what lies under it: `path = "../mylib.c"`
 gives `-I..`, and a 50 MB file in a sibling dir took a no-change build
@@ -2343,10 +2344,6 @@ A git checkout as a vendored dir, with 3000 doc files and a 30 MB file
 beside its headers, took a no-change build from 52 ms to 129 ms, each
 build a hit. A commit there changes only `.git` and still hits; an edit
 to a doc file misses.
-
-Known limits: a vendored header can name a file outside every vendored
-dir, as `#include "../include/x.h"` or by an absolute path, or a dot
-file in one. Nothing keys such a file.
 
 `tests/test_objcache_key_covers_every_file_in_a_vendored_dir_tree_and_the_include_dir_order.bl`
 holds the tree and the order, per-module and one-unit.
@@ -2361,6 +2358,73 @@ holds the link loop and the dir or file the walk cannot read.
 and
 `tests/test_a_cc_that_rejects_the_macro_prefix_map_keys_and_compiles_vendored_dirs_by_path.bl`
 hold this, with gcc and clang.
+
+#### Files a compile read outside the key
+
+A vendored header can include a file the key does not hold: one outside
+every vendored dir, as `#include "../shared/k.h"` or by an absolute
+path, or one under a dot entry of a vendored dir. Before this, an edit
+to such a file linked the object of the old bytes, per-module and
+one-unit.
+
+Each unit compile, the one-unit compile and the PCH build now take
+`-MMD -MF <file>.d`. After the compile, `build_objcache.compile_reads`
+keeps each file the depfile names that no key line holds, as
+`<sha256> <where>`. `<where>` is `v<i>:<path>` under the i-th vendored
+dir (as the compile line spelled it), `a:<path>` for an absolute path,
+`r:<path>` for a relative one. A file a key line holds is dropped: the
+unit's C and the private dir it compiles in, the archive header,
+`runtime.h` and the gcc PCH, and a file under a vendored dir that the
+walk reaches. The test is membership, not a prefix: a file under a dot
+dir lies under the vendored dir, but the walk does not reach it.
+
+- No such file (each build without one): the object goes under
+  `<key>.o`, as before. No `.reads` file, no extra cost.
+- One or more: the cache writes the lines to `<key>.reads` and the
+  object under a key over the unit key and those lines
+  (`build_objcache.reads_key`), with its `.meta`.
+- A depfile that cannot be read or parsed, or a file it names that no
+  longer resolves or hashes: the object is not stored.
+
+On a lookup, `<key>.o` is a hit as before. Else, with a `<key>.reads`,
+`build_objcache.hold_objs` hashes each file the lines name (each once,
+all units in one batch) and holds the object of those lines only when
+each sha matches. An edit to one of them misses, the compile writes new
+lines, and a build after it hits again. A line that names a vendored dir
+this build does not have misses.
+
+A unit that reads the PCH gets from gcc a depfile that names none of
+the files the PCH read. So the PCH dir holds its own list, `reads`,
+written from the PCH build's depfile before the store, and only when it
+has a line: a PCH dir of a build that read nothing more holds what it
+held before. A build that finds the PCH checks that list in its hold
+before any unit reads it. A PCH whose list no longer matches is dropped
+and built again. Each unit that read the PCH stores the PCH's lines with
+its own. The PCH key went from `schema:pch-1` to `schema:pch-2`: a
+PCH stored before kept no list, so no build could check it. (A unit key
+holds the `blinkc` sha, so a new compiler finds no object stored by an
+old one.) The GC and `blink clean` (with
+`--older-than` too) remove `.reads` files with their objects.
+
+The cost is the hash of what a compile read outside the key, once per
+build. A no-change build of `src/cli.bl` and of `tests/test_sqlite.bl`
+stores no `.reads` file, and took the same time as before (median of 5,
+gen1 of each, in turn: 509 ms against 510 ms, 78 ms against 78 ms).
+
+Known limits:
+
+- `-MMD` leaves out headers in system dirs, so an edit to one is not
+  seen, as before. A vendored header that includes a file by `<...>`
+  from a vendored dir is in the depfile.
+- A file `__has_include` looked for outside the key, and did not find,
+  is in no list: adding it later does not miss.
+- With `-I.` the project's `.bl` sources are in the key (above), so a
+  body edit to one module still compiles every unit of the project.
+
+`tests/test_objcache_rechecks_each_file_a_unit_read_outside_the_vendored_key.bl`
+holds an edit to a file by a path that climbs out, by an absolute path
+and under a dot dir, each per-module and one-unit, and a link loop
+under a vendored dir: each no-change build after stores no new object.
 
 ### Holds against a concurrent GC
 
