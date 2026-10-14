@@ -431,6 +431,7 @@ Spec locations: §3.2 (definition and widening example), §3.3 (divergence), §3
 - Fix the two meanings of W0700, then add the unreachable-code lint after a `Never` construct.
 - ~~Decide which prelude trait impls `Never` gets (for example `Display`, so `.unwrap()` works on
   `Result[T, Never]`).~~ Resolved: [never-prelude-trait-impls.md](never-prelude-trait-impls.md).
-- State in the FFI section whether the compiler trusts a foreign function declared `-> Never`.
+- ~~State in the FFI section whether the compiler trusts a foreign function declared `-> Never`.~~
+  Resolved: [ffi-never-return.md](ffi-never-return.md).
 - Define `abort`, or replace it in the §4.4.3 handler example. Handler bodies have no defined
   `abort`.
