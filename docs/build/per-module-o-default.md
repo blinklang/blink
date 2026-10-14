@@ -2385,6 +2385,20 @@ dir lies under the vendored dir, but the walk does not reach it.
   (`build_objcache.reads_key`), with its `.meta`.
 - A depfile that cannot be read or parsed, or a file it names that no
   longer resolves or hashes: the object is not stored.
+- A listed file whose mtime is at or past the start of the compile, less
+  2 s, or that is gone when the lines are made: the object is linked but
+  neither it nor its lines are stored. cc may have read that file while
+  it was being written, so its sha, taken after the compile, may not be
+  the bytes the object was built from. The start is the wall time when
+  the build made its read scope, before any compile of the build. The
+  2 s cover file systems that keep mtimes to the second (FAT to two)
+  and a kernel that stamps writes from a clock a tick behind. The check
+  comes after the hash, so a write after the check changes the sha the
+  next lookup compares. This is the check ccache makes in direct mode.
+  Only mtime is read: the runtime gives no ctime, so a write that sets
+  an old mtime back (`touch -d`, `cp -p`) during a compile is not seen.
+  What is left is clock skew: a file on a server whose clock runs more
+  than 2 s behind this one.
 
 On a lookup, `<key>.o` is a hit as before. Else, with a `<key>.reads`,
 `build_objcache.hold_objs` hashes each file the lines name (each once,
@@ -2409,13 +2423,20 @@ old one.) The GC and `blink clean` (with
 The cost is the hash of what a compile read outside the key, once per
 build. A no-change build of `src/cli.bl` and of `tests/test_sqlite.bl`
 stores no `.reads` file, and took the same time as before (median of 5,
-gen1 of each, in turn: 509 ms against 510 ms, 78 ms against 78 ms).
+gen1 of each, in turn: 507 ms against 506 ms, 77 ms against 79 ms).
+The git-checkout dir above (3000 docs files and a 30 MB blob) took
+131 ms against 131 ms: the walk of the key is unchanged, so its cost is
+too.
 
 Known limits:
 
 - `-MMD` leaves out headers in system dirs, so an edit to one is not
   seen, as before. A vendored header that includes a file by `<...>`
-  from a vendored dir is in the depfile.
+  from a vendored dir is in the depfile. No dir reaches cc as a system
+  dir: each vendored dir, native dep source dir and the GC include dir
+  goes as `-I` (`resolve_vendored_includes` in `src/cli.bl`), and no
+  code passes `-isystem`, `-idirafter` or `-iquote`. A dir a user puts
+  in `C_INCLUDE_PATH` is a system dir to cc, and is in no key.
 - A file `__has_include` looked for outside the key, and did not find,
   is in no list: adding it later does not miss.
 - With `-I.` the project's `.bl` sources are in the key (above), so a
@@ -2423,8 +2444,13 @@ Known limits:
 
 `tests/test_objcache_rechecks_each_file_a_unit_read_outside_the_vendored_key.bl`
 holds an edit to a file by a path that climbs out, by an absolute path
-and under a dot dir, each per-module and one-unit, and a link loop
-under a vendored dir: each no-change build after stores no new object.
+and under a dot dir, each per-module and one-unit: each no-change build
+after stores no new object. It sets the outside file's mtime back before
+each build, so the store it checks is allowed. Its last two rows set
+that mtime an hour ahead: the build stores no `.reads` file and fewer
+objects than a build of the same project with an old mtime. The link
+loop rows are in
+`tests/test_objcache_vendored_walk_keys_a_link_loop_once_and_leaves_an_unreadable_tree_uncached.bl`.
 
 ### Holds against a concurrent GC
 
