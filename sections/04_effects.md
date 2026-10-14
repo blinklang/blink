@@ -852,7 +852,7 @@ fn run_cli() ! Env.Read, Env.Exit, IO {
 2. The capability system tracks which code can terminate the process
 3. Sandboxed code cannot exit unless granted `! Env.Exit` (or `! Env`)
 
-**A handler cannot return from an op declared `-> Never`.** This rule applies to every effect op declared `-> Never`, not only to `exit`. A handler gives an op its result when the op's `fn` returns (§4.7 *Defining a handler*). No value of type `Never` exists (§3.2), so the handler's `fn` for such an op cannot return. Its body must diverge (§3.3 *Divergence and Body Completeness*). The mock below ends its `exit` with `abort`.
+**A handler cannot return from an op declared `-> Never`.** This rule applies to every effect op declared `-> Never`, not only to `exit`. A handler gives an op its result when the op's `fn` returns (§4.7 *Defining a handler*). No value of type `Never` exists (§3.2), so the handler's `fn` for such an op cannot return. Its body must diverge (§3.3 *Divergence and Body Completeness*). The mock below ends its `exit` with `panic`.
 
 ```blink
 test "CLI exits with 1 on missing args" {
@@ -867,15 +867,21 @@ test "CLI exits with 1 on missing args" {
         fn remove_var(name: Str) { }
         fn exit(code: Int) -> Never {
             exit_code = code
-            abort
+            panic("env.exit({code})")
         }
     }
-    with mock, capture_log([]) {
-        run_cli()
+    assert_panics(matching: "env.exit(1)") {
+        with mock, capture_log([]) {
+            run_cli()
+        }
     }
     assert_eq(exit_code, 1)
 }
 ```
+
+`assert_panics` (§2.20) stops the run: it catches the panic from `exit`, and the test continues after its block. `exit_code` only records the code. It is a captured `let mut`, so it is a shared cell, and the write in `exit` is visible after the block (§4.7 *Defining a handler*). The op writes the cell before it panics, because nothing after the `panic` runs.
+
+**A handler cannot end the `with` body early.** A test observes a diverging op by panicking in it and wrapping the `with` in `assert_panics`. Production code that needs early exit declares an op whose result type carries the outcome (e.g. `Result[T, E]`), and the caller propagates it with `?`.
 
 The mock lists all eight operations at one level. A handler for an effect with children gives every operation of the tree, whichever child declares it (§4.12 *Leaf effects and effect trees*).
 
@@ -1835,7 +1841,9 @@ trait BlockHandler {
 | Assertion failure (`assert`, `assert_eq`, `assert_ne`, `assert_matches`) | `false` |
 | `skip()` in a test block | `false` |
 | Expected panic caught by `assert_panics` (the *armed* boundary, §2.20) | `false` |
-| Uncaught panic (`panic()`, arithmetic overflow, OOB index, OOM, abort) outside a runtime catch frame | *bypasses `exit()` entirely* |
+| Uncaught panic (`panic()`, arithmetic overflow, OOB index) outside a runtime catch frame, or a fatal runtime error | *bypasses `exit()` entirely* |
+
+A **fatal runtime error** is a fault the runtime cannot recover from: OOM, stack overflow, or foreign code that ends the process. The runtime ends the process at once. Nothing unwinds, and no `exit()` or `close()` runs.
 
 The runtime catch frames are the test runner's per-test boundary, the `?`/`return` desugar, and — within a test only — the boundary armed by an `assert_panics` block (§2.20). The set of runtime catch boundaries is **exhaustively defined by this spec and cannot be extended by user code**. Introducing user-level panic recovery (e.g., `recover`, `catch_panic`) would require a separate spec amendment that re-evaluates `exit()`/`close()` semantics under the new boundary set.
 
