@@ -3132,3 +3132,130 @@ initializer names, where the monolith builds and runs; this also still fails on 
 two daemon print gaps of 85653d77 (W1000 on stdout, the lexer escape warning) are closed. The
 corpus passed 2325/2325 in each gate, with the 31 test_daemon_* files whose names say they
 compare with a cold build, check or query.
+
+## Release delta: v0.54.0 to main 37a55b7a
+
+What a Blink user sees from release v0.54.0 (tag 39f906df) to main 37a55b7a. Measured
+2026-10-14, gcc 16.2.1, 24 CPUs, all runs in blink-gates.slice (12-CPU cap). Ratio is main /
+release, so below 1 is faster on main. Each row is a median of 5 with [min-max].
+
+### Binaries
+
+| | release v0.54.0 | main 37a55b7a |
+|---|---|---|
+| seed (gen0) | compilers/gen0-656c9286-gen0-rewrite-selfhost-2 (the v0.54.0 scripts/gen0.sh default) | gen0-rewrite-selfhost-19 (7fa9a4d9) |
+| `task gen1` blink | 1709592de636cdea0eeaadc7c03ea05b3934a584e813445dd7db73aaa3c51b5b (cc, no -O) | d471d0349b26ab4b4ae636293f186b2fec445ea557558c403adbf5efac79802c (-O1 -flto) |
+| blink for rows 1-6, 8 | 39aba6257ee72c13a59f5cd624add78b5bbecdc0c78b282fcff87254c5b4bcd9 | 8b5fe04313bb95376596bea4dc370eaa7b3cf5d822160532300b5e5d74b3ebb4 |
+
+The gen1 binaries are not what a user runs: the v0.54.0 gen1 link has no -O, main's has -O1.
+A release is -O2 (v0.54.0 `build-binaries` uses zig cc -O2; main's install uses `LINK_OPT`,
+-O2). So rows 1-6 and 8 use each tree's gen1 `cli.c` linked again with `cc -O2` against the
+same archive that gen1 linked. As a check, `blink check src/cli.bl` in the release tree took
+4.19 s and 4.17 s with this binary and 4.51 s and 4.53 s with an installed v0.54.0 (zig cc -O2,
+sha256 becaab54a914e7b8...). A first pass with the gen1 binaries was slower per row by 2-29%
+for the release and by -1-17% for main; its data is not committed. Row 7 builds programs, whose speed does not depend on
+the -O of the compiler, so it uses the gen1 binaries.
+
+### Workloads
+
+- A: each tree's own src/cli.bl. These are different inputs: v0.54.0 has 68 files and 78214
+  lines in src/, main 73 files and 91041 lines. Body edits go to `cname.strip_blink` and
+  `typecheck.assignment_types_compatible` (the exit-criteria fn `tc_variant_enum_decl_node`
+  does not exist in v0.54.0). The pub fn goes at the end of cname.bl and of typecheck.bl.
+  The test is tests/test_cname_mono_types.bl, the same file in both trees (6 tests), after the
+  cname body edit.
+- B: main's bench/edit_loop/src (7 files, 211 lines), the same input in both trees. Body edits go
+  to `inventory.restock_amount` and `audit.audit_line`, the pub fn to model.bl, and the test is
+  src/inventory_test.bl after the inventory body edit.
+- C: rows 5 of A and B.
+- D: benchmarks/arena_process_batch.bl (the same file in both trees), a spectral norm (n = 3000,
+  Float math and List[Float] get and set) and a word count (6,000,000 generated words into a
+  Map[Str, Int]). The last two are not in the repo. Each is built at the default (-O1 in both
+  versions) and with `--release` (-O2), and by main also with `--no-per-module`. The three
+  binaries print the same output at each level (timing lines left out).
+
+### Results
+
+| row | workload | release | main | ratio | file |
+|---|---|---|---|---|---|
+| 1 cold build (obj cache removed, std archive kept) | A | 25.477 s [25.256-25.583] | 1.900 s [1.880-1.912] | 0.075 | release_delta_37a55b7a.tsv |
+| | B | 0.158 s [0.152-0.165] | 0.116 s [0.114-0.117] | 0.734 | same |
+| 2 no-change build | A | 16.845 s [16.604-16.909] | 0.439 s [0.429-0.441] | 0.026 | same |
+| | B | 0.078 s [0.076-0.079] | 0.054 s [0.054-0.055] | 0.692 | same |
+| 3 private body edit, then build | A cname | 25.526 s [25.309-25.672] | 0.646 s [0.643-0.650] | 0.025 | same |
+| | A typecheck | 25.476 s [25.263-25.559] | 0.790 s [0.788-0.797] | 0.031 | same |
+| | B inventory | 0.141 s [0.139-0.142] | 0.085 s [0.084-0.088] | 0.603 | same |
+| | B audit | 0.141 s [0.135-0.141] | 0.075 s [0.072-0.075] | 0.532 | same |
+| 4 add a pub fn, then build | A cname | 25.370 s [24.948-25.582] | 0.654 s [0.647-0.730] | 0.026 | same |
+| | A typecheck | 25.455 s [25.165-25.552] | 0.626 s [0.624-0.640] | 0.025 | same |
+| | B model | 0.142 s [0.139-0.147] | 0.077 s [0.076-0.079] | 0.542 | same |
+| 5 `blink test` after a body edit | A | 5.252 s [5.235-5.268] | 0.376 s [0.376-0.731] | 0.072 | same |
+| | B | 0.146 s [0.144-0.149] | 0.079 s [0.078-0.097] | 0.541 | same |
+| 6 `blink check` after a body edit, no daemon | A | 4.177 s [4.175-4.184] | 0.311 s [0.308-0.312] | 0.074 | same |
+| | B | 0.038 s [0.037-0.039] | 0.013 s [0.013-0.014] | 0.342 | same |
+| 6 same, with the daemon | A | not valid (stale answer, see below) | 0.009 s [0.009-0.010] | - | release_delta_daemon_settle1_37a55b7a.tsv |
+| | B | not valid (stale answer) | 0.004 s [0.004-0.004] | - | same |
+| 7 output, -O1, wall / cycles:u | arena_process_batch | 0.178 s [0.177-0.183] / 895 M | 0.127 s [0.126-0.128] / 625 M | 0.713 / 0.699 | release_delta_output_speed_37a55b7a.tsv |
+| | spectral | 1.089 s [1.086-1.091] / 5800 M | 0.804 s [0.804-0.807] / 4332 M | 0.738 / 0.747 | same |
+| | wordfreq | 0.971 s [0.960-0.989] / 5221 M | 0.980 s [0.973-0.982] / 5252 M | 1.009 / 1.006 | same |
+| 7 output, -O2, wall / cycles:u | arena_process_batch | 0.177 s [0.176-0.179] / 886 M | 0.127 s [0.126-0.128] / 626 M | 0.718 / 0.707 | same |
+| | spectral | 1.147 s [1.145-1.149] / 6144 M | 0.807 s [0.807-0.808] / 4332 M | 0.704 / 0.705 | same |
+| | wordfreq | 0.965 s [0.960-0.968] / 5196 M | 0.969 s [0.965-1.020] / 5207 M | 1.004 / 1.002 | same |
+| 8 peak memory, cold build of A: largest process (%M) | A | 781364 KB [780224-812576] | 224148 KB [208704-224548] | 0.287 | release_delta_37a55b7a.tsv |
+| 8 same, whole scope (cgroup memory.peak) | A | 1403628 KB [1393720-1431720] | 749808 KB [730512-751460] | 0.534 | same |
+
+The daemon builds of main have no release row, since the v0.54.0 daemon serves check and query
+only. With the daemon (settle 1 s), main reads: A no-change 0.161 s, body edit 0.405 s (cname)
+and 0.598 s (typecheck), pub fn 0.430 s and 0.442 s, test 0.379 s; B no-change 0.046 s, body
+edit 0.078 s and 0.067 s, pub fn 0.070 s, test 0.079 s
+(release_delta_daemon_settle1_37a55b7a.tsv).
+
+### Method
+
+`blink` runs from a copy of each tree (git ls-files) under build/, with the tree's binary at
+build/blink, runtime.h flattened, gc_unity.c written and the std archive built by that binary
+(`__build-stdlib-archive`). Every run of both binaries sets `BLINK_ROOT` to its tree, because
+v0.54.0 `blink test` outside the source root does not find runtime.h without it. Each case
+waits for a 1-minute load below 3 (each run, below 3 or 120 s), and the reps alternate: odd
+reps run release then main, even reps main then release. An edit puts a fresh nonce line after
+`fn <name>(` (body) or appends a pub fn, then restores the file after the run, as
+scripts/bench_edit_loop.sh does. Each build or test checks the sha256 of its emitted C: the same
+as the warm C after no change, and new after each edit. The highest 1-minute load at the start
+of a run was 2.96. Wall comes from the bash clock around the command, and %M from
+`/usr/bin/time`. The cgroup peak is reset (write to memory.peak through one open fd) just
+before the run; it counts every process in the scope, cc included, and the page cache the
+scope has already charged, which is why B reads 347-416 MB against a %M of 45-48 MB. For A,
+read it as an upper bound, not as the memory one build needs. Row 7 runs each binary 5 times
+under `setarch -R perf stat -e cycles:u,instructions:u`, the order rotating over release,
+main and main `--no-per-module`.
+
+Not measured:
+
+- A cold build with the std archive removed as well. v0.54.0 failed it in this layout: cc
+  found no libblink_std.h (`build/cli.c:2:10: fatal error: libblink_std.h: No such file or
+  directory`). An installed blink of either version ships its archive, so row 1 keeps it.
+- v0.54.0 with the daemon, for check (row 6). Its answer is stale: with a type error put into
+  the edited module (cname.bl for A, inventory.bl for B), its check through the daemon exits 0
+  and prints no error, where a check with no daemon on the same tree exits 1 and prints it. Its
+  status reads `"files":1`: it does not see an edit to an imported module. Main's daemon check
+  exits 1 and prints the error in both workloads.
+
+Notes:
+
+- v0.54.0 gains nothing from its obj cache on an edit of A: the build is one C unit, so any
+  edit changes it and cc runs again (25.5 s, the same as cold). A no-change build skips cc
+  but still runs the whole front end (16.8 s at 790 MB).
+- Main's 0.009 s check with the daemon is the reply time only. The daemon checked the edit in
+  its poll during the 1 s settle before the command. A check made at once after an edit
+  waits for that work; it is not measured here.
+- Main `blink test` does not go through the daemon: the daemon's build count rose by 25
+  (5 build cases x 5 reps), not by the 5 test runs, and the test row reads 107 MB maxRSS
+  with the daemon as without it.
+- A main daemon check falls back to a check with no daemon, and prints nothing to say so,
+  when the client's environment differs from the daemon's by one variable. A first daemon pass
+  had that fault in its harness (a variable exported after the daemon started), so `checks`
+  read 0 and its rows were cold checks; it was run again and only the second pass is shown.
+- Row 7: on wordfreq main runs 7.5% (-O1) and 8.2% (-O2) more instructions:u than v0.54.0
+  for the same cycles. v0.54.0 spectral is slower at -O2 than at -O1 (1.147 s against
+  1.089 s). Main per-module and main `--no-per-module` read within 1.5% of each other on all
+  rows (release_delta_output_speed_37a55b7a.tsv, bin `mainmono`).
