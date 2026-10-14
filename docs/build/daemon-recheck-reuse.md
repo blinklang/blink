@@ -1001,7 +1001,8 @@ a collection. Four cuts, all in `src/typecheck.bl` and `src/diagnostics.bl`:
    call, which reads its own arguments before the outer call reads its next one. Each open call
    holds a map that no other open call holds, so a nested call cannot clear or fill the map of
    the call outside it. A check that panics out of a call leaves that map off the list, which
-   costs one new map and nothing else, so `init_types` does not reset the list.
+   costs one new map and nothing else. `init_types` empties the list, as it resets every
+   typecheck global, so no map outlives its check.
 3. `diag_clear_allows` clears the allow set in place and does not make a new one.
 4. `check_ptr_bearing_struct_in_type_ann` searches for an `@ffi.struct` only when the
    annotation has type arguments or names an `@ffi.struct`. In all other cases the search
