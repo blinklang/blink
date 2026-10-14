@@ -79,6 +79,25 @@ The `Err(e)` arm is required (§3.5 *Exhaustiveness*). Its body `e` has type `Ne
 
 `Never` implements no trait unless the prelude declares an impl of that trait for `Never`. No rule derives an impl for `Never` from the fact that it has no values.
 
+The prelude declares seven impls for `Never`: `Eq`, `Ord`, `Hash`, `Clone`, `Debug`, `Display` and `Serialize`. This list is closed. **Each prelude impl for `Never` holds only methods that take a `Never` argument.** That sentence limits the list. It does not give `Never` an impl of each trait that meets it. So `Never` has no `Deserialize` (`from_json` is static), no `Default`, no `From` or `TryFrom` in either direction, and none of the numeric operator traits. No method of these impls can run, because no value of type `Never` exists. The spec states no `debug()` or `display()` text for `Never`, and the laws that tie `Ord`, `Hash` and `Debug` to `Eq` (§3.6) hold with nothing to check.
+
+These impls let the conditional container impls (§3.6 *Container Equality*, *Debug vs Display*) and user derives reach a type argument that is `Never`:
+
+```blink
+@derive(Eq, Hash, Debug)
+type Key[E] { id: Int, tag: E }
+
+fn first(r: Result[Int, Never]) -> Int {
+    assert_eq(r, r)              // Eq and Debug on Result[Int, Never]
+    let shown = "{r.debug()}"    // "Ok(3)" when r is Ok(3)
+    r.unwrap()                   // unwrap needs Debug on the Err arm
+}
+```
+
+`"{r}"` is still an error (E0523) for every `Result`, because `Result` has no `Display` (§3.6 *Debug vs Display*). `Key[Never]` is a valid type: it is `Eq`, `Hash` and `Debug`, but it has no values.
+
+When a trait bound fails because `Never` has no impl of the trait (E0306), the error adds a `note:` that lists the seven impls above and a `help:`. When the `Never` is a type argument of a value's type, and the type that the `match` rewrite above gives meets the bound, the help names that rewrite. Otherwise the help names the bound that failed. The error never suggests deriving or implementing the trait for `Never`.
+
 `-> Never` does not remove the effect row. `fn exit(code: Int) -> Never` in `Env.Exit` (§4.4.3) still needs `! Env.Exit` at each call.
 
 **Why short names.** `Str` not `String`. `Int` not `Integer`. `Bool` not `Boolean`. These are the most-written types in any codebase. Over thousands of occurrences, 3 characters vs 6 saves real token budget. All types are PascalCase -- no special casing rules, no distinction between "primitive" and "user-defined." `Str` and `UserProfile` follow the same convention.
@@ -2519,7 +2538,7 @@ A function whose result depends on unsorted `Map`/`Set` iteration order is **not
 
 **Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would give equal values different hashes. Round to an integer key instead.
 
-**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). A fieldless enum is `Eq` already (*Container Equality*), so it needs only `@derive(Hash)` or an `impl Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
+**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), `Never` (§3.2), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. `Never` is the only type outside these groups on the list; it gives no container a way in. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). A fieldless enum is `Eq` already (*Container Equality*), so it needs only `@derive(Hash)` or an `impl Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
 
 For pinning the seed (golden-file tests, fixture-driven runners, self-hosting diff stability) and for the `--deterministic` flag and `BLINK_MAP_SEED` environment variable, see §8.10.
 
@@ -3016,8 +3035,9 @@ assert(1.0 / -0.0 < 0.0)        // the sign of zero
 | Str | -- | -- | -- | -- | -- | -- | Y | Y | Y | Y | Y | Y |
 | Char | -- | -- | -- | -- | -- | -- | Y | Y | Y | Y | Y | Y |
 | Bytes | -- | -- | -- | -- | -- | -- | Y | -- | -- | -- | Y | Y |
+| Never | -- | -- | -- | -- | -- | -- | Y | Y | Y | Y | Y | Y |
 
-Y* = total ordering semantics. Unsigned types don't impl `Neg`. `Float` doesn't impl `Hash`. `Bytes` equality is byte-wise; `Bytes` has no `Ord`.
+Y* = total ordering semantics. Unsigned types don't impl `Neg`. `Float` doesn't impl `Hash`. `Bytes` equality is byte-wise; `Bytes` has no `Ord`. `Never` has no values, so no method of its impls can run (§3.2).
 
 `Option`, `Result`, `List`, `Set`, `Map` and tuples implement `Eq` when their parts do — see *Container Equality* below.
 
