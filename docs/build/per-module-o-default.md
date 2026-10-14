@@ -2335,6 +2335,10 @@ files a unit read, but only after the compile, and the key must exist
 before it to find a hit. Nor does it name a file `__has_include` looked
 for and did not find, which a later build can add.
 
+A dir above the project costs what lies under it: `path = "../mylib.c"`
+gives `-I..`, and a 50 MB file in a sibling dir took a no-change build
+from 51 ms to 78 ms, each build a hit.
+
 Known limits: a vendored header can name a file outside every vendored
 dir, as `#include "../include/x.h"` or by an absolute path, or a dot
 file in one. Nothing keys such a file.
