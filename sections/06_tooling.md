@@ -1057,12 +1057,11 @@ test "loader reads DATABASE_URL with fallback" {
 
 test "CLI exits 1 on missing argument" {
     let me = mock_env(Map.new())
-    let result = try {
+    assert_panics(matching: "env.exit(1)") {
         with me.as_handler() {
             run_cli([])
         }
     }
-    assert(result.is_err())  // exit(1) became a panic, not a process termination
 }
 
 test "setup writes log path before reload" {
@@ -1076,7 +1075,7 @@ test "setup writes log path before reload" {
 }
 ```
 
-**Important: `mock_env`'s `Env.exit(code)` op panics with the captured code rather than terminating the process.** The real `env.exit` is non-resumable (returns `Never`) — if a test's CUT calls `env.exit(1)` and the handler auto-delegates, the test runner dies. `mock_env` papers over this in one place so every test author does not write the same five-line `let mut exit_code = -1; handler Env { ... fn exit(...) { exit_code = code; abort } }` shim. Tests that want to *observe* an exit should run the CUT inside a `try { with me.as_handler() { ... } }` and assert on the error.
+**Important: `mock_env`'s `Env.exit(code)` op panics with the captured code rather than terminating the process.** The real `env.exit` is non-resumable (returns `Never`) — if a test's CUT calls `env.exit(1)` and the handler auto-delegates, the test runner dies. `mock_env` papers over this in one place so every test author does not write the same five-line `let mut exit_code = -1; handler Env { ... fn exit(...) { exit_code = code; panic(...) } }` shim (§4.4.3). The panic message contains `env.exit(`, then the code in decimal with no padding, then `)`: `env.exit(1)` for code `1`, `env.exit(-2)` for code `-2`. This text is stable; the rest of the message is not specified. Because the text includes the closing `)`, `matching: "env.exit(1)"` does not match code `10`. Tests that want to *observe* an exit run the CUT inside `assert_panics(matching: "env.exit(<code>)") { with me.as_handler() { ... } }` (§2.20).
 
 **`env.var(name)`** reads from `vars`. **`env.vars()`** returns a copy of `vars`. **`env.set_var(name, value)`** updates `vars` *and* appends `(name, value)` to `writes` — this lets tests distinguish setup-driven environment state from environment writes performed by the CUT. `.set(name, value)` is the test-author-facing mutation that does **not** record into `.writes`; it is for staging environment changes between calls to the CUT. `.writes()` returns a copy: later handler activity does not change it.
 
