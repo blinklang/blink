@@ -2339,6 +2339,11 @@ A dir above the project costs what lies under it: `path = "../mylib.c"`
 gives `-I..`, and a 50 MB file in a sibling dir took a no-change build
 from 51 ms to 78 ms, each build a hit.
 
+A git checkout as a vendored dir, with 3000 doc files and a 30 MB file
+beside its headers, took a no-change build from 52 ms to 129 ms, each
+build a hit. A commit there changes only `.git` and still hits; an edit
+to a doc file misses.
+
 Known limits: a vendored header can name a file outside every vendored
 dir, as `#include "../include/x.h"` or by an absolute path, or a dot
 file in one. Nothing keys such a file.
@@ -2348,6 +2353,8 @@ holds the tree and the order, per-module and one-unit.
 `tests/test_objcache_hits_a_no_change_build_when_a_vendored_dir_holds_the_project.bl`
 holds the `-I.` case: a no-change build stores no new object, and an
 edit under `sub/` still keys.
+`tests/test_objcache_vendored_walk_keys_a_link_loop_once_and_leaves_an_unreadable_tree_uncached.bl`
+holds the link loop and the dir or file the walk cannot read.
 `tests/test_objects_of_two_trees_with_byte_equal_vendored_dirs_at_different_paths_share_one_cache_below_debug.bl`,
 `tests/test_debug_object_names_the_vendored_dir_it_was_compiled_with.bl`,
 `tests/test_vendored_dirs_of_one_name_keep_their_paths_so_trees_that_swap_their_headers_share_no_object.bl`

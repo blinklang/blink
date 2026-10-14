@@ -1,0 +1,165 @@
+// The unit key walks every file under a vendored dir. A dir link back to a dir it lies in
+// names the same files again, so the walk keys each one once and goes on; two links that
+// name each other are no file cc can open. A file the walk cannot hash, or a dir it cannot
+// list, may hold what a unit includes, so the key gives up and the unit is not cached. None
+// of these may stop the build.
+
+import std.process.{ProcessResult}
+import build_objcache.{header_lines_named}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// The names in key lines "<path>=<sha>".
+fn names(lines: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    for l in lines {
+        match l.byte_index_of("=", 0) {
+            Some(i) => out.push(l.byte_slice(0, i))
+            None => out.push(l)
+        }
+    }
+    out
+}
+
+fn loop_dir(name: Str) -> Str {
+    let d = "{sh("pwd -P")}/.tmp/_walk_{name}_{getpid()}"
+    shell_exec("rm -rf {d} && mkdir -p {d}/sub")
+    write_file("{d}/k.h", "#define K 1\n")
+    write_file("{d}/sub/x.h", "#define X 1\n")
+    d
+}
+
+fn as_root() -> Bool {
+    sh("id -u") == "0"
+}
+
+test "a dir link back to a dir it lies in keys each file under it once" {
+    let d = loop_dir("back")
+    shell_exec("ln -s .. {d}/sub/back")
+    let lines = header_lines_named([d], false)
+    shell_exec("rm -rf {d}")
+    match lines {
+        Some(l) => {
+            let n = names(l)
+            assert_eq(n.len(), 2)
+            assert(n.contains("{d}/k.h"), "k.h is not keyed: {n.join(", ")}")
+            assert(n.contains("{d}/sub/x.h"), "sub/x.h is not keyed: {n.join(", ")}")
+        }
+        None => assert(false, "a link loop left the unit uncached")
+    }
+}
+
+test "two links that name each other are no file of the key" {
+    let d = loop_dir("pair")
+    shell_exec("ln -s b {d}/a && ln -s a {d}/b")
+    let lines = header_lines_named([d], false)
+    shell_exec("rm -rf {d}")
+    match lines {
+        Some(l) => assert_eq(names(l).len(), 2)
+        None => assert(false, "a link pair left the unit uncached")
+    }
+}
+
+test "a file under a vendored dir that cannot be read leaves the unit uncached" {
+    if as_root() { return }
+    let d = loop_dir("unreadable_file")
+    shell_exec("chmod 000 {d}/sub/x.h")
+    let lines = header_lines_named([d], false)
+    shell_exec("chmod 644 {d}/sub/x.h && rm -rf {d}")
+    assert(lines.is_none(), "an unreadable file got a key")
+}
+
+test "a dir under a vendored dir that cannot be listed leaves the unit uncached" {
+    if as_root() { return }
+    let d = loop_dir("unreadable_dir")
+    shell_exec("chmod 000 {d}/sub")
+    let lines = header_lines_named([d], false)
+    shell_exec("chmod 755 {d}/sub && rm -rf {d}")
+    assert(lines.is_none(), "an unlisted dir got a key")
+}
+
+// A dev tree with a project over one native dep in vendor/mylib whose mylib.h answers
+// MYLIB_K from sub/k.h, beside a link loop and a link pair.
+fn loop_project(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src {tree}/app/vendor/mylib/sub")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    let app = "{tree}/app"
+    write_file("{app}/blink.toml", "[package]\nname = \"lp\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nmylib = \{ type = \"vendored\", path = \"vendor/mylib/mylib.c\", headers = [\"mylib.h\"] \}\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{app}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{app}/vendor/mylib/mylib.h", [
+        "#pragma once",
+        "#include <stdint.h>",
+        "#include \"sub/k.h\"",
+        "typedef struct mylib_ctx mylib_ctx;",
+        "static inline int64_t mylib_k(void) \{ return MYLIB_K; \}",
+        "",
+    ].join("\n"))
+    write_file("{app}/vendor/mylib/mylib.c", "#include \"mylib.h\"\nint64_t mylib_unused(void) \{ return 0; \}\n")
+    write_file("{app}/vendor/mylib/sub/k.h", "#define MYLIB_K 1\n")
+    shell_exec("ln -s .. {app}/vendor/mylib/sub/back && ln -s b {app}/vendor/mylib/a && ln -s a {app}/vendor/mylib/b")
+    write_file("{app}/src/part.bl", [
+        #"@ffi.opaque(header: "mylib.h", name: "mylib_ctx")"#,
+        #"pub type Ctx"#,
+        #""#,
+        #"@ffi("mylib", "mylib_k", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn k() -> Int ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_file("{app}/src/main.bl", [
+        #"import part.{k}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("k {k()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// Builds on the given cache. The corpus exports BLINK_COMPILER_ARCHIVE and module filters,
+// which make the build one unit, so the run drops them.
+fn built_run(tree: Str, flags: Str) -> Str {
+    let r = process_run("sh", ["-c", "cd {tree}/app && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/cache {tree}/build/blink build src/main.bl -o out/app {flags}"])
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    sh("{tree}/app/out/app")
+}
+
+fn cached_objs(tree: Str) -> Str {
+    sh("find {tree}/cache -name '*.o' | wc -l")
+}
+
+fn check_loop_build(name: Str, flags: Str) {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_walk_loop_build_{name}_{getpid()}"
+    loop_project(root, tree)
+    assert_eq(built_run(tree, flags), "k 1")
+    let first = cached_objs(tree)
+    assert_eq(built_run(tree, flags), "k 1")
+    let second = cached_objs(tree)
+    write_file("{tree}/app/vendor/mylib/sub/k.h", "#define MYLIB_K 2\n")
+    let after = built_run(tree, flags)
+    shell_exec("rm -rf {tree}")
+    assert(first != "0", "a vendored dir with a link loop left the unit uncached")
+    assert_eq(second, first)
+    assert_eq(after, "k 2")
+}
+
+test "a build over a vendored dir with a link loop is cached, hits, and keys an edit under the loop" {
+    check_loop_build("units", "--per-module")
+}
+
+test "a one-unit build over a vendored dir with a link loop is cached, hits, and keys an edit under the loop" {
+    check_loop_build("one", "--no-per-module")
+}
