@@ -10,8 +10,8 @@
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
 import diagnostics.{
-    Diag, diag_ice_at, diag_ice_count, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
-    UNVERIFIED_IR_AT_PRINT,
+    Diag, diag_ice, diag_ice_at, diag_ice_count, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    UNVERIFIED_IR_AT_PRINT, TYPEDEF_QUEUED_NOT_WRITTEN,
 }
 import cname.{
     c_archive_header_guard, c_layer_archive_header_guard, c_layer_archive_header_name, c_module_header_guard, c_module_init_globals_name,
@@ -26,7 +26,7 @@ import parser.{
 }
 import layout.{
     LayoutTypedefMarks, Position, layout_of, layout_reset, layout_start_from, layout_typedef_marks, set_current_inst,
-    layout_take_typedefs,
+    layout_take_typedefs, layout_queued_typedef_tids,
 }
 import cg_print.{
     print_ev_default_decl, print_ev_storage, print_fn, print_fn_decl, print_guard_open, print_include, print_main_shim, print_reset, print_scope_restore_support,
@@ -42,12 +42,12 @@ import cg_decl.{
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_foreign_wrapper,
     cg_decl_emit_impl_method_decl,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
-    cg_decl_emit_prologue, cg_decl_emit_typedefs, cg_decl_emit_typedefs_over, cg_decl_has_deferred_global, cg_decl_reset,
+    cg_decl_emit_prologue, cg_decl_emit_typedefs_over, cg_decl_has_deferred_global, cg_decl_reset,
     cg_decl_spelled_carrier_tids, CgDeclMarks, cg_decl_marks, cg_decl_start_from,
 }
 import cg_derive.{
-    cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables, cg_derive_key_table_names,
-    cg_derive_key_table_nodes, cg_derive_reset,
+    cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables, cg_derive_key_table_keys,
+    cg_derive_key_table_names, cg_derive_key_table_nodes, cg_derive_reset,
 }
 import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify}
 import mono.{instances, named_instance_rows, program_spawns, set_named_instance_rows}
@@ -333,10 +333,10 @@ fn globals_in_scope(cfg: CgConfig, module_key: Str, declare_only: Bool) -> List[
 // signature names them again. Answers the globals that could not take their value on the
 // definition line, in declaration order, for the entry point to assign before anything
 // else runs; a header declares no definition and so never has any to answer.
-fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool) -> List[Int] ! Diag.Report {
+fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool, key_table_nodes: List[Int]) -> List[Int] ! Diag.Report {
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, defines_runtime_storage(cfg), false, header_guard, self_header, false)
     if links_compiler_archive(cfg) { print_include(c_layer_archive_header_name()) }
-    cg_decl_emit_typedefs()
+    cg_decl_emit_typedefs_over(program_carrier_tids(key_table_nodes))
     if define_ev {
         emit_ev(cfg)
     } else if cfg.archive_over_std != 0 {
@@ -842,7 +842,8 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     cg_promote_set_trace(cfg.trace_codegen != 0)
     let shared = cfg.archive_build_mode != 0
-    let deferred = emit_declarations(cfg, "", "", true, false, shared)
+    let key_table_nodes = cg_derive_key_table_nodes()
+    let deferred = emit_declarations(cfg, "", "", true, false, shared, key_table_nodes)
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
     // Pre-scan for the async.scope guard (see unit_uses_async_scope): an archive monolith
@@ -853,7 +854,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
-    emit_definitions(cfg, "", shared, cg_derive_key_table_nodes())
+    emit_definitions(cfg, "", shared, key_table_nodes)
     // An archive monolith has no entry point: the user TU that links against it owns
     // main(), so neither the test-body table nor the main shim belongs here.
     let init_fns = emit_global_init_fn(cfg, program, deferred)
@@ -871,7 +872,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
 pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     let guard = if cfg.archive_over_std != 0 { c_layer_archive_header_guard() } else { c_archive_header_guard() }
-    let _ = emit_declarations(cfg, guard, "", false, true, true)
+    let _ = emit_declarations(cfg, guard, "", false, true, true, cg_derive_key_table_nodes())
     print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, archive_init_globals_name(cfg), [], false)
     cg_decl_emit_epilogue(guard)
     print_take()
@@ -886,11 +887,25 @@ pub fn generate_types_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag
     begin_unit(program)
     let guard = c_program_types_header_guard()
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, guard, "", false)
-    cg_decl_emit_typedefs()
+    cg_decl_emit_typedefs_over(program_carrier_tids(cg_derive_key_table_nodes()))
     cg_decl_emit_ev_typedef()
     cg_derive_emit_decls(derived_decls_declared_everywhere())
+    types_header_check_queue_drained()
     cg_decl_emit_epilogue(guard)
     print_take()
+}
+
+// A pass that only queues a typedef leaves it out of the header every unit includes, and
+// cc then rejects each unit that names it, far from the cause.
+fn types_header_check_queue_drained() ! Diag.Report {
+    let queued = layout_queued_typedef_tids()
+    if queued.len() == 0 { return }
+    let mut names: List[Str] = []
+    for t in queued { names.push("tid {t} ({layout_of(t, Position.Local).c_spelling})") }
+    let listed = names.join(", ")
+    diag_ice("TypedefQueuedNotWritten", TYPEDEF_QUEUED_NOT_WRITTEN,
+        "the types header queued and never wrote: {listed}", 0, 0,
+        "the pass that called ensure_typedef_for must drain layout_take_typedefs into the header")
 }
 
 // One module's two headers for the per-module mode. `surface` declares what other modules
@@ -921,7 +936,19 @@ pub fn program_facts(program: Int, cfg: CgConfig) -> ProgramFacts ! Diag.Report 
     begin_unit(program)
     let init_fns = module_init_fn_names(cfg)
     begin_unit(program)
-    ProgramFacts { key_table_nodes: cg_derive_key_table_nodes(), carrier_tids: cg_decl_spelled_carrier_tids(), entry_init_fns: init_fns }
+    let key_table_nodes = cg_derive_key_table_nodes()
+    ProgramFacts { key_table_nodes: key_table_nodes, carrier_tids: program_carrier_tids(key_table_nodes), entry_init_fns: init_fns }
+}
+
+// The carriers whose typedefs the declarations every unit shares hold: each one a node
+// spells, then the key of each table. A key written only inside a Map or Set type is no
+// node's own type, yet its table names it, and the unit that defines the table reads the
+// key's typedef from those shared declarations. The types header writes this list and
+// every other unit marks it written, so both read this one list.
+fn program_carrier_tids(key_table_nodes: List[Int]) -> List[Int] {
+    let mut out = cg_decl_spelled_carrier_tids()
+    for key in cg_derive_key_table_keys(key_table_nodes) { out.push(key) }
+    out
 }
 
 pub fn generate_module_headers(program: Int, module_key: Str, cfg: CgConfig) -> ModuleHeaders ! Codegen, Diag.Report {

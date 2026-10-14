@@ -1,0 +1,79 @@
+import std.fs
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types}
+import layout.{ensure_typedef_for, layout_queued_typedef_tids, layout_take_typedefs, layout_reset, layout_typedef_marks, layout_start_from}
+import parser.{node_count}
+import compiler.{compile_to_program}
+
+fn probe_src() -> Str {
+    #"fn main() {
+    let a: Option[Str] = None
+    let b: (Int, Option[Str]) = (1, None)
+    let c: Option[Int] = Some(1)
+    assert(a.is_none() && b.0 == 1 && c.is_some())
+}
+"#
+}
+
+// The probe is deleted before any assertion so a red row never leaks the file.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_queued_typedef_tids_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < node_count() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn expect_tid(m: Map[Str, Int], key: Str) -> Int {
+    let tid = m.get(key) ?? -1
+    assert(tid != -1)
+    tid
+}
+
+// A pass that must have drained the queue reads these to name what it left behind, so each
+// block a tuple queues for its members is named too, in the order the blocks would print.
+test "each queued block is named by its tid, members first" {
+    let m = harvest_type_tids()
+    let pair = expect_tid(m, "(Int, Option[Str])")
+    let _ = ensure_typedef_for(pair)
+    let queued = layout_queued_typedef_tids()
+    assert_eq(queued.len(), 2)
+    assert_eq(tc_type_str(queued[0]), "Option[Str]")
+    assert_eq(queued[1], pair)
+    assert_eq(layout_take_typedefs().len(), 2)
+}
+
+test "a drained queue names no tid" {
+    let m = harvest_type_tids()
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Int]"))
+    assert_eq(layout_queued_typedef_tids().len(), 1)
+    let _ = layout_take_typedefs()
+    assert_eq(layout_queued_typedef_tids().len(), 0)
+}
+
+test "a reset queue names no tid" {
+    let m = harvest_type_tids()
+    let _ = ensure_typedef_for(expect_tid(m, "Option[Int]"))
+    layout_reset()
+    assert_eq(layout_queued_typedef_tids().len(), 0)
+}
+
+// A module header starts from the marks of one walk, and a block still queued there is one
+// the header has to write, so the start names it as the walk did.
+test "a start from marks names the blocks the walk left queued" {
+    let m = harvest_type_tids()
+    let tid = expect_tid(m, "Option[Int]")
+    let _ = ensure_typedef_for(tid)
+    let marks = layout_typedef_marks()
+    layout_reset()
+    layout_start_from(marks)
+    assert_eq(layout_queued_typedef_tids(), [tid])
+}

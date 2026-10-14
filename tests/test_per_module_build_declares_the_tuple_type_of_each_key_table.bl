@@ -1,0 +1,243 @@
+// The entry unit defines every tuple key table, and the table names the key's tuple type.
+// That type has to reach every unit through the types header even when no expression of the
+// program has the tuple as its own type: an empty map in a global, in a local, or behind a
+// call, or in a generic fn's instance is keyed on a pair that nothing else spells. Each row builds one program per-module
+// and as one unit, and the two must print the same thing.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+let MAIN_CALLS_TAG: Str = [
+    "import base.\{tag\}",
+    "",
+    "fn main() \{",
+    "    io.println(tag(\"main\"))",
+    "\}",
+    "",
+].join("\n")
+
+fn dev_tree(root: Str, tree: Str, files: Map[Str, Str]) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"key_types_app\"\nversion = \"0.1.0\"\n")
+    for name in files.keys() {
+        write_file("{tree}/app/src/{name}", files.get(name) ?? "")
+    }
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes
+// --per-module build one unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_PER_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"])
+}
+
+// Builds `files` both ways and checks each build runs and prints `want`.
+fn check_both_builds(label: Str, files: Map[Str, Str], want: Str) {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_per_module_key_types_{label}_{getpid()}"
+    dev_tree(root, tree, files)
+    let pm = blink_in(tree, "build app/src/main.bl -o {tree}/out/pm --per-module")
+    let one = blink_in(tree, "build app/src/main.bl -o {tree}/out/one --no-per-module")
+    let pm_out = sh("{tree}/out/pm 2>&1")
+    let one_out = sh("{tree}/out/one 2>&1")
+    shell_exec("rm -rf {tree}")
+    assert(pm.exit_code == 0, "{label}: per-module build failed: {pm.out}{pm.err_out}")
+    assert(one.exit_code == 0, "{label}: one-unit build failed: {one.out}{one.err_out}")
+    assert_eq(one_out, want)
+    assert_eq(pm_out, one_out)
+}
+
+fn with_main(base: Str) -> Map[Str, Str] {
+    let mut files: Map[Str, Str] = Map()
+    files.insert("base.bl", base)
+    files.insert("main.bl", MAIN_CALLS_TAG)
+    files
+}
+
+test "an empty tuple-keyed map in a global builds per-module" {
+    check_both_builds("tuple_key_global", with_main([
+        "pub let NAMES: Map[(Int, Str), Int] = Map()",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{NAMES.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "an empty set of tuples in a global builds per-module" {
+    check_both_builds("tuple_set_global", with_main([
+        "pub let SEEN: Set[(Str, Int)] = Set()",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{SEEN.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "a map global keyed on a derived struct builds per-module" {
+    check_both_builds("struct_key_global", with_main([
+        "@derive(Eq, Hash)",
+        "pub type P \{",
+        "    x: Int",
+        "    y: Int",
+        "\}",
+        "",
+        "pub let PTS: Map[P, Int] = Map()",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{PTS.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "a map global keyed on a derived enum builds per-module" {
+    check_both_builds("enum_key_global", with_main([
+        "@derive(Eq, Hash)",
+        "pub type Color \{",
+        "    Red",
+        "    Green",
+        "\}",
+        "",
+        "pub let COLS: Map[Color, Int] = Map()",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{COLS.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "a map global keyed on a nested tuple builds per-module" {
+    check_both_builds("nested_tuple_key_global", with_main([
+        "pub let NEST: Map[(Int, (Str, Int)), Int] = Map()",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{NEST.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "a tuple-keyed map global in a module main does not import builds per-module" {
+    let mut files = with_main([
+        "import deep.\{deep_len\}",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{deep_len()\}]\"",
+        "\}",
+        "",
+    ].join("\n"))
+    files.insert("deep.bl", [
+        "pub let DEEP: Map[(Int, Str), Int] = Map()",
+        "",
+        "pub fn deep_len() -> Int \{",
+        "    DEEP.len()",
+        "\}",
+        "",
+    ].join("\n"))
+    check_both_builds("transitive_module_global", files, "[main 0]")
+}
+
+test "a global built by a call returning a tuple-keyed map builds per-module" {
+    check_both_builds("global_via_fn", with_main([
+        "fn make() -> Map[(Int, Str), Int] \{",
+        "    Map()",
+        "\}",
+        "",
+        "pub let MADE: Map[(Int, Str), Int] = make()",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{MADE.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "a map global with a tuple value builds per-module" {
+    check_both_builds("tuple_value_global", with_main([
+        "pub let VALS: Map[Str, (Int, Str)] = Map()",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{VALS.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "an empty tuple-keyed map in a local builds per-module" {
+    check_both_builds("tuple_key_local", with_main([
+        "pub fn tag(s: Str) -> Str \{",
+        "    let m: Map[(Int, Str), Int] = Map()",
+        "    \"[\{s\} \{m.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "an empty tuple-keyed map in a global of the entry module builds per-module" {
+    let mut files: Map[Str, Str] = Map()
+    files.insert("base.bl", [
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\}]\"",
+        "\}",
+        "",
+    ].join("\n"))
+    files.insert("main.bl", [
+        "import base.\{tag\}",
+        "",
+        "let NAMES: Map[(Int, Str), Int] = Map()",
+        "",
+        "fn main() \{",
+        "    io.println(\"\{tag(\"main\")\} \{NAMES.len()\}\")",
+        "\}",
+        "",
+    ].join("\n"))
+    check_both_builds("tuple_key_global_in_main", files, "[main] 0")
+}
+
+let MAKE_GENERIC: Str = [
+    "fn make[K](k: K) -> Map[(K, Str), Int] \{",
+    "    let mut m: Map[(K, Str), Int] = Map()",
+    "    m.insert((k, \"a\"), 1)",
+    "    m.remove((k, \"a\"))",
+    "    m",
+    "\}",
+    "",
+].join("\n")
+
+test "a generic fn instance that builds a tuple-keyed map builds per-module" {
+    check_both_builds("generic_fn_local", with_main([
+        MAKE_GENERIC,
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{make(1).len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
+
+test "a global built by a generic fn instance with a tuple key builds per-module" {
+    check_both_builds("generic_fn_global", with_main([
+        MAKE_GENERIC,
+        "pub let MADE: Map[(Int, Str), Int] = make(1)",
+        "",
+        "pub fn tag(s: Str) -> Str \{",
+        "    \"[\{s\} \{MADE.len()\}]\"",
+        "\}",
+        "",
+    ].join("\n")), "[main 0]")
+}
