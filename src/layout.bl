@@ -66,7 +66,7 @@ pub type LayoutRecord {
 // The memo is a pure cache over (tid, position). The typedef buffer and guard set are
 // the only side effects this module owns; the binder frames are the only scope state.
 let mut layout_memo: Map[Int, LayoutRecord] = Map()
-let mut typedef_buffer: List[Str] = []
+let mut typedef_buffer: List[QueuedTypedef] = []
 let mut typedef_guard: TypedefGuards = TypedefGuards { own: Map(), base: Map() }
 let mut binder_frame_parent: List[Int] = []
 let mut binder_frame_alive: List[Int] = []
@@ -77,6 +77,13 @@ let mut binder_entries: List[BinderEntry] = []
 // entries a chain, newest first, so a lookup reads only the entries that carry its name:
 // it costs the name's shadow count rather than every live entry of every frame it walks.
 let mut binder_name_top: Map[Str, Int] = Map()
+
+// One guarded block and the tid it was queued for, so a pass that must have drained the
+// buffer can name what it left behind.
+type QueuedTypedef {
+    tid: Int
+    block: Str
+}
 
 // The typedefs this unit wrote, over those of the header preamble it starts from. The
 // preamble's set is only read, so every header of one pass shares one walk's set.
@@ -93,7 +100,7 @@ fn lo_guarded(name: Str) -> Bool {
 // of the same program to start from instead of walking again.
 pub type LayoutTypedefMarks {
     guards: Map[Str, Int]
-    buffer: List[Str]
+    buffer: List[QueuedTypedef]
 }
 
 pub fn layout_typedef_marks() -> LayoutTypedefMarks {
@@ -103,7 +110,7 @@ pub fn layout_typedef_marks() -> LayoutTypedefMarks {
         for k in typedef_guard.base.keys() { guards.insert(k, 1) }
         for k in typedef_guard.own.keys() { guards.insert(k, 1) }
     }
-    let mut buffer: List[Str] = []
+    let mut buffer: List[QueuedTypedef] = []
     for b in typedef_buffer { buffer.push(b) }
     LayoutTypedefMarks { guards: guards, buffer: buffer }
 }
@@ -111,7 +118,7 @@ pub fn layout_typedef_marks() -> LayoutTypedefMarks {
 // After layout_reset: this unit has written what `m` marks.
 pub fn layout_start_from(m: LayoutTypedefMarks) {
     typedef_guard = TypedefGuards { own: Map(), base: m.guards }
-    let mut buffer: List[Str] = []
+    let mut buffer: List[QueuedTypedef] = []
     for b in m.buffer { buffer.push(b) }
     typedef_buffer = buffer
 }
@@ -455,7 +462,7 @@ pub fn box_gc_layout_of(tid: Int, pointee_spelling: Str) -> Str {
     // A module header can hold this block, and the per-module scan copies it into a unit that
     // names the function with no other declaration, so the body may name only types-header
     // and runtime names.
-    lo_guard_and_push(name, "{c_gc_layout_head(name)}\n    static blink_gc_descr_cell cell;\n{table}    return {call};\n}")
+    lo_guard_and_push(r, name, "{c_gc_layout_head(name)}\n    static blink_gc_descr_cell cell;\n{table}    return {call};\n}")
     name
 }
 
@@ -487,8 +494,16 @@ fn lo_field_never_holds_pointer(field_tid: Int, rec: LayoutRecord) -> Bool {
 
 // Drains the typedef buffer in emit order. Each entry is one guarded block.
 pub fn layout_take_typedefs() -> List[Str] {
-    let out = typedef_buffer
+    let mut out: List[Str] = []
+    for q in typedef_buffer { out.push(q.block) }
     typedef_buffer = []
+    out
+}
+
+// The tid of each block queued and not yet drained, in emit order.
+pub fn layout_queued_typedef_tids() -> List[Int] {
+    let mut out: List[Int] = []
+    for q in typedef_buffer { out.push(q.tid) }
     out
 }
 
@@ -1219,10 +1234,10 @@ pub fn decl_has_derive(decl: Int, derive_name: Str) -> Bool {
 
 // ── Typedef emission ──────────────────────────────────────────────────────
 
-fn lo_guard_and_push(name: Str, body: Str) {
+fn lo_guard_and_push(tid: Int, name: Str, body: Str) {
     typedef_guard.own.insert(name, 1)
     let open = td_guard_open_lines(name)
-    typedef_buffer.push("{open.get(0).unwrap()}\n{open.get(1).unwrap()}\n{body}\n{td_guard_close_line()}")
+    typedef_buffer.push(QueuedTypedef { tid: tid, block: "{open.get(0).unwrap()}\n{open.get(1).unwrap()}\n{body}\n{td_guard_close_line()}" })
 }
 
 fn lo_is_carrier_kind(k: TyKind) -> Bool {
@@ -1243,7 +1258,7 @@ fn lo_emit_option_typedef(r: Int, name: Str) {
     if lo_guarded(name) { return }
     lo_ensure_child_typedef(inner)
     let member = if lo_fits_word(inner) { lo_member_spelling(inner) } else { pointer_spelling(lo_spell(inner)) }
-    lo_guard_and_push(name, "typedef struct \{ int tag; {member} value; } {name};")
+    lo_guard_and_push(r, name, "typedef struct \{ int tag; {member} value; } {name};")
 }
 
 // The ok arm is by value; a struct-typed err arm is by pointer; a Void arm is an
@@ -1261,7 +1276,7 @@ fn lo_emit_result_typedef(r: Int, name: Str) {
     let ok_member = lo_member_spelling(ok)
     let mut err_member = lo_member_spelling(err)
     if lo_is_struct_by_pointer_err(err) { err_member = pointer_spelling(err_member) }
-    lo_guard_and_push(name, "typedef struct \{ int tag; union \{ {ok_member} ok; {err_member} err; }; } {name};")
+    lo_guard_and_push(r, name, "typedef struct \{ int tag; union \{ {ok_member} ok; {err_member} err; }; } {name};")
 }
 
 fn lo_is_struct_by_pointer_err(err: Int) -> Bool {
@@ -1285,7 +1300,7 @@ fn lo_emit_tuple_typedef(r: Int, name: Str) {
         body = "{body}    {lo_member_spelling(lo_res(tc_tid_child(r, i)))} {c_tuple_member(i)};\n"
         i = i + 1
     }
-    lo_guard_and_push(name, "{body}} {name};")
+    lo_guard_and_push(r, name, "{body}} {name};")
 }
 
 // A carrier member drops the pointee or effect: one blink_Option_ptr must serve every
