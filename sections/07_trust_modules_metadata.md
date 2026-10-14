@@ -132,6 +132,50 @@ warning[W0800]: unaudited foreign function
 
 Neither help line is machine-applicable. No tool writes a claim for the author (§9.1, *Audit Records*).
 
+#### `-> Never` — A Foreign Function That Does Not Return
+
+An `@ffi` fn may declare `-> Never` for a foreign function that does not return, such as `abort` or `_exit`. The effect row stays (§3.2):
+
+```blink
+@ffi("c", "abort")
+@trusted(audit: "LIBC-ABORT")
+fn c_abort() -> Never ! ()
+
+@ffi("c", "_exit")
+@trusted(audit: "LIBC-EXIT")
+fn c_exit(code: I32) -> Never ! Env.Exit
+```
+
+The result type is a claim, as the rest of the signature is. `@trusted(audit: K)` records it, and the pin of the record covers it: a change from `-> Int` to `-> Never` makes the pin stale, so the binding needs a new review (*Audit Records*). No other gate applies.
+
+**The compiler does not assume the claim.** A call to the binding has type `Never` (§3.3), but the claim alone never lets the compiler remove the code after the call. If the foreign function returns, the program panics at the call, in every build mode, as if `unreachable()` (§2.20) came after the call. This is a panic, not a fatal runtime error (§4.6.3): the foreign code returned normally and did not end the process. The message starts with the name `FfiNeverReturned`, and it names the binding, the C symbol, the audit key and the call site:
+
+```
+panic: FfiNeverReturned: foreign function `c_abort` is declared `-> Never` but returned
+  --> src/sys.bl:9:5
+   = note: audit record "LIBC-ABORT" claims that the C symbol `abort` never returns
+   = help: declare the real C return type, then review the record again
+```
+
+When a `header:` that the binding names declares the function noreturn, that is a claim of the C library. Blink does not check it.
+
+**Declare `-> Never` only when the function returns on no path.** `execv` replaces the process when it succeeds, but it returns `-1` when it fails. Bind it with its real return type. Its safe wrapper returns `Result[Never, E]`, as `process.exec` does (§4.4.8). `Result[Never, E]` fits only a function that does not return when it succeeds; a function that returns a value when it succeeds uses `Result[T, E]`.
+
+```blink
+@ffi("c", "execv")
+@trusted(audit: "LIBC-EXECV")
+fn c_execv(path: Ptr[U8], argv: Ptr[Ptr[U8]]) -> I32 ! Process.Spawn, Env.Exit
+```
+
+W0800 on a binding that declares `-> Never` adds a note that states the claim:
+
+```
+   = note: `-> Never` claims that `c_abort` never returns; if it returns,
+           the program panics at the call (`FfiNeverReturned`)
+```
+
+**`Never` is not FFI-compatible.** It has no C type. In a foreign signature it is legal as the whole return type, as above. `Ptr[Never]` is E0810 (§9.1.1), and an `@ffi.struct` field of type `Never` is E0812 (§9.1.3).
+
 #### Audit-Gated Diagnostics — One Channel, Stated Once
 
 A handful of diagnostics exist to force a **record**, not to report a mistake. The program they fire on is legal and may well be correct; what the language asks is that its author, human or agent, looked at it and wrote a claim in a place a reviewer can find. `@trusted(audit: K)` is that place, and this subsection states the mechanism once for every diagnostic that uses it. No other section restates it.
