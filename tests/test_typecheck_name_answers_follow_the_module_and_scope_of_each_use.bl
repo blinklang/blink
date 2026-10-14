@@ -1,0 +1,92 @@
+// Resolve answers each use of a name in the module and scope of that use. One spelling can be
+// selected in one module and not in another, private in one module and its own in another, and
+// shadowed by a local at one position and not at the next: an answer reused across modules or
+// across a shadow would report the wrong use, or miss one. Each probe loads the two modules in
+// both orders, because an answer reused across modules is right for whichever module asks first.
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_name_answers_per_use_pkg"
+
+fn compile_probe(probe_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcnameanswers\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/lib.bl", "pub fn shared() -> Int \{ 1 \}\npub fn other() -> Int \{ 2 \}\nfn hidden() -> Int \{ 3 \}\n")
+    write_file("{PKG}/src/picks.bl", "import lib.\{shared\}\npub fn use_picks() -> Int \{ shared() \}\n")
+    write_file("{PKG}/src/skips.bl", "import lib.\{other\}\npub fn use_skips() -> Int \{ shared() + other() \}\n")
+    write_file("{PKG}/src/owns.bl", "import lib.\{shared\}\nfn hidden() -> Int \{ 4 \}\npub fn use_owns() -> Int \{ hidden() \}\n")
+    write_file("{PKG}/src/peeks.bl", "import lib.\{shared\}\npub fn use_peeks() -> Int \{ hidden() \}\n")
+    write_file("{PKG}/src/shadow.bl", "import lib.\{other\}\npub fn with_local() -> Int \{\n    let shared = 5\n    shared\n\}\npub fn without_local() -> Int \{ shared() \}\npub fn local_after() -> Int \{\n    let shared = 6\n    shared + other()\n\}\n")
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+// Each error as its name and the file it names, so a report on the wrong module fails too.
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name} {d.file}") }
+    }
+    out
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered.
+fn assert_errors(label: Str, want: List[Str]) {
+    let got = errors()
+    let same = got.len() == want.len() && got.join("\n") == want.join("\n")
+    if !same {
+        io.eprintln("FAIL: {label}:\n  got:")
+        for e in got { io.eprintln("    {e}") }
+        io.eprintln("  want:")
+        for e in want { io.eprintln("    {e}") }
+    }
+    assert(same)
+}
+
+fn test_a_name_selected_in_one_module_is_not_selected_in_another_selecting_module_first() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import picks.\{use_picks\}\nimport skips.\{use_skips\}\nfn main() \{ assert(use_picks() + use_skips() > 0) \}\n")
+    assert_errors("shared is selected in picks, not in skips", ["ImportNotSelected {PKG}/src/skips.bl"])
+    cleanup()
+}
+
+fn test_a_name_selected_in_one_module_is_not_selected_in_another_skipping_module_first() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import skips.\{use_skips\}\nimport picks.\{use_picks\}\nfn main() \{ assert(use_picks() + use_skips() > 0) \}\n")
+    assert_errors("shared is selected in picks, not in skips", ["ImportNotSelected {PKG}/src/skips.bl"])
+    cleanup()
+}
+
+fn test_a_private_name_is_its_own_module_s_and_no_other_s_owner_first() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import owns.\{use_owns\}\nimport peeks.\{use_peeks\}\nfn main() \{ assert(use_owns() + use_peeks() > 0) \}\n")
+    assert_errors("hidden is owns' own, and private to lib and owns from peeks", ["PrivateItemAccess {PKG}/src/peeks.bl"])
+    cleanup()
+}
+
+fn test_a_private_name_is_its_own_module_s_and_no_other_s_reader_first() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import peeks.\{use_peeks\}\nimport owns.\{use_owns\}\nfn main() \{ assert(use_owns() + use_peeks() > 0) \}\n")
+    assert_errors("hidden is owns' own, and private to lib and owns from peeks", ["PrivateItemAccess {PKG}/src/peeks.bl"])
+    cleanup()
+}
+
+fn test_a_local_shadows_an_unselected_name_only_where_it_is_bound() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import shadow.\{with_local, without_local, local_after\}\nfn main() \{ assert(with_local() + without_local() + local_after() > 0) \}\n")
+    assert_errors("shared is a local in with_local and local_after, unselected in without_local", ["ImportNotSelected {PKG}/src/shadow.bl"])
+    cleanup()
+}
+
+fn main() {
+    test_a_name_selected_in_one_module_is_not_selected_in_another_selecting_module_first()
+    test_a_name_selected_in_one_module_is_not_selected_in_another_skipping_module_first()
+    test_a_private_name_is_its_own_module_s_and_no_other_s_owner_first()
+    test_a_private_name_is_its_own_module_s_and_no_other_s_reader_first()
+    test_a_local_shadows_an_unselected_name_only_where_it_is_bound()
+    io.println("name answers follow the module and scope of each use: ok")
+}
