@@ -582,6 +582,10 @@ edit (it compares bytes too, so it never replies from the old bytes).
 makes that edit through `BLINK_DEV_TEST_SETTLE_HOOK`, a shell command the
 settle runs before it takes the stats. It is for tests only, like the other
 `BLINK_DEV_*` knobs. Unset, it costs one getenv per settle, after the reply.
+Its test-only partner `BLINK_DEV_DAEMON_IDLE_HOLD=<path>` stops the poll while
+that file exists, so a test whose check request must check an edit is not beaten
+to it by the poll (see `docs/build/daemon-recheck-reuse.md`). Unset, it costs one
+getenv per idle wait.
 The test fails at `assert(resettled)` when the settle keeps the stats it took
 and skips the compare: the poll does not recheck in 20 s. Its asserts before
 that one pass in the same run: the next request and a CLI check still report

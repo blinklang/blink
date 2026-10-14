@@ -538,8 +538,11 @@ not kept. `node_pop` below the parsed end stops the parser (`parser_limit_stop`)
 - `tests/test_daemon_build_right_after_an_edit_checks_the_program_once.bl`: a build sent
   right after an edit, with no check request between, checks the program once.
 
-The warm-against-cold tests ask the warm tree last in each step, so the next edit comes
-within the poll's 500 ms wait and the check request, not the poll, checks it.
+A test that needs a check request, not the poll, to check an edit sets the dev knob
+`BLINK_DEV_DAEMON_IDLE_HOLD=<path>`: while that file exists, the poll does nothing. Without
+it, a request that comes more than 500 ms after the edit finds the poll's cold check done,
+keeps no source, and has nothing to check. On a loaded machine that gap is common. The poll
+test and the first half of the idle recheck test leave the file absent.
 
 Mutations that make the first test fail: skip the desugar undo; keep the edited source's old
 `file_ranges` entry; merge in arena order; skip the keyword-default undo. Merge in arena
