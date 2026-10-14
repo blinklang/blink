@@ -50,6 +50,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | E06xx | Resource scope / closures |
 | W060x | Linting |
 | W061x | Resource scope lints |
+| W070x | Linting |
 | E07xx | Method resolution / arena / coherence |
 | E08xx | FFI |
 | E09xx | Module capabilities / trait contracts |
@@ -270,6 +271,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
 | TodoInCode | W0703 | A call resolves to the built-in `todo()`. Fires in every context, test blocks included; in a test the `help:` line names `@skip`. `unreachable()` has no warning | Linting | §2.20 |
 | DivisionByLiteralZero | W0704 | The divisor of an integer `/` or `%` is an integer literal 0, with optional parentheses and unary `-`; the expression always panics. A `const` reference or a `let` binding with the value 0 does not trigger it. Fires in a branch that never runs; does not fire inside an `assert_panics` body | Linting | §3.6 |
+| PanicInLibrary | W0705 | A reference resolves to the built-in `panic()` (a call or a value use) outside test blocks, in a library package: one whose entry module `src/<name>.bl` declares no `fn main`. Private functions included; `todo()` and `unreachable()` exempt. The one `help:` names `Result` with the enclosing function's return type; the notes give the scope fact, `unreachable()` for a path that can never run, and `@allow`. No machine-applicable fix. Suppress with `@allow(PanicInLibrary)`; `@trusted(audit: K)` does not suppress it; set the level with `W0705 = "off"` or `"error"` under `[lints]` | Linting | §2.20 |
 | OverrideOfDeprecatedDefault | W0731 | `impl` overrides a trait default marked `@deprecate_override` | Trait sealing | §3.6 |
 | SealedMethodNameCollision | W0734 | A method in an `impl` for a built-in type has the same name as a method a sealed trait gives that type; unqualified calls of the name are E0522. Fires at the method only, never at calls. On by default, never an error, no effect on resolution | Method resolution | §3c.4 |
 | UnauditedFfi | W0800 | Unaudited foreign function call. Audit-gated: `@trusted(audit: K)` is its only suppression channel — `@allow` and `[lints]` are refused | FFI | §9.1 |

@@ -1794,7 +1794,7 @@ fn divide(a: Int, b: Int) -> Int {
 
 `panic` returns `Never` (§3.2), the bottom type. `Never` has no values and is a subtype of every type, so a call to `panic` fits in any expression position. Panic is *not* an algebraic effect — it is untracked divergence, like integer division by zero or array bounds violations. It cannot be caught or handled in normal code (only the test runner catches it).
 
-**Use `Result[T, E]` for recoverable errors.** `panic` is reserved for programmer errors, violated invariants, and genuinely unreachable states. A lint warns when `panic()` appears in library code. It does not fire on `todo()` or `unreachable()` (below).
+**Use `Result[T, E]` for recoverable errors.** `panic` is reserved for programmer errors, violated invariants, and genuinely unreachable states. In a library package, `PanicInLibrary` (W0705, below) warns on each `panic`. It does not fire on `todo()` or `unreachable()`.
 
 **Panel vote: 5-0 unanimous.** See [DECISIONS.md](../DECISIONS.md).
 
@@ -1865,7 +1865,60 @@ warning[TodoInCode]: `todo()` left in code
 
 `unreachable` has no warning. It states a claim about the program, not unfinished work.
 
-**The library-panic lint.** Neither built-in triggers the lint on `panic()` in library code (above). `todo` already has its own warning. `unreachable` is the form that the paragraph on `panic` allows for states that cannot occur. The exemption applies only to a call that resolves to the built-in; a user function named `todo` or `unreachable` gets no exemption. The lint's `help:` line names `Result[T, E]` for error paths and `unreachable` only for paths that cannot run. It never proposes changing `panic` to `unreachable` as the repair by itself.
+**`PanicInLibrary` (W0705).** A library returns errors to its caller. It does not end the caller's program. This lint warns on `panic` in a library package.
+
+- **Scope.** A package is a *library package* when its entry module `src/<name>.bl` (§10.1 *Package Entry Resolution*) declares no `fn main`. A package whose entry module declares `fn main` is an application, also when it exports `pub` items and also when the `main` is only a demo. A file outside a package is never library code. If Blink adds a separate library target to a package, this rule applies to that target.
+- **What fires.** In each module of a library package, outside test blocks, each reference that resolves to the built-in `panic` gets the warning. Private functions are included. A call fires, and so does a use of `panic` as a value (`let f = panic`); the span is on the reference, and a later call through `f` does not fire again. A call to a user function that panics does not fire; the lint checks that function's own body. The exemption is the same as for `todo` and `unreachable` above: it applies only to a reference that resolves to the built-in, so a user function named `panic`, `todo` or `unreachable` gets no special treatment.
+- **Exemptions.** Neither `todo` nor `unreachable` triggers the lint. `todo` already has its own warning. `unreachable` is the form that the paragraph on `panic` allows for states that cannot occur.
+- **Level.** The lint is a warning by default. Suppress it with `@allow(PanicInLibrary)` on the function, or set its level with `W0705 = "off"` or `W0705 = "error"` under `[lints]` (§4.16.8). A function-level `@allow` overrides `[lints]`. `@trusted(audit: K)` does not suppress it. The diagnostic has no machine-applicable fix, because each repair changes the function's interface.
+
+```blink
+pub fn average(total: Int, count: Int) -> Int {
+    if count == 0 { panic("count is zero") }
+    total / count
+}
+```
+
+```
+warning[PanicInLibrary]: `panic()` in a library package
+ --> src/stats.bl:2:21
+  |
+2 |     if count == 0 { panic("count is zero") }
+  |                     ^^^^^ this ends the caller's program
+  |
+  = help: return `Result[Int, E]` and return `Err(...)` for this error
+  = note: package `stats` is a library: `src/stats.bl` declares no `fn main`
+  = note: if this path can never run, use `unreachable()`
+  = note: to keep this panic, add `@allow(PanicInLibrary)` to the function
+```
+
+The repair that the `help:` line names:
+
+```blink
+pub fn average(total: Int, count: Int) -> Result[Int, Str] {
+    if count == 0 { return Err("count is zero") }
+    Ok(total / count)
+}
+```
+
+**The `help:` line.** There is one `help:` line, and it names `Result`. The type in it comes from the return type of the nearest enclosing function or closure:
+
+| Return type | `help:` line |
+|---|---|
+| A concrete type, such as `Int` | ``return `Result[Int, E]` and return `Err(...)` for this error`` |
+| `()` | ``return `Result[(), E]` and return `Err(...)` for this error`` |
+| A type parameter, or `Never` | ``return `Result[T, E]` and return `Err(...)` for this error`` |
+| Already `Result[R, E]` | ``return `Err(...)` for this error`` |
+
+The diagnostic has three `note:` lines, in this order:
+
+1. The scope fact: the package name and the entry file path that the compiler resolved. This note states the fact only. It never suggests adding a `fn main`.
+2. `unreachable()`, only for a path that can never run.
+3. `@allow(PanicInLibrary)`, to keep the panic.
+
+The output never proposes changing `panic` to `unreachable` as the repair by itself, never names `Option`, and never names `@requires`. A `fn main` added to the entry module only to stop the warning is not a repair: it makes the package an application, and the `panic` still ends the caller's program.
+
+**`blink explain W0705`.** The explain text names the repairs in this order. First, return `Result`. Second, for a condition that each caller must meet, state it with `@requires(...)` (§3b.2) and remove the check, so that no `panic` remains. Third, `unreachable()` for a path that can never run. Fourth, `@allow(PanicInLibrary)`. It says that adding `@requires` and changing the `panic` to `unreachable` is not a repair.
 
 #### `assert_panics` — Asserting Expected Panics
 
