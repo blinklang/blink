@@ -1070,3 +1070,114 @@ emit for `src/cli.bl` and `src/blinkc_main.bl` is byte-equal.
 slower than base. Worker VmHWM over 20 rechecks of `src/cli.bl`: 377700 kB on base and
 358668 kB on tip with base first, and 381012 kB on tip and 359948 kB on base with tip first.
 The binary that runs first peaks about 20 MB higher, so the memo shows no RSS cost.
+
+### The Str hash row after the word-at-a-time cut
+
+The runtime map hashed a Str key one byte at a time (FNV-1a), so each byte cost one multiply
+that waited on the one before it. That hash was the top self row of a warm recheck of
+`src/cli.bl`: 16.4 ms of 272.8 ms. During one cold check of `src/cli.bl` the compiler hashes
+about 2.03 million Str keys. The median key is 9 bytes, 24% are 1 to 4 bytes, 24% are 5 to 8,
+36% are 9 to 16, and 0.3% are longer than 32.
+
+The cut, in `bootstrap/runtime_core.h` (`blink_map_hash_of`):
+
+- The start value is the length times an odd constant, so keys that differ only in length
+  start apart.
+- A key longer than 8 bytes is read 8 bytes at a time. The last step reads the last 8 bytes of
+  the key, which can overlap the step before it. A key of 4 to 8 bytes is one step on its first
+  4 and its last 4 bytes. A key of 1 to 3 bytes is one step on its first, middle and last byte.
+  Each byte of the key is in at least one step, and no load reads past the recorded length.
+  The loads use `memcpy`, so an unaligned key is not undefined behavior.
+- Each step is an exclusive-or, a multiply and a shift. The answer goes through
+  `blink_kops_mix_u64`, the splitmix64 finish that every integer key already takes.
+- The seed is mixed in as before: `blink_kops_hash_str` gives the hash exclusive-or the map
+  seed. `blink_map_hash` (the hash that a derived `Hash` reads) takes no seed, as before.
+- `blink_kops_hash_str` forces the hash inline. Without that, cc kept it as a call, and each
+  probe made two calls.
+
+The hash reads the key with native byte order, so a big-endian host gives other hash values.
+The spec allows this: a hash value and the iteration order vary from build to build (section
+3.6), and no test pins a value.
+
+No hash value leaves the process. The std archive key, the object cache key and the package
+content hashes are sha256 of the bytes. The daemon sends the environment whole, not hashed.
+
+Tests:
+
+- `tests/test_str_keyed_map_and_set_answer_for_every_key_length_up_to_40.bl`: `Map[Str, Int]`
+  and `Set[Str]` with keys of 0 to 40 bytes in six byte classes (ASCII, the bytes 0x01 and 0x7f,
+  and two-, three- and four-byte UTF-8), each with the variants that change one byte at each
+  offset. Keys are made by concatenation, slice and interpolation, so equal keys are separate
+  cells. Get, contains, insert over, remove and iteration are checked against a linear scan.
+- `tests/test_derived_hash_of_a_str_field_sees_every_byte_at_every_length_up_to_40.bl`: the
+  same keys through a derived `Hash` on a one-field struct. Every distinct key gets a distinct
+  `hash()`, and equal keys made by other routes get the same one. The seed is one
+  exclusive-or before a mix that loses no bits, so the result does not depend on the seed.
+- `tests/test_str_keyed_map_order_follows_the_pinned_seed.bl`: with `BLINK_MAP_SEED` pinned,
+  two processes iterate Str keys of every length in the same order, and another seed gives
+  another order.
+
+All three pass on base. Each mutation of the cut makes one of them fail: drop the tail (929
+same hashes), hash only the first word (3168), read the tail one byte short (192) or one byte
+long (24), leave out the length (2372), read the 4-to-8 tail at the wrong offset (24), read the
+last word past the key (the Map and Set test fails) and leave out the seed (the order test fails).
+
+Self rows, `perf record` over 20 warm rechecks of `src/cli.bl`, base (83d6902f) and tip in one
+window, ms for each check:
+
+| row | base | tip |
+|---|---|---|
+| reply path | 275.8 | 264.3 |
+| `blink_kops_hash_str` (the hash inline in tip) | 16.76 | 12.88 |
+| `blink_str_eq` | 10.16 | 8.65 |
+| `memcmp` | 7.68 | 7.48 |
+| `blink_kops_eq_str` | 6.63 | 5.88 |
+| `blink_map_find` | 9.78 | 11.16 |
+
+In a tip build without the forced inline, 29% of the hash samples are on the first read of
+the key header (its length). That is a cache miss that a hash of any kind takes.
+
+Probes, one cold check of `src/cli.bl` with a counting runtime, five pinned seeds (0 to 4),
+range over the seeds:
+
+| op | calls | base slots per call | tip slots per call | base key compares per call | tip key compares per call |
+|---|---|---|---|---|---|
+| find | 1373093 | 1.385-1.447 | 1.317-1.340 | 1.309-1.375 | 1.235-1.263 |
+| has | 329088 | 1.497-1.573 | 1.431-1.523 | 1.496-1.572 | 1.426-1.516 |
+| set | 144570 | 2.743-2.839 | 2.670-2.712 | 1.453-1.539 | 1.375-1.411 |
+
+The fewer probes are why `blink_str_eq` and `memcmp` also fall.
+
+Wall time, alternating, `setarch -R`, 10 pairs in two runs, the order swapped in the second,
+median of 5 [min-max] for each run (s):
+
+| case | base | tip | pairs tip faster | median paired delta (ms) |
+|---|---|---|---|---|
+| warm body edit, `src/cli.bl` | 0.270 [0.269-0.274], 0.273 [0.270-0.290] | 0.264 [0.261-0.267], 0.267 [0.263-0.274] | 9/10 | -7 |
+| warm body edit, `src/cname.bl` | 0.263 [0.262-0.270], 0.273 [0.263-0.281] | 0.259 [0.252-0.270], 0.259 [0.257-0.263] | 9/10 | -7 |
+| cold `blink check src/cli.bl` | 0.376 [0.367-0.378], 0.372 [0.369-0.392] | 0.365 [0.364-0.371], 0.361 [0.356-0.369] | 9/10 | -10 |
+| warm, no change | 0.009 | 0.009 | | 0 |
+
+The output of each run is the same for base and tip, except that the first cold check of a
+run also prints `resolving dependencies...`.
+
+`task bench-edit-loop`, base and tip, two rounds, the order swapped in the second: no row is
+slower than base. `cli cold-obj` had one tip round above the base range while other work
+loaded the machine; two more rounds of that row in a quiet window gave base 1.920 and 1.921 s
+and tip 1.924 and 1.904 s.
+
+A user program, `Map[Str, Int]` with 300000 keys, insert then 5 rounds of get, 15 runs each,
+median ms:
+
+| keys | base insert | tip insert | base get | tip get |
+|---|---|---|---|---|
+| `k{i}` (2 to 7 bytes), get in insert order | 14 | 14 | 22 | 25 |
+| `name_{i}_x` (8 to 13 bytes), get in insert order | 21 | 19 | 26 | 25 |
+| 41 to 46 bytes, get in insert order | 35 | 18 | 63 | 33 |
+| `k{i}`, get in scattered order | 12 | 12 | 41 | 35 |
+| `name_{i}_x`, get in scattered order | 22 | 19 | 43 | 33 |
+| 41 to 46 bytes, get in scattered order | 34 | 17 | 133 | 67 |
+
+Only one row is slower: short keys read back in the order they were put in. The probable
+cause: FNV-1a puts keys that differ only in the last byte in nearby slots, so that read order
+stays in cache. When the same keys are read in scattered order, tip is faster.
