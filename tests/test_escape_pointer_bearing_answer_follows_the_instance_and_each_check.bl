@@ -1,0 +1,86 @@
+// sections/07_trust_modules_metadata.md, *Scope tags*: a call result takes the tag of its
+// pointer argument only when its own type can hold a pointer. Whether a type can hold one is a
+// fact about the instance: `Box[Ptr[U8]]` can and `Box[Int]` cannot, whichever the program
+// asks about first. It is also a fact about this check's declarations: a second check in the
+// same process, after a field of `W` turns into a `Ptr` or out of one, answers from the new
+// field, not from the check before.
+import typecheck.{check_types}
+import escape.{analyze_escapes}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PROBE = "build/escape_pointer_bearing_instance_probe.bl"
+
+fn mk_box(name: Str, ret: Str) -> Str {
+    "@ffi(\"c\", \"{name}\")\n@trusted(audit: \"PTR-BEARING-{name}\")\nfn {name}(p: Ptr[U8]) -> {ret} ! FFI \{ \}\n"
+}
+
+fn scope_call(name: Str) -> Str {
+    "    let _ = with ffi.scope() as s \{\n        let p = s.alloc[U8]()\n        {name}(p)\n    \}\n"
+}
+
+// `first` and `second` name the FFI calls in the order main makes them, on lines 16 and 20.
+fn box_program(first: Str, second: Str) -> Str {
+    let decls = "type Box[T] \{\n    v: T\n\}\n\n{mk_box("mk_int", "Box[Int]")}\n{mk_box("mk_ptr", "Box[Ptr[U8]]")}\n"
+    "{decls}fn main() ! FFI \{\n{scope_call(first)}{scope_call(second)}\}\n"
+}
+
+fn w_program(field: Str) -> Str {
+    "type W \{\n    v: {field}\n\}\n\n{mk_box("mk_w", "W")}\nfn main() ! FFI \{\n{scope_call("mk_w")}\}\n"
+}
+
+fn check(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    diag_reset()
+    write_file(PROBE, src)
+    let program = compile_to_program(PROBE, 1)
+    check_types(program)
+    analyze_escapes(program)
+}
+
+// Each error and internal error, as its name and line, in the order it was reported.
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name} {d.line}") }
+    }
+    out
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered.
+fn assert_errors(label: Str, want: List[Str]) {
+    let got = errors()
+    let same = got.join("\n") == want.join("\n")
+    if !same {
+        io.eprintln("FAIL: {label}:\n  got:")
+        for e in got { io.eprintln("    {e}") }
+        io.eprintln("  want:")
+        for e in want { io.eprintln("    {e}") }
+    }
+    assert(same)
+}
+
+fn test_each_instance_of_a_generic_type_answers_for_itself() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    check(box_program("mk_int", "mk_ptr"))
+    assert_errors("Box[Int] asked first, then Box[Ptr[U8]]", ["PtrEscapesFfiScope 20"])
+    check(box_program("mk_ptr", "mk_int"))
+    assert_errors("Box[Ptr[U8]] asked first, then Box[Int]", ["PtrEscapesFfiScope 16"])
+}
+
+fn test_a_second_check_answers_from_the_new_field() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    check(w_program("Int"))
+    assert_errors("W holds an Int", [])
+    check(w_program("Ptr[U8]"))
+    assert_errors("W now holds a Ptr", ["PtrEscapesFfiScope 12"])
+    check(w_program("Int"))
+    assert_errors("W holds an Int again", [])
+}
+
+fn main() {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    test_each_instance_of_a_generic_type_answers_for_itself()
+    test_a_second_check_answers_from_the_new_field()
+    let _rm = process_run("rm", ["-f", PROBE])
+    io.println("the pointer-bearing answer follows the instance and each check: ok")
+}

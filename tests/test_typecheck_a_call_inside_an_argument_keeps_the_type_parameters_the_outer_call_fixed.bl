@@ -1,0 +1,66 @@
+// A type parameter has one type per call: a later argument is checked against the type an
+// earlier argument fixed. A call written inside an argument fixes its own type parameters, and
+// neither call may see the other's. Once the inner call returns, the outer call still knows
+// what its earlier arguments fixed, and the next call starts from nothing.
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PROBE = "build/tc_call_inside_an_argument_probe.bl"
+
+let SRC = #"fn same[T](a: T, b: Int, c: T) -> T {
+    let _ = b
+    let _ = c
+    a
+}
+
+fn width[U](a: U, b: U) -> Int {
+    let _ = a
+    let _ = b
+    1
+}
+
+fn main() {
+    let x = same(1, width("x", "y"), "s")
+    let y = same("a", width(2, 3), "b")
+    let z = same(1, width(2, "q"), 3)
+    let w = same(same(1, 2, 3), width(same("a", 0, "b"), "c"), "d")
+    let v = same(true, 0, false)
+    io.println("{x} {y} {z} {w} {v}")
+}
+"#
+
+// Each error and internal error, as its message and line, in the order it was reported.
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.line}: {d.message}") }
+    }
+    out
+}
+
+fn main() {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    diag_reset()
+    write_file(PROBE, SRC)
+    let program = compile_to_program(PROBE, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", PROBE])
+    let want = [
+        "14: argument 3 of `same` expects Int, got Str",
+        "16: argument 2 of `width` expects Int, got Str",
+        "17: argument 3 of `same` expects Int, got Str",
+    ]
+    let got = errors()
+    // Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout
+    // has buffered.
+    if got.join("\n") != want.join("\n") {
+        io.eprintln("FAIL: got:")
+        for e in got { io.eprintln("    {e}") }
+        io.eprintln("  want:")
+        for e in want { io.eprintln("    {e}") }
+    }
+    assert_eq(got.join("\n"), want.join("\n"))
+    io.println("a call inside an argument keeps the type parameters the outer call fixed: ok")
+}
