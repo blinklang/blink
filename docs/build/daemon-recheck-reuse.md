@@ -979,3 +979,94 @@ also prints `resolving dependencies...`, whichever binary runs first.
 `task bench-edit-loop`, base and tip, two rounds, the order swapped in the second: no row is
 slower than base. Worker VmHWM over 20 rechecks of `src/cli.bl`: 363852 and 373816 kB on base,
 361656 and 362064 kB on tip.
+
+### The allocation row after the per-call cut
+
+Most allocation on the warm recheck path came from a few calls that built a new Map or List
+each time, though the call needed none, or needed one map that could be kept. Each GC
+allocation can start a collection, so a new map per call costs both the allocation and part of
+a collection. Four cuts, all in `src/typecheck.bl` and `src/diagnostics.bl`:
+
+1. `tc_tid_is_pointer_bearing` keeps its answer for each resolved tid in
+   `tc_ptr_bearing_memo`, for one check. Escape asks for every expression, and each walk built a
+   seen map and read the field pools. The walk reads only the pool entry of each tid it meets,
+   the field declarations of a struct or enum (`tc_declared_field_tids`) and the instance each
+   field maps to (`tc_member_tid_at_instance`). A tid names one instance, and these are fixed
+   once interned, so only `init_types`, which clears `ty_pool`, clears the memo. The one entry
+   that can change is a metavar that a later unify binds. A walk that meets an unbound metavar
+   puts `PTR_BEARING_MET_METAVAR` in its seen map, and its answer is not kept. The memo writes
+   only its own map.
+2. `check_arg_shapes_with_binds` takes its `seen` map off a free list
+   (`tc_arg_binds_free`), clears it, and gives it back when it returns. An argument can hold a
+   call, which reads its own arguments before the outer call reads its next one. Each open call
+   holds a map that no other open call holds, so a nested call cannot clear or fill the map of
+   the call outside it. A check that panics out of a call leaves that map off the list, which
+   costs one new map and nothing else. `init_types` empties the list, as it resets every
+   typecheck global, so no map outlives its check.
+3. `diag_clear_allows` clears the allow set in place and does not make a new one.
+4. `check_ptr_bearing_struct_in_type_ann` searches for an `@ffi.struct` only when the
+   annotation has type arguments or names an `@ffi.struct`. In all other cases the search
+   answers -1 at once, so its seen map is not made.
+
+The memo of cut 1 also removes most calls to `tc_evar_field_slots`, which made a new list for
+each enum variant that the walk read (2.35 ms for each check on base).
+
+The ratchet does not let a commit add a module `let mut`. Cuts 1 and 2 add two, so the three
+lists of pending under-determined blames (`tc_ud_pending_names`, `_tids`, `_nodes`) become one
+list of `TcUdPending` records. The count stays the same.
+
+Tests:
+
+- `tests/test_escape_pointer_bearing_answer_follows_the_instance_and_each_check.bl`: two
+  `Box[Int]` and `Box[Ptr[U8]]` are asked in both orders, and a second check in one process changes a field to add or remove a `Ptr`. It
+  fails when the memo is kept across checks, and when it is keyed by the declaration and not by
+  the instance.
+- `tests/test_typecheck_a_call_inside_an_argument_keeps_the_type_parameters_the_outer_call_fixed.bl`:
+  generic calls whose arguments hold other generic calls, some well typed and some not, each
+  error checked by message and line. It fails when all calls share one map, and when a map is
+  not cleared before use.
+- `tests/test_daemon_recheck_after_a_field_edit_that_adds_or_removes_a_ptr_prints_what_a_cold_check_prints.bl`:
+  a warm daemon and a cold check after each field edit that adds or removes a `Ptr`, with and
+  without `BLINK_DEV_DAEMON_KEEP_SOURCES=0`. It fails when the memo is kept across checks.
+
+All three pass on base.
+
+Allocator rows, `perf record --call-graph dwarf` over 20 warm rechecks of `src/cli.bl`, base
+(gen1 of 903ffaa8) and tip (gen1 of 3734a0f8) in one window, ms for each check:
+
+| part | base | tip |
+|---|---|---|
+| reply path | 287.4 | 268.2 |
+| any GC frame on the reply path | 35.6 | 24.0 |
+| `blink_map_new` | 8.20 | 0.90 |
+| `tc_tid_is_pointer_bearing` map | 3.10 | 0.03 |
+| `check_arg_shapes_with_binds` map | 2.58 | 0 |
+| `diag_clear_allows` map | 0.93 | 0 |
+| `check_ptr_bearing_struct_in_type_ann` map | 0.83 | 0 |
+| `blink_list_new` | 5.23 | 4.55 |
+| `blink_list_new_atomic` | 9.90 | 7.15 |
+| escape phase | 37.8 | 27.2 |
+| infer phase | 63.0 | 59.2 |
+
+No row that is still allocated is worth 5% of a check (about 14 ms). The largest are
+`sr_scan_for_patterns_block` (1.43), `substitute_typevar_tid` (1.40) and
+`closeable_binders_reached` (0.98).
+
+Wall time, alternating, `setarch -R`, 10 pairs in each of two runs, the order swapped in the
+second, median of the first 5 [min-max] (s):
+
+| case | base | tip | pairs tip faster | median paired delta (ms) |
+|---|---|---|---|---|
+| warm body edit, `src/cli.bl` | 0.285 [0.283-0.289], 0.286 [0.283-0.288] | 0.267 [0.265-0.271], 0.267 [0.263-0.267] | 10/10, 10/10 | -19, -19 |
+| warm body edit, `src/cname.bl` | 0.278 [0.274-0.306], 0.276 [0.273-0.280] | 0.258 [0.253-0.264], 0.260 [0.253-0.269] | 10/10, 10/10 | -16, -18 |
+| cold `blink check src/cli.bl` | 0.384 [0.384-0.406], 0.386 [0.384-0.392] | 0.370 [0.367-0.375], 0.365 [0.365-0.374] | 10/10, 10/10 | -19, -16 |
+| warm, no change | 0.009 | 0.009 | | 0 |
+
+The output of each run is byte-equal between base and tip. The first cold check of a run
+also prints `resolving dependencies...`, whichever binary runs first. The C that base and tip
+emit for `src/cli.bl` and `src/blinkc_main.bl` is byte-equal.
+
+`task bench-edit-loop`, base and tip, two rounds, the order swapped in the second: no row is
+slower than base. Worker VmHWM over 20 rechecks of `src/cli.bl`: 377700 kB on base and
+358668 kB on tip with base first, and 381012 kB on tip and 359948 kB on base with tip first.
+The binary that runs first peaks about 20 MB higher, so the memo shows no RSS cost.

@@ -1,0 +1,190 @@
+// Whether a call result inside `with ffi.scope()` takes the scope's tag depends on whether its
+// type can hold a pointer (sections/07_trust_modules_metadata.md, *Scope tags*), and a field
+// edit can change that between two checks. After each edit that turns a field of `W` into a
+// `Ptr`, directly or through a field of another type, or back, a warm daemon check must print
+// what a cold check of a twin tree prints, in human and JSON form. An answer kept from the
+// check before the edit would print the old verdict: the edit keeps the shape of the file, so
+// each type takes the type id it had. The run goes once with the daemon keeping the parse of
+// each source the edit did not touch, and once with the dev knob that loads each check cold.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {tree}/build/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_ptr_field_edit_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    // The edits below turn W.n, or Inner.v that W holds, into a Ptr and back.
+    write_file("{tree}/app/src/shapes.bl", "pub type Inner \{\n    v: Int\n\}\n\npub type W \{\n    i: Inner\n    n: Int\n\}\n")
+    write_file("{tree}/app/src/main.bl", "import shapes.\{W\}\n\n@ffi(\"c\", \"mk_w\")\n@trusted(audit: \"PTR-FIELD-EDIT\")\nfn mk_w(p: Ptr[U8]) -> W ! FFI \{ \}\n\nfn main() ! FFI \{\n    let _ = with ffi.scope() as s \{\n        let p = s.alloc[U8]()\n        mk_w(p)\n    \}\n\}\n")
+    // The idle poll would check an edit cold and keep no source, if the request after the
+    // edit came later than its wait; the hold keeps it off, so each warm check is a request's.
+    write_file("{tree}/hold", "")
+}
+
+// The knob setting of the run under way: "" keeps sources, "BLINK_DEV_DAEMON_KEEP_SOURCES=0"
+// loads each check cold.
+let mut knob: Str = ""
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE and the module
+// filters; the daemon serves only a client whose env is its own, so both drop them, and both
+// run with the knob as set. Both name the idle hold, which only the warm tree's daemon reads.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_DAEMON_KEEP_SOURCES BLINK_CACHE_DIR={tree}/objcache BLINK_DEV_DAEMON_IDLE_HOLD={tree}/hold {knob}"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 {tree}/build/blink {args}"])
+}
+
+// The pid of the daemon started on src/main.bl in tree, or -1. The timeout ends a daemon
+// that nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 {tree}/build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+// Ends the daemon and each worker it started, by pid.
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    let workers = sh("ps -o pid= --ppid {pid} | tr -s ' \\n' ' '").trim()
+    shell_exec("kill {pid} {workers} 2>/dev/null; for i in $(seq 1 100); do left=''; for p in {pid} {workers}; do kill -0 $p 2>/dev/null && left=1; done; [ -z \"$left\" ] && exit 0; sleep 0.05; done; kill -9 {pid} {workers} 2>/dev/null")
+}
+
+// A field of `daemon status`, such as "checks", or -1 when the status has none.
+fn served(tree: Str, field: Str) -> Int {
+    let out = blink_in(tree, "daemon status").out
+    let key = "\"{field}\":"
+    match out.byte_index_of(key, 0) {
+        Some(at) => {
+            let rest = out.byte_slice(at + key.byte_len(), out.byte_len())
+            let mut n = ""
+            for c in rest {
+                if c < '0' || c > '9' { break }
+                n = "{n}{c}"
+            }
+            if n == "" { -1 } else { n.to_int() }
+        }
+        None => -1
+    }
+}
+
+// The first difference between two results of the same command in two trees, or "".
+fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
+    let ao = a.out.replace(a_tree, "TREE")
+    let bo = b.out.replace(b_tree, "TREE")
+    let ae = a.err_out.replace(a_tree, "TREE")
+    let be = b.err_out.replace(b_tree, "TREE")
+    if a.exit_code != b.exit_code { return "exit {a.exit_code} vs {b.exit_code}:\n{ao}{ae}\n-- vs --\n{bo}{be}" }
+    if ao != bo { return "stdout:\n{ao}\n-- vs --\n{bo}" }
+    if ae != be { return "stderr:\n{ae}\n-- vs --\n{be}" }
+    ""
+}
+
+// What the last warm human check printed, and how many checks the warm tree ran: a step
+// that printed the wrong verdict in both trees would compare equal, and a check the daemon
+// did not serve would compare two cold checks.
+let mut last_warm: Str = ""
+let mut warm_checks: Int = 0
+
+// The check of src/main.bl in both trees, in both formats; what differs, or "".
+fn compare(warm: Str, cold: Str, step: Str) -> Str {
+    let mut out: List[Str] = []
+    let human = "check src/main.bl"
+    let json = "check --format json src/main.bl"
+    let w = blink_in(warm, human)
+    last_warm = "{w.out}{w.err_out}"
+    let d = differ(warm, w, cold, blink_in(cold, human))
+    if d != "" { out.push("after {step}: {human}: {d}") }
+    let cj = blink_in(cold, json)
+    let wj = blink_in(warm, json)
+    warm_checks = warm_checks + 2
+    let dj = differ(warm, wj, cold, cj)
+    if dj != "" { out.push("after {step}: {json}: {dj}") }
+    out.join("\n")
+}
+
+// "" when the last warm check printed `needle` exactly when `want` says so, else why not.
+fn printed(step: Str, needle: Str, want: Bool) -> Str {
+    if last_warm.contains(needle) == want { return "" }
+    let verb = if want { "did not print" } else { "printed" }
+    "after {step}: the check {verb} `{needle}`:\n{last_warm}"
+}
+
+// Replaces `old`, which must occur once, with `new` in src/<file> of both trees.
+fn edit_both(warm: Str, cold: Str, file: Str, old: Str, new: Str) {
+    for t in [warm, cold] {
+        let path = "{t}/app/src/{file}"
+        let before = read_file(path)
+        assert_eq(before.split(old).len(), 2)
+        write_file(path, before.replace(old, new))
+    }
+}
+
+// Runs the edits under `with_knob` and asserts that each warm check printed what the cold
+// check printed, and the verdict each edit calls for.
+fn run_edits(tag: Str, with_knob: Str) {
+    knob = with_knob
+    last_warm = ""
+    warm_checks = 0
+    let root = sh("pwd -P")
+    let warm = "{root}/.tmp/_daemon_ptr_field_edit_{tag}_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_ptr_field_edit_{tag}_cold_{getpid()}"
+    dev_tree(root, warm)
+    dev_tree(root, cold)
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut checks = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        let escape = "PtrEscapesFfiScope"
+        problems.push(compare(warm, cold, "the first check"))
+        problems.push(printed("the first check", escape, false))
+        edit_both(warm, cold, "shapes.bl", "    n: Int\n", "    n: Ptr[U8]\n")
+        problems.push(compare(warm, cold, "an edit that makes W.n a Ptr"))
+        problems.push(printed("an edit that makes W.n a Ptr", escape, true))
+        edit_both(warm, cold, "shapes.bl", "    n: Ptr[U8]\n", "    n: Int\n")
+        problems.push(compare(warm, cold, "an edit that makes W.n an Int again"))
+        problems.push(printed("an edit that makes W.n an Int again", escape, false))
+        // W holds no Ptr of its own here: only the field of Inner it holds can make it one.
+        edit_both(warm, cold, "shapes.bl", "    v: Int\n", "    v: Ptr[U8]\n")
+        problems.push(compare(warm, cold, "an edit that makes Inner.v a Ptr"))
+        problems.push(printed("an edit that makes Inner.v a Ptr", escape, true))
+        edit_both(warm, cold, "shapes.bl", "    v: Ptr[U8]\n", "    v: Int\n")
+        problems.push(compare(warm, cold, "an edit that makes Inner.v an Int again"))
+        problems.push(printed("an edit that makes Inner.v an Int again", escape, false))
+        checks = served(warm, "checks")
+    }
+    shell_exec("rm -rf {warm} {cold}")
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(checks, warm_checks)
+}
+
+test "a warm recheck after a field edit that adds or removes a Ptr prints what a cold check prints" {
+    run_edits("keep", "")
+}
+
+test "a warm recheck that loads each check cold prints what a cold check prints after a field edit that adds or removes a Ptr" {
+    run_edits("cold_load", "BLINK_DEV_DAEMON_KEEP_SOURCES=0")
+}
