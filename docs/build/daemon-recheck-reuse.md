@@ -809,3 +809,41 @@ the Str hash (row 2, 50 ms: a hash cached in the Str header, interned keys, or a
 Map order is seeded per process, so the hash value sets no order a user sees); a new Map or
 List for each call, which drives the GC (rows 4, 6); the AST getters, measured at `-O2`
 (row 1).
+
+### The stamp row after the cut
+
+`tc_stamp_assert` now finds the untyped nodes first and runs the name ladder only where a name
+position holds one of them. A name position always holds a bare Ident, so with no untyped
+Ident the ladder does not run. The walk order and the owner column get room for every node
+before the walk starts. The report is the same: the first untyped node of each kind, in walk
+order, with the same text, and an item name in a name position is still excused.
+
+In `src/cli.bl` the walk reaches 343942 nodes. 33427 of them carry no type, and each one is an
+item name in a name position. So the ladder still runs 33427 times, against 46622 before (one
+for each name position). The ladder itself, keyed by Str, is the chore for the Str-keyed name
+lookups.
+
+Stamp phase (row 5), gen1 of 51306b80 (base) and of 29d8c697 (tip), as `task gen1` links them (`-O1`, no `-g`),
+`perf record --call-graph dwarf` over 20 warm rechecks of `src/cli.bl`, ms for each check:
+
+| part | base | tip |
+|---|---|---|
+| stamp phase | 37.2 | 32.5 |
+| list growth in the walk (`list_push`) | 3.7 | 1.7 |
+| stood lookup on an empty map (`map_has`) | 1.5 | 0.1 |
+| `List.with_capacity` in the assert | 0.7 | 0.0 |
+| name ladder (`is_import_module_name`, `is_trait_name`, `is_known_type`, `lookup_fnsig`) | 6.7 | 5.6 |
+
+Wall time, alternating, `setarch -R`, median of 5 [min-max] (s), two runs, load 0.3 to 1.3:
+
+| case | base | tip |
+|---|---|---|
+| warm body edit, `src/cli.bl` | 0.304 [0.296-0.305], 0.300 [0.298-0.307] | 0.299 [0.293-0.300], 0.298 [0.297-0.299] |
+| warm body edit, `src/cname.bl` | 0.295 [0.290-0.298], 0.293 [0.289-0.297] | 0.287 [0.285-0.289], 0.289 [0.286-0.293] |
+| cold `blink check src/cli.bl` | 0.400 [0.398-0.404], 0.407 [0.399-0.426] | 0.401 [0.395-0.402], 0.394 [0.393-0.408] |
+
+The cut is about 5 ms of a 300 ms recheck, which is near the spread of 5 runs. Over 20 warm
+rechecks with a real edit each, the median is 0.304 on base and 0.297 on tip in one run, and
+0.307 and 0.303 in another. The output of each run is byte-equal between base and tip. In
+`task bench-edit-loop`, no row is slower than base. Worker VmHWM over 20 rechecks: 363500 and
+371236 kB on base, 371052 and 369292 kB on tip.
