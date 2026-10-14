@@ -809,3 +809,85 @@ the Str hash (row 2, 50 ms: a hash cached in the Str header, interned keys, or a
 Map order is seeded per process, so the hash value sets no order a user sees); a new Map or
 List for each call, which drives the GC (rows 4, 6); the AST getters, measured at `-O2`
 (row 1).
+
+### The stamp row after the cut
+
+`tc_stamp_assert` now finds the untyped nodes first and runs the name ladder only where a name
+position holds one of them. A name position always holds a bare Ident, so with no untyped
+Ident the ladder does not run. The walk order and the owner column get room for every node
+before the walk starts. The report is the same: the first untyped node of each kind, in walk
+order, with the same text, and an item name in a name position is still excused.
+
+In `src/cli.bl` the walk reaches 343942 nodes. 33427 of them carry no type, and each one is an
+item name in a name position. So the ladder still runs 33427 times, against 46622 before (one
+for each name position). The ladder itself, keyed by Str, is the chore for the Str-keyed name
+lookups.
+
+Stamp phase (row 5), gen1 of 51306b80 (base) and of 29d8c697 (tip), as `task gen1` links them (`-O1`, no `-g`),
+`perf record --call-graph dwarf` over 20 warm rechecks of `src/cli.bl`, ms for each check:
+
+| part | base | tip |
+|---|---|---|
+| stamp phase | 37.2 | 32.5 |
+| list growth in the walk (`list_push`) | 3.7 | 1.7 |
+| stood lookup on an empty map (`map_has`) | 1.5 | 0.1 |
+| `List.with_capacity` in the assert | 0.7 | 0.0 |
+| name ladder (`is_import_module_name`, `is_trait_name`, `is_known_type`, `lookup_fnsig`) | 6.7 | 5.6 |
+
+Wall time, alternating, `setarch -R`, median of 5 [min-max] (s), two runs, load 0.3 to 1.3:
+
+| case | base | tip |
+|---|---|---|
+| warm body edit, `src/cli.bl` | 0.304 [0.296-0.305], 0.300 [0.298-0.307] | 0.299 [0.293-0.300], 0.298 [0.297-0.299] |
+| warm body edit, `src/cname.bl` | 0.295 [0.290-0.298], 0.293 [0.289-0.297] | 0.287 [0.285-0.289], 0.289 [0.286-0.293] |
+| cold `blink check src/cli.bl` | 0.400 [0.398-0.404], 0.407 [0.399-0.426] | 0.401 [0.395-0.402], 0.394 [0.393-0.408] |
+
+The cut is about 5 ms of a 300 ms recheck, which is near the spread of 5 runs. Over 20 warm
+rechecks with a real edit each, the median is 0.304 on base and 0.297 on tip in one run, and
+0.307 and 0.303 in another. The output of each run is byte-equal between base and tip. In
+`task bench-edit-loop`, no row is slower than base. Worker VmHWM over 20 rechecks: 363500 and
+371236 kB on base, 371052 and 369292 kB on tip.
+
+### The stamp row after the per-spelling memo
+
+The 33427 ladder calls in `src/cli.bl` ask about only 4228 spellings. The assert now keeps
+the ladder's answer for each spelling in a map that lives for one `tc_stamp_assert` call. The
+key is the spelling alone. Every other input to the ladder is a table that nothing writes while
+the assert runs, plus `nr_current_module`, which is one value for the whole call. Scope is not
+in the key: the scope checks (`tc_old_calls`, `tc_name_position_is_value`) still run for each
+position, because one spelling can be an item at one position and a shadowing local at
+another. The assert also no longer clears the walk marks at its end, as nothing reads them
+after the pass.
+
+The ladder reads the module that is current when the assert runs, not the module of the node.
+A fix that changes this must add the module to the memo key.
+
+Stamp phase, the same perf method, tip 29d8c697 and memo 24564045 in one window each, ms for
+each check:
+
+| part | base | tip | memo |
+|---|---|---|---|
+| stamp phase | 37.2 | 32.7 | 27.8 |
+| `tc_stamp_assert`, inclusive | | 15.4 | 10.8 |
+| name ladder, inclusive (`is_import_module_name`, `is_known_type`, `lookup_fnsig`, `is_trait_name`) | 6.7 | 5.8 | 0.9 |
+| reply path, total | | 302.9 | 295.2 |
+
+Wall time, alternating base 51306b80, tip 29d8c697 and memo 24564045, `setarch -R`, median of 5
+[min-max] (s), two runs:
+
+| case | base | memo |
+|---|---|---|
+| warm body edit, `src/cli.bl` | 0.300 [0.294-0.314], 0.301 [0.298-0.303] | 0.294 [0.292-0.296], 0.296 [0.291-0.298] |
+| warm body edit, `src/cname.bl` | 0.294 [0.289-0.296], 0.294 [0.290-0.297] | 0.282 [0.280-0.287], 0.287 [0.286-0.292] |
+| cold `blink check src/cli.bl` | 0.398, 0.403 | 0.393, 0.393 |
+
+The min-max ranges touch, so the 5-run spread alone does not separate them. The runs alternate,
+so each memo run has a base run next to it. In those pairs the memo is faster in 9 of 10 for
+`src/cli.bl` (median gain 5.5 ms) and in 10 of 10 for `src/cname.bl` (median gain 9 ms). That
+is about 2 to 3% of the recheck.
+
+`task bench-edit-loop`, base against the final branch build, two rounds, the order swapped in the
+second: no row is slower than base. Worker VmHWM over 20 rechecks of `src/cli.bl`: 342904 and
+348824 kB on base, 369816 and 363308 kB on the final build. Base read 363500 and 371236 kB in
+the earlier runs, so this is within the spread of the GC heap high-water mark. The memo holds
+a few thousand entries.

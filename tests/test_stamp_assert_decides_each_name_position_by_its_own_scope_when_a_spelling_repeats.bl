@@ -1,0 +1,129 @@
+// One spelling can stand in many name positions of a program, and the stamp assert may answer
+// the item-table half of the question once per spelling. The scope half it may not: a binding
+// shadows an item at ONE position, so the same spelling is an excused item name in one place
+// and a value that must carry a type in another. Each row puts the same item spelling in two
+// name positions of one check, one of them bound as a value, and pins the exact report. Rows
+// run in both walk orders, so an answer carried from the first position to the second is wrong
+// in at least one of them.
+//
+// The holes are grafted onto the body of `main`, because a hole in clean source is what the
+// pass exists to make impossible. Inference records a shadowing binding per node; the graft
+// writes the same record by hand, as inference never sees the grafted nodes.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_stamp_program, tc_name_position_is_value}
+import parser.{node_count, node_push, node_kind, node_name, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist}
+import ast.{NodeKind, AstNode}
+import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn clean_src() -> Str {
+    let mut s = "type ZzShape \{ zzw: Int }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let zzs = ZzShape \{ zzw: 1 }\n")
+    s = s.concat("    io.println(\"\{zzs.zzw}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn compile_probe(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, clean_src())
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn main_body() -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == "main" { return node_body(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// `<nm>.zzfield` on line `line`, the untyped qualifier at column 5 and the untyped access at
+// column 9. The access is a cascade from its qualifier, so only the qualifier can report.
+fn access_on(nm: Str, line: Int) -> Int ! Parse.Build {
+    let q = node_count()
+    node_push(AstNode { kind: NodeKind.Ident, name: nm, line: line, col: 5 })
+    let n = node_count()
+    node_push(AstNode { kind: NodeKind.FieldAccess, name: "zzfield", obj: q, line: line, col: 9 })
+    n
+}
+
+// The same access, with its qualifier recorded as a value: a local bound under `nm` stands
+// between the spelling and the item.
+fn shadowed_access_on(nm: Str, line: Int) -> Int ! Parse.Build {
+    let n = access_on(nm, line)
+    let q = n - 1
+    while tc_name_position_is_value.len() <= q { tc_name_position_is_value.push(0) }
+    tc_name_position_is_value.set(q, 1)
+    n
+}
+
+// Append `stmts` to the body of `main`, run the pass, and answer the internal errors it raised
+// as "<message> @<line>:<col>" in report order.
+fn ices_with(program: Int, stmts: List[Int]) -> List[Str] ! Parse.Build, TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let body = main_body()
+    assert(body != -1)
+    // sublist_push guards on an open sublist, which only the parser normally holds.
+    let scratch = new_sublist()
+    for s in stmts { sublist_push(node_stmts(body), s) }
+    finalize_sublist(scratch)
+    diag_reset()
+    tc_stamp_program(program)
+    assert_eq(diag_count, 0)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "ice" { out.push("{d.name} {d.code}: {d.message} @{d.line}:{d.col}") }
+    }
+    assert_eq(out.len(), diag_ice_count)
+    out
+}
+
+fn ice(kind: Str, line: Int, col: Int) -> Str {
+    "NodeCarriesNoType I0001: a {kind} node reached the end of type checking with no type @{line}:{col}"
+}
+
+// The walk pops the LAST statement first, so walk order runs the statements backwards.
+
+test "a type name reached first as an item does not excuse a later shadowed one" {
+    let program = compile_probe("build/stamp_scope_type_item_first.bl")
+    let got = ices_with(program, [shadowed_access_on("ZzShape", 951), access_on("ZzShape", 952)])
+    assert_eq(got, [ice("Ident", 951, 5)])
+}
+
+test "a type name reached first as a shadowed value reports, and the later item stays excused" {
+    let program = compile_probe("build/stamp_scope_type_value_first.bl")
+    let got = ices_with(program, [access_on("ZzShape", 961), shadowed_access_on("ZzShape", 962)])
+    assert_eq(got, [ice("Ident", 962, 5)])
+}
+
+test "a module name reached first as an item does not excuse a later shadowed one" {
+    let program = compile_probe("build/stamp_scope_module_item_first.bl")
+    let got = ices_with(program, [shadowed_access_on("io", 971), access_on("io", 972)])
+    assert_eq(got, [ice("Ident", 971, 5)])
+}
+
+test "every position of one spelling is asked on its own: items between shadowed ones" {
+    let program = compile_probe("build/stamp_scope_interleaved.bl")
+    let got = ices_with(program, [
+        access_on("ZzShape", 981),
+        shadowed_access_on("ZzShape", 982),
+        access_on("ZzShape", 983),
+        shadowed_access_on("ZzShape", 984),
+        access_on("ZzShape", 985),
+    ])
+    assert_eq(got, [ice("Ident", 984, 5)])
+}
+
+test "the shadowed positions alone, with no item position of the spelling, all go unexcused" {
+    let program = compile_probe("build/stamp_scope_all_shadowed.bl")
+    let got = ices_with(program, [shadowed_access_on("ZzShape", 991), shadowed_access_on("ZzShape", 992)])
+    assert_eq(got, [ice("Ident", 992, 5)])
+}

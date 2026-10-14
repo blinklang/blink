@@ -168,8 +168,8 @@ let mut tc_mc_obj_value_marks: List[Int] = []
 // the only time the question can be asked; read by tc_stamp_name_child long after
 // the scope is gone. Monotonic, like tc_mc_obj_value_marks and for the same reason: a
 // later re-inference with the scope torn down must not un-mark what it can no
-// longer see.
-let mut tc_name_position_is_value: List[Int] = []
+// longer see. Public so a test can bind a grafted node, which inference never sees.
+pub let mut tc_name_position_is_value: List[Int] = []
 
 // MethodCall node id -> 1 when inference typed it as a sealed ops trait's qualified call,
 // `StrOps.len(s)`. The build rewrites exactly these into method form, so no later stage
@@ -24451,6 +24451,15 @@ fn tc_record_name_position_value(n: Int) {
 // to describe. Everything else in those three positions is a value and must carry a type like
 // any other, which is what the total-stamp pass excuses against this answer.
 pub fn tc_stamp_name_child(n: Int) -> Int {
+    let mut items: Map[Str, Int] = Map()
+    tc_stamp_name_child_in(n, items)
+}
+
+// tc_stamp_name_child with the item-table answer kept in `items` per spelling. The ladder
+// reads the spelling and tables that nothing writes while the assert runs, so one answer holds
+// for every position of that spelling. Scope is per position and stays out of the key: the
+// same spelling is an item at one position and a shadowing local at another.
+fn tc_stamp_name_child_in(n: Int, items: Map[Str, Int]) -> Int {
     let c = tc_name_position_child(n)
     if c == -1 { return -1 }
     // `old` in an @ensures snapshot names the snapshot form, not a value or an item.
@@ -24462,7 +24471,13 @@ pub fn tc_stamp_name_child(n: Int) -> Int {
     if c < tc_name_position_is_value.len() {
         if tc_name_position_is_value.get(c).unwrap() != 0 { return -1 }
     }
-    if tc_name_is_item(node_name(c)) == 0 { return -1 }
+    let nm = node_name(c)
+    let mut is_item = items.get(nm) ?? -1
+    if is_item == -1 {
+        is_item = tc_name_is_item(nm)
+        items.insert(nm, is_item)
+    }
+    if is_item == 0 { return -1 }
     c
 }
 
@@ -24684,7 +24699,13 @@ fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.R
 // walks a field default or a @where predicate on its own; it reuses the same buffer, so those
 // walks cost their own subtree and not a pass over every node.
 pub fn tc_stamp_walk(root: Int, owners: List[Int], seen: List[Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let mut order: List[Int] = []
+    tc_stamp_walk_sized(root, owners, seen, 0)
+}
+
+// The walk with room for `cap` nodes in its order: the whole-program walk reaches nearly every
+// node, and growing a list that size by doubling copies it again at each step.
+fn tc_stamp_walk_sized(root: Int, owners: List[Int], seen: List[Int], cap: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut order: List[Int] = List.with_capacity(cap)
     if root == -1 { return order }
     while seen.len() < node_count() { seen.push(0) }
     let mut stack: List[Int] = [root]
@@ -24827,39 +24848,55 @@ fn tc_stamp_standdown_bodies(owner_index: List[Int]) -> Map[Int, Int] {
 // Phase 5. Reports against the first offending node per kind, so a systemic hole reads as one
 // error naming its kind and not as thousands. Nodes inside a body `stood` names are passed
 // over: an unclaimed call there leaves holes the report coming from codegen already owns.
-fn tc_stamp_assert(order: List[Int], owners: List[Int], stood: Map[Int, Int]) ! Diag.Report {
-    // The name positions first, read off the PARENT, so the loop below can ask about a node
-    // without having to find its parent again. One slot per node id, 1 for a name position.
-    let mut names: List[Int] = List.with_capacity(node_count())
-    while names.len() < node_count() { names.push(0) }
-    let mut ni = 0
-    while ni < order.len() {
-        let nc = tc_stamp_name_child(order.get(ni).unwrap())
-        if nc != -1 { names.set(nc, 1) }
-        ni = ni + 1
-    }
-    let mut reported: Map[Str, Int] = Map()
+//
+// `marks` is the walk's `seen` buffer: all zero, one slot per node the walk reached. Nothing
+// reads it after this pass, so the marks are left in it.
+fn tc_stamp_assert(order: List[Int], owners: List[Int], stood: Map[Int, Int], marks: List[Int]) ! Diag.Report {
+    // The untyped nodes first. Only a node that carries no type can need a name excuse, so the
+    // name ladder runs for those alone. In a program that type checks they are the item names
+    // in name positions, which leaves out the typed name positions (about three in ten).
+    // Slot 1 marks a candidate, 2 a candidate excused as a name.
+    let check_stood = stood.len() > 0
+    let mut cands: List[Int] = []
+    let mut ident_cand = false
     let mut i = 0
     while i < order.len() {
-        let n = order.get(i).unwrap()
-        let k = nk_of(node_kind(n))
-        if stood.contains_key(owners.get(i).unwrap()) {
-            i = i + 1
-            continue
-        }
-        if nk_is_typed(k) != 0 && names[n] == 0 {
-            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 && tc_stamp_is_cascade(n) == 0 {
-                let kn = node_kind_name(node_kind(n))
-                if reported.contains_key(kn) == false {
-                    reported.insert(kn, 1)
-                    diag_ice_at("NodeCarriesNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                        "a {kn} node reached the end of type checking with no type",
-                        n,
-                        "every node whose kind denotes or binds a value must carry a type by the end of inference; this is a compiler defect, not a program error")
-                }
+        let n = order[i]
+        if !check_stood || !stood.contains_key(owners[i]) {
+            if nk_is_typed(nk_of(node_kind(n))) != 0 && tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
+                cands.push(n)
+                marks.set(n, 1)
+                if node_kind(n) == NodeKind.Ident { ident_cand = true }
             }
         }
         i = i + 1
+    }
+    // A name position always holds a bare Ident, so with no Ident candidate there is nothing
+    // to excuse. Otherwise the positions are read off the PARENT, as the walk has no parent
+    // column, and the ladder is put only where the child is a candidate.
+    if ident_cand {
+        // A few thousand spellings fill tens of thousands of name positions. Dropped with
+        // this call, so no answer outlives the tables it was read from.
+        let mut items: Map[Str, Int] = Map()
+        for p in order {
+            let c = tc_name_position_child(p)
+            if c != -1 && c < marks.len() && marks[c] == 1 {
+                if tc_stamp_name_child_in(p, items) == c { marks.set(c, 2) }
+            }
+        }
+    }
+    let mut reported: Map[Str, Int] = Map()
+    for n in cands {
+        if marks[n] == 1 && tc_stamp_is_cascade(n) == 0 {
+            let kn = node_kind_name(node_kind(n))
+            if reported.contains_key(kn) == false {
+                reported.insert(kn, 1)
+                diag_ice_at("NodeCarriesNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                    "a {kn} node reached the end of type checking with no type",
+                    n,
+                    "every node whose kind denotes or binds a value must carry a type by the end of inference; this is a compiler defect, not a program error")
+            }
+        }
     }
 }
 
@@ -24902,10 +24939,10 @@ fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
 // Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
 // harness reach the same pass by the same name.
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let mut owners: List[Int] = []
+    let mut owners: List[Int] = List.with_capacity(node_count())
     // tc_stamp_walk fills one slot per node.
     let mut seen: List[Int] = List.with_capacity(node_count())
-    let order = tc_stamp_walk(program, owners, seen)
+    let order = tc_stamp_walk_sized(program, owners, seen, node_count())
     tc_report_unclaimed_calls()
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
@@ -24947,7 +24984,7 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
         // readers are the whole program. That one case still stands the pass down everywhere.
         if stood.contains_key(-1) { return }
     }
-    tc_stamp_assert(order, owners, stood)
+    tc_stamp_assert(order, owners, stood, seen)
 }
 
 // ── Name and impl-shape helpers ────────────────────────────────────────────────

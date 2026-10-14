@@ -1,0 +1,139 @@
+// The total-stamp assert reports a node that denotes a value and carries no type, once per
+// node kind, against the first such node in walk order. A bare Ident in a NAME position (the
+// qualifier of a field access or method call, a callee) is excused when its spelling names an
+// item and nothing is bound under it: it has no value for a type to describe. The same
+// spelling anywhere else, and any other spelling in that position, is a value and reports.
+//
+// The holes are grafted onto the body of `main`, because a hole in clean source is what the
+// pass exists to make impossible. Each row pins the exact internal-error text and the order of
+// the reports, so a pass that excuses too much, reports a later node of a kind, or skips a
+// kind turns a row red.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_stamp_program}
+import parser.{node_count, node_push, node_kind, node_name, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist}
+import ast.{NodeKind, AstNode}
+import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn clean_src() -> Str {
+    let mut s = "type ZzShape \{ zzw: Int }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let zzs = ZzShape \{ zzw: 1 }\n")
+    s = s.concat("    io.println(\"\{zzs.zzw}\")\n")
+    s = s.concat("}\n")
+    s
+}
+
+fn compile_probe(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, clean_src())
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn main_body() -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == "main" { return node_body(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// An untyped literal on line `line`.
+fn lit_at(line: Int) -> Int ! Parse.Build {
+    let n = node_count()
+    node_push(AstNode { kind: NodeKind.IntLit, line: line, col: 5 })
+    n
+}
+
+// An untyped bare Ident spelled `nm` on line `line`.
+fn ident_at(nm: Str, line: Int) -> Int ! Parse.Build {
+    let n = node_count()
+    node_push(AstNode { kind: NodeKind.Ident, name: nm, line: line, col: 5 })
+    n
+}
+
+// `<nm>.zzfield` on line `line`, the qualifier at column 5 and the access at column 9; neither
+// carries a type. The access is a cascade from its qualifier, so only the qualifier can report.
+fn access_on(nm: Str, line: Int) -> Int ! Parse.Build {
+    let q = ident_at(nm, line)
+    let n = node_count()
+    node_push(AstNode { kind: NodeKind.FieldAccess, name: "zzfield", obj: q, line: line, col: 9 })
+    n
+}
+
+// Append `stmts` to the body of `main`, run the pass, and answer the internal errors it raised
+// as "<message> @<line>:<col>" in report order.
+fn ices_with(program: Int, stmts: List[Int]) -> List[Str] ! Parse.Build, TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let body = main_body()
+    assert(body != -1)
+    // sublist_push guards on an open sublist, which only the parser normally holds.
+    let scratch = new_sublist()
+    for s in stmts { sublist_push(node_stmts(body), s) }
+    finalize_sublist(scratch)
+    diag_reset()
+    tc_stamp_program(program)
+    assert_eq(diag_count, 0)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "ice" { out.push("{d.name} {d.code}: {d.message} @{d.line}:{d.col}") }
+    }
+    assert_eq(out.len(), diag_ice_count)
+    out
+}
+
+fn ice(kind: Str, line: Int, col: Int) -> Str {
+    "NodeCarriesNoType I0001: a {kind} node reached the end of type checking with no type @{line}:{col}"
+}
+
+test "the clean program raises nothing" {
+    let program = compile_probe("build/stamp_first_per_kind_clean.bl")
+    assert_eq(diag_count, 0)
+    assert_eq(diag_ice_count, 0)
+    assert_eq(ices_with(program, []).len(), 0)
+}
+
+test "an untyped value node reports once, against the first of its kind in walk order" {
+    let program = compile_probe("build/stamp_first_per_kind_lits.bl")
+    // The walk pops the LAST statement first, so walk order runs the statements backwards.
+    let got = ices_with(program, [lit_at(901), lit_at(902), lit_at(903)])
+    assert_eq(got, [ice("IntLit", 903, 5)])
+}
+
+test "a name-position qualifier that names an item is excused" {
+    let program = compile_probe("build/stamp_first_per_kind_items.bl")
+    let got = ices_with(program, [access_on("io", 911), access_on("ZzShape", 912)])
+    assert_eq(got.len(), 0)
+}
+
+test "a name-position qualifier with nothing behind its spelling reports as an Ident" {
+    let program = compile_probe("build/stamp_first_per_kind_unbound.bl")
+    let got = ices_with(program, [access_on("zzunbound", 921), access_on("zzother", 922)])
+    assert_eq(got, [ice("Ident", 922, 5)])
+}
+
+test "an item spelling outside a name position is a value and reports" {
+    let program = compile_probe("build/stamp_first_per_kind_bare_item.bl")
+    let got = ices_with(program, [ident_at("io", 931)])
+    assert_eq(got, [ice("Ident", 931, 5)])
+}
+
+test "each kind reports its own first node, in walk order, and excused names stay excused" {
+    let program = compile_probe("build/stamp_first_per_kind_mixed.bl")
+    let got = ices_with(program, [
+        lit_at(941),
+        access_on("zzunbound", 942),
+        access_on("io", 943),
+        lit_at(944),
+        access_on("ZzShape", 945),
+        access_on("zzother", 946),
+        lit_at(947),
+    ])
+    assert_eq(got, [ice("IntLit", 947, 5), ice("Ident", 946, 5)])
+}
