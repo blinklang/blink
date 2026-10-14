@@ -1,0 +1,112 @@
+// While the file BLINK_DEV_DAEMON_IDLE_HOLD names exists, the daemon's idle poll checks no
+// edit; once the file goes, the poll checks it. Daemon tests that need a check request, not
+// the poll, to check an edit rely on the hold, and some of them still pass without testing
+// anything when the poll checks first. A settle hook writes a line for each check the daemon
+// runs.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn set_leaf(tree: Str, value: Str) {
+    write_file("{tree}/app/src/leaf.bl", "pub fn leaf_value() -> Str \{\n    \"{value}\"\n}\n")
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_idle_hold_app\"\nversion = \"0.1.0\"\n")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    set_leaf(tree, "one")
+    write_file("{tree}/app/src/main.bl", "import leaf.\{leaf_value}\n\nfn main() \{\n    io.println(leaf_value())\n}\n")
+    write_file("{tree}/hold", "")
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the run drops
+// both, and the module filters. The daemon serves only a client whose env is its own, so both
+// run with the hook and the idle hold set. Their files live outside the app, so they are no
+// input of the check.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_DEV_TEST_SETTLE_HOOK='echo x >> {tree}/settles' BLINK_DEV_DAEMON_IDLE_HOLD={tree}/hold"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+// How many checks the daemon has settled.
+fn settles(tree: Str) -> Int {
+    sh("cat {tree}/settles 2>/dev/null | wc -l").to_int()
+}
+
+// Waits up to 20 s for the settle count to pass `than`; the count it read.
+fn settles_past(tree: Str, than: Int) -> Int {
+    let _ = process_run("sh", ["-c", "for i in $(seq 1 200); do [ $(cat {tree}/settles 2>/dev/null | wc -l) -gt {than} ] && exit 0; sleep 0.1; done; exit 1"])
+    settles(tree)
+}
+
+test "the idle hold keeps the poll from checking an edit until its file goes" {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_daemon_idle_hold_{getpid()}"
+    dev_tree(root, tree)
+    let pid = start_daemon(tree)
+    let mut started = -1
+    let mut checked = process_run("true", [])
+    let mut before_edit = -1
+    let mut held = -1
+    let mut released = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        // The worker checks when it starts.
+        started = settles_past(tree, 0)
+        checked = blink_in(tree, "check src/main.bl")
+        // Nothing changed since the worker's own check, so the request reuses it and settles
+        // nothing.
+        before_edit = settles(tree)
+        set_leaf(tree, "two")
+        // The one wait here that is not on an event: no settle is the event that must not
+        // happen. 1.5 s is three of the poll's 500 ms waits. Under load the poll may get fewer
+        // turns, which can only let this pass falsely, never fail falsely, so it cannot flake.
+        shell_exec("sleep 1.5")
+        held = settles(tree)
+        shell_exec("rm -f {tree}/hold")
+        released = settles_past(tree, held)
+    }
+    shell_exec("rm -rf {tree}")
+
+    assert(started > 0, "the worker settled no check")
+    assert_eq(checked.exit_code, 0)
+    assert_eq(before_edit, started)
+    assert_eq(held, before_edit)
+    assert(released > held, "no poll checked the edit after the hold went")
+}
