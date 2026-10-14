@@ -1,0 +1,93 @@
+// Resolve may keep what it learns about a spelling in one module, but each read of the spelling
+// is still a read of its own. Two reads that break the same rule are two errors, each at its own
+// position and in source order; two reads of an imported name both count as using the import;
+// and a check after the import list changes answers from the new list, not the one before.
+import typecheck.{check_types}
+import compiler.{compile_to_program, check_unused_imports}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PKG = "build/tc_spelling_read_twice_pkg"
+
+let SELECTS_BOTH = "import lib.\{shared, other\}\npub fn use_swaps() -> Int \{ shared() + other() \}\n"
+let SELECTS_OTHER = "import lib.\{other\}\npub fn use_swaps() -> Int \{ shared() + other() \}\n"
+
+fn compile_probe(probe_src: Str, swaps_src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let _mk = process_run("mkdir", ["-p", "{PKG}/src"])
+    write_file("{PKG}/blink.toml", "[package]\nname = \"tcspellingtwice\"\nversion = \"0.1.0\"\n")
+    write_file("{PKG}/src/lib.bl", "pub fn shared() -> Int \{ 1 \}\npub fn other() -> Int \{ 2 \}\nfn hidden() -> Int \{ 3 \}\n")
+    write_file("{PKG}/src/extra.bl", "pub fn thing() -> Int \{ 7 \}\n")
+    write_file("{PKG}/src/twice.bl", "import lib.\{other\}\npub fn first() -> Int \{ shared() \}\npub fn second() -> Int \{ shared() + other() \}\n")
+    write_file("{PKG}/src/peeks.bl", "import lib.\{shared\}\npub fn first_peek() -> Int \{ hidden() \}\npub fn second_peek() -> Int \{ hidden() + shared() \}\n")
+    write_file("{PKG}/src/swaps.bl", swaps_src)
+    write_file("{PKG}/src/probe.bl", probe_src)
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/probe.bl", 1)
+    check_types(program)
+    check_unused_imports()
+}
+
+fn cleanup() {
+    let _rm = process_run("rm", ["-rf", PKG])
+}
+
+// Each diagnostic of `severity` as its name, file and line, in the order it was reported.
+fn reported(severity: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == severity || (severity == "error" && d.severity == "ice") { out.push("{d.name} {d.file}:{d.line}") }
+    }
+    out
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops whatever stdout has
+// buffered.
+fn assert_reported(label: Str, severity: Str, want: List[Str]) {
+    let got = reported(severity)
+    let same = got.len() == want.len() && got.join("\n") == want.join("\n")
+    if !same {
+        io.eprintln("FAIL: {label}:\n  got:")
+        for e in got { io.eprintln("    {e}") }
+        io.eprintln("  want:")
+        for e in want { io.eprintln("    {e}") }
+    }
+    assert(same)
+}
+
+fn test_an_unselected_name_read_twice_is_two_errors_in_source_order() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import twice.\{first, second\}\nfn main() \{ assert(first() + second() > 0) \}\n", SELECTS_BOTH)
+    assert_reported("shared is not selected in twice, read on lines 2 and 3", "error", ["ImportNotSelected {PKG}/src/twice.bl:2", "ImportNotSelected {PKG}/src/twice.bl:3"])
+    cleanup()
+}
+
+fn test_a_private_name_read_twice_is_two_errors_in_source_order() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import peeks.\{first_peek, second_peek\}\nfn main() \{ assert(first_peek() + second_peek() > 0) \}\n", SELECTS_BOTH)
+    assert_reported("hidden is private to lib, read in peeks on lines 2 and 3", "error", ["PrivateItemAccess {PKG}/src/peeks.bl:2", "PrivateItemAccess {PKG}/src/peeks.bl:3"])
+    cleanup()
+}
+
+fn test_an_import_read_twice_is_used_and_an_unread_one_is_not() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    compile_probe("import lib.\{shared\}\nimport extra.\{thing\}\nfn main() \{ assert(shared() + shared() > 0) \}\n", SELECTS_BOTH)
+    assert_reported("no errors", "error", [])
+    assert_reported("extra is unused, lib is read twice", "warning", ["UnusedImport {PKG}/src/probe.bl:2"])
+    cleanup()
+}
+
+fn test_a_check_after_the_import_list_stops_selecting_a_name_reports_the_read() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let probe = "import swaps.\{use_swaps\}\nfn main() \{ assert(use_swaps() > 0) \}\n"
+    compile_probe(probe, SELECTS_BOTH)
+    assert_reported("swaps selects shared", "error", [])
+    compile_probe(probe, SELECTS_OTHER)
+    assert_reported("swaps no longer selects shared", "error", ["ImportNotSelected {PKG}/src/swaps.bl:2"])
+    compile_probe(probe, SELECTS_BOTH)
+    assert_reported("swaps selects shared again", "error", [])
+    cleanup()
+}
+
+fn main() {
+    test_an_unselected_name_read_twice_is_two_errors_in_source_order()
+    test_a_private_name_read_twice_is_two_errors_in_source_order()
+    test_an_import_read_twice_is_used_and_an_unread_one_is_not()
+    test_a_check_after_the_import_list_stops_selecting_a_name_reports_the_read()
+    io.println("a spelling read twice in one module is reported and marked at each read: ok")
+}

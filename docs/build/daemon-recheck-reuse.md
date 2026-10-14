@@ -894,3 +894,88 @@ second: no row is slower than base. Worker VmHWM over 20 rechecks of `src/cli.bl
 348824 kB on base, 369816 and 363308 kB on the final build. Base read 363500 and 371236 kB in
 the earlier runs, so this is within the spread of the GC heap high-water mark. The memo holds
 a few thousand entries.
+
+### The resolve row after the name lookup cut
+
+Resolve asked the same Str-keyed questions of a spelling at every read of it. Three cuts, all
+in `src/typecheck.bl`:
+
+1. `nr_check_selective_access_at` rules out a local binding before it runs the builtin ladder
+   (`is_builtin_name`), since most reads are of locals.
+2. Each module record (`ModuleNames`) keeps, for each module it imports selectively, the set of
+   spellings that import binds: each selected name and each alias. `is_selected_import` reads
+   that set and no longer walks the import list. The set is built and dropped with the import
+   index of the record, so an edit to an import list makes the next question build it again.
+3. Each module record keeps the answer resolve gives each spelling the module reads that no
+   local binding holds: the module it is not selected from (`nr_unselected_source`), whether
+   it is private here (`nr_private_access_here`), and the declaration it names
+   (`nr_find_bare_decl`). Every table behind an answer is filled before the walk: each
+   module's declarations and privates, the import lists, the symbol modules, the re-exports,
+   the namesake types, the type declarations of `Handler` and `Template` and the prelude
+   modules. Nothing writes them again until the next check. `resolve_names` drops every
+   answer when it starts to fill them. The module is in the key, as the record is the module's
+   own. Scope is not in the key: no answer reads scope state, and the import answer is read
+   only after the local check.
+
+The three calls emit nothing and mark nothing. Each diagnostic, each used-import mark and each
+note of the declaration a node names is made by the caller at each node, from the kept answer.
+The only writes under the calls fill the import index and the selected spellings of a module
+record, both built from that module's import list alone.
+
+The state lives in the module record, not in new module globals.
+
+Tests:
+
+- `tests/test_typecheck_name_answers_follow_the_module_and_scope_of_each_use.bl`: one spelling
+  selected in one module and not in another, private in one module and declared in another,
+  and shadowed by a local in one function and not in the next. Each module pair loads in both
+  orders. It fails when all modules read one answer record, and when a kept answer is read
+  for a local binding.
+- `tests/test_daemon_recheck_after_an_edit_to_an_import_or_a_top_level_name_prints_what_a_cold_check_prints.bl`:
+  a warm daemon and a cold check after each edit to an import list, a top-level name and a
+  private declaration. Both outputs must be equal, in human and JSON form. It runs once with
+  the daemon keeping sources, and once with `BLINK_DEV_DAEMON_KEEP_SOURCES=0`. It fails when
+  the answers are kept from the check before, and when the selected spellings are not built
+  again after an import list changes.
+- `tests/test_typecheck_a_spelling_read_twice_in_one_module_is_reported_and_marked_at_each_read.bl`:
+  a name not selected and a private name, each read twice in one module, give two errors in
+  source order; an import read twice is used and an unread one is reported; and a second check
+  in one process after the import list stops selecting a name reports the read. It fails when
+  a diagnostic comes only from the first read, when a call does not mark its import used, and
+  when the selected spellings are not built again after an import list changes.
+
+All three pass on base.
+
+Resolve phase, `perf record --call-graph dwarf` over 20 warm rechecks of `src/cli.bl`, base
+(gen1 of 3c41c677) and tip (gen1 of 60c890dc) in one window each, ms for each check:
+
+| part | base | tip |
+|---|---|---|
+| resolve phase | 65.0 | 54.7 |
+| Str-keyed work in resolve | 32.5 | 28.6 |
+| `nr_check_selective_access_at` | 11.9 | 4.4 |
+| `is_selected_import` | 4.6 | 0.7 |
+| `is_builtin_name` | 4.5 | 0.6 |
+| `nr_resolve_bare_decl` | 3.0 | 2.5 |
+| `is_private_access` | 3.1 | 2.4 |
+| `nr_top_index` (not cut) | 5.5 | 4.4 |
+
+The memo of the private and declaration answers gains less than the other cuts: each read
+still hashes the module name to find the record (`nr_module_names_of`, 2.2 ms).
+
+Wall time, alternating, `setarch -R`, 10 pairs in each of two runs, the order swapped in the
+second, median of the first 5 [min-max] (s):
+
+| case | base | tip | pairs tip faster | median paired delta (ms) |
+|---|---|---|---|---|
+| warm body edit, `src/cli.bl` | 0.297 [0.293-0.299], 0.296 [0.292-0.296] | 0.284 [0.281-0.286], 0.285 [0.281-0.292] | 10/10, 10/10 | -12, -8 |
+| warm body edit, `src/cname.bl` | 0.281 [0.281-0.290], 0.282 [0.281-0.287] | 0.277 [0.271-0.282], 0.279 [0.271-0.281] | 10/10, 10/10 | -7, -7 |
+| cold `blink check src/cli.bl` | 0.393 [0.391-0.395], 0.400 [0.389-0.410] | 0.385 [0.382-0.394], 0.390 [0.385-0.397] | 9/10, 9/10 | -9, -11 |
+| warm, no change | 0.009 | 0.009 | | 0 |
+
+The output of each run is byte-equal between base and tip. The first cold check of a run
+also prints `resolving dependencies...`, whichever binary runs first.
+
+`task bench-edit-loop`, base and tip, two rounds, the order swapped in the second: no row is
+slower than base. Worker VmHWM over 20 rechecks of `src/cli.bl`: 363852 and 373816 kB on base,
+361656 and 362064 kB on tip.
