@@ -4,7 +4,10 @@
 // the spelling a module uses, or that adds or removes a private item of that spelling in
 // another module, a warm daemon check must print what a cold check of a twin tree prints, in
 // human and JSON form. An answer kept from the check before the edit would print the old
-// verdict.
+// verdict. The run goes once with the daemon keeping the parse of each source the edit did
+// not touch, and once with the dev knob that loads each check cold: a cold load gives an
+// edited import the node id its old text had, so an answer filed by node id and kept from the
+// last check is read back for the new text.
 
 import std.process.{ProcessResult}
 import std.testing.{cleanup}
@@ -28,21 +31,25 @@ fn dev_tree(root: Str, tree: Str) {
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
     write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
     write_file("{tree}/app/src/lib.bl", "pub fn shared() -> Int \{ 1 \}\npub fn other() -> Int \{ 2 \}\n")
-    // picks and skips import one spelling each from lib; both use shared, which skips does
-    // not import.
+    // picks and skips both use shared from lib; the edits below take it out of the import
+    // list of skips and put it back.
     write_file("{tree}/app/src/picks.bl", "import lib.\{shared\}\npub fn use_picks() -> Int \{ shared() \}\n")
-    write_file("{tree}/app/src/skips.bl", "import lib.\{other\}\npub fn use_skips() -> Int \{ shared() \}\n")
+    write_file("{tree}/app/src/skips.bl", "import lib.\{shared\}\npub fn use_skips() -> Int \{ shared() \}\n")
     write_file("{tree}/app/src/main.bl", "import picks.\{use_picks\}\nimport skips.\{use_skips\}\n\nfn main() \{\n    io.println(\"\{use_picks()\} \{use_skips()\}\")\n\}\n")
     // The idle poll would check an edit cold and keep no source, if the request after the
     // edit came later than its wait; the hold keeps it off, so each warm check is a request's.
     write_file("{tree}/hold", "")
 }
 
+// The knob setting of the run under way: "" keeps sources, "BLINK_DEV_DAEMON_KEEP_SOURCES=0"
+// loads each check cold.
+let mut knob: Str = ""
+
 // The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE and the module
-// filters; the daemon serves only a client whose env is its own, so both drop them. Both
-// name the idle hold, which only the warm tree's daemon reads.
+// filters; the daemon serves only a client whose env is its own, so both drop them, and both
+// run with the knob as set. Both name the idle hold, which only the warm tree's daemon reads.
 fn env_of(tree: Str) -> Str {
-    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_DEV_DAEMON_IDLE_HOLD={tree}/hold"
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE -u BLINK_DEV_DAEMON_KEEP_SOURCES BLINK_CACHE_DIR={tree}/objcache BLINK_DEV_DAEMON_IDLE_HOLD={tree}/hold {knob}"
 }
 
 fn blink_in(tree: Str, args: Str) -> ProcessResult {
@@ -139,10 +146,15 @@ fn edit_both(warm: Str, cold: Str, file: Str, old: Str, new: Str) {
     }
 }
 
-test "a warm recheck after an edit to an import or a top-level name prints what a cold check prints" {
+// Runs the edits under `with_knob` and asserts that each warm check printed what the cold
+// check printed, and the verdict each edit calls for.
+fn run_edits(tag: Str, with_knob: Str) {
+    knob = with_knob
+    last_warm = ""
+    warm_checks = 0
     let root = sh("pwd -P")
-    let warm = "{root}/.tmp/_daemon_import_edit_warm_{getpid()}"
-    let cold = "{root}/.tmp/_daemon_import_edit_cold_{getpid()}"
+    let warm = "{root}/.tmp/_daemon_import_edit_{tag}_warm_{getpid()}"
+    let cold = "{root}/.tmp/_daemon_import_edit_{tag}_cold_{getpid()}"
     dev_tree(root, warm)
     dev_tree(root, cold)
     let pid = start_daemon(warm)
@@ -152,18 +164,18 @@ test "a warm recheck after an edit to an import or a top-level name prints what 
         assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
         let unselected = "ImportNotSelected"
         problems.push(compare(warm, cold, "the first check"))
-        problems.push(printed("the first check", unselected, true))
+        problems.push(printed("the first check", unselected, false))
         // Swapping one selected name for another keeps the shape of the file, so the new
         // import node can take the id the old one had.
-        edit_both(warm, cold, "skips.bl", "import lib.\{other\}", "import lib.\{shared\}")
-        problems.push(compare(warm, cold, "an edit that selects shared"))
-        problems.push(printed("an edit that selects shared", unselected, false))
         edit_both(warm, cold, "skips.bl", "import lib.\{shared\}", "import lib.\{other\}")
         problems.push(compare(warm, cold, "an edit that stops selecting shared"))
         problems.push(printed("an edit that stops selecting shared", unselected, true))
-        edit_both(warm, cold, "skips.bl", "import lib.\{other\}\n", "import lib.\{other, shared\}\n")
-        problems.push(compare(warm, cold, "an edit that adds shared to the selection"))
-        problems.push(printed("an edit that adds shared to the selection", unselected, false))
+        edit_both(warm, cold, "skips.bl", "import lib.\{other\}", "import lib.\{shared\}")
+        problems.push(compare(warm, cold, "an edit that selects shared again"))
+        problems.push(printed("an edit that selects shared again", unselected, false))
+        edit_both(warm, cold, "skips.bl", "import lib.\{shared\}\n", "import lib.\{other, shared\}\n")
+        problems.push(compare(warm, cold, "an edit that adds other to the selection"))
+        problems.push(printed("an edit that adds other to the selection", unselected, false))
         edit_both(warm, cold, "skips.bl", "import lib.\{other, shared\}\n", "import lib.\{other\}\n")
         problems.push(compare(warm, cold, "an edit that removes shared from the selection"))
         problems.push(printed("an edit that removes shared from the selection", unselected, true))
@@ -190,4 +202,12 @@ test "a warm recheck after an edit to an import or a top-level name prints what 
     let found: List[Str] = problems.filter(fn(p) { p != "" })
     assert_eq(found.join("\n"), "")
     assert_eq(checks, warm_checks)
+}
+
+test "a warm recheck after an edit to an import or a top-level name prints what a cold check prints" {
+    run_edits("keep", "")
+}
+
+test "a warm recheck that loads each check cold prints what a cold check prints after an edit to an import or a top-level name" {
+    run_edits("cold_load", "BLINK_DEV_DAEMON_KEEP_SOURCES=0")
 }
