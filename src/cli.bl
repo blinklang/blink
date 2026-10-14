@@ -839,9 +839,13 @@ fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool 
 }
 
 // The vendored header lines of a unit's key: each dir spelled as the compile's object spells
-// it (vendored_map_flags).
-fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str) -> Option[List[Str]] ! IO {
-    build_objcache.header_lines_named(dirs, vendored_dirs_by_name(debug_mode, dirs, target))
+// it (vendored_map_flags). written names what this build writes. A vendored dir can hold the
+// project, as -I. does, and what the build writes there is no input of it: in the key, each
+// build would miss the objects the last one stored.
+fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str, written: List[Str]) -> Option[List[Str]] ! IO {
+    let mut skip: List[Str] = [build_objcache.obj_cache_dir()]
+    for w in written { skip.push(w) }
+    build_objcache.vendored_key_lines(dirs, vendored_dirs_by_name(debug_mode, dirs, target), skip)
 }
 
 // " <flags>" a unit compile adds so its object names a vendored dir only as its key does
@@ -1112,14 +1116,14 @@ let mut cache_did_store: Int = 0
 // The object answered sits in snap_dir, which the caller removes after its link: the GC of
 // another build can remove the cache entry before then. The key and the compile both read
 // snap, the private copy of the C the build emitted.
-fn cache_compile_snapshot(snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
+fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
     let vendored_dirs = vendored_dirs_in(include_flags)
     let flags = cc_opt_flags(debug_mode, release_mode)
     let paths = match recorded_paths(debug_mode, path_dirname(c_path), arc_dir) {
         Some(p) => p
         None => return ""
     }
-    let lines = match vendored_header_lines(debug_mode, vendored_dirs, target) {
+    let lines = match vendored_header_lines(debug_mode, vendored_dirs, target, [out, c_path, snap_dir]) {
         Some(l) => l
         None => return ""
     }
@@ -1309,7 +1313,7 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     }
     let snap = "{snap_dir}/{path_basename(c_path)}"
     write_file(snap, c_source)
-    let cached_o = if cache_dir != "" { cache_compile_snapshot(snap, c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags) } else { "" }
+    let cached_o = if cache_dir != "" { cache_compile_snapshot(out, snap, c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags) } else { "" }
     // The map gives the binary the __FILE__ and debug paths a compile of c_path gives.
     let compile_input = if cached_o != "" { cached_o } else { "{snap} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}" }
     if build_objcache.dev_evict_at("link") {
@@ -2541,7 +2545,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut vendored_headers: Option[List[Str]] = None
     let vendored_dirs = vendored_dirs_in(include_flags)
     if use_cache && shas.is_some() {
-        vendored_headers = vendored_header_lines(debug_mode, vendored_dirs, target)
+        vendored_headers = vendored_header_lines(debug_mode, vendored_dirs, target, [out, work, units_dir])
         let mut modules: List[Str] = []
         let mut unit_headers: Map[Str, List[Str]] = Map()
         for u in files {

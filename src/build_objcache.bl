@@ -19,7 +19,7 @@
 // key both compile and both rename — content is byte-identical.
 
 import build_fs
-import std.path.{path_basename}
+import std.path.{path_basename, path_dirname}
 import sha256.{sha256_hex, sha256_file_hex}
 import std_cache_key.{sha256_of_manifest, sha256_of_file_first, IN_PROCESS_HASH_BYTES}
 
@@ -120,16 +120,55 @@ pub fn compute_obj_key(
     sha256_of_manifest(m.to_str())
 }
 
-// "<path>=<sha256>" for each header in dirs. None when one cannot be hashed, so a header
-// the unit may read never drops out of the key. A build hashes them once for every key it
-// makes: a vendored header can be large (sqlite3.h is 680 KB).
-pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
-    header_lines_named(dirs, false)
+// The vendored lines of a unit key: header_lines_named for dirs, and "incdir:<i>=<dir>" for
+// the i-th dir when there are two or more. A unit takes a name present in two dirs from the
+// first in -I order, so the key holds the order; one dir has one order, and its keys stay the
+// keys made before the order was keyed. None as header_lines_named answers it. skip names what
+// the build writes, which is under a vendored dir when the dir holds the project.
+pub fn vendored_key_lines(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[Str]] ! IO {
+    let mut lines = match lines_under(dirs, by_name, skip) {
+        Some(l) => l
+        None => return None
+    }
+    if dirs.len() > 1 {
+        let spellings = if by_name { vendored_dir_spellings(dirs) } else { dirs }
+        let mut k = 0
+        for spelling in spellings {
+            // The key sorts its lines, so the index carries the order.
+            lines.push("incdir:{k}={spelling}")
+            k = k + 1
+        }
+    }
+    Some(lines)
 }
 
-// header_lines_in, with each dir spelled as vendored_dir_spellings spells it when by_name:
-// the lines of an object compiled with vendored_dir_maps, which records no other spelling.
+// vendored_key_lines for dirs spelled by their paths.
+pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
+    vendored_key_lines(dirs, false, [])
+}
+
+// "<path>=<sha256>" for each file under dirs, each dir spelled as vendored_dir_spellings
+// spells it when by_name: the lines of an object compiled with vendored_dir_maps, which
+// records no other spelling. A unit can #include any file under a dir, at any depth and by
+// any name, so every file is in the key. None when a file cannot be hashed or a dir cannot
+// be listed, so a file the unit may read never drops out of the key. A build hashes them
+// once for every key it makes: a vendored dir can be large (sqlite3.c is 9.4 MB).
 pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] ! IO {
+    lines_under(dirs, by_name, [])
+}
+
+// header_lines_named without the files at the paths in skip.
+fn lines_under(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[Str]] ! IO {
+    // The walk meets each entry under the realpath of its dir, so a skip path is spelled so
+    // too. One whose dir does not exist yet is under no dir the walk lists.
+    let mut skip_real: List[Str] = []
+    for s in skip {
+        let p = without_trailing_slash(s)
+        match build_fs.real_path(path_dirname(p)) {
+            Some(r) => skip_real.push("{without_trailing_slash(r)}/{path_basename(p)}")
+            None => {}
+        }
+    }
     let mut lines: List[Str] = []
     let mut paths: List[Str] = []
     let mut spelled: List[Str] = []
@@ -138,14 +177,13 @@ pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] !
     for d in dirs {
         let spelling = spellings.get(k).unwrap()
         k = k + 1
-        for name in list_dir(d) {
-            // What the glob "$d"/*.h names: no dotfile, and only what exists past a link.
-            if name.starts_with(".") || !name.ends_with(".h") { continue }
-            let path = "{d}/{name}"
-            if file_exists(path) == 1 {
-                paths.push(path)
-                spelled.push("{spelling}/{name}")
-            }
+        let rels = match files_under(d, "", [], skip_real) {
+            Some(r) => r
+            None => return None
+        }
+        for rel in rels {
+            paths.push("{d}/{rel}")
+            spelled.push("{spelling}/{rel}")
         }
     }
     let shas = hash_files(paths)
@@ -158,6 +196,46 @@ pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] !
         i = i + 1
     }
     Some(lines)
+}
+
+// The path relative to root of each file under {root}/{rel}, past each link, but for a dot
+// entry and a path in skip (realpaths). A dot entry is what the glob "$d"/*.h left out at
+// the top, and holds .git and the .tmp the build writes. A dir link back to a dir it lies in
+// is not walked again: cc reaches each file under it by a path the walk already took. None
+// when a dir cannot be listed.
+fn files_under(root: Str, rel: Str, ancestors: List[Str], skip: List[Str]) -> Option[List[Str]] ! IO {
+    let dir = if rel == "" { root } else { "{root}/{rel}" }
+    let real = match build_fs.real_path(dir) {
+        Some(r) => r
+        None => return None
+    }
+    if ancestors.contains(real) {
+        return Some([])
+    }
+    // A copy: a sibling dir is not an ancestor.
+    let mut chain: List[Str] = []
+    for a in ancestors { chain.push(a) }
+    chain.push(real)
+    let names = list_dir(dir)
+    if fs.errno() != 0 {
+        return None
+    }
+    let mut out: List[Str] = []
+    for name in names {
+        if name.starts_with(".") || skip.contains("{without_trailing_slash(real)}/{name}") { continue }
+        let sub = if rel == "" { name } else { "{rel}/{name}" }
+        if is_dir("{root}/{sub}") == 1 {
+            match files_under(root, sub, chain, skip) {
+                Some(inner) => {
+                    for f in inner { out.push(f) }
+                }
+                None => return None
+            }
+        } else if file_exists("{root}/{sub}") == 1 {
+            out.push(sub)
+        }
+    }
+    Some(out)
 }
 
 fn without_trailing_slash(d: Str) -> Str {
@@ -207,8 +285,7 @@ pub fn vendored_dir_maps(dirs: List[Str]) -> List[Str] {
 // vendored_dir_name, except a dir that keeps its path when its name is not its own. Two dirs
 // of one name would spell their headers alike, and their key lines sort together, so trees
 // that swap the headers between them would share a key and not their bytes. A dir inside
-// another gets the map of either one, by the order of the -I flags, which the key does not
-// hold.
+// another gets the map of either one, by the order of the -I flags.
 pub fn vendored_dir_spellings(dirs: List[Str]) -> List[Str] {
     let mut names: List[Str] = []
     for d in dirs {
@@ -281,7 +358,7 @@ pub fn user_unit_key(
     }
 }
 
-// user_unit_key over the lines header_lines_named answered for the vendored include dirs.
+// user_unit_key over the lines vendored_key_lines answered for the vendored include dirs.
 pub fn user_unit_key_with_headers(
     src_path: Str,
     module_key: Str,
@@ -344,7 +421,11 @@ fn hash_files(paths: List[Str]) -> Map[Str, Str] ! IO {
     let mut total = 0
     for p in paths {
         let n = build_fs.file_size(p)
-        if n > 0 { total = total + n }
+        // A dir answers a size up to the Int max on some filesystems, which would overflow
+        // the sum; past the bound the sum no longer matters.
+        if n > 0 && total <= IN_PROCESS_HASH_BYTES {
+            total = if n > IN_PROCESS_HASH_BYTES { n } else { total + n }
+        }
     }
     if total > IN_PROCESS_HASH_BYTES && build_fs.find_program("sha256sum") != "" {
         for run in exec_sized_batches(paths) {
@@ -480,7 +561,7 @@ pub fn unit_keys_from(
     }
 }
 
-// unit_keys_from over the lines header_lines_named answered for the vendored include dirs, with
+// unit_keys_from over the lines vendored_key_lines answered for the vendored include dirs, with
 // each path the objects record (recorded_paths) in every key.
 pub fn unit_keys_with_headers(
     shas: Map[Str, Str],
@@ -798,7 +879,7 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
 // built from the archive dir itself. The key covers what the compiler needs to take the PCH:
 // the header bytes, the compiler (cc_id, so a gcc and a clang PCH never serve each other),
 // every flag, the macros a unit defines before the header, each include dir and the headers
-// in it (vendored_headers, as header_lines_named answers them for those dirs), and the archive
+// in it (vendored_headers, as vendored_key_lines answers them for those dirs), and the archive
 // dir the debug info names. gcc checks the rest itself and reads the header copy beside a .gch
 // it rejects; clang stops on one, and the unit compiles again without it. Either way a
 // unit's object, and its key, do not depend on the PCH.

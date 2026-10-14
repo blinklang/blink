@@ -1,0 +1,226 @@
+// A unit can read any file under a vendored include dir, not only the headers at its top:
+// a header there includes sub/k.h, or sub/deeper/k.h, or picks up sub/opt.h through
+// __has_include once it is added. Each of those changes what the unit compiles to, so each
+// must change its key, or the next build on the same cache links the old object. The -I
+// order of the vendored dirs comes from the manifest, and a header present in two dirs is
+// read from the first, so the order is in the key too.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+// A dev tree with an empty project in {tree}/app.
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+}
+
+fn write_in(tree: Str, rel: Str, text: Str) {
+    let path = "{tree}/app/{rel}"
+    shell_exec("mkdir -p $(dirname {path})")
+    write_file(path, text)
+}
+
+// A project over one native dep in vendor/mylib whose mylib.h answers MYLIB_K, a macro
+// the files under the dir define.
+fn mylib_project(tree: Str, mylib_h_body: Str) {
+    write_in(tree, "blink.toml", "[package]\nname = \"sv\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nmylib = \{ type = \"vendored\", path = \"vendor/mylib/mylib.c\", headers = [\"mylib.h\"] \}\n")
+    write_in(tree, "vendor/mylib/mylib.h", [
+        "#pragma once",
+        "#include <stdint.h>",
+        mylib_h_body,
+        "typedef struct mylib_ctx mylib_ctx;",
+        "static inline int64_t mylib_k(void) \{ return MYLIB_K; \}",
+        "",
+    ].join("\n"))
+    write_in(tree, "vendor/mylib/mylib.c", "#include \"mylib.h\"\nint64_t mylib_unused(void) \{ return 0; \}\n")
+    write_in(tree, "src/part.bl", [
+        #"@ffi.opaque(header: "mylib.h", name: "mylib_ctx")"#,
+        #"pub type Ctx"#,
+        #""#,
+        #"@ffi("mylib", "mylib_k", header: "mylib.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn k() -> Int ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_in(tree, "src/main.bl", [
+        #"import part.{k}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("k {k()}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+// A project over two native deps in a/ and b/, each with a pick.h of other words, listed in
+// the manifest in the order given.
+fn pick_project(tree: Str, first: Str, second: Str) {
+    for d in ["a", "b"] {
+        let word = if d == "a" { "one" } else { "two" }
+        write_in(tree, "{d}/pick.h", [
+            "#pragma once",
+            "#include <stdint.h>",
+            "typedef struct pick_ctx pick_ctx;",
+            "static inline uint8_t *pick_word(void) \{ return (uint8_t *)\"{word}\"; \}",
+            "",
+        ].join("\n"))
+        write_in(tree, "{d}/{d}.c", "#include <stdint.h>\nint64_t {d}lib_id(void) \{ return 1; \}\n")
+    }
+    pick_manifest(tree, first, second)
+    write_in(tree, "src/part.bl", [
+        #"@ffi.opaque(header: "pick.h", name: "pick_ctx")"#,
+        #"pub type Ctx"#,
+        #""#,
+        #"@ffi("alib", "alib_id", header: "pick.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn alib_id() -> Int ! FFI {}"#,
+        #""#,
+        #"@ffi("blib", "blib_id", header: "pick.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn blib_id() -> Int ! FFI {}"#,
+        #""#,
+        #"@ffi("alib", "pick_word", header: "pick.h")"#,
+        #"@trusted(audit: "T1")"#,
+        #"pub fn pick_word() -> Ptr[U8] ! FFI {}"#,
+        #""#,
+    ].join("\n"))
+    write_in(tree, "src/main.bl", [
+        #"import part.{alib_id, blib_id, pick_word}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println("{alib_id() + blib_id()} {pick_word().to_str() ?? "-"}")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+}
+
+fn pick_manifest(tree: Str, first: Str, second: Str) {
+    let mut text = "[package]\nname = \"sw\"\nversion = \"0.1.0\"\n\n[native-dependencies]\n"
+    for d in [first, second] {
+        text = "{text}{d}lib = \{ type = \"vendored\", path = \"{d}/{d}.c\", headers = [\"pick.h\"] \}\n"
+    }
+    write_in(tree, "blink.toml", text)
+    shell_exec("touch {tree}/app/blink.lock")
+}
+
+// Runs blink in the project with the given object cache and the unit trace. The corpus
+// exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so the
+// run drops them.
+fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units {tree}/build/blink {args}"])
+}
+
+// What the program prints when built on cache with flags.
+fn built_run(tree: Str, cache: Str, flags: Str) -> Str {
+    shell_exec("rm -rf {tree}/app/out")
+    let r = blink_in(tree, cache, "build src/main.bl -o out/app {flags}")
+    assert(r.exit_code == 0, "build failed: {r.out}{r.err_out}")
+    sh("{tree}/app/out/app")
+}
+
+// Builds on a cache, runs edit, and builds again on the same cache. The second build must
+// print what a build on a fresh cache prints, and not what the first one printed.
+fn check_edit(name: Str, flags: Str, setup: fn(Str), edit: fn(Str)) {
+    let root = sh("pwd -P")
+    let tree = "{root}/.tmp/_vendored_tree_key_{name}_{getpid()}"
+    dev_tree(root, tree)
+    setup(tree)
+    let before = built_run(tree, "{tree}/cache", flags)
+    edit(tree)
+    let after = built_run(tree, "{tree}/cache", flags)
+    let fresh = built_run(tree, "{tree}/fresh", flags)
+    shell_exec("rm -rf {tree}")
+    assert(before != fresh, "the edit changes nothing: both print {fresh}")
+    assert_eq(after, fresh)
+}
+
+fn nested_setup(tree: Str) {
+    mylib_project(tree, "#include \"sub/k.h\"")
+    write_in(tree, "vendor/mylib/sub/k.h", "#define MYLIB_K 1\n")
+}
+
+fn nested_edit(tree: Str) {
+    write_in(tree, "vendor/mylib/sub/k.h", "#define MYLIB_K 2\n")
+}
+
+fn deep_setup(tree: Str) {
+    mylib_project(tree, "#include \"sub/deeper/k.h\"")
+    write_in(tree, "vendor/mylib/sub/deeper/k.h", "#define MYLIB_K 1\n")
+}
+
+fn deep_edit(tree: Str) {
+    write_in(tree, "vendor/mylib/sub/deeper/k.h", "#define MYLIB_K 2\n")
+}
+
+// A dir whose name ends in .h is a dir, not a header to hash.
+fn header_named_dir_setup(tree: Str) {
+    mylib_project(tree, "#include \"k.h/k.h\"")
+    write_in(tree, "vendor/mylib/k.h/k.h", "#define MYLIB_K 1\n")
+}
+
+fn header_named_dir_edit(tree: Str) {
+    write_in(tree, "vendor/mylib/k.h/k.h", "#define MYLIB_K 2\n")
+}
+
+fn added_setup(tree: Str) {
+    mylib_project(tree, "#if __has_include(\"sub/opt.h\")\n#include \"sub/opt.h\"\n#else\n#define MYLIB_K 1\n#endif")
+    shell_exec("mkdir -p {tree}/app/vendor/mylib/sub")
+}
+
+fn added_edit(tree: Str) {
+    write_in(tree, "vendor/mylib/sub/opt.h", "#define MYLIB_K 2\n")
+}
+
+fn order_setup(tree: Str) {
+    pick_project(tree, "a", "b")
+}
+
+fn order_edit(tree: Str) {
+    pick_manifest(tree, "b", "a")
+}
+
+test "an edit to a header in a subdir of a vendored dir gives the unit a new key" {
+    check_edit("nested", "--per-module", nested_setup, nested_edit)
+}
+
+test "an edit to a header in a subdir of a vendored dir gives the one-unit build a new key" {
+    check_edit("nested_one", "--no-per-module", nested_setup, nested_edit)
+}
+
+test "an edit to a header two dirs deep in a vendored dir gives the unit a new key" {
+    check_edit("deep", "--per-module", deep_setup, deep_edit)
+}
+
+test "an edit to a header in a vendored subdir named like a header gives the unit a new key" {
+    check_edit("header_named_dir", "--per-module", header_named_dir_setup, header_named_dir_edit)
+}
+
+test "a header added under a vendored dir gives the unit a new key" {
+    check_edit("added", "--per-module", added_setup, added_edit)
+}
+
+test "a header added under a vendored dir gives the one-unit build a new key" {
+    check_edit("added_one", "--no-per-module", added_setup, added_edit)
+}
+
+test "swapping the manifest order of two vendored dirs that hold one header name gives the unit a new key" {
+    check_edit("order", "--per-module", order_setup, order_edit)
+}
+
+test "swapping the manifest order of two vendored dirs gives the one-unit build a new key" {
+    check_edit("order_one", "--no-per-module", order_setup, order_edit)
+}

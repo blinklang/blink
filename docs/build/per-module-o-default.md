@@ -2196,9 +2196,9 @@ its debug sections, so `grep -a` finds nothing), gcc 16.2.1 and clang
 | `app/src/main.bl` | panic and assert text in the C | yes | yes |
 
 The work and hold dirs are mapped away. Panic text and `__FILE__` in
-the C are in the source sha. The key names each vendored header as a
-`<dir>/<name>=<sha>` line ("Vendored include dirs" below gives how it
-spells the dir), and `cc --version` covers `/usr/include`.
+the C are in the source sha. The key names each file under a vendored
+dir as a `<dir>/<path>=<sha>` line ("Vendored include dirs" below gives
+how it spells the dir and which files it holds), and `cc --version` covers `/usr/include`.
 
 So at `--debug` the key also holds the compile dir, the dir the C is
 named under and the archive dir (`recorded_paths` in `cli.bl`). They
@@ -2252,8 +2252,8 @@ dir the objects of both trees were byte-equal at every level.
 Below `--debug` each unit compile, the archive header PCH build and the
 one-unit compile take `-fmacro-prefix-map=<dir>/=<name>/` for each
 absolute vendored dir, where `<name>` is the last part of the dir. The
-key spells the dir the same way: `<name>/<header>=<sha>`
-(`build_objcache.header_lines_named`, `vendored_dir_spellings`,
+key spells the dir the same way: `<name>/<path>=<sha>`
+(`build_objcache.vendored_key_lines`, `vendored_dir_spellings`,
 `vendored_dir_maps`). So `__FILE__` reads `mylib/mylib.h` in every
 tree, and the second tree compiles no unit. The trailing slash keeps
 the map off a sibling dir whose name starts with the same name. A dir
@@ -2275,8 +2275,7 @@ its own:
   file of the first `-I` dir. A relative dir with the same spelling as
   the name counts too.
 - A dir inside another listed dir. A header in it matches both maps,
-  and which one gcc uses follows the order of the `-I` flags, which the
-  key does not hold.
+  and which one gcc uses follows the order of the `-I` flags.
 
 A cc that rejects `-fmacro-prefix-map` (gcc before 8, clang before 10)
 gets no map: the key keeps the full dir and the object records it
@@ -2300,9 +2299,55 @@ header lines as the unit keys, and the PCH builds with the same maps,
 so a header's `__FILE__` in the PCH reads as in a unit built without
 it. The PCH key also keeps the raw `-I` flags and the archive dir.
 
-Known limits, not changed here: the key covers only the `*.h` files at
-the top of each vendored dir, and not the order of the `-I` flags.
+The key holds every file a unit can `#include` from a vendored dir, and
+the order of the dirs (`build_objcache.vendored_key_lines`):
 
+- Each regular file under each dir, at any depth and by any name, with
+  its path relative to the dir: `<dir>/sub/k.h=<sha>`. A header can
+  include `sub/k.h`, a file with no `.h` name, or a file that
+  `__has_include` finds once it is added. The dep's own `.c` counts
+  too. The walk follows links, and does not walk a dir again inside
+  itself. A dir that cannot be listed, or a file that cannot be hashed,
+  leaves the unit out of the cache.
+- Not a dot entry, as the glob `<dir>/*.h` of the old key skipped them:
+  a dot dir holds `.git` and the `.tmp` the build writes the dep's
+  object to.
+- Not what the build writes (`cli.vendored_header_lines`): the obj
+  cache dir, the output binary, and the units dir and its work dir (the
+  one-unit build: its C and the private dir it compiles in). A dep
+  whose source sits at the project root, `path = "mylib.c"`, gives
+  `-I.`, and all of these lie under it. In the key, each build would
+  miss the objects the last one stored. Any other file under the
+  project is still in the key, so an edit to a `.bl` file there misses
+  every unit of that project.
+- With two dirs or more, an `incdir:<i>=<dir>` line for the i-th `-I`
+  dir. A name in two dirs comes from the first. The order is the
+  manifest's: registry deps first, then `[native-dependencies]` in the
+  order the manifest lists them (`cli.resolve_vendored_includes`), so a
+  user who swaps two entries swaps the order. The key sorts its lines,
+  so the index carries the order. One dir has one order, so its keys
+  stay the keys made before the order was keyed.
+
+The whole tree costs more than its top-level headers: the sqlite dir
+holds `sqlite3.c` (9.4 MB) beside `sqlite3.h`, 6.8 ms against 2.4 ms
+with `sha256sum`, once per build. A compile with `-MD` would name the
+files a unit read, but only after the compile, and the key must exist
+before it to find a hit. Nor does it name a file `__has_include` looked
+for and did not find, which a later build can add.
+
+A dir above the project costs what lies under it: `path = "../mylib.c"`
+gives `-I..`, and a 50 MB file in a sibling dir took a no-change build
+from 51 ms to 78 ms, each build a hit.
+
+Known limits: a vendored header can name a file outside every vendored
+dir, as `#include "../include/x.h"` or by an absolute path, or a dot
+file in one. Nothing keys such a file.
+
+`tests/test_objcache_key_covers_every_file_in_a_vendored_dir_tree_and_the_include_dir_order.bl`
+holds the tree and the order, per-module and one-unit.
+`tests/test_objcache_hits_a_no_change_build_when_a_vendored_dir_holds_the_project.bl`
+holds the `-I.` case: a no-change build stores no new object, and an
+edit under `sub/` still keys.
 `tests/test_objects_of_two_trees_with_byte_equal_vendored_dirs_at_different_paths_share_one_cache_below_debug.bl`,
 `tests/test_debug_object_names_the_vendored_dir_it_was_compiled_with.bl`,
 `tests/test_vendored_dirs_of_one_name_keep_their_paths_so_trees_that_swap_their_headers_share_no_object.bl`
