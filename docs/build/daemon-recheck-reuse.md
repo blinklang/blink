@@ -692,3 +692,120 @@ by 2 and 10 ms. Two more rounds of those rows, alternating, overlap. Over 20 cyc
 edit to `src/cname.bl`, a check request and a build of `src/cli.bl` through the daemon, the
 worker ran 41 checks on base and 21 on this change, and its peak RSS (VmHWM) was 463 / 472
 MB on base and 327 / 320 MB on this change, in two runs each.
+
+## Warm recheck profile
+
+Typecheck reuse is parked, so this section measures the work that each warm recheck does
+again, ranks it, and cuts the top row that keeps the output byte-equal.
+
+### Numbers
+
+Binary: gen1 of a027384e, built `-O1 -g`, run under `setarch -R`. Median of 5 (s):
+
+| case | s |
+|---|---|
+| warm body edit, `src/cli.bl` entry, edit in `src/cli.bl` | 0.315 |
+| warm body edit, `src/cli.bl` entry, edit in `src/cname.bl` | 0.307 |
+| cold `blink check src/cli.bl` | 0.420 |
+| warm, no change | 0.009 |
+
+The 5% bar is about 15.7 ms. `perf record --call-graph dwarf` on the worker, over 20 warm
+rechecks that alternate two bodies, lost 1.4% of the samples. The reply path on the worker
+main thread is 317 ms of CPU for each check. The phases, in ms for each check:
+
+| phase | ms |
+|---|---|
+| resolve | 65.2 |
+| infer (fn bodies) | 62.3 |
+| escape | 38.8 |
+| stamp | 36.2 |
+| typecheck, other | 26.9 |
+| mono | 18.7 |
+| load | 16.9 |
+| mutations (15.3 in its own frame, 13.2 inlined into callers) | 28.5 |
+| save/restore | 10.5 |
+| index of the entry | 8.4 |
+| render | 4.2 |
+| settle, after the reply | 23.1 |
+
+Function families, self time in ms for each check: AST getters 83, Str-keyed map hash and eq
+about 50 to 56, GC on the main thread 35, other Str operations 29.
+
+### Top 10
+
+"w66" is the cold-compile profile from before; "named" means its cut table or report gave the
+row.
+
+| # | row | ms | why it costs | fix shape | risk | w66 |
+|---|---|---|---|---|---|---|
+| 1 | AST getters (`parser.node_*`, `sublist_get`) | 83 | every field read is a call into the dense pool | inline or batch reads; measure at `-O2` first | low; wide | named (15% self); the dense pool made it larger |
+| 2 | Str-keyed map hash and eq (`map_find`, `kops_hash_str`) | ~50 | each lookup hashes the full name and compares the bytes | a hash cached in the Str header, interned keys, or a cheaper hash | medium; Map order is seeded per process, so no order a user sees depends on the hash | named (9%); no change |
+| 3 | `analyze_mutations` (`src/mutation_analysis.bl:406`) | 26.7 | a dense fns x globals Int matrix (about 1.6M cells), full sweeps over each call edge until no change, then a scan of each fn x each global | bit sets, a worklist over reverse call edges | low | named (alloc 2.6%, GC trigger); **cut here** |
+| 4 | `tc_tid_is_pointer_bearing` (`src/typecheck.bl:3490`, from `src/escape.bl:684`) | 12.0 | a new Map for each expression node | memo by tid for each check | low | named (alloc 1.3%) |
+| 5 | stamp walk and assert (`tc_stamp_name_child` to `tc_name_is_item`, `src/typecheck.bl:24390`; `recover_node`) | 18.2 + 18.0 | name lookups by Str and many small calls | key by id; see row 2 | medium | `tc_stamp_walk` and `tc_name_is_item` named |
+| 6 | `check_arg_shapes_with_binds` (`src/typecheck.bl:5015`) | 17.9 | a new Map for each call, each bind copied in | reuse a scratch map | low | named (alloc 2.1%) |
+| 7 | `nr_check_selective_access_at` (`src/typecheck.bl:12343`) | 12.4 | Str lookups for each name use | see row 2 | low | not named |
+| 8 | `check_spawn_mut_captures` (`src/escape.bl:1179`) | 10.4 | the `let mut` scan runs in each fn, also in fns with no `spawn` | skip fns with no `spawn` | low | not named |
+| 9 | `nr_top_index` (`src/typecheck.bl:12999`) | 9.2 | Str lookups | see row 2 | low | not named |
+| 10 | index of the entry (`daemon_index_entry`, `src/daemon.bl:265`) | 8.4 | a second lex and parse of the entry for the query index | share the check's parse | medium | not named; a cold compile does not do it |
+
+Rows 1, 2, 5 and 6 are 5% or more and are not cut here; each one has a chore. Rows 4 and 8
+are under 5% alone; row 6 shares a cause with row 4 (a new Map for each call).
+
+### The cut: write sets as bits and a worklist
+
+`analyze_mutations` now keeps one bit for each (fn, global) pair, 64 globals to a U64 word.
+The word is unsigned because a shift of a signed 1 into bit 63 is undefined in C: GCC gives it
+a meaning, clang does not. The closure takes each fn whose set is not empty, pushes its writes
+to each caller, and puts a caller back in the queue only when its set grew. The least fixpoint
+is unique, so the visit order does not change the result. The write lists come from a
+word-by-word scan of the bits, which gives the globals in declared order, as the W0550/W0551
+text needs. That text is the only output that reads the write sets.
+
+Tests, each with 70 globals:
+
+- `tests/test_mutation_write_set_reaches_every_caller_through_cycles_in_global_order.bl`:
+  writes to globals 0, 64 and 69 through a cycle of three fns and a self call. It fails with
+  a worklist that never puts a caller back, and with a bit index that always uses word 0.
+- `tests/test_mutation_write_set_keeps_the_top_bit_of_a_word_and_the_next_word.bl`: writes to
+  globals 62, 63 and 64 through a two-fn cycle, and a save of global 63 alone around the call.
+  It fails with a list scan that stops at bit 62, and with a bit index of `gi % 63` (the
+  closure then never ends).
+
+Both pass on base.
+
+Results, gen1 of a027384e (base) and of 0cf7df35 (tip), alternating, `setarch -R`, median of 5
+[min-max] (s), load 0.54 to 1.04:
+
+| case | base | tip |
+|---|---|---|
+| warm body edit, `src/cli.bl` | 0.313 [0.311-0.322] | 0.301 [0.297-0.304] |
+| warm body edit, `src/cname.bl` | 0.307 [0.301-0.309] | 0.292 [0.288-0.296] |
+| cold `blink check src/cli.bl` | 0.417 [0.412-0.423] | 0.400 [0.399-0.405] |
+| warm, no change | 0.009 | 0.009 |
+
+The output of each run is byte-equal between base and tip. `analyze_mutations` falls from
+26.7 to 12.7 ms (the AST walk is 8.6 of that; the closure 2.2; the lists 0.3). That is about
+14 ms of CPU, 4.4% of the reply path: a little under the bar, but the row itself was 8.4%.
+Worker memory over 20 rechecks: VmHWM 416680 kB on base, 359820 kB on tip; VmRSS at the end
+416680 kB on base, 292040 kB on tip.
+
+`task bench-edit-loop`, base (`build/base_gen1/bin/blink`, sha256 c1101c11) and tip
+(`build/gen1/bin/blink`, sha256 5124c406), two rounds, alternating, peak load 2.96: no row is
+slower than base. In 11 of 28 rows, both tip medians are below every base run. In the row
+`src/cli.bl`, private fn edit of `typecheck`, one tip round reads 0.782 against a base maximum
+of 0.757. Two more rounds of that row read base 0.736 and 0.739, tip 0.725 and 0.729. Some rows:
+
+| row | base, r1 / r2 | tip, r1 / r2 |
+|---|---|---|
+| `src/cli.bl`, daemon, body edit of `cname` | 0.755 / 0.750 | 0.736 / 0.742 |
+| `src/cli.bl`, daemon, body edit of `typecheck` | 0.743 / 0.747 | 0.723 / 0.729 |
+| `src/cli.bl`, daemon, body edit, check, build | 1.166 / 1.171 | 1.141 / 1.143 |
+| `src/cli.bl`, cold, all | 4.428 / 4.416 | 4.440 / 4.412 |
+
+Chores for the rows not cut: Str-keyed name lookups in resolve and stamp (rows 2, 5, 7, 9);
+the stamp pass, which finds every name position before it knows any node is untyped (row 5);
+the Str hash (row 2, 50 ms: a hash cached in the Str header, interned keys, or a cheaper hash;
+Map order is seeded per process, so the hash value sets no order a user sees); a new Map or
+List for each call, which drives the GC (rows 4, 6); the AST getters, measured at `-O2`
+(row 1).

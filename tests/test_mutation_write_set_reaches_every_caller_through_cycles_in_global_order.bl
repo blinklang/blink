@@ -1,0 +1,53 @@
+// A function's write set is the closure of its own writes over every call path, cycles and
+// self calls included, and the W0550/W0551 text lists it in the order the globals are
+// declared. The globals run past 64 so a write set spans more than one 64-bit word.
+import compile_test_helpers
+import std.str.{str_join}
+
+fn program_source() -> Str {
+    let mut lines: List[Str] = []
+    let mut i = 0
+    while i < 70 {
+        lines.push("let mut g{i}: Int = 0")
+        i = i + 1
+    }
+    // top comes before its callees; ring_a only reaches its writes through the a-b-c cycle,
+    // and it reaches g64 before g0.
+    lines.push("fn top() \{")
+    lines.push("    let saved = g0")
+    lines.push("    ring_a(3)")
+    lines.push("    g0 = saved")
+    lines.push("}")
+    lines.push("fn ring_a(n: Int) \{")
+    lines.push("    if n > 0 \{")
+    lines.push("        ring_b(n - 1)")
+    lines.push("    }")
+    lines.push("}")
+    lines.push("fn ring_b(n: Int) \{")
+    lines.push("    g64 = 1")
+    lines.push("    ring_c(n)")
+    lines.push("}")
+    lines.push("fn ring_c(n: Int) \{")
+    lines.push("    g0 = 1")
+    lines.push("    self_loop(n)")
+    lines.push("    ring_a(n)")
+    lines.push("}")
+    lines.push("fn self_loop(n: Int) \{")
+    lines.push("    if n > 0 \{")
+    lines.push("        self_loop(n - 1)")
+    lines.push("    }")
+    lines.push("    g69 = 2")
+    lines.push("}")
+    lines.push("fn main() \{")
+    lines.push("    top()")
+    lines.push("}")
+    lines.push("")
+    str_join(lines, "\n")
+}
+
+test "a write reached only through a call cycle is in the write set of every caller, in declared order" {
+    let output = compile_test_helpers.compile_and_capture(program_source(), "_test_ma_cycle_write_set")
+    compile_test_helpers.expect_warning(output, "IncompleteStateRestore", "the partial restore around ring_a draws W0550")
+    compile_test_helpers.expect_contains(output, "call to `ring_a` in `top` mutates [g64, g69] which are not saved/restored (write-set: 3 globals, saved: 1)", "ring_a's unsaved writes come through the cycle and the self call")
+    compile_test_helpers.expect_contains(output, "`ring_a` writes \{g0, g64, g69}", "ring_a's write set lists g0, g64 and g69 in declared order")
+}
