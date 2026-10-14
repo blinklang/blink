@@ -847,3 +847,47 @@ rechecks with a real edit each, the median is 0.304 on base and 0.297 on tip in 
 0.307 and 0.303 in another. The output of each run is byte-equal between base and tip. In
 `task bench-edit-loop`, no row is slower than base. Worker VmHWM over 20 rechecks: 363500 and
 371236 kB on base, 371052 and 369292 kB on tip.
+
+### The stamp row after the per-spelling memo
+
+The 33427 ladder calls in `src/cli.bl` ask about only 4228 spellings. The assert now keeps
+the ladder's answer for each spelling in a map that lives for one `tc_stamp_assert` call. The
+key is the spelling alone. Every other input to the ladder is a table that nothing writes while
+the assert runs, plus `nr_current_module`, which is one value for the whole call. Scope is not
+in the key: the scope checks (`tc_old_calls`, `tc_name_position_is_value`) still run for each
+position, because one spelling can be an item at one position and a shadowing local at
+another. The assert also no longer clears the walk marks at its end, as nothing reads them
+after the pass.
+
+The ladder reads the module that is current when the assert runs, not the module of the node.
+A fix that changes this must add the module to the memo key.
+
+Stamp phase, the same perf method, tip 29d8c697 and memo 24564045 in one window each, ms for
+each check:
+
+| part | base | tip | memo |
+|---|---|---|---|
+| stamp phase | 37.2 | 32.7 | 27.8 |
+| `tc_stamp_assert`, inclusive | | 15.4 | 10.8 |
+| name ladder, inclusive (`is_import_module_name`, `is_known_type`, `lookup_fnsig`, `is_trait_name`) | 6.7 | 5.8 | 0.9 |
+| reply path, total | | 302.9 | 295.2 |
+
+Wall time, alternating base 51306b80, tip 29d8c697 and memo 24564045, `setarch -R`, median of 5
+[min-max] (s), two runs:
+
+| case | base | memo |
+|---|---|---|
+| warm body edit, `src/cli.bl` | 0.300 [0.294-0.314], 0.301 [0.298-0.303] | 0.294 [0.292-0.296], 0.296 [0.291-0.298] |
+| warm body edit, `src/cname.bl` | 0.294 [0.289-0.296], 0.294 [0.290-0.297] | 0.282 [0.280-0.287], 0.287 [0.286-0.292] |
+| cold `blink check src/cli.bl` | 0.398, 0.403 | 0.393, 0.393 |
+
+The min-max ranges touch, so the 5-run spread alone does not separate them. The runs alternate,
+so each memo run has a base run next to it. In those pairs the memo is faster in 9 of 10 for
+`src/cli.bl` (median gain 5.5 ms) and in 10 of 10 for `src/cname.bl` (median gain 9 ms). That
+is about 2 to 3% of the recheck.
+
+`task bench-edit-loop`, base against the final branch build, two rounds, the order swapped in the
+second: no row is slower than base. Worker VmHWM over 20 rechecks of `src/cli.bl`: 342904 and
+348824 kB on base, 369816 and 363308 kB on the final build. Base read 363500 and 371236 kB in
+the earlier runs, so this is within the spread of the GC heap high-water mark. The memo holds
+a few thousand entries.
