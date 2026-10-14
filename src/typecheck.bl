@@ -704,7 +704,7 @@ fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
         if source_mod == "" { continue }
         match module_import(reader, source_mod) {
             Some(imp_node) => {
-                if imp_node != -1 && is_selected_import(bare, imp_node) != 0 { return "{source_mod}.{bare}" }
+                if imp_node != -1 && is_selected_import(bare, reader, source_mod) != 0 { return "{source_mod}.{bare}" }
             }
             None => {}
         }
@@ -12072,7 +12072,8 @@ fn nr_drop_import_index(consuming_mod: Str) {
         Some(r) => {
             if r.imports_built {
                 r.imports.clear()
-                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, imports_built: false })
+                r.selects.clear()
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: false })
             }
         }
         None => {}
@@ -12080,14 +12081,22 @@ fn nr_drop_import_index(consuming_mod: Str) {
 }
 
 fn nr_module_import_index(consuming_mod: Str) -> Map[Str, List[ImportBinding]] {
+    nr_module_imports_built(consuming_mod).imports
+}
+
+// The record of `consuming_mod` with its import index and selected spellings built.
+fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
     let r = nr_module_names_of(consuming_mod)
-    if r.imports_built { return r.imports }
+    if r.imports_built { return r }
     let mut idx = r.imports
+    let mut selects = r.selects
     match per_module_imports.get(consuming_mod) {
         Some(imports) => {
             for source_mod in imports.keys() {
                 let imp_node = imports.get(source_mod) ?? -1
                 if imp_node == -1 { continue }
+                let mut spellings: Map[Str, Int] = Map()
+                selects.insert(source_mod, spellings)
                 let names_sl = node_args(imp_node)
                 if names_sl == -1 { continue }
                 let mut i = 0
@@ -12098,14 +12107,17 @@ fn nr_module_import_index(consuming_mod: Str) -> Map[Str, List[ImportBinding]] {
                     let mut binds = idx.get(bound) ?? []
                     binds.push(ImportBinding { source_mod: source_mod, member: node_name(name_node) })
                     idx.insert(bound, binds)
+                    spellings.insert(node_name(name_node), 1)
+                    if alias != "" { spellings.insert(alias, 1) }
                     i = i + 1
                 }
             }
         }
         None => {}
     }
-    nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, imports_built: true })
-    idx
+    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, imports_built: true }
+    nr_module_names.insert(consuming_mod, built)
+    built
 }
 
 fn module_import(consuming_mod: Str, source_mod: Str) -> Option[Int] {
@@ -12204,18 +12216,13 @@ fn tc_build_import_map() {
     }
 }
 
-fn is_selected_import(name: Str, imp_node: Int) -> Int {
-    let names_sl = node_args(imp_node)
-    if names_sl == -1 { return 0 }
-    let mut i = 0
-    while i < sublist_length(names_sl) {
-        let name_node = sublist_get(names_sl, i)
-        if node_name(name_node) == name { return 1 }
-        let alias = node_str_val(name_node)
-        if alias != "" && alias == name { return 1 }
-        i = i + 1
+// Whether the selective import of `source_mod` in `consuming_mod` binds `name`, as the selected
+// name or as its alias. The caller has found that import with module_import.
+fn is_selected_import(name: Str, consuming_mod: Str, source_mod: Str) -> Int {
+    match nr_module_imports_built(consuming_mod).selects.get(source_mod) {
+        Some(spellings) => if spellings.contains_key(name) { 1 } else { 0 }
+        None => 0
     }
-    0
 }
 
 pub fn is_import_module_name(name: Str) -> Int {
@@ -12261,7 +12268,7 @@ fn is_filtered_for_module(name: Str, source_mod: Str, consuming_mod: Str) -> Int
     match module_import(consuming_mod, source_mod) {
         Some(imp_node) => {
             if imp_node == -1 { return 1 }
-            return is_selected_import(name, imp_node) == 0
+            return is_selected_import(name, consuming_mod, source_mod) == 0
         }
         None => {}
     }
@@ -12292,7 +12299,7 @@ fn nr_is_unimported_prelude_free_fn(name: Str) -> Int {
     match module_import(nr_current_module, source_mod) {
         Some(imp_node) => {
             if imp_node == -1 { return 0 }
-            if is_selected_import(name, imp_node) != 0 { return 0 }
+            if is_selected_import(name, nr_current_module, source_mod) != 0 { return 0 }
         }
         None => {}
     }
@@ -12342,10 +12349,11 @@ fn nr_check_selective_access(name: Str, node: Int) -> Int ! Diag.Report {
 // the name.
 fn nr_check_selective_access_at(name: Str, node: Int, idx: Int) -> Int ! Diag.Report {
     if nr_current_module == "" { return 0 }
-    if is_builtin_name(name) != 0 { return 0 }
     // A local binding holds a value, not a declaration some module exported. It may be spelled
-    // like an exported name, and an import list has nothing to say about a local.
+    // like an exported name, and an import list has nothing to say about a local. Asked before
+    // the builtin test, which costs a string compare ladder, since most reads are of locals.
     if idx != -1 && nr_index_is_global(idx) == 0 { return 0 }
+    if is_builtin_name(name) != 0 { return 0 }
     nr_check_selective_import(name, node)
 }
 
@@ -12401,6 +12409,11 @@ type ModuleNames {
     // and walking every name of every import list there was the cost of that question. Built
     // on first use; meaningless while imports_built is false.
     imports: Map[Str, List[ImportBinding]]
+    // Each module the module imports selectively → every spelling that import binds: each
+    // selected name and each alias. Resolve asks whether an import selects a name for most names
+    // it reads, and a walk of the import list per question was its largest cost. Built and
+    // dropped with `imports`.
+    selects: Map[Str, Map[Str, Int]]
     imports_built: Bool
 }
 let mut nr_module_names: Map[Str, ModuleNames] = Map()
@@ -12414,7 +12427,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), imports_built: false }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), imports_built: false }
             nr_module_names.insert(mod_name, r)
             r
         }
@@ -12561,7 +12574,7 @@ fn tc_check_namesake_import_ambiguity() ! Diag.Report {
                 if source_mod == "" { continue }
                 let imp_node = module_import(reader, source_mod) ?? -1
                 if imp_node == -1 { continue }
-                if is_selected_import(bare, imp_node) == 0 { continue }
+                if is_selected_import(bare, reader, source_mod) == 0 { continue }
                 hits = hits + 1
                 if hits == 1 { first = source_mod } else { second = source_mod }
             }
