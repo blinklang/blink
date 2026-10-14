@@ -1,0 +1,111 @@
+// A derived Hash on a struct with one Str field mixes the runtime's Str hash once, so
+// distinct hashes here mean distinct Str hashes. For keys of 0 to 40 bytes in each byte
+// class, a key and each of its one-byte variants (one variant per byte offset) must all
+// hash apart. A Str hash that skips the tail, reads only the first word, reads the tail
+// at the wrong offset, or leaves out the length makes two of these keys hash the same.
+// A 64-bit hash gives two of these few thousand keys the same value by chance about once
+// in 10^12 runs.
+
+@derive(Hash, Eq)
+type Key { s: Str }
+
+fn families() -> List[Int] { [0, 1, 127, 233, 8364, 128512] }
+
+fn fill_cp(j: Int) -> Int { 97 + (j * 7) % 26 }
+
+fn unit_len(cp: Int) -> Int {
+    if cp < 128 { return 1 }
+    if cp < 2048 { return 2 }
+    if cp < 65536 { return 3 }
+    4
+}
+
+fn pow64(k: Int) -> Int {
+    let mut p = 1
+    let mut i = 0
+    while i < k {
+        p = p * 64
+        i = i + 1
+    }
+    p
+}
+
+fn write_cp(sb: StringBuilder, cp: Int) {
+    sb.write_char(Char.from_code_point(cp).unwrap())
+}
+
+// n bytes of family `fam` (0 = ASCII letters that change from byte to byte). With `vary`
+// in 0..n, byte `vary` differs from the base key and no other byte does.
+fn build_key(fam: Int, n: Int, vary: Int) -> Str {
+    let u = unit_len(fam)
+    let pad = n % u
+    let sb = StringBuilder.new()
+    let mut j = 0
+    while j < pad {
+        if j == vary { write_cp(sb, fill_cp(j) + 1) } else { write_cp(sb, fill_cp(j)) }
+        j = j + 1
+    }
+    let mut start = pad
+    while start < n {
+        let mut cp = fam
+        if fam == 0 { cp = fill_cp(start) }
+        if vary >= start && vary < start + u {
+            let step = pow64(start + u - 1 - vary)
+            if fam == 127 { cp = cp - step } else { cp = cp + step }
+        }
+        write_cp(sb, cp)
+        start = start + u
+    }
+    sb.to_str()
+}
+
+fn show(k: Str) -> Str { "{k.byte_len()} bytes {Bytes.from_str(k).to_hex()}" }
+
+test "keys of 0 to 40 bytes that differ in one byte, or only in length, hash apart" {
+    let mut keys: List[Str] = []
+    let mut known: Set[Str] = Set()
+    for fam in families() {
+        let mut n = 0
+        while n <= 40 {
+            let mut i = -1
+            while i < n {
+                let k = build_key(fam, n, i)
+                if known.insert(k) { keys.push(k) }
+                i = i + 1
+            }
+            n = n + 1
+        }
+    }
+    let mut by_hash: Map[U64, Int] = Map()
+    let mut clashes = 0
+    let mut i = 0
+    while i < keys.len() {
+        let k = keys.get(i).unwrap()
+        let h = Key { s: k }.hash()
+        match by_hash.get(h) {
+            Some(j) => {
+                if clashes < 10 { io.println("same hash: {show(keys.get(j).unwrap())} and {show(k)}") }
+                clashes = clashes + 1
+            }
+            None => by_hash.insert(h, i)
+        }
+        i = i + 1
+    }
+    assert(keys.len() > 4000)
+    assert_eq(clashes, 0)
+}
+
+test "equal Strs made by other routes hash the same" {
+    for fam in families() {
+        let mut n = 0
+        while n <= 40 {
+            let k = build_key(fam, n, -1)
+            let wide = "<".concat(k).concat(">>>>>>>>")
+            let sliced = wide.byte_slice(1, n + 1)
+            let built = "{k}"
+            assert_eq(Key { s: sliced }.hash(), Key { s: k }.hash())
+            assert_eq(Key { s: built }.hash(), Key { s: k }.hash())
+            n = n + 1
+        }
+    }
+}
