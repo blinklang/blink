@@ -2912,3 +2912,64 @@ goes through the diagnostics. The 9 corpus tests that compare a daemon build
 or check with a cold one passed in each gate. Two open P2 cache bugs give no
 wrong output: `blink test --no-cache` still uses the obj cache in its parallel
 workers, and a vendored native-dep object is reused across build modes.
+
+## Exit criteria on main 826eb3dc
+
+Measured 2026-10-14 on main 826eb3dc (gen0 selfhost-19) with the gen1 blink of that tree
+(sha256 1da768879848731...), gcc 16.2.1, all runs in blink-gates.slice (12 CPUs) after the
+load fell below 3. The method is the one of the 85653d77 section, with the same scripts, so the
+rows compare one for one. Each bench row is a median of 5. (1)-(5) come from
+`scripts/bench_edit_loop.sh build/gen1/bin/blink`, once with no daemon and once with
+`BENCH_DAEMON=1 BENCH_SETTLE=1`.
+
+(6) is the output-speed job of the 85653d77 section: each build of src/cli.bl runs `setarch -R
+<bin> build --emit c src/blinkc_main.bl` under `perf stat -e cycles:u,instructions:u` and
+`/usr/bin/time -f %M`, the 4 binaries alternating 5 times per set, 3 sets, then one main-thread
+set (`perf stat -i`, no time wrapper, so its maxrss_kb column reads 0 and is not a measurement).
+The default -O1 build made 71 units: 53 modules plus 18 typecheck split units (17
+typecheck.p<hex8>.c and typecheck.pos.c). `--release` splits nothing and made 53. One
+reference C file, from the first run of set 1, served all 80 runs, and each run's C was
+byte-equal to it.
+
+| criterion | bar | 85653d77 | 826eb3dc | result | file |
+|---|---|---|---|---|---|
+| (1) cli private-body edit | <= 1.0 s | 0.733 s, daemon 0.412 s | 0.709 s, daemon 0.405 s | pass | exit_criteria_826eb3dc.tsv, exit_criteria_daemon_settle1_826eb3dc.tsv |
+| (2) cli new pub fn | <= 2.0 s | 0.739 s, daemon 0.440 s | 0.712 s, daemon 0.420 s | pass | same |
+| (3) small body / pub fn edit | <= 0.3 s | 0.088 / 0.079 s, daemon 0.082 / 0.072 s | 0.086 / 0.080 s, daemon 0.078 / 0.073 s | pass | same |
+| (4) cli `blink test` after a body edit | order of (1) | 0.416 s, daemon 0.457 s | 0.411 s, daemon 0.412 s | pass | same |
+| (5) cli cold build | <= 6.0 s | cold-all 4.380 s, daemon 4.570 s | cold-all 4.368 s, daemon 4.416 s | pass | same |
+| (5) cli no-change build | <= 0.8 s | 0.516 s, daemon 0.149 s | 0.490 s, daemon 0.143 s | pass | same |
+| (6) output speed -O1, cycles:u | <= +3% | +0.65, +0.66, +2.25% per set; +1.26% pooled; main thread +1.98% | +1.67, +1.42, +1.46% per set; +1.33% pooled (paired +1.32%); main thread +0.66% | pass | exit_criteria_output_speed_run{1,2,3}_826eb3dc.tsv, exit_criteria_output_speed_main_thread_826eb3dc.tsv |
+| (6) output speed -O2, cycles:u | <= +3% | +2.54, +3.87, +1.33% per set; +2.54% pooled; main thread +1.74% | +0.93, +1.79, +0.19% per set; +0.96% pooled (paired +0.85%); main thread +0.23% | pass | same |
+| (6) instructions:u, -O1 / -O2 | - | +0.40 / +1.45% pooled | +0.51 / +1.12% pooled | - | same |
+| (6) maxRSS, -O1 / -O2 | - | -0.04 / -0.25% pooled | -0.18 / -0.16% pooled | - | same |
+| (7) `task ci` wall, median of 3 | <= 117.6 s | 117.69 s | 135.42 s (135.93, 135.15, 135.42) | miss by 17.8 s | gate logs |
+| (7) per-module invariants | green | exit 0 | `task ci-per-module-checks` exit 0 | pass | gate log |
+| (8) open P1/P2 obj-cache or daemon correctness bug | none | open | an open P2 obj-cache bug links a stale object (wrong binary) | miss | br sweep |
+
+Spread. The cycles:u spread within one set of 5 is 2-6%, as before, so one set can read over
+the bar when the pooled median does not. This time every set passes at both levels. In the
+bench, the wide rows (pubfn-cname 10.7%, daemon 25.2%; testblock-cname daemon 52.5%) each come
+from one slow run; their medians sit within 2% of their minimums. The 1-minute load reached
+2.84 in each bench pass and 1.23 in the (6) sets.
+
+(7). The miss comes from the corpus, not from load. The three walls agree within 0.8 s; runs 2
+and 3 started at a 1-minute load of 2.79 and 2.60 (5-minute 3.73 and 5.57, from other work on
+the machine), run 1 at 0.74. The corpus sweep took 120-122 s, against 103-104 s on 85653d77:
+that is about all of the 17.7 s. Since 85653d77 the corpus grew from 2195 to 2325 files (130
+added, none removed), its rows from 2419 to 2570, and the per-module slice from 224 to 245
+rows. The sweep's instructions:u rose 19.0% (7186 to 8553 G), more than its rows (+6.2%), so the
+work per row rose too. The 130 new files take 146.8 s of the 1002 s summed per-file time; one
+of them, test_daemon_recheck_that_keeps_parsed_modules_prints_what_a_cold_check_prints.bl,
+takes 41.9 s by itself.
+
+(8). An open P2 bug makes the obj cache give a wrong binary: the unit key hashes only the
+top-level headers of a vendored include dir, so an edit to a nested header links the old
+object. Its MVCE still gives the old value on 826eb3dc (with `#pragma once` added to its
+header, which the MVCE as written needs). A second open P2 has the same shape (the key holds no
+-I order of vendored dirs) and is not reproduced. Outside the daemon and the obj cache, an open
+P2 makes the default per-module build fail cc on a tuple-keyed Map global that only a global
+initializer names, where the monolith builds and runs; this also still fails on 826eb3dc. The
+two daemon print gaps of 85653d77 (W1000 on stdout, the lexer escape warning) are closed. The
+corpus passed 2325/2325 in each gate, with the 31 test_daemon_* files whose names say they
+compare with a cold build, check or query.
