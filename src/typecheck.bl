@@ -12073,7 +12073,7 @@ fn nr_drop_import_index(consuming_mod: Str) {
             if r.imports_built {
                 r.imports.clear()
                 r.selects.clear()
-                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: false })
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl })
             }
         }
         None => {}
@@ -12115,7 +12115,7 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
         }
         None => {}
     }
-    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, imports_built: true }
+    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl }
     nr_module_names.insert(consuming_mod, built)
     built
 }
@@ -12353,36 +12353,46 @@ fn nr_check_selective_access_at(name: Str, node: Int, idx: Int) -> Int ! Diag.Re
     // like an exported name, and an import list has nothing to say about a local. Asked before
     // the builtin test, which costs a string compare ladder, since most reads are of locals.
     if idx != -1 && nr_index_is_global(idx) == 0 { return 0 }
-    if is_builtin_name(name) != 0 { return 0 }
-    nr_check_selective_import(name, node)
+    let mut answers = nr_module_names_of(nr_current_module).unselected
+    let source_mod = match answers.get(name) {
+        Some(m) => m
+        None => {
+            let m = nr_unselected_source(name)
+            answers.insert(name, m)
+            m
+        }
+    }
+    if source_mod == "" { return 0 }
+    let display_mod = tc_qualifier_for_module(source_mod)
+    if node == -1 {
+        diag_error_no_loc("ImportNotSelected", IMPORT_NOT_SELECTED, "`{name}` is not in scope — add it to the import list or use qualified access `{display_mod}.{name}`", "add `{name}` to your selective import")
+    } else {
+        diag_error_at("ImportNotSelected", IMPORT_NOT_SELECTED, "`{name}` is not in scope — add it to the import list or use qualified access `{display_mod}.{name}`", node, "add `{name}` to your selective import")
+    }
+    1
 }
 
-// The import-list half of nr_check_selective_access, for a name no local binding holds.
-fn nr_check_selective_import(name: Str, node: Int) -> Int ! Diag.Report {
-    if nr_module_declares(nr_current_module, name) != 0 { return 0 }
+// The import-list half of nr_check_selective_access, for a name no local binding holds: the
+// module the name comes from when this module's import list does not select it, else "".
+fn nr_unselected_source(name: Str) -> Str {
+    if is_builtin_name(name) != 0 { return "" }
+    if nr_module_declares(nr_current_module, name) != 0 { return "" }
     // A namesake type is in scope when this module's import list selects one declaration of
     // it; the last-writer symbol table below knows only one module for the name.
-    if tc_nominal_type_name_in(name, nr_current_module) != name { return 0 }
+    if tc_nominal_type_name_in(name, nr_current_module) != name { return "" }
     let source_mod = match tc_symbol_module.get(name) {
         Some(v) => v
-        None => return 0
+        None => return ""
     }
     // A private declaration cannot be selected or qualified, so the import list is not the
     // fix; the private-access check names the real problem.
-    if nr_is_private_in(name, source_mod) != 0 { return 0 }
+    if nr_is_private_in(name, source_mod) != 0 { return "" }
     // The same last-writer limit as the namesake-type check above: `source_mod` is whichever
     // module was recorded last for the spelling, not the one this file's import list picked.
-    if nr_bare_name_in_scope_here(name, nr_current_module) != 0 { return 0 }
-    if is_filtered_for_module(name, source_mod, nr_current_module) != 0 {
-        let display_mod = tc_qualifier_for_module(source_mod)
-        if node == -1 {
-            diag_error_no_loc("ImportNotSelected", IMPORT_NOT_SELECTED, "`{name}` is not in scope — add it to the import list or use qualified access `{display_mod}.{name}`", "add `{name}` to your selective import")
-        } else {
-            diag_error_at("ImportNotSelected", IMPORT_NOT_SELECTED, "`{name}` is not in scope — add it to the import list or use qualified access `{display_mod}.{name}`", node, "add `{name}` to your selective import")
-        }
-        return 1
-    }
-    0
+    if nr_bare_name_in_scope_here(name, nr_current_module) != 0 { return "" }
+    // is_filtered_for_module answers 0 for an empty source, so "" is free to mean "in scope".
+    if is_filtered_for_module(name, source_mod, nr_current_module) != 0 { return source_mod }
+    ""
 }
 
 // ── Import visibility ───────────────────────────────────────────────
@@ -12415,6 +12425,16 @@ type ModuleNames {
     // dropped with `imports`.
     selects: Map[Str, Map[Str, Int]]
     imports_built: Bool
+    // The answers resolve gives a spelling the module reads that no local binding holds, kept
+    // because it asks them again at every read: nr_unselected_source, nr_private_access_here
+    // and nr_find_bare_decl of each spelling. Each answer depends on the module and the
+    // spelling, and on tables that resolve_names' setup and the passes before it fill: each
+    // module's declarations and privates, the import lists, the symbol modules, the re-exports,
+    // the namesake types and the prelude modules. Nothing after that setup writes any of them
+    // until the next check, so resolve_names drops every answer when it starts the setup.
+    unselected: Map[Str, Str]
+    private_access: Map[Str, Int]
+    bare_decl: Map[Str, Int]
 }
 let mut nr_module_names: Map[Str, ModuleNames] = Map()
 // The same declarations gathered by bare name, so a caller can see every module that spells
@@ -12427,7 +12447,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), imports_built: false }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map() }
             nr_module_names.insert(mod_name, r)
             r
         }
@@ -12610,6 +12630,18 @@ fn nr_resolve_imported_decl(name: Str, consuming_mod: Str) -> Int {
 
 // Which declaration of `name` the bare spelling means inside `consuming_mod`.
 fn nr_resolve_bare_decl(name: Str, consuming_mod: Str) -> Int {
+    let mut answers = nr_module_names_of(consuming_mod).bare_decl
+    match answers.get(name) {
+        Some(d) => d
+        None => {
+            let d = nr_find_bare_decl(name, consuming_mod)
+            answers.insert(name, d)
+            d
+        }
+    }
+}
+
+fn nr_find_bare_decl(name: Str, consuming_mod: Str) -> Int {
     let cands = nr_decls_by_name.get(name) ?? []
     // A module's own declaration wins over any import, so it is asked for first.
     for c in cands {
@@ -12752,6 +12784,18 @@ fn nr_qualified_private_access(qualifier: Str, name: Str) -> Int {
 }
 
 fn is_private_access(name: Str) -> Int {
+    let mut answers = nr_module_names_of(nr_current_module).private_access
+    match answers.get(name) {
+        Some(v) => v
+        None => {
+            let v = nr_private_access_here(name)
+            answers.insert(name, v)
+            v
+        }
+    }
+}
+
+fn nr_private_access_here(name: Str) -> Int {
     // Builtin names (primitive types + builtin fns/variants like Ok/Err/Some/Map)
     // can never be private — a user cannot make a builtin private, so a colliding
     // user variant must not poison the verdict. Mirrors nr_check_selective_access.
@@ -14520,7 +14564,11 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_private_imports = Map()
     nr_name_source_module = Map()
     for mod_name in nr_module_names.keys() {
-        nr_module_names_of(mod_name).decls.clear()
+        let r = nr_module_names_of(mod_name)
+        r.decls.clear()
+        r.unselected.clear()
+        r.private_access.clear()
+        r.bare_decl.clear()
     }
     nr_decls_by_name = Map()
     tc_call_decl = Map()
