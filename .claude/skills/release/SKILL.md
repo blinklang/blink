@@ -12,7 +12,9 @@ Codify the full release process: version bump, docs update, CI, cross-compile, t
 
 ## Step 1: Classify commits
 
-Run `git log $(git describe --tags --abbrev=0)..HEAD --oneline` to list commits since the last tag.
+Run `git log --no-merges $(git describe --tags --abbrev=0 --match 'v*')..HEAD --oneline` to list commits since the last release tag. The `--match 'v*'` matters: the repo also carries `gen0-*` pin tags, and without it `describe` picks the newest pin, not the release.
+
+A range of a few hundred commits is too big to read in this session. Hand the read to one subagent, read-only: it reads every body, writes a per-commit classification file (sha, kind, user-facing, reason) and a draft section, and checks each claim against the tree. Check its draft before you edit anything.
 
 **Read each commit body** with `git show --format=%B --no-patch <sha>` before classifying. Do not classify from subject alone — internal refactors routinely have user-sounding subjects. Past examples:
 
@@ -26,7 +28,7 @@ Classify each commit as **breaking**, **feature**, **fix**, or **chore** — the
 
 Apply this filter before drafting notes. A commit is **internal** (drop from notes) if any of these apply:
 
-- **Codegen plumbing.** Changes only in `src/codegen*.bl` that don't add builtins/methods or alter emitted user-observable behavior. Telltales: "Replace parallel arrays with struct pools", "Remove dead `__blink_*` globals", "Erase `tp_get_kind`", "Switch X dispatch from globals to evidence parameter".
+- **Codegen plumbing.** Changes only in the codegen layer (`src/cg*.bl`, `src/ir.bl`, `src/mono.bl`, `src/layout.bl`, `src/cname.bl`) that don't add builtins/methods or alter emitted user-observable behavior. A fix that makes a program build or run right where it failed cc or gave wrong output is user-facing: keep one line per class of fix, not one per commit. Telltales: "Replace parallel arrays with struct pools", "Remove dead `__blink_*` globals", "Erase `tp_get_kind`", "Switch X dispatch from globals to evidence parameter".
 - **Compiler-internal symbols.** Anything mentioning `__blink_ctx`, `__blink_ev`, `__blink_ue_*`, `tp_get_kind`, parallel arrays, struct pools, evidence passing, vtable plumbing. These names never appear in user code.
 - **Spec / decisions only.** Commit body says "task ci is a no-op" or only touches `sections/`, `decisions/`, `OPEN_QUESTIONS.md`, `DECISIONS.md`.
 - **Compiler-internal tooling.** ICE infra, fuzzer harness, negative test scaffolding, test-only helpers. Mention only if user-visible diagnostics changed.
@@ -80,7 +82,7 @@ Update the `VERSION` file to the confirmed version.
 
 ## Step 5: Update CHANGELOG.md
 
-Prepend a new section to `CHANGELOG.md` (at repo root). Format matches prior entries — `## Breaking Changes (vX.Y.Z)` or `## What's New (vX.Y.Z)` with bullet-list body from Step 1c.
+Prepend a new section to `CHANGELOG.md` (at repo root). Format matches prior entries — `## Breaking Changes (vX.Y.Z)` or `## What's New (vX.Y.Z)` with bullet-list body from Step 1c. If CHANGELOG.md has a `## Changes (unreleased)` section, fold its entries into the new section and remove that heading.
 
 `CHANGELOG.md` is the single source of truth for release history. Both `blink llms` and `blink llms --full` append it automatically; `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing here. **Do not edit the stub in `llms.md` / `llms-full.md`.**
 
@@ -90,34 +92,44 @@ Also bump the Docker tag list in `llms.md` and `llms-full.md` (the `Tags: \`late
 
 ## Step 6: Refresh the full reference
 
-In `llms-full.md`:
-1. **Scan the diff for new builtins** — check `src/codegen.bl` `reg_fn()` calls against the Builtin Functions table; add any missing.
-2. **Scan for new methods** — check `src/codegen_methods.bl` against method tables; add any missing.
-3. **Scan for new stdlib functions** — check `lib/std/*.bl` pub functions against docs; add any missing.
-4. **Check runtime.h** — look for new functions that should be documented.
+In `llms-full.md`, check what changed since the last release tag (`git diff v<last>..HEAD -- <path>`):
+1. **Builtin functions** — `is_builtin_fn` and `get_builtin_fn_ret` in `src/typecheck.bl` against the Builtin Functions table.
+2. **Builtin namespaces** — `is_builtin_namespace` in `src/typecheck.bl` against Namespace Methods.
+3. **Methods** — `is_builtin_method` in `src/typecheck.bl`, and the sealed ops traits (`StrOps`, `BytesOps`, `StringBuildOps`) in `lib/std/traits.bl`, against the per-type method tables.
+4. **Stdlib** — `pub fn` in `lib/std/*.bl` against the Standard Library section.
+5. **CLI** — new flags and env vars (`src/cli.bl`, `build/gen1/bin/blink --help`) against Build & Run.
+6. **Diagnostics** — new codes in `ERROR_CATALOG.md` that a user can hit.
+
+Add what is missing. Remove what no longer exists. `src/codegen.bl` and `src/codegen_methods.bl` are gone since the codegen rewrite; do not look for `reg_fn`.
 
 ## Step 7: Review CLAUDE.md
 
-Check if any new files were added that should appear in the [Docs Index]. Update if needed.
+Check that the Architecture and Build & Verify sections still name files and tasks that exist (`rg` each path and `task --list`). Update if needed.
 
 ## Step 8: Commit Prep
 
 Stage all changes and commit with: `Prepare vX.Y.Z release`
 
+## Step 8b: Scan for br IDs
+
+br is local-only, so a ticket ID in pushed text means nothing to a reader. Before the push, collect every ID (`br list --all --json`) and `rg -wf` them against the commit messages, the added lines and the added file names in `origin/main..HEAD`. Fix new hits in docs and changelog text. Report hits in `decisions/` and in existing test names to the user; never rename tests.
+
 ## Step 9: Push
 
-`git push origin main`
+Ask the user before the push: it is public. Then `git push origin main`.
 
 ## Step 10: Execute Release
 
 Run `task release -- vX.Y.Z`
 
 This will:
-- Run full CI (`task ci-release`)
+- Run full CI (`task ci-release`; its regen step needs a seeded build/, see CLAUDE.md Bootstrap)
 - Cross-compile binaries (`task build-binaries`)
 - Create git tag
 - Push tag
 - Create GitHub release with binaries + llms-full.md
+
+Run `task ci-release` on HEAD early, while Step 1 runs, so a failure shows before the release commit.
 
 ## Step 11: Verify
 
@@ -128,13 +140,14 @@ Run `gh release view vX.Y.Z` and show the user the release URL.
 ## Checklist
 
 - [ ] VERSION bumped
-- [ ] `CHANGELOG.md` updated with new release section
+- [ ] `CHANGELOG.md` updated with new release section (the unreleased section folded in)
 - [ ] `llms-full.md` header `**Compiler vX.Y.Z**` bumped
 - [ ] Docker tag list bumped in `llms.md` and `llms-full.md`
-- [ ] `llms-full.md` builtins table matches `src/codegen.bl` reg_fn() calls
-- [ ] `llms-full.md` method tables match `src/codegen_methods.bl`
+- [ ] `llms-full.md` builtins, namespaces and method tables match `src/typecheck.bl` and `lib/std/traits.bl`
 - [ ] `llms-full.md` stdlib docs match `lib/std/*.bl` pub functions
-- [ ] CLAUDE.md [Docs Index] current
+- [ ] New CLI flags, env vars and user diagnostics documented
+- [ ] CLAUDE.md paths and tasks current
+- [ ] No new br IDs in the pushed range
 - [ ] `task ci-release` passes
 - [ ] Release created on GitHub with binaries
 
