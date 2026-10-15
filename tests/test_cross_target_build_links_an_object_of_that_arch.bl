@@ -1,0 +1,93 @@
+// `blink build -T <target>` links the stdlib archive into a binary for that target, so the
+// archive must hold objects zig built for that target: neither the host's archive (another
+// arch) nor one host cc built against the host's libc (symbols zig's libc lacks) links. Each
+// build runs in a fresh temporary directory, since a cross build caches its objects in the
+// .tmp/ of its working directory. The binaries are only inspected with `file`, never run.
+// An installed tree (bin/ + share/blink/) cross-builds from the monolith.c it ships, and the
+// archive stamp's fifth field, the sha of that monolith.c, rejects a torn install.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn scratch() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_cross_target.XXXXXX").out.trim()
+    write_file("{dir}/ok.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    dir
+}
+
+// What is wrong with `<blink> build -T target` in a fresh dir, or "" when it exits 0 and
+// `file` names arch for the binary.
+fn cross_build(blink: Str, target: Str, arch: Str) -> Str {
+    let dir = scratch()
+    let r = sh("R=$(pwd); cd {dir} && timeout 300 env -u BLINK_ROOT {blink} build -T {target} ok.bl -o out")
+    let kind = sh("file -b {dir}/out").out.trim()
+    let _ = sh("rm -rf {dir}")
+    if r.exit_code != 0 { return "-T {target} exited {r.exit_code}\nstdout:\n{r.out}\nstderr:\n{r.err_out}" }
+    if !kind.contains(arch) { return "-T {target} gave `{kind}`, not {arch}" }
+    ""
+}
+
+// A bin/ + share/blink/ tree like the one install.sh lays down, holding this tree's blink and
+// archive files. The stamp is the dev archive's, with its monolith.c field swapped for
+// mono_field when that is not "", or cut off when it is "-".
+fn installed_tree(mono_field: Str, with_monolith: Bool) -> Str {
+    let p = sh("mktemp -d /tmp/blink_cross_installed.XXXXXX").out.trim()
+    let _ = sh("R=$(pwd); mkdir -p {p}/bin {p}/share/blink && cp $R/build/blink {p}/bin/ && cp -L $R/build/libblink_std.a $R/build/libblink_std.h $R/build/runtime.h {p}/share/blink/")
+    if with_monolith {
+        let _ = sh("R=$(pwd); cp -L $R/build/monolith.c {p}/share/blink/")
+    }
+    let stamp = sh("R=$(pwd); cut -d'|' -f1-4 $R/build/.archive-id").out.trim()
+    let five = sh("R=$(pwd); cut -s -d'|' -f5 $R/build/.archive-id").out.trim()
+    let field = if mono_field == "" { five } else { mono_field }
+    let line = if mono_field == "-" { stamp } else { "{stamp}|{field}" }
+    write_file("{p}/share/blink/.archive-id", "{line}\n")
+    p
+}
+
+test "zig is on PATH, so the cross-target cases below cannot skip" {
+    assert_eq(sh("command -v zig >/dev/null && echo yes").out.trim(), "yes")
+}
+
+test "-T linux-arm64 links an aarch64 ELF binary" {
+    assert_eq(cross_build("$R/build/blink", "linux-arm64", "ARM aarch64"), "")
+}
+
+test "-T linux links an x86-64 ELF binary against zig's libc, not the host's" {
+    assert_eq(cross_build("$R/build/blink", "linux", "x86-64"), "")
+}
+
+test "-T macos-arm64 links an arm64 Mach-O binary" {
+    assert_eq(cross_build("$R/build/blink", "macos-arm64", "Mach-O 64-bit arm64"), "")
+}
+
+test "an installed blink cross-builds from the monolith.c in share/blink" {
+    let p = installed_tree("", true)
+    let wrong = cross_build("{p}/bin/blink", "linux-arm64", "ARM aarch64")
+    let _ = sh("rm -rf {p}")
+    assert_eq(wrong, "")
+}
+
+test "a stamp whose monolith.c sha does not match share/blink/monolith.c is a torn install" {
+    let p = installed_tree("0000000000000000000000000000000000000000000000000000000000000000", true)
+    let dir = scratch()
+    let r = sh("cd {dir} && timeout 300 env -u BLINK_ROOT {p}/bin/blink build -T linux-arm64 ok.bl -o out")
+    let built = sh("ls {dir}/out").exit_code
+    let _ = sh("rm -rf {p} {dir}")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("IncompatibleStdlibArchive"))
+    assert(r.err_out.contains("monolith.c"))
+    assert(built != 0)
+}
+
+test "an older install with no monolith.c is told to reinstall, not handed a linker error" {
+    let p = installed_tree("-", false)
+    let dir = scratch()
+    let r = sh("cd {dir} && timeout 300 env -u BLINK_ROOT {p}/bin/blink build -T linux-arm64 ok.bl -o out")
+    let _ = sh("rm -rf {p} {dir}")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("reinstall"))
+    assert(!r.err_out.contains("ld.lld"))
+}

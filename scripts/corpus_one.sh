@@ -114,7 +114,7 @@ for d in tests src lib bootstrap blink.toml; do
 done
 # src/cli.bl embeds ../build/gc_unity.c; corpus.sh generates it once.
 [ -e "$root/build/gc_unity.c" ] && ln -s "$root/build/gc_unity.c" "$work/build/gc_unity.c"
-for f in blink blinkc libblink_std.a libblink_std.h skip_modules.txt runtime.h .archive-id; do
+for f in blink blinkc libblink_std.a libblink_std.h skip_modules.txt runtime.h .archive-id monolith.c; do
     if [ -e "$comp_dir/$f" ]; then
         ln -s "$(readlink -f "$comp_dir/$f")" "$work/build/$f"
     elif [ -e "$comp_dir/share/blink/$f" ]; then

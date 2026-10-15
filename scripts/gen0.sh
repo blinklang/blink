@@ -9,7 +9,7 @@
 #   build/gen0/bin/{blinkc,blink}
 #   build/gen0/lib/{std,pkg}      stdlib sources: blinkc reads <dir of argv[0]>/lib/std
 #   build/gen0/bin/lib -> ../lib
-#   build/gen0/share/blink/{libblink_std.a,libblink_std.h,skip_modules.txt,runtime.h,.archive-id,native/}
+#   build/gen0/share/blink/{libblink_std.a,libblink_std.h,skip_modules.txt,runtime.h,.archive-id,monolith.c,native/}
 #   build/gen0/{blinkc,blink,libblink_std.a,libblink_std.h}   symlinks into the above
 #   build/gen0/.provenance
 #
@@ -182,6 +182,11 @@ ln -s ../lib "$OUT/bin/lib"
 # `blinkc --link-archive <hdr>` reads it next to the header.
 cp -L build/libblink_std.a build/libblink_std.h build/skip_modules.txt \
       build/runtime.h build/.archive-id "$OUT/share/blink/"
+# The stdlib's C, which a cross build compiles for its target. An older
+# tag's build/ has no link to it.
+if [ -e build/monolith.c ]; then
+    cp -L build/monolith.c "$OUT/share/blink/"
+fi
 # Native dep sidecars, same layout `task build` installs, so a gen0 build of
 # a program that imports a peeled module (std.db_sqlite) links from gen0.
 # The list goes through a file so a failed `__native-deps` stops the script.

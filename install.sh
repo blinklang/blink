@@ -51,9 +51,8 @@ case "$uname_m" in
     *) err "unsupported arch: $uname_m" ;;
 esac
 
-# Linux arm64 is not yet released; bail with a clear message.
 case "$os-$arch" in
-    linux-x86_64|macos-x86_64|macos-aarch64) ;;
+    linux-x86_64|linux-aarch64|macos-x86_64|macos-aarch64) ;;
     *) err "no release tarball for $os-$arch yet" ;;
 esac
 
@@ -121,6 +120,11 @@ $sudo_cmd cp "$src/share/blink/libblink_std.a" \
 # absence so an older tarball (pre-stamp) still installs.
 if [ -f "$src/share/blink/.archive-id" ]; then
     $sudo_cmd cp "$src/share/blink/.archive-id" "$PREFIX/share/blink/"
+fi
+# The stdlib's C, which a cross build (blink build -T) compiles for its
+# target. Guard for absence so an older tarball still installs.
+if [ -f "$src/share/blink/monolith.c" ]; then
+    $sudo_cmd cp "$src/share/blink/monolith.c" "$PREFIX/share/blink/"
 fi
 # Peeled native deps (e.g. sqlite3) ship as a sidecar under
 # share/blink/native/<name>/. Programs that import a peeled stdlib module

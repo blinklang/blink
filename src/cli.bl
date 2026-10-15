@@ -1025,9 +1025,10 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
     objects
 }
 
-fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str {
+// The -I flags a zig compile for target needs to find gc.h, which the host's cc finds
+// installed; none for a host build.
+fn cross_gc_includes(target: Str) -> List[Str] {
     let mut includes: List[Str] = []
-
     if target != "" {
         let gc_inc = resolve_gc_include()
         if gc_inc != "" {
@@ -1040,6 +1041,11 @@ fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str {
             includes.push("-I{gc_inc}")
         }
     }
+    includes
+}
+
+fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str {
+    let mut includes = cross_gc_includes(target)
 
     let mut di = 0
     while di < used_deps.len() {
@@ -1223,7 +1229,7 @@ fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO {
 // needs no check here. An *installed* archive (copied out of the cache into
 // <prefix>/share/blink/, losing the hash-named directory) carries a
 // `.archive-id` stamp instead:
-// runtime.h SHA | archive-header SHA | compiler SHA | version.
+// runtime.h SHA | archive-header SHA | compiler SHA | version | monolith.c SHA.
 //
 // The runtime.h and archive-header (libblink_std.h) SHAs catch a torn install:
 // BOTH headers are #included by the freshly emitted user TU and define the
@@ -1237,7 +1243,9 @@ fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO {
 // The headers do not cover the archive's function bodies, which another
 // compiler's codegen may have emitted under the same headers, so the stamp's
 // compiler SHA must name the running compiler. Every installer stamps the
-// binary it ships. The version is shown in the diagnostic only.
+// binary it ships. The version is shown in the diagnostic only. A cross build
+// compiles the shipped monolith.c in place of the archive, so a monolith.c that
+// is there must match the fifth field; a stamp from before that field has four.
 //
 // Returns 0 when the link may proceed (dev archive, or matching installed
 // stamp), 1 when an installed archive is incompatible or unstamped (a
@@ -1262,11 +1270,88 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO {
     let arc_ver = if parts.len() > 3 { parts.get(3).unwrap() } else { "?" }
     let cur_bc_sha = process_compiler_sha()
     if arc_rt_sha == cur_rt_sha && arc_hdr_sha == cur_hdr_sha && cur_bc_sha != "" && arc_bc_sha == cur_bc_sha {
-        return 0
+        // A stamp from before the fifth field names no monolith.c to check. A missing
+        // monolith.c leaves the host link whole; ensure_target_archive refuses a cross one.
+        let mono_path = path_join(arc_dir, "monolith.c")
+        if parts.len() <= 4 || file_exists(mono_path) == 0 {
+            return 0
+        }
+        let arc_mono_sha = parts.get(4).unwrap()
+        let cur_mono_sha = sha256_of_file_first(mono_path)
+        if arc_mono_sha == cur_mono_sha {
+            return 0
+        }
+        diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "installed stdlib archive is torn: its stamp names monolith.c {sha8(arc_mono_sha)}, but {mono_path} is {sha8(cur_mono_sha)}", "reinstall: task install   (or rebuild against the current toolchain)")
+        diag_flush()
+        return 1
     }
     diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "installed stdlib archive is incompatible with this compiler\n  archive built by blink {arc_ver} (compiler {sha8(arc_bc_sha)}, runtime {sha8(arc_rt_sha)}, header {sha8(arc_hdr_sha)}), current blink is {blink_cli_version} (compiler {sha8(cur_bc_sha)}, runtime {sha8(cur_rt_sha)}, header {sha8(cur_hdr_sha)})", "reinstall: task install   (or rebuild against the current toolchain)")
     diag_flush()
     1
+}
+
+// The stdlib archive a link for target takes. A host link takes the one in arc_dir. A
+// cross link takes one zig built for target from the archive's monolith.c: the archive in
+// arc_dir holds host-arch objects, built against the host's libc, whose symbols zig's libc
+// for the same arch can lack. It is cached under .tmp/ as the cross-built gc is, since
+// share/blink may be read-only. "" after an error is printed.
+fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO {
+    if target == "" {
+        return "{arc_dir}/libblink_std.a"
+    }
+    let mono = path_join(arc_dir, "monolith.c")
+    if file_exists(mono) == 0 {
+        io.eprintln("error: cannot cross-build for {target}: {mono} is missing, so the stdlib cannot be compiled for that target")
+        io.eprintln("  reinstall blink: this install is older than cross builds and does not ship monolith.c")
+        return ""
+    }
+    let cc_id = process_cc_id(target)
+    if cc_id == "" {
+        io.eprintln("error: cannot cross-build for {target}: `zig cc -target {target}` does not run (is zig on PATH?)")
+        return ""
+    }
+    let flags = "-c -w -ffunction-sections -fdata-sections {cross_gc_includes(target).join(" ")} -I{arc_dir}"
+    let mut id = StringBuilder.new()
+    id.write("monolith:{sha256_of_file_first(mono)}\n")
+    id.write("header:{sha256_of_file_first(path_join(arc_dir, "libblink_std.h"))}\n")
+    id.write("runtime:{sha256_of_file_first(path_join(arc_dir, "runtime.h"))}\n")
+    id.write("cc:{cc_id}\n")
+    id.write("target:{target}\n")
+    id.write("flags:{cc_opt_flags(0, 1).join(" ")} {flags}\n")
+    let dir = ".tmp/std-{target}-{sha256_hex(id.to_str()).byte_slice(0, 16)}"
+    let archive = "{dir}/libblink_std.a"
+    if file_exists(archive) == 1 {
+        return archive
+    }
+    // Built aside and renamed into place, as build_stdlib_archive_in does, so a concurrent
+    // cross build never links a half-written archive.
+    let _ = build_fs.mkdir_p(".tmp")
+    build_fs.reap_dead(".tmp", ["std-tmp"])
+    let stage = build_fs.private_dir(".tmp", "std-tmp")
+    if stage == "" {
+        io.eprintln("error: cannot make a staging directory in .tmp")
+        return ""
+    }
+    // -w: monolith.c compiles clean under the host's cc, but clang warns on it by the
+    // thousand. Errors still print.
+    let rc = run_cc("{flags} -o {stage}/monolith.o {mono}", 0, 1, target)
+    if rc != 0 {
+        let _ = build_fs.remove_tree(stage)
+        io.eprintln("error: zig cc failed building the stdlib archive for {target} (rc={rc})")
+        return ""
+    }
+    let ar = process_run("zig", ["ar", "rcs", "{stage}/libblink_std.a", "{stage}/monolith.o"])
+    if ar.exit_code != 0 {
+        let _ = build_fs.remove_tree(stage)
+        io.eprint(ar.err_out)
+        io.eprintln("error: zig ar failed building the stdlib archive for {target} (rc={ar.exit_code})")
+        return ""
+    }
+    fs_remove("{stage}/monolith.o")
+    build_fs.unmark(stage)
+    // A concurrent build that renamed first wins; its archive is as good.
+    shell_exec("if [ -e {dir} ]; then rm -rf {stage}; else chmod 755 {stage}; mv {stage} {dir}; fi")
+    archive
 }
 
 fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report, IO {
@@ -1285,9 +1370,13 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     if vrc != 0 {
         return vrc
     }
+    let std_archive = ensure_target_archive(arc_dir, target)
+    if std_archive == "" {
+        return 1
+    }
     // The layer goes ahead of the stdlib archive, whose symbols it uses.
     let layer = if compiler_archive != "" { " {compiler_archive_link_args(compiler_archive)}" } else { "" }
-    let archive = "{layer} -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections"
+    let archive = "{layer} -I{arc_dir} {std_archive} -Wl,--gc-sections"
     let mut effective_link_flags = link_flags
     // obj_files / include_flags carry per-build vendored deps the caller
     // resolved via detect_native_deps(c_source); the archive itself owns
@@ -2573,6 +2662,10 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     if vrc != 0 {
         return vrc
     }
+    let std_archive = ensure_target_archive(arc_dir, target)
+    if std_archive == "" {
+        return 1
+    }
     // Each file of a unit compiles to an object of its own, cached on its own.
     let mut files: List[emit_record.UnitChunkFile] = []
     for u in units {
@@ -2826,7 +2919,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     if build_objcache.dev_evict_at("link") {
         dbg_trace("build.units", "dev evict link")
     }
-    let rc = run_cc("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {arc_dir}/libblink_std.a -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target)
+    let rc = run_cc("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {std_archive} -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target)
     if finish_pch(run) {
         stored = true
     }
