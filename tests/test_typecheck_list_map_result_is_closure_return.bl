@@ -1,0 +1,159 @@
+// `map` and `flat_map` with a closure that names no `-> U` type the call from what the
+// closure's body computes (sections/03_types.md, forward inference from the body), never from
+// the receiver's element. A body whose type nothing can determine is reported, not defaulted
+// (decisions/under-determined-types.md).
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe_error_names(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name} " }
+    }
+    out.trim()
+}
+
+fn assert_names(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+fn str_map_then_add_int_src() -> Str {
+    #"fn main() {
+    let xs = [1, 2, 3]
+    let s = xs.map(fn(v: Int) { "{v}" })
+    let y = s.get(0).unwrap()
+    let _z = y + 1
+}
+"#
+}
+
+fn iter_map_collect_then_add_int_src() -> Str {
+    #"fn main() {
+    let it = [1, 2].into_iter().map(fn(v) { "{v}" }).collect()
+    let _q = it.get(0).unwrap() + 1
+}
+"#
+}
+
+fn annotated_let_disagrees_src() -> Str {
+    #"fn main() {
+    let s: List[Str] = [1].map(fn(v) { v })
+    io.println("{s.len()}")
+}
+"#
+}
+
+fn join_on_int_map_src() -> Str {
+    #"fn main() {
+    let s = [1].map(fn(v) { v })
+    io.println(s.join(","))
+}
+"#
+}
+
+fn int_annotation_on_str_map_src() -> Str {
+    #"fn main() {
+    let s: List[Int] = [1].map(fn(v) { "{v}" })
+    io.println("{s.len()}")
+}
+"#
+}
+
+fn join_on_str_map_src() -> Str {
+    #"fn main() {
+    io.println([1, 2].map(fn(v) { "{v}" }).join(","))
+}
+"#
+}
+
+fn join_on_int_map_same_expression_src() -> Str {
+    #"fn main() {
+    io.println([1].map(fn(v) { v }).join(","))
+}
+"#
+}
+
+fn flat_map_closure_returns_option_src() -> Str {
+    #"fn main() {
+    let s = [1].flat_map(fn(v) { Some(v) })
+    io.println("{s.len()}")
+}
+"#
+}
+
+fn undetermined_body_src() -> Str {
+    #"fn main() {
+    let s = [1, 2].map(fn(v) { [] })
+    io.println("{s.len()}")
+}
+"#
+}
+
+fn tuple_map_destructure_src() -> Str {
+    #"fn main() {
+    let pairs = ["a", "b"].map(fn(w) { (w, 1) })
+    for (word, count) in pairs { io.println("{word} {count}") }
+}
+"#
+}
+
+fn named_fn_map_src() -> Str {
+    #"fn chars2(s: Str) -> List[Str] { [s] }
+fn main() {
+    for row in ["ab"].map(chars2) { for (i, c) in row.enumerate() { io.println("{i}{c}") } }
+}
+"#
+}
+
+test "a Str-producing map closure types the call List[Str]" {
+    assert_names("Str + Int after map", probe_error_names("tc_lmr_str", str_map_then_add_int_src()), "StrPlusUnsupported")
+}
+
+test "an Iterator map closure types the collected list from its body" {
+    assert_names("collect then + 1", probe_error_names("tc_lmr_iter", iter_map_collect_then_add_int_src()), "StrPlusUnsupported")
+}
+
+test "a let annotation that disagrees with the closure body is reported" {
+    assert_names("List[Str] = Int map", probe_error_names("tc_lmr_ann", annotated_let_disagrees_src()), "TypeError")
+}
+
+test "join on a map whose closure returns Int is reported" {
+    assert_names("join on List[Int]", probe_error_names("tc_lmr_join", join_on_int_map_src()), "TypeError")
+}
+
+test "a List[Int] annotation on a Str-producing map is reported" {
+    assert_names("List[Int] = Str map", probe_error_names("tc_lmr_ann_int", int_annotation_on_str_map_src()), "TypeError")
+}
+
+test "join reads a Str-producing map in the same expression as List[Str]" {
+    assert_names("map then join", probe_error_names("tc_lmr_join_str", join_on_str_map_src()), "")
+}
+
+test "join in the same expression as an Int-producing map is reported" {
+    assert_names("map then join on Int", probe_error_names("tc_lmr_join_int", join_on_int_map_same_expression_src()), "TypeError")
+}
+
+test "an unannotated flat_map closure that returns no List is reported" {
+    assert_names("flat_map to Some", probe_error_names("tc_lmr_fm_opt", flat_map_closure_returns_option_src()), "TypeError")
+}
+
+test "a closure body with no determinable type is CannotInferType" {
+    assert_names("map to []", probe_error_names("tc_lmr_ud", undetermined_body_src()), "CannotInferType")
+}
+
+test "a tuple-producing map closure destructures in a for loop" {
+    assert_names("tuple map", probe_error_names("tc_lmr_tuple", tuple_map_destructure_src()), "")
+}
+
+test "a named fn passed to map types the call from its return" {
+    assert_names("map(chars2)", probe_error_names("tc_lmr_named", named_fn_map_src()), "")
+}
