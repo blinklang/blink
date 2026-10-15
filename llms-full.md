@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.54.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.55.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.54`, `0.54.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.55`, `0.55.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -1175,6 +1175,10 @@ build/blink doc std.json --json     # module docs as JSON
 build/blink audit src/main.bl     # FFI audit report
 build/blink update                  # update deps + blink-version in blink.toml
 
+# Output format: --format json prints what --json prints; human is the default.
+# check, build, fmt, run and test take it. --json beside another --format value is an error.
+build/blink check src/main.bl --format json
+
 # Default builds (no mode flag) compile the C at -O1
 build/blink build src/main.bl
 
@@ -1245,22 +1249,25 @@ build uses per-module units.
 
 ### Compiler Daemon
 
-The compiler daemon is a persistent background process that maintains a live dependency graph with file watching and incremental recheck. When running, `blink check` and `blink query` use it automatically for faster responses.
+The compiler daemon is a background process that keeps checked programs in memory, watches their files and rechecks a program when one of its files changes. A project has one daemon; its socket is in `.blink/` at the project root. While it runs, `blink check`, `blink query`, `blink build` and `blink run` use it. When it cannot serve a build or run (its compiler, environment or settings differ from the client's), the command builds cold, with the same result.
 
 ```sh
-# Start daemon for a project (watches for file changes)
+# Start the daemon for the project that holds this entry file
 blink daemon start src/main.bl
+blink daemon start src/main.bl --max-entries 4   # entry files kept checked at once (default 8)
 
-# Check status and stop
+# Status and stop take no file argument
 blink daemon status      # uptime, memory, graph size
 blink daemon stop
 
-# These commands use the daemon automatically when it's running:
-blink check src/auth.bl  # incremental recheck (sub-200ms for single function changes)
-blink query src/auth.bl  # symbol lookup from cached index
+# These commands use the daemon when it runs:
+blink check src/auth.bl  # incremental recheck
+blink query src/auth.bl  # symbol lookup from the cached index
+blink build src/main.bl  # warm build; falls back to a cold build
+blink run src/main.bl
 ```
 
-Start the daemon at the beginning of iterative development sessions for significantly faster feedback loops.
+Start the daemon at the start of an edit session to get faster checks and builds.
 
 ### Debugging & Inspection Flags
 

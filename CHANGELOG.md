@@ -2,10 +2,54 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
-## Changes (unreleased)
+## Breaking Changes (v0.55.0)
 
-- **`blink build`, `blink run` and `blink test` compile one C unit per module by default.** The units compile in parallel and each is cached on its own, so an edit recompiles only the units it changed, and a build whose inputs did not change reuses the last build's units. The units go in `<output>.units/` beside the binary, and no `<output>.c` is written. `--no-per-module` or `BLINK_PER_MODULE=0` builds the whole program as one C unit, to bisect a per-module bug; a flag beats the env var, which beats the default, and passing both flags is an error. `--per-module` still works and asks for the default by name. `--emit c`, `BLINK_SKIP_MODULES`, `BLINK_ONLY_MODULE` and `BLINK_COMPILER_ARCHIVE` still build one unit, with no note unless `--per-module` was passed.
-- **`blink build` no longer takes `--format blink`.** `--format` sets the output format (json or human); `blink fmt` formats Blink source. `blink build`, `blink run` and `blink test` refuse `--format blink` as they refuse any other unknown value: `error: --format must be json or human, got 'blink'` on stderr, a hint to use `blink fmt`, and exit 1, before any compile. Before, `blink build --format blink` passed the formatted source to the C compiler, which failed.
+### Strings
+- **`Str` methods count codepoints, not bytes.** `len`, `substring`, `char_at` and `index_of` use codepoint positions. `"héllo".len()` is 5, not 6. Code that mixed `len` with byte offsets gives different results for text that is not ASCII.
+- **`substring(start, end)` takes an end position, not a length.** Before, `s.substring(i, n)` returned `n` characters from `i`; now it returns the characters from `i` up to `end`. The compiler does not catch this change, because both forms take two `Int`s: change each `substring(i, n)` call to `substring(i, i + n)`. `substring` clamps a range that goes past the end of the string.
+- **`Str.index_of` returns `Option[Int]`.** Match on the result or use `??`; before, it returned a bare `Int`.
+- **`Str.slice` and `Str.substr` are gone.** A call is E0505 UnresolvedMethod, and the help names the fix: `.substring` for a range of codepoints, `.byte_slice(start, end)` for a range of bytes.
+- **`Str.byte_at` returns `U8` and panics out of bounds.** Use `.to_int()` to widen the result to `Int`.
+
+### Command line and build
+- **`blink build`, `blink run` and `blink test` compile one C unit per module by default.** The units compile in parallel and each is cached on its own, so an edit recompiles only the units it changed, and a build whose inputs did not change reuses the last build's units. The units go in `<output>.units/` beside the binary, and no `<output>.c` is written. `--no-per-module` or `BLINK_PER_MODULE=0` builds the whole program as one C unit, to find a per-module bug; a flag beats the env var, which beats the default, and passing both flags is an error. `--per-module` asks for the default by name. `--jobs <n>` or `BLINK_JOBS` sets how many units compile at once (default: the CPU count). `--emit c`, `BLINK_SKIP_MODULES`, `BLINK_ONLY_MODULE` and `BLINK_COMPILER_ARCHIVE` still build one unit.
+- **`--format blink` is refused.** `--format` sets the output format (`json` or `human`); `blink fmt` formats Blink source. `blink build`, `blink run` and `blink test` refuse `--format blink` as they refuse any other unknown value: `error: --format must be json or human, got 'blink'` on stderr, a hint to use `blink fmt`, and exit 1, before any compile. Before, `blink build --format blink` passed the formatted source to the C compiler, which failed.
+- **CLI usage errors exit 1 with the message on stderr.** An unknown option, an option with no value, an unknown command and a missing argument now print to stderr and exit 1. Before, some of them printed to stdout and exited 0, so a script did not see the failure.
+
+### Daemon and editor tools
+- **One daemon per project.** Every daemon command finds its socket in `.blink/` at the project root. `blink daemon status` and `blink daemon stop` take no file argument; `blink daemon start` still takes the entry file of the program to serve.
+- **Unix socket writes report a closed peer.** `socket_write(fd, data)` returns an `Int`: the bytes written, or `-1` when the peer has closed. Before, it returned nothing, and a write to a closed peer killed the process with SIGPIPE. `socket_read_line` reads a line of any length, and `unix_socket_listen` and `unix_socket_connect` return `-1` for a path that is too long for a socket address.
+
+### Diagnostics
+- **A malformed escape drops the whole escape.** In `"a\qb"`, the lexer reports the bad escape and the string is `"ab"`; before, it kept the escaped character. Each lexer error now has its own code: E1114 to E1122 for bad `\u{...}`, `\x` and NUL escapes, E1123 UnknownEscape, E1124 EmptyCharLiteral, E1125 MultiCharLiteral and E1126 UnterminatedLiteral. They go through the normal diagnostic output, so `--json` shows them.
+
+## What's New (v0.55.0)
+- **`Str.byte_len`, `Str.byte_slice(start, end)` and `Str.byte_index_of(needle, from)`** read text by byte position. `byte_slice` panics if a bound cuts a codepoint. `byte_index_of` returns `Option[Int]`.
+- **`List.with_capacity(n)` and `List.capacity()`** make a list with room for `n` elements and read how much room it has.
+- **The daemon builds and runs.** `blink build` and `blink run` use a warm daemon when one serves the project, and build cold when it cannot serve the build. The daemon serves a check, build or run of any entry file of the project; `blink daemon start --max-entries <n>` sets how many programs it keeps (default 8). It answers `status`, `check` and `query` while a build runs, and it rechecks a program when one of its files changes, not when the next client asks.
+- **`--format json` and `--format human`.** `blink check`, `blink build` and `blink fmt` take `--format json`, which prints what `--json` prints, and `--format human`, the default. `blink run` and `blink test` take `--format json|human` and `--json`. `--json` together with a different `--format` value is an error.
+- **`blink check --json` prints its status line on every failing exit.**
+- **`blink.toml` issues are diagnostics.** A bad lint level is E0843 InvalidLintLevel, and an unknown section is W1001 UnknownManifestSection. Manifest warnings and errors print once per command, on stderr.
+- **An internal parser limit is an internal compiler error.** The compiler reports I0012 ParserInternalLimit and exits 101. `blink-lsp` tells the editor about an internal error before it stops.
+- **`Ptr.offset` works on any pointee that has a C size**, not only an `@ffi.struct`. E0838 now applies only to `Ptr[Void]`, an opaque handle or a type parameter.
+- **`std.toml` gives source positions.** `toml_key_spans`, `toml_value_spans`, `toml_headers` and `toml_header_spans` return the line and column of each key, value and table header as `TomlSpan` records.
+- **Faster builds, less memory.** On the compiler's own CLI program (`src/cli.bl`, about 73 files and 91k lines), compared with v0.54.0: a cold build takes 1.90 s, not 25.48 s; a build with no change takes 0.44 s, not 16.85 s; a build after a change to one function body takes 0.65 to 0.79 s, not 25.5 s; `blink test` after an edit takes 0.38 s, not 5.25 s; `blink check` after an edit, with no daemon, takes 0.31 s, not 4.18 s. The largest process of a cold build peaks at 224 MB, not 781 MB. Programs run faster too: `len` on a `List` or `Str` is a direct read, `Str.replace` and `split` take linear time (250k matches: 9 ms, not 4170 ms), `json_parse` reads long strings in linear time, and `Map`/`Set` lookups and the garbage collector do less work.
+
+## Fixes (v0.55.0)
+- **A source file that is not UTF-8 gives E1113 UnexpectedCharacter**, with the bad byte shown as `\xNN`, instead of crashing the compiler. A stray multi-byte character gives one diagnostic that names it as `U+XXXX`, not one per byte.
+- **`blink fmt` keeps parentheses around `??`** where removing them would change the meaning.
+- **`blink fmt` keeps the `as` name of a selective import.** It printed `import m.{a as b}` as `import m { a }`, so each use of `b` no longer resolved.
+- **`&&` and `||` with a list literal, a capturing closure or a `Box` on the right side** compile; before, they stopped with an internal compiler error.
+- **`with arena` blocks.** A process, socket or stdin read past the first buffer inside `with arena` aborted with "Duplicate large block deallocation". A `List`, `Map`, `Set`, `Bytes` or `StringBuilder` made outside an arena and grown inside one pointed at freed memory after the block. Both work now.
+- **A `Map` or `Set` with many inserts and removes no longer hangs.**
+- **The default `net.dns` and crypto handlers return an empty `Str`**, not an invalid one.
+- **`http_client` returns a `ProtocolError` for a chunked body that is not valid UTF-8**, instead of a `Str` with invalid bytes.
+- **Process handles.** Two spawns at the same time no longer share one slot. A `Pid` handle from before a slot was reused no longer reads the new process. The runtime keeps at most 4096 waited results and 1 MiB of their output; `wait` on a dropped result gives exit code -1 and the error "invalid pid handle".
+- **Daemon security.** The daemon socket was open to other users on the machine. The socket directory is now `0700`, the socket `0600`, and the daemon refuses a client whose user ID does not match.
+- **The daemon and `blink-lsp` give the same results as a cold `blink check`**, including the exit code and output, and after a change to any file the compiler read. The daemon serves a client only when the client's compiler, environment and settings match its own.
+- **Each warning prints once.** `blink build` printed some warnings twice, and `blink test` printed manifest warnings once per test file.
+- **`blink test` shows the diagnostics of every test file**, builds each file with the `blink` that runs it, works with a `PATH` that has no `env`, and no longer reports BUILD FAILED for a file whose result it lost under `--parallel`.
+- **Install and build cache.** Installing on macOS works where `sha256sum` or `readlink -f` is missing. The stdlib archive and the object cache rebuild when the compiler, a header or a vendored file changes, two builds at the same time no longer fail with "cannot find <key>.o", and a killed build no longer leaves files behind.
 
 ## Breaking Changes (v0.54.0)
 
