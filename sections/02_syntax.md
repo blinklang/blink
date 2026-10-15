@@ -1771,7 +1771,7 @@ test "let-bound property closure is not elaborated" {
 
 Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
 
-**Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.6.3 — it runs `BlockHandler.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
+**Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.7.2 — it runs `BlockHandler.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
 
 **Validation symmetry.** `blink check` and `blink test` apply the same elaboration rule — `?` is valid in a test body iff the body would type-check after the implicit `Result[(), TestError]` elaboration. The two pipelines never disagree.
 
@@ -1820,7 +1820,7 @@ error[E0306]: trait bound not satisfied
 
 **Note:** `assert_matches` is a compiler intrinsic whose second argument is a **pattern** (same syntax as `match` arms), not an expression. It cannot be passed as a higher-order function.
 
-Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe. The test runner's per-test frame is a **runtime catch boundary** in the sense of §4.6.3, so `BlockHandler.exit(false)` and `Closeable.close()` run during the unwind — `with db.transaction() { assert_eq(...) }` rolls back the transaction on assertion failure.
+Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe. The test runner's per-test frame is a **runtime catch boundary** in the sense of §4.7.2, so `BlockHandler.exit(false)` and `Closeable.close()` run during the unwind — `with db.transaction() { assert_eq(...) }` rolls back the transaction on assertion failure.
 
 **Panel vote: 4-1** for three built-ins (original §2.20 vote). PLT dissented (assert_ne is `assert(a != b)` — Principle 2 violation). See [DECISIONS.md](../DECISIONS.md). Testing framework deliberation added `assert_matches` (4-1, AI/ML dissented) and optional messages (3-2). See [DECISIONS.md](../DECISIONS.md).
 
@@ -1999,7 +1999,7 @@ The literal `10 / 0` in the first test gives no warning: `DivisionByLiteralZero`
 
 **Pass semantics.** A passing `assert_panics` *consumes* the expected panic: the test's status is `"passed"`, **not** `"panicked"`. The top-level `"panicked"` status is reserved for an *unexpected* panic that escapes a test body. See §8.10 for runner output.
 
-**Resource cleanup on the expected panic.** A panic caught by `assert_panics` is a **catchable unwind** in the sense of §4.6.3: in-scope `with`/`Closeable` resources opened *inside* the block run `BlockHandler.exit(false)` / `Closeable.close()` during the unwind, before the runner records the pass.
+**Resource cleanup on the expected panic.** A panic caught by `assert_panics` is a **catchable unwind** in the sense of §4.7.2: in-scope `with`/`Closeable` resources opened *inside* the block run `BlockHandler.exit(false)` / `Closeable.close()` during the unwind, before the runner records the pass.
 
 ```blink
 test "rolls back on the expected panic" {
@@ -2011,7 +2011,7 @@ test "rolls back on the expected panic" {
 }
 ```
 
-This is the one place in the language where a `panic` unwind runs cleanup. An *unexpected* panic (outside any `assert_panics` body) still terminates the process and bypasses cleanup, exactly as before. See §4.6.3 for the catchable-unwind set and the fence amendment.
+This is the one place in the language where a `panic` unwind runs cleanup. An *unexpected* panic (outside any `assert_panics` body) still terminates the process and bypasses cleanup, exactly as before. See §4.7.2 for the catchable-unwind set and the fence amendment.
 
 **Why a block, not a closure.** A closure (`fn() { ... }`) is a first-class value: a user could bind it (`let g = ...`) and hold a value whose invocation is panic-catchable, leaking panic recovery into ordinary code. The only guarantee the compiler enforces is about where a catch frame is **created**: a catch frame can only be created by code written lexically inside a `test { ... }` block (**E0833**). A recognized block is never a value, so no expression in the language has a panic-catching type, and `panic: Never` stays sound in the narrow sense that no signature can promise recovery. A closure written inside a test may still *contain* an `assert_panics` block. Nothing confines the resulting function value after that. It may be passed to ordinary code, stored in module-level mutable state, and invoked later from a plain `fn` with no test on the call stack. The block form also keeps the surface familiar: like `pytest.raises(...)` / Rust `#[should_panic(expected = "...")]`, you wrap the region and optionally assert the message.
 
@@ -2101,9 +2101,9 @@ test "deposit then withdraw" {
 }
 ```
 
-`with` handlers run their `exit(false)` on assertion failure (§4.6.3 / `BlockHandler` catchable-unwind), so transactional rollback, log capture, and temp-path cleanup all behave correctly across the unwind.
+`with` handlers run their `exit(false)` on assertion failure (§4.7.2 / `BlockHandler` catchable-unwind), so transactional rollback, log capture, and temp-path cleanup all behave correctly across the unwind.
 
-**Why no `subtest` primitive.** Adding `subtest` as either a stdlib HOF or a compiler-recognized block was deliberated and rejected. The shapes that go beyond `for_each` + flat `test` blocks all require either (a) a second catch-site for `panic` inside `test` (so siblings could continue after one fails), which would contradict §2.20's "panic is untracked divergence; only the test runner catches it" and §4.6.3's deferral of recoverable panics, or (b) sugar that adds language surface without expressivity gain. Future evidence-driven re-evaluation may reopen the question; the current evidence (no shipped feature missing it, `for_each` covers parametric, helper `fn` covers heterogeneous) is that the gap is documentation-shaped, not syntax-shaped.
+**Why no `subtest` primitive.** Adding `subtest` as either a stdlib HOF or a compiler-recognized block was deliberated and rejected. The shapes that go beyond `for_each` + flat `test` blocks all require either (a) a second catch-site for `panic` inside `test` (so siblings could continue after one fails), which would contradict §2.20's "panic is untracked divergence; only the test runner catches it" and §4.7.2's deferral of recoverable panics, or (b) sugar that adds language surface without expressivity gain. Future evidence-driven re-evaluation may reopen the question; the current evidence (no shipped feature missing it, `for_each` covers parametric, helper `fn` covers heterogeneous) is that the gap is documentation-shaped, not syntax-shaped.
 
 **Panel vote: 5-1** (sys dissent for compiler builtin with static enumerability). See [DECISIONS.md](../DECISIONS.md) and [decisions/sub-tests.md](../decisions/sub-tests.md).
 
@@ -2378,7 +2378,7 @@ test "platform specific" {
 }
 ```
 
-`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags. Like assertion failure, `skip()` is a catchable unwind in the sense of §4.6.3 — `Closeable.close()` and `BlockHandler.exit(false)` run for any in-scope resources before the test runner records the skip. A test that allocates a temp directory and then `skip()`s on platform mismatch will release the temp directory.
+`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags. Like assertion failure, `skip()` is a catchable unwind in the sense of §4.7.2 — `Closeable.close()` and `BlockHandler.exit(false)` run for any in-scope resources before the test runner records the skip. A test that allocates a temp directory and then `skip()`s on platform mismatch will release the temp directory.
 
 **When to use which:**
 

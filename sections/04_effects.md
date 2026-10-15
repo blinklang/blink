@@ -893,7 +893,7 @@ The mock lists all eight operations at one level. A handler for an effect with c
 
 #### 4.4.4 DB.Write Scoped Transaction
 
-`db.transaction` implements the `BlockHandler` trait (see §4.6.3), providing automatic `BEGIN`/`COMMIT`/`ROLLBACK` semantics via `with`. It requires the `DB.Write` effect.
+`db.transaction` implements the `BlockHandler` trait (see §4.7.2), providing automatic `BEGIN`/`COMMIT`/`ROLLBACK` semantics via `with`. It requires the `DB.Write` effect.
 
 ```blink
 fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[(), DBError] ! DB.Write {
@@ -1508,7 +1508,7 @@ The LSP displays `main`'s actual effect set as an inlay hint, computed from the 
 
 #### Unhandled user effects
 
-A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.6.3 *Scoped effect handlers* for a `BlockHandler` whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
+A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `BlockHandler` whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
 
 ```blink
 effect Store {
@@ -1563,7 +1563,7 @@ with handler_expression {
 }
 ```
 
-A `handler E { ... }` expression captures bindings from its enclosing scope exactly as a closure does (§2.8). A captured `let mut` binding is a shared cell (§3.6 *Shared cells*): writes in a handler op are visible to the enclosing scope and to any closure that captured the same binding. This differs from `BlockHandler` block bodies (§4.6.3), which run in the caller's scope and capture nothing. The `std.testing` mock controllers (§8.10.3) depend on this rule.
+A `handler E { ... }` expression captures bindings from its enclosing scope exactly as a closure does (§2.8). A captured `let mut` binding is a shared cell (§3.6 *Shared cells*): writes in a handler op are visible to the enclosing scope and to any closure that captured the same binding. This differs from `BlockHandler` block bodies (§4.7.2), which run in the caller's scope and capture nothing. The `std.testing` mock controllers (§8.10.3) depend on this rule.
 
 #### Testing: mock handlers
 
@@ -1765,9 +1765,9 @@ The outer `with mock_db(fixtures), temp_fs()` installs effect handlers (no `as`)
 
 When `as` is absent, the compiler checks `Handler[E]` first, then a `BlockHandler` whose `Context` is `Handler[E]`, then a `BlockHandler` whose `Context` is `()`. Any other `Context` without `as` is an error (E0839). When `as` is present, the compiler checks `Closeable` first, then `BlockHandler`. A type implementing both `Closeable` and `BlockHandler` is a compile error (ambiguity).
 
-`as` never changes what a `with` item does. For a scoped effect handler, `with expr as name { }` installs the handler exactly as `with expr { }` does, and also binds `name` to the same `Handler[E]` value. The typing rule and evaluation order are in §4.6.3, *Scoped effect handlers*.
+`as` never changes what a `with` item does. For a scoped effect handler, `with expr as name { }` installs the handler exactly as `with expr { }` does, and also binds `name` to the same `Handler[E]` value. The typing rule and evaluation order are in §4.7.2, *Scoped effect handlers*.
 
-**Comma-separated items nest from left to right.** `with a, b { body }` means `with a { with b { body } }`. The compiler evaluates and type-checks item *i* after items *0..i-1* are entered and their handlers installed, so a later item can use an effect that an earlier item installs. Teardown is LIFO. If item *i* fails through `?`, the `?` fires before item *i* is entered, and the normal unwind of items *0..i-1* runs their `exit(false)` or `close()` (§4.6.3, *Catchable unwind*; §5.5, *Multiple resources*).
+**Comma-separated items nest from left to right.** `with a, b { body }` means `with a { with b { body } }`. The compiler evaluates and type-checks item *i* after items *0..i-1* are entered and their handlers installed, so a later item can use an effect that an earlier item installs. Teardown is LIFO. If item *i* fails through `?`, the `?` fires before item *i* is entered, and the normal unwind of items *0..i-1* runs their `exit(false)` or `close()` (§4.7.2, *Catchable unwind*; §5.5, *Multiple resources*).
 
 All forms can appear in the same comma-separated `with`:
 
@@ -1811,219 +1811,6 @@ fn good_example() ! FS, Async {
     }
 }
 ```
-
----
-
-### 4.6.3 BlockHandler Trait — Scoped Blocks
-
-The `BlockHandler` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It lets a type accept a block without new syntax for each API.
-
-```blink
-trait BlockHandler {
-    type Context
-
-    fn enter(self) -> Self.Context
-    fn exit(self, ok: Bool)
-}
-```
-
-**`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). If `Context` is `Handler[E]`, the return value is also installed as the handler for `E` (see *Scoped effect handlers* below). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` for any **catchable unwind** (see below).
-
-#### Catchable unwind
-
-`exit(self, false)` runs on every exit path that terminates at a runtime-defined catch boundary. The set is closed and exhaustively defined:
-
-| Path | `ok` value |
-|------|-----------|
-| Normal block completion | `true` |
-| `?` propagation | `false` |
-| `return` from enclosing function | `false` |
-| Assertion failure (`assert`, `assert_eq`, `assert_ne`, `assert_matches`) | `false` |
-| `skip()` in a test block | `false` |
-| Expected panic caught by `assert_panics` (the *armed* boundary, §2.20) | `false` |
-| Uncaught panic (`panic()`, arithmetic overflow, OOB index) outside a runtime catch frame, or a fatal runtime error | *bypasses `exit()` entirely* |
-
-A **fatal runtime error** is a fault the runtime cannot recover from: OOM, stack overflow, or foreign code that ends the process. The runtime ends the process at once. Nothing unwinds, and no `exit()` or `close()` runs.
-
-The runtime catch frames are the test runner's per-test boundary, the `?`/`return` desugar, and — within a test only — the boundary armed by an `assert_panics` block (§2.20). The set of runtime catch boundaries is **exhaustively defined by this spec and cannot be extended by user code**. Introducing user-level panic recovery (e.g., `recover`, `catch_panic`) would require a separate spec amendment that re-evaluates `exit()`/`close()` semantics under the new boundary set.
-
-**Amendment — `assert_panics` extends the catchable-unwind set (compiler-managed, not user-extensible).** Be precise about what changed: outside a test, a real `panic()` does *not* unwind to any in-process catch frame — it terminates the process and bypasses `exit()`/`close()` (the last row above). `assert_panics` (§2.20) genuinely *adds* a new catch boundary: within the dynamic extent of its block, a panic is caught and converted to a test pass/fail rather than terminating the process. This boundary is **compiler-managed and test-only** — only an `assert_panics` block arms it, is rejected outside a test (E0833), is not nestable (E0834), and exposes **no user-nameable symbol** (there is no `recover`/`catch_panic` a user can call). It therefore does not extend the set of catch boundaries reachable by *user code*; the user-extensible set remains empty, and the fence above holds.
-
-The `panic: Never` typing claim (§2.20, *`panic()` Function*) is preserved: the `assert_panics` construct has type `()`, its body is a recognized block (not a reified `fn` value), and the `matching:` argument binds nothing into user scope — so no user expression acquires a type that witnesses the panic. As with `BlockHandler.exit(false)` itself, the cleanup that runs during an armed-panic unwind cannot receive the panic value, cannot inspect any discriminant beyond `ok: Bool`, cannot suppress the unwind, and cannot rescue the test.
-
-The cleanup asymmetry is intentional and must be read carefully: an **armed** (expected) panic runs in-scope `exit(false)`/`close()`; an **unarmed/uncaught** panic still terminates and bypasses them. A resource opened inside an `assert_panics` body is therefore released on the expected panic, whereas the same panic escaping a plain test body is not — armed test boundaries are controlled, like `skip()`, and uncaught divergence is not.
-
-**Concurrency.** The armed state is **per-test (thread-local)**. An `assert_panics` in one test or task must never catch a panic raised on a different spawned task; arming is scoped to the calling frame's thread. This is normative, not implementation-defined.
-
-**Cleanup that itself panics during an armed unwind.** If an in-scope `exit(false)`/`close()` *itself* panics while unwinding an armed expected panic, the original body panic remains "the expected panic" for `matching:` (E0832) purposes and stays load-bearing as the test's result and unwind cause; the cleanup fault surfaces as a **secondary `warning`-severity `E0824`** on the **same trace frame** (the test runner records it in the per-test record's `cleanup_warnings[]`, additive to the original status — see E0824, §5.5), not as a separate failing record. The panicking cleanup body's own control flow is abandoned at the panic point; remaining LIFO handlers still run (`continue-drain`, per line below).
-
-This rule is uniform across `BlockHandler.exit()` and `Closeable.close()` (§5.5) — every catchable structured unwind runs registered cleanup; uncaught divergence does not.
-
-#### Block semantics
-
-`BlockHandler` blocks have block semantics, not closure semantics:
-
-- `?` propagates errors to the **enclosing function's** `Result` return type
-- `return` exits the **enclosing function**, not just the block
-- Variables from the enclosing scope are directly accessible (no capture)
-
-This is the same behavior as `async.scope { }` — the block runs in the caller's context, not in a separate closure scope.
-
-#### Usage
-
-```blink
-// With binding — Context is meaningful
-with db.transaction() as tx {
-    db.execute(t"INSERT INTO orders ...")?
-}
-
-// Without binding — Context is ()
-with metrics.timer("request_duration") {
-    handle_request()?
-}
-
-// As an expression
-let result = with db.transaction() {
-    db.query_one(t"SELECT count(*) FROM users")?
-}
-```
-
-#### Implementing BlockHandler
-
-Any type can implement `BlockHandler`. A handler gets all its state when it is built: `self` is a by-value copy (§3.6), so `enter()` cannot pass new state to `exit()`. Put the build in a function, and call that function in the `with` item. Step 1 of the *Order* below evaluates the item right before `enter()`, so each `with` gets a new value:
-
-```blink
-pub type Timer {
-    label: Str
-    start: Instant
-}
-
-pub fn timer(label: Str) -> Timer ! Time.Read {
-    Timer { label: label, start: time.read() }
-}
-
-impl BlockHandler for Timer {
-    type Context = ()
-
-    fn enter(self) -> () {}
-
-    fn exit(self, ok: Bool) ! Time.Read, IO.Log {
-        let elapsed = self.start.elapsed()
-        io.log("{self.label}: {elapsed} (ok={ok})")
-    }
-}
-
-// Usage
-with timer("db_query") {
-    db.query(t"SELECT * FROM large_table")?
-}
-```
-
-Nested items are correct for the same reason. In `with timer("a") { with timer("b") { } }`, each value is built right before its own `enter()`, and the two `exit()` calls run in LIFO order.
-
-A value that is stored and then goes into two `with` items runs `exit()` twice on one state. The scope lints (§5.5) warn about this: W0610 for a value that reaches no `with`, and W0611 for a value that reaches more than one.
-
-`enter()` cannot write to `self`. An assignment such as `self.start = time.read()` is a parameter assignment, which is a compile error (§3.6). Inside `enter()` of a `BlockHandler` impl, that error's help text names the fix: set the field when the value is built, and build the value in the `with` item.
-
-#### Scoped effect handlers
-
-A `BlockHandler` whose `Context` is `Handler[E]` is a **scoped effect handler**. The `with` block installs the handler that `enter()` returns, for the block body only. This joins an effect handler and a cleanup in one `with` item. In this example, `sqlite_open` returns `Result[Sqlite3, DBError]`, with `Err(ConnectionError(..))` when the open fails:
-
-```blink
-pub type Connection {
-    handle: Sqlite3
-}
-
-impl BlockHandler for Connection {
-    type Context = Handler[DB]
-
-    fn enter(self) -> Handler[DB] {
-        sqlite_handler(self.handle)
-    }
-
-    fn exit(self, ok: Bool) {
-        sqlite_close(self.handle)
-    }
-}
-
-pub fn connect(path: Str) -> Result[Connection, DBError] {
-    let handle = sqlite_open(path)?
-    Ok(Connection { handle: handle })
-}
-
-// Usage
-with db.connect(":memory:")? {
-    db.exec(t"CREATE TABLE users (name TEXT)")?
-}
-```
-
-**Order.** For `with expr { body }`:
-
-1. Evaluate `expr`
-2. Call `enter()`
-3. Install the returned `Handler[E]`
-4. Run `body`
-5. Uninstall the handler
-6. Call `exit(ok)`
-
-Steps 5 and 6 run on every catchable unwind, as for every `BlockHandler`. `exit()` runs after the uninstall, with the outer handlers in place. A `db.*` call inside `exit()` therefore goes to the outer `DB` handler, not to the one this item installed. Use `self` in `exit()`.
-
-**Typing rule.** The item discharges `E` from the effect row of the body. `enter()` and `exit()` are checked against the outer effect row:
-
-```
-Γ ⊢ e : T    T : BlockHandler    T.Context ≡ Handler[E]
-Γ ⊢ body : U ! ρ ∪ {E}
-───────────────────────────────────────────────
-Γ ⊢ with e { body } : U ! ρ ∪ eff(enter) ∪ eff(exit)
-```
-
-The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: BlockHandler](t: T) { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. It must then meet the `Context == ()` row. An abstract `Context` does not meet it, so the compiler reports E0839 and names the abstract `Context` as the cause. There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
-
-**Binding.** `with expr as name { }` installs the handler and binds `name` to the same `Handler[E]` value. `name` follows the scoping rules in *Interaction with async* below.
-
-**Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Build it in the `with` item, as `connect` does above. Entering the same value in two `with` blocks runs `exit()` twice; W0611 (§5.5) warns about it.
-
-A second `exit()` on a value whose resource is already released should do nothing, or should fail with a defined error. The stdlib's native handles do this: after `close`, a call on the handle returns an error such as `Err(ConnectionError("connection is closed"))`, not a use-after-free. This is guidance for user impls, not a rule the compiler checks. `std.testing`'s `Cleanup` runs its action on each `exit()`, so a second entry runs the action a second time.
-
-A failed acquisition uses `?` on the item: `with db.connect(p)? { }`. The `?` fires before the scope is entered, so a failed open needs no cleanup.
-
-#### `exit()` constraints
-
-`exit()` is a finalizer, not a control flow mechanism. It **cannot**:
-
-- **Inspect or suppress the unwind value** — `exit(self, ok: Bool)` receives only the success bit; it cannot read the panic message, the propagated error, or the `skip()` reason
-- **Retry the block** — no mechanism to re-enter the block body
-- **Transform the block's result** — `exit()` returns `()`, not a modified value
-- **Replace errors** — if `exit()` itself panics on a catchable-unwind path, the original panic is preserved as the unwind cause; the test runner reports the original failure as the test's result, not the cleanup panic. The cleanup panic surfaces as a secondary `warning`-severity `E0824` (`CleanupPanickedDuringUnwind`) on the same trace frame, so the author can see the cleanup bug without losing the primary cause. On a stacked `with...as` chain, remaining handlers in the LIFO stack still run — the ordering matches the multi-cleanup test registrar decision's Q2 ruling (`continue-drain`, 6-0): short-circuiting would leak resources held by deeper-stacked handlers
-- **Catch uncaught panics** — process-terminating panics bypass `exit()` entirely
-
-Because `exit(false)` cannot observe *which* path triggered the unwind, handler authors must design `exit` to be safe under every catchable-unwind path. A handler that should commit on success and roll back on any failure pattern-matches on `ok`; a handler that always releases (timer, lock) ignores `ok`.
-
-#### Interaction with async
-
-`BlockHandler` bindings follow the same scoping rules as `Closeable` bindings (E0601, E0602). This includes the `Handler[E]` that `as` binds for a scoped effect handler: that handler uses a resource that `exit()` releases. A `BlockHandler` binding cannot be sent to a spawned task:
-
-```blink
-fn bad_example() ! DB, Async {
-    with db.transaction() as tx {
-        async.spawn(fn() {
-            // COMPILE ERROR: `tx` escapes BlockHandler scope
-            use_tx(tx)
-        })
-    }
-}
-```
-
-#### Relationship to existing scoped blocks
-
-| Block form | Mechanism | Migration status |
-|-----------|-----------|-----------------|
-| `db.transaction { }` | `BlockHandler` | Migrated — uses `with db.transaction() { }` |
-| `async.scope { }` | Special syntax | v1: remains special syntax. v2: migrate to `BlockHandler` |
-
-`async.scope` is not a `BlockHandler` in v1, because its structured concurrency semantics (task cancellation, panic propagation, implicit join at scope exit) need more than `enter()/exit()` provides. Once `BlockHandler` proves itself on simpler use cases, `async.scope` migration will be evaluated for v2.
-
-**Panel vote: 5-0 (runoff).** See [decisions/scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md).
 
 ---
 
@@ -2314,6 +2101,221 @@ The diagnostic carries a machine-applicable fix. The fix adds each missing opera
 #### Generic handler parameters
 
 In v1, handler type parameters must be concrete effects: `Handler[DB]`, `Handler[IO]`, `Handler[Net.Connect]`. Effect-kinded generic parameters (e.g., `fn foo[E: Effect](h: Handler[E])`) are deferred to v2, alongside named effect variables.
+
+---
+
+### 4.7.2 BlockHandler Trait — Scoped Blocks
+
+Records in `decisions/` and DECISIONS.md cite this section as §4.6.3, its earlier number.
+
+The `BlockHandler` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It lets a type accept a block without new syntax for each API.
+
+```blink
+trait BlockHandler {
+    type Context
+
+    fn enter(self) -> Self.Context
+    fn exit(self, ok: Bool)
+}
+```
+
+**`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). If `Context` is `Handler[E]`, the return value is also installed as the handler for `E` (see *Scoped effect handlers* below). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` for any **catchable unwind** (see below).
+
+#### Catchable unwind
+
+`exit(self, false)` runs on every exit path that terminates at a runtime-defined catch boundary. The set is closed and exhaustively defined:
+
+| Path | `ok` value |
+|------|-----------|
+| Normal block completion | `true` |
+| `?` propagation | `false` |
+| `return` from enclosing function | `false` |
+| Assertion failure (`assert`, `assert_eq`, `assert_ne`, `assert_matches`) | `false` |
+| `skip()` in a test block | `false` |
+| Expected panic caught by `assert_panics` (the *armed* boundary, §2.20) | `false` |
+| Uncaught panic (`panic()`, arithmetic overflow, OOB index) outside a runtime catch frame, or a fatal runtime error | *bypasses `exit()` entirely* |
+
+A **fatal runtime error** is a fault the runtime cannot recover from: OOM, stack overflow, or foreign code that ends the process. The runtime ends the process at once. Nothing unwinds, and no `exit()` or `close()` runs.
+
+The runtime catch frames are the test runner's per-test boundary, the `?`/`return` desugar, and — within a test only — the boundary armed by an `assert_panics` block (§2.20). The set of runtime catch boundaries is **exhaustively defined by this spec and cannot be extended by user code**. Introducing user-level panic recovery (e.g., `recover`, `catch_panic`) would require a separate spec amendment that re-evaluates `exit()`/`close()` semantics under the new boundary set.
+
+**Amendment — `assert_panics` extends the catchable-unwind set (compiler-managed, not user-extensible).** Be precise about what changed: outside a test, a real `panic()` does *not* unwind to any in-process catch frame — it terminates the process and bypasses `exit()`/`close()` (the last row above). `assert_panics` (§2.20) genuinely *adds* a new catch boundary: within the dynamic extent of its block, a panic is caught and converted to a test pass/fail rather than terminating the process. This boundary is **compiler-managed and test-only** — only an `assert_panics` block arms it, is rejected outside a test (E0833), is not nestable (E0834), and exposes **no user-nameable symbol** (there is no `recover`/`catch_panic` a user can call). It therefore does not extend the set of catch boundaries reachable by *user code*; the user-extensible set remains empty, and the fence above holds.
+
+The `panic: Never` typing claim (§2.20, *`panic()` Function*) is preserved: the `assert_panics` construct has type `()`, its body is a recognized block (not a reified `fn` value), and the `matching:` argument binds nothing into user scope — so no user expression acquires a type that witnesses the panic. As with `BlockHandler.exit(false)` itself, the cleanup that runs during an armed-panic unwind cannot receive the panic value, cannot inspect any discriminant beyond `ok: Bool`, cannot suppress the unwind, and cannot rescue the test.
+
+The cleanup asymmetry is intentional and must be read carefully: an **armed** (expected) panic runs in-scope `exit(false)`/`close()`; an **unarmed/uncaught** panic still terminates and bypasses them. A resource opened inside an `assert_panics` body is therefore released on the expected panic, whereas the same panic escaping a plain test body is not — armed test boundaries are controlled, like `skip()`, and uncaught divergence is not.
+
+**Concurrency.** The armed state is **per-test (thread-local)**. An `assert_panics` in one test or task must never catch a panic raised on a different spawned task; arming is scoped to the calling frame's thread. This is normative, not implementation-defined.
+
+**Cleanup that itself panics during an armed unwind.** If an in-scope `exit(false)`/`close()` *itself* panics while unwinding an armed expected panic, the original body panic remains "the expected panic" for `matching:` (E0832) purposes and stays load-bearing as the test's result and unwind cause; the cleanup fault surfaces as a **secondary `warning`-severity `E0824`** on the **same trace frame** (the test runner records it in the per-test record's `cleanup_warnings[]`, additive to the original status — see E0824, §5.5), not as a separate failing record. The panicking cleanup body's own control flow is abandoned at the panic point; remaining LIFO handlers still run (`continue-drain`, per line below).
+
+This rule is uniform across `BlockHandler.exit()` and `Closeable.close()` (§5.5) — every catchable structured unwind runs registered cleanup; uncaught divergence does not.
+
+#### Block semantics
+
+`BlockHandler` blocks have block semantics, not closure semantics:
+
+- `?` propagates errors to the **enclosing function's** `Result` return type
+- `return` exits the **enclosing function**, not just the block
+- Variables from the enclosing scope are directly accessible (no capture)
+
+This is the same behavior as `async.scope { }` — the block runs in the caller's context, not in a separate closure scope.
+
+#### Usage
+
+```blink
+// With binding — Context is meaningful
+with db.transaction() as tx {
+    db.execute(t"INSERT INTO orders ...")?
+}
+
+// Without binding — Context is ()
+with metrics.timer("request_duration") {
+    handle_request()?
+}
+
+// As an expression
+let result = with db.transaction() {
+    db.query_one(t"SELECT count(*) FROM users")?
+}
+```
+
+#### Implementing BlockHandler
+
+Any type can implement `BlockHandler`. A handler gets all its state when it is built: `self` is a by-value copy (§3.6), so `enter()` cannot pass new state to `exit()`. Put the build in a function, and call that function in the `with` item. Step 1 of the *Order* below evaluates the item right before `enter()`, so each `with` gets a new value:
+
+```blink
+pub type Timer {
+    label: Str
+    start: Instant
+}
+
+pub fn timer(label: Str) -> Timer ! Time.Read {
+    Timer { label: label, start: time.read() }
+}
+
+impl BlockHandler for Timer {
+    type Context = ()
+
+    fn enter(self) -> () {}
+
+    fn exit(self, ok: Bool) ! Time.Read, IO.Log {
+        let elapsed = self.start.elapsed()
+        io.log("{self.label}: {elapsed} (ok={ok})")
+    }
+}
+
+// Usage
+with timer("db_query") {
+    db.query(t"SELECT * FROM large_table")?
+}
+```
+
+Nested items are correct for the same reason. In `with timer("a") { with timer("b") { } }`, each value is built right before its own `enter()`, and the two `exit()` calls run in LIFO order.
+
+A value that is stored and then goes into two `with` items runs `exit()` twice on one state. The scope lints (§5.5) warn about this: W0610 for a value that reaches no `with`, and W0611 for a value that reaches more than one.
+
+`enter()` cannot write to `self`. An assignment such as `self.start = time.read()` is a parameter assignment, which is a compile error (§3.6). Inside `enter()` of a `BlockHandler` impl, that error's help text names the fix: set the field when the value is built, and build the value in the `with` item.
+
+#### Scoped effect handlers
+
+A `BlockHandler` whose `Context` is `Handler[E]` is a **scoped effect handler**. The `with` block installs the handler that `enter()` returns, for the block body only. This joins an effect handler and a cleanup in one `with` item. In this example, `sqlite_open` returns `Result[Sqlite3, DBError]`, with `Err(ConnectionError(..))` when the open fails:
+
+```blink
+pub type Connection {
+    handle: Sqlite3
+}
+
+impl BlockHandler for Connection {
+    type Context = Handler[DB]
+
+    fn enter(self) -> Handler[DB] {
+        sqlite_handler(self.handle)
+    }
+
+    fn exit(self, ok: Bool) {
+        sqlite_close(self.handle)
+    }
+}
+
+pub fn connect(path: Str) -> Result[Connection, DBError] {
+    let handle = sqlite_open(path)?
+    Ok(Connection { handle: handle })
+}
+
+// Usage
+with db.connect(":memory:")? {
+    db.exec(t"CREATE TABLE users (name TEXT)")?
+}
+```
+
+**Order.** For `with expr { body }`:
+
+1. Evaluate `expr`
+2. Call `enter()`
+3. Install the returned `Handler[E]`
+4. Run `body`
+5. Uninstall the handler
+6. Call `exit(ok)`
+
+Steps 5 and 6 run on every catchable unwind, as for every `BlockHandler`. `exit()` runs after the uninstall, with the outer handlers in place. A `db.*` call inside `exit()` therefore goes to the outer `DB` handler, not to the one this item installed. Use `self` in `exit()`.
+
+**Typing rule.** The item discharges `E` from the effect row of the body. `enter()` and `exit()` are checked against the outer effect row:
+
+```
+Γ ⊢ e : T    T : BlockHandler    T.Context ≡ Handler[E]
+Γ ⊢ body : U ! ρ ∪ {E}
+───────────────────────────────────────────────
+Γ ⊢ with e { body } : U ! ρ ∪ eff(enter) ∪ eff(exit)
+```
+
+The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: BlockHandler](t: T) { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. It must then meet the `Context == ()` row. An abstract `Context` does not meet it, so the compiler reports E0839 and names the abstract `Context` as the cause. There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
+
+**Binding.** `with expr as name { }` installs the handler and binds `name` to the same `Handler[E]` value. `name` follows the scoping rules in *Interaction with async* below.
+
+**Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Build it in the `with` item, as `connect` does above. Entering the same value in two `with` blocks runs `exit()` twice; W0611 (§5.5) warns about it.
+
+A second `exit()` on a value whose resource is already released should do nothing, or should fail with a defined error. The stdlib's native handles do this: after `close`, a call on the handle returns an error such as `Err(ConnectionError("connection is closed"))`, not a use-after-free. This is guidance for user impls, not a rule the compiler checks. `std.testing`'s `Cleanup` runs its action on each `exit()`, so a second entry runs the action a second time.
+
+A failed acquisition uses `?` on the item: `with db.connect(p)? { }`. The `?` fires before the scope is entered, so a failed open needs no cleanup.
+
+#### `exit()` constraints
+
+`exit()` is a finalizer, not a control flow mechanism. It **cannot**:
+
+- **Inspect or suppress the unwind value** — `exit(self, ok: Bool)` receives only the success bit; it cannot read the panic message, the propagated error, or the `skip()` reason
+- **Retry the block** — no mechanism to re-enter the block body
+- **Transform the block's result** — `exit()` returns `()`, not a modified value
+- **Replace errors** — if `exit()` itself panics on a catchable-unwind path, the original panic is preserved as the unwind cause; the test runner reports the original failure as the test's result, not the cleanup panic. The cleanup panic surfaces as a secondary `warning`-severity `E0824` (`CleanupPanickedDuringUnwind`) on the same trace frame, so the author can see the cleanup bug without losing the primary cause. On a stacked `with...as` chain, remaining handlers in the LIFO stack still run — the ordering matches the multi-cleanup test registrar decision's Q2 ruling (`continue-drain`, 6-0): short-circuiting would leak resources held by deeper-stacked handlers
+- **Catch uncaught panics** — process-terminating panics bypass `exit()` entirely
+
+Because `exit(false)` cannot observe *which* path triggered the unwind, handler authors must design `exit` to be safe under every catchable-unwind path. A handler that should commit on success and roll back on any failure pattern-matches on `ok`; a handler that always releases (timer, lock) ignores `ok`.
+
+#### Interaction with async
+
+`BlockHandler` bindings follow the same scoping rules as `Closeable` bindings (E0601, E0602). This includes the `Handler[E]` that `as` binds for a scoped effect handler: that handler uses a resource that `exit()` releases. A `BlockHandler` binding cannot be sent to a spawned task:
+
+```blink
+fn bad_example() ! DB, Async {
+    with db.transaction() as tx {
+        async.spawn(fn() {
+            // COMPILE ERROR: `tx` escapes BlockHandler scope
+            use_tx(tx)
+        })
+    }
+}
+```
+
+#### Relationship to existing scoped blocks
+
+| Block form | Mechanism | Migration status |
+|-----------|-----------|-----------------|
+| `db.transaction { }` | `BlockHandler` | Migrated — uses `with db.transaction() { }` |
+| `async.scope { }` | Special syntax | v1: remains special syntax. v2: migrate to `BlockHandler` |
+
+`async.scope` is not a `BlockHandler` in v1, because its structured concurrency semantics (task cancellation, panic propagation, implicit join at scope exit) need more than `enter()/exit()` provides. Once `BlockHandler` proves itself on simpler use cases, `async.scope` migration will be evaluated for v2.
+
+**Panel vote: 5-0 (runoff).** See [decisions/scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md).
 
 ---
 
@@ -2695,7 +2697,7 @@ Concurrency in Blink is not a language keyword or a function color — it is an 
 
 | Primitive | Purpose |
 |-----------|---------|
-| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: special syntax; v2: may become a `BlockHandler` — see §4.6.3)* |
+| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: special syntax; v2: may become a `BlockHandler` — see §4.7.2)* |
 | `async.spawn(fn() { ... })` | Launch a concurrent task within the current scope. Returns `Handle[T]`. |
 | `handle.await` | Wait for a spawned task's result. Method on `Handle[T]`, returns `T`. |
 | `channel.new[T](buffer: N)` | Create a buffered channel for inter-task communication. |

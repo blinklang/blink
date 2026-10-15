@@ -148,7 +148,7 @@ fn c_exit(code: I32) -> Never ! Env.Exit
 
 The result type is a claim, as the rest of the signature is. `@trusted(audit: K)` records it, and the pin of the record covers it: a change from `-> Int` to `-> Never` makes the pin stale, so the binding needs a new review (*Audit Records*). No other gate applies.
 
-**The compiler does not assume the claim.** A call to the binding has type `Never` (§3.3), but the claim alone never lets the compiler remove the code after the call. If the foreign function returns, the program panics at the call, in every build mode, as if `unreachable()` (§2.20) came after the call. This is a panic, not a fatal runtime error (§4.6.3): the foreign code returned normally and did not end the process. The message starts with the name `FfiNeverReturned`, and it names the binding, the C symbol, the audit key and the call site:
+**The compiler does not assume the claim.** A call to the binding has type `Never` (§3.3), but the claim alone never lets the compiler remove the code after the call. If the foreign function returns, the program panics at the call, in every build mode, as if `unreachable()` (§2.20) came after the call. This is a panic, not a fatal runtime error (§4.7.2): the foreign code returned normally and did not end the process. The message starts with the name `FfiNeverReturned`, and it names the binding, the C symbol, the audit key and the call site:
 
 ```
 panic: FfiNeverReturned: foreign function `c_abort` is declared `-> Never` but returned

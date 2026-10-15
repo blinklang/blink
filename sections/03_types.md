@@ -2825,7 +2825,7 @@ error[ParamAssign]: cannot assign to parameter `self`
   |         ^^^^^^^^^^ `self` is a parameter
   |
   = note: `exit()` receives the value the `with` item built, not this copy
-  = help: set `start` when the value is built, and build it in the `with` item (§4.6.3)
+  = help: set `start` when the value is built, and build it in the `with` item (§4.7.2)
 ```
 
 This help text appears only in `BlockHandler.enter()`. Every other parameter assignment gets the `let mut` help above.

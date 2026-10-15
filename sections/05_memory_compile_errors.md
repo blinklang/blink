@@ -107,7 +107,7 @@ An allocation site inside an `! Arena` function is classified as either **promot
 
 ##### Handler behavior
 
-`with arena { body }` behaves as a `BlockHandler` (§4.6.3), as if the compiler builds a new scope value at each `with arena`. `arena` is a keyword form, not a value that a program can store and enter again. On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
+`with arena { body }` behaves as a `BlockHandler` (§4.7.2), as if the compiler builds a new scope value at each `with arena`. `arena` is a keyword form, not a value that a program can store and enter again. On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
 
 Because the block is a `BlockHandler`, arena enter and exit events appear in `--blink-trace` and `--trace all` output, as for every other block-scoped construct. `! Arena` on a function signature is a *marker* effect. The escape check uses it. It does not select a handler.
 
@@ -236,9 +236,9 @@ Desugars to:
 }
 ```
 
-The compiler inserts `name.close()` on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.6.3 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
+The compiler inserts `name.close()` on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.7.2 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
 
-This rule is uniform with `BlockHandler.exit()` (§4.6.3): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with conn = db.connect() { assert(...) }` block releases `conn` on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.6.3).
+This rule is uniform with `BlockHandler.exit()` (§4.7.2): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with conn = db.connect() { assert(...) }` block releases `conn` on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.7.2).
 
 #### Multiple resources
 
@@ -252,7 +252,7 @@ Cleanup is LIFO — `b.close()` runs before `a.close()`. If `expr2` fails (via `
 
 **W0610 `ScopedValueWithoutWith`: scoped value that does not go into a `with`**
 
-The lint applies to every **scoped value**: a value whose type implements `Closeable` or `BlockHandler` (§4.6.3). It fires when such a value reaches anything other than a `with` item. The check follows the value, not its construction: `let tx = db.transaction()` followed by `with tx { }` does not warn. A scoped value returned from a function is not reported in that function.
+The lint applies to every **scoped value**: a value whose type implements `Closeable` or `BlockHandler` (§4.7.2). It fires when such a value reaches anything other than a `with` item. The check follows the value, not its construction: `let tx = db.transaction()` followed by `with tx { }` does not warn. A scoped value returned from a function is not reported in that function.
 
 The code for this lint is W0610. Code W0600 is `UnusedVariable`, and it never refers to this lint.
 

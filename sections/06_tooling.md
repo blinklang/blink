@@ -702,7 +702,7 @@ The summary line always shows `passed` and `failed`. It shows `panicked` and `sk
 11 passed, 2 failed, 1 panicked (of 14)
 ```
 
-**Cleanup warnings.** A record of any status can carry a `cleanup_warnings` array. Each entry is `{"code": "E0824", "message": <cleanup panic message>}`. When a cleanup (`exit(false)` or `close()`) panics during a catchable unwind, the runner adds an entry and does not change the status (§4.6.3, E0824; cleanup in §5.5). The test keeps one record. This includes a panic in cleanup while an armed `assert_panics` unwinds: the expected panic sets the status (`passed`, or `failed` under E0832), and the cleanup panic is an E0824 entry on that record, not a separate `panicked` record:
+**Cleanup warnings.** A record of any status can carry a `cleanup_warnings` array. Each entry is `{"code": "E0824", "message": <cleanup panic message>}`. When a cleanup (`exit(false)` or `close()`) panics during a catchable unwind, the runner adds an entry and does not change the status (§4.7.2, E0824; cleanup in §5.5). The test keeps one record. This includes a panic in cleanup while an armed `assert_panics` unwinds: the expected panic sets the status (`passed`, or `failed` under E0832), and the cleanup panic is an E0824 entry on that record, not a separate `panicked` record:
 
 ```json
 {"name": "rejects bad header", "status": "passed", "duration_ms": 2,
@@ -861,7 +861,7 @@ test "unwrap on empty list panics" {
 }
 ```
 
-The body is a `{ ... }` block (not a closure), the optional `matching:` argument is a literal **substring** test on the panic message, and the construct is test-only and valueless. On failure the runner renders structured output: a body that returns without panicking is **E0831** (`expected the block to panic, but it returned normally`); a panic whose message lacks the `matching:` substring is **E0832**, which prints the expected substring, the **full actual panic message**, and the source location where the panic fired. A passing `assert_panics` consumes the panic — the test status is `"passed"`, not `"panicked"`. In-scope `with`/`Closeable` resources opened inside the block are released on the expected panic (§4.6.3, *armed* catchable unwind). See §2.20 for the full semantics, the test-only (E0833) and no-nesting (E0834) rules, and the R3-fence amendment.
+The body is a `{ ... }` block (not a closure), the optional `matching:` argument is a literal **substring** test on the panic message, and the construct is test-only and valueless. On failure the runner renders structured output: a body that returns without panicking is **E0831** (`expected the block to panic, but it returned normally`); a panic whose message lacks the `matching:` substring is **E0832**, which prints the expected substring, the **full actual panic message**, and the source location where the panic fired. A passing `assert_panics` consumes the panic — the test status is `"passed"`, not `"panicked"`. In-scope `with`/`Closeable` resources opened inside the block are released on the expected panic (§4.7.2, *armed* catchable unwind). See §2.20 for the full semantics, the test-only (E0833) and no-nesting (E0834) rules, and the R3-fence amendment.
 
 For testing that a *separate binary* exits via panic, continue to isolate the call in a subprocess via `process_run` and inspect `exit_code`/`err_out`; `assert_panics` is for in-process expressions within the test itself.
 
