@@ -87,7 +87,7 @@ The first deliberation left a contradiction the compiler could not honor: §3c.1
 
 **D3 — sys, held D3-B then fell back to C:** "COMPROMISE: adopt D3-B as the open extension point, ship `from_fn` as SUGAR over it … Fallback C (sealed v1) acceptable; cannot support A-as-only-mechanism."
 
-**D4 — aiml folded to A (found the fact that folds it):** "`tests/test_vag3wc_channel_handle_iterator_tids.bl:241` asserts `Iterator[Int]` resolves to kind `Typevar` (comment at :236 records it as known divergence). D1-A invalidates that assertion regardless of D4; that file is edited EITHER WAY. So D4-B does NOT keep the test green. Fold now, not at 5-1."
+**D4 — aiml folded to A (found the fact that folds it):** "`tests/test_channel_handle_iterator_tids.bl:241` asserts `Iterator[Int]` resolves to kind `Typevar` (comment at :236 records it as known divergence). D1-A invalidates that assertion regardless of D4; that file is edited EITHER WAY. So D4-B does NOT keep the test green. Fold now, not at 5-1."
 
 **D6 — sys, split it:** "Type-level slot is FREE (`Iterator[T] ≡ Iterator[T] ! {}`, reserve syntactic position now) — RESERVE. Runtime plumbing … do NOT build now." web: "accept IF INVISIBLE … If it leaks into `fn iter(self) -> Iterator[T]` spelling, I'm against."
 

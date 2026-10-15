@@ -10,6 +10,9 @@
 # Rows:
 #   br_ids_in_source         a br ticket id anywhere in src/ or Taskfile.yml;
 #                            absolute zero gate (br is local-only)
+#   br_ids_in_test_comments  a `br <id>` in a `//` comment under tests/; absolute
+#                            zero gate. Counted in the live tree only: a
+#                            historical ref is materialized with src/ alone
 #   module_let_mut           mutable module globals anywhere in src/: every
 #                            column-0 `let mut`, pub or not. A global need not be
 #                            pub to be shared state. Scoped to the whole surface on
@@ -198,6 +201,11 @@ lib_substr() {
   rg -o -g '*.bl' '\.substr\(' "$1/lib" 2>/dev/null | wc -l | tr -d ' '
 }
 
+tests_br_ids() {
+  [ -d "$1/tests" ] || { echo 0; return; }
+  rg -o -g '*.bl' '//.*\bbr [0-9a-z]{6}\b' "$1/tests" 2>/dev/null | wc -l | tr -d ' '
+}
+
 # The PCRE group matches the whole balanced argument list, so a `.len()` nested in
 # another call inside it still counts.
 len_in_byte_args() {
@@ -219,6 +227,7 @@ compute_rows() {
 
   cat <<ROWS
 br_ids_in_source $(( $(cnt '\bbr [0-9a-z]{6}\b' "$allbl $tf") + $(cnt '\b(g3sba0|qf1vzx|0kpmac)\b' "$allbl $tf") ))
+br_ids_in_test_comments $(tests_br_ids "$root")
 module_let_mut $(cnt '^(pub )?let mut ' "$allbl")
 typecheck_module_let_mut $(cnt '^(pub )?let mut ' "$tcbl")
 layout_decline_unhandled $(decline_unhandled "$root")
@@ -331,7 +340,7 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   # Absolute zero gates: an id means nothing to another reader or to training
   # data, and a swallowed decline is a wrong answer waiting to be found.
   case "$name" in
-    br_ids_in_source|layout_decline_unhandled|node_pool_writes|str_substring_callers|str_len_in_byte_args)
+    br_ids_in_source|br_ids_in_test_comments|layout_decline_unhandled|node_pool_writes|str_substring_callers|str_len_in_byte_args)
       [ "$now" -gt 0 ] && mark="$mark NONZERO(must-be-zero)" ;;
   esac
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"

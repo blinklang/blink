@@ -1,0 +1,36 @@
+// Bug: a Map[Str, V] reached through a generic-struct field erased its
+// VALUE type — typecheck does not monomorphize struct instances, so the field's
+// value defaults to the erased CT_VOID. Each `b.m` field re-emit re-registered
+// the map var with that erased value, clobbering the concrete type stored at
+// insert, so get() emitted an int reinterpretation of the stored Str pointer.
+// Interpolation renders the recovered value, exposing the int-vs-Str carrier.
+//
+// FLOOR PROBE (nqq29j): both cases below formerly monomorphized to the SAME
+// blink_GVMap_Void — two logically distinct instances (V=Str, V=Int) sharing one
+// #ifndef BLINK_TD_ typedef guard. Expected _Void count for this file:
+//   blink build --emit c tests/test_map_field_value_type.bl -o .tmp/f
+//   grep -c '_Void' .tmp/f.c
+// must be 0 (was 7); the two now spell GVMap_Str and GVMap_Int. Fix: RESOLVING the slot
+// (tc_tid_resolved) before asking about it lets the tid-native mono path see a bound
+// metavar's real shape. Historically that read went through a resolving twin of
+// tc_tid_ct, deleted with its last caller; the live gate is tc_tid_resolved +
+// tc_struct_slot_encodable in tid_native_struct_mono_slots.
+// Grep _Void: the retired csvresolve channel missed this class entirely. This file
+// was also one of the last two string-CSV holdouts — the inferred `GVMap { m: Map() }`
+// slot is a metavar bound IN PLACE, which mono_instance_arg_tids_from_tid used to read
+// RAW (still TK_UNKNOWN, so unencodable) while the gate above it read the same slot
+// RESOLVED. It now resolves on both sides, so the slot carries a real tid.
+
+type GVMap[V] { m: Map[Str, V] }
+
+test "map field value type preserved for Str value" {
+    let b = GVMap { m: Map() }
+    b.m.insert("k", "hello")
+    assert_eq("got: {b.m.get(\"k\").unwrap()}", "got: hello")
+}
+
+test "map field Int value still works" {
+    let b = GVMap { m: Map() }
+    b.m.insert("n", 42)
+    assert_eq("got: {b.m.get(\"n\").unwrap()}", "got: 42")
+}

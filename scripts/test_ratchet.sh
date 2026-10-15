@@ -135,6 +135,21 @@ check_row() {
 
 check_row module_let_mut           codegen.bl   'pub let mut other_global2: Int = 0'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
+mkdir -p "$BASE/tests"
+printf '%s\n' 'test "x" { assert(true) }' > "$BASE/tests/test_fixture.bl"
+check_tests_row() {
+  d="$WORK/tests_row"
+  rm -rf "$d"
+  cp -r "$BASE" "$d"
+  printf '%s\n' '// see br xyz987' >> "$d/tests/test_fixture.bl"
+  if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+    echo "FAIL br_ids_in_test_comments: a +1 on this row did not fail ratchet.sh"
+    fail=1
+  else
+    echo "PASS br_ids_in_test_comments: +1 correctly failed ratchet.sh"
+  fi
+}
+check_tests_row
 check_row layout_decline_unhandled cname.bl     'let swallowed = d.decline_reason'
 
 # The two name-keyed rows. A plain "the script failed" check would pass if some
