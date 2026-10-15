@@ -231,6 +231,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | EmptyCharLiteral | E1124 | `''` holds no character; help shows `' '` and notes that an empty `Str` is `""` | Lexer | §2.4 |
 | MultiCharLiteral | E1125 | A char literal holds two or more scalar values (closed, or open to the end of the line); help shows the double-quoted `Str` | Lexer | §2.4 |
 | UnterminatedLiteral | E1126 | A char, string, template or raw-string literal with no closer. Primary span on the opening delimiter, `note:` at the end of the line (char) or file (string); help names the exact closer, `#` count included | Lexer | §2.4 |
+| MixedOperatorPrecedence | E1127 | An operand of an operator in one integer operator group (arithmetic, shift, `&`, `^`, `\|`) is a bare operator expression of a different group, e.g. `x << n + 1` or `x \| y & 3`. The `help:` line shows both groupings; the language server offers both rewrites, neither machine-applicable | Parser | §2.19 |
 | ModuleNotFound | E1200 | Import statement referenced a module that could not be found | Modules | §10.1 |
 | InvalidStringBackedEnum | E1201 | String-backed enum variant value is not a string literal | Type checking | §3 |
 | ContractPredicateNotDecidable | E1300 | Contract predicate uses construct outside SMT-decidable subset | Refinement contracts | §3b |
@@ -269,7 +270,6 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | ScopedValueEnteredTwice | W0611 | A `Closeable` or `BlockHandler` value reaches more than one `with` item, including a `with` in a loop that enters a value built outside it (flow-based, same analysis as W0610). Suppress with `@allow(ScopedValueEnteredTwice)`; `@trusted(audit: K)` does not suppress it; upgrade to an error with `W0611 = "error"` under `[lints]` | Resources | §5.5 |
 | UnreachableCode | W0700 | Code follows an unconditional return/break/continue | Linting | §6 |
 | ArenaEffectRedundant | W0701 | `! Arena` on a function where every Arena call is already inside `with arena { }` | Arena | §5.2 |
-| BitwisePrecedence | W0702 | Bitwise `&`/`|` mixed with comparison without parentheses | Linting | §6 |
 | TodoInCode | W0703 | A call resolves to the built-in `todo()`. Fires in every context, test blocks included; in a test the `help:` line names `@skip`. `unreachable()` has no warning | Linting | §2.20 |
 | DivisionByLiteralZero | W0704 | The divisor of an integer `/` or `%` is an integer literal 0, with optional parentheses and unary `-`; the expression always panics. A `const` reference or a `let` binding with the value 0 does not trigger it. Fires in a branch that never runs; does not fire inside an `assert_panics` body | Linting | §3.6 |
 | PanicInLibrary | W0705 | A reference resolves to the built-in `panic()` (a call or a value use) outside test blocks, in a library package: one whose entry module `src/<name>.bl` declares no `fn main`. Private functions included; `todo()` and `unreachable()` exempt. The one `help:` names `Result` with the enclosing function's return type; the notes give the scope fact, `unreachable()` for a path that can never run, and `@allow`. No machine-applicable fix. Suppress with `@allow(PanicInLibrary)`; `@trusted(audit: K)` does not suppress it; set the level with `W0705 = "off"` or `"error"` under `[lints]` | Linting | §2.20 |
@@ -307,6 +307,7 @@ A retired code and its name are never reused (see *Conventions*). `blink explain
 | CallSiteTypeArgs | E0307 | It refused explicit type application at a call, which §3.4 *Explicit Type Application* makes legal | TypeArgArity (E0303), NoIndexOperator (E0313), TypeArgsWithoutCall (E0314) |
 | WithPtrBodyTooComplex | E0816 | It rejected a `Bytes.with_ptr` body of more than one expression, an inlining limit of the old codegen; §9.1.3 lets the body be any `fn(Ptr[U8]) -> R` | None |
 | CloseableWithoutScope | — | The lint it named now covers every `Closeable` and `BlockHandler` value, under a new name. Its old code, W0600, belongs to `UnusedVariable` | ScopedValueWithoutWith (W0610) |
+| BitwisePrecedence | W0702 | It warned on a bitwise operator with a comparison operand. Bitwise operators now bind tighter than comparison (§2.19), and a mix of operator groups is a parse error | MixedOperatorPrecedence (E1127) |
 
 ---
 
