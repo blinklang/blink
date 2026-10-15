@@ -19,11 +19,11 @@ Blink's compiler can emit a program in two shapes:
 The per-module machinery is mature: the four invariants in
 `task ci-per-module-checks` (monolith-vs-per-module byte-equality,
 cli.bl self-host, determinism, gen1/gen2 byte-equality) have held green
-through the `tc83pp` project. Until now it was only reachable through the
+through the per-module project. Until now it was only reachable through the
 **hidden** `__emit-per-module` subcommand — undocumented, unstable, and
 not surfaced in `blink build --help` or `blink llms`.
 
-This decision (br `fc9nrd`) promotes per-module emit to a documented flag
+This decision promotes per-module emit to a documented flag
 and charts the path to making it the default build path.
 
 This is a build-orchestrator decision — **BDFL, no `/deliberate` panel**
