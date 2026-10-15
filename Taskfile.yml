@@ -174,6 +174,8 @@ tasks:
       # linking an ABI-skewed binary. Follows the build/ symlink
       # into the std-cache dir; -L so the real file lands, not a dangling link.
       - cp -L {{.BUILD_DIR}}/.archive-id ~/.local/share/blink/
+      # The stdlib's C, which a cross build (blink build -T) compiles for its target.
+      - cp -L {{.BUILD_DIR}}/monolith.c ~/.local/share/blink/
       # Copy each registered native dep's source + headers as a sidecar so
       # the installed blink can compile a user TU that imports a peeled
       # stdlib module (e.g. std/db_sqlite). Layout mirrors the dev tree:
@@ -273,7 +275,7 @@ tasks:
         mkdir -p "$INSTALL_PREFIX/bin" "$INSTALL_PREFIX/share/blink"
         cp {{.BUILD_DIR}}/blink "$INSTALL_PREFIX/bin/blink"
         cp {{.BUILD_DIR}}/libblink_std.a {{.BUILD_DIR}}/libblink_std.h {{.BUILD_DIR}}/runtime.h "$INSTALL_PREFIX/share/blink/"
-        cp -L {{.BUILD_DIR}}/.archive-id "$INSTALL_PREFIX/share/blink/"
+        cp -L {{.BUILD_DIR}}/.archive-id {{.BUILD_DIR}}/monolith.c "$INSTALL_PREFIX/share/blink/"
         # Mirror the install pipeline: drop each registered native dep
         # under <prefix>/share/blink/native/<name>/ so resolve_native_dep_source
         # finds the sidecar copy instead of falling through to the dev tree.
@@ -420,7 +422,7 @@ tasks:
         SH_TARBALL="$TMPDIR/sh_tarball/share/blink"
         mkdir -p "$SH_TARBALL"
         cp "$REPO_BUILD/libblink_std.a" "$REPO_BUILD/libblink_std.h" "$REPO_BUILD/runtime.h" "$SH_TARBALL/"
-        cp -L "$REPO_BUILD/.archive-id" "$SH_TARBALL/"
+        cp -L "$REPO_BUILD/.archive-id" "$REPO_BUILD/monolith.c" "$SH_TARBALL/"
         ( cd "$REPO_ROOT" && "$REPO_BUILD/blink" __native-deps | while IFS='|' read -r NAME SRCS HDR_DIR _DEFS _GATE; do
             [ -z "$NAME" ] && continue
             DEST="$SH_TARBALL/native/$NAME"
@@ -437,6 +439,9 @@ tasks:
            "$SH_PREFIX/share/blink/"
         if [ -f "$SH_TARBALL/.archive-id" ]; then
           cp "$SH_TARBALL/.archive-id" "$SH_PREFIX/share/blink/"
+        fi
+        if [ -f "$SH_TARBALL/monolith.c" ]; then
+          cp "$SH_TARBALL/monolith.c" "$SH_PREFIX/share/blink/"
         fi
         if [ -d "$SH_TARBALL/native" ]; then
           cp -R "$SH_TARBALL/native" "$SH_PREFIX/share/blink/"
@@ -490,6 +495,16 @@ tasks:
           exit 1
         fi
         echo "PASS test-installed (install.sh layout — std.db_sqlite statically vendored from sidecar)"
+        # A cross build compiles the stdlib from the installed monolith.c for its target, so
+        # the binary is an aarch64 one even on an x86_64 host. Never run.
+        SH_ARM="$SH_PROJECT/main-arm64"
+        SH_ARM_LOG=$(env -u BLINK_ROOT PATH="$SH_PREFIX/bin:$PATH" blink build -T linux-arm64 src/main.bl --output "$SH_ARM" 2>&1 || true)
+        if ! file -b "$SH_ARM" 2>/dev/null | grep -q "ARM aarch64"; then
+          echo "FAIL test-installed (install.sh layout — blink build -T linux-arm64 gave no aarch64 binary)"
+          echo "$SH_ARM_LOG" | tail -20
+          exit 1
+        fi
+        echo "PASS test-installed (install.sh layout — -T linux-arm64 links an aarch64 binary)"
 
   # `ci-release` runs the full monolith verification (`ci-monolith`) AND the
   # four per-module emit invariants (`ci-per-module-checks`). The per-module
@@ -1211,17 +1226,20 @@ tasks:
       - mkdir -p .tmp
       # GC per target
       - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target x86_64-linux-gnu -o .tmp/gc-linux-x86_64.o {{.GC_SRC}}
+      - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target aarch64-linux-gnu -o .tmp/gc-linux-aarch64.o {{.GC_SRC}}
       - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target x86_64-macos -o .tmp/gc-macos-x86_64.o {{.GC_SRC}}
       - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target aarch64-macos -o .tmp/gc-macos-aarch64.o {{.GC_SRC}}
       # stdlib monolith per target (uses the same archive sources that build-cli compiled host-side via __build-stdlib-archive)
       - |
         ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
         zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-linux-x86_64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-linux-aarch64.o "$ARC_REL/monolith.c"
         zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-x86_64.o "$ARC_REL/monolith.c"
         zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-aarch64.o "$ARC_REL/monolith.c"
       # Link each target binary against its own GC + stdlib monolith. The
       # CLI doesn't import any peeled native dep, so no sqlite3.o here.
       - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-x86_64.o .tmp/gc-linux-x86_64.o -lm -Wl,--gc-sections
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target aarch64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-aarch64.o .tmp/gc-linux-aarch64.o -lm -Wl,--gc-sections
       - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-x86_64.o .tmp/gc-macos-x86_64.o -lm -Wl,-dead_strip
       - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-aarch64.o .tmp/gc-macos-aarch64.o -lm -Wl,-dead_strip
       # Per-target stdlib archives, assembled from the matching monolith.o so
@@ -1232,7 +1250,7 @@ tasks:
       # target is the whole stdlib. zig ar emits a portable
       # ranlib'd archive regardless of host toolchain.
       - |
-        for t in linux-x86_64 macos-x86_64 macos-aarch64; do
+        for t in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
           rm -f .tmp/libblink_std-$t.a
           zig ar rcs .tmp/libblink_std-$t.a .tmp/monolith-$t.o
         done
@@ -1245,13 +1263,15 @@ tasks:
       - |
         ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
         rm -rf {{.BUILD_DIR}}/dist
-        for t in linux-x86_64 macos-x86_64 macos-aarch64; do
+        for t in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
           d={{.BUILD_DIR}}/dist/blink-$t
           mkdir -p $d/bin $d/share/blink
           cp {{.BUILD_DIR}}/blink-$t $d/bin/blink
           cp .tmp/libblink_std-$t.a $d/share/blink/libblink_std.a
           cp "$ARC_REL/libblink_std.h" $d/share/blink/libblink_std.h
           cp {{.BUILD_DIR}}/runtime.h $d/share/blink/runtime.h
+          # A cross build (blink build -T) compiles the stdlib from this for its target.
+          cp "$ARC_REL/monolith.c" $d/share/blink/monolith.c
           # Identity stamp: runtime.h SHA must match the shipped runtime.h so
           # the released blink accepts its own archive at link time. The
           # per-target .a is zig-rebuilt from the same monolith/runtime.h, so
@@ -1274,10 +1294,10 @@ tasks:
       # Tar each layout for upload. Use `-C` so the top-level dir inside the
       # tar is blink-<target>/, giving extractors a clean rename target.
       - |
-        for t in linux-x86_64 macos-x86_64 macos-aarch64; do
+        for t in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
           tar -czf {{.BUILD_DIR}}/blink-$t.tar.gz -C {{.BUILD_DIR}}/dist blink-$t
         done
-      - echo "Built binaries + dist tarballs for linux-x86_64, macos-x86_64, macos-aarch64 ({{.VERSION}})"
+      - echo "Built binaries + dist tarballs for linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64 ({{.VERSION}})"
 
   __build-binaries-smoke:
     desc: One-target cross-compile smoke. Catches archive-mode regressions in the build-binaries pipeline at PR time (vs at release-cut).
@@ -1348,6 +1368,7 @@ tasks:
         scripts/release_notes.sh {{.CLI_ARGS}} "$PREV" > {{.BUILD_DIR}}/release-notes.md
         gh release create {{.CLI_ARGS}} \
           {{.BUILD_DIR}}/blink-linux-x86_64.tar.gz \
+          {{.BUILD_DIR}}/blink-linux-aarch64.tar.gz \
           {{.BUILD_DIR}}/blink-macos-x86_64.tar.gz \
           {{.BUILD_DIR}}/blink-macos-aarch64.tar.gz \
           install.sh \

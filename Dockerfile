@@ -24,11 +24,7 @@ RUN curl -fsSL "https://github.com/blinklang/blink/releases/download/${BLINK_VER
     && mkdir -p /usr/local/share/blink \
     && cp /tmp/blink-linux-x86_64/bin/blink /usr/local/bin/blink \
     && chmod +x /usr/local/bin/blink \
-    && cp /tmp/blink-linux-x86_64/share/blink/libblink_std.a \
-          /tmp/blink-linux-x86_64/share/blink/libblink_std.h \
-          /tmp/blink-linux-x86_64/share/blink/runtime.h \
-          /usr/local/share/blink/ \
-    && cp -R /tmp/blink-linux-x86_64/share/blink/native /usr/local/share/blink/ \
+    && cp -R /tmp/blink-linux-x86_64/share/blink/. /usr/local/share/blink/ \
     && rm -rf /tmp/blink.tar.gz /tmp/blink-linux-x86_64
 
 WORKDIR /workspace

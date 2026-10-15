@@ -28,7 +28,7 @@ finds its stdlib and archive from its own path.
 `build/gen1/share/blink/` holds gen1's own archive and header: `gen1.sh`
 flattens this tree's `bootstrap/runtime_*.h` into `runtime.h`, then runs
 gen1's own `blink __build-stdlib-archive` against the current `lib/std`
-and repoints `libblink_std.{a,h}`, `skip_modules.txt` and `.archive-id`
+and repoints `libblink_std.{a,h}`, `skip_modules.txt`, `.archive-id` and `monolith.c`
 at the result. `native/` sidecars still come from gen0 — those are C,
 not codegen output. Every gen1 compile therefore mixes gen1-emitted
 user C with a gen1-built archive; the link to gen0's archive is cut.

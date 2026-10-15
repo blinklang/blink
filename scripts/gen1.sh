@@ -46,7 +46,7 @@ ln -s ../lib "$out/bin/lib"
 
 gen0_share="$gen0/share/blink"
 [ -d "$gen0_share" ] || gen0_share="$gen0"
-for f in libblink_std.a libblink_std.h skip_modules.txt runtime.h .archive-id native; do
+for f in libblink_std.a libblink_std.h skip_modules.txt runtime.h .archive-id monolith.c native; do
     [ -e "$gen0_share/$f" ] && ln -s "$(readlink -f "$gen0_share/$f")" "$out/share/blink/$f"
 done
 archive_h="$out/share/blink/libblink_std.h"
@@ -140,7 +140,7 @@ if ! BLINK_FORCE_STDLIB_REBUILD=1 "$out/bin/blink" __build-stdlib-archive > "$ar
 fi
 
 # build_stdlib_archive's relink_archive writes build/{libblink_std.a,libblink_std.h,
-# skip_modules.txt,.archive-id} as symlinks into build/std-cache/<hash>/, relative
+# skip_modules.txt,.archive-id,monolith.c} as symlinks into build/std-cache/<hash>/, relative
 # to the cwd it ran under ($root, since this script cd's there up top) — not into
 # build/gen1/. That is the one place this leaves a side effect outside build/gen1
 # and build/std-cache; nothing task ci/ci-fast reads depends on it (fmt-semantic,
@@ -159,7 +159,7 @@ fi
 # runtime.h stays the flattened file dropped in above; native/ stays gen0's (C
 # sidecars, not codegen output). Only the archive itself and its direct sidecars
 # move to gen1's own build.
-for f in libblink_std.a libblink_std.h skip_modules.txt .archive-id; do
+for f in libblink_std.a libblink_std.h skip_modules.txt .archive-id monolith.c; do
     rm -f "$out/share/blink/$f"
     ln -s "$cache_dir/$f" "$out/share/blink/$f"
 done
