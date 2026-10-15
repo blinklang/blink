@@ -44,7 +44,7 @@ Each panelist wrote alone. Text is verbatim.
 > The test binary exits 1 when `failed + panicked > 0`. There is one non-zero code. CI tells "found a bug" from "test is broken" by reading NDJSON, not the exit status. Separate exit codes would leak detail through an 8-bit channel that shells and task runners already mangle. The `blink test` driver stays as it is (it reads the exit code only).
 >
 > ## P4: Human output
-> The per-test line is `test NAME ... PANIC`, then the message and span. The summary line is `N passed, M failed, P panicked[, K skipped] (of T)`. The `panicked` term shows only when P > 0, the same rule as `skipped`. Update the assertions in `tests/test_runner_panic_continues_zs3w3y.bl`; do not delete them.
+> The per-test line is `test NAME ... PANIC`, then the message and span. The summary line is `N passed, M failed, P panicked[, K skipped] (of T)`. The `panicked` term shows only when P > 0, the same rule as `skipped`. Update the assertions in `tests/test_runner_panic_continues.bl`; do not delete them.
 >
 > ## P5: test.failing
 > A panic counts as red, which the runtime already does. The record stays `status:"passed"` with `expected_fail:true`, plus the panic `message` so drift stays visible. Why: the most common known bug is an unwrap on None. If a panic did not count as red, a user could not mark that bug. Cross-language: pytest's `xfail` counts any exception as expected unless you give `raises=`. Rust `#[should_panic]` is a different construct (Blink's is `assert_panics`). This does not conflict with Q3: no new status and no new cause.
@@ -99,7 +99,7 @@ Each panelist wrote alone. Text is verbatim.
 > - Correct the §8.10 example so its summary shows all keys.
 > - The human line is `test NAME ... PANIC`, and the panic message follows on stderr.
 > - The human summary is `N passed, M failed[, P panicked][, K skipped] (of T)`. Show `panicked` only when it is not zero, the same rule as for `skipped`.
-> - Update `tests/test_runner_panic_continues_zs3w3y.bl` so it expects `PANIC` and `1 panicked`. Change the assertions; do not delete them.
+> - Update `tests/test_runner_panic_continues.bl` so it expects `PANIC` and `1 panicked`. Change the assertions; do not delete them.
 >
 > **Tradeoff:** People who grep CI logs for `FAIL` will miss panics. I accept that: the word should match the status one to one. The other option, `FAIL (panic)`, prints one status as two words, which will confuse people later.
 >
@@ -200,7 +200,7 @@ Each panelist wrote alone. Text is verbatim.
 > - The DevOps requirement from Testing Q2 (5-0), which separates "found a bug" from "test broken", is met at last.
 >
 > **Against:**
-> - The human output and summary change, so the assertions in `tests/test_runner_panic_continues_zs3w3y.bl` must be updated (updated, not deleted).
+> - The human output and summary change, so the assertions in `tests/test_runner_panic_continues.bl` must be updated (updated, not deleted).
 > - `blink test` only reads exit codes, so it needs no change. Any tool that parses the JSON and relied on `cause:"panic"` will break, but the spec never allowed that value.
 >
 > ## Cross-language note
@@ -246,7 +246,7 @@ Each panelist wrote alone. Text is verbatim.
 >   panicked at src/hdr_test.bl:14:22: unwrap called on None
 > 3 passed, 1 failed, 1 panicked, 1 skipped (of 6)
 > ```
-> `PANIC` has the same width as `FAIL`/`PASS`/`SKIP`, and the summary line omits zero counts as it does today. tests/test_runner_panic_continues_zs3w3y.bl must have its assertions updated (not deleted) from `FAIL`/`1 failed` to `PANIC`/`1 panicked`. zs3w3y's real fix, continue-after-panic, stays as it is.
+> `PANIC` has the same width as `FAIL`/`PASS`/`SKIP`, and the summary line omits zero counts as it does today. tests/test_runner_panic_continues.bl must have its assertions updated (not deleted) from `FAIL`/`1 failed` to `PANIC`/`1 panicked`. zs3w3y's real fix, continue-after-panic, stays as it is.
 >
 > **P5: test.failing.** A panic counts as "expected red", which is what the runtime does today: `status:"passed"`, `expected_fail:true`. The record still carries the `panic` object, so a dashboard can see how the test was red. This adds no status and no `cause`, so Q3 holds. pytest `xfail` works the same way: any exception is an expected failure unless the author narrows it with `raises=`. A narrowing option like that is out of scope here, for a later ticket.
 >
@@ -295,7 +295,7 @@ Each panelist wrote alone. Text is verbatim.
 >
 > **Rule:** the result word is `PANIC` (not `FAIL`), followed by the panic message and its location. The summary line is `N passed, M failed, P panicked[, K skipped] (of T)`. Show `panicked` only when P > 0, the same way `skipped` works today.
 >
-> Update the assertions in tests/test_runner_panic_continues_zs3w3y.bl to match. Do not delete them.
+> Update the assertions in tests/test_runner_panic_continues.bl to match. Do not delete them.
 >
 > **Why:** agents read human output as often as JSON. The word must match the status token exactly (`panicked` ↔ `PANIC`) so there is no second vocabulary to learn.
 >
@@ -349,7 +349,7 @@ Each panelist wrote alone. Text is verbatim.
 >    "summary":{"total":14,"passed":11,"failed":1,"panicked":1,"skipped":1,"duration_ms":340}
 >    ```
 > 3. **Exit code:** non-zero if `failed + panicked > 0`. The code stays binary. A separate code for "panicked" would add surface that the records already cover.
-> 4. **Human output:** the word shown for a test is its status: `PASS | FAIL | PANIC | SKIP`. The summary line lists only the non-zero counts: `11 passed, 1 failed, 1 panicked, 1 skipped (of 14)`. The test `tests/test_runner_panic_continues_zs3w3y.bl` gets its assertions updated, not deleted.
+> 4. **Human output:** the word shown for a test is its status: `PASS | FAIL | PANIC | SKIP`. The summary line lists only the non-zero counts: `11 passed, 1 failed, 1 panicked, 1 skipped (of 14)`. The test `tests/test_runner_panic_continues.bl` gets its assertions updated, not deleted.
 > 5. **test.failing:** a panic counts as red. The rule becomes "any outcome other than `passed` is inverted." The runtime already does this, and a known bug often shows up as an `unwrap` panic, so an exception here would be a trap. The record is `status:"passed"`, `expected_fail:true`, as §8.10.6 specifies.
 > 6. **prop_check:** a panic inside the property is not a falsification. The runner does not shrink it, and the test reports `panicked`. The γ rejection in vote 3 already assumed this, and this rule makes it normative. Shrinking on a panic would need catch-and-retry machinery for a path the panel has already called "the test itself is broken."
 >
@@ -500,7 +500,7 @@ The moderator grouped the six proposals into shared points S1–S6 and variation
 > Keep one record per test. Agents and tools index results by test `name`, and two records with the same name break that silently: the last one wins in a dict. I also accept sys's "first escape wins, never upgrade failed → panicked". This refines the vote-4 DevOps wording ("separate record"), so the panel must say so explicitly, and devops should confirm it.
 >
 > ## V6: human summary. **Show `panicked` only when it is above 0**, the same rule as `skipped`.
-> Min's "non-zero only" would also hide `0 failed`. That changes the line that tests/test_runner_panic_continues_zs3w3y.bl and users' log greps already match, and this ticket does not need that change.
+> Min's "non-zero only" would also hide `0 failed`. That changes the line that tests/test_runner_panic_continues.bl and users' log greps already match, and this ticket does not need that change.
 >
 > ## To the panel
 > - S1–S6 are the substance, and all six of us agree on them. Please do not let V2–V6 hold up the vote on S1–S6. The runtime's off-enum `cause:"panic"` teaches every model that reads Blink output that closed enums are not closed.
