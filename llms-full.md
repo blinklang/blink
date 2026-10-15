@@ -350,8 +350,8 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `??` | Option[T] | Unwrap or default |
 | `\|>` | Any | Pipe: `x \|> f()` = `f(x)` |
 | `+=` `-=` `*=` `/=` | Int, Float | Compound assignment (mut only) |
-| `&` `\|` `^` `~` | Int, sized ints | Bitwise AND / OR / XOR / NOT |
-| `<<` `>>` | Int, sized ints | Shift (amount is `U32`; arithmetic on signed, logical on unsigned). Out-of-range literal shifts caught at compile time; non-literal amounts get a runtime bounds check. `W0700` warns on bitwise-of-comparison without parens. |
+| `&` `\|` `^` `~` | Int, sized ints | Bitwise AND / OR / XOR / NOT. Shifts and each of `&` `^` `\|` are separate groups: mixing two groups, or a group with `+ - * / %`, needs parentheses (`(d << 24) \| (d << 16)`, error E1127 otherwise). All bind tighter than comparison: `flags & 0x0F == 0` is `(flags & 0x0F) == 0` |
+| `<<` `>>` | Int, sized ints | Shift (amount is `U32`; arithmetic on signed, logical on unsigned). Out-of-range literal shifts caught at compile time; non-literal amounts get a runtime bounds check. |
 
 ## Builtin Functions
 

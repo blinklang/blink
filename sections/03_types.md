@@ -1072,16 +1072,17 @@ trait BitNot {
 }
 ```
 
-**Precedence:** Bitwise operators bind *lower* than comparison operators. This means `x & mask == 0` parses as `x & (mask == 0)`, which is almost certainly not what you intended. The compiler emits a warning (W0700) and requires explicit parentheses:
+The decision to use operators, not named methods, had a panel vote of 4-1. AI/ML dissented and wanted named methods.
+
+**Precedence:** Bitwise operators and shifts bind *tighter* than comparison operators, so `flags & 0x0F == 0` means `(flags & 0x0F) == 0`. A shift and each bitwise operator form a separate group. Mixing two groups, or a group with arithmetic, needs parentheses (§2.19 *Integer Operator Groups*):
 
 ```blink
-// WARNING: bitwise operator has lower precedence than comparison
-let bad = flags & 0x0F == 0          // W0700: add parentheses
-
-let good = (flags & 0x0F) == 0       // OK: intent is clear
+let low_clear = flags & 0x0F == 0    // OK: (flags & 0x0F) == 0; fmt prints the parentheses
+let word = (hi << 8) | lo            // OK
+let bad = hi << 8 | lo               // error[MixedOperatorPrecedence] (E1127)
 ```
 
-**Why lower precedence than comparison.** This matches C's precedence table. Changing it would surprise every programmer with C/C++/Java experience and create a different class of bugs. Instead, the mandatory-parentheses warning eliminates the footgun while preserving familiar precedence. (Panel vote: 4-1, AI/ML dissented wanting named methods instead of operators.)
+**`Bool` operands.** `&`, `|` and `^` take integer operands only. `(a == 0) & (b == 0)` is a type error, and its `help:` line names `&&` (or `||` for `|`).
 
 **Standard methods on sized integer types:**
 

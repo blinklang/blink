@@ -1473,13 +1473,56 @@ From lowest to highest binding:
 | 4 | `&&` | left | logical and (short-circuit) |
 | 5 | `==` `!=` | left | equality |
 | 6 | `<` `>` `<=` `>=` | left | comparison |
-| 7 | `+` `-` | left | additive |
-| 8 | `*` `/` `%` | left | multiplicative |
-| 9 | `-` `!` | right | unary prefix |
-| 10 | `?` | left | postfix unwrap |
-| 11 (highest) | `.` `()` | left | member access, call |
+| 7 | `+` `-` `*` `/` `%` `<<` `>>` `&` `^` `\|` | left | integer operator groups (see below) |
+| 8 | `-` `!` `~` | right | unary prefix |
+| 9 | `?` | left | postfix unwrap |
+| 10 (highest) | `.` `()` | left | member access, call |
 
 **Non-chaining comparisons.** `a < b < c` is a compile error. The compiler suggests `a < b && b < c`. Chained comparisons introduce context-sensitive operator semantics that contradict Blink's unambiguous-parsing priority. (Vote: 4-1)
+
+#### Integer Operator Groups
+
+Level 7 is a partial order, not one level. It holds five groups:
+
+| Group | Operators | Inside the group |
+|-------|-----------|------------------|
+| arithmetic | `+` `-` `*` `/` `%` | `*` `/` `%` bind tighter than `+` `-`; each chains left |
+| shift | `<<` `>>` | chains left |
+| bitwise and | `&` | chains left |
+| bitwise xor | `^` | chains left |
+| bitwise or | `\|` | chains left |
+
+Each group binds tighter than comparison and equality (levels 5 and 6), and looser than unary prefix (level 8). The five groups have no order among them. An operand of an operator in one group cannot be a bare operator expression of a different group. Write parentheses. If you do not, the compiler gives the parse error `MixedOperatorPrecedence` (E1127):
+
+```blink
+fn pack(hi: U32, lo: U32) -> U32 {
+    (hi << 16) | lo                // OK: parentheses group the shift
+}
+
+let a = x << 1 >> 2                // OK: (x << 1) >> 2, one group
+let b = x | y | z                  // OK: one group
+let c = a + b * w                  // OK: one group, * binds tighter
+let m = ~x & y                     // OK: unary binds tighter, (~x) & y
+
+let e = x << n + 1                 // error[MixedOperatorPrecedence]: `<<` and `+`
+let f = v << 24 | v << 16          // error[MixedOperatorPrecedence]: `|` and `<<`
+let g = x | y & 3                  // error[MixedOperatorPrecedence]: `|` and `&`
+let k = h * 31 ^ x                 // error[MixedOperatorPrecedence]: `^` and `*`
+```
+
+The `help:` line of `MixedOperatorPrecedence` shows both groupings, for example `(x << n) + 1` and `x << (n + 1)`. The language server offers both as rewrites. Neither rewrite is machine-applicable, because the compiler cannot know which one the author meant.
+
+An expression of any group can be a bare operand of a comparison or equality operator:
+
+```blink
+let low_clear = flags & 0x0F == 0  // (flags & 0x0F) == 0
+let fits = x << 1 < limit          // (x << 1) < limit
+let same = a + b == c              // (a + b) == c
+```
+
+`blink fmt` (§8.8) prints parentheses around a bitwise or shift operand of a comparison or equality operator. Thus `flags & 0x0F == 0` and `(flags & 0x0F) == 0` both format to `(flags & 0x0F) == 0`. The formatter does not add parentheses around an arithmetic operand.
+
+**Why a partial order.** Languages do not agree on these levels. C and Rust put shifts below `+`. Go puts `<<` and `&` on the level of `*`, so `a & b << c` is `(a & b) << c` in Go and `a & (b << c)` in C and Rust. All operands are integers, so a reader who expects the wrong order gets a wrong value and no error. A parse error removes each mix where two languages give different values. The comparison edge stays ordered because the other grouping never type-checks: in `flags & 0x0F == 0`, the C grouping `flags & (0x0F == 0)` applies `&` to a `Bool`. (Votes: shift with arithmetic 6-0; two bitwise operators 6-0; bitwise with arithmetic 6-0; shift with bitwise 6-0 R2, was 4-2; bitwise above comparison 6-0 R2, was 3-2-1; shift as a bare comparison operand 5-1; formatter parentheses 5-1; diagnostic 5-1; unary `~` 6-0.)
 
 #### Operator Desugaring
 
