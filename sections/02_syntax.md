@@ -2715,7 +2715,7 @@ fn main() {
 
 #### Assignment places
 
-A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. Each step of a field path names a struct field (`s.f`) or a tuple field (`t.0`), so a path such as `s.f.0` has no sub-expressions that have effects or can fail. No step goes through a `Ptr`: for `p: Ptr[S]`, `p.f = v` is not an assignment to a place, and the help names `p.f.write(v)` (§9.1.1). `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost. Storage the compiler shares between values is never a place. A feature that adds places must keep that rule (§3.6.1 *Clone Semantics*). A store to a place is rule 1 of E0601 (§9.1.1 *Scope tags*).
+A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. Each step of a field path names a struct field (`s.f`) or a tuple field (`t.0`), so a path such as `s.f.0` has no sub-expressions that have effects or can fail. No step goes through a `Ptr`: for `p: Ptr[S]`, `p.f = v` is not an assignment to a place, and the help names `p.f.write(v)` (§9.1.3, *Writes that are not to a place* below). `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost. Storage the compiler shares between values is never a place. A feature that adds places must keep that rule (§3.6.1 *Clone Semantics*). A store to a place is rule 1 of E0601 (§9.1.1 *Scope tags*).
 
 ```blink
 type Stats {
@@ -2755,6 +2755,79 @@ The formatter never reorders arguments, struct-literal fields or list elements, 
 **Why not "unspecified".** C leaves argument order unspecified, and the C compilers Blink targets differ. An unspecified order would give one Blink program different output under gcc, clang and zig cc. No diagnostic can find the order-sensitive cases, because effect rows do not record writes to captured `let mut` bindings or overflow panics. That is under-determined behaviour with no error, which Blink rejects (§3.4, `E0301`).
 
 **Panel vote: 6-0** on each point: written order everywhere, the closed list, compound assignment, the formatter rule, and assignment places. See [decisions/argument-evaluation-order.md](../decisions/argument-evaluation-order.md).
+
+#### Writes that are not to a place
+
+The left side of `=` or `op=` must be a place. When it is not, the compiler checks four cases in this order and reports only the first that applies. So the help is always the last fix the line needs:
+
+1. **A step goes through a `Ptr`.** `error[NotAPlace]` (E0611). The `Ptr` can be the root (`p.f = v` for `p: Ptr[S]`) or a field in the middle of the path (`s.p.f = v` for `s.p: Ptr[S]`). The root kind does not matter: a `let`, a `let mut` and a parameter all give E0611.
+2. **The root is a temporary**, such as a call result: `mk().x = 5`. `error[NotAPlace]` (E0611). No name reaches the value, so the store is lost.
+3. **The root is a parameter**, `self` included. `error[ParamAssign]` (E0612, §3.6 *Mutable Parameters*).
+4. **The root is an immutable binding.** `error[MutationRequiresMut]` (E0610, §3.2.2 *Construction and Mutability*).
+
+When two cases apply, the first one in the list wins. For `mk().p.f = v` case 1 wins, and the help is `mk().p.f.write(v)`. For `fn f(p: Ptr[S]) { p.f = 1 }` case 1 wins over case 3. A `Ptr` write is legal through a plain `let`, a parameter or a temporary (§3.6 *What `mut self` covers*), so "add `mut`" or "copy it to a new name" would not fix the line.
+
+**A write through a `Ptr`.** The fix calls `write` on the same path (§9.1.3 *Field access on `Ptr[@ffi.struct T]`*). `place = rhs` runs `rhs` and then reads the root, but a method call reads its receiver before its arguments (*What each form evaluates*). So `p.f.write(rhs)` reads `p` before `rhs` runs, and when `rhs` changes `p` through a closure, the two forms store to different memory. The fix keeps the order of `place = rhs`:
+
+- **`rhs` is inert:** a literal, a name, or a field path of names (`cfg.limit`). It has no operator, call or other sub-expression, so it cannot run code. The machine-applicable fix writes `p.f.write(rhs)`.
+- **Any other `rhs`, when the assignment is a statement in a block:** the machine-applicable fix binds `rhs` to a new name on the line before, and then writes the name: `let v = rhs` and `p.f.write(v)`. The name is one that is not in scope at that line.
+- **Otherwise**, for example the body of a match arm with no braces: help only. The help shows the two-line form.
+
+`p.f op= rhs` through a `Ptr` gets help only, in every case: `p.f.write(p.f.read() op rhs)`. A note says this is a read and then a write, not one atomic step.
+
+```
+error[NotAPlace]: cannot assign through a `Ptr`
+ --> poll.bl:7:5
+  |
+7 |     p.events = next_events()
+  |     ^^^^^^^^ `p` is a `Ptr[PollFd]`
+  |
+  = note: a field behind a `Ptr` is not a place; write it with `.write()`
+  = note: the right side runs before `p` is read, so the fix keeps it on its own line
+  = help: `let events = next_events()`, then `p.events.write(events)`
+```
+
+```
+error[NotAPlace]: cannot assign through a `Ptr`
+ --> stats.bl:9:5
+  |
+9 |     c.hits += 1
+  |     ^^^^^^ `c` is a `Ptr[Counter]`
+  |
+  = note: this is a read and then a write, not one atomic step
+  = help: `c.hits.write(c.hits.read() + 1)`
+```
+
+**A temporary root.** The help says to bind the value first. There is no machine-applicable fix:
+
+```
+error[NotAPlace]: cannot assign to a temporary value
+ --> cfg.bl:4:5
+  |
+4 |     mk().x = 5
+  |     ^^^^ no name holds this value, so the store is lost
+  |
+  = help: bind it first: `let mut c = mk()`, then `c.x = 5`
+```
+
+**An immutable root.** `x = v`, `x op= v` and `s.f = v` on a plain `let` root are E0610, the same error as a mutating method call on that root. The fix depends on how the root is declared (§3.2.2). An assignment inside a closure to a captured binding gets the same error. A label marks the capture, and the fix goes at the `let`:
+
+```
+error[MutationRequiresMut]: cannot assign to `total`, which is not `mut`
+ --> sum.bl:4:9
+  |
+2 |     let total = 0
+  |         ----- declared here
+3 |     let add = fn(n: Int) {
+4 |         total = total + n
+  |         ^^^^^ captured here
+  |
+  = help: declare it `let mut total`
+```
+
+**Rollout.** NotAPlace (E0611) and E0610 on an assignment are errors from the first release that has them. None of these programs had a meaning under this section. ParamAssign (E0612) keeps the rollout of §3.6 *Mutable Parameters*.
+
+**Panel vote: 6-0** on each point: E0610 for an immutable root, NotAPlace for a `Ptr` step and a temporary root, a code for ParamAssign, the order of the four cases, the `Ptr` fix rules, help only for a module-level `let`, and errors at once. The `Ptr` fix rules passed 6-0 in a second round. See [decisions/assignment-place-diagnostics.md](../decisions/assignment-place-diagnostics.md).
 
 ### 2.23 Reserved Words
 

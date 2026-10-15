@@ -304,6 +304,8 @@ What this gives the AI:
 - **Related locations** — where the type/trait/variant was defined, for context
 - **No guesswork** — the AI doesn't interpret an English sentence and hope it understands what the compiler meant
 
+**Applying fixes.** `blink fix` applies the machine-applicable fixes in a set of diagnostics. When two fixes contain the same edit (same span, same text), it applies that edit once. Two different edits whose spans overlap are a conflict: `blink fix` applies neither and reports both diagnostics.
+
 The effect on the generate-compile-fix loop is dramatic. In Python, an AI reads a traceback, infers what went wrong, generates a fix hypothesis, applies it, and hopes. In Blink, the compiler tells the AI exactly what's wrong, exactly where, and often exactly how to fix it. The fix loop becomes mechanical rather than inferential.
 
 ---

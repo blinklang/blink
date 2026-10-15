@@ -48,6 +48,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | W055x | Mutation analysis |
 | E05xx | Effects / capabilities |
 | E06xx | Resource scope / closures |
+| E061x | Mutation analysis (assignment and mutable roots) |
 | W060x | Linting |
 | W061x | Resource scope lints |
 | W070x | Linting |
@@ -135,6 +136,9 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | ConstEvalPanic | E0546 | Evaluation of a const expression in a const context (a `const` right-hand side, a struct field default, a keyword default, a range-pattern bound) would panic: integer `/` or `%` by zero, signed `MIN / -1`, or integer overflow. The span is the subexpression that fails, with one `note:` for each `const` reference that leads to the failing value | Type checking | §2.21 |
 | UndeclaredModuleState | E0552 | A boundary function (`pub fn`, `pub` method, trait impl method) touches module state, through its body or a call, and its row does not name `State`. One `note:` per binding: its name, read or written, the access location, and the call it goes through. Machine-applicable fix: add `State` to the row. E0500 does not fire for `State` | Effects | §4.16.1 |
 | CloseableEscapesScope | E0601 | `Closeable` value escapes `with...as` scope | Resources | §5.5 |
+| MutationRequiresMut | E0610 | A mutation whose root is not mutable: a call to a `mut self` method, or `=`/`op=`, whose first name is not a `let mut` binding or a `mut` parameter. A closure's assignment to a captured binding is included, with a label at the capture. Machine-applicable fix: insert `mut` on a local `let` with a plain name. Help only for a destructuring `let`, a `for` or `match` binding, a module-level `let` (the help says `mut` adds `State` to each reader's and writer's row) and an imported `pub let` (names E1013). Reported after E0611 and E0612 | Mutation analysis | §3.2.2, §2.22 |
+| NotAPlace | E0611 | The left side of `=`/`op=` is not a place: a step goes through a `Ptr` (at the root or mid-path, any root kind), or the root is a temporary such as a call result. For a `Ptr` step with `=`: machine-applicable `p.f.write(rhs)` when `rhs` is a literal, a name or a field path of names; otherwise, in a block statement, a fix that binds `rhs` to a new name on the line before; otherwise help only. With `op=`: help only, `p.f.write(p.f.read() op rhs)`, with a note that it is not atomic. A temporary root: help only, bind it first. Checked first: a `Ptr` step, then a temporary root | Mutation analysis | §2.22 |
+| ParamAssign | E0612 | An assignment to a parameter or to a field of one, `self` included, with or without `mut`. Help: copy it to a new `let mut` name; in `BlockHandler.enter()`, build the value in the `with` item. Reported after E0611, before E0610. Ships first as a warning (§3.6 *Mutable Parameters*) | Mutation analysis | §3.6 |
 | MutableCaptureInSpawn | E0650 | A closure passed to `async.spawn` captures a `let mut` binding | Closures | §2.8 |
 | SpawnTouchesModuleState | E0651 | A function value passed to `async.spawn`, closure literal or named function, whose effective row contains `State`. The help says to pass the data in, return it from the task, or use a `Channel` | Closures | §4.16.6, §2.8 |
 | ArenaValueEscapes | E0700 | Arena-scoped value escapes arena scope | Arena | §5.2 |
