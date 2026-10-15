@@ -84,6 +84,8 @@ Update the `VERSION` file to the confirmed version.
 
 Prepend a new section to `CHANGELOG.md` (at repo root). Format matches prior entries — `## Breaking Changes (vX.Y.Z)` or `## What's New (vX.Y.Z)` with bullet-list body from Step 1c. If CHANGELOG.md has a `## Changes (unreleased)` section, fold its entries into the new section and remove that heading.
 
+End every CHANGELOG heading for the release with `(vX.Y.Z)`. `task release` prints those sections as the GitHub release notes (`scripts/release_notes.sh`) and refuses to start when it finds none.
+
 `CHANGELOG.md` is the single source of truth for release history. Both `blink llms` and `blink llms --full` append it automatically; `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing here. **Do not edit the stub in `llms.md` / `llms-full.md`.**
 
 Also bump the version in the header of `llms-full.md` (line 3, `**Compiler vX.Y.Z**`).
@@ -127,7 +129,7 @@ This will:
 - Cross-compile binaries (`task build-binaries`)
 - Create git tag
 - Push tag
-- Create GitHub release with binaries + llms-full.md
+- Create GitHub release with binaries + llms-full.md; the notes come from the CHANGELOG.md sections for the version
 
 Run `task ci-release` on HEAD early, while Step 1 runs, so a failure shows before the release commit.
 
