@@ -5741,10 +5741,89 @@ fn tc_closure_body_result_tid(cls: Int, depth: Int) -> Int {
     t
 }
 
+// The result of a `map` / `flat_map` whose closure names no `-> U`: a List or Iterator of a
+// metavar that the body walk binds (tc_bind_hof_result). infer_type answers for the call
+// before that walk, and again on each later pass, so the call node's own memo is reused when
+// it already holds this slot — a fresh metavar per pass would leave the earlier binder's
+// type holding a hole that nothing binds.
+fn tc_hof_result_slot(node: Int, kind: TyKind) -> Int {
+    let memo = tc_lookup_node_tid(node)
+    if memo >= 0 && tc_tid_kind(memo) == kind {
+        let inner = ty_pool.get(memo).unwrap().inner1
+        if inner >= 0 && inner != TYPE_UNKNOWN && tc_tid_kind(inner) == TyKind.Unknown { return memo }
+    }
+    let alpha = make_metavar()
+    if kind == TyKind.Iterator { make_iterator_type(alpha) } else { make_list_type(alpha) }
+}
+
+// What a `map` / `flat_map` argument that is a fn VALUE rather than a closure literal (a
+// named fn, an fn-typed local) returns: its type already states it. -1 when the argument is a
+// closure, or its return is not determined here — a generic fn's own typevar is never
+// substituted at this site.
+fn tc_hof_fn_value_ret(arg: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if arg == -1 || node_kind(arg) == NodeKind.Closure { return -1 }
+    let r = tc_fn_tid_ret(infer_type(arg))
+    if r < 0 || tc_tid_is_no_info(r) != 0 { return -1 }
+    if tc_tid_has_unbound_metavar(r) != 0 || tc_tid_has_unknown(r) != 0 || tc_tid_has_foreign_typevar(r) != 0 { return -1 }
+    r
+}
+
+// The element metavar of a tc_hof_result_slot memo, or -1 when the call's memo is not one
+// (an annotated closure, or a named fn whose return was already known).
+fn tc_hof_result_slot_elem(node: Int) -> Int {
+    let memo = tc_lookup_node_tid(node)
+    if memo < 0 { return -1 }
+    let k = tc_tid_kind(memo)
+    if k != TyKind.List && k != TyKind.Iterator { return -1 }
+    let inner = ty_pool.get(memo).unwrap().inner1
+    if inner < 0 || inner == TYPE_UNKNOWN || tc_tid_kind(inner) != TyKind.Unknown { return -1 }
+    inner
+}
+
+// Binds the call's result metavar to what the walked closure body produced. `bind_metavar`,
+// not tc_unify: tc_unify leaves a typevar unbound in a generic body, which would report a
+// `fn f[T](xs: List[T]) { xs.map(fn(x) { Some(x) }) }` as under-determined. An undeterminable
+// body leaves the slot open for the E0301 boundary check; when the body already reported
+// why, the slot is marked so that check does not report the same hole again.
+fn tc_bind_hof_result(node: Int, cls: Int, method: Str, diag_before: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
+    if node_type_ann(cls) != -1 || node_return_type(cls) != "" { return }
+    let slot = tc_hof_result_slot_elem(node)
+    if slot == -1 { return }
+    let ret = tc_fn_tid_ret(tc_lookup_node_tid(cls))
+    let mut produced = ret
+    if method == "flat_map" && ret >= 0 {
+        let rk = type_kind(ret)
+        if rk == TyKind.Unknown || rk == TyKind.Typevar {
+            if diag_count > diag_before { tc_ud_mark_blamed(slot) }
+            return
+        }
+        if rk != TyKind.List && rk != TyKind.Iterator {
+            tc_error_at("the closure of `flat_map` must return a List or an Iterator, got {type_to_str(ret)}", cls)
+            // A let binder's E0301 ignores the blamed set, so close the hole instead: this
+            // error already stops the build, and an unknown element keeps uses quiet.
+            bind_metavar(slot, TYPE_UNKNOWN)
+            return
+        }
+        produced = ty_pool.get(tc_resolve(ret)).unwrap().inner1
+    }
+    if produced < 0 || tc_tid_is_no_info(produced) != 0 {
+        if diag_count > diag_before { tc_ud_mark_blamed(slot) }
+        return
+    }
+    if tc_is_unbound_metavar(tc_resolve(slot)) != 0 {
+        bind_metavar(slot, produced)
+        return
+    }
+    if types_compatible(tc_resolve(slot), produced) == 0 {
+        tc_error_at("`{method}` is used here as producing {type_to_str(slot)}, but its closure returns {type_to_str(produced)}", cls)
+    }
+}
+
 // List HOFs whose closure takes a single element-typed param. `fold` is handled
 // separately (its closure takes accumulator + element).
 fn is_elem_closure_hof(method: Str) -> Int {
-    method == "map" || method == "filter" || method == "for_each" || method == "any" || method == "all" || method == "find"
+    method == "map" || method == "filter" || method == "for_each" || method == "any" || method == "all" || method == "find" || method == "flat_map"
 }
 
 // The single install point for a closure's own fn-identity: installs
@@ -18530,11 +18609,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let u = resolve_type_ann(ret_ann)
                     if u != -1 { return make_iterator_type(u) }
                 }
+                let fv_ret = tc_hof_fn_value_ret(cls)
+                if fv_ret != -1 { return make_iterator_type(fv_ret) }
                 let ret_str = node_return_type(cls)
-                if ret_str == "" { return obj_t }
+                if ret_str == "" { return tc_hof_result_slot(node, TyKind.Iterator) }
                 let u = resolve_type_name(ret_str)
                 if u != -1 { return make_iterator_type(u) }
-                return obj_t
+                return tc_hof_result_slot(node, TyKind.Iterator)
             }
             if method == "flat_map" {
                 let cls = closure_arg_at(args_sl, 0)
@@ -18545,11 +18626,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let u = resolve_type_ann(ret_ann)
                     if u != -1 { return u }
                 }
+                let fv_ret = tc_hof_fn_value_ret(cls)
+                if fv_ret != -1 { return fv_ret }
                 let ret_str = node_return_type(cls)
-                if ret_str == "" { return obj_t }
+                if ret_str == "" { return tc_hof_result_slot(node, TyKind.Iterator) }
                 let u = resolve_type_name(ret_str)
                 if u != -1 { return u }
-                return obj_t
+                return tc_hof_result_slot(node, TyKind.Iterator)
             }
             if method == "filter" {
                 let cls = closure_arg_at(args_sl, 0)
@@ -18707,6 +18790,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // should require a bound is a spec question about generic bounds.
             if method == "join" {
                 check_builtin_arg(method, 0, TYPE_STR, args_sl, "List")
+                // An element still open here (a `map` whose closure body is walked after this
+                // call is typed) is pinned to Str, so a body that produces anything else
+                // conflicts and is reported instead of passing through the fail-open below.
+                if tc_is_unbound_metavar(tc_resolve(elem)) != 0 { tc_unify(elem, TYPE_STR) }
                 let ek = type_kind(elem)
                 if ek != TyKind.Str && ek != TyKind.Unknown && ek != TyKind.Typevar {
                     tc_error_at("List.join requires List[Str], got {type_to_str(obj_t)}", node)
@@ -18727,11 +18814,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let u = resolve_type_ann(ret_ann)
                     if u != -1 { return make_list_type(u) }
                 }
+                let fv_ret = tc_hof_fn_value_ret(cls)
+                if fv_ret != -1 { return make_list_type(fv_ret) }
                 let ret_str = node_return_type(cls)
-                if ret_str == "" { return obj_t }
+                if ret_str == "" { return tc_hof_result_slot(node, TyKind.List) }
                 let u = resolve_type_name(ret_str)
                 if u != -1 { return make_list_type(u) }
-                return obj_t
+                return tc_hof_result_slot(node, TyKind.List)
             }
             if method == "flat_map" {
                 let cls = closure_arg_at(args_sl, 0)
@@ -18747,11 +18836,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let u = resolve_type_ann(ret_ann)
                     if u != -1 { return u }
                 }
+                let fv_ret = tc_hof_fn_value_ret(cls)
+                if fv_ret != -1 { return fv_ret }
                 let ret_str = node_return_type(cls)
-                if ret_str == "" { return obj_t }
+                if ret_str == "" { return tc_hof_result_slot(node, TyKind.List) }
                 let u = resolve_type_name(ret_str)
                 if u != -1 { return u }
-                return obj_t
+                return tc_hof_result_slot(node, TyKind.List)
             }
             if method == "filter" {
                 let cls = closure_arg_at(args_sl, 0)
@@ -22875,6 +22966,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // the Part B body walk: bind unannotated closure params to the elem/acc
         // type and type-check the body once.
         let obj_t = infer_type(node_obj(node))
+        // The RECEIVER of this call is a value the arm above only inferred, never body-walked,
+        // so a HOF in the receiver chain (`a.map(f).collect()`) reaches check_closure_body only
+        // through this descent. It runs first so a receiver `map` has bound its result before
+        // this call's own closure is handed that element (`xs.map(f1).map(f2)`).
+        tc_walk_nested_hof_bodies(node_obj(node))
         // This arm, and not infer_type's MethodCall arm: infer_type is called several
         // times per node (the nr pass, then the inference pass, then re-inference for
         // mono) and its memo wrapper does not short-circuit, so a diagnostic emitted there
@@ -22892,8 +22988,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let method = node_method(node)
             let elem = tc_tid_iter_elem(obj_t)
             if is_elem_closure_hof(method) != 0 {
-                check_closure_body(closure_arg_at(args_sl, 0), make_fn_type(TYPE_UNKNOWN, [elem]))
+                let hof_cls = closure_arg_at(args_sl, 0)
+                let diag_before = diag_count
+                check_closure_body(hof_cls, make_fn_type(TYPE_UNKNOWN, [elem]))
                 hof_arg = 0
+                if method == "map" || method == "flat_map" { tc_bind_hof_result(node, hof_cls, method, diag_before) }
             } else if method == "fold" {
                 if args_sl != -1 && sublist_length(args_sl) >= 2 {
                     let acc_t = infer_type(sublist_get(args_sl, 0))
@@ -22928,10 +23027,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // List, so its body still needs walking below.
         tc_check_callable_arg_bodies(args_sl, hof_arg)
         tc_check_mutating_in_args(args_sl)
-        // The RECEIVER of this call is a value the arm above only inferred, never body-walked,
-        // so a HOF in the receiver chain (`a.map(f).collect()`) reaches check_closure_body only
-        // through this descent.
-        tc_walk_nested_hof_bodies(node_obj(node))
         return
     }
 
