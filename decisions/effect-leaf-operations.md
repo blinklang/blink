@@ -441,7 +441,7 @@ All six put "leaf effects may declare operations; a body holds `fn` items or `ef
 4. **Op names unique across one top-level tree.** Yes, state it. One handle means one flat op namespace, and one vtable means one slot per name. Without this rule, `db.get` is ambiguous at the call site, and so is the slot.
 5. **Diagnostic notes.** Support both web's and devops's notes. They are cheap and point the reader at the right row.
 6. **`effect X {}`.** Same as `effect X`: a marker leaf with a zero-slot vtable. `blink fmt` rewrites it to the bare form.
-7. **Leaf-to-tree evolution (factual).** plt and web are right, and aiml is wrong. A handler for a parent effect already lists its ops flat, with no child grouping. See the spec at §4.7 (`handler DB { … }`) and `tests/test_resqj9_with_field_operand.bl`, where `handler Metrics { fn counter … }` covers `Metrics.Emit.counter`. When `Store { fn get; fn put }` becomes `Store { effect Read { fn get } effect Write { fn put } }`:
+7. **Leaf-to-tree evolution (factual).** plt and web are right, and aiml is wrong. A handler for a parent effect already lists its ops flat, with no child grouping. See the spec at §4.7 (`handler DB { … }`) and `tests/test_with_field_operand.bl`, where `handler Metrics { fn counter … }` covers `Metrics.Emit.counter`. When `Store { fn get; fn put }` becomes `Store { effect Read { fn get } effect Write { fn put } }`:
    - `handler Store { fn get … fn put … }` still compiles, because completeness is over ops(Store).
    - The `! Store` rows still compile, as do `store.get` calls and `Handler[Store]` values.
    - Only the declaration changes, and callers may now narrow to `! Store.Read`.
