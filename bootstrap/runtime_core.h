@@ -27,6 +27,11 @@
 #endif
 #define GC_THREADS
 #include <gc.h>
+#if !defined(__APPLE__)
+/* glibc declares realpath only past plain _POSIX_C_SOURCE. The compiler calls an
+   @ffi("realpath") binding through this prototype, so the unit needs one on every host. */
+extern char* realpath(const char* __restrict path, char* __restrict resolved);
+#endif
 /* The vendored headers sit flat beside gc.h; a system install keeps this one under gc/. */
 #if defined(__has_include)
 #if __has_include(<gc_typed.h>)
