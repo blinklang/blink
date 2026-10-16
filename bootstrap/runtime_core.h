@@ -1165,6 +1165,31 @@ BLINK_RT_FN void* blink_list_pop(blink_list* l) {
 }
 #endif
 
+/* index == len appends, so insert's valid range is one wider than a read's. */
+BLINK_RT_FN void blink_list_insert(blink_list* l, int64_t index, void* item);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_list_insert(blink_list* l, int64_t index, void* item) {
+    if (index < 0 || index > l->len) blink_list_index_oob(index, l->len);
+    int64_t tail = l->len - index;
+    blink_list_push(l, item);
+    memmove(&l->items[index + 1], &l->items[index], sizeof(void*) * (size_t)tail);
+    l->items[index] = item;
+}
+#endif
+
+BLINK_RT_FN void* blink_list_remove(blink_list* l, int64_t index);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_list_remove(blink_list* l, int64_t index) {
+    if (index < 0 || index >= l->len) blink_list_index_oob(index, l->len);
+    void* item = l->items[index];
+    memmove(&l->items[index], &l->items[index + 1], sizeof(void*) * (size_t)(l->len - index - 1));
+    l->len--;
+    /* The vacated slot would otherwise keep the removed element reachable to the GC. */
+    l->items[l->len] = NULL;
+    return item;
+}
+#endif
+
 BLINK_RT_FN void blink_list_free(blink_list* l);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_list_free(blink_list* l) {

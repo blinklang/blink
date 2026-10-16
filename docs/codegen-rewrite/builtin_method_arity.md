@@ -79,10 +79,10 @@ method name and never the arm:
 
 | method | args | reads |
 |---|---|---|
-| `get`, `push`, `take`, `skip`, `chain`, `append`, `join`, `contains` | 1 | typed |
+| `get`, `push`, `remove`, `take`, `skip`, `chain`, `append`, `join`, `contains` | 1 | typed |
 | `map`, `flat_map`, `filter`, `for_each`, `any`, `all`, `find` | 1 | closure |
 | `zip` | 1 | arity |
-| `set`, `slice` | 2 | typed |
+| `set`, `insert`, `slice` | 2 | typed |
 | `fold` | 2 | arity |
 | `len`, `count`, `pop`, `clear`, `enumerate`, `is_empty` | 0 | none |
 
