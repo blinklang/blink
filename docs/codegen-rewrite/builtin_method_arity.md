@@ -123,7 +123,7 @@ accepted and reach codegen short.
 |---|---|---|
 | `Map.get`, `Map.contains_key`, `Map.contains`, `Map.remove` | 1 | typed |
 | `Map.insert` | 2 | typed |
-| `Map.len`, `Map.clear`, `Map.is_empty`, `Map.keys`, `Map.values` | 0 | none |
+| `Map.len`, `Map.clear`, `Map.is_empty`, `Map.keys`, `Map.values`, `Map.entries` | 0 | none |
 | `Set.contains`, `Set.insert`, `Set.remove`, `Set.union` | 1 | typed |
 | `Set.len`, `Set.is_empty` | 0 | none |
 | `Channel.send` | 1 | typed |

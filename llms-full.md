@@ -639,6 +639,7 @@ let first_two = names
 | `.len()` | Int | Entry count |
 | `.keys()` | List[K] | All keys |
 | `.values()` | List[V] | All values |
+| `.entries()` | List[(K,V)] | All (key, value) pairs, in the order `for (k, v) in m` gives |
 | `.clear()` | () | Remove all entries (mutates) |
 
 ## Set[T] Methods
