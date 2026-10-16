@@ -1,0 +1,159 @@
+// Arithmetic, shift, `&`, `^` and `|` are five operator groups with no order among them
+// (sections/02_syntax.md §2.19, "Integer Operator Groups"). A bare operand of a second group is
+// the parse error MixedOperatorPrecedence (E1127), once per run of operators, and its help shows
+// the grouping C uses first and then the other one. Neither grouping is machine-applicable, so the
+// row carries no fix. A Bool operand of `&` or `|` is a type error whose help names `&&` or `||`,
+// and the retired W0702 explains itself by naming E1127.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/mixing_integer_operator_groups"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn check_json(name: Str, body: Str) -> ProcessResult {
+    write_file("{DIR}/{name}.bl", "fn main() \{\n    let x = 5\n    let y = 6\n    let z = 7\n{body}}\n")
+    sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json {name}.bl")
+}
+
+// Typecheck still runs after a parse error and reports on the tree the parser built for
+// recovery, so only the parser's rows are counted. A parse error other than E1127 would mean the
+// parser lost its place.
+fn parser_rows(out: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for row in out.trim().split("\n") {
+        if row.contains("\"code\":\"E11") { rows.push(row) }
+    }
+    rows
+}
+
+// One representative per arithmetic operator, so `*` and `+` each meet every other group.
+fn int_ops() -> List[Str] {
+    ["+", "-", "*", "/", "%", "<<", ">>", "&", "^", "|"]
+}
+
+fn group_of(op: Str) -> Int {
+    if op == "<<" || op == ">>" { return 2 }
+    if op == "&" { return 3 }
+    if op == "^" { return 4 }
+    if op == "|" { return 5 }
+    1
+}
+
+test "each pair of operators from two groups is one E1127 on its line, with no fix" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut body = ""
+    let mut want: List[Str] = []
+    // The source starts with `fn main() {` and three lets, so the first case is on line 5.
+    let mut line = 5
+    for a in int_ops() {
+        for b in int_ops() {
+            if group_of(a) != group_of(b) {
+                body = body.concat("    let _ = x {a} y {b} z\n")
+                want.push("{a} {b} @ {line}")
+                line = line + 1
+            }
+        }
+    }
+    let r = check_json("pairs", body)
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(r.exit_code, 1)
+    let rows = parser_rows(r.err_out)
+    let mut problems: List[Str] = []
+    if rows.len() != want.len() { problems.push("want {want.len()} rows, got {rows.len()}:\n{r.err_out}") }
+    let mut i = 0
+    while i < rows.len() && i < want.len() {
+        let row = rows.get(i).unwrap()
+        let w = want.get(i).unwrap()
+        let want_line = w.split("@ ").get(1).unwrap()
+        if !row.contains("\"code\":\"E1127\"") { problems.push("{w}: want E1127 in {row}") }
+        if !row.contains("\"line\":{want_line},") { problems.push("{w}: want line {want_line} in {row}") }
+        if row.contains("\"fix\"") { problems.push("{w}: E1127 must not carry a fix: {row}") }
+        i = i + 1
+    }
+    assert_eq(problems.join("\n"), "")
+}
+
+test "a run that mixes several groups is one E1127" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let r = check_json("run", "    let _ = x + y << z & x | y ^ z\n")
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(r.exit_code, 1)
+    let rows = parser_rows(r.err_out)
+    assert_eq(rows.len(), 1)
+    assert(rows.get(0).unwrap().contains("\"code\":\"E1127\""), r.err_out)
+}
+
+type HelpCase {
+    expr: Str
+    message: Str
+    help: Str
+}
+
+fn help_cases() -> List[HelpCase] {
+    [
+        HelpCase { expr: "x << y + 1", message: "`<<` and `+` have no order between them", help: "write `x << (y + 1)` (the grouping C uses) or `(x << y) + 1`" },
+        HelpCase { expr: "x << 24 | y << 16", message: "`|` and `<<` have no order between them", help: "write `(x << 24) | (y << 16)` (the grouping C uses) or `x << (24 | y) << 16`" },
+        HelpCase { expr: "x | y & 3", message: "`|` and `&` have no order between them", help: "write `x | (y & 3)` (the grouping C uses) or `(x | y) & 3`" },
+        HelpCase { expr: "x * 31 ^ y", message: "`^` and `*` have no order between them", help: "write `(x * 31) ^ y` (the grouping C uses) or `x * (31 ^ y)`" },
+        // The operands are quoted as written, parentheses and calls included.
+        HelpCase { expr: "(x + 1) << y.abs() + z", message: "`<<` and `+` have no order between them", help: "write `(x + 1) << (y.abs() + z)` (the grouping C uses) or `((x + 1) << y.abs()) + z`" },
+        // An operand over several lines is put on one line.
+        HelpCase { expr: "x | (\n        y & 3) ^ 1", message: "`|` and `^` have no order between them", help: "write `x | ((y & 3) ^ 1)` (the grouping C uses) or `(x | (y & 3)) ^ 1`" },
+    ]
+}
+
+test "the help shows the C grouping first and then the other one, verbatim" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    let mut n = 0
+    for c in help_cases() {
+        let r = check_json("help{n}", "    let _ = {c.expr}\n")
+        let rows = parser_rows(r.err_out)
+        if rows.len() != 1 {
+            problems.push("{c.expr}: want one row, got:\n{r.err_out}")
+        } else {
+            let row = rows.get(0).unwrap()
+            if !row.contains("\"message\":\"{c.message}\"") { problems.push("{c.expr}: want message {c.message} in {row}") }
+            if !row.contains("\"help\":\"{c.help}\"") { problems.push("{c.expr}: want help {c.help} in {row}") }
+        }
+        n = n + 1
+    }
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(problems.join("\n"), "")
+}
+
+test "a mix inside an interpolation is E1127, not an interpolation parse failure" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let r = check_json("interp", "    io.println(\"a \{x << y + 1} b\")\n")
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(r.exit_code, 1)
+    let rows = parser_rows(r.err_out)
+    assert_eq(rows.len(), 1)
+    assert(rows.get(0).unwrap().contains("\"code\":\"E1127\""), r.err_out)
+}
+
+test "a Bool operand of & or | is a type error whose help names the logical operator" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let and_r = check_json("bool_and", "    let a = x < y\n    let b = y < z\n    let _ = a & b\n")
+    let or_r = check_json("bool_or", "    let a = x < y\n    let b = y < z\n    let _ = a | b\n")
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(and_r.exit_code, 1)
+    assert(and_r.err_out.contains("\"code\":\"E0300\""), and_r.err_out)
+    assert(and_r.err_out.contains("write `&&`"), and_r.err_out)
+    assert_eq(or_r.exit_code, 1)
+    assert(or_r.err_out.contains("\"code\":\"E0300\""), or_r.err_out)
+    assert(or_r.err_out.contains("write `||`"), or_r.err_out)
+}
+
+test "blink explain W0702 says the code is retired and names E1127" {
+    let r = sh("build/blink explain W0702")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("BitwisePrecedence (retired)"), r.out)
+    assert(r.out.contains("MixedOperatorPrecedence (E1127)"), r.out)
+    let e = sh("build/blink explain E1127")
+    assert_eq(e.exit_code, 0)
+    assert(e.out.contains("E1127 -- MixedOperatorPrecedence"), e.out)
+}
