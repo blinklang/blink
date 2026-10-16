@@ -1483,7 +1483,7 @@ This is what makes a single-payload enum a real newtype: `type Errno { Errno(Int
 
 **Tag Operations.** Three operations use an enum's integer tag: comparison with an `Int`, `Enum.to_int()` and `Enum.from_int()`. They are defined only on a **fieldless enum**, an enum whose variants all have no payload.
 
-- **Comparison with `Int`.** The comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) are defined between a fieldless enum and `Int`. They compare the enum's tag with the `Int` and yield `Bool`. This is a comparison, not an assignability claim, so it does not weaken the nominal distinctness above.
+- **Comparison with `Int`.** The comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) are defined between a fieldless enum and `Int`. They compare the enum's tag with the `Int` and yield `Bool`. This is a comparison, not an assignability claim, so it does not weaken the nominal distinctness above. A comparison of two values of the same fieldless enum is not a tag operation: it is the enum's `Ord` (§3.6 *Container Equality*, *Enum Ord*).
 - **Crossing the boundary is explicit.** To get the tag as an `Int`, use `Enum.to_int()` (total). To go the other way, use `Enum.from_int(n) -> Option[Enum]`. It is fallible, because an arbitrary `Int` may not be a valid tag. There is no implicit coercion and no cast operator.
 
 ```blink
@@ -3129,6 +3129,36 @@ type Bag { Items(xs: List[Widget])  Empty }     // error[NonDerivableTrait] (E14
 - **A redundant derive is legal.** `@derive(Eq)` on a fieldless enum is allowed, with no error and no warning. The compiler checks it as it checks any `@derive`.
 - **The first payload.** When a fieldless enum gets its first payload variant, `==` on it is an error until the declaration has `@derive(Eq)` or an `impl Eq`.
 - **Recursive types.** `@derive(Eq)` and `impl Eq` on a recursive type resolve coinductively: while the compiler checks the payloads, it assumes that the type is `Eq`. This applies to a type that contains itself (`type Tree { Leaf  Node(kids: List[Tree]) }`), to two or more types that contain each other, also across modules, and to a generic type such as `Tree[T]`, where the derive adds the bound `T: Eq` (§3.6.1 *Generic Type Bound Inference*).
+
+**Enum Ord.** A fieldless enum is also `Ord` with no derive and no impl. Its order is declaration order: a variant declared earlier is less than a variant declared later (vote: 6-0; see [Enum Ord rationale](../decisions/enum-ord.md)). This is the real `Ord` instance, so `.cmp()` works, a `T: Ord` bound accepts the enum, a tuple that holds it is `Ord`, and `@derive(Ord)` accepts a field of its type. An enum with at least one payload is `Ord` only through `@derive(Ord)` or a written `impl Ord`, the same as a struct. The payload types alone never make an enum `Ord`. `<`, `<=`, `>`, `>=` or `.cmp()` on an enum that is not `Ord` is a compile error that names the missing `Ord`.
+
+```blink
+type Priority { Low  Medium  High }
+
+@derive(Ord)
+type Task { p: Priority  id: Int }                     // OK: `Priority` is `Ord`
+
+type Shape { Circle(r: Int)  Sq(s: Int) }
+
+fn biggest[T: Ord](a: T, b: T) -> T {
+    if a > b { a } else { b }
+}
+
+fn main() {
+    let top = biggest(Priority.Low, Priority.High)     // Priority.High
+    let o = Priority.Medium.cmp(Priority.Low)          // Greater
+    let t = (Priority.Low, 9) < (Priority.High, 0)     // true
+    let bad = Shape.Circle(1) < Shape.Circle(2)        // error: `Shape` does not implement `Ord`
+                                                       //   help: add `@derive(Ord)` to `Shape`
+}
+```
+
+- **Two traits, from the declaration.** The declaration of a fieldless enum gives it `Eq` and `Ord`, as an implicit derive, while the enum is fieldless as written. It gives no other trait: `Hash`, `Display`, `Debug`, `Clone` and `Serialize` each still need a `@derive` or an `impl`. So `Set[Priority]` needs `@derive(Hash)` on `Priority`. An explicit `@derive(Eq)` or `@derive(Ord)` names the same instance. It is legal, with no error and no warning.
+- **No `impl Ord` on a fieldless enum.** A written `impl Ord for E`, where `E` is a fieldless enum, is a compile error, as a written `impl Eq` is. A second order would make `<` on `E` disagree with the comparison with `Int` and with `to_int()`. One diagnostic code covers a written `impl Eq` and a written `impl Ord` on a fieldless enum. The message names the trait that the user wrote and gives the reason. A second label points at the `type` line, where the built-in instance comes from. The help gives the fix in one line: for a different `Eq`, a named method; for a different order, a named key method used with `sort_by` (*The `ListOps` Trait*, §3.2.2). The `blink explain` page for the code also gives the second fix: when a `T: Ord` bound must hold with a different order, wrap the enum in a struct that has its own `impl Ord`.
+- **The order agrees with the tag.** For a fieldless enum `E` and any `a: E`, `b: E`: `a < b` exactly when `a.to_int() < b.to_int()`, and the same holds for `<=`, `>`, `>=` and for `a.cmp(b)` against `a.to_int().cmp(b.to_int())`. The compiler gives this guarantee, and no user code can break it, because no second order on `E` can be written. It does not apply to an enum with a payload, which has no `to_int()`.
+- **Str-backed enums.** A Str-backed enum (§3.4 *Str-Backed Enums*) is fieldless, so its order is declaration order, not the order of its backing strings. To compare by the strings, compare `a.to_str()` and `b.to_str()`.
+- **Generic fieldless enums.** `type Tag[T] { A  B }` is fieldless as written, so it is `Eq` and `Ord` with no bound on `T`.
+- **The first payload.** When a fieldless enum gets its first payload variant, it loses the implicit `Eq` and `Ord` together. `==`, `<` and `.cmp()` on it are errors until the declaration has the derives or impls.
 
 **Ord.** `Set` and `Map` never implement `Ord`: no order over them is canonical and agrees with membership equality.
 
