@@ -11432,82 +11432,105 @@ fn init_types() ! TypeCheck.Register {
     TYPE_NEVER = new_type(TyKind.Never, "Never")
 }
 
+// Declarations resolve their annotations in their own module, so a bare namesake reads
+// as the declaring module's type. The caller's module comes back after: the module context
+// also gates the used-import bookkeeping, which these passes must not touch.
+fn tc_register_type_decls(types_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    let saved_module = nr_current_module
+    tc_register_type_decls_in_own_modules(types_sl)
+    nr_current_module = saved_module
+}
+
+fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    if types_sl == -1 { return }
+    tc_collect_namesake_type_names(types_sl)
+    let mut i = 0
+    while i < sublist_length(types_sl) {
+        let td = sublist_get(types_sl, i)
+        let td_flds = node_fields(td)
+        let mut is_enum = 0
+        if td_flds != -1 && sublist_length(td_flds) > 0 {
+            if node_kind(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
+                is_enum = 1
+            }
+        }
+        if is_enum != 0 {
+            register_enum_type(td)
+        } else {
+            register_struct_type(td)
+        }
+        i = i + 1
+    }
+    // Before any annotation resolves, so an alias underlying or a field that applies a
+    // generic type already sees which of its parameters must be hashable.
+    tc_compute_type_hash_obligations(types_sl)
+    // Second pass: resolve each alias's underlying type now that every type
+    // name is interned, so a target declared textually after the alias
+    // resolves to its real instance tid instead of an orphan typevar.
+    let mut j = 0
+    while j < sublist_length(types_sl) {
+        let atd = sublist_get(types_sl, j)
+        let alias_ann = node_value(atd)
+        if alias_ann != -1 {
+            // The alias's own binders are in scope inside its underlying type, so
+            // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
+            // variable there, not the constructor (§3.4:1259).
+            let alias_tparams = node_type_params(atd)
+            nr_current_module = node_module(atd)
+            tc_push_tparam_scope(alias_tparams)
+            tc_alias_underlying.insert(tc_nominal_type_name(atd), resolve_type_ann(alias_ann))
+            tc_pop_tparam_scope(alias_tparams)
+        }
+        j = j + 1
+    }
+    // Third pass: resolve enum variant payloads and struct field types.
+    // Deferred to here so a payload or field that names an alias
+    // (`Wrap(o: MB)`, `items: List[MB]`) peels through a fully-populated
+    // tc_alias_underlying regardless of declaration order. An alias node has
+    // no fields, so resolve_struct_fields is a no-op for it.
+    let mut k = 0
+    while k < sublist_length(types_sl) {
+        let etd = sublist_get(types_sl, k)
+        nr_current_module = node_module(etd)
+        let etd_flds = node_fields(etd)
+        let mut is_enum = 0
+        if etd_flds != -1 && sublist_length(etd_flds) > 0 {
+            if node_kind(sublist_get(etd_flds, 0)) == NodeKind.TypeVariant {
+                is_enum = 1
+            }
+        }
+        if is_enum != 0 {
+            resolve_enum_variants(etd)
+        } else {
+            resolve_struct_fields(etd)
+        }
+        k = k + 1
+    }
+}
+
+fn tc_register_fn_sigs(fns_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    let saved_module = nr_current_module
+    tc_register_fn_sigs_in_own_modules(fns_sl)
+    nr_current_module = saved_module
+}
+
+fn tc_register_fn_sigs_in_own_modules(fns_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    let mut i = 0
+    while i < sublist_length(fns_sl) {
+        let fn_node = sublist_get(fns_sl, i)
+        nr_current_module = node_module(fn_node)
+        register_fn_sig(fn_node)
+        i = i + 1
+    }
+}
+
 pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if trace_mode != "" { trace("typecheck", "start") }
     init_types()
 
     // Register all type definitions (structs and enums)
     let types_sl = node_fields(program)
-    // Declarations resolve their annotations in their own module, so a bare namesake reads
-    // as the declaring module's type. Restored after each pass: the module context also
-    // gates the used-import bookkeeping, which these passes must not touch.
-    let saved_module = nr_current_module
-    if types_sl != -1 {
-        tc_collect_namesake_type_names(types_sl)
-        let mut i = 0
-        while i < sublist_length(types_sl) {
-            let td = sublist_get(types_sl, i)
-            let td_flds = node_fields(td)
-            let mut is_enum = 0
-            if td_flds != -1 && sublist_length(td_flds) > 0 {
-                if node_kind(sublist_get(td_flds, 0)) == NodeKind.TypeVariant {
-                    is_enum = 1
-                }
-            }
-            if is_enum != 0 {
-                register_enum_type(td)
-            } else {
-                register_struct_type(td)
-            }
-            i = i + 1
-        }
-        // Before any annotation resolves, so an alias underlying or a field that applies a
-        // generic type already sees which of its parameters must be hashable.
-        tc_compute_type_hash_obligations(types_sl)
-        // Second pass: resolve each alias's underlying type now that every type
-        // name is interned, so a target declared textually after the alias
-        // resolves to its real instance tid instead of an orphan typevar.
-        let mut j = 0
-        while j < sublist_length(types_sl) {
-            let atd = sublist_get(types_sl, j)
-            let alias_ann = node_value(atd)
-            if alias_ann != -1 {
-                // The alias's own binders are in scope inside its underlying type, so
-                // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
-                // variable there, not the constructor (§3.4:1259).
-                let alias_tparams = node_type_params(atd)
-                nr_current_module = node_module(atd)
-                tc_push_tparam_scope(alias_tparams)
-                tc_alias_underlying.insert(tc_nominal_type_name(atd), resolve_type_ann(alias_ann))
-                tc_pop_tparam_scope(alias_tparams)
-            }
-            j = j + 1
-        }
-        // Third pass: resolve enum variant payloads and struct field types.
-        // Deferred to here so a payload or field that names an alias
-        // (`Wrap(o: MB)`, `items: List[MB]`) peels through a fully-populated
-        // tc_alias_underlying regardless of declaration order. An alias node has
-        // no fields, so resolve_struct_fields is a no-op for it.
-        let mut k = 0
-        while k < sublist_length(types_sl) {
-            let etd = sublist_get(types_sl, k)
-            nr_current_module = node_module(etd)
-            let etd_flds = node_fields(etd)
-            let mut is_enum = 0
-            if etd_flds != -1 && sublist_length(etd_flds) > 0 {
-                if node_kind(sublist_get(etd_flds, 0)) == NodeKind.TypeVariant {
-                    is_enum = 1
-                }
-            }
-            if is_enum != 0 {
-                resolve_enum_variants(etd)
-            } else {
-                resolve_struct_fields(etd)
-            }
-            k = k + 1
-        }
-    }
-    nr_current_module = saved_module
+    tc_register_type_decls(types_sl)
 
     // Kind A: a struct name equal to an enum variant name is a hard error (E0518).
     // Detected over the whole-program symbol table (catches cross-module collisions).
@@ -11523,14 +11546,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Register all function signatures
     let fns_sl = node_params(program)
     if fns_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(fns_sl) {
-            let fn_node = sublist_get(fns_sl, i)
-            nr_current_module = node_module(fn_node)
-            register_fn_sig(fn_node)
-            i = i + 1
-        }
-        nr_current_module = saved_module
+        tc_register_fn_sigs(fns_sl)
     }
 
     // Validate FFI annotations and Ptr[T] usage
@@ -15060,23 +15076,31 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     let tests_sl = node_captures(program)
     if tests_sl != -1 {
         nr_current_module = "__main__"
-        // The let arm infers a call initializer during this walk, and the test-only fences
-        // it can reach ask whether the code is lexically in a test.
-        let prev_in_test_lex = tc_in_test_lexical
-        tc_in_test_lexical = 1
-        let mut i = 0
-        while i < sublist_length(tests_sl) {
-            let tb = sublist_get(tests_sl, i)
-            let tbody = node_body(tb)
-            if tbody != -1 {
-                nr_check_node(tbody)
-            }
-            i = i + 1
-        }
-        tc_in_test_lexical = prev_in_test_lex
+        nr_check_test_bodies(tests_sl)
     }
 
     nr_pop_scope()
+}
+
+// The let arm infers a call initializer during this walk, and the test-only fences
+// it can reach ask whether the code is lexically in a test.
+fn nr_check_test_bodies(tests_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let prev_in_test_lex = tc_in_test_lexical
+    tc_in_test_lexical = 1
+    nr_check_test_bodies_in_test(tests_sl)
+    tc_in_test_lexical = prev_in_test_lex
+}
+
+fn nr_check_test_bodies_in_test(tests_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut i = 0
+    while i < sublist_length(tests_sl) {
+        let tb = sublist_get(tests_sl, i)
+        let tbody = node_body(tb)
+        if tbody != -1 {
+            nr_check_node(tbody)
+        }
+        i = i + 1
+    }
 }
 
 // The declaration's own type parameters are in scope for every annotation it writes, so
@@ -15117,10 +15141,20 @@ fn nr_check_type_decl(td: Int) ! TypeCheck.Resolve, Diag.Report {
 fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Before the scope, because the warnings this walk raises are raised by CLOSING it.
     diag_enter_allows(fn_node)
-    // This walk raises diagnostics that read the enclosing function's annotations, and it
-    // runs before tc_check_fn, which is the other writer of this.
+    nr_check_fn_as_current(fn_node)
+    diag_exit_allows()
+}
+
+// This walk raises diagnostics that read the enclosing function's annotations, and it
+// runs before tc_check_fn, which is the other writer of this.
+fn nr_check_fn_as_current(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let prev_fn_node = tc_current_fn_node
     tc_current_fn_node = fn_node
+    nr_check_fn_scope(fn_node)
+    tc_current_fn_node = prev_fn_node
+}
+
+fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     nr_push_scope()
     // Bind this fn's own type params so a single-letter annotation resolves as a
     // declared type variable rather than an unknown type. Enclosing impl binders
@@ -15164,8 +15198,6 @@ fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     }
     tc_pop_tparam_scope(fn_tparams)
     nr_pop_scope()
-    tc_current_fn_node = prev_fn_node
-    diag_exit_allows()
 }
 
 fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -16714,10 +16746,7 @@ fn infer_arm_body(arm: Int, scrut_tid: Int) -> Int ! TypeCheck.Resolve, TypeChec
     // placeholder, so the two need not be the same value.
     if b == -1 { return -1 }
     nr_push_scope()
-    let saved_pat = tc_pattern_binding_type
-    tc_pattern_binding_type = scrut_tid
-    tc_check_pattern_types(node_pattern(arm))
-    tc_pattern_binding_type = saved_pat
+    tc_check_pattern_types_against(node_pattern(arm), scrut_tid)
     tc_check_arm_guard(arm)
     // Infer the BODY NODE whatever its shape. infer_type answers for the statement kinds a
     // braceless arm produces (ExprStmt passes through to its value, a control transfer is
@@ -22247,6 +22276,65 @@ fn tc_check_enum_pattern_scrutinee(pat: Int, scrut_tid: Int) ! Diag.Report {
         "match the enum itself, or cross the boundary explicitly with {qual}.from_int(...), which answers Option[{qual}]")
 }
 
+// Installs `hint` as the construction hint for one walk of `node`, then puts the caller's back.
+fn tc_check_body_with_hint(node: Int, hint: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = hint
+    tc_check_body(node)
+    tc_construct_hint = saved_hint
+}
+
+// A let's value is inferred under the let's own hint, and with its binder named so an
+// `FfiScope` misuse repair carries the author's name.
+fn tc_infer_let_value(val: Int, binder: Str, hint: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = hint
+    let saved_binder = tc_ffi_scope_binder
+    tc_ffi_scope_binder = binder
+    let t = tc_infer_value(val)
+    tc_ffi_scope_binder = saved_binder
+    tc_construct_hint = saved_hint
+    t
+}
+
+fn tc_check_pattern_types_against(pat: Int, binding_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_pat = tc_pattern_binding_type
+    tc_pattern_binding_type = binding_t
+    tc_check_pattern_types(pat)
+    tc_pattern_binding_type = saved_pat
+}
+
+fn tc_check_assert_panics_body(body: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let prev_in_ap = tc_in_assert_panics
+    tc_in_assert_panics = 1
+    tc_check_body_in_scope(body)
+    tc_in_assert_panics = prev_in_ap
+}
+
+fn tc_check_body_in_scope(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    nr_push_scope()
+    tc_check_body(node)
+    nr_pop_scope()
+}
+
+fn tc_infer_returned_value_with_hint(val: Int, returns_value: Bool, hint: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = hint
+    let t = tc_infer_returned_value(val, returns_value)
+    tc_construct_hint = saved_hint
+    t
+}
+
+fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // A closure in return position takes its signature from the declared return, the
+    // same way a call argument takes it from the formal. Seeded before the value is
+    // inferred and walked, which is where the closure body reads it. Inside a closure
+    // body tc_current_fn_ret still names the ENCLOSING fn, so seeding there would
+    // publish another function's signature on this closure.
+    if returns_value && tc_in_closure_depth == 0 { tc_seed_expected_into_value(val, tc_current_fn_ret) }
+    if returns_value { tc_infer_value(val) } else { infer_type(val) }
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Read-then-zero before anything can recurse, so a nested walk never inherits it.
     let in_value = tc_walk_value_tail
@@ -22287,11 +22375,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // of inference with none. Installed around the WALK, not around the tail compare
                 // further down: the walk is what publishes the node tids, and the compare re-reads
                 // what the walk already decided.
-                let saved_tail_hint = tc_construct_hint
-                if stmt == hint_tail { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
+                let stmt_hint = if stmt == hint_tail { resolve_alias_tid(tc_current_fn_ret) } else { tc_construct_hint }
                 if stmt == value_tail { tc_walk_value_tail = 1 }
-                tc_check_body(stmt)
-                tc_construct_hint = saved_tail_hint
+                tc_check_body_with_hint(stmt, stmt_hint)
                 let sk = node_kind(stmt)
                 if sk == NodeKind.Return || sk == NodeKind.Break || sk == NodeKind.Continue {
                     _found_terminal = 1
@@ -22350,16 +22436,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let mut inferred_tid = TYPE_UNKNOWN
         if val != -1 {
             tc_seed_expected_into_value(val, declared_tid)
-            let saved_hint = tc_construct_hint
-            if tc_tid_is_no_info(declared_tid) == 0 { tc_construct_hint = resolve_alias_tid(declared_tid) }
+            let let_hint = if tc_tid_is_no_info(declared_tid) == 0 { resolve_alias_tid(declared_tid) } else { tc_construct_hint }
             // A let binding is expression context (§2.9): infer in value context so an else-less
             // `if` as its value (no value on the false path) is rejected regardless of the
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
-            let saved_binder = tc_ffi_scope_binder
-            tc_ffi_scope_binder = vname
-            inferred_tid = tc_infer_value(val)
-            tc_ffi_scope_binder = saved_binder
-            tc_construct_hint = saved_hint
+            inferred_tid = tc_infer_let_value(val, vname, let_hint)
             // What the inference above wrote for the value's tail, read BEFORE the walk below
             // retypes it in scope. A tail that names a binding the value's own construct
             // introduces was resolved against the enclosing scope, so a name it SHADOWS
@@ -22666,10 +22747,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // The ELEMENT type is the binding hint: a destructured `for (k, v) in m` needs the
             // same tuple decomposition the match path gets. Without the hint the TuplePattern
             // arm takes its `tup_start == -1` path and types both leaves as untyped.
-            let tc_saved_pat_hint = tc_pattern_binding_type
-            tc_pattern_binding_type = elem_t
-            tc_check_pattern_types(tc_for_pat_node)
-            tc_pattern_binding_type = tc_saved_pat_hint
+            tc_check_pattern_types_against(tc_for_pat_node, elem_t)
         }
         tc_check_body(node_body(node))
         nr_pop_scope()
@@ -22853,12 +22931,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_error_at("assert_panics matching: must be Str, got {type_to_str(mt)}", node)
             }
         }
-        let prev_in_ap = tc_in_assert_panics
-        tc_in_assert_panics = 1
-        nr_push_scope()
-        tc_check_body(node_body(node))
-        nr_pop_scope()
-        tc_in_assert_panics = prev_in_ap
+        tc_check_assert_panics_body(node_body(node))
         return
     }
 
@@ -22928,21 +23001,13 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.Return {
         let val = node_value(node)
         if val != -1 {
-            let saved_hint = tc_construct_hint
             // An explicit `return` is expression context (§2.9) ONLY when the fn returns a
             // value: infer in value context there so an else-less `if` (no value on the false
             // path) is rejected. `return if c { .. }` in a `-> ()` fn is statement context —
             // the returned value is discarded — so it stays legal (plain infer, flag off).
             let returns_value = tc_fn_returns_value()
-            if returns_value { tc_construct_hint = resolve_alias_tid(tc_current_fn_ret) }
-            // A closure in return position takes its signature from the declared return, the
-            // same way a call argument takes it from the formal. Seeded before the value is
-            // inferred and walked, which is where the closure body reads it. Inside a closure
-            // body tc_current_fn_ret still names the ENCLOSING fn, so seeding there would
-            // publish another function's signature on this closure.
-            if returns_value && tc_in_closure_depth == 0 { tc_seed_expected_into_value(val, tc_current_fn_ret) }
-            let val_t = if returns_value { tc_infer_value(val) } else { infer_type(val) }
-            tc_construct_hint = saved_hint
+            let ret_hint = if returns_value { resolve_alias_tid(tc_current_fn_ret) } else { tc_construct_hint }
+            let val_t = tc_infer_returned_value_with_hint(val, returns_value, ret_hint)
             // Shared with the implicit tail — see tc_check_returned_value for why each
             // guard is load-bearing. This arm stays necessary alongside the tail site: an
             // EARLY return inside an `if` is not the block's last statement, so the tail
@@ -23805,20 +23870,50 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     nr_scope_depth = 0
     nr_loop_depth = 0
     nr_push_scope()
-    // The E0301 region-boundary check is on for the WHOLE inference pass, not just
-    // inside tc_check_fn/tc_check_test_block. Turning it on here makes the check
-    // unconditional at module scope: the module-scope nr_pop_scope below runs it for
-    // every top-level binder that still holds a metavar in scope, so no future
-    // module-scope binder class can silently escape it the way the inline top-level
-    // report (the second-pass under-determined check) covers only unannotated lets.
-    // tc_check_fn/tc_check_test_block still save/restore around their own regions, so
-    // this only widens the region — it does not change their behaviour, and the
-    // module-scope pop is independent of the --incremental fn filter (fn bodies it
-    // skips report at their own site, not here). Reset to 0 by init_types before every
-    // run; restored at the end for symmetry.
+    tc_infer_program_with_boundary_check(program)
+}
+
+fn tc_check_trait_default_bodies(tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let prev_walk_ret = tc_current_fn_ret
+    tc_check_each_trait_default_body(tmethods_sl)
+    tc_current_fn_ret = prev_walk_ret
+}
+
+fn tc_check_each_trait_default_body(tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut mj = 0
+    while mj < sublist_length(tmethods_sl) {
+        let dm = sublist_get(tmethods_sl, mj)
+        if node_body(dm) != -1 {
+            // sig == -1 leaves tc_check_fn's declared-return install un-run, so
+            // set it here (Self resolves to the abstract self typevar) — an
+            // explicit `return expr` in the body is checked against it.
+            let dm_ann = node_type_ann(dm)
+            tc_current_fn_ret = if dm_ann == -1 { TYPE_VOID } else { resolve_type_ann(dm_ann) }
+            tc_check_fn(dm)
+        }
+        mj = mj + 1
+    }
+}
+
+// The E0301 region-boundary check is on for the WHOLE inference pass, not just
+// inside tc_check_fn/tc_check_test_block. Turning it on here makes the check
+// unconditional at module scope: the module-scope nr_pop_scope in the pass runs it for
+// every top-level binder that still holds a metavar in scope, so no future
+// module-scope binder class can silently escape it the way the inline top-level
+// report (the second-pass under-determined check) covers only unannotated lets.
+// tc_check_fn/tc_check_test_block still save/restore around their own regions, so
+// this only widens the region — it does not change their behaviour, and the
+// module-scope pop is independent of the --incremental fn filter (fn bodies it
+// skips report at their own site, not here). Reset to 0 by init_types before every
+// run; restored at the end for symmetry.
+fn tc_infer_program_with_boundary_check(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let prev_boundary = tc_boundary_check_active
     tc_boundary_check_active = 1
+    tc_infer_program_body(program)
+    tc_boundary_check_active = prev_boundary
+}
 
+fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Register top-level let bindings WITH their declared types so fn bodies that
     // reference a module-global see its real type. Annotated type is resolved
     // directly (never forward-references other globals, so order-independent).
@@ -23970,21 +24065,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
                 // missing-tail check (gated on sig != -1) does not run against the abstract
                 // `Self`. Only the operator / method licensing is wanted here.
                 tc_current_method_sig_key = "__trait_default_no_sig__"
-                let prev_walk_ret = tc_current_fn_ret
-                let mut mj = 0
-                while mj < sublist_length(tmethods_sl) {
-                    let dm = sublist_get(tmethods_sl, mj)
-                    if node_body(dm) != -1 {
-                        // sig == -1 leaves tc_check_fn's declared-return install un-run, so
-                        // set it here (Self resolves to the abstract self typevar) — an
-                        // explicit `return expr` in the body is checked against it.
-                        let dm_ann = node_type_ann(dm)
-                        tc_current_fn_ret = if dm_ann == -1 { TYPE_VOID } else { resolve_type_ann(dm_ann) }
-                        tc_check_fn(dm)
-                    }
-                    mj = mj + 1
-                }
-                tc_current_fn_ret = prev_walk_ret
+                tc_check_trait_default_bodies(tmethods_sl)
                 tc_current_method_sig_key = ""
                 tc_current_self_tid = -1
                 tc_pop_tparam_scope(node_type_params(trn))
@@ -24013,7 +24094,6 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     tc_ud_flush_pending()
     tc_ud_flush_calls()
     tc_flush_untyped_type_args()
-    tc_boundary_check_active = prev_boundary
 }
 
 // ── Debug / introspection ───────────────────────────────────────────

@@ -276,29 +276,42 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     // and comes back off after, leaving nothing for the next function to read.
     let ann = node_type_ann(fn_node)
     cg_expr_set_return_type(if ann < 0 { -1 } else { stmt_tid(ann) })
-    let saved_fn_name = cs_current_fn_name
-    cs_current_fn_name = node_name(fn_node)
-    let saved_ensures = cs_exit_ensures
-    let saved_where = cs_exit_where
-    cg_promote_body_enter()
-    let mut stmts = if bound && body >= 0 { contract_entry(fn_node, tail == TAIL_RETURN) } else { [] }
-    let block = if !bound || body < 0 { -1 } else if tail == TAIL_RETURN { lower_block_returning(body) } else { lower_block(body) }
-    // A function with no result falls off the end of its body, which is an exit too.
-    let falls_off = if block >= 0 && tail != TAIL_RETURN { contract_void_exit() } else { [] }
-    cg_promote_body_exit()
-    cs_exit_ensures = saved_ensures
-    cs_exit_where = saved_where
+    let (entry, block, falls_off) = lower_fn_body_as_current(fn_node, bound, tail, body)
     cg_expr_clear_old_snapshots()
-    cs_current_fn_name = saved_fn_name
     cg_expr_set_return_type(-1)
     close_scope()
     // A stopped body, a parameter with no type and a declaration with no body all leave
     // nothing worth printing, and the seam still answers a node.
     if block < 0 { return ir_block(fn_node, []) }
+    let mut stmts = entry
     if stmts.len() == 0 && falls_off.len() == 0 { return block }
     stmts.push(block)
     for check in falls_off { stmts.push(check) }
     ir_block(fn_node, stmts)
+}
+
+// The body's exit checks name this function and read its own @ensures and `where`
+// predicates, so the caller's come back once the body has lowered.
+fn lower_fn_body_as_current(fn_node: Int, bound: Bool, tail: Int, body: Int) -> (List[Int], Int, List[Int]) ! Diag.Report {
+    let saved_fn_name = cs_current_fn_name
+    cs_current_fn_name = node_name(fn_node)
+    let saved_ensures = cs_exit_ensures
+    let saved_where = cs_exit_where
+    let lowered = lower_fn_body_with_contracts(fn_node, bound, tail, body)
+    cs_exit_ensures = saved_ensures
+    cs_exit_where = saved_where
+    cs_current_fn_name = saved_fn_name
+    lowered
+}
+
+fn lower_fn_body_with_contracts(fn_node: Int, bound: Bool, tail: Int, body: Int) -> (List[Int], Int, List[Int]) ! Diag.Report {
+    cg_promote_body_enter()
+    let stmts = if bound && body >= 0 { contract_entry(fn_node, tail == TAIL_RETURN) } else { [] }
+    let block = if !bound || body < 0 { -1 } else if tail == TAIL_RETURN { lower_block_returning(body) } else { lower_block(body) }
+    // A function with no result falls off the end of its body, which is an exit too.
+    let falls_off = if block >= 0 && tail != TAIL_RETURN { contract_void_exit() } else { [] }
+    cg_promote_body_exit()
+    (stmts, block, falls_off)
 }
 
 // ── Contracts ─────────────────────────────────────────────────────────────
