@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.55.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.56.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.55`, `0.55.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.56`, `0.56.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -49,7 +49,7 @@ fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! FFI
 fn malloc(size: Int) -> Ptr[Int] ! FFI
 ```
 
-`@trusted(audit: "ID")` marks an FFI function as audited for safety. The `audit:` text is required: a bare `@trusted` or an empty `audit:` is `E0836`. The text is free-form (a ticket or review ID). `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead.
+`@trusted(audit: "ID")` marks an FFI function as audited for safety. The `audit:` text is required: a bare `@trusted` or an empty `audit:` is `E0836`. The text is free-form (a ticket or review ID). `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead. A `@trusted` fn, as an `@ffi` fn, may name `Ptr[T]`, or an `@ffi.struct` that holds a `Ptr`, in its signature; elsewhere that is `E0811`.
 
 ### Ptr[T] Type
 

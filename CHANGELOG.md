@@ -2,6 +2,23 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.56.0)
+
+### Operators
+- **Shifts and bitwise operators bind tighter than comparison.** Arithmetic, shifts, `&`, `^` and `|` form five operator groups with no order among them, and each binds tighter than comparison. `flags & 15 == 0` now means `(flags & 15) == 0`; before, it was a type error.
+- **Mixing two operator groups without parentheses is E1127 MixedOperatorPrecedence.** A bare operand such as `x << n + 1` or `a | b & c` is a parse error. The help writes out the C grouping first, then the other one, so a fix to code ported from C is mechanical. One group still chains without parentheses: `a | b | c` is valid. `blink fmt` adds parentheses around a shift or bitwise operand of a comparison.
+- **W0702 BitwisePrecedence is retired.** `blink explain W0702` says so and names E1127.
+
+### Closures
+- **An unannotated `map` or `flat_map` closure takes its result type from its body.** This applies to `List` and `Iterator`. Before, `blink check` typed the call as the element type of the receiver, so it accepted a `Str` used as an `Int`. Such code is now a type error. A named fn passed to `map` keeps its return type.
+
+## What's New (v0.56.0)
+
+- **Release binaries for linux-aarch64.** `install.sh` accepts it.
+- **`blink build -T <target>` builds the stdlib for that target with zig**, so a cross build links. Before, it linked the host's archive and failed in the linker. An install without the stdlib source gets a "reinstall" error instead of a linker error.
+- **A `@trusted` fn may name `Ptr[T]`, or an `@ffi.struct` that holds a `Ptr`, in its signature.** Before, this was E0811. E0811's text now states the FFI region rule.
+- **A `Bool` operand of `&` or `|` gets a help that names `&&` or `||`.**
+
 ## Breaking Changes (v0.55.0)
 
 ### Strings

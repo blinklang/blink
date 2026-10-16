@@ -31,7 +31,7 @@ Build output: build/ (gitignored)
 
 ## Build & Verify
 
-Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Needs build/blinkc + build/blink that match this tree's runtime ABI. Seed them from the pinned gen0: `task gen0`, then `cp build/gen0/bin/blinkc build/gen0/bin/blink build/`. The blink on PATH (0.53.1) and any build/ binary from before the rewrite cannot compile this tree
+Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Needs build/blinkc + build/blink that match this tree's runtime ABI. Seed them from the pinned gen0: `task gen0`, then `cp build/gen0/bin/blinkc build/gen0/bin/blink build/`. An installed blink from before the rewrite (such as 0.53.1) and any build/ binary from before the rewrite cannot compile this tree
 Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point). Runs once build/ is seeded as above
 Adding a lib/std or lib/pkg module: `task regen` refreshes the embedded registry. Without a seeded build/, run `./scripts/gen_embedded_stdlib.sh` and commit src/embedded_stdlib_registry.bl; `task ci` checks it
 Known-good compilers: /home/nhumrich/blinklang/compilers/ holds every gen0 pin (MANIFEST.txt has version + sha256). Copy each new pin there before installing it. Recover from a miscompile with `BLINK_GEN0_SEED=<dir>/bin/blink` or by copying a dir back to build/gen0
