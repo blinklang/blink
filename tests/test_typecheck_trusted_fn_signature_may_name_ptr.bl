@@ -1,0 +1,82 @@
+// sections/07_trust_modules_metadata.md §9.1.3: the body of an `@trusted` function is an FFI
+// region, as the body of an `@ffi` function is, and its pointer-bearing parameters are part
+// of the audited surface. So its signature may name `Ptr[T]` and a Ptr-bearing
+// `@ffi.struct`; E0811 still holds for a plain function.
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count, diag_explain}
+import std.io
+
+// Checks `src` and answers every error as `Name@line`, one per line, in emit order.
+fn errors_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    assert_eq(diag_ice_count, 0)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = "{out}{d.name}@{d.line}\n" }
+    }
+    io.println("{stem}: {out}")
+    out
+}
+
+// The message of the first error named `name`, or "" when there is none.
+fn message_of(name: Str) -> Str {
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name { return d.message }
+    }
+    ""
+}
+
+let IOVEC = #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+"#
+
+test "an @trusted fn may take a Ptr parameter" {
+    assert_eq(errors_in("tfs_ptr_param", #"@trusted(audit: "MEM-1")
+fn first(p: Ptr[U8]) -> Bool {
+    p.is_null()
+}
+fn main() { }
+"#), "")
+}
+
+test "an @trusted fn may return a Ptr" {
+    assert_eq(errors_in("tfs_ptr_return", #"@trusted(audit: "MEM-2")
+fn none() -> Ptr[U8] {
+    null_ptr[U8]()
+}
+fn main() { }
+"#), "")
+}
+
+test "an @trusted fn may take a Ptr-bearing @ffi.struct parameter" {
+    assert_eq(errors_in("tfs_struct_param", "{IOVEC}@trusted(audit: \"MEM-3\")\nfn len_of(v: IoVec) -> U64 \{\n    v.iov_len\n}\nfn main() \{ }\n"), "")
+}
+
+test "a plain fn with a Ptr parameter is still E0811, and the message names the FFI region rule" {
+    assert_eq(errors_in("tfs_plain_ptr", #"fn first(p: Ptr[U8]) -> Bool {
+    p.is_null()
+}
+fn main() { }
+"#), "PtrOutsideFFI@1\n")
+    let msg = message_of("PtrOutsideFFI")
+    assert(msg.contains("FFI region"))
+    assert(msg.contains("@trusted function"))
+    assert(!msg.contains("@trusted blocks"))
+}
+
+test "the E0811 explain text names @trusted functions as FFI regions" {
+    let text = diag_explain("E0811")
+    assert(text.contains("@trusted"))
+    assert(!text.contains("not marked @ffi."))
+}
