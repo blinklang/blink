@@ -296,3 +296,58 @@ test "W0551 fires for unsaved call in sibling block" {
     let output = compile_test_helpers.compile_and_capture(src, "_test_ma_w0551_sibling")
     compile_test_helpers.expect_warning(output, "UnrestoredMutation", "W0551 fires for unsaved call in sibling block")
 }
+
+// §4.16.7 puts no limit on where the call sits: the spec example checks a call
+// whose result a `let` binds, so a call in any expression position counts.
+test "W0550 fires for a call in a let value" {
+    let src = "let mut g = 0\nlet mut h = 0\nfn w() -> Int \{\n    g = 1\n    h = 1\n    0\n}\nfn f() -> Int \{\n    let s = g\n    let x = w()\n    g = s\n    x\n}\nfn main() \{\n    let _ = f()\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_w0550_let_value")
+    compile_test_helpers.expect_warning(output, "IncompleteStateRestore", "W0550 fires for a call in a let value")
+}
+
+test "W0550 fires for a call nested in a binop" {
+    let src = "let mut g = 0\nlet mut h = 0\nfn w() -> Int \{\n    g = 1\n    h = 1\n    0\n}\nfn f() -> Int \{\n    let s = g\n    let x = 1 + w()\n    g = s\n    x\n}\nfn main() \{\n    let _ = f()\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_w0550_binop")
+    compile_test_helpers.expect_warning(output, "IncompleteStateRestore", "W0550 fires for a call nested in a binop")
+}
+
+test "W0550 fires for a call in a call argument" {
+    let src = "let mut g = 0\nlet mut h = 0\nfn w() -> Int \{\n    g = 1\n    h = 1\n    0\n}\nfn id(x: Int) -> Int \{\n    x\n}\nfn f() -> Int \{\n    let s = g\n    let x = id(w())\n    g = s\n    x\n}\nfn main() \{\n    let _ = f()\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_w0550_call_arg")
+    compile_test_helpers.expect_warning(output, "IncompleteStateRestore", "W0550 fires for a call in a call argument")
+}
+
+test "W0550 fires for a call in an if condition" {
+    let src = "let mut g = 0\nlet mut h = 0\nfn w() -> Int \{\n    g = 1\n    h = 1\n    0\n}\nfn f() -> Int \{\n    let s = g\n    let mut x = 0\n    if w() == 0 \{\n        x = 1\n    }\n    g = s\n    x\n}\nfn main() \{\n    let _ = f()\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_w0550_if_cond")
+    compile_test_helpers.expect_warning(output, "IncompleteStateRestore", "W0550 fires for a call in an if condition")
+}
+
+// The save lives in a block that an `if` used as a let value holds. It covers
+// only that block: the outer call to `wg` writes the saved global but is not
+// covered, so it gets W0551 (the block's pattern makes `f` speculative), not
+// silence.
+test "save in an if-expression block is scoped to that block and makes the fn speculative" {
+    let src = "let mut g = 0\nlet mut h = 0\nfn w() -> Int \{\n    g = 1\n    h = 1\n    0\n}\nfn wg() \{\n    g = 2\n}\nfn f(c: Bool) -> Int \{\n    wg()\n    let v = if c \{\n        let s = g\n        let x = w()\n        g = s\n        x\n    } else \{\n        0\n    }\n    v\n}\nfn main() \{\n    let _ = f(true)\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_if_expr_block")
+    compile_test_helpers.expect_warning(output, "IncompleteStateRestore", "W0550 fires inside an if-expression block")
+    compile_test_helpers.expect_contains(output, "call to `wg` in `f` mutates [g]; these are not saved/restored", "W0551 fires for the unsaved outer call")
+}
+
+// A closure body does not run where the closure is defined, so the saves
+// around the definition say nothing about the calls inside it.
+test "W0550 does not fire for a call inside a closure body" {
+    let src = "let mut g = 0\nlet mut h = 0\nfn w() -> Int \{\n    g = 1\n    h = 1\n    0\n}\nfn f() -> Int \{\n    let s = g\n    let c = fn() -> Int \{ w() }\n    g = s\n    c()\n}\nfn main() \{\n    let _ = f()\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_closure_body")
+    assert(!output.contains("\"severity\":\"error\""))
+    assert(!output.contains("IncompleteStateRestore"))
+    assert(!output.contains("UnrestoredMutation"))
+}
+
+test "no warning when the whole write set is saved around a call in a let value" {
+    let src = "let mut g = 0\nlet mut h = 0\nfn w() -> Int \{\n    g = 1\n    h = 1\n    0\n}\nfn f() -> Int \{\n    let s = g\n    let t = h\n    let x = w()\n    g = s\n    h = t\n    x\n}\nfn main() \{\n    let _ = f()\n}\n"
+    let output = compile_test_helpers.compile_and_capture(src, "_test_ma_full_save_let_value")
+    assert(!output.contains("\"severity\":\"error\""))
+    assert(!output.contains("IncompleteStateRestore"))
+    assert(!output.contains("UnrestoredMutation"))
+}
