@@ -4,12 +4,12 @@ import lexer.{tokens}
 import std.path.{path_dirname}
 import diagnostics.{
     Diag, diag_error, diag_error_range, diag_source_file, diag_ice_abort, PARSER_INTERNAL_LIMIT, PARSER_INTERNAL_LIMIT_NAME,
-    diag_count, diag_entry_count, diag_truncate, diag_file_for_node,
+    diag_count, diag_entry_count, diag_errors_since, diag_truncate, diag_file_for_node,
     INLINE_MODULE_NOT_SUPPORTED, UNEXPECTED_ANNOTATION, UNEXPECTED_TOKEN,
     UNEXPECTED_TOKEN_STRING, UNEXPECTED_TOKEN_PATTERN, KEYWORD_AS_IDENTIFIER,
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
-    TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP,
+    TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE,
 }
 
 effect Parse {
@@ -4535,60 +4535,15 @@ fn parse_or() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 }
 
 fn parse_and() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let mut left = parse_bit_or()
-    while at(TokenKind.And) {
-        let op_line = peek_line()
-        let op_col = peek_col()
-        advance()
-        skip_newlines()
-        let right = parse_bit_or()
-        let nd = node_count()
-        node_push(AstNode { kind: NodeKind.BinOp, op: "&&", left: left, right: right, line: op_line, col: op_col })
-        left = nd
-    }
-    left
-}
-
-fn parse_bit_or() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let mut left = parse_bit_xor()
-    while at(TokenKind.Pipe) {
-        let op_line = peek_line()
-        let op_col = peek_col()
-        advance()
-        skip_newlines()
-        let right = parse_bit_xor()
-        let nd = node_count()
-        node_push(AstNode { kind: NodeKind.BinOp, op: "|", left: left, right: right, line: op_line, col: op_col })
-        left = nd
-    }
-    left
-}
-
-fn parse_bit_xor() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let mut left = parse_bit_and()
-    while at(TokenKind.Caret) {
-        let op_line = peek_line()
-        let op_col = peek_col()
-        advance()
-        skip_newlines()
-        let right = parse_bit_and()
-        let nd = node_count()
-        node_push(AstNode { kind: NodeKind.BinOp, op: "^", left: left, right: right, line: op_line, col: op_col })
-        left = nd
-    }
-    left
-}
-
-fn parse_bit_and() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let mut left = parse_equality()
-    while at(TokenKind.Amp) {
+    while at(TokenKind.And) {
         let op_line = peek_line()
         let op_col = peek_col()
         advance()
         skip_newlines()
         let right = parse_equality()
         let nd = node_count()
-        node_push(AstNode { kind: NodeKind.BinOp, op: "&", left: left, right: right, line: op_line, col: op_col })
+        node_push(AstNode { kind: NodeKind.BinOp, op: "&&", left: left, right: right, line: op_line, col: op_col })
         left = nd
     }
     left
@@ -4610,13 +4565,13 @@ fn parse_equality() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 }
 
 fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let mut left = parse_additive()
+    let mut left = parse_int_ops()
     while at(TokenKind.Less) || at(TokenKind.Greater) || at(TokenKind.LessEq) || at(TokenKind.GreaterEq) {
         let op_line = peek_line()
         let op_col = peek_col()
         let op = advance_value()
         skip_newlines()
-        let right = parse_additive()
+        let right = parse_int_ops()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
         left = nd
@@ -4624,49 +4579,230 @@ fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     left
 }
 
-fn parse_additive() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let mut left = parse_shift()
-    while at(TokenKind.Plus) || at(TokenKind.Minus) {
-        let op_line = peek_line()
-        let op_col = peek_col()
-        let op = advance_value()
-        skip_newlines()
-        let right = parse_shift()
-        let nd = node_count()
-        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
-        left = nd
-    }
-    left
+// ── Integer operator groups (§2.19 level 7) ─────────────────────────
+// Arithmetic, shift, `&`, `^` and `|` have no order among them, so a level-7 expression is read
+// as a flat run of unary operands and operators and grouped once the whole run is known. A
+// parenthesized operand comes back from parse_unary whole, so only a bare operator of a second
+// group is a mix.
+
+const OPS_ARITH = 1
+const OPS_SHIFT = 2
+const OPS_AND = 3
+const OPS_XOR = 4
+const OPS_OR = 5
+
+pub fn int_op_group(op: Str) -> Int {
+    if op == "*" || op == "/" || op == "%" || op == "+" || op == "-" { return OPS_ARITH }
+    if op == "<<" || op == ">>" { return OPS_SHIFT }
+    if op == "&" { return OPS_AND }
+    if op == "^" { return OPS_XOR }
+    if op == "|" { return OPS_OR }
+    0
 }
 
-fn parse_shift() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let mut left = parse_multiplicative()
-    while at(TokenKind.Shl) || at(TokenKind.Shr) {
-        let op_line = peek_line()
-        let op_col = peek_col()
-        let op = advance_value()
-        skip_newlines()
-        let right = parse_multiplicative()
-        let nd = node_count()
-        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
-        left = nd
-    }
-    left
+// Whether printing `child_op` bare as an operand of `parent_op` loses or hides its grouping, for
+// the printers that rebuild source from the tree. A different integer group does not parse bare. A
+// shift or bitwise operand of a comparison does, but C binds it the other way, so a reader from C
+// would misread it.
+pub fn int_operand_needs_parens(child_op: Str, parent_op: Str) -> Bool {
+    let child = int_op_group(child_op)
+    if child == 0 { return false }
+    let parent = int_op_group(parent_op)
+    if parent != 0 { return parent != child }
+    if child == OPS_ARITH { return false }
+    parent_op == "==" || parent_op == "!=" || parent_op == "<" || parent_op == ">" || parent_op == "<=" || parent_op == ">="
 }
 
-fn parse_multiplicative() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let mut left = parse_unary()
-    while at(TokenKind.Star) || at(TokenKind.Slash) || at(TokenKind.Percent) {
-        let op_line = peek_line()
-        let op_col = peek_col()
-        let op = advance_value()
-        skip_newlines()
-        let right = parse_unary()
-        let nd = node_count()
-        node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
-        left = nd
+fn at_int_op() -> Bool {
+    let k = peek_kind()
+    k == TokenKind.Star || k == TokenKind.Slash || k == TokenKind.Percent || k == TokenKind.Plus || k == TokenKind.Minus || k == TokenKind.Shl || k == TokenKind.Shr || k == TokenKind.Amp || k == TokenKind.Caret || k == TokenKind.Pipe
+}
+
+// How tightly an operator binds when a run is grouped the way C groups it, or, with
+// `reversed`, the opposite way between groups. `*` `/` `%` stay above `+` `-` either way,
+// because the language itself orders them.
+fn int_op_rank(op: Str, reversed: Bool) -> Int {
+    let g = int_op_group(op)
+    let mul = op == "*" || op == "/" || op == "%"
+    if reversed {
+        if g == OPS_ARITH {
+            if mul { return 2 }
+            return 1
+        }
+        return g + 1
     }
-    left
+    if g == OPS_ARITH {
+        if mul { return 6 }
+        return 5
+    }
+    6 - g
+}
+
+// The operator that operands lo..hi split at: the loosest one, and the last of those because
+// each group chains left.
+fn int_ops_split(ops: List[Str], lo: Int, hi: Int, reversed: Bool) -> Int {
+    let mut k = lo
+    let mut i = lo + 1
+    while i < hi {
+        if int_op_rank(ops[i], reversed) <= int_op_rank(ops[k], reversed) {
+            k = i
+        }
+        i = i + 1
+    }
+    k
+}
+
+fn int_ops_tree(operands: List[Int], ops: List[Str], op_toks: List[Int], lo: Int, hi: Int) -> Int ! Parse.Build {
+    if lo == hi { return operands[lo] }
+    let k = int_ops_split(ops, lo, hi, false)
+    let left = int_ops_tree(operands, ops, op_toks, lo, k)
+    let right = int_ops_tree(operands, ops, op_toks, k + 1, hi)
+    let tok = op_toks[k]
+    let nd = node_count()
+    node_push(AstNode { kind: NodeKind.BinOp, op: ops[k], left: left, right: right, line: tokens.lines[tok], col: tokens.cols[tok] })
+    nd
+}
+
+// The run written with parentheses wherever an operand is an operation of another group.
+fn int_ops_text(texts: List[Str], ops: List[Str], lo: Int, hi: Int, reversed: Bool, parent_group: Int) -> Str {
+    if lo == hi { return texts[lo] }
+    let k = int_ops_split(ops, lo, hi, reversed)
+    let g = int_op_group(ops[k])
+    let left = int_ops_text(texts, ops, lo, k, reversed, g)
+    let right = int_ops_text(texts, ops, k + 1, hi, reversed, g)
+    let text = "{left} {ops[k]} {right}"
+    if parent_group != 0 && parent_group != g {
+        return "({text})"
+    }
+    text
+}
+
+// The byte offset of a token position, or -1 when the source does not reach it.
+fn source_offset(line: Int, col: Int) -> Int {
+    let mut off = 0
+    let mut l = 1
+    while l < line && off < tokens.source.byte_len() {
+        if tokens.source.byte_at(off) == 10 {
+            l = l + 1
+        }
+        off = off + 1
+    }
+    if l < line { return -1 }
+    let at_col = off + col - 1
+    if at_col > tokens.source.byte_len() { return -1 }
+    at_col
+}
+
+// The source text of tokens first..last as written, or "" when it cannot be read back.
+fn token_span_text(first: Int, last: Int) -> Str {
+    if first < 0 || last < first || last >= tokens.kinds.len() { return "" }
+    let start = source_offset(tokens.lines[first], tokens.cols[first])
+    let end = source_offset(tokens.lines[last], tokens.end_cols[last])
+    if start < 0 || end <= start { return "" }
+    tokens.source.byte_slice(start, end)
+}
+
+// An operand as one line of text for the help. One written over several lines is rebuilt from
+// its tokens, so a line break becomes a space and a comment drops out, while each line keeps
+// its own spacing. A token that itself spans lines cannot be put on one line, so the operand
+// reads as "".
+fn operand_text(first: Int, last: Int) -> Str {
+    if first < 0 || last < first || last >= tokens.kinds.len() { return "" }
+    if tokens.lines[first] == tokens.lines[last] {
+        let t = token_span_text(first, last)
+        if t.contains("\n") { return "" }
+        return t
+    }
+    let mut out = ""
+    let mut prev = -1
+    let mut t = first
+    while t <= last {
+        let k = peek_kind_at(t)
+        if k != TokenKind.Newline && k != TokenKind.Comment && k != TokenKind.DocComment {
+            let piece = token_span_text(t, t)
+            if piece == "" || piece.contains("\n") { return "" }
+            if prev == -1 {
+                out = piece
+            } else if tokens.lines[prev] == tokens.lines[t] {
+                let span = token_span_text(prev, t)
+                out = out.concat(span.byte_slice(token_span_text(prev, prev).byte_len(), span.byte_len()))
+            } else if out.ends_with("(") || out.ends_with("[") || piece.starts_with(")") || piece.starts_with("]") || piece.starts_with(".") || piece.starts_with(",") {
+                out = out.concat(piece)
+            } else {
+                out = out.concat(" ").concat(piece)
+            }
+            prev = t
+        }
+        t = t + 1
+    }
+    out
+}
+
+// The last token of an operand that ends before p: a lookahead past the operand may have
+// stopped on a newline or a comment.
+fn last_token_before(p: Int) -> Int {
+    let mut q = p - 1
+    while q > 0 && (peek_kind_at(q) == TokenKind.Newline || peek_kind_at(q) == TokenKind.Comment || peek_kind_at(q) == TokenKind.DocComment) {
+        q = q - 1
+    }
+    q
+}
+
+fn report_mixed_operators(ops: List[Str], op_toks: List[Int], firsts: List[Int], lasts: List[Int], mix: Int) ! Diag.Report {
+    let tok = op_toks[mix]
+    // Name first the operator C applies last, the outer one of the C grouping.
+    let mut outer = ops[mix - 1]
+    let mut inner = ops[mix]
+    if int_op_rank(inner, false) < int_op_rank(outer, false) {
+        outer = ops[mix]
+        inner = ops[mix - 1]
+    }
+    let msg = "`{outer}` and `{inner}` have no order between them"
+    let mut texts: List[Str] = []
+    let mut readable = true
+    let mut i = 0
+    while i < firsts.len() {
+        let t = operand_text(firsts[i], lasts[i])
+        if t == "" { readable = false }
+        texts.push(t)
+        i = i + 1
+    }
+    let mut help = "add parentheses around the operation that applies first"
+    if readable {
+        let c_order = int_ops_text(texts, ops, 0, ops.len(), false, 0)
+        let other = int_ops_text(texts, ops, 0, ops.len(), true, 0)
+        help = "write `{c_order}` (the grouping C uses) or `{other}`"
+    }
+    diag_error_range("MixedOperatorPrecedence", MIXED_OPERATOR_PRECEDENCE, msg, tokens.lines[tok], tokens.cols[tok], tokens.end_cols[tok], help)
+}
+
+fn parse_int_ops() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let first_tok = pos
+    let first = parse_unary()
+    if !at_int_op() { return first }
+    let mut operands: List[Int] = [first]
+    let mut firsts: List[Int] = [first_tok]
+    let mut lasts: List[Int] = [last_token_before(pos)]
+    let mut ops: List[Str] = []
+    let mut op_toks: List[Int] = []
+    while at_int_op() {
+        op_toks.push(pos)
+        ops.push(advance_value())
+        skip_newlines()
+        firsts.push(pos)
+        operands.push(parse_unary())
+        lasts.push(last_token_before(pos))
+    }
+    let group = int_op_group(ops[0])
+    let mut mix = 1
+    while mix < ops.len() && int_op_group(ops[mix]) == group {
+        mix = mix + 1
+    }
+    // One report per run; the tree is still built the C way so later passes see a whole node.
+    if mix < ops.len() {
+        report_mixed_operators(ops, op_toks, firsts, lasts, mix)
+    }
+    int_ops_tree(operands, ops, op_toks, 0, ops.len())
 }
 
 fn parse_unary() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
@@ -5312,7 +5448,9 @@ fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             advance()
             let interp_expr = parse_expr()
             let mut interp_failed = 0
-            if diag_count > errs_before {
+            // A mix of operator groups leaves a whole expression behind, so its E1127 stands
+            // instead of collapsing into InterpParseFailure.
+            if diag_count - errs_before > diag_errors_since(entries_before, MIXED_OPERATOR_PRECEDENCE) {
                 interp_failed = 1
             } else if !at(TokenKind.InterpEnd) {
                 interp_failed = 1
