@@ -246,7 +246,7 @@ Each panelist wrote alone. Text is verbatim.
 >   panicked at src/hdr_test.bl:14:22: unwrap called on None
 > 3 passed, 1 failed, 1 panicked, 1 skipped (of 6)
 > ```
-> `PANIC` has the same width as `FAIL`/`PASS`/`SKIP`, and the summary line omits zero counts as it does today. tests/test_runner_panic_continues.bl must have its assertions updated (not deleted) from `FAIL`/`1 failed` to `PANIC`/`1 panicked`. zs3w3y's real fix, continue-after-panic, stays as it is.
+> `PANIC` has the same width as `FAIL`/`PASS`/`SKIP`, and the summary line omits zero counts as it does today. tests/test_runner_panic_continues.bl must have its assertions updated (not deleted) from `FAIL`/`1 failed` to `PANIC`/`1 panicked`. The earlier bug fix, continue-after-panic, stays as it is.
 >
 > **P5: test.failing.** A panic counts as "expected red", which is what the runtime does today: `status:"passed"`, `expected_fail:true`. The record still carries the `panic` object, so a dashboard can see how the test was red. This adds no status and no `cause`, so Q3 holds. pytest `xfail` works the same way: any exception is an expected failure unless the author narrows it with `raises=`. A narrowing option like that is out of scope here, for a later ticket.
 >
