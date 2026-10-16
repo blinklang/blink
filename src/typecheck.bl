@@ -14489,7 +14489,21 @@ fn tc_ident_alphabet() -> Str {
     "abcdefghijklmnopqrstuvwxyz_0123456789"
 }
 
-// The closest BUILTIN method name one edit away from `method`, or "" when there is none.
+// Whether `cand` may be offered in place of `method` on a builtin receiver of kind `obj_k`.
+// is_builtin_method answers per NAME, so on its own it offers `add` (an operator method) to a
+// Set and `index_of` (a Str method) to a List. tc_builtin_method_arity is keyed on the pair
+// and mirrors the dispatch arms row for row, so a name it claims for this kind is one the
+// call would resolve. A swap of two equal letters, or a letter replaced by itself, rebuilds
+// the written name, and that is never a suggestion.
+fn tc_builtin_suggestion_ok(obj_k: TyKind, method: Str, cand: Str) -> Int {
+    if cand == method { return 0 }
+    if is_builtin_method_on_receiver(obj_k, cand) == 0 { return 0 }
+    if tc_builtin_method_arity(obj_k, cand) < 0 { return 0 }
+    1
+}
+
+// The closest BUILTIN method name one edit away from `method` that this receiver answers,
+// or "" when there is none.
 //
 // Generated-and-probed rather than scanned, because is_builtin_method is a name chain, not
 // a list, and cannot be enumerated. Probing it keeps ONE authority for "this builtin method
@@ -14497,20 +14511,20 @@ fn tc_ident_alphabet() -> Str {
 // failure this compiler has already paid for twice. The four edits are tried in order of how
 // likely each is to be the typo the user made: transposition, deletion, substitution,
 // insertion.
-fn tc_builtin_method_edit1(method: Str) -> Str {
+fn tc_builtin_method_edit1(obj_k: TyKind, method: Str) -> Str {
     let n = method.byte_len()
     // Two characters give too many neighbours for the match to mean anything.
     if n < 3 { return "" }
     let mut i = 0
     while i + 1 < n {
         let c = method.byte_slice(0, i).concat(method.byte_slice(i + 1, i + 2)).concat(method.byte_slice(i, i + 1)).concat(method.byte_slice(i + 2, n))
-        if is_builtin_method(c) != 0 { return c }
+        if tc_builtin_suggestion_ok(obj_k, method, c) != 0 { return c }
         i = i + 1
     }
     i = 0
     while i < n {
         let c = method.byte_slice(0, i).concat(method.byte_slice(i + 1, n))
-        if is_builtin_method(c) != 0 { return c }
+        if tc_builtin_suggestion_ok(obj_k, method, c) != 0 { return c }
         i = i + 1
     }
     let alpha = tc_ident_alphabet()
@@ -14520,7 +14534,7 @@ fn tc_builtin_method_edit1(method: Str) -> Str {
         let mut a = 0
         while a < alen {
             let c = method.byte_slice(0, i).concat(alpha.byte_slice(a, a + 1)).concat(method.byte_slice(i + 1, n))
-            if is_builtin_method(c) != 0 { return c }
+            if tc_builtin_suggestion_ok(obj_k, method, c) != 0 { return c }
             a = a + 1
         }
         i = i + 1
@@ -14530,7 +14544,7 @@ fn tc_builtin_method_edit1(method: Str) -> Str {
         let mut a = 0
         while a < alen {
             let c = method.byte_slice(0, i).concat(alpha.byte_slice(a, a + 1)).concat(method.byte_slice(i, n))
-            if is_builtin_method(c) != 0 { return c }
+            if tc_builtin_suggestion_ok(obj_k, method, c) != 0 { return c }
             a = a + 1
         }
         i = i + 1
@@ -14578,7 +14592,7 @@ fn tc_suggest_method(obj_k: TyKind, tname: Str, method: Str) -> Str {
         }
     }
     if obj_k == TyKind.Struct || obj_k == TyKind.Enum { return "" }
-    tc_builtin_method_edit1(method)
+    tc_builtin_method_edit1(obj_k, method)
 }
 
 // What `List[T].contains` needs of its element: the method walks the elements comparing
@@ -14633,8 +14647,13 @@ fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str) -> Str {
     if obj_k == TyKind.Map && method == "set" {
         return "a Map is written with `.insert(key, value)`"
     }
+    // `add` is what most languages call it, and it is no typo, so no near-miss reaches it.
+    if obj_k == TyKind.Set && method == "add" {
+        return "a Set is written with `.insert(value)`"
+    }
     let near = tc_suggest_method(obj_k, tname, method)
-    if near != "" { return "did you mean `.{near}`?" }
+    // Naming the method the caller already wrote sends them in a circle.
+    if near != "" && near != method { return "did you mean `.{near}`?" }
     ""
 }
 
