@@ -678,7 +678,7 @@ This separation of concerns means the compiler never encodes dialect knowledge. 
 
 #### The `Template[C]` Surface (normative)
 
-`Template[C]` has **no fields and no constructor**. Only a template literal `t"..."` builds one (§2.4.3). A `Raw[T]` hole in that literal folds its text into the parts (see *`Raw(expr)` — The Escape Hatch* below). **Every part of a `Template[C]` is literal source text, or text folded in from a `Raw[T]`.** To bind, return, store or pass a template keeps this true, so these need no further rule. A handler reads a template through two methods:
+`Template[C]` has **no fields and no constructor**. Only a template literal `t"..."` builds one (§2.4.3). A `Raw[Str]` hole in that literal folds its text into the parts (see *`Raw(expr)` — The Escape Hatch* below). **Every part of a `Template[C]` is literal source text, or text folded in from a `Raw[Str]`.** To bind, return, store or pass a template keeps this true, so these need no further rule. A handler reads a template through two methods:
 
 | Method | Signature | Returns |
 |---|---|---|
@@ -752,7 +752,7 @@ Each interpolation hole in a template literal becomes one value, by the hole's s
 | `Str` | `TemplateValue.Str` |
 | `Bytes` | `TemplateValue.Bytes` |
 | `Option[T]`, where `T` is a type in the rows above | `Some(x)` gives the value for `x`; `None` gives `TemplateValue.Null` |
-| `Raw[T]` | No value: the text folds into the parts (see below; `Raw[Bytes]` is an error) |
+| `Raw[Str]` | No value: the text folds into the parts (see below; `Raw` wraps only a `Str`) |
 
 `Display` is not invoked on a hole (§3.6 *Display Format Protocol*). Any other hole type is `error[TemplateHoleType]` (E0534). That includes `Char`, `U64`, `Option[Option[T]]` (`None` and `Some(None)` would both give `Null`, and the handler could not tell them apart), and every struct, enum, tuple and collection. The compiler reports it at typecheck, at the hole, and never at codegen. Each `help:` line is a repair that compiles and keeps the value a parameter:
 
@@ -859,22 +859,56 @@ As for `TemplateHoleType`, no `help:` line offers `Raw(...)`.
 
 For dynamic SQL (table names, column lists, generated clauses), wrapping an interpolated expression in `Raw()` bypasses decomposition for that specific value — folding it into the literal parts instead.
 
-`Raw[T]` is a **real marker type**, not a spelling the compiler matches. `Raw(expr)` constructs a `Raw[T]` from a `T`, and the type carries the marker wherever the value goes:
+`Raw[Str]` is a **real marker type**, not a spelling the compiler matches. `Raw(s)` with `s: Str` constructs a `Raw[Str]`, and the type carries the marker wherever the value goes:
 
-- `Raw[T]` implements **no `Display`**. The only thing that consumes it is a hole of a template literal `t"..."`, which concatenates the wrapped value into the adjacent literal segment.
+- `Raw[Str]` implements **no `Display`**. The only thing that consumes it is a hole of a template literal `t"..."`, which concatenates the wrapped string into the adjacent literal segment, byte for byte.
 - The marker survives a binding. `let r = Raw(table)` has type `Raw[Str]`, and `{r}` in a template literal is the same bypass as writing `Raw(table)` inline — with the same audit obligation.
-- Nothing strips it implicitly. A `Raw[T]` is not a `T`, and there is no coercion from one to the other.
+- Nothing strips it implicitly. A `Raw[Str]` is not a `Str`, and there is no coercion from one to the other.
 
-**This is a typing rule, not a rule on the source text.** In a template literal, each hole has a Template value type or a `Raw[T]` of one. A `Raw[T]` hole folds and raises `RawBypassesParam`, whether the `Raw(...)` call is in the hole or the value came through a binding, a return or a generic call. A `Raw[T]` in any other position, including a hole of a plain `"..."` literal, is `error[RawOutsideTemplate]` (E0530, below).
+**This is a typing rule, not a rule on the source text.** In a template literal, each hole has a Template value type or the type `Raw[Str]`. A `Raw[Str]` hole folds and raises `RawBypassesParam`, whether the `Raw(...)` call is in the hole or the value came through a binding, a return or a generic call. A `Raw[Str]` in any other position, including a hole of a plain `"..."` literal, is `error[RawOutsideTemplate]` (E0530, below).
 
-**A `Raw[Bytes]` cannot fold.** The parts are `List[Str]`, and a `Bytes` value has no lossless map into a `Str`. So `{Raw(b)}` with `b: Bytes` is `error[TemplateHoleType]` (E0534), and its `help:` sends the value as a parameter:
+**`Raw` wraps only a `Str`.** The fold text is the string itself, so no type needs a rule for its text form. The compiler checks this where the `Raw` is built, at typecheck, and never at mono or codegen:
+
+- `Raw(e)` requires `e: Str`. Any other type of `e` is `error[TemplateHoleType]` (E0534), and the span is the argument `e`. This holds when `e` has a type parameter `T` as its type: the error is at the generic definition, because `T` is not `Str`.
+- A written type `Raw[X]` with `X` not `Str` is E0534 at that annotation. This holds in every place a type is written: a parameter, a return type, a field, a type alias and a type argument. `fn f[T](x: T) -> Raw[T]` is an error at its definition, not at a later instantiation.
+
+So no value of type `Raw[X]` with `X` other than `Str` can exist, and a hole never has to consider one. The primary message names the rule, because the span is not at a hole: "`Raw` wraps only a `Str`, found `Int`". The `help:` lines remove the `Raw` and then apply the repairs of *Template Values* above to the type of `e`. They keep the value a parameter, and they never offer `Raw(...)`, as for every `TemplateHoleType`. If no repair applies, the diagnostic gives the `note:` line only:
+
+```
+error[TemplateHoleType]: `Raw` wraps only a `Str`, found `Int`
+ --> page.bl:2:59
+  |
+2 |     db.query(t"SELECT * FROM posts ORDER BY id LIMIT {Raw(n)}")
+  |                                                           ^ `n` is `Int`, not `Str`
+  |
+  = note: `Raw` folds only a `Str`; the text is the string, byte for byte
+  = help: send it as a parameter: `{n}`
+```
+
+When the `Raw(...)` call is in a binding, the help drops the wrapper there: `let r = Raw(n)` gets `help: drop the wrapper: let r = n`, and the hole `{r}` then sends a parameter. A `Raw(opt)` with `opt: Option[Str]` gets `help: send it as a parameter: {opt}`, and `None` becomes `TemplateValue.Null`.
+
+**A `Raw[Bytes]` is one case of this rule.** The parts are `List[Str]`, and a `Bytes` value has no lossless map into a `Str`. So `Raw(b)` with `b: Bytes` is E0534 at the argument, and its `help:` sends the value as a parameter:
 
 ```blink
 // intentional-error example
 fn store(img: Bytes) -> Result[Int, DBError] ! DB.Write {
-    db.execute(t"INSERT INTO imgs VALUES ({Raw(img)})")   // error[TemplateHoleType]: a `Raw[Bytes]`
-                                                         //   cannot fold into the parts
+    db.execute(t"INSERT INTO imgs VALUES ({Raw(img)})")   // error[TemplateHoleType]: `Raw` wraps
+                                                         //   only a `Str`, found `Bytes`
                                                          // help: send it as a parameter: `{img}`
+}
+```
+
+**`Raw` of a `Raw[Str]` is E0534 too**, because the argument is a `Raw[Str]`, not a `Str`. Its `help:` removes one `Raw`. This removes a bypass and adds none, so it keeps the rule above. The repair keeps exactly one `Raw[Str]` in the hole, and never removes both:
+
+- `{Raw(Raw(s))}` gets `help: remove one Raw: {Raw(s)}`.
+- `{Raw(r)}` with `r: Raw[Str]` gets `help: remove one Raw: {r}`.
+
+**A value that is not a `Str` stays a parameter.** A number, a `Bool` or a `Float` in a template almost always belongs in a hole of its own type: `LIMIT {n}`, not `LIMIT {Raw(n)}`. Only when the context takes no parameter at that place, for example a column width in DDL, does the author build the text. The author then writes the conversion, and the audit sees it:
+
+```blink
+fn make_table(name: Str, width: Int) -> Result[Int, DBError] ! DB.Write {
+    let w = width.display()
+    db.execute(t"CREATE TABLE {Raw(name)} (title VARCHAR({Raw(w)}))")
 }
 ```
 
@@ -892,7 +926,7 @@ fn dynamic_report(table: Str, id: Int) -> Result[Row, DBError] ! DB.Read {
 db.query_one(t"{Raw(whole_query)}")
 ```
 
-**The audit warning fires where the bypass happens.** A `Raw[T]` folded into a `Template[C]` is the un-parameterized interpolation, and that fold — and only that fold — raises `RawBypassesParam`:
+**The audit warning fires where the bypass happens.** A `Raw[Str]` folded into a `Template[C]` is the un-parameterized interpolation, and that fold — and only that fold — raises `RawBypassesParam`:
 
 ```
 warning[RawBypassesParam]: Raw() bypasses parameterization
@@ -909,16 +943,16 @@ warning[RawBypassesParam]: Raw() bypasses parameterization
 
 Neither help line is machine-applicable, and the second is never offered as a quick fix. The record holds the author's claim that the value cannot carry an injection; §9.1 *Audit Records* says what the record must hold and when its pin lapses.
 
-The warning does **not** fire on an ordinary interpolated string, because an ordinary string contains no `Raw[T]`. That is what making the marker a type buys: the trigger is the value's type, so it is neither defeated by binding the value to a variable first nor raised by a string that merely mentions the word.
+The warning does **not** fire on an ordinary interpolated string, because an ordinary string contains no `Raw[Str]`. That is what making the marker a type buys: the trigger is the value's type, so it is neither defeated by binding the value to a variable first nor raised by a string that merely mentions the word.
 
 `RawBypassesParam` is an **audit-gated** diagnostic: `@trusted(audit: K)` is its only suppression channel, and naming it in `@allow` or in `[lints]` is refused. The mechanism is stated once, for every diagnostic that uses it, in §9.1 *Audit-Gated Diagnostics*.
 
-**A `Raw[T]` in a position that does not consume it is an error.** Because `Raw[T]` has no `Display`, a misplaced `Raw()` would otherwise fall through to `MissingDisplayImpl` (E0523), whose prescribed repairs — derive `Display`, write an `impl`, call `.debug()` — are all impossible on a compiler-known marker type. It gets its own diagnostic instead, whose first repair compiles:
+**A `Raw[Str]` in a position that does not consume it is an error.** Because `Raw[Str]` has no `Display`, a misplaced `Raw()` would otherwise fall through to `MissingDisplayImpl` (E0523), whose prescribed repairs — derive `Display`, write an `impl`, call `.debug()` — are all impossible on a compiler-known marker type. It gets its own diagnostic instead, whose first repair compiles:
 
 ```blink
 // intentional-error example
 fn log_table(table: Str) ! IO {
-    io.println("scanning {Raw(table)}")   // error[RawOutsideTemplate]: a `Raw[T]` reached a
+    io.println("scanning {Raw(table)}")   // error[RawOutsideTemplate]: a `Raw[Str]` reached a
                                           //   position that does not consume it -- only a
                                           //   hole of a `t"..."` literal does
                                           // help: drop the wrapper: `"scanning {table}"`
@@ -929,7 +963,7 @@ fn log_table(table: Str) ! IO {
 
 - **Per-interpolation granularity.** Unlike a whole-string `raw()` which disables parameterization entirely, `Raw()` affects only the wrapped expression. Mixed safe/unsafe queries work naturally.
 - **No string grammar extension.** `Raw(expr)` is just an expression inside `{...}` — zero new parser productions. No `:modifier` syntax that invites format specs (`:.2f`, `:>20`).
-- **Type-system native.** Consistent with Blink's "types are the mechanism" philosophy. `Raw[T]` is a compiler-known type like `Option[T]` or `Result[T,E]`.
+- **Type-system native.** Consistent with Blink's "types are the mechanism" philosophy. `Raw[Str]` is a compiler-known type like `Option[T]` or `Result[T,E]`.
 - **Proven pattern.** Django's `mark_safe()`, Rails' `raw()`, Jinja2's `Markup()` — the industry consensus is to mark the VALUE, not the template slot.
 
 #### Phantom Type Extensibility
@@ -953,7 +987,7 @@ Each context defines its own reassembly strategy. The developer writes the same 
 
 #### Design Rationale
 
-**Why not taint tracking:** Full information flow tracking (Section 9.3) requires tracking provenance on every value through inference, generics, and closures. `Template[C]` with `Raw[T]` achieves 95% of the safety at the type boundary with minimal type system extension — two compiler-known types that enable per-interpolation safety control.
+**Why not taint tracking:** Full information flow tracking (Section 9.3) requires tracking provenance on every value through inference, generics, and closures. `Template[C]` with `Raw[Str]` achieves 95% of the safety at the type boundary with minimal type system extension — two compiler-known types that enable per-interpolation safety control.
 
 **Why a `t` prefix, and not a tag for each context:** `t` is a prefix on the one delimiter, as `#` is (§2.4.2). It adds no delimiter, so the "one string syntax" decision (§2.2) holds. A tag for each context, such as `sql"..."` or `html"..."`, would repeat what the phantom type `C` already says, and each new context would need a new tag. The `t` says only "keep the holes apart", and the type says where the template can go. An earlier rule had no prefix: a plain literal became a template when the site expected `Template[C]`. That rule was an implicit conversion, which Blink rejects elsewhere, and it worked only for a literal written directly as an argument. With `t`, a template is an ordinary expression that you can bind, return and pass, and the literal alone shows whether a hole is a value or text. A forgotten `t` is a compile error with a one-character fix (E0310). Python 3.14 uses the same spelling, `t"..."`, for the same meaning. (Panel vote: 6-0. See [Template literal prefix rationale](../decisions/template-literal-prefix.md).)
 

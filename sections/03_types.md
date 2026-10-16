@@ -3896,7 +3896,7 @@ error[E0523]: type `Matrix` does not implement `Display`
    = note: use `matrix.debug()` for structural representation
 ```
 
-A `Raw[T]` argument is the one exception: it reports `RawOutsideTemplate` (§3b.5 *`Raw(expr)` — The Escape Hatch*), not E0523.
+A `Raw[Str]` argument is the one exception: it reports `RawOutsideTemplate` (§3b.5 *`Raw(expr)` — The Escape Hatch*), not E0523.
 
 **Typing rule.** The compiler checks `T: Display` for every `{expr}`. This is a standard trait bound check — identical to requiring `T: Eq` for equality comparison.
 
@@ -3936,7 +3936,7 @@ let q: Template[DB] = t"SELECT * FROM users WHERE id = {id} AND name = {name}"
 // q.values() == [TemplateValue.Int(42), TemplateValue.Str("Alice")]   ← typed values, not strings
 ```
 
-The set of types valid as Template values is compiler-known: `Int` and the narrower integers `I8`, `I16`, `I32`, `U8`, `U16`, `U32` (widened to `Int`), `Float` and `F32` (widened to `Float`), `Bool`, `Str`, `Bytes`, and `Option[T]` where `T` is one of these (`None` becomes `TemplateValue.Null`). `Option[Option[T]]` is not valid. Any other type in a Template interpolation is `error[TemplateHoleType]` at typecheck, with repairs that keep the value a parameter (§3b.5 *Template Values*). The `Raw(expr)` marker type bypasses decomposition for a specific interpolation (see §3b.5).
+The set of types valid as Template values is compiler-known: `Int` and the narrower integers `I8`, `I16`, `I32`, `U8`, `U16`, `U32` (widened to `Int`), `Float` and `F32` (widened to `Float`), `Bool`, `Str`, `Bytes`, and `Option[T]` where `T` is one of these (`None` becomes `TemplateValue.Null`). `Option[Option[T]]` is not valid. Any other type in a Template interpolation is `error[TemplateHoleType]` at typecheck, with repairs that keep the value a parameter (§3b.5 *Template Values*). The `Raw(s)` marker type, which wraps only a `Str`, bypasses decomposition for a specific interpolation (see §3b.5).
 
 This separation is critical: calling `Display.display()` first and then decomposing the resulting `Str` would defeat `Template[C]`'s injection safety by losing type information and forcing all values through string round-tripping.
 

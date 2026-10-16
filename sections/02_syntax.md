@@ -339,7 +339,7 @@ fn get_user(id: Int) -> User? ! DB.Read {
 }
 ```
 
-If α is not solved at the end of inference for the definition, the literal is `error[CannotInferType]` (E0301), and the span points at the `t"..."` literal. Each hole must have a Template value type, or be a `Raw[T]`, which folds its text into the parts and raises `RawBypassesParam` (§3b.5).
+If α is not solved at the end of inference for the definition, the literal is `error[CannotInferType]` (E0301), and the span points at the `t"..."` literal. Each hole must have a Template value type, or be a `Raw[Str]`, which folds its text into the parts and raises `RawBypassesParam` (§3b.5).
 
 **A plain literal is always a `Str`.** A `"..."` literal never becomes a template, whatever type the site expects. A plain literal where `Template[C]` is expected, and a template literal where `Str` is expected, are each `error[TemplateMismatch]` (E0310). The `help:` adds or removes the `t`, and a tool can apply it (§3b.5 *Compile Errors for `Str` and `Template` Mismatch*).
 

@@ -1663,7 +1663,7 @@ let q: Str = "SELECT * FROM users WHERE id = {id}"
 db.query_one(q)  // error[TemplateMismatch]: expected Template[DB], found Str
 ```
 
-**Escape hatch:** `Raw(expr)` constructs a value of the marker type `Raw[T]`, which bypasses parameterization for a single hole of a template literal. Folding a `Raw[T]` into a template raises `RawBypassesParam`, an audit-gated warning: `@trusted(audit: K)` is its only suppression channel (see §9.1, *Audit-Gated Diagnostics*). See §3b.5 for the type rules.
+**Escape hatch:** `Raw(s)` with `s: Str` constructs a value of the marker type `Raw[Str]`, which bypasses parameterization for a single hole of a template literal. Folding a `Raw[Str]` into a template raises `RawBypassesParam`, an audit-gated warning: `@trusted(audit: K)` is its only suppression channel (see §9.1, *Audit-Gated Diagnostics*). See §3b.5 for the type rules.
 
 ```blink
 // Auditable escape hatch for dynamic SQL:
@@ -2506,7 +2506,7 @@ The table below is the **complete** set of compiler-known type names a program c
 | `Never` | prelude | §3.2, §3.6 | shadows, W1010 |
 | `Bytes`, `StringBuilder` | prelude | §3.2.1, §3.2.3 | shadows, W1010 |
 | `Handle[T]`, `Channel[T]` | prelude | §4.13 | shadows, W1010 |
-| `Template[C]`, `Raw[T]`, `TemplateValue` | prelude | §3b.5 | shadows, W1010 |
+| `Template[C]`, `Raw[Str]`, `TemplateValue` | prelude | §3b.5 | shadows, W1010 |
 | `ConversionError` | `blink.core` | §3c.2 | shadows, W1010 |
 | `Range[T]` | `blink.core` | §2.10 | shadows, W1010 |
 | `Handler[E]` | `blink.core` | §4.7.1 | shadows, W1010 |
