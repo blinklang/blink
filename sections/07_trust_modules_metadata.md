@@ -1158,7 +1158,7 @@ with ffi.scope() as scope {
 
 Rule: `p.field.read()` reads the C field at its C offset; `p.field.write(v)` writes it. The layout check described below verifies that the offsets of the declaration match the C ABI.
 
-`p.field` outside a `read()`/`write()` call is rejected. There is no first-class "pointer to field" value.
+`p.field` outside a `read()`/`write()` call is rejected. There is no first-class "pointer to field" value. `p.field = v` and `p.field op= v` are `error[NotAPlace]` (E0611), with a fix that calls `write` (§2.22 *Writes that are not to a place*).
 
 #### Array allocation: `scope.alloc_n[T](n)`
 

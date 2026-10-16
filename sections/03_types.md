@@ -407,7 +407,14 @@ trait StringBuildOps {
 
 ##### Construction and Mutability
 
-Collections are constructed via `Type.new()` for empty collections or literal syntax where available. `List.with_capacity(n)` also makes an empty list (see *Capacity* below). A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A call to a mutating method needs a mutable **root**: the first name of the receiver path must be a `let mut` binding or a `mut` parameter. `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`.
+Collections are constructed via `Type.new()` for empty collections or literal syntax where available. `List.with_capacity(n)` also makes an empty list (see *Capacity* below). A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A mutation needs a mutable **root**: the first name of the receiver path or of the place must be a `let mut` binding or a `mut` parameter. A mutation is a call to a mutating method, or an assignment `=` or `op=` (§2.22 *Assignment places*). `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`. A `mut` parameter is a mutable root only for a call. An assignment to a parameter, or to a field of one, is `error[E0612] ParamAssign` with or without `mut` (§3.6 *Mutable Parameters*), and the compiler reports it in place of E0610 (§2.22 *Writes that are not to a place*).
+
+The fix for E0610 depends on how the root is declared:
+
+- **A local `let` with a plain name:** a machine-applicable fix inserts `mut` (`let mut names`). When several mutations have the same root, they get the same edit, and `blink fix` applies it once (§8.6).
+- **A `let` that destructures, a `for` variable, or a `match` binding:** help only.
+- **A module-level `let`:** help only. The help says why in one clause: `mut` adds `State` to the row of each function that reads or writes the binding (§4.16), which can cause errors far from the edit.
+- **A `pub let` from another module:** help only. The help says that `pub let mut` is not allowed (E1013, §2.12.1).
 
 ```blink
 // Empty collections
@@ -2781,7 +2788,7 @@ impl Stack {
 }
 ```
 
-**A parameter is never assigned.** An assignment to a parameter, or to a field of one, is always a compile error, with or without `mut`, `self` included. Such a write changes only the callee's copy of the value (§3.6 *`self` is always passed by value*), so the caller never sees it. To change a value locally, copy it to a new `let mut` name:
+**A parameter is never assigned.** An assignment to a parameter, or to a field of one, is always a compile error, `error[E0612] ParamAssign`, with or without `mut`, `self` included. Such a write changes only the callee's copy of the value (§3.6 *`self` is always passed by value*), so the caller never sees it. To change a value locally, copy it to a new `let mut` name:
 
 ```blink
 fn gcd(a: Int, b: Int) -> Int {
@@ -2859,7 +2866,7 @@ impl Display for Marker {
 
 `MutAliasOfImmutable` checks direct aliases only. An alias made through a call result (`id(a)`) or a struct literal (`W { xs: a }`) passes it. An immutable `let` is not a promise that the value behind it never changes (§3.2.2).
 
-**Rollout.** Each new error in this subsection ships first as a warning with a machine-applicable fix that `blink fix` applies, and becomes an error in the next release.
+**Rollout.** Each new error in this subsection ships first as a warning with a machine-applicable fix that `blink fix` applies, and becomes an error in the next release. A diagnostic keeps its name and code when it becomes an error.
 
 #### Operations on `Self` in a Default Body
 
