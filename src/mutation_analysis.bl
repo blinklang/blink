@@ -6,7 +6,7 @@ import parser.{
     node_target, node_iterable, node_is_mut, node_start, node_end, node_obj,
     node_method, node_index, node_params, node_args, node_stmts, node_arms,
     node_fields, node_elements,
-    sublist_get, sublist_length,
+    node_push_value_child_ids, sublist_get, sublist_length,
 }
 import diagnostics.{
     Diag, diag_warn_at_notes, diag_source_file, diag_file_for_node,
@@ -647,7 +647,7 @@ fn srp_is_save_local(name: Str) -> Str {
 // the recursive descent also sets sr_fn_has_pattern (the accumulated output of
 // this pre-pass), an intended broad write outside that pattern.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn sr_scan_for_patterns_block(stmts_sl: Int) {
+fn sr_scan_for_patterns_block(stmts_sl: Int, kids: List[Int]) {
     if stmts_sl == -1 {
         return
     }
@@ -695,7 +695,7 @@ fn sr_scan_for_patterns_block(stmts_sl: Int) {
     // Recurse into nested blocks so a pattern anywhere in the function is found.
     i = 0
     while i < num_stmts {
-        sr_scan_for_patterns_node(sublist_get(stmts_sl, i))
+        sr_scan_for_patterns_node(sublist_get(stmts_sl, i), kids)
         i = i + 1
     }
 
@@ -703,49 +703,40 @@ fn sr_scan_for_patterns_block(stmts_sl: Int) {
     srp_save_global = outer_g
 }
 
-fn sr_scan_for_patterns_node(node: Int) {
+// Walks the same blocks as sr_scan_node, so the W0551 gate and the emitting
+// scan agree on which blocks exist.
+fn sr_scan_for_patterns_node(node: Int, kids: List[Int]) {
     if node == -1 {
         return
     }
     let kind = node_kind(node)
-
+    if sr_body_runs_later(kind) != 0 {
+        return
+    }
     if kind == NodeKind.Block {
-        sr_scan_for_patterns_block(node_stmts(node))
+        sr_scan_for_patterns_block(node_stmts(node), kids)
         return
     }
-
-    if kind == NodeKind.IfExpr {
-        sr_scan_for_patterns_node(node_then_body(node))
-        sr_scan_for_patterns_node(node_else_body(node))
-        return
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        sr_scan_for_patterns_node(kids.get(i).unwrap(), kids)
+        i = i + 1
     }
+    sr_drop_kids_to(kids, base)
+}
 
-    if kind == NodeKind.WhileLoop {
-        sr_scan_for_patterns_node(node_body(node))
-        return
-    }
+// A closure or nested fn body does not run where it is defined, so the saves
+// around the definition do not cover the calls inside it.
+fn sr_body_runs_later(kind: Int) -> Int {
+    if kind == NodeKind.Closure || kind == NodeKind.FnDef { 1 } else { 0 }
+}
 
-    if kind == NodeKind.ForIn {
-        sr_scan_for_patterns_node(node_body(node))
-        return
-    }
-
-    if kind == NodeKind.LoopExpr {
-        sr_scan_for_patterns_node(node_body(node))
-        return
-    }
-
-    if kind == NodeKind.MatchExpr {
-        let arms_sl = node_arms(node)
-        if arms_sl != -1 {
-            let mut ai = 0
-            while ai < sublist_length(arms_sl) {
-                let arm = sublist_get(arms_sl, ai)
-                sr_scan_for_patterns_node(node_body(arm))
-                ai = ai + 1
-            }
-        }
-        return
+fn sr_drop_kids_to(kids: List[Int], base: Int) {
+    while kids.len() > base {
+        let _ = kids.pop()
     }
 }
 
@@ -800,7 +791,7 @@ fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
     }
 }
 
-fn sr_scan_stmts(stmts_sl: Int) ! Diag.Report {
+fn sr_scan_stmts(stmts_sl: Int, kids: List[Int]) ! Diag.Report {
     if stmts_sl == -1 {
         return
     }
@@ -827,97 +818,51 @@ fn sr_scan_stmts(stmts_sl: Int) ! Diag.Report {
         i = i + 1
     }
 
-    // Pass 2: check each call against the save/restore sets
+    // Pass 2: check every call in each statement against the block's saves.
     i = 0
     while i < num_stmts {
-        let stmt = sublist_get(stmts_sl, i)
-        let kind = node_kind(stmt)
-
-        if kind == NodeKind.ExprStmt {
-            let inner = node_value(stmt)
-            if inner != -1 {
-                let ik = node_kind(inner)
-                if ik == NodeKind.Call {
-                    let callee = node_left(inner)
-                    let cname = extract_ident_name(callee)
-                    if cname.is_some() {
-                        sr_check_call(inner, cname.unwrap())
-                    }
-                }
-            }
-        }
-
-        if kind == NodeKind.Call {
-            let callee = node_left(stmt)
-            let cname = extract_ident_name(callee)
-            if cname.is_some() {
-                sr_check_call(stmt, cname.unwrap())
-            }
-        }
-
-        i = i + 1
-    }
-
-    // Pass 3: recurse into nested blocks (if, while, match, etc.)
-    i = 0
-    while i < num_stmts {
-        let stmt = sublist_get(stmts_sl, i)
-        sr_scan_node(stmt)
+        sr_scan_node(sublist_get(stmts_sl, i), kids)
         i = i + 1
     }
 }
 
 // Block branch saves/restores sr_save_global around the nested scan;
-// sr_scan_stmts also writes diag_* globals outside that pattern, which the
+// sr_check_call writes diag_* globals outside that pattern, which the
 // analyzer correctly flags.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn sr_scan_node(node: Int) ! Diag.Report {
+fn sr_scan_node(node: Int, kids: List[Int]) ! Diag.Report {
     if node == -1 {
         return
     }
     let kind = node_kind(node)
+    if sr_body_runs_later(kind) != 0 {
+        return
+    }
 
     if kind == NodeKind.Block {
         let outer_saves_g = sr_save_global
         sr_save_global = []
-        sr_scan_stmts(node_stmts(node))
+        sr_scan_stmts(node_stmts(node), kids)
         sr_save_global = outer_saves_g
         return
     }
 
-    if kind == NodeKind.IfExpr {
-        sr_scan_node(node_then_body(node))
-        sr_scan_node(node_else_body(node))
-        return
-    }
-
-    if kind == NodeKind.WhileLoop {
-        sr_scan_node(node_body(node))
-        return
-    }
-
-    if kind == NodeKind.ForIn {
-        sr_scan_node(node_body(node))
-        return
-    }
-
-    if kind == NodeKind.LoopExpr {
-        sr_scan_node(node_body(node))
-        return
-    }
-
-    if kind == NodeKind.MatchExpr {
-        let arms_sl = node_arms(node)
-        if arms_sl != -1 {
-            let mut ai = 0
-            while ai < sublist_length(arms_sl) {
-                let arm = sublist_get(arms_sl, ai)
-                sr_scan_node(node_body(arm))
-                ai = ai + 1
-            }
+    if kind == NodeKind.Call {
+        let cname = extract_ident_name(node_left(node))
+        if cname.is_some() {
+            sr_check_call(node, cname.unwrap())
         }
-        return
     }
+
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        sr_scan_node(kids.get(i).unwrap(), kids)
+        i = i + 1
+    }
+    sr_drop_kids_to(kids, base)
 }
 
 // Genuine save/restore of diag_source_file (saved 826, restored 842): the
@@ -940,8 +885,9 @@ fn sr_analyze_fn(fn_node: Int) ! Diag.Report {
         // Pre-pass: determine whether the function is speculative (has any
         // save/restore pattern) before any call is checked, since the pattern
         // may live in a block scanned after an early call (§4.16.7).
-        sr_scan_for_patterns_block(body_stmts)
-        sr_scan_stmts(body_stmts)
+        let mut kids: List[Int] = []
+        sr_scan_for_patterns_block(body_stmts, kids)
+        sr_scan_stmts(body_stmts, kids)
     }
     diag_clear_allows()
     diag_source_file = saved_source
