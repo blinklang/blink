@@ -22829,10 +22829,14 @@ fn tc_report_immutable_binder(name: Str, message: Str, at: Int) -> Bool ! Diag.R
 // so the fix puts `mut` before the binder in every alternative: one edit from the first binder
 // to the last, which needs them all on one line with the name where each node says.
 fn tc_report_immutable_or_binder(name: Str, message: Str, at: Int, decl: Int, site: Int, idx: Int, notes0: List[Str]) -> Bool ! Diag.Report {
+    let pat = tc_site_pattern(site)
+    // In a match arm, a name `mut` in some alternatives and not others is already E0005, whose fix
+    // is this one.
+    let sk = node_kind(site)
+    if sk != NodeKind.LetBinding && sk != NodeKind.ForIn && tc_has_mut_binder(pat, name) { return true }
     let mut notes = notes0
     let in_closure = tc_closure_scope_base.len() > 0 && idx < tc_closure_scope_base.get(tc_closure_scope_base.len() - 1).unwrap()
     if in_closure { notes.push("captured here: the closure that makes this write captures `{name}`") }
-    let pat = tc_site_pattern(site)
     let mut binders: List[Int] = []
     tc_binders_named(pat, name, binders)
     let line = node_line(decl)
@@ -22888,7 +22892,7 @@ fn tc_binders_named(pat: Int, name: Str, out: List[Int]) {
         if node_name(pat) == name { out.push(pat) }
     } else if k == NodeKind.AsPattern {
         tc_binders_named(node_pattern(pat), name, out)
-        if node_name(pat) == name { out.push(pat) }
+        if node_name(pat) == name && node_is_mut(pat) == 0 { out.push(pat) }
     } else if k == NodeKind.TuplePattern || k == NodeKind.ListPattern || k == NodeKind.OrPattern {
         tc_binders_named_in(node_elements(pat), name, out)
     } else if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
@@ -22900,6 +22904,33 @@ fn tc_binders_named(pat: Int, name: Str, out: List[Int]) {
             tc_binders_named(node_pattern(pat), name, out)
         }
     }
+}
+
+// Whether some node in `pat` binds `name` with `mut`, in any alternative.
+fn tc_has_mut_binder(pat: Int, name: Str) -> Bool {
+    if pat == -1 { return false }
+    let k = node_kind(pat)
+    if k == NodeKind.IdentPattern || (k == NodeKind.StructLitField && node_pattern(pat) == -1) {
+        return node_name(pat) == name && node_is_mut(pat) != 0
+    }
+    if k == NodeKind.AsPattern {
+        if node_name(pat) == name && node_is_mut(pat) != 0 { return true }
+        return tc_has_mut_binder(node_pattern(pat), name)
+    }
+    if k == NodeKind.StructLitField { return tc_has_mut_binder(node_pattern(pat), name) }
+    let mut sl = -1
+    if k == NodeKind.TuplePattern || k == NodeKind.ListPattern || k == NodeKind.OrPattern {
+        sl = node_elements(pat)
+    } else if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
+        sl = node_fields(pat)
+    }
+    if sl == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        if tc_has_mut_binder(sublist_get(sl, i), name) { return true }
+        i = i + 1
+    }
+    false
 }
 
 fn tc_binders_named_in(sl: Int, name: Str, out: List[Int]) {
@@ -23164,6 +23195,8 @@ fn tc_report_or_pattern_bindings(or_pat: Int) ! Diag.Report {
         if !all.contains(nm) { all.push(nm) }
     }
     let mut notes: List[Str] = []
+    let mut other_notes = 0
+    let mut mut_names: List[Str] = []
     for nm in all {
         let mut first = -1
         let mut a = 0
@@ -23171,6 +23204,7 @@ fn tc_report_or_pattern_bindings(or_pat: Int) ! Diag.Report {
             let hit = tc_binder_in(names, nodes, alt_start.get(a).unwrap(), alt_start.get(a + 1).unwrap(), nm)
             if hit == -1 {
                 notes.push("`{tc_or_alt_text(sublist_get(alts, a), a)}` does not bind `{nm}`")
+                other_notes = other_notes + 1
             } else if first == -1 {
                 first = a
             } else {
@@ -23178,16 +23212,97 @@ fn tc_report_or_pattern_bindings(or_pat: Int) ! Diag.Report {
                 let t1 = tc_lookup_node_tid(hit)
                 if t0 >= 0 && t1 >= 0 && !tc_tid_same_type(t0, t1) {
                     notes.push("`{nm}` is `{type_to_str(t0)}` in `{tc_or_alt_text(sublist_get(alts, first), first)}` but `{type_to_str(t1)}` in `{tc_or_alt_text(sublist_get(alts, a), a)}`")
+                    other_notes = other_notes + 1
                 }
             }
             a = a + 1
         }
+        if tc_or_mut_notes(alts, names, nodes, alt_start, nm, notes) { mut_names.push(nm) }
     }
     if notes.len() == 0 { return }
+    let mut help = "all alternatives must bind the same variables"
+    if mut_names.len() > 0 {
+        let mut spelled: List[Str] = []
+        for nm in mut_names { spelled.push("`mut {nm}`") }
+        let sep = " and "
+        let mut_help = "write {spelled.join(sep)} in every alternative, or in none"
+        help = if other_notes == 0 { mut_help } else { "{help}; {mut_help}" }
+    }
     tc_errors.push("inconsistent bindings in OR-pattern")
+    let before = diag_entry_count()
     diag_error_at_notes("InconsistentPatternBindings", INCONSISTENT_PATTERN_BINDINGS,
-        "inconsistent bindings in OR-pattern", or_pat,
-        "all alternatives must bind the same variables", notes)
+        "inconsistent bindings in OR-pattern", or_pat, help, notes)
+    // The fix is offered only when mutability is the whole problem, so applying it clears the error.
+    if other_notes == 0 && diag_entry_count() > before { tc_set_or_mut_fix(or_pat, mut_names) }
+}
+
+// Notes for a name that is `mut` in some alternatives of an OR-pattern and not in others: one for
+// the first alternative that binds it, one for each later alternative that differs from it. A
+// binder that E0613 recovery made `mut` counts as `mut`, and a name with one is left to that error.
+fn tc_or_mut_notes(alts: Int, names: List[Str], nodes: List[Int], alt_start: List[Int], name: Str, notes: List[Str]) -> Bool {
+    let n = sublist_length(alts)
+    let mut first = -1
+    let mut first_mut = false
+    let mut differ: List[Int] = []
+    let mut a = 0
+    while a < n {
+        let hit = tc_binder_in(names, nodes, alt_start.get(a).unwrap(), alt_start.get(a + 1).unwrap(), name)
+        if hit != -1 {
+            if node_is_mut(hit) == BINDER_MUT_RECOVERED { return false }
+            let is_mut = node_is_mut(hit) != 0
+            if first == -1 {
+                first = a
+                first_mut = is_mut
+            } else if is_mut != first_mut {
+                differ.push(a)
+            }
+        }
+        a = a + 1
+    }
+    if differ.len() == 0 { return false }
+    notes.push(tc_or_mut_note(name, first_mut, sublist_get(alts, first), first))
+    for d in differ { notes.push(tc_or_mut_note(name, !first_mut, sublist_get(alts, d), d)) }
+    true
+}
+
+fn tc_or_mut_note(name: Str, is_mut: Bool, alt: Int, index: Int) -> Str {
+    let state = if is_mut { "is `mut`" } else { "is not `mut`" }
+    "`{name}` {state} in `{tc_or_alt_text(alt, index)}`"
+}
+
+// The E0005 fix for `mut` that differs across alternatives: `mut` before each binder of `names`
+// that lacks it. A diagnostic holds one edit, so it runs from the first such binder to the last,
+// which needs them all on one line with the name where each node says.
+fn tc_set_or_mut_fix(or_pat: Int, names: List[Str]) {
+    if names.len() == 0 { return }
+    let mut binders: List[Int] = []
+    for nm in names { tc_binders_named(or_pat, nm, binders) }
+    if binders.len() == 0 { return }
+    // tc_binders_named keeps source order for one name; the names interleave, so sort by column.
+    let mut i = 1
+    while i < binders.len() {
+        let mut j = i
+        while j > 0 && node_col(binders.get(j - 1).unwrap()) > node_col(binders.get(j).unwrap()) {
+            let t = binders.get(j).unwrap()
+            binders.set(j, binders.get(j - 1).unwrap())
+            binders.set(j - 1, t)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    let line = node_line(binders.get(0).unwrap())
+    let text = diag_source_line(diag_file_for_node(or_pat), line)
+    if text == "" { return }
+    for b in binders {
+        let k = node_kind(b)
+        let name_end = node_col(b) - 1 + node_name(b).byte_len()
+        if k != NodeKind.IdentPattern && k != NodeKind.StructLitField && k != NodeKind.AsPattern { return }
+        if node_line(b) != line || name_end > text.byte_len() || text.byte_slice(node_col(b) - 1, name_end) != node_name(b) { return }
+    }
+    let last = binders.get(binders.len() - 1).unwrap()
+    let fix_col = node_col(binders.get(0).unwrap())
+    let fix_end = node_col(last) + node_name(last).byte_len()
+    diag_set_last_fix_at("insert `mut`", tc_insert_mut_before(text, binders, fix_col, fix_end), line, fix_col, line, fix_end)
 }
 
 // The binder node of `name` among names[from..to), or -1.

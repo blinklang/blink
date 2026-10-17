@@ -1,6 +1,6 @@
-// Every alternative of an OR-pattern binds the same names with the same types
-// (sections/03_types.md §3.5 *OR-Patterns*). An alternative that misses a name another one
-// binds, or binds it at another type, is `error[InconsistentPatternBindings]`. Name
+// Every alternative of an OR-pattern binds the same names with the same types and the same
+// `mut` (sections/03_types.md §3.5 *OR-Patterns*). An alternative that misses a name another one
+// binds, or binds it at another type or `mut`ness, is `error[InconsistentPatternBindings]`. Name
 // resolution checks every alternative, not only the first two. A write to an OR binder
 // with no `mut` is E0610, and its fix puts `mut` on the binder in every alternative.
 
@@ -220,5 +220,195 @@ fn main() {
         if d.name == "ShadowedVariable" && (d.line != 8 || d.col != 11) { ok = false }
     }
     if !ok { show("shadow") }
+    assert(ok)
+}
+
+// Exactly one error, InconsistentPatternBindings at line:col, with exactly `notes`, a help that
+// holds `help`, and the fix `fix` over line:fix_col-fix_end ("" for no fix).
+fn expect_mut_mismatch(label: Str, line: Int, col: Int, notes: List[Str], help: Str, fix: Str, fix_col: Int, fix_end: Int) {
+    let mut ok = errors() == 1 && count("error", "InconsistentPatternBindings") == 1
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "InconsistentPatternBindings" {
+            if d.code != "E0005" || d.message != "inconsistent bindings in OR-pattern" { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if !d.help.contains(help) { ok = false }
+            if d.notes.len() != notes.len() { ok = false }
+            for n in notes {
+                if !d.notes.contains(n) { ok = false }
+            }
+            if fix == "" {
+                if d.fix_text != "" { ok = false }
+            } else {
+                if d.fix_action != "insert `mut`" || d.fix_text != fix { ok = false }
+                if d.fix_line != line || d.fix_col != fix_col || d.fix_end_line != line || d.fix_end_col != fix_end { ok = false }
+            }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "a binder mut in the first alternative only is InconsistentPatternBindings" {
+    probe("build/orb_mut_first.bl", #"
+type E { Click(Int, Int), Touch(Int, Int) }
+
+fn main() {
+    let e = E.Click(1, 2)
+    match e {
+        E.Click(mut x, y) | E.Touch(x, y) => { let _ = x + y }
+    }
+}
+"#)
+    expect_mut_mismatch("mut first", 7, 9,
+        ["`x` is `mut` in `E.Click(mut x, y)`", "`x` is not `mut` in `E.Touch(x, y)`"],
+        "write `mut x` in every alternative, or in none", "mut x", 37, 38)
+}
+
+test "a binder mut in a later alternative only is one error, with no E0610 for a write" {
+    probe("build/orb_mut_later.bl", #"
+type E { Click(Int, Int), Touch(Int, Int) }
+
+fn main() {
+    let e = E.Click(1, 2)
+    match e {
+        E.Click(x, y) | E.Touch(mut x, y) => {
+            x = 5
+            let _ = x + y
+        }
+    }
+}
+"#)
+    expect_mut_mismatch("mut later", 7, 9,
+        ["`x` is not `mut` in `E.Click(x, y)`", "`x` is `mut` in `E.Touch(mut x, y)`"],
+        "write `mut x` in every alternative, or in none", "mut x", 17, 18)
+}
+
+test "one alternative of three without mut is reported against that alternative" {
+    probe("build/orb_mut_three.bl", #"
+type S { A(Int), B(Int), C(Int) }
+
+fn main() {
+    let s = S.A(1)
+    match s {
+        A(mut n) | B(mut n) | C(n) => { let _ = n }
+    }
+}
+"#)
+    expect_mut_mismatch("three-way", 7, 9,
+        ["`n` is `mut` in `A(mut n)`", "`n` is not `mut` in `C(n)`"],
+        "write `mut n` in every alternative, or in none", "mut n", 33, 34)
+}
+
+test "the fix puts mut before the binder in every alternative that lacks it" {
+    probe("build/orb_mut_span.bl", #"
+type S { A(Int), B(Int), C(Int) }
+
+fn main() {
+    let s = S.A(1)
+    match s {
+        A(mut n) | B(n) | C(n) => { let _ = n }
+    }
+}
+"#)
+    expect_mut_mismatch("fix span", 7, 9,
+        ["`n` is `mut` in `A(mut n)`", "`n` is not `mut` in `B(n)`", "`n` is not `mut` in `C(n)`"],
+        "write `mut n` in every alternative, or in none", "mut n) | C(mut n", 22, 30)
+}
+
+test "a struct shorthand binder mut in one alternative only is InconsistentPatternBindings" {
+    probe("build/orb_mut_struct.bl", #"
+type Shape { Circle { r: Int }, Ring { r: Int, w: Int } }
+
+fn main() {
+    let s = Shape.Circle { r: 1 }
+    match s {
+        Shape.Circle { mut r } | Shape.Ring { r, .. } => { let _ = r }
+    }
+}
+"#)
+    expect_mut_mismatch("struct shorthand", 7, 9,
+        [#"`r` is `mut` in `Shape.Circle { mut r }`"#, #"`r` is not `mut` in `Shape.Ring { r, .. }`"#],
+        "write `mut r` in every alternative, or in none", "mut r", 47, 48)
+}
+
+test "an as name mut in one alternative only is InconsistentPatternBindings" {
+    probe("build/orb_mut_as.bl", #"
+type T { A((Int, Int)), B((Int, Int)) }
+
+fn main() {
+    let t = T.A((1, 2))
+    match t {
+        A(mut v as (p, _)) | B(v as (_, p)) => {
+            let _ = v
+            let _ = p
+        }
+    }
+}
+"#)
+    expect_mut_mismatch("as name", 7, 9,
+        ["`v` is `mut` in `A(mut v as (p, _))`", "`v` is not `mut` in `B(v as (_, p))`"],
+        "write `mut v` in every alternative, or in none", "mut v", 32, 33)
+}
+
+test "a name whose type and mutability both differ is one error with both notes and no fix" {
+    probe("build/orb_mut_type.bl", #"
+fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    match r {
+        Ok(mut x) | Err(x) => { let _ = x }
+    }
+}
+"#)
+    expect_mut_mismatch("type and mut", 5, 9,
+        ["`x` is `Int` in `Ok(mut x)` but `Str` in `Err(x)`", "`x` is `mut` in `Ok(mut x)`", "`x` is not `mut` in `Err(x)`"],
+        "write `mut x` in every alternative, or in none", "", 0, 0)
+    let mut ok = true
+    for d in diag_entries {
+        if d.name == "InconsistentPatternBindings" && !d.help.contains("all alternatives must bind the same variables") { ok = false }
+    }
+    if !ok { show("type and mut help") }
+    assert(ok)
+}
+
+test "struct shorthand and as names mut in every alternative are clean" {
+    probe("build/orb_mut_all.bl", #"
+type Shape { Circle { r: Int }, Ring { r: Int, w: Int } }
+type T { A((Int, Int)), B((Int, Int)) }
+
+fn main() {
+    let s = Shape.Circle { r: 1 }
+    match s {
+        Shape.Circle { mut r } | Shape.Ring { mut r, .. } => {
+            r = 2
+            let _ = r
+        }
+    }
+    let t = T.A((1, 2))
+    match t {
+        A(mut v as (p, _)) | B(mut v as (_, p)) => {
+            v = (p, p)
+            let _ = v
+        }
+    }
+}
+"#)
+    let ok = errors() == 0 && count("warning", "UnusedMut") == 0
+    if !ok { show("all mut") }
+    assert(ok)
+}
+
+test "a binder mut only through E0613 recovery adds no InconsistentPatternBindings" {
+    probe("build/orb_mut_recovered.bl", #"
+type T { A((Int, Int)), B((Int, Int)) }
+
+fn main() {
+    let t = T.A((1, 2))
+    match t {
+        A(mut (a, b)) | B((mut a, b)) => { let _ = a + b }
+    }
+}
+"#)
+    let ok = errors() == 1 && count("error", "MutOnPattern") == 1
+    if !ok { show("recovered") }
     assert(ok)
 }
