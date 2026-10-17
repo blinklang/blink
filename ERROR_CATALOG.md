@@ -89,6 +89,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | Name | Code | One-line | Category | Spec ref |
 |------|------|----------|----------|----------|
 | NonExhaustiveMatch | E0004 | A `match` leaves an enum variant unhandled. Guarded arms do not contribute to coverage; a `_` or plain-binding arm makes the match exhaustive | Pattern matching | §3.9 |
+| InconsistentPatternBindings | E0005 | The alternatives of an OR-pattern do not bind the same names, or bind one name at different types. One error per OR-pattern; each missing name and each type difference is a note | Pattern matching | §3.5 |
 | TypeError | E0300 | Type mismatch detected during type checking | Type checking | §3 |
 | CannotInferType | E0301 | Inference left a type variable unbound — annotate the binding, or supply the type argument at the call when the callee's signature does not supply it. Reported where the repair attaches | Type checking | §3.4 |
 | TypeArgArity | E0303 | A type-argument list has the wrong count for the declaration it applies to. In a type position that includes none (a bare `Channel`/`List`). At a callee or a struct-literal head, a written list of the wrong count (`decode[A, B](s)`, `plain[Int](3)`); an absent list there is left to inference. A non-generic declaration or a local value binds zero. Under- and over-application are one code. A rejected list supplies nothing: no E0301 or E0306 for that call's binders. Decided when the head resolves: at name resolution for a type or a path, once the receiver's type is known for a method | Name resolution | §3.4 |
@@ -325,6 +326,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | Code | Name | Implementation |
 |------|------|---------------|
 | E0004 | NonExhaustiveMatch | `typecheck.bl` — `tc_check_match_exhaustive`, on a match whose scrutinee resolves to a declared enum. Under-approximating: Int/Str/Char ranges, tuple/struct patterns and nested refutable sub-patterns contribute nothing rather than risk a false positive |
+| E0005 | InconsistentPatternBindings | `typecheck.bl` — `tc_check_or_pattern_bindings`, from the match statement walk, for each OR-pattern in an arm's pattern at any depth |
 | E0500 | UndeclaredEffect | `typecheck.bl` — `tc_check_effect_rows`, at each call to a fn or method that declares effects, each user effect operation, and each `! Arena` callee, in every fn but `main`. Not yet checked: a builtin namespace call (`io.println`), the declared row of an `@ffi` callee, and test blocks |
 | E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |

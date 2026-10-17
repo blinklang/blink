@@ -1,0 +1,224 @@
+// Every alternative of an OR-pattern binds the same names with the same types
+// (sections/03_types.md §3.5 *OR-Patterns*). An alternative that misses a name another one
+// binds, or binds it at another type, is `error[InconsistentPatternBindings]`. Name
+// resolution checks every alternative, not only the first two. A write to an OR binder
+// with no `mut` is E0610, and its fix puts `mut` on the binder in every alternative.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn all() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        out.push("{d.severity} {d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help} | notes: {d.notes.join(\"; \")} | fix: {d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}")
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for e in all() { io.println("  {e}") }
+}
+
+fn count(severity: Str, name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == severity && d.name == name { n += 1 }
+    }
+    n
+}
+
+fn errors() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" { n += 1 }
+    }
+    n
+}
+
+// Exactly one error, InconsistentPatternBindings at line:col, whose notes hold each of `notes`.
+fn expect_inconsistent(label: Str, line: Int, col: Int, notes: List[Str]) {
+    let mut ok = errors() == 1 && count("error", "InconsistentPatternBindings") == 1
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "InconsistentPatternBindings" {
+            if d.code != "E0005" || d.message != "inconsistent bindings in OR-pattern" { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if !d.help.contains("all alternatives must bind the same variables") { ok = false }
+            if d.notes.len() != notes.len() { ok = false }
+            for n in notes {
+                if !d.notes.contains(n) { ok = false }
+            }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "an alternative that does not bind a name is InconsistentPatternBindings" {
+    probe("build/orb_missing.bl", #"
+fn use_it(n: Int) -> Int { n }
+
+fn main() {
+    let o: Option[Int] = Some(1)
+    match o {
+        Some(x) | None => { let _ = use_it(x) }
+    }
+}
+"#)
+    expect_inconsistent("missing name", 7, 9, ["`None` does not bind `x`"])
+}
+
+test "a name only a later alternative binds is reported against the earlier one" {
+    probe("build/orb_later.bl", #"
+type S { A(Int), B(Int, Int) }
+
+fn main() {
+    let s = S.A(1)
+    match s {
+        A(x) | B(x, y) => { let _ = x + y }
+    }
+}
+"#)
+    expect_inconsistent("later name", 7, 9, ["`A(x)` does not bind `y`"])
+}
+
+test "a name with another type in another alternative is InconsistentPatternBindings" {
+    probe("build/orb_type.bl", #"
+fn main() {
+    let r: Result[Int, Str] = Ok(1)
+    match r {
+        Ok(x) | Err(x) => { let _ = x }
+    }
+}
+"#)
+    expect_inconsistent("type mismatch", 5, 9, ["`x` is `Int` in `Ok(x)` but `Str` in `Err(x)`"])
+}
+
+test "consistent alternatives bind each name once, with no warning" {
+    probe("build/orb_clean.bl", #"
+type E { Click(Int, Int), Touch(Int, Int), Quit }
+
+fn main() {
+    let e = E.Click(1, 2)
+    match e {
+        Click(x, y) | Touch(x, y) => { let _ = x + y }
+        Quit => {}
+    }
+}
+"#)
+    let ok = diag_entries.len() == 0
+    if !ok { show("clean") }
+    assert(ok)
+}
+
+test "an unread OR binder is one UnusedVariable, at the first alternative" {
+    probe("build/orb_unused.bl", #"
+type S { A(Int), B(Int), C(Int) }
+
+fn main() {
+    let s = S.A(1)
+    match s {
+        A(n) | B(n) | C(n) => {}
+    }
+}
+"#)
+    let mut ok = errors() == 0 && count("warning", "UnusedVariable") == 1
+    for d in diag_entries {
+        if d.name == "UnusedVariable" && (d.line != 7 || d.col != 11) { ok = false }
+    }
+    if !ok { show("unused") }
+    assert(ok)
+}
+
+test "name resolution checks the third alternative of an OR-pattern" {
+    probe("build/orb_third.bl", #"
+type V { A, B, C }
+
+fn main() {
+    let v = V.A
+    match v {
+        A | B | mut C => {}
+    }
+}
+"#)
+    let mut ok = errors() == 1 && count("error", "MutOnPattern") == 1
+    for d in diag_entries {
+        if d.name == "MutOnPattern" && (d.line != 7 || d.col != 17) { ok = false }
+    }
+    if !ok { show("third alternative") }
+    assert(ok)
+}
+
+test "a write to an OR binder without mut is E0610 with a fix in every alternative" {
+    probe("build/orb_write.bl", #"
+type Shape { Circle(Int), Rect(Int, Int), Tri(Int) }
+
+fn main() {
+    let s = Shape.Circle(1)
+    match s {
+        Shape.Circle(r) | Shape.Rect(r, _) | Shape.Tri(r) => { r = 9 }
+    }
+}
+"#)
+    let mut ok = errors() == 1 && count("error", "MutationRequiresMut") == 1
+    for d in diag_entries {
+        if d.name == "MutationRequiresMut" {
+            if d.fix_action != "insert `mut`" { ok = false }
+            if d.fix_text != "mut r) | Shape.Rect(mut r, _) | Shape.Tri(mut r" { ok = false }
+            if d.fix_line != 7 || d.fix_col != 22 || d.fix_end_line != 7 || d.fix_end_col != 57 { ok = false }
+            if !d.help.contains("`Shape.Circle(mut r) | Shape.Rect(mut r, _) | Shape.Tri(mut r)`") { ok = false }
+        }
+    }
+    if !ok { show("E0610 in every alternative") }
+    assert(ok)
+}
+
+test "a mut binder in every alternative takes a write" {
+    probe("build/orb_mut.bl", #"
+type Shape { Circle(Int), Rect(Int, Int) }
+
+fn main() {
+    let s = Shape.Circle(1)
+    match s {
+        Shape.Circle(mut r) | Shape.Rect(mut r, _) => {
+            r = 9
+            let _ = r
+        }
+    }
+}
+"#)
+    let ok = errors() == 0
+    if !ok { show("mut in every alternative") }
+    assert(ok)
+}
+
+test "an OR binder that shadows an outer name is one ShadowedVariable" {
+    probe("build/orb_shadow.bl", #"
+type S { A(Int), B(Int) }
+
+fn main() {
+    let n = 1
+    let s = S.A(n)
+    match s {
+        A(n) | B(n) => { let _ = n }
+    }
+}
+"#)
+    let mut ok = errors() == 0 && count("warning", "ShadowedVariable") == 1
+    for d in diag_entries {
+        if d.name == "ShadowedVariable" && (d.line != 8 || d.col != 11) { ok = false }
+    }
+    if !ok { show("shadow") }
+    assert(ok)
+}

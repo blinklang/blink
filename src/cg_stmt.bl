@@ -3297,8 +3297,175 @@ fn pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report 
         NodeKind.TuplePattern => tuple_pattern_binds(ctx, pat, out)
         NodeKind.StructPattern => struct_pattern_binds(ctx, pat, out)
         NodeKind.ListPattern => list_pattern_binds(ctx, pat, out)
+        NodeKind.OrPattern => or_pattern_binds(ctx, pat, out)
         _ => true
     }
+}
+
+// Each alternative binds the same names at the same types (typecheck holds it), but each
+// reads them out of a different shape. So each name gets a holder declared ahead of a chain
+// that tests the alternatives in order: the branch of the one that matched binds its names
+// in a scope of its own and copies them into the holders. Then the arm binds each name from
+// its holder, with the `mut` of the first alternative.
+fn or_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let alts = node_elements(pat)
+    if alts == -1 || sublist_length(alts) == 0 { return true }
+    let n = sublist_length(alts)
+    let mut names: List[Str] = []
+    let mut nodes: List[Int] = []
+    let mut alt_start: List[Int] = []
+    let mut a = 0
+    while a < n {
+        alt_start.push(names.len())
+        if !or_alt_binders(sublist_get(alts, a), names, nodes) { return false }
+        a = a + 1
+    }
+    alt_start.push(names.len())
+    let first_end = alt_start.get(1).unwrap()
+    if first_end == 0 { return true }
+    let mut holders: List[Str] = []
+    let mut tids: List[Int] = []
+    let mut recs: List[LayoutRecord] = []
+    let mut i = 0
+    while i < first_end {
+        let node = nodes.get(i).unwrap()
+        let tid = stmt_tid(node)
+        if tid < 0 { return false }
+        let _ = ensure_typedef_for(tid)
+        let rec = layout_at(tid, Position.Local, node)
+        let holder = c_mint_local("orb")
+        out.push(ir_let(tid, node, rec.c_spelling, holder, rec.slot_form, -1))
+        holders.push(holder)
+        tids.push(tid)
+        recs.push(rec)
+        i = i + 1
+    }
+    // Built from the last alternative up, so each test's else is the rest of the chain. The
+    // last alternative needs no test: the arm runs only when one of them matched.
+    let mut chain = -1
+    a = n - 1
+    while a >= 0 {
+        let alt = sublist_get(alts, a)
+        let branch = or_alt_branch(ctx, alt, names, holders, tids, recs, first_end)
+        if branch < 0 { return false }
+        let cond = if a == n - 1 { -1 } else { pattern_test(ctx, alt) }
+        chain = if cond < 0 { branch } else { ir_block(alt, [ir_if(alt, cond, branch, chain)]) }
+        a = a - 1
+    }
+    out.push(chain)
+    i = 0
+    while i < first_end {
+        let name = names.get(i).unwrap()
+        let first = nodes.get(i).unwrap()
+        // A frame write resolves to one alternative's binder of the name, not always the first.
+        let mut decl = first
+        a = 0
+        while a < n {
+            let other = or_binder_in(names, nodes, alt_start.get(a).unwrap(), alt_start.get(a + 1).unwrap(), name)
+            if other >= 0 && cg_eff_frame_written(other) { decl = other }
+            a = a + 1
+        }
+        let rec = recs.get(i).unwrap()
+        let tid = tids.get(i).unwrap()
+        let held = ir_var_ref(tid, first, rec.c_spelling, holders.get(i).unwrap(), rec.slot_form)
+        bind_pattern_binder(first, decl, name, tid, rec, held, out, node_is_mut(first) == 1)
+        i = i + 1
+    }
+    true
+}
+
+// One alternative's branch: its binders in a scope of their own, each copied to its holder.
+fn or_alt_branch(ctx: MatchCtx, alt: Int, names: List[Str], holders: List[Str], tids: List[Int], recs: List[LayoutRecord], count: Int) -> Int ! Diag.Report {
+    let _ = open_scope()
+    let mut out: List[Int] = []
+    if !pattern_binds(ctx, alt, out) {
+        close_scope()
+        return -1
+    }
+    let mut i = 0
+    while i < count {
+        let tid = tids.get(i).unwrap()
+        let rec = recs.get(i).unwrap()
+        let name = names.get(i).unwrap()
+        let target = ir_var_ref(tid, alt, rec.c_spelling, holders.get(i).unwrap(), rec.slot_form)
+        // A `mut` binder a closure shares is a cell in the branch too.
+        let value = if binder_is_celled(cur_scope(), name) {
+            ir_cell_ref(tid, alt, rec.c_spelling, name, rec.slot_form)
+        } else {
+            ir_var_ref(tid, alt, rec.c_spelling, cg_local_c_name(name), rec.slot_form)
+        }
+        out.push(ir_assign(alt, target, value))
+        i = i + 1
+    }
+    close_scope()
+    ir_block(alt, out)
+}
+
+// The binder node of `name` among nodes[from..to), or -1.
+fn or_binder_in(names: List[Str], nodes: List[Int], from: Int, to: Int, name: Str) -> Int {
+    let mut i = from
+    while i < to {
+        if names.get(i).unwrap() == name { return nodes.get(i).unwrap() }
+        i = i + 1
+    }
+    -1
+}
+
+// Each name `pat` binds, with the node that binds it, in source order. A nested OR-pattern
+// binds what its first alternative binds. False when a binder has no recorded type, which
+// leaves no way to tell a name from a bare variant.
+fn or_alt_binders(pat: Int, names: List[Str], nodes: List[Int]) -> Bool ! Diag.Report {
+    if pat == -1 { return true }
+    let k = nk_of(node_kind(pat))
+    if k == NodeKind.IdentPattern {
+        let name = node_name(pat)
+        let tid = stmt_tid(pat)
+        if tid < 0 { return false }
+        if is_variant_name(tid, name) { return true }
+        names.push(name)
+        nodes.push(pat)
+        return true
+    }
+    if k == NodeKind.AsPattern {
+        if !or_alt_binders(node_pattern(pat), names, nodes) { return false }
+        names.push(node_name(pat))
+        nodes.push(pat)
+        return true
+    }
+    if k == NodeKind.OrPattern {
+        let alts = node_elements(pat)
+        if alts == -1 || sublist_length(alts) == 0 { return true }
+        return or_alt_binders(sublist_get(alts, 0), names, nodes)
+    }
+    if k == NodeKind.TuplePattern || k == NodeKind.ListPattern {
+        let sl = node_elements(pat)
+        if sl == -1 { return true }
+        let mut i = 0
+        while i < sublist_length(sl) {
+            if !or_alt_binders(sublist_get(sl, i), names, nodes) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
+        let sl = node_fields(pat)
+        if sl == -1 { return true }
+        let by_name = k == NodeKind.StructPattern || node_int_val(pat) != 0
+        let mut i = 0
+        while i < sublist_length(sl) {
+            let f = sublist_get(sl, i)
+            if by_name && node_pattern(f) == -1 {
+                names.push(node_name(f))
+                nodes.push(f)
+            } else if by_name {
+                if !or_alt_binders(node_pattern(f), names, nodes) { return false }
+            } else if !or_alt_binders(f, names, nodes) {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    true
 }
 
 // A StructPattern's own type_name may in fact be a bare (unqualified) variant name: the

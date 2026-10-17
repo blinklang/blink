@@ -27,7 +27,7 @@ import diagnostics.{
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
-    NON_EXHAUSTIVE_MATCH, DUPLICATE_MODULE_BINDING,
+    NON_EXHAUSTIVE_MATCH, INCONSISTENT_PATTERN_BINDINGS, DUPLICATE_MODULE_BINDING,
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
@@ -13096,6 +13096,72 @@ fn nr_scope_push_entry(name: Str, is_mut: Int, tid: Int, node: Int) {
     nr_name_top.insert(name, new_idx)
 }
 
+// An OR-pattern binds each name once for its arm (§3.5 *OR-Patterns*). The first alternative
+// binds into the arm's scope as any pattern does. Each later one binds into a frame of its own,
+// with no shadow warning, and nr_or_alt_close then keeps only the names no earlier alternative
+// bound: a name bound again is the same binding, so the arm sees one entry, warned about once.
+fn nr_or_alt_open() -> Int {
+    let saved_warn = nr_warn_unused
+    nr_warn_unused = 0
+    nr_push_scope()
+    saved_warn
+}
+
+// Closes the frame nr_or_alt_open began, for an OR-pattern whose entries begin at `or_start`.
+// Answers the scope index of each name it keeps, for the caller's shadow check.
+fn nr_or_alt_close(or_start: Int, saved_warn: Int) -> List[Int] {
+    let frame = nr_scope_frames.get(nr_scope_frames.len() - 1).unwrap()
+    let mut names: List[Str] = []
+    let mut muts: List[Int] = []
+    let mut tids: List[Int] = []
+    let mut nodes: List[Int] = []
+    let mut i = frame
+    while i < nr_scope_names.len() {
+        let nm = nr_scope_names.get(i).unwrap()
+        let mut bound = false
+        let mut j = or_start
+        while j < frame {
+            if nr_scope_names.get(j).unwrap() == nm { bound = true }
+            j = j + 1
+        }
+        if !bound {
+            names.push(nm)
+            muts.push(nr_scope_muts.get(i).unwrap())
+            tids.push(nr_scope_types.get(i).unwrap())
+            nodes.push(nr_scope_nodes.get(i).unwrap())
+        }
+        i = i + 1
+    }
+    while nr_scope_names.len() > frame {
+        let idx = nr_scope_names.len() - 1
+        let prev = nr_scope_prev.get(idx).unwrap()
+        if prev == -1 {
+            nr_name_top.remove(nr_scope_names.get(idx).unwrap())
+        } else {
+            nr_name_top.insert(nr_scope_names.get(idx).unwrap(), prev)
+        }
+        nr_scope_names.pop()
+        nr_scope_muts.pop()
+        nr_scope_types.pop()
+        nr_scope_reads.pop()
+        nr_scope_writes.pop()
+        nr_scope_nodes.pop()
+        nr_scope_captured.pop()
+        nr_scope_prev.pop()
+    }
+    nr_scope_frames.pop()
+    nr_scope_depth = nr_scope_depth - 1
+    nr_warn_unused = saved_warn
+    let mut kept: List[Int] = []
+    i = 0
+    while i < names.len() {
+        kept.push(nr_scope_names.len())
+        nr_scope_push_entry(names.get(i).unwrap(), muts.get(i).unwrap(), tids.get(i).unwrap(), nodes.get(i).unwrap())
+        i = i + 1
+    }
+    kept
+}
+
 fn nr_push_scope() {
     nr_scope_frames.push(nr_scope_names.len())
     nr_scope_depth = nr_scope_depth + 1
@@ -16612,8 +16678,21 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.OrPattern {
-        nr_check_pattern(node_left(node))
-        nr_check_pattern(node_right(node))
+        let alts = node_elements(node)
+        if alts != -1 && sublist_length(alts) > 0 {
+            let or_start = nr_scope_names.len()
+            nr_check_pattern(sublist_get(alts, 0))
+            let mut i = 1
+            while i < sublist_length(alts) {
+                let saved_warn = nr_or_alt_open()
+                nr_check_pattern(sublist_get(alts, i))
+                for idx in nr_or_alt_close(or_start, saved_warn) {
+                    let decl = nr_scope_nodes.get(idx).unwrap()
+                    if decl != -1 { nr_check_shadow(nr_scope_names.get(idx).unwrap(), decl) }
+                }
+                i = i + 1
+            }
+        }
         return
     }
 
@@ -22723,9 +22802,9 @@ fn tc_report_immutable_binder(name: Str, message: Str, at: Int) -> Bool ! Diag.R
     }
     if k != NodeKind.IdentPattern && k != NodeKind.AsPattern && k != NodeKind.StructLitField { return false }
     let site = tc_binder_site(decl)
-    // Name resolution does not bind an OR-pattern's names yet, so a write to one is already
-    // UndefinedVariable, and one `mut` would not fix it: each alternative binds the name.
-    if site != -1 && tc_pattern_holds(tc_site_pattern(site), decl) == 2 { return false }
+    if site != -1 && tc_pattern_holds(tc_site_pattern(site), decl) == 2 {
+        return tc_report_immutable_or_binder(name, message, at, decl, site, idx, notes)
+    }
     let preview = tc_binder_fix_preview(decl, site)
     let in_closure = tc_closure_scope_base.len() > 0 && idx < tc_closure_scope_base.get(tc_closure_scope_base.len() - 1).unwrap()
     if in_closure { notes.push("captured here: the closure that makes this write captures `{name}`") }
@@ -22744,6 +22823,92 @@ fn tc_report_immutable_binder(name: Str, message: Str, at: Int) -> Bool ! Diag.R
         diag_set_last_fix_at("insert `mut`", "mut {name}", line, col, line, col + name.byte_len())
     }
     true
+}
+
+// E0610 for a binder an OR-pattern holds. Each alternative binds the name (§3.5 *OR-Patterns*),
+// so the fix puts `mut` before the binder in every alternative: one edit from the first binder
+// to the last, which needs them all on one line with the name where each node says.
+fn tc_report_immutable_or_binder(name: Str, message: Str, at: Int, decl: Int, site: Int, idx: Int, notes0: List[Str]) -> Bool ! Diag.Report {
+    let mut notes = notes0
+    let in_closure = tc_closure_scope_base.len() > 0 && idx < tc_closure_scope_base.get(tc_closure_scope_base.len() - 1).unwrap()
+    if in_closure { notes.push("captured here: the closure that makes this write captures `{name}`") }
+    let pat = tc_site_pattern(site)
+    let mut binders: List[Int] = []
+    tc_binders_named(pat, name, binders)
+    let line = node_line(decl)
+    let text = diag_source_line(diag_file_for_node(decl), line)
+    let mut ok = text != "" && binders.len() > 0
+    for b in binders {
+        let k = node_kind(b)
+        let name_end = node_col(b) - 1 + name.byte_len()
+        if k != NodeKind.IdentPattern && k != NodeKind.StructLitField {
+            ok = false
+        } else if node_line(b) != line || name_end > text.byte_len() || text.byte_slice(node_col(b) - 1, name_end) != name { ok = false }
+    }
+    let mut fix = ""
+    let mut fix_col = 0
+    let mut fix_end = 0
+    let mut preview = ""
+    if ok {
+        fix_col = node_col(binders.get(0).unwrap())
+        fix_end = node_col(binders.get(binders.len() - 1).unwrap()) + name.byte_len()
+        fix = tc_insert_mut_before(text, binders, fix_col, fix_end)
+        if node_line(pat) == line && node_end_line(pat) == line && node_col(pat) <= fix_col && node_end_col(pat) >= fix_end && node_end_col(pat) - 1 <= text.byte_len() {
+            preview = tc_insert_mut_before(text, binders, node_col(pat), node_end_col(pat)).trim()
+        }
+    }
+    let help = if preview != "" { "declare it `mut` in every alternative that binds it: `{preview}`" } else { "declare it `mut` in every alternative that binds it: `mut {name}`" }
+    tc_errors.push(message)
+    let before = diag_entry_count()
+    diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at, help, notes)
+    if ok && diag_entry_count() > before {
+        diag_set_last_fix_at("insert `mut`", fix, line, fix_col, line, fix_end)
+    }
+    true
+}
+
+// Source columns [from, to) of `text`, with `mut ` before each of `binders`, which sit in that
+// range in source order.
+fn tc_insert_mut_before(text: Str, binders: List[Int], from: Int, to: Int) -> Str {
+    let mut out = ""
+    let mut c = from
+    for b in binders {
+        out = "{out}{text.byte_slice(c - 1, node_col(b) - 1)}mut "
+        c = node_col(b)
+    }
+    "{out}{text.byte_slice(c - 1, to - 1)}"
+}
+
+// Every node in `pat` that binds `name` with no `mut`, in every alternative, in source order.
+fn tc_binders_named(pat: Int, name: Str, out: List[Int]) {
+    if pat == -1 { return }
+    let k = node_kind(pat)
+    if node_name(pat) == name && node_is_mut(pat) != 0 && (k == NodeKind.IdentPattern || k == NodeKind.StructLitField) { return }
+    if k == NodeKind.IdentPattern {
+        if node_name(pat) == name { out.push(pat) }
+    } else if k == NodeKind.AsPattern {
+        tc_binders_named(node_pattern(pat), name, out)
+        if node_name(pat) == name { out.push(pat) }
+    } else if k == NodeKind.TuplePattern || k == NodeKind.ListPattern || k == NodeKind.OrPattern {
+        tc_binders_named_in(node_elements(pat), name, out)
+    } else if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
+        tc_binders_named_in(node_fields(pat), name, out)
+    } else if k == NodeKind.StructLitField {
+        if node_pattern(pat) == -1 {
+            if node_name(pat) == name { out.push(pat) }
+        } else {
+            tc_binders_named(node_pattern(pat), name, out)
+        }
+    }
+}
+
+fn tc_binders_named_in(sl: Int, name: Str, out: List[Int]) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        tc_binders_named(sublist_get(sl, i), name, out)
+        i = i + 1
+    }
 }
 
 // sections/03_types.md:302 — "Mutating methods require the binding to be `let mut`", with
@@ -22947,6 +23112,147 @@ fn tc_kind_has_no_variants(tid: Int) -> Int {
         TyKind.U32 => 1
         TyKind.U64 => 1
         _ => 0
+    }
+}
+
+// error[InconsistentPatternBindings] (E0005) for each OR-pattern in `pat`, at any depth, whose
+// alternatives do not bind the same names at the same types (§3.5 *OR-Patterns*). One error per
+// OR-pattern, with a note for each name an alternative misses and each name whose type differs.
+// Reported from the statement walk for the same reason as tc_check_enum_pattern_scrutinee.
+fn tc_check_or_pattern_bindings(pat: Int) ! Diag.Report {
+    if pat == -1 { return }
+    let k = node_kind(pat)
+    if k == NodeKind.OrPattern {
+        tc_report_or_pattern_bindings(pat)
+        tc_check_or_bindings_in(node_elements(pat))
+    } else if k == NodeKind.TuplePattern || k == NodeKind.ListPattern {
+        tc_check_or_bindings_in(node_elements(pat))
+    } else if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
+        tc_check_or_bindings_in(node_fields(pat))
+    } else if k == NodeKind.AsPattern || k == NodeKind.StructLitField {
+        tc_check_or_pattern_bindings(node_pattern(pat))
+    }
+}
+
+fn tc_check_or_bindings_in(sl: Int) ! Diag.Report {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        tc_check_or_pattern_bindings(sublist_get(sl, i))
+        i = i + 1
+    }
+}
+
+fn tc_report_or_pattern_bindings(or_pat: Int) ! Diag.Report {
+    let alts = node_elements(or_pat)
+    if alts == -1 { return }
+    let n = sublist_length(alts)
+    // Each alternative's binders, flattened: alt_start[i] is where alternative i's begin.
+    let mut names: List[Str] = []
+    let mut nodes: List[Int] = []
+    let mut alt_start: List[Int] = []
+    let mut i = 0
+    while i < n {
+        alt_start.push(names.len())
+        tc_pattern_binders(sublist_get(alts, i), names, nodes)
+        i = i + 1
+    }
+    alt_start.push(names.len())
+    // Every name some alternative binds, in source order.
+    let mut all: List[Str] = []
+    for nm in names {
+        if !all.contains(nm) { all.push(nm) }
+    }
+    let mut notes: List[Str] = []
+    for nm in all {
+        let mut first = -1
+        let mut a = 0
+        while a < n {
+            let hit = tc_binder_in(names, nodes, alt_start.get(a).unwrap(), alt_start.get(a + 1).unwrap(), nm)
+            if hit == -1 {
+                notes.push("`{tc_or_alt_text(sublist_get(alts, a), a)}` does not bind `{nm}`")
+            } else if first == -1 {
+                first = a
+            } else {
+                let t0 = tc_lookup_node_tid(tc_binder_in(names, nodes, alt_start.get(first).unwrap(), alt_start.get(first + 1).unwrap(), nm))
+                let t1 = tc_lookup_node_tid(hit)
+                if t0 >= 0 && t1 >= 0 && !tc_tid_same_type(t0, t1) {
+                    notes.push("`{nm}` is `{type_to_str(t0)}` in `{tc_or_alt_text(sublist_get(alts, first), first)}` but `{type_to_str(t1)}` in `{tc_or_alt_text(sublist_get(alts, a), a)}`")
+                }
+            }
+            a = a + 1
+        }
+    }
+    if notes.len() == 0 { return }
+    tc_errors.push("inconsistent bindings in OR-pattern")
+    diag_error_at_notes("InconsistentPatternBindings", INCONSISTENT_PATTERN_BINDINGS,
+        "inconsistent bindings in OR-pattern", or_pat,
+        "all alternatives must bind the same variables", notes)
+}
+
+// The binder node of `name` among names[from..to), or -1.
+fn tc_binder_in(names: List[Str], nodes: List[Int], from: Int, to: Int, name: Str) -> Int {
+    let mut i = from
+    while i < to {
+        if names.get(i).unwrap() == name { return nodes.get(i).unwrap() }
+        i = i + 1
+    }
+    -1
+}
+
+// An alternative as the user wrote it, or its position when it spans lines.
+fn tc_or_alt_text(alt: Int, index: Int) -> Str {
+    let line = node_line(alt)
+    if node_end_line(alt) == line && node_end_col(alt) > node_col(alt) {
+        let text = diag_source_line(diag_file_for_node(alt), line)
+        if node_end_col(alt) - 1 <= text.byte_len() { return text.byte_slice(node_col(alt) - 1, node_end_col(alt) - 1).trim() }
+    }
+    "alternative {index + 1}"
+}
+
+// Each name `pat` binds, with the node that binds it. A nested OR-pattern binds what its first
+// alternative binds; its own check compares the rest.
+fn tc_pattern_binders(pat: Int, names: List[Str], nodes: List[Int]) {
+    if pat == -1 { return }
+    let k = node_kind(pat)
+    if k == NodeKind.IdentPattern {
+        let name = node_name(pat)
+        if name != "_" && is_variant_name(name) == 0 {
+            names.push(name)
+            nodes.push(pat)
+        }
+    } else if k == NodeKind.AsPattern {
+        tc_pattern_binders(node_pattern(pat), names, nodes)
+        names.push(node_name(pat))
+        nodes.push(pat)
+    } else if k == NodeKind.OrPattern {
+        let alts = node_elements(pat)
+        if alts != -1 && sublist_length(alts) > 0 { tc_pattern_binders(sublist_get(alts, 0), names, nodes) }
+    } else if k == NodeKind.TuplePattern || k == NodeKind.ListPattern {
+        let sl = node_elements(pat)
+        if sl == -1 { return }
+        let mut i = 0
+        while i < sublist_length(sl) {
+            tc_pattern_binders(sublist_get(sl, i), names, nodes)
+            i = i + 1
+        }
+    } else if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
+        let sl = node_fields(pat)
+        if sl == -1 { return }
+        let by_name = k == NodeKind.StructPattern || node_int_val(pat) != 0
+        let mut i = 0
+        while i < sublist_length(sl) {
+            let f = sublist_get(sl, i)
+            if by_name && node_pattern(f) == -1 {
+                names.push(node_name(f))
+                nodes.push(f)
+            } else if by_name {
+                tc_pattern_binders(node_pattern(f), names, nodes)
+            } else {
+                tc_pattern_binders(f, names, nodes)
+            }
+            i = i + 1
+        }
     }
 }
 
@@ -23487,6 +23793,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 tc_check_pattern_types(node_pattern(arm))
                 tc_pattern_binding_type = -1
                 tc_check_enum_pattern_scrutinee(node_pattern(arm), scrut_tid)
+                tc_check_or_pattern_bindings(node_pattern(arm))
                 tc_check_stmt_match_arm(arm, in_value)
                 // Resolve the arm's body-value tid through the scoped-value memo, NOT a bare
                 // tc_lookup_node_tid: a braced arm body (`Pat => { ... }`) makes tc_arm_body_value
@@ -24137,11 +24444,21 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         // unchanged.
         let alts = node_elements(node)
         if alts != -1 {
+            let saved_binding = tc_pattern_binding_type
+            let or_start = nr_scope_names.len()
             let mut i = 0
             while i < sublist_length(alts) {
-                tc_check_pattern_types(sublist_get(alts, i))
+                tc_pattern_binding_type = saved_binding
+                if i == 0 {
+                    tc_check_pattern_types(sublist_get(alts, i))
+                } else {
+                    let saved_warn = nr_or_alt_open()
+                    tc_check_pattern_types(sublist_get(alts, i))
+                    let _ = nr_or_alt_close(or_start, saved_warn)
+                }
                 i = i + 1
             }
+            tc_pattern_binding_type = saved_binding
         }
         return
     }
