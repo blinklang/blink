@@ -31,7 +31,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT,
+    MUTATION_REQUIRES_MUT, UNEXPECTED_TOKEN_PATTERN,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -16136,7 +16136,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.ForIn {
         nr_check_node(node_iterable(node))
         nr_push_scope()
-        nr_define_at(node_var_name(node), node)
+        nr_define_mut_at(node_var_name(node), tc_for_binder_is_mut(node), node)
         let for_pat_sl = node_elements(node)
         if for_pat_sl != -1 {
             nr_check_pattern(for_pat_sl)
@@ -16414,6 +16414,18 @@ pub fn tc_let_binder_is_discard(node: Int) -> Int {
     0
 }
 
+// A leaf of a destructuring `let` is mutable when `mut` stands before it, or when the
+// whole pattern is under `let mut (a, b)`, which marks every leaf.
+fn tc_leaf_is_mut(leaf: Int, let_is_mut: Int) -> Int {
+    if let_is_mut != 0 || node_is_mut(leaf) != 0 { 1 } else { 0 }
+}
+
+// `for mut i in xs` marks the simple binder; a destructuring `for` marks each leaf.
+fn tc_for_binder_is_mut(for_node: Int) -> Int {
+    let binder = node_for_binder(for_node)
+    if binder == -1 { 0 } else { node_is_mut(binder) }
+}
+
 fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
     if pat == -1 { return }
     let kind = node_kind(pat)
@@ -16447,7 +16459,7 @@ fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
 
     if kind == NodeKind.WildcardPattern { return }
 
-    nr_define_typed(node_name(pat), is_mut, tid, pat)
+    nr_define_typed(node_name(pat), tc_leaf_is_mut(pat, is_mut), tid, pat)
     tc_publish_node_tid(pat, tid)
 }
 
@@ -16487,7 +16499,7 @@ fn nr_define_let_pattern(pat: Int, is_mut: Int) ! Diag.Report {
     // error where an undefined name is a diagnostic the author can act on. Refusing a
     // refutable pattern in a `let` is specified and unimplemented; until some pass does
     // it, both walks have to agree on which names exist.
-    nr_define_mut_at(node_name(pat), is_mut, pat)
+    nr_define_mut_at(node_name(pat), tc_leaf_is_mut(pat, is_mut), pat)
 }
 
 fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -16497,7 +16509,9 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if kind == NodeKind.IdentPattern {
         let name = node_name(node)
         if name != "_" && is_variant_name(name) == 0 {
-            nr_define_at(name, node)
+            nr_define_mut_at(name, node_is_mut(node), node)
+        } else if node_is_mut(node) != 0 {
+            diag_error_at("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "`mut` must come before a name the pattern binds, and `{name}` is a variant", node, "remove `mut`; a variant binds no name")
         }
         return
     }
@@ -16519,7 +16533,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
                     if fpat != -1 {
                         nr_check_pattern(fpat)
                     } else {
-                        nr_define_at(node_name(f), f)
+                        nr_define_mut_at(node_name(f), node_is_mut(f), f)
                     }
                 } else {
                     nr_check_pattern(f)
@@ -16544,7 +16558,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 if fpat != -1 {
                     nr_check_pattern(fpat)
                 } else {
-                    nr_define_at(node_name(f), f)
+                    nr_define_mut_at(node_name(f), node_is_mut(f), f)
                 }
                 i = i + 1
             }
@@ -16588,7 +16602,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
 
     if kind == NodeKind.AsPattern {
         nr_check_pattern(node_pattern(node))
-        nr_define_typed(node_name(node), 0, TYPE_UNKNOWN, node)
+        nr_define_typed(node_name(node), node_is_mut(node), TYPE_UNKNOWN, node)
         return
     }
 
@@ -23221,7 +23235,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // lets `for x in xs { } xs.push(1)` pin the element AFTER this scope closes without
         // the binder being false-rejected, and what makes `for x in []` reportable with no
         // named-place gate here.
-        nr_define_typed(node_var_name(node), 0, elem_t, node_for_binder(node))
+        nr_define_typed(node_var_name(node), tc_for_binder_is_mut(node), elem_t, node_for_binder(node))
         // Stamp the simple `for x in xs` binder's dedicated IdentPattern node with the element
         // type. The destructuring path carries for_binder == -1 and is stamped through its tuple
         // pattern below instead.
@@ -23670,7 +23684,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         }
         if name != "_" && is_variant_name(name) == 0 {
             if tc_pattern_binding_type >= 0 {
-                nr_define_typed(name, 0, tc_pattern_binding_type, node)
+                nr_define_typed(name, node_is_mut(node), tc_pattern_binding_type, node)
                 // Publish on the LEAF node as well as into scope. Every arm above decomposes
                 // the binding hint one level — Option/Result unwrap, tuple element, list
                 // element, enum variant field — so by the time control reaches here the
@@ -23679,7 +23693,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                 // second time to re-derive it.
                 tc_publish_node_tid(node, tc_pattern_binding_type)
             } else {
-                nr_define(name)
+                nr_define_mut(name, node_is_mut(node))
             }
         }
         return
@@ -23744,10 +23758,10 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                         tc_check_pattern_types(fpat)
                     } else {
                         if sub_t >= 0 {
-                            nr_define_typed(fname, 0, sub_t, f)
+                            nr_define_typed(fname, node_is_mut(f), sub_t, f)
                             tc_publish_node_tid(f, sub_t)
                         } else {
-                            nr_define(fname)
+                            nr_define_mut(fname, node_is_mut(f))
                         }
                     }
                 } else {
@@ -23816,10 +23830,10 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
                     tc_check_pattern_types(fpat)
                 } else {
                     if sub_t >= 0 {
-                        nr_define_typed(fname, 0, sub_t, f)
+                        nr_define_typed(fname, node_is_mut(f), sub_t, f)
                         tc_publish_node_tid(f, sub_t)
                     } else {
-                        nr_define(fname)
+                        nr_define_mut(fname, node_is_mut(f))
                     }
                 }
                 i = i + 1
@@ -23920,10 +23934,10 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         // alone, and the inner pattern then decomposes that same hint rather than one the binder
         // already consumed.
         if tc_pattern_binding_type >= 0 {
-            nr_define_typed(node_name(node), 0, tc_pattern_binding_type, node)
+            nr_define_typed(node_name(node), node_is_mut(node), tc_pattern_binding_type, node)
             tc_publish_node_tid(node, tc_pattern_binding_type)
         } else {
-            nr_define(node_name(node))
+            nr_define_mut(node_name(node), node_is_mut(node))
         }
         tc_check_pattern_types(node_pattern(node))
         return
@@ -24240,7 +24254,7 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
             leaf_tid = tc_tid_child(tup, i)
             if leaf_tid < 0 { leaf_tid = TYPE_UNKNOWN }
         }
-        nr_define_typed(node_name(leaf), is_mut, leaf_tid, leaf)
+        nr_define_typed(node_name(leaf), tc_leaf_is_mut(leaf, is_mut), leaf_tid, leaf)
         tc_publish_node_tid(leaf, leaf_tid)
         if l_mod_key != "" {
             tc_module_let_decl.insert("{l_mod_key}.{node_name(leaf)}", leaf)

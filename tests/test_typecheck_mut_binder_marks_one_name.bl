@@ -1,0 +1,198 @@
+// `mut` in a pattern marks the one name after it (sections/03_types.md §3.5 *Mutable
+// Binders*). The name resolver records each binder's own mutability, which the W0606 fix
+// text reads back: a mutable binder gets `v = v.sort()`, an immutable one gets a new `let`.
+// `let mut (a, b)` keeps its meaning, every leaf mutable. A `mut` that stands before
+// anything but a name the pattern binds is a parse error.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries}
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn copy_helps() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "DiscardedCollectionCopy" { out.push(d.help) }
+    }
+    out
+}
+
+fn expect_no_errors(label: Str) {
+    let errs = errors()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: want no errors, got:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+fn expect_error_containing(label: Str, want: Str) {
+    let errs = errors()
+    let mut found = false
+    for e in errs {
+        if e.contains(want) { found = true }
+    }
+    if !found {
+        io.println("FAIL: {label}: want an error containing `{want}`, got:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(found)
+}
+
+test "for mut i parses as a mutable binder, not a name spelled mut" {
+    probe("build/mut_binder_for_simple.bl", #"
+fn main() {
+    let mut total = 0
+    for mut i in [1, 2] {
+        i += 1
+        total += i
+    }
+    let _ = total
+}
+"#)
+    expect_no_errors("for mut i")
+}
+
+test "let mut over a tuple pattern still makes every leaf mutable" {
+    probe("build/mut_binder_let_mut_tuple.bl", #"
+fn main() {
+    let mut (a, b) = ([1], [2])
+    a.push(3)
+    b.push(4)
+    a = b
+    let _ = a
+}
+"#)
+    expect_no_errors("let mut (a, b)")
+}
+
+test "only the leaf written mut is a mutable binder" {
+    probe("build/mut_binder_one_leaf.bl", #"
+fn main() {
+    let (k, mut v) = ([3, 1], [2, 1])
+    v.sort()
+    k.sort()
+}
+"#)
+    expect_no_errors("(k, mut v)")
+    let helps = copy_helps()
+    assert_eq(helps.len(), 2)
+    assert(helps.get(0).unwrap().contains("`v = v.sort()`"))
+    assert(helps.get(1).unwrap().contains("`let "))
+}
+
+test "a mut binder in a for pattern and a match arm is mutable and its sibling is not" {
+    probe("build/mut_binder_for_and_match.bl", #"
+fn main() {
+    for (k, mut v) in [([1], [2])] {
+        v.sort()
+        k.sort()
+    }
+    let o: List[Int]? = Some([2, 1])
+    match o {
+        Some(mut xs) => xs.sort()
+        None => {}
+    }
+}
+"#)
+    expect_no_errors("for and match")
+    let helps = copy_helps()
+    assert_eq(helps.len(), 3)
+    assert(helps.get(0).unwrap().contains("`v = v.sort()`"))
+    assert(helps.get(1).unwrap().contains("`let "))
+    assert(helps.get(2).unwrap().contains("`xs = xs.sort()`"))
+}
+
+test "mut before a nested pattern is a parse error" {
+    probe("build/mut_binder_bad_nested.bl", #"
+fn main() {
+    let (mut (a, b), c) = ((1, 2), 3)
+    let _ = a + b + c
+}
+"#)
+    expect_error_containing("mut (a, b)", "`mut` must come before a name the pattern binds")
+}
+
+test "mut before a wildcard is a parse error" {
+    probe("build/mut_binder_bad_wildcard.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    match o {
+        Some(mut _) => {}
+        None => {}
+    }
+}
+"#)
+    expect_error_containing("mut _", "`mut` must come before a name the pattern binds")
+}
+
+test "mut before a for tuple pattern is a parse error" {
+    probe("build/mut_binder_bad_for_tuple.bl", #"
+fn main() {
+    for mut (a, b) in [(1, 2)] {
+        let _ = a + b
+    }
+}
+"#)
+    expect_error_containing("for mut (a, b)", "`mut` must come before a name the pattern binds")
+}
+
+test "mut before a field label is a parse error" {
+    probe("build/mut_binder_bad_field_label.bl", #"
+type Point {
+    x: Int
+    y: Int
+}
+fn main() {
+    let p = Point { x: 1, y: 2 }
+    match p {
+        Point { mut x: px, .. } => { let _ = px }
+    }
+}
+"#)
+    expect_error_containing("mut x: px", "not the field label `x`")
+}
+
+test "mut before a variant name is an error" {
+    probe("build/mut_binder_bad_variant.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    let n = match o {
+        mut None => 0
+        Some(v) => v
+    }
+    let _ = n
+}
+"#)
+    expect_error_containing("mut None", "`None` is a variant")
+}
+
+test "mut before a constructor is a parse error" {
+    probe("build/mut_binder_bad_constructor.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    let n = match o {
+        mut Some(v) => v
+        None => 0
+    }
+    let _ = n
+}
+"#)
+    expect_error_containing("mut Some(v)", "`mut` must come before a name the pattern binds")
+}

@@ -4471,15 +4471,16 @@ fn parse_for_in() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     // has a node to stamp the element tid onto. `var_name` still carries the raw name, so
     // codegen's scalar path is untouched.
     let mut simple_binder = -1
+    let var_line = peek_line()
+    let var_col = peek_col()
+    let var_mut = parse_binder_mut()
     if at(TokenKind.LParen) {
         pat = parse_pattern()
         var = "_tuple"
     } else {
-        let var_line = peek_line()
-        let var_col = peek_col()
         var = expect_value(TokenKind.Ident)
         simple_binder = node_count()
-        node_push(AstNode { kind: NodeKind.IdentPattern, name: var, line: var_line, col: var_col })
+        node_push(AstNode { kind: NodeKind.IdentPattern, name: var, is_mut: var_mut, line: var_line, col: var_col })
     }
     expect(TokenKind.In)
     let iter = parse_expr()
@@ -5581,9 +5582,45 @@ fn parse_pattern() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     nd
 }
 
+// A punned field binds the field's own name, so `{ mut x }` is short for `{ x: mut x }`.
+fn parse_field_mut() -> Int ! Parse.Advance {
+    if !at(TokenKind.Mut) { return 0 }
+    advance()
+    1
+}
+
+// In `{ x: px }` the `x` is a field label, not a name the pattern binds.
+fn report_mut_on_field_label(fname: Str, line: Int, col: Int) ! Diag.Report {
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "`mut` must come before a name the pattern binds, not the field label `{fname}`", line, col, col + 3, "put `mut` after the colon: `{fname}: mut <name>`")
+}
+
+// `mut` marks the one name right after it (§3.5 *Mutable Binders*). Answers 1 when it
+// stands before a name the pattern binds. Before anything else it is reported here and
+// answers 0, and the pattern after it parses as written, so one stray `mut` does not hide
+// the errors that follow it.
+fn parse_binder_mut() -> Int ! Parse.Advance, Diag.Report {
+    if !at(TokenKind.Mut) { return 0 }
+    advance()
+    if at_binder_name() { return 1 }
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "`mut` must come before a name the pattern binds", peek_line(), peek_col(), peek_end_col(), "`mut` marks one name; put it before each name inside the pattern that changes")
+    0
+}
+
+// A name that binds: not `_`, not a literal, and not the head of a variant or a
+// constructor. A bare variant name such as `None` is told apart only once names
+// resolve, so typecheck rejects `mut` there.
+fn at_binder_name() -> Bool {
+    if !at(TokenKind.Ident) { return false }
+    let v = peek_value()
+    if v == "_" || v == "true" || v == "false" { return false }
+    let next = peek_kind_at(pos + 1)
+    next != TokenKind.Dot && next != TokenKind.LParen && next != TokenKind.LBrace
+}
+
 fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     let sp_line = peek_line()
     let sp_col = peek_col()
+    let binder_mut = parse_binder_mut()
     if at(TokenKind.LBracket) {
         advance()
         skip_newlines()
@@ -5751,8 +5788,10 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                     }
                     let fld_line = peek_line()
                     let fld_col = peek_col()
+                    let fld_mut = parse_field_mut()
                     let fname = expect_value(TokenKind.Ident)
                     if at(TokenKind.Colon) {
+                        if fld_mut == 1 { report_mut_on_field_label(fname, fld_line, fld_col) }
                         advance()
                         skip_newlines()
                         let fpat = parse_pattern()
@@ -5761,7 +5800,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                         sublist_push(flds, sf)
                     } else {
                         let sf = node_count()
-                        node_push(AstNode { kind: NodeKind.StructLitField, name: fname, line: fld_line, col: fld_col })
+                        node_push(AstNode { kind: NodeKind.StructLitField, name: fname, is_mut: fld_mut, line: fld_line, col: fld_col })
                         sublist_push(flds, sf)
                     }
                     if at(TokenKind.Comma) {
@@ -5816,8 +5855,10 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                 }
                 let fld_line = peek_line()
                 let fld_col = peek_col()
+                let fld_mut = parse_field_mut()
                 let fname = expect_value(TokenKind.Ident)
                 if at(TokenKind.Colon) {
+                    if fld_mut == 1 { report_mut_on_field_label(fname, fld_line, fld_col) }
                     advance()
                     skip_newlines()
                     let fpat = parse_pattern()
@@ -5826,7 +5867,7 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                     sublist_push(flds, sf)
                 } else {
                     let sf = node_count()
-                    node_push(AstNode { kind: NodeKind.StructLitField, name: fname, line: fld_line, col: fld_col })
+                    node_push(AstNode { kind: NodeKind.StructLitField, name: fname, is_mut: fld_mut, line: fld_line, col: fld_col })
                     sublist_push(flds, sf)
                 }
                 if at(TokenKind.Comma) {
@@ -5844,11 +5885,11 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             advance()
             let inner = parse_pattern()
             let nd = node_count()
-            node_push(AstNode { kind: NodeKind.AsPattern, name: name, pattern: inner, line: sp_line, col: sp_col })
+            node_push(AstNode { kind: NodeKind.AsPattern, name: name, pattern: inner, is_mut: binder_mut, line: sp_line, col: sp_col })
             return nd
         }
         let nd = node_count()
-        node_push(AstNode { kind: NodeKind.IdentPattern, name: name, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.IdentPattern, name: name, is_mut: binder_mut, line: sp_line, col: sp_col })
         return nd
     }
     diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "unexpected token in pattern: {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), "")

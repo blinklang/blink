@@ -11,7 +11,7 @@
 import ast.{NodeKind, nk_of}
 import parser.{
     node_args, node_body, node_elements, node_is_mut, node_kind, node_method, node_methods, node_name, node_obj,
-    node_params, node_recv_type_args, node_stmts, node_target, node_trait_name, node_type_ann, node_value, node_push_value_child_ids, sublist_get,
+    node_params, node_pattern, node_guard, node_iterable, node_for_binder, node_value_child_ids, node_recv_type_args, node_stmts, node_target, node_trait_name, node_type_ann, node_value, node_push_value_child_ids, sublist_get,
     sublist_length,
 }
 import typecheck.{
@@ -1301,6 +1301,24 @@ fn scan_frame_writes(node: Int, env: List[FrameBinder], depth: Int, out: List[In
         enter_let_binders(node, env, depth)
         return
     }
+    // A match arm's binders scope over its guard and body, and a for-in's over its body.
+    if k == NodeKind.MatchArm {
+        let mark = env.len()
+        enter_match_binders(node_pattern(node), env, depth)
+        scan_frame_writes(node_guard(node), env, depth, out, kids)
+        scan_frame_writes(node_body(node), env, depth, out, kids)
+        drop_env_to(env, mark)
+        return
+    }
+    if k == NodeKind.ForIn {
+        scan_frame_writes(node_iterable(node), env, depth, out, kids)
+        let mark = env.len()
+        enter_match_binders(node_for_binder(node), env, depth)
+        enter_match_binders(node_elements(node), env, depth)
+        scan_frame_writes(node_body(node), env, depth, out, kids)
+        drop_env_to(env, mark)
+        return
+    }
     if k == NodeKind.Assignment || k == NodeKind.CompoundAssign {
         let b = innermost_frame_binder(env, assigned_root_name(node_target(node)))
         if b.decl >= 0 && b.depth < depth && !out.contains(b.decl) { out.push(b.decl) }
@@ -1315,11 +1333,26 @@ fn scan_frame_writes(node: Int, env: List[FrameBinder], depth: Int, out: List[In
         i += 1
     }
     drop_kids_to(kids, base)
-    if k == NodeKind.Block {
-        while env.len() > mark {
-            let _ = env.pop()
-        }
+    if k == NodeKind.Block { drop_env_to(env, mark) }
+}
+
+fn drop_env_to(env: List[FrameBinder], mark: Int) {
+    while env.len() > mark {
+        let _ = env.pop()
     }
+}
+
+// The decl node of a binder in a match or for-in pattern is the pattern node that names
+// it, the node its codegen asks cg_eff_frame_written about.
+fn enter_match_binders(pat: Int, env: List[FrameBinder], depth: Int) {
+    if pat < 0 { return }
+    let k = nk_of(node_kind(pat))
+    let punned = k == NodeKind.StructLitField && node_pattern(pat) < 0
+    if k == NodeKind.IdentPattern || k == NodeKind.AsPattern || punned {
+        env.push(FrameBinder { name: node_name(pat), decl: pat, depth: depth })
+    }
+    if k == NodeKind.IdentPattern || punned { return }
+    for kid in node_value_child_ids(pat) { enter_match_binders(kid, env, depth) }
 }
 
 // The decl node is the one the let lowering declares from: the LetBinding for a single
@@ -1411,6 +1444,11 @@ fn collect_shared_muts(node: Int, read: List[Str], out: List[Str], kids: List[In
             if read.contains(leaf) && !out.contains(leaf) { out.push(leaf) }
         }
     }
+    // A binder written `mut x` in any pattern is a `let mut` of its own.
+    if is_mut_binder(node) {
+        let nm = node_name(node)
+        if read.contains(nm) && !out.contains(nm) { out.push(nm) }
+    }
     let base = kids.len()
     node_push_value_child_ids(node, kids)
     let end = kids.len()
@@ -1420,6 +1458,13 @@ fn collect_shared_muts(node: Int, read: List[Str], out: List[Str], kids: List[In
         i += 1
     }
     drop_kids_to(kids, base)
+}
+
+fn is_mut_binder(node: Int) -> Bool {
+    if node_is_mut(node) != 1 { return false }
+    let k = nk_of(node_kind(node))
+    if k == NodeKind.IdentPattern || k == NodeKind.AsPattern { return true }
+    k == NodeKind.StructLitField && node_pattern(node) < 0
 }
 
 // The walkers above share one child buffer down the descent: each node appends its children,
