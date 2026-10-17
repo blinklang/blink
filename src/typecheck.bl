@@ -6310,7 +6310,14 @@ fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Rep
     let returns = tc_body_valued_returns(node_body(cls))
     let tail_t = tc_closure_body_result_tid(cls, 0)
     let mut ret = tc_resolve(slot)
-    if tc_is_unbound_metavar(slot) != 0 {
+    // Unless a use already pinned the return to (), the tail is the value the closure hands
+    // back, so the walk (which checked the body against the Void default) did not compare it.
+    if tc_is_unbound_metavar(ret) != 0 || (tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID) {
+        tc_report_consumed_branch_mismatch(tc_value_tail_of(node_body(cls)))
+    }
+    // Resolved first: a slot tied to a sibling's (tc_tie_fn_rets) is bound to that slot, which
+    // may itself still be open.
+    if tc_is_unbound_metavar(ret) != 0 {
         // A tail that leaves by another edge, or that the walk could not name, says nothing of
         // the value; the `return`s do. With neither, the body is a statement body: the walk
         // names no value for a tail such as a match whose arms assign, and a named fn with
@@ -17127,19 +17134,123 @@ fn tc_fn_value_unannotated_closure(val0: Int) -> Int {
     val
 }
 
-// A value that shares one type with `other_t` (a list element, an if branch) and is a closure
-// with no `-> R` must return what `other_t` returns. Binding its open return slot to that
-// return makes the body walk hold the closure to it; otherwise each closure would settle its
-// own return and a list of them could mix Int and Str behind one element type.
-fn tc_tie_closure_ret(val: Int, val_t: Int, other_t: Int) {
-    if tc_fn_value_unannotated_closure(val) == -1 { return }
-    let r = tc_resolve(val_t)
-    let o = tc_resolve(other_t)
-    if tc_tid_kind(r) != TyKind.Fn || tc_tid_kind(o) != TyKind.Fn { return }
-    if tc_tid_child_count(r) != tc_tid_child_count(o) { return }
-    let want = tc_resolve(tc_tid_child(o, 0))
-    if tc_tid_is_no_info(want) != 0 { return }
-    let _ = bind_metavar(tc_tid_child(r, 0), want)
+// Two fn values that share one type (list elements, the branches of an `if`, the arms of a
+// `match`) return one type. A return slot still open on either side is bound to the other
+// side's return, so each body walk holds its closure to that one return; otherwise each
+// closure would settle its own and a list of them could mix Int and Str behind one element
+// type. The slot is open on a closure with no `-> R` (tc_closure_ret_slot), and on an `if` or
+// `match` of such closures, whose own type carries its first closure's slot.
+fn tc_tie_fn_rets(a_t: Int, b_t: Int) {
+    let a = tc_resolve(a_t)
+    let b = tc_resolve(b_t)
+    if tc_tid_kind(a) != TyKind.Fn || tc_tid_kind(b) != TyKind.Fn { return }
+    if tc_tid_child_count(a) != tc_tid_child_count(b) { return }
+    let a_ret = tc_resolve(tc_tid_child(a, 0))
+    let b_ret = tc_resolve(tc_tid_child(b, 0))
+    if tc_tid_is_no_info(a_ret) != 0 || tc_tid_is_no_info(b_ret) != 0 { return }
+    if tc_is_unbound_metavar(a_ret) != 0 {
+        let _ = bind_metavar(a_ret, b_ret)
+        return
+    }
+    let _ = bind_metavar(b_ret, a_ret)
+}
+
+// Whether two values that one form yields as a single type (the branches of an `if`, the arms
+// of a `match`) can share it. Their fn returns are tied first, so a closure with no `-> R` is
+// held to its sibling's return by its own body walk, not compared here against a return its
+// body has not produced yet.
+fn tc_branch_values_agree(a_node: Int, a_t: Int, b_node: Int, b_t: Int) -> Int {
+    if tc_tid_is_no_info(a_t) != 0 || tc_tid_is_no_info(b_t) != 0 { return 1 }
+    // A diverging value yields nothing, so it fits any type (Never is a subtype of every type).
+    if tc_resolve(a_t) == TYPE_NEVER || tc_resolve(b_t) == TYPE_NEVER { return 1 }
+    tc_tie_fn_rets(a_t, b_t)
+    if tc_tid_has_unknown(a_t) != 0 || tc_tid_has_unknown(b_t) != 0 { return 1 }
+    types_compatible(tc_fn_value_open_ret(a_node, a_t), tc_fn_value_open_ret(b_node, b_t))
+}
+
+// A `match` used as a value yields one type, so every arm that yields a value must share the
+// type of the first one that does. An arm with no value makes the whole match `()` (§3.3), so
+// the others' values are dropped rather than compared; a diverging arm fits any type. One
+// report per match, at the first arm that disagrees.
+fn tc_report_match_arm_mismatch(nodes: List[Int], types: List[Int]) ! TypeCheck.Report, Diag.Report {
+    for t in types {
+        if tc_tid_is_no_info(t) == 0 && tc_resolve(t) == TYPE_VOID { return }
+    }
+    let mut first = -1
+    let mut i = 0
+    while i < types.len() {
+        let t = types.get(i).unwrap()
+        if tc_tid_is_no_info(t) == 0 && tc_resolve(t) != TYPE_NEVER {
+            if first == -1 {
+                first = i
+            } else {
+                let first_t = types.get(first).unwrap()
+                if tc_branch_values_agree(nodes.get(first).unwrap(), first_t, nodes.get(i).unwrap(), t) == 0 {
+                    tc_error_at("match arms have incompatible types: {type_to_str(first_t)} vs {type_to_str(t)}", tc_value_report_node(nodes.get(i).unwrap()))
+                    return
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The value a body yields: a block's tail value, or the body itself when it is no block.
+fn tc_value_tail_of(body: Int) -> Int {
+    if body == -1 || node_kind(body) != NodeKind.Block { return body }
+    let tail = tc_block_tail_stmt(body)
+    if tail == -1 { return -1 }
+    tc_block_tail_value(tail)
+}
+
+// The branch or arm compare for an `if` or `match` whose value a walk that did not consume it
+// has already typed in its own scopes.
+fn tc_report_consumed_branch_mismatch(val: Int) ! TypeCheck.Report, Diag.Report {
+    if val == -1 { return }
+    let k = node_kind(val)
+    if k == NodeKind.MatchExpr {
+        tc_report_walked_match_arm_mismatch(val)
+    } else if k == NodeKind.IfExpr && node_else_body(val) != -1 {
+        tc_report_if_branch_mismatch(val)
+    }
+}
+
+// Where a report about a value points: a block's tail value, which is what disagrees, else the
+// value itself.
+fn tc_value_report_node(val: Int) -> Int {
+    let tail_val = tc_value_tail_of(val)
+    if tail_val == -1 { return val }
+    tail_val
+}
+
+// Whether any arm of a match is a block whose tail names a binding of that block. Such an arm
+// is typed only once the walk has opened its scope, so its compare waits for that walk
+// (tc_report_deferred_branch_mismatch), as an `if` with such a branch does.
+fn tc_match_declaring_arm(node: Int) -> Int {
+    let arms_sl = node_arms(node)
+    if arms_sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(arms_sl) {
+        if tc_block_tail_reads_own_local(tc_arm_body_value(sublist_get(arms_sl, i))) != 0 { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+// A match's arm value nodes and the types the walk memoized for them in their own scopes.
+fn tc_report_walked_match_arm_mismatch(node: Int) ! TypeCheck.Report, Diag.Report {
+    let arms_sl = node_arms(node)
+    if arms_sl == -1 { return }
+    let mut nodes: List[Int] = []
+    let mut types: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(arms_sl) {
+        let v = tc_arm_body_value(sublist_get(arms_sl, i))
+        nodes.push(v)
+        types.push(if v == -1 { -1 } else { tc_scoped_value_memo(v, 0) })
+        i = i + 1
+    }
+    tc_report_match_arm_mismatch(nodes, types)
 }
 
 // The fn type `val` offers to a comparison made before its closure body is walked. A closure
@@ -17995,7 +18106,13 @@ fn tc_infer_coalesce(node: Int, lt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.R
     }
     let rt = infer_type(node_right(node))
     tc_construct_hint = saved_hint
-    if tc_tid_has_unbound_metavar(inner) != 0 { let _ = tc_unify(inner, rt) }
+    if tc_tid_has_unbound_metavar(inner) != 0 {
+        let _ = tc_unify(inner, rt)
+    } else if tc_branch_values_agree(-1, inner, node_right(node), rt) == 0 {
+        // `??` is a match on the Option whose `None` arm is the default, so the default
+        // shares the value type the `Some` arm yields.
+        tc_error_at("`??` default type {type_to_str(rt)} does not match the Option's value type {type_to_str(inner)}", node_right(node))
+    }
     tc_resolve(inner)
 }
 
@@ -21041,8 +21158,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let elem = sublist_get(elems_sl, ei)
                 let c = tc_list_elem_contribution(elem)
                 tc_check_list_elem_compat(elem, tc_fn_value_open_ret(elem, c), ei, first_cmp)
-                tc_tie_closure_ret(elem, c, first_t)
-                tc_tie_closure_ret(sublist_get(elems_sl, 0), first_t, c)
+                tc_tie_fn_rets(first_t, c)
                 ei = ei + 1
             }
             tc_check_spread_sources(elems_sl, first_t)
@@ -21212,19 +21328,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // walked them in their own scopes, and the gate there is this same test, so
             // exactly one of the two sites reports any one `if`.
             if tc_if_declaring_branch(node) == 0 {
-                if tc_tid_is_no_info(then_t) == 0 && tc_tid_is_no_info(else_t) == 0 {
-                    if tc_tid_has_unknown(then_t) == 0 && tc_tid_has_unknown(else_t) == 0 {
-                        let then_cmp = tc_fn_value_open_ret(node_then_body(node), then_t)
-                        if types_compatible(then_cmp, tc_fn_value_open_ret(else_node, else_t)) == 0 {
-                            tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
-                        }
-                    }
+                if tc_branch_values_agree(node_then_body(node), then_t, else_node, else_t) == 0 {
+                    tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
                 }
             }
             if tc_tid_is_no_info(then_t) != 0 { return else_t }
             if tc_tid_is_no_info(else_t) != 0 { return then_t }
-            tc_tie_closure_ret(else_node, else_t, then_t)
-            tc_tie_closure_ret(node_then_body(node), then_t, else_t)
             // A hole takes the other branch's answer for that position, so the `if`'s own
             // type never carries an absence into a container the callers then read.
             if tc_tid_has_unknown(then_t) != 0 { return tc_tid_fill_unknowns(then_t, else_t) }
@@ -21257,10 +21366,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let mut merged = infer_arm_body(sublist_get(arms_sl, 0), scrut_tid)
             let mut completes = 0
             if tc_resolve(merged) == TYPE_VOID { completes = 1 }
+            let mut arm_nodes: List[Int] = [tc_arm_body_value(sublist_get(arms_sl, 0))]
+            let mut arm_types: List[Int] = [merged]
             let mut i = 1
             while i < sublist_length(arms_sl) {
                 tc_if_value_ctx = incoming
                 let arm_t = infer_arm_body(sublist_get(arms_sl, i), scrut_tid)
+                arm_nodes.push(tc_arm_body_value(sublist_get(arms_sl, i)))
+                arm_types.push(arm_t)
                 if tc_resolve(arm_t) == TYPE_VOID { completes = 1 }
                 if tc_tid_is_no_info(merged) != 0 {
                     merged = arm_t
@@ -21269,6 +21382,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
                 i = i + 1
             }
+            // An arm whose tail names its own block's binding was typed against the enclosing
+            // scope here, so its compare is made once the walk has typed it in its own.
+            if tc_match_declaring_arm(node) == 0 { tc_report_match_arm_mismatch(arm_nodes, arm_types) }
             if completes != 0 && tc_tid_is_no_info(merged) == 0 { return TYPE_VOID }
             return merged
         }
@@ -22275,8 +22391,8 @@ fn tc_report_unclaimed_type_args(node: Int) ! Diag.Report {
     diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "this call expects 0 type argument(s), {given} given", node, "remove the brackets; this call's types come from its arguments and from where its result goes")
 }
 
-// The branch compare infer_type declined to make, made once both branches have been walked
-// inside their own scopes, so their tails mean what they say.
+// The branch or arm compare infer_type declined to make, made once every branch has been
+// walked inside its own scope, so the tails mean what they say.
 //
 // Called from the CONSUMER of the `if`, never from the walk of the `if` itself. Whether the
 // value is used decides whether a difference between the branches is an error at all — an
@@ -22284,8 +22400,12 @@ fn tc_report_unclaimed_type_args(node: Int) ! Diag.Report {
 // unrelated types is ordinary code. The walk cannot see which it is; the consumer can, because
 // it is the thing doing the consuming. The value-context walk is that consumer's proxy: its
 // marker says the value is consumed, so it checks the `if` itself (tc_check_if_value).
-fn tc_report_deferred_if_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
+fn tc_report_deferred_branch_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
     if node == -1 { return }
+    if node_kind(node) == NodeKind.MatchExpr {
+        if tc_match_declaring_arm(node) != 0 { tc_report_walked_match_arm_mismatch(node) }
+        return
+    }
     if node_kind(node) != NodeKind.IfExpr { return }
     if node_else_body(node) == -1 { return }
     if tc_if_declaring_branch(node) == 0 { return }
@@ -22306,10 +22426,7 @@ fn tc_check_if_value(node: Int) ! Diag.Report, TypeCheck.Report {
 fn tc_report_if_branch_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
     let then_t = tc_scoped_value_memo(node_then_body(node), 0)
     let else_t = tc_scoped_value_memo(node_else_body(node), 0)
-    if tc_tid_is_no_info(then_t) != 0 || tc_tid_is_no_info(else_t) != 0 { return }
-    if tc_tid_has_unknown(then_t) != 0 || tc_tid_has_unknown(else_t) != 0 { return }
-    let then_cmp = tc_fn_value_open_ret(node_then_body(node), then_t)
-    if types_compatible(then_cmp, tc_fn_value_open_ret(node_else_body(node), else_t)) != 0 { return }
+    if tc_branch_values_agree(node_then_body(node), then_t, node_else_body(node), else_t) != 0 { return }
     tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
 }
 
@@ -24125,7 +24242,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // descends a call or a struct literal, not a list, and infer_type types the closure's
             // signature without its body. tc_walk_stmt_value picks the walk the value's kind needs.
             tc_walk_stmt_value(val)
-            tc_report_deferred_if_mismatch(val)
+            tc_report_deferred_branch_mismatch(val)
             // `let x = { let h = 5  h }` and
             // `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
             // the construct itself introduces, which the infer_type above could not see because
@@ -24470,6 +24587,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 nr_pop_scope()
                 i = i + 1
             }
+            // A consumed match the value-context walk reached. infer_type never types this node,
+            // so its arm compare is made here, as tc_check_if_value makes an `if`'s.
+            if in_value != 0 { tc_report_walked_match_arm_mismatch(node) }
 
             // Materialization boundary: an anonymous temporary scrutinee is a value exactly
             // like a `let` initializer, so a metavar still unbound after every arm's

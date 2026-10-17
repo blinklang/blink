@@ -1,0 +1,312 @@
+// The arms of a `match` used as a value yield one type, exactly as the two branches of an
+// `if` do. An arm whose value cannot share the type of its siblings is an error, not a value
+// the first arm's type quietly stands for: `let v = match x { 0 => 1  _ => "s" }` passed check
+// and failed in the C compiler, and a match of closures that return Int and Str passed both
+// and printed a pointer.
+//
+// A closure that omits `-> R` takes the return of the arms beside it, as a list element or an
+// `if` branch does, so its body is held to that return. The same holds one level down: an
+// `else if` chain and a match nested in an arm join their own values first, then the result
+// joins the arms around it.
+//
+// The controls are what must not change. Arms that agree report nothing; a diverging arm fits
+// any type (§3.3); one arm with no value makes the whole match `()` (§3.3), so a sibling's
+// value is dropped rather than compared; a match whose value is discarded compares nothing.
+
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_count, node_kind, node_name}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// Warnings name the same binders this test is about, so only errors are read here.
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+// No error from the first line holding `from` through the line holding `to`.
+fn assert_clean_between(from: Str, to: Str) {
+    let a = line_of(probe_src(), from)
+    let b = line_of(probe_src(), to)
+    let mut msgs = ""
+    let mut l = a
+    while l <= b {
+        msgs = msgs.concat(errors_on_line(l))
+        l = l + 1
+    }
+    if msgs != "" { io.println("FAIL: lines {a}..{b} ({from}..{to}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+// The type typecheck gave the `let` binder `name`.
+fn binder_type(name: Str) -> Str {
+    let mut i = 0
+    while i < node_count() {
+        if nk_of(node_kind(i)) == NodeKind.LetBinding && node_name(i) == name {
+            let tid = tc_lookup_node_tid(i)
+            if tid < 0 { return "<none>" }
+            return tc_type_str(tc_resolve(tid))
+        }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no binder '{name}'")
+    assert(false)
+    ""
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn probe_src() -> Str {
+    #"fn maident(i: Int) -> Int { i }
+
+fn matail(x: Int) -> Int {
+    match x {
+        0 => 1
+        _ => "s"  // M_FN_TAIL_VALUES
+    }
+}
+
+fn main() {
+    let x = 1
+    let y = 2
+    let _mv = match x {
+        0 => 1
+        _ => "s"  // M_VALUES
+    }
+    let _mvs = match x {
+        0 => "s"
+        _ => 1  // M_VALUES_STR_FIRST
+    }
+    let _mb = match x {
+        0 => 1
+        _ => {
+            let s = "s"
+            s  // M_BLOCK_LOCAL
+        }
+    }
+    let _mc = match x {
+        0 => fn(i: Int) { i }
+        _ => fn(i: Int) { "s" }  // M_CLOSURES
+    }
+    let _mcs = match x {
+        0 => fn(i: Int) { "s" }
+        _ => fn(i: Int) { i }  // M_CLOSURES_STR_FIRST
+    }
+    let _mca = match x {
+        0 => fn(i: Int) -> Int { i }
+        _ => fn(i: Int) { "s" }  // M_ANNOTATED_THEN_UNANNOTATED
+    }
+    let _mcu = match x {
+        0 => fn(i: Int) { "s" }  // M_UNANNOTATED_THEN_ANNOTATED
+        _ => fn(i: Int) -> Int { i }
+    }
+    let _mcn = match x {
+        0 => maident
+        _ => fn(i: Int) { "s" }  // M_NAMED_THEN_CLOSURE
+    }
+    let _mcb = match x {
+        0 => fn(i: Int) { i }
+        _ => { fn(i: Int) { "s" } }  // M_BRACED_ARM_CLOSURE
+    }
+    let _mnm = match x {
+        0 => fn(i: Int) { i }
+        _ => match y {
+            0 => fn(i: Int) { "s" }  // M_NESTED_MATCH
+            _ => fn(i: Int) { "t" }
+        }
+    }
+    let _mni = match x {
+        0 => fn(i: Int) { i }
+        _ => if y > 0 { fn(i: Int) { "s" } } else { fn(i: Int) { "t" } }  // M_NESTED_IF
+    }
+    let _eif = if x == 0 { fn(i: Int) { i } } else if x == 1 { fn(i: Int) { "s" } } else { fn(i: Int) { "t" } }  // M_ELSE_IF_CHAIN
+    let _mcl = [match x {
+        0 => fn(i: Int) { i }
+        _ => fn(i: Int) { "s" }  // M_IN_LIST
+    }]
+    let _ct = fn(z: Int) {
+        match z {
+            0 => 1
+            _ => "s"  // M_CLOSURE_TAIL_MATCH
+        }
+    }
+    let _cti = fn(z: Int) { if z > 0 { 1 } else { "s" } }  // M_CLOSURE_TAIL_IF
+    let oi: Option[Int] = None
+    let of: Option[fn(Int) -> Int] = None
+    let _co = oi ?? "s"  // M_COALESCE_VALUES
+    let _cf = of ?? fn(i: Int) { "s" }  // M_COALESCE_CLOSURE
+
+    // OK_BEGIN
+    let _ok_co = oi ?? 2
+    let _ok_cf = of ?? fn(i: Int) { i + 1 }
+    let _ok_cnone = None ?? 99
+    let _ok_ct = fn(z: Int) {
+        match z {
+            0 => 1
+            _ => 2
+        }
+    }
+    let _ok_cdrop = fn(z: Int) {
+        match z {
+            0 => 1
+            _ => { let _ = z }
+        }
+    }
+    let _ok_v = match x {
+        0 => 1
+        _ => 2
+    }
+    let _ok_c = match x {
+        0 => fn(i: Int) { i }
+        _ => fn(i: Int) { i * 2 }
+    }
+    let _ok_never = match x {
+        0 => fn(i: Int) { i }
+        1 => loop { }
+        _ => fn(i: Int) { i + 1 }
+    }
+    let _ok_ann = match x {
+        0 => fn(i: Int) -> Int { i }
+        _ => fn(i: Int) { i + 1 }
+    }
+    let _ok_named = match x {
+        0 => maident
+        _ => fn(i: Int) { i + 1 }
+    }
+    let _ok_nested = match x {
+        0 => fn(i: Int) { i }
+        _ => match y {
+            0 => fn(i: Int) { i + 1 }
+            _ => fn(i: Int) { i + 2 }
+        }
+    }
+    let _ok_eif = if x == 0 { fn(i: Int) { i } } else if x == 1 { fn(i: Int) { i + 1 } } else { fn(i: Int) { i + 2 } }
+    let _ok_block = match x {
+        0 => 1
+        _ => {
+            let n = 2
+            n
+        }
+    }
+    let _ok_unit = match x {
+        0 => 1
+        _ => { let _ = y }
+    }
+    match x {
+        0 => 1
+        _ => "s"
+    }
+    // OK_END
+}
+"#
+}
+
+test "match arms whose values differ are rejected" {
+    let _p = probe("build/tc_match_arms_src.bl", probe_src())
+    assert_error_at("M_VALUES", "match arms have incompatible types: Int vs Str")
+    assert_error_at("M_VALUES_STR_FIRST", "match arms have incompatible types: Str vs Int")
+    assert_error_at("M_FN_TAIL_VALUES", "match arms have incompatible types: Int vs Str")
+    assert_error_at("M_BLOCK_LOCAL", "match arms have incompatible types: Int vs Str")
+    // One report per match, whichever walk makes it.
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.message.contains("match arms have incompatible types") { n = n + 1 }
+    }
+    if n != 5 { io.println("FAIL: want 5 arm mismatch reports, got {n}:\n{all_errors()}") }
+    assert_eq(n, 5)
+}
+
+test "unannotated closures in match arms return what their siblings return" {
+    let _p = probe("build/tc_match_arms_src.bl", probe_src())
+    assert_error_at("M_CLOSURES", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("M_CLOSURES_STR_FIRST", "return value type Int does not match function `closure` return type Str")
+    assert_error_at("M_ANNOTATED_THEN_UNANNOTATED", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("M_UNANNOTATED_THEN_ANNOTATED", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("M_NAMED_THEN_CLOSURE", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("M_BRACED_ARM_CLOSURE", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("M_IN_LIST", "return value type Str does not match function `closure` return type Int")
+}
+
+test "a nested match, nested if or else-if chain joins the arms around it" {
+    let _p = probe("build/tc_match_arms_src.bl", probe_src())
+    assert_error_at("M_NESTED_MATCH", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("M_NESTED_IF", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("M_ELSE_IF_CHAIN", "return value type Str does not match function `closure` return type Int")
+}
+
+// An unannotated closure returns its tail, so a match or if there is a consumed value.
+test "the tail of an unannotated closure joins its arms and branches" {
+    let _p = probe("build/tc_match_arms_src.bl", probe_src())
+    assert_error_at("M_CLOSURE_TAIL_MATCH", "match arms have incompatible types: Int vs Str")
+    assert_error_at("M_CLOSURE_TAIL_IF", "if branches have incompatible types: Int vs Str")
+}
+
+// `??` desugars to a match on the Option (03_types.md): its default is the `None` arm, so it
+// shares the type the `Some` arm yields.
+test "a `??` default shares the Option's value type" {
+    let _p = probe("build/tc_match_arms_src.bl", probe_src())
+    assert_error_at("M_COALESCE_VALUES", "`??` default type Str does not match the Option's value type Int")
+    assert_error_at("M_COALESCE_CLOSURE", "return value type Str does not match function `closure` return type Int")
+}
+
+test "arms that agree, diverge, or drop their value report nothing" {
+    let _p = probe("build/tc_match_arms_src.bl", probe_src())
+    assert_clean_between("OK_BEGIN", "OK_END")
+    assert_eq(binder_type("_ok_c"), "Fn(Int) -> Int")
+    assert_eq(binder_type("_ok_never"), "Fn(Int) -> Int")
+    assert_eq(binder_type("_ok_nested"), "Fn(Int) -> Int")
+    assert_eq(binder_type("_ok_eif"), "Fn(Int) -> Int")
+    assert_eq(binder_type("_ok_cf"), "Fn(Int) -> Int")
+    assert_eq(binder_type("_ok_cnone"), "Int")
+    assert_eq(binder_type("_ok_ct"), "Fn(Int) -> Int")
+    // The type printer still spells the unit type `Void` in places; either spelling is ().
+    let unit_t = binder_type("_ok_unit")
+    assert(unit_t == "()" || unit_t == "Void")
+}
