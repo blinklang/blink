@@ -1,0 +1,195 @@
+// A type name has no call form unless the language gives it one: a builtin type is built
+// through a literal or a static constructor on the type name (sections/03_types.md), and a
+// struct through a struct literal (sections/02_syntax.md 2.14). So a call of the name is an
+// undefined function, reported with the repair and nothing else: the call answers the
+// recovery type, and the uses of its value report nothing further.
+import cg_test_helpers.{cg_probe_begin, cg_probe_errors_named}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.io
+
+fn check_src(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+}
+
+// Checks `src` and answers the UndefinedFunction count. Any other error, or an internal
+// error, fails the row.
+fn undefined_in(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    check_src(stem, src)
+    let mut others = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != "UndefinedFunction" {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    assert_eq(diag_ice_count, 0)
+    cg_probe_errors_named("UndefinedFunction")
+}
+
+fn repair_of(name: Str) -> Str {
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UndefinedFunction" && d.message.contains("`{name}`") {
+            return d.help
+        }
+    }
+    ""
+}
+
+test "a bare Duration() is an undefined function" {
+    let src = #"fn main() {
+    let d = Duration()
+    let _x = d
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_duration", src), 1)
+    assert(repair_of("Duration").contains("`Duration.ms(...)`"))
+}
+
+test "a bare Instant() is an undefined function" {
+    let src = #"fn main() {
+    let d = Instant()
+    let _x = d
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_instant", src), 1)
+    assert(repair_of("Instant").contains("`Instant.from_epoch_secs(...)`"))
+}
+
+test "a bare Str() is an undefined function" {
+    let src = #"fn main() {
+    let s = Str()
+    io.println(s)
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_str", src), 1)
+    assert(repair_of("Str").contains("literal"))
+}
+
+test "a bare Option(v) is an undefined function" {
+    let src = #"fn main() {
+    let o = Option(3)
+    let _x = o
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_option", src), 1)
+    assert(repair_of("Option").contains("`Some(value)`"))
+}
+
+test "a positional call of a struct name is an undefined function" {
+    let src = #"type P {
+    x: Int
+}
+
+fn main() {
+    let d = P(1)
+    io.println("{d.x}")
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_struct_positional", src), 1)
+    assert(repair_of("P").contains("`P \{ x: ... }`"))
+}
+
+test "a labelled call of a struct name is an undefined function" {
+    let src = #"type Circle {
+    radius: Int
+}
+
+fn main() {
+    let c = Circle(radius: 5)
+    io.println("{c.radius}")
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_struct_labelled", src), 1)
+    assert(repair_of("Circle").contains("`Circle \{ radius: ... }`"))
+}
+
+test "a call of an enum name is an undefined function" {
+    let src = #"type Color {
+    Red
+    Green
+}
+
+fn main() {
+    let c = Color()
+    let _x = c
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_enum", src), 1)
+    assert(repair_of("Color").contains("variants"))
+}
+
+test "a call of a type alias name is an undefined function" {
+    let src = #"type Ages = Map[Str, Int]
+
+fn main() {
+    let a = Ages()
+    let _x = a
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_alias", src), 1)
+    assert(repair_of("Ages").contains("type alias"))
+}
+
+test "an argument of the refused call is still checked" {
+    let src = #"type P {
+    x: Int
+}
+
+fn main() {
+    let d = P(1 + "a")
+    let _x = d
+}
+"#
+    check_src("typecheck_tncf_arg_checked", src)
+    assert_eq(diag_ice_count, 0)
+    assert_eq(cg_probe_errors_named("UndefinedFunction"), 1)
+    let mut arg_errors = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name != "UndefinedFunction" { arg_errors = arg_errors + 1 }
+    }
+    assert_eq(arg_errors, 1)
+}
+
+test "the call forms the language gives still build" {
+    let src = #"type P {
+    x: Int
+}
+
+fn main() {
+    let m: Map[Str, Int] = Map()
+    let s: Set[Int] = Set()
+    let b = Bytes()
+    let d = Duration.ms(1)
+    let p = P { x: 1 }
+    let o = Some(1)
+    io.println("{m.len()} {s.len()} {b.len()} {d.to_ms()} {p.x} {o.unwrap()}")
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_call_forms", src), 0)
+}
+
+test "a fn that shares a type name answers its call" {
+    let src = #"type P {
+    x: Int
+}
+
+fn P(x: Int) -> P {
+    P { x: x }
+}
+
+fn main() {
+    let d = P(1)
+    io.println("{d.x}")
+}
+"#
+    assert_eq(undefined_in("typecheck_tncf_fn_namesake", src), 0)
+}

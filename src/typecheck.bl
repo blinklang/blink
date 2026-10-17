@@ -13773,7 +13773,92 @@ fn tc_no_call_form_repair(name: Str) -> Str {
     if name == "Channel" {
         return "`Channel` has no constructor call; build a channel with `channel.new[T](buffer: n)`, which names its element type"
     }
+    // Every other name in the type namespace has no call form either, except the builtins that
+    // is_builtin_fn answers for: `Map()`, `Set()`, `Bytes()` and `Raw(e)` (sections/03_types.md,
+    // sections/03b_contracts.md). A declaration is read before the builtin spelling, because a
+    // program may declare a type that a builtin also names.
+    if is_builtin_fn(name) != 0 { return "" }
+    let aliased = tc_alias_underlying_of(name)
+    if aliased != -1 {
+        return "`{name}` is a type alias and has no call form; build the value the way `{type_to_str(aliased)}` is built"
+    }
+    let declared = lookup_named_type(name)
+    if declared != -1 { return tc_declared_type_call_repair(name, declared) }
+    if is_primitive_type(name) != 0 { return tc_builtin_type_call_repair(name) }
+    if is_trait_name(name) != 0 {
+        return "`{name}` is a trait, not a type, and has no call form; call one of its methods on a value, or qualified as in `{name}.method(value)`"
+    }
     ""
+}
+
+// The repair for a call of a type the program declares (sections/02_syntax.md 2.14: a struct
+// value is a struct literal; an enum value is one of its variants).
+fn tc_declared_type_call_repair(name: Str, tid: Int) -> Str {
+    let k = type_kind(tid)
+    if k == TyKind.Struct {
+        let slots = tc_struct_field_slots(tid)
+        let mut fields = ""
+        for slot in slots {
+            if fields != "" { fields = "{fields}," }
+            fields = "{fields} {tc_sfield_name(slot)}: ..."
+        }
+        let literal = if fields == "" { "`{name} \{}`" } else { "`{name} \{{fields} }`" }
+        let scoped = tc_type_scoped_ctor_examples(name, tid)
+        if scoped != "" {
+            return "`{name}` has no constructor call; build a value with a function of `{name}`, such as {scoped}, or with a struct literal, as in {literal}"
+        }
+        return "`{name}` has no constructor call; build a value with a struct literal, as in {literal}"
+    }
+    if k == TyKind.Enum {
+        return "`{name}` is an enum and has no constructor call; build a value with one of its variants"
+    }
+    "`{name}` has no constructor call; build a value with the form of the type it names"
+}
+
+// Up to two type-scoped functions of the type that answer the type itself
+// (sections/02_syntax.md 2.12.3), spelled as a call is written, or "" when it has none.
+fn tc_type_scoped_ctor_examples(name: Str, tid: Int) -> Str {
+    let prefix = "{name}_"
+    let mut out = ""
+    let mut found = 0
+    let mut i = 0
+    while i < fnsig_pool.len() && found < 2 {
+        let fs = fnsig_pool.get(i).unwrap()
+        if fs.name.starts_with(prefix) && fs.ret == tid {
+            let short = fs.name.byte_slice(prefix.byte_len(), fs.name.byte_len())
+            if out != "" { out = "{out} or " }
+            out = "{out}`{name}.{short}(...)`"
+            found = found + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn tc_builtin_type_call_repair(name: Str) -> Str {
+    if name == "Duration" {
+        return "`Duration` has no constructor call; build one with a static constructor such as `Duration.ms(n)` or `Duration.seconds(n)`"
+    }
+    if name == "Instant" {
+        return "`Instant` has no constructor call; build one with a static constructor such as `Instant.from_epoch_secs(n)`"
+    }
+    if name == "Option" { return "`Option` has no constructor call; build one with `Some(value)` or `None`" }
+    if name == "Result" { return "`Result` has no constructor call; build one with `Ok(value)` or `Err(error)`" }
+    if name == "Tuple" { return "`Tuple` has no constructor call; write a tuple literal, as in `(a, b)`" }
+    if name == "Self" {
+        return "`Self` is a type-position alias, not a constructor; build the value through the concrete type name"
+    }
+    if name == "Ptr" {
+        return "`Ptr` has no constructor call; build one with `alloc_ptr[T](n)` or `null_ptr[T]()`"
+    }
+    if name == "FfiScope" { return "`FfiScope` has no constructor call; open one with `ffi.scope()`" }
+    if name == "Template" { return "`Template` has no constructor call; write a template literal, as in `t\"...\"`" }
+    if name == "Handle" { return "`Handle` has no constructor call; `async.spawn(f)` answers one" }
+    if name == "Iterator" { return "`Iterator` has no constructor call; ask a collection for one with `.into_iter()`" }
+    if name == "Fn" { return "`Fn` has no constructor call; write a closure, or name a function" }
+    if name == "Handler" { return "`Handler` has no constructor call; write a handler expression" }
+    if name == "Void" { return "`Void` has no constructor call" }
+    "`{name}` has no constructor call; write a literal of the type, or convert a value to it with a conversion method"
 }
 
 // Whether a bare call of `name` calls one of those types, and not a declaration or a variant
@@ -18265,6 +18350,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     return tc_error_recovery_tid()
                 }
                 let sig = lookup_fnsig(fn_name)
+                // Name resolution already reported the call; the arguments are still checked,
+                // and the call answers the recovery type so its uses report nothing further.
+                if sig == -1 && tc_names_type_without_call_form(fn_name) {
+                    let _ = tc_infer_arg_tids(node_args(node))
+                    return tc_error_recovery_tid()
+                }
                 if sig != -1 {
                     check_deprecated_fn(fn_name, node)
                     let args_sl = node_args(node)
