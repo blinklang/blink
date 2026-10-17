@@ -528,6 +528,7 @@ pub fn tc_is_sealed_list_hof(method: Str) -> Int {
 // HOF table above; mono and cg_call both read this one row so neither can drift.
 pub fn tc_is_list_generic_adapter(method: Str) -> Int {
     if method == "skip" || method == "enumerate" || method == "zip" || method == "find" || method == "flat_map" { return 1 }
+    if method == "sort" || method == "sort_by" { return 1 }
     0
 }
 
@@ -2385,6 +2386,13 @@ fn tc_ops_trait_qualified_ret(method: Str, recv: Int, node: Int) -> Int ! TypeCh
         }
         if method == "last" { return make_option_type(elem) }
         if method == "join" { return TYPE_STR }
+        if method == "sort" {
+            let qargs = node_args(node)
+            if qargs != -1 && sublist_length(qargs) >= 1 && tc_refuse_unordered_sort(node, sublist_get(qargs, 0), elem) != 0 {
+                return tc_error_recovery_tid()
+            }
+            return recv
+        }
     }
     if k == TyKind.Map {
         let key_t = ty_pool.get(recv).unwrap().inner1
@@ -5358,10 +5366,10 @@ fn tc_builtin_method_arity(obj_k: TyKind, method: Str) -> Int {
         if method == "get" || method == "push" || method == "contains" || method == "join" || method == "remove" { return 1 }
         if method == "index_of" { return 1 }
         if method == "take" || method == "skip" || method == "chain" || method == "append" || method == "zip" { return 1 }
-        if method == "map" || method == "flat_map" || method == "filter" { return 1 }
+        if method == "map" || method == "flat_map" || method == "filter" || method == "sort_by" { return 1 }
         if method == "for_each" || method == "any" || method == "all" || method == "find" { return 1 }
         if method == "set" || method == "insert" || method == "slice" || method == "fold" { return 2 }
-        if method == "len" || method == "count" || method == "pop" || method == "clear" { return 0 }
+        if method == "len" || method == "count" || method == "pop" || method == "clear" || method == "sort" { return 0 }
         if method == "enumerate" || method == "is_empty" || method == "capacity" || method == "last" { return 0 }
         return -1
     }
@@ -5865,6 +5873,24 @@ fn tc_bind_hof_result(node: Int, cls: Int, method: Str, diag_before: Int) ! Type
 // separately (its closure takes accumulator + element).
 fn is_elem_closure_hof(method: Str) -> Int {
     method == "map" || method == "filter" || method == "for_each" || method == "any" || method == "all" || method == "find" || method == "flat_map"
+}
+
+// A `sort_by` comparator with no `-> Ordering` is given both elements and walked, and then
+// the type its body answers is held to `Ordering`; check_closure_ret covers one with an
+// annotation. The body's own tail is read, not the closure's Fn tid, so a body that answers
+// nothing is refused too. A body whose type the walk could not name is left to the error
+// that says why.
+fn tc_check_sort_by_body(cls: Int, elem: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
+    check_closure_body(cls, make_fn_type(TYPE_UNKNOWN, [elem, elem]))
+    if node_type_ann(cls) != -1 { return }
+    let ord_t = lookup_named_type("Ordering")
+    if ord_t == -1 { return }
+    let ret = tc_closure_body_result_tid(cls, 0)
+    if ret < 0 { return }
+    if types_compatible(ret, ord_t) == 0 {
+        tc_error_at("closure of `List.sort_by` must return Ordering, got {type_to_str(ret)}", cls)
+    }
 }
 
 // The single install point for a closure's own fn-identity: installs
@@ -13516,6 +13542,8 @@ pub fn is_builtin_fn(name: Str) -> Int {
 pub fn tc_list_rename_help(method: Str) -> Str {
     if method == "concat" { return "list concatenation is `.append(other)`" }
     if method == "collect" { return "`.collect()` crosses an iterator back to a list; a collection is already collected — drop it, or call `.into_iter()` first to enter the lazy world" }
+    if method == "sorted" { return "there is no `.sorted()`: `.sort()` already returns a new sorted list and leaves the receiver as it was" }
+    if method == "sort_by_key" { return "there is no `.sort_by_key(key)`: compare the keys in a `.sort_by` comparator, `.sort_by(fn(a, b) \{ key(a).cmp(key(b)) })`" }
     ""
 }
 
@@ -13574,6 +13602,8 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "pop" { return 1 }
     if name == "get" { return 1 }
     if name == "last" { return 1 }
+    if name == "sort" { return 1 }
+    if name == "sort_by" { return 1 }
     if name == "set" { return 1 }
     if name == "join" { return 1 }
     if name == "clear" { return 1 }
@@ -17230,6 +17260,150 @@ fn reject_eq_less_assert_args(lt: Int, rt: Int, node: Int) ! TypeCheck.Report, D
         tc_eq_need_fixes(path.get(path.len() - 1).unwrap()).join("\n"), tc_eq_need_notes(path))
 }
 
+fn tc_tuple_elem_tids(tid: Int) -> List[Int] {
+    let t = ty_pool.get(tid).unwrap()
+    let mut elems: List[Int] = []
+    let mut i = 0
+    while i < t.params_count {
+        elems.push(ty_param_list.get(t.params_start + i).unwrap())
+        i = i + 1
+    }
+    elems
+}
+
+// What `sort` needs of its element: `T: Ord` (03_types.md, *The `ListOps` Trait*). The
+// answer runs from the element to the innermost type with no `Ord`, and is empty when the
+// element is `Ord`. A tuple is `Ord` when every element is (*Tuples*), and a fieldless enum
+// is `Ord` by its declaration (*Enum Ord*). An element nothing has chosen yet is not refused,
+// for the reason tc_list_scan_elem_need gives.
+fn tc_ord_need(tid0: Int) -> List[Int] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 || tc_tid_has_unbound_metavar(tid) != 0 { return [] }
+    let k = type_kind(tid)
+    if tc_scalar_has_ord(k) || k == TyKind.Never || k == TyKind.Void || k == TyKind.Unknown { return [] }
+    if k == TyKind.Tuple {
+        for e in tc_tuple_elem_tids(tid) {
+            let need = tc_ord_need(e)
+            if need.len() > 0 { return eq_need_through(tid, need) }
+        }
+        return []
+    }
+    if k == TyKind.Struct {
+        if tc_type_has_ord_impl(strip_module_qualifier(tc_type_name(tc_struct_base_tid(tid)))) != 0 { return [] }
+        return [tid]
+    }
+    if k == TyKind.Enum {
+        let base = tc_enum_base_tid(tid)
+        if tc_type_has_ord_impl(strip_module_qualifier(tc_type_name(base))) != 0 { return [] }
+        if !tc_enum_has_payload(base) { return [] }
+        return [tid]
+    }
+    if k == TyKind.Typevar {
+        // "" is a name that is not an active type parameter; it passes, as in tc_eq_need.
+        let traits = tc_tparam_bound_traits(type_to_str(tid))
+        if traits == "" || tc_pipe_has(traits, "Ord") != 0 { return [] }
+        return [tid]
+    }
+    [tid]
+}
+
+// An `Ord` element whose `cmp` the compiler cannot build yet, or -1. The spec gives a tuple
+// of `Ord` elements and a fieldless enum with no derive an order, and neither has a `cmp`
+// to call.
+fn tc_ord_not_lowered(tid0: Int) -> Int {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 { return -1 }
+    let k = type_kind(tid)
+    if k == TyKind.Tuple { return tid }
+    if k == TyKind.Enum {
+        let base = tc_enum_base_tid(tid)
+        if tc_type_has_ord_impl(strip_module_qualifier(tc_type_name(base))) == 0 { return tid }
+    }
+    -1
+}
+
+// The part of `tid` a comparator can order by, spelled as a field access (`.name`, `.0`),
+// or "" when no part of it is `Ord`.
+fn tc_ord_example_part(tid0: Int) -> Str {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 { return "" }
+    let k = type_kind(tid)
+    if k == TyKind.Tuple {
+        let mut i = 0
+        for e in tc_tuple_elem_tids(tid) {
+            if tc_ord_need(e).len() == 0 && tc_ord_not_lowered(e) == -1 { return ".{i}" }
+            i = i + 1
+        }
+    }
+    if k == TyKind.Struct {
+        for slot in tc_struct_field_slots(tid) {
+            let ft = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
+            if tc_ord_need(ft).len() == 0 && tc_ord_not_lowered(ft) == -1 { return ".{tc_sfield_name(slot)}" }
+        }
+    }
+    ""
+}
+
+// The `sort_by` call that orders `recv` by one of its element's parts, or "".
+fn tc_sort_by_example(recv: Int, elem: Int) -> Str ! Diag.Report {
+    let part = tc_ord_example_part(elem)
+    if part == "" { return "" }
+    "`{unparse_expr(recv)}.sort_by(fn(a, b) \{ a{part}.cmp(b{part}) })`"
+}
+
+// The fix for an element with no `Ord`, or for one whose order is not built yet, ending in
+// a comparator the caller can pass to `sort_by` in place of the bound.
+fn tc_sort_fix(lead: Str, recv: Int, elem: Int) -> Str ! Diag.Report {
+    let example = tc_sort_by_example(recv, elem)
+    if example != "" { return "{lead}, or sort with a comparator: {example}" }
+    "{lead}, or pass a comparator that returns `Ordering` to `{unparse_expr(recv)}.sort_by`"
+}
+
+// `sort` needs `T: Ord` on the list's element. Refuses an element with no `Ord` as an unmet
+// bound, naming the innermost type without it, and an element whose order the compiler
+// cannot build yet as a TypeError that says so. Returns 1 when it reported.
+fn tc_refuse_unordered_sort(node: Int, recv: Int, elem: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    let path = tc_ord_need(elem)
+    if path.len() > 0 {
+        let leaf = path.get(path.len() - 1).unwrap()
+        let lk = type_kind(leaf)
+        let lead = if lk == TyKind.Struct {
+            "implement `Ord` for `{strip_module_qualifier(tc_type_name(tc_struct_base_tid(leaf)))}`"
+        } else if lk == TyKind.Enum {
+            "implement `Ord` for `{strip_module_qualifier(tc_type_name(tc_enum_base_tid(leaf)))}`"
+        } else if lk == TyKind.Typevar {
+            "add the bound `[{type_to_str(leaf)}: Ord]`"
+        } else {
+            "`{type_to_str(leaf)}` has no order"
+        }
+        let mut notes: List[Str] = []
+        let mut i = 0
+        while i + 1 < path.len() {
+            let outer = path.get(i).unwrap()
+            let inner = path.get(i + 1).unwrap()
+            let elems = tc_tuple_elem_tids(outer)
+            let mut idx = 0
+            while idx < elems.len() && elems.get(idx).unwrap() != inner { idx = idx + 1 }
+            notes.push("`{type_to_str(inner)}` does not implement `Ord` (element .{idx} of tuple)")
+            i = i + 1
+        }
+        diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
+            "`{type_to_str(path.get(0).unwrap())}` does not implement `Ord`", node, tc_sort_fix(lead, recv, elem), notes)
+        return 1
+    }
+    let unbuilt = tc_ord_not_lowered(elem)
+    if unbuilt == -1 { return 0 }
+    if type_kind(unbuilt) == TyKind.Tuple {
+        tc_error_at_code("`sort` on `{type_to_str(elem)}` is not built yet: the compiler cannot order a tuple", node, "TypeError", TYPE_ERROR,
+            tc_sort_fix("sort by one element instead", recv, elem))
+    } else {
+        let ename = strip_module_qualifier(tc_type_name(tc_enum_base_tid(unbuilt)))
+        tc_error_at_code("`sort` on `{type_to_str(elem)}` is not built yet: the compiler cannot order a fieldless enum with no `@derive(Ord)`", node, "TypeError", TYPE_ERROR,
+            "add `@derive(Ord)` to `type {ename}`, which gives it the same declaration order")
+    }
+    1
+}
+
 // The spec enum-vs-Int comparison exception (03_types.md:1093). An
 // enum value stays comparable to an Int (shared tag representation), in EITHER
 // operand order. This is what keeps the compiler's own `node_kind(x) ==
@@ -18904,6 +19078,25 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return make_option_type(elem)
             }
             if method == "last" { return make_option_type(elem) }
+            // A sorted copy. The bound is asked here, at the call, where the element is known;
+            // the comparator a `sort_by` takes is checked here when it is annotated or a fn
+            // value, and by tc_check_sort_by_body once an unannotated one is walked.
+            if method == "sort" {
+                if tc_refuse_unordered_sort(node, node_obj(node), elem) != 0 { return tc_error_recovery_tid() }
+                return obj_t
+            }
+            if method == "sort_by" {
+                let ord_t = lookup_named_type("Ordering")
+                let cmp_arg = closure_arg_at(args_sl, 0)
+                if cmp_arg != -1 && node_kind(cmp_arg) == NodeKind.Closure {
+                    check_closure_param(cmp_arg, 0, elem, method, "List")
+                    check_closure_param(cmp_arg, 1, elem, method, "List")
+                    if ord_t != -1 { check_closure_ret(cmp_arg, ord_t, method, "List") }
+                } else if ord_t != -1 {
+                    check_builtin_arg(method, 0, make_fn_type(ord_t, [elem, elem]), args_sl, "List")
+                }
+                return obj_t
+            }
             if method == "push" {
                 check_builtin_arg(method, 0, elem, args_sl, "List")
                 return TYPE_VOID
@@ -23360,6 +23553,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     check_closure_body(sublist_get(args_sl, 1), make_fn_type(TYPE_UNKNOWN, [acc_t, elem]))
                     hof_arg = 1
                 }
+            } else if method == "sort_by" && type_kind(obj_t) == TyKind.List {
+                tc_check_sort_by_body(closure_arg_at(args_sl, 0), elem)
+                hof_arg = 0
             }
         }
         // Bytes.with_ptr hands its closure a `Ptr[U8]` (sections/07_trust_modules_metadata.md;
