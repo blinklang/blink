@@ -5,8 +5,9 @@ description: (overrides global commit skill with small modification)
 
 Create a git commit with the following workflow:
 
+0. If the work is already committed on a worktree branch: in the worktree, `git rebase main`; then in main, `git merge --ff-only <branch>`. Never make a merge commit. Run the steps below from main.
 1. Run `task ci` to make sure all code is ready.
-- return code 0 with no output, means its green (cached). 
+- return code 0 with no output, means its green (cached). The cache lives in `.task/` in each checkout, so a new worktree runs the full gate cold. Run the gate in main to use its cache.
 2. Fix code if needed.
 3. IMPORTANT:DO NOT CONTINUE UNLESS CI PASSES (exit code 0)
   - (if it says "up to date" that means its green, you dont need to force a rerun)
