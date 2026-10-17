@@ -2651,7 +2651,7 @@ error[MutOnPattern]: `mut` must come before a name, not a tuple pattern
 2 |     let mut (x, y) = pair
   |         ^^^ this `mut` marks no name
   |
-  = help: put `mut` on each name that changes: `let (mut x, mut y) = pair`
+  = help: put `mut` on each name in the pattern: `let (mut x, mut y) = pair`
 ```
 
 **A `mut` binder is a mutable root.** A `mut` binder follows every rule for a `let mut` binding. It can be the root of an assignment or a mutating method call (§3.2.2 *Construction and Mutability*). `async.spawn` cannot capture it (E0650, §2.8). `warning[UnusedMut]` fires on each `mut` binder that the body never mutates (§3.6 *Lints*). A mutation whose root is a binder with no `mut` is `error[E0610] MutationRequiresMut`, and the fix inserts `mut` before that binder.

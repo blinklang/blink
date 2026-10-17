@@ -121,6 +121,8 @@ One round. All six ended "STABLE, ready to vote".
 - DevOps and AI/ML: struct patterns in `let` do not parse yet (separate bug); test field binders in `match` first.
 - Web and DevOps: reword `InconsistentPatternBindings` so a mutability mismatch does not read as a type mismatch.
 
+**Owner ruling on the fix shape (2026-10-17).** The owner overruled the first concern: where a fix and the spec disagree, the spec wins. §3.5 *Mutable Binders* says the E0613 fix puts `mut` on every binder in a tuple, struct or constructor, so the fix keeps the meaning of the old form and needs no knowledge of the body. UnusedMut then fires on each binder the body never changes, and its own fix removes that `mut`, so a second `blink fix` run gives the minimal form. The E0613 help says "each name in the pattern", not "each name that changes", so it matches the fix it shows.
+
 **AI-first review:** learnability, consistency, generability, debuggability, token efficiency: 5/5 pass. The one token cost is `let (mut x, mut y)` over `let mut (x, y)`.
 
 ### Final Spec
