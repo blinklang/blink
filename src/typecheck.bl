@@ -5895,7 +5895,8 @@ fn tc_check_sort_by_body(cls: Int, elem: Int) ! TypeCheck.Resolve, TypeCheck.Rep
 }
 
 // The single install point for a closure's own fn-identity: installs
-// tc_current_fn_name/tc_current_fn_ret to the closure's OWN declared return
+// tc_current_fn_name/tc_current_fn_ret to `ret`, the return the closure's body answers to —
+// its own `-> R`, or the one the context declares when the arrow is omitted
 // (never the enclosing fn's, which is what every other read of these globals
 // gets for free once this runs), walks the body once, and checks the implicit
 // tail against that same declared return. Mirrors emit_closure's codegen
@@ -5910,11 +5911,11 @@ fn tc_check_sort_by_body(cls: Int, elem: Int) ! TypeCheck.Resolve, TypeCheck.Rep
 // ty_pool, ...) that this function does not save/restore around that one call,
 // which the analyzer correctly flags (mirrors tc_check_fn:9052).
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn tc_check_closure_body_against_own_ret(cls: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_closure_body_against_own_ret(cls: Int, ret: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let prev_fn_name = tc_current_fn_name
     let prev_fn_ret = tc_current_fn_ret
     tc_current_fn_name = "closure"
-    tc_current_fn_ret = tc_closure_declared_ret(cls)
+    tc_current_fn_ret = ret
     // codegen's expr_task_ret position reads the closure return-annotation node's tid. Publish
     // the declared return so an annotated task closure resolves off the tid instead of the flat
     // carrier; an unannotated closure has no annotation node and the emit site reads tc_void_tid().
@@ -5964,6 +5965,30 @@ fn tc_fn_tid_ret(fn_tid: Int) -> Int {
     tc_tid_child(r, 0)
 }
 
+// The return slot of a closure that omits `-> R`: a metavar the body walk binds, so every value
+// built from the closure before the walk sees the return the body produces. The one already on
+// the closure's tid is reused, bound or not; minting a second would orphan the first in any
+// type that captured it.
+fn tc_closure_ret_slot(cls: Int) -> Int {
+    let own_ret = tc_fn_tid_ret(tc_lookup_node_tid(cls))
+    if own_ret >= 0 && own_ret != TYPE_UNKNOWN && tc_tid_kind(own_ret) == TyKind.Unknown { return own_ret }
+    make_metavar()
+}
+
+// The return a context DECLARES for a closure written in it, or -1 when it declares none.
+//
+// A HOF hint carries UNKNOWN there, and a metavar is the slot infer_type minted for the
+// closure's own omitted arrow, which the body fills rather than answers to. A return naming a
+// type parameter or a hole is decided per instance or by inference, so a body is not held to
+// it here.
+fn tc_closure_context_ret(exp_fn: Int) -> Int {
+    let r = tc_fn_tid_ret(exp_fn)
+    if tc_tid_is_no_info(r) != 0 { return -1 }
+    if tc_tid_kind(r) == TyKind.Unknown { return -1 }
+    if tc_tid_has_bare_typevar(r) != 0 || tc_tid_has_unbound_metavar(r) != 0 || tc_tid_has_unknown(r) != 0 { return -1 }
+    r
+}
+
 // `async.spawn` takes `fn() -> T ! _` (sections/04_effects.md): the pool thread calls the task
 // with no arguments, so any value of that type is a task, whatever expression names it, and
 // the call is Handle[T]. Any other argument is reported the way a call argument that does not
@@ -6011,7 +6036,22 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) ! TypeCheck.Resolve, Ty
     let cls_arity = if cls_params == -1 { 0 } else { sublist_length(cls_params) }
     if cls_arity != tc_tid_child_count(tc_tid_resolved(seed)) - 1 { return }
     tc_check_closure_ann_against_declared(a, seed)
-    tc_publish_node_tid(a, seed)
+    // An inference pass may already have built a type around the closure's return slot
+    // (tc_closure_ret_slot). The declaration answers it; a position the declaration leaves
+    // open keeps the slot for the body walk to fill.
+    let mut published = seed
+    if node_type_ann(a) == -1 {
+        let old_ret = tc_fn_tid_ret(tc_lookup_node_tid(a))
+        if old_ret >= 0 && old_ret != TYPE_UNKNOWN && tc_tid_kind(old_ret) == TyKind.Unknown {
+            let want_ret = tc_fn_tid_ret(seed)
+            if tc_tid_is_no_info(want_ret) != 0 {
+                published = make_fn_type(old_ret, tc_fn_tid_param_hints(seed))
+            } else {
+                let _ = bind_metavar(old_ret, want_ret)
+            }
+        }
+    }
+    tc_publish_node_tid(a, published)
 }
 
 // A closure may spell a position the context has already declared. Two types for one position
@@ -6218,34 +6258,105 @@ fn check_closure_body(cls: Int, exp_fn: Int) ! TypeCheck.Resolve, TypeCheck.Repo
     // from the element type) instead of the position-blind element hint. The Fn tid minted
     // during inference left unannotated params UNKNOWN; this overwrites it.
     //
-    // An omitted `-> R` makes tc_closure_declared_ret answer Void, which is worse than what
-    // the context already knows, so the expected return seeds the stamp there; the
-    // re-stamp below then covers the case where neither said anything.
+    // A closure that omits `-> R` takes R from the context when the context declares it, and
+    // its body answers to that R exactly as a named fn's body answers to its own: the tail,
+    // every `return e`, and a body with no tail value. Held to the Void default instead, a
+    // body yielding () passed where `fn(Int) -> Int` was expected and the caller read back a
+    // value nothing wrote. With no declared R the obligation stays Void, which drops the tail
+    // as a named fn with no `-> R` does, and the return is read off the body after the walk.
     let cls_ret_ann = node_type_ann(cls)
-    let exp_ret = tc_fn_tid_ret(exp_fn)
-    let mut seed_ret = tc_closure_declared_ret(cls)
-    if cls_ret_ann == -1 && tc_tid_is_no_info(exp_ret) == 0 { seed_ret = exp_ret }
-    tc_publish_node_tid(cls, make_fn_type(seed_ret, param_types))
-    tc_check_closure_body_against_own_ret(cls)
-    // An unannotated closure carries no `-> T`, so tc_closure_declared_ret answered Void
-    // above and the Fn tid returned Void — the HOF then reads an uninitialised
-    // accumulator/element slot. Now that the body has been walked (and therefore its tail
-    // is memoized), infer the return from that tail and re-stamp. This mirrors the
-    // Bytes.with_ptr / LetBinding recovery, which reads the same body-result tid one step
-    // after the walk; reading the memo does not re-report the body's diagnostics. The depth
-    // arg is the tail-value tree-recursion bound (tc_scoped_value_memo caps it at 8), a fresh
-    // walk from here, so seed it at 0 — NOT the closure depth, an unrelated closure-nesting
-    // counter that would shrink the budget to 8 minus the nesting and skip the re-stamp for a
-    // HOF closure nested inside another closure body.
-    // A context that already stated the return (an fn-typed annotation) is authoritative,
-    // so the re-stamp is limited to the case where the seed is still the Void default.
-    if cls_ret_ann == -1 && seed_ret == TYPE_VOID {
-        let inferred_ret = tc_closure_body_result_tid(cls, 0)
-        if inferred_ret >= 0 {
-            tc_publish_node_tid(cls, make_fn_type(inferred_ret, param_types))
+    let mut obligation = tc_closure_declared_ret(cls)
+    let mut stamp_ret = obligation
+    // The return slot of an omitted arrow (tc_closure_ret_slot). A value built from the
+    // closure before this walk (a list literal's element type) holds it, so it is bound below
+    // rather than replaced, and the closure keeps it as its return.
+    let mut slot = -1
+    if cls_ret_ann == -1 {
+        slot = tc_closure_ret_slot(cls)
+        stamp_ret = slot
+        let declared_ret = tc_closure_context_ret(exp_fn)
+        if declared_ret >= 0 {
+            obligation = declared_ret
+            stamp_ret = declared_ret
         }
     }
+    tc_publish_node_tid(cls, make_fn_type(stamp_ret, param_types))
+    tc_check_closure_body_against_own_ret(cls, obligation)
+    if cls_ret_ann != -1 {
+        nr_pop_scope()
+        return
+    }
+    if stamp_ret == slot {
+        tc_settle_closure_ret(cls, slot)
+    } else {
+        let _ = bind_metavar(slot, stamp_ret)
+    }
+    // The slot, not its solution, is published: a later walk reads this tid back as `exp_fn`,
+    // and a return the body itself produced must not come back as one the context declared.
+    tc_publish_node_tid(cls, make_fn_type(slot, param_types))
     nr_pop_scope()
+}
+
+// The return of a closure that neither writes `-> R` nor sits where one is declared is what its
+// body produces: the tail, or, when the tail leaves by another edge, the value its `return`s
+// carry. Every `return e` then answers to that type as it would to a written `-> R`. A slot
+// already bound — by an earlier walk of this closure, or by a use that pinned it — is the
+// answer the body is held to instead.
+//
+// Read after the walk, off the memo, so nothing in the body is reported twice. The depth arg of
+// tc_closure_body_result_tid is the tail-value recursion bound (tc_scoped_value_memo caps it at
+// 8), a fresh walk from here, so it starts at 0 — NOT the closure-nesting depth.
+fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let returns = tc_body_valued_returns(node_body(cls))
+    let tail_t = tc_closure_body_result_tid(cls, 0)
+    let mut ret = tc_resolve(slot)
+    if tc_is_unbound_metavar(slot) != 0 {
+        // A tail that leaves by another edge, or that the walk could not name, says nothing of
+        // the value; the `return`s do. With neither, the body is a statement body: the walk
+        // names no value for a tail such as a match whose arms assign, and a named fn with
+        // that body returns ().
+        let mut found = tail_t
+        if found < 0 || tc_resolve(found) == TYPE_NEVER {
+            for r in returns {
+                let vt = tc_lookup_node_tid(node_value(r))
+                if tc_tid_is_no_info(vt) == 0 && tc_resolve(vt) != TYPE_NEVER {
+                    found = vt
+                    break
+                }
+            }
+        }
+        if found < 0 { found = TYPE_VOID }
+        ret = found
+        let _ = bind_metavar(slot, ret)
+    } else if tc_tid_is_no_info(tail_t) == 0 && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && types_compatible(ret, tail_t) == 0 {
+        tc_error_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls)
+    }
+    // A Void return drops what a `return e` carries, as a named fn with no `-> R` does.
+    if ret == TYPE_VOID || tc_tid_is_no_info(ret) != 0 { return }
+    for r in returns {
+        let vt = tc_lookup_node_tid(node_value(r))
+        if tc_tid_is_no_info(vt) == 0 && types_compatible(ret, vt) == 0 {
+            tc_error_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r)
+        }
+    }
+}
+
+// The `return e` statements of a body, not those of a closure nested in it, whose `return`
+// leaves that closure. The shapes descended are tc_loop_scan_children's, which names every
+// statement position a `return` can sit in.
+fn tc_body_valued_returns(node: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if node == -1 { return out }
+    let kind = node_kind(node)
+    if kind == NodeKind.Return {
+        if node_value(node) != -1 { out.push(node) }
+        return out
+    }
+    if kind == NodeKind.Closure { return out }
+    for kid in tc_loop_scan_children(node) {
+        for r in tc_body_valued_returns(kid) { out.push(r) }
+    }
+    out
 }
 
 // The third entry point into a body that is its own fn context. A handler method
@@ -6412,8 +6523,14 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
         tc_check_body(expr)
         return
     }
-    if k == NodeKind.NamedArg {
+    if k == NodeKind.NamedArg || k == NodeKind.SpreadExpr {
         tc_walk_nested_hof_bodies(node_value(expr))
+        return
+    }
+    // `channel.new[T](buffer: ..)` is its own node kind, not a call, so the call arms above
+    // never reach its arguments.
+    if k == NodeKind.ChannelNew {
+        tc_check_callable_arg_bodies(node_args(expr), -1)
         return
     }
     if k == NodeKind.BinOp {
@@ -16989,11 +17106,9 @@ fn tc_fn_mismatch_detail(want0: Int, got0: Int) -> Str {
     ""
 }
 
-// The fn type `val` offers to a comparison made before its closure body is walked. A closure
-// with no `-> R` returns its body's type, but until check_closure_body has walked the body its
-// tid holds the Void default, which is not an answer, so the return is left open there. A
-// position that declares the fn type seeds the closure instead (tc_seed_expected_into_value).
-fn tc_fn_value_open_ret(val0: Int, t: Int) -> Int {
+// The closure `val0` is, seen through the wrappers a value position adds, when that closure
+// has no `-> R`; -1 otherwise.
+fn tc_fn_value_unannotated_closure(val0: Int) -> Int {
     let mut val = val0
     let mut depth = 0
     while val != -1 && depth < 8 {
@@ -17008,9 +17123,36 @@ fn tc_fn_value_open_ret(val0: Int, t: Int) -> Int {
         }
         depth = depth + 1
     }
-    if val == -1 || node_kind(val) != NodeKind.Closure || node_type_ann(val) != -1 { return t }
+    if val == -1 || node_kind(val) != NodeKind.Closure || node_type_ann(val) != -1 { return -1 }
+    val
+}
+
+// A value that shares one type with `other_t` (a list element, an if branch) and is a closure
+// with no `-> R` must return what `other_t` returns. Binding its open return slot to that
+// return makes the body walk hold the closure to it; otherwise each closure would settle its
+// own return and a list of them could mix Int and Str behind one element type.
+fn tc_tie_closure_ret(val: Int, val_t: Int, other_t: Int) {
+    if tc_fn_value_unannotated_closure(val) == -1 { return }
+    let r = tc_resolve(val_t)
+    let o = tc_resolve(other_t)
+    if tc_tid_kind(r) != TyKind.Fn || tc_tid_kind(o) != TyKind.Fn { return }
+    if tc_tid_child_count(r) != tc_tid_child_count(o) { return }
+    let want = tc_resolve(tc_tid_child(o, 0))
+    if tc_tid_is_no_info(want) != 0 { return }
+    let _ = bind_metavar(tc_tid_child(r, 0), want)
+}
+
+// The fn type `val` offers to a comparison made before its closure body is walked. A closure
+// with no `-> R` returns its body's type, but until check_closure_body has walked the body its
+// tid holds an unfilled return slot (or, from an older stamp, the Void default), which is not an
+// answer, so the return is left open there. A position that declares the fn type seeds the
+// closure instead (tc_seed_expected_into_value).
+fn tc_fn_value_open_ret(val0: Int, t: Int) -> Int {
+    if tc_fn_value_unannotated_closure(val0) == -1 { return t }
     let r = tc_resolve(t)
-    if tc_tid_kind(r) != TyKind.Fn || tc_resolve(tc_tid_child(r, 0)) != TYPE_VOID { return t }
+    if tc_tid_kind(r) != TyKind.Fn { return t }
+    let ret = tc_resolve(tc_tid_child(r, 0))
+    if ret != TYPE_VOID && tc_is_unbound_metavar(ret) == 0 { return t }
     let mut params: List[Int] = []
     let mut i = 1
     while i < tc_tid_child_count(r) {
@@ -20899,6 +21041,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 let elem = sublist_get(elems_sl, ei)
                 let c = tc_list_elem_contribution(elem)
                 tc_check_list_elem_compat(elem, tc_fn_value_open_ret(elem, c), ei, first_cmp)
+                tc_tie_closure_ret(elem, c, first_t)
+                tc_tie_closure_ret(sublist_get(elems_sl, 0), first_t, c)
                 ei = ei + 1
             }
             tc_check_spread_sources(elems_sl, first_t)
@@ -21079,6 +21223,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             if tc_tid_is_no_info(then_t) != 0 { return else_t }
             if tc_tid_is_no_info(else_t) != 0 { return then_t }
+            tc_tie_closure_ret(else_node, else_t, then_t)
+            tc_tie_closure_ret(node_then_body(node), then_t, else_t)
             // A hole takes the other branch's answer for that position, so the `if`'s own
             // type never carries an absence into a container the callers then read.
             if tc_tid_has_unknown(then_t) != 0 { return tc_tid_fill_unknowns(then_t, else_t) }
@@ -21231,11 +21377,17 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
     // A closure literal's type is its signature, computed from the declaration rather
     // than the body: params through resolve_param_type (TYPE_UNKNOWN for an
-    // un-annotated param, which is honest — nothing infers those yet), the return
-    // through tc_closure_declared_ret (TYPE_VOID when the arrow is omitted, matching
-    // the named-fn default).
+    // un-annotated param, which is honest — nothing infers those yet), a written return
+    // through tc_closure_declared_ret.
     if kind == NodeKind.Closure {
-        let ret_t = tc_closure_declared_ret(node)
+        let mut ret_t = tc_closure_declared_ret(node)
+        // An omitted arrow is not a Void return: the body decides it. check_closure_body binds
+        // this slot after its walk, so a type built from the closure first (a list literal's
+        // element type) still ends up naming what the body returns.
+        if node_type_ann(node) == -1 {
+            ret_t = tc_fn_tid_ret(tc_lookup_node_tid(node))
+            if ret_t < 0 { ret_t = tc_closure_ret_slot(node) }
+        }
         let mut param_types: List[Int] = []
         let params_sl = node_params(node)
         if params_sl != -1 {

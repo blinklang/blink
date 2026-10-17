@@ -1,0 +1,232 @@
+// A closure that leaves out `-> R` still has a return type. Where a position declares the fn
+// type the closure must have, that declaration states R, and the body is held to it exactly as
+// a named fn's body is held to its own `-> R`: the tail, every `return e`, and a body with no
+// tail value at all.
+//
+// Before this check the body was held to the Void default of an omitted arrow, so a closure
+// whose body yields () passed where `fn(Int) -> Int` was expected, and the callee read back a
+// value nothing had written.
+//
+// With no declared type, the return comes from the body: a closure in a list literal is a
+// function that returns what its body computes, not a function that returns Void.
+//
+// The controls are what must not change. A tail that fits reports nothing; a diverging tail
+// fits any return (§3.3); a declared `()` return drops the tail value, as a named
+// `fn f() -> () { 42 }` does (§3.5 *Discarded copies*: the last statement of a function that
+// returns nothing drops its result); and the stdlib closure positions keep working.
+
+import typecheck.{check_types, tc_lookup_node_tid, tc_resolve, tc_type_str}
+import parser.{node_count, node_kind, node_name}
+import ast.{NodeKind, nk_of}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// Warnings name the same binders this test is about, so only errors are read here.
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+fn assert_clean_at(marker: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if msgs != "" { io.println("FAIL: line {line} ({marker}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+// The type typecheck gave the binder `name` (a `let` binding or a parameter).
+fn binder_type(name: Str) -> Str {
+    let mut i = 0
+    while i < node_count() {
+        let k = nk_of(node_kind(i))
+        if (k == NodeKind.LetBinding || k == NodeKind.Param) && node_name(i) == name {
+            let tid = tc_lookup_node_tid(i)
+            if tid < 0 { return "<none>" }
+            return tc_type_str(tc_resolve(tid))
+        }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no binder '{name}'")
+    assert(false)
+    ""
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn probe_src() -> Str {
+    #"type UcBox { f: fn(Int) -> Int }
+
+fn ucapply(f: fn(Int) -> Int) -> Int { f(1) }
+fn ucapply_unit(f: fn(Int) -> ()) { f(1) }
+fn ucapply_str(f: fn(Int) -> Str) -> Str { f(1) }
+fn ucident(i: Int) -> Int { i }
+
+fn main() {
+    let _ = ucapply(fn(i: Int) { let _ = i })  // R_UNIT_BODY
+    let _ = ucapply(fn(i) { let _ = i })  // R_UNIT_BODY_INFERRED_PARAM
+    let _ = ucapply(fn(i: Int) { "{i}" })  // R_TAIL_WRONG
+    let _ = ucapply(fn(i: Int) {
+        if i > 0 { return "pos" }  // R_RETURN_WRONG
+        i
+    })
+    let _ = ucapply(fn(i: Int) { if i > 0 { "a" } else { "b" } })  // R_IF_TAIL_WRONG
+    let _ = ucapply(fn(i: Int) {
+        match i {  // R_MATCH_TAIL_WRONG
+            0 => "zero"
+            _ => "other"
+        }
+    })
+    let _ = ucapply(fn(i: Int) { { "{i}" } })  // R_BLOCK_TAIL_WRONG
+    let _ = ucapply_str(fn(i: Int) { i })  // R_STR_EXPECTED_INT_TAIL
+    let _ucf: fn(Int) -> Int = fn(i: Int) { let _ = i }  // R_LET_UNIT_BODY
+    let _ucb = UcBox { f: fn(i: Int) { let _ = i } }  // R_FIELD_UNIT_BODY
+    let _ucl1 = [ucident, fn(i: Int) { "{i}" }]  // R_LIST_NAMED_THEN_CLOSURE
+    let _ucl2 = [fn(i: Int) { "{i}" }, ucident]  // R_LIST_CLOSURE_THEN_NAMED
+    let _ucl3 = [
+        fn(i: Int) { i },
+        fn(i: Int) { "{i}" },  // R_LIST_TWO_CLOSURES
+    ]
+    let _uci = if true { ucident } else { fn(i: Int) { "{i}" } }  // R_IF_NAMED_ELSE_CLOSURE
+
+    let _ = ucapply(fn(i: Int) { i + 1 })  // R_OK_TAIL
+    let _ = ucapply(fn(i) { i + 1 })  // R_OK_TAIL_INFERRED_PARAM
+    let _ = ucapply(fn(i: Int) {
+        if i > 0 { return i }  // R_OK_RETURN
+        0
+    })
+    let _ = ucapply(fn(i: Int) { if i > 0 { i } else { 0 } })  // R_OK_IF_TAIL
+    let _ = ucapply(fn(i: Int) { if i > 0 { return i } loop { } })  // R_OK_NEVER_TAIL
+    ucapply_unit(fn(i: Int) { i + 1 })  // R_OK_UNIT_DROPS_INT_TAIL
+    ucapply_unit(fn(i: Int) { let _ = i })  // R_OK_UNIT_BODY
+    let _ucg: fn(Int) -> Int = fn(i: Int) { i * 2 }  // R_OK_LET
+    let _ucc = UcBox { f: fn(i: Int) { i * 3 } }  // R_OK_FIELD
+    let ucxs = [1, 2, 3]
+    let _ucm = ucxs.map(fn(x) { x + 1 })  // R_OK_MAP
+    let _ucfl = ucxs.filter(fn(x) { x > 1 })  // R_OK_FILTER
+    ucxs.for_each(fn(x) { let _ = x })  // R_OK_FOR_EACH
+    ucxs.for_each(fn(x) { x + 1 })  // R_OK_FOR_EACH_DROPS_TAIL
+    let _ucs = ucxs.fold(0, fn(a, x) { a + x })  // R_OK_FOLD
+
+    let _ucl4 = [ucident, fn(i: Int) { i + 1 }]  // R_OK_LIST_MIXED
+    let _ucl5 = [fn(i: Int) { i }, fn(i: Int) { i * 2 }]  // R_OK_LIST_CLOSURES
+    let _uci2 = if true { ucident } else { fn(i: Int) { i + 1 } }  // R_OK_IF_MIXED
+    let uclist = [fn(i: Int) { i }]
+    let ucfirst = uclist.get(0).unwrap()
+    let ucn = ucfirst(1)
+    let _ = ucn
+}
+"#
+}
+
+test "a body that yields () is rejected where the declared return is Int" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_error_at("R_UNIT_BODY", "declared return type Int but body returns")
+    assert_error_at("R_UNIT_BODY_INFERRED_PARAM", "declared return type Int but body returns")
+    assert_error_at("R_LET_UNIT_BODY", "declared return type Int but body returns")
+    assert_error_at("R_FIELD_UNIT_BODY", "declared return type Int but body returns")
+}
+
+test "a tail of the wrong type is rejected against the declared return" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_error_at("R_TAIL_WRONG", "return value type Str does not match function `closure` return type Int")
+    assert_error_at("R_IF_TAIL_WRONG", "Str")
+    assert_error_at("R_MATCH_TAIL_WRONG", "Str")
+    assert_error_at("R_BLOCK_TAIL_WRONG", "Str")
+    assert_error_at("R_STR_EXPECTED_INT_TAIL", "return value type Int does not match function `closure` return type Str")
+}
+
+test "closures that share one type with their neighbours must return what those return" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_error_at("R_LIST_NAMED_THEN_CLOSURE", "Str")
+    assert_error_at("R_LIST_CLOSURE_THEN_NAMED", "Str")
+    assert_error_at("R_LIST_TWO_CLOSURES", "Str")
+    assert_error_at("R_IF_NAMED_ELSE_CLOSURE", "Str")
+    assert_clean_at("R_OK_LIST_MIXED")
+    assert_clean_at("R_OK_LIST_CLOSURES")
+    assert_clean_at("R_OK_IF_MIXED")
+    assert_eq(binder_type("_ucl5"), "List[Fn(Int) -> Int]")
+}
+
+test "a return of the wrong type is rejected against the declared return" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_error_at("R_RETURN_WRONG", "return value type Str does not match function `closure` return type Int")
+}
+
+test "bodies that fit the declared return report nothing" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_clean_at("R_OK_TAIL")
+    assert_clean_at("R_OK_TAIL_INFERRED_PARAM")
+    assert_clean_at("R_OK_RETURN")
+    assert_clean_at("R_OK_IF_TAIL")
+    assert_clean_at("R_OK_NEVER_TAIL")
+    assert_clean_at("R_OK_LET")
+    assert_clean_at("R_OK_FIELD")
+}
+
+test "a declared () return drops the tail value" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_clean_at("R_OK_UNIT_DROPS_INT_TAIL")
+    assert_clean_at("R_OK_UNIT_BODY")
+    assert_clean_at("R_OK_FOR_EACH_DROPS_TAIL")
+}
+
+test "stdlib closure positions keep their inferred returns" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_clean_at("R_OK_MAP")
+    assert_clean_at("R_OK_FILTER")
+    assert_clean_at("R_OK_FOR_EACH")
+    assert_clean_at("R_OK_FOLD")
+    assert_eq(binder_type("_ucm"), "List[Int]")
+}
+
+test "a closure with no declared type returns what its body computes" {
+    let _p = probe("build/tc_uc_ret_src.bl", probe_src())
+    assert_eq(binder_type("uclist"), "List[Fn(Int) -> Int]")
+    assert_eq(binder_type("ucn"), "Int")
+}
