@@ -20,10 +20,10 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
-    diag_set_last_fix, UNDECLARED_EFFECT,
+    diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
-    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION,
+    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
@@ -1297,12 +1297,13 @@ let mut tc_impl_of_method: Map[Int, Int] = Map()
 // no impl method's declared return type gets installed — every wrong return escapes to the C
 // compiler. The node name stays the display spelling; only the lookup uses this.
 let mut tc_current_method_sig_key: Str = ""
-// Depth of closure bodies the type-inference pass is currently inside. tc_current_fn_ret
-// is saved/restored by tc_check_fn (and the test-body elaborator) only, so within a
-// closure body it still names the ENCLOSING fn's declared return — the closure's own is
-// never installed. Read-only diagnostics tolerate that; an in-place ty_pool MUTATION
+// One entry per closure body the type-inference pass is currently inside, innermost last: the
+// scope index where that closure's own bindings start, so a binding below the last entry is a
+// capture. Its length is the closure depth. tc_current_fn_ret is saved/restored by
+// tc_check_fn (and the test-body elaborator) only, so within a closure body it still names
+// the ENCLOSING fn's declared return — the closure's own is never installed. Read-only diagnostics tolerate that; an in-place ty_pool MUTATION
 // keyed on it does not (see tc_pin_tail_ret_generic's call site in the Return arm).
-let mut tc_in_closure_depth: Int = 0
+let mut tc_closure_scope_base: List[Int] = []
 
 // Consume-once marker: tc_check_fn sets it immediately before calling
 // tc_check_body on the fn's own body, and tc_check_body's Block arm reads-then-zeroes
@@ -4634,7 +4635,7 @@ fn tc_pin_declared_into_arm(declared_tid: Int, body: Int) ! TypeCheck.Resolve, T
 //     an unbound metavar, so this IS the branch an under-determined tail takes, and
 //     placing the pin here means it can never turn a reported mismatch into a silent
 //     success.
-//   • tc_in_closure_depth == 0 — tc_current_fn_ret DOES name the closure's own
+//   • the closure depth is 0 — tc_current_fn_ret DOES name the closure's own
 //     declared return inside a closure body (installed by
 //     tc_check_closure_body_against_own_ret, never the enclosing fn's), so the
 //     compare above is no longer misreporting there. The gate stays anyway:
@@ -4725,7 +4726,7 @@ fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCh
             tc_error_at("return value type {type_to_str(val_t)} does not match function `{tc_current_fn_name}` return type {type_to_str(tc_current_fn_ret)}", at_node)
         }
     } else {
-        if tc_in_closure_depth == 0 {
+        if tc_closure_scope_base.len() == 0 {
             // A `return`-wrapped value carries the returned node one level down; an
             // implicit tail passes the value node itself. When that value is an if/match
             // whose every arm tail minted a return-only group, the declared return can
@@ -5901,7 +5902,7 @@ fn tc_check_sort_by_body(cls: Int, elem: Int) ! TypeCheck.Resolve, TypeCheck.Rep
 // treatment of a closure as its own fn context (src/codegen_closures.bl:868-874,
 // 1028-1043, 1046-1052) — codegen already does this; typecheck never did. Shared
 // by the two positions a closure body is walked from (tc_check_body's Closure arm
-// and check_closure_body's HOF path below), so the tc_in_closure_depth bump and
+// and check_closure_body's HOF path below), so the tc_closure_scope_base push and
 // the tc_fn_body_block one-shot marker live here exactly once instead of
 // duplicated at both call sites.
 // tc_current_fn_name/tc_current_fn_ret are genuinely saved and restored here;
@@ -5927,9 +5928,9 @@ fn tc_check_closure_body_against_own_ret(cls: Int) ! TypeCheck.Resolve, TypeChec
     // (mirrors nr_check_node's Closure arm, which resets this for the same reason).
     let saved_in_test = tc_in_test_body
     tc_in_test_body = 0
-    tc_in_closure_depth = tc_in_closure_depth + 1
+    tc_closure_scope_base.push(nr_scope_names.len())
     tc_check_body(body)
-    tc_in_closure_depth = tc_in_closure_depth - 1
+    let _ = tc_closure_scope_base.pop()
     tc_in_test_body = saved_in_test
     tc_check_missing_tail_value(body, tc_current_fn_ret, "closure", cls)
     tc_current_fn_name = prev_fn_name
@@ -6175,7 +6176,7 @@ fn tc_fn_tid_is_concrete(fn_tid: Int) -> Int {
 // `Int`) leaks past typecheck to the C compiler. When a param IS explicitly annotated we
 // bind the declared type instead — this preserves Part A's annotation validation and never
 // contradicts it. The body walk itself — including installing the closure's own declared
-// return and the tc_in_closure_depth bump — is shared with tc_check_body's Closure arm via
+// return and the tc_closure_scope_base push — is shared with tc_check_body's Closure arm via
 // tc_check_closure_body_against_own_ret.
 //
 // Hints are read off `exp_fn` per POSITION with no special-casing of index 0 and 1: the
@@ -6228,7 +6229,7 @@ fn check_closure_body(cls: Int, exp_fn: Int) ! TypeCheck.Resolve, TypeCheck.Repo
     // Bytes.with_ptr / LetBinding recovery, which reads the same body-result tid one step
     // after the walk; reading the memo does not re-report the body's diagnostics. The depth
     // arg is the tail-value tree-recursion bound (tc_scoped_value_memo caps it at 8), a fresh
-    // walk from here, so seed it at 0 — NOT tc_in_closure_depth, an unrelated closure-nesting
+    // walk from here, so seed it at 0 — NOT the closure depth, an unrelated closure-nesting
     // counter that would shrink the budget to 8 minus the nesting and skip the re-stamp for a
     // HOF closure nested inside another closure body.
     // A context that already stated the return (an fn-typed annotation) is authoritative,
@@ -6308,10 +6309,10 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     tc_in_test_body = 0
     // And it is not inside any closure written around the handler: tc_current_fn_ret now names
     // this method's own return, which is what depth 0 promises.
-    let saved_closure_depth = tc_in_closure_depth
-    tc_in_closure_depth = 0
+    let saved_closure_bases = tc_closure_scope_base
+    tc_closure_scope_base = []
     tc_check_body(body)
-    tc_in_closure_depth = saved_closure_depth
+    tc_closure_scope_base = saved_closure_bases
     tc_in_test_body = saved_in_test
     tc_check_missing_tail_value(body, tc_current_fn_ret, mname, m)
     nr_pop_scope()
@@ -11450,7 +11451,7 @@ fn init_types() ! TypeCheck.Register {
     tc_current_fn_node = -1
     tc_current_self_tid = -1
     tc_current_method_sig_key = ""
-    tc_in_closure_depth = 0
+    tc_closure_scope_base = []
     tc_fn_body_block = 0
     tc_suppress_ann_validation = 0
     tc_boundary_check_active = 0
@@ -12153,7 +12154,7 @@ fn nr_resolve_default_receiver(call: Int, obj: Int) {
 // `root`. A closure can outlive the operation it is written in, so there is no enclosing
 // handler for it to name.
 fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if tc_in_closure_depth > 0 {
+    if tc_closure_scope_base.len() > 0 {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
             "`default` cannot be used inside a closure within a handler operation", call,
             "call `default.{method}` in the operation body itself")
@@ -22627,6 +22628,58 @@ fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
     diag_error_at("MutationRequiresMut", MUTATION_REQUIRES_MUT, "cannot call mutating method `.{method}` on immutable binding `{name}`", node, "declare it as `let mut {name}` at line {node_line(decl)}")
 }
 
+// §2.22 *Writes that are not to a place*, case 4: `=` or `op=` whose root is a plain `let`.
+// Runs once the path's types are known, since the cases before it in the spec's order -- a
+// `Ptr` step, a temporary root, a parameter root -- are other errors and take the write. A
+// pattern binder and the name after `with ... as` are left alone here too.
+fn tc_check_assign_root(target: Int) ! Diag.Report {
+    let mut root = target
+    while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
+        let obj = node_obj(root)
+        if obj == -1 { return }
+        if type_kind(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(obj)))) == TyKind.Ptr { return }
+        root = obj
+    }
+    if node_kind(root) != NodeKind.Ident { return }
+    let name = node_name(root)
+    let idx = nr_top_index(name)
+    if idx == -1 { return }
+    let global = nr_index_is_global(idx) != 0
+    // Every module's globals share one flat scope, so the newest spelling may be another
+    // module's; the declaration this module sees decides.
+    let decl = if global { nr_resolve_bare_decl(name, nr_current_module) } else { nr_scope_nodes.get(idx).unwrap() }
+    if decl < 0 || node_kind(decl) != NodeKind.LetBinding { return }
+    let is_mut = if global { node_is_mut(decl) } else { nr_scope_muts.get(idx).unwrap() }
+    if is_mut != 0 { return }
+    if node_elements(decl) != -1 || node_is_const(decl) != 0 { return }
+    let message = if root == target { "cannot assign to `{name}`, which is not `mut`" } else { "cannot assign to `{unparse_expr(target)}`, whose root `{name}` is not `mut`" }
+    let mut notes = ["declared here: `let {name}` at line {node_line(decl)}"]
+    let decl_module = node_module(decl)
+    let imported = global && decl_module != "" && decl_module != nr_current_module
+    if imported {
+        notes = ["declared here: `pub let {name}` at {diag_normalize_path(diag_file_for_node(decl))}:{node_line(decl)}"]
+    }
+    let in_closure = !global && tc_closure_scope_base.len() > 0 && idx < tc_closure_scope_base.get(tc_closure_scope_base.len() - 1).unwrap()
+    if in_closure { notes.push("captured here: the closure that makes this write captures `{name}`") }
+    tc_errors.push(message)
+    if !global {
+        let before = diag_entry_count()
+        diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, target, "declare it `let mut {name}`", notes)
+        // The span is the `let` keyword, so every write to one root gives the same edit.
+        if diag_entry_count() > before {
+            diag_set_last_fix_at("insert `mut`", "let mut", node_line(decl), node_col(decl), node_line(decl), node_col(decl) + 3)
+        }
+        return
+    }
+    if imported {
+        diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, target,
+            "`{name}` is a `pub let` of module `{tc_get_dotted_module_path(decl_module)}`, and `pub let mut` is not allowed (E1013); copy it into a local `let mut`", notes)
+        return
+    }
+    diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, target,
+        "declare it `let mut {name}` only if it must change: `mut` adds `State` to the row of each function that reads or writes it (§4.16)", notes)
+}
+
 // The mutation check above runs from tc_check_body's MethodCall arm, which is reached only in
 // statement/initializer position, so a mutating call written as an ARGUMENT is never checked —
 // the same mutation on the same binding caught or allowed by syntactic position alone. The
@@ -22838,7 +22891,7 @@ fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Res
     // inferred and walked, which is where the closure body reads it. Inside a closure
     // body tc_current_fn_ret still names the ENCLOSING fn, so seeding there would
     // publish another function's signature on this closure.
-    if returns_value && tc_in_closure_depth == 0 { tc_seed_expected_into_value(val, tc_current_fn_ret) }
+    if returns_value && tc_closure_scope_base.len() == 0 { tc_seed_expected_into_value(val, tc_current_fn_ret) }
     if returns_value { tc_infer_value(val) } else { infer_type(val) }
 }
 
@@ -23117,6 +23170,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let val = node_value(node)
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
+            tc_check_assign_root(target)
             let val_t = tc_infer_assigned_value(target_t, val)
             if kind == NodeKind.CompoundAssign {
                 reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
@@ -23139,7 +23193,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // target through the field arm, which substitutes the enclosing
                     // instance's concrete args.
                     //
-                    // No tc_in_closure_depth guard, unlike tc_check_returned_value: that
+                    // No closure-depth guard, unlike tc_check_returned_value: that
                     // guard exists because tc_current_fn_ret names the closure's own
                     // declared return, not stale ambient state. target_t was never
                     // ambient to begin with: it's read from the

@@ -418,6 +418,12 @@ pub type DiagEntry {
     end_col: Int
     fix_action: Str
     fix_text: Str
+    // Where the fix's edit goes. 0 means the diagnostic's own span: a fix may edit another
+    // line, such as the `let` that a write on a later line needs to be `mut`.
+    fix_line: Int
+    fix_col: Int
+    fix_end_line: Int
+    fix_end_col: Int
     notes: List[Str]
 }
 
@@ -659,6 +665,12 @@ fn diag_emit(severity: Str, name: Str, code: Str, message: Str, line: Int, col: 
 }
 
 pub fn diag_set_last_fix(action: Str, text: Str) {
+    diag_set_last_fix_at(action, text, 0, 0, 0, 0)
+}
+
+// A fix whose edit replaces line:col..end_line:end_col of the diagnostic's file, not the
+// diagnostic's own span.
+pub fn diag_set_last_fix_at(action: Str, text: Str, line: Int, col: Int, end_line: Int, end_col: Int) {
     let idx = diag_entries.len() - 1
     if idx >= 0 {
         let d = diag_entries.get(idx).unwrap()
@@ -667,6 +679,7 @@ pub fn diag_set_last_fix(action: Str, text: Str) {
             message: d.message, file: d.file, line: d.line,
             col: d.col, help: d.help, end_line: d.end_line,
             end_col: d.end_col, fix_action: action, fix_text: text,
+            fix_line: line, fix_col: col, fix_end_line: end_line, fix_end_col: end_col,
             notes: d.notes
         })
     }
@@ -940,7 +953,8 @@ fn diag_record(effective_severity: Str, name: Str, code: Str, message: Str, line
         severity: effective_severity, name: name, code: code,
         message: message, file: diag_source_file, line: line,
         col: col, help: help, end_line: end_line, end_col: end_col,
-        fix_action: "", fix_text: "", notes: notes
+        fix_action: "", fix_text: "", fix_line: 0, fix_col: 0, fix_end_line: 0, fix_end_col: 0,
+        notes: notes
     })
     if effective_severity == "error" {
         diag_count = diag_count + 1
@@ -1075,7 +1089,11 @@ fn diag_json_line(idx: Int) -> Str {
     let fix_act = d.fix_action
     if fix_act != "" {
         let fix_txt = json_escape(d.fix_text)
-        json = json.concat(",\"fix\":\{\"action\":\"{fix_act}\",\"text\":\"{fix_txt}\"}")
+        let mut fix_span = ""
+        if d.fix_line > 0 {
+            fix_span = ",\"span\":\{\"file\":\"{file}\",\"line\":{d.fix_line},\"col\":{d.fix_col},\"end_line\":{d.fix_end_line},\"end_col\":{d.fix_end_col}}"
+        }
+        json = json.concat(",\"fix\":\{\"action\":\"{fix_act}\",\"text\":\"{fix_txt}\"{fix_span}}")
     }
     json.concat("}\n")
 }
@@ -1167,7 +1185,9 @@ fn diag_human_text(idx: Int) -> Str {
     } else if d.help != "" {
         sb.write(diag_help_text(d.help))
     }
-    if d.fix_action != "" {
+    if d.fix_action != "" && d.fix_line > 0 {
+        sb.write("  fix: {d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}\n")
+    } else if d.fix_action != "" {
         sb.write("  fix: {d.fix_action} `{d.fix_text}`\n")
     }
     sb.to_str()
@@ -1654,7 +1674,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0601 -- CloseableEscapesScope / PtrEscapesFfiScope\n\nCloseableEscapesScope: a `Closeable` value escapes the `with ... as`\nblock that owns it. Closeable resources are released when the\nwith-block exits, so references that survive would be use-after-close.\n\nFix: keep the value inside the with-block, or copy out only the\ndata you need before the block ends.\n\n  with open(\"f.txt\") as f \{\n      let bytes = f.read_all()  // OK -- bytes is plain data\n      // return f               // E0601 -- f outlives the scope\n  \}\n\nPtrEscapesFfiScope: a `Ptr` allocated inside a `with ffi.scope() as\nscope` block escapes the block. The scope frees its allocations when\nthe block exits, so the escaped Ptr would dangle.\n\nFix: call `scope.take(p)` to detach the Ptr from the scope before it\nleaves the block.\n\n  with ffi.scope() as scope \{\n      let p: Ptr[Pollfd] = scope.alloc()\n      scope.take(p)             // OK -- detached, may now escape\n  \}"
     }
     if code == MUTATION_REQUIRES_MUT {
-        return "E0610 -- MutationRequiresMut\n\nA mutating collection method was called on a binding declared with\nplain `let`. Mutating methods (List: `push`, `pop`, `set`, `clear`;\nMap: `insert`, `remove`, `clear`; Set: `insert`, `remove`) require\n`let mut`, so that every mutation source is visible at the binding.\n\nFix: declare the binding `let mut`, or build the new value with a\nnon-mutating method that returns a fresh collection (`concat`,\n`map`, `filter`).\n\n  let names = [\"Alice\"]\n  names.push(\"Dave\")       // E0610 -- names is not mut\n\n  let mut names = [\"Alice\"]\n  names.push(\"Dave\")       // OK"
+        return "E0610 -- MutationRequiresMut\n\nA mutation needs a mutable root: the first name of the receiver or of\nthe place must be `let mut`, a `mut` pattern binder or a `mut`\nparameter. A mutation is a call to a method that declares `mut self`\n(List `push`, `pop`, `set`, `clear`; Map and Set `insert`, `remove`,\n`clear`; the `StringBuilder` and `Bytes` writers), or an assignment\n`=` or `op=`. Each mutation source is then visible at its binding.\n\nAn assignment to a parameter, or to a field of one, is E0612\nParamAssign, with or without `mut`.\n\nFix: declare the binding `let mut`. A module-level `let` gets no\nautomatic fix, since `mut` adds `State` to the row of each function\nthat reads or writes it; `pub let mut` is not allowed (E1013).\n\n  let names = [\"Alice\"]\n  names.push(\"Dave\")       // E0610 -- names is not mut\n  let total = 0\n  total += 1               // E0610\n\n  let mut names = [\"Alice\"]\n  names.push(\"Dave\")       // OK\n  let mut total = 0\n  total += 1               // OK"
     }
     if code == MUT_ON_PATTERN {
         return "E0613 -- MutOnPattern\n\n`mut` marks the one name right after it. Before a pattern that is not a\nname -- a tuple, list, struct, constructor, variant, `_`, a literal or a\nrange -- it marks nothing. Before a field label it marks the label,\nwhich is not a name the pattern binds. After `with ... as` it would let\nthe name change, but `close()` runs on the value that `with` acquired.\n\nFix: put `mut` on each name inside the pattern that changes, move it\nafter the colon of a field label, or remove it.\n\n  let (mut (a, b), c) = ((1, 2), 3)   // E0613\n  let ((mut a, mut b), c) = ((1, 2), 3)   // OK\n\n  match p \{ Point \{ mut x: px \} => px \}   // E0613\n  match p \{ Point \{ x: mut px \} => px \}   // OK\n\n  match o \{ mut None => 0, Some(v) => v \}   // E0613 -- None binds no name"

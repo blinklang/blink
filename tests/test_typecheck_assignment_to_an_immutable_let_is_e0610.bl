@@ -1,0 +1,358 @@
+// `=` or `op=` whose root is a plain `let` is `error[E0610] MutationRequiresMut`
+// (sections/02_syntax.md §2.22 *Writes that are not to a place*, case 4; sections/03_types.md
+// §3.2.2 *Construction and Mutability*). A local `let` gets a fix that turns its `let` into
+// `let mut`, and every write to that root gets the same edit. A module-level `let` and an
+// imported `pub let` get help only. A `Ptr` step, a temporary root, a parameter root and a
+// pattern binder are other cases or later work, so none of them is E0610 here.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help} | notes: {d.notes.join(\"; \")} | fix: {d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}")
+        }
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for e in errors() { io.println("  {e}") }
+}
+
+fn e0610_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.code == "E0610" { n += 1 }
+    }
+    n
+}
+
+// `n` E0610 errors and no other error, each with `message`, its help containing `help_part`,
+// and its fix turning the `let` at let_line:let_col into `let mut`.
+fn expect_local(label: Str, n: Int, message: Str, help_part: Str, let_line: Int, let_col: Int) {
+    let mut ok = e0610_count() == n && errors().len() == n
+    for d in diag_entries {
+        if d.severity == "error" && d.code == "E0610" {
+            if d.name != "MutationRequiresMut" || d.message != message { ok = false }
+            if !d.help.contains(help_part) { ok = false }
+            if d.fix_text != "let mut" || d.fix_action == "" { ok = false }
+            if d.fix_line != let_line || d.fix_col != let_col { ok = false }
+            if d.fix_end_line != let_line || d.fix_end_col != let_col + 3 { ok = false }
+            if !d.notes.join("\n").contains("declared here") { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+// One E0610 and no other error, with help only: no fix.
+fn expect_help_only(label: Str, message: Str, help_part: Str) {
+    let mut ok = e0610_count() == 1 && errors().len() == 1
+    for d in diag_entries {
+        if d.severity == "error" && d.code == "E0610" {
+            if d.message != message || !d.help.contains(help_part) { ok = false }
+            if d.fix_action != "" || d.fix_text != "" { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_no_e0610(label: Str) {
+    if e0610_count() != 0 { show(label) }
+    assert_eq(e0610_count(), 0)
+}
+
+fn expect_clean(label: Str) {
+    if errors().len() != 0 { show(label) }
+    assert_eq(errors().len(), 0)
+}
+
+test "a scalar let given a new value is E0610 with a let mut fix" {
+    probe("build/asg_imm_scalar.bl", #"
+fn main() {
+    let a = 5
+    a = 6
+    let _ = a
+}
+"#)
+    expect_local("a = 6", 1, "cannot assign to `a`, which is not `mut`", "declare it `let mut a`", 3, 5)
+}
+
+test "a field of a struct let given a new value is E0610" {
+    probe("build/asg_imm_field.bl", #"
+type Pt { x: Int }
+
+fn main() {
+    let p = Pt { x: 1 }
+    p.x = 5
+    let _ = p.x
+}
+"#)
+    expect_local("p.x = 5", 1, "cannot assign to `p.x`, whose root `p` is not `mut`", "declare it `let mut p`", 5, 5)
+}
+
+test "a collection let given a new list is E0610" {
+    probe("build/asg_imm_list.bl", #"
+fn main() {
+    let xs: List[Int] = [1]
+    xs = [7, 8, 9]
+    let _ = xs.len()
+}
+"#)
+    expect_local("xs = [7, 8, 9]", 1, "cannot assign to `xs`, which is not `mut`", "declare it `let mut xs`", 3, 5)
+}
+
+test "a compound assignment to a let is E0610" {
+    probe("build/asg_imm_compound.bl", #"
+fn main() {
+    let x = 1
+    x += 1
+    let _ = x
+}
+"#)
+    expect_local("x += 1", 1, "cannot assign to `x`, which is not `mut`", "declare it `let mut x`", 3, 5)
+}
+
+test "a compound assignment to a nested field of a let is E0610" {
+    probe("build/asg_imm_nested.bl", #"
+type In { n: Int }
+type Out { inner: In }
+
+fn main() {
+    let o = Out { inner: In { n: 1 } }
+    o.inner.n -= 1
+    let _ = o.inner.n
+}
+"#)
+    expect_local("o.inner.n -= 1", 1, "cannot assign to `o.inner.n`, whose root `o` is not `mut`", "declare it `let mut o`", 6, 5)
+}
+
+test "a tuple field and a list element of a let are E0610" {
+    probe("build/asg_imm_tuple_index.bl", #"
+fn main() {
+    let t = (1, 2)
+    t.0 = 5
+    let xs = [1, 2]
+    xs[0] = 5
+    let _ = t.0 + xs.len()
+}
+"#)
+    let mut ok = e0610_count() == 2 && errors().len() == 2
+    let mut lines: List[Int] = []
+    for d in diag_entries {
+        if d.code == "E0610" {
+            lines.push(d.fix_line)
+            if d.fix_text != "let mut" { ok = false }
+        }
+    }
+    if lines.len() != 2 || lines.get(0).unwrap() != 3 || lines.get(1).unwrap() != 5 { ok = false }
+    if !ok { show("t.0 and xs[0]") }
+    assert(ok)
+}
+
+test "two writes to one let give the same edit" {
+    probe("build/asg_imm_two_writes.bl", #"
+fn main() {
+    let n = 0
+    n = 1
+    n += 2
+    let _ = n
+}
+"#)
+    expect_local("n = 1; n += 2", 2, "cannot assign to `n`, which is not `mut`", "declare it `let mut n`", 3, 5)
+}
+
+test "a closure that assigns to a captured let is E0610 with a capture note and the fix at the let" {
+    probe("build/asg_imm_closure.bl", #"
+fn main() {
+    let total = 0
+    let add = fn(n: Int) {
+        total = total + n
+    }
+    add(1)
+    let _ = total
+}
+"#)
+    expect_local("total = total + n", 1, "cannot assign to `total`, which is not `mut`", "declare it `let mut total`", 3, 5)
+    let mut captured = false
+    for d in diag_entries {
+        if d.code == "E0610" && d.line == 5 && d.notes.join("\n").contains("captured here") { captured = true }
+    }
+    if !captured { show("captured here") }
+    assert(captured)
+}
+
+test "a module-level let gets help only, naming State, and a closure does not capture it" {
+    probe("build/asg_imm_module_let.bl", #"
+let g = 1
+
+fn main() {
+    let set = fn() {
+        g = 2
+    }
+    set()
+}
+"#)
+    expect_help_only("g = 2", "cannot assign to `g`, which is not `mut`", "`State`")
+    // A closure reaches a global without capturing it.
+    for d in diag_entries {
+        if d.code == "E0610" { assert(!d.notes.join("\n").contains("captured here")) }
+    }
+}
+
+test "an imported pub let gets help only, naming E1013" {
+    probe("build/asg_imm_pub_let.bl", #"
+import std.json.{JSON_NULL}
+
+fn main() {
+    JSON_NULL = 5
+}
+"#)
+    expect_help_only("JSON_NULL = 5", "cannot assign to `JSON_NULL`, which is not `mut`", "E1013")
+}
+
+test "let mut given new values stays clean" {
+    probe("build/asg_imm_let_mut.bl", #"
+type Pt { x: Int }
+
+fn main() {
+    let mut a = 5
+    a = 6
+    a += 1
+    let mut p = Pt { x: 1 }
+    p.x = 5
+    let mut xs = [1]
+    xs = [2, 3]
+    xs[0] = 4
+    let add = fn(n: Int) {
+        a = a + n
+    }
+    add(1)
+    let _ = a + p.x + xs.len()
+}
+"#)
+    expect_clean("let mut")
+}
+
+test "a write through a Ptr is not E0610" {
+    probe("build/asg_imm_ptr.bl", #"
+@ffi.struct(header: "poll.h", name: "pollfd")
+type Pollfd { fd: I32, events: I16, revents: I16 }
+
+@trusted(audit: "asg-imm-ptr-test")
+fn go() ! FFI {
+    with ffi.scope() as scope {
+        let p: Ptr[Pollfd] = scope.alloc()
+        p.fd = 9
+    }
+}
+
+fn main() ! FFI {
+    go()
+}
+"#)
+    expect_no_e0610("p.fd = 9 through a Ptr")
+}
+
+test "a write to a field of a temporary is not E0610" {
+    probe("build/asg_imm_temporary.bl", #"
+type Pt { x: Int }
+
+fn mk() -> Pt { Pt { x: 1 } }
+
+fn main() {
+    mk().x = 5
+}
+"#)
+    expect_no_e0610("mk().x = 5")
+}
+
+test "a write to a parameter or self is not E0610" {
+    probe("build/asg_imm_param.bl", #"
+type Pt { x: Int }
+
+impl Pt {
+    fn reset(self) {
+        self.x = 0
+    }
+}
+
+fn f(p: Pt, n: Int) -> Int {
+    p.x = 2
+    n = 3
+    p.x + n
+}
+
+fn main() {
+    let _ = f(Pt { x: 1 }, 1)
+    Pt { x: 1 }.reset()
+}
+"#)
+    expect_no_e0610("parameter roots")
+}
+
+test "a write to a pattern binder is not E0610 yet" {
+    probe("build/asg_imm_pattern.bl", #"
+fn main() {
+    let (a, b) = (1, 2)
+    a = 3
+    for x in [1, 2] {
+        x = 5
+    }
+    let o: Int? = Some(1)
+    match o {
+        Some(v) => { v = 2 }
+        None => {}
+    }
+    let _ = a + b
+}
+"#)
+    expect_no_e0610("pattern binders")
+}
+
+test "a mutating method call on a let is still one E0610" {
+    probe("build/asg_imm_method.bl", #"
+fn main() {
+    let xs = [1]
+    xs.push(2)
+}
+"#)
+    assert_eq(e0610_count(), 1)
+}
+
+// Every module's globals share one scope in name resolution, so the newest spelling of a name
+// may be another module's. Each write must be judged against the declaration its own module
+// sees: dep's `let mut count` stays writable in dep, and the probe's own `let count` does not.
+test "a write is judged by the global its own module sees, not a namesake in another module" {
+    let pkg = "build/asg_imm_namesake_pkg"
+    let _mk = process_run("mkdir", ["-p", "{pkg}/src"])
+    write_file("{pkg}/blink.toml", "[package]\nname = \"asgimmnamesake\"\nversion = \"0.1.0\"\n")
+    write_file("{pkg}/src/dep.bl", "let mut count = 0\n\npub fn bump() -> Int \{\n    count += 1\n    count\n\}\n")
+    write_file("{pkg}/src/probe.bl", "import dep.\{bump\}\n\nlet count = 5\n\nfn main() \{\n    count = 6\n    let _ = bump() + count\n\}\n")
+    diag_reset()
+    let program = compile_to_program("{pkg}/src/probe.bl", 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-rf", pkg])
+    let mut ok = e0610_count() == 1 && errors().len() == 1
+    for d in diag_entries {
+        if d.code == "E0610" && (d.line != 6 || !d.file.contains("probe.bl")) { ok = false }
+    }
+    if !ok { show("namesake globals") }
+    assert(ok)
+}
