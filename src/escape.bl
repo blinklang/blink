@@ -1179,45 +1179,11 @@ fn emit_spawn_scoped_capture(node: Int, binder: Int) ! Diag.Report {
 fn check_spawn_mut_captures(fn_node: Int) ! Diag.Report {
     let body = node_body(fn_node)
     if body == -1 { return }
-    let mut mut_leaves: List[Int] = []
     let mut kids: List[Int] = []
-    let_mut_pattern_leaves(body, mut_leaves, kids)
-    smc_walk(body, body, mut_leaves, kids)
+    smc_walk(body, body, kids)
 }
 
-// A destructuring `let mut (a, b)` binds each leaf IdentPattern, and only the LetBinding
-// above it records the `mut`.
-fn let_mut_pattern_leaves(node: Int, out: List[Int], kids: List[Int]) {
-    if node == -1 { return }
-    if node_kind(node) == NodeKind.LetBinding && node_is_mut(node) != 0 {
-        pattern_leaves(node_elements(node), out)
-    }
-    let base = kids.len()
-    node_push_value_child_ids(node, kids)
-    let end = kids.len()
-    let mut i = base
-    while i < end {
-        let_mut_pattern_leaves(kids.get(i).unwrap(), out, kids)
-        i = i + 1
-    }
-    drop_kids_to(kids, base)
-}
-
-fn pattern_leaves(pat: Int, out: List[Int]) {
-    if pat == -1 { return }
-    if node_kind(pat) == NodeKind.TuplePattern {
-        let elems_sl = node_elements(pat)
-        let mut i = 0
-        while elems_sl != -1 && i < sublist_length(elems_sl) {
-            pattern_leaves(sublist_get(elems_sl, i), out)
-            i = i + 1
-        }
-        return
-    }
-    out.push(pat)
-}
-
-fn smc_walk(node: Int, body: Int, mut_leaves: List[Int], kids: List[Int]) ! Diag.Report {
+fn smc_walk(node: Int, body: Int, kids: List[Int]) ! Diag.Report {
     if node == -1 { return }
     if node_kind(node) == NodeKind.MethodCall && is_async_spawn(node) {
         let args_sl = node_args(node)
@@ -1226,7 +1192,7 @@ fn smc_walk(node: Int, body: Int, mut_leaves: List[Int], kids: List[Int]) ! Diag
             let arg = sublist_get(args_sl, i)
             let mut reads: List[Int] = []
             let mut seen: List[Int] = []
-            mut_captures_reached(arg, body, mut_leaves, reads, seen)
+            mut_captures_reached(arg, body, reads, seen)
             for read in reads { emit_spawn_mut_capture(arg, read) }
             i = i + 1
         }
@@ -1236,13 +1202,13 @@ fn smc_walk(node: Int, body: Int, mut_leaves: List[Int], kids: List[Int]) ! Diag
     let end = kids.len()
     let mut i = base
     while i < end {
-        smc_walk(kids.get(i).unwrap(), body, mut_leaves, kids)
+        smc_walk(kids.get(i).unwrap(), body, kids)
         i = i + 1
     }
     drop_kids_to(kids, base)
 }
 
-// Both walks above share one child buffer down the descent: each node appends its children,
+// The walk above shares one child buffer down the descent: each node appends its children,
 // walks them, and gives the slots back, so a body is walked without a list per node.
 fn drop_kids_to(kids: List[Int], base: Int) {
     while kids.len() > base {
@@ -1252,7 +1218,7 @@ fn drop_kids_to(kids: List[Int], base: Int) {
 
 // Collects one read per `let mut` binder the value of `node` captures. `seen` holds the
 // binders already visited, so a binder is reported once and a self-referencing let ends.
-fn mut_captures_reached(node: Int, body: Int, mut_leaves: List[Int], reads: List[Int], seen: List[Int]) {
+fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int]) {
     if node == -1 { return }
     let k = node_kind(node)
     if k == NodeKind.Closure {
@@ -1260,10 +1226,10 @@ fn mut_captures_reached(node: Int, body: Int, mut_leaves: List[Int], reads: List
             let binder = tc_ident_binder_node(read)
             if binder < 0 || seen.contains(binder) { continue }
             seen.push(binder)
-            if is_mut_binder(binder) || mut_leaves.contains(binder) {
+            if is_mut_binder(binder) {
                 reads.push(read)
             } else if is_fn_typed(read) {
-                closure_values_of(binder, body, mut_leaves, reads, seen)
+                closure_values_of(binder, body, reads, seen)
             }
         }
         return
@@ -1272,42 +1238,42 @@ fn mut_captures_reached(node: Int, body: Int, mut_leaves: List[Int], reads: List
         let binder = tc_ident_binder_node(node)
         if binder < 0 || seen.contains(binder) { return }
         seen.push(binder)
-        closure_values_of(binder, body, mut_leaves, reads, seen)
+        closure_values_of(binder, body, reads, seen)
         return
     }
     if k == NodeKind.IfExpr {
-        mut_captures_reached(node_then_body(node), body, mut_leaves, reads, seen)
-        mut_captures_reached(node_else_body(node), body, mut_leaves, reads, seen)
+        mut_captures_reached(node_then_body(node), body, reads, seen)
+        mut_captures_reached(node_else_body(node), body, reads, seen)
         return
     }
     if k == NodeKind.MatchExpr {
         let arms_sl = node_arms(node)
         let mut i = 0
         while arms_sl != -1 && i < sublist_length(arms_sl) {
-            mut_captures_reached(node_body(sublist_get(arms_sl, i)), body, mut_leaves, reads, seen)
+            mut_captures_reached(node_body(sublist_get(arms_sl, i)), body, reads, seen)
             i = i + 1
         }
         return
     }
     if k == NodeKind.Block {
-        mut_captures_reached(block_tail_node(node), body, mut_leaves, reads, seen)
+        mut_captures_reached(block_tail_node(node), body, reads, seen)
         return
     }
     if k == NodeKind.ExprStmt {
-        mut_captures_reached(node_value(node), body, mut_leaves, reads, seen)
+        mut_captures_reached(node_value(node), body, reads, seen)
     }
 }
 
 // Every value a binder can hold: a `let`'s initializer and, for a mutable binder, each
 // value assigned to it in the body.
-fn closure_values_of(binder: Int, body: Int, mut_leaves: List[Int], reads: List[Int], seen: List[Int]) {
+fn closure_values_of(binder: Int, body: Int, reads: List[Int], seen: List[Int]) {
     if node_kind(binder) == NodeKind.LetBinding {
-        mut_captures_reached(node_value(binder), body, mut_leaves, reads, seen)
+        mut_captures_reached(node_value(binder), body, reads, seen)
     }
-    if !is_mut_binder(binder) && !mut_leaves.contains(binder) { return }
+    if !is_mut_binder(binder) { return }
     let mut assigned: List[Int] = []
     assignments_to(body, binder, assigned)
-    for v in assigned { mut_captures_reached(v, body, mut_leaves, reads, seen) }
+    for v in assigned { mut_captures_reached(v, body, reads, seen) }
 }
 
 fn assignments_to(node: Int, binder: Int, out: List[Int]) {

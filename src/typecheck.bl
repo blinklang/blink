@@ -15814,7 +15814,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         let let_pat_sl = node_elements(node)
         if let_pat_sl != -1 {
-            nr_define_let_pattern(let_pat_sl, let_is_mut)
+            nr_define_let_pattern(let_pat_sl)
         }
         return
     }
@@ -16471,10 +16471,6 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 // "on type ?" and codegen's binder has nothing to read. Recursive for the same reason
 // nr_define_let_pattern is: a leaf of `let ((x, y), label) = ...` is itself a pattern,
 // and the type it needs is a child of a child.
-//
-// Not delegated to tc_check_pattern_types: its IdentPattern arm hard-codes
-// `nr_define_typed(name, 0, ...)`, which would take `mut` away from every destructured
-// binder.
 // A `let` whose binder is the discard `_`. The binder is a NODE, not a spelling: the
 // parser mints a WildcardPattern in the pattern slot and leaves the name empty, so every
 // pass reads the kind here instead of comparing a name against "_". A destructuring `let`
@@ -16487,10 +16483,10 @@ pub fn tc_let_binder_is_discard(node: Int) -> Int {
     0
 }
 
-// A leaf of a destructuring `let` is mutable when `mut` stands before it, or when the
-// whole pattern is under `let mut (a, b)`, which marks every leaf.
-fn tc_leaf_is_mut(leaf: Int, let_is_mut: Int) -> Int {
-    if let_is_mut != 0 || node_is_mut(leaf) != 0 { 1 } else { 0 }
+// A leaf of a destructuring `let` is mutable when `mut` stands before it, or when parse
+// recovery after an E0613 marked it.
+fn tc_leaf_is_mut(leaf: Int) -> Int {
+    if node_is_mut(leaf) != 0 { 1 } else { 0 }
 }
 
 // `for mut i in xs` marks the simple binder; a destructuring `for` marks each leaf.
@@ -16499,7 +16495,7 @@ fn tc_for_binder_is_mut(for_node: Int) -> Int {
     if binder == -1 { 0 } else { node_is_mut(binder) }
 }
 
-fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
+fn tc_type_let_pattern(pat: Int, tid: Int) {
     if pat == -1 { return }
     let kind = node_kind(pat)
 
@@ -16524,7 +16520,7 @@ fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
                 elem_tid = tc_tid_child(tup, i)
                 if elem_tid < 0 { elem_tid = TYPE_UNKNOWN }
             }
-            tc_type_let_pattern(sublist_get(elems_sl, i), elem_tid, is_mut)
+            tc_type_let_pattern(sublist_get(elems_sl, i), elem_tid)
             i = i + 1
         }
         return
@@ -16532,7 +16528,7 @@ fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
 
     if kind == NodeKind.WildcardPattern { return }
 
-    nr_define_typed(node_name(pat), tc_leaf_is_mut(pat, is_mut), tid, pat)
+    nr_define_typed(node_name(pat), tc_leaf_is_mut(pat), tid, pat)
     tc_publish_node_tid(pat, tid)
 }
 
@@ -16542,9 +16538,9 @@ fn tc_type_let_pattern(pat: Int, tid: Int, is_mut: Int) {
 // every read of them reports UndefinedVariable.
 //
 // Separate from nr_check_pattern, which walks the same shapes for a match arm, because
-// that one binds through nr_define_at and a `let mut` has to carry its mutability down
-// to the leaf that a later assignment names.
-fn nr_define_let_pattern(pat: Int, is_mut: Int) ! Diag.Report {
+// that one binds through nr_define_at and a `mut` leaf has to carry its mutability to
+// the binding that a later assignment names.
+fn nr_define_let_pattern(pat: Int) ! Diag.Report {
     if pat == -1 { return }
     let kind = node_kind(pat)
 
@@ -16553,7 +16549,7 @@ fn nr_define_let_pattern(pat: Int, is_mut: Int) ! Diag.Report {
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
-                nr_define_let_pattern(sublist_get(elems_sl, i), is_mut)
+                nr_define_let_pattern(sublist_get(elems_sl, i))
                 i = i + 1
             }
         }
@@ -16572,7 +16568,7 @@ fn nr_define_let_pattern(pat: Int, is_mut: Int) ! Diag.Report {
     // error where an undefined name is a diagnostic the author can act on. Refusing a
     // refutable pattern in a `let` is specified and unimplemented; until some pass does
     // it, both walks have to agree on which names exist.
-    nr_define_mut_at(node_name(pat), tc_leaf_is_mut(pat, is_mut), pat)
+    nr_define_mut_at(node_name(pat), tc_leaf_is_mut(pat), pat)
 }
 
 // `mut Red` names a variant, which binds nothing. The parser cannot tell a bare variant from a
@@ -23730,7 +23726,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         let tc_let_pat_sl = node_elements(node)
         if tc_let_pat_sl != -1 {
-            tc_type_let_pattern(tc_let_pat_sl, final_tid, is_mut)
+            tc_type_let_pattern(tc_let_pat_sl, final_tid)
         }
         return
     }
@@ -24890,7 +24886,6 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
     if pat_sl == -1 { return }
     let elems_sl = node_elements(pat_sl)
     if elems_sl == -1 { return }
-    let is_mut = node_is_mut(l)
     let l_mod_key = node_module(l)
     let tup = tc_tid_resolved(l_tid)
     let mut arity = -1
@@ -24903,7 +24898,7 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
             leaf_tid = tc_tid_child(tup, i)
             if leaf_tid < 0 { leaf_tid = TYPE_UNKNOWN }
         }
-        nr_define_typed(node_name(leaf), tc_leaf_is_mut(leaf, is_mut), leaf_tid, leaf)
+        nr_define_typed(node_name(leaf), tc_leaf_is_mut(leaf), leaf_tid, leaf)
         tc_publish_node_tid(leaf, leaf_tid)
         if l_mod_key != "" {
             tc_module_let_decl.insert("{l_mod_key}.{node_name(leaf)}", leaf)
