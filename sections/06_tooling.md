@@ -403,6 +403,7 @@ What this means in practice:
 - **Diffs are always semantic.** Every line in a diff represents a behavioral change, never a formatting change. No "reformatted the whole file" noise commits.
 - **No bikeshedding.** Tabs vs spaces, brace placement, line length — none of these are decisions. They are answered by the grammar itself.
 - **Deterministic output.** Given any syntactically valid Blink program, `blink fmt` produces exactly one output. Two developers formatting the same code always get identical results.
+- **Variant order is meaning.** `blink fmt` never reorders the variants of an enum, and no auto-fix or refactor tool does so without a request from the user. Variant order sets `to_int()`, the comparison with `Int` and the enum's `Ord` (§3.4 *Tag Operations*, §3.6 *Enum Ord*).
 
 The formatter runs in the compiler daemon.
 
