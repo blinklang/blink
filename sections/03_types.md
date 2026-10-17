@@ -301,12 +301,61 @@ let vowels = "hello".into_iter().filter(fn(c) { "aeiou".contains("{c}") }).colle
 
 `parse_int` and `parse_float` are methods on `Str` rather than standalone functions. They give a discoverable, grep-able API surface.
 
-`parse_float` accepts every text that `Float.display()` can produce, including `NaN`, `inf` and `-inf`. It rounds to nearest, ties to even, so `x.display().parse_float() == Ok(x)` for every `Float` (§3.6 *Float Text Form*). The decimal mark is always `.`, and the result does not depend on the locale.
+The whole text must match one of these grammars, with nothing before or after it:
+
+```
+int      = sign? digits
+float    = sign? ( numeric | special )
+sign     = "+" | "-"
+numeric  = digits ( "." digits )? exponent?
+exponent = ( "e" | "E" ) sign? digits
+special  = "nan" | "inf" | "infinity"
+digits   = one or more ASCII "0" to "9"
+```
+
+- `parse_int` accepts `int`. `parse_float` accepts `float`. Both use the same `sign`.
+- `special` ignores letter case, for the ASCII letters A to Z only: `NaN`, `INF` and `Infinity` match. No other case mapping applies.
+- A sign on `nan` has no effect. Blink has one NaN (*Float Total Ordering*).
+- These are `Err`: whitespace before or after the text (call `s.trim()` first), `_`, hex forms, `nan(...)`, a decimal mark other than `.`, and `.5` or `1.` (a digit must be on each side of `.`). The result does not depend on the locale.
+- `parse_float` rounds to nearest, ties to even, for any count of digits and any exponent length.
+- A `numeric` text whose rounded value is ±infinity gives `Err`. A value that rounds to a subnormal or to zero gives `Ok`, with the sign kept: `"-1e-400"` gives `Ok(-0.0)`.
+- `parse_int` gives `Err` for a value outside the `Int` range.
+- A parse does not check for canonical text: `"+007".parse_int()` gives `Ok(7)`. To check that `s` is canonical, compare `n.display() == s`.
+
+**Why `.5` and `1.` are `Err`.** No common writer produces these forms by default. A later change to accept them breaks no program, but a later change to refuse them would. (Vote: 4-2, Web/Scripting and AI/ML dissented.)
+
+**Errors.** On failure the result is `Err(ConversionError)`. Its `message` names one cause class from this list:
+
+1. surrounding whitespace, with a hint to call `.trim()`;
+2. an unexpected character;
+3. missing digits (empty text, no digit on one side of `.`, or no digit after the exponent mark);
+4. a value out of range.
+
+The cause class is part of the contract. The wording of `message` is not, so programs must not compare it. The message may also give a position. The size of the message does not grow with the size of the input. If it quotes the input, it quotes a bounded excerpt.
+
+**Laws.** For every text `t`:
+
+- **Round trip.** `x.display().parse_float() == Ok(x)` for every `Float` `x` (§3.6 *Float Text Form*).
+- **Int text is Float text.** When `t.parse_int()` gives `Ok`, `t.parse_float()` gives `Ok` with that value, rounded to nearest, ties to even.
+- **One number reader.** `json.parse` first matches its own RFC 8259 number grammar (§3.6.2 *Numbers*). For a JSON number `t` that becomes a `JsonValue.Float`, the value is `t.parse_float()`, and when that gives `Err`, `json.parse` gives `Err`. `parse_float` does not decide what JSON accepts.
+- **Literals.** The text of every Blink `Float` literal parses with `parse_float` to the value of that literal. This law does not require the literal grammar to accept every text that `parse_float` accepts.
+- **Finite in, finite out.** A `numeric` text never gives NaN or ±infinity.
 
 ```blink
 let port = "8080".parse_int()?                      // Ok(8080)
 let rate = "3.14".parse_float()?                     // Ok(3.14)
 let bad = "not_a_number".parse_int()                 // Err(ConversionError)
+let big = "1E5".parse_float()                        // Ok(100000.0)
+let pos = "+1.5e+3".parse_float()                    // Ok(1500.0)
+let inf = "-Infinity".parse_float()                  // Ok(-inf)
+let half = ".5".parse_float()                        // Err: digit required before "."
+let huge = "1e999".parse_float()                     // Err: value out of Float range
+let padded = " 2.5".parse_float()                    // Err: surrounding whitespace, call .trim()
+
+match padded {
+    Ok(v) => io.println("{v}")
+    Err(e) => io.println(e.message)
+}
 
 // Common pattern: parse with default
 let timeout = config.get("timeout") ?? "30"
@@ -4374,6 +4423,7 @@ A derived `from_json` reads each field from the first object entry with that fie
 JSON has one number type. `JsonValue` has two, and these rules decide between them:
 
 - `json.parse` gives `JsonValue.Int` when the number has no fraction and no exponent and its value fits in `Int` (64-bit signed). It gives `JsonValue.Float` in every other case: `20` is `Int`, `20.0` and `2e1` are `Float`.
+- The value of a `JsonValue.Float` is `t.parse_float()` of the number text `t` (§3.2.1 *Parsing*, law *One number reader*). A number whose value rounds to ±infinity, such as `1e999`, makes `json.parse` give `Err`. Some JSON libraries give infinity for it.
 - **An integer outside the `Int` range becomes a `Float` and loses precision.** `json.parse("18446744073709551615")` gives `Ok(JsonValue.Float(18446744073709551616.0))`, not an error. To keep a large ID exact, send it as a JSON string and give the field the type `Str`.
 - A derived `from_json` for a `Float` field accepts `JsonValue.Int` and converts it, so `{"temp_c": 20}` decodes into `temp_c: Float`.
 - A derived `from_json` for an `Int` field accepts only `JsonValue.Int`. It never narrows a `Float`, not even `3.0`.
