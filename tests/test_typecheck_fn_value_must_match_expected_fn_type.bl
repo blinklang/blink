@@ -1,0 +1,227 @@
+// A function type names the arity, the parameter types and the return type of every value that
+// may sit in that position. A closure or a named function placed there must have all three, or
+// the callee calls it with arguments it cannot take and reads back a value of the wrong type.
+//
+// Each site where a declared fn type meets a function value is covered for each way the two can
+// disagree: a call argument, a typed `let`, a struct-literal field, a return value, an
+// assignment to a typed `let mut`, and a list element under a declared element type. Named
+// functions and closures reach these sites by different routes, so both are probed.
+//
+// The controls are what must not change: a value that fits reports nothing, a generic function
+// named as a value is solved against the expected type (§3.3), a closure that leaves its
+// parameter types to the context still takes them from it, and keyword labels are erased in a
+// function type (§3.3).
+//
+// A rejected binding takes its declared type, so a later call through it is checked against
+// the declaration and reports nothing more.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// Warnings name the same binders this test is about, so only errors are read here.
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(mismatch_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+// A closure that writes a parameter type the slot contradicts is reported once, by the
+// closure check at the parameter, and not again by the position the closure sits in.
+fn assert_one_error_at(marker: Str, want: Str) {
+    let line = line_of(mismatch_src(), marker)
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { n = n + 1 }
+    }
+    if n != 1 { io.println("FAIL: line {line} ({marker}) must report one error, got {n}: {errors_on_line(line)}") }
+    assert_eq(n, 1)
+    assert_error_at(marker, want)
+}
+
+fn assert_clean_at(marker: Str) {
+    let line = line_of(mismatch_src(), marker)
+    let msgs = errors_on_line(line)
+    if msgs != "" { io.println("FAIL: line {line} ({marker}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn mismatch_src() -> Str {
+    #"type FvBox { f: fn(Int) -> () }
+
+fn fvapply(f: fn(Int) -> ()) { f(1) }
+fn fvapply_int(f: fn(Int) -> Int) -> Int { f(1) }
+fn fvapply_two(f: fn(Int, Int) -> Int) -> Int { f(1, 2) }
+fn fvtakes_str(s: Str) { let _ = s }
+fn fvstr_to_int(s: Str) -> Int { s.len() }
+fn fvint_to_str(i: Int) -> Str { "{i}" }
+fn fvint_to_int(i: Int) -> Int { i + 1 }
+fn fvtwo_ints(a: Int, b: Int) -> Int { a + b }
+fn fvidentity[T](x: T) -> T { x }
+fn fvlabelled(a: Int, -- b: Int) -> Int { a + b }
+
+fn fvret_named() -> fn(Int) -> Int { fvstr_to_int }  // R_RET_NAMED_PARAM
+fn fvret_arity() -> fn(Int) -> Int { fn(a: Int, b: Int) -> Int { a + b } }  // R_RET_CLOSURE_ARITY
+fn fvret_ok() -> fn(Int) -> Int { fvint_to_int }  // R_RET_OK
+
+fn main() {
+    fvapply(fn(a: Int, b: Int, c: Str) { let _ = c })  // R_ARG_CLOSURE_ARITY
+    fvapply(fvtakes_str)  // R_ARG_NAMED_PARAM
+    let _ = fvapply_int(fvint_to_str)  // R_ARG_NAMED_RETURN
+    let _ = fvapply_int(fvtwo_ints)  // R_ARG_NAMED_ARITY
+    let _ = fvapply_two(fn(a: Int) -> Int { a })  // R_ARG_CLOSURE_TOO_FEW
+    fvapply(fn(s: Str) { let _ = s })  // R_ARG_CLOSURE_PARAM
+
+    let fvg: fn(Int) -> Int = fvstr_to_int  // R_LET_NAMED_PARAM
+    let _ = fvg(1)  // R_LET_NO_CASCADE
+    let _fvh: fn(Int) -> Int = fvtwo_ints  // R_LET_NAMED_ARITY
+    let _fvi: fn(Int) -> Int = fvint_to_str  // R_LET_NAMED_RETURN
+    let _fvj: fn(Int) -> Int = fn(a: Int, b: Int) -> Int { a + b }  // R_LET_CLOSURE_ARITY
+
+    let _b1 = FvBox { f: fn(s: Str) { let _ = s } }  // R_FIELD_CLOSURE_PARAM
+    let _b2 = FvBox { f: fvtakes_str }  // R_FIELD_NAMED_PARAM
+    let _b3 = FvBox { f: fn(a: Int, b: Int) { let _ = a + b } }  // R_FIELD_CLOSURE_ARITY
+
+    let mut fvm: fn(Int) -> Int = fvint_to_int
+    fvm = fvstr_to_int  // R_ASSIGN_NAMED_PARAM
+    fvm = fn(i: Int) { i * 3 }  // R_OK_ASSIGN_CLOSURE
+    let _ = fvm(1)
+
+    let _fvl: List[fn(Int) -> Int] = [fvint_to_int, fvstr_to_int]  // R_LIST_NAMED_PARAM
+
+    let _ = fvapply_int(fvint_to_int)  // R_OK_NAMED
+    let _ = fvapply_int(fn(i: Int) -> Int { i * 2 })  // R_OK_CLOSURE
+    let _ = fvapply_int(fvidentity)  // R_OK_GENERIC
+    let _ = fvapply_int(fn(i) { i + 3 })  // R_OK_INFERRED_PARAM
+    let fvlet = fn(i: Int) { i + 4 }
+    let _ = fvapply_int(fvlet)  // R_OK_LET_BOUND_CLOSURE
+    let _ = fvapply_two(fvlabelled)  // R_OK_LABELS_ERASED
+    let _fvk: fn(Str) -> Str = fvidentity  // R_OK_GENERIC_LET
+    let _fvb = FvBox { f: fn(i: Int) { let _ = i } }  // R_OK_FIELD
+    let _fvn = [fvint_to_int, fn(i: Int) { i + 5 }]  // R_OK_LIST_CLOSURE_AFTER_NAMED
+    let fvc = true
+    let _fvo = if fvc { fvint_to_int } else { fn(i: Int) { i + 6 } }  // R_OK_IF_CLOSURE_AFTER_NAMED
+    let _ = fvret_named()
+    let _ = fvret_arity()
+    let _ = fvret_ok()
+}
+"#
+}
+
+test "a closure with the wrong arity is rejected as a call argument" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_error_at("R_ARG_CLOSURE_ARITY", "expects 1 parameter, got 3")
+    assert_error_at("R_ARG_CLOSURE_TOO_FEW", "expects 2 parameters, got 1")
+}
+
+test "a closure parameter type the slot contradicts is reported once" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_one_error_at("R_ARG_CLOSURE_PARAM", "closure parameter 1 `s`: declared type Int but written Str")
+    assert_one_error_at("R_FIELD_CLOSURE_PARAM", "closure parameter 1 `s`: declared type Int but written Str")
+}
+
+test "a named fn with the wrong signature is rejected as a call argument" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_error_at("R_ARG_NAMED_PARAM", "parameter 1 expects Int, got Str")
+    assert_error_at("R_ARG_NAMED_RETURN", "return type expects Int, got Str")
+    assert_error_at("R_ARG_NAMED_ARITY", "expects 1 parameter, got 2")
+}
+
+test "a typed let rejects a function value with the wrong signature" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_error_at("R_LET_NAMED_PARAM", "parameter 1 expects Int, got Str")
+    assert_error_at("R_LET_NAMED_ARITY", "expects 1 parameter, got 2")
+    assert_error_at("R_LET_NAMED_RETURN", "return type expects Int, got Str")
+    assert_error_at("R_LET_CLOSURE_ARITY", "expects 1 parameter, got 2")
+}
+
+test "a rejected typed let takes its declared type" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_clean_at("R_LET_NO_CASCADE")
+}
+
+test "a struct-literal field rejects a function value with the wrong signature" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_error_at("R_FIELD_CLOSURE_PARAM", "Int")
+    assert_error_at("R_FIELD_NAMED_PARAM", "parameter 1 expects Int, got Str")
+    assert_error_at("R_FIELD_CLOSURE_ARITY", "expects 1 parameter, got 2")
+}
+
+test "a return value must match the declared fn return type" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_error_at("R_RET_NAMED_PARAM", "parameter 1 expects Int, got Str")
+    assert_error_at("R_RET_CLOSURE_ARITY", "expects 1 parameter, got 2")
+}
+
+test "assignment to a typed let mut rejects a function value with the wrong signature" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_error_at("R_ASSIGN_NAMED_PARAM", "parameter 1 expects Int, got Str")
+}
+
+test "a list element under a declared fn element type must match it" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_error_at("R_LIST_NAMED_PARAM", "parameter 1 expects Int, got Str")
+}
+
+test "function values that fit the expected type report nothing" {
+    let _p = probe("build/tc_fn_value_src.bl", mismatch_src())
+    assert_clean_at("R_OK_NAMED")
+    assert_clean_at("R_OK_CLOSURE")
+    assert_clean_at("R_OK_GENERIC")
+    assert_clean_at("R_OK_INFERRED_PARAM")
+    assert_clean_at("R_OK_LET_BOUND_CLOSURE")
+    assert_clean_at("R_OK_LABELS_ERASED")
+    assert_clean_at("R_OK_GENERIC_LET")
+    assert_clean_at("R_OK_FIELD")
+    assert_clean_at("R_OK_ASSIGN_CLOSURE")
+    assert_clean_at("R_OK_LIST_CLOSURE_AFTER_NAMED")
+    assert_clean_at("R_OK_IF_CLOSURE_AFTER_NAMED")
+    assert_clean_at("R_RET_OK")
+}

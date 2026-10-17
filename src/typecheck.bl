@@ -4723,7 +4723,7 @@ fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCh
         if mr_kind != "" {
             tc_report_missing_return(mr_kind, at_node)
         } else {
-            tc_error_at("return value type {type_to_str(val_t)} does not match function `{tc_current_fn_name}` return type {type_to_str(tc_current_fn_ret)}", at_node)
+            if !tc_closure_checked_against(at_node, tc_current_fn_ret) { tc_error_at("return value type {type_to_str(val_t)} does not match function `{tc_current_fn_name}` return type {type_to_str(tc_current_fn_ret)}{tc_fn_mismatch_suffix(tc_current_fn_ret, val_t)}", at_node) }
         }
     } else {
         if tc_closure_scope_base.len() == 0 {
@@ -5154,7 +5154,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
     // argument, and only the second argument can pin α.
     if tc_tid_has_unbound_metavar(arg_t) != 0 || tc_tid_has_unbound_metavar(ptid) != 0 {
         if tc_unify(ptid, arg_t) == 0 {
-            tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+            if !tc_closure_checked_against(arg_node, ptid) { tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(ptid, arg_t)}", arg_node) }
         }
     } else {
         let mut lit_to_int = 0
@@ -5183,7 +5183,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
             lit_to_int = 1
         }
         if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
-            tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}", arg_node)
+            if !tc_closure_checked_against(arg_node, ptid) { tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(ptid, arg_t)}", arg_node) }
         }
     }
     arg_t
@@ -5222,7 +5222,7 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
             lit_ok = 1
         }
         if lit_ok == 0 && tc_unify(expected_t, arg_t) == 0 {
-            tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", value_node)
+            if !tc_closure_checked_against(value_node, expected_t) { tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(expected_t, arg_t)}", value_node) }
         }
         return
     }
@@ -5239,12 +5239,12 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     // fully-concrete path keeps its existing types_compatible semantics.
     if lit_to_int == 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
         if tc_unify(expected_t, arg_t) == 0 {
-            tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", value_node)
+            if !tc_closure_checked_against(value_node, expected_t) { tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(expected_t, arg_t)}", value_node) }
         }
         return
     }
     if lit_to_int == 0 && types_compatible(arg_t, expected_t) == 0 {
-        tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}", value_node)
+        if !tc_closure_checked_against(value_node, expected_t) { tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(expected_t, arg_t)}", value_node) }
     }
 }
 
@@ -6005,6 +6005,11 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) ! TypeCheck.Resolve, Ty
     // the whole signature would leave `Str` and `Int` here undeclared as well.
     let seed = tc_fn_tid_declared_positions(expected)
     if seed < 0 { return }
+    // A closure of another arity cannot take the declared type: published, it would read as
+    // a fit, and the position's own compare is the one that names the arity it expects.
+    let cls_params = node_params(a)
+    let cls_arity = if cls_params == -1 { 0 } else { sublist_length(cls_params) }
+    if cls_arity != tc_tid_child_count(tc_tid_resolved(seed)) - 1 { return }
     tc_check_closure_ann_against_declared(a, seed)
     tc_publish_node_tid(a, seed)
 }
@@ -6570,7 +6575,7 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
         if li < expected {
             let ptid = ty_param_list.get(pstart + li).unwrap()
             if tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 && types_compatible(ptid, arg_tid) == 0 {
-                tc_error_at("{label} argument {li} expects {type_to_str(ptid)}, got {type_to_str(arg_tid)}", node)
+                tc_error_at("{label} argument {li} expects {type_to_str(ptid)}, got {type_to_str(arg_tid)}{tc_fn_mismatch_suffix(ptid, arg_tid)}", node)
             }
         }
         li = li + 1
@@ -7825,15 +7830,35 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
         let v = node_value(f)
         if v != -1 {
             let vk = node_kind(v)
-            if vk == NodeKind.Closure {
-                let declared = resolve_alias_tid(get_struct_field_tid(stid, node_name(f)))
-                if type_kind(declared) == TyKind.Fn { check_closure_body(v, declared) }
-            } else if vk == NodeKind.HandlerExpr {
+            let declared = resolve_alias_tid(get_struct_field_tid(stid, node_name(f)))
+            if type_kind(declared) == TyKind.Fn {
+                tc_check_struct_lit_fn_field(stid, f, v, declared)
+            }
+            if vk == NodeKind.HandlerExpr {
                 tc_check_body(v)
             }
         }
         fi = fi + 1
     }
+}
+
+// A function-typed field is a position that declares a fn type, like a parameter or an
+// annotated `let`, so its value is held to that type. Only function-typed fields are compared
+// here: a general field-value check is a wider change than a function value needs.
+fn tc_check_struct_lit_fn_field(stid: Int, f: Int, v: Int, declared: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node_kind(v) == NodeKind.Closure {
+        tc_seed_closure_expected_fn(v, declared)
+        check_closure_body(v, declared)
+    }
+    // A generic struct's field names its own type parameters, which this literal binds
+    // elsewhere; such a field has no settled type to hold the value to here.
+    if tc_tid_has_bare_typevar(declared) != 0 { return }
+    let got = infer_type(v)
+    if tc_tid_is_no_info(got) != 0 || type_kind(got) != TyKind.Fn { return }
+    if tc_closure_checked_against(v, declared) { return }
+    let detail = tc_fn_mismatch_detail(declared, got)
+    if detail == "" { return }
+    tc_error_at("field `{node_name(f)}` of `{type_to_str(stid)}`: declared type {type_to_str(declared)} but got {type_to_str(got)}: {detail}", v)
 }
 
 // A field value inferred under the field's OWN type rather than under the whole literal's.
@@ -15814,8 +15839,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // The recorded type goes on the entry THIS let just defined, which is the
                 // top one. A discard defines no entry, so the top one belongs to whatever
                 // binder came before it, and writing there retypes a binder the discard
-                // has nothing to do with.
-                if let_binds && tc_tid_is_no_info(inferred) == 0 {
+                // has nothing to do with. A declared type is the binder's type even when the
+                // value does not fit it, so the value's type is not recorded over an
+                // annotation; the body walk defines the binder at the declared type.
+                if let_binds && let_type_ann == -1 && node_type_name(node) == "" && tc_tid_is_no_info(inferred) == 0 {
                     nr_set_last_type(inferred)
                 }
             }
@@ -16892,6 +16919,12 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
             }
             return 1
         }
+        // A function value is called with the arguments its slot's type names and read back as
+        // that type's return, so the arity and every position must agree. The spec gives no
+        // variance for parameters or return (§3.3: `fn() -> Never` is not a `fn() -> Int`).
+        if ka == TyKind.Fn {
+            return if tc_fn_mismatch_detail(a, b) == "" { 1 } else { 0 }
+        }
         if ka == TyKind.Struct || ka == TyKind.Enum {
             // Nominal equality by base name first (mirrors the TyKind.Tuple branch
             // above). Two struct/enum tids are compatible iff they name the same
@@ -16921,6 +16954,92 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         return 1
     }
     0
+}
+
+// The first way a function value of type `got` fails to fit a slot of type `want`, worded for
+// the end of a TypeError, or "" when it fits or either side is not a function type.
+// types_compatible decides with this, so the reason a site reports is the one it was refused for.
+fn tc_fn_mismatch_detail(want0: Int, got0: Int) -> Str {
+    let want = tc_resolve(resolve_alias_tid(want0))
+    let got = tc_resolve(resolve_alias_tid(got0))
+    if tc_tid_kind(want) != TyKind.Fn || tc_tid_kind(got) != TyKind.Fn { return "" }
+    // Child 0 of a Fn is its RETURN; the params start at 1 (tc_tid_child).
+    let nwant = tc_tid_child_count(want) - 1
+    let ngot = tc_tid_child_count(got) - 1
+    if nwant != ngot {
+        let noun = if nwant == 1 { "parameter" } else { "parameters" }
+        return "expects {nwant} {noun}, got {ngot}"
+    }
+    let mut i = 1
+    while i <= nwant {
+        let pw = tc_tid_child(want, i)
+        let pg = tc_tid_child(got, i)
+        let settled = tc_tid_is_no_info(pw) == 0 && tc_tid_is_no_info(pg) == 0
+        if settled && types_compatible(pw, pg) == 0 {
+            return "parameter {i} expects {type_to_str(pw)}, got {type_to_str(pg)}"
+        }
+        i = i + 1
+    }
+    let rw = tc_tid_child(want, 0)
+    let rg = tc_tid_child(got, 0)
+    let ret_settled = tc_tid_is_no_info(rw) == 0 && tc_tid_is_no_info(rg) == 0
+    if ret_settled && types_compatible(rw, rg) == 0 {
+        return "return type expects {type_to_str(rw)}, got {type_to_str(rg)}"
+    }
+    ""
+}
+
+// The fn type `val` offers to a comparison made before its closure body is walked. A closure
+// with no `-> R` returns its body's type, but until check_closure_body has walked the body its
+// tid holds the Void default, which is not an answer, so the return is left open there. A
+// position that declares the fn type seeds the closure instead (tc_seed_expected_into_value).
+fn tc_fn_value_open_ret(val0: Int, t: Int) -> Int {
+    let mut val = val0
+    let mut depth = 0
+    while val != -1 && depth < 8 {
+        let k = node_kind(val)
+        if k == NodeKind.NamedArg || k == NodeKind.ExprStmt {
+            val = node_value(val)
+        } else if k == NodeKind.Block {
+            let tail = tc_block_tail_stmt(val)
+            val = if tail == -1 { -1 } else { tc_block_tail_value(tail) }
+        } else {
+            break
+        }
+        depth = depth + 1
+    }
+    if val == -1 || node_kind(val) != NodeKind.Closure || node_type_ann(val) != -1 { return t }
+    let r = tc_resolve(t)
+    if tc_tid_kind(r) != TyKind.Fn || tc_resolve(tc_tid_child(r, 0)) != TYPE_VOID { return t }
+    let mut params: List[Int] = []
+    let mut i = 1
+    while i < tc_tid_child_count(r) {
+        params.push(tc_tid_child(r, i))
+        i = i + 1
+    }
+    make_fn_type(TYPE_UNKNOWN, params)
+}
+
+// Whether `val` is a closure that a fn-typed position of its own arity seeded. The seed checks
+// each parameter and return the closure wrote against that position and gives every one it
+// left unwritten the declared type, so a compare of the two can only repeat the closure check's
+// own report, which names the parameter. The position leaves such a closure to it.
+fn tc_closure_checked_against(val0: Int, want: Int) -> Bool {
+    let mut val = val0
+    if val != -1 && (node_kind(val) == NodeKind.NamedArg || node_kind(val) == NodeKind.Return) { val = node_value(val) }
+    if val == -1 || node_kind(val) != NodeKind.Closure { return false }
+    let w = tc_resolve(resolve_alias_tid(want))
+    if tc_tid_kind(w) != TyKind.Fn { return false }
+    let params_sl = node_params(val)
+    let n = if params_sl == -1 { 0 } else { sublist_length(params_sl) }
+    n == tc_tid_child_count(w) - 1
+}
+
+// tc_fn_mismatch_detail as the tail of a site's own TypeError, so the site keeps its wording and
+// a function-value mismatch also names the position that failed.
+fn tc_fn_mismatch_suffix(want: Int, got: Int) -> Str {
+    let d = tc_fn_mismatch_detail(want, got)
+    if d == "" { "" } else { ": {d}" }
 }
 
 // Assignment-position compatibility: like types_compatible, but allows an
@@ -17917,12 +18036,12 @@ fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first_t: Int) ! T
     }
     if tc_tid_has_unbound_metavar(first_t) != 0 || tc_tid_has_unbound_metavar(elem_t) != 0 {
         if tc_unify(first_t, elem_t) == 0 {
-            tc_error_at("list element {idx + 1} has type {tc_type_str(elem_t)} but the list is built from {tc_type_str(first_t)}", elem)
+            tc_error_at("list element {idx + 1} has type {tc_type_str(elem_t)} but the list is built from {tc_type_str(first_t)}{tc_fn_mismatch_suffix(first_t, elem_t)}", elem)
         }
         return
     }
     if types_compatible(elem_t, first_t) == 0 {
-        tc_error_at("list element {idx + 1} has type {tc_type_str(elem_t)} but the list is built from {tc_type_str(first_t)}", elem)
+        tc_error_at("list element {idx + 1} has type {tc_type_str(elem_t)} but the list is built from {tc_type_str(first_t)}{tc_fn_mismatch_suffix(first_t, elem_t)}", elem)
     }
 }
 
@@ -20765,6 +20884,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let elems_sl = node_elements(node)
         if elems_sl != -1 && sublist_length(elems_sl) > 0 {
             let first_t = tc_list_elem_contribution(sublist_get(elems_sl, 0))
+            let first_cmp = tc_fn_value_open_ret(sublist_get(elems_sl, 0), first_t)
             // Every element beyond the first must still be visited: infer_type is
             // what memoizes a per-node tid (tc_node_tid), and a CALL-style
             // generic-enum/struct constructor's mono-name recovery
@@ -20778,7 +20898,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             while ei < sublist_length(elems_sl) {
                 let elem = sublist_get(elems_sl, ei)
                 let c = tc_list_elem_contribution(elem)
-                tc_check_list_elem_compat(elem, c, ei, first_t)
+                tc_check_list_elem_compat(elem, tc_fn_value_open_ret(elem, c), ei, first_cmp)
                 ei = ei + 1
             }
             tc_check_spread_sources(elems_sl, first_t)
@@ -20950,7 +21070,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_if_declaring_branch(node) == 0 {
                 if tc_tid_is_no_info(then_t) == 0 && tc_tid_is_no_info(else_t) == 0 {
                     if tc_tid_has_unknown(then_t) == 0 && tc_tid_has_unknown(else_t) == 0 {
-                        if types_compatible(then_t, else_t) == 0 {
+                        let then_cmp = tc_fn_value_open_ret(node_then_body(node), then_t)
+                        if types_compatible(then_cmp, tc_fn_value_open_ret(else_node, else_t)) == 0 {
                             tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
                         }
                     }
@@ -22035,7 +22156,8 @@ fn tc_report_if_branch_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
     let else_t = tc_scoped_value_memo(node_else_body(node), 0)
     if tc_tid_is_no_info(then_t) != 0 || tc_tid_is_no_info(else_t) != 0 { return }
     if tc_tid_has_unknown(then_t) != 0 || tc_tid_has_unknown(else_t) != 0 { return }
-    if types_compatible(then_t, else_t) != 0 { return }
+    let then_cmp = tc_fn_value_open_ret(node_then_body(node), then_t)
+    if types_compatible(then_cmp, tc_fn_value_open_ret(node_else_body(node), else_t)) != 0 { return }
     tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
 }
 
@@ -23369,6 +23491,9 @@ fn tc_walk_stmt_value(val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 fn tc_infer_assigned_value(target_t: Int, val: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_hint = tc_construct_hint
     if tc_tid_is_no_info(target_t) == 0 { tc_construct_hint = resolve_alias_tid(target_t) }
+    // The target declares the value's type as a typed `let` does, so a closure takes its
+    // signature from it.
+    tc_seed_expected_into_value(val, target_t)
     let t = tc_infer_value(val)
     tc_construct_hint = saved_hint
     tc_walk_stmt_value(val)
@@ -23900,7 +24025,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         if tc_tid_is_no_info(declared_tid) == 0 && tc_tid_is_no_info(inferred_tid) == 0 {
             if assignment_types_compatible(declared_tid, inferred_tid, val) == 0 {
-                tc_report_declared_mismatch("variable `{vname}`: declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}", node, val, declared_tid, inferred_tid)
+                if !tc_closure_checked_against(val, declared_tid) { tc_report_declared_mismatch("variable `{vname}`: declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}{tc_fn_mismatch_suffix(declared_tid, inferred_tid)}", node, val, declared_tid, inferred_tid) }
             } else {
                 // A declared let type is an expected-type source for the value's
                 // metavars, not only something to compare against. This arm otherwise
@@ -24023,7 +24148,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             }
             if tc_tid_is_no_info(target_t) == 0 && tc_tid_is_no_info(val_t) == 0 {
                 if assignment_types_compatible(target_t, val_t, val) == 0 {
-                    tc_error_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}", node)
+                    if !tc_closure_checked_against(val, target_t) { tc_error_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node) }
                 } else {
                     // An assignment TARGET is a declared-type source for the value's
                     // metavars, not only something to compare against — the same
@@ -25214,7 +25339,7 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
         // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
         // ahead of the compare can turn a mismatch into a silent success.
         if assignment_types_compatible(declared, v_tid, l_val) == 0 {
-            tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {type_to_str(declared)} but got {type_to_str(v_tid)}", l, l_val, declared, v_tid)
+            if !tc_closure_checked_against(l_val, declared) { tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {type_to_str(declared)} but got {type_to_str(v_tid)}{tc_fn_mismatch_suffix(declared, v_tid)}", l, l_val, declared, v_tid) }
         } else {
             if tc_pin_ok_for_declared(l_val, declared) != 0 {
                 tc_pin_tail_ret_generic(declared, v_tid)
