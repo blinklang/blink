@@ -159,6 +159,7 @@ let x = 42                       // immutable
 let mut count = 0                // mutable
 let name: Str = "Alice"          // type annotation
 let (a, b) = (10, 20)           // tuple destructuring
+let (mut lo, hi) = (0, 9)       // mut goes on each name: only `lo` is mutable
 
 // Functions
 fn add(a: Int, b: Int) -> Int {
@@ -208,12 +209,37 @@ match args {
     [cmd, ..] => io.println("unknown: {cmd}")  // .. = rest wildcard (no binding)
 }
 
+// OR-patterns: every alternative binds the same names, with the same types and mut
+match e {
+    Click(x, y) | Touch(x, y) => io.println("at {x},{y}")
+    Quit => {}
+}
+
+// mut on a binder in a match arm
+match o {
+    Some(mut n) => {
+        n *= 2
+        io.println("{n}")
+    }
+    None => {}
+}
+match p {
+    Point { mut x, .. } => {
+        x += 10                  // changes the binder `x` only, not `p.x`
+        io.println("{x}")
+    }
+}
+
 // Control flow
 if x > 0 { "positive" } else { "non-positive" }  // expression
 for item in list { io.println(item) }
 for c in "héy" { io.println("{c}") }      // over a Str: each Unicode scalar value, as a Char
 for x in some_set { io.println("{x}") }   // over a Set
 for (k, v) in some_map { io.println("{k}={v}") }   // over a Map
+for (name, mut score) in pts {            // only `score` is mutable
+    score += 1
+    io.println("{name}={score}")
+}
 while count < 10 { count += 1 }
 loop { if done { break } }
 
@@ -276,7 +302,9 @@ test "addition works" {
 - **An undeclared type name is `E0507 UnknownType`.** A user type named `Tuple`, `Fn` or `Self` is `E0524 ReservedTypeName`.
 - **Operators need operands they apply to.** `+ - * / %`, unary `-` and the compound forms on `Bool`, `()`, structs, `Str - Str` or opaque handles are `E0300`.
 - **Indexing `x[0]` works on a `List` only.** Use `.get(i)` on other types, `.insert(k, v)` on a `Map`. A tuple field is `t.0`; `t._0` is rejected. A field that does not exist is `E0525 NoSuchField`.
-- **A mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` is `E0610`.** Use `let mut`.
+- **A write through a name that is not `mut` is `E0610`.** This covers `=`, `op=` and a mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` or on a pattern binder. Use `let mut x`, or `mut` before the binder: `Some(mut ys) => ys.push(1)`.
+- **`mut` goes before a name, not before a pattern.** `let mut (x, y) = pair` and `for mut (k, v) in pairs` are `E0613 MutOnPattern`; write `let (mut x, mut y) = pair`. `blink fix` makes this edit.
+- **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`** (`E0005 InconsistentPatternBindings`). `Click(mut x, y) | Touch(x, y)` is an error; write `mut x` in both.
 - **`for x in <non-iterable>` is `E0302`.**
 - **A value in a string interpolation must implement `Display`** (`E0523`).
 - **`==`, `!=`, `assert_eq` and `assert_ne` need `Eq`**, also through `Option`, `Result`, containers and enum payloads (`E0306`, with the `@derive(Eq)` fix). `x.into()`, `T.from(x)` and `T.try_from(x)` need a matching `From`/`TryFrom` impl (`E0312`). `Int` widens to `Float` through `From[Int]`.
@@ -1160,7 +1188,7 @@ Run `blink doc --list` to list available modules.
 - No `return` needed for last expression in function body
 - `match` must be exhaustive — cover all variants or use `_ =>` wildcard
 - List patterns in `match` ALWAYS need a wildcard `_` or rest `...` arm — finite patterns can't cover unbounded lists
-- `let mut` required for any variable you want to reassign
+- `let mut` required for any variable you want to reassign. In a pattern, `mut` goes on each name: `let (mut x, y) = pair`, not `let mut (x, y) = pair`
 - Function args separated by commas in calls, but by newlines in multi-line definitions
 - `assert`, `assert_eq`, `assert_ne` only available inside `test` blocks and debug mode
 - `assert_panics { ... }` (and `assert_panics(matching: "substr") { ... }`) is a compiler-recognized, test-only block assertion that passes only if its body panics — valueless and non-nestable

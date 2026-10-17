@@ -2,6 +2,14 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Changes (unreleased)
+
+- **`mut` goes on each name in a pattern.** Write `mut` directly before the name that changes, in any pattern: `let (mut lo, hi) = pair`, `for (k, mut v) in pairs`, `Some(mut n) =>`, `Point { mut x, .. } =>`. Only the name right after `mut` is mutable. A `mut` binder follows the rules for `let mut`: it can be assigned, it can take a mutating method call, and `async.spawn` cannot capture it (E0650).
+- **`mut` before a pattern that binds no name is E0613 MutOnPattern (breaking).** This includes `let mut (x, y) = pair`, `for mut (k, v) in pairs` and `mut _`. Before, `let mut (x, y)` made each name mutable. Run `blink fix` to migrate: it writes `let (mut x, mut y) = pair`, which keeps the old meaning.
+- **A write through a name that is not `mut` is E0610 MutationRequiresMut (breaking).** This covers `=` and `op=` on a plain `let`, and an assignment or a mutating method call on a pattern binder without `mut`. Before, `blink check` accepted an assignment to a plain `let`. The fix inserts `mut` at the `let` or before the binder; `blink fix` applies it.
+- **The alternatives of an OR-pattern bind names.** In `Click(x, y) | Touch(x, y) => use(x, y)`, the arm body can use `x` and `y`. Before, the body got `UndefinedVariable` for them. Each alternative must bind the same names with the same types and the same `mut`; if not, it is E0005 InconsistentPatternBindings (breaking for a binder that is `mut` in some alternatives only). The fix writes `mut` in every alternative.
+- **`blink fix <file>` applies the machine-applicable fixes of the file's diagnostics** and prints how many it applied and how many diagnostics are left.
+
 ## Breaking Changes (v0.56.0)
 
 ### Operators
