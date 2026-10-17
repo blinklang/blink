@@ -1400,7 +1400,7 @@ test.failing(
 | Field | Type | Meaning |
 |-------|------|---------|
 | `expected_fail` | `Bool` | `true` iff the test was registered with `test.failing` |
-| `xfail_reason` | `Str` | The `reason` from the registration, unchanged |
+| `xfail_reason` | `Str` | The `reason` from the registration, unchanged. It appears exactly when `expected_fail` appears |
 
 The **expected** (red) case emits `status: "passed"`:
 
@@ -1457,6 +1457,20 @@ The suite-failure rule is mechanical. It reads only `status`:
 
 An unexpected pass is the only record with `expected_fail: true` and `status: "failed"`. A consumer tests the pair, not the `assertion` text. `expected_fail` is never true on a `panicked` record.
 
+A skipped `test.failing` test keeps `expected_fail: true` and `xfail_reason`. It has no `xfail_observed`. The run gave no result: the record is neither an expected red nor an unexpected pass.
+
+```json
+{ "name": "trait impl resolves through alias chain",
+  "status": "skipped",
+  "reason": "env gate",
+  "expected_fail": true,
+  "xfail_reason": "Phase 3 trait elaboration not yet implemented" }
+```
+
+For a `test.failing` test that uses `for_each` (§8.10.2): `cases` entries never carry `expected_fail` or `xfail_reason`. The parent record carries them whatever its status.
+
+*Informative:* the human-readable output may mark a skipped `test.failing` test on its skip line, so the text log shows the same facts as the record. This section does not specify the marker, and its text is not stable. Tools read the NDJSON record, not the human output.
+
 There is **no** soft / "warn-only" mode for unexpected passes. The intent of `test.failing` is to record a known red state; the moment it goes green, the test must be moved back to `test(...)` in the same commit that removes the `test.failing` registration.
 
 ##### When to use which mechanism
@@ -1477,6 +1491,8 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 **Superseded in part.** A later decision removed the parking workflow (Q1 above, §8.10.5) and the `br` coupling: the panel voted to remove parking and the closed-ticket lint (**6-0** each), and the user (BDFL) overruled the panel's optional `ticket:` to remove the argument from the language, so `xfail_reason` holds the reason only. See [decisions/parking-removal-and-xfail-ticket.md](../decisions/parking-removal-and-xfail-ticket.md).
 
 **Rule text fixed.** A later panel fixed the suite-failure rule above to match the unexpected-pass example and the runtime. Rule keyed by `status` alone, over all four statuses: **5-1** (Minimalism dissent, for rules keyed by `status` and `expected_fail` together). The "only record" sentence with "a consumer tests the pair": **5-1** after a second round (Systems dissent, for the first sentence only). "`expected_fail` is never true on a `panicked` record", with no sentence on `xfail_observed`: **3-3 → user (BDFL) tiebreak**. No sentence that `expected_fail` is a property of the test: **3-3 → user tiebreak**. The added sentence in §8.10: **5-1** (Minimalism dissent: two copies can drift). See [decisions/xfail-unexpected-pass-rule.md](../decisions/xfail-unexpected-pass-rule.md).
+
+**Skipped records.** A later panel ruled on a skipped `test.failing` test. Both fields on every record of a `test.failing` test, `skipped` included, with the runtime fixed to match: **6-0**. The `xfail_reason` presence rule in its table row: **5-1** (Systems dissent, for one sentence after the table). The `expected_fail` row unchanged: **5-1** (AI/ML dissent, for a row that also says "absent on all other records"). The sentence on a skipped record: **4-2** in the first round, then **6-0** for a reworded sentence, with the wording chosen by plurality and ranked preference (3 first choices of 6). The informative note on human output: **5-1** (Minimalism dissent). The `cases` line: **5-1** (Minimalism dissent, for one clause). See [decisions/xfail-skipped-record.md](../decisions/xfail-skipped-record.md).
 
 ---
 
