@@ -1,0 +1,113 @@
+// fix_edits.bl — which machine-applicable fixes `blink fix` applies, and the text after them
+//
+// sections/06_tooling.md §8.6 *Applying fixes*: the same edit twice applies once; two
+// different edits whose spans overlap are a conflict, and neither applies.
+
+// One fix as an edit: bytes start..end of `file` (end exclusive) become `text`. `diag` is the
+// index of the diagnostic that carries the fix.
+pub type FixEdit {
+    file: Str
+    start: Int
+    end: Int
+    text: Str
+    diag: Int
+}
+
+// The diagnostic `diag` has a fix that overlaps the different fix of diagnostic `other`.
+pub type FixConflict {
+    diag: Int
+    other: Int
+}
+
+pub type FixPlan {
+    // One edit for each distinct edit that conflicts with none, in input order.
+    applied: List[FixEdit]
+    // The diagnostics whose fix is one of `applied`, in input order.
+    fixed: List[Int]
+    // One row for each diagnostic whose fix overlaps a different fix, in input order.
+    conflicts: List[FixConflict]
+}
+
+fn same_edit(a: FixEdit, b: FixEdit) -> Bool {
+    a.file == b.file && a.start == b.start && a.end == b.end && a.text == b.text
+}
+
+// Two inserts at one place overlap too: no order of the two is more right than the other.
+fn edits_overlap(a: FixEdit, b: FixEdit) -> Bool {
+    if a.file != b.file { return false }
+    if a.start == b.start { return true }
+    a.start < b.end && b.start < a.end
+}
+
+pub fn fix_plan(edits: List[FixEdit]) -> FixPlan {
+    let mut applied: List[FixEdit] = []
+    let mut fixed: List[Int] = []
+    let mut conflicts: List[FixConflict] = []
+    let mut i = 0
+    while i < edits.len() {
+        let e = edits.get(i).unwrap()
+        let mut other = -1
+        let mut first_same = true
+        let mut j = 0
+        while j < edits.len() {
+            let f = edits.get(j).unwrap()
+            if same_edit(e, f) {
+                if j < i { first_same = false }
+            } else if other == -1 && edits_overlap(e, f) {
+                other = f.diag
+            }
+            j = j + 1
+        }
+        if other != -1 {
+            conflicts.push(FixConflict { diag: e.diag, other: other })
+        } else {
+            fixed.push(e.diag)
+            if first_same { applied.push(e) }
+        }
+        i = i + 1
+    }
+    FixPlan { applied: applied, fixed: fixed, conflicts: conflicts }
+}
+
+// The byte offset in `src` of 1-based `line` and byte column `col`, or -1 when no such place
+// exists. The column just past a line's last byte is on that line, so an edit can end there.
+pub fn fix_byte_offset(src: Str, line: Int, col: Int) -> Int {
+    if line < 1 || col < 1 { return -1 }
+    let n = src.byte_len()
+    let mut start = 0
+    let mut at = 1
+    while at < line {
+        match src.byte_index_of("\n", start) {
+            Some(nl) => { start = nl + 1 }
+            None => { return -1 }
+        }
+        at = at + 1
+    }
+    // A newline that ends the file starts no line after it.
+    if line > 1 && start == n { return -1 }
+    let line_end = match src.byte_index_of("\n", start) {
+        Some(nl) => nl
+        None => n
+    }
+    let off = start + col - 1
+    if off > line_end { return -1 }
+    off
+}
+
+// `src` with `edits` applied. The edits are to this one text and overlap none of each other;
+// they apply from the last to the first, so each offset still names the text it was made for.
+pub fn fix_apply(src: Str, edits: List[FixEdit]) -> Str {
+    let mut order: List[FixEdit] = []
+    for e in edits {
+        let mut k = 0
+        while k < order.len() && order.get(k).unwrap().start > e.start {
+            k = k + 1
+        }
+        order.insert(k, e)
+    }
+    let mut out = src
+    for e in order {
+        out = out.byte_slice(0, e.start).concat(e.text).concat(out.byte_slice(e.end, out.byte_len()))
+    }
+    out
+}

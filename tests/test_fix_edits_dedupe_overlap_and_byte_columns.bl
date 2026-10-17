@@ -1,0 +1,89 @@
+// How `blink fix` turns the fixes of a set of diagnostics into edits (sections/06_tooling.md
+// §8.6 *Applying fixes*). The same edit twice applies once. Two different edits whose spans
+// overlap are a conflict: neither applies, and both diagnostics stay reported. Edits that touch
+// only at an end do not overlap. A fix span is 1-based, its end column is exclusive, and both
+// columns count bytes, so a non-ASCII character before the edit on the same line moves it by
+// its byte length.
+
+import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
+
+fn edit(diag: Int, start: Int, end: Int, text: Str) -> FixEdit {
+    FixEdit { file: "a.bl", start: start, end: end, text: text, diag: diag }
+}
+
+test "the same edit from two diagnostics applies once and fixes both" {
+    let plan = fix_plan([edit(0, 4, 7, "let mut"), edit(1, 4, 7, "let mut")])
+    assert_eq(plan.applied.len(), 1)
+    assert_eq(plan.fixed, [0, 1])
+    assert_eq(plan.conflicts.len(), 0)
+    assert_eq(fix_apply("    let n = 1\n", plan.applied), "    let mut n = 1\n")
+}
+
+test "two different edits whose spans overlap apply neither and report both" {
+    let plan = fix_plan([edit(0, 4, 10, "a"), edit(1, 8, 12, "b"), edit(2, 20, 21, "c")])
+    assert_eq(plan.applied.len(), 1)
+    assert_eq(plan.applied.get(0).unwrap().diag, 2)
+    assert_eq(plan.fixed, [2])
+    assert_eq(plan.conflicts.len(), 2)
+    assert_eq(plan.conflicts.get(0).unwrap().diag, 0)
+    assert_eq(plan.conflicts.get(0).unwrap().other, 1)
+    assert_eq(plan.conflicts.get(1).unwrap().diag, 1)
+    assert_eq(plan.conflicts.get(1).unwrap().other, 0)
+}
+
+test "an edit repeated by a third diagnostic still conflicts with the edit it overlaps" {
+    let plan = fix_plan([edit(0, 4, 10, "a"), edit(1, 4, 10, "a"), edit(2, 6, 7, "b")])
+    assert_eq(plan.applied.len(), 0)
+    assert_eq(plan.fixed.len(), 0)
+    assert_eq(plan.conflicts.len(), 3)
+}
+
+test "two inserts at one place with different text conflict" {
+    let plan = fix_plan([edit(0, 4, 4, "a"), edit(1, 4, 4, "b")])
+    assert_eq(plan.applied.len(), 0)
+    assert_eq(plan.conflicts.len(), 2)
+}
+
+test "an insert inside a replaced span conflicts with it" {
+    let plan = fix_plan([edit(0, 4, 10, "a"), edit(1, 6, 6, "b")])
+    assert_eq(plan.applied.len(), 0)
+    assert_eq(plan.conflicts.len(), 2)
+}
+
+test "edits that only touch at an end do not overlap" {
+    let plan = fix_plan([edit(0, 0, 2, "AB"), edit(1, 2, 4, "CD")])
+    assert_eq(plan.conflicts.len(), 0)
+    assert_eq(fix_apply("abcdef", plan.applied), "ABCDef")
+}
+
+test "edits to different files never overlap" {
+    let other = FixEdit { file: "b.bl", start: 4, end: 10, text: "x", diag: 1 }
+    let plan = fix_plan([edit(0, 4, 10, "a"), other])
+    assert_eq(plan.conflicts.len(), 0)
+    assert_eq(plan.fixed, [0, 1])
+}
+
+test "edits apply back to front so each keeps its place" {
+    let src = "let a = 1\nlet b = 2\n"
+    let plan = fix_plan([edit(0, 0, 3, "let mut"), edit(1, 10, 13, "let mut")])
+    assert_eq(fix_apply(src, plan.applied), "let mut a = 1\nlet mut b = 2\n")
+}
+
+test "a fix position is a 1-based byte column with an exclusive end" {
+    let src = "fn main() \{\n    let n = 1\n}\n"
+    assert_eq(fix_byte_offset(src, 2, 5), 16)
+    assert_eq(fix_byte_offset(src, 2, 8), 19)
+    // The column just past the last byte of a line is still on the line.
+    assert_eq(fix_byte_offset(src, 2, 14), 25)
+    assert_eq(fix_byte_offset(src, 2, 15), -1)
+    assert_eq(fix_byte_offset(src, 4, 1), -1)
+    assert_eq(fix_byte_offset(src, 0, 1), -1)
+    assert_eq(fix_byte_offset(src, 1, 0), -1)
+}
+
+test "a non-ASCII character before the edit counts its bytes" {
+    // `é` is two bytes, so the second `let` starts at byte column 19, its 18th character.
+    let src = "    let s = \"é\"; let n = 1\n"
+    let at = fix_byte_offset(src, 1, 19)
+    assert_eq(src.byte_slice(at, at + 3), "let")
+}

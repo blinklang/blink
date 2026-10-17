@@ -67,13 +67,14 @@ import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
+import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import diagnostics.{
     Diag, DiagEntry, diag_entries, diag_prepend,
     diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
-    embedded_inner_key,
+    embedded_inner_key, diag_entry_text, diag_normalize_path,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
 }
 import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send, daemon_proc_identity}
@@ -4664,6 +4665,146 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 }
 
+// `blink fix`: checks the file as `blink check` does, cold, and applies the machine-applicable
+// fixes of its diagnostics in one pass (sections/06_tooling.md §8.6 *Applying fixes*). A fix is
+// machine-applicable when it names the span it replaces; one without a span is help only.
+// Prints a line for each edit it applied, then each diagnostic it did not fix as `check` prints
+// it, and exits as `check` would on those alone.
+fn cmd_fix(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO {
+    let source_path = args_positional(a, 0)
+    if source_path == "" {
+        io.eprintln("error: no source file specified")
+        io.eprintln(generate_command_help(p, "fix"))
+        exit(1)
+    }
+    if !file_exists(source_path) {
+        io.eprintln("error: file not found: {source_path}")
+        exit(1)
+    }
+    if !deps_resolved() {
+        exit(1)
+    }
+    diag_set_abort_status_line(check_status_line(source_path, 0, 0, 1, 0, 0))
+    let _ = check_source(source_path)
+
+    let editable = fix_editable_sources(source_path)
+    let mut edits: List[FixEdit] = []
+    let mut i = 0
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        if d.fix_action != "" && d.fix_line > 0 && d.severity != "ice" {
+            match editable.get(d.file) {
+                Some(src_idx) => {
+                    let text = loaded_inputs.source_texts.get(src_idx).unwrap()
+                    let start = fix_byte_offset(text, d.fix_line, d.fix_col)
+                    let end = fix_byte_offset(text, d.fix_end_line, d.fix_end_col)
+                    if start >= 0 && end >= start {
+                        edits.push(FixEdit { file: d.file, start: start, end: end, text: d.fix_text, diag: i })
+                    }
+                }
+                None => {}
+            }
+        }
+        i = i + 1
+    }
+    let plan = fix_plan(edits)
+
+    // Rendered before any file changes, so each quoted source line is the one the span names.
+    let mut report = StringBuilder.new()
+    let mut left_errors = 0
+    let mut left_warnings = 0
+    let mut left_ices = 0
+    i = 0
+    while i < diag_entries.len() {
+        if !plan.fixed.contains(i) {
+            let d = diag_entries.get(i).unwrap()
+            report.write(diag_entry_text(i, 0))
+            for c in plan.conflicts {
+                if c.diag == i {
+                    let o = diag_entries.get(c.other).unwrap()
+                    report.write("  note: its fix overlaps the different fix of the {o.severity} at {o.file}:{o.line}:{o.col}, so `blink fix` applied neither\n")
+                }
+            }
+            if d.severity == "ice" {
+                left_ices = left_ices + 1
+            } else if d.severity == "error" {
+                left_errors = left_errors + 1
+            } else if d.severity == "warning" {
+                left_warnings = left_warnings + 1
+            }
+        }
+        i = i + 1
+    }
+
+    let mut files: List[Str] = []
+    for e in plan.applied {
+        if !files.contains(e.file) { files.push(e.file) }
+    }
+    let mut applied_lines: List[Str] = []
+    for f in files {
+        let src_idx = editable.get(f).unwrap()
+        let path = loaded_inputs.source_paths.get(src_idx).unwrap()
+        let text = loaded_inputs.source_texts.get(src_idx).unwrap()
+        // The edits name bytes of the text the check read; a file changed since then is left
+        // alone, as they may no longer name what the diagnostics meant.
+        if read_file(path) != text {
+            io.eprintln("error: {f} changed while `blink fix` checked it; it was left as it was")
+            left_errors = left_errors + 1
+            continue
+        }
+        let file_edits = plan.applied.filter(fn(e) { e.file == f })
+        write_file(path, fix_apply(text, file_edits))
+        for e in file_edits {
+            let d = diag_entries.get(e.diag).unwrap()
+            applied_lines.push("{d.file}:{d.fix_line}:{d.fix_col}: {d.code} {d.fix_action}")
+        }
+    }
+    io.eprint(report.to_str())
+    for line in applied_lines {
+        io.println(line)
+    }
+    io.println("{applied_lines.len()} fix(es) applied, {left_ices + left_errors + left_warnings} diagnostic(s) left")
+    let code = check_exit_code(0, left_ices, left_errors, left_warnings)
+    if code != 0 {
+        exit(code)
+    }
+}
+
+// The sources of the last check that `blink fix` may edit, from the file name a diagnostic
+// spells to its index in loaded_inputs. Those are the files on disk inside the entry's project,
+// the nearest directory at or above the entry that holds blink.toml, else the entry's own
+// directory. The embedded stdlib, a stdlib or vendored package on disk, and a package in the
+// cache or anywhere outside the project are someone else's code.
+fn fix_editable_sources(source_path: Str) -> Map[Str, Int] {
+    let mut out: Map[Str, Int] = Map()
+    let entry_dir = build_fs.real_path(path_dirname(source_path)) ?? ""
+    if entry_dir == "" { return out }
+    let mut root = entry_dir
+    while file_exists(path_join(root, "blink.toml")) != 1 {
+        let up = path_dirname(root)
+        if up == root {
+            root = entry_dir
+            break
+        }
+        root = up
+    }
+    let prefix = if root.ends_with("/") { root } else { root.concat("/") }
+    let mut i = 0
+    while i < loaded_inputs.source_paths.len() {
+        let p = loaded_inputs.source_paths.get(i).unwrap()
+        let shown = diag_normalize_path(p)
+        let real = if p.starts_with("<embedded:") { "" } else { build_fs.real_path(p) ?? "" }
+        if shown == p && real.starts_with(prefix) {
+            let rel = real.byte_slice(prefix.byte_len(), real.byte_len())
+            if !rel.starts_with("lib/std/") && !rel.starts_with("lib/pkg/") && !rel.starts_with(".blink/") {
+                out.insert(shown, i)
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
 // A check that fails before it checks anything exits 1; under --json it first prints the
 // status line, so a tool that parses stdout still gets a result.
 fn check_failed_exit(source_path: Str, json_status: Int) {
@@ -6069,6 +6210,7 @@ fn cli_parser() -> ArgParser {
     p = add_command(p, "build", "Compile Blink source to native binary (C at -O1 unless --debug or --release)")
     p = add_command(p, "run", "Build and execute (C at -O1 unless --debug or --release)")
     p = add_command(p, "check", "Validate without producing binary")
+    p = add_command(p, "fix", "Apply the machine-applicable fixes of a file's diagnostics")
     p = add_command(p, "test", "Build and run tests (discovers source files with test blocks)")
     p = add_command(p, "fmt", "Format source file(s) in place")
     p = add_command(p, "ast", "Dump parsed AST as JSON")
@@ -6093,6 +6235,7 @@ fn cli_parser() -> ArgParser {
     p = command_add_positional(p, "build", "file", "Source file to compile")
     p = command_add_positional(p, "run", "file", "Source file to build and run")
     p = command_add_positional(p, "check", "file", "Source file to validate")
+    p = command_add_positional(p, "fix", "file", "Source file to check and fix")
     p = command_add_positional(p, "query", "file", "Source file to query")
     p = command_add_positional(p, "ast", "file", "Source file to parse")
     p = command_add_flag(p, "ast", "--imports", "-i", "Resolve imports and show merged AST")
@@ -6357,6 +6500,8 @@ fn main() {
         cmd_test(p, a)
     } else if command == "check" {
         cmd_check(p, a)
+    } else if command == "fix" {
+        cmd_fix(p, a)
     } else if command == "fmt" {
         cmd_fmt(p, a)
     } else if command == "audit" {

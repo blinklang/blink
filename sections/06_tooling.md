@@ -1666,6 +1666,7 @@ The AI gets structured feedback — result value, type, effects actually perform
 | `blink run --trace` | Run with full execution tracing (NDJSON to stderr) |
 | `blink run --trace=<filter>` | Run with filtered tracing (see §8.15) |
 | `blink check` | Type-check without codegen (fast) |
+| `blink fix <file>` | Apply the machine-applicable fixes of a file's diagnostics (§8.6) |
 | `blink eval <expr>` | Interpret an expression with full checking |
 | **Query & Inspect** | |
 | `blink query --layer intent` | Get doc comment summaries for all functions |

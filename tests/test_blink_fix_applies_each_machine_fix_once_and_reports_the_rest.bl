@@ -1,0 +1,118 @@
+// `blink fix <file>` checks the file as `blink check` does and applies the machine-applicable
+// fixes of its diagnostics (sections/06_tooling.md §8.6 *Applying fixes*). It prints one line
+// on stdout for each edit it applied and a summary, and on stderr each diagnostic it could not
+// fix, as `check` prints it. Several writes to one `let` give one edit, applied once. A
+// diagnostic with help only leaves the file as it was, and the command exits 1. A second run
+// over a fixed file changes nothing. A fix after a non-ASCII character on its line lands on the
+// bytes the diagnostic names. The commands run in a fresh temporary directory, since the test
+// tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+// What went wrong when `blink fix` on `src` does not give `want`, exit `code`, and a stdout
+// that contains each of `out_has`; "" when it does.
+fn problem(dir: Str, name: Str, src: Str, want: Str, code: Int, out_has: List[Str]) -> Str {
+    write_file("{dir}/{name}", src)
+    let r = blink_in(dir, "fix {name}")
+    let got = read_file("{dir}/{name}")
+    let what = "{name}: exit {r.exit_code}\nstdout:\n{r.out}\nstderr:\n{r.err_out}\nfile:\n{got}"
+    if got != want { return "{name}: want file:\n{want}\n{what}" }
+    if r.exit_code != code { return "{name}: want exit {code}\n{what}" }
+    for s in out_has {
+        if !r.out.contains(s) { return "{name}: want `{s}` on stdout\n{what}" }
+    }
+    // A second run finds nothing more it can fix and edits nothing.
+    let again = blink_in(dir, "fix {name}")
+    if read_file("{dir}/{name}") != want { return "{name}: a second run changed the file\n{read_file("{dir}/{name}")}" }
+    if again.exit_code != code { return "{name}: a second run exits {again.exit_code}, want {code}\n{again.err_out}" }
+    if !again.out.contains("0 fix(es) applied") { return "{name}: a second run applied a fix:\n{again.out}" }
+    ""
+}
+
+test "blink fix applies each machine fix once, edits nothing twice and reports the rest" {
+    let dir = sh("mktemp -d /tmp/blink_fix.XXXXXX").out.trim()
+    let mut problems: List[Str] = []
+
+    let tuple_mut = lines(["fn main() \{", "    let mut (x, y) = (1, 2)", "    x = x + 1", "    y = y + 1", #"    io.println("{x} {y}")"#, "}"])
+    let tuple_fixed = lines(["fn main() \{", "    let (mut x, mut y) = (1, 2)", "    x = x + 1", "    y = y + 1", #"    io.println("{x} {y}")"#, "}"])
+    problems.push(problem(dir, "tuple_mut.bl", tuple_mut, tuple_fixed, 0,
+        ["tuple_mut.bl:2:9: E0613 put `mut` on each name", "1 fix(es) applied, 0 diagnostic(s) left"]))
+
+    let two_writes = lines(["fn main() \{", "    let n = 1", "    n = 2", "    n += 3", #"    io.println("{n}")"#, "}"])
+    let two_fixed = lines(["fn main() \{", "    let mut n = 1", "    n = 2", "    n += 3", #"    io.println("{n}")"#, "}"])
+    problems.push(problem(dir, "two_writes.bl", two_writes, two_fixed, 0,
+        ["two_writes.bl:2:5: E0610 insert `mut`", "1 fix(es) applied, 0 diagnostic(s) left"]))
+
+    let accented = lines(["fn main() \{", #"    let t = ("é", (1, 2))"#, "    let r = match t \{", #"        ("é", mut (x, y)) => x + y"#, "        _ => 0", "    }", #"    io.println("{r}")"#, "}"])
+    let accented_fixed = lines(["fn main() \{", #"    let t = ("é", (1, 2))"#, "    let r = match t \{", #"        ("é", (mut x, mut y)) => x + y"#, "        _ => 0", "    }", #"    io.println("{r}")"#, "}"])
+    problems.push(problem(dir, "accented.bl", accented, accented_fixed, 0,
+        ["accented.bl:4:16: E0613 put `mut` on each name"]))
+
+    // `mut` before a variant name with no payload binds nothing; the fix removes it.
+    let variant_mut = lines(["type Color \{ Red, Green }", "fn main() \{", "    let n = match Color.Red \{", "        mut Red => 1", "        Green => 2", "    }", #"    io.println("{n}")"#, "}"])
+    let variant_fixed = lines(["type Color \{ Red, Green }", "fn main() \{", "    let n = match Color.Red \{", "        Red => 1", "        Green => 2", "    }", #"    io.println("{n}")"#, "}"])
+    problems.push(problem(dir, "variant_mut.bl", variant_mut, variant_fixed, 0,
+        ["variant_mut.bl:4:9: E0613 remove `mut`", "1 fix(es) applied, 0 diagnostic(s) left"]))
+
+    // A module-level `let` gets help only (sections/03_types.md §3.2.2): the file stays as it
+    // was and the error is reported as `check` reports it.
+    let help_only = lines(["let counter = 0", "", "fn main() \{", "    counter = 1", #"    io.println("{counter}")"#, "}"])
+    problems.push(problem(dir, "help_only.bl", help_only, help_only, 1, ["0 fix(es) applied, 1 diagnostic(s) left"]))
+    write_file("{dir}/help_only.bl", help_only)
+    let r = blink_in(dir, "fix help_only.bl")
+    if !r.err_out.contains("error[MutationRequiresMut]") || !r.err_out.contains("--> help_only.bl:4:5") {
+        problems.push("help_only.bl: want the E0610 on stderr as check prints it:\n{r.err_out}")
+    }
+
+    // An error with no fix beside one with a fix: the fix applies, the error stays reported.
+    let mixed = lines(["fn main() \{", "    let n = 1", "    n = 2", #"    let s: Int = "x""#, #"    io.println("{n} {s}")"#, "}"])
+    let mixed_fixed = lines(["fn main() \{", "    let mut n = 1", "    n = 2", #"    let s: Int = "x""#, #"    io.println("{n} {s}")"#, "}"])
+    problems.push(problem(dir, "mixed.bl", mixed, mixed_fixed, 1, ["mixed.bl:2:5: E0610 insert `mut`", "1 fix(es) applied, 1 diagnostic(s) left"]))
+
+    let _ = sh("rm -rf {dir}")
+    assert_eq(problems.filter(fn(p) { p != "" }).join("\n"), "")
+}
+
+// In `(a, b) | (b, a)` the fix for `a` runs from its first binder to its last and so covers
+// the fix for `b`: two different edits whose spans overlap. Neither applies, both errors are
+// reported with a line that says so, and a fix elsewhere in the file still applies.
+fn overlap_src(let_n: Str) -> Str {
+    lines(["fn main() \{", "    let t = (1, 2)", let_n, "    match t \{", "        (a, b) | (b, a) => \{", "            a = a + 1", "            b = b + 1", #"            io.println("{a} {b}")"#, "        }", "    }", "    n = 1", #"    io.println("{n}")"#, "}"])
+}
+
+test "blink fix applies neither of two overlapping fixes and reports both" {
+    let dir = sh("mktemp -d /tmp/blink_fix.XXXXXX").out.trim()
+    let src = overlap_src("    let n = 0")
+    let want = overlap_src("    let mut n = 0")
+    write_file("{dir}/overlap.bl", src)
+    let r = blink_in(dir, "fix overlap.bl")
+    let got = read_file("{dir}/overlap.bl")
+    let _ = sh("rm -rf {dir}")
+    let what = "exit {r.exit_code}\nstdout:\n{r.out}\nstderr:\n{r.err_out}\nfile:\n{got}"
+    assert_eq(got, want)
+    assert_eq(r.exit_code, 1)
+    assert(r.out.contains("overlap.bl:3:5: E0610 insert `mut`\n1 fix(es) applied, 2 diagnostic(s) left"))
+    if !r.err_out.contains("--> overlap.bl:6:13") || !r.err_out.contains("--> overlap.bl:7:13") { io.println(what) }
+    assert(r.err_out.contains("its fix overlaps the different fix of the error at overlap.bl:7:13, so `blink fix` applied neither"))
+    assert(r.err_out.contains("its fix overlaps the different fix of the error at overlap.bl:6:13, so `blink fix` applied neither"))
+}
+
+test "blink fix with no file is a usage error" {
+    let dir = sh("mktemp -d /tmp/blink_fix.XXXXXX").out.trim()
+    let r = blink_in(dir, "fix")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("no source file specified"))
+}

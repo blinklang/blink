@@ -256,6 +256,7 @@ blink build <file> --debug      # Debug mode (-g -O0)
 blink build <file> --release    # Optimized build (-O2)
 blink run <file>                # Build and execute in one step
 blink check <file>              # Type-check without producing binary
+blink fix <file>                # Apply the machine-applicable fixes of its diagnostics
 
 # Testing
 blink test                      # Discover and run all test files

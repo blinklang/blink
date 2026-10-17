@@ -1172,6 +1172,7 @@ build/blink build src/main.bl     # compile to build/main
 build/blink run src/main.bl       # compile + run
 build/blink test                    # discover + run all test blocks
 build/blink check src/main.bl     # typecheck without compiling
+build/blink fix src/main.bl       # apply the machine-applicable fixes of its diagnostics
 build/blink fmt src/main.bl       # format in place
 build/blink doc --list              # list available stdlib modules
 build/blink doc std.args            # print module documentation

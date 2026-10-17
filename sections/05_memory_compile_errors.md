@@ -594,6 +594,7 @@ This loop is mechanical. The AI does not need to "understand" the error -- it ap
 | `blink run` | Compile + execute in one step | Program output |
 | `blink check` | Type-check without codegen | Structured diagnostics (JSON) |
 | `blink check --format json` | Machine-readable type-check | JSON diagnostics with `fix.edits` |
+| `blink fix <file>` | Apply machine-applicable fixes | One line per applied fix; the rest as `check` prints them |
 | `blink eval <expr>` | Interpret expression | Result + effect/allocation report |
 | `blink verify` | SMT-based contract verification | Proof results per contract |
 | `blink verify --deny runtime,trust` | Fail when a contract has a named outcome | Non-zero exit; report unchanged |
