@@ -1168,9 +1168,9 @@ fn emit_spawn_scoped_capture(node: Int, binder: Int) ! Diag.Report {
     diag_source_file = saved
 }
 
-// ── E0650 a `let mut` captured by a spawned task (MutableCaptureInSpawn) ─────────
+// ── E0650 a mutable binder captured by a spawned task (MutableCaptureInSpawn) ─────────
 // A task and the scope that spawned it would share one mutable binding with no order
-// between their accesses, so a spawned closure may not capture a `let mut` at all, even
+// between their accesses, so a spawned closure may not capture a mutable binder at all, even
 // to read it (§2.8). Copying a closure shares its captures, so the walk follows a binder
 // whose value is a closure; copying any other value takes a snapshot, which is the fix.
 // The body is walked here, not from walk_expr, because a `let mut` closure's value may
@@ -1260,7 +1260,7 @@ fn mut_captures_reached(node: Int, body: Int, mut_leaves: List[Int], reads: List
             let binder = tc_ident_binder_node(read)
             if binder < 0 || seen.contains(binder) { continue }
             seen.push(binder)
-            if is_let_mut_binder(binder) || mut_leaves.contains(binder) {
+            if is_mut_binder(binder) || mut_leaves.contains(binder) {
                 reads.push(read)
             } else if is_fn_typed(read) {
                 closure_values_of(binder, body, mut_leaves, reads, seen)
@@ -1298,12 +1298,13 @@ fn mut_captures_reached(node: Int, body: Int, mut_leaves: List[Int], reads: List
     }
 }
 
-// Every value a `let` binder can hold: its initializer and, for a `let mut`, each value
-// assigned to it in the body.
+// Every value a binder can hold: a `let`'s initializer and, for a mutable binder, each
+// value assigned to it in the body.
 fn closure_values_of(binder: Int, body: Int, mut_leaves: List[Int], reads: List[Int], seen: List[Int]) {
-    if node_kind(binder) != NodeKind.LetBinding { return }
-    mut_captures_reached(node_value(binder), body, mut_leaves, reads, seen)
-    if node_is_mut(binder) == 0 { return }
+    if node_kind(binder) == NodeKind.LetBinding {
+        mut_captures_reached(node_value(binder), body, mut_leaves, reads, seen)
+    }
+    if !is_mut_binder(binder) && !mut_leaves.contains(binder) { return }
     let mut assigned: List[Int] = []
     assignments_to(body, binder, assigned)
     for v in assigned { mut_captures_reached(v, body, mut_leaves, reads, seen) }
@@ -1320,8 +1321,17 @@ fn assignments_to(node: Int, binder: Int, out: List[Int]) {
     for kid in node_value_child_ids(node) { assignments_to(kid, binder, out) }
 }
 
-fn is_let_mut_binder(binder: Int) -> Bool {
-    node_kind(binder) == NodeKind.LetBinding && node_is_mut(binder) != 0
+// A `let mut`, or a pattern binder written `mut` (§3.5 *Mutable Binders*). A struct field
+// binder is the shorthand `{ mut x }`; `{ x: mut px }` binds the IdentPattern inside it.
+// Name resolution records the `for` node itself as the binder of `for mut i in xs`.
+fn is_mut_binder(binder: Int) -> Bool {
+    let k = node_kind(binder)
+    if k == NodeKind.ForIn {
+        let simple = node_for_binder(binder)
+        return simple != -1 && node_is_mut(simple) != 0
+    }
+    let binds = k == NodeKind.LetBinding || k == NodeKind.IdentPattern || k == NodeKind.AsPattern || k == NodeKind.StructLitField
+    binds && node_is_mut(binder) != 0
 }
 
 // Reported at the read when the spawned closure holds it, and at the argument when the
