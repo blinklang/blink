@@ -530,8 +530,9 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 | `.to_upper()` | Str | Uppercase |
 | `.to_lower()` | Str | Lowercase |
 | `.replace(old, new)` | Str | Replace all occurrences |
-| `.to_int()` | Int | Parse as integer |
-| `.parse_float()` | Float | Parse as float |
+| `.to_int()` | Int | Leading digits as an integer (lax) |
+| `.parse_int()` | Result[Int, ConversionError] | Optional `-` then digits; `Err` on any other text or overflow |
+| `.parse_float()` | Result[Float, ConversionError] | `-? DIGITS ('.' DIGITS)? ('e' '-'? DIGITS)?`, `NaN`, `inf`, `-inf`; correctly rounded |
 | `.char_at(idx)` | Option[Char] | Char at codepoint index, `None` if out of range |
 | `.byte_len()` | Int | Length in bytes (O(1)) |
 | `.byte_at(idx)` | U8 | Raw byte at byte offset; panics when out of bounds |

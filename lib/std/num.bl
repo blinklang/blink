@@ -100,3 +100,93 @@ pub fn parse_float(s: Str) -> Float {
     }
     result
 }
+
+fn conversion_error(target: Str, message: Str) -> ConversionError {
+    ConversionError { message: message, source_type: "Str", target_type: target }
+}
+
+/// Backing function for the codegen-routed `Str.parse_int` method: an optional `-`, then
+/// one or more ASCII digits, nothing before or after.
+fn str_parse_int(s: Str) -> Result[Int, ConversionError] {
+    let slen = s.byte_len()
+    let mut i = 0
+    let negative = slen > 0 && s.byte_at(0).to_int() == 45
+    if negative { i = 1 }
+    if i == slen { return Err(conversion_error("Int", "invalid integer text")) }
+    // Accumulate as a negative number: Int.MIN has no positive counterpart.
+    let mut acc = 0
+    while i < slen {
+        let d = s.byte_at(i).to_int() - 48
+        if d < 0 || d > 9 { return Err(conversion_error("Int", "invalid integer text")) }
+        if acc < -922337203685477580 || (acc == -922337203685477580 && d > 8) {
+            return Err(conversion_error("Int", "value out of Int range"))
+        }
+        acc = acc * 10 - d
+        i = i + 1
+    }
+    if negative { return Ok(acc) }
+    if acc == -9223372036854775807 - 1 { return Err(conversion_error("Int", "value out of Int range")) }
+    Ok(0 - acc)
+}
+
+@ffi("strtod", header: "stdlib.h")
+@trusted(audit: "STD-NUM: wraps strtod(3). The text holds only ASCII digits, '-' and 'e' and is NUL-terminated; endptr is NULL.")
+fn c_strtod(text: Str, endptr: Ptr[Void]) -> Float ! FFI {}
+
+@trusted(audit: "STD-NUM: passes NULL as strtod's endptr, which strtod permits.")
+fn strtod_digits(text: Str) -> Float {
+    c_strtod(text, null_ptr())
+}
+
+// Longer exponents saturate here. Past it the value is 0 or inf whatever the digits are,
+// and the fraction shift below cannot bring it back into range.
+let PARSE_FLOAT_EXP_CAP: Int = 1000000000000000
+
+/// Backing function for the codegen-routed `Str.parse_float` method. It accepts
+/// `-? DIGITS ('.' DIGITS)? ('e' '-'? DIGITS)?`, `NaN`, `inf` and `-inf` (§3.6 *Float Text Form*),
+/// and rounds to nearest, ties to even.
+fn str_parse_float(s: Str) -> Result[Float, ConversionError] {
+    if s == "NaN" { return Ok(0.0 / 0.0) }
+    if s == "inf" { return Ok(1.0 / 0.0) }
+    if s == "-inf" { return Ok(-1.0 / 0.0) }
+    let invalid = conversion_error("Float", "invalid float text")
+    let slen = s.byte_len()
+    let mut i = 0
+    let negative = slen > 0 && s.byte_at(0).to_int() == 45
+    if negative { i = 1 }
+    // strtod reads the digits with the decimal point removed and the exponent lowered by
+    // the count of fraction digits, so the radix character of the locale never matters.
+    let mut digits = StringBuilder.new()
+    if negative { digits.write("-") }
+    let int_start = i
+    while i < slen && s.byte_at(i).to_int() >= 48 && s.byte_at(i).to_int() <= 57 { i = i + 1 }
+    if i == int_start { return Err(invalid) }
+    digits.write(s.byte_slice(int_start, i))
+    let mut frac_len = 0
+    if i < slen && s.byte_at(i).to_int() == 46 {
+        i = i + 1
+        let frac_start = i
+        while i < slen && s.byte_at(i).to_int() >= 48 && s.byte_at(i).to_int() <= 57 { i = i + 1 }
+        if i == frac_start { return Err(invalid) }
+        digits.write(s.byte_slice(frac_start, i))
+        frac_len = i - frac_start
+    }
+    let mut exp = 0
+    if i < slen && s.byte_at(i).to_int() == 101 {
+        i = i + 1
+        let exp_negative = i < slen && s.byte_at(i).to_int() == 45
+        if exp_negative { i = i + 1 }
+        let exp_start = i
+        while i < slen && s.byte_at(i).to_int() >= 48 && s.byte_at(i).to_int() <= 57 {
+            if exp < PARSE_FLOAT_EXP_CAP { exp = exp * 10 + (s.byte_at(i).to_int() - 48) }
+            i = i + 1
+        }
+        if i == exp_start { return Err(invalid) }
+        if exp_negative { exp = 0 - exp }
+    }
+    if i != slen { return Err(invalid) }
+    digits.write("e{exp - frac_len}")
+    let v = strtod_digits(digits.to_str())
+    if v == 1.0 / 0.0 || v == -1.0 / 0.0 { return Err(conversion_error("Float", "value out of Float range")) }
+    Ok(v)
+}
