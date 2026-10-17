@@ -1,0 +1,340 @@
+// W0606 DiscardedCollectionCopy (sections/03_types.md §3.2.2 *Discarded copies*). A method of
+// the ListOps, MapOps or SetOps table that does not mutate and returns the receiver's type
+// hands back a new collection and leaves the receiver as it was. Called as a bare statement,
+// its whole output is dropped: `xs.append(ys)` reads like an in-place append and does nothing.
+//
+// A mutating method (`pop`, `remove`, `insert`) as a statement is correct code that drops a
+// value on purpose, so it never warns. Neither does a method outside the three tables, nor a
+// user method that happens to share a name with one.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, lint_set_override}
+import std.io
+
+fn probe(path: Str, src: Str, lints_off: Bool) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    // After compile_to_program, which resets the [lints] table it loads from the manifest.
+    if lints_off { lint_set_override("W0606", "off") }
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn copy_warnings() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "DiscardedCollectionCopy" { out.push("{d.severity} {d.code} {d.message} | {d.help}") }
+    }
+    out
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn expect(label: Str, want: Int) -> List[Str] {
+    let errs = errors()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: the probe has errors:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+    let hits = copy_warnings()
+    if hits.len() != want {
+        io.println("FAIL: {label}: DiscardedCollectionCopy raised {hits.len()} time(s), want {want}")
+        for m in hits { io.println("  {m}") }
+    }
+    assert(hits.len() == want)
+    hits
+}
+
+fn list_copies_src() -> Str {
+    #"
+fn main() {
+    let xs = [1, 2, 3]
+    xs.append([4])
+    xs.slice(0, 1)
+    let _ = xs
+}
+"#
+}
+
+test "a List append or slice used as a statement warns" {
+    probe("build/w0606_list_copies.bl", list_copies_src(), false)
+    let hits = expect("list copies", 2)
+    let first = hits.get(0).unwrap()
+    assert(first.starts_with("warning W0606 "))
+    assert(first.contains("`append` returns a new list"))
+    assert(first.contains("discarded"))
+}
+
+fn set_union_src() -> Str {
+    #"
+fn main() {
+    let mut a: Set[Int] = Set()
+    a.insert(1)
+    let b: Set[Int] = Set()
+    a.union(b)
+}
+"#
+}
+
+test "a Set union used as a statement warns and names a set" {
+    probe("build/w0606_set_union.bl", set_union_src(), false)
+    let hits = expect("set union", 1)
+    assert(hits.get(0).unwrap().contains("`union` returns a new set"))
+}
+
+fn alias_src() -> Str {
+    #"
+type Ints = List[Int]
+fn main() {
+    let xs: Ints = [1, 2]
+    xs.append([3])
+}
+"#
+}
+
+test "a copy dropped through a type alias of List warns" {
+    probe("build/w0606_alias.bl", alias_src(), false)
+    expect("alias", 1)
+}
+
+fn void_tail_src() -> Str {
+    #"
+fn grow(xs: List[Int]) {
+    xs.append([9])
+}
+fn main() { grow([1]) }
+"#
+}
+
+// The tail of a function that returns nothing is a statement whose value is dropped.
+test "the tail of a Void function is a discarded copy" {
+    probe("build/w0606_void_tail.bl", void_tail_src(), false)
+    expect("void fn tail", 1)
+}
+
+fn dropped_branches_src() -> Str {
+    #"
+fn main() {
+    let xs = [1, 2]
+    let zs = [3]
+    let c = xs.len() > 1
+    if c { xs.append(zs) }
+    if c { xs.slice(0, 1) } else { xs.append(zs) }
+    for x in xs { xs.append([x]) }
+    while false { xs.slice(0, 1) }
+    match c {
+        true => xs.append(zs)
+        false => xs.slice(0, 0)
+    }
+}
+"#
+}
+
+// A loop body's value is always dropped, and so is each branch of an `if` or `match` that is
+// itself a statement.
+test "a copy in a loop body or in a branch of a statement if or match warns" {
+    probe("build/w0606_dropped_branches.bl", dropped_branches_src(), false)
+    expect("dropped branches", 7)
+}
+
+fn impl_methods_src() -> Str {
+    #"
+type W { xs: List[Int] }
+trait T {
+    fn grown(self) -> List[Int]
+    fn dropped(self)
+    fn mid(self)
+}
+impl T for W {
+    fn grown(self) -> List[Int] { self.xs.append([1]) }
+    fn dropped(self) { self.xs.append([2]) }
+    fn mid(self) {
+        self.xs.slice(0, 1)
+        let _ = 1
+    }
+}
+fn main() {
+    let w = W { xs: [0] }
+    let _ = w.grown().len()
+    w.dropped()
+    w.mid()
+}
+"#
+}
+
+// An impl method follows the function rule: a value tail is used, a Void tail is dropped.
+test "an impl method warns on a dropped copy but not on its value tail" {
+    probe("build/w0606_impl_methods.bl", impl_methods_src(), false)
+    let hits = expect("impl methods", 2)
+    assert(hits.get(0).unwrap().contains("[2]"))
+    assert(hits.get(1).unwrap().contains("slice"))
+}
+
+fn help_src() -> Str {
+    #"
+fn main() {
+    let mut xs = [1, 2]
+    xs.append([3])
+    let ys = [4]
+    ys.slice(0, 1)
+    if ys.len() > 0 { xs.append([5]) }
+    for y in ys {
+        let mut zs = [y]
+        zs.append([6])
+    }
+    let _ = xs
+}
+"#
+}
+
+// A `let mut` binding can take the copy back in place; anything else has to bind it. The
+// answer holds inside a branch or a loop body too.
+test "the help reassigns a let mut receiver and binds any other" {
+    probe("build/w0606_help.bl", help_src(), false)
+    let hits = expect("help", 4)
+    assert(hits.get(0).unwrap().contains("xs = xs.append([3])"))
+    assert(hits.get(1).unwrap().contains("let sliced = ys.slice(0, 1)"))
+    assert(hits.get(2).unwrap().contains("xs = xs.append([5])"))
+    assert(hits.get(3).unwrap().contains("zs = zs.append([6])"))
+}
+
+fn mutators_src() -> Str {
+    #"
+fn main() {
+    let mut xs = [1, 2, 3, 4]
+    xs.pop()
+    xs.remove(0)
+    xs.insert(0, 1)
+    xs.push(5)
+    xs.set(0, 7)
+    let mut s: Set[Int] = Set()
+    s.insert(1)
+    s.remove(1)
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    m.remove("a")
+    xs.clear()
+}
+"#
+}
+
+test "a mutating collection method used as a statement never warns" {
+    probe("build/w0606_mutators.bl", mutators_src(), false)
+    expect("mutators", 0)
+}
+
+fn used_results_src() -> Str {
+    #"
+fn takes(xs: List[Int]) -> Int { xs.len() }
+fn first_two(xs: List[Int]) -> List[Int] {
+    return xs.slice(0, 2)
+}
+fn doubled(xs: List[Int]) -> List[Int] {
+    xs.append(xs)
+}
+fn main() {
+    let xs = [1, 2, 3]
+    let zs = [4]
+    let ys = xs.append(zs)
+    let _ = xs.append(zs)
+    let mut acc = [0]
+    acc = acc.append(zs)
+    let n = takes(xs.slice(0, 1))
+    let r = if n > 0 { xs.append(zs) } else { xs }
+    let f = fn() -> List[Int] { xs.append(zs) }
+    let g = fn() { xs.append(zs) }
+    let h = match n {
+        0 => xs.append(zs)
+        _ => { xs.slice(0, 1) }
+    }
+    let k = { xs.append(zs) }
+    let _ = ys.len() + acc.len() + r.len() + f().len() + g().len() + h.len() + k.len()
+    let _ = first_two(xs).len() + doubled(xs).len()
+}
+"#
+}
+
+test "a copy that is bound, assigned, passed, returned or a value tail does not warn" {
+    probe("build/w0606_used_results.bl", used_results_src(), false)
+    expect("used results", 0)
+}
+
+fn outside_tables_src() -> Str {
+    #"
+fn main() {
+    let xs = [1, 2, 3]
+    xs.map(fn(x) { x })
+    xs.filter(fn(x) { x > 1 })
+    xs.take(2)
+    xs.skip(1)
+    let m: Map[Str, Int] = Map()
+    m.keys()
+    xs.len()
+}
+"#
+}
+
+// `map`, `filter`, `take` and `skip` are eager adapters that also return a List, but they are
+// not rows of the ListOps table, and the rule is drawn by the table.
+test "a method outside the three Ops tables does not warn" {
+    probe("build/w0606_outside_tables.bl", outside_tables_src(), false)
+    expect("outside tables", 0)
+}
+
+fn user_method_src() -> Str {
+    #"
+type Log { lines: List[Str] }
+trait Appendable {
+    fn append(self, other: Log) -> Log
+}
+impl Appendable for Log {
+    fn append(self, other: Log) -> Log { Log { lines: self.lines.append(other.lines) } }
+}
+fn main() {
+    let a = Log { lines: ["x"] }
+    let b = Log { lines: ["y"] }
+    a.append(b)
+}
+"#
+}
+
+test "a user method named append called as a statement does not warn" {
+    probe("build/w0606_user_method.bl", user_method_src(), false)
+    expect("user method", 0)
+}
+
+fn allowed_src() -> Str {
+    #"
+@allow(DiscardedCollectionCopy)
+fn quiet(xs: List[Int]) {
+    xs.append([1])
+}
+fn loud(xs: List[Int]) {
+    xs.append([2])
+}
+fn main() {
+    quiet([0])
+    loud([0])
+}
+"#
+}
+
+test "an allow of DiscardedCollectionCopy silences it in that function only" {
+    probe("build/w0606_allowed.bl", allowed_src(), false)
+    let hits = expect("allow", 1)
+    assert(hits.get(0).unwrap().contains("[2]"))
+}
+
+test "W0606 off under [lints] silences it" {
+    probe("build/w0606_lints_off.bl", list_copies_src(), true)
+    expect("lints off", 0)
+}

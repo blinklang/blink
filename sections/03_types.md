@@ -623,7 +623,7 @@ items.last()                         // Some(5)
 items.clear()                        // items is now [], capacity retained
 ```
 
-**Sorting.** `sort` and `sort_by` return a sorted copy. The receiver keeps its order. Both sorts are **stable**: elements that compare `Equal` keep their input order. There is no unstable sort. `sort` needs `T: Ord`. `sort_by` takes a comparator that returns `Ordering` (§3.6) and needs no bound on `T`. `xs.sort()` gives the same result as `xs.sort_by(fn(a, b) { a.cmp(b) })`.
+**Sorting.** `sort` and `sort_by` return a sorted copy. The receiver keeps its order. Both sorts are **stable**: elements that compare `Equal` keep their input order. There is no unstable sort. `sort` needs `T: Ord`. `sort_by` takes a comparator that returns `Ordering` (§3.6) and needs no bound on `T`. `xs.sort()` gives the same result as `xs.sort_by(fn(a, b) { a.cmp(b) })`. Because `sort` returns a copy, `xs.sort()` as a bare statement does nothing, and it draws warning W0606 (*Discarded copies* below).
 
 ```blink
 type Person { name: Str, age: Int }
@@ -780,6 +780,25 @@ All built-in method-surface traits are in the prelude — no import required. Th
 Sealing forbids an impl of the sealed trait itself. It does not forbid a user trait that gives a built-in type a method with a name a sealed trait already uses, such as `impl Tidy for Str { fn trim(self) -> Str { … } }`. The sealed trait and the user trait are then two owners of the name, so an unqualified call is E0522 and a qualified call picks one; the impl draws warning W0734 (§3c.4 *Built-in Type Method Dispatch*).
 
 A sealed trait may still be named in a generic bound — e.g. `fn f[T: Sized](x: T) -> Int { x.len() }`. `Sized` spans several built-in types, so a bound on it is genuinely polymorphic. A bound on a single-implementor trait (`StrOps`, `BytesOps`, `StringBuildOps`) is legal but degenerate: it is satisfiable only by the one built-in type that implements it (e.g. `[T: StrOps]` admits only `Str`), so it carries no more abstraction than naming that type directly.
+
+**Discarded copies.** Some collection methods return a new collection and leave the receiver as it was. The warning `W0606 DiscardedCollectionCopy` fires when a statement calls such a method and drops the result. A method draws the warning when all three of these hold:
+
+- It is a row of the `ListOps`, `MapOps` or `SetOps` table above, called on a `List`, `Map` or `Set`.
+- Its row says Mutates = no.
+- It returns the receiver's own type: `List[T]` on a `List`, `Map[K, V]` on a `Map`, `Set[T]` on a `Set`.
+
+These are `append`, `slice`, `reverse`, `sort` and `sort_by` on `List`, and `union` on `Set`. No `Map` method qualifies. A mutating method such as `push`, `pop`, `insert`, `remove` or `clear` never draws W0606: it does its work on the receiver, so a statement that drops its result is correct code.
+
+```blink
+let mut xs = [1, 2]
+xs.append([3])                 // W0606: xs is still [1, 2]
+xs = xs.append([3])            // OK: xs is [1, 2, 3]
+let longer = xs.append([4])    // OK
+let _ = xs.append([5])         // OK: `let _ =` drops the result on purpose
+xs.pop()                       // OK: pop changes xs
+```
+
+A statement drops its result when it comes before the last statement of a block, when it is the last statement of a function that returns nothing, when it is the body of a loop, and when it is a branch of an `if` or `match` that itself drops its result. The warning covers only the sealed built-in collection methods. It does not cover a user function or a user method, even one with the same name. `@allow(DiscardedCollectionCopy)` on the enclosing function silences it, as does `W0606 = "off"` under `[lints]`.
 
 ---
 

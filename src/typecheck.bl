@@ -1,7 +1,7 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
-import unparse.{type_ann_text}
+import unparse.{type_ann_text, unparse_expr}
 import parser.{
     node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
@@ -60,6 +60,7 @@ import diagnostics.{
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME,
+    DISCARDED_COLLECTION_COPY,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
     NO_SUCH_FIELD, OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
@@ -22281,6 +22282,100 @@ fn tc_is_mutating_collection_method(k: TyKind, method: Str) -> Int {
     0
 }
 
+// The rows of the per-type tables of ListOps, MapOps and SetOps (sections/03_types.md §3.2.2),
+// keyed by receiver kind. A List also answers the eager adapters `map`, `filter`, `take` and
+// `skip`, which return a List too, but they are not rows, and the discarded-copy rule is drawn
+// by the tables.
+fn tc_collection_ops_row(k: TyKind, method: Str) -> Bool {
+    if method == "len" || method == "is_empty" || method == "contains" {
+        return k == TyKind.List || k == TyKind.Map || k == TyKind.Set
+    }
+    if k == TyKind.List {
+        if method == "get" || method == "last" || method == "index_of" || method == "capacity" || method == "join" { return true }
+        if method == "push" || method == "pop" || method == "set" || method == "insert" || method == "remove" || method == "clear" { return true }
+        return method == "append" || method == "slice" || method == "reverse" || method == "sort" || method == "sort_by"
+    }
+    if k == TyKind.Map { return tc_map_surface_has(method) != 0 }
+    if k == TyKind.Set { return method == "insert" || method == "remove" || method == "union" }
+    false
+}
+
+// The name the help binds a dropped copy to.
+fn tc_discarded_copy_binding(method: Str) -> Str {
+    if method == "append" { return "appended" }
+    if method == "slice" { return "sliced" }
+    if method == "reverse" { return "reversed" }
+    if method == "sort" || method == "sort_by" { return "sorted" }
+    if method == "union" { return "combined" }
+    "copy"
+}
+
+// `node` has been walked and its value is dropped: it is a statement before its block's tail,
+// the tail of a function that returns nothing, or a loop body. A dropped `if`, `match` or block
+// drops the value of each branch tail in turn. Only tails are followed: the statements before
+// a nested block's tail are that block's own walk's business.
+fn tc_check_dropped_value(node: Int) ! Diag.Report {
+    if node == -1 { return }
+    let k = node_kind(node)
+    if k == NodeKind.MethodCall {
+        tc_check_discarded_copy(node)
+        return
+    }
+    if k == NodeKind.ExprStmt {
+        tc_check_dropped_value(node_value(node))
+        return
+    }
+    if k == NodeKind.Block {
+        tc_check_dropped_value(tc_block_tail_stmt(node))
+        return
+    }
+    if k == NodeKind.IfExpr {
+        tc_check_dropped_value(node_then_body(node))
+        tc_check_dropped_value(node_else_body(node))
+        return
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        if arms_sl == -1 { return }
+        let mut i = 0
+        while i < sublist_length(arms_sl) {
+            tc_check_dropped_value(node_body(sublist_get(arms_sl, i)))
+            i = i + 1
+        }
+        return
+    }
+    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope { tc_check_dropped_value(node_body(node)) }
+}
+
+// W0606. A table row that does not mutate and returns the receiver's own type hands back a
+// new collection and leaves the receiver as it was, so as a statement its only output is
+// dropped. Both facts are read off the row and the call's type, not off a list of names, so a
+// row that later lands with that signature is covered as it lands.
+fn tc_check_discarded_copy(val: Int) ! Diag.Report {
+    if val == -1 || node_kind(val) != NodeKind.MethodCall { return }
+    let obj = node_obj(val)
+    if obj == -1 { return }
+    let recv = tc_resolve(tc_lookup_node_tid(obj))
+    if recv < 0 { return }
+    let recv_t = resolve_alias_tid(recv)
+    let k = type_kind(recv_t)
+    let method = node_method(val)
+    if !tc_collection_ops_row(k, method) { return }
+    if tc_is_mutating_collection_method(k, method) != 0 { return }
+    if resolve_alias_tid(tc_resolve(tc_lookup_node_tid(val))) != recv_t { return }
+    let what = if k == TyKind.Set { "set" } else if k == TyKind.Map { "map" } else { "list" }
+    let call = unparse_expr(val)
+    let mut fix = "let {tc_discarded_copy_binding(method)} = {call}"
+    // Read off the binder, not the scope: the call may sit in a branch whose scope is gone.
+    if node_kind(obj) == NodeKind.Ident {
+        let binder = tc_ident_binder_node(obj)
+        if binder != -1 && node_is_mut(binder) != 0 { fix = "{node_name(obj)} = {call}" }
+    }
+    diag_warn_at("DiscardedCollectionCopy", DISCARDED_COLLECTION_COPY,
+        "`{method}` returns a new {what} and leaves the receiver unchanged; the result is discarded",
+        val, "use the result: `{fix}`")
+}
+
 // sections/03_types.md:302 — "Mutating methods require the binding to be `let mut`", with
 // `names.push("Dave")  // COMPILE ERROR` at :316. The rationale at :320 is that `grep "let
 // mut"` must find every mutation source, so the check has to key on the BINDING, which is
@@ -22552,6 +22647,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             }
         }
         let value_tail = tc_value_tail_stmt(node, value_fn_body || in_value != 0)
+        // A closure with no `-> T` hands its tail back to the caller even though its body is
+        // checked against Void, so only a named function's Void body drops its tail.
+        let drops_tail = is_fn_body != 0 && !value_fn_body && tc_current_fn_name != "closure"
+        let last_stmt = tc_block_tail_stmt(node)
         if stmts_sl != -1 {
             let mut i = 0
             let mut _found_terminal = 0
@@ -22569,6 +22668,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let stmt_hint = if stmt == hint_tail { resolve_alias_tid(tc_current_fn_ret) } else { tc_construct_hint }
                 if stmt == value_tail { tc_walk_value_tail = 1 }
                 tc_check_body_with_hint(stmt, stmt_hint)
+                if stmt != last_stmt || drops_tail { tc_check_dropped_value(stmt) }
                 let sk = node_kind(stmt)
                 if sk == NodeKind.Return || sk == NodeKind.Break || sk == NodeKind.Continue {
                     _found_terminal = 1
@@ -22891,6 +22991,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             tc_error_at("while condition must be Bool, got {type_to_str(cond_t)}", node)
         }
         tc_check_body(node_body(node))
+        tc_check_dropped_value(node_body(node))
         return
     }
 
@@ -22941,6 +23042,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             tc_check_pattern_types_against(tc_for_pat_node, elem_t)
         }
         tc_check_body(node_body(node))
+        tc_check_dropped_value(node_body(node))
         nr_pop_scope()
         return
     }
@@ -23016,6 +23118,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.LoopExpr {
         tc_check_body(node_body(node))
+        tc_check_dropped_value(node_body(node))
         return
     }
 
