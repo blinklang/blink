@@ -23,7 +23,7 @@
 import build_fs
 import std.path.{path_basename, path_dirname}
 import sha256.{sha256_hex, sha256_file_hex}
-import std_cache_key.{sha256_of_manifest, sha256_of_file_first, IN_PROCESS_HASH_BYTES}
+import std_cache_key.{sha256_of_manifest, sha256_of_file_first}
 
 pub fn obj_cache_dir() -> Str {
     let override_val = env.var("BLINK_CACHE_DIR") ?? ""
@@ -66,17 +66,17 @@ pub fn make_private_dir() -> Str ! IO {
 }
 
 fn cc_identity() -> Str {
-    let res = process_run("sh", ["-c", "cc --version 2>&1 | head -1"])
-    res.out.trim()
+    let res = process_run("cc", ["--version"])
+    let shown = if res.out != "" { res.out } else { res.err_out }
+    (shown.split("\n").get(0) ?? "").trim()
 }
 
+// The lines of s sorted by byte, ended by no newline.
 fn sort_lines(s: Str) -> Str {
     if s == "" {
         return ""
     }
-    let cmd = "printf '%s' \"{s}\" | sort"
-    let res = process_run("sh", ["-c", cmd])
-    res.out
+    sorted_strs(s.split("\n")).join("\n")
 }
 
 // Build the manifest text, then hash it. Caller passes pre-computed
@@ -419,36 +419,10 @@ pub fn sorted_strs(xs: List[Str]) -> List[Str] {
     out
 }
 
-// The sha of each file in paths, by its path; a file that cannot be read is absent. Files
-// that together hold more than IN_PROCESS_HASH_BYTES go to sha256sum, one exec per run of
-// paths that fits an exec argument list, since past that it hashes faster than this process
-// does; the rest, and any file sha256sum did not answer for, are hashed in process.
+// The sha of each file in paths, by its path; a file that cannot be read is absent.
 fn hash_files(paths: List[Str]) -> Map[Str, Str] ! IO {
     let mut m: Map[Str, Str] = Map()
-    let mut total = 0
     for p in paths {
-        let n = build_fs.file_size(p)
-        // A dir answers a size up to the Int max on some filesystems, which would overflow
-        // the sum; past the bound the sum no longer matters.
-        if n > 0 && total <= IN_PROCESS_HASH_BYTES {
-            total = if n > IN_PROCESS_HASH_BYTES { n } else { total + n }
-        }
-    }
-    if total > IN_PROCESS_HASH_BYTES && build_fs.find_program("sha256sum") != "" {
-        for run in exec_sized_batches(paths) {
-            let mut args = ["--"]
-            for p in run { args.push(p) }
-            let r = process_run("sha256sum", args)
-            for line in r.out.lines() {
-                // sha256sum prints "<64 hex>  <name>", and starts the line with a backslash
-                // when it had to escape the name, which then misses below.
-                if line.byte_len() < 67 || line.starts_with("\\") { continue }
-                m.insert(line.byte_slice(66, line.byte_len()), line.byte_slice(0, 64))
-            }
-        }
-    }
-    for p in paths {
-        if m.contains_key(p) { continue }
         match sha256_file_hex(p) {
             Some(sha) => m.insert(p, sha)
             None => {}
@@ -646,8 +620,7 @@ pub fn unit_keys_with_headers(
 }
 
 // Linux caps one exec argument at 128 KiB. The keys on disk were made when each run of
-// digest_of_lines went to sha256sum as one `sh -c` argument, so the runs keep that size, and
-// it bounds the paths hash_files gives one sha256sum.
+// digest_of_lines went to sha256sum as one `sh -c` argument, so the runs keep that size.
 let EXEC_ARG_BUDGET: Int = 65536
 
 // texts in order, split into runs whose total size stays under EXEC_ARG_BUDGET. A text over

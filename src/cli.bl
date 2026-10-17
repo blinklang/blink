@@ -40,7 +40,7 @@ import parser.{
 }
 import ast.{NodeKind, dbg_channels, dbg_trace, trace_mode}
 import typecheck.{TypeCheck, check_types, strip_module_qualifier, tc_builtin_trait_names}
-import sha256.{sha256_hex}
+import sha256.{sha256_hex, read_file_bytes}
 import compiler.{
     compile_to_program, reset_compiler_state, resolve_module_path,
     find_src_root, check_unused_imports, check_file_exists,
@@ -62,7 +62,7 @@ import stdlib_native_deps.{
 import build_fs
 import build_objcache
 import emit_record
-import std_cache_key.{SHA256SUM_SH, archive_compiler_path, sha256_of_file_first}
+import std_cache_key.{archive_compiler_path, sha256_of_file_first}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
@@ -4791,20 +4791,53 @@ fn daemon_may_build(a: Args) -> Bool {
 // and the directory it was in, so two shells differ in them, and a build reads none of them.
 // PWD is left out as each directory of a project has its own; the request carries it, and
 // the daemon's build sets it.
-// Where /proc names both (daemon_proc_identity), no process starts. Elsewhere one shell hashes
-// both. The variables are sorted, since a shell lists them in an order that changes as it sets
-// them, and a build reads no order. They are sorted as NUL-ended records, as a value may hold
-// a newline; an env without -0 lists them unsorted, so the order then counts, and a client in
-// another order builds cold.
+// Where /proc names both (daemon_proc_identity), no process starts. Elsewhere `env` lists the
+// variables and this process hashes them. They are sorted by byte, since a shell lists them in
+// an order that changes as it sets them, and a build reads no order. `env -0` ends each record
+// with a NUL, as a value may hold a newline; an env without -0 lists them one per line, so a
+// value with a newline then splits in two. The records are kept as hex, which sorts as the
+// bytes do and holds the NUL that a Str cannot.
 fn daemon_identity() -> Str ! IO {
     let compiler = archive_compiler_path()
     match daemon_proc_identity(compiler) {
         Some(id) => return "{get_arg(0)}\n{compiler}\n{id}"
         None => {}
     }
-    let unset = "-u _ -u SHLVL -u OLDPWD -u PWD"
-    let hashes = process_run("sh", ["-c", "{SHA256SUM_SH}sha256sum '{compiler}' 2>/dev/null; \{ env -0 {unset} 2>/dev/null || env {unset}; } | LC_ALL=C sort -z | sha256sum"]).out.trim()
-    "{get_arg(0)}\n{compiler}\n{hashes}"
+    let unset = ["-u", "_", "-u", "SHLVL", "-u", "OLDPWD", "-u", "PWD"]
+    let mut zero_args = ["-0"]
+    for u in unset { zero_args.push(u) }
+    let mut records = env_records(zero_args, 0)
+    if records.is_none() {
+        records = env_records(unset, 10)
+    }
+    let env_hash = sha256_hex(build_objcache.sorted_strs(records ?? []).join("\n"))
+    "{get_arg(0)}\n{compiler}\n{sha256_of_file_first(compiler)}\n{env_hash}"
+}
+
+// The hex of each sep-ended record that `env args` prints, or None when env fails.
+fn env_records(args: List[Str], sep: Int) -> Option[List[Str]] ! IO {
+    let tmp = env.var("TMPDIR") ?? "/tmp"
+    let dir = build_fs.private_dir(if tmp == "" { "/tmp" } else { tmp }, "blink-env")
+    if dir == "" { return None }
+    let child = build_fs.spawn_to_files("env", args, "{dir}/out", "{dir}/err")
+    let done = build_fs.wait_children([child])
+    let listed = read_file_bytes("{dir}/out")
+    let res = build_fs.reap_to_files(done.get(0).unwrap())
+    build_fs.remove_tree(dir)
+    if res.exit_code != 0 { return None }
+    let bytes = listed ?? Bytes.new()
+    let mut records: List[Str] = []
+    let mut start = 0
+    let mut i = 0
+    while i < bytes.len() {
+        if bytes.get(i).unwrap() == sep {
+            if i > start { records.push(bytes.slice(start, i).to_hex()) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < bytes.len() { records.push(bytes.slice(start, bytes.len()).to_hex()) }
+    Some(records)
 }
 
 // What the front end reads besides its inputs and the environment, so a daemon's check is a

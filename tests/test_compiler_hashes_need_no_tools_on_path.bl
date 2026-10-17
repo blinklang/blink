@@ -1,0 +1,95 @@
+// The compiler hashes in process, so a cache key needs no sha256sum, shasum, sort, awk or head
+// on PATH. Each test runs with a PATH that holds one fake `cc` and nothing else, and expects
+// the digest an independent sha256sum run gave for the same bytes.
+
+import std_cache_key.{compute_cache_key, sha256_of_file_first}
+import build_objcache.{compute_obj_key, unit_file_shas}
+
+let DIR = "build/compiler_hashes_no_tools_probe"
+let BIN = "build/compiler_hashes_no_tools_probe/bin"
+
+fn setup() {
+    shell_exec("rm -rf {DIR} && mkdir -p {BIN} {DIR}/std {DIR}/units {DIR}/arc")
+    write_file("{DIR}/compiler", "compiler\n")
+    write_file("{DIR}/std/b.bl", "fn b() \{}\n")
+    write_file("{DIR}/std/a.bl", "fn a() \{}\n")
+    write_file("{DIR}/runtime.h", "int blink_part(void);\n")
+    write_file("{DIR}/runtime_core.h", "int core(void);\n")
+    write_file("{DIR}/runtime_a.h", "int extra(void);\n")
+    write_file("{BIN}/cc", "#!/bin/sh\necho 'fakecc 1.0'\necho 'second line'\n")
+    assert_eq(shell_exec("chmod +x {BIN}/cc"), 0)
+}
+
+fn big_file(path: Str) {
+    let mut sb = StringBuilder.new()
+    let chunk = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    let mut n = 0
+    while n < 10000 {
+        sb.write(chunk)
+        n = n + 1
+    }
+    write_file(path, sb.to_str())
+}
+
+fn with_only_cc(f: fn() -> Str) -> Str {
+    let path = env.var("PATH") ?? ""
+    env.set_var("PATH", "{env.cwd()}/{BIN}")
+    let out = f()
+    env.set_var("PATH", path)
+    out
+}
+
+test "a file over a megabyte hashes without sha256sum on PATH" {
+    setup()
+    big_file("{DIR}/big.bin")
+    let got = with_only_cc(fn() { sha256_of_file_first("{DIR}/big.bin") })
+    shell_exec("rm -rf {DIR}")
+    assert_eq(got, "090ed0fd008b4645311999f03ee2867f4b79a0cba06dfa87258a328a315643f7")
+}
+
+test "a missing file has no hash" {
+    assert_eq(sha256_of_file_first("build/compiler_hashes_no_tools_probe/none"), "")
+    assert_eq(sha256_of_file_first(""), "")
+}
+
+test "the stdlib cache key without tools on PATH is the sha256 of its text" {
+    setup()
+    let got = with_only_cc(fn() { compute_cache_key("{DIR}/compiler", "{DIR}/std", "{DIR}/runtime.h", "manifest\n") })
+    let again = with_only_cc(fn() { compute_cache_key("{DIR}/compiler", "{DIR}/std", "{DIR}/runtime.h", "manifest") })
+    shell_exec("rm -rf {DIR}")
+    assert_eq(got, "bb533e2d431c53b2")
+    assert_eq(again, got)
+}
+
+test "the stdlib cache key is empty when the compiler is missing" {
+    setup()
+    let got = with_only_cc(fn() { compute_cache_key("{DIR}/nocompiler", "{DIR}/std", "{DIR}/runtime.h", "m\n") })
+    shell_exec("rm -rf {DIR}")
+    assert_eq(got, "")
+}
+
+test "the object cache key without tools on PATH sorts its lines by byte" {
+    setup()
+    let a = with_only_cc(fn() {
+        compute_obj_key("main", "abc", ["b.h", "a.h"], "rt", "bc", "cc 1", ["-O2", "-g"], "x86_64-linux")
+    })
+    let b = with_only_cc(fn() {
+        compute_obj_key("main", "abc", ["b.h", "a.h"], "rt", "bc", "cc 1", ["-g", "-O2", "-Wall"], "x86_64-linux")
+    })
+    shell_exec("rm -rf {DIR}")
+    assert_eq(a, "9ce737faa54f979a")
+    assert_eq(b, "1d245f94cbaa6b74")
+}
+
+test "unit file hashes without sha256sum on PATH include a file over a megabyte" {
+    setup()
+    big_file("{DIR}/arc/runtime.h")
+    write_file("{DIR}/units/leaf.c", "int leaf;\n")
+    let path = env.var("PATH") ?? ""
+    env.set_var("PATH", "{env.cwd()}/{BIN}")
+    let shas = unit_file_shas("{DIR}/units", "{DIR}/arc") ?? Map()
+    env.set_var("PATH", path)
+    shell_exec("rm -rf {DIR}")
+    assert_eq(shas.get("{DIR}/arc/runtime.h") ?? "none", "090ed0fd008b4645311999f03ee2867f4b79a0cba06dfa87258a328a315643f7")
+    assert_eq(shas.get("leaf.c") ?? "none", "a82a853192e2262e911b7c13e62c5eeb81aa1610c818d1c980c2584d3d1f92c6")
+}

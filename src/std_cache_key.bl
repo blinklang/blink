@@ -1,7 +1,6 @@
 // The key the stdlib archive cache is stored under. It lives apart from build_stdlib
 // so a test can import it: build_stdlib imports cli, whose fn main no test can link.
 
-import build_fs
 import sha256.{sha256_hex, sha256_file_hex}
 
 // The archive's C is emitted in process, so the binary to hash is the running one, not a
@@ -18,31 +17,11 @@ pub fn archive_compiler_path() -> Str {
 @trusted(audit: "Runtime function: takes no input and returns a GC-owned Str, never NULL.")
 fn runtime_exe_path() -> Str ! FFI {}
 
-// Put first in an sh command that runs `sha256sum`. macOS ships `shasum`, not GNU
-// coreutils, and `shasum -a 256` prints the same "<hex>  <name>" lines, so a hash or a key
-// is the same on either host.
-pub let SHA256SUM_SH: Str = "command -v sha256sum >/dev/null 2>&1 || sha256sum() \{ shasum -a 256 \"$@\"; \}; "
-
-// A file this size or smaller is hashed in process: below it, starting sha256sum costs more
-// than the hashing does.
-pub let IN_PROCESS_HASH_BYTES: Int = 1048576
-
 pub fn sha256_of_file_first(path: Str) -> Str ! IO {
     if path == "" || file_exists(path) == 0 {
         return ""
     }
-    let size = build_fs.file_size(path)
-    if size >= 0 && size <= IN_PROCESS_HASH_BYTES {
-        return sha256_file_hex(path) ?? ""
-    }
-    if build_fs.find_program("sha256sum") != "" {
-        let r = process_run("sha256sum", ["--", path])
-        // A name sha256sum had to escape starts its line with a backslash.
-        let at = if r.out.starts_with("\\") { 1 } else { 0 }
-        return if r.exit_code == 0 && r.out.byte_len() >= at + 64 { r.out.byte_slice(at, at + 64) } else { "" }
-    }
-    let r = process_run("sh", ["-c", "{SHA256SUM_SH}sha256sum {path} 2>/dev/null | awk '\{print $1}'"])
-    r.out.trim()
+    return sha256_file_hex(path) ?? ""
 }
 
 // The 16-hex digest of a manifest text, ended by a newline when it has none. The keys on disk
@@ -52,28 +31,73 @@ pub fn sha256_of_manifest(text: Str) -> Str {
     sha256_hex(body).byte_slice(0, 16)
 }
 
+// The directory part of a path, as dirname gives it.
+fn dir_of(path: Str) -> Str {
+    let parts = path.split("/")
+    if parts.len() == 1 {
+        return "."
+    }
+    let mut keep: List[Str] = []
+    let mut i = 0
+    while i < parts.len() - 1 {
+        keep.push(parts.get(i).unwrap())
+        i = i + 1
+    }
+    let dir = keep.join("/")
+    if dir == "" { "/" } else { dir }
+}
+
+// One "<hex>  <path>" line, in the shape sha256sum prints, for each readable file in dir whose
+// name starts with prefix and ends with suffix, by byte order. A dotfile is left out, as a glob does.
+fn hash_lines(dir: Str, prefix: Str, suffix: Str, out: StringBuilder) ! IO {
+    let mut names: List[Str] = []
+    for name in list_dir(dir) {
+        if name.starts_with(".") || !name.starts_with(prefix) || !name.ends_with(suffix) { continue }
+        names.push(name)
+    }
+    for name in sorted_names(names) {
+        add_hash_line("{dir}/{name}", out)
+    }
+}
+
+fn add_hash_line(path: Str, out: StringBuilder) ! IO {
+    match sha256_file_hex(path) {
+        Some(hex) => out.write("{hex}  {path}\n")
+        None => {}
+    }
+}
+
+fn sorted_names(xs: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    for x in xs {
+        out.push(x)
+        let mut i = out.len() - 1
+        while i > 0 && out.get(i - 1).unwrap() > x {
+            out.set(i, out.get(i - 1).unwrap())
+            i = i - 1
+        }
+        out.set(i, x)
+    }
+    out
+}
+
 // "" when the compiler binary is missing: a key without it would match an archive that any
 // compiler emitted.
-pub fn compute_cache_key(compiler: Str, std_dir: Str, rt_path: Str, manifest: Str) -> Str {
+pub fn compute_cache_key(compiler: Str, std_dir: Str, rt_path: Str, manifest: Str) -> Str ! IO {
     if compiler == "" || file_exists(compiler) == 0 { return "" }
-    // Cache key = sha256 over manifest + content of compiler binary,
-    // stdlib sources, runtime.h, cc version. Manifest is fed inline via
-    // a heredoc so we don't touch the disk on the cache-hit path.
-    // The source tree's runtime.h only includes its runtime_*.h siblings,
-    // so those are hashed too.
-    let mut cmd = StringBuilder.new()
-    cmd.write(SHA256SUM_SH)
-    cmd.write("(cat <<'__BLINK_MANIFEST_EOF__'\n")
-    cmd.write(manifest)
-    cmd.write("__BLINK_MANIFEST_EOF__\n")
-    cmd.write("sha256sum {compiler}\n")
-    cmd.write("sha256sum {std_dir}/*.bl 2>/dev/null\n")
+    // The source tree's runtime.h only includes its runtime_*.h siblings, so those are
+    // hashed too. Names sort by byte, so the key does not depend on the locale.
+    let mut text = StringBuilder.new()
+    text.write("format=2\n")
+    text.write(if manifest.ends_with("\n") { manifest } else { "{manifest}\n" })
+    add_hash_line(compiler, text)
+    hash_lines(std_dir, "", ".bl", text)
     if rt_path != "" {
-        cmd.write("sha256sum {rt_path} 2>/dev/null\n")
-        cmd.write("sha256sum \"$(dirname {rt_path})\"/runtime*.h 2>/dev/null\n")
+        add_hash_line(rt_path, text)
+        hash_lines(dir_of(rt_path), "runtime", ".h", text)
     }
-    cmd.write("cc --version 2>&1 | head -1) | sha256sum | cut -c1-16")
-
-    let res = process_run("sh", ["-c", cmd.to_str()])
-    res.out.trim()
+    let cc = process_run("cc", ["--version"])
+    let shown = if cc.out != "" { cc.out } else { cc.err_out }
+    text.write("{shown.split("\n").get(0) ?? ""}\n")
+    sha256_hex(text.to_str()).byte_slice(0, 16)
 }
