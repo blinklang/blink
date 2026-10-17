@@ -1,15 +1,14 @@
-// `xs[i]` lowered as an expression. The read itself belongs to the call stage, which owns
-// the one reader `[i]` and `.get(i)` share; this stage only finds the two operands and
-// hands them over. Every test of a lowering starts at lower_expr, the entry a statement
-// reaches, so such a test fails if the dispatch arm is missing rather than passing on a
-// direct call to the seam.
+// `xs[i]` with a value in the brackets. Blink has no index operator (sections/03_types.md
+// §3.4), so typecheck reports every such read as NoIndexOperator (E0313) and names the
+// `.get` call that reads the element instead. Codegen holds no lowering for the read: an
+// IndexExpr that reaches lower_expr anyway is an internal error, not a value. Every test of
+// that refusal starts at lower_expr, the entry a statement reaches.
 
-import lower_test_helpers.{
-    probe, probe_but, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
-    assert_ice_saying, assert_refused_saying,
-}
-import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_node_count}
-import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import lower_test_helpers.{probe_but, rhs_of, assert_ice_saying, assert_refused_saying}
+import ir.{ir_node_count}
+import cg_expr.{lower_expr}
+import diagnostics.{diag_entries}
+import std.io
 
 fn src_reads() -> Str {
     #"fn main() {
@@ -31,53 +30,42 @@ fn src_reads() -> Str {
 "#
 }
 
-test "a literal index reads the element through the container's runtime reader" {
-    probe("cg_expr_index", src_reads())
-    let id = lower_expr(rhs_of("literal_read"))
-    assert_kind("kind", id, IrKind.Cast)
-    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, Const)))")
-    assert_eq_str("reader", ir_c_name(ir_kid(ir_kid(id, 0), 0)), "blink_list_get")
-    assert_verifies("verify", id)
+// Exactly one NoIndexOperator says `help`, so each row pins the read it names.
+fn assert_help(label: Str, help: Str) {
+    let mut found = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "NoIndexOperator" && d.help == help { found = found + 1 }
+    }
+    if found != 1 {
+        io.println("FAIL: {label}: {found} NoIndexOperator errors with help '{help}', want 1:")
+        for d in diag_entries {
+            if d.severity == "error" { io.println("  {d.name}: {d.message} | help: {d.help}") }
+        }
+    }
+    assert_eq(found, 1)
 }
 
-test "a named index lowers its operand like any other expression" {
-    probe("cg_expr_index", src_reads())
-    let id = lower_expr(rhs_of("named_read"))
-    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_eq_str("reader", ir_c_name(ir_kid(ir_kid(id, 0), 0)), "blink_list_get")
-    assert_verifies("verify", id)
+test "a literal index is NoIndexOperator, and the help names the .get read" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    assert_refused_saying("one per read", "Blink has no index operator", 7)
+    assert_help("literal", "`nums.get(0)` returns `Option[Int]`")
 }
 
-// The add is checked (sections/03_types.md:781), so it runs once ahead of the read: the
-// Const held once, the result temp, one overflow test, and the reader reads that temp.
-test "a compound index is lowered whole, not folded or re-read" {
-    probe("cg_expr_index", src_reads())
-    let mark = cg_expr_pending_count()
-    let id = lower_expr(rhs_of("compound_read"))
-    let pre = cg_expr_take_pending(mark)
-    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_verifies("verify", id)
-    assert_eq(pre.len(), 3)
-    assert_shape("const held once", pre.get(0).unwrap(), "Let(Const)")
-    assert_shape("result temp", pre.get(1).unwrap(), "Let")
-    assert_shape("one checked add", pre.get(2).unwrap(),
-        "If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
-    assert_eq_str("add", ir_c_name(ir_kid(pre.get(2).unwrap(), 0)), "__builtin_add_overflow")
-    let index = ir_kid(ir_kid(ir_kid(id, 0), 0), 1)
-    assert_eq_str("reads the result", ir_c_name(index), ir_c_name(pre.get(1).unwrap()))
+test "a named index is NoIndexOperator, and the help names it as the .get argument" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    assert_help("named", "`nums.get(at)` returns `Option[Int]`")
 }
 
-// Nothing here knows the container's length, and a constant index is not a promise about
-// it: the bounds test is the runtime reader's. An index past the end must therefore lower
-// exactly like any other constant, or this stage would be deciding a question it cannot see.
-test "an index past the end lowers like any other constant index" {
-    probe("cg_expr_index", src_reads())
-    let past = lower_expr(rhs_of("past_end"))
-    let inside = lower_expr(rhs_of("literal_read"))
-    assert_shape("past the end", past, "Cast(Cast(CallRuntime(VarRef, Const)))")
-    assert_shape("inside", inside, "Cast(Cast(CallRuntime(VarRef, Const)))")
-    assert_eq_str("same reader", ir_c_name(ir_kid(past, 0)), ir_c_name(ir_kid(inside, 0)))
-    assert_verifies("verify", past)
+test "a compound index is NoIndexOperator, and the help keeps the whole index" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    assert_help("compound", "`nums.get(at + 1)` returns `Option[Int]`")
+}
+
+// The compiler does not know the list's length, so an index past the end is refused for the
+// same reason as any other, and not for its value.
+test "an index past the end is NoIndexOperator like any other constant index" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    assert_help("past the end", "`nums.get(99)` returns `Option[Int]`")
 }
 
 fn src_str_index() -> Str {
@@ -90,53 +78,42 @@ fn src_str_index() -> Str {
 "#
 }
 
-// A Str index is typecheck's to refuse, and it does. This stage never sees one, so it needs
-// no arm for it; the test is here to keep that boundary where it is. The code alone would
-// not say so — every type error carries it — so the sentence is what the test reads.
-test "an index that is not an Int is refused before this stage, by typecheck" {
-    probe_but("cg_expr_index_str", src_str_index(), "TypeError")
-    assert_refused_saying("str index", "index must be an Int", 1)
+// A read is refused before its index type is checked, so a Str index gets the one report
+// and no TypeError beside it.
+test "an index that is not an Int is NoIndexOperator alone" {
+    probe_but("cg_expr_index_str", src_str_index(), "NoIndexOperator")
+    assert_refused_saying("str index", "index must be an Int", 0)
+    assert_help("str index", "`nums.get(key)` returns `Option[Int]`")
 }
 
-// A Str is already the width of the runtime's word, so it takes no integer on the way back
-// and needs one cast where an Int needs two. One reader serves both, which is the point of
-// there being one.
-test "a pointer element reads through the same one reader, with no word between" {
-    probe("cg_expr_index", src_reads())
-    let id = lower_expr(rhs_of("word_read"))
-    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
-    assert_eq_str("reader", ir_c_name(ir_kid(id, 0)), "blink_list_get")
-    assert_verifies("verify", id)
+test "a Str element read is NoIndexOperator, and the help names its Option" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    assert_help("word", "`words.get(at)` returns `Option[Str]`")
 }
 
-// A double must not be punned through the runtime's integer word, so the runtime holds a
-// Float behind a pointer. This stage still only hands the operands over: what comes back
-// is the call stage's two-step read, the cast naming the slot's pointer and the
-// dereference naming the element.
-test "an element held behind a pointer comes back as a cast the read dereferences" {
-    probe("cg_expr_index", src_reads())
-    let id = lower_expr(rhs_of("real_read"))
-    assert_kind("kind", id, IrKind.Unbox)
-    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "double*")
-    assert_eq_str("element type", ir_c_spelling(id), "double")
-    assert_verifies("verify", id)
+test "a Float element read is NoIndexOperator, and the help names its Option" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    assert_help("real", "`reals.get(at)` returns `Option[Float]`")
 }
 
-// An element that simply is an Option answers the same type a bounds-checked read answers,
-// so the answer's type cannot say which read was written. The syntax can: this one is an
-// index, so it reads the element and the carrier it finds there is just the element.
-test "an element whose own type is a carrier is read, not taken for a checked result" {
-    probe("cg_expr_index", src_reads())
-    let id = lower_expr(rhs_of("opt_read"))
-    assert_kind("kind", id, IrKind.Unbox)
-    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "blink_Option_int*")
-    assert_eq_str("element type", ir_c_spelling(id), "blink_Option_int")
-    assert_verifies("verify", id)
+// An element that is itself an Option comes back wrapped once more, and the help says so
+// rather than naming the element type alone.
+test "an element whose own type is a carrier gets help that names the nested Option" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    assert_help("opt", "`opts.get(at)` returns `Option[Option[Int]]`")
 }
 
-fn src_unspellable_element() -> Str {
+// The refusal must not build an operand before it refuses, or the operand is stranded in the
+// arena with no statement that names it.
+test "an index read that reaches lower_expr is an internal error and leaves no node behind" {
+    probe_but("cg_expr_index", src_reads(), "NoIndexOperator")
+    let before = ir_node_count()
+    assert_ice_saying("index read", lower_expr(rhs_of("named_read")),
+        "IndexExprReachedCodegen", "an index expression reached codegen")
+    assert_eq(ir_node_count(), before)
+}
+
+fn src_generic_element() -> Str {
     #"fn pick[T](xs: List[T]) -> T {
     let got = xs[0]
     got
@@ -148,15 +125,8 @@ fn main() {
 "#
 }
 
-// The dispatch arm must not build an operand of its own before handing the read on. It has
-// none to build while the read is a straight delegation, so what this pins is that it stays
-// one: an arm that lowered an operand first would strand it whenever the read refuses. The
-// stage that owns the read pins the same count from its own side, where the reasons for the
-// fixture and for counting rather than checking a shape are written down.
-test "a refused index read leaves no orphan node behind in the arena" {
-    probe("cg_expr_index_unspellable", src_unspellable_element())
-    let before = ir_node_count()
-    assert_ice_saying("unspellable element", lower_expr(rhs_of("got")),
-        "UnspellableElementType", "container element has no C layout")
-    assert_eq(ir_node_count(), before)
+test "an index read in a generic body is NoIndexOperator before any instance is built" {
+    probe_but("cg_expr_index_generic", src_generic_element(), "NoIndexOperator")
+    assert_refused_saying("generic", "Blink has no index operator", 1)
+    assert_help("generic", "`xs.get(0)` returns `Option[T]`")
 }

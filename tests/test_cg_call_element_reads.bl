@@ -7,9 +7,9 @@
 // behind a pointer instead: the slot holds the address, so the read casts to the pointer
 // type and then dereferences it.
 //
-// Which of the two a read is does not depend on what the element type is. `[i]` answers the
-// element and `.get(i)` answers an Option over it, and a container of Option elements makes
-// those two answers the same type, so the syntax that was written is what says which.
+// Blink has no index operator, so the one element read is `.get(i)`, which tests the bounds
+// and answers an Option. The element a read takes out of the slot is the payload of that
+// Option's Some arm, so the rows below read that payload.
 
 import lower_test_helpers.{
     probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
@@ -28,30 +28,28 @@ fn src_reads() -> Str {
 fn main() {
     let at = 0
     let ints = [1, 2, 3]
-    let int_read = ints[at]
+    let int_read = ints.get(at)
     let words = ["a", "b"]
-    let word_read = words[at]
+    let word_read = words.get(at)
     let reals = [1.5, 2.5]
-    let real_read = reals[at]
+    let real_read = reals.get(at)
     let points = [Point { x: 1, y: 2 }]
-    let point_read = points[at]
+    let point_read = points.get(at)
     let opts = [Some(1), None]
-    let opt_read = opts[at]
-    let checked = ints.get(at)
+    let opt_read = opts.get(at)
     let counted = words.len()
-    let _keep = [int_read, real_read.to_int(), point_read.x, opt_read.unwrap()]
-    let _keep2 = [word_read.len(), checked.unwrap(), counted]
+    let _keep = [int_read.unwrap(), real_read.unwrap().to_int(), point_read.unwrap().x]
+    let _keep2 = [word_read.unwrap().len(), opt_read.unwrap().unwrap(), counted]
 }
 "#
 }
 
-// A free type variable is the element type that still refuses. Every refusal a plain
-// `xs[i]` over a concrete element could raise has an answer by now, and typecheck already
-// holds `[i]` to a List, so the container arm cannot be reached from a program either.
+// A free type variable is the element type that still refuses. The Option over it is
+// spelled first, so the refusal names the read's own result.
 fn src_unbuilt_read() -> Str {
     #"fn first[T](xs: List[T]) -> T {
-    let looked = xs[0]
-    looked
+    let looked = xs.get(0)
+    looked.unwrap()
 }
 
 fn main() {
@@ -60,117 +58,9 @@ fn main() {
 "#
 }
 
-// ── A refusal builds neither operand ─────────────────────────────────────
-
-// The read resolves before it lowers anything, so an element it cannot spell builds no node
-// at all. The count is the whole claim: the refused read answers -1 either way, and the
-// node count is the only record of the difference. It measures the order, not emitted C.
-// A node no answer names is never printed, because the printer reaches a node only through
-// the kids of a root it is given; the statements that would reach C go to the pending
-// buffer, which lower_expr already takes back on any refusal.
-test "a read this stage cannot build lowers neither of its operands" {
-    probe("cg_call_orphan", src_unbuilt_read())
-    let before = ir_node_count()
-    assert_ice_saying("generic element", lower_expr(rhs_of("looked")),
-        "UnspellableElementType", "container element has no C layout")
-    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
-}
-
-// ── Elements that fit the runtime's word ─────────────────────────────────
-
-test "an Int element takes the word, so the read is a cast off the word and a cast home" {
-    probe("cg_call_element", src_reads())
-    let id = lower_expr(rhs_of("int_read"))
-    assert_kind("kind", id, IrKind.Cast)
-    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_eq_str("cast type", ir_c_spelling(id), "int64_t")
-    assert_verifies("verify", id)
-}
-
-test "a Str element is a pointer that fits the word, so it too is one cast" {
-    probe("cg_call_element", src_reads())
-    let id = lower_expr(rhs_of("word_read"))
-    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
-    assert_eq_str("cast type", ir_c_spelling(id), "const char*")
-    assert_verifies("verify", id)
-}
-
-// The runtime call itself always answers the container's own void* cell -- that is the one
-// C signature every container helper shares, whatever element type the caller asked for.
-// The two casts above it are what carry the element's own type home; the call node beneath
-// them must keep the cell's type, not borrow the element's, because a statement that hoists
-// this call into a temp of its own reads this node's own label to declare that temp, and a
-// void* returned into a variable declared int64_t is not a conversion C performs on its own.
-test "the runtime call under the casts is labelled with the cell it returns, not the element" {
-    probe("cg_call_element", src_reads())
-    let id = lower_expr(rhs_of("int_read"))
-    let raw = ir_kid(ir_kid(id, 0), 0)
-    assert_eq_str("kind", ir_kind_name(ir_kind(raw)), "CallRuntime")
-    assert_eq_str("call type", ir_c_spelling(raw), container_slot_spelling())
-}
-
-// ── Elements the slot holds behind a pointer ─────────────────────────────
-
-// A double punned through the runtime's integer word would come back as a different
-// number, so the slot holds its address. The cast names the pointer type layout gives for
-// the slot, and the dereference names the element's own type.
-test "a Float element is read by casting to the pointer type and dereferencing it" {
-    probe("cg_call_element", src_reads())
-    let id = lower_expr(rhs_of("real_read"))
-    assert_kind("kind", id, IrKind.Unbox)
-    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "double*")
-    assert_eq_str("element type", ir_c_spelling(id), "double")
-    assert_verifies("verify", id)
-}
-
-// An aggregate cannot fit a word at all, so it takes the same path a double does. The two
-// share it because the slot's shape decides, not the element's kind.
-test "a struct element is read the same way, through the slot's pointer" {
-    probe("cg_call_element", src_reads())
-    let id = lower_expr(rhs_of("point_read"))
-    assert_kind("kind", id, IrKind.Unbox)
-    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "blink_Point*")
-    assert_eq_str("element type", ir_c_spelling(id), "blink_Point")
-    assert_verifies("verify", id)
-}
-
-// ── Which read was written ───────────────────────────────────────────────
-
-// `[i]` on a container of Option elements answers an Option, and so does `.get(i)` on a
-// container of anything. Reading the answer's type cannot tell them apart, so this read
-// must be the plain one: it was written as an index.
-test "an index into a container of carriers is a plain read, not a checked one" {
-    probe("cg_call_element", src_reads())
-    let id = lower_expr(rhs_of("opt_read"))
-    assert_kind("kind", id, IrKind.Unbox)
-    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
-    assert_verifies("verify", id)
-}
-
-// `.get(i)` tests the bounds and answers a carrier: the receiver and the index are read
-// once, a guard compares the index against the container's own length, and one of two
-// arms fills the carrier -- Some with the element the plain read would have answered,
-// None with nothing. It is selected by the syntax that was written, the same as the
-// plain read above, not by the type either one answers.
-fn src_checked() -> Str {
-    #"fn main() {
-    let ints = [1, 2, 3]
-    let at = 0
-    let missing = 9
-    let neg = 0 - 1
-    let in_bounds = ints.get(at)
-    let past_end = ints.get(missing)
-    let negative = ints.get(neg)
-}
-"#
-}
-
 // What one checked read hoists: however many statements the guard needs, the last of
 // them is the `if` that fills the carrier, and the value the caller reads back is a
-// VarRef naming it -- exactly the shape lower_element_read's own map-remove sibling
-// already builds for a presence test.
+// VarRef naming it.
 type CheckedReadLowered { answer: Int  branch: Int }
 
 fn cc_probe_checked(anchor: Str) -> CheckedReadLowered ! Diag.Report {
@@ -186,6 +76,112 @@ fn cc_probe_checked(anchor: Str) -> CheckedReadLowered ! Diag.Report {
 
 fn checked_arm_value(branch: Int, which: Int) -> Int {
     ir_kid(ir_kid(ir_kid(branch, which), 0), 1)
+}
+
+// The element the Some arm carries: the carrier's second kid, beside the tag.
+fn element_of(anchor: Str) -> Int ! Diag.Report {
+    let low = cc_probe_checked(anchor)
+    assert_verifies(anchor, low.branch)
+    ir_kid(checked_arm_value(low.branch, 1), 1)
+}
+
+// ── A refusal builds neither operand ─────────────────────────────────────
+
+// The read resolves before it lowers anything, so an element it cannot spell builds no node
+// at all. The count is the whole claim: the refused read answers -1 either way, and the
+// node count is the only record of the difference. It measures the order, not emitted C.
+// A node no answer names is never printed, because the printer reaches a node only through
+// the kids of a root it is given; the statements that would reach C go to the pending
+// buffer, which lower_expr already takes back on any refusal.
+test "a read this stage cannot build lowers neither of its operands" {
+    probe("cg_call_orphan", src_unbuilt_read())
+    let before = ir_node_count()
+    assert_ice_saying("generic element", lower_expr(rhs_of("looked")),
+        "UnspellableCallType", "call result has no C layout")
+    assert_eq_str("nodes built", "{ir_node_count() - before}", "0")
+}
+
+// ── Elements that fit the runtime's word ─────────────────────────────────
+
+test "an Int element takes the word, so the read is a cast off the word and a cast home" {
+    probe("cg_call_element", src_reads())
+    let id = element_of("int_read")
+    assert_kind("kind", id, IrKind.Cast)
+    assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("cast type", ir_c_spelling(id), "int64_t")
+}
+
+test "a Str element is a pointer that fits the word, so it too is one cast" {
+    probe("cg_call_element", src_reads())
+    let id = element_of("word_read")
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("cast type", ir_c_spelling(id), "const char*")
+}
+
+// The runtime call itself always answers the container's own void* cell -- that is the one
+// C signature every container helper shares, whatever element type the caller asked for.
+// The two casts above it are what carry the element's own type home; the call node beneath
+// them must keep the cell's type, not borrow the element's, because a statement that hoists
+// this call into a temp of its own reads this node's own label to declare that temp, and a
+// void* returned into a variable declared int64_t is not a conversion C performs on its own.
+test "the runtime call under the casts is labelled with the cell it returns, not the element" {
+    probe("cg_call_element", src_reads())
+    let id = element_of("int_read")
+    let raw = ir_kid(ir_kid(id, 0), 0)
+    assert_eq_str("kind", ir_kind_name(ir_kind(raw)), "CallRuntime")
+    assert_eq_str("call type", ir_c_spelling(raw), container_slot_spelling())
+}
+
+// ── Elements the slot holds behind a pointer ─────────────────────────────
+
+// A double punned through the runtime's integer word would come back as a different
+// number, so the slot holds its address. The cast names the pointer type layout gives for
+// the slot, and the dereference names the element's own type.
+test "a Float element is read by casting to the pointer type and dereferencing it" {
+    probe("cg_call_element", src_reads())
+    let id = element_of("real_read")
+    assert_kind("kind", id, IrKind.Unbox)
+    assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
+    assert_eq_str("cast type", ir_c_spelling(ir_kid(id, 0)), "double*")
+    assert_eq_str("element type", ir_c_spelling(id), "double")
+}
+
+// An aggregate cannot fit a word at all, so its slot holds the address as a double's does.
+// The Some arm holds such an element by pointer too, so the read hands the slot's pointer
+// over as it stands and opens no box.
+test "a struct element is read through the slot's pointer and handed over unopened" {
+    probe("cg_call_element", src_reads())
+    let id = element_of("point_read")
+    assert_kind("kind", id, IrKind.Cast)
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("cast type", ir_c_spelling(id), "blink_Point*")
+}
+
+// ── A carrier element ────────────────────────────────────────────────────
+
+// `.get(i)` on a container of Option elements answers an Option of an Option. The element
+// in the Some arm is the inner Option, read out of its slot like any other element.
+test "a carrier element is read out of its slot as the payload of the outer Some" {
+    probe("cg_call_element", src_reads())
+    let id = element_of("opt_read")
+    assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
+    assert_eq_str("cast type", ir_c_spelling(id), "blink_Option_int*")
+}
+
+// `.get(i)` tests the bounds and answers a carrier: the receiver and the index are read
+// once, a guard compares the index against the container's own length, and one of two
+// arms fills the carrier -- Some with the element, None with nothing.
+fn src_checked() -> Str {
+    #"fn main() {
+    let ints = [1, 2, 3]
+    let at = 0
+    let missing = 9
+    let neg = 0 - 1
+    let in_bounds = ints.get(at)
+    let past_end = ints.get(missing)
+    let negative = ints.get(neg)
+}
+"#
 }
 
 test "an in-bounds index answers a carrier, and the answer is a plain read of it" {
@@ -231,10 +227,10 @@ test "the whole checked read, with the statements it hoists, is a well-formed tr
     assert_verifies("answer", low.answer)
 }
 
-// The seam is reached from two arms of the caller's dispatch and from nowhere else. A node
-// that is neither read is a wrong arm, not a shape this stage has yet to build, so it is
+// The seam is reached from the checked-read arm of the caller's dispatch and from nowhere
+// else. Any other node is a wrong arm, not a shape this stage has yet to build, so it is
 // named as the caller's fault and not as a gap here.
-test "a node that is neither read is refused as a wrong dispatch, not as a gap" {
+test "a node that is not a checked read is refused as a wrong dispatch, not as a gap" {
     probe("cg_call_element", src_reads())
     assert_ice_saying("not a read", lower_element_read(rhs_of("at")),
         "NotAnElementRead", "is not an element read")

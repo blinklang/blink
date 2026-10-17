@@ -48,7 +48,7 @@ import diagnostics.{
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
-    CALL_SITE_TYPE_ARGS, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM,
+    CALL_SITE_TYPE_ARGS, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM, NO_INDEX_OPERATOR,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -11389,7 +11389,7 @@ fn init_types() ! TypeCheck.Register {
     tc_impl_of_method = Map()
     tc_active_tparams.clear()
     tc_hash_oblig = Map()
-    tc_call_site_type_args.clear()
+    tc_bracket_sites.clear()
     tc_type_args_claimed.clear()
     tc_type_args_unresolved.clear()
     tc_type_args_untyped = []
@@ -11958,6 +11958,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // Phase 2: Expression type inference
     tc_infer_program(program)
+    tc_flush_index_sites()
 
     // Phase 3: whatever Phase 1 found unresolvable and Phase 2 did not report on. The
     // receiver's type was never known at the call, so no type can be named as lacking the
@@ -15500,14 +15501,21 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
 fn nr_check_call_type_args(call_node: Int) ! TypeCheck.Resolve, Diag.Report {
     let sl = node_type_params(call_node)
     if sl == -1 { return }
+    let mut reported = false
     let mut i = 0
     while i < sublist_length(sl) {
         let ann = sublist_get(sl, i)
         let name = node_name(ann)
         if nr_names_a_type(name) == 0 && nr_has_binding(name) != 0 {
+            // The value is read, as the element position it was meant to be.
+            nr_mark_read_at(nr_top_index(name))
             tc_type_args_unresolved.insert(call_node, 1)
-            tc_errors.push("unknown type `{name}`")
-            nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", ann, ELEMENT_ACCESS_HELP)
+            if !reported {
+                reported = true
+                tc_errors.push("no index operator")
+                diag_error_at_notes("NoIndexOperator", NO_INDEX_OPERATOR, "Blink has no index operator", call_node, "",
+                    [tc_called_element_note(tc_call_head_text(call_node), name)])
+            }
         } else {
             nr_check_type_ann_visibility(ann)
         }
@@ -15822,6 +15830,14 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
         let assign_target = node_target(node)
         nr_check_node(node_value(node))
+        if assign_target != -1 && node_kind(assign_target) == NodeKind.IndexExpr {
+            // A store is no read of the element, so the target is not walked as one.
+            nr_check_node(node_obj(assign_target))
+            let item = node_index(assign_target)
+            let mode = if nr_index_written_twice_safely(item) { INDEX_STORE_STABLE } else { INDEX_STORE }
+            nr_note_index_site(node, item, mode)
+            return
+        }
         if assign_target != -1 && node_kind(assign_target) == NodeKind.Ident {
             let assign_name = node_name(assign_target)
             if kind == NodeKind.CompoundAssign {
@@ -15992,6 +16008,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         nr_note_call_decl(node, nr_resolve_bare_call_decl(fn_name, nr_current_module))
                     }
                 }
+            } else if callee_kind == NodeKind.IndexExpr && tc_index_is_type_application(callee) == 0 {
+                nr_check_node(node_obj(callee))
+                nr_note_index_site(callee, node_index(callee), INDEX_CALLED_READ)
             } else {
                 nr_check_node(callee)
             }
@@ -16161,14 +16180,14 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let ty_name = node_name(node_index(node))
             let obj = node_obj(node)
             let fn_text = if node_kind(obj) == NodeKind.Ident { node_name(obj) } else { "f" }
-            tc_call_site_type_args.insert(node, 1)
+            tc_bracket_sites.insert(node, BRACKET_TYPE_ARGS)
             tc_errors.push("type arguments with no call")
             diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "type argument `[{ty_name}]` has no call to apply to", node, "type arguments belong to a call, as in `{fn_text}[{ty_name}]()`; to keep the function as a value, annotate the binding with its function type")
             nr_check_node(obj)
             return
         }
         nr_check_node(node_obj(node))
-        nr_check_node(node_index(node))
+        nr_note_index_site(node, node_index(node), INDEX_READ)
         return
     }
 
@@ -20722,7 +20741,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.IndexExpr {
-        if (tc_call_site_type_args.get(node) ?? 0) != 0 {
+        if (tc_bracket_sites.get(node) ?? 0) == BRACKET_TYPE_ARGS {
             // Reported already, as a type application. The operands are still walked so the
             // nodes under them carry types, and the answer is the error-recovery type: the
             // program has no reading in which this expression holds a value.
@@ -20730,29 +20749,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let _ = infer_type(node_index(node))
             return tc_error_recovery_tid()
         }
-        let obj_t = tc_resolve(infer_type(node_obj(node)))
-        // The index is an operand like any other: codegen reads its type from the memo, so
-        // it must be walked even when the receiver already settles the answer. Only a
-        // settled non-Int is reported; an open metavar is pinned to Int by the unify.
+        let obj_t = infer_type(node_obj(node))
         let idx_t = infer_type(node_index(node))
-        let idx_k = type_kind(tc_resolve(idx_t))
-        if tc_unify(idx_t, TYPE_INT) == 0 && idx_k != TyKind.Unknown && idx_k != TyKind.Typevar {
-            diag_error_at("TypeError", TYPE_ERROR, "index must be an Int, found {type_to_str(tc_resolve(idx_t))}", node_index(node), "a List is indexed by an Int position")
+        let _ = tc_index_pin_open(idx_t, tc_index_get_arg(tc_resolve(obj_t)))
+        let mode = tc_bracket_sites.get(node) ?? INDEX_READ
+        // A walk that runs before the receiver's binding is typed sees no type; a later walk,
+        // or tc_flush_index_sites, reports the site.
+        if mode == INDEX_CALLED_READ || tc_tid_is_no_info(tc_resolve(obj_t)) == 0 {
+            tc_report_index_read(node, obj_t, mode == INDEX_CALLED_READ)
         }
-        if type_kind(obj_t) == TyKind.List {
-            return ty_pool.get(obj_t).unwrap().inner1
-        }
-        // sections/03_types.md:1250 states the language has no index operator and that element
-        // access is `.get()`. The parser accepts `x[0]` anyway and codegen lowers it to a raw C
-        // subscript, so every non-List receiver reached `cc` and was reported in C's vocabulary
-        // ("subscripted value is neither array nor pointer nor vector") — or, on a Str, silently
-        // produced a byte while the expression typed as unknown, so `let v: Str = s[0]` passed.
-        // A receiver whose own type is not yet determined is not yet known to be wrong.
-        let obj_k = type_kind(obj_t)
-        if obj_k == TyKind.Unknown || obj_k == TyKind.Typevar {
-            return tc_error_recovery_tid()
-        }
-        diag_error_at("TypeError", TYPE_ERROR, "cannot index a value of type {type_to_str(obj_t)}", node, "element access is `.get(i)`; `[i]` resolves only on a List")
         return tc_error_recovery_tid()
     }
 
@@ -21521,11 +21526,26 @@ fn tc_unannotated_spawn_closure(node: Int) -> Int {
     cls
 }
 
-// Bracketed type arguments with no call after them, recorded when name resolution reports
-// them. The index-typing arm reads this to stay quiet: the construct already has its
-// diagnostic, and "cannot index a value of type Fn() -> Int" describes a reading of the
-// brackets that the program did not intend.
-let mut tc_call_site_type_args: Map[Int, Int] = Map()
+// A postfix `[...]` whose item is a value is NoIndexOperator (E0313, 03_types.md §3.4), read
+// or store alike. Name resolution decides that a site is one, but the first help depends on
+// the receiver's type, so the report waits for inference; tc_flush_index_sites reports any
+// site inference never reached.
+const INDEX_READ = 1
+const INDEX_CALLED_READ = 2
+const INDEX_STORE = 3
+// A store whose index can be written twice without changing what it names: the `op=` repair
+// writes it twice.
+const INDEX_STORE_STABLE = 4
+// Bracketed type arguments with no call after them. The construct already has its
+// diagnostic, so the index-typing arm stays quiet on it.
+const BRACKET_TYPE_ARGS = 5
+// A site already reported, or one whose item holds a name that resolves nowhere: that name's
+// own error is the only report, since what the name is decides the code.
+const INDEX_REPORTED = 6
+
+// What name resolution found at each bracket site, by node: an IndexExpr for a read or a type
+// application, the Assignment or CompoundAssign for a store.
+let mut tc_bracket_sites: Map[Int, Int] = Map()
 
 // Calls whose bracketed type-argument list a typing arm read. A list no arm read binds
 // nothing, and tc_check_type_args_claimed reports it once the call is typed.
@@ -21540,8 +21560,9 @@ let mut tc_type_args_unresolved: Map[Int, Int] = Map()
 let mut tc_type_args_untyped: List[Int] = []
 
 // Whether an index expression with no call after it is a type applied in brackets rather
-// than a position read. The brackets hold a NAME, that name names a type or a type
-// parameter in scope, and no value of that name is in scope to be indexed by.
+// than a position read. The brackets hold a NAME that names a type or a type parameter in
+// scope. A bracket item is in type position, so a value of the same name does not count
+// (03_types.md §3.4).
 fn tc_index_is_type_application(idx: Int) -> Int {
     if idx == -1 { return 0 }
     if node_kind(idx) != NodeKind.IndexExpr { return 0 }
@@ -21550,10 +21571,254 @@ fn tc_index_is_type_application(idx: Int) -> Int {
     if node_kind(arg) != NodeKind.Ident { return 0 }
     let nm = node_name(arg)
     if nm == "" { return 0 }
-    if nr_has_binding(nm) != 0 { return 0 }
     if (tc_active_tparams.get(nm) ?? 0) > 0 { return 1 }
     if tc_names_a_type(nm) { return 1 }
     0
+}
+
+fn nr_note_index_site(site: Int, item: Int, mode: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let before = tc_errors.len()
+    nr_check_node(item)
+    tc_bracket_sites.insert(site, if tc_errors.len() > before { INDEX_REPORTED } else { mode })
+}
+
+// A literal, a local, or a const, as name resolution sees it. A module-level `let mut` or a
+// call can name a different element the second time.
+fn nr_index_written_twice_safely(item: Int) -> Bool {
+    let k = node_kind(item)
+    if k == NodeKind.IntLit { return true }
+    if k != NodeKind.Ident { return false }
+    let top = nr_top_index(node_name(item))
+    if top == -1 { return false }
+    if nr_index_is_global(top) == 0 { return true }
+    let decl = nr_binding_node(node_name(item))
+    decl != -1 && node_kind(decl) == NodeKind.LetBinding && node_is_const(decl) != 0
+}
+
+// Whether unparse_expr renders every node under `node`. A help quotes only what it can
+// render faithfully.
+fn tc_index_renders(node: Int) -> Bool {
+    if node == -1 { return false }
+    let k = node_kind(node)
+    if k == NodeKind.IntLit || k == NodeKind.FloatLit || k == NodeKind.CharLit || k == NodeKind.BoolLit || k == NodeKind.Ident {
+        return true
+    }
+    if k == NodeKind.InterpString { return tc_index_renders_parts(node_elements(node), true) }
+    if k == NodeKind.BinOp { return tc_index_renders(node_left(node)) && tc_index_renders(node_right(node)) }
+    if k == NodeKind.UnaryOp { return tc_index_renders(node_left(node)) }
+    if k == NodeKind.FieldAccess { return tc_index_renders(node_obj(node)) }
+    if k == NodeKind.IndexExpr { return tc_index_renders(node_obj(node)) && tc_index_renders(node_index(node)) }
+    if k == NodeKind.Call { return tc_index_renders(node_left(node)) && tc_index_renders_parts(node_args(node), false) }
+    if k == NodeKind.MethodCall { return tc_index_renders(node_obj(node)) && tc_index_renders_parts(node_args(node), false) }
+    if k == NodeKind.TupleLit || k == NodeKind.ListLit { return tc_index_renders_parts(node_elements(node), false) }
+    if k == NodeKind.NamedArg { return tc_index_renders(node_value(node)) }
+    false
+}
+
+fn tc_index_renders_parts(sl: Int, interp: Bool) -> Bool {
+    if sl == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let part = sublist_get(sl, i)
+        let literal = interp && is_literal_string_part(part) != 0
+        if !literal && !tc_index_renders(part) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// The source text of `node` as a help quotes it, or "" when it cannot be rendered.
+fn tc_index_text(node: Int) -> Str ! Diag.Report {
+    if !tc_index_renders(node) { return "" }
+    unparse_expr(node)
+}
+
+// What a call with value type arguments was called on: `fns` in `fns[i](x)`, `s.fns` in
+// `s.fns[i](x)`.
+fn tc_call_head_text(call_node: Int) -> Str ! Diag.Report {
+    if node_kind(call_node) == NodeKind.MethodCall {
+        let obj = tc_index_text(node_obj(call_node))
+        if obj == "" { return "" }
+        return "{obj}.{node_method(call_node)}"
+    }
+    tc_index_text(node_left(call_node))
+}
+
+// A called element is an Option to unwrap first, and no single edit unwraps it correctly
+// in every function, so this note is all the report offers.
+fn tc_called_element_note(recv: Str, item: Str) -> Str {
+    if recv == "" || item == "" {
+        return "`.get(...)` returns an `Option`; `match` on it before calling the element"
+    }
+    "`{recv}.get({item})` returns an `Option`; `match` on it before calling the element"
+}
+
+// Whether a struct or enum type answers `.get(...)` itself.
+fn tc_type_has_get(tid: Int) -> Bool {
+    let k = type_kind(tid)
+    if k != TyKind.Struct && k != TyKind.Enum { return false }
+    let tname = ty_pool.get(tid).unwrap().name
+    tc_method_trait_count(tname, "get") >= 1 || lookup_fnsig("{tname}_get") != -1
+}
+
+// The element type `.get` answers an Option of on a List, Map or Bytes, or -1.
+fn tc_index_get_elem(tid: Int) -> Int {
+    let k = type_kind(tid)
+    if k == TyKind.List { return ty_pool.get(tid).unwrap().inner1 }
+    if k == TyKind.Map { return ty_pool.get(tid).unwrap().inner2 }
+    if k == TyKind.Bytes { return TYPE_INT }
+    -1
+}
+
+// The type `.get` takes as its argument on a List, Map or Bytes, or -1.
+fn tc_index_get_arg(tid: Int) -> Int {
+    let k = type_kind(tid)
+    if k == TyKind.List || k == TyKind.Bytes { return TYPE_INT }
+    if k == TyKind.Map { return ty_pool.get(tid).unwrap().inner1 }
+    -1
+}
+
+// The repair passes `operand` where the method takes `want`, so an operand whose type nothing
+// else settles takes that type. Without it, a name only the brackets use draws E0301 as well.
+fn tc_index_pin_open(operand_t: Int, want: Int) -> Int {
+    if want == -1 || tc_is_unbound_metavar(tc_resolve(operand_t)) == 0 { return 0 }
+    tc_unify(operand_t, want)
+}
+
+// The field a decimal integer literal names, or -1 for any other item.
+fn tc_tuple_position(item: Int) -> Int {
+    if node_kind(item) != NodeKind.IntLit { return -1 }
+    let text = node_str_val(item)
+    let n = text.to_int()
+    if "{n}" != text { return -1 }
+    n
+}
+
+fn tc_report_no_index(node: Int, help: Str, notes: List[Str]) ! Diag.Report {
+    if notes.len() > 0 {
+        diag_error_at_notes("NoIndexOperator", NO_INDEX_OPERATOR, "Blink has no index operator", node, help, notes)
+    } else {
+        diag_error_at("NoIndexOperator", NO_INDEX_OPERATOR, "Blink has no index operator", node, help)
+    }
+}
+
+// The fix replaces the whole site, so it needs the site's end on the line it starts on.
+fn tc_index_fix(node: Int, before: Int, action: Str, text: Str) {
+    if text == "" || diag_entry_count() <= before { return }
+    if node_end_line(node) != node_line(node) || node_end_col(node) <= node_col(node) { return }
+    diag_set_last_fix_at(action, text, node_line(node), node_col(node), node_end_line(node), node_end_col(node))
+}
+
+// A read through brackets: `xs[i]`, or `fns[i](x)` when `called`.
+fn tc_report_index_read(node: Int, obj_tid: Int, called: Bool) ! Diag.Report {
+    let mode = tc_bracket_sites.get(node) ?? INDEX_READ
+    if mode == INDEX_REPORTED || mode == BRACKET_TYPE_ARGS { return }
+    tc_bracket_sites.insert(node, INDEX_REPORTED)
+    tc_errors.push("no index operator")
+    let obj_t = tc_resolve(obj_tid)
+    let recv = tc_index_text(node_obj(node))
+    let item = node_index(node)
+    let item_text = tc_index_text(item)
+    if called {
+        tc_report_no_index(node, "", [tc_called_element_note(recv, item_text)])
+        return
+    }
+    let k = type_kind(obj_t)
+    if k == TyKind.Tuple {
+        let arity = ty_pool.get(obj_t).unwrap().params_count
+        let pos = tc_tuple_position(item)
+        if recv == "" || pos < 0 || pos >= arity {
+            tc_report_no_index(node, "a tuple field is a literal position after a dot, such as `.0`", [])
+            return
+        }
+        let field = "{recv}.{pos}"
+        let before = diag_entry_count()
+        tc_report_no_index(node, "a tuple field is `{field}`", [])
+        tc_index_fix(node, before, "use the tuple field", field)
+        return
+    }
+    // A `.get` read answers an Option where the bracket read answered the element, so the
+    // repair changes the type of the expression and is not offered as a fix.
+    let call = if recv == "" || item_text == "" { "`.get(...)`" } else { "`{recv}.get({item_text})`" }
+    let elem = tc_index_get_elem(obj_t)
+    let help = if elem != -1 {
+        "{call} returns `Option[{type_to_str(tc_resolve(elem))}]`"
+    } else if tc_type_has_get(obj_t) {
+        call
+    } else {
+        ""
+    }
+    tc_report_no_index(node, help, [])
+}
+
+// A receiver a repair can quote: a binding, or a field path from one.
+fn tc_index_receiver_is_path(node: Int) -> Bool {
+    let k = node_kind(node)
+    if k == NodeKind.Ident { return true }
+    if k == NodeKind.FieldAccess { return tc_index_receiver_is_path(node_obj(node)) }
+    false
+}
+
+// A store through brackets: `xs[i] = v` or `xs[i] op= v` at `node`.
+fn tc_report_index_store(node: Int, obj_tid: Int) ! Diag.Report {
+    let mode = tc_bracket_sites.get(node) ?? INDEX_STORE
+    if mode == INDEX_REPORTED { return }
+    tc_bracket_sites.insert(node, INDEX_REPORTED)
+    tc_errors.push("no index operator")
+    let target = node_target(node)
+    let obj = node_obj(target)
+    let k = type_kind(tc_resolve(obj_tid))
+    let compound = node_kind(node) == NodeKind.CompoundAssign
+    let r = tc_index_text(obj)
+    let i = tc_index_text(node_index(target))
+    let v = tc_index_text(node_value(node))
+    let quoted = r != "" && i != "" && v != "" && tc_index_receiver_is_path(obj)
+    let rr = if r == "" { "xs" } else { r }
+    let ii = if i == "" { "i" } else { i }
+    let vv = if v == "" { "v" } else { v }
+    let op = node_op(node)
+    let seq = k == TyKind.List || k == TyKind.Bytes
+    let mut help = ""
+    let mut notes: List[Str] = []
+    let mut fix = ""
+    if seq || k == TyKind.Map {
+        let verb = if seq { "set" } else { "insert" }
+        if !compound {
+            help = "`{rr}.{verb}({ii}, {vv})`"
+            if quoted { fix = "{r}.{verb}({i}, {v})" }
+        } else if seq && quoted && node_kind(obj) == NodeKind.Ident && mode == INDEX_STORE_STABLE {
+            // A field-path receiver may count as the nested place the spec excludes, so only a
+            // bare binding gets the fix.
+            fix = "{r}.set({i}, {r}.get({i}).unwrap() {op} {v})"
+            help = "`{fix}` (panics when `{i}` is out of bounds)"
+        } else {
+            let key = if seq { "i" } else { "k" }
+            let missing = if seq { "out of bounds" } else { "absent" }
+            help = "`let {key} = {ii}`, then `{rr}.{verb}({key}, {rr}.get({key}).unwrap() {op} {vv})` (panics when `{key}` is {missing})"
+            notes.push("bind the index with `let` first, so the repair computes it once")
+        }
+    } else {
+        let nv = if compound { "{rr}.get({ii}).unwrap() {op} {vv}" } else { vv }
+        help = "`{rr}.set({ii}, {nv})` on a List or Bytes, `{rr}.insert({ii}, {nv})` on a Map"
+    }
+    let before = diag_entry_count()
+    tc_report_no_index(node, help, notes)
+    tc_index_fix(node, before, "write the element with a method", fix)
+}
+
+// Sites inference never reached carry no receiver type, so they get the type-free help.
+// Node order keeps the reports the same from run to run, which map order does not.
+fn tc_flush_index_sites() ! Diag.Report {
+    for site in tc_bracket_sites.keys().sort() {
+        let mode = tc_bracket_sites.get(site) ?? INDEX_REPORTED
+        if mode >= INDEX_READ && mode <= INDEX_STORE_STABLE {
+            if mode == INDEX_STORE || mode == INDEX_STORE_STABLE {
+                tc_report_index_store(site, TYPE_UNKNOWN)
+            } else {
+                tc_report_index_read(site, TYPE_UNKNOWN, mode == INDEX_CALLED_READ)
+            }
+        }
+    }
 }
 
 // Marks the type-argument list at `call_node` as read, and reports it when the callee
@@ -23734,6 +23999,20 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
         let target = node_target(node)
         let val = node_value(node)
+        if target != -1 && val != -1 && node_kind(target) == NodeKind.IndexExpr {
+            // The target is no place, so neither the root's `mut` nor the value's type is
+            // checked against it; the one report is the store's.
+            let obj_t = infer_type(node_obj(target))
+            let val_t = infer_type(val)
+            let _ = tc_index_pin_open(val_t, tc_index_get_elem(tc_resolve(obj_t)))
+            let type_args = (tc_bracket_sites.get(target) ?? 0) == BRACKET_TYPE_ARGS
+            if !type_args { tc_bracket_sites.insert(target, INDEX_REPORTED) }
+            let _ = infer_type(target)
+            if !type_args && tc_tid_is_no_info(tc_resolve(obj_t)) == 0 {
+                tc_report_index_store(node, obj_t)
+            }
+            return
+        }
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
             tc_check_assign_root(target)

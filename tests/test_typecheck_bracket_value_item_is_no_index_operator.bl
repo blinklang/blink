@@ -1,0 +1,323 @@
+// Blink has no index operator (sections/03_types.md §3.4 *Postfix Brackets That Are Not a Type
+// Application*, §2.22 *Assignment places*). A postfix `[...]` whose item is a value is
+// `error[NoIndexOperator]` (E0313), whether the brackets are read, written to, or called. The
+// first help is picked from the receiver's type. A read gets help only, since `.get()` answers
+// an Option and would change the type in place; a tuple read gets its field as a fix. A store
+// gets `.set` or `.insert` as a fix, and `op=` gets one only when the receiver is a plain
+// binding and the index can be written twice. A name in the brackets that resolves nowhere gets its name-resolution error alone, and
+// the initializer of a rejected read draws no further error.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset, diag_explain, NO_INDEX_OPERATOR}
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn all() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        out.push("{d.severity} {d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help} | notes: {d.notes.join(\"; \")} | fix: {d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}")
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for e in all() { io.println("  {e}") }
+}
+
+fn error_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { n += 1 }
+    }
+    n
+}
+
+fn code_count(code: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.code == code { n += 1 }
+    }
+    n
+}
+
+fn warning_named(name: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "warning" && d.name == name { n += 1 }
+    }
+    n
+}
+
+// Exactly one error, and it is E0313 at line:col with `help`, no note, and no fix.
+fn expect_help_only(label: Str, line: Int, col: Int, help: Str) {
+    let mut ok = error_count() == 1 && code_count("E0313") == 1
+    for d in diag_entries {
+        if d.code == "E0313" {
+            if d.name != "NoIndexOperator" || d.message != "Blink has no index operator" { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if d.help != help { ok = false }
+            if d.fix_action != "" || d.fix_text != "" { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+// Exactly one error, and it is E0313 whose help contains `help_part`, whose notes contain
+// `note_part`, and that has no fix.
+fn expect_note(label: Str, help_part: Str, note_part: Str) {
+    let mut ok = error_count() == 1 && code_count("E0313") == 1
+    for d in diag_entries {
+        if d.code == "E0313" {
+            if !d.help.contains(help_part) { ok = false }
+            if !d.notes.join("\n").contains(note_part) { ok = false }
+            if d.fix_action != "" || d.fix_text != "" { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+// Exactly one error, and it is E0313 whose help contains `help_part` and whose fix writes
+// `fix` over line:col to line:end_col.
+fn expect_fix(label: Str, help_part: Str, fix: Str, line: Int, col: Int, end_col: Int) {
+    let mut ok = error_count() == 1 && code_count("E0313") == 1
+    for d in diag_entries {
+        if d.code == "E0313" {
+            if !d.help.contains(help_part) { ok = false }
+            if d.fix_action == "" || d.fix_text != fix { ok = false }
+            if d.fix_line != line || d.fix_col != col || d.fix_end_line != line || d.fix_end_col != end_col { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "a List read through brackets is E0313 with .get help and no fix" {
+    probe("build/noidx_list_read.bl", #"
+fn main() {
+    let xs = [10, 20, 30]
+    let x = xs[1]
+    let _ = x
+}
+"#)
+    expect_help_only("xs[1]", 4, 13, "`xs.get(1)` returns `Option[Int]`")
+}
+
+test "a Map read with a Str key is E0313 with .get help" {
+    probe("build/noidx_map_read.bl", #"
+fn main() {
+    let mut ages: Map[Str, Int] = Map()
+    ages.insert("bob", 41)
+    let a = ages["bob"]
+    let _ = a
+}
+"#)
+    expect_help_only("ages[\"bob\"]", 5, 13, "`ages.get(\"bob\")` returns `Option[Int]`")
+}
+
+test "a read whose result is called is E0313 with a note and no fix" {
+    probe("build/noidx_call_lit.bl", #"
+fn main() {
+    let fns = [fn(x: Int) -> Int { x + 1 }]
+    let v = fns[0](3)
+    let _ = v
+}
+"#)
+    expect_note("fns[0](3)", "", "`fns.get(0)` returns an `Option`")
+}
+
+test "a read by a local whose result is called is E0313 and the local is read" {
+    probe("build/noidx_call_local.bl", #"
+fn main() {
+    let fns = [fn(x: Int) -> Int { x + 1 }]
+    let i = 0
+    let v = fns[i](3)
+    let _ = v
+}
+"#)
+    expect_note("fns[i](3)", "", "`fns.get(i)` returns an `Option`")
+    assert_eq(warning_named("UnusedVariable"), 0)
+}
+
+test "a read by a computed index whose result is called is E0313" {
+    probe("build/noidx_call_expr.bl", #"
+fn main() {
+    let fns = [fn(x: Int) -> Int { x + 1 }]
+    let i = 0
+    let v = fns[i + 0](3)
+    let _ = v
+}
+"#)
+    expect_note("fns[i + 0](3)", "", "`fns.get(i + 0)` returns an `Option`")
+}
+
+test "an uppercase const in the brackets is a value" {
+    probe("build/noidx_const.bl", #"
+const MAX = 2
+
+fn main() {
+    let xs = [10, 20, 30]
+    let c = xs[MAX]
+    let _ = c
+}
+"#)
+    expect_help_only("xs[MAX]", 6, 13, "`xs.get(MAX)` returns `Option[Int]`")
+}
+
+test "a tuple read is E0313 with the field as its fix" {
+    probe("build/noidx_tuple.bl", #"
+fn main() {
+    let pair = (1, "a")
+    let t = pair[0]
+    let _ = t
+}
+"#)
+    expect_fix("pair[0]", "a tuple field is `pair.0`", "pair.0", 4, 13, 20)
+}
+
+test "a name in the brackets that resolves nowhere gets only its own error" {
+    probe("build/noidx_unresolved.bl", #"
+fn main() {
+    let xs = [10, 20, 30]
+    let a = xs[nope]
+    let _ = a
+}
+"#)
+    let ok = code_count("E0313") == 0 && error_count() == 1
+    if !ok { show("xs[nope]") }
+    assert(ok)
+}
+
+test "a store into a List is E0313 with a .set fix" {
+    probe("build/noidx_list_store.bl", #"
+fn main() {
+    let mut xs = [10, 20, 30]
+    xs[0] = 5
+    let _ = xs.len()
+}
+"#)
+    expect_fix("xs[0] = 5", "`xs.set(0, 5)`", "xs.set(0, 5)", 4, 5, 14)
+}
+
+test "a store into a List that is not mut is E0313 alone" {
+    probe("build/noidx_list_store_imm.bl", #"
+fn main() {
+    let xs = [10, 20, 30]
+    xs[0] = 5
+    let _ = xs.len()
+}
+"#)
+    expect_fix("xs[0] = 5 on a let", "`xs.set(0, 5)`", "xs.set(0, 5)", 4, 5, 14)
+}
+
+test "a store into a Map is E0313 with an .insert fix" {
+    probe("build/noidx_map_store.bl", #"
+fn main() {
+    let mut ages: Map[Str, Int] = Map()
+    ages["bob"] = 41
+    let _ = ages.len()
+}
+"#)
+    expect_fix("ages[\"bob\"] = 41", "`ages.insert(\"bob\", 41)`", "ages.insert(\"bob\", 41)", 4, 5, 21)
+}
+
+test "a compound store with a local index has a fix that panics out of bounds" {
+    probe("build/noidx_compound_local.bl", #"
+fn main() {
+    let mut xs = [10, 20, 30]
+    let i = 1
+    xs[i] += 1
+    let _ = xs.len()
+}
+"#)
+    expect_fix("xs[i] += 1", "panics when `i` is out of bounds", "xs.set(i, xs.get(i).unwrap() + 1)", 5, 5, 15)
+}
+
+test "a compound store with a literal index has a fix" {
+    probe("build/noidx_compound_lit.bl", #"
+fn main() {
+    let mut xs = [10, 20, 30]
+    xs[2] *= 3
+    let _ = xs.len()
+}
+"#)
+    expect_fix("xs[2] *= 3", "`xs.set(2, xs.get(2).unwrap() * 3)`", "xs.set(2, xs.get(2).unwrap() * 3)", 4, 5, 15)
+}
+
+test "a compound store with a call for its index has a note and no fix" {
+    probe("build/noidx_compound_call.bl", #"
+fn pick() -> Int { 1 }
+
+fn main() {
+    let mut xs = [10, 20, 30]
+    xs[pick()] += 1
+    let _ = xs.len()
+}
+"#)
+    expect_note("xs[pick()] += 1", ".set(","bind the index with `let`")
+}
+
+test "a compound store through a field path has a note and no fix" {
+    probe("build/noidx_compound_field.bl", #"
+type Bag { items: List[Int] }
+
+fn main() {
+    let mut bag = Bag { items: [10, 20, 30] }
+    bag.items[0] += 1
+    let _ = bag.items.len()
+}
+"#)
+    expect_note("bag.items[0] += 1", ".set(", "bind the index with `let`")
+}
+
+test "a store whose receiver type is not known names both verbs and has no fix" {
+    probe("build/noidx_unknown_store.bl", #"
+fn main() {
+    let mut xs = nothing_declares_this()
+    xs[0] = 5
+}
+"#)
+    let mut ok = code_count("E0313") == 1
+    for d in diag_entries {
+        if d.code == "E0313" {
+            if !d.help.contains(".set(0, 5)") || !d.help.contains(".insert(0, 5)") { ok = false }
+            if !d.help.contains("List") || !d.help.contains("Map") { ok = false }
+            if d.fix_action != "" || d.fix_text != "" { ok = false }
+        }
+    }
+    if !ok { show("unknown receiver store") }
+    assert(ok)
+}
+
+test "a rejected read draws no inference error from its binding" {
+    probe("build/noidx_no_follow_on.bl", #"
+fn main() {
+    let xs: List[List[Int]] = []
+    let row = xs[0]
+    let n = row.len()
+    let _ = n
+}
+"#)
+    let ok = error_count() == 1 && code_count("E0313") == 1 && code_count("E0300") == 0 && code_count("E0301") == 0
+    if !ok { show("no follow-on") }
+    assert(ok)
+}
+
+test "the explanation names the code and the method repairs" {
+    let text = diag_explain(NO_INDEX_OPERATOR)
+    assert(text.contains("E0313 -- NoIndexOperator"))
+    assert(text.contains(".get("))
+    assert(text.contains(".set("))
+    assert(text.contains(".insert("))
+}

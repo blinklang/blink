@@ -16,8 +16,9 @@ import lower_test_helpers.{
 import parser.{node_count, node_kind, node_method}
 import ast.{NodeKind, nk_of}
 import ir.{ir_c_spelling, ir_kid}
-import cg_expr.{lower_expr}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import layout.{container_slot_spelling}
+import diagnostics.{Diag}
 import std.io
 
 // What every store's outermost conversion has to name. Reading it from the same producer
@@ -40,6 +41,22 @@ fn call_after(anchor: Str, method: Str) -> Int {
     -1
 }
 
+// A read is `.get(i)`, which answers an Option, so the element read out of the slot is the
+// payload of the Some arm in the last statement the read hoists.
+fn element_of(anchor: Str) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let built = lower_expr(rhs_of(anchor))
+    assert(built >= 0)
+    let stmts = cg_expr_take_pending(mark)
+    if stmts.len() == 0 {
+        io.println("FAIL: '{anchor}' hoisted no statements")
+        assert(false)
+    }
+    let branch = stmts.get(stmts.len() - 1).unwrap()
+    assert_verifies(anchor, branch)
+    ir_kid(ir_kid(ir_kid(ir_kid(branch, 1), 0), 1), 1)
+}
+
 // The five element types that separate the three ways a slot can hold one: two integer
 // widths, an unsigned one that takes a different word, a pointer that takes no word, and a
 // value too wide for the word at all.
@@ -47,16 +64,17 @@ fn src_reads() -> Str {
     #"fn main() {
     let at = 0
     let ints: List[Int] = [1]
-    let int_read = ints[at]
+    let int_read = ints.get(at)
     let narrows: List[I32] = [1.to_i32()]
-    let narrow_read = narrows[at]
+    let narrow_read = narrows.get(at)
     let wides: List[U64] = [1.to_u64()]
-    let wide_read = wides[at]
+    let wide_read = wides.get(at)
     let words: List[Str] = ["a"]
-    let word_read = words[at]
+    let word_read = words.get(at)
     let reals: List[Float] = [1.5]
-    let real_read = reals[at]
-    let _keep = [int_read, narrow_read.to_int(), word_read.len(), real_read.to_int()]
+    let real_read = reals.get(at)
+    let _keep = [int_read.unwrap(), narrow_read.unwrap().to_int(), wide_read.unwrap().to_int()]
+    let _keep2 = [word_read.unwrap().len(), real_read.unwrap().to_int()]
 }
 "#
 }
@@ -93,7 +111,7 @@ fn main() {
 // change the size of a pointer in one step, which is what the middle cast exists to avoid.
 test "an Int element is read back through the pointer-wide word" {
     probe("sw_ri", src_reads())
-    let id = lower_expr(rhs_of("int_read"))
+    let id = element_of("int_read")
     assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
     assert_eq_str("element", ir_c_spelling(id), "int64_t")
     assert_eq_str("word", ir_c_spelling(ir_kid(id, 0)), "intptr_t")
@@ -105,7 +123,7 @@ test "an Int element is read back through the pointer-wide word" {
 // value the runtime ever stored.
 test "a narrow element is read back at the cell's width before it is narrowed" {
     probe("sw_rn", src_reads())
-    let id = lower_expr(rhs_of("narrow_read"))
+    let id = element_of("narrow_read")
     assert_shape("shape", id, "Cast(Cast(CallRuntime(VarRef, VarRef)))")
     assert_eq_str("element", ir_c_spelling(id), "int32_t")
     assert_eq_str("word", ir_c_spelling(ir_kid(id, 0)), "intptr_t")
@@ -117,7 +135,7 @@ test "a narrow element is read back at the cell's width before it is narrowed" {
 // so which word this element takes is asserted and not assumed to be the other one.
 test "a U64 element takes the unsigned word, not the signed one" {
     probe("sw_rw", src_reads())
-    let id = lower_expr(rhs_of("wide_read"))
+    let id = element_of("wide_read")
     assert_eq_str("element", ir_c_spelling(id), "uint64_t")
     assert_eq_str("word", ir_c_spelling(ir_kid(id, 0)), "uintptr_t")
     assert_verifies("verify", id)
@@ -127,7 +145,7 @@ test "a U64 element takes the unsigned word, not the signed one" {
 // be a conversion that changes nothing and names a type the value never has.
 test "a pointer element is read back with no integer between" {
     probe("sw_rp", src_reads())
-    let id = lower_expr(rhs_of("word_read"))
+    let id = element_of("word_read")
     assert_shape("shape", id, "Cast(CallRuntime(VarRef, VarRef))")
     assert_eq_str("element", ir_c_spelling(id), "const char*")
     assert_verifies("verify", id)
@@ -137,7 +155,7 @@ test "a pointer element is read back with no integer between" {
 // copy. The word belongs to the values that fit, so this read must not grow one.
 test "an element held behind a pointer is read through that pointer alone" {
     probe("sw_rb", src_reads())
-    let id = lower_expr(rhs_of("real_read"))
+    let id = element_of("real_read")
     assert_shape("shape", id, "Unbox(Cast(CallRuntime(VarRef, VarRef)))")
     assert_eq_str("slot", ir_c_spelling(ir_kid(id, 0)), "double*")
     assert_verifies("verify", id)
