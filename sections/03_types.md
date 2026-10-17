@@ -897,16 +897,44 @@ fn format_log() -> Str ! Time.Read {
 }
 ```
 
-**Instant** is an opaque type (§2.12.2), declared `pub opaque type Instant` in `std.time`. It has nanosecond precision. Code builds an `Instant` only through `time.read()` and its type-scoped functions, such as `Instant.from_epoch_secs` (§2.12.3).
+**Instant** is an opaque type (§2.12.2), declared `pub opaque type Instant` in `std.time`. It has nanosecond precision. Code builds an `Instant` only through `time.read()` and its type-scoped functions, such as `Instant.from_epoch_secs` and `Instant.parse` (§2.12.3).
+
+**The std.time range.** An `Instant` lies in the std.time range 1677-09-22T00:00:00Z ..= 2262-04-11T23:47:16.854775807Z. Every Instant constructor checks this range: `Instant.parse` returns `Err` outside it; `Instant.add` and `Instant.from_epoch_secs` panic outside it, as `Int` overflow does. The range starts on a whole day, so every `Instant` has a `Date` (*Date and Weekday* below). Calendar fields use the proleptic Gregorian calendar in UTC, with no leap seconds.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
 | `elapsed` | `fn(self) -> Duration ! Time.Read` | Time since this instant |
 | `since` | `fn(self, other: Instant) -> Duration` | Duration between two instants |
-| `add` | `fn(self, d: Duration) -> Instant` | Point in the future |
+| `add` | `fn(self, d: Duration) -> Instant` | This instant moved by `d` (`d` may be negative); panics outside the std.time range |
+| `date` | `fn(self) -> Date` | The UTC calendar day of this instant; total |
+| `hour` | `fn(self) -> Int` | UTC hour, 0..=23 |
+| `minute` | `fn(self) -> Int` | UTC minute, 0..=59 |
+| `second` | `fn(self) -> Int` | UTC second, 0..=59; the fraction is dropped |
 | `to_rfc3339` | `fn(self) -> Str` | RFC 3339 string in UTC, whole seconds only |
 | `to_unix_ms` | `fn(self) -> Int` | Milliseconds since epoch |
 | `to_unix_secs` | `fn(self) -> Int` | Seconds since epoch |
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `Instant.from_epoch_secs` | `fn(s: Int) -> Instant` | Panics outside the std.time range |
+| `Instant.parse` | `fn(s: Str) -> Result[Instant, ConversionError]` | Closed RFC 3339 grammar below; normalizes the offset to UTC |
+
+The calendar fields round down, as `Display` does: for 500 ms before the epoch, `date()` is 1969-12-31, `hour()` is 23 and `second()` is 59.
+
+**`Instant.parse` grammar.** `Instant.parse` accepts exactly this production, in ABNF (RFC 5234), and the whole text must match it:
+
+```
+date-time   = full-date ("T" / " ") full-time
+full-date   = year "-" month "-" day        ; 4DIGIT "-" 2DIGIT "-" 2DIGIT
+full-time   = hour ":" minute ":" second [fraction] time-offset
+hour        = 2DIGIT                        ; 00..23
+minute      = 2DIGIT                        ; 00..59
+second      = 2DIGIT                        ; 00..59
+fraction    = "." 1*9DIGIT
+time-offset = "Z" / ("+" / "-") hh ":" mm   ; hh 00..23, mm 00..59
+```
+
+The separator is an uppercase `T` or exactly one U+0020 SPACE. The offset is `Z` (uppercase) or a numeric offset, and the result is the same instant in UTC. Seconds are required. The fraction uses `.` and has 1 to 9 digits. Nothing outside this grammar is accepted: no lowercase `t` or `z`, no comma fraction, no missing seconds, no second `60`, no space before the offset, no text before or after. Widening it is a spec change. Text with no offset is an error that says how to fix it (*Errors* below), because a time with no offset does not name one instant.
 
 Instant implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. Does NOT implement arithmetic traits (sealed to built-in numerics). Use `.since()` and `.add()` named methods.
 
@@ -917,6 +945,104 @@ Instant's `Display` writes RFC 9557 in UTC with a `Z` offset: `2026-02-14T12:00:
 | Method | Signature | Notes |
 |--------|-----------|-------|
 | `since` | `fn(self, earlier: Monotonic) -> Duration` | Time from `earlier` to this reading; never negative when `earlier` was read first |
+
+##### Date and Weekday
+
+**Date** is an opaque type, declared `pub opaque type Date` in `std.time`. It is one day of the proleptic Gregorian calendar, with no time of day and no time zone. Its range is 1677-09-22 ..= 2262-04-11, the whole days of the std.time range. Code builds a `Date` only through `Date.from_ymd`, `Date.parse`, `instant.date()` and `add_days`.
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `Date.from_ymd` | `fn(y: Int, m: Int, d: Int) -> Result[Date, ConversionError]` | `m` is 1..=12; `d` is 1 to the last day of that month |
+| `Date.parse` | `fn(s: Str) -> Result[Date, ConversionError]` | `YYYY-MM-DD` only: 4 digits, `-`, 2 digits, `-`, 2 digits, nothing else |
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `year` | `fn(self) -> Int` | 1677..=2262 |
+| `month` | `fn(self) -> Int` | 1..=12 |
+| `day` | `fn(self) -> Int` | 1..=31 |
+| `weekday` | `fn(self) -> Weekday` | Day of the week |
+| `add_days` | `fn(self, n: Int) -> Date` | `n` may be negative; panics outside the Date range |
+| `days_since` | `fn(self, earlier: Date) -> Int` | Days from `earlier` to `self`; negative when `earlier` is later |
+| `to_instant` | `fn(self) -> Instant` | 00:00:00Z on this day; total |
+
+**Weekday** is a fieldless enum in `std.time`:
+
+```blink
+pub type Weekday { Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday }
+```
+
+`Weekday.Monday.to_int()` is 0 and `Weekday.Sunday.to_int()` is 6 (§3.4 *Tag Operations*). The ISO 8601 day number is `to_int() + 1`. `Display` writes the English name: `Monday`.
+
+Date and Weekday implement: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. `Debug` writes the same text as `Display`. `Date`'s `Display` writes `YYYY-MM-DD`: `2026-10-17`. Dates order by time, and weekdays order from Monday to Sunday.
+
+**Errors.** Each parse and constructor failure is `Err(ConversionError)`. Its `message` starts with `invalid date: ` (from `Date.from_ymd` and `Date.parse`) or `invalid timestamp: ` (from `Instant.parse`), then gives exactly one of these texts. The texts are fixed, and tests check them word for word.
+
+- **Syntax errors** give the byte offset, counted from 0, of the first byte that does not match the grammar:
+  - `expected X at byte N (found 'c')`, where `X` is one of `digit`, `'-'`, `':'`, `'T' or ' '`, `'Z', '+' or '-'`, and `c` is the character that starts at byte `N`. At the end of the text, `(found end of input)` replaces `(found 'c')`.
+  - `unexpected text at byte N (found 'c')`, for text after a complete value.
+  - `more than 9 fraction digits at byte N`, where `N` is the offset of the tenth digit.
+  - `no UTC offset at byte N; append Z if the time is UTC`, for `Instant.parse` text that ends where the offset starts.
+- **Field errors** name the field's range and give no offset:
+  - `month M out of range 1..12`
+  - `day D out of range 1..L for YYYY-MM`, where `L` is the last day of that month
+  - `hour H out of range 0..23`, `minute M out of range 0..59`, `second S out of range 0..59`
+  - `offset hour H out of range 0..23`, `offset minute M out of range 0..59`
+- **Range errors** name the std.time range and give no offset:
+  - `YYYY-MM-DD outside 1677-09-22..2262-04-11`
+  - `S outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z`, where `S` is the input text
+
+A check stops at the first error. Syntax comes first, then the fields from left to right, then the range, which `Instant.parse` checks after it applies the offset. In a `Date.from_ymd` message, the year is written as `y.display_zero_padded(4)` and the month and day with two digits. The panics use the same range text: `Date.add_days` panics with `date out of range: result outside 1677-09-22..2262-04-11`, and `Instant.add` and `Instant.from_epoch_secs` panic with `instant out of range: result outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z`.
+
+```blink
+Date.parse("2026-1-07")          // Err: "invalid date: expected digit at byte 6 (found '-')"
+Date.parse("2026-02-30")         // Err: "invalid date: day 30 out of range 1..28 for 2026-02"
+Date.from_ymd(1677, 9, 21)       // Err: "invalid date: 1677-09-21 outside 1677-09-22..2262-04-11"
+Instant.parse("2026-02-14t12:00:00Z")
+// Err: "invalid timestamp: expected 'T' or ' ' at byte 10 (found 't')"
+Instant.parse("2026-02-14 12:00:00")
+// Err: "invalid timestamp: no UTC offset at byte 19; append Z if the time is UTC"
+```
+
+**Laws.** For every `d: Date`, every `i: Instant` and every `n: Int` where `d.add_days(n)` is in range:
+
+- `Date.parse("{d}") == Ok(d)` and `Instant.parse("{i}") == Ok(i)`
+- `d.to_instant().date() == d`
+- `d.to_instant() <= i` exactly when `d <= i.date()`
+- `d.add_days(n).days_since(d) == n`
+
+The laws are on values. Text with an offset other than `Z`, a space separator or a fraction with trailing zeros does not round-trip as text: `Instant.parse("2026-02-14 12:00:00+01:00")` gives the instant whose `Display` is `2026-02-14T11:00:00Z`.
+
+```blink
+import std.time.{Instant, Date, Weekday}
+
+// Each line starts with a 20-byte stamp: "2026-10-17 09:30:00Z GET /"
+fn count_by_date(lines: List[Str]) -> Result[Map[Date, Int], ConversionError] {
+    let mut counts: Map[Date, Int] = Map()
+    for line in lines {
+        let d = Instant.parse(line.substring(0, 20))?.date()
+        counts.insert(d, (counts.get(d) ?? 0) + 1)
+    }
+    Ok(counts)
+}
+
+fn report(launch: Date) ! Time.Read, IO.Print {
+    let today = time.read().date()
+    io.println("{today} is a {today.weekday()}, {today.days_since(launch)} days after launch")
+    // 2026-10-17 is a Saturday, 245 days after launch
+}
+```
+
+Cut the stamp with `substring`, not `split(" ")`: a space separator splits the stamp in two.
+
+**Out of v1.** Each item below needs its own panel decision.
+
+- Time zones and zone names. `Instant` is UTC; an offset in parsed text is applied and then dropped.
+- `add_months` and `add_years`. Month ends have no single right answer (January 31 plus one month).
+- Format strings. Interpolate the accessors: `"{d.year()}/{d.month()}"`.
+- `today()`. Write `time.read().date()`, which shows the `Time.Read` effect at the call.
+- `day_of_year`.
+- Leap seconds. A second of `60` is a field error.
+- `and_time` or `at` to join a `Date` and a time of day. Write `d.to_instant().add(...)`.
 
 **Duration** is a typed time span. Named constructors enforce units at construction — no ambiguity between seconds and milliseconds.
 
@@ -949,7 +1075,11 @@ Duration's `Display` writes the same text as Go's `time.Duration.String`. A dura
 
 **Why stdlib Tier 2, not prelude.** Instant and Duration require no special syntax, no special desugaring, and no special inference rules. They are nominal types with named methods. The effect system's `Time.Read` and `Time.Sleep` operations reference these types, creating a coupling between compiler effects and stdlib, so the spec fixes these types as part of the effect specification. Not every program uses time operations. (Panel vote: 5-0.)
 
-**Wall-clock DateTime.** Calendar-aware datetime (year, month, day, timezone) lives in `std.time.DateTime`, constructed from an `Instant` via `DateTime.from(instant)`. Calendar decomposition carries unbounded complexity (timezones, DST, leap seconds) that belongs in stdlib, not built-in types.
+**Why Date and no DateTime.** An `Instant` is already a point in UTC, so a UTC `DateTime` would hold the same value under a second name, and each signature would have to choose one. `Instant` gets the time-of-day accessors, and `Date` is the one new value: a calendar day with no time. A zone-aware type needs time-zone data and its own panel; v1 has no zone support and reserves no name for it. (Panel vote: 6-0.)
+
+**Why the std.time range starts at 1677-09-22.** An `Int64` count of nanoseconds reaches back to 1677-09-21T00:12:43.145224192Z, part way through a day. If the range started there, `instant.date()` could give 1677-09-21, and `Date.to_instant()` on that date would have no midnight to return. Starting the range at the next whole day keeps both conversions total. The cost is one range check in `Instant.add` and `Instant.from_epoch_secs`, which panic on overflow anyway. (Panel vote: 5-1; Web/Scripting dissented, to keep the full `Int64` domain for `Instant` and reject only in the parsers.)
+
+**Why Monday is 0.** `Weekday` is a fieldless enum, and §3.4 gives the first variant the tag 0. Monday is first, as in ISO 8601. A second numbering method would give two numbers for one day; the ISO number is `to_int() + 1`. (Panel vote: 6-0.)
 
 ##### Bytes (compiler-known, §10.6)
 
@@ -1124,6 +1254,7 @@ UUID implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`, `Serialize`, 
 |------|----------|------|---------|-----------|
 | `Instant` | `std.time` | 2 | No | Effect return type, opaque, nanosecond precision |
 | `Duration` | `std.time` | 2 | No | Effect parameter type, named constructors eliminate unit confusion |
+| `Date`, `Weekday` | `std.time` | 2 | No | Calendar day with no time or zone; day of the week as a fieldless enum |
 | `Bytes` | `std.bytes` | 1 | No | Contiguous binary buffer for I/O, FFI, crypto |
 | `F32` | built-in | — | Yes | Sized numeric alongside I8–U64; `@ffi` maps it to C `float` |
 | `Decimal` | `std.decimal` | 2 | No | Exact decimal (38 digits) for financial arithmetic |
@@ -1698,7 +1829,7 @@ fn main() {
 
 This is what makes a single-payload enum a real newtype: `type Errno { Errno(Int) }` used as the error arm of `Result[Int, Errno]` cannot be confused with a plain `Int` count, which is the entire reason to prefer it over `Result[Int, Int]`.
 
-**Tag Operations.** Three operations use an enum's integer tag: comparison with an `Int`, `Enum.to_int()` and `Enum.from_int()`. They are defined only on a **fieldless enum**, an enum whose variants all have no payload.
+**Tag Operations.** Three operations use an enum's integer tag: comparison with an `Int`, `Enum.to_int()` and `Enum.from_int()`. They are defined only on a **fieldless enum**, an enum whose variants all have no payload. The first variant in the declaration has the tag 0, and each next variant has the tag one greater.
 
 - **Comparison with `Int`.** The comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) are defined between a fieldless enum and `Int`. They compare the enum's tag with the `Int` and yield `Bool`. This is a comparison, not an assignability claim, so it does not weaken the nominal distinctness above. A comparison of two values of the same fieldless enum is not a tag operation: it is the enum's `Ord` (§3.6 *Container Equality*, *Enum Ord*).
 - **Crossing the boundary is explicit.** To get the tag as an `Int`, use `Enum.to_int()` (total). To go the other way, use `Enum.from_int(n) -> Option[Enum]`. It is fallible, because an arbitrary `Int` may not be a valid tag. There is no implicit coercion and no cast operator.
