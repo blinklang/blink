@@ -23,7 +23,7 @@ import diagnostics.{
     diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
-    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path,
+    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
@@ -11828,7 +11828,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 // carry several disjoint Display impls (§3.6 coherence is per (Trait,
                 // TYPE)), so accumulate them all — the resolver tries each in turn.
                 match tc_display_impl_nodes.get(impl_type) {
-                    Some(lst) => { lst.push(im) }
+                    Some(lst) => {
+                        let mut impls = lst
+                        impls.push(im)
+                    }
                     None => {
                         let l: List[Int] = [im]
                         tc_display_impl_nodes.insert(impl_type, l)
@@ -12244,7 +12247,10 @@ type ImportBinding {
 pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int) {
     nr_drop_import_index(consuming_mod)
     match per_module_imports.get(consuming_mod) {
-        Some(imports) => imports.insert(source_mod, imp_node)
+        Some(imports) => {
+            let mut known = imports
+            known.insert(source_mod, imp_node)
+        }
         None => {
             let mut imports: Map[Str, Int] = Map()
             imports.insert(source_mod, imp_node)
@@ -22598,6 +22604,148 @@ fn tc_check_discarded_copy(val: Int) ! Diag.Report {
         val, "use the result: `{fix}`")
 }
 
+// The pattern site that holds `binder`: the destructuring `let` or the `for` it sits in, or the
+// top pattern of its match arm; -1 when none does. Only an error asks, so this scans rather than
+// keep a table for every binder. A site is parsed next to its pattern, so the scan starts at the
+// binder and works outward.
+fn tc_binder_site(binder: Int) -> Int {
+    let n = node_count()
+    let mut d = 1
+    while binder - d >= 0 || binder + d < n {
+        let below = tc_site_holding(binder - d, binder)
+        if below != -1 { return below }
+        let above = tc_site_holding(binder + d, binder)
+        if above != -1 { return above }
+        d = d + 1
+    }
+    -1
+}
+
+fn tc_site_holding(node: Int, binder: Int) -> Int {
+    if node < 0 || node >= node_count() { return -1 }
+    let k = node_kind(node)
+    if k == NodeKind.LetBinding && tc_pattern_holds(node_elements(node), binder) != 0 { return node }
+    if k == NodeKind.ForIn && (node_for_binder(node) == binder || tc_pattern_holds(node_elements(node), binder) != 0) { return node }
+    if k == NodeKind.MatchArm && tc_pattern_holds(node_pattern(node), binder) != 0 { return node_pattern(node) }
+    -1
+}
+
+// The pattern a site binds through: the site itself for a match arm.
+fn tc_site_pattern(site: Int) -> Int {
+    let k = node_kind(site)
+    if k == NodeKind.LetBinding || k == NodeKind.ForIn { node_elements(site) } else { site }
+}
+
+// 0 when `target` is not a node of pattern `pat`, 2 when an OR-pattern holds it, else 1.
+fn tc_pattern_holds(pat: Int, target: Int) -> Int {
+    if pat == -1 { return 0 }
+    if pat == target { return 1 }
+    let k = node_kind(pat)
+    let mut found = 0
+    if k == NodeKind.TuplePattern || k == NodeKind.ListPattern || k == NodeKind.OrPattern {
+        found = tc_patterns_hold(node_elements(pat), target)
+    } else if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
+        found = tc_patterns_hold(node_fields(pat), target)
+    } else if k == NodeKind.AsPattern || k == NodeKind.StructLitField {
+        found = tc_pattern_holds(node_pattern(pat), target)
+    }
+    if found != 0 && k == NodeKind.OrPattern { 2 } else { found }
+}
+
+fn tc_patterns_hold(sl: Int, target: Int) -> Int {
+    if sl == -1 { return 0 }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let found = tc_pattern_holds(sublist_get(sl, i), target)
+        if found != 0 { return found }
+        i = i + 1
+    }
+    0
+}
+
+// The pattern that holds `binder`, as the user wrote it, with `mut ` before the binder: `let (mut
+// a, b)`, `for (k, mut v) in pairs`, `Point { mut x, .. }`. "" when the pattern spans lines or the
+// source cannot be read, so the caller falls back to a help with no quote.
+fn tc_binder_fix_preview(binder: Int, site: Int) -> Str {
+    if site == -1 { return "" }
+    let line = node_line(binder)
+    let col = node_col(binder)
+    if node_line(site) != line || node_col(site) > col { return "" }
+    let sk = node_kind(site)
+    let mut end_line = node_end_line(site)
+    let mut end_col = node_end_col(site)
+    if sk == NodeKind.LetBinding {
+        let pat = node_elements(site)
+        end_line = node_end_line(pat)
+        end_col = node_end_col(pat)
+    } else if sk == NodeKind.ForIn {
+        // A `for` ends at its body, so the quote runs up to the body's `{`.
+        let body = node_body(site)
+        if body == -1 { return "" }
+        end_line = node_line(body)
+        end_col = node_col(body)
+    }
+    if end_line != line || end_col <= col { return "" }
+    let text = diag_source_line(diag_file_for_node(binder), line)
+    if end_col - 1 > text.byte_len() { return "" }
+    "{text.byte_slice(node_col(site) - 1, col - 1)}mut {text.byte_slice(col - 1, end_col - 1).trim()}"
+}
+
+// E0610 for a write or a mutating call whose root `name` is a pattern binder with no `mut`: a name
+// of a destructuring `let`, of a `for` or match pattern, an `as` name, or the name after `with ...
+// as` (sections/03_types.md §3.5 *Mutable Binders*). False when the root is not such a binder, so
+// the caller goes on to its own cases. A parameter is not a binder here: its root is another case.
+fn tc_report_immutable_binder(name: Str, message: Str, at: Int) -> Bool ! Diag.Report {
+    let idx = nr_top_index(name)
+    if idx == -1 { return false }
+    if nr_scope_muts.get(idx).unwrap() != 0 { return false }
+    let decl = nr_scope_nodes.get(idx).unwrap()
+    if decl < 0 { return false }
+    let k = node_kind(decl)
+    let mut notes = ["declared here: `{name}` in the pattern at line {node_line(decl)}"]
+    if nr_index_is_global(idx) != 0 {
+        // Every module's globals share one flat scope, so the binder must be this module's own
+        // module-level `let` leaf.
+        if k != NodeKind.IdentPattern || tc_module_let_decl_node(nr_current_module, name) != decl { return false }
+        let preview = tc_binder_fix_preview(decl, tc_binder_site(decl))
+        let edit = if preview != "" { "write `{preview}`" } else { "add `mut` before `{name}` in its pattern" }
+        tc_errors.push(message)
+        diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at,
+            "{edit} only if it must change: `mut` adds `State` to the row of each function that reads or writes it (§4.16)", notes)
+        return true
+    }
+    if k == NodeKind.WithResource {
+        notes = ["declared here: `with ... as {name}` at line {node_line(decl)}"]
+        tc_errors.push(message)
+        diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at,
+            "bind a new `let mut` name inside the block; the name after `as` is never `mut` (§2.18)", notes)
+        return true
+    }
+    if k != NodeKind.IdentPattern && k != NodeKind.AsPattern && k != NodeKind.StructLitField { return false }
+    let site = tc_binder_site(decl)
+    // Name resolution does not bind an OR-pattern's names yet, so a write to one is already
+    // UndefinedVariable, and one `mut` would not fix it: each alternative binds the name.
+    if site != -1 && tc_pattern_holds(tc_site_pattern(site), decl) == 2 { return false }
+    let preview = tc_binder_fix_preview(decl, site)
+    let in_closure = tc_closure_scope_base.len() > 0 && idx < tc_closure_scope_base.get(tc_closure_scope_base.len() - 1).unwrap()
+    if in_closure { notes.push("captured here: the closure that makes this write captures `{name}`") }
+    let line = node_line(decl)
+    let col = node_col(decl)
+    // The fix rewrites the binder's own name, so each write to one binder gives the same edit. It
+    // is withheld only when the source is readable and the name is not where the node says.
+    let text = diag_source_line(diag_file_for_node(decl), line)
+    let name_end = col - 1 + name.byte_len()
+    let at_name = text == "" || (name_end <= text.byte_len() && text.byte_slice(col - 1, name_end) == name)
+    let help = if preview != "" { "declare it `mut` where the pattern binds it: `{preview}`" } else { "declare it `mut` where the pattern binds it: `mut {name}`" }
+    tc_errors.push(message)
+    let before = diag_entry_count()
+    diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at, help, notes)
+    if at_name && diag_entry_count() > before {
+        diag_set_last_fix_at("insert `mut`", "mut {name}", line, col, line, col + name.byte_len())
+    }
+    true
+}
+
 // sections/03_types.md:302 — "Mutating methods require the binding to be `let mut`", with
 // `names.push("Dave")  // COMPILE ERROR` at :316. The rationale at :320 is that `grep "let
 // mut"` must find every mutation source, so the check has to key on the BINDING, which is
@@ -22608,19 +22756,19 @@ fn tc_check_discarded_copy(val: Int) ! Diag.Report {
 // List[Int]) { xs.push(9) }` mutates the caller's list — and whether the rule reaches there
 // is a live spec question, so params are left alone. nr_is_mut answers 0 for a
 // param exactly as it does for a plain `let`, so is_mut alone cannot tell them apart: the
-// binder identity has to come from the decl node, which only the `let` binder records. That
-// same guard leaves match/for/with binders and closure params out, each of which is its own
-// question the spec's text does not reach.
+// binder identity has to come from the decl node. A pattern binder and the name after `with ...
+// as` go to tc_report_immutable_binder, as a write does.
 fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
     if obj == -1 { return }
     if node_kind(obj) != NodeKind.Ident { return }
     let name = node_name(obj)
     if nr_has_binding(name) == 0 { return }
     if nr_is_mut(name) != 0 { return }
-    let decl = nr_binding_node(name)
-    if decl == -1 || node_kind(decl) != NodeKind.LetBinding { return }
     let method = node_method(node)
     if tc_is_mutating_collection_method(type_kind(resolve_alias_tid(obj_t)), method) == 0 { return }
+    if tc_report_immutable_binder(name, "cannot call mutating method `.{method}` on immutable binding `{name}`", node) { return }
+    let decl = nr_binding_node(name)
+    if decl == -1 || node_kind(decl) != NodeKind.LetBinding { return }
     tc_errors.push("cannot call mutating method `{method}` on immutable binding `{name}`")
     // The span points at the CALL, because that is what the reader is looking at, so the help
     // has to carry the line of the `let` — otherwise a long function makes the reader hunt for
@@ -22631,7 +22779,7 @@ fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
 // §2.22 *Writes that are not to a place*, case 4: `=` or `op=` whose root is a plain `let`.
 // Runs once the path's types are known, since the cases before it in the spec's order -- a
 // `Ptr` step, a temporary root, a parameter root -- are other errors and take the write. A
-// pattern binder and the name after `with ... as` are left alone here too.
+// pattern binder and the name after `with ... as` go to tc_report_immutable_binder.
 fn tc_check_assign_root(target: Int) ! Diag.Report {
     let mut root = target
     while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
@@ -22644,6 +22792,8 @@ fn tc_check_assign_root(target: Int) ! Diag.Report {
     let name = node_name(root)
     let idx = nr_top_index(name)
     if idx == -1 { return }
+    let message = if root == target { "cannot assign to `{name}`, which is not `mut`" } else { "cannot assign to `{unparse_expr(target)}`, whose root `{name}` is not `mut`" }
+    if tc_report_immutable_binder(name, message, target) { return }
     let global = nr_index_is_global(idx) != 0
     // Every module's globals share one flat scope, so the newest spelling may be another
     // module's; the declaration this module sees decides.
@@ -22652,7 +22802,6 @@ fn tc_check_assign_root(target: Int) ! Diag.Report {
     let is_mut = if global { node_is_mut(decl) } else { nr_scope_muts.get(idx).unwrap() }
     if is_mut != 0 { return }
     if node_elements(decl) != -1 || node_is_const(decl) != 0 { return }
-    let message = if root == target { "cannot assign to `{name}`, which is not `mut`" } else { "cannot assign to `{unparse_expr(target)}`, whose root `{name}` is not `mut`" }
     let mut notes = ["declared here: `let {name}` at line {node_line(decl)}"]
     let decl_module = node_module(decl)
     let imported = global && decl_module != "" && decl_module != nr_current_module

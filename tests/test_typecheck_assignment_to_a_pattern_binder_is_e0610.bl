@@ -1,0 +1,419 @@
+// A mutation whose root is a pattern binder with no `mut` is `error[E0610]
+// MutationRequiresMut` (sections/03_types.md §3.5 *Mutable Binders*; §3.2.2 *Construction and
+// Mutability*; sections/02_syntax.md §2.22 *Writes that are not to a place*, case 4). That is
+// `=`, `op=` or a mutating method call, through a name of a destructuring `let`, a `for`
+// pattern, a match arm or the name before `as`. For a local binder the fix inserts `mut`
+// before the binder where the pattern declares it, and the help shows the pattern after the
+// edit. A leaf of a module-level destructuring `let` and the name after `with ... as` get help
+// only.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help} | notes: {d.notes.join(\"; \")} | fix: {d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}")
+        }
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for e in errors() { io.println("  {e}") }
+}
+
+fn e0610_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.code == "E0610" { n += 1 }
+    }
+    n
+}
+
+// `n` E0610 errors and no other error, each with `message`, a help that shows `edited`, and a
+// fix that replaces `name` at line:col with `mut name`.
+fn expect_binder(label: Str, n: Int, message: Str, edited: Str, name: Str, line: Int, col: Int) {
+    let mut ok = e0610_count() == n && errors().len() == n
+    for d in diag_entries {
+        if d.severity == "error" && d.code == "E0610" {
+            if d.name != "MutationRequiresMut" || d.message != message { ok = false }
+            if !d.help.contains("`{edited}`") { ok = false }
+            if d.fix_action != "insert `mut`" || d.fix_text != "mut {name}" { ok = false }
+            if d.fix_line != line || d.fix_col != col { ok = false }
+            if d.fix_end_line != line || d.fix_end_col != col + name.byte_len() { ok = false }
+            if !d.notes.join("\n").contains("declared here") { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+// One E0610 and no other error, with help only: no fix.
+fn expect_help_only(label: Str, message: Str, help_part: Str) {
+    let mut ok = e0610_count() == 1 && errors().len() == 1
+    for d in diag_entries {
+        if d.severity == "error" && d.code == "E0610" {
+            if d.message != message || !d.help.contains(help_part) { ok = false }
+            if d.fix_action != "" || d.fix_text != "" { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_clean(label: Str) {
+    if errors().len() != 0 { show(label) }
+    assert_eq(errors().len(), 0)
+}
+
+test "a name of a destructuring let given a new value is E0610 with a fix at the binder" {
+    probe("build/pbind_let.bl", #"
+fn main() {
+    let (a, b) = (1, 2)
+    a = 5
+    let _ = a + b
+}
+"#)
+    expect_binder("a = 5", 1, "cannot assign to `a`, which is not `mut`", "let (mut a, b)", "a", 3, 10)
+}
+
+test "a compound assignment to a field of a destructured name is E0610" {
+    probe("build/pbind_let_field.bl", #"
+type Pt { x: Int }
+
+fn main() {
+    let (p, n) = (Pt { x: 1 }, 2)
+    p.x += n
+    let _ = p.x
+}
+"#)
+    expect_binder("p.x += n", 1, "cannot assign to `p.x`, whose root `p` is not `mut`", "let (mut p, n)", "p", 5, 10)
+}
+
+test "a name of a nested destructuring let is E0610" {
+    probe("build/pbind_let_nested.bl", #"
+fn main() {
+    let ((a, b), c) = ((1, 2), 3)
+    b -= c
+    let _ = a + b
+}
+"#)
+    expect_binder("b -= c", 1, "cannot assign to `b`, which is not `mut`", "let ((a, mut b), c)", "b", 3, 14)
+}
+
+test "a name of a for pattern is E0610 and the help shows the for line" {
+    probe("build/pbind_for_tuple.bl", #"
+fn main() {
+    let pairs = [(1, 2)]
+    for (k, v) in pairs {
+        v += k
+        let _ = v
+    }
+}
+"#)
+    expect_binder("v += k", 1, "cannot assign to `v`, which is not `mut`", "for (k, mut v) in pairs", "v", 4, 13)
+}
+
+test "the simple for binder is E0610" {
+    probe("build/pbind_for_simple.bl", #"
+fn main() {
+    for i in [1, 2] {
+        i = i * 2
+        let _ = i
+    }
+}
+"#)
+    expect_binder("i = i * 2", 1, "cannot assign to `i`, which is not `mut`", "for mut i in [1, 2]", "i", 3, 9)
+}
+
+test "a match arm binder is E0610 and the help shows the arm pattern" {
+    probe("build/pbind_match.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    match o {
+        Some(n) => {
+            n *= 2
+            let _ = n
+        }
+        None => {}
+    }
+}
+"#)
+    expect_binder("n *= 2", 1, "cannot assign to `n`, which is not `mut`", "Some(mut n)", "n", 5, 14)
+}
+
+test "a renamed struct field binder is E0610" {
+    probe("build/pbind_struct_renamed.bl", #"
+type Point { x: Int, y: Int }
+
+fn main() {
+    let p = Point { x: 1, y: 2 }
+    match p {
+        Point { x: px, .. } => {
+            px = 0
+            let _ = px
+        }
+    }
+}
+"#)
+    expect_binder("px = 0", 1, "cannot assign to `px`, which is not `mut`", #"Point { x: mut px, .. }"#, "px", 7, 20)
+}
+
+test "a punned struct field binder is E0610 and the fix puts mut before the field name" {
+    probe("build/pbind_struct_punned.bl", #"
+type Point { x: Int, y: Int }
+
+fn main() {
+    let p = Point { x: 1, y: 2 }
+    match p {
+        Point { x, .. } => {
+            x = 0
+            let _ = x
+        }
+    }
+}
+"#)
+    expect_binder("x = 0", 1, "cannot assign to `x`, which is not `mut`", #"Point { mut x, .. }"#, "x", 7, 17)
+}
+
+test "a punned field of a variant struct pattern is E0610" {
+    probe("build/pbind_variant_struct.bl", #"
+type Shape {
+    Circle(Int)
+    Rect { w: Int, h: Int }
+}
+
+fn main() {
+    let s = Shape.Rect { w: 1, h: 2 }
+    match s {
+        Shape.Rect { w, h } => {
+            w += h
+            let _ = w
+        }
+        Shape.Circle(_) => {}
+    }
+}
+"#)
+    expect_binder("w += h", 1, "cannot assign to `w`, which is not `mut`", #"Shape.Rect { mut w, h }"#, "w", 10, 22)
+}
+
+test "the name before as is E0610" {
+    probe("build/pbind_as.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    match o {
+        whole as Some(q) => {
+            whole = None
+            let _ = whole
+            let _ = q
+        }
+        None => {}
+    }
+}
+"#)
+    expect_binder("whole = None", 1, "cannot assign to `whole`, which is not `mut`", "mut whole as Some(q)", "whole", 5, 9)
+}
+
+test "two writes to one binder give the same edit" {
+    probe("build/pbind_two_writes.bl", #"
+fn main() {
+    let (n, m) = (0, 1)
+    n = 1
+    n += m
+    let _ = n
+}
+"#)
+    expect_binder("n = 1; n += m", 2, "cannot assign to `n`, which is not `mut`", "let (mut n, m)", "n", 3, 10)
+}
+
+test "a closure that assigns to a captured binder is E0610 with a capture note" {
+    probe("build/pbind_closure.bl", #"
+fn main() {
+    for t in [1] {
+        let add = fn(n: Int) {
+            t = t + n
+        }
+        add(1)
+        let _ = t
+    }
+}
+"#)
+    expect_binder("t = t + n", 1, "cannot assign to `t`, which is not `mut`", "for mut t in [1]", "t", 3, 9)
+    let mut captured = false
+    for d in diag_entries {
+        if d.code == "E0610" && d.notes.join("\n").contains("captured here") { captured = true }
+    }
+    if !captured { show("captured here") }
+    assert(captured)
+}
+
+test "a mutating method call on a pattern binder is E0610 with the same fix" {
+    probe("build/pbind_method.bl", #"
+fn main() {
+    let lists = [[1], [2]]
+    for l in lists {
+        l.push(3)
+    }
+    let pair: (List[Int], Int) = ([1], 2)
+    let (xs, n) = pair
+    xs.push(n)
+}
+"#)
+    let mut ok = e0610_count() == 2 && errors().len() == 2
+    let mut seen: List[Str] = []
+    for d in diag_entries {
+        if d.code == "E0610" {
+            seen.push("{d.message} | {d.fix_text} {d.fix_line}:{d.fix_col}")
+            if d.fix_action != "insert `mut`" { ok = false }
+        }
+    }
+    if seen.len() != 2 { ok = false }
+    if ok {
+        if seen.get(0).unwrap() != "cannot call mutating method `.push` on immutable binding `l` | mut l 4:9" { ok = false }
+        if seen.get(1).unwrap() != "cannot call mutating method `.push` on immutable binding `xs` | mut xs 8:10" { ok = false }
+    }
+    if !ok { show("l.push(3); xs.push(n)") }
+    assert(ok)
+}
+
+test "a leaf of a module-level destructuring let gets help only, naming State" {
+    probe("build/pbind_module_let.bl", #"
+let (ga, gb) = (1, 2)
+
+fn main() {
+    ga = gb
+}
+"#)
+    expect_help_only("ga = gb", "cannot assign to `ga`, which is not `mut`", "`State`")
+}
+
+test "the name after with as gets help only: bind a new let mut name" {
+    probe("build/pbind_with.bl", #"
+import std.traits
+
+type Res { n: Int }
+
+impl Closeable for Res {
+    fn close(self) {}
+}
+
+fn main() {
+    with Res { n: 1 } as r {
+        r = Res { n: 2 }
+        let _ = r.n
+    }
+}
+"#)
+    expect_help_only("r = Res", "cannot assign to `r`, which is not `mut`", "bind a new `let mut` name inside the block")
+}
+
+test "mut binders and let mut patterns given new values stay clean" {
+    probe("build/pbind_clean.bl", #"
+type Point { x: Int, y: Int }
+
+fn main() {
+    let (mut c, d) = (1, 2)
+    c = d
+    let mut (e, f) = (1, 2)
+    e = f
+    f += 1
+    let pairs = [(1, 2)]
+    for (k, mut v) in pairs {
+        v += k
+        let _ = v
+    }
+    for mut i in [1] {
+        i = 2
+        let _ = i
+    }
+    let o: Int? = Some(1)
+    match o {
+        Some(mut n) => {
+            n = 2
+            let _ = n
+        }
+        None => {}
+    }
+    let p = Point { x: 1, y: 2 }
+    match p {
+        Point { mut x, y: mut py } => {
+            x = 0
+            py = 0
+            let _ = x + py
+        }
+    }
+    let lists = [[1]]
+    for mut l in lists {
+        l.push(2)
+    }
+    let _ = c + e + f
+}
+"#)
+    expect_clean("mut binders")
+}
+
+test "a binder that an E0613 fix marks mut gets no E0610 as well" {
+    probe("build/pbind_after_e0613.bl", #"
+fn main() {
+    let (mut (a, b), c) = ((1, 2), 3)
+    a = b + c
+    let _ = a
+}
+"#)
+    let mut ok = e0610_count() == 0 && errors().len() == 1
+    for d in diag_entries {
+        if d.severity == "error" && d.code != "E0613" { ok = false }
+    }
+    if !ok { show("mut (a, b)") }
+    assert(ok)
+}
+
+test "a binder that is only read is clean" {
+    probe("build/pbind_read_only.bl", #"
+fn main() {
+    let (a, b) = (1, 2)
+    for (k, v) in [(a, b)] {
+        let _ = k + v
+    }
+}
+"#)
+    expect_clean("read only")
+}
+
+// An OR-pattern binds no name yet: name resolution reports a name an arm body uses as
+// undefined, and one `mut` would not fix a write, so it is not E0610 as well. Once alternatives
+// bind names, the E0610 fix must edit every alternative, and this test must change with that
+// work.
+test "an OR-pattern binds no name yet, so a write in its arm is not E0610" {
+    probe("build/pbind_or.bl", #"
+type Shape { Circle(Int), Rect(Int, Int) }
+
+fn main() {
+    let s = Shape.Circle(1)
+    match s {
+        Shape.Circle(r) | Shape.Rect(r, _) => { r = 9 }
+    }
+}
+"#)
+    let mut undefined = false
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UndefinedVariable" { undefined = true }
+    }
+    if e0610_count() != 0 || !undefined { show("OR-pattern") }
+    assert_eq(e0610_count(), 0)
+    assert(undefined)
+}
