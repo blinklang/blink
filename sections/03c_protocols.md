@@ -525,6 +525,8 @@ let n = Int.from(c)        // 65 (equivalent, via From trait)
 fn to_number[T: From[Char]](c: Char) -> T { T.from(c) }
 ```
 
+To read a digit character as its numeric value, use `c.to_digit(radix)` (§3.2.4), not `c.to_int() - '0'.to_int()`: `'7'.to_digit(10)` is `Some(7)`, and a non-digit gives `None`.
+
 **Note.** `.to_int()` returns the Unicode codepoint value, not an ASCII code. For ASCII characters the values coincide, but `'é'.to_int()` returns `233`, not an error. `Char` does not implement `Add`, `Sub`, or other arithmetic traits — use `.to_int()` to perform arithmetic on codepoint values, then convert back.
 
 ##### Int → Char (Fallible — `TryFrom`)

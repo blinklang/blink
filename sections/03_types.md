@@ -162,8 +162,16 @@ trait StrOps {
     fn to_upper(self) -> Str
     fn to_lower(self) -> Str
     fn trim(self) -> Str
-    fn trim_left(self) -> Str
-    fn trim_right(self) -> Str
+    fn trim_start(self) -> Str
+    fn trim_end(self) -> Str
+    fn trim_by(self, pred: fn(Char) -> Bool ! _) -> Str ! _
+    fn trim_start_by(self, pred: fn(Char) -> Bool ! _) -> Str ! _
+    fn trim_end_by(self, pred: fn(Char) -> Bool ! _) -> Str ! _
+    fn strip_prefix(self, prefix: Str) -> Option[Str]
+    fn strip_suffix(self, suffix: Str) -> Option[Str]
+    fn pad_start(self, width: Int, fill: Char) -> Str
+    fn pad_end(self, width: Int, fill: Char) -> Str
+    fn repeat(self, n: Int) -> Str
     fn replace(self, needle: Str, replacement: Str) -> Str
 
     // Parsing
@@ -172,7 +180,7 @@ trait StrOps {
 }
 ```
 
-The full method surface (15 core methods from `Sized` + `StrOps`, plus byte-access and parsing):
+The full method surface (`Sized` + `StrOps`):
 
 | Method | Signature | Returns |
 |--------|-----------|---------|
@@ -187,9 +195,17 @@ The full method surface (15 core methods from `Sized` + `StrOps`, plus byte-acce
 | `split` | `fn(self, Str) -> List[Str]` | Split by separator |
 | `to_upper` | `fn(self) -> Str` | Uppercase (Unicode-aware) |
 | `to_lower` | `fn(self) -> Str` | Lowercase (Unicode-aware) |
-| `trim` | `fn(self) -> Str` | Strip leading/trailing whitespace |
-| `trim_left` | `fn(self) -> Str` | Strip leading whitespace only |
-| `trim_right` | `fn(self) -> Str` | Strip trailing whitespace only |
+| `trim` | `fn(self) -> Str` | Strip leading and trailing whitespace (`Char.is_whitespace`) |
+| `trim_start` | `fn(self) -> Str` | Strip leading whitespace only |
+| `trim_end` | `fn(self) -> Str` | Strip trailing whitespace only |
+| `trim_by` | `fn(self, fn(Char) -> Bool ! _) -> Str ! _` | Strip leading and trailing codepoints that match the predicate |
+| `trim_start_by` | `fn(self, fn(Char) -> Bool ! _) -> Str ! _` | Strip leading codepoints that match the predicate |
+| `trim_end_by` | `fn(self, fn(Char) -> Bool ! _) -> Str ! _` | Strip trailing codepoints that match the predicate |
+| `strip_prefix` | `fn(self, Str) -> Option[Str]` | The rest after the prefix; `None` when `self` does not start with it |
+| `strip_suffix` | `fn(self, Str) -> Option[Str]` | The rest before the suffix; `None` when `self` does not end with it |
+| `pad_start` | `fn(self, Int, Char) -> Str` | Fill before the text up to `width` codepoints; never truncates |
+| `pad_end` | `fn(self, Int, Char) -> Str` | Fill after the text up to `width` codepoints; never truncates |
+| `repeat` | `fn(self, Int) -> Str` | `n` copies of `self`; panics when `n < 0` |
 | `replace` | `fn(self, Str, Str) -> Str` | Replace all occurrences |
 | `index_of` | `fn(self, Str) -> Option[Int]` | Codepoint index of first match |
 | `lines` | `fn(self) -> List[Str]` | Split by line endings |
@@ -295,6 +311,53 @@ for c in "hello" {
 
 // Or explicitly via .into_iter()
 let vowels = "hello".into_iter().filter(fn(c) { "aeiou".contains("{c}") }).collect()
+```
+
+##### Trim, Strip, Pad and Repeat
+
+Methods that work on one side of a string name the side `start` (the first codepoint) and `end` (the last codepoint): `trim_start`, `trim_end`, `trim_start_by`, `trim_end_by`, `pad_start`, `pad_end`. The names do not say `left` or `right`. There is no `trim_left` or `trim_right` method; a call to either is `UnresolvedMethod` (E0505) with a help line that names `trim_start` or `trim_end`. (Panel vote: 6-0.)
+
+**Whitespace.** `trim`, `trim_start` and `trim_end` strip exactly the codepoints for which `Char.is_whitespace` is true: the 25 codepoints of the Unicode `White_Space` property (§3.2.4). That set includes `\t`, `\n`, `\r`, U+000B, U+000C, U+0085 and U+00A0 as well as space. For every `s`:
+
+- `s.trim() == s.trim_by(fn(c) { c.is_whitespace() })`
+- `s.trim_start() == s.trim_start_by(fn(c) { c.is_whitespace() })`
+- `s.trim_end() == s.trim_end_by(fn(c) { c.is_whitespace() })`
+
+**Trim by predicate.** `trim_start_by(pred)` removes codepoints from the start while `pred` returns `true`, and stops at the first codepoint for which it returns `false`. `trim_end_by` does the same from the end. `trim_by` does both. The predicate sees each codepoint as a `Char`. To strip a fixed set of codepoints, test membership in the predicate:
+
+```blink
+let path = "//usr/lib//".trim_by(fn(c) { c == '/' })      // "usr/lib"
+let n = "0042".trim_start_by(fn(c) { c == '0' })          // "42"
+let word = "--a-b--".trim_by(fn(c) { "-_".contains("{c}") }) // "a-b"
+```
+
+**Strip a prefix or suffix.** `strip_prefix(p)` returns `Some(rest)` when `self` starts with `p`, where `rest` is `self` without that one leading `p`. It returns `None` when `self` does not start with `p`. `strip_suffix` is the same at the end. An empty argument gives `Some(self)`. For every `s` and `p`: `s.strip_prefix(p)` is `Some(r)` exactly when `s.starts_with(p)`, and then `p.concat(r) == s`.
+
+```blink
+"v1.2.0".strip_prefix("v")       // Some("1.2.0")
+"1.2.0".strip_prefix("v")        // None
+"main.bl".strip_suffix(".bl")    // Some("main")
+"aaa".strip_prefix("a")          // Some("aa") (one copy only)
+```
+
+**Pad.** `pad_start(width, fill)` puts copies of `fill` before `self` until the result has `width` codepoints. `pad_end` puts them after `self`. The `fill` argument is a required `Char`. `width` counts codepoints, the same unit as `len()`. A pad never truncates: when `width <= self.len()`, a negative `width` included, the result is `self`. For every `s`, `w` and `c`: `s.pad_start(w, c).len() == w.max(s.len())`.
+
+```blink
+"7".pad_start(3, '0')      // "007"
+"ab".pad_end(5, '.')       // "ab..."
+"hello".pad_start(3, ' ')  // "hello" (never truncates)
+```
+
+`width` counts codepoints, not terminal columns. A wide CJK character or an emoji takes two columns in most terminals but counts as one codepoint, so a padded table that holds them does not line up on screen.
+
+`pad_start` with `'0'` does not know about a sign: `"-7".pad_start(3, '0')` is `"0-7"`. To zero-pad an `Int`, use `Int.display_zero_padded` (§3.6.1 *Fixed-Decimal and Zero-Padded Forms*), which puts the zeros after the sign.
+
+**Repeat.** `s.repeat(n)` returns `n` copies of `s`, one after the other. `n == 0` gives `""`. `n < 0` panics: the panic message names the count, and its help names `pad_start` and `pad_end`, because a negative count most often comes from `" ".repeat(width - s.len())` on text wider than `width`. When `self.byte_len() * n` overflows `Int`, the call panics. For every `s` and `n >= 0`: `s.repeat(n).len() == s.len() * n`. (Panel vote: 4-2 after Phase D, Web and AI/ML dissented wanting `n <= 0` to give `""`.)
+
+```blink
+"ab".repeat(3)        // "ababab"
+"-".repeat(0)         // ""
+"-".repeat(-1)        // panics: repeat count -1 is negative
 ```
 
 ##### Parsing
@@ -1214,6 +1277,87 @@ The compiler performs range checking on all constant expressions assigned to siz
 **Why no literal suffixes.** Languages like Rust use `42u8`, `100i32`, etc. Blink omits suffixes because (1) function signatures already provide the context -- `fn process(val: U8)` makes `process(200)` unambiguous; (2) suffixes add visual noise to a language designed for readability; (3) the rare case where disambiguation is needed can use a type annotation: `let x: U8 = 42`. (Panel vote: 4-1, Systems expert preferred constructor syntax `U8(42)`.)
 
 **Why not refinement types.** Sized integers are not `Int @where(self >= 0 && self <= 255)`. A refined `Int` is still an `Int`: it has the 64-bit range and overflow of `Int`. `U8` has an 8-bit range and maps to C `uint8_t` in `@ffi` signatures. The overflow and bitwise semantics also differ by width: `U8(255) + U8(1)` wraps to 0 (with `wrapping_add`), while a refined `Int` would just be 256. These are fundamentally different kinds of types serving different purposes. (Panel vote: 5-0.)
+
+#### §3.2.4 Char Methods
+
+`Char` classifies and converts a codepoint through methods on `Char`. There is no `std.char` module and no free-function form (§3.2, *Stdlib API surface: methods only*). Conversions between `Char`, `Int` and `Str` are in §3c.3 *Char Conversions*.
+
+| Method | Signature | True for |
+|--------|-----------|----------|
+| `is_ascii` | `fn(self) -> Bool` | Codepoints 0 to 127 (`0..=127`) |
+| `is_ascii_digit` | `fn(self) -> Bool` | `'0'..='9'` |
+| `is_ascii_alpha` | `fn(self) -> Bool` | `'A'..='Z'` and `'a'..='z'` |
+| `is_ascii_alphanumeric` | `fn(self) -> Bool` | `is_ascii_digit` or `is_ascii_alpha` |
+| `is_ascii_upper` | `fn(self) -> Bool` | `'A'..='Z'` |
+| `is_ascii_lower` | `fn(self) -> Bool` | `'a'..='z'` |
+| `is_whitespace` | `fn(self) -> Bool` | The 25 codepoints of the Unicode `White_Space` property (below) |
+| `to_digit` | `fn(self, Int) -> Option[Int]` | — (returns the digit value in a radix; see below) |
+
+An `is_ascii_*` method is false for every codepoint above 127. The name says so, because a letter outside ASCII is still a letter: `'É'.is_ascii_upper()` is `false`, and `'é'.is_ascii_alpha()` is `false`.
+
+`is_whitespace` is true for exactly these codepoints, and these are the codepoints that `trim`, `trim_start` and `trim_end` strip (§3.2.1 *Trim, Strip, Pad and Repeat*):
+
+| Codepoints | Names |
+|------------|-------|
+| U+0009–U+000D | tab, line feed, vertical tab, form feed, carriage return |
+| U+0020 | space |
+| U+0085 | next line |
+| U+00A0 | no-break space |
+| U+1680 | Ogham space mark |
+| U+2000–U+200A | en quad to hair space (11 codepoints) |
+| U+2028 | line separator |
+| U+2029 | paragraph separator |
+| U+202F | narrow no-break space |
+| U+205F | medium mathematical space |
+| U+3000 | ideographic space |
+
+There is no `is_ascii_whitespace`.
+
+`c.to_digit(radix)` returns the value of `c` as one digit in base `radix`. `'0'..='9'` have the values 0 to 9, and `'a'..='z'` and `'A'..='Z'` have the values 10 to 35. The result is `Some(value)` when that value is less than `radix`, and `None` otherwise, including for every codepoint outside ASCII. A `radix` outside `2..=36` panics.
+
+```blink
+'7'.to_digit(10)     // Some(7)
+'f'.to_digit(16)     // Some(15)
+'F'.to_digit(16)     // Some(15)
+'9'.to_digit(8)      // None
+'x'.to_digit(10)     // None
+'1'.to_digit(37)     // panics: radix 37 is outside 2..=36
+```
+
+```blink
+fn digit_sum(s: Str) -> Int {
+    let mut total = 0
+    for c in s {
+        total += c.to_digit(10) ?? 0
+    }
+    total
+}
+```
+
+(Panel votes: names and the whitespace set 6-0; `is_ascii_upper`/`is_ascii_lower` 5-1 and `is_ascii` 5-1, Minimalism dissented both times; `to_digit` 6-0.)
+
+#### §3.2.5 Float Rounding
+
+`Float` has three rounding methods. Each takes no argument and returns a `Float`, so the result keeps NaN and the infinities. To get an `Int`, call `.truncate()` on the result (§3c.3).
+
+| Method | Signature | Result |
+|--------|-----------|--------|
+| `round` | `fn(self) -> Float` | The nearest integer value; a tie goes away from zero (IEEE 754 `roundToIntegralTiesToAway`) |
+| `floor` | `fn(self) -> Float` | The largest integer value `<= self` (IEEE 754 `roundToIntegralTowardNegative`) |
+| `ceil` | `fn(self) -> Float` | The smallest integer value `>= self` (IEEE 754 `roundToIntegralTowardPositive`) |
+
+NaN, `inf`, `-inf`, `0.0` and `-0.0` come back unchanged.
+
+```blink
+2.5.round()          // 3.0
+(-2.5).round()       // -3.0
+2.4.round()          // 2.0
+(-2.1).floor()       // -3.0
+2.1.ceil()           // 3.0
+let n = 7.6.round().truncate()   // 8 (Int)
+```
+
+`round` takes no digit count. To show a `Float` with a fixed number of decimal places, use `display_fixed` (§3.6.1 *Fixed-Decimal and Zero-Padded Forms*), which returns a `Str`. There is no `round_even`, `trunc` or `round(digits)`. (Panel vote: 6-0.)
 
 ---
 
@@ -4078,7 +4222,7 @@ Built-in types (`Int`, `Float`, `Bool`, `Str`, `Char`) have compiler-provided `D
 
 **Built-in `Display` impls.** The five impls for `Str`, `Int`, `Float`, `Bool` and `Char` are built in, and the list is closed: every other `Display` impl, including every derived one, writes through `sb.write`, `sb.write_char` or a child's `fmt`. `Str.fmt` appends the receiver's bytes to the builder. `Str.display()` returns a `Str` equal to the receiver.
 
-**A scalar renders to `Str` only through `Display`.** To get a `Str` from an `Int`, `Float` or `Bool`, write `"{x}"` when the value is part of a larger string, and `x.display()` when you need the `Str` value alone. These types have no `to_str` and no `to_string` method. Rendering is not a conversion: a scalar has a `to_` method only as sugar over a `From` or `TryFrom` impl (§3c.3), and no `From[Int] for Str`, `From[Float] for Str` or `From[Bool] for Str` exists. `Char` has `to_str` because `From[Char] for Str` exists (§3c.3 *Char → Str*).
+**A scalar renders to `Str` only through `Display`.** To get a `Str` from an `Int`, `Float` or `Bool`, write `"{x}"` when the value is part of a larger string, and `x.display()` when you need the `Str` value alone. These types have no `to_str` and no `to_string` method. Rendering is not a conversion: a scalar has a `to_` method only as sugar over a `From` or `TryFrom` impl (§3c.3), and no `From[Int] for Str`, `From[Float] for Str` or `From[Bool] for Str` exists. `Char` has `to_str` because `From[Char] for Str` exists (§3c.3 *Char → Str*). Two methods give a different text form of a number: `Float.display_fixed` and `Int.display_zero_padded` (*Fixed-Decimal and Zero-Padded Forms*).
 
 ```blink
 let n = 42
@@ -4098,6 +4242,22 @@ error[E0505]: unresolved method `.to_string` on type Int
    = help: a number becomes a `Str` with `.display()`, or with `"{port}"` inside a larger string
    = fix: replace `.to_string()` with `.display()`
 ```
+
+**Foreign spellings of the text helpers.** Where a common spelling from another language differs from the Blink method, the compiler gives a help line that names the Blink method. It is a hint only: the foreign name is never an alias, and the call stays an error. An unknown method name is `UnresolvedMethod` (E0505); a call that resolves but has the wrong arguments or result type is a type mismatch. (Panel vote: 5-1, Minimalism dissented.)
+
+| Written | Help names |
+|---------|------------|
+| `x.to_fixed(n)`, `x.toFixed(n)`, `x.fixed(n)` on `Float` | `x.display_fixed(n)` |
+| `x.round(n)` on `Float` | `x.display_fixed(n)` for text, or `x.round()` |
+| `x.round()` where an `Int` is expected | `x.round().truncate()` |
+| `c.is_digit(10)`, `c.is_digit()` on `Char` | `c.is_ascii_digit()`, or `c.to_digit(10)` |
+| `c.is_alpha()`, `c.is_alphanumeric()`, `c.is_upper()`, `c.is_lower()` on `Char` | the `is_ascii_*` method of the same class |
+| `s.is_ascii()` on `Str` | `c.is_ascii()` on each `Char` |
+| `s.strip()`, `s.lstrip()`, `s.rstrip()` | `s.trim()`, `s.trim_start()`, `s.trim_end()` |
+| `s.trim_left()`, `s.trim_right()` | `s.trim_start()`, `s.trim_end()` |
+| `s.trim_matches(..)`, `s.trim_start_matches(..)`, `s.trim_end_matches(..)` | `s.trim_by(..)`, `s.trim_start_by(..)`, `s.trim_end_by(..)` with a `fn(Char) -> Bool` |
+| `s.rjust(w)`, `s.padStart(w)`, `s.pad_left(w, c)` | `s.pad_start(w, ' ')` (or the given fill) |
+| `s.ljust(w)`, `s.padEnd(w)`, `s.pad_right(w, c)` | `s.pad_end(w, ' ')` (or the given fill) |
 
 **Every Display sink uses the same bound.** `"{x}"`, `x.display()`, `sb.write(x)` (§3.2 *String Building*) and the `io` print functions (§4.4) each require `T: Display` and nothing else. A `Str` argument is one `Display` type among five; it takes no separate path in the type system. A value that fails the bound at any of these sinks, or at any other call whose type parameter is bounded by `Display`, gets the same `MissingDisplayImpl` (E0523) error. The message names the sink and the span covers the argument:
 
@@ -4201,9 +4361,52 @@ fn main() {
 
 The text does not show the sign of zero or the bits of a NaN, because no `Float` equality tells those values apart. To test the sign of zero, use `1.0 / x < 0.0`.
 
-**One form everywhere.** Every place that Blink, its standard library or the `blink` toolchain writes a finite `Float` as decimal text uses this form, unless this spec names a different form for that place. Such places include `display()`, `debug()`, string interpolation, power-assert values (§2.20), JSON number output (§3.6.2) and test-runner output (§8.10). A form that is not decimal text, such as a bit pattern, is outside this rule. How JSON encodes NaN and the infinities belongs to §3.6.2, not to this rule.
+**One form everywhere.** Every place that Blink, its standard library or the `blink` toolchain writes a finite `Float` as decimal text uses this form, unless this spec names a different form for that place. Such places include `display()`, `debug()`, string interpolation, power-assert values (§2.20), JSON number output (§3.6.2) and test-runner output (§8.10). `Float.display_fixed` is a named different form (*Fixed-Decimal and Zero-Padded Forms*). A form that is not decimal text, such as a bit pattern, is outside this rule. How JSON encodes NaN and the infinities belongs to §3.6.2, not to this rule.
 
 **F32.** Whenever an `F32` renders as text, it uses the same rules, with the digits chosen for IEEE 754 binary32 in place of binary64. An `F32` that holds `0.1` renders as `0.1`. The same value widened to `Float` renders as `0.10000000149011612`, because it is a different `Float`. This rule does not add `F32` to the built-in `Display` impls.
+
+##### Fixed-Decimal and Zero-Padded Forms
+
+Two methods render a number in a form other than `display()`. Each is a named form in the sense of *One form everywhere*. Neither is a `Display` impl, and string interpolation never uses them; interpolation has no format specs. Write the call inside the hole: `"{price.display_fixed(2)}"`.
+
+**`Float.display_fixed(self, digits: Int) -> Str`** writes `self` with exactly `digits` digits after the decimal point. The output does not depend on the locale or the C library (Rule 6 of *Float Text Form*), so an implementation computes the digits exactly and does not call the host `printf`.
+
+1. **NaN and infinity.** NaN, `inf` and `-inf` render as `display()` renders them (Rules 1 and 2), whatever `digits` is.
+2. **Rounding.** For a finite `x`, take the exact value of the binary64 `x` and round it to `digits` places after the decimal point. When the exact value is exactly halfway between two candidates, take the one whose last digit is even. The rounding acts on the stored value, not on the literal: `2.675` is stored as 2.67499999999999982236431605997495353221893310546875, so it renders as `"2.67"` with 2 digits.
+3. **Sign.** Write `-` first only when `x < 0` and the rounded text has at least one non-zero digit. `-0.0`, and a negative value that rounds to all zeros, render with no sign.
+4. **Layout.** Write the integer part in decimal with no leading zeros (a single `0` when it is zero) and no digit grouping. When `digits > 0`, write `.` and then exactly `digits` digits, trailing zeros included. When `digits == 0`, write no `.`. The output never uses exponent form.
+5. **Range of `digits`.** `digits < 0` panics. There is no upper bound: a large `digits` writes the exact decimal expansion of the stored value, then zeros.
+
+```blink
+fn main() {
+    let big = 1000000000000000000000.0
+    io.println(3.14159.display_fixed(2))     // 3.14
+    io.println(2.675.display_fixed(2))       // 2.67
+    io.println(0.125.display_fixed(2))       // 0.12 (exact tie, to even)
+    io.println(0.375.display_fixed(2))       // 0.38 (exact tie, to even)
+    io.println(2.5.display_fixed(0))         // 2
+    io.println(1.0.display_fixed(3))         // 1.000
+    io.println((-0.001).display_fixed(2))    // 0.00
+    io.println((-0.006).display_fixed(2))    // -0.01
+    io.println(big.display())                // 1.0e21
+    io.println(big.display_fixed(0))         // 1000000000000000000000
+    io.println(0.1.display_fixed(20))        // 0.10000000000000000555
+    io.println((0.0 / 0.0).display_fixed(2)) // NaN
+}
+```
+
+`display_fixed` breaks a tie toward the even digit, and `Float.round` (§3.2.5) breaks a tie away from zero, so the two can differ on an exact tie: `2.5.display_fixed(0)` is `"2"`, while `2.5.round()` is `3.0`. `display_fixed` uses the same tie rule as C `%.*f`, Rust `{:.N}` and Python `f"{x:.Nf}"`, so it gives the same digits as those for every value; only Rule 3 (no sign on an all-zero result) differs from them. (Panel votes: name 6-0; tie rule 5-1, PLT dissented wanting ties away from zero; sign rule 6-0; `digits` rules 6-0.)
+
+**`Int.display_zero_padded(self, width: Int) -> Str`** writes `self` in decimal with zeros between the sign and the digits, so the result has `width` characters. `width` counts the sign. The method never truncates: when `self.display().len() >= width`, a negative `width` included, the result is `self.display()`.
+
+```blink
+42.display_zero_padded(5)       // "00042"
+(-7).display_zero_padded(3)     // "-07"
+12345.display_zero_padded(3)    // "12345"
+0.display_zero_padded(2)        // "00"
+```
+
+Compare `"-7".pad_start(3, '0')`, which gives `"0-7"` (§3.2.1 *Trim, Strip, Pad and Repeat*). (Panel vote: method 4-2, Web/Scripting and Minimalism dissented wanting no method; name 6-0.)
 
 ##### Product Type Codegen (Structs)
 
