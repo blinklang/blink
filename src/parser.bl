@@ -7,6 +7,7 @@ import diagnostics.{
     diag_count, diag_entry_count, diag_errors_since, diag_truncate, diag_file_for_node,
     INLINE_MODULE_NOT_SUPPORTED, UNEXPECTED_ANNOTATION, UNEXPECTED_TOKEN,
     UNEXPECTED_TOKEN_STRING, UNEXPECTED_TOKEN_PATTERN, KEYWORD_AS_IDENTIFIER,
+    diag_error_span, diag_set_last_fix, MUT_ON_PATTERN,
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
     TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE,
@@ -3995,9 +3996,12 @@ fn parse_with_item() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             return wr
         }
         advance()
+        let with_mut = at(TokenKind.Mut) && peek_kind_at(pos + 1) == TokenKind.Ident
+        if with_mut { advance() }
         let mut binding = ""
         if at(TokenKind.Ident) {
             binding = advance_value()
+            if with_mut { report_mut_after_with_as(pos - 1) }
         } else {
             diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "expected identifier after `as` in with-clause, got {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), "")
             binding = lhs_name
@@ -4014,7 +4018,10 @@ fn parse_with_item() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     }
     if at(TokenKind.As) {
         advance()
+        let with_mut = at(TokenKind.Mut) && peek_kind_at(pos + 1) == TokenKind.Ident
+        if with_mut { advance() }
         let binding = expect_value(TokenKind.Ident)
+        if with_mut { report_mut_after_with_as(pos - 1) }
         let wr = node_count()
         node_push(AstNode {
             kind: NodeKind.WithResource, value: expr, name: binding,
@@ -4474,13 +4481,16 @@ fn parse_for_in() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let var_line = peek_line()
     let var_col = peek_col()
     let var_mut = parse_binder_mut()
-    if at(TokenKind.LParen) {
+    if at(TokenKind.LParen) || (at(TokenKind.Mut) && peek_kind_at(pos + 1) == TokenKind.LParen) {
         pat = parse_pattern()
         var = "_tuple"
     } else {
+        let mut_tok = if at(TokenKind.Mut) { advance() } else { -1 }
+        let first = pos
         var = expect_value(TokenKind.Ident)
         simple_binder = node_count()
-        node_push(AstNode { kind: NodeKind.IdentPattern, name: var, is_mut: var_mut, line: var_line, col: var_col })
+        node_push(AstNode { kind: NodeKind.IdentPattern, name: var, is_mut: var_mut, line: var_line, col: var_col, end_line: tokens.lines[pos - 1], end_col: tokens.end_cols[pos - 1] })
+        if mut_tok != -1 { report_mut_on_pattern(mut_tok, first, pos - 1, simple_binder) }
     }
     expect(TokenKind.In)
     let iter = parse_expr()
@@ -5589,35 +5599,189 @@ fn parse_field_mut() -> Int ! Parse.Advance {
     1
 }
 
-// In `{ x: px }` the `x` is a field label, not a name the pattern binds.
-fn report_mut_on_field_label(fname: Str, line: Int, col: Int) ! Diag.Report {
-    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "`mut` must come before a name the pattern binds, not the field label `{fname}`", line, col, col + 3, "put `mut` after the colon: `{fname}: mut <name>`")
-}
+// After an E0613 the compiler reads each name inside the pattern as `mut`, as the fix would
+// mark it, so the one error brings no mutation error after it. The value differs from a
+// written `mut` (1) so that typecheck does not report the name a second time.
+pub const BINDER_MUT_RECOVERED = 2
 
 // `mut` marks the one name right after it (§3.5 *Mutable Binders*). Answers 1 when it
-// stands before a name the pattern binds. Before anything else it is reported here and
-// answers 0, and the pattern after it parses as written, so one stray `mut` does not hide
-// the errors that follow it.
-fn parse_binder_mut() -> Int ! Parse.Advance, Diag.Report {
-    if !at(TokenKind.Mut) { return 0 }
+// stands before a name the pattern binds, and consumes it then. A `mut` before anything
+// else is left for parse_single_pattern to report as E0613.
+fn parse_binder_mut() -> Int ! Parse.Advance {
+    if !at(TokenKind.Mut) || !at_binder_name_at(pos + 1) { return 0 }
     advance()
-    if at_binder_name() { return 1 }
-    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "`mut` must come before a name the pattern binds", peek_line(), peek_col(), peek_end_col(), "`mut` marks one name; put it before each name inside the pattern that changes")
-    0
+    1
 }
 
 // A name that binds: not `_`, not a literal, and not the head of a variant or a
 // constructor. A bare variant name such as `None` is told apart only once names
-// resolve, so typecheck rejects `mut` there.
-fn at_binder_name() -> Bool {
-    if !at(TokenKind.Ident) { return false }
-    let v = peek_value()
+// resolve, so typecheck reports `mut` there.
+fn at_binder_name_at(p: Int) -> Bool {
+    if peek_kind_at(p) != TokenKind.Ident { return false }
+    let v = tokens.values[p]
     if v == "_" || v == "true" || v == "false" { return false }
-    let next = peek_kind_at(pos + 1)
+    let next = peek_kind_at(p + 1)
     next != TokenKind.Dot && next != TokenKind.LParen && next != TokenKind.LBrace
 }
 
+// The names inside `pat` that a `mut` before it would mark, in source order: each binder
+// with no `mut` of its own. A builtin variant such as `None` binds nothing; a user variant
+// is told apart only once names resolve, so it is listed here.
+fn mut_pattern_binders(pat: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    collect_mut_pattern_binders(pat, out)
+    out
+}
+
+fn collect_mut_pattern_binders(pat: Int, out: List[Int]) {
+    if pat == -1 { return }
+    let k = node_kind(pat)
+    if k == NodeKind.IdentPattern {
+        let n = node_name(pat)
+        if node_is_mut(pat) == 0 && n != "_" && n != "None" && n != "Some" && n != "Ok" && n != "Err" {
+            out.push(pat)
+        }
+        return
+    }
+    if k == NodeKind.AsPattern {
+        if node_is_mut(pat) == 0 { out.push(pat) }
+        collect_mut_pattern_binders(node_pattern(pat), out)
+        return
+    }
+    if k == NodeKind.StructLitField {
+        if node_pattern(pat) != -1 {
+            collect_mut_pattern_binders(node_pattern(pat), out)
+        } else if node_is_mut(pat) == 0 {
+            out.push(pat)
+        }
+        return
+    }
+    let mut sl = -1
+    if k == NodeKind.TuplePattern || k == NodeKind.ListPattern || k == NodeKind.OrPattern {
+        sl = node_elements(pat)
+    } else if k == NodeKind.EnumPattern || k == NodeKind.StructPattern {
+        sl = node_fields(pat)
+    }
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        collect_mut_pattern_binders(sublist_get(sl, i), out)
+        i = i + 1
+    }
+}
+
+// The text of tokens first..last with `mut ` put before each of `binders`, which must lie
+// inside that text in source order. Answers "" when the text cannot be read back or a
+// binder's name is not written where its node says. A caller may pass only some of the
+// binders, so this is the one place that writes `mut` into a pattern for a fix.
+fn mut_pattern_fix_text(first: Int, last: Int, binders: List[Int]) -> Str {
+    let text = token_span_text(first, last)
+    if text == "" { return "" }
+    let base = source_offset(tokens.lines[first], tokens.cols[first])
+    let sb = StringBuilder.new()
+    let mut prev = 0
+    for b in binders {
+        let at_off = source_offset(node_line(b), node_col(b)) - base
+        let name_end = at_off + node_name(b).byte_len()
+        if at_off < prev || name_end > text.byte_len() { return "" }
+        // A node that parse recovery made up has no name written at its place.
+        if text.byte_slice(at_off, name_end) != node_name(b) { return "" }
+        sb.write(text.byte_slice(prev, at_off))
+        sb.write("mut ")
+        prev = at_off
+    }
+    sb.write(text.byte_slice(prev, text.byte_len()))
+    sb.to_str()
+}
+
+// What a `mut` stood before, for the E0613 message.
+fn mut_pattern_what(pat: Int) -> Str {
+    let k = node_kind(pat)
+    if k == NodeKind.TuplePattern { return "a tuple pattern" }
+    if k == NodeKind.ListPattern { return "a list pattern" }
+    if k == NodeKind.StructPattern { return "a struct pattern" }
+    if k == NodeKind.WildcardPattern { return "`_`" }
+    if k == NodeKind.IntPattern || k == NodeKind.StringPattern { return "a literal" }
+    if k == NodeKind.RangePattern { return "a range" }
+    if k == NodeKind.IdentPattern && node_name(pat) == "_" { return "`_`" }
+    if k == NodeKind.EnumPattern {
+        if node_int_val(pat) == 1 { return "a struct pattern" }
+        if node_fields(pat) != -1 { return "a constructor pattern" }
+        return "the variant `{node_name(pat)}.{node_type_name(pat)}`"
+    }
+    "a pattern"
+}
+
+// E0613 over tokens mut_tok..last: the span is the text the fix replaces, so it runs from
+// `mut` to the end of the pattern.
+fn emit_mut_on_pattern(message: Str, mut_tok: Int, last: Int, help: Str, action: Str, fix: Str) ! Diag.Report {
+    let before = diag_entry_count()
+    diag_error_span("MutOnPattern", MUT_ON_PATTERN, message, tokens.lines[mut_tok], tokens.cols[mut_tok], tokens.lines[last], tokens.end_cols[last], help)
+    if fix != "" && diag_entry_count() > before { diag_set_last_fix(action, fix) }
+}
+
+fn mark_recovered_mut(binders: List[Int]) {
+    for b in binders { node_set_is_mut(b, BINDER_MUT_RECOVERED) }
+}
+
+// `mut` at token mut_tok stood before `pat`, written as tokens first..last.
+fn report_mut_on_pattern(mut_tok: Int, first: Int, last: Int, pat: Int) ! Diag.Report {
+    let what = mut_pattern_what(pat)
+    let message = "`mut` must come before a name, not {what}"
+    let binders = mut_pattern_binders(pat)
+    if binders.len() == 0 {
+        emit_mut_on_pattern(message, mut_tok, last, "remove `mut`; {what} binds no name", "remove `mut`", token_span_text(first, last))
+        return
+    }
+    let fixed = mut_pattern_fix_text(first, last, binders)
+    let help = if fixed == "" { "put `mut` on each name inside the pattern that changes" } else { "put `mut` on each name that changes: `{fixed}`" }
+    emit_mut_on_pattern(message, mut_tok, last, help, "put `mut` on each name", fixed)
+    mark_recovered_mut(binders)
+}
+
+// In `{ x: px }` the `x` is a field label, not a name the pattern binds. The field runs
+// over tokens label..last, and `mut` is the token before the label.
+fn report_mut_on_field_label(fname: Str, label: Int, last: Int, fpat: Int) ! Diag.Report {
+    let message = "`mut` must come before a name, not the field label `{fname}`"
+    let binders = mut_pattern_binders(fpat)
+    if binders.len() == 0 {
+        emit_mut_on_pattern(message, label - 1, last, "remove `mut`; the field label `{fname}` binds no name, and neither does the pattern after it", "remove `mut`", token_span_text(label, last))
+        return
+    }
+    let fixed = mut_pattern_fix_text(label, last, binders)
+    let help = if fixed == "" { "put `mut` after the colon, before the name it marks" } else { "put `mut` after the colon, before the name it marks: `{fixed}`" }
+    emit_mut_on_pattern(message, label - 1, last, help, "move `mut` after the colon", fixed)
+    mark_recovered_mut(binders)
+}
+
+// `with e as mut f`: the name at token `name_tok` follows `mut` at token name_tok - 1.
+fn report_mut_after_with_as(name_tok: Int) ! Diag.Report {
+    emit_mut_on_pattern("`mut` cannot mark the name after `as` in `with`", name_tok - 1, name_tok,
+        "remove `mut`; `close()` runs on the value that `with` acquired, so the name after `as` cannot be given a new value",
+        "remove `mut`", token_span_text(name_tok, name_tok))
+}
+
+// A `mut` before a pattern that binds no name is reported here (E0613), and the pattern
+// after it parses as written, so one stray `mut` does not hide the errors that follow it.
 fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
+    if !at(TokenKind.Mut) || at_binder_name_at(pos + 1) {
+        return parse_single_pattern_body()
+    }
+    let mut_tok = advance()
+    let k = peek_kind()
+    if k != TokenKind.LBracket && k != TokenKind.LParen && k != TokenKind.StringStart && k != TokenKind.Int && k != TokenKind.CharLit && k != TokenKind.Ident {
+        diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "expected a pattern after `mut`, got {token_kind_name(k)}", peek_line(), peek_col(), peek_end_col(), "")
+        let nd = node_count()
+        node_push(AstNode { kind: NodeKind.WildcardPattern, line: tokens.lines[mut_tok], col: tokens.cols[mut_tok] })
+        return nd
+    }
+    let first = pos
+    let pat = parse_single_pattern_body()
+    report_mut_on_pattern(mut_tok, first, pos - 1, pat)
+    pat
+}
+
+fn parse_single_pattern_body() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     let sp_line = peek_line()
     let sp_col = peek_col()
     let binder_mut = parse_binder_mut()
@@ -5789,12 +5953,13 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                     let fld_line = peek_line()
                     let fld_col = peek_col()
                     let fld_mut = parse_field_mut()
+                    let label = pos
                     let fname = expect_value(TokenKind.Ident)
                     if at(TokenKind.Colon) {
-                        if fld_mut == 1 { report_mut_on_field_label(fname, fld_line, fld_col) }
                         advance()
                         skip_newlines()
                         let fpat = parse_pattern()
+                        if fld_mut == 1 { report_mut_on_field_label(fname, label, pos - 1, fpat) }
                         let sf = node_count()
                         node_push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, line: fld_line, col: fld_col })
                         sublist_push(flds, sf)
@@ -5856,12 +6021,13 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                 let fld_line = peek_line()
                 let fld_col = peek_col()
                 let fld_mut = parse_field_mut()
+                let label = pos
                 let fname = expect_value(TokenKind.Ident)
                 if at(TokenKind.Colon) {
-                    if fld_mut == 1 { report_mut_on_field_label(fname, fld_line, fld_col) }
                     advance()
                     skip_newlines()
                     let fpat = parse_pattern()
+                    if fld_mut == 1 { report_mut_on_field_label(fname, label, pos - 1, fpat) }
                     let sf = node_count()
                     node_push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, line: fld_line, col: fld_col })
                     sublist_push(flds, sf)
@@ -5888,8 +6054,9 @@ fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             node_push(AstNode { kind: NodeKind.AsPattern, name: name, pattern: inner, is_mut: binder_mut, line: sp_line, col: sp_col })
             return nd
         }
+        // The span lets typecheck report a `mut` before a bare variant over `mut` through the name.
         let nd = node_count()
-        node_push(AstNode { kind: NodeKind.IdentPattern, name: name, is_mut: binder_mut, line: sp_line, col: sp_col })
+        node_push(AstNode { kind: NodeKind.IdentPattern, name: name, is_mut: binder_mut, line: sp_line, col: sp_col, end_line: tokens.lines[pos - 1], end_col: tokens.end_cols[pos - 1] })
         return nd
     }
     diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "unexpected token in pattern: {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), "")

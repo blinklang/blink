@@ -13,7 +13,7 @@ import parser.{
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
-    node_set_module, node_set_name, node_supertraits, synth_struct_decl,
+    node_set_module, node_set_name, node_supertraits, synth_struct_decl, node_end_line, node_end_col, BINDER_MUT_RECOVERED,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
     node_xfail_reason, node_value_child_ids, node_push_value_child_ids, node_spell_child_ids,
     sublist_get, sublist_length,
@@ -22,7 +22,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
     diag_set_last_fix, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
-    diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count,
+    diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
@@ -31,7 +31,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, UNEXPECTED_TOKEN_PATTERN,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -16502,6 +16502,20 @@ fn nr_define_let_pattern(pat: Int, is_mut: Int) ! Diag.Report {
     nr_define_mut_at(node_name(pat), tc_leaf_is_mut(pat, is_mut), pat)
 }
 
+// `mut Red` names a variant, which binds nothing. The parser cannot tell a bare variant from a
+// binder, so this E0613 comes once names resolve. Its span runs over `mut` through the name,
+// the text the fix replaces.
+fn nr_report_mut_on_variant(node: Int, name: Str) ! Diag.Report {
+    let has_end = node_end_line(node) > 0
+    let end_line = if has_end { node_end_line(node) } else { 0 }
+    let end_col = if has_end { node_end_col(node) } else { 0 }
+    let before = diag_entry_count()
+    diag_emit_in_file("error", "MutOnPattern", MUT_ON_PATTERN, "`mut` must come before a name, not the variant `{name}`",
+        diag_file_for_node(node), node_line(node), node_col(node), end_line, end_col,
+        "remove `mut`; the variant `{name}` binds no name")
+    if has_end && diag_entry_count() > before { diag_set_last_fix("remove `mut`", name) }
+}
+
 fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
@@ -16510,8 +16524,8 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
         let name = node_name(node)
         if name != "_" && is_variant_name(name) == 0 {
             nr_define_mut_at(name, node_is_mut(node), node)
-        } else if node_is_mut(node) != 0 {
-            diag_error_at("UnexpectedToken", UNEXPECTED_TOKEN_PATTERN, "`mut` must come before a name the pattern binds, and `{name}` is a variant", node, "remove `mut`; a variant binds no name")
+        } else if node_is_mut(node) != 0 && node_is_mut(node) != BINDER_MUT_RECOVERED {
+            nr_report_mut_on_variant(node, name)
         }
         return
     }

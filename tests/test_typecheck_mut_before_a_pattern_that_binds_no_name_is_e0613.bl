@@ -1,0 +1,365 @@
+// `mut` before a pattern that binds no name is `error[E0613] MutOnPattern`
+// (sections/03_types.md §3.5 *Mutable Binders*, §2.18 *Rules*). Each form gives exactly one
+// E0613, with help for its case and a fix that replaces the span `mut ...` with the text below.
+// Before a tuple, struct, list or constructor the fix puts `mut` on each name inside it, and
+// the compiler reads those names as `mut` from then on, so the one E0613 brings no mutation
+// error after it. Elsewhere the fix removes `mut`.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries}
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name} {d.code}: {d.message} | help: {d.help} | fix: {d.fix_action} `{d.fix_text}`") }
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for e in errors() { io.println("  {e}") }
+}
+
+fn e0613_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.code == "E0613" { n += 1 }
+    }
+    n
+}
+
+// The one E0613, its help containing `help_part` and its fix replacing the span with `fix`.
+fn expect_e0613(label: Str, help_part: Str, fix: Str) {
+    let mut ok = e0613_count() == 1
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "UnexpectedToken" { ok = false }
+        if d.severity == "error" && d.code == "E0613" {
+            if d.name != "MutOnPattern" { ok = false }
+            if !d.help.contains(help_part) { ok = false }
+            if d.fix_action == "" || d.fix_text != fix { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_only_e0613(label: Str, help_part: Str, fix: Str) {
+    expect_e0613(label, help_part, fix)
+    let errs = errors()
+    if errs.len() != 1 { show(label) }
+    assert_eq(errs.len(), 1)
+}
+
+fn copy_helps() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "DiscardedCollectionCopy" { out.push(d.help) }
+    }
+    out
+}
+
+test "mut before a nested tuple pattern puts mut on each name inside it" {
+    probe("build/mut_on_pattern_tuple.bl", #"
+fn main() {
+    let (mut (a, b), c) = ((1, 2), 3)
+    let _ = a + b + c
+}
+"#)
+    expect_only_e0613("mut (a, b)", "put `mut` on each name that changes: `(mut a, mut b)`", "(mut a, mut b)")
+}
+
+test "mut before a for tuple pattern puts mut on each name inside it" {
+    probe("build/mut_on_pattern_for_tuple.bl", #"
+fn main() {
+    for mut (a, b) in [(1, 2)] {
+        let _ = a + b
+    }
+}
+"#)
+    expect_only_e0613("for mut (a, b)", "`(mut a, mut b)`", "(mut a, mut b)")
+}
+
+test "mut before a wildcard is removed" {
+    probe("build/mut_on_pattern_wildcard.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    match o {
+        Some(mut _) => {}
+        None => {}
+    }
+}
+"#)
+    expect_only_e0613("mut _", "remove `mut`", "_")
+}
+
+test "mut before the wildcard of a for loop is removed" {
+    probe("build/mut_on_pattern_for_wildcard.bl", #"
+fn main() {
+    for mut _ in [1, 2] {}
+}
+"#)
+    expect_only_e0613("for mut _", "remove `mut`", "_")
+}
+
+test "mut before a literal and a range is removed" {
+    probe("build/mut_on_pattern_literal.bl", #"
+fn main() {
+    let n = 3
+    let s = match n {
+        mut 1 => "one"
+        _ => "other"
+    }
+    let _ = s
+}
+"#)
+    expect_only_e0613("mut 1", "remove `mut`", "1")
+    probe("build/mut_on_pattern_range.bl", #"
+fn main() {
+    let n = 3
+    let s = match n {
+        mut 1..5 => "low"
+        _ => "other"
+    }
+    let _ = s
+}
+"#)
+    expect_only_e0613("mut 1..5", "remove `mut`", "1..5")
+}
+
+test "mut before None is removed" {
+    probe("build/mut_on_pattern_none.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    let n = match o {
+        mut None => 0
+        Some(v) => v
+    }
+    let _ = n
+}
+"#)
+    expect_only_e0613("mut None", "remove `mut`", "None")
+}
+
+test "mut before a variant of a user enum is removed, bare or qualified" {
+    probe("build/mut_on_pattern_user_variant.bl", #"
+type Color { Red, Green }
+fn main() {
+    let c = Color.Red
+    let n = match c {
+        mut Red => 0
+        Green => 1
+    }
+    let _ = n
+}
+"#)
+    expect_only_e0613("mut Red", "remove `mut`", "Red")
+    probe("build/mut_on_pattern_qualified_variant.bl", #"
+type Color { Red, Green }
+fn main() {
+    let c = Color.Red
+    let n = match c {
+        mut Color.Red => 0
+        Color.Green => 1
+    }
+    let _ = n
+}
+"#)
+    expect_only_e0613("mut Color.Red", "remove `mut`", "Color.Red")
+}
+
+test "mut before a constructor puts mut on the names inside it" {
+    probe("build/mut_on_pattern_constructor.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    let n = match o {
+        mut Some(v) => v
+        None => 0
+    }
+    let _ = n
+}
+"#)
+    expect_only_e0613("mut Some(v)", "`Some(mut v)`", "Some(mut v)")
+}
+
+test "a constructor that binds no name loses its mut" {
+    probe("build/mut_on_pattern_constructor_no_name.bl", #"
+fn main() {
+    let o: Int? = Some(1)
+    let n = match o {
+        mut Some(_) => 1
+        None => 0
+    }
+    let _ = n
+}
+"#)
+    expect_only_e0613("mut Some(_)", "remove `mut`", "Some(_)")
+}
+
+test "mut before a struct pattern puts mut on each punned field" {
+    probe("build/mut_on_pattern_struct.bl", #"
+type Point {
+    x: Int
+    y: Int
+}
+fn main() {
+    let o: Point? = Some(Point { x: 1, y: 2 })
+    match o {
+        Some(mut Point { x, y }) => { let _ = x + y }
+        None => {}
+    }
+}
+"#)
+    expect_only_e0613(#"mut Point { x, y }"#, #"`Point { mut x, mut y }`"#, #"Point { mut x, mut y }"#)
+}
+
+test "mut before a list pattern puts mut on each name inside it" {
+    probe("build/mut_on_pattern_list.bl", #"
+fn main() {
+    let xs = [1, 2]
+    match xs {
+        mut [a, b] => { let _ = a + b }
+        _ => {}
+    }
+}
+"#)
+    expect_only_e0613("mut [a, b]", "`[mut a, mut b]`", "[mut a, mut b]")
+}
+
+test "mut before a field label moves after the colon" {
+    probe("build/mut_on_pattern_field_label.bl", #"
+type Point {
+    x: Int
+    y: Int
+}
+fn main() {
+    let p = Point { x: 1, y: 2 }
+    match p {
+        Point { mut x: px, .. } => { let _ = px }
+    }
+}
+"#)
+    expect_only_e0613("mut x: px", "`x: mut px`", "x: mut px")
+}
+
+test "mut before the name after as in with is removed" {
+    probe("build/mut_on_pattern_with.bl", #"
+import std.traits
+type Res { n: Int }
+impl Closeable for Res {
+    fn close(self) {}
+}
+fn main() {
+    with Res { n: 1 } as mut r {
+        let _ = r.n
+    }
+}
+"#)
+    expect_only_e0613("with ... as mut r", "`close()` runs on the value that `with` acquired", "r")
+}
+
+test "mut before a variant inside a tuple gives one error and spares the variant" {
+    probe("build/mut_on_pattern_none_in_tuple.bl", #"
+fn main() {
+    let p: (Int?, Int) = (None, 1)
+    match p {
+        mut (None, n) => { let _ = n }
+        _ => {}
+    }
+}
+"#)
+    expect_only_e0613("mut (None, n)", "`(None, mut n)`", "(None, mut n)")
+    probe("build/mut_on_pattern_user_variant_in_tuple.bl", #"
+type Color { Red, Green }
+fn main() {
+    let p = (Color.Red, 1)
+    match p {
+        mut (Red, n) => { let _ = n }
+        _ => {}
+    }
+}
+"#)
+    if e0613_count() != 1 || errors().len() != 1 { show("mut (Red, n)") }
+    assert_eq(e0613_count(), 1)
+    assert_eq(errors().len(), 1)
+}
+
+test "after E0613 the names inside read as mut and a later error still shows" {
+    probe("build/mut_on_pattern_recovery.bl", #"
+fn main() {
+    let o: List[Int]? = Some([2, 1])
+    match o {
+        mut Some(xs) => xs.sort()
+        None => {}
+    }
+    let bad: Int = "text"
+}
+"#)
+    expect_e0613("mut Some(xs)", "`Some(mut xs)`", "Some(mut xs)")
+    let mut mismatch = false
+    for e in errors() {
+        if e.contains("E0613") { continue }
+        if e.contains("Int") && e.contains("Str") { mismatch = true }
+    }
+    if !mismatch { show("later error") }
+    assert(mismatch)
+    let helps = copy_helps()
+    if helps.len() != 1 { show("recovery") }
+    assert_eq(helps.len(), 1)
+    assert(helps.get(0).unwrap().contains("`xs = xs.sort()`"))
+}
+
+test "after E0613 on a for tuple and a field label the names inside read as mut" {
+    probe("build/mut_on_pattern_recovery_for.bl", #"
+fn main() {
+    for mut (k, v) in [([1], [2])] {
+        k.sort()
+        v.sort()
+    }
+}
+"#)
+    expect_only_e0613("for mut (k, v)", "`(mut k, mut v)`", "(mut k, mut v)")
+    let helps = copy_helps()
+    if helps.len() != 2 { show("recovery for") }
+    assert_eq(helps.len(), 2)
+    assert(helps.get(0).unwrap().contains("`k = k.sort()`"))
+    assert(helps.get(1).unwrap().contains("`v = v.sort()`"))
+    probe("build/mut_on_pattern_recovery_label.bl", #"
+type Bag {
+    items: List[Int]
+}
+fn main() {
+    let b = Bag { items: [2, 1] }
+    match b {
+        Bag { mut items: xs } => xs.sort()
+    }
+}
+"#)
+    expect_only_e0613("mut items: xs", "`items: mut xs`", "items: mut xs")
+    let label_helps = copy_helps()
+    assert_eq(label_helps.len(), 1)
+    assert(label_helps.get(0).unwrap().contains("`xs = xs.sort()`"))
+}
+
+test "let mut over a tuple pattern is still not an error" {
+    probe("build/mut_on_pattern_let_mut_tuple.bl", #"
+fn main() {
+    let mut (a, b) = ([1], [2])
+    a.push(3)
+    b.push(4)
+}
+"#)
+    let errs = errors()
+    if errs.len() != 0 { show("let mut (a, b)") }
+    assert_eq(errs.len(), 0)
+}
