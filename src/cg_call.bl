@@ -33,7 +33,7 @@ import typecheck.{
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count, tc_tid_child,
     tc_evar_field_slots, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance,
     tc_struct_field_slots, tc_sfield_name, get_struct_field_tid,
-    tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_call_user_effect, tc_call_builtin_default,
+    tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_call_user_effect, tc_call_builtin_default,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_tid_name, tc_mc_obj_is_value,
     tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_conversion_impl_for, tc_conversion_trait_of, CONVERSION_IS_IDENTITY,
@@ -3633,11 +3633,11 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let routed = iterator_route_name(kind, mname)
     if routed != "" { return cc_iterator_call(node, obj, routed) }
     if kind == TyKind.List && (cc_names_list_hof(mname) || cc_names_list_generic_adapter(mname)) { return cc_list_hof_call(node, obj, mname) }
-    if kind == TyKind.List && cc_is_list_take(mname) { return cc_list_take(node, obj) }
+    if kind == TyKind.List && cc_is_list_own_lowering(mname) { return cc_list_own_lowering(node, obj, mname) }
+    if tc_map_generic_adapter(kind, mname) != "" { return cc_map_adapter_call(node, obj, kind, mname) }
     if kind == TyKind.Template { return cc_template_method(node, obj, mname) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
-    if kind == TyKind.List && cc_is_list_remove(mname) { return cc_list_remove(node, obj) }
     if kind == TyKind.Channel && cc_is_channel_recv(mname) { return cc_channel_recv(node, obj) }
     if kind == TyKind.Channel && cc_is_channel_send(mname) { return cc_channel_send(node, obj) }
     let keyed = cc_keyed_row(kind, mname)
@@ -5356,6 +5356,17 @@ fn cc_is_list_remove(method: Str) -> Bool {
     table.get(method) ?? false
 }
 
+// The List methods with a lowering of their own, kept to one dispatch line in
+// lower_method_call, which is at the function length limit.
+fn cc_is_list_own_lowering(method: Str) -> Bool {
+    cc_is_list_take(method) || cc_is_list_remove(method)
+}
+
+fn cc_list_own_lowering(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
+    if cc_is_list_take(method) { return cc_list_take(node, obj) }
+    cc_list_remove(node, obj)
+}
+
 // `take(n)` is the first n elements, which `list_slice` already answers given a start of
 // 0 -- but the method writes one argument where the declaration takes two, so this cannot
 // go through the plain redirect that hands a callee the call's own written arguments
@@ -5729,6 +5740,33 @@ fn cc_iterator_no_body(node: Int, name: Str) -> Int ! Diag.Report {
     diag_ice_at("IteratorMethodBodyNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "this method stands for `{name}`, which no loaded module declares", node,
         "lib/std/iter.bl declares the generic every Iterator method means")
+    -1
+}
+
+// The receiver is the generic's first parameter, as for the List adapters above.
+fn cc_map_adapter_call(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let callee = tc_map_generic_adapter(kind, method)
+    let decl = cc_stdlib_fn_named(node, tc_map_generic_adapter_module(), callee)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_map_adapter_no_body(node, callee) }
+    let want = sublist_length(node_params(decl)) - 1
+    let given = sublist_length(node_args(node))
+    if want != given { return cc_map_adapter_arity_wrong(node, callee, want, given) }
+    cc_declared_call(node, decl, obj)
+}
+
+fn cc_map_adapter_arity_wrong(node: Int, callee: Str, want: Int, given: Int) -> Int ! Diag.Report {
+    diag_ice_at("MapMethodArityWrong", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "`{callee}` takes {want} argument(s) after its receiver, and this call gives {given}", node,
+        "typecheck checks a call's argument count before codegen builds it; this is a compiler bug")
+    -1
+}
+
+// std.map is a prelude module, so a missing body is a broken build, as for the List ones.
+fn cc_map_adapter_no_body(node: Int, callee: Str) -> Int ! Diag.Report {
+    diag_ice_at("MapMethodBodyNotDeclared", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "this method stands for `{callee}`, which no loaded module declares", node,
+        "lib/std/map.bl declares the generic each routed Map method means")
     -1
 }
 
