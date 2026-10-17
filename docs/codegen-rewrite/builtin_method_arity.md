@@ -63,7 +63,7 @@ method name and never the arm:
 |---|---|---|---|
 | `display` | 0 | none | Int/Float/Bool/Str/Char |
 | `fmt` | 1 | none | takes the StringBuilder; the argument is not read here |
-| `into_iter` | 0 | none | List/Set/Iterator |
+| `into_iter` | 0 | none | List/Set/Str/Iterator |
 
 ### Iterator
 

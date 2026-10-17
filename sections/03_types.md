@@ -293,8 +293,8 @@ for c in "hello" {
     io.println("{c}")
 }
 
-// Or explicitly via .chars()
-let vowels = "hello".chars().filter(fn(c) { "aeiou".contains("{c}") }).collect()
+// Or explicitly via .into_iter()
+let vowels = "hello".into_iter().filter(fn(c) { "aeiou".contains("{c}") }).collect()
 ```
 
 ##### Parsing

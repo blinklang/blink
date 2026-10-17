@@ -2801,6 +2801,27 @@ BLINK_RT_FN int blink_str_next_char(const char* s, int64_t* pos, int32_t* out) {
 }
 #endif
 
+/* One pull of Str.into_iter's cursor, as one value an @ffi fn can return: -1 at the
+ * terminating NUL, else the byte position past the Char at byte `pos`, shifted left 21,
+ * with the Char's scalar value in the low 21 bits. */
+BLINK_RT_FN int64_t blink_str_char_step(const char* s, int64_t pos);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_str_char_step(const char* s, int64_t pos) {
+    int32_t cp = 0;
+    if (!blink_str_next_char(s, &pos, &cp)) { return -1; }
+    return (pos << 21) | (int64_t)cp;
+}
+#endif
+
+/* The Char a blink_str_char_step answer holds. The decoder made it, so it is already a
+ * scalar value and needs no check. */
+BLINK_RT_FN int32_t blink_str_step_char(int64_t step);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int32_t blink_str_step_char(int64_t step) {
+    return (int32_t)(step & 0x1FFFFF);
+}
+#endif
+
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_substr(const char* s, int64_t start, int64_t len) {

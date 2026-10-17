@@ -564,7 +564,7 @@ let s = Str.from('é')     // "é" (via From trait)
 
 // Useful in method chains
 let vowels = "hello"
-    .chars()
+    .into_iter()
     .filter(fn(c) { "aeiou".contains(c.to_str()) })
     .map(fn(c) { c.to_str() })
     .collect()
