@@ -27,6 +27,7 @@ import parser.{
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
+    tc_scalar_has_eq, tc_scalar_has_ord,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
     tc_type_str, tc_ptr_offset_stride_known,
@@ -3645,7 +3646,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
-    if cc_is_ieee_compare(kind, mname) { return cc_ieee_compare(node, obj, kind, mname) }
+    if cc_is_scalar_compare(kind, mname) { return cc_scalar_compare(node, obj, recv_tid, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_sb_write_char(kind, mname) { return cc_sb_write_char(node, obj) }
     if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
@@ -4686,64 +4687,69 @@ fn cc_wrapping_arith(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: S
     ir_cast(recv_tid, node, recv_answer.c_spelling, wrapped)
 }
 
-// ── IEEE 754 comparison ─────────────────────────────────────────────────
+// ── Scalar comparison ───────────────────────────────────────────────────
 //
-// Float's operators follow the spec's total order through the runtime helpers. `ieee_eq`
-// is the one way back to IEEE 754 equality, so it alone is C's own `==`: NaN is unequal to
-// everything, itself included.
+// `eq` and `cmp` on a scalar the built-in trait table gives Eq or Ord are the explicit forms
+// of `==` and `<`, so they reach the comparisons the operators reach and cannot give a
+// different answer. `ieee_eq` is Float's one way back to IEEE 754 equality, so it alone is
+// C's own `==`: NaN is unequal to everything, itself included.
 
-fn ieee_op_for_method(method: Str) -> Str {
-    let mut table: Map[Str, Str] = Map()
-    table.insert("ieee_eq", "==")
-    table.get(method) ?? ""
+type ScalarCompare { NotOne, IeeeEq, Eq, Cmp }
+
+fn scalar_compare_of(kind: TyKind, method: Str) -> ScalarCompare {
+    // Every method call reaches this test, so a kind with no row skips building the table.
+    if !tc_scalar_has_eq(kind) { return ScalarCompare.NotOne }
+    let mut table: Map[Str, ScalarCompare] = Map()
+    table.insert("ieee_eq", ScalarCompare.IeeeEq)
+    table.insert(method_eq, ScalarCompare.Eq)
+    table.insert(method_cmp, ScalarCompare.Cmp)
+    let row = table.get(method) ?? ScalarCompare.NotOne
+    let held = match row {
+        ScalarCompare.NotOne => false
+        ScalarCompare.IeeeEq => kind == TyKind.Float
+        ScalarCompare.Eq => tc_scalar_has_eq(kind)
+        ScalarCompare.Cmp => tc_scalar_has_ord(kind)
+    }
+    if held { row } else { ScalarCompare.NotOne }
 }
 
-fn cc_is_ieee_compare(kind: TyKind, method: Str) -> Bool {
-    if kind != TyKind.Float { return false }
-    ieee_op_for_method(method) != "" || float_total_row(method) != ""
+fn cc_is_scalar_compare(kind: TyKind, method: Str) -> Bool {
+    scalar_compare_of(kind, method) != ScalarCompare.NotOne
 }
 
-fn cc_ieee_compare(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
-    if cc_is_float_total_compare(kind, method) { return cc_float_total_compare(node, obj, kind, method) }
+fn cc_scalar_compare(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
     if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let rhs = lower_expr(sublist_get(node_args(node), 0))
+    if rhs < 0 { return -1 }
+    match scalar_compare_of(kind, method) {
+        ScalarCompare.Cmp => cc_scalar_order(node, recv_tid, recv, rhs)
+        ScalarCompare.Eq => cc_values_equal(node, recv_tid, recv, rhs)
+        _ => cc_ieee_equal(node, recv, rhs)
+    }
+}
+
+fn cc_ieee_equal(node: Int, recv: Int, rhs: Int) -> Int ! Diag.Report {
     let answer = cc_local(TYPE_BOOL, node)
     if cc_stopped(answer) { return -1 }
-    let recv = lower_expr(obj)
-    if recv < 0 { return -1 }
-    let rhs = lower_expr(sublist_get(node_args(node), 0))
-    if rhs < 0 { return -1 }
-    ir_binary(TYPE_BOOL, node, answer.c_spelling, ieee_op_for_method(method), recv, rhs)
+    ir_binary(TYPE_BOOL, node, answer.c_spelling, "==", recv, rhs)
 }
 
-fn float_total_row(method: Str) -> Str {
-    let mut table: Map[Str, Str] = Map()
-    table.insert("eq", "eq")
-    table.insert("cmp", "cmp")
-    table.get(method) ?? ""
+// The runtime helper that answers a kind's order as a sign, for a kind C's own < does not
+// order the way the language does: a Str is a pointer, and C's < answers false for every
+// NaN. "" is a kind C orders itself.
+pub fn cg_call_order_sign_helper(k: TyKind) -> Str {
+    if k == TyKind.Str { return "str_cmp" }
+    if k == TyKind.Float { return "float_cmp" }
+    ""
 }
 
-fn cc_is_float_total_compare(kind: TyKind, method: Str) -> Bool {
-    kind == TyKind.Float && float_total_row(method) != ""
-}
-
-// `x.eq(y)` and `x.cmp(y)` on a Float are the operators' own helpers, so the method and the
-// operator cannot give two answers. The helper's int is bound once: the Ordering is chosen
-// by two tests of it, and a second evaluation of an operand would repeat its effects.
-fn cc_float_total_compare(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
-    let given = sublist_length(node_args(node))
-    if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
-    let recv = lower_expr(obj)
-    if recv < 0 { return -1 }
-    let rhs = lower_expr(sublist_get(node_args(node), 0))
-    if rhs < 0 { return -1 }
-    if float_total_row(method) == "eq" {
-        let bools = cc_local(TYPE_BOOL, node)
-        if cc_stopped(bools) { return -1 }
-        return cc_helper_equal(node, bools, "float_eq", recv, rhs)
-    }
-    let ints = cc_local(TYPE_INT, node)
-    if cc_stopped(ints) { return -1 }
+// The Ordering is chosen by two tests, so what they read is bound once: the helper's sign
+// against zero, or else the two operands themselves. A second evaluation of an operand
+// would repeat its effects.
+fn cc_scalar_order(node: Int, tid: Int, recv: Int, rhs: Int) -> Int ! Diag.Report {
     let otid = cc_ordering_tid(node)
     if otid < 0 { return -1 }
     let orec = cc_local(otid, node)
@@ -4754,13 +4760,32 @@ fn cc_float_total_compare(node: Int, obj: Int, kind: TyKind, method: Str) -> Int
     if less < 0 || equal < 0 || greater < 0 { return -1 }
     let bools = cc_local(TYPE_BOOL, node)
     if cc_stopped(bools) { return -1 }
-    let sign = c_mint_local("cmp")
-    let cmp = ir_call_runtime(TYPE_INT, node, ints.c_spelling, c_runtime_helper("float_cmp"), SlotForm.InlineWord, [recv, rhs])
-    cg_expr_push_pending(node, ir_let(TYPE_INT, node, ints.c_spelling, sign, ints.slot_form, cmp))
-    let is_less = ir_binary(TYPE_BOOL, node, bools.c_spelling, "<", cc_temp_ref(node, TYPE_INT, ints, sign), ir_const(TYPE_INT, node, ints.c_spelling, "0"))
-    let is_equal = ir_binary(TYPE_BOOL, node, bools.c_spelling, "==", cc_temp_ref(node, TYPE_INT, ints, sign), ir_const(TYPE_INT, node, ints.c_spelling, "0"))
+    let helper = cg_call_order_sign_helper(cc_kind(tid))
+    let read_tid = if helper != "" { TYPE_INT } else { tid }
+    let reads = cc_local(read_tid, node)
+    if cc_stopped(reads) { return -1 }
+    let left = c_mint_local("cmp")
+    let mut right = ""
+    if helper != "" {
+        let sign = ir_call_runtime(TYPE_INT, node, reads.c_spelling, c_runtime_helper(helper), SlotForm.InlineWord, [recv, rhs])
+        cg_expr_push_pending(node, ir_let(TYPE_INT, node, reads.c_spelling, left, reads.slot_form, sign))
+    } else {
+        right = c_mint_local("cmp")
+        cg_expr_push_pending(node, ir_let(tid, node, reads.c_spelling, left, reads.slot_form, recv))
+        cg_expr_push_pending(node, ir_let(tid, node, reads.c_spelling, right, reads.slot_form, rhs))
+    }
+    let is_less = ir_binary(TYPE_BOOL, node, bools.c_spelling, "<",
+        cc_temp_ref(node, read_tid, reads, left), cc_order_right(node, read_tid, reads, right))
+    let is_equal = ir_binary(TYPE_BOOL, node, bools.c_spelling, "==",
+        cc_temp_ref(node, read_tid, reads, left), cc_order_right(node, read_tid, reads, right))
     let rest = ir_select(otid, node, orec.c_spelling, orec.slot_form, is_equal, equal, greater)
     ir_select(otid, node, orec.c_spelling, orec.slot_form, is_less, less, rest)
+}
+
+// What the left read is tested against: the bound right operand, or zero for a sign.
+fn cc_order_right(node: Int, tid: Int, reads: LayoutRecord, right: Str) -> Int {
+    if right == "" { return ir_const(TYPE_INT, node, reads.c_spelling, "0") }
+    cc_temp_ref(node, tid, reads, right)
 }
 
 fn cc_is_char_text(kind: TyKind, method: Str) -> Bool {

@@ -98,6 +98,8 @@ method name and never the arm:
 
 | method | args | reads |
 |---|---|---|
+| `eq` on Int, Float, Char, Str, Bool, sized ints | 1 | typed |
+| `cmp` on Int, Float, Char, Str, sized ints | 1 | typed |
 | `Int.min`, `Int.max` | 1 | none |
 | sized `wrapping_add`, `wrapping_sub`, `wrapping_mul` | 1 | none |
 | `Int.to_str`, `Int.to_string`, `Int.to_float`, `Int.abs`, `Int.to_i8` … `Int.to_u64` | 0 | none |
