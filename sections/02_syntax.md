@@ -39,7 +39,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Statement terminator | Newline | No semicolons. Canonical formatting makes them redundant. Saves 1 token per line across every file. See [2.5](#25-contested-no-semicolons). |
 | String delimiter | `"double quotes"` only | One string syntax. No single quotes, no backticks, no raw strings. Zero style debates. A prefix (`#`, `t`) changes how the content is read, never the delimiter. See [2.4.3](#243-template-literals-t). |
 | String interpolation | `"Hello, {name}!"` | Universal — every string supports `{expr}`. No `f"..."` prefix needed. Literal brace via `\{`. A `t` prefix makes a template literal (§2.4.3). See [2.4](#24-contested-universal-interpolation). |
-| Bindings | `let` / `let mut` | Immutable by default. `let mut` is a deliberate speed bump that says "this will change." `:=` was rejected 5-0 — it's ambiguous about mutability. Parameters follow the same rule: `mut name: T` (§3.6 *Mutable Parameters*). |
+| Bindings | `let` / `let mut` | Immutable by default. `let mut` is a deliberate speed bump that says "this will change." `:=` was rejected 5-0 — it's ambiguous about mutability. Parameters follow the same rule: `mut name: T` (§3.6 *Mutable Parameters*). In a pattern, `mut` goes before each name that changes: `let (mut x, y) = pair` (§3.5 *Mutable Binders*). |
 | Pattern matching | `match val { P => e }` | Expression-based. `=>` for arms (not `->`, which means return type). |
 | Match arm separator | Newline | No commas between arms. Consistent with the newline-terminated philosophy. |
 | Generic syntax | `List[Str]` | Square brackets. Zero parsing ambiguity with comparison operators. See [2.6](#26-contested-square-bracket-generics). |
@@ -67,6 +67,8 @@ All decided through independent design and cross-team voting. None are revisitab
 - each name in a `match` arm pattern;
 - each name in a `for` loop pattern (§2.10);
 - the name after `as` in `with expr as name { }`.
+
+Each of these is immutable unless it is declared `mut`. In a pattern, `mut` goes directly before the name: `let (mut x, y) = pair`, `for (k, mut v) in pairs`, `Some(mut n) =>` (§3.5 *Mutable Binders*). The name after `as` in `with` is never `mut` (§2.18).
 
 A local binding hides a module qualifier of the same name for its scope (§10.1 *Qualified Access*).
 
@@ -632,7 +634,7 @@ Same logic applies to arena-allocated values — closures capturing arena bindin
 - `let` captures: immutable. Equivalent to a copy, except that a change to a shared cell (§3.6) through another name shows through the capture
 - `let mut` captures: mutations visible across closure boundary
 - No explicit capture syntax (no `move`, no capture lists)
-- `async.spawn` closures: immutable captures only. `let mut` captures are compile error E0650
+- `async.spawn` closures: immutable captures only. A capture of a `let mut` binding or a `mut` pattern binder (§3.5 *Mutable Binders*) is compile error E0650
 - A function value passed to `async.spawn` whose row contains `State`, closure or named function, is compile error E0651 (§4.16.6)
 - `async.spawn` freezes each shared cell its captures reach until the spawner joins the task; a write to a frozen cell panics
 - A handler in force at an `async.spawn` site whose captures reach a shared cell is homed: its ops run on the task that ran its `with`
@@ -710,6 +712,15 @@ loop {
 ```
 
 `break` exits the loop. `continue` skips to the next `__iter.next()` call.
+
+The loop pattern is a `match` arm pattern, so each name in it is immutable unless it is declared `mut` (§3.5 *Mutable Binders*):
+
+```blink
+for (name, mut score) in scores {
+    score += bonus
+    io.println("{name}: {score}")
+}
+```
 
 **Ranges:**
 
@@ -1456,6 +1467,7 @@ Here `mock_db(fixtures)` is an effect handler (no `as`) and `f` is a scoped `Clo
 - `Closeable` bindings cannot be stored in fields or collections within the block (compile error E0602)
 - Multiple resources clean up in LIFO order (reverse declaration order)
 - Partial acquisition: if `expr2` fails via `?`, only resources from earlier bindings are cleaned up
+- The name after `as` is a plain name, never `mut`. Cleanup runs `close()` on the value that `with` acquired, and an assignment to the name would make it close a different value. `with expr as mut f` is `error[E0613] MutOnPattern`; the help says to remove `mut`. A method that writes to a file or a socket takes plain `self` (§3.6 *What `mut self` covers*), so the name needs no `mut` for such calls
 
 ---
 
@@ -2814,7 +2826,7 @@ error[NotAPlace]: cannot assign to a temporary value
   = help: bind it first: `let mut c = mk()`, then `c.x = 5`
 ```
 
-**An immutable root.** `x = v`, `x op= v` and `s.f = v` on a plain `let` root are E0610, the same error as a mutating method call on that root. The fix depends on how the root is declared (§3.2.2). An assignment inside a closure to a captured binding gets the same error. A label marks the capture, and the fix goes at the `let`:
+**An immutable root.** `x = v`, `x op= v` and `s.f = v` on a plain `let` root, or on a pattern binder with no `mut` (§3.5 *Mutable Binders*), are E0610, the same error as a mutating method call on that root. The fix depends on how the root is declared (§3.2.2). An assignment inside a closure to a captured binding gets the same error. A label marks the capture, and the fix goes at the `let`:
 
 ```
 error[MutationRequiresMut]: cannot assign to `total`, which is not `mut`
@@ -2829,7 +2841,7 @@ error[MutationRequiresMut]: cannot assign to `total`, which is not `mut`
   = help: declare it `let mut total`
 ```
 
-**Rollout.** NotAPlace (E0611) and E0610 on an assignment are errors from the first release that has them. None of these programs had a meaning under this section. ParamAssign (E0612) keeps the rollout of §3.6 *Mutable Parameters*.
+**Rollout.** NotAPlace (E0611) and E0610 on an assignment are errors from the first release that has them. None of these programs had a meaning under this section. The same holds for E0610 on a pattern binder and for MutOnPattern (E0613, §3.5). ParamAssign (E0612) keeps the rollout of §3.6 *Mutable Parameters*.
 
 **Panel vote: 6-0** on each point: E0610 for an immutable root, NotAPlace for a `Ptr` step and a temporary root, a code for ParamAssign, the order of the four cases, the `Ptr` fix rules, help only for a module-level `let`, and errors at once. The `Ptr` fix rules passed 6-0 in a second round. See [decisions/assignment-place-diagnostics.md](../decisions/assignment-place-diagnostics.md).
 

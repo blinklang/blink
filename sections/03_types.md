@@ -459,12 +459,14 @@ trait StringBuildOps {
 
 ##### Construction and Mutability
 
-Collections are constructed via `Type.new()` for empty collections or literal syntax where available. `List.with_capacity(n)` also makes an empty list (see *Capacity* below). A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A mutation needs a mutable **root**: the first name of the receiver path or of the place must be a `let mut` binding or a `mut` parameter. A mutation is a call to a mutating method, or an assignment `=` or `op=` (§2.22 *Assignment places*). `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`. A `mut` parameter is a mutable root only for a call. An assignment to a parameter, or to a field of one, is `error[E0612] ParamAssign` with or without `mut` (§3.6 *Mutable Parameters*), and the compiler reports it in place of E0610 (§2.22 *Writes that are not to a place*).
+Collections are constructed via `Type.new()` for empty collections or literal syntax where available. `List.with_capacity(n)` also makes an empty list (see *Capacity* below). A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A mutation needs a mutable **root**: the first name of the receiver path or of the place must be a `let mut` binding, a `mut` pattern binder (§3.5 *Mutable Binders*) or a `mut` parameter. A mutation is a call to a mutating method, or an assignment `=` or `op=` (§2.22 *Assignment places*). `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`. A `mut` parameter is a mutable root only for a call. An assignment to a parameter, or to a field of one, is `error[E0612] ParamAssign` with or without `mut` (§3.6 *Mutable Parameters*), and the compiler reports it in place of E0610 (§2.22 *Writes that are not to a place*).
 
 The fix for E0610 depends on how the root is declared:
 
 - **A local `let` with a plain name:** a machine-applicable fix inserts `mut` (`let mut names`). When several mutations have the same root, they get the same edit, and `blink fix` applies it once (§8.6).
-- **A `let` that destructures, a `for` variable, or a `match` binding:** help only.
+- **A local pattern binder** (a name in a destructuring `let`, a `for` pattern or a `match` arm): a machine-applicable fix inserts `mut` before the binder where it is declared (§3.5 *Mutable Binders*). The help shows the user's own pattern after the edit, for example `for (k, mut v) in pairs` or `Point { x: mut px, .. }`. In an OR-pattern, the fix edits every alternative.
+- **A binder in a parameter pattern:** it is a parameter (§3.6 *Mutable Parameters*). An assignment to it is E0612, not E0610.
+- **The name after `as` in `with expr as name { }`:** help only. That name is never `mut` (§2.18). The help says to bind a new `let mut` name inside the block.
 - **A module-level `let`:** help only. The help says why in one clause: `mut` adds `State` to the row of each function that reads or writes the binding (§4.16), which can cause errors far from the edit.
 - **A `pub let` from another module:** help only. The help says that `pub let mut` is not allowed (E1013, §2.12.1).
 
@@ -487,7 +489,7 @@ let mut form = Form { tags: List.new() }
 form.tags.push("new")                           // OK — root `form` is mut
 ```
 
-**Why `Type.new()` + `let mut`.** Mutability is a property of the *binding*, not the *type*. `List[T]` is one type regardless of whether the binding is mutable — no `MutList`/`ImmutableList` split, no doubled API surface, no coercion rules at function boundaries. `mut` marks every place where a mutation starts: each mutating call and each assignment names a `let mut` binding or a `mut` parameter. It does not mark every value that changes. Collections are shared cells (§3.6 *Shared cells*), so an immutable name can observe a change made through a `mut` alias:
+**Why `Type.new()` + `let mut`.** Mutability is a property of the *binding*, not the *type*. `List[T]` is one type regardless of whether the binding is mutable — no `MutList`/`ImmutableList` split, no doubled API surface, no coercion rules at function boundaries. `mut` marks every place where a mutation starts: each mutating call and each assignment names a `let mut` binding, a `mut` pattern binder or a `mut` parameter. It does not mark every value that changes. Collections are shared cells (§3.6 *Shared cells*), so an immutable name can observe a change made through a `mut` alias:
 
 ```blink
 let a = [1, 2]
@@ -2183,11 +2185,13 @@ pattern       ::= or_pattern
 
 or_pattern    ::= bind_pattern ( "|" bind_pattern )*
 
-bind_pattern  ::= IDENT "as" atomic_pattern
+bind_pattern  ::= binder "as" atomic_pattern
                |  atomic_pattern
 
+binder        ::= "mut"? IDENT                                // a name the pattern binds
+
 atomic_pattern ::= "_"                                        // wildcard
-               |   IDENT                                      // variable binding
+               |   binder                                     // variable binding
                |   INT_LIT                                    // integer literal
                |   FLOAT_LIT                                  // float literal
                |   BOOL_LIT                                   // true | false
@@ -2209,14 +2213,14 @@ field_patterns ::= field_pattern ( "," field_pattern )* ( "," ".." )?
                |   ".."
 
 field_pattern  ::= MEMBER_NAME ":" pattern                    // field with sub-pattern; a keyword is legal (§2.23)
-               |   IDENT                                      // field punning; never a keyword
+               |   binder                                     // field punning; the name is never a keyword
 
 guard         ::= "if" expression
 
 match_arm     ::= pattern guard? "=>" expression
 ```
 
-`TYPE_NAME` and `IDENT` are both identifiers. The scrutinee type decides whether a bare name is a variant or a binding (*Bare names: variant or binding*, below).
+`TYPE_NAME` and `IDENT` are both identifiers. The scrutinee type decides whether a bare name is a variant or a binding (*Bare names: variant or binding*, below). A `mut` before a name that is a variant is not a binder (*Mutable Binders*, below).
 
 #### Pattern Forms
 
@@ -2365,7 +2369,7 @@ match config {
 
 #### OR-Patterns
 
-Multiple patterns separated by `|` share a single arm body. All alternatives must bind the same set of variable names with the same types. `|` binds looser than constructor application, tighter than `=>`. No nested OR inside constructors — use `Some(1) | Some(2)`, not `Some(1 | 2)`.
+Multiple patterns separated by `|` share a single arm body. All alternatives must bind the same set of variable names with the same types and the same mutability (*Mutable Binders*, below). `|` binds looser than constructor application, tighter than `=>`. No nested OR inside constructors — use `Some(1) | Some(2)`, not `Some(1 | 2)`.
 
 ```blink
 match status_code {
@@ -2390,6 +2394,20 @@ error[InconsistentPatternBindings]: inconsistent bindings in OR-pattern
   |     ^^^^^^^   ^^^^ `None` does not bind `x`
   |
   = help: all alternatives must bind the same variables
+```
+
+A binder that is `mut` in one alternative and not in another gets the same error. The fix puts `mut` on the binder in every alternative. `blink fix` can apply it, because the alternatives share one arm body:
+
+```
+error[InconsistentPatternBindings]: inconsistent bindings in OR-pattern
+ --> input.bl:5:5
+  |
+5 |     Event.Click(mut x, y) | Event.Touch(x, y) => step(x, y)
+  |                 -----                  ^ `x` is not `mut` here
+  |                 |
+  |                 `x` is `mut` here
+  |
+  = help: write `mut x` in every alternative, or in none
 ```
 
 #### Range Patterns
@@ -2436,6 +2454,83 @@ match event {
     _ => {}
 }
 ```
+
+#### Mutable Binders (`mut`)
+
+A **binder** is a name that a pattern binds: a variable binding, a punned field name, or the name before `as`. A binder is immutable, like a `let` binding (§2.2). To make a binder mutable, write `mut` directly before it. `let mut x = v` is the one-binder case of this rule. The rule is the same in `let`, `for`, `match` arms and parameter patterns.
+
+```blink
+fn widen(pair: (Int, Int), pts: List[(Str, Int)], o: Int?) {
+    let (mut lo, mut hi) = pair         // two mutable binders
+    lo -= 1
+    hi += 1
+
+    let (mut count, total) = (0, 10)    // `total` is not mut
+    count += total
+    io.println("{lo} {hi} {count}")
+
+    for (name, mut score) in pts {      // only `score` is mut
+        score += 1
+        io.println("{name}: {score}")
+    }
+
+    match o {
+        Some(mut n) => {
+            n *= 2
+            io.println("{n}")
+        }
+        None => {}
+    }
+}
+```
+
+**`mut` marks one name.** `mut` applies to the binder right after it and to nothing else. In `let mut whole as (a, b) = pair`, only `whole` is mutable; `a` and `b` are not. To make each of them mutable, write `let mut whole as (mut a, mut b) = pair`.
+
+**Struct fields.** In a punned field, `mut` goes before the field name: `Point { mut x, .. }` is short for `Point { x: mut x, .. }`. In a renamed field, `mut` goes before the binder after the colon: `Point { x: mut px, .. }`. A field label is not a binder, so `Point { mut x: px }` is an error (below).
+
+**`mut` before a pattern that is not a binder.** `mut` before a tuple, a struct, a constructor, a variant, `_`, a literal or a range binds no name. This is `error[E0613] MutOnPattern`. `blink fix` can apply each fix:
+
+| Code | Fix |
+|---|---|
+| `let mut (x, y) = pair` | `let (mut x, mut y) = pair` |
+| `for mut (k, v) in pairs` | `for (mut k, mut v) in pairs` |
+| `Some(mut Point { x, y })` | `Some(Point { mut x, mut y })` |
+| `Point { mut x: px }` | `Point { x: mut px }` |
+| `mut _`, `mut 5`, `mut None` | remove `mut` |
+
+For a tuple, struct or constructor, the fix puts `mut` on every binder inside it. This keeps the meaning of the old form. `for mut i in xs` is legal: `i` is a binder.
+
+```
+error[MutOnPattern]: `mut` must come before a name, not a tuple pattern
+ --> pair.bl:2:9
+  |
+2 |     let mut (x, y) = pair
+  |         ^^^ this `mut` marks no name
+  |
+  = help: put `mut` on each name that changes: `let (mut x, mut y) = pair`
+```
+
+**A `mut` binder is a mutable root.** A `mut` binder follows every rule for a `let mut` binding. It can be the root of an assignment or a mutating method call (§3.2.2 *Construction and Mutability*). `async.spawn` cannot capture it (E0650, §2.8). `warning[UnusedMut]` fires on each `mut` binder that the body never mutates (§3.6 *Lints*). A mutation whose root is a binder with no `mut` is `error[E0610] MutationRequiresMut`, and the fix inserts `mut` before that binder.
+
+**A binder is a new local.** Binding copies the matched value into the binder, as `let` does. An assignment to a `mut` binder changes the binder only, never the matched value. A shared cell in the value stays shared (§3.6 *Shared cells*), so a mutating call on it shows through both names:
+
+```blink
+type User { name: Str, visits: Int, tags: List[Str] }
+
+fn visit(u: User?) {
+    match u {
+        Some(mut v) => {
+            v.visits += 1               // changes `v` only; `u` keeps the old count
+            v.tags.push("seen")         // `tags` is a shared cell: `u` sees "seen" too
+        }
+        None => {}
+    }
+}
+```
+
+**Parameter patterns.** Each binder in a parameter pattern is a parameter (§3.6 *Mutable Parameters*). `mut` makes it a mutable root for a mutating method call only. An assignment to it is `error[E0612] ParamAssign`, with or without `mut`.
+
+**`with ... as`.** The name after `as` in `with expr as name { }` is not a pattern binder. It is never `mut` (§2.18 *Rules*).
 
 #### Guard Clauses
 
@@ -2541,6 +2636,9 @@ let User { name, email, .. } = get_current_user()
 
 // Ignoring elements
 let (_, count) = tally(items)
+
+// Mutable names: `mut` goes before each name that changes
+let (mut lo, hi) = bounds(xs)
 
 // In for loops
 for (key, value) in map {
@@ -2863,6 +2961,15 @@ impl Push for Stack {
 }
 ```
 
+**Parameter patterns.** Each binder in a parameter pattern is a parameter and follows the rules of this subsection. `mut` on it allows a mutating method call. An assignment to it is E0612 (below), with or without `mut`:
+
+```blink
+fn fill((mut xs, n): (List[Int], Int)) -> Int {
+    xs.push(n)                          // OK — `xs` is a mut parameter
+    xs.len()
+}
+```
+
 **A parameter is never assigned.** An assignment to a parameter, or to a field of one, is always a compile error, `error[E0612] ParamAssign`, with or without `mut`, `self` included. Such a write changes only the callee's copy of the value (§3.6 *`self` is always passed by value*), so the caller never sees it. To change a value locally, copy it to a new `let mut` name:
 
 ```blink
@@ -2941,7 +3048,7 @@ impl Display for Marker {
 | Warning | Fires on | Help |
 |---|---|---|
 | `MutAliasOfImmutable` | An argument to a `mut` parameter, or the right side of `let mut b = a`, when it is a place with a non-`mut` root | "`b` shares `a`'s collections; a change through `b` is visible through `a`" |
-| `UnusedMut` | A `let mut` binding or `mut` parameter whose body never uses the mutability | Remove `mut`. Does not fire on a `mut` an impl keeps from its trait, or on `@ffi` parameters |
+| `UnusedMut` | A `let mut` binding, `mut` pattern binder or `mut` parameter whose body never uses the mutability. It fires on each binder alone | Remove `mut` from that name. Does not fire on a `mut` an impl keeps from its trait, or on `@ffi` parameters |
 
 `MutAliasOfImmutable` checks direct aliases only. An alias made through a call result (`id(a)`) or a struct literal (`W { xs: a }`) passes it. An immutable `let` is not a promise that the value behind it never changes (§3.2.2).
 

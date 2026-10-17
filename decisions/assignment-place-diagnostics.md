@@ -11,7 +11,7 @@
 - `ParamAssign` gets E0612 now. Its code does not change when it moves from warning to error.
 - Order, first that applies wins: a `Ptr` step, a temporary root, a parameter root, an immutable binding.
 - `p.f = rhs` through a `Ptr`: the direct fix `p.f.write(rhs)` is machine-applicable when `rhs` is a literal, a name or a field path of names (no operators). Any other `rhs` in a block statement gets a machine-applicable fix that binds `rhs` to a new name first. Otherwise help only. `op=` through a `Ptr` is help only, with a note that it is not atomic.
-- "Insert `mut`" is machine-applicable for a local plain-name `let` only. A module-level `let` gets help only, because `mut` adds `State` to rows far from the edit (§4.16). An imported `pub let` gets help naming E1013. A destructuring `let`, a `for` variable and a `match` binding get help only.
+- "Insert `mut`" is machine-applicable for a local plain-name `let` only. A module-level `let` gets help only, because `mut` adds `State` to rows far from the edit (§4.16). An imported `pub let` gets help naming E1013. A destructuring `let`, a `for` variable and a `match` binding get help only. *(Amended by [`mut` in Patterns](mut-in-patterns.md): a local pattern binder now gets a machine-applicable fix.)*
 - Every new case is an error at once. `ParamAssign` keeps its warn-first rollout.
 - A closure's assignment to a captured immutable binding is E0610, with a label at the capture and the fix at the `let`. `blink fix` applies an identical edit once (§8.6).
 
