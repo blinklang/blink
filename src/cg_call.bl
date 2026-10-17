@@ -1444,6 +1444,22 @@ fn cc_checked_pop(node: Int) -> Int ! Diag.Report {
     cc_temp_ref(node, tid, carrier, held)
 }
 
+// `.remove(i)` on a List answers the bare element, not an Option: blink_list_remove makes
+// the bounds test itself and panics as an out-of-range `xs[i]` does, so unlike `get` and
+// `pop` there is no carrier to fill and the call is the whole lowering.
+fn cc_list_remove(node: Int, obj: Int) -> Int ! Diag.Report {
+    let written = node_args(node)
+    let given = sublist_length(written)
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.List, "remove", 1, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let receiver = lower_expr(obj)
+    if receiver < 0 { return -1 }
+    let index = lower_expr_as_value(sublist_get(written, 0))
+    if index < 0 { return -1 }
+    cg_call_element_from_runtime(node, tid, c_runtime_helper("list_remove"), [receiver, index])
+}
+
 // Neither syntax. The seam reads an element, so a node that is not one of the two reads
 // reached it by a wrong dispatch arm rather than by a gap in this stage.
 fn cc_not_an_element_read(node: Int) -> Int ! Diag.Report {
@@ -3621,6 +3637,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if kind == TyKind.Template { return cc_template_method(node, obj, mname) }
     let primitive = cc_runtime_method(kind, mname)
     if primitive != "" { return cc_lower_runtime_method(node, obj, kind, mname, primitive) }
+    if kind == TyKind.List && cc_is_list_remove(mname) { return cc_list_remove(node, obj) }
     if kind == TyKind.Channel && cc_is_channel_recv(mname) { return cc_channel_recv(node, obj) }
     if kind == TyKind.Channel && cc_is_channel_send(mname) { return cc_channel_send(node, obj) }
     let keyed = cc_keyed_row(kind, mname)
@@ -3946,6 +3963,7 @@ fn cc_runtime_method(kind: TyKind, method: Str) -> Str {
         let mut table: Map[Str, Str] = Map()
         table.insert("push", "list_push")
         table.insert("set", "list_set")
+        table.insert("insert", "list_insert")
         return table.get(method) ?? ""
     }
     if kind == TyKind.Channel {
@@ -3962,6 +3980,7 @@ fn cc_runtime_method_arity(op: Str) -> Int {
     let mut table: Map[Str, Int] = Map()
     table.insert("list_push", 1)
     table.insert("list_set", 2)
+    table.insert("list_insert", 2)
     table.insert("channel_close", 0)
     table.get(op) ?? NO_ARITY
 }
@@ -5298,7 +5317,9 @@ fn cc_num_intrinsic(kind: TyKind, method: Str) -> Str {
 // `len`, `is_empty` and `clear` are absent because real impls answer them, as they do for
 // Str; an impl method that only hands `self` to a foreign binding is called through that
 // binding (cc_forwarded_binding), so `len` still reaches list_len. `push` and `set` are
-// absent because no Blink declaration answers them; they reach cc_runtime_method instead. `get`, `pop` and `contains` are absent because none of the
+// absent because no Blink declaration answers them; they reach cc_runtime_method instead,
+// as does `insert`. `remove` is one runtime call too, but it answers an element the slot
+// word has to be decoded into, so cc_list_remove builds it. `get`, `pop` and `contains` are absent because none of the
 // three is one call: the first two fill a carrier behind a bounds or emptiness test, and
 // the last is a scan. Each is refused under its own name in cc_list_not_built.
 //
@@ -5326,6 +5347,12 @@ fn cc_list_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
 fn cc_is_list_take(method: Str) -> Bool {
     let mut table: Map[Str, Bool] = Map()
     table.insert("take", true)
+    table.get(method) ?? false
+}
+
+fn cc_is_list_remove(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("remove", true)
     table.get(method) ?? false
 }
 

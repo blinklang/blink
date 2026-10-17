@@ -568,6 +568,8 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.pop()` | Option[T] | Remove last |
 | `.get(idx)` | Option[T] | Element at index (None if OOB) |
 | `.set(idx, val)` | () | Set element (mutates) |
+| `.insert(idx, val)` | () | Insert at idx, shift the rest right (mutates); idx == len appends, idx outside 0..=len panics |
+| `.remove(idx)` | T | Remove and return the element at idx, shift the rest left (mutates); idx outside 0..len panics |
 | `.contains(elem)` | Bool | Membership check by `==`; needs `T: Eq` |
 | `.append(other)` | List[T] | Concatenate, returns a new list |
 | `.slice(start, end)` | List[T] | Sub-list |
