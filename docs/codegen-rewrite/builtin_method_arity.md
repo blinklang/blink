@@ -79,12 +79,12 @@ method name and never the arm:
 
 | method | args | reads |
 |---|---|---|
-| `get`, `push`, `remove`, `take`, `skip`, `chain`, `append`, `join`, `contains` | 1 | typed |
+| `get`, `push`, `remove`, `take`, `skip`, `chain`, `append`, `join`, `contains`, `index_of` | 1 | typed |
 | `map`, `flat_map`, `filter`, `for_each`, `any`, `all`, `find` | 1 | closure |
 | `zip` | 1 | arity |
 | `set`, `insert`, `slice` | 2 | typed |
 | `fold` | 2 | arity |
-| `len`, `count`, `pop`, `clear`, `enumerate`, `is_empty` | 0 | none |
+| `len`, `count`, `pop`, `last`, `clear`, `enumerate`, `is_empty` | 0 | none |
 
 ### Str
 

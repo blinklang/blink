@@ -1333,7 +1333,7 @@ fn cc_read_is_checked(node: Int) -> Bool {
 //
 // `.pop()` reaches this same seam (cc_list_not_built) for the same reason -- it, too,
 // answers a carrier behind a test the runtime cannot make for it -- but it takes no index,
-// so it is built by cc_checked_pop below rather than grown into this one.
+// so it is built by cc_checked_tail below rather than grown into this one.
 fn cc_checked_read(node: Int) -> Int ! Diag.Report {
     if node_method(node) != method_get { return cc_checked_read_not_built(node) }
     let tid = tid_of_node(node)
@@ -1396,12 +1396,13 @@ fn cc_checked_read_not_built(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-// `.pop()` on a List: a length test filling an Option, the same shape cc_checked_read
-// builds for `.get(i)` with the index test and the index argument removed. blink_list_pop
-// removes the tail and answers it, and panics on an empty list the same way blink_list_get
-// panics on an out-of-bounds index, so it too is called only from the Some arm the guard
-// has already settled -- never ahead of the length test that decides whether that arm runs.
-fn cc_checked_pop(node: Int) -> Int ! Diag.Report {
+// `.pop()` and `.last()` on a List: a length test filling an Option, the same shape
+// cc_checked_read builds for `.get(i)` with the index test and the index argument removed.
+// blink_list_pop removes the tail and answers it, and blink_list_get at `len - 1` reads it
+// in place; each panics on an empty list the same way blink_list_get panics on an
+// out-of-bounds index, so each is called only from the Some arm the guard has already
+// settled -- never ahead of the length test that decides whether that arm runs.
+fn cc_checked_tail(node: Int, removes: Bool) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let container = tid_of_node(node_obj(node))
@@ -1428,8 +1429,14 @@ fn cc_checked_pop(node: Int) -> Int ! Diag.Report {
     cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
     let present = ir_binary(TYPE_BOOL, node, found.c_spelling, "!=",
         cc_temp_ref(node, TYPE_INT, found, said), ir_const(TYPE_INT, node, found.c_spelling, "0"))
-    let raw = ir_call_runtime(shape.tid, node, container_slot_spelling(), c_runtime_helper("list_pop"), shape.slot.slot_form,
-        [cc_temp_ref(node, container, recv_rec, recv_name)])
+    let recv_ref = cc_temp_ref(node, container, recv_rec, recv_name)
+    let raw = if removes {
+        ir_call_runtime(shape.tid, node, container_slot_spelling(), c_runtime_helper("list_pop"), shape.slot.slot_form, [recv_ref])
+    } else {
+        let tail_idx = ir_binary(TYPE_INT, node, found.c_spelling, "-",
+            cc_temp_ref(node, TYPE_INT, found, said), ir_const(TYPE_INT, node, found.c_spelling, "1"))
+        ir_call_runtime(shape.tid, node, container_slot_spelling(), c_runtime_helper("list_get"), shape.slot.slot_form, [recv_ref, tail_idx])
+    }
     let native = ir_cast(shape.tid, node, shape.slot.c_spelling, cc_from_slot_word(shape.tid, node, shape.slot, raw))
     let member = cc_member_layout(node, tid, Slot.Inner1)
     if cc_stopped(member) { return -1 }
@@ -4248,11 +4255,14 @@ fn cc_key_arg(node: Int, plan: KeyPlan, written: Int) -> Int ! Diag.Report {
 
 // ── Element scans ─────────────────────────────────────────────────────────
 
-// `xs.contains(x)`: a loop over the elements that reads and compares one per turn by the
-// element type's own `==`, stopping the first time it answers true. The receiver, its
-// length and the index are each bound once ahead of the loop, as lower_for_indexed binds
-// them for a for-in over the same container, so an append inside an element's written Eq
-// cannot change how many turns run.
+// `xs.contains(x)` and `xs.index_of(x)`: a loop over the elements that reads and compares
+// one per turn by the element type's own `==`, stopping the first time it answers true.
+// The receiver, its length and the index are each bound once ahead of the loop, as
+// lower_for_indexed binds them for a for-in over the same container, so an append inside
+// an element's written Eq cannot change how many turns run. The loop breaks with the index
+// on the match, so `index_of` answers the first one by wrapping that index after the loop.
+// The call's own type says which of the two was written: `contains` answers Bool and
+// `index_of` an Option[Int].
 fn cc_element_scan(node: Int, container: Int) -> Int ! Diag.Report {
     let elem = child_tid(container, Slot.Inner1)
     if elem < 0 {
@@ -4271,6 +4281,11 @@ fn cc_element_scan(node: Int, container: Int) -> Int ! Diag.Report {
     if cc_stopped(len_rec) { return -1 }
     let found_rec = cc_local(TYPE_BOOL, node)
     if cc_stopped(found_rec) { return -1 }
+    let answer_tid = tid_of_node(node)
+    if answer_tid < 0 { return -1 }
+    let answers_index = cc_kind(answer_tid) == TyKind.Option
+    let answer_rec = cc_local(answer_tid, node)
+    if cc_stopped(answer_rec) { return -1 }
     let recv_val = lower_expr(node_obj(node))
     if recv_val < 0 { return -1 }
 
@@ -4323,7 +4338,24 @@ fn cc_element_scan(node: Int, container: Int) -> Int ! Diag.Report {
     for bind in turn_binds { body.push(bind) }
     body.push(matched)
     cg_expr_push_pending(node, ir_loop(node, ir_block(node, body)))
-    cc_temp_ref(node, TYPE_BOOL, found_rec, found_name)
+    let found_ref = cc_temp_ref(node, TYPE_BOOL, found_rec, found_name)
+    if !answers_index { return found_ref }
+    cc_scan_index_carrier(node, answer_tid, answer_rec, found_ref, cc_temp_ref(node, TYPE_INT, idx_rec, idx_name))
+}
+
+// The Option[Int] `index_of` answers, filled from the scan's flag and the index it stopped at.
+fn cc_scan_index_carrier(node: Int, tid: Int, carrier: LayoutRecord, found: Int, idx: Int) -> Int ! Diag.Report {
+    let _td = ensure_typedef_for(tid)
+    let held = c_mint_local("cs")
+    cg_expr_push_pending(node, ir_let(tid, node, carrier.c_spelling, held, carrier.slot_form, -1))
+    let some = cg_expr_option_some(tid, node, carrier, idx)
+    if some < 0 { return -1 }
+    let none = cg_expr_option_none(tid, node, carrier)
+    if none < 0 { return -1 }
+    cg_expr_push_pending(node, ir_if(node, found,
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), some)]),
+        ir_block(node, [ir_assign(node, cc_temp_ref(node, tid, carrier, held), none)])))
+    cc_temp_ref(node, tid, carrier, held)
 }
 
 // What the runtime hands back, and what the call answers with it.
@@ -5723,20 +5755,36 @@ fn cc_pointer_body_not_lowered(node: Int) -> Int ! Diag.Report {
     -1
 }
 
-// The two List methods that are not one call, plus the scan. `get` and `pop` both answer
+// The List methods that are not one call, plus the scans. `get`, `pop` and `last` answer
 // a carrier filled behind a test the runtime cannot make for them -- a bounds test for
-// `get`, a length test for `pop` -- so each has its own lowering below. `contains` walks
-// the elements comparing each by the element type's `==`, which cc_element_scan builds as
-// a loop.
+// `get`, a length test for `pop` and `last` -- so each has its own lowering below.
+// `contains` and `index_of` walk the elements comparing each by the element type's `==`,
+// which cc_element_scan builds as a loop.
 fn cc_list_not_built(node: Int, method: Str) -> Int ! Diag.Report {
     if method == "get" { return cc_checked_read(node) }
-    if method == "pop" { return cc_checked_pop(node) }
-    if method == "contains" {
+    let tail = cc_list_tail_removes(method)
+    if tail.is_some() { return cc_checked_tail(node, tail.unwrap()) }
+    if cc_is_list_scan(method) {
         let container = tid_of_node(node_obj(node))
         if container < 0 { return -1 }
         return cc_element_scan(node, container)
     }
     cc_intrinsic_not_built(node, TyKind.List, method)
+}
+
+// The two reads of the tail, and whether each takes the element out of the list.
+fn cc_list_tail_removes(method: Str) -> Option[Bool] {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("pop", true)
+    table.insert("last", false)
+    table.get(method)
+}
+
+fn cc_is_list_scan(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("contains", true)
+    table.insert("index_of", true)
+    table.get(method) ?? false
 }
 
 // The higher-order methods the standard library already has a body for. The list of names

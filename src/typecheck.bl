@@ -2374,12 +2374,15 @@ fn tc_ops_trait_qualified_ret(method: Str, recv: Int, node: Int) -> Int ! TypeCh
         if method == "append" || method == "slice" || method == "take" || method == "skip" { return recv }
         // Refused here rather than by declining to the unresolved arm below: that arm asks
         // `tc_method_unavailable_on_receiver`, which is keyed on the receiver KIND alone, and
-        // `contains` is on the List surface for every element. Only this row knows the element.
-        if method == "contains" {
-            let need = tc_list_contains_elem_need(elem)
-            if need.len() > 0 { return tc_refuse_list_contains(node, recv, need) }
+        // `contains` and `index_of` are on the List surface for every element. Only this row
+        // knows the element.
+        if method == "contains" || method == "index_of" {
+            let need = tc_list_scan_elem_need(elem)
+            if need.len() > 0 { return tc_refuse_list_scan(node, recv, need, method) }
+            if method == "index_of" { return make_option_type(TYPE_INT) }
             return TYPE_BOOL
         }
+        if method == "last" { return make_option_type(elem) }
         if method == "join" { return TYPE_STR }
     }
     if k == TyKind.Map {
@@ -5352,12 +5355,13 @@ fn tc_builtin_method_arity(obj_k: TyKind, method: Str) -> Int {
     }
     if obj_k == TyKind.List {
         if method == "get" || method == "push" || method == "contains" || method == "join" || method == "remove" { return 1 }
+        if method == "index_of" { return 1 }
         if method == "take" || method == "skip" || method == "chain" || method == "append" || method == "zip" { return 1 }
         if method == "map" || method == "flat_map" || method == "filter" { return 1 }
         if method == "for_each" || method == "any" || method == "all" || method == "find" { return 1 }
         if method == "set" || method == "insert" || method == "slice" || method == "fold" { return 2 }
         if method == "len" || method == "count" || method == "pop" || method == "clear" { return 0 }
-        if method == "enumerate" || method == "is_empty" || method == "capacity" { return 0 }
+        if method == "enumerate" || method == "is_empty" || method == "capacity" || method == "last" { return 0 }
         return -1
     }
     if obj_k == TyKind.Str {
@@ -13568,6 +13572,7 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "push" { return 1 }
     if name == "pop" { return 1 }
     if name == "get" { return 1 }
+    if name == "last" { return 1 }
     if name == "set" { return 1 }
     if name == "join" { return 1 }
     if name == "clear" { return 1 }
@@ -14733,14 +14738,15 @@ fn tc_suggest_method(obj_k: TyKind, tname: Str, method: Str) -> Str {
     tc_builtin_method_edit1(obj_k, method)
 }
 
-// What `List[T].contains` needs of its element: the method walks the elements comparing
-// each with `==`, so `T` must be `Eq` (sections/03_types.md, *The `Contains` Trait*). The
-// answer is the same chain `==` reports, empty when the element is `Eq`.
+// What `List[T].contains` and `List[T].index_of` need of their element: each walks the
+// elements comparing each with `==`, so `T` must be `Eq` (sections/03_types.md, *The
+// `Contains` Trait* and *The `ListOps` Trait*). The answer is the same chain `==` reports,
+// empty when the element is `Eq`.
 //
 // An element nothing has chosen yet is not refused. There is no type to name as lacking the
 // comparison, and the instance the call is monomorphised to meets this same gate once its
 // element is decided.
-fn tc_list_contains_elem_need(elem: Int) -> List[Int] {
+fn tc_list_scan_elem_need(elem: Int) -> List[Int] {
     let k = type_kind(elem)
     if k == TyKind.Unknown { return [] }
     if tc_tid_has_unbound_metavar(elem) != 0 { return [] }
@@ -14751,10 +14757,10 @@ fn tc_list_contains_elem_need(elem: Int) -> List[Int] {
 // does not go on to flush the softer W0501 about the same call. The answer is poisoned
 // rather than absent, so a declared Bool over the call unifies with the recovery tid instead
 // of drawing a second error about a type the program never had.
-fn tc_refuse_list_contains(node: Int, obj_t: Int, need: List[Int]) -> Int ! Diag.Report {
+fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> Int ! Diag.Report {
     tc_unresolved_method_hard.insert(node, 1)
     let leaf = need.get(need.len() - 1).unwrap()
-    let mut help = "`.contains` compares elements with `==`, and `{type_to_str(leaf)}` does not implement `Eq`"
+    let mut help = "`.{method}` compares elements with `==`, and `{type_to_str(leaf)}` does not implement `Eq`"
     let k = type_kind(leaf)
     if k == TyKind.Struct || k == TyKind.Enum {
         let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
@@ -14762,7 +14768,7 @@ fn tc_refuse_list_contains(node: Int, obj_t: Int, need: List[Int]) -> Int ! Diag
     }
     if k == TyKind.Typevar { help = "{help}; add the bound `[{type_to_str(leaf)}: Eq]`" }
     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
-        "unresolved method `.contains` on type {type_to_str(obj_t)}", node, help)
+        "unresolved method `.{method}` on type {type_to_str(obj_t)}", node, help)
     tc_error_recovery_tid()
 }
 
@@ -18896,6 +18902,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "List")
                 return make_option_type(elem)
             }
+            if method == "last" { return make_option_type(elem) }
             if method == "push" {
                 check_builtin_arg(method, 0, elem, args_sl, "List")
                 return TYPE_VOID
@@ -19047,10 +19054,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 check_closure_ret(cls, TYPE_BOOL, method, "List")
                 return obj_t
             }
-            if method == "contains" {
-                let need = tc_list_contains_elem_need(elem)
-                if need.len() > 0 { return tc_refuse_list_contains(node, obj_t, need) }
+            if method == "contains" || method == "index_of" {
+                let need = tc_list_scan_elem_need(elem)
+                if need.len() > 0 { return tc_refuse_list_scan(node, obj_t, need, method) }
                 check_builtin_arg(method, 0, elem, args_sl, "List")
+                if method == "index_of" { return make_option_type(TYPE_INT) }
                 return TYPE_BOOL
             }
             if method == "is_empty" { return TYPE_BOOL }
