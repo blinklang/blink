@@ -359,7 +359,10 @@ match padded {
 
 // Common pattern: parse with default
 let timeout = config.get("timeout") ?? "30"
-let seconds = timeout.parse_int() ?? 30
+let seconds = match timeout.parse_int() {
+    Ok(n) => n
+    Err(_) => 30
+}
 ```
 
 ##### String Building
@@ -2830,7 +2833,11 @@ fn count(xs: List[Int]) -> Int {
     xs.len()
 }
 
-impl Stack {
+trait Push {
+    fn push(mut self, x: Int)
+}
+
+impl Push for Stack {
     fn push(mut self, x: Int) {
         self.items.push(x)              // OK — `mut self`
     }
@@ -2851,7 +2858,11 @@ fn gcd(a: Int, b: Int) -> Int {
     x
 }
 
-impl Point {
+trait WithX {
+    fn with_x(self, x: Int) -> Point
+}
+
+impl WithX for Point {
     fn with_x(self, x: Int) -> Point {
         Point { x: x, y: self.y }       // build a new value; `self.x = x` is an error
     }

@@ -2197,7 +2197,11 @@ assertion failed: assert(result == Ok(500))
 **An operand bound to a `mut` parameter gets no line.** This applies to the receiver of a mutating method (§3.2.2 *Construction and Mutability*) and to an argument bound to a `mut` parameter. The compiler does not bind that operand to a temporary. The call runs on the original place, as written. The callee signature decides this at compile time. The other operands of the call keep their lines:
 
 ```blink
-impl Queue {
+trait Enqueue {
+    fn try_push(mut self, job: Job) -> Bool
+}
+
+impl Enqueue for Queue {
     fn try_push(mut self, job: Job) -> Bool {
         // ...
     }
@@ -2890,7 +2894,11 @@ type Route {
     handler: fn(Request) -> Response
 }
 
-impl Route {
+trait Matcher {
+    fn match(self, path: Str) -> Bool
+}
+
+impl Matcher for Route {
     fn match(self, path: Str) -> Bool {
         path == self.pattern
     }

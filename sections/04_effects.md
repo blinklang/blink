@@ -554,7 +554,10 @@ server.post("/users", handle_create_user)
 
 ```blink
 pub fn handle_get_user(req: Request) -> Response ! IO, DB.Read {
-    let id = req.param("id").parse_int() ?? return Response.bad_request("Invalid ID")
+    let id = match req.param("id").parse_int() {
+        Ok(n) => n
+        Err(_) => return Response.bad_request("Invalid ID")
+    }
     match get_user(id) {
         Ok(user) => Response.json(user)
         Err(ApiError.NotFound(msg)) => Response.not_found(msg)
@@ -828,8 +831,11 @@ effect Env {
 ```blink
 fn load_config() -> Config ! Env.Read {
     let db = env.var("DATABASE_URL") ?? panic("DATABASE_URL not set")
-    let port = env.var("PORT") ?? "8080"
-    Config { db_url: db, port: port.parse_int() ?? 8080 }
+    let port = match (env.var("PORT") ?? "8080").parse_int() {
+        Ok(n) => n
+        Err(_) => 8080
+    }
+    Config { db_url: db, port: port }
 }
 
 fn run_cli() ! Env.Read, Env.Exit, IO {
