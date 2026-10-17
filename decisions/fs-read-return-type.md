@@ -1,5 +1,7 @@
 [< All Decisions](../DECISIONS.md)
 
+> **Erratum.** This record writes `W0603` for the `UnusedResult` lint. W0603 is `ShadowedVariable` in the spec and the compiler. The `UnusedResult` lint has code W0605, reserved in `ERROR_CATALOG.md` and not yet emitted. The vote text below stays as it was.
+
 # Filesystem `fs.read` Return Type (`Result[T, FsError]`) — Design Rationale
 
 Resolves **br jr4xf7** — "What does `fs.read` return — spec says `Result`, the compiler emits a bare `Str`." Three questions were on the table:
