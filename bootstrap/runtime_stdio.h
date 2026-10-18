@@ -59,11 +59,21 @@ BLINK_RT_FN void blink_stdin_advance(int64_t n) {
 }
 #endif
 
-/* Reads more of fd 0 onto the end of the buffer. Returns the count read, or 0 at end of
-   input. The caller holds blink_stdin_mu; a read failure drops it, then panics and names op. */
-BLINK_RT_FN int64_t blink_stdin_fill(const char* op);
+/* Why a read gave nothing back. Every read entry point fills one in while it holds
+   blink_stdin_mu and raises it only after it drops the lock, so a panic never runs with
+   the lock held and no path drops it twice. err is an errno; why is a static message for
+   bytes a Str cannot hold, and at is where in the input they start. */
+typedef struct {
+    int err;
+    const char* why;
+    int64_t at;
+} blink_stdin_fault_t;
+
+/* Reads more of fd 0 onto the end of the buffer. Returns the count read, 0 at end of input,
+   or -errno when the read fails. The caller holds blink_stdin_mu. */
+BLINK_RT_FN int64_t blink_stdin_fill(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_stdin_fill(const char* op) {
+BLINK_RT_FN int64_t blink_stdin_fill(void) {
     blink_stdin_reader_t* r = &blink_stdin_reader;
     if (r->cap - r->end < BLINK_STDIN_CHUNK && r->start > 0) {
         memmove(r->data, r->data + r->start, (size_t)(r->end - r->start));
@@ -90,34 +100,54 @@ BLINK_RT_FN int64_t blink_stdin_fill(const char* op) {
             struct pollfd pfd = { 0, POLLIN, 0 };
             if (poll(&pfd, 1, -1) >= 0 || errno == EINTR) continue;
         }
-        int err = errno;
-        pthread_mutex_unlock(&blink_stdin_mu);
-        __blink_panic_dispatchf("%s: cannot read standard input: %s (errno %d)",
-                                op, blink_strerror(err), err);
+        return -(int64_t)errno;
     }
 }
 #endif
 
-/* Gives out the next n buffered bytes as a Str, after the UTF-8 check that Bytes.to_str makes,
-   then skips `skip` more, and drops blink_stdin_mu. The bytes are taken even when the check
-   fails, as the derived bodies take them. The Str is on the GC heap: a line read inside
-   `with arena` is not an allocation of that block. */
-BLINK_RT_FN const char* blink_stdin_take_text(const char* op, int64_t n, int64_t skip);
+/* Fills until want bytes are buffered or the input ends. Records a read failure in *f. */
+BLINK_RT_FN void blink_stdin_fill_to(int64_t want, blink_stdin_fault_t* f);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_stdin_take_text(const char* op, int64_t n, int64_t skip) {
+BLINK_RT_FN void blink_stdin_fill_to(int64_t want, blink_stdin_fault_t* f) {
+    blink_stdin_reader_t* r = &blink_stdin_reader;
+    while (r->end - r->start < want) {
+        int64_t got = blink_stdin_fill();
+        if (got < 0) { f->err = (int)-got; return; }
+        if (got == 0) return;
+    }
+}
+#endif
+
+/* Gives out the next n buffered bytes as a Str, after the check that Bytes.to_str makes,
+   then skips `skip` more. The bytes are taken even when the check fails, as the derived
+   bodies take them, and *f records why. The Str is on the GC heap: a line read inside
+   `with arena` is not an allocation of that block. */
+BLINK_RT_FN const char* blink_stdin_take_text(int64_t n, int64_t skip, blink_stdin_fault_t* f);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_stdin_take_text(int64_t n, int64_t skip, blink_stdin_fault_t* f) {
     blink_stdin_reader_t* r = &blink_stdin_reader;
     const uint8_t* p = r->data + r->start;
-    const char* why = NULL;
-    int64_t bad = blink_utf8_bad_offset(p, n, &why);
-    int64_t at = r->taken;
+    int64_t bad = blink_utf8_bad_offset(p, n, &f->why);
+    if (bad >= 0) f->at = r->taken + bad;
     const char* s = bad < 0 ? blink_str_from_bytes_gc((const char*)p, n) : NULL;
     blink_stdin_advance(n + skip);
-    pthread_mutex_unlock(&blink_stdin_mu);
-    if (bad >= 0) {
-        __blink_panic_dispatchf("%s: input is not valid UTF-8; read it with io.read_bytes "
-                                "(%s at byte %lld of the input)", op, why, (long long)(at + bad));
-    }
     return s;
+}
+#endif
+
+/* Panics for a recorded fault, naming op; returns when there is none. The caller has
+   dropped blink_stdin_mu. */
+BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f) {
+    if (f->err != 0) {
+        __blink_panic_dispatchf("%s: cannot read standard input: %s (errno %d)",
+                                op, blink_strerror(f->err), f->err);
+    }
+    if (f->why != NULL) {
+        __blink_panic_dispatchf("%s: input is not valid UTF-8; read it with io.read_bytes "
+                                "(%s at byte %lld of the input)", op, f->why, (long long)f->at);
+    }
 }
 #endif
 
@@ -129,18 +159,23 @@ BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n) {
         __blink_panic_dispatchf("io.read_bytes: n must be at least 1, got %lld", (long long)n);
     }
     blink_stdin_reader_t* r = &blink_stdin_reader;
+    blink_stdin_fault_t f = {0, NULL, 0};
     pthread_mutex_lock(&blink_stdin_mu);
-    while (r->end - r->start < n && blink_stdin_fill("io.read_bytes") > 0) {}
-    int64_t take = r->end - r->start < n ? r->end - r->start : n;
-    blink_bytes* b = blink_bytes_new();
-    if (take > b->cap) {
-        b->data = (uint8_t*)blink_realloc_in(b->owner, b->data, b->cap, take);
-        b->cap = take;
+    blink_stdin_fill_to(n, &f);
+    blink_bytes* b = NULL;
+    if (f.err == 0) {
+        int64_t take = r->end - r->start < n ? r->end - r->start : n;
+        b = blink_bytes_new();
+        if (take > b->cap) {
+            b->data = (uint8_t*)blink_realloc_in(b->owner, b->data, b->cap, take);
+            b->cap = take;
+        }
+        if (take > 0) memcpy(b->data, r->data + r->start, (size_t)take);
+        b->len = take;
+        blink_stdin_advance(take);
     }
-    if (take > 0) memcpy(b->data, r->data + r->start, (size_t)take);
-    b->len = take;
-    blink_stdin_advance(take);
     pthread_mutex_unlock(&blink_stdin_mu);
+    blink_stdin_raise("io.read_bytes", &f);
     return b;
 }
 #endif
@@ -150,6 +185,8 @@ BLINK_RT_FN const char* blink_stdin_read_line(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_stdin_read_line(void) {
     blink_stdin_reader_t* r = &blink_stdin_reader;
+    blink_stdin_fault_t f = {0, NULL, 0};
+    const char* line = NULL;
     pthread_mutex_lock(&blink_stdin_mu);
     int64_t scanned = 0;
     for (;;) {
@@ -161,17 +198,20 @@ BLINK_RT_FN const char* blink_stdin_read_line(void) {
             int64_t n = (int64_t)(nl - (r->data + r->start));
             int64_t skip = 1;
             if (n > 0 && r->data[r->start + n - 1] == '\r') { n--; skip = 2; }
-            return blink_stdin_take_text("io.read_line", n, skip);
+            line = blink_stdin_take_text(n, skip, &f);
+            break;
         }
         scanned = have;
-        if (blink_stdin_fill("io.read_line") == 0) {
-            if (r->end == r->start) {
-                pthread_mutex_unlock(&blink_stdin_mu);
-                return NULL;
-            }
-            return blink_stdin_take_text("io.read_line", r->end - r->start, 0);
+        int64_t got = blink_stdin_fill();
+        if (got < 0) { f.err = (int)-got; break; }
+        if (got == 0) {
+            if (r->end > r->start) line = blink_stdin_take_text(r->end - r->start, 0, &f);
+            break;
         }
     }
+    pthread_mutex_unlock(&blink_stdin_mu);
+    blink_stdin_raise("io.read_line", &f);
+    return line;
 }
 #endif
 
@@ -179,9 +219,16 @@ BLINK_RT_FN const char* blink_stdin_read_line(void) {
 BLINK_RT_FN const char* blink_stdin_read_all(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_stdin_read_all(void) {
+    blink_stdin_fault_t f = {0, NULL, 0};
+    const char* all = NULL;
     pthread_mutex_lock(&blink_stdin_mu);
-    while (blink_stdin_fill("io.read_all") > 0) {}
-    return blink_stdin_take_text("io.read_all", blink_stdin_reader.end - blink_stdin_reader.start, 0);
+    blink_stdin_fill_to(INT64_MAX, &f);
+    if (f.err == 0) {
+        all = blink_stdin_take_text(blink_stdin_reader.end - blink_stdin_reader.start, 0, &f);
+    }
+    pthread_mutex_unlock(&blink_stdin_mu);
+    blink_stdin_raise("io.read_all", &f);
+    return all;
 }
 #endif
 

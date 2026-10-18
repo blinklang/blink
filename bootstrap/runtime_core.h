@@ -2195,11 +2195,13 @@ BLINK_RT_FN blink_bytes* blink_bytes_slice(const blink_bytes* b, int64_t start, 
 }
 #endif
 
-/* The offset of the first sequence in p[0, n) that is not valid UTF-8, or -1 when all of it
-   is. *why gets a static message for that sequence. Bytes.to_str and the stdin reader both
-   check with this, so io.read_line accepts the bytes that Bytes.to_str accepts. */
+/* The offset of the first sequence in p[0, n) that a Str cannot hold, or -1 when it can hold
+   all of it: that is valid UTF-8 with no NUL byte. *why gets a static message for that
+   sequence. Bytes.to_str and the stdin reader both check with this, so io.read_line accepts
+   the bytes that Bytes.to_str accepts. */
 BLINK_RT_FN int64_t blink_utf8_bad_offset(const uint8_t* p, int64_t n, const char** why);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_STR_STATIC(blink_utf8_err_nul, "a Str cannot hold a NUL byte");
 BLINK_STR_STATIC(blink_utf8_err_continuation, "invalid UTF-8: unexpected continuation byte");
 BLINK_STR_STATIC(blink_utf8_err_invalid_byte, "invalid UTF-8: invalid byte");
 BLINK_STR_STATIC(blink_utf8_err_truncated, "invalid UTF-8: truncated sequence");
@@ -2215,6 +2217,8 @@ BLINK_RT_FN int64_t blink_utf8_bad_offset(const uint8_t* p, int64_t n, const cha
         /* The second byte's range is what rules out an overlong form, a surrogate
            (U+D800-DFFF) and a code point past U+10FFFF (RFC 3629 section 4). */
         uint8_t lo = 0x80, hi = 0xBF;
+        /* Text crosses into C as a NUL-terminated string, so a NUL would end it early. */
+        if (c == 0) { *why = blink_utf8_err_nul.d; return i; }
         if (c < 0x80) { i++; continue; }
         else if (c < 0xC0) { *why = blink_utf8_err_continuation.d; return i; }
         else if (c < 0xC2) { *why = blink_utf8_err_overlong.d; return i; }
