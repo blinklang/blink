@@ -1117,13 +1117,52 @@ fn walk_field_access(ctx: Int, node: Int) ! Diag.Report {
 
 fn mono_walk_call(ctx: Int, node: Int) ! Diag.Report {
     discover_call(ctx, node)
+    register_default_fill_instances(ctx, node)
     walk_ref_and_list(ctx, node_left(node), node_args(node))
 }
 
 fn mono_walk_method_call(ctx: Int, node: Int) ! Diag.Report {
     if is_async_spawn(node) { mono_saw_spawn = true }
     discover_method_call(ctx, node)
+    register_default_fill_instances(ctx, node)
     walk_ref_and_list(ctx, node_obj(node), node_args(node))
+}
+
+// A default a call leaves out is walked with the callee's instance when that instance's
+// declaration holds it. A call through a bound reads the trait's default, which no instance
+// of the impl the call reaches holds, so a default typed over the trait's `Self` or type
+// parameters gets an instance of its own: keyed by the type the call gives it, and binding
+// what its declared type says those parameters are at this call.
+fn register_default_fill_instances(ctx: Int, call_node: Int) {
+    let callee = instance_for_call(ctx, call_node)
+    let callee_decl = if callee >= 0 { mono_table.get(callee).unwrap().base_decl_node } else { -1 }
+    let args_sl = node_args(call_node)
+    let mut i = 0
+    while i < sl_len(args_sl) {
+        let fill = sublist_get(args_sl, i)
+        let dflt = node_value(fill)
+        if tc_is_default_fill(fill) && !declares_default(callee_decl, dflt) {
+            let declared = tc_lookup_node_tid(dflt)
+            let at_call = canon_tid(ctx_node_tid(ctx, fill))
+            if declared >= 0 && at_call >= 0 && tid_is_open(declared) && !tid_is_open(at_call) {
+                let binds: Map[Str, Int] = Map()
+                unify(declared, at_call, binds)
+                note_call_target(ctx, fill, register_with_binds(dflt, binds, [at_call], at_call, ""))
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn declares_default(decl: Int, dflt: Int) -> Bool {
+    if decl < 0 { return false }
+    let params_sl = node_params(decl)
+    let mut i = 0
+    while i < sl_len(params_sl) {
+        if node_value(sublist_get(params_sl, i)) == dflt { return true }
+        i = i + 1
+    }
+    false
 }
 
 // A default is walked with the fn it belongs to, so an instance records it under its own
@@ -1132,7 +1171,8 @@ fn walk_param(ctx: Int, node: Int) ! Diag.Report {
     walk2(ctx, node_type_ann(node), node_value(node))
 }
 
-// A default typecheck filled in belongs to the callee, and is walked there by walk_param.
+// A default typecheck filled in belongs to the callee, and is walked there by walk_param, or
+// in its own instance where the callee's does not hold it (register_default_fill_instances).
 fn walk_named_arg(ctx: Int, node: Int) ! Diag.Report {
     if !tc_is_default_fill(node) { mono_walk(ctx, node_value(node)) }
 }
