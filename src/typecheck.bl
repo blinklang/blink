@@ -12861,7 +12861,8 @@ fn nr_drop_import_index(consuming_mod: Str) {
             if r.imports_built {
                 r.imports.clear()
                 r.selects.clear()
-                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package })
+                r.qualifiers.clear()
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package })
             }
         }
         None => {}
@@ -12878,9 +12879,12 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
     if r.imports_built { return r }
     let mut idx = r.imports
     let mut selects = r.selects
+    let mut quals = r.qualifiers
     match per_module_imports.get(consuming_mod) {
         Some(imports) => {
             for source_mod in imports.keys() {
+                // A selective import binds the module's qualifier as a whole-module one does.
+                quals.insert(tc_qualifier_for_module(source_mod), source_mod)
                 let imp_node = imports.get(source_mod) ?? -1
                 if imp_node == -1 { continue }
                 let mut spellings: Map[Str, Int] = Map()
@@ -12903,7 +12907,7 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
         }
         None => {}
     }
-    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package }
+    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, qualifiers: quals, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package }
     nr_module_names.insert(consuming_mod, built)
     built
 }
@@ -13217,6 +13221,10 @@ type ModuleNames {
     // it reads, and a walk of the import list per question was its largest cost. Built and
     // dropped with `imports`.
     selects: Map[Str, Map[Str, Int]]
+    // Each qualifier the module's imports bind → the module it names. Only these qualify a
+    // name in the module: another module's import loads a module into the program and binds
+    // nothing here. Built and dropped with `imports`.
+    qualifiers: Map[Str, Str]
     imports_built: Bool
     // The answers resolve gives a spelling the module reads that no local binding holds, kept
     // because it asks them again at every read: nr_unselected_source, nr_private_access_here
@@ -13245,7 +13253,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "" }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "" }
             nr_module_names.insert(mod_name, r)
             r
         }
@@ -13254,7 +13262,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
 
 pub fn tc_record_module_package(mod_name: Str, package: Str) {
     let r = nr_module_names_of(mod_name)
-    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package })
+    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package })
 }
 
 // Whether two modules sit in one package. A module is always in its own, and the standard
@@ -13544,7 +13552,8 @@ fn nr_resolve_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
 // A module qualifier settles the module before any name is looked up, so an alias another
 // file bound to the same spelling has nothing to say here.
 fn nr_resolve_qualified_decl(qualifier: Str, member: Str) -> Int {
-    let target = tc_qualifier_to_module.get(qualifier) ?? qualifier
+    let here = nr_qualifier_module_here(qualifier)
+    let target = if here != "" { here } else { tc_qualifier_to_module.get(qualifier) ?? qualifier }
     nr_resolve_decl_in_module(target, member, 0)
 }
 
@@ -13604,9 +13613,28 @@ fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Di
 // namesake still cannot see the other module's.
 fn nr_qualified_private_access(qualifier: Str, name: Str) -> Int {
     if is_builtin_name(name) != 0 { return 0 }
-    let target = tc_qualifier_to_module_or_self(qualifier)
+    let here = nr_qualifier_module_here(qualifier)
+    let target = if here != "" { here } else { tc_qualifier_to_module_or_self(qualifier) }
     if target == nr_current_module { return 0 }
     nr_is_private_in(name, target)
+}
+
+// The module the reading module's own imports bind `qualifier` to, or "" when none does
+// (section 10.1). A module's own qualifier names it too. A reader with no module recorded has
+// no import list to ask, so any module the program imports answers for it.
+fn nr_qualifier_module_here(qualifier: Str) -> Str {
+    if nr_current_module == "" {
+        return if is_import_module_name(qualifier) != 0 { tc_qualifier_to_module_or_self(qualifier) } else { "" }
+    }
+    if tc_qualifier_for_module(nr_current_module) == qualifier { return nr_current_module }
+    nr_module_imports_built(nr_current_module).qualifiers.get(qualifier) ?? ""
+}
+
+// The fix for a qualifier the reading module does not import. A module another file imports
+// is named by the import that would bind it here.
+fn nr_missing_import_help(qualifier: Str) -> Str {
+    if is_import_module_name(qualifier) == 0 { return "" }
+    "this file does not import `{qualifier}`: add `import {tc_get_dotted_module_path(tc_qualifier_to_module_or_self(qualifier))}`"
 }
 
 fn is_private_access(name: Str) -> Int {
@@ -16262,6 +16290,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
             nr_current_module = node_module(im)
+            nr_check_impl_trait_ref(im)
             let methods_sl = node_methods(im)
             let impl_binders_sl = node_impl_binders(im)
             tc_push_tparam_scope(impl_binders_sl)
@@ -16289,6 +16318,17 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     }
 
     nr_pop_scope()
+}
+
+// The trait an impl header names is read as a bound's is. A name no trait declares is
+// validate_trait_impls' report, and a compiler-known trait with no declaration has nothing to
+// import.
+fn nr_check_impl_trait_ref(im: Int) ! TypeCheck.Resolve, Diag.Report {
+    let trait_name = node_trait_name(im)
+    if trait_name == "" { return }
+    if is_trait_name(strip_module_qualifier(trait_name)) == 0 { return }
+    if tc_undeclared_trait_names().contains(trait_name) { return }
+    nr_check_type_ref(trait_name, im)
 }
 
 // A call through a bound fills a default from the trait's declaration, so each default is
@@ -16500,7 +16540,7 @@ fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
         return
     }
     // A compiler-known trait with no declaration has nothing to import.
-    if !undeclared { nr_check_bound_trait_access(written, trait_name, bound) }
+    if !undeclared { nr_check_type_ref(written, bound) }
     let args_sl = node_elements(bound)
     let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
     let want = tc_trait_tparam_count_idx.get(trait_name) ?? -1
@@ -16516,22 +16556,6 @@ fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
         nr_resolve_bound_arg(arg)
         i = i + 1
     }
-}
-
-// The import and visibility rules a type name in a type position follows, for a bound's
-// trait: a bare name must be selected by this file's imports, and a qualified one must be
-// `pub` in the module its qualifier names.
-fn nr_check_bound_trait_access(written: Str, trait_name: Str, bound: Int) ! TypeCheck.Resolve, Diag.Report {
-    if written == trait_name {
-        nr_check_type_ref(trait_name, bound)
-        return
-    }
-    let qualifier = written.byte_slice(0, written.byte_len() - trait_name.byte_len() - 1)
-    if nr_qualified_private_access(qualifier, trait_name) != 0 {
-        nr_emit_private_access(trait_name, bound)
-        return
-    }
-    tc_mark_symbol_used(trait_name)
 }
 
 // Resolving the argument is what counts a nested constructor's arguments (E0303).
@@ -16614,6 +16638,16 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     // below instead of passing it unchecked.
     if (tc_active_tparams.get(name) ?? 0) > 0 { return }
     if tc_report_reserved_unbuilt(name, at) != 0 { return }
+    match name.byte_index_of(".", 0) {
+        Some(dot) => {
+            let qualifier = name.byte_slice(0, dot)
+            if nr_qualifier_names_a_type(qualifier) == 0 {
+                nr_check_qualified_type_ref(name, qualifier, name.byte_slice(dot + 1, name.byte_len()), at)
+                return
+            }
+        }
+        None => {}
+    }
     if is_known_type(name) != 0 {
         if nr_check_selective_access(name, at) != 0 { return }
         if is_private_access(name) != 0 {
@@ -16636,6 +16670,38 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     }
     tc_errors.push("unknown type `{name}`")
     nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, "")
+}
+
+// `Self.Context` and `T.Item` qualify by a type, not a module.
+fn nr_qualifier_names_a_type(qualifier: Str) -> Int {
+    if qualifier == "Self" { return 1 }
+    nr_names_a_type(qualifier)
+}
+
+// A qualified name in a type position: the qualifier must be a module the reading module
+// imports, and the member a declaration that module makes or re-exports, `pub` there.
+fn nr_check_qualified_type_ref(name: Str, qualifier: Str, member: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
+    let target = nr_qualifier_module_here(qualifier)
+    if target == "" {
+        tc_errors.push("unknown type `{name}`")
+        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: no module `{qualifier}` is imported here", at, nr_missing_import_help(qualifier))
+        return
+    }
+    tc_mark_qualifier_used(qualifier)
+    // `mod.Type.Member` is its own report, made where the member is read.
+    if member.contains(".") { return }
+    if nr_resolve_decl_in_module(target, member, 0) == -1 {
+        tc_errors.push("unknown type `{name}`")
+        let near = suggest_module_member(target, member)
+        let help = if near != "" { "did you mean `{qualifier}.{near}`?" } else { "" }
+        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: module `{qualifier}` declares no `{member}`", at, help)
+        return
+    }
+    if nr_qualified_private_access(qualifier, member) != 0 {
+        nr_emit_private_access(member, at)
+        return
+    }
+    tc_mark_symbol_used(member)
 }
 
 fn nr_error(name: Str, code: Str, message: Str, at: Int, help: Str) ! Diag.Report {
@@ -17021,9 +17087,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             tc_mark_symbol_used(name)
             return
         }
-        if is_import_module_name(name) != 0 { return }
+        if nr_qualifier_module_here(name) != "" { return }
         tc_errors.push("undefined variable `{name}`")
-        diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{name}`", node, tc_undefined_name_help(name))
+        let help = if is_import_module_name(name) != 0 { nr_missing_import_help(name) } else { tc_undefined_name_help(name) }
+        diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{name}`", node, help)
         return
     }
 
@@ -17120,7 +17187,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let mut is_module_qual = 0
         if obj != -1 && node_kind(obj) == NodeKind.Ident {
             let obj_name = node_name(obj)
-            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
+            if nr_qualifier_module_here(obj_name) != "" && nr_is_defined(obj_name) == 0 {
                 is_module_qual = 1
                 let mq_method = node_method(node)
                 if nr_qualified_private_access(obj_name, mq_method) != 0 {
@@ -17137,7 +17204,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let inner_obj = node_obj(obj)
                 if inner_obj != -1 && node_kind(inner_obj) == NodeKind.Ident {
                     let inner_name = node_name(inner_obj)
-                    if is_import_module_name(inner_name) != 0 && nr_is_defined(inner_name) == 0 {
+                    if nr_qualifier_module_here(inner_name) != "" && nr_is_defined(inner_name) == 0 {
                         let mid_field = node_name(obj)
                         if is_known_type(mid_field) != 0 {
                             let outer_field = node_method(node)
@@ -17225,7 +17292,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let obj_kind = node_kind(obj)
             if obj_kind == NodeKind.Ident {
                 let fa_obj_name = node_name(obj)
-                if is_import_module_name(fa_obj_name) != 0 && nr_is_defined(fa_obj_name) == 0 {
+                if nr_qualifier_module_here(fa_obj_name) != "" && nr_is_defined(fa_obj_name) == 0 {
                     is_mod_fa = 1
                     let fa_field = node_name(node)
                     if nr_qualified_private_access(fa_obj_name, fa_field) != 0 {
@@ -17240,7 +17307,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let inner_obj = node_obj(obj)
                 if inner_obj != -1 && node_kind(inner_obj) == NodeKind.Ident {
                     let inner_name = node_name(inner_obj)
-                    if is_import_module_name(inner_name) != 0 && nr_is_defined(inner_name) == 0 {
+                    if nr_qualifier_module_here(inner_name) != "" && nr_is_defined(inner_name) == 0 {
                         let mid_field = node_name(obj)
                         if is_known_type(mid_field) != 0 {
                             let outer_field = node_name(node)
@@ -17389,10 +17456,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             match type_name.byte_index_of(".", 0) {
                 Some(dot_pos) => {
                     let prefix = type_name.byte_slice(0, dot_pos)
-                    if is_import_module_name(prefix) != 0 && nr_is_defined(prefix) == 0 {
-                        // module.Type qualified construction: mark module used; nr_check_type_ref not needed
-                        // (lookup_named_type in type inference strips the qualifier and resolves the bare name)
-                        tc_mark_qualifier_used(prefix)
+                    let names_module = nr_qualifier_module_here(prefix) != "" || (is_import_module_name(prefix) != 0 && is_known_type(prefix) == 0)
+                    if names_module && nr_is_defined(prefix) == 0 {
+                        // module.Type qualified construction reads the type as an annotation does.
+                        nr_check_type_ref(type_name, node)
                     } else {
                         // Enum.Variant struct-style construction: check the enum type only
                         nr_check_type_ref(prefix, node)
