@@ -14451,10 +14451,41 @@ pub fn tc_qualified_carrier(qualifier: Str, variant: Str) -> Option[TyKind] {
 }
 
 // A carrier variant named with no argument list, bare (`None`) or qualified (`Option.None`).
-// Only None is a value on its own; Some, Ok and Err named as values carry no type here.
-fn tc_carrier_nullary_tid(variant: Str) -> Int {
+// Only None is a value on its own. `spelled` is the name as written.
+fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
     if variant == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
-    TYPE_UNKNOWN
+    let (fewest, most) = tc_carrier_arity(variant)
+    let want = if fewest == most { "{most}" } else { "{fewest} or {most}" }
+    tc_report_payload_variant_value(variant, want, "fn(x) \{ {spelled}(x) \}", node)
+}
+
+// A declared variant named with no argument list. One with a payload is no value on its own;
+// the closure the help offers gives each parameter its field's type where that type is
+// concrete, since nothing else would pin it.
+fn tc_declared_variant_value_tid(enum_tid: Int, var_idx: Int, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    let n = variant_field_count(var_idx)
+    if n == 0 { return tc_nullary_variant_tid(enum_tid, evar_pool.get(var_idx).unwrap().enum_decl, var_idx) }
+    let mut params: List[Str] = []
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < n {
+        let pname = if n == 1 { "x" } else { "x{i + 1}" }
+        let ft = lookup_evfield_type_by_index(var_idx, i)
+        let typed = ft >= 0 && tc_tid_has_typevar_among(ft, 0) == 0
+        params.push(if typed { "{pname}: {type_to_str(ft)}" } else { pname })
+        names.push(pname)
+        i = i + 1
+    }
+    let closure = "fn({params.join(", ")}) \{ {spelled}({names.join(", ")}) \}"
+    tc_report_payload_variant_value(evar_pool.get(var_idx).unwrap().name, "{n}", closure, node)
+}
+
+// No rule makes a variant constructor a function value, so a payload variant named as one is
+// refused rather than given the enum's type, which would build a variant with no payload.
+fn tc_report_payload_variant_value(variant: Str, want: Str, closure: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    tc_error_at_code("variant `{variant}` takes {want} argument(s) and is not a function value", node,
+        "TypeError", TYPE_ERROR, "wrap the constructor in a closure: `{closure}`")
+    tc_error_recovery_tid()
 }
 
 // The fewest and most arguments each carrier constructor takes. `Ok()` is `Ok(())`.
@@ -15098,6 +15129,17 @@ fn is_known_type(name: Str) -> Int {
 // not a type and answers false here; a qualified trait call is its own reading.
 pub fn tc_names_a_type(name: Str) -> Bool {
     is_known_type(name) != 0
+}
+
+// A method call's receiver. A bare name with no value under it that names a type is the
+// qualifier of a static call (`Errno.from(3)`), not a read of the type's namesake variant,
+// so it answers what every other type qualifier answers: no type.
+fn tc_infer_receiver(recv: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if recv != -1 && node_kind(recv) == NodeKind.Ident {
+        let name = node_name(recv)
+        if is_variant_name(name) != 0 && tc_names_a_type(name) && tc_tid_is_no_info(nr_get_type(name)) != 0 { return -1 }
+    }
+    infer_type(recv)
 }
 
 // Impl method registry for name resolution
@@ -16709,7 +16751,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         if is_with_ptr_call != 0 { nr_with_ptr_depth = nr_with_ptr_depth - 1 }
         if method_name == "as_ptr" && nr_with_ptr_depth == 0 && obj_is_ident != 0 {
-            let recv_t = infer_type(obj)
+            let recv_t = tc_infer_receiver(obj)
             if type_kind(recv_t) == TyKind.Bytes {
                 diag_error_at("BytesPtrCastForbidden", BYTES_PTR_CAST_FORBIDDEN, "cannot take a raw Ptr[U8] from Bytes outside a with_ptr closure — Bytes is GC-managed and may be relocated", node, "use Bytes.with_ptr(fn(p) \{ ... }) to pin the buffer for the FFI call")
             }
@@ -19261,10 +19303,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let vt = if top != -1 { nr_scope_types.get(top).unwrap() } else { -1 }
         if tc_tid_is_no_info(vt) == 0 { return vt }
         match tc_pick_bare_variant(name, node, tc_prelude_carrier_of(name)) {
-            BareVariantPick.Carrier(_) => return tc_carrier_nullary_tid(name)
-            BareVariantPick.Declared(enum_tid, var_idx) => {
-                return tc_nullary_variant_tid(enum_tid, evar_pool.get(var_idx).unwrap().enum_decl, var_idx)
-            }
+            BareVariantPick.Carrier(_) => return tc_carrier_nullary_tid(name, name, node)
+            BareVariantPick.Declared(enum_tid, var_idx) => return tc_declared_variant_value_tid(enum_tid, var_idx, name, node)
             BareVariantPick.Ambiguous(enums) => {
                 tc_report_ambiguous_construction(name, enums, node)
                 return tc_error_recovery_tid()
@@ -19924,7 +19964,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // type_kind already resolves, so `obj_k` names the solution's kind — but reading
         // the UNRESOLVED α's inner1 returns the binding pointer, not the type's real
         // child, which typed `e.unwrap()` on an `Option[T]` α one level too deep.
-        let obj_t = tc_resolve(infer_type(recv_node))
+        let obj_t = tc_resolve(tc_infer_receiver(recv_node))
         let obj_k = type_kind(obj_t)
 
         // A plain method call on `Self` in a trait default body is licensed only when the
@@ -21448,12 +21488,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
             if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 && tc_qualified_carrier(obj_name, fname).is_some() {
-                return tc_carrier_nullary_tid(fname)
+                return tc_carrier_nullary_tid(fname, "{obj_name}.{fname}", node)
             }
             let tid = lookup_named_type(obj_name)
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 let edecl = tc_type_decl_nodes.get(tc_written_type_nominal(obj_name)) ?? -1
-                return tc_nullary_variant_tid(tid, edecl, get_variant_by_name(tid, fname))
+                let vi = get_variant_by_name(tid, fname)
+                if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
+                return tc_nullary_variant_tid(tid, edecl, vi)
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
             // field, a tuple index, and this fourth case for `module.name` — without
@@ -24198,7 +24240,7 @@ fn tc_check_mutating_nested(n: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         // Gated on Ident before infer_type runs. tc_check_mutating_method rejects every other
         // object kind anyway, and inferring here would re-report infer_type's own diagnostics.
         if obj != -1 && node_kind(obj) == NodeKind.Ident {
-            tc_check_mutating_method(n, obj, infer_type(obj))
+            tc_check_mutating_method(n, obj, tc_infer_receiver(obj))
         }
         tc_check_mutating_nested(obj)
         tc_check_mutating_in_args(tc_mc_call_args(n))
@@ -25340,7 +25382,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // the Part B body walk: bind unannotated closure params to the elem/acc
         // type and type-check the body once.
         let recv = tc_mc_receiver(node)
-        let obj_t = infer_type(recv)
+        let obj_t = tc_infer_receiver(recv)
         // The RECEIVER of this call is a value the arm above only inferred, never body-walked,
         // so a HOF in the receiver chain (`a.map(f).collect()`) reaches check_closure_body only
         // through this descent. It runs first so a receiver `map` has bound its result before
