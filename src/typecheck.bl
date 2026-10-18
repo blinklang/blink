@@ -13220,7 +13220,7 @@ fn builtin_handler_op_key(root: Str, op: Str) -> Str {
 // The signature of a handler operation of a builtin root, or -1 for a name the spec does not
 // give that root. io.eprint is not interceptable, so eprint is no operation, and a caller
 // name such as println is not one either. Registered on first use, so Instant and Duration are
-// minted only for a program that delegates a Time operation.
+// minted only for a program that delegates a Time operation or omits one from a Time handler.
 fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
     let key = builtin_handler_op_key(root, op)
     let found = lookup_fnsig(key)
@@ -13240,21 +13240,25 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
     lookup_fnsig(key)
 }
 
-// The builtin effects the stdlib marks `@handle_all` (§4.7.1), one row per primitive operation
-// the mark covers, in the order a warning names them. `marked` is what carries the mark: the
-// root, or one sub-effect such as `IO.Read`. Each operation's signature comes from
-// builtin_handler_op_sig.
-type BuiltinMarkedOp {
-    marked: Str
+// The primitive operations of the builtin roots that the W0545 check reads, in the order a
+// warning names them. Each operation's signature comes from builtin_handler_op_sig.
+type BuiltinHandlerOp {
+    root: Str
     sub_effect: Str
     op: Str
 }
 
-fn builtin_handle_all_ops() -> List[BuiltinMarkedOp] {
+fn builtin_handler_ops() -> List[BuiltinHandlerOp] {
     [
-        BuiltinMarkedOp { marked: "Time", sub_effect: "Read", op: "read" },
-        BuiltinMarkedOp { marked: "Time", sub_effect: "Sleep", op: "sleep" },
+        BuiltinHandlerOp { root: "Time", sub_effect: "Read", op: "read" },
+        BuiltinHandlerOp { root: "Time", sub_effect: "Sleep", op: "sleep" },
     ]
+}
+
+// The builtin effects the stdlib marks `@handle_all` (§4.7.1): a root such as `Time`, or one
+// sub-effect such as `IO.Read`. A marked effect needs its operations in builtin_handler_ops.
+fn builtin_handle_all_marks() -> List[Str] {
+    ["Time"]
 }
 
 pub fn is_user_effect_handle_name(name: Str) -> Int {
@@ -13489,72 +13493,92 @@ fn tc_check_partial_handler(he: Int) ! Diag.Report, TypeCheck.Resolve {
     partial_handler_warn(he, eff, names, stubs, fixable, marked)
 }
 
-// W0545 on a handler for a builtin effect, which has no declaration: the marked operations
-// come from builtin_handle_all_ops and their signatures from builtin_handler_op_sig.
+// W0545 on a handler for a builtin effect, which has no declaration: the operations come from
+// builtin_handler_ops, the marks from builtin_handle_all_marks, and the rule is the one
+// tc_check_partial_handler applies to a declared effect.
 fn tc_check_partial_builtin_handler(he: Int, eff: Str, root: Str) ! Diag.Report, TypeCheck.Resolve {
+    let marks = builtin_handle_all_marks()
+    let root_marked = marks.contains(root)
     let sub = if eff == root { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
     let implemented = partial_handler_implemented(he)
-    let rows = builtin_handle_all_ops()
+    let mut touched: Map[Str, Int] = Map()
+    for row in builtin_handler_ops() {
+        if row.root == root && implemented.contains_key(row.op) { touched.insert(row.sub_effect, 1) }
+    }
     let mut names: List[Str] = []
     let mut stubs: List[Str] = []
     let mut fixable = true
     let mut marked: List[Str] = []
-    for row in rows {
-        let counts = if row.marked == root {
-            sub == "" || sub == row.sub_effect
-        } else if sub == "" {
-            // As for a declared effect: an unmarked parent counts a marked sub-effect only
-            // once the handler implements one of its operations.
-            row.marked == "{root}.{row.sub_effect}" && builtin_marked_touched(rows, row.marked, implemented)
-        } else {
-            row.marked == eff
-        }
+    for row in builtin_handler_ops() {
+        let path = "{root}.{row.sub_effect}"
+        // As for a declared effect: a marked root covers every sub-effect, and an unmarked
+        // parent counts a marked sub-effect only once the handler implements one of its
+        // operations.
+        let in_scope = row.root == root && (sub == "" || sub == row.sub_effect)
+        let counts = in_scope && (root_marked || (marks.contains(path) && (sub != "" || touched.contains_key(row.sub_effect))))
         if counts && !implemented.contains_key(row.op) {
-            let stub = builtin_partial_handler_stub(root, row.op)
-            if stub.text != "" {
-                names.push(row.op)
-                stubs.push(stub.text)
-                fixable = fixable && stub.fixable
-                if !marked.contains(row.marked) { marked.push(row.marked) }
-            }
+            let stub = builtin_partial_handler_stub(he, root, row.op)
+            names.push(row.op)
+            stubs.push(stub.text)
+            fixable = fixable && stub.fixable
+            let label = if root_marked { root } else { path }
+            if !marked.contains(label) { marked.push(label) }
         }
     }
     partial_handler_warn(he, eff, names, stubs, fixable, marked)
 }
 
-fn builtin_marked_touched(rows: List[BuiltinMarkedOp], marked: Str, implemented: Map[Str, Int]) -> Bool {
-    for row in rows {
-        if row.marked == marked && implemented.contains_key(row.op) { return true }
-    }
-    false
-}
-
-// The clause the fix adds for the builtin operation `op` of `root`, or an empty text when the
-// root has no such operation. The fix is withheld when a parameter has no name, or when the
-// file names a type of the signature for something else.
-fn builtin_partial_handler_stub(root: Str, op: Str) -> HandlerStub ! TypeCheck.Resolve {
+// The clause the fix adds for the builtin operation `op` of `root`. The fix is withheld when a
+// parameter has no name, or when the file spells a type of the signature as another type. A
+// parameter named `default` would shadow the handler the clause forwards to, so it gets a
+// fresh name.
+fn builtin_partial_handler_stub(he: Int, root: Str, op: Str) -> HandlerStub ! Diag.Report, TypeCheck.Resolve {
     let sig = builtin_handler_op_sig(root, op)
-    if sig == -1 { return HandlerStub { text: "", fixable: false } }
+    if sig == -1 {
+        diag_ice_at("BuiltinHandlerOpUnsigned", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "builtin operation `{root}.{op}` has no handler signature", he,
+            "every row of builtin_handler_ops needs a signature in builtin_handler_op_sig")
+        return HandlerStub { text: "", fixable: false }
+    }
     let entry = fnsig_pool.get(sig).unwrap()
+    let mut taken: List[Str] = []
+    let mut i = 0
+    while i < entry.params_count {
+        taken.push(fnsig_param_names.get(entry.params_start + i) ?? "")
+        i = i + 1
+    }
     let mut fixable = true
     let mut params: List[Str] = []
     let mut args: List[Str] = []
-    let mut i = 0
+    i = 0
     while i < entry.params_count {
-        let name = fnsig_param_names.get(entry.params_start + i) ?? ""
         let t = fnsig_param_list.get(entry.params_start + i) ?? -1
-        if name == "" || resolve_type_name(type_to_str(t)) != t { fixable = false }
+        let mut name = taken.get(i) ?? ""
+        if name == "default" {
+            name = "default_"
+            while taken.contains(name) { name = name.concat("_") }
+        }
+        if name == "" || !builtin_stub_type_spellable(t) { fixable = false }
         params.push("{name}: {type_to_str(t)}")
         args.push(name)
         i = i + 1
     }
     let mut ret = ""
     if entry.ret != TYPE_VOID {
-        if resolve_type_name(type_to_str(entry.ret)) != entry.ret { fixable = false }
+        if !builtin_stub_type_spellable(entry.ret) { fixable = false }
         ret = " -> {type_to_str(entry.ret)}"
     }
     let text = "fn {op}({params.join(", ")}){ret} \{ default.{op}({args.join(", ")}) }"
     HandlerStub { text: text, fixable: fixable }
+}
+
+// Whether the current module spells `t` by its name. The types a builtin signature names are
+// declared in lib/std, and ensure_runtime_struct_type returns a namesake that a user module
+// declares, so a declaration from outside lib/std means the name is not the runtime's type.
+fn builtin_stub_type_spellable(t: Int) -> Bool ! TypeCheck.Resolve {
+    if resolve_type_name(type_to_str(t)) != t { return false }
+    let decl = tc_tid_decl_node(t)
+    decl == -1 || (decl >= 0 && node_source_module(decl).starts_with("std_"))
 }
 
 // Raises W0545 on `he` for the omitted operations `names`, whose clauses are `stubs`, and
