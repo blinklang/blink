@@ -1,0 +1,104 @@
+// `panic` is a built-in by resolution, not a reserved name (§2.20): a user fn or a local named
+// `panic` shadows it under the normal scoping rules, and a call then gets that binding's own
+// signature. A local binding shadows any built-in fn this way, as codegen already reads it.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+fn assert_clean_between(from: Str, to: Str) {
+    let a = line_of(probe_src(), from)
+    let b = line_of(probe_src(), to)
+    let mut msgs = ""
+    let mut l = a
+    while l <= b {
+        msgs = msgs.concat(errors_on_line(l))
+        l = l + 1
+    }
+    if msgs != "" { io.println("FAIL: lines {a}..{b} ({from}..{to}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+fn probe_src() -> Str {
+    #"fn panic(code: Int) -> Int { code + 1 }
+
+// OK_BEGIN
+fn user_fn() -> Int { panic(3) }
+
+fn local_closure() -> Str {
+    let panic = fn(s: Str) -> Str { s }
+    panic("not the built-in")
+}
+
+fn local_exit() -> Str {
+    let exit = fn(c: Int) -> Str { "{c}" }
+    exit(3)
+}
+// OK_END
+
+fn user_fn_is_int() -> Str { panic(4) }  // E_USER_INT
+
+fn user_fn_takes_int() -> Int { panic("s") }  // E_USER_ARG
+
+fn main() {
+    let _ = user_fn()
+}
+"#
+}
+
+test "a user fn named panic replaces the built-in" {
+    let _p = probe("build/tc_user_panic_src.bl", probe_src())
+    assert_clean_between("OK_BEGIN", "OK_END")
+    assert_error_at("E_USER_INT", "Int")
+    assert_error_at("E_USER_ARG", "argument 1 of `panic` expects Int, got Str")
+}

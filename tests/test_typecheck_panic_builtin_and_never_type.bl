@@ -1,0 +1,219 @@
+// `panic(msg: Str) -> Never` is a built-in in all code (§2.20), and `Never` is a type name in
+// every type position (§3.2). A call whose callee declares `-> Never` diverges (§3.3), so it
+// fits a fn tail, a match arm, an `if` branch, a `??` default and a call argument of any type.
+// The rule reads the callee's declared result type, so a user fn declared `-> Never` diverges
+// the same way, and its own body must diverge: a body that can reach its end is E0311.
+//
+// The controls are the normal call rules: `panic` takes one Str, with the wording any other
+// function's call gets.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat("{d.code} {d.message} | help: {d.help}\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.code} {d.message} | help: {d.help}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+fn assert_no_error_at(marker: Str, unwanted: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if msgs.contains(unwanted) {
+        io.println("FAIL: an error on line {line} ({marker}) contains '{unwanted}':\n{msgs}")
+    }
+    assert(!msgs.contains(unwanted))
+}
+
+// No error from the first line holding `from` through the line holding `to`.
+fn assert_clean_between(from: Str, to: Str) {
+    let a = line_of(probe_src(), from)
+    let b = line_of(probe_src(), to)
+    let mut msgs = ""
+    let mut l = a
+    while l <= b {
+        msgs = msgs.concat(errors_on_line(l))
+        l = l + 1
+    }
+    if msgs != "" { io.println("FAIL: lines {a}..{b} ({from}..{to}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn probe_src() -> Str {
+    #"// OK_BEGIN
+fn takes_int(i: Int) -> Int { i }
+
+fn p_tail() -> Int { panic("tail") }
+
+fn p_arm(x: Int) -> Int {
+    match x {
+        0 => 1
+        _ => panic("arm")
+    }
+}
+
+fn p_if(x: Int) -> Int { if x > 0 { x } else { panic("negative") } }
+
+fn p_coalesce(o: Option[Int]) -> Int { o ?? panic("none") }
+
+fn p_arg() -> Int { takes_int(panic("arg")) }
+
+fn p_stmt(x: Int) -> Int {
+    if x < 0 { panic("statement") }
+    x
+}
+
+fn p_closure() -> Int {
+    let c = fn(i: Int) -> Int { if i > 0 { i } else { panic("closure") } }
+    c(1)
+}
+
+fn fail(m: Str) -> Never { panic("config: {m}") }
+
+fn port(raw: Str) -> Int {
+    if raw == "" { return 8080 }
+    fail("bad port")
+}
+
+fn n_coalesce(o: Option[Str]) -> Str { o ?? fail("none") }
+
+fn n_arm(x: Int) -> Str {
+    match x {
+        0 => "zero"
+        _ => fail("arm")
+    }
+}
+
+fn n_loop() -> Never { loop { } }
+
+fn n_param(n: Never) -> Int { n }
+
+type NeverHolder { n: Never }
+
+fn n_let() -> Int {
+    let z: Never = panic("let")
+    z
+}
+
+fn n_result() -> Int {
+    let r: Result[Int, Never] = Ok(3)
+    match r {
+        Ok(v) => v
+        Err(e) => e
+    }
+}
+
+fn n_list() -> Int {
+    let xs: List[Never] = []
+    xs.len()
+}
+// OK_END
+
+fn bad_arity_zero() { panic() }  // E_ARITY_ZERO
+
+fn bad_arity_two() { panic("a", "b") }  // E_ARITY_TWO
+
+fn bad_arg_type() { panic(1) }  // E_ARG_TYPE
+
+fn never_falls_off() -> Never {  // E_NEVER_NO_TAIL
+    let _x = 1
+}
+
+fn never_while(n: Int) -> Never {
+    while n > 0 { panic("w") }  // E_NEVER_WHILE
+}
+
+fn never_value() -> Never { 3 }  // E_NEVER_VALUE
+
+fn never_widen() -> Result[Int, Str] {
+    let r: Result[Int, Never] = Ok(3)
+    r  // E_NEVER_NOT_WIDENED
+}
+
+fn main() {
+    let _ = p_tail()
+}
+"#
+}
+
+test "panic fits any position of any type" {
+    let _p = probe("build/tc_panic_builtin_src.bl", probe_src())
+    assert_clean_between("OK_BEGIN", "OK_END")
+}
+
+test "panic takes one Str, checked like any call" {
+    let _p = probe("build/tc_panic_builtin_src.bl", probe_src())
+    assert_error_at("E_ARITY_ZERO", "function `panic` expects 1 argument(s), got 0")
+    assert_error_at("E_ARITY_TWO", "function `panic` expects 1 argument(s), got 2")
+    assert_error_at("E_ARG_TYPE", "argument 1 of `panic` expects Str, got Int")
+    assert_no_error_at("E_ARITY_ZERO", "undefined function")
+}
+
+test "a fn declared -> Never must diverge" {
+    let _p = probe("build/tc_panic_builtin_src.bl", probe_src())
+    assert_error_at("E_NEVER_NO_TAIL", "E0311 function `never_falls_off` can finish without returning a value of type Never")
+    assert_error_at("E_NEVER_WHILE", "E0311 function `never_while` can finish without returning a value of type Never")
+    assert_error_at("E_NEVER_VALUE", "return value type Int does not match function `never_value` return type Never")
+}
+
+// §3.3: no value of type Never exists, so the help names only a diverging tail.
+test "the E0311 help for a -> Never fn names only a diverging tail" {
+    let _p = probe("build/tc_panic_builtin_src.bl", probe_src())
+    assert_error_at("E_NEVER_NO_TAIL", "help: end the body with a call that diverges: `panic(\"...\")` or a call to a function declared `-> Never`")
+    assert_error_at("E_NEVER_WHILE", "help: end the body with a call that diverges")
+    assert_no_error_at("E_NEVER_NO_TAIL", "Option[Never]")
+}
+
+// §3.2: Never is a subtype of every type, but not through a type constructor.
+test "Never as a type argument does not widen" {
+    let _p = probe("build/tc_panic_builtin_src.bl", probe_src())
+    assert_error_at("E_NEVER_NOT_WIDENED", "Result[Int, Never]")
+}

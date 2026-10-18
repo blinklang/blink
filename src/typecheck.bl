@@ -3208,6 +3208,7 @@ fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     if name == "U32" { return TYPE_U32 }
     if name == "U64" { return TYPE_U64 }
     if name == "Char" { return TYPE_CHAR }
+    if name == "Never" { return TYPE_NEVER }
     // A builtin with no Blink declaration anywhere: `StringBuilder` names codegen's
     // StringBuilder C type / `blink_sb*` and is listed by is_primitive_type, but lib/std/sb.bl
     // only declares FUNCTIONS over it. Without this arm every `sb: StringBuilder` param
@@ -4695,25 +4696,35 @@ fn tc_missing_return_cause(kind: Str) -> Str {
     if kind == "while" { return "its tail `while` loop can finish, because the condition may be false on entry" }
     if kind == "for" { return "its tail `for` loop can finish, because the iterable may be empty or exhaust" }
     if kind == "loop" { return "a `break` targets its tail `loop`, so the loop can finish" }
+    if kind == "end" { return "its body reaches its end with no tail expression" }
     "an arm of its tail completes without producing a value"
 }
 
 fn tc_report_missing_return(kind: Str, at_node: Int) ! Diag.Report {
-    let r = type_to_str(tc_current_fn_ret)
+    tc_report_missing_return_of(kind, tc_current_fn_name, tc_current_fn_ret, at_node)
+}
+
+fn tc_report_missing_return_of(kind: Str, owner_name: Str, ret: Int, at_node: Int) ! Diag.Report {
+    let r = type_to_str(ret)
     // Both repairs must compile as written (§3.1). Naming the Option wrap for a fn that
     // ALREADY returns an Option would spell Option[Option[T]], which compiles but is not
     // the repair anyone wants — such a fn only needs the trailing None.
     let mut fix = "add a trailing `return <value>` (or a tail value expression), or change the return type to Option[{r}] and yield None"
-    if type_kind(tc_current_fn_ret) == TyKind.Option {
+    if type_kind(ret) == TyKind.Option {
         fix = "add a trailing `return <value>` (or a tail value expression), or yield None"
     }
-    diag_error_at_notes("MissingReturn", MISSING_RETURN, "function `{tc_current_fn_name}` can finish without returning a value of type {r}: {tc_missing_return_cause(kind)}", at_node, fix, ["tail-kind: {kind}"])
+    // No value of type Never exists, so only a diverging tail repairs the body (§3.3). A
+    // program's own `panic` shadows the builtin and need not diverge, so it is not named then.
+    if tc_resolve(ret) == TYPE_NEVER {
+        fix = if lookup_fnsig("panic") == -1 { "end the body with a call that diverges: `panic(\"...\")` or a call to a function declared `-> Never`" } else { "end the body with a call to a function declared `-> Never`" }
+    }
+    diag_error_at_notes("MissingReturn", MISSING_RETURN, "function `{owner_name}` can finish without returning a value of type {r}: {tc_missing_return_cause(kind)}", at_node, fix, ["tail-kind: {kind}"])
 }
 
 fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_current_fn_ret == TYPE_VOID || tc_tid_is_no_info(tc_current_fn_ret) != 0 { return }
     if tc_tid_is_no_info(val_t) != 0 { return }
-    if types_compatible(tc_current_fn_ret, val_t) == 0 {
+    if types_compatible(tc_current_fn_ret, val_t) == 0 || tc_value_misses_never_slot(tc_current_fn_ret, val_t) != 0 {
         // §3.3 body completeness: the tail type must be a subtype of R, and `()` is a
         // subtype only of `()`. When the tail is a loop or an arm-bearing form that can
         // complete, the SHAPE is what names the repair, so it reports as
@@ -5182,7 +5193,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
             diag_error_at("TemplateMismatch", TEMPLATE_MISMATCH, "expected {type_to_str(ptid)}, found {type_to_str(arg_t)} — string variables cannot be implicitly converted to Template", arg_node, "pass the string literal directly, or wrap values in Raw() for dynamic SQL")
             lit_to_int = 1
         }
-        if lit_to_int == 0 && types_compatible(arg_t, ptid) == 0 {
+        if lit_to_int == 0 && (types_compatible(arg_t, ptid) == 0 || tc_value_misses_never_slot(ptid, arg_t) != 0) {
             if !tc_closure_checked_against(arg_node, ptid) { tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(ptid, arg_t)}", arg_node) }
         }
     }
@@ -5243,7 +5254,7 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
         }
         return
     }
-    if lit_to_int == 0 && types_compatible(arg_t, expected_t) == 0 {
+    if lit_to_int == 0 && (types_compatible(arg_t, expected_t) == 0 || tc_value_misses_never_slot(expected_t, arg_t) != 0) {
         if !tc_closure_checked_against(value_node, expected_t) { tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(expected_t, arg_t)}", value_node) }
     }
 }
@@ -5491,6 +5502,33 @@ fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
     }
     fnsig_map.insert(key, fnsig_pool.len())
     fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: -1 })
+}
+
+// The bare builtins whose call is checked like a declared fn's (sections/02_syntax.md §2.20).
+// Each is signed under a dotted key no user fn can spell, so a program's own `fn panic` keeps
+// the bare key and wins by resolution.
+fn tc_builtin_sig_key(name: Str) -> Str {
+    if name == "panic" { return "builtin.panic" }
+    ""
+}
+
+fn register_builtin_fn_sigs() {
+    register_intrinsic_fn_sig("builtin.panic", [TYPE_STR], TYPE_NEVER)
+    fnsig_param_names.set(fnsig_param_names.len() - 1, "msg")
+}
+
+// A bare builtin call against its tc_builtin_sig_key signature, with the wording a declared
+// fn's call gets.
+fn tc_check_builtin_sig_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let args_sl = node_args(node)
+    let kw_bad = tc_check_keyword_args(fn_name, sig, args_sl, 0, node)
+    let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+    if kw_bad == 0 && arg_count != fs.params_count {
+        tc_error_at("function `{fn_name}` expects {fs.params_count} argument(s), got {arg_count}", node)
+    }
+    let _ = check_arg_shapes(fn_name, sig, args_sl, 0, node)
+    fs.ret
 }
 
 // The signature of every namespace intrinsic typecheck is allowed to know.
@@ -6335,14 +6373,14 @@ fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Rep
         if found < 0 { found = TYPE_VOID }
         ret = found
         let _ = bind_metavar(slot, ret)
-    } else if tc_tid_is_no_info(tail_t) == 0 && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && types_compatible(ret, tail_t) == 0 {
+    } else if tc_tid_is_no_info(tail_t) == 0 && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && (types_compatible(ret, tail_t) == 0 || tc_value_misses_never_slot(ret, tail_t) != 0) {
         tc_error_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls)
     }
     // A Void return drops what a `return e` carries, as a named fn with no `-> R` does.
     if ret == TYPE_VOID || tc_tid_is_no_info(ret) != 0 { return }
     for r in returns {
         let vt = tc_lookup_node_tid(node_value(r))
-        if tc_tid_is_no_info(vt) == 0 && types_compatible(ret, vt) == 0 {
+        if tc_tid_is_no_info(vt) == 0 && (types_compatible(ret, vt) == 0 || tc_value_misses_never_slot(ret, vt) != 0) {
             tc_error_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r)
         }
     }
@@ -7171,7 +7209,7 @@ fn tc_ctor_arity(name: Str) -> Int {
     if n == "Int" || n == "Float" || n == "F32" || n == "F64" || n == "Bool" || n == "Str" {
         return 0
     }
-    if n == "Void" || n == "Bytes" || n == "Instant" || n == "Duration" || n == "Char" || n == "StringBuilder" {
+    if n == "Void" || n == "Never" || n == "Bytes" || n == "Instant" || n == "Duration" || n == "Char" || n == "StringBuilder" {
         return 0
     }
     if n == "U8" || n == "U16" || n == "U32" || n == "U64" || n == "I8" || n == "I16" || n == "I32" || n == "I64" {
@@ -12026,6 +12064,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
     // The signatures of the namespace intrinsics codegen emits directly.
     register_ns_intrinsic_sigs()
+    register_builtin_fn_sigs()
 
     // The signatures of the methods @derive synthesizes. AFTER the user fn and
     // impl-method registrations above, so a key a program spells for itself is never taken
@@ -13671,6 +13710,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
         }
         5 => match name {
             "Bytes" => 1
+            "panic" => 1
             _ => 0
         }
         6 => match name {
@@ -14175,6 +14215,7 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "file_exists" { return TYPE_INT }
     if name == "shell_exec" { return TYPE_INT }
     if name == "exit" { return TYPE_VOID }
+    if name == "panic" { return TYPE_NEVER }
     if name == "is_dir" { return TYPE_INT }
 
     if name == "time_ms" { return TYPE_INT }
@@ -14691,6 +14732,7 @@ fn is_primitive_type(name: Str) -> Int {
             "Float" => 1
             "Bytes" => 1
             "Tuple" => 1
+            "Never" => 1
             _ => 0
         }
         6 => match name {
@@ -16929,6 +16971,36 @@ pub fn tc_resolve_transparent_alias_name(name: Str) -> Int {
     result
 }
 
+// Whether exactly one of two types is Never and the other is a settled type that is not.
+// Never fits any slot as a whole value only (§3.2): a value of type Int does not fit a
+// `Never` slot, and `List[Never]` is not a `List[Int]`.
+fn tc_never_mismatch(a0: Int, b0: Int) -> Int {
+    let a = tc_resolve(resolve_alias_tid(a0))
+    let b = tc_resolve(resolve_alias_tid(b0))
+    if a == b { return 0 }
+    if a != TYPE_NEVER && b != TYPE_NEVER { return 0 }
+    let other = if a == TYPE_NEVER { b } else { a }
+    if tc_tid_is_no_info(other) != 0 { return 0 }
+    let k = type_kind(other)
+    if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
+    1
+}
+
+// The slot `want` is Never and the value `got` is settled and is not. types_compatible is
+// asked in both directions, so it lets Never through either way; a site that knows which
+// side is the slot asks this too.
+fn tc_value_misses_never_slot(want: Int, got: Int) -> Int {
+    if tc_resolve(resolve_alias_tid(want)) != TYPE_NEVER { return 0 }
+    tc_never_mismatch(want, got)
+}
+
+// A type argument, a field of a fn type, or any other part of a type built by a constructor:
+// Never there is only Never.
+fn tc_type_part_compatible(a: Int, b: Int) -> Int {
+    if tc_never_mismatch(a, b) != 0 { return 0 }
+    types_compatible(a, b)
+}
+
 fn types_compatible(a0: Int, b0: Int) -> Int {
     // Follow bound metavars to their solution FIRST: a pinned α reads as
     // its concrete type, so `let s: Str = intList.get(0).unwrap()` is now rejected
@@ -16974,7 +17046,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     // via Enum.to_int() / Enum.from_int(n) -> Option[Enum].
     if ka == kb {
         if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Iterator || ka == TyKind.Set {
-            return types_compatible(ta.inner1, tb.inner1)
+            return tc_type_part_compatible(ta.inner1, tb.inner1)
         }
         // A pointer is compatible only with a pointer to the same thing. Same
         // one-inner recursion as the line above, spelled separately because the reason differs:
@@ -16988,7 +17060,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // FFI signature needs the C conversion, it belongs in an explicit cast, not in the
         // compatibility relation.
         if ka == TyKind.Ptr {
-            return types_compatible(ta.inner1, tb.inner1)
+            return tc_type_part_compatible(ta.inner1, tb.inner1)
         }
         // The phantom injection context, and the same one-inner recursion for a third
         // distinct reason: sections/03b_contracts.md:566 is normative — "`Template[DB]` and
@@ -17002,7 +17074,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // arm bites only when the context is a real type. Making the effect spelling bite is a
         // spec question (filed) and not something a compatibility arm can decide.
         if ka == TyKind.Template {
-            return types_compatible(ta.inner1, tb.inner1)
+            return tc_type_part_compatible(ta.inner1, tb.inner1)
         }
         // Two handler types are interchangeable exactly when they install into the
         // same effect slot, and the slot is picked by the ROOT effect — resolve_effect_vtable
@@ -17025,12 +17097,12 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
             return if tc_handler_effect_root(ta.name) == tc_handler_effect_root(tb.name) { 1 } else { 0 }
         }
         if ka == TyKind.Map {
-            if types_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
-            return types_compatible(ta.inner2, tb.inner2)
+            if tc_type_part_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
+            return tc_type_part_compatible(ta.inner2, tb.inner2)
         }
         if ka == TyKind.Result {
-            if types_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
-            return types_compatible(ta.inner2, tb.inner2)
+            if tc_type_part_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
+            return tc_type_part_compatible(ta.inner2, tb.inner2)
         }
         if ka == TyKind.Tuple {
             if ta.params_count != tb.params_count { return 0 }
@@ -17038,7 +17110,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
             while i < ta.params_count {
                 let ea = ty_param_list.get(ta.params_start + i).unwrap()
                 let eb = ty_param_list.get(tb.params_start + i).unwrap()
-                if types_compatible(ea, eb) == 0 { return 0 }
+                if tc_type_part_compatible(ea, eb) == 0 { return 0 }
                 i = i + 1
             }
             return 1
@@ -17069,7 +17141,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
                 while si < ta.params_count {
                     let sea = ty_param_list.get(ta.params_start + si).unwrap()
                     let seb = ty_param_list.get(tb.params_start + si).unwrap()
-                    if types_compatible(sea, seb) == 0 { return 0 }
+                    if tc_type_part_compatible(sea, seb) == 0 { return 0 }
                     si = si + 1
                 }
             }
@@ -17099,7 +17171,7 @@ fn tc_fn_mismatch_detail(want0: Int, got0: Int) -> Str {
         let pw = tc_tid_child(want, i)
         let pg = tc_tid_child(got, i)
         let settled = tc_tid_is_no_info(pw) == 0 && tc_tid_is_no_info(pg) == 0
-        if settled && types_compatible(pw, pg) == 0 {
+        if settled && tc_type_part_compatible(pw, pg) == 0 {
             return "parameter {i} expects {type_to_str(pw)}, got {type_to_str(pg)}"
         }
         i = i + 1
@@ -17107,7 +17179,7 @@ fn tc_fn_mismatch_detail(want0: Int, got0: Int) -> Str {
     let rw = tc_tid_child(want, 0)
     let rg = tc_tid_child(got, 0)
     let ret_settled = tc_tid_is_no_info(rw) == 0 && tc_tid_is_no_info(rg) == 0
-    if ret_settled && types_compatible(rw, rg) == 0 {
+    if ret_settled && tc_type_part_compatible(rw, rg) == 0 {
         return "return type expects {type_to_str(rw)}, got {type_to_str(rg)}"
     }
     ""
@@ -17299,6 +17371,7 @@ fn tc_fn_mismatch_suffix(want: Int, got: Int) -> Str {
 // untyped integer literal RHS to flow into a sized-int target (I8/U32/...).
 // Kept OUT of types_compatible so function-arg checking stays strict.
 fn assignment_types_compatible(target_t: Int, val_t: Int, val_node: Int) -> Int {
+    if tc_value_misses_never_slot(target_t, val_t) != 0 { return 0 }
     if types_compatible(target_t, val_t) == 1 { return 1 }
     let literal_to_sized = is_sized_int(type_kind(target_t)) && val_t == TYPE_INT && is_int_literal_node(val_node)
     if literal_to_sized { return 1 }
@@ -18155,7 +18228,29 @@ fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, Ty
     }
     let inner = infer_type(arg_node)
     tc_construct_hint = saved_hint
+    // Inference never picks Never for an open slot (§3.2): a diverging payload leaves the
+    // slot to the hint or to a later use.
+    if tc_resolve(inner) == TYPE_NEVER {
+        if carrier == "Err" { return tc_carrier_slot_from_hint(TyKind.Result, 2) }
+        if carrier == "Ok" { return tc_carrier_slot_from_hint(TyKind.Result, 1) }
+        return tc_carrier_slot_from_hint(TyKind.Option, 1)
+    }
     inner
+}
+
+// The element type of a list literal whose first element is Never: the first plain element
+// that has another settled type, else the slot the position expects.
+fn tc_list_elem_past_never(elems_sl: Int) -> Int ! TypeCheck.Resolve {
+    let mut i = 1
+    while i < sublist_length(elems_sl) {
+        let elem = sublist_get(elems_sl, i)
+        if node_kind(elem) != NodeKind.SpreadExpr {
+            let t = tc_lookup_node_tid(elem)
+            if tc_tid_is_no_info(t) == 0 && tc_resolve(t) != TYPE_NEVER { return t }
+        }
+        i = i + 1
+    }
+    tc_carrier_slot_from_hint(TyKind.List, 1)
 }
 
 // The element type one list-literal element CONTRIBUTES, which is not the same as its own
@@ -18977,7 +19072,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // tc_call_decl_is_fn. Skipping the builtin branch here lets this call fall
                 // through to lookup_fnsig below, which types it against the user's own
                 // signature instead of the builtin's.
-                if is_builtin_fn(fn_name) != 0 && skip_is_intrinsic && !tc_call_decl_is_fn(node) {
+                // A local binding shadows a builtin as it shadows a module-level fn: the
+                // local-scope arm below reads it.
+                if is_builtin_fn(fn_name) != 0 && skip_is_intrinsic && !tc_call_decl_is_fn(node) && tc_tid_is_no_info(nr_get_type(fn_name)) != 0 {
+                    let bsig = fnsig_map.get(tc_builtin_sig_key(fn_name)) ?? -1
+                    if bsig != -1 { return tc_check_builtin_sig_call(fn_name, bsig, node) }
                     // Infer args so nested expressions (e.g. a method call passed
                     // to println) are type-checked — variadic builtins otherwise
                     // skip arg inference, hiding errors like E0522.
@@ -21161,8 +21260,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 tc_tie_fn_rets(first_t, c)
                 ei = ei + 1
             }
-            tc_check_spread_sources(elems_sl, first_t)
-            return make_list_type(first_t)
+            // Inference never picks Never for an open slot (§3.2): a diverging element
+            // yields nothing, so the element type comes from another element or the hint.
+            let elem_t = if tc_resolve(first_t) == TYPE_NEVER { tc_list_elem_past_never(elems_sl) } else { first_t }
+            tc_check_spread_sources(elems_sl, elem_t)
+            return make_list_type(elem_t)
         }
         // Empty `[]`: the elements say nothing, so the element type can only come from what
         // the position expects. Taking it from the hint makes the FIRST stamp the right one,
@@ -22490,6 +22592,7 @@ fn tc_check_missing_tail_value(body: Int, declared_ret: Int, owner_name: Str, at
     if node_kind(body) != NodeKind.Block { return }
     if declared_ret == TYPE_VOID || tc_tid_is_no_info(declared_ret) != 0 { return }
     if tc_block_tail_stmt(body) == -1 {
+        if tc_resolve(declared_ret) == TYPE_NEVER { return tc_report_missing_return_of("end", owner_name, declared_ret, at_node) }
         tc_error_at("function `{owner_name}` declared return type {type_to_str(declared_ret)} but body returns {type_to_str(TYPE_VOID)}", at_node)
     }
 }
