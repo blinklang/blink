@@ -1,14 +1,35 @@
 import std.net_error.{NetError}
 
+// TcpHandle points at a box the runtime allocates around the fd. Close takes
+// the fd out of the box, so every copy of a TcpSocket or TcpListener sees the
+// close, and a second close cannot reach an fd number the OS has reused.
+@ffi.opaque(name: "blink_tcp_handle")
+pub type TcpHandle
+
+@ffi("blink_tcp_handle_new")
+@trusted(audit: "STD-NET-TCP")
+fn tcp_handle_new(fd: Int) -> TcpHandle ! FFI {}
+
+@ffi("blink_tcp_handle_fd")
+@trusted(audit: "STD-NET-TCP")
+/// The fd, or -1 once any copy of the handle was closed.
+fn tcp_handle_fd(h: TcpHandle) -> Int ! FFI {}
+
+@ffi("blink_tcp_handle_take")
+@trusted(audit: "STD-NET-TCP")
+/// Clears the handle and returns the fd it held, or -1 if it was closed.
+fn tcp_handle_take(h: TcpHandle) -> Int ! FFI {}
+
 pub type TcpSocket {
-    fd: Int
+    handle: TcpHandle
 }
 
 pub type TcpListener {
-    fd: Int
+    handle: TcpHandle
 }
 
 pub trait TcpSocketOps {
+    fn fd(self) -> Int
     fn read(self, max_bytes: Int) -> Str
     fn read_all(self) -> Str
     fn read_bytes(self, max_bytes: Int) -> Result[Bytes, NetError]
@@ -19,48 +40,109 @@ pub trait TcpSocketOps {
 }
 
 pub trait TcpListenerOps {
+    fn fd(self) -> Int
     fn close(self)
 }
 
 impl TcpSocketOps for TcpSocket {
-    fn read(self, max_bytes: Int) -> Str {
-        net.read(self.fd, max_bytes)
+    /// The socket's fd, or -1 once any copy of the socket was closed.
+    fn fd(self) -> Int {
+        tcp_handle_fd(self.handle)
     }
 
+    /// Returns "" once the socket is closed, as at end of stream.
+    fn read(self, max_bytes: Int) -> Str {
+        let fd = self.fd()
+        if fd < 0 {
+            return ""
+        }
+        net.read(fd, max_bytes)
+    }
+
+    /// Returns "" once the socket is closed, as at end of stream.
     fn read_all(self) -> Str {
-        net.read_all(self.fd)
+        let fd = self.fd()
+        if fd < 0 {
+            return ""
+        }
+        net.read_all(fd)
     }
 
     fn read_bytes(self, max_bytes: Int) -> Result[Bytes, NetError] {
-        tcp_read_bytes(self.fd, max_bytes)
+        let fd = self.fd()
+        if fd < 0 {
+            return Err(NetError.IoError("socket is closed"))
+        }
+        tcp_read_bytes(fd, max_bytes)
     }
 
+    /// Does nothing once the socket is closed.
     fn write(self, data: Str) {
-        net.write(self.fd, data)
+        let fd = self.fd()
+        if fd < 0 {
+            return
+        }
+        net.write(fd, data)
     }
 
     fn write_bytes(self, data: Bytes) -> Result[Void, NetError] {
-        tcp_write_bytes(self.fd, data)
+        let fd = self.fd()
+        if fd < 0 {
+            return Err(NetError.IoError("socket is closed"))
+        }
+        tcp_write_bytes(fd, data)
     }
 
+    /// Closing a closed socket does nothing.
     fn close(self) {
-        net.close(self.fd)
+        let fd = tcp_handle_take(self.handle)
+        if fd >= 0 {
+            net.close(fd)
+        }
     }
 
+    /// Does nothing once the socket is closed.
     fn set_timeout(self, ms: Int) {
-        net.set_timeout(self.fd, ms)
+        let fd = self.fd()
+        if fd < 0 {
+            return
+        }
+        net.set_timeout(fd, ms)
     }
 }
 
 impl TcpListenerOps for TcpListener {
-    fn close(self) {
-        net.close(self.fd)
+    /// The listener's fd, or -1 once any copy of the listener was closed.
+    fn fd(self) -> Int {
+        tcp_handle_fd(self.handle)
     }
+
+    /// Closing a closed listener does nothing.
+    fn close(self) {
+        let fd = tcp_handle_take(self.handle)
+        if fd >= 0 {
+            net.close(fd)
+        }
+    }
+}
+
+/// Wrap an fd the caller owns as a TcpSocket. The socket closes the fd on close().
+pub fn tcp_socket_from_fd(fd: Int) -> TcpSocket {
+    TcpSocket { handle: tcp_handle_new(fd) }
+}
+
+/// Wrap an fd the caller owns as a TcpListener. The listener closes the fd on close().
+pub fn tcp_listener_from_fd(fd: Int) -> TcpListener {
+    TcpListener { handle: tcp_handle_new(fd) }
 }
 
 /// Accept an incoming connection on a TcpListener. Returns a TcpSocket.
 pub fn listener_accept(listener: TcpListener) -> Result[TcpSocket, NetError] {
-    tcp_accept(listener.fd)
+    let fd = listener.fd()
+    if fd < 0 {
+        return Err(NetError.IoError("listener is closed"))
+    }
+    tcp_accept(fd)
 }
 
 /// Connect to a TCP host:port. Returns a TcpSocket on success.
@@ -75,7 +157,7 @@ pub fn tcp_connect(host: Str, port: Int) -> Result[TcpSocket, NetError] {
     if fd < 0 {
         return Err(NetError.ConnectionRefused("connection refused"))
     }
-    Ok(TcpSocket { fd: fd })
+    Ok(tcp_socket_from_fd(fd))
 }
 
 /// Bind and listen on host:port. Returns a TcpListener on success.
@@ -84,7 +166,7 @@ pub fn tcp_listen(host: Str, port: Int) -> Result[TcpListener, NetError] {
     if fd < 0 {
         return Err(NetError.BindError("failed to listen on {host}:{port.to_string()}"))
     }
-    Ok(TcpListener { fd: fd })
+    Ok(tcp_listener_from_fd(fd))
 }
 
 /// Accept an incoming connection on a listener fd. Returns a TcpSocket.
@@ -93,7 +175,7 @@ pub fn tcp_accept(listener_fd: Int) -> Result[TcpSocket, NetError] {
     if conn < 0 {
         return Err(NetError.BindError("accept failed"))
     }
-    Ok(TcpSocket { fd: conn })
+    Ok(tcp_socket_from_fd(conn))
 }
 
 /// Read up to max_bytes from a socket. Returns the data read (empty string on EOF).

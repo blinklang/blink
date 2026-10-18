@@ -132,7 +132,7 @@ pub fn read_line(f: File) -> Result[Str, FileError] {
 }
 ```
 
-`std.db` does this: after a `Connection` closes, every `db.*` call through it returns `Err(ConnectionError("connection is closed"))`, and a `Stmt` call after `finalize()` returns `Err(ExecError("statement is finalized"))`.
+`std.db` does this: after a `Connection` closes, every `db.*` call through it returns `Err(ConnectionError("connection is closed"))`, and a `Stmt` call after `finalize()` returns `Err(ExecError("statement is finalized"))`. `std.net` does it too: after a `TcpSocket` closes, `read_bytes` and `write_bytes` return `Err(IoError("socket is closed"))` and `.fd()` returns -1.
 
 `Ptr[T]` accepts only FFI-valid pointee types (`E0810` otherwise, also inside aliases, fields, payloads, closure and trait signatures, and nested `Ptr[Ptr[T]]`). `Bool` is not a valid pointee. A field read through a `Ptr` types only when the pointee is an `@ffi.struct`.
 
@@ -450,7 +450,7 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `socket_read_line(fd)` | Str | Read one line of any length, without its newline; `""` at end of input |
 | `socket_write(fd, data)` | Int | Write all of `data`; returns the bytes written, or -1 when the peer has closed or the write fails |
 
-The `tcp_*` functions are not builtins. They live in `std.net`: `import std.net` (see Standard Library). `tcp_connect`, `tcp_listen` and `tcp_accept` return `Result[TcpSocket, NetError]` or `Result[TcpListener, NetError]`; `tcp_read_bytes` returns `Result[Bytes, NetError]`.
+The `tcp_*` functions are not builtins. They live in `std.net`: `import std.net` (see Standard Library). `tcp_connect`, `tcp_listen` and `tcp_accept` return `Result[TcpSocket, NetError]` or `Result[TcpListener, NetError]`; `tcp_read_bytes` returns `Result[Bytes, NetError]`. Read a socket's fd with `.fd()` (-1 once closed); wrap an fd you own with `tcp_socket_from_fd(fd)` or `tcp_listener_from_fd(fd)`.
 
 ## Namespace Methods
 

@@ -6,6 +6,37 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+/* TcpSocket and TcpListener hold a pointer to one of these boxes, never the bare fd. Close
+ * takes the fd out and leaves the GC-owned box alive, so every copy of a handle sees the
+ * closed state and no later op reaches an fd number the OS has given to a new socket. */
+typedef struct {
+    int64_t fd;            /* -1 once closed */
+} blink_tcp_handle;
+
+BLINK_RT_FN blink_tcp_handle* blink_tcp_handle_new(int64_t fd);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_tcp_handle* blink_tcp_handle_new(int64_t fd) {
+    blink_tcp_handle* h = (blink_tcp_handle*)blink_alloc_atomic(sizeof(blink_tcp_handle));
+    h->fd = fd < 0 ? -1 : fd;
+    return h;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_tcp_handle_fd(blink_tcp_handle* h);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_tcp_handle_fd(blink_tcp_handle* h) {
+    return h ? __atomic_load_n(&h->fd, __ATOMIC_ACQUIRE) : -1;
+}
+#endif
+
+/* The exchange lets exactly one close, of any copy on any thread, get the live fd. */
+BLINK_RT_FN int64_t blink_tcp_handle_take(blink_tcp_handle* h);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_tcp_handle_take(blink_tcp_handle* h) {
+    return h ? __atomic_exchange_n(&h->fd, (int64_t)-1, __ATOMIC_ACQ_REL) : -1;
+}
+#endif
+
 BLINK_RT_FN int64_t blink_tcp_listen(const char* host, int64_t port);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_tcp_listen(const char* host, int64_t port) {

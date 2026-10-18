@@ -1,0 +1,104 @@
+// A closed TcpSocket or TcpListener keeps its closed state behind the handle: a second
+// close does nothing, so it cannot close the socket the OS gave the same fd number, every
+// copy sees the close, and an op after close returns an error without touching the fd.
+import std.net.{TcpSocket, TcpListener, NetError, tcp_listen, tcp_connect, listener_accept, tcp_socket_from_fd, tcp_listener_from_fd}
+
+@ffi("blinkrt_socketpair_packed")
+@trusted(audit: "TEST-TCP-SOCKET")
+fn socketpair_packed() -> Int ! FFI {}
+
+fn socket_pair() -> (TcpSocket, TcpSocket) {
+    let packed = socketpair_packed()
+    assert(packed >= 0)
+    (tcp_socket_from_fd(packed >> 32), tcp_socket_from_fd(packed & 4294967295))
+}
+
+fn is_closed_error(r: Result[Bytes, NetError]) -> Bool {
+    match r {
+        Err(NetError.IoError(msg)) => msg == "socket is closed"
+        _ => false
+    }
+}
+
+test "a second close of a socket leaves the socket that reused its fd open" {
+    let (a, a_peer) = socket_pair()
+    let a_fd = a.fd()
+    a.close()
+    let (b, b_peer) = socket_pair()
+    // The OS hands out the lowest free fd, so b takes the number a held.
+    assert_eq(b.fd(), a_fd)
+    a.close()
+    assert(b_peer.write_bytes(Bytes.from_str("hi")).is_ok())
+    let got = b.read_bytes(16)
+    assert(got.is_ok())
+    assert_eq(got.unwrap().len(), 2)
+    a_peer.close()
+    b.close()
+    b_peer.close()
+}
+
+test "a second close of a listener leaves the listener that reused its fd open" {
+    let a = tcp_listen("127.0.0.1", 47811).unwrap()
+    a.close()
+    let b = tcp_listen("127.0.0.1", 47812).unwrap()
+    a.close()
+    assert(tcp_listen("127.0.0.1", 47812).is_err())
+    // A connect completes into the backlog, so this accept does not block.
+    let client = tcp_connect("127.0.0.1", 47812).unwrap()
+    let conn = listener_accept(b)
+    assert(conn.is_ok())
+    conn.unwrap().close()
+    client.close()
+    b.close()
+}
+
+test "an op on a closed socket returns an error" {
+    let (a, peer) = socket_pair()
+    a.close()
+    assert_eq(a.fd(), -1)
+    assert(is_closed_error(a.read_bytes(16)))
+    match a.write_bytes(Bytes.from_str("hi")) {
+        Err(NetError.IoError(msg)) => assert_eq(msg, "socket is closed")
+        _ => assert(false)
+    }
+    assert_eq(a.read(16), "")
+    assert_eq(a.read_all(), "")
+    a.write("ignored")
+    a.set_timeout(10)
+    peer.close()
+}
+
+test "a copy of a socket sees the close" {
+    let (a, peer) = socket_pair()
+    let b = a
+    a.close()
+    assert_eq(b.fd(), -1)
+    assert(is_closed_error(b.read_bytes(16)))
+    b.close()
+    peer.close()
+}
+
+test "accept on a closed listener returns an error" {
+    let a = tcp_listen("127.0.0.1", 47813).unwrap()
+    let b = a
+    a.close()
+    assert_eq(b.fd(), -1)
+    match listener_accept(b) {
+        Err(NetError.IoError(msg)) => assert_eq(msg, "listener is closed")
+        _ => assert(false)
+    }
+    b.close()
+    // The port is free once the listener closed.
+    let again = tcp_listen("127.0.0.1", 47813)
+    assert(again.is_ok())
+    again.unwrap().close()
+}
+
+test "closing a handle that never held an fd does nothing" {
+    let s = tcp_socket_from_fd(-1)
+    assert_eq(s.fd(), -1)
+    s.close()
+    let l = tcp_listener_from_fd(-1)
+    l.close()
+    assert_eq(l.fd(), -1)
+}
