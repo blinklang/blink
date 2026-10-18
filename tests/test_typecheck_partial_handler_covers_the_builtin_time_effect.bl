@@ -1,0 +1,172 @@
+// W0545 PartialHandler on the builtin `Time` effect (sections/04_effects.md §4.3, §4.7.1).
+// The stdlib marks `Time` `@handle_all`, since its operations read one clock, but `Time` has no
+// declaration in source: the compiler knows its operations. So the check reads the marked
+// builtin roots and their operations from the compiler's own table, and the warning, the note
+// and the fix are the same as for a declared effect. `Time` is marked at the root, so a handler
+// for `Time` counts every primitive operation of every sub-effect, and a handler for
+// `Time.Read` or `Time.Sleep` counts only the operations of that sub-effect.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries}
+import std.io
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    // A path per row: the fix reads the handler's source lines, and they are cached by path.
+    let path = "build/w0545_time_{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn partial_warnings() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            out.push("{d.severity} {d.code} {d.line}:{d.col} {d.message} | {d.help} | {d.notes.join(" / ")}")
+        }
+    }
+    out
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn expect(label: Str, want: Int) -> List[Str] {
+    let errs = errors()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: {label}: the probe has errors:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+    let hits = partial_warnings()
+    if hits.len() != want {
+        io.eprintln("FAIL: {label}: PartialHandler raised {hits.len()} time(s), want {want}")
+        for m in hits { io.eprintln("  {m}") }
+    }
+    assert(hits.len() == want)
+    hits
+}
+
+fn expect_eq(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.eprintln("FAIL: {label}:\n  got:  {got}\n  want: {want}")
+    }
+    assert(got == want)
+}
+
+fn expect_fix(label: Str, text: Str, line: Int, col: Int) {
+    let mut seen = 0
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            seen = seen + 1
+            expect_eq("{label} fix text", d.fix_text, text)
+            assert_eq(d.fix_line, line)
+            assert_eq(d.fix_col, col)
+            assert_eq(d.fix_end_line, line)
+            assert_eq(d.fix_end_col, col)
+        }
+    }
+    assert_eq(seen, 1)
+}
+
+test "a Time handler that omits sleep warns with the spec's text and a fix" {
+    probe("no_sleep", #"import std.time
+
+fn frozen() -> Handler[Time] {
+    handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(0) }
+    }
+}
+"#)
+    let hits = expect("sleep omitted", 1)
+    expect_eq("sleep omitted", hits.get(0).unwrap(), "warning W0545 4:5 handler for `Time` does not implement `sleep` | implement it, or forward on purpose: `fn sleep(d: Duration) \{ default.sleep(d) }` | `Time` is marked `@handle_all` / omitted operations go to the enclosing handler")
+    expect_fix("sleep omitted", "    fn sleep(d: Duration) \{ default.sleep(d) }\n    ", 6, 5)
+}
+
+test "a Time handler that omits read warns with the spec's text and a fix" {
+    probe("no_read", #"fn no_wait() -> Handler[Time] {
+    handler Time {
+        fn sleep(d: Duration) { }
+    }
+}
+"#)
+    let hits = expect("read omitted", 1)
+    expect_eq("read omitted", hits.get(0).unwrap(), "warning W0545 2:5 handler for `Time` does not implement `read` | implement it, or forward on purpose: `fn read() -> Instant \{ default.read() }` | `Time` is marked `@handle_all` / omitted operations go to the enclosing handler")
+    expect_fix("read omitted", "    fn read() -> Instant \{ default.read() }\n    ", 4, 5)
+}
+
+test "an empty Time handler names both ops in declaration order" {
+    probe("empty", #"fn nothing() -> Handler[Time] {
+    handler Time { }
+}
+"#)
+    let hits = expect("empty", 1)
+    let got = hits.get(0).unwrap()
+    assert(got.contains("handler for `Time` does not implement `read`, `sleep` |"))
+    assert(got.contains("| implement them, or forward on purpose: `fn read() -> Instant \{ default.read() }` |"))
+}
+
+test "a Time sub-effect handler counts only the ops of its own sub-effect" {
+    probe("subs", #"fn reader() -> Handler[Time.Read] {
+    handler Time.Read { }
+}
+
+fn sleeper() -> Handler[Time.Sleep] {
+    handler Time.Sleep { }
+}
+
+fn whole_reader() -> Handler[Time.Read] {
+    handler Time.Read {
+        fn read() -> Instant { default.read() }
+    }
+}
+"#)
+    let hits = expect("sub-effects", 2)
+    assert(hits.get(0).unwrap().contains("warning W0545 2:5 handler for `Time.Read` does not implement `read` |"))
+    assert(hits.get(0).unwrap().contains("| `Time` is marked `@handle_all` / "))
+    assert(hits.get(1).unwrap().contains("warning W0545 6:5 handler for `Time.Sleep` does not implement `sleep` |"))
+}
+
+test "a whole Time handler gets no warning" {
+    probe("whole", #"import std.time
+
+fn frozen() -> Handler[Time] {
+    handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(0) }
+        fn sleep(d: Duration) { default.sleep(d) }
+    }
+}
+"#)
+    let _ = expect("whole", 0)
+}
+
+test "@allow(PartialHandler) silences it on a Time handler" {
+    probe("allow", #"import std.time
+
+@allow(PartialHandler)
+fn frozen() -> Handler[Time] {
+    handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(0) }
+    }
+}
+"#)
+    let _ = expect("allow", 0)
+}
+
+test "a builtin effect that is not marked never warns" {
+    probe("unmarked", #"fn quiet() -> Handler[IO] {
+    handler IO {
+        fn print(msg: Str) { }
+    }
+}
+"#)
+    let _ = expect("unmarked builtin", 0)
+}

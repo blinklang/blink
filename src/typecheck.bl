@@ -5665,11 +5665,17 @@ fn tc_builtin_method_arity(obj_k: TyKind, method: Str) -> Int {
 // finds it, check_arg_shapes reports "argument 2 of 'net.listen' expects Int, got Str", and
 // `.ret` is the return tid.
 fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
+    register_named_intrinsic_fn_sig(key, params, [], ret)
+}
+
+// As register_intrinsic_fn_sig, with the parameter names the spec writes. A name that
+// `names` does not give stays "".
+fn register_named_intrinsic_fn_sig(key: Str, params: List[Int], names: List[Str], ret: Int) {
     let start = fnsig_param_list.len()
     let mut i = 0
     while i < params.len() {
         fnsig_param_list.push(params.get(i).unwrap())
-        fnsig_param_names.push("")
+        fnsig_param_names.push(names.get(i) ?? "")
         fnsig_param_kw.push(0)
         fnsig_param_default.push(-1)
         i = i + 1
@@ -13224,7 +13230,7 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
     } else if root == "Time" && op == "read" {
         register_intrinsic_fn_sig(key, [], runtime_instant_tid())
     } else if root == "Time" && op == "sleep" {
-        register_intrinsic_fn_sig(key, [runtime_duration_tid()], TYPE_VOID)
+        register_named_intrinsic_fn_sig(key, [runtime_duration_tid()], ["d"], TYPE_VOID)
     } else if root == "FS" && fs_op_sub_effect(op) != "" {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
         return lookup_fnsig("fs.{op}")
@@ -13232,6 +13238,23 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
         return -1
     }
     lookup_fnsig(key)
+}
+
+// The builtin effects the stdlib marks `@handle_all` (§4.7.1), one row per primitive operation
+// the mark covers, in the order a warning names them. `marked` is what carries the mark: the
+// root, or one sub-effect such as `IO.Read`. Each operation's signature comes from
+// builtin_handler_op_sig.
+type BuiltinMarkedOp {
+    marked: Str
+    sub_effect: Str
+    op: Str
+}
+
+fn builtin_handle_all_ops() -> List[BuiltinMarkedOp] {
+    [
+        BuiltinMarkedOp { marked: "Time", sub_effect: "Read", op: "read" },
+        BuiltinMarkedOp { marked: "Time", sub_effect: "Sleep", op: "sleep" },
+    ]
 }
 
 pub fn is_user_effect_handle_name(name: Str) -> Int {
@@ -13399,15 +13422,8 @@ fn tc_effect_decl_named(root: Str) -> Int {
     -1
 }
 
-fn tc_check_partial_handler(he: Int) ! Diag.Report {
-    let eff = node_name(he)
-    let root = tc_handler_effect_root(eff)
-    let ed = tc_effect_decl_named(root)
-    if ed == -1 { return }
-    // A declaration the parser recovered from may have lost operations, so its handlers are
-    // not judged against it.
-    if diag_errors_in_lines(diag_file_for_node(ed), node_line(ed), node_end_line(ed)) > 0 { return }
-    let root_marked = has_annotation(ed, "handle_all") != 0
+// The operation names the clauses of the handler expression `he` implement.
+fn partial_handler_implemented(he: Int) -> Map[Str, Int] {
     let mut implemented: Map[Str, Int] = Map()
     let clauses = node_methods(he)
     if clauses != -1 {
@@ -13417,6 +13433,22 @@ fn tc_check_partial_handler(he: Int) ! Diag.Report {
             i = i + 1
         }
     }
+    implemented
+}
+
+fn tc_check_partial_handler(he: Int) ! Diag.Report, TypeCheck.Resolve {
+    let eff = node_name(he)
+    let root = tc_handler_effect_root(eff)
+    let ed = tc_effect_decl_named(root)
+    if ed == -1 {
+        tc_check_partial_builtin_handler(he, eff, root)
+        return
+    }
+    // A declaration the parser recovered from may have lost operations, so its handlers are
+    // not judged against it.
+    if diag_errors_in_lines(diag_file_for_node(ed), node_line(ed), node_end_line(ed)) > 0 { return }
+    let root_marked = has_annotation(ed, "handle_all") != 0
+    let implemented = partial_handler_implemented(he)
     let mut missing: List[Int] = []
     let mut marked: List[Str] = []
     if eff == root {
@@ -13426,8 +13458,9 @@ fn tc_check_partial_handler(he: Int) ! Diag.Report {
             while i < sublist_length(children) {
                 let child = sublist_get(children, i)
                 let ops = node_methods(child)
-                let child_marked = root_marked || has_annotation(child, "handle_all") != 0
-                if child_marked && partial_handler_touches(ops, implemented) {
+                // A marked root covers every sub-effect. Only an unmarked parent waits for a
+                // clause of the marked sub-effect, which says the handler means to handle it.
+                if root_marked || (has_annotation(child, "handle_all") != 0 && partial_handler_touches(ops, implemented)) {
                     let before = missing.len()
                     partial_handler_collect(ops, implemented, missing)
                     let label = if root_marked { root } else { "{root}.{node_name(child)}" }
@@ -13444,24 +13477,100 @@ fn tc_check_partial_handler(he: Int) ! Diag.Report {
             marked.push(if root_marked { root } else { eff })
         }
     }
-    if missing.len() == 0 { return }
     let mut names: List[Str] = []
     let mut stubs: List[Str] = []
     let mut fixable = true
     for op in missing {
-        names.push("`{node_name(op)}`")
+        names.push(node_name(op))
         let stub = partial_handler_stub(op, node_module(ed), nr_current_module)
         stubs.push(stub.text)
         fixable = fixable && stub.fixable
     }
-    let one = missing.len() == 1
+    partial_handler_warn(he, eff, names, stubs, fixable, marked)
+}
+
+// W0545 on a handler for a builtin effect, which has no declaration: the marked operations
+// come from builtin_handle_all_ops and their signatures from builtin_handler_op_sig.
+fn tc_check_partial_builtin_handler(he: Int, eff: Str, root: Str) ! Diag.Report, TypeCheck.Resolve {
+    let sub = if eff == root { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
+    let implemented = partial_handler_implemented(he)
+    let rows = builtin_handle_all_ops()
+    let mut names: List[Str] = []
+    let mut stubs: List[Str] = []
+    let mut fixable = true
+    let mut marked: List[Str] = []
+    for row in rows {
+        let counts = if row.marked == root {
+            sub == "" || sub == row.sub_effect
+        } else if sub == "" {
+            // As for a declared effect: an unmarked parent counts a marked sub-effect only
+            // once the handler implements one of its operations.
+            row.marked == "{root}.{row.sub_effect}" && builtin_marked_touched(rows, row.marked, implemented)
+        } else {
+            row.marked == eff
+        }
+        if counts && !implemented.contains_key(row.op) {
+            let stub = builtin_partial_handler_stub(root, row.op)
+            if stub.text != "" {
+                names.push(row.op)
+                stubs.push(stub.text)
+                fixable = fixable && stub.fixable
+                if !marked.contains(row.marked) { marked.push(row.marked) }
+            }
+        }
+    }
+    partial_handler_warn(he, eff, names, stubs, fixable, marked)
+}
+
+fn builtin_marked_touched(rows: List[BuiltinMarkedOp], marked: Str, implemented: Map[Str, Int]) -> Bool {
+    for row in rows {
+        if row.marked == marked && implemented.contains_key(row.op) { return true }
+    }
+    false
+}
+
+// The clause the fix adds for the builtin operation `op` of `root`, or an empty text when the
+// root has no such operation. The fix is withheld when a parameter has no name, or when the
+// file names a type of the signature for something else.
+fn builtin_partial_handler_stub(root: Str, op: Str) -> HandlerStub ! TypeCheck.Resolve {
+    let sig = builtin_handler_op_sig(root, op)
+    if sig == -1 { return HandlerStub { text: "", fixable: false } }
+    let entry = fnsig_pool.get(sig).unwrap()
+    let mut fixable = true
+    let mut params: List[Str] = []
+    let mut args: List[Str] = []
+    let mut i = 0
+    while i < entry.params_count {
+        let name = fnsig_param_names.get(entry.params_start + i) ?? ""
+        let t = fnsig_param_list.get(entry.params_start + i) ?? -1
+        if name == "" || resolve_type_name(type_to_str(t)) != t { fixable = false }
+        params.push("{name}: {type_to_str(t)}")
+        args.push(name)
+        i = i + 1
+    }
+    let mut ret = ""
+    if entry.ret != TYPE_VOID {
+        if resolve_type_name(type_to_str(entry.ret)) != entry.ret { fixable = false }
+        ret = " -> {type_to_str(entry.ret)}"
+    }
+    let text = "fn {op}({params.join(", ")}){ret} \{ default.{op}({args.join(", ")}) }"
+    HandlerStub { text: text, fixable: fixable }
+}
+
+// Raises W0545 on `he` for the omitted operations `names`, whose clauses are `stubs`, and
+// attaches the fix unless a stub cannot be spelled in this file.
+fn partial_handler_warn(he: Int, eff: Str, names: List[Str], stubs: List[Str], fixable: Bool, marked: List[Str]) ! Diag.Report {
+    if names.len() == 0 { return }
+    let mut quoted: List[Str] = []
+    for n in names { quoted.push("`{n}`") }
+    let one = names.len() == 1
     let pronoun = if one { "it" } else { "them" }
     let mut notes: List[Str] = []
     for m in marked { notes.push("`{m}` is marked `@handle_all`") }
     notes.push("omitted operations go to the enclosing handler")
     let before = diag_entry_count()
     diag_warn_span_at_notes("PartialHandler", PARTIAL_HANDLER,
-        "handler for `{eff}` does not implement {names.join(", ")}", he,
+        "handler for `{eff}` does not implement {quoted.join(", ")}", he,
         partial_handler_span_end(he, eff),
         "implement {pronoun}, or forward on purpose: `{stubs.get(0).unwrap()}`", notes)
     // A silenced warning records no entry, and the fix would land on someone else's.
