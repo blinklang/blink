@@ -809,6 +809,37 @@ with capture_log(logs), capture_print(prints) {
 
 `capture_print` follows the same pattern and is also provided by `std.testing`. Users can write custom capture handlers for any effect using the standard handler syntax (see §4.7).
 
+**Standard input: `stdin_from`.** `std.testing` also gives a handler that supplies standard input:
+
+```blink
+pub fn stdin_from(text: Str) -> Handler[IO.Read]
+```
+
+The handler reads the UTF-8 bytes of `text` as the input stream, from the start, and then gives end of input. It keeps the `IO.Read` handler contract (§4.4.9): `read_bytes(n)` returns exactly `n` bytes until fewer are left, and `read_line` and `read_all` give the same results as their derived bodies over those bytes. Each call to `stdin_from` makes a new stream.
+
+```blink
+import std.testing.{stdin_from}
+
+fn sum_lines() -> Int ! IO.Read {
+    let mut sum = 0
+    loop {
+        match io.read_line() {
+            Some(line) => sum = sum + line.parse_int().unwrap_or(0)
+            None => break
+        }
+    }
+    sum
+}
+
+test "sum_lines adds each line" {
+    with stdin_from("1\n2\n\n3") {
+        assert_eq(sum_lines(), 6)
+    }
+}
+```
+
+**Standard input of a test.** `blink test` gives each test process the null device as its standard input. A test that reads with no `IO.Read` handler sees end of input at the first read: `io.read_line()` gives `None`, `io.read_all()` gives `""` and `io.read_bytes(n)` gives empty `Bytes`. A test never waits for input from the terminal that started the runner.
+
 #### 8.10.2 std.testing — Library API
 
 Beyond the four built-in assertions (§2.20) and the effect-capture handlers (§8.10.1), `std.testing` ships a small set of library helpers for common test-authoring patterns. Everything in this section is plain Blink — no new compiler intrinsics, no new keywords. Each helper is a thin wrapper around the existing built-in assertions so power-assert introspection (§2.20 Assertion Failure Output) renders the failure.

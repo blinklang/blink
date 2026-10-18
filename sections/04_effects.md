@@ -144,6 +144,8 @@ effect DB {
 effect IO {
     effect Print      // stdout
     effect Log        // structured logging subsystem
+    @handle_all
+    effect Read       // read standard input (operations in §4.4.9)
 }
 
 effect Env {
@@ -233,6 +235,9 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 | `io.print(x)` | `T: Display` | stdout, no newline | Yes (`IO.Print`) | Yes | Yes |
 | `io.println(x)` | `T: Display` | stdout, with newline | Yes (`IO.Print`) | Yes | Yes |
 | `io.log(x)` | `T: Display` | stderr, `[LOG]` prefix + newline | Yes (`IO.Log`) | Yes | Yes |
+| `io.read_line()` | — | next stdin line, `None` at end of input (§4.4.9) | Yes (`IO.Read`) | Yes | Yes |
+| `io.read_all()` | — | all stdin that is left (§4.4.9) | Yes (`IO.Read`) | Yes | Yes |
+| `io.read_bytes(n)` | `Int` | exactly `n` stdin bytes, fewer only at end of input (§4.4.9) | Yes (`IO.Read`) | Yes | Yes |
 | `io.eprintln(x)` | `T: Display` | stderr, with newline | No | No | Yes |
 | `io.eprint(x)` | `T: Display` | stderr, no newline | No | No | Yes |
 | `io.print_raw(s)` | `Str` | raw stdout, no newline | No | No | No |
@@ -252,21 +257,24 @@ error[TypeError]: mismatched types
   = help: render it first: `io.print_raw("{done}")`
 ```
 
-**Handler operations take `Str`.** The generic surface is a stdlib wrapper, not a generic effect operation. `io.println(x)` renders `x` via `x.display()`, then performs the handler operation with the result; `io.print` and `io.log` do the same. `io.eprint` and `io.eprintln` render the same way, then write the `Str` to stderr. The handler operations are:
+**Print and log handler operations take `Str`.** The generic surface is a stdlib wrapper, not a generic effect operation. `io.println(x)` renders `x` via `x.display()`, then performs the handler operation with the result; `io.print` and `io.log` do the same. `io.eprint` and `io.eprintln` render the same way, then write the `Str` to stderr. The handler operations are:
 
 | Effect | Operation | Called by |
 |---|---|---|
 | `IO.Print` | `fn print(msg: Str)` | `io.println(x)`; the default handler writes `msg` and a newline |
 | `IO.Print` | `fn print_no_nl(msg: Str)` | `io.print(x)` |
 | `IO.Log` | `fn log(msg: Str)` | `io.log(x)` |
+| `IO.Read` | `fn read_bytes(n: Int) -> Bytes` | `io.read_bytes(n)`; primitive |
+| `IO.Read` | `fn read_line() -> Option[Str]` | `io.read_line()`; derived (§4.4.9) |
+| `IO.Read` | `fn read_all() -> Str` | `io.read_all()`; derived (§4.4.9) |
 
-The wrapper selects the operation; it does not add the newline to `msg`. A handler therefore sees the same `msg` for `io.println(42)` and `io.println("42")`: the text `42`, with no newline.
+The `IO.Read` operations take and return other types (§4.4.9). The wrapper selects the operation; it does not add the newline to `msg`. A handler therefore sees the same `msg` for `io.println(42)` and `io.println("42")`: the text `42`, with no newline.
 
 **Handle naming is deterministic:**
 
 | Effect | Handle | Operations |
 |---|---|---|
-| `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)` |
+| `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)`, `io.read_line()`, `io.read_all()`, `io.read_bytes(...)` (§4.4.9) |
 | `FS` / `FS.*` | `fs` | `fs.read(...)`, `fs.write(...)`, `fs.list_dir(...)`, `fs.stat(...)`, `fs.delete(...)`, `fs.watch(...)` (§4.4.5) |
 | `DB` / `DB.*` | `db` | `db.query(...)`, `db.query_one(...)`, `db.exec(...)`, `db.execute(...)`, `db.prepare(...)`, `db.begin()`, `db.commit()`, `db.rollback()` |
 | `Net` / `Net.*` | `net` | `net.request(...)`, `net.get(...)`, `net.post(...)`, `net.listen(...)`, `net.dns(...)` |
@@ -1409,6 +1417,185 @@ test "build reports a failed make" {
 
 A handler implements `run` with all three parameters. The default value of `stdin` applies at the call site only.
 
+#### 4.4.9 Standard Input (`IO.Read`)
+
+The `IO.Read` sub-effect reads the standard input of the process. It has one primitive operation, `read_bytes`, and two derived operations, `read_line` and `read_all` (§4.7.1):
+
+```blink
+effect IO {
+    effect Print
+    effect Log
+
+    @handle_all
+    effect Read {
+        /// Exactly n bytes, or fewer only at end of input. Empty at end of input.
+        fn read_bytes(n: Int) -> Bytes
+
+        /// The next line without its terminator, or None at end of input.
+        fn read_line() -> Option[Str] {
+            let mut line = Bytes.new()
+            loop {
+                let b = io.read_bytes(1)
+                if b.is_empty() {
+                    if line.is_empty() { return None }
+                    break
+                }
+                if b.get(0) == Some(10) {
+                    let n = line.len()
+                    if n > 0 && line.get(n - 1) == Some(13) {
+                        line = line.slice(0, n - 1)
+                    }
+                    break
+                }
+                line = line.concat(b)
+            }
+            match line.to_str() {
+                Ok(s) => Some(s)
+                Err(_) => panic("io.read_line: input is not valid UTF-8; read it with io.read_bytes")
+            }
+        }
+
+        /// All of the input that is left. Empty at end of input.
+        fn read_all() -> Str {
+            let mut all = Bytes.new()
+            loop {
+                let chunk = io.read_bytes(65536)
+                all = all.concat(chunk)
+                if chunk.len() < 65536 { break }
+            }
+            match all.to_str() {
+                Ok(s) => s
+                Err(_) => panic("io.read_all: input is not valid UTF-8; read it with io.read_bytes")
+            }
+        }
+    }
+}
+```
+
+The bodies above define what the two derived operations return. The default handler answers all three operations from one buffer and gives the same results.
+
+**The `io` methods.** A program calls `io.read_bytes(n)`, `io.read_line()` and `io.read_all()`. Each method calls its operation once. `io.read_bytes(n)` with `n <= 0` panics before the operation runs, so a handler never sees such an `n`. With `n > 0`, an empty result means end of input and nothing else.
+
+```blink
+fn main() ! IO {
+    let mut sum = 0
+    loop {
+        match io.read_line() {
+            Some(line) => sum = sum + line.parse_int().unwrap_or(0)
+            None => break
+        }
+    }
+    io.println(sum)
+}
+```
+
+**Lines.** A line ends at `\n` or at `\r\n`. `read_line` removes the terminator. A last line with no terminator is still a line. A blank line is `Some("")`, and end of input is `None`, so the two never look the same:
+
+| Input left | `read_line()` calls give |
+|---|---|
+| `"a\nb\n"` | `Some("a")`, `Some("b")`, `None` |
+| `"a\r\nb"` | `Some("a")`, `Some("b")`, `None` |
+| `"\n"` | `Some("")`, `None` |
+| `""` | `None` |
+
+A line has no length limit.
+
+**One stream.** The three operations take bytes from the front of one input stream, in the order the program calls them. A program can mix them in any order. A message with a header line and a body of known length reads both from the same stream:
+
+```blink
+fn read_message() -> Option[Str] ! IO.Read {
+    let header = io.read_line()?
+    let size = match header.strip_prefix("Content-Length: ")?.parse_int() {
+        Ok(n) => n
+        Err(_) => return None
+    }
+    if size <= 0 { return Some("") }
+    match io.read_bytes(size).to_str() {
+        Ok(body) => Some(body)
+        Err(_) => None
+    }
+}
+```
+
+`io.read_bytes(n)` waits until it has `n` bytes or the input ends. A short result means the input ended. No `io` operation returns only the bytes that are ready now.
+
+**Handler contract.** A handler for `IO.Read` must keep the same rules as the default handler:
+
+1. Its `read_bytes(n)` returns exactly `n` bytes, or fewer only at end of input. The derived `read_all` stops at the first short result, so a handler that returns short chunks before the end cuts the input.
+2. If it implements `read_line` or `read_all`, the results must be the same as the bodies above give over its own `read_bytes`. So `read_all()` returns the same text as the lines from repeated `read_line()` calls, each one followed by its terminator.
+
+The compiler does not check these rules. `std.testing.stdin_from` keeps them (§8.10.1). `IO.Read` is marked `@handle_all`, so a handler for it that omits `read_bytes` gets the `PartialHandler` warning (W0545, §4.7.1). A derived operation that a handler omits runs its body above over that handler's `read_bytes`.
+
+**Errors.** If the operating system reports a read failure, the operation panics. The panic message names the operation and the errno. If the bytes for `read_line` or `read_all` are not valid UTF-8, the operation panics, and the message names the operation and `io.read_bytes`. The operations do not replace bad bytes with U+FFFD: that gives wrong data with no signal. Code that must recover from a read failure uses `libc.read_bytes(0, n) -> Result[Bytes, Errno]` (§9.1.3.3) and makes no `io.read_*` call.
+
+**Mixing with file descriptor 0.** The `io` stream can hold bytes that file descriptor 0 has already given. After any `io.read_*` call, the order of the bytes that `libc.read_bytes(0, ..)` or `std.io.read_fully(0, ..)` returns is not specified. A program reads standard input through `io` or through file descriptor 0, not both.
+
+**Every line.** The v1 iterator is pure (§3c.1), so there is no `io.lines()`. Use one of these two forms:
+
+```blink
+fn count_words() -> Int ! IO.Read {
+    let mut count = 0
+    for line in io.read_all().lines() {
+        count = count + line.split(" ").len()
+    }
+    count
+}
+
+fn echo_upper() ! IO.Read, IO.Print {
+    loop {
+        match io.read_line() {
+            Some(line) => io.println(line.to_upper())
+            None => break
+        }
+    }
+}
+```
+
+The first form reads all the input before the loop starts. The second form reads one line at a time. `Str.lines()` uses the same line rules as `read_line` (§3), so both forms give the same lines.
+
+A call to `io.lines()` is E0505 (UnresolvedMethod), with a help line that shows the two forms:
+
+```
+error[UnresolvedMethod]: no method `lines` on the `io` handle
+ --> wc.bl:2:17
+  |
+2 |     for line in io.lines() {
+  |                 ^^^^^^^^ no method `lines`
+  |
+  = help: read all the input, then split it: `for line in io.read_all().lines() { ... }`
+  = help: or read one line at a time: `loop { match io.read_line() { Some(line) => ..., None => break } }`
+```
+
+**Migration.** In earlier versions, `io.read_line()` returned `Str`, with `""` for both a blank line and end of input. Code that uses the result as a `Str` now gets a type error. When the value comes from `io.read_line()`, the error has a help line that shows the `match` form:
+
+```
+error[TypeError]: mismatched types
+ --> sum.bl:4:19
+  |
+3 |         let line = io.read_line()
+4 |         if line == "" { break }
+  |            ^^^^^^^^^^ expected `Option[Str]`, found `Str`
+  |
+  = note: `io.read_line()` returns `None` at end of input and `Some("")` for a blank line
+  = help: match on it: `match io.read_line() { Some(line) => ..., None => break }`
+```
+
+No fix is machine-applicable. The help does not show `?? ""`, because that form gives back the old behavior, where a blank line and end of input look the same.
+
+**Tests.** `std.testing.stdin_from(text)` gives a handler that reads `text` as standard input (§8.10.1). A test with no `IO.Read` handler reads the null device, so its first read sees end of input (§8.10.1).
+
+```blink
+import std.testing.{stdin_from, capture_print}
+
+test "echo_upper prints each line in capitals" {
+    let out: List[Str] = []
+    with stdin_from("ab\n\ncd"), capture_print(out) {
+        echo_upper()
+    }
+    assert_eq(out, ["AB", "", "CD"])
+}
+```
+
 ---
 
 ### 4.5 Effect Composition Rules
@@ -2062,7 +2249,7 @@ The operation never returns and never produces a default value, whatever its ret
 
 #### Whole-handler effects: `@handle_all`
 
-For most effects, a partial handler is correct code: `logging_db` above changes `read` and keeps the enclosing handler for the rest. For some effects, all operations are views of one resource. The three `Rand` operations read one random stream, and the `Time` operations read one clock. A handler that answers some of these operations and forwards the rest mixes two streams or two clocks. Only the author of the effect knows which kind of effect it is, so the author marks it:
+For most effects, a partial handler is correct code: `logging_db` above changes `read` and keeps the enclosing handler for the rest. For some effects, all operations are views of one resource. The three `Rand` operations read one random stream, the `Time` operations read one clock, and the `IO.Read` operations read one input stream. A handler that answers some of these operations and forwards the rest mixes two streams or two clocks. Only the author of the effect knows which kind of effect it is, so the author marks it:
 
 ```blink
 @handle_all
@@ -2072,9 +2259,9 @@ effect Dice {
 }
 ```
 
-`@handle_all` attaches to an effect declaration. It covers the sub-effects of the effect too. The stdlib marks `Rand` (§4.4.7) and `Time` (§4.3), and no other effect.
+`@handle_all` attaches to an effect declaration. It covers the sub-effects of the effect too. It can also mark a nested sub-effect, and then it covers only that sub-effect. The stdlib marks `Rand` (§4.4.7), `Time` (§4.3) and `IO.Read` (§4.4.9), and no other effect.
 
-When a handler expression for a marked effect omits a primitive operation of the effect that it handles, the compiler gives the warning `PartialHandler` (W0545). A derived operation never counts, because the effect declaration supplies its body. A handler for a sub-effect counts only the operations of that sub-effect. The warning is about the handler expression, so it fires in all code, not only in tests:
+When a handler expression for a marked effect omits a primitive operation of the effect that it handles, the compiler gives the warning `PartialHandler` (W0545). A derived operation never counts, because the effect declaration supplies its body. A handler for a sub-effect counts only the operations of that sub-effect. A handler for a parent effect counts the operations of a marked sub-effect only if it implements one or more of them: a `handler IO { ... }` that implements only `print` gets no warning, and one that implements `read_line` but not `read_bytes` does. The warning is about the handler expression, so it fires in all code, not only in tests:
 
 ```blink
 fn always_high() -> Handler[Rand] {

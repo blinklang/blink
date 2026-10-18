@@ -218,6 +218,8 @@ The full method surface (`Sized` + `StrOps`):
 
 The `byte_` methods are exactly the four in this table: `byte_len`, `byte_at`, `byte_slice` and `byte_index_of`. The prefix does not extend to other methods; there is no `byte_split` or `byte_starts_with`.
 
+**Line splitting.** `lines` splits at `\n` and at `\r\n`, and removes the terminators. A terminator at the end of the string does not make an empty last item, and a string with no terminator is one line. So `"a\nb\n".lines()` and `"a\r\nb".lines()` give `["a", "b"]`, `"\n".lines()` gives `[""]`, and `"".lines()` gives `[]`. These are the rules of `io.read_line()` (§4.4.9), so `io.read_all().lines()` gives the same lines as repeated `io.read_line()` calls.
+
 ##### Unicode Semantics
 
 Blink strings are codepoint-oriented by default. All index-based methods operate on codepoint positions, not byte offsets.

@@ -1353,6 +1353,8 @@ The law governs only the *shape* of a wrapper; it is not a license to auto-add w
 
 **`read_fully_bytes` is not a `libc` member.** Reading exactly `n` bytes (looping over `read_bytes` until `n` or EOF) is a derived combinator with no syscall and no bridge crossing of its own; it lives in `std.io` as ordinary Blink (`std.io.read_fully`), preserving the "`libc.*` is exactly one syscall, 1:1" invariant that keeps the `libc` surface auditable. It ships at v1 (a hard, gate-coupled deliverable — `read_bytes` alone is a short-read footgun), and the `read_bytes` doc/hover **must** cross-reference it: "`read_bytes` may return fewer than `max`; for read-until-`n` use `std.io.read_fully`."
 
+**File descriptor 0 and `io`.** The `io` read operations (§4.4.9) can hold bytes that file descriptor 0 has already given. After any `io.read_*` call, the order of the bytes that `libc.read_bytes(0, ..)` or `std.io.read_fully(0, ..)` returns is not specified. A program reads standard input through `io` or through file descriptor 0, not both.
+
 **Audit category.** `blink audit` reports a `bytes-bridge` category with three subcategories:
 
 - `bridge-call` — call sites of `copy_to_buf` / `copy_from_buf` / `copy_from_buf_n` (the sealed-`Buf` path).
