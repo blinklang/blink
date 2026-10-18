@@ -33,7 +33,8 @@ import typecheck.{
 import layout.{
     LayoutRecord, Position, Slot, SlotForm, layout_of, binder_is_celled, carrier_member_layout,
     child_tid, current_binder_scope, field_layout_of, tid_of_binder, tid_of_node, ensure_typedef_for,
-    format_spec_of, varargs_spelling, pointer_spelling,
+    format_spec_of, varargs_spelling, pointer_spelling, binder_scope_push_detached, binder_scope_pop,
+    current_inst, set_current_inst,
 }
 import cg_reg.{cg_reg_global_decls, cg_reg_module_of}
 import cname.{
@@ -613,6 +614,21 @@ fn lower_ident(node: Int) -> Int ! Diag.Report {
         "`{name}` is neither a typed binder in scope nor a resolved module global", node,
         "every local must be bound at its own type before an expression that reads it is lowered")
     -1
+}
+
+// A default, lowered where it was written: in the module of `owner`, with none of the
+// locals around the use that leaves it out in scope, and with the types of instance `inst`
+// (-1 for the types typecheck stamped at the declaration).
+pub fn x_lower_default(owner: Int, default: Int, inst: Int) -> Int ! Diag.Report {
+    let saved_module = tc_enter_body_module(owner)
+    let saved_inst = current_inst()
+    set_current_inst(inst)
+    let _ = binder_scope_push_detached()
+    let value = lower_expr_as_value(default)
+    binder_scope_pop()
+    set_current_inst(saved_inst)
+    tc_leave_body_module(saved_module)
+    value
 }
 
 // The language lets a local shadow a module global, so a bare name is a local wherever
@@ -1781,14 +1797,9 @@ fn x_struct_field_value(node: Int, decl: Int, fd: Int, written: StructWritten) -
     // field's default: the reader asked for the source's value, not for a fresh one.
     if base.name != "" { return x_field_of_spread(node, want, base) }
     let default = node_condition(fd)
-    if default >= 0 {
-        // The default is written in the type's module and checked there, so its names read
-        // there too, not in the module of the literal that leaves the field out.
-        let saved_module = tc_enter_body_module(decl)
-        let value = lower_expr_as_value(default)
-        tc_leave_body_module(saved_module)
-        return value
-    }
+    // The default is written in the type's module and checked there, so its names read
+    // there too, not in the module of the literal that leaves the field out.
+    if default >= 0 { return x_lower_default(decl, default, current_inst()) }
     diag_ice_at("StructLiteralFieldMissing", CODEGEN_STAGE_NOT_BUILT,
         "the literal gives no value for field `{want}` and the field has no default", node,
         "typecheck must reject an incomplete struct literal before codegen")

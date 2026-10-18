@@ -27,7 +27,7 @@ import parser.{
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
-    tc_scalar_has_eq, tc_scalar_has_ord,
+    tc_scalar_has_eq, tc_scalar_has_ord, tc_is_default_fill,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
     tc_type_str, tc_ptr_offset_stride_known,
@@ -73,6 +73,7 @@ import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
     x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor, cg_expr_sequence, cg_expr_lower_pair,
+    x_lower_default,
 }
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
@@ -6244,7 +6245,10 @@ fn cc_lower_call_operands(node: Int, recv: Int, operands: List[Int]) -> List[Int
     }
     let mut i = 0
     while i < order.len() {
-        let a = lower_expr_as_value(operands.get(order.get(i).unwrap()).unwrap())
+        let op = operands.get(order.get(i).unwrap()).unwrap()
+        let fill = cc_default_fill_of(node, op)
+        // A default belongs to the callee, so it reads the callee's instance types.
+        let a = if fill < 0 { lower_expr_as_value(op) } else { x_lower_default(fill, op, instance_for_call(current_inst(), node)) }
         if a < 0 { return slots }
         values.push(a)
         ends.push(cg_expr_pending_count())
@@ -6259,6 +6263,15 @@ fn cc_lower_call_operands(node: Int, recv: Int, operands: List[Int]) -> List[Int
         k = k + 1
     }
     slots
+}
+
+// The keyword argument typecheck filled from a default whose value is `operand`, or -1. The
+// fill names the module the default was written in.
+fn cc_default_fill_of(node: Int, operand: Int) -> Int {
+    for w in cc_written_args(node) {
+        if tc_is_default_fill(w) && node_value(w) == operand { return w }
+    }
+    -1
 }
 
 // The indices of `operands` in the order the call wrote them.

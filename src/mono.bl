@@ -33,7 +33,7 @@ import typecheck.{
     make_ptr_type, make_result_type, make_set_type, make_struct_instance_type, make_template_type,
     make_tuple_type,
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
-    tc_alias_to_original, tc_call_decl_node, tc_call_user_effect, tc_field_tid_at_instance,
+    tc_alias_to_original, tc_call_decl_node, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl,
@@ -550,8 +550,11 @@ fn solve_call_binds(ctx: Int, gfn: Int, call_node: Int, lead: List[Int], args_sl
     while i < sl_len(args_sl) {
         let mut arg = sublist_get(args_sl, i)
         let mut pidx = i + lead.len()
+        // A default carries the callee's own parameter types, not the call's, so it
+        // solves nothing here.
+        if tc_is_default_fill(arg) { pidx = -1 }
         if nk_of(node_kind(arg)) == NodeKind.NamedArg {
-            pidx = param_index_by_name(params_sl, node_name(arg))
+            if pidx >= 0 { pidx = param_index_by_name(params_sl, node_name(arg)) }
             arg = node_value(arg)
         }
         if pidx >= 0 && pidx < sl_len(params_sl) {
@@ -1105,6 +1108,17 @@ fn mono_walk_method_call(ctx: Int, node: Int) ! Diag.Report {
     walk_ref_and_list(ctx, node_obj(node), node_args(node))
 }
 
+// A default is walked with the fn it belongs to, so an instance records it under its own
+// binds; a call that leaves it out lowers it in the callee's instance.
+fn walk_param(ctx: Int, node: Int) ! Diag.Report {
+    walk2(ctx, node_type_ann(node), node_value(node))
+}
+
+// A default typecheck filled in belongs to the callee, and is walked there by walk_param.
+fn walk_named_arg(ctx: Int, node: Int) ! Diag.Report {
+    if !tc_is_default_fill(node) { mono_walk(ctx, node_value(node)) }
+}
+
 fn walk_closure(ctx: Int, node: Int) ! Diag.Report {
     walk_sl(ctx, node_params(node))
     walk2(ctx, node_type_ann(node), node_body(node))
@@ -1179,7 +1193,7 @@ fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
         NodeKind.Continue => {}
         NodeKind.Block => walk_sl(ctx, node_stmts(node))
         NodeKind.FnDef => walk_fn_parts(ctx, node)
-        NodeKind.Param => mono_walk(ctx, node_type_ann(node))
+        NodeKind.Param => walk_param(ctx, node)
         NodeKind.Program => ice_unwalkable(node, kind)
         NodeKind.TypeDef => walk_type_def(ctx, node)
         NodeKind.TypeField => walk2(ctx, node_condition(node), node_value(node))
@@ -1214,7 +1228,7 @@ fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
         NodeKind.AwaitExpr => mono_walk(ctx, node_obj(node))
         NodeKind.ChannelNew => walk_sl(ctx, node_args(node))
         NodeKind.EmbedExpr => {}
-        NodeKind.NamedArg => mono_walk(ctx, node_value(node))
+        NodeKind.NamedArg => walk_named_arg(ctx, node)
         NodeKind.AssocType => mono_walk(ctx, node_type_ann(node))
         NodeKind.SpreadExpr => mono_walk(ctx, node_value(node))
         NodeKind.CharLit => {}

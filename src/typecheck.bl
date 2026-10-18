@@ -4829,6 +4829,10 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     // call that omits the argument, which is how a struct field default already reaches a
     // literal that does not name the field. `seen` is what makes a second pass over the same
     // program find the argument already there instead of appending it twice.
+    //
+    // The default was written in the callee's module and is checked there, at the
+    // declaration, so the fill carries that module and the default's own position: a later
+    // stage lowers it there, and a report about it names the default's file.
     let mut k = kw_start
     while k < param_count {
         let nm = fnsig_param_names.get(param_start + k) ?? ""
@@ -4838,13 +4842,28 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
                 diag_error_at("MissingKeywordArg", MISSING_KEYWORD_ARG, "keyword argument `{nm}` is missing from the call to `{fn_name}`", call_node, "add `{nm}: <value>`")
                 return 1
             }
-            sublist_append(args_sl, synth_named_arg(nm, dflt, node_line(call_node), node_col(call_node)))
+            let fill = synth_named_arg(nm, dflt, node_line(dflt), node_col(dflt))
+            node_set_module(fill, tc_default_fill_module(fs.decl))
+            sublist_append(args_sl, fill)
             tc_grow_node_tables()
             seen.insert(nm, 1)
         }
         k = k + 1
     }
     0
+}
+
+// The module a default of `decl` was written in. A trait method's signature carries no
+// declaration, so its fill keeps the caller's module and is read at the call as before.
+fn tc_default_fill_module(decl: Int) -> Str {
+    if decl < 0 { return "" }
+    tc_body_module(decl)
+}
+
+// A keyword argument typecheck appended from a declaration's default. Its value was checked
+// at the declaration, in the module the fill names, so nothing reads it again in the caller.
+pub fn tc_is_default_fill(arg: Int) -> Bool {
+    node_kind(arg) == NodeKind.NamedArg && node_module(arg) != ""
 }
 
 fn tc_args_have_label(args_sl: Int, argc: Int) -> Int {
@@ -4998,7 +5017,14 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
             // the metavariables in the formal.
             let concrete = if seen.len() == 0 { tc_no_binds } else { tc_concrete_binds(seen) }
             let ptid = substitute_typevar_tid(substitute_typevar_tid(formal, binds), concrete)
-            if tc_tid_is_no_info(ptid) == 0 { arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid) }
+            if tc_is_default_fill(arg_node) {
+                // Inferring the default here would read its names in the caller's module
+                // and scope; it was held to this parameter at the declaration.
+                arg_t = ptid
+                tc_publish_node_tid(arg_node, ptid)
+            } else if tc_tid_is_no_info(ptid) == 0 {
+                arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid)
+            }
             if arg_t >= 0 { unify_typevar_binds(formal, arg_t, seen) }
         }
         // build_typevar_binds aligns by position, so a position with a parameter needs a
@@ -6586,7 +6612,7 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
         return
     }
     if k == NodeKind.NamedArg || k == NodeKind.SpreadExpr {
-        tc_walk_nested_hof_bodies(node_value(expr))
+        if !tc_is_default_fill(expr) { tc_walk_nested_hof_bodies(node_value(expr)) }
         return
     }
     // `channel.new[T](buffer: ..)` is its own node kind, not a call, so the call arms above
@@ -15917,6 +15943,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let td = sublist_get(nr_types_sl, i)
             nr_current_module = node_module(td)
             nr_check_type_decl(td)
+            nr_check_field_defaults(td)
             i = i + 1
         }
     }
@@ -16037,6 +16064,22 @@ fn nr_check_type_decl(td: Int) ! TypeCheck.Resolve, Diag.Report {
     tc_pop_tparam_scope(tparams)
 }
 
+// A field default is read in the module that declares the type, whichever literal leaves the
+// field out, so its names are resolved here, once, and not at each literal.
+fn nr_check_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let flds = node_fields(td)
+    if flds == -1 { return }
+    let tparams = node_type_params(td)
+    tc_push_tparam_scope(tparams)
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        if node_kind(f) == NodeKind.TypeField { nr_check_node(node_condition(f)) }
+        i = i + 1
+    }
+    tc_pop_tparam_scope(tparams)
+}
+
 fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Before the scope, because the warnings this walk raises are raised by CLOSING it.
     diag_enter_allows(fn_node)
@@ -16062,6 +16105,15 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     tc_push_tparam_scope(fn_tparams)
     let nr_is_ffi = has_annotation(fn_node, "ffi")
     let params_sl = node_params(fn_node)
+    // A default is read where it is written, before any parameter is in scope: a call that
+    // leaves the argument out has none of them to give it.
+    if params_sl != -1 {
+        let mut d = 0
+        while d < sublist_length(params_sl) {
+            nr_check_node(node_value(sublist_get(params_sl, d)))
+            d = d + 1
+        }
+    }
     if params_sl != -1 && nr_is_ffi == 0 {
         let mut i = 0
         while i < sublist_length(params_sl) {
@@ -17112,7 +17164,8 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.NamedArg {
-        nr_check_node(node_value(node))
+        // A default fill was resolved at its declaration, in its own module.
+        if !tc_is_default_fill(node) { nr_check_node(node_value(node)) }
         return
     }
 
@@ -21994,6 +22047,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // no arm at all, so `serve(port: 8080)` left both the label node and the literal inside
         // it with nothing — check_arg_shapes infers the NamedArg node, not the value, so the
         // argument was never checked against the parameter either.
+        if tc_is_default_fill(node) { return tc_lookup_node_tid(node) }
         return infer_type(node_value(node))
     }
 
@@ -23184,6 +23238,36 @@ fn tc_check_param_defaults(fn_node: Int) ! Diag.Report {
     }
 }
 
+// Each default against its parameter's type, here at the declaration, in the declaration's
+// module and before any parameter is in scope. Every call that leaves the argument out
+// shares the one node, so this is the one place it is read, and a mistake in it is reported
+// at the default in its own file, not at a call.
+fn tc_check_param_default_types(fn_name: Str, fn_node: Int, sig: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let params_sl = node_params(fn_node)
+    if params_sl == -1 || sig == -1 { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    // The receiver is the one parameter written with no type, and a call counts its
+    // arguments after it.
+    let mut receiver = 0
+    if sublist_length(params_sl) > 0 {
+        let p0 = sublist_get(params_sl, 0)
+        if node_type_ann(p0) == -1 && node_type_name(p0) == "" { receiver = 1 }
+    }
+    let mut i = 0
+    while i < sublist_length(params_sl) && i < fs.params_count {
+        let dflt = node_value(sublist_get(params_sl, i))
+        if dflt != -1 {
+            let ptid = fnsig_param_list.get(fs.params_start + i) ?? -1
+            if ptid >= 0 && tc_tid_is_no_info(ptid) == 0 {
+                let _ = check_one_arg_shape(fn_name, i - receiver, dflt, ptid)
+            } else {
+                let _ = tc_infer_unhinted(dflt)
+            }
+        }
+        i = i + 1
+    }
+}
+
 fn tc_check_allow_annotation(fn_node: Int) ! Diag.Report {
     let allow_ann = get_annotation(fn_node, "allow")
     if allow_ann == -1 { return }
@@ -23240,6 +23324,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     let is_ffi = has_annotation(fn_node, "ffi")
     tc_check_allow_annotation(fn_node)
     tc_check_param_defaults(fn_node)
+    tc_check_param_default_types(fn_name, fn_node, sig)
     diag_push_allows(fn_node)
 
     let params_sl = node_params(fn_node)

@@ -1,0 +1,293 @@
+// A struct field default and a keyword argument default are written in the module that
+// declares them, and every name in one reads there (sections/02_syntax.md §2.13, §2.14,
+// §2.21), whichever module leaves the field or the argument out. A diagnostic inside a
+// default points at the default in its own file.
+
+fn cleanup(base: Str) {
+    let _ = process_run("rm", ["-rf", base])
+}
+
+fn fail(base: Str, msg: Str) {
+    io.println("FAIL: {msg}")
+    cleanup(base)
+    assert(false)
+}
+
+fn blink_bin() -> Str {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    "{blink_root}/build/blink"
+}
+
+fn new_package(base: Str) {
+    cleanup(base)
+    let _ = process_run("mkdir", ["-p", "{base}/src"])
+    write_file("{base}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+}
+
+// The combined output of `blink <cmd> src/main.bl`, with its exit status on the last line.
+fn blink_in(base: Str, cmd: Str) -> Str {
+    let r = process_run("sh", ["-c", "cd {base} && {blink_bin()} {cmd} src/main.bl 2>&1"])
+    "{r.out}\nexit {r.exit_code}"
+}
+
+fn exited_clean(out: Str) -> Bool {
+    out.ends_with("\nexit 0")
+}
+
+// Writes alpha and beta, and a main file that imports them in `order`.
+fn write_package(base: Str, alpha: Str, beta: Str, order: List[Str]) {
+    new_package(base)
+    write_file("{base}/src/alpha.bl", alpha)
+    write_file("{base}/src/beta.bl", beta)
+    let mut imports = ""
+    for m in order {
+        let line = if m == "alpha" { "import alpha.\{make_a\}\n" } else { "import beta.\{make_b\}\n" }
+        imports = imports.concat(line)
+    }
+    write_file("{base}/src/main.bl", "{imports}\nfn main() \{ io.println(\"\{make_a()\} \{make_b()\}\") \}\n")
+}
+
+// Checks the package and runs it as one C unit per module and as one unit for the whole
+// program, in both import orders; each run's output must hold `want`.
+fn expect_run(base: Str, alpha: Str, beta: Str, want: Str) {
+    for order in [["alpha", "beta"], ["beta", "alpha"]] {
+        write_package(base, alpha, beta, order)
+        let names = order.join(", ")
+        let chk = blink_in(base, "check")
+        if !exited_clean(chk) {
+            fail(base, "importing {names} should check clean, got: {chk}")
+            return
+        }
+        for cmd in ["run", "run --no-per-module"] {
+            let run = blink_in(base, cmd)
+            if !exited_clean(run) || !run.contains(want) {
+                fail(base, "importing {names}, `{cmd}` should print `{want}`, got: {run}")
+                return
+            }
+        }
+    }
+    cleanup(base)
+}
+
+test "a keyword default naming a namesake type reads the declaring module's type" {
+    let alpha = #"pub type Hue {
+    Red
+    Green
+}
+
+pub fn code(n: Int, -- h: Hue = Hue.Green) -> Int {
+    match h {
+        Red => n + 1
+        Green => n + 2
+    }
+}
+
+pub fn make_a() -> Int {
+    code(0)
+}
+"#
+    let beta = #"import alpha.{code}
+
+pub type Hue {
+    Blue
+    Gray
+}
+
+pub fn make_b() -> Int {
+    code(10)
+}
+"#
+    expect_run(".tmp/_test_defaults_kw_namesake_type", alpha, beta, "2 12")
+}
+
+test "a keyword default naming a namesake const reads the declaring module's const" {
+    let alpha = #"const start = 1
+
+pub fn take(-- n: Int = start) -> Int {
+    n
+}
+
+pub fn make_a() -> Int {
+    take()
+}
+"#
+    let beta = #"import alpha.{take}
+
+const start = "two"
+
+pub fn make_b() -> Str {
+    "{start}{take()}"
+}
+"#
+    expect_run(".tmp/_test_defaults_kw_namesake_const", alpha, beta, "1 two1")
+}
+
+// main has no `K` of its own, and the declaring module never uses its own defaults.
+test "a field default and a keyword default naming a const work from a module without it" {
+    let base = ".tmp/_test_defaults_const_elsewhere"
+    new_package(base)
+    write_file("{base}/src/base.bl", #"pub const K: Int = 3
+
+pub type Cfg {
+    n: Int = K
+}
+
+pub fn wait(-- n: Int = K) -> Int {
+    n
+}
+"#)
+    write_file("{base}/src/main.bl", #"import base.{Cfg, wait}
+
+fn main() {
+    let c = Cfg {}
+    io.println("{c.n} {wait()}")
+}
+"#)
+    for cmd in ["run", "run --no-per-module"] {
+        let run = blink_in(base, cmd)
+        if !exited_clean(run) || !run.contains("3 3") {
+            fail(base, "`{cmd}` should print `3 3`, got: {run}")
+            return
+        }
+    }
+    cleanup(base)
+}
+
+// A local of the caller is not in scope where the default was written.
+test "a default reads the declaring module's const over a caller local of the same name" {
+    let alpha = #"const start = 1
+
+pub type Spot {
+    n: Int = start
+}
+
+pub fn take(-- n: Int = start) -> Int {
+    n
+}
+
+pub fn make_a() -> Int {
+    take()
+}
+"#
+    let beta = #"import alpha.{Spot, take}
+
+pub fn make_b() -> Int {
+    let start = 40
+    let s = Spot {}
+    start + s.n + take()
+}
+"#
+    expect_run(".tmp/_test_defaults_caller_local", alpha, beta, "1 42")
+}
+
+test "a keyword default naming a bare variant reads the declaring module's enum" {
+    let alpha = #"pub type Hue {
+    Red
+    Green
+}
+
+pub fn code(-- h: Hue = Green) -> Int {
+    match h {
+        Red => 1
+        Green => 2
+    }
+}
+
+pub fn make_a() -> Int {
+    code()
+}
+"#
+    let beta = #"import alpha.{code}
+
+pub type Shade {
+    Green
+    Blue
+}
+
+pub fn make_b() -> Int {
+    let s = Shade.Blue
+    let n = match s {
+        Green => 10
+        Blue => 20
+    }
+    n + code()
+}
+"#
+    expect_run(".tmp/_test_defaults_kw_bare_variant", alpha, beta, "2 22")
+}
+
+// The generic fn is instantiated from beta, but its default is alpha's.
+test "a keyword default of a generic fn instantiated from another module reads its own module" {
+    let alpha = #"const start = 1
+
+pub fn pick[T](_x: T, -- n: Int = start) -> Int {
+    n
+}
+
+pub fn make_a() -> Int {
+    pick(true)
+}
+"#
+    let beta = #"import alpha.{pick}
+
+const start = "two"
+
+pub fn make_b() -> Str {
+    let n = pick("q")
+    "{start}{n}"
+}
+"#
+    expect_run(".tmp/_test_defaults_generic", alpha, beta, "1 two1")
+}
+
+// One default node serves every instance, so each call must read it at its own type.
+test "a keyword default typed by a type parameter takes each instance's type" {
+    let alpha = #"pub fn first[T](xs: List[T], -- fallback: Option[T] = None) -> Option[T] {
+    if xs.len() > 0 {
+        return xs.get(0)
+    }
+    fallback
+}
+
+pub fn make_a() -> Int {
+    let none: List[Int] = []
+    (first([7]) ?? 0) + (first(none) ?? 1)
+}
+"#
+    let beta = #"import alpha.{first}
+
+pub fn make_b() -> Str {
+    let none: List[Str] = []
+    "{first(["q"]) ?? "-"}{first(none) ?? "-"}"
+}
+"#
+    expect_run(".tmp/_test_defaults_generic_typed", alpha, beta, "8 q-")
+}
+
+// The call is in beta, but the mistake is the default, so the report names alpha's line.
+test "a keyword default of the wrong type is reported at the default in its own file" {
+    let base = ".tmp/_test_defaults_wrong_type_span"
+    let alpha = #"pub fn take(-- n: Int = "x") -> Int {
+    n
+}
+
+pub fn make_a() -> Int {
+    1
+}
+"#
+    let beta = #"import alpha.{take}
+
+pub fn make_b() -> Int {
+    take()
+}
+"#
+    for order in [["alpha", "beta"], ["beta", "alpha"]] {
+        write_package(base, alpha, beta, order)
+        let chk = blink_in(base, "check")
+        if exited_clean(chk) || !chk.contains("src/alpha.bl:1:25") || chk.contains("src/main.bl") || chk.contains("src/beta.bl") {
+            fail(base, "importing {order.join(", ")} should report the default at src/alpha.bl:1:25 alone, got: {chk}")
+            return
+        }
+    }
+    cleanup(base)
+}
