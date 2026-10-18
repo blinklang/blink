@@ -380,7 +380,7 @@ digits   = one or more ASCII "0" to "9"
 
 - `parse_int` accepts `int`. `parse_float` accepts `float`. Both use the same `sign`.
 - `special` ignores letter case, for the ASCII letters A to Z only: `NaN`, `INF` and `Infinity` match. No other case mapping applies.
-- A sign on `nan` has no effect. Blink has one NaN (*Float Total Ordering*).
+- A sign on `nan` has no effect under `==`: every NaN is `==` every other NaN (*Float Total Ordering*).
 - These are `Err`: whitespace before or after the text (call `s.trim()` first), `_`, hex forms, `nan(...)`, a decimal mark other than `.`, and `.5` or `1.` (a digit must be on each side of `.`). The result does not depend on the locale.
 - `parse_float` rounds to nearest, ties to even, for any count of digits and any exponent length.
 - A `numeric` text whose rounded value is ±infinity gives `Err`. A value that rounds to a subnormal or to zero gives `Ok`, with the sign kept: `"-1e-400"` gives `Ok(-0.0)`.
@@ -3502,7 +3502,7 @@ Operands must be the same type. Mixed-type arithmetic (`Int + Float`) is a compi
 - `-0.0 == 0.0` is `true`
 - `Float` does **not** implement `Hash` — bitwise hashing cannot stay coherent with `Eq` (e.g. `-0.0 == 0.0` with distinct bit patterns), so `Float` keys are rejected as `E1400` (see Hash Contract and Seeding, §3.6)
 
-For IEEE 754 equality, use the method `x.ieee_eq(y)`. It is the IEEE 754 equality predicate (C's `==`): `NaN` is unequal to every value, itself included, and `(-0.0).ieee_eq(0.0)` is `true`. `x == y` is `true` exactly when `x.ieee_eq(y)` is `true` or both operands are `NaN`. No `Float` equality tells `-0.0` from `0.0`. To test the sign of zero, use `1.0 / x < 0.0`.
+For IEEE 754 equality, use the method `x.ieee_eq(y)`. It is the IEEE 754 equality predicate (C's `==`): `NaN` is unequal to every value, itself included, and `(-0.0).ieee_eq(0.0)` is `true`. `x == y` is `true` exactly when `x.ieee_eq(y)` is `true` or both operands are `NaN`. No `Float` equality tells `-0.0` from `0.0`. To test the sign, use `x.is_sign_negative()` (*Float Bits*).
 
 ```blink
 let nan = 0.0 / 0.0
@@ -3510,7 +3510,41 @@ assert(nan == nan)              // total order
 assert(!nan.ieee_eq(nan))       // IEEE: NaN is unequal to itself
 assert(-0.0 == 0.0)
 assert((-0.0).ieee_eq(0.0))     // IEEE: the zeros are equal
-assert(1.0 / -0.0 < 0.0)        // the sign of zero
+assert((-0.0).is_sign_negative()) // the sign of zero
+```
+
+#### Float Bits
+
+`Float` and `F32` have three built-in methods that read and write the IEEE 754 bit pattern. They need no import.
+
+| Method | Signature on `Float` | Signature on `F32` | Returns |
+|--------|----------------------|--------------------|---------|
+| `to_bits` | `fn(self) -> U64` | `fn(self) -> U32` | The IEEE 754 binary64 (binary32) bit pattern |
+| `from_bits` | `fn(U64) -> Float` (static) | `fn(U32) -> F32` (static) | The value with that bit pattern |
+| `is_sign_negative` | `fn(self) -> Bool` | `fn(self) -> Bool` | The sign bit |
+
+`from_bits` is total: every bit pattern is a value, so it returns `Float` (`F32`), not an `Option`. `to_bits` is not a conversion and has no `From` impl (§3c.3 *The `to_` rule for scalars*). A bitwise operator on a `Float` is a type error (§3.2.3 *Sized Integer Types*); its help names `to_bits()`.
+
+**Laws.** For every `b: U64` and all `x`, `y` of type `Float` (and the same for `F32` over `U32`):
+
+- **Round trip.** `Float.from_bits(b).to_bits() == b`. This holds for every NaN payload, signaling NaNs included.
+- **Bits are finer than `==`.** If `x.to_bits() == y.to_bits()`, then `x == y`. The converse is false: `-0.0 == 0.0`, and two NaNs with a different sign or payload are `==`, but their bits differ.
+- **Arithmetic.** An operation that gives a NaN does not fix the sign or payload of that NaN.
+- **Sign.** `x.is_sign_negative()` is `true` exactly when the sign bit of `x` is set. That includes `-0.0` and a NaN with the sign bit set. `1.0 / x < 0.0` is `false` for every NaN, so it is not a sign test. To test for negative zero, use `x == 0.0 && x.is_sign_negative()`.
+- **Copies keep every bit.** Copy, move, storage, and passing to or from an `@ffi` function keep every bit of a `Float` or `F32`. This law does not cover what C code does with the value.
+
+```blink
+fn main() {
+    let z = -0.0
+    assert(z == 0.0)                         // == does not see the sign
+    assert(z.is_sign_negative())
+    assert(!0.0.is_sign_negative())
+    assert(z.to_bits() != 0.0.to_bits())     // the bits do
+    let nan = Float.from_bits(9221120237041090561) // a quiet NaN, payload 1
+    assert(nan == 0.0 / 0.0)                 // every NaN is == every NaN
+    assert(nan.to_bits() == 9221120237041090561) // the payload is kept
+    io.println(z.to_bits().display())        // 9223372036854775808
+}
 ```
 
 #### Built-in Type Trait Implementations
@@ -4511,7 +4545,7 @@ fn main() {
 - **Round trip.** `x.display().parse_float() == Ok(x)`, with `==` as in *Float Total Ordering*. This holds for NaN and for `-0.0` too.
 - **One text per value.** `x == y` exactly when `x.display() == y.display()`.
 
-The text does not show the sign of zero or the bits of a NaN, because no `Float` equality tells those values apart. To test the sign of zero, use `1.0 / x < 0.0`.
+The text does not show the sign of zero or the bits of a NaN, because no `Float` equality tells those values apart. To read them, use `x.is_sign_negative()` and `x.to_bits()` (*Float Bits*).
 
 **One form everywhere.** Every place that Blink, its standard library or the `blink` toolchain writes a finite `Float` as decimal text uses this form, unless this spec names a different form for that place. Such places include `display()`, `debug()`, string interpolation, power-assert values (§2.20), JSON number output (§3.6.2) and test-runner output (§8.10). `Float.display_fixed` is a named different form (*Fixed-Decimal and Zero-Padded Forms*). A form that is not decimal text, such as a bit pattern, is outside this rule. JSON writes NaN and the infinities as `null` (§3.6.2 *NaN and Infinity*), so this rule covers only its finite numbers.
 

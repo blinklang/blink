@@ -788,8 +788,11 @@ let first_two = names
 | `.is_nan()` | Bool | NaN check (needs `import std.float`) |
 | `.truncate()` | Int | Drop the fraction |
 | `.to_int_checked()` | Result | Float to Int; fails out of range |
+| `.to_bits()` | U64 | IEEE 754 bit pattern (`F32`: `U32`); not a conversion |
+| `Float.from_bits(b)` | Float | Value with bit pattern `b: U64` (`F32.from_bits(U32)`); every pattern is valid, NaN payloads are kept |
+| `.is_sign_negative()` | Bool | The sign bit: `true` for `-0.0` and for a NaN with the sign bit set |
 
-`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign of zero, use `1.0 / x < 0.0`.
+`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign, use `x.is_sign_negative()`. Equal bits imply `==`, but `==` does not imply equal bits. `to_bits`, `from_bits` and `is_sign_negative` need no import.
 
 ## Option[T] Methods
 

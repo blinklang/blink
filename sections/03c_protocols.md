@@ -420,7 +420,7 @@ fn load_user(id: Int) -> Result[User, AppError] ! DB {
 
 Numeric types support both named conversion methods (for discoverability) and From/TryFrom impls (for generic programming). Named methods are sugar over the trait impls — one source of truth.
 
-**The `to_` rule for scalars.** On the built-in scalar types (`Int`, `Float`, `Bool`, `Char` and the sized integers), every `to_` conversion method is sugar over a `From` or `TryFrom` impl. `.to_X()` stands for `From` and returns `X`. `.to_X_checked()` stands for `TryFrom` and returns `Result[X, ConversionError]`. A scalar has no `to_` method without such an impl. Rendering a scalar as text is not a conversion: it goes through `Display` (`x.display()` or `"{x}"`, §3.6 *Display Format Protocol*), not through a `to_str` method.
+**The `to_` rule for scalars.** On the built-in scalar types (`Int`, `Float`, `Bool`, `Char` and the sized integers), every `to_` conversion method is sugar over a `From` or `TryFrom` impl. `.to_X()` stands for `From` and returns `X`. `.to_X_checked()` stands for `TryFrom` and returns `Result[X, ConversionError]`. A scalar has no `to_` method without such an impl. The rule covers a method `to_X` or `to_X_checked` where `X` names a type (`to_int`, `to_u64`). A `to_` method whose suffix names no type, such as `Float.to_bits` or `Char.to_digit`, is not a conversion and has no `From` impl behind it. Rendering a scalar as text is not a conversion: it goes through `Display` (`x.display()` or `"{x}"`, §3.6 *Display Format Protocol*), not through a `to_str` method.
 
 #### Widening Conversions (Infallible — `From`)
 
