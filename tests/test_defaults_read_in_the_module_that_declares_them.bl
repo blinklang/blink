@@ -444,3 +444,203 @@ pub fn make_b() -> Int {
     }
     cleanup(base)
 }
+
+// A call through a bound, in either spelling, fills the default from the trait's declaration,
+// so that default reads in the trait's module. The direct and the qualified call on the
+// concrete type fill from the impl, which here sits beside the trait and writes the same
+// default.
+test "a trait method's keyword default reads the trait's module through a bound" {
+    let alpha = #"const K = 3
+
+pub type Pt {
+    v: Int
+}
+
+pub trait Bump {
+    fn bump(self, -- d: Int = K) -> Int
+}
+
+impl Bump for Pt {
+    fn bump(self, -- d: Int = K) -> Int {
+        self.v + d
+    }
+}
+
+pub fn make_a() -> Int {
+    0
+}
+"#
+    let beta = #"import alpha.{Pt, Bump}
+
+const K = 100
+
+fn viab[T: Bump](x: T) -> Int {
+    x.bump()
+}
+
+fn viaq[T: Bump](x: T) -> Int {
+    Bump.bump(x)
+}
+
+pub fn make_b() -> Str {
+    let p = Pt { v: 1 }
+    "{viab(p)} {viaq(p)} {p.bump()} {Bump.bump(p)} {K}"
+}
+"#
+    expect_run(".tmp/_test_defaults_trait_bound", alpha, beta, "0 4 4 4 4 100")
+}
+
+// A method with a default body declares its defaults the same way a required one does.
+test "a keyword default on a trait method with a default body reads the trait's module" {
+    let alpha = #"const K = 3
+
+pub type Pt {
+    v: Int
+}
+
+pub trait Hi {
+    fn hi(self, -- d: Int = K) -> Int {
+        d
+    }
+}
+
+impl Hi for Pt {
+    fn hi(self, -- d: Int = K) -> Int {
+        self.v + d
+    }
+}
+
+pub fn make_a() -> Int {
+    0
+}
+"#
+    let beta = #"import alpha.{Pt, Hi}
+
+const K = 100
+
+fn viab[T: Hi](x: T) -> Int {
+    x.hi()
+}
+
+pub fn make_b() -> Str {
+    "{viab(Pt { v: 1 })} {K}"
+}
+"#
+    expect_run(".tmp/_test_defaults_trait_default_body", alpha, beta, "0 4 100")
+}
+
+// The impl and the bounded call sit in a module with its own `K`; the trait's default still
+// names the trait module's.
+test "a trait method's keyword default reads the trait's module when the impl is the caller's" {
+    let alpha = #"const K = 3
+
+pub trait Bump {
+    fn bump(self, -- d: Int = K) -> Int
+}
+
+pub fn make_a() -> Int {
+    0
+}
+"#
+    let beta = #"import alpha.{Bump}
+
+const K = 100
+
+type Q {
+    v: Int
+}
+
+impl Bump for Q {
+    fn bump(self, -- d: Int = 3) -> Int {
+        self.v + d
+    }
+}
+
+fn viab[T: Bump](x: T) -> Int {
+    x.bump()
+}
+
+pub fn make_b() -> Str {
+    "{viab(Q { v: 1 })} {K}"
+}
+"#
+    expect_run(".tmp/_test_defaults_trait_impl_in_caller", alpha, beta, "0 4 100")
+}
+
+test "a trait method's keyword default declared in the main file fills a bounded call there" {
+    let base = ".tmp/_test_defaults_trait_in_main"
+    new_package(base)
+    write_file("{base}/src/main.bl", #"const K = 3
+
+type Pt {
+    v: Int
+}
+
+trait Bump {
+    fn bump(self, -- d: Int = K) -> Int
+}
+
+impl Bump for Pt {
+    fn bump(self, -- d: Int = K) -> Int {
+        self.v + d
+    }
+}
+
+fn viab[T: Bump](x: T) -> Int {
+    x.bump()
+}
+
+fn main() {
+    io.println("{viab(Pt { v: 1 })}")
+}
+"#)
+    for cmd in ["run", "run --no-per-module"] {
+        let run = blink_in(base, cmd)
+        if !exited_clean(run) || !run.contains("4") {
+            fail(base, "`{cmd}` should print `4`, got: {run}")
+            return
+        }
+    }
+    cleanup(base)
+}
+
+test "a trait method's keyword default of the wrong type is reported at the trait in its own file" {
+    let base = ".tmp/_test_defaults_trait_wrong_type_span"
+    let alpha = #"pub trait Bump {
+    fn bump(self, -- d: Int = "x") -> Int
+}
+
+pub fn make_a() -> Int {
+    1
+}
+"#
+    let beta = #"import alpha.{Bump}
+
+type Q {
+    v: Int
+}
+
+impl Bump for Q {
+    fn bump(self, -- d: Int = 2) -> Int {
+        self.v + d
+    }
+}
+
+fn viab[T: Bump](x: T) -> Int {
+    x.bump()
+}
+
+pub fn make_b() -> Int {
+    viab(Q { v: 1 })
+}
+"#
+    for order in [["alpha", "beta"], ["beta", "alpha"]] {
+        write_package(base, alpha, beta, order)
+        let chk = blink_in(base, "check")
+        if exited_clean(chk) || !chk.contains("src/alpha.bl:2:31") || chk.contains("src/main.bl") || chk.contains("src/beta.bl") {
+            fail(base, "importing {order.join(", ")} should report the default at src/alpha.bl:2:31 alone, got: {chk}")
+            return
+        }
+    }
+    cleanup(base)
+}

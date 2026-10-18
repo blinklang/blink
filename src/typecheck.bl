@@ -1218,7 +1218,7 @@ fn tc_impl_binds_for_instance(im: Int, tid: Int) -> Map[Str, Int] ! TypeCheck.Re
 // the receiver's arguments.
 fn tc_impl_binds_at_call(sig: Int, recv: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
     let none: Map[Str, Int] = Map()
-    let im = tc_impl_of_method.get(fnsig_pool.get(sig).unwrap().decl) ?? -1
+    let im = tc_method_block.get(fnsig_pool.get(sig).unwrap().decl) ?? -1
     if im == -1 || !tc_impl_is_poly_user(im) { return none }
     tc_impl_binds_for_instance(im, recv)
 }
@@ -1298,9 +1298,10 @@ let mut tc_conv_source_tids: Map[Int, Int] = Map()
 // the receiver type's declaration. Written beside the receiver tid; read through
 // tc_poly_user_impl_decl.
 let mut tc_poly_user_impls: Map[Int, Int] = Map()
-// The impl block of every impl method, keyed by method node. A call knows its method's
-// declaration, and only the impl says what the method's type variables stand for.
-let mut tc_impl_of_method: Map[Int, Int] = Map()
+// The impl or trait block that declares each method, keyed by method node. A call knows its
+// method's declaration, and only the block says what module it reads in and, for an impl,
+// what the method's type variables stand for.
+let mut tc_method_block: Map[Int, Int] = Map()
 // The fnsig KEY of the impl method being checked, or "" outside one. An impl method registers its
 // signature under the trait-mangled spelling (tc_mangle_impl_fnsig) but is checked under
 // "{impl_type}_{method}", so without this key, tc_check_fn's `lookup_fnsig(fn_name)` misses and
@@ -4842,7 +4843,7 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
                 return 1
             }
             let fill = synth_named_arg(nm, dflt, node_line(dflt), node_col(dflt))
-            node_set_module(fill, tc_default_fill_module(fs.decl))
+            node_set_module(fill, tc_body_module(fs.decl))
             sublist_append(args_sl, fill)
             tc_grow_node_tables()
             seen.insert(nm, 1)
@@ -4852,11 +4853,21 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     0
 }
 
-// The module a default of `decl` was written in. A trait method's signature carries no
-// declaration, so its fill keeps the caller's module and is read at the call as before.
-fn tc_default_fill_module(decl: Int) -> Str {
-    if decl < 0 { return "" }
-    tc_body_module(decl)
+// A call that reads a trait's signature compares no argument against its parameter types,
+// which may name `Self` or a trait type parameter, so a default it filled takes its type
+// here: the parameter's, which its value was held to at the declaration.
+fn tc_type_default_fills(sig: Int, args_sl: Int, self_offset: Int) {
+    if args_sl == -1 { return }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let arg = sublist_get(args_sl, i)
+        if tc_is_default_fill(arg) {
+            let pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg))
+            if pidx >= 0 { tc_publish_node_tid(arg, fnsig_param_list.get(fs.params_start + pidx).unwrap()) }
+        }
+        i = i + 1
+    }
 }
 
 // A keyword argument typecheck appended from a declaration's default. Its value was checked
@@ -10897,7 +10908,7 @@ fn tc_register_trait_method_sig(key: Str, m: Int, p_start: Int, ret: Int) -> Int
         }
     }
     let sig = fnsig_pool.len()
-    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: count, type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: -1 })
+    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: count, type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: m })
     sig
 }
 
@@ -10947,6 +10958,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
             let m = sublist_get(methods_sl, i)
             let mname = node_name(m)
             tc_trait_method_names.push("{name}.{mname}")
+            tc_method_block.insert(m, tr_node)
             // Store method signature for contract validation
             let p_start = tc_tmsig_param_tids.len()
             let params_sl = node_params(m)
@@ -11690,7 +11702,7 @@ fn init_types() ! TypeCheck.Register {
     tc_impl_recv_tids = Map()
     tc_conv_source_tids = Map()
     tc_poly_user_impls = Map()
-    tc_impl_of_method = Map()
+    tc_method_block = Map()
     tc_active_tparams.clear()
     tc_hash_oblig = Map()
     tc_bracket_sites.clear()
@@ -12158,7 +12170,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                     // so two traits sharing a method name don't overwrite.
                     let mangled = tc_mangle_impl_fnsig(impl_type, trait_name, orig_name, im)
                     tc_record_method_trait(impl_type, orig_name, trait_name)
-                    tc_impl_of_method.insert(m, im)
+                    tc_method_block.insert(m, im)
                     node_set_name(m, mangled)
                     register_fn_sig(m)
                     node_set_name(m, orig_name)
@@ -16029,6 +16041,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         }
     }
 
+    nr_check_trait_method_defaults(node_arms(program))
+
     // Walk test block bodies for unused import detection
     let tests_sl = node_captures(program)
     if tests_sl != -1 {
@@ -16037,6 +16051,35 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     }
 
     nr_pop_scope()
+}
+
+// A call through a bound fills a default from the trait's declaration, so each default is
+// read here, in the trait's module and before any parameter is in scope, as a function's is.
+fn nr_check_trait_method_defaults(traits_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if traits_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(traits_sl) {
+        let tr = sublist_get(traits_sl, i)
+        let methods_sl = node_methods(tr)
+        if methods_sl != -1 {
+            nr_current_module = node_module(tr)
+            tc_push_tparam_scope(node_type_params(tr))
+            let mut j = 0
+            while j < sublist_length(methods_sl) {
+                let params_sl = node_params(sublist_get(methods_sl, j))
+                if params_sl != -1 {
+                    let mut d = 0
+                    while d < sublist_length(params_sl) {
+                        nr_check_node(node_value(sublist_get(params_sl, d)))
+                        d = d + 1
+                    }
+                }
+                j = j + 1
+            }
+            tc_pop_tparam_scope(node_type_params(tr))
+        }
+        i = i + 1
+    }
 }
 
 // The let arm infers a call initializer during this walk, and the test-only fences
@@ -20945,6 +20988,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // would reject correct code.
                         let tv_name = "{tm.trait_name}.{method}"
                         if tc_check_keyword_args(tv_name, tm.sig, args_sl, 1, node) == 0 {
+                            tc_type_default_fills(tm.sig, args_sl, 1)
                             tc_check_call_arity(tv_name, tm.sig, args_sl, 1, node)
                         }
                         return tm.ret_tid
@@ -21347,6 +21391,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                 // bound per instantiation, and comparing an unbound one rejects
                                 // correct code.
                                 let qtm_kw_bad = tc_check_keyword_args("{obj_name}.{method}", qtm.sig, qt_args, 0, node)
+                                if qtm_kw_bad == 0 { tc_type_default_fills(qtm.sig, qt_args, 0) }
                                 let qtm_filled = if qt_args != -1 { sublist_length(qt_args) } else { 0 }
                                 if qtm_kw_bad == 0 && qtm_filled != qtm.params_count {
                                     tc_error_at("qualified trait call `{obj_name}.{method}` expects {qtm.params_count} argument(s) including the receiver, got {qtm_filled}", node)
@@ -26300,6 +26345,27 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     tc_infer_program_with_boundary_check(program)
 }
 
+// Each trait method's defaults against the signature a call through a bound reads. A method
+// with a default body has its const rules read by tc_check_fn, which checks that body with no
+// signature and so leaves the types to this.
+fn tc_check_trait_method_defaults(trait_name: Str, tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut i = 0
+    while i < sublist_length(tmethods_sl) {
+        let m = sublist_get(tmethods_sl, i)
+        if node_body(m) == -1 { tc_check_param_defaults(m) }
+        let mut si = 0
+        while si < tc_tmsig_pool.len() {
+            let tm = tc_tmsig_pool.get(si).unwrap()
+            if fnsig_pool.get(tm.sig).unwrap().decl == m {
+                tc_check_param_default_types("{trait_name}.{node_name(m)}", m, tm.sig)
+                break
+            }
+            si = si + 1
+        }
+        i = i + 1
+    }
+}
+
 fn tc_check_trait_default_bodies(tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let prev_walk_ret = tc_current_fn_ret
     tc_check_each_trait_default_body(tmethods_sl)
@@ -26492,6 +26558,7 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
                 // missing-tail check (gated on sig != -1) does not run against the abstract
                 // `Self`. Only the operator / method licensing is wanted here.
                 tc_current_method_sig_key = "__trait_default_no_sig__"
+                tc_check_trait_method_defaults(node_name(trn), tmethods_sl)
                 tc_check_trait_default_bodies(tmethods_sl)
                 tc_current_method_sig_key = ""
                 tc_current_self_tid = -1
@@ -27100,12 +27167,12 @@ fn tc_name_is_item_in(name: Str, module: Str) -> Int {
 }
 
 // The module a body's names are read in: the one tc_infer_program_body checks it under. An
-// impl method carries no module of its own, so it reads in its impl's; a test block reads in
-// the main file's.
+// impl or trait method carries no module of its own, so it reads in its block's; a test block
+// reads in the main file's.
 fn tc_body_module(decl: Int) -> Str {
     let own = node_module(decl)
     if own != "" { return own }
-    match tc_impl_of_method.get(decl) {
+    match tc_method_block.get(decl) {
         Some(im) => node_module(im)
         None => "__main__"
     }
