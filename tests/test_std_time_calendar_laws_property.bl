@@ -1,0 +1,120 @@
+// The std.time laws (sections/03_types.md, *Laws*), checked on fixed-seed random values across
+// the whole std.time range and on the values at its edges:
+//   Date.parse("{d}") == Ok(d) and Instant.parse("{i}") == Ok(i)
+//   d.to_instant().date() == d
+//   d.to_instant() <= i exactly when d <= i.date()
+//   d.add_days(n).days_since(d) == n
+
+import std.time.{Instant, Duration, Date}
+
+const MIN_SECS = -9223286400
+const MAX_SECS = 9223372036
+const MAX_LAST_NANOS = 854775807
+const SPAN_DAYS = 213502
+
+// Park-Miller minimal standard generator: small enough that no step overflows Int.
+type Rng { state: Int }
+
+fn rng_next(r: Rng) -> Rng {
+    Rng { state: r.state * 48271 % 2147483647 }
+}
+
+// A value in 0..n built from two steps, so n may be near 2^62.
+fn rng_below(r: Rng, n: Int) -> (Rng, Int) {
+    let a = rng_next(r)
+    let b = rng_next(a)
+    (b, (a.state * 2147483647 + b.state) % n)
+}
+
+fn first_date() -> Date { Date.from_ymd(1677, 9, 22).unwrap() }
+
+fn date_at(k: Int) -> Date { first_date().add_days(k) }
+
+fn instant_at(secs: Int, frac: Int) -> Instant {
+    Instant.from_epoch_secs(secs).add(Duration.nanos(frac))
+}
+
+fn check_date_laws(d: Date, n: Int) {
+    let text = "{d}"
+    let back = Date.parse(text)
+    if !back.is_ok() || back.unwrap() != d { io.println("FAIL parse round trip: {text}") }
+    assert(Date.parse(text).unwrap() == d)
+    assert(d.to_instant().date() == d)
+    assert(d.add_days(n).days_since(d) == n)
+}
+
+fn check_instant_laws(i: Instant, d: Date) {
+    let text = "{i}"
+    let back = Instant.parse(text)
+    if !back.is_ok() || back.unwrap() != i { io.println("FAIL parse round trip: {text}") }
+    assert(Instant.parse(text).unwrap() == i)
+    let lhs = d.to_instant() <= i
+    let rhs = d <= i.date()
+    if lhs != rhs { io.println("FAIL order law: {d} vs {i}") }
+    assert(lhs == rhs)
+}
+
+test "the laws hold at the edges of the range" {
+    let lo = first_date()
+    let hi = date_at(SPAN_DAYS)
+    check_date_laws(lo, SPAN_DAYS)
+    check_date_laws(hi, 0 - SPAN_DAYS)
+    check_date_laws(lo, 0)
+    let min_i = instant_at(MIN_SECS, 0)
+    let max_i = instant_at(MAX_SECS, MAX_LAST_NANOS)
+    check_instant_laws(min_i, lo)
+    check_instant_laws(min_i, hi)
+    check_instant_laws(max_i, lo)
+    check_instant_laws(max_i, hi)
+    check_instant_laws(instant_at(MIN_SECS + 86399, 999999999), lo)
+    check_instant_laws(instant_at(MIN_SECS + 86400, 0), lo.add_days(1))
+    check_instant_laws(instant_at(MIN_SECS + 86399, 999999999), lo.add_days(1))
+}
+
+test "the date laws hold for random dates and day counts" {
+    let mut r = Rng { state: 20261017 }
+    let mut i = 0
+    while i < 2000 {
+        let (r1, k) = rng_below(r, SPAN_DAYS + 1)
+        let (r2, j) = rng_below(r1, SPAN_DAYS + 1)
+        r = r2
+        check_date_laws(date_at(k), j - k)
+        i = i + 1
+    }
+}
+
+test "the instant laws hold for random instants and dates" {
+    let mut r = Rng { state: 1677 }
+    let mut i = 0
+    while i < 2000 {
+        let (r1, s) = rng_below(r, MAX_SECS - MIN_SECS + 1)
+        let (r2, f) = rng_below(r1, 1000000000)
+        let (r3, k) = rng_below(r2, SPAN_DAYS + 1)
+        r = r3
+        let secs = MIN_SECS + s
+        let frac = if secs == MAX_SECS && f > MAX_LAST_NANOS { MAX_LAST_NANOS } else { f }
+        let inst = instant_at(secs, frac)
+        check_instant_laws(inst, date_at(k))
+        // A date next to the instant's own day, where the order law is closest to failing.
+        check_instant_laws(inst, inst.date())
+        if inst.date() != first_date() { check_instant_laws(inst, inst.date().add_days(-1)) }
+        if inst.date() != date_at(SPAN_DAYS) { check_instant_laws(inst, inst.date().add_days(1)) }
+        i = i + 1
+    }
+}
+
+test "instants on whole seconds and near midnight round-trip" {
+    let mut r = Rng { state: 42 }
+    let mut i = 0
+    while i < 500 {
+        let (r1, k) = rng_below(r, SPAN_DAYS)
+        let (r2, f) = rng_below(r1, 3)
+        r = r2
+        let d = date_at(k)
+        let mid = d.to_instant()
+        let near = if f == 0 { mid } else if f == 1 { mid.add(Duration.nanos(1)) } else { mid.add(Duration.nanos(86399999999999)) }
+        check_instant_laws(near, d)
+        assert(near.date() == d)
+        i = i + 1
+    }
+}

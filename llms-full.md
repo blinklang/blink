@@ -825,11 +825,17 @@ result.exit_code    // Int — exit code
 | Method | Returns | Purpose |
 |--------|---------|---------|
 | `time.read()` | Instant | Current time |
-| `Instant.from_epoch_secs(n)` | Instant | From unix timestamp |
+| `Instant.from_epoch_secs(n)` | Instant | From unix timestamp; panics outside the std.time range |
+| `Instant.parse(s)` | Result[Instant, ConversionError] | RFC 3339 text, offset applied to give UTC |
 | `.since(other)` | Duration | Difference between instants (`later.since(earlier)`) |
-| `.add(dur)` | Instant | Add duration |
+| `.add(dur)` | Instant | Add duration; panics outside the std.time range |
+| `.date()` | Date | UTC calendar day |
+| `.hour()` / `.minute()` / `.second()` | Int | UTC fields; the fraction is dropped |
 | `.to_unix_ms()` | Int | As unix milliseconds |
 | `.to_unix_secs()` | Int | As unix seconds |
+
+The std.time range is 1677-09-22T00:00:00Z ..= 2262-04-11T23:47:16.854775807Z. The calendar
+fields round down: 500 ms before the epoch is `1969-12-31`, hour 23, second 59.
 
 ```blink
 let start = time.read()
@@ -841,6 +847,65 @@ io.println("Took {elapsed}")          // Display: "1.234s"
 let d = Duration.seconds(5)
 time.sleep(d)
 ```
+
+## Date and Weekday
+
+`import std.time.{Instant, Date, Weekday}`. There is no `DateTime`: an `Instant` is already a
+point in UTC, and a `Date` is a calendar day with no time and no zone.
+
+| Function / Method | Returns | Purpose |
+|-------------------|---------|---------|
+| `Date.from_ymd(y, m, d)` | Result[Date, ConversionError] | Day from year, month, day |
+| `Date.parse(s)` | Result[Date, ConversionError] | `YYYY-MM-DD` only |
+| `.year()` / `.month()` / `.day()` | Int | Calendar fields |
+| `.weekday()` | Weekday | Day of the week |
+| `.add_days(n)` | Date | `n` may be negative; panics outside 1677-09-22..2262-04-11 |
+| `.days_since(earlier)` | Int | Days from `earlier`; negative when `earlier` is later |
+| `.to_instant()` | Instant | 00:00:00Z on this day |
+| `time.read().date()` | Date | Today in UTC (needs `! Time.Read`) |
+
+`Weekday` is `Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday`.
+`Weekday.Monday.to_int()` is 0 and `Weekday.Sunday.to_int()` is 6. The ISO 8601 day number
+is `to_int() + 1`. `Display` writes `2026-10-17` for a Date and `Saturday` for a Weekday;
+`Debug` writes the same text. Both are `Eq`, `Ord`, `Hash` and `Clone`, so they key a Map.
+
+`Instant.parse` accepts `YYYY-MM-DDTHH:MM:SS[.f]` then `Z` or `+HH:MM` / `-HH:MM`. The
+separator is `T` or one space. Seconds and an offset are required; the fraction has 1 to 9
+digits. Nothing else is accepted: no lowercase `t` or `z`, no comma fraction, no second 60.
+Errors give the byte and what was found:
+
+```blink
+Date.parse("2026-1-07")          // Err: "invalid date: expected digit at byte 6 (found '-')"
+Date.parse("2026-02-30")         // Err: "invalid date: day 30 out of range 1..28 for 2026-02"
+Instant.parse("2026-02-14 12:00:00")
+// Err: "invalid timestamp: no UTC offset at byte 19; append Z if the time is UTC"
+Instant.parse("2026-02-14 12:00:00+01:00")   // Ok: 2026-02-14T11:00:00Z
+```
+
+Group log lines by day. Cut the stamp with `substring`, never `split(" ")`: a space
+separator splits the stamp in two.
+
+```blink
+import std.time.{Instant, Date, Weekday}
+
+// Each line starts with a 20-byte stamp: "2026-10-17 09:30:00Z GET /"
+fn count_by_date(lines: List[Str]) -> Result[Map[Date, Int], ConversionError] {
+    let mut counts: Map[Date, Int] = Map()
+    for line in lines {
+        let d = Instant.parse(line.substring(0, 20))?.date()
+        counts.insert(d, (counts.get(d) ?? 0) + 1)
+    }
+    Ok(counts)
+}
+
+fn report(launch: Date) ! Time.Read, IO.Print {
+    let today = time.read().date()
+    io.println("{today} is a {today.weekday()}, {today.days_since(launch)} days after launch")
+}
+```
+
+Not in v1: time zones, `add_months`, format strings, `today()`, leap seconds. Interpolate
+the fields instead: `"{d.year()}/{d.month()}"`.
 
 ## JSON (with @derive)
 

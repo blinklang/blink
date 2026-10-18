@@ -29,11 +29,160 @@ pub fn Duration_to_iso8601(d: Duration) -> Str {
     sb.to_str()
 }
 
-pub fn Instant_from_epoch_secs(s: Int) -> Instant { Instant { nanos: s * 1000000000 } }
-pub fn Instant_add(i: Instant, d: Duration) -> Instant { Instant { nanos: i.nanos + d.nanos } }
+// The std.time range, 1677-09-22T00:00:00Z ..= 2262-04-11T23:47:16.854775807Z, in the unit
+// each constructor checks it in. The top is Int's maximum; the bottom is the first whole day
+// after Int's minimum, so every Instant has a Date and every Date has a midnight.
+let TIME_MIN_NANOS = -9223286400000000000
+let TIME_MAX_NANOS = 9223372036854775807
+let TIME_MIN_SECS = -9223286400
+let TIME_MAX_SECS = 9223372036
+let TIME_MAX_LAST_NANOS = 854775807
+let TIME_MIN_DAY = -106751
+let TIME_MAX_DAY = 106751
+let TIME_NANOS_PER_DAY = 86400000000000
+
+// Checked before the multiply, so a count outside the range panics with the range text and
+// not as Int overflow.
+pub fn Instant_from_epoch_secs(s: Int) -> Instant {
+    if s < TIME_MIN_SECS || s > TIME_MAX_SECS { time_instant_out_of_range() }
+    Instant { nanos: s * 1000000000 }
+}
+
+pub fn Instant_add(i: Instant, d: Duration) -> Instant {
+    // Each bound is moved by d instead of adding d to i, so the check itself cannot overflow.
+    if d.nanos > 0 && i.nanos > TIME_MAX_NANOS - d.nanos { time_instant_out_of_range() }
+    if d.nanos < 0 && i.nanos < TIME_MIN_NANOS - d.nanos { time_instant_out_of_range() }
+    Instant { nanos: i.nanos + d.nanos }
+}
+
+pub fn Instant_date(i: Instant) -> Date { Date { days: time_floor_div(i.nanos, TIME_NANOS_PER_DAY) } }
+pub fn Instant_hour(i: Instant) -> Int { time_second_of_day(i) / 3600 }
+pub fn Instant_minute(i: Instant) -> Int { time_second_of_day(i) / 60 % 60 }
+pub fn Instant_second(i: Instant) -> Int { time_second_of_day(i) % 60 }
+pub fn Instant_parse(s: Str) -> Result[Instant, ConversionError] {
+    let syntax = time_scan(s, "dddd-dd-ddTdd:dd:dd", 0)
+    if syntax.len() > 0 { return Err(time_parse_err("invalid timestamp: {syntax}", "Instant")) }
+    let n = s.byte_len()
+    let mut p = 19
+    let mut frac = 0
+    if p < n && s.byte_at(p).to_int() == 46 {
+        p = p + 1
+        let start = p
+        while p < n && time_is_digit(s, p) {
+            if p - start == 9 { return Err(time_parse_err("invalid timestamp: more than 9 fraction digits at byte {p}", "Instant")) }
+            frac = frac * 10 + s.byte_at(p).to_int() - 48
+            p = p + 1
+        }
+        if p == start { return Err(time_parse_err("invalid timestamp: expected digit at byte {p} {time_found(s, p)}", "Instant")) }
+        let mut k = p - start
+        while k < 9 {
+            frac = frac * 10
+            k = k + 1
+        }
+    }
+    if p == n { return Err(time_parse_err("invalid timestamp: no UTC offset at byte {p}; append Z if the time is UTC", "Instant")) }
+    let sign_byte = s.byte_at(p).to_int()
+    let mut sign = 0
+    let mut off_at = 0
+    if sign_byte == 90 {
+        p = p + 1
+    } else if sign_byte == 43 || sign_byte == 45 {
+        let off = time_scan(s, "dd:dd", p + 1)
+        if off.len() > 0 { return Err(time_parse_err("invalid timestamp: {off}", "Instant")) }
+        sign = if sign_byte == 43 { 1 } else { -1 }
+        off_at = p + 1
+        p = p + 6
+    } else {
+        return Err(time_parse_err("invalid timestamp: expected 'Z', '+' or '-' at byte {p} {time_found(s, p)}", "Instant"))
+    }
+    if p < n { return Err(time_parse_err("invalid timestamp: unexpected text at byte {p} {time_found(s, p)}", "Instant")) }
+    let y = time_num(s, 0, 4)
+    let m = time_num(s, 5, 2)
+    let d = time_num(s, 8, 2)
+    let date_err = time_ymd_field_error(y, m, d)
+    if date_err.len() > 0 { return Err(time_parse_err("invalid timestamp: {date_err}", "Instant")) }
+    let hh = time_num(s, 11, 2)
+    let mm = time_num(s, 14, 2)
+    let ss = time_num(s, 17, 2)
+    if hh > 23 { return Err(time_parse_err("invalid timestamp: hour {hh} out of range 0..23", "Instant")) }
+    if mm > 59 { return Err(time_parse_err("invalid timestamp: minute {mm} out of range 0..59", "Instant")) }
+    if ss > 59 { return Err(time_parse_err("invalid timestamp: second {ss} out of range 0..59", "Instant")) }
+    let oh = if sign == 0 { 0 } else { time_num(s, off_at, 2) }
+    let om = if sign == 0 { 0 } else { time_num(s, off_at + 3, 2) }
+    if oh > 23 { return Err(time_parse_err("invalid timestamp: offset hour {oh} out of range 0..23", "Instant")) }
+    if om > 59 { return Err(time_parse_err("invalid timestamp: offset minute {om} out of range 0..59", "Instant")) }
+    // A 4-digit year keeps the second count far inside Int, so the range check runs on it
+    // before any multiply by a billion.
+    let secs = time_days_from_civil(y, m, d) * 86400 + hh * 3600 + mm * 60 + ss - sign * (oh * 3600 + om * 60)
+    if secs < TIME_MIN_SECS || secs > TIME_MAX_SECS || (secs == TIME_MAX_SECS && frac > TIME_MAX_LAST_NANOS) {
+        return Err(time_parse_err("invalid timestamp: {s} outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z", "Instant"))
+    }
+    Ok(Instant { nanos: secs * 1000000000 + frac })
+}
+
 pub fn Instant_since(later: Instant, earlier: Instant) -> Duration { Duration { nanos: later.nanos - earlier.nanos } }
 pub fn Instant_to_unix_secs(i: Instant) -> Int { i.nanos / 1000000000 }
 pub fn Instant_to_unix_ms(i: Instant) -> Int { i.nanos / 1000000 }
+
+pub fn Date_from_ymd(y: Int, m: Int, d: Int) -> Result[Date, ConversionError] {
+    let field = time_ymd_field_error(y, m, d)
+    if field.len() > 0 { return Err(ConversionError { message: "invalid date: {field}", source_type: "Int", target_type: "Date" }) }
+    let range = time_ymd_range_error(y, m, d)
+    if range.len() > 0 { return Err(ConversionError { message: "invalid date: {range}", source_type: "Int", target_type: "Date" }) }
+    Ok(Date { days: time_days_from_civil(y, m, d) })
+}
+
+pub fn Date_parse(s: Str) -> Result[Date, ConversionError] {
+    let syntax = time_scan(s, "dddd-dd-dd", 0)
+    if syntax.len() > 0 { return Err(time_parse_err("invalid date: {syntax}", "Date")) }
+    if s.byte_len() > 10 { return Err(time_parse_err("invalid date: unexpected text at byte 10 {time_found(s, 10)}", "Date")) }
+    let y = time_num(s, 0, 4)
+    let m = time_num(s, 5, 2)
+    let d = time_num(s, 8, 2)
+    let field = time_ymd_field_error(y, m, d)
+    if field.len() > 0 { return Err(time_parse_err("invalid date: {field}", "Date")) }
+    let range = time_ymd_range_error(y, m, d)
+    if range.len() > 0 { return Err(time_parse_err("invalid date: {range}", "Date")) }
+    Ok(Date { days: time_days_from_civil(y, m, d) })
+}
+
+pub fn Date_year(d: Date) -> Int { time_civil(d.days).0 }
+pub fn Date_month(d: Date) -> Int { time_civil(d.days).1 }
+pub fn Date_day(d: Date) -> Int { time_civil(d.days).2 }
+
+// 1970-01-01 was a Thursday, tag 3 counted from Monday.
+pub fn Date_weekday(d: Date) -> Weekday {
+    match time_floor_mod(d.days + 3, 7) {
+        0 => Weekday.Monday
+        1 => Weekday.Tuesday
+        2 => Weekday.Wednesday
+        3 => Weekday.Thursday
+        4 => Weekday.Friday
+        5 => Weekday.Saturday
+        _ => Weekday.Sunday
+    }
+}
+
+pub fn Date_add_days(d: Date, n: Int) -> Date {
+    // Each bound is moved by n instead of adding n to d, so the check itself cannot overflow.
+    if n > TIME_MAX_DAY - d.days || n < TIME_MIN_DAY - d.days {
+        panic("date out of range: result outside 1677-09-22..2262-04-11")
+    }
+    Date { days: d.days + n }
+}
+
+pub fn Date_days_since(d: Date, earlier: Date) -> Int { d.days - earlier.days }
+pub fn Date_to_instant(d: Date) -> Instant { Instant { nanos: d.days * TIME_NANOS_PER_DAY } }
+
+// A count of days since 1970-01-01. Debug is written by hand: the derived form would show
+// the count, and sections/03_types.md asks for the same text as Display.
+@derive(Eq, Ord, Hash, Clone)
+pub type Date {
+    days: Int
+}
+
+@derive(Eq, Ord, Hash, Clone, Debug)
+pub type Weekday { Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday }
 
 // The traits sections/03_types.md grants each type. Duration has no Hash there, so it is
 // not a Map key.
@@ -82,32 +231,168 @@ impl Display for Duration {
 // RFC 9557 in UTC with a Z offset.
 impl Display for Instant {
     fn fmt(self, sb: StringBuilder) {
-        let mut secs = self.nanos / 1000000000
-        let mut frac = self.nanos % 1000000000
-        if frac < 0 {
-            frac = frac + 1000000000
-            secs = secs - 1
-        }
-        let mut days = secs / 86400
-        let mut sod = secs % 86400
-        if sod < 0 {
-            sod = sod + 86400
-            days = days - 1
-        }
-        // Howard Hinnant's civil_from_days, on 400-year eras that start on March 1.
-        let z = days + 719468
-        let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
-        let doe = z - era * 146097
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
-        let mp = (5 * doy + 2) / 153
-        let day = doy - (153 * mp + 2) / 5 + 1
-        let month = if mp < 10 { mp + 3 } else { mp - 9 }
-        let year = if month <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }
-        sb.write("{time_pad(year, 4)}-{time_pad(month, 2)}-{time_pad(day, 2)}")
+        let sod = time_second_of_day(self)
+        Instant_date(self).fmt(sb)
         sb.write("T{time_pad(sod / 3600, 2)}:{time_pad(sod / 60 % 60, 2)}:{time_pad(sod % 60, 2)}")
-        sb.write("{time_frac(frac, 9)}Z")
+        sb.write("{time_frac(time_floor_mod(self.nanos, 1000000000), 9)}Z")
     }
+}
+
+impl Display for Date {
+    fn fmt(self, sb: StringBuilder) {
+        let (y, m, d) = time_civil(self.days)
+        sb.write("{time_year(y)}-{time_pad(m, 2)}-{time_pad(d, 2)}")
+    }
+}
+
+impl Debug for Date {
+    fn debug(self) -> Str { "{self}" }
+}
+
+impl Display for Weekday {
+    fn fmt(self, sb: StringBuilder) {
+        let name = match self {
+            Monday => "Monday"
+            Tuesday => "Tuesday"
+            Wednesday => "Wednesday"
+            Thursday => "Thursday"
+            Friday => "Friday"
+            Saturday => "Saturday"
+            Sunday => "Sunday"
+        }
+        sb.write(name)
+    }
+}
+
+fn time_second_of_day(i: Instant) -> Int {
+    time_floor_mod(time_floor_div(i.nanos, 1000000000), 86400)
+}
+
+fn time_instant_out_of_range() -> Never {
+    panic("instant out of range: result outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z")
+}
+
+// `/` and `%` on Int round toward zero; the calendar fields round down, so an instant before
+// the epoch falls in the earlier day and second.
+fn time_floor_div(a: Int, b: Int) -> Int {
+    if a % b < 0 { a / b - 1 } else { a / b }
+}
+
+fn time_floor_mod(a: Int, b: Int) -> Int {
+    let m = a % b
+    if m < 0 { m + b } else { m }
+}
+
+// The UTC calendar day of a day count, by H. Hinnant's civil_from_days.
+fn time_civil(days: Int) -> (Int, Int, Int) {
+    let z = days + 719468
+    let era = time_floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }
+    let year = if month <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }
+    (year, month, day)
+}
+
+// The inverse of time_civil, by H. Hinnant's days_from_civil.
+fn time_days_from_civil(y: Int, m: Int, d: Int) -> Int {
+    let y2 = if m <= 2 { y - 1 } else { y }
+    let era = time_floor_div(y2, 400)
+    let yoe = y2 - era * 400
+    let mp = if m > 2 { m - 3 } else { m + 9 }
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+fn time_days_in_month(y: Int, m: Int) -> Int {
+    match m {
+        2 => if time_floor_mod(y, 4) == 0 && (time_floor_mod(y, 100) != 0 || time_floor_mod(y, 400) == 0) { 29 } else { 28 }
+        4 => 30
+        6 => 30
+        9 => 30
+        11 => 30
+        _ => 31
+    }
+}
+
+// The month and day field errors, or "" when both are valid.
+fn time_ymd_field_error(y: Int, m: Int, d: Int) -> Str {
+    if m < 1 || m > 12 { return "month {m} out of range 1..12" }
+    let last = time_days_in_month(y, m)
+    if d < 1 || d > last { return "day {d} out of range 1..{last} for {time_year(y)}-{time_pad(m, 2)}" }
+    ""
+}
+
+// The range error for a valid y-m-d, or "" inside the range. The year is checked first so
+// that time_days_from_civil never sees a year that would overflow it.
+fn time_ymd_range_error(y: Int, m: Int, d: Int) -> Str {
+    let inside = y >= 1677 && y <= 2262 && time_days_from_civil(y, m, d) >= TIME_MIN_DAY && time_days_from_civil(y, m, d) <= TIME_MAX_DAY
+    if inside { return "" }
+    "{time_year(y)}-{time_pad(m, 2)}-{time_pad(d, 2)} outside 1677-09-22..2262-04-11"
+}
+
+// Not generic: std.time is in every program, and a generic helper would add its instances to each.
+fn time_parse_err(message: Str, target: Str) -> ConversionError {
+    ConversionError { message: message, source_type: "Str", target_type: target }
+}
+
+// Matches pat against s from byte start: 'd' is one ASCII digit, 'T' is "T" or " ", and any
+// other byte stands for itself. Gives the syntax error text, or "" on a match.
+fn time_scan(s: Str, pat: Str, start: Int) -> Str {
+    let mut i = 0
+    while i < pat.byte_len() {
+        let at = start + i
+        let want = pat.byte_at(i).to_int()
+        let have = if at < s.byte_len() { s.byte_at(at).to_int() } else { -1 }
+        let ok = if want == 100 { have >= 48 && have <= 57 } else if want == 84 { have == 84 || have == 32 } else { have == want }
+        if !ok {
+            let what = if want == 100 { "digit" } else if want == 84 { "'T' or ' '" } else { "'{pat.byte_slice(i, i + 1)}'" }
+            return "expected {what} at byte {at} {time_found(s, at)}"
+        }
+        i = i + 1
+    }
+    ""
+}
+
+fn time_is_digit(s: Str, at: Int) -> Bool {
+    let b = s.byte_at(at).to_int()
+    b >= 48 && b <= 57
+}
+
+// The width-digit number at byte at; time_scan has already checked each byte is a digit.
+fn time_num(s: Str, at: Int, width: Int) -> Int {
+    let mut v = 0
+    let mut i = 0
+    while i < width {
+        v = v * 10 + s.byte_at(at + i).to_int() - 48
+        i = i + 1
+    }
+    v
+}
+
+// "(found 'c')" for the character that starts at byte at, or "(found end of input)".
+fn time_found(s: Str, at: Int) -> Str {
+    let n = s.byte_len()
+    if at >= n { return "(found end of input)" }
+    let lead = s.byte_at(at).to_int()
+    let width = if lead < 128 { 1 } else if lead < 224 { 2 } else if lead < 240 { 3 } else { 4 }
+    let end = if at + width > n { n } else { at + width }
+    "(found '{s.byte_slice(at, end)}')"
+}
+
+// y.display_zero_padded(4): zeros go after the sign, and the width counts the sign.
+fn time_year(y: Int) -> Str {
+    let text = "{y}"
+    if y >= 0 { return time_pad(y, 4) }
+    let mut digits = text.byte_slice(1, text.byte_len())
+    while digits.byte_len() < 3 {
+        digits = "0{digits}"
+    }
+    "-{digits}"
 }
 
 fn time_abs(n: Int) -> Int {
