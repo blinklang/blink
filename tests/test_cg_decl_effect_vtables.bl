@@ -18,7 +18,7 @@ import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_na
 import cname.{c_effect_default_op_name, c_ev_type_name, c_field_name, c_vtable_type_name, td_guard_name}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
-import typecheck.{make_handler_type}
+import typecheck.{fs_op_rows, make_handler_type}
 import cg_decl.{cg_decl_reset, cg_decl_emit_ev}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) {
@@ -278,4 +278,29 @@ test "two operations of one name under a root effect report a gap rather than wr
     let _ = emitted_but(duplicate_op_src(), "cg_decl_ev_dup_probe", "DuplicateEffectOperation")
     assert_eq_int("one gap for the repeated name",
         cg_probe_ices_named("EffectOperationNameRepeated"), 1)
+}
+
+fn fs_vtable() -> Str { c_vtable_type_name(make_handler_type("FS")) }
+
+// FS's vtable is laid out from std.fs_ops. A program that never loads it can name no
+// FsError, so it performs no FS operation and its FS vtable keeps the one word.
+test "a program that never loads std.fs_ops has an FS vtable of one word" {
+    let text = emitted(two_ops_src(), "cg_decl_fs_slots_without_import_probe")
+    assert_has(text, "typedef struct \{\n    void* __userdata;\n} {fs_vtable()};")
+}
+
+// A layout read off which fs.* calls one unit reaches would differ between the units of one
+// program, and the evidence vector is one ABI across them. So a program that loads std.fs_ops
+// lays out every operation of the table, whatever it calls.
+test "a program that loads std.fs_ops lays out every FS operation" {
+    let text = emitted("import std.fs\nfn main() \{ assert(true) }\n", "cg_decl_fs_slots_with_import_probe")
+    let at = text.byte_index_of("} {fs_vtable()};", 0) ?? -1
+    if at < 0 { io.println("FAIL: no {fs_vtable()} typedef\n--- output ---\n{text}") }
+    assert(at >= 0)
+    for row in fs_op_rows() {
+        let slot = "(*{c_field_name(row.op)})("
+        let found = text.byte_index_of(slot, 0) ?? -1
+        if found < 0 || found > at { io.println("FAIL: no FS slot '{slot}'\n--- output ---\n{text}") }
+        assert(found >= 0 && found < at)
+    }
 }

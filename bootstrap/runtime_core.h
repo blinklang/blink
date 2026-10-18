@@ -3428,6 +3428,38 @@ BLINK_RT_FN int64_t blink_file_mtime(const char* path) {
 }
 #endif
 
+/* fs.stat: one stat(2), its fields held per thread until the next blink_fs_stat, so the
+   three reads that build a FileInfo come from the same call. Returns errno, 0 on success. */
+BLINK_RT_FN int64_t blink_fs_stat(const char* path);
+BLINK_RT_FN int64_t blink_fs_stat_kind(void);
+BLINK_RT_FN int64_t blink_fs_stat_size(void);
+BLINK_RT_FN int64_t blink_fs_stat_mtime_ns(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_UNUSED static __thread struct stat blink_fs_stat_last;
+BLINK_RT_FN int64_t blink_fs_stat(const char* path) {
+    if (stat(path, &blink_fs_stat_last) != 0) return (int64_t)errno;
+    return 0;
+}
+/* 0 = File, 1 = Dir, 2 = Other: the FileKind variant order. */
+BLINK_RT_FN int64_t blink_fs_stat_kind(void) {
+    if (S_ISREG(blink_fs_stat_last.st_mode)) return 0;
+    if (S_ISDIR(blink_fs_stat_last.st_mode)) return 1;
+    return 2;
+}
+BLINK_RT_FN int64_t blink_fs_stat_size(void) {
+    return (int64_t)blink_fs_stat_last.st_size;
+}
+BLINK_RT_FN int64_t blink_fs_stat_mtime_ns(void) {
+#ifdef __APPLE__
+    return (int64_t)blink_fs_stat_last.st_mtimespec.tv_sec * 1000000000 +
+           (int64_t)blink_fs_stat_last.st_mtimespec.tv_nsec;
+#else
+    return (int64_t)blink_fs_stat_last.st_mtim.tv_sec * 1000000000 +
+           (int64_t)blink_fs_stat_last.st_mtim.tv_nsec;
+#endif
+}
+#endif
+
 /* ── Process info ───────────────────────────────────────────────────── */
 
 BLINK_RT_FN int64_t blink_getpid(void);

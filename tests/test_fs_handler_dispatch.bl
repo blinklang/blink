@@ -1,0 +1,165 @@
+// Every fs.* operation of sections/04_effects.md §4.4.5 performs through the FS handler in
+// force, so a `with handler FS { ... }` answers the calls made inside its body. Each row
+// asserts on output the real filesystem cannot produce, so a call that skipped the handler
+// fails the row rather than passing on a lucky file.
+
+import compile_test_helpers.{compile_and_run}
+
+test "a mock FS handler intercepts read, write, list_dir, stat and delete" {
+    let src = #"
+import std.fs.{FsError, FsOp, FileInfo, FileKind}
+import std.time.{Instant}
+import std.errno.{Errno}
+
+fn mock_fs() -> Handler[FS] {
+    handler FS {
+        fn read(path: Str) -> Result[Str, FsError] {
+            Ok("[mock read] {path}")
+        }
+        fn write(path: Str, content: Str) -> Result[(), FsError] {
+            io.println("[mock write] {path} <- {content}")
+            Ok(())
+        }
+        fn list_dir(_path: Str) -> Result[List[Str], FsError] {
+            Ok(["a.txt", "b.txt"])
+        }
+        fn stat(_path: Str) -> Result[FileInfo, FsError] {
+            Ok(FileInfo { kind: FileKind.Dir, size: 42, mtime: Instant.from_epoch_secs(7) })
+        }
+        fn delete(path: Str) -> Result[(), FsError] {
+            Err(FsError { op: FsOp.Delete, path: "[mock] {path}", code: Errno(13) })
+        }
+    }
+}
+
+fn main() ! IO, FS {
+    with mock_fs() {
+        io.println(fs.read("/no/such/file").unwrap())
+        fs.write("/no/such/dir/out.txt", "hello").unwrap()
+        let names = fs.list_dir("/no/such/dir").unwrap()
+        io.println("list: {names.len()} {names.get(1).unwrap()}")
+        let info = fs.stat("/no/such/file").unwrap()
+        io.println("stat: {info.size} {info.kind == FileKind.Dir} {info.mtime.to_unix_secs()}")
+        match fs.delete("/no/such/file") {
+            Ok(_) => io.println("delete: ok")
+            Err(e) => io.println("delete: {e.path}")
+        }
+    }
+}
+"#
+    let r = compile_and_run(src, "_fs_handler_mock_all_ops")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "[mock read] /no/such/file\n[mock write] /no/such/dir/out.txt <- hello\nlist: 2 b.txt\nstat: 42 true 7\ndelete: [mock] /no/such/file\n")
+}
+
+// An omitted primitive operation forwards to the enclosing handler (§4.7.1), which outside
+// every `with` is the real filesystem. The write lands on disk, and the read of the same
+// path inside the block still answers from the mock.
+test "a partial FS handler sends the ops it omits to the enclosing handler" {
+    let src = #"
+import std.fs.{FsError}
+
+fn main() ! IO, FS {
+    let path = "build/_fs_handler_partial.txt"
+    with handler FS {
+        fn read(path: Str) -> Result[Str, FsError] {
+            Ok("[mock] {path}")
+        }
+    } {
+        fs.write(path, "on disk").unwrap()
+        io.println(fs.read(path).unwrap())
+    }
+    io.println(fs.read(path).unwrap())
+    fs.delete(path).unwrap()
+}
+"#
+    let r = compile_and_run(src, "_fs_handler_partial")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "[mock] build/_fs_handler_partial.txt\non disk\n")
+}
+
+// The innermost handler answers. An operation it omits reaches the handler it was installed
+// over, not the real filesystem, so the inner block's write prints the outer mock's line.
+test "nested FS handlers: the inner one answers and an op it omits reaches the outer one" {
+    let src = #"
+import std.fs.{FsError}
+
+fn main() ! IO, FS {
+    with handler FS {
+        fn read(_path: Str) -> Result[Str, FsError] { Ok("outer read") }
+        fn write(path: Str, _content: Str) -> Result[(), FsError] {
+            io.println("outer write {path}")
+            Ok(())
+        }
+    } {
+        with handler FS {
+            fn read(_path: Str) -> Result[Str, FsError] { Ok("inner read") }
+        } {
+            io.println(fs.read("x").unwrap())
+            fs.write("/no/such/dir/y", "z").unwrap()
+        }
+        io.println(fs.read("x").unwrap())
+    }
+}
+"#
+    let r = compile_and_run(src, "_fs_handler_nested")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "inner read\nouter write /no/such/dir/y\nouter read\n")
+}
+
+// `default.op(args)` in an FS operation body delegates to the handler this one was installed
+// over (§4.7.1), and an fs.* call in the same body reaches it too rather than recursing.
+test "default.read and fs.read in an FS handler op reach the enclosing handler" {
+    let src = #"
+import std.fs.{FsError}
+
+fn main() ! IO, FS {
+    with handler FS {
+        fn read(path: Str) -> Result[Str, FsError] { Ok("base({path})") }
+    } {
+        with handler FS {
+            fn read(path: Str) -> Result[Str, FsError] {
+                let a = default.read(path)?
+                let b = fs.read("{path}!")?
+                Ok("wrapped {a} {b}")
+            }
+        } {
+            io.println(fs.read("p").unwrap())
+        }
+    }
+}
+"#
+    let r = compile_and_run(src, "_fs_handler_default_delegation")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "wrapped base(p) base(p!)\n")
+}
+
+// A handler of one sub-effect handles only that sub-effect's operations (§4.4.5: list_dir
+// and stat are reads), and the write still reaches the real filesystem.
+test "a handler of FS.Read intercepts read, list_dir and stat" {
+    let src = #"
+import std.fs.{FsError, FileInfo, FileKind}
+import std.time.{Instant}
+
+fn main() ! IO, FS {
+    let path = "build/_fs_handler_read_sub.txt"
+    with handler FS.Read {
+        fn read(_path: Str) -> Result[Str, FsError] { Ok("mock") }
+        fn list_dir(_path: Str) -> Result[List[Str], FsError] { Ok(["m"]) }
+        fn stat(_path: Str) -> Result[FileInfo, FsError] {
+            Ok(FileInfo { kind: FileKind.Other, size: 1, mtime: Instant.from_epoch_secs(0) })
+        }
+    } {
+        fs.write(path, "real").unwrap()
+        io.println(fs.read(path).unwrap())
+        io.println(fs.list_dir("/no/such/dir").unwrap().get(0).unwrap())
+        io.println("{fs.stat(path).unwrap().kind == FileKind.Other}")
+    }
+    io.println(fs.read(path).unwrap())
+    fs.delete(path).unwrap()
+}
+"#
+    let r = compile_and_run(src, "_fs_handler_read_sub")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "mock\nm\ntrue\nreal\n")
+}

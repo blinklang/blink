@@ -13,7 +13,7 @@ import parser.{
     node_name, node_fields, node_stmts, node_params, node_arms, node_methods,
     node_args, node_captures, node_elements, node_source_module, sublist_get, sublist_length,
 }
-import typecheck.{lookup_named_type, tc_handler_effect_root, tc_tid_decl_node}
+import typecheck.{fs_op_rows, lookup_named_type, tc_handler_effect_root, tc_tid_decl_node}
 
 let mut reg_types: List[Int] = []
 let mut reg_fns: List[Int] = []
@@ -193,6 +193,55 @@ pub fn cg_reg_effect_root_decl(effect_name: Str) -> Int {
         if node_name(e) == root { return e }
     }
     -1
+}
+
+// `fs_ops.bl` declares no `@module` of its own, so it mangles under the dotted path every
+// loader reaches it by: `std.fs_ops`, the line `std.fs.bl` writes as `pub import
+// std.fs_ops`, underscored the way every module segment is.
+fn fs_ops_module() -> Str { "std_fs_ops" }
+
+// The std.fs_ops function that is the default body of an FS operation, or -1 when `op` is no
+// FS operation.
+pub fn cg_reg_fs_op_decl(op: Str) -> Int {
+    for row in fs_op_rows() {
+        if row.op == op {
+            let found = cg_reg_fns_named(fs_ops_module(), row.default_fn)
+            if found.len() == 0 { return -1 }
+            return found.get(0).unwrap()
+        }
+    }
+    -1
+}
+
+// The FS operations in vtable order: the whole table when the program loads std.fs_ops, and
+// none when it does not. Every unit that holds the default bodies agrees on the layout that
+// way. A program that never loads std.fs_ops cannot name FsError, so it can neither perform
+// an FS operation nor write a clause for one.
+pub fn cg_reg_fs_ops() -> List[Str] {
+    let mut out: List[Str] = []
+    if reg_module_seen.contains_key(fs_ops_module()) == 0 { return out }
+    for row in fs_op_rows() { out.push(row.op) }
+    out
+}
+
+// The modules that hold a builtin effect's default bodies. An archive that defines the
+// evidence vector's default for other units holds every builtin effect's defaults, so it
+// imports these whatever its own modules reach.
+pub fn cg_reg_effect_default_modules() -> List[Str] { ["std.fs_ops"] }
+
+// The operation names of the root effect a handler of `effect_name` fills, in vtable order:
+// FS's table, or the declared operations of a user effect. A builtin
+// root whose vtable the runtime declares answers none.
+pub fn cg_reg_root_op_names(effect_name: Str) -> List[Str] {
+    match tc_handler_effect_root(effect_name) {
+        "FS" => { return cg_reg_fs_ops() }
+        _ => {}
+    }
+    let mut out: List[Str] = []
+    let decl = cg_reg_effect_root_decl(effect_name)
+    if decl < 0 { return out }
+    for op in cg_reg_effect_ops(decl) { out.push(node_name(op)) }
+    out
 }
 
 // The operations a root effect owns, in the order the sub-effects and their operations are

@@ -2,11 +2,44 @@
 // raw fs op — which records errno via fs.errno() (0 = success) instead of
 // exiting — and turns a nonzero errno into Err(FsError{op, path, code}), the same
 // way http_do_request turns a raw socket failure into Err(NetError). The public
-// fs.read/write/list_dir/delete surface redirects codegen here; the wrappers call
+// fs.read/write/list_dir/stat/delete surface redirects codegen here; the wrappers call
 // the raw free-fn layer (read_file/write_file/list_dir/fs_remove) so the redirect
 // does not recurse back through the signed methods.
 import std.fs_error.{FsError, FsOp}
 import std.errno.{Errno}
+import std.time.{Instant}
+
+// The metadata fs.stat answers (sections/04_effects.md §4.4.5).
+@derive(Eq)
+pub type FileKind {
+    File
+    Dir
+    Other
+}
+
+pub type FileInfo {
+    kind: FileKind
+    size: Int
+    mtime: Instant
+}
+
+// stat(2) through the blink_fs_stat shim (bootstrap/runtime_core.h). The shim holds the
+// fields of its last call per thread, so the getters read the same stat as the errno.
+@ffi("blink_fs_stat")
+@trusted(audit: "Calls stat(2) on a GC string path and keeps the struct stat in a thread-local the getters below read. Returns errno; no memory is shared back to Blink.")
+fn c_fs_stat(path: Str) -> Int ! FFI {}
+
+@ffi("blink_fs_stat_kind")
+@trusted(audit: "Reads the file type of the thread's last blink_fs_stat as 0 File, 1 Dir, 2 Other. Pure read of a thread-local.")
+fn c_fs_stat_kind() -> Int ! FFI {}
+
+@ffi("blink_fs_stat_size")
+@trusted(audit: "Reads st_size of the thread's last blink_fs_stat. Pure read of a thread-local.")
+fn c_fs_stat_size() -> Int ! FFI {}
+
+@ffi("blink_fs_stat_mtime_ns")
+@trusted(audit: "Reads st_mtim of the thread's last blink_fs_stat as nanoseconds since the epoch. Pure read of a thread-local.")
+fn c_fs_stat_mtime_ns() -> Int ! FFI {}
 
 pub fn fs_do_read(path: Str) -> Result[Str, FsError] ! FS.Read {
     let content = read_file(path)
@@ -42,4 +75,17 @@ pub fn fs_do_delete(path: Str) -> Result[Void, FsError] ! FS.Delete {
         return Err(FsError { op: FsOp.Delete, path: path, code: Errno(code) })
     }
     Ok()
+}
+
+pub fn fs_do_stat(path: Str) -> Result[FileInfo, FsError] ! FS.Read {
+    let code = c_fs_stat(path)
+    if code != 0 {
+        return Err(FsError { op: FsOp.Stat, path: path, code: Errno(code) })
+    }
+    let kind = match c_fs_stat_kind() {
+        0 => FileKind.File
+        1 => FileKind.Dir
+        _ => FileKind.Other
+    }
+    Ok(FileInfo { kind: kind, size: c_fs_stat_size(), mtime: Instant { nanos: c_fs_stat_mtime_ns() } })
 }

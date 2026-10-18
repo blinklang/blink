@@ -40,7 +40,7 @@ import cname.{
 }
 import cg_print.{print_fn, print_fn_decl, print_capture_desc_table}
 import escape.{ea_closure_is_promoted, ea_refuse_recursive_crossing}
-import cg_reg.{cg_reg_effect_ops, cg_reg_effect_root_decl, cg_reg_tid_for_decl}
+import cg_reg.{cg_reg_root_op_names, cg_reg_tid_for_decl}
 import cg_call.{cg_call_element_from_runtime, cg_call_element_from_word, cg_call_element_to_slot_in}
 import ir.{
     ir_line_text, ir_col, ir_arena_target, ir_assign, ir_binary, ir_block, ir_box_into, ir_break, ir_c_spelling,
@@ -709,7 +709,8 @@ fn record_fixes(w: Walk) -> List[Int] ! Diag.Report {
 fn vtable_fixes(w: Walk) -> List[Int] ! Diag.Report {
     let span = w.span
     let r = tc_resolve(w.tid)
-    if cg_reg_effect_root_decl(tc_tid_handler_effect(r)) < 0 { return [runtime_vtable_copy(w, r)] }
+    let promoter = c_vtable_promoter_name(r)
+    if !diag_is_ice_seg(promoter) { return [runtime_vtable_copy(w, promoter)] }
     let members = vtable_capture_members(r)
     if members.len() == 0 {
         invariant(span, "{tc_type_str(tc_resolve(w.tid))} reached the walker builder with no declared operations")
@@ -734,13 +735,8 @@ fn vtable_fixes(w: Walk) -> List[Int] ! Diag.Report {
         ir_if(span, copied, ir_block(span, fixes), -1)]
 }
 
-// A builtin root's vtable is a struct the runtime declares, so the runtime owns its walker.
-fn runtime_vtable_copy(w: Walk, r: Int) -> Int ! Diag.Report {
-    let promoter = c_vtable_promoter_name(r)
-    if diag_is_ice_seg(promoter) {
-        invariant(w.span, "{tc_type_str(r)} reached the walker builder with no vtable of its own")
-        return -1
-    }
+// A vtable the runtime declares has a walker the runtime owns.
+fn runtime_vtable_copy(w: Walk, promoter: Str) -> Int ! Diag.Report {
     let copy = ir_call_runtime(w.tid, w.span, w.rec.c_spelling, promoter, w.rec.slot_form, [walk_ctx(w), walk_value(w)])
     ir_let(w.tid, w.span, w.rec.c_spelling, w.out, w.rec.slot_form, copy)
 }
@@ -751,21 +747,16 @@ fn held_out(w: Walk) -> Int {
 }
 
 fn vtable_buildable(r: Int) -> Int {
-    if cg_reg_effect_root_decl(tc_tid_handler_effect(r)) < 0 {
-        if diag_is_ice_seg(c_vtable_promoter_name(r)) { return BUILD_NO }
-        return BUILD_YES
-    }
+    if !diag_is_ice_seg(c_vtable_promoter_name(r)) { return BUILD_YES }
     if vtable_capture_members(r).len() > 0 { BUILD_YES } else { BUILD_NO }
 }
 
-// The capture word of each operation the handler's root effect declares, or none for a root
-// the program does not declare.
+// The capture word of each operation of the vtable this compiler writes for the handler's
+// root effect, or none for a vtable the runtime declares.
 fn vtable_capture_members(r: Int) -> List[Str] {
     let mut out: List[Str] = []
-    let decl = cg_reg_effect_root_decl(tc_tid_handler_effect(r))
-    if decl < 0 { return out }
-    for op in cg_reg_effect_ops(decl) {
-        let slot = c_effect_vtable_slot_name(r, node_name(op))
+    for op in cg_reg_root_op_names(tc_tid_handler_effect(r)) {
+        let slot = c_effect_vtable_slot_name(r, op)
         if diag_is_ice_seg(slot) { return [] }
         out.push(c_vtable_userdata_member(slot))
     }

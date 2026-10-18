@@ -52,7 +52,7 @@ import layout.{
     async_scope_handles_spelling, list_slots_hold_no_pointer,
 }
 import mono.{instances, instance_for_call, iterator_route_name, iterator_route_module, mark_instance_named}
-import cg_reg.{cg_reg_fn_decls, cg_reg_fns_named, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
+import cg_reg.{cg_reg_fn_decls, cg_reg_fns_named, cg_reg_fs_op_decl, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
@@ -77,7 +77,7 @@ import cg_expr.{
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
-    cg_eff_lower_builtin_default_perform,
+    cg_eff_lower_builtin_default_perform, cg_eff_lower_fs_perform,
     cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
 }
 import cg_print.{vtable_slot_self_spelling}
@@ -2128,61 +2128,15 @@ pub fn lower_await_expr(node: Int) -> Int ! Diag.Report {
 // publishes one call to read it, so this is a plain zero-argument runtime call, the same
 // shape as io.read_line.
 //
-// `fs.read`, `fs.write`, `fs.list_dir` and `fs.delete` are typecheck's intrinsic-gated
-// spelling of that same signed surface (is_intrinsic_method admits them, so line 914's
-// module-call branch above never sees them). Each one redirects to the matching fs_do_*
-// declared function fs_ops.bl exports: `cc_module_fn_decl` below finds that declaration
-// by module and name alone, the same fact tc_module_let_decl_node already keeps for a
-// top-level `let`, and once it is found the redirect is an ordinary declared call —
-// `cc_free_call` reads the declaration's own row for its symbol, its evidence and its
-// arguments, exactly as it would for a call written `std_fs_ops.fs_do_delete(path)` by
-// hand. `fs_redirect_fn_name` below holds the method-name -> fs_do_* table; `errno`
-// stays the one compare in this function, because it is not a redirect.
+// Every other fs.* method is an FS operation (sections/04_effects.md §4.4.5) and performs
+// through the FS slot of the vector, so the handler in force answers it. The default that
+// slot starts with is the std.fs_ops function the operation table names.
 fn lower_fs_call(node: Int, method: Str) -> Int ! Diag.Report {
-    if method != "errno" { return cc_fs_redirect(node, method) }
-    cc_build_call(node, c_runtime_helper("fs_errno_get"), NO_RECEIVER, CallForm.Runtime, false)
-}
-
-// `fs_ops.bl` declares no `@module` of its own, so it mangles under the dotted path every
-// loader reaches it by: `std.fs_ops`, the line `std.fs.bl` writes as `pub import
-// std.fs_ops`, underscored the way every module segment is.
-let fs_ops_module = "std_fs_ops"
-
-// The fs_ops.bl function an intrinsic fs.* method redirects to, or "" for a method with
-// no redirect. A table, so lower_fs_call and this function ask it once per call site
-// instead of comparing the method name by hand.
-fn fs_redirect_fn_name(method: Str) -> Str {
-    let mut table: Map[Str, Str] = Map()
-    table.insert("delete", "fs_do_delete")
-    table.insert("read", "fs_do_read")
-    table.insert("write", "fs_do_write")
-    table.insert("list_dir", "fs_do_list_dir")
-    table.get(method) ?? ""
-}
-
-fn cc_fs_redirect(node: Int, method: Str) -> Int ! Diag.Report {
-    let redirect_fn = fs_redirect_fn_name(method)
-    if redirect_fn == "" { return cc_ns_not_built(node, ns_fs, method) }
-    let decl = cc_module_fn_decl(fs_ops_module, redirect_fn)
-    if decl < 0 { return cc_ns_not_built(node, ns_fs, method) }
-    cc_free_call(node, decl)
-}
-
-// The declaration node of a module-level `fn` named by its module and its own name alone,
-// or -1 when no such function is registered. `cg_reg_fn_decls` already lists every fn
-// declaration the whole program reaches, prelude and every import alike, so this walks
-// that list rather than re-deriving it: a second index would drift from the one cg_reg
-// already builds. A linear scan is enough — this is asked once per intrinsic redirect
-// call site, not once per name the program spells.
-fn cc_module_fn_decl(module: Str, name: Str) -> Int {
-    let decls = cg_reg_fn_decls()
-    let mut i = 0
-    while i < decls.len() {
-        let d = decls.get(i).unwrap()
-        if node_source_module(d) == module && node_name(d) == name { return d }
-        i = i + 1
+    if method == "errno" {
+        return cc_build_call(node, c_runtime_helper("fs_errno_get"), NO_RECEIVER, CallForm.Runtime, false)
     }
-    -1
+    if cg_reg_fs_op_decl(method) < 0 { return cc_ns_not_built(node, ns_fs, method) }
+    cg_eff_lower_fs_perform(node, method)
 }
 
 // Every net method the runtime publishes a call for, keyed to the op name

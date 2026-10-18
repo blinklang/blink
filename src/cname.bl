@@ -790,6 +790,17 @@ fn is_builtin_effect_root(root: Str) -> Bool {
     false
 }
 
+// The builtin roots in evidence-vector order, for the stage that writes the vector.
+pub fn c_builtin_effect_roots() -> List[Str] { builtin_effect_roots }
+
+// The builtin roots whose vtable this compiler emits rather than the runtime header. An FS
+// operation answers a Result of std.fs types, which only a unit that reads those types can
+// spell, so its vtable is laid out from the std.fs_ops functions that are its defaults. The
+// runtime's own FS vtable stays for compilers that still emit against it, under its own name.
+fn compiled_builtin_roots() -> List[Str] { ["FS"] }
+
+fn is_compiled_builtin_root(root: Str) -> Bool { compiled_builtin_roots().contains(root) }
+
 // The root effect a handler tid installs for. A sub-effect shares its root's slot and a
 // full-size vtable, so the sub-effect rides neither name.
 //
@@ -813,11 +824,13 @@ fn effect_root_of(handler_tid: Int) -> Str {
     root
 }
 
-// The vtable struct of a Handler tid. The eight builtin effects have runtime-declared
-// vtables; a user effect gets `blink_ue_<root>_vtable`.
+// The vtable struct of a Handler tid. A builtin effect has a runtime-declared vtable, or
+// `blink_<root>_ops_vtable` when this compiler emits it; a user effect gets
+// `blink_ue_<root>_vtable`.
 pub fn c_vtable_type_name(handler_tid: Int) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
+    if is_compiled_builtin_root(root) { return "blink_{root.to_lower()}_ops_vtable" }
     if is_builtin_effect_root(root) { return "blink_{root.to_lower()}_vtable" }
     "blink_ue_{root.to_lower()}_vtable"
 }
@@ -828,7 +841,7 @@ pub fn c_vtable_type_name(handler_tid: Int) -> Str {
 pub fn c_vtable_promoter_name(handler_tid: Int) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
-    if !is_builtin_effect_root(root) { return ICE_SEG_UNHANDLED_KIND }
+    if !is_builtin_effect_root(root) || is_compiled_builtin_root(root) { return ICE_SEG_UNHANDLED_KIND }
     "{c_vtable_type_name(handler_tid)}_promote"
 }
 
@@ -847,12 +860,13 @@ pub fn c_ev_field_name(handler_tid: Int) -> Str {
 // and the operation, which is what keeps two operations of different sub-effects apart in the
 // one vtable their root owns.
 //
-// A builtin effect's vtable and its defaults belong to the runtime. Spelling one here would
-// define a second body under a name the runtime already owns, so a builtin root answers an
-// ICE segment instead.
+// A builtin effect's vtable and its defaults belong to the runtime unless this compiler emits
+// that vtable. Spelling one of the runtime's here would define a second body under a name the
+// runtime already owns, so such a root answers an ICE segment instead.
 pub fn c_effect_default_op_name(handler_tid: Int, op: Str) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
+    if is_compiled_builtin_root(root) { return "blink_{root.to_lower()}_ops_default_{c_field_name(op)}" }
     if is_builtin_effect_root(root) { return ICE_SEG_UNHANDLED_KIND }
     "blink_ue_{root.to_lower()}_default_{c_field_name(op)}"
 }
@@ -865,7 +879,8 @@ pub fn c_effect_default_op_name(handler_tid: Int, op: Str) -> Str {
 // names its member verbatim: escaping `log` to `_blink_log` names a member
 // `blink_io_vtable` does not declare, and C rejects the assignment. A user effect's vtable
 // is emitted by this compiler, so its members are C names this compiler owns and they take
-// the escaping every other field name takes.
+// the escaping every other field name takes, as do the members of a builtin vtable this
+// compiler emits.
 //
 // This is a spelling and not a lookup: it does not ask whether the operation is an
 // operation of the effect. A builtin root that the handler writes an unknown operation for
@@ -873,7 +888,7 @@ pub fn c_effect_default_op_name(handler_tid: Int, op: Str) -> Str {
 pub fn c_effect_vtable_slot_name(handler_tid: Int, op: Str) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
-    if is_builtin_effect_root(root) { return op }
+    if is_builtin_effect_root(root) && !is_compiled_builtin_root(root) { return op }
     c_field_name(op)
 }
 

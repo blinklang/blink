@@ -1529,6 +1529,7 @@ fn ev_field_of(handler_tid: Int, node: Int) -> Str ! Diag.Report {
 let NS_IO = "io"
 let NS_ENV = "env"
 let NS_TIME = "time"
+let NS_FS = "fs"
 let ENV_VAR = "var"
 let TIME_READ = "read"
 
@@ -1560,19 +1561,21 @@ fn slot_read(node: Int, handler_tid: Int) -> Int ! Diag.Report {
     ir_field_get(handler_tid, node, rec.c_spelling, field, SlotForm.PointerBoxed, ev_read(node))
 }
 
-// The root effect behind a builtin namespace. The pair is checked against cname's field
-// producer, so the namespace a caller writes and the field the vector holds cannot drift
-// apart without a report.
+// The builtin roots whose namespace performs through the evidence vector.
+fn vector_performing_roots() -> List[Str] { ["IO", "FS", "Time", "Env"] }
+
+// The root effect behind a builtin namespace. A namespace is the name of its root's field,
+// so the match is on cname's field producer, and the namespace a caller writes and the field
+// the vector holds cannot drift apart without a report.
 fn builtin_handler_tid(ns: Str, node: Int) -> Int ! Diag.Report {
-    let root = if ns == NS_IO { "IO" } else if ns == NS_ENV { "Env" } else if ns == NS_TIME { "Time" } else { "" }
-    let tid = if root == "" { -1 } else { make_handler_type(root) }
-    if tid < 0 || c_ev_field_name(tid) != ns {
-        diag_ice_at("BuiltinNamespaceNotAnEffect", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "namespace `{ns}` owns no field of the evidence vector", node,
-            "only the io, env and time namespaces perform through the vector; this is a compiler bug")
-        return -1
+    for root in vector_performing_roots() {
+        let tid = make_handler_type(root)
+        if c_ev_field_name(tid) == ns { return tid }
     }
-    tid
+    diag_ice_at("BuiltinNamespaceNotAnEffect", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "namespace `{ns}` owns no field of the evidence vector", node,
+        "only the io, fs, env and time namespaces perform through the vector; this is a compiler bug")
+    -1
 }
 
 fn lower_args(node: Int) -> Option[List[Int]] ! Diag.Report {
@@ -1633,10 +1636,22 @@ pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Di
 // pass as they are.
 pub fn cg_eff_lower_builtin_default_perform(node: Int, handler_tid: Int) -> Int ! Diag.Report {
     if handler_tid < 0 { return -1 }
-    let slot = c_effect_vtable_slot_name(handler_tid, node_method(node))
+    perform_op(node, handler_tid, node_method(node))
+}
+
+// An operation of the fs namespace, reached through FS's vtable. Typecheck held the call to
+// the operation's signature, which is the slot's, so the arguments pass as they are.
+pub fn cg_eff_lower_fs_perform(node: Int, method: Str) -> Int ! Diag.Report {
+    let handler_tid = builtin_handler_tid(NS_FS, node)
+    if handler_tid < 0 { return -1 }
+    perform_op(node, handler_tid, method)
+}
+
+fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
+    let slot = c_effect_vtable_slot_name(handler_tid, op)
     if diag_is_ice_seg(slot) {
         diag_ice_at("HandlerOpNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "no vtable member for operation `{node_method(node)}` of this handler", node,
+            "no vtable member for operation `{op}` of this handler", node,
             "typecheck admits `default` only on a builtin root with a vtable; this is a compiler bug")
         return -1
     }

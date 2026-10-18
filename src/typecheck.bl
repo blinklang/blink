@@ -5523,6 +5523,11 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("fs.write", [TYPE_STR, TYPE_STR], make_result_type(TYPE_VOID, fs_err_t))
     register_intrinsic_fn_sig("fs.list_dir", [TYPE_STR], make_result_type(make_list_type(TYPE_STR), fs_err_t))
     register_intrinsic_fn_sig("fs.delete", [TYPE_STR], make_result_type(TYPE_VOID, fs_err_t))
+    // FileInfo has no unimported carrier: without `import std.fs`, fs.stat has no signature.
+    let file_info_t = lookup_named_type("FileInfo")
+    if file_info_t != -1 {
+        register_intrinsic_fn_sig("fs.stat", [TYPE_STR], make_result_type(file_info_t, fs_err_t))
+    }
 
     // fs.errno — the last fs op's errno side-channel (0 = success). Unlike the signed
     // surface above, its type is not an open question: it is plumbing the Result wrappers
@@ -6407,6 +6412,51 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
 
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
+}
+
+// A clause of an FS handler fills the vtable slot of the operation it names, and the slot's C
+// type is that operation's signature, so a clause must name an operation its effect has and
+// take and answer exactly that operation's types (§4.4.5).
+fn tc_check_fs_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if m == -1 || node_kind(m) != NodeKind.FnDef { return }
+    if tc_handler_effect_root(eff_name) != "FS" { return }
+    let op = node_name(m)
+    let sub = fs_op_sub_effect(op)
+    if sub == "" || (eff_name != "FS" && eff_name != "FS.{sub}") {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
+            "the FS operations are read, write, list_dir, stat and delete (§4.4.5)")
+        return
+    }
+    let sig_idx = builtin_handler_op_sig("FS", op)
+    if sig_idx == -1 { return }
+    let sig = fnsig_pool.get(sig_idx).unwrap()
+    let mut want: List[Str] = []
+    let mut i = 0
+    while i < sig.params_count {
+        want.push(type_to_str(fnsig_param_list.get(sig.params_start + i).unwrap()))
+        i = i + 1
+    }
+    let spec_sig = "fn {op}({want.join(", ")}) -> {type_to_str(sig.ret)}"
+    let params_sl = node_params(m)
+    let n = if params_sl == -1 { 0 } else { sublist_length(params_sl) }
+    if n != sig.params_count {
+        tc_error_at("FS handler clause `{op}` takes {n} parameter(s), but fs.{op} takes {sig.params_count}: `{spec_sig}`", m)
+        return
+    }
+    let mut j = 0
+    while j < n {
+        let ptid = resolve_param_type(sublist_get(params_sl, j))
+        let wtid = fnsig_param_list.get(sig.params_start + j).unwrap()
+        if tc_tid_is_no_info(ptid) == 0 && !tc_tid_same_type(ptid, wtid) {
+            tc_error_at("FS handler clause `{op}` parameter {j + 1} is {type_to_str(ptid)}, but fs.{op} takes {type_to_str(wtid)}: `{spec_sig}`", m)
+            return
+        }
+        j = j + 1
+    }
+    let rtid = tc_closure_declared_ret(m)
+    if tc_tid_is_no_info(rtid) == 0 && !tc_tid_same_type(rtid, sig.ret) {
+        tc_error_at("FS handler clause `{op}` answers {type_to_str(rtid)}, but fs.{op} answers {type_to_str(sig.ret)}: `{spec_sig}`", m)
+    }
 }
 
 // Walk the BODY of every Closure / HandlerExpr argument at a call site. infer_type validates a
@@ -12326,10 +12376,39 @@ fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeChec
 }
 
 // The builtin roots whose handler operations the spec names (§4.3): IO's three, which take
-// the rendered text, and Time's two. Env's names differ between the spec and the runtime, so
-// it has none here until that is settled; the other builtin roots name none.
+// the rendered text, Time's two, and the five FS operations of §4.4.5. Env's names differ
+// between the spec and the runtime, so it has none here until that is settled; the other
+// builtin roots name none.
 fn builtin_root_has_handler_ops(root: Str) -> Bool {
-    root == "IO" || root == "Time"
+    root == "IO" || root == "Time" || root == "FS"
+}
+
+// The FS operations of §4.4.5, in the order the FS vtable lays out its slots. Each row names
+// the sub-effect that performs the operation (list_dir and stat are reads; there is no FS.List
+// or FS.Stat) and the std.fs_ops function that is its default body. Typecheck reads the rows
+// for the clauses a handler may write and codegen for the vtable, so the two cannot drift.
+pub type FsOpRow {
+    op: Str
+    sub_effect: Str
+    default_fn: Str
+}
+
+pub fn fs_op_rows() -> List[FsOpRow] {
+    [
+        FsOpRow { op: "read", sub_effect: "Read", default_fn: "fs_do_read" },
+        FsOpRow { op: "write", sub_effect: "Write", default_fn: "fs_do_write" },
+        FsOpRow { op: "list_dir", sub_effect: "Read", default_fn: "fs_do_list_dir" },
+        FsOpRow { op: "stat", sub_effect: "Read", default_fn: "fs_do_stat" },
+        FsOpRow { op: "delete", sub_effect: "Delete", default_fn: "fs_do_delete" },
+    ]
+}
+
+// The sub-effect that performs an FS operation, or "" for a name that is no FS operation.
+pub fn fs_op_sub_effect(op: Str) -> Str {
+    for row in fs_op_rows() {
+        if row.op == op { return row.sub_effect }
+    }
+    ""
 }
 
 // No source spelling reaches this key, so no declaration can take it over.
@@ -12351,6 +12430,9 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
         register_intrinsic_fn_sig(key, [], runtime_instant_tid())
     } else if root == "Time" && op == "sleep" {
         register_intrinsic_fn_sig(key, [runtime_duration_tid()], TYPE_VOID)
+    } else if root == "FS" && fs_op_sub_effect(op) != "" {
+        // The handle call's own signature, so a clause and the call it answers cannot differ.
+        return lookup_fnsig("fs.{op}")
     } else {
         return -1
     }
@@ -24740,6 +24822,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if hm_sl != -1 {
             let mut hi = 0
             while hi < sublist_length(hm_sl) {
+                tc_check_fs_handler_clause(node_name(node), sublist_get(hm_sl, hi))
                 tc_check_handler_method(sublist_get(hm_sl, hi))
                 hi = hi + 1
             }
@@ -27153,7 +27236,7 @@ pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
         }
     }
     if namespace == "fs" {
-        if method == "read" || method == "write" || method == "list_dir" || method == "delete" || method == "errno" {
+        if fs_op_sub_effect(method) != "" || method == "errno" {
             return 1
         }
     }
