@@ -17,7 +17,7 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
     tc_enter_body_module, tc_leave_body_module, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
-    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_handler_effect_root, tc_impl_trait_id, io_read_op_rows, handles_io_read,
+    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_handler_effect_root, tc_impl_trait_id, io_read_ops, is_io_read_derived_op, IO_READ_PRIMITIVE, handles_io_read,
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, async_scope_handles_spelling,
@@ -690,17 +690,27 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
 // The loader brings in std.io_read whenever a module writes a handler of IO or IO.Read, so a
 // derived operation with no body means the loader and this stage disagree.
 fn io_derived_bodies_loaded(tid: Int, written: List[Int], node: Int) -> Bool ! Diag.Report {
-    if !handles_io_read(tc_tid_handler_effect(tid)) { return true }
-    let mut names: List[Str] = []
-    for w in written { names.push(node_name(w)) }
-    for row in io_read_op_rows() {
-        if row.derived_fn == "" || names.contains(row.op) || cg_reg_io_derived_decl(row.op) >= 0 { continue }
+    for op in omitted_io_read_derived_ops(tc_tid_handler_effect(tid), written) {
+        if cg_reg_io_derived_decl(op) >= 0 { continue }
         diag_ice_at("IoDerivedBodyNotLoaded", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "no body for IO.Read operation `{row.op}`: std.io_read is not loaded", node,
+            "no body for IO.Read operation `{op}`: std.io_read is not loaded", node,
             "the loader loads std.io_read for every handler of IO or IO.Read; this is a compiler bug")
         return false
     }
     true
+}
+
+// The derived IO.Read operations a handler literal of `eff` does not write; none unless the
+// literal handles IO.Read.
+fn omitted_io_read_derived_ops(eff: Str, written: List[Int]) -> List[Str] {
+    let mut out: List[Str] = []
+    if !handles_io_read(eff) { return out }
+    let mut names: List[Str] = []
+    for w in written { names.push(node_name(w)) }
+    for op in io_read_ops() {
+        if is_io_read_derived_op(op) && !names.contains(op) { out.push(op) }
+    }
+    out
 }
 
 // The derived operations of the effect a literal names that the literal does not write. The
@@ -716,12 +726,9 @@ fn omitted_derived_ops(tid: Int, written: List[Int]) -> List[DefaultSlot] {
     let children = if decl == -1 { -1 } else { node_elements(decl) }
     let mut names: List[Str] = []
     for w in written { names.push(node_name(w)) }
-    if handles_io_read(eff) {
-        for row in io_read_op_rows() {
-            if row.derived_fn == "" || names.contains(row.op) { continue }
-            let slot = c_effect_vtable_slot_name(tid, row.op)
-            out.push(DefaultSlot { slot: slot, userdata: c_vtable_userdata_member(slot), symbol: c_builtin_derived_op_name(tid, row.op) })
-        }
+    for op in omitted_io_read_derived_ops(eff, written) {
+        let slot = c_effect_vtable_slot_name(tid, op)
+        out.push(DefaultSlot { slot: slot, userdata: c_vtable_userdata_member(slot), symbol: c_builtin_derived_op_name(tid, op) })
     }
     let mut ci = 0
     while children != -1 && ci < sublist_length(children) {
@@ -1731,20 +1738,12 @@ pub fn cg_eff_lower_io_read_perform(node: Int, method: Str) -> Int ! Diag.Report
     perform_op(node, handler_tid, method)
 }
 
-fn io_read_checks_count(op: Str) -> Bool {
-    for row in io_read_op_rows() {
-        if row.op == op { return row.checks_count }
-    }
-    false
-}
-
 // The count argument of read_bytes passed through the runtime's check, which panics for a
 // count below one and answers the count otherwise.
-fn io_read_checked_args(node: Int, args: List[Int]) -> List[Int] ! Diag.Report {
-    if args.len() != 1 { return args }
+fn io_read_checked_count(node: Int, count: Int) -> Int ! Diag.Report {
     let rec = perform_layout(TYPE_INT, Position.Local, node)
-    if rec.c_spelling == "" { return [] }
-    [ir_call_runtime(TYPE_INT, node, rec.c_spelling, c_runtime_helper("io_read_bytes_count"), rec.slot_form, [args.get(0).unwrap()])]
+    if rec.c_spelling == "" { return -1 }
+    ir_call_runtime(TYPE_INT, node, rec.c_spelling, c_runtime_helper("io_read_bytes_count"), rec.slot_form, [count])
 }
 
 fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
@@ -1764,9 +1763,12 @@ fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
         Some(lowered) => {
             let read = slot_read(node, handler_tid)
             if read < 0 { return -1 }
-            let args = if c_ev_field_name(handler_tid) == NS_IO && io_read_checks_count(op) { io_read_checked_args(node, lowered) } else { lowered }
-            if args.len() != lowered.len() { return -1 }
-            ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, args)
+            if c_ev_field_name(handler_tid) != NS_IO || op != IO_READ_PRIMITIVE || lowered.len() != 1 {
+                return ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, lowered)
+            }
+            let count = io_read_checked_count(node, lowered.get(0).unwrap())
+            if count < 0 { return -1 }
+            ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, [count])
         }
     }
 }
