@@ -310,27 +310,32 @@ let mut tc_active_tparams: Map[Str, Int] = Map()
 // by declaration node, types and fns alike.
 type HashRole { Free, SetElement, MapKey }
 let mut tc_hash_oblig: Map[Int, List[HashRole]] = Map()
-// A stack of active type-parameter bindings, one frame per binder brought into
-// scope, recording the parameter name. A frame per binder — not a per-name count —
-// so an inner binder that reuses an outer name shadows it: the innermost frame for
-// a name wins. Read (through the parallel tc_tp_bound_traits) by
-// reject_non_numeric_arith_operand and the E0305 check to decide whether an
-// operation is licensed on a type parameter. A name absent from this stack is not a
-// type parameter (e.g. Self, or an unmodeled builtin that lowers to a typevar).
-let mut tc_tp_arith_names: List[Str] = []
-// Parallel to tc_tp_arith_names, one entry per frame: the NODE that binds this type
-// parameter. A type parameter is identified by its binder, not by its spelling, so
-// `T` of `type Box[T]` and `T` of `fn pick[T, U]` are two types that share a letter.
-// The implicit `Self` frame binds nothing and carries SELF_BINDER_NODE.
-let mut tc_tp_binder_nodes: List[Int] = []
-// Parallel to tc_tp_arith_names, one entry per frame: the full trait-bound set
-// (pipe-framed, e.g. "|Add|Ord|Eq|") and — for the implicit `Self` frame of a trait
-// default body — the guarantee-set METHOD names ("|eq|ne|"). Type-parameter frames
-// carry an empty method set. Read by the E0305 licensing check for operators and
-// method calls on `Self` in a default body (sections/03_types.md "Operations on
-// `Self` in a Default Body").
-let mut tc_tp_bound_traits: List[Str] = []
-let mut tc_tp_bound_methods: List[Str] = []
+// One active type-parameter binding. A frame per binder — not a per-name count — so an
+// inner binder that reuses an outer name shadows it: the innermost frame for a name wins.
+// A name absent from the stack is not a type parameter (e.g. Self, or an unmodeled builtin
+// that lowers to a typevar).
+type TpFrame {
+    name: Str
+    // The NODE that binds this type parameter. A type parameter is identified by its
+    // binder, not by its spelling, so `T` of `type Box[T]` and `T` of `fn pick[T, U]` are
+    // two types that share a letter. The implicit `Self` frame binds nothing and carries
+    // SELF_BINDER_NODE.
+    binder: Int
+    // The node whose bounds this frame adds: the binder itself, or the `where` constraint
+    // that bounds it further. A bound's trait arguments are read off this node, as the
+    // pipe-framed names below keep none.
+    bounds_node: Int
+    // The full trait-bound set (pipe-framed, e.g. "|Add|Ord|Eq|"), read by
+    // reject_non_numeric_arith_operand and the E0305 check to decide whether an operation is
+    // licensed on a type parameter.
+    traits: Str
+    // For the implicit `Self` frame of a trait default body, the guarantee-set METHOD names
+    // ("|eq|ne|"); type-parameter frames carry an empty set. Read by the E0305 licensing
+    // check for method calls on `Self` in a default body (sections/03_types.md "Operations
+    // on `Self` in a Default Body").
+    methods: Str
+}
+let mut tc_tp_frames: List[TpFrame] = []
 // The trait whose default body is being checked, for the E0305 diagnostic; "" when no
 // `Self` frame is active. tc_trait_node_idx maps each registered trait name to its AST node,
 // so the guarantee-set closure can traverse user supertraits transitively and a call can read
@@ -1227,6 +1232,7 @@ fn tc_impl_binds_at_call(sig: Int, recv: Int) -> Map[Str, Int] ! TypeCheck.Resol
 // Evaluate the impl's `where`-bounds against the discovered binds. Tri-state
 // combine: any definitely-unmet bound (-1) rejects the whole impl; an unbound
 // param or an unmodeled bound is skipped (fail open). Returns -1 (reject) or 1.
+// A bound on a program trait is judged at its arguments, as a binder's bound is at a call.
 fn tc_impl_where_bounds_hold(im: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.Resolve, Diag.Report {
     let wb = node_impl_where_bounds(im)
     if wb == -1 { return 1 }
@@ -1245,6 +1251,7 @@ fn tc_impl_where_bounds_hold(im: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.R
                     j = j + 1
                 }
             }
+            if tc_unmet_user_bound(cons, node_impl_binders(im), -1, tc_resolve(concrete), binds).trait_name != "" { return -1 }
         }
         i = i + 1
     }
@@ -1656,11 +1663,10 @@ pub let BUILTIN_BINDER_NODE: Int = -3
 // parameter. Scans the frame stack from the top, so an inner declaration's parameter
 // shadows an outer one of the same spelling.
 fn tc_active_binder_node(name: Str) -> Int {
-    let mut i = tc_tp_arith_names.len() - 1
+    let mut i = tc_tp_frames.len() - 1
     while i >= 0 {
-        if tc_tp_arith_names.get(i).unwrap() == name {
-            return tc_tp_binder_nodes.get(i).unwrap()
-        }
+        let f = tc_tp_frames.get(i).unwrap()
+        if f.name == name { return f.binder }
         i = i - 1
     }
     NO_BINDER_NODE
@@ -2775,8 +2781,8 @@ fn tc_typevar_binds_here(tid0: Int) -> Int {
 // by a method's own `T` is still substituted once per instance of the method body.
 fn tc_binder_is_active(binder: Int) -> Int {
     if binder == NO_BINDER_NODE { return 0 }
-    for b in tc_tp_binder_nodes {
-        if b == binder { return 1 }
+    for f in tc_tp_frames {
+        if f.binder == binder { return 1 }
     }
     0
 }
@@ -4051,17 +4057,67 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) -> Int !
 
 // The bounds on the type parameter at `idx` whose trait a program module declares, read at
 // the call's types: `U: Tr[Str]` holds for `Pt` only where an impl of `Tr` for `Pt` has the
-// trait argument Str, and `V` in `U: Tr[V]` is the call's type for V. A trait a std module
-// declares is left to the modeled check above, as its impls include ones no impl block
-// writes (the sealed Ops surfaces, From's identity rule). Reports at most one bound.
-fn tc_check_user_bounds(decl: Int, idx: Int, concrete0: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+// trait argument Str, and `V` in `U: Tr[V]` is the call's type for V. Reports at most one bound.
+fn tc_check_user_bounds(decl: Int, idx: Int, concrete: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
     if decl < 0 { return }
     let tp = fnsig_tparam_nodes.get(idx) ?? NO_BINDER_NODE
-    if tp < 0 || node_kind(tp) != NodeKind.TypeParam { return }
-    let bounds = node_elements(tp)
-    if bounds == -1 { return }
+    let block = tc_method_block.get(decl) ?? -1
+    let impl_binders = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
+    let _ = tc_report_unmet_user_bound(tp, impl_binders, node_type_params(decl), concrete, binds, node)
+}
+
+// The `where` bounds of the impl a method call reached, read at the receiver instance's
+// arguments (sections/05_memory_compile_errors.md, "Checked at the call"). Empty `ibinds`
+// means the impl's binders are not read off the receiver, so there is nothing to judge.
+fn tc_check_impl_where_bounds_at_call(decl: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let im = tc_method_block.get(decl) ?? -1
+    if im == -1 || node_kind(im) != NodeKind.ImplBlock { return }
+    let wb = node_impl_where_bounds(im)
+    if wb == -1 { return }
+    let mut i = 0
+    while i < sublist_length(wb) {
+        let cons = sublist_get(wb, i)
+        let concrete = ibinds.get(node_name(cons)) ?? -1
+        if concrete != -1 && tc_report_unmet_user_bound(cons, node_impl_binders(im), -1, concrete, ibinds, node) != 0 { return }
+        i = i + 1
+    }
+}
+
+// E0306 for the first bound on `carrier` that tc_unmet_user_bound finds; answers 1 when it
+// reported.
+fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete0: Int, binds: Map[Str, Int], node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let concrete = tc_resolve(concrete0)
-    if tc_tid_is_judgeable(concrete) == 0 { return }
+    let u = tc_unmet_user_bound(carrier, outer_sl, own_sl, concrete, binds)
+    if u.trait_name == "" { return 0 }
+    let bound_text = tc_trait_at_text(u.trait_name, u.want)
+    let has = if u.held.impls == 0 { "it has no impl of {u.trait_name}" } else { "it implements {tc_trait_heads_text(u.trait_name, u.held.args, u.want.len())}" }
+    diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
+        "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(carrier)}: {has}", node,
+        "pass an argument whose type implements {bound_text}, or write `impl {bound_text} for {type_to_str(concrete)}`")
+    1
+}
+
+// A bound `concrete` provably does not meet: the trait, the arguments the bound asks for at
+// these types, and the impls the type has. `trait_name` is "" when every bound holds or
+// cannot be judged.
+type UnmetBound {
+    trait_name: Str
+    want: List[Int]
+    held: ImplArgsHeld
+}
+
+// The first bound on `carrier` (a TypeParam, or an impl's `where` constraint, which has the
+// same shape) whose trait a program module declares and which `concrete` provably does not
+// meet at the bound's arguments. The arguments are read under `outer_sl` and `own_sl`, the
+// binders in scope where the bound is written, then `binds` replaces them. A trait a std
+// module declares is left to the modeled checks, as its impls include ones no impl block
+// writes (the sealed Ops surfaces, From's identity rule).
+fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, binds: Map[Str, Int]) -> UnmetBound ! TypeCheck.Resolve, Diag.Report {
+    let none = UnmetBound { trait_name: "", want: [], held: ImplArgsHeld { verdict: 0, impls: 0, args: [] } }
+    if carrier < 0 || node_kind(carrier) != NodeKind.TypeParam { return none }
+    let bounds = node_elements(carrier)
+    if bounds == -1 { return none }
+    if tc_tid_is_judgeable(concrete) == 0 { return none }
     let mut i = 0
     while i < sublist_length(bounds) {
         let b = sublist_get(bounds, i)
@@ -4072,21 +4128,17 @@ fn tc_check_user_bounds(decl: Int, idx: Int, concrete0: Int, binds: Map[Str, Int
         // A wrong count is reported where the bound is written.
         let arity_ok = got == (tc_trait_tparam_count_idx.get(trait_name) ?? -1)
         if tr != -1 && arity_ok && !node_source_module(tr).starts_with("std_") {
-            let want = tc_bound_args_at_call(decl, args_sl, binds)
+            let want = tc_bound_args_at_call(outer_sl, own_sl, args_sl, binds)
             if want.len() == got {
                 let held = tc_impl_trait_args_held(concrete, trait_name)
                 if held.verdict == 1 && tc_impl_args_held_has(held, want) == 0 {
-                    let bound_text = tc_trait_at_text(trait_name, want)
-                    let has = if held.impls == 0 { "it has no impl of {trait_name}" } else { "it implements {tc_trait_heads_text(trait_name, held.args, got)}" }
-                    diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
-                        "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(tp)}: {has}", node,
-                        "pass an argument whose type implements {bound_text}, or write `impl {bound_text} for {type_to_str(concrete)}`")
-                    return
+                    return UnmetBound { trait_name: trait_name, want: want, held: held }
                 }
             }
         }
         i = i + 1
     }
+    none
 }
 
 // Whether a type is fixed enough to judge an impl against: no unsolved metavariable and no
@@ -4098,17 +4150,14 @@ fn tc_tid_is_judgeable(tid: Int) -> Int {
 }
 
 // A bound's trait arguments as types at this call, or a shorter list when one is not judgeable
-// here. They are read under the callee's binders (its own, and its impl's for a method), so
-// `V` is the callee's V, then the call's types replace them.
+// here. They are read under the binders of the declaration that writes the bound (a method's
+// own, and its impl's), so `V` is that declaration's V, then the call's types replace them.
 @allow(UnrestoredMutation)
-fn tc_bound_args_at_call(decl: Int, args_sl: Int, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+fn tc_bound_args_at_call(outer_sl: Int, own_sl: Int, args_sl: Int, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
     let mut out: List[Int] = []
     if args_sl == -1 { return out }
-    let block = tc_method_block.get(decl) ?? -1
-    let impl_binders = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
-    let own = node_type_params(decl)
-    tc_push_tparam_scope(impl_binders)
-    tc_push_tparam_scope(own)
+    tc_push_tparam_scope(outer_sl)
+    tc_push_tparam_scope(own_sl)
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let mut i = 0
@@ -4119,8 +4168,8 @@ fn tc_bound_args_at_call(decl: Int, args_sl: Int, binds: Map[Str, Int]) -> List[
         i = i + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    tc_pop_tparam_scope(own)
-    tc_pop_tparam_scope(impl_binders)
+    tc_pop_tparam_scope(own_sl)
+    tc_pop_tparam_scope(outer_sl)
     out
 }
 
@@ -7154,10 +7203,7 @@ fn tc_push_arith_frames(sl: Int) {
     let mut i = 0
     while i < sublist_length(sl) {
         let tp = sublist_get(sl, i)
-        tc_tp_arith_names.push(node_name(tp))
-        tc_tp_binder_nodes.push(tp)
-        tc_tp_bound_traits.push(tparam_node_bound_traits(tp))
-        tc_tp_bound_methods.push("|")
+        tc_tp_frames.push(TpFrame { name: node_name(tp), binder: tp, bounds_node: tp, traits: tparam_node_bound_traits(tp), methods: "|" })
         i = i + 1
     }
 }
@@ -7171,10 +7217,7 @@ fn tc_push_where_frames(sl: Int) {
     while i < sublist_length(sl) {
         let wc = sublist_get(sl, i)
         let binder = tc_active_binder_node(node_name(wc))
-        tc_tp_arith_names.push(node_name(wc))
-        tc_tp_binder_nodes.push(if binder == NO_BINDER_NODE { wc } else { binder })
-        tc_tp_bound_traits.push(tparam_node_bound_traits(wc))
-        tc_tp_bound_methods.push("|")
+        tc_tp_frames.push(TpFrame { name: node_name(wc), binder: if binder == NO_BINDER_NODE { wc } else { binder }, bounds_node: wc, traits: tparam_node_bound_traits(wc), methods: "|" })
         i = i + 1
     }
 }
@@ -7184,10 +7227,7 @@ fn tc_pop_arith_frames(sl: Int) {
     if sl == -1 { return }
     let mut i = 0
     while i < sublist_length(sl) {
-        let _ = tc_tp_arith_names.pop()
-        let _ = tc_tp_binder_nodes.pop()
-        let _ = tc_tp_bound_traits.pop()
-        let _ = tc_tp_bound_methods.pop()
+        let _ = tc_tp_frames.pop()
         i = i + 1
     }
 }
@@ -7317,38 +7357,30 @@ fn tc_push_self_frame(tr_node: Int) {
             }
         }
     }
-    tc_tp_arith_names.push("Self")
-    tc_tp_binder_nodes.push(SELF_BINDER_NODE)
-    tc_tp_bound_traits.push(traits)
-    tc_tp_bound_methods.push(methods)
+    tc_tp_frames.push(TpFrame { name: "Self", binder: SELF_BINDER_NODE, bounds_node: NO_BINDER_NODE, traits: traits, methods: methods })
 }
 
 fn tc_pop_self_frame() {
-    let _ = tc_tp_arith_names.pop()
-    let _ = tc_tp_binder_nodes.pop()
-    let _ = tc_tp_bound_traits.pop()
-    let _ = tc_tp_bound_methods.pop()
+    let _ = tc_tp_frames.pop()
 }
 
 // The innermost active binding of `name`: its pipe-framed trait set / method set, or
 // "" if `name` is not an active type parameter.
 fn tc_tparam_bound_traits(name: Str) -> Str {
-    let mut i = tc_tp_arith_names.len() - 1
+    let mut i = tc_tp_frames.len() - 1
     while i >= 0 {
-        if tc_tp_arith_names.get(i).unwrap() == name {
-            return tc_tp_bound_traits.get(i).unwrap()
-        }
+        let f = tc_tp_frames.get(i).unwrap()
+        if f.name == name { return f.traits }
         i = i - 1
     }
     ""
 }
 
 fn tc_tparam_bound_methods(name: Str) -> Str {
-    let mut i = tc_tp_arith_names.len() - 1
+    let mut i = tc_tp_frames.len() - 1
     while i >= 0 {
-        if tc_tp_arith_names.get(i).unwrap() == name {
-            return tc_tp_bound_methods.get(i).unwrap()
-        }
+        let f = tc_tp_frames.get(i).unwrap()
+        if f.name == name { return f.methods }
         i = i - 1
     }
     ""
@@ -10894,9 +10926,7 @@ pub fn tc_fn_has_effect(name: Str, eff: Str) -> Int {
 // Eq for `==`, Closeable for `with`, IntoIterator for `for`), and the ones registered with no
 // declaration. Valid after tc_set_prelude_modules.
 pub fn tc_builtin_trait_names(program: Int) -> List[Str] {
-    // The arithmetic traits, Serialize and Iterator have no trait declaration, and a bound, an
-    // operator or a type reads them by name.
-    let mut names: List[Str] = ["From", "TryFrom", "Into", "IntoIterator", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Serialize", "Iterator"]
+    let mut names = tc_undeclared_trait_names()
     let traits_sl = node_arms(program)
     if traits_sl != -1 {
         for name in tc_prelude_trait_names(traits_sl) { names.push(name) }
@@ -11001,6 +11031,12 @@ fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.
     }
     // `fn(A, B) -> R` keeps its parameters in `elements` and its return in `type_ann`.
     if name == "Fn" { tc_check_trait_sig_ann(node_type_ann(ann), trait_name, mname, m) }
+}
+
+// The arithmetic traits, Serialize, Deserialize and Iterator have no trait declaration, and a
+// bound, an operator, a derive or a type reads them by name.
+fn tc_undeclared_trait_names() -> List[Str] {
+    ["From", "TryFrom", "Into", "IntoIterator", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Serialize", "Deserialize", "Iterator"]
 }
 
 fn tc_prelude_trait_names(traits_sl: Int) -> List[Str] {
@@ -11214,10 +11250,28 @@ fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int) -> Map[Str, Int] ! TypeChe
 
 // The trait arguments the type parameter declared at `binder` is bounded by `trait_name`
 // at (`[Int]` of `U: Tr[Int]`), or -1 when its bounds do not name the trait with arguments.
+// An impl's `where T: Tr[Int]` bounds the impl's `T` from a node of its own, which the frame
+// for that binder carries, so every active frame of the binder is read, not the binder alone.
 fn tc_bound_trait_args(binder: Int, trait_name: Str) -> Int {
     if binder < 0 { return -1 }
-    if node_kind(binder) != NodeKind.TypeParam { return -1 }
-    let bounds = node_elements(binder)
+    let mut i = tc_tp_frames.len() - 1
+    while i >= 0 {
+        let f = tc_tp_frames.get(i).unwrap()
+        if f.binder == binder {
+            let args = tc_bounds_node_trait_args(f.bounds_node, trait_name)
+            if args != -1 { return args }
+        }
+        i = i - 1
+    }
+    tc_bounds_node_trait_args(binder, trait_name)
+}
+
+// The arguments one TypeParam or `where` constraint node bounds its parameter by `trait_name`
+// at, or -1.
+fn tc_bounds_node_trait_args(bounds_node: Int, trait_name: Str) -> Int {
+    if bounds_node < 0 { return -1 }
+    if node_kind(bounds_node) != NodeKind.TypeParam { return -1 }
+    let bounds = node_elements(bounds_node)
     if bounds == -1 { return -1 }
     let mut i = 0
     while i < sublist_length(bounds) {
@@ -11893,10 +11947,7 @@ fn init_types() ! TypeCheck.Register {
     tc_type_args_claimed.clear()
     tc_type_args_unresolved.clear()
     tc_type_args_untyped = []
-    tc_tp_arith_names.clear()
-    tc_tp_bound_traits.clear()
-    tc_tp_bound_methods.clear()
-    tc_tp_binder_nodes.clear()
+    tc_tp_frames.clear()
     // A diagnostic can stop a walk before it restores these flags.
     tc_walk_value_tail = 0
     tc_pin_tparam_binds = 0
@@ -16440,7 +16491,16 @@ fn nr_check_binder_bounds(binders_sl: Int) ! TypeCheck.Resolve, Diag.Report {
 }
 
 fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
-    let trait_name = strip_module_qualifier(node_name(bound))
+    let written = node_name(bound)
+    let trait_name = strip_module_qualifier(written)
+    // A bound names a trait, so a name no trait declares gets the impl header's error.
+    let undeclared = tc_undeclared_trait_names().contains(trait_name)
+    if is_trait_name(trait_name) == 0 && !undeclared {
+        diag_error_at("TraitContract", TRAIT_CONTRACT_904, "trait `{written}` is not defined", bound, "check the trait name or define `trait {trait_name} \{ ... }`")
+        return
+    }
+    // A compiler-known trait with no declaration has nothing to import.
+    if !undeclared { nr_check_bound_trait_access(written, trait_name, bound) }
     let args_sl = node_elements(bound)
     let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
     let want = tc_trait_tparam_count_idx.get(trait_name) ?? -1
@@ -16456,6 +16516,22 @@ fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
         nr_resolve_bound_arg(arg)
         i = i + 1
     }
+}
+
+// The import and visibility rules a type name in a type position follows, for a bound's
+// trait: a bare name must be selected by this file's imports, and a qualified one must be
+// `pub` in the module its qualifier names.
+fn nr_check_bound_trait_access(written: Str, trait_name: Str, bound: Int) ! TypeCheck.Resolve, Diag.Report {
+    if written == trait_name {
+        nr_check_type_ref(trait_name, bound)
+        return
+    }
+    let qualifier = written.byte_slice(0, written.byte_len() - trait_name.byte_len() - 1)
+    if nr_qualified_private_access(qualifier, trait_name) != 0 {
+        nr_emit_private_access(trait_name, bound)
+        return
+    }
+    tc_mark_symbol_used(trait_name)
 }
 
 // Resolving the argument is what counts a nested constructor's arguments (E0303).
@@ -21279,6 +21355,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // Before the argument check: an argument typed by an impl binder takes the
                 // receiver's type argument as its hint, as a List poly-impl argument does.
                 let ibinds = tc_impl_binds_at_call(sig, obj_t)
+                tc_check_impl_where_bounds_at_call(fnsig_pool.get(sig).unwrap().decl, ibinds, node)
                 if node_type_params(node) != -1 {
                     nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
                     return tc_call_with_type_args("{tname}.{method}", sig, node, 1, ibinds)

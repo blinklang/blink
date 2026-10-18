@@ -201,3 +201,114 @@ test "a bound on a type declaration's parameter is counted" {
     let p = problems_reported()
     assert(p.contains("TraitContract: trait `Tr` takes 1 type argument(s), 0 were given"), "expected E0910 at the bound, got:\n{p}")
 }
+
+// An impl's `where` bound is a bound on the impl's binder: a method call on an instance whose
+// argument does not meet it is E0306 at the call, as `unwrap` on a Result whose error type has
+// no Debug is (sections/05_memory_compile_errors.md, "Checked at the call").
+fn shw_impl(where_clause: Str) -> Str {
+    "trait Shw \{\n    fn shw(self) -> Int\n}\n\nimpl[T] Shw for Bx[T] where {where_clause} \{\n    fn shw(self) -> Int \{\n        0\n    }\n}"
+}
+
+test "an instance whose argument implements the trait at other arguments does not meet a where-bound" {
+    bound_probe(".tmp/_tc_where_wrong.bl", bounded_src(shw_impl("T: Tr[Str]"), "Bx \{ t: Pt \{ v: 1 } }.shw()"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied"), "expected E0306 at the call, got:\n{p}")
+    assert(p.contains("Tr[Str]") && p.contains("Tr[Int]"), "expected the message to name Tr[Str] and Pt's Tr[Int], got:\n{p}")
+}
+
+test "an instance whose argument implements the trait at the where-bound's arguments meets it" {
+    bound_probe(".tmp/_tc_where_right.bl", bounded_src(shw_impl("T: Tr[Int]"), "Bx \{ t: Pt \{ v: 1 } }.shw()"))
+    let p = problems_reported()
+    assert(p == "", "expected no problems, got:\n{p}")
+}
+
+test "an instance whose argument has no impl of a user trait does not meet a where-bound" {
+    bound_probe(".tmp/_tc_where_noimpl.bl", bounded_src(shw_impl("T: Other"), "Bx \{ t: Pt \{ v: 1 } }.shw()"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied") && p.contains("Other"), "expected E0306 naming Other, got:\n{p}")
+}
+
+test "the second of two where-bounds is checked at its arguments" {
+    bound_probe(".tmp/_tc_where_two.bl", bounded_src(shw_impl("T: Plain + Tr[Str]"), "Bx \{ t: Pt \{ v: 1 } }.shw()"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied") && p.contains("Tr[Str]"), "expected E0306 naming Tr[Str], got:\n{p}")
+}
+
+test "a where-bound argument naming another impl binder is read at the instance's type for it" {
+    let decls = "type Two[A, B] \{\n    a: A\n    b: B\n}\n\ntrait Shw \{\n    fn shw(self) -> Int\n}\n\nimpl[A, B] Shw for Two[A, B] where A: Tr[B] \{\n    fn shw(self) -> Int \{\n        0\n    }\n}"
+    bound_probe(".tmp/_tc_where_tv_bad.bl", bounded_src(decls, "Two \{ a: Pt \{ v: 1 }, b: \"s\" }.shw()"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied") && p.contains("Tr[Str]"), "expected E0306 naming Tr[Str] at B = Str, got:\n{p}")
+    bound_probe(".tmp/_tc_where_tv_ok.bl", bounded_src(decls, "Two \{ a: Pt \{ v: 1 }, b: 1 }.shw()"))
+    let q = problems_reported()
+    assert(q == "", "expected no problems at B = Int, got:\n{q}")
+}
+
+test "an impl whose where-bound the instance does not meet does not meet a bound on its trait" {
+    let decls = shw_impl("T: Tr[Str]").concat("\n\nfn probe[U: Shw](u: U) -> Int \{\n    u.shw()\n}")
+    bound_probe(".tmp/_tc_where_through.bl", bounded_src(decls, "probe(Bx \{ t: Pt \{ v: 1 } })"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied") && p.contains("Shw"), "expected E0306 naming Shw at the call, got:\n{p}")
+}
+
+// A bound names a trait, so a name no trait declares is the impl header's error at the bound.
+test "a bound naming no trait is reported where it is written" {
+    bound_probe(".tmp/_tc_bound_undef_fn.bl", bounded_src("fn probe[U: Nonexist](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Nonexist` is not defined"), "expected the undefined-trait error at a fn bound, got:\n{p}")
+    assert(problem_count() == 1, "expected exactly one problem, got:\n{p}")
+    bound_probe(".tmp/_tc_bound_undef_impl.bl", bounded_src("trait Shw \{\n    fn shw(self) -> Int\n}\n\nimpl[T: Nonexist] Shw for Bx[T] \{\n    fn shw(self) -> Int \{\n        0\n    }\n}", "0"))
+    let q = problems_reported()
+    assert(q.contains("TraitContract: trait `Nonexist` is not defined"), "expected the undefined-trait error at an impl binder bound, got:\n{q}")
+    bound_probe(".tmp/_tc_bound_undef_where.bl", bounded_src(shw_impl("T: Nonexist"), "0"))
+    let r = problems_reported()
+    assert(r.contains("TraitContract: trait `Nonexist` is not defined"), "expected the undefined-trait error at a where-bound, got:\n{r}")
+}
+
+test "a bound naming a type that is not a trait is reported where it is written" {
+    bound_probe(".tmp/_tc_bound_type_not_trait.bl", bounded_src("fn probe[U: Pt](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Pt` is not defined"), "expected the undefined-trait error, got:\n{p}")
+}
+
+// The arithmetic and serialization traits have no declaration to find, yet a bound may name them.
+test "a bound naming a compiler-known trait with no declaration resolves" {
+    for name in ["Add", "Neg", "Serialize", "Deserialize"] {
+        bound_probe(".tmp/_tc_bound_known_{name}.bl", bounded_src("fn probe[U: {name}](u: U) -> Int \{\n    0\n}", "0"))
+        let p = problems_reported()
+        assert(p == "", "expected `U: {name}` to resolve, got:\n{p}")
+    }
+}
+
+fn module_probe(path: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    diag_reset()
+    check_types(compile_to_program(path, 1))
+}
+
+test "a bound reads a trait another module declares, qualified or selected" {
+    module_probe("tests/zzwb_bounds/src/main_qualified.bl")
+    let p = problems_reported()
+    assert(p == "", "expected a qualified bound to resolve, got:\n{p}")
+    module_probe("tests/zzwb_bounds/src/main_selected.bl")
+    let q = problems_reported()
+    assert(q == "", "expected a selected bound to resolve, got:\n{q}")
+}
+
+test "a qualified bound naming no trait of that module is reported" {
+    module_probe("tests/zzwb_bounds/src/main_qualified_missing.bl")
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `zzwb_traits.ZNope` is not defined"), "expected the undefined-trait error, got:\n{p}")
+}
+
+test "a bound naming another module's private trait is reported" {
+    module_probe("tests/zzwb_bounds/src/main_qualified_private.bl")
+    let p = problems_reported()
+    assert(p.contains("PrivateItemAccess") && p.contains("ZHidden"), "expected a private-access error, got:\n{p}")
+}
+
+test "a bound naming a trait the import list does not select is reported" {
+    module_probe("tests/zzwb_bounds/src/main_unselected.bl")
+    let p = problems_reported()
+    assert(p.contains("ImportNotSelected") && p.contains("ZOther"), "expected ImportNotSelected naming ZOther, got:\n{p}")
+}
