@@ -17,7 +17,7 @@
 #                    through to corpus_one.sh (default: the compiler's own)
 #   CORPUS_COMPILER_ARCHIVE  0 builds every file in one unit, with no compiler
 #                    archive (default 1). For a compiler that predates the
-#                    archive, such as the pinned gen0 the suites run under.
+#                    archive, such as the pinned gen0.
 #   CORPUS_PER_MODULE  1 runs the per-module mode (default 0, which exports
 #                    BLINK_PER_MODULE=0 for the one-unit build): every build,
 #                    the row's own and each one its test starts through the

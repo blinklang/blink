@@ -49,9 +49,9 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
 | `task commit-messages` | Runs `scripts/lint_commit_messages.sh` over `main..HEAD`, or over `HEAD^..HEAD` when HEAD is on main, so the main gate checks a merge message and every commit it brought. It matches every token that `br` lists as a ticket or project id. Without `br` it checks only the forms `br <id>`, `ticket: <id>` and `#<id>`, and says so. | A message names a br id. |
 | `task test-lint` | Runs `scripts/test_lint_codegen.sh`: each row goes red on a fixture. | A row does not catch its construct. |
 | `task ratchet` | Debt counts over the whole compiler (see below), then the lint. | A count rises, on the tip or on any commit of the branch, or a zero-gate row is not zero. |
-| `task suites-in-corpus` | Reads `build/corpus.json` and requires every file of the typecheck and rewrite suites to be there with status `pass`. The corpus runs each of them under gen1, so `task ci` uses this check in place of the gen0 suite runs; `task ci-fast` still runs the suites. | A suite file is missing or did not pass, a suite selects no file, or the JSON is not from gen1 at this commit and blinkc hash. |
-| `task typecheck-suite` | Runs the files in `scripts/typecheck_suite.txt` under gen0. They assert typechecker behaviour by RUNNING, so they need a compiler that can emit; under gen0 the suite measures gen0's typechecker, not this tree's. | Any file does not pass. |
-| `task rewrite-suite` | Runs every rewrite unit-test file under gen0: `tests/test_cg_*.bl`, `test_layout_*.bl`, `test_cname_*.bl`, `test_ir_*.bl`, minus `scripts/rewrite_suite_exclude.txt`. Writes `build/rewrite_suite.json`. | Any file does not pass, a prelude root is missing, one of the four prefixes matches no file, the exclude file is gone, or an exclude line names a file that does not exist or that the glob does not select. |
+| `task suites-in-corpus` | Reads `build/corpus.json` and requires every file of the typecheck and rewrite suites to be there with status `pass`. The corpus runs each of them under gen1, so `task ci` uses this check in place of the suite runs; `task ci-fast`, which has no full corpus, runs the suites. | A suite file is missing or did not pass, a suite selects no file, or the JSON is not from gen1 at this commit and blinkc hash. |
+| `task typecheck-suite` | Runs the files in `scripts/typecheck_suite.txt` under gen1. They assert typechecker behaviour by RUNNING: their probes compile programs in process through this tree's typechecker, against this tree's `lib/`. Writes `build/typecheck_suite.json`. | Any file does not pass. |
+| `task rewrite-suite` | Runs every rewrite unit-test file under gen1: `tests/test_cg_*.bl`, `test_layout_*.bl`, `test_cname_*.bl`, `test_ir_*.bl`, minus `scripts/rewrite_suite_exclude.txt`. Writes `build/rewrite_suite.json`. | Any file does not pass, a prelude root is missing, one of the four prefixes matches no file, the exclude file is gone, or an exclude line names a file that does not exist or that the glob does not select. |
 | `task ci-release` | The old full gate: self-host regen, `blink test`, per-module invariants, installed smoke, `corpus-per-module`. | Any step fails. |
 | `task corpus-per-module` | Runs the corpus with `CORPUS_PER_MODULE=1`: every build is per-module and no build links the compiler archive. Writes `build/corpus_per_module.json`, then runs `scripts/corpus_per_module_check.sh`. | A file fails that `scripts/corpus_per_module_known_failures.txt` does not name, a named file passes or does not exist, a passing file did not build in units, or the run does not cover every `tests/test_*.bl` file. |
 
@@ -64,9 +64,8 @@ build provides. `task test-fmt` and `task ci-release` run all three.
 
 `task rewrite-suite` runs `scripts/rewrite_suite.sh`. These files test the
 rewrite layer directly: `cg_*`, `layout`, `cname` and `ir`. They test it by
-RUNNING, so they need a compiler that can emit C. This tree cannot, so the
-suite runs under gen0 and measures this tree's rewrite sources compiled by
-the pin.
+RUNNING, under gen1, with this tree's `lib/` as the prelude, so the suite
+measures this tree's rewrite sources and stdlib.
 
 The file list is a glob over four prefixes, not a list file: a new test file
 joins the suite by existing, and nobody can forget it. To keep a file out,

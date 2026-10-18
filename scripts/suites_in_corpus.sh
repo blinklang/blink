@@ -1,6 +1,6 @@
 #!/bin/bash
 # Require that every typecheck-suite and rewrite-suite file passed in the
-# whole-tree corpus run, in place of running the suites again under gen0.
+# whole-tree corpus run, in place of running the suites again.
 #
 #   scripts/suites_in_corpus.sh
 #

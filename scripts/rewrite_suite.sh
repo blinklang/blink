@@ -1,20 +1,20 @@
 #!/bin/bash
-# Run every rewrite unit-test file under the pinned gen0 and require that all
-# of them pass. These files test the rewrite layer (cg, layout, cname, ir) by
-# RUNNING, so they need a compiler that can emit C. This tree cannot, which is
-# why they run under gen0.
+# Run every rewrite unit-test file under gen1 and require that all of them
+# pass. These files test the rewrite layer (cg, layout, cname, ir) by RUNNING:
+# their probes compile programs in process through this tree's compiler
+# sources, against this tree's lib/.
 #
 #   scripts/rewrite_suite.sh
 #
 # Env:
-#   REWRITE_SUITE_COMPILER  dir holding blink/blinkc (default build/gen0)
+#   REWRITE_SUITE_COMPILER  dir holding blink/blinkc (default build/gen1)
 #   REWRITE_SUITE_OUT       output JSON (default build/rewrite_suite.json)
 #
 # scripts/rewrite_suite_list.sh selects the files.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
-comp="${REWRITE_SUITE_COMPILER:-build/gen0}"
+comp="${REWRITE_SUITE_COMPILER:-build/gen1}"
 out="${REWRITE_SUITE_OUT:-build/rewrite_suite.json}"
 
 # corpus.sh and rewrite_suite_list.sh check their own tools. These are the ones
@@ -73,15 +73,10 @@ list=$(./scripts/rewrite_suite_list.sh) || exit 2
 # total empty, `[ "" != "" ]` is false, and the gate reports ok on a run that
 # never happened.
 set -e
-# CORPUS_PRELUDE_LIB: a sandbox exposes the compiler's own lib/ as the prelude by
-# default, and under gen0 that is a PINNED stdlib. These probes compile programs in
-# process through THIS tree's compiler sources, so they must read this tree's stdlib;
-# otherwise a stdlib change here is invisible to all of them and a diagnostic this
-# tree adds fires against a stdlib this tree cannot fix.
 # Exit 1 is a failing file, which the count below reports; only 2 stops here.
-# CORPUS_COMPILER_ARCHIVE=0: the default compiler, the pinned gen0, predates the
-# compiler archive.
-CORPUS_COMPILER_ARCHIVE=0 CORPUS_PRELUDE_LIB="$(pwd)/lib" CORPUS_COMPILER="$comp" CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint || [ $? -eq 1 ]
+# Each sandbox exposes the compiler's own lib/ as the prelude, and gen1's links
+# this tree's, so the run is the corpus's own for these files.
+CORPUS_COMPILER="$comp" CORPUS_OUT="$out" ./scripts/corpus.sh --only "$list" --no-lint || [ $? -eq 1 ]
 passed=$(jq -r .passed "$out")
 total=$(jq -r .total "$out")
 selected=$(wc -l < "$list" | tr -d ' ')
