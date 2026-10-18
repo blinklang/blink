@@ -1,0 +1,96 @@
+// While an operation body of a handler runs, that handler is not in force for the effect it
+// handles (spec §4.7.1). A call through the effect's handle reaches the handler this one was
+// installed over, whether the body writes the call itself, calls a function that makes it,
+// or calls a closure that makes it. When the operation returns or panics, the handler is in
+// force again.
+
+import compile_test_helpers
+
+fn log_src(body: Str) -> Str {
+    let head = #"effect Log {
+    effect W {
+        fn write(m: Str) -> Str
+    }
+}
+
+fn via(m: Str) -> Str ! Log { log.write(m) }
+
+fn outer() -> Handler[Log] {
+    handler Log {
+        fn write(m: Str) -> Str { "outer:{m}" }
+    }
+}
+"#
+    "{head}{body}"
+}
+
+test "a function called from an operation body reaches the enclosing handler" {
+    let r = compile_test_helpers.compile_and_run(log_src(#"
+fn main() {
+    with outer() {
+        with handler Log { fn write(m: Str) -> Str { "inner({via(m)})" } } {
+            io.println(log.write("a"))
+        }
+    }
+}
+"#), "op_body_fn_reaches_outer")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("inner(outer:a)"))
+}
+
+test "a closure called from an operation body reaches the enclosing handler" {
+    let r = compile_test_helpers.compile_and_run(log_src(#"
+fn apply(f: fn(Str) -> Str, m: Str) -> Str { f(m) }
+
+fn main() {
+    with outer() {
+        with handler Log {
+            fn write(m: Str) -> Str { "inner({apply(fn(x: Str) -> Str { log.write(x) }, m)})" }
+        } {
+            io.println(log.write("b"))
+        }
+    }
+}
+"#), "op_body_closure_reaches_outer")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("inner(outer:b)"))
+}
+
+test "the handler is in force again once its operation returns" {
+    let r = compile_test_helpers.compile_and_run(log_src(#"
+fn main() {
+    with outer() {
+        with handler Log { fn write(m: Str) -> Str { "inner({via(m)})" } } {
+            io.println(log.write("c"))
+            io.println(via("d"))
+        }
+    }
+}
+"#), "op_body_handler_back_after_return")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("inner(outer:c)"))
+    assert(r.out.contains("inner(outer:d)"))
+}
+
+test "the handler is in force again once its operation panics" {
+    let src = log_src(#"
+fn boom(m: Str) -> Str ! Log {
+    if m == "x" { panic("boom") }
+    log.write(m)
+}
+
+test "a panic in an operation restores its handler" {
+    with outer() {
+        with handler Log { fn write(m: Str) -> Str { "inner({boom(m)})" } } {
+            assert_panics(matching: "boom") {
+                let _ = log.write("x")
+            }
+            assert_eq(log.write("e"), "inner(outer:e)")
+        }
+    }
+}
+"#)
+    let r = compile_test_helpers.compile_and_run_test_json(src, "op_body_handler_back_after_panic")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("\"passed\":1"))
+}

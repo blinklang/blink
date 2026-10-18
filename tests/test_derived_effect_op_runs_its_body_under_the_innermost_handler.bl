@@ -286,3 +286,102 @@ fn main() {
     let out = compile_test_helpers.compile_and_capture(src, "derived_op_default_rejected")
     compile_test_helpers.expect_contains(out, "`default` is only valid inside a handler operation body", "default in a derived body")
 }
+
+test "default.op on a derived op runs its body over the enclosing handler" {
+    let r = run_kv(#"
+fn logging_both() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn fetch(key: Str) -> Str { default.fetch("x{key}") }
+        fn shout(key: Str) -> Str { default.shout(key) }
+    }
+}
+
+fn main() {
+    with real() {
+        with logging_both() {
+            io.println(kv.shout("n"))
+        }
+    }
+}
+"#, "derived_op_default_over_enclosing")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("real-n!"))
+    assert(!r.out.contains("real-xn"))
+}
+
+test "a primitive clause that calls a derived op of its own effect reaches the enclosing handler" {
+    let r = run_kv(#"
+fn via_shout() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn fetch(key: Str) -> Str { kv.shout("in-{key}") }
+    }
+}
+
+fn via_default() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn fetch(key: Str) -> Str { default.shout("df-{key}") }
+    }
+}
+
+fn main() {
+    with real() {
+        with via_shout() {
+            io.println(kv.fetch("o"))
+        }
+        with via_default() {
+            io.println(kv.fetch("p"))
+        }
+    }
+}
+"#, "derived_op_from_primitive_clause")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("real-in-o!"))
+    assert(r.out.contains("real-df-p!"))
+}
+
+test "a derived body may open an async scope" {
+    let r = compile_test_helpers.compile_and_run(#"effect Kv {
+    effect Get {
+        fn fetch(key: Str) -> Str
+        fn par(key: Str) -> Str {
+            async.scope {
+                let t = async.spawn(fn() -> Str { kv.fetch(key) })
+                t.await
+            }
+        }
+    }
+}
+
+fn main() {
+    with handler Kv { fn fetch(key: Str) -> Str { "got-{key}" } } {
+        io.println(kv.par("q"))
+    }
+}
+"#, "derived_op_async_scope")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("got-q"))
+}
+
+test "a derived body is checked for a mutable capture in a spawned task" {
+    let src = #"effect Kv {
+    effect Get {
+        fn fetch(key: Str) -> Str
+        fn count(key: Str) -> Int {
+            let mut c = 0
+            async.scope {
+                async.spawn(fn() { c = c + 1 })
+            }
+            c
+        }
+    }
+}
+
+fn main() {
+    with handler Kv { fn fetch(key: Str) -> Str { key } } {
+        io.println("{kv.count("r")}")
+    }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "derived_op_spawn_mut_capture")
+    compile_test_helpers.expect_contains(out, "MutableCaptureInSpawn", "mutable capture in a derived body")
+}

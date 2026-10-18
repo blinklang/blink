@@ -41,7 +41,7 @@ import cg_print.{
     DefaultSlot, print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
     print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
 }
-import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
+import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_decls}
 import cg_promote.{cg_promote_capture_table}
 import free_names.{closure_read_names}
 import cg_decl.{cg_decl_takes_ev}
@@ -695,25 +695,23 @@ fn omitted_derived_ops(tid: Int, written: List[Int]) -> List[DefaultSlot] {
     let mut out: List[DefaultSlot] = []
     let eff = tc_tid_handler_effect(tid)
     let root = tc_handler_effect_root(eff)
+    let decl = cg_reg_effect_root_decl(eff)
+    let children = if decl == -1 { -1 } else { node_elements(decl) }
     let mut names: List[Str] = []
     for w in written { names.push(node_name(w)) }
-    for e in cg_reg_effect_decls() {
-        if node_name(e) != root { continue }
-        let children = node_elements(e)
-        let mut ci = 0
-        while children != -1 && ci < sublist_length(children) {
-            let child = sublist_get(children, ci)
-            ci = ci + 1
-            if eff != root && eff != "{root}.{node_name(child)}" { continue }
-            let ops = node_methods(child)
-            let mut oi = 0
-            while ops != -1 && oi < sublist_length(ops) {
-                let op = sublist_get(ops, oi)
-                oi = oi + 1
-                if node_body(op) == -1 || names.contains(node_name(op)) { continue }
-                let slot = c_effect_vtable_slot_name(tid, node_name(op))
-                out.push(DefaultSlot { slot: slot, userdata: c_vtable_userdata_member(slot), symbol: c_effect_default_op_name(tid, node_name(op)) })
-            }
+    let mut ci = 0
+    while children != -1 && ci < sublist_length(children) {
+        let child = sublist_get(children, ci)
+        ci = ci + 1
+        if eff != root && eff != "{root}.{node_name(child)}" { continue }
+        let ops = node_methods(child)
+        let mut oi = 0
+        while ops != -1 && oi < sublist_length(ops) {
+            let op = sublist_get(ops, oi)
+            oi = oi + 1
+            if node_body(op) == -1 || names.contains(node_name(op)) { continue }
+            let slot = c_effect_vtable_slot_name(tid, node_name(op))
+            out.push(DefaultSlot { slot: slot, userdata: c_vtable_userdata_member(slot), symbol: c_effect_default_op_name(tid, node_name(op)) })
         }
     }
     out
@@ -1095,7 +1093,20 @@ fn with_capture_prologue(th: PendingThunk, body: Int) -> Int ! Diag.Report {
         stmts.push(s)
         i = i + 1
     }
-    stmts.push(body)
+    if !is_op {
+        stmts.push(body)
+        return ir_block(th.closure, stmts)
+    }
+    // A handler is not in force while one of its own operations runs (§4.7.1), and that
+    // holds for the functions and closures the body calls, which read the vector and not
+    // the outer local. So the body runs with the copied-from handler in the field, and the
+    // install's cleanup puts this one back on return and on panic.
+    let field = ev_field_of(th.handler_tid, th.closure)
+    if field == "" { return -1 }
+    let rec = perform_layout(th.handler_tid, Position.Local, th.closure)
+    if rec.c_spelling == "" { return -1 }
+    let outer = ir_var_ref(th.handler_tid, th.closure, rec.c_spelling, th.outer_name, SlotForm.PointerBoxed)
+    stmts.push(ir_handler_install(th.closure, field, outer, body))
     ir_block(th.closure, stmts)
 }
 
@@ -1588,11 +1599,11 @@ fn slot_read(node: Int, handler_tid: Int) -> Int ! Diag.Report {
     let rec = perform_layout(handler_tid, Position.Local, node)
     if rec.c_spelling == "" { return -1 }
     // Inside a handler operation, a perform of the root that operation handles reaches the
-    // handler this one was copied from. The vector holds this very operation, so reading it
-    // here would call the operation from its own body and recurse until the stack ran out,
-    // silently, because the C is well formed. Every other root reads the vector, or a handler
-    // installed around this one would be missed. Two handler tids of one root own one field,
-    // so the field is the comparison the vtable identity rule already makes.
+    // handler this one was copied from. The prologue installs that handler in the field for
+    // the body, so the vector would answer the same; the local spares the read. Every other
+    // root reads the vector, or a handler installed around this one would be missed. Two
+    // handler tids of one root own one field, so the field is the comparison the vtable
+    // identity rule already makes.
     if eff_op_outer_name != "" && eff_op_field == field {
         // The operation's prologue binds this local out of the operation's own word 0.
         return ir_var_ref(handler_tid, node, rec.c_spelling, eff_op_outer_name, SlotForm.PointerBoxed)
