@@ -39,7 +39,7 @@ import typecheck.{
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_tid_name, tc_mc_obj_is_value,
     tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_conversion_impl_for, tc_conversion_trait_of, CONVERSION_IS_IDENTITY,
     tc_tid_same_type, make_option_type, make_fn_type,
-    TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
+    TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID, TYPE_NEVER,
     type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
 }
 import layout.{
@@ -56,7 +56,7 @@ import cg_reg.{cg_reg_fn_decls, cg_reg_fns_named, cg_reg_impl_decls, cg_reg_trai
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
-    c_runtime_helper, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_str_const, c_field_name,
+    c_runtime_helper, c_panic_dispatcher, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_str_const, c_field_name,
     cname_ffi_struct_mirror, c_local_name,
     c_variant_discriminant, c_variant_member_name,
     c_container_ctor, c_pool_global,
@@ -1541,6 +1541,7 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
 // keyed container's bare constructor, and the rest), and falls to the same refusal a
 // declaration miss would reach.
 fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
+    if cc_panicking_builtin(name) != "" { return cc_lower_panic(node) }
     let ptr_ctor = cc_ptr_ctor_op(name)
     if ptr_ctor != "" { return cc_lower_ptr_ctor(node, name, ptr_ctor) }
     let symbol = cc_builtin_free_symbol(name)
@@ -1561,6 +1562,39 @@ fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
     }
     if cc_is_keyed_container(cc_kind(answer)) { return cc_container_new(node, cc_kind(answer)) }
     cc_no_such_callee(node)
+}
+
+// The bare builtins that end in the panic dispatcher, each mapped to itself so the dispatch
+// above reads one table, as cc_ptr_ctor_op does.
+fn cc_panicking_builtin(name: Str) -> Str {
+    let mut table: Map[Str, Str] = Map()
+    table.insert("panic", "panic")
+    table.get(name) ?? ""
+}
+
+// `panic(msg)` hands the panic dispatcher the sentence every other panic says, naming the
+// call's own position. The call is Never-typed, so each seam that reads a value drops its
+// slot the way it does for any diverging call.
+fn cc_lower_panic(node: Int) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_free_arity_wrong(node, "panic", 1, given) }
+    let g = cc_guard_spellings(node)
+    if cc_guard_stopped(g) { return -1 }
+    let said = lower_expr_as_value(sublist_get(node_args(node), 0))
+    if said < 0 { return -1 }
+    let text = format_spec_of(TYPE_STR)
+    let tabled = ir_line_tabled(node)
+    let fmt = cc_panic_sentence(text, "", text, if tabled { format_spec_of(TYPE_INT) } else { text })
+    let args = [
+        ir_const(TYPE_STR, node, g.message, c_str_const(fmt)),
+        said,
+        ir_const(TYPE_STR, node, g.message, c_str_const(cc_panic_file(node))),
+        if tabled { cc_panic_line_value(node) } else { ir_const(TYPE_STR, node, g.message, c_str_const(cc_panic_line(node))) },
+    ]
+    let message = ir_call_runtime(TYPE_STR, node, g.message, c_runtime_helper("str_format"), g.message_form, args)
+    let rec = cc_local(TYPE_NEVER, node)
+    if cc_stopped(rec) { return -1 }
+    ir_call_runtime(TYPE_NEVER, node, rec.c_spelling, c_panic_dispatcher(), rec.slot_form, [message])
 }
 
 // The two bare pointer constructors, each mapped to itself so the dispatch below reads one

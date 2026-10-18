@@ -1,0 +1,200 @@
+// `panic(msg)` (§2.20) unwinds with its message. In a test block the runner catches it, so
+// `assert_panics(matching:)` sees the message, and a `with` resource opened inside the block
+// is closed on the way out (§4.6.3). Outside a test it ends the process: the message goes to
+// stderr and the exit status is not zero. A call whose callee declares `-> Never` diverges in
+// every position a value can stand in, so no code after it runs and no value is read from it.
+
+import compile_test_helpers.{compile_and_run, compile_and_run_test_json}
+
+let mut panic_log: List[Str] = []
+
+fn panic_log_has(needle: Str) -> Bool {
+    for s in panic_log {
+        if s == needle { return true }
+    }
+    false
+}
+
+type PanicRes { id: Int }
+
+impl Closeable for PanicRes {
+    fn close(self) { panic_log.push("closed:{self.id}") }
+}
+
+fn takes_int(i: Int) -> Int { i + 1 }
+
+fn tail_panics(n: Int) -> Int {
+    if n > 0 { return n }
+    panic("tail boom {n}")
+}
+
+fn arm_panics(n: Int) -> Str {
+    match n {
+        0 => "zero"
+        _ => panic("arm boom")
+    }
+}
+
+fn default_panics(o: Option[Int]) -> Int { o ?? panic("default boom") }
+
+fn arg_panics() -> Int { takes_int(panic("arg boom")) }
+
+fn fail(m: Str) -> Never { panic("config: {m}") }
+
+fn port(raw: Str) -> Int {
+    if raw == "" { return 8080 }
+    fail("bad port")
+}
+
+fn never_default(o: Option[Str]) -> Str { o ?? fail("no name") }
+
+type Pair { a: Int, b: Str }
+type Outer { n: Int, p: Pair }
+
+fn takes_pair(p: Pair) -> Int { p.a }
+fn takes_two(a: Int, b: Int) -> Int { a + b }
+
+fn noted(tag: Str) -> Int {
+    panic_log.push(tag)
+    1
+}
+
+fn struct_arg_panics() -> Int { takes_pair(panic("struct arg boom")) }
+fn struct_payload_panics() -> Option[Pair] { Some(panic("struct payload boom")) }
+fn struct_field_panics() -> Outer { Outer { n: 1, p: panic("struct field boom") } }
+fn struct_elem_panics() -> List[Pair] { [Pair { a: 1, b: "x" }, panic("struct elem boom")] }
+fn operand_panics(x: Int) -> Int { x + panic("operand boom") }
+
+fn let_panics() -> Int {
+    let v = takes_pair(panic("let boom"))
+    v + 1
+}
+
+fn order_arg_panics() -> Int { takes_two(noted("arg before"), panic("order arg boom")) }
+fn order_operand_panics() -> Int { noted("operand before") + panic("order operand boom") }
+
+test "a panic in a fn tail is caught with its message" {
+    assert_eq(tail_panics(2), 2)
+    assert_panics(matching: "tail boom 0") {
+        let _ = tail_panics(0)
+    }
+}
+
+test "the message names the panic and where it was raised" {
+    assert_panics(matching: "panic: tail boom -1 at ") {
+        let _ = tail_panics(-1)
+    }
+}
+
+test "a panic in a match arm, a ?? default and a call argument is caught" {
+    assert_eq(arm_panics(0), "zero")
+    assert_panics(matching: "arm boom") {
+        let _ = arm_panics(1)
+    }
+    assert_eq(default_panics(Some(4)), 4)
+    assert_panics(matching: "default boom") {
+        let _ = default_panics(None)
+    }
+    assert_panics(matching: "arg boom") {
+        let _ = arg_panics()
+    }
+}
+
+test "a panic in a closure is caught" {
+    let c = fn(i: Int) -> Int { if i > 0 { i } else { panic("closure boom") } }
+    assert_eq(c(3), 3)
+    assert_panics(matching: "closure boom") {
+        let _ = c(0)
+    }
+}
+
+test "a user fn declared -> Never diverges like panic" {
+    assert_eq(port(""), 8080)
+    assert_panics(matching: "config: bad port") {
+        let _ = port("x")
+    }
+    assert_eq(never_default(Some("n")), "n")
+    assert_panics(matching: "config: no name") {
+        let _ = never_default(None)
+    }
+}
+
+// No value of the slot's type exists to hand the reader, so the call ends the statement
+// wherever its value would have gone, whatever that slot's type is.
+test "a panic where a struct, a payload, a field, an element or an operand is wanted is caught" {
+    assert_panics(matching: "struct arg boom") {
+        let _ = struct_arg_panics()
+    }
+    assert_panics(matching: "struct payload boom") {
+        let _ = struct_payload_panics()
+    }
+    assert_panics(matching: "struct field boom") {
+        let _ = struct_field_panics()
+    }
+    assert_panics(matching: "struct elem boom") {
+        let _ = struct_elem_panics()
+    }
+    assert_panics(matching: "operand boom") {
+        let _ = operand_panics(2)
+    }
+    assert_panics(matching: "let boom") {
+        let _ = let_panics()
+    }
+}
+
+// §2.22: operands run in written order, so the work written before the panic runs first.
+test "the work written before a panic in the same expression runs first" {
+    assert_panics(matching: "order arg boom") {
+        let _ = order_arg_panics()
+    }
+    assert(panic_log_has("arg before"))
+    assert_panics(matching: "order operand boom") {
+        let _ = order_operand_panics()
+    }
+    assert(panic_log_has("operand before"))
+}
+
+test "a with resource is closed when panic unwinds through it" {
+    assert_panics(matching: "inside with") {
+        with PanicRes { id: 5 } as _r {
+            panic_log.push("inside:5")
+            panic("inside with")
+            panic_log.push("after:5")
+        }
+    }
+    assert(panic_log_has("inside:5"))
+    assert(panic_log_has("closed:5"))
+    assert(!panic_log_has("after:5"))
+}
+
+test "a panic in main writes its message to stderr and exits non-zero" {
+    let src = "import std.io\nfn main() \{\n    io.println(\"before\")\n    panic(\"production boom\")\n    io.println(\"after\")\n}\n"
+    let r = compile_and_run(src, "_panic_builtin_main")
+    assert_eq(r.exit_code, 1)
+    assert(r.out.contains("before"))
+    assert(!r.out.contains("after"))
+    assert(r.err_out.contains("panic: production boom at "))
+}
+
+test "a panic in a ?? default in main ends the process" {
+    let src = "fn pick(o: Option[Int]) -> Int \{ o ?? panic(\"no value\") }\nfn main() \{\n    let _ = pick(None)\n}\n"
+    let r = compile_and_run(src, "_panic_builtin_default")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("panic: no value at "))
+}
+
+// env.exit is the other built-in that returns Never; its call in a `??` default must build
+// the same way panic's does.
+test "env.exit in a ?? default ends the process with its code" {
+    let src = "fn pick(o: Option[Int]) -> Int ! Env.Exit \{ o ?? env.exit(4) }\nfn main() ! Env.Exit \{\n    let _ = pick(None)\n}\n"
+    let r = compile_and_run(src, "_panic_builtin_env_exit_default")
+    assert_eq(r.exit_code, 4)
+}
+
+test "a panic a test does not expect fails that test and the runner goes on" {
+    let src = "test \"first\" \{\n    panic(\"unexpected\")\n}\n\ntest \"second\" \{\n    assert(1 == 1)\n}\n"
+    let r = compile_and_run_test_json(src, "_panic_builtin_runner")
+    assert(r.out.contains("unexpected"))
+    assert(r.out.contains("\"passed\":1"))
+    assert(r.out.contains("\"failed\":1"))
+}

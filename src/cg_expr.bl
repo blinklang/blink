@@ -472,6 +472,46 @@ fn x_take_from(mark: Int) -> List[Int] {
     out
 }
 
+// Where a run of statements stops for good: the first marker that control never passes,
+// or -1. A Never call run for its effect is followed by one, and whatever was lowered
+// after it reads a value that does not exist, so it is dead and goes with the marker.
+fn x_leave_index(stmts: List[Int]) -> Int {
+    let mut i = 0
+    while i < stmts.len() {
+        if ir_kind(stmts.get(i).unwrap()) == IrKind.Unreachable { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn x_cut_after_leave(stmts: List[Int], at: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i <= at {
+        out.push(stmts.get(i).unwrap())
+        i = i + 1
+    }
+    out
+}
+
+// The index past `mark` at which the pending statements stop for good, or -1. A statement
+// whose values left the block while cg_stmt materialised them is not lowered.
+pub fn cg_expr_pending_leaves_from(mark: Int) -> Int {
+    let at = x_leave_index(x_pending_from(mark))
+    if at < 0 { return -1 }
+    mark + at
+}
+
+fn x_pending_from(mark: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = mark
+    while i < cx_pending.len() {
+        out.push(cx_pending.get(i).unwrap())
+        i = i + 1
+    }
+    out
+}
+
 // Declares a temp of `tid` and answers its name. init < 0 declares without initialising.
 fn x_bind(tid: Int, node: Int, init: Int) -> Str ! Diag.Report {
     let rec = x_local(tid, node)
@@ -752,6 +792,7 @@ pub fn lower_expr_as_value(node: Int) -> Int ! Diag.Report {
     if tid < 0 || !x_is_void_like(tid) { return produced }
     if !x_has_effect(produced) { return produced }
     x_hoist(ir_expr_stmt(node, produced))
+    if x_kind(tid) == TyKind.Never { x_hoist(ir_unreachable(node)) }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
     ir_const(tid, node, rec.c_spelling, "0")
@@ -1161,8 +1202,9 @@ fn lower_short_circuit_guarded(node: Int, tid: Int, op: Str, lhs: Int, rhs: Int,
     if name == "" { return -1 }
     let target = x_ref(tid, node, name)
     if target < 0 { return -1 }
-    let mut stmts = arm
-    stmts.push(ir_assign(node, target, rhs))
+    let left = x_leave_index(arm)
+    let mut stmts = if left >= 0 { x_cut_after_leave(arm, left) } else { arm }
+    if left < 0 { stmts.push(ir_assign(node, target, rhs)) }
     let mut cond = x_ref(tid, node, name)
     if cond < 0 { return -1 }
     let rec = x_local(tid, node)
@@ -1202,9 +1244,14 @@ fn lower_coalesce_arms(node: Int, opt_tid: Int, carrier: Str) -> Int ! Diag.Repo
     let fallback = lower_expr(node_right(node))
     if fallback < 0 { return -1 }
     let mut none_arm = x_take_from(mark)
-    let none_target = x_ref(tid, node, result)
-    if none_target < 0 { return -1 }
-    none_arm.push(ir_assign(node, none_target, fallback))
+    let left = x_leave_index(none_arm)
+    if left >= 0 {
+        none_arm = x_cut_after_leave(none_arm, left)
+    } else {
+        let none_target = x_ref(tid, node, result)
+        if none_target < 0 { return -1 }
+        none_arm.push(ir_assign(node, none_target, fallback))
+    }
     let some = x_payload_of(node, opt_tid, tid, carrier, Slot.Inner1, member_value)
     if some < 0 { return -1 }
     let some_target = x_ref(tid, node, result)

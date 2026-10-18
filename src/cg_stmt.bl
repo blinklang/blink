@@ -20,7 +20,7 @@ import parser.{
     get_annotation, get_str_named_arg, node_value_child_ids, node_type_params,
 }
 import typecheck.{
-    TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_STR, TYPE_VOID,
+    TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_NEVER, TYPE_STR, TYPE_VOID,
     tc_alias_to_original, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
     tc_lookup_node_tid, tc_tid_decl_node, tc_tid_kind, make_list_type,
     tc_alias_decl_of_ann, tc_ensures_preds_of, tc_is_old_snapshot, tc_requires_preds_of,
@@ -55,7 +55,7 @@ import cg_expr.{
     cg_expr_async_scope_close, cg_expr_async_scope_open, cg_expr_drain_pending, cg_expr_drop_values,
     cg_expr_frame_close, cg_expr_frame_current, cg_expr_frame_left_by_jump, cg_expr_frame_loop_enter,
     cg_expr_frame_loop_exit, cg_expr_frame_open,
-    cg_expr_is_registered, cg_expr_pending_count,
+    cg_expr_is_registered, cg_expr_pending_count, cg_expr_pending_leaves_from,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type, cg_expr_return_type,
     cg_expr_take_pending, cg_expr_value_count, lower_expr,
     cg_expr_clear_old_snapshots, cg_expr_set_old_snapshot,
@@ -1258,16 +1258,31 @@ fn lower_let(node: Int) -> Int ! Diag.Report {
     bind_and_declare_let(node, tid, rec, name, value, discard)
 }
 
+// A let whose initializer left the block before it produced a value, its names declared
+// with none, the way bind_never_let declares them.
+fn declare_let_unset(node: Int) -> Int ! Diag.Report {
+    let discard = tc_let_binder_is_discard(node) == 1
+    let tid = stmt_tid(node)
+    if tid < 0 { return -1 }
+    if !discard && node_elements(node) != -1 { return lower_destructuring_let_from(node, tid, -1) }
+    let rec = layout_at(tid, Position.Local, node)
+    let _ = ensure_typedef_for(tid)
+    bind_and_declare_let(node, tid, rec, if discard { "" } else { node_name(node) }, -1, discard)
+}
+
 // `let (a, b) = e`. The tuple binds once so the initializer runs once, and each element
 // binds from that local. A nested tuple pattern binds through another element local.
 fn lower_destructuring_let(node: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(node)
     if tid < 0 { return -1 }
+    let init = node_value(node)
+    lower_destructuring_let_from(node, tid, if init < 0 { poison_value(node) } else { lower_value(init) })
+}
+
+fn lower_destructuring_let_from(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
     let rec = layout_at(tid, Position.Local, node)
     let _ = ensure_typedef_for(tid)
     let holder = c_mint_local("tup")
-    let init = node_value(node)
-    let value = if init < 0 { poison_value(node) } else { lower_value(init) }
     let mut out: List[Int] = [ir_let(tid, node, rec.c_spelling, holder, rec.slot_form, value)]
     if !bind_tuple_pattern(node_elements(node), tid, holder, rec.c_spelling, rec.slot_form, out) {
         return -1
@@ -1470,7 +1485,14 @@ fn lower_return(node: Int) -> Int ! Diag.Report {
 fn lower_stmt_hoisted(s: Int, tail: Int, dest: Str, dest_tid: Int, out: List[Int]) -> Bool ! Diag.Report {
     let mark = cg_expr_pending_count()
     let value_mark = cg_expr_value_count()
-    let lowered = if materialise_stmt_values(s) { lower_stmt_tail(s, tail, dest, dest_tid) } else { -1 }
+    if !materialise_stmt_values(s) {
+        let _dropped = cg_expr_take_pending(mark)
+        cg_expr_drop_values(value_mark)
+        return false
+    }
+    let left = cg_expr_pending_leaves_from(mark)
+    if left >= 0 { return lower_stmt_left(s, mark, left, out) }
+    let lowered = lower_stmt_tail(s, tail, dest, dest_tid)
     if lowered < 0 {
         // The statements filled temps only the stopped statement reads, so they go nowhere,
         // and the rows naming those temps go with them.
@@ -1480,6 +1502,24 @@ fn lower_stmt_hoisted(s: Int, tail: Int, dest: Str, dest_tid: Int, out: List[Int
     }
     cg_expr_drain_pending(mark, out)
     out.push(lowered)
+    true
+}
+
+// A part the statement runs every time diverged while its values were materialised, so the
+// statement ends at the marker that follows it: what was pushed after the marker reads a
+// value that does not exist, and the statement itself is never lowered. A let still
+// declares its names with no value, because code after it must compile. The statement's
+// own work is one block, as a statement lowered whole is.
+fn lower_stmt_left(s: Int, mark: Int, left: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let _dead = cg_expr_take_pending(left + 1)
+    if nk_of(node_kind(s)) != NodeKind.LetBinding {
+        out.push(ir_block(s, cg_expr_take_pending(mark)))
+        return true
+    }
+    let declared = declare_let_unset(s)
+    if declared < 0 { return false }
+    out.push(ir_block(s, cg_expr_take_pending(mark)))
+    out.push(declared)
     true
 }
 
@@ -1686,10 +1726,47 @@ fn mv_expr(e: Int) -> Bool ! Diag.Report {
         NodeKind.InterpString => mv_after(mv_interp_holes(e), e)
         NodeKind.StructLit => mv_struct_lit(e)
         // A call's left is the callee, which runs before its arguments.
-        NodeKind.Call => mv_after(mv_call_head(node_left(e)) && mv_list(node_args(e)), e)
-        NodeKind.MethodCall => mv_after(mv_call_head(node_obj(e)) && mv_list(node_args(e)), e)
+        NodeKind.Call => mv_call(e, node_left(e))
+        NodeKind.MethodCall => mv_call(e, node_obj(e))
         _ => mv_moves_work(e)
     }
+}
+
+fn mv_call(e: Int, head: Int) -> Bool ! Diag.Report {
+    if mv_call_leaves(e) { return mv_leave_through_call(e, head) }
+    mv_after(mv_call_head(head) && mv_list(node_args(e)), e)
+}
+
+// A call of type Never that every passed work item can move above. One that sits after
+// unhoistable work -- inside an assignment's target, after a spread -- keeps its place
+// and is lowered where it stands, as before.
+fn mv_call_leaves(e: Int) -> Bool ! Diag.Report {
+    if mv_in_target { return false }
+    let tid = tc_lookup_node_tid(e)
+    if tid < 0 || tc_tid_kind(tid) != TyKind.Never { return false }
+    let mut i = 0
+    while i < mv_work.len() {
+        if !mv_work.get(i).unwrap().hoistable { return false }
+        i = i + 1
+    }
+    true
+}
+
+// Never has no value, so whatever reads this call's result is dead, and C has no value of
+// the reader's type to give it. The work passed before the call moves above it in order,
+// the call runs there as a statement with the marker after it, and the node reads a word
+// zero nothing reaches. lower_stmt_hoisted sees the marker and ends the statement there.
+fn mv_leave_through_call(e: Int, head: Int) -> Bool ! Diag.Report {
+    if !mv_hoist_pending() { return false }
+    if !mv_call_head(head) { return false }
+    if !mv_list(node_args(e)) { return false }
+    let ran = lower_expr(e)
+    if ran < 0 { return false }
+    cg_expr_push_pending(e, ir_expr_stmt(e, ran))
+    cg_expr_push_pending(e, ir_unreachable(e))
+    cg_expr_register_value(e, "0", TYPE_NEVER)
+    mv_work = []
+    true
 }
 
 // codegen fills a struct literal one declared field at a time, by name, not in the order
