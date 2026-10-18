@@ -1,0 +1,205 @@
+// Whether a nominal type has `Eq` or `Ord` is read at the instance, by one predicate that
+// `==`, `<`, `sort`, a call's `[T: Eq]` bound and an impl's bounds all ask (sections/03_types.md,
+// *Container Equality* and *Generic Type Bound Inference*). A derive on a generic type holds
+// where each type argument a field uses has the trait, so `Box[Widget]` is not `Eq` when
+// `Widget` is not; a parameter no field uses adds no bound. A written impl holds where its
+// own binder bounds and `where` bounds hold, and an unbounded `impl[T] Eq` holds for every T.
+// A refusal names the innermost type without the trait, gives the chain to it, and offers
+// the derive on that type.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    init_embedded_stdlib()
+    let path = "/tmp/zz_eqinst_{stem}.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out = out.concat("{d.name}: {d.message}\n")
+            for n in d.notes { out = out.concat("note: {n}\n") }
+            if d.help != "" { out = out.concat("help: {d.help}\n") }
+        }
+    }
+    out
+}
+
+fn assert_has(stem: Str, errs: Str, want: Str) {
+    if !errs.contains(want) { io.println("FAIL: {stem}: want '{want}', got:\n{errs}") }
+    assert(errs.contains(want))
+}
+
+fn assert_lacks(stem: Str, errs: Str, unwanted: Str) {
+    if errs.contains(unwanted) { io.println("FAIL: {stem}: did not want '{unwanted}', got:\n{errs}") }
+    assert(!errs.contains(unwanted))
+}
+
+fn assert_accepted(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    if errs != "" { io.println("FAIL: {stem}: unexpected diagnostics:\n{errs}") }
+    assert(errs == "")
+}
+
+// Each `want` line must appear in the report.
+fn assert_refused(stem: Str, src: Str, wants: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let errs = probe(stem, src)
+    for w in wants { assert_has(stem, errs, w) }
+    assert_lacks(stem, errs, "incompatible types")
+}
+
+fn decls() -> Str {
+    "type Widget \{ id: Int }\n\n@derive(Eq)\ntype Box[T] \{ v: T }\n\n@derive(Ord)\ntype Rank[T] \{ v: T }\n\n"
+}
+
+fn main_src(extra: Str, body: Str) -> Str {
+    "{decls()}{extra}fn main() \{\n{body}}\n"
+}
+
+fn same_fn() -> Str {
+    "fn same[T: Eq](a: T, b: T) -> Bool \{ a == b }\n\n"
+}
+
+fn less_fn() -> Str {
+    "fn less[T: Ord](a: T, b: T) -> Bool \{ a < b }\n\n"
+}
+
+fn eq_bound_line(ty: Str) -> Str {
+    "TraitBoundNotSatisfied: `{ty}` does not satisfy the Eq bound on type parameter T"
+}
+
+fn chain(outer: Str, inner: Str, tr: Str) -> Str {
+    "note: `{outer}` is `{tr}` only if `{inner}` is `{tr}`"
+}
+
+let WIDGET_EQ_HELP = "add `@derive(Eq)` to `type Widget`"
+let WIDGET_ORD_HELP = "add `@derive(Ord)` to `type Widget`"
+
+test "a [T: Eq] bound refuses a derived-Eq instance whose field type has no Eq" {
+    let src = main_src(same_fn(), "    let b = Box \{ v: Widget \{ id: 1 } }\n    io.println(\"\{same(b, b)}\")\n")
+    assert_refused("bound_box", src, [eq_bound_line("Box[Widget]"), chain("Box[Widget]", "Widget", "Eq"), WIDGET_EQ_HELP])
+}
+
+test "a [T: Eq] bound reads a nested instance down to the type with no Eq" {
+    let src = main_src(same_fn(), "    let b = Box \{ v: Box \{ v: Widget \{ id: 1 } } }\n    io.println(\"\{same(b, b)}\")\n")
+    assert_refused("bound_nested", src, [eq_bound_line("Box[Box[Widget]]"), chain("Box[Box[Widget]]", "Box[Widget]", "Eq"),
+        chain("Box[Widget]", "Widget", "Eq"), WIDGET_EQ_HELP])
+}
+
+test "a [T: Eq] bound reads a List of a derived instance through its element" {
+    let src = main_src(same_fn(), "    let xs = [Box \{ v: Widget \{ id: 1 } }]\n    io.println(\"\{same(xs, xs)}\")\n")
+    assert_refused("bound_list", src, [eq_bound_line("List[Box[Widget]]"), chain("List[Box[Widget]]", "Box[Widget]", "Eq"),
+        chain("Box[Widget]", "Widget", "Eq"), WIDGET_EQ_HELP])
+}
+
+test "a [T: Eq] bound reads a derived generic enum at its payloads" {
+    let extra = "@derive(Eq)\ntype Slot[T] \{\n    Held(v: T)\n    Empty\n}\n\n{same_fn()}"
+    let src = main_src(extra, "    let a: Slot[Widget] = Slot.Empty\n    io.println(\"\{same(a, a)}\")\n")
+    assert_refused("bound_enum", src, [eq_bound_line("Slot[Widget]"), chain("Slot[Widget]", "Widget", "Eq"), WIDGET_EQ_HELP])
+}
+
+test "a [T: Eq] bound refuses an instance with one bad argument of two" {
+    let extra = "@derive(Eq)\ntype Pair[A, B] \{ a: A, b: B }\n\n{same_fn()}"
+    let src = main_src(extra, "    let p = Pair \{ a: 1, b: Widget \{ id: 1 } }\n    io.println(\"\{same(p, p)}\")\n")
+    assert_refused("bound_pair", src, [eq_bound_line("Pair[Int, Widget]"), chain("Pair[Int, Widget]", "Widget", "Eq"), WIDGET_EQ_HELP])
+}
+
+test "a [T: Eq] bound on a plain struct with no Eq offers the derive" {
+    let src = main_src(same_fn(), "    let w = Widget \{ id: 1 }\n    io.println(\"\{same(w, w)}\")\n")
+    assert_refused("bound_plain", src, [eq_bound_line("Widget"), WIDGET_EQ_HELP])
+}
+
+test "a derived Eq or Ord instance is accepted where its arguments have the trait" {
+    assert_accepted("bound_box_int", main_src(same_fn(), "    io.println(\"\{same(Box \{ v: 1 }, Box \{ v: 2 })}\")\n"))
+    assert_accepted("bound_box_nested_int", main_src(same_fn(), "    let b = Box \{ v: Box \{ v: \"a\" } }\n    io.println(\"\{same(b, b)}\")\n"))
+    let extra = "@derive(Eq)\ntype Pair[A, B] \{ a: A, b: B }\n\n{same_fn()}"
+    assert_accepted("bound_pair_ok", main_src(extra, "    let p = Pair \{ a: 1, b: \"x\" }\n    io.println(\"\{same(p, p)}\")\n"))
+    assert_accepted("bound_rank_int", main_src(less_fn(), "    io.println(\"\{less(Rank \{ v: 1 }, Rank \{ v: 2 })}\")\n"))
+}
+
+test "a type parameter no field uses adds no bound" {
+    let extra = "@derive(Eq)\ntype Tag[T] \{ id: Int }\n\n{same_fn()}"
+    let src = main_src(extra, "    let a: Tag[Widget] = Tag \{ id: 1 }\n    io.println(\"\{a == a} \{same(a, a)}\")\n")
+    assert_accepted("phantom", src)
+}
+
+test "< on a derived-Ord instance whose field type has no Ord names that type" {
+    let src = main_src("", "    let a = Rank \{ v: Widget \{ id: 1 } }\n    io.println(\"\{a < a}\")\n")
+    assert_refused("ord_op_rank", src, ["TypeError: `Rank[Widget]` does not implement `Ord`", chain("Rank[Widget]", "Widget", "Ord"), WIDGET_ORD_HELP])
+}
+
+test "< on a plain struct with no Ord says Ord is missing" {
+    let src = main_src("", "    let a = Widget \{ id: 1 }\n    io.println(\"\{a < a}\")\n")
+    assert_refused("ord_op_plain", src, ["TypeError: `Widget` does not implement `Ord`", WIDGET_ORD_HELP])
+}
+
+test "a [T: Ord] bound refuses a derived-Ord instance whose field type has no Ord" {
+    let src = main_src(less_fn(), "    let a = Rank \{ v: Widget \{ id: 1 } }\n    io.println(\"\{less(a, a)}\")\n")
+    assert_refused("ord_bound", src, ["TraitBoundNotSatisfied: `Rank[Widget]` does not satisfy the Ord bound on type parameter T",
+        chain("Rank[Widget]", "Widget", "Ord"), WIDGET_ORD_HELP])
+}
+
+test "sort refuses a list of a derived-Ord instance whose field type has no Ord" {
+    let src = main_src("", "    let xs = [Rank \{ v: Widget \{ id: 1 } }]\n    let ys = xs.sort()\n    io.println(\"\{ys.len()}\")\n")
+    assert_refused("ord_sort", src, ["TraitBoundNotSatisfied: `Rank[Widget]` does not implement `Ord`", chain("Rank[Widget]", "Widget", "Ord")])
+    assert_lacks("ord_sort", probe("ord_sort2", src), "of tuple")
+}
+
+fn holder_decl(header: Str) -> Str {
+    "type Holder[T] \{ v: T }\n\n{header} \{\n    fn eq(self, other: Holder[T]) -> Bool \{ true }\n}\n\n"
+}
+
+test "a written impl with a binder bound holds only where the bound does" {
+    let extra = holder_decl("impl[T: Eq] Eq for Holder[T]")
+    let src = main_src(extra, "    let a = Holder \{ v: Widget \{ id: 1 } }\n    io.println(\"\{a == a}\")\n")
+    assert_refused("hand_binder_op", src, ["TypeError: `Holder[Widget]` does not implement `Eq`", chain("Holder[Widget]", "Widget", "Eq"), WIDGET_EQ_HELP])
+    assert_lacks("hand_binder_op", probe("hand_binder_op2", src), "add `@derive(Eq)` to `type Holder`")
+    let bsrc = main_src("{extra}{same_fn()}", "    let a = Holder \{ v: Widget \{ id: 1 } }\n    io.println(\"\{same(a, a)}\")\n")
+    assert_refused("hand_binder_bound", bsrc, [eq_bound_line("Holder[Widget]"), chain("Holder[Widget]", "Widget", "Eq")])
+    assert_accepted("hand_binder_ok", main_src("{extra}{same_fn()}", "    let a = Holder \{ v: 1 }\n    io.println(\"\{a == a} \{same(a, a)}\")\n"))
+}
+
+test "a written impl with a where bound holds only where the bound does" {
+    let extra = holder_decl("impl[T] Eq for Holder[T] where T: Eq")
+    let src = main_src(extra, "    let a = Holder \{ v: Widget \{ id: 1 } }\n    io.println(\"\{a == a}\")\n")
+    assert_refused("hand_where_op", src, ["TypeError: `Holder[Widget]` does not implement `Eq`", chain("Holder[Widget]", "Widget", "Eq")])
+    assert_accepted("hand_where_ok", main_src(extra, "    let a = Holder \{ v: 1 }\n    io.println(\"\{a == a}\")\n"))
+}
+
+test "an unbounded written impl holds for every argument" {
+    let extra = holder_decl("impl[T] Eq for Holder[T]")
+    let src = main_src("{extra}{same_fn()}", "    let a = Holder \{ v: Widget \{ id: 1 } }\n    io.println(\"\{a == a} \{same(a, a)}\")\n")
+    assert_accepted("hand_unbounded", src)
+}
+
+fn same_trait_decl(header: Str) -> Str {
+    "type W[T] \{ v: T }\n\ntrait Same \{\n    fn same(self) -> Bool\n}\n\n{header} \{\n    fn same(self) -> Bool \{ self.v == self.v }\n}\n\n"
+}
+
+test "a method call through an impl checks its binder bound at the receiver" {
+    let src = main_src(same_trait_decl("impl[T: Eq] Same for W[T]"), "    let w = W \{ v: Widget \{ id: 1 } }\n    io.println(\"\{w.same()}\")\n")
+    assert_refused("call_binder", src, [eq_bound_line("Widget"), WIDGET_EQ_HELP])
+    let nested = main_src(same_trait_decl("impl[T: Eq] Same for W[T]"), "    let w = W \{ v: Box \{ v: Widget \{ id: 1 } } }\n    io.println(\"\{w.same()}\")\n")
+    assert_refused("call_binder_nested", nested, [eq_bound_line("Box[Widget]"), chain("Box[Widget]", "Widget", "Eq")])
+    assert_accepted("call_binder_ok", main_src(same_trait_decl("impl[T: Eq] Same for W[T]"), "    let w = W \{ v: Box \{ v: 1 } }\n    io.println(\"\{w.same()}\")\n"))
+}
+
+test "a method call through an impl checks its where bound on a std trait at the receiver" {
+    let src = main_src(same_trait_decl("impl[T] Same for W[T] where T: Eq"), "    let w = W \{ v: Widget \{ id: 1 } }\n    io.println(\"\{w.same()}\")\n")
+    assert_refused("call_where", src, [eq_bound_line("Widget"), WIDGET_EQ_HELP])
+    assert_accepted("call_where_ok", main_src(same_trait_decl("impl[T] Same for W[T] where T: Eq"), "    let w = W \{ v: 1 }\n    io.println(\"\{w.same()}\")\n"))
+}
+
+test "a method call through an impl checks a binder bound on a program trait" {
+    let extra = "trait Tr \{\n    fn t(self) -> Int\n}\n\ntype W[T] \{ v: T }\n\ntrait Get \{\n    fn get(self) -> Int\n}\n\nimpl[T: Tr] Get for W[T] \{\n    fn get(self) -> Int \{ self.v.t() }\n}\n\n"
+    let src = main_src(extra, "    let w = W \{ v: Widget \{ id: 1 } }\n    io.println(\"\{w.get()}\")\n")
+    assert_refused("call_user_binder", src, ["TraitBoundNotSatisfied: `Widget` does not satisfy the Tr bound on type parameter T"])
+}
