@@ -298,7 +298,7 @@ The LSP offers the `with` fix first. It offers the `@allow` fix second, and that
 
 **W0611 `ScopedValueEnteredTwice`: scoped value that goes into more than one `with`**
 
-A scoped value must reach exactly one `with` item. W0611 fires when one value reaches two or more, including a `with` inside a loop body that enters a value built outside the loop. Its state was fixed when it was built, so a second `exit()` releases it again. It uses the same flow analysis as W0610, and it has the same limit: it does not follow a value into a function it is passed to. No W0611 is not a proof that a value goes into one `with` only.
+A scoped value must reach exactly one `with` item. W0611 counts the `with` items that one execution path takes the value into, and fires when the count is two or more. Items on paths that exclude each other (`if`/`else` branches, `match` arms) count once. A `with` in a loop body that enters a value built outside the loop counts as two, unless every path through the body after that `with` leaves the loop. A copy of a scoped value is the same value: `let copy = conn` followed by `with copy` enters `conn`. Its state was fixed when it was built, so a second `exit()` releases it again. It uses the same flow analysis as W0610, and it has the same limit: it does not follow a value into a function it is passed to. No W0611 is not a proof that a value goes into one `with` only, and W0611 is not a safety check: a type that wraps a foreign handle should make a second `exit()` safe (§4.7.2).
 
 ```
 warning[ScopedValueEnteredTwice]: `BlockHandler` value goes into more than one `with`
@@ -316,6 +316,7 @@ warning[ScopedValueEnteredTwice]: `BlockHandler` value goes into more than one `
 4 |         with db.connect("app.db")? {
   |
   = note: if running `exit()` more than once is intended, add `@allow(ScopedValueEnteredTwice)`
+  = note: upgrade to error in blink.toml: [lints] W0611 = "error"
 ```
 
 When the value is a call result bound to a name, the fix moves the call into each `with` item. That fix is machine-applicable (§8.6) if the call has no other use. W0611 is a warning by default, and is upgradeable to an error with `W0611 = "error"` under `[lints]` without a change to W0610. Suppress it on a function with `@allow(ScopedValueEnteredTwice)` (§4.16.8). `@trusted(audit: K)` does not suppress it (§9.1). A type whose `exit()` is correct to run more than once, such as `std.testing`'s `Cleanup` when the action is meant to run twice, is a case for that suppression. When W0611 fires in a function that has `@trusted`, the output adds this note:

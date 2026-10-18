@@ -1190,7 +1190,7 @@ impl BlockHandler for Timer {
 with timer("db_query") { run_query()? }
 ```
 
-A scoped value must reach exactly one `with`. W0611 `ScopedValueEnteredTwice` warns when one value reaches two, for example a value built before a loop and entered inside it.
+A scoped value must reach exactly one `with`. W0611 `ScopedValueEnteredTwice` warns when one execution path takes a value into two, for example a value built before a loop and entered inside it. A copy of a scoped value is the same value.
 
 ## Associated Types on Traits
 
