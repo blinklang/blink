@@ -6785,7 +6785,23 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
 // A binding declared as T whose value is a channel `recv()`: recv answers Option[T], and the
 // help names the forms that handle a closed channel before the `.unwrap()` that panics on one.
 fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_error_at_code(msg, at, "TypeError", TYPE_ERROR, tc_recv_option_help(val, declared, got))
+    let recv_help = tc_recv_option_help(val, declared, got)
+    let help = if recv_help != "" { recv_help } else { tc_hidden_variant_help(val, declared) }
+    tc_error_at_code(msg, at, "TypeError", TYPE_ERROR, help)
+}
+
+// A value that hides a variant reads as the value even where the hint names the variant's
+// enum (sections/03_types.md §3.4 "Values come first"), so the mismatch there names the
+// qualified variant the site likely meant. "" when the hint's enum has no variant of the name.
+fn tc_hidden_variant_help(val: Int, declared: Int) -> Str {
+    if val < 0 { return "" }
+    let named = if node_kind(val) == NodeKind.Call { node_left(val) } else { val }
+    if named < 0 || node_kind(named) != NodeKind.Ident { return "" }
+    let name = node_name(named)
+    match tc_bare_variant_from_type(name, None, declared) {
+        BareVariantPick.Declared(_, var_idx) => "write `{node_name(evar_pool.get(var_idx).unwrap().enum_decl)}.{name}` for the variant"
+        _ => ""
+    }
 }
 
 fn tc_recv_option_help(val: Int, declared: Int, got: Int) -> Str ! TypeCheck.Resolve {
@@ -12540,7 +12556,7 @@ fn nr_drop_import_index(consuming_mod: Str) {
             if r.imports_built {
                 r.imports.clear()
                 r.selects.clear()
-                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl })
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package })
             }
         }
         None => {}
@@ -12582,7 +12598,7 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
         }
         None => {}
     }
-    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl }
+    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package }
     nr_module_names.insert(consuming_mod, built)
     built
 }
@@ -12906,6 +12922,9 @@ type ModuleNames {
     unselected: Map[Str, Str]
     private_access: Map[Str, Int]
     bare_decl: Map[Str, Int]
+    // The package the module's file belongs to, as the loader names it; "" when the loader
+    // recorded none. A variant collides with a value only inside one package (E1016).
+    package: Str
 }
 let mut nr_module_names: Map[Str, ModuleNames] = Map()
 // The same declarations gathered by bare name, so a caller can see every module that spells
@@ -12918,10 +12937,31 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map() }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "" }
             nr_module_names.insert(mod_name, r)
             r
         }
+    }
+}
+
+pub fn tc_record_module_package(mod_name: Str, package: Str) {
+    let r = nr_module_names_of(mod_name)
+    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package })
+}
+
+// Whether two modules sit in one package. A module is always in its own, and the standard
+// library is one package whatever loaded it. Two modules the loader named no package for are
+// taken to be one, as a program checked from a single source is.
+fn tc_same_package(a: Str, b: Str) -> Bool {
+    if a == b { return true }
+    tc_module_package(a) == tc_module_package(b)
+}
+
+fn tc_module_package(m: Str) -> Str {
+    if m.starts_with("std_") { return "std" }
+    match nr_module_names.get(m) {
+        Some(r) => r.package
+        None => ""
     }
 }
 
@@ -13114,10 +13154,17 @@ fn nr_resolve_bare_decl(name: Str, consuming_mod: Str) -> Int {
 
 fn nr_find_bare_decl(name: Str, consuming_mod: Str) -> Int {
     let cands = nr_decls_by_name.get(name) ?? []
-    // A module's own declaration wins over any import, so it is asked for first.
+    // A module's own declaration wins over any import, so it is asked for first. Among its
+    // own, a value comes before a variant of the same spelling (sections/03_types.md §3.4).
+    let mut own = -1
     for c in cands {
-        if node_module(c) == consuming_mod { return c }
+        if node_module(c) == consuming_mod {
+            let k = nk_of(node_kind(c))
+            if k == NodeKind.FnDef || k == NodeKind.LetBinding { return c }
+            if own == -1 { own = c }
+        }
     }
+    if own != -1 { return own }
     // A selective import is this file's own binding for the spelling, so it outranks whatever
     // other modules declare under it. It is also the only way an alias or a name selected
     // from a facade resolves, since the declaration sits under another spelling or module.
@@ -14512,8 +14559,34 @@ fn tc_site_in_std(site: Int) -> Bool {
     node_source_module(site).starts_with("std_")
 }
 
+// Step 1 of the resolution order (sections/03_types.md §3.4 "Values come first"): a local,
+// a parameter, or the module-scope fn or let name resolution bound the spelling to. A hint
+// never moves the name past it, so this is asked before any variant is.
+fn tc_bare_name_is_value(name: Str, site: Int) -> Bool {
+    let top = nr_top_index(name)
+    if top != -1 && nr_index_is_global(top) == 0 { return true }
+    let decl = match tc_call_decl.get(site) {
+        Some(d) => d
+        None => tc_global_read_decl.get(site) ?? -1
+    }
+    if decl < 0 { return false }
+    let k = nk_of(node_kind(decl))
+    if k != NodeKind.FnDef && k != NodeKind.LetBinding { return false }
+    // The main file's declarations reach every module's resolver, but no other module
+    // imports them, so only the main file reads them as its own values.
+    node_module(decl) != "__main__" || tc_site_module(site) == "__main__"
+}
+
+// The module a site belongs to. An expression node records no module of its own; the
+// function around it does.
+fn tc_site_module(site: Int) -> Str {
+    if tc_current_fn_node >= 0 { return node_module(tc_current_fn_node) }
+    node_module(site)
+}
+
 fn tc_pick_bare_variant(name: Str, site: Int, carrier: Option[TyKind]) -> BareVariantPick {
     if carrier.is_none() && tc_first_variant_slot(name) == -1 { return BareVariantPick.NotAVariant }
+    if tc_bare_name_is_value(name, site) { return BareVariantPick.NotAVariant }
     let site_t = tc_bare_variant_site_type(name, site, carrier)
     if site_t >= 0 { return tc_bare_variant_from_type(name, carrier, site_t) }
     tc_bare_variant_from_program(name, site, carrier)
@@ -15368,6 +15441,72 @@ fn tc_recv_type_is_determined(obj_k: TyKind, obj_t: Int) -> Int {
 
 // ── Name resolution walker ──────────────────────────────────────────
 
+// A module-scope value must not take the name of a variant of a prelude enum or of an enum
+// its own package declares (sections/02_syntax.md §2.12.1). A dependency's variant is not
+// covered: there the value comes first at a bare use (sections/03_types.md §3.4).
+fn tc_check_values_named_like_variants(program: Int) ! Diag.Report {
+    let fns = node_params(program)
+    if fns != -1 {
+        let mut i = 0
+        while i < sublist_length(fns) {
+            let f = sublist_get(fns, i)
+            tc_check_value_named_like_variant(node_name(f), f)
+            i = i + 1
+        }
+    }
+    let lets = node_stmts(program)
+    if lets != -1 {
+        let mut i = 0
+        while i < sublist_length(lets) {
+            let l = sublist_get(lets, i)
+            // One diagnostic per declaration, so a destructuring `let` stops at its first.
+            for bound in tc_module_let_bound_names(l) {
+                if tc_check_value_named_like_variant(bound, l) { break }
+            }
+            i = i + 1
+        }
+    }
+}
+
+// Reports E1016 for the value `decl` binds under `name` when that name is a colliding
+// variant, naming the first such variant; true when it reported.
+fn tc_check_value_named_like_variant(name: Str, decl: Int) -> Bool ! Diag.Report {
+    match tc_prelude_carrier_of(name) {
+        Some(k) => {
+            tc_report_prelude_variant_collision(name, tc_prelude_carrier_name(k), decl)
+            return true
+        }
+        None => {}
+    }
+    let vmod = node_module(decl)
+    for slot in evar_slots_by_name.get(name) ?? [] {
+        let enum_decl = evar_pool.get(slot).unwrap().enum_decl
+        let emod = node_module(enum_decl)
+        if tc_prelude_modules.contains_key(emod) {
+            tc_report_prelude_variant_collision(name, node_name(enum_decl), decl)
+            return true
+        }
+        if tc_same_package(vmod, emod) {
+            let qual = "{node_name(enum_decl)}.{name}"
+            let shown = if tc_module_key_is_main(emod) != 0 { "main" } else { tc_get_dotted_module_path(emod) }
+            let vnode = tc_variant_decl_node(slot)
+            let at = "{diag_file_for_node(vnode)}:{node_line(vnode)}:{node_col(vnode)}"
+            diag_error_at_notes("DuplicateModuleBinding", DUPLICATE_MODULE_BINDING,
+                "`{name}` collides with variant `{qual}` (module `{shown}`)", decl,
+                "rename the value; a bare `{name}` in this package must have one meaning",
+                ["variant `{qual}` is declared at {at}"])
+            return true
+        }
+    }
+    false
+}
+
+fn tc_report_prelude_variant_collision(name: Str, enum_name: Str, decl: Int) ! Diag.Report {
+    diag_error_at_notes("DuplicateModuleBinding", DUPLICATE_MODULE_BINDING,
+        "`{name}` collides with variant `{enum_name}.{name}` (prelude)", decl, "rename the value",
+        ["`{name}` is a variant of the prelude type `{enum_name}`", "the variants of a prelude enum count as declared in every module"])
+}
+
 fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     nr_scope_names = []
     nr_scope_muts = []
@@ -15560,6 +15699,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             i = i + 1
         }
     }
+
+    tc_check_values_named_like_variants(program)
 
     // Pre-collect __main__ names to suppress ambiguity when local defs shadow
     let mut main_names: Map[Str, Int] = Map()

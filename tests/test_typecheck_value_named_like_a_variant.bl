@@ -1,0 +1,159 @@
+// A module-scope `let`, `let mut`, `const` or `fn` must not take the name of a variant of an
+// enum in the same package or of a prelude enum (sections/02_syntax.md §2.12.1): that pair is
+// DuplicateModuleBinding (E1016), one diagnostic per value declaration, on the value. A local
+// with a variant's name is legal and comes first at a bare use (sections/03_types.md §3.4
+// "Values come first"), in a call as in a read.
+import lower_test_helpers.{probe, probe_but, assert_eq_str}
+import diagnostics.{diag_entries, DiagEntry}
+
+fn e1016_entries() -> List[DiagEntry] {
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.code == "E1016" { out.push(d) }
+    }
+    out
+}
+
+fn only_e1016() -> DiagEntry {
+    let es = e1016_entries()
+    assert_eq(es.len(), 1)
+    es.get(0).unwrap()
+}
+
+fn has_note(d: DiagEntry, prefix: Str) -> Bool {
+    for n in d.notes {
+        if n.starts_with(prefix) { return true }
+    }
+    false
+}
+
+test "a fn named like a variant of the same module is E1016 on the fn" {
+    let src = #"type Color { Red, Green }
+
+fn Red() -> Int { 7 }
+
+fn main() {
+    let x = Red()
+    let _ = x
+}
+"#
+    assert(probe_but("vnv_fn_call", src, "DuplicateModuleBinding") >= 0)
+    let d = only_e1016()
+    assert_eq_str("message", d.message, "`Red` collides with variant `Color.Red` (module `main`)")
+    assert_eq_str("help", d.help, "rename the value; a bare `Red` in this package must have one meaning")
+    assert_eq(d.line, 3)
+    assert(has_note(d, "variant `Color.Red` is declared at "))
+}
+
+test "a fn named like a variant and read as a value is one E1016, nothing else" {
+    let src = #"type Color { Red, Green }
+
+fn Red() -> Int { 7 }
+
+fn main() {
+    let c = Red
+    let _ = c
+}
+"#
+    assert(probe_but("vnv_fn_value", src, "DuplicateModuleBinding") >= 0)
+    let d = only_e1016()
+    assert_eq_str("message", d.message, "`Red` collides with variant `Color.Red` (module `main`)")
+}
+
+test "a module let and a const named like a variant are each E1016" {
+    let src = #"type Shade { Dark, Light }
+
+let Dark = 1
+const Light = 2
+
+fn main() {
+    let _ = Dark + Light
+}
+"#
+    assert(probe_but("vnv_let_const", src, "DuplicateModuleBinding") >= 0)
+    let es = e1016_entries()
+    assert_eq(es.len(), 2)
+    assert_eq_str("let", es.get(0).unwrap().message, "`Dark` collides with variant `Shade.Dark` (module `main`)")
+    assert_eq_str("const", es.get(1).unwrap().message, "`Light` collides with variant `Shade.Light` (module `main`)")
+}
+
+test "a value named like a prelude variant is E1016 that names the prelude type" {
+    let src = #"let Ok = 5
+
+fn main() {
+    let _ = Ok
+}
+"#
+    assert(probe_but("vnv_prelude_ok", src, "DuplicateModuleBinding") >= 0)
+    let d = only_e1016()
+    assert_eq_str("message", d.message, "`Ok` collides with variant `Result.Ok` (prelude)")
+    assert_eq_str("help", d.help, "rename the value")
+    assert(has_note(d, "`Ok` is a variant of the prelude type `Result`"))
+    assert(has_note(d, "the variants of a prelude enum count as declared in every module"))
+}
+
+test "a fn named like a prelude Option variant is E1016" {
+    let src = #"fn Some(n: Int) -> Int { n }
+
+fn main() {
+    let _ = Some(1)
+}
+"#
+    assert(probe_but("vnv_prelude_some", src, "DuplicateModuleBinding") >= 0)
+    let d = only_e1016()
+    assert_eq_str("message", d.message, "`Some` collides with variant `Option.Some` (prelude)")
+}
+
+test "a value named like a variant two enums declare is still one E1016" {
+    let src = #"type JobState { Pending, Done }
+type NetState { Pending, Closed }
+
+fn Pending() -> Int { 1 }
+
+fn main() {
+    let _ = Pending()
+}
+"#
+    assert(probe_but("vnv_two_enums", src, "DuplicateModuleBinding") >= 0)
+    let d = only_e1016()
+    assert_eq_str("message", d.message, "`Pending` collides with variant `JobState.Pending` (module `main`)")
+}
+
+test "a local named like a variant is not E1016 and a read of it reads the local" {
+    let src = #"type Color { Red, Green }
+
+fn main() {
+    let Red = 5
+    let x: Int = Red + 1
+    let _ = x
+}
+"#
+    assert(probe("vnv_local_read", src) >= 0)
+    assert_eq(e1016_entries().len(), 0)
+}
+
+test "a call through a local named like a variant calls the local" {
+    let src = #"type Wrap { Leaf(Int), Empty }
+
+fn main() {
+    let Leaf = fn(n: Int) -> Int { n * 10 }
+    let x: Int = Leaf(2)
+    let _ = x
+}
+"#
+    assert(probe("vnv_local_call", src) >= 0)
+}
+
+test "a call through a parameter named like a variant calls the parameter" {
+    let src = #"type Wrap { Leaf(Int), Empty }
+
+fn apply(Leaf: fn(Int) -> Int) -> Int {
+    Leaf(2)
+}
+
+fn main() {
+    let _ = apply(fn(n: Int) -> Int { n })
+}
+"#
+    assert(probe("vnv_param_call", src) >= 0)
+}

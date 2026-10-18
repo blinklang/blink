@@ -211,6 +211,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | OrphanFile | E1010 | Source file has no enclosing `blink.toml` | Modules | §10.1 |
 | InvalidPackageName | E1011 | `[package].name` violates package-name grammar | Modules | §10.1 |
 | DuplicateSymbol | E1012 | A module-level declaration (`type`, alias, `trait`, `effect`, `fn`, `const`, `let`) takes a name that an import (`import` or `pub import`) binds: a listed name or the qualifier; the check uses the name after `as`. Replaces W0602 on that import entry | Modules | §10.5 |
+| DuplicateModuleBinding | E1016 | One module-scope name has two meanings: a module declares it twice (a `let` and a `fn`), or a module-scope `let`, `let mut`, `const` or `fn` takes the name of a variant of an enum in the same package or of a prelude enum. A dependency's variant does not collide | Modules | §2.12.1 |
 | InlineModuleNotSupported | E1015 | Inline `mod name { ... }` blocks are not supported | Modules | §10.1 |
 | PackageNotDeclared | E1052 | Package not declared in blink.toml — Tier 2 package needs explicit dependency | Stdlib | §10.7.1 |
 | UnexpectedToken | E1100 | Parser found a token in an unexpected position | Parser | §2 |

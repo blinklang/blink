@@ -1,0 +1,119 @@
+// A variant of a dependency's enum does not collide with a module-scope value of the using
+// package (sections/02_syntax.md §2.12.1). At a bare use the value comes first
+// (sections/03_types.md §3.4 "Values come first"), so typecheck and codegen both call the
+// fn, in a call and when the name is read as a value. At a site whose hint names the enum,
+// the fn's type is a type error whose help names the qualified variant.
+
+fn cleanup(base: Str) {
+    let _ = process_run("rm", ["-rf", base])
+}
+
+fn fail(base: Str, msg: Str) {
+    io.println("FAIL: {msg}")
+    cleanup(base)
+    assert(false)
+}
+
+test "a local fn hides a dependency variant in typecheck and codegen alike" {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let blink = "{blink_root}/build/blink"
+    let base = ".tmp/_test_dependency_variant_hidden_by_a_local_fn"
+    cleanup(base)
+    let _ = process_run("mkdir", ["-p", "{base}/pal/src", "{base}/app/src"])
+    write_file("{base}/pal/blink.toml", "[package]\nname = \"pal\"\nversion = \"0.1.0\"\n")
+    write_file("{base}/pal/src/pal.bl", "pub type Tone \{ Warm, Cool \}\npub type Wrap \{ Leaf(Int), Empty \}\n")
+    write_file("{base}/app/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\npal = \{ path = \"../pal\" \}\n")
+
+    write_file("{base}/app/src/main.bl", #"import pal.{Tone, Wrap}
+
+fn Warm() -> Int { 7 }
+fn Leaf(n: Int) -> Int { n * 10 }
+
+fn main() {
+    let x = Warm()
+    io.println("call {x}")
+    io.println("payload {Leaf(2)}")
+    let f = Warm
+    io.println("value {f()}")
+    let t: Tone = Tone.Warm
+    let w: Wrap = Wrap.Leaf(3)
+    let tn = match t {
+        Tone.Warm => "warm"
+        Tone.Cool => "cool"
+    }
+    let wn = match w {
+        Wrap.Leaf(n) => "leaf {n}"
+        Wrap.Empty => "empty"
+    }
+    io.println("qualified {tn} {wn}")
+}
+"#)
+    let run = process_run("sh", ["-c", "cd {base}/app && {blink} run src/main.bl 2>&1"])
+    if run.exit_code != 0 {
+        fail(base, "the program with a local fn hiding a dependency variant did not run (exit {run.exit_code}): {run.out}")
+        return
+    }
+    let want = ["call 7", "payload 20", "value 7", "qualified warm leaf 3"]
+    for w in want {
+        if !run.out.contains(w) {
+            fail(base, "expected `{w}` in the output, got: {run.out}")
+            return
+        }
+    }
+
+    write_file("{base}/app/src/hinted.bl", #"import pal.{Tone}
+
+fn Warm() -> Int { 7 }
+
+fn main() {
+    let t: Tone = Warm()
+    let _ = t
+}
+"#)
+    let chk = process_run("sh", ["-c", "cd {base}/app && {blink} check src/hinted.bl 2>&1"])
+    if chk.exit_code == 0 {
+        fail(base, "`let t: Tone = Warm()` with a local fn Warm checked clean")
+        return
+    }
+    if !chk.out.contains("TypeError") || !chk.out.contains("write `Tone.Warm` for the variant") {
+        fail(base, "the hinted site should be a TypeError whose help names `Tone.Warm`, got: {chk.out}")
+        return
+    }
+    if chk.out.contains("DuplicateModuleBinding") {
+        fail(base, "a dependency variant must not collide with a local fn, got: {chk.out}")
+        return
+    }
+    cleanup(base)
+}
+
+test "a fn in one module named like a variant in another module of the package is E1016" {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    let blink = "{blink_root}/build/blink"
+    let base = ".tmp/_test_dependency_variant_hidden_by_a_local_fn_xmod"
+    cleanup(base)
+    let _ = process_run("mkdir", ["-p", "{base}/src/paint"])
+    write_file("{base}/blink.toml", "[package]\nname = \"paint\"\nversion = \"0.1.0\"\n")
+    write_file("{base}/src/paint/colors.bl", "pub type Color \{ Red, Green \}\n")
+    write_file("{base}/src/main.bl", #"import paint.colors.{Color}
+
+fn Red() -> Int { 1 }
+
+fn main() {
+    let _ = Red()
+}
+"#)
+    let chk = process_run("sh", ["-c", "cd {base} && {blink} check src/main.bl 2>&1"])
+    if chk.exit_code == 0 {
+        fail(base, "a fn named like a variant of another module of the package checked clean")
+        return
+    }
+    if !chk.out.contains("error[DuplicateModuleBinding]: `Red` collides with variant `Color.Red` (module `paint.colors`)") {
+        fail(base, "expected E1016 naming `Color.Red` in module `paint.colors`, got: {chk.out}")
+        return
+    }
+    if !chk.out.contains("variant `Color.Red` is declared at src/paint/colors.bl:1:18") {
+        fail(base, "expected a note with the variant's location, got: {chk.out}")
+        return
+    }
+    cleanup(base)
+}
