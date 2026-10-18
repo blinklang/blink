@@ -1,0 +1,173 @@
+// A method call is a call against a declared signature, so it owes the signature its argument
+// count exactly as a free function call does (sections/02_syntax.md 2.13, Extent of
+// enforcement: method calls included). The count excludes the receiver, and a keyword
+// parameter with a default may be left out. Each path a method call can resolve through is
+// a row here, because each one used to reach the argument check without the count, and a
+// wrong count then passed `blink check` and broke the build.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// Everything that is not a warning, as `code: message` lines.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.code}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn decls() -> Str {
+    #"trait Sc { fn scale(self, factor: Int, by: Int) -> Int }
+trait Kw { fn kscale(self, factor: Int, -- k: Int, d: Int = 1) -> Int }
+trait Mk { fn make_one(v: Int) -> Self }
+type Box { w: Int }
+impl Sc for Box {
+    fn scale(self, factor: Int, by: Int) -> Int { self.w * factor * by }
+}
+impl Kw for Box {
+    fn kscale(self, factor: Int, -- k: Int, d: Int = 1) -> Int { self.w * factor * k * d }
+}
+impl Mk for Box {
+    fn make_one(v: Int) -> Box { Box { w: v } }
+}
+type Pair[T] { a: T }
+impl[T] Sc for Pair[T] {
+    fn scale(self, factor: Int, by: Int) -> Int {
+        let _ = self.a
+        factor * by
+    }
+}
+impl Sc for Int {
+    fn scale(self, factor: Int, by: Int) -> Int { self * factor * by }
+}
+fn Box_grow(b: Box, n: Int) -> Int { b.w + n }
+fn Box_make(v: Int) -> Box { Box { w: v } }
+effect Lg { effect Put { fn put(s: Str) -> Int } }
+"#
+}
+
+fn check(name: Str, body: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let _p = probe("build/mcarity_{name}.bl", decls().concat(body))
+    problems_reported()
+}
+
+fn in_main(stmt: Str) -> Str {
+    "fn main() \{\n    let b = Box \{ w: 2 \}\n    let p = Pair \{ a: 1 \}\n    let x = 3\n    {stmt}\n    let _ = b.w + p.a + x\n\}\n"
+}
+
+fn expect_one(label: Str, got: Str, want: Str) {
+    assert_eq_str(label, got, "E0300: {want}\n")
+}
+
+test "a trait impl method on a struct receiver checks its count" {
+    expect_one("too few", check("impl_few", in_main("let _ = b.scale(1)")), "method `Box.scale` expects 2 argument(s), got 1")
+    expect_one("too many", check("impl_many", in_main("let _ = b.scale(1, 2, 3)")), "method `Box.scale` expects 2 argument(s), got 3")
+}
+
+test "a method of a generic impl checks its count" {
+    expect_one("too few", check("gen_few", in_main("let _ = p.scale(1)")), "method `Pair.scale` expects 2 argument(s), got 1")
+    expect_one("too many", check("gen_many", in_main("let _ = p.scale(1, 2, 3)")), "method `Pair.scale` expects 2 argument(s), got 3")
+}
+
+test "a user impl method on a builtin receiver checks its count" {
+    expect_one("too few", check("int_few", in_main("let _ = x.scale(1)")), "method `Int.scale` expects 2 argument(s), got 1")
+    expect_one("too many", check("int_many", in_main("let _ = x.scale(1, 2, 3)")), "method `Int.scale` expects 2 argument(s), got 3")
+}
+
+test "a method called through a bounded type parameter checks its count" {
+    let few = "fn g[T: Sc](t: T) -> Int \{ t.scale(1) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    let many = "fn g[T: Sc](t: T) -> Int \{ t.scale(1, 2, 3) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    expect_one("too few", check("bound_few", few), "method `Sc.scale` expects 2 argument(s), got 1")
+    expect_one("too many", check("bound_many", many), "method `Sc.scale` expects 2 argument(s), got 3")
+}
+
+test "a Type_method fn called as a method checks its count" {
+    expect_one("too few", check("tm_few", in_main("let _ = b.grow()")), "method `Box.grow` expects 1 argument(s), got 0")
+    expect_one("too many", check("tm_many", in_main("let _ = b.grow(1, 2)")), "method `Box.grow` expects 1 argument(s), got 2")
+}
+
+test "a Type_method fn called on the type checks its count" {
+    expect_one("too few", check("tms_few", in_main("let _ = Box.make()")), "function `Box.make` expects 1 argument(s), got 0")
+    expect_one("too many", check("tms_many", in_main("let _ = Box.make(1, 2)")), "function `Box.make` expects 1 argument(s), got 2")
+}
+
+test "a trait's associated function called on the type checks its count" {
+    expect_one("too few", check("assoc_few", in_main("let _ = Box.make_one()")), "function `Box.make_one` expects 1 argument(s), got 0")
+    expect_one("too many", check("assoc_many", in_main("let _ = Box.make_one(1, 2)")), "function `Box.make_one` expects 1 argument(s), got 2")
+}
+
+test "a qualified trait call checks its count including the receiver" {
+    expect_one("too few", check("q_few", in_main("let _ = Sc.scale(b, 1)")), "qualified trait call `Sc.scale` expects 3 argument(s) including the receiver, got 2")
+    expect_one("too many", check("q_many", in_main("let _ = Sc.scale(b, 1, 2, 3)")), "qualified trait call `Sc.scale` expects 3 argument(s) including the receiver, got 4")
+}
+
+test "a qualified trait call on a bounded receiver follows the keyword rules and counts the receiver" {
+    let ok = "fn g[T: Kw](t: T) -> Int \{ Kw.kscale(t, 1, k: 2) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    assert_eq_str("omitted default", check("qb_ok", ok), "")
+    let few = "fn g[T: Kw](t: T) -> Int \{ Kw.kscale(t, k: 2) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    expect_one("too few", check("qb_few", few), "qualified trait call `Kw.kscale` expects 4 argument(s) including the receiver, got 2")
+    let miss = "fn g[T: Kw](t: T) -> Int \{ Kw.kscale(t, 1) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    assert_eq_str("missing keyword", check("qb_miss", miss), "E0510: keyword argument `k` is missing from the call to `Kw.kscale`\n")
+}
+
+test "an effect operation checks its count" {
+    let few = "fn f() -> Int ! Lg.Put \{ lg.put() \}\nfn main() \{ \}\n"
+    let many = "fn f() -> Int ! Lg.Put \{ lg.put(\"a\", \"b\") \}\nfn main() \{ \}\n"
+    expect_one("too few", check("eff_few", few), "function `lg.put` expects 1 argument(s), got 0")
+    expect_one("too many", check("eff_many", many), "function `lg.put` expects 1 argument(s), got 2")
+}
+
+test "a keyword-parameter method missing its positional argument is an arity mistake" {
+    expect_one("on the struct", check("kw_nopos", in_main("let _ = b.kscale(k: 2)")), "method `Box.kscale` expects 3 argument(s), got 1")
+    let bound = "fn g[T: Kw](t: T) -> Int \{ t.kscale(k: 2) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    expect_one("through a bound", check("kw_bound_nopos", bound), "method `Kw.kscale` expects 3 argument(s), got 1")
+}
+
+test "a missing keyword argument stays a keyword report" {
+    let got = check("kw_miss", in_main("let _ = b.kscale(1)"))
+    assert_eq_str("on the struct", got, "E0510: keyword argument `k` is missing from the call to `Box.kscale`\n")
+    let bound = "fn g[T: Kw](t: T) -> Int \{ t.kscale(1) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    assert_eq_str("through a bound", check("kw_bound_miss", bound), "E0510: keyword argument `k` is missing from the call to `Kw.kscale`\n")
+}
+
+test "a call with the exact count, or an omitted defaulted keyword, is accepted" {
+    let body = in_main("let _ = b.scale(1, 2) + p.scale(1, 2) + x.scale(1, 2) + b.kscale(1, k: 2) + b.kscale(1, k: 2, d: 3) + b.grow(1) + Box.make(1).w + Box.make_one(1).w + Sc.scale(b, 1, 2)")
+    assert_eq_str("concrete receivers", check("exact", body), "")
+    let bound = "fn g[T: Sc + Kw](t: T) -> Int \{ t.scale(1, 2) + t.kscale(1, k: 2) + t.kscale(1, k: 2, d: 3) \}\nfn main() \{ let _ = g(Box \{ w: 1 \}) \}\n"
+    assert_eq_str("through a bound", check("exact_bound", bound), "")
+    let eff = "fn f() -> Int ! Lg.Put \{ lg.put(\"a\") \}\nfn main() \{ \}\n"
+    assert_eq_str("an effect operation", check("exact_eff", eff), "")
+}
+
+// A label that names no parameter is its own mistake, and the argument written positionally
+// beside it is still checked against its parameter.
+test "a bogus label on a method call is reported and the positional argument is still checked" {
+    let got = check("bogus_label", in_main("let _ = b.scale(\"s\", bogus: 1)"))
+    assert(got.contains("E0511: `bogus` names no keyword parameter of `Box.scale`\n"))
+    assert(got.contains("E0300: argument 1 of `Box.scale` expects Int, got Str\n"))
+}
+
+test "a method call whose labels name no parameter of an all-positional signature is E0511" {
+    let src = "trait Scalable \{ fn scale2(self, factor: Int, label: Str) -> Int \}\nimpl Scalable for Box \{\n    fn scale2(self, factor: Int, label: Str) -> Int \{ self.w * factor + label.len() \}\n\}\n".concat(in_main("let _ = b.scale2(nosuch: \"s\", label: \"x\")"))
+    assert_eq_str("whole report", check("bogus_all_positional", src), "E0511: `nosuch` names no keyword parameter of `Box.scale2`\n")
+}
