@@ -1219,6 +1219,66 @@ let config = ServerConfig { port: 3000, debug: true }
 - An omitted field takes its default value
 - Struct field defaults do not interact with the type system: `ServerConfig` is the same type regardless of which fields were explicitly provided
 
+#### Checking a Literal's Fields
+
+These rules apply to each literal that names fields:
+
+- a struct literal `T { ... }`, with or without `..source` (§2.16);
+- a variant brace literal, qualified or bare (§3.4);
+- a variant paren payload whose arguments are **all** labelled (§3.4);
+- the construction shorthand `{ ... }` (§2.15).
+
+In each literal, the labels form a set. `blink check` reports three faults:
+
+| Fault | Diagnostic | Where it points |
+|-------|------------|-----------------|
+| A label names a field that the type does not declare | `NoSuchField` (E0525) | the label |
+| A label appears twice | `DuplicateField` (E0316) | the second label, with a `note:` at the first |
+| A field without a default has no label, and there is no `..source` | `MissingField` (E0315) | the type or variant name; for the shorthand, its opening `{` |
+
+`MissingField` fires once per literal. It lists every missing field, with its type, in declaration order. A variant field has no default (§3.4), so a variant literal must label every field of its variant.
+
+```blink
+type Point {
+    x: Float
+    y: Float
+}
+
+let a = Point { x: 1.0 }
+let b = Point { x: 1.0, y: 2.0, z: 3.0 }
+let c = Point { x: 1.0, x: 3.0, y: 2.0 }
+```
+
+```
+error[MissingField]: `Point` literal is missing field `y` (Float)
+  help: add `y: ` and a value
+error[NoSuchField]: `Point` has no field `z`
+  help: `Point` declares: x (given), y (given)
+error[DuplicateField]: field `x` is given twice
+  note: first given here
+  help: remove one of the two
+```
+
+**Copy-update.** With `..source`, a field that has no label takes its value from the source, so `MissingField` never fires. A label beside `..source` shadows the source field; it is not a duplicate. The same label written twice is still `DuplicateField`: `T { x: 1, x: 2, ..src }` is an error.
+
+**Help lines.**
+
+- `NoSuchField`: the candidates are the declared fields that the literal does not already label. The nearest-name rule of the Error Catalog (*Conventions*) picks at most one. With a suggestion, the `help:` line names it, and the rename is machine-applicable. Without one, the `help:` line lists the declared fields and marks those the literal already gives.
+- `MissingField`: the `help:` line says to add each missing field with a value. It has no machine-applicable fix: a tool cannot choose the value, and an inserted `todo()` would turn a `blink check` error into a panic each time the literal runs.
+- `DuplicateField`: the `help:` line says to remove one of the two. It has no machine-applicable fix, because each field expression is evaluated, and the tool cannot choose which to keep.
+- A second repair that edits the declaration — "or add the field to `T`" on `NoSuchField`, "or give `y` a default in `T`" on a struct's `MissingField` — is offered only when `T` is declared in the package being compiled (§3.1 rule 1).
+
+**Convergence (§3.1 rule 3).** When the unique suggestion for an unknown label is a missing field, that field leaves the `MissingField` list. If the list is then empty, `MissingField` does not fire. The typo `Point { x: 1.0, yy: 2.0 }` thus gives one `NoSuchField` with the help `y`, and the one rename clears it.
+
+**Order.** Within one literal, the compiler reports every `DuplicateField`, then every `NoSuchField`, then `MissingField`. Inside each kind, reports come in source order. Convergence comes from the suppression above, not from this order; the order makes output the same on each run.
+
+**Shorthand.** A diagnostic on a §2.15 shorthand literal names the inferred type and the parameter, because neither appears at the call site:
+
+```
+error[NoSuchField]: `ServerConfig` literal (argument `config` of `start_server`) has no field `prot`
+  help: did you mean `port`?
+```
+
 #### Why Struct Defaults, Not Function Param Defaults
 
 Function parameter defaults interact with closures (does `fn(Int) -> Int` match a function with a defaulted second param?), higher-order functions, and partial application. Struct field defaults are simpler — a struct is always fully constructed before a function sees it. The complexity stays at the construction site, not in the type system.
@@ -1249,6 +1309,8 @@ The shorthand applies only when:
 - The call site uses `{ field: value }` syntax without a type name
 
 When the type is ambiguous (e.g., the parameter is a trait object or generic), the full form is required.
+
+A shorthand literal follows the same field rules as the full form (§2.14 *Checking a Literal's Fields*). Its diagnostics name the inferred type and the parameter.
 
 ### 2.16 Spread / Rest Operator (`..`)
 
@@ -1289,8 +1351,9 @@ This is purely syntactic sugar. The compiler desugars `T { f1: e1, ..src }` to `
 - The source must be the **same nominal type** as the struct being constructed. Cross-type spread is not supported (Blink uses nominal typing).
 - `..source` must appear **last** in the field list. This is a hard parse rule — `{ ..src, field: val }` is a parse error.
 - At most **one** `..source` per literal. Multiple spread sources are not supported.
-- Explicitly provided fields **shadow** same-named fields from the source.
+- Explicitly provided fields **shadow** same-named fields from the source. A label written twice is still `DuplicateField` (E0316), with or without `..source` (§2.14 *Checking a Literal's Fields*).
 - Source field values take precedence over field defaults (§2.14) for non-explicit fields.
+- Copy-update applies to struct literals only. A variant brace literal with `..source` is `VariantSpread` (E0317); see §3.4 *Variant Construction*.
 
 Copy-update composes with the construction shorthand (§2.15):
 

@@ -1809,7 +1809,26 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
 }
 ```
 
-The `..` rest sigil is a pattern-only construct (§3.5); it has no meaning in construction, where every field must be supplied (or defaulted, see *Product Types*).
+Variant construction does not accept `..source`; copy-update (§2.16) applies to struct literals only. Every variant field must be supplied.
+
+```blink
+type Figure {
+    Rect { width: Float, height: Float }
+    Circle(radius: Float, tag: Int)
+    Dot
+}
+
+fn widen(s: Figure) -> Figure {
+    Figure.Rect { width: 2.0, ..s }
+}
+```
+
+```
+error[VariantSpread]: a variant literal cannot copy fields with `..s`
+  help: write every field, or match on `s` to bind its fields (copy-update is for struct literals, §2.16)
+```
+
+A variant brace literal, and a variant paren payload whose arguments are all labelled, follow the field rules of §2.14 *Checking a Literal's Fields*: `NoSuchField`, `DuplicateField` and `MissingField`. For a labelled paren payload these take the place of the argument-count error, so `Figure.Circle(radius: 1.0, radius: 2.0)` reports `DuplicateField` at the second `radius` and `MissingField` for `tag`, not a count. A paren payload with a positional argument keeps the argument-count `TypeError` (E0300), with a `note:` that lists the variant's fields in order.
 
 `blink fmt` does not canonicalize between the bare and qualified forms in either direction — a formatter must never change which entity a name resolves to.
 
