@@ -1,0 +1,112 @@
+// `todo()` and `unreachable()` (§2.20) are each a `panic` at run time. A `todo` message
+// contains `not yet implemented` and an `unreachable` message contains `entered unreachable
+// code`, plus the call's `msg` when it has one, so `assert_panics(matching:)` can test for
+// either. Outside a test each ends the process: the message goes to stderr and the exit status
+// is not zero. `unreachable` stays a checked panic in every build mode, an optimized one
+// included.
+
+import compile_test_helpers.{compile_and_run, compile_and_run_opt}
+
+fn stub(n: Int) -> Int {
+    if n > 0 { return n }
+    todo()
+}
+
+fn stub_msg(n: Int) -> Str {
+    match n {
+        0 => "zero"
+        _ => todo("names for {n}")
+    }
+}
+
+fn weekday_name(day: Int) -> Str {
+    match day {
+        0 => "Sun"
+        1 => "Mon"
+        _ => unreachable()
+    }
+}
+
+fn pick(o: Option[Int]) -> Int { o ?? unreachable("pick needs a value") }
+
+type Status { Pending, Shipped, Cancelled }
+
+// The repair the E0004 fix inserts for a missing arm (§5), as the fix writes it.
+fn refund(s: Status, total: Int) -> Int {
+    match s {
+        Pending => 0
+        Shipped => total
+        Cancelled => todo()
+    }
+}
+
+test "a bare todo panics with not yet implemented" {
+    assert_eq(stub(3), 3)
+    assert_panics(matching: "not yet implemented") {
+        let _ = stub(0)
+    }
+}
+
+test "a todo with a message panics with both texts" {
+    assert_eq(stub_msg(0), "zero")
+    assert_panics(matching: "not yet implemented: names for 2") {
+        let _ = stub_msg(2)
+    }
+}
+
+test "a bare unreachable panics with entered unreachable code" {
+    assert_eq(weekday_name(1), "Mon")
+    assert_panics(matching: "entered unreachable code") {
+        let _ = weekday_name(9)
+    }
+}
+
+test "an unreachable with a message panics with both texts" {
+    assert_eq(pick(Some(4)), 4)
+    assert_panics(matching: "entered unreachable code: pick needs a value") {
+        let _ = pick(None)
+    }
+}
+
+test "the message names the panic and where it was raised" {
+    assert_panics(matching: "panic: not yet implemented at ") {
+        let _ = stub(-1)
+    }
+    assert_panics(matching: "panic: entered unreachable code at ") {
+        let _ = weekday_name(7)
+    }
+}
+
+test "the E0004 fix arm todo() builds and panics when it runs" {
+    assert_eq(refund(Shipped, 12), 12)
+    assert_panics(matching: "not yet implemented") {
+        let _ = refund(Cancelled, 12)
+    }
+}
+
+test "a todo in main writes its message to stderr and exits non-zero" {
+    let src = "import std.io\nfn main() \{\n    io.println(\"before\")\n    todo(\"main body\")\n    io.println(\"after\")\n}\n"
+    let r = compile_and_run(src, "_todo_builtin_main")
+    assert_eq(r.exit_code, 1)
+    assert(r.out.contains("before"))
+    assert(!r.out.contains("after"))
+    assert(r.err_out.contains("panic: not yet implemented: main body at "))
+}
+
+test "an unreachable in main writes its message to stderr and exits non-zero" {
+    let src = "fn pick(o: Option[Int]) -> Int \{ o ?? unreachable() }\nfn main() \{\n    let _ = pick(None)\n}\n"
+    let r = compile_and_run(src, "_unreachable_builtin_main")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("panic: entered unreachable code at "))
+}
+
+// The C compiler may not assume the call does not run, so at -O2 the panic still fires and
+// the code after it still does not.
+test "an unreachable in an -O2 build still panics" {
+    let src = "import std.io\nfn day(n: Int) -> Str \{\n    match n \{\n        0 => \"Sun\"\n        _ => unreachable(\"day out of range\")\n    }\n}\nfn main() \{\n    io.println(day(0))\n    io.println(day(5))\n    io.println(\"after\")\n}\n"
+    let r = compile_and_run_opt(src, "_unreachable_builtin_o2", "-O2")
+    assert_eq(r.exit_code, 1)
+    assert(r.out.contains("Sun"))
+    assert(!r.out.contains("after"))
+    assert(r.err_out.contains("panic: entered unreachable code: day out of range at "))
+}

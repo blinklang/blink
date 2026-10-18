@@ -1541,7 +1541,10 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
 // keyed container's bare constructor, and the rest), and falls to the same refusal a
 // declaration miss would reach.
 fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
-    if cc_panicking_builtin(name) != "" { return cc_lower_panic(node) }
+    match cc_panicking_builtin(name) {
+        Some(words) => return cc_lower_panic(node, name, words)
+        None => {}
+    }
     let ptr_ctor = cc_ptr_ctor_op(name)
     if ptr_ctor != "" { return cc_lower_ptr_ctor(node, name, ptr_ctor) }
     let symbol = cc_builtin_free_symbol(name)
@@ -1564,33 +1567,48 @@ fn lower_builtin_free_call(node: Int, name: Str) -> Int ! Diag.Report {
     cc_no_such_callee(node)
 }
 
-// The bare builtins that end in the panic dispatcher, each mapped to itself so the dispatch
-// above reads one table, as cc_ptr_ctor_op does.
-fn cc_panicking_builtin(name: Str) -> Str {
+// The bare builtins that end in the panic dispatcher, each mapped to the words its message
+// opens with, so the dispatch above reads one table, as cc_ptr_ctor_op does. `panic` has no
+// words of its own and says only what its call passed. The other two are stable texts a test
+// matches with `assert_panics(matching:)` (§2.20), and they tell an operator a stub from a
+// broken invariant.
+fn cc_panicking_builtin(name: Str) -> Option[Str] {
     let mut table: Map[Str, Str] = Map()
-    table.insert("panic", "panic")
-    table.get(name) ?? ""
+    table.insert("panic", "")
+    table.insert("todo", "not yet implemented")
+    table.insert("unreachable", "entered unreachable code")
+    table.get(name)
 }
 
-// `panic(msg)` hands the panic dispatcher the sentence every other panic says, naming the
-// call's own position. The call is Never-typed, so each seam that reads a value drops its
-// slot the way it does for any diverging call.
-fn cc_lower_panic(node: Int) -> Int ! Diag.Report {
+// A panicking builtin hands the panic dispatcher the sentence every other panic says, naming
+// the call's own position: `panic(msg)` says msg, and `todo` and `unreachable` say their own
+// words, then `: msg` when the call passes one. The call is Never-typed, so each seam that
+// reads a value drops its slot the way it does for any diverging call. `unreachable` is a
+// checked panic in every build mode (§2.20), so it lowers like the others and is never the C
+// compiler's unreachable.
+fn cc_lower_panic(node: Int, name: Str, words: Str) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
-    if given != 1 { return cc_free_arity_wrong(node, "panic", 1, given) }
+    let own_words = words != ""
+    // Only a builtin with words of its own may leave out the message.
+    let fewest = if own_words { 0 } else { 1 }
+    if given < fewest || given > 1 { return cc_free_arity_wrong(node, name, if given < fewest { fewest } else { 1 }, given) }
     let g = cc_guard_spellings(node)
     if cc_guard_stopped(g) { return -1 }
-    let said = lower_expr_as_value(sublist_get(node_args(node), 0))
-    if said < 0 { return -1 }
     let text = format_spec_of(TYPE_STR)
     let tabled = ir_line_tabled(node)
-    let fmt = cc_panic_sentence(text, "", text, if tabled { format_spec_of(TYPE_INT) } else { text })
-    let args = [
-        ir_const(TYPE_STR, node, g.message, c_str_const(fmt)),
-        said,
-        ir_const(TYPE_STR, node, g.message, c_str_const(cc_panic_file(node))),
-        if tabled { cc_panic_line_value(node) } else { ir_const(TYPE_STR, node, g.message, c_str_const(cc_panic_line(node))) },
-    ]
+    let mut what = words
+    let mut said: List[Int] = []
+    if given == 1 {
+        let v = lower_expr_as_value(sublist_get(node_args(node), 0))
+        if v < 0 { return -1 }
+        what = if own_words { "{words}: {text}" } else { text }
+        said.push(v)
+    }
+    let fmt = cc_panic_sentence(what, "", text, if tabled { format_spec_of(TYPE_INT) } else { text })
+    let mut args: List[Int] = [ir_const(TYPE_STR, node, g.message, c_str_const(fmt))]
+    for v in said { args.push(v) }
+    args.push(ir_const(TYPE_STR, node, g.message, c_str_const(cc_panic_file(node))))
+    args.push(if tabled { cc_panic_line_value(node) } else { ir_const(TYPE_STR, node, g.message, c_str_const(cc_panic_line(node))) })
     let message = ir_call_runtime(TYPE_STR, node, g.message, c_runtime_helper("str_format"), g.message_form, args)
     let rec = cc_local(TYPE_NEVER, node)
     if cc_stopped(rec) { return -1 }
