@@ -838,6 +838,21 @@ BLINK_RT_FN const char* blink_str_from_bytes(const char* p, int64_t n) {
 }
 #endif
 
+/* blink_str_from_bytes on the GC heap, for a Str that must outlive any open
+   `with arena`. */
+BLINK_RT_FN const char* blink_str_from_bytes_gc(const char* p, int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_from_bytes_gc(const char* p, int64_t n) {
+    if (n < 0) n = 0;
+    const char* nul = n > 0 ? (const char*)memchr(p, 0, (size_t)n) : NULL;
+    if (nul) n = (int64_t)(nul - p);
+    char* s = blink_str_alloc_gc(n);
+    if (n > 0) memcpy(s, p, (size_t)n);
+    blink_str_count_and_set_cps(s);
+    return s;
+}
+#endif
+
 /* A Str copy of a C string. NULL stays NULL so the caller decides what an
    absent value means. */
 BLINK_RT_FN const char* blink_str_from_cstr(const char* p);
@@ -2180,29 +2195,54 @@ BLINK_RT_FN blink_bytes* blink_bytes_slice(const blink_bytes* b, int64_t start, 
 }
 #endif
 
-/* Validate UTF-8. Returns NULL on success, or a static error message on failure. */
-BLINK_RT_FN const char* blink_bytes_validate_utf8(const blink_bytes* b);
+/* The offset of the first sequence in p[0, n) that is not valid UTF-8, or -1 when all of it
+   is. *why gets a static message for that sequence. Bytes.to_str and the stdin reader both
+   check with this, so io.read_line accepts the bytes that Bytes.to_str accepts. */
+BLINK_RT_FN int64_t blink_utf8_bad_offset(const uint8_t* p, int64_t n, const char** why);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_STR_STATIC(blink_utf8_err_continuation, "invalid UTF-8: unexpected continuation byte");
+BLINK_STR_STATIC(blink_utf8_err_invalid_byte, "invalid UTF-8: invalid byte");
 BLINK_STR_STATIC(blink_utf8_err_truncated, "invalid UTF-8: truncated sequence");
 BLINK_STR_STATIC(blink_utf8_err_bad_continuation, "invalid UTF-8: bad continuation byte");
-BLINK_RT_FN const char* blink_bytes_validate_utf8(const blink_bytes* b) {
+BLINK_STR_STATIC(blink_utf8_err_overlong, "invalid UTF-8: overlong encoding");
+BLINK_STR_STATIC(blink_utf8_err_surrogate, "invalid UTF-8: surrogate code point");
+BLINK_STR_STATIC(blink_utf8_err_too_large, "invalid UTF-8: code point past U+10FFFF");
+BLINK_RT_FN int64_t blink_utf8_bad_offset(const uint8_t* p, int64_t n, const char** why) {
     int64_t i = 0;
-    while (i < b->len) {
-        uint8_t c = b->data[i];
+    while (i < n) {
+        uint8_t c = p[i];
         int64_t seq_len;
-        if (c < 0x80) { seq_len = 1; }
-        else if ((c & 0xE0) == 0xC0) { seq_len = 2; }
-        else if ((c & 0xF0) == 0xE0) { seq_len = 3; }
-        else if ((c & 0xF8) == 0xF0) { seq_len = 4; }
-        else { return blink_utf8_err_continuation.d; }
-        if (i + seq_len > b->len) { return blink_utf8_err_truncated.d; }
+        /* The second byte's range is what rules out an overlong form, a surrogate
+           (U+D800-DFFF) and a code point past U+10FFFF (RFC 3629 section 4). */
+        uint8_t lo = 0x80, hi = 0xBF;
+        if (c < 0x80) { i++; continue; }
+        else if (c < 0xC0) { *why = blink_utf8_err_continuation.d; return i; }
+        else if (c < 0xC2) { *why = blink_utf8_err_overlong.d; return i; }
+        else if (c < 0xE0) { seq_len = 2; }
+        else if (c < 0xF0) { seq_len = 3; if (c == 0xE0) lo = 0xA0; if (c == 0xED) hi = 0x9F; }
+        else if (c < 0xF5) { seq_len = 4; if (c == 0xF0) lo = 0x90; if (c == 0xF4) hi = 0x8F; }
+        else { *why = blink_utf8_err_invalid_byte.d; return i; }
+        if (i + seq_len > n) { *why = blink_utf8_err_truncated.d; return i; }
         for (int64_t j = 1; j < seq_len; j++) {
-            if ((b->data[i + j] & 0xC0) != 0x80) { return blink_utf8_err_bad_continuation.d; }
+            if ((p[i + j] & 0xC0) != 0x80) { *why = blink_utf8_err_bad_continuation.d; return i; }
+        }
+        if (p[i + 1] < lo) { *why = blink_utf8_err_overlong.d; return i; }
+        if (p[i + 1] > hi) {
+            *why = c == 0xED ? blink_utf8_err_surrogate.d : blink_utf8_err_too_large.d;
+            return i;
         }
         i += seq_len;
     }
-    return NULL;
+    return -1;
+}
+#endif
+
+/* Validate UTF-8. Returns NULL on success, or a static error message on failure. */
+BLINK_RT_FN const char* blink_bytes_validate_utf8(const blink_bytes* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_bytes_validate_utf8(const blink_bytes* b) {
+    const char* why = NULL;
+    return blink_utf8_bad_offset(b->data, b->len, &why) < 0 ? NULL : why;
 }
 #endif
 

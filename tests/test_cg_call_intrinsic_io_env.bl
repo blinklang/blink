@@ -10,7 +10,7 @@
 // Calling the runtime's default directly would ignore that handler and print where a test
 // meant to capture. Those names route to the effect stage, which performs through the
 // vector. The two `_raw` names have no slot by design, so they call the runtime's default
-// writer directly, with the value rendered to text first. The last four read and write the
+// writer directly, with the value rendered to text first. The last five read and write the
 // standard streams through calls the runtime publishes, so they are built. env.args is no
 // handler's operation either, so the runtime answers the whole argument list in one call.
 
@@ -19,8 +19,8 @@ import lower_test_helpers.{
 }
 import parser.{node_count, node_kind, node_method}
 import ast.{NodeKind, nk_of}
-import ir.{IrKind, ir_c_name}
-import cg_expr.{lower_expr}
+import ir.{IrKind, ir_c_name, ir_kid}
+import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import std.io
 
 // A call written as a statement binds no name, so it is found by walking forward from a
@@ -39,16 +39,17 @@ fn call_after(anchor: Str, method: Str) -> Int {
     -1
 }
 
-// The four io names that reach the standard streams with no handler between. Two answer a
+// The five io names that reach the standard streams with no handler between. Three answer a
 // value and two answer nothing, so the probe writes each in the position its type allows.
 fn src_streams() -> Str {
     #"fn main() {
     let count = 4
     let line = io.read_line()
+    let rest = io.read_all()
     let buffer = io.read_bytes(count)
-    io.write(line)
+    io.write(rest)
     io.write_bytes(buffer)
-    let _keep = [line.len()]
+    let _keep = [line.is_some()]
 }
 "#
 }
@@ -68,13 +69,27 @@ fn src_other_groups() -> Str {
 "#
 }
 
-test "io.read_line reaches the runtime line reader with no argument" {
+// The runtime answers NULL at end of input, and the Option is built from that text.
+test "io.read_line answers the Option built from the runtime line reader's text" {
     probe("cg_call_io_read_line", src_streams())
+    let mark = cg_expr_pending_count()
     let built = lower_expr(rhs_of("line"))
-    assert_kind("read_line kind", built, IrKind.CallRuntime)
-    assert_shape("read_line shape", built, "CallRuntime")
-    assert_eq_str("read_line symbol", ir_c_name(built), "blink_stdin_read_line")
+    let stmts = cg_expr_take_pending(mark)
+    assert_kind("read_line kind", built, IrKind.VarRef)
     assert_verifies("read_line", built)
+    assert(stmts.len() > 0)
+    let read = ir_kid(stmts.get(0).unwrap(), 0)
+    assert_shape("read_line shape", read, "CallRuntime")
+    assert_eq_str("read_line symbol", ir_c_name(read), "blink_stdin_read_line")
+}
+
+test "io.read_all reaches the runtime reader with no argument" {
+    probe("cg_call_io_read_all", src_streams())
+    let built = lower_expr(rhs_of("rest"))
+    assert_kind("read_all kind", built, IrKind.CallRuntime)
+    assert_shape("read_all shape", built, "CallRuntime")
+    assert_eq_str("read_all symbol", ir_c_name(built), "blink_stdin_read_all")
+    assert_verifies("read_all", built)
 }
 
 test "io.read_bytes passes its count to the runtime byte reader" {

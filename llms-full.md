@@ -461,8 +461,9 @@ io.print("text")                // print without newline
 io.eprintln("error")            // print to stderr + newline
 io.eprint("error")              // print to stderr, no newline
 io.log("debug info")            // stderr with [LOG] prefix
-io.read_line()                  // -> Str (read line from stdin)
-io.read_bytes(n)                // -> Bytes (read n bytes from stdin)
+io.read_line()                  // -> Option[Str]: next stdin line without \n or \r\n; Some("") blank, None at end
+io.read_all()                   // -> Str: the rest of stdin
+io.read_bytes(n)                // -> Bytes: exactly n bytes, fewer only at end of input; n <= 0 panics
 io.write(s)                     // write string to stdout (no newline)
 io.write_bytes(b)               // write Bytes to stdout
 io.print_raw("text")            // raw printf (bypasses vtable)
@@ -585,7 +586,7 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 | `.concat(s)` | Str | Concatenate |
 | `.substring(start, end)` | Str | Codepoint range `[start, end)`; clamps |
 | `.split(sep)` | List[Str] | Split by separator |
-| `.lines()` | List[Str] | Split by newlines |
+| `.lines()` | List[Str] | Split at `\n` and `\r\n`; no empty last item |
 | `.trim()` | Str | Strip leading and trailing whitespace |
 | `.trim_right()` | Str | Strip trailing whitespace |
 | `.trim_left()` | Str | Strip leading whitespace |

@@ -1,0 +1,188 @@
+// io.read_line() answers Option[Str], where it once answered Str with "" for both a blank line
+// and end of input. Code that still uses the value as a Str gets a TypeError whose note says
+// what changed and whose help shows the match form, never `?? ""`, which brings back the old
+// confusion (sections/04_effects.md §4.4.9, "Migration"). `io.lines()` does not exist, and its
+// E0505 shows the two forms that read lines.
+import lower_test_helpers.{probe_but, assert_eq_str}
+import diagnostics.{diag_entries, DiagEntry}
+
+let READ_LINE_NOTE = "`io.read_line()` returns `None` at end of input and `Some(\"\")` for a blank line"
+let READ_LINE_HELP = "match on it: `match io.read_line() \{ Some(line) => ..., None => break }`"
+
+fn let_binding_compared_src() -> Str {
+    #"fn main() {
+    loop {
+        let line = io.read_line()
+        if line == "" { break }
+    }
+}
+"#
+}
+
+fn declared_str_src() -> Str {
+    #"fn main() {
+    let line: Str = io.read_line()
+    io.println(line)
+}
+"#
+}
+
+fn argument_src() -> Str {
+    #"fn shout(s: Str) -> Str {
+    s.to_upper()
+}
+
+fn main() {
+    io.println(shout(io.read_line()))
+}
+"#
+}
+
+fn named_argument_src() -> Str {
+    #"fn shout(-- s: Str) -> Str {
+    s.to_upper()
+}
+
+fn main() {
+    io.println(shout(s: io.read_line()))
+}
+"#
+}
+
+fn returned_src() -> Str {
+    #"fn next_line() -> Str {
+    io.read_line()
+}
+
+fn main() {
+    io.println(next_line())
+}
+"#
+}
+
+fn assigned_src() -> Str {
+    #"fn main() {
+    let mut line = "start"
+    line = io.read_line()
+    io.println(line)
+}
+"#
+}
+
+fn other_option_src() -> Str {
+    #"fn find() -> Option[Str] {
+    None
+}
+
+fn main() {
+    let line: Str = find()
+    io.println(line)
+}
+"#
+}
+
+fn module_io_binding_src() -> Str {
+    #"trait ReadsLine {
+    fn read_line(self) -> Int
+}
+
+type LineSource {
+    n: Int
+}
+
+impl ReadsLine for LineSource {
+    fn read_line(self) -> Int {
+        self.n
+    }
+}
+
+let io = LineSource { n: 1 }
+
+fn main() {
+    let line: Str = io.read_line()
+}
+"#
+}
+
+fn io_lines_src() -> Str {
+    #"fn main() {
+    for line in io.lines() {
+        io.println(line)
+    }
+}
+"#
+}
+
+// The one TypeError the probe reported, so a row fails when a second one appears.
+fn only_type_error(stem: Str, src: Str) -> DiagEntry ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = probe_but(stem, src, "TypeError")
+    assert(program >= 0)
+    let mut found: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.name == "TypeError" { found.push(d) }
+    }
+    assert_eq(found.len(), 1)
+    found.get(0).unwrap()
+}
+
+fn assert_migration_help(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let d = only_type_error(stem, src)
+    assert_eq(d.notes, [READ_LINE_NOTE])
+    assert_eq_str("help", d.help, READ_LINE_HELP)
+    assert(!d.help.contains("??"))
+    assert_eq_str("fix", d.fix_action, "")
+}
+
+test "a let-bound read_line value compared with a Str gets the note and the match help" {
+    assert_migration_help("rl_migrate_let_compare", let_binding_compared_src())
+}
+
+test "a read_line value declared as Str gets the note and the match help" {
+    assert_migration_help("rl_migrate_declared", declared_str_src())
+}
+
+test "a read_line value passed for a Str parameter gets the note and the match help" {
+    assert_migration_help("rl_migrate_argument", argument_src())
+}
+
+test "a read_line value passed by name for a Str parameter gets the note and the match help" {
+    assert_migration_help("rl_migrate_named_argument", named_argument_src())
+}
+
+test "a read_line value returned as Str gets the note and the match help" {
+    assert_migration_help("rl_migrate_return", returned_src())
+}
+
+test "a read_line value assigned to a Str gets the note and the match help" {
+    assert_migration_help("rl_migrate_assign", assigned_src())
+}
+
+test "an Option of Str from elsewhere gets no read_line note" {
+    let d = only_type_error("rl_migrate_other_option", other_option_src())
+    assert_eq(d.notes.len(), 0)
+    assert(!d.help.contains("read_line"))
+}
+
+test "a read_line method on a module binding named io gets no read_line note" {
+    let d = only_type_error("rl_migrate_module_io", module_io_binding_src())
+    assert_eq(d.notes.len(), 0)
+    assert(!d.help.contains("read_line"))
+}
+
+test "io.lines is E0505 and the help shows both forms that read lines" {
+    let program = probe_but("rl_io_lines", io_lines_src(), "UnresolvedMethod")
+    assert(program >= 0)
+    let mut msgs: List[Str] = []
+    let mut help = ""
+    let mut code = ""
+    for d in diag_entries {
+        if d.name == "UnresolvedMethod" {
+            msgs.push(d.message)
+            help = d.help
+            code = d.code
+        }
+    }
+    assert_eq(msgs, ["no method `lines` on the `io` handle"])
+    assert_eq_str("code", code, "E0505")
+    assert_eq_str("help", help, "read all the input, then split it: `for line in io.read_all().lines() \{ ... }`\nor read one line at a time: `loop \{ match io.read_line() \{ Some(line) => ..., None => break } }`")
+}

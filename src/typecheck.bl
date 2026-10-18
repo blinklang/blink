@@ -4828,7 +4828,7 @@ fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCh
         if mr_kind != "" {
             tc_report_missing_return(mr_kind, at_node)
         } else {
-            if !tc_closure_checked_against(at_node, tc_current_fn_ret) { tc_error_at("return value type {type_to_str(val_t)} does not match function `{tc_current_fn_name}` return type {type_to_str(tc_current_fn_ret)}{tc_fn_mismatch_suffix(tc_current_fn_ret, val_t)}", at_node) }
+            if !tc_closure_checked_against(at_node, tc_current_fn_ret) { tc_value_mismatch_at("return value type {type_to_str(val_t)} does not match function `{tc_current_fn_name}` return type {type_to_str(tc_current_fn_ret)}{tc_fn_mismatch_suffix(tc_current_fn_ret, val_t)}", at_node, at_node, tc_current_fn_ret) }
         }
     } else {
         if tc_closure_scope_base.len() == 0 {
@@ -5338,7 +5338,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
     // argument, and only the second argument can pin α.
     if tc_tid_has_unbound_metavar(arg_t) != 0 || tc_tid_has_unbound_metavar(ptid) != 0 {
         if tc_unify(ptid, arg_t) == 0 {
-            if !tc_closure_checked_against(arg_node, ptid) { tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(ptid, arg_t)}", arg_node) }
+            tc_arg_mismatch(fn_name, idx + 1, arg_node, ptid, arg_t)
         }
     } else {
         let mut lit_to_int = 0
@@ -5367,7 +5367,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
             lit_to_int = 1
         }
         if lit_to_int == 0 && (types_compatible(arg_t, ptid) == 0 || tc_value_misses_never_slot(ptid, arg_t) != 0) {
-            if !tc_closure_checked_against(arg_node, ptid) { tc_error_at("argument {idx + 1} of `{fn_name}` expects {type_to_str(ptid)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(ptid, arg_t)}", arg_node) }
+            tc_arg_mismatch(fn_name, idx + 1, arg_node, ptid, arg_t)
         }
     }
     arg_t
@@ -5406,7 +5406,7 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
             lit_ok = 1
         }
         if lit_ok == 0 && tc_unify(expected_t, arg_t) == 0 {
-            if !tc_closure_checked_against(value_node, expected_t) { tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(expected_t, arg_t)}", value_node) }
+            tc_arg_mismatch(label, arg_idx + 1, value_node, expected_t, arg_t)
         }
         return
     }
@@ -5423,12 +5423,12 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     // fully-concrete path keeps its existing types_compatible semantics.
     if lit_to_int == 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
         if tc_unify(expected_t, arg_t) == 0 {
-            if !tc_closure_checked_against(value_node, expected_t) { tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(expected_t, arg_t)}", value_node) }
+            tc_arg_mismatch(label, arg_idx + 1, value_node, expected_t, arg_t)
         }
         return
     }
     if lit_to_int == 0 && (types_compatible(arg_t, expected_t) == 0 || tc_value_misses_never_slot(expected_t, arg_t) != 0) {
-        if !tc_closure_checked_against(value_node, expected_t) { tc_error_at("argument {arg_idx + 1} of `{label}` expects {type_to_str(expected_t)}, got {type_to_str(arg_t)}{tc_fn_mismatch_suffix(expected_t, arg_t)}", value_node) }
+        tc_arg_mismatch(label, arg_idx + 1, value_node, expected_t, arg_t)
     }
 }
 
@@ -5807,12 +5807,11 @@ fn tc_warn_todo_in_code(fn_name: Str, node: Int) ! Diag.Report {
 //   - `env.vars` — spelled in sections/04_effects.md:209 and typed Map[Str, Str] at :752, with
 //     no codegen arm at all. Unimplemented, not mistyped.
 //
-// io.read_bytes/write/write_bytes and the five env.* below are none of them spelled in
-// sections/04_effects.md — the IO table at :193 stops at the print family — but unlike fs.read
-// there is no open question about what they ARE: the emitted C fixes each one completely
-// (blink_stdin_read_bytes(int) -> blink_bytes*, blink_stdout_write(const char*) -> void). That
-// is the same basis on which io.read_line was signed above, and it decides nothing the spec has
-// left open. The spec gap is real but separate: these are unspec'd intrinsics, not new types.
+// io.read_bytes, io.read_line and io.read_all are the IO.Read operations of
+// sections/04_effects.md §4.4.9. io.write/write_bytes and the five env.* below are not spelled
+// there, but unlike fs.read there is no open question about what they ARE: the emitted C fixes
+// each one completely (blink_stdout_write(const char*) -> void). The spec gap is real but
+// separate: these are unspec'd intrinsics, not new types.
 fn register_ns_intrinsic_sigs() {
     let bytes_t = new_type(TyKind.Bytes, "Bytes")
 
@@ -5829,8 +5828,9 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("net.set_timeout", [TYPE_INT, TYPE_INT], TYPE_VOID)
     register_intrinsic_fn_sig("net.close", [TYPE_INT], TYPE_VOID)
 
-    register_intrinsic_fn_sig("io.read_line", [], TYPE_STR)
+    register_intrinsic_fn_sig("io.read_line", [], make_option_type(TYPE_STR))
     register_intrinsic_fn_sig("io.read_bytes", [TYPE_INT], bytes_t)
+    register_intrinsic_fn_sig("io.read_all", [], TYPE_STR)
     register_intrinsic_fn_sig("io.write", [TYPE_STR], TYPE_VOID)
     register_intrinsic_fn_sig("io.write_bytes", [bytes_t], TYPE_VOID)
 
@@ -7092,10 +7092,56 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
     diag_error_at(name, code, msg, node_id, help)
 }
 
+// io.read_line() once answered Str, with "" for both a blank line and end of input, so a
+// mismatch on its value says what changed and shows the match that replaces the old use. The
+// help never shows `?? ""`: that form brings the old confusion back (sections/04_effects.md
+// §4.4.9, "Migration").
+fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if !tc_read_line_used_as_str(val, want) { return tc_error_at(msg, at) }
+    tc_errors.push(msg)
+    diag_error_at_notes("TypeError", TYPE_ERROR, msg, at,
+        "match on it: `match io.read_line() \{ Some(line) => ..., None => break }`",
+        ["`io.read_line()` returns `None` at end of input and `Some(\"\")` for a blank line"])
+}
+
+// One report for an argument that does not fit its parameter, unless the closure check
+// already made one for it.
+fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_closure_checked_against(node, want) { return }
+    tc_value_mismatch_at("argument {pos} of `{callee}` expects {type_to_str(want)}, got {type_to_str(got)}{tc_fn_mismatch_suffix(want, got)}", node, node, want)
+}
+
+fn tc_read_line_used_as_str(val: Int, want: Int) -> Bool ! TypeCheck.Resolve {
+    tc_is_read_line_value(val) && resolve_alias_tid(tc_resolve(want)) == TYPE_STR
+}
+
+// A `return` and a labelled argument report at their own node, and a local reads as the
+// value its `let` bound.
+fn tc_is_read_line_value(val: Int) -> Bool {
+    if val < 0 { return false }
+    let k = node_kind(val)
+    if k == NodeKind.Return || k == NodeKind.NamedArg { return tc_is_read_line_value(node_value(val)) }
+    if k == NodeKind.Ident {
+        let binder = tc_ident_binder_node(val)
+        if binder < 0 || node_kind(binder) != NodeKind.LetBinding { return false }
+        return tc_is_read_line_call(node_value(binder))
+    }
+    tc_is_read_line_call(val)
+}
+
+// The receiver test is the one the intrinsic arm makes: a binding named `io`, local or
+// module-level, makes `io.read_line()` a call of its own method.
+fn tc_is_read_line_call(val: Int) -> Bool {
+    if val < 0 || node_kind(val) != NodeKind.MethodCall || node_method(val) != "read_line" { return false }
+    let obj = node_obj(val)
+    node_kind(obj) == NodeKind.Ident && node_name(obj) == "io" && nr_top_index("io") == -1
+}
+
 // A binding declared as T whose value is a channel `recv()`: recv answers Option[T], and the
 // help names the forms that handle a closed channel before the `.unwrap()` that panics on one.
 fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let recv_help = tc_recv_option_help(val, declared, got)
+    if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared) }
     let help = if recv_help != "" { recv_help } else { tc_hidden_variant_help(val, declared) }
     tc_error_at_code(msg, at, "TypeError", TYPE_ERROR, help)
 }
@@ -19786,7 +19832,12 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
                         let unordered = if cmp_operands_ok(lt, lt, 1) != 0 { rt } else { lt }
                         tc_error_at("binary `{op}` needs Ord, and {type_to_str(unordered)} does not implement Ord", node)
                     } else {
-                        tc_error_at("binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
+                        let cmp_msg = "binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}"
+                        if tc_is_read_line_value(node_right(node)) {
+                            tc_value_mismatch_at(cmp_msg, node, node_right(node), lt)
+                        } else {
+                            tc_value_mismatch_at(cmp_msg, node, node_left(node), rt)
+                        }
                     }
                 }
             }
@@ -26130,7 +26181,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             }
             if tc_tid_is_no_info(target_t) == 0 && tc_tid_is_no_info(val_t) == 0 {
                 if assignment_types_compatible(target_t, val_t, val) == 0 {
-                    if !tc_closure_checked_against(val, target_t) { tc_error_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node) }
+                    if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t) }
                 } else {
                     // An assignment TARGET is a declared-type source for the value's
                     // metavars, not only something to compare against — the same
@@ -28826,6 +28877,11 @@ fn tc_report_unclaimed_calls() ! Diag.Report {
             if q == "default" {
                 diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "`default` is only valid inside a handler operation body", uc,
                     "`default` names the handler an operation's own handler was installed over")
+            } else if q == "io" && mname == "lines" {
+                // Some languages have a lines iterator on stdin; Blink reads lines with two
+                // forms, and the help shows both (sections/04_effects.md §4.4.9).
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no method `lines` on the `io` handle", uc,
+                    "read all the input, then split it: `for line in io.read_all().lines() \{ ... }`\nor read one line at a time: `loop \{ match io.read_line() \{ Some(line) => ..., None => break } }`")
             } else if is_builtin_namespace(q) == 1 || is_import_module_name(q) == 1 {
                 let near = suggest_module_member(tc_qualifier_to_module_or_self(q), mname)
                 let help = if near != "" { "did you mean `{q}.{near}`?" } else { "" }
@@ -28939,7 +28995,7 @@ pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
         }
     }
     if namespace == "io" {
-        if method == "println" || method == "print" || method == "print_raw" || method == "eprintln" || method == "eprint" || method == "eprint_raw" || method == "log" || method == "debug" || method == "read_line" || method == "read_bytes" || method == "write" || method == "write_bytes" {
+        if method == "println" || method == "print" || method == "print_raw" || method == "eprintln" || method == "eprint" || method == "eprint_raw" || method == "log" || method == "debug" || method == "read_line" || method == "read_bytes" || method == "read_all" || method == "write" || method == "write_bytes" {
             return 1
         }
     }

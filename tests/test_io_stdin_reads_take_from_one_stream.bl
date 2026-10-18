@@ -1,0 +1,274 @@
+// io.read_bytes, io.read_line and io.read_all take bytes from the front of one standard
+// input stream, in the order the program calls them, with the line rules of
+// sections/04_effects.md §4.4.9. Each test puts its input on fd 0 as an in-memory fd and
+// reads it to the end, so the next test starts on an empty stream.
+import std.libc.{write_bytes}
+import std.process.{spawn, Pid}
+
+@ffi("memfd_create", header: "sys/mman.h")
+@trusted(audit: "TEST-STDIN-STREAM: anonymous in-memory fd to stand in for standard input")
+fn t_memfd_create(name: Ptr[U8], flags: U32) -> I32 ! FFI {}
+
+@ffi("lseek", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-STREAM: rewind the in-memory fd after the write")
+fn t_lseek(fd: I32, offset: I64, whence: I32) -> I64 ! FFI {}
+
+@ffi("dup2", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-STREAM: make the in-memory fd the standard input")
+fn t_dup2(old_fd: I32, new_fd: I32) -> I32 ! FFI {}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-STREAM: close the in-memory fd, and close fd 0 to fail a read")
+fn t_close(fd: I32) -> I32 ! FFI {}
+
+@ffi("pipe", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-STREAM: a pipe whose read end stands in for standard input")
+fn t_pipe(fds: Ptr[I32]) -> I32 ! FFI {}
+
+@ffi("fcntl", header: "fcntl.h")
+@trusted(audit: "TEST-STDIN-STREAM: set O_NONBLOCK on the pipe read end")
+fn t_fcntl(fd: I32, cmd: I32, arg: I32) -> I32 ! FFI {}
+
+// fd 0 is an empty pipe that is not blocking; a child process holds the write end and writes
+// `late\n` to it after a pause, then exits.
+@trusted(audit: "TEST-STDIN-STREAM: read both descriptors pipe(2) fills")
+fn stdin_from_late_writer() -> Pid ! IO, FFI {
+    let ends = with ffi.scope() as scope {
+        let fds = scope.alloc_n[I32](2)
+        assert(t_pipe(fds).to_int() == 0)
+        (fds.deref().to_int(), fds.offset(1).deref().to_int())
+    }
+    let (r, w) = ends
+    // F_SETFL is 4 and O_NONBLOCK is 0o4000 on Linux.
+    assert(t_fcntl(r.to_i32(), 4.to_i32(), 2048.to_i32()).to_int() == 0)
+    assert(t_dup2(r.to_i32(), 0.to_i32()).to_int() == 0)
+    let _ = t_close(r.to_i32())
+    let child = spawn("sh", ["-c", "sleep 0.2; printf 'late\\n' >&{w}"])
+    let _ = t_close(w.to_i32())
+    child
+}
+
+fn stdin_bytes(data: Bytes) ! IO, FFI {
+    let fd = with ffi.scope() as scope {
+        let name = scope.cstr("blink_stdin_stream_test")
+        t_memfd_create(name, 0.to_u32()).to_int()
+    }
+    assert(fd >= 0)
+    let _ = write_bytes(fd, data)
+    let _ = t_lseek(fd.to_i32(), 0, 0)
+    // With fd 0 closed, the new fd is fd 0 already.
+    if fd != 0 {
+        assert(t_dup2(fd.to_i32(), 0.to_i32()).to_int() == 0)
+        let _ = t_close(fd.to_i32())
+    }
+}
+
+fn stdin_text(text: Str) ! IO, FFI {
+    stdin_bytes(Bytes.from_str(text))
+}
+
+fn all_lines() -> List[Str] ! IO {
+    let mut out: List[Str] = []
+    loop {
+        match io.read_line() {
+            Some(line) => out.push(line)
+            None => break
+        }
+    }
+    out
+}
+
+fn digits(n: Int) -> Str {
+    let sb = StringBuilder.new()
+    let mut i = 0
+    while i < n {
+        sb.write("{i % 10}")
+        i += 1
+    }
+    sb.to_str()
+}
+
+test "a blank line is Some of the empty string and end of input is None" {
+    stdin_text("a\n\nb\n")
+    assert_eq(io.read_line(), Some("a"))
+    assert_eq(io.read_line(), Some(""))
+    assert_eq(io.read_line(), Some("b"))
+    assert_eq(io.read_line(), None)
+}
+
+test "read_line strips a CRLF terminator and keeps a final line with no terminator" {
+    stdin_text("a\r\nb")
+    assert_eq(all_lines(), ["a", "b"])
+}
+
+test "a lone newline is one blank line" {
+    stdin_text("\n")
+    assert_eq(all_lines(), [""])
+}
+
+test "empty input gives no line" {
+    stdin_text("")
+    assert_eq(io.read_line(), None)
+}
+
+test "a carriage return not before a newline stays in the line" {
+    stdin_text("a\rb\nc\r")
+    assert_eq(all_lines(), ["a\rb", "c\r"])
+}
+
+test "a line longer than 4096 bytes comes back whole" {
+    let long = digits(5000)
+    stdin_text("{long}\nnext\n")
+    assert_eq(all_lines(), [long, "next"])
+}
+
+test "a line longer than 64 KiB comes back whole" {
+    let long = digits(200000)
+    stdin_text("{long}\r\nnext")
+    let got = all_lines()
+    assert_eq(got.len(), 2)
+    assert(got.get(0).unwrap() == long)
+    assert_eq(got.get(1).unwrap(), "next")
+}
+
+test "a header line, a body of known length and the next header read from one stream" {
+    stdin_text("Content-Length: 5\r\n\r\nhelloContent-Length: 2\r\n\r\nhi")
+    assert_eq(io.read_line(), Some("Content-Length: 5"))
+    assert_eq(io.read_line(), Some(""))
+    assert(io.read_bytes(5) == Bytes.from_str("hello"))
+    assert_eq(io.read_line(), Some("Content-Length: 2"))
+    assert_eq(io.read_line(), Some(""))
+    assert(io.read_bytes(2) == Bytes.from_str("hi"))
+    assert_eq(io.read_line(), None)
+}
+
+test "read_all after read_line gives the rest of the input" {
+    stdin_text("first\nsecond\nthird")
+    assert_eq(io.read_line(), Some("first"))
+    assert_eq(io.read_all(), "second\nthird")
+    assert_eq(io.read_all(), "")
+}
+
+test "read_all at end of input is empty" {
+    stdin_text("")
+    assert_eq(io.read_all(), "")
+}
+
+test "read_bytes gives exactly n bytes, fewer only at end of input, then empty" {
+    stdin_text("abcdefg")
+    assert(io.read_bytes(3) == Bytes.from_str("abc"))
+    assert(io.read_bytes(10) == Bytes.from_str("defg"))
+    assert(io.read_bytes(10).is_empty())
+}
+
+test "read_all gives the lines of repeated read_line calls with their terminators" {
+    let text = "one\r\n\ntwo\rx\nlast"
+    stdin_text(text)
+    let all = io.read_all()
+    assert_eq(all, text)
+    assert_eq(all.lines(), ["one", "", "two\rx", "last"])
+}
+
+test "read_bytes with n of zero panics before it reads" {
+    stdin_text("abc")
+    assert_panics(matching: "io.read_bytes") {
+        let _ = io.read_bytes(0)
+    }
+    assert_eq(io.read_all(), "abc")
+}
+
+test "read_bytes with a negative n panics before it reads" {
+    stdin_text("abc")
+    assert_panics(matching: "io.read_bytes") {
+        let _ = io.read_bytes(-1)
+    }
+    assert_eq(io.read_all(), "abc")
+}
+
+test "read_line on bytes that are not UTF-8 panics and names io.read_bytes" {
+    let mut bad = Bytes.from_str("ok\nx")
+    bad.push(255)
+    bad = bad.concat(Bytes.from_str("\nafter\n"))
+    stdin_bytes(bad)
+    assert_eq(io.read_line(), Some("ok"))
+    assert_panics(matching: "io.read_line: input is not valid UTF-8; read it with io.read_bytes") {
+        let _ = io.read_line()
+    }
+    assert_eq(io.read_line(), Some("after"))
+    assert_eq(io.read_line(), None)
+}
+
+test "read_all on bytes that are not UTF-8 panics and names io.read_bytes" {
+    let mut bad = Bytes.from_str("x")
+    bad.push(192)
+    stdin_bytes(bad)
+    assert_panics(matching: "io.read_all: input is not valid UTF-8; read it with io.read_bytes") {
+        let _ = io.read_all()
+    }
+    assert_eq(io.read_all(), "")
+}
+
+test "a read failure panics and names the op and the errno" {
+    stdin_text("")
+    let _ = t_close(0.to_i32())
+    assert_panics(matching: "io.read_line") {
+        let _ = io.read_line()
+    }
+    assert_panics(matching: "errno 9") {
+        let _ = io.read_all()
+    }
+    assert_panics(matching: "io.read_bytes") {
+        let _ = io.read_bytes(1)
+    }
+    stdin_text("")
+    assert_eq(io.read_line(), None)
+}
+
+test "a read on standard input that is not blocking waits for the input" {
+    let child = stdin_from_late_writer()
+    assert_eq(io.read_line(), Some("late"))
+    assert_eq(io.read_line(), None)
+    assert_eq(child.wait().exit_code, 0)
+}
+
+test "lines read inside an arena outlive it" {
+    stdin_text("alpha\nbeta\ngamma")
+    let mut keep: List[Str] = []
+    with arena {
+        keep.push(io.read_line().unwrap())
+        keep.push(io.read_line().unwrap())
+        keep.push(io.read_all())
+    }
+    with arena {
+        let mut junk: List[Str] = []
+        let mut i = 0
+        while i < 2000 {
+            junk.push("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz{i}")
+            i += 1
+        }
+    }
+    assert_eq(keep, ["alpha", "beta", "gamma"])
+}
+
+test "an overlong encoding, a surrogate and a lead byte past U+10FFFF are not UTF-8" {
+    let cases: List[List[Int]] = [[192, 128], [224, 128, 128], [240, 128, 128, 128], [237, 160, 128], [244, 144, 128, 128], [245, 128, 128, 128]]
+    for c in cases {
+        let mut bad = Bytes.from_str("")
+        for b in c { bad.push(b) }
+        bad = bad.concat(Bytes.from_str("\nnext\n"))
+        stdin_bytes(bad)
+        assert_panics(matching: "io.read_line: input is not valid UTF-8") {
+            let _ = io.read_line()
+        }
+        assert_eq(io.read_line(), Some("next"))
+    }
+}
+
+test "a byte that never starts a UTF-8 sequence is named as an invalid byte" {
+    let mut bad = Bytes.from_str("x")
+    bad.push(255)
+    stdin_bytes(bad)
+    assert_panics(matching: "invalid byte at byte") {
+        let _ = io.read_all()
+    }
+}
