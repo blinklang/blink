@@ -1,0 +1,125 @@
+// A call through a bound reads the trait's declared signature with `Self` as the receiver's
+// type parameter and each trait type parameter as the bound's argument (sections/03_types.md
+// §3.6). So through `U: Tr[Int]` an argument is held to `Int` and the result is `Int`, and a
+// mistake is a type error at the call, as it is on a concrete receiver, not a C error later.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
+import parser.{node_count, node_kind, node_method}
+import ast.{NodeKind}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn bound_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Everything the probe reported that is not a warning, as `name: message` lines.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
+    }
+    out
+}
+
+fn first_method_call_type_str(name: Str) -> Str {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == name {
+            return tc_type_str(tc_lookup_node_tid(i))
+        }
+        i = i + 1
+    }
+    ""
+}
+
+fn tr_src(body: Str, ret: Str) -> Str {
+    let head = #"type Pt {
+    v: Int
+}
+
+trait Tr[T] {
+    fn put(self, x: T) -> T
+}
+
+impl Tr[Int] for Pt {
+    fn put(self, x: Int) -> Int {
+        x + self.v
+    }
+}
+
+"#
+    head.concat("fn probe[U: Tr[Int]](u: U) -> {ret} \{\n    {body}\n}\n\nfn main() \{\n    let _ = probe(Pt \{ v: 1 })\n}\n")
+}
+
+fn maker_src(body: Str, ret: Str) -> Str {
+    let head = #"type Pt {
+    v: Int
+}
+
+trait Maker {
+    fn make(self) -> Self
+}
+
+impl Maker for Pt {
+    fn make(self) -> Self {
+        Pt { v: self.v }
+    }
+}
+
+"#
+    head.concat("fn probe[T: Maker](v: T) -> {ret} \{\n    {body}\n}\n\nfn main() \{\n    let _ = probe(Pt \{ v: 1 })\n}\n")
+}
+
+test "a call through a bound types its result at the bound's argument" {
+    bound_probe(".tmp/_tc_bound_args_ret.bl", tr_src("u.put(1)", "Int"))
+    let p = problems_reported()
+    assert(p == "", "expected no problems, got:\n{p}")
+    let t = first_method_call_type_str("put")
+    assert(t == "Int", "expected u.put(1) to type as Int, got '{t}'")
+}
+
+test "an argument of the wrong type through a bound is a type error" {
+    bound_probe(".tmp/_tc_bound_args_arg.bl", tr_src("u.put(\"s\")", "Int"))
+    let p = problems_reported()
+    assert(p.contains("TypeError: argument 1 of `Tr.put` expects Int, got Str"), "expected the argument to be held to Int, got:\n{p}")
+}
+
+test "an argument of the wrong type through a qualified call on a bound is a type error" {
+    bound_probe(".tmp/_tc_bound_args_qarg.bl", tr_src("Tr.put(u, \"s\")", "Int"))
+    let p = problems_reported()
+    assert(p.contains("expects Int, got Str"), "expected the argument to be held to Int, got:\n{p}")
+}
+
+test "a result through a bound used at the wrong type is a type error" {
+    bound_probe(".tmp/_tc_bound_args_wrong_ret.bl", tr_src("u.put(1)", "Str"))
+    let p = problems_reported()
+    assert(p.contains("TypeError"), "expected Int where Str is wanted to be a type error, got:\n{p}")
+}
+
+test "a call through a bound returning Self types as the receiver's type parameter" {
+    bound_probe(".tmp/_tc_bound_self_ret.bl", maker_src("v.make()", "T"))
+    let p = problems_reported()
+    assert(p == "", "expected no problems, got:\n{p}")
+    let t = first_method_call_type_str("make")
+    assert(t == "T", "expected v.make() to type as T, got '{t}'")
+}
+
+test "a qualified call through a bound returning Self used at the wrong type is a type error" {
+    bound_probe(".tmp/_tc_bound_self_qret.bl", maker_src("Maker.make(v)", "Int"))
+    let p = problems_reported()
+    assert(p.contains("TypeError"), "expected T where Int is wanted to be a type error, got:\n{p}")
+}
+
+test "a call through a bound returning Self used at the wrong type is a type error" {
+    bound_probe(".tmp/_tc_bound_self_wrong_ret.bl", maker_src("v.make()", "Int"))
+    let p = problems_reported()
+    assert(p.contains("TypeError"), "expected T where Int is wanted to be a type error, got:\n{p}")
+}

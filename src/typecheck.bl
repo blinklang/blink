@@ -4853,23 +4853,6 @@ fn tc_check_keyword_args(fn_name: Str, sig: Int, args_sl: Int, self_offset: Int,
     0
 }
 
-// A call that reads a trait's signature compares no argument against its parameter types,
-// which may name `Self` or a trait type parameter, so a default it filled takes its type
-// here: the parameter's, which its value was held to at the declaration.
-fn tc_type_default_fills(sig: Int, args_sl: Int, self_offset: Int) {
-    if args_sl == -1 { return }
-    let fs = fnsig_pool.get(sig).unwrap()
-    let mut i = 0
-    while i < sublist_length(args_sl) {
-        let arg = sublist_get(args_sl, i)
-        if tc_is_default_fill(arg) {
-            let pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg))
-            if pidx >= 0 { tc_publish_node_tid(arg, fnsig_param_list.get(fs.params_start + pidx).unwrap()) }
-        }
-        i = i + 1
-    }
-}
-
 // A keyword argument typecheck appended from a declaration's default. Its value was checked
 // at the declaration, in the module the fill names, so nothing reads it again in the caller.
 pub fn tc_is_default_fill(arg: Int) -> Bool {
@@ -11042,6 +11025,47 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
         }
     }
     substitute_typevar_tid(type_tid, binds)
+}
+
+// The binds a call through a bound reads the trait method's declared signature with: `Self`
+// is the receiver's type parameter and each trait type parameter is the bound's argument, so
+// through `U: Tr[Int]` the trait's `T` is `Int`. The bound is read off the receiver's binder,
+// which keeps the argument a bound spelled with another type parameter (`U: Tr[V]`) in that
+// declaration's scope. A trait type parameter the bound gives no argument for stays unbound.
+fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut binds: Map[Str, Int] = Map()
+    binds.insert("Self", recv_tid)
+    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), recv_tid)
+    let tm = tc_tmsig_pool.get(tmsig_idx).unwrap()
+    if tm.tparams_count == 0 { return binds }
+    let args_sl = tc_bound_trait_args(tc_tid_binder(recv_tid), tm.trait_name)
+    if args_sl == -1 { return binds }
+    let mut k = 0
+    while k < tm.tparams_count && k < sublist_length(args_sl) {
+        let tp_name = tc_trait_tparam_names.get(tm.tparams_start + k).unwrap()
+        let tp_node = tc_trait_tparam_nodes.get(tm.tparams_start + k) ?? NO_BINDER_NODE
+        let arg_tid = resolve_type_ann(sublist_get(args_sl, k))
+        binds.insert(tp_name, arg_tid)
+        binds.insert(tc_binder_key(tp_node, tp_name), arg_tid)
+        k = k + 1
+    }
+    binds
+}
+
+// The trait arguments the type parameter declared at `binder` is bounded by `trait_name`
+// at (`[Int]` of `U: Tr[Int]`), or -1 when its bounds do not name the trait with arguments.
+fn tc_bound_trait_args(binder: Int, trait_name: Str) -> Int {
+    if binder < 0 { return -1 }
+    if node_kind(binder) != NodeKind.TypeParam { return -1 }
+    let bounds = node_elements(binder)
+    if bounds == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(bounds) {
+        let b = sublist_get(bounds, i)
+        if strip_module_qualifier(node_name(b)) == trait_name { return node_elements(b) }
+        i = i + 1
+    }
+    -1
 }
 
 // One deep trait-contract compare: `verdict` is -1 when a side is unknown
@@ -20983,15 +21007,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 while tvi < tc_tmsig_pool.len() {
                     let tm = tc_tmsig_pool.get(tvi).unwrap()
                     if tm.method == method && tc_pipe_has(tv_traits, tm.trait_name) != 0 {
-                        // The keyword shape and the count only. A parameter typed `Self` or by
-                        // a trait type parameter is unbound here, so the per-argument compare
-                        // would reject correct code.
-                        let tv_name = "{tm.trait_name}.{method}"
-                        if tc_check_keyword_args(tv_name, tm.sig, args_sl, 1, node) == 0 {
-                            tc_type_default_fills(tm.sig, args_sl, 1)
-                            tc_check_call_arity(tv_name, tm.sig, args_sl, 1, node)
-                        }
-                        return tm.ret_tid
+                        let binds = tc_bound_call_binds(obj_t, tvi)
+                        let _ = check_arg_shapes_with_binds("{tm.trait_name}.{method}", tm.sig, args_sl, 1, node, binds)
+                        return substitute_typevar_tid(tm.ret_tid, binds)
                     }
                     tvi = tvi + 1
                 }
@@ -21386,17 +21404,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             if qtm.trait_name == obj_name && qtm.method == method {
                                 // The receiver IS param 0 (`self`), so the declared param count
                                 // is the qualified form's arity exactly, as it is on the concrete
-                                // path below. The per-argument type compare is NOT made here: a
-                                // trait param declared `Self` or over a trait type parameter is
-                                // bound per instantiation, and comparing an unbound one rejects
-                                // correct code.
+                                // path below.
                                 let qtm_kw_bad = tc_check_keyword_args("{obj_name}.{method}", qtm.sig, qt_args, 0, node)
-                                if qtm_kw_bad == 0 { tc_type_default_fills(qtm.sig, qt_args, 0) }
                                 let qtm_filled = if qt_args != -1 { sublist_length(qt_args) } else { 0 }
                                 if qtm_kw_bad == 0 && qtm_filled != qtm.params_count {
                                     tc_error_at("qualified trait call `{obj_name}.{method}` expects {qtm.params_count} argument(s) including the receiver, got {qtm_filled}", node)
                                 }
-                                return qtm.ret_tid
+                                let qtm_binds = tc_bound_call_binds(qt_recv, qv)
+                                let _ = tc_check_arg_types_with_binds("{obj_name}.{method}", qtm.sig, qt_args, 0, qtm_binds)
+                                return substitute_typevar_tid(qtm.ret_tid, qtm_binds)
                             }
                             qv = qv + 1
                         }
