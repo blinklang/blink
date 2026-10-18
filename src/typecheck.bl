@@ -1,7 +1,7 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
-import unparse.{type_ann_text, type_ann_names, unparse_expr}
+import unparse.{type_ann_text, unparse_expr}
 import formatter.{effect_op_sig_text}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
@@ -24,7 +24,7 @@ import diagnostics.{
     diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
-    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line,
+    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
@@ -13284,33 +13284,63 @@ fn partial_handler_child(ed: Int, name: Str) -> Int {
     -1
 }
 
+// The clause the fix adds for one omitted operation. `fixable` is false when the file that gets
+// it cannot spell one of the types the operation names.
+type HandlerStub {
+    text: Str
+    fixable: Bool
+}
+
+// The qualifier through which `here` reaches `decl` as `name`, or "" when no import of
+// `here` reaches it.
+fn partial_handler_qualifier(name: Str, decl: Int, here: Str) -> Str {
+    let quals = nr_module_imports_built(here).qualifiers
+    for q in quals.keys() {
+        if nr_resolve_decl_in_module(quals.get(q) ?? "", name, 0) == decl { return q }
+    }
+    ""
+}
+
 // The clause the fix adds for `op` in module `here`: its declared signature, forwarding on
-// purpose. The declaration spells its types for its own module, so a type that module declares
-// and `here` does not reach by its bare name is spelled qualified.
-fn partial_handler_stub(op: Int, decl_mod: Str, here: Str) -> Str {
-    let mut args: List[Str] = []
+// purpose. The declaration spells its types for its own module, so a type that `here` reaches
+// only through a qualifier is spelled qualified. A parameter named `default` would shadow the
+// handler the clause forwards to, so it gets a fresh name.
+fn partial_handler_stub(op: Int, decl_mod: Str, here: Str) -> HandlerStub {
+    let mut taken: List[Str] = []
     let mut names: List[Str] = []
     let params = node_params(op)
     if params != -1 {
         let mut i = 0
         while i < sublist_length(params) {
             let p = sublist_get(params, i)
-            args.push(node_name(p))
-            if node_type_ann(p) != -1 { type_ann_names(node_type_ann(p), names) } else { names.push(node_type_name(p)) }
+            taken.push(node_name(p))
+            if node_type_ann(p) != -1 { tc_collect_type_ann_names(node_type_ann(p), names) } else { names.push(node_type_name(p)) }
             i = i + 1
         }
     }
-    if node_type_ann(op) != -1 { type_ann_names(node_type_ann(op), names) } else { names.push(node_return_type(op)) }
+    if node_type_ann(op) != -1 { tc_collect_type_ann_names(node_type_ann(op), names) } else { names.push(node_return_type(op)) }
+    let mut args: List[Str] = []
+    for n in taken {
+        let mut a = n
+        if n == "default" {
+            a = "default_"
+            while taken.contains(a) { a = a.concat("_") }
+        }
+        args.push(a)
+    }
     let mut renames: Map[Str, Str] = Map()
+    let mut fixable = true
     if decl_mod != here {
         for n in names {
-            let bare = nr_module_declares(here, n) == 0 && is_filtered_for_module(n, decl_mod, here) == 0
-            if nr_module_declares(decl_mod, n) != 0 && !bare {
-                renames.insert(n, "{tc_qualifier_for_module(decl_mod)}.{n}")
+            let d = nr_resolve_bare_decl(n, decl_mod)
+            if d != -1 && !renames.contains_key(n) && nr_resolve_bare_decl(n, here) != d {
+                let q = partial_handler_qualifier(n, d, here)
+                if q == "" { fixable = false } else { renames.insert(n, "{q}.{n}") }
             }
         }
     }
-    "{effect_op_sig_text(op, renames)} \{ default.{node_name(op)}({args.join(", ")}) }"
+    let text = "{effect_op_sig_text(op, renames, args, false)} \{ default.{node_name(op)}({args.join(", ")}) }"
+    HandlerStub { text: text, fixable: fixable }
 }
 
 fn leading_whitespace(line: Str) -> Str {
@@ -13329,24 +13359,54 @@ fn partial_handler_fix(he: Int, stubs: List[Str], action: Str) {
     if close_line <= 0 || close_col <= 0 || text.byte_len() < close_col { return }
     let before = text.byte_slice(0, close_col - 1)
     if leading_whitespace(before) == before {
+        let unit = indent_unit(before)
         let mut add = ""
-        for stub in stubs { add = add.concat("    {stub}\n{before}") }
+        for stub in stubs { add = add.concat("{unit}{stub}\n{before}") }
         diag_set_last_fix_at(action, add, close_line, close_col, close_line, close_col)
         return
     }
     let base = leading_whitespace(diag_source_line(file, node_line(he)))
+    let unit = indent_unit(base)
     let mut end = before.byte_len()
     while end > 0 && (before.byte_at(end - 1) == 32 || before.byte_at(end - 1) == 9) { end = end - 1 }
     let mut add = "\n"
-    for stub in stubs { add = add.concat("{base}    {stub}\n") }
+    for stub in stubs { add = add.concat("{base}{unit}{stub}\n") }
     diag_set_last_fix_at(action, add.concat(base), close_line, end + 1, close_line, close_col)
+}
+
+// One level of indentation in the style of `ws`: a tab when it holds one, else four spaces.
+fn indent_unit(ws: Str) -> Str {
+    if ws.contains("\t") { "\t" } else { "    " }
+}
+
+// The column just past the effect name of the handler expression `he`, which names `eff`.
+// Any run of blanks may sit between `handler` and the name.
+fn partial_handler_span_end(he: Int, eff: Str) -> Int {
+    let line = diag_source_line(diag_file_for_node(he), node_line(he))
+    let mut i = node_col(he) - 1 + "handler".byte_len()
+    while i < line.byte_len() && (line.byte_at(i) == 32 || line.byte_at(i) == 9) { i = i + 1 }
+    if i + eff.byte_len() > line.byte_len() { return node_col(he) + "handler ".byte_len() + eff.byte_len() }
+    i + 1 + eff.byte_len()
+}
+
+// The EffectDecl named `root`. A handle is the lowercased name, so two effects whose names
+// differ only in case share one, and the handle alone does not say which is meant.
+fn tc_effect_decl_named(root: Str) -> Int {
+    let handle = str_to_lower(root)
+    for h in tc_ue_handles {
+        if h.handle == handle && node_name(h.decl) == root { return h.decl }
+    }
+    -1
 }
 
 fn tc_check_partial_handler(he: Int) ! Diag.Report {
     let eff = node_name(he)
     let root = tc_handler_effect_root(eff)
-    let ed = tc_ue_handle_decl(str_to_lower(root))
-    if ed == -1 || node_name(ed) != root { return }
+    let ed = tc_effect_decl_named(root)
+    if ed == -1 { return }
+    // A declaration the parser recovered from may have lost operations, so its handlers are
+    // not judged against it.
+    if diag_errors_in_lines(diag_file_for_node(ed), node_line(ed), node_end_line(ed)) > 0 { return }
     let root_marked = has_annotation(ed, "handle_all") != 0
     let mut implemented: Map[Str, Int] = Map()
     let clauses = node_methods(he)
@@ -13387,9 +13447,12 @@ fn tc_check_partial_handler(he: Int) ! Diag.Report {
     if missing.len() == 0 { return }
     let mut names: List[Str] = []
     let mut stubs: List[Str] = []
+    let mut fixable = true
     for op in missing {
         names.push("`{node_name(op)}`")
-        stubs.push(partial_handler_stub(op, node_module(ed), nr_current_module))
+        let stub = partial_handler_stub(op, node_module(ed), nr_current_module)
+        stubs.push(stub.text)
+        fixable = fixable && stub.fixable
     }
     let one = missing.len() == 1
     let pronoun = if one { "it" } else { "them" }
@@ -13399,10 +13462,10 @@ fn tc_check_partial_handler(he: Int) ! Diag.Report {
     let before = diag_entry_count()
     diag_warn_span_at_notes("PartialHandler", PARTIAL_HANDLER,
         "handler for `{eff}` does not implement {names.join(", ")}", he,
-        node_col(he) + "handler ".byte_len() + eff.byte_len(),
+        partial_handler_span_end(he, eff),
         "implement {pronoun}, or forward on purpose: `{stubs.get(0).unwrap()}`", notes)
     // A silenced warning records no entry, and the fix would land on someone else's.
-    if diag_entry_count() == before { return }
+    if diag_entry_count() == before || !fixable { return }
     partial_handler_fix(he, stubs, if one { "add the omitted operation" } else { "add the omitted operations" })
 }
 

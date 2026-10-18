@@ -655,12 +655,12 @@ fn format_closure_inline(node: Int) -> Str {
 }
 
 pub fn format_param(node: Int) -> Str {
-    format_param_renamed(node, Map())
+    format_param_renamed(node, Map(), node_name(node), true)
 }
 
-// format_param with its type spelled through type_ann_text_renamed.
-fn format_param_renamed(node: Int, renames: Map[Str, Str]) -> Str {
-    let name = node_name(node)
+// format_param under the name `name`, with its type spelled through type_ann_text_renamed, and
+// its default value only when `with_default` holds.
+fn format_param_renamed(node: Int, renames: Map[Str, Str], name: Str, with_default: Bool) -> Str {
     let type_name = node_type_name(node)
     let is_mut = node_is_mut(node)
     let type_ann = node_type_ann(node)
@@ -677,7 +677,7 @@ fn format_param_renamed(node: Int, renames: Map[Str, Str]) -> Str {
         sb.write(renames.get(type_name) ?? type_name)
     }
     let dflt = node_value(node)
-    if dflt != -1 {
+    if with_default && dflt != -1 {
         sb.write(" = ")
         sb.write(format_expr(dflt))
     }
@@ -2001,12 +2001,17 @@ fn format_block_body(node: Int) ! Format.Emit {
 // ── Top-level formatting ────────────────────────────────────────────
 
 pub fn format_fn_sig_suffix(ret: Str, ret_ann: Int, effects_sl: Int) -> Str {
+    format_fn_sig_suffix_renamed(ret, ret_ann, effects_sl, Map())
+}
+
+// format_fn_sig_suffix with the return type spelled through type_ann_text_renamed.
+fn format_fn_sig_suffix_renamed(ret: Str, ret_ann: Int, effects_sl: Int, renames: Map[Str, Str]) -> Str {
     let mut suffix = ""
     if ret != "" {
         if ret_ann != -1 {
-            suffix = suffix.concat(" -> ").concat(type_ann_text(ret_ann))
+            suffix = suffix.concat(" -> ").concat(type_ann_text_renamed(ret_ann, renames))
         } else {
-            suffix = suffix.concat(" -> ").concat(ret)
+            suffix = suffix.concat(" -> ").concat(renames.get(ret) ?? ret)
         }
     }
     if effects_sl != -1 && sublist_length(effects_sl) > 0 {
@@ -2504,7 +2509,6 @@ fn annotation_order(name: Str) -> Int {
     }
 }
 
-// Annotations print in the canonical order, whatever order the source wrote them in.
 // What precedes an item's own line. Comment attachment gives a comment written above an
 // annotation to the annotation, and one between the annotations and the item to the item, so
 // each is printed where it was written. A doc comment goes first, above the annotations.
@@ -2514,41 +2518,32 @@ fn format_item_head(node: Int) ! Format.Emit {
     emit_leading_comments(node)
 }
 
+// Annotations print in the canonical order, whatever order the source wrote them in; two that
+// share a rank keep their source order. A comment above the first annotation the source wrote
+// is about the whole list, so it stays on top; any other stays with its annotation.
 fn format_sorted_annotations(anns_sl: Int) ! Format.Emit {
-    if anns_sl == -1 {
+    if anns_sl == -1 || sublist_length(anns_sl) == 0 {
         return
     }
-    let count = sublist_length(anns_sl)
+    let first = sublist_get(anns_sl, 0)
+    emit_comments(first)
     let mut sorted: List[Int] = []
     let mut i = 0
-    while i < count {
-        sorted.push(sublist_get(anns_sl, i))
+    while i < sublist_length(anns_sl) {
+        let ann = sublist_get(anns_sl, i)
+        let rank = annotation_order(node_name(ann))
+        let mut pos = sorted.len()
+        while pos > 0 && annotation_order(node_name(sorted.get(pos - 1).unwrap())) > rank { pos = pos - 1 }
+        sorted.insert(pos, ann)
         i = i + 1
     }
-    let mut si = 0
-    while si < count - 1 {
-        let mut min_idx = si
-        let mut sj = si + 1
-        while sj < count {
-            if annotation_order(node_name(sorted.get(sj).unwrap())) < annotation_order(node_name(sorted.get(min_idx).unwrap())) {
-                min_idx = sj
-            }
-            sj = sj + 1
-        }
-        if min_idx != si {
-            let tmp = sorted.get(si).unwrap()
-            sorted.set(si, sorted.get(min_idx).unwrap())
-            sorted.set(min_idx, tmp)
-        }
-        si = si + 1
-    }
     for ann in sorted {
+        if ann != first { emit_comments(ann) }
         format_annotation(ann)
     }
 }
 
 fn format_annotation(node: Int) ! Format.Emit {
-    emit_comments(node)
     let name = node_name(node)
     let args_sl = node_args(node)
     let mut line = "@".concat(name)
@@ -2652,9 +2647,11 @@ fn format_effect_decl(node: Int) ! Format.Emit {
 }
 
 // The signature line of an effect operation, without its body. The PartialHandler fix spells
-// each operation it adds with this, so the added clause matches the declaration exactly;
-// `renames` respells a type name the file that gets the clause can reach only qualified.
-pub fn effect_op_sig_text(node: Int, renames: Map[Str, Str]) -> Str {
+// each operation it adds with this, so the added clause matches the declaration: `renames`
+// respells a type name the file that gets the clause reaches another way, `params` renames the
+// parameters it lists in order, and a clause leaves the defaults out because they apply at the
+// call site only.
+pub fn effect_op_sig_text(node: Int, renames: Map[Str, Str], params: List[Str], with_defaults: Bool) -> Str {
     let params_sl = node_params(node)
     let mut line = "fn ".concat(node_name(node)).concat("(")
     if params_sl != -1 {
@@ -2663,21 +2660,17 @@ pub fn effect_op_sig_text(node: Int, renames: Map[Str, Str]) -> Str {
             if i > 0 {
                 line = line.concat(", ")
             }
-            line = line.concat(format_param_renamed(sublist_get(params_sl, i), renames))
+            let p = sublist_get(params_sl, i)
+            line = line.concat(format_param_renamed(p, renames, params.get(i) ?? node_name(p), with_defaults))
             i = i + 1
         }
     }
-    line = line.concat(")")
-    let ret = node_return_type(node)
-    if ret == "" { return line }
-    let ret_ann = node_type_ann(node)
-    if ret_ann != -1 { return line.concat(" -> ").concat(type_ann_text_renamed(ret_ann, renames)) }
-    line.concat(" -> ").concat(renames.get(ret) ?? ret)
+    line.concat(")").concat(format_fn_sig_suffix_renamed(node_return_type(node), node_type_ann(node), -1, renames))
 }
 
 fn format_effect_op_sig(node: Int) ! Format.Emit {
     emit_comments(node)
-    let line = effect_op_sig_text(node, Map())
+    let line = effect_op_sig_text(node, Map(), [], true)
     let body = node_body(node)
     if body == -1 {
         fmt_emit(line)

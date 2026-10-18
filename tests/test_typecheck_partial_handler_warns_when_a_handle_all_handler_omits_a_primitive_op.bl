@@ -321,7 +321,7 @@ fn main() {
     let _ = expect("signatures", 1)
     for d in diag_entries {
         if d.name == "PartialHandler" {
-            // The handler closes on its own line, so the ops go on new lines before the `}`.
+            // The handler's `}` shares its line with a clause, so it moves to a line of its own.
             expect_eq("signature fix", d.fix_text, "\n        fn find(keys: List[Str], pred: fn(Int) -> Bool) -> Option[(Int, Str)] \{ default.find(keys, pred) }\n        fn load(path: Str, limit: Int) -> Result[Map[Str, Int], Str] \{ default.load(path, limit) }\n    ")
         }
     }
@@ -372,4 +372,168 @@ fn main() { }
     let hits = errors_named("UnexpectedAnnotation")
     assert_eq(hits.len(), 1)
     expect_eq("dangling", hits.get(0).unwrap(), "E1110 5:5 @handle_all in effect `Kv` is not followed by a sub-effect")
+}
+
+test "an effect named like another but for case is checked against its own declaration" {
+    probe("case_only", #"effect DICE {
+    effect Roll {
+        fn roll(sides: Int) -> Int
+    }
+}
+
+@handle_all
+effect Dice {
+    effect Toss {
+        fn toss() -> Int
+        fn coin() -> Bool
+    }
+}
+
+fn main() {
+    with handler Dice.Toss { fn toss() -> Int { 1 } } {
+        io.println("{dice.toss()}")
+    }
+}
+"#, "")
+    let hits = expect("case only", 1)
+    assert(hits.get(0).unwrap().contains("handler for `Dice.Toss` does not implement `coin` |"))
+}
+
+fn fix_of(label: Str) -> Str {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "PartialHandler" { out.push("{d.fix_action}|{d.fix_text}") }
+    }
+    if out.len() != 1 { io.println("FAIL: {label}: {out.len()} PartialHandler fixes") }
+    assert_eq(out.len(), 1)
+    out.get(0).unwrap()
+}
+
+test "the fix leaves a parameter's default out, as it applies at the call site only" {
+    probe("dflt", #"@handle_all
+effect Kv {
+    effect S {
+        fn get(key: Str, n: Int = 5) -> Int
+        fn put(key: Str)
+    }
+}
+
+fn main() {
+    with handler Kv.S {
+        fn put(key: Str) { }
+    } {
+        io.println("{kv.get("a", 5)}")
+    }
+}
+"#, "")
+    let _ = expect("default value", 1)
+    expect_eq("default value fix", fix_of("default value"), "add the omitted operation|    fn get(key: Str, n: Int) -> Int \{ default.get(key, n) }\n    ")
+}
+
+test "the fix renames a parameter named default, which would hide the forward" {
+    probe("default_param", #"@handle_all
+effect Kv {
+    effect S {
+        fn put(default: Int, default_: Int) -> Int
+        fn size() -> Int
+    }
+}
+
+fn main() {
+    with handler Kv.S {
+        fn size() -> Int { 0 }
+    } {
+        io.println("{kv.size()}")
+    }
+}
+"#, "")
+    let hits = expect("default param", 1)
+    let stub = "fn put(default__: Int, default_: Int) -> Int \{ default.put(default__, default_) }"
+    assert(hits.get(0).unwrap().contains("forward on purpose: `{stub}` |"))
+    expect_eq("default param fix", fix_of("default param"), "add the omitted operation|    {stub}\n    ")
+}
+
+test "an effect the parser had to recover from gets no check and no fix" {
+    probe("recovered", #"@handle_all
+effect Dice {
+    effect Roll {
+        fn roll(sides: Int) -> Int
+        fn coin() -> Bool ! IO
+    }
+}
+
+fn main() {
+    with handler Dice.Roll { fn roll(sides: Int) -> Int { sides } } {
+        io.println("{dice.roll(2)}")
+    }
+}
+"#, "")
+    assert(errors().len() > 0)
+    assert_eq(partial_warnings().len(), 0)
+}
+
+test "the fix indents with tabs in a file indented with tabs" {
+    probe("tabs", dice_src("fn main() \{\n\tlet h = handler Dice.Roll \{\n\t\tfn coin() -> Bool \{ true }\n\t}\n\twith h \{ io.println(\"\{dice.coin()}\") }\n}\n"), "")
+    let _ = expect("tabs", 1)
+    expect_eq("tabs fix", fix_of("tabs"), "add the omitted operations|\tfn roll(sides: Int) -> Int \{ default.roll(sides) }\n\t\tfn pick(xs: List[Str]) -> Option[Str] \{ default.pick(xs) }\n\t")
+
+    probe("tabs_shared", dice_src("fn main() \{\n\tlet h = handler Dice.Roll \{ fn coin() -> Bool \{ true } }\n\twith h \{ io.println(\"\{dice.coin()}\") }\n}\n"), "")
+    let _ = expect("tabs, shared line", 1)
+    expect_eq("tabs shared fix", fix_of("tabs, shared line"), "add the omitted operations|\n\t\tfn roll(sides: Int) -> Int \{ default.roll(sides) }\n\t\tfn pick(xs: List[Str]) -> Option[Str] \{ default.pick(xs) }\n\t")
+}
+
+test "the caret ends at the end of the effect name, however far it is from handler" {
+    probe("spaced", dice_src(#"fn main() {
+    let h = handler   Dice.Roll {
+        fn coin() -> Bool { true }
+        fn pick(xs: List[Str]) -> Option[Str] { None }
+    }
+    with h { io.println("{dice.coin()}") }
+}
+"#), "")
+    let _ = expect("spaced", 1)
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            assert_eq(d.col, 13)
+            // `handler` at 13, three spaces, then `Dice.Roll` at 23..31.
+            assert_eq(d.end_col, 32)
+        }
+    }
+}
+
+test "an annotation where no annotation belongs in an effect body is one UnexpectedAnnotation" {
+    write_file("build/w0545_op_ann.bl", #"effect Kv {
+    effect Get {
+        @handle_all
+        fn get(k: Str) -> Int
+        fn has(k: Str) -> Bool
+    }
+    @requires(true)
+    effect Put {
+        fn put(k: Str)
+    }
+}
+
+type Point {
+    @handle_all
+    x: Int
+}
+
+fn main() { }
+
+@handle_all
+"#)
+    let _ = compile_to_program("build/w0545_op_ann.bl", 1)
+    let _ = fs.delete("build/w0545_op_ann.bl")
+    let errs = errors()
+    if errs.len() != 4 {
+        for e in errs { io.println("  {e}") }
+    }
+    assert_eq(errs.len(), 4)
+    let hits = errors_named("UnexpectedAnnotation")
+    assert_eq(hits.len(), 4)
+    expect_eq("on an op", hits.get(0).unwrap(), "E1110 3:9 @handle_all is not allowed on an effect operation")
+    expect_eq("on a sub-effect", hits.get(1).unwrap(), "E1110 7:5 @requires is not allowed on a sub-effect")
+    expect_eq("on a field", hits.get(2).unwrap(), "E1110 14:5 @handle_all is only allowed on an effect declaration")
+    expect_eq("at the end of the file", hits.get(3).unwrap(), "E1110 20:1 @handle_all is only allowed on an effect declaration")
 }
