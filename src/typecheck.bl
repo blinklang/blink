@@ -22,7 +22,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
     diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
-    diag_warn_at, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
+    diag_warn_at, diag_warn_at_notes, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
@@ -60,7 +60,7 @@ import diagnostics.{
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME,
-    DISCARDED_COLLECTION_COPY,
+    DISCARDED_COLLECTION_COPY, TODO_IN_CODE,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
     NO_SUCH_FIELD, OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
@@ -5504,17 +5504,30 @@ fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
     fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: -1 })
 }
 
-// The bare builtins whose call is checked like a declared fn's (sections/02_syntax.md §2.20).
+// The bare builtins whose call is checked like a declared fn's (sections/02_syntax.md §2.20),
+// each with the fewest arguments it takes, or -1 for any other name. `todo` and `unreachable`
+// may leave out their one `msg`: two forms are a property of these builtins only, since a
+// positional parameter of a user fn has no default (§2.13).
+fn tc_builtin_fewest_args(name: Str) -> Int {
+    let mut table: Map[Str, Int] = Map()
+    table.insert("panic", 1)
+    table.insert("todo", 0)
+    table.insert("unreachable", 0)
+    table.get(name) ?? -1
+}
+
 // Each is signed under a dotted key no user fn can spell, so a program's own `fn panic` keeps
 // the bare key and wins by resolution.
 fn tc_builtin_sig_key(name: Str) -> Str {
-    if name == "panic" { return "builtin.panic" }
-    ""
+    if tc_builtin_fewest_args(name) < 0 { return "" }
+    "builtin.{name}"
 }
 
 fn register_builtin_fn_sigs() {
-    register_intrinsic_fn_sig("builtin.panic", [TYPE_STR], TYPE_NEVER)
-    fnsig_param_names.set(fnsig_param_names.len() - 1, "msg")
+    for name in ["panic", "todo", "unreachable"] {
+        register_intrinsic_fn_sig(tc_builtin_sig_key(name), [TYPE_STR], TYPE_NEVER)
+        fnsig_param_names.set(fnsig_param_names.len() - 1, "msg")
+    }
 }
 
 // A bare builtin call against its tc_builtin_sig_key signature, with the wording a declared
@@ -5524,11 +5537,37 @@ fn tc_check_builtin_sig_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeChe
     let args_sl = node_args(node)
     let kw_bad = tc_check_keyword_args(fn_name, sig, args_sl, 0, node)
     let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
-    if kw_bad == 0 && arg_count != fs.params_count {
-        tc_error_at("function `{fn_name}` expects {fs.params_count} argument(s), got {arg_count}", node)
+    let fewest = tc_builtin_fewest_args(fn_name)
+    if kw_bad == 0 && (arg_count < fewest || arg_count > fs.params_count) {
+        if fewest == fs.params_count {
+            tc_error_at("function `{fn_name}` expects {fs.params_count} argument(s), got {arg_count}", node)
+        } else {
+            tc_error_at_code("function `{fn_name}` expects {fewest} or {fs.params_count} argument(s), got {arg_count}", node, "TypeError", TYPE_ERROR, "call `{fn_name}()` or `{fn_name}({tc_builtin_param_spelling(fs)})`")
+        }
     }
     let _ = check_arg_shapes(fn_name, sig, args_sl, 0, node)
     fs.ret
+}
+
+// The parameter list of a builtin signature as a user would write it: `msg: Str`.
+fn tc_builtin_param_spelling(fs: FnSigEntry) -> Str {
+    let mut parts: List[Str] = []
+    let mut i = 0
+    while i < fs.params_count {
+        let at = fs.params_start + i
+        parts.push("{fnsig_param_names.get(at).unwrap()}: {type_to_str(fnsig_param_list.get(at).unwrap())}")
+        i = i + 1
+    }
+    parts.join(", ")
+}
+
+// W0703 (§2.20). The caller has resolved the call to the builtin `todo`, so a program's own
+// `todo` never reaches here. A test that is not finished has `@skip` for that, so the help
+// names it there.
+fn tc_warn_todo_in_code(fn_name: Str, node: Int) ! Diag.Report {
+    if fn_name != "todo" { return }
+    let help = if tc_in_test_lexical != 0 { "write the missing code, or mark the test `@skip(\"reason\")` until it is written" } else { "write the missing code" }
+    diag_warn_at_notes("TodoInCode", TODO_IN_CODE, "`todo()` left in code", node, help, ["upgrade to error in blink.toml: [lints] W0703 = \"error\""])
 }
 
 // The signature of every namespace intrinsic typecheck is allowed to know.
@@ -13706,6 +13745,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
             "Some" => 1
             "None" => 1
             "skip" => 1
+            "todo" => 1
             _ => 0
         }
         5 => match name {
@@ -13747,6 +13787,7 @@ pub fn is_builtin_fn(name: Str) -> Int {
         11 => match name {
             "file_exists" => 1
             "process_run" => 1
+            "unreachable" => 1
             _ => 0
         }
         12 => match name {
@@ -14215,7 +14256,7 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "file_exists" { return TYPE_INT }
     if name == "shell_exec" { return TYPE_INT }
     if name == "exit" { return TYPE_VOID }
-    if name == "panic" { return TYPE_NEVER }
+    if tc_builtin_fewest_args(name) >= 0 { return TYPE_NEVER }
     if name == "is_dir" { return TYPE_INT }
 
     if name == "time_ms" { return TYPE_INT }
@@ -19076,7 +19117,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // local-scope arm below reads it.
                 if is_builtin_fn(fn_name) != 0 && skip_is_intrinsic && !tc_call_decl_is_fn(node) && tc_tid_is_no_info(nr_get_type(fn_name)) != 0 {
                     let bsig = fnsig_map.get(tc_builtin_sig_key(fn_name)) ?? -1
-                    if bsig != -1 { return tc_check_builtin_sig_call(fn_name, bsig, node) }
+                    if bsig != -1 {
+                        let bret = tc_check_builtin_sig_call(fn_name, bsig, node)
+                        tc_warn_todo_in_code(fn_name, node)
+                        return bret
+                    }
                     // Infer args so nested expressions (e.g. a method call passed
                     // to println) are type-checked — variadic builtins otherwise
                     // skip arg inference, hiding errors like E0522.

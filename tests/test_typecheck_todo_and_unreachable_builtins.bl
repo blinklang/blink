@@ -1,0 +1,242 @@
+// `todo()` and `unreachable()` are built-ins in all code (§2.20), each with two forms: no
+// argument, or one `msg: Str`. Both return `Never`, so a call fits a fn tail, a match arm and
+// a `??` default of any type (§3.3). The two forms belong to these built-ins only; any other
+// arity or argument type is reported with the wording a declared fn's call gets, naming both
+// forms.
+//
+// TodoInCode (W0703) fires on each call that resolves to the built-in `todo`, test blocks
+// included. In a test the help names `@skip("reason")`; elsewhere it says to write the missing
+// code. `unreachable` has no warning. `@allow(TodoInCode)` and `W0703 = "off"` under `[lints]`
+// silence it.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, lint_set_override}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str, lints_off: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    // After compile_to_program, which resets the [lints] table it loads from the manifest.
+    if lints_off { lint_set_override("W0703", "off") }
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat("{d.code} {d.message} | help: {d.help}\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.code} {d.message} | help: {d.help}\n") }
+    }
+    out
+}
+
+// Every TodoInCode row, one per line, with its line, level, message, help and notes.
+fn todo_warnings() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "TodoInCode" { out.push("{d.line}: {d.severity} {d.code} {d.message} | help: {d.help} | notes: {d.notes.join("; ")}") }
+    }
+    out
+}
+
+fn todo_warnings_on_line(line: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for w in todo_warnings() {
+        if w.starts_with("{line}: ") { out.push(w) }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+fn assert_no_error_at(marker: Str, unwanted: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if msgs.contains(unwanted) {
+        io.println("FAIL: an error on line {line} ({marker}) contains '{unwanted}':\n{msgs}")
+    }
+    assert(!msgs.contains(unwanted))
+}
+
+// No error from the first line holding `from` through the line holding `to`.
+fn assert_clean_between(from: Str, to: Str) {
+    let a = line_of(probe_src(), from)
+    let b = line_of(probe_src(), to)
+    let mut msgs = ""
+    let mut l = a
+    while l <= b {
+        msgs = msgs.concat(errors_on_line(l))
+        l = l + 1
+    }
+    if msgs != "" { io.println("FAIL: lines {a}..{b} ({from}..{to}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+// The one TodoInCode row on the line marked `marker`, which must contain `want`.
+fn assert_todo_warning_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let hits = todo_warnings_on_line(line)
+    if hits.len() != 1 || !hits.get(0).unwrap().contains(want) {
+        io.println("FAIL: want one TodoInCode on line {line} ({marker}) containing '{want}'; all rows:")
+        for w in todo_warnings() { io.println("  {w}") }
+    }
+    assert_eq(hits.len(), 1)
+    assert(hits.get(0).unwrap().contains(want))
+}
+
+fn assert_no_todo_warning_at(marker: Str) {
+    let line = line_of(probe_src(), marker)
+    let hits = todo_warnings_on_line(line)
+    if hits.len() != 0 {
+        io.println("FAIL: line {line} ({marker}) must have no TodoInCode, got:")
+        for w in hits { io.println("  {w}") }
+    }
+    assert_eq(hits.len(), 0)
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe of other source would be measuring the first one's leftovers.
+fn probe_src() -> Str {
+    #"// OK_BEGIN
+fn t_tail() -> Int { todo() }  // W_FN_BARE
+
+fn t_tail_msg() -> Int { todo("tail") }  // W_FN_MSG
+
+fn t_arm(x: Int) -> Str {
+    match x {
+        0 => "zero"
+        _ => todo("arm")  // W_ARM
+    }
+}
+
+fn t_coalesce(o: Option[Int]) -> Int { o ?? todo() }  // W_COALESCE
+
+fn u_tail() -> Int { unreachable() }  // U_TAIL
+
+fn u_tail_msg() -> Int { unreachable("tail") }  // U_TAIL_MSG
+
+fn u_arm(x: Int) -> Str {
+    match x {
+        0 => "zero"
+        _ => unreachable("arm")  // U_ARM
+    }
+}
+
+fn u_coalesce(o: Option[Int]) -> Int { o ?? unreachable() }  // U_COALESCE
+
+fn fail(m: Str) -> Never { panic(m) }
+
+fn port(raw: Str) -> Int {
+    if raw == "" { return 8080 }
+    fail("bad port")
+}
+
+@allow(TodoInCode)
+fn quiet() -> Int { todo() }  // W_ALLOWED
+
+test "stub" {
+    let _ = todo("write this test")  // W_TEST
+}
+// OK_END
+
+fn bad_todo_two() { todo("a", "b") }  // E_TODO_TWO
+
+fn bad_todo_type() { todo(1) }  // E_TODO_TYPE
+
+fn bad_unreachable_two() { unreachable("a", "b") }  // E_UNREACHABLE_TWO
+
+fn bad_unreachable_type() { unreachable(true) }  // E_UNREACHABLE_TYPE
+
+fn main() {
+    let _ = t_tail()
+}
+"#
+}
+
+test "todo and unreachable fit a fn tail, a match arm and a ?? default" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), false)
+    assert_clean_between("OK_BEGIN", "OK_END")
+}
+
+test "a user fn declared -> Never diverges, so a fn ending in it needs no return" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), false)
+    assert_clean_between("fn port(", "fail(\"bad port\")")
+}
+
+test "todo and unreachable take no argument or one Str, checked like any call" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), false)
+    assert_error_at("E_TODO_TWO", "function `todo` expects 0 or 1 argument(s), got 2")
+    assert_error_at("E_TODO_TWO", "`todo()` or `todo(msg: Str)`")
+    assert_error_at("E_TODO_TYPE", "argument 1 of `todo` expects Str, got Int")
+    assert_error_at("E_UNREACHABLE_TWO", "function `unreachable` expects 0 or 1 argument(s), got 2")
+    assert_error_at("E_UNREACHABLE_TWO", "`unreachable()` or `unreachable(msg: Str)`")
+    assert_error_at("E_UNREACHABLE_TYPE", "argument 1 of `unreachable` expects Str, got Bool")
+    assert_no_error_at("E_TODO_TWO", "undefined function")
+}
+
+test "each call of the built-in todo warns, outside a test with the missing-code help" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), false)
+    assert_todo_warning_at("W_FN_BARE", "warning W0703 `todo()` left in code | help: write the missing code")
+    assert_todo_warning_at("W_FN_BARE", "upgrade to error in blink.toml: [lints] W0703 = \"error\"")
+    assert_todo_warning_at("W_FN_MSG", "help: write the missing code")
+    assert_todo_warning_at("W_ARM", "help: write the missing code")
+    assert_todo_warning_at("W_COALESCE", "help: write the missing code")
+}
+
+test "a todo in a test block warns, and its help names @skip" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), false)
+    assert_todo_warning_at("W_TEST", "@skip(\"reason\")")
+}
+
+test "unreachable has no warning" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), false)
+    assert_no_todo_warning_at("U_TAIL")
+    assert_no_todo_warning_at("U_TAIL_MSG")
+    assert_no_todo_warning_at("U_ARM")
+    assert_no_todo_warning_at("U_COALESCE")
+}
+
+test "an allow of TodoInCode silences it in that function only" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), false)
+    assert_no_todo_warning_at("W_ALLOWED")
+    assert_todo_warning_at("W_FN_BARE", "W0703")
+}
+
+test "W0703 off under [lints] silences every todo" {
+    let _p = probe("build/tc_todo_unreachable_src.bl", probe_src(), true)
+    assert_eq(todo_warnings().len(), 0)
+}

@@ -1,0 +1,123 @@
+// `todo` and `unreachable` are built-ins by resolution, not reserved names (§2.20): a user fn
+// or a local named either shadows it under the normal scoping rules, and a call then gets
+// that binding's own signature. TodoInCode (W0703) keys on resolution to the built-in, so a
+// call of a user `todo` gets no warning.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+fn assert_clean_between(from: Str, to: Str) {
+    let a = line_of(probe_src(), from)
+    let b = line_of(probe_src(), to)
+    let mut msgs = ""
+    let mut l = a
+    while l <= b {
+        msgs = msgs.concat(errors_on_line(l))
+        l = l + 1
+    }
+    if msgs != "" { io.println("FAIL: lines {a}..{b} ({from}..{to}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+fn probe_src() -> Str {
+    #"fn todo(code: Int) -> Int { code + 1 }
+
+fn unreachable(a: Int, b: Int) -> Int { a + b }
+
+// OK_BEGIN
+fn user_todo() -> Int { todo(3) }
+
+fn user_unreachable() -> Int { unreachable(1, 2) }
+
+fn local_todo() -> Str {
+    let todo = fn(s: Str, n: Int) -> Str { "{s}{n}" }
+    todo("not the built-in", 2)
+}
+
+test "user todo in a test" {
+    assert_eq(todo(1), 2)
+}
+// OK_END
+
+fn user_todo_is_int() -> Str { todo(4) }  // E_USER_INT
+
+fn user_todo_takes_int() -> Int { todo("s") }  // E_USER_ARG
+
+fn user_unreachable_arity() -> Int { unreachable() }  // E_USER_ARITY
+
+fn main() {
+    let _ = user_todo()
+}
+"#
+}
+
+test "a user fn named todo or unreachable replaces the built-in" {
+    let _p = probe("build/tc_user_todo_src.bl", probe_src())
+    assert_clean_between("OK_BEGIN", "OK_END")
+    assert_error_at("E_USER_INT", "Int")
+    assert_error_at("E_USER_ARG", "argument 1 of `todo` expects Int, got Str")
+    assert_error_at("E_USER_ARITY", "unreachable")
+}
+
+test "a call of a user todo gets no TodoInCode" {
+    let _p = probe("build/tc_user_todo_src.bl", probe_src())
+    let mut hits = 0
+    for d in diag_entries {
+        if d.name == "TodoInCode" {
+            io.println("FAIL: TodoInCode on line {d.line}: {d.message}")
+            hits = hits + 1
+        }
+    }
+    assert_eq(hits, 0)
+}
