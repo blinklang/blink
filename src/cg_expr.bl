@@ -27,6 +27,7 @@ import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, tc_tid_child_count, is_integer_type, type_bit_width,
     lookup_named_type, tc_field_tid_at_instance, is_import_module_name,
     tc_qualifier_to_module_or_self, tc_tid_struct, tc_global_decl_node, tc_fn_value_decl_node, tc_type_str,
+    tc_prelude_carrier_of, tc_qualified_carrier,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID,
 }
 import layout.{
@@ -1810,12 +1811,25 @@ fn x_field_of_spread(node: Int, want: Str, base: SpreadBase) -> Int ! Diag.Repor
 
 fn lower_field_access(node: Int) -> Int ! Diag.Report {
     let obj = node_obj(node)
+    let variant = node_name(node)
+    if x_names_carrier_type(obj, variant) && cg_expr_builds_carrier(node, variant) {
+        return cg_expr_lower_carrier_ctor(node, variant)
+    }
     if x_variant_of(node, obj) >= 0 { return x_variant_const(node, obj) }
     if x_module_qualifier(obj) != "" { return lower_module_global(node, obj) }
     let obj_tid = tid_of_node(obj)
     if obj_tid < 0 { return -1 }
     if x_kind(obj_tid) == TyKind.Tuple { return lower_tuple_index(node, obj, obj_tid) }
     lower_struct_field(node, obj, obj_tid)
+}
+
+// `Option.None`: the qualifier is the carrier's type, not a value spelled `Option`.
+fn x_names_carrier_type(obj: Int, variant: Str) -> Bool {
+    if nk_of(node_kind(obj)) != NodeKind.Ident { return false }
+    let name = node_name(obj)
+    if x_is_local(name) { return false }
+    if tc_global_decl_node(obj) >= 0 { return false }
+    tc_qualified_carrier(name, variant).is_some()
 }
 
 // `mod.NAME` reads another module's global. The qualifier names a module, not a value, so
@@ -1942,23 +1956,30 @@ fn lower_call_expr(node: Int) -> Int ! Diag.Report {
         None => {}
     }
     let callee = node_left(node)
-    if callee >= 0 {
-        // The type typecheck resolved says which constructor this is: a user enum may
-        // declare a variant spelled like a carrier's.
-        let carrier = x_kind(tid_of_node(node))
-        if nk_of(node_kind(callee)) == NodeKind.Ident && (carrier == TyKind.Option || carrier == TyKind.Result) {
-            let name = node_name(callee)
-            if name == ctor_some { return lower_wrap(node, Slot.Inner1, member_value, 1) }
-            if name == ctor_ok { return lower_wrap(node, Slot.Inner1, member_ok, 0) }
-            if name == ctor_err { return lower_wrap(node, Slot.Inner2, member_err, 1) }
-            if name == ctor_none {
-                let tid = tid_of_node(node)
-                if tid < 0 { return -1 }
-                return lower_none(node, tid)
-            }
-        }
+    if callee >= 0 && nk_of(node_kind(callee)) == NodeKind.Ident && cg_expr_builds_carrier(node, node_name(callee)) {
+        return cg_expr_lower_carrier_ctor(node, node_name(callee))
     }
     lower_call(node)
+}
+
+// Whether `node`, spelled with the carrier variant `variant` bare or qualified, constructs
+// that carrier. The type typecheck resolved says so, not the spelling: a user enum may
+// declare a variant spelled like a carrier's.
+pub fn cg_expr_builds_carrier(node: Int, variant: Str) -> Bool ! Diag.Report {
+    match tc_prelude_carrier_of(variant) {
+        Some(k) => x_kind(tid_of_node(node)) == k
+        None => false
+    }
+}
+
+// The one construction of a carrier variant, for `Some(x)` and `Option.Some(x)` alike.
+pub fn cg_expr_lower_carrier_ctor(node: Int, variant: Str) -> Int ! Diag.Report {
+    if variant == ctor_some { return lower_wrap(node, Slot.Inner1, member_value, 1) }
+    if variant == ctor_ok { return lower_wrap(node, Slot.Inner1, member_ok, 0) }
+    if variant == ctor_err { return lower_wrap(node, Slot.Inner2, member_err, 1) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    lower_none(node, tid)
 }
 
 fn x_old_snapshot_read(node: Int, snap: Str) -> Int ! Diag.Report {

@@ -14376,7 +14376,7 @@ fn tc_builtin_static_ret(tname: Str, method: Str) -> Int {
 
 // The prelude carrier a variant name constructs. Option and Result are type kinds, not
 // enums in evar_pool, so their variants are answered here.
-fn tc_prelude_carrier_of(name: Str) -> Option[TyKind] {
+pub fn tc_prelude_carrier_of(name: Str) -> Option[TyKind] {
     match name {
         "None" => Some(TyKind.Option)
         "Some" => Some(TyKind.Option)
@@ -14388,6 +14388,49 @@ fn tc_prelude_carrier_of(name: Str) -> Option[TyKind] {
 
 fn tc_prelude_carrier_name(k: TyKind) -> Str {
     if k == TyKind.Option { "Option" } else { "Result" }
+}
+
+// The carrier `Qualifier.Variant` names when the qualifier is that carrier's type and the
+// variant one of its own, as in `Option.None` or `Result.Err`. The caller decides that the
+// qualifier is a free name and not a value spelled `Option`.
+pub fn tc_qualified_carrier(qualifier: Str, variant: Str) -> Option[TyKind] {
+    match tc_prelude_carrier_of(variant) {
+        Some(k) => if tc_prelude_carrier_name(k) == qualifier { Some(k) } else { None }
+        None => None
+    }
+}
+
+// A carrier variant named with no argument list, bare (`None`) or qualified (`Option.None`).
+// Only None is a value on its own; Some, Ok and Err named as values carry no type here.
+fn tc_carrier_nullary_tid(variant: Str) -> Int {
+    if variant == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
+    TYPE_UNKNOWN
+}
+
+// A carrier constructor call, bare (`Some(x)`) or qualified (`Option.Some(x)`): the one path
+// both spellings are typed by. -1 for a variant this does not answer (`None(...)`).
+//
+// The slot a one-sided carrier does not name mints a FRESH metavar, not the shared
+// TYPE_UNKNOWN singleton. A metavar unifies with an annotation / declared return / later use
+// that constrains it; an unconstrained one trips the E0301 region boundary. The singleton is
+// excluded from that boundary check, so it must not stand in for an inferable slot.
+fn tc_carrier_call_tid(variant: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let arg = if args_sl != -1 && sublist_length(args_sl) >= 1 { sublist_get(args_sl, 0) } else { -1 }
+    match variant {
+        "Some" => {
+            if arg == -1 { return make_option_type(make_metavar()) }
+            make_option_type(infer_carrier_arg(arg, variant))
+        }
+        "Ok" => {
+            if arg == -1 { return make_result_type(make_metavar(), make_metavar()) }
+            make_result_type(infer_carrier_arg(arg, variant), tc_carrier_slot_from_hint(TyKind.Result, 2))
+        }
+        "Err" => {
+            if arg == -1 { return make_result_type(make_metavar(), make_metavar()) }
+            make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), infer_carrier_arg(arg, variant))
+        }
+        _ => -1
+    }
 }
 
 fn is_variant_name(name: Str) -> Int {
@@ -18395,10 +18438,18 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
     return TYPE_BOOL
 }
 
-// Whether `n` is a bare variant name (`Pending`, `Running(1)`) that no binding hides.
+// Whether `n` is a bare variant name (`Pending`, `Running(1)`) that no binding hides, or a
+// qualified carrier variant (`Option.None`, `Result.Ok(1)`): a carrier names no slot its
+// variant does not carry, so it reads the rest from the expected type as the bare one does.
 fn tc_names_bare_variant(n: Int) -> Bool {
     if n == -1 { return false }
     let k = node_kind(n)
+    if k == NodeKind.FieldAccess || k == NodeKind.MethodCall {
+        let obj = node_obj(n)
+        if obj == -1 || node_kind(obj) != NodeKind.Ident || nr_top_index(node_name(obj)) != -1 { return false }
+        let variant = if k == NodeKind.FieldAccess { node_name(n) } else { node_method(n) }
+        return tc_qualified_carrier(node_name(obj), variant).is_some()
+    }
     let mut name = ""
     if k == NodeKind.Ident { name = node_name(n) }
     if k == NodeKind.Call && node_left(n) != -1 && node_kind(node_left(n)) == NodeKind.Ident { name = node_name(node_left(n)) }
@@ -19057,10 +19108,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let vt = if top != -1 { nr_scope_types.get(top).unwrap() } else { -1 }
         if tc_tid_is_no_info(vt) == 0 { return vt }
         match tc_pick_bare_variant(name, node, tc_prelude_carrier_of(name)) {
-            BareVariantPick.Carrier(_) => {
-                if name == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
-                return TYPE_UNKNOWN
-            }
+            BareVariantPick.Carrier(_) => return tc_carrier_nullary_tid(name)
             BareVariantPick.Declared(enum_tid, var_idx) => {
                 return tc_nullary_variant_tid(enum_tid, evar_pool.get(var_idx).unwrap().enum_decl, var_idx)
             }
@@ -19300,34 +19348,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         None => {}
                     }
                 }
-                if fn_name == "Some" && as_carrier {
-                    let args_sl = node_args(node)
-                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Some")
-                        return make_option_type(inner)
-                    }
-                    return make_option_type(make_metavar())
-                }
-                // The slot a one-sided carrier does not name mints a FRESH metavar, not the
-                // shared TYPE_UNKNOWN singleton — matching None above. A metavar unifies with
-                // an annotation / declared return / later use that constrains it; an
-                // unconstrained one trips the E0301 region boundary. The singleton is excluded
-                // from that boundary check, so it must not stand in for an inferable slot.
-                if fn_name == "Ok" && as_carrier {
-                    let args_sl = node_args(node)
-                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Ok")
-                        return make_result_type(inner, tc_carrier_slot_from_hint(TyKind.Result, 2))
-                    }
-                    return make_result_type(make_metavar(), make_metavar())
-                }
-                if fn_name == "Err" && as_carrier {
-                    let args_sl = node_args(node)
-                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Err")
-                        return make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), inner)
-                    }
-                    return make_result_type(make_metavar(), make_metavar())
+                if as_carrier {
+                    let carrier_t = tc_carrier_call_tid(fn_name, node_args(node))
+                    if carrier_t != -1 { return carrier_t }
                 }
                 if fn_name == "Raw" {
                     let args_sl = node_args(node)
@@ -19634,6 +19657,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     return tc_spawn_value_handle(sp_cls)
                 }
+            }
+        }
+
+        // `Option.Some(x)` and `Result.Err(e)` name the carrier directly (§3.4 resolution
+        // step 1), so neither the expected type nor a user enum's namesake variant is asked.
+        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && tc_tid_is_no_info(nr_get_type(node_name(obj_node))) != 0 {
+            if tc_qualified_carrier(node_name(obj_node), method).is_some() {
+                let carrier_t = tc_carrier_call_tid(method, node_args(node))
+                if carrier_t != -1 { return carrier_t }
             }
         }
 
@@ -21264,6 +21296,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
         if node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
+            if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 && tc_qualified_carrier(obj_name, fname).is_some() {
+                return tc_carrier_nullary_tid(fname)
+            }
             let tid = lookup_named_type(obj_name)
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 let edecl = tc_type_decl_nodes.get(tc_written_type_nominal(obj_name)) ?? -1
@@ -25339,11 +25374,13 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         // Option[Int]). type_kind already resolves; the inner read must too. Identity on a
         // concrete scrutinee, so only the metavar case changes.
         let pbt_resolved = if tc_pattern_binding_type >= 0 { tc_tid_resolved(tc_pattern_binding_type) } else { tc_pattern_binding_type }
-        if vname == "Some" && tc_pattern_binding_type >= 0 && type_kind(pbt_resolved) == TyKind.Option {
+        // `Option.Some(v)` peels as `Some(v)` does; `Mode.Some(v)` names a user enum's variant.
+        let carrier_spelled = tname == "" || tc_qualified_carrier(vname, tname).is_some()
+        if carrier_spelled && short_name == "Some" && tc_pattern_binding_type >= 0 && type_kind(pbt_resolved) == TyKind.Option {
             tc_pattern_binding_type = ty_pool.get(pbt_resolved).unwrap().inner1
-        } else if vname == "Ok" && tc_pattern_binding_type >= 0 && type_kind(pbt_resolved) == TyKind.Result {
+        } else if carrier_spelled && short_name == "Ok" && tc_pattern_binding_type >= 0 && type_kind(pbt_resolved) == TyKind.Result {
             tc_pattern_binding_type = ty_pool.get(pbt_resolved).unwrap().inner1
-        } else if vname == "Err" && tc_pattern_binding_type >= 0 && type_kind(pbt_resolved) == TyKind.Result {
+        } else if carrier_spelled && short_name == "Err" && tc_pattern_binding_type >= 0 && type_kind(pbt_resolved) == TyKind.Result {
             tc_pattern_binding_type = ty_pool.get(pbt_resolved).unwrap().inner2
         } else {
             tc_pattern_binding_type = -1

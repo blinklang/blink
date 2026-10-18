@@ -1,0 +1,140 @@
+// The qualified carrier spellings `Option.Some(x)`, `Option.None`, `Result.Ok(x)` and
+// `Result.Err(e)` are typed by the one path the bare spellings take (sections/03_types.md
+// §3.4), so a wrong payload draws the same TypeError, and the first repair E0519 names for
+// an unhinted bare `None` beside a user enum that declares `None` compiles.
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_tid_kind, TyKind}
+import parser.{node_count, node_kind, node_name, node_obj, node_method}
+import ast.{NodeKind}
+import lower_test_helpers.{probe, probe_but, assert_eq_str}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn message_of(name: Str) -> Str {
+    let mut msg = ""
+    for d in diag_entries {
+        if d.name == name { msg = d.message }
+    }
+    msg
+}
+
+// Every error message type checking records for one source.
+fn error_messages(stem: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn one_error(label: Str, errs: List[Str]) -> Str {
+    if errs.len() != 1 { io.println("FAIL: {label}: {errs.len()} errors: {errs.join(" | ")}") }
+    assert_eq(errs.len(), 1)
+    errs.get(0).unwrap()
+}
+
+fn option_payload_src(ctor: Str) -> Str {
+    "fn main() \{\n    let e: Option[Int] = {ctor}(\"x\")\n    let _ = e\n}\n"
+}
+
+fn result_payload_src(ctor: Str) -> Str {
+    "fn main() \{\n    let r: Result[Int, Str] = {ctor}(1)\n    let _ = r\n}\n"
+}
+
+test "a wrong payload on Option.Some is the TypeError the bare Some gives" {
+    let bare = one_error("bare", error_messages("qcc_bare_some", option_payload_src("Some")))
+    let qualified = one_error("qualified", error_messages("qcc_qual_some", option_payload_src("Option.Some")))
+    assert_eq_str("bare", bare, "TypeError: variable `e`: declared type Option[Int] but got Option[Str]")
+    assert_eq_str("qualified", qualified, bare)
+}
+
+test "a wrong payload on Result.Err is the TypeError the bare Err gives" {
+    let bare = one_error("bare", error_messages("qcc_bare_err", result_payload_src("Err")))
+    let qualified = one_error("qualified", error_messages("qcc_qual_err", result_payload_src("Result.Err")))
+    assert_eq_str("qualified", qualified, bare)
+}
+
+// The qualified carrier constructions in the probe, each with the carrier kind its
+// qualifier names. Returns how many there are and fails a row for each one typecheck did
+// not type at that carrier.
+fn check_qualified_carriers_typed() -> Int {
+    let mut seen = 0
+    let mut i = 0
+    while i < node_count() {
+        let k = node_kind(i)
+        let variant = if k == NodeKind.MethodCall { node_method(i) } else if k == NodeKind.FieldAccess { node_name(i) } else { "" }
+        let obj = if variant != "" { node_obj(i) } else { -1 }
+        if obj >= 0 && node_kind(obj) == NodeKind.Ident {
+            let want = match node_name(obj) {
+                "Option" => TyKind.Option
+                "Result" => TyKind.Result
+                _ => TyKind.Unknown
+            }
+            if want != TyKind.Unknown {
+                seen = seen + 1
+                let t = tc_lookup_node_tid(i)
+                if t < 0 || tc_tid_kind(t) != want { io.println("FAIL: {node_name(obj)}.{variant} at node {i} typed {t}") }
+                assert(t >= 0)
+                assert(tc_tid_kind(t) == want)
+            }
+        }
+        i = i + 1
+    }
+    seen
+}
+
+test "qualified carriers type in every position" {
+    let src = #"fn take(o: Option[Int]) -> Int { o ?? 0 }
+fn tail(n: Int) -> Result[Int, Str] {
+    if n > 0 { return Result.Ok(n) }
+    Result.Err("neg")
+}
+fn main() {
+    let a: Option[Int] = Option.Some(1)
+    let b = Option.Some("s")
+    let c: Option[Int] = Option.None
+    let d = take(Option.None)
+    let nn: Option[Option[Int]] = None
+    let e: Option[Int] = nn ?? Option.Some(2)
+    let f = fn(k: Int) -> Option[Int] { Option.Some(k) }
+    let _ = a
+    let _ = b
+    let _ = c
+    let _ = d
+    let _ = e
+    let _ = f
+    let _ = tail(1)
+}
+"#
+    assert(probe("qcc_positions", src) >= 0)
+    assert_eq(check_qualified_carriers_typed(), 8)
+}
+
+fn namesake_none() -> Str {
+    "type Mode \{ None, Fast }\nfn take(o: Option[Int]) -> Int \{ o ?? 0 }\n"
+}
+
+test "an unhinted bare None beside a user None is E0519 naming Option.None first" {
+    let src = namesake_none().concat("fn main() \{\n    let m = None\n    let _ = take(m)\n}\n")
+    assert(probe_but("qcc_e0519", src, "AmbiguousConstruction") >= 0)
+    assert_eq_str("message", message_of("AmbiguousConstruction"), "`None` is a variant of both Option and Mode; qualify as Option.None or Mode.None")
+}
+
+test "the first repair E0519 names compiles" {
+    let src = namesake_none().concat("fn main() \{\n    let m = Option.None\n    let _ = take(m)\n}\n")
+    assert(probe("qcc_e0519_option_repair", src) >= 0)
+    assert_eq(check_qualified_carriers_typed(), 1)
+}
+
+test "the second repair E0519 names compiles" {
+    let src = namesake_none().concat("fn main() \{\n    let m = Mode.None\n    let _ = m\n}\n")
+    assert(probe("qcc_e0519_mode_repair", src) >= 0)
+}
