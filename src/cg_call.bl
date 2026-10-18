@@ -72,7 +72,7 @@ import ir.{
 import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
-    x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor,
+    x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor, cg_expr_sequence, cg_expr_lower_pair,
 }
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
@@ -200,10 +200,10 @@ pub fn lower_operator_method(node: Int, op: Str) -> Int ! Diag.Report {
     if operand < 0 { return -1 }
     // Resolved before the operands are lowered, so a refusal leaves no node behind.
     if !cc_equality_resolves(node, operand) { return -1 }
-    let lhs = lower_expr(node_left(node))
-    if lhs < 0 { return -1 }
-    let rhs = lower_expr(node_right(node))
-    if rhs < 0 { return -1 }
+    let pair = cg_expr_lower_pair(node_left(node), node_right(node))
+    let lhs = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
+    if lhs < 0 || rhs < 0 { return -1 }
     let eq = cc_values_equal(node, operand, lhs, rhs)
     if eq < 0 { return -1 }
     if op == "==" { return eq }
@@ -379,10 +379,10 @@ fn cc_ordering_operator(node: Int, op: Str, tid: Int, rec: LayoutRecord) -> Int 
     if cc_stopped(orec) { return -1 }
     let variant = cc_ordering_variant(node, otid, orec.c_spelling, answer)
     if variant < 0 { return -1 }
-    let lhs = lower_expr(node_left(node))
-    if lhs < 0 { return -1 }
-    let rhs = lower_expr(node_right(node))
-    if rhs < 0 { return -1 }
+    let pair = cg_expr_lower_pair(node_left(node), node_right(node))
+    let lhs = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
+    if lhs < 0 || rhs < 0 { return -1 }
     let cmp = ir_call_direct(otid, node, orec.c_spelling, symbol, orec.slot_form, [lhs, rhs])
     let test_op = if op == "<=" || op == ">=" { "!=" } else { "==" }
     ir_binary(tid, node, rec.c_spelling, test_op, cmp, variant)
@@ -892,9 +892,12 @@ fn cc_scalar_fmt(node: Int, obj: Int, kind: TyKind) -> Int ! Diag.Report {
         ev = cg_eff_ev_argument(node)
         if ev < 0 { return -1 }
     }
+    let recv_lowered = lower_expr(obj)
+    if recv_lowered < 0 { return -1 }
+    let recv_end = cg_expr_pending_count()
     let sb_arg = lower_expr(sublist_get(node_args(node), 0))
     if sb_arg < 0 { return -1 }
-    let recv_value = lower_expr(obj)
+    let recv_value = cc_receiver_held(recv_lowered, recv_end)
     if recv_value < 0 { return -1 }
     let value = if kind == TyKind.Char { cc_char_text_of_value(node, rec.c_spelling, rec.slot_form, recv_value) } else { recv_value }
     if value < 0 { return -1 }
@@ -1317,10 +1320,13 @@ fn cc_checked_read(node: Int) -> Int ! Diag.Report {
     if cc_stopped(idx_rec) { return -1 }
     let found = cc_local(TYPE_INT, node)
     if cc_stopped(found) { return -1 }
-    let recv_val = lower_expr(node_obj(node))
-    if recv_val < 0 { return -1 }
+    let recv_lowered = lower_expr(node_obj(node))
+    if recv_lowered < 0 { return -1 }
+    let recv_end = cg_expr_pending_count()
     let idx_val = lower_expr(sublist_get(node_args(node), 0))
     if idx_val < 0 { return -1 }
+    let recv_val = cc_receiver_held(recv_lowered, recv_end)
+    if recv_val < 0 { return -1 }
     let _td = ensure_typedef_for(tid)
     let recv_name = c_mint_local("cr")
     cg_expr_push_pending(node, ir_let(container, node, recv_rec.c_spelling, recv_name, recv_rec.slot_form, recv_val))
@@ -1427,10 +1433,13 @@ fn cc_list_remove(node: Int, obj: Int) -> Int ! Diag.Report {
     if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.List, "remove", 1, given) }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
-    let receiver = lower_expr(obj)
-    if receiver < 0 { return -1 }
+    let lowered = lower_expr(obj)
+    if lowered < 0 { return -1 }
+    let recv_end = cg_expr_pending_count()
     let index = lower_expr_as_value(sublist_get(written, 0))
     if index < 0 { return -1 }
+    let receiver = cc_receiver_held(lowered, recv_end)
+    if receiver < 0 { return -1 }
     cg_call_element_from_runtime(node, tid, c_runtime_helper("list_remove"), [receiver, index])
 }
 
@@ -1735,16 +1744,25 @@ fn cc_closure_call(node: Int, callee: Int) -> Int ! Diag.Report {
     if fn_type == "" { return -1 }
     let closure = lower_expr(callee)
     if closure < 0 { return -1 }
-    let mut args: List[Int] = []
+    let mut operands = [closure]
+    let mut ends = [cg_expr_pending_count()]
     let written = node_args(node)
     let mut i = 0
     while i < sublist_length(written) {
         let a = lower_expr_as_value(sublist_get(written, i))
         if a < 0 { return -1 }
-        args.push(a)
+        operands.push(a)
+        ends.push(cg_expr_pending_count())
         i = i + 1
     }
-    ir_call_closure(tid, node, rec.c_spelling, fn_type, rec.slot_form, closure, args)
+    let held = cg_expr_sequence(operands, ends, false)
+    let mut args: List[Int] = []
+    let mut k = 1
+    while k < held.len() {
+        args.push(held.get(k).unwrap())
+        k = k + 1
+    }
+    ir_call_closure(tid, node, rec.c_spelling, fn_type, rec.slot_form, held.get(0).unwrap(), args)
 }
 
 // A call node the front end accepted with no callee at all: a compiler bug elsewhere, not
@@ -2085,9 +2103,14 @@ fn lower_async_call(node: Int, method: Str) -> Int ! Diag.Report {
     cg_expr_push_pending(node, ir_let(tid, node, handle_rec.c_spelling, handle_name, handle_rec.slot_form,
         ir_call_runtime(tid, node, handle_rec.c_spelling, c_runtime_helper("handle_new"), handle_rec.slot_form, [])))
 
-    let pair = ir_box(TYPE_INT, node, pointer_spelling(spawn_pair_spelling()), spawn_pair_spelling(),
-        ir_struct_new(TYPE_INT, node, spawn_pair_spelling(),
-            [closure_val, ir_var_ref(tid, node, handle_rec.c_spelling, handle_name, handle_rec.slot_form)]))
+    // The pair holds the spawned value, so it is bound before the call that queues it: the
+    // pool and the task entry read ahead of it in that call are not the program's operands.
+    let pair_name = c_mint_local("pair")
+    cg_expr_push_pending(node, ir_let(TYPE_INT, node, pointer_spelling(spawn_pair_spelling()), pair_name, SlotForm.PointerBoxed,
+        ir_box(TYPE_INT, node, pointer_spelling(spawn_pair_spelling()), spawn_pair_spelling(),
+            ir_struct_new(TYPE_INT, node, spawn_pair_spelling(),
+                [closure_val, ir_var_ref(tid, node, handle_rec.c_spelling, handle_name, handle_rec.slot_form)]))))
+    let pair = ir_var_ref(TYPE_INT, node, pointer_spelling(spawn_pair_spelling()), pair_name, SlotForm.PointerBoxed)
 
     let void_rec = layout_of(TYPE_VOID, Position.Return)
     cg_expr_push_pending(node, ir_expr_stmt(node, ir_call_runtime(TYPE_VOID, node, void_rec.c_spelling,
@@ -2355,8 +2378,9 @@ fn cc_lower_scope_alloc(node: Int, obj: Int, method: Str, is_alloc_n: Bool) -> I
     if cc_stopped(ptr_rec) { return -1 }
     let elem_rec = cc_local(elem_tid, node)
     if cc_stopped(elem_rec) { return -1 }
-    let scope_ir = lower_expr(obj)
-    if scope_ir < 0 { return -1 }
+    let scope_lowered = lower_expr(obj)
+    if scope_lowered < 0 { return -1 }
+    let scope_end = cg_expr_pending_count()
     let count_ir = if is_alloc_n {
         lower_expr(sublist_get(node_args(node), 0))
     } else {
@@ -2365,6 +2389,8 @@ fn cc_lower_scope_alloc(node: Int, obj: Int, method: Str, is_alloc_n: Bool) -> I
         ir_const(TYPE_INT, node, one_rec.c_spelling, "1")
     }
     if count_ir < 0 { return -1 }
+    let scope_ir = cc_receiver_held(scope_lowered, scope_end)
+    if scope_ir < 0 { return -1 }
     ir_sized_alloc(ptr_tid, node, ptr_rec.c_spelling, elem_rec.c_spelling, scope_ir, count_ir)
 }
 
@@ -2463,10 +2489,10 @@ fn cc_lower_ptr_offset(node: Int, obj: Int) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
-    let base = lower_expr(obj)
-    if base < 0 { return -1 }
-    let step = lower_expr(sublist_get(node_args(node), 0))
-    if step < 0 { return -1 }
+    let pair = cg_expr_lower_pair(obj, sublist_get(node_args(node), 0))
+    let base = pair.get(0).unwrap()
+    let step = pair.get(1).unwrap()
+    if base < 0 || step < 0 { return -1 }
     ir_binary(tid, node, rec.c_spelling, "+", base, step)
 }
 
@@ -3831,16 +3857,25 @@ fn cc_field_closure_call(node: Int, obj: Int, recv_tid: Int, mname: Str) -> Int 
     let target = lower_expr(obj)
     if target < 0 { return -1 }
     let closure = ir_field_get(field_tid, node, frec.c_spelling, c_field_name(mname), frec.slot_form, target)
-    let mut args: List[Int] = []
+    let mut operands = [closure]
+    let mut ends = [cg_expr_pending_count()]
     let written = node_args(node)
     let mut i = 0
     while i < sublist_length(written) {
         let a = lower_expr_as_value(sublist_get(written, i))
         if a < 0 { return -1 }
-        args.push(a)
+        operands.push(a)
+        ends.push(cg_expr_pending_count())
         i = i + 1
     }
-    ir_call_closure(tid, node, rec.c_spelling, fn_type, rec.slot_form, closure, args)
+    let held = cg_expr_sequence(operands, ends, false)
+    let mut args: List[Int] = []
+    let mut k = 1
+    while k < held.len() {
+        args.push(held.get(k).unwrap())
+        k = k + 1
+    }
+    ir_call_closure(tid, node, rec.c_spelling, fn_type, rec.slot_form, held.get(0).unwrap(), args)
 }
 
 // A field read takes the owner's stored form: a field whose type reaches its own owner by
@@ -3927,6 +3962,7 @@ fn cc_lower_runtime_method(node: Int, obj: Int, kind: TyKind, method: Str, op: S
 // builds can be empty.
 fn cc_store_args(node: Int, receiver: Int, count: Int, shape: ElementShape) -> List[Int] ! Diag.Report {
     let mut out: List[Int] = [receiver]
+    let mut ends = [cg_expr_pending_count()]
     let written = node_args(node)
     let mut i = 0
     while i < count {
@@ -3937,9 +3973,10 @@ fn cc_store_args(node: Int, receiver: Int, count: Int, shape: ElementShape) -> L
         } else {
             out.push(a)
         }
+        ends.push(cg_expr_pending_count())
         i = i + 1
     }
-    out
+    cg_expr_sequence(out, ends, false)
 }
 
 // Which runtime primitive a receiver's method reaches, for the methods no Blink
@@ -4006,13 +4043,16 @@ fn cc_template_method(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let result = cc_local(tid, node)
     if cc_stopped(result) { return -1 }
-    let receiver = lower_expr(obj)
-    if receiver < 0 { return -1 }
-    let mut args = [receiver]
+    let mut args: List[Int] = []
     if want == 1 {
-        let index = lower_expr(sublist_get(written, 0))
-        if index < 0 { return -1 }
-        args.push(index)
+        args = cg_expr_lower_pair(obj, sublist_get(written, 0))
+    } else {
+        args.push(lower_expr(obj))
+    }
+    let mut i = 0
+    while i < args.len() {
+        if args.get(i).unwrap() < 0 { return -1 }
+        i = i + 1
     }
     ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args)
 }
@@ -4054,10 +4094,13 @@ fn cc_channel_send(node: Int, obj: Int) -> Int ! Diag.Report {
     if cc_shape_stopped(shape) { return -1 }
     let said = cc_local(TYPE_STR, node)
     if cc_stopped(said) { return -1 }
-    let receiver = lower_expr(obj)
-    if receiver < 0 { return -1 }
+    let lowered = lower_expr(obj)
+    if lowered < 0 { return -1 }
+    let recv_end = cg_expr_pending_count()
     let value = lower_expr_as_value(sublist_get(node_args(node), 0))
     if value < 0 { return -1 }
+    let receiver = cc_receiver_held(lowered, recv_end)
+    if receiver < 0 { return -1 }
     let elem = c_mint_local("send")
     cg_expr_push_pending(node, ir_let(shape.tid, node, shape.value.c_spelling, elem, shape.value.slot_form, value))
     let from = ir_unary(shape.tid, node, pointer_spelling(shape.value.c_spelling), "&",
@@ -4499,6 +4542,7 @@ fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Ke
     let recv = lower_expr(obj)
     if recv < 0 { return -1 }
     let mut args = [recv]
+    let mut ends = [cg_expr_pending_count()]
     let written = node_args(node)
     // Every written argument is lowered once, at the position the row puts it in: the key
     // first when the row is keyed, the stored value last when the row stores one. Choosing
@@ -4516,8 +4560,10 @@ fn cc_lower_keyed_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Ke
         }
         if a < 0 { return -1 }
         args.push(a)
+        ends.push(cg_expr_pending_count())
         i = i + 1
     }
+    args = cg_expr_sequence(args, ends, false)
     let call = ir_call_runtime(
         if plain { tid } else { TYPE_INT }, node,
         if plain { answer.c_spelling } else { g.tag },
@@ -4544,10 +4590,13 @@ fn cc_map_remove_carrier(node: Int, obj: Int, kind: TyKind, tid: Int, container:
     if cc_stopped(found) { return -1 }
     let plan = cc_key_plan(node, container, kind, row)
     if cc_key_stopped(plan) { return -1 }
-    let recv = lower_expr(obj)
-    if recv < 0 { return -1 }
+    let lowered = lower_expr(obj)
+    if lowered < 0 { return -1 }
+    let recv_end = cg_expr_pending_count()
     let key_arg = cc_key_arg(node, plan, sublist_get(node_args(node), 0))
     if key_arg < 0 { return -1 }
+    let recv = cc_receiver_held(lowered, recv_end)
+    if recv < 0 { return -1 }
     let _td = ensure_typedef_for(tid)
 
     // The cell the value comes back in is the container's own cell type, at the width
@@ -4685,10 +4734,10 @@ fn cc_wrapping_unsigned_tid(recv_tid: Int) -> Int {
 fn cc_wrapping_arith(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
     if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
-    let recv = lower_expr(obj)
-    if recv < 0 { return -1 }
-    let rhs = lower_expr(sublist_get(node_args(node), 0))
-    if rhs < 0 { return -1 }
+    let pair = cg_expr_lower_pair(obj, sublist_get(node_args(node), 0))
+    let recv = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
+    if recv < 0 || rhs < 0 { return -1 }
     let unsigned_tid = cc_wrapping_unsigned_tid(recv_tid)
     let unsigned_answer = cc_local(unsigned_tid, node)
     if cc_stopped(unsigned_answer) { return -1 }
@@ -4733,10 +4782,10 @@ fn cc_is_scalar_compare(kind: TyKind, method: Str) -> Bool {
 fn cc_scalar_compare(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
     if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
-    let recv = lower_expr(obj)
-    if recv < 0 { return -1 }
-    let rhs = lower_expr(sublist_get(node_args(node), 0))
-    if rhs < 0 { return -1 }
+    let pair = cg_expr_lower_pair(obj, sublist_get(node_args(node), 0))
+    let recv = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
+    if recv < 0 || rhs < 0 { return -1 }
     match scalar_compare_of(kind, method) {
         ScalarCompare.Cmp => cc_scalar_order(node, recv_tid, recv, rhs)
         ScalarCompare.Eq => cc_values_equal(node, recv_tid, recv, rhs)
@@ -5476,11 +5525,11 @@ fn cc_list_take(node: Int, obj: Int) -> Int ! Diag.Report {
         ev = cg_eff_ev_argument(node)
         if ev < 0 { return -1 }
     }
-    let receiver = lower_expr(obj)
-    if receiver < 0 { return -1 }
+    let pair = cg_expr_lower_pair(obj, sublist_get(node_args(node), 0))
+    let receiver = pair.get(0).unwrap()
+    let end = pair.get(1).unwrap()
+    if receiver < 0 || end < 0 { return -1 }
     let start = ir_const(TYPE_INT, node, rec.c_spelling, "0")
-    let end = lower_expr(sublist_get(node_args(node), 0))
-    if end < 0 { return -1 }
     let mut args: List[Int] = [receiver, start, end]
     if takes_ev { args.push(ev) }
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
@@ -5620,10 +5669,10 @@ fn cc_sb_write_char(node: Int, obj: Int) -> Int ! Diag.Report {
         ev = cg_eff_ev_argument(node)
         if ev < 0 { return -1 }
     }
-    let receiver = lower_expr(obj)
-    if receiver < 0 { return -1 }
-    let ch = lower_expr(sublist_get(node_args(node), 0))
-    if ch < 0 { return -1 }
+    let pair = cg_expr_lower_pair(obj, sublist_get(node_args(node), 0))
+    let receiver = pair.get(0).unwrap()
+    let ch = pair.get(1).unwrap()
+    if receiver < 0 || ch < 0 { return -1 }
     let text = cc_char_text_of_value(node, rec.c_spelling, rec.slot_form, ch)
     let mut args: List[Int] = [receiver, text]
     if takes_ev { args.push(ev) }
@@ -6155,17 +6204,10 @@ fn cc_build_call_of(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev:
         ev = cg_eff_ev_argument(node)
         if ev < 0 { return -1 }
     }
-    let mut args: List[Int] = []
-    if recv != NO_RECEIVER {
-        let receiver = lower_expr(recv)
-        if receiver < 0 { return -1 }
-        args.push(receiver)
-    }
+    let mut args = cc_lower_call_operands(node, recv, operands)
     let mut i = 0
-    while i < operands.len() {
-        let a = lower_expr_as_value(operands.get(i).unwrap())
-        if a < 0 { return -1 }
-        args.push(a)
+    while i < args.len() {
+        if args.get(i).unwrap() < 0 { return -1 }
         i = i + 1
     }
     // Last, because that is the position the callee declares it in.
@@ -6174,6 +6216,87 @@ fn cc_build_call_of(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev:
         return ir_call_runtime(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
     }
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
+}
+
+// A receiver lowered ahead of an argument, read by the call after the statements that
+// argument's lowering pushed. It is bound ahead of them when they could change it.
+fn cc_receiver_held(receiver: Int, end: Int) -> Int ! Diag.Report {
+    cg_expr_sequence([receiver], [end], false).get(0).unwrap()
+}
+
+// The receiver and the operands, lowered in the order the call was written and given back
+// in the order the callee declares them. A keyword argument binds by label, so `operands`
+// may hold them in another order than the source; an operand the call did not write, such
+// as a default typecheck appended, comes after every written one. A refused operand stops
+// the lowering and leaves -1 in its slot.
+fn cc_lower_call_operands(node: Int, recv: Int, operands: List[Int]) -> List[Int] ! Diag.Report {
+    let lead = if recv == NO_RECEIVER { 0 } else { 1 }
+    let order = cc_written_order(node, operands)
+    let mut slots: List[Int] = []
+    while slots.len() < lead + operands.len() { slots.push(-1) }
+    let mut values: List[Int] = []
+    let mut ends: List[Int] = []
+    if recv != NO_RECEIVER {
+        let receiver = lower_expr(recv)
+        if receiver < 0 { return slots }
+        values.push(receiver)
+        ends.push(cg_expr_pending_count())
+    }
+    let mut i = 0
+    while i < order.len() {
+        let a = lower_expr_as_value(operands.get(order.get(i).unwrap()).unwrap())
+        if a < 0 { return slots }
+        values.push(a)
+        ends.push(cg_expr_pending_count())
+        i = i + 1
+    }
+    let reordered = cc_is_reordered(order)
+    let held = cg_expr_sequence(values, ends, reordered)
+    if recv != NO_RECEIVER { slots.set(0, held.get(0).unwrap()) }
+    let mut k = 0
+    while k < order.len() {
+        slots.set(lead + order.get(k).unwrap(), held.get(lead + k).unwrap())
+        k = k + 1
+    }
+    slots
+}
+
+// The indices of `operands` in the order the call wrote them.
+fn cc_written_order(node: Int, operands: List[Int]) -> List[Int] {
+    let written = cc_written_args(node)
+    let mut taken: List[Bool] = []
+    while taken.len() < operands.len() { taken.push(false) }
+    let mut order: List[Int] = []
+    let mut j = 0
+    while j < written.len() {
+        let w = written.get(j).unwrap()
+        let value = if nk_of(node_kind(w)) == NodeKind.NamedArg { node_value(w) } else { w }
+        let mut k = 0
+        while k < operands.len() {
+            if !taken.get(k).unwrap() && operands.get(k).unwrap() == value {
+                taken.set(k, true)
+                order.push(k)
+                k = operands.len()
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+    let mut k = 0
+    while k < operands.len() {
+        if !taken.get(k).unwrap() { order.push(k) }
+        k = k + 1
+    }
+    order
+}
+
+fn cc_is_reordered(order: List[Int]) -> Bool {
+    let mut i = 0
+    while i < order.len() {
+        if order.get(i).unwrap() != i { return true }
+        i = i + 1
+    }
+    false
 }
 
 // Which C name a built call reaches: one the compiler emits for a declaration, or one the

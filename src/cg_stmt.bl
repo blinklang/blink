@@ -57,7 +57,7 @@ import cg_expr.{
     cg_expr_frame_loop_exit, cg_expr_frame_open,
     cg_expr_is_registered, cg_expr_pending_count, cg_expr_pending_leaves_from,
     cg_expr_push_pending, cg_expr_register_value, cg_expr_set_return_type, cg_expr_return_type,
-    cg_expr_take_pending, cg_expr_value_count, lower_expr,
+    cg_expr_take_pending, cg_expr_value_count, lower_expr, cg_expr_sequence,
     cg_expr_clear_old_snapshots, cg_expr_set_old_snapshot,
     x_layout_checked, x_panic_message, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
 }
@@ -1013,13 +1013,24 @@ fn agg_tag_label(node: Int, tid: Int, value_ref: Int, pre: List[Int]) -> Int ! D
     ir_var_ref(TYPE_STR, node, str_rec.c_spelling, holder, str_rec.slot_form)
 }
 
+// The two sides of an assertion, in the order they are written. The statements the right
+// side pushes run ahead of this statement's own temps, so the left side is bound ahead of
+// them when they could change it.
+fn lower_assert_sides(left_node: Int, right_node: Int) -> List[Int] ! Diag.Report {
+    let left_value = lower_value(left_node)
+    let left_end = cg_expr_pending_count()
+    let right_value = lower_value(right_node)
+    cg_expr_sequence([left_value, right_value], [left_end, cg_expr_pending_count()], false)
+}
+
 // assert_eq and assert_ne share the same comparison and the same two rendered sides; only
 // the failing condition and the message wording differ, the same split the scalar buckets
 // above make between an EQ and an NE failure. The sides render only on the failing path,
 // so a passing assertion costs one compare.
 fn lower_assert_aggregate(node: Int, tid: Int, left_node: Int, right_node: Int, is_eq: Bool) -> Int ! Diag.Report {
-    let left_value = lower_value(left_node)
-    let right_value = lower_value(right_node)
+    let sides = lower_assert_sides(left_node, right_node)
+    let left_value = sides.get(0).unwrap()
+    let right_value = sides.get(1).unwrap()
     if left_value < 0 || right_value < 0 { return -1 }
     let left_bound = bind_temp("left", tid, node, left_value)
     let right_bound = bind_temp("right", tid, node, right_value)
@@ -1064,8 +1075,9 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(left_node)
     if tid < 0 { return -1 }
     if eq_is_aggregate(tid) { return lower_assert_aggregate(node, tid, left_node, right_node, true) }
-    let left_value = lower_value(left_node)
-    let right_value = lower_value(right_node)
+    let sides = lower_assert_sides(left_node, right_node)
+    let left_value = sides.get(0).unwrap()
+    let right_value = sides.get(1).unwrap()
     if left_value < 0 || right_value < 0 { return -1 }
     let left_bound = bind_temp("left", tid, node, left_value)
     let right_bound = bind_temp("right", tid, node, right_value)
@@ -1113,8 +1125,9 @@ fn lower_assert_ne_call(node: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(left_node)
     if tid < 0 { return -1 }
     if eq_is_aggregate(tid) { return lower_assert_aggregate(node, tid, left_node, right_node, false) }
-    let left_value = lower_value(left_node)
-    let right_value = lower_value(right_node)
+    let sides = lower_assert_sides(left_node, right_node)
+    let left_value = sides.get(0).unwrap()
+    let right_value = sides.get(1).unwrap()
     if left_value < 0 || right_value < 0 { return -1 }
     let left_bound = bind_temp("left", tid, node, left_value)
     let right_bound = bind_temp("right", tid, node, right_value)
@@ -1778,12 +1791,11 @@ fn mv_leaving_call_stmt(e: Int) -> Int ! Diag.Report {
     ir_expr_stmt(e, ran)
 }
 
-// codegen fills a struct literal one declared field at a time, by name, not in the order
-// the literal spelled them. A field the literal omits runs its default at the place the
-// type declares it, so the walk cannot put it among the others and refuses the literal. A
-// spread is bound to a temp before any field is written, and an omitted field then reads
-// that temp, which nothing can write. So the walk takes the source first, then the written
-// fields in declaration order, the order lower_struct_lit runs them in.
+// A struct literal runs its written fields and its spread in the order it writes them,
+// the order lower_struct_lit lowers them in. A field the literal omits runs its default
+// once every written field has run, so the walk cannot put it among the others and
+// refuses the literal. An omitted field read through a spread reads the spread's temp,
+// which nothing can write.
 fn mv_struct_lit(e: Int) -> Bool ! Diag.Report {
     let tid = tid_of_node(e)
     if tid < 0 { return mv_moves_work(e) }
@@ -1791,20 +1803,16 @@ fn mv_struct_lit(e: Int) -> Bool ! Diag.Report {
     if decl < 0 { return mv_moves_work(e) }
     let given = node_fields(e)
     let sp = mv_struct_lit_spread(given)
-    if sp >= 0 {
-        if !mv_expr(node_value(sp)) { return false }
-    }
     let decls = node_fields(decl)
     let mut i = 0
     while i < sublist_length(decls) {
-        let fd = sublist_get(decls, i)
-        let g = mv_struct_lit_find(given, node_name(fd))
-        if g >= 0 {
-            if !mv_expr(node_value(g)) { return false }
-        } else if sp < 0 {
-            return mv_moves_work(e)
-        }
+        if sp < 0 && mv_struct_lit_find(given, node_name(sublist_get(decls, i))) < 0 { return mv_moves_work(e) }
         i = i + 1
+    }
+    let mut j = 0
+    while j < sublist_length(given) {
+        if !mv_expr(node_value(sublist_get(given, j))) { return false }
+        j = j + 1
     }
     true
 }

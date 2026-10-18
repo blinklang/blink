@@ -1,0 +1,68 @@
+// C leaves the order of a call's arguments and of an operator's operands unspecified, and
+// Blink evaluates them left to right (§2.22). The IR constructors flag an operand that must
+// run before a sibling, and ir_operand_stable says which values read the same wherever
+// among their siblings they run.
+
+import ir.{
+    ir_reset, ir_must_materialize, ir_operand_stable,
+    ir_const, ir_var_ref, ir_global_ref, ir_unary, ir_binary, ir_call_direct,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn int_const(text: Str) -> Int { ir_const(1, 0, "int64_t", text) }
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+fn int_global(name: Str) -> Int { ir_global_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+fn call_f(args: List[Int]) -> Int { ir_call_direct(1, 0, "int64_t", "main_f", SlotForm.InlineWord, args) }
+
+test "a constant, a local and arithmetic over them are stable" {
+    ir_reset()
+    assert(ir_operand_stable(int_const("1")))
+    assert(ir_operand_stable(int_var("a")))
+    assert(ir_operand_stable(ir_binary(1, 0, "int64_t", "+", int_var("a"), int_const("1"))))
+}
+
+test "a call, a global and a dereference are not stable" {
+    ir_reset()
+    assert(!ir_operand_stable(call_f([])))
+    assert(!ir_operand_stable(int_global("g")))
+    assert(!ir_operand_stable(ir_unary(1, 0, "int64_t", "*", int_var("p"))))
+    assert(ir_operand_stable(ir_unary(1, 0, "int64_t", "-", int_var("a"))))
+}
+
+test "two calls as arguments flag the first so it runs first" {
+    ir_reset()
+    let first = call_f([])
+    let second = call_f([])
+    let _outer = call_f([first, second])
+    assert_eq(ir_must_materialize(first), 1)
+    assert_eq(ir_must_materialize(second), 0)
+}
+
+test "a global read before a call is flagged so the call cannot change it first" {
+    ir_reset()
+    let read = int_global("g")
+    let work = call_f([])
+    let _outer = call_f([read, work])
+    assert_eq(ir_must_materialize(read), 1)
+    assert_eq(ir_must_materialize(work), 0)
+}
+
+test "a local beside a call stays inline" {
+    ir_reset()
+    let local = int_var("a")
+    let work = call_f([])
+    let _outer = ir_binary(1, 0, "int64_t", "+", local, work)
+    assert_eq(ir_must_materialize(local), 0)
+    assert_eq(ir_must_materialize(work), 0)
+}
+
+test "the right side of a short circuit is not an operand" {
+    ir_reset()
+    let left = call_f([])
+    let right = call_f([])
+    let _outer = ir_binary(1, 0, "bool", "&&", left, right)
+    assert_eq(ir_must_materialize(left), 0)
+}

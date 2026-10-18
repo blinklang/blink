@@ -13,7 +13,8 @@
 // is held, not what it is.
 //
 // Inline rule. A value node prints inline unless must_materialize is set. Lowering sets the
-// flag for an effectful node and for a node the tree reaches twice, and for nothing else,
+// flag for an effectful node, for a node the tree reaches twice, and for an operand whose
+// order against a sibling C would not keep (Operand order, below), and for nothing else,
 // so the C keeps today's nested expression shape that gcc -O2 already optimises well.
 // A flagged node binds its temporary inside the braces of the Block it is first reached in,
 // so every later reach must sit in that Block or in one nested inside it. A reach from a
@@ -548,6 +549,136 @@ pub fn ir_mark_materialize(id: Int) {
     part_of(id).marks.set(index_in_part(id), 1)
 }
 
+// ── Operand order ─────────────────────────────────────────────────────────
+
+// Operands evaluate left to right (§2.22), but C leaves the order of a call's arguments
+// and of an operator's or initializer's operands unspecified. The printer binds a marked
+// kid when it prints it, and it prints kids in kid order, so a mark is how a node keeps
+// its order. A kid is marked when it does work and a later kid could see that work, or
+// when it reads a value a later kid's work could change. Kids from `first` on are
+// operands; the ones before it are parts the node reads in a fixed way.
+// A deeper operand counts as one that works and reads, which costs a temp, not order.
+let operand_scan_depth = 24
+
+fn sequence_kids(id: Int, first: Int) -> Int {
+    let mut later_works = false
+    let mut later_reads = false
+    let mut i = ir_kid_count(id) - 1
+    while i >= first {
+        let kid = ir_kid(id, i)
+        if in_arena(kid) {
+            let works = does_work_within(kid, operand_scan_depth)
+            let reads = works || !stable_within(kid, operand_scan_depth)
+            if (works && later_reads) || (reads && later_works) { ir_mark_materialize(kid) }
+            later_works = later_works || works
+            later_reads = later_reads || reads
+        }
+        i = i - 1
+    }
+    id
+}
+
+// Whether evaluating the value runs code another operand could observe: a call, a
+// perform, or a statement the printer binds ahead of the expression. An allocation alone
+// is not observable, so a node that only allocates and fills is work only through its kids.
+// The printer binds such a node ahead of its siblings, which stable_within answers.
+fn does_work_within(id: Int, budget: Int) -> Bool {
+    if budget < 0 { return true }
+    if ir_must_materialize(id) == 1 && !ir_kind_is_name(ir_kind(id)) { return true }
+    if kind_does_work(ir_kind(id)) { return true }
+    let n = ir_kid_count(id)
+    let mut i = 0
+    while i < n {
+        let kid = ir_kid(id, i)
+        if in_arena(kid) && does_work_within(kid, budget - 1) { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn kind_does_work(kind: IrKind) -> Bool {
+    match kind {
+        IrKind.CallDirect => true
+        IrKind.CallIndirect => true
+        IrKind.CallClosure => true
+        IrKind.CallVirtual => true
+        IrKind.CallRuntime => true
+        IrKind.EffectPerform => true
+        _ => false
+    }
+}
+
+// Whether the value is the same wherever among its siblings it is evaluated. A local is:
+// only a closure can write one inside an expression, and a local a closure shares is a
+// CellRef. A global, a cell, and anything read through a pointer can change under another
+// operand's work, and a node bound ahead of the expression is evaluated out of its place.
+fn stable_within(id: Int, budget: Int) -> Bool {
+    if budget < 0 { return false }
+    if ir_must_materialize(id) == 1 && !ir_kind_is_name(ir_kind(id)) { return false }
+    match ir_kind(id) {
+        IrKind.Const => true
+        IrKind.VarRef => true
+        IrKind.EvidenceVector => true
+        IrKind.EvidenceAddress => true
+        IrKind.ArenaTarget => true
+        IrKind.PromoteCtx => kids_stable(id, budget)
+        IrKind.Unary => unary_keeps_value(ir_c_name(id)) && kids_stable(id, budget)
+        IrKind.Binary => kids_stable(id, budget)
+        IrKind.Cast => kids_stable(id, budget)
+        IrKind.StructNew => kids_stable(id, budget)
+        IrKind.TupleNew => kids_stable(id, budget)
+        IrKind.EnumNew => kids_stable(id, budget)
+        IrKind.CarrierWrap => kids_stable(id, budget)
+        IrKind.FieldGet => member_read_stable(id, budget)
+        IrKind.CarrierUnwrap => member_read_stable(id, budget)
+        IrKind.CarrierTag => member_read_stable(id, budget)
+        _ => false
+    }
+}
+
+// A dereference reads memory another operand's work could write; every other unary
+// operator reads only its operand.
+fn unary_keeps_value(op: Str) -> Bool {
+    match op {
+        "*" => false
+        _ => true
+    }
+}
+
+// Whether a value lowered ahead of a later operand's statements still reads the same
+// after them. Lowering asks before it binds the value in front of those statements.
+pub fn ir_operand_stable(id: Int) -> Bool { stable_within(id, operand_scan_depth) }
+
+fn kids_stable(id: Int, budget: Int) -> Bool {
+    let n = ir_kid_count(id)
+    let mut i = 0
+    while i < n {
+        let kid = ir_kid(id, i)
+        if in_arena(kid) && !stable_within(kid, budget - 1) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// A member of an inline value is part of that value. A member reached through a pointer
+// is not, unless the pointer is reached from the evidence vector: a handler an operand
+// installs is gone again before the next operand runs.
+fn member_read_stable(id: Int, budget: Int) -> Bool {
+    let obj = ir_kid(id, 0)
+    if !in_arena(obj) { return true }
+    if ir_held_by_pointer(obj) && !reached_from_evidence(obj, budget) { return false }
+    stable_within(obj, budget - 1)
+}
+
+fn reached_from_evidence(id: Int, budget: Int) -> Bool {
+    if budget < 0 { return false }
+    match ir_kind(id) {
+        IrKind.EvidenceVector => true
+        IrKind.FieldGet => in_arena(ir_kid(id, 0)) && reached_from_evidence(ir_kid(id, 0), budget - 1)
+        _ => false
+    }
+}
+
 // ── Kind tables ───────────────────────────────────────────────────────────
 
 pub fn ir_all_kinds() -> List[IrKind] {
@@ -794,7 +925,10 @@ pub fn ir_unary(tid: Int, span: Int, c_spelling: Str, op: Str, operand: Int) -> 
 }
 
 pub fn ir_binary(tid: Int, span: Int, c_spelling: Str, op: Str, lhs: Int, rhs: Int) -> Int {
-    node2(IrKind.Binary, tid, span, c_spelling, op, SlotForm.InlineWord, lhs, rhs)
+    let id = node2(IrKind.Binary, tid, span, c_spelling, op, SlotForm.InlineWord, lhs, rhs)
+    // The rhs of a short circuit runs only when it is taken, so it is not an operand.
+    if op == "&&" || op == "||" { return id }
+    sequence_kids(id, 0)
 }
 
 pub fn ir_cast(tid: Int, span: Int, c_spelling: Str, expr: Int) -> Int {
@@ -815,11 +949,11 @@ pub fn ir_field_get(tid: Int, span: Int, c_spelling: Str, field: Str, slot_form:
 }
 
 pub fn ir_struct_new(tid: Int, span: Int, c_spelling: Str, fields: List[Int]) -> Int {
-    ir_new(IrKind.StructNew, tid, span, c_spelling, "", SlotForm.Inline, fields)
+    sequence_kids(ir_new(IrKind.StructNew, tid, span, c_spelling, "", SlotForm.Inline, fields), 0)
 }
 
 pub fn ir_tuple_new(tid: Int, span: Int, c_spelling: Str, elems: List[Int]) -> Int {
-    ir_new(IrKind.TupleNew, tid, span, c_spelling, "", SlotForm.Inline, elems)
+    sequence_kids(ir_new(IrKind.TupleNew, tid, span, c_spelling, "", SlotForm.Inline, elems), 0)
 }
 
 // One arm of a tagged union: `Shape.Circle(2)`. tid is the enum (a mono instance tid for a
@@ -832,7 +966,7 @@ pub fn ir_tuple_new(tid: Int, span: Int, c_spelling: Str, elems: List[Int]) -> I
 pub fn ir_enum_new(tid: Int, span: Int, c_spelling: Str, variant: Int, member: Str, tag: Int, payload: List[Int]) -> Int {
     let id = node_after(IrKind.EnumNew, tid, span, c_spelling, member, SlotForm.Inline, tag, payload)
     set_decl(id, variant)
-    stamp_tagged_members(id)
+    sequence_kids(stamp_tagged_members(id), 1)
 }
 
 fn set_decl(id: Int, decl: Int) {
@@ -929,7 +1063,7 @@ pub fn ir_carrier_wrap(tid: Int, span: Int, c_spelling: Str, member: Str, tag: I
     } else {
         node2(IrKind.CarrierWrap, tid, span, c_spelling, member, SlotForm.Inline, tag, payload)
     }
-    stamp_tagged_members(id)
+    sequence_kids(stamp_tagged_members(id), 1)
 }
 
 pub fn ir_carrier_unwrap(tid: Int, span: Int, c_spelling: Str, member: Str, slot_form: SlotForm, carrier: Int) -> Int {
@@ -941,24 +1075,24 @@ pub fn ir_carrier_tag(tid: Int, span: Int, c_spelling: Str, carrier: Int) -> Int
 }
 
 pub fn ir_call_direct(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_form: SlotForm, args: List[Int]) -> Int {
-    ir_new(IrKind.CallDirect, tid, span, c_spelling, symbol, slot_form, args)
+    sequence_kids(ir_new(IrKind.CallDirect, tid, span, c_spelling, symbol, slot_form, args), 0)
 }
 
 pub fn ir_call_indirect(tid: Int, span: Int, c_spelling: Str, slot_form: SlotForm, callee: Int, args: List[Int]) -> Int {
-    node_after(IrKind.CallIndirect, tid, span, c_spelling, "", slot_form, callee, args)
+    sequence_kids(node_after(IrKind.CallIndirect, tid, span, c_spelling, "", slot_form, callee, args), 0)
 }
 
 // fn_type is the C function-pointer type the closure's fn_ptr is cast to before the call.
 pub fn ir_call_closure(tid: Int, span: Int, c_spelling: Str, fn_type: Str, slot_form: SlotForm, closure: Int, args: List[Int]) -> Int {
-    node_after(IrKind.CallClosure, tid, span, c_spelling, fn_type, slot_form, closure, args)
+    sequence_kids(node_after(IrKind.CallClosure, tid, span, c_spelling, fn_type, slot_form, closure, args), 0)
 }
 
 pub fn ir_call_virtual(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, receiver: Int, args: List[Int]) -> Int {
-    node_after(IrKind.CallVirtual, tid, span, c_spelling, slot, slot_form, receiver, args)
+    sequence_kids(node_after(IrKind.CallVirtual, tid, span, c_spelling, slot, slot_form, receiver, args), 0)
 }
 
 pub fn ir_call_runtime(tid: Int, span: Int, c_spelling: Str, symbol: Str, slot_form: SlotForm, args: List[Int]) -> Int {
-    ir_new(IrKind.CallRuntime, tid, span, c_spelling, symbol, slot_form, args)
+    sequence_kids(ir_new(IrKind.CallRuntime, tid, span, c_spelling, symbol, slot_form, args), 0)
 }
 
 // capture_descs names the table describing what each capture holds and promoter the
@@ -1009,7 +1143,8 @@ pub fn ir_evidence_address(span: Int, vector: Int) -> Int {
 // effect's slot off an EvidenceVector, and `slot` is the vtable member the runtime or the
 // user effect declares. Printing it as `(handler)->slot(args)` is the printer's rule.
 pub fn ir_effect_perform(tid: Int, span: Int, c_spelling: Str, slot: Str, slot_form: SlotForm, slot_read: Int, args: List[Int]) -> Int {
-    node_after(IrKind.EffectPerform, tid, span, c_spelling, slot, slot_form, slot_read, args)
+    // The slot read is a place the printer writes twice, and nothing an argument does moves it.
+    sequence_kids(node_after(IrKind.EffectPerform, tid, span, c_spelling, slot, slot_form, slot_read, args), 1)
 }
 
 // ── Constructors: statements ──────────────────────────────────────────────

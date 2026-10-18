@@ -45,9 +45,10 @@ The rule holds inside one block. A flagged node that two blocks reach, for examp
 it later. Lowering must put such a value in a `Let` of its own; the verifier does not
 check this yet.
 
-When one C form joins several values, the printer binds each value in its own `let`
-in source order before it joins the text. The holes of one interpolated string give no
-promise about their evaluation order, so `f() + g()` binds `f` before `g` this way.
+C leaves the order of a call's arguments and of an operator's operands unspecified,
+but Blink evaluates operands left to right (§2.22). Lowering flags each operand that
+must run before a sibling, and the printer binds flagged kids in kid order before it
+joins the text, so `f() + g()` binds `f` before `g` calls.
 An lvalue always prints in place, even when a read of the same node bound a
 temporary: a store into the temporary would land in a copy.
 
@@ -55,8 +56,9 @@ An expression statement follows the same rule. A flagged non-void value binds it
 temporary and then prints `(void)_tN;`, so a later reach of the same node reuses the
 temporary. A void value prints bare, because nothing can reach it again.
 
-Lowering sets the flag for two shapes only: a node with an effect, and a node the
-tree reaches more than once. The IR verifier rejects a shared node with no flag. So
+Lowering sets the flag for three shapes only: a node with an effect, a node the
+tree reaches more than once, and an operand whose order against a sibling C would
+not keep (see the operand order section of ir.md). The IR verifier rejects a shared node with no flag. So
 the C keeps the nested expression shape that `gcc -O2` already handles well, and no
 value is evaluated twice.
 

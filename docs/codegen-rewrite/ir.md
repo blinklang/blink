@@ -57,10 +57,32 @@ the verifier rejects a statement reached twice even when it is flagged.
 ## Inline rule
 
 A value node prints inline unless `must_materialize` is set. Lowering sets the
-flag for an effectful node and for a node the tree reaches twice, and for
-nothing else. This keeps the nested expression shape that gcc -O2 already
-optimises well. The flag is a hint to the printer about *where* a value is
-computed; it does not change what the tree means.
+flag for an effectful node, for a node the tree reaches twice, and for an
+operand whose order C would not keep, and for nothing else. This keeps the
+nested expression shape that gcc -O2 already optimises well. The flag is a hint
+to the printer about *where* a value is computed; it does not change what the
+tree means.
+
+## Operand order
+
+Operands evaluate left to right (§2.22). C does not order a call's arguments
+or the operands of an operator or initializer, so the IR keeps the order with
+two rules.
+
+- **Kids of one node.** The constructors of calls, `Binary` (not `&&` or `||`),
+  `StructNew`, `TupleNew`, `EnumNew`, `CarrierWrap` and `EffectPerform` flag an
+  operand that does work a later operand could see, or that reads a value a
+  later operand's work could change. The printer binds flagged kids in kid
+  order. A local, a constant, and a member of an inline value are stable; a
+  global, a cell, and a read through a pointer are not.
+- **Statements a later operand pushes.** A `?`, `??`, checked operator or other
+  construct pushes statements that run before the expression they feed. Lowering
+  (`cg_expr_sequence` in cg_expr.bl) binds each earlier operand that is not
+  stable in a `Let` ahead of those statements.
+
+Lowering keeps written order where it differs from kid order: call arguments
+given by keyword, and struct fields written out of declaration order, are
+lowered as written and bound before the node puts them in slot order.
 
 `If`, `Switch` and `Block` are statements only. A value-position `if` or
 `match` lowers to `Let` with no initialiser, followed by `Assign` inside each

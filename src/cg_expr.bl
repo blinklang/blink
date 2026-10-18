@@ -48,6 +48,7 @@ import ir.{
     ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
     ir_expr_stmt, ir_if, ir_block, ir_enum_new, ir_unreachable, ir_panic_catch_exit, ir_binds_statement,
+    ir_operand_stable, ir_mark_materialize, ir_container_spread,
 }
 import cg_stmt.{cg_stmt_return_value, cg_stmt_materialise_where_run}
 import cg_call.{
@@ -833,8 +834,9 @@ fn lower_binop(node: Int) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
-    let lhs = lower_expr(node_left(node))
-    let rhs = lower_expr(node_right(node))
+    let pair = cg_expr_lower_pair(node_left(node), node_right(node))
+    let lhs = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
     if lhs < 0 { return -1 }
     if rhs < 0 { return -1 }
     lower_arith_operator(ArithSite { node: node, op: op, tid: tid, lhs_node: node_left(node),
@@ -967,6 +969,74 @@ fn x_hold(tid: Int, node: Int, value: Int) -> Int ! Diag.Report {
     let bound = x_bind(tid, node, value)
     if bound == "" { return -1 }
     x_ref(tid, node, bound)
+}
+
+// Two operands, lowered and sequenced as the program wrote them. A refused left operand
+// stops the lowering, and the answer holds -1 for each operand not built.
+pub fn cg_expr_lower_pair(left: Int, right: Int) -> List[Int] ! Diag.Report {
+    let lhs = lower_expr(left)
+    if lhs < 0 { return [-1, -1] }
+    let lhs_end = cx_pending.len()
+    let rhs = lower_expr(right)
+    cg_expr_sequence([lhs, rhs], [lhs_end, cx_pending.len()], false)
+}
+
+// Operands lowered one after another, made safe to read in the order the node reads them,
+// in place.
+// `ends.get(i)` is the length of the pending buffer just after operand i was lowered. A
+// statement a later operand pushed runs before the expression that reads operand i, so an
+// operand whose value could move under that statement is bound ahead of it. With `all`,
+// each such operand but the last is bound even with no statement after it, for a node
+// that reads its operands in another order than the program wrote them.
+//
+// It runs from the last operand back, so binding one leaves the ends of the earlier ones
+// where they were.
+pub fn cg_expr_sequence(values: List[Int], ends: List[Int], all: Bool) -> List[Int] ! Diag.Report {
+    let mut i = values.len() - 1
+    while i >= 0 {
+        let value = values.get(i).unwrap()
+        let end = ends.get(i).unwrap()
+        let later = cx_pending.len() > end || (all && i < values.len() - 1)
+        if value >= 0 && later { values.set(i, x_hold_operand(end, value)) }
+        i = i - 1
+    }
+    values
+}
+
+// A spread is not a value of its own: it copies its source into the literal being built,
+// so the source is what is held.
+fn x_hold_operand(end: Int, value: Int) -> Int ! Diag.Report {
+    if ir_kind(value) == IrKind.ContainerSpread {
+        let source = ir_kid(value, 0)
+        if ir_operand_stable(source) { return value }
+        let held = x_hold_at(end, source)
+        if held < 0 { return -1 }
+        return ir_container_spread(ir_tid(value), ir_span(value), ir_c_spelling(value), ir_c_name(value), held)
+    }
+    if ir_operand_stable(value) { return value }
+    x_hold_at(end, value)
+}
+
+// The value bound to a temp at position `end` of the pending buffer, in front of the
+// statements pushed after it. A Void value has no temp to read, so its statement runs
+// there and its later reads print the placeholder the printer records for it.
+fn x_hold_at(end: Int, value: Int) -> Int ! Diag.Report {
+    let later = x_take_from(end)
+    let tid = ir_tid(value)
+    let mut held = value
+    if x_is_void_like(tid) {
+        ir_mark_materialize(value)
+        x_hoist(ir_expr_stmt(ir_span(value), value))
+    } else {
+        let bound = x_bind(tid, ir_span(value), value)
+        held = if bound == "" { -1 } else { x_ref(tid, ir_span(value), bound) }
+    }
+    let mut i = 0
+    while i < later.len() {
+        x_hoist(later.get(i).unwrap())
+        i = i + 1
+    }
+    held
 }
 
 // A held operand read once more. A module global stays a GlobalRef, so no read of it
@@ -1126,8 +1196,9 @@ fn lower_str_binop(node: Int, op: Str) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
-    let lhs = lower_expr(node_left(node))
-    let rhs = lower_expr(node_right(node))
+    let pair = cg_expr_lower_pair(node_left(node), node_right(node))
+    let lhs = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
     if lhs < 0 { return -1 }
     if rhs < 0 { return -1 }
     if op == "==" { return x_str_eq(node, tid, rec, lhs, rhs) }
@@ -1159,8 +1230,9 @@ fn lower_float_compare(node: Int, op: Str) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = x_local(tid, node)
     if x_stopped(rec) { return -1 }
-    let lhs = lower_expr(node_left(node))
-    let rhs = lower_expr(node_right(node))
+    let pair = cg_expr_lower_pair(node_left(node), node_right(node))
+    let lhs = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
     if lhs < 0 { return -1 }
     if rhs < 0 { return -1 }
     if op == "==" || op == "!=" {
@@ -1531,13 +1603,15 @@ fn lower_tuple_lit(node: Int) -> Int ! Diag.Report {
 
 fn x_lower_all(sl: Int) -> List[Int] ! Diag.Report {
     let mut out: List[Int] = []
+    let mut ends: List[Int] = []
     if sl < 0 { return out }
     let mut i = 0
     while i < sublist_length(sl) {
         out.push(lower_expr_as_value(sublist_get(sl, i)))
+        ends.push(cx_pending.len())
         i = i + 1
     }
-    out
+    cg_expr_sequence(out, ends, false)
 }
 
 // The elements a container literal is written with. A written element is an expression; a
@@ -1552,6 +1626,7 @@ fn x_lower_all(sl: Int) -> List[Int] ! Diag.Report {
 // and none of them can be built into a literal that is not built.
 fn x_lower_container_elements(sl: Int, into_tid: Int) -> List[Int] ! Diag.Report {
     let mut out: List[Int] = []
+    let mut ends: List[Int] = []
     if sl < 0 { return out }
     let mut i = 0
     while i < sublist_length(sl) {
@@ -1563,9 +1638,10 @@ fn x_lower_container_elements(sl: Int, into_tid: Int) -> List[Int] ! Diag.Report
         }
         out.push(built)
         if built < 0 { return out }
+        ends.push(cx_pending.len())
         i = i + 1
     }
-    out
+    cg_expr_sequence(out, ends, false)
 }
 
 // A container literal hands its elements to the runtime constructor. A map or set literal
@@ -1621,13 +1697,9 @@ fn lower_struct_lit(node: Int) -> Int ! Diag.Report {
         return -1
     }
     ensure_typedef_for(tid)
-    let sp = x_spread_node(node)
-    let mut base = SpreadBase {}
-    if sp >= 0 {
-        base = x_bind_spread(sp)
-        if base.name == "" { return -1 }
-    }
-    let values = x_struct_fields(node, decl, base)
+    let written = x_struct_written(node, decl)
+    if written.failed { return -1 }
+    let values = x_struct_fields(node, decl, written)
     let mut i = 0
     while i < values.len() {
         if values.get(i).unwrap() < 0 { return -1 }
@@ -1636,25 +1708,73 @@ fn lower_struct_lit(node: Int) -> Int ! Diag.Report {
     ir_struct_new(tid, node, rec.c_spelling, values)
 }
 
-fn x_struct_fields(node: Int, decl: Int, base: SpreadBase) -> List[Int] ! Diag.Report {
-    let decls = node_fields(decl)
+// The fields a struct literal writes, lowered in the order it writes them (§2.22), with
+// the spread bound where it is written. C fills the literal in declaration order, so a
+// field written out of that order is bound ahead when its value could see another's work.
+type StructWritten {
+    names: List[Str]
+    values: List[Int]
+    base: SpreadBase
+    failed: Bool
+}
+
+fn x_struct_written(node: Int, decl: Int) -> StructWritten ! Diag.Report {
     let given = node_fields(node)
+    let decls = node_fields(decl)
+    let mut names: List[Str] = []
+    let mut values: List[Int] = []
+    let mut ends: List[Int] = []
+    let mut base = SpreadBase {}
+    let mut reordered = false
+    let mut last_at = -1
+    let mut j = 0
+    while j < sublist_length(given) {
+        let g = sublist_get(given, j)
+        if nk_of(node_kind(g)) == NodeKind.SpreadExpr {
+            base = x_bind_spread(g)
+            if base.name == "" { return StructWritten { names: names, values: values, base: base, failed: true } }
+        } else {
+            let value = lower_expr_as_value(node_value(g))
+            if value < 0 { return StructWritten { names: names, values: values, base: base, failed: true } }
+            names.push(node_name(g))
+            values.push(value)
+            ends.push(cx_pending.len())
+            let at = x_decl_field_index(decls, node_name(g))
+            if at < last_at { reordered = true }
+            last_at = at
+        }
+        j = j + 1
+    }
+    StructWritten { names: names, values: cg_expr_sequence(values, ends, reordered), base: base, failed: false }
+}
+
+fn x_decl_field_index(decls: Int, name: Str) -> Int {
+    let mut i = 0
+    while i < sublist_length(decls) {
+        if node_name(sublist_get(decls, i)) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn x_struct_fields(node: Int, decl: Int, written: StructWritten) -> List[Int] ! Diag.Report {
+    let decls = node_fields(decl)
     let mut out: List[Int] = []
     let mut i = 0
     while i < sublist_length(decls) {
         let fd = sublist_get(decls, i)
-        out.push(x_struct_field_value(node, decl, fd, given, base))
+        out.push(x_struct_field_value(node, decl, fd, written))
         i = i + 1
     }
     out
 }
 
-fn x_struct_field_value(node: Int, decl: Int, fd: Int, given: Int, base: SpreadBase) -> Int ! Diag.Report {
+fn x_struct_field_value(node: Int, decl: Int, fd: Int, written: StructWritten) -> Int ! Diag.Report {
     let want = node_name(fd)
+    let base = written.base
     let mut j = 0
-    while j < sublist_length(given) {
-        let g = sublist_get(given, j)
-        if node_name(g) == want { return lower_expr_as_value(node_value(g)) }
+    while j < written.names.len() {
+        if written.names.get(j).unwrap() == want { return written.values.get(j).unwrap() }
         j = j + 1
     }
     // A spread supplies every field the literal does not name, and it outranks the
@@ -2038,6 +2158,7 @@ fn lower_interp(node: Int) -> Int ! Diag.Report {
 fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int ! Diag.Report {
     let mut fmt = ""
     let mut holes: List[Int] = []
+    let mut ends: List[Int] = []
     let mut i = 0
     while i < sublist_length(parts) {
         let part = sublist_get(parts, i)
@@ -2048,9 +2169,11 @@ fn lower_interp_call(node: Int, tid: Int, rec: LayoutRecord, parts: Int) -> Int 
             if hole.spec == "" { return -1 }
             fmt = fmt.concat(hole.spec)
             holes.push(hole.arg)
+            ends.push(cx_pending.len())
         }
         i = i + 1
     }
+    holes = cg_expr_sequence(holes, ends, false)
     let mut args = [ir_const(TYPE_STR, node, rec.c_spelling, c_str_const(fmt))]
     let mut j = 0
     while j < holes.len() {
@@ -2074,13 +2197,17 @@ fn lower_template(node: Int, tid: Int, rec: LayoutRecord) -> Int ! Diag.Report {
     let mut i = 0
     while i <= n {
         if i == n || x_template_takes_value(sublist_get(parts, i)) {
+            // The template built so far is read after the statements the next part
+            // pushes, so it is bound ahead of them when they could change it.
+            let built_end = cx_pending.len()
             let text = x_template_segment(node, parts, from, i)
             if text < 0 { return -1 }
-            t = x_template_push(node, tid, rec, "template_push_part", t, text)
+            t = x_template_push(node, tid, rec, "template_push_part", cg_expr_sequence([t], [built_end], false).get(0).unwrap(), text)
             if i < n {
+                let value_end = cx_pending.len()
                 let value = x_template_value(sublist_get(parts, i))
                 if value.op == "" { return -1 }
-                t = x_template_push(node, tid, rec, value.op, t, value.arg)
+                t = x_template_push(node, tid, rec, value.op, cg_expr_sequence([t], [value_end], false).get(0).unwrap(), value.arg)
             }
             from = i + 1
         }
