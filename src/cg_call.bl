@@ -20,7 +20,7 @@
 import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
     node_body, node_is_mut, node_handlers, node_stmts,
-    node_methods, node_trait_name, node_impl_binders, node_type_params,
+    node_methods, node_impl_binders, node_type_params,
     node_module, node_source_module, node_params, node_fields, node_value, node_str_val,
     sublist_get, sublist_length,
 }
@@ -37,7 +37,7 @@ import typecheck.{
     tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_call_user_effect, tc_call_builtin_default,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_tid_name, tc_mc_obj_is_value,
-    tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_conversion_impl_for, tc_conversion_trait_of, CONVERSION_IS_IDENTITY,
+    tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_impl_trait_id, tc_call_trait, tc_impl_is_of_call_trait, tc_qualified_call_trait, tc_names_a_trait, tc_conversion_impl_for, tc_conversion_trait_of, CONVERSION_IS_IDENTITY,
     tc_tid_same_type, make_option_type, make_fn_type, tc_qualified_carrier,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID, TYPE_NEVER,
     type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
@@ -52,7 +52,7 @@ import layout.{
     async_scope_handles_spelling, list_slots_hold_no_pointer,
 }
 import mono.{instances, instance_for_call, instance_of_poly_method, iterator_route_name, iterator_route_module, mark_instance_named}
-import cg_reg.{cg_reg_fn_decls, cg_reg_fns_named, cg_reg_fs_op_decl, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
+import cg_reg.{cg_reg_fn_decls, cg_reg_fns_named, cg_reg_fs_op_decl, cg_reg_impl_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
@@ -3026,7 +3026,7 @@ fn lower_declared_static_call(node: Int, owner: Str, method: Str) -> Int ! Diag.
 // argument rather than a receiver, so nothing here is a receiver and the qualifier only
 // picks the symbol; every argument then travels in source order, as it is written.
 fn lower_trait_qualified_call(node: Int, obj: Int) -> Int ! Diag.Report {
-    let trait_name = node_name(obj)
+    let trait_name = tc_qualified_call_trait(node, node_name(obj))
     let method = node_method(node)
     let args = node_args(node)
     if args == -1 || sublist_length(args) == 0 {
@@ -3176,7 +3176,7 @@ fn cc_is_conversion(method: Str) -> Bool {
 // trait that declares it. The rule lives in cname and is read back from it rather than
 // written out a second time: the two spellings agree exactly when the key carries no source.
 fn cc_is_source_typed(im: Int, method: Str) -> Bool {
-    c_impl_method_name(im, method) != c_impl_method_name_q(im, node_trait_name(im), method)
+    c_impl_method_name(im, method) != c_impl_method_name_q(im, tc_impl_trait_id(im), method)
 }
 
 fn cc_static_impl_ambiguous(node: Int, owner: Str, method: Str) -> Int ! Diag.Report {
@@ -6008,18 +6008,8 @@ fn cc_receiver_role(node: Int, obj: Int) -> Receiver {
     if is_builtin_namespace(name) == 1 { return Receiver.Namespace }
     if is_import_module_name(name) == 1 { return Receiver.Module }
     if tc_names_a_type(name) { return Receiver.TypeOwner }
-    if cc_names_a_trait(name) { return Receiver.TraitOwner }
+    if tc_names_a_trait(name) { return Receiver.TraitOwner }
     Receiver.Value
-}
-
-// Whether the program declares a trait of this name. The register of declarations is the
-// one this stage reads every other declaration through, so a trait is found the same way
-// an impl or a function is.
-fn cc_names_a_trait(name: Str) -> Bool {
-    for tr in cg_reg_trait_decls() {
-        if node_name(tr) == name { return true }
-    }
-    false
 }
 
 // Whether the receiver is a bare name that binds no value here. A binder in scope wins
@@ -6039,10 +6029,14 @@ fn cc_impl_with_method(node: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Repor
     let want = tc_tid_decl_node(recv_tid)
     let builtin = cc_builtin_owner_name(recv_tid)
     if want < 0 && builtin == "" { return -1 }
+    // The trait typecheck read the call through, when it read one: one type may hold two
+    // traits of one spelling, each with a method of this name.
+    let call_trait = tc_call_trait(node)
     let mut found = -1
     let mut clashes = 0
     for im in cg_reg_impl_decls() {
         if cc_method_index(im, mname) < 0 { continue }
+        if !tc_impl_is_of_call_trait(im, call_trait) { continue }
         if !cc_impl_answers_for(im, want, builtin) { continue }
         if found >= 0 { clashes = clashes + 1 }
         found = im
@@ -6117,7 +6111,7 @@ fn cc_impl_for(node: Int, recv_tid: Int, trait_name: Str) -> Int ! Diag.Report {
     let mut found = -1
     let mut clashes = 0
     for im in cg_reg_impl_decls() {
-        if node_trait_name(im) != trait_name { continue }
+        if tc_impl_trait_id(im) != trait_name { continue }
         if !cc_impl_answers_for(im, want, builtin) { continue }
         if found >= 0 { clashes = clashes + 1 }
         found = im

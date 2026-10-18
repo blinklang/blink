@@ -23,7 +23,7 @@ import parser.{
     node_for_binder, node_guard, node_handlers, node_impl_binders, node_impl_where_bounds,
     node_index, node_iterable, node_kind, node_left, node_method, node_methods, node_name,
     node_obj, node_params, node_pattern, node_recv_type_args, node_right, node_scrutinee, node_source_module,
-    node_start, node_stmts, node_target, node_then_body, node_trait_name, node_type_ann,
+    node_start, node_stmts, node_target, node_then_body, node_type_ann,
     node_type_params, node_value, node_captures, node_arms, node_assoc_types, get_annotation,
     sublist_get, sublist_length,
 }
@@ -33,7 +33,7 @@ import typecheck.{
     make_ptr_type, make_result_type, make_set_type, make_struct_instance_type, make_template_type,
     make_tuple_type,
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
-    tc_alias_to_original, tc_call_decl_node, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
+    tc_alias_to_original, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait,
@@ -348,16 +348,17 @@ fn ann_mentions_binder(ann: Int, binders_sl: Int) -> Bool {
 fn register_poly_impl(im: Int) {
     if !is_poly_impl(im) { return }
     let user_decl = tc_poly_user_impl_decl(im)
+    let trait_id = tc_impl_trait_id(im)
     let methods_sl = node_methods(im)
     let mut j = 0
     while j < sl_len(methods_sl) {
         let m = sublist_get(methods_sl, j)
         if user_decl >= 0 {
             poly_user_method_by_recv.insert(poly_user_key(user_decl, node_name(m)), m)
-            poly_user_method_by_recv.insert(poly_user_key(user_decl, "{node_trait_name(im)}.{node_name(m)}"), m)
+            poly_user_method_by_recv.insert(poly_user_key(user_decl, "{trait_id}.{node_name(m)}"), m)
         } else {
             poly_method_by_name.insert(node_name(m), m)
-            poly_method_by_qualified.insert("{node_trait_name(im)}.{node_name(m)}", m)
+            poly_method_by_qualified.insert("{trait_id}.{node_name(m)}", m)
         }
         poly_block_of_method.insert(m, im)
         j = j + 1
@@ -853,13 +854,20 @@ fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
         let args_sl = node_args(node)
         if sl_len(args_sl) == 0 { return }
         let recv = sublist_get(args_sl, 0)
-        let qualified = "{node_name(obj)}.{method}"
+        // A method only the compiler writes has no record, and mono reads no file's scope.
+        let trait_id = tc_call_trait(node) ?? node_name(obj)
+        let qualified = "{trait_id}.{method}"
         if discover_poly_user_call(ctx, node, recv, qualified) { return }
         match poly_method_by_qualified.get(qualified) {
             Some(m) => register_poly_recv(ctx, m, recv, node)
             None => {}
         }
         return
+    }
+    // The trait typecheck read the call through keeps two same-named traits' methods apart.
+    match tc_call_trait(node) {
+        Some(key) => if discover_poly_user_call(ctx, node, obj, "{key}.{method}") { return }
+        None => {}
     }
     if discover_poly_user_call(ctx, node, obj, method) { return }
     match poly_method_by_name.get(method) {
