@@ -1,0 +1,148 @@
+// `Trait.method(recv, args)` is the same call as `recv.method(args)` (§3c.4 Qualified Method
+// Calls), so a sealed ops trait's qualified spelling must draw exactly the report the instance
+// spelling draws: same name, same message, same help. Each row writes one call both ways and
+// compares the whole report. A row that passes because both spellings say nothing would prove
+// nothing, so every row also requires the instance spelling to report something.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+
+type Row {
+    setup: Str
+    inst: Str
+    qual: Str
+}
+
+fn probe_src(setup: Str, call: Str) -> Str {
+    let head = #"import std.traits.{StrOps, BytesOps, StringBuildOps, Sized, Contains, ListOps, MapOps, SetOps, Joinable}
+type P { x: Int }
+fn main() {
+"#
+    "{head}    {setup}\n    let _ = {call}\n\}\n"
+}
+
+// Every error's code, message and help, in report order. The span is left out: the two
+// spellings put the call at different columns.
+fn error_report(path: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message} | {d.help}") }
+    }
+    out
+}
+
+fn same_report(label: Str, a: List[Str], b: List[Str]) -> Bool {
+    let mut same = a.len() == b.len()
+    let mut i = 0
+    while same && i < a.len() {
+        if a.get(i).unwrap() != b.get(i).unwrap() { same = false }
+        i = i + 1
+    }
+    if !same {
+        io.println("FAIL: {label}")
+        for e in a { io.println("  instance:  {e}") }
+        for e in b { io.println("  qualified: {e}") }
+    }
+    same
+}
+
+fn check_rows(rows: List[Row]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let mut bad = 0
+    for r in rows {
+        let inst = error_report("build/tc_ops_qual_same_inst.bl", probe_src(r.setup, r.inst))
+        let qual = error_report("build/tc_ops_qual_same_qual.bl", probe_src(r.setup, r.qual))
+        if inst.len() == 0 {
+            io.println("FAIL: {r.inst} reports nothing, so the row proves nothing")
+            bad = bad + 1
+        } else if !same_report(r.qual, inst, qual) {
+            bad = bad + 1
+        }
+    }
+    bad
+}
+
+test "Joinable.join refuses a receiver, separator and arity exactly as the instance call does" {
+    let rows: List[Row] = [
+        Row { setup: "let xs: List[Int] = [1, 2]", inst: #"xs.join(",")"#, qual: #"Joinable.join(xs, ",")"# },
+        Row { setup: #"let xs: List[Str] = ["a"]"#, inst: "xs.join(1)", qual: "Joinable.join(xs, 1)" },
+        Row { setup: #"let xs: List[Str] = ["a"]"#, inst: "xs.join()", qual: "Joinable.join(xs)" },
+    ]
+    assert_eq(check_rows(rows), 0)
+}
+
+test "StrOps calls refuse arguments and arity exactly as the instance call does" {
+    let rows: List[Row] = [
+        Row { setup: #"let s = "abc""#, inst: "s.contains(1)", qual: "StrOps.contains(s, 1)" },
+        Row { setup: #"let s = "abc""#, inst: "s.trim(1)", qual: "StrOps.trim(s, 1)" },
+        Row { setup: #"let s = "abc""#, inst: #"s.byte_index_of("b")"#, qual: #"StrOps.byte_index_of(s, "b")"# },
+        Row { setup: #"let s = "abc""#, inst: #"s.substring("a", 1)"#, qual: #"StrOps.substring(s, "a", 1)"# },
+        Row { setup: #"let s = "abc""#, inst: "s.split(1)", qual: "StrOps.split(s, 1)" },
+        Row { setup: #"let s = "abc""#, inst: #"s.replace(1, "b")"#, qual: #"StrOps.replace(s, 1, "b")"# },
+    ]
+    assert_eq(check_rows(rows), 0)
+}
+
+test "ListOps and Contains calls refuse arguments, closure bodies and arity exactly as the instance call does" {
+    let rows: List[Row] = [
+        Row { setup: "let mut xs: List[Int] = [1]", inst: #"xs.push("s")"#, qual: #"ListOps.push(xs, "s")"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: #"xs.get("s")"#, qual: #"ListOps.get(xs, "s")"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: #"xs.slice("a", 1)"#, qual: #"ListOps.slice(xs, "a", 1)"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: #"xs.append(["a"])"#, qual: #"ListOps.append(xs, ["a"])"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: #"xs.map(fn(s: Str) -> Str { s })"#, qual: #"ListOps.map(xs, fn(s: Str) -> Str { s })"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: #"xs.contains("s")"#, qual: #"Contains.contains(xs, "s")"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: "xs.collect()", qual: "ListOps.collect(xs)" },
+        Row { setup: "let xs: List[Int] = [1]", inst: #"xs.map(fn(x) { x + "a" })"#, qual: #"ListOps.map(xs, fn(x) { x + "a" })"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: #"xs.fold(0, fn(acc, x) { acc + "a" })"#, qual: #"ListOps.fold(xs, 0, fn(acc, x) { acc + "a" })"# },
+        Row { setup: "let xs: List[Int] = [1]", inst: "xs.len(1)", qual: "Sized.len(xs, 1)" },
+        Row { setup: "let xs: List[Int] = [1]", inst: "xs.is_empty(1)", qual: "Sized.is_empty(xs, 1)" },
+    ]
+    assert_eq(check_rows(rows), 0)
+}
+
+test "MapOps and SetOps calls refuse keys, values and arity exactly as the instance call does" {
+    let rows: List[Row] = [
+        Row { setup: "let mut m: Map[Str, Int] = Map()", inst: "m.get(1)", qual: "MapOps.get(m, 1)" },
+        Row { setup: "let mut m: Map[Str, Int] = Map()", inst: #"m.insert("k", "v")"#, qual: #"MapOps.insert(m, "k", "v")"# },
+        Row { setup: "let mut m: Map[Str, Int] = Map()", inst: "m.contains_key(1)", qual: "MapOps.contains_key(m, 1)" },
+        Row { setup: "let mut m: Map[Str, Int] = Map()", inst: "m.remove(1)", qual: "MapOps.remove(m, 1)" },
+        Row { setup: "let mut m: Map[Str, Int] = Map()", inst: "m.keys(1)", qual: "MapOps.keys(m, 1)" },
+        Row { setup: "let mut st: Set[Int] = Set()", inst: #"st.insert("x")"#, qual: #"SetOps.insert(st, "x")"# },
+        Row { setup: "let mut st: Set[Int] = Set()", inst: "st.union(1)", qual: "SetOps.union(st, 1)" },
+    ]
+    assert_eq(check_rows(rows), 0)
+}
+
+test "BytesOps and StringBuildOps calls refuse arguments and arity exactly as the instance call does" {
+    let rows: List[Row] = [
+        Row { setup: "let mut b = Bytes.new()", inst: #"b.push("x")"#, qual: #"BytesOps.push(b, "x")"# },
+        Row { setup: "let mut b = Bytes.new()", inst: #"b.get("x")"#, qual: #"BytesOps.get(b, "x")"# },
+        Row { setup: "let mut b = Bytes.new()", inst: #"b.read_u16_be("x")"#, qual: #"BytesOps.read_u16_be(b, "x")"# },
+        Row { setup: "let mut b = Bytes.new()", inst: #"b.slice("x", 1)"#, qual: #"BytesOps.slice(b, "x", 1)"# },
+        Row { setup: "let sb = StringBuilder.new()", inst: #"sb.write_char("x")"#, qual: #"StringBuildOps.write_char(sb, "x")"# },
+        Row { setup: "let sb = StringBuilder.new()", inst: "sb.to_str(1)", qual: "StringBuildOps.to_str(sb, 1)" },
+    ]
+    assert_eq(check_rows(rows), 0)
+}
+
+test "a qualified mutating call on an immutable binding is refused as the instance call is" {
+    let rows: List[Row] = [
+        Row { setup: "let xs: List[Int] = [1]", inst: "xs.push(2)", qual: "ListOps.push(xs, 2)" },
+        Row { setup: "let m: Map[Str, Int] = Map()", inst: #"m.insert("k", 1)"#, qual: #"MapOps.insert(m, "k", 1)"# },
+    ]
+    assert_eq(check_rows(rows), 0)
+}
+
+test "the well-typed qualified Joinable.join on a List[Str] is accepted" {
+    let src = probe_src(#"let xs: List[Str] = ["a", "b"]"#, #"Joinable.join(xs, ",")"#)
+    let errs = error_report("build/tc_ops_qual_join_ok.bl", src)
+    for e in errs { io.println("unexpected: {e}") }
+    assert_eq(errs.len(), 0)
+}

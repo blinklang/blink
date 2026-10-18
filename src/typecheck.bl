@@ -172,9 +172,10 @@ let mut tc_mc_obj_value_marks: List[Int] = []
 // longer see. Public so a test can bind a grafted node, which inference never sees.
 pub let mut tc_name_position_is_value: List[Int] = []
 
-// MethodCall node id -> 1 when inference typed it as a sealed ops trait's qualified call,
-// `StrOps.len(s)`. The build rewrites exactly these into method form, so no later stage
-// reads the qualifier. Presized and monotonic like tc_mc_obj_value_marks.
+// MethodCall node id -> 1 + the sublist of its arguments after the receiver, when inference
+// typed it as a sealed ops trait's qualified call, `StrOps.len(s)`; 0 otherwise. The build
+// rewrites exactly these into method form, so no later stage reads the qualifier. Presized
+// and monotonic like tc_mc_obj_value_marks.
 let mut tc_sealed_ops_call_marks: List[Int] = []
 
 // The program the rewrite ran on, -1 before it runs, and the calls it rewrote. Both reset
@@ -2272,213 +2273,75 @@ fn tc_hint_slot_str(tid: Int) -> Str {
     type_to_str(tid)
 }
 
-// Pin a sealed Ops-trait receiver's element metavar(s) from the call's payload
-// args. These static calls (MapOps.insert(m,k,v) …) put the receiver at
-// args[0]; the element-bearing args follow. Mirrors the method-call pin so the
-// trait-qualified spelling is an equally-good constraining use. No-op unless the
-// receiver container actually carries an unbound metavar.
-fn tc_pin_ops_trait_receiver(trait_name: Str, method: Str, args_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if args_sl == -1 || sublist_length(args_sl) < 2 { return }
-    let recv = tc_resolve(infer_type(sublist_get(args_sl, 0)))
-    if tc_tid_has_unbound_metavar(recv) == 0 { return }
-    let rk = ty_pool.get(recv).unwrap().kind
-    // Only pin from a method whose pinned-position argument GENUINELY carries the
-    // element/key/value. A blind "arg1"/"last-arg" heuristic mis-pins the many
-    // methods whose args are indices or whole containers (ListOps.get(l, idx),
-    // ListOps.concat(l, other), SetOps.union(s, other)) — that would infer the
-    // element from an Int index or a nested container. Gate per method explicitly.
-    if trait_name == "MapOps" {
-        // insert(m,k,v): arg1→key, arg2→value. get/contains_key/remove(m,k): arg1→key.
-        // (len/keys/values are 1-arg → early-returned above.) Every 2+-arg MapOps
-        // method takes the key at arg1, so arg1→key is always right here.
-        if rk != TyKind.Map { return }
-        let key_a = ty_pool.get(recv).unwrap().inner1
-        let val_a = ty_pool.get(recv).unwrap().inner2
-        if method == "insert" || method == "get" || method == "contains_key" || method == "remove" {
-            if tc_tid_has_unbound_metavar(key_a) != 0 {
-                let _ = tc_unify(key_a, infer_type(sublist_get(args_sl, 1)))
-            }
-        }
-        if method == "insert" && sublist_length(args_sl) >= 3 && tc_tid_has_unbound_metavar(val_a) != 0 {
-            let _ = tc_unify(val_a, infer_type(sublist_get(args_sl, 2)))
-        }
-        return
+// The arguments after the receiver of a sealed ops trait's qualified call `StrOps.len(s)`,
+// or -1 when the call is not one. A local that shadows the trait's name makes the call an
+// instance call on that value (§3c.4), and a call with no argument has no receiver to take.
+//
+// Built once per node and kept in the node's mark, so a walk that infers the call again does
+// not grow the sublist arena, and the rewrite into method form installs this same list.
+fn tc_sealed_ops_qualified_args(node: Int, obj_node: Int) -> Int {
+    if obj_node == -1 || node_kind(obj_node) != NodeKind.Ident { return -1 }
+    if is_sealed_builtin_trait(node_name(obj_node)) == 0 { return -1 }
+    if tc_mc_obj_is_value(node) != 0 { return -1 }
+    if node >= tc_sealed_ops_call_marks.len() { return -1 }
+    let args = node_args(node)
+    if args == -1 || sublist_length(args) == 0 { return -1 }
+    let kept = tc_sealed_ops_call_marks.get(node).unwrap()
+    if kept != 0 { return kept - 1 }
+    let mut rest: List[Int] = []
+    let mut i = 1
+    while i < sublist_length(args) {
+        rest.push(sublist_get(args, i))
+        i = i + 1
     }
-    if trait_name == "SetOps" {
-        // insert/contains/remove(s,e): arg1→elem. union(s, other) takes a Set, NOT
-        // an element — must NOT pin from it (would infer Set[Set[T]]).
-        if rk != TyKind.Set { return }
-        if method != "insert" && method != "contains" && method != "remove" { return }
-        let elem_a = ty_pool.get(recv).unwrap().inner1
-        if tc_tid_has_unbound_metavar(elem_a) != 0 {
-            let _ = tc_unify(elem_a, infer_type(sublist_get(args_sl, 1)))
-        }
-        return
-    }
-    if trait_name == "ListOps" {
-        // Only push(l,x), set(l,i,x) and insert(l,i,x) carry the element at the LAST arg.
-        // get(l,i), pop(l), remove(l,i), concat(l,other), slice(l,s,e) do NOT — their last
-        // arg is an Int index/bound or another List, so pinning from it mis-infers the element.
-        if rk != TyKind.List { return }
-        if method != "push" && method != "set" && method != "insert" { return }
-        let elem_a = ty_pool.get(recv).unwrap().inner1
-        if tc_tid_has_unbound_metavar(elem_a) != 0 {
-            let last = sublist_get(args_sl, sublist_length(args_sl) - 1)
-            let _ = tc_unify(elem_a, infer_type(last))
-        }
-        return
-    }
+    let tail = sublist_of(rest)
+    tc_sealed_ops_call_marks.set(node, tail + 1)
+    tail
 }
 
-// The RETURN TYPE of a sealed Ops-trait call spelled statically —
-// `MapOps.get(m, k)`, the spec's disambiguating form (§03c:697). The qualified
-// resolution arm excludes the sealed traits (no impl fnsig exists for them), so the
-// call answered Unknown and NOTHING stamped the node: a chained receiver
-// (`MapOps.get(m, k).unwrap()`) then reached codegen with no type to dispatch on.
+// The receiver and the arguments of a method call, read the same way for `s.len()` and for
+// `StrOps.len(s)`, so every check over a method call holds for both spellings.
+fn tc_mc_receiver(node: Int) -> Int {
+    if tc_sealed_ops_qualified_args(node, node_obj(node)) != -1 { return sublist_get(node_args(node), 0) }
+    node_obj(node)
+}
+
+fn tc_mc_call_args(node: Int) -> Int {
+    let qualified = tc_sealed_ops_qualified_args(node, node_obj(node))
+    if qualified != -1 { return qualified }
+    node_args(node)
+}
+
+// A method call no arm of the dispatch answered. Its arguments are still inferred, so a
+// mistake nested in one is reported: this is what surfaces E0522 for `x.m()` passed to
+// io.println.
 //
-// The qualified spelling denotes the same call as `m.get(k)`, so it answers with the
-// same type, read off the receiver the caller inferred. Only the ANSWER is given here —
-// the checks the instance arms make are not repeated. Two of the gaps that leaves are
-// still open: the trait qualifier goes unverified, so `ListOps.get(m, k)` on a Map is
-// answered by the Map row, and arity goes unchecked. The third is closed next door:
-// tc_ops_trait_qualified_unresolved refuses a method the instance arm would refuse, so
-// declining here no longer means the call passes. Declines with -1 for anything outside
-// the sealed method surface.
-fn tc_ops_trait_qualified_ret(method: Str, recv: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let k = type_kind(recv)
-    // `len` and `is_empty` are the two every sized receiver answers; `count` is List's
-    // alone and `capacity` List's and StringBuilder's, exactly as the instance arms below
-    // have them. Answering either for the other receivers would invent surface codegen
-    // cannot emit.
-    if method == "len" || method == "is_empty" || (method == "count" && k == TyKind.List) || (method == "capacity" && (k == TyKind.List || k == TyKind.StringBuilder)) {
-        if tc_ops_trait_sized_kind(k) != 0 {
-            if method == "is_empty" { return TYPE_BOOL }
-            return TYPE_INT
+// When the receiver is a BUILTIN type the front end knows and nothing it has answers the
+// name, that is a name error, the same one a struct receiver already draws, and nothing later
+// can supply the method. Struct and enum receivers never reach here — their own gate answers
+// them with the impl registries in hand. The poison return is what keeps this to ONE
+// diagnostic: a declared type over the call unifies with the recovery tid instead of drawing
+// a second, derived error about a type the program never had.
+fn tc_method_call_unanswered(node: Int, method: Str, obj_t: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(args_sl) {
+            infer_type(sublist_get(args_sl, i))
+            i = i + 1
         }
     }
-    if k == TyKind.Str {
-        if method == "contains" || method == "starts_with" || method == "ends_with" { return TYPE_BOOL }
-        if method == "byte_len" || method == "to_int" { return TYPE_INT }
-        if method == "byte_at" { return TYPE_U8 }
-        if method == "parse_int" { return make_result_type(TYPE_INT, tc_conversion_error_type()) }
-        if method == "parse_float" { return make_result_type(TYPE_FLOAT, tc_conversion_error_type()) }
-        if method == "concat" || method == "replace" || method == "trim" || method == "trim_left" || method == "trim_right" { return TYPE_STR }
-        if method == "to_upper" || method == "to_lower" || method == "substring" { return TYPE_STR }
-        if method == "char_at" { return make_option_type(TYPE_CHAR) }
-        if method == "byte_slice" { return TYPE_STR }
-        if method == "byte_index_of" || method == "index_of" { return make_option_type(TYPE_INT) }
-        if method == "split" || method == "lines" { return make_list_type(TYPE_STR) }
+    let obj_k = type_kind(obj_t)
+    if tc_recv_type_is_determined(obj_k, obj_t) != 0 && tc_method_unavailable_on_receiver(obj_k, method) != 0 {
+        let tname = type_to_str(obj_t)
+        tc_unresolved_method_hard.insert(node, 1)
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(obj_k, tname, method))
+        return tc_error_recovery_tid()
     }
-    if k == TyKind.List {
-        let elem = ty_pool.get(recv).unwrap().inner1
-        if method == "get" || method == "pop" { return make_option_type(elem) }
-        if method == "remove" { return elem }
-        if method == "push" || method == "set" || method == "insert" || method == "clear" { return TYPE_VOID }
-        if method == "append" || method == "slice" || method == "take" || method == "skip" { return recv }
-        // Refused here rather than by declining to the unresolved arm below: that arm asks
-        // `tc_method_unavailable_on_receiver`, which is keyed on the receiver KIND alone, and
-        // `contains` and `index_of` are on the List surface for every element. Only this row
-        // knows the element.
-        if method == "contains" || method == "index_of" {
-            let need = tc_list_scan_elem_need(elem)
-            if need.len() > 0 { return tc_refuse_list_scan(node, recv, need, method) }
-            if method == "index_of" { return make_option_type(TYPE_INT) }
-            return TYPE_BOOL
-        }
-        if method == "last" { return make_option_type(elem) }
-        if method == "join" { return TYPE_STR }
-        if method == "sort" {
-            let qargs = node_args(node)
-            if qargs != -1 && sublist_length(qargs) >= 1 && tc_refuse_unordered_sort(node, sublist_get(qargs, 0), elem) != 0 {
-                return tc_error_recovery_tid()
-            }
-            return recv
-        }
-    }
-    if k == TyKind.Map {
-        let key_t = ty_pool.get(recv).unwrap().inner1
-        let val_t = ty_pool.get(recv).unwrap().inner2
-        if method == "get" { return make_option_type(val_t) }
-        if method == "insert" || method == "clear" { return TYPE_VOID }
-        if method == "contains_key" || method == "contains" { return TYPE_BOOL }
-        if method == "remove" { return make_option_type(val_t) }
-        if method == "keys" { return make_list_type(key_t) }
-        if method == "values" { return make_list_type(val_t) }
-        if method == "entries" { return make_list_type(make_tuple_type([key_t, val_t])) }
-    }
-    if k == TyKind.Set {
-        if method == "insert" || method == "contains" || method == "remove" { return TYPE_BOOL }
-        if method == "union" { return recv }
-    }
-    if k == TyKind.Bytes {
-        if method == "get" { return make_option_type(TYPE_INT) }
-        if method == "push" || method == "set" { return TYPE_VOID }
-        if method == "slice" || method == "concat" { return recv }
-        if method == "to_str" { return make_result_type(TYPE_STR, TYPE_STR) }
-        if method == "to_hex" { return TYPE_STR }
-        if tc_bytes_read_be_le(method) != 0 { return make_result_type(TYPE_INT, TYPE_STR) }
-        if tc_bytes_write_be_le(method) != 0 { return TYPE_VOID }
-        if tc_bytes_set_be_le(method) != 0 { return make_result_type(TYPE_VOID, TYPE_STR) }
-    }
-    if k == TyKind.StringBuilder {
-        if method == "write" || method == "write_char" || method == "clear" { return TYPE_VOID }
-        if method == "to_str" { return TYPE_STR }
-    }
+    // Nothing claimed this node, so nothing has typed it — an absence. Codegen's backstop is
+    // what names the receiver and the method, so the node says WHY it carries nothing and the
+    // stamp pass leaves that report standing.
+    if tc_boundary_check_active != 0 { tc_mark_unclaimed_call(node) }
     -1
-}
-
-// A qualified sealed-Ops call the return table above declined, judged the way the INSTANCE
-// spelling judges it. `MapOps.get_or_default(m, k, d)` denotes the same call as
-// `m.get_or_default(k, d)`, which is a hard UnresolvedMethod: the method is written in the
-// trait the spec gives Map, and nothing in the front end answers it. Through the qualified
-// spelling that same call used to pass `blink check` carrying a warning that the receiver's
-// type was not known — it was known, and it was the very thing that refuses the method.
-//
-// Both gates are the instance arm's own, so this refuses exactly what that arm refuses. A
-// receiver whose type is not yet determined keeps its silence, because nothing has decided
-// its surface yet; and a method that IS on the receiver's surface is not refused here just
-// because the table above has no row for that receiver kind, which keeps the table free to
-// decline without turning every gap into an error.
-//
-// Poisons the answer rather than leaving it absent, so a declared type over the call unifies
-// with the recovery tid instead of drawing a second, derived error about a type the program
-// never had. Declines with -1, which the caller reads as "not mine".
-fn tc_ops_trait_qualified_unresolved(method: Str, recv: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let k = type_kind(recv)
-    if tc_recv_type_is_determined(k, recv) == 0 { return -1 }
-    if tc_method_unavailable_on_receiver(k, method) == 0 { return -1 }
-    let tname = type_to_str(recv)
-    tc_unresolved_method_hard.insert(node, 1)
-    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(k, tname, method))
-    tc_error_recovery_tid()
-}
-
-// The receivers that answer `Sized`. Anything else declines, so a sized method on a
-// receiver the instance arms never answer for stays untyped rather than inventing one.
-fn tc_ops_trait_sized_kind(k: TyKind) -> Int {
-    if k == TyKind.Str || k == TyKind.List || k == TyKind.Map || k == TyKind.Set { return 1 }
-    if k == TyKind.Bytes || k == TyKind.StringBuilder { return 1 }
-    0
-}
-
-// The three Bytes offset families, spelled once each. They differ only in what they
-// answer with, so listing the names inline at each use would hide that.
-fn tc_bytes_read_be_le(method: Str) -> Int {
-    if method == "read_u16_be" || method == "read_u32_be" || method == "read_i32_be" || method == "read_i64_be" { return 1 }
-    if method == "read_u16_le" || method == "read_u32_le" || method == "read_i32_le" || method == "read_i64_le" { return 1 }
-    0
-}
-
-fn tc_bytes_write_be_le(method: Str) -> Int {
-    if method == "write_u16_be" || method == "write_u32_be" || method == "write_i32_be" || method == "write_i64_be" { return 1 }
-    if method == "write_u16_le" || method == "write_u32_le" || method == "write_i32_le" || method == "write_i64_le" { return 1 }
-    0
-}
-
-fn tc_bytes_set_be_le(method: Str) -> Int {
-    if method == "set_u16_be" || method == "set_u32_be" || method == "set_u64_be" || method == "set_i16_be" || method == "set_i32_be" || method == "set_i64_be" { return 1 }
-    if method == "set_u16_le" || method == "set_u32_le" || method == "set_u64_le" || method == "set_i16_le" || method == "set_i32_le" || method == "set_i64_le" { return 1 }
-    0
 }
 
 // ── Deferred E0301 blame ────────────────────────────────────────────
@@ -18654,16 +18517,9 @@ fn tc_rewrite_sealed_ops_call(node: Int) ! Diag.Report {
             "a sealed ops trait has no source impl, so its qualified call resolves to no declaration")
         return
     }
-    let args = node_args(node)
-    let recv = sublist_get(args, 0)
-    let mut rest: List[Int] = []
-    let mut i = 1
-    while i < sublist_length(args) {
-        rest.push(sublist_get(args, i))
-        i = i + 1
-    }
+    let recv = sublist_get(node_args(node), 0)
     node_set_obj(node, recv)
-    node_set_args(node, sublist_of(rest))
+    node_set_args(node, tc_sealed_ops_call_marks.get(node).unwrap() - 1)
     tc_mc_obj_value_marks.set(node, 1)
     if node_kind(recv) == NodeKind.Ident && recv < tc_name_position_is_value.len() {
         tc_name_position_is_value.set(recv, 1)
@@ -19555,13 +19411,21 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
+        // A sealed ops trait's qualified call `StrOps.len(s)` is the same call as `s.len()`
+        // (§3c.4), so it takes the receiver from its first argument and goes through the one
+        // dispatch below. The instance spelling's checks are then the qualified spelling's
+        // checks by construction, not by a second table that has to keep up with them.
+        let qualified = tc_sealed_ops_qualified_args(node, obj_node)
+        let recv_node = tc_mc_receiver(node)
+        let args_sl = tc_mc_call_args(node)
+
         // Resolve bound metavars up front: a pinned α (`let mut xs = []` whose element
         // is fixed by a later `push`) has kind Unknown with inner1 pointing at its
         // solution, and every arm below reads structural children from `obj_t.inner1`.
         // type_kind already resolves, so `obj_k` names the solution's kind — but reading
         // the UNRESOLVED α's inner1 returns the binding pointer, not the type's real
         // child, which typed `e.unwrap()` on an `Option[T]` α one level too deep.
-        let obj_t = tc_resolve(infer_type(obj_node))
+        let obj_t = tc_resolve(infer_type(recv_node))
         let obj_k = type_kind(obj_t)
 
         // A plain method call on `Self` in a trait default body is licensed only when the
@@ -19585,9 +19449,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // sealed built-in List surface. Placed BEFORE the builtin arity table and
         // the builtin List block: ambiguity is a resolution error, so a user method
         // shadowing fold/map/... must not first be counted as the sealed one. Mirrors the
-        // struct/enum guard below. The qualified call `Trait.method(receiver)`
-        // parses with obj = Ident(Trait), so obj_k != List — it never enters here.
-        if obj_k == TyKind.List {
+        // struct/enum guard below. A qualified call names its owner, so it is never
+        // ambiguous: a sealed one skips this, and any other has obj = Ident(Trait).
+        if obj_k == TyKind.List && qualified == -1 {
             let user_traits = tc_method_trait_count("List", method)
             let sealed_hof = tc_is_sealed_list_hof(method)
             if user_traits + sealed_hof >= 2 {
@@ -19606,12 +19470,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // once, ahead of every arm, and stop on a wrong count: an arm that reads argument 1
         // of a one-argument call would otherwise index past the end.
         let bi_arity = tc_builtin_method_arity(obj_k, method)
-        if obj_k == TyKind.Str && method == "byte_index_of" && node_args(node) != -1 && sublist_length(node_args(node)) == 1 {
-            tc_report_byte_index_of_missing_from(sublist_get(node_args(node), 0))
+        if obj_k == TyKind.Str && method == "byte_index_of" && args_sl != -1 && sublist_length(args_sl) == 1 {
+            tc_report_byte_index_of_missing_from(sublist_get(args_sl, 0))
             return tc_error_recovery_tid()
         }
         if bi_arity >= 0 {
-            if check_builtin_arity(tc_builtin_recv_label(obj_k), method, bi_arity, node_args(node), node) == 0 {
+            if check_builtin_arity(tc_builtin_recv_label(obj_k), method, bi_arity, args_sl, node) == 0 {
                 return tc_error_recovery_tid()
             }
         }
@@ -19652,7 +19516,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // wraps each adapter result in a fresh Iterator carrier; `.collect()` is the door back to
         // a List.
         if obj_k == TyKind.Iterator {
-            let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
             if method == "map" {
                 let cls = closure_arg_at(args_sl, 0)
@@ -19751,7 +19614,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         if obj_k == TyKind.List {
-            let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
             if method == "len" || method == "count" || method == "capacity" { return TYPE_INT }
             if method == "get" {
@@ -19763,7 +19625,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // the comparator a `sort_by` takes is checked here when it is annotated or a fn
             // value, and by tc_check_sort_by_body once an unannotated one is walked.
             if method == "sort" {
-                if tc_refuse_unordered_sort(node, node_obj(node), elem) != 0 { return tc_error_recovery_tid() }
+                if tc_refuse_unordered_sort(node, recv_node, elem) != 0 { return tc_error_recovery_tid() }
                 return obj_t
             }
             if method == "sort_by" {
@@ -19976,8 +19838,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // of TYPE_UNKNOWN. Only the canonical single-binder shape registered in
         // tc_poly_list_impl_node; any other shape leaves `im == -1` and this
         // block does nothing, falling through to today's arg-inference loop and
-        // TYPE_UNKNOWN — no path regresses.
-        if obj_k == TyKind.List {
+        // TYPE_UNKNOWN — no path regresses. A sealed qualified call names the
+        // sealed owner, so a user impl never answers it.
+        if obj_k == TyKind.List && qualified == -1 {
             let sole_trait = tc_method_trait_names("List", method)
             if sole_trait != "" && tc_method_trait_count("List", method) == 1 {
                 let sig_name = "List_{sole_trait}_{method}"
@@ -20001,7 +19864,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // binds must exist before this call: a bare-literal argument whose
                         // static param type is the impl's own Typevar(T) needs the RECEIVER's
                         // concrete element type as its hint, not the raw unsubstituted binder.
-                        let _ = check_arg_shapes_with_binds("List.{method}", sig, node_args(node), 1, node, binds)
+                        let _ = check_arg_shapes_with_binds("List.{method}", sig, args_sl, 1, node, binds)
                         let raw_ret = fnsig_pool.get(sig).unwrap().ret
                         return substitute_typevar_tid(raw_ret, binds)
                     }
@@ -20012,16 +19875,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // The explicit forms of a scalar's `==` and `<`, against one value of the receiver's
         // own type, with the Ordering the prelude declares.
         if method == "eq" && tc_scalar_has_eq(obj_k) {
-            check_builtin_arg(method, 0, obj_t, node_args(node), tc_builtin_recv_label(obj_k))
+            check_builtin_arg(method, 0, obj_t, args_sl, tc_builtin_recv_label(obj_k))
             return TYPE_BOOL
         }
         if method == "cmp" && tc_scalar_has_ord(obj_k) {
-            check_builtin_arg(method, 0, obj_t, node_args(node), tc_builtin_recv_label(obj_k))
+            check_builtin_arg(method, 0, obj_t, args_sl, tc_builtin_recv_label(obj_k))
             return lookup_named_type("Ordering")
         }
 
         if obj_k == TyKind.Str {
-            let args_sl = node_args(node)
             if method == "len" { return TYPE_INT }
             // The one Ptr-producing method the spec states outright AND codegen agrees with:
             // `fn as_cstr(self: Str) -> Ptr[U8]` (sections/07_trust_modules_metadata.md:221)
@@ -20111,7 +19973,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "to_string" { return TYPE_STR }
             if method == "to_int" { return TYPE_INT }
             if method == "ieee_eq" {
-                check_builtin_arg(method, 0, TYPE_FLOAT, node_args(node), "Float")
+                check_builtin_arg(method, 0, TYPE_FLOAT, args_sl, "Float")
                 return TYPE_BOOL
             }
         }
@@ -20148,7 +20010,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         if obj_k == TyKind.Map {
-            let args_sl = node_args(node)
             let key_t = ty_pool.get(obj_t).unwrap().inner1
             let val_t = ty_pool.get(obj_t).unwrap().inner2
             if method == "len" { return TYPE_INT }
@@ -20181,7 +20042,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         if obj_k == TyKind.Set {
-            let args_sl = node_args(node)
             let elem = ty_pool.get(obj_t).unwrap().inner1
             if method == "len" { return TYPE_INT }
             if method == "is_empty" { return TYPE_BOOL }
@@ -20200,7 +20060,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // constraining use, exactly as `insert` is for Map/Set, so it goes through the same
         // check_builtin_arg.
         if obj_k == TyKind.Channel {
-            let args_sl = node_args(node)
             let elem = ty_pool.get(tc_resolve(obj_t)).unwrap().inner1
             if method == "send" {
                 check_builtin_arg(method, 0, elem, args_sl, "Channel")
@@ -20220,7 +20079,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         if obj_k == TyKind.Bytes {
-            let args_sl = node_args(node)
             if method == "len" { return TYPE_INT }
             if method == "get" {
                 check_builtin_arg(method, 0, TYPE_INT, args_sl, "Bytes")
@@ -20306,7 +20164,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // `write_char` is signed `(self, c: Char)` in sections/03_types.md, and codegen
         // converts that Char to text, so any other argument is a type error here.
         if obj_k == TyKind.StringBuilder {
-            let args_sl = node_args(node)
             if method == "write_char" {
                 check_builtin_arg(method, 0, TYPE_CHAR, args_sl, "StringBuilder")
                 return TYPE_VOID
@@ -20331,7 +20188,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // `deref` (:219) is signed as the pointee T so a sized pointee cannot launder into
         // an Int binding; `offset` preserves the pointee.
         if obj_k == TyKind.Ptr {
-            let args_sl = node_args(node)
             if method == "is_null" { return TYPE_BOOL }
             // `.write(v)` stores through the pointer and answers unit. The stored value is
             // inferred but NOT checked against the pointee — that check still does not exist —
@@ -20363,7 +20219,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         "`offset` needs a pointee whose size is known at compile time, and {type_to_str(obj_t)} does not point at an `@ffi.struct`",
                         node,
                         "annotate the pointee type `@ffi.struct`, or walk the bytes through a `Bytes` value")
-                } else if tc_ptr_reads_singleton_alloc(obj_node) != 0 {
+                } else if tc_ptr_reads_singleton_alloc(recv_node) != 0 {
                     // Only once the stride is known: a pointee with no stride is the more
                     // basic error, and two reports for one call name one fault twice.
                     diag_error_at("FfiOffsetOnSingleton", FFI_OFFSET_ON_SINGLETON,
@@ -20390,7 +20246,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // as an Int, `get_float` memcpys a double, `get_str` yields the interned Str.
         // Reconciling the two surfaces is a spec question, filed separately.
         if obj_k == TyKind.Template {
-            let args_sl = node_args(node)
             if method == "parts" { return make_list_type(TYPE_STR) }
             if method == "count" { return TYPE_INT }
             if method == "type_tag" {
@@ -20437,7 +20292,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // for an argument or a return. Their argument IS checked: alloc_n takes a count, and
         // passing a Str for it silently calloc'd a garbage size and returned NULL.
         if obj_k == TyKind.FfiScope {
-            let args_sl = node_args(node)
             if method == "cstr" {
                 check_builtin_arg(method, 0, TYPE_STR, args_sl, "scope")
                 return make_ptr_type(TYPE_U8)
@@ -20464,6 +20318,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 return tc_ffi_alloc_hint_tid(node)
             }
         }
+
+        // Every arm a sealed ops trait owns is above. What follows answers from user impls,
+        // bounds and names, none of which a call naming the sealed trait can reach.
+        if qualified != -1 { return tc_method_call_unanswered(node, method, obj_t, args_sl) }
 
         // A method call on a BOUNDED type parameter (`fn show[T: Display](x: T) { x.fmt(sb) }`).
         // The bound is what licenses the call, so it is also what answers it: the trait's own
@@ -20681,29 +20539,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
-            // A sealed Ops-trait mutator (MapOps.insert(m,k,v),
-            // SetOps.insert(s,e), ListOps.push(l,x)) is a constraining use spelled
-            // statically with the receiver at args[0]. Pin the receiver container's
-            // element metavar(s) from the payload args so `let m = Map();
-            // MapOps.insert(m,"k",42)` infers Map[Str,Int] rather than E0301.
-            if is_sealed_builtin_trait(obj_name) != 0 {
-                let ops_args = node_args(node)
-                tc_pin_ops_trait_receiver(obj_name, method, ops_args)
-                if ops_args != -1 && sublist_length(ops_args) >= 1 {
-                    // Inferred ONCE here and handed to both the answer and the refusal.
-                    // Inference is uncached, so a second walk of the receiver re-runs its
-                    // reports and re-mints the metavars an empty literal binds. The call's
-                    // remaining arguments are swept by infer_type once this answer returns.
-                    let ops_recv = tc_resolve(infer_type(sublist_get(ops_args, 0)))
-                    let ops_ret = tc_ops_trait_qualified_ret(method, ops_recv, node)
-                    if ops_ret != -1 {
-                        if node < tc_sealed_ops_call_marks.len() { tc_sealed_ops_call_marks.set(node, 1) }
-                        return ops_ret
-                    }
-                    let ops_refused = tc_ops_trait_qualified_unresolved(method, ops_recv, node)
-                    if ops_refused != -1 { return ops_refused }
-                }
-            }
             if obj_name == "Char" {
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, tc_conversion_error_type())
@@ -21097,39 +20932,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
         }
 
-        // Fall-through (e.g. module-qualified calls like io.println(...)): the
-        // type-specific branches above returned for their own receivers, so any
-        // call reaching here had its args unchecked. Infer them so nested method
-        // calls are validated — this is what surfaces E0522 for x.m() passed to
-        // io.println.
-        let mc_args = node_args(node)
-        if mc_args != -1 {
-            let mut mci = 0
-            while mci < sublist_length(mc_args) {
-                infer_type(sublist_get(mc_args, mci))
-                mci = mci + 1
-            }
-        }
-        // The receiver is a BUILTIN type the front end knows, the per-kind dispatch above
-        // did not claim the call, and nothing the receiver has answers the name. That is a
-        // name error, the same one a struct receiver already draws, and nothing later can
-        // supply the method. Struct and enum receivers never reach here — their own gate
-        // above answers them with the impl registries in hand.
-        //
-        // The poison return is what keeps this to ONE diagnostic: a declared type over the
-        // call unifies with the recovery tid instead of drawing a second, derived error
-        // about a type the program never had.
-        if tc_recv_type_is_determined(obj_k, obj_t) != 0 && tc_method_unavailable_on_receiver(obj_k, method) != 0 {
-            let mc_tname = type_to_str(obj_t)
-            tc_unresolved_method_hard.insert(node, 1)
-            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {mc_tname}", node, tc_unresolved_method_help(obj_k, mc_tname, method))
-            return tc_error_recovery_tid()
-        }
-        // Nothing above claimed this node, so nothing has typed it — an absence. Codegen's
-        // backstop is what names the receiver and the method, so the node says WHY it carries
-        // nothing and the stamp pass leaves that report standing.
-        if tc_boundary_check_active != 0 { tc_mark_unclaimed_call(node) }
-        return -1
+        return tc_method_call_unanswered(node, method, obj_t, args_sl)
     }
 
     if kind == NodeKind.FieldAccess {
@@ -23878,14 +23681,14 @@ fn tc_check_mutating_nested(n: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     let k = node_kind(n)
     if k == NodeKind.Closure { return }
     if k == NodeKind.MethodCall {
-        let obj = node_obj(n)
+        let obj = tc_mc_receiver(n)
         // Gated on Ident before infer_type runs. tc_check_mutating_method rejects every other
         // object kind anyway, and inferring here would re-report infer_type's own diagnostics.
         if obj != -1 && node_kind(obj) == NodeKind.Ident {
             tc_check_mutating_method(n, obj, infer_type(obj))
         }
         tc_check_mutating_nested(obj)
-        tc_check_mutating_in_args(node_args(n))
+        tc_check_mutating_in_args(tc_mc_call_args(n))
         return
     }
     if k == NodeKind.Call {
@@ -25022,19 +24825,20 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // ran arg/method checks during the binding/ExprStmt inference. Here we add
         // the Part B body walk: bind unannotated closure params to the elem/acc
         // type and type-check the body once.
-        let obj_t = infer_type(node_obj(node))
+        let recv = tc_mc_receiver(node)
+        let obj_t = infer_type(recv)
         // The RECEIVER of this call is a value the arm above only inferred, never body-walked,
         // so a HOF in the receiver chain (`a.map(f).collect()`) reaches check_closure_body only
         // through this descent. It runs first so a receiver `map` has bound its result before
         // this call's own closure is handed that element (`xs.map(f1).map(f2)`).
-        tc_walk_nested_hof_bodies(node_obj(node))
+        tc_walk_nested_hof_bodies(recv)
         // This arm, and not infer_type's MethodCall arm: infer_type is called several
         // times per node (the nr pass, then the inference pass, then re-inference for
         // mono) and its memo wrapper does not short-circuit, so a diagnostic emitted there
         // reports two or three times. tc_check_body walks each node once, with the nr scope
         // frames live, which is the pair of facts the check needs.
-        tc_check_mutating_method(node, node_obj(node), obj_t)
-        let args_sl = node_args(node)
+        tc_check_mutating_method(node, recv, obj_t)
+        let args_sl = tc_mc_call_args(node)
         // The argument the List-HOF path walks itself, so the generic walk below does not
         // report its contents a second time.
         let mut hof_arg = -1
