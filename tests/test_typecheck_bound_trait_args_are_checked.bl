@@ -1,0 +1,203 @@
+// A bound's trait arguments are part of the bound (sections/03_types.md §3.6). They are
+// resolved and counted where the bound is written, on every binder that carries one, and a
+// call meets the bound only when the argument's type implements the trait at those arguments:
+// `Pt` with `impl Tr[Int]` does not meet `U: Tr[Str]`. A wrong count is E0910 (§3.4, trait
+// references), an unmet bound is E0306 at the call.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn bound_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Everything the probe reported that is not a warning, as `name: message` lines.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
+    }
+    out
+}
+
+fn problem_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity != "warning" { n = n + 1 }
+    }
+    n
+}
+
+// `Pt` implements `Tr[Int]` and `Plain`; `Bx[T]` implements `Tr[T]` for every `T`.
+fn bounded_src(decls: Str, call: Str) -> Str {
+    let head = #"type Pt {
+    v: Int
+}
+
+type Bx[T] {
+    t: T
+}
+
+trait Tr[T] {
+    fn put(self, x: T) -> T
+}
+
+trait Plain {
+    fn p(self) -> Int
+}
+
+trait Other {
+    fn o(self) -> Int
+}
+
+impl Tr[Int] for Pt {
+    fn put(self, x: Int) -> Int {
+        x + self.v
+    }
+}
+
+impl Plain for Pt {
+    fn p(self) -> Int {
+        self.v
+    }
+}
+
+impl[T] Tr[T] for Bx[T] {
+    fn put(self, x: T) -> T {
+        x
+    }
+}
+
+"#
+    head.concat(decls).concat("\n\nfn main() \{\n    let _ = {call}\n}\n")
+}
+
+test "a type that implements the trait at other arguments does not meet the bound" {
+    bound_probe(".tmp/_tc_bargs_wrong.bl", bounded_src("fn probe[U: Tr[Str]](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied"), "expected E0306 at the call, got:\n{p}")
+    assert(p.contains("Tr[Str]"), "expected the message to name the bound Tr[Str], got:\n{p}")
+    assert(p.contains("Tr[Int]"), "expected the message to name the impl Pt has, Tr[Int], got:\n{p}")
+}
+
+test "a type that implements the trait at the bound's arguments meets the bound" {
+    bound_probe(".tmp/_tc_bargs_right.bl", bounded_src("fn probe[U: Tr[Int]](u: U) -> Int \{\n    u.put(1)\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p == "", "expected no problems, got:\n{p}")
+}
+
+test "a type with no impl of a user trait does not meet its bound" {
+    bound_probe(".tmp/_tc_bargs_noimpl.bl", bounded_src("fn probe[U: Other](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied"), "expected E0306 at the call, got:\n{p}")
+    assert(p.contains("Other"), "expected the message to name the trait, got:\n{p}")
+}
+
+test "the second of two bounds is checked at its arguments" {
+    bound_probe(".tmp/_tc_bargs_two.bl", bounded_src("fn probe[U: Plain + Tr[Str]](u: U) -> Int \{\n    u.p()\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied"), "expected E0306 at the call, got:\n{p}")
+    assert(p.contains("Tr[Str]"), "expected the message to name the bound Tr[Str], got:\n{p}")
+}
+
+test "a bound argument naming another type parameter is read at the call's type for it" {
+    let decls = "fn probe[V, U: Tr[V]](v: V, u: U) -> Int \{\n    0\n}"
+    bound_probe(".tmp/_tc_bargs_tv_bad.bl", bounded_src(decls, "probe(\"s\", Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitBoundNotSatisfied") && p.contains("Tr[Str]"), "expected E0306 naming Tr[Str] at V = Str, got:\n{p}")
+    bound_probe(".tmp/_tc_bargs_tv_ok.bl", bounded_src(decls, "probe(1, Pt \{ v: 1 })"))
+    let q = problems_reported()
+    assert(q == "", "expected no problems at V = Int, got:\n{q}")
+}
+
+test "a generic impl meets the bound at the instance its arguments give" {
+    let decls = "fn probe[U: Tr[Int]](u: U) -> Int \{\n    0\n}"
+    bound_probe(".tmp/_tc_bargs_poly_ok.bl", bounded_src(decls, "probe(Bx \{ t: 1 })"))
+    let p = problems_reported()
+    assert(p == "", "expected Bx[Int] to meet Tr[Int], got:\n{p}")
+    bound_probe(".tmp/_tc_bargs_poly_bad.bl", bounded_src(decls, "probe(Bx \{ t: \"s\" })"))
+    let q = problems_reported()
+    assert(q.contains("TraitBoundNotSatisfied") && q.contains("Tr[Int]"), "expected Bx[Str] not to meet Tr[Int], got:\n{q}")
+}
+
+test "a bound that leaves out a generic trait's arguments is a trait arity error" {
+    bound_probe(".tmp/_tc_bargs_bare.bl", bounded_src("fn probe[U: Tr](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Tr` takes 1 type argument(s), 0 were given"), "expected E0910 at the bound, got:\n{p}")
+}
+
+test "a bound with too many trait arguments is a trait arity error" {
+    bound_probe(".tmp/_tc_bargs_extra.bl", bounded_src("fn probe[U: Tr[Int, Str]](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Tr` takes 1 type argument(s), 2 were given"), "expected E0910 at the bound, got:\n{p}")
+}
+
+test "a bound on a trait with no type parameters given arguments is a trait arity error" {
+    bound_probe(".tmp/_tc_bargs_plain_args.bl", bounded_src("fn probe[U: Plain[Int]](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Plain` takes 0 type argument(s), 1 were given"), "expected E0910 at the bound, got:\n{p}")
+}
+
+test "an unknown type in a bound's arguments is reported once without a call through it" {
+    bound_probe(".tmp/_tc_bargs_nope.bl", bounded_src("fn probe[U: Tr[Nope]](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("UnknownType") && p.contains("Nope"), "expected an unknown-type error at Nope, got:\n{p}")
+    assert(problem_count() == 1, "expected exactly one problem, got:\n{p}")
+}
+
+test "an unknown type nested in a bound's arguments is reported" {
+    bound_probe(".tmp/_tc_bargs_nested.bl", bounded_src("fn probe[U: Tr[List[Nope]]](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("UnknownType") && p.contains("Nope"), "expected an unknown-type error at Nope, got:\n{p}")
+}
+
+test "a constructor in a bound's arguments is counted" {
+    bound_probe(".tmp/_tc_bargs_nested_arity.bl", bounded_src("fn probe[U: Tr[List[Int, Str]]](u: U) -> Int \{\n    0\n}", "probe(Pt \{ v: 1 })"))
+    let p = problems_reported()
+    assert(p.contains("TypeArgArity") && p.contains("`List`"), "expected E0303 at List[Int, Str], got:\n{p}")
+}
+
+test "an impl where-bound's arguments are counted and resolved" {
+    let shw = "trait Shw \{\n    fn shw(self) -> Int\n}\n\n"
+    bound_probe(".tmp/_tc_bargs_where_nope.bl", bounded_src(shw.concat("impl[T] Shw for Bx[T] where T: Tr[Nope] \{\n    fn shw(self) -> Int \{\n        0\n    }\n}"), "Bx \{ t: Pt \{ v: 1 } }.shw()"))
+    let p = problems_reported()
+    assert(p.contains("UnknownType") && p.contains("Nope"), "expected an unknown-type error at Nope, got:\n{p}")
+    bound_probe(".tmp/_tc_bargs_where_bare.bl", bounded_src(shw.concat("impl[T] Shw for Bx[T] where T: Tr \{\n    fn shw(self) -> Int \{\n        0\n    }\n}"), "Bx \{ t: Pt \{ v: 1 } }.shw()"))
+    let q = problems_reported()
+    assert(q.contains("TraitContract: trait `Tr` takes 1 type argument(s), 0 were given"), "expected E0910 at the where-bound, got:\n{q}")
+}
+
+test "an impl binder's bound arguments are counted and resolved" {
+    let shw = "trait Shw \{\n    fn shw(self) -> Int\n}\n\n"
+    bound_probe(".tmp/_tc_bargs_implb.bl", bounded_src(shw.concat("impl[T: Tr[Nope]] Shw for Bx[T] \{\n    fn shw(self) -> Int \{\n        0\n    }\n}"), "Bx \{ t: Pt \{ v: 1 } }.shw()"))
+    let p = problems_reported()
+    assert(p.contains("UnknownType") && p.contains("Nope"), "expected an unknown-type error at Nope, got:\n{p}")
+}
+
+test "a bound on a trait method's own type parameter is counted" {
+    let decls = "trait Q \{\n    fn q[U: Tr](self, u: U) -> Int\n}"
+    bound_probe(".tmp/_tc_bargs_tmeth.bl", bounded_src(decls, "0"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Tr` takes 1 type argument(s), 0 were given"), "expected E0910 at the bound, got:\n{p}")
+}
+
+test "a bound on an impl method's own type parameter is counted" {
+    let decls = "trait Q \{\n    fn q[U: Plain](self, u: U) -> Int\n}\n\nimpl Q for Pt \{\n    fn q[U: Tr](self, u: U) -> Int \{\n        0\n    }\n}"
+    bound_probe(".tmp/_tc_bargs_imeth.bl", bounded_src(decls, "0"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Tr` takes 1 type argument(s), 0 were given"), "expected E0910 at the bound, got:\n{p}")
+}
+
+test "a bound on a type declaration's parameter is counted" {
+    bound_probe(".tmp/_tc_bargs_tdecl.bl", bounded_src("type Hold[U: Tr] \{\n    u: U\n}", "0"))
+    let p = problems_reported()
+    assert(p.contains("TraitContract: trait `Tr` takes 1 type argument(s), 0 were given"), "expected E0910 at the bound, got:\n{p}")
+}

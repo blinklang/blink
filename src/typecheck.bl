@@ -332,8 +332,9 @@ let mut tc_tp_binder_nodes: List[Int] = []
 let mut tc_tp_bound_traits: List[Str] = []
 let mut tc_tp_bound_methods: List[Str] = []
 // The trait whose default body is being checked, for the E0305 diagnostic; "" when no
-// `Self` frame is active. tc_trait_node_idx maps a trait name to its AST node so the
-// guarantee-set closure can traverse user supertraits transitively.
+// `Self` frame is active. tc_trait_node_idx maps each registered trait name to its AST node,
+// so the guarantee-set closure can traverse user supertraits transitively and a call can read
+// where a bound's trait is declared.
 let mut tc_current_self_trait: Str = ""
 let mut tc_trait_node_idx: Map[Str, Int] = Map()
 // Each trait name → the pipe-framed set of its DIRECT declared supertraits, built in
@@ -4016,7 +4017,10 @@ fn tc_check_bounds_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCh
             let name = fnsig_type_param_names.get(idx).unwrap()
             let bounds = fnsig_tparam_bounds.get(idx).unwrap()
             if bounds != "" && binds.contains_key(name) != 0 {
-                tc_check_one_bound(name, bounds, binds.get(name).unwrap(), node)
+                let concrete = binds.get(name).unwrap()
+                if tc_check_one_bound(name, bounds, concrete, node) == 0 {
+                    tc_check_user_bounds(fs.decl, idx, concrete, binds, node)
+                }
             }
         }
         ti = ti + 1
@@ -4028,8 +4032,8 @@ fn tc_check_bounds_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCh
 // traits (mirroring tc_type_satisfies_bound's coverage) avoids a pipe-string splitter and
 // matches the existing tc_pipe_has idiom. Reports at most one bound per param: the first
 // provably-unmet trait (`T: Ord` frames `|Ord|Eq|`, both -1 for a non-Ord type — one
-// error, not two).
-fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+// error, not two). Answers 1 when it reported.
+fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let traits = ["Add", "Sub", "Mul", "Div", "Rem", "Neg", "Ord", "Eq", "Display", "Debug", "Hash", "Serialize"]
     let mut i = 0
     while i < traits.len() {
@@ -4038,10 +4042,165 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) ! TypeCh
             diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
                 "`{type_to_str(concrete)}` does not satisfy the {tr} bound on type parameter {name}", node,
                 "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types")
-            return
+            return 1
         }
         i = i + 1
     }
+    0
+}
+
+// The bounds on the type parameter at `idx` whose trait a program module declares, read at
+// the call's types: `U: Tr[Str]` holds for `Pt` only where an impl of `Tr` for `Pt` has the
+// trait argument Str, and `V` in `U: Tr[V]` is the call's type for V. A trait a std module
+// declares is left to the modeled check above, as its impls include ones no impl block
+// writes (the sealed Ops surfaces, From's identity rule). Reports at most one bound.
+fn tc_check_user_bounds(decl: Int, idx: Int, concrete0: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+    if decl < 0 { return }
+    let tp = fnsig_tparam_nodes.get(idx) ?? NO_BINDER_NODE
+    if tp < 0 || node_kind(tp) != NodeKind.TypeParam { return }
+    let bounds = node_elements(tp)
+    if bounds == -1 { return }
+    let concrete = tc_resolve(concrete0)
+    if tc_tid_is_judgeable(concrete) == 0 { return }
+    let mut i = 0
+    while i < sublist_length(bounds) {
+        let b = sublist_get(bounds, i)
+        let trait_name = strip_module_qualifier(node_name(b))
+        let tr = tc_trait_node_idx.get(trait_name) ?? -1
+        let args_sl = node_elements(b)
+        let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
+        // A wrong count is reported where the bound is written.
+        let arity_ok = got == (tc_trait_tparam_count_idx.get(trait_name) ?? -1)
+        if tr != -1 && arity_ok && !node_source_module(tr).starts_with("std_") {
+            let want = tc_bound_args_at_call(decl, args_sl, binds)
+            if want.len() == got {
+                let held = tc_impl_trait_args_held(concrete, trait_name)
+                if held.verdict == 1 && tc_impl_args_held_has(held, want) == 0 {
+                    let bound_text = tc_trait_at_text(trait_name, want)
+                    let has = if held.impls == 0 { "it has no impl of {trait_name}" } else { "it implements {tc_trait_heads_text(trait_name, held.args, got)}" }
+                    diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
+                        "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(tp)}: {has}", node,
+                        "pass an argument whose type implements {bound_text}, or write `impl {bound_text} for {type_to_str(concrete)}`")
+                    return
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Whether a type is fixed enough to judge an impl against: no unsolved metavariable and no
+// type parameter anywhere in it.
+fn tc_tid_is_judgeable(tid: Int) -> Int {
+    if tc_tid_is_concrete(tid) == 0 { return 0 }
+    if tc_tid_has_unbound_metavar(tid) != 0 || tc_tid_has_bare_typevar(tid) != 0 { return 0 }
+    1
+}
+
+// A bound's trait arguments as types at this call, or a shorter list when one is not judgeable
+// here. They are read under the callee's binders (its own, and its impl's for a method), so
+// `V` is the callee's V, then the call's types replace them.
+@allow(UnrestoredMutation)
+fn tc_bound_args_at_call(decl: Int, args_sl: Int, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Int] = []
+    if args_sl == -1 { return out }
+    let block = tc_method_block.get(decl) ?? -1
+    let impl_binders = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
+    let own = node_type_params(decl)
+    tc_push_tparam_scope(impl_binders)
+    tc_push_tparam_scope(own)
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let t = tc_resolve(substitute_typevar_tid(resolve_type_ann(sublist_get(args_sl, i)), binds))
+        if tc_tid_is_judgeable(t) == 0 { break }
+        out.push(t)
+        i = i + 1
+    }
+    tc_suppress_ann_validation = saved_suppress
+    tc_pop_tparam_scope(own)
+    tc_pop_tparam_scope(impl_binders)
+    out
+}
+
+// The trait arguments of each of the `impls` impls of a trait that apply to a type, one
+// impl's after another in `args`. `verdict` is 1 when each impl could be judged, 0 when some
+// impl could not (a receiver its binders do not pin), so the caller does not report.
+type ImplArgsHeld {
+    verdict: Int
+    impls: Int
+    args: List[Int]
+}
+
+fn tc_impl_trait_args_held(recv: Int, trait_name: Str) -> ImplArgsHeld ! TypeCheck.Resolve, Diag.Report {
+    let mut args: List[Int] = []
+    let mut verdict = 1
+    let mut impls = 0
+    for im in tc_impl_recv_tids.keys() {
+        if strip_module_qualifier(node_trait_name(im)) != trait_name { continue }
+        let binders = node_impl_binders(im)
+        let poly = binders != -1 && sublist_length(binders) > 0
+        let raw_recv = tc_impl_recv_tids.get(im) ?? -1
+        if tc_tid_kind(raw_recv) == TyKind.Typevar {
+            verdict = 0
+            continue
+        }
+        if poly && tc_impl_matches_instance(im, recv) == 0 { continue }
+        let binds: Map[Str, Int] = if poly { tc_impl_binds_for_instance(im, recv) } else { Map() }
+        let at = tc_resolve(substitute_typevar_tid(raw_recv, binds))
+        // A receiver of another kind (`List[T]` against a struct) cannot apply, pinned or not.
+        if tc_tid_kind(at) != tc_tid_kind(recv) { continue }
+        if tc_tid_has_bare_typevar(at) != 0 {
+            verdict = 0
+            continue
+        }
+        if !tc_tid_same_type(at, recv) { continue }
+        if poly && tc_impl_where_bounds_hold(im, binds) == -1 { continue }
+        let mut heads: List[Int] = []
+        for t in tc_impl_trait_arg_tids(im) {
+            let ta = tc_resolve(substitute_typevar_tid(t, binds))
+            if tc_tid_has_bare_typevar(ta) != 0 { verdict = 0 }
+            heads.push(ta)
+        }
+        for t in heads { args.push(t) }
+        impls = impls + 1
+    }
+    ImplArgsHeld { verdict: verdict, impls: impls, args: args }
+}
+
+// Whether one of the impls in `held` has exactly the trait arguments `want`.
+fn tc_impl_args_held_has(held: ImplArgsHeld, want: List[Int]) -> Int {
+    let n = want.len()
+    let mut s = 0
+    let mut j = 0
+    while j < held.impls {
+        let mut k = 0
+        while k < n && tc_tid_same_type(held.args.get(s + k) ?? -1, want.get(k).unwrap()) { k = k + 1 }
+        if k == n { return 1 }
+        s = s + n
+        j = j + 1
+    }
+    0
+}
+
+// A trait at arguments as a bound writes it: `Tr[Str]`, or `Tr` for none.
+fn tc_trait_at_text(trait_name: Str, args: List[Int]) -> Str {
+    if args.len() == 0 { return trait_name }
+    let mut parts: List[Str] = []
+    for t in args { parts.push(type_to_str(t)) }
+    "{trait_name}[{parts.join(", ")}]"
+}
+
+// Each impl's head in `args` (`n` arguments per impl), as `Tr[Int]` or `Tr[Int] and Tr[Bool]`.
+fn tc_trait_heads_text(trait_name: Str, args: List[Int], n: Int) -> Str {
+    let mut heads: List[Str] = []
+    let mut s = 0
+    while n > 0 && s + n <= args.len() {
+        heads.push(tc_trait_at_text(trait_name, args.slice(s, s + n)))
+        s = s + n
+    }
+    heads.join(" and ")
 }
 
 // The metavars minted for `call_node`'s return-only type params, as a full-arity
@@ -10915,6 +11074,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
     // Record the declared tparam count by trait name for the E0910
     // arity check, independent of whether the trait has any methods.
     tc_trait_tparam_count_idx.insert(name, tp_count)
+    tc_trait_node_idx.insert(name, tr_node)
     // Record direct supertraits for the E0911 obligation check.
     let mut supers = "|"
     let sup_sl = node_supertraits(tr_node)
@@ -11783,6 +11943,7 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_tparam_names.clear()
     tc_trait_tparam_nodes.clear()
     tc_trait_tparam_count_idx.clear()
+    tc_trait_node_idx.clear()
     tc_trait_supers_idx.clear()
     tc_current_fn_ret = -1
     tc_current_fn_name = ""
@@ -16053,6 +16214,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let methods_sl = node_methods(im)
             let impl_binders_sl = node_impl_binders(im)
             tc_push_tparam_scope(impl_binders_sl)
+            nr_check_binder_bounds(impl_binders_sl)
+            nr_check_binder_bounds(node_impl_where_bounds(im))
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
@@ -16079,18 +16242,21 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
 
 // A call through a bound fills a default from the trait's declaration, so each default is
 // read here, in the trait's module and before any parameter is in scope, as a function's is.
+// The bounds on the trait's and each method's own type parameters are read here too.
 fn nr_check_trait_method_defaults(traits_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if traits_sl == -1 { return }
     let mut i = 0
     while i < sublist_length(traits_sl) {
         let tr = sublist_get(traits_sl, i)
         let methods_sl = node_methods(tr)
+        nr_current_module = node_module(tr)
+        tc_push_tparam_scope(node_type_params(tr))
+        nr_check_binder_bounds(node_type_params(tr))
         if methods_sl != -1 {
-            nr_current_module = node_module(tr)
-            tc_push_tparam_scope(node_type_params(tr))
             let mut j = 0
             while j < sublist_length(methods_sl) {
-                let params_sl = node_params(sublist_get(methods_sl, j))
+                let m = sublist_get(methods_sl, j)
+                let params_sl = node_params(m)
                 if params_sl != -1 {
                     let mut d = 0
                     while d < sublist_length(params_sl) {
@@ -16098,10 +16264,13 @@ fn nr_check_trait_method_defaults(traits_sl: Int) ! TypeCheck.Resolve, TypeCheck
                         d = d + 1
                     }
                 }
+                tc_push_tparam_scope(node_type_params(m))
+                nr_check_binder_bounds(node_type_params(m))
+                tc_pop_tparam_scope(node_type_params(m))
                 j = j + 1
             }
-            tc_pop_tparam_scope(node_type_params(tr))
         }
+        tc_pop_tparam_scope(node_type_params(tr))
         i = i + 1
     }
 }
@@ -16132,6 +16301,7 @@ fn nr_check_test_bodies_in_test(tests_sl: Int) ! TypeCheck.Resolve, TypeCheck.Re
 fn nr_check_type_decl(td: Int) ! TypeCheck.Resolve, Diag.Report {
     let tparams = node_type_params(td)
     tc_push_tparam_scope(tparams)
+    nr_check_binder_bounds(tparams)
     // A type alias keeps its underlying annotation in the value slot and has no fields.
     let alias_ann = node_value(td)
     if alias_ann != -1 {
@@ -16201,6 +16371,7 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     // are already pushed by the caller.
     let fn_tparams = node_type_params(fn_node)
     tc_push_tparam_scope(fn_tparams)
+    nr_check_binder_bounds(fn_tparams)
     let nr_is_ffi = has_annotation(fn_node, "ffi")
     let params_sl = node_params(fn_node)
     // A default is read where it is written, before any parameter is in scope: a call that
@@ -16247,6 +16418,53 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     }
     tc_pop_tparam_scope(fn_tparams)
     nr_pop_scope()
+}
+
+// The bounds a list of binders carries (`[U: Tr[Int]]`, or an impl's `where T: Tr[Int]`).
+// A bound's trait arguments are part of the bound, so they are counted against the trait and
+// resolved here, where the bound is written, whether or not any call ever reaches it.
+fn nr_check_binder_bounds(binders_sl: Int) ! TypeCheck.Resolve, Diag.Report {
+    if binders_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(binders_sl) {
+        let bounds = node_elements(sublist_get(binders_sl, i))
+        if bounds != -1 {
+            let mut j = 0
+            while j < sublist_length(bounds) {
+                nr_check_bound_args(sublist_get(bounds, j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
+    let trait_name = strip_module_qualifier(node_name(bound))
+    let args_sl = node_elements(bound)
+    let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
+    let want = tc_trait_tparam_count_idx.get(trait_name) ?? -1
+    if want >= 0 && got != want {
+        diag_error_at("TraitContract", TRAIT_ARG_ARITY, "trait `{trait_name}` takes {want} type argument(s), {got} were given", bound,
+            "write one type argument per trait type parameter: `{trait_name}[...]`")
+        return
+    }
+    let mut i = 0
+    while i < got {
+        let arg = sublist_get(args_sl, i)
+        nr_check_type_ann_visibility(arg)
+        nr_resolve_bound_arg(arg)
+        i = i + 1
+    }
+}
+
+// Resolving the argument is what counts a nested constructor's arguments (E0303).
+@allow(UnrestoredMutation)
+fn nr_resolve_bound_arg(arg: Int) ! TypeCheck.Resolve, Diag.Report {
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let _ = resolve_type_ann(arg)
+    tc_suppress_ann_validation = saved_suppress
 }
 
 fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -26549,15 +26767,6 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     // the typechecker and died at the C compiler.
     let traits_walk_sl = node_arms(program)
     if traits_walk_sl != -1 {
-        // Index every trait by name so the guarantee-set closure can traverse user
-        // supertraits transitively.
-        tc_trait_node_idx.clear()
-        let mut ti = 0
-        while ti < sublist_length(traits_walk_sl) {
-            let trn0 = sublist_get(traits_walk_sl, ti)
-            tc_trait_node_idx.insert(node_name(trn0), trn0)
-            ti = ti + 1
-        }
         let self_tv = make_typevar_bound("Self", SELF_BINDER_NODE)
         let mut wi = 0
         while wi < sublist_length(traits_walk_sl) {
