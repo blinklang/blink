@@ -1,0 +1,128 @@
+// AmbiguousConstruction (E0519, sections/03_types.md §3.4) names every enum that holds the bare
+// variant and says how to qualify it. Two enums of one bare name print as `Name (module)`
+// (sections/07_trust_modules_metadata.md §10.6, "Diagnostics that involve a shadowing name").
+// The qualify list holds only spellings that resolve where the error is: an enum the module
+// cannot name gets the import that reaches it, and one whose bare name means another type
+// there gets no spelling. Enums of different names print as before. Check and the
+// per-module build report the same text.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn new_package(tag: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_ambiguous_construction_{tag}.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    dir
+}
+
+fn cleanup(dir: Str) {
+    let _ = sh("rm -rf {dir}")
+}
+
+// The check and the per-module build both fail, and each output holds every line of `want`
+// and none of `never`.
+fn expect_report(dir: Str, want: List[Str], never: List[Str]) {
+    for args in ["check", "build --per-module"] {
+        let r = blink_in(dir, args)
+        let mut ok = r.exit_code != 0
+        for w in want {
+            if !r.out.contains(w) { ok = false }
+        }
+        for n in never {
+            if r.out.contains(n) { ok = false }
+        }
+        if !ok { io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}") }
+        assert(ok)
+    }
+}
+
+fn write_namesake_shapes(dir: Str) {
+    write_file("{dir}/src/alpha.bl", #"pub type Shape {
+    Dot(r: Int)
+    Bar(w: Int, h: Int)
+}
+
+pub fn make_a() -> Int {
+    match Shape.Dot(1) {
+        Shape.Dot(r) => r
+        Shape.Bar(w, _) => w
+    }
+}
+"#)
+    write_file("{dir}/src/beta.bl", #"pub type Shape {
+    Tri(a: Int, b: Int, c: Int)
+    Dot(name: Str)
+}
+
+pub fn make_b() -> Int {
+    let t = Dot("abc")
+    match t {
+        Shape.Dot(n) => n.len()
+        _ => 0
+    }
+}
+"#)
+    write_file("{dir}/src/main.bl", #"import alpha.{make_a}
+import beta.{make_b}
+
+fn main() {
+    io.println("{make_a()} {make_b()}")
+}
+"#)
+}
+
+fn write_job_and_net(dir: Str, main_src: Str) {
+    write_file("{dir}/src/jobs.bl", "pub type JobState \{\n    Pending\n    Done\n}\n")
+    write_file("{dir}/src/net.bl", "pub type NetState \{\n    Pending\n    Closed\n}\n")
+    write_file("{dir}/src/main.bl", main_src)
+}
+
+fn pending_main(imports: Str) -> Str {
+    "{imports}\nfn main() \{\n    let x = Pending\n    let _ = x\n}\n"
+}
+
+test "two enums named Shape print with their modules, and the hint names only the spelling beta resolves" {
+    let dir = new_package("namesake")
+    write_namesake_shapes(dir)
+    expect_report(dir, [
+        "error[AmbiguousConstruction]: `Dot` is a variant of both Shape (alpha) and Shape (beta); qualify as Shape.Dot\n",
+        "--> src/beta.bl:7:13",
+    ], ["Shape and Shape", "Shape.Dot or Shape.Dot", "alpha.Shape"])
+    cleanup(dir)
+}
+
+test "an enum the use site does not import gets the import that reaches it, not a bare spelling" {
+    let dir = new_package("unimported")
+    write_job_and_net(dir, pending_main("import jobs.\{JobState\}\nimport net\n"))
+    expect_report(dir, [
+        "error[AmbiguousConstruction]: `Pending` is a variant of both JobState and NetState; qualify as JobState.Pending\n",
+        "note: add `NetState` to your import: `import net.\{NetState\}` then use `NetState.Pending`",
+    ], ["NetState.Pending or", "or NetState.Pending", "(jobs)", "(net)"])
+    cleanup(dir)
+}
+
+test "an enum the use site imports under another name is qualified by that name" {
+    let dir = new_package("aliased")
+    write_job_and_net(dir, pending_main("import jobs.\{JobState as JS\}\nimport net.\{NetState\}\n"))
+    expect_report(dir, [
+        "error[AmbiguousConstruction]: `Pending` is a variant of both JobState and NetState; qualify as JS.Pending or NetState.Pending\n",
+    ], ["JobState.Pending", "note: add"])
+    cleanup(dir)
+}
+
+test "enums of different names that the use site imports print as plain names" {
+    let dir = new_package("plain")
+    write_job_and_net(dir, pending_main("import jobs.\{JobState\}\nimport net.\{NetState\}\n"))
+    expect_report(dir, [
+        "error[AmbiguousConstruction]: `Pending` is a variant of both JobState and NetState; qualify as JobState.Pending or NetState.Pending\n",
+    ], ["(jobs)", "(net)", "note: add"])
+    cleanup(dir)
+}

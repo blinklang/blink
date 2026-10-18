@@ -11308,13 +11308,16 @@ fn tc_traits_shown(keys: Str) -> Str {
 // How a diagnostic names a trait: `Eq (geo.sim)` for one that shares its name.
 fn tc_trait_shown(key: Str) -> Str {
     match key.byte_index_of("@", 0) {
-        Some(at) => {
-            let m = key.byte_slice(at + 1, key.byte_len())
-            let shown_mod = if m == "__main__" { "main" } else { tc_get_dotted_module_path(m) }
-            "{key.byte_slice(0, at)} ({shown_mod})"
-        }
+        Some(at) => tc_name_with_module(key.byte_slice(0, at), key.byte_slice(at + 1, key.byte_len()))
         None => key
     }
+}
+
+// `Name (module)`: how a diagnostic tells apart two declarations of one name
+// (sections/07_trust_modules_metadata.md, "Diagnostics that involve a shadowing name").
+fn tc_name_with_module(name: Str, mod_key: Str) -> Str {
+    let shown_mod = if tc_module_key_is_main(mod_key) != 0 { "main" } else { tc_get_dotted_module_path(mod_key) }
+    "{name} ({shown_mod})"
 }
 
 // The trait declaration `member` names inside module `target`, or -1, following a `pub
@@ -15760,7 +15763,9 @@ type BareVariantPick {
     NotAVariant
     Carrier(kind: TyKind)
     Declared(enum_tid: Int, var_idx: Int)
-    Ambiguous(enums: List[Str])
+    // The prelude carrier that also has the variant, if one does, and the declaration of each
+    // enum that has it.
+    Ambiguous(carrier: Option[TyKind], enums: List[Int])
 }
 
 // Step 2 of the resolution order: the expected type names the carrier or an enum that has a
@@ -15796,24 +15801,21 @@ fn tc_bare_variant_site_type(name: Str, site: Int, carrier: Option[TyKind]) -> I
 // Step 3: the one constructible name of that spelling in the program. A std module never
 // depends on the program that uses it, so its sites do not see the program's enums.
 fn tc_bare_variant_from_program(name: Str, site: Int, carrier: Option[TyKind]) -> BareVariantPick {
-    let mut enums: List[Str] = []
-    let mut only = BareVariantPick.NotAVariant
-    match carrier {
-        Some(k) => {
-            enums.push(tc_prelude_carrier_name(k))
-            only = BareVariantPick.Carrier(k)
-        }
-        None => {}
+    let mut enums: List[Int] = []
+    let mut only = match carrier {
+        Some(k) => BareVariantPick.Carrier(k)
+        None => BareVariantPick.NotAVariant
     }
     let std_site = tc_site_in_std(site)
     for i in evar_slots_by_name.get(name) ?? [] {
         let ev = evar_pool.get(i).unwrap()
         if !std_site || node_source_module(ev.enum_decl).starts_with("std_") {
-            enums.push(node_name(ev.enum_decl))
+            enums.push(ev.enum_decl)
             only = BareVariantPick.Declared(ev.enum_id, i)
         }
     }
-    if enums.len() > 1 { return BareVariantPick.Ambiguous(enums) }
+    let carriers = if carrier.is_some() { 1 } else { 0 }
+    if enums.len() + carriers > 1 { return BareVariantPick.Ambiguous(carrier, enums) }
     only
 }
 
@@ -15859,8 +15861,8 @@ fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -
             let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
             Some(tc_enum_ctor_instance_tid(venum, vdecl, fn_name, node_args(node)))
         }
-        BareVariantPick.Ambiguous(enums) => {
-            tc_report_ambiguous_construction(fn_name, enums, node)
+        BareVariantPick.Ambiguous(carrier, enums) => {
+            tc_report_ambiguous_construction(fn_name, carrier, enums, node)
             let args_sl = node_args(node)
             if args_sl != -1 {
                 let saved_hint = tc_construct_hint
@@ -15878,21 +15880,96 @@ fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -
     }
 }
 
-fn tc_report_ambiguous_construction(name: Str, enums: List[Str], node: Int) ! Diag.Report {
-    let last = enums.len() - 1
-    let mut owners = ""
-    let mut quals = ""
+// How the module under check can write an enum as the qualifier of one of its variants.
+type EnumReach {
+    // A spelling that names the enum here: its own name, or the alias an import gives it.
+    Named(qualifier: Str)
+    // Nothing here names it, and a selective import of its module would bind its bare name.
+    Importable
+    // Its bare name means another declaration here, or its module cannot be imported.
+    Unreachable
+}
+
+// What the enum `bare` declared in `src_mod` is to module `reader`. A prelude carrier has no
+// declaration (`carrier`); it is in every module's scope unless the module binds the name.
+fn tc_enum_reach(bare: Str, src_mod: Str, carrier: Bool, reader: Str) -> EnumReach {
+    if !carrier && (src_mod == reader || (tc_module_key_is_main(src_mod) != 0 && tc_module_key_is_main(reader) != 0)) {
+        return EnumReach.Named(bare)
+    }
+    let binds = nr_module_import_index(reader)
+    let mut alias = ""
+    if !carrier {
+        for bound in binds.keys() {
+            for b in binds.get(bound) ?? [] {
+                if b.source_mod == src_mod && b.member == bare {
+                    if bound == bare { return EnumReach.Named(bare) }
+                    if alias == "" { alias = bound }
+                }
+            }
+        }
+    }
+    if alias != "" { return EnumReach.Named(alias) }
+    if nr_module_declares(reader, bare) != 0 || binds.contains_key(bare) { return EnumReach.Unreachable }
+    if carrier || tc_prelude_modules.contains_key(src_mod) { return EnumReach.Named(bare) }
+    if tc_module_key_is_main(src_mod) != 0 { return EnumReach.Unreachable }
+    EnumReach.Importable
+}
+
+// The prelude carrier comes first, then the enums. Two of one bare name print with their
+// modules. The qualify list holds only what resolves at the site; an enum an import would
+// reach gets a note with that import, and one whose name means something else there gets
+// nothing, since no spelling of it resolves.
+fn tc_report_ambiguous_construction(name: Str, carrier: Option[TyKind], enums: List[Int], node: Int) ! Diag.Report {
+    let mut bares: List[Str] = []
+    let mut mods: List[Str] = []
+    match carrier {
+        Some(k) => {
+            bares.push(tc_prelude_carrier_name(k))
+            // The home sections/07_trust_modules_metadata.md gives the compiler-known types.
+            mods.push("blink.core")
+        }
+        None => {}
+    }
+    for e in enums {
+        bares.push(node_name(e))
+        mods.push(node_module(e))
+    }
+    let carriers = if carrier.is_some() { 1 } else { 0 }
+    let mut seen: Map[Str, Int] = Map()
+    for b in bares {
+        seen.insert(b, (seen.get(b) ?? 0) + 1)
+    }
+    let mut owners: List[Str] = []
+    let mut quals: List[Str] = []
+    let mut notes: List[Str] = []
     let mut i = 0
-    while i < enums.len() {
-        let e = enums.get(i).unwrap()
-        let sep = if i == 0 { "" } else if i == last { " and " } else { ", " }
-        let qsep = if i == 0 { "" } else if i == last { " or " } else { ", " }
-        owners = "{owners}{sep}{e}"
-        quals = "{quals}{qsep}{e}.{name}"
+    while i < bares.len() {
+        let bare = bares.get(i).unwrap()
+        let m = mods.get(i).unwrap()
+        owners.push(if (seen.get(bare) ?? 0) > 1 { tc_name_with_module(bare, m) } else { bare })
+        match tc_enum_reach(bare, m, i < carriers, nr_current_module) {
+            EnumReach.Named(q) => quals.push("{q}.{name}")
+            EnumReach.Importable => notes.push("add `{bare}` to your import: `import {tc_get_dotted_module_path(m)}.\{{bare}\}` then use `{bare}.{name}`")
+            EnumReach.Unreachable => {}
+        }
         i = i + 1
     }
-    let both = if enums.len() == 2 { "both " } else { "" }
-    diag_error_at("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "`{name}` is a variant of {both}{owners}; qualify as {quals}", node, "write the enum before the variant, or give the site an expected type")
+    let both = if owners.len() == 2 { "both " } else { "" }
+    let qualify = if quals.len() == 0 { "" } else { "; qualify as {tc_series(quals, "or")}" }
+    diag_error_at_notes("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "`{name}` is a variant of {both}{tc_series(owners, "and")}{qualify}", node, "write the enum before the variant, or give the site an expected type", notes)
+}
+
+// `a`, `a and b`, `a, b and c`: a list as a sentence names it.
+fn tc_series(items: List[Str], conj: Str) -> Str {
+    let last = items.len() - 1
+    let mut out = ""
+    let mut i = 0
+    while i < items.len() {
+        let sep = if i == 0 { "" } else if i == last { " {conj} " } else { ", " }
+        out = "{out}{sep}{items.get(i).unwrap()}"
+        i = i + 1
+    }
+    out
 }
 
 // ── Literal field checks (§2.14 Checking a Literal's Fields) ─────────
@@ -21269,8 +21346,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         match tc_pick_bare_variant(name, node, tc_prelude_carrier_of(name)) {
             BareVariantPick.Carrier(_) => return tc_carrier_nullary_tid(name, name, node)
             BareVariantPick.Declared(enum_tid, var_idx) => return tc_declared_variant_value_tid(enum_tid, var_idx, name, node)
-            BareVariantPick.Ambiguous(enums) => {
-                tc_report_ambiguous_construction(name, enums, node)
+            BareVariantPick.Ambiguous(carrier, enums) => {
+                tc_report_ambiguous_construction(name, carrier, enums, node)
                 return tc_error_recovery_tid()
             }
             BareVariantPick.NotAVariant => {}
@@ -23726,8 +23803,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             tc_check_brace_literal(tc_variant_literal_owner(var_idx), node)
                             return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
                         }
-                        BareVariantPick.Ambiguous(enums) => {
-                            tc_report_ambiguous_construction(sname, enums, node)
+                        BareVariantPick.Ambiguous(carrier, enums) => {
+                            tc_report_ambiguous_construction(sname, carrier, enums, node)
                             return tc_error_recovery_tid()
                         }
                         _ => {}
