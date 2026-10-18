@@ -1,0 +1,170 @@
+// A `map` / `flat_map` closure with no `-> U` produces the type its body computes
+// (sections/03_types.md, closure inference). The rest of the expression that holds the call
+// reads that type, so a misuse of it is the same error as when the result is first bound to a
+// name: `xs.map(fn(v) { "{v}" }).get(0).unwrap() + 1` adds to a Str, wherever it is written.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn order_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Everything the probe reported that is not a warning, as `name: message` lines.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
+    }
+    out
+}
+
+fn problem_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity != "warning" { n = n + 1 }
+    }
+    n
+}
+
+fn in_main(stmt: Str) -> Str {
+    let head = #"type Pt {
+    x: Int
+}
+
+fn named(v: Int) -> Result[Str, Str] {
+    Ok("n")
+}
+
+fn main() {
+    "#
+    head.concat(stmt).concat("\n}\n")
+}
+
+// The let-split form of each row reports this one problem.
+fn expect_only(path: Str, stmt: Str, want: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    order_probe(path, in_main(stmt))
+    let p = problems_reported()
+    assert(p.contains(want), "expected `{want}`, got:\n{p}")
+    assert(problem_count() == 1, "expected one problem, got:\n{p}")
+}
+
+test "an iterator chain's Str element added to an Int is refused" {
+    expect_only(".tmp/_tc_cord_iter.bl", #"let _q = [1, 2].into_iter().map(fn(v) { "{v}" }).collect().get(0).unwrap() + 1"#,
+        "StrPlusUnsupported")
+}
+
+test "a List chain's Str element added to an Int is refused" {
+    expect_only(".tmp/_tc_cord_list.bl", #"let _q = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap() + 1"#, "StrPlusUnsupported")
+}
+
+test "a Str element is not a numeric operand of minus" {
+    order_probe(".tmp/_tc_cord_minus.bl", in_main(#"let _q = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap() - 1"#))
+    let p = problems_reported()
+    assert(p.contains("arithmetic `-` requires numeric operand, got Str"), "expected the Str operand refused, got:\n{p}")
+}
+
+test "a Str element compared with an Int names both types" {
+    expect_only(".tmp/_tc_cord_eq.bl", #"let _q = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap() == 1"#,
+        "binary `==`: incompatible types Str and Int")
+}
+
+test "a Str element ordered against an Int names both types" {
+    expect_only(".tmp/_tc_cord_lt.bl", #"let _q = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap() < 1"#,
+        "binary `<`: incompatible types Str and Int")
+}
+
+test "a method the Str element lacks is unresolved on Str" {
+    expect_only(".tmp/_tc_cord_abs.bl", #"let _q = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap().abs()"#,
+        "unresolved method `.abs` on type Str")
+}
+
+test "a field the Str element lacks is a missing field, not an untyped node" {
+    expect_only(".tmp/_tc_cord_field.bl", #"let _q = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap().x"#,
+        "type Str has no field `x`")
+}
+
+test "a template hole reads the element type" {
+    expect_only(".tmp/_tc_cord_hole.bl", #"let _q = "{[1, 2].map(fn(v) { "{v}" }).get(0).unwrap() + 1}""#, "StrPlusUnsupported")
+}
+
+test "a flat_map result reads the element type" {
+    expect_only(".tmp/_tc_cord_fmap.bl", #"let _q = [1, 2].flat_map(fn(v) { ["{v}"] }).get(0).unwrap() + 1"#, "StrPlusUnsupported")
+}
+
+test "a filter over a map result reads the element type" {
+    expect_only(".tmp/_tc_cord_filter.bl", #"let _q = [1, 2].map(fn(v) { "{v}" }).filter(fn(s) { s.len() > 0 }).get(0).unwrap() + 1"#,
+        "StrPlusUnsupported")
+}
+
+test "a map nested in a map reads the inner element type" {
+    expect_only(".tmp/_tc_cord_nest.bl", #"let _q = [[1], [2]].map(fn(r) { r.map(fn(v) { "{v}" }) }).get(0).unwrap().get(0).unwrap() + 1"#,
+        "StrPlusUnsupported")
+}
+
+test "a closure's tail reads the element type of a map inside it" {
+    expect_only(".tmp/_tc_cord_tail.bl", #"let _q = [[1], [2]].map(fn(r) { r.map(fn(v) { "{v}" }).get(0).unwrap() + 1 })"#,
+        "StrPlusUnsupported")
+}
+
+test "a statement-position call argument reads the element type" {
+    expect_only(".tmp/_tc_cord_stmt.bl", #"io.println("{[1, 2].map(fn(v) { "{v}" }).get(0).unwrap() + 1}")"#, "StrPlusUnsupported")
+}
+
+test "an assigned value reads the element type" {
+    order_probe(".tmp/_tc_cord_assign.bl", in_main(#"let mut z = 0
+    z = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap() + 1
+    io.println("{z}")"#))
+    let p = problems_reported()
+    assert(p.contains("StrPlusUnsupported"), "expected the Str `+` refused, got:\n{p}")
+}
+
+test "a returned value reads the element type" {
+    order_probe(".tmp/_tc_cord_return.bl", in_main(#"let _q = 0
+}
+
+fn f() -> Int {
+    return [1, 2].map(fn(v) { "{v}" }).get(0).unwrap() + 1"#))
+    let p = problems_reported()
+    assert(p.contains("StrPlusUnsupported"), "expected the Str `+` refused, got:\n{p}")
+}
+
+test "an effectful closure's result reads its element type" {
+    expect_only(".tmp/_tc_cord_eff.bl", #"let _q = [1, 2].map(fn(v) {
+        io.println("e")
+        "{v}"
+    }).get(0).unwrap() + 1"#, "StrPlusUnsupported")
+}
+
+test "a question mark on a Result element reads its Ok type" {
+    order_probe(".tmp/_tc_cord_try.bl", in_main(#"let _q = 0
+}
+
+fn g() -> Result[Int, Str] {
+    let n = [1, 2].map(fn(v) { named(v) }).get(0).unwrap()? + 1
+    Ok(n)"#))
+    let p = problems_reported()
+    assert(p.contains("StrPlusUnsupported"), "expected the Str `+` refused, got:\n{p}")
+}
+
+test "an error in the closure body is reported once" {
+    expect_only(".tmp/_tc_cord_once.bl", #"let _q = [1, 2].map(fn(v) { v.nope() }).get(0).unwrap() + 1"#,
+        "unresolved method `.nope` on type Int")
+}
+
+test "a well-typed closure result read in its own expression has no problems" {
+    order_probe(".tmp/_tc_cord_ok.bl", in_main(#"let a = [1, 2].map(fn(v) { v * 10 }).get(0).unwrap() + 1
+    let b = [1, 2].map(fn(v) { "{v}" }).get(0).unwrap().len() == 1
+    let c = [1, 2].map(fn(v) { Pt { x: v } }).get(1).unwrap().x < 3
+    io.println("{a} {b} {c}")"#))
+    let p = problems_reported()
+    assert(p == "", "expected no problems, got:\n{p}")
+}
