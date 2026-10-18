@@ -13622,26 +13622,41 @@ fn nr_define_typed(name: Str, is_mut: Int, tid: Int, node: Int) {
     nr_scope_push_entry(name, is_mut, tid, node)
 }
 
-// match-with-return per arm (instead of `let x = match { ... }` as an
-// expression) is a workaround for a codegen issue where binding a match
-// expression whose arms `return` from the enclosing fn produces wrong C.
-// Applies to nr_is_mut / nr_get_type / nr_check_shadow below too.
 fn nr_is_defined(name: Str) -> Int {
-    match nr_name_top.get(name) {
-        Some(i) => {
-            nr_mark_read_at(i)
-            return 1
-        }
-        None => {}
-    }
-    0
+    let i = nr_top_index(name)
+    if i == -1 { return 0 }
+    nr_mark_read_at(i)
+    1
 }
 
-// The scope index of `name`'s current top binding, or -1 when nothing binds it. A reference
+// The scope index of the binding `name` reads here, or -1 when nothing binds it. A reference
 // that asks several questions of its binding looks the name up once here and asks the rest by
 // index, since each lookup by name hashes and compares the whole spelling again.
 fn nr_top_index(name: Str) -> Int {
-    nr_name_top.get(name) ?? -1
+    let top = nr_name_top.get(name) ?? -1
+    if top == -1 { return -1 }
+    nr_module_global_index(name, top)
+}
+
+// Every module's top-level bindings share the outermost frame, so two modules that each
+// declare a private `start` leave two entries there, and the newest belongs to whichever
+// module registered last. The reading module's own declaration is the one its bare spelling
+// means, so a global entry is chosen by the declaration name resolution picks for the
+// current module, never by registration order.
+fn nr_module_global_index(name: Str, top: Int) -> Int {
+    if nr_scope_prev.get(top).unwrap() == -1 { return top }
+    if nr_index_is_global(top) == 0 { return top }
+    let decl = nr_resolve_bare_decl(name, nr_current_module)
+    if decl < 0 { return top }
+    let mut idx = top
+    while idx != -1 {
+        if nr_scope_nodes.get(idx).unwrap() == decl {
+            if idx != top { dbg_trace("nr.global", "`{name}` in {nr_current_module}: entry {idx} (decl {decl}), not newest {top}") }
+            return idx
+        }
+        idx = nr_scope_prev.get(idx).unwrap()
+    }
+    top
 }
 
 // nr_is_defined's side effects for a binding already looked up.
@@ -13698,23 +13713,18 @@ fn nr_index_is_global(idx: Int) -> Int {
 }
 
 fn nr_is_mut(name: Str) -> Int {
-    match nr_name_top.get(name) {
-        Some(i) => return nr_scope_muts.get(i).unwrap()
-        None => {}
-    }
-    0
+    let i = nr_top_index(name)
+    if i == -1 { return 0 }
+    nr_scope_muts.get(i).unwrap()
 }
 
 fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
-    match nr_name_top.get(name) {
-        Some(i) => {
-            if nr_loop_depth == 0 && nr_scope_captured.get(i).unwrap() == 0 {
-                nr_scope_reads.set(i, 0)
-            }
-            nr_scope_writes.set(i, nr_scope_writes.get(i).unwrap() + 1)
-        }
-        None => {}
+    let i = nr_top_index(name)
+    if i == -1 { return }
+    if nr_loop_depth == 0 && nr_scope_captured.get(i).unwrap() == 0 {
+        nr_scope_reads.set(i, 0)
     }
+    nr_scope_writes.set(i, nr_scope_writes.get(i).unwrap() + 1)
 }
 
 // The declaring node of `name`'s current top binding, or -1 when the binder recorded none.
@@ -13722,21 +13732,17 @@ fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
 // parameter, a match/for/with binder and a closure param all define through the node-less
 // nr_define_typed / nr_define_mut, so -1 there means "not a let" without a per-binder flag.
 fn nr_binding_node(name: Str) -> Int {
-    match nr_name_top.get(name) {
-        Some(i) => return nr_scope_nodes.get(i).unwrap()
-        None => {}
-    }
-    -1
+    let i = nr_top_index(name)
+    if i == -1 { return -1 }
+    nr_scope_nodes.get(i).unwrap()
 }
 
 // -1 for a name the scope does not carry. The give-up singleton would be a TYPE here, and a
 // caller cannot tell "this name has no recorded type" from "this name is typed as unknown".
 fn nr_get_type(name: Str) -> Int {
-    match nr_name_top.get(name) {
-        Some(i) => return nr_scope_types.get(i).unwrap()
-        None => {}
-    }
-    -1
+    let i = nr_top_index(name)
+    if i == -1 { return -1 }
+    nr_scope_types.get(i).unwrap()
 }
 
 fn nr_set_last_type(tid: Int) {

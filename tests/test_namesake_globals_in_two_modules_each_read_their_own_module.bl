@@ -1,0 +1,240 @@
+// Two modules of one package may each declare a private top-level binding of the same bare
+// name, and the two are different bindings (sections/07_trust_modules_metadata.md, module
+// scope). Inside each module the bare name means that module's own declaration: its type,
+// its mutability and the storage a write reaches, whichever module the main file imports first.
+
+fn cleanup(base: Str) {
+    let _ = process_run("rm", ["-rf", base])
+}
+
+fn fail(base: Str, msg: Str) {
+    io.println("FAIL: {msg}")
+    cleanup(base)
+    assert(false)
+}
+
+fn blink_bin() -> Str {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    "{blink_root}/build/blink"
+}
+
+fn new_package(base: Str) {
+    cleanup(base)
+    let _ = process_run("mkdir", ["-p", "{base}/src"])
+    write_file("{base}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+}
+
+// The combined output of `blink <cmd> src/main.bl`, with its exit status on the last line.
+fn blink_in(base: Str, cmd: Str) -> Str {
+    let r = process_run("sh", ["-c", "cd {base} && {blink_bin()} {cmd} src/main.bl 2>&1"])
+    "{r.out}\nexit {r.exit_code}"
+}
+
+fn exited_clean(out: Str) -> Bool {
+    out.ends_with("\nexit 0")
+}
+
+// Writes alpha and beta, and a main file that imports them in `order`.
+fn write_package(base: Str, alpha: Str, beta: Str, order: List[Str]) {
+    new_package(base)
+    write_file("{base}/src/alpha.bl", alpha)
+    write_file("{base}/src/beta.bl", beta)
+    let mut imports = ""
+    for m in order {
+        let line = if m == "alpha" { "import alpha.\{make_a\}\n" } else { "import beta.\{make_b\}\n" }
+        imports = imports.concat(line)
+    }
+    write_file("{base}/src/main.bl", "{imports}\nfn main() \{ io.println(\"\{make_a()\} \{make_b()\}\") \}\n")
+}
+
+// Checks and runs the package in both import orders; each run's output must hold `want`.
+fn expect_run(base: Str, alpha: Str, beta: Str, want: Str) {
+    for order in [["alpha", "beta"], ["beta", "alpha"]] {
+        write_package(base, alpha, beta, order)
+        let names = order.join(", ")
+        let chk = blink_in(base, "check")
+        if !exited_clean(chk) {
+            fail(base, "importing {names} should check clean, got: {chk}")
+            return
+        }
+        let run = blink_in(base, "run")
+        if !exited_clean(run) || !run.contains(want) {
+            fail(base, "importing {names} should run and print `{want}`, got: {run}")
+            return
+        }
+    }
+    cleanup(base)
+}
+
+test "a namesake private let of another type reads its own module's let" {
+    let alpha = #"let start = 1
+
+pub fn make_a() -> Int {
+    start
+}
+"#
+    let beta = #"let start = "two"
+
+pub fn make_b() -> Str {
+    start
+}
+"#
+    expect_run(".tmp/_test_namesake_globals_let", alpha, beta, "1 two")
+}
+
+test "a namesake const of another type reads its own module's const" {
+    let alpha = #"const LIMIT = 1
+
+pub fn make_a() -> Int {
+    LIMIT
+}
+"#
+    let beta = #"const LIMIT = "two"
+
+pub fn make_b() -> Str {
+    LIMIT
+}
+"#
+    expect_run(".tmp/_test_namesake_globals_const", alpha, beta, "1 two")
+}
+
+// Each module grows its own list, so a push that reached the other module's list would
+// fail to check, or count into the wrong one.
+test "a mutating method on a namesake let mut reaches its own module's list" {
+    let alpha = #"let mut items: List[Int] = []
+
+pub fn make_a() -> Int {
+    items.push(1)
+    items.len()
+}
+"#
+    let beta = #"let mut items: List[Str] = []
+
+pub fn make_b() -> Int {
+    items.push("x")
+    items.push("y")
+    items.len()
+}
+"#
+    expect_run(".tmp/_test_namesake_globals_let_mut", alpha, beta, "1 2")
+}
+
+// Only beta's binding is mutable, so the write checks only where it is that module's own.
+test "an assignment to a namesake global follows its own module's mutability" {
+    let alpha = #"let count = "one"
+
+pub fn make_a() -> Str {
+    count
+}
+"#
+    let beta = #"let mut count = 100
+
+pub fn make_b() -> Int {
+    count = count + 1
+    count
+}
+"#
+    expect_run(".tmp/_test_namesake_globals_mutability", alpha, beta, "one 101")
+}
+
+test "a closure captures its own module's namesake global" {
+    let alpha = #"let start = 1
+
+pub fn make_a() -> Int {
+    let f = fn() -> Int { start + 1 }
+    f()
+}
+"#
+    let beta = #"let start = "two"
+
+pub fn make_b() -> Str {
+    let f = fn() -> Str { start.concat("!") }
+    f()
+}
+"#
+    expect_run(".tmp/_test_namesake_globals_closure", alpha, beta, "2 two!")
+}
+
+// The generic fn is instantiated from beta, but its body is alpha's and reads alpha's global.
+test "a generic fn instantiated from another module reads its own module's namesake global" {
+    let alpha = #"let start = 1
+
+pub fn pick[T](_x: T) -> Int {
+    start
+}
+
+pub fn make_a() -> Int {
+    start
+}
+"#
+    let beta = #"import alpha.{pick}
+
+let start = "two"
+
+pub fn make_b() -> Str {
+    let n = pick("q")
+    "{start}{n}"
+}
+"#
+    expect_run(".tmp/_test_namesake_globals_generic", alpha, beta, "1 two1")
+}
+
+test "a namesake global of a namesake enum matches its own module's variants" {
+    let alpha = #"pub type Hue {
+    Red
+    Green
+}
+
+let start = Hue.Green
+
+pub fn make_a() -> Int {
+    match start {
+        Red => 1
+        Green => 2
+    }
+}
+"#
+    let beta = #"pub type Hue {
+    Blue
+    Gray
+}
+
+let start = Hue.Gray
+
+pub fn make_b() -> Int {
+    match start {
+        Blue => 3
+        Gray => 4
+    }
+}
+"#
+    expect_run(".tmp/_test_namesake_globals_enum", alpha, beta, "2 4")
+}
+
+// `blink test` on a module that imports another loads both, so a test block's bare read has
+// the same two declarations to choose from as a function body's.
+test "a test block reads its own module's namesake global" {
+    let base = ".tmp/_test_namesake_globals_test_block"
+    new_package(base)
+    write_file("{base}/src/alpha.bl", #"import beta.{make_b}
+
+let start = 1
+
+test "alpha reads its own start" {
+    assert_eq(start, 1)
+    assert_eq(make_b(), "two")
+}
+"#)
+    write_file("{base}/src/beta.bl", #"let start = "two"
+
+pub fn make_b() -> Str {
+    start
+}
+"#)
+    let r = process_run("sh", ["-c", "cd {base} && {blink_bin()} test src/alpha.bl 2>&1"])
+    if r.exit_code != 0 || !r.out.contains("1 passed, 0 failed") {
+        fail(base, "the alpha test block should pass, got: {r.out}")
+        return
+    }
+    cleanup(base)
+}
