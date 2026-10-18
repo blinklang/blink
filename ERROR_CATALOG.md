@@ -341,6 +341,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0505 | UnresolvedMethod | `typecheck.bl` — unresolved method on any receiver whose type is known: struct/enum, and the builtin scalars/containers (primary) + `codegen_methods.bl` — method dispatch (fail-open backstop) |
 | E0506 | UndefinedVariable | `typecheck.bl` — name resolution |
 | E0507 | UnknownType | `typecheck.bl` — name resolution |
+| E0519 | AmbiguousConstruction | `typecheck.bl` — `tc_report_ambiguous_construction`, when `tc_pick_bare_variant` (or `tc_bare_variant_from_program` for a brace literal) finds two or more enums, a prelude carrier counting, for a bare variant with no expected type: at a nullary name, a payload call and a brace literal |
 | W0501 | UnknownMethod | `typecheck.bl` — name resolution records the call, inference reports it (soft class only: the receiver's type is a bare typevar or unresolved at the call; a KNOWN receiver type is E0505 instead) |
 | E1004 | VersionConflict | `compiler.bl` — lockfile version conflict validation in `ensure_lockfile_loaded()` |
 | V0003 | ContractUnverifiable | `typecheck.bl` — `tc_check_contract_verifiable`, one error per contract. With no solver, every contract without `@verify` gets it |
