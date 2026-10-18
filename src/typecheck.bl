@@ -7305,17 +7305,75 @@ fn builtin_trait_methods(name: Str) -> Str {
     ""
 }
 
-// The trait-bound set of one TypeParam / where-constraint node — its declared bounds,
-// plus each bound's built-in supertrait (so `T: Ord` also licenses `==`).
+// The traits a bound on trait `key` guarantees, each by identity: the trait and every
+// supertrait, transitively (§3 "Operations on `Self` in a Default Body"). A built-in
+// supertrait (Ord: Eq) lives in the compiler, a declared one in the trait's own clause.
+fn tc_trait_guarantee_set(key: Str) -> Str {
+    let mut set = "|"
+    let mut work: List[Str] = [key]
+    while work.len() > 0 {
+        let t = work.pop().unwrap()
+        if t.is_empty() || tc_pipe_has(set, t) != 0 { continue }
+        set = tc_pipe_add(set, t)
+        let builtin_super = builtin_trait_supers(t)
+        if !builtin_super.is_empty() { work.push(builtin_super) }
+        let tr = tc_trait_node_idx.get(t) ?? -1
+        if tr == -1 { continue }
+        let sup = node_supertraits(tr)
+        if sup == -1 { continue }
+        let mut i = 0
+        while i < sublist_length(sup) {
+            work.push(tc_bound_trait(sublist_get(sup, i)))
+            i = i + 1
+        }
+    }
+    set
+}
+
+// The methods the traits of a guarantee set provide.
+fn tc_guarantee_methods(traits: Str) -> Str {
+    let mut methods = "|"
+    for t in traits.split("|") {
+        if t.is_empty() { continue }
+        // A builtin trait's sealed or synthesized methods (Display's `display`, Eq's `ne`)
+        // live in the compiler, not the AST, even when the trait also has a node.
+        methods = tc_pipe_merge(methods, builtin_trait_methods(t))
+        let tr = tc_trait_node_idx.get(t) ?? -1
+        if tr != -1 { methods = tc_add_node_methods(methods, tr) }
+    }
+    methods
+}
+
+// Whether every trait of a non-empty guarantee set has a known method list: a declaration,
+// or the compiler's own list for a trait it provides.
+fn tc_guarantee_lists_all_methods(traits: Str) -> Bool {
+    let mut any = false
+    for t in traits.split("|") {
+        if t.is_empty() { continue }
+        if !tc_trait_node_idx.contains_key(t) && builtin_trait_methods(t).is_empty() { return false }
+        any = true
+    }
+    any
+}
+
+// A pipe-framed set as the " and "-joined list a diagnostic reads.
+fn tc_pipe_joined(set: Str) -> Str {
+    let mut items: List[Str] = []
+    for t in set.split("|") {
+        if !t.is_empty() { items.push(t) }
+    }
+    items.join(" and ")
+}
+
+// The trait-bound set of one TypeParam / where-constraint node: the guarantee set of each
+// declared bound, so `T: Ord` also licenses `==` and `U: Kid` licenses Kid's supertraits.
 fn tparam_node_bound_traits(tp: Int) -> Str {
     let mut set = "|"
     let bounds = node_elements(tp)
     if bounds == -1 { return set }
     let mut i = 0
     while i < sublist_length(bounds) {
-        let bn = tc_bound_trait(sublist_get(bounds, i))
-        set = tc_pipe_add(set, bn)
-        set = tc_pipe_add(set, builtin_trait_supers(bn))
+        set = tc_pipe_merge(set, tc_trait_guarantee_set(tc_bound_trait(sublist_get(bounds, i))))
         i = i + 1
     }
     set
@@ -7337,42 +7395,8 @@ fn tc_add_node_methods(set: Str, tr_node: Int) -> Str {
 // trait's guarantee set (own methods + the transitive supertrait closure's methods),
 // with an arithmetic bit set when any arithmetic trait is in the closure.
 fn tc_push_self_frame(tr_node: Int) {
-    let mut traits = tc_pipe_add("|", tc_trait_key_of(tr_node))
-    let mut methods = tc_add_node_methods("|", tr_node)
-    let mut work: List[Str] = []
-    let seed = node_supertraits(tr_node)
-    if seed != -1 {
-        let mut si = 0
-        while si < sublist_length(seed) {
-            work.push(tc_bound_trait(sublist_get(seed, si)))
-            si = si + 1
-        }
-    }
-    while work.len() > 0 {
-        let s = work.pop().unwrap()
-        if tc_pipe_has(traits, s) == 0 {
-            traits = tc_pipe_add(traits, s)
-            // A builtin trait's sealed/synthesized methods (Display's `display`, Eq's `ne`)
-            // and intrinsic supertraits (Ord: Eq) live in the compiler, not the AST — merge
-            // them even when the trait ALSO has a user node (Display/Eq/Ord are in the
-            // stdlib). Both are "" for a pure user trait, so this is a no-op there.
-            methods = tc_pipe_merge(methods, builtin_trait_methods(s))
-            let bs = builtin_trait_supers(s)
-            if bs != "" { work.push(bs) }
-            let snode = tc_trait_node_idx.get(s) ?? -1
-            if snode != -1 {
-                methods = tc_add_node_methods(methods, snode)
-                let sup = node_supertraits(snode)
-                if sup != -1 {
-                    let mut ui = 0
-                    while ui < sublist_length(sup) {
-                        work.push(tc_bound_trait(sublist_get(sup, ui)))
-                        ui = ui + 1
-                    }
-                }
-            }
-        }
-    }
+    let traits = tc_trait_guarantee_set(tc_trait_key_of(tr_node))
+    let methods = tc_guarantee_methods(traits)
     tc_tp_frames.push(TpFrame { name: "Self", binder: SELF_BINDER_NODE, bounds_node: NO_BINDER_NODE, traits: traits, methods: methods })
 }
 
@@ -11475,13 +11499,12 @@ fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int) -> Map[Str, Int] ! TypeChe
     binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), recv_tid)
     let tm = tc_tmsig_pool.get(tmsig_idx).unwrap()
     if tm.tparams_count == 0 { return binds }
-    let args_sl = tc_bound_trait_args(tc_tid_binder(recv_tid), tm.trait_name)
-    if args_sl == -1 { return binds }
+    let arg_tids = tc_bound_trait_arg_tids(tc_tid_binder(recv_tid), tm.trait_name)
     let mut k = 0
-    while k < tm.tparams_count && k < sublist_length(args_sl) {
+    while k < tm.tparams_count && k < arg_tids.len() {
         let tp_name = tc_trait_tparam_names.get(tm.tparams_start + k).unwrap()
         let tp_node = tc_trait_tparam_nodes.get(tm.tparams_start + k) ?? NO_BINDER_NODE
-        let arg_tid = resolve_type_ann(sublist_get(args_sl, k))
+        let arg_tid = arg_tids.get(k).unwrap()
         binds.insert(tp_name, arg_tid)
         binds.insert(tc_binder_key(tp_node, tp_name), arg_tid)
         k = k + 1
@@ -11490,37 +11513,114 @@ fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int) -> Map[Str, Int] ! TypeChe
 }
 
 // The trait arguments the type parameter declared at `binder` is bounded by `trait_name`
-// at (`[Int]` of `U: Tr[Int]`), or -1 when its bounds do not name the trait with arguments.
+// at (`[Int]` of `U: Tr[Int]`), empty when its bounds do not name the trait with arguments.
 // An impl's `where T: Tr[Int]` bounds the impl's `T` from a node of its own, which the frame
 // for that binder carries, so every active frame of the binder is read, not the binder alone.
-fn tc_bound_trait_args(binder: Int, trait_name: Str) -> Int {
-    if binder < 0 { return -1 }
+fn tc_bound_trait_arg_tids(binder: Int, trait_name: Str) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    if binder < 0 { return [] }
     let mut i = tc_tp_frames.len() - 1
     while i >= 0 {
         let f = tc_tp_frames.get(i).unwrap()
         if f.binder == binder {
-            let args = tc_bounds_node_trait_args(f.bounds_node, trait_name)
-            if args != -1 { return args }
+            let args = tc_bounds_node_trait_arg_tids(f.bounds_node, trait_name)
+            if args.len() > 0 { return args }
         }
         i = i - 1
     }
-    tc_bounds_node_trait_args(binder, trait_name)
+    tc_bounds_node_trait_arg_tids(binder, trait_name)
+}
+
+fn tc_resolve_type_args(args_sl: Int) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Int] = []
+    if args_sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        out.push(resolve_type_ann(sublist_get(args_sl, i)))
+        i = i + 1
+    }
+    out
 }
 
 // The arguments one TypeParam or `where` constraint node bounds its parameter by `trait_name`
-// at, or -1.
-fn tc_bounds_node_trait_args(bounds_node: Int, trait_name: Str) -> Int {
-    if bounds_node < 0 { return -1 }
-    if node_kind(bounds_node) != NodeKind.TypeParam { return -1 }
+// at, or empty.
+fn tc_bounds_node_trait_arg_tids(bounds_node: Int, trait_name: Str) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    if bounds_node < 0 { return [] }
+    if node_kind(bounds_node) != NodeKind.TypeParam { return [] }
     let bounds = node_elements(bounds_node)
-    if bounds == -1 { return -1 }
+    if bounds == -1 { return [] }
     let mut i = 0
     while i < sublist_length(bounds) {
         let b = sublist_get(bounds, i)
-        if tc_bound_trait(b) == trait_name { return node_elements(b) }
+        if tc_bound_trait(b) == trait_name { return tc_resolve_type_args(node_elements(b)) }
         i = i + 1
     }
-    -1
+    // A trait the bound guarantees through a supertrait clause takes that clause's arguments.
+    i = 0
+    while i < sublist_length(bounds) {
+        let b = sublist_get(bounds, i)
+        let args = tc_super_clause_arg_tids(tc_bound_trait(b), tc_resolve_type_args(node_elements(b)), trait_name, "|")
+        if args.len() > 0 { return args }
+        i = i + 1
+    }
+    []
+}
+
+// The arguments a supertrait clause of trait `key`, or of one of its supertraits, names
+// `trait_name` at, read with `key`'s own type parameters bound to `key_args`: through
+// `trait Sub[X]: Tr[X]` and the bound `Sub[Int]`, `Tr` takes `[Int]`. Empty when no clause
+// names the trait with arguments.
+fn tc_super_clause_arg_tids(key: Str, key_args: List[Int], trait_name: Str, seen: Str) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    if tc_pipe_has(seen, key) != 0 { return [] }
+    let tr = tc_trait_node_idx.get(key) ?? -1
+    if tr == -1 { return [] }
+    let sup = node_supertraits(tr)
+    if sup == -1 { return [] }
+    let tparams_sl = node_type_params(tr)
+    let mut binds: Map[Str, Int] = Map()
+    let mut k = 0
+    while tparams_sl != -1 && k < sublist_length(tparams_sl) && k < key_args.len() {
+        let tp_node = sublist_get(tparams_sl, k)
+        binds.insert(node_name(tp_node), key_args.get(k).unwrap())
+        binds.insert(tc_binder_key(tp_node, node_name(tp_node)), key_args.get(k).unwrap())
+        k = k + 1
+    }
+    let mut named: List[Str] = []
+    let mut clause_args: List[List[Int]] = []
+    let mut i = 0
+    while i < sublist_length(sup) {
+        let clause = sublist_get(sup, i)
+        named.push(tc_bound_trait(clause))
+        clause_args.push(tc_clause_arg_tids(clause, tparams_sl, binds))
+        i = i + 1
+    }
+    i = 0
+    while i < named.len() {
+        if named.get(i).unwrap() == trait_name { return clause_args.get(i).unwrap() }
+        i = i + 1
+    }
+    let seen_here = tc_pipe_add(seen, key)
+    i = 0
+    while i < named.len() {
+        let args = tc_super_clause_arg_tids(named.get(i).unwrap(), clause_args.get(i).unwrap(), trait_name, seen_here)
+        if args.len() > 0 { return args }
+        i = i + 1
+    }
+    []
+}
+
+// One supertrait clause's arguments, resolved in the declaring trait's scope and then read
+// at `binds`. The clause was checked where the trait registered, so it is not re-validated.
+fn tc_clause_arg_tids(clause: Int, tparams_sl: Int, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    tc_push_tparam_scope(tparams_sl)
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut args: List[Int] = []
+    for a in tc_resolve_type_args(node_elements(clause)) {
+        args.push(substitute_typevar_tid(a, binds))
+    }
+    tc_suppress_ann_validation = saved_suppress
+    tc_pop_tparam_scope(tparams_sl)
+    args
 }
 
 // One deep trait-contract compare: `verdict` is -1 when a side is unknown
@@ -21875,18 +21975,40 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // The sealed synthesized `display()`, which has no declared signature anywhere
                 // — the same arm the struct path carries below.
                 if method == "display" && tc_pipe_has(tv_traits, "Display") != 0 { return TYPE_STR }
+                let tv_name = type_to_str(obj_t)
+                let mut found = -1
+                let mut owners: List[Str] = []
                 let mut tvi = 0
                 while tvi < tc_tmsig_pool.len() {
                     let tm = tc_tmsig_pool.get(tvi).unwrap()
-                    if tm.method == method && tc_pipe_has(tv_traits, tm.trait_name) != 0 {
-                        // Each instance picks its impl by this bound's trait: the type may
-                        // hold another trait of one spelling with a method of this name.
-                        nr_note_call_decl(node, tc_trait_method_decl(tm.trait_name, method))
-                        let binds = tc_bound_call_binds(obj_t, tvi)
-                        let _ = check_arg_shapes_with_binds("{tc_trait_shown(tm.trait_name)}.{method}", tm.sig, args_sl, 1, node, binds)
-                        return substitute_typevar_tid(tm.ret_tid, binds)
+                    if tm.method == method && tc_pipe_has(tv_traits, tm.trait_name) != 0 && !owners.contains(tm.trait_name) {
+                        if found < 0 { found = tvi }
+                        owners.push(tm.trait_name)
                     }
                     tvi = tvi + 1
+                }
+                // §3c rule 3 holds for a bound as for a type: two traits the bound guarantees
+                // that both declare the name leave the call without one answer.
+                if owners.len() >= 2 {
+                    diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits that bound type parameter `{tv_name}` ({tc_traits_shown(owners.join(" and "))})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`")
+                    return tc_error_recovery_tid()
+                }
+                if found >= 0 {
+                    let tm = tc_tmsig_pool.get(found).unwrap()
+                    // Each instance picks its impl by the trait that declares the method: the
+                    // type may hold another trait of one spelling with a method of this name.
+                    nr_note_call_decl(node, tc_trait_method_decl(tm.trait_name, method))
+                    let binds = tc_bound_call_binds(obj_t, found)
+                    let _ = check_arg_shapes_with_binds("{tc_trait_shown(tm.trait_name)}.{method}", tm.sig, args_sl, 1, node, binds)
+                    return substitute_typevar_tid(tm.ret_tid, binds)
+                }
+                // The bound is the whole licence, so a method none of its traits declares is
+                // refused here, in the generic body, not at each instance. Only a guarantee
+                // set whose method lists are all known can say a method is absent.
+                if tc_guarantee_lists_all_methods(tv_traits) && tc_pipe_has(tc_guarantee_methods(tv_traits), method) == 0 {
+                    tc_unresolved_method_hard.insert(node, 1)
+                    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` is bounded by {tc_traits_shown(tc_pipe_joined(tv_traits))}, and none of them declares method `{method}`", node, "correct the method name, or add a bound whose trait declares `{method}`")
+                    return tc_error_recovery_tid()
                 }
             }
         }
