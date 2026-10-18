@@ -1,0 +1,123 @@
+// A bound guarantees its trait's methods and every supertrait's, transitively
+// (sections/03_types.md, "Operations on `Self` in a Default Body"), and nothing else. A
+// method none of those traits declares is an error that names the type parameter and the
+// traits searched; a method two of them declare is ambiguous until a qualified call picks one.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn guarantee_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Everything the probe reported that is not a warning, as `name: message` lines.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
+    }
+    out
+}
+
+fn problem_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity != "warning" { n = n + 1 }
+    }
+    n
+}
+
+// `Pt` implements `Base`, `Kid: Base`, and the two traits `Lb` and `Rb` that both declare `x`,
+// joined by `Both: Lb + Rb`.
+fn guarantee_src(decls: Str) -> Str {
+    let head = #"type Pt {
+    v: Int
+}
+
+trait Base {
+    fn base(self) -> Int
+}
+
+trait Kid: Base {
+    fn one(self) -> Int
+}
+
+trait Lb {
+    fn x(self) -> Int
+}
+
+trait Rb {
+    fn x(self) -> Int
+}
+
+trait Both: Lb + Rb {
+    fn both(self) -> Int
+}
+
+impl Base for Pt {
+    fn base(self) -> Int {
+        self.v
+    }
+}
+
+impl Kid for Pt {
+    fn one(self) -> Int {
+        1
+    }
+}
+
+impl Lb for Pt {
+    fn x(self) -> Int {
+        1
+    }
+}
+
+impl Rb for Pt {
+    fn x(self) -> Int {
+        2
+    }
+}
+
+impl Both for Pt {
+    fn both(self) -> Int {
+        3
+    }
+}
+
+"#
+    head.concat(decls).concat("\n\nfn main() \{\n    let _ = probe(Pt \{ v: 1 })\n}\n")
+}
+
+test "a supertrait's method is available through the subtrait's bound" {
+    guarantee_probe(".tmp/_tc_guar_super.bl", guarantee_src("fn probe[U: Kid](u: U) -> Int \{\n    u.base() + Base.base(u) + u.one()\n}"))
+    let p = problems_reported()
+    assert(p == "", "expected no problems, got:\n{p}")
+}
+
+test "a method neither the bound's trait nor its supertraits declare is an error naming them" {
+    guarantee_probe(".tmp/_tc_guar_nope.bl", guarantee_src("fn probe[U: Kid](u: U) -> Int \{\n    u.nope()\n}"))
+    let p = problems_reported()
+    assert(p.contains("UnresolvedMethod"), "expected an unresolved-method error, got:\n{p}")
+    assert(p.contains("`U`") && p.contains("Kid") && p.contains("Base") && p.contains("`nope`"), "expected the message to name U, Kid, Base and nope, got:\n{p}")
+    assert(problem_count() == 1, "expected exactly one problem, got:\n{p}")
+}
+
+test "a method two supertraits declare is ambiguous through the bound" {
+    guarantee_probe(".tmp/_tc_guar_amb.bl", guarantee_src("fn probe[U: Both](u: U) -> Int \{\n    u.x()\n}"))
+    let p = problems_reported()
+    assert(p.contains("AmbiguousMethodCall") && p.contains("Lb") && p.contains("Rb"), "expected an ambiguous-call error naming Lb and Rb, got:\n{p}")
+}
+
+test "a qualified call picks one of two supertraits that declare the method" {
+    guarantee_probe(".tmp/_tc_guar_qual.bl", guarantee_src("fn probe[U: Both](u: U) -> Int \{\n    Lb.x(u) + Rb.x(u) + u.both()\n}"))
+    let p = problems_reported()
+    assert(p == "", "expected no problems, got:\n{p}")
+}
