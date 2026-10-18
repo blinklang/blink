@@ -8592,7 +8592,7 @@ fn tc_bind_has_hole(tid: Int) -> Int {
 }
 
 fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_check_struct_literal(stid, node)
+    tc_check_brace_literal(tc_struct_literal_owner(stid), node)
     tc_check_struct_lit_field_closures(stid, node)
     tc_pin_struct_lit_field_ret_mints(stid, node)
     let bare = tc_instance_base_name(stid)
@@ -15899,10 +15899,11 @@ fn tc_report_ambiguous_construction(name: Str, enums: List[Str], node: Int) ! Di
 // Every literal that names fields comes here: a struct literal, a variant brace literal, and a
 // variant paren payload. A struct pattern can plan its own faults with literal_field_faults.
 
-// A field a literal may label, in declaration order.
+// A field a literal may label, in declaration order. `field` is its TypeField node; its type
+// is written out only when a report names it.
 type LitFieldRow {
     name: Str
-    type_text: Str
+    field: Int
     has_default: Bool
 }
 
@@ -15922,17 +15923,15 @@ type LitFaults {
     missing: List[LitFieldRow]
 }
 
-// The type a literal builds, as its diagnostics name it. `local` says whether its declaration
-// is in the package being compiled, the only place a repair may edit it.
+// The type a literal builds, as its diagnostics name it, and the declaration a repair would edit.
 type LitOwner {
     shown: Str
-    decl_fields: Int
+    decl: Int
     rows: List[LitFieldRow]
-    local: Bool
     is_struct: Bool
 }
 
-// A list of fields in a message stops after this many and says how many it left out.
+// A help or note that lists fields stops after this many and says how many it left out.
 const LIT_FIELD_LIST_MAX = 6
 
 // The Error Catalog's nearest-name rule: compare with case, `_` and `-` ignored, and name a
@@ -15949,7 +15948,7 @@ fn nearest_name(written: Str, candidates: List[Str]) -> Str {
             best = c
             best_dist = d
             tied = false
-        } else if d == best_dist && best != "" {
+        } else if d == best_dist {
             tied = true
         }
     }
@@ -15962,8 +15961,9 @@ fn nearest_name_key(s: Str) -> Str {
 
 // The faults of one literal, each kind in source order. `labels` are the label nodes as
 // written. A missing field that an unknown label's suggestion names is left out, so a typo
-// gives one report and one rename clears it.
-fn literal_field_faults(rows: List[LitFieldRow], labels: List[Int], has_spread: Bool) -> LitFaults {
+// gives one report and one rename clears it. A field that two unknown labels both come nearest
+// to is suggested to neither: renaming both would give it twice.
+fn literal_field_faults(rows: List[LitFieldRow], labels: List[Int], check_missing: Bool) -> LitFaults {
     let mut first_at: Map[Str, Int] = Map()
     let mut dups: List[LitDup] = []
     for l in labels {
@@ -15973,24 +15973,32 @@ fn literal_field_faults(rows: List[LitFieldRow], labels: List[Int], has_spread: 
         }
     }
     let mut declared: Map[Str, Int] = Map()
-    let mut candidates: List[Str] = []
-    for r in rows {
-        declared.insert(r.name, 1)
-        if !first_at.contains_key(r.name) { candidates.push(r.name) }
+    for r in rows { declared.insert(r.name, 1) }
+    let mut unknown_at: List[Int] = []
+    for l in labels {
+        if !declared.contains_key(node_name(l)) && (first_at.get(node_name(l)) ?? -1) == l { unknown_at.push(l) }
     }
     let mut unknowns: List[LitUnknown] = []
-    let mut suggested: Map[Str, Int] = Map()
-    for l in labels {
-        if !declared.contains_key(node_name(l)) && (first_at.get(node_name(l)) ?? -1) == l {
+    let mut picks: Map[Str, Int] = Map()
+    if unknown_at.len() > 0 {
+        let mut candidates: List[Str] = []
+        for r in rows {
+            if !first_at.contains_key(r.name) { candidates.push(r.name) }
+        }
+        let mut found: List[LitUnknown] = []
+        for l in unknown_at {
             let s = nearest_name(node_name(l), candidates)
-            if s != "" { suggested.insert(s, 1) }
-            unknowns.push(LitUnknown { at: l, suggestion: s })
+            if s != "" { picks.insert(s, (picks.get(s) ?? 0) + 1) }
+            found.push(LitUnknown { at: l, suggestion: s })
+        }
+        for u in found {
+            unknowns.push(if (picks.get(u.suggestion) ?? 0) > 1 { LitUnknown { at: u.at, suggestion: "" } } else { u })
         }
     }
     let mut missing: List[LitFieldRow] = []
-    if !has_spread {
+    if check_missing {
         for r in rows {
-            if !r.has_default && !first_at.contains_key(r.name) && !suggested.contains_key(r.name) { missing.push(r) }
+            if !r.has_default && !first_at.contains_key(r.name) && (picks.get(r.name) ?? 0) != 1 { missing.push(r) }
         }
     }
     LitFaults { dups: dups, unknowns: unknowns, missing: missing }
@@ -16004,7 +16012,7 @@ fn tc_lit_rows(decl_fields: Int) -> List[LitFieldRow] {
     while i < sublist_length(decl_fields) {
         let f = sublist_get(decl_fields, i)
         if node_kind(f) == NodeKind.TypeField && node_int_val(f) == 0 {
-            rows.push(LitFieldRow { name: node_name(f), type_text: type_ann_text(node_value(f)), has_default: node_condition(f) != -1 })
+            rows.push(LitFieldRow { name: node_name(f), field: f, has_default: node_condition(f) != -1 })
         }
         i = i + 1
     }
@@ -16013,27 +16021,30 @@ fn tc_lit_rows(decl_fields: Int) -> List[LitFieldRow] {
 
 // §3.1 rule 1: a repair that edits a declaration is offered only in the package being
 // compiled. The root package stands for it until the spec defines workspaces and path deps.
+// A declaration the checker synthesizes has no source line, and no file a person could edit.
 fn tc_decl_in_root_package(decl: Int) -> Bool {
+    if node_line(decl) <= 0 { return false }
     let m = node_module(decl)
     tc_module_key_is_main(m) != 0 || tc_same_package(m, "__main__")
 }
 
+// An alias head builds its target, so the target's declaration owns the fields.
 fn tc_struct_literal_owner(stid: Int) -> Option[LitOwner] {
-    let decl = tc_struct_decl_nodes.get(tc_instance_base_name(stid)) ?? -1
+    let written = tc_instance_base_name(stid)
+    let target = tc_alias_underlying_of(written)
+    let name = if target != -1 { tc_instance_base_name(target) } else { written }
+    let decl = tc_struct_decl_nodes.get(name) ?? -1
     if decl == -1 { return None }
-    let flds = node_fields(decl)
-    Some(LitOwner { shown: node_name(decl), decl_fields: flds, rows: tc_lit_rows(flds), local: tc_decl_in_root_package(decl), is_struct: true })
+    Some(LitOwner { shown: tc_nominal_type_name(decl), decl: decl, rows: tc_lit_rows(node_fields(decl)), is_struct: true })
 }
 
 fn tc_variant_literal_owner(var_idx: Int) -> Option[LitOwner] {
     let vdecl = tc_variant_decl_node(var_idx)
     if vdecl == -1 { return None }
     let edecl = evar_pool.get(var_idx).unwrap().enum_decl
-    let flds = node_fields(vdecl)
-    Some(LitOwner { shown: "{node_name(edecl)}.{node_name(vdecl)}", decl_fields: flds, rows: tc_lit_rows(flds), local: tc_decl_in_root_package(edecl), is_struct: false })
+    Some(LitOwner { shown: "{tc_nominal_type_name(edecl)}.{node_name(vdecl)}", decl: edecl, rows: tc_lit_rows(node_fields(vdecl)), is_struct: false })
 }
 
-// The labels of a literal or payload: its StructLitField and NamedArg nodes, in source order.
 fn tc_lit_labels(sl: Int) -> List[Int] {
     let mut labels: List[Int] = []
     if sl == -1 { return labels }
@@ -16062,54 +16073,52 @@ fn lit_list_text(items: List[Str]) -> Str {
     "{items.slice(0, LIT_FIELD_LIST_MAX).join(", ")} and {items.len() - LIT_FIELD_LIST_MAX} more"
 }
 
-fn tc_check_struct_literal(stid: Int, node: Int) ! Diag.Report {
-    match tc_struct_literal_owner(stid) {
-        Some(owner) => tc_report_literal_fields(owner, tc_lit_labels(node_fields(node)), tc_lit_spread(node_fields(node)), node, node)
-        None => {}
-    }
-}
-
-fn tc_check_variant_brace_literal(var_idx: Int, node: Int) ! Diag.Report {
-    if var_idx == -1 { return }
-    match tc_variant_literal_owner(var_idx) {
-        Some(owner) => {
+fn tc_check_brace_literal(owner: Option[LitOwner], node: Int) ! Diag.Report {
+    match owner {
+        Some(o) => {
             let spread = tc_lit_spread(node_fields(node))
-            tc_report_literal_fields(owner, tc_lit_labels(node_fields(node)), spread, node, node)
-            if spread != -1 { tc_report_variant_spread(owner, spread) }
+            tc_report_literal_fields(o, tc_lit_labels(node_fields(node)), spread, node, node)
+            if spread != -1 && !o.is_struct { tc_report_variant_spread(o, spread) }
         }
         None => {}
     }
 }
 
 // §3.4: an all-labelled payload takes the literal field checks in place of the argument count.
+// A label can name only a named field, so a variant with a positional field keeps the count.
 // Any other payload keeps the count, with a note that lists the fields in order, and its
 // labels still name fields.
 fn tc_check_variant_paren_payload(var_idx: Int, vname: Str, node: Int) ! TypeCheck.Report, Diag.Report {
     let args_sl = node_args(node)
     let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
     let labels = tc_lit_labels(args_sl)
+    let expected = variant_field_count(var_idx)
+    if labels.len() == 0 && got == expected { return }
     match tc_variant_literal_owner(var_idx) {
         Some(owner) => {
-            if got > 0 && labels.len() == got && owner.rows.len() > 0 {
+            if got > 0 && labels.len() == got && owner.rows.len() > 0 && owner.rows.len() == expected {
                 tc_report_literal_fields(owner, labels, -1, node, -1)
                 return
             }
-            tc_report_variant_arity(owner, var_idx, vname, got, node)
-            let faults = literal_field_faults(owner.rows, labels, true)
+            tc_report_variant_arity(owner.shown, var_idx, vname, got, node)
+            let faults = literal_field_faults(owner.rows, labels, false)
             for u in faults.unknowns { tc_report_unknown_label(owner, labels, u) }
         }
-        None => tc_report_variant_arity_bare(var_idx, vname, got, node)
+        None => tc_report_variant_arity("", var_idx, vname, got, node)
     }
 }
 
-fn tc_report_variant_arity(owner: LitOwner, var_idx: Int, vname: Str, got: Int, node: Int) ! TypeCheck.Report, Diag.Report {
+// The count error, with a note that lists the variant's fields when its declaration is known.
+fn tc_report_variant_arity(shown: Str, var_idx: Int, vname: Str, got: Int, node: Int) ! TypeCheck.Report, Diag.Report {
     let expected = variant_field_count(var_idx)
     if got == expected { return }
+    let vdecl = tc_variant_decl_node(var_idx)
+    let decl_fields = if vdecl != -1 { node_fields(vdecl) } else { -1 }
     let mut fields: List[Str] = []
-    if owner.decl_fields != -1 {
+    if decl_fields != -1 {
         let mut i = 0
-        while i < sublist_length(owner.decl_fields) {
-            let f = sublist_get(owner.decl_fields, i)
+        while i < sublist_length(decl_fields) {
+            let f = sublist_get(decl_fields, i)
             let t = type_ann_text(node_value(f))
             fields.push(if node_int_val(f) != 0 { t } else { "{node_name(f)} ({t})" })
             i = i + 1
@@ -16117,19 +16126,14 @@ fn tc_report_variant_arity(owner: LitOwner, var_idx: Int, vname: Str, got: Int, 
     }
     let msg = "variant `{vname}` expects {expected} argument(s), got {got}"
     tc_errors.push(msg)
-    let notes = if fields.len() > 0 { ["fields of `{owner.shown}`, in order: {lit_list_text(fields)}"] } else { [] }
+    let notes = if fields.len() > 0 { ["fields of `{shown}`, in order: {lit_list_text(fields)}"] } else { [] }
     diag_error_at_notes("TypeError", TYPE_ERROR, msg, node, "", notes)
-}
-
-fn tc_report_variant_arity_bare(var_idx: Int, vname: Str, got: Int, node: Int) ! TypeCheck.Report, Diag.Report {
-    let expected = variant_field_count(var_idx)
-    if got != expected { tc_error_at("variant `{vname}` expects {expected} argument(s), got {got}", node) }
 }
 
 // Every DuplicateField, then every NoSuchField, then MissingField (§2.14 Order). `lit` is the
 // brace literal a fill-in assist edits, or -1 for a paren payload.
 fn tc_report_literal_fields(owner: LitOwner, labels: List[Int], spread: Int, head: Int, lit: Int) ! Diag.Report {
-    let faults = literal_field_faults(owner.rows, labels, spread != -1)
+    let faults = literal_field_faults(owner.rows, labels, spread == -1)
     for d in faults.dups {
         diag_error_at_notes("DuplicateField", DUPLICATE_FIELD, "field `{node_name(d.at)}` is given twice", d.at,
             "remove one of the two", ["first given here: {node_line(d.first)}:{node_col(d.first)}"])
@@ -16139,14 +16143,15 @@ fn tc_report_literal_fields(owner: LitOwner, labels: List[Int], spread: Int, hea
     let mut shown: List[Str] = []
     let mut fill: List[Str] = []
     for r in faults.missing {
-        shown.push("`{r.name}` ({r.type_text})")
+        shown.push("`{r.name}` ({type_ann_text(node_value(r.field))})")
         fill.push("{r.name}: ")
     }
     let one = faults.missing.len() == 1
     let first = faults.missing.get(0).unwrap().name
-    let what = if one { "field {shown.get(0).unwrap()}" } else { "fields {lit_list_text(shown)}" }
+    // §2.14: the message names every missing field; only the help lists are trimmed.
+    let what = if one { "field {shown.get(0).unwrap()}" } else { "fields {shown.join(", ")}" }
     let mut help = if one { "add `{first}: ` and a value" } else { "add each missing field with a value" }
-    if owner.is_struct && owner.local {
+    if owner.is_struct && tc_decl_in_root_package(owner.decl) {
         help = if one { "{help}\nor give `{first}` a default in `{owner.shown}`" } else { "{help}\nor give each a default in `{owner.shown}`" }
     }
     let before = diag_entry_count()
@@ -16167,9 +16172,11 @@ fn tc_assist_fill_fields(lit: Int, labels: List[Int], fill: List[Str]) ! Diag.Re
     }
 }
 
+// A variant with no named field cannot take one beside its positional fields, so it gets no
+// "add the field" help.
 fn tc_report_unknown_label(owner: LitOwner, labels: List[Int], u: LitUnknown) ! Diag.Report {
     let name = node_name(u.at)
-    let add = if owner.local { "\nor add the field to `{owner.shown}`" } else { "" }
+    let add = if owner.rows.len() > 0 && tc_decl_in_root_package(owner.decl) { "\nor add the field to `{owner.shown}`" } else { "" }
     let msg = "`{owner.shown}` has no field `{name}`"
     if u.suggestion != "" {
         let before = diag_entry_count()
@@ -16180,13 +16187,12 @@ fn tc_report_unknown_label(owner: LitOwner, labels: List[Int], u: LitUnknown) ! 
         return
     }
     if owner.rows.len() == 0 {
-        diag_error_at("NoSuchField", NO_SUCH_FIELD, msg, u.at, "`{owner.shown}` has no named fields{add}")
+        diag_error_at("NoSuchField", NO_SUCH_FIELD, msg, u.at, "`{owner.shown}` has no named fields")
         return
     }
     diag_error_at("NoSuchField", NO_SUCH_FIELD, msg, u.at, "`{owner.shown}` declares: {lit_list_text(tc_declared_marks(owner, labels))}{add}")
 }
 
-// Each declared field, marked `(given)` when the literal labels it.
 fn tc_declared_marks(owner: LitOwner, labels: List[Int]) -> List[Str] {
     let mut given: Map[Str, Int] = Map()
     for l in labels { given.insert(node_name(l), 1) }
@@ -23662,7 +23668,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
                         check_deprecated_type(qual, node)
                         let edecl = tc_decl_node_for_type(type_to_str(qtid))
-                        tc_check_variant_brace_literal(get_variant_by_name(qtid, vname), node)
+                        tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(qtid, vname)), node)
                         return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
                     }
                     let etid = lookup_named_type(sname)
@@ -23685,7 +23691,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let site_t = tc_bare_variant_site_type(sname, node, None)
                     match tc_bare_variant_from_type(sname, None, site_t) {
                         BareVariantPick.Declared(_, hint_var_idx) => {
-                            tc_check_variant_brace_literal(hint_var_idx, node)
+                            tc_check_brace_literal(tc_variant_literal_owner(hint_var_idx), node)
                             // The hint answers the literal's own type without looking inside it, so the
                             // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
                             // left the inner literal's fields with nothing.
@@ -23726,7 +23732,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
                             // infers its concrete instance tid; non-generic keeps bare.
                             let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
-                            tc_check_variant_brace_literal(var_idx, node)
+                            tc_check_brace_literal(tc_variant_literal_owner(var_idx), node)
                             return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
                         }
                         BareVariantPick.Ambiguous(enums) => {
