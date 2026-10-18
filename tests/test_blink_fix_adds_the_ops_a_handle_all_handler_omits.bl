@@ -1,0 +1,299 @@
+// W0545 PartialHandler carries a machine-applicable fix (sections/04_effects.md §4.7.1). It
+// adds each omitted primitive operation with the exact signature from the effect declaration
+// and the body `default.op(args)`, in declaration order, inside the handler. An explicit
+// `default.op(args)` gives the same program as the omitted operation, so the fixed file runs
+// the same as before, as one unit and under --per-module, and checks with no W0545. The
+// warning also reaches a handler for an effect imported from another module, and the
+// [lints] table turns it off or into an error by name or code.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn dice() -> List[Str] {
+    [
+        "@handle_all",
+        "effect Dice \{",
+        "    effect Roll \{",
+        "        fn roll(sides: Int) -> Int",
+        "        fn coin() -> Bool",
+        "        fn pick(xs: List[Str], at: Int) -> Option[Str]",
+        "        fn twice(sides: Int) -> Int \{",
+        "            dice.roll(sides) + dice.roll(sides)",
+        "        }",
+        "    }",
+        "}",
+        "",
+        "fn real() -> Handler[Dice.Roll] \{",
+        "    handler Dice.Roll \{",
+        "        fn roll(sides: Int) -> Int \{ sides }",
+        "        fn coin() -> Bool \{ true }",
+        "        fn pick(xs: List[Str], at: Int) -> Option[Str] \{ xs.get(at) }",
+        "    }",
+        "}",
+        "",
+    ]
+}
+
+fn tail_lines() -> List[Str] {
+    [
+        "fn main() \{",
+        "    with real() \{",
+        "        with low() \{",
+        #"            let p = dice.pick(["a", "b"], 1) ?? "-""#,
+        #"            io.println("{dice.roll(6)} {dice.twice(6)} {dice.coin()} {p}")"#,
+        "        }",
+        "        with handler Dice.Roll \{ fn coin() -> Bool \{ false } } \{",
+        #"            io.println("{dice.roll(3)} {dice.coin()}")"#,
+        "        }",
+        "    }",
+        "}",
+    ]
+}
+
+fn partial_src() -> Str {
+    lines(dice().append([
+        "fn low() -> Handler[Dice.Roll] \{",
+        "    handler Dice.Roll \{",
+        "        fn roll(sides: Int) -> Int \{ 1 }",
+        "    }",
+        "}",
+        "",
+    ]).append(tail_lines()))
+}
+
+fn fixed_src() -> Str {
+    lines(dice().append([
+        "fn low() -> Handler[Dice.Roll] \{",
+        "    handler Dice.Roll \{",
+        "        fn roll(sides: Int) -> Int \{ 1 }",
+        "        fn coin() -> Bool \{ default.coin() }",
+        "        fn pick(xs: List[Str], at: Int) -> Option[Str] \{ default.pick(xs, at) }",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    with real() \{",
+        "        with low() \{",
+        #"            let p = dice.pick(["a", "b"], 1) ?? "-""#,
+        #"            io.println("{dice.roll(6)} {dice.twice(6)} {dice.coin()} {p}")"#,
+        "        }",
+        "        with handler Dice.Roll \{ fn coin() -> Bool \{ false }",
+        "            fn roll(sides: Int) -> Int \{ default.roll(sides) }",
+        "            fn pick(xs: List[Str], at: Int) -> Option[Str] \{ default.pick(xs, at) }",
+        "        } \{",
+        #"            io.println("{dice.roll(3)} {dice.coin()}")"#,
+        "        }",
+        "    }",
+        "}",
+    ]))
+}
+
+test "blink fix adds each omitted op as a forward, and the fixed file runs the same" {
+    let dir = sh("mktemp -d /tmp/blink_fix_w0545.XXXXXX").out.trim()
+    write_file("{dir}/dice.bl", partial_src())
+    let before = blink_in(dir, "run dice.bl")
+    assert_eq(before.exit_code, 0)
+    assert_eq(before.out, "1 2 true b\n3 false\n")
+
+    let r = blink_in(dir, "fix dice.bl")
+    let got = read_file("{dir}/dice.bl")
+    if got != fixed_src() {
+        io.println("want file:\n{fixed_src()}\ngot file:\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}")
+    }
+    assert(got == fixed_src())
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("dice.bl:24:5: W0545 add the omitted operations"))
+    assert(r.out.contains("2 fix(es) applied"))
+
+    // A second run finds nothing more to fix and edits nothing.
+    let again = blink_in(dir, "fix dice.bl")
+    assert(read_file("{dir}/dice.bl") == fixed_src())
+    assert(again.out.contains("0 fix(es) applied"))
+
+    let check = blink_in(dir, "check --json dice.bl")
+    if check.err_out.contains("W0545") || check.out.contains("W0545") { io.println(check.err_out) }
+    assert(!check.err_out.contains("W0545"))
+    assert(!check.out.contains("W0545"))
+
+    let after = blink_in(dir, "run dice.bl")
+    assert_eq(after.exit_code, 0)
+    assert_eq(after.out, before.out)
+    let per = blink_in(dir, "run --per-module dice.bl")
+    assert_eq(per.exit_code, 0)
+    assert_eq(per.out, before.out)
+    let _ = sh("rm -rf {dir}")
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+test "the LSP code action carries the same edit as blink fix" {
+    let dir = sh("mktemp -d /tmp/blink_lsp_w0545.XXXXXX").out.trim()
+    write_file("{dir}/dice.bl", partial_src())
+    let uri = "file://{dir}/dice.bl"
+    let td = "\"textDocument\":\{\"uri\":\"{uri}\"}"
+    let input = [
+        lsp_msg(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{{td}}}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/codeAction\",\"params\":\{{td},\"range\":\{\"start\":\{\"line\":21,\"character\":0},\"end\":\{\"line\":21,\"character\":0}},\"context\":\{\"diagnostics\":[]}}}"),
+        lsp_msg(#"{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"exit","params":{}}"#),
+    ].join("")
+    write_file("{dir}/input.bin", input)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 60 $B lsp < input.bin")
+    let want = "\"title\":\"add the omitted operations\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[\{\"range\":\{\"start\":\{\"line\":23,\"character\":4},\"end\":\{\"line\":23,\"character\":4}},\"newText\":\"    fn coin() -> Bool \{ default.coin() }\\n        fn pick(xs: List[Str], at: Int) -> Option[Str] \{ default.pick(xs, at) }\\n    \"}]}}}"
+    if !r.out.contains(want) { io.println("want: {want}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(r.out.contains(want))
+    let _ = sh("rm -rf {dir}")
+}
+
+fn dicedefs_src() -> Str {
+    lines([
+        "@handle_all",
+        "pub effect Dice \{",
+        "    effect Roll \{",
+        "        fn roll(sides: Int) -> Int",
+        "        fn coin() -> Bool",
+        "    }",
+        "}",
+    ])
+}
+
+fn importer_src() -> Str {
+    lines([
+        "import dicedefs.\{Dice}",
+        "",
+        "fn main() \{",
+        "    with handler Dice.Roll \{",
+        "        fn roll(sides: Int) -> Int \{ sides }",
+        "        fn coin() -> Bool \{ true }",
+        "    } \{",
+        "        with handler Dice.Roll \{",
+        "            fn roll(sides: Int) -> Int \{ 4 }",
+        "        } \{",
+        #"            io.println("{dice.roll(6)} {dice.coin()}")"#,
+        "        }",
+        "    }",
+        "}",
+    ])
+}
+
+test "a handler for an effect imported from another module warns, and runs per module" {
+    let out = compile_test_helpers.compile_xmod_capture(importer_src(), "dicedefs", dicedefs_src(), "w0545_import")
+    let _ = process_run("rm", ["-rf", ".tmp/w0545_import"])
+    if !out.contains("\"code\":\"W0545\"") { io.println(out) }
+    assert(out.contains("\"code\":\"W0545\""))
+    assert(out.contains("handler for `Dice.Roll` does not implement `coin`"))
+    assert(out.contains("\"line\":8"))
+
+    let r = compile_test_helpers.run_xmod(importer_src(), ".", "dicedefs", dicedefs_src(), "w0545_import_run")
+    let _ = process_run("rm", ["-rf", ".tmp/w0545_import_run"])
+    if r.exit_code != 0 { io.println(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "4 true\n")
+}
+
+fn lint_src() -> Str {
+    lines([
+        "@handle_all",
+        "effect Dice \{",
+        "    effect Roll \{",
+        "        fn roll(sides: Int) -> Int",
+        "        fn coin() -> Bool",
+        "    }",
+        "}",
+        "",
+        "fn low() -> Handler[Dice.Roll] \{",
+        "    handler Dice.Roll \{",
+        "        fn roll(sides: Int) -> Int \{ 1 }",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ }",
+    ])
+}
+
+fn rows(output: Str, severity: Str) -> Int {
+    let mut n = 0
+    for row in output.split("\n") {
+        if row.contains("\"code\":\"W0545\"") && row.contains("\"severity\":\"{severity}\"") { n = n + 1 }
+    }
+    n
+}
+
+test "the [lints] table turns W0545 off or into an error, by name or by code" {
+    let plain = compile_test_helpers.compile_pkg_and_capture(lint_src(), "", "w0545_lints_none")
+    assert_eq(rows(plain, "warning"), 1)
+    let off = compile_test_helpers.compile_pkg_and_capture(lint_src(), "PartialHandler = \"off\"", "w0545_lints_off")
+    assert_eq(rows(off, "warning") + rows(off, "error"), 0)
+    let err = compile_test_helpers.compile_pkg_and_capture(lint_src(), "W0545 = \"error\"", "w0545_lints_error")
+    assert_eq(rows(err, "error"), 1)
+    let _ = process_run("rm", ["-rf", ".tmp/w0545_lints_none", ".tmp/w0545_lints_off", ".tmp/w0545_lints_error"])
+}
+
+fn cfgdefs_src() -> Str {
+    lines([
+        "pub type Cfg \{",
+        "    x: Int",
+        "}",
+        "",
+        "@handle_all",
+        "pub effect Store \{",
+        "    effect Keep \{",
+        "        fn size() -> Int",
+        "        fn keep(c: Cfg, xs: List[Cfg]) -> Option[Cfg]",
+        "    }",
+        "}",
+    ])
+}
+
+fn cfg_main() -> Str {
+    lines(["import cfgdefs.\{Store}", "", "fn main() \{", "    with handler Store.Keep \{"].append([
+        "        fn size() -> Int \{ 7 }",
+        "    } \{",
+        #"        io.println("{store.size()}")"#,
+        "    }",
+        "}",
+    ]))
+}
+
+test "the fix spells a type the importing file has not selected with its module" {
+    let dir = sh("mktemp -d /tmp/blink_fix_w0545_import.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"w0545imp\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/cfgdefs.bl", cfgdefs_src())
+    write_file("{dir}/src/main.bl", cfg_main())
+    let r = blink_in(dir, "fix src/main.bl")
+    // The fix appends the clause after the handler's last one, so it lands below size().
+    let want = cfg_main().replace(
+        "        fn size() -> Int \{ 7 }\n",
+        "        fn size() -> Int \{ 7 }\n        fn keep(c: cfgdefs.Cfg, xs: List[cfgdefs.Cfg]) -> Option[cfgdefs.Cfg] \{ default.keep(c, xs) }\n")
+    let got = read_file("{dir}/src/main.bl")
+    if got != want { io.println("want file:\n{want}\ngot file:\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(got == want)
+
+    let check = blink_in(dir, "check src/main.bl")
+    if check.exit_code != 0 { io.println(check.err_out) }
+    assert_eq(check.exit_code, 0)
+    assert(!check.err_out.contains("W0545"))
+    assert(!check.err_out.contains("PartialHandler"))
+    let run = blink_in(dir, "run src/main.bl")
+    assert_eq(run.out, "7\n")
+    let per = blink_in(dir, "run --per-module src/main.bl")
+    assert_eq(per.out, "7\n")
+    let _ = sh("rm -rf {dir}")
+}

@@ -1,7 +1,8 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_of, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
-import unparse.{type_ann_text, unparse_expr}
+import unparse.{type_ann_text, type_ann_names, unparse_expr}
+import formatter.{effect_op_sig_text}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
@@ -22,7 +23,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_no_loc,
     diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
-    diag_warn_at, diag_warn_at_notes, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
+    diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
@@ -12875,7 +12876,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         while ei < sublist_length(effects_decl_sl) {
             let ed = sublist_get(effects_decl_sl, ei)
             let eff_name = node_name(ed)
-            register_ue_handle(str_to_lower(eff_name))
+            register_ue_handle(str_to_lower(eff_name), ed)
             register_ue_op_sigs(ed)
             tc_check_effect_op_names(ed)
             ei = ei + 1
@@ -12976,15 +12977,20 @@ fn tc_flush_unresolved_method_warnings() ! Diag.Report {
 
 // ── User-effect handle name tracking ────────────────────────────────
 
-let mut tc_ue_handles: List[Str] = []
+// An effect handle (the lowercased root effect name) and that root's EffectDecl node.
+type UeHandle {
+    handle: Str
+    decl: Int
+}
+let mut tc_ue_handles: List[UeHandle] = []
 
 // Effect operation declaration node -> the root effect declaring it. An operation is a
 // bodiless FnDef like any other, so this is what tells a call recorded against one apart
 // from a call of a function.
 let mut tc_ue_op_root: Map[Int, Int] = Map()
 
-fn register_ue_handle(name: Str) {
-    tc_ue_handles.push(name)
+fn register_ue_handle(name: Str, ed: Int) {
+    tc_ue_handles.push(UeHandle { handle: name, decl: ed })
 }
 
 // Register one fnsig per effect operation, keyed `{handle}.{op}` — the same
@@ -13229,14 +13235,175 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
 }
 
 pub fn is_user_effect_handle_name(name: Str) -> Int {
+    if tc_ue_handle_decl(name) != -1 { 1 } else { 0 }
+}
+
+// The root EffectDecl whose handle is `name`, or -1.
+fn tc_ue_handle_decl(name: Str) -> Int {
+    for h in tc_ue_handles {
+        if h.handle == name { return h.decl }
+    }
+    -1
+}
+
+// ── PartialHandler (W0545) ──────────────────────────────────────────
+// sections/04_effects.md §4.7.1. The check sits on the handler expression, so a literal, a
+// factory's tail and a handler bound to a value each warn once, wherever it is installed.
+
+// The primitive operations of `ops` that `implemented` does not name, appended in
+// declaration order. A derived operation has a body in the declaration, so it never counts.
+fn partial_handler_collect(ops: Int, implemented: Map[Str, Int], missing: List[Int]) {
+    if ops == -1 { return }
     let mut i = 0
-    while i < tc_ue_handles.len() {
-        if tc_ue_handles.get(i).unwrap() == name {
-            return 1
-        }
+    while i < sublist_length(ops) {
+        let op = sublist_get(ops, i)
+        if node_body(op) == -1 && !implemented.contains_key(node_name(op)) { missing.push(op) }
         i = i + 1
     }
-    0
+}
+
+fn partial_handler_touches(ops: Int, implemented: Map[Str, Int]) -> Bool {
+    if ops == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(ops) {
+        if implemented.contains_key(node_name(sublist_get(ops, i))) { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn partial_handler_child(ed: Int, name: Str) -> Int {
+    let children = node_elements(ed)
+    if children == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(children) {
+        let c = sublist_get(children, i)
+        if node_name(c) == name { return c }
+        i = i + 1
+    }
+    -1
+}
+
+// The clause the fix adds for `op` in module `here`: its declared signature, forwarding on
+// purpose. The declaration spells its types for its own module, so a type that module declares
+// and `here` does not reach by its bare name is spelled qualified.
+fn partial_handler_stub(op: Int, decl_mod: Str, here: Str) -> Str {
+    let mut args: List[Str] = []
+    let mut names: List[Str] = []
+    let params = node_params(op)
+    if params != -1 {
+        let mut i = 0
+        while i < sublist_length(params) {
+            let p = sublist_get(params, i)
+            args.push(node_name(p))
+            if node_type_ann(p) != -1 { type_ann_names(node_type_ann(p), names) } else { names.push(node_type_name(p)) }
+            i = i + 1
+        }
+    }
+    if node_type_ann(op) != -1 { type_ann_names(node_type_ann(op), names) } else { names.push(node_return_type(op)) }
+    let mut renames: Map[Str, Str] = Map()
+    if decl_mod != here {
+        for n in names {
+            let bare = nr_module_declares(here, n) == 0 && is_filtered_for_module(n, decl_mod, here) == 0
+            if nr_module_declares(decl_mod, n) != 0 && !bare {
+                renames.insert(n, "{tc_qualifier_for_module(decl_mod)}.{n}")
+            }
+        }
+    }
+    "{effect_op_sig_text(op, renames)} \{ default.{node_name(op)}({args.join(", ")}) }"
+}
+
+fn leading_whitespace(line: Str) -> Str {
+    let mut i = 0
+    while i < line.byte_len() && (line.byte_at(i) == 32 || line.byte_at(i) == 9) { i = i + 1 }
+    line.byte_slice(0, i)
+}
+
+// Adds the stubs before the handler's closing brace, one clause per line, indented one level
+// inside the handler. A brace that shares its line with code is moved to a line of its own.
+fn partial_handler_fix(he: Int, stubs: List[Str], action: Str) {
+    let file = diag_file_for_node(he)
+    let close_line = node_end_line(he)
+    let close_col = node_end_col(he)
+    let text = diag_source_line(file, close_line)
+    if close_line <= 0 || close_col <= 0 || text.byte_len() < close_col { return }
+    let before = text.byte_slice(0, close_col - 1)
+    if leading_whitespace(before) == before {
+        let mut add = ""
+        for stub in stubs { add = add.concat("    {stub}\n{before}") }
+        diag_set_last_fix_at(action, add, close_line, close_col, close_line, close_col)
+        return
+    }
+    let base = leading_whitespace(diag_source_line(file, node_line(he)))
+    let mut end = before.byte_len()
+    while end > 0 && (before.byte_at(end - 1) == 32 || before.byte_at(end - 1) == 9) { end = end - 1 }
+    let mut add = "\n"
+    for stub in stubs { add = add.concat("{base}    {stub}\n") }
+    diag_set_last_fix_at(action, add.concat(base), close_line, end + 1, close_line, close_col)
+}
+
+fn tc_check_partial_handler(he: Int) ! Diag.Report {
+    let eff = node_name(he)
+    let root = tc_handler_effect_root(eff)
+    let ed = tc_ue_handle_decl(str_to_lower(root))
+    if ed == -1 || node_name(ed) != root { return }
+    let root_marked = has_annotation(ed, "handle_all") != 0
+    let mut implemented: Map[Str, Int] = Map()
+    let clauses = node_methods(he)
+    if clauses != -1 {
+        let mut i = 0
+        while i < sublist_length(clauses) {
+            implemented.insert(node_name(sublist_get(clauses, i)), 1)
+            i = i + 1
+        }
+    }
+    let mut missing: List[Int] = []
+    let mut marked: List[Str] = []
+    if eff == root {
+        let children = node_elements(ed)
+        if children != -1 {
+            let mut i = 0
+            while i < sublist_length(children) {
+                let child = sublist_get(children, i)
+                let ops = node_methods(child)
+                let child_marked = root_marked || has_annotation(child, "handle_all") != 0
+                if child_marked && partial_handler_touches(ops, implemented) {
+                    let before = missing.len()
+                    partial_handler_collect(ops, implemented, missing)
+                    let label = if root_marked { root } else { "{root}.{node_name(child)}" }
+                    if missing.len() > before && !marked.contains(label) { marked.push(label) }
+                }
+                i = i + 1
+            }
+        }
+    } else {
+        let child = partial_handler_child(ed, eff.byte_slice(root.byte_len() + 1, eff.byte_len()))
+        if child == -1 { return }
+        if root_marked || has_annotation(child, "handle_all") != 0 {
+            partial_handler_collect(node_methods(child), implemented, missing)
+            marked.push(if root_marked { root } else { eff })
+        }
+    }
+    if missing.len() == 0 { return }
+    let mut names: List[Str] = []
+    let mut stubs: List[Str] = []
+    for op in missing {
+        names.push("`{node_name(op)}`")
+        stubs.push(partial_handler_stub(op, node_module(ed), nr_current_module))
+    }
+    let one = missing.len() == 1
+    let pronoun = if one { "it" } else { "them" }
+    let mut notes: List[Str] = []
+    for m in marked { notes.push("`{m}` is marked `@handle_all`") }
+    notes.push("omitted operations go to the enclosing handler")
+    let before = diag_entry_count()
+    diag_warn_span_at_notes("PartialHandler", PARTIAL_HANDLER,
+        "handler for `{eff}` does not implement {names.join(", ")}", he,
+        node_col(he) + "handler ".byte_len() + eff.byte_len(),
+        "implement {pronoun}, or forward on purpose: `{stubs.get(0).unwrap()}`", notes)
+    // A silenced warning records no entry, and the fix would land on someone else's.
+    if diag_entry_count() == before { return }
+    partial_handler_fix(he, stubs, if one { "add the omitted operation" } else { "add the omitted operations" })
 }
 
 // ── Selective import filtering ──────────────────────────────────────
@@ -26498,6 +26665,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // call argument, written inline in a `with`, or bound to a `let`. The WithBlock arm
     // above already routes an inline handler here, so this arm is what actually walks it.
     if kind == NodeKind.HandlerExpr {
+        tc_check_partial_handler(node)
         let hm_sl = node_methods(node)
         if hm_sl != -1 {
             let mut hi = 0

@@ -1,0 +1,375 @@
+// W0545 PartialHandler (sections/04_effects.md §4.7.1 *Whole-handler effects*). An effect
+// marked `@handle_all` has operations that are views of one resource, so a handler expression
+// for it that omits a primitive operation mixes two resources. The warning sits on the handler
+// expression, so a literal, a factory and a handler bound to a value all warn once, wherever
+// the handler is later installed. A derived operation never counts. A sub-effect handler
+// counts only its own operations; a parent handler counts a marked sub-effect only once it
+// implements one of its operations. Writing the operation, `@allow(PartialHandler)` and the
+// [lints] table each silence it. `@handle_all` attaches to an effect declaration only.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, lint_set_override}
+import std.io
+
+fn probe(name: Str, src: Str, lint: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    // A path per row: the fix reads the handler's source lines, and they are cached by path.
+    let path = "build/w0545_{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    // After compile_to_program, which resets the [lints] table it loads from the manifest.
+    if lint != "" { lint_set_override(lint, "off") }
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn partial_warnings() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            out.push("{d.severity} {d.code} {d.line}:{d.col} {d.message} | {d.help} | {d.notes.join(" / ")}")
+        }
+    }
+    out
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn expect(label: Str, want: Int) -> List[Str] {
+    let errs = errors()
+    if errs.len() != 0 {
+        io.println("FAIL: {label}: the probe has errors:")
+        for e in errs { io.println("  {e}") }
+    }
+    assert(errs.len() == 0)
+    let hits = partial_warnings()
+    if hits.len() != want {
+        io.println("FAIL: {label}: PartialHandler raised {hits.len()} time(s), want {want}")
+        for m in hits { io.println("  {m}") }
+    }
+    assert(hits.len() == want)
+    hits
+}
+
+fn expect_eq(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}")
+    }
+    assert(got == want)
+}
+
+fn dice_src(body: Str) -> Str {
+    #"@handle_all
+effect Dice {
+    effect Roll {
+        fn roll(sides: Int) -> Int
+        fn coin() -> Bool
+        fn pick(xs: List[Str]) -> Option[Str]
+        fn twice(sides: Int) -> Int {
+            dice.roll(sides) + dice.roll(sides)
+        }
+    }
+}
+
+"#.concat(body)
+}
+
+test "a handler that omits one primitive op warns with the spec's text and a fix" {
+    probe("one", dice_src(#"fn fixed() -> Handler[Dice.Roll] {
+    handler Dice.Roll {
+        fn roll(sides: Int) -> Int { 4 }
+        fn pick(xs: List[Str]) -> Option[Str] { xs.get(0) }
+    }
+}
+"#), "")
+    let hits = expect("one omitted", 1)
+    expect_eq("one omitted", hits.get(0).unwrap(), "warning W0545 14:5 handler for `Dice.Roll` does not implement `coin` | implement it, or forward on purpose: `fn coin() -> Bool \{ default.coin() }` | `Dice` is marked `@handle_all` / omitted operations go to the enclosing handler")
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            expect_eq("one omitted fix action", d.fix_action, "add the omitted operation")
+            expect_eq("one omitted fix text", d.fix_text, "    fn coin() -> Bool \{ default.coin() }\n    ")
+            assert_eq(d.fix_line, 17)
+            assert_eq(d.fix_col, 5)
+            assert_eq(d.fix_end_line, 17)
+            assert_eq(d.fix_end_col, 5)
+        }
+    }
+}
+
+test "every omitted op is named once, in declaration order, and the fix adds them in that order" {
+    probe("several", dice_src(#"fn main() {
+    let h = handler Dice.Roll {
+        fn coin() -> Bool { true }
+    }
+    with h { io.println("{dice.coin()}") }
+}
+"#), "")
+    let hits = expect("several omitted", 1)
+    let got = hits.get(0).unwrap()
+    assert(got.contains("handler for `Dice.Roll` does not implement `roll`, `pick` |"))
+    assert(got.contains("| implement them, or forward on purpose: `fn roll(sides: Int) -> Int \{ default.roll(sides) }` |"))
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            expect_eq("several fix action", d.fix_action, "add the omitted operations")
+            expect_eq("several fix text", d.fix_text, "    fn roll(sides: Int) -> Int \{ default.roll(sides) }\n        fn pick(xs: List[Str]) -> Option[Str] \{ default.pick(xs) }\n    ")
+        }
+    }
+}
+
+test "a derived op left out never counts" {
+    probe("derived", dice_src(#"fn main() {
+    with handler Dice.Roll {
+        fn roll(sides: Int) -> Int { 4 }
+        fn coin() -> Bool { true }
+        fn pick(xs: List[Str]) -> Option[Str] { None }
+    } {
+        io.println("{dice.twice(6)}")
+    }
+}
+"#), "")
+    let _ = expect("derived omitted", 0)
+}
+
+test "writing the op with any body silences it" {
+    probe("any_body", dice_src(#"fn main() {
+    with handler Dice.Roll {
+        fn roll(sides: Int) -> Int { default.roll(sides) }
+        fn coin() -> Bool { false }
+        fn pick(xs: List[Str]) -> Option[Str] { None }
+    } {
+        io.println("{dice.coin()}")
+    }
+}
+"#), "")
+    let _ = expect("every op written", 0)
+}
+
+fn kv_src(root_mark: Str, get_mark: Str, body: Str) -> Str {
+    "{root_mark}effect Kv \{\n    {get_mark}effect Get \{\n        fn get(k: Str) -> Int\n        fn has(k: Str) -> Bool\n    }\n    effect Put \{\n        fn put(k: Str, v: Int)\n        fn drop_all()\n    }\n}\n\n{body}"
+}
+
+test "a sub-effect handler counts only the ops of its own sub-effect" {
+    probe("sub_only", kv_src("@handle_all\n", "", #"fn reader() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn get(k: Str) -> Int { 1 }
+        fn has(k: Str) -> Bool { true }
+    }
+}
+
+fn writer() -> Handler[Kv.Put] {
+    handler Kv.Put {
+        fn put(k: Str, v: Int) { }
+    }
+}
+"#), "")
+    let hits = expect("sub-effect", 1)
+    assert(hits.get(0).unwrap().contains("handler for `Kv.Put` does not implement `drop_all` |"))
+}
+
+test "a parent handler counts a marked sub-effect only once it implements one of its ops" {
+    // Only Kv.Get is marked; this handler touches Kv.Put alone.
+    probe("parent_untouched", kv_src("", "@handle_all\n    ", #"fn writer() -> Handler[Kv] {
+    handler Kv {
+        fn put(k: Str, v: Int) { }
+    }
+}
+"#), "")
+    let _ = expect("parent, marked sub-effect untouched", 0)
+
+    probe("parent_touched", kv_src("", "@handle_all\n    ", #"fn half() -> Handler[Kv] {
+    handler Kv {
+        fn get(k: Str) -> Int { 1 }
+        fn put(k: Str, v: Int) { }
+    }
+}
+"#), "")
+    let hits = expect("parent, marked sub-effect touched", 1)
+    let got = hits.get(0).unwrap()
+    assert(got.contains("handler for `Kv` does not implement `has` |"))
+    // The mark sits on the sub-effect, so the note names the sub-effect.
+    assert(got.contains("| `Kv.Get` is marked `@handle_all` / "))
+
+    // A root mark covers each sub-effect, and each one still counts only once touched.
+    probe("parent_root_marked", kv_src("@handle_all\n", "", #"fn half() -> Handler[Kv] {
+    handler Kv {
+        fn get(k: Str) -> Int { 1 }
+        fn put(k: Str, v: Int) { }
+    }
+}
+
+fn empty() -> Handler[Kv] {
+    handler Kv { }
+}
+"#), "")
+    let hits2 = expect("parent, root marked", 1)
+    assert(hits2.get(0).unwrap().contains("handler for `Kv` does not implement `has`, `drop_all` |"))
+}
+
+test "an effect without the mark never warns" {
+    probe("unmarked", kv_src("", "", #"fn reader() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn get(k: Str) -> Int { 1 }
+    }
+}
+"#), "")
+    let _ = expect("unmarked", 0)
+}
+
+test "a factory, a bound handler and a handler argument each warn once, at the expression" {
+    probe("forms", dice_src(#"fn always_four() -> Handler[Dice.Roll] {
+    handler Dice.Roll {
+        fn roll(sides: Int) -> Int { 4 }
+        fn pick(xs: List[Str]) -> Option[Str] { None }
+    }
+}
+
+fn run_with(h: Handler[Dice.Roll]) -> Bool {
+    with h { dice.coin() }
+}
+
+fn main() {
+    with always_four() { io.println("{dice.roll(6)}") }
+    with always_four() { io.println("{dice.roll(6)}") }
+    let bound = handler Dice.Roll {
+        fn coin() -> Bool { true }
+        fn pick(xs: List[Str]) -> Option[Str] { None }
+    }
+    with bound { io.println("{dice.coin()}") }
+    let r = run_with(handler Dice.Roll {
+        fn roll(sides: Int) -> Int { 1 }
+        fn coin() -> Bool { false }
+    })
+    io.println("{r}")
+}
+"#), "")
+    let hits = expect("factory, bound, argument", 3)
+    assert(hits.get(0).unwrap().contains("warning W0545 14:5 handler for `Dice.Roll` does not implement `coin` |"))
+    assert(hits.get(1).unwrap().contains("warning W0545 27:17 handler for `Dice.Roll` does not implement `roll` |"))
+    assert(hits.get(2).unwrap().contains("warning W0545 32:22 handler for `Dice.Roll` does not implement `pick` |"))
+}
+
+test "a handler in a test block warns like any other" {
+    probe("in_test", dice_src(#"test "rolls" {
+    with handler Dice.Roll {
+        fn roll(sides: Int) -> Int { 4 }
+    } {
+        assert_eq(dice.roll(6), 4)
+    }
+}
+"#), "")
+    let hits = expect("in a test", 1)
+    assert(hits.get(0).unwrap().contains("does not implement `coin`, `pick` |"))
+}
+
+fn allow_src() -> Str {
+    dice_src(#"@allow(PartialHandler)
+fn always_four() -> Handler[Dice.Roll] {
+    handler Dice.Roll {
+        fn roll(sides: Int) -> Int { 4 }
+    }
+}
+
+fn main() {
+    with always_four() { io.println("{dice.roll(6)}") }
+}
+"#)
+}
+
+test "@allow(PartialHandler) on the enclosing fn silences it" {
+    probe("allow", allow_src(), "")
+    let _ = expect("allow", 0)
+}
+
+fn lint_src() -> Str {
+    dice_src(#"fn always_four() -> Handler[Dice.Roll] {
+    handler Dice.Roll {
+        fn roll(sides: Int) -> Int { 4 }
+    }
+}
+"#)
+}
+
+test "the lint table silences it by name and by code" {
+    probe("lint_name", lint_src(), "PartialHandler")
+    let _ = expect("lint off by name", 0)
+    probe("lint_code", lint_src(), "W0545")
+    let _ = expect("lint off by code", 0)
+}
+
+test "the fix spells each op signature as the effect declares it" {
+    probe("sigs", #"@handle_all
+effect Store {
+    effect Ops {
+        fn find(keys: List[Str], pred: fn(Int) -> Bool) -> Option[(Int, Str)]
+        fn load(path: Str, limit: Int) -> Result[Map[Str, Int], Str]
+        fn reset()
+    }
+}
+
+fn main() {
+    let h = handler Store.Ops { fn reset() { } }
+    with h { store.reset() }
+}
+"#, "")
+    let _ = expect("signatures", 1)
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            // The handler closes on its own line, so the ops go on new lines before the `}`.
+            expect_eq("signature fix", d.fix_text, "\n        fn find(keys: List[Str], pred: fn(Int) -> Bool) -> Option[(Int, Str)] \{ default.find(keys, pred) }\n        fn load(path: Str, limit: Int) -> Result[Map[Str, Int], Str] \{ default.load(path, limit) }\n    ")
+        }
+    }
+}
+
+fn errors_named(name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == name { out.push("{d.code} {d.line}:{d.col} {d.message}") }
+    }
+    out
+}
+
+test "@handle_all on anything but an effect is an UnexpectedAnnotation" {
+    write_file("build/w0545_misplaced.bl", #"@handle_all
+fn f() -> Int { 1 }
+
+@handle_all
+type Point { x: Int }
+
+fn main() {
+    io.println("{f()}")
+}
+"#)
+    let _ = compile_to_program("build/w0545_misplaced.bl", 1)
+    let _ = fs.delete("build/w0545_misplaced.bl")
+    let hits = errors_named("UnexpectedAnnotation")
+    if hits.len() != 2 {
+        for h in hits { io.println("  {h}") }
+    }
+    assert_eq(hits.len(), 2)
+    expect_eq("on a fn", hits.get(0).unwrap(), "E1110 1:1 @handle_all is only allowed on an effect declaration")
+    expect_eq("on a type", hits.get(1).unwrap(), "E1110 4:1 @handle_all is only allowed on an effect declaration")
+}
+
+test "an annotation inside an effect body must precede a sub-effect" {
+    write_file("build/w0545_dangling.bl", #"effect Kv {
+    effect Get {
+        fn get(k: Str) -> Int
+    }
+    @handle_all
+}
+
+fn main() { }
+"#)
+    let _ = compile_to_program("build/w0545_dangling.bl", 1)
+    let _ = fs.delete("build/w0545_dangling.bl")
+    let hits = errors_named("UnexpectedAnnotation")
+    assert_eq(hits.len(), 1)
+    expect_eq("dangling", hits.get(0).unwrap(), "E1110 5:5 @handle_all in effect `Kv` is not followed by a sub-effect")
+}
