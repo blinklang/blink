@@ -116,7 +116,7 @@ When a trait bound fails because `Never` has no impl of the trait (E0306), the e
 
 Strings are not bare character arrays. They are UTF-8 encoded, immutable values with a method surface designed to be complete enough that 90% of programs never need a string utility library. Methods are organized into two traits: `Sized` (generic, shared with collections) and `StrOps` (string-specific).
 
-**Every `Str` is valid UTF-8.** Every safe way to make a `Str` gives valid UTF-8: literals, interpolation, the `Str` methods, `StringBuilder`, and `Bytes.to_str`, which returns `Err` on input that is not valid UTF-8. A `Str` that comes in through `@ffi` or `@trusted` code (§9) must also be valid UTF-8. The compiler cannot check that, so the author of that boundary must make sure of it. The codepoint methods and the `byte_slice` boundary check depend on this invariant.
+**Every `Str` is valid UTF-8.** Every safe way to make a `Str` gives valid UTF-8: literals, interpolation, the `Str` methods, `StringBuilder`, and `Bytes.to_str`, which returns `Err` on input that is not valid UTF-8 or that holds a NUL byte (a `Str` cannot hold NUL). A `Str` that comes in through `@ffi` or `@trusted` code (§9) must also be valid UTF-8. The compiler cannot check that, so the author of that boundary must make sure of it. The codepoint methods and the `byte_slice` boundary check depend on this invariant.
 
 ##### The `Sized` Trait
 
@@ -1101,7 +1101,7 @@ fn encode(s: Str) -> Bytes {
 }
 
 fn decode(b: Bytes) -> Result[Str, ConversionError] {
-    b.to_str()                  // validates UTF-8
+    b.to_str()                  // Err unless valid UTF-8 with no NUL
 }
 ```
 
@@ -1114,7 +1114,7 @@ fn decode(b: Bytes) -> Result[Str, ConversionError] {
 | `get` | `fn(self, Int) -> Option[U8]` | Byte at index |
 | `slice` | `fn(self, Int, Int) -> Bytes` | Sub-buffer `[start, end)` (copy); clamps (§3.2.1 *Out-of-range indices*) |
 | `concat` | `fn(self, Bytes) -> Bytes` | Concatenation |
-| `to_str` | `fn(self) -> Result[Str, ConversionError]` | UTF-8 decode |
+| `to_str` | `fn(self) -> Result[Str, ConversionError]` | UTF-8 decode; `Err` on bad UTF-8 or a NUL byte |
 | `to_hex` | `fn(self) -> Str` | Hex string |
 | `to_list` | `fn(self) -> List[U8]` | Convert to list |
 | `from_str` | `fn(Str) -> Bytes` | UTF-8 encode |

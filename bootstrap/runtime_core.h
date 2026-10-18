@@ -2213,14 +2213,16 @@ BLINK_RT_FN int64_t blink_utf8_bad_offset(const uint8_t* p, int64_t n, const cha
     int64_t i = 0;
     while (i < n) {
         uint8_t c = p[i];
+        /* One unsigned compare takes bytes 1-0x7F, so the NUL check costs the ASCII path
+           no second branch. */
+        if ((uint8_t)(c - 1) < 0x7F) { i++; continue; }
+        /* Text crosses into C as a NUL-terminated string, so a NUL would end it early. */
+        if (c == 0) { *why = blink_utf8_err_nul.d; return i; }
         int64_t seq_len;
         /* The second byte's range is what rules out an overlong form, a surrogate
            (U+D800-DFFF) and a code point past U+10FFFF (RFC 3629 section 4). */
         uint8_t lo = 0x80, hi = 0xBF;
-        /* Text crosses into C as a NUL-terminated string, so a NUL would end it early. */
-        if (c == 0) { *why = blink_utf8_err_nul.d; return i; }
-        if (c < 0x80) { i++; continue; }
-        else if (c < 0xC0) { *why = blink_utf8_err_continuation.d; return i; }
+        if (c < 0xC0) { *why = blink_utf8_err_continuation.d; return i; }
         else if (c < 0xC2) { *why = blink_utf8_err_overlong.d; return i; }
         else if (c < 0xE0) { seq_len = 2; }
         else if (c < 0xF0) { seq_len = 3; if (c == 0xE0) lo = 0xA0; if (c == 0xED) hi = 0x9F; }

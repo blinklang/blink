@@ -127,8 +127,12 @@ BLINK_RT_FN const char* blink_stdin_take_text(int64_t n, int64_t skip, blink_std
 BLINK_RT_FN const char* blink_stdin_take_text(int64_t n, int64_t skip, blink_stdin_fault_t* f) {
     blink_stdin_reader_t* r = &blink_stdin_reader;
     const uint8_t* p = r->data + r->start;
-    int64_t bad = blink_utf8_bad_offset(p, n, &f->why);
-    if (bad >= 0) f->at = r->taken + bad;
+    const char* why = NULL;
+    int64_t bad = blink_utf8_bad_offset(p, n, &why);
+    if (bad >= 0) {
+        f->why = why;
+        f->at = r->taken + bad;
+    }
     const char* s = bad < 0 ? blink_str_from_bytes_gc((const char*)p, n) : NULL;
     blink_stdin_advance(n + skip);
     return s;

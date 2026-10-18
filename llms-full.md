@@ -734,7 +734,7 @@ let first_two = names
 | `.is_empty()` | Bool | Check if empty |
 | `.slice(start, end)` | Bytes | Sub-buffer |
 | `.concat(other)` | Bytes | Concatenate |
-| `.to_str()` | Result[Str, Str] | Convert to UTF-8 string |
+| `.to_str()` | Result[Str, Str] | Convert to UTF-8 string; Err on bad UTF-8 or a NUL byte |
 | `.to_hex()` | Str | Hex encoding |
 | `.read_u16_be(offset)` | Result[Int, Str] | Read unsigned 16-bit big-endian at offset |
 | `.read_u16_le(offset)` | Result[Int, Str] | Read unsigned 16-bit little-endian at offset |
