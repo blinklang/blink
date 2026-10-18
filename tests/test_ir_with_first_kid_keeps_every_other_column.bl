@@ -1,0 +1,63 @@
+import std.io
+import ir.{
+    IrKind, ir_reset, ir_kind, ir_kid, ir_kid_count, ir_tid, ir_span, ir_c_spelling, ir_c_name,
+    ir_slot_form, ir_slot_form_name, ir_gc_layout, ir_must_materialize, ir_mark_materialize,
+    ir_var_ref, ir_box, ir_box_into, ir_container_spread, ir_with_first_kid,
+}
+import layout.{SlotForm}
+// lexer and parser read the trace globals that compiler.bl owns, so a test that imports
+// typecheck through layout must load compiler as well.
+import compiler.{compile_to_program}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn assert_eq_str(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}: got '{got}' want '{want}'") }
+    assert_eq(got, want)
+}
+
+fn int_var(name: Str) -> Int { ir_var_ref(1, 0, "int64_t", name, SlotForm.InlineWord) }
+fn list_var(name: Str) -> Int { ir_var_ref(4, 0, "blink_list*", name, SlotForm.InlineWord) }
+
+// A stage that moves a wrapper's operand into a temp rebuilds the wrapper around the temp.
+// A box made for a promotion carries the promotion as its second kid; losing it would
+// allocate the copy in the arena that is about to die.
+test "a promotion box keeps its promotion kid when its value is swapped" {
+    ir_reset()
+    let ctx = int_var("ctx")
+    let boxed = ir_box_into(7, 3, "Foo*", "Foo", int_var("a"), ctx)
+    let held = int_var("held")
+    let again = ir_with_first_kid(boxed, held)
+    assert_eq_str("kind", if ir_kind(again) == IrKind.Box { "Box" } else { "other" }, "Box")
+    assert_eq_int("kid count", ir_kid_count(again), 2)
+    assert_eq_int("value kid", ir_kid(again, 0), held)
+    assert_eq_int("promotion kid", ir_kid(again, 1), ctx)
+    assert_eq_int("tid", ir_tid(again), 7)
+    assert_eq_int("span", ir_span(again), 3)
+    assert_eq_str("spelling", ir_c_spelling(again), "Foo*")
+    assert_eq_str("pointee", ir_c_name(again), "Foo")
+    assert_eq_str("slot", ir_slot_form_name(ir_slot_form(again)), "PointerBoxed")
+}
+
+test "a box keeps its gc layout and its materialize mark when its value is swapped" {
+    ir_reset()
+    let boxed = ir_box(7, 0, "Foo*", "Foo", int_var("a"))
+    ir_mark_materialize(boxed)
+    let again = ir_with_first_kid(boxed, int_var("held"))
+    assert_eq_str("gc layout", ir_gc_layout(again), ir_gc_layout(boxed))
+    assert_eq_int("mark", ir_must_materialize(again), 1)
+}
+
+test "a spread keeps its extend symbol when its source is swapped" {
+    ir_reset()
+    let sp = ir_container_spread(4, 0, "blink_list*", "blink_list_extend", list_var("xs"))
+    let held = list_var("held")
+    let again = ir_with_first_kid(sp, held)
+    assert_eq_int("one kid", ir_kid_count(again), 1)
+    assert_eq_int("source kid", ir_kid(again, 0), held)
+    assert_eq_str("extend symbol", ir_c_name(again), "blink_list_extend")
+    assert_eq_int("unmarked", ir_must_materialize(again), 0)
+}
