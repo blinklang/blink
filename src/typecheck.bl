@@ -15890,28 +15890,26 @@ type EnumReach {
     Unreachable
 }
 
-// What the enum `bare` declared in `src_mod` is to module `reader`. A prelude carrier has no
-// declaration (`carrier`); it is in every module's scope unless the module binds the name.
-fn tc_enum_reach(bare: Str, src_mod: Str, carrier: Bool, reader: Str) -> EnumReach {
-    if !carrier && (src_mod == reader || (tc_module_key_is_main(src_mod) != 0 && tc_module_key_is_main(reader) != 0)) {
+// What the candidate `decl` is to module `reader`, by the spellings that resolve there to that
+// very declaration. -1 is the prelude carrier `bare`: it has no declaration and is in every
+// module's scope unless the module binds the name.
+fn tc_enum_reach(decl: Int, bare: Str, reader: Str) -> EnumReach {
+    let binds = nr_module_import_index(reader)
+    let taken = nr_module_declares(reader, bare) != 0 || binds.contains_key(bare)
+    if decl == -1 { return if taken { EnumReach.Unreachable } else { EnumReach.Named(bare) } }
+    let src_mod = node_module(decl)
+    if src_mod == reader || (tc_module_key_is_main(src_mod) != 0 && tc_module_key_is_main(reader) != 0) {
         return EnumReach.Named(bare)
     }
-    let binds = nr_module_import_index(reader)
-    let mut alias = ""
-    if !carrier {
-        for bound in binds.keys() {
-            for b in binds.get(bound) ?? [] {
-                if b.source_mod == src_mod && b.member == bare {
-                    if bound == bare { return EnumReach.Named(bare) }
-                    if alias == "" { alias = bound }
-                }
-            }
-        }
+    // Only a spelling the file's own imports bind counts, so a facade's re-export or an alias
+    // is followed to the declaration. Sorted, so two aliases of one enum give one answer.
+    if nr_resolve_imported_decl(bare, reader) == decl { return EnumReach.Named(bare) }
+    for bound in binds.keys().sort() {
+        if nr_resolve_imported_decl(bound, reader) == decl { return EnumReach.Named(bound) }
     }
-    if alias != "" { return EnumReach.Named(alias) }
-    if nr_module_declares(reader, bare) != 0 || binds.contains_key(bare) { return EnumReach.Unreachable }
-    if carrier || tc_prelude_modules.contains_key(src_mod) { return EnumReach.Named(bare) }
-    if tc_module_key_is_main(src_mod) != 0 { return EnumReach.Unreachable }
+    if taken { return EnumReach.Unreachable }
+    if tc_prelude_modules.contains_key(src_mod) { return EnumReach.Named(bare) }
+    if tc_module_key_is_main(src_mod) != 0 || node_is_pub(decl) == 0 { return EnumReach.Unreachable }
     EnumReach.Importable
 }
 
@@ -15920,43 +15918,43 @@ fn tc_enum_reach(bare: Str, src_mod: Str, carrier: Bool, reader: Str) -> EnumRea
 // reach gets a note with that import, and one whose name means something else there gets
 // nothing, since no spelling of it resolves.
 fn tc_report_ambiguous_construction(name: Str, carrier: Option[TyKind], enums: List[Int], node: Int) ! Diag.Report {
-    let mut bares: List[Str] = []
-    let mut mods: List[Str] = []
-    match carrier {
-        Some(k) => {
-            bares.push(tc_prelude_carrier_name(k))
-            // The home sections/07_trust_modules_metadata.md gives the compiler-known types.
-            mods.push("blink.core")
-        }
-        None => {}
+    let carrier_name = match carrier {
+        Some(k) => tc_prelude_carrier_name(k)
+        None => ""
     }
+    let mut cands: List[Int] = []
+    if carrier_name != "" { cands.push(-1) }
     for e in enums {
-        bares.push(node_name(e))
-        mods.push(node_module(e))
+        cands.push(e)
     }
-    let carriers = if carrier.is_some() { 1 } else { 0 }
     let mut seen: Map[Str, Int] = Map()
-    for b in bares {
-        seen.insert(b, (seen.get(b) ?? 0) + 1)
+    for c in cands {
+        let bare = if c == -1 { carrier_name } else { node_name(c) }
+        seen.insert(bare, (seen.get(bare) ?? 0) + 1)
     }
     let mut owners: List[Str] = []
     let mut quals: List[Str] = []
     let mut notes: List[Str] = []
-    let mut i = 0
-    while i < bares.len() {
-        let bare = bares.get(i).unwrap()
-        let m = mods.get(i).unwrap()
+    for c in cands {
+        let bare = if c == -1 { carrier_name } else { node_name(c) }
+        // The home sections/07_trust_modules_metadata.md gives the compiler-known types.
+        let m = if c == -1 { "blink.core" } else { node_module(c) }
         owners.push(if (seen.get(bare) ?? 0) > 1 { tc_name_with_module(bare, m) } else { bare })
-        match tc_enum_reach(bare, m, i < carriers, nr_current_module) {
+        match tc_enum_reach(c, bare, nr_current_module) {
             EnumReach.Named(q) => quals.push("{q}.{name}")
-            EnumReach.Importable => notes.push("add `{bare}` to your import: `import {tc_get_dotted_module_path(m)}.\{{bare}\}` then use `{bare}.{name}`")
+            EnumReach.Importable => notes.push(tc_import_help(bare, tc_get_dotted_module_path(m), name))
             EnumReach.Unreachable => {}
         }
-        i = i + 1
     }
     let both = if owners.len() == 2 { "both " } else { "" }
     let qualify = if quals.len() == 0 { "" } else { "; qualify as {tc_series(quals, "or")}" }
     diag_error_at_notes("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "`{name}` is a variant of {both}{tc_series(owners, "and")}{qualify}", node, "write the enum before the variant, or give the site an expected type", notes)
+}
+
+// How to reach `ty.member` when `ty` is not selected: the same words wherever a type
+// qualifier is missing from the import list.
+fn tc_import_help(ty: Str, dotted_mod: Str, member: Str) -> Str {
+    "add `{ty}` to your import: `import {dotted_mod}.\{{ty}\}` then use `{ty}.{member}`"
 }
 
 // `a`, `a and b`, `a, b and c`: a list as a sentence names it.
@@ -18517,7 +18515,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                             tc_mark_symbol_used(mid_field)
                             tc_mark_symbol_used(outer_field)
                             let dotted_mod = tc_get_dotted_module_path(inner_name)
-                            diag_error_at("ModuleQualifiedType", MODULE_QUALIFIED_TYPE, "cannot access type member `{mid_field}.{outer_field}` via module qualifier — add `{mid_field}` to your import: `import {dotted_mod}.\{{mid_field}\}` then use `{mid_field}.{outer_field}`", node, "enum variants and type members use type qualifiers, not module qualifiers")
+                            diag_error_at("ModuleQualifiedType", MODULE_QUALIFIED_TYPE, "cannot access type member `{mid_field}.{outer_field}` via module qualifier — {tc_import_help(mid_field, dotted_mod, outer_field)}", node, "enum variants and type members use type qualifiers, not module qualifiers")
                             return
                         }
                     }
@@ -18620,7 +18618,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                             tc_mark_symbol_used(mid_field)
                             tc_mark_symbol_used(outer_field)
                             let dotted_mod = tc_get_dotted_module_path(inner_name)
-                            diag_error_at("ModuleQualifiedType", MODULE_QUALIFIED_TYPE, "cannot access type member `{mid_field}.{outer_field}` via module qualifier — add `{mid_field}` to your import: `import {dotted_mod}.\{{mid_field}\}` then use `{mid_field}.{outer_field}`", node, "enum variants and type members use type qualifiers, not module qualifiers")
+                            diag_error_at("ModuleQualifiedType", MODULE_QUALIFIED_TYPE, "cannot access type member `{mid_field}.{outer_field}` via module qualifier — {tc_import_help(mid_field, dotted_mod, outer_field)}", node, "enum variants and type members use type qualifiers, not module qualifiers")
                             return
                         }
                     }
