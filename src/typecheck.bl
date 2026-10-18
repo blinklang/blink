@@ -1641,6 +1641,9 @@ pub let NO_BINDER_NODE: Int = -1
 // `Self` binds once per compile, not at a node. It needs an identity distinct from
 // NO_BINDER_NODE so an unsolved fallback mint can never be mistaken for the receiver.
 pub let SELF_BINDER_NODE: Int = -2
+// The type parameters of the builtin signatures (register_builtin_fn_sigs) belong to no
+// declaration in the program.
+pub let BUILTIN_BINDER_NODE: Int = -3
 
 // The innermost binder of `name`, or NO_BINDER_NODE when `name` is not an active type
 // parameter. Scans the frame stack from the top, so an inner declaration's parameter
@@ -5392,15 +5395,18 @@ fn register_intrinsic_fn_sig(key: Str, params: List[Int], ret: Int) {
     fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: -1 })
 }
 
-// The bare builtins whose call is checked like a declared fn's (sections/02_syntax.md §2.20),
-// each with the fewest arguments it takes, or -1 for any other name. `todo` and `unreachable`
-// may leave out their one `msg`: two forms are a property of these builtins only, since a
-// positional parameter of a user fn has no default (§2.13).
+// The bare builtins whose call is checked like a declared fn's (sections/02_syntax.md §2.20
+// and *Built-in Assertions*), each with the fewest arguments it takes, or -1 for any other
+// name. `todo`, `unreachable`, `assert_eq` and `assert_ne` may leave out their trailing `msg`:
+// two forms are a property of these builtins only, since a positional parameter of a user fn
+// has no default (§2.13).
 fn tc_builtin_fewest_args(name: Str) -> Int {
     let mut table: Map[Str, Int] = Map()
     table.insert("panic", 1)
     table.insert("todo", 0)
     table.insert("unreachable", 0)
+    table.insert("assert_eq", 2)
+    table.insert("assert_ne", 2)
     table.get(name) ?? -1
 }
 
@@ -5416,6 +5422,35 @@ fn register_builtin_fn_sigs() {
         register_intrinsic_fn_sig(tc_builtin_sig_key(name), [TYPE_STR], TYPE_NEVER)
         fnsig_param_names.set(fnsig_param_names.len() - 1, "msg")
     }
+    // `fn assert_eq[T: Eq + Debug](left: T, right: T, msg: Str = "")`. Both values share the
+    // one T, so the second is checked against the type the first fixed, as a user
+    // `fn eq[T: Eq](a: T, b: T)` call is. Eq is not in the bound set: tc_check_assert_eq_args
+    // asks for it with a report that walks into containers. Debug is not in it yet either:
+    // codegen renders the values without a Debug impl, and the programs that compare a type
+    // with no Debug have to be repaired before the bound can be asked for.
+    for name in ["assert_eq", "assert_ne"] {
+        let t = make_typevar_bound("T", BUILTIN_BINDER_NODE)
+        register_intrinsic_fn_sig(tc_builtin_sig_key(name), [t, t, TYPE_STR], TYPE_VOID)
+        let at = fnsig_param_names.len() - 3
+        fnsig_param_names.set(at, "left")
+        fnsig_param_names.set(at + 1, "right")
+        fnsig_param_names.set(at + 2, "msg")
+        tc_add_builtin_sig_tparam("T", "|")
+    }
+}
+
+// Gives the newest fnsig one more type parameter, in every table parallel to
+// fnsig_type_param_names, so the readers indexing those tables by the same slot agree.
+fn tc_add_builtin_sig_tparam(name: Str, bounds: Str) {
+    let sig = fnsig_pool.len() - 1
+    let fs = fnsig_pool.get(sig).unwrap()
+    let start = if fs.type_params_count == 0 { fnsig_type_param_names.len() } else { fs.type_params_start }
+    fnsig_type_param_names.push(name)
+    fnsig_tparam_nodes.push(BUILTIN_BINDER_NODE)
+    fnsig_tparam_ret_only.push(0)
+    fnsig_tparam_sourced.push(1)
+    fnsig_tparam_bounds.push(bounds)
+    fnsig_pool.set(sig, FnSigEntry { name: fs.name, ret: fs.ret, params_start: fs.params_start, params_count: fs.params_count, type_params_start: start, type_params_count: fs.type_params_count + 1, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl })
 }
 
 // A bare builtin call against its tc_builtin_sig_key signature, with the wording a declared
@@ -5430,18 +5465,22 @@ fn tc_check_builtin_sig_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeChe
         if fewest == fs.params_count {
             tc_error_at("function `{fn_name}` expects {fs.params_count} argument(s), got {arg_count}", node)
         } else {
-            tc_error_at_code("function `{fn_name}` expects {fewest} or {fs.params_count} argument(s), got {arg_count}", node, "TypeError", TYPE_ERROR, "call `{fn_name}()` or `{fn_name}({tc_builtin_param_spelling(fs)})`")
+            tc_error_at_code("function `{fn_name}` expects {fewest} or {fs.params_count} argument(s), got {arg_count}", node, "TypeError", TYPE_ERROR, "call `{fn_name}({tc_builtin_param_spelling(fs, fewest)})` or `{fn_name}({tc_builtin_param_spelling(fs, fs.params_count)})`")
         }
     }
-    let _ = tc_check_arg_types_with_binds(fn_name, sig, args_sl, 0, tc_no_binds)
+    let tids = tc_check_arg_types_with_binds(fn_name, sig, args_sl, 0, tc_no_binds)
+    if fs.type_params_count > 0 {
+        tc_check_bounds_for_binds(sig, build_typevar_binds(sig, tids, 0), node)
+    }
+    if fn_name == "assert_eq" || fn_name == "assert_ne" { tc_check_assert_eq_args(tids, node) }
     fs.ret
 }
 
-// The parameter list of a builtin signature as a user would write it: `msg: Str`.
-fn tc_builtin_param_spelling(fs: FnSigEntry) -> Str {
+// The first `count` parameters of a builtin signature as a user would write them: `msg: Str`.
+fn tc_builtin_param_spelling(fs: FnSigEntry, count: Int) -> Str {
     let mut parts: List[Str] = []
     let mut i = 0
-    while i < fs.params_count {
+    while i < count {
         let at = fs.params_start + i
         parts.push("{fnsig_param_names.get(at).unwrap()}: {type_to_str(fnsig_param_list.get(at).unwrap())}")
         i = i + 1
@@ -10930,7 +10969,7 @@ fn tc_type_origin_qualifier(tid: Int) -> Str {
     if tc_tid_kind(tid) != TyKind.Typevar { return " (the declared type)" }
     let b = tc_tid_binder(tid)
     if b == SELF_BINDER_NODE { return " (the implementing type)" }
-    if b == NO_BINDER_NODE { return " (a type parameter)" }
+    if b == NO_BINDER_NODE || b == BUILTIN_BINDER_NODE { return " (a type parameter)" }
     " (the type parameter declared at line {node_line(b)})"
 }
 
@@ -14254,13 +14293,12 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "file_exists" { return TYPE_INT }
     if name == "shell_exec" { return TYPE_INT }
     if name == "exit" { return TYPE_VOID }
-    if tc_builtin_fewest_args(name) >= 0 { return TYPE_NEVER }
+    let bsig = fnsig_map.get(tc_builtin_sig_key(name)) ?? -1
+    if bsig != -1 { return fnsig_pool.get(bsig).unwrap().ret }
     if name == "is_dir" { return TYPE_INT }
 
     if name == "time_ms" { return TYPE_INT }
     if name == "assert" { return TYPE_VOID }
-    if name == "assert_eq" { return TYPE_VOID }
-    if name == "assert_ne" { return TYPE_VOID }
     if name == "debug_assert" { return TYPE_VOID }
     if name == "skip" { return TYPE_VOID }
     if name == "unix_socket_listen" { return TYPE_INT }
@@ -18271,15 +18309,16 @@ fn tc_container_slot_from_hint(want: TyKind, slot: Int) -> Int {
     s
 }
 
-// assert_eq/assert_ne infer each argument independently, so a bare Ok/Err/None
-// argument mints an unbound metavariable for the slot it doesn't spell. Unify
-// both sides after inferring them so either argument can be the bare literal, then
-// ask for the `Eq` bound on the unified type.
-fn tc_check_assert_eq_args(args_sl: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let arg0 = sublist_get(args_sl, 0)
-    let arg1 = sublist_get(args_sl, 1)
-    let t0 = infer_type(arg0)
-    let t1 = infer_type(arg1)
+// A bare Ok/Err/None argument mints an unbound metavariable for the slot it doesn't
+// spell, and the signature check hints the other argument only from a concrete bind, so a
+// bare first argument leaves its slot open. Unify both sides so either argument can be the
+// bare literal, then ask for the `Eq` bound on the unified type. `tids` is what the
+// signature check read for each argument.
+fn tc_check_assert_eq_args(tids: List[Int], node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tids.len() < 2 { return }
+    let t0 = tids.get(0).unwrap()
+    let t1 = tids.get(1).unwrap()
+    if t0 < 0 || t1 < 0 { return }
     if tc_tid_has_unbound_metavar(t0) != 0 { let _ = tc_unify(t0, t1) }
     if tc_tid_has_unbound_metavar(t1) != 0 { let _ = tc_unify(t1, t0) }
     reject_eq_less_assert_args(t0, t1, node)
@@ -19146,14 +19185,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // skip arg inference, hiding errors like E0522.
                     let bf_args = node_args(node)
                     if bf_args != -1 {
-                        if (fn_name == "assert_eq" || fn_name == "assert_ne") && sublist_length(bf_args) == 2 {
-                            tc_check_assert_eq_args(bf_args, node)
-                        } else {
-                            let mut bai = 0
-                            while bai < sublist_length(bf_args) {
-                                infer_type(sublist_get(bf_args, bai))
-                                bai = bai + 1
-                            }
+                        let mut bai = 0
+                        while bai < sublist_length(bf_args) {
+                            infer_type(sublist_get(bf_args, bai))
+                            bai = bai + 1
                         }
                     }
                     if fn_name == "alloc_ptr" || fn_name == "null_ptr" {
