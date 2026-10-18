@@ -246,13 +246,19 @@ let mut evar_pool: List[EnumVariantEntry] = []
 // is first-declared-wins per bare variant name, so two enums sharing a variant name get one
 // answer between them.
 let mut evar_decl_nodes: List[Int] = []
-// First-declared evar_pool slot per variant name. Name lookups run once per identifier,
-// so they must not scan evar_pool.
-let mut evar_first_by_name: Map[Str, Int] = Map()
+// Every evar_pool slot per variant name, in declaration order. Name lookups run once per
+// identifier, so they must not scan evar_pool, and a name two enums share must keep both.
+let mut evar_slots_by_name: Map[Str, List[Int]] = Map()
+
+fn tc_first_variant_slot(name: Str) -> Int {
+    let slots = evar_slots_by_name.get(name) ?? []
+    if slots.len() == 0 { return -1 }
+    slots.get(0).unwrap()
+}
 
 // The enum declaration of the first-declared variant named `name`, or -1.
 fn tc_variant_enum_decl_node(name: Str) -> Int {
-    let i = evar_first_by_name.get(name) ?? -1
+    let i = tc_first_variant_slot(name)
     if i < 0 { return -1 }
     evar_pool.get(i).unwrap().enum_decl
 }
@@ -3199,13 +3205,8 @@ fn tc_struct_base_tid(tid0: Int) -> Int {
 }
 
 fn get_variant_by_name(enum_tid: Int, vname: Str) -> Int {
-    let mut i = 0
-    while i < evar_pool.len() {
-        let ev = evar_pool.get(i).unwrap()
-        if ev.enum_id == enum_tid && ev.name == vname {
-            return i
-        }
-        i = i + 1
+    for i in evar_slots_by_name.get(vname) ?? [] {
+        if evar_pool.get(i).unwrap().enum_id == enum_tid { return i }
     }
     -1
 }
@@ -8958,9 +8959,9 @@ fn resolve_enum_variants(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
             }
             evar_pool.push(EnumVariantEntry { enum_id: tid, name: vname, tag: _tag, has_data: _has_data, enum_decl: td })
             evar_decl_nodes.push(v)
-            if evar_first_by_name.contains_key(vname) == 0 {
-                evar_first_by_name.insert(vname, var_idx)
-            }
+            let mut name_slots = evar_slots_by_name.get(vname) ?? []
+            name_slots.push(var_idx)
+            evar_slots_by_name.insert(vname, name_slots)
 
             _tag = _tag + 1
             i = i + 1
@@ -11636,7 +11637,7 @@ fn init_types() ! TypeCheck.Register {
     nr_callable_field_names.clear()
     evar_pool.clear()
     evar_decl_nodes.clear()
-    evar_first_by_name.clear()
+    evar_slots_by_name.clear()
     evfield_pool.clear()
     fnsig_pool.clear()
     fnsig_by_decl.clear()
@@ -14373,23 +14374,160 @@ fn tc_builtin_static_ret(tname: Str, method: Str) -> Int {
     -1
 }
 
-fn is_builtin_variant_name(name: Str) -> Int {
-    if name == "None" { return 1 }
-    if name == "Some" { return 1 }
-    if name == "Ok" { return 1 }
-    if name == "Err" { return 1 }
-    0
+// The prelude carrier a variant name constructs. Option and Result are type kinds, not
+// enums in evar_pool, so their variants are answered here.
+fn tc_prelude_carrier_of(name: Str) -> Option[TyKind] {
+    match name {
+        "None" => Some(TyKind.Option)
+        "Some" => Some(TyKind.Option)
+        "Ok" => Some(TyKind.Result)
+        "Err" => Some(TyKind.Result)
+        _ => None
+    }
+}
+
+fn tc_prelude_carrier_name(k: TyKind) -> Str {
+    if k == TyKind.Option { "Option" } else { "Result" }
 }
 
 fn is_variant_name(name: Str) -> Int {
-    if is_builtin_variant_name(name) != 0 { return 1 }
-    evar_first_by_name.contains_key(name)
+    if tc_prelude_carrier_of(name).is_some() { return 1 }
+    if tc_first_variant_slot(name) != -1 { 1 } else { 0 }
 }
 
 fn get_variant_enum_tid(name: Str) -> Int {
-    let i = evar_first_by_name.get(name) ?? -1
+    let i = tc_first_variant_slot(name)
     if i < 0 { return TYPE_UNKNOWN }
     evar_pool.get(i).unwrap().enum_id
+}
+
+// What a bare variant name in value position constructs (sections/03_types.md §3.4).
+type BareVariantPick {
+    NotAVariant
+    Carrier(kind: TyKind)
+    Declared(enum_tid: Int, var_idx: Int)
+    Ambiguous(enums: List[Str])
+}
+
+// Step 2 of the resolution order: the expected type names the carrier or an enum that has a
+// variant `name`. `carrier` is the prelude carrier `name` constructs, or None.
+fn tc_bare_variant_from_type(name: Str, carrier: Option[TyKind], t: Int) -> BareVariantPick {
+    if t < 0 { return BareVariantPick.NotAVariant }
+    let h = resolve_alias_tid(t)
+    let hk = type_kind(h)
+    if (carrier ?? TyKind.Unknown) == hk && hk != TyKind.Unknown { return BareVariantPick.Carrier(hk) }
+    if hk != TyKind.Enum { return BareVariantPick.NotAVariant }
+    let base = tc_enum_base_tid(h)
+    let vi = get_variant_by_name(base, name)
+    if vi == -1 { return BareVariantPick.NotAVariant }
+    BareVariantPick.Declared(base, vi)
+}
+
+// The type that picks `name` at `site`: the expected type, else the type an earlier walk
+// stamped on the site under its expected type. A site denotes one variant, so a later walk
+// that reaches it with no expected type (an `if` branch walked after its let) keeps that
+// answer. -1 when neither picks.
+fn tc_bare_variant_site_type(name: Str, site: Int, carrier: Option[TyKind]) -> Int {
+    match tc_bare_variant_from_type(name, carrier, tc_construct_hint) {
+        BareVariantPick.NotAVariant => {}
+        _ => return tc_construct_hint
+    }
+    let stamped = tc_lookup_node_tid(site)
+    match tc_bare_variant_from_type(name, carrier, stamped) {
+        BareVariantPick.NotAVariant => -1
+        _ => stamped
+    }
+}
+
+// Step 3: the one constructible name of that spelling in the program. A std module never
+// depends on the program that uses it, so its sites do not see the program's enums.
+fn tc_bare_variant_from_program(name: Str, site: Int, carrier: Option[TyKind]) -> BareVariantPick {
+    let mut enums: List[Str] = []
+    let mut only = BareVariantPick.NotAVariant
+    match carrier {
+        Some(k) => {
+            enums.push(tc_prelude_carrier_name(k))
+            only = BareVariantPick.Carrier(k)
+        }
+        None => {}
+    }
+    let std_site = tc_site_in_std(site)
+    for i in evar_slots_by_name.get(name) ?? [] {
+        let ev = evar_pool.get(i).unwrap()
+        if !std_site || node_source_module(ev.enum_decl).starts_with("std_") {
+            enums.push(node_name(ev.enum_decl))
+            only = BareVariantPick.Declared(ev.enum_id, i)
+        }
+    }
+    if enums.len() > 1 { return BareVariantPick.Ambiguous(enums) }
+    only
+}
+
+// An expression node records no module of its own; the function around it does.
+fn tc_site_in_std(site: Int) -> Bool {
+    if tc_current_fn_node >= 0 { return node_source_module(tc_current_fn_node).starts_with("std_") }
+    node_source_module(site).starts_with("std_")
+}
+
+fn tc_pick_bare_variant(name: Str, site: Int, carrier: Option[TyKind]) -> BareVariantPick {
+    if carrier.is_none() && tc_first_variant_slot(name) == -1 { return BareVariantPick.NotAVariant }
+    let site_t = tc_bare_variant_site_type(name, site, carrier)
+    if site_t >= 0 { return tc_bare_variant_from_type(name, carrier, site_t) }
+    tc_bare_variant_from_program(name, site, carrier)
+}
+
+// A call `Name(...)` whose name resolved to a declared variant or to no single one; None for
+// any other pick.
+@allow(UnrestoredMutation)
+fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -> Option[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    match vpick {
+        BareVariantPick.Declared(venum, var_idx) => {
+            let expected = variant_field_count(var_idx)
+            let args_sl = node_args(node)
+            let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+            if arg_count != expected {
+                tc_error_at("variant `{fn_name}` expects {expected} argument(s), got {arg_count}", node)
+            }
+            // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
+            // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
+            // it; a non-generic enum keeps the bare tid.
+            let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
+            Some(tc_enum_ctor_instance_tid(venum, vdecl, fn_name, node_args(node)))
+        }
+        BareVariantPick.Ambiguous(enums) => {
+            tc_report_ambiguous_construction(fn_name, enums, node)
+            let args_sl = node_args(node)
+            if args_sl != -1 {
+                let saved_hint = tc_construct_hint
+                tc_construct_hint = -1
+                let mut ai = 0
+                while ai < sublist_length(args_sl) {
+                    infer_type(sublist_get(args_sl, ai))
+                    ai = ai + 1
+                }
+                tc_construct_hint = saved_hint
+            }
+            Some(tc_error_recovery_tid())
+        }
+        _ => None
+    }
+}
+
+fn tc_report_ambiguous_construction(name: Str, enums: List[Str], node: Int) ! Diag.Report {
+    let last = enums.len() - 1
+    let mut owners = ""
+    let mut quals = ""
+    let mut i = 0
+    while i < enums.len() {
+        let e = enums.get(i).unwrap()
+        let sep = if i == 0 { "" } else if i == last { " and " } else { ", " }
+        let qsep = if i == 0 { "" } else if i == last { " or " } else { ", " }
+        owners = "{owners}{sep}{e}"
+        quals = "{quals}{qsep}{e}.{name}"
+        i = i + 1
+    }
+    let both = if enums.len() == 2 { "both " } else { "" }
+    diag_error_at("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "`{name}` is a variant of {both}{owners}; qualify as {quals}", node, "write the enum before the variant, or give the site an expected type")
 }
 
 // Reverse-infer a generic-enum INSTANCE tid (`Tree[Int]`) from a variant
@@ -14407,7 +14545,7 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
     let tparams_sl = node_type_params(decl)
     if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
     if args_sl == -1 { return enum_tid }
-    let var_idx = get_variant_var_idx(vname)
+    let var_idx = get_variant_by_name(tc_enum_base_tid(enum_tid), vname)
     if var_idx == -1 { return enum_tid }
     let mut binds: Map[Str, Int] = Map()
     let mut fi = 0
@@ -14465,9 +14603,9 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int)
 // reaches it.
 // @allow: publishing the field values' types IS this function's effect.
 @allow(UnrestoredMutation)
-fn tc_infer_enum_structlit_field_values(vname: Str, flds_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if flds_sl == -1 { return }
-    let var_idx = get_variant_var_idx(vname)
+    let var_idx = get_variant_by_name(tc_enum_base_tid(enum_tid), vname)
     let mut fi = 0
     while fi < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, fi)
@@ -14475,7 +14613,8 @@ fn tc_infer_enum_structlit_field_values(vname: Str, flds_sl: Int) ! TypeCheck.Re
         if v != -1 {
             let mut declared = -1
             if var_idx != -1 { declared = lookup_evfield_type_by_name(var_idx, node_name(f)) }
-            if declared != -1 { declared = resolve_alias_tid(declared) }
+            // At an instance (`Tree[Option[Str]]`) a field is typed at the instance's arguments.
+            if declared != -1 { declared = resolve_alias_tid(tc_subst_evfield_from_instance(declared, enum_tid)) }
             if node_kind(v) == NodeKind.Closure && type_kind(declared) == TyKind.Fn {
                 check_closure_body(v, declared)
             } else if node_kind(v) == NodeKind.HandlerExpr {
@@ -14496,18 +14635,18 @@ fn tc_infer_enum_structlit_field_values(vname: Str, flds_sl: Int) ! TypeCheck.Re
 
 fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if decl == -1 {
-        tc_infer_enum_structlit_field_values(vname, flds_sl)
+        tc_infer_enum_structlit_field_values(enum_tid, vname, flds_sl)
         return enum_tid
     }
     let tparams_sl = node_type_params(decl)
     if tparams_sl == -1 || sublist_length(tparams_sl) == 0 {
-        tc_infer_enum_structlit_field_values(vname, flds_sl)
+        tc_infer_enum_structlit_field_values(enum_tid, vname, flds_sl)
         return enum_tid
     }
     if flds_sl == -1 { return enum_tid }
-    let var_idx = get_variant_var_idx(vname)
+    let var_idx = get_variant_by_name(tc_enum_base_tid(enum_tid), vname)
     if var_idx == -1 {
-        tc_infer_enum_structlit_field_values(vname, flds_sl)
+        tc_infer_enum_structlit_field_values(enum_tid, vname, flds_sl)
         return enum_tid
     }
     let mut binds: Map[Str, Int] = Map()
@@ -14603,7 +14742,7 @@ fn tc_nullary_variant_tid(enum_tid: Int, decl: Int, var_idx: Int) -> Int {
 // evar_pool.len() just before pushing the variant), so it lets variant_field_count
 // look up the declared field count for that variant. Returns -1 if not found.
 fn get_variant_var_idx(name: Str) -> Int {
-    evar_first_by_name.get(name) ?? -1
+    tc_first_variant_slot(name)
 }
 
 // Number of declared fields for the variant at the given evar_pool index, by
@@ -14615,26 +14754,6 @@ fn variant_field_count(var_idx: Int) -> Int {
     while i < evfield_pool.len() {
         if evfield_pool.get(i).unwrap().var_idx == var_idx {
             count = count + 1
-        }
-        i = i + 1
-    }
-    count
-}
-
-// Count the number of DISTINCT enums that declare a variant named `name`.
-// get_variant_enum_tid returns only the first match, so it cannot detect
-// non-uniqueness; this is what the bare-construction cascade uses to decide
-// between a unique-variant fallback and an E0519 AmbiguousConstruction.
-fn count_enums_with_variant(name: Str) -> Int {
-    let mut seen: Map[Int, Int] = Map()
-    let mut count = 0
-    let mut i = 0
-    while i < evar_pool.len() {
-        let ev = evar_pool.get(i).unwrap()
-        if ev.name == name && seen.contains_key(ev.enum_id) == 0 {
-            seen.insert(ev.enum_id, 1)
-            count = count + 1
-            if count > 1 { return count }
         }
         i = i + 1
     }
@@ -16077,7 +16196,15 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // body walk below.
                 let saved_nr_binder = tc_ffi_scope_binder
                 tc_ffi_scope_binder = node_name(node)
+                // A bare variant name resolves from the annotation (§3.4); without it here, the
+                // first inference would find the name ambiguous before the body walk hints it.
+                let saved_nr_hint = tc_construct_hint
+                if let_type_ann != -1 && tc_names_bare_variant(val) {
+                    let ann_tid = resolve_type_ann(let_type_ann)
+                    if tc_tid_is_no_info(ann_tid) == 0 { tc_construct_hint = resolve_alias_tid(ann_tid) }
+                }
                 let inferred = infer_type(val)
+                tc_construct_hint = saved_nr_hint
                 tc_ffi_scope_binder = saved_nr_binder
                 // The recorded type goes on the entry THIS let just defined, which is the
                 // top one. A discard defines no entry, so the top one belongs to whatever
@@ -18213,6 +18340,71 @@ fn bitwise_bool_help(op: Str, operand_tid: Int) -> Str {
     ""
 }
 
+// A bare variant name on either side of a comparison takes the other operand as its expected
+// type (`a.cmp(b) == Greater`). The enclosing expectation is a Bool and names nothing about
+// either operand. A bare variant name on the left is typed after the right, the only thing
+// that can hint it.
+@allow(UnrestoredMutation)
+fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = -1
+    let left_first = !tc_names_bare_variant(node_left(node))
+    let mut lt = -1
+    if left_first { lt = infer_type(node_left(node)) }
+    if left_first && tc_names_bare_variant(node_right(node)) && tc_tid_is_no_info(lt) == 0 { tc_construct_hint = resolve_alias_tid(lt) }
+    let rt = infer_type(node_right(node))
+    tc_construct_hint = -1
+    if !left_first {
+        if tc_tid_is_no_info(rt) == 0 { tc_construct_hint = resolve_alias_tid(rt) }
+        lt = infer_type(node_left(node))
+    }
+    tc_construct_hint = saved_hint
+    // A comparison on a type-parameter operand is licensed only by that
+    // parameter's declared bounds (Ord/Eq): `Self` in a trait default body by
+    // the guarantee set (E0305), any other type parameter by its `[T: Ord]` /
+    // `[T: Eq]` bound (E0300). Report on the left operand; on the right only
+    // when the left is not itself the same `Self`, so `self < other` reports once.
+    reject_unlicensed_comparison(op, lt, node)
+    if type_kind(resolve_alias_tid(lt)) != TyKind.Typevar || type_to_str(lt) != "Self" {
+        reject_unlicensed_comparison(op, rt, node)
+    }
+    // Comparison operators desugar to Eq.eq / Ord.cmp and require
+    // same-type operands (spec 03_types.md:1809). Validate when both sides
+    // are known, preserving the enum-vs-Int representation exception
+    // (03_types.md:1093) and untyped-int-literal coercion to a sized int.
+    if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
+        if cmp_is_enum_int_pair(lt, rt) == 0 {
+            let lit_r = is_sized_int(type_kind(lt)) != 0 && rt == TYPE_INT && is_int_literal_node(node_right(node)) != 0
+            let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
+            if lit_r == 0 && lit_l == 0 {
+                let relational = if op == "==" || op == "!=" { 0 } else { 1 }
+                let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { 0 }
+                if refused == 0 && cmp_operands_ok(lt, rt, relational) == 0 {
+                    // Operands that pass as an equality pair fail only for want of Ord.
+                    // Name the side without it: `1 < true` lacks Ord on the Bool.
+                    if relational != 0 && cmp_operands_ok(lt, rt, 0) != 0 {
+                        let unordered = if cmp_operands_ok(lt, lt, 1) != 0 { rt } else { lt }
+                        tc_error_at("binary `{op}` needs Ord, and {type_to_str(unordered)} does not implement Ord", node)
+                    } else {
+                        tc_error_at("binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
+                    }
+                }
+            }
+        }
+    }
+    return TYPE_BOOL
+}
+
+// Whether `n` is a bare variant name (`Pending`, `Running(1)`) that no binding hides.
+fn tc_names_bare_variant(n: Int) -> Bool {
+    if n == -1 { return false }
+    let k = node_kind(n)
+    let mut name = ""
+    if k == NodeKind.Ident { name = node_name(n) }
+    if k == NodeKind.Call && node_left(n) != -1 && node_kind(node_left(n)) == NodeKind.Ident { name = node_name(node_left(n)) }
+    name != "" && nr_top_index(name) == -1 && is_variant_name(name) != 0
+}
+
 fn is_comparison_op(op: Str) -> Int {
     if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" { return 1 }
     0
@@ -18861,13 +19053,22 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" { return TYPE_BOOL }
-        if name == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
         let top = nr_top_index(name)
         let vt = if top != -1 { nr_scope_types.get(top).unwrap() } else { -1 }
         if tc_tid_is_no_info(vt) == 0 { return vt }
-        if is_variant_name(name) != 0 {
-            let vdecl = tc_variant_enum_decl_node(name)
-            return tc_nullary_variant_tid(get_variant_enum_tid(name), vdecl, get_variant_var_idx(name))
+        match tc_pick_bare_variant(name, node, tc_prelude_carrier_of(name)) {
+            BareVariantPick.Carrier(_) => {
+                if name == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
+                return TYPE_UNKNOWN
+            }
+            BareVariantPick.Declared(enum_tid, var_idx) => {
+                return tc_nullary_variant_tid(enum_tid, evar_pool.get(var_idx).unwrap().enum_decl, var_idx)
+            }
+            BareVariantPick.Ambiguous(enums) => {
+                tc_report_ambiguous_construction(name, enums, node)
+                return tc_error_recovery_tid()
+            }
+            BareVariantPick.NotAVariant => {}
         }
         // A named function used as a VALUE (`take_fn(m, bump)`) denotes its own signature. No
         // binding carries it — the name lives in the function table, not in a scope — so the
@@ -18926,6 +19127,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
 
     if kind == NodeKind.BinOp {
         let op = node_op(node)
+        if is_comparison_op(op) != 0 { return tc_infer_comparison(node, op) }
         let lt = infer_type(node_left(node))
         // Answered before the shared right-operand inference below: the fallback's hint is the
         // left side's element type, and it has to be in hand the FIRST time the fallback is
@@ -18933,42 +19135,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if op == "??" { return tc_infer_coalesce(node, lt) }
         let rt = infer_type(node_right(node))
 
-        if is_comparison_op(op) {
-            // A comparison on a type-parameter operand is licensed only by that
-            // parameter's declared bounds (Ord/Eq): `Self` in a trait default body by
-            // the guarantee set (E0305), any other type parameter by its `[T: Ord]` /
-            // `[T: Eq]` bound (E0300). Report on the left operand; on the right only
-            // when the left is not itself the same `Self`, so `self < other` reports once.
-            reject_unlicensed_comparison(op, lt, node)
-            if type_kind(resolve_alias_tid(lt)) != TyKind.Typevar || type_to_str(lt) != "Self" {
-                reject_unlicensed_comparison(op, rt, node)
-            }
-            // Comparison operators desugar to Eq.eq / Ord.cmp and require
-            // same-type operands (spec 03_types.md:1809). Validate when both sides
-            // are known, preserving the enum-vs-Int representation exception
-            // (03_types.md:1093) and untyped-int-literal coercion to a sized int.
-            if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
-                if cmp_is_enum_int_pair(lt, rt) == 0 {
-                    let lit_r = is_sized_int(type_kind(lt)) != 0 && rt == TYPE_INT && is_int_literal_node(node_right(node)) != 0
-                    let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
-                    if lit_r == 0 && lit_l == 0 {
-                        let relational = if op == "==" || op == "!=" { 0 } else { 1 }
-                        let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { 0 }
-                        if refused == 0 && cmp_operands_ok(lt, rt, relational) == 0 {
-                            // Operands that pass as an equality pair fail only for want of Ord.
-                            // Name the side without it: `1 < true` lacks Ord on the Bool.
-                            if relational != 0 && cmp_operands_ok(lt, rt, 0) != 0 {
-                                let unordered = if cmp_operands_ok(lt, lt, 1) != 0 { rt } else { lt }
-                                tc_error_at("binary `{op}` needs Ord, and {type_to_str(unordered)} does not implement Ord", node)
-                            } else {
-                                tc_error_at("binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
-                            }
-                        }
-                    }
-                }
-            }
-            return TYPE_BOOL
-        }
         if op == "&&" || op == "||" {
             if is_bool_compat(lt) == 0 {
                 tc_error_at("logical operator `{op}` requires Bool operands, got {type_to_str(lt)}", node)
@@ -19121,7 +19287,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if callee_kind == NodeKind.Ident {
                 let mut fn_name = node_name(callee)
                 fn_name = tc_alias_to_original.get(fn_name) ?? fn_name
-                if fn_name == "Some" {
+                let vpick = tc_pick_bare_variant(fn_name, node, tc_prelude_carrier_of(fn_name))
+                let as_carrier = match vpick {
+                    BareVariantPick.Carrier(_) => true
+                    _ => false
+                }
+                // A prelude carrier name some enum also declares resolves here, before the
+                // builtins below, which would take it for the carrier.
+                if !as_carrier && tc_prelude_carrier_of(fn_name).is_some() {
+                    match tc_infer_bare_variant_call(node, fn_name, vpick) {
+                        Some(t) => return t
+                        None => {}
+                    }
+                }
+                if fn_name == "Some" && as_carrier {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Some")
@@ -19134,7 +19313,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // an annotation / declared return / later use that constrains it; an
                 // unconstrained one trips the E0301 region boundary. The singleton is excluded
                 // from that boundary check, so it must not stand in for an inferable slot.
-                if fn_name == "Ok" {
+                if fn_name == "Ok" && as_carrier {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Ok")
@@ -19142,7 +19321,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     return make_result_type(make_metavar(), make_metavar())
                 }
-                if fn_name == "Err" {
+                if fn_name == "Err" && as_carrier {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
                         let inner = infer_carrier_arg(sublist_get(args_sl, 0), "Err")
@@ -19205,28 +19384,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // answers the type it plainly meant, so its uses report nothing further.
                     return get_builtin_fn_ret(fn_name)
                 }
-                if is_variant_name(fn_name) != 0 {
-                    // Arity-check only when the variant name is unambiguous. An
-                    // ambiguous name (declared by >1 enum) keeps deferring to the
-                    // existing E0519 AmbiguousConstruction cascade rather than
-                    // guessing which variant's field count to compare against.
-                    if count_enums_with_variant(fn_name) == 1 {
-                        let var_idx = get_variant_var_idx(fn_name)
-                        if var_idx != -1 {
-                            let expected = variant_field_count(var_idx)
-                            let args_sl = node_args(node)
-                            let arg_count = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
-                            if arg_count != expected {
-                                tc_error_at("variant `{fn_name}` expects {expected} argument(s), got {arg_count}", node)
-                            }
-                        }
+                if !as_carrier {
+                    match tc_infer_bare_variant_call(node, fn_name, vpick) {
+                        Some(t) => return t
+                        None => {}
                     }
-                    let venum = get_variant_enum_tid(fn_name)
-                    // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
-                    // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
-                    // it; a non-generic enum keeps the bare tid.
-                    let vdecl = tc_variant_enum_decl_node(fn_name)
-                    return tc_enum_ctor_instance_tid(venum, vdecl, fn_name, node_args(node))
                 }
                 // Local lexical scope shadows module-level definitions
                 // (sections/02_syntax.md:671-680, 07_trust_modules_metadata.md:1042).
@@ -21367,12 +21529,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 None => {
                     // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
                     //    rebind a locally-determined site).
-                    if tc_construct_hint >= 0 && type_kind(tc_construct_hint) == TyKind.Enum && get_variant_by_name(tc_construct_hint, sname) != -1 {
-                        // The hint answers the literal's own type without looking inside it, so the
-                        // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
-                        // left the inner literal's fields with nothing.
-                        tc_infer_enum_structlit_field_values(sname, node_fields(node))
-                        return tc_construct_hint
+                    let site_t = tc_bare_variant_site_type(sname, node, None)
+                    match tc_bare_variant_from_type(sname, None, site_t) {
+                        BareVariantPick.Declared(_, _) => {
+                            // The hint answers the literal's own type without looking inside it, so the
+                            // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
+                            // left the inner literal's fields with nothing.
+                            tc_infer_enum_structlit_field_values(resolve_alias_tid(site_t), sname, node_fields(node))
+                            return site_t
+                        }
+                        _ => {}
                     }
                     // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
                     //    User-first: a user type shadowing a builtin name (`type Char { .. }`)
@@ -21401,17 +21567,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         return tc_error_recovery_tid()
                     }
                     // 3) global-unique variant.
-                    let n = count_enums_with_variant(sname)
-                    if n == 1 {
-                        let venum = get_variant_enum_tid(sname)
-                        // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
-                        // infers its concrete instance tid; non-generic keeps bare.
-                        let vdecl = tc_variant_enum_decl_node(sname)
-                        return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
-                    }
-                    if n > 1 {
-                        diag_error_at("AmbiguousConstruction", AMBIGUOUS_CONSTRUCTION, "bare construction of `{sname}` is ambiguous: `{sname}` is a variant of {n} enums; qualify it (e.g. SomeEnum.{sname} \{ ... }) or add a type annotation", node, "qualify with the enum name or annotate the binding")
-                        return tc_error_recovery_tid()
+                    match tc_bare_variant_from_program(sname, node, None) {
+                        BareVariantPick.Declared(venum, var_idx) => {
+                            // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
+                            // infers its concrete instance tid; non-generic keeps bare.
+                            let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
+                            return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
+                        }
+                        BareVariantPick.Ambiguous(enums) => {
+                            tc_report_ambiguous_construction(sname, enums, node)
+                            return tc_error_recovery_tid()
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -22672,7 +22839,7 @@ fn tc_args_are_const(args_sl: Int) -> Int {
 // are named because they are variants the language declares rather than the program.
 fn tc_name_is_variant_ctor(name: Str) -> Int {
     if name == "Some" || name == "Ok" || name == "Err" || name == "None" { return 1 }
-    if evar_first_by_name.contains_key(name) != 0 { return 1 }
+    if tc_first_variant_slot(name) != -1 { return 1 }
     0
 }
 

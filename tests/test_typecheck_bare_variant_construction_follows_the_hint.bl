@@ -1,0 +1,301 @@
+// A bare variant construction resolves in the order of sections/03_types.md §3.4: the
+// expected type first (a binding annotation, a parameter, a return type, the other operand
+// of `==`), then the one enum in the program that declares the name. When two enums declare
+// it and no expected type picks one, the site is AmbiguousConstruction (E0519). This holds
+// for a nullary name, a payload call and a brace literal alike, and for a user enum whose
+// variant is spelled like a prelude one (`Ok`, `Some`, `None`): no path picks the
+// first-declared enum.
+import lower_test_helpers.{probe, probe_but, assert_eq_str}
+import diagnostics.{diag_entries}
+
+fn two_enums() -> Str {
+    #"type JobState { Pending, Running(pct: Int), Done }
+type NetState { Pending, Running(host: Str, port: Int), Closed }
+"#
+}
+
+fn ambiguous_message() -> Str {
+    let mut msg = ""
+    for d in diag_entries {
+        if d.name == "AmbiguousConstruction" { msg = d.message }
+    }
+    msg
+}
+
+fn ambiguous_help() -> Str {
+    let mut help = ""
+    for d in diag_entries {
+        if d.name == "AmbiguousConstruction" { help = d.help }
+    }
+    help
+}
+
+fn ambiguous_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == "AmbiguousConstruction" { n = n + 1 }
+    }
+    n
+}
+
+let HELP = "write the enum before the variant, or give the site an expected type"
+
+test "a nullary name two enums declare, with no expected type, is E0519" {
+    let src = two_enums().concat(#"fn main() {
+    let a = Pending
+    let _ = a
+}
+"#)
+    let program = probe_but("bvc_nullary", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq(ambiguous_count(), 1)
+    assert_eq_str("message", ambiguous_message(), "`Pending` is a variant of both JobState and NetState; qualify as JobState.Pending or NetState.Pending")
+    assert_eq_str("help", ambiguous_help(), HELP)
+}
+
+test "a payload call two enums declare, with no expected type, is E0519" {
+    let src = two_enums().concat(#"fn main() {
+    let b = Running("h", 1)
+    let _ = b
+}
+"#)
+    let program = probe_but("bvc_payload", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq(ambiguous_count(), 1)
+    assert_eq_str("message", ambiguous_message(), "`Running` is a variant of both JobState and NetState; qualify as JobState.Running or NetState.Running")
+}
+
+test "a payload call whose arguments fit only one of the enums is still E0519" {
+    let src = two_enums().concat(#"fn main() {
+    let b = Running(5)
+    let _ = b
+}
+"#)
+    let program = probe_but("bvc_payload_one_arg", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq(ambiguous_count(), 1)
+}
+
+test "a brace literal two enums declare, with no expected type, names both enums" {
+    let src = #"type JobState { Pending { id: Int }, Done }
+type NetState { Pending { port: Int }, Closed }
+fn main() {
+    let s = Pending { id: 1 }
+    let _ = s
+}
+"#
+    let program = probe_but("bvc_brace", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq_str("message", ambiguous_message(), "`Pending` is a variant of both JobState and NetState; qualify as JobState.Pending or NetState.Pending")
+    assert_eq_str("help", ambiguous_help(), HELP)
+}
+
+test "three enums are all named" {
+    let src = #"type A { Pending, X }
+type B { Pending, Y }
+type C { Pending, Z }
+fn main() {
+    let p = Pending
+    let _ = p
+}
+"#
+    let program = probe_but("bvc_three", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq_str("message", ambiguous_message(), "`Pending` is a variant of A, B and C; qualify as A.Pending, B.Pending or C.Pending")
+}
+
+test "the expected type picks each enum's variant" {
+    let src = two_enums().concat(#"fn job(js: JobState) -> Int {
+    match js {
+        Pending => 1
+        Running(p) => p
+        Done => 3
+    }
+}
+fn net(ns: NetState) -> Int {
+    match ns {
+        Pending => 10
+        Running(_, p) => p
+        Closed => 30
+    }
+}
+fn make_net() -> NetState { Pending }
+fn make_job() -> JobState { Running(7) }
+fn main() {
+    let a: JobState = Pending
+    let b: NetState = Pending
+    let c: NetState = Running("h", 80)
+    let d: JobState = Running(5)
+    let total = job(a) + net(b) + net(c) + job(d) + net(Pending) + job(Pending)
+    let e = make_net()
+    let f = make_job()
+    let g = e == Pending
+    let h = f == Running(7)
+    let _ = total
+    let _ = g
+    let _ = h
+}
+"#)
+    let program = probe("bvc_hints", src)
+    assert(program >= 0)
+}
+
+test "a user enum's Ok, Err, Some and None follow the expected type" {
+    let src = #"type Outcome[T, E] { Ok(v: T), Err(e: E) }
+type Opt[T] { Nada, Some(val: T), None }
+fn wrap(w: Opt[Int]) -> Int {
+    match w {
+        Some(v) => v
+        Nada => 0
+        None => -1
+    }
+}
+fn ok_of(k: Int) -> Outcome[Int, Str] { Ok(k) }
+fn main() {
+    let a: Outcome[Int, Str] = Ok(3)
+    let b: Outcome[Int, Str] = Err("x")
+    let o: Opt[Int] = Some(2)
+    let n: Opt[Int] = None
+    let r: Result[Int, Str] = Ok(4)
+    let m: Option[Int] = None
+    let s: Option[Int] = Some(5)
+    let _ = wrap(o) + wrap(n) + wrap(Some(9))
+    let _ = ok_of(1)
+    let _ = a
+    let _ = b
+    let _ = r
+    let _ = m
+    let _ = s
+}
+"#
+    let program = probe("bvc_user_carrier_names", src)
+    assert(program >= 0)
+}
+
+test "an unhinted Ok is E0519 when a user enum also declares Ok" {
+    let src = #"type Outcome { Ok(v: Int), Fail }
+fn main() {
+    let a = Ok(3)
+    let _ = a
+}
+"#
+    let program = probe_but("bvc_unhinted_ok", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq_str("message", ambiguous_message(), "`Ok` is a variant of both Result and Outcome; qualify as Result.Ok or Outcome.Ok")
+}
+
+test "an unhinted None is E0519 when a user enum also declares None" {
+    let src = #"type Slot { None, Full(n: Int) }
+fn main() {
+    let a = None
+    let _ = a
+}
+"#
+    let program = probe_but("bvc_unhinted_none", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq_str("message", ambiguous_message(), "`None` is a variant of both Option and Slot; qualify as Option.None or Slot.None")
+}
+
+test "builtin Some, None, Ok and Err with no user namesake need no hint" {
+    let src = #"fn half(k: Int) -> Result[Int, Str] {
+    if k < 0 { return Err("negative") }
+    Ok(k / 2)
+}
+fn main() {
+    let a = Some(1)
+    let c: Result[Int, Str] = Err("e")
+    let mut d = None
+    d = Some("x")
+    let n = None
+    let h = half(4)
+    let _ = a ?? 0
+    let _ = h
+    let _ = c
+    let _ = d ?? ""
+    let _ = n ?? 3
+}
+"#
+    let program = probe("bvc_builtin_carriers", src)
+    assert(program >= 0)
+}
+
+test "the left operand of == picks Ordering over a user enum that declares Greater" {
+    let src = #"type Tok { Less, Greater, Plus }
+fn bigger(a: Int, b: Int) -> Bool {
+    a.cmp(b) == Greater
+}
+fn main() {
+    let t = Tok.Plus
+    let _ = t
+    let _ = bigger(2, 1)
+}
+"#
+    let program = probe("bvc_eq_operand_ordering", src)
+    assert(program >= 0)
+}
+
+test "the right operand of == picks the enum for a bare name on the left" {
+    let src = two_enums().concat(#"fn main() {
+    let s = NetState.Closed
+    let _ = Pending == s
+}
+"#)
+    let program = probe("bvc_eq_left_operand", src)
+    assert(program >= 0)
+}
+
+test "an unhinted Greater is E0519 when a user enum also declares Greater" {
+    let src = #"type Tok { Less, Greater, Plus }
+fn main() {
+    let g = Greater
+    let _ = g
+}
+"#
+    let program = probe_but("bvc_unhinted_greater", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq_str("message", ambiguous_message(), "`Greater` is a variant of both Ordering and Tok; qualify as Ordering.Greater or Tok.Greater")
+}
+
+test "a name only one enum declares needs no hint" {
+    let src = two_enums().concat(#"fn main() {
+    let d = Done
+    let c = Closed
+    let _ = d
+    let _ = c
+}
+"#)
+    let program = probe("bvc_unique", src)
+    assert(program >= 0)
+}
+
+test "a let annotation and an assignment target reach a bare name in an if branch" {
+    let src = #"type Slot { None, Full(n: Int) }
+fn pick(q: Bool) -> Option[Int] { if q { Some(1) } else { None } }
+fn main() {
+    let c = false
+    let r: Option[Int] = if c { pick(c) } else { None }
+    let mut s = pick(true)
+    s = if c { pick(c) } else { None }
+    let t: Slot = if c { Full(2) } else { None }
+    let _ = r
+    let _ = s
+    let _ = t
+}
+"#
+    let program = probe("bvc_if_branch_hint", src)
+    assert(program >= 0)
+}
+
+test "a bare name in an if branch with no expected type is still E0519" {
+    let src = #"type Slot { None, Full(n: Int) }
+fn pick(q: Bool) -> Option[Int] { if q { Some(1) } else { None } }
+fn main() {
+    let c = false
+    let r = if c { pick(c) } else { None }
+    let _ = r
+}
+"#
+    let program = probe_but("bvc_if_branch_no_hint", src, "AmbiguousConstruction")
+    assert(program >= 0)
+    assert_eq(ambiguous_count(), 1)
+}
