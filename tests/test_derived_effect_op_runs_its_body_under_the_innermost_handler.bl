@@ -46,8 +46,18 @@ fn with_kv(body: Str) -> Str {
     "{kv_effect_src()}{body}"
 }
 
+// Each program runs as one unit and again under --per-module, where the vtable defaults and
+// the derived bodies live in a unit other than the caller's; the two must agree.
 fn run_kv(body: Str, tag: Str) -> compile_test_helpers.RunResult {
-    compile_test_helpers.compile_and_run(with_kv(body), tag)
+    run_both(with_kv(body), tag)
+}
+
+fn run_both(src: Str, tag: Str) -> compile_test_helpers.RunResult {
+    let one = compile_test_helpers.compile_and_run(src, tag)
+    let per = compile_test_helpers.run_via_cli(src, "{tag}_pm", "--per-module")
+    assert_eq(per.exit_code, one.exit_code)
+    assert_eq(per.out, one.out)
+    one
 }
 
 test "a request-only mock answers a derived op through its own primitive" {
@@ -340,7 +350,7 @@ fn main() {
 }
 
 test "a derived body may open an async scope" {
-    let r = compile_test_helpers.compile_and_run(#"effect Kv {
+    let r = run_both(#"effect Kv {
     effect Get {
         fn fetch(key: Str) -> Str
         fn par(key: Str) -> Str {
@@ -384,4 +394,55 @@ fn main() {
 "#
     let out = compile_test_helpers.compile_and_capture(src, "derived_op_spawn_mut_capture")
     compile_test_helpers.expect_contains(out, "MutableCaptureInSpawn", "mutable capture in a derived body")
+}
+
+test "a literal that writes a derived op answers it over an outer clause for it" {
+    let r = run_kv(#"
+fn outer_shout() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn shout(key: Str) -> Str { "OUTER-{key}" }
+    }
+}
+
+fn main() {
+    with real() {
+        with outer_shout() {
+            with handler Kv.Get {
+                fn shout(key: Str) -> Str { "INNER-{key}" }
+            } {
+                io.println(kv.shout("s"))
+            }
+        }
+    }
+}
+"#, "derived_op_inner_clause_over_outer")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("INNER-s"))
+    assert(!r.out.contains("OUTER"))
+}
+
+test "a derived op over instantiated generic types runs under the innermost handler" {
+    let r = run_both(#"effect Store {
+    effect Get {
+        fn find(keys: List[Str]) -> Option[Str]
+        fn first_or(keys: List[Str], fallback: Str) -> Str {
+            match store.find(keys) {
+                Some(v) => v
+                None => fallback
+            }
+        }
+    }
+}
+
+fn main() {
+    with handler Store { fn find(keys: List[Str]) -> Option[Str] { keys.get(0) } } {
+        with handler Store.Get { fn find(keys: List[Str]) -> Option[Str] { None } } {
+            io.println(store.first_or(["a", "b"], "none"))
+        }
+        io.println(store.first_or(["a", "b"], "none"))
+    }
+}
+"#, "derived_op_generic_types")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("none\na"))
 }
