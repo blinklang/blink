@@ -529,6 +529,12 @@ fn tc_method_trait_names(tname: Str, method: Str) -> Str {
     tc_method_trait_names_idx.get(tc_method_traits_key(tname, method)) ?? ""
 }
 
+// Whether an impl of `tr` written for `tname` records `method`. Matched by whole name, so a
+// trait `MyEq` with an `eq` method is not taken for `Eq`.
+fn tc_type_writes_trait_method(tname: Str, method: Str, tr: Str) -> Bool {
+    tc_method_trait_names(tname, method).split(" and ").contains(tr)
+}
+
 // The sealed built-in List HOF surface (sections/03c_protocols.md:38,
 // sections/03_types.md:531). A user poly-impl method reusing one of these names
 // collides with the sealed method, so the name counts as one ambiguity owner.
@@ -842,11 +848,6 @@ fn tc_type_has_eq_impl(tname: Str) -> Int {
     0
 }
 
-// Does `tname` implement Eq by hand, rather than by a derive?
-fn tc_type_has_hand_eq(tname: Str) -> Bool {
-    tc_method_trait_names(tname, "eq").contains("Eq") != 0
-}
-
 // Does `tname` carry an Ord impl usable by `<`/`>`/`<=`/`>=`?
 // Covers @derive(Ord) and a user `impl Ord for T` (records `cmp` under `Ord`).
 fn tc_type_has_ord_impl(tname: Str) -> Int {
@@ -1058,30 +1059,19 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
     let k = type_kind(concrete_tid)
     // Unknowable for an unresolved/generic type — fail open, never reject.
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
-    let scalar = if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str { 1 } else { is_sized_int(k) }
     if trait_name == "Display" {
         if tc_type_id_has_display(concrete_tid) != 0 { return 1 }
         return -1
     }
-    // The @derive-backed traits resolve per INSTANCE off the tid; the impl-backed ones
-    // still key on the struct/enum BASE name. Scalars satisfy all of them structurally.
-    let base = tc_tid_struct(concrete_tid)
+    // The derivable traits are read at the instance, through its arguments and the bounds
+    // of any impl written for it (tc_trait_need).
     if trait_name == "Debug" || trait_name == "Hash" || trait_name == "Serialize" {
-        if scalar != 0 { return 1 }
-        return tc_tid_derive_fact(concrete_tid, trait_name)
+        return tc_derive_only_fact(concrete_tid, trait_name)
     }
-    if trait_name == "Eq" {
-        if scalar != 0 { return 1 }
-        if base != "" && tc_type_has_eq_impl(base) != 0 { return 1 }
-        if base != "" { return -1 }
-        return 0
-    }
-    if trait_name == "Ord" {
-        if k == TyKind.Bool { return -1 }
-        if scalar != 0 { return 1 }
-        if base != "" && tc_type_has_ord_impl(base) != 0 { return 1 }
-        if base != "" { return -1 }
-        return 0
+    if trait_name == "Eq" || trait_name == "Ord" {
+        if tc_tid_has_unbound_metavar(concrete_tid) != 0 { return 0 }
+        if tc_trait_need(concrete_tid, trait_name, []).len() == 0 { return 1 }
+        return -1
     }
     // The arithmetic traits are sealed to the built-in numeric types (03_types.md:2011),
     // so a concrete type satisfies one iff it is numeric. The top guard already returned
@@ -1096,6 +1086,15 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
     // is not needed: the compiler declares no such where-bound (audited), and
     // an unmodeled bound must never manufacture a false E0523.
     0
+}
+
+// The Hash, Debug or Serialize answer for one type, tri-state as tc_type_satisfies_bound's:
+// a scalar has each of them, and a type parameter or an unsolved type is not judged.
+fn tc_derive_only_fact(tid: Int, tr: Str) -> Int {
+    let k = type_kind(tid)
+    if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str || is_sized_int(k) != 0 { return 1 }
+    tc_tid_derive_fact(tid, tr)
 }
 
 // Tri-state per-INSTANCE answer for the three @derive-backed traits (Hash / Debug /
@@ -1113,7 +1112,7 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
 // judged against the declaration by the derive-field passes (E0520 / E1401), so it is
 // skipped here rather than decided twice. Recursion runs on the instance's arguments,
 // which are strictly less nested than the instance, so it terminates.
-fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int {
     let base = tc_tid_struct(tid)
     if base == "" { return 0 }
     let mut td = tc_type_decl_node_by_tid.get(tid) ?? -1
@@ -1146,7 +1145,7 @@ fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report
 // One field of a generic declaration, judged against the instance `tid`. Answers -1 only
 // when a type parameter occurring in the field's annotation is bound to an argument that
 // definitely lacks the trait; every other shape answers 0 (skip).
-fn tc_tparam_field_fact(f: Int, tps: Int, tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+fn tc_tparam_field_fact(f: Int, tps: Int, tid: Int, tr: Str) -> Int {
     tc_ann_tparam_fact(node_value(f), tps, tid, tr)
 }
 
@@ -1154,7 +1153,7 @@ fn tc_tparam_field_fact(f: Int, tps: Int, tid: Int, tr: Str) -> Int ! TypeCheck.
 // not only when it IS the whole annotation: a derived impl must traverse every field, and
 // every container it can traverse imposes the same trait on its own element. So
 // `inner: Box[T]` is judged exactly like `v: T`, one level deeper.
-fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int {
     if ann == -1 { return 0 }
     let aname = node_name(ann)
     let mut i = 0
@@ -1162,7 +1161,7 @@ fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int ! TypeCheck.
         if node_name(sublist_get(tps, i)) == aname {
             let arg = tc_tid_struct_arg_tid(tid, i)
             if arg == -1 { return 0 }
-            return tc_type_satisfies_bound(arg, tr)
+            return tc_derive_only_fact(arg, tr)
         }
         i = i + 1
     }
@@ -4045,9 +4044,14 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) -> Int !
     while i < traits.len() {
         let tr = traits.get(i).unwrap()
         if tc_pipe_has(bounds, tr) != 0 && tc_type_satisfies_bound(concrete, tr) == -1 {
-            diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
-                "`{type_to_str(concrete)}` does not satisfy the {tr} bound on type parameter {name}", node,
-                "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types")
+            let path = tc_trait_need(concrete, tr, [])
+            let fixes = if path.len() > 0 { tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tr) } else { [] }
+            let help = if fixes.len() > 0 { fixes.join("\n") } else {
+                "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
+            }
+            diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
+                "`{type_to_str(concrete)}` does not satisfy the {tr} bound on type parameter {name}", node, help,
+                tc_trait_need_notes(path, tr))
             return 1
         }
         i = i + 1
@@ -4066,20 +4070,31 @@ fn tc_check_user_bounds(decl: Int, idx: Int, concrete: Int, binds: Map[Str, Int]
     let _ = tc_report_unmet_user_bound(tp, impl_binders, node_type_params(decl), concrete, binds, node)
 }
 
-// The `where` bounds of the impl a method call reached, read at the receiver instance's
-// arguments (sections/05_memory_compile_errors.md, "Checked at the call"). Empty `ibinds`
-// means the impl's binders are not read off the receiver, so there is nothing to judge.
-fn tc_check_impl_where_bounds_at_call(decl: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+// The bounds of the impl a method call reached, on its binders and in its `where` clause,
+// read at the receiver instance's arguments (sections/05_memory_compile_errors.md, "Checked
+// at the call"). Empty `ibinds` means the impl's binders are not read off the receiver, so
+// there is nothing to judge. Reports at most one bound.
+fn tc_check_impl_bounds_at_call(decl: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
     let im = tc_method_block.get(decl) ?? -1
     if im == -1 || node_kind(im) != NodeKind.ImplBlock { return }
-    let wb = node_impl_where_bounds(im)
-    if wb == -1 { return }
+    let binders = node_impl_binders(im)
+    let mut carriers: List[Int] = []
     let mut i = 0
-    while i < sublist_length(wb) {
-        let cons = sublist_get(wb, i)
-        let concrete = ibinds.get(node_name(cons)) ?? -1
-        if concrete != -1 && tc_report_unmet_user_bound(cons, node_impl_binders(im), -1, concrete, ibinds, node) != 0 { return }
+    while binders != -1 && i < sublist_length(binders) {
+        carriers.push(sublist_get(binders, i))
         i = i + 1
+    }
+    let wb = node_impl_where_bounds(im)
+    let mut j = 0
+    while wb != -1 && j < sublist_length(wb) {
+        carriers.push(sublist_get(wb, j))
+        j = j + 1
+    }
+    for c in carriers {
+        let concrete = ibinds.get(node_name(c)) ?? -1
+        if concrete == -1 { continue }
+        if tc_check_one_bound(node_name(c), tparam_node_bound_traits(c), concrete, node) != 0 { return }
+        if tc_report_unmet_user_bound(c, binders, -1, concrete, ibinds, node) != 0 { return }
     }
 }
 
@@ -18652,10 +18667,13 @@ fn tc_eq_need_parts(tid: Int, parts: List[Int], visiting: List[Int]) -> List[Int
 fn tc_eq_need_enum(tid: Int, visiting: List[Int]) -> List[Int] {
     let base = tc_enum_base_tid(tid)
     let bname = strip_module_qualifier(tc_type_name(base))
-    if tc_type_has_hand_eq(bname) { return [] }
+    match tc_hand_impl_need(tid, base, "Eq", "eq", visiting) {
+        Some(need) => { return need }
+        None => {}
+    }
     if tc_type_name_derives(bname, "Eq") != 0 && base == tid { return [] }
     if !tc_enum_has_payload(base) { return [] }
-    if visiting.contains(base) { return [] }
+    if tc_need_visited(visiting, tid) { return [] }
     let inst = if base == tid { -1 } else { tid }
     let mut parts: List[Int] = []
     for vslot in tc_enum_variant_slots(base) {
@@ -18663,29 +18681,142 @@ fn tc_eq_need_enum(tid: Int, visiting: List[Int]) -> List[Int] {
             parts.push(tc_member_tid_at_instance(tc_evfield_tid(fslot), inst))
         }
     }
-    let mut inner: List[Int] = []
-    for v in visiting { inner.push(v) }
-    inner.push(base)
-    tc_eq_need_parts(tid, parts, inner)
+    tc_eq_need_parts(tid, parts, tc_need_visiting(visiting, tid))
 }
 
-// A hand impl answers for every instance. A derive answers from the fields, read at the
-// instance, so `Box[Widget]` asks about `Widget` (03_types.md, *Generic Type Bound
-// Inference*). A struct already being walked counts as `Eq`, as an enum does.
+// A hand impl answers where its own bounds hold (tc_hand_impl_need). A derive answers from
+// the fields, read at the instance, so `Box[Widget]` asks about `Widget` (03_types.md,
+// *Generic Type Bound Inference*). A struct already being walked counts as `Eq`, as an enum
+// does.
 fn tc_eq_need_struct(tid: Int, visiting: List[Int]) -> List[Int] {
     let base = tc_struct_base_tid(tid)
-    let bname = strip_module_qualifier(tc_type_name(base))
-    if tc_type_has_hand_eq(bname) { return [] }
-    if tc_type_name_derives(bname, "Eq") == 0 { return [tid] }
-    if base == tid || visiting.contains(base) { return [] }
-    let mut parts: List[Int] = []
-    for slot in tc_struct_field_slots(base) {
-        parts.push(tc_member_tid_at_instance(tc_sfield_tid(slot), tid))
+    match tc_hand_impl_need(tid, base, "Eq", "eq", visiting) {
+        Some(need) => { return need }
+        None => {}
     }
+    if tc_type_name_derives(strip_module_qualifier(tc_type_name(base)), "Eq") == 0 { return [tid] }
+    tc_struct_need_fields(tid, base, "Eq", visiting)
+}
+
+// A derived impl on a struct holds where every field, read at the instance, has the trait.
+fn tc_struct_need_fields(tid: Int, base: Int, tr: Str, visiting: List[Int]) -> List[Int] {
+    if base == tid || tc_need_visited(visiting, tid) { return [] }
+    let inner = tc_need_visiting(visiting, tid)
+    for slot in tc_struct_field_slots(base) {
+        let need = tc_trait_need(tc_member_tid_at_instance(tc_sfield_tid(slot), tid), tr, inner)
+        if need.len() > 0 { return eq_need_through(tid, need) }
+    }
+    []
+}
+
+// An instance already being walked counts as having the trait, which lets a recursive type
+// answer from its other parts. The walk is keyed by instance, so `Box[Box[Widget]]` still
+// reads `Box[Widget]`; a type whose recursion grows its arguments (`Nest[A]` holding a `Nest[List[A]]`)
+// would never repeat one, so past a fixed depth the walk stops and asks nothing.
+fn tc_need_visited(visiting: List[Int], tid: Int) -> Bool {
+    if visiting.len() >= 32 { return true }
+    for v in visiting {
+        if tc_tid_same_type(v, tid) { return true }
+    }
+    false
+}
+
+fn tc_need_visiting(visiting: List[Int], tid: Int) -> List[Int] {
     let mut inner: List[Int] = []
     for v in visiting { inner.push(v) }
-    inner.push(base)
-    tc_eq_need_parts(tid, parts, inner)
+    inner.push(tid)
+    inner
+}
+
+// What `tr` needs of `tid`, read as tc_eq_need reads `Eq`: the chain from `tid` to the
+// innermost type without the trait, or empty when `tid` has it. A trait this has no rule
+// for asks nothing, so no caller refuses on it.
+fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
+    match tr {
+        "Eq" => tc_eq_need(tid, visiting)
+        "Ord" => tc_ord_need(tid, visiting)
+        "Hash" => tc_derive_only_need(tid, tr)
+        "Debug" => tc_derive_only_need(tid, tr)
+        "Serialize" => tc_derive_only_need(tid, tr)
+        _ => []
+    }
+}
+
+fn tc_derive_only_need(tid0: Int, tr: Str) -> List[Int] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_derive_only_fact(tid, tr) == -1 { return [tid] }
+    []
+}
+
+// Whether the instance `tid` has `tr`, by the rule the type checker judged it with. Pure,
+// so codegen emits a derived body only at an instance where the derive holds.
+pub fn tc_instance_has_trait(tid: Int, tr: Str) -> Bool {
+    tc_trait_need(tid, tr, []).len() == 0
+}
+
+// What the impls of `tr` written for `base` need of the instance `tid`, or None when no
+// impl of `tr` is written for it. An impl answers where its receiver matches `tid` and its
+// binder bounds and `where` bounds hold at the arguments it binds, so an unbounded
+// `impl[T] Eq for H[T]` holds for every T. The bare declaration stands for an instance
+// not yet chosen, which any impl answers.
+fn tc_hand_impl_need(tid: Int, base: Int, tr: Str, method: Str, visiting: List[Int]) -> Option[List[Int]] {
+    if !tc_type_writes_trait_method(strip_module_qualifier(tc_type_name(base)), method, tr) { return None }
+    if base == tid { return Some([]) }
+    let k = type_kind(tid)
+    let mut failed: List[Int] = []
+    let mut applies = false
+    for im in tc_impl_recv_tids.keys() {
+        if strip_module_qualifier(node_trait_name(im)) != tr { continue }
+        let raw = tc_impl_recv_tids.get(im) ?? -1
+        if type_kind(raw) != k { continue }
+        let rbase = if k == TyKind.Struct { tc_struct_base_tid(raw) } else { tc_enum_base_tid(raw) }
+        if rbase != base { continue }
+        let binds: Map[Str, Int] = Map()
+        unify_typevar_binds(raw, tid, binds)
+        if !tc_tid_same_type(tc_resolve(substitute_typevar_tid(raw, binds)), tid) { continue }
+        applies = true
+        let need = tc_impl_bounds_need(im, binds, visiting)
+        if need.len() == 0 { return Some([]) }
+        if failed.len() == 0 { failed = need }
+    }
+    if !applies { return Some([tid]) }
+    Some(eq_need_through(tid, failed))
+}
+
+// What an impl's binder bounds and `where` bounds need of the arguments `binds` gives its
+// binders: the first bound that does not hold, as tc_trait_need answers it.
+fn tc_impl_bounds_need(im: Int, binds: Map[Str, Int], visiting: List[Int]) -> List[Int] {
+    let binders = node_impl_binders(im)
+    let mut i = 0
+    while binders != -1 && i < sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        let need = tc_carrier_bounds_need(tp, binds.get(tc_binder_key(tp, node_name(tp))) ?? -1, visiting)
+        if need.len() > 0 { return need }
+        i = i + 1
+    }
+    let wb = node_impl_where_bounds(im)
+    let mut j = 0
+    while wb != -1 && j < sublist_length(wb) {
+        let cons = sublist_get(wb, j)
+        let need = tc_carrier_bounds_need(cons, binds.get(node_name(cons)) ?? -1, visiting)
+        if need.len() > 0 { return need }
+        j = j + 1
+    }
+    []
+}
+
+// The first of the bounds written on `carrier` (a binder or a `where` constraint) that the
+// type `arg` does not have. An argument nothing binds is not judged.
+fn tc_carrier_bounds_need(carrier: Int, arg: Int, visiting: List[Int]) -> List[Int] {
+    let bounds = node_elements(carrier)
+    if arg == -1 || bounds == -1 { return [] }
+    let mut i = 0
+    while i < sublist_length(bounds) {
+        let need = tc_trait_need(arg, strip_module_qualifier(node_name(sublist_get(bounds, i))), visiting)
+        if need.len() > 0 { return need }
+        i = i + 1
+    }
+    []
 }
 
 fn tc_eq_need(tid0: Int, visiting: List[Int]) -> List[Int] {
@@ -18761,25 +18892,82 @@ fn tc_eq_need_help(leaf: Int, op: Str, node: Int) -> Str {
 
 // The fix for the innermost type with no `Eq`, the same for `==` and for assert_eq.
 fn tc_eq_need_fixes(leaf: Int) -> List[Str] {
+    tc_trait_need_fixes(leaf, "Eq")
+}
+
+// The fix for the innermost type without `tr`. A type that already has an impl of `tr` that
+// does not apply here needs one that does; a type that derives `tr` already lacks it only
+// through an argument, which the chain names, so it gets no fix of its own.
+fn tc_trait_need_fixes(leaf: Int, tr: Str) -> List[Str] {
     let mut lines: List[Str] = []
     let k = type_kind(leaf)
     if k == TyKind.Struct || k == TyKind.Enum {
         let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
-        lines.push("add `@derive(Eq)` to `type {strip_module_qualifier(tc_type_name(base))}`")
+        let bname = strip_module_qualifier(tc_type_name(base))
+        if tc_type_writes_trait_method(bname, tc_trait_method(tr), tr) {
+            lines.push("write `impl {tr} for {type_to_str(leaf)}`")
+        } else if tc_type_name_derives(bname, tr) == 0 {
+            lines.push("add `@derive({tr})` to `type {bname}`")
+        }
     }
-    if k == TyKind.Typevar { lines.push("add the bound `[{type_to_str(leaf)}: Eq]`") }
+    if k == TyKind.Typevar { lines.push("add the bound `[{type_to_str(leaf)}: {tr}]`") }
     lines
+}
+
+// The method an impl of a derivable trait records under its trait.
+fn tc_trait_method(tr: Str) -> Str {
+    match tr {
+        "Eq" => "eq"
+        "Ord" => "cmp"
+        "Hash" => "hash"
+        "Debug" => "debug"
+        _ => ""
+    }
+}
+
+// The derivable trait whose derive writes `method`, or "".
+fn tc_derived_method_trait(method: Str) -> Str {
+    match method {
+        "eq" => "Eq"
+        "cmp" => "Ord"
+        "hash" => "Hash"
+        "debug" => "Debug"
+        _ => ""
+    }
+}
+
+// A derived method called by name is the derive at this instance, so it holds only where the
+// derive does, as `==` holds only there.
+fn tc_refuse_derived_method_at(recv: Int, method: Str, node: Int) ! Diag.Report {
+    let tr = tc_derived_method_trait(method)
+    if tr == "" { return }
+    let path = tc_trait_need(recv, tr, [])
+    if path.len() == 0 { return }
+    tc_report_trait_need(path, tr, node)
+}
+
+fn tc_report_trait_need(path: List[Int], tr: Str, node: Int) ! Diag.Report {
+    diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `{tr}`", node,
+        tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tr).join("\n"), tc_trait_need_notes(path, tr))
 }
 
 // Each step of the chain from the compared type to the innermost type with no `Eq`.
 fn tc_eq_need_notes(path: List[Int]) -> List[Str] {
+    tc_trait_need_notes(path, "Eq")
+}
+
+fn tc_trait_need_notes(path: List[Int], tr: Str) -> List[Str] {
     let mut notes: List[Str] = []
     let mut i = 0
     while i + 1 < path.len() {
-        notes.push("`{type_to_str(path.get(i).unwrap())}` is `Eq` only if `{type_to_str(path.get(i + 1).unwrap())}` is `Eq`")
+        notes.push(tc_trait_need_step(path.get(i).unwrap(), path.get(i + 1).unwrap(), tr))
         i = i + 1
     }
     notes
+}
+
+fn tc_trait_need_step(outer: Int, inner: Int, tr: Str) -> Str {
+    "`{type_to_str(outer)}` is `{tr}` only if `{type_to_str(inner)}` is `{tr}`"
 }
 
 // `==` and `!=` need `Eq` on the operand type, recursively. Returns 1 when it reported,
@@ -18803,6 +18991,20 @@ fn reject_eq_less_operands(op: Str, lt: Int, rt: Int, node: Int) -> Int ! TypeCh
         return 1
     }
     0
+}
+
+// `<`, `>`, `<=` and `>=` on two values of one struct need `Ord` on it, read at the instance
+// as `==` reads `Eq`. Returns 1 when it reported. An enum compares by its tag, and other
+// operand kinds are left to the caller's own match.
+fn reject_ord_less_operands(lt: Int, rt: Int, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    let a = resolve_alias_tid(tc_resolve(lt))
+    let b = resolve_alias_tid(tc_resolve(rt))
+    if type_kind(a) != TyKind.Struct || type_kind(b) != TyKind.Struct { return 0 }
+    if tc_struct_base_tid(a) != tc_struct_base_tid(b) || types_compatible(a, b) == 0 { return 0 }
+    let path = tc_ord_need(a, [])
+    if path.len() == 0 { return 0 }
+    tc_report_trait_need(path, "Ord", node)
+    1
 }
 
 // assert_eq and assert_ne carry a `T: Eq` bound, checked the way `==` is checked, so a
@@ -18839,29 +19041,47 @@ fn tc_tuple_elem_tids(tid: Int) -> List[Int] {
 // What `sort` needs of its element: `T: Ord` (03_types.md, *The `ListOps` Trait*). The
 // answer runs from the element to the innermost type with no `Ord`, and is empty when the
 // element is `Ord`. A tuple is `Ord` when every element is (*Tuples*), and a fieldless enum
-// is `Ord` by its declaration (*Enum Ord*). An element nothing has chosen yet is not refused,
-// for the reason tc_list_scan_elem_need gives.
-fn tc_ord_need(tid0: Int) -> List[Int] {
+// is `Ord` by its declaration (*Enum Ord*). A struct or enum is read at the instance, as
+// tc_eq_need reads it for `Eq`. An element nothing has chosen yet is not refused, for the
+// reason tc_list_scan_elem_need gives.
+fn tc_ord_need(tid0: Int, visiting: List[Int]) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
     if tc_tid_is_no_info(tid) != 0 || tc_tid_has_unbound_metavar(tid) != 0 { return [] }
     let k = type_kind(tid)
     if tc_scalar_has_ord(k) || k == TyKind.Never || k == TyKind.Void || k == TyKind.Unknown { return [] }
     if k == TyKind.Tuple {
         for e in tc_tuple_elem_tids(tid) {
-            let need = tc_ord_need(e)
+            let need = tc_ord_need(e, visiting)
             if need.len() > 0 { return eq_need_through(tid, need) }
         }
         return []
     }
     if k == TyKind.Struct {
-        if tc_type_has_ord_impl(strip_module_qualifier(tc_type_name(tc_struct_base_tid(tid)))) != 0 { return [] }
-        return [tid]
+        let base = tc_struct_base_tid(tid)
+        match tc_hand_impl_need(tid, base, "Ord", "cmp", visiting) {
+            Some(need) => { return need }
+            None => {}
+        }
+        if tc_type_name_derives(strip_module_qualifier(tc_type_name(base)), "Ord") == 0 { return [tid] }
+        return tc_struct_need_fields(tid, base, "Ord", visiting)
     }
     if k == TyKind.Enum {
         let base = tc_enum_base_tid(tid)
-        if tc_type_has_ord_impl(strip_module_qualifier(tc_type_name(base))) != 0 { return [] }
+        match tc_hand_impl_need(tid, base, "Ord", "cmp", visiting) {
+            Some(need) => { return need }
+            None => {}
+        }
         if !tc_enum_has_payload(base) { return [] }
-        return [tid]
+        if tc_type_name_derives(strip_module_qualifier(tc_type_name(base)), "Ord") == 0 { return [tid] }
+        if base == tid || tc_need_visited(visiting, tid) { return [] }
+        let inner = tc_need_visiting(visiting, tid)
+        for vslot in tc_enum_variant_slots(base) {
+            for fslot in tc_evar_field_slots(vslot) {
+                let need = tc_ord_need(tc_member_tid_at_instance(tc_evfield_tid(fslot), tid), inner)
+                if need.len() > 0 { return eq_need_through(tid, need) }
+            }
+        }
+        return []
     }
     if k == TyKind.Typevar {
         // "" is a name that is not an active type parameter; it passes, as in tc_eq_need.
@@ -18896,14 +19116,14 @@ fn tc_ord_example_part(tid0: Int) -> Str {
     if k == TyKind.Tuple {
         let mut i = 0
         for e in tc_tuple_elem_tids(tid) {
-            if tc_ord_need(e).len() == 0 && tc_ord_not_lowered(e) == -1 { return ".{i}" }
+            if tc_ord_need(e, []).len() == 0 && tc_ord_not_lowered(e) == -1 { return ".{i}" }
             i = i + 1
         }
     }
     if k == TyKind.Struct {
         for slot in tc_struct_field_slots(tid) {
             let ft = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
-            if tc_ord_need(ft).len() == 0 && tc_ord_not_lowered(ft) == -1 { return ".{tc_sfield_name(slot)}" }
+            if tc_ord_need(ft, []).len() == 0 && tc_ord_not_lowered(ft) == -1 { return ".{tc_sfield_name(slot)}" }
         }
     }
     ""
@@ -18928,7 +19148,7 @@ fn tc_sort_fix(lead: Str, recv: Int, elem: Int) -> Str ! Diag.Report {
 // bound, naming the innermost type without it, and an element whose order the compiler
 // cannot build yet as a TypeError that says so. Returns 1 when it reported.
 fn tc_refuse_unordered_sort(node: Int, recv: Int, elem: Int) -> Int ! TypeCheck.Report, Diag.Report {
-    let path = tc_ord_need(elem)
+    let path = tc_ord_need(elem, [])
     if path.len() > 0 {
         let leaf = path.get(path.len() - 1).unwrap()
         let lk = type_kind(leaf)
@@ -18946,10 +19166,14 @@ fn tc_refuse_unordered_sort(node: Int, recv: Int, elem: Int) -> Int ! TypeCheck.
         while i + 1 < path.len() {
             let outer = path.get(i).unwrap()
             let inner = path.get(i + 1).unwrap()
-            let elems = tc_tuple_elem_tids(outer)
-            let mut idx = 0
-            while idx < elems.len() && elems.get(idx).unwrap() != inner { idx = idx + 1 }
-            notes.push("`{type_to_str(inner)}` does not implement `Ord` (element .{idx} of tuple)")
+            if type_kind(outer) == TyKind.Tuple {
+                let elems = tc_tuple_elem_tids(outer)
+                let mut idx = 0
+                while idx < elems.len() && elems.get(idx).unwrap() != inner { idx = idx + 1 }
+                notes.push("`{type_to_str(inner)}` does not implement `Ord` (element .{idx} of tuple)")
+            } else {
+                notes.push(tc_trait_need_step(outer, inner, "Ord"))
+            }
             i = i + 1
         }
         diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
@@ -19070,10 +19294,9 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
         let an = tc_type_name(a)
         let bn = tc_type_name(b)
         if an != bn || an == "" { return 0 }
-        if relational != 0 {
-            return tc_type_has_ord_impl(an)
-        }
-        return tc_type_has_eq_impl(an)
+        let tr = if relational != 0 { "Ord" } else { "Eq" }
+        if tc_trait_need(a, tr, []).len() == 0 { return 1 }
+        return 0
     }
 
     0
@@ -19137,7 +19360,7 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
             let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
             if lit_r == 0 && lit_l == 0 {
                 let relational = if op == "==" || op == "!=" { 0 } else { 1 }
-                let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { 0 }
+                let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { reject_ord_less_operands(lt, rt, node) }
                 if refused == 0 && cmp_operands_ok(lt, rt, relational) == 0 {
                     // Operands that pass as an equality pair fail only for want of Ord.
                     // Name the side without it: `1 < true` lacks Ord on the Bool.
@@ -21425,7 +21648,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // Before the argument check: an argument typed by an impl binder takes the
                 // receiver's type argument as its hint, as a List poly-impl argument does.
                 let ibinds = tc_impl_binds_at_call(sig, obj_t)
-                tc_check_impl_where_bounds_at_call(fnsig_pool.get(sig).unwrap().decl, ibinds, node)
+                tc_check_impl_bounds_at_call(fnsig_pool.get(sig).unwrap().decl, ibinds, node)
+                if sole_trait == "" && fnsig_pool.get(sig).unwrap().decl < 0 {
+                    tc_refuse_derived_method_at(obj_t, method, node)
+                }
                 if node_type_params(node) != -1 {
                     nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
                     return tc_call_with_type_args("{tname}.{method}", sig, node, 1, ibinds)

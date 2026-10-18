@@ -1,0 +1,65 @@
+// `==` on a generic type with a written Eq impl names no method, so no call node leads the
+// pass to the impl's body. An instance of the type registers the impl's method itself, but
+// only where the impl holds: a bounded impl at an argument without the bound has no body.
+
+import lower_test_helpers.{rhs_of, assert_eq_str}
+import cg_test_helpers.{cg_probe_compile}
+import mono.{run_mono, instances, instance_of_poly_method}
+import layout.{tid_of_node}
+import parser.{node_count, node_kind, node_methods, node_name, sublist_get}
+import ast.{NodeKind, nk_of}
+import typecheck.{tc_type_str}
+import diagnostics.{Diag}
+
+fn src() -> Str {
+    #"type Widget { id: Int }
+
+type Holder[T] { v: T }
+
+impl[T] Eq for Holder[T] {
+    fn eq(self, other: Holder[T]) -> Bool { true }
+}
+
+type Bounded[T] { v: T }
+
+impl[T: Eq] Eq for Bounded[T] {
+    fn eq(self, other: Bounded[T]) -> Bool { self.v == other.v }
+}
+
+fn main() {
+    let h = Holder { v: Widget { id: 1 } }
+    let g = Bounded { v: 1 }
+    let w = Bounded { v: Widget { id: 2 } }
+    let _keep = [h == h, g == g, w.v.id == 2]
+}
+"#
+}
+
+fn eq_of_impl_for(recv: Str) -> Int {
+    let mut found = -1
+    let mut i = 0
+    while i < node_count() {
+        if nk_of(node_kind(i)) == NodeKind.ImplBlock && node_name(i) == recv {
+            found = sublist_get(node_methods(i), 0)
+        }
+        i = i + 1
+    }
+    found
+}
+
+fn eq_instance_at(recv: Str, local: Str) -> Int ! Diag.Report {
+    instance_of_poly_method(eq_of_impl_for(recv), tid_of_node(rhs_of(local)))
+}
+
+test "an unbounded written Eq impl has an instance at an argument with no Eq" {
+    run_mono(cg_probe_compile("build/mono_operator_impl.bl", src()))
+    let row = eq_instance_at("Holder", "h")
+    assert(row >= 0)
+    assert_eq_str("receiver", tc_type_str(instances().get(row).unwrap().arg_tids), "(Widget)")
+}
+
+test "a bounded written Eq impl has an instance only where its bound holds" {
+    run_mono(cg_probe_compile("build/mono_operator_impl.bl", src()))
+    assert(eq_instance_at("Bounded", "g") >= 0)
+    assert_eq_str("bad argument", "{eq_instance_at("Bounded", "w")}", "-1")
+}

@@ -51,7 +51,7 @@ import layout.{
     tid_holds_tag_member, spawn_pair_spelling, task_entry_spelling, pool_spelling,
     async_scope_handles_spelling, list_slots_hold_no_pointer,
 }
-import mono.{instances, instance_for_call, iterator_route_name, iterator_route_module, mark_instance_named}
+import mono.{instances, instance_for_call, instance_of_poly_method, iterator_route_name, iterator_route_module, mark_instance_named}
 import cg_reg.{cg_reg_fn_decls, cg_reg_fns_named, cg_reg_fs_op_decl, cg_reg_impl_decls, cg_reg_trait_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
@@ -350,13 +350,33 @@ fn cc_carrier_arm_into(node: Int, c: CarrierRef, bools: LayoutRecord, left: Str,
 fn cc_equality_symbol(node: Int, decl: Int, recv_tid: Int) -> Str ! Diag.Report {
     let im = cc_impl_for(node, recv_tid, trait_eq)
     if im == IMPL_REFUSED { return "" }
-    if im >= 0 { return c_impl_method_name(im, method_eq) }
+    if im >= 0 { return cc_impl_operator_symbol(node, im, method_eq, recv_tid) }
     if cc_derives_equality(decl) { return c_derived_method_symbol(recv_tid, method_eq) }
     // An enum is Eq when every payload is, so one with neither compares its members.
     if cc_kind(recv_tid) == TyKind.Enum { return cc_members_eq_fn(node, recv_tid) }
     diag_ice_at("EqualityMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "`{node_name(decl)}` has neither a derived nor a written {trait_eq} method", node,
         "typecheck must reject a comparison whose operand carries no equality; this is a compiler bug")
+    ""
+}
+
+// A written impl over a user generic type has one body per instance, which the pass
+// registered beside the type's own instance, so the operator names that one.
+fn cc_impl_operator_symbol(node: Int, im: Int, mname: Str, recv_tid: Int) -> Str ! Diag.Report {
+    if !tc_impl_is_poly_user(im) { return c_impl_method_name(im, mname) }
+    let m = cc_method_of(im, mname)
+    if m < 0 { return "" }
+    let row = instance_of_poly_method(m, recv_tid)
+    match instances().get(row) {
+        Some(inst) => {
+            mark_instance_named(row)
+            return inst.c_name
+        }
+        None => {}
+    }
+    diag_ice_at("MonoInstanceNotRegistered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "`{mname}` of `{tc_type_str(recv_tid)}` has no monomorphised instance here", node,
+        "the pass must register the impl method at every instance of the type it holds at")
     ""
 }
 
@@ -410,7 +430,7 @@ fn cc_ordering_symbol(node: Int, operand: Int) -> Str ! Diag.Report {
     }
     let im = cc_impl_for(node, operand, trait_ord)
     if im == IMPL_REFUSED { return "" }
-    if im >= 0 { return c_impl_method_name(im, method_cmp) }
+    if im >= 0 { return cc_impl_operator_symbol(node, im, method_cmp, operand) }
     if decl_has_derive(decl, trait_ord) { return c_derived_method_symbol(operand, method_cmp) }
     diag_ice_at("OrderingMethodNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "`{node_name(decl)}` has neither a derived nor a written {trait_ord} method", node,
