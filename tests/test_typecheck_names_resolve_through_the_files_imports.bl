@@ -1,0 +1,74 @@
+// A name written in a file binds only through that file's own imports (sections/07 §10.1):
+// a bare name through a selection or the file's own module, a qualified name through a module
+// the file imports, whose `pub` item it names. A module another file imports is loaded into
+// the program, but its qualifier binds nothing in a file that does not import it.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn module_probe(name: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    diag_reset()
+    check_types(compile_to_program("tests/zzin_imports/src/{name}.bl", 1))
+}
+
+// Everything the probe reported that is not a warning, as `name: message` lines.
+fn problems_reported() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity != "warning" { out = out.concat("{d.name}: {d.message}\n") }
+    }
+    out
+}
+
+test "selected and qualified names of an imported module check clean" {
+    module_probe("main_clean")
+    let p = problems_reported()
+    assert(p == "", "expected the selected and qualified forms to resolve, got:\n{p}")
+}
+
+test "an impl header naming a trait the import list does not select is reported" {
+    module_probe("main_impl_unselected")
+    let p = problems_reported()
+    assert(p.contains("ImportNotSelected") && p.contains("ZiOther"), "expected ImportNotSelected naming ZiOther, got:\n{p}")
+}
+
+test "a type qualifier naming no imported module is reported in every type position" {
+    for form in ["param", "return", "field", "bound"] {
+        module_probe("main_{form}_unimported_qualifier")
+        let p = problems_reported()
+        assert(p.contains("nomod"), "expected the {form} form to report `nomod`, got:\n{p}")
+    }
+}
+
+test "a value qualifier naming no imported module is reported" {
+    module_probe("main_value_unimported_qualifier")
+    let p = problems_reported()
+    let mut count = 0
+    for line in p.split("\n") {
+        if line.contains("nomod") { count = count + 1 }
+    }
+    assert(count == 3, "expected the call, the literal and the variant to each report `nomod`, got:\n{p}")
+}
+
+test "a qualifier another file imports binds nothing in this file" {
+    for form in ["type", "call", "literal"] {
+        module_probe("main_{form}_through_another_files_import")
+        let p = problems_reported()
+        assert(p.contains("zzin_lib"), "expected the {form} form to report `zzin_lib`, got:\n{p}")
+    }
+}
+
+test "a qualified type naming a private type of that module is reported" {
+    module_probe("main_qualified_private_type")
+    let p = problems_reported()
+    assert(p.contains("PrivateItemAccess") && p.contains("ZiPriv"), "expected a private-access error naming ZiPriv, got:\n{p}")
+}
+
+test "a qualified type naming a type its module does not declare is reported" {
+    module_probe("main_qualifier_module_lacks_type")
+    let p = problems_reported()
+    assert(p.contains("UnknownType") && p.contains("zzin_helper.ZiPt"), "expected an unknown-type error naming zzin_helper.ZiPt, got:\n{p}")
+}
