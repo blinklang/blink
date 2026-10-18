@@ -317,3 +317,130 @@ pub fn make_b() -> Int {
     }
     cleanup(base)
 }
+
+// A call through a module qualifier fills the default as a bare call does, in the module
+// that declares it.
+test "a module-qualified call that leaves out a keyword default fills it in the declaring module" {
+    let alpha = #"const k = 3
+
+pub fn scaled(n: Int, -- by: Int = k) -> Int {
+    n * by
+}
+
+pub fn make_a() -> Int {
+    scaled(2)
+}
+"#
+    let beta = #"import alpha
+
+const k = "two"
+
+pub fn make_b() -> Str {
+    "{k}{alpha.scaled(2)}/{alpha.scaled(2, by: 5)}"
+}
+"#
+    expect_run(".tmp/_test_defaults_qualified", alpha, beta, "6 two6/10")
+}
+
+test "a module-qualified generic call that leaves out a keyword default fills it in the declaring module" {
+    let alpha = #"const k = 3
+
+pub fn tagged[T](x: T, -- n: Int = k) -> Int {
+    let _ = x
+    n
+}
+
+pub fn make_a() -> Int {
+    tagged(true)
+}
+"#
+    let beta = #"import alpha
+
+const k = "two"
+
+pub fn make_b() -> Str {
+    "{k}{alpha.tagged("q")}/{alpha.tagged(1, n: 5)}"
+}
+"#
+    expect_run(".tmp/_test_defaults_qualified_generic", alpha, beta, "3 two3/5")
+}
+
+// beta declares its own `scaled` with another signature; the qualifier names alpha's.
+test "a module-qualified call checks against the signature of the module the qualifier names" {
+    let alpha = #"pub fn scaled(n: Int, -- by: Int = 3) -> Int {
+    n * by
+}
+
+pub fn make_a() -> Int {
+    scaled(1)
+}
+"#
+    let beta = #"import alpha
+
+fn scaled(s: Str) -> Str {
+    "s{s}"
+}
+
+pub fn make_b() -> Str {
+    "{scaled("x")}{alpha.scaled(2, by: 3)}"
+}
+"#
+    expect_run(".tmp/_test_defaults_qualified_namesake_fn", alpha, beta, "3 sx6")
+}
+
+// Each call is a mistake a bare call to the same fn reports; the qualifier must not hide it.
+test "a module-qualified call reports the argument mistakes a bare call reports" {
+    let base = ".tmp/_test_defaults_qualified_mistakes"
+    let alpha = #"pub fn scaled(n: Int, -- by: Int = 3) -> Int {
+    n * by
+}
+
+pub fn make_a() -> Int {
+    1
+}
+"#
+    let cases = [
+        ["alpha.scaled()", "argument(s), got 0"],
+        ["alpha.scaled(2, bx: 5)", "names no keyword parameter"],
+        ["alpha.scaled(2, 5)", "take their arguments by label"],
+        ["alpha.scaled(\"a\")", "expects Int, got Str"],
+    ]
+    for c in cases {
+        let call = c.get(0).unwrap()
+        let want = c.get(1).unwrap()
+        let beta = "import alpha\n\npub fn make_b() -> Int \{\n    {call}\n\}\n"
+        write_package(base, alpha, beta, ["alpha", "beta"])
+        let chk = blink_in(base, "check")
+        if exited_clean(chk) || !chk.contains(want) || chk.contains("internal compiler error") {
+            fail(base, "`{call}` should report `{want}`, got: {chk}")
+            return
+        }
+    }
+    cleanup(base)
+}
+
+test "a module-qualified call of a deprecated fn warns as a bare call does" {
+    let base = ".tmp/_test_defaults_qualified_deprecated"
+    let alpha = #"@deprecated(since: "1.0", replacement: "make_a")
+pub fn old(n: Int) -> Int {
+    n
+}
+
+pub fn make_a() -> Int {
+    1
+}
+"#
+    let beta = #"import alpha
+
+pub fn make_b() -> Int {
+    alpha.old(2)
+}
+"#
+    write_package(base, alpha, beta, ["alpha", "beta"])
+    let chk = blink_in(base, "check")
+    if !exited_clean(chk) || !chk.contains("use of deprecated function `alpha.old`") {
+        fail(base, "`alpha.old(2)` should check clean with a deprecation warning, got: {chk}")
+        return
+    }
+    cleanup(base)
+}

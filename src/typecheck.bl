@@ -1339,7 +1339,6 @@ let mut tc_walk_value_tail: Int = 0
 let mut tc_errors: List[Str] = []
 
 // ── Deprecation tracking ───────────────────────────────────────────
-let mut depr_fn_nodes: Map[Str, Int] = Map()
 let mut depr_type_nodes: Map[Str, Int] = Map()
 
 // ── Kind A name-collision tracking (struct name == enum variant name) ──
@@ -4935,6 +4934,44 @@ fn tc_raw_report_unconsumed() ! Diag.Report {
                 part, "drop the wrapper and interpolate the value itself")
         }
         i = i + 1
+    }
+}
+
+// A call of a free function whose signature is settled: a bare `f(..)` or a module-qualified
+// `m.f(..)`. Both forms reach the same function, so both take the keyword fill, the count and
+// the argument types from check_arg_shapes; a form that skipped it would leave a defaulted
+// argument out of the call.
+fn tc_check_free_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let fs = fnsig_pool.get(sig).unwrap()
+    check_deprecated_fn(fn_name, fs.decl, node)
+    if node_type_params(node) != -1 {
+        let no_outer: Map[Str, Int] = Map()
+        return tc_call_with_type_args(fn_name, sig, node, 0, no_outer)
+    }
+    let args_sl = node_args(node)
+    let arg_tids = check_arg_shapes(fn_name, sig, args_sl, 0, node)
+    if fs.type_params_count == 0 { return fs.ret }
+    // Enforce each type param's declared bound against the concrete type inferred for it
+    // (E0306). Read-only: bind the args, check, diagnose.
+    tc_check_bounds_for_binds(sig, build_typevar_binds(sig, arg_tids, 0), node)
+    // The return type is substituted, so a generic-struct return such as `Box[T]` carries
+    // its concrete slots and codegen can spell the instance. Any metavar-carrying arg is
+    // then pinned from the call's binds, so `fill(Map(), 256, "x")` (K→Int, V→Str from the
+    // sibling args) codegens the Map() with the right kops instead of an erased default. If
+    // a typevar is genuinely unbound (no arg pins it), the arg's α stays unbound and E0301
+    // fires at its own binding/boundary.
+    let ret_t = instantiate_return_type(sig, arg_tids, node, 0)
+    tc_pin_generic_args_from_binds(sig, args_sl, arg_tids, 0)
+    ret_t
+}
+
+// The signature a module-qualified call names. Name resolution recorded the declaration the
+// qualifier reaches, and that settles it: the bare spelling may name a namesake in the
+// caller's own module or in another import.
+fn tc_qualified_call_fnsig(node: Int, method: Str) -> Int {
+    match fnsig_by_decl.get(tc_call_decl_node(node)) {
+        Some(s) => s
+        None => lookup_fnsig(method)
     }
 }
 
@@ -9691,9 +9728,6 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     }
     fnsig_pool.push(FnSigEntry { name: name, ret: ret_tid, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: eff_start, effects_count: eff_count, decl: fn_node })
 
-    if has_annotation(fn_node, "deprecated") != 0 {
-        depr_fn_nodes.insert(name, fn_node)
-    }
     tc_pop_tparam_scope(fn_tparams)
 }
 
@@ -9714,11 +9748,9 @@ fn depr_ann_str_arg(ann_node: Int, key: Str) -> Str {
     ""
 }
 
-fn check_deprecated_fn(fn_name: Str, call_node: Int) ! Diag.Report {
-    if depr_fn_nodes.contains_key(fn_name) == 0 { return }
-    let def_node = depr_fn_nodes.get(fn_name) ?? -1
-    if def_node == -1 { return }
-    let ann = get_annotation(def_node, "deprecated")
+fn check_deprecated_fn(fn_name: Str, decl: Int, call_node: Int) ! Diag.Report {
+    if decl < 0 { return }
+    let ann = get_annotation(decl, "deprecated")
     if ann == -1 { return }
     let since = depr_ann_str_arg(ann, "since")
     let replacement = depr_ann_str_arg(ann, "replacement")
@@ -11734,7 +11766,6 @@ fn init_types() ! TypeCheck.Register {
     tc_call_open_tids = []
     tc_call_reported.clear()
     tc_errors.clear()
-    depr_fn_nodes.clear()
     depr_type_nodes.clear()
     tc_struct_decl_nodes.clear()
     tc_collision_reported.clear()
@@ -19717,32 +19748,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let _ = tc_infer_arg_tids(node_args(node))
                     return tc_error_recovery_tid()
                 }
-                if sig != -1 {
-                    check_deprecated_fn(fn_name, node)
-                    let args_sl = node_args(node)
-                    let fs = fnsig_pool.get(sig).unwrap()
-                    if node_type_params(node) != -1 {
-                        let no_outer: Map[Str, Int] = Map()
-                        return tc_call_with_type_args(fn_name, sig, node, 0, no_outer)
-                    }
-                    let arg_tids = check_arg_shapes(fn_name, sig, args_sl, 0, node)
-                    if fs.type_params_count > 0 {
-                        // Enforce each type param's declared bound against the concrete
-                        // type inferred for it (E0306). Read-only: bind the args, check,
-                        // diagnose.
-                        tc_check_bounds_for_binds(sig, build_typevar_binds(sig, arg_tids, 0), node)
-                        // Pin any metavar-carrying arg from the call's resolved
-                        // typevar binds, so `fill(Map(), 256, "x")` (K→Int, V→Str from
-                        // the sibling args) codegens the Map() with the right kops
-                        // instead of an erased default. If a
-                        // typevar is genuinely unbound (no arg pins it), the arg's α
-                        // stays unbound and E0301 fires at its own binding/boundary.
-                        let ret_t = instantiate_return_type(sig, arg_tids, node, 0)
-                        tc_pin_generic_args_from_binds(sig, args_sl, arg_tids, 0)
-                        return ret_t
-                    }
-                    return fs.ret
-                }
+                if sig != -1 { return tc_check_free_call(fn_name, sig, node) }
             } else if callee_kind == NodeKind.FieldAccess {
                 // A FIELD holding a function value — `(self.action)()`, `(h.on_error)(1, m)`.
                 // The field's own type is the only thing that says what the call answers and
@@ -21240,46 +21246,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) == 0 {
                 if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
-                let sig = lookup_fnsig(method)
-                if sig != -1 {
-                    let mq_gen_args = node_args(node)
-                    // A generic module-qualified call must SUBSTITUTE its type
-                    // params into the return type, exactly like the same-module
-                    // bare-Ident path (instantiate_return_type at the callee_kind ==
-                    // Ident arm). Returning the raw fnsig ret leaves a
-                    // generic-struct-instance return memoized as CmgBox[T] with T
-                    // unsubstituted — so the return node's tid carries the typevar
-                    // (unencodable), and every codegen consumer that recovers inner
-                    // tids off that return tid (mono_instance_arg_tids_from_tid ->
-                    // resolve_arg_seg_via_slot_tid / resolve_tparam_via_tid) misses
-                    // the tid path and spells the bare binder. Substituting
-                    // here binds T->Int so CmgBox[Int]'s inner slot is the concrete
-                    // Int tid the tid path can spell. The scalar-return
-                    // path (`-> T`, cmg_identity) already resolved correctly; this
-                    // additionally fixes the generic-struct-instance return.
-                    // tc_infer_arg_tids infers each arg, so the generic path also populates
-                    // the node→tid memo the tid-driven mono lowering (tc_mono_tids_core) reads.
-                    let mq_fs = fnsig_pool.get(sig).unwrap()
-                    if node_type_params(node) != -1 {
-                        let no_outer: Map[Str, Int] = Map()
-                        return tc_call_with_type_args("{obj_name}.{method}", sig, node, 0, no_outer)
-                    }
-                    if mq_fs.type_params_count > 0 {
-                        return instantiate_return_type(sig, tc_infer_arg_tids(mq_gen_args), node, 0)
-                    }
-                    // Non-generic module-qualified call: no substitution, but still
-                    // infer the args so their node→tid memo is populated (the
-                    // fall-through inference loop below is unreachable past this
-                    // early return).
-                    if mq_gen_args != -1 {
-                        let mut mgi = 0
-                        while mgi < sublist_length(mq_gen_args) {
-                            infer_type(sublist_get(mq_gen_args, mgi))
-                            mgi = mgi + 1
-                        }
-                    }
-                    return mq_fs.ret
-                }
+                let sig = tc_qualified_call_fnsig(node, method)
+                if sig != -1 { return tc_check_free_call("{obj_name}.{method}", sig, node) }
             }
             // Every path below reads the receiver Ident as a TYPE NAME. A name with
             // a binding in scope is a value, and `value.method()` is an instance call no
