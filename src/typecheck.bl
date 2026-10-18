@@ -6121,6 +6121,32 @@ fn tc_hof_result_slot_elem(node: Int) -> Int {
     inner
 }
 
+// Whether a `map` / `flat_map` in a statement's value still holds the open result slot that
+// its closure's walk binds. The value was inferred before that walk, so whatever reads the
+// result in the same expression (an operator, a method, a field) met an element nothing had
+// chosen and let it pass; the statement infers its value again once the walk is done. Read
+// before the walk, which binds the slot. A closure's body is not searched: the walk infers
+// its statements in their own scope.
+fn tc_value_awaits_closure_ret(val: Int) -> Bool {
+    if val == -1 { return false }
+    let mut stack: List[Int] = [val]
+    let mut kids: List[Int] = []
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        let k = node_kind(n)
+        if k != NodeKind.Closure {
+            if k == NodeKind.MethodCall {
+                let elem = tc_hof_result_slot_elem(n)
+                if elem != -1 && tc_is_unbound_metavar(elem) != 0 { return true }
+            }
+            kids.clear()
+            node_push_value_child_ids(n, kids)
+            for kid in kids { stack.push(kid) }
+        }
+    }
+    false
+}
+
 // Binds the call's result metavar to what the walked closure body produced. `bind_metavar`,
 // not tc_unify: tc_unify leaves a typevar unbound in a generic body, which would report a
 // `fn f[T](xs: List[T]) { xs.map(fn(x) { Some(x) }) }` as under-determined. An undeterminable
@@ -6823,9 +6849,12 @@ fn tc_check_callable_arg_bodies(args_sl: Int, skip_idx: Int) ! TypeCheck.Resolve
 // (`if list_any(xs, fn(s) { ... })`, `for v in xs.filter(fn(n) { ... })`) reached
 // check_closure_body from nowhere, so its closure bound no params and its body carried no
 // types. Every such arm wants the same two steps in the same order, so they share one name.
+// A value that reads a closure's result is inferred again once the walk has bound it.
 fn tc_check_nested_value(expr: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let t = infer_type(expr)
+    let reread = tc_value_awaits_closure_ret(expr)
     tc_walk_nested_hof_bodies(expr)
+    if reread { return infer_type(expr) }
     t
 }
 
@@ -19610,8 +19639,12 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
     //   - TyKind.Void: an under-inferred value (e.g. an un-annotated closure return
     //     flowing through Bytes.with_ptr) types as Void; rejecting it would
     //     break programs that compiled before operand checking landed.
+    //   - An unbound metavar: compatible pending its binding, as in types_compatible. A
+    //     statement whose value read one before a walk bound it infers the value again
+    //     (tc_value_awaits_closure_ret), and the compare is judged then.
     if ka == TyKind.Typevar || kb == TyKind.Typevar { return 1 }
     if ka == TyKind.Void || kb == TyKind.Void { return 1 }
+    if ka == TyKind.Unknown || kb == TyKind.Unknown { return 1 }
 
     // Int and Bool are interchangeable (C-style truthiness, mirroring
     // types_compatible:5132). `flag == 0`, `set.contains(x) != 0`, and
@@ -20599,9 +20632,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             return operand
         }
         if op == "?" {
-            let ok = type_kind(operand)
+            // Read through a bound metavar: an operand such as a `map` element carries its
+            // Result or Option only as the metavar's solution.
+            let carrier = resolve_alias_tid(tc_resolve(operand))
+            let ok = type_kind(carrier)
             if ok == TyKind.Result {
-                let operand_err = ty_pool.get(operand).unwrap().inner2
+                let operand_err = ty_pool.get(carrier).unwrap().inner2
                 if tc_in_test_body == 1 {
                     // Spec §2.20 / §3c.2: inside a test body E is rendered via
                     // Display.display(e), not structurally propagated. Skip the
@@ -20625,7 +20661,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         }
                     }
                 }
-                return ty_pool.get(operand).unwrap().inner1
+                return ty_pool.get(carrier).unwrap().inner1
             }
             if ok == TyKind.Option {
                 // Spec §2.20: in a test body `?` on Option is permitted —
@@ -20639,7 +20675,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         diag_error_at("QuestionMarkOptionInNonOption", QM_OPTION_IN_NON_OPTION, "`?` on Option in function `{tc_current_fn_name}` which does not return Option", node, "change the return type to Option[T]")
                     }
                 }
-                return ty_pool.get(operand).unwrap().inner1
+                return ty_pool.get(carrier).unwrap().inner1
             }
             if ok != TyKind.Unknown {
                 tc_errors.push("`?` requires Result or Option value")
@@ -24544,8 +24580,10 @@ fn tc_type_contract_predicates(fn_node: Int, ret_tid: Int) ! TypeCheck.Resolve, 
 }
 
 fn tc_type_predicate(pred: Int, what: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let t = tc_infer_value(pred)
+    let mut t = tc_infer_value(pred)
+    let reread = tc_value_awaits_closure_ret(pred)
     tc_walk_stmt_value(pred)
+    if reread { t = tc_infer_value(pred) }
     if is_bool_compat(t) == 0 {
         tc_error_at("{what} predicate must be Bool, got {type_to_str(t)}", pred)
     }
@@ -25421,14 +25459,23 @@ fn tc_walk_stmt_value(val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 // @allow: as tc_walk_stmt_value.
 @allow(UnrestoredMutation)
 fn tc_infer_assigned_value(target_t: Int, val: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let saved_hint = tc_construct_hint
-    if tc_tid_is_no_info(target_t) == 0 { tc_construct_hint = resolve_alias_tid(target_t) }
     // The target declares the value's type as a typed `let` does, so a closure takes its
     // signature from it.
     tc_seed_expected_into_value(val, target_t)
+    let t = tc_infer_value_under(target_t, val)
+    let reread = tc_value_awaits_closure_ret(val)
+    tc_walk_stmt_value(val)
+    if reread { return tc_infer_value_under(target_t, val) }
+    t
+}
+
+// @allow: the hint is restored before the return.
+@allow(UnrestoredMutation)
+fn tc_infer_value_under(target_t: Int, val: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    if tc_tid_is_no_info(target_t) == 0 { tc_construct_hint = resolve_alias_tid(target_t) }
     let t = tc_infer_value(val)
     tc_construct_hint = saved_hint
-    tc_walk_stmt_value(val)
     t
 }
 
@@ -25900,11 +25947,16 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // answered with the outer binding's type: confidently, and wrongly, which is why
             // the recovery below cannot gate on the answer being absent.
             let pre_val_memo = tc_scoped_value_memo(val, 0)
+            let reread = tc_value_awaits_closure_ret(val)
             // A closure written inside a container literal — `let fs: List[fn(Int) -> Int] =
             // [fn(x: Int) -> Int { x + 1 }]` — is reached by neither walk on its own: tc_check_body
             // descends a call or a struct literal, not a list, and infer_type types the closure's
             // signature without its body. tc_walk_stmt_value picks the walk the value's kind needs.
             tc_walk_stmt_value(val)
+            // What the walk wrote for the value in scope, read before the inference below
+            // writes its own answer over it again.
+            let post_val_memo = tc_scoped_value_memo(val, 0)
+            if reread { inferred_tid = tc_infer_let_value(val, vname, let_hint) }
             tc_report_deferred_branch_mismatch(val)
             // `let x = { let h = 5  h }` and
             // `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
@@ -25927,12 +25979,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // whole, exactly as before, and a partially erased answer takes only the memo's
             // answers for the positions it has no answer of its own for.
             if tc_tid_is_no_info(inferred_tid) != 0 || tc_tid_has_unknown(inferred_tid) != 0 {
-                let memo = tc_scoped_value_memo(val, 0)
-                if tc_tid_is_no_info(memo) == 0 {
+                if tc_tid_is_no_info(post_val_memo) == 0 {
                     if tc_tid_is_no_info(inferred_tid) != 0 {
-                        inferred_tid = memo
+                        inferred_tid = post_val_memo
                     } else {
-                        inferred_tid = tc_tid_fill_unknowns(inferred_tid, memo)
+                        inferred_tid = tc_tid_fill_unknowns(inferred_tid, post_val_memo)
                     }
                 }
             } else {
@@ -25943,7 +25994,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // block does not produce. The proof is the delta: the walk retyped the very
                 // node the earlier answer was read from, so a memo that MOVED is the in-scope
                 // answer replacing an out-of-scope one. An unmoved memo keeps the old path.
-                let post_val_memo = tc_scoped_value_memo(val, 0)
                 if tc_tid_is_no_info(post_val_memo) == 0 && post_val_memo != pre_val_memo {
                     inferred_tid = post_val_memo
                     // The value node keeps the out-of-scope answer too, and codegen reads
@@ -26225,8 +26275,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.MatchExpr {
-        tc_check_body(node_scrutinee(node))
-        let scrut_tid = infer_type(node_scrutinee(node))
+        let scrut = node_scrutinee(node)
+        // Walked before it is inferred, so a closure result it reads is bound by then; a
+        // scrutinee such as an operator can hide a HOF that tc_check_body does not reach.
+        tc_check_body(scrut)
+        if !tc_stmt_value_walks_body(node_kind(scrut)) { tc_walk_nested_hof_bodies(scrut) }
+        let scrut_tid = infer_type(scrut)
         // The arm bodies as the speculative inference left them, read before any arm scope
         // exists. The recovery below reads them again and takes the delta as its gate.
         let pre_arm_memo = tc_scoped_value_memo(node, 0)
@@ -26437,6 +26491,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let val = node_value(node)
         if val != -1 {
             if in_value != 0 { tc_infer_value(val) } else { infer_type(val) }
+            let reread = tc_value_awaits_closure_ret(val)
             // Statement-position HOFs (l.for_each(fn(x){...})) need the MethodCall
             // branch to walk the closure body. Binding-position calls already
             // get this via tc_check_body(val) in the LetBinding handler. Scoped to the
@@ -26470,6 +26525,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // diagnostics are skipped and node tids unpublished unless it reaches the HandlerExpr
             // arm here. A handler consumed by `with` routes through the WithBlock arm instead.
             tc_walk_stmt_value(val)
+            if reread {
+                if in_value != 0 { tc_infer_value(val) } else { infer_type(val) }
+            }
         }
         return
     }
@@ -26483,18 +26541,25 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // the returned value is discarded — so it stays legal (plain infer, flag off).
             let returns_value = tc_fn_returns_value()
             let ret_hint = if returns_value { resolve_alias_tid(tc_current_fn_ret) } else { tc_construct_hint }
-            let val_t = tc_infer_returned_value_with_hint(val, returns_value, ret_hint)
+            let mut val_t = tc_infer_returned_value_with_hint(val, returns_value, ret_hint)
+            // The check pins open types of the value to the declared return, so a value that
+            // reads a closure's result is checked once the walk has bound it.
+            let reread = tc_value_awaits_closure_ret(val)
             // Shared with the implicit tail — see tc_check_returned_value for why each
             // guard is load-bearing. This arm stays necessary alongside the tail site: an
             // EARLY return inside an `if` is not the block's last statement, so the tail
             // check never visits it.
-            tc_check_returned_value(val_t, node)
+            if !reread { tc_check_returned_value(val_t, node) }
             // A returned value is walked the same way the ExprStmt arm walks a tail value,
             // through the shared tc_stmt_value_walks_body predicate: infer_type types only a
             // value's shape, never the bodies nested inside it (a struct literal's block-valued
             // fields, a returned closure's or handler's method bodies, a call's closure args),
             // so those stay unwalked unless this walk reaches them.
             tc_walk_stmt_value(val)
+            if reread {
+                val_t = tc_infer_returned_value_with_hint(val, returns_value, ret_hint)
+                tc_check_returned_value(val_t, node)
+            }
         } else {
             if tc_current_fn_ret != TYPE_VOID && tc_tid_is_no_info(tc_current_fn_ret) == 0 {
                 tc_error_at("function `{tc_current_fn_name}` returns {type_to_str(tc_current_fn_ret)} but bare `return` has no value", node)
@@ -28492,21 +28557,24 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
 // The default's value against the field's declared type: the same pair of walks a let
 // binding's value gets, so a container default types its elements and a closure default binds
 // its params and types its body.
-// @allow: publishing types IS this function's effect, as in tc_walk_stmt_value; the one global
-// it must not leak, the construct hint, is saved and restored.
+// @allow: publishing types IS this function's effect, as in tc_walk_stmt_value.
 @allow(UnrestoredMutation)
 fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_seed_expected_into_value(dflt, ftid)
-    let saved_hint = tc_construct_hint
-    if tc_tid_is_no_info(ftid) == 0 { tc_construct_hint = resolve_alias_tid(ftid) }
-    let inferred = tc_infer_value(dflt)
-    tc_construct_hint = saved_hint
+    let mut inferred = tc_infer_value_under(ftid, dflt)
+    // The pin below would fix a closure's open result to the field's type, so a default that
+    // reads one is pinned once the walk has bound it.
+    let reread = tc_value_awaits_closure_ret(dflt)
+    if reread {
+        tc_walk_stmt_value(dflt)
+        inferred = tc_infer_value_under(ftid, dflt)
+    }
     // An empty `Map()` mints its own key and value metavars, which a hint over the
     // declaration's own parameters cannot fill. Pinning them to K and V is a determination:
     // each instance of the type substitutes its own arguments there.
     tc_pin_tail_ret_generic(ftid, inferred)
     if tc_tid_is_concrete(tc_lookup_node_tid(dflt)) == 0 { tc_publish_node_tid(dflt, inferred) }
-    tc_walk_stmt_value(dflt)
+    if !reread { tc_walk_stmt_value(dflt) }
 }
 
 // Post-order over the value children of `node`. Explicitly iterative: the AST is as deep as
