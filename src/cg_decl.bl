@@ -56,7 +56,7 @@ import typecheck.{
 }
 import parser.{
     get_annotation, get_str_named_arg, node_effects, parser_live_ranges, node_elements, node_fields, node_impl_binders,
-    node_is_pub, node_methods, node_name, node_params, node_type_ann,
+    node_body, node_is_pub, node_methods, node_name, node_params, node_type_ann,
     node_type_params, node_value, sublist_get, sublist_length,
 }
 import stdlib_native_deps.{
@@ -70,7 +70,7 @@ let mut typedef_state: NameMarks = no_marks()
 
 // What this unit has written for each root effect's vtable typedef, keyed by the C name the
 // typedef carries: 1 once a name this stage cannot spell has stopped it and reported that,
-// 2 once the typedef is written. A struct field of handler type reaches an effect from the
+// 2 once the typedef is written, 3 once the default bodies and instance are written too. A struct field of handler type reaches an effect from the
 // type graph and the evidence vector reaches the same effect from the declarations, so both
 // read this rather than writing one typedef twice or reporting one gap twice.
 let mut vtable_state: NameMarks = no_marks()
@@ -1389,19 +1389,58 @@ fn emit_effect_vtable(effect_decl: Int, slot_tid: Int, vtable: Str) -> Int ! Dia
     let ops = cg_reg_effect_ops(effect_decl)
     let mut i = 0
     while i < ops.len() {
-        print_vtable_slot_fn(sig.rets.get(i).unwrap(), sig.defaults.get(i).unwrap(), sig.params.get(i).unwrap(),
-            default_op_body(ops.get(i).unwrap(), sig.rets.get(i).unwrap()))
+        let op = ops.get(i).unwrap()
+        // A derived operation's default is its declared body. That body may call anything
+        // the program declares, so only its prototype goes here, ahead of the instance, and
+        // the definition half writes it from cg_decl_derived_slots.
+        if node_body(op) != -1 {
+            print_vtable_slot_fn_decl(sig.rets.get(i).unwrap(), sig.defaults.get(i).unwrap(), sig.params.get(i).unwrap())
+        } else {
+            print_vtable_slot_fn(sig.rets.get(i).unwrap(), sig.defaults.get(i).unwrap(), sig.params.get(i).unwrap(),
+                default_op_body(op, sig.rets.get(i).unwrap()))
+        }
         i = i + 1
     }
     ir_sources_resume(track)
     print_effect_default_vtable(vtable, sig.defaults)
+    vtable_state.own.insert(vtable, 3)
     1
+}
+
+// One derived operation whose default this unit declared, with the spellings its definition
+// must repeat.
+pub type DerivedSlot {
+    op: Int
+    ret: Str
+    symbol: Str
+    params: List[Str]
+}
+
+// Every derived operation of the effects whose defaults this unit has declared. Each unit
+// keeps its own static copy, as it does every other default body.
+pub fn cg_decl_derived_slots() -> List[DerivedSlot] ! Diag.Report {
+    let mut out: List[DerivedSlot] = []
+    for e in cg_reg_effect_decls() {
+        let slot_tid = make_handler_type(node_name(e))
+        if mark_of(vtable_state, c_vtable_type_name(slot_tid)) != 3 { continue }
+        let sig = vtable_sig(e, slot_tid)
+        let ops = cg_reg_effect_ops(e)
+        let mut i = 0
+        while i < ops.len() {
+            let op = ops.get(i).unwrap()
+            if node_body(op) != -1 {
+                out.push(DerivedSlot { op: op, ret: sig.rets.get(i).unwrap(), symbol: sig.defaults.get(i).unwrap(), params: sig.params.get(i).unwrap() })
+            }
+            i = i + 1
+        }
+    }
+    out
 }
 
 // The typedef alone, written once per unit. Both readers of `vtable_state` come through
 // here, so whichever reaches the effect first writes it and the other one does not.
 fn emit_vtable_typedef(vtable: Str, sig: VtableSig) ! Diag.Report {
-    if mark_of(vtable_state, vtable) == 2 { return }
+    if mark_of(vtable_state, vtable) >= 2 { return }
     vtable_state.own.insert(vtable, 2)
     let mut userdata: List[Str] = []
     for slot in sig.slots { userdata.push(c_vtable_userdata_member(slot)) }

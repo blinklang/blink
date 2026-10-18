@@ -1,0 +1,288 @@
+// An operation with a body in its effect declaration is a derived operation (spec §4.7.1).
+// A call goes to the innermost handler of the effect. When that handler omits a derived
+// operation, the declared body runs at the call site with the same handlers in force, so
+// its own effect calls reach that same innermost handler. Only an omitted primitive
+// operation forwards to the enclosing handler; nothing searches outward for a clause.
+
+import compile_test_helpers
+
+fn kv_effect_src() -> Str {
+    #"effect Kv {
+    effect Get {
+        fn fetch(key: Str) -> Str
+        fn tag() -> Str
+        fn shout(key: Str) -> Str {
+            "{kv.fetch(key)}!"
+        }
+        fn label(key: Str) -> Str {
+            "{kv.tag()}:{kv.fetch(key)}"
+        }
+    }
+    effect Mark {
+        fn mark() -> Str
+        fn badge() -> Str {
+            "<{kv.mark()}>"
+        }
+    }
+}
+
+fn real() -> Handler[Kv] {
+    handler Kv {
+        fn fetch(key: Str) -> Str { "real-{key}" }
+        fn tag() -> Str { "outer" }
+        fn mark() -> Str { "real-mark" }
+    }
+}
+
+fn mock() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn fetch(key: Str) -> Str { "mock-{key}" }
+    }
+}
+"#
+}
+
+fn with_kv(body: Str) -> Str {
+    "{kv_effect_src()}{body}"
+}
+
+fn run_kv(body: Str, tag: Str) -> compile_test_helpers.RunResult {
+    compile_test_helpers.compile_and_run(with_kv(body), tag)
+}
+
+test "a request-only mock answers a derived op through its own primitive" {
+    let r = run_kv(#"
+fn main() {
+    with real() {
+        with mock() {
+            io.println(kv.shout("a"))
+        }
+    }
+}
+"#, "derived_op_mock_answers")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("mock-a!"))
+    assert(!r.out.contains("real-a"))
+}
+
+test "an outer clause for a derived op is bypassed by an inner handler that omits it" {
+    let r = run_kv(#"
+fn logging_shout() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn shout(key: Str) -> Str {
+            io.println("LOG {key}")
+            default.shout(key)
+        }
+    }
+}
+
+fn main() {
+    with real() {
+        with logging_shout() {
+            with mock() {
+                io.println(kv.shout("b"))
+            }
+        }
+    }
+}
+"#, "derived_op_outer_clause_bypassed")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("mock-b!"))
+    assert(!r.out.contains("LOG"))
+}
+
+test "default.op on a derived op runs the enclosing handler's version of it" {
+    let r = run_kv(#"
+fn logging_shout() -> Handler[Kv.Get] {
+    handler Kv.Get {
+        fn shout(key: Str) -> Str {
+            io.println("LOG {key}")
+            default.shout(key)
+        }
+    }
+}
+
+fn main() {
+    with real() {
+        with logging_shout() {
+            io.println(kv.shout("c"))
+        }
+    }
+}
+"#, "derived_op_default_reaches_outer")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("LOG c"))
+    assert(r.out.contains("real-c!"))
+}
+
+test "an explicit clause for a derived op still answers" {
+    let r = run_kv(#"
+fn main() {
+    with real() {
+        with handler Kv.Get {
+            fn fetch(key: Str) -> Str { "inner-{key}" }
+            fn shout(key: Str) -> Str { "CLAUSE-{key}" }
+        } {
+            io.println(kv.shout("d"))
+        }
+    }
+}
+"#, "derived_op_explicit_clause")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("CLAUSE-d"))
+}
+
+test "a derived body reaches the inner handler for one primitive and the outer for another" {
+    let r = run_kv(#"
+fn main() {
+    with real() {
+        with handler Kv {
+            fn fetch(key: Str) -> Str { "inner-{key}" }
+        } {
+            io.println(kv.label("e"))
+        }
+    }
+}
+"#, "derived_op_two_primitives")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("outer:inner-e"))
+}
+
+test "a handler of a sibling sub-effect leaves an outer derived-op clause in force" {
+    let r = run_kv(#"
+fn main() {
+    with real() {
+        with handler Kv.Get {
+            fn shout(key: Str) -> Str { "OUTER-SHOUT-{key}" }
+        } {
+            with handler Kv.Mark {
+                fn mark() -> Str { "sib" }
+            } {
+                io.println(kv.shout("f"))
+                io.println(kv.badge())
+            }
+        }
+    }
+}
+"#, "derived_op_sibling_sub_effect")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("OUTER-SHOUT-f"))
+    assert(r.out.contains("<sib>"))
+}
+
+test "a derived op called inside a closure reaches the innermost handler" {
+    let r = run_kv(#"
+fn call_it(f: fn(Str) -> Str, k: Str) -> Str { f(k) }
+
+fn main() {
+    with real() {
+        with mock() {
+            io.println(call_it(fn(k: Str) -> Str { kv.shout(k) }, "g"))
+        }
+    }
+}
+"#, "derived_op_in_closure")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("mock-g!"))
+}
+
+test "a derived op called inside a spawned task reaches the innermost handler" {
+    let r = run_kv(#"
+fn main() {
+    with real() {
+        with mock() {
+            async.scope {
+                let t = async.spawn(fn() -> Str { kv.shout("h") })
+                io.println(t.await)
+            }
+        }
+    }
+}
+"#, "derived_op_in_spawn")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("mock-h!"))
+}
+
+test "a derived op called inside with arena reaches the innermost handler" {
+    let r = run_kv(#"
+fn main() {
+    with real() {
+        with mock() {
+            let s = with arena {
+                kv.shout("i")
+            }
+            io.println(s)
+        }
+    }
+}
+"#, "derived_op_in_arena")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("mock-i!"))
+}
+
+test "a derived op under a handler passed as a value runs against that handler" {
+    let r = run_kv(#"
+fn use_it(h: Handler[Kv.Get], k: Str) -> Str ! Kv {
+    with h {
+        kv.shout(k)
+    }
+}
+
+fn main() {
+    with real() {
+        let m = mock()
+        io.println(use_it(m, "j"))
+    }
+}
+"#, "derived_op_handler_value")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("mock-j!"))
+}
+
+test "a derived op with no handler in force runs its body over the defaults" {
+    let r = run_kv(#"
+fn main() {
+    with real() {
+        io.println(kv.shout("k"))
+    }
+}
+"#, "derived_op_over_real")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("real-k!"))
+}
+
+test "a request-only mock answers a derived op under --per-module" {
+    let src = with_kv(#"
+fn main() {
+    with real() {
+        with mock() {
+            io.println(kv.shout("l"))
+        }
+    }
+}
+"#)
+    let r = compile_test_helpers.run_via_cli(src, "derived_op_per_module", "--per-module")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("mock-l!"))
+}
+
+// A derived body is not an operation of any handler, so it has no handler to delegate to.
+test "default in a derived op body is an error" {
+    let src = #"effect Kv {
+    effect Get {
+        fn fetch(key: Str) -> Str
+        fn shout(key: Str) -> Str {
+            default.fetch(key)
+        }
+    }
+}
+
+fn main() {
+    with handler Kv { fn fetch(key: Str) -> Str { key } } {
+        io.println(kv.shout("m"))
+    }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "derived_op_default_rejected")
+    compile_test_helpers.expect_contains(out, "`default` is only valid inside a handler operation body", "default in a derived body")
+}

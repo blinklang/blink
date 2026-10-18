@@ -17,7 +17,7 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
     tc_enter_body_module, tc_leave_body_module, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
-    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_impl_trait_id,
+    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_handler_effect_root, tc_impl_trait_id,
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, async_scope_handles_spelling,
@@ -26,7 +26,7 @@ import layout.{
     layout_of, pointer_spelling, tid_of_binder, tid_of_node, spawn_pair_spelling,
 }
 import cname.{
-    c_builtin_effect_slot, c_cell_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
+    c_builtin_effect_slot, c_cell_name, c_effect_default_op_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
     c_vtable_userdata_member,
     c_ev_type_name, c_field_name,
     c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
@@ -38,10 +38,10 @@ import ir.{
     ir_expr_stmt, ir_return,
 }
 import cg_print.{
-    print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
+    DefaultSlot, print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
     print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
 }
-import cg_reg.{cg_reg_impl_decls}
+import cg_reg.{cg_reg_effect_decls, cg_reg_impl_decls}
 import cg_promote.{cg_promote_capture_table}
 import free_names.{closure_read_names}
 import cg_decl.{cg_decl_takes_ev}
@@ -682,8 +682,41 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
         symbols.push(b.symbol)
     }
     let symbol = c_mint_local("handler")
-    print_handler_builder(rec.c_spelling, symbol, c_ev_global_name(), field, slots, userdata, symbols)
+    print_handler_builder(rec.c_spelling, symbol, c_ev_global_name(), field, slots, userdata, symbols, omitted_derived_ops(tid, ops))
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, words)
+}
+
+// The derived operations of the effect a literal names that the literal does not write. The
+// copied vtable may hold an enclosing handler's clause for one, and an omitted derived
+// operation runs its declared body instead (§4.7.1), so the builder points each back at its
+// default. A literal for one sub-effect names only that sub-effect's operations; a literal
+// for the root names them all.
+fn omitted_derived_ops(tid: Int, written: List[Int]) -> List[DefaultSlot] {
+    let mut out: List[DefaultSlot] = []
+    let eff = tc_tid_handler_effect(tid)
+    let root = tc_handler_effect_root(eff)
+    let mut names: List[Str] = []
+    for w in written { names.push(node_name(w)) }
+    for e in cg_reg_effect_decls() {
+        if node_name(e) != root { continue }
+        let children = node_elements(e)
+        let mut ci = 0
+        while children != -1 && ci < sublist_length(children) {
+            let child = sublist_get(children, ci)
+            ci = ci + 1
+            if eff != root && eff != "{root}.{node_name(child)}" { continue }
+            let ops = node_methods(child)
+            let mut oi = 0
+            while ops != -1 && oi < sublist_length(ops) {
+                let op = sublist_get(ops, oi)
+                oi = oi + 1
+                if node_body(op) == -1 || names.contains(node_name(op)) { continue }
+                let slot = c_effect_vtable_slot_name(tid, node_name(op))
+                out.push(DefaultSlot { slot: slot, userdata: c_vtable_userdata_member(slot), symbol: c_effect_default_op_name(tid, node_name(op)) })
+            }
+        }
+    }
+    out
 }
 
 // One operation's closure before anything is queued: its symbol, its capture words and the

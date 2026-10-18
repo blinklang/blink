@@ -291,3 +291,94 @@ fn main() {
     compile_test_helpers.expect_error(out, "E0500", "calling an IO method from a pure fn")
     compile_test_helpers.expect_contains(out, "`show`", "the diagnostic names the method")
 }
+
+// An operation body runs over the handler it was installed on (§4.7.1), so its calls to the
+// effect it handles reach that outer handler. A handler factory does not declare that effect.
+test "a handler clause may call its own effect without the enclosing fn declaring it" {
+    let src = with_tattle(#"fn doubled() -> Handler[Tattle.Note] {
+    handler Tattle.Note {
+        fn emit() -> Int { default.emit() * 2 }
+    }
+}
+fn main() {
+    with handler Tattle { fn emit() -> Int { 7 } } {
+        with doubled() {
+            io.println("{tattle.emit()}")
+        }
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_clause_own_effect")
+    compile_test_helpers.expect_compiles_clean(out, "the clause holds the effect its handler handles")
+}
+
+test "a handler clause calling a sibling sub-effect still needs it declared" {
+    let src = #"effect Pair {
+    effect Left {
+        fn left() -> Int
+    }
+    effect Right {
+        fn right() -> Int
+    }
+}
+fn lefty() -> Handler[Pair.Left] {
+    handler Pair.Left {
+        fn left() -> Int { pair.right() }
+    }
+}
+fn main() {
+    with handler Pair { fn left() -> Int { 1 } fn right() -> Int { 2 } } {
+        with lefty() {
+            io.println("{pair.left()}")
+        }
+    }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "undeclared_effect_clause_sibling")
+    compile_test_helpers.expect_error(out, "E0500", "the clause does not hold a sibling sub-effect")
+    compile_test_helpers.expect_contains(out, "Pair.Right", "the diagnostic names the sibling")
+}
+
+// A derived operation's body runs at the call site (§4.7.1), and that call needs only the
+// effect that declares the operation. The body holds that effect and nothing more.
+fn derived_src(body: Str) -> Str {
+    let head = #"effect Pair {
+    effect Left {
+        fn left() -> Int
+        fn twice() -> Int {
+            "#
+    let tail = #"
+        }
+    }
+    effect Right {
+        fn right() -> Int
+    }
+}
+fn shout() -> Int ! IO {
+    io.println("!")
+    1
+}
+fn main() {
+    with handler Pair { fn left() -> Int { 1 } fn right() -> Int { 2 } } {
+        io.println("{pair.twice()}")
+    }
+}
+"#
+    "{head}{body}{tail}"
+}
+
+test "a derived body may call an op of its own effect" {
+    let out = compile_test_helpers.compile_and_capture(derived_src("pair.left() * 2"), "undeclared_effect_derived_own")
+    compile_test_helpers.expect_compiles_clean(out, "the derived body holds its own effect")
+}
+
+test "a derived body calling a sibling sub-effect is E0500" {
+    let out = compile_test_helpers.compile_and_capture(derived_src("pair.right() * 2"), "undeclared_effect_derived_sibling")
+    compile_test_helpers.expect_error(out, "E0500", "the call site of twice need not hold Pair.Right")
+    compile_test_helpers.expect_contains(out, "Pair.Right", "the diagnostic names the sibling")
+}
+
+test "a derived body calling a fn that declares IO is E0500" {
+    let out = compile_test_helpers.compile_and_capture(derived_src("shout()"), "undeclared_effect_derived_io")
+    compile_test_helpers.expect_error(out, "E0500", "an op signature declares no effects")
+}

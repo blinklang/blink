@@ -3,7 +3,7 @@ import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, unparse_expr}
 import parser.{
-    node_load_rank, parser_load_order_moved, parser_live_ranges,
+    effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
@@ -6681,6 +6681,17 @@ fn tc_body_valued_returns(node: Int) -> List[Int] {
         for r in tc_body_valued_returns(kid) { out.push(r) }
     }
     out
+}
+
+// A derived body is checked as a handler clause is, against the operation's own signature.
+// It is the current fn so that name resolution and rigid typevars read this operation.
+fn tc_check_derived_op(op: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let prev_fn_node = tc_current_fn_node
+    tc_current_fn_node = op
+    diag_enter_allows(op)
+    tc_check_handler_method(op)
+    diag_exit_allows()
+    tc_current_fn_node = prev_fn_node
 }
 
 // The third entry point into a body that is its own fn context. A handler method
@@ -16786,6 +16797,13 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     }
 
     nr_check_trait_method_defaults(node_arms(program))
+
+    // A derived operation's body is a function of its own (§4.7.1). It names no handler of
+    // its own, so `default` does not resolve in it.
+    for op in effect_derived_ops(program) {
+        nr_current_module = tc_body_module(op)
+        nr_check_fn(op)
+    }
 
     // Walk test block bodies for unused import detection
     let tests_sl = node_captures(program)
@@ -27700,6 +27718,11 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
         }
     }
 
+    for op in effect_derived_ops(program) {
+        nr_current_module = tc_body_module(op)
+        tc_check_derived_op(op)
+    }
+
     // Type check test block bodies under elaborated return type
     let tests_sl = node_captures(program)
     if tests_sl != -1 {
@@ -28302,10 +28325,10 @@ fn tc_name_is_item_in(name: Str, module: Str) -> Int {
 fn tc_body_module(decl: Int) -> Str {
     let own = node_module(decl)
     if own != "" { return own }
-    match tc_method_block.get(decl) {
-        Some(im) => node_module(im)
-        None => "__main__"
-    }
+    // A derived operation reads in the module that declares its effect.
+    let owner = tc_method_block.get(decl) ?? (tc_ue_op_root.get(decl) ?? -1)
+    if owner < 0 { return "__main__" }
+    node_module(owner)
 }
 
 // Codegen asks the type and function tables by name too, and they answer a bare namesake
@@ -29256,11 +29279,14 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: Str, kids: List[I
         return
     }
     if k == NodeKind.HandlerExpr {
+        // An operation body runs over the handler this one was installed on, so its calls
+        // through the effect it handles are answered there (§4.7.1).
+        let row = tc_er_row_with(held, tc_tid_handler_effect(resolve_alias_tid(tc_lookup_node_tid(node))))
         let ms = node_methods(node)
         if ms != -1 {
             let mut i = 0
             while i < sublist_length(ms) {
-                tc_er_walk(program, node_body(sublist_get(ms, i)), held, owner, kids)
+                tc_er_walk(program, node_body(sublist_get(ms, i)), row, owner, kids)
                 i = i + 1
             }
         }
@@ -29321,4 +29347,12 @@ fn tc_check_effect_rows(program: Int) ! TypeCheck.Resolve, Diag.Report {
     }
     tc_er_walk_methods(program, node_methods(program), kids)
     tc_er_walk_methods(program, node_arms(program), kids)
+    // A derived body runs at the call site, and that call needs only the effect that declares
+    // the operation, so the body holds that effect and nothing more.
+    for op in effect_derived_ops(program) {
+        match tc_ue_op_root.get(op) {
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], "{node_name(ed)}.{node_name(op)}", kids)
+            None => {}
+        }
+    }
 }
