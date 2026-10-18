@@ -7610,7 +7610,10 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             let key_ann = sublist_get(elems_sl, 0)
             let key_t = resolve_type_ann(key_ann)
             let val_t = resolve_type_ann(sublist_get(elems_sl, 1))
-            if tc_suppress_ann_validation == 0 { validate_map_key(key_ann) }
+            if tc_suppress_ann_validation == 0 {
+                validate_map_key(key_ann)
+                tc_refuse_unhashable_instance(key_t, key_ann, "Map key")
+            }
             return make_map_type(key_t, val_t)
         }
         return make_map_type(TYPE_UNKNOWN, TYPE_UNKNOWN)
@@ -7619,7 +7622,10 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let elem_ann = sublist_get(elems_sl, 0)
             let elem_t = resolve_type_ann(elem_ann)
-            if tc_suppress_ann_validation == 0 { validate_set_elem(elem_ann) }
+            if tc_suppress_ann_validation == 0 {
+                validate_set_elem(elem_ann)
+                tc_refuse_unhashable_instance(elem_t, elem_ann, "Set element")
+            }
             return make_set_type(elem_t)
         }
         return make_set_type(TYPE_UNKNOWN)
@@ -8665,6 +8671,21 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     if is_primitive_type(key_name) != 0 {
         diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type `{decl_name}` does not implement Hash — {key_name} has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be Map keys)", key_ann, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the key instead")
     }
+}
+
+// validate_map_key reads the written name, so it passes any instance of a type that derives
+// Hash. The derive holds only at an instance whose arguments have Hash, read here at the tid.
+fn tc_refuse_unhashable_instance(tid0: Int, ann: Int, role: Str) ! Diag.Report {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    let k = type_kind(tid)
+    if k != TyKind.Struct && k != TyKind.Enum { return }
+    if tc_tid_child_count(tid) == 0 { return }
+    let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+    if tc_type_name_derives(strip_module_qualifier(tc_type_name(base)), "Hash") == 0 { return }
+    if tc_instance_has_trait(tid, "Hash") { return }
+    diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
+        "{role} type `{type_to_str(tid)}` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash", ann,
+        "use type arguments that are Hash, or derive Hash on the argument types")
 }
 
 // Verify that a Set element type annotation is hashable — a Set is a keys-only
