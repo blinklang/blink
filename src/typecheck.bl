@@ -844,7 +844,7 @@ fn tc_type_has_eq_impl(tname: Str) -> Int {
     if td != -1 {
         if tc_decl_derives(td, "Eq") != 0 { return 1 }
     }
-    if tc_method_trait_names(tname, "eq").contains("Eq") != 0 { return 1 }
+    if tc_type_writes_trait_method(tname, "eq", "Eq") { return 1 }
     0
 }
 
@@ -855,7 +855,7 @@ fn tc_type_has_ord_impl(tname: Str) -> Int {
     if td != -1 {
         if tc_decl_derives(td, "Ord") != 0 { return 1 }
     }
-    if tc_method_trait_names(tname, "cmp").contains("Ord") != 0 { return 1 }
+    if tc_type_writes_trait_method(tname, "cmp", "Ord") { return 1 }
     0
 }
 
@@ -886,7 +886,7 @@ fn tc_impl_exists(impls_sl: Int, sname: Str, tname: Str) -> Int {
     let mut i = 0
     while i < sublist_length(impls_sl) {
         let other = sublist_get(impls_sl, i)
-        if node_trait_name(other) == sname {
+        if tc_impl_trait_id(other) == sname {
             if node_name(other) == tname { return 1 }
         }
         i = i + 1
@@ -906,13 +906,13 @@ fn tc_type_satisfies_trait(tname: Str, sname: Str, impls_sl: Int) -> Int {
     if sname == "Hash" {
         let td = tc_type_decl_nodes.get(tname) ?? -1
         if td != -1 && tc_decl_derives(td, "Hash") != 0 { return 1 }
-        if tc_method_trait_names(tname, "hash").contains("Hash") != 0 { return 1 }
+        if tc_type_writes_trait_method(tname, "hash", "Hash") { return 1 }
         return 0
     }
     if sname == "Clone" {
         let td = tc_type_decl_nodes.get(tname) ?? -1
         if td != -1 && tc_decl_derives(td, "Clone") != 0 { return 1 }
-        if tc_method_trait_names(tname, "clone").contains("Clone") != 0 { return 1 }
+        if tc_type_writes_trait_method(tname, "clone", "Clone") { return 1 }
         return 0
     }
     // Arithmetic traits are sealed to numerics; a user type can never satisfy one.
@@ -1245,7 +1245,7 @@ fn tc_impl_where_bounds_hold(im: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.R
             if bounds != -1 {
                 let mut j = 0
                 while j < sublist_length(bounds) {
-                    let trait_name = strip_module_qualifier(node_name(sublist_get(bounds, j)))
+                    let trait_name = tc_bound_trait(sublist_get(bounds, j))
                     if tc_type_satisfies_bound(concrete, trait_name) == -1 { return -1 }
                     j = j + 1
                 }
@@ -4104,11 +4104,12 @@ fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete
     let concrete = tc_resolve(concrete0)
     let u = tc_unmet_user_bound(carrier, outer_sl, own_sl, concrete, binds)
     if u.trait_name == "" { return 0 }
-    let bound_text = tc_trait_at_text(u.trait_name, u.want)
-    let has = if u.held.impls == 0 { "it has no impl of {u.trait_name}" } else { "it implements {tc_trait_heads_text(u.trait_name, u.held.args, u.want.len())}" }
+    let shown = tc_trait_shown(u.trait_name)
+    let bound_text = tc_trait_at_text(shown, u.want)
+    let has = if u.held.impls == 0 { "it has no impl of {shown}" } else { "it implements {tc_trait_heads_text(shown, u.held.args, u.want.len())}" }
     diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
         "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(carrier)}: {has}", node,
-        "pass an argument whose type implements {bound_text}, or write `impl {bound_text} for {type_to_str(concrete)}`")
+        "pass an argument whose type implements {bound_text}, or write `impl {tc_trait_at_text(tc_trait_spelling(u.trait_name), u.want)} for {type_to_str(concrete)}`")
     1
 }
 
@@ -4136,7 +4137,7 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
     let mut i = 0
     while i < sublist_length(bounds) {
         let b = sublist_get(bounds, i)
-        let trait_name = strip_module_qualifier(node_name(b))
+        let trait_name = tc_bound_trait(b)
         let tr = tc_trait_node_idx.get(trait_name) ?? -1
         let args_sl = node_elements(b)
         let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
@@ -4202,7 +4203,7 @@ fn tc_impl_trait_args_held(recv: Int, trait_name: Str) -> ImplArgsHeld ! TypeChe
     let mut verdict = 1
     let mut impls = 0
     for im in tc_impl_recv_tids.keys() {
-        if strip_module_qualifier(node_trait_name(im)) != trait_name { continue }
+        if tc_impl_trait_id(im) != trait_name { continue }
         let binders = node_impl_binders(im)
         let poly = binders != -1 && sublist_length(binders) > 0
         let raw_recv = tc_impl_recv_tids.get(im) ?? -1
@@ -7312,7 +7313,7 @@ fn tparam_node_bound_traits(tp: Int) -> Str {
     if bounds == -1 { return set }
     let mut i = 0
     while i < sublist_length(bounds) {
-        let bn = strip_module_qualifier(node_name(sublist_get(bounds, i)))
+        let bn = tc_bound_trait(sublist_get(bounds, i))
         set = tc_pipe_add(set, bn)
         set = tc_pipe_add(set, builtin_trait_supers(bn))
         i = i + 1
@@ -7336,14 +7337,14 @@ fn tc_add_node_methods(set: Str, tr_node: Int) -> Str {
 // trait's guarantee set (own methods + the transitive supertrait closure's methods),
 // with an arithmetic bit set when any arithmetic trait is in the closure.
 fn tc_push_self_frame(tr_node: Int) {
-    let mut traits = tc_pipe_add("|", node_name(tr_node))
+    let mut traits = tc_pipe_add("|", tc_trait_key_of(tr_node))
     let mut methods = tc_add_node_methods("|", tr_node)
     let mut work: List[Str] = []
     let seed = node_supertraits(tr_node)
     if seed != -1 {
         let mut si = 0
         while si < sublist_length(seed) {
-            work.push(strip_module_qualifier(node_name(sublist_get(seed, si))))
+            work.push(tc_bound_trait(sublist_get(seed, si)))
             si = si + 1
         }
     }
@@ -7365,7 +7366,7 @@ fn tc_push_self_frame(tr_node: Int) {
                 if sup != -1 {
                     let mut ui = 0
                     while ui < sublist_length(sup) {
-                        work.push(strip_module_qualifier(node_name(sublist_get(sup, ui))))
+                        work.push(tc_bound_trait(sublist_get(sup, ui)))
                         ui = ui + 1
                     }
                 }
@@ -11050,7 +11051,7 @@ fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.
     }
     if name != "" && tc_trait_sig_name_declared(name, m) == 0 {
         tc_trait_sig_poisoned.insert(trait_name, 1)
-        diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type `{name}` in method `{mname}` of trait `{trait_name}`", ann,
+        diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type `{name}` in method `{mname}` of trait `{tc_trait_shown(trait_name)}`", ann,
             "a trait signature may name a declared type, a builtin type, `Self`, an associated type, or one of the trait's or method's own type parameters")
         return
     }
@@ -11086,19 +11087,215 @@ fn tc_prelude_trait_names(traits_sl: Int) -> List[Str] {
     names
 }
 
-// The prelude trait names some declaration outside the prelude modules also declares.
-fn tc_shadowed_prelude_traits(traits_sl: Int, prelude_traits: List[Str]) -> List[Str] {
-    let mut names: List[Str] = []
+// ── A trait is known by its module and its name ─────────────────────
+//
+// Every trait table is keyed by the trait's identity. A trait no other declaration answers to
+// keeps its bare name, as does a compiler-known one (a prelude module's, or one with no
+// declaration), so the compiler's own uses of `Eq` or `TryFrom` keep naming those. A trait
+// whose name a compiler-known trait or another module's trait also has is keyed
+// `Name@module`. A name written in a file reaches one of them only through that file's scope
+// (sections/07 §10.6, a shadow has module scope).
+
+// Files each trait declaration under its identity before any registers, so a supertrait
+// clause resolves against every trait in the program.
+fn tc_file_trait_keys(traits_sl: Int, prelude_traits: List[Str]) {
+    let compiler_known = tc_undeclared_trait_names()
+    let mut first_module: Map[Str, Str] = Map()
+    let mut shared: Map[Str, Int] = Map()
     let mut i = 0
     while i < sublist_length(traits_sl) {
         let tr = sublist_get(traits_sl, i)
         let name = node_name(tr)
-        if !tc_prelude_modules.contains_key(node_module(tr)) && prelude_traits.contains(name) && is_sealed_builtin_trait(name) == 0 {
-            names.push(name)
+        let m = node_module(tr)
+        if !tc_prelude_modules.contains_key(m) {
+            if compiler_known.contains(name) || prelude_traits.contains(name) { shared.insert(name, 1) }
+            match first_module.get(name) {
+                Some(seen) => if seen != m { shared.insert(name, 1) }
+                None => first_module.insert(name, m)
+            }
         }
         i = i + 1
     }
-    names
+    i = 0
+    while i < sublist_length(traits_sl) {
+        let tr = sublist_get(traits_sl, i)
+        let name = node_name(tr)
+        let key = if tc_prelude_modules.contains_key(node_module(tr)) || !shared.contains_key(name) { name } else { "{name}@{node_module(tr)}" }
+        tc_trait_node_idx.insert(key, tr)
+        i = i + 1
+    }
+}
+
+// The identity of a trait declaration, once tc_file_trait_keys has filed it.
+fn tc_trait_key_of(tr: Int) -> Str {
+    let name = node_name(tr)
+    if tc_prelude_modules.contains_key(node_module(tr)) { return name }
+    if (tc_trait_node_idx.get(name) ?? -1) == tr { return name }
+    "{name}@{node_module(tr)}"
+}
+
+// The name a trait was declared under, which is what an impl method's signature key and C
+// symbol carry: one scope never names two traits alike, so the receiver type and that name
+// already tell the impls apart.
+fn tc_trait_spelling(key: Str) -> Str {
+    match key.byte_index_of("@", 0) {
+        Some(at) => key.byte_slice(0, at)
+        None => key
+    }
+}
+
+// A " and "-joined list of trait keys, as a diagnostic names them.
+fn tc_traits_shown(keys: Str) -> Str {
+    let mut shown: List[Str] = []
+    for k in keys.split(" and ") {
+        shown.push(tc_trait_shown(k))
+    }
+    shown.join(" and ")
+}
+
+// How a diagnostic names a trait: `Eq (geo.sim)` for one that shares its name.
+fn tc_trait_shown(key: Str) -> Str {
+    match key.byte_index_of("@", 0) {
+        Some(at) => {
+            let m = key.byte_slice(at + 1, key.byte_len())
+            let shown_mod = if m == "__main__" { "main" } else { tc_get_dotted_module_path(m) }
+            "{key.byte_slice(0, at)} ({shown_mod})"
+        }
+        None => key
+    }
+}
+
+// The trait declaration `member` names inside module `target`, or -1, following a `pub
+// import` that re-exports it as nr_resolve_decl_in_module does.
+fn tc_trait_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
+    if target == "" { return -1 }
+    let shared = tc_trait_node_idx.get("{member}@{target}") ?? -1
+    if shared != -1 { return shared }
+    let alone = tc_trait_node_idx.get(member) ?? -1
+    if alone != -1 && node_module(alone) == target { return alone }
+    if depth >= 8 { return -1 }
+    for src in nr_reexport_sources(target, member) {
+        let hit = tc_trait_decl_in_module(src, member, depth + 1)
+        if hit != -1 { return hit }
+    }
+    -1
+}
+
+// The identity of the trait a name written in module `consuming_mod` names. A qualified name
+// reaches the trait the qualified module declares. A bare name reaches the module's own
+// trait, then one its imports select, then the compiler-known trait of that name; a trait
+// another module declares is never in scope under its bare name alone.
+fn tc_trait_ref_key(written: Str, consuming_mod: Str) -> Str {
+    let name = strip_module_qualifier(written)
+    if name != written {
+        let qualifier = written.byte_slice(0, written.byte_len() - name.byte_len() - 1)
+        let d = tc_trait_decl_in_module(nr_qualifier_module_in(qualifier, consuming_mod), name, 0)
+        return if d == -1 { name } else { tc_trait_key_of(d) }
+    }
+    let alone = tc_trait_node_idx.get(name) ?? -1
+    if alone != -1 && !tc_prelude_modules.contains_key(node_module(alone)) { return name }
+    if consuming_mod == "" { return name }
+    let own = tc_trait_node_idx.get("{name}@{consuming_mod}") ?? -1
+    if own != -1 { return tc_trait_key_of(own) }
+    match nr_module_import_index(consuming_mod).get(name) {
+        Some(binds) => {
+            for b in binds {
+                let d = tc_trait_decl_in_module(b.source_mod, b.member, 0)
+                if d != -1 { return tc_trait_key_of(d) }
+            }
+        }
+        None => {}
+    }
+    name
+}
+
+// The trait a bound, a where-bound or a supertrait clause names, read in the file that
+// wrote it (tc_stamp_trait_ref_modules).
+fn tc_bound_trait(b: Int) -> Str {
+    tc_trait_ref_key(node_name(b), node_module(b))
+}
+
+// The trait an impl header names.
+fn tc_impl_trait_id(im: Int) -> Str {
+    tc_trait_ref_key(node_trait_name(im), node_module(im))
+}
+
+// Only declarations carry the module they were written in. A trait-naming node inside one (a
+// bound, a where-bound, a supertrait) gets its declaration's module, so whatever reads that
+// name resolves it through the file that wrote it.
+fn tc_stamp_trait_ref_modules(program: Int) {
+    let fns_sl = node_params(program)
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            let f = sublist_get(fns_sl, i)
+            tc_stamp_bounds(node_type_params(f), node_module(f))
+            tc_stamp_bounds(node_impl_where_bounds(f), node_module(f))
+            i = i + 1
+        }
+    }
+    let types_sl = node_fields(program)
+    if types_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(types_sl) {
+            let td = sublist_get(types_sl, i)
+            tc_stamp_bounds(node_type_params(td), node_module(td))
+            i = i + 1
+        }
+    }
+    let traits_sl = node_arms(program)
+    if traits_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(traits_sl) {
+            let tr = sublist_get(traits_sl, i)
+            let m = node_module(tr)
+            tc_stamp_bounds(node_type_params(tr), m)
+            tc_stamp_names(node_supertraits(tr), m)
+            tc_stamp_method_bounds(node_methods(tr), m)
+            i = i + 1
+        }
+    }
+    let impls_sl = node_methods(program)
+    if impls_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(impls_sl) {
+            let im = sublist_get(impls_sl, i)
+            let m = node_module(im)
+            tc_stamp_bounds(node_impl_binders(im), m)
+            tc_stamp_bounds(node_impl_where_bounds(im), m)
+            tc_stamp_method_bounds(node_methods(im), m)
+            i = i + 1
+        }
+    }
+}
+
+fn tc_stamp_method_bounds(methods_sl: Int, m: Str) {
+    if methods_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(methods_sl) {
+        tc_stamp_bounds(node_type_params(sublist_get(methods_sl, i)), m)
+        tc_stamp_bounds(node_impl_where_bounds(sublist_get(methods_sl, i)), m)
+        i = i + 1
+    }
+}
+
+// The bounds of each type parameter (or where-constraint) in `tparams_sl`.
+fn tc_stamp_bounds(tparams_sl: Int, m: Str) {
+    if tparams_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(tparams_sl) {
+        tc_stamp_names(node_elements(sublist_get(tparams_sl, i)), m)
+        i = i + 1
+    }
+}
+
+fn tc_stamp_names(names_sl: Int, m: Str) {
+    if names_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(names_sl) {
+        node_set_module(sublist_get(names_sl, i), m)
+        i = i + 1
+    }
 }
 
 // A trait method declaration as a fnsig, so a call through a bound or a qualified call on a
@@ -11127,7 +11324,7 @@ fn tc_register_trait_method_sig(key: Str, m: Int, p_start: Int, ret: Int) -> Int
 }
 
 fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
-    let name = node_name(tr_node)
+    let name = tc_trait_key_of(tr_node)
     tc_trait_names.push(name)
     // Collect trait-level type params (e.g., T in trait From[T])
     let tparams_sl = node_type_params(tr_node)
@@ -11153,7 +11350,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
     if sup_sl != -1 {
         let mut spi = 0
         while spi < sublist_length(sup_sl) {
-            supers = tc_pipe_add(supers, strip_module_qualifier(node_name(sublist_get(sup_sl, spi))))
+            supers = tc_pipe_add(supers, tc_bound_trait(sublist_get(sup_sl, spi)))
             spi = spi + 1
         }
     }
@@ -11312,7 +11509,7 @@ fn tc_bounds_node_trait_args(bounds_node: Int, trait_name: Str) -> Int {
     let mut i = 0
     while i < sublist_length(bounds) {
         let b = sublist_get(bounds, i)
-        if strip_module_qualifier(node_name(b)) == trait_name { return node_elements(b) }
+        if tc_bound_trait(b) == trait_name { return node_elements(b) }
         i = i + 1
     }
     -1
@@ -11453,21 +11650,21 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
     let mut ii = 0
     while ii < sublist_length(impls_sl) {
         let im = sublist_get(impls_sl, ii)
-        let trait_name = node_trait_name(im)
+        let trait_name = tc_impl_trait_id(im)
         let impl_type = tc_impl_target_name(im)
         tc_record_impl_recv_tid(im)
         if is_trait_name(trait_name) == 0 {
             if is_sealed_builtin_type(trait_name) != 0 && is_user_sourced(im) != 0 {
-                diag_error_at("TraitContract", TRAIT_CONTRACT_907, "`{trait_name}` is a sealed built-in type and cannot be implemented for user types", im, "`{trait_name}` is a closed built-in; define your own trait with the methods you need and impl that instead")
+                diag_error_at("TraitContract", TRAIT_CONTRACT_907, "`{tc_trait_shown(trait_name)}` is a sealed built-in type and cannot be implemented for user types", im, "`{tc_trait_shown(trait_name)}` is a closed built-in; define your own trait with the methods you need and impl that instead")
                 ii = ii + 1
                 continue
             }
-            diag_error_at("TraitContract", TRAIT_CONTRACT_904, "trait `{trait_name}` is not defined", im, "check the trait name or define `trait {trait_name} \{ ... }`")
+            diag_error_at("TraitContract", TRAIT_CONTRACT_904, "trait `{tc_trait_shown(trait_name)}` is not defined", im, "check the trait name or define `trait {tc_trait_shown(trait_name)} \{ ... }`")
             ii = ii + 1
             continue
         }
         if is_sealed_builtin_trait(trait_name) != 0 && is_user_sourced(im) != 0 {
-            diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait `{trait_name}` is a sealed built-in trait and cannot be implemented for user types", im, "define your own trait with the methods you need and impl that instead")
+            diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait `{tc_trait_shown(trait_name)}` is a sealed built-in trait and cannot be implemented for user types", im, "define your own trait with the methods you need and impl that instead")
             ii = ii + 1
             continue
         }
@@ -11577,7 +11774,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         let mut trait_arg_arity_ok = 1
         if trait_tparam_count >= 0 && supplied_trait_args != trait_tparam_count {
             trait_arg_arity_ok = 0
-            diag_error_at("TraitContract", TRAIT_ARG_ARITY, "impl of trait `{trait_name}` supplies {supplied_trait_args} type argument(s) but `{trait_name}` declares {trait_tparam_count}", im, "supply one type argument per trait type parameter: `impl {trait_name}[...] for {impl_type}`")
+            diag_error_at("TraitContract", TRAIT_ARG_ARITY, "impl of trait `{tc_trait_shown(trait_name)}` supplies {supplied_trait_args} type argument(s) but `{tc_trait_shown(trait_name)}` declares {trait_tparam_count}", im, "supply one type argument per trait type parameter: `impl {tc_trait_shown(trait_name)}[...] for {impl_type}`")
         }
         // Display.display and Eq.ne are synthesized sealed methods: the compiler derives
         // them from the impl's `fmt` and `eq`, so a user impl may not define them. The
@@ -11591,7 +11788,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                 while dmi < sublist_length(sealed_methods_sl) {
                     let dm = sublist_get(sealed_methods_sl, dmi)
                     if node_name(dm) == sealed {
-                        diag_error_at("SealedMethodOverride", SEALED_METHOD_OVERRIDE, "method `{sealed}` of trait `{trait_name}` is sealed and cannot be overridden — it is synthesized from `{source}`", dm, "implement `{source}` and remove `{sealed}`; `{sealed}()` is generated from `{source}`")
+                        diag_error_at("SealedMethodOverride", SEALED_METHOD_OVERRIDE, "method `{sealed}` of trait `{tc_trait_shown(trait_name)}` is sealed and cannot be overridden — it is synthesized from `{source}`", dm, "implement `{source}` and remove `{sealed}`; `{sealed}()` is generated from `{source}`")
                     }
                     dmi = dmi + 1
                 }
@@ -11626,7 +11823,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                 impl_pcount = sublist_length(impl_params_sl)
                             }
                             if trait_pcount != impl_pcount {
-                                diag_error_at("TraitContract", TRAIT_CONTRACT_901, "method `{expected_method}` in impl {trait_name} for {impl_type} has {impl_pcount} params, expected {trait_pcount}", impl_m, "trait requires {trait_pcount} parameters (including self)")
+                                diag_error_at("TraitContract", TRAIT_CONTRACT_901, "method `{expected_method}` in impl {tc_trait_shown(trait_name)} for {impl_type} has {impl_pcount} params, expected {trait_pcount}", impl_m, "trait requires {trait_pcount} parameters (including self)")
                             } else if trait_arg_arity_ok != 0 {
                                 // Skipped when the impl's trait-arg arity is
                                 // wrong (E0910 already reported): subst_trait_type_tid
@@ -11645,7 +11842,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                             let e_s = type_to_str(r.expected)
                                             let a_q = if a_s == e_s { tc_type_origin_qualifier(r.actual) } else { "" }
                                             let e_q = if a_s == e_s { tc_type_origin_qualifier(r.expected) } else { "" }
-                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method `{expected_method}` param has type `{a_s}`{a_q}, expected `{e_s}`{e_q}", impl_p, "change type to `{e_s}`{e_q} to match trait {trait_name}")
+                                            diag_error_at("TraitContract", TRAIT_CONTRACT_902, "method `{expected_method}` param has type `{a_s}`{a_q}, expected `{e_s}`{e_q}", impl_p, "change type to `{e_s}`{e_q} to match trait {tc_trait_shown(trait_name)}")
                                         }
                                     }
                                     pi = pi + 1
@@ -11671,9 +11868,9 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                                         let re_q = if ra_s == re_s { tc_type_origin_qualifier(r.expected) } else { "" }
                                         let want = if r.expected == TYPE_VOID { "no return value" } else { "`{re_s}`{re_q}" }
                                         let fix = if r.expected == TYPE_VOID {
-                                            "remove the return type — trait {trait_name} declares `{expected_method}` with no return"
+                                            "remove the return type — trait {tc_trait_shown(trait_name)} declares `{expected_method}` with no return"
                                         } else {
-                                            "change return type to `{re_s}`{re_q} to match trait {trait_name}"
+                                            "change return type to `{re_s}`{re_q} to match trait {tc_trait_shown(trait_name)}"
                                         }
                                         diag_error_at("TraitContract", TRAIT_CONTRACT_903, "method `{expected_method}` returns `{ra_s}`{ra_q}, expected {want}", impl_m, fix)
                                     }
@@ -11685,7 +11882,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                     }
                 }
                 if found == 0 {
-                    diag_error_at("TraitContract", TRAIT_CONTRACT_900, "impl {trait_name} for {impl_type} is missing method `{expected_method}`", im, "add `fn {expected_method}(...)` to the impl block")
+                    diag_error_at("TraitContract", TRAIT_CONTRACT_900, "impl {tc_trait_shown(trait_name)} for {impl_type} is missing method `{expected_method}`", im, "add `fn {expected_method}(...)` to the impl block")
                 }
             }
             si = si + 1
@@ -11706,13 +11903,13 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                         let sname = supers.byte_slice(seg_start, ci)
                         if tc_type_satisfies_trait(impl_type, sname, impls_sl) == 0 {
                             let fix = if is_arith_trait_name(sname) != 0 {
-                                "{sname} is a sealed arithmetic trait — only built-in numeric types implement it, so no user type can satisfy `{trait_name}: {sname}`; implement `{trait_name}` only for a numeric type, or drop the `: {sname}` supertrait if `{trait_name}` does not need it"
+                                "{tc_trait_shown(sname)} is a sealed arithmetic trait — only built-in numeric types implement it, so no user type can satisfy `{tc_trait_shown(trait_name)}: {tc_trait_shown(sname)}`; implement `{tc_trait_shown(trait_name)}` only for a numeric type, or drop the `: {tc_trait_shown(sname)}` supertrait if `{tc_trait_shown(trait_name)}` does not need it"
                             } else if tc_is_derivable_trait(sname) != 0 {
-                                "derive it: `@derive({sname})` on `{impl_type}`, or write `impl {sname} for {impl_type}`"
+                                "derive it: `@derive({tc_trait_shown(sname)})` on `{impl_type}`, or write `impl {tc_trait_shown(sname)} for {impl_type}`"
                             } else {
-                                "add `impl {sname} for {impl_type}`"
+                                "add `impl {tc_trait_shown(sname)} for {impl_type}`"
                             }
-                            diag_error_at("MissingSupertraitImpl", MISSING_SUPERTRAIT_IMPL, "impl {trait_name} for {impl_type} requires {impl_type} to also implement supertrait `{sname}` (trait {trait_name}: {sname})", im, fix)
+                            diag_error_at("MissingSupertraitImpl", MISSING_SUPERTRAIT_IMPL, "impl {tc_trait_shown(trait_name)} for {impl_type} requires {impl_type} to also implement supertrait `{tc_trait_shown(sname)}` (trait {tc_trait_shown(trait_name)}: {tc_trait_shown(sname)})", im, fix)
                         }
                     }
                     seg_start = ci + 1
@@ -11739,20 +11936,20 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
                     }
                 }
                 if found_assoc == 0 {
-                    diag_error_at("TraitContract", TRAIT_CONTRACT_905, "impl {trait_name} for {impl_type} is missing associated type `{expected_assoc}`", im, "add `type {expected_assoc} = ...` to the impl block")
+                    diag_error_at("TraitContract", TRAIT_CONTRACT_905, "impl {tc_trait_shown(trait_name)} for {impl_type} is missing associated type `{expected_assoc}`", im, "add `type {expected_assoc} = ...` to the impl block")
                 }
             }
             ati = ati + 1
         }
         if is_poly != 0 && poly_supported == 0 {
-            diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "spec §3.6 defines `impl[T] {trait_name}[T] for Recv[T]`, but compiled support is still in progress; write a separate impl per concrete type for now")
+            diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "spec §3.6 defines `impl[T] {tc_trait_shown(trait_name)}[T] for Recv[T]`, but compiled support is still in progress; write a separate impl per concrete type for now")
         }
         let conflict_trait = if trait_name == "BlockHandler" { "Closeable" } else if trait_name == "Closeable" { "BlockHandler" } else { "" }
         if conflict_trait != "" {
             let mut ci = 0
             while ci < sublist_length(impls_sl) {
                 let other = sublist_get(impls_sl, ci)
-                if node_trait_name(other) == conflict_trait && node_name(other) == impl_type {
+                if tc_impl_trait_id(other) == conflict_trait && node_name(other) == impl_type {
                     diag_error_at("TraitContract", TRAIT_CONTRACT_906, "type `{impl_type}` cannot implement both Closeable and BlockHandler (ambiguous with-block semantics)", im, "remove one of the impl blocks")
                     break
                 }
@@ -11771,7 +11968,7 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
 fn tc_impl_trait_key(im: Int) -> Str {
     let args = node_type_params(im)
     let n = if args == -1 { 0 } else { sublist_length(args) }
-    "{node_trait_name(im)}/{n}"
+    "{tc_impl_trait_id(im)}/{n}"
 }
 
 // The types an impl's trait arguments name, resolved under its own binders so that
@@ -11856,7 +12053,7 @@ fn tc_impl_bounds_rule_out(im: Int, fresh: Map[Str, Int]) -> Bool ! TypeCheck.Re
             let inline = node_elements(tp)
             let mut j = 0
             while inline != -1 && j < sublist_length(inline) {
-                traits.push(strip_module_qualifier(node_name(sublist_get(inline, j))))
+                traits.push(tc_bound_trait(sublist_get(inline, j)))
                 j = j + 1
             }
             let mut w = 0
@@ -11865,7 +12062,7 @@ fn tc_impl_bounds_rule_out(im: Int, fresh: Map[Str, Int]) -> Bool ! TypeCheck.Re
                 let bounds = node_elements(cons)
                 let mut k = 0
                 while node_name(cons) == name && bounds != -1 && k < sublist_length(bounds) {
-                    traits.push(strip_module_qualifier(node_name(sublist_get(bounds, k))))
+                    traits.push(tc_bound_trait(sublist_get(bounds, k)))
                     k = k + 1
                 }
                 w = w + 1
@@ -11910,7 +12107,7 @@ fn tc_check_impl_overlap(impls_sl: Int) ! TypeCheck.Resolve, Diag.Report {
     let mut i = 0
     while i < n {
         let later = sublist_get(impls_sl, i)
-        if is_trait_name(node_trait_name(later)) != 0 {
+        if is_trait_name(tc_impl_trait_id(later)) != 0 {
             let key = tc_impl_trait_key(later)
             let mut j = 0
             while j < i {
@@ -12183,6 +12380,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if trace_mode != "" { trace("typecheck", "start") }
     init_types()
 
+    // A trait name is read from the first signature on, so every trait is filed under its
+    // identity, and every name that refers to one knows its file, before anything registers.
+    tc_stamp_trait_ref_modules(program)
+    let all_traits_sl = node_arms(program)
+    if all_traits_sl != -1 { tc_file_trait_keys(all_traits_sl, tc_prelude_trait_names(all_traits_sl)) }
+
     // Register all type definitions (structs and enums)
     let types_sl = node_fields(program)
     tc_register_type_decls(types_sl)
@@ -12337,7 +12540,6 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     let traits_sl = node_arms(program)
     if traits_sl != -1 {
         let prelude_traits = tc_prelude_trait_names(traits_sl)
-        let shadowed = tc_shadowed_prelude_traits(traits_sl, prelude_traits)
         let mut i = 0
         while i < sublist_length(traits_sl) {
             let tr = sublist_get(traits_sl, i)
@@ -12347,11 +12549,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             } else if !in_prelude && prelude_traits.contains(node_name(tr)) {
                 diag_warn_at("ShadowedPreludeName", SHADOWED_PRELUDE_NAME, "trait `{node_name(tr)}` shadows prelude trait `{node_name(tr)}`", tr, "consider a different name to avoid confusion")
             }
-            // The shadowing declaration wins (section 10.6), so the prelude one registers
-            // nothing an impl could be checked against.
-            if !(in_prelude && shadowed.contains(node_name(tr))) {
-                register_trait(tr)
-            }
+            register_trait(tr)
             i = i + 1
         }
     }
@@ -12380,6 +12578,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let im = sublist_get(impls_sl, i)
             let impl_type = tc_impl_target_name(im)
             let trait_name = node_trait_name(im)
+            let trait_id = tc_impl_trait_id(im)
             // Register the canonical monomorphized poly impl
             // `impl[T] Trait[T] for List[T]` for binder recovery in the
             // MethodCall arm. Same shape gate as validate_trait_impls'
@@ -12409,7 +12608,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             }
             // Record Display impls so infer_type can resolve the synthesized
             // display() to Str.
-            if trait_name == "Display" {
+            if trait_id == "Display" {
                 tc_display_impl_types.push(impl_type)
                 // Record every impl NODE for per-instantiation resolution. A base may
                 // carry several disjoint Display impls (§3.6 coherence is per (Trait,
@@ -12441,7 +12640,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                     // other impl methods register under the trait-qualified key
                     // so two traits sharing a method name don't overwrite.
                     let mangled = tc_mangle_impl_fnsig(impl_type, trait_name, orig_name, im)
-                    tc_record_method_trait(impl_type, orig_name, trait_name)
+                    tc_record_method_trait(impl_type, orig_name, trait_id)
                     tc_method_block.insert(m, im)
                     node_set_name(m, mangled)
                     register_fn_sig(m)
@@ -13571,21 +13770,27 @@ fn nr_resolve_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
     let direct = nr_module_decl(target, member)
     if direct != -1 { return direct }
     if depth >= 8 { return -1 }
+    for src in nr_reexport_sources(target, member) {
+        let hit = nr_resolve_decl_in_module(src, member, depth + 1)
+        if hit != -1 { return hit }
+    }
+    -1
+}
+
+// The modules a `pub import` in `target` forwards `member` from: a named re-export first,
+// then each wildcard one.
+fn nr_reexport_sources(target: Str, member: Str) -> List[Str] {
+    let mut out: List[Str] = []
     match tc_reexport_source.get("{target}:{member}") {
-        Some(src) => {
-            let hit = nr_resolve_decl_in_module(src, member, depth + 1)
-            if hit != -1 { return hit }
-        }
+        Some(src) => out.push(src)
         None => {}
     }
     let wildcard_prefix = "{target}:*:"
     for key in tc_reexport_source.keys() {
         if key.starts_with(wildcard_prefix) == 0 { continue }
-        let src = key.byte_slice(wildcard_prefix.byte_len(), key.byte_len())
-        let hit = nr_resolve_decl_in_module(src, member, depth + 1)
-        if hit != -1 { return hit }
+        out.push(key.byte_slice(wildcard_prefix.byte_len(), key.byte_len()))
     }
-    -1
+    out
 }
 
 // A module qualifier settles the module before any name is looked up, so an alias another
@@ -13662,11 +13867,15 @@ fn nr_qualified_private_access(qualifier: Str, name: Str) -> Int {
 // (section 10.1). A module's own qualifier names it too. A reader with no module recorded has
 // no import list to ask, so any module the program imports answers for it.
 fn nr_qualifier_module_here(qualifier: Str) -> Str {
-    if nr_current_module == "" {
+    nr_qualifier_module_in(qualifier, nr_current_module)
+}
+
+fn nr_qualifier_module_in(qualifier: Str, reader: Str) -> Str {
+    if reader == "" {
         return if is_import_module_name(qualifier) != 0 { tc_qualifier_to_module_or_self(qualifier) } else { "" }
     }
-    if tc_qualifier_for_module(nr_current_module) == qualifier { return nr_current_module }
-    nr_module_imports_built(nr_current_module).qualifiers.get(qualifier) ?? ""
+    if tc_qualifier_for_module(reader) == qualifier { return reader }
+    nr_module_imports_built(reader).qualifiers.get(qualifier) ?? ""
 }
 
 // The fix for a qualifier the reading module does not import. A module another file imports
@@ -15394,10 +15603,13 @@ pub fn suggest_module_member(mod_name: Str, member: Str) -> Str {
     best_name
 }
 
+// Whether `name` is a trait's identity, or the bare name of one that shares its name.
 fn is_trait_name(name: Str) -> Int {
+    let shared = "{name}@"
     let mut i = 0
     while i < tc_trait_names.len() {
-        if tc_trait_names.get(i).unwrap() == name {
+        let key = tc_trait_names.get(i).unwrap()
+        if key == name || key.starts_with(shared) {
             return 1
         }
         i = i + 1
@@ -16238,10 +16450,10 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             }
             // The compiler synthesizes a sealed display() for every Display
             // impl; register it so calls resolve.
-            if node_trait_name(im) == "Display" {
+            if tc_impl_trait_id(im) == "Display" {
                 nr_register_impl_method(impl_type, "display", -1)
             }
-            if node_trait_name(im) == "BlockHandler" {
+            if tc_impl_trait_id(im) == "BlockHandler" {
                 let ctx_sl = node_assoc_types(im)
                 if ctx_sl != -1 {
                     let mut ai = 0
@@ -16365,8 +16577,9 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
 fn nr_check_impl_trait_ref(im: Int) ! TypeCheck.Resolve, Diag.Report {
     let trait_name = node_trait_name(im)
     if trait_name == "" { return }
-    if is_trait_name(strip_module_qualifier(trait_name)) == 0 { return }
-    if tc_undeclared_trait_names().contains(trait_name) { return }
+    let trait_id = tc_impl_trait_id(im)
+    if is_trait_name(trait_id) == 0 { return }
+    if tc_undeclared_trait_names().contains(trait_id) { return }
     nr_check_type_ref(trait_name, im)
 }
 
@@ -16571,11 +16784,11 @@ fn nr_check_binder_bounds(binders_sl: Int) ! TypeCheck.Resolve, Diag.Report {
 
 fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
     let written = node_name(bound)
-    let trait_name = strip_module_qualifier(written)
+    let trait_name = tc_bound_trait(bound)
     // A bound names a trait, so a name no trait declares gets the impl header's error.
     let undeclared = tc_undeclared_trait_names().contains(trait_name)
     if is_trait_name(trait_name) == 0 && !undeclared {
-        diag_error_at("TraitContract", TRAIT_CONTRACT_904, "trait `{written}` is not defined", bound, "check the trait name or define `trait {trait_name} \{ ... }`")
+        diag_error_at("TraitContract", TRAIT_CONTRACT_904, "trait `{written}` is not defined", bound, "check the trait name or define `trait {strip_module_qualifier(written)} \{ ... }`")
         return
     }
     // A compiler-known trait with no declaration has nothing to import.
@@ -16584,8 +16797,8 @@ fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
     let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
     let want = tc_trait_tparam_count_idx.get(trait_name) ?? -1
     if want >= 0 && got != want {
-        diag_error_at("TraitContract", TRAIT_ARG_ARITY, "trait `{trait_name}` takes {want} type argument(s), {got} were given", bound,
-            "write one type argument per trait type parameter: `{trait_name}[...]`")
+        diag_error_at("TraitContract", TRAIT_ARG_ARITY, "trait `{tc_trait_shown(trait_name)}` takes {want} type argument(s), {got} were given", bound,
+            "write one type argument per trait type parameter: `{strip_module_qualifier(written)}[...]`")
         return
     }
     let mut i = 0
@@ -18787,7 +19000,7 @@ fn tc_hand_impl_need(tid: Int, base: Int, tr: Str, method: Str, visiting: List[I
     let mut failed: List[Int] = []
     let mut applies = false
     for im in tc_impl_recv_tids.keys() {
-        if strip_module_qualifier(node_trait_name(im)) != tr { continue }
+        if tc_impl_trait_id(im) != tr { continue }
         let raw = tc_impl_recv_tids.get(im) ?? -1
         if type_kind(raw) != k { continue }
         let rbase = if k == TyKind.Struct { tc_struct_base_tid(raw) } else { tc_enum_base_tid(raw) }
@@ -18833,7 +19046,7 @@ fn tc_carrier_bounds_need(carrier: Int, arg: Int, visiting: List[Int]) -> List[I
     if arg == -1 || bounds == -1 { return [] }
     let mut i = 0
     while i < sublist_length(bounds) {
-        let need = tc_trait_need(arg, strip_module_qualifier(node_name(sublist_get(bounds, i))), visiting)
+        let need = tc_trait_need(arg, tc_bound_trait(sublist_get(bounds, i)), visiting)
         if need.len() > 0 { return need }
         i = i + 1
     }
@@ -20734,7 +20947,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             let user_traits = tc_method_trait_count("List", method)
             let sealed_hof = tc_is_sealed_list_hof(method)
             if user_traits + sealed_hof >= 2 {
-                let user_names = tc_method_trait_names("List", method)
+                let user_names = tc_traits_shown(tc_method_trait_names("List", method))
                 let names = if sealed_hof != 0 {
                     if user_names != "" { "{user_names} and the sealed built-in List.{method}" } else { "the sealed built-in List.{method}" }
                 } else { user_names }
@@ -21122,7 +21335,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if obj_k == TyKind.List && qualified == -1 {
             let sole_trait = tc_method_trait_names("List", method)
             if sole_trait != "" && tc_method_trait_count("List", method) == 1 {
-                let sig_name = "List_{sole_trait}_{method}"
+                let sig_name = "List_{tc_trait_spelling(sole_trait)}_{method}"
                 let sig = lookup_fnsig(sig_name)
                 if sig != -1 {
                     let im = tc_poly_list_impl_node.get(sig_name) ?? -1
@@ -21616,7 +21829,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let tm = tc_tmsig_pool.get(tvi).unwrap()
                     if tm.method == method && tc_pipe_has(tv_traits, tm.trait_name) != 0 {
                         let binds = tc_bound_call_binds(obj_t, tvi)
-                        let _ = check_arg_shapes_with_binds("{tm.trait_name}.{method}", tm.sig, args_sl, 1, node, binds)
+                        let _ = check_arg_shapes_with_binds("{tc_trait_shown(tm.trait_name)}.{method}", tm.sig, args_sl, 1, node, binds)
                         return substitute_typevar_tid(tm.ret_tid, binds)
                     }
                     tvi = tvi + 1
@@ -21636,7 +21849,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if bname != "" {
                 let btrait = tc_method_trait_names(bname, method)
                 if btrait != "" {
-                    let bsig = lookup_fnsig("{bname}_{btrait}_{method}")
+                    let bsig = lookup_fnsig("{bname}_{tc_trait_spelling(btrait)}_{method}")
                     if bsig != -1 {
                         let _ = check_arg_shapes("{bname}.{method}", bsig, node_args(node), 1, node)
                         // Which declaration this call reached. Phase 1 could not say: it has
@@ -21655,7 +21868,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // or more traits this type implements is ambiguous. Reject before
             // resolving — the qualified call `Trait.method(receiver)` selects one.
             if tc_method_trait_count(tname, method) >= 2 {
-                let names = tc_method_trait_names(tname, method)
+                let names = tc_traits_shown(tc_method_trait_names(tname, method))
                 diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits implemented by {tname} ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`")
                 return tc_error_recovery_tid()
             }
@@ -21663,7 +21876,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // under their source-typed key (handled via the builtin-method path
             // below), so a bare-key fallback keeps any non-trait inherent sig.
             let sole_trait = tc_method_trait_names(tname, method)
-            let sig_name = if sole_trait != "" { "{tname}_{sole_trait}_{method}" } else { "{tname}_{method}" }
+            let sig_name = if sole_trait != "" { "{tname}_{tc_trait_spelling(sole_trait)}_{method}" } else { "{tname}_{method}" }
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
                 // Before the argument check: an argument typed by an impl binder takes the
@@ -22076,7 +22289,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // Gated on the TRAIT's declaration rather than on the missing fnsig, so
                     // a declared-but-unregistered method keeps its existing answer.
                     if tc_trait_declares_method(obj_name, method) == 0 {
-                        let qt_owner = tc_method_trait_names(qt_tname, method)
+                        let qt_owner = tc_traits_shown(tc_method_trait_names(qt_tname, method))
                         let qt_help = if qt_owner != "" { "`{method}` on {qt_tname} is defined by {qt_owner}" } else { "" }
                         tc_unresolved_method_hard.insert(node, 1)
                         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait `{obj_name}` does not define method `{method}`", node, qt_help)
@@ -22131,13 +22344,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // receiver as the first argument, and an associated function has no receiver to
                 // pass. So the fixes it can offer are both in the declarations.
                 if tc_method_distinct_trait_count(obj_name, method) >= 2 {
-                    let amb_traits = tc_method_distinct_trait_names(obj_name, method)
+                    let amb_traits = tc_traits_shown(tc_method_distinct_trait_names(obj_name, method))
                     diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous static call: `{obj_name}.{method}` is declared by multiple traits implemented by {obj_name} ({amb_traits})", node, "rename one of the methods, or drop one of the impls: a qualified call names the trait by passing the receiver first, and an associated function has no receiver to pass")
                     return tc_error_recovery_tid()
                 }
                 let static_trait = tc_method_trait_names(obj_name, method)
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
-                    let q_sig = lookup_fnsig("{obj_name}_{static_trait}_{method}")
+                    let q_sig = lookup_fnsig("{obj_name}_{tc_trait_spelling(static_trait)}_{method}")
                     if q_sig != -1 {
                         nr_note_call_decl(node, fnsig_pool.get(q_sig).unwrap().decl)
                         // The impl's signature still says `Self`; the call names the type.
@@ -24459,7 +24672,7 @@ fn tc_tid_has_block_handler(tid: Int) -> Int ! Diag.Report {
     let decl = tc_tid_decl_node(tid)
     if decl < 0 { return 0 }
     for im in tc_impl_recv_tids.keys() {
-        if node_trait_name(im) == "BlockHandler" && tc_tid_decl_node(tc_impl_recv_tid(im)) == decl {
+        if tc_impl_trait_id(im) == "BlockHandler" && tc_tid_decl_node(tc_impl_recv_tid(im)) == decl {
             return 1
         }
     }
