@@ -24587,7 +24587,7 @@ fn tc_check_enum_pattern_scrutinee(pat: Int, scrut_tid: Int) ! Diag.Report {
     let variant = node_type_name(pat)
     if variant == "" { return }
     let qual = node_name(pat)
-    let qual_tid = named_type_map.get(qual) ?? -1
+    let qual_tid = lookup_named_type(qual)
     if qual_tid < 0 { return }
     if type_kind(qual_tid) != TyKind.Enum { return }
     if tc_kind_has_no_variants(scrut_tid) == 0 { return }
@@ -25558,7 +25558,7 @@ fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
         let mut variant_enum_tid = -1
         if tname != "" {
             short_name = tname
-            variant_enum_tid = named_type_map.get(vname) ?? -1
+            variant_enum_tid = lookup_named_type(vname)
         }
         // Peel from the RESOLVED binding hint: a push-built (metavar-pinned) scrutinee holds
         // the carrier as a bound metavar (kind Unknown, inner1 -> the Option/Result solution),
@@ -27026,6 +27026,46 @@ fn tc_ann_names_tparam(ann: Int, param_name: Str) -> Bool {
 // "is one" — tc_stamp_name_child asks the scope first and reaches here only when nothing was
 // bound under the name.
 pub fn tc_name_is_item(name: Str) -> Int {
+    tc_name_is_item_in(name, nr_current_module)
+}
+
+// tc_name_is_item as read from inside `module`. The type and function tables answer a bare
+// namesake per reading module, so the ladder has to run with the module of the position it
+// excuses, not with whichever module the checker happened to finish on.
+fn tc_name_is_item_in(name: Str, module: Str) -> Int {
+    let saved_module = nr_current_module
+    nr_current_module = module
+    let is_item = tc_name_is_item_here(name)
+    nr_current_module = saved_module
+    is_item
+}
+
+// The module a body's names are read in: the one tc_infer_program_body checks it under. An
+// impl method carries no module of its own, so it reads in its impl's; a test block reads in
+// the main file's.
+fn tc_body_module(decl: Int) -> Str {
+    let own = node_module(decl)
+    if own != "" { return own }
+    match tc_impl_of_method.get(decl) {
+        Some(im) => node_module(im)
+        None => "__main__"
+    }
+}
+
+// Codegen asks the type and function tables by name too, and they answer a bare namesake
+// per reading module, so a lowered body must read in the module it was checked in. Answers
+// the module it replaces, for tc_leave_body_module.
+pub fn tc_enter_body_module(decl: Int) -> Str {
+    let saved_module = nr_current_module
+    nr_current_module = tc_body_module(decl)
+    saved_module
+}
+
+pub fn tc_leave_body_module(saved_module: Str) {
+    nr_current_module = saved_module
+}
+
+fn tc_name_is_item_here(name: Str) -> Int {
     // `import m.{add as plus}` registers `add` in the item tables and nothing under `plus`,
     // so the ladder has to ask about the original name — the same resolution the Call arm
     // applies before it reads the signature.
@@ -27090,14 +27130,16 @@ fn tc_record_name_position_value(n: Int) {
 // any other, which is what the total-stamp pass excuses against this answer.
 pub fn tc_stamp_name_child(n: Int) -> Int {
     let mut items: Map[Str, Int] = Map()
-    tc_stamp_name_child_in(n, items)
+    tc_stamp_name_child_in(n, nr_current_module, items)
 }
 
-// tc_stamp_name_child with the item-table answer kept in `items` per spelling. The ladder
-// reads the spelling and tables that nothing writes while the assert runs, so one answer holds
-// for every position of that spelling. Scope is per position and stays out of the key: the
-// same spelling is an item at one position and a shadowing local at another.
-fn tc_stamp_name_child_in(n: Int, items: Map[Str, Int]) -> Int {
+// tc_stamp_name_child for a position inside `module`, with the item-table answer kept in
+// `items` per module and spelling. The ladder reads tables that nothing writes while the
+// assert runs, so one answer holds for every position of that spelling in that module; two
+// modules can each declare a type of the same name, so the module is part of the key. Scope
+// is per position and stays out of the key: the same spelling is an item at one position and
+// a shadowing local at another.
+fn tc_stamp_name_child_in(n: Int, module: Str, items: Map[Str, Int]) -> Int {
     let c = tc_name_position_child(n)
     if c == -1 { return -1 }
     // `old` in an @ensures snapshot names the snapshot form, not a value or an item.
@@ -27110,10 +27152,12 @@ fn tc_stamp_name_child_in(n: Int, items: Map[Str, Int]) -> Int {
         if tc_name_position_is_value.get(c).unwrap() != 0 { return -1 }
     }
     let nm = node_name(c)
-    let mut is_item = items.get(nm) ?? -1
+    // A spelling holds no space, so the module before it cannot run into it.
+    let key = "{module} {nm}"
+    let mut is_item = items.get(key) ?? -1
     if is_item == -1 {
-        is_item = tc_name_is_item(nm)
-        items.insert(nm, is_item)
+        is_item = tc_name_is_item_in(nm, module)
+        items.insert(key, is_item)
     }
     if is_item == 0 { return -1 }
     c
@@ -27337,24 +27381,35 @@ fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.R
 // walks a field default or a @where predicate on its own; it reuses the same buffer, so those
 // walks cost their own subtree and not a pass over every node.
 pub fn tc_stamp_walk(root: Int, owners: List[Int], seen: List[Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_stamp_walk_sized(root, owners, seen, 0)
+    let mut mods: List[Str] = []
+    tc_stamp_walk_sized(root, owners, mods, seen, 0)
 }
 
 // The walk with room for `cap` nodes in its order: the whole-program walk reaches nearly every
 // node, and growing a list that size by doubling copies it again at each step.
-fn tc_stamp_walk_sized(root: Int, owners: List[Int], seen: List[Int], cap: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+//
+// `mods` gets a third column: the module each node was checked in. Only a top-level
+// declaration carries its module, so a node below one reads it from the nearest ancestor that
+// does, which is the module tc_infer_program_body sets around that declaration's body.
+fn tc_stamp_walk_sized(root: Int, owners: List[Int], mods: List[Str], seen: List[Int], cap: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut order: List[Int] = List.with_capacity(cap)
     if root == -1 { return order }
     while seen.len() < node_count() { seen.push(0) }
     let mut stack: List[Int] = [root]
     let mut pending: List[Int] = [-1]
+    // A test block carries no module and is checked in the main file's, as tc_body_module reads it.
+    let mut pending_mod: List[Str] = ["__main__"]
     let mut kids: List[Int] = []
     while stack.len() > 0 {
         let n = stack.pop().unwrap()
         let o = pending.pop().unwrap()
+        let outer_mod = pending_mod.pop().unwrap()
         if seen.get(n).unwrap() != 0 { continue }
         seen.set(n, 1)
+        let own_mod = node_module(n)
+        let m = if own_mod != "" { own_mod } else { outer_mod }
         owners.push(o)
+        mods.push(m)
         order.push(n)
         // An `@ffi` declaration's body is never checked — tc_check_fn skips it, and name
         // resolution does not even bind its params — so nothing in it was ever given a type.
@@ -27376,6 +27431,7 @@ fn tc_stamp_walk_sized(root: Int, owners: List[Int], seen: List[Int], cap: Int) 
             if kid != skip_body {
                 stack.push(kid)
                 pending.push(inner)
+                pending_mod.push(m)
             }
             i = i + 1
         }
@@ -27489,7 +27545,7 @@ fn tc_stamp_standdown_bodies(owner_index: List[Int]) -> Map[Int, Int] {
 //
 // `marks` is the walk's `seen` buffer: all zero, one slot per node the walk reached. Nothing
 // reads it after this pass, so the marks are left in it.
-fn tc_stamp_assert(order: List[Int], owners: List[Int], stood: Map[Int, Int], marks: List[Int]) ! Diag.Report {
+fn tc_stamp_assert(order: List[Int], owners: List[Int], mods: List[Str], stood: Map[Int, Int], marks: List[Int]) ! Diag.Report {
     // The untyped nodes first. Only a node that carries no type can need a name excuse, so the
     // name ladder runs for those alone. In a program that type checks they are the item names
     // in name positions, which leaves out the typed name positions (about three in ten).
@@ -27516,11 +27572,14 @@ fn tc_stamp_assert(order: List[Int], owners: List[Int], stood: Map[Int, Int], ma
         // A few thousand spellings fill tens of thousands of name positions. Dropped with
         // this call, so no answer outlives the tables it was read from.
         let mut items: Map[Str, Int] = Map()
-        for p in order {
+        let mut j = 0
+        while j < order.len() {
+            let p = order.get(j).unwrap()
             let c = tc_name_position_child(p)
             if c != -1 && c < marks.len() && marks.get(c).unwrap() == 1 {
-                if tc_stamp_name_child_in(p, items) == c { marks.set(c, 2) }
+                if tc_stamp_name_child_in(p, mods.get(j).unwrap(), items) == c { marks.set(c, 2) }
             }
+            j = j + 1
         }
     }
     let mut reported: Map[Str, Int] = Map()
@@ -27579,8 +27638,9 @@ fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut owners: List[Int] = List.with_capacity(node_count())
     // tc_stamp_walk fills one slot per node.
+    let mut mods: List[Str] = List.with_capacity(node_count())
     let mut seen: List[Int] = List.with_capacity(node_count())
-    let order = tc_stamp_walk_sized(program, owners, seen, node_count())
+    let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
     tc_report_unclaimed_calls()
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
@@ -27622,7 +27682,7 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
         // readers are the whole program. That one case still stands the pass down everywhere.
         if stood.contains_key(-1) { return }
     }
-    tc_stamp_assert(order, owners, stood, seen)
+    tc_stamp_assert(order, owners, mods, stood, seen)
 }
 
 // ── Name and impl-shape helpers ────────────────────────────────────────────────

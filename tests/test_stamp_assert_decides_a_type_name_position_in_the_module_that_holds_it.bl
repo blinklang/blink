@@ -1,0 +1,121 @@
+// Whether a name position holds an item depends on the module the position sits in: two
+// modules may each declare a type `ZzHue`, and a third module that neither declares nor
+// imports one has no item under that spelling. The stamp assert may answer the item-table
+// half once per spelling only within one module. Each row grafts an untyped `ZzHue` qualifier
+// into bodies of those modules and pins the exact report.
+//
+// The pass reports the first offending node per kind, so a row with two grafts shows only the
+// first one the walk reaches. The two-graft rows therefore run under both import orders of the
+// main file, which flips the order the walk reaches the modules in: an answer carried from the
+// declaring module to the other one excuses the hole in at least one of them.
+//
+// The holes are grafted, because a hole in clean source is what the pass exists to make
+// impossible; see test_stamp_assert_decides_each_name_position_by_its_own_scope_when_a_spelling_repeats.bl.
+
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_stamp_program}
+import parser.{node_count, node_push, node_kind, node_name, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist}
+import ast.{NodeKind, AstNode}
+import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn hue_module(variant_a: Str, variant_b: Str, f: Str, n: Int) -> Str {
+    let mut s = "pub type ZzHue \{\n    {variant_a}\n    {variant_b}\n}\n\n"
+    s = s.concat("pub fn {f}() -> Int \{\n    let zzh = ZzHue.{variant_a}\n    match zzh \{\n")
+    s = s.concat("        {variant_a} => {n}\n        {variant_b} => 0\n    }\n}\n")
+    s
+}
+
+fn compile_probe(dir: Str, gamma_first: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process {
+    init_embedded_stdlib()
+    let _ = process_run("rm", ["-rf", dir])
+    let _ = process_run("mkdir", ["-p", "{dir}/src"])
+    write_file("{dir}/src/zzalpha.bl", hue_module("ZzRed", "ZzGreen", "zzmake_a", 1))
+    write_file("{dir}/src/zzbeta.bl", hue_module("ZzBlue", "ZzGray", "zzmake_b", 3))
+    write_file("{dir}/src/zzgamma.bl", "pub fn zzmake_c() -> Int \{\n    5\n}\n")
+    let declaring = "import zzalpha.\{zzmake_a}\nimport zzbeta.\{zzmake_b}\n"
+    let other = "import zzgamma.\{zzmake_c}\n"
+    let mut main = if gamma_first { "{other}{declaring}\n" } else { "{declaring}{other}\n" }
+    main = main.concat("fn main() \{\n    io.println(\"\{zzmake_a()} \{zzmake_b()} \{zzmake_c()}\")\n}\n")
+    write_file("{dir}/src/main.bl", main)
+    diag_reset()
+    let program = compile_to_program("{dir}/src/main.bl", 1)
+    check_types(program)
+    assert_eq(diag_count, 0)
+    let _ = process_run("rm", ["-rf", dir])
+    program
+}
+
+fn body_of(f: Str) -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == f { return node_body(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// `ZzHue.zzfield` on line `line`, the untyped qualifier at column 5 and the untyped access at
+// column 9. The access is a cascade from its qualifier, so only the qualifier can report.
+fn access_on(line: Int) -> Int ! Parse.Build {
+    let q = node_count()
+    node_push(AstNode { kind: NodeKind.Ident, name: "ZzHue", line: line, col: 5 })
+    let n = node_count()
+    node_push(AstNode { kind: NodeKind.FieldAccess, name: "zzfield", obj: q, line: line, col: 9 })
+    n
+}
+
+// One graft: the access at `line`, appended to the body of the function `f`.
+type Graft { f: Str  line: Int }
+
+// Graft each access in order, run the pass, and answer the internal errors it raised as
+// "<message> @<line>:<col>" in report order.
+fn ices_with(program: Int, grafts: List[Graft]) -> List[Str] ! Parse.Build, TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // sublist_push guards on an open sublist, which only the parser normally holds.
+    let scratch = new_sublist()
+    for g in grafts {
+        let body = body_of(g.f)
+        assert(body != -1)
+        sublist_push(node_stmts(body), access_on(g.line))
+    }
+    finalize_sublist(scratch)
+    diag_reset()
+    tc_stamp_program(program)
+    assert_eq(diag_count, 0)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "ice" { out.push("{d.name} {d.code}: {d.message} @{d.line}:{d.col}") }
+    }
+    assert_eq(out.len(), diag_ice_count)
+    out
+}
+
+fn ice(line: Int) -> Str {
+    "NodeCarriesNoType I0001: a Ident node reached the end of type checking with no type @{line}:5"
+}
+
+test "a type name position in a module that declares the type is excused" {
+    let program = compile_probe("build/stamp_module_declaring", false)
+    let got = ices_with(program, [Graft { f: "zzmake_a", line: 951 }])
+    assert_eq(got, [])
+}
+
+test "a type name position in a module with no such type in scope reports" {
+    let program = compile_probe("build/stamp_module_undeclaring", false)
+    let got = ices_with(program, [Graft { f: "zzmake_c", line: 952 }])
+    assert_eq(got, [ice(952)])
+}
+
+test "each declaring module excuses its own namesake type name" {
+    let program = compile_probe("build/stamp_module_both_declaring", false)
+    let got = ices_with(program, [Graft { f: "zzmake_a", line: 961 }, Graft { f: "zzmake_b", line: 962 }])
+    assert_eq(got, [])
+}
+
+test "an excuse in the declaring module does not carry to a module without the type, either order" {
+    for gamma_first in [false, true] {
+        let program = compile_probe("build/stamp_module_mixed", gamma_first)
+        let got = ices_with(program, [Graft { f: "zzmake_a", line: 971 }, Graft { f: "zzmake_c", line: 972 }])
+        assert_eq(got, [ice(972)])
+    }
+}
