@@ -1,0 +1,196 @@
+// The main file is a module like any other for scoping (sections/07_trust_modules_metadata.md
+// §10.1): its declarations reach another module of the package only through that module's
+// imports. A module that names a main-file fn, type, const or let it never imported gets the
+// error it would get for the same declaration in any other module.
+
+fn cleanup(base: Str) {
+    let _ = process_run("rm", ["-rf", base])
+}
+
+fn fail(base: Str, msg: Str) {
+    io.println("FAIL: {msg}")
+    cleanup(base)
+    assert(false)
+}
+
+fn blink_bin() -> Str {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    "{blink_root}/build/blink"
+}
+
+fn new_package(base: Str) {
+    cleanup(base)
+    let _ = process_run("mkdir", ["-p", "{base}/src"])
+    write_file("{base}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+}
+
+// The combined output of `blink <cmd> src/main.bl`, with its exit status on the last line.
+fn blink_in(base: Str, cmd: Str) -> Str {
+    let r = process_run("sh", ["-c", "cd {base} && {blink_bin()} {cmd} src/main.bl 2>&1"])
+    "{r.out}\nexit {r.exit_code}"
+}
+
+fn exited_clean(out: Str) -> Bool {
+    out.ends_with("\nexit 0")
+}
+
+// The diagnostic codes of a failed check, in order, such as "ImportNotSelected,".
+fn error_codes(out: Str) -> Str {
+    let mut codes = ""
+    for line in out.split("\n") {
+        if !line.starts_with("error[") { continue }
+        let end = line.byte_index_of("]", 0) ?? line.byte_len()
+        codes = "{codes}{line.byte_slice(6, end)},"
+    }
+    codes
+}
+
+test "a module that calls a main-file pub fn it never imported is ImportNotSelected" {
+    let base = ".tmp/_test_main_file_decls_unimported_fn"
+    new_package(base)
+    write_file("{base}/src/helper.bl", "pub fn helper() -> Int \{ secret() \}\n")
+    write_file("{base}/src/main.bl", #"import helper.{helper}
+
+pub fn secret() -> Int { 42 }
+
+fn main() { io.println("{helper()}") }
+"#)
+    let chk = blink_in(base, "check")
+    if exited_clean(chk) {
+        fail(base, "a module that never imported the main file's `secret` checked clean: {chk}")
+        return
+    }
+    if !chk.contains("error[ImportNotSelected]: `secret` is not in scope") || !chk.contains("--> src/helper.bl:1:26") {
+        fail(base, "expected ImportNotSelected for `secret` at src/helper.bl:1:26, got: {chk}")
+        return
+    }
+    if error_codes(chk) != "ImportNotSelected," {
+        fail(base, "expected exactly one ImportNotSelected, got: {chk}")
+        return
+    }
+    cleanup(base)
+}
+
+// Each row declares the same items once in the main file and once in a sibling module that
+// the main file imports, and the module that uses them imports neither.
+test "a main-file declaration that a module did not import gets the error a sibling's gets" {
+    let base = ".tmp/_test_main_file_decls_same_as_sibling"
+    let rows = [
+        ["pub fn secret() -> Int \{ 42 \}", "pub fn helper() -> Int \{ secret() \}"],
+        ["fn secret() -> Int \{ 42 \}", "pub fn helper() -> Int \{ secret() \}"],
+        ["pub type Point \{ x: Int \}", "pub fn helper() -> Int \{\n    let p = Point \{ x: 1 \}\n    p.x\n\}"],
+        ["pub const LIMIT: Int = 3", "pub fn helper() -> Int \{ LIMIT \}"],
+        ["pub let base: Int = 5", "pub fn helper() -> Int \{ base \}"],
+    ]
+    for row in rows {
+        let decl = row.get(0) ?? ""
+        let use_site = row.get(1) ?? ""
+
+        new_package(base)
+        write_file("{base}/src/helper.bl", "{use_site}\n")
+        write_file("{base}/src/main.bl", "import helper.\{helper\}\n\n{decl}\n\nfn main() \{ io.println(\"\{helper()\}\") \}\n")
+        let in_main = blink_in(base, "check")
+
+        new_package(base)
+        write_file("{base}/src/helper.bl", "{use_site}\n")
+        write_file("{base}/src/other.bl", "{decl}\n")
+        write_file("{base}/src/main.bl", "import helper.\{helper\}\nimport other\n\nfn main() \{ io.println(\"\{helper()\}\") \}\n")
+        let in_sibling = blink_in(base, "check")
+
+        if exited_clean(in_main) {
+            fail(base, "`{decl}` in the main file reached a module that never imported it: {in_main}")
+            return
+        }
+        let want = error_codes(in_sibling)
+        if want == "" {
+            fail(base, "`{decl}` in a sibling module reached a module that never imported it: {in_sibling}")
+            return
+        }
+        if error_codes(in_main) != want {
+            fail(base, "`{decl}`: the main file gave {error_codes(in_main)} where a sibling gives {want}; main: {in_main}; sibling: {in_sibling}")
+            return
+        }
+    }
+    cleanup(base)
+}
+
+test "a module that imports a main-file declaration can use it" {
+    let base = ".tmp/_test_main_file_decls_imported"
+    new_package(base)
+    write_file("{base}/src/helper.bl", #"import main.{secret, Point, LIMIT, base}
+
+pub fn helper() -> Int {
+    let p = Point { x: secret() }
+    p.x + LIMIT + base
+}
+"#)
+    write_file("{base}/src/main.bl", #"import helper.{helper}
+
+pub type Point { x: Int }
+pub const LIMIT: Int = 3
+pub let base: Int = 5
+
+pub fn secret() -> Int { 42 }
+
+fn main() { io.println("helper {helper()}") }
+"#)
+    let run = blink_in(base, "run")
+    if !exited_clean(run) || !run.contains("helper 50") {
+        fail(base, "a module that imports the main file's declarations should run and print `helper 50`, got: {run}")
+        return
+    }
+    cleanup(base)
+}
+
+test "a main file that calls into modules is unchanged" {
+    let base = ".tmp/_test_main_file_decls_calls_out"
+    new_package(base)
+    let _ = process_run("mkdir", ["-p", "{base}/src/util"])
+    write_file("{base}/src/util/math.bl", "pub fn double(n: Int) -> Int \{ n * 2 \}\npub const STEP: Int = 4\n")
+    write_file("{base}/src/helper.bl", "import util.math.\{double\}\n\npub fn helper(n: Int) -> Int \{ double(n) + 1 \}\n")
+    write_file("{base}/src/main.bl", #"import helper.{helper}
+import util.math
+
+fn local() -> Int { 10 }
+
+fn main() { io.println("out {helper(local())} {math.double(3)} {math.STEP}") }
+"#)
+    let run = blink_in(base, "run")
+    if !exited_clean(run) || !run.contains("out 21 6 4") {
+        fail(base, "a main file calling into modules should print `out 21 6 4`, got: {run}")
+        return
+    }
+    cleanup(base)
+}
+
+// A main-file value named like a prelude variant is E1016 in the main file. It must stay only
+// that: the bare `Ok` and `Some` of another module, and of std, still mean the variants.
+test "a main-file let named Ok does not reach another module's bare Ok and Some" {
+    let base = ".tmp/_test_main_file_decls_let_ok"
+    new_package(base)
+    write_file("{base}/src/helper.bl", #"pub fn helper() -> Int {
+    let r: Result[Int, Str] = Ok(1)
+    let o = Some(2)
+    match r {
+        Ok(n) => n + (o ?? 0)
+        Err(_) => 0
+    }
+}
+"#)
+    write_file("{base}/src/main.bl", #"import helper.{helper}
+
+let Ok = 5
+
+fn main() { io.println("{helper()} {Ok}") }
+"#)
+    let chk = blink_in(base, "check")
+    if error_codes(chk) != "DuplicateModuleBinding," {
+        fail(base, "expected only the main file's DuplicateModuleBinding for `let Ok`, got: {chk}")
+        return
+    }
+    if !chk.contains("--> src/main.bl:3:1") {
+        fail(base, "expected the DuplicateModuleBinding on the main file's `let Ok`, got: {chk}")
+        return
+    }
+    cleanup(base)
+}
