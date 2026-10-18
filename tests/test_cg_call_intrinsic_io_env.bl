@@ -4,15 +4,16 @@
 // reaches is decided from the namespace and the method name alone, the same two spellings
 // typecheck reads to accept the call in the first place.
 //
-// The names divide three ways, and the division is not cosmetic. Five io operations and
+// The names divide three ways, and the division is not cosmetic. Eight io operations and
 // five env operations are operations of an EFFECT: each one is a slot of a vtable the
 // evidence vector points at, so a handler installed over the call site replaces it.
 // Calling the runtime's default directly would ignore that handler and print where a test
-// meant to capture. Those names route to the effect stage, which performs through the
-// vector. The two `_raw` names have no slot by design, so they call the runtime's default
-// writer directly, with the value rendered to text first. The last five read and write the
-// standard streams through calls the runtime publishes, so they are built. env.args is no
-// handler's operation either, so the runtime answers the whole argument list in one call.
+// meant to capture, or read the real standard input where a test gave its own. Those names
+// route to the effect stage, which performs through the vector. The two `_raw` names have
+// no slot by design, so they call the runtime's default writer directly, with the value
+// rendered to text first. The last two write the standard output through calls the runtime
+// publishes, so they are built. env.args is no handler's operation either, so the runtime
+// answers the whole argument list in one call.
 
 import lower_test_helpers.{
     probe, rhs_of, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
@@ -20,7 +21,7 @@ import lower_test_helpers.{
 import parser.{node_count, node_kind, node_method}
 import ast.{NodeKind, nk_of}
 import ir.{IrKind, ir_c_name, ir_kid}
-import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
+import cg_expr.{lower_expr}
 import std.io
 
 // A call written as a statement binds no name, so it is found by walking forward from a
@@ -39,8 +40,9 @@ fn call_after(anchor: Str, method: Str) -> Int {
     -1
 }
 
-// The five io names that reach the standard streams with no handler between. Three answer a
-// value and two answer nothing, so the probe writes each in the position its type allows.
+// The three IO.Read operations and the two io names that write the standard output with no
+// handler between. Three answer a value and two answer nothing, so the probe writes each in
+// the position its type allows.
 fn src_streams() -> Str {
     #"fn main() {
     let count = 4
@@ -69,34 +71,32 @@ fn src_other_groups() -> Str {
 "#
 }
 
-// The runtime answers NULL at end of input, and the Option is built from that text.
-test "io.read_line answers the Option built from the runtime line reader's text" {
+// IO.Read is handleable, so each of its operations performs through the io slot of the
+// evidence vector; with no handler installed, that slot holds the runtime's reader.
+test "io.read_line performs through the io slot of the evidence vector" {
     probe("cg_call_io_read_line", src_streams())
-    let mark = cg_expr_pending_count()
     let built = lower_expr(rhs_of("line"))
-    let stmts = cg_expr_take_pending(mark)
-    assert_kind("read_line kind", built, IrKind.VarRef)
+    assert_kind("read_line kind", built, IrKind.EffectPerform)
+    assert_eq_str("read_line slot", ir_c_name(built), "read_line")
     assert_verifies("read_line", built)
-    assert(stmts.len() > 0)
-    let read = ir_kid(stmts.get(0).unwrap(), 0)
-    assert_shape("read_line shape", read, "CallRuntime")
-    assert_eq_str("read_line symbol", ir_c_name(read), "blink_stdin_read_line")
 }
 
-test "io.read_all reaches the runtime reader with no argument" {
+test "io.read_all performs through the io slot with no argument" {
     probe("cg_call_io_read_all", src_streams())
     let built = lower_expr(rhs_of("rest"))
-    assert_kind("read_all kind", built, IrKind.CallRuntime)
-    assert_shape("read_all shape", built, "CallRuntime")
-    assert_eq_str("read_all symbol", ir_c_name(built), "blink_stdin_read_all")
+    assert_shape("read_all shape", built, "EffectPerform(FieldGet(EvidenceVector))")
+    assert_eq_str("read_all slot", ir_c_name(built), "read_all")
     assert_verifies("read_all", built)
 }
 
-test "io.read_bytes passes its count to the runtime byte reader" {
+// The count passes through the runtime's check first, so a count below one panics before
+// any handler runs.
+test "io.read_bytes performs through the io slot with its count checked first" {
     probe("cg_call_io_read_bytes", src_streams())
     let built = lower_expr(rhs_of("buffer"))
-    assert_shape("read_bytes shape", built, "CallRuntime(VarRef)")
-    assert_eq_str("read_bytes symbol", ir_c_name(built), "blink_stdin_read_bytes")
+    assert_shape("read_bytes shape", built, "EffectPerform(FieldGet(EvidenceVector), CallRuntime(VarRef))")
+    assert_eq_str("read_bytes slot", ir_c_name(built), "read_bytes")
+    assert_eq_str("read_bytes count check", ir_c_name(ir_kid(built, 1)), "blink_io_read_bytes_count")
     assert_verifies("read_bytes", built)
 }
 

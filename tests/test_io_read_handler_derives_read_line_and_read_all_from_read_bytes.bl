@@ -1,0 +1,208 @@
+// IO.Read has one primitive operation, read_bytes; read_line and read_all are derived
+// (§4.4.9). A handler that writes only read_bytes answers both derived operations over its
+// own read_bytes, and a handler that writes a derived operation answers it with its clause.
+
+fn bytes_of(text: Str) -> Handler[IO.Read] { reader_of(Bytes.from_str(text)) }
+
+// A read_bytes clause over `data`. The position lives in a closure because a handler
+// operation cannot yet assign a captured `let mut`.
+fn reader_of(data: Bytes) -> Handler[IO.Read] {
+    let mut pos = 0
+    let next = fn(n: Int) -> Bytes {
+        let left = data.len() - pos
+        let take = if n < left { n } else { left }
+        let out = data.slice(pos, pos + take)
+        pos = pos + take
+        out
+    }
+    handler IO.Read {
+        fn read_bytes(n: Int) -> Bytes { next(n) }
+    }
+}
+
+fn lines_read() -> List[Str] ! IO.Read {
+    let mut out: List[Str] = []
+    loop {
+        match io.read_line() {
+            Some(line) => out.push(line)
+            None => break
+        }
+    }
+    out
+}
+
+test "a read_bytes-only handler answers read_line over its read_bytes" {
+    with bytes_of("a\r\nb\n\nlast") {
+        assert_eq(lines_read(), ["a", "b", "", "last"])
+    }
+}
+
+test "a read_bytes-only handler answers read_all over its read_bytes" {
+    with bytes_of("one\ntwo\r\n") {
+        assert_eq(io.read_line(), Some("one"))
+        assert_eq(io.read_all(), "two\r\n")
+        assert_eq(io.read_all(), "")
+    }
+}
+
+test "read_all over a read_bytes-only handler reads past one 65536-byte chunk" {
+    let sb = StringBuilder.new()
+    let mut i = 0
+    while i < 70000 {
+        sb.write("{i % 7}")
+        i += 1
+    }
+    let text = sb.to_str()
+    with bytes_of(text) { assert_eq(io.read_all(), text) }
+}
+
+test "the derived read_line panics on bytes that are not UTF-8 and names io.read_bytes" {
+    let mut raw = Bytes.new()
+    raw.push(255)
+    raw.push(10)
+    with reader_of(raw) {
+        assert_panics(matching: "io.read_line: input is not valid UTF-8; read it with io.read_bytes") {
+            let _ = io.read_line()
+        }
+    }
+}
+
+test "a handler that writes read_line answers read_line with its clause" {
+    let h = handler IO.Read {
+        fn read_bytes(_n: Int) -> Bytes { Bytes.from_str("x") }
+        fn read_line() -> Option[Str] { Some("from the clause") }
+    }
+    with h {
+        assert_eq(io.read_line(), Some("from the clause"))
+        assert(io.read_bytes(1) == Bytes.from_str("x"))
+    }
+}
+
+test "a handler that writes read_all answers read_all with its clause" {
+    let h = handler IO.Read {
+        fn read_bytes(_n: Int) -> Bytes { Bytes.new() }
+        fn read_all() -> Str { "everything" }
+    }
+    with h {
+        assert_eq(io.read_all(), "everything")
+        assert_eq(io.read_line(), None)
+    }
+}
+
+test "an inner read_bytes-only handler answers read_line over its own read_bytes" {
+    let outer = handler IO.Read {
+        fn read_bytes(_n: Int) -> Bytes { Bytes.new() }
+        fn read_line() -> Option[Str] { Some("outer clause") }
+    }
+    with outer {
+        assert_eq(io.read_line(), Some("outer clause"))
+        with bytes_of("inner\n") {
+            assert_eq(io.read_line(), Some("inner"))
+            assert_eq(io.read_line(), None)
+        }
+        assert_eq(io.read_line(), Some("outer clause"))
+    }
+}
+
+test "a handler of IO.Print leaves the read operations of the handler around it" {
+    with bytes_of("kept\n") {
+        let printer = handler IO.Print {
+            fn print(_msg: Str) {}
+        }
+        with printer {
+            assert_eq(io.read_line(), Some("kept"))
+            assert_eq(io.read_line(), None)
+        }
+    }
+}
+
+test "default.read_bytes in a clause reaches the handler around this one" {
+    with bytes_of("abc\ndef") {
+        let upper = handler IO.Read {
+            fn read_bytes(n: Int) -> Bytes {
+                let b = default.read_bytes(n)
+                Bytes.from_str(b.to_str().unwrap().to_upper())
+            }
+        }
+        with upper {
+            assert_eq(io.read_line(), Some("ABC"))
+            assert_eq(io.read_all(), "DEF")
+        }
+    }
+}
+
+test "read_bytes with n below one panics before the handler runs" {
+    let mut called = 0
+    let count = fn() { called = called + 1 }
+    let h = handler IO.Read {
+        fn read_bytes(_n: Int) -> Bytes {
+            count()
+            Bytes.new()
+        }
+    }
+    with h {
+        assert_panics(matching: "io.read_bytes: n must be at least 1, got 0") {
+            let _ = io.read_bytes(0)
+        }
+        assert_panics(matching: "io.read_bytes: n must be at least 1, got -1") {
+            let _ = io.read_bytes(-1)
+        }
+    }
+    assert_eq(called, 0)
+}
+
+test "a read handler works in a closure called under it" {
+    let read_two = fn() -> List[Str] {
+        [io.read_line() ?? "none", io.read_line() ?? "none"]
+    }
+    with bytes_of("x\ny\n") {
+        assert_eq(read_two(), ["x", "y"])
+    }
+}
+
+test "a read handler answers a task spawned under it" {
+    let mut got = ""
+    with bytes_of("for the task\n") {
+        async.scope {
+            let t = async.spawn(fn() -> Str { io.read_line() ?? "none" })
+            got = t.await
+        }
+    }
+    assert_eq(got, "for the task")
+}
+
+test "a read handler installed in a spawned task answers that task" {
+    let mut got = ""
+    async.scope {
+        let t = async.spawn(fn() -> Str {
+            with bytes_of("from the task\n") { io.read_line() ?? "none" }
+        })
+        got = t.await
+    }
+    assert_eq(got, "from the task")
+}
+
+test "lines read under a handler inside an arena outlive it" {
+    let keep = with bytes_of("alpha\nbeta\ngamma") {
+        with arena {
+            [io.read_line().unwrap(), io.read_line().unwrap(), io.read_all()]
+        }
+    }
+    with arena {
+        let mut junk: List[Str] = []
+        let mut i = 0
+        while i < 2000 {
+            junk.push("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz{i}")
+            i += 1
+        }
+    }
+    assert_eq(keep, ["alpha", "beta", "gamma"])
+}
+
+test "a handler built inside an arena reads after the arena closes" {
+    let h = with arena { bytes_of("one\ntwo\n") }
+    with h {
+        assert_eq(io.read_line(), Some("one"))
+        assert_eq(io.read_all(), "two\n")
+    }
+}

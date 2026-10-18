@@ -3900,12 +3900,22 @@ BLINK_RT_FN blink_closure* blink_closure_promote(blink_promote_ctx* ctx, blink_c
  */
 
 /* ── IO ─────────────────────────────────────────────────────────────── */
+/* read_line answers Option[Str]; the guard is the one the compiler emits for that type, so
+ * the program's own typedef of it is skipped. */
+#ifndef BLINK_TD_blink_Option_str
+#define BLINK_TD_blink_Option_str
+typedef struct { int tag; const char* value; } blink_Option_str;
+#endif
+
 typedef struct {
     void  (*print)(void* __self, const char* msg);
     void  (*print_no_nl)(void* __self, const char* msg);
     void  (*log)(void* __self, const char* msg);
     void  (*eprint)(void* __self, const char* msg);
     void  (*eprint_no_nl)(void* __self, const char* msg);
+    blink_bytes*     (*read_bytes)(void* __self, int64_t n);
+    blink_Option_str (*read_line)(void* __self);
+    const char*      (*read_all)(void* __self);
     /* One userdata word per op, passed back as the op's first argument. A
      * handler expression stores in it the closure object of each op it
      * defines: the handler it was copied from, then the op's captures. Per
@@ -3919,6 +3929,9 @@ typedef struct {
     void* __userdata_log;
     void* __userdata_eprint;
     void* __userdata_eprint_no_nl;
+    void* __userdata_read_bytes;
+    void* __userdata_read_line;
+    void* __userdata_read_all;
 } blink_io_vtable;
 
 /* A handler value is a heap copy of its root's vtable, so a closure tail of
@@ -3937,6 +3950,9 @@ BLINK_RT_FN blink_io_vtable* blink_io_vtable_promote(blink_promote_ctx* ctx, bli
     out->__userdata_log = blink_closure_promote(ctx, (blink_closure*)out->__userdata_log);
     out->__userdata_eprint = blink_closure_promote(ctx, (blink_closure*)out->__userdata_eprint);
     out->__userdata_eprint_no_nl = blink_closure_promote(ctx, (blink_closure*)out->__userdata_eprint_no_nl);
+    out->__userdata_read_bytes = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read_bytes);
+    out->__userdata_read_line = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read_line);
+    out->__userdata_read_all = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read_all);
     return out;
 }
 #endif
@@ -3976,6 +3992,47 @@ BLINK_RT_FN void blink_io_default_eprint_no_nl(void* __self, const char* msg) {
 }
 #endif
 
+/* The standard input reader lives in runtime_stdio.h, which comes later. */
+BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n);
+BLINK_RT_FN const char* blink_stdin_read_line(void);
+BLINK_RT_FN const char* blink_stdin_read_all(void);
+
+/* io.read_bytes(n) checks n before any handler runs, so a handler never sees n < 1. */
+BLINK_RT_FN int64_t blink_io_read_bytes_count(int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_io_read_bytes_count(int64_t n) {
+    if (n <= 0) {
+        __blink_panic_dispatchf("io.read_bytes: n must be at least 1, got %lld", (long long)n);
+    }
+    return n;
+}
+#endif
+
+/* The defaults read the one standard input buffer. Its read_line and read_all give what the
+ * derived bodies of §4.4.9 give over its read_bytes. */
+BLINK_RT_FN blink_bytes* blink_io_default_read_bytes(void* __self, int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_bytes* blink_io_default_read_bytes(void* __self, int64_t n) {
+    return blink_stdin_read_bytes(n);
+}
+#endif
+
+BLINK_RT_FN blink_Option_str blink_io_default_read_line(void* __self);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_Option_str blink_io_default_read_line(void* __self) {
+    const char* line = blink_stdin_read_line();
+    if (line == NULL) return (blink_Option_str){.tag = 0};
+    return (blink_Option_str){.tag = 1, .value = line};
+}
+#endif
+
+BLINK_RT_FN const char* blink_io_default_read_all(void* __self);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_io_default_read_all(void* __self) {
+    return blink_stdin_read_all();
+}
+#endif
+
 /* Vtables stay per-TU (not externalized like other globals). They are
  * read-only tables of pointers to externalized runtime helpers, so each
  * TU's copy resolves to the same archive-side functions. User-TU main()
@@ -3986,7 +4043,10 @@ BLINK_UNUSED static blink_io_vtable blink_io_vtable_default = {
     blink_io_default_print_no_nl,
     blink_io_default_log,
     blink_io_default_eprint,
-    blink_io_default_eprint_no_nl
+    blink_io_default_eprint_no_nl,
+    blink_io_default_read_bytes,
+    blink_io_default_read_line,
+    blink_io_default_read_all
 };
 
 /* ── FS ─────────────────────────────────────────────────────────────── */

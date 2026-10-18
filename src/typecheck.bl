@@ -6779,20 +6779,44 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     tc_current_fn_ret = prev_fn_ret
 }
 
-// A clause of an FS handler fills the vtable slot of the operation it names, and the slot's C
-// type is that operation's signature, so a clause must name an operation its effect has and
-// take and answer exactly that operation's types (§4.4.5).
-fn tc_check_fs_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// A clause of an FS handler or an IO.Read clause fills the vtable slot of the operation it
+// names, and the slot's C type is that operation's signature, so a clause must name an
+// operation its effect has and take and answer exactly that operation's types (§4.4.5,
+// §4.4.9). An IO literal holds the print operations too, which this does not check.
+fn tc_check_builtin_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if m == -1 || node_kind(m) != NodeKind.FnDef { return }
-    if tc_handler_effect_root(eff_name) != "FS" { return }
+    let root = tc_handler_effect_root(eff_name)
     let op = node_name(m)
-    let sub = fs_op_sub_effect(op)
-    if sub == "" || (eff_name != "FS" && eff_name != "FS.{sub}") {
-        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
-            "the FS operations are read, write, list_dir, stat and delete (§4.4.5)")
+    if root == "FS" {
+        let sub = fs_op_sub_effect(op)
+        if sub == "" || (eff_name != "FS" && eff_name != "FS.{sub}") {
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
+                "the FS operations are read, write, list_dir, stat and delete (§4.4.5)")
+            return
+        }
+        tc_check_builtin_clause_sig("FS", "fs", op, m)
         return
     }
-    let sig_idx = builtin_handler_op_sig("FS", op)
+    if root != "IO" { return }
+    let reads = is_io_read_op(op)
+    if eff_name == "IO.Read" && !reads {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
+            "the IO.Read operations are read_bytes, read_line and read_all (§4.4.9)")
+        return
+    }
+    if !reads { return }
+    if !handles_io_read(eff_name) {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
+            "`{op}` is an operation of IO.Read (§4.4.9)")
+        return
+    }
+    tc_check_builtin_clause_sig("IO", "io", op, m)
+}
+
+// The clause `m` for operation `op` of builtin root `root` against the signature of the
+// call `{ns}.{op}` that it answers.
+fn tc_check_builtin_clause_sig(root: Str, ns: Str, op: Str, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let sig_idx = builtin_handler_op_sig(root, op)
     if sig_idx == -1 { return }
     let sig = fnsig_pool.get(sig_idx).unwrap()
     let mut want: List[Str] = []
@@ -6805,7 +6829,7 @@ fn tc_check_fs_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, TypeCh
     let params_sl = node_params(m)
     let n = if params_sl == -1 { 0 } else { sublist_length(params_sl) }
     if n != sig.params_count {
-        tc_error_at("FS handler clause `{op}` takes {n} parameter(s), but fs.{op} takes {sig.params_count}: `{spec_sig}`", m)
+        tc_error_at("{root} handler clause `{op}` takes {n} parameter(s), but {ns}.{op} takes {sig.params_count}: `{spec_sig}`", m)
         return
     }
     let mut j = 0
@@ -6813,14 +6837,14 @@ fn tc_check_fs_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, TypeCh
         let ptid = resolve_param_type(sublist_get(params_sl, j))
         let wtid = fnsig_param_list.get(sig.params_start + j).unwrap()
         if tc_tid_is_no_info(ptid) == 0 && !tc_tid_same_type(ptid, wtid) {
-            tc_error_at("FS handler clause `{op}` parameter {j + 1} is {type_to_str(ptid)}, but fs.{op} takes {type_to_str(wtid)}: `{spec_sig}`", m)
+            tc_error_at("{root} handler clause `{op}` parameter {j + 1} is {type_to_str(ptid)}, but {ns}.{op} takes {type_to_str(wtid)}: `{spec_sig}`", m)
             return
         }
         j = j + 1
     }
     let rtid = tc_closure_declared_ret(m)
     if tc_tid_is_no_info(rtid) == 0 && !tc_tid_same_type(rtid, sig.ret) {
-        tc_error_at("FS handler clause `{op}` answers {type_to_str(rtid)}, but fs.{op} answers {type_to_str(sig.ret)}: `{spec_sig}`", m)
+        tc_error_at("{root} handler clause `{op}` answers {type_to_str(rtid)}, but {ns}.{op} answers {type_to_str(sig.ret)}: `{spec_sig}`", m)
     }
 }
 
@@ -13212,6 +13236,35 @@ pub fn fs_op_sub_effect(op: Str) -> Str {
     ""
 }
 
+// The operations of IO.Read (§4.4.9), in the order the IO vtable lays out their slots.
+// read_bytes is the primitive. read_line and read_all are derived: each row names the
+// std.io_read function that holds the spec's body, which runs over the read_bytes of the
+// handler that omits the operation. Only read_bytes takes a count the perform checks.
+// Typecheck reads the rows for the clauses a handler may write and codegen for the slots.
+pub type IoReadOpRow {
+    op: Str
+    derived_fn: Str
+    checks_count: Bool
+}
+
+pub fn io_read_op_rows() -> List[IoReadOpRow] {
+    [
+        IoReadOpRow { op: "read_bytes", derived_fn: "", checks_count: true },
+        IoReadOpRow { op: "read_line", derived_fn: "read_line", checks_count: false },
+        IoReadOpRow { op: "read_all", derived_fn: "read_all", checks_count: false },
+    ]
+}
+
+pub fn is_io_read_op(op: Str) -> Bool {
+    for row in io_read_op_rows() {
+        if row.op == op { return true }
+    }
+    false
+}
+
+// Whether a handler of `eff` writes IO.Read's operations: a handler of the root or of IO.Read.
+pub fn handles_io_read(eff: Str) -> Bool { eff == "IO" || eff == "IO.Read" }
+
 // No source spelling reaches this key, so no declaration can take it over.
 fn builtin_handler_op_key(root: Str, op: Str) -> Str {
     "Handler[{root}].{op}"
@@ -13234,6 +13287,8 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
     } else if root == "FS" && fs_op_sub_effect(op) != "" {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
         return lookup_fnsig("fs.{op}")
+    } else if root == "IO" && is_io_read_op(op) {
+        return lookup_fnsig("io.{op}")
     } else {
         return -1
     }
@@ -26866,7 +26921,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if hm_sl != -1 {
             let mut hi = 0
             while hi < sublist_length(hm_sl) {
-                tc_check_fs_handler_clause(node_name(node), sublist_get(hm_sl, hi))
+                tc_check_builtin_handler_clause(node_name(node), sublist_get(hm_sl, hi))
                 tc_check_handler_method(sublist_get(hm_sl, hi))
                 hi = hi + 1
             }

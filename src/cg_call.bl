@@ -26,7 +26,7 @@ import parser.{
 }
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
-    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type,
+    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, lookup_named_type, is_io_read_op,
     tc_scalar_has_eq, tc_scalar_has_ord, tc_is_default_fill,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_alias_to_original,
@@ -80,7 +80,7 @@ import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
     cg_eff_lower_builtin_default_perform, cg_eff_lower_fs_perform,
     cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
-    cg_eff_wrap_nullable_text,
+    cg_eff_lower_io_read_perform,
 }
 import cg_print.{vtable_slot_self_spelling}
 import cg_promote.{
@@ -2245,37 +2245,21 @@ fn lower_ffi_call(node: Int, method: Str) -> Int ! Diag.Report {
 
 fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
     if io_handler_ops.contains(method) { return cg_eff_lower_builtin_perform(node, ns_io, method) }
+    if is_io_read_op(method) { return cg_eff_lower_io_read_perform(node, method) }
     let raw_writer = io_raw_writer(method)
     if raw_writer != "" { return cc_raw_print(node, method, raw_writer) }
     let op = io_stream_op(method)
     if op == "" { return cc_ns_not_built(node, ns_io, method) }
-    let symbol = c_runtime_helper(op)
-    let tid = tid_of_node(node)
-    if tid < 0 { return -1 }
-    if cc_kind(tid) == TyKind.Option { return cc_nullable_text_call(node, tid, symbol) }
-    cc_build_call(node, symbol, NO_RECEIVER, CallForm.Runtime, false)
+    cc_build_call(node, c_runtime_helper(op), NO_RECEIVER, CallForm.Runtime, false)
 }
 
-// The io names with nothing in the path: three read the standard input and two write the
-// standard output. None of them is a slot of the io vtable, so none of them is an operation
-// a handler replaces.
+// The io names with nothing in the path that write the standard output. Neither is a slot
+// of the io vtable, so neither is an operation a handler replaces.
 fn io_stream_op(method: Str) -> Str {
     let mut table: Map[Str, Str] = Map()
-    table.insert("read_line", "stdin_read_line")
-    table.insert("read_bytes", "stdin_read_bytes")
-    table.insert("read_all", "stdin_read_all")
     table.insert("write", "stdout_write")
     table.insert("write_bytes", "stdout_write_bytes")
     table.get(method) ?? ""
-}
-
-// A runtime call with no arguments that answers a text pointer, null for an absent value,
-// where the call holds an Option[Str].
-fn cc_nullable_text_call(node: Int, opt_tid: Int, symbol: Str) -> Int ! Diag.Report {
-    let rec = cc_local(TYPE_STR, node)
-    if cc_stopped(rec) { return -1 }
-    let read = ir_call_runtime(TYPE_STR, node, rec.c_spelling, symbol, rec.slot_form, [])
-    cg_eff_wrap_nullable_text(node, opt_tid, read)
 }
 
 fn lower_env_call(node: Int, method: Str) -> Int ! Diag.Report {

@@ -27,6 +27,7 @@ import cname.{
     c_impl_method_name, c_display_dispatch_name, c_local_name, c_runtime_helper,
     c_typedef_name, c_variant_discriminant, c_string_literal,
     cname_is_runtime_owned, td_guard_name, c_enum_tag_member, c_enum_payload_member,
+    c_builtin_derived_op_name,
 }
 import cg_print.{
     print_effect_default_vtable, print_effect_vtable_typedef,
@@ -37,6 +38,7 @@ import cg_print.{
 }
 import cg_reg.{
     cg_reg_effect_decls, cg_reg_effect_ops, cg_reg_entry_point, cg_reg_fs_op_decl, cg_reg_fs_ops, cg_reg_fn_decls, cg_reg_global_decls,
+    cg_reg_io_derived_decl,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_module_of, cg_reg_modules, cg_reg_tid_for_decl,
     cg_reg_type_decls,
 }
@@ -52,7 +54,7 @@ import typecheck.{
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     make_handler_type, tc_member_tid_at_instance, tc_impl_trait_id,
     tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
-    tc_lookup_node_tid, tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS, TYPE_STR,
+    tc_lookup_node_tid, tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS, TYPE_STR, io_read_op_rows,
 }
 import parser.{
     get_annotation, get_str_named_arg, node_effects, parser_live_ranges, node_elements, node_fields, node_impl_binders,
@@ -1173,6 +1175,7 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
     if !slots.ok { return }
     print_ev(td_guard_name(c_ev_type_name()), slots.vtables, slots.fields, ev_storage)
     if defines_default { emit_fs_default_bodies(false) }
+    emit_io_derived_bodies(false)
 }
 
 // The vector of the archive layered over the stdlib archive. A program that links it calls
@@ -1187,6 +1190,7 @@ pub fn cg_decl_emit_ev_owned_by_archive() ! Diag.Report {
     if !slots.ok { return }
     print_ev_with_external_default(td_guard_name(c_ev_type_name()), slots.vtables, slots.fields)
     emit_fs_default_bodies(true)
+    emit_io_derived_bodies(true)
 }
 
 type EvSlots {
@@ -1311,7 +1315,46 @@ fn emit_fs_default_bodies(private: Bool) ! Diag.Report {
     while i < decls.len() {
         let ret = sig.rets.get(i).unwrap()
         print_vtable_slot_fn(ret, sig.defaults.get(i).unwrap(), sig.params.get(i).unwrap(),
-            fs_default_body(decls.get(i).unwrap(), ret))
+            std_forwarding_body(decls.get(i).unwrap(), ret))
+        i = i + 1
+    }
+    ir_sources_resume(track)
+}
+
+// The derived slots of a unit that reads the vector's typedef and default from the archive
+// layered over the stdlib archive. That header does not carry them, and the std.io_read
+// bodies they call are the stdlib archive's.
+pub fn cg_decl_emit_io_derived_bodies() ! Diag.Report { emit_io_derived_bodies(false) }
+
+// The slot a handler literal points an omitted IO.Read derived operation at: a function that
+// runs the std.io_read body with the program's vector, so the body's io.read_bytes reaches the
+// handler installed at the time of the call. The literal names it from any unit that builds a
+// handler, so every unit that spells the vector holds its own static copy.
+fn emit_io_derived_bodies(private: Bool) ! Diag.Report {
+    let slot_tid = make_handler_type("IO")
+    let mut decls: List[Int] = []
+    let mut symbols: List[Str] = []
+    for row in io_read_op_rows() {
+        if row.derived_fn == "" { continue }
+        let decl = cg_reg_io_derived_decl(row.op)
+        if decl < 0 { continue }
+        let symbol = c_builtin_derived_op_name(slot_tid, row.op)
+        if diag_is_ice_seg(symbol) {
+            diag_ice_at("IoDerivedBodyNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "no slot function name for IO.Read operation `{row.op}`", decl,
+                "IO is a builtin root the runtime owns, so its derived slot names are fixed; this is a compiler bug")
+            return
+        }
+        decls.push(decl)
+        symbols.push(symbol)
+    }
+    for d in decls { cg_decl_emit_fn_decl(d, private) }
+    let track = ir_sources_pause()
+    let mut i = 0
+    while i < decls.len() {
+        let decl = decls.get(i).unwrap()
+        let ret = op_ret_spelling(decl)
+        print_vtable_slot_fn(ret, symbols.get(i).unwrap(), fn_param_decls(decl), std_forwarding_body(decl, ret))
         i = i + 1
     }
     ir_sources_resume(track)
@@ -1339,7 +1382,9 @@ fn fs_vtable_sig(slot_tid: Int) -> VtableSig ! Diag.Report {
     vtable_sig_over("FS", slot_tid, ops, decls)
 }
 
-fn fs_default_body(decl: Int, ret: Str) -> Int ! Diag.Report {
+// A slot function's body: its arguments and the program's one vector, handed to the std
+// function that holds the operation's Blink body.
+fn std_forwarding_body(decl: Int, ret: Str) -> Int ! Diag.Report {
     let mut args: List[Int] = []
     let sl = node_params(decl)
     let mut i = 0

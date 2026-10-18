@@ -1,0 +1,168 @@
+// std.testing.stdin_from gives a handler that reads its text as standard input, keeping the
+// IO.Read handler contract: read_all gives the same text as the lines of repeated read_line
+// calls, each with the terminator it had in the input.
+
+import std.testing.{stdin_from}
+
+fn all_lines() -> List[Str] ! IO.Read {
+    let mut out: List[Str] = []
+    loop {
+        match io.read_line() {
+            Some(line) => out.push(line)
+            None => break
+        }
+    }
+    out
+}
+
+fn line_ends(text: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    let bytes = Bytes.from_str(text)
+    let mut start = 0
+    let mut i = 0
+    while i < bytes.len() {
+        if bytes.get(i) == Some(10) {
+            out.push(bytes.slice(start, i + 1).to_str().unwrap())
+            start = i + 1
+        }
+        i += 1
+    }
+    if start < bytes.len() { out.push(bytes.slice(start, bytes.len()).to_str().unwrap()) }
+    out
+}
+
+// The terminator each line had: "\r\n" for a line read_line stripped a carriage return
+// from, "\n" for any other line, and nothing for a last line with no newline.
+fn joined_with_terminators(text: Str) -> Str {
+    let lines = with stdin_from(text) { all_lines() }
+    let ends = line_ends(text)
+    assert_eq(lines.len(), ends.len())
+    let sb = StringBuilder.new()
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines.get(i).unwrap()
+        let raw = ends.get(i).unwrap()
+        sb.write(line)
+        sb.write(raw.byte_slice(line.len(), raw.len()))
+        i += 1
+    }
+    sb.to_str()
+}
+
+fn long_line(n: Int) -> Str {
+    let sb = StringBuilder.new()
+    let mut i = 0
+    while i < n {
+        sb.write("{i % 10}")
+        i += 1
+    }
+    sb.to_str()
+}
+
+let CASES: List[Str] = ["a\n\nb\n", "\n\n", "one\r\ntwo\r\n", "no final newline", "", "a\rb\nc\r", "x\r\n\r\ny"]
+
+test "read_line gives each line without its terminator" {
+    with stdin_from("a\n\nb\r\nlast") {
+        assert_eq(io.read_line(), Some("a"))
+        assert_eq(io.read_line(), Some(""))
+        assert_eq(io.read_line(), Some("b"))
+        assert_eq(io.read_line(), Some("last"))
+        assert_eq(io.read_line(), None)
+        assert_eq(io.read_line(), None)
+    }
+}
+
+test "empty text is end of input at the first read" {
+    with stdin_from("") {
+        assert_eq(io.read_line(), None)
+        assert_eq(io.read_all(), "")
+        assert(io.read_bytes(4).is_empty())
+    }
+}
+
+test "read_all equals the lines of repeated read_line calls, each with its terminator" {
+    for text in CASES {
+        let all = with stdin_from(text) { io.read_all() }
+        assert_eq(all, text)
+        assert_eq(joined_with_terminators(text), text)
+    }
+}
+
+test "one long line reads whole, by read_line and by read_all" {
+    let long = long_line(200000)
+    with stdin_from("{long}\nnext") {
+        assert_eq(io.read_line(), Some(long))
+        assert_eq(io.read_all(), "next")
+    }
+    with stdin_from(long) {
+        assert_eq(io.read_all(), long)
+        assert_eq(io.read_all(), "")
+    }
+}
+
+test "read_bytes gives exactly n bytes, fewer only at end of input" {
+    with stdin_from("abcdefg") {
+        assert(io.read_bytes(3) == Bytes.from_str("abc"))
+        assert(io.read_bytes(10) == Bytes.from_str("defg"))
+        assert(io.read_bytes(10).is_empty())
+    }
+}
+
+test "read_line and read_all share the one stream" {
+    with stdin_from("first\nsecond\nthird") {
+        assert_eq(io.read_line(), Some("first"))
+        assert(io.read_bytes(3) == Bytes.from_str("sec"))
+        assert_eq(io.read_all(), "ond\nthird")
+    }
+}
+
+test "each call to stdin_from makes a new stream" {
+    let h = stdin_from("one\ntwo\n")
+    with h { assert_eq(io.read_line(), Some("one")) }
+    with stdin_from("one\ntwo\n") { assert_eq(io.read_line(), Some("one")) }
+    with h { assert_eq(io.read_line(), Some("two")) }
+    let a = stdin_from("A\n")
+    let b = stdin_from("B\n")
+    with a {
+        with b { assert_eq(io.read_line(), Some("B")) }
+        assert_eq(io.read_line(), Some("A"))
+        with b { assert_eq(io.read_line(), None) }
+    }
+}
+
+test "multi-byte UTF-8 text reads whole" {
+    with stdin_from("héllo wörld\n✓") {
+        assert_eq(io.read_line(), Some("héllo wörld"))
+        assert_eq(io.read_line(), Some("✓"))
+    }
+}
+
+test "read_bytes with n of zero panics before the handler reads" {
+    with stdin_from("abc") {
+        assert_panics(matching: "io.read_bytes: n must be at least 1, got 0") {
+            let _ = io.read_bytes(0)
+        }
+        assert_panics(matching: "io.read_bytes: n must be at least 1, got -2") {
+            let _ = io.read_bytes(-2)
+        }
+        assert_eq(io.read_all(), "abc")
+    }
+}
+
+test "the sum_lines example of the spec adds each line" {
+    with stdin_from("1\n2\n\n3") {
+        let mut sum = 0
+        loop {
+            match io.read_line() {
+                Some(line) => {
+                    match line.parse_int() {
+                        Ok(v) => sum = sum + v
+                        Err(_) => {}
+                    }
+                }
+                None => break
+            }
+        }
+        assert_eq(sum, 6)
+    }
+}

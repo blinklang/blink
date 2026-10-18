@@ -353,6 +353,12 @@ BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args)
     if (pid == 0) {
         close(out_pipe[0]);
         close(err_pipe[0]);
+        /* The child reads the null device, not the parent's input (spec: process.spawn). */
+        int dn = open("/dev/null", O_RDONLY);
+        if (dn >= 0) {
+            dup2(dn, STDIN_FILENO);
+            if (dn != STDIN_FILENO) close(dn);
+        }
         dup2(out_pipe[1], STDOUT_FILENO);
         dup2(err_pipe[1], STDERR_FILENO);
         close(out_pipe[1]);

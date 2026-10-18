@@ -17,7 +17,7 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, lookup_named_type, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
     tc_enter_body_module, tc_leave_body_module, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
-    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_handler_effect_root, tc_impl_trait_id,
+    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_handler_effect_root, tc_impl_trait_id, io_read_op_rows, handles_io_read,
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, async_scope_handles_spelling,
@@ -26,7 +26,7 @@ import layout.{
     layout_of, pointer_spelling, tid_of_binder, tid_of_node, spawn_pair_spelling,
 }
 import cname.{
-    c_builtin_effect_slot, c_cell_name, c_effect_default_op_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
+    c_builtin_derived_op_name, c_builtin_effect_slot, c_cell_name, c_effect_default_op_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
     c_vtable_userdata_member,
     c_ev_type_name, c_field_name,
     c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
@@ -41,7 +41,7 @@ import cg_print.{
     DefaultSlot, print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
     print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
 }
-import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_decls}
+import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_decls, cg_reg_io_derived_decl}
 import cg_promote.{cg_promote_capture_table}
 import free_names.{closure_read_names}
 import cg_decl.{cg_decl_takes_ev}
@@ -657,6 +657,7 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
         if sig.slot == "" { return -1 }
         sigs.push(sig)
     }
+    if !io_derived_bodies_loaded(tid, ops, node) { return -1 }
     let outer = c_mint_local("handler_outer")
     let mut built: List[HandlerOpBuild] = []
     for sig in sigs {
@@ -686,6 +687,22 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, words)
 }
 
+// The loader brings in std.io_read whenever a module writes a handler of IO or IO.Read, so a
+// derived operation with no body means the loader and this stage disagree.
+fn io_derived_bodies_loaded(tid: Int, written: List[Int], node: Int) -> Bool ! Diag.Report {
+    if !handles_io_read(tc_tid_handler_effect(tid)) { return true }
+    let mut names: List[Str] = []
+    for w in written { names.push(node_name(w)) }
+    for row in io_read_op_rows() {
+        if row.derived_fn == "" || names.contains(row.op) || cg_reg_io_derived_decl(row.op) >= 0 { continue }
+        diag_ice_at("IoDerivedBodyNotLoaded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "no body for IO.Read operation `{row.op}`: std.io_read is not loaded", node,
+            "the loader loads std.io_read for every handler of IO or IO.Read; this is a compiler bug")
+        return false
+    }
+    true
+}
+
 // The derived operations of the effect a literal names that the literal does not write. The
 // copied vtable may hold an enclosing handler's clause for one, and an omitted derived
 // operation runs its declared body instead (§4.7.1), so the builder points each back at its
@@ -699,6 +716,13 @@ fn omitted_derived_ops(tid: Int, written: List[Int]) -> List[DefaultSlot] {
     let children = if decl == -1 { -1 } else { node_elements(decl) }
     let mut names: List[Str] = []
     for w in written { names.push(node_name(w)) }
+    if handles_io_read(eff) {
+        for row in io_read_op_rows() {
+            if row.derived_fn == "" || names.contains(row.op) { continue }
+            let slot = c_effect_vtable_slot_name(tid, row.op)
+            out.push(DefaultSlot { slot: slot, userdata: c_vtable_userdata_member(slot), symbol: c_builtin_derived_op_name(tid, row.op) })
+        }
+    }
     let mut ci = 0
     while children != -1 && ci < sublist_length(children) {
         let child = sublist_get(children, ci)
@@ -1699,6 +1723,30 @@ pub fn cg_eff_lower_fs_perform(node: Int, method: Str) -> Int ! Diag.Report {
     perform_op(node, handler_tid, method)
 }
 
+// An operation of IO.Read, reached through the IO vtable's slot of the same name. The count
+// of read_bytes is checked before the slot runs, so no handler sees a count below one.
+pub fn cg_eff_lower_io_read_perform(node: Int, method: Str) -> Int ! Diag.Report {
+    let handler_tid = builtin_handler_tid(NS_IO, node)
+    if handler_tid < 0 { return -1 }
+    perform_op(node, handler_tid, method)
+}
+
+fn io_read_checks_count(op: Str) -> Bool {
+    for row in io_read_op_rows() {
+        if row.op == op { return row.checks_count }
+    }
+    false
+}
+
+// The count argument of read_bytes passed through the runtime's check, which panics for a
+// count below one and answers the count otherwise.
+fn io_read_checked_args(node: Int, args: List[Int]) -> List[Int] ! Diag.Report {
+    if args.len() != 1 { return args }
+    let rec = perform_layout(TYPE_INT, Position.Local, node)
+    if rec.c_spelling == "" { return [] }
+    [ir_call_runtime(TYPE_INT, node, rec.c_spelling, c_runtime_helper("io_read_bytes_count"), rec.slot_form, [args.get(0).unwrap()])]
+}
+
 fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
     let slot = c_effect_vtable_slot_name(handler_tid, op)
     if diag_is_ice_seg(slot) {
@@ -1716,7 +1764,9 @@ fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
         Some(lowered) => {
             let read = slot_read(node, handler_tid)
             if read < 0 { return -1 }
-            ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, lowered)
+            let args = if c_ev_field_name(handler_tid) == NS_IO && io_read_checks_count(op) { io_read_checked_args(node, lowered) } else { lowered }
+            if args.len() != lowered.len() { return -1 }
+            ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, args)
         }
     }
 }
@@ -1774,15 +1824,14 @@ fn lower_text_args(node: Int) -> Option[List[Int]] ! Diag.Report {
     Some(out)
 }
 
-// The runtime's env read and stdin line read answer a text pointer that is null for an
-// absent value (an unset name, end of input), and the call holds an Option. The read lands
-// in a temp, the Option starts as None, and the Some is written only when the temp holds
-// text; the answer is a reference to the Option temp.
-pub fn cg_eff_wrap_nullable_text(node: Int, opt_tid: Int, perform: Int) -> Int ! Diag.Report {
+// The runtime's env read answers a text pointer that is null for an unset name, and the
+// call holds an Option. The read lands in a temp, the Option starts as None, and the Some is
+// written only when the temp holds text; the answer is a reference to the Option temp.
+fn cg_eff_wrap_nullable_text(node: Int, opt_tid: Int, perform: Int) -> Int ! Diag.Report {
     if tc_tid_kind(tc_resolve(opt_tid)) != TyKind.Option {
         diag_ice_at("NullableSlotAnswerNotOption", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "a nullable text read is typed {tk_name(tc_tid_kind(tc_resolve(opt_tid)))} where an Option is needed", node,
-            "typecheck signs env.var and io.read_line as Option[Str]; this is a compiler bug")
+            "typecheck signs env.var as Option[Str]; this is a compiler bug")
         return -1
     }
     let text = perform_layout(TYPE_STR, Position.Local, node)

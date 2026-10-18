@@ -1,0 +1,42 @@
+// A process.spawn child takes the null device as its standard input (§4.4.8), not the
+// parent's, so a child that reads sees end of input and leaves the parent's input unread.
+
+import std.libc.{write_bytes}
+import std.process.{spawn, Pid}
+
+@ffi("memfd_create", header: "sys/mman.h")
+@trusted(audit: "test helper: an anonymous file to stand in for standard input")
+fn t_memfd_create(name: Ptr[U8], flags: U32) -> I32 ! FFI {}
+
+@ffi("lseek", header: "unistd.h")
+@trusted(audit: "test helper: rewind the anonymous file")
+fn t_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FFI {}
+
+@ffi("dup2", header: "unistd.h")
+@trusted(audit: "test helper: put the anonymous file on fd 0")
+fn t_dup2(oldfd: I32, newfd: I32) -> I32 ! FFI {}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "test helper: close the spare fd")
+fn t_close(fd: I32) -> I32 ! FFI {}
+
+fn stdin_text(text: Str) ! IO, FFI {
+    let fd = with ffi.scope() as scope {
+        let name = scope.cstr("blink_spawn_stdin_test")
+        t_memfd_create(name, 0.to_u32()).to_int()
+    }
+    assert(fd >= 0)
+    let _ = write_bytes(fd, Bytes.from_str(text))
+    let _ = t_lseek(fd.to_i32(), 0, 0)
+    if fd != 0 {
+        assert(t_dup2(fd.to_i32(), 0.to_i32()).to_int() == 0)
+        let _ = t_close(fd.to_i32())
+    }
+}
+
+test "a spawned child reads end of input and leaves the parent's input unread" {
+    stdin_text("parent input\n")
+    let p = spawn("sh", ["-c", "if read line; then exit 3; fi; exit 0"])
+    assert_eq(p.wait().exit_code, 0)
+    assert_eq(io.read_line(), Some("parent input"))
+}
