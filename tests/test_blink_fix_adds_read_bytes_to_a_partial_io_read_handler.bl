@@ -1,0 +1,82 @@
+// The W0545 fix on the builtin `IO.Read` sub-effect (sections/04_effects.md §4.4.9, §4.7.1).
+// `IO.Read` has no declaration in source, so the fix takes the signature of `read_bytes` from
+// the compiler's own table. An explicit `default.read_bytes(n)` gives the same program as the
+// omitted operation, so the fixed file checks with no W0545 and runs the same, as one unit and
+// under --per-module.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} < /dev/null")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn tail_lines() -> List[Str] {
+    [
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    with one_line() \{",
+        #"        io.println(io.read_line() ?? "none")"#,
+        #"        io.println("{io.read_bytes(4).len()}")"#,
+        "    }",
+        "}",
+    ]
+}
+
+fn head_lines() -> List[Str] {
+    [
+        "fn one_line() -> Handler[IO.Read] \{",
+        "    handler IO.Read \{",
+        #"        fn read_line() -> Option[Str] { Some("seven") }"#,
+    ]
+}
+
+fn partial_src() -> Str {
+    lines(head_lines().append(tail_lines()))
+}
+
+fn fixed_src() -> Str {
+    lines(head_lines().append(["        fn read_bytes(n: Int) -> Bytes \{ default.read_bytes(n) }"]).append(tail_lines()))
+}
+
+test "blink fix adds read_bytes to an IO.Read handler as a forward, and the fixed file runs the same" {
+    let dir = sh("mktemp -d /tmp/blink_fix_w0545_io_read.XXXXXX").out.trim()
+    write_file("{dir}/reader.bl", partial_src())
+    let before = blink_in(dir, "run reader.bl")
+    assert_eq(before.exit_code, 0)
+    assert_eq(before.out, "seven\n0\n")
+    assert(before.err_out.contains("warning[PartialHandler]: handler for `IO.Read` does not implement `read_bytes`"))
+
+    let r = blink_in(dir, "fix reader.bl")
+    let got = read_file("{dir}/reader.bl")
+    if got != fixed_src() {
+        io.eprintln("want file:\n{fixed_src()}\ngot file:\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}")
+    }
+    assert(got == fixed_src())
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("reader.bl:4:5: W0545 add the omitted operation"))
+    assert(r.out.contains("1 fix(es) applied"))
+
+    let check = blink_in(dir, "check --json reader.bl")
+    if check.exit_code != 0 || check.err_out.contains("W0545") || check.out.contains("W0545") { io.eprintln(check.err_out) }
+    assert_eq(check.exit_code, 0)
+    assert(!check.err_out.contains("W0545"))
+    assert(!check.out.contains("W0545"))
+
+    let after = blink_in(dir, "run reader.bl")
+    assert_eq(after.exit_code, 0)
+    assert_eq(after.out, before.out)
+    let per = blink_in(dir, "run --per-module reader.bl")
+    assert_eq(per.exit_code, 0)
+    assert_eq(per.out, before.out)
+    let _ = sh("rm -rf {dir}")
+}

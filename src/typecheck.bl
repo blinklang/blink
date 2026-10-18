@@ -5836,7 +5836,8 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("net.close", [TYPE_INT], TYPE_VOID)
 
     register_intrinsic_fn_sig("io.read_line", [], make_option_type(TYPE_STR))
-    register_intrinsic_fn_sig("io.read_bytes", [TYPE_INT], bytes_t)
+    // Named as §4.4.9 names it, so the W0545 fix can spell a read_bytes clause.
+    register_named_intrinsic_fn_sig("io.read_bytes", [TYPE_INT], ["n"], bytes_t)
     register_intrinsic_fn_sig("io.read_all", [], TYPE_STR)
     register_intrinsic_fn_sig("io.write", [TYPE_STR], TYPE_VOID)
     register_intrinsic_fn_sig("io.write_bytes", [bytes_t], TYPE_VOID)
@@ -13285,25 +13286,43 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
     lookup_fnsig(key)
 }
 
-// The primitive operations of the builtin roots that the W0545 check reads, in the order a
-// warning names them. Each operation's signature comes from builtin_handler_op_sig.
+// The operations of the marked builtin effects that the W0545 check reads, in the order a
+// warning names them. Only a primitive operation can be missing; a derived one still shows
+// that a parent handler means to handle its sub-effect. Each operation's signature comes from
+// builtin_handler_op_sig.
 type BuiltinHandlerOp {
     root: Str
     sub_effect: Str
     op: Str
+    primitive: Bool
 }
 
 fn builtin_handler_ops() -> List[BuiltinHandlerOp] {
-    [
-        BuiltinHandlerOp { root: "Time", sub_effect: "Read", op: "read" },
-        BuiltinHandlerOp { root: "Time", sub_effect: "Sleep", op: "sleep" },
+    let mut rows = [
+        BuiltinHandlerOp { root: "Time", sub_effect: "Read", op: "read", primitive: true },
+        BuiltinHandlerOp { root: "Time", sub_effect: "Sleep", op: "sleep", primitive: true },
     ]
+    for op in io_read_ops() {
+        rows.push(BuiltinHandlerOp { root: "IO", sub_effect: "Read", op: op, primitive: !is_io_read_derived_op(op) })
+    }
+    rows
 }
 
 // The builtin effects the stdlib marks `@handle_all` (§4.7.1): a root such as `Time`, or one
-// sub-effect such as `IO.Read`. A marked effect needs its operations in builtin_handler_ops.
+// sub-effect such as `IO.Read`, which covers that sub-effect only. A marked effect needs its
+// operations in builtin_handler_ops.
 fn builtin_handle_all_marks() -> List[Str] {
-    ["Time"]
+    ["Time", "IO.Read"]
+}
+
+// The sub-effects of the builtin `root` that the handler clauses `implemented` write one or
+// more operations of, derived ones included.
+fn builtin_sub_effects_written(root: Str, implemented: Map[Str, Int]) -> Map[Str, Int] {
+    let mut written: Map[Str, Int] = Map()
+    for row in builtin_handler_ops() {
+        if row.root == root && implemented.contains_key(row.op) { written.insert(row.sub_effect, 1) }
+    }
+    written
 }
 
 pub fn is_user_effect_handle_name(name: Str) -> Int {
@@ -13546,10 +13565,7 @@ fn tc_check_partial_builtin_handler(he: Int, eff: Str, root: Str) ! Diag.Report,
     let root_marked = marks.contains(root)
     let sub = if eff == root { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
     let implemented = partial_handler_implemented(he)
-    let mut touched: Map[Str, Int] = Map()
-    for row in builtin_handler_ops() {
-        if row.root == root && implemented.contains_key(row.op) { touched.insert(row.sub_effect, 1) }
-    }
+    let touched = builtin_sub_effects_written(root, implemented)
     let mut names: List[Str] = []
     let mut stubs: List[Str] = []
     let mut fixable = true
@@ -13559,7 +13575,7 @@ fn tc_check_partial_builtin_handler(he: Int, eff: Str, root: Str) ! Diag.Report,
         // As for a declared effect: a marked root covers every sub-effect, and an unmarked
         // parent counts a marked sub-effect only once the handler implements one of its
         // operations.
-        let in_scope = row.root == root && (sub == "" || sub == row.sub_effect)
+        let in_scope = row.primitive && row.root == root && (sub == "" || sub == row.sub_effect)
         let counts = in_scope && (root_marked || (marks.contains(path) && (sub != "" || touched.contains_key(row.sub_effect))))
         if counts && !implemented.contains_key(row.op) {
             let stub = builtin_partial_handler_stub(he, root, row.op)
@@ -13621,7 +13637,11 @@ fn builtin_partial_handler_stub(he: Int, root: Str, op: Str) -> HandlerStub ! Di
 // declared in lib/std, and ensure_runtime_struct_type returns a namesake that a user module
 // declares, so a declaration from outside lib/std means the name is not the runtime's type.
 fn builtin_stub_type_spellable(t: Int) -> Bool ! TypeCheck.Resolve {
-    if resolve_type_name(type_to_str(t)) != t { return false }
+    let named = resolve_type_name(type_to_str(t))
+    // Each mention of Bytes gets its own tid, so Bytes is spellable when no declaration takes
+    // the name.
+    if type_kind(t) == TyKind.Bytes { return named == -1 }
+    if named != t { return false }
     let decl = tc_tid_decl_node(t)
     decl == -1 || (decl >= 0 && node_source_module(decl).starts_with("std_"))
 }

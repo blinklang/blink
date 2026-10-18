@@ -1,0 +1,239 @@
+// W0545 PartialHandler on the builtin `IO.Read` sub-effect (sections/04_effects.md §4.4.9,
+// §4.7.1). The stdlib marks `IO.Read` `@handle_all`, and the mark covers that sub-effect only,
+// never `IO.Print` or the other sub-effects of `IO`. `read_bytes` is the one primitive
+// operation; `read_line` and `read_all` are derived, so they never count. A handler for
+// `IO.Read` counts `read_bytes`. A handler for the unmarked parent `IO` counts it only when it
+// writes one or more `IO.Read` operations, derived ones included: one that writes only `print`
+// stays clean, and one that writes `read_line` but not `read_bytes` warns.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, lint_set_override}
+import std.io
+
+fn probe(name: Str, src: Str, lint: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    // A path per row: the fix reads the handler's source lines, and they are cached by path.
+    let path = "build/w0545_io_read_{name}.bl"
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    // After compile_to_program, which resets the [lints] table it loads from the manifest.
+    if lint != "" { lint_set_override(lint, "off") }
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn partial_warnings() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            out.push("{d.severity} {d.code} {d.line}:{d.col} {d.message} | {d.help} | {d.notes.join(" / ")}")
+        }
+    }
+    out
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn expect(label: Str, want: Int) -> List[Str] {
+    let errs = errors()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: {label}: the probe has errors:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+    let hits = partial_warnings()
+    if hits.len() != want {
+        io.eprintln("FAIL: {label}: PartialHandler raised {hits.len()} time(s), want {want}")
+        for m in hits { io.eprintln("  {m}") }
+    }
+    assert(hits.len() == want)
+    hits
+}
+
+fn expect_eq(label: Str, got: Str, want: Str) {
+    if got != want {
+        io.eprintln("FAIL: {label}:\n  got:  {got}\n  want: {want}")
+    }
+    assert(got == want)
+}
+
+fn expect_fix(label: Str, text: Str, line: Int, col: Int) {
+    let mut seen = 0
+    for d in diag_entries {
+        if d.name == "PartialHandler" {
+            seen = seen + 1
+            expect_eq("{label} fix text", d.fix_text, text)
+            assert_eq(d.fix_line, line)
+            assert_eq(d.fix_col, col)
+            assert_eq(d.fix_end_line, line)
+            assert_eq(d.fix_end_col, col)
+        }
+    }
+    assert_eq(seen, 1)
+}
+
+let READ_BYTES_HELP = "implement it, or forward on purpose: `fn read_bytes(n: Int) -> Bytes \{ default.read_bytes(n) }`"
+
+test "an IO.Read handler with no read_bytes warns with the spec's text and a fix" {
+    probe("no_read_bytes", #"fn one_line() -> Handler[IO.Read] {
+    handler IO.Read {
+        fn read_line() -> Option[Str] { Some("x") }
+    }
+}
+"#, "")
+    let hits = expect("read_bytes omitted", 1)
+    expect_eq("read_bytes omitted", hits.get(0).unwrap(), "warning W0545 2:5 handler for `IO.Read` does not implement `read_bytes` | {READ_BYTES_HELP} | `IO.Read` is marked `@handle_all` / omitted operations go to the enclosing handler")
+    expect_fix("read_bytes omitted", "    fn read_bytes(n: Int) -> Bytes \{ default.read_bytes(n) }\n    ", 4, 5)
+}
+
+test "an empty IO.Read handler names read_bytes only" {
+    probe("empty", #"fn nothing() -> Handler[IO.Read] {
+    handler IO.Read { }
+}
+"#, "")
+    let hits = expect("empty", 1)
+    assert(hits.get(0).unwrap().contains("handler for `IO.Read` does not implement `read_bytes` |"))
+}
+
+test "an IO.Read handler that writes only read_bytes is clean, as derived ops never count" {
+    probe("only_read_bytes", #"fn none() -> Handler[IO.Read] {
+    handler IO.Read {
+        fn read_bytes(_n: Int) -> Bytes { Bytes.new() }
+    }
+}
+"#, "")
+    let _ = expect("only read_bytes", 0)
+}
+
+test "writing read_bytes with any body silences it" {
+    probe("forward", #"fn upper() -> Handler[IO.Read] {
+    handler IO.Read {
+        fn read_bytes(n: Int) -> Bytes { default.read_bytes(n) }
+        fn read_line() -> Option[Str] { None }
+    }
+}
+"#, "")
+    let _ = expect("forward", 0)
+}
+
+test "an IO handler that writes only print is clean" {
+    probe("print_only", #"fn quiet() -> Handler[IO] {
+    handler IO {
+        fn print(_msg: Str) { }
+    }
+}
+"#, "")
+    let _ = expect("print only", 0)
+}
+
+test "an IO handler that writes read_line but not read_bytes warns, naming read_bytes" {
+    probe("parent_read_line", #"fn one_line() -> Handler[IO] {
+    handler IO {
+        fn print(_msg: Str) { }
+        fn read_line() -> Option[Str] { None }
+    }
+}
+"#, "")
+    let hits = expect("parent read_line", 1)
+    expect_eq("parent read_line", hits.get(0).unwrap(), "warning W0545 2:5 handler for `IO` does not implement `read_bytes` | {READ_BYTES_HELP} | `IO.Read` is marked `@handle_all` / omitted operations go to the enclosing handler")
+    expect_fix("parent read_line", "    fn read_bytes(n: Int) -> Bytes \{ default.read_bytes(n) }\n    ", 5, 5)
+}
+
+test "an IO handler that writes read_all but not read_bytes warns" {
+    probe("parent_read_all", #"fn all() -> Handler[IO] {
+    handler IO {
+        fn read_all() -> Str { "" }
+    }
+}
+"#, "")
+    let hits = expect("parent read_all", 1)
+    assert(hits.get(0).unwrap().contains("handler for `IO` does not implement `read_bytes` |"))
+}
+
+test "an IO handler that writes read_bytes is clean" {
+    probe("parent_read_bytes", #"fn none() -> Handler[IO] {
+    handler IO {
+        fn print(_msg: Str) { }
+        fn read_bytes(_n: Int) -> Bytes { Bytes.new() }
+    }
+}
+"#, "")
+    let _ = expect("parent read_bytes", 0)
+}
+
+test "a handler of another IO sub-effect is clean" {
+    probe("print_sub", #"fn quiet() -> Handler[IO.Print] {
+    handler IO.Print {
+        fn print(_msg: Str) { }
+    }
+}
+"#, "")
+    let _ = expect("IO.Print", 0)
+}
+
+test "a factory, a bound handler and a handler argument each warn once, at the expression" {
+    probe("forms", #"fn one_line() -> Handler[IO.Read] {
+    handler IO.Read {
+        fn read_line() -> Option[Str] { Some("f") }
+    }
+}
+
+fn run_with(h: Handler[IO.Read]) -> Str {
+    with h { io.read_all() }
+}
+
+fn main() {
+    with one_line() { io.println(io.read_line() ?? "") }
+    with one_line() { io.println(io.read_line() ?? "") }
+    let bound = handler IO.Read {
+        fn read_all() -> Str { "b" }
+    }
+    with bound { io.println(io.read_all()) }
+    io.println(run_with(handler IO {
+        fn read_line() -> Option[Str] { None }
+    }))
+}
+"#, "")
+    let hits = expect("factory, bound, argument", 3)
+    assert(hits.get(0).unwrap().contains("warning W0545 2:5 handler for `IO.Read` does not implement `read_bytes` |"))
+    assert(hits.get(1).unwrap().contains("warning W0545 14:17 handler for `IO.Read` does not implement `read_bytes` |"))
+    assert(hits.get(2).unwrap().contains("warning W0545 18:25 handler for `IO` does not implement `read_bytes` |"))
+}
+
+fn allow_src() -> Str {
+    #"@allow(PartialHandler)
+fn one_line() -> Handler[IO.Read] {
+    handler IO.Read {
+        fn read_line() -> Option[Str] { None }
+    }
+}
+"#
+}
+
+test "@allow(PartialHandler) on the enclosing fn silences it" {
+    probe("allow", allow_src(), "")
+    let _ = expect("allow", 0)
+}
+
+fn lint_src() -> Str {
+    #"fn one_line() -> Handler[IO] {
+    handler IO {
+        fn read_line() -> Option[Str] { None }
+    }
+}
+"#
+}
+
+test "the lint table silences it by name and by code" {
+    probe("lint_name", lint_src(), "PartialHandler")
+    let _ = expect("lint off by name", 0)
+    probe("lint_code", lint_src(), "W0545")
+    let _ = expect("lint off by code", 0)
+}
