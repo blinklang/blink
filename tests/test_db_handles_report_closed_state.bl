@@ -1,0 +1,146 @@
+// A stdlib wrapper over a sqlite handle keeps its closed state behind the handle, so every
+// copy of the wrapper sees it. A call after close returns a defined error, and a second
+// close does nothing. Neither ever reaches a freed sqlite3 or sqlite3_stmt.
+
+import std.db
+import std.db_error.{DBError}
+import std.db_sqlite.{db_connect, sqlite_handler, sqlite_open, sqlite_close, sqlite_transaction}
+import std.db_stmt.{Stmt, STEP_ROW}
+
+fn is_closed_err[T](r: Result[T, DBError]) -> Bool {
+    match r {
+        Err(DBError.ConnectionError(msg)) => msg == "connection is closed"
+        _ => false
+    }
+}
+
+fn is_finalized_err[T](r: Result[T, DBError]) -> Bool {
+    match r {
+        Err(DBError.ExecError(msg)) => msg == "statement is finalized"
+        _ => false
+    }
+}
+
+test "the first with on a connection works as before" {
+    let conn = db.connect(":memory:")?
+    with conn {
+        db.exec("create table t (x int)").unwrap()
+        db.exec("insert into t values (7)").unwrap()
+        let rows = db.query("select x from t").unwrap()
+        assert_eq(rows.get(0).unwrap().get_int("x").unwrap(), 7)
+    }
+}
+
+@allow(ScopedValueEnteredTwice)
+test "a second with on a closed connection gets the closed error from every op" {
+    let conn = db.connect(":memory:")?
+    with conn {
+        db.exec("create table t (x int)").unwrap()
+    }
+    with conn {
+        assert(is_closed_err(db.exec("insert into t values (1)")))
+        assert(is_closed_err(db.execute("insert into t values (1)")))
+        assert(is_closed_err(db.query("select x from t")))
+        assert(is_closed_err(db.query_one("select x from t")))
+        assert(is_closed_err(db.prepare("select x from t")))
+        assert(is_closed_err(db.begin()))
+        assert(is_closed_err(db.commit()))
+        assert(is_closed_err(db.rollback()))
+    }
+}
+
+@allow(ScopedValueEnteredTwice)
+test "a copy of a connection sees that the original closed" {
+    let conn = db.connect(":memory:")?
+    let copy = conn
+    with conn {
+        db.exec("create table t (x int)").unwrap()
+    }
+    with copy {
+        assert(is_closed_err(db.exec("insert into t values (1)")))
+    }
+}
+
+test "closing a raw handle twice is a no-op, and ops after close get the closed error" {
+    let h = sqlite_open(":memory:")
+    assert_eq(sqlite_close(h), 0)
+    assert_eq(sqlite_close(h), 0)
+    with sqlite_handler(h) {
+        assert(is_closed_err(db.exec("create table t (x int)")))
+    }
+}
+
+test "closing a Closeable connection twice is a no-op" {
+    let conn = db_connect(":memory:")
+    with conn as c, sqlite_handler(c.handle) {
+        db.exec("create table t (x int)").unwrap()
+    }
+    conn.close()
+    with sqlite_handler(conn.handle) {
+        assert(is_closed_err(db.exec("insert into t values (1)")))
+    }
+}
+
+test "a transaction on a closed connection panics with the closed error" {
+    let h = sqlite_open(":memory:")
+    sqlite_close(h)
+    with sqlite_handler(h) {
+        assert_panics(matching: "connection is closed") {
+            with sqlite_transaction(h) {
+                db.exec("create table t (x int)").unwrap()
+            }
+        }
+    }
+}
+
+test "a statement after finalize gets the finalized error, and a second finalize is a no-op" {
+    let conn = db.connect(":memory:")?
+    with conn {
+        db.exec("create table t (x int)").unwrap()
+        db.exec("insert into t values (3)").unwrap()
+        let stmt = db.prepare("select x from t where x = ?").unwrap()
+        stmt.bind_int(1, 3).unwrap()
+        assert_eq(stmt.step().unwrap(), STEP_ROW)
+        assert_eq(stmt.column_int(0), 3)
+        stmt.finalize().unwrap()
+        assert(stmt.finalize().is_ok())
+        stmt.close()
+        assert(is_finalized_err(stmt.step()))
+        assert(is_finalized_err(stmt.reset()))
+        assert(is_finalized_err(stmt.bind_int(1, 3)))
+        assert(is_finalized_err(stmt.bind_text(1, "3")))
+    }
+}
+
+test "a statement column read after finalize panics" {
+    let conn = db.connect(":memory:")?
+    with conn {
+        db.exec("create table t (x int)").unwrap()
+        let stmt = db.prepare("select x from t").unwrap()
+        stmt.finalize().unwrap()
+        assert_panics(matching: "statement is finalized") {
+            let _ = stmt.column_int(0)
+        }
+        assert_panics(matching: "statement is finalized") {
+            let _ = stmt.column_text(0)
+        }
+    }
+}
+
+test "a statement whose connection closed gets the closed error, and can still be finalized" {
+    let conn = db.connect(":memory:")?
+    let mut kept: Option[Stmt] = None
+    with conn {
+        db.exec("create table t (x int)").unwrap()
+        kept = Some(db.prepare("select x from t").unwrap())
+    }
+    let stmt = kept.unwrap()
+    assert(is_closed_err(stmt.step()))
+    assert(is_closed_err(stmt.reset()))
+    assert(is_closed_err(stmt.bind_int(1, 1)))
+    assert_panics(matching: "connection is closed") {
+        let _ = stmt.column_int(0)
+    }
+    assert(stmt.finalize().is_ok())
+    stmt.close()
+}

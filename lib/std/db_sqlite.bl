@@ -6,15 +6,18 @@ import std.template.{TPL_INT, TPL_FLOAT, TPL_BOOL, TPL_STR}
 
 // --- SQLite opaque handle types ---
 // Each FFI boundary is a nominal @ffi.opaque handle, not the interchangeable
-// bare Handle (which is the async task handle, a different type). sqlite3 and
-// sqlite3_stmt come from the system header. SqliteResult is the result-set
-// wrapper the shim allocates; its pointee blink_sqlite3_result lives in the
-// always-included runtime shim, so it declares no system header.
+// bare Handle (which is the async task handle, a different type). Sqlite3 and
+// Sqlite3Stmt point at boxes the shim allocates around sqlite3 and sqlite3_stmt.
+// Close and finalize clear the box and keep it alive, so the closed state lives
+// behind the pointer and every copy of a handle sees it; a struct field could
+// not do that, since a copy of the struct would carry its own flag. The pointees
+// and SqliteResult's blink_sqlite3_result live in the always-included runtime
+// shim, so they declare no system header.
 
-@ffi.opaque(header: "sqlite3.h", name: "sqlite3")
+@ffi.opaque(name: "blink_sqlite3_conn")
 pub type Sqlite3
 
-@ffi.opaque(header: "sqlite3.h", name: "sqlite3_stmt")
+@ffi.opaque(name: "blink_sqlite3_stmt")
 pub type Sqlite3Stmt
 
 @ffi.opaque(name: "blink_sqlite3_result")
@@ -29,8 +32,18 @@ pub fn sqlite_open(path: Str) -> Sqlite3 ! FFI {}
 
 @ffi("blink_sqlite3_close")
 @trusted(audit: "STD-DB-SQLITE")
-/// Close a SQLite database handle.
+/// Close a SQLite database handle. Closing a closed handle does nothing and returns 0.
 pub fn sqlite_close(handle: Sqlite3) -> Int ! FFI {}
+
+@ffi("blink_sqlite3_is_closed")
+@trusted(audit: "STD-DB-SQLITE")
+/// 1 once any copy of the handle was closed, else 0.
+fn sqlite_is_closed(handle: Sqlite3) -> Int ! FFI {}
+
+@ffi("blink_sqlite3_is_finalized")
+@trusted(audit: "STD-DB-SQLITE")
+/// 1 once any copy of the statement handle was finalized, else 0.
+pub fn sqlite_is_finalized(stmt: Sqlite3Stmt) -> Int ! FFI {}
 
 @ffi("blink_sqlite3_exec_void")
 @trusted(audit: "STD-DB-SQLITE")
@@ -107,7 +120,7 @@ pub fn sqlite_reset(stmt: Sqlite3Stmt) -> Int ! FFI {}
 
 @ffi("blink_sqlite3_finalize")
 @trusted(audit: "STD-DB-SQLITE")
-/// Finalize (free) a prepared statement.
+/// Finalize (free) a prepared statement. Finalizing a finalized statement does nothing.
 pub fn sqlite_finalize(stmt: Sqlite3Stmt) -> Int ! FFI {}
 
 @ffi("blink_sqlite3_bind_double")
@@ -132,6 +145,14 @@ pub fn sqlite_errmsg(handle: Sqlite3) -> Str ! FFI {}
 fn sqlite_last_insert_rowid(handle: Sqlite3) -> Int ! FFI {}
 
 // --- Template-based parameterized query helpers (pure Blink) ---
+
+/// `Err(ConnectionError("connection is closed"))` once the handle was closed, else `Ok`.
+pub fn sqlite_check_open(handle: Sqlite3) -> Result[Void, DBError] {
+    if sqlite_is_closed(handle) != 0 {
+        return Err(DBError.ConnectionError("connection is closed"))
+    }
+    Ok()
+}
 
 fn reassemble_sql(tpl: Template[DB]) -> Str {
     let parts: List[Str] = tpl.parts()
@@ -171,6 +192,7 @@ fn bind_template(stmt: Sqlite3Stmt, tpl: Template[DB]) -> Int {
 }
 
 fn prepare_and_bind(handle: Sqlite3, tpl: Template[DB]) -> Result[Sqlite3Stmt, DBError] {
+    sqlite_check_open(handle)?
     let sql = reassemble_sql(tpl)
     let stmt = match sqlite_prepare(handle, sql) {
         Some(s) => s
@@ -270,6 +292,7 @@ fn sqlite_execute_checked(handle: Sqlite3, sql: Template[DB]) -> Result[Int, DBE
 }
 
 fn sqlite_exec_str(handle: Sqlite3, sql: Str) -> Result[Void, DBError] {
+    sqlite_check_open(handle)?
     let rc = sqlite_exec_raw(handle, sql)
     if rc != 0 {
         return Err(DBError.ExecError(sqlite_errmsg(handle)))

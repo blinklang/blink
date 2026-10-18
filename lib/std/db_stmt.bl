@@ -1,6 +1,7 @@
 import std.db_error.{DBError}
 import std.db_sqlite.{Sqlite3, Sqlite3Stmt, sqlite_bind_int, sqlite_bind_text, sqlite_step,
-    sqlite_column_int, sqlite_column_text, sqlite_reset, sqlite_finalize, sqlite_errmsg}
+    sqlite_column_int, sqlite_column_text, sqlite_reset, sqlite_finalize, sqlite_errmsg,
+    sqlite_is_finalized, sqlite_check_open}
 
 pub let STEP_ROW: Int = 100
 pub let STEP_DONE: Int = 101
@@ -17,6 +18,23 @@ fn check_rc(db_handle: Sqlite3, rc: Int) -> Result[Void, DBError] {
     Ok()
 }
 
+// A finalized statement, or one whose connection closed, reports an error and never
+// reaches sqlite.
+fn check_live(stmt: Stmt) -> Result[Void, DBError] {
+    if sqlite_is_finalized(stmt.handle) != 0 {
+        return Err(DBError.ExecError("statement is finalized"))
+    }
+    sqlite_check_open(stmt.db_handle)
+}
+
+// The column reads return no Result, so a dead statement is a panic, not a made-up value.
+fn require_live(stmt: Stmt) {
+    match check_live(stmt) {
+        Ok(_) => {}
+        Err(e) => panic("cannot read a column: {e}")
+    }
+}
+
 pub trait StmtOps {
     fn bind_int(self, idx: Int, val: Int) -> Result[Void, DBError]
     fn bind_text(self, idx: Int, val: Str) -> Result[Void, DBError]
@@ -29,14 +47,17 @@ pub trait StmtOps {
 
 impl StmtOps for Stmt {
     fn bind_int(self, idx: Int, val: Int) -> Result[Void, DBError] {
+        check_live(self)?
         check_rc(self.db_handle, sqlite_bind_int(self.handle, idx, val))
     }
 
     fn bind_text(self, idx: Int, val: Str) -> Result[Void, DBError] {
+        check_live(self)?
         check_rc(self.db_handle, sqlite_bind_text(self.handle, idx, val))
     }
 
     fn step(self) -> Result[Int, DBError] {
+        check_live(self)?
         let rc = sqlite_step(self.handle)
         if rc == STEP_DONE || rc == STEP_ROW {
             Ok(rc)
@@ -46,18 +67,25 @@ impl StmtOps for Stmt {
     }
 
     fn column_int(self, idx: Int) -> Int {
+        require_live(self)
         sqlite_column_int(self.handle, idx)
     }
 
     fn column_text(self, idx: Int) -> Str {
+        require_live(self)
         sqlite_column_text(self.handle, idx)
     }
 
     fn reset(self) -> Result[Void, DBError] {
+        check_live(self)?
         check_rc(self.db_handle, sqlite_reset(self.handle))
     }
 
+    // A second finalize does nothing, as close does.
     fn finalize(self) -> Result[Void, DBError] {
+        if sqlite_is_finalized(self.handle) != 0 {
+            return Ok()
+        }
         check_rc(self.db_handle, sqlite_finalize(self.handle))
     }
 }

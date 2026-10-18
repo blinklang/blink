@@ -100,6 +100,40 @@ fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> Option[CFile] ! FFI { }
 
 `@ffi.opaque(header, name)` declares a nominal type for a C handle such as `FILE*` or `sqlite3*`. It lowers to a bare pointer. It has no deref, `==`, fields or arithmetic, and `Option[CFile]` uses `NULL` for `None`. `blink audit --ffi` lists it as `opaque-ffi-handle`. A struct literal whose head is an `@ffi.opaque` type is `E0300`.
 
+#### Closed state for a wrapper over a C handle
+
+A `Closeable` or `BlockHandler` wrapper over a C handle must make a second `close()` or `exit()` do nothing, and a call after close return an error. Keep the closed state behind the handle, not in a `Bool` field: values are copied, so a field flag in one copy goes stale in the others. Point the opaque type at a small C box that your shim allocates (GC memory, so it outlives the C resource). Close frees the resource and clears the box. Every shim checks the box first:
+
+```c
+typedef struct { FILE* f; } my_file;          /* f is NULL once closed */
+
+int64_t my_file_close(my_file* b) {
+    if (!b->f) return 0;                       /* second close: no-op */
+    FILE* f = b->f;
+    b->f = NULL;
+    return fclose(f);
+}
+int64_t my_file_is_closed(my_file* b) { return b->f ? 0 : 1; }
+```
+
+```blink
+@ffi.opaque(name: "my_file")
+type File
+
+@ffi("my_file_is_closed")
+@trusted(audit: "SEC-104")
+fn file_is_closed(f: File) -> Int ! FFI { }
+
+pub fn read_line(f: File) -> Result[Str, FileError] {
+    if file_is_closed(f) != 0 {
+        return Err(FileError.Closed("file is closed"))
+    }
+    // ...
+}
+```
+
+`std.db` does this: after a `Connection` closes, every `db.*` call through it returns `Err(ConnectionError("connection is closed"))`, and a `Stmt` call after `finalize()` returns `Err(ExecError("statement is finalized"))`.
+
 `Ptr[T]` accepts only FFI-valid pointee types (`E0810` otherwise, also inside aliases, fields, payloads, closure and trait signatures, and nested `Ptr[Ptr[T]]`). `Bool` is not a valid pointee. A field read through a `Ptr` types only when the pointee is an `@ffi.struct`.
 
 ### @ffi.struct (C struct layout twin)
