@@ -1,0 +1,434 @@
+// The field checks of sections/02_syntax.md §2.14 "Checking a Literal's Fields" and §3.4
+// "Variant Construction", as `blink check` prints them. Each row compares the whole of stderr
+// with the text the spec gives, so a change to a message, a help line, a note, a span or the
+// order of the reports shows up here.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn point_decl() -> List[Str] {
+    [
+        "type Point \{",
+        "    x: Float",
+        "    y: Float",
+        "}",
+        "",
+    ]
+}
+
+fn figure_decl() -> List[Str] {
+    [
+        "type Figure \{",
+        "    Rect \{ width: Float, height: Float }",
+        "    Circle(radius: Float, tag: Int)",
+        "    Dot",
+        "}",
+        "",
+    ]
+}
+
+// `body` is the line that holds the literal under test, as line 7 of a file whose main reads
+// the value back, so nothing else in the file draws a diagnostic.
+fn point_src(body: Str) -> Str {
+    lines(point_decl().append([
+        "fn make() -> Point \{",
+        body,
+        "}",
+        "",
+        "fn main() \{",
+        #"    io.println("{make().x}")"#,
+        "}",
+    ]))
+}
+
+fn check_stderr(name: Str, src: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_literal_fields.XXXXXX").out.trim()
+    write_file("{dir}/{name}", src)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check {name} < /dev/null")
+    let _ = sh("rm -rf {dir}")
+    r.err_out
+}
+
+fn expect_text(name: Str, src: Str, want: List[Str]) {
+    let got = check_stderr(name, src)
+    let w = lines(want)
+    if got != w { io.eprintln("want:\n{w}\ngot:\n{got}") }
+    assert(got == w)
+}
+
+test "an unknown label whose nearest field is missing gives one NoSuchField with a rename and no MissingField" {
+    expect_text("point_yy.bl", point_src(#"    Point { x: 1.0, yy: 2.0 }"#), [
+        "error[NoSuchField]: `Point` has no field `yy`",
+        "  --> point_yy.bl:7:21",
+        "  |",
+        #"7 |     Point { x: 1.0, yy: 2.0 }"#,
+        "  |                     ^",
+        "  help: did you mean `y`?",
+        "  help: or add the field to `Point`",
+        "  fix: rename to `y` at 7:21",
+        "1 error(s) found",
+    ])
+}
+
+test "an unknown label with no near field lists the declared fields and marks those given" {
+    expect_text("point_z.bl", point_src(#"    Point { x: 1.0, y: 2.0, z: 3.0 }"#), [
+        "error[NoSuchField]: `Point` has no field `z`",
+        "  --> point_z.bl:7:29",
+        "  |",
+        #"7 |     Point { x: 1.0, y: 2.0, z: 3.0 }"#,
+        "  |                             ^",
+        "  help: `Point` declares: x (given), y (given)",
+        "  help: or add the field to `Point`",
+        "1 error(s) found",
+    ])
+}
+
+test "a field with no label and no default is MissingField at the type name" {
+    expect_text("point_missing.bl", point_src(#"    Point { x: 1.0 }"#), [
+        "error[MissingField]: `Point` literal is missing field `y` (Float)",
+        "  --> point_missing.bl:7:5",
+        "  |",
+        #"7 |     Point { x: 1.0 }"#,
+        "  |     ^",
+        "  help: add `y: ` and a value",
+        "  help: or give `y` a default in `Point`",
+        "1 error(s) found",
+    ])
+}
+
+test "a label given twice is DuplicateField at the second, with a note at the first" {
+    expect_text("point_dup.bl", point_src(#"    Point { x: 1.0, x: 3.0, y: 2.0 }"#), [
+        "error[DuplicateField]: field `x` is given twice",
+        "  --> point_dup.bl:7:21",
+        "  |",
+        #"7 |     Point { x: 1.0, x: 3.0, y: 2.0 }"#,
+        "  |                     ^",
+        "  note: first given here: 7:13",
+        "  help: remove one of the two",
+        "1 error(s) found",
+    ])
+}
+
+test "a variant brace literal with ..source is VariantSpread" {
+    let src = lines(figure_decl().append([
+        "fn widen(s: Figure) -> Figure \{",
+        #"    Figure.Rect { width: 2.0, ..s }"#,
+        "}",
+        "",
+        "fn main() \{",
+        "    match widen(Figure.Dot) \{",
+        #"        Figure.Dot => io.println("dot")"#,
+        #"        _ => io.println("other")"#,
+        "    }",
+        "}",
+    ]))
+    expect_text("figure_spread.bl", src, [
+        "error[VariantSpread]: a variant literal cannot copy fields with `..s`",
+        "  --> figure_spread.bl:8:31",
+        "  |",
+        #"8 |     Figure.Rect { width: 2.0, ..s }"#,
+        "  |                               ^",
+        #"  note: for example, `match s { Figure.Rect { width, height } => ... }` binds the fields of `Figure.Rect`"#,
+        "  help: write every field, or match on `s` to bind its fields (copy-update is for struct literals, §2.16)",
+        "1 error(s) found",
+    ])
+}
+
+test "one literal reports every DuplicateField, then every NoSuchField, then MissingField, each in source order" {
+    let src = lines([
+        "type Trio \{",
+        "    a: Int",
+        "    b: Int",
+        "    c: Int",
+        "}",
+        "",
+        "fn make() -> Trio \{",
+        #"    Trio { b: 1, qq: 2, b: 3, ww: 4 }"#,
+        "}",
+        "",
+        "fn main() \{",
+        #"    io.println("{make().a}")"#,
+        "}",
+    ])
+    expect_text("trio_order.bl", src, [
+        "error[DuplicateField]: field `b` is given twice",
+        "  --> trio_order.bl:8:25",
+        "  |",
+        #"8 |     Trio { b: 1, qq: 2, b: 3, ww: 4 }"#,
+        "  |                         ^",
+        "  note: first given here: 8:12",
+        "  help: remove one of the two",
+        "error[NoSuchField]: `Trio` has no field `qq`",
+        "  --> trio_order.bl:8:18",
+        "  |",
+        #"8 |     Trio { b: 1, qq: 2, b: 3, ww: 4 }"#,
+        "  |                  ^",
+        "  help: `Trio` declares: a, b (given), c",
+        "  help: or add the field to `Trio`",
+        "error[NoSuchField]: `Trio` has no field `ww`",
+        "  --> trio_order.bl:8:31",
+        "  |",
+        #"8 |     Trio { b: 1, qq: 2, b: 3, ww: 4 }"#,
+        "  |                               ^",
+        "  help: `Trio` declares: a, b (given), c",
+        "  help: or add the field to `Trio`",
+        "error[MissingField]: `Trio` literal is missing fields `a` (Int), `c` (Int)",
+        "  --> trio_order.bl:8:5",
+        "  |",
+        #"8 |     Trio { b: 1, qq: 2, b: 3, ww: 4 }"#,
+        "  |     ^",
+        "  help: add each missing field with a value",
+        "  help: or give each a default in `Trio`",
+        "4 error(s) found",
+    ])
+}
+
+test "a labelled paren payload takes the field checks in place of the argument count" {
+    let src = lines(figure_decl().append([
+        "fn make() -> Figure \{",
+        "    Figure.Circle(radius: 1.0, radius: 2.0)",
+        "}",
+        "",
+        "fn main() \{",
+        "    match make() \{",
+        #"        Figure.Dot => io.println("dot")"#,
+        #"        _ => io.println("other")"#,
+        "    }",
+        "}",
+    ]))
+    expect_text("figure_paren_labels.bl", src, [
+        "error[DuplicateField]: field `radius` is given twice",
+        "  --> figure_paren_labels.bl:8:32",
+        "  |",
+        "8 |     Figure.Circle(radius: 1.0, radius: 2.0)",
+        "  |                                ^",
+        "  note: first given here: 8:19",
+        "  help: remove one of the two",
+        "error[MissingField]: `Figure.Circle` literal is missing field `tag` (Int)",
+        "  --> figure_paren_labels.bl:8:5",
+        "  |",
+        "8 |     Figure.Circle(radius: 1.0, radius: 2.0)",
+        "  |     ^",
+        "  help: add `tag: ` and a value",
+        "2 error(s) found",
+    ])
+}
+
+test "a positional paren payload keeps the argument-count error, with a note that lists the fields" {
+    let src = lines(figure_decl().append([
+        "fn make() -> Figure \{",
+        "    Figure.Circle(1.0)",
+        "}",
+        "",
+        "fn bare() -> Figure \{",
+        "    Circle(2.0)",
+        "}",
+        "",
+        "fn main() \{",
+        "    match make() \{",
+        #"        Figure.Dot => io.println("dot")"#,
+        #"        _ => io.println("other")"#,
+        "    }",
+        "    match bare() \{",
+        #"        Figure.Dot => io.println("dot")"#,
+        #"        _ => io.println("other")"#,
+        "    }",
+        "}",
+    ]))
+    expect_text("figure_paren_positional.bl", src, [
+        "error[TypeError]: variant `Circle` expects 2 argument(s), got 1",
+        "  --> figure_paren_positional.bl:8:5",
+        "  |",
+        "8 |     Figure.Circle(1.0)",
+        "  |     ^",
+        "  note: fields of `Figure.Circle`, in order: radius (Float), tag (Int)",
+        "error[TypeError]: variant `Circle` expects 2 argument(s), got 1",
+        "  --> figure_paren_positional.bl:12:5",
+        "   |",
+        "12 |     Circle(2.0)",
+        "   |     ^",
+        "  note: fields of `Figure.Circle`, in order: radius (Float), tag (Int)",
+        "2 error(s) found",
+    ])
+}
+
+test "a mixed paren payload keeps the argument-count error and its field note" {
+    let src = lines(figure_decl().append([
+        "fn make() -> Figure \{",
+        "    Figure.Circle(1.0, tag: 2, radius: 3.0)",
+        "}",
+        "",
+        "fn main() \{",
+        "    match make() \{",
+        #"        Figure.Dot => io.println("dot")"#,
+        #"        _ => io.println("other")"#,
+        "    }",
+        "}",
+    ]))
+    expect_text("figure_paren_mixed.bl", src, [
+        "error[TypeError]: variant `Circle` expects 2 argument(s), got 3",
+        "  --> figure_paren_mixed.bl:8:5",
+        "  |",
+        "8 |     Figure.Circle(1.0, tag: 2, radius: 3.0)",
+        "  |     ^",
+        "  note: fields of `Figure.Circle`, in order: radius (Float), tag (Int)",
+        "1 error(s) found",
+    ])
+}
+
+fn wide_src(body: Str) -> Str {
+    lines([
+        "type Wide \{",
+        "    f0: Int",
+        "    f1: Int",
+        "    f2: Int",
+        "    f3: Int",
+        "    f4: Int",
+        "    f5: Int",
+        "    f6: Int",
+        "    f7: Int",
+        "    f8: Int",
+        "    f9: Int",
+        "}",
+        "",
+        "fn make() -> Wide \{",
+        body,
+        "}",
+        "",
+        "fn main() \{",
+        #"    io.println("{make().f0}")"#,
+        "}",
+    ])
+}
+
+test "the field lists of a wide type are trimmed" {
+    expect_text("wide_missing.bl", wide_src(#"    Wide { f0: 1 }"#), [
+        "error[MissingField]: `Wide` literal is missing fields `f1` (Int), `f2` (Int), `f3` (Int), `f4` (Int), `f5` (Int), `f6` (Int) and 3 more",
+        "  --> wide_missing.bl:15:5",
+        "   |",
+        #"15 |     Wide { f0: 1 }"#,
+        "   |     ^",
+        "  help: add each missing field with a value",
+        "  help: or give each a default in `Wide`",
+        "1 error(s) found",
+    ])
+    let all = #"    Wide { f0: 0, f1: 1, f2: 2, f3: 3, f4: 4, f5: 5, f6: 6, f7: 7, f8: 8, f9: 9, zzz: 10 }"#
+    expect_text("wide_unknown.bl", wide_src(all), [
+        "error[NoSuchField]: `Wide` has no field `zzz`",
+        "  --> wide_unknown.bl:15:82",
+        "   |",
+        "15 | {all}",
+        "   |                                                                                  ^",
+        "  help: `Wide` declares: f0 (given), f1 (given), f2 (given), f3 (given), f4 (given), f5 (given) and 4 more",
+        "  help: or add the field to `Wide`",
+        "1 error(s) found",
+    ])
+}
+
+test "a default on a variant field is one parse error that says variant fields take none" {
+    let src = lines([
+        "type Shape \{",
+        "    Circle(radius: Float = 1.0)",
+        #"    Rect { width: Float = 2.0, height: Float }"#,
+        "}",
+        "",
+        "fn main() \{",
+        #"    io.println("x")"#,
+        "}",
+    ])
+    expect_text("shape_default.bl", src, [
+        "error[UnexpectedToken]: a variant field takes no default",
+        "  --> shape_default.bl:2:26",
+        "  |",
+        "2 |     Circle(radius: Float = 1.0)",
+        "  |                          ^",
+        "  help: remove `=` and the value; a variant literal gives every field (§3.4)",
+        "error[UnexpectedToken]: a variant field takes no default",
+        "  --> shape_default.bl:3:25",
+        "  |",
+        #"3 |     Rect { width: Float = 2.0, height: Float }"#,
+        "  |                         ^",
+        "  help: remove `=` and the value; a variant literal gives every field (§3.4)",
+        "2 error(s) found",
+    ])
+}
+
+fn acct_src(body: Str) -> Str {
+    lines([
+        "type Acct \{",
+        "    id: Int",
+        "    bal: Int",
+        "}",
+        "",
+        "fn bump(a: Acct) -> Acct \{",
+        body,
+        "}",
+        "",
+        "fn main() \{",
+        #"    let b = bump(Acct { id: 7, bal: 1 })"#,
+        #"    io.println("{b.id} {b.bal}")"#,
+        "}",
+    ])
+}
+
+test "copy-update never reports MissingField, a label beside ..source shadows it, and a repeated label is still DuplicateField" {
+    let dir = sh("mktemp -d /tmp/blink_literal_fields_copy.XXXXXX").out.trim()
+    write_file("{dir}/acct_ok.bl", acct_src(#"    Acct { bal: a.bal + 5, ..a }"#))
+    let ok = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B run acct_ok.bl < /dev/null")
+    let _ = sh("rm -rf {dir}")
+    if ok.exit_code != 0 { io.eprintln(ok.err_out) }
+    assert_eq(ok.exit_code, 0)
+    assert_eq(ok.out, "7 6\n")
+
+    expect_text("acct_dup.bl", acct_src(#"    Acct { bal: 5, bal: 6, ..a }"#), [
+        "error[DuplicateField]: field `bal` is given twice",
+        "  --> acct_dup.bl:7:20",
+        "  |",
+        #"7 |     Acct { bal: 5, bal: 6, ..a }"#,
+        "  |                    ^",
+        "  note: first given here: 7:12",
+        "  help: remove one of the two",
+        "1 error(s) found",
+    ])
+    expect_text("acct_typo.bl", acct_src(#"    Acct { bxl: 5, ..a }"#), [
+        "error[NoSuchField]: `Acct` has no field `bxl`",
+        "  --> acct_typo.bl:7:12",
+        "  |",
+        #"7 |     Acct { bxl: 5, ..a }"#,
+        "  |            ^",
+        "  help: did you mean `bal`?",
+        "  help: or add the field to `Acct`",
+        "  fix: rename to `bal` at 7:12",
+        "1 error(s) found",
+    ])
+}
+
+test "the help that edits the declaration is left out for a type another package declares" {
+    let src = lines([
+        "import std.process.\{ProcessResult}",
+        "",
+        "fn make() -> ProcessResult \{",
+        #"    ProcessResult { out: "", err_out: "", exit_code: 0, code: 1 }"#,
+        "}",
+        "",
+        "fn main() \{",
+        #"    io.println(make().out)"#,
+        "}",
+    ])
+    expect_text("foreign_unknown.bl", src, [
+        "error[NoSuchField]: `ProcessResult` has no field `code`",
+        "  --> foreign_unknown.bl:4:57",
+        "  |",
+        #"4 |     ProcessResult { out: "", err_out: "", exit_code: 0, code: 1 }"#,
+        "  |                                                         ^",
+        "  help: `ProcessResult` declares: out (given), err_out (given), exit_code (given)",
+        "1 error(s) found",
+    ])
+}

@@ -1,0 +1,124 @@
+// A literal's field errors carry repairs of two kinds (sections/02_syntax.md §2.14). A single
+// nearest-name suggestion for an unknown label is a machine fix: `blink fix` applies it and the
+// LSP offers it as a quickfix. MissingField and DuplicateField have no machine fix, since only a
+// person knows the value or which copy to keep. The LSP offers to write the missing labels as
+// an assist under a refactor kind, so a client's "fix all" never leaves a half-written literal.
+// `blink check`, `blink build` and a one-unit build report the same set.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn shapes_src(rename: Str) -> Str {
+    lines([
+        "type Point \{",
+        "    x: Float",
+        "    y: Float",
+        "}",
+        "",
+        "fn typo() -> Point \{",
+        "    Point \{ x: 1.0, {rename}: 2.0 }",
+        "}",
+        "",
+        "fn short() -> Point \{",
+        "    Point \{ x: 1.0 }",
+        "}",
+        "",
+        "fn twice() -> Point \{",
+        "    Point \{ x: 1.0, x: 2.0, y: 3.0 }",
+        "}",
+        "",
+        "fn main() \{",
+        #"    io.println("{typo().y} {short().x} {twice().x}")"#,
+        "}",
+    ])
+}
+
+test "blink fix applies the rename and leaves MissingField and DuplicateField for a person" {
+    let dir = sh("mktemp -d /tmp/blink_fix_literal_fields.XXXXXX").out.trim()
+    write_file("{dir}/shapes.bl", shapes_src("yy"))
+    let r = blink_in(dir, "fix shapes.bl")
+    let got = read_file("{dir}/shapes.bl")
+    if got != shapes_src("y") { io.eprintln("got file:\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(got == shapes_src("y"))
+    assert(r.out.contains("shapes.bl:7:21: E0525 rename to"))
+    assert(r.out.contains("1 fix(es) applied"))
+
+    let check = blink_in(dir, "check shapes.bl")
+    assert(check.exit_code != 0)
+    assert(!check.err_out.contains("NoSuchField"))
+    assert(check.err_out.contains("error[MissingField]: `Point` literal is missing field `y` (Float)"))
+    assert(check.err_out.contains("error[DuplicateField]: field `x` is given twice"))
+    assert(check.err_out.contains("2 error(s) found"))
+    let _ = sh("rm -rf {dir}")
+}
+
+test "blink check, blink build and a one-unit build report the same literal field errors" {
+    let dir = sh("mktemp -d /tmp/blink_literal_fields_parity.XXXXXX").out.trim()
+    write_file("{dir}/shapes.bl", shapes_src("yy"))
+    let check = blink_in(dir, "check shapes.bl")
+    let build = blink_in(dir, "build shapes.bl")
+    let one = blink_in(dir, "build --no-per-module shapes.bl")
+    assert(check.exit_code != 0)
+    assert(build.exit_code != 0)
+    assert(one.exit_code != 0)
+    let shown = check.err_out.replace("error: check failed\n", "")
+    if shown != build.err_out || build.err_out != one.err_out {
+        io.eprintln("check:\n{check.err_out}\nbuild:\n{build.err_out}\none unit:\n{one.err_out}")
+    }
+    assert(shown == build.err_out)
+    assert(build.err_out == one.err_out)
+    assert(build.err_out.contains("3 error(s) found"))
+    let _ = sh("rm -rf {dir}")
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+fn code_actions(dir: Str, uri: Str, line: Int) -> Str {
+    let td = "\"textDocument\":\{\"uri\":\"{uri}\"}"
+    let input = [
+        lsp_msg(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{{td}}}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/codeAction\",\"params\":\{{td},\"range\":\{\"start\":\{\"line\":{line},\"character\":0},\"end\":\{\"line\":{line},\"character\":0}},\"context\":\{\"diagnostics\":[]}}}"),
+        lsp_msg(#"{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"exit","params":{}}"#),
+    ].join("")
+    write_file("{dir}/input.bin", input)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 60 $B lsp < input.bin")
+    r.out
+}
+
+test "the LSP offers the rename as a quickfix and the missing labels as a refactor assist" {
+    let dir = sh("mktemp -d /tmp/blink_lsp_literal_fields.XXXXXX").out.trim()
+    write_file("{dir}/shapes.bl", shapes_src("yy"))
+    let uri = "file://{dir}/shapes.bl"
+
+    let rename = code_actions(dir, uri, 6)
+    let want_rename = "\"title\":\"rename to\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[\{\"range\":\{\"start\":\{\"line\":6,\"character\":20},\"end\":\{\"line\":6,\"character\":22}},\"newText\":\"y\"}]}}}"
+    if !rename.contains(want_rename) { io.eprintln("want: {want_rename}\nstdout:\n{rename}") }
+    assert(rename.contains(want_rename))
+
+    let fill = code_actions(dir, uri, 10)
+    let want_fill = "\"title\":\"add the missing field\",\"kind\":\"refactor.rewrite\",\"edit\":\{\"changes\":\{\"{uri}\":[\{\"range\":\{\"start\":\{\"line\":10,\"character\":18},\"end\":\{\"line\":10,\"character\":18}},\"newText\":\", y: \"}]}}}"
+    if !fill.contains(want_fill) { io.eprintln("want: {want_fill}\nstdout:\n{fill}") }
+    assert(fill.contains(want_fill))
+    assert(!fill.contains("quickfix"))
+
+    // DuplicateField has no repair of either kind.
+    let dup = code_actions(dir, uri, 14)
+    assert(dup.contains("\"id\":2,\"result\":[]"))
+    let _ = sh("rm -rf {dir}")
+}

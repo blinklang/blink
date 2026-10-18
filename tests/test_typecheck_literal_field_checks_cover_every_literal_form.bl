@@ -1,0 +1,161 @@
+// One field-set check serves every literal that names fields (sections/02_syntax.md §2.14,
+// sections/03_types.md §3.4): a struct literal, generic or not; a variant brace literal named
+// `Enum.Variant`, named bare under an expected type, or named bare by a program-unique
+// variant; and an all-labelled variant paren payload, qualified or bare. Each form must
+// answer an unknown, a repeated and a missing label the same way, so each row names one form
+// and one fault. Before this check, most of these forms passed the front end and reached
+// codegen with a field nothing filled.
+//
+// The last rows hold the nearest-name rule (ERROR_CATALOG Conventions): case, `_` and `-` do
+// not count, and only a unique nearest candidate that is near enough is named.
+import lower_test_helpers.{probe, probe_but, assert_eq_str}
+import diagnostics.{diag_entries}
+
+fn decls() -> Str {
+    #"type Point {
+    x: Float
+    y: Float
+}
+
+type Box[T] {
+    v: T
+    tag: Int
+}
+
+type Figure {
+    Rect { width: Float, height: Float }
+    Circle(radius: Float, tag: Int)
+    Dot
+}
+
+type Tree[T] {
+    Leaf { value: T, depth: Int }
+    Empty
+}
+
+type Account {
+    user_name: Str
+    ab: Int
+    ac: Int
+    balance: Int = 0
+}
+
+type Pair {
+    ab: Int = 0
+    ac: Int = 0
+}
+"#
+}
+
+fn with_body(body: Str) -> Str {
+    "{decls()}\nfn main() \{\n{body}\n}\n"
+}
+
+// The one error a row expects: its name, its message and the help it carries.
+fn only(stem: Str, body: Str, name: Str, message: Str, help: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = probe_but(stem, with_body(body), name)
+    assert(program >= 0)
+    let mut got: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { got.push("{d.name}: {d.message} | {d.help}") }
+    }
+    assert_eq_str(stem, got.join("\n"), "{name}: {message} | {help}")
+}
+
+fn missing(stem: Str, body: Str, shown: Str, field: Str, ty: Str, local_help: Bool) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let tail = if local_help { "\nor give `{field}` a default in `{shown}`" } else { "" }
+    only(stem, body, "MissingField", "`{shown}` literal is missing field `{field}` ({ty})", "add `{field}: ` and a value{tail}")
+}
+
+fn unknown(stem: Str, body: Str, shown: Str, declares: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    only(stem, body, "NoSuchField", "`{shown}` has no field `zzz`", "`{shown}` declares: {declares}\nor add the field to `{shown}`")
+}
+
+fn dup(stem: Str, body: Str, field: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    only(stem, body, "DuplicateField", "field `{field}` is given twice", "remove one of the two")
+}
+
+test "every literal form passes when it gives each field once" {
+    let program = probe("lit_forms_well_formed", with_body(#"    let p = Point { x: 1.0, y: 2.0 }
+    let b = Box { v: 1, tag: 2 }
+    let r = Figure.Rect { width: 1.0, height: 2.0 }
+    let h: Figure = Rect { width: 1.0, height: 2.0 }
+    let g = Rect { width: 3.0, height: 4.0 }
+    let c = Figure.Circle(radius: 1.0, tag: 2)
+    let d = Circle(tag: 3, radius: 4.0)
+    let l = Tree.Leaf { value: 1, depth: 0 }
+    let a = Account { user_name: "n", ab: 1, ac: 2 }
+    let u = Point { x: 9.0, ..p }
+    io.println("{p.x} {b.v} {a.balance} {u.y}")"#))
+    assert(program >= 0)
+}
+
+test "a struct literal" {
+    missing("lit_struct_missing", "    let p = Point \{ x: 1.0 }", "Point", "y", "Float", true)
+    unknown("lit_struct_unknown", "    let p = Point \{ x: 1.0, y: 2.0, zzz: 3.0 }", "Point", "x (given), y (given)")
+    dup("lit_struct_dup", "    let p = Point \{ x: 1.0, y: 2.0, y: 3.0 }", "y")
+}
+
+test "a generic struct literal" {
+    missing("lit_generic_missing", "    let b = Box \{ v: 1 }", "Box", "tag", "Int", true)
+    unknown("lit_generic_unknown", "    let b = Box \{ v: 1, tag: 2, zzz: 3 }", "Box", "v (given), tag (given)")
+    dup("lit_generic_dup", "    let b = Box \{ v: 1, v: 2, tag: 3 }", "v")
+}
+
+test "a qualified variant brace literal" {
+    missing("lit_qual_missing", "    let f = Figure.Rect \{ width: 1.0 }", "Figure.Rect", "height", "Float", false)
+    unknown("lit_qual_unknown", "    let f = Figure.Rect \{ width: 1.0, height: 2.0, zzz: 3.0 }", "Figure.Rect", "width (given), height (given)")
+    dup("lit_qual_dup", "    let f = Figure.Rect \{ width: 1.0, width: 2.0, height: 3.0 }", "width")
+}
+
+test "a bare variant brace literal under an expected type" {
+    missing("lit_hint_missing", "    let f: Figure = Rect \{ width: 1.0 }", "Figure.Rect", "height", "Float", false)
+    unknown("lit_hint_unknown", "    let f: Figure = Rect \{ width: 1.0, height: 2.0, zzz: 3.0 }", "Figure.Rect", "width (given), height (given)")
+    dup("lit_hint_dup", "    let f: Figure = Rect \{ width: 1.0, height: 2.0, height: 3.0 }", "height")
+}
+
+test "a bare variant brace literal named by a program-unique variant" {
+    missing("lit_global_missing", "    let f = Rect \{ height: 1.0 }", "Figure.Rect", "width", "Float", false)
+    unknown("lit_global_unknown", "    let f = Rect \{ width: 1.0, height: 2.0, zzz: 3.0 }", "Figure.Rect", "width (given), height (given)")
+    dup("lit_global_dup", "    let f = Rect \{ width: 1.0, width: 2.0, height: 3.0 }", "width")
+}
+
+test "a generic variant brace literal" {
+    missing("lit_gvar_missing", "    let t = Tree.Leaf \{ value: 1 }", "Tree.Leaf", "depth", "Int", false)
+    unknown("lit_gvar_unknown", "    let t = Tree.Leaf \{ value: 1, depth: 0, zzz: 2 }", "Tree.Leaf", "value (given), depth (given)")
+    dup("lit_gvar_dup", "    let t = Tree.Leaf \{ value: 1, value: 2, depth: 0 }", "value")
+}
+
+test "a labelled qualified variant paren payload" {
+    missing("lit_qparen_missing", "    let f = Figure.Circle(radius: 1.0)", "Figure.Circle", "tag", "Int", false)
+    unknown("lit_qparen_unknown", "    let f = Figure.Circle(radius: 1.0, tag: 2, zzz: 3)", "Figure.Circle", "radius (given), tag (given)")
+    dup("lit_qparen_dup", "    let f = Figure.Circle(radius: 1.0, tag: 2, tag: 3)", "tag")
+}
+
+test "a labelled bare variant paren payload" {
+    missing("lit_bparen_missing", "    let f = Circle(tag: 1)", "Figure.Circle", "radius", "Float", false)
+    unknown("lit_bparen_unknown", "    let f = Circle(radius: 1.0, tag: 2, zzz: 3)", "Figure.Circle", "radius (given), tag (given)")
+    dup("lit_bparen_dup", "    let f = Circle(radius: 1.0, radius: 2.0, tag: 3)", "radius")
+}
+
+test "a field with a default may be left out, and copy-update never misses a field" {
+    let program = probe("lit_default_and_spread", with_body(#"    let a = Account { user_name: "n", ab: 1, ac: 2 }
+    let p = Point { x: 1.0, y: 2.0 }
+    let q = Point { ..p }
+    io.println("{a.balance} {q.x}")"#))
+    assert(program >= 0)
+}
+
+test "the nearest-name rule ignores case and underscores" {
+    only("lit_near_case", "    let p = Point \{ X: 1.0, y: 2.0 }", "NoSuchField", "`Point` has no field `X`", "did you mean `x`?\nor add the field to `Point`")
+    only("lit_near_underscore", #"    let a = Account { username: "n", ab: 1, ac: 2 }"#, "NoSuchField", "`Account` has no field `username`", "did you mean `user_name`?\nor add the field to `Account`")
+}
+
+test "the nearest-name rule names no candidate on a tie or past the threshold" {
+    only("lit_near_tie", "    let p = Pair \{ ad: 1 }", "NoSuchField", "`Pair` has no field `ad`", "`Pair` declares: ab, ac\nor add the field to `Pair`")
+    only("lit_near_far", "    let p = Pair \{ abcdef: 1 }", "NoSuchField", "`Pair` has no field `abcdef`", "`Pair` declares: ab, ac\nor add the field to `Pair`")
+}
+
+test "a suggestion takes the place of the MissingField it would clear" {
+    only("lit_near_converges", #"    let a = Account { user_name: "n", ab: 1, acc: 2 }"#, "NoSuchField", "`Account` has no field `acc`", "did you mean `ac`?\nor add the field to `Account`")
+}

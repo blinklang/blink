@@ -10,7 +10,7 @@ import diagnostics.{
     diag_error_span, diag_set_last_fix_at, MUT_ON_PATTERN,
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
-    TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE,
+    TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE, VARIANT_FIELD_DEFAULT_HELP,
 }
 
 effect Parse {
@@ -3132,6 +3132,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                             expect(TokenKind.Colon)
                         }
                         let vf_type = parse_type_annotation()
+                        reject_variant_field_default()
                         let vf = node_count()
                         // int_val marks a POSITIONAL field (synthesized `_N` name) so
                         // the formatter round-trips `Variant(Type)` rather than leaking
@@ -3177,6 +3178,7 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                     let vf_name = expect_value(TokenKind.Ident)
                     expect(TokenKind.Colon)
                     let vf_type = parse_type_annotation()
+                    reject_variant_field_default()
                     let vf = node_count()
                     node_push(AstNode {
                         kind: NodeKind.TypeField, name: vf_name, value: vf_type,
@@ -5057,7 +5059,7 @@ fn parse_postfix() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                         // Reconstruct dotted name
                         let dotted = flatten_field_access(node)
                         if dotted.is_some() {
-                            node = parse_struct_lit(dotted.unwrap())
+                            node = parse_struct_lit(dotted.unwrap(), node_line(node), node_col(node))
                         }
                     }
                 }
@@ -5403,7 +5405,7 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             return nd
         }
         if at(TokenKind.LBrace) && looks_like_struct_lit() {
-            return parse_struct_lit(name)
+            return parse_struct_lit(name, pm_line, pm_col)
         }
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.Ident, name: name, line: pm_line, col: pm_col })
@@ -5523,9 +5525,9 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     new_node(NodeKind.IntLit)
 }
 
-fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    let sl_line = peek_line()
-    let sl_col = peek_col()
+// The literal sits at its type name, where MissingField points; its end is the `}`, and each
+// field ends where its value does, so a tool can insert a field after the last one.
+fn parse_struct_lit(type_name: Str, sl_line: Int, sl_col: Int) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     expect(TokenKind.LBrace)
     skip_newlines_and_comments()
     let flds = new_sublist()
@@ -5551,7 +5553,7 @@ fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Re
         skip_newlines()
         let fval = parse_expr()
         let sf = node_count()
-        node_push(AstNode { kind: NodeKind.StructLitField, name: fname, value: fval, line: fld_line, col: fld_col })
+        node_push(AstNode { kind: NodeKind.StructLitField, name: fname, value: fval, line: fld_line, col: fld_col, end_line: tokens.lines.get(pos - 1).unwrap(), end_col: tokens.end_cols.get(pos - 1).unwrap() })
         sublist_push(flds, sf)
         if at(TokenKind.Comma) {
             advance()
@@ -5561,8 +5563,18 @@ fn parse_struct_lit(type_name: Str) -> Int ! Parse.Advance, Parse.Build, Diag.Re
     expect(TokenKind.RBrace)
     finalize_sublist(flds)
     let nd = node_count()
-    node_push(AstNode { kind: NodeKind.StructLit, type_name: type_name, fields: flds, line: sl_line, col: sl_col })
+    node_push(AstNode { kind: NodeKind.StructLit, type_name: type_name, fields: flds, line: sl_line, col: sl_col, end_line: tokens.lines.get(pos - 1).unwrap(), end_col: tokens.end_cols.get(pos - 1).unwrap() })
     nd
+}
+
+// A variant literal gives every field (§3.4), so a default has no meaning there. Skipping the
+// default's expression keeps one error, not a cascade of token errors after it.
+fn reject_variant_field_default() ! Parse.Advance, Parse.Build, Diag.Report {
+    if !at(TokenKind.Equals) { return }
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "a variant field takes no default", peek_line(), peek_col(), peek_end_col(), VARIANT_FIELD_DEFAULT_HELP)
+    advance()
+    skip_newlines_and_comments()
+    let _ = parse_expr()
 }
 
 fn parse_list_lit() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
