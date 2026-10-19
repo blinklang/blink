@@ -228,7 +228,6 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | MutFieldNotSupported | E1109 | `mut` keyword on struct field declaration | Parser | §2 |
 | UnexpectedAnnotation | E1110 | Annotation used in unsupported position | Parser | §2 |
 | UnknownIntrinsic | E1111 | Unknown compile-time intrinsic (`#name`) | Parser | §2.20 |
-| UnknownDerive | E1112 | `@derive` names a trait the compiler does not synthesize | Parser | §3.6.1 |
 | UnexpectedCharacter | E1113 | The lexer found a character that starts no token | Lexer | §2 |
 | EmptyUnicodeEscape | E1114 | `\u{}` with no hex digits | Lexer | §2.4 |
 | UnicodeEscapeTooLong | E1115 | `\u{...}` with more than 6 hex digits | Lexer | §2.4 |
@@ -321,6 +320,7 @@ A retired code and its name are never reused (see *Conventions*). `blink explain
 | CallSiteTypeArgs | E0307 | It refused explicit type application at a call, which §3.4 *Explicit Type Application* makes legal | TypeArgArity (E0303), NoIndexOperator (E0313), TypeArgsWithoutCall (E0314) |
 | WithPtrBodyTooComplex | E0816 | It rejected a `Bytes.with_ptr` body of more than one expression, an inlining limit of the old codegen; §9.1.3 lets the body be any `fn(Ptr[U8]) -> R` | None |
 | CloseableWithoutScope | — | The lint it named now covers every `Closeable` and `BlockHandler` value, under a new name. Its old code, W0600, belongs to `UnusedVariable` | ScopedValueWithoutWith (W0610) |
+| UnknownDerive | E1112 | It matched a `@derive` argument by spelling. A `@derive` argument now resolves by scope (§10.6) | NotDerivable (E1402) |
 | BitwisePrecedence | W0702 | It warned on a bitwise operator with a comparison operand. Bitwise operators now bind tighter than comparison (§2.19), and a mix of operator groups is a parse error | MixedOperatorPrecedence (E1127) |
 
 ---

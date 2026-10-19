@@ -63,7 +63,7 @@ import diagnostics.{
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME,
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
-    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, UNKNOWN_DERIVE_NAME,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, NOT_DERIVABLE,
     NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, diag_set_last_assist_at,
     OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
     POSITIONAL_AFTER_KEYWORD, DUPLICATE_KEYWORD_ARG, UNLABELED_KEYWORD_ARG,
@@ -9870,7 +9870,7 @@ fn tc_derive_obliges(listed: Str, tr: Str) -> Int {
 // here rather than keeping a second copy, because two copies disagree the day one gains a
 // name and the check that rejects an unknown name starts rejecting a legal one.
 pub fn tc_derive_names() -> List[Str] {
-    ["Serialize", "Deserialize", "Eq", "Ord", "Clone", "Hash", "Debug"]
+    ["Eq", "Ord", "Hash", "Clone", "Debug", "Serialize", "Deserialize"]
 }
 
 // The compiler-known trait a @derive argument denotes, or "" when it denotes none @derive
@@ -9888,13 +9888,48 @@ pub fn tc_derive_arg_trait(a: Int) -> Str {
 // kept the misspelling and lost the method silently.
 fn tc_reject_unknown_derives(td: Int) ! Diag.Report {
     for a in tc_decl_derive_args(td) {
-        let name = node_name(a)
-        if tc_derive_arg_trait(a) == "" {
-            diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME,
-                "unknown @derive name `{name}`; expected one of {tc_derive_names().join(", ")}",
-                a, "remove or replace this derive name")
+        if tc_derive_arg_trait(a) == "" { tc_report_not_derivable(a) }
+    }
+}
+
+// One E1402 for every argument that does not denote a derivable compiler-known trait, worded
+// for what the name does denote (sections/07 §10.6, ERROR_CATALOG E1402).
+fn tc_report_not_derivable(a: Int) ! Diag.Report {
+    let name = node_name(a)
+    let bare = strip_module_qualifier(name)
+    let key = tc_trait_ref_key(name, node_module(a))
+    let takes = "@derive takes {tc_derive_names().join(", ")} (§3.6.1)"
+    let decl = tc_trait_node_idx.get(key) ?? -1
+    if tc_trait_is_compiler_known(key) {
+        if key == "Display" {
+            diag_error_at_notes("NotDerivable", NOT_DERIVABLE,
+                "cannot derive `{name}`: this compiler does not synthesize it yet", a,
+                "implement `{name}` by hand", [takes])
+            return
+        }
+        diag_error_at_notes("NotDerivable", NOT_DERIVABLE,
+            "cannot derive `{name}`: it is not a derivable trait", a,
+            "implement `{name}` by hand", [takes])
+        return
+    }
+    if decl == -1 {
+        diag_error_at_notes("NotDerivable", NOT_DERIVABLE,
+            "cannot derive `{name}`: no trait named `{name}` is in scope", a,
+            "use one of the traits @derive takes", [takes])
+        return
+    }
+    let site = "{diag_normalize_path(diag_file_for_node(decl))}:{node_line(decl)}"
+    let mut notes = ["`{name}` here is `trait {bare}` ({site}), a user trait"]
+    let mut help = "implement `{name}` by hand"
+    if tc_trait_is_compiler_known(bare) {
+        notes.push("`{name}` here is `trait {bare}` ({site}), which shadows the compiler-known `{bare}` (blink.core)")
+        if tc_derive_names().contains(bare) {
+            help = "import blink.core.\{{bare} as Core{bare}\}\nthen write @derive(Core{bare})"
         }
     }
+    notes.push(takes)
+    diag_error_at_notes("NotDerivable", NOT_DERIVABLE,
+        "cannot derive `{name}`: it is not a compiler-known trait", a, help, notes)
 }
 
 // Every name written in every @derive on a declaration, as the annotation argument nodes.
