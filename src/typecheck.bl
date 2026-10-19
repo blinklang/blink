@@ -9615,7 +9615,7 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
             let vk = node_kind(v)
             let declared = resolve_alias_tid(get_struct_field_tid(stid, node_name(f)))
             if type_kind(declared) == TyKind.Fn {
-                tc_check_struct_lit_fn_field(stid, f, v, declared)
+                tc_check_struct_lit_fn_field(v, declared)
             }
             if vk == NodeKind.HandlerExpr {
                 tc_check_body(v)
@@ -9625,24 +9625,13 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
     }
 }
 
-// A function-typed field is a position that declares a fn type, like a parameter or an
-// annotated `let`, so its value is held to that type. Only function-typed fields are compared
-// here: a general field-value check is a wider change than a function value needs.
-fn tc_check_struct_lit_fn_field(stid: Int, f: Int, v: Int, declared: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if node_kind(v) == NodeKind.Closure {
-        tc_seed_closure_expected_fn(v, declared)
-        check_closure_body(v, declared)
-    }
-    // A generic struct's field names its own type parameters, which this literal binds
-    // elsewhere; such a field has no settled type to hold the value to here.
-    if tc_tid_has_bare_typevar(declared) != 0 { return }
-    let got = infer_type(v)
-    if tc_tid_is_no_info(got) != 0 || type_kind(got) != TyKind.Fn { return }
-    if tc_closure_checked_against(v, declared) { return }
-    let detail = tc_fn_mismatch_detail(declared, got)
-    if detail == "" { return }
-    let (declared_s, got_s) = tc_type_pair_strs(declared, got)
-    tc_type_error_naming("field `{node_name(f)}` of `{type_to_str(stid)}`: declared type {declared_s} but got {got_s}: {detail}", v, "", [declared, got])
+// A closure written as a function-typed field's value takes its parameter hints from the
+// field's type. The value itself is held to that type with every other field, by
+// tc_check_lit_field_values.
+fn tc_check_struct_lit_fn_field(v: Int, declared: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node_kind(v) != NodeKind.Closure { return }
+    tc_seed_closure_expected_fn(v, declared)
+    check_closure_body(v, declared)
 }
 
 // A field value inferred under the field's OWN type rather than under the whole literal's.
@@ -18345,10 +18334,14 @@ fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int)
             if var_idx != -1 { declared = lookup_evfield_type_by_name(var_idx, node_name(f)) }
             // At an instance (`Tree[Option[Str]]`) a field is typed at the instance's arguments.
             if declared != -1 { declared = resolve_alias_tid(tc_subst_evfield_from_instance(declared, enum_tid)) }
+            // A closure or handler value is typed too, so tc_check_lit_field_values can hold it
+            // to the field.
             if node_kind(v) == NodeKind.Closure && type_kind(declared) == TyKind.Fn {
-                check_closure_body(v, declared)
+                tc_check_struct_lit_fn_field(v, declared)
+                let _ = infer_type(v)
             } else if node_kind(v) == NodeKind.HandlerExpr {
                 tc_check_body(v)
+                let _ = infer_type(v)
             } else {
                 let saved_hint = tc_construct_hint
                 if declared != -1 && tc_tid_is_no_info(declared) == 0 { tc_construct_hint = declared }
@@ -23047,6 +23040,185 @@ fn tc_infer_unclaimed_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     }
 }
 
+// A brace literal's own type: a struct, or a struct-style variant of an enum.
+fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let sname = node_type_name(node)
+    if sname != "" {
+        match sname.byte_index_of(".", 0) {
+            Some(dot) => {
+                // A qualified struct-style variant `E.V { .. }` is named by its PREFIX —
+                // 03_types.md:1040 rule 1: "if the site is already written `Enum.Variant {
+                // ... }`, that names the variant directly". This must be tried BEFORE
+                // lookup_named_type(sname) below, which strips the qualifier and looks up
+                // the SUFFIX. That is right for the module-qualified struct literal it was
+                // written for (`mod.Type { .. }`, suffix IS the type) and wrong here: the
+                // suffix is the variant name, never a type (E0518 makes struct-vs-variant a
+                // declaration-time error). Getting the order wrong would infer TYPE_UNKNOWN,
+                // which unifies with anything — and worse, an unrelated enum that happened
+                // to be NAMED like the variant would hijack the lookup and reject correct
+                // code.
+                //
+                // Mirrors the bare global-unique variant path below exactly rather than returning the bare
+                // enum tid, so a generic enum reverse-infers its instance (`Tree[Int]`);
+                // the two spellings must "emit identical code" (03_types.md:1036). The decl
+                // node comes from tc_type_decl_nodes keyed by the ENUM — NOT from
+                // tc_variant_enum_decl_node, which is first-declared-wins per variant name
+                // and would hand back the other enum's decl for a shared name, the very
+                // confusion this block exists to end.
+                //
+                // Guarded on the prefix being a TyKind.Enum that HAS the variant, so a
+                // module qualifier still falls through untouched. A prefix enum without the
+                // named variant also falls through, staying TYPE_UNKNOWN as before — that
+                // needs an unknown-variant diagnostic which does not exist yet, and covers
+                // the unit and tuple spellings too.
+                let qual = sname.byte_slice(0, dot)
+                let vname = sname.byte_slice(dot + 1, sname.byte_len())
+                let qtid = lookup_named_type(qual)
+                if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
+                    check_deprecated_type(qual, node)
+                    let edecl = tc_decl_node_for_type(type_to_str(qtid))
+                    tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(qtid, vname)), node)
+                    return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
+                }
+                let etid = lookup_named_type(sname)
+                if etid != -1 {
+                    check_deprecated_type(sname, node)
+                    if tc_head_constructible_struct(etid) == 0 {
+                        tc_report_unconstructible_head(etid, sname, node)
+                        return tc_error_recovery_tid()
+                    }
+                    // `mod.Type { .. }` is the same construction as `Type { .. }` and must
+                    // answer the same way — the bare spelling reverse-infers its instance and
+                    // types its field values, this one returned the head and looked at nothing,
+                    // so every field value under a qualified literal carried no type.
+                    return tc_struct_lit_instance_tid(etid, node)
+                }
+            }
+            None => {
+                // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
+                //    rebind a locally-determined site).
+                let site_t = tc_bare_variant_site_type(sname, node, None)
+                match tc_bare_variant_from_type(sname, None, site_t) {
+                    BareVariantPick.Declared(_, hint_var_idx) => {
+                        tc_check_brace_literal(tc_variant_literal_owner(hint_var_idx), node)
+                        // A hint that still names an enclosing literal's own T (`b: Tree[T]`
+                        // before T is settled) says nothing about the arguments, so the values
+                        // settle them, as with no hint at all. Values that settle nothing keep
+                        // the hint, which is right inside a generic fn.
+                        let hint_t = resolve_alias_tid(site_t)
+                        if tc_tid_has_bare_typevar(hint_t) != 0 {
+                            let base = tc_enum_base_tid(hint_t)
+                            let inst = tc_enum_structlit_instance_tid(base, evar_pool.get(hint_var_idx).unwrap().enum_decl, sname, node_fields(node))
+                            if inst != base { return inst }
+                            return site_t
+                        }
+                        // The hint answers the literal's own type without looking inside it, so the
+                        // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
+                        // left the inner literal's fields with nothing.
+                        tc_infer_enum_structlit_field_values(hint_t, sname, node_fields(node))
+                        return site_t
+                    }
+                    _ => {}
+                }
+                // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
+                //    User-first: a user type shadowing a builtin name (`type Char { .. }`)
+                //    resolves here and stays constructible, matching how the annotation and
+                //    field-access paths resolve the same name.
+                let stid = lookup_named_type(sname)
+                if stid != -1 {
+                    check_deprecated_type(sname, node)
+                    if tc_head_constructible_struct(stid) == 0 {
+                        tc_report_unconstructible_head(stid, sname, node)
+                        return tc_error_recovery_tid()
+                    }
+                    // Reverse-infer the concrete instance tid (Box[Int]) from the
+                    // field values so the literal carries its specialization, not the
+                    // bare generic tid. Falls back to the bare stid when no concrete
+                    // bind is discoverable (all-typevar / empty collection fields).
+                    return tc_struct_lit_instance_tid(stid, node)
+                }
+                // A builtin type used as a struct-literal head — scalar (`Int { }`) or
+                // structural (`List { }`, `Map { }`, `Option { }`) — is not a product struct
+                // and cannot be built with `{ ... }`. A user type of the same name was handled
+                // above (user-first), so this fires only for a genuine builtin, which
+                // lookup_named_type (name-map only) never finds.
+                if is_primitive_type(sname) != 0 {
+                    tc_report_unconstructible_head(-1, sname, node)
+                    return tc_error_recovery_tid()
+                }
+                // 3) global-unique variant.
+                match tc_bare_variant_from_program(sname, node, None) {
+                    BareVariantPick.Declared(venum, var_idx) => {
+                        // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
+                        // infers its concrete instance tid; non-generic keeps bare.
+                        let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
+                        tc_check_brace_literal(tc_variant_literal_owner(var_idx), node)
+                        return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
+                    }
+                    BareVariantPick.Ambiguous(carrier, enums) => {
+                        tc_report_ambiguous_construction(sname, carrier, enums, node)
+                        return tc_error_recovery_tid()
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Nothing above claimed this node, so nothing has typed it — an absence.
+    return -1
+}
+
+// Each written value is held to its field's declared type, read at the literal's own instance
+// (sections/02_syntax.md §2.14), so a field the literal's type parameters reach is checked at
+// the arguments the literal settled on. A copy-update source must be the literal's own type
+// (§2.16).
+fn tc_check_lit_field_values(node: Int, lit_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_tid_is_no_info(lit_t) != 0 { return }
+    let r = resolve_alias_tid(lit_t)
+    let k = type_kind(r)
+    if k != TyKind.Struct && k != TyKind.Enum { return }
+    let flds_sl = node_fields(node)
+    if flds_sl == -1 { return }
+    // A variant literal is spelled `V` or `E.V`; its last segment names the variant.
+    let mut vname = ""
+    let mut var_idx = -1
+    if k == TyKind.Enum {
+        let segs = node_type_name(node).split(".")
+        vname = segs.get(segs.len() - 1) ?? ""
+        var_idx = get_variant_by_name(tc_enum_base_tid(r), vname)
+        if var_idx == -1 { return }
+    }
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let f = sublist_get(flds_sl, fi)
+        fi = fi + 1
+        let v = node_value(f)
+        if v == -1 { continue }
+        let got = tc_lookup_node_tid(v)
+        if tc_tid_is_no_info(got) != 0 { continue }
+        if node_kind(f) == NodeKind.SpreadExpr {
+            // A variant literal's spread is VariantSpread, reported with the literal's labels.
+            if k == TyKind.Struct && types_compatible(r, got) == 0 {
+                let (ws, gs) = tc_type_pair_strs(r, got)
+                tc_report_declared_mismatch("spread source of `{type_to_str(r)}`: expected {ws} but got {gs}", v, v, r, got)
+            }
+            continue
+        }
+        let fname = node_name(f)
+        let declared = tc_lit_field_tid_at(var_idx, fname, r)
+        if declared == -1 { continue }
+        let want = resolve_alias_tid(declared)
+        if tc_tid_is_no_info(want) != 0 { continue }
+        if assignment_types_compatible(want, got, v) != 0 { continue }
+        // A closure's own check ran before the literal's T was read, so it stands for this one
+        // only when the literal has no type arguments.
+        if ty_pool.get(r).unwrap().params_count == 0 && tc_closure_checked_against(v, want) { continue }
+        let owner = if k == TyKind.Enum { "{type_to_str(r)}.{vname}" } else { type_to_str(r) }
+        let (ws, gs) = tc_type_pair_strs(want, got)
+        tc_report_declared_mismatch("field `{fname}` of `{owner}`: declared type {ws} but got {gs}{tc_fn_mismatch_suffix(want, got)}", v, v, want, got)
+    }
+}
+
 pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // §2.9: infer_type_uncached resets tc_if_value_ctx to 1 at entry (its consuming child
     // descents are all value positions) and only its pass-through arms restore the incoming
@@ -25688,119 +25860,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     }
 
     if kind == NodeKind.StructLit {
-        let sname = node_type_name(node)
-        if sname != "" {
-            match sname.byte_index_of(".", 0) {
-                Some(dot) => {
-                    // A qualified struct-style variant `E.V { .. }` is named by its PREFIX —
-                    // 03_types.md:1040 rule 1: "if the site is already written `Enum.Variant {
-                    // ... }`, that names the variant directly". This must be tried BEFORE
-                    // lookup_named_type(sname) below, which strips the qualifier and looks up
-                    // the SUFFIX. That is right for the module-qualified struct literal it was
-                    // written for (`mod.Type { .. }`, suffix IS the type) and wrong here: the
-                    // suffix is the variant name, never a type (E0518 makes struct-vs-variant a
-                    // declaration-time error). Getting the order wrong would infer TYPE_UNKNOWN,
-                    // which unifies with anything — and worse, an unrelated enum that happened
-                    // to be NAMED like the variant would hijack the lookup and reject correct
-                    // code.
-                    //
-                    // Mirrors the bare path (:10131) exactly rather than returning the bare
-                    // enum tid, so a generic enum reverse-infers its instance (`Tree[Int]`);
-                    // the two spellings must "emit identical code" (03_types.md:1036). The decl
-                    // node comes from tc_type_decl_nodes keyed by the ENUM — NOT from
-                    // tc_variant_enum_decl_node, which is first-declared-wins per variant name
-                    // and would hand back the other enum's decl for a shared name, the very
-                    // confusion this block exists to end.
-                    //
-                    // Guarded on the prefix being a TyKind.Enum that HAS the variant, so a
-                    // module qualifier still falls through untouched. A prefix enum without the
-                    // named variant also falls through, staying TYPE_UNKNOWN as before — that
-                    // needs an unknown-variant diagnostic which does not exist yet, and covers
-                    // the unit and tuple spellings too.
-                    let qual = sname.byte_slice(0, dot)
-                    let vname = sname.byte_slice(dot + 1, sname.byte_len())
-                    let qtid = lookup_named_type(qual)
-                    if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
-                        check_deprecated_type(qual, node)
-                        let edecl = tc_decl_node_for_type(type_to_str(qtid))
-                        tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(qtid, vname)), node)
-                        return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
-                    }
-                    let etid = lookup_named_type(sname)
-                    if etid != -1 {
-                        check_deprecated_type(sname, node)
-                        if tc_head_constructible_struct(etid) == 0 {
-                            tc_report_unconstructible_head(etid, sname, node)
-                            return tc_error_recovery_tid()
-                        }
-                        // `mod.Type { .. }` is the same construction as `Type { .. }` and must
-                        // answer the same way — the bare spelling reverse-infers its instance and
-                        // types its field values, this one returned the head and looked at nothing,
-                        // so every field value under a qualified literal carried no type.
-                        return tc_struct_lit_instance_tid(etid, node)
-                    }
-                }
-                None => {
-                    // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
-                    //    rebind a locally-determined site).
-                    let site_t = tc_bare_variant_site_type(sname, node, None)
-                    match tc_bare_variant_from_type(sname, None, site_t) {
-                        BareVariantPick.Declared(_, hint_var_idx) => {
-                            tc_check_brace_literal(tc_variant_literal_owner(hint_var_idx), node)
-                            // The hint answers the literal's own type without looking inside it, so the
-                            // field VALUES still need typing — `QeHolder { err: NotFound { msg: "x" } }`
-                            // left the inner literal's fields with nothing.
-                            tc_infer_enum_structlit_field_values(resolve_alias_tid(site_t), sname, node_fields(node))
-                            return site_t
-                        }
-                        _ => {}
-                    }
-                    // 2) struct (Kind A guarantees a name is never both a struct AND a variant).
-                    //    User-first: a user type shadowing a builtin name (`type Char { .. }`)
-                    //    resolves here and stays constructible, matching how the annotation and
-                    //    field-access paths resolve the same name.
-                    let stid = lookup_named_type(sname)
-                    if stid != -1 {
-                        check_deprecated_type(sname, node)
-                        if tc_head_constructible_struct(stid) == 0 {
-                            tc_report_unconstructible_head(stid, sname, node)
-                            return tc_error_recovery_tid()
-                        }
-                        // Reverse-infer the concrete instance tid (Box[Int]) from the
-                        // field values so the literal carries its specialization, not the
-                        // bare generic tid. Falls back to the bare stid when no concrete
-                        // bind is discoverable (all-typevar / empty collection fields).
-                        return tc_struct_lit_instance_tid(stid, node)
-                    }
-                    // A builtin type used as a struct-literal head — scalar (`Int { }`) or
-                    // structural (`List { }`, `Map { }`, `Option { }`) — is not a product struct
-                    // and cannot be built with `{ ... }`. A user type of the same name was handled
-                    // above (user-first), so this fires only for a genuine builtin, which
-                    // lookup_named_type (name-map only) never finds.
-                    if is_primitive_type(sname) != 0 {
-                        tc_report_unconstructible_head(-1, sname, node)
-                        return tc_error_recovery_tid()
-                    }
-                    // 3) global-unique variant.
-                    match tc_bare_variant_from_program(sname, node, None) {
-                        BareVariantPick.Declared(venum, var_idx) => {
-                            // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
-                            // infers its concrete instance tid; non-generic keeps bare.
-                            let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
-                            tc_check_brace_literal(tc_variant_literal_owner(var_idx), node)
-                            return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
-                        }
-                        BareVariantPick.Ambiguous(carrier, enums) => {
-                            tc_report_ambiguous_construction(sname, carrier, enums, node)
-                            return tc_error_recovery_tid()
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        // Nothing above claimed this node, so nothing has typed it — an absence.
-        return -1
+        let lit_t = tc_infer_struct_lit_type(node)
+        tc_check_lit_field_values(node, lit_t)
+        return lit_t
     }
 
     if kind == NodeKind.TupleLit {

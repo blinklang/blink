@@ -1,0 +1,238 @@
+// Each value written into a literal must have its field's declared type (§2.14 "Checking a
+// Literal's Fields", §3.3). A literal that stores a Str in an Int field compiles to C that
+// reads the Str pointer back as a number, so the check has to happen at the literal.
+//
+// The rule holds for every literal that names fields: a struct literal, a variant brace
+// literal, a copy-update with `..source`, and a literal nested inside another one. A field
+// that a type parameter reaches is read at the arguments the literal settled on, so two
+// fields that disagree about T are an error, and so is a value that fits T but not the
+// List[T] the field declares. A Handler field holds a handler for its own effect only.
+//
+// The controls are what must not change: values that fit report nothing, an int literal fits
+// a sized integer field (§3.3 "Numeric literals"), and a generic literal inside a generic
+// function is checked at the function's own T.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// Warnings name the same binders this test is about, so only errors are read here.
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat(d.message).concat("\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) {
+    let line = line_of(field_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+fn assert_clean_at(marker: Str) {
+    let line = line_of(field_src(), marker)
+    let msgs = errors_on_line(line)
+    if msgs != "" { io.println("FAIL: line {line} ({marker}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn field_src() -> Str {
+    #"effect SvMetrics { effect Emit { fn counter(name: Str, value: Int) } }
+
+type SvColor { SvRed, SvGreen }
+type SvP {
+    n: Int = 0
+    b: U8 = 0
+}
+type SvQ { inner: SvP }
+type SvR { name: Str }
+type SvPair[T] {
+    first: T
+    second: T
+}
+type SvBox[T] { value: List[T] }
+type SvShape { SvCircle(r: Float), SvSquare(side: Int) }
+type SvEnv { h: Handler[IO] }
+type SvFlag { on: Bool }
+type SvFnBox[T] {
+    v: T
+    f: fn(T) -> T
+}
+type SvOp { SvApply { f: fn(Int) -> Int }, SvRun { h: Handler[IO] } }
+type SvGOp[T] { SvGApply { v: T, f: fn(T) -> T } }
+type SvTree[T] { SvLeaf { v: T }, SvNode { l: SvTree[T], r: SvTree[T] } }
+type SvTwo[T] {
+    a: SvTree[T]
+    b: SvTree[T]
+}
+
+fn sv_metrics() -> Handler[SvMetrics] {
+    handler SvMetrics { fn counter(name: Str, value: Int) { let _ = name.len() + value } }
+}
+fn sv_find() -> Option[Str] { None }
+fn sv_twin[T](x: T) -> SvPair[T] { SvPair { first: x, second: x } }  // R_OK_GENERIC_FN
+fn sv_keep[T](x: T) -> SvFnBox[T] { SvFnBox { v: x, f: fn(y: T) -> T { y } } }  // R_OK_FN_FIELD_IN_GENERIC_FN
+
+fn main() {
+    let _p1 = SvP { n: "not an int" }  // R_TICKET
+    let _p2: SvPair[Int] = SvPair { first: 1, second: "x" }  // R_PAIR_ANNOTATED
+    let _p3 = SvPair { first: 1, second: "x" }  // R_PAIR_CONFLICT
+    let _b1: SvBox[Int] = SvBox { value: 5 }  // R_BOX_ELEMENT
+    let _b2 = SvBox { value: "s" }  // R_BOX_INFERRED
+    let _e1 = SvEnv { h: sv_metrics() }  // R_HANDLER
+    let _s1 = SvShape.SvCircle { r: "x" }  // R_VARIANT_BRACE_QUALIFIED
+    let _s2 = SvSquare { side: 1.5 }  // R_VARIANT_BRACE_BARE
+    let _s3 = SvShape.SvCircle(r: "x")  // R_VARIANT_PAREN_LABELLED
+    let p = SvP { n: 1, b: 3 }  // R_OK_INT_LITERALS
+    let _p4 = SvP { n: "z", ..p }  // R_COPY_UPDATE
+    let q = SvQ { inner: p }
+    let _p5 = SvP { ..q }  // R_SPREAD_OTHER_TYPE
+    let _q1 = SvQ { inner: SvP { n: "y" } }  // R_NESTED
+    let _p6 = SvP { n: SvColor.SvRed }  // R_ENUM_INTO_INT
+    let _r1 = SvR { name: sv_find() }  // R_OPTION_INTO_STR
+    let _p7 = SvPair { first: 1, second: 2 }  // R_OK_PAIR_INFERRED
+    let _p8: SvPair[Str] = SvPair { first: "a", second: "b" }  // R_OK_PAIR_ANNOTATED
+    let _b3 = SvBox { value: [1, 2] }  // R_OK_BOX
+    let _p9 = SvP { b: 7, ..p }  // R_OK_COPY_UPDATE
+    let _t1 = sv_twin(3)
+    let _s4 = SvShape.SvCircle { r: 1.5 }  // R_OK_VARIANT_BRACE
+    let _f1 = SvFlag { on: 2 }  // R_INT_INTO_BOOL
+    let _g1 = SvFnBox { v: "abc", f: fn(x: Int) -> Int { x + 1 } }  // R_FN_FIELD_GENERIC
+    let _g2 = SvFnBox { v: 1, f: fn(x: Int) -> Int { x + 1 } }  // R_OK_FN_FIELD_GENERIC
+    let _o1 = SvOp.SvApply { f: fn(x: Str) -> Str { x } }  // R_FN_FIELD_VARIANT
+    let _o2 = SvOp.SvApply { f: fn(x: Int) -> Int { x } }  // R_OK_FN_FIELD_VARIANT
+    let _o3 = SvOp.SvRun { h: handler SvMetrics { fn counter(name: Str, value: Int) { let _ = name.len() + value } } }  // R_HANDLER_VARIANT
+    let _o4 = SvGOp.SvGApply { v: "abc", f: fn(x: Int) -> Int { x + 1 } }  // R_FN_FIELD_GENERIC_VARIANT
+    let t: SvTree[Int] = SvLeaf { v: 1 }
+    let _w1 = SvTwo { a: t, b: SvLeaf { v: "s" } }  // R_BARE_VARIANT_UNDER_FIELD
+    let _w2 = SvTwo { a: t, b: SvLeaf { v: 2 } }  // R_OK_BARE_VARIANT_UNDER_FIELD
+}
+"#
+}
+
+test "a value of the wrong type in a struct field is an error" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_TICKET", "field `n` of `SvP`: declared type Int but got Str")
+    assert_error_at("R_ENUM_INTO_INT", "field `n` of `SvP`: declared type Int but got SvColor")
+    assert_error_at("R_OPTION_INTO_STR", "field `name` of `SvR`: declared type Str but got Option[Str]")
+}
+
+test "a field a type parameter reaches is checked at the literal's arguments" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_PAIR_ANNOTATED", "field `second` of `SvPair[Int]`: declared type Int but got Str")
+    assert_error_at("R_PAIR_CONFLICT", "field `second` of `SvPair[Int]`: declared type Int but got Str")
+    assert_error_at("R_BOX_ELEMENT", "field `value` of `SvBox[Int]`: declared type List[Int] but got Int")
+    assert_error_at("R_BOX_INFERRED", "field `value`")
+}
+
+test "a handler field takes a handler for its own effect only" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_HANDLER", "field `h` of `SvEnv`: declared type Handler[IO] but got Handler[SvMetrics]")
+}
+
+test "a variant literal checks each labelled value" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_VARIANT_BRACE_QUALIFIED", "field `r` of `SvShape.SvCircle`")
+    assert_error_at("R_VARIANT_BRACE_QUALIFIED", "declared type Float but got Str")
+    assert_error_at("R_VARIANT_BRACE_BARE", "field `side` of `SvShape.SvSquare`: declared type Int but got Float")
+    assert_error_at("R_VARIANT_PAREN_LABELLED", "expects Float, got Str")
+}
+
+test "a copy-update checks its labels and its source" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_COPY_UPDATE", "field `n` of `SvP`: declared type Int but got Str")
+    assert_error_at("R_SPREAD_OTHER_TYPE", "spread source of `SvP`: expected SvP but got SvQ")
+}
+
+test "a literal nested in a field is checked too" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_NESTED", "field `n` of `SvP`: declared type Int but got Str")
+}
+
+test "values that fit their fields report nothing" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_clean_at("R_OK_INT_LITERALS")
+    assert_clean_at("R_OK_PAIR_INFERRED")
+    assert_clean_at("R_OK_PAIR_ANNOTATED")
+    assert_clean_at("R_OK_BOX")
+    assert_clean_at("R_OK_COPY_UPDATE")
+    assert_clean_at("R_OK_GENERIC_FN")
+    assert_clean_at("R_OK_VARIANT_BRACE")
+    assert_clean_at("R_OK_FN_FIELD_GENERIC")
+    assert_clean_at("R_OK_FN_FIELD_IN_GENERIC_FN")
+    assert_clean_at("R_OK_FN_FIELD_VARIANT")
+    assert_clean_at("R_OK_BARE_VARIANT_UNDER_FIELD")
+}
+
+// A closure's own annotations decide its type, so a closure that fits only after T is read at
+// the literal's arguments is still held to the field.
+test "a closure in a function field is checked at the literal's arguments" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_FN_FIELD_GENERIC", "field `f` of `SvFnBox[Str]`")
+    assert_error_at("R_FN_FIELD_GENERIC_VARIANT", "field `f` of `SvGOp[Str].SvGApply`")
+}
+
+test "a variant literal checks a closure or handler value" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_FN_FIELD_VARIANT", "closure parameter 1 `x`: declared type Int but written Str")
+    assert_error_at("R_HANDLER_VARIANT", "field `h` of `SvOp.SvRun`: declared type Handler[IO] but got Handler[SvMetrics]")
+}
+
+// The field's type has T unsolved when the other fields have not been read yet, so the bare
+// variant must still settle its own arguments for the literal to compare them.
+test "a bare variant under a generic field is checked at the literal's arguments" {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    assert_error_at("R_BARE_VARIANT_UNDER_FIELD", "field `b` of `SvTwo[Int]`")
+}
+
+test.failing(
+    "an Int in a Bool field is an error",
+    reason: "the shared assignment check still lets an Int stand for a Bool; Bool becomes distinct from Int at every site at once (sections/03_types.md §3.4)",
+) {
+    let _p = probe("build/tc_struct_lit_values_src.bl", field_src())
+    // Not assert_error_at: its FAIL line on stdout would break the --test-json report the
+    // corpus reads to count this row as a known failure.
+    let msgs = errors_on_line(line_of(field_src(), "R_INT_INTO_BOOL"))
+    assert(msgs.contains("field `on` of `SvFlag`: declared type Bool but got Int"))
+}

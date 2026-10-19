@@ -1,0 +1,128 @@
+// A struct literal whose value does not fit its field's declared type is a TypeError in
+// `blink check` and in both builds alike (§2.14 "Checking a Literal's Fields"). Such a program
+// would build and then read a value of one type as another at run time, so no path may let
+// it through. Each row runs check and both builds and wants the same error from all three.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_struct_lit_field_types.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+// check and both builds fail without an internal or C compiler error, and each output holds
+// every one of `wants`.
+fn rejects(main: Str, sim: Str, wants: List[Str]) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let mut wrong: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { wrong.push("missing {w}") }
+        }
+        let crashed = r.out.contains("internal compiler error") || r.out.contains("error: cc")
+        if r.exit_code == 0 || wrong.len() > 0 || crashed {
+            bad.push("blink {args}: exit {r.exit_code}, {wrong.join(", ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+fn expect_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+test "a Str in an Int field is rejected by check and both builds" {
+    let main = #"type P {
+    n: Int
+}
+
+fn main() {
+    let p = P { n: "not an int" }
+    io.println("{p.n}")
+}
+"#
+    expect_none(rejects(main, "", ["error[TypeError]: field `n` of `P`: declared type Int but got Str", "src/main.bl:6:"]))
+}
+
+test "a field read back at the type its literal settled on is rejected at the literal" {
+    let main = #"type Box[T] {
+    value: List[T]
+}
+
+fn main() {
+    let b: Box[Int] = Box { value: 5 }
+    let n = b.value.len()
+    io.println("{n}")
+}
+"#
+    expect_none(rejects(main, "", ["field `value` of `Box[Int]`: declared type List[Int] but got Int", "src/main.bl:6:"]))
+}
+
+test "a handler for another effect is rejected in a Handler field" {
+    let main = #"effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+}
+
+type Env {
+    h: Handler[IO]
+}
+
+fn mk() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str, value: Int) { io.println("{name}={value}") }
+    }
+}
+
+fn main() {
+    let e = Env { h: mk() }
+    with e.h { io.println("laundered") }
+}
+"#
+    expect_none(rejects(main, "", ["declared type Handler[IO] but got Handler[Metrics]", "src/main.bl:18:"]))
+}
+
+test "a literal of a type from another module is checked against that module's fields" {
+    let main = #"import geo.sim.{Point}
+
+fn main() {
+    let p = Point { x: 1, y: "two" }
+    io.println("{p.x}")
+}
+"#
+    let sim = #"pub type Point {
+    x: Int
+    y: Int
+}
+"#
+    expect_none(rejects(main, sim, ["field `y` of `Point`: declared type Int but got Str", "src/main.bl:4:"]))
+}
+
+test "a closure that fits another instance is rejected in a generic variant literal" {
+    let main = #"type Op[T] {
+    Apply { v: T, f: fn(T) -> T }
+}
+
+fn main() {
+    let o = Op.Apply { v: "abc", f: fn(x: Int) -> Int { x + 1 } }
+    match o {
+        Apply { v, f } => io.println(f(v))
+    }
+}
+"#
+    expect_none(rejects(main, "", ["field `f` of `Op[Str].Apply`: declared type Fn(Str) -> Str but got Fn(Int) -> Int", "src/main.bl:6:"]))
+}
