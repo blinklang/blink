@@ -1,0 +1,131 @@
+// A cleanup that panics while a test unwinds is an E0824 entry in the record's
+// `cleanup_warnings`, on a record of any status, and does not change the status
+// (spec §8.10, Cleanup warnings). The human output prints one warning line per entry
+// under the test's result line, for every status, passing tests included. Each row runs
+// a fixture under `build/blink test --json` and under human output, with stderr merged
+// into stdout so the order of the lines shows.
+//
+// Each fixture gets its warning from a cleanup that panics while an `assert_panics`
+// unwinds, then ends with the status under test. An armed unwind is the one that runs
+// cleanups in a plain test body today (spec §4.7.2).
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
+
+type Run { json: Str, json_exit: Int, human: Str, human_exit: Int }
+
+fn run_fixture(tag: Str, lines: List[Str]) -> Run {
+    let name = "cw_status_{tag}_{getpid()}"
+    let scratch = ".tmp/_test_cleanup_warnings_status_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, lines.join("\n"))
+    let j = process_run("build/blink", ["test", "--json", fixture])
+    let h = process_run("sh", ["-c", "build/blink test {fixture} 2>&1"])
+    shell_exec("rm -rf {scratch}")
+    Run { json: j.out.concat(j.err_out), json_exit: j.exit_code, human: h.out, human_exit: h.exit_code }
+}
+
+fn diag(r: Run) -> Str {
+    "json exit={r.json_exit}:\n{r.json}\nhuman exit={r.human_exit}:\n{r.human}"
+}
+
+// A resource whose close always panics.
+fn bad_close() -> List[Str] {
+    [
+        #"type Bad { id: Int }"#,
+        #"impl Closeable for Bad {"#,
+        #"    fn close(self) {"#,
+        #"        let xs: List[Int] = []"#,
+        #"        io.println("{xs.get(self.id).unwrap()}")"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ]
+}
+
+// The human result line for `name` comes before its warning line.
+fn assert_warning_under(human: Str, result_line: Str, d: Str) {
+    let at = human.index_of(result_line)
+    let warn = human.index_of("  warning: E0824 cleanup panicked during unwind: ")
+    assert(at.is_some(), "no human result line `{result_line}`; {d}")
+    assert(warn.is_some(), "no human E0824 warning line; {d}")
+    assert(at.unwrap() < warn.unwrap(), "the warning line is not under the result line; {d}")
+}
+
+// A test whose cleanup panics under an armed unwind, then runs `rest`.
+fn warn_then(name: Str, rest: List[Str]) -> List[Str] {
+    let mut lines = bad_close()
+    lines.push("test \"{name}\" \{")
+    lines.push(#"    assert_panics(matching: "first") {"#)
+    lines.push(#"        with Bad { id: 1 } as _b { panic("first") }"#)
+    lines.push(#"    }"#)
+    for line in rest { lines.push(line) }
+    lines.push("}")
+    lines.push("")
+    lines
+}
+
+test "a passed record carries the cleanup warning and an ok line has it under it" {
+    let r = run_fixture("passed", warn_then("caught", [#"    assert(true)"#]))
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"caught","status":"passed""#), "the record is not passed; {d}")
+    assert(r.json.contains(#""cleanup_warnings":[{"code":"E0824","message":"#), "the passed record has no cleanup warning; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert_warning_under(r.human, "test caught ... ", d)
+}
+
+test "a failed record carries the cleanup warning and keeps its failure" {
+    let r = run_fixture("failed", warn_then("fails", [#"    assert_eq(1, 2)"#]))
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"fails","status":"failed""#), "the record is not failed; {d}")
+    assert(r.json.contains(#""cause":"assertion""#), "the record lost its assertion cause; {d}")
+    assert(r.json.contains(#""cleanup_warnings":[{"code":"E0824","message":"#), "the failed record has no cleanup warning; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert_warning_under(r.human, "test fails ... ", d)
+}
+
+test "a panicked record carries the cleanup warning" {
+    let r = run_fixture("panicked", warn_then("panics", [#"    panic("second")"#]))
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"panics","status":"panicked""#), "the record is not panicked; {d}")
+    assert(r.json.contains(#""message":"panic: second at "#), "the record lost the escaped panic; {d}")
+    assert(r.json.contains(#""cleanup_warnings":[{"code":"E0824","message":"#), "the panicked record has no cleanup warning; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert_warning_under(r.human, "test panics ... ", d)
+}
+
+test "a skipped record carries the cleanup warning" {
+    let r = run_fixture("skipped", warn_then("skips", [#"    skip("not here")"#]))
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"skips","status":"skipped""#), "the record is not skipped; {d}")
+    assert(r.json.contains(#""cleanup_warnings":[{"code":"E0824","message":"#), "the skipped record has no cleanup warning; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert_warning_under(r.human, "test skips ... ", d)
+}
+
+test "an expected red under test.failing carries the cleanup warning" {
+    let mut lines = bad_close()
+    for line in [
+        #"test.failing("knownred", reason: "not yet") {"#,
+        #"    assert_panics(matching: "first") {"#,
+        #"        with Bad { id: 1 } as _b { panic("first") }"#,
+        #"    }"#,
+        #"    panic("second")"#,
+        #"}"#,
+        #""#,
+    ] { lines.push(line) }
+    let r = run_fixture("xfail", lines)
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"knownred","status":"passed""#), "the record is not passed; {d}")
+    assert(r.json.contains(#""cleanup_warnings":[{"code":"E0824","message":"#), "the expected red has no cleanup warning; {d}")
+    assert(r.json.contains(#""xfail_observed":"panicked""#), "the record does not observe the panic; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert_warning_under(r.human, "test knownred ... ", d)
+}
