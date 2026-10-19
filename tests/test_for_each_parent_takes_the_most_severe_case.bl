@@ -1,0 +1,142 @@
+// A for_each parent test takes the most severe status among its cases, in the order
+// panicked > failed > passed (spec §8.10.2). Each case entry is one of the four test
+// statuses, a panicked entry carries the panic message, and every case that ran has
+// an entry. Each row runs a fixture under `build/blink test --json` and under human
+// output.
+//
+// Which case the parent names when two cases share the most severe status is not
+// settled by the spec; today the first one wins, and the rows below keep that.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
+
+type Run { json: Str, json_exit: Int, human: Str, human_exit: Int }
+
+fn run_fixture(tag: Str, lines: List[Str]) -> Run {
+    let name = "fe_severe_{tag}_{getpid()}"
+    let scratch = ".tmp/_test_for_each_severe_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, lines.join("\n"))
+    let j = process_run("build/blink", ["test", "--json", fixture])
+    let h = process_run("build/blink", ["test", fixture])
+    shell_exec("rm -rf {scratch}")
+    Run { json: j.out.concat(j.err_out), json_exit: j.exit_code, human: h.out.concat(h.err_out), human_exit: h.exit_code }
+}
+
+fn diag(r: Run) -> Str {
+    "json exit={r.json_exit}:\n{r.json}\nhuman exit={r.human_exit}:\n{r.human}"
+}
+
+fn occurrences(s: Str, part: Str) -> Int {
+    s.split(part).len() - 1
+}
+
+test "a panicking case after a failed case makes the parent panicked" {
+    let r = run_fixture("failthenpanic", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "failthenpanic" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        if v == 2 { panic("boom b") }"#,
+        #"        assert(v == 2, "case a is wrong")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"failthenpanic","status":"panicked""#), "the parent is not panicked; {d}")
+    assert(r.json.contains(#""case":"b""#), "the parent does not name case b; {d}")
+    assert(!r.json.contains(#""cause":"#), "the panicked parent carries a cause; {d}")
+    assert(!r.json.contains(#""user_message":"case a is wrong""#), "the parent kept case a's failure; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"failed"},{"label":"b","status":"panicked","message":"panic: boom b at "#), "cases[] is not a failed, b panicked; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("failthenpanic::case[b] ... "), "the human line does not name case b; {d}")
+    assert(r.human.contains("PANIC"), "the human line does not say PANIC; {d}")
+    assert(r.human.contains("  panic: boom b at "), "the human output does not carry case b's message; {d}")
+    assert(r.human.contains("0 failed, 1 panicked (of 1)"), "the human summary does not count one panic; {d}")
+}
+
+test "a failed case after a panicking case leaves the parent panicked" {
+    let r = run_fixture("panicthenfail", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "panicthenfail" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        if v == 1 { panic("boom a") }"#,
+        #"        assert(v == 1, "case b is wrong")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"panicthenfail","status":"panicked""#), "the parent is not panicked; {d}")
+    assert(r.json.contains(#""case":"a""#), "the parent does not name case a; {d}")
+    assert(r.json.contains(#""message":"panic: boom a at "#), "the parent does not carry case a's message; {d}")
+    assert(!r.json.contains(#""user_message":"#), "case b's failure took the parent; {d}")
+    assert(r.json.contains(#"{"label":"b","status":"failed"}]"#), "case b is not failed; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("panicthenfail::case[a] ... "), "the human line does not name case a; {d}")
+    assert(r.human.contains("PANIC"), "the human line does not say PANIC; {d}")
+}
+
+test "two panicking cases leave the parent with the first" {
+    let r = run_fixture("twopanics", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "twopanics" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        panic("boom {v}")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"twopanics","status":"panicked""#), "the parent is not panicked; {d}")
+    assert(r.json.contains(#""case":"a""#), "the parent does not name case a; {d}")
+    assert(r.json.contains(#"{"label":"a","status":"panicked","message":"panic: boom 1 at "#), "case a is not panicked with its message; {d}")
+    assert(r.json.contains(#"{"label":"b","status":"panicked","message":"panic: boom 2 at "#), "case b is not panicked with its message; {d}")
+}
+
+test "a case that passes is passed in cases[]" {
+    let r = run_fixture("allpass", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "allpass" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        assert(v > 0)"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"allpass","status":"passed""#), "the parent is not passed; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"passed"},{"label":"b","status":"passed"}]"#), "cases[] is not a passed, b passed; {d}")
+    assert(!r.json.contains(#""status":"pass""#), "a case status is outside the status enum; {d}")
+}
+
+test "every case that ran has an entry in cases[]" {
+    let r = run_fixture("manycases", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "manycases" {"#,
+        #"    let mut cases: List[(Str, Int)] = []"#,
+        #"    for i in 0..300 { cases.push(("c{i}", i)) }"#,
+        #"    for_each(cases, fn(v: Int) {"#,
+        #"        assert(v != 299, "the last case")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert_eq(occurrences(r.json, #""status":"passed"}"#), 299, d)
+    assert(r.json.contains(#"{"label":"c299","status":"failed"}]"#), "the last case is missing from cases[]; {d}")
+    assert(r.json.contains(#""case":"c299""#), "the parent does not name the last case; {d}")
+    assert(!r.json.contains("dropped"), "cases[] drops entries; {d}")
+}
