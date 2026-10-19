@@ -1,0 +1,72 @@
+// Name resolution keeps one declaration of each name in a module namespace, so no program
+// reaches codegen with two declarations under one C symbol. The driver still checks: a
+// mangler that gave one C name twice would hand cc a unit that defines the symbol twice,
+// or one where every call reaches whichever copy C kept. Each row renames a declaration
+// after the front end has passed, which is the one way to build that state.
+
+import std.fs
+import std.io
+import layout.{layout_reset}
+import cname.{cname_reset}
+import cg.{CgConfig, generate}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named}
+import mono.{run_mono}
+import parser.{node_name, node_params, node_set_name, node_stmts, sublist_get, sublist_length}
+
+fn assert_eq_int(label: Str, got: Int, want: Int) {
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+fn build_probe(name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let src = #"fn first() -> Int { 1 }
+
+fn second() -> Int { 2 }
+
+let third = 3
+
+fn main() { io.println("{first()} {third}") }
+"#
+    let path = "build/{name}.bl"
+    let program = cg_probe_compile(path, src)
+    run_mono(program)
+    layout_reset()
+    cname_reset()
+    let _ = fs.delete(path)
+    program
+}
+
+fn standalone_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
+}
+
+fn decl_named(sl: Int, name: Str) -> Int {
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let d = sublist_get(sl, i)
+        if node_name(d) == name { return d }
+        i = i + 1
+    }
+    -1
+}
+
+test "a program whose declarations each have their own C symbol raises nothing" {
+    let program = build_probe("cg_csym_clean_probe")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("no shared-symbol refusal", cg_probe_ices_named("TwoDeclarationsOneCSymbol"), 0)
+}
+
+test "two functions under one C symbol are refused" {
+    let program = build_probe("cg_csym_two_fns_probe")
+    node_set_name(decl_named(node_params(program), "second"), "first")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the shared symbol is named once", cg_probe_ices_named("TwoDeclarationsOneCSymbol"), 1)
+}
+
+test "a global and a function under one C symbol are refused" {
+    let program = build_probe("cg_csym_global_fn_probe")
+    node_set_name(decl_named(node_stmts(program), "third"), "first")
+    let _text = generate(program, standalone_cfg())
+    assert_eq_int("the shared symbol is named once", cg_probe_ices_named("TwoDeclarationsOneCSymbol"), 1)
+}

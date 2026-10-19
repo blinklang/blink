@@ -11,12 +11,12 @@
 
 import diagnostics.{
     Diag, diag_ice, diag_ice_at, diag_ice_count, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
-    UNVERIFIED_IR_AT_PRINT, TYPEDEF_QUEUED_NOT_WRITTEN,
+    UNVERIFIED_IR_AT_PRINT, TYPEDEF_QUEUED_NOT_WRITTEN, TWO_DECLARATIONS_ONE_C_SYMBOL,
 }
 import cname.{
     c_archive_header_guard, c_layer_archive_header_guard, c_layer_archive_header_name, c_module_header_guard, c_module_init_globals_name,
     c_module_private_header_guard, c_program_types_header_guard, c_program_types_header_name,
-    c_string_literal, c_test_fn_name,
+    c_global_name, c_string_literal, c_test_fn_name,
 }
 import ast.{NodeKind, nk_of}
 import parser.{
@@ -38,7 +38,7 @@ import cg_reg.{
     cg_reg_test_decls, cg_reg_type_decls,
 }
 import cg_decl.{
-    BodySite, cg_decl_body_site, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_ev, cg_decl_emit_ev_owned_by_archive, cg_decl_emit_ev_typedef, cg_decl_emit_io_derived_bodies,
+    BodySite, cg_decl_body_site, cg_decl_c_name, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_ev, cg_decl_emit_ev_owned_by_archive, cg_decl_emit_ev_typedef, cg_decl_emit_io_derived_bodies,
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_foreign_wrapper,
     cg_decl_emit_impl_method_decl,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
@@ -116,6 +116,44 @@ fn begin_unit(program: Int) ! Diag.Report {
     reset_unit_state()
     cg_reg_reset()
     cg_reg_build(program)
+    refuse_shared_c_symbols()
+}
+
+// Name resolution keeps one declaration of each name in a module namespace, so two
+// declarations that still meet under one C symbol were named alike by the mangler. C
+// would reject the unit, or the linker would bind every call to one of the two, so the
+// driver stops first. One report is enough: every unit of a program reads one registry.
+fn refuse_shared_c_symbols() ! Diag.Report {
+    if diag_ice_count > 0 { return }
+    let mut owners: Map[Str, Int] = Map()
+    let mut named: List[Int] = []
+    for d in cg_reg_fn_decls().append(cg_reg_impl_methods()) {
+        match cg_decl_body_site(d) {
+            BodySite.ThisUnit => named.push(d)
+            BodySite.ForeignWrapper => named.push(d)
+            _ => {}
+        }
+    }
+    let mut symbols: List[Str] = []
+    for d in named { symbols.push(cg_decl_c_name(d)) }
+    for g in cg_reg_global_decls() {
+        named.push(g)
+        symbols.push(c_global_name(g))
+    }
+    let mut i = 0
+    while i < named.len() {
+        let d = named.get(i).unwrap()
+        let symbol = symbols.get(i).unwrap()
+        let first = owners.get(symbol) ?? -1
+        if first >= 0 {
+            diag_ice_at("TwoDeclarationsOneCSymbol", TWO_DECLARATIONS_ONE_C_SYMBOL,
+                "`{node_name(first)}` and `{node_name(d)}` both became the C symbol `{symbol}`", d,
+                "each declaration needs its own C symbol; this is a compiler bug")
+            return
+        }
+        owners.insert(symbol, d)
+        i = i + 1
+    }
 }
 
 // Every piece of codegen state but the registry, which cg_reg_build makes from the program

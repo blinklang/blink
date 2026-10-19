@@ -1,0 +1,356 @@
+// Module scope has two namespaces (sections/02_syntax.md §2.12.1). The value namespace holds
+// `let`, `let mut`, `const` and `fn`; the type namespace holds `type`, type alias, `trait` and
+// `effect`. Two declarations of one name in one namespace are DuplicateModuleBinding (E1016),
+// whatever their kinds and signatures. The error sits on the later declaration in source order
+// and names the first, and the compiler checks the rest against the first, so a use of the
+// name reports nothing more. Each row runs check and both builds, so no duplicate reaches cc.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_module_dup_decls.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+// check and both builds fail with exactly `count` errors and no internal or C compiler error,
+// and each output holds every one of `wants` and none of `nots`.
+fn rejects(main: Str, sim: Str, count: Int, wants: List[Str], nots: List[Str]) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let mut wrong: List[Str] = []
+        if !r.out.contains("{count} error(s) found") { wrong.push("want {count} error(s)") }
+        for w in wants {
+            if !r.out.contains(w) { wrong.push("missing {w}") }
+        }
+        for n in nots {
+            if r.out.contains(n) { wrong.push("unwanted {n}") }
+        }
+        let crashed = r.out.contains("internal compiler error") || r.out.contains("error: cc")
+        if r.exit_code == 0 || wrong.len() > 0 || crashed {
+            bad.push("blink {args}: exit {r.exit_code}, {wrong.join(", ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+// check passes and both builds run and print `want`.
+fn runs(main: Str, sim: Str, want: Str) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let printed = args == "check" || r.out.contains(want)
+        if r.exit_code != 0 || !printed || r.out.contains("DuplicateModuleBinding") {
+            bad.push("blink {args}: exit {r.exit_code}, want {want}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+fn expect_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+fn twice(name: Str) -> Str { "error[DuplicateModuleBinding]: `{name}` is declared twice in module `main`" }
+
+let help = "help: rename one of the two declarations"
+
+test "two lets of one name are E1016 at the second" {
+    let prog = #"let a = 1
+let a = 2
+
+fn main() { io.println("{a}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("a"), "--> src/main.bl:2:5", "first declared at src/main.bl:1:5", help], []))
+}
+
+test "a let mut and a let of one name are E1016" {
+    let prog = #"let mut a = 1
+let a = 2
+
+fn main() { io.println("{a}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("a"), "--> src/main.bl:2:5", "first declared at src/main.bl:1:9"], []))
+}
+
+test "two consts of one name are E1016" {
+    let prog = #"const k = 1
+const k = 2
+
+fn main() { io.println("{k}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("k"), "--> src/main.bl:2:7", "first declared at src/main.bl:1:7"], []))
+}
+
+test "a const and a let of one name are E1016" {
+    let prog = #"const k = 1
+let k = 2
+
+fn main() { io.println("{k}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("k"), "--> src/main.bl:2:5", "first declared at src/main.bl:1:7"], []))
+}
+
+test "two fns of one name and one signature are E1016" {
+    let prog = #"fn f() -> Int { 1 }
+fn f() -> Int { 2 }
+
+fn main() { io.println("{f()}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("f"), "--> src/main.bl:2:4", "first declared at src/main.bl:1:4", help], []))
+}
+
+test "two fns of one name and different signatures are E1016 and the call adds nothing" {
+    let prog = #"fn f() -> Int { 1 }
+fn f(n: Int) -> Int { n }
+
+fn main() { io.println("{f()}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("f"), "--> src/main.bl:2:4", "first declared at src/main.bl:1:4"],
+        ["expects 1 argument"]))
+}
+
+test "a call that fits only the later fn adds nothing to the E1016" {
+    let prog = #"fn f(n: Int) -> Int { n }
+fn f() -> Int { 1 }
+
+fn main() { io.println("{f()}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("f"), "--> src/main.bl:2:4", "first declared at src/main.bl:1:4"],
+        ["expects 1 argument"]))
+}
+
+test "a let and a fn of one name are E1016 at whichever comes later in the file" {
+    let fn_first = #"fn thing() -> Int { 1 }
+let thing = 2
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(fn_first, "", 1, [twice("thing"), "--> src/main.bl:2:5", "first declared at src/main.bl:1:4"], []))
+    let let_first = #"let thing = 2
+fn thing() -> Int { 1 }
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(let_first, "", 1, [twice("thing"), "--> src/main.bl:2:4", "first declared at src/main.bl:1:5"], []))
+}
+
+test "two types of one name are E1016" {
+    let prog = #"type P {
+    x: Int
+}
+
+type P {
+    y: Int
+}
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("P"), "--> src/main.bl:5:6", "first declared at src/main.bl:1:6"], []))
+}
+
+test "two traits of one name are E1016" {
+    let prog = #"trait T {
+    fn a(self) -> Int
+}
+
+trait T {
+    fn b(self) -> Int
+}
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("T"), "--> src/main.bl:5:7", "first declared at src/main.bl:1:7"], []))
+}
+
+test "a type and a trait of one name are E1016" {
+    let prog = #"type T {
+    x: Int
+}
+
+trait T {
+    fn b(self) -> Int
+}
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("T"), "--> src/main.bl:5:7", "first declared at src/main.bl:1:6"], []))
+}
+
+test "a type alias and a type of one name are E1016" {
+    let prog = #"type A = Int
+
+type A {
+    x: Int
+}
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("A"), "--> src/main.bl:3:6", "first declared at src/main.bl:1:6"], []))
+}
+
+test "an effect and a type of one name are E1016" {
+    let prog = #"effect E {
+    effect Op {
+        fn op() -> Int
+    }
+}
+
+type E {
+    x: Int
+}
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("E"), "--> src/main.bl:7:6", "first declared at src/main.bl:1:8"], []))
+}
+
+test "two effects of one name are E1016" {
+    let prog = #"effect E {
+    effect Op {
+        fn op() -> Int
+    }
+}
+
+effect E {
+    effect Op2 {
+        fn op2() -> Int
+    }
+}
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("E"), "--> src/main.bl:7:8", "first declared at src/main.bl:1:8"], []))
+}
+
+test "a use that fits only the later let adds nothing to the E1016" {
+    let prog = #"let a = 1
+let a = "s"
+
+fn main() { io.println(a.to_upper()) }
+"#
+    expect_none(rejects(prog, "", 1, [twice("a")], []))
+}
+
+test "a use that fits only the later type adds nothing to the E1016" {
+    let prog = #"type P {
+    x: Int
+}
+
+type P {
+    y: Str
+}
+
+fn show(p: P) -> Str { p.y }
+
+fn main() { io.println(show(P { y: "s" })) }
+"#
+    expect_none(rejects(prog, "", 1, [twice("P")], []))
+}
+
+test "three declarations of one name give two errors, each pointing at the first" {
+    let prog = #"fn f() -> Int { 1 }
+fn f() -> Int { 2 }
+fn f() -> Int { 3 }
+
+fn main() { io.println("{f()}") }
+"#
+    expect_none(rejects(prog, "", 2, ["--> src/main.bl:2:4", "--> src/main.bl:3:4", "first declared at src/main.bl:1:4"],
+        ["first declared at src/main.bl:2:4"]))
+}
+
+test "a duplicate in another module is reported there and names that module" {
+    let sim = #"pub fn area() -> Int { 1 }
+pub fn area() -> Int { 2 }
+"#
+    let prog = #"import geo.sim
+
+fn main() { io.println("{sim.area()}") }
+"#
+    expect_none(rejects(prog, sim, 1, ["`area` is declared twice in module `geo.sim`", "--> src/geo/sim.bl:2:8",
+        "first declared at src/geo/sim.bl:1:8"], []))
+}
+
+test "a type and a fn of one name are in different namespaces" {
+    let prog = #"type P {
+    x: Int
+}
+
+fn P() -> Int { 7 }
+
+fn main() { io.println("{P()} {P { x: 3 }.x}") }
+"#
+    expect_none(runs(prog, "", "7 3"))
+}
+
+test "two modules may each declare one name" {
+    let sim = #"pub let size = 4
+
+pub fn area() -> Int { 2 }
+
+pub type Shape {
+    r: Int
+}
+"#
+    let prog = #"import geo.sim
+
+let size = 3
+
+fn area() -> Int { 1 }
+
+type Shape {
+    r: Int
+}
+
+fn main() { io.println("{size} {sim.size} {area()} {sim.area()} {Shape { r: 5 }.r}") }
+"#
+    expect_none(runs(prog, sim, "3 4 1 2 5"))
+}
+
+test "a type that shadows a builtin is not a duplicate, but two such types are" {
+    let one = #"type Option {
+    label: Str
+}
+
+fn main() { io.println(Option { label: "x" }.label) }
+"#
+    expect_none(runs(one, "", "x"))
+    let two = #"type Option {
+    label: Str
+}
+
+type Option {
+    tag: Int
+}
+
+fn main() { io.println("x") }
+"#
+    expect_none(rejects(two, "", 1, [twice("Option"), "--> src/main.bl:5:6", "first declared at src/main.bl:1:6"], []))
+}
+
+test "the E1016 fix is a suggestion, never machine-applicable" {
+    let dir = project(#"let a = 1
+let a = 2
+
+fn main() { io.println("{a}") }
+"#, "")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check --json src/main.bl < /dev/null 2>&1")
+    let _ = sh("rm -rf {dir}")
+    if !r.out.contains("\"code\":\"E1016\"") || r.out.contains("\"fix\"") { io.eprintln(r.out) }
+    assert(r.out.contains("\"code\":\"E1016\""))
+    assert(!r.out.contains("\"fix\""))
+}

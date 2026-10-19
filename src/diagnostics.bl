@@ -331,6 +331,11 @@ pub const PARSER_INTERNAL_LIMIT_NAME = "ParserInternalLimit"
 // the types header as written, so a block left there is a type each unit names and none
 // declares. The driver stops here instead of handing cc a header that leaves it out.
 pub const TYPEDEF_QUEUED_NOT_WRITTEN = "I0013"
+// I0014: two declarations reached code generation under one C symbol. Name resolution
+// rejects two declarations of one name in one module namespace, so a pair here is a C name
+// the mangler gave twice. The driver stops instead of handing cc a unit that defines one
+// symbol twice, or one where a call reaches whichever of the two C kept.
+pub const TWO_DECLARATIONS_ONE_C_SYMBOL = "I0014"
 
 // ── I0001 mangler sentinels ──────────────────────────────
 //
@@ -910,6 +915,17 @@ pub fn diag_error_at_notes(name: Str, code: Str, message: Str, node_id: Int, hel
     diag_source_file = saved_file
 }
 
+// An error at a column of the node's line that the caller found, for a node whose own column
+// is not where the caret belongs: a declaration starts at its keyword, and the error is about
+// its name.
+@allow(UnrestoredMutation, IncompleteStateRestore)
+pub fn diag_error_at_col_notes(name: Str, code: Str, message: Str, node_id: Int, col: Int, help: Str, notes: List[Str]) ! Diag.Report {
+    let saved_file = diag_source_file
+    diag_source_file = diag_file_for_node(node_id)
+    diag_emit_range_notes("error", name, code, message, node_line(node_id), col, 0, 0, help, notes)
+    diag_source_file = saved_file
+}
+
 pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: Str) ! Diag.Report {
     diag_emit("ice", name, code, message, line, col, help)
 }
@@ -1466,7 +1482,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E1052 -- PackageNotDeclared\n\nA Tier 2 stdlib package was imported without declaring it in blink.toml.\nTier 2 packages (std.http, std.db, std.log, std.config, std.net) require\nexplicit dependency declaration.\n\n  // blink.toml\n  [dependencies]\n  std/http = \"0.1\"\n\n  // then in your code:\n  import std.http  // OK with declaration\n\nTier 1 packages (std.json, std.toml, etc.) are always available."
     }
     if code == DUPLICATE_MODULE_BINDING {
-        return "E1016 -- DuplicateModuleBinding\n\nA module declares a module-level binding and a function under one\nname. Module scope is one flat namespace, so neither declaration is\ninner to the other and a bare name cannot say which one it means. The\ntwo also need one C symbol between them, and only one of them can have\nit.\n\nFix: rename one of them.\n\n  let mut count: List[Int] = []\n  fn count(i: Int) -> Int \{ ... \}   // E1016 -- `count` already binds\n\n  let mut counts: List[Int] = []\n  fn count(i: Int) -> Int \{ ... \}   // OK -- distinct names\n\nA module-scope let, let mut, const or fn must also not take the name\nof a variant of an enum in the same package, or of a prelude enum\n(Option, Result, Ordering). A bare name has one meaning at each site.\nA variant of a dependency's enum does not collide: there the value\ncomes first at a bare use.\n\n  type Color \{ Red, Green \}\n  fn Red() -> Int \{ 1 \}           // E1016 -- collides with Color.Red\n  let Ok = 5                       // E1016 -- collides with Result.Ok\n\nFix: rename the value. See section 2.12.1."
+        return "E1016 -- DuplicateModuleBinding\n\nA module declares one name twice in one namespace. Module scope has\ntwo namespaces: values (let, let mut, const, fn) and types (type, type\nalias, trait, effect). Module scope is flat, so neither declaration is\ninner to the other and a bare name cannot say which one it means. The\nkinds and signatures do not matter: two fns of one name collide even\nwhen their parameters differ, because Blink has no overloading. A type\nand a fn of one name do not collide.\n\n  let x = 1\n  let x = 2                        // E1016 -- `x` is declared twice\n  fn f() -> Int \{ 1 \}\n  fn f(n: Int) -> Int \{ n \}       // E1016 -- `f` is declared twice\n  type Shape \{ r: Int \}\n  trait Shape \{ fn area(self) -> Int \}   // E1016\n\nFix: rename one of the two declarations. The compiler cannot know\nwhich one to rename, so it applies no fix.\n\nA module-scope let, let mut, const or fn must also not take the name\nof a variant of an enum in the same package, or of a prelude enum\n(Option, Result, Ordering). A bare name has one meaning at each site.\nA variant of a dependency's enum does not collide: there the value\ncomes first at a bare use.\n\n  type Color \{ Red, Green \}\n  fn Red() -> Int \{ 1 \}           // E1016 -- collides with Color.Red\n  let Ok = 5                       // E1016 -- collides with Result.Ok\n\nFix: rename the value. See section 2.12.1."
     }
     if code == INLINE_MODULE_NOT_SUPPORTED {
         return "E1015 -- InlineModuleNotSupported\n\nInline modules (mod name \{ ... \}) are not supported in Blink.\nBlink uses file-based modules: one file = one module.\n\nFix: move the module contents into a separate file and use import.\n\n  // Instead of:\n  mod schema \{\n      fn validate() \{ ... \}\n  \}\n\n  // Create schema.bl with the contents and import it:\n  import schema\n  schema.validate()\n\nSee section 10.1 for details on Blink's module system."
