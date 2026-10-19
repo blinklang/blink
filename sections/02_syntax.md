@@ -954,7 +954,7 @@ error[E1016]: `Ok` collides with variant `Result.Ok` (prelude)
 
 The primary span is always on the value declaration, whatever the source order. The message names the variant's type and the module that declares it, and a `note:` gives the variant's location; when both are in one file, a secondary label marks the variant instead. A prelude variant has no source span, so the message says which prelude type has it. Each value declaration with a variant's name gives one diagnostic. As above, the fix is a suggestion only.
 
-**`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For compile-time constants, prefer `const` (see [2.21](#221-const-declarations)) — `let` at module level is for runtime-initialized values.
+**`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For a compile-time constant, use `const` (see [2.21](#221-const-declarations)). Use `let` for a value that a `const` cannot hold, such as a list or a function literal. Its initializer must be static (below).
 
 **`pub let mut` is forbidden.** Mutable module-level state must not be directly exposed to other modules. The compiler reports `PubLetMutForbidden` (E1013) for `pub let mut`.
 
@@ -963,13 +963,103 @@ The primary span is always on the value declaration, whatever the source order. 
 pub const api_version = "2.0"
 pub const default_timeout = 30
 
-// Runtime module state — use let
+// Module state — use let
 let mut connection_count = 0
 
 // INVALID — compile error E1013
 pub let mut shared_counter = 0  // error[PubLetMutForbidden]: `pub let mut` is forbidden
                                 // help: expose mutable state through functions that declare `! State` (§4.16)
 ```
+
+**A module-level initializer is static.** The initializer of a module-level `let` or `let mut` must be a *static expression*. No user code runs before `main` or a test block starts, and an initializer has no effects. A static expression is one of these:
+
+- A const expression (§2.21). This includes references to `const` bindings and type-scoped constants.
+- A list literal or tuple literal whose elements are static.
+- A struct literal whose field values are static.
+- An enum variant whose payloads are static.
+- An empty-collection constructor with no arguments: `[]`, `Map()`, `Set()`, `Map.new[K, V]()`, `Set.new[T]()`, `List.new()`, `List.new[T]()`.
+- A function literal. Its body does not run at initialization. The compiler checks the body as it checks any function body, and the body's effects go in the literal's type, not in the initializer. A body that reads a `let mut` gives the literal `State` in its row (§4.16).
+
+Nothing else is static. In particular, these are not:
+
+- A function call or method call, including other constructors such as `List.with_capacity(n)`.
+- A read of a module-level `let` or `let mut`. To share a value, make it a `const`, or write the value again.
+- `if`, `match`, a block, and `with`.
+- String interpolation, because it calls `Display`. A plain string literal is a const expression.
+- An operator that is not allowed in a const expression, such as an operator on a user type (§2.21).
+- `return` and `?`. An initializer has no enclosing function.
+
+The rule is the same for `let`, `let mut` and `pub let`. Because no initializer reads another module binding or runs a function, no initializer can see another one. The spec does not define the order in which module bindings are initialized, and the order cannot change any value. A cycle between initializers cannot occur.
+
+```blink
+const MAX_RETRIES = 5
+
+type Limits {
+    low: Int
+    high: Int
+}
+
+type Level { Debug, Info }
+
+// Valid — static initializers
+let retries = MAX_RETRIES * 2
+let names = ["ada", "bob"]
+let pair = (1, "one")
+let default_level = Level.Info
+let mut seen: Map[Str, Int] = Map()
+let mut queue: List[Int] = List.new()
+let mut tags: Set[Str] = Set.new[Str]()
+let mut limits = Limits { low: 0, high: MAX_RETRIES }
+let double = fn(n: Int) -> Int { n * 2 }
+
+fn build_table() -> Map[Str, Int] { Map() }
+fn parse(s: Str) -> Result[Int, Str] { Ok(s.len()) }
+
+// INVALID — compile error E1129
+let table = build_table()        // function call
+let first = names.get(0)         // method call
+let copy = names                 // read of module `let` `names`
+let label = "v{MAX_RETRIES}"     // string interpolation
+let mode = if retries > 3 { 1 } else { 0 }  // `if` expression
+let parsed = { parse("8080")? }  // block
+```
+
+The compiler reports `NonInitExpr` (E1129). There is one diagnostic for each initializer. The primary span is on the first part that is not static, in left-to-right order, and its label names the kind of that part: "function call", "method call", "`if` expression", "`match` expression", "block", "`with` expression", "string interpolation", "read of module `let` `x`", or "`?` has no enclosing function" (also for `return`). Each other part of the same initializer that is not static gets a secondary label, so one fix pass can repair them all. The diagnostic does not use `NonConstExpr` (E1101) or E0508/E0509, because those name a different rule.
+
+```
+error[NonInitExpr]: the initializer of module-level `table` is not static
+ --> src/main.bl:3:13
+  |
+3 | let table = build_table()
+  |             ^^^^^^^^^^^^^ function call
+  |
+  = note: a module-level initializer cannot run code before `main`
+  = help: compute the value in `main`, or fill a `let mut` on first use;
+          each function that reads the `let mut` has `State` in its row (§4.16)
+```
+
+For a read of a module `let`, the help says to make the source a `const`, or to write the value again. For `return` or `?`, the help says to move the code into a function that `main` calls.
+
+A value that must be computed, such as a lookup table, has two forms. Compute it in `main` and pass it to the functions that need it. Or fill a `let mut` the first time a function asks for it:
+
+```blink
+let mut port_table: Option[Map[Str, Int]] = None
+
+fn ports() -> Map[Str, Int] ! State {
+    match port_table {
+        Some(t) => t
+        None => {
+            let mut t: Map[Str, Int] = Map()
+            t.insert("http", 80)
+            t.insert("https", 443)
+            port_table = Some(t)
+            t
+        }
+    }
+}
+```
+
+The second form reads a `let mut`, so `ports` and each function that calls it have `State` in their row (§4.16.2), and a `pub` function among them must declare it (E0552).
 
 **Function-local shadowing is unaffected.** Within function bodies, `let` shadowing remains allowed (§2.2). This distinction reflects different scoping models: function bodies use sequential lexical scoping (each `let` opens a new scope), while modules use a flat namespace (all bindings coexist).
 
@@ -2519,7 +2609,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 
 ### 2.21 Const Declarations
 
-The `const` keyword declares compile-time constants. Unlike `let` (runtime-initialized, immutable), `const` bindings are evaluated by the compiler during compilation and their values are fixed at compile time. The right-hand side must be a **const expression**.
+The `const` keyword declares compile-time constants. Unlike a module-level `let`, whose value is set when the program starts, `const` bindings are evaluated by the compiler during compilation and their values are fixed at compile time. The right-hand side must be a **const expression**.
 
 ```blink
 const MAX_RETRIES = 5
@@ -2688,19 +2778,20 @@ There is no `const mut` — constants are inherently immutable. `const mut` is a
 
 | | `const` | `let` |
 |-|---------|-------|
-| Evaluation | Compile time | Program initialization |
-| RHS | Must be const expression | Any expression (runtime) |
+| Evaluation | Compile time | Program start, before `main` |
+| RHS | Must be const expression | Must be static expression (§2.12.1) |
 | Mutability | Never | `let mut` allowed |
 | `pub` export | Yes | Yes (immutable only) |
 
-Module-level `let` remains valid for runtime-initialized module state:
+Module-level `let` holds module state. Its initializer must be a static expression (§2.12.1). That set is wider than the const expressions: it adds list and tuple literals, empty-collection constructors and function literals. No other call is static.
 
 ```blink
 // Compile-time constant
 const MAX_RETRIES = 5
 
-// Runtime: initialized when the module loads
+// Module state: a static initializer, set before `main` runs
 let mut request_count = 0
+let mut seen: Map[Str, Int] = Map()
 ```
 
 The compiler folds const expressions at compile time. Arithmetic like `1024 * 64` gives `65536`, and struct consts have all fields resolved.
@@ -2715,6 +2806,7 @@ The compiler folds const expressions at compile time. Arithmetic like `1024 * 64
 | `NonConstKeywordDefault` | E1104 | Keyword argument default is not a const expression |
 | `NonConstRangeBound` | E1105 | Range pattern bound is not a const expression |
 | `ConstEvalPanic` | E0546 | Evaluation of a const expression would panic: integer `/` or `%` by zero, signed `MIN / -1`, or overflow |
+| `NonInitExpr` | E1129 | Initializer of a module-level `let` or `let mut` is not a static expression (§2.12.1) |
 
 ```
 error[NonConstExpr]: expression is not a compile-time constant
