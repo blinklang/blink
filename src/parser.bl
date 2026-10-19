@@ -1,5 +1,5 @@
 import tokens.{TokenKind, is_keyword, token_kind_name}
-import ast.{NodeKind, AstNode, ChildWalk, node_child_ids_into, node_unclaimed_child, nk_of, nk_is_typed, nk_bridge_gap, node_kind_name, trace, trace_mode, dbg_trace}
+import ast.{NodeKind, AstNode, ChildWalk, node_child_ids_into, node_unclaimed_child, nk_tag, nk_is_typed, node_kind_name, trace, trace_mode, dbg_trace}
 import lexer.{tokens}
 import std.path.{path_dirname}
 import diagnostics.{
@@ -57,7 +57,7 @@ effect Parse {
 // the old one unread.
 type NodeColumns {
     count: Int
-    kind: List[Int]
+    kind: List[NodeKind]
     ints: List[List[Int]]
     strs: List[List[Str]]
     shape_mask: List[Int]
@@ -222,6 +222,8 @@ type NodeJournal {
     old: List[Int]
     old2: List[Int]
     old_str: List[Str]
+    // The old kinds of JOURNAL_KIND records, each at the index its record holds as `old`.
+    old_kind: List[NodeKind]
     // The parsed end: the length of each Int and Str chunk, of child_slots and of the sublist
     // arena, and the sublist count, when the last parse ended. Empty before the first.
     marked: Bool
@@ -247,7 +249,7 @@ let JOURNAL_CHILD_AT = 3
 let JOURNAL_SUBLIST = 4
 
 fn node_journal_empty(keep: Bool) -> NodeJournal {
-    NodeJournal { keep: keep, floor: 0, sl_floor: 0, what: [], at: [], old: [], old2: [], old_str: [], marked: false, end_ints: [], end_strs: [], end_child_slots: 0, end_sublists: 0, end_arena: 0, order_firsts: [], order_ends: [], order_offsets: [], order_live: 0, order_floor: 0 }
+    NodeJournal { keep: keep, floor: 0, sl_floor: 0, what: [], at: [], old: [], old2: [], old_str: [], old_kind: [], marked: false, end_ints: [], end_strs: [], end_child_slots: 0, end_sublists: 0, end_arena: 0, order_firsts: [], order_ends: [], order_offsets: [], order_live: 0, order_floor: 0 }
 }
 
 let mut journal: NodeJournal = node_journal_empty(false)
@@ -323,7 +325,7 @@ pub fn parser_rewind() {
         } else if what == JOURNAL_STR {
             columns.strs.get(slot >> 32).unwrap().set(slot & 4294967295, journal.old_str.get(k).unwrap())
         } else if what == JOURNAL_KIND {
-            columns.kind.set(slot, journal.old.get(k).unwrap())
+            columns.kind.set(slot, journal.old_kind.get(journal.old.get(k).unwrap()).unwrap())
         } else if what == JOURNAL_CHILD_AT {
             columns.child_at.get(slot >> 12).unwrap().set(slot & 4095, journal.old.get(k).unwrap())
         } else {
@@ -337,6 +339,7 @@ pub fn parser_rewind() {
     journal.old.clear()
     journal.old2.clear()
     journal.old_str.clear()
+    journal.old_kind.clear()
     let n = journal.floor
     let chunks = (n + 4095) >> 12
     while columns.ints.len() > chunks {
@@ -564,8 +567,8 @@ fn node_mask(n: AstNode) -> Int {
 }
 
 // The shape whose fields are the bits of `m`, made on first use.
-fn node_shape(m: Int, kind: Int) -> Int {
-    let k = (kind & 255) * 2
+fn node_shape(m: Int, kind: NodeKind) -> Int {
+    let k = nk_tag(kind) * 2
     if columns.shape_memo.get(k).unwrap() == m { return columns.shape_memo.get(k + 1).unwrap() }
     let s = match columns.shape_of_mask.get(m) {
         Some(found) => found
@@ -986,7 +989,7 @@ fn node_strs_drop(c: Int, n: Int) {
 // writes them on nearly every node of that kind (name resolution the module of each binding,
 // comment attachment and pub marking a fn's), and a write outside the shape would move the
 // node's payload into a chunk already full.
-fn node_kind_fields(kind: Int) -> Int {
+fn node_kind_fields(kind: NodeKind) -> Int {
     if kind == NodeKind.FnDef { return 4644337115742208 }
     if kind == NodeKind.LetBinding || kind == NodeKind.Param || kind == NodeKind.ForIn { return 140737488355328 }
     0
@@ -1069,7 +1072,10 @@ fn node_replace(id: Int, n: AstNode) {
         let s2 = node_shape(m | held, n.kind)
         columns.ints.get(c).unwrap().set(j, node_store(n, s2, c))
     }
-    if kept && columns.kind.get(id).unwrap() != n.kind { journal_record(JOURNAL_KIND, id, columns.kind.get(id).unwrap(), 0, "") }
+    if kept && columns.kind.get(id).unwrap() != n.kind {
+        journal_record(JOURNAL_KIND, id, journal.old_kind.len(), 0, "")
+        journal.old_kind.push(columns.kind.get(id).unwrap())
+    }
     columns.kind.set(id, n.kind)
     // Most setters change a field that is not a child, so a run equal to the old one is
     // dropped again instead of growing the column on every write.
@@ -1808,7 +1814,7 @@ fn node_die(id: Int, where: Str) {
             let nk = columns.kind.get(i).unwrap()
             let nl = node_get_int(i, columns.at_line, node_blank.line)
             let nc = node_get_int(i, columns.at_col, node_blank.col)
-            io.eprintln("parser-dump: node[{i}] kind={nk} line={nl} col={nc}")
+            io.eprintln("parser-dump: node[{i}] kind={node_kind_name(nk)} line={nl} col={nc}")
             i = i + 1
         }
         // Largest sublist sizes — useful if a sublist length looks insane.
@@ -1828,7 +1834,7 @@ fn node_die(id: Int, where: Str) {
     parser_limit_stop("parser: {where}({id}) out of bounds; nodes.len()={columns.count}")
 }
 
-pub fn node_kind(id: Int) -> Int {
+pub fn node_kind(id: Int) -> NodeKind {
     columns.kind.get(checked_node_id(id, "node_kind")).unwrap()
 }
 pub fn node_int_val(id: Int) -> Int {
@@ -2397,7 +2403,7 @@ fn sub_effect_annotation_allowed(name: Str) -> Bool {
 }
 
 fn attach_pending_annotations(node: Int) ! Parse.Build, Diag.Report {
-    check_pending_sole_targets(nk_of(node_kind(node)))
+    check_pending_sole_targets(node_kind(node))
     if annotations.item.len() > 0 {
         let anns_sl = new_sublist()
         let mut ai = 0
@@ -5708,7 +5714,7 @@ fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
 // an identifier whose text is its own name. Any other part is a hole, including an
 // identifier with no text.
 pub fn interp_part_is_literal(part: Int) -> Bool {
-    if nk_of(node_kind(part)) != NodeKind.Ident { return false }
+    if node_kind(part) != NodeKind.Ident { return false }
     node_str_val(part) == node_name(part)
 }
 

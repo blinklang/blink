@@ -23,7 +23,7 @@ pub type NodeKind {
     CharLit,
     AssertPanics,
     // Not a node kind. Kept last so its tag is the number of real kinds, which is what
-    // nk_bridge_gap walks to prove the Int-to-NodeKind bridge is total.
+    // nk_bridge_gap walks to prove NK_ALL lists every kind.
     KindCount,
 }
 
@@ -61,7 +61,7 @@ pub type AstNode {
     trailing_comments: Str = ""
     doc_comment: Str = ""
     xfail_reason: Str = ""
-    kind: Int = 0
+    kind: NodeKind = NodeKind.IntLit
     int_val: Int = 0
     left: Int = -1
     right: Int = -1
@@ -109,11 +109,9 @@ pub type AstNode {
 
 
 
-// The name a node kind spells. A match over NodeKind, not over the stored Int: an enum is
-// nominally distinct from Int, so widening the kind to match it against `NodeKind.*` arms
-// is ill-typed, and it throws exhaustiveness away as well — a kind added without a
-// spelling would fall through a catch-all instead of failing to compile here.
-pub fn nk_name(k: NodeKind) -> Str {
+// The name a node kind spells. The match has no catch-all, so a kind added without a
+// spelling fails to compile here.
+pub fn node_kind_name(k: NodeKind) -> Str {
     match k {
         NodeKind.IntLit => "IntLit"
         NodeKind.FloatLit => "FloatLit"
@@ -189,20 +187,11 @@ pub fn nk_name(k: NodeKind) -> Str {
     }
 }
 
-// The same name for a kind held as a stored tag. The bridge crosses to NodeKind once and
-// asks the speller above, so the two answers cannot drift. A tag that names no kind is not
-// given a plausible-wrong one.
-pub fn node_kind_name(kind: Int) -> Str {
-    if kind < 0 { return "Unknown" }
-    if kind > nk_tag(NodeKind.KindCount) { return "Unknown" }
-    nk_name(nk_of(kind))
-}
-
 // Helper: does this node kind carry control-flow blocks whose non-tail
 // statements need walking? Single source of truth for the typecheck ExprStmt
 // re-dispatch (tc_check_body) so a future block-bearing kind cannot silently
 // lose statement-walking coverage there.
-pub fn is_block_bearing(kind: Int) -> Int {
+pub fn is_block_bearing(kind: NodeKind) -> Int {
     if kind == NodeKind.IfExpr { return 1 }
     if kind == NodeKind.MatchExpr { return 1 }
     if kind == NodeKind.WhileLoop { return 1 }
@@ -219,13 +208,11 @@ pub fn is_block_bearing(kind: Int) -> Int {
 
 // ── NodeKind as a value, and the child/type tables keyed on it ──────────────
 //
-// `AstNode.kind` is an Int, so a match on it can never be proved exhaustive: adding a
-// NodeKind would compile and every Int-keyed table would answer its catch-all instead.
 // The tables below are keyed on the NodeKind VALUE with no catch-all arm, so a new
 // variant fails the build until every table has an arm for it — which is the point, since
 // a walk that silently skips a kind is the bug these tables exist to make impossible.
-// NK_ALL and nk_tag bridge the stored Int to that value, and nk_bridge_gap proves the
-// bridge is total and order-faithful, the one part no match can check.
+// NK_ALL lists every kind and nk_tag gives a kind's tag, for a walk over every kind and a
+// table indexed by tag; nk_bridge_gap proves the two agree, the one part no match can check.
 
 // Every real kind, in declaration order: the index of an entry is its nk_tag.
 pub let NK_ALL: List[NodeKind] = [
@@ -249,7 +236,7 @@ pub let NK_ALL: List[NodeKind] = [
     NodeKind.CharLit, NodeKind.AssertPanics,
 ]
 
-// The Int spelling of a NodeKind, which is what AstNode.kind holds.
+// The tag of a NodeKind, for a table indexed by kind.
 pub fn nk_tag(k: NodeKind) -> Int {
     match k {
         NodeKind.IntLit => 0
@@ -326,17 +313,9 @@ pub fn nk_tag(k: NodeKind) -> Int {
     }
 }
 
-// The stored Int read back as a value. Out of range answers the sentinel, which every
-// table treats as childless and untyped.
-pub fn nk_of(kind: Int) -> NodeKind {
-    if kind < 0 { return NodeKind.KindCount }
-    if kind >= NK_ALL.len() { return NodeKind.KindCount }
-    NK_ALL.get(kind).unwrap()
-}
-
-// The first tag NK_ALL spells wrong, or -1 when the bridge is total and in order. A gap
-// here makes nk_of answer the WRONG kind for every node of that tag, so a caller treats a
-// non-negative answer as an internal error and not a warning.
+// The first tag NK_ALL spells wrong, or -1 when NK_ALL is total and in order. A gap here
+// makes a walk over NK_ALL skip a kind or read the WRONG kind for a tag, so a caller treats
+// a non-negative answer as an internal error and not a warning.
 pub fn nk_bridge_gap() -> Int {
     if NK_ALL.len() != nk_tag(NodeKind.KindCount) { return NK_ALL.len() }
     let mut t = 0
@@ -344,11 +323,9 @@ pub fn nk_bridge_gap() -> Int {
         let k = NK_ALL.get(t).unwrap()
         if nk_tag(k) != t { return t }
         // Two independent spellings of the same number: nk_tag's hand-written match, and the
-        // Int the enum itself stores in AstNode.kind — which is what the parser writes and
-        // node_kind reads back. nk_tag agreeing with NK_ALL proves nothing if both drifted
-        // from the enum, so the stored Int is compared too.
-        let probe = AstNode { kind: k }
-        if probe.kind != t { return t }
+        // enum's own tag. nk_tag agreeing with NK_ALL proves nothing if both drifted from the
+        // enum, so the enum's tag is compared too.
+        if k != t { return t }
         t = t + 1
     }
     -1
@@ -435,7 +412,7 @@ pub fn node_children(node: AstNode) -> NodeChildren {
 // for each node the parser pushes.
 pub fn node_child_ids_into(n: AstNode, walk: ChildWalk, out: List[Int]) {
     let s = ChildSink { walk: walk, out: out }
-    match nk_of(n.kind) {
+    match n.kind {
         NodeKind.IntLit => {}
         NodeKind.FloatLit => {}
         NodeKind.Ident => {}
