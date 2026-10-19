@@ -8241,6 +8241,46 @@ fn arith_backing_trait(op: Str, is_unary: Int) -> Str {
     "Sub"
 }
 
+// W1010 at a trait that shadows a compiler-known one, with the forms in this module that
+// still use the compiler-known trait and the alias import that names it (sections/07 §10.6).
+fn tc_warn_shadowed_trait(tr: Int) ! Diag.Report {
+    let name = node_name(tr)
+    let mut notes = ["shadows compiler-known trait `{name}` (blink.core)"]
+    let forms = tc_desugaring_forms(name)
+    if forms.len() > 0 {
+        let last = forms.get(forms.len() - 1).unwrap()
+        let listed = if forms.len() == 1 { last } else { "{forms.slice(0, forms.len() - 1).join(", ")} and {last}" }
+        notes.push("{listed} in this module still use `{name}` (blink.core)")
+    }
+    diag_warn_at_notes("ShadowedPreludeName", SHADOWED_PRELUDE_NAME, "name shadows compiler-known trait", tr,
+        "to use the compiler-known trait in this module, import it under another name:\nimport blink.core.\{{name} as Core{name}\}", notes)
+}
+
+// The forms a desugaring writes with the compiler-known trait `tr`, which go on using it in
+// a module that shadows `tr` (sections/03 §3.4 Hygiene, and the Used by column of Prelude
+// Traits in sections/07). The one list of them, so W1010 cannot drift from the desugarings.
+// `@derive` is never one: its argument resolves by scope.
+fn tc_desugaring_forms(tr: Str) -> List[Str] {
+    let mut forms: List[Str] = []
+    for op in ["+", "-", "*", "/", "%"] {
+        if arith_backing_trait(op, 0) == tr { forms.push("`{op}`") }
+    }
+    if arith_backing_trait("-", 1) == tr { forms.push("unary `-`") }
+    match tr {
+        "Eq" => ["`==`", "`!=`", "`assert_eq`", "`assert_ne`", "Map/Set keys"]
+        "Ord" => ["`<`", "`>`", "`<=`", "`>=`"]
+        "Hash" => ["Map/Set keys"]
+        "Debug" => ["`assert_eq`", "`assert_ne`"]
+        "Display" => ["string interpolation"]
+        "From" => ["the `.into()` that `From` derives"]
+        "Into" => ["`.into()`"]
+        "IntoIterator" => ["`for` loops"]
+        "Iterator" => ["`for` loops"]
+        "Closeable" => ["`with ... as`"]
+        _ => forms
+    }
+}
+
 fn arith_backing_method(op: Str, is_unary: Int) -> Str {
     if op == "+" { return "add" }
     if op == "*" { return "mul" }
@@ -13631,8 +13671,8 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let in_prelude = tc_prelude_modules.contains_key(node_module(tr))
             if is_sealed_builtin_trait(node_name(tr)) != 0 && is_user_sourced(tr) != 0 {
                 diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait `{node_name(tr)}` is a sealed built-in trait and cannot be redefined", tr, "rename your trait, or define your own trait with the methods you need")
-            } else if !in_prelude && prelude_traits.contains(node_name(tr)) {
-                diag_warn_at("ShadowedPreludeName", SHADOWED_PRELUDE_NAME, "trait `{node_name(tr)}` shadows prelude trait `{node_name(tr)}`", tr, "consider a different name to avoid confusion")
+            } else if !in_prelude && (prelude_traits.contains(node_name(tr)) || tc_undeclared_trait_names().contains(node_name(tr))) {
+                tc_warn_shadowed_trait(tr)
             }
             register_trait(tr)
             i = i + 1

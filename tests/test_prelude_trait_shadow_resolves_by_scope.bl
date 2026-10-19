@@ -63,6 +63,25 @@ fn expect_rejects(main: Str, sim: Str, wants: List[Str]) {
     assert(ok)
 }
 
+// Each of `wants` is in the output of check and of both builds, and all of them pass.
+fn expect_warns(main: Str, sim: Str, wants: List[Str]) {
+    let dir = project(main, sim)
+    let mut ok = true
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = blink(dir, args)
+        let mut missing: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { missing.push(w) }
+        }
+        if r.exit_code != 0 || missing.len() > 0 {
+            io.eprintln("blink {args}: exit {r.exit_code}, missing {missing.join(", ")}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
 let shadow_eq = #"trait Eq {
     fn eq(self, other: Int) -> Bool
 }
@@ -316,4 +335,50 @@ fn main() {
 }
 "#
     expect_rejects(main, "", ["`+` on T needs `Add (blink.core)`, but the bound `T: Add` names `Add (main)`", "then write `[T: CoreAdd]`"])
+}
+
+test "W1010 on a shadowing Eq lists the forms that still use the compiler-known Eq" {
+    let main = shadow_eq.concat(#"
+fn main() {
+    io.println("{1 == 1}")
+}
+"#)
+    expect_warns(main, "", [
+        "warning[ShadowedPreludeName]: name shadows compiler-known trait",
+        "shadows compiler-known trait `Eq` (blink.core)",
+        "`==`, `!=`, `assert_eq`, `assert_ne` and Map/Set keys in this module still use `Eq` (blink.core)",
+        "to use the compiler-known trait in this module, import it under another name:",
+        "import blink.core.\{Eq as CoreEq}",
+    ])
+}
+
+test "W1010 on a shadowing Add names + as a form that still uses the compiler-known Add" {
+    let main = #"trait Add {
+    fn add(self, other: Self) -> Self
+}
+
+fn main() {
+    io.println("{1 + 2}")
+}
+"#
+    expect_warns(main, "", [
+        "shadows compiler-known trait `Add` (blink.core)",
+        "`+` in this module still use `Add` (blink.core)",
+    ])
+}
+
+test "W1010 on a shadowing Clone has no forms note, since only @derive names Clone" {
+    let main = #"trait Clone {
+    fn dup(self) -> Self
+}
+
+fn main() {
+    io.println("ok")
+}
+"#
+    let dir = project(main, "")
+    let r = blink(dir, "check")
+    let _ = sh("rm -rf {dir}")
+    assert(r.out.contains("shadows compiler-known trait `Clone` (blink.core)"))
+    assert(!r.out.contains("in this module still use"))
 }
