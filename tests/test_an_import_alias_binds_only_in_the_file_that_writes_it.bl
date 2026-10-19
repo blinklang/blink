@@ -34,7 +34,8 @@ fn expect_runs(files: List[(Str, Str)], want: Str) {
     let mut ok = true
     for args in ["check", "run --no-per-module", "run --per-module"] {
         let r = blink_in(dir, args)
-        let good = r.exit_code == 0 && (args == "check" || r.out.trim().ends_with(want))
+        // An alias the file uses is no reason for any warning, an unused import least of all.
+        let good = r.exit_code == 0 && !r.out.contains("warning[") && (args == "check" || r.out.trim().ends_with(want))
         if !good {
             io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
             ok = false
@@ -155,4 +156,75 @@ test "two imports in one file that bind one alias to different items are refused
     expect_refused([alpha, beta,
         ("main", "import alpha.\{tag_a as t}\nimport beta.\{tag_b as t}\nfn main() \{ io.println(\"\{t()}\") }\n")],
         "error[AmbiguousImport]: `t` is imported twice", "")
+}
+
+// Check passes and says nothing about unused imports: the alias is what uses the entry.
+fn expect_import_used(files: List[(Str, Str)]) {
+    let dir = new_package(files)
+    let r = blink_in(dir, "check")
+    let good = r.exit_code == 0 && !r.out.contains("UnusedImport")
+    if !good { io.eprintln("blink check: exit {r.exit_code}\n{r.out}") }
+    cleanup(dir)
+    assert(good)
+}
+
+test "a call through an alias uses the import that writes it" {
+    expect_import_used([alpha, ("main", "import alpha.\{tag_a as t}\nfn main() \{ io.println(\"\{t()}\") }\n")])
+}
+
+test "a variant reached through a type alias uses the import that writes it" {
+    expect_import_used([job_state, ("main", "import jobs.\{JobState as JS}\nfn main() \{\n    match JS.Done \{\n        JS.Done => io.println(\"d\")\n        JS.Pending => io.println(\"p\")\n    }\n}\n")])
+}
+
+test "a type alias written only in annotations uses the import that writes it" {
+    expect_import_used([("jobs", "pub type Box \{\n    n: Int\n}\npub fn mk() -> Box \{ Box \{ n: 1 } }\n"),
+        ("main", "import jobs.\{Box as B, mk}\nfn show(b: B) -> Int \{ b.n }\nfn main() \{ io.println(\"\{show(mk())}\") }\n")])
+}
+
+let items = ("alpha", "pub type Box \{\n    n: Int\n}\npub let items = [1, 2, 3]\npub let cfg = Box \{ n: 4 }\n")
+
+test "an alias of a module-level binding reads that binding" {
+    expect_runs([items, ("main", "import alpha.\{items as xs, cfg as k}\nfn main() \{ io.println(\"\{xs.len()} \{k.n}\") }\n")], "3 4")
+}
+
+test "an alias of an immutable binding refuses a mutating method" {
+    expect_refused([items, ("main", "import alpha.\{items as xs}\nfn main() \{\n    xs.push(4)\n    io.println(\"\{xs.len()}\")\n}\n")],
+        "error[MutationRequiresMut]", "")
+}
+
+test "an alias of an immutable binding refuses an assignment, and does not call it undefined" {
+    expect_refused([items, ("main", "import alpha.\{items as xs}\nfn main() \{\n    xs = [9]\n    io.println(\"\{xs.len()}\")\n}\n")],
+        "error[MutationRequiresMut]", "UndefinedVariable")
+}
+
+test "a renamed function is a value under its alias" {
+    expect_runs([alpha, ("main", "import alpha.\{tag_a as t}\nfn main() \{\n    let h = t\n    io.println(\"\{h()}\")\n}\n")], "1")
+}
+
+test "a pure function may not call an effectful one through an alias" {
+    expect_refused([("alpha", "pub fn effectful() -> Int \{\n    io.println(\"x\")\n    1\n}\n"),
+        ("main", "import alpha.\{effectful as f}\n@pure\nfn g() -> Int \{ f() }\nfn main() \{ io.println(\"\{g()}\") }\n")],
+        "error[ImpureBodyForPureAnnotation]", "")
+}
+
+test "a type alias outranks a type another module declares under its spelling" {
+    expect_runs([("gamma", "pub type Sh \{\n    v: Int\n}\n"), ("alpha", "pub type Shape \{\n    r: Int\n}\n"),
+        ("user", "import alpha.\{Shape as Sh}\npub fn f(x: Sh) -> Int \{ x.r }\n"),
+        ("main", "import user\nimport alpha\nimport gamma\nfn main() \{\n    let g = gamma.Sh \{ v: 1 }\n    io.println(\"\{user.f(alpha.Shape \{ r: 5 })} \{g.v}\")\n}\n")], "5 1")
+}
+
+test "a use of a name two imports bind is not reported again, nor read from a third module" {
+    expect_refused([alpha, beta, ("gamma", "pub fn t() -> Int \{ 7 }\n"),
+        ("main", "import alpha.\{tag_a as t}\nimport beta.\{tag_b as t}\nimport gamma\nfn main() \{ io.println(\"\{t()} \{gamma.t()}\") }\n")],
+        "error[AmbiguousImport]: `t` is imported twice", "ImportNotSelected")
+}
+
+test "an import whose name an alias also binds is not reported unused" {
+    expect_refused([alpha, beta,
+        ("main", "import alpha.\{tag_a as tag_b}\nimport beta.\{tag_b}\nfn main() \{ io.println(\"\{tag_b()}\") }\n")],
+        "error[AmbiguousImport]: `tag_b` is imported twice", "UnusedImport")
+}
+
+test "a standard library function runs under an alias" {
+    expect_runs([("main", "import std.path.\{path_basename as bn}\nfn main() \{ io.println(bn(\"/a/b\")) }\n")], "b")
 }

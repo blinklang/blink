@@ -720,15 +720,6 @@ fn tc_struct_tid_declared_as(bare: Str) -> Int {
     -1
 }
 
-// The named_type_map key a type declaration is registered under: the bare name, or the
-// module-qualified one for a name two modules declare.
-fn tc_named_type_key_of_decl(decl: Int) -> Str {
-    let bare = node_name(decl)
-    let m = node_module(decl)
-    if tc_is_namesake_type_name(bare) == 0 || tc_module_key_is_main(m) != 0 { return bare }
-    "{m}.{bare}"
-}
-
 // What the bare type name `bare` means inside module `reader`: the module's own declaration,
 // else the one its import list selects, else the bare spelling (the main file's, if any).
 fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
@@ -1460,10 +1451,28 @@ pub fn tc_set_prelude_modules(mods: List[Str]) {
 
 fn tc_mark_symbol_used(name: Str) {
     if nr_current_module != "" && nr_current_module != "__main__" { return }
+    if tc_mark_alias_used(name) { return }
     match tc_symbol_module.get(name) {
         Some(mod_name) => tc_used_modules.insert(mod_name, 1)
         None => {}
     }
+}
+
+// An alias is known only to the import index of the file that writes it, so no symbol table
+// maps its spelling to a module: the entries that bind it are what it uses. When an alias and
+// a plain selection bind one spelling, the clash is the one report, so neither entry is
+// called unused on top of it.
+fn tc_mark_alias_used(name: Str) -> Bool {
+    let binds = nr_module_import_index(nr_current_module).get(name) ?? []
+    let mut renames = false
+    for b in binds {
+        if b.member != name { renames = true }
+    }
+    if !renames { return false }
+    for b in binds {
+        tc_used_modules.insert(b.source_mod, 1)
+    }
+    true
 }
 
 // The dotted module a top-level symbol resolves to, or "" if unknown.
@@ -1478,6 +1487,7 @@ pub fn tc_get_symbol_module(name: Str) -> Str {
 
 fn tc_mark_qualifier_used(qualifier: Str) {
     if nr_current_module != "" && nr_current_module != "__main__" { return }
+    if tc_mark_alias_used(qualifier) { return }
     tc_used_modules.insert(qualifier, 1)
     match tc_qualifier_to_module.get(qualifier) {
         Some(mod_name) => tc_used_modules.insert(mod_name, 1)
@@ -2980,6 +2990,21 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
 
 pub fn lookup_named_type(name: Str) -> Int {
     let dot = name.byte_index_of(".", 0)
+    // A selective import may rename what it selects, and the file then writes the alias. No
+    // declaration carries that spelling, so the pool holds nothing under it: the declaration
+    // is registered under its original name. The alias outranks any type another module
+    // declares under the same spelling, since in this file the spelling means the import.
+    // The key comes from the declaration the import reaches, not from the original spelling,
+    // since this file may declare a namesake of the original and two modules may declare it.
+    if dot.is_none() {
+        let aliased = nr_alias_decl_here(name)
+        if aliased >= 0 && node_kind(aliased) == NodeKind.TypeDef {
+            match named_type_map.get(tc_nominal_type_name(aliased)) {
+                Some(v) => return v
+                None => {}
+            }
+        }
+    }
     // A bare namesake means the reading module's own declaration, or the one its imports
     // select, before the bare key (which only the main file can hold).
     if dot.is_none() && tc_is_namesake_type_name(name) != 0 {
@@ -2991,20 +3016,6 @@ pub fn lookup_named_type(name: Str) -> Int {
     match named_type_map.get(name) {
         Some(v) => return v
         None => {}
-    }
-    // A selective import may rename what it selects, and the file then writes the alias. No
-    // declaration carries that spelling, so the pool holds nothing under it: the declaration
-    // is registered under its original name. The key comes from the declaration the import
-    // reaches, not from the original spelling, since this file may declare a namesake of the
-    // original and two modules may declare it.
-    if dot.is_none() {
-        let aliased = nr_alias_decl_here(name)
-        if aliased >= 0 {
-            match named_type_map.get(tc_named_type_key_of_decl(aliased)) {
-                Some(v) => return v
-                None => {}
-            }
-        }
     }
     match dot {
         Some(at) => {
@@ -10638,7 +10649,7 @@ fn pv_walk(expr: Int, in_ensures: Int) ! Diag.Report {
         let callee = node_left(expr)
         let mut call_name = ""
         if callee != -1 {
-            call_name = node_name(callee)
+            call_name = tc_unresolved_callee_name(node_name(callee))
         }
         pv_validate_call_target(call_name, expr, in_ensures)
         let is_old = if call_name == "old" { 1 } else { 0 }
@@ -10841,18 +10852,21 @@ fn pp_walk(node: Int, fn_name: Str, anchor: Int) ! Diag.Report {
 
     if k == NodeKind.Call {
         let callee = node_left(node)
-        let mut call_name = ""
-        if callee != -1 { call_name = node_name(callee) }
+        let mut written = ""
+        if callee != -1 { written = node_name(callee) }
+        // The tables are keyed on the declaration's own name, which an import alias hides; the
+        // message keeps the spelling the reader wrote.
+        let call_name = if callee != -1 { tc_call_declared_name(node) } else { "" }
         if pp_is_collection_constructor(call_name) != 0 {
-            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function `{fn_name}` allocates a `{call_name}` — @pure forbids List/Map/Set allocation", anchor, "compute on existing inputs or drop the @pure annotation")
+            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function `{fn_name}` allocates a `{written}` — @pure forbids List/Map/Set allocation", anchor, "compute on existing inputs or drop the @pure annotation")
         } else if pv_fn_has_any_effect(call_name) != 0 {
-            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function `{fn_name}` calls effectful function `{call_name}` — @pure may only call @pure helpers (or len/is_empty/unwrap/abs/fabs)", anchor, "drop the @pure annotation or rewrite without the effectful call")
+            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function `{fn_name}` calls effectful function `{written}` — @pure may only call @pure helpers (or len/is_empty/unwrap/abs/fabs)", anchor, "drop the @pure annotation or rewrite without the effectful call")
         } else if pv_is_whitelisted_call(call_name) == 0 && tc_fn_is_pure(call_name) == 0 {
             // Skip if the callee is unresolvable — could be a stdlib helper
             // (e.g. assert) or a builtin we don't track. Only complain when
             // we can prove it's a defined non-pure user function.
             if lookup_fnsig(call_name) != -1 {
-                diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function `{fn_name}` calls non-@pure function `{call_name}` — mark it @pure or drop the annotation", anchor, "add @pure to `{call_name}` if it qualifies, or remove @pure from `{fn_name}`")
+                diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION, "@pure function `{fn_name}` calls non-@pure function `{written}` — mark it @pure or drop the annotation", anchor, "add @pure to `{written}` if it qualifies, or remove @pure from `{fn_name}`")
             }
         }
         // Still recurse into args — a pure-looking call could embed impurity.
@@ -12755,7 +12769,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
+            let saved = tc_enter_body_module(sublist_get(fns_sl, i))
             pv_validate_fn_contracts(sublist_get(fns_sl, i))
+            tc_leave_body_module(saved)
             tc_check_contract_verifiable(sublist_get(fns_sl, i))
             i = i + 1
         }
@@ -12776,7 +12792,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             let mut j = 0
             while methods_sl != -1 && j < sublist_length(methods_sl) {
                 validate_verify_fallback(sublist_get(methods_sl, j))
+                let saved = tc_enter_body_module(sublist_get(methods_sl, j))
                 pv_validate_fn_contracts(sublist_get(methods_sl, j))
+                tc_leave_body_module(saved)
                 tc_check_contract_verifiable(sublist_get(methods_sl, j))
                 j = j + 1
             }
@@ -12786,22 +12804,15 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if types_sl != -1 {
         let mut i = 0
         while i < sublist_length(types_sl) {
+            let saved = tc_enter_body_module(sublist_get(types_sl, i))
             pv_validate_type_alias(sublist_get(types_sl, i))
+            tc_leave_body_module(saved)
             i = i + 1
         }
     }
 
     tc_check_namesake_import_ambiguity()
     tc_check_renamed_import_conflicts()
-
-    // Enforce @pure body constraints.
-    if fns_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(fns_sl) {
-            tc_check_pure(sublist_get(fns_sl, i))
-            i = i + 1
-        }
-    }
 
     validate_capabilities_budget(program, fns_sl)
 
@@ -13064,6 +13075,16 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Phase 1: Name resolution
     resolve_names(program)
     nr_warn_unused = 0
+
+    // Enforce @pure body constraints. After name resolution, since a callee is judged by the
+    // declaration it reaches, and an import alias or a local decides which one that is.
+    if fns_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(fns_sl) {
+            tc_check_pure(sublist_get(fns_sl, i))
+            i = i + 1
+        }
+    }
 
     // Phase 2: Expression type inference
     tc_infer_program(program)
@@ -13805,10 +13826,12 @@ pub fn clear_module_imports() {
 }
 
 // The index is derived from per_module_imports[consuming_mod] alone, so a change to that one
-// import list is all that makes it stale.
+// import list is all that makes it stale. The module's answers about bare names read the
+// index, so they go with it.
 fn nr_drop_import_index(consuming_mod: Str) {
     match nr_module_names.get(consuming_mod) {
         Some(r) => {
+            nr_forget_module_answers(r)
             if r.imports_built {
                 r.imports.clear()
                 r.selects.clear()
@@ -14082,10 +14105,15 @@ fn nr_check_selective_access_at(name: Str, node: Int, idx: Int) -> Int ! Diag.Re
     // A local binding holds a value, not a declaration some module exported. It may be spelled
     // like an exported name, and an import list has nothing to say about a local. Asked before
     // the builtin test, which costs a string compare ladder, since most reads are of locals.
-    if idx != -1 && nr_index_is_global(idx) == 0 { return 0 }
+    if nr_index_is_local(idx) { return 0 }
     // Two imports of this file bind the spelling to different declarations, which
-    // tc_check_renamed_import_conflicts has reported. One mistake, one report.
-    if idx == -1 && nr_renamed_import_clash(nr_current_module, name).0 != "" { return 1 }
+    // tc_check_renamed_import_conflicts has reported. One mistake, one report, even when a
+    // third module's declaration of the spelling sits in the shared frame. The read uses
+    // both imports, so neither is reported unused either.
+    if nr_renamed_import_clash(nr_current_module, name).0 != "" {
+        tc_mark_alias_used(name)
+        return 1
+    }
     let mut answers = nr_module_names_of(nr_current_module).unselected
     let source_mod = match answers.get(name) {
         Some(m) => m
@@ -14139,8 +14167,8 @@ let mut nr_name_source_module: Map[Str, Str] = Map()
 // What one module's bare names mean inside it. Filed by module and then by bare name because
 // name resolution asks these per name reference, and building a "module|name" key there cost
 // an allocation and a hash of the longer key on each question. Each table keeps the lifetime
-// it had on its own: init_types clears `sigs`, resolve_names clears `decls`, and `imports` is
-// dropped whenever the module's import list changes.
+// it had on its own: init_types clears `sigs`, nr_record_program_decls clears `decls`, and
+// `imports` is dropped whenever the module's import list changes.
 type ModuleNames {
     // Every top-level declaration of the module, holding the declaration node. A module's own
     // declaration is what its bare name means, whatever other loaded modules declare under the
@@ -14172,7 +14200,8 @@ type ModuleNames {
     // module's declarations and privates, the import lists, the symbol modules, the re-exports,
     // the namesake types, the type declarations of Handler and Template, and the prelude
     // modules. Nothing after that setup writes any of them until the next check, so
-    // resolve_names drops every answer when it starts the setup. The calls emit and mark
+    // nr_record_program_decls and resolve_names drop every answer (nr_forget_answers), and a
+    // change to one module's import list drops that module's. The calls emit and mark
     // nothing, so each caller still reports and marks at each node.
     unselected: Map[Str, Str]
     private_access: Map[Str, Int]
@@ -14228,14 +14257,26 @@ fn nr_module_decl(mod_name: Str, name: Str) -> Int {
     }
 }
 
+// Drop every module's cached answers about the bare names it reads.
+fn nr_forget_answers() {
+    for mod_name in nr_module_names.keys() {
+        nr_forget_module_answers(nr_module_names_of(mod_name))
+    }
+}
+
+fn nr_forget_module_answers(r: ModuleNames) {
+    r.unselected.clear()
+    r.private_access.clear()
+    r.bare_decl.clear()
+}
+
 // Every top-level declaration on record before any pass reads a name, since signature and
 // type registration already resolve spellings (an alias in an annotation among them).
 fn nr_record_program_decls(program: Int) {
     for mod_name in nr_module_names.keys() {
-        let r = nr_module_names_of(mod_name)
-        r.decls.clear()
-        r.bare_decl.clear()
+        nr_module_names_of(mod_name).decls.clear()
     }
+    nr_forget_answers()
     nr_decls_by_name = Map()
     let fns_sl = node_params(program)
     if fns_sl != -1 {
@@ -14331,11 +14372,18 @@ pub fn tc_call_declared_name(call_node: Int) -> Str {
     node_name(node_left(call_node))
 }
 
+// The name a bare callee spelling stands for before name resolution has recorded what the call
+// reaches: the declaration an import alias of the module under check renames, else the
+// spelling itself.
+fn tc_unresolved_callee_name(written: Str) -> Str {
+    let decl = tc_aliased_callee_decl(written)
+    if decl >= 0 { node_name(decl) } else { written }
+}
+
 // The declaration a bare callee spelling reaches through an import alias in the module under
 // check, or -1. A local of that spelling shadows the import.
 fn tc_aliased_callee_decl(written: Str) -> Int {
-    let top = nr_name_top.get(written) ?? -1
-    if top != -1 && nr_index_is_global(top) == 0 { return -1 }
+    if nr_index_is_local(nr_name_top.get(written) ?? -1) { return -1 }
     nr_alias_decl_here(written)
 }
 
@@ -14482,12 +14530,19 @@ fn tc_check_renamed_import_conflicts() ! Diag.Report {
 // different declarations when one of them renames, else ("", "").
 fn nr_renamed_import_clash(reader: Str, spelling: Str) -> (Str, Str) {
     let binds = nr_module_import_index(reader).get(spelling) ?? []
-    if binds.len() < 2 { return ("", "") }
     let mut renames = false
     for b in binds {
         if b.member != spelling { renames = true }
     }
     if !renames { return ("", "") }
+    nr_imports_disagree(reader, spelling)
+}
+
+// The two source modules of the first pair of `reader`'s imports that bind `spelling` to
+// different declarations, else ("", "").
+fn nr_imports_disagree(reader: Str, spelling: Str) -> (Str, Str) {
+    let binds = nr_module_import_index(reader).get(spelling) ?? []
+    if binds.len() < 2 { return ("", "") }
     let mut first = -1
     let mut first_mod = ""
     for b in binds {
@@ -14556,6 +14611,9 @@ fn nr_find_bare_decl(name: Str, consuming_mod: Str) -> Int {
     // from a facade resolves, since the declaration sits under another spelling or module.
     let imported = nr_resolve_imported_decl(name, consuming_mod)
     if imported != -1 { return imported }
+    // Imports that disagree settle the spelling as ambiguous, which is reported once; a third
+    // module's declaration of it is not what this file means.
+    if nr_imports_disagree(consuming_mod, name).0 != "" { return -1 }
     if cands.len() == 0 { return -1 }
     let mut found = -1
     let mut hits = 0
@@ -15047,7 +15105,7 @@ fn nr_is_defined(name: Str) -> Int {
 // index, since each lookup by name hashes and compares the whole spelling again.
 fn nr_top_index(name: Str) -> Int {
     let top = nr_name_top.get(name) ?? -1
-    if top != -1 && nr_index_is_global(top) == 0 { return top }
+    if nr_index_is_local(top) { return top }
     // An alias is bound only in the file whose import writes it, so the shared frame holds
     // no entry under it: it reads the entry of the declaration it renames.
     let aliased = nr_alias_decl_here(name)
@@ -15056,19 +15114,32 @@ fn nr_top_index(name: Str) -> Int {
     nr_module_global_index(name, top)
 }
 
-// The outermost-frame entry that holds `decl` under its own name: the one that carries the
-// node when one does, else the newest global entry of the name. -1 when none is global.
+// Whether the scope entry `idx` is a binding inside a function, which no import can shadow.
+fn nr_index_is_local(idx: Int) -> Bool {
+    idx != -1 && nr_index_is_global(idx) == 0
+}
+
+// The outermost-frame entry that holds `decl` under its own name, or -1. Only a function or a
+// module-level binding has one. Name resolution files a function, and every global before
+// inference reaches it, with no node, and those node-less entries of one name are
+// interchangeable; an entry that carries another node belongs to another declaration.
 fn nr_global_index_of_decl(decl: Int) -> Int {
-    let mut idx = nr_name_top.get(node_name(decl)) ?? -1
-    let mut first_global = -1
-    while idx != -1 {
-        if nr_index_is_global(idx) != 0 {
-            if nr_scope_nodes.get(idx).unwrap() == decl { return idx }
-            if first_global == -1 { first_global = idx }
-        }
-        idx = nr_scope_prev.get(idx).unwrap()
+    let k = nk_of(node_kind(decl))
+    if k != NodeKind.FnDef && k != NodeKind.LetBinding { return -1 }
+    let top = nr_name_top.get(node_name(decl)) ?? -1
+    let own = nr_entry_holding(top, decl)
+    if own != -1 { return own }
+    nr_entry_holding(top, -1)
+}
+
+// The first entry from `idx` down its shadow chain that is global and holds `decl`, or -1.
+fn nr_entry_holding(idx: Int, decl: Int) -> Int {
+    let mut at = idx
+    while at != -1 {
+        if nr_index_is_global(at) != 0 && nr_scope_nodes.get(at).unwrap() == decl { return at }
+        at = nr_scope_prev.get(at).unwrap()
     }
-    first_global
+    -1
 }
 
 // The declaration `name` reaches in the module under check when one of its selective imports
@@ -15093,15 +15164,10 @@ fn nr_module_global_index(name: Str, top: Int) -> Int {
     if nr_index_is_global(top) == 0 { return top }
     let decl = nr_resolve_bare_decl(name, nr_current_module)
     if decl < 0 { return top }
-    let mut idx = top
-    while idx != -1 {
-        if nr_scope_nodes.get(idx).unwrap() == decl {
-            if idx != top { dbg_trace("nr.global", "`{name}` in {nr_current_module}: entry {idx} (decl {decl}), not newest {top}") }
-            return idx
-        }
-        idx = nr_scope_prev.get(idx).unwrap()
-    }
-    top
+    let idx = nr_entry_holding(top, decl)
+    if idx == -1 { return top }
+    if idx != top { dbg_trace("nr.global", "`{name}` in {nr_current_module}: entry {idx} (decl {decl}), not newest {top}") }
+    idx
 }
 
 // nr_is_defined's side effects for a binding already looked up.
@@ -15132,6 +15198,8 @@ fn nr_mark_read_at(i: Int) {
 // pure-inspection contract as nr_top_binding_is_global below.
 fn nr_has_binding(name: Str) -> Int {
     if nr_name_top.contains_key(name) { return 1 }
+    // An alias of a function or a module-level binding reads that declaration's entry.
+    if nr_top_index(name) != -1 { return 1 }
     0
 }
 
@@ -17456,12 +17524,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_name_source_module = Map()
     // Bare-name answers cached by the passes before this one may predate the prelude's
     // free-function table, so they are asked again here.
-    for mod_name in nr_module_names.keys() {
-        let r = nr_module_names_of(mod_name)
-        r.unselected.clear()
-        r.private_access.clear()
-        r.bare_decl.clear()
-    }
+    nr_forget_answers()
     tc_call_decl = Map()
     tc_global_read_decl = Map()
     tc_local_binder = Map()
@@ -21563,8 +21626,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // the name-resolution walk registers a local before anything types it, and reads types as
         // it goes. Answering from the function table there types a shadowing local as the
         // function it shadows.
-        if top != -1 && nr_index_is_global(top) == 0 { return -1 }
-        let fn_sig = lookup_fnsig(name)
+        if nr_index_is_local(top) { return -1 }
+        let fn_sig = tc_bare_callee_sig(name)
         if fn_sig != -1 {
             let fs = fnsig_pool.get(fn_sig).unwrap()
             let mut fn_param_types: List[Int] = []
@@ -29349,18 +29412,21 @@ pub fn tc_leave_body_module(saved_module: Str) {
 
 fn tc_name_is_item_here(name: Str) -> Int {
     // `import m.{add as plus}` registers `add` in the item tables and nothing under `plus`,
-    // so the ladder has to ask about the declaration the alias reaches in this file.
+    // so the ladder has to ask about the declaration the alias reaches in this file. A
+    // module-level binding is a value, not an item.
     let aliased = nr_alias_decl_here(name)
-    if aliased >= 0 { return 1 }
-    let item = name
-    if is_builtin_namespace(item) != 0 { return 1 }
-    if is_import_module_name(item) != 0 { return 1 }
-    if is_variant_name(item) != 0 { return 1 }
-    if is_builtin_fn(item) != 0 { return 1 }
-    if is_known_type(item) != 0 { return 1 }
-    if is_trait_name(item) != 0 { return 1 }
-    if is_user_effect_handle_name(item) != 0 { return 1 }
-    if lookup_fnsig(item) != -1 { return 1 }
+    if aliased >= 0 {
+        if nk_of(node_kind(aliased)) == NodeKind.LetBinding { return 0 }
+        return 1
+    }
+    if is_builtin_namespace(name) != 0 { return 1 }
+    if is_import_module_name(name) != 0 { return 1 }
+    if is_variant_name(name) != 0 { return 1 }
+    if is_builtin_fn(name) != 0 { return 1 }
+    if is_known_type(name) != 0 { return 1 }
+    if is_trait_name(name) != 0 { return 1 }
+    if is_user_effect_handle_name(name) != 0 { return 1 }
+    if lookup_fnsig(name) != -1 { return 1 }
     0
 }
 
