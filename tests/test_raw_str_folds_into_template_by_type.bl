@@ -1,0 +1,211 @@
+// A `Raw[Str]` is a marker type (sections/03b_contracts.md 3b.5): a template hole of that type
+// folds the string into the query text whatever the value came through, an inline call, a
+// binding, a return, a generic call, a field or an if/match arm. Each fold raises
+// RawBypassesParam unless an audit covers it, a Raw[Str] anywhere else is E0530, and `Raw` of
+// anything but a Str is E0534.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn project(src: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_raw_fold.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    dir
+}
+
+// `show` prints what the template's handler sees: how many parts, and the first one.
+fn with_show(body: Str) -> Str {
+    let head = #"type Ctx {}
+type Holder { r: Raw[Str] }
+fn show(t: Template[Ctx]) -> Str {
+    let parts = t.parts()
+    "{parts.len()}|{parts.get(0) ?? "?"}|{t.count()}"
+}
+fn mk(s: Str) -> Raw[Str] { Raw(s) }
+fn id[T](x: T) -> T { x }
+"#
+    "{head}{body}"
+}
+
+fn expect_runs(src: Str, want: Str) {
+    let dir = project(src)
+    let mut ok = true
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check src/main.bl < /dev/null 2>&1")
+    if c.exit_code != 0 || c.out.contains("RawBypassesParam") {
+        io.eprintln("blink check: exit {c.exit_code}\n{c.out}")
+        ok = false
+    }
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            io.eprintln("blink {args}: exit {r.exit_code}, want `{want}`\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+fn expect_rejects(src: Str, want: Str) {
+    let dir = project(src)
+    let mut ok = true
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code == 0 || !r.out.contains(want) || r.out.contains("internal compiler error") {
+            io.eprintln("blink {args}: exit {r.exit_code}, want `{want}`\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+// The check output names each warning once, so the count is the number of folds that warned.
+fn expect_warns(src: Str, want: Int) {
+    let dir = project(src)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check src/main.bl < /dev/null 2>&1")
+    let got = r.out.split("warning[RawBypassesParam]").len() - 1
+    if r.exit_code != 0 || got != want {
+        io.eprintln("blink check: exit {r.exit_code}, RawBypassesParam {got} time(s), want {want}\n{r.out}")
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(r.exit_code == 0 && got == want)
+}
+
+test "a Raw[Str] held in a binding folds like the inline call" {
+    expect_runs(with_show(#"@trusted(audit: "RAW-001")
+fn main() {
+    let table = "users"
+    io.println(show("SELECT * FROM {Raw(table)}"))
+    let r = Raw(table)
+    io.println(show("SELECT * FROM {r} WHERE id = {7}"))
+}
+"#), "1|SELECT * FROM users|0\n2|SELECT * FROM users WHERE id = |1")
+}
+
+test "a Raw[Str] returned by a fn folds" {
+    expect_runs(with_show(#"@trusted(audit: "RAW-001")
+fn main() {
+    io.println(show("SELECT * FROM {mk("users")}"))
+}
+"#), "1|SELECT * FROM users|0")
+}
+
+test "a Raw[Str] through a generic identity call folds" {
+    expect_runs(with_show(#"@trusted(audit: "RAW-001")
+fn main() {
+    let r = Raw("users")
+    io.println(show("SELECT * FROM {id(Raw("t"))}"))
+    io.println(show("SELECT * FROM {id(r)}"))
+    io.println(id("plain"))
+}
+"#), "1|SELECT * FROM t|0\n1|SELECT * FROM users|0\nplain")
+}
+
+test "a Raw[Str] in a struct field folds" {
+    expect_runs(with_show(#"@trusted(audit: "RAW-001")
+fn main() {
+    let h = Holder { r: Raw("users") }
+    io.println(show("SELECT * FROM {h.r}"))
+}
+"#), "1|SELECT * FROM users|0")
+}
+
+test "a Raw[Str] chosen by an if or a match arm folds" {
+    expect_runs(with_show(#"@trusted(audit: "RAW-001")
+fn main() {
+    let c = "users".len() > 2
+    let x = if c { Raw("a") } else { Raw("b") }
+    io.println(show("SELECT * FROM {x}"))
+    let y = match c {
+        true => Raw("m")
+        false => Raw("n")
+    }
+    io.println(show("SELECT * FROM {y}"))
+}
+"#), "1|SELECT * FROM a|0\n1|SELECT * FROM m|0")
+}
+
+test "a Raw[Str] in a list and in an Option folds once read back out" {
+    expect_runs(with_show(#"@trusted(audit: "RAW-001")
+fn main() {
+    let rs = [Raw("a"), Raw("b")]
+    io.println(show("SELECT * FROM {rs.get(1).unwrap()}"))
+    let o = Some(Raw("users"))
+    io.println(show("SELECT * FROM {o.unwrap()}"))
+}
+"#), "1|SELECT * FROM b|0\n1|SELECT * FROM users|0")
+}
+
+test "each fold warns without an audit, whatever the source form" {
+    expect_warns(with_show(#"fn main() {
+    let r = Raw("users")
+    io.println(show("SELECT * FROM {r}"))
+    io.println(show("SELECT * FROM {mk("t")}"))
+    io.println(show("SELECT * FROM {id(r)}"))
+}
+"#), 3)
+}
+
+test "an audit silences the fold of a binding" {
+    expect_warns(with_show(#"@trusted(audit: "RAW-001")
+fn main() {
+    let r = Raw("users")
+    io.println(show("SELECT * FROM {r}"))
+}
+"#), 0)
+}
+
+test "a Raw[Str] binding in a plain literal hole is E0530" {
+    expect_rejects(#"fn main() {
+    let r = Raw("users")
+    io.println("scanning {r}")
+}
+"#, "RawOutsideTemplate")
+}
+
+test "a Raw[Str] binding passed to io.println is E0530" {
+    expect_rejects(#"fn main() {
+    let r = Raw("users")
+    io.println(r)
+}
+"#, "RawOutsideTemplate")
+}
+
+test "a Raw[Str] binding written to a StringBuilder is E0530" {
+    expect_rejects(#"fn main() {
+    let r = Raw("users")
+    let sb = StringBuilder.new()
+    sb.write(r)
+    io.println(sb.to_str())
+}
+"#, "RawOutsideTemplate")
+}
+
+test "Raw of a value that is not a Str is E0534 at the argument" {
+    expect_rejects(with_show(#"fn main() {
+    io.println(show("SELECT * FROM t LIMIT {Raw(5)}"))
+}
+"#), "`Raw` wraps only a `Str`, found `Int`")
+}
+
+test "Raw of a type parameter is E0534 at the generic definition" {
+    expect_rejects(#"fn wrap[T](x: T) -> Raw[T] { Raw(x) }
+fn main() {
+    io.println("ok")
+}
+"#, "`Raw` wraps only a `Str`, found `T`")
+}
+
+test "Raw of a Raw[Str] is E0534" {
+    expect_rejects(with_show(#"fn main() {
+    let r = Raw("users")
+    io.println(show("SELECT * FROM {Raw(r)}"))
+}
+"#), "`Raw` wraps only a `Str`, found `Raw[Str]`")
+}

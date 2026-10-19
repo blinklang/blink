@@ -40,7 +40,7 @@ import diagnostics.{
     TRUSTED_REQUIRES_AUDIT,
     PUB_FFI, FFI_NO_EFFECTS, CONTRACT_ON_FFI, INVALID_PTR_TYPE,
     COALESCE_REQUIRES_OPT, MISSING_KEYWORD_ARG, INVALID_KEYWORD_ARG,
-    FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM, RAW_OUTSIDE_TEMPLATE,
+    FFI_SCOPE_NOT_WITH_RESOURCE, RAW_BYPASSES_PARAM, RAW_OUTSIDE_TEMPLATE, TEMPLATE_HOLE_TYPE,
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BUF_OUTSIDE_FFI_SURFACE, BYTES_GROW_IN_WITH_PTR,
     MISSING_CANONICAL_HEADER,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
@@ -5730,6 +5730,26 @@ fn tc_raw_report_unconsumed() ! Diag.Report {
         }
         i = i + 1
     }
+}
+
+// §3b.5: the folded text is the string itself, so `Raw` wraps only a `Str`. A type still
+// open here is left to the later use that settles it.
+fn tc_raw_require_str(arg: Int, t: Int) ! Diag.Report {
+    let r = tc_resolve(t)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Str || k == TyKind.Unknown || tc_is_unbound_metavar(r) != 0 { return }
+    diag_error_at("TemplateHoleType", TEMPLATE_HOLE_TYPE,
+        "`Raw` wraps only a `Str`, found `{type_to_str(r)}`", arg,
+        "send it as a parameter instead of wrapping it in `Raw`")
+}
+
+// A print sink shows its argument through Display, which a Raw[Str] has none of. Only a
+// template hole consumes one, so here it is stranded the same as in a plain literal.
+fn tc_raw_reject_display_sink(arg: Int, t: Int) ! Diag.Report {
+    if tc_tid_kind(tc_resolve(t)) != TyKind.Raw { return }
+    diag_error_at("RawOutsideTemplate", RAW_OUTSIDE_TEMPLATE,
+        "a `Raw[T]` reached a position that does not consume it — only a `Template[C]` coercion does",
+        arg, "drop the wrapper and pass the value itself")
 }
 
 // A call of a free function whose signature is settled: a bare `f(..)` or a module-qualified
@@ -22501,7 +22521,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if fn_name == "Raw" {
                     let args_sl = node_args(node)
                     if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        return make_raw_type(infer_type(sublist_get(args_sl, 0)))
+                        let raw_arg = sublist_get(args_sl, 0)
+                        let raw_inner = infer_type(raw_arg)
+                        tc_raw_require_str(raw_arg, raw_inner)
+                        return make_raw_type(raw_inner)
                     }
                     return make_raw_type(make_metavar())
                 }
@@ -23608,7 +23631,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // this arm is what surfaces E0522 for a nested call in an argument, and
                 // returning early here would skip it.
                 if args_sl != -1 && sublist_length(args_sl) > 0 {
-                    infer_type(sublist_get(args_sl, 0))
+                    let sb_arg = sublist_get(args_sl, 0)
+                    tc_raw_reject_display_sink(sb_arg, infer_type(sb_arg))
                 }
                 return TYPE_VOID
             }
@@ -24091,7 +24115,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         pf_got = sublist_length(pf_args)
                         let mut pf_i = 0
                         while pf_i < sublist_length(pf_args) {
-                            infer_type(sublist_get(pf_args, pf_i))
+                            let pf_arg = sublist_get(pf_args, pf_i)
+                            tc_raw_reject_display_sink(pf_arg, infer_type(pf_arg))
                             pf_i = pf_i + 1
                         }
                     }
