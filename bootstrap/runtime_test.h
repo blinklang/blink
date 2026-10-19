@@ -56,16 +56,17 @@ BLINK_TEST_STORAGE char __blink_test_fail_user_msg[256];
 BLINK_TEST_STORAGE const char* __blink_test_fail_cause;
 BLINK_TEST_STORAGE char __blink_test_fail_error_type[128];
 BLINK_TEST_STORAGE char __blink_test_fail_error_message[512];
-/* Active for_each case label. Set by std.testing.for_each before invoking
- * each case body; cleared after a case returns successfully. On unwind via
- * __blink_assert_fail*, the buffer retains the failing case label so the
- * runner can emit it in the JSON "case" field. */
+/* Label of the for_each case that is running. After the loop it holds the
+ * label of the case whose failure the test reports, so the runner can emit it
+ * in the JSON "case" field, and is empty when no case failed. */
 BLINK_TEST_STORAGE char __blink_test_case_label[256];
+/* Cleanup depth at the frame __blink_test_jmp points to. An assertion failure
+ * runs the armed `with` cleanups above it before the longjmp, while their
+ * guards are still on the stack. */
+BLINK_TEST_STORAGE size_t __blink_test_jmp_mark;
 
-/* Per-iteration `for_each` case records. std.testing.for_each calls
- * blink_record_case after each case that *returns* (pass/skip); the runner
- * synthesizes the trailing failed entry from __blink_test_case_label (which
- * survives the longjmp). Accumulate-then-emit, mirroring __blink_cleanup_warnings.
+/* One record per for_each case that ran, written by blink_test_run_case.
+ * Accumulate-then-emit, mirroring __blink_cleanup_warnings.
  * The records sit behind a pointer the runner allocates on its own thread, so
  * every other thread pays one pointer of thread-local storage, not 64 KB, and
  * records nothing. Reset per test. */
@@ -85,7 +86,6 @@ BLINK_TEST_STORAGE char __blink_test_skip_reason[256];
 /* Units read only these declarations, and one unit holds the bodies, so an -O0 unit does
  * not compile a copy of each one. */
 BLINK_RT_FN void __blink_assert_fail(const char* msg, int line);
-BLINK_RT_FN void blink_set_case_label(const char* s);
 BLINK_RT_FN void blink_record_case(const char* label, int64_t status);
 BLINK_RT_FN void __blink_assert_fail_eq(const char* msg, const char* expected, const char* actual, int line);
 BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion, const char* intro, const char* file, int line, int col, const char* user_msg);
@@ -93,8 +93,8 @@ BLINK_RT_FN void __blink_test_set_propagate(const char* message, const char* err
 BLINK_RT_FN void __blink_test_set_skipped(const char* reason);
 BLINK_RT_FN void __blink_assert_panics_returned(const char* file, int line, int col);
 BLINK_RT_FN void __blink_assert_panics_mismatch(const char* expected, const char* actual, const char* file, int line, int col);
-BLINK_RT_FN int64_t __blink_test_is_failed(void);
-BLINK_RT_FN int64_t __blink_test_is_skipped(void);
+BLINK_RT_FN int64_t blink_test_run_case(const char* label, const char* duplicate, blink_closure* body);
+BLINK_RT_FN void blink_test_mark_skipped(void);
 BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int argc, const char** argv);
 
 /* That unit is the one that defines the runtime storage, except in the stdlib archive: it
@@ -139,6 +139,15 @@ BLINK_UNUSED static void __blink_assert_fail_uncaught(void) {
     __blink_panic_dispatch(buf);
 }
 
+/* Unwind an assertion failure to the frame __blink_test_jmp points to: the
+ * per-test frame or a for_each case frame. */
+BLINK_UNUSED static void __blink_test_unwind(void) {
+    if (__blink_panic_cleanup_top > __blink_test_jmp_mark) {
+        __blink_cleanup_run_to(__blink_test_jmp_mark);
+    }
+    longjmp(__blink_test_jmp, 1);
+}
+
 BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
     __blink_test_failed = 1;
     if (msg) {
@@ -156,7 +165,7 @@ BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
     if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
-    longjmp(__blink_test_jmp, 1);
+    __blink_test_unwind();
 }
 
 #define BLINK_COPY_OR_EMPTY(dst, src) do { \
@@ -168,12 +177,8 @@ BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
     } \
 } while (0)
 
-BLINK_RT_FN void blink_set_case_label(const char* s) {
-    BLINK_COPY_OR_EMPTY(__blink_test_case_label, s);
-}
-
-/* Append a finished for_each case record (br afazzf). status: 0=pass 1=fail
- * 2=skip. Count keeps incrementing past the cap so the JSON helper can emit an
+/* Append a finished for_each case record. status: 0=pass 1=fail 2=skip.
+ * Count keeps incrementing past the cap so the JSON helper can emit an
  * accurate overflow marker for the dropped remainder. */
 BLINK_RT_FN void blink_record_case(const char* label, int64_t status) {
     if (__blink_test_case_records == NULL) return;
@@ -202,7 +207,7 @@ BLINK_RT_FN void __blink_assert_fail_eq(const char* msg,
     BLINK_COPY_OR_EMPTY(__blink_test_fail_expected, expected);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_actual, actual);
     if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
-    longjmp(__blink_test_jmp, 1);
+    __blink_test_unwind();
 }
 
 BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion,
@@ -227,7 +232,7 @@ BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion,
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
     if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
-    longjmp(__blink_test_jmp, 1);
+    __blink_test_unwind();
 }
 
 /* Spec §2.20: ?-in-test propagation. No longjmp — caller emits `return;`
@@ -287,12 +292,10 @@ BLINK_RT_FN void __blink_assert_panics_mismatch(const char* expected,
         __intro, file, line, col, "");
 }
 
-/* zs3w3y: installed as __blink_panic_test_hook by blink_test_run. An uncaught
- * panic in a test body lands here instead of terminating the binary: record it
- * as a plain-message ("panic" cause) failure and longjmp to the per-test
- * setjmp frame so the runner reports FAIL and continues with the next test.
- * Clears the assertion-shaped fields so emit takes the plain-message path. */
-BLINK_UNUSED static void __blink_test_panic_handler(const char* msg) {
+/* Record a panic that escaped a test body or a for_each case as a
+ * plain-message ("panic" cause) failure. Clears the assertion-shaped fields so
+ * emit takes the plain-message path. */
+BLINK_UNUSED static void __blink_test_note_panic(const char* msg) {
     __blink_test_failed = 1;
     __blink_test_fail_cause = "panic";
     BLINK_COPY_OR_EMPTY(__blink_test_fail_msg, msg);
@@ -306,14 +309,133 @@ BLINK_UNUSED static void __blink_test_panic_handler(const char* msg) {
     __blink_test_fail_user_msg[0] = '\0';
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
+}
+
+/* Installed as __blink_panic_test_hook by blink_test_run. An uncaught panic in
+ * a test body lands here instead of terminating the binary: record it and
+ * longjmp to the per-test frame so the runner reports FAIL and continues with
+ * the next test. */
+BLINK_UNUSED static void __blink_test_panic_handler(const char* msg) {
+    __blink_test_note_panic(msg);
     longjmp(__blink_test_jmp, 1);
 }
 
-/* Polled by std.testing.for_each between case-body iterations so that a
- * failing/skipped case stops the loop instead of running every remaining
- * case under a poisoned global state. int64_t signature matches Blink Int. */
-BLINK_RT_FN int64_t __blink_test_is_failed(void) { return (int64_t)__blink_test_failed; }
-BLINK_RT_FN int64_t __blink_test_is_skipped(void) { return (int64_t)__blink_test_skipped; }
+/* The failure record of a test, saved while a for_each case runs, so the test
+ * reports the first case that failed. */
+typedef struct {
+    const char* cause;
+    int line;
+    int col;
+    char msg[512];
+    char expected[256];
+    char actual[256];
+    char assertion[256];
+    char intro[BLINK_PA_INTRO_BUF_SIZE];
+    char file[256];
+    char user_msg[256];
+    char error_type[128];
+    char error_message[512];
+    char case_label[256];
+} blink_test_fail_record;
+
+BLINK_UNUSED static void __blink_test_fail_record_save(blink_test_fail_record* r) {
+    r->cause = __blink_test_fail_cause;
+    r->line = __blink_test_fail_line;
+    r->col = __blink_test_fail_col;
+    memcpy(r->msg, __blink_test_fail_msg, sizeof(r->msg));
+    memcpy(r->expected, __blink_test_fail_expected, sizeof(r->expected));
+    memcpy(r->actual, __blink_test_fail_actual, sizeof(r->actual));
+    memcpy(r->assertion, __blink_test_fail_assertion, sizeof(r->assertion));
+    memcpy(r->intro, __blink_test_fail_intro, sizeof(r->intro));
+    memcpy(r->file, __blink_test_fail_file, sizeof(r->file));
+    memcpy(r->user_msg, __blink_test_fail_user_msg, sizeof(r->user_msg));
+    memcpy(r->error_type, __blink_test_fail_error_type, sizeof(r->error_type));
+    memcpy(r->error_message, __blink_test_fail_error_message, sizeof(r->error_message));
+    memcpy(r->case_label, __blink_test_case_label, sizeof(r->case_label));
+}
+
+BLINK_UNUSED static void __blink_test_fail_record_restore(const blink_test_fail_record* r) {
+    __blink_test_fail_cause = r->cause;
+    __blink_test_fail_line = r->line;
+    __blink_test_fail_col = r->col;
+    memcpy(__blink_test_fail_msg, r->msg, sizeof(r->msg));
+    memcpy(__blink_test_fail_expected, r->expected, sizeof(r->expected));
+    memcpy(__blink_test_fail_actual, r->actual, sizeof(r->actual));
+    memcpy(__blink_test_fail_assertion, r->assertion, sizeof(r->assertion));
+    memcpy(__blink_test_fail_intro, r->intro, sizeof(r->intro));
+    memcpy(__blink_test_fail_file, r->file, sizeof(r->file));
+    memcpy(__blink_test_fail_user_msg, r->user_msg, sizeof(r->user_msg));
+    memcpy(__blink_test_fail_error_type, r->error_type, sizeof(r->error_type));
+    memcpy(__blink_test_fail_error_message, r->error_message, sizeof(r->error_message));
+    memcpy(__blink_test_case_label, r->case_label, sizeof(r->case_label));
+}
+
+/* Run one for_each case in its own catch frame and record it (spec §8.10.2).
+ * The frame is the one assert_panics opens, so `with` cleanups push while the
+ * case runs and a panic drains them to the case's mark. A second frame on
+ * __blink_test_jmp catches assertion failures, which unwind there and never
+ * reach panic dispatch. A non-empty `duplicate` is the message of a repeated
+ * label: the case panics with it before its body runs. The test keeps the
+ * failure record of the first case that failed, and its own skip state; the
+ * caller decides whether every case skipped. Returns 0=pass 1=fail 2=skip. */
+BLINK_RT_FN int64_t blink_test_run_case(const char* label, const char* duplicate, blink_closure* body) {
+    int prev_failed = __blink_test_failed;
+    int prev_skipped = __blink_test_skipped;
+    blink_test_fail_record prev_record;
+    __blink_test_fail_record_save(&prev_record);
+    char prev_reason[sizeof(__blink_test_skip_reason)];
+    memcpy(prev_reason, __blink_test_skip_reason, sizeof(prev_reason));
+    jmp_buf prev_jmp;
+    memcpy(prev_jmp, __blink_test_jmp, sizeof(jmp_buf));
+    size_t prev_jmp_mark = __blink_test_jmp_mark;
+    int prev_armed = __blink_panic_armed;
+    size_t prev_top = __blink_panic_cleanup_top;
+
+    __blink_panic_frame frame;
+    __blink_panic_frame_enter(&frame);
+    __blink_test_jmp_mark = __blink_panic_cleanup_top;
+    __blink_test_failed = 0;
+    __blink_test_skipped = 0;
+    BLINK_COPY_OR_EMPTY(__blink_test_case_label, label);
+    int64_t status;
+    if (setjmp(__blink_panic_jmp) != 0) {
+        __blink_test_note_panic(__blink_panic_msg);
+        status = 1;
+    } else if (setjmp(__blink_test_jmp) != 0) {
+        status = 1;
+    } else {
+        if (duplicate && duplicate[0]) { __blink_panic_dispatch(duplicate); }
+        ((void (*)(const blink_closure*))body->fn_ptr)(body);
+        status = __blink_test_failed ? 1 : __blink_test_skipped ? 2 : 0;
+    }
+
+    /* An assertion that fails inside a nested assert_panics unwinds past that
+     * frame's leave, so the catch state is put back by value, not by count. */
+    __blink_panic_armed = prev_armed + 1;
+    __blink_panic_cleanup_top = prev_top;
+    __blink_panic_frame_leave(&frame);
+    memcpy(__blink_test_jmp, prev_jmp, sizeof(jmp_buf));
+    __blink_test_jmp_mark = prev_jmp_mark;
+
+    if (status == 1 && !prev_failed) {
+        __blink_test_failed = 1;
+    } else {
+        __blink_test_failed = prev_failed;
+        __blink_test_fail_record_restore(&prev_record);
+    }
+    __blink_test_skipped = prev_skipped;
+    if (status != 2 || prev_reason[0]) {
+        memcpy(__blink_test_skip_reason, prev_reason, sizeof(prev_reason));
+    }
+    blink_record_case(label, status);
+    return status;
+}
+
+/* for_each calls this when every case skipped: the test is skipped, with the
+ * reason of the first case that skipped. */
+BLINK_RT_FN void blink_test_mark_skipped(void) {
+    __blink_test_skipped = 1;
+}
 
 /* JSON-escape a string into a static buffer. Each call overwrites the previous
  * result, so callers must consume the output before invoking again. */
@@ -479,6 +601,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         __blink_test_fail_expected[0] = '\0';
         __blink_test_fail_actual[0] = '\0';
         __blink_test_case_label[0] = '\0';
+        __blink_test_jmp_mark = 0;
         __blink_test_case_record_count = 0;
         __blink_test_fail_cause = "assertion";
         __blink_test_fail_error_type[0] = '\0';
@@ -588,12 +711,6 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
-                /* The failing case longjmp'd out of for_each before it could
-                 * self-report; synthesize its entry from the surviving label so
-                 * cases[] ends with the correctly-failed case (br afazzf). */
-                if (__blink_test_case_label[0]) {
-                    blink_record_case(__blink_test_case_label, 1);
-                }
                 __blink_test_print_case_records_json();
                 if (tests[i].expected_fail) {
                     printf(",\"expected_fail\":true");

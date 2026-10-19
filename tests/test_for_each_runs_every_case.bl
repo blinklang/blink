@@ -1,0 +1,282 @@
+// for_each runs the body for every case (spec §8.10.2). A case that fails, panics or
+// skips is recorded for that case, and the next case still runs. The parent test takes
+// the most severe case status, and is skipped only when every case is skipped. Each row
+// runs a fixture under `build/blink test --json` and under human output.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
+
+type Run { json: Str, json_exit: Int, human: Str, human_exit: Int }
+
+fn run_fixture(tag: Str, lines: List[Str]) -> Run {
+    let name = "fe_every_{tag}_{getpid()}"
+    let scratch = ".tmp/_test_for_each_every_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, lines.join("\n"))
+    let j = process_run("build/blink", ["test", "--json", fixture])
+    let h = process_run("build/blink", ["test", fixture])
+    shell_exec("rm -rf {scratch}")
+    Run { json: j.out.concat(j.err_out), json_exit: j.exit_code, human: h.out.concat(h.err_out), human_exit: h.exit_code }
+}
+
+fn diag(r: Run) -> Str {
+    "json exit={r.json_exit}:\n{r.json}\nhuman exit={r.human_exit}:\n{r.human}"
+}
+
+test "a failing middle case does not stop the cases after it" {
+    let r = run_fixture("midfail", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "midfail" {"#,
+        #"    for_each([("a", 1), ("b", 2), ("c", 3)], fn(v: Int) {"#,
+        #"        io.println("start {v}")"#,
+        #"        assert_eq(v == 2, false)"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""status":"failed""#), "no parent failed; {d}")
+    assert(r.json.contains(#""case":"b""#), "the parent does not name case b; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"pass"},{"label":"b","status":"failed"},{"label":"c","status":"pass"}]"#), "cases[] is not a pass, b failed, c pass; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("start 3"), "case c did not run under human output; {d}")
+    assert(r.human.contains("midfail::case[b] ... "), "the human FAIL line does not name case b; {d}")
+}
+
+test "a panic in the first case leaves the other two cases passing" {
+    let r = run_fixture("panicfirst", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "panicfirst" {"#,
+        #"    for_each([("a", 5), ("b", 0), ("c", 0)], fn(v: Int) {"#,
+        #"        let xs = [10]"#,
+        #"        io.println("start {v} {xs.get(v).unwrap()}")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""status":"failed""#), "no parent failed; {d}")
+    assert(r.json.contains(#""cause":"panic""#), "the parent does not carry the panic; {d}")
+    assert(r.json.contains(#""case":"a""#), "the parent does not name case a; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"failed"},{"label":"b","status":"pass"},{"label":"c","status":"pass"}]"#), "cases[] is not a failed, b pass, c pass; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("panicfirst::case[a] ... "), "the human FAIL line does not name case a; {d}")
+    assert(r.human.contains("start 0 10"), "cases b and c did not run under human output; {d}")
+}
+
+test "a skipped case among passing cases leaves the parent passed" {
+    let r = run_fixture("oneskip", [
+        #"import std.testing.{for_each, skip}"#,
+        #""#,
+        #"test "oneskip" {"#,
+        #"    for_each([("a", 1), ("b", 2), ("c", 3)], fn(v: Int) {"#,
+        #"        if v == 2 { skip("not b") }"#,
+        #"        io.println("ran {v}")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""status":"passed""#), "no parent passed; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"pass"},{"label":"b","status":"skipped"},{"label":"c","status":"pass"}]"#), "cases[] is not a pass, b skipped, c pass; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert(r.human.contains("ran 3"), "case c did not run; {d}")
+    assert(r.human.contains("oneskip ... "), "no human line for the parent; {d}")
+    assert(!r.human.contains("skipped"), "the human parent line says skipped; {d}")
+}
+
+test "the parent is skipped only when every case is skipped" {
+    let r = run_fixture("allskip", [
+        #"import std.testing.{for_each, skip}"#,
+        #""#,
+        #"test "allskip" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        io.println("ran {v}")"#,
+        #"        skip("all of them")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"allskip","status":"skipped""#), "no parent skipped; {d}")
+    assert(r.json.contains(#""reason":"all of them""#), "the parent lost the skip reason; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"skipped"},{"label":"b","status":"skipped"}]"#), "cases[] is not a and b skipped; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert(r.human.contains("ran 2"), "case b did not run; {d}")
+    assert(r.human.contains("allskip ... "), "no human line for the parent; {d}")
+    assert(r.human.contains("skipped"), "the human parent line is not skipped; {d}")
+}
+
+test "a duplicate label panics in its own case and the next case still runs" {
+    let r = run_fixture("duplabel", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "duplabel" {"#,
+        #"    for_each([("a", 1), ("a", 2), ("c", 3)], fn(v: Int) {"#,
+        #"        io.println("ran {v}")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""status":"failed""#), "no parent failed; {d}")
+    assert(r.json.contains(#""cause":"panic""#), "the duplicate label is not a panic; {d}")
+    assert(r.json.contains(#"for_each: duplicate case label \"a\" at indices 0 and 1"#), "no duplicate-label message; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"pass"},{"label":"a","status":"failed"},{"label":"c","status":"pass"}]"#), "cases[] is not a pass, a failed, c pass; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("ran 3"), "case c did not run; {d}")
+    assert(!r.human.contains("ran 2"), "the duplicate case ran its body; {d}")
+}
+
+test "a with resource in a failing case is closed before the next case starts" {
+    let r = run_fixture("withclose", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"type Res { id: Int }"#,
+        #"impl Closeable for Res { fn close(self) { io.println("closed {self.id}") } }"#,
+        #""#,
+        #"test "withclose" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        io.println("start {v}")"#,
+        #"        with Res { id: v } as res {"#,
+        #"            assert(res.id == 2)"#,
+        #"        }"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""cases":[{"label":"a","status":"failed"},{"label":"b","status":"pass"}]"#), "cases[] is not a failed, b pass; {d}")
+    let human = r.human
+    let closed = human.index_of("closed 1")
+    let next = human.index_of("start 2")
+    assert(closed.is_some(), "the resource of the failing case was never closed; {d}")
+    assert(next.is_some(), "case b did not run; {d}")
+    assert(closed.unwrap() < next.unwrap(), "case b started before the failing case closed its resource; {d}")
+    assert(human.contains("closed 2"), "the passing case did not close its resource; {d}")
+}
+
+test "an assert after the loop still fails the test" {
+    let r = run_fixture("afterloop", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "afterloop" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        assert(v > 0)"#,
+        #"    })"#,
+        #"    assert_eq(1, 2)"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""status":"failed""#), "no parent failed; {d}")
+    assert(!r.json.contains(#""case":"#), "a failure after the loop names a case; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"pass"},{"label":"b","status":"pass"}]"#), "cases[] is not a and b pass; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("afterloop ... "), "no human FAIL line; {d}")
+    assert(!r.human.contains("afterloop::case["), "the human FAIL line names a case; {d}")
+}
+
+test "the parent reports the first case that failed" {
+    let r = run_fixture("firstfail", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "firstfail" {"#,
+        #"    for_each([("a", 1), ("b", 2), ("c", 3)], fn(v: Int) {"#,
+        #"        if v == 3 { let xs = [0]"#,
+        #"            io.println("{xs.get(v).unwrap()}") }"#,
+        #"        assert(v == 1, "case {v} is wrong")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""case":"b""#), "the parent does not name case b; {d}")
+    assert(r.json.contains(#""user_message":"case 2 is wrong""#), "the parent does not carry case b's message; {d}")
+    assert(r.json.contains(#""cause":"assertion""#), "a later panic took the parent; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"pass"},{"label":"b","status":"failed"},{"label":"c","status":"failed"}]"#), "cases[] is not a pass, b failed, c failed; {d}")
+}
+
+test "a with resource in a panicking case is closed before the next case starts" {
+    let r = run_fixture("withpanic", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"type Res { id: Int }"#,
+        #"impl Closeable for Res { fn close(self) { io.println("closed {self.id}") } }"#,
+        #""#,
+        #"test "withpanic" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        io.println("start {v}")"#,
+        #"        with Res { id: v } as res {"#,
+        #"            let xs = [0]"#,
+        #"            io.println("{xs.get(res.id).unwrap()}")"#,
+        #"        }"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""cases":[{"label":"a","status":"failed"},{"label":"b","status":"failed"}]"#), "cases[] is not a and b failed; {d}")
+    let human = r.human
+    let closed = human.index_of("closed 1")
+    let next = human.index_of("start 2")
+    assert(closed.is_some(), "the resource of the panicking case was never closed; {d}")
+    assert(next.is_some(), "case b did not run; {d}")
+    assert(closed.unwrap() < next.unwrap(), "case b started before the panicking case closed its resource; {d}")
+    assert(human.contains("closed 2"), "the second panicking case did not close its resource; {d}")
+}
+
+test "a failing assert_panics inside a case does not leak its catch frame into the next case" {
+    let r = run_fixture("innerpanics", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "innerpanics" {"#,
+        #"    for_each([("a", "zzz"), ("b", "boom"), ("c", "boom")], fn(want: Str) {"#,
+        #"        assert_panics(matching: want) {"#,
+        #"            panic("boom here")"#,
+        #"        }"#,
+        #"        io.println("caught {want}")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""case":"a""#), "the parent does not name case a; {d}")
+    assert(r.json.contains(#""cause":"assertion""#), "case a is not an assertion failure; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"failed"},{"label":"b","status":"pass"},{"label":"c","status":"pass"}]"#), "a stale frame from case a broke a later case; {d}")
+    assert(r.human.contains("caught boom"), "a later case did not catch its panic; {d}")
+    assert(r.human.contains("innerpanics::case[a] ... "), "the human FAIL line does not name case a; {d}")
+}
+
+test "cases of a test.failing test never carry expected_fail" {
+    let r = run_fixture("xfailcases", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test.failing("xfailcases", reason: "case b is wrong") {"#,
+        #"    for_each([("a", 1), ("b", 2), ("c", 3)], fn(v: Int) {"#,
+        #"        assert(v != 2)"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""expected_fail":true"#), "the parent does not carry expected_fail; {d}")
+    assert(r.json.contains(#""xfail_reason":"case b is wrong""#), "the parent does not carry xfail_reason; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"pass"},{"label":"b","status":"failed"},{"label":"c","status":"pass"}]"#), "cases[] is not a pass, b failed, c pass, or a case carries xfail fields; {d}")
+    assert_eq(r.human_exit, 0, d)
+}
