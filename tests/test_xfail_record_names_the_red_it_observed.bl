@@ -1,0 +1,116 @@
+// A test.failing record that came out as an expected red names the status the test
+// would have had without test.failing in `xfail_observed`, "failed" or "panicked", and
+// an expected-red panic keeps the panic message (spec §8.10.6). No other record carries
+// `xfail_observed`. A skipped test.failing test keeps `expected_fail` and
+// `xfail_reason`. Each row runs a fixture under `build/blink test --json` and under
+// human output.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
+
+type Run { json: Str, json_exit: Int, human: Str, human_exit: Int }
+
+fn run_fixture(tag: Str, lines: List[Str]) -> Run {
+    let name = "xf_observed_{tag}_{getpid()}"
+    let scratch = ".tmp/_test_xfail_observed_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, lines.join("\n"))
+    let j = process_run("build/blink", ["test", "--json", fixture])
+    let h = process_run("build/blink", ["test", fixture])
+    shell_exec("rm -rf {scratch}")
+    Run { json: j.out.concat(j.err_out), json_exit: j.exit_code, human: h.out.concat(h.err_out), human_exit: h.exit_code }
+}
+
+fn diag(r: Run) -> Str {
+    "json exit={r.json_exit}:\n{r.json}\nhuman exit={r.human_exit}:\n{r.human}"
+}
+
+test "an expected red from a failed assertion observes failed" {
+    let r = run_fixture("failed", [
+        #"test.failing("knownfail", reason: "not yet") {"#,
+        #"    assert_eq(1, 2)"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"knownfail","status":"passed""#), "the expected red is not passed; {d}")
+    assert(r.json.contains(#""expected_fail":true,"xfail_reason":"not yet","xfail_observed":"failed""#), "the record does not observe failed; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert(r.human.contains("1 passed, 0 failed (of 1)"), "the expected red does not count as passed; {d}")
+}
+
+test "an expected red from a panic observes panicked and keeps the message" {
+    let r = run_fixture("panicked", [
+        #"test.failing("knownpanic", reason: "not yet") {"#,
+        #"    panic("boom here")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"knownpanic","status":"passed""#), "the expected red is not passed; {d}")
+    assert(r.json.contains(#""xfail_observed":"panicked""#), "the record does not observe panicked; {d}")
+    assert(r.json.contains(#""message":"panic: boom here at "#), "the record lost the panic message; {d}")
+    assert(!r.json.contains(#""cause":"#), "the expected red carries a cause; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert(!r.human.contains("PANIC"), "the expected red says PANIC; {d}")
+    assert(r.human.contains("1 passed, 0 failed (of 1)"), "the expected red does not count as passed; {d}")
+}
+
+test "a panicking for_each case in a test.failing test observes panicked" {
+    let r = run_fixture("casepanic", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test.failing("knowncase", reason: "not yet") {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        assert(v == 1, "case b is wrong")"#,
+        #"        panic("never")"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""xfail_observed":"panicked""#), "the record does not observe the panicked case; {d}")
+    assert(r.json.contains(#""message":"panic: never at "#), "the record lost the panic message; {d}")
+}
+
+test "an unexpected pass and an ordinary test carry no xfail_observed" {
+    let r = run_fixture("nopass", [
+        #"test.failing("fixednow", reason: "was broken") {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+        #"test "plain" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"fixednow","status":"failed""#), "the unexpected pass is not failed; {d}")
+    assert(r.json.contains(#""assertion":"expected failure, got pass""#), "the unexpected pass lost its assertion; {d}")
+    assert(!r.json.contains(#""xfail_observed":"#), "a record that is not an expected red carries xfail_observed; {d}")
+    assert_eq(r.human_exit, 1, d)
+}
+
+test "a skipped test.failing test keeps expected_fail and xfail_reason" {
+    let r = run_fixture("skipped", [
+        #"import std.testing.{skip}"#,
+        #""#,
+        #"test.failing("knownskip", reason: "not yet") {"#,
+        #"    skip("not here")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"knownskip","status":"skipped""#), "the test is not skipped; {d}")
+    assert(r.json.contains(#""expected_fail":true,"xfail_reason":"not yet""#), "the skipped record lost expected_fail or xfail_reason; {d}")
+    assert(!r.json.contains(#""xfail_observed":"#), "the skipped record carries xfail_observed; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert(r.human.contains("1 skipped (of 1)"), "the human summary does not count the skip; {d}")
+}

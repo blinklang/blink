@@ -42,7 +42,7 @@
 # that test test.failing itself hold their rows in source strings, not at top
 # level, so they count 0 like any other file. A report
 # that does not run or does not parse gives null, never 0. A test.failing row
-# that skips does not carry expected_fail in the report, so it is not counted.
+# that skips has status "skipped", so it is not counted.
 #
 # The record also says whether the binary linked the prebuilt compiler
 # archive ("compiler_archive"), read from the binary's own symbols rather than
