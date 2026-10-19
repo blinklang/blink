@@ -62,7 +62,7 @@ import diagnostics.{
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
     UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME,
-    DISCARDED_COLLECTION_COPY, TODO_IN_CODE,
+    DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, NOT_DERIVABLE,
     NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, diag_set_last_assist_at,
@@ -6653,7 +6653,15 @@ fn tc_check_builtin_sig_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeChe
     if fs.type_params_count > 0 {
         tc_check_bounds_for_binds(sig, build_typevar_binds(sig, tids, 0), node)
     }
-    if fn_name == "assert_eq" || fn_name == "assert_ne" { tc_check_assert_eq_args(tids, node) }
+    if fn_name == "assert_eq" || fn_name == "assert_ne" {
+        tc_check_assert_eq_args(tids, node)
+        let a = tc_arg_value_at(args_sl, 0)
+        let b = tc_arg_value_at(args_sl, 1)
+        if tc_has_written_negative_zero(a, b) && tc_is_float_comparison(tids.get(0) ?? -1) && tc_is_float_comparison(tids.get(1) ?? -1) {
+            let family = if fn_name == "assert_eq" { NegativeZeroFamily.TrueForBoth } else { NegativeZeroFamily.FalseForBoth }
+            tc_warn_negative_zero_pair(a, b, family)
+        }
+    }
     fs.ret
 }
 
@@ -22625,8 +22633,111 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
                 }
             }
         }
+        if tc_has_written_negative_zero(node_left(node), node_right(node)) && tc_is_float_comparison(lt) && tc_is_float_comparison(rt) {
+            tc_warn_negative_zero_pair(node_left(node), node_right(node), tc_negative_zero_family(op))
+        }
     }
     return TYPE_BOOL
+}
+
+// W0706 (sections/03_types.md §3.6) fires only where the comparison resolves to the Float
+// impl. A type parameter is not Float here, so a generic body never warns, whatever it is
+// instantiated with. F32 joins by its kind when it exists.
+fn tc_is_float_comparison(tid: Int) -> Bool {
+    tid >= 0 && type_kind(resolve_alias_tid(tid)) == TyKind.Float
+}
+
+// What a comparison family gives for 0.0 and -0.0: the label and the help differ by it.
+type NegativeZeroFamily {
+    TrueForBoth
+    FalseForBoth
+    SameForBoth
+}
+
+fn tc_negative_zero_family(op: Str) -> NegativeZeroFamily {
+    if op == "==" { return NegativeZeroFamily.TrueForBoth }
+    if op == "!=" { return NegativeZeroFamily.FalseForBoth }
+    NegativeZeroFamily.SameForBoth
+}
+
+// A written negative zero: one unary `-` over a float literal with the value zero. The parser
+// keeps no node for parentheses, so `(-0.0)`, `-(0.0)` and `((-((0.0))))` reach here as this
+// one shape, and `-(-0.0)` is a `-` over a `-`, which does not match. A const or a let that
+// holds -0.0 is an Ident, so it does not match either: the check reads the code as written.
+fn tc_is_written_negative_zero(n: Int) -> Bool {
+    if n == -1 || node_kind(n) != NodeKind.UnaryOp || node_op(n) != "-" { return false }
+    let lit = node_left(n)
+    lit != -1 && node_kind(lit) == NodeKind.FloatLit && tc_float_lit_is_zero(node_str_val(lit))
+}
+
+// Read before any operand type: the syntax test is cheap, and almost no comparison passes it.
+fn tc_has_written_negative_zero(a: Int, b: Int) -> Bool {
+    tc_is_written_negative_zero(a) || tc_is_written_negative_zero(b)
+}
+
+// Whether a float literal's text has the value zero: no digit in it is 1-9.
+fn tc_float_lit_is_zero(text: Str) -> Bool {
+    let mut i = 0
+    while i < text.byte_len() {
+        let c = text.byte_at(i)
+        if c >= 49 && c <= 57 { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn tc_warn_negative_zero_pair(a: Int, b: Int, family: NegativeZeroFamily) ! Diag.Report {
+    tc_warn_negative_zero_operand(a, b, family)
+    tc_warn_negative_zero_operand(b, a, family)
+}
+
+// W0706 on `n` when it is a written negative zero compared with `other`. The caret ends at
+// the literal: with no paren node, the closing parens of `-(0.0)` have no column to end on.
+// A span holds one line, so a literal on a later line than its `-` leaves the caret on the `-`.
+// No machine fix: only the author knows whether the code means the sign, negative zero or zero.
+fn tc_warn_negative_zero_operand(n: Int, other: Int, family: NegativeZeroFamily) ! Diag.Report {
+    if !tc_is_written_negative_zero(n) { return }
+    let lit = node_left(n)
+    let end_col = if node_line(lit) == node_line(n) { node_col(lit) + node_str_val(lit).byte_len() } else { node_col(n) + 1 }
+    let label = match family {
+        TrueForBoth => "this comparison is true for 0.0 and -0.0"
+        FalseForBoth => "this comparison is false for 0.0 and -0.0"
+        SameForBoth => "this comparison gives the same result for 0.0 and -0.0"
+    }
+    diag_warn_span_label_at_notes("NegativeZeroComparison", NEGATIVE_ZERO_COMPARISON, "`-0.0` compares the same as `0.0`", n, end_col, label, tc_negative_zero_help(other, family), ["to test for zero, write `0.0`; it means the same and does not warn"])
+}
+
+// The help names the other operand when it is a simple path. Any other operand is bound with
+// `let` first, so the help never writes a call twice.
+fn tc_negative_zero_help(other: Int, family: NegativeZeroFamily) -> Str ! Diag.Report {
+    let path = if other != -1 && tc_index_receiver_is_path(other) { unparse_expr(other) } else { "" }
+    let v = if path != "" { path } else { "v" }
+    let zero_test = if family == NegativeZeroFamily.FalseForBoth {
+        "to test that it is not negative zero, use `{v} != 0.0 || !{v}.is_sign_negative()`"
+    } else {
+        "to test for negative zero, use `{v} == 0.0 && {v}.is_sign_negative()`"
+    }
+    let tests = "to test the sign, use `{v}.is_sign_negative()`\n{zero_test}"
+    if path != "" { return tests }
+    let text = tc_index_text(other)
+    let bind = if text != "" { "bind the other operand first: `let v = {text}`" } else { "bind the other operand first: `let v = ...`" }
+    "{bind}\n{tests}"
+}
+
+// The caller has just checked the argument, so its type is read from the memo: inferring it
+// again would walk each nested call's argument twice per level.
+fn tc_warn_negative_zero_method(obj_t: Int, recv_node: Int, args_sl: Int, family: NegativeZeroFamily) ! Diag.Report {
+    let arg = tc_arg_value_at(args_sl, 0)
+    if arg == -1 || !tc_has_written_negative_zero(recv_node, arg) { return }
+    if !tc_is_float_comparison(obj_t) || !tc_is_float_comparison(tc_lookup_node_tid(arg)) { return }
+    tc_warn_negative_zero_pair(recv_node, arg, family)
+}
+
+// A labelled argument compares its value, so the label is looked through.
+fn tc_arg_value_at(args_sl: Int, i: Int) -> Int {
+    if args_sl == -1 || sublist_length(args_sl) <= i { return -1 }
+    let a = sublist_get(args_sl, i)
+    if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a }
 }
 
 // Whether `n` is a bare variant name (`Pending`, `Running(1)`) that no binding hides, or a
@@ -24560,10 +24671,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // own type, with the Ordering the prelude declares.
         if method == "eq" && tc_scalar_has_eq(obj_k) {
             check_builtin_arg(method, 0, obj_t, args_sl, tc_builtin_recv_label(obj_k))
+            tc_warn_negative_zero_method(obj_t, recv_node, args_sl, NegativeZeroFamily.TrueForBoth)
             return TYPE_BOOL
         }
         if method == "cmp" && tc_scalar_has_ord(obj_k) {
             check_builtin_arg(method, 0, obj_t, args_sl, tc_builtin_recv_label(obj_k))
+            tc_warn_negative_zero_method(obj_t, recv_node, args_sl, NegativeZeroFamily.SameForBoth)
             return tc_compiler_known_tid("Ordering")
         }
 
@@ -24661,6 +24774,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "is_sign_negative" { return TYPE_BOOL }
             if method == "ieee_eq" {
                 check_builtin_arg(method, 0, TYPE_FLOAT, args_sl, "Float")
+                tc_warn_negative_zero_method(obj_t, recv_node, args_sl, NegativeZeroFamily.TrueForBoth)
                 return TYPE_BOOL
             }
         }

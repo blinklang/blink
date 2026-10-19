@@ -1,0 +1,415 @@
+// NegativeZeroComparison (W0706, sections/03_types.md §3.6). `-0.0` and `0.0` are equal in the
+// total order, so a `-` in front of a zero literal cannot change a Float comparison. The
+// warning fires when an operand of a call that resolves to the Float impl of `==`, `!=`, `<`,
+// `<=`, `>`, `>=`, `eq`, `cmp`, `ieee_eq`, or of `assert_eq`/`assert_ne` at T = Float, is a
+// written negative zero: one unary `-` over a zero float literal, with optional parens.
+//
+// It reads the operand as written: a const, a let, `-(-0.0)`, `0.0 * -1.0` and `-x` do not
+// match. It checks the resolved callee, so a generic body, a user `eq` that takes a Float and
+// `contains` do not fire. The span is the operand; the label names the family; the help names
+// `is_sign_negative()` with the other operand's text when that is a simple path, else it says
+// to bind the operand with `let` first. No machine fix.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, lint_set_override}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+// `level` is "" for the default, else the [lints] level set for W0706. A probe source that
+// fails to check would make every "no warning" row pass, so it must give no other error.
+fn probe_with(src: Str, level: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/tc_negzero_src.bl"
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    // After compile_to_program, which resets the [lints] table it loads from the manifest.
+    if level != "" { lint_set_override("W0706", level) }
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut errors: List[Str] = []
+    for d in diag_entries {
+        if (d.severity == "error" || d.severity == "ice") && d.name != "NegativeZeroComparison" { errors.push("{d.line}:{d.col}: {d.code} {d.message}") }
+    }
+    for e in errors { io.eprintln("FAIL: probe error {e}") }
+    assert_eq(errors.len(), 0)
+}
+
+fn probe(level: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    probe_with(probe_src(), level)
+}
+
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.eprintln("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn line_text(src: Str, line: Int) -> Str {
+    src.split("\n").get(line - 1).unwrap()
+}
+
+// Every W0706 row: line, columns, level, message, label, help, notes and fix.
+fn nz_rows() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.name == "NegativeZeroComparison" {
+            out.push("{d.line}:{d.col}-{d.end_col}: {d.severity} {d.code} {d.message} | label: {d.label} | help: {d.help} | notes: {d.notes.join("; ")} | fix: {d.fix_action}")
+        }
+    }
+    out
+}
+
+fn nz_rows_on_line(line: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    for r in nz_rows() {
+        if r.starts_with("{line}:") { out.push(r) }
+    }
+    out
+}
+
+fn dump_rows() {
+    io.eprintln("  all W0706 rows:")
+    for r in nz_rows() { io.eprintln("    {r}") }
+}
+
+fn assert_count_at(marker: Str, want: Int) {
+    let line = line_of(probe_src(), marker)
+    let hits = nz_rows_on_line(line)
+    if hits.len() != want {
+        io.eprintln("FAIL: want {want} W0706 on line {line} ({marker}), got {hits.len()}")
+        dump_rows()
+    }
+    assert_eq(hits.len(), want)
+}
+
+// The one W0706 row on the marked line contains `want`.
+fn assert_warn_at(marker: Str, want: Str) {
+    let line = line_of(probe_src(), marker)
+    let hits = nz_rows_on_line(line)
+    if hits.len() != 1 || !hits.get(0).unwrap().contains(want) {
+        io.eprintln("FAIL: want one W0706 on line {line} ({marker}) containing '{want}'")
+        dump_rows()
+    }
+    assert_eq(hits.len(), 1)
+    assert(hits.get(0).unwrap().contains(want))
+}
+
+fn assert_no_warn_at(marker: Str) {
+    assert_count_at(marker, 0)
+}
+
+// The caret starts at the first `operand` text on the marked line, which starts with its
+// `-`, and ends after the zero literal `lit` in it.
+fn assert_span_at(marker: Str, operand: Str, lit: Str) {
+    let src = probe_src()
+    let line = line_of(src, marker)
+    let at = line_text(src, line).index_of(operand).unwrap()
+    let lit_at = at + operand.index_of(lit).unwrap()
+    assert_warn_at(marker, "{line}:{at + 1}-{lit_at + lit.byte_len() + 1}:")
+}
+
+fn note_tail() -> Str {
+    " | notes: to test for zero, write `0.0`; it means the same and does not warn | fix: "
+}
+
+// The two help lines for an `==` form on the operand text `v`, then the note.
+fn eq_tests(v: Str) -> Str {
+    "to test the sign, use `{v}.is_sign_negative()`\nto test for negative zero, use `{v} == 0.0 && {v}.is_sign_negative()`{note_tail()}"
+}
+
+fn probe_src() -> Str {
+    #"type P { y: Float }
+
+type Q { v: Int }
+
+trait Near {
+    fn eq(self, o: Float) -> Bool
+}
+
+impl Near for Q {
+    fn eq(self, o: Float) -> Bool { o > self.v.to_float() }
+}
+
+const NZ: Float = -0.0
+
+let MODULE_LET: Bool = 1.0 == -0.0  // MOD_LET
+
+fn same[T: Eq](a: T, b: T) -> Bool { a == b }  // GEN_EQ_BODY
+
+fn less[T: Ord](a: T, b: T) -> Bool { a < b }  // GEN_ORD_BODY
+
+fn negate(x: Float) -> Float { -x }
+
+fn rows(x: Float, p: P, q: Q, xs: List[Float], i: Int) {
+    let _ = x == -0.0  // R_EQ
+    let _ = x != -0.0  // R_NE
+    let _ = x < -0.0  // R_LT
+    let _ = x <= -0.0  // R_LE
+    let _ = x > -0.0  // R_GT
+    let _ = x >= -0.0  // R_GE
+    let _ = -0.0 == x  // R_EQ_LEFT
+    let _ = -0.0 < x  // R_LT_LEFT
+    let _ = x.eq(-0.0)  // R_M_EQ
+    let _ = (-0.0).eq(x)  // R_M_EQ_RECV
+    let _ = x.cmp(-0.0)  // R_M_CMP
+    let _ = (-0.0).cmp(x)  // R_M_CMP_RECV
+    let _ = x.ieee_eq(-0.0)  // R_IEEE
+    let _ = (-0.0).ieee_eq(x)  // R_IEEE_RECV
+    let _ = x == (-0.0)  // R_PAREN_OUT
+    let _ = x == -(0.0)  // R_PAREN_IN
+    let _ = x == ((-((0.0))))  // R_PAREN_DEEP
+    let _ = x == -0.00  // R_ZERO_DIGITS
+    let _ = -0.0 == -0.0  // R_BOTH
+    let _ = 0.0 == -0.0  // R_LIT_OTHER
+    let _ = p.y == -0.0  // R_FIELD
+    let _ = p.y != -0.0  // R_FIELD_NE
+    let _ = negate(0.0) == -0.0  // R_CALL
+    let _ = negate(x) < -0.0  // R_CALL_ORD
+    if false { let _ = x == -0.0 }  // R_DEAD
+    let _ = x == -(
+        0.0)  // R_SPLIT
+    let _ = x == -(-0.0)  // N_DOUBLE_NEG
+    let _ = x == 0.0  // N_POS_ZERO
+    let _ = x == -1.0  // N_NEG_ONE
+    let _ = x == -0.5  // N_NEG_HALF
+    let _ = x == NZ  // N_CONST
+    let nz = -0.0
+    let _ = x == nz  // N_LET
+    let _ = xs.contains(-0.0)  // N_CONTAINS
+    let _ = same(x, -0.0)  // N_GEN_CALL
+    let _ = less(x, -0.0)  // N_GEN_ORD_CALL
+    let _ = q.eq(-0.0)  // N_USER_EQ
+    let _ = 0.0 * -1.0 == x  // N_MUL
+    let _ = -x == 0.0  // N_NEG_X
+    let _ = i == -0  // N_INT
+    let _ = -0.0  // N_BARE
+}
+
+@allow(NegativeZeroComparison)
+fn quiet(x: Float) -> Bool { x == -0.0 }  // A_ALLOWED
+
+test "asserts" {
+    assert_eq(negate(0.0), -0.0)  // T_ASSERT_EQ
+    assert_ne(negate(0.0), -0.0)  // T_ASSERT_NE
+    assert_eq(-0.0, negate(0.0))  // T_ASSERT_EQ_LEFT
+    let y = 1.0
+    assert_eq(y, -0.0)  // T_ASSERT_EQ_PATH
+    assert(y == -0.0)  // T_IN_TEST
+    assert_panics {
+        assert(y < -0.0)  // T_IN_PANICS
+    }
+    let n = 0
+    assert_eq(n, -0)  // T_ASSERT_INT
+}
+
+fn main() {
+    rows(1.0, P { y: 1.0 }, Q { v: 1 }, [1.0], 0)
+}
+"#
+}
+
+test "each Float relation warns once on a written -0.0, on either side" {
+    probe("")
+    assert_warn_at("R_EQ", "warning W0706 `-0.0` compares the same as `0.0`")
+    assert_warn_at("R_NE", "W0706")
+    assert_warn_at("R_LT", "W0706")
+    assert_warn_at("R_LE", "W0706")
+    assert_warn_at("R_GT", "W0706")
+    assert_warn_at("R_GE", "W0706")
+    assert_warn_at("R_EQ_LEFT", "W0706")
+    assert_warn_at("R_LT_LEFT", "W0706")
+}
+
+test "eq, cmp and ieee_eq on Float warn with -0.0 as receiver or argument" {
+    probe("")
+    assert_warn_at("R_M_EQ", "W0706")
+    assert_warn_at("R_M_EQ_RECV", "W0706")
+    assert_warn_at("R_M_CMP", "W0706")
+    assert_warn_at("R_M_CMP_RECV", "W0706")
+    assert_warn_at("R_IEEE", "W0706")
+    assert_warn_at("R_IEEE_RECV", "W0706")
+}
+
+test "assert_eq and assert_ne at Float warn on a written -0.0 in either argument" {
+    probe("")
+    assert_warn_at("T_ASSERT_EQ", "W0706")
+    assert_warn_at("T_ASSERT_NE", "W0706")
+    assert_warn_at("T_ASSERT_EQ_LEFT", "W0706")
+    assert_warn_at("T_ASSERT_EQ_PATH", "W0706")
+    assert_no_warn_at("T_ASSERT_INT")
+}
+
+test "parens around the minus or the literal still match" {
+    probe("")
+    assert_warn_at("R_PAREN_OUT", "W0706")
+    assert_warn_at("R_PAREN_IN", "W0706")
+    assert_warn_at("R_PAREN_DEEP", "W0706")
+    assert_warn_at("R_ZERO_DIGITS", "W0706")
+}
+
+test "both operands written as -0.0 give two warnings" {
+    probe("")
+    assert_count_at("R_BOTH", 2)
+    assert_warn_at("R_LIT_OTHER", "W0706")
+}
+
+test "it fires in a dead branch, a test block, an assert_panics body and a module let" {
+    probe("")
+    assert_warn_at("R_DEAD", "W0706")
+    assert_warn_at("T_IN_TEST", "W0706")
+    assert_warn_at("T_IN_PANICS", "W0706")
+    assert_warn_at("MOD_LET", "W0706")
+}
+
+test "a double minus, a nonzero literal, a const, a let and arithmetic do not match" {
+    probe("")
+    assert_no_warn_at("N_DOUBLE_NEG")
+    assert_no_warn_at("N_POS_ZERO")
+    assert_no_warn_at("N_NEG_ONE")
+    assert_no_warn_at("N_NEG_HALF")
+    assert_no_warn_at("N_CONST")
+    assert_no_warn_at("N_LET")
+    assert_no_warn_at("N_MUL")
+    assert_no_warn_at("N_NEG_X")
+    assert_no_warn_at("N_INT")
+    assert_no_warn_at("N_BARE")
+}
+
+test "only the resolved Float impl fires: not contains, a generic body or a user eq" {
+    probe("")
+    assert_no_warn_at("N_CONTAINS")
+    assert_no_warn_at("N_GEN_CALL")
+    assert_no_warn_at("N_GEN_ORD_CALL")
+    assert_no_warn_at("GEN_EQ_BODY")
+    assert_no_warn_at("GEN_ORD_BODY")
+    assert_no_warn_at("N_USER_EQ")
+}
+
+test "the caret covers the written -0.0 operand only" {
+    probe("")
+    assert_span_at("R_EQ", "-0.0", "0.0")
+    assert_span_at("R_EQ_LEFT", "-0.0", "0.0")
+    assert_span_at("R_PAREN_IN", "-(0.0)", "0.0")
+    assert_span_at("R_ZERO_DIGITS", "-0.00", "0.00")
+    assert_span_at("R_M_EQ", "-0.0", "0.0")
+}
+
+test "a literal on a later line than its minus gives a caret on the minus" {
+    probe("")
+    let line = line_of(probe_src(), "R_SPLIT") - 1
+    let at = line_text(probe_src(), line).index_of("-(").unwrap()
+    let hits = nz_rows_on_line(line)
+    if hits.len() != 1 { dump_rows() }
+    assert_eq(hits.len(), 1)
+    assert(hits.get(0).unwrap().starts_with("{line}:{at + 1}-{at + 2}:"))
+}
+
+test "the label names what the comparison does for 0.0 and -0.0" {
+    probe("")
+    let is_true = "label: this comparison is true for 0.0 and -0.0 |"
+    let is_false = "label: this comparison is false for 0.0 and -0.0 |"
+    let same = "label: this comparison gives the same result for 0.0 and -0.0 |"
+    assert_warn_at("R_EQ", is_true)
+    assert_warn_at("R_M_EQ", is_true)
+    assert_warn_at("R_IEEE", is_true)
+    assert_warn_at("T_ASSERT_EQ", is_true)
+    assert_warn_at("R_NE", is_false)
+    assert_warn_at("T_ASSERT_NE", is_false)
+    assert_warn_at("R_LT", same)
+    assert_warn_at("R_LE", same)
+    assert_warn_at("R_GT", same)
+    assert_warn_at("R_GE", same)
+    assert_warn_at("R_M_CMP", same)
+}
+
+test "help golden: a simple path is written into the help" {
+    probe("")
+    assert_warn_at("R_EQ", "| help: {eq_tests("x")}")
+    assert_warn_at("R_EQ_LEFT", "| help: {eq_tests("x")}")
+    assert_warn_at("R_LT", "| help: {eq_tests("x")}")
+    assert_warn_at("R_FIELD", "| help: {eq_tests("p.y")}")
+    assert_warn_at("R_FIELD_NE", "| help: to test the sign, use `p.y.is_sign_negative()`\nto test that it is not negative zero, use `p.y != 0.0 || !p.y.is_sign_negative()`{note_tail()}")
+    assert_warn_at("R_NE", "to test that it is not negative zero, use `x != 0.0 || !x.is_sign_negative()`")
+    assert_warn_at("R_M_EQ_RECV", "use `x == 0.0 && x.is_sign_negative()`")
+    assert_warn_at("T_ASSERT_EQ_PATH", "use `y == 0.0 && y.is_sign_negative()`")
+}
+
+test "help golden: any other operand is bound with let first, and no call is repeated" {
+    probe("")
+    let bind = "| help: bind the other operand first: `let v = negate(0.0)`\n{eq_tests("v")}"
+    assert_warn_at("R_CALL", bind)
+    assert_warn_at("T_ASSERT_EQ", bind)
+    assert_warn_at("T_ASSERT_EQ_LEFT", bind)
+    assert_warn_at("T_ASSERT_NE", "| help: bind the other operand first: `let v = negate(0.0)`\nto test the sign, use `v.is_sign_negative()`\nto test that it is not negative zero, use `v != 0.0 || !v.is_sign_negative()`{note_tail()}")
+    assert_warn_at("R_CALL_ORD", "bind the other operand first: `let v = negate(x)`")
+    assert_warn_at("R_LIT_OTHER", "bind the other operand first: `let v = 0.0`")
+}
+
+test "no machine-applicable fix is offered" {
+    probe("")
+    for r in nz_rows() { assert(r.ends_with("| fix: ")) }
+    assert(nz_rows().len() > 0)
+}
+
+test "an allow of NegativeZeroComparison silences it in that function only" {
+    probe("")
+    assert_no_warn_at("A_ALLOWED")
+    assert_warn_at("R_EQ", "W0706")
+}
+
+test "W0706 off under [lints] silences every row, a module let included" {
+    probe("off")
+    assert_eq(nz_rows().len(), 0)
+}
+
+test "W0706 error under [lints] makes each row an error, except under an allow" {
+    probe("error")
+    assert_warn_at("R_EQ", "error W0706")
+    assert_warn_at("MOD_LET", "error W0706")
+    assert_no_warn_at("A_ALLOWED")
+}
+
+// Each level checks the argument of a Float `eq` once; a second walk per level made this
+// 2^40 walks.
+test "nested Float eq calls check in linear time" {
+    let mut e = "1.0"
+    let mut d = 0
+    while d < 40 {
+        e = "if x.eq({e}) \{ 1.0 } else \{ 2.0 }"
+        d = d + 1
+    }
+    probe_with("fn deep(x: Float) -> Bool \{ x.eq({e}) }\n\nfn main() \{ let _ = deep(1.0) }\n", "")
+}
+
+test.failing(
+    "a Float operand inferred after the comparison still warns",
+    reason: "a comparison does not unify its operand types, so an element type still unknown at `v == -0.0` is not Float there and the check skips it",
+) {
+    probe_with("fn main() \{\n    let mut ys = []\n    for v in ys \{ let _ = v == -0.0 }\n    ys.push(1.0)\n}\n", "")
+    assert_eq(nz_rows().len(), 1)
+}
+
+test.failing(
+    "Float.ne warns on a written -0.0",
+    reason: "`.ne` on a Float does not resolve yet, so the probe gives an unresolved-method error and no W0706",
+) {
+    probe_with("fn main() \{\n    let x = 1.0\n    let _ = x.ne(-0.0)\n}\n", "")
+    assert_eq(nz_rows().len(), 1)
+}
+
+test.failing(
+    "a qualified Float.eq or Float.cmp call warns on a written -0.0",
+    reason: "the qualified call forms resolve without the method hooks that check W0706",
+) {
+    probe_with("fn main() \{\n    let x = 1.0\n    let _ = Float.eq(x, -0.0)\n    let _ = Float.cmp(x, -0.0)\n}\n", "")
+    assert_eq(nz_rows().len(), 2)
+}

@@ -1,0 +1,146 @@
+// A doc example line that fires NegativeZeroComparison (W0706, sections/03_types.md §3.6)
+// must say so with `// warning[NegativeZeroComparison]`, and a marker on a line that does
+// not fire is stale. The compiler decides what fires: a second copy of the rule in this
+// test would drift from it, since it would see no types.
+
+import std.process.{ProcessResult}
+
+fn marker() -> Str { "// warning[NegativeZeroComparison]" }
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn ch(s: Str, i: Int) -> Str {
+    if i < 0 || i >= s.byte_len() { return "" }
+    if s.byte_at(i) >= 128 { return "?" }
+    s.byte_slice(i, i + 1)
+}
+
+// A cheap superset of the §3.6 grammar: a `-`, then spaces, newlines and `(`, then zeros and
+// a `.`. The grammar may span lines, so this reads the whole fence.
+fn may_hold_negative_zero(code: Str) -> Bool {
+    let mut i = 0
+    while i < code.byte_len() {
+        if ch(code, i) == "-" {
+            let mut j = i + 1
+            while ch(code, j) == " " || ch(code, j) == "\n" || ch(code, j) == "(" { j = j + 1 }
+            let digits = j
+            while ch(code, j) == "0" { j = j + 1 }
+            if j > digits && ch(code, j) == "." { return true }
+        }
+        i = i + 1
+    }
+    false
+}
+
+// The primary-span line of each diagnostic with `code` in `blink check --format json` output.
+fn diag_lines(out: Str, code: Str) -> List[Int] {
+    let mut lines: List[Int] = []
+    for row in out.split("\n") {
+        if !row.contains("\"code\":\"{code}\"") { continue }
+        let at = row.byte_index_of("\"span\":\{\"file\":", 0) ?? -1
+        if at < 0 { continue }
+        let key = "\"line\":"
+        let l = row.byte_index_of(key, at) ?? -1
+        if l < 0 { continue }
+        lines.push(row.byte_slice(l + key.byte_len(), row.byte_len()).to_int())
+    }
+    lines
+}
+
+fn has_parse_error(out: Str) -> Bool {
+    out.contains("\"code\":\"E11")
+}
+
+// The lines (1-based, within `src`) where W0706 fires, or None when `src` does not parse.
+fn fire_lines(dir: Str, name: Str, src: Str) -> Option[List[Int]] {
+    let path = "{dir}/{name}.bl"
+    write_file(path, src)
+    let r = process_run("build/blink", ["check", path, "--format", "json"])
+    let out = "{r.out}{r.err_out}"
+    if has_parse_error(out) { return None }
+    Some(diag_lines(out, "W0706"))
+}
+
+// A fence may be a fragment, so a fence that does not parse is retried inside a function.
+fn fence_fire_lines(dir: Str, name: Str, body: Str) -> Option[List[Int]] {
+    match fire_lines(dir, name, "{body}\n") {
+        Some(lines) => return Some(lines)
+        None => {}
+    }
+    let wrapped = fire_lines(dir, "{name}_wrapped", "fn __doc_example() \{\n{body}\n}\n")?
+    let mut lines: List[Int] = []
+    for l in wrapped { lines.push(l - 1) }
+    Some(lines)
+}
+
+// Each problem in one doc file, as "file:line: what", and the number of lines that fire.
+// `doc` numbers the file, so each fence gets its own scratch file.
+fn check_doc(dir: Str, doc: Int, path: Str, text: Str) -> (List[Str], Int) {
+    let mut bad: List[Str] = []
+    let mut hits = 0
+    let lines = text.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines.get(i) ?? ""
+        if !line.trim().starts_with("```blink") {
+            i = i + 1
+            continue
+        }
+        let mut end = i + 1
+        while end < lines.len() && !(lines.get(end) ?? "").trim().starts_with("```") {
+            end = end + 1
+        }
+        let mut body_lines: List[Str] = []
+        let mut k = i + 1
+        while k < end {
+            body_lines.push(lines.get(k) ?? "")
+            k = k + 1
+        }
+        let body = body_lines.join("\n")
+        if may_hold_negative_zero(body) || body.contains(marker()) {
+            match fence_fire_lines(dir, "fence_{doc}_{i + 1}", body) {
+                None => bad.push("{path}:{i + 1}: cannot be checked: it does not parse alone or inside a function")
+                Some(fired) => {
+                    let mut r = 0
+                    while r < body_lines.len() {
+                        let l = body_lines.get(r) ?? ""
+                        let hit = fired.contains(r + 1)
+                        let marked = l.contains(marker())
+                        if hit { hits = hits + 1 }
+                        if hit && !marked { bad.push("{path}:{i + 2 + r}: fires W0706 but has no marker: {l.trim()}") }
+                        if marked && !hit { bad.push("{path}:{i + 2 + r}: has the marker but does not fire W0706: {l.trim()}") }
+                        r = r + 1
+                    }
+                }
+            }
+        }
+        i = end + 1
+    }
+    (bad, hits)
+}
+
+fn doc_files() -> List[Str] {
+    let r = sh("ls sections/*.md llms.md llms-full.md")
+    assert_eq(r.exit_code, 0)
+    r.out.trim().split("\n")
+}
+
+test "every doc example line that fires W0706 carries the marker, and no other line does" {
+    let dir = sh("mktemp -d /tmp/blink_nz_docmarker.XXXXXX").out.trim()
+    let mut bad: List[Str] = []
+    let mut hits = 0
+    let mut doc = 0
+    for path in doc_files() {
+        doc = doc + 1
+        let (b, h) = check_doc(dir, doc, path, read_file(path))
+        hits = hits + h
+        for x in b { bad.push(x) }
+    }
+    let _ = sh("rm -rf {dir}")
+    for b in bad { io.eprintln(b) }
+    assert_eq(bad.len(), 0)
+    // §3.6 marks five lines itself, so a scan that checks no fence fails here.
+    assert(hits >= 5)
+}

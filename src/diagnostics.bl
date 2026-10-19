@@ -251,6 +251,7 @@ pub const UNREACHABLE_CODE        = "W0700"
 pub const ARENA_EFFECT_REDUNDANT  = "W0701"
 pub const TODO_IN_CODE            = "W0703"
 // W0702 retired (was BITWISE_PRECEDENCE — bitwise operators now bind tighter than comparison, and a mix of operator groups is E1127)
+pub const NEGATIVE_ZERO_COMPARISON = "W0706"
 pub const UNAUDITED_FFI           = "W0800"
 pub const AUDIT_GATED_SUPPRESSION = "E0837"
 pub const MISSING_CANONICAL_HEADER = "W0812"
@@ -449,6 +450,9 @@ pub type DiagEntry {
     assist_text: Str = ""
     assist_line: Int = 0
     assist_col: Int = 0
+    // Printed after the carets: what the marked text does, where the message says what is
+    // wrong with it.
+    label: Str = ""
 }
 
 type FileRange {
@@ -896,6 +900,19 @@ pub fn diag_warn_span_at_notes(name: Str, code: Str, message: Str, node_id: Int,
     diag_source_file = saved_file
 }
 
+// diag_warn_span_at_notes with a label after the carets. The label goes on only when the
+// warning was recorded: an `off` level or a repeat records nothing, and the last entry then
+// belongs to another diagnostic.
+pub fn diag_warn_span_label_at_notes(name: Str, code: Str, message: Str, node_id: Int, end_col: Int, label: Str, help: Str, notes: List[Str]) ! Diag.Report {
+    let before = diag_entries.len()
+    diag_warn_span_at_notes(name, code, message, node_id, end_col, help, notes)
+    if diag_entries.len() > before {
+        let idx = diag_entries.len() - 1
+        let d = diag_entries.get(idx).unwrap()
+        diag_entries.set(idx, DiagEntry { label: label, ..d })
+    }
+}
+
 // A warning about a whole file rather than a node in it: module resolution reports one
 // before the file is parsed, so no node id exists yet.
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -1142,12 +1159,14 @@ fn diag_json_line(idx: Int) -> Str {
     let help = d.help
     let el = d.end_line
     let ec = d.end_col
-    let mut span = "\"span\":\{\"file\":\"{file}\",\"line\":{line},\"col\":{col}"
-    if el > 0 {
-        span = span.concat(",\"end_line\":{el},\"end_col\":{ec}")
-    }
-    span = span.concat("}")
+    let pos = if el > 0 { "\"line\":{line},\"col\":{col},\"end_line\":{el},\"end_col\":{ec}" } else { "\"line\":{line},\"col\":{col}" }
+    let span = "\"span\":\{\"file\":\"{file}\",{pos}}"
     let mut json = "\{\"severity\":\"{sev}\",\"name\":\"{name}\",\"code\":\"{code}\",\"message\":\"{msg}\",{span}"
+    // The schema of sections/06_tooling.md §8.6 lists labels with their own spans; the one
+    // label an entry holds marks its primary span.
+    if d.label != "" {
+        json = json.concat(",\"labels\":[\{\"span\":\{{pos}},\"message\":\"").concat(json_escape(d.label)).concat("\"}]")
+    }
     if help != "" {
         json = json.concat(",\"help\":\"").concat(json_escape(help)).concat("\"")
     }
@@ -1250,7 +1269,8 @@ fn diag_human_text(idx: Int) -> Str {
             let caret_len = if d.end_col > d.col { d.end_col - d.col } else { 1 }
             let caret_col = if d.col > 1 { d.col - 1 } else { 0 }
             let caret_pad = str_repeat(" ", caret_col)
-            sb.write("{gutter_pad}| {caret_pad}{str_repeat("^", caret_len)}\n")
+            let label = if d.label != "" { " {d.label}" } else { "" }
+            sb.write("{gutter_pad}| {caret_pad}{str_repeat("^", caret_len)}{label}\n")
         }
     }
     let mut ni = 0
@@ -1618,6 +1638,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == ARENA_EFFECT_REDUNDANT {
         return "W0701 -- ArenaEffectRedundant\n\nA function declares `! Arena` but every Arena-effectful call in its\nbody is already contained inside a `with arena \{ }` block. Because\n`with arena \{ }` is the escape boundary for the `! Arena` marker,\nthe outer annotation adds no information.\n\nFix: remove `! Arena` from the function signature, or add\n@allow(ArenaEffectRedundant) if the annotation is intentional for\ndocumentation or API stability.\n\n  fn wrap() -> Int \{                     // OK -- no marker needed\n      with arena \{ consume([1, 2]) }\n  \}\n\n  fn wrap() -> Int ! Arena \{             // W0701\n      with arena \{ consume([1, 2]) }\n  \}"
+    }
+    if code == NEGATIVE_ZERO_COMPARISON {
+        return "W0706 -- NegativeZeroComparison\n\nAn operand of a Float comparison is a written negative zero: a `-` in\nfront of a zero float literal, with optional parentheses. -0.0 and 0.0\nare equal in the Float order and in IEEE equality, so the `-` cannot\nchange the result. Code that writes `x == -0.0` usually means a sign\ntest, but that test is also true for 0.0.\n\n                                     x = 0.0    x = -0.0\n  x == -0.0                          true       true      // W0706\n  x.ieee_eq(-0.0)                    true       true      // W0706\n  x.is_sign_negative()               false      true\n  x.to_bits() == (-0.0).to_bits()    false      true\n\nThe warning covers `==`, `!=`, `<`, `<=`, `>`, `>=`, `eq`, `ne`, `cmp` and\n`ieee_eq` on Float, and `assert_eq` and `assert_ne` when the values are\nFloat. It fires in a branch that never runs, in tests and in\n`assert_panics` bodies. A generic body does not warn.\n\nThe check reads the code as written. A `const` or `let` that holds -0.0\nis not checked, and moving -0.0 into one does not make a sign test\ncorrect. A call that compares inside its own body is not checked\neither, so `xs.contains(-0.0)` gives no warning.\n\nFix: to test the sign, use `x.is_sign_negative()`. To test for negative\nzero, use `x == 0.0 && x.is_sign_negative()`. To test for zero, write\n`0.0`. No machine fix is offered: only you know which one the code\nmeans.\n\nSuppress with @allow(NegativeZeroComparison) on the function, or set\nthe level with W0706 = \"off\" or \"error\" under [lints]. A module-scope\n`let` or `const` has no function, so only [lints] applies there."
     }
     if code == TODO_IN_CODE {
         return "W0703 -- TodoInCode\n\nA call resolves to the built-in `todo()`, which marks code that is not\nwritten yet. The call panics with `not yet implemented` if it runs, so\nthe warning lets CI find each one before a release.\n\n  fn refund(order: Order) -> Int \{\n      match order.status \{\n          Pending => 0\n          Shipped => order.total\n          Cancelled => todo(\"refund rules\")   // W0703\n      }\n  }\n\nIt fires in every context, test blocks included. A function or local\nnamed `todo` that the program declares is not the built-in and gets no\nwarning. `unreachable()` has no warning: it states that a path can\nnever run, not that code is missing.\n\nFix: write the missing code. In a test that is not finished, mark the\ntest `@skip(\"reason\")` instead.\n\n  @skip(\"waiting on the refund rules\")\n  test \"refund of a cancelled order\" \{ ... }\n\nSuppress with `@allow(TodoInCode)`, or set the level with\n`W0703 = \"off\"` or `\"error\"` under `[lints]` in blink.toml."

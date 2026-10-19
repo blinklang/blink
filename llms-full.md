@@ -794,7 +794,7 @@ let first_two = names
 | `Float.from_bits(b)` | Float | Value with bit pattern `b: U64` (`F32.from_bits(U32)`); every pattern is valid, NaN payloads are kept |
 | `.is_sign_negative()` | Bool | The sign bit: `true` for `-0.0` and for a NaN with the sign bit set |
 
-`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign, use `x.is_sign_negative()`. Equal bits imply `==`, but `==` does not imply equal bits. `to_bits`, `from_bits` and `is_sign_negative` need no import.
+`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign, use `x.is_sign_negative()`. A comparison with a written `-0.0` operand (`x == -0.0`, `x < -0.0`, `x.ieee_eq(-0.0)`, `assert_eq(x, -0.0)`) gives the same result for `0.0` and warns `NegativeZeroComparison` (W0706). To test for negative zero, use `x == 0.0 && x.is_sign_negative()`. Equal bits imply `==`, but `==` does not imply equal bits. `to_bits`, `from_bits` and `is_sign_negative` need no import.
 
 ## Option[T] Methods
 

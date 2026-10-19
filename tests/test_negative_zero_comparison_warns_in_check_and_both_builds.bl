@@ -1,0 +1,141 @@
+// NegativeZeroComparison (W0706, sections/03_types.md §3.6) is a typecheck warning, so
+// `blink check` and both builds report the same rows, each once, with the caret on the
+// written -0.0 and the label after it. `[lints] W0706 = "error"` in blink.toml stops all
+// three. `blink explain W0706` shows the forms side by side for 0.0 and -0.0.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and `geo/sim.bl`, with `lints` appended to blink.toml.
+fn project(lints: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_negzero_cmp.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n{lints}")
+    write_file("{dir}/src/main.bl", main_src())
+    write_file("{dir}/src/geo/sim.bl", sim_src())
+    dir
+}
+
+fn main_src() -> Str {
+    #"import geo.sim.{below}
+
+fn classify(x: Float) -> Str {
+    if x == -0.0 { return "negative zero" }
+    "other"
+}
+
+fn main() {
+    io.println(classify(0.0))
+    io.println("{below(1.0)}")
+}
+"#
+}
+
+fn sim_src() -> Str {
+    #"pub fn below(y: Float) -> Bool {
+    y < -0.0
+}
+"#
+}
+
+fn count(hay: Str, needle: Str) -> Int {
+    hay.split(needle).len() - 1
+}
+
+// `blink <args> src/main.bl` run in the package `dir`, stderr folded into stdout.
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn assert_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert_eq(bad.len(), 0)
+}
+
+fn run_all(lints: Str) -> List[(Str, ProcessResult)] {
+    let dir = project(lints)
+    let mut out: List[(Str, ProcessResult)] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        out.push((args, blink_in(dir, args)))
+    }
+    let _ = sh("rm -rf {dir}")
+    out
+}
+
+test "check and both builds give the same two warnings, once each" {
+    let mut bad: List[Str] = []
+    let main_caret = "  |             ^^^^ this comparison is true for 0.0 and -0.0\n"
+    let sim_caret = "  |         ^^^^ this comparison gives the same result for 0.0 and -0.0\n"
+    for (args, r) in run_all("") {
+        let wants = [
+            "warning[NegativeZeroComparison]: `-0.0` compares the same as `0.0`\n  --> src/main.bl:4:13\n",
+            main_caret,
+            "  note: to test for zero, write `0.0`; it means the same and does not warn\n  help: to test the sign, use `x.is_sign_negative()`\n  help: to test for negative zero, use `x == 0.0 && x.is_sign_negative()`\n",
+            "  --> src/geo/sim.bl:2:9\n",
+            sim_caret,
+            "  help: to test the sign, use `y.is_sign_negative()`\n"
+        ]
+        let mut missing: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { missing.push(w) }
+        }
+        let n = count(r.out, "warning[NegativeZeroComparison]")
+        if r.exit_code != 0 || missing.len() > 0 || n != 2 {
+            bad.push("blink {args}: exit {r.exit_code}, {n} warnings, missing {missing.join(" | ")}\n{r.out}")
+        }
+    }
+    assert_none(bad)
+}
+
+test "W0706 = error under [lints] stops check and both builds" {
+    let mut bad: List[Str] = []
+    for (args, r) in run_all("\n[lints]\nW0706 = \"error\"\n") {
+        let n = count(r.out, "error[NegativeZeroComparison]")
+        if r.exit_code == 0 || n != 2 || r.out.contains("internal compiler error") {
+            bad.push("blink {args}: exit {r.exit_code}, {n} errors\n{r.out}")
+        }
+    }
+    assert_none(bad)
+}
+
+test "W0706 = off under [lints] silences check and both builds" {
+    let mut bad: List[Str] = []
+    for (args, r) in run_all("\n[lints]\nW0706 = \"off\"\n") {
+        if r.exit_code != 0 || r.out.contains("NegativeZeroComparison") {
+            bad.push("blink {args}: exit {r.exit_code}\n{r.out}")
+        }
+    }
+    assert_none(bad)
+}
+
+test "explain W0706 shows the forms side by side for 0.0 and -0.0" {
+    let r = sh("$(pwd)/build/blink explain W0706 2>&1")
+    assert_eq(r.exit_code, 0)
+    let wants = [
+        "W0706 -- NegativeZeroComparison",
+        "x = 0.0    x = -0.0",
+        "  x == -0.0                          true       true",
+        "  x.ieee_eq(-0.0)                    true       true",
+        "  x.is_sign_negative()               false      true",
+        "  x.to_bits() == (-0.0).to_bits()    false      true",
+        "moving -0.0 into one does not make a sign test",
+        "`xs.contains(-0.0)` gives no warning"
+    ]
+    for w in wants {
+        if !r.out.contains(w) { io.eprintln("missing: {w}\n{r.out}") }
+        assert(r.out.contains(w))
+    }
+}
+
+test "the JSON row carries the label on the operand's span and no fix" {
+    let dir = project("")
+    let r = blink_in(dir, "check --json")
+    let _ = sh("rm -rf {dir}")
+    let want = "\"span\":\{\"file\":\"src/main.bl\",\"line\":4,\"col\":13,\"end_line\":4,\"end_col\":17},\"labels\":[\{\"span\":\{\"line\":4,\"col\":13,\"end_line\":4,\"end_col\":17},\"message\":\"this comparison is true for 0.0 and -0.0\"}]"
+    if !r.out.contains(want) { io.eprintln("missing: {want}\n{r.out}") }
+    assert(r.out.contains(want))
+    assert(!r.out.contains("\"fix\""))
+}
