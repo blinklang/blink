@@ -2770,7 +2770,8 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
     if tc_boundary_check_active == 0 || call_node < 0 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     if fs.type_params_count == 0 { return }
-    if tc_call_open_group.contains_key(call_node) == 0 { tc_call_open_calls.push(call_node) }
+    let prev = tc_call_open_group.get(call_node) ?? -1
+    if prev < 0 { tc_call_open_calls.push(call_node) }
     tc_call_open_group.insert(call_node, tc_call_open_tids.len())
     tc_call_open_tids.push(sig)
     tc_call_open_tids.push(self_offset)
@@ -2790,6 +2791,18 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
     }
     let keyed = tc_fn_hash_obligations(sig).len() > 0
     let first = tc_call_open_tids.len() - fs.type_params_count
+    // One call has one set of binders. The body walk infers a call again after its argument
+    // or statement already did, and that inference mints fresh metavariables, so an expected
+    // type that filled the first set must reach the new one.
+    if prev >= 0 && tc_call_open_tids.get(prev).unwrap() == sig {
+        let mut li = 0
+        while li < fs.type_params_count {
+            let was = tc_call_open_tids.get(prev + 3 + li).unwrap()
+            let now = tc_call_open_tids.get(first + li).unwrap()
+            if was >= 0 && now >= 0 { let _ = tc_unify(was, now) }
+            li = li + 1
+        }
+    }
     let mut oi = 0
     while oi < fs.type_params_count {
         let tid = tc_call_open_tids.get(first + oi).unwrap()
@@ -2847,15 +2860,6 @@ fn tc_drop_deferred_conversion(call_node: Int) {
 
 fn tc_open_group_is_deferred_conversion(g: Int) -> Bool {
     tc_call_open_tids.get(g).unwrap() == -2
-}
-
-// Whether `node` is a generic call or a conversion that recorded a group, whose binders the
-// expected type may fill (sections/03_types.md 3.3) as a later use does. A bare Map()/Set()
-// key group is not a call.
-fn tc_node_is_recorded_call(node: Int) -> Bool {
-    let g = tc_call_open_group.get(node) ?? -1
-    if g < 0 { return false }
-    tc_call_open_tids.get(g).unwrap() != -1 || tc_open_group_is_conversion(g)
 }
 
 // Whether the group at `g` is a conversion call's (tc_note_conversion_call).
@@ -4834,46 +4838,12 @@ pub fn tc_ret_mint_at(call_node: Int, arity: Int, pi: Int) -> Int {
     tc_resolve(tid)
 }
 
-// Did THIS node mint return-only metavars? The let-target pin is gated on it, so that
-// caller reaches exactly the under-determination this ticket introduced and nothing else.
-//
-// Without the gate the pin also fires on an annotated let whose initializer is a struct
-// LITERAL carrying field metavars — `let x: Box[Map[Float,Int]] = Box { value: Map() }`.
-// That is a different mechanism with a different owner, and pinning it changes emitted C
-// two ways at once: it fixes a latent kops miscompile (an Int-keyed Set hashed
-// as a string) and it drives a Float key all the way to resolve_ctor_kops_elem, which has
-// no vtable for one and emits a BLINK_COMPILER_BUG_ sentinel — an invalid C identifier.
-// Both are real findings about the struct-literal path, both are filed, and neither is
-// this ticket's to decide.
-//
-// The half of that which was a BLOCKER is now gone: the enforcement gap it named — a
-// declared `Map[Float,_]` rejected by validate_keyed_ann while the same type reached
-// through a struct type-arg was not — is closed by tc_validate_type_arg_hashability, so
-// the Float MVCE above no longer reaches codegen at all and the sentinel arm is
-// unreachable from it. What remains is the kops half, which is a genuine question about
-// the struct-literal path and still not this gate's to answer. Widening the gate is now
-// a decision, not a wait.
+// Did THIS node mint return-only metavars? A struct-literal field reads it to tell a
+// generic call's under-determination from a literal's own field metavars.
 fn tc_node_has_ret_mint(n: Int) -> Int {
     if n < 0 || n >= tc_ret_mint_start.len() { return 0 }
     if tc_ret_mint_start.get(n).unwrap() < 0 { return 0 }
     1
-}
-
-// The shared pin_ok gate for a declared-type pin, used by the LetBinding and
-// Assignment arms so both spell it once. The value minted a return-only group (the
-// generic-call path), OR the declared head is a container/carrier whose element
-// slots a concrete annotation determines: List/Map/Set/Option/Result carry their slots
-// on inner1/inner2, so a fully-concrete declared head (no bare typevar) can pin an
-// under-determined initializer without the struct-literal-field-metavar ambiguity
-// that keeps Struct/Enum heads on the mint path above.
-fn tc_pin_ok_for_declared(val: Int, declared_tid: Int) -> Int {
-    if tc_node_has_ret_mint(val) != 0 { return 1 }
-    if tc_node_is_recorded_call(val) { return 1 }
-    let dk = type_kind(resolve_alias_tid(declared_tid))
-    if dk == TyKind.List || dk == TyKind.Map || dk == TyKind.Set || dk == TyKind.Option || dk == TyKind.Result {
-        return 1
-    }
-    0
 }
 
 // A generic call's return type, with its type params substituted from the call's
@@ -5120,22 +5090,20 @@ fn tc_arm_tail_value_node(body: Int) -> Int {
 // whether it fills the call's binders. Each tail pins on its own because the merged type of an
 // if/match over a generic struct carries only one arm's metavar (type_merge keeps the first
 // side), and the value itself pins too, since a merged type may hold a metavar no arm does.
-// `gated` applies tc_pin_ok_for_declared at each level, as a let or an assignment needs; a
-// declared return pins without it.
-fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int, gated: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if !gated || tc_pin_ok_for_declared(val, declared_tid) != 0 {
-        tc_pin_tail_ret_generic(declared_tid, val_tid)
-    }
+// A let, an assignment, an argument and a return all pin through here, so a position cannot
+// fill a binder another position leaves open.
+fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_pin_tail_ret_generic(declared_tid, val_tid)
     let k = node_kind(val)
     if k == NodeKind.Block {
-        tc_pin_declared_into_tail(declared_tid, val, gated)
+        tc_pin_declared_into_tail(declared_tid, val)
         return
     }
     if k == NodeKind.IfExpr {
         let en = node_else_body(val)
         if en == -1 { return }
-        tc_pin_declared_into_tail(declared_tid, node_then_body(val), gated)
-        tc_pin_declared_into_tail(declared_tid, en, gated)
+        tc_pin_declared_into_tail(declared_tid, node_then_body(val))
+        tc_pin_declared_into_tail(declared_tid, en)
         return
     }
     if k == NodeKind.MatchExpr {
@@ -5143,16 +5111,16 @@ fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int, gated: 
         if arms == -1 { return }
         let mut i = 0
         while i < sublist_length(arms) {
-            tc_pin_declared_into_tail(declared_tid, node_body(sublist_get(arms, i)), gated)
+            tc_pin_declared_into_tail(declared_tid, node_body(sublist_get(arms, i)))
             i = i + 1
         }
     }
 }
 
-fn tc_pin_declared_into_tail(declared_tid: Int, body: Int, gated: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_pin_declared_into_tail(declared_tid: Int, body: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let v = tc_arm_tail_value_node(body)
     if v < 0 { return }
-    tc_pin_declared_into_value(declared_tid, v, tc_pin_tail_tid(v), gated)
+    tc_pin_declared_into_value(declared_tid, v, tc_pin_tail_tid(v))
 }
 
 // The tid the checked walk recorded for a tail inside a value. A fresh infer_type would mint
@@ -5294,7 +5262,7 @@ fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCh
             // implicit tail passes the value node itself.
             let vnode = if node_kind(at_node) == NodeKind.Return { node_value(at_node) } else { at_node }
             if vnode >= 0 {
-                tc_pin_declared_into_value(tc_current_fn_ret, vnode, val_t, false)
+                tc_pin_declared_into_value(tc_current_fn_ret, vnode, val_t)
             } else {
                 tc_pin_tail_ret_generic(tc_current_fn_ret, val_t)
             }
@@ -5768,6 +5736,18 @@ fn tc_concrete_binds(binds: Map[Str, Int]) -> Map[Str, Int] {
 // One argument against its parameter type `ptid`, answering the argument's type.
 // Saves and restores tc_construct_hint around infer_type.
 @allow(UnrestoredMutation)
+// A parameter type is an expected type like a let annotation or a return type
+// (sections/03_types.md 3.3), so it reaches a call inside a block or a branch of the
+// argument too. The unify above binds only the merged type, which for an if/match over
+// a generic struct carries one arm's metavar. A parameter type that still holds a bare
+// typevar names the callee's own parameter, which no caller metavar may bind.
+fn tc_pin_param_into_arg(ptid: Int, arg_node: Int, arg_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_tid_has_bare_typevar(ptid) != 0 { return }
+    let v = if node_kind(arg_node) == NodeKind.NamedArg { node_value(arg_node) } else { arg_node }
+    if v < 0 { return }
+    tc_pin_declared_into_value(tc_resolve(ptid), v, arg_t)
+}
+
 fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_seed_expected_into_value(arg_node, ptid)
     let saved_hint = tc_construct_hint
@@ -5795,6 +5775,8 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
     if tc_tid_has_unbound_metavar(arg_t) != 0 || tc_tid_has_unbound_metavar(ptid) != 0 {
         if tc_unify(ptid, arg_t) == 0 {
             tc_arg_mismatch(fn_name, idx + 1, arg_node, ptid, arg_t)
+        } else {
+            tc_pin_param_into_arg(ptid, arg_node, arg_t)
         }
     } else {
         let mut lit_to_int = 0
@@ -5824,6 +5806,10 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
         }
         if lit_to_int == 0 && (types_compatible(arg_t, ptid) == 0 || tc_value_misses_never_slot(ptid, arg_t) != 0) {
             tc_arg_mismatch(fn_name, idx + 1, arg_node, ptid, arg_t)
+        } else if lit_to_int == 0 {
+            // A merged if/match type can read concrete from one arm while another arm's
+            // call still holds an open binder.
+            tc_pin_param_into_arg(ptid, arg_node, arg_t)
         }
     }
     arg_t
@@ -5863,6 +5849,8 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
         }
         if lit_ok == 0 && tc_unify(expected_t, arg_t) == 0 {
             tc_arg_mismatch(label, arg_idx + 1, value_node, expected_t, arg_t)
+        } else {
+            tc_pin_param_into_arg(expected_t, value_node, arg_t)
         }
         return
     }
@@ -5880,11 +5868,15 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     if lit_to_int == 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
         if tc_unify(expected_t, arg_t) == 0 {
             tc_arg_mismatch(label, arg_idx + 1, value_node, expected_t, arg_t)
+        } else {
+            tc_pin_param_into_arg(expected_t, value_node, arg_t)
         }
         return
     }
     if lit_to_int == 0 && (types_compatible(arg_t, expected_t) == 0 || tc_value_misses_never_slot(expected_t, arg_t) != 0) {
         tc_arg_mismatch(label, arg_idx + 1, value_node, expected_t, arg_t)
+    } else if lit_to_int == 0 {
+        tc_pin_param_into_arg(expected_t, value_node, arg_t)
     }
 }
 
@@ -8754,9 +8746,8 @@ fn tc_evfield_structural_tid(ann_node: Int, bare_tid: Int, self_enum: Str, is_ro
 //     struct literal in the program. Answering "can this mint" without inferring
 //     keeps the walk free for the overwhelming majority of literals.
 //
-//   • SCOPE. It STRUCTURALLY excludes the hazard the pin doc at tc_node_has_ret_mint
-//     warns about — `let x: Box[Map[Float,Int]] = Box { value: Map() }`, which drives
-//     a Float key into resolve_ctor_kops_elem and out the BLINK_COMPILER_BUG_ escape.
+//   • SCOPE. It STRUCTURALLY excludes a bare ctor field value such as
+//     `Box { value: Map() }`, whose key the field's own metavar carries, not a call's.
 //     `Map()`/`Set()`/`[]`/`None` are builtins handled long before lookup_fnsig, so
 //     the lookup misses and this returns 0. The field pin therefore cannot reach a
 //     bare ctor field value at all; that shape stays exactly where it is today.
@@ -27712,54 +27703,19 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 if !tc_closure_checked_against(val, declared_tid) { tc_report_declared_mismatch("variable `{vname}`: declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}{tc_fn_mismatch_suffix(declared_tid, inferred_tid)}", node, val, declared_tid, inferred_tid) }
             } else {
                 // A declared let type is an expected-type source for the value's
-                // metavars, not only something to compare against. This arm otherwise
-                // only compares and then discards `inferred_tid` for `final_tid =
-                // declared_tid`, so `let e: RGT[Int] = mk()` left the α that
-                // instantiate_return_type minted for mk's return-only T unbound — the
-                // declared instantiation was right there and never written down.
+                // metavars (sections/03_types.md 3.3), not only something to compare
+                // against: `let e: RGT[Int] = mk()` must fill the α that
+                // instantiate_return_type minted for mk's return-only T, and `let m:
+                // Map[Str, Int] = Map()` must fill the ctor's key and value. The pin
+                // unifies in place, so one bind solves the mono name and the field
+                // ctor's key operations together.
                 //
-                // In the COMPATIBLE branch only, and via the same in-place unify the
-                // tail-return site uses: the α integers in the value's instance arg
-                // list are the same integers its fields hold, so one bind solves the
-                // mono name and the field ctor's kops vtable together. Placing it here
-                // rather than before the compare means it can never turn a reported
-                // mismatch into a silent success.
-                //
-                // The mint gate is no longer the ONLY way in. It asks "did instantiate_return_type
-                // register a return-only metavar group for this call node", which only a GENERIC
-                // FN CALL ever does, so a builtin container ctor never qualified: `let m: Map[Str,
-                // List[Int]] = Map()` left the ctor node at `Map[α, β]` with both metavars unbound
-                // while the declared instantiation sat right there.
-                //
-                // The second way in is deliberately narrow, and each clause paid for itself by
-                // breaking a pinned test when it was absent:
-                //
-                //   • Map/Set HEAD only. The struct/enum heads tc_pin_admits_declared also
-                //     admits stay mint-gated. `let e: GT[QB[Int]] = GT { s: Set() }` binds a
-                //     FIELD's α, not the binding's, and making `Set[QB[Int]]` concrete drives
-                //     kops_table_name down its fail-closed branch — QB carries no Hash derive,
-                //     so there is genuinely no table and the compiler emits
-                //     BLINK_COMPILER_BUG_kops. That program's hazard is real and pre-existing
-                //     (the annotation-only hashability validators); revealing it here would
-                //     report it as a C compile error instead of a diagnostic.
-                //   • A bare type parameter of THIS declaration is pinned too. `let m: Map[K, V]
-                //     = Map()` inside `fn f[K, V]()` gets `α := K`, which is not the loss it
-                //     reads as: monomorphization substitutes f's own parameters once per
-                //     instance of f's body, and a body no instance reaches is never lowered.
-                //     Refusing the pin left the ctor at `Map[α, β]` with both metavars
-                //     unbound, which is the one hole nothing downstream can fill -- the key
-                //     type chooses the container's key operations, and an unbound key answers
-                //     no table. tc_unify holds the licence for this one call and keys it on the
-                //     binder node, so a same-spelled parameter of another declaration still
-                //     unifies vacuously.
-                //
-                // An alias key needs no gate: resolve_type_parts now peels a transparent
-                // `type Port = Int` at the tid leaf, so `Map[Port, Int]` already carries Int
-                // in its key slot and pinning commits the canonical spelling.
-                //
-                // Two gates then remain inside tc_pin_tail_ret_generic and they are the shared
-                // ones: an admitted declared head, and an actually-unbound metavar in the value.
-                tc_pin_declared_into_value(declared_tid, val, inferred_tid, true)
+                // In the COMPATIBLE branch only, so a pin can never turn a reported
+                // mismatch into a silent success. A bare type parameter of THIS
+                // declaration pins too (`let m: Map[K, V] = Map()` in `fn f[K, V]()`),
+                // since mono substitutes f's own parameters once per instance; see
+                // tc_pin_tail_ret_generic for the licence that allows it.
+                tc_pin_declared_into_value(declared_tid, val, inferred_tid)
             }
         }
 
@@ -27852,12 +27808,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // generic struct/enum), so the branch would be dead. Excluded on
                     // purpose rather than by accident.
                     //
-                    // Same shared gate as the LetBinding arm: a value that minted here,
-                    // or a concrete container/carrier target that determines an
-                    // under-determined value's slots (`x = Err("boom")` pins the mut
-                    // carrier's other slot).
+                    // The same walker as the LetBinding arm, so a block or a branch
+                    // around the value does not change what the target fills
+                    // (`x = Err("boom")` pins the mut carrier's other slot).
                     if kind == NodeKind.Assignment {
-                        tc_pin_declared_into_value(target_t, val, val_t, true)
+                        tc_pin_declared_into_value(target_t, val, val_t)
                     }
                 }
             }
@@ -29040,7 +28995,7 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
         if assignment_types_compatible(declared, v_tid, l_val) == 0 {
             if !tc_closure_checked_against(l_val, declared) { tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {type_to_str(declared)} but got {type_to_str(v_tid)}{tc_fn_mismatch_suffix(declared, v_tid)}", l, l_val, declared, v_tid) }
         } else {
-            tc_pin_declared_into_value(declared, l_val, v_tid, true)
+            tc_pin_declared_into_value(declared, l_val, v_tid)
         }
     }
 }

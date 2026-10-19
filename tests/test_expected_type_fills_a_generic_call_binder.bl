@@ -1,6 +1,6 @@
-// A let annotation is an expected type for its value (sections/03_types.md 3.3, bidirectional
-// inference), so it fixes a generic call's binder that the arguments leave open, as a return
-// type or a parameter type already does.
+// A let annotation, a parameter type and a return type are each an expected type for a value
+// (sections/03_types.md 3.3, bidirectional inference), so each fixes a generic call's binder
+// that the arguments leave open, however a block, an if or a match wraps the call.
 
 import std.process.{ProcessResult}
 
@@ -14,6 +14,11 @@ fn expect_runs(src: Str, want: Str) {
     write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
     write_file("{dir}/src/main.bl", src)
     let mut ok = true
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check src/main.bl < /dev/null 2>&1")
+    if c.exit_code != 0 {
+        io.eprintln("blink check: exit {c.exit_code}\n{c.out}")
+        ok = false
+    }
     for args in ["run --no-per-module", "run --per-module"] {
         let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
         if r.exit_code != 0 || !r.out.trim().ends_with(want) {
@@ -93,4 +98,57 @@ fn main() {
     io.println("{ret().v.len()}")
 }
 "#, "0")
+}
+
+test "a let annotation reaches the call in every wrapper" {
+    expect_runs(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn main() {
+    let c = true
+    let b: Box[Int] = { mk([]) }
+    let i: Box[Int] = if c { mk([]) } else { mk([1]) }
+    let m: Box[Int] = match c {
+        true => mk([])
+        false => mk([1])
+    }
+    let n: Box[Int] = { { mk([]) } }
+    io.println("{b.v.len()} {i.v.len()} {m.v.len()} {n.v.len()}")
+}
+"#, "0 0 0 0")
+}
+
+test "a parameter type reaches the call in every wrapper" {
+    expect_runs(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn take(b: Box[Int]) -> Int { b.v.len() }
+fn main() {
+    let c = true
+    let b = take({ mk([]) })
+    let i = take(if c { mk([]) } else { mk([1]) })
+    let m = take(match c {
+        true => mk([])
+        false => mk([1])
+    })
+    let n = take({ { mk([]) } })
+    io.println("{b} {i} {m} {n}")
+}
+"#, "0 0 0 0")
+}
+
+test "a return type reaches the call in every wrapper" {
+    expect_runs(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn b() -> Box[Int] { { mk([]) } }
+fn i(c: Bool) -> Box[Int] { if c { mk([]) } else { mk([1]) } }
+fn m(c: Bool) -> Box[Int] {
+    match c {
+        true => mk([])
+        false => mk([1])
+    }
+}
+fn n() -> Box[Int] { { { mk([]) } } }
+fn main() {
+    io.println("{b().v.len()} {i(true).v.len()} {m(true).v.len()} {n().v.len()}")
+}
+"#, "0 0 0 0")
 }
