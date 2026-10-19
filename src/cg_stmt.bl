@@ -213,11 +213,31 @@ pub fn lower_global_init(g: Int) -> Int ! Diag.Report {
     let _ = open_scope()
     let saved_fn_name = cs_current_fn_name
     cs_current_fn_name = "<module init>"
-    let mark = cg_expr_pending_count()
-    let value = lower_value(node_value(g))
-    let hoisted = cg_expr_take_pending(mark)
+    let lowered = lower_global_value(g)
     cs_current_fn_name = saved_fn_name
     close_scope()
+    lowered
+}
+
+// An if, a match or a block the initializer reads as a value is materialised first, as at
+// any statement (lower_stmt_hoisted), because the expression stage only reads a temp
+// something else declared. An initializer that always diverges keeps the statements up to
+// the divergence and assigns nothing, as lower_stmt_left does for a local.
+fn lower_global_value(g: Int) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let value_mark = cg_expr_value_count()
+    if !materialise_stmt_values(g) {
+        let _dropped = cg_expr_take_pending(mark)
+        cg_expr_drop_values(value_mark)
+        return poison_value(node_value(g))
+    }
+    let left = cg_expr_pending_leaves_from(mark)
+    if left >= 0 {
+        let _dead = cg_expr_take_pending(left + 1)
+        return ir_block(g, cg_expr_take_pending(mark))
+    }
+    let value = lower_value(node_value(g))
+    let hoisted = cg_expr_take_pending(mark)
     if hoisted.len() == 0 { return value }
     lower_global_assign(g, hoisted, value)
 }
@@ -1790,50 +1810,19 @@ fn mv_leaving_call_stmt(e: Int) -> Int ! Diag.Report {
     ir_expr_stmt(e, ran)
 }
 
-// A struct literal runs its written fields and its spread in the order it writes them,
-// the order lower_struct_lit lowers them in. A field the literal omits runs its default
-// once every written field has run, so the walk cannot put it among the others and
-// refuses the literal. An omitted field read through a spread reads the spread's temp,
-// which nothing can write.
+// A struct or brace-variant literal runs its written fields and its spread in the order it
+// writes them (sections/02_syntax.md §2.22), so the walk passes them in that order. A field
+// the literal omits takes its default, and a default is a const (§2.21): it reads and writes
+// nothing, so where it runs cannot be seen and the walk has nothing to place for it.
 fn mv_struct_lit(e: Int) -> Bool ! Diag.Report {
-    let tid = tid_of_node(e)
-    if tid < 0 { return mv_moves_work(e) }
-    let decl = tc_tid_decl_node(tid)
-    if decl < 0 { return mv_moves_work(e) }
     let given = node_fields(e)
-    let sp = mv_struct_lit_spread(given)
-    let decls = node_fields(decl)
+    if given == -1 { return true }
     let mut i = 0
-    while i < sublist_length(decls) {
-        if sp < 0 && mv_struct_lit_find(given, node_name(sublist_get(decls, i))) < 0 { return mv_moves_work(e) }
+    while i < sublist_length(given) {
+        if !mv_expr(node_value(sublist_get(given, i))) { return false }
         i = i + 1
-    }
-    let mut j = 0
-    while j < sublist_length(given) {
-        if !mv_expr(node_value(sublist_get(given, j))) { return false }
-        j = j + 1
     }
     true
-}
-
-fn mv_struct_lit_spread(given: Int) -> Int {
-    let mut i = 0
-    while i < sublist_length(given) {
-        let g = sublist_get(given, i)
-        if nk_of(node_kind(g)) == NodeKind.SpreadExpr { return g }
-        i = i + 1
-    }
-    -1
-}
-
-fn mv_struct_lit_find(given: Int, name: Str) -> Int {
-    let mut i = 0
-    while i < sublist_length(given) {
-        let g = sublist_get(given, i)
-        if node_name(g) == name { return g }
-        i = i + 1
-    }
-    -1
 }
 
 // The part of a value-position expression that lowers ahead of the statements that fill

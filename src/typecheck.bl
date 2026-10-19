@@ -5401,22 +5401,44 @@ fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeC
         }
         return
     }
-    // A brace variant's fields meet their types at the expected instance, as payloads do.
+    // A struct literal's and a brace variant's fields meet their types at the expected
+    // instance, as payloads do. A spread's operand is a whole value of the struct itself.
     if k == NodeKind.StructLit {
         let var_idx = tc_variant_built_by_brace(val, val_tid, d)
         let flds = node_fields(val)
-        if var_idx < 0 || flds == -1 { return }
+        if flds == -1 || (var_idx < 0 && !tc_struct_built_by_lit(val_tid, d)) { return }
         let mut i = 0
         while i < sublist_length(flds) {
             let f = sublist_get(flds, i)
-            let field = lookup_evfield_type_by_name(var_idx, node_name(f))
             let fv = node_value(f)
-            if field != -1 && fv != -1 {
-                tc_pin_declared_into_value(tc_subst_evfield_from_instance(field, d), fv, tc_pin_tail_tid(fv))
+            let ft = if node_kind(f) == NodeKind.SpreadExpr { d } else { tc_lit_field_tid_at(var_idx, node_name(f), d) }
+            if ft != -1 && fv != -1 {
+                tc_pin_declared_into_value(ft, fv, tc_pin_tail_tid(fv))
             }
             i = i + 1
         }
     }
+}
+
+// The type of field `name` read at instance `d`: of variant `var_idx` when the literal builds
+// one, else of the struct `d`. -1 when there is no such field.
+fn tc_lit_field_tid_at(var_idx: Int, name: Str, d: Int) -> Int {
+    if var_idx < 0 { return tc_field_tid_at_instance(d, name) }
+    let field = lookup_evfield_type_by_name(var_idx, name)
+    if field == -1 { return -1 }
+    tc_subst_evfield_from_instance(field, d)
+}
+
+// Whether a struct literal typed `lit_tid` builds struct type `d` with field types that can be
+// read at `d`. A generic struct's bare head leaves the struct's own type parameters in each
+// field type, as tc_variant_fields_typed_at says of an enum.
+fn tc_struct_built_by_lit(lit_tid: Int, d: Int) -> Bool {
+    if tc_tid_kind(d) != TyKind.Struct { return false }
+    let lt = resolve_alias_tid(tc_resolve(lit_tid))
+    if tc_tid_kind(lt) != TyKind.Struct || tc_struct_base_tid(lt) != tc_struct_base_tid(d) { return false }
+    let decl = tc_tid_decl_node(d)
+    let tparams = if decl >= 0 { node_type_params(decl) } else { -1 }
+    tparams == -1 || sublist_length(tparams) == 0 || ty_pool.get(d).unwrap().params_count > 0
 }
 
 // The variant of enum type `d` that call `call` constructs, or -1 when it constructs none of
@@ -26364,6 +26386,52 @@ fn tc_value_tail_stmt(block: Int, consumed: Bool) -> Int {
     tail
 }
 
+// A binding's value type once the walk has typed the value in its own scope: `inferred` is what
+// infer_type answered before the walk, `pre` and `post` the value's scoped memo before and after
+// it. A fn-body `let` and a module-level `let` both read their value this way.
+//
+// `let x = { let h = 5  h }` and
+// `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
+// the construct itself introduces, which infer_type could not see because
+// tc_check_body had not pushed that frame yet. It has now, and it memoized the value
+// in scope, so the answer is available one line later. A caller reads it BEFORE its
+// declared/inferred compare, which is the point: TYPE_UNKNOWN unifies with
+// anything, so `let x: Str = { let h = 5  h }` typechecked clean, and a closure
+// reached this way lost the arity check.
+//
+// Recovery only — it can never overwrite an answer infer_type already gave, so no
+// shape that resolved before now takes a different tid.
+//
+// The gate reads "carries a hole", not "IS a hole". A carrier whose
+// ELEMENT names the block-local infers as `List[?]` / `Option[?]` / `(?, Int)` —
+// none of them TYPE_UNKNOWN — so an `== TYPE_UNKNOWN` gate treated a partially
+// erased answer as an answer and left the element erased, which is a SILENT
+// miscompile one level down (`let bad: Int = xs.get(0).unwrap()` ran and printed a
+// Str). The take stays monotone in both cases: a bare UNKNOWN accepts the memo
+// whole, exactly as before, and a partially erased answer takes only the memo's
+// answers for the positions it has no answer of its own for.
+fn tc_value_tid_after_walk(val: Int, inferred: Int, pre: Int, post: Int) -> Int {
+    if tc_tid_is_no_info(inferred) != 0 || tc_tid_has_unknown(inferred) != 0 {
+        if tc_tid_is_no_info(post) != 0 { return inferred }
+        if tc_tid_is_no_info(inferred) != 0 { return post }
+        return tc_tid_fill_unknowns(inferred, post)
+    }
+    // A CONFIDENT answer can still be an out-of-scope answer. In
+    // `let v = 1` followed by `let x = ...` whose value block re-binds `v` to a
+    // Str and names it as the tail, the tail was typed against the OUTER `v` and
+    // came back Int, so the gate above declines and the binding takes a type the
+    // block does not produce. The proof is the delta: the walk retyped the very
+    // node the earlier answer was read from, so a memo that MOVED is the in-scope
+    // answer replacing an out-of-scope one. An unmoved memo keeps the old path.
+    if tc_tid_is_no_info(post) != 0 || post == pre { return inferred }
+    // The value node keeps the out-of-scope answer too, and codegen reads
+    // node tids, so correcting only the binding would leave the block itself
+    // lowered at the type the block does not produce. The `with` and `match`
+    // arms republish their own node; a bare block has no such arm.
+    tc_publish_node_tid(val, post)
+    post
+}
+
 // The tid the IN-SCOPE walk recorded for a value produced inside a scope the speculative
 // infer could not see, or -1.
 //
@@ -28895,51 +28963,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let post_val_memo = tc_scoped_value_memo(val, 0)
             if reread { inferred_tid = tc_infer_let_value(val, vname, let_hint) }
             tc_report_deferred_branch_mismatch(val)
-            // `let x = { let h = 5  h }` and
-            // `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
-            // the construct itself introduces, which the infer_type above could not see because
-            // tc_check_body had not pushed that frame yet. It has now, and it memoized the value
-            // in scope, so the answer is available one line later. Placed BEFORE the
-            // declared/inferred compare below, which is the point: TYPE_UNKNOWN unifies with
-            // anything, so `let x: Str = { let h = 5  h }` typechecked clean, and a closure
-            // reached this way lost the arity check.
-            //
-            // Recovery only — it can never overwrite an answer infer_type already gave, so no
-            // shape that resolved before now takes a different tid.
-            //
-            // The gate reads "carries a hole", not "IS a hole". A carrier whose
-            // ELEMENT names the block-local infers as `List[?]` / `Option[?]` / `(?, Int)` —
-            // none of them TYPE_UNKNOWN — so an `== TYPE_UNKNOWN` gate treated a partially
-            // erased answer as an answer and left the element erased, which is a SILENT
-            // miscompile one level down (`let bad: Int = xs.get(0).unwrap()` ran and printed a
-            // Str). The take stays monotone in both cases: a bare UNKNOWN accepts the memo
-            // whole, exactly as before, and a partially erased answer takes only the memo's
-            // answers for the positions it has no answer of its own for.
-            if tc_tid_is_no_info(inferred_tid) != 0 || tc_tid_has_unknown(inferred_tid) != 0 {
-                if tc_tid_is_no_info(post_val_memo) == 0 {
-                    if tc_tid_is_no_info(inferred_tid) != 0 {
-                        inferred_tid = post_val_memo
-                    } else {
-                        inferred_tid = tc_tid_fill_unknowns(inferred_tid, post_val_memo)
-                    }
-                }
-            } else {
-                // A CONFIDENT answer can still be an out-of-scope answer. In
-                // `let v = 1` followed by `let x = ...` whose value block re-binds `v` to a
-                // Str and names it as the tail, the tail was typed against the OUTER `v` and
-                // came back Int, so the gate above declines and the binding takes a type the
-                // block does not produce. The proof is the delta: the walk retyped the very
-                // node the earlier answer was read from, so a memo that MOVED is the in-scope
-                // answer replacing an out-of-scope one. An unmoved memo keeps the old path.
-                if tc_tid_is_no_info(post_val_memo) == 0 && post_val_memo != pre_val_memo {
-                    inferred_tid = post_val_memo
-                    // The value node keeps the out-of-scope answer too, and codegen reads
-                    // node tids, so correcting only the binding would leave the block itself
-                    // lowered at the type the block does not produce. The `with` and `match`
-                    // arms republish their own node; a bare block has no such arm.
-                    tc_publish_node_tid(val, post_val_memo)
-                }
-            }
+            inferred_tid = tc_value_tid_after_walk(val, inferred_tid, pre_val_memo, post_val_memo)
         }
 
         if tc_tid_is_no_info(declared_tid) == 0 && tc_tid_is_no_info(inferred_tid) == 0 {
@@ -29568,6 +29592,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 sfi = sfi + 1
             }
         }
+        // The walk infers each field value again, and an empty container in an arm tail
+        // mints fresh metavars when it does. The literal's own type is still each field's
+        // expected type (sections/03_types.md 3.3), so it pins them once more, as a let's
+        // annotation pins its value after the same walk.
+        let sl_tid = tc_lookup_node_tid(node)
+        if tc_tid_is_no_info(sl_tid) == 0 { tc_pin_declared_into_value(sl_tid, node, sl_tid) }
         return
     }
 
@@ -30243,7 +30273,7 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
     tc_construct_hint = saved_hint
     // infer_type types a value's shape only, never a body nested in a closure, in a call's
     // closure argument or in a struct literal's block-valued field — tc_stmt_value_walks_body.
-    tc_check_body(l_val)
+    tc_walk_stmt_value(l_val)
     if tc_tid_is_no_info(declared) == 0 && tc_tid_is_no_info(v_tid) == 0 {
         // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
         // ahead of the compare can turn a mismatch into a silent success.
@@ -30300,7 +30330,13 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
                 if vk != NodeKind.IntLit && vk != NodeKind.FloatLit && vk != NodeKind.BoolLit && vk != NodeKind.InterpString {
                     nr_current_module = node_module(l)
                     let saved = diag_entry_count()
-                    let l_tid = infer_type(l_val)
+                    let shape_tid = infer_type(l_val)
+                    // infer_type types a value's shape, never the statements of a block or an
+                    // arm inside it, so the value is walked and then read as a fn-body let
+                    // reads its own.
+                    let pre = tc_scoped_value_memo(l_val, 0)
+                    tc_walk_stmt_value(l_val)
+                    let l_tid = tc_value_tid_after_walk(l_val, shape_tid, pre, tc_scoped_value_memo(l_val, 0))
                     let clean = diag_entry_count() == saved
                     if clean && tc_tid_is_no_info(l_tid) == 0 {
                         if tc_tid_has_unbound_metavar(l_tid) != 0 {

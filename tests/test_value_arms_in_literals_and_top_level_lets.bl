@@ -1,0 +1,214 @@
+// An if, a match or a block is a value wherever an expression is (sections/02_syntax.md), so
+// it runs as one as a struct or brace-variant field (a struct that leaves another field to its
+// default included) and as a top-level `let` initializer (§2.12.1). The declared type is the
+// expected type of each arm (sections/03_types.md 3.3), so an empty Map(), Set() or [] in an
+// arm takes its element types from a field, a let annotation or a return type.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn expect_runs(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_value_arms.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    let mut ok = true
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check src/main.bl < /dev/null 2>&1")
+    if c.exit_code != 0 {
+        io.eprintln("blink check: exit {c.exit_code}\n{c.out}")
+        ok = false
+    }
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+test "a struct literal that leaves a field to its default runs an if, a match and a block field" {
+    expect_runs(#"type S {
+    a: Int = 3
+    b: Int
+}
+fn main() {
+    let c = true
+    let s = S { b: if c { 1 } else { 2 } }
+    let t = S { b: match c {
+        true => 4
+        false => 5
+    } }
+    let u = S { b: { let x = 6
+        x + 1 } }
+    io.println("{s.a} {s.b} {t.b} {u.a} {u.b}")
+}
+"#, "3 1 4 3 7")
+}
+
+test "a brace variant literal runs an if, a match and a block field" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type V {
+    B { b: Box[Int], n: Int }
+    C
+}
+fn len_of(v: V) -> Int {
+    match v {
+        V.B { b, n } => b.v.len() * 10 + n
+        V.C => 99
+    }
+}
+fn main() {
+    let c = true
+    let x = V.B { b: if c { Box { v: [1] } } else { Box { v: [2, 3] } }, n: 1 }
+    let y = V.B { b: Box { v: [] }, n: match c {
+        true => 2
+        false => 0
+    } }
+    let z = V.B { n: { let k = 3
+        k }, b: { Box { v: [4, 5] } } }
+    io.println("{len_of(x)} {len_of(y)} {len_of(z)}")
+}
+"#, "11 2 23")
+}
+
+test "a top-level let runs an if, a match and a block initializer" {
+    expect_runs(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+let FLAG = true
+let A: Box[Int] = if FLAG { mk([]) } else { mk([1]) }
+let B: Box[Int] = { mk([]) }
+let C: Int = match FLAG {
+    true => 5
+    false => 6
+}
+let D = { let t = 2
+    t * 4 }
+fn main() {
+    io.println("{A.v.len()} {B.v.len()} {C} {D}")
+}
+"#, "0 0 5 8")
+}
+
+test "a field's type reaches an empty Map, Set and list in each if arm" {
+    expect_runs(#"type W {
+    m: Map[Str, Int]
+    s: Set[Int]
+    l: List[Str]
+}
+fn main() {
+    let c = true
+    let w = W {
+        m: if c { Map() } else { Map() },
+        s: if c { Set() } else { Set() },
+        l: if c { [] } else { [] },
+    }
+    io.println("{w.m.len()} {w.s.len()} {w.l.len()}")
+}
+"#, "0 0 0")
+}
+
+test "a field's type reaches an empty Map, Set and list in each match arm and block tail" {
+    expect_runs(#"type W {
+    m: Map[Str, Int]
+    s: Set[Int]
+    l: List[Str]
+}
+fn main() {
+    let c = true
+    let w = W {
+        m: match c {
+            true => Map()
+            false => { Map() }
+        },
+        s: { { Set() } },
+        l: match c {
+            true => []
+            false => []
+        },
+    }
+    io.println("{w.m.len()} {w.s.len()} {w.l.len()}")
+}
+"#, "0 0 0")
+}
+
+test "a brace variant and a generic struct field reach an empty container in each arm" {
+    expect_runs(#"type G[K] { m: Map[K, Int] }
+type V {
+    B { m: Map[Str, Int] }
+    C
+}
+fn n_of(v: V) -> Int {
+    match v {
+        V.B { m } => m.len()
+        V.C => 9
+    }
+}
+fn main() {
+    let c = true
+    let v = V.B { m: if c { Map() } else { Map() } }
+    let g: G[Str] = G { m: match c {
+        true => Map()
+        false => Map()
+    } }
+    io.println("{n_of(v)} {g.m.len()}")
+}
+"#, "0 0")
+}
+
+test "a struct literal passed as an argument or returned reaches an empty container in each arm" {
+    expect_runs(#"type W { s: Set[Str] }
+fn size(w: W) -> Int { w.s.len() }
+fn make(c: Bool) -> W {
+    W { s: if c { Set() } else { Set() } }
+}
+fn main() {
+    let c = true
+    io.println("{size(W { s: if c { Set() } else { Set() } })} {make(c).s.len()}")
+}
+"#, "0 0")
+}
+
+test "a let annotation and a return type reach an empty container in each arm" {
+    expect_runs(#"fn pick(c: Bool) -> Map[Str, Int] {
+    if c { Map() } else { Map() }
+}
+fn tags(c: Bool) -> Set[Int] {
+    match c {
+        true => Set()
+        false => { Set() }
+    }
+}
+fn main() {
+    let c = true
+    let m: Map[Str, Int] = if c { Map() } else { Map() }
+    let s: Set[Int] = match c {
+        true => Set()
+        false => Set()
+    }
+    let l: List[Int] = { [] }
+    io.println("{m.len()} {s.len()} {l.len()} {pick(c).len()} {tags(c).len()}")
+}
+"#, "0 0 0 0 0")
+}
+
+test "a closure in a top-level let initializer is defined before the code that sets the global" {
+    expect_runs(#"let BASE = 10
+let add = fn(n: Int) -> Int { n + BASE }
+let maybe = Some(fn(n: Int) -> Int { n * 2 })
+let all = [fn(n: Int) -> Int { n - 1 }]
+let chosen = if BASE > 5 { fn(n: Int) -> Int { n + 100 } } else { fn(n: Int) -> Int { n } }
+fn main() {
+    let f = add
+    let g = maybe.unwrap()
+    let h = all.get(0).unwrap()
+    let k = chosen
+    io.println("{f(1)} {g(4)} {h(9)} {k(1)}")
+}
+"#, "11 8 8 101")
+}
