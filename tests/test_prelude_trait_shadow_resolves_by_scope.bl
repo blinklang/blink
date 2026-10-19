@@ -44,18 +44,22 @@ fn expect_runs(main: Str, sim: Str, want: Str) {
     assert(ok)
 }
 
-// Each of `wants` is in the output of check and of both builds, and none of them passes.
-fn expect_rejects(main: Str, sim: Str, wants: List[Str]) {
+// Each of `wants` is in the output of check and of both builds, none of `nots` is, no build
+// hits an internal compiler error, and each build passes exactly when `passes` says so.
+fn expect_output(main: Str, sim: Str, passes: Bool, wants: List[Str], nots: List[Str]) {
     let dir = project(main, sim)
     let mut ok = true
     for args in ["check", "build --no-per-module", "build --per-module"] {
         let r = blink(dir, args)
-        let mut missing: List[Str] = []
+        let mut wrong: List[Str] = []
         for w in wants {
-            if !r.out.contains(w) { missing.push(w) }
+            if !r.out.contains(w) { wrong.push("missing {w}") }
         }
-        if r.exit_code == 0 || missing.len() > 0 || r.out.contains("internal compiler error") {
-            io.eprintln("blink {args}: exit {r.exit_code}, missing {missing.join(", ")}\n{r.out}")
+        for n in nots {
+            if r.out.contains(n) { wrong.push("unwanted {n}") }
+        }
+        if (r.exit_code == 0) != passes || wrong.len() > 0 || r.out.contains("internal compiler error") {
+            io.eprintln("blink {args}: exit {r.exit_code}, {wrong.join(", ")}\n{r.out}")
             ok = false
         }
     }
@@ -63,23 +67,12 @@ fn expect_rejects(main: Str, sim: Str, wants: List[Str]) {
     assert(ok)
 }
 
-// Each of `wants` is in the output of check and of both builds, and all of them pass.
+fn expect_rejects(main: Str, sim: Str, wants: List[Str]) {
+    expect_output(main, sim, false, wants, [])
+}
+
 fn expect_warns(main: Str, sim: Str, wants: List[Str]) {
-    let dir = project(main, sim)
-    let mut ok = true
-    for args in ["check", "build --no-per-module", "build --per-module"] {
-        let r = blink(dir, args)
-        let mut missing: List[Str] = []
-        for w in wants {
-            if !r.out.contains(w) { missing.push(w) }
-        }
-        if r.exit_code != 0 || missing.len() > 0 {
-            io.eprintln("blink {args}: exit {r.exit_code}, missing {missing.join(", ")}\n{r.out}")
-            ok = false
-        }
-    }
-    let _ = sh("rm -rf {dir}")
-    assert(ok)
+    expect_output(main, sim, true, wants, [])
 }
 
 let shadow_eq = #"trait Eq {
@@ -231,7 +224,7 @@ pub fn near(x: Int) -> Int { x }
         "cannot derive `Eq`: it is not a compiler-known trait",
         "`Eq` here is `trait Eq` (src/geo/sim.bl:1), a user trait",
         "`Eq` here is `trait Eq` (src/geo/sim.bl:1), which shadows the compiler-known `Eq` (blink.core)",
-        "@derive takes Eq, Ord, Hash, Clone, Debug, Serialize, Deserialize",
+        "@derive takes Eq, Ord, Hash, Clone, Display, Debug, Serialize, Deserialize",
         "import blink.core.\{Eq as CoreEq}",
         "then write @derive(CoreEq)",
     ])
@@ -289,10 +282,10 @@ pub fn same[T: Eq](a: T, b: T) -> Bool {
 pub fn near(x: Int) -> Int { x }
 "#)
     expect_rejects(fine_main, sim, [
-        "`==` on T needs `Eq (blink.core)`, but the bound `T: Eq` names `Eq (geo.sim)`",
+        "`==` on T needs `Eq (blink.core)`, but the bounds on T give only `Eq (geo.sim)`",
         "`Eq (geo.sim)` and `Eq (blink.core)` are different traits with the same name",
         "import blink.core.\{Eq as CoreEq}",
-        "then write `[T: CoreEq]`",
+        "then add the bound `[T: CoreEq]`",
     ])
 }
 
@@ -334,7 +327,7 @@ fn main() {
     io.println("hi")
 }
 "#
-    expect_rejects(main, "", ["`+` on T needs `Add (blink.core)`, but the bound `T: Add` names `Add (main)`", "then write `[T: CoreAdd]`"])
+    expect_rejects(main, "", ["`+` on T needs `Add (blink.core)`, but the bounds on T give only `Add (main)`", "then add the bound `[T: CoreAdd]`"])
 }
 
 test "W1010 on a shadowing Eq lists the forms that still use the compiler-known Eq" {
@@ -363,7 +356,7 @@ fn main() {
 "#
     expect_warns(main, "", [
         "shadows compiler-known trait `Add` (blink.core)",
-        "`+` in this module still use `Add` (blink.core)",
+        "`+` in this module still uses `Add` (blink.core)",
     ])
 }
 
@@ -376,9 +369,163 @@ fn main() {
     io.println("ok")
 }
 "#
-    let dir = project(main, "")
-    let r = blink(dir, "check")
-    let _ = sh("rm -rf {dir}")
-    assert(r.out.contains("shadows compiler-known trait `Clone` (blink.core)"))
-    assert(!r.out.contains("in this module still use"))
+    expect_output(main, "", true, ["shadows compiler-known trait `Clone` (blink.core)"], ["in this module still use"])
+}
+
+test "a qualified @derive argument that names no trait is E1402, not the compiler-known trait" {
+    let main = #"@derive(nosuch.Eq)
+type P {
+    x: Int
+}
+
+fn main() {
+    io.println("{P { x: 1 }.x}")
+}
+"#
+    expect_rejects(main, "", ["NotDerivable", "cannot derive `nosuch.Eq`: no trait named `nosuch.Eq` is in scope"])
+}
+
+test "a qualified bound that names no trait is rejected, not read as the compiler-known trait" {
+    let main = #"fn g[T: nosuch.Eq](a: T) -> Int { 1 }
+
+fn main() {
+    io.println("{g(1)}")
+}
+"#
+    expect_rejects(main, "", ["nosuch.Eq"])
+}
+
+test "an alias of a compiler-known trait wins over another module's trait of the alias name" {
+    let main = #"import blink.core.{Eq as CoreEq}
+import geo.sim
+
+@derive(CoreEq)
+type P {
+    x: Int
+}
+
+fn main() {
+    io.println("{P { x: 1 } == P { x: 1 }} {sim.near(1)}")
+}
+"#
+    let sim = #"pub trait CoreEq {
+    fn same(self) -> Bool
+}
+
+pub fn near(x: Int) -> Int { x }
+"#
+    expect_runs(main, sim, "true 1")
+}
+
+test "E1402 on an alias of a shadowing trait names the trait it declares" {
+    let main = #"import geo.sim.{Eq as SimEq}
+
+@derive(SimEq)
+type P {
+    x: Int
+}
+
+fn main() {
+    io.println("{P { x: 1 }.x}")
+}
+"#
+    let sim = #"pub trait Eq {
+    fn eq(self, other: Int) -> Bool
+}
+"#
+    expect_rejects(main, sim, [
+        "`SimEq` here is `trait Eq` (src/geo/sim.bl:1), a user trait",
+        "`SimEq` here is `trait Eq` (src/geo/sim.bl:1), which shadows the compiler-known `Eq` (blink.core)",
+    ])
+}
+
+test "== on a type parameter bound by a shadowing Ord names Eq as the trait it needs" {
+    let main = #"trait Ord {
+    fn rank(self) -> Int
+}
+
+fn same[T: Ord](a: T, b: T) -> Bool {
+    a == b
+}
+
+fn main() {
+    io.println("hi")
+}
+"#
+    expect_rejects(main, "", [
+        "`==` on T needs `Eq (blink.core)`, but the bounds on T give only `Ord (main)`",
+        "add the bound `[T: Eq]`",
+    ])
+}
+
+test "+ on a type parameter with no Add bound in a module that shadows Add gives the alias bound" {
+    let main = #"trait Add {
+    fn add(self, other: Self) -> Self
+}
+
+fn twice[T: Display](a: T) -> T {
+    a + a
+}
+
+fn main() {
+    io.println("hi")
+}
+"#
+    expect_output(main, "", false, ["import blink.core.\{Add as CoreAdd}", "then add the bound `[T: CoreAdd]`"], ["e.g. `[T: Add]`"])
+}
+
+test "a fix in a module that already aliases the compiler-known Eq uses that alias" {
+    let main = #"import blink.core.{Eq as BaseEq}
+
+trait Eq {
+    fn eq(self, other: Self) -> Bool
+}
+
+type P {
+    x: Int
+}
+
+impl Eq for P {
+    fn eq(self, other: P) -> Bool { self.x == other.x }
+}
+
+fn main() {
+    io.println("{P { x: 1 } == P { x: 1 }}")
+}
+"#
+    expect_output(main, "", false, ["add `@derive(BaseEq)` to `type P`"], ["import blink.core.\{Eq as CoreEq}"])
+}
+
+test "a type whose impl of the compiler-known Eq does not apply is told to write it under the alias" {
+    let main = #"import blink.core.{Eq as CoreEq}
+"#.concat(shadow_eq).concat(#"
+type B[T] {
+    v: T
+}
+
+impl CoreEq for B[Int] {
+    fn eq(self, other: B[Int]) -> Bool { self.v == other.v }
+}
+
+fn main() {
+    io.println("{B { v: "a" } == B { v: "a" }}")
+}
+"#)
+    expect_output(main, "", false, ["write `impl CoreEq for B[Str]`"], ["write `impl Eq for"])
+}
+
+test "a type passed for a bound on a shadowing Eq that has only the compiler-known Eq says so" {
+    let main = shadow_eq.concat(#"
+fn same[T: Eq](a: T) -> Bool {
+    a.eq(1)
+}
+
+fn main() {
+    io.println("{same(3)}")
+}
+"#)
+    expect_rejects(main, "", [
+        "`Int` does not satisfy the Eq (main) bound on type parameter T",
+        "`Int` implements `Eq (blink.core)`, a different trait with the same name as `Eq (main)`",
+    ])
 }

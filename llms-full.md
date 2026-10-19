@@ -1028,7 +1028,7 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 |------------|--------|---------|
 | `@module(name)` | module | Module declaration |
 | `@capabilities(...)` | module | Effect ceiling |
-| `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Ord`, `Clone`, `Hash`, `Debug`. `Ord` synthesizes a lexicographic `.cmp(other) -> Ordering` and auto-includes `Eq` (`Ord: Eq`); enables `<`/`>`/`<=`/`>=`. Unknown names rejected as `E1112 UnknownDerive`. |
+| `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Ord`, `Clone`, `Hash`, `Debug`. `Ord` synthesizes a lexicographic `.cmp(other) -> Ordering` and auto-includes `Eq` (`Ord: Eq`); enables `<`/`>`/`<=`/`>=`. Each name resolves by scope: in a module that declares its own `Eq`, `@derive(Eq)` names that trait and is rejected; write `import blink.core.{Eq as CoreEq}` and `@derive(CoreEq)`. Any name that is not a derivable compiler-known trait is `E1402 NotDerivable`. |
 | `@src(req)` | fn | Requirement traceability |
 | `@requires(expr)` | fn | Precondition. Needs `@verify(fallback: ...)` on the fn, or it is `V0003 ContractUnverifiable` |
 | `@ensures(expr)` | fn | Postcondition (`result` = return value). Needs `@verify(fallback: ...)` on the fn, or it is `V0003 ContractUnverifiable`; with `"runtime"` it is checked at every return. Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |

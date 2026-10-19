@@ -257,7 +257,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | RecursiveContractPredicate | E1309 | A contract predicate of fn `f` calls `f`, directly or through a cycle of contract predicates (body calls are not edges); the diagnostic prints the cycle | Refinement contracts | §3b.2 |
 | MapKeyNotHashable | E1400 | `Map` key / `Set` element type does not implement `Hash` (Float, container, `Bytes`/`StringBuilder`, `fn`, or a user type with no `Hash` impl, derived or written) | Generic collections | §3.6 |
 | NonDerivableTrait | E1401 | A `@derive(Hash/Eq/Ord)` field's type does not implement the derived trait | Generic collections | §3.6 |
-| NotDerivable | E1402 | A `@derive` argument does not denote a derivable compiler-known trait by identity (a user trait, or a local trait that shadows a prelude trait); help gives `import blink.core.{X as Y}` and `@derive(Y)` | Generic collections | §3.6.1, §10.6 |
+| NotDerivable | E1402 | A `@derive` argument does not denote a derivable compiler-known trait by identity: a user trait, a local trait that shadows a prelude trait, a compiler-known trait @derive cannot synthesize, or a name no trait in scope has; for a shadow, help gives `import blink.core.{X as Y}` and `@derive(Y)` | Generic collections | §3.6.1, §10.6 |
 | ContractUnverifiable | V0003 | The outcome of a `@requires`/`@ensures` is Unknown, and the effective policy is `@verify(fallback: "error")` (own, or for an impl method the trait method's default), or the predicate is not executable and has no `"trust"`. The message says when no solver ran, and names the trait method when the policy is inherited | Contract verification | §3b.4 |
 
 ---
