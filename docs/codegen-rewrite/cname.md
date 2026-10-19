@@ -32,20 +32,40 @@ asks it and never builds a name from parts.
   `cname_reset()` does not clear it: a cname test that wants a user effect must
   reach a typecheck that declared one.
 
+## The escape
+
+A C symbol joins its parts with `_`, and a user name may hold `_`, so a bare join is not
+one to one: trait `Tr` of module `x` and trait `Tr_x` would spell one symbol. Every
+user name part of a symbol goes through `tc_sym_escape` (typecheck.bl), which writes
+`_` as `_1`. After the escape, `_` followed by a digit is a marker:
+
+- `_0` opens a mono argument, or the source type of a `From` or `TryFrom` method.
+- `_1` is an escaped `_`.
+- `_2` opens the module of a trait that more than one module declares.
+
+A name with no `_` keeps its spelling. These parts stay verbatim: module keys, the
+`blink_{name}` symbol of an `@ffi` function and of a runtime export, `main`, effect
+vtables, carrier tags and the init-globals names.
+
+`tc_impl_method_stem` and `tc_impl_conv_stem` in typecheck.bl give both the signature
+key of an impl method and the stem of its C symbol. A conversion's key spells its source
+with `tc_type_str`; its C stem spells the source with `seg_at` at TOP position. The two
+have one shape, but an alias source keys under its target.
+
 ## Name forms
 
 | Form | Function | Inputs | Example |
 |---|---|---|---|
 | Function | `c_fn_decl_name(fn)` | fn decl node | `helper` in main -> `blink_u_helper`; `main` -> `blink_main`; `@ffi` `getpid` -> `blink_getpid`; `ping` in `mymod` -> `blink_mymod_ping` |
-| Global let | `c_global_name(let)` | let node | `counter` -> `counter` (every module) |
-| Mono fn instance | `c_mono_fn_name(fn, args_tid)` | fn decl node, interned tuple tid of the type args | `identity[Box[Int]]` -> `blink_identity_0Box_10Int`; `wrap[Ngx]` from `mymod` -> `blink_wrap_0Ngx` |
+| Global let | `c_global_name(let)` | let node | `counter` in main -> `blink_u_counter`; `mod_counter` in `mymod` -> `blink_mymod_mod_1counter` |
+| Mono fn instance | `c_mono_fn_name(fn, args_tid)` | fn decl node, interned tuple tid of the type args | `identity[Box[Int]]` -> `blink_identity_0Box_10Int`; `my_fn[Int]` -> `blink_my_11fn_0Int`; `wrap[Ngx]` from `mymod` -> `blink_wrap_0Ngx` |
 | Type | `c_type_decl_name(td)` | type decl node | `Point` -> `blink_Point`; `Ngx` in `mymod` -> `blink_mymod_Ngx`; opaque `@ffi.opaque(name: "FILE")` -> `FILE*`; marked runtime-owned `ConversionError` -> `blink_ConversionError` |
 | Type tag | `c_type_decl_tag(td)` | type decl node | `Ngx` in `mymod` -> `mymod_Ngx`; opaque `CFile` -> `CFile` |
-| Mono type instance | `c_mono_type_c_name(tid)` | struct or enum instance tid | `Box[Option[Int]]` -> `blink_Box_0Option_1int`; `Box2[Int]` in `mymod` -> `blink_mymod_1Box2_0Int` |
+| Mono type instance | `c_mono_type_c_name(tid)` | struct or enum instance tid | `Box[Option[Int]]` -> `blink_Box_0Option_1int`; `Box2[Int]` in `mymod` -> `blink_mymod_1Box2_0Int`; `My_Box[Int]` -> `blink_My_11Box_0Int` |
 | Typedef | `c_typedef_name(tid)` | struct, enum, Option, Result or tuple tid | `Option[Int]` -> `blink_Option_int`; `Result[Void, Str]` -> `blink_Result_void_str`; `(Int, Str)` -> `blink_Tuple2_int_str` |
 | Variant tag macro | `c_variant_tag_macro(td, v)` / `c_mono_variant_tag_macro(tid, v)` | type decl node or instance tid, variant node | `Shape.Circle` -> `blink_Shape_Circle_TAG`; `Tree[Int].Leaf` -> `blink_Tree_0Int_Leaf_TAG` |
-| Derived method | `c_derive_method_name(td, m)` | type decl node, method | `Point` `eq` -> `blink_Point_eq` |
-| Impl method | `c_impl_method_name(im, m)` / `_q(im, trait, m)` | impl node, method | `impl Greet for Point` `greet` -> `blink_Point_Greet_greet`; `impl From[Int] for Point` `from` -> `blink_Point_from_Int`; in `mymod` -> `blink_mymod_Ngx_Greet2_greet2` |
+| Derived method | `c_derive_method_name(td, m)` | type decl node, method | `Point` `eq` -> `blink_Point_eq`; `User` `to_json` -> `blink_User_to_1json` |
+| Impl method | `c_impl_method_name(im, m)` / `_q(im, trait, m)` | impl node, method | `impl Greet for Point` `greet` -> `blink_Point_Greet_greet`; `impl From[Int] for Point` `from` -> `blink_Point_From_from_0Int`; `impl TryFrom[Int] for Char` -> `blink_std_char_Char_TryFrom_try_1from_0Int`; in `mymod` -> `blink_mymod_Ngx_Greet2_greet2`; a trait `Tr` that modules `a` and `b` both declare -> `blink_Point_Tr_2a_go` |
 | Display dispatcher | `c_display_dispatch_name(im)` | impl node | `blink_Point_Display_display` |
 | Segment | `c_seg_top(tid)` / `c_seg_inner(tid)` | tid | `Int` -> `Int` / `int`; `Float` -> `Float` / `double`; `Map[K, V]` -> `Map` / `map`; `Point` -> `Point` / `Point`; `Ngx` in `mymod` -> `Ngx` / `mymod_Ngx`; fn type -> ICE / `closure` |
 | Kops table | `c_kops_table_name(tid)` | key tid | `Int` -> `blink_kops_i64`; `Str` -> `blink_kops_str`; struct, enum or tuple -> `kops_` + typedef name (`Key` -> `kops_blink_Key`, `(Int, Str)` -> `kops_blink_Tuple2_int_str`); opaque handle -> ICE segment, its C name is a pointer |
@@ -55,8 +75,12 @@ asks it and never builds a name from parts.
 
 One private function, `mono_stem(base, args_start, args_count)`, builds every mono
 name. It reads the type arguments from `ty_param_list`, spells each at TOP position,
-escapes `_` as `_1` in every segment, and joins with `_0`. A fn instance and a
-struct or enum instance both go through it.
+escapes `_` as `_1` in the base and in every segment, and joins with `_0`. A fn
+instance and a struct or enum instance both go through it.
+
+The base is a declaration tag, which already escaped its name, so a base name with
+`_` is escaped twice: `my_fn[Int]` -> `blink_my_11fn_0Int`. Two injective escapes give
+an injective name, so this costs only length.
 
 ## Segment positions
 

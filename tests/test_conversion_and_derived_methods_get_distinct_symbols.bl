@@ -1,0 +1,53 @@
+// A From impl's method and a derived method each get a symbol no trait impl method can
+// spell. A user trait may be named `from` or `to`, and its method may be named for a source
+// type or for the rest of a derived name, so a conversion or a derive must not take the
+// shape `{type}_{trait}_{method}` of a trait impl. Two conversions with different types must
+// not share a signature either. The one-unit build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn expect_runs(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_conv_symbols.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+test "a From impl and a method of a trait named from" {
+    let types = "type src \{\n    v: Int\n}\ntype T \{\n    x: Int\n}\n"
+    let tr = "trait from \{\n    fn src(self) -> T\n}\nimpl from for T \{\n    fn src(_self) -> T \{ T \{ x: 111 } }\n}\n"
+    let conv = "impl From[src] for T \{\n    fn from(s: src) -> T \{ T \{ x: s.v } }\n}\n"
+    let main = "fn main() \{\n    let t = T \{ x: 0 }\n    io.println(\"\{t.src().x} \{T.from(src \{ v: 7 }).x}\")\n}\n"
+    expect_runs("{types}{tr}{conv}{main}", "111 7")
+}
+
+test "From impls whose type names join to one spelling" {
+    let types = "type A \{\n    v: Int\n}\ntype A_from_B \{\n    v: Int\n}\ntype B_from_c \{\n    v: Int\n}\ntype c \{\n    v: Int\n}\n"
+    let one = "impl From[B_from_c] for A \{\n    fn from(s: B_from_c) -> A \{ A \{ v: s.v + 1 } }\n}\n"
+    let two = "impl From[c] for A_from_B \{\n    fn from(s: c) -> A_from_B \{ A_from_B \{ v: s.v + 2 } }\n}\n"
+    let main = "fn main() \{\n    let a = A.from(B_from_c \{ v: 10 })\n    let p = A_from_B.from(c \{ v: 20 })\n    io.println(\"\{a.v} \{p.v}\")\n}\n"
+    expect_runs("{types}{one}{two}{main}", "11 22")
+}
+
+test "a derived to_json and the method json of a trait named to" {
+    let ty = "@derive(Serialize)\ntype T \{\n    v: Int\n}\n"
+    // `json` answers Str as to_json does: the checker's key for a derived method can still equal
+    // a trait impl's key, so this row proves only that the C symbols differ.
+    let tr = "trait to \{\n    fn json(self) -> Str\n}\nimpl to for T \{\n    fn json(_self) -> Str \{ \"7\" }\n}\n"
+    let main = "fn main() \{\n    let t = T \{ v: 3 }\n    io.println(\"\{t.to_json()} \{t.json()}\")\n}\n"
+    expect_runs("{ty}{tr}{main}", "\{\"v\":3} 7")
+}
