@@ -571,19 +571,27 @@ pub fn tc_is_iterator_method(method: Str) -> Int {
     0
 }
 
-// The fnsig key for an impl method, from the trait's identity. A From/TryFrom key also holds
-// its source, spelled from the resolved source type so an alias source keys under its target;
-// all other traits use the trait-qualified tc_impl_method_stem.
+// The fnsig key for an impl method, from the trait's identity. One type takes many From and
+// TryFrom impls, so their keys hold the impl itself where the C stem holds the source. Every
+// reader of the key has the impl in hand, and only cname spells the source: a second
+// spelling here could name an alias source, or a source with binders, apart from the symbol.
+// All other traits use the trait-qualified tc_impl_method_stem.
 fn tc_mangle_impl_fnsig(impl_type: Str, trait_key: Str, mname: Str, im: Int) -> Str ! TypeCheck.Resolve, Diag.Report {
     if tc_is_conversion_trait(trait_key) {
         let src = tc_impl_conv_source_tid(im)
-        if src >= 0 { return tc_impl_conv_stem(impl_type, trait_key, mname, tc_type_str(src)) }
+        if src >= 0 { return tc_impl_conv_stem(impl_type, trait_key, mname, "{im}") }
     }
     tc_impl_method_stem(impl_type, trait_key, mname)
 }
 
 fn tc_is_conversion_trait(trait_name: Str) -> Bool {
     trait_name == "From" || trait_name == "TryFrom"
+}
+
+// `.into()` is From read from the target's side (sections/03_types.md, `Into[T]`). Mono reads
+// the form here so the method name has one home.
+pub fn tc_is_into_method(method: Str) -> Bool {
+    method == "into"
 }
 
 // The trait a static conversion method belongs to, or "" for any other method. Typecheck and
@@ -629,18 +637,76 @@ pub let CONVERSION_IS_IDENTITY: Int = -2
 
 // The impl a conversion from `source` to `target` runs, CONVERSION_IS_IDENTITY, or -1 when
 // none is declared. Matched on tids and never on spellings, so an alias converts as the type
-// it names. Pure, so codegen reads the answer typecheck checked.
+// it names. Pure, so codegen reads the answer typecheck checked. The spec's no-overlap rule
+// leaves at most one impl that matches a call.
 pub fn tc_conversion_impl_for(trait_name: Str, source: Int, target: Int) -> Int {
     if trait_name == "From" && tc_tid_same_type(source, target) { return CONVERSION_IS_IDENTITY }
     let mut found = -1
     for im in tc_conv_source_tids.keys() {
         if tc_impl_trait_id(im) != trait_name { continue }
-        if !tc_tid_same_type(tc_conv_source_tids.get(im) ?? -1, source) { continue }
-        if !tc_tid_same_type(tc_impl_recv_tids.get(im) ?? -1, target) { continue }
+        if tc_conversion_match_binds(im, source, target).is_none() { continue }
         // The impl a cold load parsed first, whatever ids a recheck that kept nodes gave.
         if found < 0 || node_load_rank(im) < node_load_rank(found) { found = im }
     }
     found
+}
+
+// The binds under which impl `im` converts `source` to `target`, or None when it does not. The
+// impl's binders are filled from the source, then from the target, and the heads they fill
+// must then be the call's own types, so the two sides cannot fill one binder two ways. A
+// static call names a generic receiver bare (`Box.from(xs)`); an impl whose receiver
+// arguments are all its binders answers for every instance of it, so the source decides.
+pub fn tc_conversion_match_binds(im: Int, source0: Int, target0: Int) -> Option[Map[Str, Int]] {
+    let src = tc_conv_source_tids.get(im) ?? -1
+    let recv = tc_impl_recv_tids.get(im) ?? -1
+    if src < 0 || recv < 0 { return None }
+    let no_binds: Map[Str, Int] = Map()
+    let source = substitute_typevar_tid(source0, no_binds)
+    let target = substitute_typevar_tid(target0, no_binds)
+    let mut binds: Map[Str, Int] = Map()
+    unify_typevar_binds(src, source, binds)
+    let target_decl = tc_tid_decl_node(target)
+    let bare_target = target_decl >= 0 && target_decl == tc_tid_decl_node(recv) && tc_tid_struct_arg_count(tc_resolve(target)) == 0
+    let bare = tc_impl_is_poly_user(im) && bare_target
+    if !bare { unify_typevar_binds(recv, target, binds) }
+    if !tc_tid_same_type(substitute_typevar_tid(src, binds), source) { return None }
+    if !bare && !tc_tid_same_type(substitute_typevar_tid(recv, binds), target) { return None }
+    Some(binds)
+}
+
+// A From or TryFrom impl with binders over a declared type, compiled once per instance:
+// `impl[T] From[List[T]] for X`, or `for Box[T]` when the receiver's arguments are the binders
+// in order. Every binder must appear in the source or the receiver, or no call could say what
+// it is. Pure, so mono and codegen read the one decision typecheck made.
+pub fn tc_impl_is_poly_conversion(im: Int) -> Bool {
+    if !tc_is_conversion_trait(tc_impl_trait_id(im)) { return false }
+    let binders = node_impl_binders(im)
+    if binders == -1 || sublist_length(binders) == 0 { return false }
+    let src = tc_conv_source_tids.get(im) ?? -1
+    let recv = tc_impl_recv_tids.get(im) ?? -1
+    if src < 0 || recv < 0 { return false }
+    if tc_tid_decl_node(recv) < 0 { return false }
+    if tc_impl_is_poly_user(im) { return true }
+    if tc_tid_struct_arg_count(tc_resolve(recv)) != 0 { return false }
+    let mut i = 0
+    while i < sublist_length(binders) {
+        if !tc_tid_mentions_binder(src, sublist_get(binders, i)) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn tc_tid_mentions_binder(tid0: Int, binder: Int) -> Bool {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    if type_kind(tid) == TyKind.Typevar { return tc_tid_binder(tid) == binder }
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n {
+        if tc_tid_mentions_binder(tc_tid_child(tid, i), binder) { return true }
+        i = i + 1
+    }
+    false
 }
 
 // Bare type names declared by more than one module, each with the modules that declare it
@@ -2407,7 +2473,8 @@ let mut tc_ud_pending: List[TcUdPending] = []
 // IS its own identity (tc_is_unbound_metavar: kind Unknown with no solution), so two
 // bindings that share one share the same under-determination.
 let mut tc_ud_blamed: Map[Int, Int] = Map()
-// Each unbracketed generic call's own binder tids, judged once inference is done: a
+// Each unbracketed generic call's own binder tids, and each conversion call's impl binder
+// tids, judged once inference is done: a
 // binder a later statement pins is solved by then. A call is walked again after a
 // speculative walk, so the last record of a node is the one that counts.
 let mut tc_call_open_calls: List[Int] = []
@@ -2618,6 +2685,54 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
     }
 }
 
+// A call that converts through an impl with binders, as the group [-1, im, n, tid...]: one
+// tid per impl binder, -1 for a slot with no bind. A binder only the argument fills
+// (`X.from([])`) is open in no binding the program writes, so the call is what the flush
+// blames.
+fn tc_note_conversion_call(im: Int, call_node: Int, binds: Map[Str, Int]) {
+    if tc_boundary_check_active == 0 || call_node < 0 { return }
+    let binders = node_impl_binders(im)
+    if binders == -1 || sublist_length(binders) == 0 { return }
+    if tc_call_open_group.contains_key(call_node) == 0 { tc_call_open_calls.push(call_node) }
+    tc_call_open_group.insert(call_node, tc_call_open_tids.len())
+    tc_call_open_tids.push(-1)
+    tc_call_open_tids.push(im)
+    tc_call_open_tids.push(sublist_length(binders))
+    let mut i = 0
+    while i < sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        tc_call_open_tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
+        i = i + 1
+    }
+}
+
+// The flush half of tc_note_conversion_call.
+fn tc_ud_flush_conversion_call(call_node: Int, g: Int) ! Diag.Report {
+    let im = tc_call_open_tids.get(g + 1).unwrap()
+    let binders = node_impl_binders(im)
+    let n = tc_call_open_tids.get(g + 2).unwrap()
+    let mut names: List[Str] = []
+    let mut tids: List[Int] = []
+    let mut pi = 0
+    while pi < n {
+        let tid = tc_call_open_tids.get(g + 3 + pi).unwrap()
+        if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
+            names.push(node_name(sublist_get(binders, pi)))
+            tids.push(tid)
+        }
+        pi = pi + 1
+    }
+    if names.len() == 0 { return }
+    tc_call_reported.insert(call_node, 1)
+    let head = "impl {tc_impl_trait_id(im)}[{tc_type_str(tc_impl_conv_source(im))}] for {tc_type_str(tc_impl_recv_tids.get(im) ?? -1)}"
+    let mut msg = "type parameter {tc_ticked_names(names)} of `{head}` is unbound at this call and nothing supplies it"
+    if names.len() > 1 {
+        msg = "type parameters {tc_ticked_names(names)} of `{head}` are unbound at this call and nothing supplies them"
+    }
+    diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, "give the value this call converts a type annotation")
+    for t in tids { tc_ud_mark_blamed(t) }
+}
+
 // A Map()/Set() construction that names no type arguments, as a group of its own:
 // [-1, -1, 1, ctor] when the key is open here, else [-1, -1, 1, -1], so a walk that found it
 // closed clears an earlier record. The flush judges the key once inference is done.
@@ -2639,6 +2754,7 @@ fn tc_note_open_ctor_key(node: Int, ctor: Int) {
 // any report has claimed it.
 fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
     let sig = tc_call_open_tids.get(g).unwrap()
+    if sig < 0 && tc_call_open_tids.get(g + 1).unwrap() >= 0 { return }
     if sig < 0 {
         let ctor = tc_call_open_tids.get(g + 3).unwrap()
         if ctor < 0 { return }
@@ -2673,7 +2789,12 @@ fn tc_ud_flush_calls() ! Diag.Report {
         let g = tc_call_open_group.get(call_node).unwrap()
         tc_flush_open_keys_of(call_node, g)
         let sig = tc_call_open_tids.get(g).unwrap()
-        if sig < 0 || tc_call_reported.contains_key(call_node) { continue }
+        if tc_call_reported.contains_key(call_node) { continue }
+        if sig < 0 && tc_call_open_tids.get(g + 1).unwrap() >= 0 {
+            tc_ud_flush_conversion_call(call_node, g)
+            continue
+        }
+        if sig < 0 { continue }
         let n = tc_call_open_tids.get(g + 2).unwrap()
         let fs = fnsig_pool.get(sig).unwrap()
         let mut names: List[Str] = []
@@ -12090,7 +12211,10 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         // both binders to the element), binders without a receiver type-arg
         // (Holder), receiver args without binders (Box[Int]), concrete
         // `List[Int]`, a nested binder (Box[List[T]]) and a repeated one.
-        let mut poly_supported = if tc_impl_is_poly_user(im) { 1 } else { 0 }
+        //  4. A From or TryFrom impl over a declared type (tc_impl_is_poly_conversion):
+        //     monomorphized per call, from the source the call converts.
+        if tc_is_conversion_trait(tc_impl_trait_id(im)) { let _ = tc_impl_conv_source_tid(im) }
+        let mut poly_supported = if tc_impl_is_poly_user(im) || tc_impl_is_poly_conversion(im) { 1 } else { 0 }
         if binders_sl != -1 && recv_args_sl != -1 {
             let nb = sublist_length(binders_sl)
             let nr = sublist_length(recv_args_sl)
@@ -23385,7 +23509,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // elsewhere and is not this arm's to widen.
         if method == "into" {
             if tc_construct_hint < 0 { return -1 }
-            tc_check_conversion(node, "From", obj_t, tc_construct_hint)
+            let im = tc_check_conversion(node, "From", obj_t, tc_construct_hint)
+            if im >= 0 { tc_note_conversion_call(im, node, tc_conversion_match_binds(im, obj_t, tc_construct_hint) ?? Map()) }
             return tc_construct_hint
         }
 
@@ -24374,12 +24499,13 @@ fn tc_conversion_side_settled(t: Int) -> Bool {
     tc_tid_is_concrete(t) != 0 && tc_tid_has_unknown(t) == 0 && tc_tid_has_bare_typevar(t) == 0
 }
 
-// The impl a settled conversion runs, CONVERSION_IS_IDENTITY, or -1 once E0312 is reported.
-// An unsettled one answers -1 and reports nothing.
+// The impl a conversion runs, CONVERSION_IS_IDENTITY, or -1. A side that holds a generic
+// body's `T` can still match an impl with binders, so the match comes first; only a
+// conversion between two settled types that nothing matches reports E0312.
 fn tc_check_conversion(node: Int, trait_name: Str, source: Int, target: Int) -> Int ! Diag.Report {
-    if !tc_conversion_side_settled(source) || !tc_conversion_side_settled(target) { return -1 }
     let im = tc_conversion_impl_for(trait_name, source, target)
     if im != -1 { return im }
+    if !tc_conversion_side_settled(source) || !tc_conversion_side_settled(target) { return -1 }
     let s = tc_type_str(source)
     let t = tc_type_str(target)
     diag_error_at("NoConversionImpl", NO_CONVERSION_IMPL,
@@ -24389,7 +24515,9 @@ fn tc_check_conversion(node: Int, trait_name: Str, source: Int, target: Int) -> 
 }
 
 // `Type.from(x)` / `Type.try_from(x)`. The target is the type the qualifier names; a
-// declared impl answers with its method's return, Self read as that target.
+// declared impl answers with its method's return, Self read as that target. The impl's
+// binders take what the source fills in, and a binder the source leaves open gets a fresh
+// metavar, so a bare generic qualifier (`Box.from(xs)`) answers `Box[Int]` for a List[Int].
 fn tc_static_conversion(node: Int, obj_name: Str, method: Str, src_t: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let target = resolve_type_name(obj_name)
     if target < 0 { return -1 }
@@ -24400,10 +24528,20 @@ fn tc_static_conversion(node: Int, obj_name: Str, method: Str, src_t: Int) -> In
     let sig = lookup_fnsig(tc_mangle_impl_fnsig(tc_impl_target_name(im), tc_impl_trait_id(im), method, im))
     if sig == -1 { return -1 }
     nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
-    let mut self_bind: Map[Str, Int] = Map()
-    self_bind.insert("Self", target)
-    self_bind.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), target)
-    substitute_typevar_tid(fnsig_pool.get(sig).unwrap().ret, self_bind)
+    let mut binds = tc_conversion_match_binds(im, src_t, target) ?? Map()
+    let binders = node_impl_binders(im)
+    let mut i = 0
+    while binders != -1 && i < sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        let key = tc_binder_key(tp, node_name(tp))
+        if !binds.contains_key(key) { binds.insert(key, make_metavar()) }
+        i = i + 1
+    }
+    tc_note_conversion_call(im, node, binds)
+    let self_t = substitute_typevar_tid(tc_impl_recv_tids.get(im) ?? target, binds)
+    binds.insert("Self", self_t)
+    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_t)
+    substitute_typevar_tid(fnsig_pool.get(sig).unwrap().ret, binds)
 }
 
 // The io.* methods that print and answer `()`. Kept separate from the

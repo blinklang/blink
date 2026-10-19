@@ -48,9 +48,15 @@ A name with no `_` keeps its spelling. These parts stay verbatim: module keys, t
 vtables, carrier tags and the init-globals names.
 
 `tc_impl_method_stem` and `tc_impl_conv_stem` in typecheck.bl give both the signature
-key of an impl method and the stem of its C symbol. A conversion's key spells its source
-with `tc_type_str`; its C stem spells the source with `seg_at` at TOP position. The two
-have one shape, but an alias source keys under its target.
+key of an impl method and the stem of its C symbol. Only the C stem spells a conversion's
+source, with `seg_at` at TOP position. The signature key holds the impl node id in the
+source slot: every reader of the key has the impl, and a second spelling of the source
+could name an alias, or a source with binders, apart from the symbol.
+
+A From or TryFrom impl with binders (`impl[T] From[List[T]] for Box[T]`) has one C
+function per instance. `c_poly_method_name` spells the source with the instance's binders
+filled in, then the binders as mono arguments, so From[List[T]] and From[Option[T]] on one
+Box[T] stay apart.
 
 ## Name forms
 
@@ -66,6 +72,7 @@ have one shape, but an alias source keys under its target.
 | Variant tag macro | `c_variant_tag_macro(td, v)` / `c_mono_variant_tag_macro(tid, v)` | type decl node or instance tid, variant node | `Shape.Circle` -> `blink_Shape_Circle_TAG`; `Tree[Int].Leaf` -> `blink_Tree_0Int_Leaf_TAG` |
 | Derived method | `c_derive_method_name(td, m)` | type decl node, method | `Point` `eq` -> `blink_Point_eq`; `User` `to_json` -> `blink_User_to_1json` |
 | Impl method | `c_impl_method_name(im, m)` / `_q(im, trait, m)` | impl node, method | `impl Greet for Point` `greet` -> `blink_Point_Greet_greet`; `impl From[Int] for Point` `from` -> `blink_Point_From_from_0Int`; `impl TryFrom[Int] for Char` -> `blink_std_char_Char_TryFrom_try_1from_0Int`; in `mymod` -> `blink_mymod_Ngx_Greet2_greet2`; a trait `Tr` that modules `a` and `b` both declare -> `blink_Point_Tr_2a_go` |
+| Poly impl method instance | `c_poly_method_name(im, m, args_tid, source_tid)` | impl node, method, interned tuple tid of the impl binders, source tid with them filled in (-1 unless From or TryFrom) | `impl[T] From[List[T]] for Box[T]` at `Int` -> `blink_Box_1From_1from_10List_11int_0Int` |
 | Display dispatcher | `c_display_dispatch_name(im)` | impl node | `blink_Point_Display_display` |
 | Segment | `c_seg_top(tid)` / `c_seg_inner(tid)` | tid | `Int` -> `Int` / `int`; `Float` -> `Float` / `double`; `Map[K, V]` -> `Map` / `map`; `Point` -> `Point` / `Point`; `Ngx` in `mymod` -> `Ngx` / `mymod_Ngx`; fn type -> ICE / `closure` |
 | Kops table | `c_kops_table_name(tid)` | key tid | `Int` -> `blink_kops_i64`; `Str` -> `blink_kops_str`; struct, enum or tuple -> `kops_` + typedef name (`Key` -> `kops_blink_Key`, `(Int, Str)` -> `kops_blink_Tuple2_int_str`); opaque handle -> ICE segment, its C name is a pointer |

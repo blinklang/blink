@@ -1,0 +1,70 @@
+// Two poly From impls on one generic receiver give one `from` per source. The receiver
+// and its type arguments are the same at both calls, so the C name tells them apart only
+// if it spells the source in the `_0` slot. An instance name escapes the impl stem once
+// more, so the stem's `_0List` reads `_10List` there.
+
+import std.fs
+import std.io
+import typecheck.{check_types, tc_sym_escape}
+import mono.{run_mono, instances, MonoInstance}
+import parser.{node_count, node_kind, node_name, node_methods, sublist_get}
+import ast.{NodeKind}
+import compiler.{compile_to_program}
+
+fn impl_blocks_for(name: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.ImplBlock && node_name(i) == name { out.push(i) }
+        i = i + 1
+    }
+    out
+}
+
+fn instances_of(decl: Int) -> List[MonoInstance] {
+    let mut out: List[MonoInstance] = []
+    for inst in instances() {
+        if inst.base_decl_node == decl { out.push(inst) }
+    }
+    out
+}
+
+fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    run_mono(program)
+    let _ = fs.delete(path)
+}
+
+fn only_from_name(im: Int) -> Str {
+    let from = sublist_get(node_methods(im), 0)
+    assert_eq(node_name(from), "from")
+    let insts = instances_of(from)
+    assert_eq(insts.len(), 1)
+    insts.get(0).unwrap().c_name
+}
+
+test "a poly conversion instance symbol spells its source" {
+    run_probe("build/mono_poly_conversion_source_stem.bl", #"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+impl[T] From[Option[T]] for Box[T] {
+    fn from(o: Option[T]) -> Box[T] { Box { v: [] } }
+}
+fn main() {
+    let a = Box.from([1])
+    let b = Box.from(Some(2))
+    assert(a.v.len() + b.v.len() == 1)
+}
+"#)
+    let ims = impl_blocks_for("Box")
+    assert_eq(ims.len(), 2)
+    let from_list = only_from_name(ims.get(0).unwrap())
+    let from_option = only_from_name(ims.get(1).unwrap())
+    io.println("poly conversion c_names {from_list} {from_option}")
+    assert(from_list.contains(tc_sym_escape("_0List")))
+    assert(from_option.contains(tc_sym_escape("_0Option")))
+    assert(from_list != from_option)
+}

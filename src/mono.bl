@@ -33,7 +33,8 @@ import typecheck.{
     make_ptr_type, make_result_type, make_set_type, make_struct_instance_type, make_template_type,
     make_tuple_type,
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
-    tc_call_declared_name, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
+    tc_call_declared_name, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_impl_conv_source,
+    tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_conversion_trait_of, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait,
@@ -285,9 +286,10 @@ fn register_own_generic_methods(im: Int) {
 // List receiver whose single type argument is that binder, and a body that can see the
 // element; an element-agnostic one is one shared symbol instead. And an impl over a user
 // generic type whose receiver arguments are its binders, which typecheck decides: each
-// instance of that type has its own C layout, so no such body is ever shared.
+// instance of that type has its own C layout, so no such body is ever shared. A From or
+// TryFrom impl with binders is per instance too, one per source a call converts.
 pub fn is_poly_impl(im: Int) -> Bool {
-    if tc_impl_is_poly_user(im) { return true }
+    if tc_impl_is_poly_user(im) || tc_impl_is_poly_conversion(im) { return true }
     if node_name(im) != "List" { return false }
     let binders_sl = node_impl_binders(im)
     let recv_args_sl = node_recv_type_args(im)
@@ -344,15 +346,23 @@ fn ann_mentions_binder(ann: Int, binders_sl: Int) -> Bool {
 }
 
 // A user impl stays out of the by-name maps: they serve List receivers, and a List impl
-// of the same method name must not reach a user type's body.
+// of the same method name must not reach a user type's body. A conversion impl stays out of
+// both, since one receiver takes many of them and only the source picks one
+// (discover_conversion_call).
 fn register_poly_impl(im: Int) {
     if !is_poly_impl(im) { return }
     let user_decl = tc_poly_user_impl_decl(im)
     let trait_id = tc_impl_trait_id(im)
+    let is_conversion = tc_impl_conv_source(im) >= 0
     let methods_sl = node_methods(im)
     let mut j = 0
     while j < sl_len(methods_sl) {
         let m = sublist_get(methods_sl, j)
+        if is_conversion {
+            poly_block_of_method.insert(m, im)
+            j = j + 1
+            continue
+        }
         if user_decl >= 0 {
             poly_user_method_by_recv.insert(poly_user_key(user_decl, node_name(m)), m)
             poly_user_method_by_recv.insert(poly_user_key(user_decl, "{trait_id}.{node_name(m)}"), m)
@@ -695,7 +705,8 @@ fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
     let im = own_generic_method_impl.get(m) ?? -1
     if im < 0 { return -1 }
     let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, arg_tids)))
-    register(m, binders_sl, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid))
+    let source = impl_source_tid(im, Map())
+    register(m, binders_sl, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid, source))
 }
 
 // A poly-impl method that declares type parameters of its own answers to two declarations:
@@ -719,7 +730,7 @@ fn register_poly_own_generic_method(m: Int, impl_tids0: List[Int], own_tids0: Li
     for k in own_binds.keys() { binds.insert(k, own_binds.get(k) ?? -1) }
     let args_tid = make_tuple_type(arg_tids)
     let inst_tid = canon_tid(fn_signature_tid(m, binds))
-    register_with_binds(m, binds, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid))
+    register_with_binds(m, binds, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid, impl_source_tid(im, binds)))
 }
 
 // Keyed on the impl binders' tids, so two receivers that differ only inside an argument the
@@ -728,9 +739,18 @@ fn register_poly_method(m: Int, impl_tids0: List[Int]) -> Int {
     let impl_tids = canon_tids(impl_tids0)
     let im = poly_block_of_method.get(m).unwrap()
     let binders_sl = node_impl_binders(im)
-    let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, impl_tids)))
-    let c_name = c_poly_method_name(im, node_name(m), make_tuple_type(impl_tids))
+    let binds = binds_from_binders(binders_sl, impl_tids)
+    let inst_tid = canon_tid(fn_signature_tid(m, binds))
+    let c_name = c_poly_method_name(im, node_name(m), make_tuple_type(impl_tids), impl_source_tid(im, binds))
     register(m, binders_sl, impl_tids, inst_tid, c_name)
+}
+
+// The source a conversion impl's instance converts from, with the instance's binders put in,
+// or -1 for any other impl.
+fn impl_source_tid(im: Int, binds: Map[Str, Int]) -> Int {
+    let source = tc_impl_conv_source(im)
+    if source < 0 { return -1 }
+    canon_tid(substitute_typevar_tid(source, binds))
 }
 
 fn note_call_target(ctx: Int, call_node: Int, inst_index: Int) {
@@ -1008,6 +1028,52 @@ fn discover_own_generic_method_call(ctx: Int, node: Int, obj: Int) ! Diag.Report
     note_call_target(ctx, node, register_own_generic_method(m, binder_args(ctx, m, node, binds)))
 }
 
+// `T.from(v)`, `T.try_from(v)` or `v.into()` that reaches a From or TryFrom impl with
+// binders. Typecheck linked the static form to the method it picked; `.into()` is linked to
+// nothing, so its impl is the one typecheck's rule picks from this instance's tids. The
+// binders are solved from the call like any generic call's, the receiver of `.into()`
+// standing for the method's source parameter.
+fn discover_conversion_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
+    let mut m = tc_call_decl_node(node)
+    let mut lead: List[Int] = []
+    if m < 0 {
+        if !tc_is_into_method(node_method(node)) || sl_len(node_args(node)) != 0 { return }
+        let source = ctx_node_tid(ctx, obj)
+        let target = ctx_node_tid(ctx, node)
+        if source < 0 || target < 0 { return }
+        let im = tc_conversion_impl_for(tc_conversion_trait_of("from"), source, target)
+        if im < 0 { return }
+        m = conversion_method_of(im)
+        lead.push(source)
+    }
+    let im = poly_block_of_method.get(m) ?? -1
+    if im < 0 || tc_impl_conv_source(im) < 0 { return }
+    let binds = solve_call_binds(ctx, m, node, lead, node_args(node))
+    let binders_sl = node_impl_binders(im)
+    let mut impl_tids: List[Int] = []
+    let mut i = 0
+    while i < sl_len(binders_sl) {
+        let b = sublist_get(binders_sl, i)
+        let t = binds.get(tc_binder_key(b, node_name(b))) ?? -1
+        if t < 0 || tid_is_open(t) { return }
+        impl_tids.push(t)
+        i = i + 1
+    }
+    note_call_target(ctx, node, register_poly_method(m, impl_tids))
+}
+
+// The method a From or TryFrom impl declares for its trait, or -1.
+fn conversion_method_of(im: Int) -> Int {
+    let methods_sl = node_methods(im)
+    let mut j = 0
+    while j < sl_len(methods_sl) {
+        let m = sublist_get(methods_sl, j)
+        if tc_conversion_trait_of(node_name(m)) == tc_impl_trait_id(im) { return m }
+        j = j + 1
+    }
+    -1
+}
+
 // A perform instantiates nothing, and its handle may be spelled like an imported module,
 // so it must not reach the module call's by-name generic lookup.
 fn discover_method_call(ctx: Int, node: Int) ! Diag.Report {
@@ -1018,6 +1084,7 @@ fn discover_method_call(ctx: Int, node: Int) ! Diag.Report {
         discover_module_call(ctx, node)
         return
     }
+    discover_conversion_call(ctx, node, obj)
     discover_own_generic_method_call(ctx, node, obj)
     discover_poly_impl_call(ctx, node, obj)
     discover_list_hof_call(ctx, node, obj)

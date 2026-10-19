@@ -1,0 +1,154 @@
+// A From or TryFrom impl with binders (`impl[T] From[List[T]] for X`) is legal (sections/
+// 03_types.md: a binder may bind the trait's type argument alone). Each call picks the impl
+// whose source and receiver match once the binders are filled in, and each instance is its
+// own C function. The one-unit build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn expect_runs(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_poly_conv.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+test "a poly From impl on a receiver with no type arguments" {
+    expect_runs(#"type X { n: Int }
+impl[T] From[List[T]] for X {
+    fn from(xs: List[T]) -> X { X { n: xs.len() } }
+}
+fn main() {
+    let a = X.from([1, 2])
+    let b = X.from(["p", "q", "r"])
+    io.println("{a.n} {b.n}")
+}
+"#, "2 3")
+}
+
+test "a poly From impl on a generic receiver" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+fn main() {
+    let b = Box.from([1, 2])
+    let s = Box.from(["x"])
+    io.println("{b.v.len()} {s.v.get(0) ?? "?"}")
+}
+"#, "2 x")
+}
+
+test "two poly From impls on one generic receiver are two functions" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+impl[T] From[Option[T]] for Box[T] {
+    fn from(o: Option[T]) -> Box[T] {
+        match o {
+            Some(x) => Box { v: [x, x] }
+            None => Box { v: [] }
+        }
+    }
+}
+fn main() {
+    let a = Box.from([1, 2, 3])
+    let b = Box.from(Some(7))
+    let n: Option[Str] = None
+    let c = Box.from(n)
+    io.println("{a.v.len()} {b.v.len()} {c.v.len()}")
+}
+"#, "3 2 0")
+}
+
+test "a poly TryFrom impl answers Ok and Err" {
+    expect_runs(#"type Pair[T] { a: T  b: T }
+impl[T] TryFrom[List[T]] for Pair[T] {
+    fn try_from(xs: List[T]) -> Result[Pair[T], ConversionError] {
+        if xs.len() != 2 {
+            return Err(ConversionError { message: "want 2, got {xs.len()}", source_type: "List", target_type: "Pair" })
+        }
+        Ok(Pair { a: xs.get(0).unwrap(), b: xs.get(1).unwrap() })
+    }
+}
+fn main() {
+    match Pair.try_from([4, 5]) {
+        Ok(p) => io.println("ok {p.a + p.b}")
+        Err(e) => io.println("err {e.message}")
+    }
+    match Pair.try_from(["a"]) {
+        Ok(p) => io.println("ok {p.a}")
+        Err(e) => io.println("err {e.message}")
+    }
+}
+"#, "ok 9\nerr want 2, got 1")
+}
+
+test "into reaches the poly From impl the static form reaches" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+type X { n: Int }
+impl[T] From[List[T]] for X {
+    fn from(xs: List[T]) -> X { X { n: xs.len() * 10 } }
+}
+fn main() {
+    let b: Box[Int] = [1, 2, 3].into()
+    let x: X = ["a", "b"].into()
+    io.println("{b.v.len()} {x.n}")
+}
+"#, "3 20")
+}
+
+test "a poly From call inside a generic body runs at each instance" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+fn wrap[U](xs: List[U]) -> Box[U] {
+    Box.from(xs)
+}
+fn main() {
+    let a = wrap([1, 2])
+    let b = wrap(["s", "t", "u"])
+    io.println("{a.v.len()} {b.v.len()}")
+}
+"#, "2 3")
+}
+
+test "an alias source converts as the type it names" {
+    expect_runs(#"type Names = List[Str]
+type X { n: Int }
+impl From[Names] for X {
+    fn from(xs: Names) -> X { X { n: xs.len() } }
+}
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() * 100 } }
+}
+type Box[T] { v: List[T] }
+impl[T] From[Option[T]] for Box[T] {
+    fn from(o: Option[T]) -> Box[T] { Box { v: if o.is_some() { [o.unwrap()] } else { [] } } }
+}
+type MaybeName = Option[Str]
+fn main() {
+    let ns: Names = ["a", "b", "c"]
+    let m: MaybeName = Some("z")
+    io.println("{X.from(ns).n} {X.from([1]).n} {Box.from(m).v.len()}")
+}
+"#, "3 100 1")
+}
