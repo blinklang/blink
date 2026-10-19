@@ -2942,13 +2942,16 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
 }
 
 // Choose the impl of each conversion tc_defer_conversion left open, now that every use in the
-// program has run. A sole impl that fits is a use like any call's: it settles what the call
-// left open, and that can leave one impl for another deferred call, so the passes repeat
-// until none chooses. tc_refuse_deferred_conversions judges the rest.
+// definition has run (sections/03_types.md 3.4 scopes a later use to the same definition). A
+// sole impl that fits is a use like any call's: it settles what the call left open, and that
+// can leave one impl for another deferred call, so the passes repeat until none chooses.
+// tc_refuse_deferred_conversions judges the rest at the end of the program.
+//
+// Each definition flushes before its type parameters leave scope, so a chosen impl may bind
+// a binder to one of them, under the licence the definition's own annotation has
+// (tc_pin_tail_ret_generic). The flush at the end of the program has none in scope.
 fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, Diag.Report {
-    // The flush records a chosen impl's binders as a walk inside a body does.
-    let prev_boundary = tc_boundary_check_active
-    tc_boundary_check_active = 1
+    tc_pin_tparam_binds = 1
     let mut chose = true
     while chose {
         chose = false
@@ -2956,7 +2959,7 @@ fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, Diag.Report {
             if tc_choose_deferred_conversion(call_node) { chose = true }
         }
     }
-    tc_boundary_check_active = prev_boundary
+    tc_pin_tparam_binds = 0
 }
 
 // Refuse each conversion no use settled: more than one impl fits, or none. This runs after
@@ -5111,57 +5114,28 @@ fn tc_arm_tail_value_node(body: Int) -> Int {
     body
 }
 
-// Does EVERY arm tail of this if/match directly mint a return-only group (a bare
-// generic call like `mk()`), so a declared type can pin THROUGH the if/match by
-// pinning each arm the way it pins a single tail call? An arm tail that is itself an
-// if/match recurses. Any other tail — a concrete value, a non-minting generic call —
-// answers 0, which leaves the value on its existing merged/loud path. This is the gate
-// that keeps the adjacent shapes LOUD: a mono-calls-mono direct tail is not an
-// if/match and never reaches here, and a mixed if (one minting arm, one concrete)
-// answers 0 so no arm is silently half-pinned.
-fn tc_ifmatch_arms_all_ret_mint(val: Int) -> Int {
+// Pin `declared_tid` into every tail `val` can produce: through a block's tail and into each
+// if/match arm, as far down as the value goes. The declared type is the expected type of the
+// whole value (sections/03_types.md 3.3), so a brace or a branch around a call must not change
+// whether it fills the call's binders. Each tail pins on its own because the merged type of an
+// if/match over a generic struct carries only one arm's metavar (type_merge keeps the first
+// side), and the value itself pins too, since a merged type may hold a metavar no arm does.
+// `gated` applies tc_pin_ok_for_declared at each level, as a let or an assignment needs; a
+// declared return pins without it.
+fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int, gated: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if !gated || tc_pin_ok_for_declared(val, declared_tid) != 0 {
+        tc_pin_tail_ret_generic(declared_tid, val_tid)
+    }
     let k = node_kind(val)
+    if k == NodeKind.Block {
+        tc_pin_declared_into_tail(declared_tid, val, gated)
+        return
+    }
     if k == NodeKind.IfExpr {
         let en = node_else_body(val)
-        if en == -1 { return 0 }
-        if tc_arm_body_ret_mint(node_then_body(val)) == 0 { return 0 }
-        if tc_arm_body_ret_mint(en) == 0 { return 0 }
-        return 1
-    }
-    if k == NodeKind.MatchExpr {
-        let arms = node_arms(val)
-        if arms == -1 { return 0 }
-        if sublist_length(arms) == 0 { return 0 }
-        let mut i = 0
-        while i < sublist_length(arms) {
-            if tc_arm_body_ret_mint(node_body(sublist_get(arms, i))) == 0 { return 0 }
-            i = i + 1
-        }
-        return 1
-    }
-    0
-}
-
-fn tc_arm_body_ret_mint(body: Int) -> Int {
-    let v = tc_arm_tail_value_node(body)
-    if v < 0 { return 0 }
-    let k = node_kind(v)
-    if k == NodeKind.IfExpr || k == NodeKind.MatchExpr { return tc_ifmatch_arms_all_ret_mint(v) }
-    tc_node_has_ret_mint(v)
-}
-
-// Pin `declared_tid` into EACH arm tail of an if/match whose arms all mint a
-// return-only group (gated by tc_ifmatch_arms_all_ret_mint at the call site). The
-// merged inferred type of an if/match over a generic STRUCT carries only ONE arm's
-// metavar (type_merge returns the first side for a struct), so pinning the merged type
-// would leave the other arms' ctors unbound. Pinning each arm tail directly binds
-// every arm's α from the one declared type, exactly as a single tail call would.
-fn tc_pin_declared_through_ifmatch(declared_tid: Int, val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let k = node_kind(val)
-    if k == NodeKind.IfExpr {
-        tc_pin_declared_into_arm(declared_tid, node_then_body(val))
-        let en = node_else_body(val)
-        if en != -1 { tc_pin_declared_into_arm(declared_tid, en) }
+        if en == -1 { return }
+        tc_pin_declared_into_tail(declared_tid, node_then_body(val), gated)
+        tc_pin_declared_into_tail(declared_tid, en, gated)
         return
     }
     if k == NodeKind.MatchExpr {
@@ -5169,22 +5143,24 @@ fn tc_pin_declared_through_ifmatch(declared_tid: Int, val: Int) ! TypeCheck.Reso
         if arms == -1 { return }
         let mut i = 0
         while i < sublist_length(arms) {
-            tc_pin_declared_into_arm(declared_tid, node_body(sublist_get(arms, i)))
+            tc_pin_declared_into_tail(declared_tid, node_body(sublist_get(arms, i)), gated)
             i = i + 1
         }
-        return
     }
 }
 
-fn tc_pin_declared_into_arm(declared_tid: Int, body: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_pin_declared_into_tail(declared_tid: Int, body: Int, gated: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let v = tc_arm_tail_value_node(body)
     if v < 0 { return }
-    let k = node_kind(v)
-    if k == NodeKind.IfExpr || k == NodeKind.MatchExpr {
-        tc_pin_declared_through_ifmatch(declared_tid, v)
-        return
-    }
-    tc_pin_tail_ret_generic(declared_tid, infer_type(v))
+    tc_pin_declared_into_value(declared_tid, v, tc_pin_tail_tid(v), gated)
+}
+
+// The tid the checked walk recorded for a tail inside a value. A fresh infer_type would mint
+// new metavars for an open argument, and pinning those leaves the recorded ones open.
+fn tc_pin_tail_tid(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let t = tc_lookup_node_tid(node)
+    if t >= 0 { return t }
+    infer_type(node)
 }
 
 // The declared-return check for one returned value, shared by NodeKind.Return and by
@@ -5315,12 +5291,10 @@ fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCh
     } else {
         if tc_closure_scope_base.len() == 0 {
             // A `return`-wrapped value carries the returned node one level down; an
-            // implicit tail passes the value node itself. When that value is an if/match
-            // whose every arm tail minted a return-only group, the declared return can
-            // only pin ONE arm through the merged type — see through and pin each arm.
+            // implicit tail passes the value node itself.
             let vnode = if node_kind(at_node) == NodeKind.Return { node_value(at_node) } else { at_node }
-            if vnode >= 0 && tc_ifmatch_arms_all_ret_mint(vnode) != 0 {
-                tc_pin_declared_through_ifmatch(tc_current_fn_ret, vnode)
+            if vnode >= 0 {
+                tc_pin_declared_into_value(tc_current_fn_ret, vnode, val_t, false)
             } else {
                 tc_pin_tail_ret_generic(tc_current_fn_ret, val_t)
             }
@@ -26235,6 +26209,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
             tc_check_missing_tail_value(body, declared_ret, fn_name, fn_node)
         }
     }
+    tc_flush_deferred_conversions()
     diag_clear_allows()
     tc_pop_tparam_scope(fn_tparams)
     tc_current_fn_name = prev_fn_name
@@ -27784,15 +27759,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 //
                 // Two gates then remain inside tc_pin_tail_ret_generic and they are the shared
                 // ones: an admitted declared head, and an actually-unbound metavar in the value.
-                if tc_pin_ok_for_declared(val, declared_tid) != 0 {
-                    tc_pin_tail_ret_generic(declared_tid, inferred_tid)
-                } else if tc_ifmatch_arms_all_ret_mint(val) != 0 {
-                    // The value is an if/match whose every arm tail minted a return-only
-                    // group. tc_pin_ok_for_declared reads the mint memo on the if/match
-                    // VALUE node, where nothing was minted, so it declines — see through
-                    // and pin the declared type into each arm tail instead.
-                    tc_pin_declared_through_ifmatch(declared_tid, val)
-                }
+                tc_pin_declared_into_value(declared_tid, val, inferred_tid, true)
             }
         }
 
@@ -27889,13 +27856,8 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // or a concrete container/carrier target that determines an
                     // under-determined value's slots (`x = Err("boom")` pins the mut
                     // carrier's other slot).
-                    if kind == NodeKind.Assignment && tc_pin_ok_for_declared(val, target_t) != 0 {
-                        tc_pin_tail_ret_generic(target_t, val_t)
-                    } else if kind == NodeKind.Assignment && tc_ifmatch_arms_all_ret_mint(val) != 0 {
-                        // Same see-through as the LetBinding arm: an if/match RHS whose
-                        // every arm tail minted a return-only group pins each arm tail
-                        // from the target type, not the (single-arm) merged value type.
-                        tc_pin_declared_through_ifmatch(target_t, val)
+                    if kind == NodeKind.Assignment {
+                        tc_pin_declared_into_value(target_t, val, val_t, true)
                     }
                 }
             }
@@ -28966,6 +28928,7 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     tc_boundary_check_active = 1
     nr_push_scope()
     tc_check_body(tbody)
+    tc_flush_deferred_conversions()
     nr_pop_scope()
     tc_boundary_check_active = prev_boundary
 
@@ -29077,11 +29040,7 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
         if assignment_types_compatible(declared, v_tid, l_val) == 0 {
             if !tc_closure_checked_against(l_val, declared) { tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {type_to_str(declared)} but got {type_to_str(v_tid)}{tc_fn_mismatch_suffix(declared, v_tid)}", l, l_val, declared, v_tid) }
         } else {
-            if tc_pin_ok_for_declared(l_val, declared) != 0 {
-                tc_pin_tail_ret_generic(declared, v_tid)
-            } else if tc_ifmatch_arms_all_ret_mint(l_val) != 0 {
-                tc_pin_declared_through_ifmatch(declared, l_val)
-            }
+            tc_pin_declared_into_value(declared, l_val, v_tid, true)
         }
     }
 }
@@ -29397,8 +29356,9 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     nr_pop_scope()
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined. A deferred conversion
-    // is chosen first, since the impl it chooses can settle what the others judge, and refused
-    // last, so a binding or call that names the open type answers for it.
+    // no definition chose (a module-scope one has no definition) is chosen first, since the
+    // impl it chooses can settle what the others judge, and refused last, so a binding or call
+    // that names the open type answers for it.
     tc_flush_deferred_conversions()
     tc_ud_flush_pending()
     tc_ud_flush_calls()
