@@ -1,4 +1,5 @@
-// A let annotation, a parameter type and a return type are each an expected type for a value
+// A let annotation, a parameter type, a return type, a field, a payload, a list element, a tuple
+// slot and a `?`/`??` operand are each an expected type for a value
 // (sections/03_types.md 3.3, bidirectional inference), so each fixes a generic call's binder
 // that the arguments leave open, however a block, an if or a match wraps the call.
 
@@ -317,9 +318,10 @@ fn main() {
         true => mk([])
         false => mk([])
     })
-    io.println("{a.v.len()} {b.v.len()} {d.v.len()} {e.v.len()} {g(c).is_ok()} {h(c).is_some()}")
+    let f: Box[Int] = (if c { mko([]) } else { mko([]) }) ?? mk([])
+    io.println("{a.v.len()} {b.v.len()} {d.v.len()} {e.v.len()} {f.v.len()} {g(c).is_ok()} {h(c).is_some()}")
 }
-"#, "0 0 0 0 true true")
+"#, "0 0 0 0 0 true true")
 }
 
 test "a value nothing determines is still E0301, and a wrong payload is still a mismatch" {
@@ -370,4 +372,160 @@ fn main() {
     io.println("{g.b.v.len()} {g.n} {h.n} {xs.len()} {xs.get(0).unwrap().v.len()} {ys.len()}")
 }
 "#, "0 1 2 2 1 1")
+}
+
+test "a payload meets its own field type, not an expected type around some other value" {
+    expect_runs(#"type Tree[T] { Leaf(T)  Nil }
+type G[T] { GP(Int)  GQ(T) }
+type N[A, B] { NV(a: A, b: B) }
+fn size[T](t: Tree[T]) -> Int { match t { Leaf(_) => 1  Nil => 0 } }
+fn main() {
+    let r: Tree[Int] = match Leaf("s") {
+        Leaf(v) => Leaf(v.len())
+        Nil => Nil
+    }
+    let g: G[Str] = {
+        let z = G.GQ(5)
+        match z {
+            G.GQ(n) => G.GQ("{n}")
+            G.GP(n) => G.GP(n)
+        }
+    }
+    let k = match g { GQ(s) => s  GP(_) => "" }
+    let w: N[Int, Str] = NV(b: "x", a: 7)
+    let m = match w { NV(a, b) => "{a}{b}" }
+    io.println("{size(r)} {k} {m}")
+}
+"#, "1 5 7x")
+}
+
+test "a wrong payload at an expected instance is reported once" {
+    expect_rejects(#"type Tree[T] { Leaf(T)  Nil }
+fn main() {
+    let t: Tree[Int] = Leaf("x")
+    match t { Leaf(n) => io.println("{n}")  Nil => {} }
+}
+"#, "1 error(s) found")
+}
+
+test "a recursive generic variant nests with an expected type and without one" {
+    expect_runs(#"type L[T] { Cons(T, L[T])  Nil }
+fn len[T](l: L[T]) -> Int { match l { Cons(_, r) => 1 + len(r)  Nil => 0 } }
+fn main() {
+    let l: L[Int] = Cons(1, Cons(2, Nil))
+    let m = Cons(3, Nil)
+    let q = L.Cons("a", L.Nil)
+    io.println("{len(l)} {len(m)} {len(q)}")
+}
+"#, "2 1 1")
+}
+
+test "two payloads of one type parameter must agree" {
+    expect_rejects(#"type P[T] { Two(T, T) }
+fn main() {
+    let p = Two(1, "x")
+    match p { Two(a, _) => io.println("{a}") }
+}
+"#, "argument 2 of `Two` expects Int, got Str")
+}
+
+test "an Option or Result payload takes the slot type in every wrapper" {
+    expect_runs(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn main() {
+    let c = true
+    let o: Option[Box[Int]] = Some(if c { mk([]) } else { mk([]) })
+    let r: Result[Box[Int], Str] = Ok(match c {
+        true => mk([])
+        false => { { mk([]) } }
+    })
+    let e: Result[Int, Box[Str]] = Err(if c { mk([]) } else { mk([]) })
+    let n = match o { Some(b) => b.v.len()  None => 9 }
+    let m = match r { Ok(b) => b.v.len()  Err(_) => 9 }
+    let k = match e { Ok(_) => 9  Err(b) => b.v.len() }
+    io.println("{n} {m} {k}")
+}
+"#, "0 0 0")
+}
+
+test "a brace variant field takes its type at the expected instance" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type V { B { b: Box[Int] }  C }
+type GV[T] { GB { b: Box[T] }  GC }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn main() {
+    let v = V.B { b: mk([]) }
+    let g: GV[Int] = GV.GB { b: mk([]) }
+    let h: GV[Str] = GB { b: mk([]) }
+    let n = match v { V.B { b } => b.v.len()  V.C => 9 }
+    let p = match g { GB { b } => b.v.len()  GC => 9 }
+    let q = match h { GB { b } => b.v.len()  GC => 9 }
+    io.println("{n} {p} {q}")
+}
+"#, "0 0 0")
+}
+
+test "an empty payload takes the expected instance" {
+    expect_runs(#"type Tr[X] { Leaf(List[X])  Nd }
+type Box[T] { v: List[T] }
+type H[T] { HB(Box[T])  HN }
+fn n[X](t: Tr[X]) -> Int { match t { Leaf(l) => l.len()  Nd => 9 } }
+fn main() {
+    let a: Tr[Int] = Leaf([])
+    let b: Tr[Int] = Tr.Leaf([])
+    let h: H[Int] = HB(Box { v: [] })
+    let m = match h { HB(x) => x.v.len()  HN => 9 }
+    io.println("{n(a)} {n(b)} {m}")
+}
+"#, "0 0 0")
+}
+
+test "a later use fills a payload binder the construction leaves open" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type GV[T] { GB { b: Box[T] }  GC  GP(Box[T]) }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn use(g: GV[Int]) -> Int { match g { GB { b } => b.v.len()  GP(b) => b.v.len() + 1  GC => 9 } }
+fn main() {
+    let g = GP(mk([]))
+    let h = GV.GB { b: mk([]) }
+    io.println("{use(g)} {use(h)}")
+}
+"#, "1 0")
+}
+
+test "a payload no use fills is reported at its binding" {
+    expect_rejects(#"type Box[T] { v: List[T] }
+type GV[T] { GB { b: Box[T] }  GC }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn main() {
+    let g = GV.GB { b: mk([]) }
+    io.println("x")
+}
+"#, "cannot infer a type for `g`")
+}
+
+test.failing(
+    "a brace variant field takes its type in every wrapper",
+    reason: "typecheck fills each binder, but codegen does not materialise an if, a match or a block in a brace variant field, nor in a struct literal that leaves a field to its default",
+) {
+    expect_runs(#"type Box[T] { v: List[T] }
+type V { B { b: Box[Int] }  C }
+type GV[T] { GB { b: Box[T] }  GC }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn main() {
+    let c = true
+    let v = V.B { b: if c { mk([]) } else { mk([]) } }
+    let w: V = B { b: match c {
+        true => mk([])
+        false => { mk([]) }
+    } }
+    let g: GV[Int] = GV.GB { b: if c { mk([]) } else { mk([]) } }
+    let h: GV[Str] = GB { b: { { mk([]) } } }
+    let n = match v { V.B { b } => b.v.len()  V.C => 9 }
+    let m = match w { B { b } => b.v.len()  C => 9 }
+    let p = match g { GB { b } => b.v.len()  GC => 9 }
+    let q = match h { GB { b } => b.v.len()  GC => 9 }
+    io.println("{n} {m} {p} {q}")
+}
+"#, "0 0 0 0")
 }

@@ -5021,9 +5021,8 @@ fn tc_formal_reaches_closure(formal: Int) -> Int {
 // Each caller is a declared type meeting an under-determined value. Every expected-type
 // position (a let, an assignment, an argument, a return, a struct field, a list element, a
 // tuple slot, a variant payload) reaches it through tc_pin_declared_into_value; a struct
-// field whose type still names the struct's own parameter
-// (tc_pin_struct_lit_field_ret_mints, tc_bind_struct_lit_fields) and a field default
-// (tc_stamp_field_default) call it direct. Every caller gates on its own
+// field whose type still names the struct's own parameter (tc_bind_struct_lit_fields) and a
+// field default (tc_stamp_field_default) call it direct. Every caller gates on its own
 // "did this value mint here" pre-check before calling; the two gates below are the
 // shared ones. The name says
 // "tail ret" for its first caller; it is really "pin a declared generic type onto a
@@ -5094,9 +5093,9 @@ fn tc_arm_tail_value_node(body: Int) -> Int {
 // whether it fills the call's binders. Each tail pins on its own because the merged type of an
 // if/match over a generic struct carries only one arm's metavar (type_merge keeps the first
 // side), and the value itself pins too, since a merged type may hold a metavar no arm does.
-// A let, an assignment, an argument, a return, a struct field, a variant payload, a list
-// element, a tuple slot and a `?`/`??` operand all pin through here, so a position cannot fill
-// a binder another position leaves open.
+// A let, an assignment, an argument, a return, a struct field, a variant payload or brace
+// field, a `Some`/`Ok`/`Err` payload, a list element, a tuple slot and a `?`/`??` operand all
+// pin through here, so a position cannot fill a binder another position leaves open.
 fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_pin_tail_ret_generic(declared_tid, val_tid)
     let k = node_kind(val)
@@ -5169,7 +5168,99 @@ fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeC
         } else if tc_tid_kind(ot) == TyKind.Option {
             tc_pin_declared_into_value(make_option_type(d), opnd, ot)
         }
+        return
     }
+    // `Some(x)`, `Ok(x)` and `Err(x)` build the expected carrier, so x meets its slot.
+    let slot = tc_carrier_slot_built_by_call(val, d)
+    if slot >= 0 {
+        let x = sublist_get(node_args(val), 0)
+        tc_pin_declared_into_value(tc_tid_child(d, slot), x, tc_pin_tail_tid(x))
+        return
+    }
+    // A variant call's payloads are its fields, so each meets its field type at the instance
+    // the whole value is expected to be.
+    if k == NodeKind.Call || k == NodeKind.MethodCall {
+        let var_idx = tc_variant_built_by_call(val, d)
+        let args = node_args(val)
+        if var_idx < 0 || args == -1 { return }
+        let mut i = 0
+        while i < sublist_length(args) {
+            let p = tc_variant_payload(var_idx, args, i)
+            if p.field != -1 {
+                tc_pin_declared_into_value(tc_subst_evfield_from_instance(p.field, d), p.value, tc_pin_tail_tid(p.value))
+            }
+            i = i + 1
+        }
+        return
+    }
+    // A brace variant's fields meet their types at the expected instance, as payloads do.
+    if k == NodeKind.StructLit {
+        let var_idx = tc_variant_built_by_brace(val, val_tid, d)
+        let flds = node_fields(val)
+        if var_idx < 0 || flds == -1 { return }
+        let mut i = 0
+        while i < sublist_length(flds) {
+            let f = sublist_get(flds, i)
+            let field = lookup_evfield_type_by_name(var_idx, node_name(f))
+            let fv = node_value(f)
+            if field != -1 && fv != -1 {
+                tc_pin_declared_into_value(tc_subst_evfield_from_instance(field, d), fv, tc_pin_tail_tid(fv))
+            }
+            i = i + 1
+        }
+    }
+}
+
+// The variant of enum type `d` that call `call` constructs, or -1 when it constructs none of
+// them.
+fn tc_variant_built_by_call(call: Int, d: Int) -> Int {
+    if tc_tid_kind(d) != TyKind.Enum { return -1 }
+    let vdecl = tc_call_decl_node(call)
+    if vdecl < 0 || node_kind(vdecl) != NodeKind.TypeVariant { return -1 }
+    let var_idx = get_variant_by_name(tc_enum_base_tid(d), node_name(vdecl))
+    if var_idx < 0 || tc_variant_decl_node(var_idx) != vdecl || !tc_variant_fields_typed_at(var_idx, d) { return -1 }
+    var_idx
+}
+
+// The variant of enum type `d` that brace literal `lit`, typed `lit_tid`, constructs, or -1
+// when it constructs none of them. The literal's own type names the enum it resolved to, so
+// its last name segment is the variant.
+fn tc_variant_built_by_brace(lit: Int, lit_tid: Int, d: Int) -> Int {
+    if tc_tid_kind(d) != TyKind.Enum { return -1 }
+    let lt = resolve_alias_tid(tc_resolve(lit_tid))
+    if tc_tid_kind(lt) != TyKind.Enum || tc_enum_base_tid(lt) != tc_enum_base_tid(d) { return -1 }
+    let sname = node_type_name(lit)
+    let mut vname = sname
+    while vname.byte_index_of(".", 0).is_some() {
+        vname = vname.byte_slice((vname.byte_index_of(".", 0) ?? 0) + 1, vname.byte_len())
+    }
+    let var_idx = get_variant_by_name(tc_enum_base_tid(d), vname)
+    if var_idx < 0 || !tc_variant_fields_typed_at(var_idx, d) { return -1 }
+    var_idx
+}
+
+// Whether variant `var_idx`'s field types can be read at enum type `d`. A generic enum's bare
+// head leaves the enum's own type parameters in each field type, and those are not the checked
+// body's to bind.
+fn tc_variant_fields_typed_at(var_idx: Int, d: Int) -> Bool {
+    let edecl = evar_pool.get(var_idx).unwrap().enum_decl
+    let tparams = if edecl >= 0 { node_type_params(edecl) } else { -1 }
+    tparams == -1 || sublist_length(tparams) == 0 || ty_pool.get(d).unwrap().params_count > 0
+}
+
+// The slot of carrier `d` that a bare `Some(x)`, `Ok(x)` or `Err(x)` call fills, or -1 when
+// `call` is not one. A user variant spelled like a carrier reaches its declaration instead.
+fn tc_carrier_slot_built_by_call(call: Int, d: Int) -> Int {
+    if node_kind(call) != NodeKind.Call { return -1 }
+    let callee = node_left(call)
+    let args = node_args(call)
+    if callee == -1 || node_kind(callee) != NodeKind.Ident || args == -1 || sublist_length(args) != 1 { return -1 }
+    if node_kind(sublist_get(args, 0)) == NodeKind.NamedArg { return -1 }
+    if tc_call_decl_node(call) >= 0 { return -1 }
+    let name = node_name(callee)
+    let carrier = tc_prelude_carrier_of(name) ?? TyKind.Unknown
+    if carrier == TyKind.Unknown || carrier != tc_tid_kind(d) { return -1 }
+    if name == "Err" { 1 } else { 0 }
 }
 
 fn tc_pin_declared_into_tail(declared_tid: Int, body: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -8793,7 +8884,7 @@ fn tc_evfield_structural_tid(ann_node: Int, bare_tid: Int, self_enum: Str, is_ro
 // declares at least one RETURN-ONLY type param — i.e. could this node have minted a
 // metavar that a declared type is entitled to pin?
 //
-// This is the load-bearing narrowing for tc_pin_struct_lit_field_ret_mints, on two
+// This is the load-bearing narrowing for each struct-field pin that calls it, on two
 // counts, and neither is an optimization detail:
 //
 //   • COST. infer_type does not memoize its diagnostics, so an unconditional infer
@@ -8829,50 +8920,6 @@ fn tc_call_mints_ret_only(v: Int) -> Int {
         pi = pi + 1
     }
     0
-}
-
-// A struct literal's DECLARED FIELD TYPE is an expected-type source for that field's
-// value, exactly as a let annotation and an assignment target are. Without
-// this, `Wrapper { inner: mk() }` for `fn mk[T]() -> RGT[T]` left the α minted for
-// mk's return-only T unbound and it reached the emit_struct_lit chokepoint erased.
-//
-// THERE IS NO OTHER PLACE THIS COULD LIVE. The compiler has no struct-literal
-// field-value type CHECK anywhere; the binds loop in tc_struct_lit_instance_tid below
-// is the only spot where a declared field type meets its value's type, and its
-// consumer unify_typevar_binds is a pure bind COLLECTOR that never mutates a metavar.
-// So this is a new, deliberately-scoped walk rather than an extra line in that loop —
-// and it must run BEFORE the loop, so a generic outer struct sees the solved α when it
-// builds its own instance args.
-//
-// TWO GATES, IN THIS ORDER, both required. On first visit the value has never been
-// inferred, so no mint exists yet and tc_node_has_ret_mint reads 0: the syntactic
-// check answers "CAN this mint" without inferring, and the existence check then
-// confirms "DID it". Reversing them makes the walk a no-op on every first visit;
-// dropping the syntactic one re-infers every field of every struct literal.
-//
-// Not transitive here. A value that CONTAINS a minting call (a block tail or an if/match
-// arm) is reached by tc_bind_struct_lit_fields, through tc_pin_declared_into_value, once
-// the field type read at the expected instance is closed. An open field type would pin
-// each arm from a half-solved type, and half-solved is the "compiles under a
-// wrong-but-plausible mono name" failure a loud I0001 exists to prevent.
-fn tc_pin_struct_lit_field_ret_mints(stid: Int, node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let flds_sl = node_fields(node)
-    if flds_sl == -1 { return }
-    let mut fi = 0
-    while fi < sublist_length(flds_sl) {
-        let f = sublist_get(flds_sl, fi)
-        let v = node_value(f)
-        if tc_call_mints_ret_only(v) != 0 {
-            let declared = get_struct_field_tid(stid, node_name(f))
-            if declared != -1 {
-                let inferred = infer_type(v)
-                if tc_node_has_ret_mint(v) != 0 {
-                    tc_pin_tail_ret_generic(declared, inferred)
-                }
-            }
-        }
-        fi = fi + 1
-    }
 }
 
 // Publish a node tid for every field VALUE of a MONOMORPHIC struct literal. The generic path
@@ -9048,8 +9095,10 @@ fn tc_bind_struct_lit_fields(stid: Int, bare: Str, flds_sl: Int, tparams_sl: Int
             // spread may yet determine.
             let at_inst = tc_field_target_hint(bare, declared)
             let ftid = tc_infer_field_value_under(at_inst, node_value(f))
-            // A field type still naming the struct's own parameter is no expected type yet:
-            // walking it into the value would bind the value's metavariables to that parameter.
+            // A field type still naming the struct's own parameter is only half solved, so the
+            // walk must not carry it into the value's tails and pin each arm from it. A value
+            // that is itself a return-only call or an empty container still meets it at the
+            // top, which links its open binder to the parameter that the binds below solve.
             if tc_tid_has_bare_typevar(at_inst) == 0 {
                 tc_pin_declared_into_value(at_inst, node_value(f), ftid)
             } else if tc_pin_field_carries_value_type(node_value(f), at_inst) != 0 {
@@ -9099,7 +9148,6 @@ fn tc_bind_has_hole(tid: Int) -> Int {
 fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_check_brace_literal(tc_struct_literal_owner(stid), node)
     tc_check_struct_lit_field_closures(stid, node)
-    tc_pin_struct_lit_field_ret_mints(stid, node)
     let bare = tc_instance_base_name(stid)
     let decl = tc_struct_decl_nodes.get(bare) ?? -1
     if decl == -1 {
@@ -16635,33 +16683,66 @@ fn tc_pick_bare_variant(name: Str, site: Int, carrier: Option[TyKind]) -> BareVa
     tc_bare_variant_from_program(name, site, carrier)
 }
 
+// One payload argument of a paren variant call: the value it holds and the variant field it
+// fills, by label when it has one and by position when not. `field` is -1 when the label
+// names no field or the position is past the arity.
+type VariantPayload {
+    value: Int
+    field: Int
+}
+
+fn tc_variant_payload(var_idx: Int, args_sl: Int, i: Int) -> VariantPayload {
+    let arg = sublist_get(args_sl, i)
+    if node_kind(arg) == NodeKind.NamedArg {
+        return VariantPayload { value: node_value(arg), field: lookup_evfield_type_by_name(var_idx, node_name(arg)) }
+    }
+    VariantPayload { value: arg, field: lookup_evfield_type_by_index(var_idx, i) }
+}
+
+// The instance of a generic variant's enum whose every argument is a fresh metavariable, as a
+// generic fn call instantiates its type parameters: the payloads fill them, so two payloads of
+// one parameter must agree, and a field type never names the enum's own parameter, which is
+// not the checked body's. -1 for a non-generic enum, whose fields name no parameter.
+fn tc_variant_open_instance(var_idx: Int) -> Int {
+    let ev = evar_pool.get(var_idx).unwrap()
+    if ev.enum_decl < 0 { return -1 }
+    let tparams = node_type_params(ev.enum_decl)
+    if tparams == -1 || sublist_length(tparams) == 0 { return -1 }
+    let mut args: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(tparams) {
+        args.push(make_metavar())
+        i = i + 1
+    }
+    make_enum_instance_type(tc_instance_base_name(ev.enum_id), args)
+}
+
 // Each payload value of a paren variant call `E.V(...)` or `V(...)` against its field type, the
 // value's expected type (sections/03_types.md 3.3). Both spellings come here, so a payload is
 // checked, and fills a generic call's binders, the same way whichever one builds the variant.
-// tc_check_variant_paren_payload owns the count and the labels. At an expected instance of a
-// generic enum the field is read at that instance's arguments, since a field type that still
-// names the enum's own parameter reaches no binder.
-fn tc_check_variant_payload_values(label: Str, enum_tid: Int, var_idx: Int, args_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if args_sl == -1 { return }
-    let bare = tc_tid_struct(enum_tid)
+// tc_check_variant_paren_payload owns the count and the labels. The field is read as declared:
+// which instance of a generic enum the call builds is the answer this check feeds, and an
+// expected type around the call is met by tc_pin_declared_into_value once the call is typed.
+// Answers each payload's type in argument order, so the instance is read off the types this
+// check recorded and no payload is inferred twice.
+fn tc_check_variant_payload_values(label: Str, var_idx: Int, args_sl: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut tids: List[Int] = []
+    if args_sl == -1 { return tids }
+    let inst = tc_variant_open_instance(var_idx)
     let mut i = 0
     while i < sublist_length(args_sl) {
-        let arg = sublist_get(args_sl, i)
-        let mut val = arg
-        let mut ftid = -1
-        if node_kind(arg) == NodeKind.NamedArg {
-            val = node_value(arg)
-            ftid = lookup_evfield_type_by_name(var_idx, node_name(arg))
-        } else {
-            ftid = lookup_evfield_type_by_index(var_idx, i)
-        }
+        let p = tc_variant_payload(var_idx, args_sl, i)
         // -1 is a named miss or an index past the arity, which the payload check has
         // reported; a mismatch against no field would be a second report of one mistake.
-        if ftid != -1 {
-            check_arg_value(label, i, tc_field_target_hint(bare, ftid), val)
+        if p.field != -1 && tc_tid_is_no_info(p.field) == 0 {
+            check_arg_value(label, i, tc_subst_evfield_from_instance(p.field, inst), p.value)
+            tids.push(tc_pin_tail_tid(p.value))
+        } else {
+            tids.push(infer_type(p.value))
         }
         i = i + 1
     }
+    tids
 }
 
 // A call `Name(...)` whose name resolved to a declared variant or to no single one; None for
@@ -16671,12 +16752,12 @@ fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -
     match vpick {
         BareVariantPick.Declared(venum, var_idx) => {
             tc_check_variant_paren_payload(var_idx, fn_name, node)
-            tc_check_variant_payload_values(fn_name, venum, var_idx, node_args(node))
+            let payload_tids = tc_check_variant_payload_values(fn_name, var_idx, node_args(node))
             // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
             // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
             // it; a non-generic enum keeps the bare tid.
             let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
-            Some(tc_enum_ctor_instance_tid(venum, vdecl, fn_name, node_args(node)))
+            Some(tc_enum_ctor_instance_tid(venum, vdecl, var_idx, node_args(node), payload_tids))
         }
         BareVariantPick.Ambiguous(carrier, enums) => {
             tc_report_ambiguous_construction(fn_name, carrier, enums, node)
@@ -17103,31 +17184,33 @@ fn tc_report_variant_spread(owner: LitOwner, spread: Int) ! Diag.Report {
 // bare `enum_tid` when the enum is non-generic or no type-param bound to a concrete
 // type — mirroring the struct path's has_concrete gate so an all-typevar / bare
 // construction keeps the existing bare behavior unchanged. `args_sl` is the raw
-// call/ctor argument sublist (positional).
-fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, vname: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// call/ctor argument sublist, and `payload_tids` the type tc_check_variant_payload_values
+// answered for each of its arguments.
+fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, var_idx: Int, args_sl: Int, payload_tids: List[Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if decl == -1 { return enum_tid }
     let tparams_sl = node_type_params(decl)
     if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
     if args_sl == -1 { return enum_tid }
-    let var_idx = get_variant_by_name(tc_enum_base_tid(enum_tid), vname)
-    if var_idx == -1 { return enum_tid }
     let mut binds: Map[Str, Int] = Map()
     let mut fi = 0
-    while fi < sublist_length(args_sl) {
-        let declared = lookup_evfield_type_by_index(var_idx, fi)
+    while fi < sublist_length(args_sl) && fi < payload_tids.len() {
+        let declared = tc_variant_payload(var_idx, args_sl, fi).field
         if declared != -1 {
-            unify_typevar_binds(declared, infer_type(sublist_get(args_sl, fi)), binds)
+            unify_typevar_binds(declared, payload_tids.get(fi).unwrap(), binds)
         }
         fi = fi + 1
     }
     // "Concrete" excludes a typevar AND TYPE_UNKNOWN — an all-typevar / all-unknown
     // instance carries no more information than the bare tid, so the bare path stays
-    // authoritative (mirrors tc_struct_lit_instance_tid's has_concrete gate).
+    // authoritative (mirrors tc_struct_lit_instance_tid's has_concrete gate). An unbound
+    // metavariable counts: it is a hole the expected type of the whole value fills, and the
+    // boundary check reports it if nothing does.
     let mut has_concrete = 0
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
         if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
+        if bound != -1 && tc_is_unbound_metavar(tc_resolve(bound)) != 0 { has_concrete = 1 }
         // A variant whose payload mentions none of the enum's parameters binds nothing, so
         // the enclosing annotation is the only place they can come from. Without this the
         // construction kept the bare head, which names no instance and has no C layout.
@@ -17191,6 +17274,9 @@ fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int)
                 if declared != -1 && tc_tid_is_no_info(declared) == 0 && tc_tid_has_unbound_metavar(vt) != 0 {
                     tc_unify(declared, vt)
                 }
+                if declared != -1 && tc_tid_is_no_info(declared) == 0 && tc_variant_fields_typed_at(var_idx, enum_tid) {
+                    tc_pin_declared_into_value(declared, v, vt)
+                }
             }
         }
         fi = fi + 1
@@ -17234,6 +17320,9 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
         if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
+        // As in tc_enum_ctor_instance_tid: an unbound metavariable is a hole the expected type
+        // of the whole value fills.
+        if bound != -1 && tc_is_unbound_metavar(tc_resolve(bound)) != 0 { has_concrete = 1 }
         // A variant whose payload mentions none of the enum's parameters binds nothing, so
         // the enclosing annotation is the only place they can come from. Without this the
         // construction kept the bare head, which names no instance and has no C layout.
@@ -22675,12 +22764,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         nr_note_call_decl(node, tc_variant_decl_node(cvar_idx))
                         let cargs_sl = node_args(node)
                         tc_check_variant_paren_payload(cvar_idx, method, node)
-                        tc_check_variant_payload_values("{cname}.{method}", ctor_tid, cvar_idx, cargs_sl)
+                        let payload_tids = tc_check_variant_payload_values("{cname}.{method}", cvar_idx, cargs_sl)
                         // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
                         // its concrete instance tid; a non-generic enum keeps the bare
                         // ctor_tid.
                         let cdecl = tc_type_decl_nodes.get(tc_written_type_nominal(cname)) ?? -1
-                        return tc_enum_ctor_instance_tid(ctor_tid, cdecl, method, cargs_sl)
+                        return tc_enum_ctor_instance_tid(ctor_tid, cdecl, cvar_idx, cargs_sl, payload_tids)
                     }
                 }
             }
