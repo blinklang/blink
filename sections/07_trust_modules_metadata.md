@@ -1806,8 +1806,8 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 
 **Rules:**
 - Qualified access works for functions (`auth.login()`), types (`auth.Token`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`.
-- Only the leaf module name is used as qualifier. `import std.num` enables `num.parse_int()`, not `std.num.parse_int()`. For modules with the same leaf name, use aliases: `import legacy.auth as legacy_auth`.
-- Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works. So a selective import binds its qualifier too: `import auth.{login}` binds `login` and `auth`.
+- Only the leaf module name is used as qualifier. `import std.num` enables `num.parse_int()`, not `std.num.parse_int()`. For modules with the same leaf name, use aliases: `import legacy.auth as legacy_auth`. To keep bare names, put the alias between the path and the list: `import legacy.auth as legacy_auth.{Token}` (*Import Aliases*, §10.5).
+- Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works. So a selective import binds its qualifier too: `import auth.{login}` binds `login` and `auth`, and `import auth as a.{login}` binds `login` and `a`.
 - A whole-module import binds only its qualifier. If `import foo` and `import bar` both export `helper`, nothing collides: call `foo.helper()` or `bar.helper()`. Two imports that bind one name, bare name or qualifier, are E1005 (*Imported Names*, §10.5). A module-level declaration that takes a qualifier's name is E1012 (*Imported and Declared Names*, §10.5).
 - A local binding hides a module qualifier for its scope. If `let auth = 5` is in scope, `auth.login()` is a method call on the integer, not a module-qualified call. Inside that scope `auth.y` resolves against the local binding only. There is no fallback to the qualifier, also when the local's type has no member `y`. Every local binding form in §2.2 *Local bindings* hides a qualifier this way. This is a shadow between nested scopes (§10.6 *Shadowing Rules*), so it is legal and gets no warning at the binding. A diagnostic that a hidden qualifier causes names the hidden module (§10.6 *Diagnostics that involve a shadowing name*).
 
@@ -2259,7 +2259,7 @@ type Point { b: Int }    // OK: the import binds `AlphaPoint`, not `Point`
 
 **Fix.** For a listed name in a plain `import`, the fix "drop the name from the import list" is machine-applicable (§8.6): every bare use of the name then means the local declaration. When the edit empties the list, the fix rewrites the line to `import alpha`, because a selective import also gives qualified access (§10.1 *Qualified Access*). It deletes the line only when no name in the file resolves through the `alpha` qualifier; the check uses name resolution, not text search. For `pub import`, the same edit changes the module's public API, so the fix is a suggestion only. On that import entry, E1012 replaces W0602 (unused import): one mistake gives one diagnostic.
 
-A qualifier collides the same way. A whole-module import binds its qualifier, the leaf name or the name after `as`. A selective import binds its qualifier too, because it also gives qualified access (§10.1 *Qualified Access*):
+A qualifier collides the same way. A whole-module import binds its qualifier, the leaf name or the name after `as`. A selective import binds its qualifier too, because it also gives qualified access (§10.1 *Qualified Access*). Its qualifier is the leaf name, or the name after an `as` that comes before the list (*Import Aliases*):
 
 ```blink
 import alpha
@@ -2284,7 +2284,7 @@ error[E1012]: `gamma` is both a module qualifier and a declaration in module `ma
 7 | let gamma = 3
   |     ^^^^^ also declared here
   |
-  = help: import the module under another name: import gamma as gamma_mod
+  = help: import the module under another name: import gamma as gamma_mod.{Point}
           or rename the declaration
 ```
 
@@ -2294,7 +2294,7 @@ When several import entries collide with one declaration, each entry gets its ow
 
 #### Imported Names
 
-Each file has its own binding table. A selective import binds each listed name, and a whole-module import binds its qualifier (the leaf name, or the name after `as`). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. The compiler checks each import when it reads it, whether or not the file uses the name.
+Each file has its own binding table. A selective import binds each listed name and its qualifier, and a whole-module import binds only its qualifier. The qualifier is the leaf name of the module path, or the name after the `as` that follows the path (*Import Aliases*). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. The compiler checks each import when it reads it, whether or not the file uses the name.
 
 ```blink
 import auth.{Error}
@@ -2324,6 +2324,35 @@ import db
 import auth.{Token as db}     // error[E1005]: `db` is imported twice
 ```
 
+A selective import takes part with its qualifier, so two modules with one leaf name collide even when the file never writes `x.y`. The import forms do not change the rule:
+
+```blink
+import a.x.{P}
+import b.x.{Q}                // error[E1005]: the qualifier `x` is imported twice
+
+import a.x
+import b.x.{Q}                // error[E1005]: the qualifier `x` is imported twice
+```
+
+```
+error[E1005]: the qualifier `x` is imported twice in module `main`
+ --> src/main.bl:2:8
+  |
+1 | import a.x.{P}
+  |        ^^^ this import binds the qualifier `x` to `a.x`
+2 | import b.x.{Q}
+  |        ^^^ this import binds `x` again, to `b.x`
+  |
+  = help: import the module under another name and keep `Q`: import b.x as bx.{Q}
+```
+
+The alias before the list keeps every listed name bare:
+
+```blink
+import a.x.{P}
+import b.x as bx.{Q}          // OK: binds `Q` and `bx`
+```
+
 Two imports that bind one name to the **same** item are not E1005. The compiler compares the items that name resolution reaches after it follows `pub import` chains, not the import paths. The later entry gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). One item under two names binds no name twice, so it is legal:
 
 ```blink
@@ -2332,7 +2361,22 @@ import auth.{Error}                   // warning[W0602]: `Error` already imports
 import auth.{Token, Token as AuthToken}   // OK: two names, one item
 ```
 
-**Fix.** Which import should keep the name is the author's choice, so the fix is a suggestion only: rename one import with `as`, or drop the name and use the qualified path. The help should print a concrete name that is not already bound in the file. On the colliding entry, E1005 replaces W0602: one mistake gives one diagnostic. When a declaration also takes the name, every import entry that collides with it gets E1012 (*Imported and Declared Names*), and E1005 applies only between import entries that have no E1012.
+A selective import's qualifier is not an entry of its own, so it never gets W0602. When a later selective import binds a qualifier again to the same module, the compiler reports nothing for the qualifier. W0602 goes only to a listed name that already imports its item. A whole-module import is an entry, and it binds only its qualifier, so it gets W0602 when that qualifier already names its module:
+
+```blink
+import a.x.{P}
+import a.x.{R}                // OK: binds `R`; `x` names `a.x` again
+import a.x                    // warning[W0602]: `x` already imports this module
+```
+
+```blink
+import b.x as bx
+import b.x.{Q}                // OK: `bx` and `x` both name `b.x`
+```
+
+There `import b.x.{Q}` binds `x` too. To bind `Q` and `bx` but not `x`, write `import b.x as bx.{Q}`.
+
+**Fix.** Which import should keep the name is the author's choice, so the fix is a suggestion only: rename one import with `as`, or drop the name and use the qualified path. The help should print a concrete name that is not already bound in the file. For a qualifier, the help names the import to rename and keeps that import's bare names: `import b.x as bx.{Q}` for a selective import, `import a.x as ax` for a whole-module import. On the colliding entry, E1005 replaces W0602: one mistake gives one diagnostic. When a declaration also takes the name, every import entry that collides with it gets E1012 (*Imported and Declared Names*), and E1005 applies only between import entries that have no E1012.
 
 #### Unused Imports
 
@@ -2384,11 +2428,27 @@ error[E1003]: item `Token` is private in module `auth.internal`
 
 #### Import Aliases
 
-Imports can be renamed at the import site to resolve ambiguity or improve local clarity:
+Imports can be renamed at the import site to resolve ambiguity or improve local clarity. `as` renames the thing on its left. An `as` after the module path renames the qualifier, and an `as` inside the list renames an item:
 
 ```blink
-import auth.{AuthError as LoginError}
-import db.connection.{Connection as DbConn}
+import auth.{AuthError as LoginError}   // binds `LoginError` and `auth`
+import legacy.auth as legacy_auth       // binds `legacy_auth` only
+import db.conn as dbc.{Connection}      // binds `Connection` and `dbc`
+import http.client as hc.{Request as HttpRequest}   // binds `HttpRequest` and `hc`
+```
+
+In `import db.conn as dbc.{Connection}`, `dbc` is a new name for `db.conn`, not a module path. The alias before the list is the only way to rename a selective import's qualifier.
+
+The `as` for a qualifier goes before the list, never after it. `import b.x.{Q} as bx` is the parse error `QualifierAliasAfterList` (E1128). Its fix is machine-applicable (§8.6): it moves `as bx` to the path, `import b.x as bx.{Q}`, and keeps the list as written, item aliases included. An `as` inside the list, as in `import b.x.{Q as R}`, is an item alias and never gets E1128. The compiler checks the import as the fix writes it, so the line gets no other diagnostic because of the wrong order: one mistake gives one diagnostic.
+
+```
+error[E1128]: `as` after the import list
+ --> src/main.bl:1:16
+  |
+1 | import b.x.{Q} as bx
+  |                ^^^^^ this renames the qualifier, so it goes between the path and the list
+  |
+  = help: import b.x as bx.{Q}
 ```
 
 Aliases are local to the importing file. They do not affect the imported module or any other consumers. Two imports in one file that bind one alias to different items are E1005 (*Imported Names*); two files may bind one alias to different items.

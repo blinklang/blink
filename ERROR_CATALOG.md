@@ -209,7 +209,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | CircularPackageDep | E1002 | Circular package dependency | Modules | §10.5 |
 | PrivateItemAccess | E1003 | Access to private item in another module | Modules | §10.5 |
 | VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |
-| AmbiguousImport | E1005 | Two imports in one file bind one name (bare name or module qualifier) to different items; the check uses the name after `as`. Two imports of the same item get W0602 instead. Replaces W0602 on the colliding entry | Modules | §10.5 |
+| AmbiguousImport | E1005 | Two imports in one file bind one name (bare name or module qualifier) to different items; the check uses the name after `as`. A selective import binds its qualifier too, so `import a.x.{P}` + `import b.x.{Q}` is E1005 on `x`; help gives `import b.x as bx.{Q}`. Two imports of the same item get W0602 instead; a selective import's qualifier bound again to the same module gets nothing. Replaces W0602 on the colliding entry | Modules | §10.5 |
 | ImportNotSelected | E1006 | Selective import does not list the referenced symbol | Modules | §10.5 |
 | ModuleQualifiedType | E1007 | Type referenced via module-qualified path is invalid | Modules | §10.5 |
 | InvalidModuleAnnotation | E1008 | `@module` value does not match parent package name | Modules | §10.1 |
@@ -245,6 +245,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | MultiCharLiteral | E1125 | A char literal holds two or more scalar values (closed, or open to the end of the line); help shows the double-quoted `Str` | Lexer | §2.4 |
 | UnterminatedLiteral | E1126 | A char, string, template or raw-string literal with no closer. Primary span on the opening delimiter, `note:` at the end of the line (char) or file (string); help names the exact closer, `#` count included | Lexer | §2.4 |
 | MixedOperatorPrecedence | E1127 | An operand of an operator in one integer operator group (arithmetic, shift, `&`, `^`, `\|`) is a bare operator expression of a different group, e.g. `x << n + 1` or `x \| y & 3`. The `help:` line shows both groupings; the language server offers both rewrites, neither machine-applicable | Parser | §2.19 |
+| QualifierAliasAfterList | E1128 | `as` after a selective import list (`import b.x.{Q} as bx`); the qualifier alias goes between the path and the list. Machine-applicable fix writes `import b.x as bx.{Q}` and keeps the list, item aliases included; the import is then checked as fixed, with no second diagnostic for the order | Parser | §10.5 |
 | ModuleNotFound | E1200 | Import statement referenced a module that could not be found | Modules | §10.1 |
 | InvalidStringBackedEnum | E1201 | String-backed enum variant value is not a string literal | Type checking | §3 |
 | ContractPredicateNotDecidable | E1300 | Contract predicate uses construct outside SMT-decidable subset | Refinement contracts | §3b |
