@@ -830,9 +830,11 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
     }
 
     if (json_output) {
-        printf("],\"summary\":{\"total\":%d,\"passed\":%d,\"failed\":%d,\"skipped\":%d,\"duration_ms\":%g}}\n", total, pass, fail, skip, total_ms);
+        printf("],\"summary\":{\"total\":%d,\"passed\":%d,\"failed\":%d,\"panicked\":%d,\"skipped\":%d,\"duration_ms\":%g}}\n",
+               total, pass, fail, panicked, skip, total_ms);
     } else {
         printf("\n%d passed, %d failed", pass, fail);
+        if (panicked > 0) printf(", %d panicked", panicked);
         if (skip > 0) printf(", %d skipped", skip);
         printf(" (of %d)\n", total);
     }

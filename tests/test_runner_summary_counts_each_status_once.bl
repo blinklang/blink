@@ -1,0 +1,92 @@
+// The test summary always carries total, passed, failed, panicked, skipped and
+// duration_ms, and total is the sum of the four counts (spec §8.10, Summary and exit
+// code). The human summary line always shows passed and failed, and shows panicked and
+// skipped only when their count is above 0 (spec §8.10, Human-readable output).
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
+
+type Run { json: Str, json_exit: Int, human: Str, human_exit: Int }
+
+fn run_fixture(tag: Str, lines: List[Str]) -> Run {
+    let name = "rs_summary_{tag}_{getpid()}"
+    let scratch = ".tmp/_test_runner_summary_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, lines.join("\n"))
+    let j = process_run("build/blink", ["test", "--json", fixture])
+    let h = process_run("build/blink", ["test", fixture])
+    shell_exec("rm -rf {scratch}")
+    Run { json: j.out.concat(j.err_out), json_exit: j.exit_code, human: h.out.concat(h.err_out), human_exit: h.exit_code }
+}
+
+fn diag(r: Run) -> Str {
+    "json exit={r.json_exit}:\n{r.json}\nhuman exit={r.human_exit}:\n{r.human}"
+}
+
+test "one test of each status is counted once under its own status" {
+    let r = run_fixture("each", [
+        #"import std.testing.{skip}"#,
+        #""#,
+        #"test "passes" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+        #"test "fails" {"#,
+        #"    assert_eq(1, 2)"#,
+        #"}"#,
+        #""#,
+        #"test "panics" {"#,
+        #"    panic("boom")"#,
+        #"}"#,
+        #""#,
+        #"test "skips" {"#,
+        #"    skip("not now")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""summary":{"total":4,"passed":1,"failed":1,"panicked":1,"skipped":1,"duration_ms":"#), "the summary does not count one of each; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("1 passed, 1 failed, 1 panicked, 1 skipped (of 4)"), "the human summary does not count one of each; {d}")
+}
+
+test "a count of zero is still a key in the JSON summary" {
+    let r = run_fixture("allpass", [
+        #"test "first" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+        #"test "second" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""summary":{"total":2,"passed":2,"failed":0,"panicked":0,"skipped":0,"duration_ms":"#), "the summary leaves out a zero count; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert(r.human.contains("2 passed, 0 failed (of 2)"), "the human summary is not passed and failed only; {d}")
+    assert(!r.human.contains("panicked"), "the human summary shows a zero panicked count; {d}")
+    assert(!r.human.contains("skipped"), "the human summary shows a zero skipped count; {d}")
+}
+
+test "a panic alone makes the binary exit non-zero" {
+    let r = run_fixture("onlypanic", [
+        #"test "ok" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+        #"test "panics" {"#,
+        #"    panic("boom")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""summary":{"total":2,"passed":1,"failed":0,"panicked":1,"skipped":0,"duration_ms":"#), "the summary does not count the panic; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("1 passed, 0 failed, 1 panicked (of 2)"), "the human summary does not show the panic; {d}")
+}

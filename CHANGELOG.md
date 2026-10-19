@@ -15,7 +15,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **`io.read_bytes`, `io.read_line` and the new `io.read_all()` read one standard input stream**, so a program can read header lines, then a body of known length. `io.read_bytes(n)` gives exactly `n` bytes, or fewer only at end of input, and panics for `n <= 0`. A read failure panics with the errno; bytes that are not UTF-8 make `read_line` and `read_all` panic.
 - **`Str.lines()` splits at `\n` and `\r\n` only (breaking).** A lone `\r` stays in the line, the same as `io.read_line()`.
 - **`io.lines()` is E0505 UnresolvedMethod**, with a help that shows `io.read_all().lines()` and the `io.read_line()` loop.
-- **A panic that escapes a test body is `status: "panicked"` (breaking for `--json` readers).** The record carries the panic `message` and no `cause`, `error` object or `line: 0`; before, it was `status: "failed"` with `cause: "panic"`. The human line says `PANIC` in place of `FAIL`, and the test binary exits non-zero.
+- **A panic that escapes a test body is `status: "panicked"` (breaking for `--json` readers).** The record carries the panic `message` and no `cause`, `error` object or `line: 0`; before, it was `status: "failed"` with `cause: "panic"`. The human line says `PANIC` in place of `FAIL`, and the test binary exits non-zero. The `summary` always carries `total`, `passed`, `failed`, `panicked`, `skipped` and `duration_ms`, and the human summary line adds `N panicked` when a test panicked.
 
 ## Breaking Changes (v0.56.0)
 
