@@ -6722,12 +6722,13 @@ fn tc_hof_result_slot_elem(node: Int) -> Int {
     inner
 }
 
-// Whether a `map` / `flat_map` in a statement's value still holds the open result slot that
-// its closure's walk binds. The value was inferred before that walk, so whatever reads the
-// result in the same expression (an operator, a method, a field) met an element nothing had
-// chosen and let it pass; the statement infers its value again once the walk is done. Read
-// before the walk, which binds the slot. A closure's body is not searched: the walk infers
-// its statements in their own scope.
+// Whether a statement's value holds a type that a closure's walk has yet to bind: a call whose
+// type names the open return of a closure argument that omits `-> R` (a generic binder taken
+// from tc_closure_ret_slot), or the result slot of a `map` / `flat_map`. The value was inferred
+// before that walk, so whatever reads the result in the same expression (an operator, a method,
+// a field) met a type nothing had chosen and let it pass; the statement infers its value again
+// once the walk is done. Read before the walk, which binds the slot. A closure's body is not
+// searched: the walk infers its statements in their own scope.
 fn tc_value_awaits_closure_ret(val: Int) -> Bool {
     if val == -1 { return false }
     let mut stack: List[Int] = [val]
@@ -6740,10 +6741,37 @@ fn tc_value_awaits_closure_ret(val: Int) -> Bool {
                 let elem = tc_hof_result_slot_elem(n)
                 if elem != -1 && tc_is_unbound_metavar(elem) != 0 { return true }
             }
+            if (k == NodeKind.Call || k == NodeKind.MethodCall) && tc_call_type_awaits_closure_ret(n) { return true }
             kids.clear()
             node_push_value_child_ids(n, kids)
             for kid in kids { stack.push(kid) }
         }
+    }
+    false
+}
+
+// Whether a call's type names the still-open return slot of one of its closure arguments.
+// Only a type the call took from that slot waits on the walk: a closure the call merely
+// consumes (`async.spawn` reads its body, not its slot) leaves the call's type alone, and
+// inferring that call again would walk the body out of its scope.
+fn tc_call_type_awaits_closure_ret(call: Int) -> Bool {
+    let memo = tc_lookup_node_tid(call)
+    if memo < 0 || tc_tid_has_unbound_metavar(memo) == 0 { return false }
+    let args_sl = node_args(call)
+    if args_sl == -1 { return false }
+    let n = sublist_length(args_sl)
+    let mut i = 0
+    while i < n {
+        let mut a = sublist_get(args_sl, i)
+        if node_kind(a) == NodeKind.NamedArg { a = node_value(a) }
+        if a != -1 && node_kind(a) == NodeKind.Closure && node_type_ann(a) == -1 {
+            let ret = tc_fn_tid_ret(tc_lookup_node_tid(a))
+            if ret >= 0 {
+                let slot = tc_resolve(ret)
+                if tc_is_unbound_metavar(slot) != 0 && tc_occurs_in(slot, memo) != 0 { return true }
+            }
+        }
+        i = i + 1
     }
     false
 }
@@ -6957,14 +6985,17 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) ! TypeCheck.Resolve, Ty
     // An inference pass may already have built a type around the closure's return slot
     // (tc_closure_ret_slot). The declaration answers it; a position the declaration leaves
     // open keeps the slot for the body walk to fill.
+    // A return the declaration leaves open is the slot itself, minted here when no pass has
+    // yet: a generic formal's `-> U` then unifies with the slot, and the body walk that binds
+    // it solves U, as it does for a slot a list literal captured.
     let mut published = seed
     if node_type_ann(a) == -1 {
-        let old_ret = tc_fn_tid_ret(tc_lookup_node_tid(a))
-        if old_ret >= 0 && old_ret != TYPE_UNKNOWN && tc_tid_kind(old_ret) == TyKind.Unknown {
-            let want_ret = tc_fn_tid_ret(seed)
-            if tc_tid_is_no_info(want_ret) != 0 {
-                published = make_fn_type(old_ret, tc_fn_tid_param_hints(seed))
-            } else {
+        let want_ret = tc_fn_tid_ret(seed)
+        if tc_tid_is_no_info(want_ret) != 0 {
+            published = make_fn_type(tc_closure_ret_slot(a), tc_fn_tid_param_hints(seed))
+        } else {
+            let old_ret = tc_fn_tid_ret(tc_lookup_node_tid(a))
+            if old_ret >= 0 && old_ret != TYPE_UNKNOWN && tc_tid_kind(old_ret) == TyKind.Unknown {
                 let _ = bind_metavar(old_ret, want_ret)
             }
         }
