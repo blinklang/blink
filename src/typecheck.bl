@@ -2571,7 +2571,7 @@ fn tc_report_unsourced_binders(sig: Int, call_node: Int, self_offset: Int) ! Dia
 
 // Record an unbracketed generic call's own binder tids for tc_ud_flush_calls. Group
 // layout in tc_call_open_tids: [sig, self_offset, n, tid..., open...], -1 for a slot with
-// no bind, and open 1 for a tid still open here. A binder the callee uses as a key is judged
+// no bind, and open 1 for a tid still open and not yet refused here. A binder the callee uses as a key is judged
 // for Hash in the flush when it was open here: the use that solves it can come later, and a
 // closed one was judged at the call. A keyed construction records a group too (see
 // tc_note_open_ctor_key).
@@ -2597,11 +2597,13 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
         tc_call_open_tids.push(tid)
         pi = pi + 1
     }
+    let keyed = tc_fn_hash_obligations(sig).len() > 0
     let first = tc_call_open_tids.len() - fs.type_params_count
     let mut oi = 0
     while oi < fs.type_params_count {
         let tid = tc_call_open_tids.get(first + oi).unwrap()
-        tc_call_open_tids.push(if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 { 1 } else { 0 })
+        let open = keyed && tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_tid_hash_fact(tid) != -1
+        tc_call_open_tids.push(if open { 1 } else { 0 })
         oi = oi + 1
     }
 }
@@ -2632,7 +2634,6 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
         if ctor < 0 { return }
         let t = tc_resolve(ctor)
         let key = ty_pool.get(t).unwrap().inner1
-        if tc_tid_has_unbound_metavar(key) != 0 { return }
         tc_refuse_unhashable_tid(key, if type_kind(t) == TyKind.Map { HashRole.MapKey } else { HashRole.SetElement }, call_node)
         return
     }
@@ -2645,7 +2646,7 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
         let role = tc_hash_oblig_mark(oblig, pi)
         let tid = tc_call_open_tids.get(g + 3 + pi).unwrap()
         let was_open = tc_call_open_tids.get(g + 3 + n + pi).unwrap()
-        if role != HashRole.Free && was_open != 0 && tc_tid_has_unbound_metavar(tid) == 0 && tc_tid_hash_fact(tid) == -1 {
+        if role != HashRole.Free && was_open != 0 && tc_tid_hash_fact(tid) == -1 {
             tc_report_unhashable_bind(sig, fnsig_type_param_names.get(fs.type_params_start + pi).unwrap(), role, tid, call_node)
         }
         pi = pi + 1
@@ -9189,36 +9190,52 @@ fn tc_hash_oblig_walk_tree(id: Int, names: List[Str], roles: List[HashRole]) {
 }
 
 // Tri-state Hash verdict on a concrete type, by the spec's closed list
-// (sections/03_types.md:1940): 1 hashable, -1 not, 0 unknown (never rejects).
+// (sections/03_types.md, "Non-hashable keys and elements in general"): 1 hashable, -1 not,
+// 0 unknown (never rejects). The list is closed: the spec gives every type it does not name
+// no Hash, so a kind not matched here, including one added later, is refused.
 fn tc_tid_hash_fact(tid0: Int) -> Int {
     let tid = tc_resolve(tid0)
-    let k = type_kind(tid)
-    if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
-    if k == TyKind.Float { return -1 }
-    if k == TyKind.Int || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str || is_sized_int(k) != 0 { return 1 }
-    if k == TyKind.Void { return 1 }
-    if k == TyKind.Tuple {
-        let te = ty_pool.get(tid).unwrap()
-        let mut verdict = 1
-        let mut i = 0
-        while i < te.params_count {
-            let f = tc_tid_hash_fact(ty_param_list.get(te.params_start + i).unwrap())
-            if f == -1 { return -1 }
-            if f == 0 { verdict = 0 }
-            i = i + 1
-        }
-        return verdict
+    match type_kind(tid) {
+        TyKind.Unknown => 0
+        TyKind.Typevar => 0
+        TyKind.Int => 1
+        TyKind.Bool => 1
+        TyKind.Char => 1
+        TyKind.Str => 1
+        TyKind.Void => 1
+        TyKind.Never => 1
+        TyKind.I8 => 1
+        TyKind.I16 => 1
+        TyKind.I32 => 1
+        TyKind.U8 => 1
+        TyKind.U16 => 1
+        TyKind.U32 => 1
+        TyKind.U64 => 1
+        TyKind.Tuple => tc_tuple_hash_fact(tid)
+        TyKind.Struct => tc_nominal_hash_fact(tid)
+        TyKind.Enum => tc_nominal_hash_fact(tid)
+        _ => -1
     }
-    if k == TyKind.Struct || k == TyKind.Enum {
-        // A type with no declaration node is compiler-provided; its Hash is not ours to judge.
-        let td = tc_type_decl_node_by_tid.get(tid) ?? -1
-        if td == -1 && tc_decl_node_for_type(tc_tid_name(tid)) == -1 { return 0 }
-        return tc_tid_derive_fact(tid, "Hash")
+}
+
+fn tc_tuple_hash_fact(tid: Int) -> Int {
+    let te = ty_pool.get(tid).unwrap()
+    let mut verdict = 1
+    let mut i = 0
+    while i < te.params_count {
+        let f = tc_tid_hash_fact(ty_param_list.get(te.params_start + i).unwrap())
+        if f == -1 { return -1 }
+        if f == 0 { verdict = 0 }
+        i = i + 1
     }
-    if k == TyKind.List || k == TyKind.Map || k == TyKind.Set || k == TyKind.Option || k == TyKind.Result || k == TyKind.Bytes || k == TyKind.StringBuilder || k == TyKind.Fn {
-        return -1
-    }
-    0
+    verdict
+}
+
+fn tc_nominal_hash_fact(tid: Int) -> Int {
+    // A type with no declaration node is compiler-provided; its Hash is not ours to judge.
+    let td = tc_type_decl_node_by_tid.get(tid) ?? -1
+    if td == -1 && tc_decl_node_for_type(tc_tid_name(tid)) == -1 { return 0 }
+    tc_tid_derive_fact(tid, "Hash")
 }
 
 // E1400 at a call whose type argument is used by the callee as a Set element or Map key
@@ -9234,8 +9251,9 @@ fn tc_check_hash_obligations_for_binds(sig: Int, binds: Map[Str, Int], node: Int
         if role != HashRole.Free && idx < fnsig_type_param_names.len() {
             let name = fnsig_type_param_names.get(idx).unwrap()
             let bound = binds.get(name) ?? -1
-            // An open bind is judged by tc_ud_flush_calls once a later use has solved it.
-            if bound != -1 && tc_tid_has_unbound_metavar(bound) == 0 && tc_tid_hash_fact(bound) == -1 {
+            // A part already known can refuse a bind that is still open (`(Float, ?)`); any
+            // other open bind is judged by tc_ud_flush_calls once a later use has solved it.
+            if bound != -1 && tc_tid_hash_fact(bound) == -1 {
                 tc_report_unhashable_bind(sig, name, role, bound, node)
             }
         }
@@ -9246,7 +9264,7 @@ fn tc_check_hash_obligations_for_binds(sig: Int, binds: Map[Str, Int], node: Int
 fn tc_report_unhashable_bind(sig: Int, name: Str, role: HashRole, bound: Int, node: Int) ! Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
-        "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{fs.name}` uses its type parameter {name} as a {tc_hash_role_words(role).title}", node,
+        "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{node_name(fs.decl)}` uses its type parameter {name} as a {tc_hash_role_words(role).title}", node,
         "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum for {name}")
 }
 
@@ -24939,6 +24957,13 @@ fn tc_container_ctor_from_type_args(call_node: Int, name: Str) -> Int ! TypeChec
     let targs = node_type_params(call_node)
     let first = resolve_type_ann(sublist_get(targs, 0))
     if name == "List.new" || name == "List.with_capacity" { return make_list_type(first) }
+    // `Set[T]()` and `Map[K, V]()` write the key as a type argument, so it is judged as a
+    // written annotation is, with its text.
+    if tc_suppress_ann_validation == 0 {
+        let role = if declared == 1 { HashRole.SetElement } else { HashRole.MapKey }
+        validate_keyed_ann(sublist_get(targs, 0), role)
+        tc_refuse_unhashable_instance(first, sublist_get(targs, 0), role)
+    }
     if declared == 1 { return make_set_type(first) }
     make_map_type(first, resolve_type_ann(sublist_get(targs, 1)))
 }
