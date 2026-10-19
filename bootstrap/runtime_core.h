@@ -3145,6 +3145,26 @@ BLINK_RT_FN int blink_float_cmp(double a, double b) {
 }
 #endif
 
+/* A Float's IEEE 754 binary64 bit pattern, sections/03_types.md "Float Bits". memcpy moves
+   the bytes with no float load or arithmetic, either of which may quiet a signaling NaN, and
+   the compiler folds it to one register move. static inline in every mode so an archive
+   build makes no call either. */
+static inline uint64_t blink_float_to_bits(double v) {
+    uint64_t u;
+    memcpy(&u, &v, sizeof u);
+    return u;
+}
+
+static inline double blink_float_from_bits(uint64_t u) {
+    double v;
+    memcpy(&v, &u, sizeof v);
+    return v;
+}
+
+static inline int blink_float_is_sign_negative(double v) {
+    return (int)(blink_float_to_bits(v) >> 63);
+}
+
 BLINK_RT_FN int blink_str_contains(const char* s, const char* needle);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_str_contains(const char* s, const char* needle) {

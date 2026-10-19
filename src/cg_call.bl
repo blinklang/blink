@@ -27,7 +27,7 @@ import parser.{
 import ast.{NodeKind, nk_of, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, tc_impl_owner_decl, tc_impl_recv_spelling, tc_static_qualifier, lookup_named_type, tc_compiler_known_tid, is_io_read_op,
-    tc_scalar_has_eq, tc_scalar_has_ord, tc_is_default_fill,
+    tc_scalar_has_eq, tc_scalar_has_ord, tc_is_default_fill, tc_is_float_from_bits,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_call_declared_name,
     tc_type_str, tc_ptr_offset_stride_known,
@@ -2892,6 +2892,8 @@ fn lower_static_call(node: Int, obj: Int) -> Int ! Diag.Report {
     if owner == char_type_name && method == from_code_point_method {
         return cc_char_from_code_point(node)
     }
+    // Keyed on the spelling for the same reason, through the test typecheck's arm makes.
+    if tc_is_float_from_bits(owner, method) { return cc_float_from_bits(node) }
     // List is a type and not a builtin fn, and typecheck keys its constructor arm on this
     // spelling above every declaration rung; reading it here in the same place keeps a
     // declared `List_new` from being built for a call typed as the empty list.
@@ -3688,9 +3690,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let keyed = cc_keyed_row(kind, mname)
     if keyed.op != "" { return cc_lower_keyed_method(node, obj, kind, mname, keyed) }
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind, mname) }
-    if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
-    if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
-    if cc_is_scalar_compare(kind, mname) { return cc_scalar_compare(node, obj, recv_tid, kind, mname) }
+    if cc_is_scalar_method(kind, mname) { return cc_scalar_method(node, obj, recv_tid, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
     if cc_is_sb_write_char(kind, mname) { return cc_sb_write_char(node, obj) }
     if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
@@ -3730,6 +3730,19 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     let symbol = cc_call_symbol(node, method, c_impl_method_name(im, node_method(node)))
     if symbol == "" { return -1 }
     cc_build_declared_call(node, symbol, obj, method)
+}
+
+// The built-in methods on a scalar receiver: a cast, wrapping arithmetic, a comparison and
+// a Float's bits. The two functions read the rows in the same order.
+fn cc_is_scalar_method(kind: TyKind, mname: Str) -> Bool {
+    cc_is_scalar_cast(kind, mname) || cc_is_wrapping_arith(kind, mname) || cc_is_scalar_compare(kind, mname) || float_bits_op(kind, mname) != ""
+}
+
+fn cc_scalar_method(node: Int, obj: Int, recv_tid: Int, kind: TyKind, mname: Str) -> Int ! Diag.Report {
+    if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
+    if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
+    if cc_is_scalar_compare(kind, mname) { return cc_scalar_compare(node, obj, recv_tid, kind, mname) }
+    cc_float_bits(node, obj, kind, mname)
 }
 
 // A method call with no declared impl to answer it may still be one a derive answers: a
@@ -4827,6 +4840,45 @@ fn cc_ieee_equal(node: Int, recv: Int, rhs: Int) -> Int ! Diag.Report {
     let answer = cc_local(TYPE_BOOL, node)
     if cc_stopped(answer) { return -1 }
     ir_binary(TYPE_BOOL, node, answer.c_spelling, "==", recv, rhs)
+}
+
+// ── Float bits ──────────────────────────────────────────────────────────
+//
+// sections/03_types.md "Float Bits". Each one is a runtime helper that moves the bytes with
+// memcpy, never a float load or arithmetic, so a signaling NaN keeps every bit.
+
+fn float_bits_op(kind: TyKind, method: Str) -> Str {
+    // Every method call reaches this test, so any other kind skips building the table.
+    if kind != TyKind.Float { return "" }
+    let mut table: Map[Str, Str] = Map()
+    table.insert("to_bits", "float_to_bits")
+    table.insert("is_sign_negative", "float_is_sign_negative")
+    table.get(method) ?? ""
+}
+
+fn cc_float_bits(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let result = cc_local(tid, node)
+    if cc_stopped(result) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(float_bits_op(kind, method)), result.slot_form, [recv])
+}
+
+fn cc_float_from_bits(node: Int) -> Int ! Diag.Report {
+    let args = node_args(node)
+    let given = if args == -1 { 0 } else { sublist_length(args) }
+    if given != 1 { return cc_ctor_arity_wrong(node, "Float", "from_bits", 1, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let result = cc_local(tid, node)
+    if cc_stopped(result) { return -1 }
+    let bits = lower_expr(sublist_get(args, 0))
+    if bits < 0 { return -1 }
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper("float_from_bits"), result.slot_form, [bits])
 }
 
 // The runtime helper that answers a kind's order as a sign, for a kind C's own < does not

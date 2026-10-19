@@ -6473,6 +6473,7 @@ fn tc_builtin_method_arity(obj_k: TyKind, method: Str) -> Int {
     if obj_k == TyKind.Float {
         if method == "to_string" || method == "to_int" { return 0 }
         if method == "ieee_eq" { return 1 }
+        if method == "to_bits" || method == "is_sign_negative" { return 0 }
         return -1
     }
     if obj_k == TyKind.Char {
@@ -17247,6 +17248,10 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "to_u64" { return 1 }
     // Float's IEEE 754 equality, the escape from its total order
     if name == "ieee_eq" { return 1 }
+    // Float's bit pattern and sign bit (sections/03_types.md "Float Bits")
+    if name == "to_bits" { return 1 }
+    if name == "from_bits" { return 1 }
+    if name == "is_sign_negative" { return 1 }
     // Sized int wrapping arithmetic
     if name == "wrapping_add" { return 1 }
     if name == "wrapping_sub" { return 1 }
@@ -17508,6 +17513,14 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     }
     if name == "Set" { return make_set_type(tc_container_slot_from_hint(TyKind.Set, 1)) }
     TYPE_UNKNOWN
+}
+
+// `Float.from_bits`, read on the qualifier's spelling as the `Char.from_code_point` arm is.
+// Codegen asks the same question here, so the call it emits is the one this typed. Every
+// U64 is a binary64 pattern, so the call is total and returns a bare Float
+// (sections/03_types.md "Float Bits").
+pub fn tc_is_float_from_bits(qualifier: Str, method: Str) -> Bool {
+    qualifier == "Float" && method == "from_bits"
 }
 
 // The typecheck mirror of codegen's builtin static-constructor blocks
@@ -22554,8 +22567,10 @@ pub fn type_bit_width(tid: Int) -> Int {
 
 // A Bool operand of `&` or `|` is most often a logical operator spelled the C bitwise way. The
 // help says that the logical one short-circuits, since a right operand with effects then may
-// not run.
-fn bitwise_bool_help(op: Str, operand_tid: Int) -> Str {
+// not run. A Float has no bitwise operators (sections/03_types.md §3.2.3); its bit pattern is
+// an integer, reached through `to_bits()`.
+fn bitwise_operand_help(op: Str, operand_tid: Int) -> Str {
+    if type_kind(operand_tid) == TyKind.Float { return "a bitwise operator works on an integer; call `to_bits()` for the Float's U64 bit pattern and `Float.from_bits` to go back" }
     if type_kind(operand_tid) != TyKind.Bool { return "" }
     if op == "&" { return "for a logical and of two Bool values write `&&`, which skips the right operand when the left is false" }
     if op == "|" { return "for a logical or of two Bool values write `||`, which skips the right operand when the left is true" }
@@ -23422,10 +23437,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
         if op == "&" || op == "|" || op == "^" {
             if tc_tid_is_no_info(lt) == 0 && is_integer_type(lt) == 0 {
-                tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(lt)}", node, "TypeError", TYPE_ERROR, bitwise_bool_help(op, lt))
+                tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(lt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, lt))
             }
             if tc_tid_is_no_info(rt) == 0 && is_integer_type(rt) == 0 {
-                tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(rt)}", node, "TypeError", TYPE_ERROR, bitwise_bool_help(op, rt))
+                tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(rt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, rt))
             }
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 && types_compatible(lt, rt) == 0 {
                 tc_error_at("bitwise `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
@@ -23435,7 +23450,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
         if op == "<<" || op == ">>" {
             if tc_tid_is_no_info(lt) == 0 && is_integer_type(lt) == 0 {
-                tc_error_at("shift `{op}` requires integer left operand, got {type_to_str(lt)}", node)
+                tc_error_at_code("shift `{op}` requires integer left operand, got {type_to_str(lt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, lt))
             }
             let rhs = node_right(node)
             if tc_tid_is_no_info(rt) == 0 && is_shift_amount_type(rt, rhs) == 0 {
@@ -23467,7 +23482,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
         if op == "~" {
             if tc_tid_is_no_info(operand) == 0 && is_integer_type(operand) == 0 {
-                tc_error_at("bitwise `~` requires integer operand, got {type_to_str(operand)}", node)
+                tc_error_at_code("bitwise `~` requires integer operand, got {type_to_str(operand)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, operand))
             }
             return operand
         }
@@ -24466,10 +24481,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // A Float receiver's `to_int` is answered here rather than in the Str block above;
         // codegen implements it at codegen_methods.bl:3782, gated on the Float type.
         // `ieee_eq` is the IEEE 754 escape from Float's total order (sections/03_types.md
-        // "Float Total Ordering").
+        // "Float Total Ordering"). `to_bits` and `is_sign_negative` read the bit pattern
+        // (sections/03_types.md "Float Bits").
         if obj_k == TyKind.Float {
             if method == "to_string" { return TYPE_STR }
             if method == "to_int" { return TYPE_INT }
+            if method == "to_bits" { return TYPE_U64 }
+            if method == "is_sign_negative" { return TYPE_BOOL }
             if method == "ieee_eq" {
                 check_builtin_arg(method, 0, TYPE_FLOAT, args_sl, "Float")
                 return TYPE_BOOL
@@ -25080,6 +25098,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, tc_conversion_error_type())
                 }
+            }
+            if tc_is_float_from_bits(obj_name, method) {
+                if check_builtin_arity("Float", method, 1, node_args(node), node) == 1 {
+                    check_builtin_arg(method, 0, TYPE_U64, node_args(node), "Float")
+                }
+                return TYPE_FLOAT
             }
             // A user-effect operation call — `db.query(..)`, `storage.get_names()`. The
             // handle is not a value, so it never had a type and the receiver-typed arms

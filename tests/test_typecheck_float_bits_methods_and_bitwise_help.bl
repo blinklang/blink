@@ -1,0 +1,149 @@
+// The front end's side of sections/03_types.md "Float Bits". `to_bits`, `Float.from_bits` and
+// `is_sign_negative` are built in and need no import, so a well-formed call reports nothing,
+// and `to_bits` is not a `to_` conversion (§3c.3), so nothing asks for a From impl behind it.
+// `from_bits` reads a U64 and nothing else. A bitwise operator on a Float, a shift included
+// (§3.2.3), stays a type error, and its help names `to_bits()`. The bits methods belong to
+// Float alone: on an Int the call is an unresolved method, and its help does not point at
+// `to_bits`.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{DiagEntry, diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+fn probe(src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    let path = "build/typecheck_float_bits_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn all_diags() -> Str {
+    let mut out = ""
+    for d in diag_entries { out = out.concat("{d.line}: {d.severity} {d.name}: {d.message} | help: {d.help}\n") }
+    out
+}
+
+fn diags_on(marker: Str) -> List[DiagEntry] {
+    let line = line_of(probe_src(), marker)
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.line == line { out.push(d) }
+    }
+    out
+}
+
+fn assert_clean_at(marker: Str) {
+    let ds = diags_on(marker)
+    if ds.len() != 0 { io.println("FAIL: {marker} must report nothing; got:\n{all_diags()}") }
+    assert_eq(ds.len(), 0)
+}
+
+fn the_error_at(marker: Str) -> DiagEntry {
+    let mut found: List[DiagEntry] = []
+    for d in diags_on(marker) {
+        if d.severity == "error" { found.push(d) }
+    }
+    if found.len() == 0 { io.println("FAIL: {marker} must report an error; got:\n{all_diags()}") }
+    assert(found.len() >= 1)
+    found.get(0).unwrap()
+}
+
+fn assert_help_names_to_bits(marker: Str) {
+    let d = the_error_at(marker)
+    if !d.help.contains("`to_bits()`") { io.println("FAIL: {marker} help must name `to_bits()`; got: {d.help}") }
+    assert(d.help.contains("`to_bits()`"))
+}
+
+// One probe source holds every shape: typecheck's tables are not reset between compiles in
+// one binary, so a second source would read the first one's leftovers.
+fn probe_src() -> Str {
+    #"fn main() {
+    let x = 1.5
+    let y = 2.5
+    let n = 5
+    let bits: U64 = x.to_bits()  // C_TO_BITS
+    let back: Float = Float.from_bits(bits)  // C_FROM_BITS
+    let neg: Bool = back.is_sign_negative()  // C_SIGN
+    let lit = Float.from_bits(9221120237041090561)  // C_FROM_BITS_LITERAL
+    let _ = Float.from_bits(1.5)  // R_FROM_BITS_FLOAT_ARG
+    let _ = Float.from_bits(n)  // R_FROM_BITS_INT_ARG
+    let _ = Float.from_bits()  // R_FROM_BITS_NO_ARG
+    let _ = x.to_bits(1)  // R_TO_BITS_ARG
+    let _ = x.is_sign_negative(1)  // R_SIGN_ARG
+    let _ = n.to_bits()  // R_INT_TO_BITS
+    let _ = x & y  // R_AND
+    let _ = x | y  // R_OR
+    let _ = x ^ y  // R_XOR
+    let _ = ~x  // R_NOT
+    let _ = x << 1  // R_SHL
+    let _ = x >> 1  // R_SHR
+    let _ = true & false  // R_BOOL_AND
+    io.println("{neg} {lit}")
+}
+"#
+}
+
+test "the bits methods are built in and a well-formed call reports nothing" {
+    let _ = probe(probe_src())
+    assert_clean_at("C_TO_BITS")
+    assert_clean_at("C_FROM_BITS")
+    assert_clean_at("C_SIGN")
+    assert_clean_at("C_FROM_BITS_LITERAL")
+}
+
+test "from_bits reads a U64 and exactly one" {
+    let _ = probe(probe_src())
+    let _ = the_error_at("R_FROM_BITS_FLOAT_ARG")
+    let _ = the_error_at("R_FROM_BITS_INT_ARG")
+    let _ = the_error_at("R_FROM_BITS_NO_ARG")
+}
+
+test "to_bits and is_sign_negative take no argument" {
+    let _ = probe(probe_src())
+    let _ = the_error_at("R_TO_BITS_ARG")
+    let _ = the_error_at("R_SIGN_ARG")
+}
+
+test "to_bits on an Int is unresolved and its help does not suggest to_bits" {
+    let _ = probe(probe_src())
+    let d = the_error_at("R_INT_TO_BITS")
+    assert_eq(d.name, "UnresolvedMethod")
+    if d.help.contains("to_bits") { io.println("FAIL: help on an Int receiver names to_bits: {d.help}") }
+    assert(!d.help.contains("to_bits"))
+}
+
+test "a bitwise operator on a Float is a type error whose help names to_bits()" {
+    let _ = probe(probe_src())
+    assert_help_names_to_bits("R_AND")
+    assert_help_names_to_bits("R_OR")
+    assert_help_names_to_bits("R_XOR")
+    assert_help_names_to_bits("R_NOT")
+    assert_help_names_to_bits("R_SHL")
+    assert_help_names_to_bits("R_SHR")
+}
+
+test "a bitwise operator on a Bool keeps its own help" {
+    let _ = probe(probe_src())
+    let d = the_error_at("R_BOOL_AND")
+    assert(d.help.contains("`&&`"))
+    assert(!d.help.contains("to_bits"))
+}

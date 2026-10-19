@@ -1,0 +1,54 @@
+// The copy law of sections/03_types.md "Float Bits" under the optimizer. At -O2 the C compiler
+// keeps a Float in a register, spills it and moves it between register files, and any of those
+// done as a float load or arithmetic would quiet a signaling NaN. The program below takes a
+// signaling NaN and a negative quiet NaN through a let copy, a struct field, a List element and
+// an @ffi call, and prints the bits it reads back. A -O2 build must print the same lines in one
+// C unit and per module, and `==` must answer the same in both.
+
+let DIR = ".tmp/float_bits_o2"
+
+fn program() -> Str {
+    #"@ffi("m", "copysign")
+@trusted(audit: "TEST-FLOAT-BITS-O2-FFI-IDENTITY")
+fn c_copysign(x: Float, y: Float) -> Float ! FFI { }
+
+type Holder { value: Float }
+
+fn main() {
+    let signaling: U64 = 9218868437227405313
+    let quiet: U64 = 9221120237041090561
+    let patterns = [signaling, (-0.0).to_bits() | quiet]
+    for b in patterns {
+        let x = Float.from_bits(b)
+        let copy = x
+        let h = Holder { value: x }
+        let xs: List[Float] = [x]
+        let through = c_copysign(x, x)
+        io.println("{b} {copy.to_bits()} {h.value.to_bits()} {xs.get(0).unwrap().to_bits()} {through.to_bits()}")
+        io.println("{x == copy} {x == 0.0} {x.is_sign_negative()}")
+    }
+}
+"#
+}
+
+fn expected() -> Str {
+    "9218868437227405313 9218868437227405313 9218868437227405313 9218868437227405313 9218868437227405313\ntrue false false\n18444492273895866369 18444492273895866369 18444492273895866369 18444492273895866369 18444492273895866369\ntrue false true\n"
+}
+
+fn run(blink_root: Str, flags: Str) -> Str {
+    let r = process_run("sh", ["-c", "cd {DIR} && {blink_root}/build/blink run {flags} bits.bl 2>&1"])
+    assert(r.exit_code == 0, "`blink run {flags}` failed:\n{r.out}{r.err_out}")
+    r.out
+}
+
+test "a -O2 build keeps every bit, in one C unit and per module" {
+    let blink_root = process_run("sh", ["-c", "pwd -P"]).out.trim_right()
+    shell_exec("rm -rf {DIR}")
+    shell_exec("mkdir -p {DIR}")
+    write_file("{DIR}/bits.bl", program())
+    let per_module = run(blink_root, "--release")
+    assert_eq(per_module, expected())
+    let one_unit = run(blink_root, "--release --no-per-module")
+    assert_eq(one_unit, expected())
+    shell_exec("rm -rf {DIR}")
+}
