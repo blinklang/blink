@@ -3340,9 +3340,18 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
         }
         return 1
     }
-    // Unbound metavar on either side: pin it to the other side.
-    if tc_is_unbound_metavar(a) != 0 { return bind_metavar(a, b) }
-    if tc_is_unbound_metavar(b) != 0 { return bind_metavar(b, a) }
+    // Unbound metavar on either side: pin it to the other side. A side that names another
+    // declaration's type parameter (a callee's `List[U]`) is not a type at this site, as a bare
+    // typevar is not: no substitution reaches it here, so the pin would turn a hole a later use
+    // can still fill into one nothing can.
+    if tc_is_unbound_metavar(a) != 0 {
+        if tc_tid_has_foreign_typevar(b) != 0 { return 1 }
+        return bind_metavar(a, b)
+    }
+    if tc_is_unbound_metavar(b) != 0 {
+        if tc_tid_has_foreign_typevar(a) != 0 { return 1 }
+        return bind_metavar(b, a)
+    }
     let ta = ty_pool.get(a).unwrap()
     let tb = ty_pool.get(b).unwrap()
     let ka = ta.kind
@@ -6748,10 +6757,11 @@ fn tc_value_awaits_closure_ret(val: Int) -> Bool {
     false
 }
 
-// Whether a call's type names the still-open return slot of one of its closure arguments.
+// Whether a call's type names the still-open return slot of a function-typed argument.
 // Only a type the call took from that slot waits on the walk: a closure the call merely
 // consumes (`async.spawn` reads its body, not its slot) leaves the call's type alone, and
-// inferring that call again would walk the body out of its scope.
+// inferring that call again would walk the body out of its scope. The argument's type is read,
+// not its node, so a closure a block or an `if` hands over counts as one written in place.
 fn tc_call_type_awaits_closure_ret(call: Int) -> Bool {
     let memo = tc_lookup_node_tid(call)
     if memo < 0 || tc_tid_has_unbound_metavar(memo) == 0 { return false }
@@ -6762,16 +6772,18 @@ fn tc_call_type_awaits_closure_ret(call: Int) -> Bool {
     while i < n {
         let mut a = sublist_get(args_sl, i)
         if node_kind(a) == NodeKind.NamedArg { a = node_value(a) }
-        if a != -1 && node_kind(a) == NodeKind.Closure && node_type_ann(a) == -1 {
-            let ret = tc_fn_tid_ret(tc_lookup_node_tid(a))
-            if ret >= 0 {
-                let slot = tc_resolve(ret)
-                if tc_is_unbound_metavar(slot) != 0 && tc_occurs_in(slot, memo) != 0 { return true }
-            }
-        }
+        if a != -1 && tc_fn_ret_open_in(tc_lookup_node_tid(a), memo) { return true }
         i = i + 1
     }
     false
+}
+
+// Whether `fn_tid` is a function type whose return is an unbound metavar that `memo` holds.
+fn tc_fn_ret_open_in(fn_tid: Int, memo: Int) -> Bool {
+    let ret = tc_fn_tid_ret(fn_tid)
+    if ret < 0 { return false }
+    let slot = tc_resolve(ret)
+    tc_is_unbound_metavar(slot) != 0 && tc_occurs_in(slot, memo) != 0
 }
 
 // Binds the call's result metavar to what the walked closure body produced. `bind_metavar`,
@@ -6980,12 +6992,10 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) ! TypeCheck.Resolve, Ty
     let cls_arity = if cls_params == -1 { 0 } else { sublist_length(cls_params) }
     if cls_arity != tc_tid_child_count(tc_tid_resolved(seed)) - 1 { return }
     tc_check_closure_ann_against_declared(a, seed)
-    // An inference pass may already have built a type around the closure's return slot
-    // (tc_closure_ret_slot). The declaration answers it; a position the declaration leaves
-    // open keeps the slot for the body walk to fill.
-    // A return the declaration leaves open is the slot itself, minted here when no pass has
-    // yet: a generic formal's `-> U` then unifies with the slot, and the body walk that binds
-    // it solves U, as it does for a slot a list literal captured.
+    // The closure's return slot (tc_closure_ret_slot) is what a declared return answers, and
+    // what a return the declaration leaves open is: a generic formal's `-> U` then unifies with
+    // the slot, and the body walk that binds it solves U, as it does for a slot a list literal
+    // captured.
     let mut published = seed
     if node_type_ann(a) == -1 {
         let want_ret = tc_fn_tid_ret(seed)
@@ -6998,6 +7008,9 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) ! TypeCheck.Resolve, Ty
             }
         }
     }
+    // A call read again after the body walk seeds the closure again; the walk's stamp names
+    // the parameters the body pinned, which the masked seed leaves open.
+    if tc_fn_tid_more_specific(tc_lookup_node_tid(a), published) != 0 { return }
     tc_publish_node_tid(a, published)
 }
 
