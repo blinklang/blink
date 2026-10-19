@@ -1,0 +1,85 @@
+// An unhashable Map key or Set element that inference finds is E1400 MapKeyNotHashable at
+// type-check (sections/03_types.md §3.6), so `blink check`, `blink build` and the per-module
+// build each report it, once per construction, and none reaches codegen. Before, the check
+// passed and the build stopped on an internal error. The key types live in a module of their
+// own, so the per-module build reads them across a module edge.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn new_package(tag: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_inferred_key_{tag}.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/keys.bl", "pub type Widget \{ id: Int }\n@derive(Hash, Eq)\npub type Keyed[T] \{ v: T }\n")
+    dir
+}
+
+fn cleanup(dir: Str) {
+    let _ = sh("rm -rf {dir}")
+}
+
+// The diagnostic lines of one run, in order: each coded error and each internal error.
+fn error_lines(out: Str) -> List[Str] {
+    let mut lines: List[Str] = []
+    for l in out.split("\n") {
+        if l.starts_with("error[") || l.starts_with("internal compiler error") { lines.push(l) }
+    }
+    lines
+}
+
+let widget_map = "error[MapKeyNotHashable]: Map key type `Widget` does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation"
+let keyed_set = "error[MapKeyNotHashable]: Set element type `Keyed[Widget]` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash"
+
+test "check, build and the per-module build report each inferred key once" {
+    let dir = new_package("refused")
+    write_file("{dir}/src/main.bl", #"import keys.{Widget, Keyed}
+
+fn main() {
+    let mut m = Map()
+    m.insert(Widget { id: 1 }, 1)
+    m.insert(Widget { id: 2 }, 2)
+    let mut s = Set()
+    s.insert(Keyed { v: Widget { id: 1 } })
+    io.println("{m.len()} {s.len()}")
+}
+"#)
+    let want = [widget_map, keyed_set]
+    for args in ["check", "build", "build --per-module"] {
+        let r = blink_in(dir, args)
+        let got = error_lines(r.out)
+        let ok = r.exit_code != 0 && got == want
+        if !ok { io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}") }
+        assert(ok)
+    }
+    cleanup(dir)
+}
+
+test "the same program at a Hash key builds and runs on both paths" {
+    let dir = new_package("accepted")
+    write_file("{dir}/src/main.bl", #"import keys.{Keyed}
+
+fn main() {
+    let mut s = Set()
+    s.insert(Keyed { v: 3 })
+    s.insert(Keyed { v: 3 })
+    io.println("{s.len()}")
+}
+"#)
+    let c = blink_in(dir, "check")
+    if c.exit_code != 0 { io.eprintln(c.out) }
+    assert(c.exit_code == 0)
+    for args in ["run", "run --per-module"] {
+        let r = blink_in(dir, args)
+        if r.exit_code != 0 || !r.out.contains("1") { io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}") }
+        assert(r.exit_code == 0 && r.out.trim().ends_with("1"))
+    }
+    cleanup(dir)
+}

@@ -1,0 +1,123 @@
+// sections/03_types.md §3.6 "Non-hashable keys and elements in general": a Map key or Set
+// element type that does not implement Hash is E1400 MapKeyNotHashable at type-check. The rule
+// is on the type, not on how it is spelled, so a key that inference finds from an insert, a
+// function return, a closure argument or a generic call is judged as a written one is. Before,
+// only the written form was judged, and an inferred key passed `blink check` and stopped codegen
+// with an internal error. Each refused row has an accepted control, so a check that refuses
+// every inferred key cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// Every error as `Name@line: message`, one per line, in report order.
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}@{d.line}: {d.message}") }
+    }
+    out.join("\n")
+}
+
+fn expect(label: Str, got: Str, want: Str) {
+    if got != want { io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}") }
+    assert(got == want)
+}
+
+let types_src = "type Widget \{ id: Int }\n@derive(Hash, Eq)\ntype HWidget \{ id: Int }\n@derive(Hash, Eq)\ntype Keyed[T] \{ v: T }\n"
+
+fn main_src(body: Str) -> Str {
+    "{types_src}fn main() \{\n{body}}\n"
+}
+
+let widget_map = "Map key type `Widget` does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation"
+let widget_set = "Set element type `Widget` does not implement Hash — user types used as Set elements must carry the @derive(Hash, Eq) annotation"
+
+test "a Map key found from its inserts is refused once, at the construction" {
+    let src = main_src("    let mut m = Map()\n    m.insert(Widget \{ id: 1 }, 1)\n    m.insert(Widget \{ id: 2 }, 2)\n    assert(m.len() == 2)\n")
+    expect("insert", probe("tc_inferkey_insert", src), "MapKeyNotHashable@7: {widget_map}")
+}
+
+test "a Map key found from its inserts is accepted when it derives Hash" {
+    let src = main_src("    let mut m = Map()\n    m.insert(HWidget \{ id: 1 }, 1)\n    assert(m.len() == 1)\n")
+    expect("insert ok", probe("tc_inferkey_insert_ok", src), "")
+}
+
+test "a Set element at an instance whose argument lacks Hash is refused" {
+    let src = main_src("    let mut s = Set()\n    s.insert(Keyed \{ v: Widget \{ id: 1 } })\n    assert(s.len() == 1)\n")
+    expect("instance", probe("tc_inferkey_instance", src),
+        "MapKeyNotHashable@7: Set element type `Keyed[Widget]` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash")
+}
+
+test "a Set element at an instance whose argument has Hash is accepted" {
+    let src = main_src("    let mut s = Set()\n    s.insert(Keyed \{ v: HWidget \{ id: 1 } })\n    let mut t = Set()\n    t.insert(Keyed \{ v: 3 })\n    assert(s.len() + t.len() == 2)\n")
+    expect("instance ok", probe("tc_inferkey_instance_ok", src), "")
+}
+
+test "a Map key found from a function return is refused" {
+    let src = "{types_src}fn key() -> Widget \{ Widget \{ id: 1 } }\nfn main() \{\n    let mut m = Map.new()\n    m.insert(key(), 1)\n    assert(m.len() == 1)\n}\n"
+    expect("return", probe("tc_inferkey_return", src), "MapKeyNotHashable@8: {widget_map}")
+}
+
+test "a Set element found from a closure argument is refused" {
+    let src = main_src("    let mut s = Set()\n    let add = fn(w: Widget) \{ s.insert(w) }\n    add(Widget \{ id: 1 })\n    assert(s.len() == 1)\n")
+    expect("closure", probe("tc_inferkey_closure", src), "MapKeyNotHashable@7: {widget_set}")
+}
+
+test "a Float key found from a literal is refused with the Float text" {
+    let src = main_src("    let mut m = Map()\n    m.insert(1.5, 1)\n    assert(m.len() == 1)\n")
+    expect("float", probe("tc_inferkey_float", src),
+        "MapKeyNotHashable@7: Map key type `Float` is not hashable — Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)")
+}
+
+test "a container element found from a literal is refused with the container text" {
+    let src = main_src("    let mut s = Set()\n    s.insert([1])\n    assert(s.len() == 1)\n")
+    expect("list", probe("tc_inferkey_list", src),
+        "MapKeyNotHashable@7: Set element type `List[Int]` does not implement Hash — List has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be Set elements)")
+}
+
+test "a tuple key is refused for its first element that lacks Hash" {
+    let src = main_src("    let mut m = Map()\n    m.insert((1, 2.5), 1)\n    assert(m.len() == 1)\n")
+    expect("tuple", probe("tc_inferkey_tuple", src),
+        "MapKeyNotHashable@7: Map key type `Float` is not hashable — Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)")
+}
+
+test "a tuple key of hashable elements is accepted" {
+    let src = main_src("    let mut m = Map()\n    m.insert((1, \"a\", HWidget \{ id: 1 }), 1)\n    assert(m.len() == 1)\n")
+    expect("tuple ok", probe("tc_inferkey_tuple_ok", src), "")
+}
+
+test "a written key is reported once, by the written form" {
+    let src = main_src("    let m: Map[Float, Int] = Map()\n    assert(m.len() == 0)\n")
+    expect("written", probe("tc_inferkey_written", src),
+        "MapKeyNotHashable@7: Map key type `Float` is not hashable — Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)")
+}
+
+test "a generic call whose key parameter a later insert solves is refused at the call" {
+    let src = "{types_src}fn mk[K]() -> Map[K, Int] \{ Map() }\nfn main() \{\n    let mut m = mk()\n    m.insert(Widget \{ id: 1 }, 1)\n    assert(m.len() == 1)\n}\n"
+    expect("generic", probe("tc_inferkey_generic", src),
+        "MapKeyNotHashable@8: `Widget` does not implement Hash — `mk` uses its type parameter K as a Map key")
+}
+
+test "a generic call whose key parameter a later insert solves is accepted at a Hash type" {
+    let src = "{types_src}fn mk[K]() -> Map[K, Int] \{ Map() }\nfn main() \{\n    let mut m = mk()\n    m.insert(HWidget \{ id: 1 }, 1)\n    assert(m.len() == 1)\n}\n"
+    expect("generic ok", probe("tc_inferkey_generic_ok", src), "")
+}
+
+test "a Float argument does not satisfy a Hash bound" {
+    let src = "fn keyed[K: Hash](k: K) -> Int \{ 0 }\nfn main() \{ assert(keyed(1.5) == 0) }\n"
+    expect("bound", probe("tc_inferkey_bound", src),
+        "TraitBoundNotSatisfied@2: `Float` does not satisfy the Hash bound on type parameter K")
+}
+
+test "an Int argument satisfies a Hash bound" {
+    let src = "fn keyed[K: Hash](k: K) -> Int \{ 0 }\nfn main() \{ assert(keyed(1) == 0) }\n"
+    expect("bound ok", probe("tc_inferkey_bound_ok", src), "")
+}

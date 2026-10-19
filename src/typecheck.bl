@@ -1091,8 +1091,11 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
 }
 
 // The Hash, Debug or Serialize answer for one type, tri-state as tc_type_satisfies_bound's:
-// a scalar has each of them, and a type parameter or an unsolved type is not judged.
+// a scalar has each of them, and a type parameter or an unsolved type is not judged. Hash
+// has its own closed list, which is narrower: a Float, a container or a tuple holding one
+// has no Hash, so a bound, a derive at an instance and a container key all read that list.
 fn tc_derive_only_fact(tid: Int, tr: Str) -> Int {
+    if tr == "Hash" { return tc_tid_hash_fact(tid) }
     let k = type_kind(tid)
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
     if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str || is_sized_int(k) != 0 { return 1 }
@@ -1497,7 +1500,7 @@ let mut tc_inc_filter: Map[Str, Int] = Map()
 // Set while tc_produce_struct_instance_tid's off-path instance-tid producer re-resolves a
 // struct's type-args (`Box[Map[Float,Int]]` → recurse into `Map[Float,Int]`). Without this
 // flag that re-resolution would emit a net-new, non-deduped E1400 MapKeyNotHashable
-// diagnostic from validate_map_key / validate_set_elem — a byte-identity violation of
+// diagnostic from validate_keyed_ann — a byte-identity violation of
 // typecheck decisions. The flag suppresses ONLY the hashability diagnostics during that
 // off-path pass; tid-building is unaffected, so the captured instance tids are
 // byte-identical either way. The live Map/Set annotation (a real `let m: Map[Float,Int]`)
@@ -2567,7 +2570,11 @@ fn tc_report_unsourced_binders(sig: Int, call_node: Int, self_offset: Int) ! Dia
 }
 
 // Record an unbracketed generic call's own binder tids for tc_ud_flush_calls. Group
-// layout in tc_call_open_tids: [sig, self_offset, n, tid...], -1 for a slot with no bind.
+// layout in tc_call_open_tids: [sig, self_offset, n, tid..., open...], -1 for a slot with
+// no bind, and open 1 for a tid still open here. A binder the callee uses as a key is judged
+// for Hash in the flush when it was open here: the use that solves it can come later, and a
+// closed one was judged at the call. A keyed construction records a group too (see
+// tc_note_open_ctor_key).
 fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[Str, Int]) {
     if tc_boundary_check_active == 0 || call_node < 0 { return }
     let fs = fnsig_pool.get(sig).unwrap()
@@ -2590,6 +2597,59 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
         tc_call_open_tids.push(tid)
         pi = pi + 1
     }
+    let first = tc_call_open_tids.len() - fs.type_params_count
+    let mut oi = 0
+    while oi < fs.type_params_count {
+        let tid = tc_call_open_tids.get(first + oi).unwrap()
+        tc_call_open_tids.push(if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 { 1 } else { 0 })
+        oi = oi + 1
+    }
+}
+
+// A Map()/Set() construction that names no type arguments, as a group of its own:
+// [-1, -1, 1, ctor] when the key is open here, else [-1, -1, 1, -1], so a walk that found it
+// closed clears an earlier record. The flush judges the key once inference is done.
+fn tc_note_open_ctor_key(node: Int, ctor: Int) {
+    if tc_boundary_check_active == 0 || node < 0 || ctor < 0 { return }
+    let t = tc_resolve(ctor)
+    let k = type_kind(t)
+    if k != TyKind.Map && k != TyKind.Set { return }
+    if tc_call_open_group.contains_key(node) == 0 { tc_call_open_calls.push(node) }
+    tc_call_open_group.insert(node, tc_call_open_tids.len())
+    tc_call_open_tids.push(-1)
+    tc_call_open_tids.push(-1)
+    tc_call_open_tids.push(1)
+    tc_call_open_tids.push(if tc_tid_has_unbound_metavar(ty_pool.get(t).unwrap().inner1) != 0 { t } else { -1 })
+}
+
+// The Hash judgment of a recorded group, made once inference is done (see
+// tc_note_generic_call). Reported before the unbound-binder check, which skips a call once
+// any report has claimed it.
+fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
+    let sig = tc_call_open_tids.get(g).unwrap()
+    if sig < 0 {
+        let ctor = tc_call_open_tids.get(g + 3).unwrap()
+        if ctor < 0 { return }
+        let t = tc_resolve(ctor)
+        let key = ty_pool.get(t).unwrap().inner1
+        if tc_tid_has_unbound_metavar(key) != 0 { return }
+        tc_refuse_unhashable_tid(key, if type_kind(t) == TyKind.Map { HashRole.MapKey } else { HashRole.SetElement }, call_node)
+        return
+    }
+    let oblig = tc_fn_hash_obligations(sig)
+    if oblig.len() == 0 { return }
+    let n = tc_call_open_tids.get(g + 2).unwrap()
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut pi = 0
+    while pi < n {
+        let role = tc_hash_oblig_mark(oblig, pi)
+        let tid = tc_call_open_tids.get(g + 3 + pi).unwrap()
+        let was_open = tc_call_open_tids.get(g + 3 + n + pi).unwrap()
+        if role != HashRole.Free && was_open != 0 && tc_tid_has_unbound_metavar(tid) == 0 && tc_tid_hash_fact(tid) == -1 {
+            tc_report_unhashable_bind(sig, fnsig_type_param_names.get(fs.type_params_start + pi).unwrap(), role, tid, call_node)
+        }
+        pi = pi + 1
+    }
 }
 
 // Report the recorded calls a binder of which is still unbound once inference is done
@@ -2599,9 +2659,10 @@ fn tc_ud_flush_calls() ! Diag.Report {
     while ci < tc_call_open_calls.len() {
         let call_node = tc_call_open_calls.get(ci).unwrap()
         ci = ci + 1
-        if tc_call_reported.contains_key(call_node) { continue }
         let g = tc_call_open_group.get(call_node).unwrap()
+        tc_flush_open_keys_of(call_node, g)
         let sig = tc_call_open_tids.get(g).unwrap()
+        if sig < 0 || tc_call_reported.contains_key(call_node) { continue }
         let n = tc_call_open_tids.get(g + 2).unwrap()
         let fs = fnsig_pool.get(sig).unwrap()
         let mut names: List[Str] = []
@@ -4365,7 +4426,7 @@ pub fn tc_ret_mint_at(call_node: Int, arity: Int, pi: Int) -> Int {
 // this ticket's to decide.
 //
 // The half of that which was a BLOCKER is now gone: the enforcement gap it named — a
-// declared `Map[Float,_]` rejected by validate_map_key while the same type reached
+// declared `Map[Float,_]` rejected by validate_keyed_ann while the same type reached
 // through a struct type-arg was not — is closed by tc_validate_type_arg_hashability, so
 // the Float MVCE above no longer reaches codegen at all and the sentinel arm is
 // unreachable from it. What remains is the kops half, which is a genuine question about
@@ -7755,8 +7816,8 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             let key_t = resolve_type_ann(key_ann)
             let val_t = resolve_type_ann(sublist_get(elems_sl, 1))
             if tc_suppress_ann_validation == 0 {
-                validate_map_key(key_ann)
-                tc_refuse_unhashable_instance(key_t, key_ann, "Map key")
+                validate_keyed_ann(key_ann, HashRole.MapKey)
+                tc_refuse_unhashable_instance(key_t, key_ann, HashRole.MapKey)
             }
             return make_map_type(key_t, val_t)
         }
@@ -7767,8 +7828,8 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             let elem_ann = sublist_get(elems_sl, 0)
             let elem_t = resolve_type_ann(elem_ann)
             if tc_suppress_ann_validation == 0 {
-                validate_set_elem(elem_ann)
-                tc_refuse_unhashable_instance(elem_t, elem_ann, "Set element")
+                validate_keyed_ann(elem_ann, HashRole.SetElement)
+                tc_refuse_unhashable_instance(elem_t, elem_ann, HashRole.SetElement)
             }
             return make_set_type(elem_t)
         }
@@ -8770,14 +8831,51 @@ fn tc_name_is_tparam_in_scope(name: Str) -> Int {
     0
 }
 
-fn validate_map_key(key_ann: Int) ! Diag.Report {
+// The words E1400 uses for one keyed role: the name of the role, the plural the rule is
+// stated over, the noun the help offers a replacement for, and what the Float help rounds.
+type HashRoleWords {
+    title: Str
+    plural: Str
+    noun: Str
+    rounded: Str
+}
+
+fn tc_hash_role_words(role: HashRole) -> HashRoleWords {
+    match role {
+        HashRole.SetElement => HashRoleWords { title: "Set element", plural: "Set elements", noun: "element", rounded: "value" }
+        _ => HashRoleWords { title: "Map key", plural: "Map keys", noun: "key", rounded: "key" }
+    }
+}
+
+// Why a key type has no Hash: a Float, a user type with no derive, a builtin with no impl, or
+// a derived Hash that fails at this instance's arguments.
+type HashRefusal { FloatKey, NoDerive, NoImpl, Instance }
+
+// E1400 for a key a container refuses, in one wording whether the key was written or
+// inferred. `shown` is the type as the reader knows it; `name` is the type the reason or the
+// help points at.
+fn tc_report_unhashable(role: HashRole, why: HashRefusal, shown: Str, name: Str, node: Int) ! Diag.Report {
+    let w = tc_hash_role_words(role)
+    match why {
+        HashRefusal.FloatKey => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` is not hashable — Float/Double values cannot serve as {w.plural} (NaN-inequality and bit-equality hazards)", node, "round the {w.rounded} to an Int (or another integer width) before inserting")
+        HashRefusal.NoDerive => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — user types used as {w.plural} must carry the @derive(Hash, Eq) annotation", node, "add @derive(Hash, Eq) to the `{name}` type definition")
+        HashRefusal.NoImpl => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — {name} has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be {w.plural})", node, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the {w.noun} instead")
+        HashRefusal.Instance => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash", node, "use type arguments that are Hash, or derive Hash on the argument types")
+    }
+}
+
+// A written Map key or Set element. A Set is a keys-only hash table, so its element carries
+// the same Hash requirement as a Map key: built-in scalars OK; user structs/enums need
+// @derive(Hash); tuples OK iff every element is hashable; Float/Double rejected; generic type
+// params accepted (opaque at this point); aliases decided by their base type.
+fn validate_keyed_ann(key_ann: Int, role: HashRole) ! Diag.Report {
     // Decisions read the base type; every message names what the USER wrote, so a rejected
     // `type Temp = Float` says "Map key type 'Temp'" and explains the Float hazard behind it.
     let decl_name = node_name(key_ann)
     if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
     let key_name = resolve_alias_type_name(decl_name)
     if key_name == "Float" || key_name == "F32" || key_name == "F64" {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type `{decl_name}` is not hashable — Float/Double values cannot serve as Map keys (NaN-inequality and bit-equality hazards)", key_ann, "round the key to an Int (or another integer width) before inserting")
+        tc_report_unhashable(role, HashRefusal.FloatKey, decl_name, key_name, key_ann)
         return
     }
     if key_name == "Tuple" {
@@ -8785,7 +8883,7 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
         if elems != -1 {
             let mut i = 0
             while i < sublist_length(elems) {
-                validate_map_key(sublist_get(elems, i))
+                validate_keyed_ann(sublist_get(elems, i), role)
                 i = i + 1
             }
         }
@@ -8804,7 +8902,7 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     // derive. For `type MyKey = Point` those differ, and pointing the fix at Point is the useful
     // half — @derive on the alias would be the category error described above.
     if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type `{decl_name}` does not implement Hash — user types used as Map keys must carry the @derive(Hash, Eq) annotation", key_ann, "add @derive(Hash, Eq) to the `{key_name}` type definition")
+        tc_report_unhashable(role, HashRefusal.NoDerive, decl_name, key_name, key_ann)
         return
     }
     // Deny-by-default: is_primitive_type enumerates every concrete builtin name the
@@ -8814,13 +8912,13 @@ fn validate_map_key(key_ann: Int) ! Diag.Report {
     // does NOT recognize, and that is also not a registered user type, is a generic type
     // parameter opaque at this point — deferred to later phases, same as always.
     if is_primitive_type(key_name) != 0 {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Map key type `{decl_name}` does not implement Hash — {key_name} has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be Map keys)", key_ann, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the key instead")
+        tc_report_unhashable(role, HashRefusal.NoImpl, decl_name, key_name, key_ann)
     }
 }
 
-// validate_map_key reads the written name, so it passes any instance of a type that derives
+// validate_keyed_ann reads the written name, so it passes any instance of a type that derives
 // Hash. The derive holds only at an instance whose arguments have Hash, read here at the tid.
-fn tc_refuse_unhashable_instance(tid0: Int, ann: Int, role: Str) ! Diag.Report {
+fn tc_refuse_unhashable_instance(tid0: Int, ann: Int, role: HashRole) ! Diag.Report {
     let tid = resolve_alias_tid(tc_resolve(tid0))
     let k = type_kind(tid)
     if k != TyKind.Struct && k != TyKind.Enum { return }
@@ -8828,54 +8926,41 @@ fn tc_refuse_unhashable_instance(tid0: Int, ann: Int, role: Str) ! Diag.Report {
     let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
     if tc_type_name_derives(strip_module_qualifier(tc_type_name(base)), "Hash") == 0 { return }
     if tc_instance_has_trait(tid, "Hash") { return }
-    diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
-        "{role} type `{type_to_str(tid)}` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash", ann,
-        "use type arguments that are Hash, or derive Hash on the argument types")
+    tc_report_unhashable(role, HashRefusal.Instance, type_to_str(tid), "", ann)
 }
 
-// Verify that a Set element type annotation is hashable — a Set is a keys-only
-// hash table, so its element carries the same Hash requirement as a Map key.
-// Emits MAP_KEY_NOT_HASHABLE (E1400) with Set-worded messages. Same rules as
-// validate_map_key: built-in scalars OK; user structs/enums need @derive(Hash);
-// tuples OK iff every element is hashable; Float/Double rejected; generic type
-// params accepted (opaque at this point); aliases decided by their base type.
-fn validate_set_elem(elem_ann: Int) ! Diag.Report {
-    // Same decl/base split as validate_map_key: verdicts read the base type, messages name what
-    // the user wrote.
-    let decl_name = node_name(elem_ann)
-    if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
-    let elem_name = resolve_alias_type_name(decl_name)
-    if elem_name == "Float" || elem_name == "F32" || elem_name == "F64" {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type `{decl_name}` is not hashable — Float/Double values cannot serve as Set elements (NaN-inequality and bit-equality hazards)", elem_ann, "round the value to an Int (or another integer width) before inserting")
-        return
-    }
-    if elem_name == "Tuple" {
-        let elems = node_elements(elem_ann)
-        if elems != -1 {
-            let mut i = 0
-            while i < sublist_length(elems) {
-                validate_set_elem(sublist_get(elems, i))
-                i = i + 1
+// A key type no annotation spelled, judged by the rule a written one is and reported in its
+// words. The reason is read off the type: a tuple answers for its first element that fails.
+fn tc_refuse_unhashable_tid(tid0: Int, role: HashRole, node: Int) ! Diag.Report {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_hash_fact(tid) != -1 { return }
+    let k = type_kind(tid)
+    if k == TyKind.Tuple {
+        let te = ty_pool.get(tid).unwrap()
+        let mut i = 0
+        while i < te.params_count {
+            let e = ty_param_list.get(te.params_start + i).unwrap()
+            if tc_tid_hash_fact(e) == -1 {
+                tc_refuse_unhashable_tid(e, role, node)
+                return
             }
+            i = i + 1
         }
         return
     }
-    if is_builtin_hashable(elem_name) != 0 { return }
-    let bare = strip_module_qualifier(elem_name)
-    let nominal = tc_written_type_nominal(elem_name)
-    if tc_type_name_derives(nominal, "Hash") != 0 {
+    let shown = type_to_str(tid)
+    if k == TyKind.Float {
+        tc_report_unhashable(role, HashRefusal.FloatKey, shown, shown, node)
         return
     }
-    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type `{decl_name}` does not implement Hash — user types used as Set elements must carry the @derive(Hash, Eq) annotation", elem_ann, "add @derive(Hash, Eq) to the `{elem_name}` type definition")
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+        let bname = strip_module_qualifier(tc_type_name(base))
+        let why = if tc_type_name_derives(bname, "Hash") != 0 { HashRefusal.Instance } else { HashRefusal.NoDerive }
+        tc_report_unhashable(role, why, shown, bname, node)
         return
     }
-    // Deny-by-default — see validate_map_key's twin comment. A name is_primitive_type
-    // recognizes is a known-concrete builtin with no Hash impl; anything else unresolved
-    // is a generic type parameter and stays deferred.
-    if is_primitive_type(elem_name) != 0 {
-        diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "Set element type `{decl_name}` does not implement Hash — {elem_name} has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be Set elements)", elem_ann, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the element instead")
-    }
+    tc_report_unhashable(role, HashRefusal.NoImpl, shown, tk_name(k), node)
 }
 
 // Hashability validation for a STRUCT or ENUM annotation's type arguments.
@@ -8908,7 +8993,7 @@ fn validate_set_elem(elem_ann: Int) ! Diag.Report {
 // The recursion descends through intervening carriers and struct levels alike, so
 // `Box[Box[Map[Float,Int]]]` and `Box[Option[Set[Float]]]` are both reached. A typevar or
 // unknown arg name matches neither "Map" nor "Set" and has no elements, so it costs one
-// comparison and terminates — the deferral validate_map_key documents for type params stays
+// comparison and terminates — the deferral validate_keyed_ann documents for type params stays
 // intact — being over-eager here would itself be a defect.
 //
 // `owner_oblig` is the owner's tc_hash_oblig entry: an argument substituted for a parameter
@@ -8922,17 +9007,17 @@ fn tc_validate_type_arg_hashability(owner_oblig: List[HashRole], elems_sl: Int) 
         let arg_name = node_name(arg)
         let arg_elems = node_elements(arg)
         match tc_hash_oblig_mark(owner_oblig, i) {
-            HashRole.SetElement => validate_set_elem(arg)
-            HashRole.MapKey => validate_map_key(arg)
+            HashRole.SetElement => validate_keyed_ann(arg, HashRole.SetElement)
+            HashRole.MapKey => validate_keyed_ann(arg, HashRole.MapKey)
             HashRole.Free => {}
         }
         if arg_name == "Map" {
             if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
-                validate_map_key(sublist_get(arg_elems, 0))
+                validate_keyed_ann(sublist_get(arg_elems, 0), HashRole.MapKey)
             }
         } else if arg_name == "Set" {
             if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
-                validate_set_elem(sublist_get(arg_elems, 0))
+                validate_keyed_ann(sublist_get(arg_elems, 0), HashRole.SetElement)
             }
         }
         tc_validate_type_arg_hashability(tc_hash_oblig_of(arg_name), arg_elems)
@@ -9105,7 +9190,7 @@ fn tc_hash_oblig_walk_tree(id: Int, names: List[Str], roles: List[HashRole]) {
 
 // Tri-state Hash verdict on a concrete type, by the spec's closed list
 // (sections/03_types.md:1940): 1 hashable, -1 not, 0 unknown (never rejects).
-fn tc_tid_hash_fact(tid0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+fn tc_tid_hash_fact(tid0: Int) -> Int {
     let tid = tc_resolve(tid0)
     let k = type_kind(tid)
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
@@ -9144,23 +9229,25 @@ fn tc_check_hash_obligations_for_binds(sig: Int, binds: Map[Str, Int], node: Int
     let fs = fnsig_pool.get(sig).unwrap()
     let mut i = 0
     while i < fs.type_params_count {
-        let role = match tc_hash_oblig_mark(oblig, i) {
-            HashRole.SetElement => "Set element"
-            HashRole.MapKey => "Map key"
-            HashRole.Free => ""
-        }
+        let role = tc_hash_oblig_mark(oblig, i)
         let idx = fs.type_params_start + i
-        if role != "" && idx < fnsig_type_param_names.len() {
+        if role != HashRole.Free && idx < fnsig_type_param_names.len() {
             let name = fnsig_type_param_names.get(idx).unwrap()
             let bound = binds.get(name) ?? -1
-            if bound != -1 && tc_tid_hash_fact(bound) == -1 {
-                diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
-                    "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{fs.name}` uses its type parameter {name} as a {role}", node,
-                    "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum for {name}")
+            // An open bind is judged by tc_ud_flush_calls once a later use has solved it.
+            if bound != -1 && tc_tid_has_unbound_metavar(bound) == 0 && tc_tid_hash_fact(bound) == -1 {
+                tc_report_unhashable_bind(sig, name, role, bound, node)
             }
         }
         i = i + 1
     }
+}
+
+fn tc_report_unhashable_bind(sig: Int, name: Str, role: HashRole, bound: Int, node: Int) ! Diag.Report {
+    let fs = fnsig_pool.get(sig).unwrap()
+    diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
+        "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{fs.name}` uses its type parameter {name} as a {tc_hash_role_words(role).title}", node,
+        "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum for {name}")
 }
 
 // Does deriving `listed` oblige `tr`: the trait itself, or one its built-in supertraits
@@ -21639,7 +21726,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     }
                     // A bare StringBuilder call, already reported by name resolution, still
                     // answers the type it plainly meant, so its uses report nothing further.
-                    return get_builtin_fn_ret(fn_name)
+                    let ret = get_builtin_fn_ret(fn_name)
+                    tc_note_open_ctor_key(node, ret)
+                    return ret
                 }
                 if !as_carrier {
                     match tc_infer_bare_variant_call(node, fn_name, vpick) {
@@ -23407,6 +23496,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     return tc_container_ctor_from_type_args(node, obj_name)
                 }
                 let bs_ret = tc_builtin_static_ret(obj_name, method)
+                if method == "new" { tc_note_open_ctor_key(node, bs_ret) }
                 if bs_ret >= 0 { return bs_ret }
             }
             // Static method on a builtin/named type: Type.from(x), Type.try_from(x), etc.
