@@ -1,0 +1,168 @@
+// A conversion whose source or target is still open at the call is chosen once inference is
+// done (sections/03_types.md 3.4: a later use in the same definition may fix an open type, and
+// E0301 fires only if it stays open). A single impl that fits is such a use: it fixes what the
+// call left open, as a call to a function fixes its argument. The one-unit build and the
+// per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn expect_runs(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_conv_late.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+// `blink check` and `blink build` give the same refusal.
+fn expect_refused(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_conv_late.XXXXXX").out.trim()
+    write_file("{dir}/main.bl", src)
+    let mut ok = true
+    for cmd in ["check", "build"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {cmd} main.bl < /dev/null 2>&1")
+        if r.exit_code == 0 || !r.out.contains(want) || r.out.contains("internal compiler error") {
+            io.eprintln("blink {cmd}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+test "a source an earlier statement settles converts by its settled type" {
+    expect_runs(#"type Tally { n: Int }
+impl From[Map[Str, Int]] for Tally {
+    fn from(m: Map[Str, Int]) -> Tally { Tally { n: m.len() } }
+}
+fn main() {
+    let mut m = Map()
+    m.insert("a", 1)
+    let a = Tally.from(m)
+    let b: Tally = m.into()
+    io.println("{a.n} {b.n}")
+}
+"#, "1 1")
+}
+
+test "a source a later statement settles converts by its settled type" {
+    expect_runs(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() + 1 } }
+}
+impl From[List[Str]] for X {
+    fn from(xs: List[Str]) -> X { X { n: xs.len() + 10 } }
+}
+fn main() {
+    let mut xs = []
+    let a = X.from(xs)
+    let b: X = xs.into()
+    xs.push(1)
+    let mut ys = []
+    let c = X.from(ys)
+    ys.push("s")
+    io.println("{a.n} {b.n} {c.n}")
+}
+"#, "1 1 10")
+}
+
+test "the only impl that fits fixes an empty source" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() + 5 } }
+}
+fn main() {
+    let b: Box[Int] = Box.from([])
+    let c: Box[Str] = [].into()
+    let x = X.from([])
+    io.println("{b.v.len()} {c.v.len()} {x.n}")
+}
+"#, "0 0 5")
+}
+
+test "into for a generic parameter takes the type the impl fills in" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+fn take[U](b: Box[U]) -> Int { b.v.len() }
+fn show[U: Display](b: Box[U]) -> Str { "{b.v.get(0).unwrap()}" }
+fn main() {
+    io.println("{take([1, 2].into())} {show(["s"].into())}")
+}
+"#, "2 s")
+}
+
+test "a source no use settles is refused where two impls fit it" {
+    expect_refused(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() } }
+}
+impl From[List[Str]] for X {
+    fn from(xs: List[Str]) -> X { X { n: xs.len() } }
+}
+fn main() {
+    let a = X.from([])
+    io.println("{a.n}")
+}
+"#, "matches more than one impl")
+}
+
+test "a binder only an empty source names is still refused" {
+    expect_refused(#"type X { n: Int }
+impl[U] From[List[U]] for X {
+    fn from(xs: List[U]) -> X { X { n: xs.len() } }
+}
+fn main() {
+    let a = X.from([])
+    io.println("{a.n}")
+}
+"#, "type parameter `U` of `impl From[List[U]] for X` is unbound at this call")
+}
+
+test "a source a later statement settles to a type with no impl is refused" {
+    expect_refused(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() } }
+}
+fn main() {
+    let mut xs = []
+    let a = X.from(xs)
+    xs.push(true)
+    io.println("{a.n}")
+}
+"#, "List[Bool] does not convert to X")
+}
+
+test "an open source the binding blames is reported once" {
+    expect_refused(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() } }
+}
+impl From[List[Str]] for X {
+    fn from(xs: List[Str]) -> X { X { n: xs.len() } }
+}
+fn main() {
+    let xs = []
+    let a = X.from(xs)
+    io.println("{a.n}")
+}
+"#, "1 error(s) found")
+}

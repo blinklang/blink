@@ -1,0 +1,51 @@
+// A let annotation is an expected type for its value (sections/03_types.md 3.3, bidirectional
+// inference), so it fixes a generic call's binder that the arguments leave open, as a return
+// type or a parameter type already does.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn expect_runs(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_let_binder.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+test "a let annotation fixes the binder an empty argument leaves open" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type Pair[A, B] { a: List[A]  b: Option[B] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn pair[A, B](a: List[A], b: Option[B]) -> Pair[A, B] { Pair { a: a, b: b } }
+fn main() {
+    let b: Box[Int] = mk([])
+    let p: Pair[Str, Int] = pair([], None)
+    let q: Pair[Str, Int] = pair(["x"], None)
+    io.println("{b.v.len()} {p.a.len()} {q.a.len()} {q.b.is_none()}")
+}
+"#, "0 0 1 true")
+}
+
+test "a return type and a parameter type fix the same binder" {
+    expect_runs(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn ret() -> Box[Str] { mk([]) }
+fn use_box(b: Box[Int]) -> Int { b.v.len() }
+fn main() {
+    io.println("{ret().v.len()} {use_box(mk([]))}")
+}
+"#, "0 0")
+}
