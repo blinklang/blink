@@ -26,6 +26,17 @@ fn expect_runs(src: Str, want: Str) {
     assert(ok)
 }
 
+fn expect_refused(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_poly_conv.XXXXXX").out.trim()
+    write_file("{dir}/main.bl", src)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B build main.bl < /dev/null 2>&1")
+    let _ = sh("rm -rf {dir}")
+    if r.exit_code == 0 || !r.out.contains(want) || r.out.contains("internal compiler error") {
+        io.eprintln("exit {r.exit_code}\n{r.out}")
+        assert(false)
+    }
+}
+
 test "a poly From impl on a receiver with no type arguments" {
     expect_runs(#"type X { n: Int }
 impl[T] From[List[T]] for X {
@@ -151,4 +162,103 @@ fn main() {
     io.println("{X.from(ns).n} {X.from([1]).n} {Box.from(m).v.len()}")
 }
 "#, "3 100 1")
+}
+
+test "a poly From impl that nothing calls needs no body" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[List[T]] for Box[T] {
+    fn from(xs: List[T]) -> Box[T] { Box { v: xs } }
+}
+impl[T] From[Option[T]] for Box[T] {
+    fn from(_o: Option[T]) -> Box[T] { Box { v: [] } }
+}
+type X { n: Int }
+impl[T] From[List[T]] for X {
+    fn from(xs: List[T]) -> X { X { n: xs.len() } }
+}
+fn main() {
+    let a = Box.from([1])
+    io.println("{a.v.len()}")
+}
+"#, "1")
+}
+
+test "a bound on a poly From binder decides which impl a call takes" {
+    expect_runs(#"type Foo { a: Int }
+type X { n: Int }
+impl[T: Display] From[List[T]] for X {
+    fn from(xs: List[T]) -> X { X { n: xs.len() } }
+}
+impl From[List[Foo]] for X {
+    fn from(_xs: List[Foo]) -> X { X { n: 100 } }
+}
+fn main() {
+    let a = X.from([Foo { a: 1 }])
+    let b: X = [Foo { a: 2 }].into()
+    let c = X.from([1, 2])
+    io.println("{a.n} {b.n} {c.n}")
+}
+"#, "100 100 2")
+}
+
+test "a static poly conversion inside a generic body runs at each instance" {
+    expect_runs(#"type X { n: Int }
+impl[U] From[List[U]] for X {
+    fn from(xs: List[U]) -> X { X { n: xs.len() } }
+}
+impl[U] TryFrom[List[U]] for X {
+    fn try_from(xs: List[U]) -> Result[X, ConversionError] { Ok(X { n: xs.len() * 10 }) }
+}
+fn g[T](x: T) -> X { X.from(x) }
+fn h[T](x: T) -> Result[X, ConversionError] { X.try_from(x) }
+fn main() {
+    let a = g([1, 2])
+    let b = g(["s"])
+    match h([1, 2, 3]) {
+        Ok(c) => io.println("{a.n} {b.n} {c.n}")
+        Err(e) => io.println("err {e.message}")
+    }
+}
+"#, "2 1 30")
+}
+
+test "an annotation fills a binder only the receiver of a static conversion names" {
+    expect_runs(#"type Box[T] { v: List[T] }
+impl[T] From[Int] for Box[T] {
+    fn from(_n: Int) -> Box[T] { Box { v: [] } }
+}
+fn main() {
+    let b: Box[Str] = Box.from(5)
+    let c: Box[Int] = 5.into()
+    io.println("{b.v.len()} {c.v.len()}")
+}
+"#, "0 0")
+}
+
+test "a conversion of a generic body's parameter runs at each instance" {
+    expect_runs(#"type X { n: Int }
+impl[U] From[List[U]] for X {
+    fn from(xs: List[U]) -> X { X { n: xs.len() } }
+}
+impl From[Str] for X {
+    fn from(s: Str) -> X { X { n: s.len() * 100 } }
+}
+fn g[T](x: T) -> X { x.into() }
+fn k[T](x: T) -> X { X.from(x) }
+fn main() {
+    io.println("{g([1, 2]).n} {g("abc").n} {k("ab").n} {k([1]).n}")
+}
+"#, "2 300 200 1")
+}
+
+test "an instance whose parameter has no conversion impl is refused there" {
+    expect_refused(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() } }
+}
+fn g[T](x: T) -> X { X.from(x) }
+fn main() {
+    io.println("{g([1]).n} {g("s").n}")
+}
+"#, "Str does not convert to X in g[Str]")
 }

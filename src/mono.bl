@@ -34,7 +34,7 @@ import typecheck.{
     make_tuple_type,
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
     tc_call_declared_name, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_impl_conv_source,
-    tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_conversion_trait_of, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
+    tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_check_conversion, tc_conversion_trait_of, tc_conversion_target_of, tc_is_conversion_trait, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait,
@@ -1029,22 +1029,29 @@ fn discover_own_generic_method_call(ctx: Int, node: Int, obj: Int) ! Diag.Report
 }
 
 // `T.from(v)`, `T.try_from(v)` or `v.into()` that reaches a From or TryFrom impl with
-// binders. Typecheck linked the static form to the method it picked; `.into()` is linked to
-// nothing, so its impl is the one typecheck's rule picks from this instance's tids. The
+// binders. Typecheck linked a static form to the method it picked where the call's types
+// settled one; `.into()`, and a static form whose source is a generic body's `T`, are linked
+// to nothing, so the impl is the one typecheck's rule picks from this instance's tids. The
 // binders are solved from the call like any generic call's, the receiver of `.into()`
 // standing for the method's source parameter.
 fn discover_conversion_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     let mut m = tc_call_decl_node(node)
     let mut lead: List[Int] = []
     if m < 0 {
-        if !tc_is_into_method(node_method(node)) || sl_len(node_args(node)) != 0 { return }
-        let source = ctx_node_tid(ctx, obj)
-        let target = ctx_node_tid(ctx, node)
+        let args = node_args(node)
+        let into = tc_is_into_method(node_method(node)) && sl_len(args) == 0
+        let trait_name = tc_conversion_trait_of(if into { "from" } else { node_method(node) })
+        if !into && (!tc_is_conversion_trait(trait_name) || sl_len(args) != 1) { return }
+        let source = ctx_node_tid(ctx, if into { obj } else { sublist_get(args, 0) })
+        let target = tc_conversion_target_of(trait_name, ctx_node_tid(ctx, node))
         if source < 0 || target < 0 { return }
-        let im = tc_conversion_impl_for(tc_conversion_trait_of("from"), source, target)
+        // Typecheck could not choose for a generic body's `T`, so an instance is the first
+        // place the call can be refused.
+        let call = if into { "`.into()`" } else { "`{node_name(obj)}.{node_method(node)}`" }
+        let im = if ctx < 0 { tc_conversion_impl_for(trait_name, source, target) } else { tc_check_conversion(node, call, " in {instance_label(ctx)}", trait_name, source, target) }
         if im < 0 { return }
         m = conversion_method_of(im)
-        lead.push(source)
+        if into { lead.push(source) }
     }
     let im = poly_block_of_method.get(m) ?? -1
     if im < 0 || tc_impl_conv_source(im) < 0 { return }
@@ -1055,7 +1062,12 @@ fn discover_conversion_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     while i < sl_len(binders_sl) {
         let b = sublist_get(binders_sl, i)
         let t = binds.get(tc_binder_key(b, node_name(b))) ?? -1
-        if t < 0 || tid_is_open(t) { return }
+        if t < 0 || tid_is_open(t) {
+            diag_ice_at("MonoUnsolvedTypeParam", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "type parameter `{node_name(b)}` of `{tc_impl_trait_id(im)}` for `{node_name(im)}` is unsolved at this call", node,
+                "typecheck must reject a conversion it cannot fully type; this is a compiler bug")
+            return
+        }
         impl_tids.push(t)
         i = i + 1
     }
