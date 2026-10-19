@@ -3300,23 +3300,22 @@ fn tc_drop_open_calls() {
 // metavar still unbound (an empty `[]`/`None`/`Map()`/`Set()` never pinned by a
 // constraining use). error[CannotInferType] (E0301), sole repair is annotation.
 // Report-at-binding, dual-span: primary caret at the
-// `let`, a secondary note at the empty ctor (the RHS value). The `help` text shows
-// the annotation SHAPE with placeholder type-params (T/K/V) — deliberately NOT a
-// machine-applicable `fix`, because the element type is precisely what the error
+// `let`, a secondary note at the value that left the slot open (the RHS). The `help`
+// text shows the annotation SHAPE with placeholder type-params (T/K/V) — deliberately
+// NOT a machine-applicable `fix`, because the open slot is precisely what the error
 // says is unknowable: an auto-applied `: List[T]` would insert an undefined `T`.
 fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Report {
     let hint = tc_infer_annotation_hint(tid)
     let dk = node_kind(decl_node)
-    let mut notes: List[Str] = []
     // Only a `let` holds its initializer in the value slot, so only there does the
-    // value node name the construction that failed to yield an element type. A
-    // `with` binder keeps its resource EXPRESSION in the same slot, and calling that
-    // "the empty construction" would be a false claim about the user's code.
-    if dk == NodeKind.LetBinding {
-        let val = node_value(decl_node)
-        if val != -1 {
-            notes.push("the empty construction here has no element type to infer at line {node_line(val)}")
-        }
+    // value node name the construction that failed to fill the slot. A `with` binder
+    // keeps its resource EXPRESSION in the same slot, and calling that "the empty
+    // construction" would be a false claim about the user's code.
+    let val = if dk == NodeKind.LetBinding { node_value(decl_node) } else { -1 }
+    let (source, slot) = tc_ud_open_slot(tid, val)
+    let mut notes: List[Str] = []
+    if val != -1 {
+        notes.push("{source} has no {slot} to infer at line {node_line(val)}")
     }
     // Claim this open type so a DEFERRED alias blame over the same metavar drops out
     // at the flush instead of adding a second report for one under-determination.
@@ -3326,13 +3325,35 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
     // list; every other binder class destructures a value it did not materialize and
     // carries no annotation at all, so naming a `let` there would prescribe a repair
     // that does not exist at that span.
-    let mut help = "add a type annotation, e.g. `let {vname}{hint} = ...` (replace the placeholder with the intended element type)"
+    let mut help = "add a type annotation, e.g. `let {vname}{hint} = ...` (replace the placeholder with the intended {slot})"
     if dk == NodeKind.Param {
-        help = "add a type annotation, e.g. `fn({vname}{hint}) \{ ... }` (replace the placeholder with the intended element type)"
+        help = "add a type annotation, e.g. `fn({vname}{hint}) \{ ... }` (replace the placeholder with the intended {slot})"
     } else if dk != NodeKind.LetBinding {
         help = "annotate the value this binder destructures — a pattern binder takes no annotation of its own"
     }
     diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for `{vname}`: it is never given one by an annotation or a later use", decl_node, help, notes)
+}
+
+// What an under-determined binding's value is, and which of its type's slots nothing filled,
+// keyed on the open type's outer kind. A Ptr or a spawned Handle comes from a call, not an
+// empty construction, and what it leaves open is a pointee or a result, not an element. A
+// Ptr nested in another kind (`Some(null_ptr())`) takes that kind's text, as `Some([])` does.
+fn tc_ud_open_slot(tid: Int, val: Int) -> (Str, Str) {
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Ptr { return (tc_ud_call_source(val), "pointee type") }
+    if k == TyKind.Handle { return (tc_ud_call_source(val), "result type") }
+    ("the empty construction here", "element type")
+}
+
+// The call a value is, spelled as written, or a plain "the value" when it is not a call.
+fn tc_ud_call_source(val: Int) -> Str {
+    if val >= 0 && node_kind(val) == NodeKind.Call && node_kind(node_left(val)) == NodeKind.Ident {
+        return "the `{node_name(node_left(val))}()` call here"
+    }
+    if val >= 0 && node_kind(val) == NodeKind.MethodCall && node_kind(node_obj(val)) == NodeKind.Ident {
+        return "the `{node_name(node_obj(val))}.{node_method(val)}()` call here"
+    }
+    "the value here"
 }
 
 // Point the caret at the specific open constructor inside a compound value: the first
