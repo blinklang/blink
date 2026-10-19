@@ -375,6 +375,8 @@ traits in `std.traits`.
 
 No implicit promotion between sized types and `Int`. Always use `.to_int()` to widen.
 
+An integer literal is its exact value and must fit the type it gets (the expected type, else `Int`), or it is `E0318 IntLiteralOutOfRange`. `let m: U64 = 9223372036854775808` is valid; `let x = 9223372036854775808` is `E0318` (annotate `U64`). A `-` directly on a literal is part of it: `-9223372036854775808` is the `Int` minimum, and any negative literal under an unsigned type (`-1`, `-0`) is `E0318`. A literal operand takes the other operand's type (`bits & 9223372036854775808`, `bits == 0`), an expected type reaches both operands of `+ - * / % & | ^` (`let t: U64 = 1 << 63`), and a shift amount is `U32`. The type is fixed at the literal: `let mut xs = List.new()` then `xs.push(9223372036854775808)` is `E0318`; annotate `List[U64]`.
+
 ## Escape Sequences
 
 | Escape | Produces |

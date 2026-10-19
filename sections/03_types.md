@@ -1397,13 +1397,59 @@ Integer literals have no suffix syntax. The type is determined by context: the e
 
 ```blink
 let byte: U8 = 255       // OK: 255 fits in U8
-let bad: U8 = 300        // COMPILE ERROR: 300 exceeds U8 range (0..255)
+let bad: U8 = 300        // error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)
 let x = 42               // type is Int (default)
 
 fn process(val: U8) { }
 process(200)              // OK: literal 200 fits in U8
-process(300)              // COMPILE ERROR: 300 exceeds U8 range
+process(300)              // error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)
 ```
+
+**Integer literal range.** An integer literal stands for the exact integer that its digits spell, in every base that the literal grammar allows. A literal in any base is a value, never a bit pattern. The literal gets its type at the literal: the expected type at that point, or `Int` when there is none. When the literal is checked against a type variable that nothing has solved yet, that variable becomes `Int`. The value must be in the range of the literal's type (*Type table* above). If it is not, the compiler gives `error[IntLiteralOutOfRange]` (E0318) at the literal. E0318 is the same for every integer type, and no `@allow` or `[lints]` setting turns it off.
+
+- **No expected type.** The message says that the literal has the default type `Int`. When the value fits in `U64`, a `help:` offers an annotation, such as `let x: U64 = ...`. When the value is above the `U64` maximum (2^64-1), the message says that no integer type holds the value, and there is no `help:`.
+- **Negative literals.** One unary `-` directly before an integer literal, with optional parentheses, makes one *negative literal*. Its value is the negated value of the literal. The check reads the expression as written, as W0704 and W0706 do (§3.6):
+  ```
+  N ::= "-" L | "(" N ")"
+  L ::= INT_LIT | "(" L ")"
+  ```
+  `-128`, `(-128)` and `-(128)` match. `-(-5)`, `-(1 + 2)` and `-x` do not match: each is a call to `Neg` (§3.6). Under a signed type, the range check uses the negative value, so `let b: I8 = -128` is valid, and `-9223372036854775808` is the `Int` minimum. Under an unsigned type, every negative literal is E0318, whatever its value, `-0` included. The error has the note `unsigned types hold no negative values`. `-x` on an unsigned value keeps the `Neg` error.
+- **Operator operands.** For `+ - * / % & | ^ == != < <= > >=`, a literal operand (a negative literal included) takes the integer type of the other operand, on either side. When an expected integer type `T` reaches one of `+ - * / % & | ^`, whose type is `T`×`T`→`T`, both operands are checked against `T`. A comparison gives `Bool`, so an expected type does not reach its operands. When both operands are literals and no type reaches them, both are `Int`. The right operand of `<<` and `>>` is `U32`, and the left operand gets the expected type, if there is one. This list is the only statement of operator positions for a literal; other sections refer to it.
+- **Patterns.** A literal pattern and a literal bound of a range pattern take the type of the scrutinee and follow the same rule. A negative bound under an unsigned scrutinee is E0318.
+- **Const contexts.** A literal out of range in a const context (§2.21) is E0318, not `ConstEvalPanic` (E0546), because nothing is evaluated. E0546 is for evaluation that would panic, such as overflow in an operation.
+
+```blink
+fn is_sign_negative_bits(x: Float) -> Bool {
+    (x.to_bits() & 9223372036854775808) != 0   // OK: both literals are U64
+}
+
+fn main() {
+    let mask: U64 = 9223372036854775808     // OK: 2^63 fits in U64
+    let top: U64 = 1 << 63                  // OK: 1 is U64, 63 is U32
+    let sum: U64 = 1 + 2                    // OK: both literals are U64
+    let low = -9223372036854775808          // OK: the Int minimum, one negative literal
+    let b: I8 = -(128)                      // OK: the same literal as -128
+
+    let big = 9223372036854775808           // error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type
+                                            //   help: let big: U64 = 9223372036854775808
+    let huge: U64 = 18446744073709551616    // error[IntLiteralOutOfRange]: no integer type holds 18446744073709551616
+    let n: U64 = -1                         // error[IntLiteralOutOfRange]: -1 does not fit in U64
+                                            //   note: unsigned types hold no negative values
+    let z: U8 = -0                          // error[IntLiteralOutOfRange]: -0 is a negative literal
+                                            //   note: unsigned types hold no negative values
+
+    let mut xs = List.new()
+    xs.push(9223372036854775808)            // error[IntLiteralOutOfRange]: the element type is not known here, so the literal is Int
+                                            //   help: let mut xs: List[U64] = List.new()
+
+    match mask {
+        18446744073709551615 => io.println("max")   // OK: the pattern is U64
+        _ => io.println("other")
+    }
+}
+```
+
+A literal does not wait for a later line to fix its type, as Rust's `{integer}` does. Its type is known at the literal, so it never leaves a type variable that would need a default (§3.4 *Under-Determined Types*).
 
 The compiler performs range checking on all constant expressions assigned to sized types. This catches errors at compile time rather than runtime. Non-constant expressions are checked at runtime via the overflow machinery described above.
 
@@ -1556,11 +1602,11 @@ apply(transfer)  // works — labels are erased at the type level
 
 Direct call sites enforce labels (the compiler errors if you call `transfer` without `from:` and `to:`). But when a function is passed as a value, labels are erased. This keeps the type system simple — 99% of same-typed-param bugs occur at direct call sites, where labels are enforced.
 
-**Numeric literals.** Unadorned integer literals default to `Int`. Unadorned float literals default to `Float`. If context demands a specific size (e.g., assigning to a `U8` field), the literal is checked against the target type's range at compile time:
+**Numeric literals.** Unadorned integer literals default to `Int`. Unadorned float literals default to `Float`. If context demands a specific size (e.g., assigning to a `U8` field), the literal is checked against the target type's range at compile time (§3.2 *Integer literal range*):
 
 ```blink
 let port: U16 = 8080        // OK: 8080 fits in U16
-let bad: U8 = 300           // COMPILE ERROR: 300 exceeds U8 range (0..255)
+let bad: U8 = 300           // error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)
 ```
 
 #### Divergence and Body Completeness
