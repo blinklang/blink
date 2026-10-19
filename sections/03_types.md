@@ -3508,8 +3508,8 @@ For IEEE 754 equality, use the method `x.ieee_eq(y)`. It is the IEEE 754 equalit
 let nan = 0.0 / 0.0
 assert(nan == nan)              // total order
 assert(!nan.ieee_eq(nan))       // IEEE: NaN is unequal to itself
-assert(-0.0 == 0.0)
-assert((-0.0).ieee_eq(0.0))     // IEEE: the zeros are equal
+assert(-0.0 == 0.0)             // warning[NegativeZeroComparison]: the zeros are equal
+assert((-0.0).ieee_eq(0.0))     // warning[NegativeZeroComparison]
 assert((-0.0).is_sign_negative()) // the sign of zero
 ```
 
@@ -3546,6 +3546,59 @@ fn main() {
     io.println(z.to_bits().display())        // 9223372036854775808
 }
 ```
+
+#### Negative Zero Comparison
+
+`-0.0` and `0.0` are equal in the total order (*Float Total Ordering*). So in a `Float` comparison, a `-` in front of a zero literal cannot change the result. Code that writes `x == -0.0` usually means a sign test, but the test is also `true` for `0.0`. The compiler gives the warning `NegativeZeroComparison` (W0706) when an operand of a `Float` or `F32` comparison is a *written negative zero*.
+
+- **Written negative zero.** The check reads the operand as written. The operand is one unary `-` over a float literal with the value zero, with optional parentheses:
+  ```
+  N ::= "-" Z | "(" N ")"
+  Z ::= FLOAT_LIT with the value zero | "(" Z ")"
+  ```
+  `-0.0`, `(-0.0)`, `-(0.0)` and `-0e0` match. `-(-0.0)` has two `-` and does not match. A `const` reference or a `let` binding that holds -0.0 does not trigger the warning, and neither do `0.0 * -1.0`, `-x` or `Float.from_bits(...)`. The check does no flow analysis, so it also fires in a branch that never runs.
+- **Comparisons.** The warning fires when an argument is N and the call resolves to the `Float` or `F32` impl of one of these:
+  - `Eq`: `==`, `!=`, `x.eq(y)`, `x.ne(y)`
+  - `Ord`: `<`, `<=`, `>`, `>=`, `x.cmp(y)`
+  - `ieee_eq`, with N as the receiver or the argument
+  - the built-in `assert_eq` and `assert_ne`, when `T` is `Float` or `F32`
+
+  Either operand can be N, also when the other operand is a literal. The check runs in typecheck on the resolved callee, not on the method name, so a method `eq` on another type that takes a `Float` argument does not fire. It fires only where the impl is concretely `Float` or `F32`: a generic body never warns because of one of its instantiations. A call that compares values inside its own body is not a comparison here, so `xs.contains(-0.0)` does not fire. `min` and `max` do not fire either: when the two values are equal, the sign of the result can depend on which one comes back.
+- **Where.** It fires in test blocks and in the body of an `assert_panics` block (§2.20). The `assert_panics` rule of `DivisionByLiteralZero` does not apply here.
+- **Patterns.** No pattern form can write `-0.0` today (*Pattern Grammar*). A change that adds such a pattern form must bring it under W0706 or make it an error.
+
+```blink
+fn classify(x: Float) -> Str {
+    if x == -0.0 { return "negative zero" }   // warning[NegativeZeroComparison]
+    if x <= -0.0 { return "not positive" }    // warning[NegativeZeroComparison]
+    "positive"
+}
+
+fn negate(x: Float) -> Float { -x }
+
+test "negate keeps the sign" {
+    assert_eq(negate(0.0), -0.0)              // warning[NegativeZeroComparison]
+}
+```
+
+```
+warning[NegativeZeroComparison]: `-0.0` compares the same as `0.0`
+ --> src/main.bl:2:13
+  |
+2 |     if x == -0.0 { return "negative zero" }
+  |             ^^^^ this comparison is true for 0.0 and -0.0
+  |
+  = help: to test the sign, use `x.is_sign_negative()`
+  = help: to test for negative zero, use `x == 0.0 && x.is_sign_negative()`
+  = note: to test for zero, write `0.0`; it means the same and does not warn
+```
+
+- **Span and label.** The primary span is the N operand, not the whole comparison. The label for `==`, `ieee_eq` and `assert_eq` is "this comparison is true for 0.0 and -0.0". For `!=` and `assert_ne` it is "this comparison is false for 0.0 and -0.0". For `<`, `<=`, `>`, `>=` and `cmp` it is "this comparison gives the same result for 0.0 and -0.0".
+- **Help.** The `help:` lines name `is_sign_negative()`. For `!=` and `assert_ne`, the negative-zero help is `x != 0.0 || !x.is_sign_negative()`. The help writes the other operand's text in place of `x` when that operand is a *simple path*: a name, or a field access on a simple path (`x`, `p.y`), with no call and no index. For any other operand, the help says to bind it first (`let v = negate(0.0)`, then `v == 0.0 && v.is_sign_negative()`). The help never repeats a call.
+- **No machine-applicable fix.** The compiler cannot tell whether the code means the sign, negative zero, or zero, so `blink fix` changes nothing. An editor can offer the rewrites as code actions that a person selects.
+- **`blink explain W0706`** shows `x == -0.0`, `x.ieee_eq(-0.0)`, `x.is_sign_negative()` and `x.to_bits() == (-0.0).to_bits()` side by side for `x = 0.0` and `x = -0.0`. It says that a `const` or `let` that holds -0.0 is not checked, and that moving `-0.0` into one does not make a sign test correct. It names `xs.contains(-0.0)` as a form the check does not see.
+
+Suppress the warning on a function with `@allow(NegativeZeroComparison)`, or set its level with `W0706 = "off"` or `W0706 = "error"` under `[lints]` (§4.16.8). A function-level `@allow` overrides `[lints]`. A module-scope `let` or `const` has no enclosing function, so only `[lints]` controls W0706 there.
 
 #### Built-in Type Trait Implementations
 
