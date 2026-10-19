@@ -1,0 +1,180 @@
+// An error whose subject is a type that shadows a compiler-known one shows the escape where the
+// error is (sections/07 §10.6 *Diagnostics that involve a shadowing name*): a note with the
+// shadowing declaration's location and the builtin's home, and the W1010 import help. Two
+// different types with one name print as `Name (module)`. Each row runs check and both builds.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_shadow_type_diags.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+// check and both builds fail without an internal or C compiler error, each output holds every
+// one of `wants`, and none holds any of `nots`.
+fn rejects(main: Str, sim: Str, wants: List[Str], nots: List[Str]) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let mut wrong: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { wrong.push("missing {w}") }
+        }
+        for n in nots {
+            if r.out.contains(n) { wrong.push("unwanted {n}") }
+        }
+        let crashed = r.out.contains("internal compiler error") || r.out.contains("error: cc")
+        if r.exit_code == 0 || wrong.len() > 0 || crashed {
+            bad.push("blink {args}: exit {r.exit_code}, {wrong.join(", ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+fn expect_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+let handler_note = "note: `Handler` here is `type Handler` (src/main.bl:1), which shadows the compiler-known `Handler[E]` (blink.core)"
+let option_note = "note: `Option` here is `type Option` (src/main.bl:1), which shadows the compiler-known `Option[T]` (blink.core)"
+let option_help = "help: import blink.core.\{Option as CoreOption}"
+
+test "a type-argument arity error on a shadowing name points to the builtin" {
+    let main = #"type Handler {
+    n: Int
+}
+
+fn with_db(h: Handler[Int]) -> Int { h.n }
+
+fn main() {}
+"#
+    expect_none(rejects(main, "", ["error[TypeArgArity]", handler_note,
+        "help: remove the extra type argument(s); `Handler` takes exactly 0",
+        "help: import blink.core.\{Handler as CoreHandler}"], []))
+}
+
+test "a type mismatch prints both Options with their module and points to the builtin" {
+    let main = #"type Option {
+    label: Str
+}
+
+fn show(o: Option) -> Str { o.label }
+
+fn first(xs: List[Int]) -> Str {
+    let o: Option = xs.get(0)
+    o.label
+}
+
+fn main() {
+    io.println(show(Some(1)))
+}
+"#
+    expect_none(rejects(main, "", [
+        "variable `o`: declared type Option (main) but got Option[Int] (blink.core)",
+        "argument 1 of `show` expects Option (main), got Option[Int] (blink.core)",
+        option_note, option_help], []))
+}
+
+test "a missing method and a missing field on a shadowing type point to the builtin" {
+    let main = #"type Option {
+    label: Str
+}
+
+fn main() {
+    let o = Option { label: "x" }
+    io.println("{o.unwrap()} {o.size}")
+}
+"#
+    expect_none(rejects(main, "", ["error[UnresolvedMethod]", "error[NoSuchField]", option_note, option_help], []))
+}
+
+test "a module that already imports the builtin under another name is told that name" {
+    let main = #"import blink.core.{Option as CoreOption}
+
+type Option {
+    label: Str
+}
+
+fn show(o: Option) -> Str { o.label }
+
+fn main() {
+    let c: CoreOption[Int] = Some(1)
+    io.println(show(c))
+}
+"#
+    let note = "note: `Option` here is `type Option` (src/main.bl:3), which shadows the compiler-known `Option[T]` (blink.core)"
+    expect_none(rejects(main, "", [note, "help: this module names the compiler-known type `CoreOption`"],
+        [option_help]))
+}
+
+test "a shadowing type declared in another module is located there" {
+    let sim = #"pub type Result {
+    score: Int
+}
+"#
+    let main = #"import geo.sim.{Result}
+
+fn total(r: Result) -> Int { r.score }
+
+fn main() {
+    let r: Result = Ok(1)
+    io.println("{total(r)}")
+}
+"#
+    expect_none(rejects(main, sim, [
+        "declared type Result (geo.sim) but got Result[Int, ?] (blink.core)",
+        "note: `Result` here is `type Result` (src/geo/sim.bl:1), which shadows the compiler-known `Result[T, E]` (blink.core)",
+        "help: import blink.core.\{Result as CoreResult}"], []))
+}
+
+test "two declarations with one name print with their modules, and neither shadows a builtin" {
+    let sim = #"pub type Shape {
+    r: Int
+}
+
+pub fn mk() -> Shape { Shape { r: 1 } }
+"#
+    let main = #"import geo.sim
+
+type Shape {
+    r: Int
+}
+
+fn take(s: Shape) -> Int { s.r }
+
+fn main() {
+    let s: Shape = sim.mk()
+    io.println("{take(sim.mk())} {s.r}")
+}
+"#
+    expect_none(rejects(main, sim, [
+        "variable `s`: declared type Shape (main) but got Shape (geo.sim)",
+        "argument 1 of `take` expects Shape (main), got Shape (geo.sim)"],
+        ["shadows the compiler-known"]))
+}
+
+test "a mismatch between types with different names keeps its plain spelling" {
+    let main = #"type Point {
+    x: Int
+}
+
+fn main() {
+    let p: Point = 3
+    io.println("{p.x}")
+}
+"#
+    expect_none(rejects(main, "", ["variable `p`: declared type Point but got Int"],
+        ["(main)", "shadows the compiler-known"]))
+}

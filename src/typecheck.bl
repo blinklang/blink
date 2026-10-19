@@ -2678,7 +2678,7 @@ fn tc_method_call_unanswered(node: Int, method: Str, obj_t: Int, args_sl: Int) -
     if tc_recv_type_is_determined(obj_k, obj_t) != 0 && tc_method_unavailable_on_receiver(obj_k, method) != 0 {
         let tname = type_to_str(obj_t)
         tc_unresolved_method_hard.insert(node, 1)
-        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(obj_k, tname, method))
+        tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(obj_k, tname, method), [obj_t])
         return tc_error_recovery_tid()
     }
     // Nothing claimed this node, so nothing has typed it — an absence. Codegen's backstop is
@@ -7949,7 +7949,8 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
         if li < expected {
             let ptid = ty_param_list.get(pstart + li).unwrap()
             if tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 && types_compatible(ptid, arg_tid) == 0 {
-                tc_error_at("{label} argument {li} expects {type_to_str(ptid)}, got {type_to_str(arg_tid)}{tc_fn_mismatch_suffix(ptid, arg_tid)}", node)
+                let (want_s, got_s) = tc_type_pair_strs(ptid, arg_tid)
+                tc_type_error_naming("{label} argument {li} expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(ptid, arg_tid)}", node, "", [ptid, arg_tid])
             }
         }
         li = li + 1
@@ -7993,7 +7994,10 @@ fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int) ! TypeCheck.Reso
 // already made one for it.
 fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_closure_checked_against(node, want) { return }
-    tc_value_mismatch_at("argument {pos} of `{callee}` expects {type_to_str(want)}, got {type_to_str(got)}{tc_fn_mismatch_suffix(want, got)}", node, node, want)
+    let (want_s, got_s) = tc_type_pair_strs(want, got)
+    let msg = "argument {pos} of `{callee}` expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(want, got)}"
+    if tc_read_line_used_as_str(node, want) { return tc_value_mismatch_at(msg, node, node, want) }
+    tc_type_error_naming(msg, node, "", [want, got])
 }
 
 fn tc_read_line_used_as_str(val: Int, want: Int) -> Bool ! TypeCheck.Resolve {
@@ -8028,7 +8032,7 @@ fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: 
     let recv_help = tc_recv_option_help(val, declared, got)
     if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared) }
     let help = if recv_help != "" { recv_help } else { tc_hidden_variant_help(val, declared) }
-    tc_error_at_code(msg, at, "TypeError", TYPE_ERROR, help)
+    tc_type_error_naming(msg, at, help, [declared, got])
 }
 
 // A value that hides a variant reads as the value even where the hint names the variant's
@@ -8421,14 +8425,104 @@ fn tc_warn_shadowed_type(decl: Int) ! Diag.Report {
     if home == "" || tc_prelude_modules.contains_key(node_module(decl)) { return }
     let mut notes = ["shadows compiler-known type `{spelled}` ({home})"]
     for n in tc_desugaring_forms_note(name, home) { notes.push(n) }
-    let alias = tc_core_type_alias_in(name, node_module(decl))
-    let prefix = if home == "blink.ffi" { "Ffi" } else { "Core" }
-    let help = if alias == "" {
-        "to use the compiler-known type in this module, import it under another name:\nimport {home}.\{{name} as {prefix}{name}\}"
-    } else {
-        "this module names the compiler-known type `{alias}`"
-    }
+    let help = tc_shadowed_type_help(name, home, node_module(decl))
     diag_warn_at_notes("ShadowedPreludeName", SHADOWED_PRELUDE_NAME, "name shadows compiler-known type", decl, help, notes)
+}
+
+// The help that reaches the compiler-known type `name` from `home` in module `in_mod`: the
+// alias the module already imports, or the aliased import that would name it.
+fn tc_shadowed_type_help(name: Str, home: Str, in_mod: Str) -> Str {
+    let alias = tc_core_type_alias_in(name, in_mod)
+    if alias != "" { return "this module names the compiler-known type `{alias}`" }
+    let prefix = if home == "blink.ffi" { "Ffi" } else { "Core" }
+    "to use the compiler-known type in this module, import it under another name:\nimport {home}.\{{name} as {prefix}{name}\}"
+}
+
+// The declaration of `tid` when it is a type outside the prelude that takes a shadowable
+// compiler-known name, else -1.
+fn tc_shadowing_type_decl(tid: Int) -> Int {
+    let d = tc_tid_decl_node(tid)
+    if d < 0 || tc_prelude_modules.contains_key(node_module(d)) { return -1 }
+    if tc_shadowable_type_home(node_name(d)) == "" { return -1 }
+    d
+}
+
+// An error whose subjects are the types `tids`. Each subject that shadows a compiler-known
+// type adds a note with the shadowing declaration's location and the builtin's home, and the
+// W1010 help, so the escape shows where the error is (sections/07 §10.6, Diagnostics that
+// involve a shadowing name, rule 2). The help is for the module being checked, which may
+// import the shadowing type from the module that declares it.
+fn tc_error_naming_types(name: Str, code: Str, msg: Str, at: Int, help: Str, tids: List[Int]) ! Diag.Report {
+    let mut notes: List[Str] = []
+    let mut helps: List[Str] = if help == "" { [] } else { [help] }
+    let mut seen: List[Int] = []
+    for t in tids {
+        let d = tc_shadowing_type_decl(t)
+        if d < 0 || seen.contains(d) { continue }
+        seen.push(d)
+        let tname = node_name(d)
+        let (home, spelled) = tc_shadowable_type(tname)
+        let site = "{diag_normalize_path(diag_file_for_node(d))}:{node_line(d)}"
+        notes.push("`{tname}` here is `type {tname}` ({site}), which shadows the compiler-known `{spelled}` ({home})")
+        helps.push(tc_shadowed_type_help(tname, home, nr_current_module))
+    }
+    if notes.len() == 0 { return diag_error_at(name, code, msg, at, help) }
+    diag_error_at_notes(name, code, msg, at, helps.join("\n"), notes)
+}
+
+// A type mismatch under TYPE_ERROR, counted as tc_error_at counts one, with the notes
+// tc_error_naming_types adds for `tids`.
+fn tc_type_error_naming(msg: Str, at: Int, help: Str, tids: List[Int]) ! TypeCheck.Report, Diag.Report {
+    tc_errors.push(msg)
+    tc_error_naming_types("TypeError", TYPE_ERROR, msg, at, help, tids)
+}
+
+// Two types an error names side by side. When both spell the same name and are different
+// types, each prints as `Name (module)`, so the reader can tell them apart (sections/07 §10.6,
+// Diagnostics that involve a shadowing name, rule 3).
+fn tc_type_pair_strs(a: Int, b: Int) -> (Str, Str) {
+    let sa = type_to_str(a)
+    let sb = type_to_str(b)
+    let head = tc_type_head_name(a)
+    // Box[Int] against Box[Str] is one declaration, and the arguments already tell them apart.
+    if head == "" || head != tc_type_head_name(b) || tc_tid_decl_node(a) == tc_tid_decl_node(b) { return (sa, sb) }
+    (tc_type_with_home(a, sa), tc_type_with_home(b, sb))
+}
+
+// The bare name `tid` is spelled with, without its module or its arguments, or "" for a type
+// no declaration or compiler-known name spells.
+fn tc_type_head_name(tid: Int) -> Str {
+    let d = tc_tid_decl_node(tid)
+    if d >= 0 { return node_name(d) }
+    let k = type_kind(tc_resolve(tid))
+    if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Fn || k == TyKind.Tuple { return "" }
+    if k == TyKind.Unknown || k == TyKind.Typevar { return "" }
+    let s = type_to_str(tid)
+    match s.byte_index_of("[", 0) {
+        Some(i) => s.byte_slice(0, i)
+        None => s
+    }
+}
+
+// `shown` (how type_to_str renders `tid`) with the module that declares it: `main` or the
+// module path for a declaration, and the §10.6 home for a compiler-known type.
+fn tc_type_with_home(tid: Int, shown: Str) -> Str {
+    let d = tc_tid_decl_node(tid)
+    if d < 0 {
+        let home = tc_shadowable_type_home(tc_type_head_name(tid))
+        return if home == "" { shown } else { "{shown} ({home})" }
+    }
+    let args = match shown.byte_index_of("[", 0) {
+        Some(i) => shown.byte_slice(i, shown.byte_len())
+        None => ""
+    }
+    let bare = "{node_name(d)}{args}"
+    if tc_prelude_modules.contains_key(node_module(d)) {
+        let home = tc_shadowable_type_home(node_name(d))
+        let shown_home = if home == "" { "blink.core" } else { home }
+        return "{bare} ({shown_home})"
+    }
+    tc_name_with_module(bare, node_module(d))
 }
 
 // The W1010 note that lists the forms which go on using the compiler-known `name` from `home`
@@ -8651,7 +8745,7 @@ fn tc_check_type_arg_arity(name: Str, core: Str, elems_sl: Int, ann_node: Int) !
     let got = if elems_sl == -1 { 0 } else { sublist_length(elems_sl) }
     if got == want { return }
     let n = strip_module_qualifier(name)
-    diag_error_at("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{n}` takes {want} type argument(s) but {got} were given", ann_node, tc_arity_help(n, want, got))
+    tc_error_naming_types("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{n}` takes {want} type argument(s) but {got} were given", ann_node, tc_arity_help(n, want, got), [lookup_named_type(name)])
 }
 
 // resolve_type_parts' answer where the annotation means the compiler-known type `name`, or -1
@@ -9399,7 +9493,8 @@ fn tc_check_struct_lit_fn_field(stid: Int, f: Int, v: Int, declared: Int) ! Type
     if tc_closure_checked_against(v, declared) { return }
     let detail = tc_fn_mismatch_detail(declared, got)
     if detail == "" { return }
-    tc_error_at("field `{node_name(f)}` of `{type_to_str(stid)}`: declared type {type_to_str(declared)} but got {type_to_str(got)}: {detail}", v)
+    let (declared_s, got_s) = tc_type_pair_strs(declared, got)
+    tc_type_error_naming("field `{node_name(f)}` of `{type_to_str(stid)}`: declared type {declared_s} but got {got_s}: {detail}", v, "", [declared, got])
 }
 
 // A field value inferred under the field's OWN type rather than under the whole literal's.
@@ -24606,7 +24701,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_method_resolvable_on_type(obj_k, tname, method) == 0 {
                 let help = tc_unresolved_method_help(obj_k, tname, method)
                 tc_unresolved_method_hard.insert(node, 1)
-                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, help)
+                tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, help, [obj_t])
                 return tc_error_recovery_tid()
             }
         }
@@ -25113,7 +25208,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // field access falls out of the same declared-shape rule (§9.1.4).
             // Otherwise the field's type is an absence, not an answer.
             if tc_struct_field_provably_absent(obj_t, fname) != 0 {
-                diag_error_at("NoSuchField", NO_SUCH_FIELD, "type {type_to_str(obj_t)} has no field `{fname}`", node, "use a declared field, or add the field to the type")
+                tc_error_naming_types("NoSuchField", NO_SUCH_FIELD, "type {type_to_str(obj_t)} has no field `{fname}`", node, "use a declared field, or add the field to the type", [obj_t])
                 return tc_error_recovery_tid()
             }
             return -1
@@ -25157,7 +25252,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if obj_k != TyKind.Unknown && obj_k != TyKind.Typevar && obj_k != TyKind.Ptr {
             let recv = type_to_str(obj_t)
             let help = if str_to_tuple_index(fname) >= 0 { "a numeric field is a tuple index, and {recv} is not a tuple" } else { "{recv} has no fields; call a method instead" }
-            diag_error_at("NoSuchField", NO_SUCH_FIELD, "type {recv} has no field `{fname}`", node, help)
+            tc_error_naming_types("NoSuchField", NO_SUCH_FIELD, "type {recv} has no field `{fname}`", node, help, [obj_t])
             return tc_error_recovery_tid()
         }
         // Nothing above claimed this node, so nothing has typed it — an absence.
@@ -28525,7 +28620,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         if tc_tid_is_no_info(declared_tid) == 0 && tc_tid_is_no_info(inferred_tid) == 0 {
             if assignment_types_compatible(declared_tid, inferred_tid, val) == 0 {
-                if !tc_closure_checked_against(val, declared_tid) { tc_report_declared_mismatch("variable `{vname}`: declared type {type_to_str(declared_tid)} but got {type_to_str(inferred_tid)}{tc_fn_mismatch_suffix(declared_tid, inferred_tid)}", node, val, declared_tid, inferred_tid) }
+                if !tc_closure_checked_against(val, declared_tid) {
+                    let (declared_s, got_s) = tc_type_pair_strs(declared_tid, inferred_tid)
+                    tc_report_declared_mismatch("variable `{vname}`: declared type {declared_s} but got {got_s}{tc_fn_mismatch_suffix(declared_tid, inferred_tid)}", node, val, declared_tid, inferred_tid)
+                }
             } else {
                 // A declared let type is an expected-type source for the value's
                 // metavars (sections/03_types.md 3.3), not only something to compare
@@ -29818,7 +29916,10 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
         // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
         // ahead of the compare can turn a mismatch into a silent success.
         if assignment_types_compatible(declared, v_tid, l_val) == 0 {
-            if !tc_closure_checked_against(l_val, declared) { tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {type_to_str(declared)} but got {type_to_str(v_tid)}{tc_fn_mismatch_suffix(declared, v_tid)}", l, l_val, declared, v_tid) }
+            if !tc_closure_checked_against(l_val, declared) {
+                let (declared_s, got_s) = tc_type_pair_strs(declared, v_tid)
+                tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {declared_s} but got {got_s}{tc_fn_mismatch_suffix(declared, v_tid)}", l, l_val, declared, v_tid)
+            }
         } else {
             tc_pin_declared_into_value(declared, l_val, v_tid)
         }
@@ -31327,15 +31428,30 @@ fn tc_stamp_assert(order: List[Int], owners: List[Int], mods: List[Str], stood: 
 // A call no arm claimed is a name error once its receiver names a type or a module
 // (section 6.3.3), and 6.3.5 wants it reported before codegen, which would otherwise lay
 // out the value the call never had. A type parameter's methods are decided per instance.
-fn tc_report_unclaimed_calls() ! Diag.Report {
-    for uc in tc_unclaimed_call_nodes() {
+// `order` and `mods` are the stamp walk's nodes and the module each one is in: a report's help
+// is written for the module that holds the call.
+fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
+    let calls = tc_unclaimed_call_nodes()
+    if calls.len() == 0 { return }
+    let mut unclaimed: Map[Int, Int] = Map()
+    for uc in calls { unclaimed.insert(uc, 1) }
+    let mut call_mod: Map[Int, Str] = Map()
+    let mut i = 0
+    while i < order.len() {
+        let n = order.get(i).unwrap()
+        if unclaimed.contains_key(n) { call_mod.insert(n, mods.get(i).unwrap()) }
+        i = i + 1
+    }
+    let saved_module = nr_current_module
+    for uc in calls {
+        nr_current_module = call_mod.get(uc) ?? saved_module
         let obj = node_obj(uc)
         let mname = node_method(uc)
         let recv = tc_lookup_node_tid(obj)
         if tc_unclaimed_receiver_is_named(recv) != 0 {
             let tname = tc_type_str(recv)
-            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{mname}` on type {tname}",
-                uc, tc_unresolved_method_help(type_kind(recv), tname, mname))
+            tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{mname}` on type {tname}",
+                uc, tc_unresolved_method_help(type_kind(recv), tname, mname), [recv])
         } else if node_kind(obj) == NodeKind.Ident {
             let q = node_name(obj)
             if q == "default" {
@@ -31353,6 +31469,7 @@ fn tc_report_unclaimed_calls() ! Diag.Report {
             }
         }
     }
+    nr_current_module = saved_module
 }
 
 // A value receiver's type, determined all the way down. A local shadowing a module name
@@ -31373,7 +31490,7 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let mut mods: List[Str] = List.with_capacity(node_count())
     let mut seen: List[Int] = List.with_capacity(node_count())
     let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
-    tc_report_unclaimed_calls()
+    tc_report_unclaimed_calls(order, mods)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
