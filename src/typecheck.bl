@@ -8,7 +8,7 @@ import parser.{
     ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
-    node_count, node_handlers, node_index, node_int_val, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
+    node_count, node_handlers, node_index, node_int_val, node_is_compiler_known_type_ann, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
     node_left, node_line, node_method, node_methods, node_module, node_name, node_obj,
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
@@ -834,7 +834,8 @@ fn tc_struct_tid_declared_as(bare: Str) -> Int {
 }
 
 // What the bare type name `bare` means inside module `reader`: the module's own declaration,
-// else the one its import list selects, else the bare spelling (the main file's, if any).
+// else the one its import list selects, else a prelude module's, else the bare spelling (the
+// main file's, if any).
 fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
     let mods = match tc_namesake_type_modules.get(bare) {
         Some(v) => v
@@ -849,22 +850,103 @@ fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
         if source_mod == "" { continue }
         if is_selected_import(bare, reader, source_mod) != 0 { return "{source_mod}.{bare}" }
     }
+    // A prelude module's type is in every module's scope (sections/07 §10.6); a namesake
+    // another module declares, the main file's included, is not.
+    for source_mod in mods.split("|") {
+        if tc_prelude_modules.contains_key(source_mod) { return "{source_mod}.{bare}" }
+    }
     bare
 }
 
-// Whether the module under check has a `type` declaration of a compiler-known name in scope,
-// its own or one its imports select. Where it does, the declaration is what the name means
-// and the builtin does not answer (sections/03_types.md, Type Name Resolution). Every site
-// that treats the name as the builtin asks this, so resolution and the checks agree.
-//
-// Only Handler and Template so far. The other shadowable names still wait on the full
-// shadowing policy.
+// The home of a compiler-known type name that a declaration may shadow, as an import path
+// names it, or "" for any other name (sections/07_trust_modules_metadata.md §10.6). This is
+// the one list: is_primitive_type, the shadow check, the alias import and the W1010 help all
+// read it.
+fn tc_shadowable_type_home(name: Str) -> Str {
+    match name {
+        "List" => "blink.core"
+        "Map" => "blink.core"
+        "Set" => "blink.core"
+        "Option" => "blink.core"
+        "Result" => "blink.core"
+        "Ordering" => "blink.core"
+        "Iterator" => "blink.core"
+        "Never" => "blink.core"
+        "Bytes" => "blink.core"
+        "StringBuilder" => "blink.core"
+        "Handle" => "blink.core"
+        "Channel" => "blink.core"
+        "Template" => "blink.core"
+        "Raw" => "blink.core"
+        "TemplateValue" => "blink.core"
+        "ConversionError" => "blink.core"
+        "Range" => "blink.core"
+        "Handler" => "blink.core"
+        "Ptr" => "blink.ffi"
+        "Buf" => "blink.ffi"
+        _ => ""
+    }
+}
+
+// Whether a declaration may take `name` only by shadowing the compiler-known type.
+pub fn tc_is_shadowable_type_name(name: Str) -> Bool {
+    tc_shadowable_type_home(name) != ""
+}
+
+// The compiler-known type names no declaration may take: literals and `self` produce them in
+// every module, so a shadow could not be escaped (sections/07 §10.6).
+fn tc_type_name_is_reserved(name: Str) -> Bool {
+    match name {
+        "Self" => true
+        "Int" => true
+        "I8" => true
+        "I16" => true
+        "I32" => true
+        "I64" => true
+        "U8" => true
+        "U16" => true
+        "U32" => true
+        "U64" => true
+        "Float" => true
+        "F32" => true
+        "F64" => true
+        "Str" => true
+        "Char" => true
+        "Bool" => true
+        "Void" => true
+        _ => false
+    }
+}
+
+// `FfiScope` is not a name (§10.6), so a declaration takes it like any other. Written with
+// none in scope, it is the scope type misplaced, which FfiScopeNotWithResource explains.
+fn tc_is_undeclared_ffi_scope(name: Str) -> Bool {
+    name == "FfiScope" && tc_type_declared_in_scope(name) == 0
+}
+
+// Whether the module under check has a `type` declaration of a shadowable compiler-known name
+// in scope, its own or one its imports select. Where it does, the declaration is what the name
+// means and the builtin does not answer (sections/03_types.md, Type Name Resolution). Every
+// site that treats the name as the builtin asks this, so resolution and the checks agree.
+// A prelude module's declaration of the name (Ordering, ConversionError) is the builtin itself.
 fn tc_declaration_shadows_builtin(name: Str) -> Int {
-    if name != "Handler" && name != "Template" { return 0 }
+    if tc_shadowable_type_home(name) == "" { return 0 }
+    tc_type_declared_in_scope(name)
+}
+
+// Whether a `type` declaration of `name` outside the prelude is in scope in the module under
+// check, its own or one its imports select.
+fn tc_type_declared_in_scope(name: Str) -> Int {
     let cur = nr_current_module
+    if tc_prelude_modules.contains_key(cur) { return 0 }
     match tc_namesake_type_modules.get(name) {
         Some(mods) => {
-            if tc_nominal_type_name_in(name, cur) != name { return 1 }
+            let meant = tc_nominal_type_name_in(name, cur)
+            if meant != name {
+                let td = tc_type_decl_nodes.get(meant) ?? -1
+                if td != -1 && tc_prelude_modules.contains_key(node_module(td)) { return 0 }
+                return 1
+            }
             if tc_module_key_is_main(cur) == 0 { return 0 }
             if mods.contains("|__main__|") != 0 || mods.contains("||") != 0 { 1 } else { 0 }
         }
@@ -872,6 +954,7 @@ fn tc_declaration_shadows_builtin(name: Str) -> Int {
             let td = tc_type_decl_nodes.get(name) ?? -1
             if td == -1 { return 0 }
             let m = node_module(td)
+            if tc_prelude_modules.contains_key(m) { return 0 }
             if tc_module_key_is_main(m) != 0 { return tc_module_key_is_main(cur) }
             if m == cur { return 1 }
             if is_filtered_for_module(name, m, cur) == 0 { 1 } else { 0 }
@@ -879,13 +962,65 @@ fn tc_declaration_shadows_builtin(name: Str) -> Int {
     }
 }
 
+// The compiler-known type an annotation means, or "" when it means a declaration. A
+// parser-built annotation (`T?`, `fn(A) -> B`, `(A, B)`, `handler[E]`) and a name imported
+// from the type's home under another name (`import blink.core.{Option as CoreOption}`) mean
+// the builtin whatever the module declares; a written shadowable name means it only where no
+// declaration takes the name. `ann_node` is -1 where no annotation node exists.
+fn tc_compiler_known_type_meant(name: Str, ann_node: Int) -> Str {
+    if ann_node != -1 && node_is_compiler_known_type_ann(ann_node) { return name }
+    let core = tc_core_type_alias_target(name, nr_current_module)
+    if core != "" { return core }
+    if tc_shadowable_type_home(name) == "" {
+        if tc_type_name_is_reserved(name) || name == "Fn" || name == "Tuple" { return name }
+        return if tc_is_undeclared_ffi_scope(name) { name } else { "" }
+    }
+    if tc_declaration_shadows_builtin(name) != 0 { "" } else { name }
+}
+
 // The type an impl header names, resolved in the impl's own module.
 fn tc_impl_target_name(im: Int) -> Str {
-    tc_nominal_type_name_in(node_name(im), node_module(im))
+    let written = node_name(im)
+    let spelled = tc_impl_recv_spelling(im)
+    if spelled != written { return spelled }
+    tc_nominal_type_name_in(written, node_module(im))
+}
+
+// The type name an impl header writes, with a name imported from a compiler-known type's home
+// under another name read as that type: `impl Tally for CoreList[T]` extends List.
+pub fn tc_impl_recv_spelling(im: Int) -> Str {
+    let written = node_name(im)
+    let core = tc_core_type_alias_target(written, tc_body_module(im))
+    if core != "" { core } else { written }
+}
+
+// The declaration an impl header names, read in the impl's own module, or -1 when it names a
+// compiler-known type: a main-file `type Bytes` is not what `impl Sized for Bytes` in
+// lib/std extends.
+pub fn tc_impl_owner_decl(im: Int) -> Int {
+    let name = node_name(im)
+    if name == "" { return -1 }
+    let saved = tc_enter_body_module(im)
+    let meant = tc_compiler_known_type_meant(name, -1)
+    let tid = if meant != "" { -1 } else { lookup_named_type(name) }
+    tc_leave_body_module(saved)
+    if meant != "" { return tc_prelude_type_decl(meant) }
+    if tid < 0 { return -1 }
+    tc_tid_decl_node(tid)
+}
+
+// The declaration a prelude module gives the compiler-known `name` (ConversionError,
+// Ordering), or -1 for one no module declares (List, Bytes).
+fn tc_prelude_type_decl(name: Str) -> Int {
+    for m in tc_prelude_modules.keys() {
+        let td = tc_type_decl_nodes.get(tc_nominal_type_name_in(name, m)) ?? -1
+        if td != -1 && tc_prelude_modules.contains_key(node_module(td)) { return td }
+    }
+    -1
 }
 
 // The tid a declaration node registered.
-fn tc_decl_tid(td: Int) -> Int {
+pub fn tc_decl_tid(td: Int) -> Int {
     named_type_map.get(tc_nominal_type_name(td)) ?? -1
 }
 
@@ -3586,12 +3721,13 @@ fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     if name == "U32" { return TYPE_U32 }
     if name == "U64" { return TYPE_U64 }
     if name == "Char" { return TYPE_CHAR }
-    if name == "Never" { return TYPE_NEVER }
+    // A declaration that takes a shadowable name answers below, through lookup_named_type.
+    if name == "Never" && tc_declaration_shadows_builtin(name) == 0 { return TYPE_NEVER }
     // A builtin with no Blink declaration anywhere: `StringBuilder` names codegen's
     // StringBuilder C type / `blink_sb*` and is listed by is_primitive_type, but lib/std/sb.bl
     // only declares FUNCTIONS over it. Without this arm every `sb: StringBuilder` param
     // and `-> StringBuilder` return resolved to -1 and inference fell back to Unknown.
-    if name == "StringBuilder" { return type_stringbuilder() }
+    if name == "StringBuilder" && tc_declaration_shadows_builtin(name) == 0 { return type_stringbuilder() }
     lookup_named_type(name)
 }
 
@@ -8393,10 +8529,26 @@ fn tc_pop_tparam_scope(tparams_sl: Int) {
 }
 
 fn tc_ctor_arity(name: Str) -> Int {
+    tc_ctor_arity_meaning(name, tc_compiler_known_type_meant(strip_module_qualifier(name), -1))
+}
+
+// The arity of `name` where it means the compiler-known type `core`, or a declaration when
+// `core` is "".
+fn tc_ctor_arity_meaning(name: Str, core: Str) -> Int {
     let n = strip_module_qualifier(name)
     // A type parameter in scope is a type variable, not a constructor: a bare
     // reference to it is well-formed and carries no arity to check (§3.4:1259).
     if (tc_active_tparams.get(n) ?? 0) > 0 { return -1 }
+    if core != "" { return tc_builtin_ctor_arity(core) }
+    let decl = tc_type_decl_nodes.get(tc_written_type_nominal(n)) ?? -1
+    if decl == -1 { return -1 }
+    let tps = node_type_params(decl)
+    if tps == -1 { return 0 }
+    sublist_length(tps)
+}
+
+// The arity of a compiler-known type constructor, or -1 for any other name.
+fn tc_builtin_ctor_arity(n: Str) -> Int {
     if n == "List" || n == "Option" || n == "Set" || n == "Channel" || n == "Handle" || n == "Iterator" {
         return 1
     }
@@ -8415,17 +8567,13 @@ fn tc_ctor_arity(name: Str) -> Int {
     if n == "Int" || n == "Float" || n == "F32" || n == "F64" || n == "Bool" || n == "Str" {
         return 0
     }
-    if n == "Void" || n == "Never" || n == "Bytes" || n == "Instant" || n == "Duration" || n == "Char" || n == "StringBuilder" {
+    if n == "Void" || n == "Never" || n == "Bytes" || n == "Char" || n == "StringBuilder" {
         return 0
     }
     if n == "U8" || n == "U16" || n == "U32" || n == "U64" || n == "I8" || n == "I16" || n == "I32" || n == "I64" {
         return 0
     }
-    let decl = tc_type_decl_nodes.get(tc_written_type_nominal(n)) ?? -1
-    if decl == -1 { return -1 }
-    let tps = node_type_params(decl)
-    if tps == -1 { return 0 }
-    sublist_length(tps)
+    -1
 }
 
 // The case-specific repair, whose first `help:` line is normative
@@ -8452,8 +8600,8 @@ fn tc_arity_help(n: Str, want: Int, got: Int) -> Str {
 // applied to exactly its declared arity. Under-application — of which a bare
 // name (0 args) is the extreme — and over-application are one failure. Decided
 // here at name resolution, from the declaration alone, before inference runs.
-fn tc_check_type_arg_arity(name: Str, elems_sl: Int, ann_node: Int) ! Diag.Report {
-    let want = tc_ctor_arity(name)
+fn tc_check_type_arg_arity(name: Str, core: Str, elems_sl: Int, ann_node: Int) ! Diag.Report {
+    let want = tc_ctor_arity_meaning(name, core)
     if want == -1 { return }
     let got = if elems_sl == -1 { 0 } else { sublist_length(elems_sl) }
     if got == want { return }
@@ -8461,20 +8609,9 @@ fn tc_check_type_arg_arity(name: Str, elems_sl: Int, ann_node: Int) ! Diag.Repor
     diag_error_at("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{n}` takes {want} type argument(s) but {got} were given", ann_node, tc_arity_help(n, want, got))
 }
 
-fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    // Arity is a property of a WRITTEN type position, so it keys on ann_node
-    // alone — not on tc_suppress_ann_validation. That flag only silences
-    // hashability re-reports the live path already emitted; arity has no such
-    // live/producer duplication (and a nested arg reached only through a
-    // suppressed producer would otherwise escape the check — sections/03_types.md
-    // §3.4). Re-resolving the same arg node across producers re-runs the check on
-    // an identical span+message, which diag dedup collapses. The impl-self path
-    // passes ann_node = -1 for the receiver base — skipped here, checked in
-    // validate_trait_impls instead — so it neither double-reports nor emits a
-    // locationless diagnostic.
-    if ann_node != -1 {
-        tc_check_type_arg_arity(name, elems_sl, ann_node)
-    }
+// resolve_type_parts' answer where the annotation means the compiler-known type `name`, or -1
+// when `name` has no arm here and resolves as a declared or primitive name.
+fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     // `Self` is a built-in type ALIAS for the type being implemented (sections/03_types.md
     // §"The `Self` Type"), so inside an impl block it lowers to the receiver's tid — the same
     // answer `self` already gets. Resolved here, at the single lowering site every type
@@ -8619,7 +8756,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // which are not types, so those land on a typevar named for the effect. Either way the
     // context is kept rather than discarded with the whole type. A `type Template` declared
     // in scope takes the name instead, and resolves below like any declared type.
-    if name == "Template" && tc_declaration_shadows_builtin(name) == 0 {
+    if name == "Template" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             return make_template_type(resolve_type_ann(sublist_get(elems_sl, 0)))
         }
@@ -8647,7 +8784,7 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // anyone can write (the parser only builds this node from `handler[...]`), so minting a
     // handler-of-no-effect would invent an identity for a shape that cannot occur, and a typevar
     // is the honest "no information" answer if some path reaches here anyway.
-    if name == "Handler" && tc_declaration_shadows_builtin(name) == 0 {
+    if name == "Handler" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
             let eff = node_name(sublist_get(elems_sl, 0))
             if eff != "" { return make_handler_type(eff) }
@@ -8666,6 +8803,32 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
             }
         }
         return make_fn_type(ret_t, param_types)
+    }
+    if name == "Never" { return TYPE_NEVER }
+    if name == "StringBuilder" { return type_stringbuilder() }
+    -1
+}
+
+fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    // Arity is a property of a WRITTEN type position, so it keys on ann_node
+    // alone — not on tc_suppress_ann_validation. That flag only silences
+    // hashability re-reports the live path already emitted; arity has no such
+    // live/producer duplication (and a nested arg reached only through a
+    // suppressed producer would otherwise escape the check — sections/03_types.md
+    // §3.4). Re-resolving the same arg node across producers re-runs the check on
+    // an identical span+message, which diag dedup collapses. The impl-self path
+    // passes ann_node = -1 for the receiver base — skipped here, checked in
+    // validate_trait_impls instead — so it neither double-reports nor emits a
+    // locationless diagnostic.
+    // The compiler-known type the annotation means, if any, decides both the arity and the
+    // arms below: a declaration that takes a shadowable name answers in their place.
+    let core = tc_compiler_known_type_meant(name, ann_node)
+    if ann_node != -1 {
+        tc_check_type_arg_arity(name, core, elems_sl, ann_node)
+    }
+    if core != "" {
+        let builtin = tc_resolve_compiler_known_type(core, elems_sl, ann_node)
+        if builtin != -1 { return builtin }
     }
 
     // A type parameter is a BINDING occurrence, so inside the declaration that binds it its
@@ -8773,13 +8936,16 @@ fn tc_record_impl_recv_tid(im: Int) ! TypeCheck.Resolve, Diag.Report {
     let name = tc_impl_target_name(im)
     let unbound = impl_binder_declared(binders_sl, written) == 0
     let reserved = if unbound { tc_report_reserved_unbuilt(written, im) } else { 0 }
-    if reserved == 0 && unbound && is_primitive_type(written) == 0 && lookup_named_type(name) == -1 {
+    if reserved == 0 && unbound && is_known_type(written) == 0 && lookup_named_type(name) == -1 {
         diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type `{written}` in receiver of impl `{node_trait_name(im)}`", im, "the receiver must be a declared type, a builtin type, or a name declared in `impl[...]` binders")
     }
     tc_push_tparam_scope(binders_sl)
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
-    let t = tc_impl_recv_structural(resolve_type_parts(name, node_recv_type_args(im), -1), node_recv_type_args(im))
+    // An aliased compiler-known receiver resolves through its alias: the builtin's own
+    // spelling would mean a declaration that takes the name in this module.
+    let resolved = if tc_impl_recv_spelling(im) != written { written } else { name }
+    let t = tc_impl_recv_structural(resolve_type_parts(resolved, node_recv_type_args(im), -1), node_recv_type_args(im))
     tc_suppress_ann_validation = saved_suppress
     tc_pop_tparam_scope(binders_sl)
     tc_impl_recv_tids.insert(im, t)
@@ -10277,8 +10443,8 @@ fn tc_is_container_name(n: Str) -> Int {
 // builds and RUNS, printing `<?>` for the field with a BLINK_COMPILER_BUG marker compiled
 // into the binary — a silent wrong answer instead of a diagnostic.
 fn tc_is_non_debug_pseudo_type(n: Str) -> Int {
-    if n == "Fn" || n == "Tuple" || n == "Void" || n == "Raw" { return 1 }
-    if n == "Handler" && tc_declaration_shadows_builtin(n) == 0 { return 1 }
+    if n == "Fn" || n == "Tuple" || n == "Void" { return 1 }
+    if (n == "Raw" || n == "Handler") && tc_declaration_shadows_builtin(n) == 0 { return 1 }
     0
 }
 
@@ -11068,7 +11234,7 @@ fn tc_ptr_reads_singleton_alloc(obj_node: Int) -> Int {
 fn check_ptr_in_type_ann(ann_node: Int, in_ffi_region: Int) ! Diag.Report {
     if ann_node == -1 { return }
     let name = node_name(ann_node)
-    if name == "Ptr" {
+    if tc_compiler_known_type_meant(name, ann_node) == "Ptr" {
         if in_ffi_region == 0 {
             diag_error_at("PtrOutsideFFI", PTR_OUTSIDE_FFI, "Ptr[T] may appear only in an FFI region: the signature or body of an @ffi or @trusted function", ann_node, "add @ffi or @trusted(audit: \"ID\") to the function")
         }
@@ -11112,7 +11278,7 @@ pub fn tc_ptr_pointee_is_valid(pointee: Int) -> Int {
 }
 
 fn check_ptr_in_type_name(type_name: Str, node: Int, in_ffi_region: Int) ! Diag.Report {
-    if type_name == "Ptr" && in_ffi_region == 0 {
+    if in_ffi_region == 0 && tc_compiler_known_type_meant(type_name, -1) == "Ptr" {
         diag_error_at("PtrOutsideFFI", PTR_OUTSIDE_FFI, "Ptr[T] may appear only in an FFI region: the signature or body of an @ffi or @trusted function", node, "add @ffi or @trusted(audit: \"ID\") to the function")
     }
 }
@@ -11866,7 +12032,7 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
         check_ptr_bearing_struct_in_type_ann(ret_ann, in_ffi_region)
     } else {
         let ret_str = node_return_type(fn_node)
-        if ret_str == "Ptr" && in_ffi_region == 0 {
+        if in_ffi_region == 0 && tc_compiler_known_type_meant(ret_str, -1) == "Ptr" {
             diag_error_at("PtrOutsideFFI", PTR_OUTSIDE_FFI, "Ptr[T] may appear only in an FFI region: the signature or body of an @ffi or @trusted function", fn_node, "add @ffi or @trusted(audit: \"ID\") to the function")
         }
     }
@@ -12036,7 +12202,8 @@ fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.
     }
     // `Template[E]` and `Handler[E]` carry an EFFECT in their argument position. An effect
     // is not in the type namespace, so that position is not read as a type here either.
-    if (name == "Template" || name == "Handler") && tc_declaration_shadows_builtin(name) == 0 { return }
+    let core = tc_compiler_known_type_meant(name, ann)
+    if core == "Template" || core == "Handler" { return }
     let elems = node_elements(ann)
     if elems != -1 {
         let mut i = 0
@@ -12124,7 +12291,7 @@ fn tc_trait_spelling(key: Str) -> Str {
 // A user name as one part of a C symbol. `_` becomes `_1`, so in a symbol `_` before a letter
 // only ever joins two parts, and no name can pass for two. An identifier never starts with a
 // digit, which leaves `_<digit>` free to mark structure: `_0` opens a mono argument, `_2` the
-// module of a shared trait.
+// module of a shared trait, `_3` ends a main-file type that takes a compiler-known name.
 pub fn tc_sym_escape(s: Str) -> Str {
     s.replace("_", "_1")
 }
@@ -12240,11 +12407,29 @@ fn tc_qualified_trait_key(written: Str, consuming_mod: Str) -> Str {
 // name in scope, and the trait it names is in no module a scope check could look in.
 // collect_imports keys the pseudo-module by its path with `_` for `.`.
 fn tc_core_alias_target(written: Str, in_mod: Str) -> Str {
+    tc_compiler_known_import(written, in_mod, false)
+}
+
+// The compiler-known type that `written` names in module `in_mod` through an import from the
+// type's home, such as `import blink.core.{Option as CoreOption}` or
+// `import blink.ffi.{Ptr as RawPtr}`, or "".
+fn tc_core_type_alias_target(written: Str, in_mod: Str) -> Str {
+    tc_compiler_known_import(written, in_mod, true)
+}
+
+// The member a pseudo-module import binds `written` to in `in_mod`, when that member is a
+// compiler-known type (`want_type`) or trait at that home, else "".
+fn tc_compiler_known_import(written: Str, in_mod: Str, want_type: Bool) -> Str {
     if in_mod == "" { return "" }
     match nr_module_import_index(in_mod).get(written) {
         Some(binds) => {
             for b in binds {
-                if b.source_mod == "blink_core" && tc_trait_is_compiler_known(b.member) { return b.member }
+                if want_type {
+                    let home = tc_shadowable_type_home(b.member)
+                    if home != "" && b.source_mod == home.replace(".", "_") { return b.member }
+                } else if b.source_mod == "blink_core" && tc_trait_is_compiler_known(b.member) {
+                    return b.member
+                }
             }
         }
         None => {}
@@ -12851,11 +13036,19 @@ fn check_impl_type_arg_names(args_sl: Int, binders_sl: Int, trait_name: Str, whe
 }
 
 fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
+    let saved_module = nr_current_module
+    validate_trait_impls_in_own_modules(program)
+    nr_current_module = saved_module
+}
+
+// Each impl is checked in its own module, where its type names mean what that module declares.
+fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let impls_sl = node_methods(program)
     if impls_sl == -1 { return }
     let mut ii = 0
     while ii < sublist_length(impls_sl) {
         let im = sublist_get(impls_sl, ii)
+        nr_current_module = node_module(im)
         let trait_name = tc_impl_trait_id(im)
         let impl_type = tc_impl_target_name(im)
         tc_record_impl_recv_tid(im)
@@ -12904,7 +13097,8 @@ fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, D
         // tc_record_impl_recv_tid with annotation validation suppressed, so its arity
         // is checked here rather than in resolve_type_parts.
         tc_push_tparam_scope(binders_sl)
-        let recv_want = tc_ctor_arity(impl_type)
+        // The written name, so an aliased compiler-known receiver takes the builtin's arity.
+        let recv_want = tc_ctor_arity(node_name(im))
         if recv_want != -1 {
             let recv_got = if recv_args_sl == -1 { 0 } else { sublist_length(recv_args_sl) }
             if recv_got != recv_want {
@@ -13637,8 +13831,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if fns_sl != -1 {
         let mut i = 0
         while i < sublist_length(fns_sl) {
+            let saved = tc_enter_body_module(sublist_get(fns_sl, i))
             validate_ffi_fn(sublist_get(fns_sl, i))
             validate_verify_fallback(sublist_get(fns_sl, i))
+            tc_leave_body_module(saved)
             i = i + 1
         }
     }
@@ -13769,7 +13965,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             } else if !in_prelude && (prelude_traits.contains(node_name(tr)) || tc_undeclared_trait_names().contains(node_name(tr))) {
                 tc_warn_shadowed_trait(tr)
             }
+            let saved = tc_enter_body_module(tr)
             register_trait(tr)
+            tc_leave_body_module(saved)
             i = i + 1
         }
     }
@@ -13793,9 +13991,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Register impl method signatures
     let impls_sl = node_methods(program)
     if impls_sl != -1 {
+        // A type name in a method signature means what it means in the impl's own module.
+        let saved_impl_module = nr_current_module
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
+            nr_current_module = node_module(im)
             let impl_type = tc_impl_target_name(im)
             let trait_id = tc_impl_trait_id(im)
             // Register the canonical monomorphized poly impl
@@ -13870,6 +14071,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
             tc_pop_tparam_scope(impl_binders_sl)
             i = i + 1
         }
+        nr_current_module = saved_impl_module
     }
 
     // Validate trait impl contracts
@@ -16645,7 +16847,7 @@ fn tc_no_call_form_repair(name: Str) -> Str {
     }
     let declared = lookup_named_type(name)
     if declared != -1 { return tc_declared_type_call_repair(name, declared) }
-    if is_primitive_type(name) != 0 { return tc_builtin_type_call_repair(name) }
+    if is_primitive_type(name) != 0 || tc_is_undeclared_ffi_scope(name) { return tc_builtin_type_call_repair(name) }
     if is_trait_name(name) != 0 {
         return "`{name}` is a trait, not a type, and has no call form; call one of its methods on a value, or qualified as in `{name}.method(value)`"
     }
@@ -17944,9 +18146,11 @@ fn tc_trait_declares_method(trait_name: Str, method: Str) -> Int {
     0
 }
 
-// FfiScope and Raw are names the language owns even though every position that can write
-// them is an error: the report the writer gets must be the scope rule, not "unknown type".
+// The compiler-known type names of §10.6 that no declaration in scope has taken. Every name
+// here must be in that table. An undeclared `FfiScope` is known through
+// tc_is_undeclared_ffi_scope instead, as it is not a name.
 fn is_primitive_type(name: Str) -> Int {
+    if tc_declaration_shadows_builtin(name) != 0 { return 0 }
     match name.byte_len() {
         2 => match name {
             "U8" => 1
@@ -17994,15 +18198,12 @@ fn is_primitive_type(name: Str) -> Int {
         }
         7 => match name {
             "Channel" => 1
-            "Instant" => 1
-            "Handler" => 1 - tc_declaration_shadows_builtin(name)
+            "Handler" => 1
             _ => 0
         }
         8 => match name {
             "Iterator" => 1
-            "Duration" => 1
-            "Template" => 1 - tc_declaration_shadows_builtin(name)
-            "FfiScope" => 1
+            "Template" => 1
             _ => 0
         }
         13 => match name {
@@ -18014,7 +18215,8 @@ fn is_primitive_type(name: Str) -> Int {
 }
 
 fn is_known_type(name: Str) -> Int {
-    if is_primitive_type(name) != 0 { return 1 }
+    if is_primitive_type(name) != 0 || tc_is_undeclared_ffi_scope(name) { return 1 }
+    if tc_core_type_alias_target(name, nr_current_module) != "" { return 1 }
     if lookup_named_type(name) != -1 { return 1 }
     0
 }
@@ -19095,7 +19297,8 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
     if ann_node == -1 { return }
     let name = node_name(ann_node)
     nr_check_type_ref(name, ann_node)
-    if (name == "Handler" || name == "Template") && tc_declaration_shadows_builtin(name) == 0 {
+    let core = tc_compiler_known_type_meant(name, ann_node)
+    if core == "Handler" || core == "Template" {
         let elems_sl = node_elements(ann_node)
         if elems_sl != -1 {
             let mut i = 0
@@ -19171,6 +19374,11 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
             }
         }
         None => {}
+    }
+    // An import from blink.core or blink.ffi names the compiler-known type under the alias.
+    if tc_core_type_alias_target(name, nr_current_module) != "" {
+        tc_mark_symbol_used(name)
+        return
     }
     if is_known_type(name) != 0 {
         if nr_check_selective_access(name, at) != 0 { return }

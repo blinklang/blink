@@ -108,8 +108,9 @@ for o in "$root"/build/corpus/native/*.o; do
     [ -f "$o" ] || continue
     cp -pl "$o" "$work/.tmp/" 2>/dev/null || cp -p "$o" "$work/.tmp/"
 done
-# bootstrap/ is for tests that drive cc over the runtime headers directly.
-for d in tests src lib bootstrap blink.toml; do
+# bootstrap/ is for tests that drive cc over the runtime headers directly, and
+# sections/ for tests that hold a compiler table to the spec's.
+for d in tests src lib bootstrap sections blink.toml; do
     [ -e "$root/$d" ] && ln -s "$root/$d" "$work/$d"
 done
 # src/cli.bl embeds ../build/gc_unity.c; corpus.sh generates it once.

@@ -1,0 +1,128 @@
+// A main-file type that takes a compiler-known name (sections/07 §10.6) is its own type in C
+// too: neither its typedef nor a mono instance over it may spell the builtin's C name, so one
+// program can hold both. Every row runs check and both builds.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_builtin_name_c.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    write_file("{dir}/src/geo/sim.bl", sim)
+    dir
+}
+
+fn runs(main: Str, sim: Str, want: Str) {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check src/main.bl < /dev/null 2>&1")
+    if c.exit_code != 0 { bad.push("blink check: exit {c.exit_code}\n{c.out}") }
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            bad.push("blink {args}: exit {r.exit_code}, want `{want}`\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+test "a declared Raw and a builtin Raw[Str] both instantiate one generic fn" {
+    let sim = #"type Ctx {}
+
+pub fn id[T](x: T) -> T { x }
+
+fn show(t: Template[Ctx]) -> Str {
+    let parts = t.parts()
+    "{parts.len()}|{parts.get(0) ?? "?"}"
+}
+
+@trusted(audit: "RAW-001")
+pub fn folded() -> Str { show("SELECT * FROM {id(Raw("t"))}") }
+"#
+    let main = #"import geo.sim
+
+type Raw {
+    v: Int
+}
+
+fn main() {
+    io.println("{sim.id(Raw { v: 3 }).v} {sim.folded()}")
+}
+"#
+    runs(main, sim, "3 1|SELECT * FROM t")
+}
+
+test "a declared Bytes and the builtin Bytes both instantiate one generic fn" {
+    let sim = #"pub fn id[T](x: T) -> T { x }
+
+pub fn byte_count() -> Int { id(Bytes.from_str("abc")).len() }
+"#
+    let main = #"import geo.sim
+
+type Bytes {
+    v: Int
+}
+
+fn main() {
+    io.println("{sim.id(Bytes { v: 4 }).v} {sim.byte_count()}")
+}
+"#
+    runs(main, sim, "4 3")
+}
+
+test "a declared ConversionError and the prelude's both reach C, and the prelude's shows" {
+    let sim = #"pub fn bad() -> Str {
+    match I8.try_from(300) {
+        Ok(_) => "ok"
+        Err(e) => "{e}"
+    }
+}
+
+pub fn order() -> Str {
+    match 1.cmp(2) {
+        Less => "Less"
+        Equal => "Equal"
+        Greater => "Greater"
+    }
+}
+"#
+    let main = #"import geo.sim
+
+type ConversionError {
+    v: Int
+}
+
+fn main() {
+    let c = ConversionError { v: 5 }
+    io.println("{c.v} {sim.bad()} {sim.order()}")
+}
+"#
+    runs(main, sim, "5 Int -> I8: value out of I8 range Less")
+}
+
+test "a main-file namesake of a runtime-owned std type reaches C" {
+    let sim = #"import std.process.{ProcessResult}
+
+pub fn code() -> Int { process_run("true", []).exit_code }
+"#
+    let main = #"import geo.sim
+
+type ProcessResult {
+    v: Int
+}
+
+fn main() {
+    let p = ProcessResult { v: 6 }
+    io.println("{p.v} {sim.code()}")
+}
+"#
+    runs(main, sim, "6 0")
+}

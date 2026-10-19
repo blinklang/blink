@@ -1,0 +1,215 @@
+// A type name denotes one declaration identity (sections/03_types.md §3.4 *Type Name
+// Resolution*). A module that declares a shadowable compiler-known name (sections/07 §10.6
+// *Compiler-Known Type Names*) means its own declaration wherever it writes that name, and
+// only a `[T]` binder makes a type variable. Every row runs check and build, one unit and per
+// module, so the two paths cannot disagree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_declared_type_wins.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+fn blink(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// check passes, and both builds run and print `want` last. Returns the failures, so a row
+// that loops over names reports every name that fails.
+fn runs(main: Str, sim: Str, want: Str) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    let c = blink(dir, "check")
+    if c.exit_code != 0 { bad.push("blink check: exit {c.exit_code}\n{c.out}") }
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = blink(dir, args)
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            bad.push("blink {args}: exit {r.exit_code}, want `{want}`\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+// Each of `wants` is in the output of check and of both builds, none of `nots` is, no build
+// hits an internal compiler error or a C compiler error, and each build fails.
+fn rejects(main: Str, sim: Str, wants: List[Str], nots: List[Str]) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = blink(dir, args)
+        let mut wrong: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { wrong.push("missing {w}") }
+        }
+        for n in nots {
+            if r.out.contains(n) { wrong.push("unwanted {n}") }
+        }
+        let crashed = r.out.contains("internal compiler error") || r.out.contains("error: cc")
+        if r.exit_code == 0 || wrong.len() > 0 || crashed {
+            bad.push("blink {args}: exit {r.exit_code}, {wrong.join(", ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+fn expect_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+// Every name §10.6 marks *shadows*. Each is declared, written as a parameter type, and read.
+let shadowable = ["List", "Map", "Set", "Option", "Result", "Ordering", "Iterator", "Never",
+    "Bytes", "StringBuilder", "Handle", "Channel", "Template", "Raw", "TemplateValue",
+    "ConversionError", "Range", "Handler", "Ptr", "Buf"]
+
+fn declared_struct(name: Str) -> Str {
+    "type {name} \{\n    v: Int\n}\n\nfn get(x: {name}) -> Int \{\n    x.v\n}\n\nfn main() \{\n    io.println(\"got=\{get({name} \{ v: 7 })}\")\n}\n"
+}
+
+test "a declared struct takes each shadowable compiler-known name in its module" {
+    let mut bad: List[Str] = []
+    for name in shadowable {
+        for b in runs(declared_struct(name), "", "got=7") { bad.push("[{name}] {b}") }
+    }
+    expect_none(bad)
+}
+
+test "the spec example: use_it(5) against a declared Handler is a type error, not a cc error" {
+    let main = #"type Handler {
+    n: Int
+}
+
+fn use_it(h: Handler) -> Int { h.n }
+
+fn main() {
+    io.println("{use_it(5)}")
+}
+"#
+    expect_none(rejects(main, "", ["TypeError"], []))
+}
+
+test "a declared Option is the parameter type, so an Option[Int] argument is a type error" {
+    let main = #"type Option {
+    label: Str
+}
+
+fn show(o: Option) -> Str { o.label }
+
+fn main() {
+    let x: Int? = Some(1)
+    io.println(show(x))
+}
+"#
+    expect_none(rejects(main, "", ["TypeError"], []))
+}
+
+test "a declared enum takes a shadowable name, with its variants" {
+    let main = #"type Ordering {
+    Up
+    Down
+}
+
+fn flip(o: Ordering) -> Ordering {
+    match o {
+        Up => Down
+        Down => Up
+    }
+}
+
+fn main() {
+    let d = flip(Up)
+    let s = match d {
+        Up => "up"
+        Down => "down"
+    }
+    io.println(s)
+}
+"#
+    expect_none(runs(main, "", "down"))
+}
+
+test "a declared generic type takes a shadowable name and its arity" {
+    let main = #"type Channel[T] {
+    item: T
+}
+
+fn first(c: Channel[Int]) -> Int { c.item }
+
+fn main() {
+    io.println("{first(Channel { item: 9 })}")
+}
+"#
+    expect_none(runs(main, "", "9"))
+}
+
+test "a type alias takes a shadowable name in its module" {
+    let main = #"type Range = Int
+
+fn next(r: Range) -> Range { r + 1 }
+
+fn main() {
+    io.println("{next(4)}")
+}
+"#
+    expect_none(runs(main, "", "5"))
+}
+
+test "a type another module declares and this module imports takes the name" {
+    let sim = #"pub type Result {
+    score: Int
+}
+"#
+    let main = #"import geo.sim.{Result}
+
+fn total(r: Result) -> Int { r.score }
+
+fn main() {
+    io.println("{total(Result { score: 3 })}")
+}
+"#
+    expect_none(runs(main, sim, "3"))
+}
+
+test "a module that does not import a namesake still has the compiler-known type" {
+    let sim = #"pub type Option {
+    label: Str
+}
+
+pub fn make() -> Option { Option { label: "sim" } }
+"#
+    let main = #"import geo.sim
+
+fn first(xs: List[Int]) -> Option[Int] { xs.get(0) }
+
+fn main() {
+    io.println("{first([6]) ?? 0} {sim.make().label}")
+}
+"#
+    expect_none(runs(main, sim, "6 sim"))
+}
+
+test "a name with no declaration and no binder is an unknown type, never a type variable" {
+    let main = #"fn id(x: Shape) -> Shape { x }
+
+fn main() {
+    io.println("{id(5)}")
+}
+"#
+    expect_none(rejects(main, "", ["UnknownType"], []))
+}
+
+test "FfiScope is not a name, so a declaration takes it" {
+    expect_none(runs(declared_struct("FfiScope"), "", "got=7"))
+}
