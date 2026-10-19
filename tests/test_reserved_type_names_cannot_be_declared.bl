@@ -1,0 +1,91 @@
+// A reserved type name cannot be declared (sections/07 §10.6 *Shadowing Rules*): `Self`, the
+// scalar types literal syntax produces, and `Void`. Every declaration that puts a name in the
+// type namespace is covered (`type` struct or enum, type alias, `trait`, `effect`), and the
+// error is E0524 alone, with the spec's text, from check and from both builds.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_reserved_type_names.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+// Each of `wants` is in the output of check and of both builds, which all fail with E0524 as
+// the only error.
+fn rejects(main: Str, sim: Str, wants: List[Str]) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let mut wrong: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { wrong.push("missing {w}") }
+        }
+        if !r.out.contains("1 error(s) found") { wrong.push("not exactly one error") }
+        if r.exit_code == 0 || wrong.len() > 0 {
+            bad.push("blink {args}: exit {r.exit_code}, {wrong.join(", ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+fn expect_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+let reserved = ["Self", "Int", "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "Float",
+    "F32", "F64", "Str", "Char", "Bool", "Void"]
+
+test "a struct cannot take any reserved name" {
+    let mut bad: List[Str] = []
+    for name in reserved {
+        let main = "type {name} \{\n    v: Int\n}\n\nfn main() \{}\n"
+        for b in rejects(main, "", ["error[ReservedTypeName]", "`{name}` is a reserved type name"]) {
+            bad.push("[{name}] {b}")
+        }
+    }
+    expect_none(bad)
+}
+
+test "the error names the reason and a name to use instead" {
+    let main = "type Int \{\n    v: Int\n}\n\nfn main() \{}\n"
+    expect_none(rejects(main, "", ["error[ReservedTypeName]: `Int` is a reserved type name",
+        "literals produce this type in every module",
+        "choose another name, for example `type IntValue`"]))
+}
+
+test "an enum, an alias, a trait and an effect cannot take a reserved name" {
+    let mut bad: List[Str] = []
+    let forms = [
+        "type Str \{\n    A\n    B\n}\n",
+        "type Bool = Int\n",
+        "trait Char \{\n    fn c(self) -> Int\n}\n",
+        "effect Float \{\n    effect Get \{\n        fn f() -> Int\n    }\n}\n",
+    ]
+    for form in forms {
+        for b in rejects("{form}\nfn main() \{}\n", "", ["error[ReservedTypeName]"]) { bad.push(b) }
+    }
+    expect_none(bad)
+}
+
+test "a reserved name declared in another module is rejected there" {
+    let sim = "pub type U8 \{\n    v: Int\n}\n"
+    let main = "import geo.sim\n\nfn main() \{\n    let x: U8 = 3\n    io.println(\"\{x}\")\n}\n"
+    expect_none(rejects(main, sim, ["error[ReservedTypeName]", "geo/sim.bl"]))
+}
+
+test "the builtin keeps the name, so uses of it raise nothing more" {
+    let main = "type Int \{\n    v: Int\n}\n\nfn twice(x: Int) -> Int \{ x * 2 }\n\nfn main() \{\n    io.println(\"\{twice(4)}\")\n}\n"
+    expect_none(rejects(main, "", ["error[ReservedTypeName]"]))
+}

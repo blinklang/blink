@@ -972,7 +972,7 @@ fn tc_compiler_known_type_meant(name: Str, ann_node: Int) -> Str {
     let core = tc_core_type_alias_target(name, nr_current_module)
     if core != "" { return core }
     if tc_shadowable_type_home(name) == "" {
-        if tc_type_name_is_reserved(name) || name == "Fn" || name == "Tuple" { return name }
+        if tc_type_name_is_undeclarable(name) { return name }
         return if tc_is_undeclared_ffi_scope(name) { name } else { "" }
     }
     if tc_declaration_shadows_builtin(name) != 0 { "" } else { name }
@@ -10239,28 +10239,31 @@ pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
     0
 }
 
-// Names the compiler reserves for internal AST head-sentinels: the parser
-// overloads these head names to tag tuple / function / self-type annotations
-// (parser.bl), and resolve_type_ann + resolve_tuple_ann key on the raw string.
-// A user `type X` with one of these names would shadow the sentinel and
-// mis-decode any annotation that mentions it (e.g. `type Tuple[X]` makes
-// `(Int, Tuple[Int])` decode as a forbidden 1-arity tuple). Unlike other
-// prelude names (shadowable with a warning), these three are un-shadowable
-// because the collision has no disambiguation path — reject at the decl site.
-fn is_reserved_type_sentinel(name: Str) -> Int {
-    if name == "Tuple" || name == "Fn" || name == "Self" { return 1 }
-    0
+// Whether no declaration may take `name`: the §10.6 reserved names, plus Fn and Tuple, which
+// the parser still writes as the head of a function or tuple annotation, so a declaration
+// that took one would change what those annotations mean.
+fn tc_type_name_is_undeclarable(name: Str) -> Bool {
+    tc_type_name_is_reserved(name) || name == "Fn" || name == "Tuple"
 }
 
-fn reject_reserved_type_name(td: Int) ! Diag.Report {
-    let name = node_name(td)
-    if is_reserved_type_sentinel(name) != 0 {
-        diag_error_at("ReservedTypeName", RESERVED_TYPE_NAME, "type name `{name}` is reserved for an internal AST sentinel and cannot be declared as a user type", td, "rename the type")
+// Reports E0524 when `decl` (a `kw` declaration) takes a reserved name. The caller then
+// registers nothing for it, so the builtin keeps the name and no use of it reports again.
+fn tc_reject_reserved_decl_name(decl: Int, kw: Str) -> Bool ! Diag.Report {
+    let name = node_name(decl)
+    if !tc_type_name_is_undeclarable(name) { return false }
+    let reason = match name {
+        "Self" => "reserved: `Self` names the implementing type in every trait and impl"
+        "Void" => "reserved: `Void` is the type of no value in every module"
+        "Fn" => "reserved: the compiler names function types `Fn`"
+        "Tuple" => "reserved: the compiler names tuple types `Tuple`"
+        _ => "reserved: literals produce this type in every module"
     }
+    diag_error_at_notes("ReservedTypeName", RESERVED_TYPE_NAME, "`{name}` is a reserved type name", decl, "choose another name, for example `{kw} {name}Value`", [reason])
+    true
 }
 
 fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
-    reject_reserved_type_name(td)
+    if tc_reject_reserved_decl_name(td, "type") { return }
     tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Struct, name)
@@ -10344,7 +10347,7 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
 }
 
 fn register_enum_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
-    reject_reserved_type_name(td)
+    if tc_reject_reserved_decl_name(td, "type") { return }
     tc_reject_unknown_derives(td)
     let name = tc_nominal_type_name(td)
     let tid = new_type(TyKind.Enum, name)
@@ -13960,6 +13963,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         while i < sublist_length(traits_sl) {
             let tr = sublist_get(traits_sl, i)
             let in_prelude = tc_prelude_modules.contains_key(node_module(tr))
+            if tc_reject_reserved_decl_name(tr, "trait") {
+                i = i + 1
+                continue
+            }
             if is_sealed_builtin_trait(node_name(tr)) != 0 && is_user_sourced(tr) != 0 {
                 diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait `{node_name(tr)}` is a sealed built-in trait and cannot be redefined", tr, "rename your trait, or define your own trait with the methods you need")
             } else if !in_prelude && (prelude_traits.contains(node_name(tr)) || tc_undeclared_trait_names().contains(node_name(tr))) {
@@ -14102,6 +14109,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
         let mut ei = 0
         while ei < sublist_length(effects_decl_sl) {
             let ed = sublist_get(effects_decl_sl, ei)
+            if tc_reject_reserved_decl_name(ed, "effect") {
+                ei = ei + 1
+                continue
+            }
             let eff_name = node_name(ed)
             register_ue_handle(str_to_lower(eff_name), ed)
             register_ue_op_sigs(ed)
