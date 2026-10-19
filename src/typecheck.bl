@@ -5724,32 +5724,63 @@ fn tc_raw_report_unconsumed() ! Diag.Report {
     while i < tc_raw_part_nodes.len() {
         let part = tc_raw_part_nodes.get(i).unwrap()
         if (tc_raw_part_consumed.get(part) ?? 0) == 0 {
-            diag_error_at("RawOutsideTemplate", RAW_OUTSIDE_TEMPLATE,
-                "a `Raw[T]` reached a position that does not consume it — only a `Template[C]` coercion does",
-                part, "drop the wrapper and interpolate the value itself")
+            tc_raw_report_stranded(part, "drop the wrapper and interpolate the value itself")
         }
         i = i + 1
     }
 }
 
 // §3b.5: the folded text is the string itself, so `Raw` wraps only a `Str`. A type still
-// open here is left to the later use that settles it.
+// open here is settled to Str, so a later use that wants another type reports there. A
+// diverging argument never yields a value, so it has no type to reject.
 fn tc_raw_require_str(arg: Int, t: Int) ! Diag.Report {
     let r = tc_resolve(t)
+    if tc_is_unbound_metavar(r) != 0 {
+        tc_unify(r, TYPE_STR)
+        return
+    }
     let k = tc_tid_kind(r)
-    if k == TyKind.Str || k == TyKind.Unknown || tc_is_unbound_metavar(r) != 0 { return }
+    if k == TyKind.Str || k == TyKind.Unknown || k == TyKind.Never { return }
     diag_error_at("TemplateHoleType", TEMPLATE_HOLE_TYPE,
         "`Raw` wraps only a `Str`, found `{type_to_str(r)}`", arg,
         "send it as a parameter instead of wrapping it in `Raw`")
 }
 
-// A print sink shows its argument through Display, which a Raw[Str] has none of. Only a
-// template hole consumes one, so here it is stranded the same as in a plain literal.
-fn tc_raw_reject_display_sink(arg: Int, t: Int) ! Diag.Report {
-    if tc_tid_kind(tc_resolve(t)) != TyKind.Raw { return }
+// True when the type at a template hole was a Raw[Str] that a template folded, so the
+// fold was seen, and audited, here. Codegen folds only these.
+pub fn tc_raw_part_folded(part: Int) -> Bool {
+    (tc_raw_part_consumed.get(part) ?? 0) == 1
+}
+
+fn tc_raw_report_stranded(node: Int, help: Str) ! Diag.Report {
     diag_error_at("RawOutsideTemplate", RAW_OUTSIDE_TEMPLATE,
         "a `Raw[T]` reached a position that does not consume it — only a `Template[C]` coercion does",
-        arg, "drop the wrapper and pass the value itself")
+        node, help)
+}
+
+// A Raw[Str] at any depth of the type. A function type is skipped: a closure that returns
+// a Raw is not shown by printing it.
+fn tc_tid_holds_raw(tid0: Int) -> Bool {
+    let tid = tc_resolve(tid0)
+    let k = tc_tid_kind(tid)
+    if k == TyKind.Raw { return true }
+    if k == TyKind.Fn { return false }
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n {
+        let c = tc_tid_child(tid, i)
+        if c >= 0 && tc_tid_holds_raw(c) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// A print sink shows its argument through Display or Debug, which a Raw[Str] has none of,
+// alone or inside a container. Only a template hole consumes one, so here it is stranded the
+// same as in a plain literal.
+fn tc_raw_reject_display_sink(arg: Int, t: Int) ! Diag.Report {
+    if !tc_tid_holds_raw(t) { return }
+    tc_raw_report_stranded(arg, "drop the wrapper and pass the value itself")
 }
 
 // A call of a free function whose signature is settled: a bare `f(..)` or a module-qualified
@@ -10095,7 +10126,8 @@ fn tc_is_container_name(n: Str) -> Int {
 // can never be made so by adding a derive:
 //   fn(...) -> T  → "Fn" (parser.bl:1437); (A, B) → "Tuple" (parser.bl:1408;
 //   tuples auto-derive Eq/Ord/Hash/Display/Clone but NOT Debug, spec §3.6);
-//   handler[E] → "Handler" (parser.bl:1453). Rejected E0520 like Set/Result
+//   handler[E] → "Handler" (parser.bl:1453); Raw[Str] → "Raw", a marker with no Debug
+//   (§3b.5). Rejected E0520 like Set/Result
 //   else they slip past tc_debug_field_ok and emit BLINK_COMPILER_BUG.
 //
 // "Void" is the one entry that is NOT a parser pseudo-type — it is an ordinary inhabited
@@ -10106,7 +10138,7 @@ fn tc_is_container_name(n: Str) -> Int {
 // builds and RUNS, printing `<?>` for the field with a BLINK_COMPILER_BUG marker compiled
 // into the binary — a silent wrong answer instead of a diagnostic.
 fn tc_is_non_debug_pseudo_type(n: Str) -> Int {
-    if n == "Fn" || n == "Tuple" || n == "Void" { return 1 }
+    if n == "Fn" || n == "Tuple" || n == "Void" || n == "Raw" { return 1 }
     if n == "Handler" && tc_declaration_shadows_builtin(n) == 0 { return 1 }
     0
 }
@@ -21071,6 +21103,8 @@ fn tc_kind_is_plain_eq(k: TyKind) -> Bool {
 // The kinds whose `==` this check decides: the containers, and the nominal types whose
 // `Eq` comes from an impl, a derive, or (for an enum) its payloads.
 fn tc_kind_takes_eq_need(k: TyKind) -> Bool {
+    // A Raw[Str] is a marker with no `Eq` (§3b.5): its one use is a template hole.
+    if k == TyKind.Raw { return true }
     if k == TyKind.Option || k == TyKind.Result || k == TyKind.List || k == TyKind.Set { return true }
     k == TyKind.Map || k == TyKind.Tuple || k == TyKind.Enum || k == TyKind.Struct
 }
@@ -22520,13 +22554,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
                 if fn_name == "Raw" {
                     let args_sl = node_args(node)
-                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        let raw_arg = sublist_get(args_sl, 0)
-                        let raw_inner = infer_type(raw_arg)
-                        tc_raw_require_str(raw_arg, raw_inner)
-                        return make_raw_type(raw_inner)
+                    let raw_count = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
+                    if raw_count != 1 {
+                        tc_error_at_code("`Raw` expects 1 argument, got {raw_count}", node, "TypeError", TYPE_ERROR,
+                            "wrap exactly one `Str`: `Raw(name)`")
+                        return tc_error_recovery_tid()
                     }
-                    return make_raw_type(make_metavar())
+                    let raw_arg = sublist_get(args_sl, 0)
+                    let raw_inner = infer_type(raw_arg)
+                    tc_raw_require_str(raw_arg, raw_inner)
+                    return make_raw_type(TYPE_STR)
                 }
                 // old(e) in an @ensures predicate is e's value at entry, so it has e's type.
                 if fn_name == "old" && tc_in_ensures_predicate != 0 {
@@ -22556,9 +22593,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     // skip arg inference, hiding errors like E0522.
                     let bf_args = node_args(node)
                     if bf_args != -1 {
+                        // An assertion shows its message when it fails, so a Raw there is
+                        // shown as a print sink would show it.
+                        let shows_msg = fn_name == "assert" || fn_name == "debug_assert"
                         let mut bai = 0
                         while bai < sublist_length(bf_args) {
-                            infer_type(sublist_get(bf_args, bai))
+                            let bf_arg = sublist_get(bf_args, bai)
+                            let bf_t = infer_type(bf_arg)
+                            if shows_msg && bai == 1 { tc_raw_reject_display_sink(bf_arg, bf_t) }
                             bai = bai + 1
                         }
                     }

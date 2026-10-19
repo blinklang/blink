@@ -209,3 +209,113 @@ test "Raw of a Raw[Str] is E0534" {
 }
 "#), "`Raw` wraps only a `Str`, found `Raw[Str]`")
 }
+
+// The build may stop, but it must never print the folded text: typecheck never saw a Raw at
+// a type-parameter hole, so nothing audited a fold there.
+fn expect_no_fold(src: Str, folded: Str) {
+    let dir = project(src)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code == 0 || r.out.contains(folded) {
+            io.eprintln("blink {args}: exit {r.exit_code}, must not fold `{folded}`\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+test "a Raw[Str] reaching a type-parameter template hole is never folded unaudited" {
+    expect_no_fold(with_show(#"fn q[T](x: T) -> Str { show("SELECT {x} END") }
+fn main() {
+    io.println(q(Raw("users")))
+}
+"#), "SELECT users END")
+}
+
+test "the values in one template segment run in source order" {
+    expect_runs(with_show(#"fn mk1(s: Str) -> Raw[Str] {
+    io.println("eval {s}")
+    Raw(s)
+}
+fn mk3(s: Str) -> Result[Raw[Str], Str] {
+    io.println("eval {s}")
+    Ok(Raw(s))
+}
+@trusted(audit: "RAW-001")
+fn q() -> Result[Str, Str] {
+    Ok(show("y {mk1("p")} {mk3("q")?}"))
+}
+fn main() {
+    io.println(q().unwrap())
+}
+"#), "eval p\neval q\n1|y p q|0")
+}
+
+test "Raw of a diverging value is accepted" {
+    expect_runs(with_show(#"@trusted(audit: "RAW-001")
+fn later() -> Str {
+    show("SELECT * FROM {Raw(todo())}")
+}
+fn main() {
+    io.println("ok")
+}
+"#), "ok")
+}
+
+test "Raw takes exactly one argument" {
+    expect_rejects(with_show(#"fn main() {
+    io.println(show("SELECT * FROM {Raw("a", "b")}"))
+}
+"#), "argument")
+    expect_rejects(with_show(#"fn main() {
+    io.println(show("SELECT * FROM {Raw()}"))
+}
+"#), "argument")
+}
+
+test "Raw of a value whose type a later use settles to Int is rejected" {
+    expect_rejects(with_show(#"fn main() {
+    let mut l = []
+    let r = Raw(l.get(0).unwrap())
+    l.push(5)
+    io.println(show("SELECT * FROM {r}"))
+}
+"#), "error")
+}
+
+test "assert_eq on two Raw[Str] values is rejected: Raw[Str] has no Eq" {
+    expect_rejects(#"fn main() {
+    assert_eq(Raw("us".concat("ers")), Raw("users"))
+}
+"#, "does not implement `Eq`")
+}
+
+test "a Raw[Str] as an assert message is E0530" {
+    expect_rejects(#"fn main() {
+    let r = Raw("users")
+    assert(true, r)
+}
+"#, "RawOutsideTemplate")
+}
+
+test "a Raw[Str] inside a tuple or an Option given to io.println is E0530" {
+    expect_rejects(#"fn main() {
+    io.println((Raw("a"), 1))
+}
+"#, "RawOutsideTemplate")
+    expect_rejects(#"fn main() {
+    io.println(Some(Raw("a")))
+}
+"#, "RawOutsideTemplate")
+}
+
+test "@derive(Debug) on a type with a Raw[Str] field is rejected" {
+    expect_rejects(#"@derive(Debug)
+type H { r: Raw[Str] }
+fn main() {
+    io.println(H { r: Raw("x") }.debug())
+}
+"#, "DeriveDebugFieldNoDebug")
+}
