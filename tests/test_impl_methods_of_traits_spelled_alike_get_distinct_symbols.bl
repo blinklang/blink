@@ -1,0 +1,82 @@
+// Two impl methods get two C symbols however their module, type and trait names line up with
+// `_`. A trait declared in more than one module, a trait whose name holds `_`, and a module
+// whose name holds `_` once spelled the same symbol as another impl method, so the C compiler
+// refused the program or the linker kept one body for both. The one-unit build and the
+// per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// A package of the given files, each `name=source`.
+fn new_package(files: List[(Str, Str)]) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_trait_symbols.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    for f in files {
+        write_file("{dir}/src/{f.0}.bl", f.1)
+    }
+    dir
+}
+
+fn cleanup(dir: Str) {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str) {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.exit_code == 0 && r.out.trim().ends_with(want)
+        if !good {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+fn trait_tr(name: Str) -> Str {
+    "pub trait {name} \{\n    fn go(self) -> Int\n}\n"
+}
+
+fn impl_go(tr: Str, ty: Str, n: Int) -> Str {
+    "impl {tr} for {ty} \{\n    fn go(_self) -> Int \{\n        {n}\n    }\n}\n"
+}
+
+// A program whose type `Ticker` implements the trait `Tr` it imports from `a`, where `b`
+// declares a `Tr` too, and its own trait `alt`.
+fn ticker_main(a: Str, b: Str, alt: Str) -> Str {
+    let head = "import {a}.\{Tr}\nimport {b}\n{trait_tr(alt)}type Ticker \{\n    n: Int\n}\n"
+    let impls = "{impl_go("Tr", "Ticker", 1)}{impl_go(alt, "Ticker", 2)}"
+    "{head}{impls}fn main() \{\n    let t = Ticker \{ n: 0 }\n    io.println(\"\{Tr.go(t)} \{{alt}.go(t)} \{{b}.k()}\")\n}\n"
+}
+
+fn trait_and_k(name: Str) -> Str {
+    "{trait_tr(name)}pub fn k() -> Int \{ 3 }\n"
+}
+
+test "a trait in two modules and a trait named for one of them" {
+    expect_runs([("a_b", trait_tr("Tr")), ("c", trait_and_k("Tr")), ("main", ticker_main("a_b", "c", "Tr_a_b"))], "1 2 3")
+}
+
+test "a trait in module x and a trait named Tr_x" {
+    expect_runs([("x", trait_tr("Tr")), ("y", trait_and_k("Tr")), ("main", ticker_main("x", "y", "Tr_x"))], "1 2 3")
+}
+
+test "an impl in module a for type b and an impl in module a_b for type C" {
+    // Module `a` implements the trait `C` of module `m` (which `n` also declares) for its type
+    // `b`; module `a_b` implements its own trait `m` for its type `C`.
+    let a = "import m.\{C}\ntype b \{\n    v: Int\n}\n{impl_go("C", "b", 1)}pub fn run() -> Int \{ b \{ v: 0 }.go() }\n"
+    let a_b = "{trait_tr("m")}type C \{\n    v: Int\n}\n{impl_go("m", "C", 2)}pub fn run() -> Int \{ C \{ v: 0 }.go() }\n"
+    let main = "import a\nimport a_b\nimport n\nfn main() \{\n    io.println(\"\{a.run()} \{a_b.run()} \{n.k()}\")\n}\n"
+    expect_runs([("m", trait_tr("C")), ("n", trait_and_k("C")), ("a", a), ("a_b", a_b), ("main", main)], "1 2 3")
+}

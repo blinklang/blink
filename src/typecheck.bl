@@ -579,7 +579,7 @@ fn tc_mangle_impl_fnsig(impl_type: Str, trait_key: Str, mname: Str, im: Int) -> 
         let src = tc_impl_conv_source_tid(im)
         if src >= 0 { return "{impl_type}_{mname}_{tc_type_str(src)}" }
     }
-    "{impl_type}_{tc_trait_segment(trait_key)}_{mname}"
+    tc_impl_method_stem(impl_type, trait_key, mname)
 }
 
 fn tc_is_conversion_trait(trait_name: Str) -> Bool {
@@ -11392,14 +11392,28 @@ fn tc_trait_spelling(key: Str) -> Str {
     }
 }
 
+// A user name as one part of a C symbol. `_` becomes `_1`, so in a symbol `_` before a letter
+// only ever joins two parts, and no name can pass for two. An identifier never starts with a
+// digit, which leaves `_<digit>` free to mark structure: `_0` opens a mono argument, `_2` the
+// module of a shared trait.
+pub fn tc_sym_escape(s: Str) -> Str {
+    s.replace("_", "_1")
+}
+
 // The trait segment of an impl method's signature key and of its C symbol. One type may hold
-// two traits of one spelling, so a shared name carries its module; every other trait keeps
-// its bare name, which leaves the symbols of a program without a shared name as they were.
-pub fn tc_trait_segment(key: Str) -> Str {
+// two traits of one spelling, so a shared name carries its module after `_2`, which no
+// escaped name holds; every other trait is its escaped name alone.
+fn tc_trait_segment(key: Str) -> Str {
     match key.byte_index_of("@", 0) {
-        Some(at) => "{key.byte_slice(0, at)}_{key.byte_slice(at + 1, key.byte_len())}"
-        None => key
+        Some(at) => "{tc_sym_escape(key.byte_slice(0, at))}_2{key.byte_slice(at + 1, key.byte_len())}"
+        None => tc_sym_escape(key)
     }
+}
+
+// The signature key of a trait impl's method, which is also the stem of its C symbol, so the
+// two cannot name different methods.
+pub fn tc_impl_method_stem(impl_type: Str, trait_key: Str, mname: Str) -> Str {
+    "{tc_sym_escape(impl_type)}_{tc_trait_segment(trait_key)}_{tc_sym_escape(mname)}"
 }
 
 // A " and "-joined list of trait keys, as a diagnostic names them.
@@ -12929,7 +12943,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                                 let mut pmi = 0
                                 while pmi < sublist_length(pl_methods) {
                                     let pl_mname = node_name(sublist_get(pl_methods, pmi))
-                                    tc_poly_list_impl_node.insert("List_{tc_trait_segment(trait_id)}_{pl_mname}", im)
+                                    tc_poly_list_impl_node.insert(tc_impl_method_stem("List", trait_id, pl_mname), im)
                                     pmi = pmi + 1
                                 }
                             }
@@ -22643,7 +22657,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if obj_k == TyKind.List && qualified == -1 {
             let sole_trait = tc_method_trait_names("List", method)
             if sole_trait != "" && tc_method_trait_count("List", method) == 1 {
-                let sig_name = "List_{tc_trait_segment(sole_trait)}_{method}"
+                let sig_name = tc_impl_method_stem("List", sole_trait, method)
                 let sig = lookup_fnsig(sig_name)
                 if sig != -1 {
                     let im = tc_poly_list_impl_node.get(sig_name) ?? -1
@@ -23182,7 +23196,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if bname != "" {
                 let btrait = tc_method_trait_names(bname, method)
                 if btrait != "" {
-                    let bsig = lookup_fnsig("{bname}_{tc_trait_segment(btrait)}_{method}")
+                    let bsig = lookup_fnsig(tc_impl_method_stem(bname, btrait, method))
                     if bsig != -1 {
                         let _ = check_arg_shapes("{bname}.{method}", bsig, node_args(node), 1, node)
                         // Which declaration this call reached. Phase 1 could not say: it has
@@ -23209,7 +23223,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // under their source-typed key (handled via the builtin-method path
             // below), so a bare-key fallback keeps any non-trait inherent sig.
             let sole_trait = tc_method_trait_names(tname, method)
-            let sig_name = if sole_trait != "" { "{tname}_{tc_trait_segment(sole_trait)}_{method}" } else { "{tname}_{method}" }
+            let sig_name = if sole_trait != "" { tc_impl_method_stem(tname, sole_trait, method) } else { "{tname}_{method}" }
             let sig = lookup_fnsig(sig_name)
             if sig != -1 {
                 // Before the argument check: an argument typed by an impl binder takes the
@@ -23593,7 +23607,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     tc_builtin_receiver_name(qt_recv)
                 }
                 if qt_tname != "" {
-                    let qt_sig = lookup_fnsig("{qt_tname}_{tc_trait_segment(qt_trait)}_{method}")
+                    let qt_sig = lookup_fnsig(tc_impl_method_stem(qt_tname, qt_trait, method))
                     if qt_sig != -1 {
                         let qt_fs = fnsig_pool.get(qt_sig).unwrap()
                         // The receiver IS param 0 (`self`), so the qualified form's arity is
@@ -23690,7 +23704,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 }
                 let static_trait = tc_method_trait_names(obj_name, method)
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
-                    let q_sig = lookup_fnsig("{obj_name}_{tc_trait_segment(static_trait)}_{method}")
+                    let q_sig = lookup_fnsig(tc_impl_method_stem(obj_name, static_trait, method))
                     if q_sig != -1 {
                         nr_note_call_decl(node, fnsig_pool.get(q_sig).unwrap().decl)
                         // The impl's signature still says `Self`; the call names the type.

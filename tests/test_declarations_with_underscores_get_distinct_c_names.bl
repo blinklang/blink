@@ -1,0 +1,70 @@
+// A module, a function, a global, a type and an enum variant whose names hold `_` get C names
+// of their own: `a.b_c` and `a_b.c`, a type `Q_R` in module `p` and a type `R` in module
+// `p_Q`, and the variants `E_A.B` and `E.A_B` once shared one C name, so the C compiler
+// refused the program. The one-unit build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// A package of the given files, each `name=source`.
+fn new_package(files: List[(Str, Str)]) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_underscore_names.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    for f in files {
+        write_file("{dir}/src/{f.0}.bl", f.1)
+    }
+    dir
+}
+
+fn cleanup(dir: Str) {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str) {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.exit_code == 0 && r.out.trim().ends_with(want)
+        if !good {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+test "functions and globals of modules a and a_b" {
+    let main = "import a\nimport a_b\nfn main() \{\n    io.println(\"\{a.b_c()} \{a_b.c()} \{a.b_k} \{a_b.k}\")\n}\n"
+    expect_runs([
+        ("a", "pub fn b_c() -> Int \{ 1 }\npub let b_k: Int = 3\n"),
+        ("a_b", "pub fn c() -> Int \{ 2 }\npub let k: Int = 4\n"),
+        ("main", main),
+    ], "1 2 3 4")
+}
+
+test "type Q_R of module p and type R of module p_Q" {
+    let main = "import p\nimport p_Q\nfn main() \{\n    io.println(\"\{p.mk().v} \{p_Q.mk().w}\")\n}\n"
+    expect_runs([
+        ("p", "pub type Q_R \{ v: Int }\npub fn mk() -> Q_R \{ Q_R \{ v: 5 } }\n"),
+        ("p_Q", "pub type R \{ w: Int }\npub fn mk() -> R \{ R \{ w: 6 } }\n"),
+        ("main", main),
+    ], "5 6")
+}
+
+test "variant B of enum E_A and variant A_B of enum E" {
+    let types = "type E_A \{\n    B\n    C\n}\ntype E \{\n    A_B\n    X\n}\n"
+    let show = "fn show(e: E) -> Int \{\n    match e \{\n        E.A_B => 7\n        E.X => 8\n    }\n}\n"
+    let show2 = "fn show2(e: E_A) -> Int \{\n    match e \{\n        E_A.B => 9\n        E_A.C => 10\n    }\n}\n"
+    let main = "fn main() \{\n    io.println(\"\{show(E.A_B)} \{show2(E_A.B)} \{show(E.X)} \{show2(E_A.C)}\")\n}\n"
+    expect_runs([("main", "{types}{show}{show2}{main}")], "7 9 8 10")
+}
