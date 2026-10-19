@@ -52,8 +52,12 @@ BLINK_TEST_STORAGE int __blink_test_fail_col;
 BLINK_TEST_STORAGE char __blink_test_fail_user_msg[256];
 /* Cause discriminator for NDJSON output: "assertion", or "propagated_error"
  * from __blink_test_set_propagate for spec §2.20 test-body `?` propagation.
- * The runner sets it at the start of each test, before anything reads it. */
+ * Each path that fails a test sets it, so it never names an earlier failure. */
 BLINK_TEST_STORAGE const char* __blink_test_fail_cause;
+#define BLINK_TEST_CAUSE_ASSERTION "assertion"
+/* The cause a panic records. It is never printed: a panic is the status
+ * `panicked`, which has no cause (spec §8.10, Panicked records). */
+#define BLINK_TEST_CAUSE_PANIC "panic"
 BLINK_TEST_STORAGE char __blink_test_fail_error_type[128];
 BLINK_TEST_STORAGE char __blink_test_fail_error_message[512];
 /* Label of the for_each case that is running. After the loop it holds the
@@ -167,6 +171,7 @@ BLINK_UNUSED static void __blink_test_fail_unless_first(const char* msg) {
 BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
     __blink_test_fail_unless_first(msg);
     __blink_test_failed = 1;
+    __blink_test_fail_cause = BLINK_TEST_CAUSE_ASSERTION;
     if (msg) {
         strncpy(__blink_test_fail_msg, msg, sizeof(__blink_test_fail_msg) - 1);
         __blink_test_fail_msg[sizeof(__blink_test_fail_msg) - 1] = '\0';
@@ -210,6 +215,8 @@ BLINK_UNUSED static void blink_record_case(const char* label, int status, const 
     BLINK_COPY_OR_EMPTY(r->label, label);
     r->status = status;
     r->message = NULL;
+    /* malloc, not blink_strdup: the GC does not scan this malloc'd array, so a
+     * GC string held only here could be collected. */
     if (message) {
         size_t len = strlen(message) + 1;
         r->message = (char*)malloc(len);
@@ -235,6 +242,7 @@ BLINK_RT_FN void __blink_assert_fail_eq(const char* msg,
                                         int line) {
     __blink_test_fail_unless_first(msg);
     __blink_test_failed = 1;
+    __blink_test_fail_cause = BLINK_TEST_CAUSE_ASSERTION;
     BLINK_COPY_OR_EMPTY(__blink_test_fail_msg, msg);
     __blink_test_fail_line = line;
     __blink_test_fail_assertion[0] = '\0';
@@ -261,6 +269,7 @@ BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion,
     }
     __blink_test_fail_unless_first(msg);
     __blink_test_failed = 1;
+    __blink_test_fail_cause = BLINK_TEST_CAUSE_ASSERTION;
     memcpy(__blink_test_fail_msg, msg, sizeof(msg));
     __blink_test_fail_line = line;
     __blink_test_fail_col = col;
@@ -333,12 +342,6 @@ BLINK_RT_FN void __blink_assert_panics_mismatch(const char* expected,
         "assert_panics: panic message did not contain the expected substring",
         __intro, file, line, col, "");
 }
-
-/* The cause a panic records. It is never printed: a panic is the status
- * `panicked`, which has no cause (spec §8.10, Panicked records). */
-#define BLINK_TEST_CAUSE_PANIC "panic"
-/* The cause an assertion failure leaves in place: assertions do not set it. */
-#define BLINK_TEST_CAUSE_ASSERTION "assertion"
 
 BLINK_UNUSED static int __blink_test_cause_is_panic(const char* cause) {
     return cause && strcmp(cause, BLINK_TEST_CAUSE_PANIC) == 0;
@@ -461,8 +464,6 @@ BLINK_RT_FN void blink_test_run_case(const char* label, const char* duplicate, b
     __blink_test_jmp_mark = __blink_panic_cleanup_top;
     __blink_test_failed = 0;
     __blink_test_skipped = 0;
-    /* A case after a panicked one must not read that panic's cause as its own. */
-    __blink_test_fail_cause = BLINK_TEST_CAUSE_ASSERTION;
     BLINK_COPY_OR_EMPTY(__blink_test_case_label, label);
     int status;
     if (setjmp(__blink_panic_jmp) != 0) {
@@ -487,7 +488,8 @@ BLINK_RT_FN void blink_test_run_case(const char* label, const char* duplicate, b
     memcpy(__blink_test_jmp, prev_jmp, sizeof(jmp_buf));
     __blink_test_jmp_mark = prev_jmp_mark;
 
-    /* Severity: panicked 2, failed 1, otherwise 0 (spec §8.10.2). */
+    /* The parent takes the most severe case (spec §8.10.2); a case of the same
+     * severity as the parent's record does not replace it, so the first wins. */
     int case_severity = status == BLINK_TEST_CASE_PANICKED ? 2 : status == BLINK_TEST_CASE_FAILED ? 1 : 0;
     int prev_severity = !prev_failed ? 0 : __blink_test_cause_is_panic(prev_record.cause) ? 2 : 1;
     const char* panic_message = status == BLINK_TEST_CASE_PANICKED ? __blink_test_fail_msg : NULL;
@@ -657,6 +659,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 printf("{\"name\":\"%s\",\"status\":\"skipped\"", tests[i].name);
                 printf(",\"duration_ms\":%g", 0.0);
                 __blink_test_print_tags_json(&tests[i]);
+                __blink_test_print_xfail_json(&tests[i]);
                 printf("}");
             } else {
                 printf("test %s ... \033[33mskipped\033[0m\n", tests[i].name);

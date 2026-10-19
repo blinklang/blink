@@ -225,7 +225,7 @@ else
         first_error="run exceeded ${run_timeout}s"
     elif [ "$run_rc" -ne 0 ]; then
         status=run_fail
-        first_error=$(grep -m1 -E '\bFAIL\b|panic|Segmentation|Aborted' "$run_log" || true)
+        first_error=$(grep -m1 -E '\bFAIL\b|\bPANIC\b|panic|Segmentation|Aborted' "$run_log" || true)
     [ -z "$first_error" ] && first_error=$(grep -E 'error|assert' "$run_log" | grep -m1 -vE '\.\.\. .*ok' || true)
         [ -z "$first_error" ] && first_error=$(grep -m1 -v '^[[:space:]]*$' "$run_log" || true)
         [ -z "$first_error" ] && first_error="test binary exited $run_rc with no output"
