@@ -8279,9 +8279,28 @@ fn reject_unlicensed_comparison(op: Str, tid: Int, node: Int) ! TypeCheck.Report
     }
     let bt = if relational != 0 { "Ord" } else { "Eq" }
     let bm = if relational != 0 { "Ord.cmp" } else { "Eq.eq" }
+    if tc_report_shadowed_operator_bound(op, name, bt, traits, node) { return }
+    if relational == 0 && tc_report_shadowed_operator_bound(op, name, "Ord", traits, node) { return }
     diag_error_at("TypeError", TYPE_ERROR,
         "comparison `{op}` requires a trait bound on type parameter {name} (`{op}` desugars to {bm})", node,
         "add a comparison bound so the operation is licensed, e.g. `[{name}: {bt}]`")
+}
+
+// An operator on a type parameter whose bound names a local trait that shadows the
+// operator's compiler-known trait: the bound looks right and is not, so the error names
+// both traits and gives the alias that reaches the compiler-known one (sections/07 §10.6).
+fn tc_report_shadowed_operator_bound(op: Str, tpname: Str, bt: Str, traits: Str, node: Int) -> Bool ! Diag.Report {
+    for key in traits.split("|") {
+        if key.starts_with("{bt}@") {
+            let local = tc_trait_shown(key)
+            diag_error_at_notes("TypeError", TYPE_ERROR,
+                "`{op}` on {tpname} needs `{bt} (blink.core)`, but the bound `{tpname}: {bt}` names `{local}`", node,
+                "{tc_core_alias_import(bt)}\nthen write `[{tpname}: Core{bt}]`",
+                ["`{local}` and `{bt} (blink.core)` are different traits with the same name; `{op}` uses `{bt} (blink.core)`"])
+            return true
+        }
+    }
+    false
 }
 
 fn tc_push_tparam_scope(tparams_sl: Int) {
@@ -9443,7 +9462,11 @@ fn tc_report_unhashable(role: HashRole, why: HashRefusal, shown: Str, name: Str,
     let w = tc_hash_role_words(role)
     match why {
         HashRefusal.FloatKey => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` is not hashable — Float/Double values cannot serve as {w.plural} (NaN-inequality and bit-equality hazards)", node, "round the {w.rounded} to an Int (or another integer width) before inserting")
-        HashRefusal.NoDerive => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — user types used as {w.plural} must carry the @derive(Hash, Eq) annotation", node, "add @derive(Hash, Eq) to the `{name}` type definition")
+        HashRefusal.NoDerive => {
+            let args = "{tc_derive_arg_for("Hash", name)}, {tc_derive_arg_for("Eq", name)}"
+            diag_error_at_notes("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement {tc_core_trait_shown("Hash")} — user types used as {w.plural} must carry the @derive(Hash, Eq) annotation", node,
+                "{tc_derive_fix_imports(["Hash", "Eq"], name)}add @derive({args}) to the `{name}` type definition", tc_shadowed_trait_notes("Hash"))
+        }
         HashRefusal.NoImpl => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — {name} has no Hash/Eq implementation in v1 (containers, Bytes, StringBuilder, and fn types cannot be {w.plural})", node, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the {w.noun} instead")
         HashRefusal.Instance => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash", node, "use type arguments that are Hash, or derive Hash on the argument types")
     }
@@ -9919,7 +9942,8 @@ fn tc_report_not_derivable(a: Int) ! Diag.Report {
         return
     }
     let site = "{diag_normalize_path(diag_file_for_node(decl))}:{node_line(decl)}"
-    let mut notes = ["`{name}` here is `trait {bare}` ({site}), a user trait"]
+    // The order of §10.6's golden: the label, what @derive takes, then the shadow.
+    let mut notes = ["`{name}` here is `trait {bare}` ({site}), a user trait", takes]
     let mut help = "implement `{name}` by hand"
     if tc_trait_is_compiler_known(bare) {
         notes.push("`{name}` here is `trait {bare}` ({site}), which shadows the compiler-known `{bare}` (blink.core)")
@@ -9927,7 +9951,6 @@ fn tc_report_not_derivable(a: Int) ! Diag.Report {
             help = "import blink.core.\{{bare} as Core{bare}\}\nthen write @derive(Core{bare})"
         }
     }
-    notes.push(takes)
     diag_error_at_notes("NotDerivable", NOT_DERIVABLE,
         "cannot derive `{name}`: it is not a compiler-known trait", a, help, notes)
 }
@@ -10434,7 +10457,8 @@ fn tc_check_derive_eq_field(f: Int, ftid: Int, tname: Str, generic_help: Str) ! 
     let k = type_kind(leaf)
     let help = if k == TyKind.Struct || k == TyKind.Enum {
         let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
-        "add `@derive(Eq)` to `type {strip_module_qualifier(tc_type_name(base))}`"
+        let bname = strip_module_qualifier(tc_type_name(base))
+        "{tc_derive_fix_imports(["Eq"], bname)}add `@derive({tc_derive_arg_for("Eq", bname)})` to `type {bname}`"
     } else {
         generic_help
     }
@@ -12125,6 +12149,47 @@ fn tc_trait_ref_key(written: Str, consuming_mod: Str) -> Str {
 // Whether `written` resolved to `key` through an alias that selects a compiler-known trait
 // from blink.core. That import is what puts the name in scope, and the trait it names is in
 // no module a scope check could look in.
+// The local trait that shadows the compiler-known `tr` in module `in_mod`, by its key, or "".
+fn tc_shadowing_trait_key(tr: Str, in_mod: Str) -> Str {
+    if in_mod == "" || !tc_trait_is_compiler_known(tr) { return "" }
+    let key = tc_trait_ref_key(tr, in_mod)
+    if key == tr { "" } else { key }
+}
+
+// How this module's diagnostics name the compiler-known `tr`: with its home when a local trait
+// shadows it, so the reader can tell the two apart.
+fn tc_core_trait_shown(tr: Str) -> Str {
+    if tc_shadowing_trait_key(tr, nr_current_module) == "" { tr } else { "{tr} (blink.core)" }
+}
+
+// The note that says the `tr` this module names is not the one a compiler-inserted form uses.
+fn tc_shadowed_trait_notes(tr: Str) -> List[Str] {
+    let key = tc_shadowing_trait_key(tr, nr_current_module)
+    if key == "" { return [] }
+    ["`{tr}` in this module is `{tc_trait_shown(key)}`, a different trait with the same name as `{tr} (blink.core)`"]
+}
+
+fn tc_core_alias_import(tr: Str) -> Str {
+    "import blink.core.\{{tr} as Core{tr}\}"
+}
+
+// The @derive argument that names the compiler-known `tr` in the module that declares type
+// `tname`: `tr`, or `Core{tr}` where a local trait shadows it there, since `@derive(tr)`
+// would then name the local trait (sections/07 §10.6).
+fn tc_derive_arg_for(tr: Str, tname: Str) -> Str {
+    let td = tc_decl_node_for_type(tname)
+    if td == -1 || tc_shadowing_trait_key(tr, node_module(td)) == "" { tr } else { "Core{tr}" }
+}
+
+// The alias imports a fix that derives `trs` on `tname` needs first, one per line, or "".
+fn tc_derive_fix_imports(trs: List[Str], tname: Str) -> Str {
+    let mut out = ""
+    for tr in trs {
+        if tc_derive_arg_for(tr, tname) != tr { out = "{out}{tc_core_alias_import(tr)}\n" }
+    }
+    out
+}
+
 fn tc_is_core_alias(written: Str, key: Str) -> Bool {
     written != key && tc_trait_is_compiler_known(key)
 }
@@ -18122,7 +18187,8 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
     let k = type_kind(leaf)
     if k == TyKind.Struct || k == TyKind.Enum {
         let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
-        help = "{help}; add `@derive(Eq)` to `type {strip_module_qualifier(tc_type_name(base))}`"
+        let bname = strip_module_qualifier(tc_type_name(base))
+        help = "{help}; {tc_derive_fix_imports(["Eq"], bname)}add `@derive({tc_derive_arg_for("Eq", bname)})` to `type {bname}`"
     }
     if k == TyKind.Typevar { help = "{help}; add the bound `[{type_to_str(leaf)}: Eq]`" }
     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
@@ -20918,6 +20984,7 @@ fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int, is_unary: Int)
                     "{bt} is a sealed arithmetic trait — only built-in numeric types implement it, so no user type could satisfy it; make this a required method (drop the default body) so each implementor defines it, or use a concrete numeric type instead of `Self`")
                 return
             }
+            if tc_report_shadowed_operator_bound(op, tpname, bt, traits, node) { return }
             diag_error_at("TypeError", TYPE_ERROR,
                 "arithmetic `{op}` requires the {bt} bound on type parameter {tpname} (`{op}` desugars to {bt}.{bm})", node,
                 "add the matching arithmetic bound, e.g. `[{tpname}: {bt}]`; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types")
@@ -21209,10 +21276,16 @@ fn tc_trait_need_fixes(leaf: Int, tr: Str) -> List[Str] {
         if tc_type_writes_trait_method(bname, tc_trait_method(tr), tr) {
             lines.push("write `impl {tr} for {type_to_str(leaf)}`")
         } else if tc_type_name_derives(bname, tr) == 0 {
-            lines.push("add `@derive({tr})` to `type {bname}`")
+            lines.push("{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {bname}`")
         }
     }
-    if k == TyKind.Typevar { lines.push("add the bound `[{type_to_str(leaf)}: {tr}]`") }
+    if k == TyKind.Typevar {
+        if tc_shadowing_trait_key(tr, nr_current_module) == "" {
+            lines.push("add the bound `[{type_to_str(leaf)}: {tr}]`")
+        } else {
+            lines.push("{tc_core_alias_import(tr)}\nthen add the bound `[{type_to_str(leaf)}: Core{tr}]`")
+        }
+    }
     lines
 }
 
@@ -21249,7 +21322,7 @@ fn tc_refuse_derived_method_at(recv: Int, method: Str, node: Int) ! Diag.Report 
 }
 
 fn tc_report_trait_need(path: List[Int], tr: Str, node: Int) ! Diag.Report {
-    diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `{tr}`", node,
+    diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `{tc_core_trait_shown(tr)}`", node,
         tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tr).join("\n"), tc_trait_need_notes(path, tr))
 }
 
@@ -21259,7 +21332,7 @@ fn tc_eq_need_notes(path: List[Int]) -> List[Str] {
 }
 
 fn tc_trait_need_notes(path: List[Int], tr: Str) -> List[Str] {
-    let mut notes: List[Str] = []
+    let mut notes = tc_shadowed_trait_notes(tr)
     let mut i = 0
     while i + 1 < path.len() {
         notes.push(tc_trait_need_step(path.get(i).unwrap(), path.get(i + 1).unwrap(), tr))
@@ -21288,7 +21361,7 @@ fn reject_eq_less_operands(op: Str, lt: Int, rt: Int, node: Int) -> Int ! TypeCh
     let mut path = tc_eq_need(a, [])
     if path.len() == 0 { path = tc_eq_need(b, []) }
     if path.len() > 0 {
-        diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `Eq`", node,
+        diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `{tc_core_trait_shown("Eq")}`", node,
             tc_eq_need_help(path.get(path.len() - 1).unwrap(), op, node), tc_eq_need_notes(path))
         return 1
     }
@@ -21325,7 +21398,7 @@ fn reject_eq_less_assert_args(lt: Int, rt: Int, node: Int) ! TypeCheck.Report, D
     if path.len() == 0 { path = tc_eq_need(b, []) }
     if path.len() == 0 { return }
     diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
-        "`{type_to_str(path.get(0).unwrap())}` does not implement `Eq`", node,
+        "`{type_to_str(path.get(0).unwrap())}` does not implement `{tc_core_trait_shown("Eq")}`", node,
         tc_eq_need_fixes(path.get(path.len() - 1).unwrap()).join("\n"), tc_eq_need_notes(path))
 }
 
@@ -21490,7 +21563,7 @@ fn tc_refuse_unordered_sort(node: Int, recv: Int, elem: Int) -> Int ! TypeCheck.
     } else {
         let ename = strip_module_qualifier(tc_type_name(tc_enum_base_tid(unbuilt)))
         tc_error_at_code("`sort` on `{type_to_str(elem)}` is not built yet: the compiler cannot order a fieldless enum with no `@derive(Ord)`", node, "TypeError", TYPE_ERROR,
-            "add `@derive(Ord)` to `type {ename}`, which gives it the same declaration order")
+            "{tc_derive_fix_imports(["Ord"], ename)}add `@derive({tc_derive_arg_for("Ord", ename)})` to `type {ename}`, which gives it the same declaration order")
     }
     1
 }
