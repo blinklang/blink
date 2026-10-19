@@ -280,3 +280,146 @@ test "cases of a test.failing test never carry expected_fail" {
     assert(r.json.contains(#""cases":[{"label":"a","status":"pass"},{"label":"b","status":"failed"},{"label":"c","status":"pass"}]"#), "cases[] is not a pass, b failed, c pass, or a case carries xfail fields; {d}")
     assert_eq(r.human_exit, 0, d)
 }
+
+test "a failed case is not hidden by a later loop whose every case skips" {
+    let r = run_fixture("failthenskip", [
+        #"import std.testing.{for_each, skip}"#,
+        #""#,
+        #"test "failthenskip" {"#,
+        #"    for_each([("a", 1)], fn(v: Int) { assert(v == 2) })"#,
+        #"    for_each([("b", 1)], fn(_v: Int) { skip("later loop") })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"failthenskip","status":"failed""#), "the failed case was hidden; {d}")
+    assert_eq(r.human_exit, 1, d)
+}
+
+test "a test with a passing case is not skipped because a later loop skipped every case" {
+    let r = run_fixture("passthenskip", [
+        #"import std.testing.{for_each, skip}"#,
+        #""#,
+        #"test "passthenskip" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) { if v == 2 { skip("one case") } })"#,
+        #"    for_each([("c", 3)], fn(_v: Int) { skip("every case") })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(r.json.contains(#""name":"passthenskip","status":"passed""#), "a test with a passing case was not passed; {d}")
+}
+
+test "an assert after a loop whose every case skipped fails the test" {
+    let r = run_fixture("skipthenfail", [
+        #"import std.testing.{for_each, skip}"#,
+        #""#,
+        #"test "skipthenfail" {"#,
+        #"    for_each([("a", 1)], fn(_v: Int) { skip("every case") })"#,
+        #"    assert(1 == 2, "after the loop")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"skipthenfail","status":"failed""#), "the failure after the loop was hidden as a skip; {d}")
+    assert_eq(r.human_exit, 1, d)
+}
+
+test "a failure after a failed case keeps the first failing case as the record" {
+    let r = run_fixture("failthenfail", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"test "failthenfail" {"#,
+        #"    for_each([("a", 1)], fn(v: Int) { assert(v == 2, "case a is wrong") })"#,
+        #"    assert(1 == 2, "after the loop")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""case":"a""#), "the parent does not name case a; {d}")
+    assert(r.json.contains(#""user_message":"case a is wrong""#), "the first failure was replaced; {d}")
+    assert(!r.json.contains("after the loop"), "a later failure replaced the record of case a; {d}")
+}
+
+test "an assert in a cleanup during a case unwind does not replace the case failure" {
+    let r = run_fixture("closeasserts", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"type Res { id: Int }"#,
+        #"impl Closeable for Res { fn close(self) { assert(self.id == 99, "close assert") } }"#,
+        #""#,
+        #"test "closeasserts" {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) {"#,
+        #"        with Res { id: v } as res { assert(res.id == 5, "body assert") }"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""user_message":"body assert""#), "the body failure was replaced by the cleanup's; {d}")
+    assert(r.json.contains(#""cleanup_warnings":["#), "the cleanup failure was not kept as a warning; {d}")
+    assert(r.json.contains(#""cases":[{"label":"a","status":"failed"},{"label":"b","status":"failed"}]"#), "cases[] is not a failed, b failed; {d}")
+}
+
+test "an assert in a cleanup during a case panic keeps the panic" {
+    let r = run_fixture("closeassertspanic", [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"type Res { id: Int }"#,
+        #"impl Closeable for Res { fn close(self) { assert(self.id == 99, "close assert") } }"#,
+        #""#,
+        #"test "closeassertspanic" {"#,
+        #"    for_each([("a", 1)], fn(v: Int) {"#,
+        #"        with Res { id: v } as res { panic("case boom {res.id}") }"#,
+        #"    })"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""cause":"panic""#), "the panic was replaced by the cleanup's assert; {d}")
+    assert(r.json.contains("case boom 1"), "the panic message is gone; {d}")
+}
+
+test "for_each outside a test run still ends the program on a failing case" {
+    let name = "fe_every_plain_{getpid()}"
+    let scratch = ".tmp/_test_for_each_every_{getpid()}_plain"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, [
+        #"import std.testing.{for_each}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    for_each([("a", 1), ("b", 2)], fn(v: Int) { assert(v == 1) })"#,
+        #"    io.println("after the loop")"#,
+        #"}"#,
+        #""#,
+    ].join("\n"))
+    let r = process_run("build/blink", ["run", fixture])
+    shell_exec("rm -rf {scratch}")
+    let out = r.out.concat(r.err_out)
+    assert(r.exit_code != 0, "a failing case outside a test run was swallowed; exit={r.exit_code}:\n{out}")
+    assert(!out.contains("after the loop"), "the program ran on past a failing case; {out}")
+}
+
+test "a skip after a failed case does not hide the failure" {
+    let r = run_fixture("failthenskipcall", [
+        #"import std.testing.{for_each, skip}"#,
+        #""#,
+        #"test "failthenskipcall" {"#,
+        #"    for_each([("a", 1)], fn(v: Int) { assert(v == 2) })"#,
+        #"    skip("after the loop")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(r.json.contains(#""name":"failthenskipcall","status":"failed""#), "a later skip hid the failed case; {d}")
+    assert_eq(r.human_exit, 1, d)
+}
