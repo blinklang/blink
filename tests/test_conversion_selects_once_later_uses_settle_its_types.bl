@@ -18,7 +18,8 @@ fn expect_runs(src: Str, want: Str) {
     let mut ok = true
     for args in ["run --no-per-module", "run --per-module"] {
         let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
-        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+        let lines = r.out.trim().split("\n")
+        if r.exit_code != 0 || lines.get(lines.len() - 1) != Some(want) {
             io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
             ok = false
         }
@@ -27,14 +28,15 @@ fn expect_runs(src: Str, want: Str) {
     assert(ok)
 }
 
-// `blink check` and `blink build` give the same refusal.
+// `blink check` and `blink build` give the same refusal, and only that one.
 fn expect_refused(src: Str, want: Str) {
     let dir = sh("mktemp -d /tmp/blink_conv_late.XXXXXX").out.trim()
     write_file("{dir}/main.bl", src)
     let mut ok = true
     for cmd in ["check", "build"] {
         let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {cmd} main.bl < /dev/null 2>&1")
-        if r.exit_code == 0 || !r.out.contains(want) || r.out.contains("internal compiler error") {
+        let one = r.out.starts_with("1 error(s) found") || r.out.contains("\n1 error(s) found")
+        if r.exit_code == 0 || !r.out.contains(want) || !one || r.out.contains("internal compiler error") {
             io.eprintln("blink {cmd}: exit {r.exit_code}\n{r.out}")
             ok = false
         }
@@ -164,5 +166,76 @@ fn main() {
     let a = X.from(xs)
     io.println("{a.n}")
 }
-"#, "1 error(s) found")
+"#, "error[CannotInferType]")
+}
+
+test "the only impl that fits fixes a named empty source" {
+    expect_runs(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() + 5 } }
+}
+fn main() {
+    let xs = []
+    let a = X.from(xs)
+    let ys = []
+    let b: X = ys.into()
+    io.println("{a.n} {b.n}")
+}
+"#, "5 5")
+}
+
+test "one conversion's choice settles the next" {
+    expect_runs(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: 1 } }
+}
+type Y { n: Int }
+impl From[List[Int]] for Y {
+    fn from(xs: List[Int]) -> Y { Y { n: 2 } }
+}
+impl From[List[Str]] for Y {
+    fn from(xs: List[Str]) -> Y { Y { n: 3 } }
+}
+fn apply[T](xs: List[T], g: fn(List[T]) -> Y, f: fn(List[T]) -> X) -> Int { g(xs).n * 10 + f(xs).n }
+fn main() {
+    io.println("{apply([], fn(q) { Y.from(q) }, fn(p) { X.from(p) })}")
+}
+"#, "21")
+}
+
+test "a source that could be the target itself ties with the impl" {
+    expect_refused(#"type W { n: Int }
+impl From[List[Int]] for W {
+    fn from(xs: List[Int]) -> W { W { n: xs.len() } }
+}
+fn main() {
+    let w = W.from([].get(0).unwrap())
+    io.println("{w.n}")
+}
+"#, "matches more than one impl: `impl From[T] for T` and `impl From[List[Int]] for W`")
+}
+
+test "a binder the identity and an impl could both fill is reported as unbound" {
+    expect_refused(#"type X { n: Int }
+impl From[List[Int]] for X {
+    fn from(xs: List[Int]) -> X { X { n: xs.len() } }
+}
+fn take[U](u: U) -> Int { 1 }
+fn main() {
+    io.println("{take([1].into())}")
+}
+"#, "type parameter `U` of `take` is unbound at this call")
+}
+
+test "an open source the only impl fits two ways is refused" {
+    expect_refused(#"type X { n: Int }
+impl From[(List[Int], List[Str])] for X {
+    fn from(p: (List[Int], List[Str])) -> X { X { n: p.0.len() + p.1.len() } }
+}
+fn dup[T](x: List[T]) -> (List[T], List[T]) { (x, x) }
+fn main() {
+    let a = X.from(dup([]))
+    io.println("{a.n}")
+}
+"#, "type parameter `T` of `dup` is unbound at this call")
 }

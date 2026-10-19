@@ -686,8 +686,10 @@ fn tc_conversion_impls_matching_at(trait_name: Str, source: Int, target: Int, op
     found
 }
 
-// How a diagnostic spells a conversion impl's head: `impl From[List[T]] for Box[T]`.
+// How a diagnostic spells a conversion impl's head: `impl From[List[T]] for Box[T]`, and the
+// compiler-provided identity `impl From[T] for T`.
 fn tc_conversion_impl_head(im: Int) -> Str {
+    if im == CONVERSION_IS_IDENTITY { return "impl From[T] for T" }
     "impl {tc_impl_trait_id(im)}[{tc_type_str(tc_impl_conv_source(im))}] for {tc_type_str(tc_impl_recv_tids.get(im) ?? -1)}"
 }
 
@@ -713,8 +715,9 @@ fn tc_conversion_match_binds_at(im: Int, source0: Int, target0: Int, open: Bool)
     let bare_target = target_decl >= 0 && target_decl == tc_tid_decl_node(recv) && tc_tid_struct_arg_count(tc_resolve(target)) == 0
     let bare = tc_impl_is_poly_user(im) && bare_target
     if !bare { unify_typevar_binds(recv, target, binds) }
-    if !tc_tid_same_type_at(substitute_typevar_tid(src, binds), source, open) { return None }
-    if !bare && !tc_tid_same_type_at(substitute_typevar_tid(recv, binds), target, open) { return None }
+    let holes: Map[Int, Int] = Map()
+    if !tc_tid_same_type_at(substitute_typevar_tid(src, binds), source, open, holes) { return None }
+    if !bare && !tc_tid_same_type_at(substitute_typevar_tid(recv, binds), target, open, holes) { return None }
     Some(binds)
 }
 
@@ -2667,11 +2670,24 @@ fn tc_ud_already_blamed(tid: Int) -> Int {
 fn tc_ud_judge_binder(vname: Str, tid: Int, decl_node: Int) ! Diag.Report {
     if decl_node == -1 { return }
     if vname == "self" { return }
-    if node_kind(decl_node) == NodeKind.LetBinding {
+    if node_kind(decl_node) == NodeKind.LetBinding && !tc_ud_conversion_may_settle(tid) {
         tc_report_under_determined(vname, tid, decl_node)
         return
     }
     tc_ud_pending.push(TcUdPending { name: vname, tid: tid, node: decl_node })
+}
+
+// Whether a deferred conversion's choice may still settle `tid`: a side of it holds one of
+// its metavariables, and the impl chosen once inference is done fills them as a later use
+// does.
+fn tc_ud_conversion_may_settle(tid: Int) -> Bool {
+    let roots = tc_ud_metavar_roots(tid)
+    for call_node in tc_deferred_conversion_calls() {
+        let (source, target) = tc_deferred_conversion_sides(call_node)
+        for r in tc_ud_metavar_roots(source) { if roots.contains(r) { return true } }
+        for r in tc_ud_metavar_roots(target) { if roots.contains(r) { return true } }
+    }
+    false
 }
 
 // Report the deferred alias blames nothing else answered. Runs once, after the whole
@@ -2809,7 +2825,7 @@ fn tc_note_conversion_call(im: Int, call_node: Int, binds: Map[Str, Int]) {
 // `[]` gives it a fresh metavariable, and the node's type is the one codegen reads.
 fn tc_note_deferred_conversion(call_node: Int) {
     if tc_boundary_check_active == 0 || call_node < 0 { return }
-    if tc_call_open_group.contains_key(call_node) == 0 { tc_call_open_calls.push(call_node) }
+    if !tc_call_open_group.contains_key(call_node) { tc_call_open_calls.push(call_node) }
     tc_call_open_group.insert(call_node, tc_call_open_tids.len())
     tc_call_open_tids.push(-2)
     tc_call_open_tids.push(-1)
@@ -2928,7 +2944,7 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
 // Choose the impl of each conversion tc_defer_conversion left open, now that every use in the
 // program has run. A sole impl that fits is a use like any call's: it settles what the call
 // left open, and that can leave one impl for another deferred call, so the passes repeat
-// until none chooses. Each still open after that is refused: more than one impl, or none.
+// until none chooses. tc_refuse_deferred_conversions judges the rest.
 fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, Diag.Report {
     // The flush records a chosen impl's binders as a walk inside a body does.
     let prev_boundary = tc_boundary_check_active
@@ -2937,11 +2953,17 @@ fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, Diag.Report {
     while chose {
         chose = false
         for call_node in tc_deferred_conversion_calls() {
-            if tc_settle_deferred_conversion(call_node, false) { chose = true }
+            if tc_choose_deferred_conversion(call_node) { chose = true }
         }
     }
-    for call_node in tc_deferred_conversion_calls() { let _ = tc_settle_deferred_conversion(call_node, true) }
     tc_boundary_check_active = prev_boundary
+}
+
+// Refuse each conversion no use settled: more than one impl fits, or none. This runs after
+// the under-determined bindings and calls are reported, since a report that names the open
+// type the program must write answers for the conversion too.
+fn tc_refuse_deferred_conversions() ! Diag.Report {
+    for call_node in tc_deferred_conversion_calls() { tc_refuse_deferred_conversion(call_node) }
 }
 
 // The calls whose last record is a deferred conversion that no report has claimed.
@@ -2954,60 +2976,100 @@ fn tc_deferred_conversion_calls() -> List[Int] {
     out
 }
 
-// Choose the impl of a deferred conversion when one fits, and answer whether this did. With
-// `last`, refuse the call when none or more than one fits. A side some binding's report has
-// already blamed is not judged again.
-fn tc_settle_deferred_conversion(call_node: Int, last: Bool) -> Bool ! TypeCheck.Resolve, Diag.Report {
-    let g = tc_call_open_group.get(call_node).unwrap()
-    if !tc_open_group_is_deferred_conversion(g) { return false }
+// The source and target of a deferred conversion as its nodes type them now, -1 for a side
+// with no type.
+fn tc_deferred_conversion_sides(call_node: Int) -> (Int, Int) {
     let into = tc_is_into_method(node_method(call_node))
     let trait_name = if into { "From" } else { tc_conversion_trait_of(node_method(call_node)) }
     let source = tc_lookup_node_tid(if into { node_obj(call_node) } else { sublist_get(node_args(call_node), 0) })
-    let target = tc_conversion_target_of(trait_name, tc_lookup_node_tid(call_node))
-    if source < 0 || target < 0 { return false }
-    if tc_ud_already_blamed(source) != 0 || tc_ud_already_blamed(target) != 0 { return false }
-    let identity = trait_name == "From" && tc_tid_could_be_same_type(source, target)
-    let found = tc_conversion_impls_matching_at(trait_name, source, target, true)
-    let count = found.len() + if identity { 1 } else { 0 }
-    if count == 1 {
-        tc_drop_deferred_conversion(call_node)
-        if identity {
-            let _ = tc_unify(source, target)
-            return true
-        }
-        tc_commit_conversion(call_node, found.get(0).unwrap(), source, target)
-        return true
-    }
-    if !last { return false }
-    tc_call_reported.insert(call_node, 1)
-    let call = if into { "`.into()`" } else { "`{node_name(node_obj(call_node))}.{node_method(call_node)}`" }
-    if count > 1 {
-        let mut heads = found
-        if identity { heads.insert(0, CONVERSION_IS_IDENTITY) }
-        tc_report_conversion_tie(call_node, call, "", source, heads)
-        tc_ud_mark_blamed(source)
-        tc_ud_mark_blamed(target)
-        return false
-    }
-    if tc_conversion_side_settled(source) && tc_conversion_side_settled(target) {
-        tc_report_no_conversion(call_node, "", trait_name, source, target)
-        tc_ud_mark_blamed(source)
-        tc_ud_mark_blamed(target)
-    }
-    false
+    (source, tc_conversion_target_of(trait_name, tc_lookup_node_tid(call_node)))
 }
 
-// Settle a deferred conversion's types by impl `im`, the sole one that fits them, and link
-// the call to it as tc_static_conversion links a call it chose at once.
-fn tc_commit_conversion(call_node: Int, im: Int, source: Int, target: Int) ! TypeCheck.Resolve, Diag.Report {
+// A deferred conversion as its nodes type it now.
+type TcDeferredConversion {
+    into: Bool
+    trait_name: Str
+    source: Int
+    target: Int
+    // The impls that still fit, CONVERSION_IS_IDENTITY first when the value itself could.
+    found: List[Int]
+}
+
+// None when a side has no type or some report already blamed it: a blamed side is not
+// judged again.
+fn tc_deferred_conversion_at(call_node: Int) -> Option[TcDeferredConversion] {
+    let into = tc_is_into_method(node_method(call_node))
+    let trait_name = if into { "From" } else { tc_conversion_trait_of(node_method(call_node)) }
+    let (source, target) = tc_deferred_conversion_sides(call_node)
+    if source < 0 || target < 0 { return None }
+    if tc_ud_already_blamed(source) != 0 || tc_ud_already_blamed(target) != 0 { return None }
+    let mut found = tc_conversion_impls_matching_at(trait_name, source, target, true)
+    if trait_name == "From" && tc_tid_same_type_at(source, target, true, Map()) { found.insert(0, CONVERSION_IS_IDENTITY) }
+    Some(TcDeferredConversion { into: into, trait_name: trait_name, source: source, target: target, found: found })
+}
+
+// Choose the impl of a deferred conversion when it is the sole one that fits, and answer
+// whether this did. The impl settles the call's types and the call links to it, as
+// tc_static_conversion links a call it chose at once.
+fn tc_choose_deferred_conversion(call_node: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let d = match tc_deferred_conversion_at(call_node) {
+        Some(x) => x
+        None => { return false }
+    }
+    if d.found.len() != 1 { return false }
+    tc_drop_deferred_conversion(call_node)
+    let im = d.found.get(0).unwrap()
+    if im == CONVERSION_IS_IDENTITY {
+        if tc_unify(d.source, d.target) == 0 { tc_refuse_chosen_conversion(call_node, d) }
+        return true
+    }
     let binds = tc_impl_fresh_binders(im)
-    let _ = tc_unify(substitute_typevar_tid(tc_impl_conv_source(im), binds), source)
-    let _ = tc_unify(substitute_typevar_tid(tc_impl_recv_tids.get(im) ?? -1, binds), target)
-    if !tc_is_into_method(node_method(call_node)) {
+    let fits = tc_unify(substitute_typevar_tid(tc_impl_conv_source(im), binds), d.source) != 0
+    if !fits || tc_unify(substitute_typevar_tid(tc_impl_recv_tids.get(im) ?? -1, binds), d.target) == 0 {
+        tc_refuse_chosen_conversion(call_node, d)
+        return true
+    }
+    if !d.into {
         let sig = tc_conversion_method_sig(im, node_method(call_node))
         if sig != -1 { nr_note_call_decl(call_node, fnsig_pool.get(sig).unwrap().decl) }
     }
     if tc_impl_is_poly_conversion(im) { tc_note_conversion_call(im, call_node, binds) }
+    true
+}
+
+// The open match let the sole impl through, but its types still refuse the call's once
+// unified (one metavariable that would have to be two types), so in fact none fits.
+fn tc_refuse_chosen_conversion(call_node: Int, d: TcDeferredConversion) ! Diag.Report {
+    tc_call_reported.insert(call_node, 1)
+    tc_report_no_conversion(call_node, "", d.trait_name, d.source, d.target)
+    tc_ud_mark_blamed(d.source)
+    tc_ud_mark_blamed(d.target)
+}
+
+fn tc_refuse_deferred_conversion(call_node: Int) ! Diag.Report {
+    let d = match tc_deferred_conversion_at(call_node) {
+        Some(x) => x
+        None => { return }
+    }
+    if d.found.len() > 1 {
+        tc_call_reported.insert(call_node, 1)
+        let call = if d.into { "`.into()`" } else { "`{node_name(node_obj(call_node))}.{node_method(call_node)}`" }
+        tc_report_conversion_tie(call_node, call, "", d.source, d.found)
+    } else if d.found.len() == 0 && tc_conversion_side_judgeable(d.source) && tc_conversion_side_judgeable(d.target) {
+        tc_call_reported.insert(call_node, 1)
+        tc_report_no_conversion(call_node, "", d.trait_name, d.source, d.target)
+    } else {
+        return
+    }
+    tc_ud_mark_blamed(d.source)
+    tc_ud_mark_blamed(d.target)
+}
+
+// A side a refusal at the end of inference may judge: an error type was reported where it
+// arose, and a generic body's `T` is judged per instance. A metavariable still open matches
+// every impl, so a side that holds one and matches none could never convert.
+fn tc_conversion_side_judgeable(t: Int) -> Bool {
+    tc_tid_has_unknown(t) == 0 && tc_tid_has_bare_typevar(t) == 0
 }
 
 // Report the recorded calls a binder of which is still unbound once inference is done
@@ -3053,6 +3115,10 @@ fn tc_ud_flush_calls() ! Diag.Report {
             ti = ti + 1
         }
     }
+}
+
+// The recorded calls once every flush has read them.
+fn tc_drop_open_calls() {
     tc_call_open_calls = []
     tc_call_open_group.clear()
     tc_call_open_tids = []
@@ -24861,7 +24927,7 @@ fn tc_collect_foreign_typevars(tid0: Int, fresh: Map[Str, Int]) {
     if tid < 0 || tid >= ty_pool.len() { return }
     if type_kind(tid) == TyKind.Typevar {
         if tc_typevar_binds_here(tid) != 0 { return }
-        let key = tc_binder_key(tc_tid_binder(tid), ty_pool.get(tid).unwrap().name)
+        let key = tc_tid_typevar_key(tid)
         if !fresh.contains_key(key) { fresh.insert(key, make_metavar()) }
         return
     }
@@ -29331,10 +29397,13 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     nr_pop_scope()
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined. A deferred conversion
-    // goes first, since the impl it chooses can settle what the others judge.
+    // is chosen first, since the impl it chooses can settle what the others judge, and refused
+    // last, so a binding or call that names the open type answers for it.
     tc_flush_deferred_conversions()
     tc_ud_flush_pending()
     tc_ud_flush_calls()
+    tc_refuse_deferred_conversions()
+    tc_drop_open_calls()
     tc_flush_untyped_type_args()
 }
 
@@ -29790,21 +29859,19 @@ pub fn tc_tid_list_elem(tid: Int) -> Int {
 }
 
 pub fn tc_tid_same_type(a0: Int, b0: Int) -> Bool {
-    tc_tid_same_type_at(a0, b0, false)
+    tc_tid_same_type_at(a0, b0, false, Map())
 }
 
-// tc_tid_same_type, except that an unbound metavariable on either side stands for whatever
-// the other side holds there: could inference still make the two one type? Pure, so a
-// candidate can be weighed without binding anything.
-fn tc_tid_could_be_same_type(a0: Int, b0: Int) -> Bool {
-    tc_tid_same_type_at(a0, b0, true)
-}
-
-fn tc_tid_same_type_at(a0: Int, b0: Int, open: Bool) -> Bool {
+// tc_tid_same_type, except with `open` an unbound metavariable on either side stands for
+// whatever the other side holds there: could inference still make the two one type? `holes`
+// keeps what each metavariable stood for, so one that occurs twice must stand for one type
+// both times. Binds nothing, so a candidate can be weighed and dropped.
+fn tc_tid_same_type_at(a0: Int, b0: Int, open: Bool, holes: Map[Int, Int]) -> Bool {
     let a = tc_resolve(a0)
     let b = tc_resolve(b0)
     if a == b { return a >= 0 && a < ty_pool.len() }
-    if open && (tc_is_unbound_metavar(a) != 0 || tc_is_unbound_metavar(b) != 0) { return true }
+    if open && tc_is_unbound_metavar(a) != 0 { return tc_open_hole_fits(a, b, holes) }
+    if open && tc_is_unbound_metavar(b) != 0 { return tc_open_hole_fits(b, a, holes) }
     if a < 0 || a >= ty_pool.len() { return false }
     if b < 0 || b >= ty_pool.len() { return false }
     let ta = ty_pool.get(a).unwrap()
@@ -29816,17 +29883,40 @@ fn tc_tid_same_type_at(a0: Int, b0: Int, open: Bool) -> Bool {
     }
     if (ta.inner1 < 0) != (tb.inner1 < 0) { return false }
     if (ta.inner2 < 0) != (tb.inner2 < 0) { return false }
-    if ta.inner1 >= 0 && !tc_tid_same_type_at(ta.inner1, tb.inner1, open) { return false }
-    if ta.inner2 >= 0 && !tc_tid_same_type_at(ta.inner2, tb.inner2, open) { return false }
+    if ta.inner1 >= 0 && !tc_tid_same_type_at(ta.inner1, tb.inner1, open, holes) { return false }
+    if ta.inner2 >= 0 && !tc_tid_same_type_at(ta.inner2, tb.inner2, open, holes) { return false }
     if ta.params_count != tb.params_count { return false }
     let mut i = 0
     while i < ta.params_count {
         let pa = ty_param_list.get(ta.params_start + i).unwrap()
         let pb = ty_param_list.get(tb.params_start + i).unwrap()
-        if !tc_tid_same_type_at(pa, pb, open) { return false }
+        if !tc_tid_same_type_at(pa, pb, open, holes) { return false }
         i = i + 1
     }
     true
+}
+
+// `holes` links each metavariable to what it stood for, as a forest: a link starts only at a
+// root, so a chain always ends.
+fn tc_open_hole_fits(hole: Int, other: Int, holes: Map[Int, Int]) -> Bool {
+    let h = tc_open_hole_root(hole, holes)
+    let o = tc_open_hole_root(other, holes)
+    if h == o { return true }
+    if tc_is_unbound_metavar(h) != 0 {
+        holes.insert(h, o)
+        return true
+    }
+    if tc_is_unbound_metavar(o) != 0 {
+        holes.insert(o, h)
+        return true
+    }
+    tc_tid_same_type_at(h, o, true, holes)
+}
+
+fn tc_open_hole_root(t: Int, holes: Map[Int, Int]) -> Int {
+    let mut r = tc_resolve(t)
+    while tc_is_unbound_metavar(r) != 0 && holes.contains_key(r) { r = tc_resolve(holes.get(r).unwrap()) }
+    r
 }
 
 // Triage the slot contradictions merge_arg_tids recorded. Drained once at the
