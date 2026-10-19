@@ -1,0 +1,187 @@
+// A module that declares a prelude trait name has two traits of that name (sections/07 §10.6
+// *Shadowing a Prelude Trait*). A name the user writes (a bound, an impl head, a @derive
+// argument) resolves by scope; a form the compiler inserts (an operator, a Map key,
+// assert_eq, the Eq that @derive(Ord) derives) uses the compiler-known trait by identity.
+// `import blink.core.{Eq as CoreEq}` names the compiler-known trait in a written position.
+// Every row runs check and build, one unit and per module, so the two paths cannot disagree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_prelude_shadow.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+fn blink(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn expect_runs(main: Str, sim: Str, want: Str) {
+    let dir = project(main, sim)
+    let mut ok = true
+    let c = blink(dir, "check")
+    if c.exit_code != 0 {
+        io.eprintln("blink check: exit {c.exit_code}\n{c.out}")
+        ok = false
+    }
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = blink(dir, args)
+        if r.exit_code != 0 || !r.out.trim().ends_with(want) {
+            io.eprintln("blink {args}: exit {r.exit_code}, want `{want}`\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+// Each of `wants` is in the output of check and of both builds, and none of them passes.
+fn expect_rejects(main: Str, sim: Str, wants: List[Str]) {
+    let dir = project(main, sim)
+    let mut ok = true
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = blink(dir, args)
+        let mut missing: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { missing.push(w) }
+        }
+        if r.exit_code == 0 || missing.len() > 0 || r.out.contains("internal compiler error") {
+            io.eprintln("blink {args}: exit {r.exit_code}, missing {missing.join(", ")}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+let shadow_eq = #"trait Eq {
+    fn eq(self, other: Int) -> Bool
+}
+"#
+
+test "an alias import of the compiler-known Eq derives it, bounds with it and licenses ==" {
+    let main = #"import blink.core.{Eq as CoreEq}
+"#.concat(shadow_eq).concat(#"
+@derive(CoreEq)
+type P {
+    x: Int
+}
+
+fn same[T: CoreEq](a: T, b: T) -> Bool {
+    a == b
+}
+
+fn main() {
+    assert_eq(P { x: 1 }, P { x: 1 })
+    io.println("{P { x: 1 } == P { x: 1 }} {same(P { x: 1 }, P { x: 2 })}")
+}
+"#)
+    expect_runs(main, "", "true false")
+}
+
+test "@derive(Ord) in a shadowing module derives the compiler-known Eq" {
+    let main = #"import blink.core.{Eq as CoreEq}
+"#.concat(shadow_eq).concat(#"
+@derive(Ord)
+type P {
+    x: Int
+}
+
+fn main() {
+    io.println("{P { x: 1 } == P { x: 1 }} {P { x: 1 } < P { x: 2 }}")
+}
+"#)
+    expect_runs(main, "", "true true")
+}
+
+test "a Map key in a module that shadows Hash and Eq uses the compiler-known traits" {
+    let main = #"import blink.core.{Hash as CoreHash}
+
+trait Hash {
+    fn hash(self) -> Int
+}
+
+trait Eq {
+    fn eq(self, other: Int) -> Bool
+}
+
+@derive(CoreHash)
+type K {
+    x: Int
+}
+
+fn main() {
+    let mut m: Map[K, Int] = Map()
+    m.insert(K { x: 1 }, 7)
+    io.println("{m.get(K { x: 1 }) ?? 0}")
+}
+"#
+    expect_runs(main, "", "7")
+}
+
+test "an impl of a shadowing Hash does not make a type a Map key" {
+    let main = #"trait Hash {
+    fn hash(self) -> Int
+}
+
+type K {
+    x: Int
+}
+
+impl Hash for K {
+    fn hash(self) -> Int { self.x }
+}
+
+fn main() {
+    let mut m: Map[K, Int] = Map()
+    m.insert(K { x: 1 }, 7)
+    io.println("{m.len()}")
+}
+"#
+    expect_rejects(main, "", ["K"])
+}
+
+test "a shadow in another module leaves @derive(Eq) and == alone here" {
+    let main = #"import geo.sim
+
+@derive(Eq)
+type P {
+    x: Int
+}
+
+fn main() {
+    io.println("{P { x: 1 } == P { x: 1 }} {sim.near(1)}")
+}
+"#
+    let sim = shadow_eq.concat(#"
+pub fn near(x: Int) -> Int { x }
+"#)
+    expect_runs(main, sim, "true 1")
+}
+
+test "an impl head under the alias implements the compiler-known Eq that == uses" {
+    let main = #"import blink.core.{Eq as CoreEq}
+"#.concat(shadow_eq).concat(#"
+type Q {
+    x: Int
+}
+
+impl CoreEq for Q {
+    fn eq(self, other: Q) -> Bool { self.x % 10 == other.x % 10 }
+}
+
+fn main() {
+    io.println("{Q { x: 3 } == Q { x: 13 }}")
+}
+"#)
+    expect_runs(main, "", "true")
+}

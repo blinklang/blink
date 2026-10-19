@@ -9873,11 +9873,14 @@ pub fn tc_derive_names() -> List[Str] {
     ["Serialize", "Deserialize", "Eq", "Ord", "Clone", "Hash", "Debug"]
 }
 
-fn tc_derive_name_is_known(name: Str) -> Int {
-    for d in tc_derive_names() {
-        if d == name { return 1 }
-    }
-    0
+// The compiler-known trait a @derive argument denotes, or "" when it denotes none @derive
+// accepts. The argument is a name the user writes, so it resolves by the scope of the file
+// that wrote it (sections/03_types.md §3.6.1): in a module that shadows `Eq`, `@derive(Eq)`
+// names the local trait, and `@derive(CoreEq)` under `import blink.core.{Eq as CoreEq}`
+// names the compiler-known one. Every reader of a derive asks here, never the spelling.
+pub fn tc_derive_arg_trait(a: Int) -> Str {
+    let key = tc_trait_ref_key(node_name(a), node_module(a))
+    if tc_derive_names().contains(key) && tc_trait_is_compiler_known(key) { key } else { "" }
 }
 
 // A @derive name outside the accepted set is reported where the author can still see the
@@ -9886,7 +9889,7 @@ fn tc_derive_name_is_known(name: Str) -> Int {
 fn tc_reject_unknown_derives(td: Int) ! Diag.Report {
     for a in tc_decl_derive_args(td) {
         let name = node_name(a)
-        if tc_derive_name_is_known(name) == 0 {
+        if tc_derive_arg_trait(a) == "" {
             diag_error_at("UnknownDerive", UNKNOWN_DERIVE_NAME,
                 "unknown @derive name `{name}`; expected one of {tc_derive_names().join(", ")}",
                 a, "remove or replace this derive name")
@@ -9929,7 +9932,7 @@ pub fn tc_decl_derive_args(decl: Int) -> List[Int] {
 // first match, so `@derive(Eq)` + `@derive(Ord)` on separate lines hid the second derive.
 pub fn tc_decl_derives(td: Int, tr: Str) -> Int {
     for a in tc_decl_derive_args(td) {
-        if tc_derive_obliges(node_name(a), tr) != 0 { return 1 }
+        if tc_derive_obliges(tc_derive_arg_trait(a), tr) != 0 { return 1 }
     }
     0
 }
@@ -10468,6 +10471,8 @@ fn tc_check_derive_opaque_handle() ! Diag.Report {
         let ttid = named_type_ids.get(ti) ?? -1
         if td != -1 && ttid >= 0 && ffi_opaque_type_set.contains_key(tc_resolve(ttid)) != 0 {
             for a in tc_decl_derive_args(td) {
+                // A name @derive does not take is reported once, where it is resolved.
+                if tc_derive_arg_trait(a) == "" { continue }
                 let tr = node_name(a)
                 diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT,
                     "@derive({tr}) on `{tname}`: an @ffi.opaque handle exposes no fields, so {tr} cannot be synthesized for it",
@@ -12069,6 +12074,10 @@ fn tc_trait_ref_key(written: Str, consuming_mod: Str) -> Str {
     match nr_module_import_index(consuming_mod).get(name) {
         Some(binds) => {
             for b in binds {
+                // `import blink.core.{Eq as CoreEq}` selects the compiler-known trait itself,
+                // which is how a module that shadows `Eq` still names it (sections/07 §10.6).
+                // collect_imports keys the pseudo-module by its path with `_` for `.`.
+                if b.source_mod == "blink_core" && tc_trait_is_compiler_known(b.member) { return b.member }
                 let d = tc_trait_decl_in_module(b.source_mod, b.member, 0)
                 if d != -1 { return tc_trait_key_of(d) }
             }
@@ -12076,6 +12085,22 @@ fn tc_trait_ref_key(written: Str, consuming_mod: Str) -> Str {
         None => {}
     }
     name
+}
+
+// Whether `written` resolved to `key` through an alias that selects a compiler-known trait
+// from blink.core. That import is what puts the name in scope, and the trait it names is in
+// no module a scope check could look in.
+fn tc_is_core_alias(written: Str, key: Str) -> Bool {
+    written != key && tc_trait_is_compiler_known(key)
+}
+
+// Whether the trait key `key` is a compiler-known trait: one a prelude module declares, or
+// one with no declaration. A user trait of the same name is keyed `Name@module`, but a user
+// trait no other declaration shares keeps its bare name, so a bare key alone proves nothing.
+fn tc_trait_is_compiler_known(key: Str) -> Bool {
+    if tc_undeclared_trait_names().contains(key) { return true }
+    let d = tc_trait_node_idx.get(key) ?? -1
+    d != -1 && tc_prelude_modules.contains_key(node_module(d))
 }
 
 // The trait a bound, a where-bound or a supertrait clause names, read in the file that
@@ -12109,6 +12134,7 @@ fn tc_stamp_trait_ref_modules(program: Int) {
         while i < sublist_length(types_sl) {
             let td = sublist_get(types_sl, i)
             tc_stamp_bounds(node_type_params(td), node_module(td))
+            for a in tc_decl_derive_args(td) { node_set_module(a, node_module(td)) }
             i = i + 1
         }
     }
@@ -18583,6 +18609,7 @@ fn nr_check_impl_trait_ref(im: Int) ! TypeCheck.Resolve, Diag.Report {
     let trait_id = tc_impl_trait_id(im)
     if is_trait_name(trait_id) == 0 { return }
     if tc_undeclared_trait_names().contains(trait_id) { return }
+    if tc_is_core_alias(trait_name, trait_id) { return }
     nr_check_type_ref(trait_name, im)
 }
 
@@ -18795,7 +18822,7 @@ fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
         return
     }
     // A compiler-known trait with no declaration has nothing to import.
-    if !undeclared { nr_check_type_ref(written, bound) }
+    if !undeclared && !tc_is_core_alias(written, trait_name) { nr_check_type_ref(written, bound) }
     let args_sl = node_elements(bound)
     let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
     let want = tc_trait_tparam_count_idx.get(trait_name) ?? -1
