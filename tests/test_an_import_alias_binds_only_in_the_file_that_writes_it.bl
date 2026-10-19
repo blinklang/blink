@@ -1,0 +1,158 @@
+// A selective import binds each listed name, which is the name after `as` when there is one
+// (sections/07_trust_modules_metadata.md §10.5, "Imported Names"). The alias is local to the
+// file that writes it ("Import Aliases"): another file does not see it, two files may bind one
+// alias to different items, and the file that renames an item does not also bind the
+// original name. Check, the one-unit build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// A package of the given files, each `name=source`.
+fn new_package(files: List[(Str, Str)]) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_import_alias.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    for f in files {
+        write_file("{dir}/src/{f.0}.bl", f.1)
+    }
+    dir
+}
+
+fn cleanup(dir: Str) {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str) {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.exit_code == 0 && (args == "check" || r.out.trim().ends_with(want))
+        if !good {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+// Check and the per-module build both fail; each output holds `want` and not `never`.
+fn expect_refused(files: List[(Str, Str)], want: Str, never: Str) {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "build --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.exit_code != 0 && r.out.contains(want) && (never == "" || !r.out.contains(never))
+        if !good {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+let alpha = ("alpha", "pub fn tag_a() -> Int \{ 1 }\n")
+let beta = ("beta", "pub fn tag_b() -> Int \{ 2 }\n")
+
+let job_state = ("jobs", "pub type JobState \{\n    Pending\n    Done\n}\npub fn code(s: JobState) -> Int \{\n    match s \{\n        JobState.Pending => 1\n        JobState.Done => 2\n    }\n}\n")
+
+test "two files may bind one alias to different items" {
+    expect_runs([alpha, beta,
+        ("user", "import alpha.\{tag_a as t}\npub fn use_t() -> Int \{ t() }\n"),
+        ("other", "import beta.\{tag_b as t}\npub fn use_t2() -> Int \{ t() }\n"),
+        ("main", "import user.\{use_t}\nimport other.\{use_t2}\nfn main() \{ io.println(\"\{use_t()} \{use_t2()}\") }\n")], "1 2")
+}
+
+test "an alias another file writes is not bound here" {
+    expect_refused([alpha, beta,
+        ("user", "import alpha.\{tag_a as t}\npub fn use_t() -> Int \{ t() }\n"),
+        ("main", "import user.\{use_t}\nfn main() \{ io.println(\"\{use_t()} \{t()}\") }\n")],
+        "`t`", "alpha.t")
+}
+
+test "a type alias names the imported type, not a namesake the file declares" {
+    expect_runs([
+        ("alpha", "pub type Shape \{\n    Dot(r: Int)\n}\n"),
+        ("beta", "import alpha.\{Shape as AlphaShape}\npub type Shape \{\n    Dot(name: Str)\n}\npub fn mk() -> Int \{\n    match AlphaShape.Dot(3) \{\n        AlphaShape.Dot(r) => r\n    }\n}\npub fn own() -> Int \{\n    match Shape.Dot(\"ab\") \{\n        Shape.Dot(n) => n.len()\n    }\n}\n"),
+        ("main", "import beta\nfn main() \{ io.println(\"\{beta.mk()} \{beta.own()}\") }\n")], "3 2")
+}
+
+test "the original name is not bound in the file that renames it" {
+    expect_refused([job_state,
+        ("main", "import jobs.\{JobState as JS}\nfn main() \{\n    let x = JobState.Done\n    let _ = x\n}\n")],
+        "error[ImportNotSelected]: `JobState` is not in scope", "")
+}
+
+test "a renamed function is not bound under its original name either" {
+    expect_refused([alpha, beta,
+        ("main", "import alpha.\{tag_a as t}\nfn main() \{ io.println(\"\{t()} \{tag_a()}\") }\n")],
+        "error[ImportNotSelected]: `tag_a` is not in scope", "")
+}
+
+test "the alias works where it is written and the original works in a file that imports it plainly" {
+    expect_runs([job_state,
+        ("plain", "import jobs.\{JobState, code}\npub fn plain_code() -> Int \{ code(JobState.Pending) }\n"),
+        ("main", "import jobs.\{JobState as JS, code}\nimport plain.\{plain_code}\nfn main() \{ io.println(\"\{code(JS.Done)} \{plain_code()}\") }\n")], "2 1")
+}
+
+test "a renamed function stays callable under its own name in a file that imports it plainly" {
+    expect_runs([alpha, beta,
+        ("user", "import alpha.\{tag_a as t}\npub fn use_t() -> Int \{ t() }\n"),
+        ("main", "import alpha.\{tag_a}\nimport user.\{use_t}\nfn main() \{ io.println(\"\{use_t()} \{tag_a()}\") }\n")], "1 1")
+}
+
+test "two files may rename one type to different names" {
+    expect_runs([job_state,
+        ("one", "import jobs.\{JobState as First, code}\npub fn f1() -> Int \{ code(First.Pending) }\n"),
+        ("two", "import jobs.\{JobState as Second, code}\npub fn f2() -> Int \{ code(Second.Done) }\n"),
+        ("main", "import one.\{f1}\nimport two.\{f2}\nfn main() \{ io.println(\"\{f1()} \{f2()}\") }\n")], "1 2")
+}
+
+test "an alias names the imported function, not a namesake the file declares" {
+    expect_runs([alpha,
+        ("user", "import alpha.\{tag_a as t}\nfn tag_a() -> Int \{ 9 }\npub fn use_t() -> Int \{ t() * 10 + tag_a() }\n"),
+        ("main", "import user.\{use_t}\nfn main() \{ io.println(\"\{use_t()}\") }\n")], "19")
+}
+
+test "an alias outranks a function another module declares under its spelling" {
+    expect_runs([alpha,
+        ("gamma", "pub fn t() -> Int \{ 7 }\n"),
+        ("user", "import gamma\nimport alpha.\{tag_a as t}\npub fn use_t() -> Int \{ t() + gamma.t() * 10 }\n"),
+        ("main", "import user.\{use_t}\nfn main() \{ io.println(\"\{use_t()}\") }\n")], "71")
+}
+
+test "a parameter spelled like an alias shadows it" {
+    expect_runs([alpha,
+        ("user", "import alpha.\{tag_a as t}\npub fn use_t(t: Int) -> Int \{ t }\npub fn call_t() -> Int \{ t() }\n"),
+        ("main", "import user.\{use_t, call_t}\nfn main() \{ io.println(\"\{use_t(4)} \{call_t()}\") }\n")], "4 1")
+}
+
+test "a renamed generic function is instantiated under its own name" {
+    expect_runs([("gen", "pub fn pick[T](x: T) -> T \{ x }\n"),
+        ("main", "import gen.\{pick as p}\nfn main() \{ io.println(\"\{p(3)} \{p(\"s\")}\") }\n")], "3 s")
+}
+
+test "a renamed function called as a statement runs" {
+    expect_runs([("say", "pub fn hello() \{ io.println(\"hi\") }\n"),
+        ("main", "import say.\{hello as greet}\nfn main() \{ greet() }\n")], "hi")
+}
+
+test "a type alias names the type in annotations of fields, parameters and bindings" {
+    expect_runs([("jobs", "pub type JobState \{\n    Pending\n    Done\n}\npub type Box \{\n    n: Int\n}\n"),
+        ("main", "import jobs.\{JobState as JS, Box as B}\ntype Holder \{\n    s: JS\n    b: B\n}\nfn flip(s: JS) -> JS \{\n    match s \{\n        JS.Pending => JS.Done\n        JS.Done => JS.Pending\n    }\n}\nfn main() \{\n    let h = Holder \{ s: flip(JS.Pending), b: B \{ n: 4 } }\n    let x: JS = h.s\n    match x \{\n        JS.Done => io.println(\"done \{h.b.n}\")\n        JS.Pending => io.println(\"pending\")\n    }\n}\n")], "done 4")
+}
+
+test "two imports in one file that bind one alias to different items are refused" {
+    expect_refused([alpha, beta,
+        ("main", "import alpha.\{tag_a as t}\nimport beta.\{tag_b as t}\nfn main() \{ io.println(\"\{t()}\") }\n")],
+        "error[AmbiguousImport]: `t` is imported twice", "")
+}
