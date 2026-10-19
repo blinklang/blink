@@ -3621,6 +3621,9 @@ pub fn lookup_named_type(name: Str) -> Int {
 // escaping as the carrier's err arm. Mint-or-return so the err arm is a concrete Struct
 // tid by construction.
 fn tc_conversion_error_type() -> Int {
+    // By identity: a module's own `type ConversionError` is not what a parse fails with.
+    let known = tc_compiler_known_tid("ConversionError")
+    if known != -1 { return known }
     ensure_runtime_struct_type("ConversionError", ["message", "source_type", "target_type"], [TYPE_STR, TYPE_STR, TYPE_STR], [])
 }
 
@@ -3718,7 +3721,7 @@ fn type_stringbuilder() -> Int {
     ty_intern_simple(TyKind.StringBuilder, "StringBuilder", -1, -1)
 }
 
-fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
+fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
     if name == "Int" { return TYPE_INT }
     if name == "Float" { return TYPE_FLOAT }
     if name == "Bool" { return TYPE_BOOL }
@@ -3733,13 +3736,12 @@ fn resolve_type_name(name: Str) -> Int ! TypeCheck.Resolve {
     if name == "U32" { return TYPE_U32 }
     if name == "U64" { return TYPE_U64 }
     if name == "Char" { return TYPE_CHAR }
-    // A declaration that takes a shadowable name answers below, through lookup_named_type.
-    if name == "Never" && tc_declaration_shadows_builtin(name) == 0 { return TYPE_NEVER }
-    // A builtin with no Blink declaration anywhere: `StringBuilder` names codegen's
-    // StringBuilder C type / `blink_sb*` and is listed by is_primitive_type, but lib/std/sb.bl
-    // only declares FUNCTIONS over it. Without this arm every `sb: StringBuilder` param
-    // and `-> StringBuilder` return resolved to -1 and inference fell back to Unknown.
-    if name == "StringBuilder" && tc_declaration_shadows_builtin(name) == 0 { return type_stringbuilder() }
+    // The same reading resolve_type_parts gives a written name, so a type spelled through a
+    // string (a closure's return, a parameter) means what its annotation means: a name
+    // imported from a compiler-known type's home under another name is that builtin, and a
+    // declaration that takes a shadowable name answers below, through lookup_named_type.
+    let core = tc_compiler_known_type_meant(name, -1)
+    if tc_is_shadowable_type_name(core) { return tc_compiler_known_type_tid(core, -1, -1) }
     lookup_named_type(name)
 }
 
@@ -8447,6 +8449,13 @@ fn tc_shadowing_type_decl(tid: Int) -> Int {
     d
 }
 
+// Whether the bare type name `name`, read in the module under check, means the declaration `d`.
+fn tc_name_means_decl_here(name: Str, d: Int) -> Bool {
+    if tc_compiler_known_type_meant(name, -1) != "" { return false }
+    let t = lookup_named_type(name)
+    t >= 0 && tc_tid_decl_node(t) == d
+}
+
 // An error whose subjects are the types `tids`. Each subject that shadows a compiler-known
 // type adds a note with the shadowing declaration's location and the builtin's home, and the
 // W1010 help, so the escape shows where the error is (sections/07 §10.6, Diagnostics that
@@ -8461,10 +8470,14 @@ fn tc_error_naming_types(name: Str, code: Str, msg: Str, at: Int, help: Str, tid
         if d < 0 || seen.contains(d) { continue }
         seen.push(d)
         let tname = node_name(d)
+        // Where the bare name means the builtin or another declaration, this one shadows
+        // nothing here, and the pair the message prints already tells the types apart.
+        if !tc_name_means_decl_here(tname, d) { continue }
         let (home, spelled) = tc_shadowable_type(tname)
         let site = "{diag_normalize_path(diag_file_for_node(d))}:{node_line(d)}"
         notes.push("`{tname}` here is `type {tname}` ({site}), which shadows the compiler-known `{spelled}` ({home})")
-        helps.push(tc_shadowed_type_help(tname, home, nr_current_module))
+        let h = tc_shadowed_type_help(tname, home, nr_current_module)
+        if !helps.contains(h) { helps.push(h) }
     }
     if notes.len() == 0 { return diag_error_at(name, code, msg, at, help) }
     diag_error_at_notes(name, code, msg, at, helps.join("\n"), notes)
@@ -8559,6 +8572,7 @@ fn tc_desugaring_forms(tr: Str) -> List[Str] {
         "Into" => ["`.into()`"]
         "IntoIterator" => ["a `for` loop"]
         "Closeable" => ["`with ... as`"]
+        "List" => ["`[T]`", "a list literal"]
         "Option" => ["`T?`", "`??`", "`?`"]
         "Ordering" => ["`<`", "`>`", "`<=`", "`>=`"]
         "Result" => ["`?`"]
@@ -8567,6 +8581,7 @@ fn tc_desugaring_forms(tr: Str) -> List[Str] {
         "Handler" => ["`with`"]
         "Handle" => ["`async.spawn`"]
         "Template" => ["a template literal"]
+        "ConversionError" => ["`parse_int`", "`parse_float`", "`Char.from_code_point`", "`try_from`"]
         _ => forms
     }
 }
@@ -8678,12 +8693,30 @@ fn tc_ctor_arity_meaning(name: Str, core: Str) -> Int {
     // A type parameter in scope is a type variable, not a constructor: a bare
     // reference to it is well-formed and carries no arity to check (§3.4:1259).
     if (tc_active_tparams.get(n) ?? 0) > 0 { return -1 }
-    if core != "" { return tc_builtin_ctor_arity(core) }
+    if core != "" { return tc_compiler_known_ctor_arity(core) }
     let decl = tc_type_decl_nodes.get(tc_written_type_nominal(n)) ?? -1
     if decl == -1 { return -1 }
     let tps = node_type_params(decl)
     if tps == -1 { return 0 }
     sublist_length(tps)
+}
+
+// The arity of the compiler-known type `core`: its builtin row, else its prelude declaration's
+// (Ordering, ConversionError), else the §10.6 table's for a type no module declares.
+fn tc_compiler_known_ctor_arity(core: Str) -> Int {
+    let builtin = tc_builtin_ctor_arity(core)
+    if builtin != -1 { return builtin }
+    let decl = tc_prelude_type_decl(core)
+    if decl != -1 {
+        let tps = node_type_params(decl)
+        return if tps == -1 { 0 } else { sublist_length(tps) }
+    }
+    match core {
+        "Range" => 1
+        "Buf" => 1
+        "TemplateValue" => 0
+        _ => -1
+    }
 }
 
 // The arity of a compiler-known type constructor, or -1 for any other name.
@@ -8745,7 +8778,8 @@ fn tc_check_type_arg_arity(name: Str, core: Str, elems_sl: Int, ann_node: Int) !
     let got = if elems_sl == -1 { 0 } else { sublist_length(elems_sl) }
     if got == want { return }
     let n = strip_module_qualifier(name)
-    tc_error_naming_types("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{n}` takes {want} type argument(s) but {got} were given", ann_node, tc_arity_help(n, want, got), [lookup_named_type(name)])
+    let subjects: List[Int] = if core != "" { [] } else { [lookup_named_type(name)] }
+    tc_error_naming_types("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{n}` takes {want} type argument(s) but {got} were given", ann_node, tc_arity_help(n, want, got), subjects)
 }
 
 // resolve_type_parts' answer where the annotation means the compiler-known type `name`, or -1
@@ -8948,6 +8982,27 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
     -1
 }
 
+// The tid of the compiler-known type `core`: its arm in tc_resolve_compiler_known_type, else
+// its prelude declaration (Ordering, ConversionError), else -1.
+fn tc_compiler_known_type_tid(core: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let builtin = tc_resolve_compiler_known_type(core, elems_sl, ann_node)
+    if builtin != -1 { return builtin }
+    tc_compiler_known_tid(core)
+}
+
+// What `written`, an import alias of the compiler-known `core`, resolves to when `core` has no
+// arm in tc_resolve_compiler_known_type. A type no declaration gives (Range, Buf,
+// TemplateValue) has no tid to answer, so the alias is reported rather than left a free type
+// variable named for the alias, which no back end can spell.
+fn tc_aliased_compiler_known_type(written: Str, core: Str, ann_node: Int) -> Int ! Diag.Report {
+    let known = tc_compiler_known_tid(core)
+    if known != -1 { return known }
+    let (home, _) = tc_shadowable_type(core)
+    let at = if ann_node != -1 { ann_node } else { 0 }
+    diag_error_at("UnknownType", UNKNOWN_TYPE, "`{written}` imports `{core}` from {home}, which cannot be named through an import alias", at, "write `{core}` where no declaration in this module takes the name")
+    tc_error_recovery_tid()
+}
+
 fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     // Arity is a property of a WRITTEN type position, so it keys on ann_node
     // alone — not on tc_suppress_ann_validation. That flag only silences
@@ -8968,6 +9023,8 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     if core != "" {
         let builtin = tc_resolve_compiler_known_type(core, elems_sl, ann_node)
         if builtin != -1 { return builtin }
+        // An import alias spells no type, so the builtin it names answers by identity.
+        if core != name { return tc_aliased_compiler_known_type(name, core, ann_node) }
     }
 
     // A type parameter is a BINDING occurrence, so inside the declaration that binds it its
@@ -10465,7 +10522,7 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
             let ftype_ann = node_value(f)
             let ftype_ann_name = node_name(ftype_ann)
             // `Buf` has no type to resolve to yet; E0822 is the whole answer for the field.
-            let is_buf_field = is_ffi_struct != 0 && ftype_ann_name == "Buf"
+            let is_buf_field = is_ffi_struct != 0 && tc_compiler_known_type_meant(ftype_ann_name, ftype_ann) == "Buf"
             let ftype_id = if is_buf_field { TYPE_UNKNOWN } else { resolve_type_ann(ftype_ann) }
             sfield_pool.push(TcStructField { struct_id: tid, name: fname, type_id: ftype_id })
             if ftype_ann_name == "Fn" {
@@ -10562,6 +10619,15 @@ fn tc_debug_field_ok(ftype_name: Str) -> Int {
     0
 }
 
+// The Debug field check for a leaf annotation that `core`, what it means
+// (tc_compiler_known_type_meant), may name as a compiler-known type. A builtin with a prelude
+// declaration (Ordering, ConversionError) answers by that declaration, not by a namesake.
+fn tc_debug_leaf_ok(written: Str, core: Str) -> Int {
+    if core == "" { return tc_debug_field_ok(written) }
+    let td = tc_prelude_type_decl(core)
+    if td == -1 { 1 } else { tc_decl_derives(td, "Debug") }
+}
+
 // The container type constructors that the v1 Debug renderer can walk
 // (or that the typecheck rule peels into the element/key/value check).
 // Set/Result are container-shaped but NOT in the v1 renderable set.
@@ -10585,9 +10651,9 @@ fn tc_is_container_name(n: Str) -> Int {
 // declared Void field lowers to an int64_t placeholder, so without this arm the type
 // builds and RUNS, printing `<?>` for the field with a BLINK_COMPILER_BUG marker compiled
 // into the binary — a silent wrong answer instead of a diagnostic.
-fn tc_is_non_debug_pseudo_type(n: Str) -> Int {
+fn tc_is_non_debug_pseudo_type(n: Str, core: Str) -> Int {
     if n == "Fn" || n == "Tuple" || n == "Void" { return 1 }
-    if (n == "Raw" || n == "Handler") && tc_declaration_shadows_builtin(n) == 0 { return 1 }
+    if core == "Raw" || core == "Handler" { return 1 }
     0
 }
 
@@ -10626,21 +10692,22 @@ fn tc_debug_map_key_ok(key_name: Str) -> Int {
 // its own element/key/value checks so arbitrary nesting is proven Debug.
 fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str) ! Diag.Report {
     let elem_name = node_name(elem_ann)
-    if tc_is_non_debug_pseudo_type(elem_name) != 0 {
+    let core = tc_compiler_known_type_meant(elem_name, elem_ann)
+    if tc_is_non_debug_pseudo_type(elem_name, core) != 0 {
         diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has element type `{elem_name}` which is not Debug-renderable in v1", f, "implement Debug manually for this field's type")
         return
     }
-    if tc_is_container_name(elem_name) != 0 {
+    if tc_is_container_name(core) != 0 {
         // Nested container: Set/Result are still rejected at every level; the
         // renderable containers (List/Option/Map) recurse.
-        if elem_name == "Set" || elem_name == "Result" {
+        if core == "Set" || core == "Result" {
             diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has element type `{elem_name}` which is not Debug-renderable (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
             return
         }
-        tc_check_container_elems(elem_ann, f, tname)
+        tc_check_container_elems(elem_ann, core, f, tname)
         return
     }
-    if tc_debug_field_ok(elem_name) == 0 {
+    if tc_debug_leaf_ok(elem_name, core) == 0 {
         diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has element type `{elem_name}` which does not derive Debug", f, "{tc_derive_fix_imports(["Debug"], elem_name)}add @derive({tc_derive_arg_for("Debug", elem_name)}) to `{elem_name}`")
     }
 }
@@ -10649,10 +10716,9 @@ fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str) ! Diag.Report {
 // key + value) types. Shared between the top-level field check and the nested
 // recursion in tc_check_debug_element, so nesting is pure composition. The
 // caller guarantees `ann` names List / Option / Map (Set/Result rejected first).
-fn tc_check_container_elems(ann: Int, f: Int, tname: Str) ! Diag.Report {
-    let ftype_name = node_name(ann)
+fn tc_check_container_elems(ann: Int, core: Str, f: Int, tname: Str) ! Diag.Report {
     let elems_sl = node_elements(ann)
-    if ftype_name == "Map" {
+    if core == "Map" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
             let key_ann = sublist_get(elems_sl, 0)
             let key_name = node_name(key_ann)
@@ -10688,26 +10754,27 @@ fn tc_check_container_elems(ann: Int, f: Int, tname: Str) ! Diag.Report {
 fn tc_check_one_debug_field(f: Int, tname: Str, _is_variant_field: Int) ! Diag.Report {
     let ann = node_value(f)
     let ftype_name = node_name(ann)
+    let core = tc_compiler_known_type_meant(ftype_name, ann)
 
-    if tc_is_non_debug_pseudo_type(ftype_name) != 0 {
+    if tc_is_non_debug_pseudo_type(ftype_name, core) != 0 {
         diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which is not Debug-renderable in v1", f, "implement Debug manually for this field's type")
         return
     }
 
-    if tc_is_container_name(ftype_name) == 0 {
-        if tc_debug_field_ok(ftype_name) == 0 {
+    if tc_is_container_name(core) == 0 {
+        if tc_debug_leaf_ok(ftype_name, core) == 0 {
             diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not derive Debug", f, "{tc_derive_fix_imports(["Debug"], ftype_name)}add @derive({tc_derive_arg_for("Debug", ftype_name)}) to `{ftype_name}`")
         }
         return
     }
 
     // Field is a container type. Set/Result are not renderable at any level.
-    if ftype_name == "Set" || ftype_name == "Result" {
+    if core == "Set" || core == "Result" {
         diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which is not Debug-renderable in v1 (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
         return
     }
 
-    tc_check_container_elems(ann, f, tname)
+    tc_check_container_elems(ann, core, f, tname)
 }
 
 fn tc_check_derive_debug() ! Diag.Report {
@@ -10716,6 +10783,8 @@ fn tc_check_derive_debug() ! Diag.Report {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
         if td != -1 && tc_decl_derives(td, "Debug") != 0 {
+            // A field annotation means what it means in the declaring module.
+            let saved_module = tc_enter_body_module(td)
             let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
@@ -10732,6 +10801,7 @@ fn tc_check_derive_debug() ! Diag.Report {
                 }
                 i = i + 1
             }
+            tc_leave_body_module(saved_module)
         }
         ti = ti + 1
     }
@@ -12553,6 +12623,13 @@ fn tc_core_alias_target(written: Str, in_mod: Str) -> Str {
     tc_compiler_known_import(written, in_mod, false)
 }
 
+// The type a static-call qualifier names: a name imported from a compiler-known type's home
+// under another name (`CoreBytes.from_str`) is that type, as `Bytes.from_str` is.
+pub fn tc_static_qualifier(written: Str) -> Str {
+    let core = tc_core_type_alias_target(written, nr_current_module)
+    if core != "" { core } else { written }
+}
+
 // The compiler-known type that `written` names in module `in_mod` through an import from the
 // type's home, such as `import blink.core.{Option as CoreOption}` or
 // `import blink.ffi.{Ptr as RawPtr}`, or "".
@@ -13255,7 +13332,9 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         if recv_want != -1 {
             let recv_got = if recv_args_sl == -1 { 0 } else { sublist_length(recv_args_sl) }
             if recv_got != recv_want {
-                diag_error_at("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{impl_type}` takes {recv_want} type argument(s) but {recv_got} were given in the impl receiver", im, tc_arity_help(impl_type, recv_want, recv_got))
+                let recv_decl = tc_impl_owner_decl(im)
+                let recv_subjects: List[Int] = if recv_decl < 0 { [] } else { [tc_decl_tid(recv_decl)] }
+                tc_error_naming_types("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{impl_type}` takes {recv_want} type argument(s) but {recv_got} were given in the impl receiver", im, tc_arity_help(impl_type, recv_want, recv_got), recv_subjects)
             }
         }
         tc_pop_tparam_scope(binders_sl)
@@ -13896,7 +13975,8 @@ fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, Ty
     while j < sublist_length(types_sl) {
         let atd = sublist_get(types_sl, j)
         let alias_ann = node_value(atd)
-        if alias_ann != -1 {
+        // E0524 rejected the declaration, so the builtin keeps the name.
+        if alias_ann != -1 && !tc_type_name_is_undeclarable(node_name(atd)) {
             // The alias's own binders are in scope inside its underlying type, so
             // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
             // variable there, not the constructor (§3.4:1259).
@@ -13924,7 +14004,9 @@ fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, Ty
                 is_enum = 1
             }
         }
-        if is_enum != 0 {
+        if tc_type_name_is_undeclarable(node_name(etd)) {
+            // Rejected by E0524 and never registered.
+        } else if is_enum != 0 {
             resolve_enum_variants(etd)
         } else {
             resolve_struct_fields(etd)
@@ -15008,11 +15090,11 @@ fn builtin_partial_handler_stub(he: Int, root: Str, op: Str) -> HandlerStub ! Di
 // Whether the current module spells `t` by its name. The types a builtin signature names are
 // declared in lib/std, and ensure_runtime_struct_type returns a namesake that a user module
 // declares, so a declaration from outside lib/std means the name is not the runtime's type.
-fn builtin_stub_type_spellable(t: Int) -> Bool ! TypeCheck.Resolve {
+fn builtin_stub_type_spellable(t: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
     let named = resolve_type_name(type_to_str(t))
     // Each mention of Bytes gets its own tid, so Bytes is spellable when no declaration takes
     // the name.
-    if type_kind(t) == TyKind.Bytes { return named == -1 }
+    if type_kind(t) == TyKind.Bytes { return named >= 0 && type_kind(named) == TyKind.Bytes }
     if named != t { return false }
     let decl = tc_tid_decl_node(t)
     decl == -1 || (decl >= 0 && node_source_module(decl).starts_with("std_"))
@@ -19304,7 +19386,7 @@ fn nr_check_type_decl(td: Int) ! TypeCheck.Resolve, Diag.Report {
                         j = j + 1
                     }
                 }
-            } else if is_ffi_struct == 0 || node_name(node_value(f)) != "Buf" {
+            } else if is_ffi_struct == 0 || tc_compiler_known_type_meant(node_name(node_value(f)), node_value(f)) != "Buf" {
                 // A Buf field of an @ffi.struct is reported as E0822 alone, in resolve_struct_fields.
                 nr_check_type_ann_visibility(node_value(f))
             }
@@ -24729,7 +24811,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         }
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
-            let obj_name = node_name(obj_node)
+            let obj_written = node_name(obj_node)
+            let obj_name = if nr_has_binding(obj_written) != 0 { obj_written } else { tc_static_qualifier(obj_written) }
             if obj_name == "Char" {
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, tc_conversion_error_type())
@@ -29271,7 +29354,7 @@ let mut tc_if_value_ctx: Int = 0
 // globals (nr_scope_*, nr_name_top) — defining the pattern's bindings is the
 // intended permanent effect, not speculative state to roll back.
 @allow(UnrestoredMutation)
-fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve {
+fn tc_check_pattern_types(node: Int) ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
     // Every pattern MATCHES a value, so every pattern node has a type: the value it is

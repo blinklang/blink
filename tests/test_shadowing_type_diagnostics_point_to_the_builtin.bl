@@ -42,6 +42,24 @@ fn rejects(main: Str, sim: Str, wants: List[Str], nots: List[Str]) -> List[Str] 
     bad
 }
 
+// check and both builds fail, each with `error` and `want` copies of `help` after it. The
+// W1010 warnings print the same help before the error, so only the error's own lines count.
+fn helps_after_error(main: Str, sim: Str, error: Str, help: Str, want: Int) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let error_at = r.out.index_of(error) ?? -1
+        let after = if error_at < 0 { "" } else { r.out.substring(error_at, r.out.len()) }
+        let helps = after.split(help).len() - 1
+        if r.exit_code == 0 || error_at < 0 || helps != want {
+            bad.push("blink {args}: exit {r.exit_code}, {helps} of `{help}` after {error}, want {want}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
 fn expect_none(bad: List[Str]) {
     for b in bad { io.eprintln(b) }
     assert(bad.len() == 0)
@@ -177,4 +195,80 @@ fn main() {
 "#
     expect_none(rejects(main, "", ["variable `p`: declared type Point but got Int"],
         ["(main)", "shadows the compiler-known"]))
+}
+
+test "an arity error on a written builtin name adds no note for another module's namesake" {
+    let sim = #"pub type Option {
+    n: Int
+}
+
+pub fn mk() -> Option { Option { n: 1 } }
+"#
+    let main = #"import geo.sim
+
+fn f(_x: Option[Int, Int]) -> Int { 0 }
+
+fn main() {
+    io.println("{sim.mk().n}")
+}
+"#
+    expect_none(rejects(main, sim, ["error[TypeArgArity]"], ["`Option` here is"]))
+}
+
+test "a shadowing declaration the name does not mean here adds no note or help" {
+    let sim = #"pub type Set[T] {
+    v: T
+}
+
+pub fn mk_other() -> Set[Int] { Set { v: 1 } }
+"#
+    let main = #"import geo.sim
+
+fn main() {
+    let _t: Set[Int] = sim.mk_other()
+    io.println("x")
+}
+"#
+    expect_none(rejects(main, sim, ["error[TypeError]"], ["`Set` here is"]))
+    expect_none(helps_after_error(main, sim, "error[TypeError]", "help: import blink.core.\{Set as CoreSet}", 0))
+}
+
+test "two shadowing namesakes in one error print the import help once" {
+    let sim = #"pub type Option {
+    n: Int
+}
+
+pub fn mk() -> Option { Option { n: 1 } }
+"#
+    let main = #"import geo.sim
+
+type Option {
+    label: Str
+}
+
+fn main() {
+    let o: Option = sim.mk()
+    io.println(o.label)
+}
+"#
+    expect_none(helps_after_error(main, sim, "error[TypeError]", "help: import blink.core.\{Option as CoreOption}", 1))
+}
+
+test "an impl-receiver arity error on a shadowing name points to the builtin" {
+    let main = #"trait Tally {
+    fn tally(self) -> Int
+}
+
+type List {
+    n: Int
+}
+
+impl[T] Tally for List[T] {
+    fn tally(self) -> Int { self.n }
+}
+
+fn main() {}
+"#
+    let note = "note: `List` here is `type List` (src/main.bl:5), which shadows the compiler-known `List[T]` (blink.core)"
+    expect_none(rejects(main, "", ["error[TypeArgArity]", note, "help: import blink.core.\{List as CoreList}"], []))
 }

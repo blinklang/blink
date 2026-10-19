@@ -213,3 +213,183 @@ fn main() {
 test "FfiScope is not a name, so a declaration takes it" {
     expect_none(runs(declared_struct("FfiScope"), "", "got=7"))
 }
+
+test "the [T] sugar means the builtin List in a module that declares List" {
+    let main = #"type List {
+    n: Int
+}
+
+fn total(xs: [Int]) -> Int {
+    let mut t = 0
+    for x in xs { t = t + x }
+    t
+}
+
+fn main() {
+    io.println("{total([1, 2, 3])} {List { n: 1 }.n}")
+}
+"#
+    expect_none(runs(main, "", "6 1"))
+}
+
+test "a prelude-declared compiler-known type imported under another name is the builtin" {
+    let mut bad: List[Str] = []
+    let alone = #"import blink.core.{Ordering as CoreOrdering}
+
+fn f(a: Int, b: Int) -> CoreOrdering { a.cmp(b) }
+
+fn main() {
+    let s = match f(1, 2) {
+        Less => "less"
+        _ => "other"
+    }
+    io.println(s)
+}
+"#
+    for b in runs(alone, "", "less") { bad.push("[alone] {b}") }
+    let shadowed = #"import blink.core.{Ordering as CoreOrdering}
+
+type Ordering {
+    Up
+    Down
+}
+
+fn f(a: Int, b: Int) -> CoreOrdering { a.cmp(b) }
+
+fn main() {
+    let s = match f(1, 2) {
+        Less => "less"
+        _ => "other"
+    }
+    let d = match Up {
+        Up => "up"
+        Down => "down"
+    }
+    io.println("{s} {d}")
+}
+"#
+    for b in runs(shadowed, "", "less up") { bad.push("[shadowed] {b}") }
+    expect_none(bad)
+}
+
+test "an import alias of a compiler-known type no declaration gives is an unknown type" {
+    let main = #"import blink.core.{Range as CoreRange}
+
+fn f(_r: CoreRange[Int]) -> Int { 0 }
+
+fn main() {
+    io.println("x")
+}
+"#
+    expect_none(rejects(main, "", ["error[UnknownType]", "`CoreRange` imports `Range` from blink.core"], []))
+}
+
+test "a prelude-declared compiler-known type checks its type-argument arity" {
+    let main = #"fn f(_o: Ordering[Int]) -> Int { 1 }
+
+fn main() {
+    io.println("x")
+}
+"#
+    expect_none(rejects(main, "", ["error[TypeArgArity]", "type constructor `Ordering` takes 0 type argument(s) but 1 were given"], []))
+}
+
+test "an import alias of a compiler-known type qualifies a static call as the builtin" {
+    let main = #"import blink.core.{Bytes as CoreBytes}
+
+type Bytes {
+    n: Int
+}
+
+fn main() {
+    let b = CoreBytes.from_str("abc")
+    io.println("{b.len()} {Bytes { n: 1 }.n}")
+}
+"#
+    expect_none(runs(main, "", "3 1"))
+}
+
+test "a closure return type written as an import alias means the builtin" {
+    let main = #"import blink.core.{StringBuilder as CoreSB}
+
+fn main() {
+    let xs = [1, 2].filter(fn(_x: Int) -> CoreSB { StringBuilder.new() })
+    io.println("{xs.len()}")
+}
+"#
+    expect_none(rejects(main, "", ["closure of `List.filter` must return Bool, got StringBuilder"], []))
+}
+
+test "a parse failure carries the builtin ConversionError in a module that declares one" {
+    let main = #"type ConversionError {
+    code: Int
+}
+
+fn main() {
+    let s = match "12x".parse_int() {
+        Ok(n) => "{n}"
+        Err(e) => if e.message.len() > 0 { "err" } else { "empty" }
+    }
+    io.println("{s} {ConversionError { code: 1 }.code}")
+}
+"#
+    expect_none(runs(main, "", "err 1"))
+}
+
+test "a Debug field check reads what the field annotation means" {
+    let mut bad: List[Str] = []
+    let declared = #"@derive(Debug)
+type Result {
+    v: Int
+}
+
+@derive(Debug)
+type W {
+    s: Result
+}
+
+fn main() {
+    let w = W { s: Result { v: 1 } }
+    io.println("{w.s.v}")
+}
+"#
+    for b in runs(declared, "", "1") { bad.push("[declared Result] {b}") }
+    let handler_field = #"effect Log {
+    effect Put {
+        fn put(s: Str)
+    }
+}
+
+@derive(Debug)
+type Handler {
+    n: Int
+}
+
+@derive(Debug)
+type S {
+    h: handler[Log.Put]
+}
+
+fn main() {}
+"#
+    for b in rejects(handler_field, "", ["error[DeriveDebugFieldNoDebug]"], []) { bad.push("[handler] {b}") }
+    expect_none(bad)
+}
+
+test "an @ffi.struct field of a declared Buf is that struct, not the ffi Buf" {
+    let main = #"@ffi.struct
+type Buf {
+    n: I32
+}
+
+@ffi.struct
+type Outer {
+    b: Buf
+}
+
+fn main() {
+    io.println("x")
+}
+"#
+    expect_none(runs(main, "", "x"))
+}
