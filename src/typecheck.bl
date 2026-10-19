@@ -24,7 +24,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
     diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
-    diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
+    diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
@@ -26388,28 +26388,18 @@ fn tc_value_tail_stmt(block: Int, consumed: Bool) -> Int {
 
 // A binding's value type once the walk has typed the value in its own scope: `inferred` is what
 // infer_type answered before the walk, `pre` and `post` the value's scoped memo before and after
-// it. A fn-body `let` and a module-level `let` both read their value this way.
+// it.
 //
-// `let x = { let h = 5  h }` and
-// `let x = match sh { Circle(a) => a  Square(a) => a }` — the value names a binding
-// the construct itself introduces, which infer_type could not see because
-// tc_check_body had not pushed that frame yet. It has now, and it memoized the value
-// in scope, so the answer is available one line later. A caller reads it BEFORE its
-// declared/inferred compare, which is the point: TYPE_UNKNOWN unifies with
-// anything, so `let x: Str = { let h = 5  h }` typechecked clean, and a closure
-// reached this way lost the arity check.
+// A value can name a binding its own construct introduces: `let x = { let h = 5  h }`, or
+// a match arm's pattern binder. infer_type reads that name before the construct's scope
+// exists, so it answers with a hole. The walk pushes the scope and memoizes the value in
+// it, so the caller reads that answer before it checks the value against an annotation.
+// A hole unifies with anything, so a check against the hole would pass any annotation.
 //
-// Recovery only — it can never overwrite an answer infer_type already gave, so no
-// shape that resolved before now takes a different tid.
-//
-// The gate reads "carries a hole", not "IS a hole". A carrier whose
-// ELEMENT names the block-local infers as `List[?]` / `Option[?]` / `(?, Int)` —
-// none of them TYPE_UNKNOWN — so an `== TYPE_UNKNOWN` gate treated a partially
-// erased answer as an answer and left the element erased, which is a SILENT
-// miscompile one level down (`let bad: Int = xs.get(0).unwrap()` ran and printed a
-// Str). The take stays monotone in both cases: a bare UNKNOWN accepts the memo
-// whole, exactly as before, and a partially erased answer takes only the memo's
-// answers for the positions it has no answer of its own for.
+// The take never replaces an answer infer_type gave. It fills holes only: a bare hole
+// takes the memo whole, and a carrier with a hole in it (`List[?]`, `Option[?]`,
+// `(?, Int)`) takes the memo's answer at each position it has none for, so an element
+// type is not left erased.
 fn tc_value_tid_after_walk(val: Int, inferred: Int, pre: Int, post: Int) -> Int {
     if tc_tid_is_no_info(inferred) != 0 || tc_tid_has_unknown(inferred) != 0 {
         if tc_tid_is_no_info(post) != 0 { return inferred }
@@ -28787,6 +28777,29 @@ fn tc_check_body_with_hint(node: Int, hint: Int) ! TypeCheck.Resolve, TypeCheck.
 
 // A let's value is inferred under the let's own hint, and with its binder named so an
 // `FfiScope` misuse repair carries the author's name.
+// The type of a `let` value, read one way for a `let` in a body and for a module-level one.
+fn tc_infer_walked_let_value(val: Int, binder: Str, hint: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let inferred = tc_infer_let_value(val, binder, hint)
+    // What the inference above wrote for the value's tail, read BEFORE the walk below
+    // retypes it in scope. A tail that names a binding the value's own construct
+    // introduces was resolved against the enclosing scope, so a name it SHADOWS
+    // answered with the outer binding's type: confidently, and wrongly, which is why
+    // the recovery below cannot gate on the answer being absent.
+    let pre = tc_scoped_value_memo(val, 0)
+    let reread = tc_value_awaits_closure_ret(val)
+    // A closure written inside a container literal — `let fs: List[fn(Int) -> Int] =
+    // [fn(x: Int) -> Int { x + 1 }]` — is reached by neither walk on its own: tc_check_body
+    // descends a call or a struct literal, not a list, and infer_type types the closure's
+    // signature without its body. tc_walk_stmt_value picks the walk the value's kind needs.
+    tc_walk_stmt_value(val)
+    // What the walk wrote for the value in scope, read before the inference below
+    // writes its own answer over it again.
+    let post = tc_scoped_value_memo(val, 0)
+    let read = if reread { tc_infer_let_value(val, binder, hint) } else { inferred }
+    tc_report_deferred_branch_mismatch(val)
+    tc_value_tid_after_walk(val, read, pre, post)
+}
+
 fn tc_infer_let_value(val: Int, binder: Str, hint: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_hint = tc_construct_hint
     tc_construct_hint = hint
@@ -28945,25 +28958,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // A let binding is expression context (§2.9): infer in value context so an else-less
             // `if` as its value (no value on the false path) is rejected regardless of the
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
-            inferred_tid = tc_infer_let_value(val, vname, let_hint)
-            // What the inference above wrote for the value's tail, read BEFORE the walk below
-            // retypes it in scope. A tail that names a binding the value's own construct
-            // introduces was resolved against the enclosing scope, so a name it SHADOWS
-            // answered with the outer binding's type: confidently, and wrongly, which is why
-            // the recovery below cannot gate on the answer being absent.
-            let pre_val_memo = tc_scoped_value_memo(val, 0)
-            let reread = tc_value_awaits_closure_ret(val)
-            // A closure written inside a container literal — `let fs: List[fn(Int) -> Int] =
-            // [fn(x: Int) -> Int { x + 1 }]` — is reached by neither walk on its own: tc_check_body
-            // descends a call or a struct literal, not a list, and infer_type types the closure's
-            // signature without its body. tc_walk_stmt_value picks the walk the value's kind needs.
-            tc_walk_stmt_value(val)
-            // What the walk wrote for the value in scope, read before the inference below
-            // writes its own answer over it again.
-            let post_val_memo = tc_scoped_value_memo(val, 0)
-            if reread { inferred_tid = tc_infer_let_value(val, vname, let_hint) }
-            tc_report_deferred_branch_mismatch(val)
-            inferred_tid = tc_value_tid_after_walk(val, inferred_tid, pre_val_memo, post_val_memo)
+            inferred_tid = tc_infer_walked_let_value(val, vname, let_hint)
         }
 
         if tc_tid_is_no_info(declared_tid) == 0 && tc_tid_is_no_info(inferred_tid) == 0 {
@@ -29475,6 +29470,13 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if reread {
                 val_t = tc_infer_returned_value_with_hint(val, returns_value, ret_hint)
                 tc_check_returned_value(val_t, node)
+            } else {
+                // The walk infers the value again, and an empty container in an arm tail
+                // mints fresh metavars when it does. The return type is still each arm's
+                // expected type (sections/03_types.md 3.3), so it pins them once more.
+                if returns_value && tc_tid_is_no_info(tc_current_fn_ret) == 0 && tc_tid_is_no_info(val_t) == 0 && types_compatible(tc_current_fn_ret, val_t) != 0 {
+                    tc_pin_declared_into_value(tc_current_fn_ret, val, val_t)
+                }
             }
         } else {
             if tc_current_fn_ret != TYPE_VOID && tc_tid_is_no_info(tc_current_fn_ret) == 0 {
@@ -30267,13 +30269,8 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
 fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let declared = tc_lookup_node_tid(l)
     tc_seed_expected_into_value(l_val, declared)
-    let saved_hint = tc_construct_hint
-    if tc_tid_is_no_info(declared) == 0 { tc_construct_hint = resolve_alias_tid(declared) }
-    let v_tid = tc_infer_value(l_val)
-    tc_construct_hint = saved_hint
-    // infer_type types a value's shape only, never a body nested in a closure, in a call's
-    // closure argument or in a struct literal's block-valued field — tc_stmt_value_walks_body.
-    tc_walk_stmt_value(l_val)
+    let hint = if tc_tid_is_no_info(declared) == 0 { resolve_alias_tid(declared) } else { tc_construct_hint }
+    let v_tid = tc_infer_walked_let_value(l_val, node_name(l), hint)
     if tc_tid_is_no_info(declared) == 0 && tc_tid_is_no_info(v_tid) == 0 {
         // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
         // ahead of the compare can turn a mismatch into a silent success.
@@ -30327,17 +30324,11 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
                 tc_stamp_annotated_global_init(l, l_val)
             } else {
                 let vk = node_kind(l_val)
-                if vk != NodeKind.IntLit && vk != NodeKind.FloatLit && vk != NodeKind.BoolLit && vk != NodeKind.InterpString {
+                if vk != NodeKind.IntLit && vk != NodeKind.FloatLit && vk != NodeKind.BoolLit {
                     nr_current_module = node_module(l)
                     let saved = diag_entry_count()
-                    let shape_tid = infer_type(l_val)
-                    // infer_type types a value's shape, never the statements of a block or an
-                    // arm inside it, so the value is walked and then read as a fn-body let
-                    // reads its own.
-                    let pre = tc_scoped_value_memo(l_val, 0)
-                    tc_walk_stmt_value(l_val)
-                    let l_tid = tc_value_tid_after_walk(l_val, shape_tid, pre, tc_scoped_value_memo(l_val, 0))
-                    let clean = diag_entry_count() == saved
+                    let l_tid = tc_infer_walked_let_value(l_val, node_name(l), tc_construct_hint)
+                    let clean = diag_any_errors_since(saved) == 0
                     if clean && tc_tid_is_no_info(l_tid) == 0 {
                         if tc_tid_has_unbound_metavar(l_tid) != 0 {
                             tc_ud_judge_binder(node_name(l), l_tid, l)

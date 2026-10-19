@@ -22,7 +22,7 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_NEVER, TYPE_STR, TYPE_VOID,
     tc_call_declared_name, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
-    tc_lookup_node_tid, tc_tid_decl_node, tc_tid_kind, make_list_type,
+    tc_lookup_node_tid, tc_tid_kind, make_list_type,
     tc_alias_decl_of_ann, tc_ensures_preds_of, tc_is_old_snapshot, tc_requires_preds_of,
 }
 import layout.{
@@ -224,13 +224,17 @@ pub fn lower_global_init(g: Int) -> Int ! Diag.Report {
 // something else declared. An initializer that always diverges keeps the statements up to
 // the divergence and assigns nothing, as lower_stmt_left does for a local.
 fn lower_global_value(g: Int) -> Int ! Diag.Report {
-    let mark = cg_expr_pending_count()
-    let value_mark = cg_expr_value_count()
-    if !materialise_stmt_values(g) {
-        let _dropped = cg_expr_take_pending(mark)
-        cg_expr_drop_values(value_mark)
+    let ret = return_outside_fn(node_value(g))
+    if ret >= 0 {
+        // The spec does not say what a return in an initializer leaves, and lowered as it
+        // stands it would return from the init function, so it fails closed.
+        diag_ice_at("ReturnInGlobalInitializer", CODEGEN_STAGE_NOT_BUILT,
+            "a `return` in a top-level `let` initializer has no function to leave", ret,
+            "compute the value without `return`, or move it into a function the initializer calls")
         return poison_value(node_value(g))
     }
+    let mark = cg_expr_pending_count()
+    if !materialise_or_drop(g, mark) { return poison_value(node_value(g)) }
     let left = cg_expr_pending_leaves_from(mark)
     if left >= 0 {
         let _dead = cg_expr_take_pending(left + 1)
@@ -240,6 +244,19 @@ fn lower_global_value(g: Int) -> Int ! Diag.Report {
     let hoisted = cg_expr_take_pending(mark)
     if hoisted.len() == 0 { return value }
     lower_global_assign(g, hoisted, value)
+}
+
+// The first `return` in `n` that is not inside a closure or a handler of its own, or -1.
+fn return_outside_fn(n: Int) -> Int {
+    if n < 0 { return -1 }
+    let k = nk_of(node_kind(n))
+    if k == NodeKind.Return { return n }
+    if k == NodeKind.Closure || k == NodeKind.HandlerExpr { return -1 }
+    for c in node_value_child_ids(n) {
+        let r = return_outside_fn(c)
+        if r >= 0 { return r }
+    }
+    -1
 }
 
 // A checked initializer needs statements ahead of its value, and a C global's own
@@ -1517,11 +1534,7 @@ fn lower_return(node: Int) -> Int ! Diag.Report {
 fn lower_stmt_hoisted(s: Int, tail: Int, dest: Str, dest_tid: Int, out: List[Int]) -> Bool ! Diag.Report {
     let mark = cg_expr_pending_count()
     let value_mark = cg_expr_value_count()
-    if !materialise_stmt_values(s) {
-        let _dropped = cg_expr_take_pending(mark)
-        cg_expr_drop_values(value_mark)
-        return false
-    }
+    if !materialise_or_drop(s, mark) { return false }
     let left = cg_expr_pending_leaves_from(mark)
     if left >= 0 { return lower_stmt_left(s, mark, left, out) }
     let lowered = lower_stmt_tail(s, tail, dest, dest_tid)
@@ -1535,6 +1548,16 @@ fn lower_stmt_hoisted(s: Int, tail: Int, dest: Str, dest_tid: Int, out: List[Int
     cg_expr_drain_pending(mark, out)
     out.push(lowered)
     true
+}
+
+// A refused walk queued statements and value rows that nothing will read, so they go
+// with it.
+fn materialise_or_drop(s: Int, mark: Int) -> Bool ! Diag.Report {
+    let value_mark = cg_expr_value_count()
+    if materialise_stmt_values(s) { return true }
+    let _dropped = cg_expr_take_pending(mark)
+    cg_expr_drop_values(value_mark)
+    false
 }
 
 // A part the statement runs every time diverged while its values were materialised, so the

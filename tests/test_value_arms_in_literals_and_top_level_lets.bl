@@ -32,6 +32,23 @@ fn expect_runs(src: Str, want: Str) {
     assert(ok)
 }
 
+fn expect_rejects(src: Str, code: Str) {
+    let dir = sh("mktemp -d /tmp/blink_value_arms.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    let mut ok = true
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code == 0 || !r.out.contains("error[{code}]") || r.out.contains("internal compiler error") {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
 test "a struct literal that leaves a field to its default runs an if, a match and a block field" {
     expect_runs(#"type S {
     a: Int = 3
@@ -211,4 +228,118 @@ fn main() {
     io.println("{f(1)} {g(4)} {h(9)} {k(1)}")
 }
 "#, "11 8 8 101")
+}
+
+test "a closure in a top-level let lowers outside every generic instance" {
+    expect_runs(#"fn wrap[T](x: T) -> List[T] { [x] }
+fn later(n: Int) -> Int { n * 3 }
+let add = fn(n: Int) -> Int { wrap(n).len() + later(n) }
+fn main() {
+    let f = add
+    io.println("{f(2)} {wrap(1).len()}")
+}
+"#, "7 1")
+}
+
+test "a with arena value in a top-level let runs in its module's init function" {
+    expect_runs(#"let made = with arena { let xs = [1, 2, 3]
+    xs.len() }
+let shout = if made > 1 { with arena { "x".to_upper() } } else { "n" }
+fn main() {
+    io.println("{made} {shout}")
+}
+"#, "3 X")
+}
+
+test "a warning inside a top-level let initializer leaves the global typed" {
+    expect_runs(#"let f = fn(n: Int) -> Int {
+    return n + 1
+    n + 2
+}
+let g = { let k = fn(n: Int) -> Int {
+        return n * 2
+        n
+    }
+    k(2) }
+fn main() {
+    let h = f
+    io.println("{h(1)} {g}")
+}
+"#, "2 4")
+}
+
+test "a block in a hole of a top-level string let is typed" {
+    expect_runs(#"let T = "y{ { let t = 3
+    t } }"
+fn main() {
+    io.println(T)
+}
+"#, "y3")
+}
+
+test "a return type reaches an empty container in each arm of an early return" {
+    expect_runs(#"fn early(c: Bool) -> Map[Str, Int] {
+    if !c { return if c { Map() } else { Map() } }
+    Map()
+}
+fn looped(c: Bool) -> Set[Int] {
+    for i in [1] { return match c {
+        true => Set()
+        false => Set()
+    } }
+    Set()
+}
+fn main() {
+    io.println("{early(false).len()} {looped(true).len()}")
+}
+"#, "0 0")
+}
+
+test "a top-level let checks a block's tail against its annotation" {
+    expect_rejects(#"let x: Str = { let h = 5
+    h }
+fn main() {
+    io.println(x)
+}
+"#, "TypeError")
+}
+
+test "a top-level let checks that its if arms agree" {
+    expect_rejects(#"let FLAG = false
+let x = if FLAG { let h = 5
+    h } else { 2.5 }
+fn main() {
+    io.println("{x}")
+}
+"#, "TypeError")
+}
+
+test "a top-level let checks an operator again once a closure's result is known" {
+    expect_rejects(#"let s = [1].map(fn(x) { "a" }).get(0).unwrap() + 1
+fn main() {
+    io.println("{s}")
+}
+"#, "StrPlusUnsupported")
+}
+
+test "a return in a top-level let initializer stops the build before C" {
+    let dir = sh("mktemp -d /tmp/blink_value_arms.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", #"let x = { if true { return 1 }
+    2 }
+fn main() {
+    io.println("{x}")
+}
+"#)
+    let mut ok = true
+    for args in ["build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code == 0 || r.out.contains("C compilation failed") {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
 }

@@ -321,10 +321,11 @@ fn impl_method_named(im: Int, name: Str, node: Int) -> Int ! Diag.Report {
 // else. The IR carries no definitions, so the value is a ClosureNew record naming
 // `symbol` and the definition waits here until the driver drains the queue.
 //
-// The driver drains after the enclosing body and BEFORE it leaves that body's instance:
-// the thunk's body reads its types through tid_of_node, which answers under the current
-// instance, so a thunk drained under a different one would read a different
-// substitution from the one its literal was lowered under.
+// The driver lowers a thunk after the enclosing body, or the enclosing global's
+// initializer, and BEFORE it leaves that instance and module: the thunk's body reads its
+// types through tid_of_node, which answers under the current instance, so a thunk lowered
+// under a different one would read a different substitution from the one its literal was
+// lowered under. Printing may wait until later.
 type PendingThunk {
     closure: Int
     // "" for an entry that is only a spawn task wrapper (cg_eff_spawn_value_task): it
@@ -358,6 +359,11 @@ type PendingThunk {
     forward_to: Int
     forward_symbol: Str
     forward_ev: Bool
+    // Set once the driver has lowered the thunk's body, which is `body` (-1 for none). A
+    // global initializer's thunks are lowered under the root with the initializer, and
+    // printed later, after the signatures they call.
+    lowered: Bool
+    body: Int
 }
 
 let mut eff_thunks: List[PendingThunk] = []
@@ -429,7 +435,7 @@ pub fn cg_eff_spawn_value_task(arg: Int) -> Str ! Diag.Report {
     eff_thunks.push(PendingThunk {
         closure: arg, symbol: "", fn_tid: tid, cap_names: [], cap_tids: [], cap_celled: [],
         handler_tid: -1, outer_name: "", task_symbol: task_symbol, forward_to: -1,
-        forward_symbol: "", forward_ev: false,
+        forward_symbol: "", forward_ev: false, lowered: false, body: -1,
     })
     task_symbol
 }
@@ -460,7 +466,7 @@ fn lower_closure_thunk(node: Int, task_symbol: Str) -> Int ! Diag.Report {
     eff_thunks.push(PendingThunk {
         closure: node, symbol: symbol, fn_tid: tid, cap_names: free, cap_tids: tids,
         cap_celled: celled, handler_tid: -1, outer_name: "", task_symbol: task_symbol,
-        forward_to: -1, forward_symbol: "", forward_ev: false,
+        forward_to: -1, forward_symbol: "", forward_ev: false, lowered: false, body: -1,
     })
     ir_closure_new(tid, node, rec.c_spelling, symbol, descs, "", words)
 }
@@ -488,7 +494,7 @@ pub fn cg_eff_lower_fn_value(node: Int, decl: Int, symbol: Str, takes_ev: Bool) 
     eff_thunks.push(PendingThunk {
         closure: node, symbol: thunk, fn_tid: tid, cap_names: [], cap_tids: [], cap_celled: [],
         handler_tid: -1, outer_name: "", task_symbol: "", forward_to: decl, forward_symbol: symbol,
-        forward_ev: takes_ev,
+        forward_ev: takes_ev, lowered: false, body: -1,
     })
     ir_closure_new(tid, node, rec.c_spelling, thunk, "", "", [])
 }
@@ -671,7 +677,7 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
         eff_thunks.push(PendingThunk {
             closure: sig.op, symbol: b.symbol, fn_tid: sig.fn_tid, cap_names: sig.free, cap_tids: b.tids,
             cap_celled: b.celled, handler_tid: tid, outer_name: outer, task_symbol: "", forward_to: -1,
-            forward_symbol: "", forward_ev: false,
+            forward_symbol: "", forward_ev: false, lowered: false, body: -1,
         })
         print_vtable_slot_fn_decl(sig.ret, b.symbol, sig.params)
         words.push(ir_closure_new(sig.fn_tid, sig.op, sig.closure_spelling, b.symbol, b.descs, "", b.kids))
@@ -883,6 +889,35 @@ fn handler_op_params(op: Int) -> List[Str] ! Diag.Report {
 // ── The thunk queue ───────────────────────────────────────────────────────────────
 
 pub fn cg_eff_pending_thunks() -> Int { eff_thunks.len() }
+
+// The driver lowers the queue in order, so the thunks still to lower are the ones after the
+// leading run that is done.
+pub fn cg_eff_lowered_thunks() -> Int {
+    let mut n = 0
+    while n < eff_thunks.len() && eff_thunks.get(n).unwrap().lowered { n = n + 1 }
+    n
+}
+
+pub fn cg_eff_thunk_set_body(i: Int, body: Int) ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return }
+    eff_thunks.set(t, PendingThunk { lowered: true, body: body, ..eff_thunks.get(t).unwrap() })
+}
+
+// A thunk printed before it was lowered would be lowered under whatever body prints it,
+// which reads its types through the wrong instance.
+pub fn cg_eff_thunk_body(i: Int) -> Int ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return -1 }
+    let th = eff_thunks.get(t).unwrap()
+    if !th.lowered {
+        diag_ice("ThunkNotLowered", POISONED_IR_AT_SEAM,
+            "thunk {i} is printed before its body was lowered", 0, 0,
+            "the driver lowers every queued thunk before it prints the queue")
+        return -1
+    }
+    th.body
+}
 
 // The driver calls this once it has printed every queued thunk, so the next body's
 // queue starts empty and a thunk is never defined twice. A thunk body can queue a

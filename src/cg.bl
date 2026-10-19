@@ -64,7 +64,8 @@ import cg_expr.{cg_expr_frame_clear, cg_expr_reset, cg_expr_set_return_type, cg_
 import cg_eff.{
     cg_eff_forwarding_body, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_register_async_scope_guard_support,
     cg_eff_register_ffi_scope_guard_support, cg_eff_reset, cg_eff_thunk_body_node, cg_eff_thunk_close,
-    cg_eff_thunk_has_body, cg_eff_thunk_open, cg_eff_thunk_ret_tid, cg_eff_thunks_drained,
+    cg_eff_thunk_has_body, cg_eff_thunk_open, cg_eff_thunk_ret_tid, cg_eff_thunks_drained, cg_eff_lowered_thunks,
+    cg_eff_thunk_set_body, cg_eff_thunk_body,
 }
 
 effect Codegen {
@@ -351,13 +352,18 @@ fn no_instance_bodies(decl: Int) ! Diag.Report {
 // chooses the scope: the whole program for a single-unit build, or one module's own
 // globals for the per-module mode — the defining module is the only one that ever lowers
 // a given global's initializer.
+//
+// The closures an initializer queues are lowered with it, in its module and under the root,
+// and wait in the queue for the definition half to print them.
 fn lower_global_inits(globals: List[Int]) -> Map[Int, Int] ! Diag.Report {
+    set_current_inst(-1)
     let mut out: Map[Int, Int] = Map()
     for g in globals {
         let init = node_value(g)
         if init < 0 { continue }
         let saved_module = tc_enter_body_module(g)
         out.insert(g, verify_lowered_unit(lower_global_init(g), g))
+        lower_queued_thunks()
         tc_leave_body_module(saved_module)
     }
     out
@@ -639,21 +645,9 @@ pub fn verify_lowered_unit(root: Int, at_node: Int) -> Int ! Diag.Report {
     root
 }
 
-// A global initializer that crosses an arena calls a walker no body has printed yet.
-fn flush_walkers() ! Diag.Report {
-    if !cg_promote_has_pending() { return }
-    print_typedef_blocks(layout_take_typedefs())
-    cg_promote_print_walkers()
-}
-
-// One body, with every closure it queued defined ahead of it. The thunks print before the
-// body that names them because C reads a name only after its definition, and they print
-// under the same mono instance the body was lowered under, because a thunk's types are
-// read through that instance. A thunk body can queue a nested closure, so the count is
-// re-read on every step, and the queue keeps the count it was told against its own length.
-//
-// Every caller prints the body before it lowers the next one, so the next body's start is
-// where this one's nodes are released.
+// One body, with every closure it queued defined ahead of it. Every caller prints the body
+// before it lowers the next one, so the next body's start is where this one's nodes are
+// released.
 fn lower_body(decl: Int) -> Int ! Diag.Report {
     let saved_module = tc_enter_body_module(decl)
     let lowered = lower_body_in_module(decl)
@@ -664,38 +658,37 @@ fn lower_body(decl: Int) -> Int ! Diag.Report {
 fn lower_body_in_module(decl: Int) -> Int ! Diag.Report {
     ir_begin_body()
     let body = lower_fn(decl)
-    print_queued_thunks(lower_queued_thunks())
+    lower_queued_thunks()
+    print_queued_thunks()
     verify_lowered_unit(body, decl)
 }
 
-// The closures a module's global initializers queued, defined ahead of the init function
-// that names them. That function prints before any body of the unit, so no body's drain
-// has defined them yet.
-fn print_global_thunks(span: Int) ! Diag.Report {
-    let saved_module = tc_enter_body_module(span)
-    print_queued_thunks(lower_queued_thunks())
-    tc_leave_body_module(saved_module)
-}
-
-fn lower_queued_thunks() -> List[Int] ! Diag.Report {
-    let mut bodies: List[Int] = []
-    while bodies.len() < cg_eff_pending_thunks() {
-        let n = bodies.len()
+// Each thunk not lowered yet, under the module and the mono instance current now. That is
+// the context the code that queued it was lowered in, because the caller lowers the queue
+// before it leaves that context: a thunk reads its types through the current instance, and
+// one lowered under another body's instance reads a substitution its literal never had. A
+// thunk body can queue a nested closure, so the length is read again on every step.
+fn lower_queued_thunks() ! Diag.Report {
+    let mut n = cg_eff_lowered_thunks()
+    while n < cg_eff_pending_thunks() {
         // A task-only entry has no body to lower. An open that refused has made its report;
         // a close would only add a second.
         if !cg_eff_thunk_has_body(n) {
-            bodies.push(-1)
+            cg_eff_thunk_set_body(n, -1)
         } else if cg_eff_thunk_open(n) >= 0 {
-            bodies.push(lower_thunk_body(n))
+            let body = lower_thunk_body(n)
             cg_eff_thunk_close()
+            cg_eff_thunk_set_body(n, body)
         } else {
-            bodies.push(-1)
+            cg_eff_thunk_set_body(n, -1)
         }
+        n = n + 1
     }
-    bodies
 }
 
-fn print_queued_thunks(bodies: List[Int]) ! Diag.Report {
+// Every queued thunk, defined ahead of the code that names it, since C reads a name only
+// after its definition.
+fn print_queued_thunks() ! Diag.Report {
     // A carrier first spelled while lowering this body or its thunks prints ahead of the
     // thunks too. The signature drains what is left, but the thunks come out before it.
     print_typedef_blocks(layout_take_typedefs())
@@ -703,12 +696,13 @@ fn print_queued_thunks(bodies: List[Int]) ! Diag.Report {
     cg_promote_print_walkers()
     // A nested closure is queued after the thunk whose body names it, so the later thunk
     // prints first.
-    let mut k = bodies.len()
+    let count = cg_eff_pending_thunks()
+    let mut k = count
     while k > 0 {
         k = k - 1
-        cg_eff_print_thunk(k, bodies.get(k).unwrap())
+        cg_eff_print_thunk(k, cg_eff_thunk_body(k))
     }
-    cg_eff_thunks_drained(bodies.len())
+    cg_eff_thunks_drained(count)
 }
 
 // One thunk's body, lowered against the closure's own result, which decides two things a
@@ -768,6 +762,9 @@ fn emit_definitions_of(cfg: CgConfig, module_key: Str, scope_fns: List[Int], sco
     // and the archive's header would then offer instances the archive does not have.
     emit_instance_signatures(cfg, fns)
     emit_instance_signatures(cfg, methods)
+    // The closures the globals' initializers queued call these signatures, and the init
+    // function that names them prints after the bodies.
+    print_queued_thunks()
     emit_bodies(cfg, fns)
     emit_bodies(cfg, methods)
     emit_derived_op_bodies()
@@ -914,7 +911,6 @@ fn emit_global_init_fn(cfg: CgConfig, program: Int, deferred: List[Int]) -> List
     let decls = cg_reg_global_decls()
     let span = if decls.len() > 0 { decls.get(0).unwrap() } else { program }
     let body = verify_lowered_unit(ir_block(span, deferred), span)
-    flush_walkers()
     let mut name = "__blink_init_globals"
     if is_archive {
         name = archive_init_globals_name(cfg)
@@ -1218,12 +1214,9 @@ fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: Pro
     let own_globals = globals_in_scope(cfg, module_key, false)
     let inits = lower_global_inits(own_globals)
     let deferred = cg_decl_emit_globals(false, own_globals, inits)
-    if deferred.len() > 0 {
-        let span = own_globals.get(0).unwrap()
-        let init_body = verify_lowered_unit(ir_block(span, deferred), span)
-        print_global_thunks(span)
-        print_fn(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false, init_body)
-    }
+    // Built before the first body, whose start would release the nodes of anything later.
+    let span = if own_globals.len() > 0 { own_globals.get(0).unwrap() } else { -1 }
+    let init_body = if deferred.len() > 0 { verify_lowered_unit(ir_block(span, deferred), span) } else { -1 }
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
     // Only the entry module reaches emit_entry, where a test body would lower; scanning
@@ -1234,6 +1227,11 @@ fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: Pro
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
     emit_definitions_of(cfg, module_key, fns, methods, facts.key_table_nodes, true)
+    // After the definitions, which print the closures it names and the scope support it
+    // calls, as the one-unit build's init function does.
+    if init_body >= 0 {
+        print_fn(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false, init_body)
+    }
     if module_key == "__main__" { emit_entry(cfg, facts.entry_init_fns) }
     if copies_on_demand(cfg, module_key) { emit_named_private_copies(cfg) }
     print_take()
