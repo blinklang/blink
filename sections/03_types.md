@@ -4513,7 +4513,7 @@ fn main() {
 
 The text does not show the sign of zero or the bits of a NaN, because no `Float` equality tells those values apart. To test the sign of zero, use `1.0 / x < 0.0`.
 
-**One form everywhere.** Every place that Blink, its standard library or the `blink` toolchain writes a finite `Float` as decimal text uses this form, unless this spec names a different form for that place. Such places include `display()`, `debug()`, string interpolation, power-assert values (§2.20), JSON number output (§3.6.2) and test-runner output (§8.10). `Float.display_fixed` is a named different form (*Fixed-Decimal and Zero-Padded Forms*). A form that is not decimal text, such as a bit pattern, is outside this rule. How JSON encodes NaN and the infinities belongs to §3.6.2, not to this rule.
+**One form everywhere.** Every place that Blink, its standard library or the `blink` toolchain writes a finite `Float` as decimal text uses this form, unless this spec names a different form for that place. Such places include `display()`, `debug()`, string interpolation, power-assert values (§2.20), JSON number output (§3.6.2) and test-runner output (§8.10). `Float.display_fixed` is a named different form (*Fixed-Decimal and Zero-Padded Forms*). A form that is not decimal text, such as a bit pattern, is outside this rule. JSON writes NaN and the infinities as `null` (§3.6.2 *NaN and Infinity*), so this rule covers only its finite numbers.
 
 **F32.** Whenever an `F32` renders as text, it uses the same rules, with the digits chosen for IEEE 754 binary32 in place of binary64. An `F32` that holds `0.1` renders as `0.1`. The same value widened to `Float` renders as `0.10000000149011612`, because it is a different `Float`. This rule does not add `F32` to the built-in `Display` impls.
 
@@ -4870,12 +4870,12 @@ type JsonError {
 
 When a derived `from_json` calls `from_json` for a field and gets `Err(e)`, it returns `e` with its own step put in `e.path` just after the `$`. A nested error from `$.age` in field `owner` becomes `$.owner.age`. A nested error with `path: ""` becomes `$.owner`. So a hand-written impl deep in the value still gets a path up to its own position.
 
-**`message`** is text for people. The spec fixes only its location content:
+**`message`** is text for people. The spec fixes its location content:
 
 - A parse error's `message` contains `line L, column C`. Both count from 1. Lines are split at `\n` (U+000A). The column counts bytes from the start of the line, the same unit as `Str.len()`.
 - A decode error whose `path` is not `""` has a `message` that contains `at <path>`, for example `at $.items[2].age`.
 
-The rest of the wording is not fixed, except that `json.decode[T]` and its two-step form give the same text (§3.6.3 *Typed Decoding and Encoding*).
+*NaN and Infinity* and *Str-Backed Enums* below add content rules for some errors. The rest of the wording is not fixed, except that `json.decode[T]` and its two-step form give the same text (§3.6.3 *Typed Decoding and Encoding*).
 
 ##### Derive Behavior
 
@@ -4920,6 +4920,32 @@ JSON has one number type. `JsonValue` has two, and these rules decide between th
 - A derived `from_json` for a `Float` field accepts `JsonValue.Int` and converts it, so `{"temp_c": 20}` decodes into `temp_c: Float`.
 - A derived `from_json` for an `Int` field accepts only `JsonValue.Int`. It never narrows a `Float`, not even `3.0`.
 - `as_float()` on a `JsonValue.Int` gives `Some`. `as_int()` on a `JsonValue.Float` gives `None`.
+
+##### NaN and Infinity
+
+JSON has no NaN and no infinity. A `JsonValue.Float` can hold either, so these rules decide what happens in each direction:
+
+- **Encode.** `json.stringify`, `json.pretty` and `json.encode` write a `JsonValue.Float` that holds NaN, `inf` or `-inf` as `null`. They stay infallible. A finite `Float` uses the Float Text Form (§3.6).
+- **Parse.** RFC 8259 has no `NaN`, `Infinity` or `-Infinity` token. Input that has one of these, in any ASCII case, makes `json.parse` give `Err`, although `parse_float` accepts the same text (§3.2.1 *Parsing*). The error `message` names the rejected token.
+- **Decode.** A derived `from_json` for a `Float` field rejects `JsonValue.Null`. The error `message` says that the value was `null` and that the field expects `Float`. An `Option[Float]` field reads `null` as `None`.
+
+The location rules for `message` still apply, and the rest of the wording is not fixed. For example:
+
+```
+NaN is not valid JSON: JSON has no NaN or Infinity, at line 1, column 7
+expected Float, got null at $.temp_c
+```
+
+The first message is for `json.parse("\{\"a\": NaN}")`. The second is for a derived `from_json` that reads `{"temp_c": null}` into `temp_c: Float`.
+
+**Laws.** For every `v` of type `JsonValue`:
+
+- **Valid output.** `json.parse(json.stringify(v))` and `json.parse(json.pretty(v))` are `Ok`. So every `Str` that `json.encode` returns is text that `json.parse` accepts.
+- **Round trip.** `json.parse(json.stringify(v)) == Ok(w)`, where `w` is `v` with each `JsonValue.Float` that holds NaN, `inf` or `-inf` replaced by `JsonValue.Null`.
+
+`JsonValue` implements `Eq` with structural `==`: two values are equal when they are the same variant and their payloads are equal. A `Float` payload compares as in *Float Total Ordering*, so `JsonValue.Float(0.0)` equals `JsonValue.Float(-0.0)`. `Object` compares its `fields` as a list, so entry order and duplicate keys count. `JsonValue.Int(1)` does not equal `JsonValue.Float(1.0)`. `JsonValue` does not implement `Hash`, because `Float` does not.
+
+A non-finite `Float` does not survive the round trip. A `Float` field that holds one encodes as `null`, and decoding that `null` into the field gives `Err`. An `Option[Float]` field that holds `Some` of a non-finite `Float` decodes as `None`.
 
 ##### Str-Backed Enums
 
