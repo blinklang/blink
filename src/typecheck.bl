@@ -859,33 +859,37 @@ fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
 }
 
 // The home of a compiler-known type name that a declaration may shadow, as an import path
-// names it, or "" for any other name (sections/07_trust_modules_metadata.md §10.6). This is
-// the one list: is_primitive_type, the shadow check, the alias import and the W1010 help all
-// read it.
-fn tc_shadowable_type_home(name: Str) -> Str {
+// names it, and the name as the table of sections/07_trust_modules_metadata.md §10.6 writes
+// it, or ("", "") for any other name. This is the one list: is_primitive_type, the shadow
+// check, the alias import and W1010 all read it.
+fn tc_shadowable_type(name: Str) -> (Str, Str) {
     match name {
-        "List" => "blink.core"
-        "Map" => "blink.core"
-        "Set" => "blink.core"
-        "Option" => "blink.core"
-        "Result" => "blink.core"
-        "Ordering" => "blink.core"
-        "Iterator" => "blink.core"
-        "Never" => "blink.core"
-        "Bytes" => "blink.core"
-        "StringBuilder" => "blink.core"
-        "Handle" => "blink.core"
-        "Channel" => "blink.core"
-        "Template" => "blink.core"
-        "Raw" => "blink.core"
-        "TemplateValue" => "blink.core"
-        "ConversionError" => "blink.core"
-        "Range" => "blink.core"
-        "Handler" => "blink.core"
-        "Ptr" => "blink.ffi"
-        "Buf" => "blink.ffi"
-        _ => ""
+        "List" => ("blink.core", "List[T]")
+        "Map" => ("blink.core", "Map[K, V]")
+        "Set" => ("blink.core", "Set[T]")
+        "Option" => ("blink.core", "Option[T]")
+        "Result" => ("blink.core", "Result[T, E]")
+        "Ordering" => ("blink.core", "Ordering")
+        "Iterator" => ("blink.core", "Iterator[T]")
+        "Never" => ("blink.core", "Never")
+        "Bytes" => ("blink.core", "Bytes")
+        "StringBuilder" => ("blink.core", "StringBuilder")
+        "Handle" => ("blink.core", "Handle[T]")
+        "Channel" => ("blink.core", "Channel[T]")
+        "Template" => ("blink.core", "Template[C]")
+        "Raw" => ("blink.core", "Raw[Str]")
+        "TemplateValue" => ("blink.core", "TemplateValue")
+        "ConversionError" => ("blink.core", "ConversionError")
+        "Range" => ("blink.core", "Range[T]")
+        "Handler" => ("blink.core", "Handler[E]")
+        "Ptr" => ("blink.ffi", "Ptr[T]")
+        "Buf" => ("blink.ffi", "Buf[T]")
+        _ => ("", "")
     }
+}
+
+fn tc_shadowable_type_home(name: Str) -> Str {
+    tc_shadowable_type(name).0
 }
 
 // Whether a declaration may take `name` only by shadowing the compiler-known type.
@@ -8390,14 +8394,7 @@ fn arith_backing_trait(op: Str, is_unary: Int) -> Str {
 fn tc_warn_shadowed_trait(tr: Int) ! Diag.Report {
     let name = node_name(tr)
     let mut notes = ["shadows compiler-known trait `{name}` (blink.core)"]
-    let forms = tc_desugaring_forms(name)
-    if forms.len() > 0 {
-        let last = forms.get(forms.len() - 1).unwrap()
-        let listed = if forms.len() == 1 { "{last} in this module still uses" } else {
-            "{forms.slice(0, forms.len() - 1).join(", ")} and {last} in this module still use"
-        }
-        notes.push("{listed} `{name}` (blink.core)")
-    }
+    for n in tc_desugaring_forms_note(name, "blink.core") { notes.push(n) }
     let alias = tc_core_alias_in(name, node_module(tr))
     let help = if alias == "" {
         "to use the compiler-known trait in this module, import it under another name:\nimport blink.core.\{{name} as Core{name}\}"
@@ -8407,11 +8404,43 @@ fn tc_warn_shadowed_trait(tr: Int) ! Diag.Report {
     diag_warn_at_notes("ShadowedPreludeName", SHADOWED_PRELUDE_NAME, "name shadows compiler-known trait", tr, help, notes)
 }
 
-// The forms a desugaring writes with the compiler-known trait `tr`, which go on using it in
-// a module that shadows `tr` (sections/03 §3.4 Hygiene, and the Used by column of Prelude
-// Traits in sections/07). W1010 reads only this list; the arithmetic rows come from
+// W1010 at a declaration outside the prelude that takes a shadowable compiler-known type name
+// (sections/07 §10.6). The prelude's own declarations of Ordering and ConversionError are the
+// builtins themselves.
+fn tc_warn_shadowed_type(decl: Int) ! Diag.Report {
+    let name = node_name(decl)
+    let (home, spelled) = tc_shadowable_type(name)
+    if home == "" || tc_prelude_modules.contains_key(node_module(decl)) { return }
+    let mut notes = ["shadows compiler-known type `{spelled}` ({home})"]
+    for n in tc_desugaring_forms_note(name, home) { notes.push(n) }
+    let alias = tc_core_type_alias_in(name, node_module(decl))
+    let prefix = if home == "blink.ffi" { "Ffi" } else { "Core" }
+    let help = if alias == "" {
+        "to use the compiler-known type in this module, import it under another name:\nimport {home}.\{{name} as {prefix}{name}\}"
+    } else {
+        "this module names the compiler-known type `{alias}`"
+    }
+    diag_warn_at_notes("ShadowedPreludeName", SHADOWED_PRELUDE_NAME, "name shadows compiler-known type", decl, help, notes)
+}
+
+// The W1010 note that lists the forms which go on using the compiler-known `name` from `home`
+// in a module that shadows it, or none when no form does.
+fn tc_desugaring_forms_note(name: Str, home: Str) -> List[Str] {
+    let forms = tc_desugaring_forms(name)
+    if forms.len() == 0 { return [] }
+    let last = forms.get(forms.len() - 1).unwrap()
+    let listed = if forms.len() == 1 { "{last} in this module still uses" } else {
+        "{forms.slice(0, forms.len() - 1).join(", ")} and {last} in this module still use"
+    }
+    ["{listed} `{name}` ({home})"]
+}
+
+// The forms a desugaring writes with the compiler-known trait or type `tr`, which go on using
+// it in a module that shadows `tr` (sections/03 §3.4 Hygiene, and the Used by column of
+// Prelude Traits in sections/07). W1010 reads only this list; the arithmetic rows come from
 // arith_backing_trait, and the rest must change with the desugaring they name. `@derive` is
-// never one: its argument resolves by scope.
+// never one: its argument resolves by scope. A row with one form spells it in the singular,
+// since the note's verb agrees with the count.
 fn tc_desugaring_forms(tr: Str) -> List[Str] {
     let mut forms: List[Str] = []
     for op in ["+", "-", "*", "/", "%"] {
@@ -8421,13 +8450,20 @@ fn tc_desugaring_forms(tr: Str) -> List[Str] {
     match tr {
         "Eq" => ["`==`", "`!=`", "`assert_eq`", "`assert_ne`", "Map/Set keys"]
         "Ord" => ["`<`", "`>`", "`<=`", "`>=`"]
-        "Hash" => ["Map/Set keys"]
+        "Hash" => ["a Map/Set key"]
         "Debug" => ["`assert_eq`", "`assert_ne`"]
         "Display" => ["string interpolation"]
         "From" => ["the `.into()` that `From` derives"]
         "Into" => ["`.into()`"]
-        "IntoIterator" => ["`for` loops"]
+        "IntoIterator" => ["a `for` loop"]
         "Closeable" => ["`with ... as`"]
+        "Option" => ["`T?`", "`??`", "`?`"]
+        "Result" => ["`?`"]
+        "Iterator" => ["a `for` loop"]
+        "Range" => ["`..`", "`..=`"]
+        "Handler" => ["`with`"]
+        "Handle" => ["`async.spawn`"]
+        "Template" => ["a template literal"]
         _ => forms
     }
 }
@@ -12463,12 +12499,22 @@ fn tc_shadowed_trait_notes(tr: Str) -> List[Str] {
     ["`{tr}` in this module is `{tc_trait_shown(key)}`, a different trait with the same name as `{tr} (blink.core)`"]
 }
 
-// The name module `in_mod` already imports the compiler-known `tr` under, other than `tr`
-// itself, or "".
+// The name module `in_mod` already imports the compiler-known trait `tr` under, other than
+// `tr` itself, or "".
 fn tc_core_alias_in(tr: Str, in_mod: Str) -> Str {
+    tc_compiler_known_alias_in(tr, in_mod, false)
+}
+
+// The name module `in_mod` already imports the compiler-known type `name` under, other than
+// `name` itself, or "".
+fn tc_core_type_alias_in(name: Str, in_mod: Str) -> Str {
+    tc_compiler_known_alias_in(name, in_mod, true)
+}
+
+fn tc_compiler_known_alias_in(name: Str, in_mod: Str, want_type: Bool) -> Str {
     if in_mod == "" { return "" }
     for local in nr_module_import_index(in_mod).keys() {
-        if local != tr && tc_core_alias_target(local, in_mod) == tr { return local }
+        if local != name && tc_compiler_known_import(local, in_mod, want_type) == name { return local }
     }
     ""
 }
@@ -13728,6 +13774,7 @@ fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, Ty
                 is_enum = 1
             }
         }
+        tc_warn_shadowed_type(td)
         if is_enum != 0 {
             register_enum_type(td)
         } else {
@@ -13971,6 +14018,8 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait `{node_name(tr)}` is a sealed built-in trait and cannot be redefined", tr, "rename your trait, or define your own trait with the methods you need")
             } else if !in_prelude && (prelude_traits.contains(node_name(tr)) || tc_undeclared_trait_names().contains(node_name(tr))) {
                 tc_warn_shadowed_trait(tr)
+            } else {
+                tc_warn_shadowed_type(tr)
             }
             let saved = tc_enter_body_module(tr)
             register_trait(tr)
@@ -14113,6 +14162,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 ei = ei + 1
                 continue
             }
+            tc_warn_shadowed_type(ed)
             let eff_name = node_name(ed)
             register_ue_handle(str_to_lower(eff_name), ed)
             register_ue_op_sigs(ed)

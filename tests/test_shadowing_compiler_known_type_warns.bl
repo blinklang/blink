@@ -1,0 +1,261 @@
+// A declaration that takes a shadowable compiler-known type name (sections/07 §10.6
+// *Shadowing Rules*) gets one ShadowedPreludeName (W1010) warning at the declaration. Its help
+// names the aliased import that reaches the builtin: `blink.core`, or `blink.ffi` for `Ptr`
+// and `Buf`. Every declaration that puts a name in the type namespace is covered. Each row
+// runs check and both builds (both runs, where it checks output), which all succeed.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_shadow_type_warns.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+// check and both builds succeed, each prints `warnings` W1010 warnings, and each output holds
+// every one of `wants`.
+fn warns(main: Str, sim: Str, warnings: Int, wants: List[Str]) -> List[Str] {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let mut wrong: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { wrong.push("missing {w}") }
+        }
+        let n = count(r.out, "warning[ShadowedPreludeName]")
+        if n != warnings { wrong.push("{n} W1010, want {warnings}") }
+        if r.exit_code != 0 || wrong.len() > 0 {
+            bad.push("blink {args}: exit {r.exit_code}, {wrong.join(", ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+// check and both runs succeed with one W1010 that holds `want`, and each run prints `out` last.
+fn runs_warning(main: Str, want: Str, out: Str) -> List[Str] {
+    let dir = project(main, "")
+    let mut bad: List[Str] = []
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let n = count(r.out, "warning[ShadowedPreludeName]")
+        let printed = args == "check" || r.out.trim().ends_with(out)
+        if r.exit_code != 0 || n != 1 || !r.out.contains(want) || !printed {
+            bad.push("blink {args}: exit {r.exit_code}, {n} W1010, want `{want}` and `{out}`\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+fn expect_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+// Every name §10.6 marks *shadows*, as its table writes it.
+let shadowable = [
+    ("List", "List[T]"), ("Map", "Map[K, V]"), ("Set", "Set[T]"), ("Option", "Option[T]"),
+    ("Result", "Result[T, E]"), ("Ordering", "Ordering"), ("Iterator", "Iterator[T]"),
+    ("Never", "Never"), ("Bytes", "Bytes"), ("StringBuilder", "StringBuilder"),
+    ("Handle", "Handle[T]"), ("Channel", "Channel[T]"), ("Template", "Template[C]"),
+    ("Raw", "Raw[Str]"), ("TemplateValue", "TemplateValue"),
+    ("ConversionError", "ConversionError"), ("Range", "Range[T]"), ("Handler", "Handler[E]"),
+    ("Ptr", "Ptr[T]"), ("Buf", "Buf[T]"),
+]
+
+test "a struct that takes a shadowable name warns once, with the import that reaches the builtin" {
+    let mut bad: List[Str] = []
+    for entry in shadowable {
+        let (name, spelled) = entry
+        let home = if name == "Ptr" || name == "Buf" { "blink.ffi" } else { "blink.core" }
+        let alias = if home == "blink.ffi" { "Ffi{name}" } else { "Core{name}" }
+        let main = "type {name} \{\n    v: Int\n}\n\nfn main() \{\n    io.println(\"\{{name} \{ v: 1 }.v}\")\n}\n"
+        let wants = ["name shadows compiler-known type", "shadows compiler-known type `{spelled}` ({home})",
+            "import it under another name", "import {home}.\{{name} as {alias}\}"]
+        for b in warns(main, "", 1, wants) { bad.push("[{name}] {b}") }
+    }
+    expect_none(bad)
+}
+
+test "an enum, an alias, a trait and an effect that take a shadowable name warn too" {
+    let mut bad: List[Str] = []
+    let forms = [
+        "type Ordering \{\n    Up\n    Down\n}\n",
+        "type Range = Int\n",
+        "trait Option \{\n    fn o(self) -> Int\n}\n",
+        "effect Handler \{\n    effect Get \{\n        fn f() -> Int\n    }\n}\n",
+    ]
+    for form in forms {
+        for b in warns("{form}\nfn main() \{}\n", "", 1, ["name shadows compiler-known type"]) {
+            bad.push(b)
+        }
+    }
+    expect_none(bad)
+}
+
+test "the warning names the forms that still use the builtin, and they do" {
+    let main = #"type Option {
+    label: Str
+}
+
+fn first(xs: List[Int]) -> Int? {
+    let x = xs.get(0)?
+    Some(x)
+}
+
+fn main() {
+    io.println("{first([4]) ?? 0} {Option { label: "mine" }.label}")
+}
+"#
+    expect_none(runs_warning(main, "`T?`, `??` and `?` in this module still use `Option` (blink.core)", "4 mine"))
+}
+
+test "a module that already imports the builtin under another name is told that name" {
+    let main = #"import blink.core.{Option as CoreOption}
+
+type Option {
+    label: Str
+}
+
+fn pick(o: CoreOption[Int]) -> Int { o ?? 0 }
+
+fn main() {
+    io.println("{pick(Some(2))}")
+}
+"#
+    expect_none(warns(main, "", 1, ["this module names the compiler-known type `CoreOption`"]))
+}
+
+test "the declaring module warns, and a module that imports the declaration does not" {
+    let sim = #"pub type Result {
+    score: Int
+}
+"#
+    let main = #"import geo.sim.{Result}
+
+fn total(r: Result) -> Int { r.score }
+
+fn main() {
+    io.println("{total(Result { score: 3 })}")
+}
+"#
+    expect_none(warns(main, sim, 1, ["geo/sim.bl"]))
+}
+
+test "a program that declares no compiler-known name gets no W1010" {
+    let main = #"fn main() {
+    let o: Int? = Some(1)
+    let c = match 1.cmp(2) {
+        Less => "less"
+        _ => "other"
+    }
+    io.println("{o ?? 0} {c}")
+}
+"#
+    expect_none(warns(main, "", 0, []))
+}
+
+// A program whose module declares `name` and uses each form W1010 names for it, which must
+// still run with the builtin.
+fn with_forms(name: Str, body: Str) -> Str {
+    "type {name} \{\n    v: Int\n}\n\n{body}"
+}
+
+test "each form the warning names still uses the builtin" {
+    let mut bad: List[Str] = []
+    let range = #"fn main() {
+    let mut t = 0
+    for i in 0..3 { t = t + i }
+    for i in 0..=3 { t = t + i }
+    io.println("{t} {Range { v: 1 }.v}")
+}
+"#
+    for b in runs_warning(with_forms("Range", range), "`..` and `..=` in this module still use `Range`", "9 1") {
+        bad.push("[Range] {b}")
+    }
+    let result = #"fn half(n: Int) -> CoreResult[Int, Str] {
+    if n % 2 == 0 { Ok(n / 2) } else { Err("odd") }
+}
+
+fn quarter(n: Int) -> CoreResult[Int, Str] {
+    let h = half(n)?
+    half(h)
+}
+
+fn main() {
+    let q = match quarter(8) {
+        Ok(v) => v
+        Err(_) => -1
+    }
+    io.println("{q} {Result { v: 1 }.v}")
+}
+"#
+    let result_main = "import blink.core.\{Result as CoreResult}\n\n{with_forms("Result", result)}"
+    for b in runs_warning(result_main, "`?` in this module still uses `Result`", "2 1") { bad.push("[Result] {b}") }
+    let iter = #"fn main() {
+    let mut t = 0
+    for x in [1, 2, 3] { t = t + x }
+    io.println("{t} {Iterator { v: 1 }.v}")
+}
+"#
+    for b in runs_warning(with_forms("Iterator", iter), "a `for` loop in this module still uses `Iterator`", "6 1") {
+        bad.push("[Iterator] {b}")
+    }
+    let with_handler = #"effect Counter {
+    effect Get {
+        fn get() -> Int
+    }
+}
+
+fn read() -> Int ! Counter {
+    counter.get()
+}
+
+fn main() {
+    let h = handler Counter {
+        fn get() -> Int { 41 }
+    }
+    let n = with h { read() }
+    io.println("{n + 1} {Handler { v: 1 }.v}")
+}
+"#
+    for b in runs_warning(with_forms("Handler", with_handler), "`with` in this module still uses `Handler`", "42 1") {
+        bad.push("[Handler] {b}")
+    }
+    let handle = #"fn main() {
+    let h = async.spawn(fn() -> Int { 5 })
+    io.println("{h.await} {Handle { v: 1 }.v}")
+}
+"#
+    for b in runs_warning(with_forms("Handle", handle), "`async.spawn` in this module still uses `Handle`", "5 1") {
+        bad.push("[Handle] {b}")
+    }
+    let templ = #"type Ctx {}
+
+fn count(t: CoreTemplate[Ctx]) -> Int { t.parts().len() }
+
+fn main() {
+    let name = "x"
+    io.println("{count("hi {name}")} {Template { v: 1 }.v}")
+}
+"#
+    let templ_main = "import blink.core.\{Template as CoreTemplate}\n\n{with_forms("Template", templ)}"
+    for b in runs_warning(templ_main, "a template literal in this module still uses `Template`", "2 1") {
+        bad.push("[Template] {b}")
+    }
+    expect_none(bad)
+}
