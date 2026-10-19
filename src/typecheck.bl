@@ -21,7 +21,7 @@ import parser.{
     sublist_get, sublist_length,
 }
 import diagnostics.{
-    Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_at_col_notes, diag_error_no_loc,
+    Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
     diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
@@ -1803,6 +1803,18 @@ fn tc_mark_qualifier_used(qualifier: Str) {
         Some(mod_name) => tc_used_modules.insert(mod_name, 1)
         None => {}
     }
+}
+
+// Whether the program's own module declares a name more than once (E1016). The copies after
+// the first are never checked, so no one knows which imports they use.
+pub fn tc_main_module_has_duplicates() -> Bool {
+    for m in ["", "__main__"] {
+        match nr_module_names.get(m) {
+            Some(r) => { if r.poisoned.len() > 0 { return true } }
+            None => {}
+        }
+    }
+    false
 }
 
 pub fn tc_is_module_used(mod_name: Str) -> Int {
@@ -5949,7 +5961,7 @@ fn tc_raw_reject_display_sink(arg: Int, t: Int) ! Diag.Report {
 fn tc_check_free_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     check_deprecated_fn(fn_name, fs.decl, node)
-    if fs.decl != -1 && nr_value_poisoned(node_module(fs.decl), node_name(fs.decl)) {
+    if tc_value_decl_poisoned(fs.decl) {
         return tc_check_poisoned_call_args(node)
     }
     if node_type_params(node) != -1 {
@@ -5974,8 +5986,10 @@ fn tc_check_free_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeCheck.Reso
 }
 
 // A call of a function its module declares twice (E1016) may have meant either declaration,
-// so the arguments are checked on their own and the call is held to neither signature.
+// so the arguments are checked on their own and the call is held to neither signature, nor
+// its type arguments to either list of binders.
 fn tc_check_poisoned_call_args(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_type_args_claimed.insert(node, 1)
     let args_sl = node_args(node)
     if args_sl != -1 {
         let mut i = 0
@@ -8336,6 +8350,8 @@ fn tc_guarantee_lists_all_methods(traits: Str) -> Bool {
     for t in traits.split("|") {
         if t.is_empty() { continue }
         if !tc_trait_node_idx.contains_key(t) && builtin_trait_methods(t).is_empty() { return false }
+        // A trait its module declares twice (E1016) may have meant the other's methods.
+        if tc_trait_key_poisoned(t) { return false }
         any = true
     }
     any
@@ -9071,7 +9087,11 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         tc_validate_type_arg_hashability(tc_hash_oblig_of(name), elems_sl)
     }
     let alias_name_tid = tc_resolve_transparent_alias_name(name)
-    if alias_name_tid != -1 { return tc_resolve(alias_name_tid) }
+    if alias_name_tid != -1 {
+        // An alias its module declares twice (E1016) may have meant either type.
+        if tc_type_name_poisoned(name) { return tc_error_recovery_tid() }
+        return tc_resolve(alias_name_tid)
+    }
 
     let resolved = resolve_type_name(name)
     if resolved != -1 {
@@ -12571,8 +12591,16 @@ fn tc_trait_shown(key: Str) -> Str {
 // `Name (module)`: how a diagnostic tells apart two declarations of one name
 // (sections/07_trust_modules_metadata.md, "Diagnostics that involve a shadowing name").
 fn tc_name_with_module(name: Str, mod_key: Str) -> Str {
-    let shown_mod = if tc_module_key_is_main(mod_key) != 0 { "main" } else { tc_get_dotted_module_path(mod_key) }
-    "{name} ({shown_mod})"
+    "{name} ({tc_module_display_name(mod_key)})"
+}
+
+// How a diagnostic names a module: `main`, its dotted import path, or the name an `@module`
+// gives it. The import path of a file that names its module with `@module` reaches only that
+// one of the module's files.
+fn tc_module_display_name(mod_key: Str) -> Str {
+    if tc_module_key_is_main(mod_key) != 0 { return "main" }
+    let dotted = tc_get_dotted_module_path(mod_key)
+    if dotted.replace(".", "_") == mod_key { dotted } else { mod_key }
 }
 
 // The trait declaration `member` names inside module `target`, or -1, following a `pub
@@ -13313,6 +13341,11 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         }
         if is_sealed_builtin_trait(trait_name) != 0 && is_user_sourced(im) != 0 {
             diag_error_at("TraitContract", TRAIT_CONTRACT_907, "trait `{tc_trait_shown(trait_name)}` is a sealed built-in trait and cannot be implemented for user types", im, "define your own trait with the methods you need and impl that instead")
+            ii = ii + 1
+            continue
+        }
+        // A trait its module declares twice (E1016) may have meant either declaration's contract.
+        if tc_trait_key_poisoned(trait_name) {
             ii = ii + 1
             continue
         }
@@ -15191,7 +15224,7 @@ fn nr_drop_import_index(consuming_mod: Str) {
                 r.imports.clear()
                 r.selects.clear()
                 r.qualifiers.clear()
-                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned_values: r.poisoned_values, poisoned_types: r.poisoned_types })
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned })
             }
         }
         None => {}
@@ -15240,7 +15273,7 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
         }
         None => {}
     }
-    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, qualifiers: quals, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned_values: r.poisoned_values, poisoned_types: r.poisoned_types }
+    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, qualifiers: quals, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned }
     nr_module_names.insert(consuming_mod, built)
     built
 }
@@ -15564,11 +15597,11 @@ type ModuleNames {
     // The package the module's file belongs to, as the loader names it; "" when the loader
     // recorded none. A variant collides with a value only inside one package (E1016).
     package: Str
-    // The names the module declares more than once in each namespace (E1016). Only the first
-    // declaration is checked, and what a use of the name gets from it is not reported against
-    // it, since the use may have meant a later one.
-    poisoned_values: Map[Str, Int]
-    poisoned_types: Map[Str, Int]
+    // The names the module declares more than once in one namespace (E1016), keyed
+    // "{namespace}|{name}", each to the first declaration (or pattern leaf) that binds it.
+    // Only the first is checked, and what a use of the name gets from it is not reported
+    // against it, since the use may have meant a later one.
+    poisoned: Map[Str, Int]
 }
 let mut nr_module_names: Map[Str, ModuleNames] = Map()
 // The same declarations gathered by bare name, so a caller can see every module that spells
@@ -15581,7 +15614,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned_values: Map(), poisoned_types: Map() }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned: Map() }
             nr_module_names.insert(mod_name, r)
             r
         }
@@ -15590,7 +15623,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
 
 pub fn tc_record_module_package(mod_name: Str, package: Str) {
     let r = nr_module_names_of(mod_name)
-    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package, poisoned_values: r.poisoned_values, poisoned_types: r.poisoned_types })
+    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package, poisoned: r.poisoned })
 }
 
 // Whether two modules sit in one package. A module is always in its own, and the standard
@@ -15687,14 +15720,13 @@ fn nr_record_program_decls(program: Int) {
     }
 }
 
-// One name a module-scope declaration binds, in the namespace it binds it in, and where the
-// name is written.
+// One name a module-scope declaration binds, in the namespace it binds it in. `binder` is the
+// pattern leaf a destructuring `let` binds it with, else -1.
 type ModuleDeclName {
     namespace: Str
     name: Str
     decl: Int
-    line: Int
-    col: Int
+    binder: Int
 }
 
 // Module scope has two namespaces (sections/02_syntax.md §2.12.1): values (`let`, `let mut`,
@@ -15704,36 +15736,37 @@ type ModuleDeclName {
 // to the first. That is recovery, not a winner, so the name is also poisoned: a use that fits
 // only a later declaration reports nothing more.
 fn nr_check_duplicate_declarations(program: Int) ! Diag.Report {
-    for mod_name in nr_module_names.keys() {
-        let r = nr_module_names_of(mod_name)
-        r.poisoned_values.clear()
-        r.poisoned_types.clear()
+    for mod_name in nr_module_names.keys() { nr_module_names_of(mod_name).poisoned.clear() }
+    // Node ids give source order: a file's top-level declarations are built one after the
+    // other, files parse in turn, and a pattern builds its leaves left to right.
+    let mut by_order: Map[Int, ModuleDeclName] = Map()
+    for d in nr_module_decl_names(program) {
+        by_order.insert(if d.binder != -1 { d.binder } else { d.decl }, d)
     }
-    let seen = nr_module_decl_names(program)
-    // The first of each module's names in each namespace, by where it is written.
     let mut firsts: Map[Str, ModuleDeclName] = Map()
-    for d in seen {
-        let key = "{d.namespace}|{node_module(d.decl)}|{d.name}"
-        let earlier = match firsts.get(key) {
-            Some(f) => f.line < d.line || (f.line == d.line && f.col <= d.col)
-            None => false
-        }
-        if !earlier { firsts.insert(key, d) }
-    }
     let mut dropped: Map[Int, Int] = Map()
-    for d in seen {
+    for order in by_order.keys().sort() {
+        let d = by_order.get(order).unwrap()
         let mod_name = node_module(d.decl)
-        let first = firsts.get("{d.namespace}|{mod_name}|{d.name}").unwrap()
-        if first.decl == d.decl && first.col == d.col { continue }
-        let shown = if tc_module_key_is_main(mod_name) != 0 { "main" } else { tc_get_dotted_module_path(mod_name) }
-        diag_error_at_col_notes("DuplicateModuleBinding", DUPLICATE_MODULE_BINDING,
-            "`{d.name}` is declared twice in module `{shown}`", d.decl, d.col,
+        let key = "{d.namespace}|{mod_name}|{d.name}"
+        let first = match firsts.get(key) {
+            Some(f) => f
+            None => {
+                firsts.insert(key, d)
+                continue
+            }
+        }
+        let (line, col) = nr_decl_name_at(d)
+        let (first_line, first_col) = nr_decl_name_at(first)
+        let first_node = if first.binder != -1 { first.binder } else { first.decl }
+        diag_error_span_at_notes("DuplicateModuleBinding", DUPLICATE_MODULE_BINDING,
+            "`{d.name}` is declared twice in module `{tc_module_display_name(mod_name)}`",
+            if d.binder != -1 { d.binder } else { d.decl }, line, col, col + d.name.byte_len(),
             "rename one of the two declarations",
-            ["first declared at {diag_file_for_node(first.decl)}:{first.line}:{first.col}"])
-        let r = nr_module_names_of(mod_name)
-        if d.namespace == "value" { r.poisoned_values.insert(d.name, 1) } else { r.poisoned_types.insert(d.name, 1) }
+            ["first declared at {diag_file_for_node(first_node)}:{first_line}:{first_col}"])
+        nr_module_names_of(mod_name).poisoned.insert("{d.namespace}|{d.name}", first_node)
         // A destructuring `let` stays while it binds a name of its own.
-        if tc_module_let_bound_names_count(d.decl) <= 1 { dropped.insert(d.decl, 1) }
+        if d.binder == -1 { dropped.insert(d.decl, 1) }
     }
     if dropped.len() == 0 { return }
     node_set_params(program, nr_sublist_without(node_params(program), dropped))
@@ -15748,47 +15781,48 @@ fn nr_module_decl_names(program: Int) -> List[ModuleDeclName] {
     let mut out: List[ModuleDeclName] = []
     for (sl, namespace) in [(node_params(program), "value"), (node_stmts(program), "value"),
         (node_fields(program), "type"), (node_arms(program), "type"), (node_args(program), "type")] {
-        for d in nr_decl_names_in(sl, namespace) { out.push(d) }
-    }
-    out
-}
-
-fn nr_decl_names_in(decls_sl: Int, namespace: Str) -> List[ModuleDeclName] {
-    let mut out: List[ModuleDeclName] = []
-    if decls_sl == -1 { return out }
-    let mut i = 0
-    while i < sublist_length(decls_sl) {
-        let decl = sublist_get(decls_sl, i)
-        let names = if node_kind(decl) == NodeKind.LetBinding { tc_module_let_bound_names(decl) } else { [node_name(decl)] }
-        for name in names {
-            // `_` binds nothing, so any number of `let _ = ...` may stand in one module.
-            if name != "_" && name != "" {
-                out.push(ModuleDeclName { namespace: namespace, name: name, decl: decl, line: node_line(decl), col: nr_decl_name_col(decl, name) })
+        if sl == -1 { continue }
+        let mut i = 0
+        while i < sublist_length(sl) {
+            let decl = sublist_get(sl, i)
+            let leaves = if node_kind(decl) == NodeKind.LetBinding { tc_module_let_leaves(decl) } else { [] }
+            if leaves.len() == 0 {
+                // `let _ = e` binds nothing, so any number of them may stand in one module.
+                if node_name(decl) != "" { out.push(ModuleDeclName { namespace: namespace, name: node_name(decl), decl: decl, binder: -1 }) }
             }
+            for leaf in leaves {
+                if node_name(leaf) != "_" && node_name(leaf) != "" {
+                    out.push(ModuleDeclName { namespace: namespace, name: node_name(leaf), decl: decl, binder: leaf })
+                }
+            }
+            i = i + 1
         }
-        i = i + 1
     }
     out
 }
 
-// The column where `name` is written in the declaration's first line, at or after the node's
-// own column, which is the keyword's. The node's column when the line does not hold it.
-fn nr_decl_name_col(decl: Int, name: Str) -> Int {
-    let text = diag_source_line(diag_file_for_node(decl), node_line(decl))
-    let mut from = if node_col(decl) > 0 { node_col(decl) - 1 } else { 0 }
+// The line and column where `d` writes its name. A pattern leaf stands at its name. Any other
+// declaration starts at its keyword, so the name is the first whole word that spells it on
+// the declaration's first line, at or after the keyword; the keyword's own place when the
+// line does not hold it.
+fn nr_decl_name_at(d: ModuleDeclName) -> (Int, Int) {
+    if d.binder != -1 { return (node_line(d.binder), node_col(d.binder)) }
+    let line = node_line(d.decl)
+    let text = diag_source_line(diag_file_for_node(d.decl), line)
+    let mut from = if node_col(d.decl) > 0 { node_col(d.decl) - 1 } else { 0 }
     while from < text.byte_len() {
-        match text.byte_index_of(name, from) {
+        match text.byte_index_of(d.name, from) {
             Some(at) => {
-                let end = at + name.byte_len()
+                let end = at + d.name.byte_len()
                 let starts_word = at == 0 || !nr_is_ident_byte(text.byte_at(at - 1).to_int())
                 let ends_word = end >= text.byte_len() || !nr_is_ident_byte(text.byte_at(end).to_int())
-                if starts_word && ends_word { return at + 1 }
+                if starts_word && ends_word { return (line, at + 1) }
                 from = at + 1
             }
-            None => return node_col(decl)
+            None => return (line, node_col(d.decl))
         }
     }
-    node_col(decl)
+    (line, node_col(d.decl))
 }
 
 fn nr_is_ident_byte(b: Int) -> Bool {
@@ -15808,26 +15842,40 @@ fn nr_sublist_without(sl: Int, dropped: Map[Int, Int]) -> Int {
     sublist_of(kept)
 }
 
-// Whether `decl` is a type declaration whose module declares its name more than once (E1016).
-fn tc_type_decl_poisoned(decl: Int) -> Bool {
-    if decl < 0 { return false }
-    let k = node_kind(decl)
-    if k != NodeKind.TypeDef && k != NodeKind.TraitDef && k != NodeKind.EffectDecl { return false }
-    nr_type_poisoned(node_module(decl), node_name(decl))
-}
-
-// Whether `mod_name` declares `name` more than once in the value namespace (E1016).
-fn nr_value_poisoned(mod_name: Str, name: Str) -> Bool {
+// Whether `mod_name` declares `name` more than once in `namespace` (E1016).
+fn nr_poisoned(mod_name: Str, namespace: Str, name: Str) -> Bool {
     match nr_module_names.get(mod_name) {
-        Some(r) => r.poisoned_values.contains_key(name)
+        Some(r) => r.poisoned.contains_key("{namespace}|{name}")
         None => false
     }
 }
 
-// Whether `mod_name` declares `name` more than once in the type namespace (E1016).
-fn nr_type_poisoned(mod_name: Str, name: Str) -> Bool {
-    match nr_module_names.get(mod_name) {
-        Some(r) => r.poisoned_types.contains_key(name)
+// Whether `decl` is the module-scope type declaration (type, alias, trait, effect) a module
+// keeps of a name it declares more than once (E1016).
+fn tc_type_decl_poisoned(decl: Int) -> Bool {
+    nr_poisoned_first(decl, "type")
+}
+
+// Whether `decl` is the module-scope value declaration (fn, let, const) a module keeps of a
+// name it declares more than once (E1016).
+fn tc_value_decl_poisoned(decl: Int) -> Bool {
+    nr_poisoned_first(decl, "value")
+}
+
+// Whether the type a written name means is one its module declares more than once (E1016).
+fn tc_type_name_poisoned(name: Str) -> Bool {
+    tc_type_decl_poisoned(tc_decl_node_for_type(tc_written_type_nominal(name)))
+}
+
+// Whether the trait a trait key names is one its module declares more than once (E1016).
+fn tc_trait_key_poisoned(key: Str) -> Bool {
+    tc_type_decl_poisoned(tc_trait_node_idx.get(key) ?? -1)
+}
+
+fn nr_poisoned_first(decl: Int, namespace: Str) -> Bool {
+    if decl < 0 { return false }
+    match nr_module_names.get(node_module(decl)) {
+        Some(r) => (r.poisoned.get("{namespace}|{node_name(decl)}") ?? -1) == decl
         None => false
     }
 }
@@ -16317,6 +16365,8 @@ fn nr_emit_private_access(name: Str, node: Int) ! Diag.Report {
 }
 
 fn nr_register_private(name: Str, mod_name: Str) {
+    // A name its module declares twice (E1016) may be public in the declaration a use meant.
+    if nr_poisoned(mod_name, "value", name) || nr_poisoned(mod_name, "type", name) { return }
     match nr_private_imports.get(name) {
         Some(prev) => nr_private_imports.insert(name, "{prev}{mod_name}|")
         None => nr_private_imports.insert(name, "|{mod_name}|")
@@ -19057,7 +19107,7 @@ fn tc_check_value_named_like_variant(name: Str, decl: Int) -> Bool ! Diag.Report
         }
         if tc_same_package(vmod, emod) {
             let qual = "{node_name(enum_decl)}.{name}"
-            let shown = if tc_module_key_is_main(emod) != 0 { "main" } else { tc_get_dotted_module_path(emod) }
+            let shown = tc_module_display_name(emod)
             let vnode = tc_variant_decl_node(slot)
             let at = "{diag_file_for_node(vnode)}:{node_line(vnode)}:{node_col(vnode)}"
             diag_error_at_notes("DuplicateModuleBinding", DUPLICATE_MODULE_BINDING,
@@ -20380,6 +20430,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     if is_intrinsic_method(node_name(obj), method_name) != 0 && nr_is_defined(node_name(obj)) == 0 {
                         is_ue_call = 1
                     }
+                    // A type its module declares twice (E1016) may have meant the member of
+                    // either declaration.
+                    if tc_type_name_poisoned(node_name(obj)) { is_ue_call = 1 }
                 }
                 if is_ue_call == 0 {
                     // Recorded, not reported. Phase 2 knows the receiver type and turns
@@ -23229,6 +23282,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let fn_sig = tc_bare_callee_sig(name)
         if fn_sig != -1 {
             let fs = fnsig_pool.get(fn_sig).unwrap()
+            // A function its module declares twice (E1016) may have meant either signature.
+            if tc_value_decl_poisoned(fs.decl) { return tc_error_recovery_tid() }
             let mut fn_param_types: List[Int] = []
             let mut fpi = 0
             while fpi < fs.params_count {
@@ -30066,7 +30121,7 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 // spellings registered so a body that reads it resolves.
 fn tc_register_module_let_tid(l: Int, l_tid0: Int) {
     // A name its module declares twice (E1016) may be read as either declaration's value.
-    let l_tid = if nr_value_poisoned(node_module(l), node_name(l)) { tc_error_recovery_tid() } else { l_tid0 }
+    let l_tid = if tc_value_decl_poisoned(l) { tc_error_recovery_tid() } else { l_tid0 }
     nr_define_typed(node_name(l), node_is_mut(l), l_tid, l)
     tc_publish_node_tid(l, l_tid)
     let l_mod_key = node_module(l)
@@ -30080,27 +30135,27 @@ fn tc_register_module_let_tid(l: Int, l_tid0: Int) {
 // parser's placeholder in the node name and its real binders in the pattern, so the
 // node name alone would register a spelling no source can write and leave every leaf
 // undefined.
-// How many names a module-level `let` binds: its leaves when it destructures, else one.
-fn tc_module_let_bound_names_count(l: Int) -> Int {
-    if node_kind(l) != NodeKind.LetBinding { return 1 }
-    tc_module_let_bound_names(l).len()
+fn tc_module_let_bound_names(l: Int) -> List[Str] {
+    let leaves = tc_module_let_leaves(l)
+    if leaves.len() == 0 { return [node_name(l)] }
+    let mut out: List[Str] = []
+    for leaf in leaves { out.push(node_name(leaf)) }
+    out
 }
 
-fn tc_module_let_bound_names(l: Int) -> List[Str] {
-    let mut out: List[Str] = []
+// The pattern leaves a destructuring module-level `let` binds, left to right; none for any
+// other `let`.
+fn tc_module_let_leaves(l: Int) -> List[Int] {
+    let mut out: List[Int] = []
     let pat_sl = node_elements(l)
-    if pat_sl != -1 {
-        let elems_sl = node_elements(pat_sl)
-        if elems_sl != -1 {
-            let mut i = 0
-            while i < sublist_length(elems_sl) {
-                out.push(node_name(sublist_get(elems_sl, i)))
-                i = i + 1
-            }
-            return out
-        }
+    if pat_sl == -1 { return out }
+    let elems_sl = node_elements(pat_sl)
+    if elems_sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        out.push(sublist_get(elems_sl, i))
+        i = i + 1
     }
-    out.push(node_name(l))
     out
 }
 
@@ -30122,7 +30177,7 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
     while i < sublist_length(elems_sl) {
         let leaf = sublist_get(elems_sl, i)
         let mut leaf_tid = TYPE_UNKNOWN
-        if i < arity && !nr_value_poisoned(l_mod_key, node_name(leaf)) {
+        if i < arity && !nr_poisoned(l_mod_key, "value", node_name(leaf)) {
             leaf_tid = tc_tid_child(tup, i)
             if leaf_tid < 0 { leaf_tid = TYPE_UNKNOWN }
         }

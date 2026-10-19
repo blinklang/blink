@@ -13,18 +13,27 @@ fn sh(cmd: Str) -> ProcessResult {
 
 // A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
 fn project(main: Str, sim: Str) -> Str {
+    project_files([("main.bl", main), ("geo/sim.bl", sim)])
+}
+
+// A package whose src/ holds each (path, text) pair with text that is not empty.
+fn project_files(files: List[(Str, Str)]) -> Str {
     let dir = sh("mktemp -d /tmp/blink_module_dup_decls.XXXXXX").out.trim()
     let _ = sh("mkdir -p {dir}/src/geo")
     write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
-    write_file("{dir}/src/main.bl", main)
-    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    for (path, text) in files {
+        if text != "" { write_file("{dir}/src/{path}", text) }
+    }
     dir
 }
 
 // check and both builds fail with exactly `count` errors and no internal or C compiler error,
 // and each output holds every one of `wants` and none of `nots`.
 fn rejects(main: Str, sim: Str, count: Int, wants: List[Str], nots: List[Str]) -> List[Str] {
-    let dir = project(main, sim)
+    rejects_in(project(main, sim), count, wants, nots)
+}
+
+fn rejects_in(dir: Str, count: Int, wants: List[Str], nots: List[Str]) -> List[Str] {
     let mut bad: List[Str] = []
     for args in ["check", "build --no-per-module", "build --per-module"] {
         let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
@@ -353,4 +362,158 @@ fn main() { io.println("{a}") }
     if !r.out.contains("\"code\":\"E1016\"") || r.out.contains("\"fix\"") { io.eprintln(r.out) }
     assert(r.out.contains("\"code\":\"E1016\""))
     assert(!r.out.contains("\"fix\""))
+}
+
+test "a use of a type alias that fits only the later declaration adds nothing" {
+    let prog = #"type A = Int
+type A = Str
+
+fn main() {
+    let x: A = "s"
+    io.println(x)
+}
+"#
+    expect_none(rejects(prog, "", 1, [twice("A")], ["TypeError"]))
+}
+
+test "an impl and a bound that fit only the later trait add nothing" {
+    let prog = #"trait T {
+    fn a(self) -> Int
+}
+
+trait T {
+    fn b(self) -> Int
+}
+
+type P {
+    x: Int
+}
+
+impl T for P {
+    fn b(self) -> Int { self.x }
+}
+
+fn use_it[X: T](v: X) -> Int { v.b() }
+
+fn main() { io.println("{use_it(P { x: 1 })}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("T")], ["TraitContract", "UnresolvedMethod"]))
+}
+
+test "a variant that only the later enum declares adds nothing" {
+    let prog = #"type E {
+    A
+    B
+}
+
+type E {
+    C(Str)
+    D
+}
+
+fn main() {
+    let e = E.C("x")
+    match e {
+        E.C(s) => io.println(s)
+        _ => io.println("o")
+    }
+}
+"#
+    expect_none(rejects(prog, "", 1, [twice("E")], ["UnknownMethod", "UnusedVariable", "UnknownVariant"]))
+}
+
+test "a function value that fits only the later fn adds nothing" {
+    let prog = #"fn f() -> Int { 1 }
+fn f(n: Int) -> Int { n }
+
+fn main() {
+    let g: fn(Int) -> Int = f
+    io.println("{g(2)}")
+}
+"#
+    expect_none(rejects(prog, "", 1, [twice("f")], ["TypeError"]))
+}
+
+test "a call with type arguments that fits only the later fn adds nothing" {
+    let prog = #"fn f() -> Int { 1 }
+fn f[T](x: T) -> T { x }
+
+fn main() { io.println("{f[Int](2)}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("f")], ["CallSiteTypeArgs"]))
+}
+
+test "one destructuring let that binds a name twice is E1016 at the second leaf" {
+    let prog = #"let (e, e) = (1, 2)
+
+fn main() { io.println("{e}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("e"), "--> src/main.bl:1:9", "first declared at src/main.bl:1:6"], []))
+}
+
+test "the errors of several duplicated names come in source order" {
+    let prog = #"let a = 1
+
+type Z {
+    x: Int
+}
+
+type Z {
+    y: Int
+}
+
+fn a() -> Int { 1 }
+
+fn main() { io.println("x") }
+"#
+    let dir = project(prog, "")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check src/main.bl < /dev/null 2>&1")
+    let _ = sh("rm -rf {dir}")
+    let z = r.out.byte_index_of("--> src/main.bl:7:6", 0) ?? -1
+    let a = r.out.byte_index_of("--> src/main.bl:11:4", 0) ?? -1
+    if z == -1 || a == -1 || z > a { io.eprintln(r.out) }
+    assert(z != -1 && a != -1 && z < a)
+}
+
+test "a public use of a name whose first declaration is private adds nothing" {
+    let sim = #"fn area() -> Int { 1 }
+pub fn area() -> Int { 2 }
+"#
+    let prog = #"import geo.sim
+
+fn main() { io.println("{sim.area()}") }
+"#
+    expect_none(rejects(prog, sim, 1, ["`area` is declared twice in module `geo.sim`"], ["PrivateItemAccess"]))
+}
+
+test "an import that only a dropped declaration uses is not reported unused" {
+    let prog = #"import std.time
+
+fn f() -> Int { 1 }
+fn f() -> Int { time.now().nanos() }
+
+fn main() { io.println("{f()}") }
+"#
+    expect_none(rejects(prog, "", 1, [twice("f")], ["UnusedImport"]))
+}
+
+test "a duplicate across two files of one module names each file and the module" {
+    let sim = #"@module("geo")
+
+pub fn area() -> Int { 2 }
+"#
+    let other = #"@module("geo")
+
+pub fn other() -> Int { 1 }
+
+pub fn area() -> Int { 1 }
+"#
+    let prog = #"import geo.sim
+import geo.other
+
+fn main() { io.println("{geo.area()} {geo.other()}") }
+"#
+    let dir = project_files([("main.bl", prog), ("geo/sim.bl", sim), ("geo/other.bl", other)])
+    expect_none(rejects_in(dir, 1, ["`area` is declared twice in module `geo`", "--> src/geo/other.bl:5:8",
+        "first declared at src/geo/sim.bl:3:8"], []))
 }
