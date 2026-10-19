@@ -94,7 +94,7 @@ outcome() {
   rc=$?
   out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
   if printf '%s\n' "$out" | grep -qE '^test .* \.\.\. '; then
-    out=$(printf '%s\n' "$out" | grep -E '^test .* \.\.\. (ok|FAIL|SKIP|skipped|xfail|XPASS)|^[0-9]+ passed, ')
+    out=$(printf '%s\n' "$out" | grep -E '^test .* \.\.\. (ok|FAIL|PANIC|SKIP|skipped|xfail|XPASS)|^[0-9]+ passed, ')
   fi
   printf 'exit %s\n%s\n' "$rc" "$out"
 }

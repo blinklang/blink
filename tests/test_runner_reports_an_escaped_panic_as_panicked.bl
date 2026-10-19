@@ -1,0 +1,149 @@
+// A panic that escapes a test body gives the test the status `panicked` (spec §8.10,
+// Panicked records). The record carries the panic message and no `cause`, no `error`
+// object, no assertion fields and no `line: 0` placeholder. The human line says PANIC
+// with the message under it, and the binary exits non-zero. Each row runs a fixture
+// under `build/blink test --json` and under human output.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
+
+type Run { json: Str, json_exit: Int, human: Str, human_exit: Int }
+
+fn run_fixture(tag: Str, lines: List[Str]) -> Run {
+    let name = "rp_panicked_{tag}_{getpid()}"
+    let scratch = ".tmp/_test_runner_panicked_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, lines.join("\n"))
+    let j = process_run("build/blink", ["test", "--json", fixture])
+    let h = process_run("build/blink", ["test", fixture])
+    shell_exec("rm -rf {scratch}")
+    Run { json: j.out.concat(j.err_out), json_exit: j.exit_code, human: h.out.concat(h.err_out), human_exit: h.exit_code }
+}
+
+fn diag(r: Run) -> Str {
+    "json exit={r.json_exit}:\n{r.json}\nhuman exit={r.human_exit}:\n{r.human}"
+}
+
+// The record of the test named `name`: from its opening brace up to the next record.
+fn record_of(json: Str, name: Str) -> Str {
+    let head = "\{\"name\":\"{name}\","
+    let at = json.index_of(head)
+    if at.is_none() { return "" }
+    let rest = json.substring(at.unwrap() + head.len(), json.len())
+    let end = rest.index_of("\{\"name\":\"")
+    if end.is_none() { return head.concat(rest) }
+    head.concat(rest.substring(0, end.unwrap()))
+}
+
+fn assert_panicked_shape(rec: Str, d: Str) {
+    assert(rec.contains(#""status":"panicked""#), "the record is not panicked; {d}")
+    assert(!rec.contains(#""cause":"#), "a panicked record carries a cause; {d}")
+    assert(!rec.contains(#""error":"#), "a panicked record carries an error object; {d}")
+    assert(!rec.contains(#""assertion":"#), "a panicked record carries an assertion; {d}")
+    assert(!rec.contains(#""line":0"#), "a panicked record carries a line 0 placeholder; {d}")
+}
+
+test "a panic call that escapes the body is a panicked record with its message" {
+    let r = run_fixture("explicit", [
+        #"test "boom" {"#,
+        #"    panic("boom here")"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    let rec = record_of(r.json, "boom")
+    assert_panicked_shape(rec, d)
+    assert(rec.contains(#""message":"panic: boom here at "#), "the record does not carry the panic message; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("test boom ... "), "no human line for the test; {d}")
+    assert(r.human.contains("PANIC"), "the human line does not say PANIC; {d}")
+    assert(!r.human.contains("FAIL"), "the human line says FAIL for a panic; {d}")
+    assert(r.human.contains("  panic: boom here at "), "the human output does not carry the panic message; {d}")
+}
+
+test "a runtime panic that escapes the body is a panicked record" {
+    let r = run_fixture("unwrap", [
+        #"test "unwrapnone" {"#,
+        #"    let xs = [1]"#,
+        #"    let _v = xs.get(5).unwrap()"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    let rec = record_of(r.json, "unwrapnone")
+    assert_panicked_shape(rec, d)
+    assert(rec.contains("unwrap called on None"), "the record does not carry the panic message; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("PANIC"), "the human line does not say PANIC; {d}")
+    assert(r.human.contains("unwrap called on None"), "the human output does not carry the panic message; {d}")
+}
+
+test "a panic leaves the passing and failing tests around it with their own status" {
+    let r = run_fixture("mixed", [
+        #"test "first_ok" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+        #"test "second_panics" {"#,
+        #"    panic("second")"#,
+        #"}"#,
+        #""#,
+        #"test "third_fails" {"#,
+        #"    assert_eq(1, 2)"#,
+        #"}"#,
+        #""#,
+        #"test "fourth_ok" {"#,
+        #"    assert(true)"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    assert(record_of(r.json, "first_ok").contains(#""status":"passed""#), "first_ok is not passed; {d}")
+    assert_panicked_shape(record_of(r.json, "second_panics"), d)
+    let third = record_of(r.json, "third_fails")
+    assert(third.contains(#""status":"failed""#), "third_fails is not failed; {d}")
+    assert(third.contains(#""cause":"assertion""#), "third_fails lost its assertion cause; {d}")
+    assert(record_of(r.json, "fourth_ok").contains(#""status":"passed""#), "fourth_ok is not passed; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("test fourth_ok ... "), "the test after the panic did not run; {d}")
+}
+
+test "a panic that assert_panics catches leaves the test passed" {
+    let r = run_fixture("caught", [
+        #"test "caught" {"#,
+        #"    assert_panics(matching: "inner") {"#,
+        #"        panic("inner")"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 0, d)
+    assert(record_of(r.json, "caught").contains(#""status":"passed""#), "a caught panic is not passed; {d}")
+    assert_eq(r.human_exit, 0, d)
+    assert(!r.human.contains("PANIC"), "a caught panic says PANIC; {d}")
+}
+
+test "an assert_panics message mismatch stays a failed assertion" {
+    let r = run_fixture("mismatch", [
+        #"test "mismatch" {"#,
+        #"    assert_panics(matching: "expected text") {"#,
+        #"        panic("other text")"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ])
+    let d = diag(r)
+    assert_eq(r.json_exit, 1, d)
+    let rec = record_of(r.json, "mismatch")
+    assert(rec.contains(#""status":"failed""#), "an E0832 mismatch is not failed; {d}")
+    assert(rec.contains(#""cause":"assertion""#), "an E0832 mismatch lost its assertion cause; {d}")
+    assert_eq(r.human_exit, 1, d)
+    assert(r.human.contains("FAIL"), "an E0832 mismatch does not say FAIL; {d}")
+    assert(!r.human.contains("PANIC"), "an E0832 mismatch says PANIC; {d}")
+}

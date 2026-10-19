@@ -308,15 +308,24 @@ BLINK_RT_FN void __blink_assert_panics_mismatch(const char* expected,
         __intro, file, line, col, "");
 }
 
-/* Record a panic that escaped a test body or a for_each case as a
- * plain-message ("panic" cause) failure, unless the test already failed.
- * Clears the assertion-shaped fields so emit takes the plain-message path. */
+/* The cause a panic records. It is never printed: a panic is the status
+ * `panicked`, which has no cause (spec §8.10, Panicked records). */
+#define BLINK_TEST_CAUSE_PANIC "panic"
+
+BLINK_UNUSED static int __blink_test_is_panicked(void) {
+    return __blink_test_failed && __blink_test_fail_cause
+        && strcmp(__blink_test_fail_cause, BLINK_TEST_CAUSE_PANIC) == 0;
+}
+
+/* Record a panic that escaped a test body or a for_each case, unless the
+ * test already failed. The runtime knows only the message, not where the
+ * panic fired, so the record keeps no line. */
 BLINK_UNUSED static void __blink_test_note_panic(const char* msg) {
     if (__blink_test_failed) return;
     __blink_test_failed = 1;
-    __blink_test_fail_cause = "panic";
+    __blink_test_fail_cause = BLINK_TEST_CAUSE_PANIC;
     BLINK_COPY_OR_EMPTY(__blink_test_fail_msg, msg);
-    BLINK_COPY_OR_EMPTY(__blink_test_fail_error_message, msg);
+    __blink_test_fail_error_message[0] = '\0';
     __blink_test_fail_error_type[0] = '\0';
     __blink_test_fail_line = 0;
     __blink_test_fail_assertion[0] = '\0';
@@ -330,7 +339,7 @@ BLINK_UNUSED static void __blink_test_note_panic(const char* msg) {
 
 /* Installed as __blink_panic_test_hook by blink_test_run. An uncaught panic in
  * a test body lands here instead of terminating the binary: record it and
- * longjmp to the per-test frame so the runner reports FAIL and continues with
+ * longjmp to the per-test frame so the runner reports PANIC and continues with
  * the next test. */
 BLINK_UNUSED static void __blink_test_panic_handler(const char* msg) {
     __blink_test_note_panic(msg);
@@ -586,7 +595,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         if (__blink_test_case_records == NULL) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
     }
 
-    int pass = 0, fail = 0, skip = 0, total = 0;
+    int pass = 0, fail = 0, panicked = 0, skip = 0, total = 0;
     double total_ms = 0.0;
 
     if (json_output) printf("{\"results\":[");
@@ -695,7 +704,30 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
             }
             continue;
         }
-        if (__blink_test_failed) {
+        if (__blink_test_is_panicked()) {
+            panicked++;
+            if (json_output) {
+                if (total > 1) printf(",");
+                printf("{\"name\":\"%s\",\"status\":\"panicked\"", tests[i].name);
+                if (__blink_test_case_label[0]) {
+                    printf(",\"case\":\"%s\"", __blink_test_json_escape(__blink_test_case_label));
+                }
+                printf(",\"message\":\"%s\"", __blink_test_json_escape(__blink_test_fail_msg));
+                printf(",\"duration_ms\":%g", dur_ms);
+                __blink_test_print_tags_json(&tests[i]);
+                __blink_test_print_cleanup_warnings_json();
+                __blink_test_print_case_records_json();
+                printf("}");
+            } else {
+                if (__blink_test_case_label[0]) {
+                    printf("test %s::case[%s] ... \033[31mPANIC\033[0m\n", tests[i].name, __blink_test_case_label);
+                } else {
+                    printf("test %s ... \033[31mPANIC\033[0m\n", tests[i].name);
+                }
+                fprintf(stderr, "  %s\n", __blink_test_fail_msg);
+                __blink_test_print_cleanup_warnings_human();
+            }
+        } else if (__blink_test_failed) {
             fail++;
             if (json_output) {
                 if (total > 1) printf(",");
@@ -766,9 +798,6 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                         fprintf(stderr, "  (line %d)\n", __blink_test_fail_line);
                     }
                 } else if (__blink_test_fail_msg[0]) {
-                    /* A panic carries its own origin inside the message
-                     * and clears fail_line to 0; suppress the bogus "(line 0)"
-                     * suffix when no line is known. */
                     if (__blink_test_fail_line) {
                         fprintf(stderr, "  %s (line %d)\n", __blink_test_fail_msg, __blink_test_fail_line);
                     } else {
@@ -807,7 +836,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         if (skip > 0) printf(", %d skipped", skip);
         printf(" (of %d)\n", total);
     }
-    if (fail > 0) exit(1);
+    if (fail + panicked > 0) exit(1);
 }
 
 #endif /* BLINK_RUNTIME_TEST_BODIES */
