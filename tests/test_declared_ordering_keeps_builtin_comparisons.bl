@@ -1,0 +1,75 @@
+// A module that declares its own `Ordering` (sections/07 §10.6 *Shadowing Rules*) still
+// compares, sorts and matches through the compiler-known `Ordering`: `cmp`, the ordering
+// operators, `sort`, `sort_by` and a derived Ord reach the builtin by identity, never by the
+// spelling the module took over. W1010 names the operators. Each row runs check and both runs.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and, when `sim` is not empty, `geo/sim.bl`.
+fn project(main: Str, sim: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_declared_ordering.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main)
+    if sim != "" { write_file("{dir}/src/geo/sim.bl", sim) }
+    dir
+}
+
+// check and both runs succeed, each output holds `note`, and each run prints `want` last.
+fn runs(main: Str, sim: Str, note: Str, want: Str) {
+    let dir = project(main, sim)
+    let mut bad: List[Str] = []
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        let printed = args == "check" || r.out.trim().ends_with(want)
+        if r.exit_code != 0 || !printed || !r.out.contains(note) {
+            bad.push("blink {args}: exit {r.exit_code}, want `{note}` and `{want}`\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    for b in bad { io.eprintln(b) }
+    assert(bad.len() == 0)
+}
+
+let body = #"@derive(Eq, Ord)
+type P {
+    x: Int
+}
+
+pub fn report() -> Str {
+    let a = P { x: 1 }
+    let b = P { x: 2 }
+    let xs = [3, 1, 2]
+    let low = xs.sort().get(0) ?? 0
+    let high = xs.sort_by(fn(l: Int, r: Int) { r.cmp(l) }).get(0) ?? 0
+    let s = match 1.cmp(2) {
+        Less => "less"
+        _ => "other"
+    }
+    let t = match a.cmp(b) {
+        Greater => "greater"
+        _ => "not"
+    }
+    let d = match Up {
+        Up => "up"
+        Down => "down"
+    }
+    "{a < b} {b >= a} {low} {high} {s} {t} {d}"
+}
+"#
+
+let own = "type Ordering \{\n    Up\n    Down\n}\n\n"
+let forms_note = "`<`, `>`, `<=` and `>=` in this module still use `Ordering` (blink.core)"
+
+test "the main module declares Ordering and still compares, sorts and matches" {
+    runs("{own}{body}\nfn main() \{\n    io.println(report())\n}\n", "", forms_note, "true true 1 3 less not up")
+}
+
+test "another module declares Ordering and still compares, sorts and matches" {
+    let main = "import geo.sim\n\nfn main() \{\n    io.println(sim.report())\n}\n"
+    runs(main, "{own}{body}", forms_note, "true true 1 3 less not up")
+}
