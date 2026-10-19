@@ -170,3 +170,204 @@ fn main() {
 }
 "#, "0 0 0 2")
 }
+
+// A value that stays open keeps E0301, and a payload of the wrong type is still a mismatch,
+// whichever spelling builds the variant.
+fn expect_rejects(src: Str, want: Str) {
+    let dir = sh("mktemp -d /tmp/blink_let_binder.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", src)
+    let mut ok = true
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+        if r.exit_code == 0 || !r.out.contains(want) || r.out.contains("internal compiler error") {
+            io.eprintln("blink {args}: exit {r.exit_code}, want `{want}`\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}
+
+test "both arms open: a field, a list element, a let, an argument and a return" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type W { b: Box[Int] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn take(b: Box[Int]) -> Int { b.v.len() }
+fn ret(c: Bool) -> Box[Int] { if c { mk([]) } else { mk([]) } }
+fn main() {
+    let c = true
+    let w = W { b: if c { mk([]) } else { mk([]) } }
+    let wm = W { b: match c {
+        true => mk([])
+        false => { mk([]) }
+    } }
+    let xs: List[Box[Int]] = [if c { mk([]) } else { mk([]) }, { { mk([]) } }]
+    let l: Box[Int] = if c { mk([]) } else { mk([]) }
+    let a = take(if c { mk([]) } else { mk([]) })
+    io.println("{w.b.v.len()} {wm.b.v.len()} {xs.len()} {l.v.len()} {a} {ret(c).v.len()}")
+}
+"#, "0 0 2 0 0 0")
+}
+
+test "a positional variant payload takes the field type in every wrapper" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type E { P(Box[Int])  Q(Box[Int], Int) }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn n(e: E) -> Int {
+    match e {
+        P(b) => b.v.len()
+        Q(b, k) => b.v.len() + k
+    }
+}
+fn main() {
+    let c = true
+    let q1 = E.P({ mk([]) })
+    let q2 = E.P(if c { mk([]) } else { mk([]) })
+    let q3 = E.Q(match c {
+        true => mk([])
+        false => mk([])
+    }, 1)
+    let q4 = E.P({ { mk([]) } })
+    let b0: E = P(mk([]))
+    let b1: E = P({ mk([]) })
+    let b2: E = P(if c { mk([]) } else { mk([]) })
+    let b3: E = Q(match c {
+        true => mk([])
+        false => { mk([]) }
+    }, 1)
+    let b4 = n(P({ { mk([]) } }))
+    io.println("{n(q1)} {n(q2)} {n(q3)} {n(q4)} {n(b0)} {n(b1)} {n(b2)} {n(b3)} {b4}")
+}
+"#, "0 0 1 0 0 0 0 1 0")
+}
+
+test "a generic enum payload takes the field type at the expected instance" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type G[T] { GP(Box[T])  GN }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn n(g: G[Int]) -> Int {
+    match g {
+        GP(b) => b.v.len()
+        GN => 9
+    }
+}
+fn main() {
+    let c = true
+    let a: G[Int] = G.GP(mk([]))
+    let b: G[Int] = GP({ mk([]) })
+    let d: G[Int] = G.GP(if c { mk([]) } else { mk([]) })
+    let e = n(GP(match c {
+        true => mk([])
+        false => { { mk([]) } }
+    }))
+    io.println("{n(a)} {n(b)} {n(d)} {e}")
+}
+"#, "0 0 0 0")
+}
+
+test "a tuple slot takes its type in every wrapper" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type WT[T] { value: T }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn pair[A, B](a: A, b: B) -> (A, B) { (a, b) }
+fn ret() -> (Box[Int], Int) { ({ mk([]) }, 2) }
+fn main() {
+    let c = true
+    let t0: (Map[Str, Str], Int) = pair(Map(), 1)
+    let w: WT[(Map[Str, Str], Int)] = WT { value: pair(Map(), 1) }
+    let t1: (Box[Int], Int) = ({ mk([]) }, 1)
+    let t2: (Box[Int], Int) = (if c { mk([]) } else { mk([]) }, 1)
+    let t3: (Box[Int], Int) = (match c {
+        true => mk([])
+        false => mk([])
+    }, 1)
+    let t4: (Box[Int], Int) = { ({ { mk([]) } }, 1) }
+    let t5: (Box[Int], Int) = if c { (mk([]), 1) } else { pair(mk([]), 1) }
+    io.println("{t0.0.len()} {w.value.1} {t1.0.v.len()} {t2.0.v.len()} {t3.0.v.len()} {t4.0.v.len()} {t5.0.v.len()} {ret().1}")
+}
+"#, "0 1 0 0 0 0 0 2")
+}
+
+test "a ?? default and a ? operand take the expected type in every wrapper" {
+    expect_runs(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn mkr[T](xs: List[T]) -> Result[Box[T], Str] { Ok(Box { v: xs }) }
+fn mko[T](xs: List[T]) -> Option[Box[T]] { Some(Box { v: xs }) }
+fn g(c: Bool) -> Result[Int, Str] {
+    let x: Box[Int] = (if c { mkr([]) } else { mkr([]) })?
+    let y: Box[Int] = { mkr([]) }?
+    Ok(x.v.len() + y.v.len())
+}
+fn h(c: Bool) -> Option[Int] {
+    let x: Box[Int] = (match c {
+        true => mko([])
+        false => mko([])
+    })?
+    Some(x.v.len())
+}
+fn main() {
+    let c = true
+    let o: Option[Box[Int]] = None
+    let a = o ?? mk([])
+    let b: Box[Int] = o ?? { mk([]) }
+    let d = o ?? (if c { mk([]) } else { mk([]) })
+    let e: Box[Int] = mko([]) ?? (match c {
+        true => mk([])
+        false => mk([])
+    })
+    io.println("{a.v.len()} {b.v.len()} {d.v.len()} {e.v.len()} {g(c).is_ok()} {h(c).is_some()}")
+}
+"#, "0 0 0 0 true true")
+}
+
+test "a value nothing determines is still E0301, and a wrong payload is still a mismatch" {
+    expect_rejects(#"type Box[T] { v: List[T] }
+type G[T] { GP(Box[T])  GN }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn main() {
+    let g = GP(mk([]))
+    match g {
+        GP(b) => io.println("{b.v.len()}")
+        GN => {}
+    }
+}
+"#, "CannotInferType")
+    expect_rejects(#"type Box[T] { v: List[T] }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn main() {
+    let t = ({ mk([]) }, 1)
+    io.println("{t.1}")
+}
+"#, "CannotInferType")
+    expect_rejects(#"type E { P(Int)  Q(Str) }
+fn main() {
+    let e = P("x")
+    match e {
+        P(n) => io.println("{n + 1}")
+        Q(s) => io.println(s)
+    }
+}
+"#, "expects Int, got Str")
+}
+
+test "a generic struct field and a spread take the type at the expected instance" {
+    expect_runs(#"type Box[T] { v: List[T] }
+type GW[T] { b: Box[T]  n: Int }
+fn mk[T](xs: List[T]) -> Box[T] { Box { v: xs } }
+fn none[T]() -> List[Box[T]] { [] }
+fn main() {
+    let c = true
+    let g: GW[Int] = GW { b: if c { mk([]) } else { mk([]) }, n: 1 }
+    let h: GW[Int] = GW { b: match c {
+        true => { { mk([]) } }
+        false => mk([])
+    }, n: 2 }
+    let base: List[Box[Int]] = [mk([1])]
+    let xs: List[Box[Int]] = [..base, mk([])]
+    let ys: List[Box[Int]] = [..none(), ..base]
+    io.println("{g.b.v.len()} {g.n} {h.n} {xs.len()} {xs.get(0).unwrap().v.len()} {ys.len()}")
+}
+"#, "0 1 2 2 1 1")
+}
