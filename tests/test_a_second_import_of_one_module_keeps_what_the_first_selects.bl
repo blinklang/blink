@@ -1,0 +1,70 @@
+// A file may import one module more than once (sections/07_trust_modules_metadata.md §10.5,
+// "Imported Names"): each selective import binds the names it lists, and a whole-module
+// import binds the qualifier. A later import of the module adds its bindings to the file and
+// takes none of the earlier ones away. The program runs the same as one C unit and per module.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn new_package(main_src: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_second_import.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/shapes.bl", "pub type A \{ v: Int }\npub fn a_t(x: A) -> Int \{ x.v }\n")
+    write_file("{dir}/src/main.bl", main_src)
+    dir
+}
+
+fn cleanup(dir: Str) {
+    let _ = sh("rm -rf {dir}")
+}
+
+// The check passes, and the program prints `want` as one C unit and per module.
+fn expect_runs(main_src: Str, want: Str) {
+    let dir = new_package(main_src)
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.exit_code == 0 && (args == "check" || r.out.trim().ends_with(want))
+        if !good {
+            io.eprintln("blink {args}: exit {r.exit_code}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+// The check fails, and its output holds `want`.
+fn expect_refused(main_src: Str, want: Str) {
+    let dir = new_package(main_src)
+    let r = blink_in(dir, "check")
+    let ok = r.exit_code != 0 && r.out.contains(want)
+    if !ok { io.eprintln("blink check: exit {r.exit_code}\n{r.out}") }
+    cleanup(dir)
+    assert(ok)
+}
+
+test "two selective imports of one module bind the names of both" {
+    expect_runs("import shapes.\{A}\nimport shapes.\{a_t}\nfn main() \{ io.println(\"\{a_t(A \{ v: 1 })}\") }\n", "1")
+}
+
+test "a whole-module import after a selective one keeps the selection" {
+    expect_runs("import shapes.\{A, a_t}\nimport shapes\nfn main() \{ io.println(\"\{a_t(A \{ v: 1 })} \{shapes.a_t(A \{ v: 2 })}\") }\n", "1 2")
+}
+
+test "a selective import after a whole-module one binds its names" {
+    expect_runs("import shapes\nimport shapes.\{A, a_t}\nfn main() \{ io.println(\"\{a_t(A \{ v: 1 })} \{shapes.a_t(A \{ v: 2 })}\") }\n", "1 2")
+}
+
+test "a name neither import selects is still refused" {
+    expect_refused("import shapes.\{A}\nimport shapes\nfn main() \{ io.println(\"\{a_t(A \{ v: 1 })}\") }\n",
+        "error[ImportNotSelected]: `a_t` is not in scope")
+}

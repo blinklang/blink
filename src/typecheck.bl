@@ -734,12 +734,7 @@ fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
     }
     for source_mod in mods.split("|") {
         if source_mod == "" { continue }
-        match module_import(reader, source_mod) {
-            Some(imp_node) => {
-                if imp_node != -1 && is_selected_import(bare, reader, source_mod) != 0 { return "{source_mod}.{bare}" }
-            }
-            None => {}
-        }
+        if is_selected_import(bare, reader, source_mod) != 0 { return "{source_mod}.{bare}" }
     }
     bare
 }
@@ -13779,11 +13774,13 @@ fn partial_handler_warn(he: Int, eff: Str, names: List[Str], stubs: List[Str], f
 }
 
 // ── Selective import filtering ──────────────────────────────────────
-// consuming_mod → source_mod → the import node, or -1 for a whole-module import. Keyed by
-// the consuming module first, since a lookup by bare name asks for one module's imports.
-// The driver fills it through record_module_import while it resolves imports; the checks that
-// read it live here.
-let mut per_module_imports: Map[Str, Map[Str, Int]] = Map()
+// consuming_mod → source_mod → every import of that module the file writes, in source order:
+// the import node, or -1 for a whole-module import. A file may import one module more than
+// once (a selection and a whole-module import, or two selections), and each import binds its
+// own names, so none replaces another. Keyed by the consuming module first, since a lookup by
+// bare name asks for one module's imports. The driver fills it through record_module_import
+// while it resolves imports; the checks that read it live here.
+let mut per_module_imports: Map[Str, Map[Str, List[Int]]] = Map()
 pub let mut tc_import_modules: List[Str] = []
 pub let mut tc_import_qualifiers: List[Str] = []
 pub let mut tc_import_nodes: List[Int] = []
@@ -13800,17 +13797,12 @@ type ImportBinding {
 
 pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int) {
     nr_drop_import_index(consuming_mod)
-    match per_module_imports.get(consuming_mod) {
-        Some(imports) => {
-            let mut known = imports
-            known.insert(source_mod, imp_node)
-        }
-        None => {
-            let mut imports: Map[Str, Int] = Map()
-            imports.insert(source_mod, imp_node)
-            per_module_imports.insert(consuming_mod, imports)
-        }
-    }
+    let mut imports = per_module_imports.get(consuming_mod) ?? Map()
+    let mut nodes = imports.get(source_mod) ?? []
+    if nodes.contains(imp_node) { return }
+    nodes.push(imp_node)
+    imports.insert(source_mod, nodes)
+    per_module_imports.insert(consuming_mod, imports)
 }
 
 pub fn clear_module_imports() {
@@ -13852,23 +13844,26 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
             for source_mod in imports.keys() {
                 // A selective import binds the module's qualifier as a whole-module one does.
                 quals.insert(tc_qualifier_for_module(source_mod), source_mod)
-                let imp_node = imports.get(source_mod) ?? -1
-                if imp_node == -1 { continue }
-                let mut spellings: Map[Str, Int] = Map()
-                selects.insert(source_mod, spellings)
-                let names_sl = node_args(imp_node)
-                if names_sl == -1 { continue }
-                let mut i = 0
-                while i < sublist_length(names_sl) {
-                    let name_node = sublist_get(names_sl, i)
-                    let alias = node_str_val(name_node)
-                    let bound = if alias != "" { alias } else { node_name(name_node) }
-                    let mut binds = idx.get(bound) ?? []
-                    binds.push(ImportBinding { source_mod: source_mod, member: node_name(name_node) })
-                    idx.insert(bound, binds)
-                    spellings.insert(node_name(name_node), 1)
-                    if alias != "" { spellings.insert(alias, 1) }
-                    i = i + 1
+                for imp_node in imports.get(source_mod) ?? [] {
+                    if imp_node == -1 { continue }
+                    // Every selection of the module adds to one spelling set, so a second
+                    // import of it never takes away what the first binds.
+                    let mut spellings = selects.get(source_mod) ?? Map()
+                    selects.insert(source_mod, spellings)
+                    let names_sl = node_args(imp_node)
+                    if names_sl == -1 { continue }
+                    let mut i = 0
+                    while i < sublist_length(names_sl) {
+                        let name_node = sublist_get(names_sl, i)
+                        let alias = node_str_val(name_node)
+                        let bound = if alias != "" { alias } else { node_name(name_node) }
+                        let mut binds = idx.get(bound) ?? []
+                        binds.push(ImportBinding { source_mod: source_mod, member: node_name(name_node) })
+                        idx.insert(bound, binds)
+                        spellings.insert(node_name(name_node), 1)
+                        if alias != "" { spellings.insert(alias, 1) }
+                        i = i + 1
+                    }
                 }
             }
         }
@@ -13879,10 +13874,11 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
     built
 }
 
-fn module_import(consuming_mod: Str, source_mod: Str) -> Option[Int] {
+// Every import of `source_mod` that `consuming_mod` writes: an empty list when it has none.
+fn module_imports_of(consuming_mod: Str, source_mod: Str) -> List[Int] {
     match per_module_imports.get(consuming_mod) {
-        Some(imports) => imports.get(source_mod)
-        None => None
+        Some(imports) => imports.get(source_mod) ?? []
+        None => []
     }
 }
 
@@ -13975,8 +13971,8 @@ fn tc_build_import_map() {
     }
 }
 
-// Whether the selective import of `source_mod` in `consuming_mod` binds `name`, as the selected
-// name or as its alias. The caller has found that import with module_import.
+// Whether some selective import of `source_mod` in `consuming_mod` binds `name`, as the
+// selected name or as its alias.
 fn is_selected_import(name: Str, consuming_mod: Str, source_mod: Str) -> Int {
     match nr_module_imports_built(consuming_mod).selects.get(source_mod) {
         Some(spellings) => if spellings.contains_key(name) { 1 } else { 0 }
@@ -14027,12 +14023,10 @@ fn is_filtered_for_module(name: Str, source_mod: Str, consuming_mod: Str) -> Int
     // A prelude module's types and traits are in every module's scope (section 10.6), so an
     // import of that module cannot narrow them to a selection. Its free functions still need one.
     if tc_prelude_modules.contains_key(source_mod) && tc_prelude_free_fn.contains_key(name) == 0 { return 0 }
-    match module_import(consuming_mod, source_mod) {
-        Some(imp_node) => {
-            if imp_node == -1 { return 1 }
-            return is_selected_import(name, consuming_mod, source_mod) == 0
-        }
-        None => {}
+    // A whole-module import binds only the qualifier, so an imported module's bare name is in
+    // scope just when one of the file's selections of that module names it.
+    if module_imports_of(consuming_mod, source_mod).len() > 0 {
+        return is_selected_import(name, consuming_mod, source_mod) == 0
     }
     // No import of this module at all. A file's imports say what it depends on, so a name
     // it never asked for is not in its scope, however many other modules pulled the
@@ -14060,13 +14054,8 @@ fn nr_is_unimported_prelude_free_fn(name: Str) -> Int {
     // The current module's own declaration is the binding; the prelude fn is not in scope.
     if nr_module_declares(nr_current_module, name) != 0 { return 0 }
     // An explicit import (bare or selective-including-name) makes it visible.
-    match module_import(nr_current_module, source_mod) {
-        Some(imp_node) => {
-            if imp_node == -1 { return 0 }
-            if is_selected_import(name, nr_current_module, source_mod) != 0 { return 0 }
-        }
-        None => {}
-    }
+    if module_imports_of(nr_current_module, source_mod).contains(-1) { return 0 }
+    if is_selected_import(name, nr_current_module, source_mod) != 0 { return 0 }
     1
 }
 
@@ -14389,8 +14378,6 @@ fn tc_check_namesake_import_ambiguity() ! Diag.Report {
             let mut second = ""
             for source_mod in mods.split("|") {
                 if source_mod == "" { continue }
-                let imp_node = module_import(reader, source_mod) ?? -1
-                if imp_node == -1 { continue }
                 if is_selected_import(bare, reader, source_mod) == 0 { continue }
                 hits = hits + 1
                 if hits == 1 { first = source_mod } else { second = source_mod }
