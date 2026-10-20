@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.56.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.57.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.56`, `0.56.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.57`, `0.57.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -335,8 +335,16 @@ test "addition works" {
 - **A fn's tail is checked against its declared return type.** A fn with a return type whose body can end with no value (a `while`, a `for`, or a `loop` that a `break` leaves) is `E0311 MissingReturn`. An `if` with no `else` used as a value is `E0304 MissingElse`.
 - **An undeclared type name is `E0507 UnknownType`.** A user type named `Tuple`, `Fn` or `Self` is `E0524 ReservedTypeName`.
 - **Operators need operands they apply to.** `+ - * / %`, unary `-` and the compound forms on `Bool`, `()`, structs, `Str - Str` or opaque handles are `E0300`.
-- **Indexing `x[0]` works on a `List` only.** Use `.get(i)` on other types, `.insert(k, v)` on a `Map`. A tuple field is `t.0`; `t._0` is rejected. A field that does not exist is `E0525 NoSuchField`.
+- **There is no index operator.** Any `[...]` after a value (read or write: `xs[0]`, `m["k"]`, `xs[i] = v`) is `E0313 NoIndexOperator`. Use `.get(i)` (returns `Option`), `.set(i, v)` on a `List` or `Bytes`, `.insert(k, v)` on a `Map`. A tuple field is `t.0`; `t._0` is rejected. A field that does not exist is `E0525 NoSuchField`.
 - **A variant that its enum does not declare is `E0547 NoSuchVariant`**, in a pattern at any depth (`Somee(v)`, `Some(Somee(v))`, `K.Zed`) and in a qualified construction (`K.Zed`, `K.Zed(1)`, `K.Zed { .. }`). The help names the nearest variant, or lists the variants. A qualified variant of another enum, or a struct pattern of another struct, is `E0300`. An arm with a bad pattern covers nothing; when it has no guard, the match gets no `E0004`.
+- **A struct or variant literal must name each field once.** A field with no default and no `..source` is `E0315 MissingField`; a label twice is `E0316 DuplicateField`; `..source` in a variant brace literal is `E0317 VariantSpread` (copy-update is for structs only).
+- **A bare variant name that two or more enums declare, with no expected type, is `E0519 AmbiguousConstruction`.** Write `Enum.Variant` or add a type annotation.
+- **Two `impl` blocks that can apply to one type for one trait are `E0526 OverlappingImpls`.**
+- **Two module-scope declarations of one name in one namespace are `E1016 DuplicateModuleBinding`** (values: `let`, `const`, `fn`; types: `type`, `alias`, `trait`, `effect`). A `let` or `fn` named like a variant of an enum in the package or the prelude is also `E1016`.
+- **A hole in a template literal `t"..."` whose type is not a Template value type is `E0534 TemplateHoleType`.**
+- **`type`, `trait` or `effect` named like a builtin type or prelude trait shadows it and warns `W1010 ShadowedPreludeName`.** To reach the builtin, write `import blink.core.{Eq as CoreEq}`.
+- **A fn declared `-> Never` must not return, else `E0311`.** `panic(msg)`, `todo()`, `unreachable()` and `skip()` have type `Never`, so they fit any expected type. `todo()` warns `W0703 TodoInCode`.
+- **A statement that drops the result of `append`, `slice`, `reverse`, `sort`, `sort_by` (List) or `union` (Set) warns `W0606 DiscardedCollectionCopy`:** they return a new value and do not mutate.
 - **A write through a name that is not `mut` is `E0610`.** This covers `=`, `op=` and a mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` or on a pattern binder. Use `let mut x`, or `mut` before the binder: `Some(mut ys) => ys.push(1)`.
 - **`mut` goes before a name, not before a pattern.** `let mut (x, y) = pair` and `for mut (k, v) in pairs` are `E0613 MutOnPattern`; write `let (mut x, mut y) = pair`. `blink fix` makes this edit.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`** (`E0005 InconsistentPatternBindings`). `Click(mut x, y) | Touch(x, y)` is an error; write `mut x` in both.
@@ -376,7 +384,7 @@ traits in `std.traits`.
 
 No implicit promotion between sized types and `Int`. Always use `.to_int()` to widen.
 
-An integer literal is its exact value and must fit the type it gets (the expected type, else `Int`), or it is `E0318 IntLiteralOutOfRange`. `let m: U64 = 9223372036854775808` is valid; `let x = 9223372036854775808` is `E0318` (annotate `U64`). A `-` directly on a literal is part of it: `-9223372036854775808` is the `Int` minimum, and any negative literal under an unsigned type (`-1`, `-0`) is `E0318`. A literal operand takes the other operand's type (`bits & 9223372036854775808`, `bits == 0`), an expected type reaches both operands of `+ - * / % & | ^` (`let t: U64 = 1 << 63`), and a shift amount is `U32`. The type is fixed at the literal: `let mut xs = List.new()` then `xs.push(9223372036854775808)` is `E0318`; annotate `List[U64]`.
+`Int`, the sized ints, `Char` and `Str` have `.eq(other) -> Bool` and `.cmp(other) -> Ordering`. `Bool` has `.eq(other)`.
 
 ## Escape Sequences
 
@@ -440,6 +448,9 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 | `process_pid_kill(pid, sig)` | Int | Send signal to child by pid; returns 0 on success |
 | `process_pid_send_signal(pid, sig)` | Int | Alias of `process_pid_kill` for the `send_signal` trait method |
 | `exit(code)` | () | Exit with code |
+| `panic(msg)` | Never | Abort with `msg`; never returns |
+| `todo()` | Never | Mark unfinished code; panics; warns `W0703` |
+| `unreachable()` | Never | Mark code that must not run; panics |
 | `arg_count()` | Int | CLI argument count |
 | `get_arg(idx)` | Str | CLI argument by index |
 | `time_ms()` | Int | Current time in milliseconds |
@@ -478,6 +489,7 @@ fs.read(path)                   // -> Result[Str, FsError]
 fs.write(path, content)         // -> Result[(), FsError]
 fs.delete(path)                 // -> Result[(), FsError] (delete file, backed by unlink(2))
 fs.list_dir(dir)                // -> Result[List[Str], FsError] (filenames)
+fs.stat(path)                   // -> Result[FileInfo, FsError] (follows symlinks; FileInfo { kind: FileKind (File|Dir|Other), size: Int, mtime: Instant }; effect: FS.Read)
 // FsError { op: FsOp, path: Str, code: Errno } — the error the fs.* surface returns.
 "{err}"                         // Display renders `op path: message`, e.g. `read /etc/app.toml: No such file or directory`
 err.not_found()                 // -> Bool: true only when the failure was ENOENT (file not there)
@@ -604,6 +616,8 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 | `.byte_at(idx)` | U8 | Raw byte at byte offset; panics when out of bounds |
 | `.byte_slice(start, end)` | Str | Byte range `[start, end)`; clamps; panics inside a codepoint |
 | `.byte_index_of(s, from)` | Option[Int] | Byte offset of first match at or after `from` |
+| `.eq(other)` / `.cmp(other)` | Bool / Ordering | Equality and byte order |
+| `.into_iter()` | Iterator[Char] | Lazy iterator over the chars |
 
 ## Char Methods
 
@@ -613,6 +627,7 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 |--------|---------|---------|
 | `.to_int()` | Int | Unicode code point as integer |
 | `.to_str()` | Str | Single-character string |
+| `.eq(other)` / `.cmp(other)` | Bool / Ordering | Equality and order by code point |
 
 **Construction:**
 ```blink
@@ -634,6 +649,8 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.push(item)` | () | Append (mutates) |
 | `.pop()` | Option[T] | Remove last |
 | `.get(idx)` | Option[T] | Element at index (None if OOB) |
+| `.last()` | Option[T] | Last element (None if empty) |
+| `.index_of(v)` | Option[Int] | Index of first element `== v`; needs `T: Eq` |
 | `.set(idx, val)` | () | Set element (mutates) |
 | `.insert(idx, val)` | () | Insert at idx, shift the rest right (mutates); idx == len appends, idx outside 0..=len panics |
 | `.remove(idx)` | T | Remove and return the element at idx, shift the rest left (mutates); idx outside 0..len panics |
@@ -655,6 +672,8 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.enumerate()` | List[(Int,T)] | Index each element (eager, list of tuples) |
 | `.take(n)` | List[T] | First n (eager) |
 | `.skip(n)` | List[T] | All but first n (eager) |
+| `.sort()` | List[T] | Stable sorted copy; receiver unchanged; needs `T: Ord` |
+| `.sort_by(fn(T,T)->Ordering)` | List[T] | Stable sorted copy; receiver unchanged |
 | `.clear()` | () | Remove all elements (mutates); does not lower `.capacity()` |
 
 Use `List.with_capacity(n)` only when the final size is known. `.capacity()` is for tests and diagnostics; do not branch on it.
@@ -787,6 +806,7 @@ let first_two = names
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
+| `.eq(other)` / `.cmp(other)` | Bool / Ordering | Total order, as `==` and `<` below |
 | `.ieee_eq(other)` | Bool | IEEE 754 equality: `NaN.ieee_eq(NaN)` is `false`, `0.0.ieee_eq(-0.0)` is `true` |
 | `.is_nan()` | Bool | NaN check (needs `import std.float`) |
 | `.truncate()` | Int | Drop the fraction |
@@ -1134,6 +1154,13 @@ with handler Metrics {
 
 Handlers nest — inner handlers shadow outer ones for the same effect.
 
+An operation can have a default body in the effect declaration (`fn b() { ... }`); a handler may omit it. `@handle_all` on an effect (or sub-effect) says a handler must write every operation that has no body; a handler that omits one warns `W0545 PartialHandler`. `IO.Read` is such an effect, so a test can handle it with `std.testing.stdin_from(text)`:
+
+```blink
+import std.testing.{stdin_from}
+with stdin_from("1\n2") { /* code that reads stdin sees "1\n2" */ }
+```
+
 ## Closeable Trait & `with`-`as` Blocks
 
 Types that implement `Closeable` (from `std.traits`) can be used in `with`-`as` blocks for automatic resource cleanup. `close()` is called on scope exit, including early exits (break, return, error propagation).
@@ -1317,6 +1344,11 @@ build/blink update                  # update deps + blink-version in blink.toml
 # Output format: --format json prints what --json prints; human is the default.
 # check, build, fmt, run and test take it. --json beside another --format value is an error.
 build/blink check src/main.bl --format json
+
+# blink test --json: per test file, {"results": [...], "summary": {...}}.
+# Each result status is passed | failed | panicked | skipped (a panic carries
+# its message). summary has total, passed, failed, panicked, skipped, duration_ms.
+build/blink test --json
 
 # Default builds (no mode flag) compile the C at -O1
 build/blink build src/main.bl

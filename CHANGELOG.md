@@ -2,22 +2,94 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
-## Changes (unreleased)
+## Breaking Changes (v0.57.0)
+
+### Indexing
+- **`xs[i]`, `m[k]` and `xs[i] = v` are E0313 NoIndexOperator.** Blink has no index operator; 0.56.0 accepted one. Read with `.get(i)` (it returns `Option`), or `.0` for a tuple. Write with `.set(i, v)` on a `List` or `Bytes`, and `.insert(k, v)` on a `Map`.
+
+### Mutation and patterns
+- **`mut` before a pattern that binds no name is E0613 MutOnPattern.** This includes `let mut (x, y) = pair`, `for mut (k, v) in pairs` and `mut _`. Before, `let mut (x, y)` made each name mutable. Run `blink fix` to migrate: it writes `let (mut x, mut y) = pair`.
+- **A write through a name that is not `mut` is E0610 MutationRequiresMut.** This covers `=` and `op=` on a plain `let`, and an assignment or a mutating method call on a pattern binder without `mut`. Before, `blink check` accepted an assignment to a plain `let`. `blink fix` inserts the `mut`.
+- **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`.** If not, it is E0005 InconsistentPatternBindings. The fix writes `mut` in every alternative.
+
+### Type checks
+- **A struct or variant literal must name each field once, and only fields that exist.** A repeated field is E0316 DuplicateField, an unknown field is E0525 NoSuchField, a missing field is E0315 MissingField, and `..spread` in a variant literal is E0317 VariantSpread. Each field value is checked against the field type.
+- **`assert_eq` and `assert_ne` need two arguments of one type.**
+- **A function value is checked against the function type it is bound to.** The body of a closure with no return annotation is checked against the expected return type. The arms of a `match` used as a value, and the default of `??`, must have one type.
+- **A bare variant resolves from the expected type, then from the one enum that has it.** If more than one enum has it, it is E0519 AmbiguousConstruction. A user variant named `Ok`, `Err`, `Some` or `None` now competes with the prelude.
+- **Two declarations of one name in one module namespace are E1016 DuplicateModuleBinding.** This includes a module-level value named like a variant.
+- **A trait bound is checked.** Wrong trait arguments on a bound are E0910 or E0306, and a bound must name a trait that exists.
+- **A `Map` key or `Set` element type that the compiler infers must have `Hash`.** `K: Hash` refuses `Float`.
+- **A tie between two conversions is E0301 CannotInferType.** A `From` impl that overlaps the built-in reflexive impl is E0526 OverlappingImpls.
+- **`let p = null_ptr()` with no pointee type is E0301 CannotInferType.** A bare `Ptr` with no type argument is E0303.
+- **`Raw(e)` needs `e: Str`** (E0534 TemplateHoleType). A `Raw[Str]` passed to `println` or used as an assert message is E0530 RawOutsideTemplate. `Raw[Str]` has no `Eq`.
+
+### Names and imports
+- **A name resolves only through the imports of the file that uses it.** This includes declarations in the main file. An import alias binds only in its own file, and there it replaces the original name.
+- **A declared type named like a built-in type (`Option`, `List`, `Raw`, `Handler`, `Ptr`) means the declaration in its own module,** with W1010 ShadowedPreludeName. A declared type named `Int`, `Str`, `Bool`, `Self`, `Void` or another scalar is E0524 ReservedTypeName.
+- **An unknown `@derive` name is E1402 NotDerivable.** E1112 UnknownDerive is retired. `@derive` resolves a trait name by scope.
+- **An annotation in the wrong position is an error.** This covers an annotation on an effect operation, an annotation other than `@handle_all` on a sub-effect, and `@handle_all` on a field.
+
+### Standard library
+- **`Str.parse_int()` and `Str.parse_float()` return `Result[_, ConversionError]` and refuse text outside the grammar.** `parse_int` takes an optional `-` and ASCII digits, and refuses overflow. `parse_float` takes `-? DIGITS ('.' DIGITS)? ('e' '-'? DIGITS)?`, `NaN`, `inf` and `-inf`, and does not use the locale. `??` on the result no longer compiles; use `.unwrap_or(d)` or `match`. `Str.to_int()` does not change.
+- **`io.read_line()` returns `Option[Str]`.** A blank line is `Some("")` and end of input is `None`; before, both were `""`. A line ends at `\n` or `\r\n` and has no length limit (before, 4096 bytes).
+- **`Str.lines()` splits at `\n` and `\r\n` only.** A lone `\r` stays in the line.
+- **`io.lines()` is E0505 UnresolvedMethod.** The help shows `io.read_all().lines()` and the `io.read_line()` loop.
+- **The `fd` field of `TcpSocket` and `TcpListener` is gone.** Read the fd with `.fd()`; it returns -1 after close. Wrap an fd you own with `tcp_socket_from_fd(fd)` or `tcp_listener_from_fd(fd)`. `close()` takes the fd out of a shared box, so a second close does nothing and every copy sees the close. After close, `read_bytes` and `write_bytes` return `Err(IoError("socket is closed"))`, `listener_accept` returns `Err(IoError("listener is closed"))`, `read` and `read_all` return `""`, and `write` and `set_timeout` do nothing.
+
+### Tools
+- **A child of `blink test` or `process.spawn` gets the null device as stdin.** A stdin read in a test with no `IO.Read` handler now ends at once; before, it waited on the terminal.
+- **A panic that escapes a test body is `status: "panicked"` in `blink test --json`.** The record carries the panic `message`, with no `cause`, `error` object or `line: 0`. The human line says `PANIC`, and the test binary exits non-zero. The `summary` always carries `total`, `passed`, `failed`, `panicked`, `skipped` and `duration_ms`. A `for_each` case entry is `passed`, `failed`, `panicked` or `skipped`; `"pass"` and the `"dropped"` entry are gone, and each case that ran has an entry. The parent test takes its most severe case. An expected red under `test.failing` adds `xfail_observed`.
+
+## What's New (v0.57.0)
+
+- **`List.insert(i, v)` and `List.remove(i)`** shift the rest of the list. An index outside the range panics.
+- **`List.last()` and `List.index_of(v)`** return `Option`.
+- **`List.sort()` and `List.sort_by(f)`** return a stable sorted copy; the receiver keeps its order. `sort` needs `T: Ord`.
+- **`Map.entries()`** returns the `(key, value)` pairs in iteration order.
+- **`Str.into_iter()`** returns an `Iterator[Char]`. `.chars()` gets a help that names it.
+- **`eq` and `cmp` methods on `Int`, the sized integers, `Char` and `Str`, and `eq` on `Bool`.** `Float.eq` and `Float.cmp` use the total order.
+- **`Float.to_bits()`, `Float.from_bits(n)` and `Float.is_sign_negative()`.** A bitwise operator on a `Float` gets a help that names them.
+- **A `Float` comparison with a written `-0.0` operand warns W0706 NegativeZeroComparison.** The help names `x.is_sign_negative()`.
+- **`panic(msg)` and the `Never` type.** A function declared `-> Never` must not return, or it is E0311 MissingReturn. `skip()` has type `Never`.
+- **`todo()` and `unreachable()`.** `todo()` warns W0703 TodoInCode.
+- **Discarding the copy that a collection method returns warns W0606 DiscardedCollectionCopy.**
+- **`std.time` has `Date` and `Weekday`.** `Date.from_ymd`, `Date.parse`, `.year()`, `.month()`, `.day()`, `.weekday()`, `.add_days(n)`, `.days_since(d)` and `.to_instant()`. `Instant` gets `.date()`, `.hour()`, `.minute()`, `.second()` and `Instant.parse(s)` (RFC 3339). A type error between `Date` and `Instant` gets a help.
+- **`fs.stat(path)`.** Each `fs` operation now goes through the `FS` handler.
+- **An effect operation can have a body.** The body runs under the innermost handler, so a handler that does not handle the operation gets the derived version.
+- **`@handle_all` on an effect requires a handler to handle every operation.** A partial handler warns W0545 PartialHandler, with a fix that adds the missing operations. `Time` and `IO.Read` use it. `blink doc` shows `@handle_all`.
+- **`IO.Read` is a handleable effect.** `std.testing.stdin_from(text)` gives a handler that feeds `text` to `io.read_line`, `io.read_bytes` and `io.read_all`.
+- **`io.read_all()`** reads the rest of stdin. `io.read_bytes`, `io.read_line` and `io.read_all` read one stream, so a program can read header lines, then a body of known length.
+- **`From` and `TryFrom` impls can have type parameters.**
+- **`import blink.core.{Eq as CoreEq}` reaches a built-in trait** when a local declaration shadows its name.
+- **A declaration that shadows a compiler-known type or trait warns W1010 ShadowedPreludeName.**
+- **`mut` goes on each name in a pattern.** `let (mut lo, hi) = pair`, `for (k, mut v) in pairs`, `Some(mut n) =>`, `Point { mut x, .. } =>`. A `mut` binder follows the rules for `let mut`.
+- **The alternatives of an OR-pattern bind names.** In `Click(x, y) | Touch(x, y) => use(x, y)`, the arm body can use `x` and `y`.
+- **`blink fix <file>`** applies the machine-applicable fixes of the file's diagnostics and prints how many it applied and how many are left.
+
+## Fixes (v0.57.0)
 
 - **A variant that its enum does not declare is E0547 NoSuchVariant.** This covers a pattern at any depth (`Somee(v)`, `Some(Somee(v))`, `Shape.Circel(r)`) and a qualified construction (`Shape.Circel`, `Shape.Circel(1.0)`, `Shape.Circel { r: 1.0 }`). Before, a bad pattern gave an internal compiler error or no error. The span is the variant name. The help names the nearest variant; `blink fix` applies the rename when its payload form agrees, else the help lists the variants. A qualified variant of another enum and a struct pattern of another struct are E0300. An arm with a bad pattern covers nothing, and an unguarded one turns off E0004 for its match. `blink explain E0547` shows the checks.
-- **A `Float` comparison with a written `-0.0` operand warns `NegativeZeroComparison` (W0706).** `-0.0 == 0.0`, so `x == -0.0`, `x < -0.0`, `x.ieee_eq(-0.0)` and `assert_eq(x, -0.0)` give the same result for `0.0` and `-0.0`. The help names `x.is_sign_negative()`; to test for negative zero, write `x == 0.0 && x.is_sign_negative()`. `blink explain W0706` shows the forms side by side. Suppress with `@allow(NegativeZeroComparison)`, or set `W0706` under `[lints]`.
-- **`mut` goes on each name in a pattern.** Write `mut` directly before the name that changes, in any pattern: `let (mut lo, hi) = pair`, `for (k, mut v) in pairs`, `Some(mut n) =>`, `Point { mut x, .. } =>`. Only the name right after `mut` is mutable. A `mut` binder follows the rules for `let mut`: it can be assigned, it can take a mutating method call, and `async.spawn` cannot capture it (E0650).
-- **`mut` before a pattern that binds no name is E0613 MutOnPattern (breaking).** This includes `let mut (x, y) = pair`, `for mut (k, v) in pairs` and `mut _`. Before, `let mut (x, y)` made each name mutable. Run `blink fix` to migrate: it writes `let (mut x, mut y) = pair`, which keeps the old meaning.
-- **A write through a name that is not `mut` is E0610 MutationRequiresMut (breaking).** This covers `=` and `op=` on a plain `let`, and an assignment or a mutating method call on a pattern binder without `mut`. Before, `blink check` accepted an assignment to a plain `let`. The fix inserts `mut` at the `let` or before the binder; `blink fix` applies it.
-- **The alternatives of an OR-pattern bind names.** In `Click(x, y) | Touch(x, y) => use(x, y)`, the arm body can use `x` and `y`. Before, the body got `UndefinedVariable` for them. Each alternative must bind the same names with the same types and the same `mut`; if not, it is E0005 InconsistentPatternBindings (breaking for a binder that is `mut` in some alternatives only). The fix writes `mut` in every alternative.
-- **A closed `std.db` handle reports an error instead of reaching freed sqlite memory.** A second `with` on one `Connection`, a copy of a closed `Connection`, or a `db.*` call through a closed handle returns `Err(ConnectionError("connection is closed"))`. A second close or `exit()` does nothing. A `Stmt` call after `finalize()` returns `Err(ExecError("statement is finalized"))`; `column_int` and `column_text` panic, since they return no `Result`. A transaction on a closed connection panics in `enter()`. Before, each of these was a use-after-free or a double free.
-- **A closed `TcpSocket` or `TcpListener` cannot close a socket that reused its fd (breaking).** The fd now lives in a box behind the handle: `close()` takes it out, so a second close does nothing and every copy sees the close. After close, `read_bytes` and `write_bytes` return `Err(IoError("socket is closed"))`, `listener_accept` returns `Err(IoError("listener is closed"))`, `read` and `read_all` return `""`, and `write` and `set_timeout` do nothing; none of them makes a syscall. Before, a second close closed whatever socket the OS had given the same fd number. The `fd` field is gone: read the fd with `.fd()` (it returns -1 after close), and wrap an fd you own with `tcp_socket_from_fd(fd)` or `tcp_listener_from_fd(fd)` in place of `TcpSocket { fd: fd }`.
-- **`blink fix <file>` applies the machine-applicable fixes of the file's diagnostics** and prints how many it applied and how many diagnostics are left.
-- **`io.read_line()` returns `Option[Str]` (breaking).** A blank line is `Some("")` and end of input is `None`; before, both were `""`. Code that uses the result as a `Str` gets a TypeError whose note and help show the `match` form. A line ends at `\n` or `\r\n`, and has no length limit (before, a line was cut at 4096 bytes).
-- **`io.read_bytes`, `io.read_line` and the new `io.read_all()` read one standard input stream**, so a program can read header lines, then a body of known length. `io.read_bytes(n)` gives exactly `n` bytes, or fewer only at end of input, and panics for `n <= 0`. A read failure panics with the errno; bytes that are not UTF-8 make `read_line` and `read_all` panic.
-- **`Str.lines()` splits at `\n` and `\r\n` only (breaking).** A lone `\r` stays in the line, the same as `io.read_line()`.
-- **`io.lines()` is E0505 UnresolvedMethod**, with a help that shows `io.read_all().lines()` and the `io.read_line()` loop.
-- **A panic that escapes a test body is `status: "panicked"` (breaking for `--json` readers).** The record carries the panic `message` and no `cause`, `error` object or `line: 0`; before, it was `status: "failed"` with `cause: "panic"`. The human line says `PANIC` in place of `FAIL`, and the test binary exits non-zero. The `summary` always carries `total`, `passed`, `failed`, `panicked`, `skipped` and `duration_ms`, and the human summary line adds `N panicked` when a test panicked. A `for_each` case entry in `cases[]` is `passed`, `failed`, `panicked` (with its `message`) or `skipped`; `"pass"` and the `"dropped"` overflow entry are gone, and every case that ran has an entry. The parent test takes its most severe case, so a panicking case outranks an earlier failed one. An expected red under `test.failing` adds `xfail_observed` (`"failed"` or `"panicked"`), and an expected-red panic keeps its `message`; a skipped `test.failing` test keeps `expected_fail` and `xfail_reason`.
+- **Operands and arguments evaluate left to right.**
+- **Two modules can declare a type, global or trait with the same name.** Before, they could collide. A name that contains `_` no longer collides with another at C link time.
+- **A default argument value is evaluated in the module that declares it.** A qualified call `m.f(...)` fills defaults, checks arguments and warns on a deprecated function.
+- **A method call through a trait bound or a supertrait works.** `Eq` and `Ord` are checked at the instance type.
+- **The expected type fills generic type parameters** through the tail of a block, `if` or `match`, tuple slots, variant payloads, `?` and `??`. A closure return type can solve a type parameter.
+- **`if`, `match` or a block works as a struct literal field value or a module-level `let` value.** A closure works in a module-level initializer.
+- **`blink fmt` keeps `()`.** Diagnostics print the unit type as `()`.
+- **A field access on a value with no fields is E0525 NoSuchField,** not an internal compiler error. Calling a type name is `UndefinedFunction` with a repair, not an internal compiler error.
+- **A wrong argument count to a carrier constructor, or a payload variant used as a value, is an error.** Method argument counts are checked.
+- **`Option.Some(x)` and `Result.Ok(x)` work.** A user variant named `Some` no longer breaks an `Option` match. A module's own `Ordering` type no longer breaks comparisons.
+- **A second import of one module keeps the selections of the first.** A local function named like a prelude function works.
+- **W0501 no longer fires on a correct program.** W0550 and W0551 check every expression position.
+- **A handler is removed while its own operation body runs.** Before, a handler that called its own operation overflowed the stack.
+- **`Bytes.to_str()` and `io.read_line()` refuse a NUL byte and text that is not strict UTF-8.**
+- **A list literal of `Option[Str]` calls compiles.**
+- **`for_each` runs every case.**
+- **`blinkc` resolves `pub` re-exports.**
+- **A closed `std.db` handle returns an error instead of reading freed memory.** A second `with` on a `Connection`, a copy of a closed `Connection`, or a `db.*` call on a closed handle returns `Err(ConnectionError("connection is closed"))`. A `Stmt` call after `finalize()` returns `Err(ExecError("statement is finalized"))`.
+- **The build no longer needs `sha256sum` or `shasum` on `PATH`.** Build cache keys change once.
+- **The method-name hint names only a method that the receiver has.** E0519 names enums with the same name by module.
 
 ## Breaking Changes (v0.56.0)
 
