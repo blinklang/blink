@@ -1579,11 +1579,11 @@ let lengths = names.map(fn(n) { n.len() })   // List[Int]
 let upper = names.map(fn(n) { n.to_upper() }) // n is Str, inferred from List[Str]
 ```
 
-**Keyword labels are not part of the type.** Declaration-site keyword parameters (see [2.13](02_syntax.md#213-declaration-site-keyword-arguments)) use `--` to separate positional from keyword params, but labels are call-site enforcement only. The function type ignores labels entirely:
+**Keyword labels are not part of the type.** Declaration-site keyword parameters (see [2.13](02_syntax.md#213-declaration-site-keyword-arguments)) use the `*` marker to separate positional from keyword params, but labels are call-site enforcement only. The function type ignores labels entirely:
 
 ```blink
 // This function:
-fn transfer(amount: Int, -- from: Account, to: Account) -> Result[Transaction, BankError]
+fn transfer(amount: Int, *, from: Account, to: Account) -> Result[Transaction, BankError]
 
 // Has type: fn(Int, Account, Account) -> Result[Transaction, BankError]
 // The -- and labels are invisible to the type system

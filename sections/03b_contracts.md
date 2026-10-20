@@ -464,7 +464,7 @@ Even before SMT verification, contracts serve as machine-readable documentation:
 @requires(from.balance >= amount)
 @ensures(result.from.balance == old(from.balance) - amount)
 @ensures(result.to.balance == old(to.balance) + amount)
-fn transfer(amount: Int, -- from: Account, to: Account) -> TransferResult {
+fn transfer(amount: Int, *, from: Account, to: Account) -> TransferResult {
     // The contracts tell you everything about this function's behavior.
     // The implementation is almost redundant.
 }

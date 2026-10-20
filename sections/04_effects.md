@@ -1091,7 +1091,7 @@ pub fn udp_bind(addr: SockAddr) -> Result[UdpSocket, NetError]            // ! N
 pub fn resolve(host: Str, port: Int) -> Result[List[SockAddr], NetError]  // ! Net.DNS
 
 pub trait UdpSocketOps {
-    fn recv_from(self, -- max: Int = 65535) -> Result[(Bytes, SockAddr), NetError]
+    fn recv_from(self, *, max: Int = 65535) -> Result[(Bytes, SockAddr), NetError]
     fn send_to(self, data: Bytes, dest: SockAddr) -> Result[(), NetError]   // ! Net.Connect
     fn local_addr(self) -> Result[SockAddr, NetError]
     fn set_timeout(self, ms: Int)
@@ -1288,7 +1288,7 @@ The `process` handle is in scope when a function declares `! Process` or one of 
 effect Process {
     effect Spawn {
         /// Run cmd with args, wait for it to exit, and return what it wrote.
-        fn run(cmd: Str, args: List[Str], -- stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]
+        fn run(cmd: Str, args: List[Str], *, stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]
 
         /// Start cmd with args and return at once.
         fn spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError]
@@ -1310,7 +1310,7 @@ effect Process {
 
 | Operation | Signature | Effect |
 |---|---|---|
-| `process.run` | `process.run(cmd: Str, args: List[Str], -- stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
+| `process.run` | `process.run(cmd: Str, args: List[Str], *, stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
 | `process.spawn` | `process.spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError]` | `Process.Spawn` |
 | `process.wait` | `process.wait(child: Child) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
 | `process.exec` | `process.exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError]` | `Process.Spawn`, `Env.Exit` |

@@ -14,7 +14,7 @@
 7. [Trust/Modules](sections/07_trust_modules_metadata.md) — FFI, modules, 15 annotations
 
 ## Key decisions (detail in DECISIONS.md)
-fn keyword|{ } braces|no semicolons|"double quotes" only|List[T] generics|keyword args (-- separator)|struct field defaults
+fn keyword|{ } braces|no semicolons|"double quotes" only|List[T] generics|keyword args (* marker)|struct field defaults
 Result[T,E]+?|Option[T]+??|no null|no exceptions|no inheritance|Query[C] injection safety
 Effects ! IO,DB|fine-grained capabilities|green threads|structured concurrency|Closeable trait + with...as scoped resources
 Annotations standalone|15 types|canonical order in §11.1 of section 7

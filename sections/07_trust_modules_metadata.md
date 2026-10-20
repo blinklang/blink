@@ -1316,9 +1316,9 @@ Decided by panel deliberation [`libc-bytes-wrapper-coverage`](../decisions/libc-
 
 ```blink
 fn read_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO
-fn recv_bytes(fd: Int, max: Int, -- flags: MsgFlags = MsgFlags.NONE) -> Result[Bytes, Errno] ! IO
+fn recv_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Bytes, Errno] ! IO
 fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO
-fn send_bytes(fd: Int, data: Bytes, -- flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
+fn send_bytes(fd: Int, data: Bytes, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
 fn getentropy_bytes(n: Int) -> Result[Bytes, Errno] ! IO
 ```
 
@@ -1336,7 +1336,7 @@ Each member ships at v1; the set **blocks the v1 release**.
 **Naming law (normative).** Every `libc` byte-moving syscall wrapper conforms to a fixed shape, so the family is name-predictable and post-v1 additions are mechanical rather than designed:
 
 - **Name** = `libc.<posix_syscall_name>_bytes` (e.g. `recvfrom` → `recvfrom_bytes`, never `recv_from_bytes`).
-- **Arguments** = POSIX C argument order. The `(void* buf, size_t len)` pair is replaced in place by `max: Int` (reads) or `data: Bytes` (writes; length is `data.len()`, never passed explicitly). `flags` is always the trailing keyword `-- flags: MsgFlags = MsgFlags.NONE`, exempt from C order.
+- **Arguments** = POSIX C argument order. The `(void* buf, size_t len)` pair is replaced in place by `max: Int` (reads) or `data: Bytes` (writes; length is `data.len()`, never passed explicitly). `flags` is always the trailing keyword `*, flags: MsgFlags = MsgFlags.NONE`, exempt from C order.
 - **Return** = `Result[Bytes, Errno]` (Bytes-out) or `Result[Int, Errno]` (Bytes-in), bound to direction — a write may not be typed `Result[Bytes, Errno]`. A non-buffer out-parameter moves into the success value as a tuple after the `Bytes` or count, in C order. A pointer-typed out-parameter that may be empty is `Option` (e.g. `recvfrom_bytes` → `Result[(Bytes, Option[SockAddr]), Errno]`).
 - **Effect** = `! IO`.
 - **Mechanism** = `Bytes.with_mut_ptr` (reads) or `Bytes.with_ptr` (writes), never the byte-bridge primitives.
@@ -1405,8 +1405,8 @@ The `bytes-bridge` doc page (`blink doc bytes-bridge`) is the single canonical e
 Decided by panel deliberation [`udp-gate-sockaddr-flags`](../decisions/udp-gate-sockaddr-flags.md). Resolves the UDP gate that §9.1.3.3 deferred. The `std.net` caller and the `SockAddr` type are specified in §4.4.6.
 
 ```blink
-fn recvfrom_bytes(fd: Int, max: Int, -- flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO
-fn sendto_bytes(fd: Int, data: Bytes, dest: SockAddr, -- flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
+fn recvfrom_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO
+fn sendto_bytes(fd: Int, data: Bytes, dest: SockAddr, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
 ```
 
 Both follow the naming law of §9.1.3.3: the peer address is a non-buffer out-parameter, so it follows the `Bytes` in the success tuple, and it is `Option` because the kernel may return no address.
@@ -1455,7 +1455,7 @@ When `[native-dependencies].headers` is missing, the compiler emits `W0812: @ffi
 User code should reach for stdlib first:
 
 - `std.libc.poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! IO`
-- `std.libc.recvfrom_bytes(fd: Int, max: Int, -- flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO`
+- `std.libc.recvfrom_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO`
 - `std.libc.sigaction(...)` — etc.
 
 `@ffi.struct` is the implementation primitive used inside `std.libc.*`. User-defined `@ffi.struct` outside stdlib is **discouraged but not banned**. `blink audit` reports a `user-defined @ffi.struct count` metric per project. If, within 12 months of v1 ship, the registry shows >50 distinct user-defined `@ffi.struct` types across third-party projects (or 5+ projects vendoring functionally-equivalent `@ffi.struct` declarations for the same syscall family), the panel reconvenes to consider stdlib expansion of `std.libc.*` to absorb them.

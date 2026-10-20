@@ -2,6 +2,8 @@
 
 # Keyword Arguments & Defaults — Design Rationale
 
+> **Superseded in part.** A later six-seat re-audit replaced the `--` separator with the `*` marker (6-0), and recorded that §2.13 allows const defaults on keyword parameters only. It also dropped the uncited "3-8%" swap figure. The record below is the original deliberation and stays as written. See [Keyword Marker Re-audit](keyword-marker-reaudit.md) and §2.13.
+
 ### Problem Statement
 
 Positional-only parameters create two classes of problems:

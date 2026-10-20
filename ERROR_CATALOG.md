@@ -125,9 +125,9 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | NoSuchField | E0525 | A field access names a field that the struct, tuple or opaque handle does not declare; or a label in a struct literal, a variant brace literal or a labelled variant paren payload names a field that the type or variant does not declare. For a label, the candidates for the nearest-name suggestion (see *Conventions*) are the declared fields the literal does not already label; with one suggestion, the rename is machine-applicable; with none, the help lists the declared fields and marks those given. The help adds "or add the field to `T`" only when `T` is declared in the package being compiled | Type checking | §3.2, §2.14 |
 | PositionalAfterKeyword | E0527 | A positional argument follows a labelled one in the same call | Name resolution | §2.13 |
 | DuplicateKeywordArg | E0528 | The same call-site label appears twice in one call | Name resolution | §2.13 |
-| UnlabeledKeywordArg | E0529 | A keyword parameter received its argument positionally — the value is present and unlabelled | Name resolution | §2.13 |
+| UnlabeledKeywordArg | E0529 | A keyword parameter received its argument positionally — the value is present and unlabelled. Help only: no machine-applicable fix, since only the author knows which value is for which parameter | Name resolution | §2.13 |
 | RawOutsideTemplate | E0530 | A `Raw[T]` reached a position that does not consume it — only a hole of a template literal `t"..."` does; a hole of a plain `"..."` literal is an error | Type checking | §3b.5 |
-| PositionalParamDefault | E0531 | A default value written on a positional parameter — only parameters declared after `--` may carry one | Type checking | §2.13 |
+| PositionalParamDefault | E0531 | A default value written on a positional parameter — only parameters declared after the `*` marker may carry one | Type checking | §2.13 |
 | NonConstParamDefault | E0532 | A parameter default that is not a const expression | Type checking | §2.13, §2.21 |
 | NonConstExpr | E0533 | The right-hand side of a `const` is not a const expression | Type checking | §2.21 |
 | TemplateHoleType | E0534 | An interpolation hole in a template literal `t"..."` has a type outside the Template value set, or is a `Raw[Bytes]`, which cannot fold into the parts (help: `{b}`) | Type checking | §3b.5 |

@@ -48,7 +48,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Effect annotation | `! Effect` | Bang after return type. Single character. Universal "danger/impurity" signal. |
 | Comments | `//` line, `///` doc | No block comments. `///` produces structured data the compiler can query. |
 | Expression-oriented | Last expr is return value | No `return` needed for the final expression. `return` exists only for early exit. |
-| Keyword args | `fn f(a: T, -- b: U)` | Declaration-site `--` separator. Positional before, keyword after. Author decides — caller has no choice. Principle 2 preserved. |
+| Keyword args | `fn f(a: T, *, b: U)` | Declaration-site `*` marker. Positional before, keyword after. Author decides — caller has no choice. Principle 2 preserved. |
 | Option sugar | `T?` for `Option[T]` | `Str?` means `Option[Str]`. Short in type position, universally understood. |
 | Option defaulting | `??` | `val ?? default` desugars to match on `Some`/`None`. Borrowed from Swift's nil-coalescing. |
 | Type names | `Str`, `Int`, `Bool`, `Float` | Short PascalCase. One casing rule for builtins and user types. Token-efficient — `Str` saves 3 chars over `String`, thousands of times per codebase. |
@@ -1163,7 +1163,7 @@ pub fn Duration.ms(n: Int) -> Duration {
     Duration { nanos: n * 1000000 }
 }
 
-fn read(-- flags: MsgFlags = MsgFlags.NONE) { /* ... */ }
+fn read(*, flags: MsgFlags = MsgFlags.NONE) { /* ... */ }
 
 let d = Duration.ms(100)
 ```
@@ -1184,7 +1184,7 @@ let d = Duration.ms(100)
 
 ### 2.13 Declaration-Site Keyword Arguments
 
-Functions use a `--` separator to divide positional parameters from keyword parameters. Positional params come before `--`, keyword params come after. The function author decides which params are keyword — the caller has no choice. Principle 2 preserved.
+A function divides its positional parameters from its keyword parameters with the marker `*`. Positional params come before `*`, keyword params come after. The function author decides which params are keyword — the caller has no choice. Principle 2 preserved.
 
 #### Syntax
 
@@ -1193,14 +1193,14 @@ Functions use a `--` separator to divide positional parameters from keyword para
 fn add(a: Int, b: Int) -> Int { a + b }
 add(1, 2)
 
-// Mixed: positional before --, keyword after --
-fn transfer(amount: Int, -- from: Account, to: Account) -> Result[Transaction, BankError] {
+// Mixed: positional before *, keyword after *
+fn transfer(amount: Int, *, from: Account, to: Account) -> Result[Transaction, BankError] {
     // ...
 }
 transfer(300, from: alice, to: bob)
 
 // All keyword (config-heavy)
-fn start_server(-- host: Str = "0.0.0.0", port: Port = 8080, debug: Bool = false) ! Net {
+fn start_server(*, host: Str = "0.0.0.0", port: Port = 8080, debug: Bool = false) ! Net {
     // ...
 }
 start_server(port: 3000)
@@ -1209,18 +1209,32 @@ start_server(port: 3000)
 transfer(300, to: bob, from: alice)  // valid, binds the same way; `bob` is evaluated before `alice`
 ```
 
+**Grammar of the marker.** The marker is one item of the parameter list: a bare `*`, with a comma after it as for any other item. A newline after the marker is allowed, so a long signature can put the marker on its own line. A parameter list has at most one marker. At least one keyword parameter must follow the marker: `fn f(a: Int, *)` is a parse error. `--` is not a marker (§2.19 *`--` is a reserved token*).
+
+```blink
+fn connect(
+    url: Str,
+    *,
+    timeout_ms: Int = 5000,
+    retries: Int = 3
+) ! Net {
+    // ...
+}
+```
+
 #### Rules
 
-- Params before `--` are **positional**: order matters, no labels at call site
-- Params after `--` are **keyword-required**: labels required, order-independent at call site. Arguments evaluate in written order, not declaration order, and bind to their parameters after all of them are evaluated (§2.22)
-- Default values only allowed on keyword params (after `--`)
+- Params before `*` are **positional**: order matters, no labels at call site
+- Params after `*` are **keyword-required**: labels required, order-independent at call site. Arguments evaluate in written order, not declaration order, and bind to their parameters after all of them are evaluated (§2.22)
+- Default values only allowed on keyword params (after `*`)
 - Default values must be const expressions (see [2.21](#221-const-declarations))
-- Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `--`. Closures, trait impls, and higher-order functions are unaffected. See [3.3](#33-type-inference).
+- Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `*`. Closures, trait impls, and higher-order functions are unaffected. See [3.3](#33-type-inference).
+- A default does not change the function type either: the type has full arity. A direct call fills each omitted keyword parameter with its const default after all written arguments evaluate, and a fn value takes every argument. Whether a parameter typed by a bare type parameter may take a default is not yet specified
 - The formatter never reorders arguments, struct-literal fields or list elements. Their written order is their evaluation order (§2.22), so a reorder would change what the program does
 
-**Both rules are enforced by `blink check`.** A label written on a positional parameter is rejected, and a keyword parameter supplied without its label is rejected. Neither rule is a style preference, and neither is left to the formatter. The separator exists to make the swap in `transfer(300, bob, alice)` impossible; a rule the checker does not enforce makes nothing impossible, and a normative sentence the compiler does not hold up teaches a calling discipline that does not exist.
+**Both rules are enforced by `blink check`.** A label written on a positional parameter is rejected, and a keyword parameter supplied without its label is rejected. Neither rule is a style preference, and neither is left to the formatter. The marker exists to make the swap in `transfer(300, bob, alice)` impossible; a rule the checker does not enforce makes nothing impossible, and a normative sentence the compiler does not hold up teaches a calling discipline that does not exist.
 
-**Where a label resolves.** A call-site label resolves in the callee's **keyword-parameter namespace** — the parameters declared after `--`, and nothing else. This rule governs calls to functions and to methods. A label in a variant-payload application or a struct literal names a **field**, not a parameter, and is outside this rule; the rule governing those labels is stated separately.
+**Where a label resolves.** A call-site label resolves in the callee's **keyword-parameter namespace** — the parameters declared after `*`, and nothing else. This rule governs calls to functions and to methods. A label in a variant-payload application or a struct literal names a **field**, not a parameter, and is outside this rule; the rule governing those labels is stated separately.
 
 **Extent of enforcement.** The rule is stated for every call against a declared `fn` signature, **method calls included**. A rule that held for `f(x: 1)` and not for `b.f(x: 1)` would select two behaviours by the receiver's spelling.
 
@@ -1237,13 +1251,13 @@ Five codes divide the call-site label rules. Each names a distinct mistake, and 
 | `DuplicateKeywordArg` (E0528) | The same label appears twice in one call | Delete the repeated argument |
 
 ```blink
-fn transfer(amount: Int, -- from: Account, to: Account) -> Int { amount }
+fn transfer(amount: Int, *, from: Account, to: Account) -> Int { amount }
 
 // intentional-error examples -- each line is rejected, under the code named
 transfer(300, alice, bob)                       // error[UnlabeledKeywordArg]: `from` and `to` are
                                                 //   keyword parameters
-                                                // help: label the arguments:
-                                                //   `transfer(300, from: alice, to: bob)`
+                                                // help: label each argument with the parameter
+                                                //   it is for: `from:`, `to:`
 
 transfer(300, frm: alice, to: bob)              // error[InvalidKeywordArg]: `frm` names no keyword
                                                 //   parameter of `transfer`
@@ -1257,13 +1271,21 @@ transfer(amount: 300, from: alice, to: bob)     // error[InvalidKeywordArg]: `am
                                                 //   help: pass it without a label
 ```
 
-`UnlabeledKeywordArg` and `MissingKeywordArg` fire on opposite conditions and must not be confused: the first means *the value is present and unlabelled*, the second means *the value is absent*. `MissingKeywordArg`'s repair inserts an argument; `UnlabeledKeywordArg`'s repair annotates one that is already written, which makes it the only code of the five whose fix is machine-applicable — the parameter names and their positions are both known, and the edit needs nothing from the author's intent.
+`UnlabeledKeywordArg` and `MissingKeywordArg` fire on opposite conditions and must not be confused: the first means *the value is present and unlabelled*, the second means *the value is absent*. `MissingKeywordArg`'s repair inserts an argument; `UnlabeledKeywordArg`'s repair annotates one that is already written.
 
-**Panel vote: `--` separator won 3-1-1** (3 for `--`, 1 for `;`, 1 for `*`). Labels as call-site sugar (not part of type signature): **5-0 unanimous**. See [DECISIONS.md](../DECISIONS.md).
+**`UnlabeledKeywordArg` has no machine-applicable fix.** Its help names the keyword parameters and does not assign a label to each written argument. A fix that labelled the arguments in declaration order would write `from: bob, to: alice` for the call `transfer(300, bob, alice)`: it would turn the swap this section exists to stop into code that compiles. Only the author knows which value is for which parameter.
 
-#### Why `--`
+**Predicted mistakes give one error.** Each mistake that a writer who knows another language is likely to make in a keyword signature or call — such as `name = value` in place of `name: value`, a `*args` or `**kw` parameter, or a second `*` — gives one error, with no follow-on errors from that construct. The error carries a machine-applicable fix only where the author already wrote the label, as in `name = value`.
 
-The separator marks a safety boundary between positional and named parameters. It should be visually loud and unmissable. `--` is the most distinctive option — hard to confuse with any other Blink syntax. `;` was rejected because Blink already rejected semicolons as statement terminators; reusing `;` as a param separator would confuse AI models into generating statement-terminator patterns. `*` (Python precedent) was considered too subtle.
+**Panel votes.** Original panel (5 seats): `--` separator won 3-1-1 (3 for `--`, 1 for `;`, 1 for `*`); labels as call-site sugar, **5-0**. Re-audit (6 seats): `*` replaces `--`, **6-0**; `--` in a parameter list is an error at once with a fix to `*,`, **6-0** after 4-2 in round 1. See [DECISIONS.md](../DECISIONS.md) and [the re-audit rationale](../decisions/keyword-marker-reaudit.md).
+
+#### Why `*`
+
+The re-audit rule is: match the forms that models already know, unless the other form prevents a bug class. The bug class here is a swap of same-typed arguments. The declaration-site rule and its two enforced checks prevent it; the spelling of the marker does not. `--` prevented nothing that `*` does not, and models do not write `--` without being told. `*` is the Python form, so models already write it.
+
+The marker does not read as multiplication. It stands where a parameter name would, and `*` has no prefix meaning in Blink: there is no unary deref and there are no variadic parameters. A `*` inside a default, as in `width: Int = 2 * 3`, is multiplication as usual; the marker never follows `=`. `;` stays rejected, because Blink rejected semicolons as statement terminators, and a `;` in a parameter list would teach models statement-terminator patterns.
+
+The original panel chose `--` (see [the original rationale](../decisions/keyword-arguments-defaults.md)). `--` is now a reserved token with no meaning, and in a parameter list its error carries a machine-applicable edit to `*,` (§2.19).
 
 #### Why Declaration-Site Control
 
@@ -1283,7 +1305,9 @@ transfer(300, from: alice, to: bob)   // correct
 transfer(300, from: bob, to: alice)   // still explicit, reviewer sees intent
 ```
 
-LLMs swap same-typed positional args at measurable rates (3-8% per call site with 3+ same-typed params). Keyword labels eliminate this class of bug structurally.
+Models and people both swap same-typed positional arguments. Keyword labels stop this class of bug at the call site.
+
+**Limit of the guard.** The guard covers direct calls and method calls on a concrete receiver. A fn value carries no labels: after `let g = transfer`, the call `g(300, bob, alice)` type-checks. A call through a trait bound is not covered until the rule that relates a trait method's keyword parameters to its impls is specified.
 
 ### 2.14 Struct Field Defaults
 
@@ -1644,6 +1668,14 @@ From lowest to highest binding:
 | 10 (highest) | `.` `()` | left | member access, call |
 
 **Non-chaining comparisons.** `a < b < c` is a compile error. The compiler suggests `a < b && b < c`. Chained comparisons introduce context-sensitive operator semantics that contradict Blink's unambiguous-parsing priority. (Vote: 4-1)
+
+**`--` is a reserved token.** The lexer reads `--` as one token, and no rule of the grammar accepts it. Blink has no decrement operator. The token stays reserved so that a mistake carried over from another language gets an error that names it, not a parse of some other meaning:
+
+- In a parameter list, `--` is the keyword marker of an earlier Blink version. It is a parse error, and the error carries a machine-applicable edit that replaces `--` with `*,` (§2.13). The parser recovers at the marker, so the rest of the signature is checked and `blink fix` can apply the edit. The edit stays as long as `--` stays reserved.
+- As a prefix, `--x` is an error. Its help says that Blink has no decrement, and to write `x -= 1`.
+- As an infix, `a--b` is an error. Its help says to write `a - -b`.
+
+The last two have help only, with no machine-applicable fix: the compiler cannot know which of the two meanings the author wanted. (Vote: 6-0)
 
 #### Integer Operator Groups
 
@@ -2700,7 +2732,7 @@ Const expressions are required in four contexts:
 
 1. **`const` declarations** — the RHS must be a const expression
 2. **Struct field defaults** — `type Foo { x: Int = <const> }`
-3. **Keyword argument defaults** — `fn f(-- x: Int = <const>)`
+3. **Keyword argument defaults** — `fn f(*, x: Int = <const>)`
 4. **Range pattern bounds** — `match n { 1..=MAX => ... }`
 
 ```blink
@@ -2712,7 +2744,7 @@ type RetryConfig {
 }
 
 // Keyword arg defaults — const expressions
-fn connect(url: Str, -- timeout: Int = TIMEOUT_MS, retries: Int = MAX_RETRIES) ! Net.Connect {
+fn connect(url: Str, *, timeout: Int = TIMEOUT_MS, retries: Int = MAX_RETRIES) ! Net.Connect {
     // ...
 }
 
@@ -2848,7 +2880,7 @@ These follow from the rule. They are not extra rules.
 - **Assignment `place = rhs`:** see *Assignment places* below.
 
 ```blink
-fn f(-- a: Int, b: Int) -> Int { a + b }
+fn f(*, a: Int, b: Int) -> Int { a + b }
 
 fn tick(n: Int) -> Int {
     io.println("{n}")
