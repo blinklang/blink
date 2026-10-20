@@ -1,0 +1,124 @@
+// NoSuchVariant (E0547, sections/03_types.md §3.5 Pattern Forms) is a typecheck error, so
+// `blink check` and both builds report the same rows, each once, and no internal compiler
+// error, in the root module and in a sub-module. The JSON row carries the full variant list
+// and the machine fix only where the payload forms agree. `blink explain E0547` explains it.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package whose src/ holds `main.bl` and `shapes/kinds.bl`.
+fn project() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_no_such_variant.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/shapes")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main_src())
+    write_file("{dir}/src/shapes/kinds.bl", kinds_src())
+    dir
+}
+
+fn main_src() -> Str {
+    #"import shapes.kinds.{Token, Expr, describe}
+
+fn main() {
+    let t = Token.Num(1)
+    let n = match t {
+        Lit(v) => v
+        Token.Plus => 0
+    }
+    let x: Option[Int] = Some(1)
+    let m = match x {
+        Somee(v) => v
+        None => 0
+    }
+    io.println("{n} {m} {describe(Expr.Lit(2))}")
+}
+"#
+}
+
+fn kinds_src() -> Str {
+    #"pub type Token { Num(Int), Plus }
+pub type Expr { Lit(Int), Neg }
+
+pub fn describe(e: Expr) -> Int {
+    match e {
+        Litt(v) => v
+        Expr.Neg => 0
+    }
+}
+"#
+}
+
+fn count(hay: Str, needle: Str) -> Int {
+    hay.split(needle).len() - 1
+}
+
+// `blink <args> src/main.bl` run in the package `dir`, stderr folded into stdout.
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn assert_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert_eq(bad.len(), 0)
+}
+
+test "check and both builds give the same three errors, once each, and no ICE" {
+    let dir = project()
+    let mut bad: List[Str] = []
+    let wants = [
+        "error[NoSuchVariant]: `Token` has no variant `Lit`\n  --> src/main.bl:6:9\n",
+        "  note: `Lit` is a variant of `Expr`, not of `Token`; a pattern for `t` can name only variants of `Token`\n  help: `Token` declares: Num, Plus\n",
+        "error[NoSuchVariant]: `Option` has no variant `Somee`\n  --> src/main.bl:11:9\n",
+        "  help: did you mean `Some`?\n  fix: rename to `Some` at 11:9\n",
+        "error[NoSuchVariant]: `Expr` has no variant `Litt`\n  --> src/shapes/kinds.bl:6:9\n",
+        "  help: did you mean `Lit`?\n  fix: rename to `Lit` at 6:9\n"
+    ]
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = blink_in(dir, args)
+        let mut missing: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { missing.push(w) }
+        }
+        let n = count(r.out, "error[NoSuchVariant]")
+        let other = count(r.out, "error[") - n
+        if r.exit_code == 0 || missing.len() > 0 || n != 3 || other != 0 || r.out.contains("internal compiler error") {
+            bad.push("blink {args}: exit {r.exit_code}, {n} E0547, {other} others, missing {missing.join(" | ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_none(bad)
+}
+
+test "the JSON rows carry the full variant list, the note, and the fix only for a same-form rename" {
+    let dir = project()
+    let r = blink_in(dir, "check --json")
+    let _ = sh("rm -rf {dir}")
+    let wants = [
+        "\"code\":\"E0547\",\"message\":\"`Token` has no variant `Lit`\",\"span\":\{\"file\":\"src/main.bl\",\"line\":6,\"col\":9,\"end_line\":6,\"end_col\":12},\"help\":\"`Token` declares: Num, Plus\",\"notes\":[\"`Lit` is a variant of `Expr`, not of `Token`; a pattern for `t` can name only variants of `Token`\"]}",
+        "\"message\":\"`Expr` has no variant `Litt`\",\"span\":\{\"file\":\"src/shapes/kinds.bl\",\"line\":6,\"col\":9,\"end_line\":6,\"end_col\":13},\"help\":\"did you mean `Lit`?\",\"fix\":\{\"action\":\"rename to\",\"text\":\"Lit\",\"span\":\{\"file\":\"src/shapes/kinds.bl\",\"line\":6,\"col\":9,\"end_line\":6,\"end_col\":13}}}"
+    ]
+    for w in wants {
+        if !r.out.contains(w) { io.eprintln("missing: {w}\n{r.out}") }
+        assert(r.out.contains(w))
+    }
+    assert_eq(count(r.out, "\"fix\""), 2)
+}
+
+test "explain E0547 names the checks, the order and the fix" {
+    let r = sh("$(pwd)/build/blink explain E0547 2>&1")
+    assert_eq(r.exit_code, 0)
+    let wants = [
+        "E0547 -- NoSuchVariant",
+        "Circel(r) => r     // E0547 -- did you mean `Circle`?",
+        "resolve a qualifier (E0507), look the variant up",
+        "An arm with a bad pattern covers nothing.",
+        "Adding a variant to the enum is"
+    ]
+    for w in wants {
+        if !r.out.contains(w) { io.eprintln("missing: {w}\n{r.out}") }
+        assert(r.out.contains(w))
+    }
+}

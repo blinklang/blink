@@ -1,0 +1,416 @@
+// NoSuchVariant (E0547, sections/03_types.md §3.5 Pattern Forms and §3.4 Variant
+// Construction). A variant pattern, or a qualified variant construction, must name a variant
+// its enum declares. The span is the variant name; the help is the nearest-name suggestion
+// over the enum's variants, or else the list of them; the rename is a machine fix only when
+// the payload forms agree. A qualified pattern of another enum, or a struct pattern of another
+// struct, is TypeError (E0300). Binders under a bad pattern have the poison type, so nothing
+// cascades from them, and an unguarded bad arm turns off NonExhaustiveMatch (E0004).
+//
+// Each row checks the exact set of errors a program gets, so an extra or a missing error
+// fails it as surely as a wrong message.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+// Every error and internal error the program gets: span, code, message, help, notes, fix.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/tc_no_such_variant_src.bl"
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "" } else { "{d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_col}" }
+            out.push("{d.line}:{d.col}-{d.end_col}: {d.code} {d.message} | help: {d.help} | notes: {d.notes.join("; ")} | fix: {fix}")
+        }
+    }
+    out
+}
+
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.eprintln("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// "line:col-end_col" of the first `word` on the line marked `marker`.
+fn span(src: Str, marker: Str, word: Str) -> Str {
+    let line = line_of(src, marker)
+    let col = src.split("\n").get(line - 1).unwrap().index_of(word).unwrap() + 1
+    "{line}:{col}-{col + word.byte_len()}"
+}
+
+fn assert_errors(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = errors_of(src)
+    let mut ok = got.len() == want.len()
+    for w in want {
+        if !got.contains(w) { ok = false }
+    }
+    if !ok {
+        io.eprintln("FAIL: want:")
+        for w in want { io.eprintln("    {w}") }
+        io.eprintln("  got:")
+        for g in got { io.eprintln("    {g}") }
+    }
+    assert(ok)
+}
+
+fn nsv(at: Str, message: Str, help: Str, notes: Str, fix: Str) -> Str {
+    "{at}: E0547 {message} | help: {help} | notes: {notes} | fix: {fix}"
+}
+
+fn rename(src: Str, marker: Str, word: Str, to: Str) -> Str {
+    let line = line_of(src, marker)
+    let col = src.split("\n").get(line - 1).unwrap().index_of(word).unwrap() + 1
+    "rename to `{to}` at {line}:{col}-{col + word.byte_len()}"
+}
+
+test "a misspelled Some in a match on Option[Int] is one E0547 with a machine rename" {
+    // The input the fuzz corpus (seed 42) found: two internal errors and no user error.
+    let src = #"fn get(x: Option[Int]) -> Int {
+    match x {
+        Somee(v) => v  // BAD
+        None => 0
+    }
+}
+
+fn main() { let _ = get(None) }
+"#
+    assert_errors(src, [nsv(span(src, "BAD", "Somee"), "`Option` has no variant `Somee`", "did you mean `Some`?", "", rename(src, "BAD", "Somee", "Some"))])
+}
+
+test "the spec example: a bare and a qualified misspelling each get E0547" {
+    let src = #"type Shape { Circle(Float), Square(Float), Dot }
+
+fn area(s: Shape) -> Float {
+    match s {
+        Circel(r) => 3.14159 * r * r  // CIRCEL
+        Shape.Square(w) => w * w
+        Shape.Dott => 0.0  // DOTT
+    }
+}
+
+fn main() { let _ = area(Shape.Dot) }
+"#
+    assert_errors(src, [
+        nsv(span(src, "CIRCEL", "Circel"), "`Shape` has no variant `Circel`", "did you mean `Circle`?", "", rename(src, "CIRCEL", "Circel", "Circle")),
+        nsv(span(src, "DOTT", "Dott"), "`Shape` has no variant `Dott`", "did you mean `Dot`?", "", rename(src, "DOTT", "Dott", "Dot"))
+    ])
+}
+
+test "a variant of exactly one other enum gets a note, the variant list, and no fix" {
+    // `takes_str(n)` would be an error if the note typed `n` from `Expr.Lit(Int)`: it must not.
+    let src = #"type Token { Num(Int), Plus }
+type Expr { Lit(Int), Add }
+
+fn takes_str(s: Str) -> Int { s.len() }
+
+fn value(t: Token) -> Int {
+    match t {
+        Lit(n) => takes_str(n)  // LIT
+        Plus => 0
+    }
+}
+
+fn main() { let _ = value(Token.Plus) let _ = Expr.Add }
+"#
+    assert_errors(src, [nsv(span(src, "LIT", "Lit"), "`Token` has no variant `Lit`", "`Token` declares: Num, Plus", "`Lit` is a variant of `Expr`, not of `Token`; a pattern for `t` can name only variants of `Token`", "")])
+}
+
+test "a bad pattern nested in a good one is checked against the payload type" {
+    let src = #"fn get(x: Option[Option[Int]]) -> Int {
+    match x {
+        Some(Somee(v)) => v  // NESTED
+        Some(None) => 1
+        None => 0
+    }
+}
+
+fn main() { let _ = get(None) }
+"#
+    assert_errors(src, [nsv(span(src, "NESTED", "Somee"), "`Option` has no variant `Somee`", "did you mean `Some`?", "", rename(src, "NESTED", "Somee", "Some"))])
+}
+
+test "a qualified pattern naming no variant of its own enum is E0547 at the variant name" {
+    let src = #"type K { A, B }
+
+fn f(k: K) -> Int {
+    match k {
+        K.A => 1
+        K.Zed => 2  // ZED
+        _ => 3
+    }
+}
+
+fn main() { let _ = f(K.A) }
+"#
+    assert_errors(src, [nsv(span(src, "ZED", "Zed"), "`K` has no variant `Zed`", "`K` declares: A, B", "", "")])
+}
+
+test "a rename across payload forms is suggested but is not a machine fix" {
+    let src = #"type Shape { Circle(Float), Dot }
+
+fn area(s: Shape) -> Float {
+    match s {
+        Dott(x) => x  // DOTT
+        Shape.Circle(r) => r
+    }
+}
+
+fn main() { let _ = area(Shape.Dot) }
+"#
+    assert_errors(src, [nsv(span(src, "DOTT", "Dott"), "`Shape` has no variant `Dott`", "did you mean `Dot`?", "", "")])
+}
+
+test "a variant another arm already matches stays a candidate" {
+    let src = #"type K { Alpha(Int), Beta }
+
+fn f(k: K) -> Int {
+    match k {
+        K.Alpha(n) => n
+        Alpa(n) => n  // ALPA
+        K.Beta => 0
+    }
+}
+
+fn main() { let _ = f(K.Beta) }
+"#
+    assert_errors(src, [nsv(span(src, "ALPA", "Alpa"), "`K` has no variant `Alpa`", "did you mean `Alpha`?", "", rename(src, "ALPA", "Alpa", "Alpha"))])
+}
+
+test "a payload pattern on a struct, a tuple or a type parameter says the type has no variants" {
+    let src = #"type Point { x: Int, y: Int }
+
+fn on_struct(p: Point) -> Int {
+    match p {
+        Zed(v) => v  // STRUCT
+    }
+}
+
+fn on_tuple(t: (Int, Int)) -> Int {
+    match t {
+        Zed(v) => v  // TUPLE
+    }
+}
+
+fn on_param[T](t: T) -> Int {
+    match t {
+        Zed(v) => 0  // PARAM
+        _ => 1
+    }
+}
+
+fn main() {
+    let _ = on_struct(Point { x: 1, y: 2 })
+    let _ = on_tuple((1, 2))
+    let _ = on_param(1)
+}
+"#
+    assert_errors(src, [
+        nsv(span(src, "STRUCT", "Zed"), "`Point` is a struct; it has no variants", "", "", ""),
+        nsv(span(src, "TUPLE", "Zed"), "`(Int, Int)` is a tuple; it has no variants", "", "", ""),
+        nsv(span(src, "PARAM", "Zed"), "`T` is a type parameter; it has no variants", "", "", "")
+    ])
+}
+
+test "an unknown qualifier is UnknownType and stops there" {
+    let src = #"type K { A, B }
+
+fn f(k: K) -> Int {
+    match k {
+        Nope.Foo => 1  // NOPE
+        _ => 2
+    }
+}
+
+fn main() { let _ = f(K.A) }
+"#
+    let got = errors_of(src)
+    let line = line_of(src, "NOPE")
+    let mut ok = got.len() == 1
+    for g in got {
+        if !g.starts_with("{line}:") || !g.contains(" E0507 ") { ok = false }
+    }
+    if !ok { for g in got { io.eprintln("got: {g}") } }
+    assert(ok)
+}
+
+test "another enum's variant with no such variant of its own is one E0547 and no E0300" {
+    let src = #"type T { A(Int), Q(Int) }
+type Other { Q(Int) }
+
+fn f(x: T) -> Int {
+    match x {
+        Other.Zed(v) => v  // OZED
+        _ => 0
+    }
+}
+
+fn main() { let _ = f(T.A(1)) let _ = Other.Q(1) }
+"#
+    assert_errors(src, [nsv(span(src, "OZED", "Zed"), "`Other` has no variant `Zed`", "`Other` declares: Q", "", "")])
+}
+
+test "a qualified variant of another enum is E0300 over the whole path with the swap fix" {
+    let src = #"type T { A(Int), Q(Int) }
+type Other { Q(Int) }
+
+fn f(x: T) -> Int {
+    match x {
+        Other.Q(v) => v  // OQ
+        T.A(v) => v
+    }
+}
+
+fn main() { let _ = f(T.A(1)) let _ = Other.Q(1) }
+"#
+    let at = span(src, "OQ", "Other.Q")
+    let fix = "rename to `T.Q` at {at.split(":").get(0).unwrap()}:{at.split(":").get(1).unwrap()}"
+    assert_errors(src, ["{at}: E0300 pattern of type `Other` used on a value of type `T` | help: write `T.Q`; `T` declares: A, Q | notes:  | fix: {fix}"])
+}
+
+test "another enum's variant that the expected type lacks gets the list and no fix" {
+    let src = #"type T { A(Int), B }
+type Other { Q(Int) }
+
+fn f(x: T) -> Int {
+    match x {
+        Other.Q(v) => v  // OQ
+        T.A(v) => v
+        T.B => 0
+    }
+}
+
+fn main() { let _ = f(T.B) let _ = Other.Q(1) }
+"#
+    assert_errors(src, ["{span(src, "OQ", "Other.Q")}: E0300 pattern of type `Other` used on a value of type `T` | help: `T` declares: A, B | notes:  | fix: "])
+}
+
+test "a struct pattern of another struct is E0300 over the type name" {
+    let src = #"type P { x: Int, y: Int }
+type Q { y: Int }
+
+fn f(p: P) -> Int {
+    match p {
+        Q { y } => y  // QP
+    }
+}
+
+fn main() { let _ = f(P { x: 1, y: 2 }) let _ = Q { y: 1 } }
+"#
+    assert_errors(src, ["{span(src, "QP", "Q")}: E0300 pattern of type `Q` used on a value of type `P` | help:  | notes:  | fix: "])
+}
+
+test "binders under a bad pattern have the poison type, so their uses report nothing" {
+    let src = #"fn takes(s: Str) -> Int { s.len() }
+
+fn get(x: Option[Int]) -> Int {
+    match x {
+        Somee(v) => {  // BAD
+            let w = v + 1
+            let s: Str = v
+            takes(v) + w + s.len()
+        }
+        None => 0
+    }
+}
+
+fn main() { let _ = get(None) }
+"#
+    assert_errors(src, [nsv(span(src, "BAD", "Somee"), "`Option` has no variant `Somee`", "did you mean `Some`?", "", rename(src, "BAD", "Somee", "Some"))])
+}
+
+test "an unguarded bad arm turns off E0004, and the arm after it is checked as usual" {
+    let src = #"type T { A(Int), B }
+
+fn f(x: T) -> Int {
+    match x {
+        Q(v) => v  // BAD
+        B => 0
+    }
+}
+
+fn main() { let _ = f(T.B) }
+"#
+    assert_errors(src, [nsv(span(src, "BAD", "Q"), "`T` has no variant `Q`", "`T` declares: A, B", "", "")])
+}
+
+test "a guarded bad arm leaves E0004 on" {
+    let src = #"type T { A(Int), B }
+
+fn f(x: T) -> Int {
+    match x {  // MATCH
+        Q(v) if v > 0 => v  // BAD
+        B => 0
+    }
+}
+
+fn main() { let _ = f(T.B) }
+"#
+    let got = errors_of(src)
+    let bad = nsv(span(src, "BAD", "Q"), "`T` has no variant `Q`", "`T` declares: A, B", "", "")
+    let mut e0004 = 0
+    for g in got {
+        if g.contains(" E0004 non-exhaustive match: missing pattern `A`") { e0004 = e0004 + 1 }
+    }
+    if got.len() != 2 || !got.contains(bad) || e0004 != 1 {
+        for g in got { io.eprintln("got: {g}") }
+    }
+    assert_eq(got.len(), 2)
+    assert(got.contains(bad))
+    assert_eq(e0004, 1)
+}
+
+test "a qualified construction naming no variant is E0547, and its binding is poison" {
+    let src = #"type Level { Low, High }
+type K { A(Int), B { n: Int } }
+
+fn main() {
+    let x = Level.Hgh  // HGH
+    let y = x
+    let z: Int = x
+    let a = K.Zed(1)  // ZPAREN
+    let b = K.Zedd { n: 1 }  // ZBRACE
+    let _ = (y, z, a, b)
+}
+"#
+    assert_errors(src, [
+        nsv(span(src, "HGH", "Hgh"), "`Level` has no variant `Hgh`", "did you mean `High`?", "", rename(src, "HGH", "Hgh", "High")),
+        nsv(span(src, "ZPAREN", "Zed"), "`K` has no variant `Zed`", "`K` declares: A, B", "", ""),
+        nsv(span(src, "ZBRACE", "Zedd"), "`K` has no variant `Zedd`", "`K` declares: A, B", "", "")
+    ])
+}
+
+test "a variant pattern on a builtin scalar stays E0308" {
+    let src = #"fn f(x: Int) -> Int {
+    match x {
+        Some(v) => v  // BARE
+        _ => 0
+    }
+}
+
+fn main() { let _ = f(1) }
+"#
+    let got = errors_of(src)
+    let line = line_of(src, "BARE")
+    let mut ok = got.len() == 1
+    for g in got {
+        if !g.starts_with("{line}:") || !g.contains(" E0308 ") { ok = false }
+    }
+    if !ok { for g in got { io.eprintln("got: {g}") } }
+    assert(ok)
+}
