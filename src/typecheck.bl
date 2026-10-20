@@ -18330,6 +18330,19 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, var_idx: Int, args_sl: In
 // reaches it.
 // @allow: publishing the field values' types IS this function's effect.
 @allow(UnrestoredMutation)
+// The field values of a construction that names no variant: typed with no hint, so nothing
+// under the error goes untyped.
+fn tc_infer_orphan_field_values(flds_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if flds_sl == -1 { return }
+    let mut fi = 0
+    while fi < sublist_length(flds_sl) {
+        let v = node_value(sublist_get(flds_sl, fi))
+        if v != -1 && node_kind(v) == NodeKind.HandlerExpr { tc_check_body(v) }
+        if v != -1 { let _ = tc_infer_unhinted(v) }
+        fi = fi + 1
+    }
+}
+
 fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if flds_sl == -1 { return }
     let var_idx = get_variant_by_name(tc_enum_base_tid(enum_tid), vname)
@@ -21758,10 +21771,7 @@ fn infer_arm_body(arm: Int, scrut_tid: Int, subject: Str) -> Int ! TypeCheck.Res
     // placeholder, so the two need not be the same value.
     if b == -1 { return -1 }
     nr_push_scope()
-    let saved_pat = tc_pattern_binding_type
-    tc_pattern_binding_type = scrut_tid
-    let _ = tc_check_pattern_types(node_pattern(arm), subject, false)
-    tc_pattern_binding_type = saved_pat
+    let _ = tc_check_pattern_types_against(node_pattern(arm), scrut_tid, subject)
     tc_check_arm_guard(arm)
     // Infer the BODY NODE whatever its shape. infer_type answers for the statement kinds a
     // braceless arm produces (ExprStmt passes through to its value, a control transfer is
@@ -23194,10 +23204,13 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(qtid, vname)), node)
                     return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
                 }
-                if qtid != -1 && type_kind(qtid) == TyKind.Enum && tc_value_names_no_variant(qtid, qual, vname) {
-                    tc_report_no_such_variant_value(node, qtid, qual, vname, 2)
-                    tc_infer_enum_structlit_field_values(qtid, vname, node_fields(node))
-                    return tc_error_recovery_tid()
+                match tc_value_missing_variant(qual, vname) {
+                    Some(owner) => {
+                        tc_report_no_such_variant_value(node, owner, qual, vname, 2)
+                        tc_infer_orphan_field_values(node_fields(node))
+                        return tc_error_recovery_tid()
+                    }
+                    None => {}
                 }
                 let etid = lookup_named_type(sname)
                 if etid != -1 {
@@ -24181,18 +24194,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         let cdecl = tc_type_decl_nodes.get(tc_written_type_nominal(cname)) ?? -1
                         return tc_enum_ctor_instance_tid(ctor_tid, cdecl, cvar_idx, cargs_sl, payload_tids)
                     }
-                    if tc_value_names_no_variant(ctor_tid, cname, method) {
-                        tc_report_no_such_variant_value(node, ctor_tid, cname, method, 1)
-                        let bad_args = node_args(node)
-                        if bad_args != -1 {
-                            let mut ai = 0
-                            while ai < sublist_length(bad_args) {
-                                let _ = tc_infer_unhinted(sublist_get(bad_args, ai))
-                                ai = ai + 1
-                            }
-                        }
+                }
+                match tc_value_missing_variant(cname, method) {
+                    Some(owner) => {
+                        tc_report_no_such_variant_value(node, owner, cname, method, 1)
+                        let _ = tc_infer_arg_tids(node_args(node))
+                        // Reported here, so the method-resolution flush adds no UnknownMethod.
+                        tc_unresolved_method_hard.insert(node, 1)
                         return tc_error_recovery_tid()
                     }
+                    None => {}
                 }
             }
         }
@@ -25779,15 +25790,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 && tc_qualified_carrier(obj_name, fname).is_some() {
                 return tc_carrier_nullary_tid(fname, "{obj_name}.{fname}", node)
             }
+            if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 {
+                match tc_value_missing_variant(obj_name, fname) {
+                    Some(owner) => {
+                        tc_report_no_such_variant_value(node, owner, obj_name, fname, 0)
+                        return tc_error_recovery_tid()
+                    }
+                    None => {}
+                }
+            }
             let tid = lookup_named_type(obj_name)
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 let edecl = tc_type_decl_nodes.get(tc_written_type_nominal(obj_name)) ?? -1
                 let vi = get_variant_by_name(tid, fname)
                 if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
-                if tc_value_names_no_variant(tid, obj_name, fname) {
-                    tc_report_no_such_variant_value(node, tid, obj_name, fname, 0)
-                    return tc_error_recovery_tid()
-                }
                 return tc_nullary_variant_tid(tid, edecl, vi)
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
@@ -28736,8 +28752,7 @@ fn tc_kind_has_no_variants(tid: Int) -> Int {
 // error[InconsistentPatternBindings] (E0005) for each OR-pattern in `pat`, at any depth, whose
 // alternatives do not bind the same names at the same types (§3.5 *OR-Patterns*). One error per
 // OR-pattern, with a note for each name an alternative misses and each name whose type differs.
-// Reported from the statement walk, not from tc_check_pattern_types: inference runs that walk
-// many times per node, so an emit there would repeat.
+// Reported from the statement walk, which visits each match arm once.
 fn tc_check_or_pattern_bindings(pat: Int) ! Diag.Report {
     if pat == -1 { return }
     let k = node_kind(pat)
@@ -29003,11 +29018,12 @@ fn tc_infer_let_value(val: Int, binder: Str, hint: Int) -> Int ! TypeCheck.Resol
     t
 }
 
-fn tc_check_pattern_types_against(pat: Int, binding_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_pattern_types_against(pat: Int, binding_t: Int, subject: Str) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_pat = tc_pattern_binding_type
     tc_pattern_binding_type = binding_t
-    let _ = tc_check_pattern_types(pat, "", false)
+    let bad = tc_check_pattern_types(pat, subject, false)
     tc_pattern_binding_type = saved_pat
+    bad
 }
 
 // The matched value's name, for the NoSuchVariant note; empty when it is not a plain name.
@@ -29374,7 +29390,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // The ELEMENT type is the binding hint: a destructured `for (k, v) in m` needs the
             // same tuple decomposition the match path gets. Without the hint the TuplePattern
             // arm takes its `tup_start == -1` path and types both leaves as untyped.
-            tc_check_pattern_types_against(tc_for_pat_node, elem_t)
+            let _ = tc_check_pattern_types_against(tc_for_pat_node, elem_t, "")
         }
         tc_check_body(node_body(node))
         tc_check_dropped_value(node_body(node))
@@ -29825,11 +29841,6 @@ let mut tc_construct_hint: Int = -1
 // than rejecting legal code. Set by tc_infer_value at let/return/assignment/fn-tail/argument.
 let mut tc_if_value_ctx: Int = 0
 
-// Genuinely saves/restores tc_pattern_binding_type around recursive descent;
-// the nr_define/nr_define_typed/recursive calls also write scope-management
-// globals (nr_scope_*, nr_name_top) — defining the pattern's bindings is the
-// intended permanent effect, not speculative state to roll back.
-@allow(UnrestoredMutation)
 // The type whose variants a pattern or a qualified construction can name: a declared enum
 // (its base tid), or a prelude carrier (`carrier` is then Option or Result and `base` is -1).
 type VariantOwner {
@@ -29856,17 +29867,14 @@ fn tc_enum_owner(base: Int) -> VariantOwner {
     VariantOwner { base: base, carrier: TyKind.Unknown }
 }
 
-// The owner's declaration node, or -1 for a prelude carrier. Error paths only: it scans
-// evar_pool.
+// The owner's declaration node, or -1 for a prelude carrier or a name two modules declare.
 fn tc_owner_decl(o: VariantOwner) -> Int {
     if o.base < 0 { return -1 }
-    for ev in evar_pool {
-        if ev.enum_id == o.base { return ev.enum_decl }
-    }
-    -1
+    let decl = tc_tid_decl_node(o.base)
+    if decl < 0 { -1 } else { decl }
 }
 
-// The owner's name as the diagnostics write it. Error paths only: it scans evar_pool.
+// The owner's name as the diagnostics write it.
 fn tc_owner_shown(o: VariantOwner) -> Str {
     if o.base < 0 { return tc_prelude_carrier_name(o.carrier) }
     let decl = tc_owner_decl(o)
@@ -29890,9 +29898,7 @@ fn tc_variant_owner_of(h: Int) -> Option[VariantOwner] {
 fn tc_qualifier_owner(qual: Str) -> Option[VariantOwner] {
     let qtid = lookup_named_type(qual)
     if qtid != -1 {
-        let r = resolve_alias_tid(qtid)
-        if type_kind(r) == TyKind.Enum { return Some(tc_enum_owner(tc_enum_base_tid(r))) }
-        return None
+        return tc_variant_owner_of(resolve_alias_tid(qtid))
     }
     if qual == "Option" { return Some(tc_carrier_owner(TyKind.Option)) }
     if qual == "Result" { return Some(tc_carrier_owner(TyKind.Result)) }
@@ -29913,9 +29919,7 @@ fn tc_owner_variant_names(o: VariantOwner) -> List[Str] {
     if o.carrier == TyKind.Option { return ["Some", "None"] }
     if o.carrier == TyKind.Result { return ["Ok", "Err"] }
     let mut names: List[Str] = []
-    for ev in evar_pool {
-        if ev.enum_id == o.base { names.push(ev.name) }
-    }
+    for slot in tc_enum_variant_slots(o.base) { names.push(tc_evar_name(slot)) }
     names
 }
 
@@ -29938,7 +29942,7 @@ fn tc_pattern_payload_form(pat: Int) -> Int {
 
 // The struct a name declares, as its base tid, or -1.
 fn tc_named_struct_base(name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let rt = resolve_type_name(name)
+    let rt = resolve_alias_tid(resolve_type_name(name))
     if rt == -1 || type_kind(rt) != TyKind.Struct { return -1 }
     tc_struct_base_tid(rt)
 }
@@ -29953,7 +29957,8 @@ fn tc_bare_variant_fault(name: Str, h: Int) -> PatternFault {
     match type_kind(h) {
         TyKind.Struct => PatternFault.NoVariants(type_to_str(h), "a struct")
         TyKind.Tuple => PatternFault.NoVariants(type_to_str(h), "a tuple")
-        TyKind.Typevar => PatternFault.NoVariants(type_to_str(h), "a type parameter")
+        // An unknown parameter type (E0507) recovers as an open type variable: it is not one.
+        TyKind.Typevar => if tc_typevar_is_rigid(h) != 0 { PatternFault.NoVariants(type_to_str(h), "a type parameter") } else { PatternFault.Clean }
         _ => PatternFault.Clean
     }
 }
@@ -29990,6 +29995,7 @@ fn tc_pattern_fault(pat: Int, hint: Int) -> PatternFault ! TypeCheck.Resolve, Di
     let h = if hint < 0 { -1 } else { resolve_alias_tid(tc_tid_resolved(hint)) }
     let open = h < 0 || tc_tid_is_no_info(h) != 0 || tc_is_unbound_metavar(h) != 0
     let k = node_kind(pat)
+    if k != NodeKind.EnumPattern && k != NodeKind.StructPattern { return PatternFault.Clean }
     if k == NodeKind.EnumPattern {
         let qual = node_name(pat)
         let variant = node_type_name(pat)
@@ -29997,16 +30003,16 @@ fn tc_pattern_fault(pat: Int, hint: Int) -> PatternFault ! TypeCheck.Resolve, Di
         if open { return PatternFault.Clean }
         return tc_bare_variant_fault(if variant == "" { qual } else { variant }, h)
     }
-    if k != NodeKind.StructPattern || open { return PatternFault.Clean }
+    if open { return PatternFault.Clean }
     let tname = node_type_name(pat)
-    let named = tc_named_struct_base(tname)
     match tc_variant_owner_of(h) {
         Some(o) => {
             if tc_owner_has_variant(o, tname) { return PatternFault.Clean }
-            return if named != -1 { PatternFault.WrongType(tname) } else { PatternFault.NoSuchVariant(o) }
+            return if tc_named_struct_base(tname) != -1 { PatternFault.WrongType(tname) } else { PatternFault.NoSuchVariant(o) }
         }
         None => {}
     }
+    let named = tc_named_struct_base(tname)
     if named == -1 { return tc_bare_variant_fault(tname, h) }
     let hk = type_kind(h)
     if hk == TyKind.Struct { return if tc_struct_base_tid(h) == named { PatternFault.Clean } else { PatternFault.WrongType(tname) } }
@@ -30015,13 +30021,14 @@ fn tc_pattern_fault(pat: Int, hint: Int) -> PatternFault ! TypeCheck.Resolve, Di
 }
 
 // The column `name` starts at in `qual.name` on the node's line, so a span can cover the
-// variant alone. The node's own column when the line does not hold the spelling.
+// variant alone. -1 when the line does not hold that spelling (`K\n    .Name`): the caller
+// then has no span it can rewrite.
 fn tc_qualified_name_col(node: Int, qual: Str, name: Str) -> Int {
     let text = diag_source_line(diag_file_for_node(node), node_line(node))
     let back = node_col(node) - 2 - qual.byte_len()
     match text.byte_index_of("{qual}.{name}", if back > 0 { back } else { 0 }) {
         Some(i) => i + qual.byte_len() + 2
-        None => node_col(node)
+        None => -1
     }
 }
 
@@ -30029,19 +30036,28 @@ fn tc_qualified_name_col(node: Int, qual: Str, name: Str) -> Int {
 // write the note: the pattern still means a variant of `owner`, so nothing is typed from it.
 fn tc_other_enum_note(name: Str, owner: VariantOwner, subject: Str, site: Int) -> List[Str] {
     let mut others: List[Str] = []
-    match tc_prelude_carrier_of(name) {
+    let mut decls: List[Int] = []
+    let mut carrier: Option[TyKind] = None
+    match tc_bare_variant_from_program(name, site, tc_prelude_carrier_of(name)) {
+        BareVariantPick.NotAVariant => {}
+        BareVariantPick.Carrier(k) => carrier = Some(k)
+        BareVariantPick.Declared(_, slot) => decls.push(evar_pool.get(slot).unwrap().enum_decl)
+        BareVariantPick.Ambiguous(c, enums) => {
+            carrier = c
+            decls = enums
+        }
+    }
+    match carrier {
         Some(k) => if k != owner.carrier { others.push(tc_prelude_carrier_name(k)) }
         None => {}
     }
-    let std_site = tc_site_in_std(site)
-    for i in evar_slots_by_name.get(name) ?? [] {
-        let ev = evar_pool.get(i).unwrap()
-        if ev.enum_id != owner.base && (!std_site || node_source_module(ev.enum_decl).starts_with("std_")) {
-            others.push(tc_nominal_type_name(ev.enum_decl))
-        }
+    let own = tc_owner_decl(owner)
+    for d in decls {
+        if d != own { others.push(tc_nominal_type_name(d)) }
     }
-    if others.len() != 1 { return [] }
     let shown = tc_owner_shown(owner)
+    // A user enum that spells its name like the owner would make the note contradict itself.
+    if others.len() != 1 || others.get(0).unwrap() == shown { return [] }
     let place = if subject != "" { "a pattern for `{subject}`" } else { "a pattern here" }
     ["`{name}` is a variant of `{others.get(0).unwrap()}`, not of `{shown}`; {place} can name only variants of `{shown}`"]
 }
@@ -30056,24 +30072,37 @@ fn tc_report_no_such_variant(node: Int, owner: VariantOwner, name: Str, form: In
     let sugg = nearest_name(name, names)
     let help = if sugg != "" { "did you mean `{sugg}`?" } else { "`{shown}` declares: {names.join(", ")}" }
     let line = node_line(node)
-    let end = col + name.byte_len()
+    let start = if col == -1 { node_col(node) } else { col }
+    let end = start + name.byte_len()
     let before = diag_entry_count()
-    diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` has no variant `{name}`", node, line, col, end, help, notes)
-    if sugg != "" && diag_entry_count() > before && tc_owner_variant_form(owner, sugg) == form {
+    diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` has no variant `{name}`", node, line, start, end, help, notes)
+    if sugg != "" && col != -1 && diag_entry_count() > before && tc_owner_variant_form(owner, sugg) == form {
         diag_set_last_fix_at("rename to", sugg, line, col, line, end)
     }
 }
 
-// The construction `qual.name` names no variant of the enum `qual` (§3.4). Reported when the
-// enum has no such variant and no static method takes the name.
-fn tc_value_names_no_variant(enum_tid: Int, qual: Str, name: Str) -> Bool {
-    if get_variant_by_name(enum_tid, name) != -1 { return false }
-    if name.byte_len() == 0 || name.byte_at(0) < 65 || name.byte_at(0) > 90 { return false }
-    lookup_fnsig("{qual}_{name}") == -1 && nr_has_impl_method(qual, name) == 0
+// The owner of the variants a construction `qual.name` (§3.4) can name, when it names none of
+// them: `qual` is an enum, an alias of one or a prelude carrier, and no static method takes
+// `name`. A lowercase name is a method or field, never a variant.
+fn tc_value_missing_variant(qual: Str, name: Str) -> Option[VariantOwner] {
+    if name.byte_len() == 0 || (name.byte_at(0) >= 97 && name.byte_at(0) <= 122) { return None }
+    match tc_qualifier_owner(qual) {
+        Some(o) => {
+            if tc_owner_has_variant(o, name) || tc_static_method_named(qual, name) { return None }
+            // Through an alias the static methods are declared on the enum itself.
+            if o.base >= 0 && tc_static_method_named(tc_owner_shown(o), name) { return None }
+            Some(o)
+        }
+        None => None
+    }
 }
 
-fn tc_report_no_such_variant_value(node: Int, enum_tid: Int, qual: Str, name: Str, form: Int) ! Diag.Report {
-    tc_report_no_such_variant(node, tc_enum_owner(tc_enum_base_tid(resolve_alias_tid(enum_tid))), name, form, tc_qualified_name_col(node, qual, name), [])
+fn tc_static_method_named(owner: Str, name: Str) -> Bool {
+    lookup_fnsig("{owner}_{name}") != -1 || nr_has_impl_method(owner, name) != 0
+}
+
+fn tc_report_no_such_variant_value(node: Int, owner: VariantOwner, qual: Str, name: Str, form: Int) ! Diag.Report {
+    tc_report_no_such_variant(node, owner, name, form, tc_qualified_name_col(node, qual, name), [])
 }
 
 fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: Str) ! Diag.Report {
@@ -30095,18 +30124,23 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
             tc_report_no_such_variant(pat, owner, name, tc_pattern_payload_form(pat), col, notes)
         }
         PatternFault.NoVariants(shown, noun) => {
-            diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` is {noun}; it has no variants", pat, line, col, col + name.byte_len(), "", [])
+            let at = if col == -1 { node_col(pat) } else { col }
+            diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` is {noun}; it has no variants", pat, line, at, at + name.byte_len(), "", [])
         }
         PatternFault.WrongType(named) => {
             let h = resolve_alias_tid(tc_tid_resolved(hint))
-            let start = if qualified { col - qual.byte_len() - 1 } else { col }
-            let end = col + name.byte_len()
+            // An enum its module declares twice (E1016) may have meant the other's variants.
+            if tc_type_decl_poisoned(tc_tid_decl_node(h)) { return }
+            let at = if col == -1 { node_col(pat) + qual.byte_len() + 1 } else { col }
+            let start = if qualified { at - qual.byte_len() - 1 } else { at }
+            let end = at + name.byte_len()
             let msg = "pattern of type `{named}` used on a value of type `{type_to_str(h)}`"
             match tc_variant_owner_of(h) {
                 Some(o) => {
                     let o_shown = tc_owner_shown(o)
                     let listed = "`{o_shown}` declares: {tc_owner_variant_names(o).join(", ")}"
-                    let swap = tc_owner_has_variant(o, name) && tc_owner_variant_form(o, name) == tc_pattern_payload_form(pat)
+                    // A module-qualified name or a span not found in the source is no safe rewrite.
+                    let swap = col != -1 && !o_shown.contains(".") && tc_owner_has_variant(o, name) && tc_owner_variant_form(o, name) == tc_pattern_payload_form(pat)
                     let before = diag_entry_count()
                     diag_error_span_at_notes("TypeError", TYPE_ERROR, msg, pat, line, start, end, if swap { "write `{o_shown}.{name}`; {listed}" } else { listed }, [])
                     if swap && diag_entry_count() > before {
@@ -30135,6 +30169,11 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
 // whether there was one. Inference runs this walk many times per node; a repeat report is one
 // diagnostic. `subject` names the matched value for the note, at the top level only. Under a
 // faulted pattern every binder takes the poison type, so no use of it reports anything more.
+// Genuinely saves/restores tc_pattern_binding_type around recursive descent;
+// the nr_define/nr_define_typed/recursive calls also write scope-management
+// globals (nr_scope_*, nr_name_top) — defining the pattern's bindings is the
+// intended permanent effect, not speculative state to roll back.
+@allow(UnrestoredMutation)
 fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return false }
     let kind = node_kind(node)
@@ -30179,6 +30218,14 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
         _ => true
     }
     if faulted { tc_report_pattern_fault(node, fault, tc_pattern_binding_type, subject) }
+    // Only an E0547 or a pattern E0300 makes the arm cover nothing (§3.5 Exhaustiveness);
+    // every fault still poisons the binders under it.
+    let covers_nothing = match fault {
+        PatternFault.NoSuchVariant(_) => true
+        PatternFault.NoVariants(_, _) => true
+        PatternFault.WrongType(_) => true
+        _ => false
+    }
     let bad = faulted || poisoned
     let poison = tc_error_recovery_tid()
     let mut child_bad = false
@@ -30267,7 +30314,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
             }
         }
         tc_pattern_binding_type = saved_binding
-        return bad || child_bad
+        return covers_nothing || child_bad
     }
     if kind == NodeKind.StructPattern {
         // Resolve the carrier so each field binder is typed from its declared field type,
@@ -30334,7 +30381,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
             }
         }
         tc_pattern_binding_type = saved_binding
-        return bad || child_bad
+        return covers_nothing || child_bad
     }
     if kind == NodeKind.TuplePattern {
         let saved_binding = tc_pattern_binding_type

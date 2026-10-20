@@ -18,6 +18,11 @@ import std.io
 
 // Every error and internal error the program gets: span, code, message, help, notes, fix.
 fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    diags_of(src, false)
+}
+
+// As errors_of, with warnings too when `all`, so a row can prove that nothing cascades.
+fn diags_of(src: Str, all: Bool) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
     let path = "build/tc_no_such_variant_src.bl"
     init_embedded_stdlib()
     write_file(path, src)
@@ -27,7 +32,7 @@ fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let _ = fs.delete(path)
     let mut out: List[Str] = []
     for d in diag_entries {
-        if d.severity == "error" || d.severity == "ice" {
+        if all || d.severity == "error" || d.severity == "ice" {
             let fix = if d.fix_action == "" { "" } else { "{d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_col}" }
             out.push("{d.line}:{d.col}-{d.end_col}: {d.code} {d.message} | help: {d.help} | notes: {d.notes.join("; ")} | fix: {fix}")
         }
@@ -55,7 +60,27 @@ fn span(src: Str, marker: Str, word: Str) -> Str {
 }
 
 fn assert_errors(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
-    let got = errors_of(src)
+    assert_same(errors_of(src), want)
+}
+
+// The exact set of diagnostics of every severity.
+fn assert_diags(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    assert_same(diags_of(src, true), want)
+}
+
+// The codes of every diagnostic, in any order, when the exact text of some is not the point.
+fn assert_codes(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = diags_of(src, true)
+    let mut codes: List[Str] = []
+    for g in got { codes.push(g.split(" ").get(1).unwrap()) }
+    codes.sort()
+    let mut sorted = want
+    sorted.sort()
+    if codes != sorted { for g in got { io.eprintln("got: {g}") } }
+    assert_eq(codes, sorted)
+}
+
+fn assert_same(got: List[Str], want: List[Str]) {
     let mut ok = got.len() == want.len()
     for w in want {
         if !got.contains(w) { ok = false }
@@ -80,7 +105,7 @@ fn rename(src: Str, marker: Str, word: Str, to: Str) -> Str {
 }
 
 test "a misspelled Some in a match on Option[Int] is one E0547 with a machine rename" {
-    // The input the fuzz corpus (seed 42) found: two internal errors and no user error.
+    // Before E0547 this gave two internal errors and no user error.
     let src = #"fn get(x: Option[Int]) -> Int {
     match x {
         Somee(v) => v  // BAD
@@ -340,13 +365,21 @@ test "an unguarded bad arm turns off E0004, and the arm after it is checked as u
 fn f(x: T) -> Int {
     match x {
         Q(v) => v  // BAD
-        B => 0
+        B => nope  // LATER
     }
 }
 
 fn main() { let _ = f(T.B) }
 "#
-    assert_errors(src, [nsv(span(src, "BAD", "Q"), "`T` has no variant `Q`", "`T` declares: A, B", "", "")])
+    let got = errors_of(src)
+    let bad = nsv(span(src, "BAD", "Q"), "`T` has no variant `Q`", "`T` declares: A, B", "", "")
+    let later = "{span(src, "LATER", "nope").split("-").get(0).unwrap()}-"
+    let mut ok = got.len() == 2 && got.contains(bad)
+    for g in got {
+        if g != bad && !(g.starts_with(later) && g.contains("undefined variable `nope`")) { ok = false }
+    }
+    if !ok { for g in got { io.eprintln("got: {g}") } }
+    assert(ok)
 }
 
 test "a guarded bad arm leaves E0004 on" {
@@ -388,7 +421,7 @@ fn main() {
     let _ = (y, z, a, b)
 }
 "#
-    assert_errors(src, [
+    assert_diags(src, [
         nsv(span(src, "HGH", "Hgh"), "`Level` has no variant `Hgh`", "did you mean `High`?", "", rename(src, "HGH", "Hgh", "High")),
         nsv(span(src, "ZPAREN", "Zed"), "`K` has no variant `Zed`", "`K` declares: A, B", "", ""),
         nsv(span(src, "ZBRACE", "Zedd"), "`K` has no variant `Zedd`", "`K` declares: A, B", "", "")
@@ -413,4 +446,121 @@ fn main() { let _ = f(1) }
     }
     if !ok { for g in got { io.eprintln("got: {g}") } }
     assert(ok)
+}
+
+test "a struct pattern through an alias of the matched struct is clean" {
+    let src = #"type Point { x: Int, y: Int }
+type P2 = Point
+
+fn f(p: P2) -> Int {
+    match p {
+        P2 { x, y } => x + y
+    }
+}
+
+fn main() { let _ = f(Point { x: 1, y: 2 }) }
+"#
+    assert_diags(src, [])
+}
+
+test "a construction through an alias or a prelude carrier names its variants too" {
+    let src = #"type K { A(Int), B { n: Int } }
+type KA = K
+type MO = Option[Int]
+
+fn main() {
+    let a = KA.Zed(1)  // KP
+    let b = KA.Zedd { n: 1 }  // KB
+    let c = KA.Zeds  // KU
+    let d = Option.Somee(1)  // OS
+    let e = Option.Nonee  // ON
+    let f = Result.Okk(1)  // RO
+    let g = MO.Somee(1)  // MOS
+    let _ = (a, b, c, d, e, f, g)
+}
+"#
+    assert_diags(src, [
+        nsv(span(src, "KP", "Zed"), "`K` has no variant `Zed`", "`K` declares: A, B", "", ""),
+        nsv(span(src, "KB", "Zedd"), "`K` has no variant `Zedd`", "`K` declares: A, B", "", ""),
+        nsv(span(src, "KU", "Zeds"), "`K` has no variant `Zeds`", "`K` declares: A, B", "", ""),
+        nsv(span(src, "OS", "Somee"), "`Option` has no variant `Somee`", "did you mean `Some`?", "", rename(src, "OS", "Somee", "Some")),
+        nsv(span(src, "ON", "Nonee"), "`Option` has no variant `Nonee`", "did you mean `None`?", "", rename(src, "ON", "Nonee", "None")),
+        nsv(span(src, "RO", "Okk"), "`Result` has no variant `Okk`", "did you mean `Ok`?", "", rename(src, "RO", "Okk", "Ok")),
+        nsv(span(src, "MOS", "Somee"), "`Option` has no variant `Somee`", "did you mean `Some`?", "", rename(src, "MOS", "Somee", "Some"))
+    ])
+}
+
+test "a variant pattern on a parameter of an unknown type adds nothing to E0507" {
+    let src = #"type Shape { Circle(Int), Dot }
+
+fn f(s: Shap) -> Int {
+    match s {
+        Circle(r) => r
+        _ => 0
+    }
+}
+
+fn main() { let _ = f(Shape.Dot) }
+"#
+    assert_codes(src, ["E0507"])
+}
+
+test "an arm whose qualifier is no type is not a bad arm, so E0004 still holds" {
+    let src = #"type Color { Red, Green }
+
+fn f(c: Color) -> Int {
+    match c {
+        Colr.Red => 1
+    }
+}
+
+fn main() { let _ = f(Color.Red) }
+"#
+    assert_codes(src, ["E0507", "E0004"])
+}
+
+test "a variant whose name starts with an underscore is still looked up" {
+    let src = #"type K { A(Int), _Hidden }
+
+fn main() {
+    let a = K._Hiddn  // HID
+    let _ = a
+}
+"#
+    assert_errors(src, [nsv(span(src, "HID", "_Hiddn"), "`K` has no variant `_Hiddn`", "did you mean `_Hidden`?", "", rename(src, "HID", "_Hiddn", "_Hidden"))])
+}
+
+test "a construction split over two lines gets no machine fix" {
+    let src = #"type K { Alpha, Beta }
+
+fn main() {
+    let a = K
+        .Alpa
+    let _ = a
+}
+"#
+    let got = errors_of(src)
+    if got.len() != 1 { for g in got { io.eprintln("got: {g}") } }
+    assert_eq(got.len(), 1)
+    let g = got.get(0).unwrap()
+    if !g.contains(" E0547 `K` has no variant `Alpa` | help: did you mean `Alpha`?") || !g.ends_with("| fix: ") { io.eprintln("got: {g}") }
+    assert(g.contains(" E0547 `K` has no variant `Alpa` | help: did you mean `Alpha`?"))
+    assert(g.ends_with("| fix: "))
+}
+
+test "a wrong-type pattern on an enum its module declares twice adds nothing to E1016" {
+    let src = #"type E { A, B }
+type E { C(Str), D }
+type Other { C(Str) }
+
+fn f(e: E) -> Int {
+    match e {
+        Other.C(s) => s.len()
+        _ => 0
+    }
+}
+
+fn main() { let _ = f(E.A) let _ = Other.C("x") }
+"#
+    assert_codes(src, ["E1016"])
 }
