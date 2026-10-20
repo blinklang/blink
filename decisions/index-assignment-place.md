@@ -842,7 +842,7 @@ fn main() {
 - A place is a `let mut` binding, or a field path whose root is one. An index is not a place (§2.22 *Assignment places*).
 - `place = rhs` evaluates `rhs`, then reads the root binding, then stores.
 - `xs[i] = v` and `xs[i] op= v` are `error[NoIndexOperator]` (E0313). The help names one write method chosen from the receiver's type, never `.insert` for a `List`, and both methods with no machine fix when the type is not known (§3.4).
-- `xs[i] op= v` on a `List` or `Bytes` gets the machine fix `xs.set(i, xs.get(i).unwrap() op v)` only when `i` is a literal, a local binding or a `const` by name resolution. Otherwise a `note:` and no machine fix.
+- `xs[i] op= v` on a `List` or `Bytes` gets the machine fix `xs.set(i, xs.get(i).unwrap() op v)` only when `i` is a literal, a local binding or a `const` by name resolution. Otherwise a `note:` and no machine fix. For a `Map` receiver, [Map Index Assignment Re-audit](map-index-assignment-reaudit.md) amends the note: it names the default form, then the `.unwrap()` form.
 - The element-write example is `xs.set(10, fill())` under §2.22 *What each form evaluates*.
 - `List.set` panics when the index is out of bounds (§3 List table). A read through `.get()` never panics.
 

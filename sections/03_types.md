@@ -2322,7 +2322,18 @@ When a call follows the brackets, as in `handlers[0](req)`, the element is an `O
 
 **A store through brackets.** An index is not an assignment place (§2.22 *Assignment places*), so `xs[i] = v` and `xs[i] op= v` are E0313 by the same rule. The first `help:` names one write method, chosen from the receiver's type: `.set(i, v)` for a `List` or `Bytes`, and `.insert(k, v)` for a `Map`. It never names `.insert` for a `List`. `List.insert` compiles, but it shifts the elements and changes the length, so it changes the meaning of the program. When the receiver's type is not known, the help names both methods, each with its receiver type, and offers no machine-applicable fix.
 
-For `xs[i] op= v` on a `List` or `Bytes`, the machine-applicable fix is `xs.set(i, xs.get(i).unwrap() op v)`. The fix writes `i` twice, so it keeps the meaning only when `i` is a literal, a local binding or a `const`, as name resolution sees it. A module-level `let mut` or a call does not qualify. The help says that the fix panics when `i` is out of bounds, because `set` does. For any other index, for a `Map` receiver, and for a nested place, the diagnostic carries a `note:` to bind the index with `let` first, and offers no machine-applicable fix.
+Every store diagnostic, plain or compound, also carries a one-line `note:` that gives the reason: brackets hold types, and a program reads and writes elements with methods. The spec fixes what the note says, not its words. The reason must be true for every receiver type and every position, so the note never gives a reason that holds for one container only, such as an allocation. The headline stays `Blink has no index operator`.
+
+For `xs[i] op= v` on a `List` or `Bytes`, the machine-applicable fix is `xs.set(i, xs.get(i).unwrap() op v)`. The fix writes `i` twice, so it keeps the meaning only when `i` is a literal, a local binding or a `const`, as name resolution sees it. A module-level `let mut` or a call does not qualify. The help says that the fix panics when `i` is out of bounds, because `set` does. For any other index, and for a nested place, the diagnostic carries a `note:` to bind the index with `let` first, and offers no machine-applicable fix.
+
+For `m[k] op= v` on a `Map`, a missing key has no value to apply `op` to, and only the author knows what that case means. So the diagnostic offers no machine-applicable fix. Its `note:` names two forms, the default form first:
+
+- `m.insert(k, (m.get(k) ?? 0) op v)` when a missing key starts at a default value.
+- `m.insert(k, m.get(k).unwrap() op v)` when a missing key is a bug. This form panics on a missing key.
+
+The note writes the literal default (`0` or `0.0`) only for `+=` and `-=` on an `Int` or `Float` value. For any other operator or value type, a default of zero is wrong or does not type-check, so the note writes a placeholder such as `<default>` in its place. The placeholder must not parse as a Blink expression, so that a copied note fails to compile and never runs with a wrong default. Both forms write `k` twice, so when `k` is not a literal, a local binding or a `const`, the note also says to bind the key with `let` first.
+
+The example below shows the reason note on the plain stores only. The compound stores carry it too.
 
 ```blink
 fn main() {
@@ -2332,10 +2343,18 @@ fn main() {
 
     xs[0] = 5              // error[NoIndexOperator]: Blink has no index operator
                            // help: `xs.set(0, 5)`
+                           // note: brackets hold types (`List[Int]`); elements use methods
     ages["bob"] = 41       // error[NoIndexOperator]: Blink has no index operator
                            // help: `ages.insert("bob", 41)`
+                           // note: brackets hold types (`List[Int]`); elements use methods
     xs[i] += 1             // error[NoIndexOperator]: Blink has no index operator
                            // help: `xs.set(i, xs.get(i).unwrap() + 1)` (panics when `i` is out of bounds)
+    ages["bob"] += 1       // error[NoIndexOperator]: Blink has no index operator
+                           // note: `ages.insert("bob", (ages.get("bob") ?? 0) + 1)` when a missing key starts at 0,
+                           //       or `ages.insert("bob", ages.get("bob").unwrap() + 1)` when it is a bug
+    ages["bob"] *= 2       // error[NoIndexOperator]: Blink has no index operator
+                           // note: `ages.insert("bob", (ages.get("bob") ?? <default>) * 2)` when a missing key
+                           //       starts at a default, or `ages.insert("bob", ages.get("bob").unwrap() * 2)`
 }
 ```
 
