@@ -1855,6 +1855,22 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
 }
 ```
 
+**A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
+
+```blink
+type Level { Low, High }
+
+fn main() {
+    let x = Level.Hihg     // error[NoSuchVariant]
+    let y = x              // no further error: `x` has the poison type
+}
+```
+
+```
+error[NoSuchVariant]: `Level` has no variant `Hihg`
+  help: did you mean `High`?
+```
+
 Variant construction does not accept `..source`; copy-update (§2.16) applies to struct literals only. Every variant field must be supplied.
 
 ```blink
@@ -2611,6 +2627,84 @@ fn show(n: Int) -> Str {
 
 A pattern binder named like a variant gets W1011 only when the scrutinee type has no variant of that name (§10.6 *Shadowing Rules*). In `show` above, the binder `Red` gets W1011; in `name`, the pattern `Red` is the variant and gets nothing.
 
+**A variant the enum does not declare.** A variant pattern must name a variant that its enum declares. The compiler reports `error[NoSuchVariant]` (E0547) for:
+
+- a bare name with a payload (`Somee(v)`, `Zed { .. }`) when the type at that pattern position has no variant of that name;
+- a qualified name `K.Zed`, with or without a payload, when the enum `K` declares no variant `Zed`;
+- a bare name with a payload when the type at that pattern position is a struct, a tuple or a type parameter. The message says that the type has no variants: "`Point` is a struct; it has no variants". For a type parameter, the help suggests no variant.
+
+When the type at the pattern position is not known yet, the compiler reports `CannotInferType` (E0301, §3.4 *Under-Determined Types*), not E0547. A variant pattern on a builtin scalar stays `EnumPatternNeedsEnumScrutinee` (E0308, §3.4 *Enums Nominally Distinct from Int*). A bare name with no payload is a binding, as above, so it never gets E0547.
+
+The rule applies at every depth. In `Some(Somee(v))` on an `Option[Option[Int]]`, the inner pattern is checked against the payload type of `Some`, so `Somee` gets E0547.
+
+The span is the variant name: `Somee` in `Somee(v)`, `Zed` in `K.Zed`. The help uses the nearest-name suggestion (ERROR_CATALOG *Conventions*). Its candidates are the variants of the enum at that pattern position that are visible at the site. A variant that another arm already matches stays a candidate. Outside the module of a `pub opaque type`, the help lists and suggests no variant of that type. With one suggestion, the rename is machine-applicable only when the payload forms agree: a pattern with no payload and a unit variant, a `( )` payload and a variant declared with `( )`, or a `{ }` payload and a variant declared with `{ }`. Otherwise the help names the variant but the fix is not machine-applicable. With no suggestion, the help lists the declared variants. The terminal text may shorten a long list and give a count of the rest; the count line names `--format json` and `blink explain NoSuchVariant`. Structured output (`--format json`, the language server) lists every variant.
+
+```blink
+type Shape { Circle(Float), Square(Float), Dot }
+
+fn area(s: Shape) -> Float {
+    match s {
+        Circel(r) => 3.14159 * r * r   // error[NoSuchVariant]
+        Shape.Square(w) => w * w
+        Shape.Dott => 0.0              // error[NoSuchVariant]
+    }
+}
+```
+
+```
+error[NoSuchVariant]: `Shape` has no variant `Circel`
+  help: did you mean `Circle`?
+error[NoSuchVariant]: `Shape` has no variant `Dott`
+  help: did you mean `Dot`?
+```
+
+When a bare name with a payload is not a variant of the type at the position, and exactly one enum visible at the site declares that name, the error gets a `note:` that names the enum. The compiler finds that enum only to write the note; the note never changes what the pattern means:
+
+```blink
+type Token { Num(Int), Plus }
+type Expr { Lit(Int), Add }
+
+fn value(t: Token) -> Int {
+    match t {
+        Lit(n) => n        // error[NoSuchVariant]
+        Plus => 0
+    }
+}
+```
+
+```
+error[NoSuchVariant]: `Token` has no variant `Lit`
+  note: `Lit` is a variant of `Expr`, not of `Token`; a pattern for `t` can name only variants of `Token`
+  help: `Token` declares: Num, Plus
+```
+
+**Qualified names and the wrong type.** The compiler checks a qualified pattern `Q.V` in this order, and the first failure is the only error for that pattern:
+
+1. Resolve `Q`. A name that is not a type is `UnknownType` (E0507).
+2. Look up `V` in `Q`. A variant that `Q` does not declare is E0547, and the message names `Q`.
+3. Compare `Q` with the type at the pattern position. A different type is `TypeError` (E0300).
+
+So `Other.Zed` on a `T` scrutinee gives one E0547 for `Other`, and no E0300. A qualified variant of a different enum, such as `Other.Q(v)` on a `T` scrutinee, is E0300, the same error as `let t: T = Other.Q(1)`. A struct pattern of a different struct type, such as `Q { y }` on a `P` scrutinee, is also E0300. The header names both types, and the span is the whole path (`Other.Q`) or type name (`Q`). The help lists the variants of the expected type. When that type declares a variant with the same name and the same payload form, the help gives the fix `T.Q`, and the fix is machine-applicable.
+
+```blink
+type T { A(Int), Q(Int) }
+type Other { Q(Int) }
+
+fn f(x: T) -> Int {
+    match x {
+        Other.Q(v) => v    // error[TypeError]
+        T.A(v) => v
+    }
+}
+```
+
+```
+error[TypeError]: pattern of type `Other` used on a value of type `T`
+  help: write `T.Q`; `T` declares: A, Q
+```
+
+**After the error.** Each binder under a pattern with one of these errors has the poison type (§6.3.5). The compiler still checks the arm body and suppresses each diagnostic that only the poison type causes. *Exhaustiveness* below says how such an arm counts for coverage. These rules apply to `blink check` and to `blink build` alike: each variant pattern resolves to its enum and variant before code generation, or the compiler reports an error, so the two commands report the same diagnostics for one program.
+
 **Literal.** Integer, float, boolean, and string literals match by value equality.
 
 ```blink
@@ -2931,6 +3025,28 @@ The exhaustiveness checker handles:
 - **Guards** — treated as opaque (may be false), so guarded arms do not contribute to exhaustiveness
 - **OR-patterns** — union of covered patterns per alternative
 - **`Never` payloads** — a variant whose payload type is `Never` still needs an arm. The checker does not remove the arm because no value can reach it. The arm body may be the payload itself, which has type `Never` and fits any expected type. §3.2 shows the `Err(e) => e` form.
+
+**An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error or one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
+
+- When a match has an unguarded bad arm, the compiler reports no `NonExhaustiveMatch` (E0004) for that match. The missing coverage is probably the variant that the bad arm tried to name.
+- A guarded bad arm does not turn off E0004. A guarded arm never adds coverage, so an E0004 next to it stays true after the user corrects the name.
+- The compiler reports no unreachable arm for the bad arm itself. Each other check runs as usual, E0005 included. Because the bad arm covers nothing, it never makes a later arm look unreachable, and each such report stays true whatever repair the user makes.
+
+```blink
+fn get(x: Option[Int]) -> Int {
+    match x {
+        Somee(v) => v      // error[NoSuchVariant]; no E0004 for `Some`
+        None => 0          // checked as usual; not unreachable
+    }
+}
+
+fn get_pos(x: Option[Int]) -> Int {
+    match x {
+        Somee(v) if v > 0 => v   // error[NoSuchVariant]
+        None => 0
+    }                            // error[NonExhaustiveMatch]: missing `Some`
+}
+```
 
 **Why exhaustiveness matters for AI.** The single most common bug AI-generated code produces is the forgotten case. A missing `None` handler, an unhandled error variant, an enum value added without updating all consumers. Exhaustive matching makes this class of bug structurally impossible. The compiler mechanically identifies what's missing and suggests the fix. An AI agent can apply the fix automatically — this is the generate-compile-fix loop working as designed.
 
