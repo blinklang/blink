@@ -129,8 +129,8 @@ Writing `.into_iter()` explicitly (the door of §3c.1) and letting `for` desugar
 | Type | `into_iter()` yields | Notes |
 |------|---------------------|-------|
 | `List[T]` | `T` | Elements in order |
-| `Set[T]` | `T` | Unspecified order |
-| `Map[K, V]` | `(K, V)` | Key-value pairs, unspecified order |
+| `Set[T]` | `T` | Insertion order (§3.6) |
+| `Map[K, V]` | `(K, V)` | Key-value pairs, insertion order (§3.6) |
 | `Range[T]` | `T` | Lazy: elements are produced on demand |
 | `Str` | `Char` | Unicode scalar values |
 | `Channel[T]` | `T` | Receives until the channel is closed and empty, then stops. Consumes what it receives, so a second loop sees only later values |

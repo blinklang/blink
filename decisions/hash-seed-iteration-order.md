@@ -2,6 +2,8 @@
 
 # Hash Seed Contract, Iteration Order & `--deterministic` — Design Rationale
 
+> **Superseded in part.** A later six-seat re-audit made `Map` and `Set` iterate in insertion order (6-0). The seed stays random per process, but now controls only bucketing. `--deterministic`, `BLINK_MAP_SEED`, `W1401 MapOrderAssumption` and the Map purity exclusion left the spec. The record below is the original deliberation and stays as written. See [Map/Set Insertion Order Re-audit](map-insertion-order-reaudit.md) and §3.6.
+
 Resolves br **tn17vz** — "Spec: Hash seed contract + iteration order + `--deterministic` CLI flag." Follow-up to the 42cvjx triage (which produced an informal 6-0 starting draft but ran no spec round) and to the `h0geg9` Map runtime work (per-K kops vtable, [decisions/map-runtime-architecture.md](map-runtime-architecture.md)).
 
 > **Erratum (2026-09-30).** This record first wrote the sort as `.sorted()`, a method that does not exist, and wrote `names.sort()` as a statement, which discards the sorted copy. Both now read `.sort()`, which returns a new list. No vote changed. See [List Sort Stability and Comparator](list-sort-stability-comparator.md).

@@ -1369,11 +1369,6 @@ build/blink run src/main.bl --jobs 4
 build/blink build src/main.bl --no-per-module
 BLINK_PER_MODULE=0 build/blink test tests/main_test.bl
 
-# Deterministic map iteration — pin Map hash seed to 0 for reproducible builds/runs
-# (default: reads $BLINK_MAP_SEED, falls back to time(NULL) ^ (getpid()<<16))
-build/blink build src/main.bl --deterministic
-build/blink run src/main.bl --deterministic
-
 # Cross-compilation (single target)
 build/blink build src/main.bl --target linux
 build/blink build src/main.bl -T macos-arm64

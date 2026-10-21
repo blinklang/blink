@@ -752,9 +752,9 @@ The full `Map[K, V]` method surface (9 methods from `MapOps` + 2 from `Sized` + 
 | `contains` | `fn(self, K) -> Bool` | no | Via `Contains`, key presence — equivalent to `contains_key` (see §3.2.2 *The `Contains` Trait*) |
 | `get` | `fn(self, K) -> Option[V]` | no | Lookup by key |
 | `get_or_default` | `fn(self, K, V) -> V` | no | Lookup with fallback |
-| `keys` | `fn(self) -> List[K]` | no | All keys (unspecified order) |
-| `values` | `fn(self) -> List[V]` | no | All values (unspecified order) |
-| `entries` | `fn(self) -> List[(K, V)]` | no | All key-value pairs |
+| `keys` | `fn(self) -> List[K]` | no | All keys, in iteration order |
+| `values` | `fn(self) -> List[V]` | no | All values, in iteration order |
+| `entries` | `fn(self) -> List[(K, V)]` | no | All key-value pairs, in iteration order |
 | `contains_key` | `fn(self, K) -> Bool` | no | Key presence check |
 | `insert` | `fn(self, K, V)` | yes | Insert or update |
 | `remove` | `fn(self, K) -> Option[V]` | yes | Remove by key |
@@ -770,8 +770,8 @@ let timeout = config.get_or_default("timeout", "30")  // "30"
 config.contains_key("port")                // true
 config.contains("port")                    // true (Contains, same as contains_key)
 
-let ks = config.keys()                     // ["host", "port"] (unspecified order)
-let vs = config.values()                   // ["localhost", "8080"] (unspecified order)
+let ks = config.keys()                     // ["host", "port"] (insertion order)
+let vs = config.values()                   // ["localhost", "8080"] (insertion order)
 let es = config.entries()                  // [("host", "localhost"), ("port", "8080")]
 
 let removed = config.remove("port")        // Some("8080")
@@ -804,7 +804,7 @@ The full `Set[T]` method surface (3 methods from `SetOps` + 2 from `Sized` + 1 f
 | `contains` | `fn(self, T) -> Bool` | no | Via `Contains`, hash lookup |
 | `insert` | `fn(self, T) -> Bool` | yes | Returns `true` if new |
 | `remove` | `fn(self, T) -> Bool` | yes | Returns `true` if present |
-| `union` | `fn(self, Set[T]) -> Set[T]` | no | Returns new set |
+| `union` | `fn(self, Set[T]) -> Set[T]` | no | Returns new set; `self`'s order, then new elements of the argument (*Hash Contract and Seeding*) |
 
 ```blink
 let mut seen = Set.new()
@@ -3179,22 +3179,38 @@ type Ordering {
 
 `hash(self) -> U64` returns a hash of the value. Implementations must satisfy the coherence law with `Eq`: for any `a` and `b`, `a == b` implies `a.hash() == b.hash()`. Coherence is a property of `hash` against `eq`.
 
-The iteration order of a `Map` or `Set` varies from run to run, build to build, and across compiler versions. This is deliberate — randomization forces accidental order-dependence to fail early rather than rot silently (vote: 6-0; see [Hash Seed & Iteration Order rationale](../decisions/hash-seed-iteration-order.md)). Programs therefore **must not** depend on iteration order; code that needs a stable order must sort the keys or entries explicitly:
+**Iteration order.** A `Map` or `Set` iterates in insertion order (vote: 6-0; see [Map/Set Insertion Order rationale](../decisions/map-insertion-order-reaudit.md)):
+
+- `insert` adds a new key at the end. `insert` on a key that is already present replaces the value and keeps the key's position.
+- `remove` keeps the relative order of the remaining keys. A key inserted again after `remove` goes at the end.
+- `keys()`, `values()`, `entries()` and `for` give the same order.
 
 ```blink
-let names = scores.keys().sort()
-for name in names {
-    io.println("{name}: {scores.get(name).unwrap()}")
+let mut scores: Map[Str, Int] = Map()
+scores.insert("carol", 3)
+scores.insert("alice", 1)
+scores.insert("carol", 4)
+for (name, score) in scores {
+    io.println("{name}: {score}")
 }
+// carol: 4
+// alice: 1
 ```
 
-A function whose result depends on unsorted `Map`/`Set` iteration order is **not** referentially transparent with respect to its `Map`/`Set` arguments, even though it has no effect annotation. Iteration order is **not** part of a `Map`/`Set` value's identity — two maps with equal entry sets are `==`-equal regardless of insertion history (§3.6 *Container Equality*).
+A `Map` or `Set` made from other values is built by inserts in this order:
+
+- `clone()` keeps the order.
+- `a.union(b)` gives the elements of `a` in `a`'s order, then the elements of `b` that are not in `a`, in `b`'s order.
+- `collect()`, and any build from a list, inserts in the order of the input. For a duplicate key, the key keeps its first position and takes the last value.
+- A std deserializer inserts in document order, but keeps the first entry for a duplicate key (§3.6.2 *Map and Set Order*).
+
+**Hash seed.** The runtime picks a random hash seed for each process. The random seed protects a `Map` or `Set` that holds untrusted keys from hash-flooding attacks. The seed controls only how keys go into buckets. It has no effect on iteration order, on `debug()` text, or on serializer output. The language has no API that reads or sets the seed.
+
+**Equality and reuse.** Iteration order is **not** part of a `Map`/`Set` value's identity — two maps with equal entry sets are `==`-equal regardless of insertion history (§3.6 *Container Equality*). A compiler may reuse the result of a pure call only for arguments that are identical in representation. `==` does not license reuse: two `==` values can give different results (two equal maps can iterate in different orders).
 
 **Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would give equal values different hashes. Round to an integer key instead.
 
 **Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), `Never` (§3.2), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. `Never` is the only type outside these groups on the list; it gives no container a way in. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). A fieldless enum is `Eq` already (*Container Equality*), so it needs only `@derive(Hash)` or an `impl Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
-
-For pinning the seed (golden-file tests, fixture-driven runners, self-hosting diff stability) and for the `--deterministic` flag and `BLINK_MAP_SEED` environment variable, see §8.10.
 
 #### The `final` Modifier
 
@@ -4944,11 +4960,9 @@ between a map key and its value; there is no inner padding.
 
 **Set and Map order.** `Set[T].debug()` sorts the rendered element strings by their UTF-8 bytes
 before it joins them. `Map[K,V].debug()` sorts its entries by the UTF-8 bytes of `key.debug()`; when
-two keys render the same text, it sorts those entries by the UTF-8 bytes of `value.debug()`. Neither
-uses iteration order. The hash seed changes per process (*Hash Contract and Seeding*), and two equal
-sets or maps can hold their contents in different orders after different insert and remove
-histories, so iteration order would break the rule that `a == b` gives `a.debug() == b.debug()`
-(*Debug agrees with Eq*, §3.6.1). Sorting by the debug string needs no `Ord` bound. The order is by
+two keys render the same text, it sorts those entries by the UTF-8 bytes of `value.debug()`.
+`debug()` sorts so that `==` maps print the same text; their iteration order can differ (see
+*Container Equality* and *Hash Contract and Seeding*, §3.6; *Debug agrees with Eq*, §3.6.1). Sorting by the debug string needs no `Ord` bound. The order is by
 text, not by value: a `Set[Int]` of 1, 2 and 10 renders `{1, 10, 2}`, and a `Map[Int, Str]` that
 maps 1 to `"a"`, 2 to `"b"` and 10 to `"c"` renders `{1: "a", 10: "c", 2: "b"}`. Only `debug()` sorts; `keys()`,
 `values()` and `for` loops keep iteration order. An empty `Set` renders `{}`, the same text as an
@@ -5238,6 +5252,12 @@ unknown value "closed" for Status at $.status; expected one of: "open", "in_prog
 | Struct with `@derive(Serialize)` | `JsonValue.Object` |
 | Enum with `@derive(Serialize)`, not Str-backed | Tagged object: `{"variant": "Name", "fields": {...}}` |
 | Str-backed enum with `@derive(Serialize)` | `JsonValue.Str` of its backing literal: `"in_progress"` |
+
+##### Map and Set Order
+
+When a std serializer (JSON or another format) encodes a `Map` or `Set`, it writes the entries in iteration order (*Hash Contract and Seeding*, §3.6). When a std deserializer builds a `Map` or `Set`, it adds the entries in document order. Where a key occurs more than once, the **first** entry gives both the position and the value, and the deserializer ignores each later entry with that key. This is the rule that `JsonValue.get` (§3.6.3) and derived `from_json` use. A round trip of a document with no duplicate keys keeps the key order.
+
+A document `{"b": 1, "a": 2, "b": 3}` decodes into a `Map[Str, Int]` that iterates `b: 1`, then `a: 2`. The deserializer ignores `"b": 3`.
 
 ##### Purity
 
