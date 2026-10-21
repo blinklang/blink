@@ -3692,33 +3692,62 @@ Operands must be the same type. Mixed-type arithmetic (`Int + Float`) is a compi
 
 #### Float Total Ordering
 
-`Float` implements `Eq` and `Ord` with **total ordering** semantics (vote: 5-0):
+`Float` implements `Eq` and `Ord` with **total ordering** semantics (vote: 5-0; re-audit kept it, 6-0):
 
 - `NaN == NaN` is `true` (restores reflexivity)
 - `NaN` sorts greater than all other values
 - `-0.0 == 0.0` is `true`
 - `Float` does **not** implement `Hash` — bitwise hashing cannot stay coherent with `Eq` (e.g. `-0.0 == 0.0` with distinct bit patterns), so `Float` keys are rejected as `E1400` (see Hash Contract and Seeding, §3.6)
 
-For IEEE 754 equality, use the method `x.ieee_eq(y)`. It is the IEEE 754 equality predicate (C's `==`): `NaN` is unequal to every value, itself included, and `(-0.0).ieee_eq(0.0)` is `true`. `x == y` is `true` exactly when `x.ieee_eq(y)` is `true` or both operands are `NaN`. No `Float` equality tells `-0.0` from `0.0`. To test the sign, use `x.is_sign_negative()` (*Float Bits*).
+For IEEE 754 equality, use the method `x.ieee_eq(y)`. It is the IEEE 754 equality predicate (C's `==`): `NaN` is unequal to every value, itself included, and `(-0.0).ieee_eq(0.0)` is `true`. `x == y` is `true` exactly when `x.ieee_eq(y)` is `true` or both operands are `NaN`. No `Float` equality tells `-0.0` from `0.0`. To test the sign, use `x.is_sign_negative()` (*Built-in Float Methods*).
+
+`F32` has the same total order and the same `ieee_eq`, with the signature `fn(self, F32) -> Bool`. Each type compares at its own width: an `F32` comparison is a binary32 comparison.
 
 ```blink
 let nan = 0.0 / 0.0
 assert(nan == nan)              // total order
 assert(!nan.ieee_eq(nan))       // IEEE: NaN is unequal to itself
+assert(nan.is_nan())            // the NaN test
 assert(-0.0 == 0.0)             // warning[NegativeZeroComparison]: the zeros are equal
 assert((-0.0).ieee_eq(0.0))     // warning[NegativeZeroComparison]
 assert((-0.0).is_sign_negative()) // the sign of zero
 ```
 
-#### Float Bits
+##### Differences from IEEE 754
 
-`Float` and `F32` have three built-in methods that read and write the IEEE 754 bit pattern. They need no import.
+IEEE 754, and C, Rust, Python and JavaScript with it, make every comparison with NaN false except `!=`. Blink's `==`, `!=`, `<`, `<=`, `>` and `>=` use the total order, so code that relies on the IEEE results gives different answers. The differences are:
+
+- `NaN == NaN` is true.
+- `NaN != NaN` is false.
+- When `y` is not NaN, `NaN > y` and `NaN >= y` are true, and `NaN < y` and `NaN <= y` are false.
+- `NaN <= NaN` and `NaN >= NaN` are true.
+
+An upper-bound check catches NaN. A lone lower-bound check lets it through:
+
+```blink
+fn clamp(x: Float, lo: Float, hi: Float) -> Float {
+    if x > hi { return hi }    // Blink: NaN -> hi. C/Rust/Python: NaN passes through
+    if x < lo { return lo }
+    x
+}
+```
+
+`x > max` is true for NaN, so it rejects NaN; under IEEE 754 it is false, and NaN passes. `x >= min` is also true for NaN, so it accepts NaN, where IEEE code would reject it. A guard such as `!(x >= 0.0)` does not reject NaN in Blink.
+
+- To test for NaN, use `x.is_nan()` (*Built-in Float Methods*).
+- For IEEE equality, use `x.ieee_eq(y)`.
+- `x != x` is always false in Blink. The compiler gives the warning `FloatSelfComparison` (W0707) for it and for the other comparisons of a value with itself (*Float Self Comparison*).
+
+#### Built-in Float Methods
+
+`Float` and `F32` have these built-in methods that work on the IEEE 754 form of a value. They need no import. Each row covers both types.
 
 | Method | Signature on `Float` | Signature on `F32` | Returns |
 |--------|----------------------|--------------------|---------|
 | `to_bits` | `fn(self) -> U64` | `fn(self) -> U32` | The IEEE 754 binary64 (binary32) bit pattern |
 | `from_bits` | `fn(U64) -> Float` (static) | `fn(U32) -> F32` (static) | The value with that bit pattern |
 | `is_sign_negative` | `fn(self) -> Bool` | `fn(self) -> Bool` | The sign bit |
+| `is_nan` | `fn(self) -> Bool` | `fn(self) -> Bool` | `true` exactly when the value is a NaN, of any sign or payload |
 
 `from_bits` is total: every bit pattern is a value, so it returns `Float` (`F32`), not an `Option`. `to_bits` is not a conversion and has no `From` impl (§3c.3 *The `to_` rule for scalars*). A bitwise operator on a `Float` is a type error (§3.2.3 *Sized Integer Types*); its help names `to_bits()`.
 
@@ -3728,6 +3757,7 @@ assert((-0.0).is_sign_negative()) // the sign of zero
 - **Bits are finer than `==`.** If `x.to_bits() == y.to_bits()`, then `x == y`. The converse is false: `-0.0 == 0.0`, and two NaNs with a different sign or payload are `==`, but their bits differ.
 - **Arithmetic.** An operation that gives a NaN does not fix the sign or payload of that NaN.
 - **Sign.** `x.is_sign_negative()` is `true` exactly when the sign bit of `x` is set. That includes `-0.0` and a NaN with the sign bit set. `1.0 / x < 0.0` is `false` for every NaN, so it is not a sign test. To test for negative zero, use `x == 0.0 && x.is_sign_negative()`.
+- **NaN test.** `x.is_nan() == !x.ieee_eq(x)`. `x != x` is not a NaN test, because it is always false (*Differences from IEEE 754*).
 - **Copies keep every bit.** Copy, move, storage, and passing to or from an `@ffi` function keep every bit of a `Float` or `F32`. This law does not cover what C code does with the value.
 
 ```blink
@@ -3739,6 +3769,7 @@ fn main() {
     assert(z.to_bits() != 0.0.to_bits())     // the bits do
     let nan = Float.from_bits(9221120237041090561) // a quiet NaN, payload 1
     assert(nan == 0.0 / 0.0)                 // every NaN is == every NaN
+    assert(nan.is_nan())                     // any payload is a NaN
     assert(nan.to_bits() == 9221120237041090561) // the payload is kept
     io.println(z.to_bits().display())        // 9223372036854775808
 }
@@ -3796,6 +3827,47 @@ warning[NegativeZeroComparison]: `-0.0` compares the same as `0.0`
 - **`blink explain W0706`** shows `x == -0.0`, `x.ieee_eq(-0.0)`, `x.is_sign_negative()` and `x.to_bits() == (-0.0).to_bits()` side by side for `x = 0.0` and `x = -0.0`. It says that a `const` or `let` that holds -0.0 is not checked, and that moving `-0.0` into one does not make a sign test correct. It names `xs.contains(-0.0)` as a form the check does not see.
 
 Suppress the warning on a function with `@allow(NegativeZeroComparison)`, or set its level with `W0706 = "off"` or `W0706 = "error"` under `[lints]` (§4.16.8). A function-level `@allow` overrides `[lints]`. A module-scope `let` or `const` has no enclosing function, so only `[lints]` controls W0706 there.
+
+#### Float Self Comparison
+
+In the total order (*Float Total Ordering*), a `Float` compared with itself always gives the same result: `x == x`, `x <= x` and `x >= x` are always true, and `x != x`, `x < x` and `x > x` are always false. Code ported from C, Rust or Python often writes `x != x` as a NaN test, and in Blink that test never passes. The compiler gives the warning `FloatSelfComparison` (W0707) when the two operands of a `Float` or `F32` comparison are the same place, written the same way.
+
+- **Operators.** `==`, `!=`, `<`, `<=`, `>` and `>=`, when the operator resolves to the `Float` or `F32` impl of `Eq` or `Ord`. As for W0706, the check runs in typecheck on the resolved operator, only where the impl is concretely `Float` or `F32`.
+- **Operands.** Both operands are the same local, parameter, or field path on one of those (`x`, `p.y`, `a.b.c`), written with the same tokens. An operand with a call or an index does not match: `f() != f()` and `xs.get(i) != xs.get(i)` do not fire. The check does no flow analysis: `let y = x` then `y != x` does not fire, and it fires in a branch that never runs.
+- **Where.** It fires in test blocks and in the body of an `assert_panics` block (§2.20).
+
+```blink
+fn check(x: Float) -> Result[Float, Str] {
+    if x != x { return Err("nan") }       // warning[FloatSelfComparison]
+    if !(x >= 0.0) { return Err("negative") } // no warning, and NaN gets through
+    Ok(x)
+}
+```
+
+```
+warning[FloatSelfComparison]: `x != x` is always false for a Float
+ --> src/main.bl:2:8
+  |
+2 |     if x != x { return Err("nan") }
+  |        ^^^^^^ NaN == NaN in Blink, so this is false for every value
+  |
+  = help: to test for NaN, use `x.is_nan()`
+```
+
+- **Span and label.** The primary span is the whole comparison. The message and label depend on the operator:
+
+  | Operator | Message | Label | Help |
+  |----------|---------|-------|------|
+  | `!=` | `` `x != x` is always false for a Float `` | NaN == NaN in Blink, so this is false for every value | to test for NaN, use `x.is_nan()` |
+  | `==`, `<=`, `>=` | `` `x == x` is always true for a Float `` (with the operator as written) | NaN == NaN in Blink, so this is true for every value | to test that the value is not NaN, use `!x.is_nan()` |
+  | `<`, `>` | `` `x < x` is always false `` (with the operator as written) | this is false for every value | the comparison is always false; remove it or compare with a different value |
+
+  The `<` and `>` rows give no NaN reason, because those comparisons are also always false under IEEE 754. The help writes the operand's text in place of `x`.
+- **Suggested fix only.** For `!=`, the replacement is `x.is_nan()`. For `==`, `<=` and `>=`, it is `!x.is_nan()`. `<` and `>` have no replacement. The `help:` line and the JSON diagnostic (§8.6) carry the exact replacement text, and an editor can offer it as a code action that a person selects. The fix is not machine-applicable: it turns a branch that never runs into one that can run, so `blink fix` never applies it.
+- **`blink explain W0707`** gives the results of the six comparisons for a NaN, in Blink and under IEEE 754 (*Differences from IEEE 754*). It names `!(x >= 0.0)` as a NaN guard that the check does not see and that lets NaN through in Blink.
+- **Index operands.** Blink has no index operator today. A change that adds one must decide whether an indexed operand such as `xs[i]` matches.
+
+Suppress the warning on a function with `@allow(FloatSelfComparison)`, or set its level with `W0707 = "off"` or `W0707 = "error"` under `[lints]` (§4.16.8). A function-level `@allow` overrides `[lints]`. A module-scope `let` or `const` has no enclosing function, so only `[lints]` controls W0707 there.
 
 #### Built-in Type Trait Implementations
 
@@ -4802,7 +4874,7 @@ fn main() {
 - **Round trip.** `x.display().parse_float() == Ok(x)`, with `==` as in *Float Total Ordering*. This holds for NaN and for `-0.0` too.
 - **One text per value.** `x == y` exactly when `x.display() == y.display()`.
 
-The text does not show the sign of zero or the bits of a NaN, because no `Float` equality tells those values apart. To read them, use `x.is_sign_negative()` and `x.to_bits()` (*Float Bits*).
+The text does not show the sign of zero or the bits of a NaN, because no `Float` equality tells those values apart. To read them, use `x.is_sign_negative()` and `x.to_bits()` (*Built-in Float Methods*).
 
 **One form everywhere.** Every place that Blink, its standard library or the `blink` toolchain writes a finite `Float` as decimal text uses this form, unless this spec names a different form for that place. Such places include `display()`, `debug()`, string interpolation, power-assert values (§2.20), JSON number output (§3.6.2) and test-runner output (§8.10). `Float.display_fixed` is a named different form (*Fixed-Decimal and Zero-Padded Forms*). A form that is not decimal text, such as a bit pattern, is outside this rule. JSON writes NaN and the infinities as `null` (§3.6.2 *NaN and Infinity*), so this rule covers only its finite numbers.
 
