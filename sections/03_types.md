@@ -112,6 +112,51 @@ When a trait bound fails because `Never` has no impl of the trait (E0306), the e
 
 **Stdlib API surface: methods only.** Built-in types expose their API exclusively through trait methods — `.len()`, `.split()`, `.push()`, `.write()`, etc. No function form of a built-in method exists. There is one way to call an operation on a built-in type: method syntax. Constructors use static method syntax on the type name (`Bytes.new()`, `StringBuilder.with_capacity(1024)`, `Duration.ms(100)`). This follows Principle 2 — no decision point between `s.len()` and `str_len(s)`. (Panel vote: 4-1. See [Stdlib API Surface rationale](../decisions/stdlib-api-surface.md).)
 
+**The rule binds the standard library.** No `std` module exports a function form of a built-in method. A `std` function that a method or the compiler lowers to is not exported, so user code cannot name it. Derived code (§3.6.1, §3.6.2) calls such functions after name resolution, so no visibility rule applies to those calls.
+
+**Removed function forms.** Earlier versions of the standard library exported function forms of built-in methods. A call to one of these names gives the usual undefined-function error (E0504), with a fix that names the replacement. An import that names one of them (`import std.list.{list_map}`) gets the same error and fix at the import. The compiler keeps the table below for good. It looks in the table only when name lookup fails, so a program that declares its own `fn parse_int` still compiles and calls that function. The third column says when the replacement does not give the same result type or value. Then the fix must change more than the call.
+
+| Removed name | Replacement | Result changes |
+|---|---|---|
+| `list_map(xs, f)`, `list_filter(xs, p)`, `list_flat_map(xs, f)` | `xs.map(f)`, `xs.filter(p)`, `xs.flat_map(f)` (§3.2.2) | no |
+| `list_fold(xs, init, f)` | `xs.fold(init, f)` | no |
+| `list_any(xs, p)`, `list_all(xs, p)`, `list_find(xs, p)` | `xs.any(p)`, `xs.all(p)`, `xs.find(p)` | no |
+| `list_for_each(xs, f)` | `for x in xs { f(x) }` | no |
+| `list_enumerate(xs)`, `list_zip(a, b)`, `list_skip(xs, n)` | `xs.enumerate()`, `a.zip(b)`, `xs.skip(n)` | no |
+| `list_slice(xs, a, b)` | `xs.slice(a, b)` | no |
+| `list_sort(xs)`, `list_sort_by(xs, cmp)` | `xs.sort()`, `xs.sort_by(cmp)` | no |
+| `map_filter(m, p)`, `map_map_values(m, f)` | `m.filter(p)`, `m.map_values(f)` (§3.2.2) | no |
+| `map_fold(m, init, f)` | `m.fold(init, f)` | no |
+| `map_merge(a, b)` | `a.merge(b)` | no |
+| `map_for_each(m, f)` | `for (k, v) in m { f(k, v) }` | no |
+| `str_split(s, d)`, `str_lines(s)`, `str_replace(s, a, b)` | `s.split(d)`, `s.lines()`, `s.replace(a, b)` (§3.2.1) | no |
+| `str_trim(s)`, `str_trim_left(s)`, `str_trim_right(s)` | `s.trim()`, `s.trim_start()`, `s.trim_end()` | no |
+| `str_to_upper(s)`, `str_to_lower(s)` | `s.to_upper()`, `s.to_lower()` | no |
+| `str_join(parts, d)` | `parts.join(d)` | no |
+| `str_char_at_opt(s, i)` | `s.char_at(i)` | no |
+| `str_cp_index_of(s, n)`, `str_byte_index_of(s, n, from)` | `s.index_of(n)`, `s.byte_index_of(n, from)` | no |
+| `str_from_code_point(n)` | `Char.from_code_point(n)?`, then `"{c}"` (§3c.3) | yes: `Str` becomes `Result[Char, ConversionError]` |
+| `int_to_str(n)`, `float_to_str(x)` | `"{n}"`, `"{x}"` | no |
+| `parse_int(s)` | `s.parse_int()` (§3.2.1 *Parsing*) | yes: `Int` becomes `Result[Int, ConversionError]`, and text such as `"12x"` or `""` gives `Err` |
+| `parse_float(s)` | `s.parse_float()` | yes: `Float` becomes `Result[Float, ConversionError]`, and text such as `"1.5x"` or `""` gives `Err` |
+| `json_escape_str(s)` | `json.stringify(JsonValue.Str(s))` (§3.6.2) | yes: the result has the surrounding quotes |
+
+```
+error[UndefinedFunction]: undefined function `parse_int`
+ --> main.bl:3:15
+  |
+3 |     let n = num.parse_int(text)
+  |                 ^^^^^^^^^ not found in module `std.num`
+  |
+  = note: `parse_int` is a method on `Str`
+  = fix: text.parse_int()
+  = help: `.parse_int()` returns `Result[Int, ConversionError]`; add `?` or match on the result
+```
+
+Some names have no method twin, because a different form is the one way. A loop over a collection is a `for` loop: there is no `for_each` method on `List` or `Map`. A method-not-found error for `xs.for_each(f)` or `m.for_each(f)` gives help that shows the `for` loop. A `Str` from a codepoint goes through `Char`. A JSON string goes through the JSON encoder.
+
+(Panel vote: 6-0 on the table. See [Removed Function Forms rationale](../decisions/removed-function-forms.md).)
+
 #### §3.2.1 String Methods
 
 Strings are not bare character arrays. They are UTF-8 encoded, immutable values with a method surface designed to be complete enough that 90% of programs never need a string utility library. Methods are organized into two traits: `Sized` (generic, shared with collections) and `StrOps` (string-specific).
@@ -364,7 +409,7 @@ let word = "--a-b--".trim_by(fn(c) { "-_".contains("{c}") }) // "a-b"
 
 ##### Parsing
 
-`parse_int` and `parse_float` are methods on `Str` rather than standalone functions. They give a discoverable, grep-able API surface.
+`parse_int` and `parse_float` are methods on `Str` rather than standalone functions. They give a discoverable, grep-able API surface. No silently lossy parse function exists in the standard library: every parse of text gives `Err` on text it does not fully accept.
 
 The whole text must match one of these grammars, with nothing before or after it:
 
@@ -520,7 +565,7 @@ trait StringBuildOps {
 
 #### §3.2.2 Collection Methods
 
-`List[T]`, `Map[K, V]`, and `Set[T]` are built-in collection types with method surfaces organized across four traits: `Sized` (shared, §3.2.1), `Contains[T]` (shared), and per-type operation traits (`ListOps[T]`, `MapOps[K, V]`, `SetOps[T]`). Iterator adapters (`.map()`, `.filter()`, `.collect()`, etc.) are default methods on `Iterator` (§3c.1) and are not repeated here.
+`List[T]`, `Map[K, V]`, and `Set[T]` are built-in collection types with method surfaces organized across four traits: `Sized` (shared, §3.2.1), `Contains[T]` (shared), and per-type operation traits (`ListOps[T]`, `MapOps[K, V]`, `SetOps[T]`). The lazy adapters on `Iterator` (`.map()`, `.filter()`, `.collect()`, etc.) are default methods there (§3c.1). `ListOps` and `MapOps` have their own eager adapters, listed below.
 
 ##### Construction and Mutability
 
@@ -644,10 +689,22 @@ trait ListOps[T] {
     fn reverse(self) -> List[T]
     fn sort(self) -> List[T]
     fn sort_by(self, cmp: fn(T, T) -> Ordering ! _) -> List[T] ! _
+
+    // Eager adapters (§3c.1: collection method in, collection out)
+    fn map[U](self, f: fn(T) -> U ! _) -> List[U] ! _
+    fn filter(self, pred: fn(T) -> Bool ! _) -> List[T] ! _
+    fn flat_map[U](self, f: fn(T) -> List[U] ! _) -> List[U] ! _
+    fn fold[U](self, init: U, f: fn(U, T) -> U ! _) -> U ! _
+    fn any(self, pred: fn(T) -> Bool ! _) -> Bool ! _
+    fn all(self, pred: fn(T) -> Bool ! _) -> Bool ! _
+    fn find(self, pred: fn(T) -> Bool ! _) -> Option[T] ! _
+    fn enumerate(self) -> List[(Int, T)]
+    fn zip[U](self, other: List[U]) -> List[(T, U)]
+    fn skip(self, n: Int) -> List[T]
 }
 ```
 
-The full `List[T]` method surface (15 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`, plus `join` from `Joinable`):
+The full `List[T]` method surface (25 methods from `ListOps` + 2 from `Sized` + 1 from `Contains`, plus `join` from `Joinable`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
@@ -670,6 +727,16 @@ The full `List[T]` method surface (15 methods from `ListOps` + 2 from `Sized` + 
 | `reverse` | `fn(self) -> List[T]` | no | Reversed copy |
 | `sort` | `fn(self) -> List[T]` | no | Stable sorted copy (requires `T: Ord`) |
 | `sort_by` | `fn(self, fn(T, T) -> Ordering ! _) -> List[T] ! _` | no | Stable sorted copy by a comparator (no bound on `T`) |
+| `map` | `fn(self, fn(T) -> U ! _) -> List[U] ! _` | no | New list of `f(x)` for each element, in order |
+| `filter` | `fn(self, fn(T) -> Bool ! _) -> List[T] ! _` | no | New list of the elements for which `pred` is `true`, in order |
+| `flat_map` | `fn(self, fn(T) -> List[U] ! _) -> List[U] ! _` | no | The lists `f(x)` joined end to end, in order |
+| `fold` | `fn(self, U, fn(U, T) -> U ! _) -> U ! _` | no | `f(acc, x)` from the first element to the last, starting with `init` |
+| `any` | `fn(self, fn(T) -> Bool ! _) -> Bool ! _` | no | `true` if `pred` is `true` for one element; stops at the first; `false` on an empty list |
+| `all` | `fn(self, fn(T) -> Bool ! _) -> Bool ! _` | no | `true` if `pred` is `true` for every element; stops at the first `false`; `true` on an empty list |
+| `find` | `fn(self, fn(T) -> Bool ! _) -> Option[T] ! _` | no | First element for which `pred` is `true`; stops there |
+| `enumerate` | `fn(self) -> List[(Int, T)]` | no | Each element with its index, from 0 |
+| `zip` | `fn(self, List[U]) -> List[(T, U)]` | no | Pairs by position; the length is that of the shorter list |
+| `skip` | `fn(self, Int) -> List[T]` | no | All but the first `n` elements; `n <= 0` gives a copy, `n >= len()` gives `[]` |
 
 ```blink
 let mut items = [3, 1, 4, 1, 5]
@@ -720,9 +787,24 @@ The comparator may have effects. `sort_by` carries them through `! _`, as `map` 
 
 There is no `sorted` method: `sort` already returns a new list. A call to `.sorted()` is `UnresolvedMethod`, and its help line says so.
 
+**Eager adapters.** `map`, `filter`, `flat_map`, `fold`, `any`, `all`, `find`, `enumerate`, `zip` and `skip` walk the list when they are called and return a new value (§3c.1 *Two Iteration Worlds*). The receiver does not change. The effect row of the call is the row of `f` or `pred` (§4.15.2), and each effect occurs during the call, in element order. `any`, `all` and `find` stop at the first element that decides the result, so `pred` is not called on the elements after it.
+
+```blink
+let nums = [3, 1, 4, 1, 5]
+let doubled = nums.map(fn(n) { n * 2 })              // [6, 2, 8, 2, 10]
+let big = nums.filter(fn(n) { n > 2 })               // [3, 4, 5]
+let total = nums.fold(0, fn(acc, n) { acc + n })     // 14
+let has_four = nums.any(fn(n) { n == 4 })            // true
+let first_even = nums.find(fn(n) { n % 2 == 0 })     // Some(4)
+let pairs = ["a", "b"].zip([1, 2, 3])                // [("a", 1), ("b", 2)]
+let rest = nums.skip(2)                              // [4, 1, 5]
+```
+
+There is no `for_each` method on `List`. A `for` loop is the one way to run code for each element. A call to `xs.for_each(f)` is `UnresolvedMethod`, and its help shows `for x in xs { f(x) }`. For lazy work, cross into the iterator world with `.into_iter()` (§3c.1).
+
 **Why `.get()` returns `Option[T]`.** Out-of-bounds access is a runtime error in most languages. Returning `Option[T]` forces the caller to handle the absence case, and there are no null pointer exceptions. The general rule (§3.2.1 *Out-of-range indices*): a point read never makes up a value. It returns `Option` when its return type can say "absent", and otherwise panics. So `List.get` and `char_at` give `None` out of bounds, and `Str.byte_at`, which returns a bare `U8`, panics. A write through `set` panics on an index that is out of bounds. A range read such as `slice` clamps. Use `??` for default values: `list.get(i) ?? 0`.
 
-**Why 13 methods (vote: 3-2).** Systems and PLT argued for 8, excluding `insert`, `remove`, `index_of`, and `last` as O(n) operations better served by iterator methods. Web/Scripting, DevOps, and AI/ML argued these are bread-and-butter operations in every major language (Python `list`, JS `Array`, Java `ArrayList`), and their absence would cause every user to write the same helpers on day one. The expanded surface won on developer experience grounds — performance characteristics should be documented, not hidden.
+**Why the first 13 methods (vote: 3-2).** The ten eager adapters came later (vote 6-0; see [Removed Function Forms rationale](../decisions/removed-function-forms.md)). Systems and PLT argued for 8, excluding `insert`, `remove`, `index_of`, and `last` as O(n) operations better served by iterator methods. Web/Scripting, DevOps, and AI/ML argued these are bread-and-butter operations in every major language (Python `list`, JS `Array`, Java `ArrayList`), and their absence would cause every user to write the same helpers on day one. The expanded surface won on developer experience grounds — performance characteristics should be documented, not hidden.
 
 ##### The `MapOps` Trait
 
@@ -740,10 +822,16 @@ trait MapOps[K, V] {
     fn insert(self, key: K, value: V)
     fn remove(self, key: K) -> Option[V]
     fn clear(self)
+
+    // Eager adapters (§3c.1: collection method in, collection out)
+    fn filter(self, pred: fn(K, V) -> Bool ! _) -> Map[K, V] ! _
+    fn map_values[U](self, f: fn(K, V) -> U ! _) -> Map[K, U] ! _
+    fn fold[U](self, init: U, f: fn(U, K, V) -> U ! _) -> U ! _
+    fn merge(self, other: Map[K, V]) -> Map[K, V]
 }
 ```
 
-The full `Map[K, V]` method surface (9 methods from `MapOps` + 2 from `Sized` + 1 from `Contains`):
+The full `Map[K, V]` method surface (13 methods from `MapOps` + 2 from `Sized` + 1 from `Contains`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
@@ -759,6 +847,10 @@ The full `Map[K, V]` method surface (9 methods from `MapOps` + 2 from `Sized` + 
 | `insert` | `fn(self, K, V)` | yes | Insert or update |
 | `remove` | `fn(self, K) -> Option[V]` | yes | Remove by key |
 | `clear` | `fn(self)` | yes | Reset to empty, retains capacity |
+| `filter` | `fn(self, fn(K, V) -> Bool ! _) -> Map[K, V] ! _` | no | New map of the entries for which `pred` is `true`, in `self`'s order |
+| `map_values` | `fn(self, fn(K, V) -> U ! _) -> Map[K, U] ! _` | no | New map with the same keys, in the same order; each value is `f(k, v)` |
+| `fold` | `fn(self, U, fn(U, K, V) -> U ! _) -> U ! _` | no | `f(acc, k, v)` for each entry in iteration order, starting with `init` |
+| `merge` | `fn(self, Map[K, V]) -> Map[K, V]` | no | Shallow merge into a new map: on a key in both maps, the argument's value wins. Order: `self`'s keys, then the new keys of the argument (*Hash Contract and Seeding*) |
 
 ```blink
 let mut config = Map.new()
@@ -776,7 +868,25 @@ let es = config.entries()                  // [("host", "localhost"), ("port", "
 
 let removed = config.remove("port")        // Some("8080")
 config.clear()                             // config is now empty, capacity retained
+
+let mut ages = Map.new()
+ages.insert("ann", 31)
+ages.insert("bo", 17)
+ages.insert("cy", 45)
+let adults = ages.filter(fn(k, v) { v >= 18 })            // {"ann": 31, "cy": 45}
+let labels = ages.map_values(fn(k, v) { "{k}:{v}" })      // {"ann": "ann:31", "bo": "bo:17", "cy": "cy:45"}
+let sum = ages.fold(0, fn(acc, k, v) { acc + v })         // 93
+let mut base = Map.new()
+base.insert("host", "localhost")
+base.insert("port", "80")
+let mut overrides = Map.new()
+overrides.insert("port", "8080")
+overrides.insert("tls", "on")
+let merged = base.merge(overrides)
+// host: "localhost", port: "8080", tls: "on" (base's keys first; overrides wins on port)
 ```
+
+**Map adapters.** `filter`, `map_values`, `fold` and `merge` walk the map when they are called, in iteration order, and return a new value. The receiver does not change. The effect row of the call is the row of `f` or `pred` (§4.15.2), and each effect occurs during the call. `merge` is shallow: a value that is itself a `Map` is replaced, not merged. The merge is not symmetric. In `a.merge(b)`, `b`'s value wins for a key in both maps, and that key keeps its position from `a`. There is no `for_each` method on `Map`: use `for (k, v) in m { }`, as for `List`.
 
 **Why `contains_key` when `Contains` exists.** `Contains[K]` on `Map[K, V]` checks key presence — identical to `contains_key`. Both exist because `contains` comes from the generic `Contains` trait (for generic code) and `contains_key` lives in `MapOps` (for map-specific code that reads more clearly). They have identical semantics.
 
@@ -831,8 +941,8 @@ These are the **built-in method-surface traits** — the traits that host the me
 | `Contains[T]` | Set, List, Map | `contains` (element/key membership) | Yes |
 | `StrOps` | Str | string methods (`char_at`, `byte_at`, `contains`, `split`, `to_upper`, `trim`, `replace`, …) | Yes |
 | `BytesOps` | Bytes | byte methods (`push`, `get`, `slice`, `to_str`, `to_hex`, `read_u32_be`, …) | Yes |
-| `ListOps[T]` | List | 15 methods | Yes |
-| `MapOps[K, V]` | Map | 9 methods | Yes |
+| `ListOps[T]` | List | 25 methods | Yes |
+| `MapOps[K, V]` | Map | 13 methods | Yes |
 | `SetOps[T]` | Set | 3 methods | Yes |
 | `IntoIterator[T]` | List, Map, Set, Str, Range, Channel | `into_iter` | Yes (§3c.1) |
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |
@@ -854,7 +964,7 @@ A sealed trait may still be named in a generic bound — e.g. `fn f[T: Sized](x:
 - Its row says Mutates = no.
 - It returns the receiver's own type: `List[T]` on a `List`, `Map[K, V]` on a `Map`, `Set[T]` on a `Set`.
 
-These are `append`, `slice`, `reverse`, `sort` and `sort_by` on `List`, and `union` on `Set`. No `Map` method qualifies. A mutating method such as `push`, `pop`, `insert`, `remove` or `clear` never draws W0606: it does its work on the receiver, so a statement that drops its result is correct code.
+These are `append`, `slice`, `reverse`, `sort`, `sort_by`, `filter` and `skip` on `List`, `filter` and `merge` on `Map`, and `union` on `Set`. A mutating method such as `push`, `pop`, `insert`, `remove` or `clear` never draws W0606: it does its work on the receiver, so a statement that drops its result is correct code.
 
 ```blink
 let mut xs = [1, 2]
@@ -3201,6 +3311,8 @@ A `Map` or `Set` made from other values is built by inserts in this order:
 
 - `clone()` keeps the order.
 - `a.union(b)` gives the elements of `a` in `a`'s order, then the elements of `b` that are not in `a`, in `b`'s order.
+- `a.merge(b)` on a `Map` gives the keys of `a` in `a`'s order, then the keys of `b` that are not in `a`, in `b`'s order. A key in both takes `b`'s value.
+- `filter` and `map_values` on a `Map` keep the receiver's order.
 - `collect()`, and any build from a list, inserts in the order of the input. For a duplicate key, the key keeps its first position and takes the last value.
 - A std deserializer inserts in document order, but keeps the first entry for a duplicate key (§3.6.2 *Map and Set Order*).
 

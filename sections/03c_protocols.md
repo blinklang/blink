@@ -17,6 +17,8 @@ The one rule that governs both worlds:
 
 `.into_iter()` crosses from a collection into the lazy world; `.collect()` crosses back. There is no implicit conversion in either direction (§3c.2 — Blink has no implicit conversions), so the boundary is always visible in source.
 
+**When an adapter's effect occurs.** An eager collection adapter takes `f: fn(...) -> ... ! _` (§3.2.2, §4.15.2). The effect row of the call is the row of `f`, and each effect of `f` occurs during the call. A lazy adapter defers its work, so the effect of `f` in `it.map(f)` belongs to the consuming call (`collect`, `fold`, a `for` loop) that runs `f`, not to the `.map` call. In v1 a lazy adapter closure is pure (*Effectful Iteration: Deferred to v2*), so this rule fixes the timing for the reserved effect row.
+
 ```blink
 let names = ["Alice", "Bob", "Carol"]
 
@@ -198,7 +200,7 @@ Only `IntoIterator` is the extension point that opens. `Iterator[T]` itself — 
 
 The v1 iterator is **pure** — an adapter closure that performs effects is a v1 error, and `Iterator[T]` carries exactly one user-visible type parameter, now and permanently. This means `for line in file.lines() ! IO` is not expressible through the iterator protocol in v1.
 
-The effect row is **reserved** rather than surfaced: it never appears in v1 surface syntax or diagnostics. Because `Iterator[T]` stays a one-parameter type, v2 can widen the family to effectful iteration as a **conservative extension** — every v1 program keeps its exact typing — instead of a breaking change that would rewrite the effect signature of every function that touches an iterator. (The PLT panelist argued for threading a live effect-row variable through the v1 checker immediately; the panel reserved the design without building the checker plumbing yet.)
+The reserved design fixes one point now: when effectful lazy adapters exist, an effect of an adapter closure occurs at the consuming call, not at the adapter call (*When an adapter's effect occurs*, above). The effect row is **reserved** rather than surfaced: it never appears in v1 surface syntax or diagnostics. Because `Iterator[T]` stays a one-parameter type, v2 can widen the family to effectful iteration as a **conservative extension** — every v1 program keeps its exact typing — instead of a breaking change that would rewrite the effect signature of every function that touches an iterator. (The PLT panelist argued for threading a live effect-row variable through the v1 checker immediately; the panel reserved the design without building the checker plumbing yet.)
 
 **Workaround for v1:** Use explicit loops with effect-performing calls:
 
