@@ -2898,23 +2898,63 @@ Annotations use the `@` prefix and are compiler-checked. They are not comments, 
 
 ### 11.1 Complete Annotation Reference
 
-| Annotation | Target | Purpose | Checked by |
-|------------|--------|---------|------------|
-| `@src(kind: "ID")` | fn, type, module | Provenance link to requirement, design doc, issue, or compliance mandate. | `blink trace` tooling |
-| `@requires(expr)` | fn, trait method | Precondition. Must hold when the function is called. | SMT solver (compile-time) or runtime assertion |
-| `@ensures(expr)` | fn, trait method | Postcondition. Must hold when the function returns. `result` refers to the return value. | SMT solver (compile-time) or runtime assertion |
-| `@where(expr)` | fn, type | Type-level constraint on generics or refinements. | Compile-time type checker |
-| `@invariant(expr)` | type | Invariant that must hold for all instances of this type at all times. | Static check and runtime checks on construction and mutation |
-| `@perf(constraint)` | fn | Performance contract. Benchmark assertion, not statically provable. | `blink bench --check-contracts` |
-| `@capabilities(list)` | module | Hard ceiling on effects permitted in this module. | Compile-time effect checker |
-| `@ffi("lib", "sym")` | fn | Declares a foreign function binding. | Linker (compile-time) |
-| `@trusted(audit: "ID")` | fn | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `ID` must name a record in `audits.toml`. Never makes an `@ffi` fn `pub` (E0801). | Compile-time record check (`AuditRecordNotFound`); `blink audit` tooling |
-| `@alt("ID", "desc")` | fn | Marks an alternative implementation. | Tooling (`blink alt list`, `blink alt select`) |
-| `@verify(fallback: "runtime" \| "error" \| "trust")` | fn, trait method | Sets what happens when the solver cannot prove or disprove a contract: a runtime check (the default), compile error V0003, or no check. A trait method takes `"runtime"` or `"error"` only (E0913). See §3b.4. | Static checker |
-| `@handle_all` | effect | Every handler of this effect should implement each primitive operation. Covers the sub-effects; on a nested sub-effect, covers only that sub-effect. A handler that omits one gets the warning `PartialHandler` (W0545). The stdlib marks `Rand`, `Time` and `IO.Read`. See §4.7.1. | Compile-time warning |
-| `@derive(Trait, ...)` | type | Auto-generate trait implementations. Compiler-known traits only in v1: `Eq`, `Ord`, `Hash`, `Debug`, `Clone`, `Display`, `Serialize`, `Deserialize`. | Compile-time derivation |
-| `@allow(WarningName, ...)` | fn | Suppress specific compiler warnings within the annotated function. Takes PascalCase warning names (e.g., `UnrestoredMutation`, `IncompleteStateRestore`). Function-level override of `blink.toml` `[lints]` config. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842). A live name that is not a warning name, such as an error name, is `NotAWarningName` (E0847). See §4.16.8. | Compiler diagnostic filter |
-| `@deprecated(since, removal, replacement, fix)` | fn, type | Edition-aware deprecation with structured migration. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). Emits W2000 when current edition < `removal`, E2001 when current edition >= `removal`. Machine-applicable fixes in structured diagnostics when `fix` is `"replace"` or `"inline"`. See §8.16.2. | Compiler warning/error (edition-gated) |
+This table is the one normative list of annotations. Every other list of annotations, in this spec, in the `blink llms` docs or in the toolchain, refers to this table or is generated from it. The set is closed: there are no user-defined annotations. To add, remove or change a row needs a panel vote and an edit to this table in the same change.
+
+The rows are in canonical order (see *Canonical Ordering* below).
+
+| Annotation | Target | Repeats | Meaning | Status |
+|------------|--------|---------|---------|--------|
+| `@module("name")` | first declaration of a file | no | Sets the module name to the parent package name. See §10.1. | checked |
+| `@capabilities(list)` | module | no | Hard ceiling on the effects this module may perform. See §10.3. | checked |
+| `@derive(Trait, ...)` | type | no | Generates trait implementations. Seven compiler-known traits only: `Eq`, `Ord`, `Hash`, `Clone`, `Debug`, `Serialize`, `Deserialize`. Each derived implementation obeys the laws in §3.6.1 *Derive Laws*. Any other argument, `Display` included, is `NotDerivable` (E1402). | checked |
+| `@handle_all` | effect | no | Every handler of this effect should implement each primitive operation. Covers the sub-effects; on a nested sub-effect, covers only that sub-effect. A handler that omits one gets the warning `PartialHandler` (W0545). The stdlib marks `Rand`, `Time` and `IO.Read`. See §4.7.1. | checked |
+| `@src(kind: "ID")` | fn, type, module | yes: the links add up | Provenance link to a requirement, design doc, issue or compliance mandate. See §11.3. | tool-checked (`blink trace`) |
+| `@requires(expr)` | fn, trait method | yes: all must hold | Precondition. Must hold when the function is called. See §3b. | checked |
+| `@ensures(expr)` | fn, trait method | yes: all must hold | Postcondition. Must hold when the function returns. `result` refers to the return value. See §3b. | checked |
+| `@where(expr)` | fn, type | no | Constraint on generics, or a refinement. | checked |
+| `@invariant(expr)` | type | yes: all must hold | Must hold for every value of this type at all times. Checked statically, and at run time on construction and mutation. See §3b.2. | checked |
+| `@pure` | fn | no | The function's effective row is empty. A function whose row is not empty is `ImpureBodyForPureAnnotation` (E1307). See §3b.2, §4.16.3. | checked |
+| `@perf(constraint)` | fn | yes: all must hold | Performance contract. A benchmark assertion, not statically provable. See §11.2. | tool-checked (`blink bench --check-contracts`) |
+| `@ffi("lib", "sym")` | fn | no | Declares a foreign function binding. See §9.1. | checked |
+| `@ffi.struct(header, name)` | type | no | The type mirrors the named C struct from the named header. See §9.1.3. | checked |
+| `@ffi.opaque(header, name)` | type | no | The type is an opaque handle to the named C type. See §9.1.4. | checked |
+| `@trusted(audit: "ID")` | fn | no | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `audit:` is required, and `ID` must name a record in `audits.toml` (`AuditRecordNotFound`). Never makes an `@ffi` fn `pub` (E0801). | checked |
+| `@alt("ID", "desc")` | fn | no | Marks an alternative implementation. See §8.7. | tool-checked (`blink alt`) |
+| `@verify(fallback: "runtime" \| "error" \| "trust")` | fn, trait method | no | What happens when the solver cannot prove or disprove a contract: a runtime check (the default), compile error V0003, or no check. A trait method takes `"runtime"` or `"error"` only (E0913). See §3b.4. | checked |
+| `@tags("tag", ...)` | test block | no | String tags for test filtering. See §2.20. | checked |
+| `@skip` or `@skip("reason")` | test block | no | Static, unconditional skip: the compiler type-checks the body and the runner does not run it. For a skip that depends on run-time state, call `skip()` in the body instead. See §2.20 *Skipping Tests*. | checked |
+| `@allow(WarningName, ...)` | fn, type | yes: the names add up | Suppresses the named warnings inside the annotated function, or inside the type declaration and its body. It does not reach an `impl` block declared apart from the type. Overrides `blink.toml` `[lints]` for that scope. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842); a live name that is not a warning name is `NotAWarningName` (E0847). See §4.16.8. | checked |
+| `@deprecated(since, removal, replacement, fix)` | fn, type, trait method | no | Deprecates **use**: a call, or a reference to the type. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). W2000 when the current edition is before `removal`, E2001 from `removal` on. A `fix` of `"replace"` or `"inline"` gives a machine-applicable fix. On a trait method it deprecates calls, not overrides; for overrides see `@deprecate_override`. See §8.16.2. | checked |
+| `@deprecate_override` | trait method with a default body | no | Deprecates **overriding** the default: an impl that overrides it gets `OverrideOfDeprecatedDefault` (W0731) at the override. Calls are not affected. It is the first step of the move to `final` (§3.6 *The `final` Modifier*). A method may carry both `@deprecated` and `@deprecate_override`. | checked |
+
+#### Status
+
+The Status column says what checks a row:
+
+- **checked**: the compiler checks the annotation.
+- **tool-checked**: the compiler checks the target and the argument shape; the named tool checks the claim.
+
+**A row works only when its checker exists.** Each annotation is a claim. A toolchain that does not check a row's claim, in the compiler for a checked row or in the named tool for a tool-checked row, rejects the annotation with `AnnotationNotSupported`. The same holds for one form of a row, such as `@verify(fallback: "error")`. The message names the annotation and the missing checker, and says that the spec allows the form. The toolchain never accepts an annotation that nothing checks.
+
+```
+error[AnnotationNotSupported]: `@perf` is not supported by this toolchain
+  --> src/batch.bl:3:1
+   |
+ 3 | @perf(p99 < 200ms)
+   | ^^^^^^^^^^^^^^^^^^ `@perf` is checked by `blink bench --check-contracts`, which this toolchain does not have
+   |
+   = note: the annotation is valid Blink; this toolchain cannot check it yet
+```
+
+#### Rules for Every Annotation
+
+1. **Unknown names.** A name that is not in the table is `UnknownAnnotation`. The diagnostic gives the nearest name in the table. For some names it gives a fixed hint instead:
+   - `@modifies` names the `State` effect (§4.16.1), which tracks writes to module-level state.
+   - Common names from other languages, such as `@inline`, `@override` and `@test`, name the Blink form, if there is one.
+
+   `@effects` keeps its own diagnostic, `EffectsAnnotationRemoved` (§9.1).
+2. **Targets.** An annotation on a target that its row does not list is `UnexpectedAnnotation` (E1110).
+3. **Repeats.** A name may occur only once on one declaration, unless its row says it repeats. A second occurrence is `DuplicateAnnotation`. The Repeats column says how repeated occurrences combine.
 
 #### Canonical Ordering
 
@@ -2935,9 +2975,9 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 }
 ```
 
-The ordering: `@module` > `@capabilities` > `@derive` > `@handle_all` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@perf` > `@ffi` > `@trusted` > `@alt` > `@verify` > `@allow` > `@deprecated`.
+The order is the row order of the table in §11.1: `@module` > `@capabilities` > `@derive` > `@handle_all` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@pure` > `@perf` > `@ffi` > `@ffi.struct` > `@ffi.opaque` > `@trusted` > `@alt` > `@verify` > `@tags` > `@skip` > `@allow` > `@deprecated` > `@deprecate_override`.
 
-Rationale: metadata about the container (module, capabilities) comes first. Then provenance (why does this exist?). Then contracts (what must be true?). Then operational concerns (performance, FFI). Then lifecycle (alternatives, deprecation).
+Rationale: metadata about the container (module, capabilities) comes first. Then provenance (why does this exist?). Then contracts (what must be true?). Then operational concerns (performance, FFI). Then test metadata. Then lifecycle (alternatives, deprecation).
 
 ### 11.2 Performance Contracts (`@perf`)
 

@@ -1990,7 +1990,7 @@ let bad = Status.from_str("Done")      // None: the match is case-sensitive
 
 **`from_str` returns `Option` on purpose.** This is the same choice as `Enum.from_int(n) -> Option[Enum]` above: an arbitrary `Str` may not name a variant, and there is only one way to fail, so there is nothing for an error value to say. It is not a `Result` in the way of Rust's `FromStr`.
 
-**Display.** A Str-backed enum has no `Display` unless it declares one. With `@derive(Display)`, its output equals `to_str()`: `"{Status.InProgress}"` is `in_progress`, not `InProgress` (§3.6.1 *Sum Type Codegen*).
+**Display.** A Str-backed enum has no `Display` unless it implements one; `Display` is not derivable (§3.6.1). An `impl Display` can write `self.to_str()`, so that `"{Status.InProgress}"` is `in_progress`.
 
 **JSON.** With `@derive(Serialize)`, a Str-backed enum serializes as a JSON string of its backing literal, not as a tagged object (§3.6.2 *Type Mapping*).
 
@@ -4387,13 +4387,13 @@ The compiler uses `Closeable` to power the ScopedValueWithoutWith lint (warn whe
 
 #### §3.6.1 Derive Mechanics
 
-The `@derive` annotation (§11.1) instructs the compiler to auto-generate trait implementations. Eight traits are derivable in v1: `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Serialize`, `Deserialize`.
+The `@derive` annotation (§11.1) instructs the compiler to auto-generate trait implementations. Seven traits are derivable in v1: `Eq`, `Ord`, `Hash`, `Clone`, `Debug`, `Serialize`, `Deserialize`. `Display` is not derivable: a type's user-facing text is a design choice, not a function of its structure. Write an `impl Display`, or use `Debug` for the structural form. `@derive(Display)` is E1402 `NotDerivable`.
 
-The argument of `@derive` is a name that the user writes, so it resolves by scope. When it does not denote one of these eight compiler-known traits by identity, the compiler reports E1402 `NotDerivable`. In a module that shadows `Eq`, `@derive(Eq)` names the local trait and is E1402. `import blink.core.{Eq as CoreEq}` and `@derive(CoreEq)` derive the compiler-known trait (§10.6 *Shadowing a Prelude Trait*).
+The argument of `@derive` is a name that the user writes, so it resolves by scope. When it does not denote one of these seven compiler-known traits by identity, the compiler reports E1402 `NotDerivable`. In a module that shadows `Eq`, `@derive(Eq)` names the local trait and is E1402. `import blink.core.{Eq as CoreEq}` and `@derive(CoreEq)` derive the compiler-known trait (§10.6 *Shadowing a Prelude Trait*).
 
 ##### Derivable Trait Declarations
 
-For reference, the eight derivable traits and their required methods:
+For reference, the seven derivable traits and their required methods:
 
 | Trait | Method | Supertrait |
 |-------|--------|------------|
@@ -4401,7 +4401,6 @@ For reference, the eight derivable traits and their required methods:
 | `Ord` | `fn cmp(self, other: Self) -> Ordering` | `Eq` |
 | `Hash` | `fn hash(self) -> U64` | `Eq` |
 | `Clone` | `fn clone(self) -> Self` | — |
-| `Display` | `fn fmt(self, mut sb: StringBuilder)` (the trait supplies `final fn display(self) -> Str`; see *Display Trait Shape*) | — |
 | `Debug` | `fn debug(self) -> Str` | — |
 | `Serialize` | `fn to_json(self) -> JsonValue` | — |
 | `Deserialize` | `fn from_json(json: JsonValue) -> Result[Self, JsonError]` | — |
@@ -4579,7 +4578,6 @@ trait Display {
 **`fmt` (push, required).** Pushes the rendered representation into a caller-provided `StringBuilder`. Recursive impls call `child.fmt(sb)` into the *same* builder, giving O(n) composition:
 
 ```blink
-@derive(Display)
 type Point { x: Int, y: Int }
 
 impl Display for Point {
@@ -4650,11 +4648,11 @@ error[E0523]: type `Matrix` does not implement `Display`
 12 |     let s = "result: {matrix}"
    |                       ^^^^^^ `Matrix` does not implement `Display`
    |
-   = help: add `@derive(Display)` or implement `Display` manually
+   = help: implement `Display` for `Matrix` with an `impl Display for Matrix` block
    = note: use `matrix.debug()` for structural representation
 ```
 
-Built-in types (`Int`, `Float`, `Bool`, `Str`, `Char`) have compiler-provided `Display` implementations. User types require `@derive(Display)` or a manual `impl Display for T` block. There is no fallback to `Debug` and no auto-synthesis — the trait bound is checked like any other.
+Built-in types (`Int`, `Float`, `Bool`, `Str`, `Char`) have compiler-provided `Display` implementations. User types require an `impl Display for T` block; `Display` is not derivable (§3.6.1). There is no fallback to `Debug` and no auto-synthesis — the trait bound is checked like any other.
 
 **Built-in `Display` impls.** The five impls for `Str`, `Int`, `Float`, `Bool` and `Char` are built in, and the list is closed: every other `Display` impl, including every derived one, writes through `sb.write`, `sb.write_char` or a child's `fmt`. `Str.fmt` appends the receiver's bytes to the builder. `Str.display()` returns a `Str` equal to the receiver.
 
@@ -4704,7 +4702,7 @@ error[E0523]: type `Matrix` does not implement `Display`
 14 |     sb.write(matrix)
    |              ^^^^^^ `Matrix` does not implement `Display`, which `StringBuilder.write` requires
    |
-   = help: add `@derive(Display)` or implement `Display` manually
+   = help: implement `Display` for `Matrix` with an `impl Display for Matrix` block
    = note: use `matrix.debug()` for structural representation
 ```
 
@@ -4723,14 +4721,23 @@ let msg = "hello {name}, you are {age} years old"
 ```
 
 ```blink
-@derive(Display)
 type Point { x: Float, y: Float }
+
+impl Display for Point {
+    fn fmt(self, mut sb: StringBuilder) {
+        sb.write("(")
+        sb.write(self.x)
+        sb.write(", ")
+        sb.write(self.y)
+        sb.write(")")
+    }
+}
 
 let p = Point { x: 1.0, y: 2.5 }
 let msg = "at {p}"
 
-// Type check: Point: Display ✓ (via @derive)
-// msg is "at Point { x: 1.0, y: 2.5 }"
+// Type check: Point: Display ✓ (via impl)
+// msg is "at (1.0, 2.5)"
 ```
 
 **Template literals: Display not invoked.** In a template literal `t"..."` (§2.4.3, §3b.5), interpolation has different semantics — `{expr}` is decomposed into the `values` list as a typed value, not concatenated via Display. Display is **not** invoked in a template literal:
@@ -4885,7 +4892,6 @@ Per-trait product type rules:
 | `Ord` | Lexicographic: compare `f1`, if `Equal` compare `f2`, ... |
 | `Hash` | Hash of all fields; equal values give equal hashes |
 | `Clone` | `Type { f1: self.f1, f2: self.f2, ... }`: the same value as a copy on bind (§3.6.1 *Clone Semantics*) |
-| `Display` | `fmt`: `sb.write(self.f1); sb.write(", "); sb.write(self.f2); ...` (comma-separated, push-style) |
 | `Debug` | `"TypeName { f1: {f1.debug()}, f2: {f2.debug()}, ... }"` |
 
 ##### Sum Type Codegen (Enums)
@@ -4933,7 +4939,6 @@ Per-trait sum type rules:
 | `Ord` | Compare variant index first; if same variant, field-wise lexicographic comparison |
 | `Hash` | Hash of the variant and the fields of data-carrying variants; equal values give equal hashes |
 | `Clone` | The same value as a copy on bind (§3.6.1 *Clone Semantics*) |
-| `Display` | Variant name for unit variants; `"Variant(f1, f2)"` for data-carrying. Exception: a Str-backed enum writes its backing literal, so the output equals `to_str()` (§3.4 *Str-Backed Enums*) |
 | `Debug` | `"Variant"` for unit variants; `"Variant({f1.debug()}, {f2.debug()})"` for data-carrying |
 
 ##### Container Debug Rendering
@@ -5069,10 +5074,20 @@ For `@derive(Eq)`, a container or tuple field is checked by the rule in *Contain
 
 Some traits have supertraits: `Ord` requires `Eq`, `Hash` requires `Eq`. When deriving a trait with a supertrait requirement:
 
-1. If the supertrait is already implemented (explicit `impl` or prior `@derive`), use the existing implementation
-2. If not, the compiler auto-derives the supertrait
+1. If the supertrait is derived (in the same or an earlier `@derive`), use that derived implementation
+2. If the supertrait is not implemented, the compiler auto-derives it
+3. If the type has a hand-written `impl Eq`, deriving `Ord` or `Hash` is an error, `DeriveOverHandWrittenEq`
 
-This means `@derive(Ord)` implicitly derives `Eq` if not already present. The supertrait is the compiler-known `Eq` by identity, also in a module that shadows `Eq` (§10.6 *Shadowing a Prelude Trait*). Redundant listing like `@derive(Eq, Ord)` is allowed — no error, no warning. The `Eq` derivation happens once regardless.
+This means `@derive(Ord)` implicitly derives `Eq` if not already present. Rule 3 exists because a hand-written `Eq` is usually coarser than the structure, so a structural `Hash` or `Ord` would break the laws in *Derive Laws* below, and a `Map` or `Set` keyed on the type would give wrong results with no error. The diagnostic gives two fixes: derive `Eq` in place of the hand-written impl, or write `Hash` (or `Ord`) by hand so that it agrees with the hand-written `Eq`. The supertrait is the compiler-known `Eq` by identity, also in a module that shadows `Eq` (§10.6 *Shadowing a Prelude Trait*). Redundant listing like `@derive(Eq, Ord)` is allowed — no error, no warning. The `Eq` derivation happens once regardless.
+
+##### Derive Laws
+
+A derived implementation satisfies these laws. A hand-written implementation of the same traits must satisfy them too; the compiler does not check a hand-written one.
+
+- **`Eq`**: `==` is reflexive, symmetric and transitive.
+- **`Hash` agrees with `Eq`**: if `a == b`, then `a.hash() == b.hash()`.
+- **`Ord` is total and agrees with `Eq`**: for each `a` and `b`, exactly one of `a < b`, `a == b` and `a > b` holds, and `a.cmp(b)` is `Equal` exactly when `a == b`.
+- **`Serialize` and `Deserialize` round-trip**: for a value `x` of type `T` that holds no NaN or infinite `Float`, `T.from_json(x.to_json())` is `Ok` of a value equal to `x`. A non-finite `Float` does not survive the round trip (§3.6.2 *NaN and Infinity*).
 
 ##### Error Reporting
 

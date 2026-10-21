@@ -947,7 +947,7 @@ The warning does **not** fire on an ordinary interpolated string, because an ord
 
 `RawBypassesParam` is an **audit-gated** diagnostic: `@trusted(audit: K)` is its only suppression channel, and naming it in `@allow` or in `[lints]` is refused. The mechanism is stated once, for every diagnostic that uses it, in §9.1 *Audit-Gated Diagnostics*.
 
-**A `Raw[Str]` in a position that does not consume it is an error.** Because `Raw[Str]` has no `Display`, a misplaced `Raw()` would otherwise fall through to `MissingDisplayImpl` (E0523), whose prescribed repairs — derive `Display`, write an `impl`, call `.debug()` — are all impossible on a compiler-known marker type. It gets its own diagnostic instead, whose first repair compiles:
+**A `Raw[Str]` in a position that does not consume it is an error.** Because `Raw[Str]` has no `Display`, a misplaced `Raw()` would otherwise fall through to `MissingDisplayImpl` (E0523), whose prescribed repairs — write an `impl`, call `.debug()` — are both impossible on a compiler-known marker type. It gets its own diagnostic instead, whose first repair compiles:
 
 ```blink
 // intentional-error example

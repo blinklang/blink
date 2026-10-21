@@ -1515,13 +1515,15 @@ let interleaved = [..heads, separator, ..tails]
 
 Annotations use the `@` prefix and are **compiler-checked** — they are not comments, not decorators, not optional metadata. They participate in type checking, verification, and optimization.
 
-| Annotation | Purpose | Checked |
-|------------|---------|---------|
-| `@requires(expr)` | Precondition. Must hold when function is called. | Compile-time (SMT) or runtime assertion |
-| `@ensures(expr)` | Postcondition. Must hold when function returns. | Compile-time (SMT) or runtime assertion |
-| `@where(expr)` | Type-level constraint on generics or refinements. | Compile-time |
-| `@perf(constraint)` | Performance contract. Checked by `blink bench`. | Benchmark runner in CI |
-| `@capabilities(list)` | Required runtime capabilities (permissions). | Compile-time capability checking |
+The complete, normative list of annotations is the table in §11.1. A name not in that table is an error (`UnknownAnnotation`). This section introduces the most common ones:
+
+| Annotation | Purpose |
+|------------|---------|
+| `@requires(expr)` | Precondition. Must hold when function is called. |
+| `@ensures(expr)` | Postcondition. Must hold when function returns. |
+| `@where(expr)` | Type-level constraint on generics or refinements. |
+| `@perf(constraint)` | Performance contract. Checked by `blink bench`. |
+| `@capabilities(list)` | Required runtime capabilities (permissions). |
 
 #### `@requires` and `@ensures` — Contracts
 
@@ -1589,7 +1591,7 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 }
 ```
 
-The canonical ordering enforced by `blink fmt` is: `@capabilities` first (permissions), then `@requires`/`@ensures` (contracts), then `@where` (type constraints), then `@perf` (performance). See section 11.1 for the complete ordering across all 13 annotation types.
+The canonical ordering enforced by `blink fmt` is: `@capabilities` first (permissions), then `@requires`/`@ensures` (contracts), then `@where` (type constraints), then `@perf` (performance). See §11.1 for the complete ordering across all annotations.
 
 ### 2.18 Scoped Resources (`with...as`)
 
