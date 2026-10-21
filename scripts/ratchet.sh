@@ -83,6 +83,22 @@
 #                            counts codepoints and those methods take byte
 #                            offsets, so the bound is byte_len. Only a call on
 #                            one line is seen, so the count is a lower bound
+#   primitive_type_names_outside_spec
+#                            a name `is_primitive_type` in src/typecheck.bl
+#                            answers `=> 1` for that the table under "Compiler-Known
+#                            Type Names (closed set)" in sections/07 does not
+#                            list; absolute zero gate. The table is closed, so a
+#                            name the compiler accepts and the spec lacks is a
+#                            built-in the spec never allowed. One direction only:
+#                            the spec may list a name the compiler lacks yet,
+#                            because the spec leads the compiler. Fn and Tuple
+#                            are exempt: `fn(A) -> B` and `(A, B)` reach the
+#                            checker as annotations spelled so, and stay on the
+#                            list until every reader tells them apart by their
+#                            marker. A parse that finds no table, or no Int in
+#                            the checker's list, counts as 1, so a changed layout
+#                            cannot read as a clean 0, and so does a missing
+#                            spec file. A root with no typecheck.bl counts 0
 #
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
 # lint over the rewrite's files, and fails if that fails. RATCHET_NO_LINT=1
@@ -215,6 +231,60 @@ len_in_byte_args() {
     rg -o '\.len\(\)' | wc -l | tr -d ' '
 }
 
+SPEC_TYPES=sections/07_trust_modules_metadata.md
+
+# First-column names of the closed table, one per line, without backticks or `[...]`.
+spec_type_names() {
+  awk '
+    /^#### Compiler-Known Type Names \(closed set\)/ { on = 1; next }
+    /^#### Shadowing Rules/ { on = 0 }
+    on && /^\| `/ {
+      split($0, col, "|")
+      n = split(col[2], part, "`")
+      for (i = 2; i <= n; i += 2) { s = part[i]; sub(/\[.*/, "", s); print s }
+    }' "$1"
+}
+
+# Names is_primitive_type answers `=> 1` for, one per line.
+primitive_type_arms() {
+  awk '
+    /^fn is_primitive_type\(/ { on = 1; next }
+    on && /^}/ { on = 0 }
+    on {
+      t = $0; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+      if (t ~ /^"/ && t ~ /=> 1$/) { split(t, q, "\""); print q[2] }
+    }' "$1"
+}
+
+primitive_names_outside_spec() {
+  tc="$1/src/typecheck.bl"
+  spec="$1/$SPEC_TYPES"
+  [ -f "$tc" ] || { echo 0; return; }
+  [ -f "$spec" ] || {
+    echo "ratchet: $SPEC_TYPES is missing; the type-name row cannot check src/typecheck.bl" >&2
+    echo 1; return
+  }
+  table=$(spec_type_names "$spec")
+  arms=$(primitive_type_arms "$tc")
+  for need in Int Self Handler Buf; do
+    printf '%s\n' "$table" | grep -qx "$need" || {
+      echo "ratchet: the spec type table in $SPEC_TYPES has no \`$need\`; the parse found no table" >&2
+      echo 1; return
+    }
+  done
+  printf '%s\n' "$arms" | grep -qx Int || {
+    echo "ratchet: is_primitive_type in src/typecheck.bl yielded no \`Int\`; the parse found no arms" >&2
+    echo 1; return
+  }
+  printf '%s\n' "$arms" | while IFS= read -r a; do
+    case "$a" in Fn|Tuple) continue ;; esac
+    printf '%s\n' "$table" | grep -qx -- "$a" || {
+      echo "ratchet: is_primitive_type answers for \`$a\`, which the spec type table does not list" >&2
+      echo x
+    }
+  done | wc -l | tr -d ' '
+}
+
 # Takes a root dir instead of reading the repo directly, so the same row
 # definitions run against the real tree, a materialized historical ref, or a
 # synthetic test fixture without duplicating the row list three times.
@@ -237,20 +307,21 @@ typecheck_str_keyed_tables $(cnt '^(pub )?let mut [A-Za-z_][A-Za-z_0-9]*: Map\[S
 node_pool_writes $(pool_writes "$root")
 str_substring_callers $(( $(cnt '\.(substring|substr)\(' "$allbl") + $(lib_substr "$root") ))
 str_len_in_byte_args $(len_in_byte_args "$root")
+primitive_type_names_outside_spec $(primitive_names_outside_spec "$root")
 ROWS
 }
 
-# Writes a plain copy of every tracked .bl file plus Taskfile.yml, as they
-# stood at $1, into $2. A file that does not exist at $1 is simply absent,
+# Writes a plain copy of every tracked .bl file, Taskfile.yml and the spec file
+# the type-name row reads, as they stood at $1, into $2. A file that does not exist at $1 is simply absent,
 # which compute_rows treats as a zero contribution.
 materialize_ref() {
   ref="$1"
   outdir="$2"
   rm -rf "$outdir"
   mkdir -p "$outdir"
-  git ls-tree -r --name-only "$ref" -- src Taskfile.yml 2>/dev/null | while IFS= read -r path; do
+  git ls-tree -r --name-only "$ref" -- src Taskfile.yml "$SPEC_TYPES" 2>/dev/null | while IFS= read -r path; do
     case "$path" in
-      *.bl|Taskfile.yml) ;;
+      *.bl|Taskfile.yml|"$SPEC_TYPES") ;;
       *) continue ;;
     esac
     mkdir -p "$outdir/$(dirname "$path")"
@@ -340,7 +411,7 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   # Absolute zero gates: an id means nothing to another reader or to training
   # data, and a swallowed decline is a wrong answer waiting to be found.
   case "$name" in
-    br_ids_in_source|br_ids_in_test_comments|layout_decline_unhandled|node_pool_writes|str_substring_callers|str_len_in_byte_args)
+    br_ids_in_source|br_ids_in_test_comments|layout_decline_unhandled|node_pool_writes|str_substring_callers|str_len_in_byte_args|primitive_type_names_outside_spec)
       [ "$now" -gt 0 ] && mark="$mark NONZERO(must-be-zero)" ;;
   esac
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"

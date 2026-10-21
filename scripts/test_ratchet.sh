@@ -41,6 +41,50 @@ EOF
   cat > "$dir/src/typecheck.bl" <<'EOF'
 let mut named_type_map: Map[Str, Int] = Map()
 EOF
+  # The type-name row's inputs. Fn and Tuple are on the checker's list but not in the table,
+  # and the table lists Spec_only, which the checker lacks: the allowances the row must keep.
+  cat >> "$dir/src/typecheck.bl" <<'EOF'
+fn is_primitive_type(name: Str) -> Int {
+    if tc_declaration_shadows_builtin(name) != 0 { return 0 }
+    match name.byte_len() {
+        2 => match name {
+            "Fn" => 1
+            _ => 0
+        }
+        3 => match name {
+            "Int" => 1
+            "Buf" => 1
+            _ => 0
+        }
+        4 => match name {
+            "Cell" => 0
+            _ => 0
+        }
+        5 => match name {
+            "Tuple" => 1
+            _ => 0
+        }
+        _ => 0
+    }
+}
+EOF
+  mkdir -p "$dir/sections"
+  cat > "$dir/sections/07_trust_modules_metadata.md" <<'EOF'
+#### Compiler-Known Type Names (closed set)
+
+| Name | Home | Specified in | Declaring it |
+|------|------|--------------|--------------|
+| `Int`, `I8` | prelude | §3.2 | reserved |
+| `Self` | prelude | §3.3 | reserved |
+| `Handler[E]`, `Buf[T]` | prelude | §3.4 | reserved |
+| `Spec_only` | prelude | §3.5 | reserved |
+
+Prose naming `Stray` in backticks, outside the table.
+
+#### Shadowing Rules
+
+| `Later` | after the table | x | y |
+EOF
   # The node pool with its writers and its columns, a test that imports the pool across
   # lines and only reads it, and a file whose own local list is named `nodes`.
   cat > "$dir/src/parser.bl" <<'EOF'
@@ -117,6 +161,47 @@ if ! RATCHET_SRC_DIR="$BASE" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BA
   echo "FAIL sanity: unperturbed fixture did not pass ratchet.sh against itself"
   fail=1
 fi
+
+# The type-name row: is_primitive_type may not answer for a name the spec table lacks. Each
+# case reads back which row failed, so another row rising cannot satisfy it.
+check_type_names() {
+  label="$1"; want="$2"; file="$3"; sedexpr="$4"
+  d="$WORK/tn_$label"
+  rm -rf "$d"
+  cp -r "$BASE" "$d"
+  sed -i "$sedexpr" "$d/$file"
+  out=$(RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+  rc=$?
+  if [ "$want" = fail ]; then
+    if [ $rc = 0 ]; then
+      echo "FAIL primitive_type_names_outside_spec-$label: ratchet.sh passed"
+      fail=1
+    elif ! printf '%s\n' "$out" | rg -q '^primitive_type_names_outside_spec .*NONZERO'; then
+      echo "FAIL primitive_type_names_outside_spec-$label: the run failed, but not on this row"
+      printf '%s\n' "$out"
+      fail=1
+    else
+      echo "PASS primitive_type_names_outside_spec-$label: failed on this row"
+    fi
+  elif [ $rc != 0 ]; then
+    echo "FAIL primitive_type_names_outside_spec-$label: ratchet.sh failed"
+    printf '%s\n' "$out"
+    fail=1
+  else
+    echo "PASS primitive_type_names_outside_spec-$label: passed"
+  fi
+}
+
+check_type_names stray fail src/typecheck.bl 's/"Cell" => 0/"Cell" => 1/'
+# A backticked name in prose, or after the table, is not in the table.
+check_type_names prose-name fail src/typecheck.bl 's/"Cell" => 0/"Stray" => 1/'
+check_type_names after-table-name fail src/typecheck.bl 's/"Cell" => 0/"Later" => 1/'
+# Empty parses read as 1, not as a clean 0.
+check_type_names no-table fail sections/07_trust_modules_metadata.md 's/Compiler-Known Type Names (closed set)/Renamed/'
+check_type_names table-lost-handler fail sections/07_trust_modules_metadata.md 's/`Handler\[E\]`, //'
+check_type_names no-arms fail src/typecheck.bl 's/=> 1/=> 0/'
+# The spec may list a name the compiler lacks: Spec_only is in the base table already.
+check_type_names spec-leads pass sections/07_trust_modules_metadata.md 's/`Spec_only`/`Spec_only`, `Ahead`/'
 
 # A synthetic +1 on each row, in turn, must fail the script.
 check_row() {

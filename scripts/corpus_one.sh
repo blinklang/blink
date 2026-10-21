@@ -109,9 +109,10 @@ for o in "$root"/build/corpus/native/*.o; do
     cp -pl "$o" "$work/.tmp/" 2>/dev/null || cp -p "$o" "$work/.tmp/"
 done
 # bootstrap/ is for tests that drive cc over the runtime headers directly, and
-# sections/ and the llms docs for tests that hold a compiler table or the doc
-# examples to what the compiler does.
-for d in tests src lib bootstrap sections llms.md llms-full.md blink.toml; do
+# the llms docs for tests that hold the doc examples to what the compiler does.
+# The spec is not linked: it leads the compiler, so no test may hold the
+# compiler to its text.
+for d in tests src lib bootstrap llms.md llms-full.md blink.toml; do
     [ -e "$root/$d" ] && ln -s "$root/$d" "$work/$d"
 done
 # src/cli.bl embeds ../build/gc_unity.c; corpus.sh generates it once.
