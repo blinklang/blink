@@ -4068,7 +4068,18 @@ error[SpawnTouchesModuleState]: spawned task touches module state
 
 #### 4.16.7 Diagnostic Precision: W0550 and W0551
 
-The write-set analysis (§4.16.4) produces two warnings related to save/restore patterns in speculative code (lookahead, backtracking):
+The write-set analysis (§4.16.4) produces two warnings related to save/restore patterns in speculative code (lookahead, backtracking). Both lints read the text of one function. They tell a speculative pair from a binding pair, and they check only the speculative one.
+
+**Save, restore and pair.**
+
+- A **save** of `G` is `let x = G` or `let x = G.clone()`, where `G` is a module-level `let mut` binding and `x` is a local.
+- A **restore** of `G` is `G = x`, where `x` holds a save of `G`.
+- A **save/restore pair** is a save of `G` and a later restore of the same `G` in the same function. A call is *between* the pair when it comes after the save and before the restore.
+
+**Binding pair and speculative pair.** A pair is **in a binding** at a call when the call is between the pair and an assignment to `G` other than the restore comes after the save and before that call. A call that comes before that assignment is not in the binding.
+
+- A **binding pair** has at least one call between its save and its restore, and the pair is in a binding at each of them. It is the dynamic-binding form: save, assign, call, restore. The function runs the call with a new value in `G`, and the restore puts the old value back.
+- A **speculative pair** is every other pair: a rollback (save, call, restore), and a pair with a call that comes before the first assignment.
 
 **W0550 (IncompleteStateRestore):** Fires when a function saves SOME module-level `let mut` bindings before a call, but the callee's write set includes additional bindings that are not saved or restored. This is the high-value diagnostic — it catches exactly the speculative-lookahead bugs that motivated the analysis.
 
@@ -4086,7 +4097,7 @@ warning[IncompleteStateRestore]: speculative lookahead may leave stale state
 
 **W0551 (UnrestoredMutation):** Fires when a function that already has a save/restore pattern (i.e., it is doing speculative work) calls a function whose write set includes unsaved bindings. Unlike W0550, W0551 applies to call sites where the caller has *no* saves for the *specific callee* — but the presence of save/restore patterns elsewhere in the function indicates speculative intent.
 
-**Context-aware firing:** W0551 only fires inside functions that already exhibit at least one save/restore pattern. Functions with no save/restore patterns at all are doing normal sequential mutation and do not trigger W0551. This eliminates false positives from normal code calling utility functions with large write sets.
+**Context-aware firing:** W0551 only fires inside functions that already exhibit at least one speculative pair. A binding pair does not count. Functions with no save/restore patterns at all are doing normal sequential mutation and do not trigger W0551. This eliminates false positives from normal code calling utility functions with large write sets.
 
 ```blink
 fn looks_like_struct_lit() -> Bool {     // has save/restore → speculative context
@@ -4105,7 +4116,56 @@ fn compile_module(path: Str) -> Result[Module, CompileError] ! IO {
 }
 ```
 
-**No threshold.** W0551 does not use a write-set size threshold. Inside a speculative context, any unsaved mutation is potentially a bug regardless of how many globals the callee writes. The context-aware heuristic (save/restore pattern present) is the sole gating condition.
+**No threshold.** W0551 does not use a write-set size threshold. Inside a speculative context, any unsaved mutation is potentially a bug regardless of how many globals the callee writes. The context-aware heuristic (a speculative pair present) is the sole gating condition.
+
+**Calls in a binding.** W0550 and W0551 check a call against the pairs around it that are not in a binding at that call. A pair that is in a binding at the call adds nothing to the check: the writes of the callee are the intended effect. This holds when the callee also writes `G`, because the restore drops that write. A function can hold both kinds of pair. Each call is checked only against the speculative pairs around it, and a binding pair does not make the function a speculative context.
+
+```blink
+let mut hint = -1
+let mut depth = 0
+let mut count = 0
+
+fn infer() -> Int {
+    count = count + 1
+    hint + depth
+}
+
+fn infer_unhinted() -> Int {
+    let saved = hint
+    hint = -1              // an assignment after the save: a binding pair
+    let t = infer()        // no warning: `infer` writes {count} on purpose
+    hint = saved
+    t
+}
+
+fn looks_ahead() -> Bool {
+    let saved = depth      // no assignment after the save: a speculative pair
+    let t = infer()        // W0551: `infer` writes {count}, and nothing saves it
+    depth = saved
+    t > 0
+}
+```
+
+A warning that still fires has a `note:` that names the pair and its class. It also has one `help:` line that names the binding shape, for a user who meant a binding:
+
+```
+warning[IncompleteStateRestore]: speculative lookahead may leave stale state
+ --> parser.bl:42:5
+  |
+42 |     let saved = pos
+  |         ^^^^^ saves `pos` before calling `skip_newlines`
+  |
+  = note: `pos` is saved at 42:9 and restored at 47:5 with no new value set between (speculative pair)
+  = note: `skip_newlines` writes {pos, pending_comments}
+  = note: only `pos` is restored after the call
+  = help: also save and restore `pending_comments`, or verify the mutation is intentional
+  = help: if the function sets a global for this call, assign that global between its save and this call
+```
+
+**Known limits.**
+
+- **Any other assignment counts.** The rule reads the text, not the value. A lookahead that sets the cursor first (`pos = start`, then `parse_item()`) or moves it first (`pos = pos + 1`, then `try_item()`) is a binding pair by this rule. Globals that the callee writes and nothing saves give no warning there.
+- **Exit paths.** A `?` or an early `return` between the assignment and the restore leaves the bound value in `G`. Neither W0550 nor W0551 looks at exit paths, so a binding pair or a speculative pair that misses its restore on such an exit gives no warning.
 
 #### 4.16.8 Warning Suppression
 
