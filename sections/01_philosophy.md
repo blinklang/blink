@@ -8,7 +8,7 @@ The consequence: every design decision in Blink is filtered through the question
 
 The language is called **Blink** because it channels raw power into focused output — like blinkers on a horse harness.
 
-Every programming language since the days of C has been designed to make humans more productive. Blink inverts that assumption: it is designed for the machine that *writes* the code, not just the machine that *runs* it. AI is the horse — immensely powerful, capable of generating code at extraordinary speed. But raw power without direction is wasted. Blinkers on a harness restrict a horse's peripheral vision, eliminating distractions and keeping the animal focused on the path ahead. Blink does the same for AI: one way to do everything, no ambiguous syntax, no decision points, no escape hatches. The language removes everything that would cause an AI to hesitate, guess, or wander.
+Every programming language since the days of C has been designed to make humans more productive. Blink inverts that assumption: it is designed for the machine that *writes* the code, not just the machine that *runs* it. AI is the horse — immensely powerful, capable of generating code at extraordinary speed. But raw power without direction is wasted. Blinkers on a harness restrict a horse's peripheral vision, eliminating distractions and keeping the animal focused on the path ahead. Blink does the same for AI: one way to do everything, no ambiguous syntax, no decision points, and no hidden escape hatches. Where the compiler must take a claim on trust, the source marks it, and §9.1 names every such construct. The language removes everything that would cause an AI to hesitate, guess, or wander.
 
 The effect system is the clearest expression of this philosophy: a function that declares `! DB` can see the database; one that does not is blinkered from it entirely. Capabilities are not granted by default and restricted — they are invisible until explicitly opened.
 
@@ -97,7 +97,7 @@ This is aspirational -- it depends on the contract and verification systems bein
 
 Blink is opinionated about what it is *not*.
 
-**Not a systems language.** Blink does not compete with Rust or C for kernel development, embedded systems, or bare-metal programming. There is no ownership model, no manual memory management, no `unsafe` escape hatch. If you need to control individual cache lines, use a different language and call it via FFI.
+**Not a systems language.** Blink does not compete with Rust or C for kernel development, embedded systems, or bare-metal programming. There is no ownership model, no manual memory management, and no general `unsafe` block that turns checks off. The one narrow form is an FFI region (§9.1.1), where a `Ptr[T]` may be used without a null or lifetime check; it relaxes only that rule, and each region is marked in source (§9.1). If you need to control individual cache lines, use a different language and call it via FFI.
 
 **Not academically novel.** Every idea in Blink is proven in at least one shipping language. Algebraic effects come from Koka. HM inference comes from ML/OCaml/Haskell. ADTs and pattern matching come from the entire ML family. Traits come from Rust/Haskell. The novelty is the composition and the AI-first design constraints, not the individual features.
 

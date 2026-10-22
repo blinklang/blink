@@ -6,6 +6,19 @@ Blink's type system, effect system, and contract system form a closed verificati
 
 Every foreign function binding carries `@ffi`, an explicit effect row and `@trusted`. Only `@trusted` may be omitted, and omitting it gives a warning (W0800).
 
+#### Escape Hatches — One Closed List
+
+An **escape hatch** is a marked construct where the compiler takes a claim on trust that it cannot check. Blink has no hidden escape hatches. Every escape hatch is marked in source at the place where it occurs, and this list names all of them:
+
+| # | Escape hatch | What the compiler takes on trust | Where it is marked | Defined in |
+|---|---|---|---|---|
+| 1 | `@ffi` binding with `@trusted(audit: K)` | The foreign code matches the binding: its types, its effect row and its memory use | `@ffi` and the `@trusted(audit: K)` annotation on the function | This section, *`@trusted` — Audit Trail*; §4.5 *Proven and assumed rows* |
+| 2 | FFI region | Each `Ptr[T]` use in the region is valid: not null and not dangling | The `@ffi` or `@trusted` function body, or the `with ffi.scope()` block | §9.1.1 *Pointer Operations*, *Lifetime and Cleanup: `ffi.scope()`* |
+| 3 | `Raw(s)` | The `Str` in this template hole cannot carry an injection | The `Raw(...)` call | §3b.5 *`Raw(expr)` — The Escape Hatch* |
+| 4 | `@verify(fallback: "trust")` | The contract holds, with no run-time check | The `@verify(fallback: "trust")` annotation on the function | §3b.4 *`@verify` Fallback Values* |
+
+The list is closed. A new entry needs a design-panel vote. No other construct is an escape hatch. In particular, no construct turns checks off for a whole block: an FFI region relaxes only the `Ptr[T]` rules (E0811).
+
 #### `@ffi` — Declaring the Foreign Binding
 
 ```blink
@@ -2793,7 +2806,7 @@ The resolution algorithm from §10.5 is unchanged:
 2. Check dependencies declared in `blink.toml` (resolved via `blink.lock`) — **stdlib packages are included here as implicit entries**
 3. No match → compile error
 
-Local modules shadow stdlib with warning W1000 (same as any dependency shadowing). Explicit `blink.toml` entries for `std/` packages override the bundled version — this is the escape hatch for pinning a specific stdlib version when needed.
+Local modules shadow stdlib with warning W1000 (same as any dependency shadowing). Explicit `blink.toml` entries for `std/` packages override the bundled version — use this to pin a specific stdlib version when needed.
 
 #### Physical Location
 

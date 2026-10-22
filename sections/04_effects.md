@@ -209,7 +209,7 @@ Declaring a parent is syntactic sugar for declaring all children. `! FS` and `! 
 
 **Why hierarchical and not flat:**
 
-A flat list of 30+ effects is unusable. Hierarchy provides two things: (1) grouping -- `FS.*` are all filesystem-related, so the handle namespace is coherent; and (2) an escape hatch -- when a function genuinely needs all filesystem operations, `! FS` is one annotation, not four. The hierarchy matches how humans and AI think about capability domains.
+A flat list of 30+ effects is unusable. Hierarchy provides two things: (1) grouping -- `FS.*` are all filesystem-related, so the handle namespace is coherent; and (2) a short form -- when a function genuinely needs all filesystem operations, `! FS` is one annotation, not four. The hierarchy matches how humans and AI think about capability domains.
 
 ---
 
@@ -240,13 +240,17 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 | `io.read_bytes(n)` | `Int` | exactly `n` stdin bytes, fewer only at end of input (§4.4.9) | Yes (`IO.Read`) | Yes | Yes |
 | `io.eprintln(x)` | `T: Display` | stderr, with newline | No | No | Yes |
 | `io.eprint(x)` | `T: Display` | stderr, no newline | No | No | Yes |
-| `io.print_raw(s)` | `Str` | raw stdout, no newline | No | No | No |
-| `io.eprint_raw(s)` | `Str` | raw stderr, no newline | No | No | No |
-| `io.print_raw_bytes(b)` | `Bytes` | raw stdout, the bytes as they are | No | No | No |
+| `io.print_raw(s)` | `Str` | raw stdout, no newline | Yes (`IO.Print`) | Yes | Yes |
+| `io.eprint_raw(s)` | `Str` | raw stderr, no newline | No | No | Yes |
+| `io.print_raw_bytes(b)` | `Bytes` | raw stdout, the bytes as they are | Yes (`IO.Print`) | Yes | Yes |
 
-The `_raw` variants are escape hatches for cases where direct stdout or stderr output is needed (e.g., streaming JSON fragments, progress indicators). They bypass the effect handler system entirely and emit no trace effects. Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
+`io.print_raw` and `io.print_raw_bytes` are operations of `IO.Print`. The innermost `IO.Print` handler receives them, a handler can intercept them, and they emit trace records. `io.eprint_raw` has the same dispatch as `io.eprint`. Use the `_raw` operations when you need exact output with no newline added and an immediate flush (for example, streaming JSON fragments or progress indicators). Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
 
-**`_raw` writes.** A `_raw` operation writes every byte of its argument, and it flushes them before it returns. `io.print_raw_bytes(b)` writes NUL bytes and bytes that are not UTF-8 as they are, for binary output such as an image or a protocol frame. Under the default `IO.Print` handler, output from `io.print`, `io.println` and the stdout `_raw` operations appears on stdout in call order. A handler that intercepts `io.print` decides where its output goes, so this order rule does not apply to it.
+**`_raw` writes.** The default (root) `IO.Print` handler keeps the byte contract of the `_raw` operations: it writes every byte of the argument, and it flushes them before the operation returns. `io.print_raw_bytes(b)` writes NUL bytes and bytes that are not UTF-8 as they are, for binary output such as an image or a protocol frame. Under the default `IO.Print` handler, output from `io.print`, `io.println` and the stdout `_raw` operations appears on stdout in call order. A handler that intercepts these operations decides where its output goes, so the byte contract and the order rule do not apply to it.
+
+A handler that omits `print_raw_bytes` forwards the call to the enclosing handler (§4.7.1 *Completeness and auto-delegation*). `IO.Print` is not marked `@handle_all`, so the omission gives no `PartialHandler` warning (W0545). A handler that omits `print_raw` runs the default body, which calls `print_no_nl`, so the handler receives the text as a `print_no_nl` call. The default handler implements both `_raw` operations itself, so it keeps the byte contract.
+
+A handler operation that delegates to the enclosing `default` can still send output outward. The row that such a delegation adds at the `with` site is an open question (§4.7.1 *Completeness and auto-delegation*).
 
 ```blink
 fn progress(done: Int, total: Int) ! IO.Print {
@@ -273,6 +277,8 @@ error[TypeError]: mismatched types
 |---|---|---|
 | `IO.Print` | `fn print(msg: Str)` | `io.println(x)`; the default handler writes `msg` and a newline |
 | `IO.Print` | `fn print_no_nl(msg: Str)` | `io.print(x)` |
+| `IO.Print` | `fn print_raw(s: Str)` | `io.print_raw(s)`; derived: the default body calls `print_no_nl(s)` |
+| `IO.Print` | `fn print_raw_bytes(b: Bytes)` | `io.print_raw_bytes(b)`; primitive |
 | `IO.Log` | `fn log(msg: Str)` | `io.log(x)` |
 | `IO.Read` | `fn read_bytes(n: Int) -> Bytes` | `io.read_bytes(n)`; primitive |
 | `IO.Read` | `fn read_line() -> Option[Str]` | `io.read_line()`; derived (§4.4.9) |
@@ -1680,6 +1686,8 @@ DB.Read + DB.Write = DB
 This is standard capability attenuation: you can always pass a more-powerful capability where a less-powerful one is expected, but never the reverse.
 
 **Proven and assumed rows.** Every effect row in Blink is either compiler-proven (including discharge by handler or `with`) or is the declared row of an @ffi decl, assumed under audit key K. An assumed row is an upper bound on the foreign call's behaviour; handlers do not intercept foreign calls. FFI regions change Ptr rules only, never rows.
+
+No Blink operation skips a handler that its row names; only an `@ffi` call does.
 
 This is the one normative statement of these rules. §9.1 (*The Effect Row*, *`@trusted`*) and §4.7 refer to it. An `@ffi` decl's row enters the program at the decl and from there propagates by the rules above, with no special case. `@trusted` does not discharge or narrow a row: a wrapper that calls an `@ffi` decl with row `! Net.Connect` must itself declare `Net.Connect` or discharge it in the usual way. The FFI regions of §9.1.1 (an `@ffi` or `@trusted` body, `with ffi.scope()`) decide where a `Ptr[T]` may appear; they do not change what any row says.
 
