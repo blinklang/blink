@@ -2288,7 +2288,7 @@ An expected type at a position reaches each branch value of an `if`, each arm va
 
 Resolution is static. A bare name at a site denotes exactly one entity, and the compiler determines it statically.
 
-**Values come first.** At a bare use of `Name`, the hint-directed and global-unique steps above apply only when no value binding has the name. This list governs a bare use of `Name`, in an expression or in a call `Name(...)`. The *Resolution order* list above governs `Name { ... }`. At a bare use, the compiler looks in this order, and the first step that finds `Name` decides:
+**Values come first.** At a bare use of `Name`, the hint-directed and global-unique steps above apply only when no value binding has the name. This list governs a bare use of `Name`, in an expression or in a call `Name(...)`. The *Resolution order* list above governs `Name { ... }`. The head of a dotted path `Name.x` follows *Dotted heads*, below. At a bare use, the compiler looks in this order, and the first step that finds `Name` decides:
 
 1. a local binding (a `let`, a parameter, a closure parameter or a pattern binder);
 2. a module-scope value: a `let`, `let mut`, `const` or `fn` of the module, or an imported value;
@@ -2330,6 +2330,42 @@ fn main() {
 }
 ```
 
+**Dotted heads.** At `Name.x` and `Name.x(...)`, `Name` can be a value, a name in the type namespace, or a bare variant. The compiler looks in this order, and the first step that finds `Name` decides:
+
+1. a local binding, or a module-scope value, named `Name` (steps 1 and 2 of *Values come first*). Then `Name.x` is a field access or a method call on that value;
+2. a name in the type namespace: a struct, enum, alias, trait or effect. Then `Name.x` is a *type path*: `x` is a member of the `T.` namespace of that type (§2.12.3). A member is a variant, a `fn T.name`, a `const T.X`, or an associated function of a trait;
+3. a bare variant `Name`, found as for a bare use of `Name`. Then `Name.x` is a field access or a method call on the variant value, for example `Green.label()`.
+
+The compiler picks the reading from scope and namespaces only, never from the members of the type. If `x` is not a member of the type in step 2, the site is an error. The compiler does not read `Name.x` again as a value or as a variant value. So an `impl` that another module adds never changes what an existing site means.
+
+A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. When a type has the name of a variant, write the qualified variant to reach a member of the variant value: `Color.Red.label()`. An enum may have a variant with its own name, as in `type Token { Token(Str), End }`. For `type Unit { Unit }`, `Unit.x` is the type path, and `Unit.Unit.x()` reaches a member of the variant value.
+
+When a site reads a type path and fails (an unknown member, a wrong number of arguments, or a type mismatch such as `let x: Red = Red`), and a bare variant of that name is in reach, the error gets a `help:` line that names the qualified variant.
+
+A type in step 2 can hide a variant of a different enum. W1011 marks it at the type declaration, once for each variant that the type hides. The type's own enum is exempt. A variant counts when a bare use of its name in the module can reach it (*Resolution order*, above); for a dependency variant, §10.6 *Shadowing Rules* adds the import-entry condition.
+
+```blink
+type Color { Red, Green }
+
+type Red { A, B }                     // warning[W1011]: type `Red` hides variant `Color.Red`
+
+trait Label { fn label(self) -> Str }
+impl Label for Red { fn label(self) -> Str { "type" } }
+impl Label for Color { fn label(self) -> Str { "variant" } }
+
+type Unit { Unit }                    // no W1011: the variant is in the type's own enum
+impl Label for Unit { fn label(self) -> Str { "unit" } }
+
+fn main() ! IO {
+    let c = Red                       // the variant `Color.Red`: a type is never a bare value
+    let r = Red.A                     // type path: variant `A` of the type `Red`
+    io.println(Red.label())           // error[TypeError]: function Red.label expects 1 argument(s), got 0
+                                      // help: to use the variant, write `Color.Red`
+    io.println(Color.Red.label())     // the qualified form always reaches the variant
+    io.println(Unit.Unit.label())     // a member of the variant value, not of the type
+}
+```
+
 **Name collisions** fall into two distinct kinds:
 
 - **A type name equal to an enum variant name** is a **compile error at declaration time** (`error[NameCollision]`, E0518) in two cases: a struct has the name of a variant, or a variant has the name of its own enum. For a struct, the reach is the package, not the module: a struct in one module and a variant of that name in another module of the package collide. The variants of a prelude enum count as declared in every module. A variant of a dependency enum never gives E0518. An import entry that binds a struct named like a variant of the package or of the prelude is also E0518, at the import entry. The fix is an alias: `import geo.{Point as GeoPoint}`. A variant with the name of its own enum, such as `type Token { Token(Str), End }` or `type Errno { Errno(Int) }`, is E0518 at the variant, once, and not at each use. The type name `Token` would then be both a type and a variant of that type:
@@ -2343,7 +2379,7 @@ fn main() {
     help: to wrap one value, use a one-field struct (*Newtypes*, above): `type Errno { code: Int }`
   ```
 
-  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique.
+  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique. For a struct, E0518 holds because `Name { ... }` reads as both a struct literal and a variant brace literal. An enum, alias, trait or effect has no such literal, so a type of one of those kinds named like a variant of a different enum is legal. At a dotted head the type comes before the variant (*Dotted heads*, above), and W1011 marks it.
 
 - **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Such a name is resolved by the hint:
 
@@ -2363,7 +2399,7 @@ fn main() {
   }
   ```
 
-No path ever silently picks a winner between two constructible names: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint). A value that hides a variant is not such a collision. It is a shadow between scopes, by the order in *Values come first*, and W1011 marks it where §10.6 *Shadowing Rules* says. A struct that hides a dependency variant is a shadow in the same way, by the struct step in *Resolution order*, and W1011 marks it too.
+No path ever silently picks a winner between two constructible names: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint). A value that hides a variant is not such a collision. It is a shadow between scopes, by the order in *Values come first*, and W1011 marks it where §10.6 *Shadowing Rules* says. A struct that hides a dependency variant is a shadow in the same way, by the struct step in *Resolution order*, and W1011 marks it too. A type that hides a variant at a dotted head is a shadow too, by the order in *Dotted heads*, and W1011 marks it.
 
 A bare struct-style construction with a payload in carrier position resolves through the carrier's expected type:
 

@@ -24,7 +24,6 @@ and no Phase D was needed.
 Six panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML, minimalism) deliberated in
 independent-proposal, debate, vote rounds. The ticket, verbatim:
 
-> Full ID:  0n0q18
 >   Title:    Spec: narrow struct-vs-variant NameCollision (E0518) from program-wide to package reach?
 >   Status:   open (ready)
 >   Priority: P2
@@ -304,9 +303,9 @@ One round. All six seats sent "ready to vote". The key shifts, by seat:
 - *plt (B1):*
 
 > I support **Option P**. I oppose Option K, as in Phase A. I withdraw plt-2 (Option U) as a live option for this
-> ticket. It is fair only if fegp6p narrows the variant pool to enums in scope, and fegp6p is open. If fegp6p later
+> ticket. It is fair only if the follow-up on the variant pool narrows it to enums in scope, and that follow-up is open. If it later
 > narrows the pool, Option P stays sound under it: the scoped struct still comes first, and the pool only gets smaller.
-> So no decision here blocks fegp6p.
+> So no decision here blocks that follow-up.
 
 - *min (B1):*
 
@@ -603,6 +602,6 @@ Binding concerns from Phase C:
 
 ### Known gaps and follow-ups
 
-1. 6xcq94 (sum type named like a variant) should take the same package reach.
+1. A sum type named like a variant should take the same package reach. See decisions/type-variant-shadow.md.
 
-2. fegp6p (variant pool limited to enums in scope): P stays sound under it (plt B1).
+2. The variant pool limited to enums in scope: P stays sound under it (plt B1).
