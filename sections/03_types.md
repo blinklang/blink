@@ -5159,6 +5159,19 @@ impl Display for User {
 
 This is valid because `User` is defined in `myapp` and the impl is also in `myapp`. Intra-package module references are allowed (§10.5).
 
+A header may name the type or the trait with a module qualifier (§10.1 *Qualified Access*). This impl is the same impl, and the orphan rule tests the same type:
+
+```blink
+// src/formatting.bl
+import models
+
+impl Display for models.User {
+    fn display(self) -> Str {
+        "{self.name} ({self.email})"
+    }
+}
+```
+
 **Impl visibility.** No syntax imports an impl. For a method call `x.foo()` where `x: T`, two rules give the candidate impls:
 
 1. **An impl in `T`'s package goes with the value.** An impl that lives in the package that defines `T` is a candidate at every call site where its trait is visible. The file does not import `T`, the trait, or any module for it. How the code got the value does not matter: a factory call, a field, a closure parameter and a generic return all give the same methods.
@@ -5202,6 +5215,8 @@ fn run() -> Int {
 ```
 
 With `import ext` in place of `import ext.{Extra}`, `c.zap()` is E0505. The error says that `import ext` does not bring trait methods into method-call scope, and its fix changes the line to `import ext.{Extra}` (§3c.4 *Trait Method Lookup*).
+
+**An impl header does not put its trait in scope.** Naming a trait in an impl header, bare or qualified, does not put it in scope. An impl body gets no special treatment (§3c.4 *Built-in Type Method Dispatch*). In `impl lib.Tr for ext.Pt` with `import lib`, a call `self.other()` to another method of `Tr` is E0505, the same as in any other function. To repair it, select the trait with `import lib.{Tr}`, or write the qualified call `lib.Tr.other(self)`.
 
 The impls in `T`'s package are fixed by the contents of that package, at the version the build uses. They never depend on which modules the build loaded. An import in another file, or a module that some dependency loads, adds no candidates to this file. The same holds for rule 2: only this file's own declarations and imports put a trait in scope.
 

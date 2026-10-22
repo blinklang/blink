@@ -2039,11 +2039,41 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 ```
 
 **Rules:**
-- Qualified access works for functions (`auth.login()`), types (`auth.Token`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`.
+- Qualified access works for functions (`auth.login()`), types (`auth.Token`), traits (`auth.Verifier`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`.
 - Only the leaf module name is used as qualifier. `import std.num` enables `num.parse_int()`, not `std.num.parse_int()`. For modules with the same leaf name, use aliases: `import legacy.auth as legacy_auth`. To keep bare names, put the alias between the path and the list: `import legacy.auth as legacy_auth.{Token}` (*Import Aliases*, §10.5).
 - Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works. So a selective import binds its qualifier too: `import auth.{login}` binds `login` and `auth`, and `import auth as a.{login}` binds `login` and `a`.
 - A whole-module import binds only its qualifier. If `import foo` and `import bar` both export `helper`, nothing collides: call `foo.helper()` or `bar.helper()`. Two imports that bind one name, bare name or qualifier, are E1005 (*Imported Names*, §10.5). A module-level declaration that takes a qualifier's name is E1012 (*Imported and Declared Names*, §10.5).
 - A local binding hides a module qualifier for its scope. If `let auth = 5` is in scope, `auth.login()` is a method call on the integer, not a module-qualified call. Inside that scope `auth.y` resolves against the local binding only. There is no fallback to the qualifier, also when the local's type has no member `y`. Every local binding form in §2.2 *Local bindings* hides a qualifier this way. This is a shadow between nested scopes (§10.6 *Shadowing Rules*), so it is legal and gets no warning at the binding. A diagnostic that a hidden qualifier causes names the hidden module (§10.6 *Diagnostics that involve a shadowing name*).
+- A qualified trait or type name works in every slot that takes the bare name. The qualifier is the one that this section already gives: the import's leaf name or its alias. The spelling does not change scope or the orphan check. The orphan rule, impl lookup, duplicate-impl detection and bound checks test the resolved trait and the resolved type (§3.4 *Identity, not spelling, selects behavior*). These are the slots:
+  - a bound (`U: lib.Tr`) and a `where` constraint (`where U: lib.Tr`)
+  - both names of an impl header (`impl lib.Tr for lib.Pt`)
+  - a supertrait clause (`trait Sh: lib.Tr`)
+  - the argument of `@derive(...)`
+  - the head of an impl-qualified call (`(lib.Mk for W).make()`, §3c.4 *Impl-Qualified Calls*)
+
+  The receiver of an impl header is a type position, so it takes `lib.Pt` by the rule for types. The list names the slots of the language today. The general rule also covers a slot that the list does not name. Naming a trait with a qualifier puts nothing in scope (§3.6 *Impl visibility*).
+
+```blink
+import lib
+
+trait Sh {
+    fn sh(self) -> Str
+}
+
+type W {
+    v: Int
+}
+
+impl lib.Tr for W {                 // the trait slot
+    fn name(self) -> Str { "w{self.v}" }
+}
+
+impl Sh for lib.Pt {                // the receiver slot
+    fn sh(self) -> Str { "pt{self.x}" }
+}
+
+fn show[U: lib.Tr](u: U) -> Str { u.name() }    // a bound
+```
 
 **No wildcard imports.** `import auth.*` does not exist. Every name in scope is explicitly imported. This is non-negotiable for locality of reasoning — an AI reading a file can determine every available name from the import block alone.
 

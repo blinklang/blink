@@ -750,7 +750,7 @@ The rules:
 - **The type must implement the trait.** If it does not, the call is `TraitBoundNotSatisfied` (E0306), reported at the head.
 - **The method must belong to the trait.** A method that the trait does not declare is a compile error, the same as `Trait.method(x)` with a method the trait does not have.
 - **A method's own type parameters** follow §3.4 *Explicit Type Application*, as for any callee.
-- **The left side must name a trait.** If it does not, the call is `QualifiedHeadNotTrait` (E0740). The most likely cause is the order of Rust's `<Widget as Alpha>`: `(Widget for Alpha)`. When the left side resolves to a type and the right side resolves to a trait, the note says which side is the trait, and the help gives the corrected head `(Alpha for Widget)`. When either name does not resolve, or the kinds are not swapped, the help suggests no swap, and an unresolved name keeps its own error. The spec fixes this content, not the wording.
+- **The left side must name a trait.** If it does not, the error is `TypeNotTrait` (E0740), reported at the name. The same error covers every other slot that expects a trait, bare or qualified: a bound, a `where` constraint, the trait of an impl header, a supertrait clause and the argument of `@derive(...)`. A module qualifier does not change it (§10.1 *Qualified Access*). The most likely cause in a call head is the order of Rust's `<Widget as Alpha>`: `(Widget for Alpha)`. When the left side resolves to a type and the right side resolves to a trait, the note says which side is the trait, and the help gives the corrected head `(Alpha for Widget)`. When either name does not resolve, or the kinds are not swapped, the help suggests no swap, and an unresolved name keeps its own error. The spec fixes this content, not the wording.
 
 ```blink
 fn pair[T: Alpha + Beta]() -> (T, T) {
@@ -760,10 +760,13 @@ fn pair[T: Alpha + Beta]() -> (T, T) {
 let w = (From[U8] for Widget).from(b)              // a generic trait, with its full instance
 
 let x = (Widget for Alpha).make()   // COMPILE ERROR E0740: `Alpha` is a trait; write `(Alpha for Widget)`
+
+impl Widget for Alpha { }           // COMPILE ERROR E0740: `Widget` is a type, not a trait
+fn f[U: Widget](u: U) { }           // COMPILE ERROR E0740: `Widget` is a type, not a trait
 ```
 
 ```
-error[QualifiedHeadNotTrait]: the left side of `for` must name a trait
+error[TypeNotTrait]: the left side of `for` must name a trait
  --> main.bl:9:10
   |
 9 | let x = (Widget for Alpha).make()
