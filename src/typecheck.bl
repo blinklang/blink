@@ -5755,35 +5755,37 @@ fn tc_literal_takes(node: Int, tid: Int) ! Diag.Report {
 }
 
 // error[IntLiteralOutOfRange] (E0318) at `node`, a literal whose value is outside `t`, its
-// type. `default_int` says no expected type reached it, so it is Int by default. A literal
-// is reported once: the passes that check it reach it more than once.
+// type. `default_int` says no expected type reached it, so it is Int by default.
 fn tc_report_int_literal_range(node: Int, t: Int, default_int: Bool, help: Str) ! Diag.Report {
-    if diag_has_error_at(INT_LITERAL_OUT_OF_RANGE, node) { return }
     let negative = node_kind(node) == NodeKind.UnaryOp
-    tc_report_int_value_range(node, int_lit_node_digits(node), negative, t, default_int, help)
+    tc_report_int_value_range(node, node_col(node), int_lit_node_digits(node), negative, t, default_int, help)
 }
 
-// The E0318 report for a value spelled `digits` (no sign), negative when `negative`.
-fn tc_report_int_value_range(node: Int, digits: Str, negative: Bool, t: Int, default_int: Bool, help: Str) ! Diag.Report {
+// The E0318 report for a value spelled `digits` (no sign), negative when `negative`, at
+// column `col` of the node's line. A value is reported once: the passes that check a
+// literal reach it more than once.
+fn tc_report_int_value_range(node: Int, col: Int, digits: Str, negative: Bool, t: Int, default_int: Bool, help: Str) ! Diag.Report {
+    if diag_has_error_at(INT_LITERAL_OUT_OF_RANGE, node, col) { return }
     let k = type_kind(t)
     let value = if negative { "-{digits}" } else { digits }
     let name = "IntLiteralOutOfRange"
+    let line = node_line(node)
     if !negative && !tc_digits_within(digits, tc_int_literal_limit(TyKind.U64, false)) {
-        diag_error_at(name, INT_LITERAL_OUT_OF_RANGE, "no integer type holds {value}", node, "")
+        diag_error_span_at_notes(name, INT_LITERAL_OUT_OF_RANGE, "no integer type holds {value}", node, line, col, 0, "", [])
         return
     }
     if negative && tc_int_literal_limit(k, true) == "" {
         let msg = if digits == "0" { "-0 is a negative literal" } else { "{value} does not fit in {type_to_str(t)}" }
-        diag_error_at_notes(name, INT_LITERAL_OUT_OF_RANGE, msg, node, "", ["unsigned types hold no negative values"])
+        diag_error_span_at_notes(name, INT_LITERAL_OUT_OF_RANGE, msg, node, line, col, 0, "", ["unsigned types hold no negative values"])
         return
     }
     if default_int {
-        diag_error_at(name, INT_LITERAL_OUT_OF_RANGE, "{value} does not fit in Int, the default type", node, help)
+        diag_error_span_at_notes(name, INT_LITERAL_OUT_OF_RANGE, "{value} does not fit in Int, the default type", node, line, col, 0, help, [])
         return
     }
     let low = tc_int_literal_limit(k, true)
     let lowest = if low == "" { "0" } else { "-{low}" }
-    diag_error_at(name, INT_LITERAL_OUT_OF_RANGE, "{value} does not fit in {type_to_str(t)} ({lowest} to {tc_int_literal_limit(k, false)})", node, "")
+    diag_error_span_at_notes(name, INT_LITERAL_OUT_OF_RANGE, "{value} does not fit in {type_to_str(t)} ({lowest} to {tc_int_literal_limit(k, false)})", node, line, col, 0, "", [])
 }
 
 // The type inference gives an int literal: the one the expected type at it published, or Int.
@@ -23378,7 +23380,9 @@ fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first: Int, first
     // whose type is a metavar already BOUND to a sized int needs the second one.
     if is_int_literal_node(elem) != 0 {
         if is_integer_type(resolve_alias_tid(first_t)) != 0 || is_integer_type(tc_resolve(first_t)) != 0 {
-            tc_literal_takes(elem, first_t)
+            // A first literal has the type an expected type gave every element, or the default
+            // Int, which the default-Int pass reports in its own words.
+            if is_int_literal_node(first) == 0 { tc_literal_takes(elem, first_t) }
             return
         }
     }
@@ -23658,6 +23662,8 @@ fn tc_check_lit_field_values(node: Int, lit_t: Int) ! TypeCheck.Resolve, TypeChe
         if declared == -1 { continue }
         let want = resolve_alias_tid(declared)
         if tc_tid_is_no_info(want) != 0 { continue }
+        // A field the literal's type parameters reach has its type only now.
+        tc_literal_takes(v, want)
         if assignment_types_compatible(want, got, v) != 0 { continue }
         // A closure's own check ran before the literal's T was read, so it stands for this one
         // only when the literal has no type arguments.
@@ -25136,6 +25142,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if method == "to_u32" { return TYPE_U32 }
             if method == "to_u64" { return TYPE_U64 }
             if method == "wrapping_add" || method == "wrapping_sub" || method == "wrapping_mul" {
+                if args_sl != -1 && sublist_length(args_sl) == 1 { tc_literal_takes(sublist_get(args_sl, 0), obj_t) }
                 return obj_t
             }
         }
@@ -29406,20 +29413,19 @@ fn tc_check_pattern_types_against(pat: Int, binding_t: Int, subject: Str, refuta
 // type, and must be in its range (sections/03_types.md §3.2 *Integer literal range*). A
 // pattern spells no sign, and a Char or Bool pattern is no integer literal.
 fn tc_check_int_pattern_range(pat: Int, hint: Int) ! Diag.Report {
-    if hint < 0 { return }
+    if hint < 0 || node_type_name(pat) == "Char" { return }
     let t = tc_resolve(resolve_alias_tid(hint))
-    if is_integer_type(t) == 0 || diag_has_error_at(INT_LITERAL_OUT_OF_RANGE, pat) { return }
-    let limit = tc_int_literal_limit(type_kind(t), false)
-    let mut bounds = [node_str_val(pat)]
-    if node_kind(pat) == NodeKind.RangePattern { bounds.push(node_name(pat)) }
-    for b in bounds {
-        if tc_is_decimal_digits(b) {
-            let digits = int_lit_decimal(b)
-            if !tc_digits_within(digits, limit) {
-                tc_report_int_value_range(pat, digits, false, t, false, "")
-                return
-            }
-        }
+    if is_integer_type(t) == 0 { return }
+    tc_check_int_pattern_bound(pat, node_col(pat), node_str_val(pat), t)
+    if node_kind(pat) == NodeKind.RangePattern { tc_check_int_pattern_bound(pat, node_int_val(pat), node_name(pat), t) }
+}
+
+// One bound of `pat`, spelled `b`, at column `col` of the pattern's line.
+fn tc_check_int_pattern_bound(pat: Int, col: Int, b: Str, t: Int) ! Diag.Report {
+    if !tc_is_decimal_digits(b) { return }
+    let digits = int_lit_decimal(b)
+    if !tc_digits_within(digits, tc_int_literal_limit(type_kind(t), false)) {
+        tc_report_int_value_range(pat, col, digits, false, t, false, "")
     }
 }
 
@@ -32934,16 +32940,18 @@ fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
     1
 }
 
-// Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
-// harness reach the same pass by the same name.
 // A literal no expected type reached is Int (sections/03_types.md §3.2 *Integer literal
 // range*). Its type is final only once every pass that can give it one has run, so the range
 // check of a literal that is Int by default waits for the whole walk. A literal that another
 // check reported is not reported again. `order` is the walk's pre-order: a let comes before
 // its value, and a negative literal before the literal under its `-`. The reports follow node
 // order, which is source order, and not the walk's.
+//
+// A literal beside an operand that is not an integer stays Int, and the operator or the
+// operand is the error there: reporting the literal too would explain one mistake twice. A
+// program with no error yet gets the report, so no literal reaches codegen out of range.
 fn tc_report_int_literals_out_of_range(order: List[Int]) ! Diag.Report {
-    let mut under_minus: Map[Int, Int] = Map()
+    let mut skip: Set[Int] = Set()
     let mut let_of: Map[Int, Int] = Map()
     let mut found: List[Int] = []
     for n in order {
@@ -32952,8 +32960,12 @@ fn tc_report_int_literals_out_of_range(order: List[Int]) ! Diag.Report {
             let v = node_value(n)
             if v != -1 && is_int_literal_node(v) != 0 { let_of.insert(v, n) }
         }
-        if is_int_literal_node(n) == 0 || under_minus.contains_key(n) { continue }
-        if k == NodeKind.UnaryOp { under_minus.insert(node_left(n), n) }
+        if k == NodeKind.BinOp {
+            tc_skip_literal_beside_non_integer(node_left(n), node_right(n), skip)
+            tc_skip_literal_beside_non_integer(node_right(n), node_left(n), skip)
+        }
+        if is_int_literal_node(n) == 0 || skip.contains(n) { continue }
+        if k == NodeKind.UnaryOp { skip.insert(node_left(n)) }
         let stamped = tc_lookup_node_tid(n)
         if stamped < 0 { continue }
         let t = tc_resolve(resolve_alias_tid(stamped))
@@ -32967,12 +32979,25 @@ fn tc_report_int_literals_out_of_range(order: List[Int]) ! Diag.Report {
         let mut help = ""
         let decl = let_of.get(n) ?? -1
         if default_int && decl != -1 && k == NodeKind.IntLit && tc_literal_fits(n, TyKind.U64) {
+            let p = if node_is_pub(decl) != 0 { "pub " } else { "" }
             let m = if node_is_mut(decl) != 0 { "mut " } else { "" }
-            help = "let {m}{node_name(decl)}: U64 = {int_lit_node_digits(n)}"
+            let kw = if node_is_const(decl) != 0 { "const" } else { "let" }
+            help = "{p}{kw} {m}{node_name(decl)}: U64 = {int_lit_node_digits(n)}"
         }
         tc_report_int_literal_range(n, t, default_int, help)
     }
 }
+
+fn tc_skip_literal_beside_non_integer(lit: Int, other: Int, skip: Set[Int]) {
+    if lit == -1 || other == -1 || is_int_literal_node(lit) == 0 || is_int_literal_node(other) != 0 { return }
+    if diag_any_errors_since(0) == 0 { return }
+    let other_t = tc_lookup_node_tid(other)
+    if other_t >= 0 && is_integer_type(tc_resolve(resolve_alias_tid(other_t))) != 0 { return }
+    skip.insert(lit)
+}
+
+// Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
+// harness reach the same pass by the same name.
 
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut owners: List[Int] = List.with_capacity(node_count())

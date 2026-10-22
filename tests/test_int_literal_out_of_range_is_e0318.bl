@@ -47,6 +47,17 @@ fn expect_errors_without(name: Str, src: Str, count: Int, want: List[Str], absen
     problems.join("\n")
 }
 
+// Checks a program for texts its report must not hold, whether the check passes or not.
+fn expect_report_without(name: Str, src: Str, absent: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("check {name}.bl")
+    let mut problems: List[Str] = []
+    for a in absent {
+        if r.err_out.contains(a) { problems.push("{name}: want no `{a}` in:\n{r.err_out}") }
+    }
+    problems.join("\n")
+}
+
 fn expect_errors(name: Str, src: Str, count: Int, want: List[Str]) -> Str {
     expect_errors_without(name, src, count, want, [])
 }
@@ -209,6 +220,25 @@ test "a literal with no expected type is Int, and the help offers U64 when it fi
     let _x: Int = 9223372036854775808
 }
 "#, 1, ["error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int"], ["help: let"]),
+        expect_errors("default_help_keeps_the_declaration", #"const B = 9223372036854775808
+pub const C = 9223372036854775808
+pub let G = 9223372036854775808
+fn main() {
+    let mut m = 9223372036854775808
+    m = 1
+    io.println("{B} {C} {G} {m}")
+}
+"#, 4, [
+            "help: const B: U64 = 9223372036854775808",
+            "help: pub const C: U64 = 9223372036854775808",
+            "help: pub let G: U64 = 9223372036854775808",
+            "help: let mut m: U64 = 9223372036854775808",
+        ]),
+        expect_errors_without("list_of_default_literals_is_the_default_form", #"fn main() {
+    let zs = [1, 9223372036854775808]
+    io.println("{zs.len()}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type"], ["(-9223372036854775808 to"]),
         expect_errors("default_negative_below_int_min", #"fn main() {
     let low = -9223372036854775809
     io.println("{low}")
@@ -261,6 +291,22 @@ fn main() {
     io.println("{p.x}")
 }
 "#, 1, ["error[IntLiteralOutOfRange]: 128 does not fit in I8 (-128 to 127)"]),
+        expect_errors("generic_struct_field", #"type G2[T] { a: T, b: T }
+fn main() {
+    let x: U8 = 1
+    let g = G2 { a: x, b: 300 }
+    io.println("{g.b}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"]),
+        expect_errors("wrapping_method_argument", #"fn main() {
+    let x: U8 = 1
+    io.println("{x.wrapping_add(300)} {x.wrapping_mul(1000)} {x.wrapping_sub(-1)}")
+}
+"#, 3, [
+            "error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)",
+            "error[IntLiteralOutOfRange]: 1000 does not fit in U8 (0 to 255)",
+            "error[IntLiteralOutOfRange]: -1 does not fit in U8",
+        ]),
         expect_errors("assignment", #"fn main() {
     let mut v: U8 = 1
     v = 256
@@ -321,6 +367,13 @@ test "an out-of-range literal gives one error and no other" {
     let _x: U8 = n + 300
 }
 "#, 1, ["variable `_x`: declared type U8 but got Int"], ["IntLiteralOutOfRange"]),
+        // The operator or the name is the error; the literal beside it is not reported too.
+        expect_errors_without("operand_beside_a_bad_value", #"fn main() {
+    let f: Float = 1.5
+    let _x: U64 = f + 9223372036854775808
+    let _y: U64 = nope + 9223372036854775808
+}
+"#, -1, ["incompatible types Float", "nope"], ["IntLiteralOutOfRange"]),
         // The count is left open: `@allow` of an error name is an error of its own.
         expect_errors("allow_does_not_turn_it_off", #"@allow(IntLiteralOutOfRange)
 fn main() {
@@ -352,9 +405,54 @@ test "a literal pattern and a range bound take the scrutinee type" {
     }
     io.println(s)
 }
-"#, 1, ["error[IntLiteralOutOfRange]: 128 does not fit in I8 (-128 to 127)"], ["NonExhaustive", "Unreachable", "warning"]),
+"#, 1, ["error[IntLiteralOutOfRange]: 128 does not fit in I8 (-128 to 127)", "--> range_pattern_bound.bl:4:13"], ["NonExhaustive", "Unreachable", "warning"]),
+        expect_errors_without("each_range_bound_at_its_place", #"fn main() {
+    let u: U8 = 1
+    let s = match u {
+        0..=300 => "a"
+        256..=400 => "b"
+        _ => "c"
+    }
+    io.println(s)
+}
+"#, 3, [
+            "error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)",
+            "--> each_range_bound_at_its_place.bl:4:13",
+            "error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)",
+            "--> each_range_bound_at_its_place.bl:5:9",
+            "error[IntLiteralOutOfRange]: 400 does not fit in U8 (0 to 255)",
+            "--> each_range_bound_at_its_place.bl:5:15",
+        ], ["NonExhaustive", "Unreachable", "warning"]),
+        // A Char pattern spells no integer literal, so its code point is no E0318.
+        expect_report_without("char_pattern_is_no_integer_literal", #"fn main() {
+    let x: I8 = 5
+    let s = match x {
+        'é' => "e"
+        'a'..='é' => "r"
+        _ => "o"
+    }
+    io.println(s)
+}
+"#, ["IntLiteralOutOfRange"]),
     ])
     let _ = sh("rm -rf {DIR}")
+}
+
+test "a [lints] entry does not turn E0318 off or down" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/blink.toml", "[package]\nname = \"lints_probe\"\nversion = \"0.1.0\"\n\n[lints]\nIntLiteralOutOfRange = \"off\"\nE0318 = \"warn\"\n")
+    write_file("{DIR}/main.bl", #"fn main() {
+    let x: U8 = 300
+    io.println("{x}")
+}
+"#)
+    let r = blink_in_dir("run main.bl")
+    let _ = sh("rm -rf {DIR}")
+    if r.exit_code == 0 || !r.err_out.contains("error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)") {
+        io.eprintln("exit {r.exit_code}\nout:\n{r.out}\nerr:\n{r.err_out}")
+    }
+    assert(r.exit_code != 0)
+    assert(r.err_out.contains("error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"))
 }
 
 test "a const out of range is E0318, not a const evaluation error" {
