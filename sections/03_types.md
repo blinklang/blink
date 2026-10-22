@@ -3898,6 +3898,8 @@ error[SealedTraitImpl]: sealed trait
   = help: define a named method instead: `fn add(self, other: Vector2) -> Vector2`
 ```
 
+**`Add` is commutative.** For every type that implements `Add`, `a + b == b + a`, or both panic. For Float, `==` is the total order (*Float Total Ordering*), so every NaN is equal to every other NaN, whatever its sign or payload. Blink states no associativity law for `Add`: Int `+` is checked (overflow panics), and Float `+` rounds. A type whose `+` would not be commutative does not implement `Add`. `Str`, `Bytes` and `List` joining are such operations (§2.19 *String Concatenation*).
+
 `Bool` is not a numeric type, so `+ - * / %` reject a `Bool` operand -- the same rule the bitwise operators follow. Blink has no truthiness, so a `Bool` never reads as 0 or 1 (§3.4 *`Bool` Is Distinct from `Int`*). Count with an explicit conditional:
 
 ```blink

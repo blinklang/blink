@@ -23,7 +23,7 @@ See `CHANGELOG.md` (also printed by `blink llms --full`).
 - `"double quotes"` ONLY — no single quotes for strings
 - Universal string interpolation: `"Hello, {name}!"` — every string supports `{expr}`
 - `io.println(...)` NOT `print(...)` — IO goes through effect handles
-- NO `+` on strings — use interpolation `"{a}{b}"` or `.concat()`
+- NO `+` or `+=` on strings (E0521) — use interpolation `"{a}{b}"` or `.concat()`
 - Square bracket generics: `List[T]` NOT `List<T>`
 - Method calls always: `x.len()` NOT `x.len` (no properties)
 - `main` has implicit effects — no annotation needed on `fn main()`
@@ -417,13 +417,13 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 
 | Op | Types | Notes |
 |----|-------|-------|
-| `+` `-` `*` `/` `%` | Int, Float | Arithmetic (NO `+` on Str). A `Bool` operand is rejected (`E0300`) — Blink has no truthiness, so count with `if c { 1 } else { 0 }`. |
+| `+` `-` `*` `/` `%` | Int, Float | Arithmetic (NO `+` on Str, E0521). A `Bool` operand is rejected (`E0300`) — Blink has no truthiness, so count with `if c { 1 } else { 0 }`. |
 | `==` `!=` `<` `>` `<=` `>=` | Int, Float, Str, `Instant`/`Duration`, `Bytes`, and any struct/enum with `@derive(Eq)` (for `==`/`!=`) or `@derive(Ord)` (for ordering) | Comparison. Operands are type-checked (`E0300` on mismatched/unordered types); struct/enum comparisons desugar to derived `eq`/`cmp`. |
 | `&&` `\|\|` `!` | Bool | Logical |
 | `?` | Result[T,E] | Propagate error — enclosing fn must return Result |
 | `??` | Option[T] | Unwrap or default |
 | `\|>` | Any | Pipe: `x \|> f()` = `f(x)` |
-| `+=` `-=` `*=` `/=` | Int, Float | Compound assignment (mut only) |
+| `+=` `-=` `*=` `/=` | Int, Float | Compound assignment (mut only). NO `+=` on Str (E0521) |
 | `&` `\|` `^` `~` | Int, sized ints | Bitwise AND / OR / XOR / NOT. Shifts and each of `&` `^` `\|` are separate groups: mixing two groups, or a group with `+ - * / %`, needs parentheses (`(d << 24) \| (d << 16)`, error E1127 otherwise). All bind tighter than comparison: `flags & 0x0F == 0` is `(flags & 0x0F) == 0` |
 | `<<` `>>` | Int, sized ints | Shift (amount is `U32`; arithmetic on signed, logical on unsigned). Out-of-range literal shifts caught at compile time; non-literal amounts get a runtime bounds check. |
 

@@ -1813,16 +1813,39 @@ For a field path, `s.f op= rhs` reads `s.f`, evaluates `rhs`, applies `op`, and 
 
 #### String Concatenation
 
-`+` does **not** work on `Str`. Use interpolation or `.concat()`.
+`+` and `+=` do **not** work on `Str`. Both are `error[StrPlusUnsupported]` (E0521). Use interpolation or `.concat()`.
 
 ```blink
-let full = first + " " + last   // compile error: Str does not implement Add
+let full = first + " " + last   // error[StrPlusUnsupported] (E0521)
+s += "x"                        // error[StrPlusUnsupported] (E0521)
 
 let full = "{first} {last}"              // interpolation (preferred)
 let full = first.concat(" ").concat(last) // .concat() for dynamic cases
 ```
 
-String `+` encourages O(n²) loops, creates ambiguity with numeric `+`, and violates Principle 2 when interpolation already exists. (Vote: 5-0)
+Two reasons:
+
+- `+` is the `Add` trait, and `Add` is commutative (§3.6 *Arithmetic Traits*). Joining strings is not: `"ab"` is not `"ba"`. So `Str` does not implement `Add`.
+- Interpolation already joins any number of values, `Str` or not. A `+` on `Str` would be a second spelling for the same join (Principle 2).
+
+(Vote: 5-0; re-audited 5-1)
+
+**One diagnostic per chain.** A *chain* is a run of `+` that the parser groups as one left-nested tree. Its operands are the expressions between the `+` signs. An operand of higher precedence is one operand of the chain: in `n * 2 + s`, the operands are `n * 2` and `s`. A parenthesized `+` is its own chain. A chain with any operand of type `Str` gets one E0521 over the whole chain, not one per `+`.
+
+**The fix.** The fix replaces the chain with one interpolated string. It has one hole per operand, in the written order. Where an operand is a `Str` literal, the fix copies its text into the string and writes each `{` and `}` as `\{` and `\}`. The fix is machine-applicable only when every operand has type `Str`. If any operand has another type, the fix is a suggestion with the exact replacement text, because that operand would need `Display`, and the author did not write that call.
+
+```
+error[StrPlusUnsupported]: `+` does not work on Str
+ --> total.bl:3:15
+  |
+3 |     let msg = "total: " + a + b
+  |               ^^^^^^^^^^^^^^^^^ a `Str` operand in a `+` chain
+  |
+  = help: join the operands with one interpolated string (not machine-applicable, because `a` and `b` are not `Str`):
+          "total: {a}{b}"
+```
+
+Here `a: Int`. A `+=` on a `Str` place gets the same E0521. The place can be a variable or a field, such as `p.name += t`. The fix is `s = "{s}{t}"`, with the same rule for when it is machine-applicable. (Vote: 6-0 for the diagnostic and one error per chain; 5-1 for the rule on machine-applicable fixes)
 
 ### 2.20 Test Blocks
 

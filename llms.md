@@ -27,7 +27,7 @@ Key facts:
 - Error handling: `Result[T, E]` + `?` propagation, `Option[T]` + `??` default
 - Effects: `fn foo() ! IO, DB` — tracked in signatures, provided by handlers
 - `io.println(...)` not `print(...)` — IO goes through effect handles
-- No string `+` operator — use interpolation or `.concat()`
+- NO `+` or `+=` on strings (E0521) — use interpolation or `.concat()`
 - `mut` goes on each name in a pattern: `let (mut x, y) = pair`, `for (k, mut v) in pairs`, `Some(mut n) =>`. `let mut (x, y)` is `E0613`; `blink fix` rewrites it
 - The unit type is `()`. `Void` exists only in `Ptr[Void]`
 - No silent type defaults: an empty `[]`, a bare `None` or an unused `Map()` is `E0301`. Annotate it, or write `List.new[T]()`, `Map.new[K, V]()`, `Set.new[T]()`
