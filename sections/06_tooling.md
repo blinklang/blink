@@ -559,7 +559,7 @@ my-lib = { path = "../my-lib" }
 external = { git = "https://github.com/org/pkg.git", tag = "v0.1" }
 ```
 
-The `blink.toml` schema is **forward-compatible**: adding `version = "1.0"` registry deps in v2 requires no schema changes. The registry is an additional source, not a replacement.
+The `blink.toml` schema is **forward-compatible**: adding `version = "1.0"` registry deps in v2 requires no schema changes. The registry is an additional source, not a replacement. The schema reserves `version` now; §8.9.8 sets what a toolchain does with a key that this specification does not define.
 
 Import paths follow the `org/name` structure: `import std.http` maps to the `std/http` package. Local modules shadow dependencies with the same path, with compiler warning W1000 (§10.5).
 
@@ -586,7 +586,51 @@ W1001 is a warning, so a manifest written for a newer toolchain still builds (§
 
 A misspelled section often causes a second error later: the compiler does not see the dependencies in it. When W1001 fired in the same build, `ModuleNotFound` (E1200) and `PackageNotDeclared` (E1052) each add a `note:` that points at the unknown section.
 
-Unknown keys inside a defined section are not yet specified.
+**Unknown keys.** Some tables have keys that this specification fixes. These tables are *closed*: `[package]`, `[capabilities]`, each dependency entry (the inline table of a key in `[dependencies]` or `[dev-dependencies]`) and each native-dependency entry (§9.1.2). Their keys are the keys that §8.9.3 and §9.1.2 list. The keys of `[dependencies]`, `[dev-dependencies]`, `[native-dependencies]`, `[alternatives]` and `[lints]` are names, and the checks for those names apply (for `[lints]`, §4.16.8 and E0842); the rules below do not apply to them.
+
+A field that picks a build input is an error. Other unknown keys are warnings:
+
+- An unknown key in `[package]` or `[capabilities]` is the warning `UnknownManifestKey` (W1002). The toolchain reads the section without the key. `--strict` and a `[lints]` entry can make W1002 an error, as for W1001.
+- An unknown field in a dependency entry or a native-dependency entry is the error `UnknownDependencyField` (E1014). No `[lints]` entry changes it. These fields choose what the toolchain fetches, compiles or links, so a field that the toolchain ignores builds a different program. For example, if `tga` stands for `tag`, the toolchain fetches the default branch and `blink.lock` pins it. The message has one `note:` line that gives this reason.
+
+Both diagnostics span the key. The help line offers the nearest key of the same table (ERROR_CATALOG.md, *Conventions*). A key of another table is never a candidate.
+
+```toml
+[package]
+name = "x"
+version = "0.1.0"
+nmae = "y"
+```
+
+```
+warning[UnknownManifestKey]: `[package]` has no key `nmae`
+ --> blink.toml:4:1
+  |
+4 | nmae = "y"
+  | ^^^^
+  = help: did you mean `name`?
+```
+
+```toml
+[dependencies]
+internal/lib = { git = "https://github.com/org/lib.git", tga = "v1.0" }
+```
+
+```
+error[UnknownDependencyField]: dependency entry has no field `tga`
+ --> blink.toml:2:58
+  |
+2 | internal/lib = { git = "https://github.com/org/lib.git", tga = "v1.0" }
+  |                                                          ^^^
+  = help: did you mean `tag`?
+  = note: an unknown field changes what is built, so it is never ignored
+```
+
+W1002 keeps a manifest that a newer toolchain wrote building on an older toolchain, when the new key is metadata (§8.9.7). A new entry field is added to this specification before any toolchain reads it, as `version` was (§8.9.7). An older toolchain stops on a field that it cannot honour.
+
+Each unknown key gets its own diagnostic, in source order. The toolchain checks the whole manifest before the load fails on E1014. The section check comes first: a section that W1001 reports gets no key diagnostic, also when a dotted key at the top level opens that section.
+
+When `[package]` lacks a required key (`name` or `version`) and W1002 fired in `[package]`, the error for the missing key adds a `note:` that points at the unknown key, as E1200 and E1052 do after W1001.
 
 ---
 
