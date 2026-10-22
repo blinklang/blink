@@ -5766,12 +5766,26 @@ fn tc_int_literal_type(node: Int) -> Int {
 // either side (sections/03_types.md *Operator operands*). The other operand's type is known
 // only once it is inferred, so this runs after both operands are, and it overrides a type an
 // expected type gave the literal before: in `let x: U64 = n + 1` with `n: Int`, the `1` is
-// Int, and the let reports Int. Whether `lit` took `other_t`.
+// Int, and the let reports Int.
 fn tc_literal_takes_operand(lit: Int, other: Int, other_t: Int) -> Bool {
     if is_int_literal_node(lit) == 0 || is_int_literal_node(other) != 0 { return false }
     if tc_tid_is_no_info(other_t) != 0 || is_integer_type(resolve_alias_tid(tc_resolve(other_t))) == 0 { return false }
     tc_literal_takes(lit, other_t)
     true
+}
+
+// The type a literal operand of `node` took from the other operand, or -1 when neither
+// operand is a lone literal beside an integer.
+fn tc_operand_literal_type(node: Int, lt: Int, rt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_literal_takes_operand(node_right(node), node_left(node), lt) { return lt }
+    if tc_literal_takes_operand(node_left(node), node_right(node), rt) { return rt }
+    -1
+}
+
+// Whether the lone literal operand of `node` fits `lit_t`, the type it took.
+fn tc_operand_literal_fits(node: Int, lit_t: Int) -> Bool {
+    let lit = if is_int_literal_node(node_right(node)) != 0 { node_right(node) } else { node_left(node) }
+    tc_literal_fits(lit, type_kind(tc_resolve(resolve_alias_tid(lit_t))))
 }
 
 fn tc_literal_fits(node: Int, k: TyKind) -> Bool {
@@ -8125,6 +8139,7 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
     while li < got {
         // A call argument is expression context (§2.9): an else-less `if` passed as an
         // argument has no value on the false path. Infer in value context.
+        if li < expected { tc_seed_expected_into_value(sublist_get(args_sl, li), ty_param_list.get(pstart + li).unwrap()) }
         let arg_tid = tc_infer_value(sublist_get(args_sl, li))
         if li < expected {
             let ptid = ty_param_list.get(pstart + li).unwrap()
@@ -18588,10 +18603,10 @@ fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int)
         let f = sublist_get(flds_sl, fi)
         let v = node_value(f)
         if v != -1 {
-            let mut declared = -1
-            if var_idx != -1 { declared = lookup_evfield_type_by_name(var_idx, node_name(f)) }
+            let mut raw = -1
+            if var_idx != -1 { raw = lookup_evfield_type_by_name(var_idx, node_name(f)) }
             // At an instance (`Tree[Option[Str]]`) a field is typed at the instance's arguments.
-            if declared != -1 { declared = resolve_alias_tid(tc_subst_evfield_from_instance(declared, enum_tid)) }
+            let declared = if raw != -1 { resolve_alias_tid(tc_subst_evfield_from_instance(raw, enum_tid)) } else { -1 }
             // A closure or handler value is typed too, so tc_check_lit_field_values can hold it
             // to the field.
             if node_kind(v) == NodeKind.Closure && type_kind(declared) == TyKind.Fn {
@@ -18602,7 +18617,10 @@ fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int)
                 let _ = infer_type(v)
             } else {
                 let saved_hint = tc_construct_hint
-                if declared != -1 && tc_tid_is_no_info(declared) == 0 { tc_construct_hint = declared }
+                if declared != -1 && tc_tid_is_no_info(declared) == 0 {
+                    tc_construct_hint = declared
+                    tc_seed_declared_field(raw, declared, v)
+                }
                 let vt = infer_type(v)
                 tc_construct_hint = saved_hint
                 if declared != -1 && tc_tid_is_no_info(declared) == 0 && tc_tid_has_unbound_metavar(vt) != 0 {
@@ -22885,12 +22903,11 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
     // Comparison operators desugar to Eq.eq / Ord.cmp and require
     // same-type operands (spec 03_types.md:1809). Validate when both sides
     // are known, preserving the enum-vs-Int representation exception
-    // (03_types.md:1093) and untyped-int-literal coercion to a sized int.
+    // (03_types.md:1093). An int literal beside an integer operand takes that operand's type
+    // first, so `x == 1` holds for any integer `x`.
     if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
         if cmp_is_enum_int_pair(lt, rt) == 0 {
-            let lit_r = tc_literal_takes_operand(node_right(node), node_left(node), lt)
-            let lit_l = !lit_r && tc_literal_takes_operand(node_left(node), node_right(node), rt)
-            if !lit_r && !lit_l {
+            if tc_operand_literal_type(node, lt, rt) < 0 {
                 let relational = if op == "==" || op == "!=" { 0 } else { 1 }
                 let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { reject_ord_less_operands(lt, rt, node) }
                 if refused == 0 && cmp_operands_ok(lt, rt, relational) == 0 {
@@ -23318,7 +23335,7 @@ fn tc_check_spread_sources(elems_sl: Int, elem_t: Int) ! TypeCheck.Resolve, Type
 // the type — `[None, Some(4)]` would otherwise be E0301, because element 0 contributes
 // `Option[α]` and the constraint in element 1 is computed and thrown away. Pinning α from a
 // later element is inference, not Void-defaulting: the literal determines the type.
-fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first: Int, first_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node_kind(elem) == NodeKind.SpreadExpr { return }
     if tc_tid_is_no_info(first_t) != 0 || tc_tid_is_no_info(elem_t) != 0 { return }
     // Both resolutions, because the two paths in check_arg_value spell this escape differently —
@@ -23327,7 +23344,9 @@ fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first_t: Int) ! T
     if is_int_literal_node(elem) != 0 {
         if is_integer_type(resolve_alias_tid(first_t)) != 0 || is_integer_type(tc_resolve(first_t)) != 0 {
             tc_literal_takes(elem, first_t)
-            return
+            // A first literal took its type from the expected one; a later literal out of that
+            // type's range keeps Int and mismatches, as it did before the first literal took it.
+            if is_int_literal_node(first) == 0 || tc_literal_fits(elem, type_kind(tc_resolve(resolve_alias_tid(first_t)))) { return }
         }
     }
     if tc_tid_has_unbound_metavar(first_t) != 0 || tc_tid_has_unbound_metavar(elem_t) != 0 {
@@ -23988,8 +24007,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if type_kind(resolve_alias_tid(lt)) != TyKind.Typevar || type_to_str(lt) != "Self" {
                 reject_non_numeric_arith_operand(op, rt, node, 0)
             }
-            if tc_literal_takes_operand(node_right(node), node_left(node), lt) { return lt }
-            if tc_literal_takes_operand(node_left(node), node_right(node), rt) { return rt }
+            let lit_t = tc_operand_literal_type(node, lt, rt)
+            if lit_t >= 0 { return lit_t }
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
                 if types_compatible(lt, rt) == 0 {
                     tc_error_at("binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
@@ -24005,8 +24024,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_tid_is_no_info(rt) == 0 && is_integer_type(rt) == 0 {
                 tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(rt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, rt))
             }
-            if tc_literal_takes_operand(node_right(node), node_left(node), lt) { return lt }
-            if tc_literal_takes_operand(node_left(node), node_right(node), rt) { return rt }
+            // A literal out of the other operand's range keeps Int and so mismatches: unlike
+            // arithmetic, a bitwise operator has no overflow panic, and C would truncate it.
+            let lit_t = tc_operand_literal_type(node, lt, rt)
+            if lit_t >= 0 && tc_operand_literal_fits(node, lit_t) { return lit_t }
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 && types_compatible(lt, rt) == 0 {
                 tc_error_at("bitwise `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
             }
@@ -26263,7 +26284,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             while ei < sublist_length(elems_sl) {
                 let elem = sublist_get(elems_sl, ei)
                 let c = tc_list_elem_contribution(elem)
-                tc_check_list_elem_compat(elem, tc_fn_value_open_ret(elem, c), ei, first_cmp)
+                tc_check_list_elem_compat(elem, tc_fn_value_open_ret(elem, c), ei, sublist_get(elems_sl, 0), first_cmp)
                 tc_tie_fn_rets(first_t, c)
                 ei = ei + 1
             }
@@ -29019,8 +29040,8 @@ fn tc_walk_stmt_value(val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
 // @allow: as tc_walk_stmt_value.
 @allow(UnrestoredMutation)
 fn tc_infer_assigned_value(target_t: Int, val: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    // The target declares the value's type as a typed `let` does, so a closure takes its
-    // signature from it.
+    // The target gives the value its type as a typed `let` does: a literal takes it, and a
+    // closure takes its signature from it.
     tc_seed_expected_into_value(val, target_t)
     let t = tc_infer_value_under(target_t, val)
     let reread = tc_value_awaits_closure_ret(val)
@@ -29377,9 +29398,9 @@ fn tc_infer_returned_value_with_hint(val: Int, returns_value: Bool, hint: Int) -
 }
 
 fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    // A closure in return position takes its signature from the declared return, the
-    // same way a call argument takes it from the formal. Seeded before the value is
-    // inferred and walked, which is where the closure body reads it. Inside a closure
+    // A value in return position takes the declared return before it is inferred, the same
+    // way a call argument takes the formal: a literal needs it to be other than Int, and a
+    // closure body reads its signature from it while it is walked. Inside a closure
     // body tc_current_fn_ret is that closure's own return (tc_check_closure_body_against_own_ret).
     if returns_value { tc_seed_expected_into_value(val, tc_current_fn_ret) }
     if returns_value { tc_infer_value(val) } else { infer_type(val) }
@@ -29398,8 +29419,8 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         tc_fn_body_block = 0
         nr_push_scope()
         let stmts_sl = node_stmts(node)
-        // The implicit tail of a value-returning fn is a return position, so a closure there
-        // takes its signature from the declared return. The tail compare below runs AFTER the
+        // The implicit tail of a value-returning fn is a return position, so a literal or a
+        // closure there takes the declared return. The tail compare below runs AFTER the
         // walk; the seed has to be in hand BEFORE it, because the walk is what checks the body.
         let mut hint_tail = -1
         let value_fn_body = is_fn_body != 0 && tc_fn_returns_value()
