@@ -1483,7 +1483,7 @@ Inside a list literal, `..expr` expands all elements from the source list:
 
 ```blink
 let copy = [..original]
-let combined = [..list1, ..list2]
+let combined = [..list1, ..list2, ..list3]
 let prepended = [first_item, ..rest]
 let interleaved = [..heads, separator, ..tails]
 ```
@@ -1495,6 +1495,7 @@ let interleaved = [..heads, separator, ..tails]
 - Spreads can appear at **any position** (unlike struct `..source` which must be last) — lists are ordered sequences with no key conflicts.
 - Spreads evaluate **left-to-right** and produce a new list (eager copy, not lazy view). `[..a, ..a]` copies `a` twice. Spreads and plain elements evaluate together in written order (§2.22).
 - Runtime cost: O(n) per spread source — same as any eager list construction.
+- Two lists and nothing else join with `a.append(b)`, not `[..a, ..b]` (§3.2.2 *Concatenation*).
 
 **Panel vote: 5-0** for including list spread in v1. The pattern/construction duality (`[first, ..]` deconstructs, `[..list, extra]` constructs) and absence of `.clone()` on lists made this essential. See [DECISIONS.md](../DECISIONS.md).
 

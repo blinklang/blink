@@ -140,6 +140,9 @@ When a trait bound fails because `Never` has no impl of the trait (E0306), the e
 | `parse_int(s)` | `s.parse_int()` (§3.2.1 *Parsing*) | yes: `Int` becomes `Result[Int, ConversionError]`, and text such as `"12x"` or `""` gives `Err` |
 | `parse_float(s)` | `s.parse_float()` | yes: `Float` becomes `Result[Float, ConversionError]`, and text such as `"1.5x"` or `""` gives `Err` |
 | `json_escape_str(s)` | `json.stringify(JsonValue.Str(s))` (§3.6.2) | yes: the result has the surrounding quotes |
+| `list_concat(a, b)` | `a.append(b)` (§3.2.2 *Concatenation*) | no |
+| `xs.chain(ys)` on `List` | `xs.append(ys)`; for a lazy sequence, `xs.into_iter().chain(ys.into_iter())` (§3c.1) | no |
+| `m.contains_key(k)` on `Map` | `m.contains(k)` (§3.2.2 *The `Contains` Trait*) | no |
 
 ```
 error[UndefinedFunction]: undefined function `parse_int`
@@ -153,9 +156,22 @@ error[UndefinedFunction]: undefined function `parse_int`
   = help: `.parse_int()` returns `Result[Int, ConversionError]`; add `?` or match on the result
 ```
 
+**Removed methods.** A row that names a method call also names the receiver type. The compiler looks at such a row only when method lookup fails for a receiver of that type, so `Iterator.chain` and a `chain` method from a user trait on `List` still resolve as usual. The failed call is the usual unresolved-method error (E0505), and it carries the fix from the row. The third column and the `blink fix` rules apply to a method row as they do to a function row. The table holds only names that a released version of Blink or its standard library accepted.
+
+```
+error[UnresolvedMethod]: no method `contains_key` on `Map[Str, Int]`
+ --> main.bl:4:12
+  |
+4 |     if ages.contains_key("ann") {
+  |             ^^^^^^^^^^^^ not found
+  |
+  = note: `contains_key` was removed; `contains` tests key presence on a `Map`
+  = fix: ages.contains("ann")
+```
+
 Some names have no method twin, because a different form is the one way. A loop over a collection is a `for` loop: there is no `for_each` method on `List` or `Map`. A method-not-found error for `xs.for_each(f)` or `m.for_each(f)` gives help that shows the `for` loop. A `Str` from a codepoint goes through `Char`. A JSON string goes through the JSON encoder.
 
-(Panel vote: 6-0 on the table. See [Removed Function Forms rationale](../decisions/removed-function-forms.md).)
+(Panel vote: 6-0 on the table. See [Removed Function Forms rationale](../decisions/removed-function-forms.md). The `list_concat`, `List.chain` and `Map.contains_key` rows and the method rows: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
 
 #### §3.2.1 String Methods
 
@@ -643,7 +659,7 @@ Every `with_capacity` constructor (`List`, `StringBuilder`) follows the same rul
 
 ##### The `Contains` Trait
 
-`Contains` provides membership testing across all collection types. It is the one operation with identical semantics on lists (linear scan), maps (key lookup), and sets (hash lookup).
+`Contains` provides membership testing across all collection types. It is the one membership name on lists (linear scan), maps (key lookup), and sets (hash lookup).
 
 ```blink
 trait Contains[T] {
@@ -655,11 +671,11 @@ trait Contains[T] {
 |------|---------------------|
 | `Set[T]` | Hash-based membership test |
 | `List[T]` | Linear scan for element equality; needs `T: Eq` |
-| `Map[K, V]` | Key presence check (equivalent to `contains_key`) |
+| `Map[K, V]` | Key presence check |
 
 **Why a shared trait.** Containment is a universal set-theoretic predicate — "is X in this collection?" Every collection answers it, and generic code benefits: `fn has_item[C: Contains[T], T](c: C, item: T) -> Bool { c.contains(item) }`. The alternative — putting `contains` in each per-type trait — prevents writing functions generic over "any collection that can test membership." (Vote: 5-0.)
 
-`Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` is equivalent to `Map.contains_key(k)`. `List[T].contains` needs `T: Eq` and compares elements with `==` (§3.6 *Container Equality*) in a linear scan, so it applies to lists of `Eq` structs, enums and nested containers as well as primitives. An element type that does not implement `Eq` is a compile error (`UnresolvedMethod`).
+`Set`, `Map`, and `List` all implement `Contains`. `Map.contains(k)` tests whether `k` is a key; it does not look at values. Each impl states what `contains` means for its type. The trait states no general rule that ties `contains` to iteration: a `Map` iterates `(K, V)` pairs, but its `contains` takes a key. `List[T].contains` needs `T: Eq` and compares elements with `==` (§3.6 *Container Equality*) in a linear scan, so it applies to lists of `Eq` structs, enums and nested containers as well as primitives. An element type that does not implement `Eq` is a compile error (`UnresolvedMethod`).
 
 **Note on `Str`.** `Str` exposes substring search as `"hello".contains("ell")` — semantically "contains substring," not "contains element." This routes through `StrOps` (§3.2.1); `Str` is not a meaningful `Contains[Char]` element-membership type. For character search use `someStr.contains("{c}")`.
 
@@ -757,6 +773,21 @@ items.last()                         // Some(5)
 items.clear()                        // items is now [], capacity retained
 ```
 
+**Concatenation.** Each concatenation has one form:
+
+- Two lists: `a.append(b)`.
+- A list literal with extra elements, or three or more sources: spread, `[..a, x, ..b]` (§2.16 *List Literal Spread*).
+
+Both forms make a new list in O(`a.len() + b.len()`) time, and neither operand changes. There is no `+` on lists, no `List.chain` and no `list_concat` (§3.2 *Removed function forms*). For a lazy sequence that does not copy, use `Iterator.chain` (§3c.1).
+
+```blink
+let all = evens.append(odds)              // two lists
+let framed = [header, ..rows, footer]     // literal with extra elements
+let merged = [..a, ..b, ..c]              // three sources
+```
+
+(Panel vote: 5-1, Minimalism dissenting for spread only; 6-0 on the cost text. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
+
 **Sorting.** `sort` and `sort_by` return a sorted copy. The receiver keeps its order. Both sorts are **stable**: elements that compare `Equal` keep their input order. There is no unstable sort. `sort` needs `T: Ord`. `sort_by` takes a comparator that returns `Ordering` (§3.6) and needs no bound on `T`. `xs.sort()` gives the same result as `xs.sort_by(fn(a, b) { a.cmp(b) })`. Because `sort` returns a copy, `xs.sort()` as a bare statement does nothing, and it draws warning W0606 (*Discarded copies* below).
 
 ```blink
@@ -816,7 +847,6 @@ trait MapOps[K, V] {
     fn values(self) -> List[V]
     fn entries(self) -> List[(K, V)]
     fn get_or_default(self, key: K, default: V) -> V
-    fn contains_key(self, key: K) -> Bool
 
     // Mutation (requires let mut)
     fn insert(self, key: K, value: V)
@@ -831,19 +861,18 @@ trait MapOps[K, V] {
 }
 ```
 
-The full `Map[K, V]` method surface (13 methods from `MapOps` + 2 from `Sized` + 1 from `Contains`):
+The full `Map[K, V]` method surface (12 methods from `MapOps` + 2 from `Sized` + 1 from `Contains`):
 
 | Method | Signature | Mutates | Notes |
 |--------|-----------|---------|-------|
 | `len` | `fn(self) -> Int` | no | Via `Sized` |
 | `is_empty` | `fn(self) -> Bool` | no | Via `Sized` |
-| `contains` | `fn(self, K) -> Bool` | no | Via `Contains`, key presence — equivalent to `contains_key` (see §3.2.2 *The `Contains` Trait*) |
+| `contains` | `fn(self, K) -> Bool` | no | Via `Contains`, key presence (see §3.2.2 *The `Contains` Trait*) |
 | `get` | `fn(self, K) -> Option[V]` | no | Lookup by key |
 | `get_or_default` | `fn(self, K, V) -> V` | no | Lookup with fallback |
 | `keys` | `fn(self) -> List[K]` | no | All keys, in iteration order |
 | `values` | `fn(self) -> List[V]` | no | All values, in iteration order |
 | `entries` | `fn(self) -> List[(K, V)]` | no | All key-value pairs, in iteration order |
-| `contains_key` | `fn(self, K) -> Bool` | no | Key presence check |
 | `insert` | `fn(self, K, V)` | yes | Insert or update |
 | `remove` | `fn(self, K) -> Option[V]` | yes | Remove by key |
 | `clear` | `fn(self)` | yes | Reset to empty, retains capacity |
@@ -859,8 +888,7 @@ config.insert("port", "8080")
 
 let host = config.get("host")              // Some("localhost")
 let timeout = config.get_or_default("timeout", "30")  // "30"
-config.contains_key("port")                // true
-config.contains("port")                    // true (Contains, same as contains_key)
+config.contains("port")                    // true (key presence)
 
 let ks = config.keys()                     // ["host", "port"] (insertion order)
 let vs = config.values()                   // ["localhost", "8080"] (insertion order)
@@ -888,7 +916,7 @@ let merged = base.merge(overrides)
 
 **Map adapters.** `filter`, `map_values`, `fold` and `merge` walk the map when they are called, in iteration order, and return a new value. The receiver does not change. The effect row of the call is the row of `f` or `pred` (§4.15.2), and each effect occurs during the call. `merge` is shallow: a value that is itself a `Map` is replaced, not merged. The merge is not symmetric. In `a.merge(b)`, `b`'s value wins for a key in both maps, and that key keeps its position from `a`. There is no `for_each` method on `Map`: use `for (k, v) in m { }`, as for `List`.
 
-**Why `contains_key` when `Contains` exists.** `Contains[K]` on `Map[K, V]` checks key presence — identical to `contains_key`. Both exist because `contains` comes from the generic `Contains` trait (for generic code) and `contains_key` lives in `MapOps` (for map-specific code that reads more clearly). They have identical semantics.
+**Why no `contains_key`.** `Contains[K]` on `Map[K, V]` already tests key presence, so a second name for the same test is a choice with no difference (Principle 2). `contains` is the name that generic code uses, and it is the name that Python's `k in d` and JavaScript's `Map.has` lead users to. `m.contains_key(k)` is a removed method (§3.2 *Removed methods*). (Panel vote: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
 
 **Why 9 methods (vote: 3-2).** Systems and PLT argued for 6, noting that `entries` duplicates `IntoIterator` (which yields `(K, V)` tuples) and `get_or_default` duplicates `get(k) ?? default`. Web/Scripting, DevOps, and AI/ML argued that `entries` is the standard "dump the map" operation every developer expects (Python's `dict.items()`, JS's `Map.entries()`), and `get_or_default` eliminates the most common map boilerplate pattern. Discoverability and training data representation won.
 
@@ -942,13 +970,13 @@ These are the **built-in method-surface traits** — the traits that host the me
 | `StrOps` | Str | string methods (`char_at`, `byte_at`, `contains`, `split`, `to_upper`, `trim`, `replace`, …) | Yes |
 | `BytesOps` | Bytes | byte methods (`push`, `get`, `slice`, `to_str`, `to_hex`, `read_u32_be`, …) | Yes |
 | `ListOps[T]` | List | 25 methods | Yes |
-| `MapOps[K, V]` | Map | 13 methods | Yes |
+| `MapOps[K, V]` | Map | 12 methods | Yes |
 | `SetOps[T]` | Set | 3 methods | Yes |
 | `IntoIterator[T]` | List, Map, Set, Str, Range, Channel | `into_iter` | Yes (§3c.1) |
 | `Joinable` | List[Str] | `join` | Yes (§3.2.1) |
 | `StringBuildOps` | StringBuilder | `write`, `write_char`, `to_str`, `len`, `capacity`, `clear` | Yes |
 
-> **`Contains` membership covers `Set`, `Map`, and `List`.** `Set.contains` is a hash lookup, `Map.contains` is key presence (identical to `contains_key`), and `List.contains` is a linear scan that compares elements with `==`, so it needs `T: Eq`. Substring search on `Str` (`"hello".contains("ell")`) is a separate operation hosted by `StrOps` (§3.2.1), not element membership.
+> **`Contains` membership covers `Set`, `Map`, and `List`.** `Set.contains` is a hash lookup, `Map.contains` is key presence, and `List.contains` is a linear scan that compares elements with `==`, so it needs `T: Eq`. Substring search on `Str` (`"hello".contains("ell")`) is a separate operation hosted by `StrOps` (§3.2.1), not element membership.
 
 All built-in method-surface traits are in the prelude — no import required. This matches the rationale from §10.6: operators like `for` desugar through `IntoIterator`, method calls resolve through traits, and requiring imports for built-in collection methods would add ceremony with no information value.
 

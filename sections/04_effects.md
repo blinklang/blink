@@ -242,10 +242,20 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 | `io.eprint(x)` | `T: Display` | stderr, no newline | No | No | Yes |
 | `io.print_raw(s)` | `Str` | raw stdout, no newline | No | No | No |
 | `io.eprint_raw(s)` | `Str` | raw stderr, no newline | No | No | No |
+| `io.print_raw_bytes(b)` | `Bytes` | raw stdout, the bytes as they are | No | No | No |
 
 The `_raw` variants are escape hatches for cases where direct stdout or stderr output is needed (e.g., streaming JSON fragments, progress indicators). They bypass the effect handler system entirely and emit no trace effects. Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
 
-**Argument types.** Each non-`_raw` operation takes any `Display` value, as `sb.write` and `"{x}"` do (§3.6 *Display Format Protocol*). So `io.println(42)`, `io.println(p)` and `io.println("n = {n}")` all compile, and a value with no `Display` impl is `error[E0523]` at the argument. The `_raw` operations take `Str` only. The split follows the `_raw` name, not the dispatch mode: `io.eprint` is not interceptable and still takes `Display`. A non-`Str` argument to a `_raw` operation is a type mismatch:
+**`_raw` writes.** A `_raw` operation writes every byte of its argument, and it flushes them before it returns. `io.print_raw_bytes(b)` writes NUL bytes and bytes that are not UTF-8 as they are, for binary output such as an image or a protocol frame. Under the default `IO.Print` handler, output from `io.print`, `io.println` and the stdout `_raw` operations appears on stdout in call order. A handler that intercepts `io.print` decides where its output goes, so this order rule does not apply to it.
+
+```blink
+fn progress(done: Int, total: Int) ! IO.Print {
+    io.println("copying")
+    io.print_raw("\r{done}/{total}")  // appears after "copying"
+}
+```
+
+**Argument types.** Each non-`_raw` operation takes any `Display` value, as `sb.write` and `"{x}"` do (§3.6 *Display Format Protocol*). So `io.println(42)`, `io.println(p)` and `io.println("n = {n}")` all compile, and a value with no `Display` impl is `error[E0523]` at the argument. `io.print_raw` and `io.eprint_raw` take `Str` only, and `io.print_raw_bytes` takes `Bytes`. The split follows the `_raw` name, not the dispatch mode: `io.eprint` is not interceptable and still takes `Display`. A non-`Str` argument to a `_raw` operation is a type mismatch:
 
 ```
 error[TypeError]: mismatched types
@@ -274,7 +284,7 @@ The `IO.Read` operations take and return other types (§4.4.9). The wrapper sele
 
 | Effect | Handle | Operations |
 |---|---|---|
-| `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)`, `io.read_line()`, `io.read_all()`, `io.read_bytes(...)` (§4.4.9) |
+| `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)`, `io.print_raw_bytes(...)`, `io.read_line()`, `io.read_all()`, `io.read_bytes(...)` (§4.4.9) |
 | `FS` / `FS.*` | `fs` | `fs.read(...)`, `fs.write(...)`, `fs.list_dir(...)`, `fs.stat(...)`, `fs.delete(...)`, `fs.watch(...)` (§4.4.5) |
 | `DB` / `DB.*` | `db` | `db.query(...)`, `db.query_one(...)`, `db.exec(...)`, `db.execute(...)`, `db.prepare(...)`, `db.begin()`, `db.commit()`, `db.rollback()` |
 | `Net` / `Net.*` | `net` | `net.request(...)`, `net.get(...)`, `net.post(...)`, `net.listen(...)`, `net.dns(...)` |
@@ -321,29 +331,33 @@ Handles also enable the handler mechanism (section 4.7). Because all effect oper
 
 Rule 2 permits a second tier: a std function or method that has a row but is not a handle op, such as `udp_bind` and `unix_listen` (§4.4.6). Rule 3 permits this only when no handle op made the value that the function consumes. The effect row gates a second-tier function as it gates a handle op, but no handler can intercept it (§4.10).
 
-**Removed free functions.** Earlier versions of Blink had free functions that performed side effects. Rule 1 removes them. A call to one of these names gives the usual undefined-function error (E0504), with a fix that names the replacement and its effect. The compiler keeps the table below for good. It looks in the table only when name lookup fails, so a program that declares its own `fn read_file` still compiles and calls that function.
+**Removed free functions.** Earlier versions of Blink had free functions that performed side effects. Rule 1 removes them. A call to one of these names gives the usual undefined-function error (E0504), with a fix that names the replacement and its effect. The compiler keeps the table below for good. It looks in the table only when name lookup fails, so a program that declares its own `fn read_file` still compiles and calls that function. The table also holds removed handle operations and removed `std` functions that took the place of a handle. A row for a handle operation follows the method rule of §3.2 *Removed methods*: the compiler looks at it only when lookup of that operation fails, and the error is E0505. The fourth column has the same meaning as the third column of the §3.2 table.
 
-| Removed name | Replacement | Effect |
-|---|---|---|
-| `read_file(p)` | `fs.read(p)` | `FS.Read` |
-| `write_file(p, s)` | `fs.write(p, s)` | `FS.Write` |
-| `list_dir(p)` | `fs.list_dir(p)` | `FS.Read` |
-| `fs_remove(p)` | `fs.delete(p)` | `FS.Delete` |
-| `file_exists(p)`, `is_dir(p)`, `file_mtime(p)` | `fs.stat(p)` (§4.4.5) | `FS.Read` |
-| `exit(c)` | `env.exit(c)` | `Env.Exit` |
-| `arg_count()`, `get_arg(i)` | `env.args()` | `Env.Read` |
-| `getpid()` | `env.pid()` | `Env.Read` |
-| `time_ms()` | `time.monotonic()` to measure elapsed time; `time.read().to_unix_ms()` for a timestamp (§3.2.3) | `Time.Read` |
-| `shell_exec(cmd)` | `process.run("sh", ["-c", cmd])` | `Process.Spawn` |
-| `process_run(cmd, args)` | `process.run(cmd, args)` | `Process.Spawn` |
-| `process_run_with_stdin(cmd, args, input)` | `process.run(cmd, args, stdin: Some(input))` | `Process.Spawn` |
-| `process_spawn(cmd, args)` | `process.spawn(cmd, args)` | `Process.Spawn` |
-| `process_pid_wait(pid)` | `process.wait(child)` | `Process.Spawn` |
-| `process_pid_kill(pid, sig)`, `process_pid_send_signal(pid, sig)` | `process.signal(child, sig)` | `Process.Signal` |
-| `process_exec(cmd, args)` | `process.exec(cmd, args)` | `Process.Spawn`, `Env.Exit` |
-| `unix_socket_listen(p)`, `unix_socket_accept(l)` | `unix_listen(p)`, `listener.accept()` in `std.net` (§4.4.6) | `Net.Listen` |
-| `unix_socket_connect(p)` | `unix_connect(p)` in `std.net` (§4.4.6) | `Net.Connect` |
-| `socket_read_line(s)`, `socket_write(s, x)`, `unix_socket_close(s)` | `stream.read_line()`, `stream.write(x)`, `stream.close()` on `UnixStream` (§4.4.6) | §4.4.6 |
+| Removed name | Replacement | Effect | Result changes |
+|---|---|---|---|
+| `read_file(p)` | `fs.read(p)` | `FS.Read` | yes: `Str` becomes `Result[Str, FsError]` |
+| `write_file(p, s)` | `fs.write(p, s)` | `FS.Write` | yes: the result becomes `Result[(), FsError]` |
+| `list_dir(p)` | `fs.list_dir(p)` | `FS.Read` | yes: the result becomes a `Result` |
+| `fs_remove(p)` | `fs.delete(p)` | `FS.Delete` | yes: the result becomes a `Result` |
+| `file_exists(p)`, `is_dir(p)`, `file_mtime(p)` | `fs.stat(p)` (§4.4.5) | `FS.Read` | yes: `Int` becomes `Result[FileInfo, FsError]` |
+| `exit(c)` | `env.exit(c)` | `Env.Exit` | no |
+| `arg_count()`, `get_arg(i)` | `env.args()` | `Env.Read` | yes: `Int` or `Str` becomes `List[Str]` |
+| `getpid()` | `env.pid()` | `Env.Read` | no |
+| `time_ms()` | `time.monotonic()` to measure elapsed time; `time.read().to_unix_ms()` for a timestamp (§3.2.3) | `Time.Read` | yes: `Int` becomes `Monotonic` or `Instant` |
+| `shell_exec(cmd)` | `process.run("sh", ["-c", cmd])` | `Process.Spawn` | yes: the result becomes `Result[_, ProcessError]` |
+| `process_run(cmd, args)` | `process.run(cmd, args)` | `Process.Spawn` | yes: the result becomes `Result[_, ProcessError]` |
+| `process_run_with_stdin(cmd, args, input)` | `process.run(cmd, args, stdin: Some(input))` | `Process.Spawn` | yes: the result becomes `Result[_, ProcessError]` |
+| `process_spawn(cmd, args)` | `process.spawn(cmd, args)` | `Process.Spawn` | yes: `Int` becomes `Result[Child, ProcessError]` |
+| `process_pid_wait(pid)` | `process.wait(child)` | `Process.Spawn` | yes: the argument is a `Child`, and the result becomes a `Result` |
+| `process_pid_kill(pid, sig)`, `process_pid_send_signal(pid, sig)` | `process.signal(child, sig)` | `Process.Signal` | yes: the argument is a `Child`, and the result becomes a `Result` |
+| `process_exec(cmd, args)` | `process.exec(cmd, args)` | `Process.Spawn`, `Env.Exit` | yes: the result becomes `Result[Never, ProcessError]` |
+| `unix_socket_listen(p)`, `unix_socket_accept(l)` | `unix_listen(p)`, `listener.accept()` in `std.net` (§4.4.6) | `Net.Listen` | yes: `Int` becomes a `Result` |
+| `unix_socket_connect(p)` | `unix_connect(p)` in `std.net` (§4.4.6) | `Net.Connect` | yes: `Int` becomes `Result[UnixStream, NetError]` |
+| `socket_read_line(s)`, `socket_write(s, x)`, `unix_socket_close(s)` | `stream.read_line()`, `stream.write(x)`, `stream.close()` on `UnixStream` (§4.4.6) | §4.4.6 | yes: reads and writes return a `Result` |
+| `io.write(s)` | `io.print_raw(s)` | `IO.Print` | no |
+| `io.write_bytes(b)` | `io.print_raw_bytes(b)` | `IO.Print` | no |
+| `db_connect(path)`, `sqlite_connect(path)` in `std.db_sqlite` | `with db.connect(path)? { }` (§4.7.2 *Scoped effect handlers*) | `DB` | yes: the result becomes `Result[Connection, DBError]` |
+| `sqlite_handler(handle)` in `std.db_sqlite` | `with db.connect(path)? { }` | `DB` | yes: the argument is a path, and the result becomes `Result[Connection, DBError]` |
 
 ```
 error[UndefinedFunction]: undefined function `read_file`
@@ -357,7 +371,7 @@ error[UndefinedFunction]: undefined function `read_file`
   = help: `fs.read` needs `FS.Read` in the effect row and returns `Result[Str, FsError]`
 ```
 
-In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count` and `get_arg` change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable.
+In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg` and `sqlite_handler` change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
 
 ---
 
@@ -1799,17 +1813,20 @@ fn run_with_postgres(config: DBConfig) ! DB, IO.Log {
     }
 }
 
-fn run_with_sqlite(path: Str) ! DB, IO.Log {
-    with sqlite_handler(path) {
+fn run_with_sqlite(path: Str) -> Result[(), DBError] ! DB, IO.Log {
+    with db.connect(path)? {
         start_server()  // same code, SQLite backend
     }
+    Ok(())
 }
 
 fn main() {
     let config = load_config()
     match config.db_backend {
         "postgres" => run_with_postgres(config.pg_config)
-        "sqlite" => run_with_sqlite(config.sqlite_path)
+        "sqlite" => if run_with_sqlite(config.sqlite_path).is_err() {
+            io.eprintln("cannot open {config.sqlite_path}")
+        }
     }
 }
 ```
