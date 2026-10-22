@@ -2040,7 +2040,7 @@ error[E0306]: trait bound not satisfied
    = help: add `@derive(Debug)` to `Item`
 ```
 
-**Note:** `assert_matches` is a compiler intrinsic whose second argument is a **pattern** (same syntax as `match` arms), not an expression. It cannot be passed as a higher-order function.
+**Note:** `assert_matches` is a compiler intrinsic whose second argument is a **pattern** (same syntax as `match` arms), not an expression. It cannot be passed as a higher-order function. The pattern is refutable, so it follows the refutable-pattern rule of §3.5 *Bare names: variant or binding*: a bare uppercase name is a variant, never a new binding.
 
 Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe. The test runner's per-test frame is a **runtime catch boundary** in the sense of §4.7.2, so `Scoped.exit(false)` and `Closeable.close()` run during the unwind — `with db.transaction() { assert_eq(...) }` rolls back the transaction on assertion failure.
 

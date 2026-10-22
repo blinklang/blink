@@ -2626,7 +2626,7 @@ The rule covers every declaration that puts a name in the type namespace: `type`
 
 **Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or imports, are a duplicate, never a shadow. A module qualifier is in both namespaces. One rule covers every pair, and the code tells which pair collided: two imports are E1005 (`AmbiguousImport`), an import entry and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. A local binding that hides a module qualifier (`let auth = 5` makes `auth.login()` a method call, §10.1 *Qualified Access*) is a shadow between nested scopes, so it is legal.
 
-**A binding that hides a variant.** A variant is not a binding, but a bare name finds a value binding before a variant (§3.4 *Values come first*). So a value binding with a variant's name hides the variant in expressions, and only there: a pattern still means the variant (§3.5). The compiler emits `ShadowedVariant` (W1011) at the binding when it hides one of these:
+**A binding that hides a variant.** A variant is not a binding, but a bare name finds a value binding before a variant (§3.4 *Values come first*). So a value binding with a variant's name hides the variant in expressions, and only there: in a refutable pattern, an uppercase name still means the variant (§3.5). The compiler emits `ShadowedVariant` (W1011) at the binding when it hides one of these:
 
 - a variant of an enum in the same package;
 - a variant of a prelude enum;
@@ -2635,7 +2635,7 @@ The rule covers every declaration that puts a name in the type namespace: `type`
 W1011 covers two kinds of binding:
 
 - a module-scope `let`, `let mut`, `const` or `fn`. Only the dependency case can occur here, because a value with the name of a variant in the same package or the prelude is E1016 (§2.12.1);
-- a local binding: a `let`, a parameter, a closure parameter or a pattern binder. A pattern binder gets W1011 only when the scrutinee type has no variant of that name, because otherwise the name is the variant (§3.5).
+- a local binding: a `let`, a parameter, a closure parameter or a pattern binder. A pattern binder in an irrefutable pattern gets W1011. In a refutable pattern, a binder cannot have the name of an uppercase variant, because an uppercase name there is the variant or an error (§3.5). So a binder in a refutable pattern gets W1011 only when its first character is not uppercase and the type at that position has no variant of that name.
 
 A dependency variant whose type the module does not import never gives W1011.
 

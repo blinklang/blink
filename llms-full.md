@@ -227,7 +227,7 @@ type Shape {
     Circle(radius: Float)
     Rect(w: Float, h: Float)
 }
-let s = Shape.Circle(5.0)
+let s = Circle(5.0)
 
 // Pattern matching (expression — returns value)
 let area = match s {
@@ -337,6 +337,7 @@ test "addition works" {
 - **Operators need operands they apply to.** `+ - * / %`, unary `-` and the compound forms on `Bool`, `()`, structs, `Str - Str` or opaque handles are `E0300`.
 - **There is no index operator.** Any `[...]` after a value (read or write: `xs[0]`, `m["k"]`, `xs[i] = v`) is `E0313 NoIndexOperator`. Use `.get(i)` (returns `Option`), `.set(i, v)` on a `List` or `Bytes`, `.insert(k, v)` on a `Map`. A tuple field is `t.0`; `t._0` is rejected. A field that does not exist is `E0525 NoSuchField`.
 - **A variant that its enum does not declare is `E0547 NoSuchVariant`**, in a pattern at any depth (`Somee(v)`, `Some(Somee(v))`, `K.Zed`) and in a qualified construction (`K.Zed`, `K.Zed(1)`, `K.Zed { .. }`). The help names the nearest variant, or lists the variants. A qualified variant of another enum, or a struct pattern of another struct, is `E0300`. An arm with a bad pattern covers nothing; when it has no guard, the match gets no `E0004`.
+- **In a `match` arm pattern (and in `assert_matches`), a bare name that starts with an uppercase letter is a variant, never a binding.** `Dott =>` on a `Shape` is `E0547`; `MAX =>` or `Red =>` on an `Int` is `E0308 EnumPatternNeedsEnumScrutinee`. To bind the value, write a lowercase name. To compare with a value, write a guard: `n if n == MAX =>`. In `let`, `for` and parameters, any bare name binds.
 - **A struct or variant literal must name each field once.** A field with no default and no `..source` is `E0315 MissingField`; a label twice is `E0316 DuplicateField`; `..source` in a variant brace literal is `E0317 VariantSpread` (copy-update is for structs only).
 - **A bare variant name that two or more enums declare, with no expected type, is `E0519 AmbiguousConstruction`.** Write `Enum.Variant` or add a type annotation.
 - **Two `impl` blocks that can apply to one type for one trait are `E0526 OverlappingImpls`.**

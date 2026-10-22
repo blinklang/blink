@@ -1962,6 +1962,14 @@ let b = NotFound { msg: "id 0" }              // bare — resolves to QueryError
 
 The bare form (`NotFound { msg: "x" }`) and the qualified form (`QueryError.NotFound { msg: "x" }`) are equivalent: they construct the same value and emit identical code. Bare construction mirrors the forms that already exist elsewhere in the language — bare tuple-style construction (`Leaf(1)`, see *Generic Types* below) and bare struct-style patterns (`NotFound { msg }` in a `match` arm, §3.5). Construction and pattern matching are duals; both accept the bare and qualified spellings.
 
+**Which spelling to write.** Write the bare form. Write the qualified form only where the bare form cannot reach the variant:
+
+- a name that two or more enums declare, with no expected type at the site (E0519, below);
+- a variant that a value binding hides (*Values come first*, below);
+- a user variant that has the name of a prelude variant (`Some`, `None`, `Ok`, `Err`).
+
+A `help:` line in a diagnostic writes the qualified form, because that form is the full name of the variant. It is not a second rule. The examples in this spec follow this guidance: an example uses one spelling for each enum, and it qualifies a variant only to show one of the cases above. `blink fmt` does not change one spelling into the other (below).
+
 **Resolution order.** At a bare struct-style construction site `Name { ... }`, the compiler resolves `Name` in this order:
 
 1. **Qualified** — if the site is already written `Enum.Variant { ... }`, that names the variant directly.
@@ -2770,7 +2778,7 @@ guard         ::= "if" expression
 match_arm     ::= pattern guard? "=>" expression
 ```
 
-`TYPE_NAME` and `IDENT` are both identifiers. The scrutinee type decides whether a bare name is a variant or a binding (*Bare names: variant or binding*, below). A `mut` before a name that is a variant is not a binder (*Mutable Binders*, below).
+`TYPE_NAME` and `IDENT` are both identifiers. In a refutable pattern, the first character of a bare name decides whether it is a variant or a binding (*Bare names: variant or binding*, below). A `mut` before a name that is a variant is not a binder (*Mutable Binders*, below).
 
 #### Pattern Forms
 
@@ -2778,7 +2786,18 @@ match_arm     ::= pattern guard? "=>" expression
 
 **Variable binding.** An identifier binds the matched value to a new variable in the arm body.
 
-**Bare names: variant or binding.** A bare name in a pattern (`Red`, or `Red(x)` and `Red { .. }` with a payload) is a variant only when the scrutinee type has a variant of that name. Otherwise a bare name with no payload is a new binding. A bare name with a payload must name a variant of the scrutinee type. The program-wide search of §3.4 (step 3) never runs in a pattern, and no value binding, local or module-scope, changes what a pattern means.
+**Bare names: variant or binding.** The first character of a bare name, and the kind of pattern it is in, decide what the name means.
+
+A pattern is *refutable* when it can fail to match (*Refutable vs Irrefutable Patterns*, below). The rule applies at every refutable pattern position. Today these are the pattern of a `match` arm, at any depth, and the pattern operand of `assert_matches` (§2.20). A future form that takes a refutable pattern uses this rule. In a refutable pattern:
+
+- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a payload (`Red`, `Red(x)`, `Red { .. }`). If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
+- A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) keeps the type-directed rule. It is a variant only when the type at that position has a variant of that name. Otherwise a name with no payload is a new binding. A name with a payload always names a variant, so it gets the same errors as an uppercase name: E0308 when the type is not an enum, E0547 when the enum has no variant of that name.
+
+The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. The protection against a typo covers variants whose names start with an uppercase letter only.
+
+In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a payload must name a variant.
+
+The program-wide search of §3.4 (step 3) never runs in a pattern, and no value binding, local or module-scope, changes what a pattern means.
 
 ```blink
 type Color { Red, Green }
@@ -2793,20 +2812,61 @@ fn name(c: Color) -> Str {
 
 fn show(n: Int) -> Str {
     match n {
-        Red => "n is {Red}"        // a new binding: Int has no variant `Red`
+        Red => "n is red"          // error[EnumPatternNeedsEnumScrutinee]: Int has no variant `Red`
+        _ => "other"
     }
 }
 ```
 
-A pattern binder named like a variant gets W1011 only when the scrutinee type has no variant of that name (§10.6 *Shadowing Rules*). In `show` above, the binder `Red` gets W1011; in `name`, the pattern `Red` is the variant and gets nothing.
+An uppercase name on a type that is not an enum gets E0308. To bind the value, write a lowercase name:
+
+```blink
+fn bind(n: Int) -> Str {
+    match n {
+        red => "n is {red}"        // OK: a lowercase name is a new binding
+    }
+}
+```
+
+A constant is not a pattern. It gets the same error. When a value with that name is in scope, the help also shows a second repair: bind the value and compare it in a guard:
+
+```blink
+const MAX = 10
+
+fn check(n: Int) -> Str {
+    match n {
+        MAX => "at the limit"      // error[EnumPatternNeedsEnumScrutinee]
+        _ => "below"
+    }
+}
+```
+
+```
+error[EnumPatternNeedsEnumScrutinee]: match arm names variant `MAX`, but the value being matched has type `Int` -- a scalar has no variants
+  help: to bind the value, write a lowercase name
+  help: to compare with the value `MAX`, write a guard: `n if n == MAX =>`
+```
+
+```blink
+fn check(n: Int) -> Str {
+    match n {
+        n if n == MAX => "at the limit"  // OK: a guard compares with the value
+        _ => "below"
+    }
+}
+```
+
+A binder in a refutable pattern cannot have the name of an uppercase variant, because that name is the variant. So a pattern binder gets W1011 (§10.6 *Shadowing Rules*) only in an irrefutable pattern, or when its name does not start with an uppercase letter.
 
 **A variant the enum does not declare.** A variant pattern must name a variant that its enum declares. The compiler reports `error[NoSuchVariant]` (E0547) for:
 
-- a bare name with a payload (`Somee(v)`, `Zed { .. }`) when the type at that pattern position has no variant of that name;
-- a qualified name `K.Zed`, with or without a payload, when the enum `K` declares no variant `Zed`;
-- a bare name with a payload when the type at that pattern position is a struct, a tuple or a type parameter. The message says that the type has no variants: "`Point` is a struct; it has no variants". For a type parameter, the help suggests no variant.
+- a bare name with a payload (`Somee(v)`, `Zed { .. }`) when the type at that pattern position is an enum that has no variant of that name;
+- a bare name with no payload and an uppercase first character (`Dott`) when the type at that pattern position is an enum that has no variant of that name;
+- a qualified name `K.Zed`, with or without a payload, when the enum `K` declares no variant `Zed`.
 
-When the type at the pattern position is not known yet, the compiler reports `CannotInferType` (E0301, §3.4 *Under-Determined Types*), not E0547. A variant pattern on a builtin scalar stays `EnumPatternNeedsEnumScrutinee` (E0308, §3.4 *Enums Nominally Distinct from Int*). A bare name with no payload is a binding, as above, so it never gets E0547.
+When the type at the pattern position is not an enum (a builtin scalar, a struct, a tuple or a type parameter), a bare name with an uppercase first character, with or without a payload, is `EnumPatternNeedsEnumScrutinee` (E0308), as *Bare names: variant or binding* says. For a struct, the message says that the type has no variants: "`Point` is a struct; it has no variants". For a type parameter, the help suggests no variant. The compiler reports E0308 for a type parameter where the generic function is defined, not at a call.
+
+When the type at the pattern position is not known yet, the compiler reports `CannotInferType` (E0301, §3.4 *Under-Determined Types*), not E0547 or E0308. A variant pattern on a builtin scalar is `EnumPatternNeedsEnumScrutinee` (E0308, §3.4 *Enums Nominally Distinct from Int*). A lowercase bare name with no payload is a binding when the type has no variant of that name, so it never gets E0547.
 
 The rule applies at every depth. In `Some(Somee(v))` on an `Option[Option[Int]]`, the inner pattern is checked against the payload type of `Some`, so `Somee` gets E0547.
 
@@ -2818,8 +2878,8 @@ type Shape { Circle(Float), Square(Float), Dot }
 fn area(s: Shape) -> Float {
     match s {
         Circel(r) => 3.14159 * r * r   // error[NoSuchVariant]
-        Shape.Square(w) => w * w
-        Shape.Dott => 0.0              // error[NoSuchVariant]
+        Square(w) => w * w
+        Dott => 0.0                    // error[NoSuchVariant]: not a new binding
     }
 }
 ```
@@ -2830,6 +2890,8 @@ error[NoSuchVariant]: `Shape` has no variant `Circel`
 error[NoSuchVariant]: `Shape` has no variant `Dott`
   help: did you mean `Dot`?
 ```
+
+The qualified form `Shape.Dott` gets the same error.
 
 When a bare name with a payload is not a variant of the type at the position, and exactly one enum visible at the site declares that name, the error gets a `note:` that names the enum. The compiler finds that enum only to write the note; the note never changes what the pattern means:
 
@@ -4123,7 +4185,7 @@ type Shape { Circle(r: Int)  Sq(s: Int) }
 
 fn main() {
     let c = Color.Red == Color.Green            // OK: fieldless, compares the variant
-    let s = Shape.Circle(1) == Shape.Circle(1)  // OK: derived
+    let s = Circle(1) == Circle(1)              // OK: derived
     let o = Some(Color.Red) == Some(Color.Red)  // OK: `Option[Color]` is `Eq`
     io.println("{c} {s} {o}")                   // false true true
 }
@@ -4161,7 +4223,7 @@ fn main() {
     let top = biggest(Priority.Low, Priority.High)     // Priority.High
     let o = Priority.Medium.cmp(Priority.Low)          // Greater
     let t = (Priority.Low, 9) < (Priority.High, 0)     // true
-    let bad = Shape.Circle(1) < Shape.Circle(2)        // error: `Shape` does not implement `Ord`
+    let bad = Circle(1) < Circle(2)                    // error: `Shape` does not implement `Ord`
                                                        //   help: add `@derive(Ord)` to `Shape`
 }
 ```
