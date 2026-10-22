@@ -97,7 +97,7 @@ This is aspirational -- it depends on the contract and verification systems bein
 
 Blink is opinionated about what it is *not*.
 
-**Not a systems language.** Blink does not compete with Rust or C for kernel development, embedded systems, or bare-metal programming. There is no ownership model, no manual memory management, and no general `unsafe` block that turns checks off. The one narrow form is an FFI region (§9.1.1), where a `Ptr[T]` may be used without a null or lifetime check; it relaxes only that rule, and each region is marked in source (§9.1). If you need to control individual cache lines, use a different language and call it via FFI.
+**Not a systems language.** Blink does not compete with Rust or C for kernel development, embedded systems, or bare-metal programming. There is no ownership model, no manual memory management, and no general `unsafe` block that turns checks off. The one narrow form is an FFI region (§9.1.1), where a `Ptr[T]` may be used without a null or lifetime check; it relaxes only that rule, and each region is marked in source (§9.1). If you need to control individual cache lines, use a different language and call it via FFI. Blink has no CPU intrinsics, no inline assembly, no per-function target features and no CPU-detection API; code that needs a CPU-specific instruction is C behind `@ffi` (§9.1, *CPU Baseline and Accelerated Code*).
 
 **Not academically novel.** Every idea in Blink is proven in at least one shipping language. Algebraic effects come from Koka. HM inference comes from ML/OCaml/Haskell. ADTs and pattern matching come from the entire ML family. Traits come from Rust/Haskell. The novelty is the composition and the AI-first design constraints, not the individual features.
 

@@ -12,7 +12,7 @@ An **escape hatch** is a marked construct where the compiler takes a claim on tr
 
 | # | Escape hatch | What the compiler takes on trust | Where it is marked | Defined in |
 |---|---|---|---|---|
-| 1 | `@ffi` binding with `@trusted(audit: K)` | The foreign code matches the binding: its types, its effect row and its memory use | `@ffi` and the `@trusted(audit: K)` annotation on the function | This section, *`@trusted` — Audit Trail*; §4.5 *Proven and assumed rows* |
+| 1 | `@ffi` binding with `@trusted(audit: K)` | The foreign code matches the binding: its types, its effect row, its memory use and the CPU instructions it runs | `@ffi` and the `@trusted(audit: K)` annotation on the function | This section, *`@trusted` — Audit Trail* and *CPU Baseline and Accelerated Code*; §4.5 *Proven and assumed rows* |
 | 2 | FFI region | Each `Ptr[T]` use in the region is valid: not null and not dangling | The `@ffi` or `@trusted` function body, or the `with ffi.scope()` block | §9.1.1 *Pointer Operations*, *Lifetime and Cleanup: `ffi.scope()`* |
 | 3 | `Raw(s)` | The `Str` in this template hole cannot carry an injection | The `Raw(...)` call | §3b.5 *`Raw(expr)` — The Escape Hatch* |
 | 4 | `@verify(fallback: "trust")` | The contract holds, with no run-time check | The `@verify(fallback: "trust")` annotation on the function | §3b.4 *`@verify` Fallback Values* |
@@ -118,7 +118,7 @@ No fix is machine-applicable: moving the row into the signature would make a too
 
 #### `@trusted` — Audit Trail
 
-`@trusted(audit: K)` records a claim, by an author who may be human or agent, that the binding matches the foreign code: its types, its effect row and its memory use. The compiler assumes the claim; it does not prove it. `K` must name a record of that claim. The language promises that the record exists, not who wrote it.
+`@trusted(audit: K)` records a claim, by an author who may be human or agent, that the binding matches the foreign code: its types, its effect row, its memory use and the CPU instructions it runs (*CPU Baseline and Accelerated Code* below). The compiler assumes the claim; it does not prove it. `K` must name a record of that claim. The language promises that the record exists, not who wrote it.
 
 `audit: K` is the only argument. Authorship, dates and ticket links go in the record's `claim` text or in version control, not in the annotation. The record lives in the package's `audits.toml` (*Audit Records* below).
 
@@ -546,6 +546,87 @@ Raw query audit coverage: 1/2 (50%)
 This output is structured JSON when `--json` is passed. CI pipelines can enforce `blink audit --require-all` to block merges with unaudited FFI. Under `--require-all`, a `@trusted` function whose pin is stale or missing counts as unaudited (*Audit Records* above).
 
 `blink audit pin K [fn]` writes the pins of record `K` in `audits.toml`. See *Audit Records* above for what it refuses and why there is no bulk re-pin.
+
+#### CPU Baseline and Accelerated Code
+
+Blink has no CPU-specific surface. It has no CPU intrinsics, no inline assembly, no per-function target-feature annotation and no CPU-detection API. It has no CPU-feature effect or capability budget, no new escape hatch for a CPU instruction and no conditional compilation on the CPU. Code that needs a CPU-specific instruction is C in a native dependency (usually `type = "vendored"`, §9.1.2), bound with `@ffi` and `@trusted(audit: K)`. This is escape hatch 1. The closed list does not change.
+
+**Baseline.** Each target triple has a CPU baseline: the default CPU of the C toolchain for that triple. `blink build` never passes a flag that raises the baseline (examples: `-march=native`, `-mcpu=native`, `-msha`). Generated code, `std.*` and vendored C are built for the baseline. A program built for a triple runs on every CPU that the baseline admits.
+
+**Floating point.** `blink build` never passes a flag that changes an IEEE 754 result of a `Float` operation (examples: `-ffast-math`, `-ffp-contract=fast`).
+
+**The `@trusted` claim.** The claim of an `@ffi` binding covers the CPU:
+
+> On every CPU that the target triple's baseline admits, the foreign code runs only instructions that CPU has.
+
+Foreign code that runs an instruction the CPU lacks breaks the claim: the process stops with SIGILL. This is the same breach as foreign code that writes out of bounds. The compiler does not check the claim. The audit record `K` states why it holds. The sentence clarifies escape hatch 1 and adds no entry to the list.
+
+**`std.*` accelerated paths.** When a `std.*` function has a CPU-specific path, it also has a portable path, and the runtime picks the path at run time. Every path gives the same result bit for bit (including `Float`), the same effect row and the same panics. Only timing differs. A pure `std.*` function stays pure. A `std.*` call never runs an instruction that the running CPU lacks. A SIGILL from `std.*` is a bug in std or in the runtime, not a user error.
+
+**Guidance: how to meet the claim.** This text and the example are guidance, not a rule. The usual way to meet the claim is that the C code checks the CPU at run time and keeps a portable path. C code that uses only baseline instructions needs no check. The binding's `! ()` row claims that the call is pure, so both paths must give the same result for the same input.
+
+`blink.toml`:
+
+```toml
+[native-dependencies]
+fastcrc = { type = "vendored", path = "vendor/fastcrc.c" }
+```
+
+`vendor/fastcrc.c`:
+
+```c
+#include <stdint.h>
+#if defined(__x86_64__)
+#include <nmmintrin.h>
+#endif
+
+static uint32_t crc32c_portable(const uint8_t *p, uint64_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint64_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++) {
+            c = (c >> 1) ^ (0x82F63B78u & (0u - (c & 1u)));
+        }
+    }
+    return ~c;
+}
+
+#if defined(__x86_64__)
+__attribute__((target("sse4.2")))
+static uint32_t crc32c_sse42(const uint8_t *p, uint64_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint64_t i = 0; i < n; i++) {
+        c = _mm_crc32_u8(c, p[i]);
+    }
+    return ~c;
+}
+#endif
+
+uint32_t fastcrc_crc32c(const uint8_t *p, uint64_t n) {
+#if defined(__x86_64__)
+    if (__builtin_cpu_supports("sse4.2")) {
+        return crc32c_sse42(p, n);
+    }
+#endif
+    return crc32c_portable(p, n);
+}
+```
+
+`crc.bl`:
+
+```blink
+@ffi("fastcrc", "fastcrc_crc32c")
+@trusted(audit: "CRC-001")
+fn raw_crc32c(data: Ptr[U8], len: U64) -> U32 ! ()
+
+@trusted(audit: "CRC-002")
+pub fn crc32c(data: Bytes) -> U32 {
+    // the closure inherits the region of the @trusted body
+    data.with_ptr(fn(p) -> U32 { raw_crc32c(p, data.len().to_u64()) })
+}
+```
+
+The C file works for every target: the preprocessor test keeps the x86-64 code out of other builds, and the build compiles the file for each cross target (§9.1.2, *Linking Strategy*). Record `CRC-001` states that the SSE4.2 path runs only after the run-time check and that both paths give equal results. Record `CRC-002` states that the length passed to C matches the buffer.
 
 ### 9.1.1 FFI Type Specification
 
@@ -1213,6 +1294,8 @@ error[E0821]: native dependency unavailable for cross-target
   = help: give the link names in link order: openssl = { type = "pkg-config", pkg-config = "openssl", libs = ["<name>", ...] }
   = help: `pkg-config --static --libs openssl` lists the -l names the package uses on the host
 ```
+
+**CPU baseline.** A build for a target triple, host or cross, uses the CPU baseline of that triple (§9.1, *CPU Baseline and Accelerated Code*).
 
 **Compiler-managed deps** follow the same strategy automatically: the toolchain bundles its own dependencies (for example, sqlite3) and builds them from source during cross-compilation, or dynamically links on the host. Users never interact with this.
 
