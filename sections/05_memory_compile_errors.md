@@ -213,13 +213,13 @@ Blink solves this with two pieces: the `Closeable` trait (section 3.6) and the `
 
 ```blink
 trait Closeable {
-    fn close(self)
+    fn close(self) ! _
 }
 ```
 
 Any type holding non-memory resources implements `Closeable`. The compiler knows this trait and uses it to power diagnostics and the `with...as` construct.
 
-A `Closeable` type is a scoped value (§4.7.2). It also implements `Scoped`, with `type Context = Self`, an `enter` that returns `self`, and an `exit(ok)` that calls `close()`. The effects of `close` are the effects of `exit`. This impl counts for trait bounds: `T: Scoped` accepts a `Closeable` type. A type that writes both `impl Closeable` and `impl Scoped` gets the overlapping-impl error (§4.7.2).
+A `Closeable` type is a scoped value (§4.7.2). It also implements `Scoped`, with `type Context = Self`, an `enter` that returns `self`, and an `exit(ok)` that calls `close()`. The synthesized `exit` has the row of `close`. This impl counts for trait bounds: `T: Scoped` accepts a `Closeable` type. A type that writes both `impl Closeable` and `impl Scoped` gets the overlapping-impl error (§4.7.2).
 
 #### `with...as` desugaring
 
@@ -238,7 +238,7 @@ Desugars to:
 }
 ```
 
-`as name` only binds a name. `with expr { body }` runs the same steps, and the compiler discards the value. The compiler inserts `name.close()` on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.7.2 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
+`as name` only binds a name. `with expr { body }` runs the same steps, and the compiler discards the value. The call `name.close()` is charged like any call of an impl-chosen row (§4.15.3). The compiler inserts it on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.7.2 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
 
 This rule is uniform with `Scoped.exit()` (§4.7.2): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with db.connect()? as conn { assert(...) }` block releases `conn` on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.7.2).
 

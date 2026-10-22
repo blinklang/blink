@@ -3870,7 +3870,7 @@ error[SubtraitMethodRedeclaration]: cannot seal inherited open default `greet`
 
 `E0733` fires at the subtrait's redeclaration site, not at any call site, and applies to two cases: redeclaring a method a supertrait already provides as an open default, and redeclaring any supertrait method to add or change its contract (§3b.2 *Contracts on Trait Methods*). A normal `impl`-block override of that open default (without `final`) is unaffected — that is the ordinary replace-only override of §3.6 *The `final` Modifier*.
 
-**Effect-row subtype for trait impls.** Every method an `impl` provides for a trait, whether it implements a required method or overrides an open default, must declare an effect row `R_i` with `R_i ⊆ R_t`, where `R_t` is the row the trait declares for that method. An impl may *narrow* the row (drop effects it does not use) but may not *widen* it (add effects the trait does not declare). A trait method with no `!` has the empty row, so every impl of it must also have no `!`. This rule is what lets a bound `T: Trait` stand as an upper bound on the effects of a call through it: a generic function with no `!` that calls `x.m()` for `x: T` performs no effects for any `T`. A widening impl is rejected at the impl method with `error[TraitContractEffectMismatch]` (E0904). The check uses the impl method's effective row, so an impl that touches module state widens a row that lacks `State` (§4.16.1). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults have no override site, so their row is fixed at the declaration.
+**Effect-row subtype for trait impls.** Every method an `impl` provides for a trait, whether it implements a required method or overrides an open default, must declare an effect row `R_i` with `R_i ⊆ R_t`, where `R_t` is the row the trait declares for that method. An impl may *narrow* the row (drop effects it does not use) but may not *widen* it (add effects the trait does not declare). A trait method with no `!` has the empty row, so every impl of it must also have no `!`. For a method whose row has no `_`, this rule is what lets a bound `T: Trait` stand as an upper bound on the effects of a call through it: a generic function with no `!` that calls `x.m()` for `x: T` performs no effects for any `T`. The rule covers fixed and empty rows. A trait method whose row has `_` and no callback source lets each impl choose its row (§4.15.2): only a row with no `_` bounds the impls, and effects beside that `_` limit no impl. A widening impl is rejected at the impl method with `error[TraitContractEffectMismatch]` (E0904). The check uses the impl method's effective row, so an impl that touches module state widens a row that lacks `State` (§4.16.1). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults have no override site, so their row is fixed at the declaration.
 
 Contracts on trait methods follow the same narrow-only shape: an impl inherits the trait method's `@requires` and `@ensures`, may add `@ensures`, and may not add `@requires` (E0912). See §3b.2 *Contracts on Trait Methods*.
 
@@ -5095,9 +5095,11 @@ The `Closeable` trait is the simplest:
 
 ```blink
 trait Closeable {
-    fn close(self)
+    fn close(self) ! _
 }
 ```
+
+The row `! _` means that each impl declares the effects of its own `close` (§4.15.2).
 
 A type implementing `Closeable` holds resources (file handles, sockets, locks, database cursors) that must be released deterministically — not at some later, unspecified time, but at a specific point in the program. The `with...as` construct (section 2.18, section 5.5) guarantees `close()` is called on all exit paths.
 

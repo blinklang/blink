@@ -1829,7 +1829,7 @@ No Blink operation skips a handler that its row names; only an `@ffi` call does.
 
 This is the one normative statement of these rules. §9.1 (*The Effect Row*, *`@trusted`*) and §4.7 refer to it. An `@ffi` decl's row enters the program at the decl and from there propagates by the rules above, with no special case. `@trusted` does not discharge or narrow a row: a wrapper that calls an `@ffi` decl with row `! Net.Connect` must itself declare `Net.Connect` or discharge it in the usual way. The FFI regions of §9.1.1 (an `@ffi` or `@trusted` body, `with ffi.scope()`) decide where a `Ptr[T]` may appear; they do not change what any row says.
 
-**Effect rows on trait impls.** When a trait declares a method `m` with effect row `R_t`, every `impl` that provides `m` must declare a row `R_i` such that `R_i ⊆ R_t` under the lattice above. The rule covers required methods and overrides of open defaults alike. An impl may *narrow* the signature (drop effects the trait declares but the impl does not use) but may not *widen* it (introduce effects the trait does not declare). A trait method with no `!` has the empty row, so its impls must have no `!` either. This preserves the trait's stated capability contract for every implementation: callers parameterized over `T: Trait` can rely on the trait's row as a sound upper bound on `m`'s effects across all `T`. A widening impl is rejected with `error[TraitContractEffectMismatch]` (E0904). Sealed (`final`) defaults have no override site and are therefore effect-monomorphic at their declaration. See §3.6 *Effect-row subtype for trait impls* for an example and §3.6 *The `final` Modifier* for the override-prevention semantics.
+**Effect rows on trait impls.** When a trait declares a method `m` with effect row `R_t`, every `impl` that provides `m` must declare a row `R_i` such that `R_i ⊆ R_t` under the lattice above. The rule covers required methods and overrides of open defaults alike. An impl may *narrow* the signature (drop effects the trait declares but the impl does not use) but may not *widen* it (introduce effects the trait does not declare). A trait method with no `!` has the empty row, so its impls must have no `!` either. This preserves the trait's stated capability contract for every implementation: callers parameterized over `T: Trait` can rely on the trait's row as a sound upper bound on `m`'s effects across all `T`, when that row has no `_`. The rule covers fixed and empty rows. A trait method whose row has `_` and no callback source lets each impl choose its row (§4.15.2). A widening impl is rejected with `error[TraitContractEffectMismatch]` (E0904). Sealed (`final`) defaults have no override site and are therefore effect-monomorphic at their declaration. See §3.6 *Effect-row subtype for trait impls* for an example and §3.6 *The `final` Modifier* for the override-prevention semantics.
 
 ---
 
@@ -2637,10 +2637,12 @@ The `Scoped` trait provides a general mechanism for types that need enter/exit s
 trait Scoped {
     type Context
 
-    fn enter(self) -> Self.Context
-    fn exit(self, ok: Bool)
+    fn enter(self) -> Self.Context ! _
+    fn exit(self, ok: Bool) ! _
 }
 ```
+
+Both methods have an impl-chosen row (§4.15.2): each impl declares the effects of its `enter` and `exit`.
 
 **`enter()`** is called before the block body executes. Its return value is bound via `as` (or discarded if `as` is absent). If `Context` is `Handler[E]`, the return value is also installed as the handler for `E` (see *Scoped effect handlers* below). **`exit(ok)`** is called after the block body completes — `ok` is `true` for normal completion, `false` for any **catchable unwind** (see below).
 
@@ -2748,7 +2750,7 @@ A type that implements `Closeable` (§3.6) also implements `Scoped`, with these 
 - `enter(self)` returns `self`
 - `exit(self, ok)` calls `self.close()`
 
-The effects of `close` are the effects of `exit`. This impl counts for trait bounds: `T: Scoped` accepts a `Closeable` type. A `with` item of a `Closeable` type therefore follows the scoped-value rule of §4.7, and `as` binds the value itself.
+The synthesized `exit` has the row of `close`. This impl counts for trait bounds: `T: Scoped` accepts a `Closeable` type. A `with` item of a `Closeable` type therefore follows the scoped-value rule of §4.7, and `as` binds the value itself.
 
 A type that writes both `impl Closeable` and `impl Scoped` has two overlapping impls of `Scoped`. This is the ordinary overlapping-impl error. Its help text says "`Closeable` already provides `Scoped` for `T`".
 
@@ -2806,7 +2808,7 @@ Steps 5 and 6 run on every catchable unwind, as for every scoped value. `exit()`
 Γ ⊢ with e { body } : U ! ρ ∪ R ∪ eff(enter) ∪ eff(exit)
 ```
 
-The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: Scoped](t: T) { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. `enter()` and `exit()` still run, and the compiler discards the `Context` or binds it to the `as` name. There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
+The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: Scoped](t: T) ! _ { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. `enter()` and `exit()` still run, and the compiler discards the `Context` or binds it to the `as` name. A `with` item is charged the row of its `enter` and `exit` impls when its type is concrete, and `_` when its type is a type parameter (§4.15.3). There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
 
 **Binding.** `with expr as name { }` installs the handler and binds `name` to the same `Handler[E]` value. `name` follows the scoping rules in *Interaction with async* below.
 
@@ -3688,6 +3690,48 @@ fn bad_nightly() ! IO.Log {
 }
 ```
 
+**Impl-chosen rows.** A trait method with no `! _` callback or handler parameter may still write `! _`. Then `_` means that each impl declares its own row for that method, and E0904 does not bound that row. A trait method that has a `! _` callback or handler parameter keeps the meaning above: `_` stands for the rows of the arguments. So the meaning of `_` in a trait method depends on whether the method has such a parameter.
+
+Only a row with no `_` bounds the impls of a trait method. Effects beside an impl-chosen `_` add to the charge at a call through a type parameter and limit no impl. For example, `! IO.Log, _` is legal on such a method, and every impl may still choose a row without `IO.Log`.
+
+The empty row stays the default contract of a trait method. Write `! _` on a method without a callback only when its impls must do effects that the trait cannot name ahead, as cleanup does. `Closeable` (§3.6) and `Scoped` (§4.7.2) are the traits of this specification that do.
+
+**Source of `_`.** A `_` in the row of a function or of an impl method needs a source: a `! _` callback or handler parameter, or a type parameter whose bound has a method with a `_` row. A `_` in the declaration of a trait method has no such need, because it is the impl-chosen contract above. An impl method that forwards the row of a type parameter has a source:
+
+```blink
+type Guard[T] {
+    inner: T
+}
+
+impl[T: Closeable] Closeable for Guard[T] {
+    fn close(self) ! _ {            // OK: the bound `T: Closeable` has a `_` method
+        self.inner.close()
+    }
+}
+```
+
+A `_` with no source is `error[UnsourcedEffectWildcard]` (E0551). It is the only error for that row: E0904 does not fire on the same method.
+
+```blink
+impl Closeable for Res {
+    fn close(self) ! _ {            // ERROR E0551
+        fs.close_fd(self.fd)
+    }
+}
+
+fn g() ! _ {}                       // ERROR E0551
+```
+
+```
+error[UnsourcedEffectWildcard]: `_` in the row of `Res.close` has no source
+  --> res.bl:2:22
+   |
+ 2 |     fn close(self) ! _ {
+   |                      ^ no `! _` parameter, and no type parameter whose bound has a `_` method
+   |
+   = help: name the effects `close` performs
+```
+
 #### 4.15.3 Call-Site Resolution
 
 - **Concrete effect function types** (`fn(T) -> U ! IO.Log`): The caller must hold the required effects at the call site.
@@ -3695,6 +3739,29 @@ fn bad_nightly() ! IO.Log {
 - **Wildcard forwarding** (`! _`): `_` resolves at each call site to the concrete effects of the callback argument. A `Handler[E ! _]` argument counts with its clause row (§4.15.2, *Handler parameters*).
 
 - **Pure callbacks in wildcard positions**: When a pure callback is passed to a `! _` function, `_` resolves to the empty effect set. The function is pure at that call site.
+
+- **Call of an impl-chosen method on a concrete type** (§4.15.2, *Impl-chosen rows*): The call is charged the row of that impl. This includes the calls that a `with` item makes (§4.7.2, §5.5).
+
+- **Call of an impl-chosen method through a type parameter**: The call is charged `_`, and inside the callee `_` is opaque. The enclosing function must have `_` in its row. If it does not, E0500 fires at the call, with the help "add `! _`".
+
+  ```blink
+  fn shut[T: Closeable](t: T) {
+      t.close()                     // ERROR E0500: `T.close` has an impl-chosen row; add `! _`
+  }
+
+  fn shut_ok[T: Closeable](t: T) ! _ {
+      t.close()
+  }
+  ```
+
+- **Type arguments**: At each call of a function whose row has `_`, the row of each type argument's impl joins `_`. For each type parameter of the callee, and for each method with a `_` row in the bounds of that parameter (supertraits included, so `T: Closeable` brings `Scoped.enter` and `Scoped.exit` through the bridge of §4.7.2), the impl row of the type argument is added. This union comes in addition to the callback and handler sources above. It uses the signature of the callee only: the body is not read, so the caller pays for each `_` method of the bound, not only for the ones the body calls. If the row of the callee has no `_`, its type arguments add nothing.
+
+  ```blink
+  fn main() ! FS {
+      let f = FileHandle { fd: 3, path: "a.txt" }
+      shut_ok(f)                    // _ = FS, the row of FileHandle.close (§3.6)
+  }
+  ```
 
 #### 4.15.4 Interaction with Existing Features
 
@@ -3960,7 +4027,7 @@ Callers see `! Parse.Advance` and know that the call moves the parser. A user-de
 
 #### 4.16.6 Interaction with Existing Features
 
-**Trait impls (§4.5, §3.6).** A trait impl method is a boundary function, and E0904 checks its effective row. So a method that touches module state can implement only a trait method whose row contains `State`. A `Display.fmt`, `Eq.eq`, `Hash.hash` or `Ord.cmp` impl that reads or writes a module-level `let mut`, for example to cache a result, is `TraitContractEffectMismatch` (E0904). Hold the cache in a value that the caller passes in.
+**Trait impls (§4.5, §3.6).** A trait impl method is a boundary function, and E0904 checks its effective row. So a method that touches module state can implement only a trait method whose row contains `State` or is impl-chosen (§4.15.2). A `Display.fmt`, `Eq.eq`, `Hash.hash` or `Ord.cmp` impl that reads or writes a module-level `let mut`, for example to cache a result, is `TraitContractEffectMismatch` (E0904). Hold the cache in a value that the caller passes in.
 
 **`async.spawn` (§4.13, §2.8).** Two tasks that touch one module-level `let mut` race. A function value passed to `async.spawn` whose effective row contains `State` is `SpawnTouchesModuleState` (E0651). The rule covers a closure literal and a named function alike. The `help:` line says to pass the data in, return it from the task, or use a `Channel` (§4.13).
 
