@@ -357,7 +357,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 
 | Code | Name | Implementation |
 |------|------|---------------|
-| E0004 | NonExhaustiveMatch | `typecheck.bl` — `tc_check_match_exhaustive`, on a match whose scrutinee resolves to a declared enum. Under-approximating: Int/Str/Char ranges, tuple/struct patterns and nested refutable sub-patterns contribute nothing rather than risk a false positive |
+| E0004 | NonExhaustiveMatch | `typecheck.bl` — `tc_check_match_exhaustive`, on a match whose scrutinee resolves to a declared enum, or to a type parameter of the function being checked (`tc_check_type_param_match_exhaustive`: only an unguarded arm that matches every value covers it). Under-approximating: Int/Str/Char ranges, tuple/struct patterns and nested refutable sub-patterns contribute nothing rather than risk a false positive |
 | E0005 | InconsistentPatternBindings | `typecheck.bl` — `tc_check_or_pattern_bindings`, from the match statement walk, for each OR-pattern in an arm's pattern at any depth |
 | E0500 | UndeclaredEffect | `typecheck.bl` — `tc_check_effect_rows`, at each call to a fn or method that declares effects, each user effect operation, and each `! Arena` callee, in every fn but `main`. Not yet checked: a builtin namespace call (`io.println`), the declared row of an `@ffi` callee, and test blocks |
 | E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
@@ -372,7 +372,8 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0505 | UnresolvedMethod | `typecheck.bl` — unresolved method on any receiver whose type is known: struct/enum, and the builtin scalars/containers (primary) + `codegen_methods.bl` — method dispatch (fail-open backstop) |
 | E0506 | UndefinedVariable | `typecheck.bl` — name resolution |
 | E0507 | UnknownType | `typecheck.bl` — name resolution |
-| E0547 | NoSuchVariant | `typecheck.bl` — `tc_pattern_fault`, from the pattern walk `tc_check_pattern_types` at every depth (match arms, nested matches, for-in), including a bare uppercase name with no payload, and the qualified construction sites (`K.Zed`, `K.Zed(..)`, `K.Zed {..}`) via `tc_report_no_such_variant_value`. Codegen `UnknownVariant` stays as an internal-error backstop |
+| E0547 | NoSuchVariant | `typecheck.bl` — `tc_pattern_fault`, from the pattern walk `tc_check_pattern_types` at every depth (match arms, nested matches, for-in), including a bare uppercase name with no payload in a match arm, and the qualified construction sites (`K.Zed`, `K.Zed(..)`, `K.Zed {..}`) via `tc_report_no_such_variant_value`. Codegen `UnknownVariant` stays as an internal-error backstop |
+| E0308 | EnumPatternNeedsEnumScrutinee | `typecheck.bl` — `tc_pattern_fault` (`OnScalar`, `NoVariants`) through `tc_report_pattern_fault`, the same lookup as E0547, before mono, so a type parameter is reported in the generic function. The bind and guard helps come from `tc_bare_name_on_non_enum_help` |
 | E0519 | AmbiguousConstruction | `typecheck.bl` — `tc_report_ambiguous_construction`, when `tc_pick_bare_variant` (or `tc_bare_variant_from_program` for a brace literal) finds two or more enums, a prelude carrier counting, for a bare variant with no expected type: at a nullary name, a payload call and a brace literal |
 | W0501 | UnknownMethod | `typecheck.bl` — name resolution records the call, inference reports it (soft class only: the receiver's type is a bare typevar or unresolved at the call; a KNOWN receiver type is E0505 instead) |
 | E1004 | VersionConflict | `compiler.bl` — lockfile version conflict validation in `ensure_lockfile_loaded()` |

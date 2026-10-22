@@ -17737,6 +17737,20 @@ fn is_variant_name(name: Str) -> Int {
     if tc_first_variant_slot(name) != -1 { 1 } else { 0 }
 }
 
+// The lexer reads only ASCII identifiers, so A-Z is the whole Unicode Lu/Lt set a name can
+// start with.
+fn tc_name_is_upper(name: Str) -> Bool {
+    name.byte_len() > 0 && name.byte_at(0) >= 65 && name.byte_at(0) <= 90
+}
+
+// Whether a bare name with no payload binds a new name (§3.5 Bare names: variant or binding).
+// In a refutable pattern an uppercase name is a variant whatever the type at that position;
+// any other name binds unless some enum declares a variant of that name.
+fn pattern_name_binds(name: Str, refutable: Bool) -> Bool {
+    if name == "_" || (refutable && tc_name_is_upper(name)) { return false }
+    is_variant_name(name) == 0
+}
+
 fn get_variant_enum_tid(name: Str) -> Int {
     let i = tc_first_variant_slot(name)
     if i < 0 { return TYPE_UNKNOWN }
@@ -20804,7 +20818,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         nr_define_mut_at(node_var_name(node), tc_for_binder_is_mut(node), node)
         let for_pat_sl = node_elements(node)
         if for_pat_sl != -1 {
-            nr_check_pattern(for_pat_sl)
+            nr_check_pattern(for_pat_sl, false)
         }
         nr_loop_depth = nr_loop_depth + 1
         nr_check_node(node_body(node))
@@ -20825,7 +20839,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             while i < sublist_length(arms_sl) {
                 let arm = sublist_get(arms_sl, i)
                 nr_push_scope()
-                nr_check_pattern(node_pattern(arm))
+                nr_check_pattern(node_pattern(arm), true)
                 let guard = node_guard(arm)
                 if guard != -1 {
                     nr_check_node(guard)
@@ -21178,13 +21192,14 @@ fn nr_report_mut_on_variant(node: Int, name: Str) ! Diag.Report {
     if has_end && diag_entry_count() > before { diag_set_last_fix_at("remove `mut`", name, node_line(node), node_col(node), end_line, end_col) }
 }
 
-fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
+// `refutable`: the pattern is a match arm's, where an uppercase bare name is a variant (§3.5).
+fn nr_check_pattern(node: Int, refutable: Bool) ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return }
     let kind = node_kind(node)
 
     if kind == NodeKind.IdentPattern {
         let name = node_name(node)
-        if name != "_" && is_variant_name(name) == 0 {
+        if pattern_name_binds(name, refutable) {
             nr_define_mut_at(name, node_is_mut(node), node)
         } else if node_is_mut(node) != 0 && node_is_mut(node) != BINDER_MUT_RECOVERED {
             nr_report_mut_on_variant(node, name)
@@ -21207,12 +21222,12 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
                     // Struct-style fields are StructLitField nodes; bind by name
                     let fpat = node_pattern(f)
                     if fpat != -1 {
-                        nr_check_pattern(fpat)
+                        nr_check_pattern(fpat, refutable)
                     } else {
                         nr_define_mut_at(node_name(f), node_is_mut(f), f)
                     }
                 } else {
-                    nr_check_pattern(f)
+                    nr_check_pattern(f, refutable)
                 }
                 i = i + 1
             }
@@ -21232,7 +21247,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
                 // qualified spellings are duals (§3.5).
                 let fpat = node_pattern(f)
                 if fpat != -1 {
-                    nr_check_pattern(fpat)
+                    nr_check_pattern(fpat, refutable)
                 } else {
                     nr_define_mut_at(node_name(f), node_is_mut(f), f)
                 }
@@ -21247,7 +21262,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
-                nr_check_pattern(sublist_get(elems_sl, i))
+                nr_check_pattern(sublist_get(elems_sl, i), refutable)
                 i = i + 1
             }
         }
@@ -21259,7 +21274,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
         if elems_sl != -1 {
             let mut i = 0
             while i < sublist_length(elems_sl) {
-                nr_check_pattern(sublist_get(elems_sl, i))
+                nr_check_pattern(sublist_get(elems_sl, i), refutable)
                 i = i + 1
             }
         }
@@ -21270,11 +21285,11 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
         let alts = node_elements(node)
         if alts != -1 && sublist_length(alts) > 0 {
             let or_start = nr_scope_names.len()
-            nr_check_pattern(sublist_get(alts, 0))
+            nr_check_pattern(sublist_get(alts, 0), refutable)
             let mut i = 1
             while i < sublist_length(alts) {
                 let saved_warn = nr_or_alt_open()
-                nr_check_pattern(sublist_get(alts, i))
+                nr_check_pattern(sublist_get(alts, i), refutable)
                 for idx in nr_or_alt_close(or_start, saved_warn) {
                     let decl = nr_scope_nodes.get(idx).unwrap()
                     if decl != -1 { nr_check_shadow(nr_scope_names.get(idx).unwrap(), decl) }
@@ -21290,7 +21305,7 @@ fn nr_check_pattern(node: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 
     if kind == NodeKind.AsPattern {
-        nr_check_pattern(node_pattern(node))
+        nr_check_pattern(node_pattern(node), refutable)
         nr_define_typed(node_name(node), node_is_mut(node), TYPE_UNKNOWN, node)
         return
     }
@@ -21927,7 +21942,7 @@ fn infer_arm_body(arm: Int, scrut_tid: Int, subject: Str) -> Int ! TypeCheck.Res
     // placeholder, so the two need not be the same value.
     if b == -1 { return -1 }
     nr_push_scope()
-    let _ = tc_check_pattern_types_against(node_pattern(arm), scrut_tid, subject)
+    let _ = tc_check_pattern_types_against(node_pattern(arm), scrut_tid, subject, true)
     tc_check_arm_guard(arm)
     // Infer the BODY NODE whatever its shape. infer_type answers for the statement kinds a
     // braceless arm produces (ExprStmt passes through to its value, a control transfer is
@@ -28080,10 +28095,10 @@ fn tc_exh_collect_pattern(pat: Int, covered: List[Str]) -> Int {
     if pk == NodeKind.WildcardPattern { return 1 }
     if pk == NodeKind.IdentPattern {
         // A bare identifier is either a variant spelling (`Red`) or a binding that
-        // matches anything (`other`). is_variant_name is the same discriminator the
-        // pre-existing heuristic used, so this inherits its resolution rules.
+        // matches anything (`other`). Coverage is only checked for match arms, which
+        // are refutable.
         let nm = node_name(pat)
-        if is_variant_name(nm) != 0 {
+        if nm != "_" && !pattern_name_binds(nm, true) {
             covered.push(nm)
             return 0
         }
@@ -28142,7 +28157,12 @@ fn tc_exh_collect_pattern(pat: Int, covered: List[Str]) -> Int {
 
 fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeCheck.Report, Diag.Report {
     if arms_sl == -1 { return }
-    let base = tc_enum_base_tid(tc_resolve(scrut_tid))
+    let resolved = tc_resolve(scrut_tid)
+    if type_kind(resolved) == TyKind.Typevar && tc_typevar_is_rigid(resolved) != 0 {
+        tc_check_type_param_match_exhaustive(node, resolved, arms_sl)
+        return
+    }
+    let base = tc_enum_base_tid(resolved)
     if base < 0 || base >= ty_pool.len() { return }
     if ty_pool.get(base).unwrap().kind != TyKind.Enum { return }
 
@@ -28196,6 +28216,22 @@ fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeChec
     diag_error_at("NonExhaustiveMatch", NON_EXHAUSTIVE_MATCH,
         "non-exhaustive match: missing {noun} {list_str}", node,
         "add an arm for {list_str}, or a `_ => ...` catch-all arm to absorb the rest of {ename}")
+}
+
+// A type parameter has no variants and no literals, so only an unguarded arm that matches
+// every value covers it. This check does not trust the pattern checks to have caught a
+// variant arm on the parameter: such a match would panic at run time.
+fn tc_check_type_param_match_exhaustive(node: Int, tv: Int, arms_sl: Int) ! TypeCheck.Report, Diag.Report {
+    let mut covered: List[Str] = []
+    let mut ai = 0
+    while ai < sublist_length(arms_sl) {
+        let arm = sublist_get(arms_sl, ai)
+        if node_guard(arm) == -1 && tc_exh_collect_pattern(node_pattern(arm), covered) != 0 { return }
+        ai = ai + 1
+    }
+    diag_error_at("NonExhaustiveMatch", NON_EXHAUSTIVE_MATCH,
+        "non-exhaustive match: a value of type parameter `{type_to_str(tv)}` is matched by no arm that always runs", node,
+        "add a binding arm or a `_ => ...` catch-all arm")
 }
 
 // Bind a `with <expr> as x { .. }` resource name WITH its type.
@@ -29101,7 +29137,8 @@ fn tc_pattern_binders(pat: Int, names: List[Str], nodes: List[Int]) {
     let k = node_kind(pat)
     if k == NodeKind.IdentPattern {
         let name = node_name(pat)
-        if name != "_" && is_variant_name(name) == 0 {
+        // Only a match arm's OR-patterns are checked for their binders, so the pattern is refutable.
+        if pattern_name_binds(name, true) {
             names.push(name)
             nodes.push(pat)
         }
@@ -29184,10 +29221,10 @@ fn tc_infer_let_value(val: Int, binder: Str, hint: Int) -> Int ! TypeCheck.Resol
     t
 }
 
-fn tc_check_pattern_types_against(pat: Int, binding_t: Int, subject: Str) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_pattern_types_against(pat: Int, binding_t: Int, subject: Str, refutable: Bool) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let saved_pat = tc_pattern_binding_type
     tc_pattern_binding_type = binding_t
-    let bad = tc_check_pattern_types(pat, subject, false)
+    let bad = tc_check_pattern_types(pat, subject, false, refutable)
     tc_pattern_binding_type = saved_pat
     bad
 }
@@ -29558,7 +29595,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // The ELEMENT type is the binding hint: a destructured `for (k, v) in m` needs the
             // same tuple decomposition the match path gets. Without the hint the TuplePattern
             // arm takes its `tup_start == -1` path and types both leaves as untyped.
-            let _ = tc_check_pattern_types_against(tc_for_pat_node, elem_t, "")
+            let _ = tc_check_pattern_types_against(tc_for_pat_node, elem_t, "", false)
         }
         tc_check_body(node_body(node))
         tc_check_dropped_value(node_body(node))
@@ -29588,7 +29625,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let arm = sublist_get(arms_sl, i)
                 nr_push_scope()
                 tc_pattern_binding_type = scrut_tid
-                let bad = tc_check_pattern_types(node_pattern(arm), subject, false)
+                let bad = tc_check_pattern_types(node_pattern(arm), subject, false, true)
                 tc_pattern_binding_type = -1
                 if bad && node_guard(arm) == -1 { bad_unguarded = true }
                 tc_check_or_pattern_bindings(node_pattern(arm))
@@ -30114,6 +30151,7 @@ fn tc_owner_variant_form(o: VariantOwner, name: Str) -> Int {
 }
 
 fn tc_pattern_payload_form(pat: Int) -> Int {
+    if node_kind(pat) == NodeKind.IdentPattern { return 0 }
     if node_kind(pat) == NodeKind.StructPattern || node_int_val(pat) == 1 { return 2 }
     if node_fields(pat) == -1 { return 0 }
     1
@@ -30126,7 +30164,7 @@ fn tc_named_struct_base(name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
     tc_struct_base_tid(rt)
 }
 
-// A bare variant name with a payload, against the resolved type `h` at its position.
+// A bare variant name, against the resolved type `h` at its position.
 fn tc_bare_variant_fault(name: Str, h: Int) -> PatternFault {
     match tc_variant_owner_of(h) {
         Some(o) => return if tc_owner_has_variant(o, name) { PatternFault.Clean } else { PatternFault.NoSuchVariant(o) }
@@ -30168,12 +30206,14 @@ fn tc_qualified_variant_fault(qual: Str, variant: Str, h: Int, open: Bool) -> Pa
 }
 
 // The one place a variant or struct pattern is looked up against the type at its position,
-// `hint`. A position whose type is not known yet is not judged here: the under-determined
-// check owns it.
+// `hint`. A bare name reaches here only when it names a variant (an uppercase name in a
+// refutable pattern). A position whose type is not known yet is not judged here: the
+// under-determined check owns it.
 fn tc_pattern_fault(pat: Int, hint: Int) -> PatternFault ! TypeCheck.Resolve, Diag.Report {
     let h = if hint < 0 { -1 } else { resolve_alias_tid(tc_tid_resolved(hint)) }
     let open = h < 0 || tc_tid_is_no_info(h) != 0 || tc_is_unbound_metavar(h) != 0
     let k = node_kind(pat)
+    if k == NodeKind.IdentPattern { return if open { PatternFault.Clean } else { tc_bare_variant_fault(node_name(pat), h) } }
     if k != NodeKind.EnumPattern && k != NodeKind.StructPattern { return PatternFault.Clean }
     if k == NodeKind.EnumPattern {
         let qual = node_name(pat)
@@ -30285,6 +30325,17 @@ fn tc_report_no_such_variant_value(node: Int, owner: VariantOwner, qual: Str, na
     tc_report_no_such_variant(node, owner, name, form, tc_qualified_name_col(node, qual, name), [])
 }
 
+// The repairs for an uppercase name with no payload at a position that is not an enum: a
+// lowercase name binds the value, and when a value has that name a guard compares with it.
+// The guard binds the matched value under its own name when the match names one.
+fn tc_bare_name_on_non_enum_help(name: Str, subject: Str) -> Str {
+    let bind = "to bind the value, write a lowercase name"
+    // nr_is_defined would mark the value read and hide an unused-value warning on it.
+    if nr_top_index(name) == -1 { return bind }
+    let v = if subject != "" { subject } else { "n" }
+    "{bind}\nto compare with the value `{name}`, write a guard: `{v} if {v} == {name} =>`"
+}
+
 fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: Str) ! Diag.Report {
     let k = node_kind(pat)
     let qualified = k == NodeKind.EnumPattern && node_type_name(pat) != ""
@@ -30305,7 +30356,8 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
         }
         PatternFault.NoVariants(shown, noun) => {
             let at = if col == -1 { node_col(pat) } else { col }
-            diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` is {noun}; it has no variants", pat, line, at, at + name.byte_len(), "", [])
+            let help = if k == NodeKind.IdentPattern { tc_bare_name_on_non_enum_help(name, subject) } else { "" }
+            diag_error_span_at_notes("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM, "`{shown}` is {noun}; it has no variants", pat, line, at, at + name.byte_len(), help, [])
         }
         PatternFault.WrongType(named, ptid) => {
             let h = resolve_alias_tid(tc_tid_resolved(hint))
@@ -30343,11 +30395,13 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
             let shown = if qualified { "{qual}.{name}" } else { name }
             let help = if enum_qual != "" {
                 "match the enum itself, or cross the boundary explicitly with {enum_qual}.from_int(...), which answers Option[{enum_qual}]"
+            } else if k == NodeKind.IdentPattern {
+                tc_bare_name_on_non_enum_help(name, subject)
             } else {
                 "a scalar has no variants: match it with literals, ranges or a binding"
             }
             diag_error_at("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM,
-                "match arm names variant `{shown}`, but the value being matched has type `{type_to_str(resolve_alias_tid(tc_tid_resolved(hint)))}` -- a scalar has no variants, so this arm can never be the one that runs",
+                "match arm names variant `{shown}`, but the value being matched has type `{type_to_str(resolve_alias_tid(tc_tid_resolved(hint)))}` -- a scalar has no variants",
                 pat, help)
         }
     }
@@ -30378,7 +30432,7 @@ fn tc_labels_cover_nothing(faults: LitFaults) -> Bool {
 // globals (nr_scope_*, nr_name_top) — defining the pattern's bindings is the
 // intended permanent effect, not speculative state to roll back.
 @allow(UnrestoredMutation)
-fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! TypeCheck.Resolve, Diag.Report {
+fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bool) -> Bool ! TypeCheck.Resolve, Diag.Report {
     if node == -1 { return false }
     let kind = node_kind(node)
     // Every pattern MATCHES a value, so every pattern node has a type: the value it is
@@ -30388,7 +30442,8 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
     // and a nested variant pattern were the shapes nothing published for, and codegen asking
     // one of them for its type found no answer at all.
     if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
-    if kind == NodeKind.IdentPattern {
+    // An uppercase name in a refutable pattern is a variant: it is judged below like `Red(x)`.
+    if kind == NodeKind.IdentPattern && !(refutable && tc_name_is_upper(node_name(node))) {
         let name = node_name(node)
         // A nullary variant (`None`) and `_` bind nothing, but they still MATCH a value, and
         // the value they match is the one the enclosing pattern decomposed to — the same type
@@ -30430,6 +30485,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
         PatternFault.WrongType(_, _) => true
         _ => false
     }
+    if kind == NodeKind.IdentPattern { return covers_nothing }
     let bad = faulted || poisoned
     let poison = tc_error_recovery_tid()
     let mut child_bad = false
@@ -30503,7 +30559,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                     if sub_t < 0 { sub_t = tc_pattern_binding_type }
                     if fpat != -1 {
                         tc_pattern_binding_type = sub_t
-                        if tc_check_pattern_types(fpat, "", bad) { child_bad = true }
+                        if tc_check_pattern_types(fpat, "", bad, refutable) { child_bad = true }
                     } else {
                         if sub_t >= 0 {
                             nr_define_typed(fname, node_is_mut(f), sub_t, f)
@@ -30517,7 +30573,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                     if var_idx >= 0 { sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_index(var_idx, i), saved_binding) }
                     if sub_t < 0 { sub_t = tc_pattern_binding_type }
                     tc_pattern_binding_type = sub_t
-                    if tc_check_pattern_types(f, "", bad) { child_bad = true }
+                    if tc_check_pattern_types(f, "", bad, refutable) { child_bad = true }
                 }
                 i = i + 1
             }
@@ -30584,7 +30640,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                 }
                 if fpat != -1 {
                     tc_pattern_binding_type = sub_t
-                    if tc_check_pattern_types(fpat, "", bad) { child_bad = true }
+                    if tc_check_pattern_types(fpat, "", bad, refutable) { child_bad = true }
                 } else {
                     if sub_t >= 0 {
                         nr_define_typed(fname, node_is_mut(f), sub_t, f)
@@ -30643,7 +30699,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                 } else {
                     tc_pattern_binding_type = -1
                 }
-                if tc_check_pattern_types(sublist_get(elems_sl, i), "", poisoned) { child_bad = true }
+                if tc_check_pattern_types(sublist_get(elems_sl, i), "", poisoned, refutable) { child_bad = true }
                 i = i + 1
             }
         }
@@ -30665,7 +30721,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
             let mut i = 0
             while i < sublist_length(elems_sl) {
                 tc_pattern_binding_type = elem_t
-                if tc_check_pattern_types(sublist_get(elems_sl, i), "", poisoned) { child_bad = true }
+                if tc_check_pattern_types(sublist_get(elems_sl, i), "", poisoned, refutable) { child_bad = true }
                 i = i + 1
             }
         }
@@ -30685,10 +30741,10 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
             while i < sublist_length(alts) {
                 tc_pattern_binding_type = saved_binding
                 if i == 0 {
-                    if tc_check_pattern_types(sublist_get(alts, i), subject, poisoned) { child_bad = true }
+                    if tc_check_pattern_types(sublist_get(alts, i), subject, poisoned, refutable) { child_bad = true }
                 } else {
                     let saved_warn = nr_or_alt_open()
-                    if tc_check_pattern_types(sublist_get(alts, i), subject, poisoned) { child_bad = true }
+                    if tc_check_pattern_types(sublist_get(alts, i), subject, poisoned, refutable) { child_bad = true }
                     let _ = nr_or_alt_close(or_start, saved_warn)
                 }
                 i = i + 1
@@ -30708,7 +30764,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
         } else {
             nr_define_mut(node_name(node), node_is_mut(node))
         }
-        return tc_check_pattern_types(node_pattern(node), subject, poisoned)
+        return tc_check_pattern_types(node_pattern(node), subject, poisoned, refutable)
     }
     false
 }

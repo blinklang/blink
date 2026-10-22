@@ -1,0 +1,342 @@
+// In a refutable pattern, a bare name whose first character is an uppercase letter names a
+// variant of the type at that position, with or without a payload (sections/03_types.md §3.5
+// *Bare names: variant or binding*). It is never a new binding there. On a type that is not
+// an enum it is EnumPatternNeedsEnumScrutinee (E0308), reported at the generic fn for a type
+// parameter; on an enum without that variant it is NoSuchVariant (E0547). A lowercase name
+// keeps the type-directed rule, and let and for patterns, which are irrefutable, still bind
+// an uppercase name.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/uppercase_bare_name_names_a_variant"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn error_rows(out: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for row in out.trim().split("\n") {
+        if row.contains("\"severity\":\"error\"") { rows.push(row) }
+    }
+    rows
+}
+
+// Each want is "CODE@line:col@message@help", in the order the errors are reported. An empty
+// help means the row has none.
+fn expect_rows(name: Str, src: List[Str], want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", lines(src))
+    let r = blink_in_dir("check --json {name}.bl")
+    let rows = error_rows(r.err_out)
+    let mut problems: List[Str] = []
+    if want.len() > 0 && r.exit_code != 1 { problems.push("{name}: want exit 1, got {r.exit_code}") }
+    if rows.len() != want.len() { problems.push("{name}: want {want.len()} error rows, got {rows.len()}:\n{r.err_out}") }
+    let mut i = 0
+    while i < rows.len() && i < want.len() {
+        let row = rows.get(i).unwrap()
+        let parts = want.get(i).unwrap().split("@")
+        let code = parts.get(0).unwrap()
+        let at = parts.get(1).unwrap().split(":")
+        let msg = parts.get(2).unwrap()
+        let help = parts.get(3).unwrap()
+        if !row.contains("\"code\":\"{code}\"") { problems.push("{name}: row {i}: want {code} in {row}") }
+        if !row.contains("\"line\":{at.get(0).unwrap()},\"col\":{at.get(1).unwrap()}") { problems.push("{name}: row {i}: want {parts.get(1).unwrap()} in {row}") }
+        if !row.contains("\"message\":\"{msg}\"") { problems.push("{name}: row {i}: want message {msg} in {row}") }
+        if help == "" && row.contains("\"help\":") { problems.push("{name}: row {i}: want no help in {row}") }
+        if help != "" && !row.contains("\"help\":\"{help}\"") { problems.push("{name}: row {i}: want help {help} in {row}") }
+        i = i + 1
+    }
+    problems.join("\n")
+}
+
+fn report(problems: List[Str]) {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+let BIND_HELP = "to bind the value, write a lowercase name"
+
+fn guard_help(subject: Str, name: Str) -> Str {
+    "{BIND_HELP}\\nto compare with the value `{name}`, write a guard: `{subject} if {subject} == {name} =>`"
+}
+
+fn on_scalar(name: Str, ty: Str) -> Str {
+    "match arm names variant `{name}`, but the value being matched has type `{ty}` -- a scalar has no variants"
+}
+
+test "a misspelled unit variant with no payload is NoSuchVariant, not a binding" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let dott = expect_rows("dott", [
+        "type Shape \{ Circle(Float), Square(Float), Dot }",
+        "",
+        "fn k(s: Shape) -> Str \{",
+        "    match s \{",
+        "        Circle(_) => \"c\"",
+        "        Dott => \"dot\"",
+        "        Square(_) => \"s\"",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(k(Shape.Dot)) }",
+    ], ["E0547@6:9@`Shape` has no variant `Dott`@did you mean `Dot`?"])
+    let gren = expect_rows("gren", [
+        "type Color \{ Red, Green }",
+        "",
+        "fn f(c: Color) -> Str \{",
+        "    match c \{",
+        "        Red => \"r\"",
+        "        Gren => \"g\"",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(f(Color.Green)) }",
+    ], ["E0547@6:9@`Color` has no variant `Gren`@did you mean `Green`?"])
+    let nested = expect_rows("nested", [
+        "type Shape \{ Circle(Float), Dot }",
+        "",
+        "fn k(s: Option[Shape]) -> Int \{",
+        "    match s \{",
+        "        Some(Dott) => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{k(None)}\") }",
+    ], ["E0547@5:14@`Shape` has no variant `Dott`@did you mean `Dot`?"])
+    let _ = sh("rm -rf {DIR}")
+    report([dott, gren, nested])
+}
+
+test "an uppercase name on a scalar is E0308, with the guard help only when a value has that name" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let max = expect_rows("max", [
+        "const MAX = 10",
+        "type Color \{ Red, Green }",
+        "",
+        "fn check(n: Int) -> Str \{",
+        "    match n \{",
+        "        MAX => \"at the limit\"",
+        "        _ => \"below\"",
+        "    }",
+        "}",
+        "",
+        "fn show(n: Int) -> Str \{",
+        "    match n \{",
+        "        Red => \"red\"",
+        "        _ => \"other\"",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    io.println(check(3))",
+        "    io.println(show(3))",
+        "}",
+    ], [
+        "E0308@6:9@{on_scalar("MAX", "Int")}@{guard_help("n", "MAX")}",
+        "E0308@13:9@{on_scalar("Red", "Int")}@{BIND_HELP}",
+    ])
+    let local = expect_rows("local", [
+        "fn check(v: Int) -> Str \{",
+        "    let LIMIT = 3",
+        "    match v \{",
+        "        LIMIT => \"at the limit\"",
+        "        _ => \"below\"",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(check(3)) }",
+    ], ["E0308@4:9@{on_scalar("LIMIT", "Int")}@{guard_help("v", "LIMIT")}"])
+    let tuple = expect_rows("tuple", [
+        "fn f(p: (Int, Int)) -> Int \{",
+        "    match p \{",
+        "        (A, b) => b",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{f((1, 2))}\") }",
+    ], ["E0308@3:10@{on_scalar("A", "Int")}@{BIND_HELP}"])
+    let _ = sh("rm -rf {DIR}")
+    report([max, local, tuple])
+}
+
+test "None on a type parameter is E0308 at the generic fn and is the only error" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let alone = expect_rows("alone", [
+        "fn pick[T](x: T) -> Int \{",
+        "    match x \{",
+        "        None => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{pick(5)}\") }",
+    ], ["E0308@3:9@`T` is a type parameter; it has no variants@{BIND_HELP}"])
+    // Never called, so no instance of it exists: the error is still reported.
+    let uncalled = expect_rows("uncalled", [
+        "fn pick[T](x: T) -> Int \{",
+        "    match x \{",
+        "        None => 0",
+        "        _ => 1",
+        "    }",
+        "}",
+        "",
+        "fn main() \{}",
+    ], ["E0308@3:9@`T` is a type parameter; it has no variants@{BIND_HELP}"])
+    // A guarded arm may not run, so it does not turn the coverage check off, and only a
+    // catch-all covers a type parameter.
+    let guarded = expect_rows("guarded", [
+        "fn pick[T](x: T) -> Int \{",
+        "    match x \{",
+        "        None if true => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{pick(5)}\") }",
+    ], [
+        "E0308@3:9@`T` is a type parameter; it has no variants@{BIND_HELP}",
+        "E0004@2:5@non-exhaustive match: a value of type parameter `T` is matched by no arm that always runs@add a binding arm or a `_ => ...` catch-all arm",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    report([alone, uncalled, guarded])
+}
+
+test "a payload pattern on a struct, tuple or type parameter is E0308, and on an enum E0547" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let upper = expect_rows("upper", [
+        "type Point \{ x: Int, y: Int }",
+        "",
+        "fn on_struct(p: Point) -> Int \{",
+        "    match p \{",
+        "        Zed(v) => v",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn on_param[T](t: T) -> Int \{",
+        "    match t \{",
+        "        Zed(v) => 0",
+        "        _ => 1",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    let _ = on_struct(Point \{ x: 1, y: 2 })",
+        "    let _ = on_param(1)",
+        "}",
+    ], [
+        "E0308@5:9@`Point` is a struct; it has no variants@",
+        "E0308@12:9@`T` is a type parameter; it has no variants@",
+    ])
+    // A name with a payload always names a variant, whatever its first character.
+    let lower = expect_rows("lower", [
+        "type Shape \{ Circle(Float), Dot }",
+        "",
+        "fn on_int(n: Int) -> Int \{",
+        "    match n \{",
+        "        zed(v) => v",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn on_enum(s: Shape) -> Int \{",
+        "    match s \{",
+        "        circel(r) => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    let _ = on_int(1)",
+        "    let _ = on_enum(Shape.Dot)",
+        "}",
+    ], [
+        "E0308@5:9@{on_scalar("zed", "Int")}@a scalar has no variants: match it with literals, ranges or a binding",
+        "E0547@12:9@`Shape` has no variant `circel`@did you mean `Circle`?",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    report([upper, lower])
+}
+
+test "let and for bind an uppercase name, and a lowercase arm name still binds" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/binds.bl", lines([
+        "fn pick[T](x: T) -> T \{",
+        "    match x \{",
+        "        other => other",
+        "    }",
+        "}",
+        "",
+        "fn name(n: Int) -> Str \{",
+        "    match n \{",
+        "        0 => \"zero\"",
+        "        red => \"n is \{red}\"",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    let Big = 5",
+        "    let mut t = 0",
+        "    for X in [1, 2] \{ t = t + X }",
+        "    let (A, b) = (1, 2)",
+        "    io.println(\"\{Big} \{t} \{A} \{b} \{pick(7)} \{name(4)}\")",
+        "}",
+    ]))
+    let r = blink_in_dir("run binds.bl")
+    let _ = sh("rm -rf {DIR}")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "5 3 1 2 7 n is 4")
+}
+
+test "blink check, a per-module build and a one-unit build report the same variant errors" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/same.bl", lines([
+        "type Shape \{ Circle(Float), Dot }",
+        "",
+        "fn pick[T](x: T) -> Int \{",
+        "    match x \{",
+        "        None => 0",
+        "    }",
+        "}",
+        "",
+        "fn k(s: Shape) -> Int \{",
+        "    match s \{",
+        "        Circle(_) => 1",
+        "        Dott => 2",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    io.println(\"\{pick(5)} \{k(Shape.Dot)}\")",
+        "}",
+    ]))
+    let check = blink_in_dir("check same.bl")
+    let build = blink_in_dir("build same.bl")
+    let one = blink_in_dir("build --no-per-module same.bl")
+    let _ = sh("rm -rf {DIR}")
+    assert(check.exit_code != 0)
+    assert(build.exit_code != 0)
+    assert(one.exit_code != 0)
+    let shown = check.err_out.replace("error: check failed\n", "")
+    if shown != build.err_out || build.err_out != one.err_out {
+        io.eprintln("check:\n{check.err_out}\nbuild:\n{build.err_out}\none unit:\n{one.err_out}")
+    }
+    assert(shown == build.err_out)
+    assert(build.err_out == one.err_out)
+    assert(check.err_out.contains("error[EnumPatternNeedsEnumScrutinee]: `T` is a type parameter; it has no variants"))
+    assert(check.err_out.contains("error[NoSuchVariant]: `Shape` has no variant `Dott`"))
+    assert(check.err_out.contains("2 error(s) found"))
+}

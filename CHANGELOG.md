@@ -10,6 +10,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 ### Mutation and patterns
 - **`mut` before a pattern that binds no name is E0613 MutOnPattern.** This includes `let mut (x, y) = pair`, `for mut (k, v) in pairs` and `mut _`. Before, `let mut (x, y)` made each name mutable. Run `blink fix` to migrate: it writes `let (mut x, mut y) = pair`.
 - **A write through a name that is not `mut` is E0610 MutationRequiresMut.** This covers `=` and `op=` on a plain `let`, and an assignment or a mutating method call on a pattern binder without `mut`. Before, `blink check` accepted an assignment to a plain `let`. `blink fix` inserts the `mut`.
+- **In a match arm, a bare name with an uppercase first letter names a variant; it never binds.** `Gren =>` on an enum is E0547 NoSuchVariant with a nearest-name help; before, it caught every value. `MAX =>` on an `Int` and `None =>` on a type parameter are E0308 EnumPatternNeedsEnumScrutinee, reported in the generic function; before, the second compiled and panicked at run time. To bind, write a lowercase name; to compare with a value, write a guard `n if n == MAX =>`. `let` and `for` still bind an uppercase name. A variant pattern with a payload on a struct, a tuple or a type parameter moves from E0547 to E0308.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`.** If not, it is E0005 InconsistentPatternBindings. The fix writes `mut` in every alternative.
 
 ### Type checks
