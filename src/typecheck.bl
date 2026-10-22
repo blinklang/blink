@@ -5707,12 +5707,64 @@ fn is_int_literal_node(node: Int) -> Int {
 // (03_types.md §3.2 *Integer literal range*). Codegen reads the literal's own stamp, so the
 // type is recorded on the node, not only accepted: a U64 operand stamped Int is held in a
 // signed temp, and 2^63 reads back as the Int minimum.
+//
+// A literal out of the type's range keeps its Int stamp until the range check rejects it:
+// stamped, it would be truncated to the narrow type in C before the operation could panic.
 fn tc_literal_takes(node: Int, tid: Int) {
     if node == -1 || is_int_literal_node(node) == 0 { return }
     let t = tc_resolve(resolve_alias_tid(tid))
-    if is_integer_type(t) == 0 { return }
+    if is_integer_type(t) == 0 || !tc_literal_fits(node, type_kind(t)) { return }
     tc_publish_node_tid(node, t)
     if node_kind(node) == NodeKind.UnaryOp { tc_publish_node_tid(node_left(node), t) }
+}
+
+fn tc_literal_fits(node: Int, k: TyKind) -> Bool {
+    let digits = int_lit_node_digits(node)
+    let limit = tc_int_literal_limit(k, node_kind(node) == NodeKind.UnaryOp)
+    if digits == "" || limit == "" { return false }
+    digits.byte_len() < limit.byte_len() || (digits.byte_len() == limit.byte_len() && digits <= limit)
+}
+
+// The largest magnitude a literal of kind `k` may spell, or "" when none may: a negative
+// literal under an unsigned type holds no value of it.
+fn tc_int_literal_limit(k: TyKind, negative: Bool) -> Str {
+    if negative {
+        return match k {
+            TyKind.I8 => "128"
+            TyKind.I16 => "32768"
+            TyKind.I32 => "2147483648"
+            TyKind.Int => "9223372036854775808"
+            _ => ""
+        }
+    }
+    match k {
+        TyKind.I8 => "127"
+        TyKind.I16 => "32767"
+        TyKind.I32 => "2147483647"
+        TyKind.Int => "9223372036854775807"
+        TyKind.U8 => "255"
+        TyKind.U16 => "65535"
+        TyKind.U32 => "4294967295"
+        TyKind.U64 => "18446744073709551615"
+        _ => ""
+    }
+}
+
+// The decimal digits of an int literal node, a negative literal's without its sign, or ""
+// when the node is no int literal.
+pub fn int_lit_node_digits(node: Int) -> Str {
+    if node == -1 || is_int_literal_node(node) == 0 { return "" }
+    let lit = if node_kind(node) == NodeKind.UnaryOp { node_left(node) } else { node }
+    let s = node_str_val(lit)
+    int_lit_decimal(if s == "" { "{node_int_val(lit)}" } else { s })
+}
+
+// A literal's digits without leading zeros. The literal is a decimal value whatever its
+// spelling, and C would read `010` as octal and reject `09`.
+pub fn int_lit_decimal(spelled: Str) -> Str {
+    let mut i = 0
+    while i + 1 < spelled.byte_len() && spelled.byte_at(i) == 48 { i = i + 1 }
+    spelled.byte_slice(i, spelled.byte_len())
 }
 
 // The parameter index a keyword argument names, or -1. Starts at self_offset so a method's
@@ -21645,11 +21697,13 @@ fn tc_std_time_type_name(tid: Int) -> Str {
 // Assignment-position compatibility: like types_compatible, but allows an
 // untyped integer literal RHS to flow into a sized-int target (I8/U32/...).
 // Kept OUT of types_compatible so function-arg checking stays strict.
+// A literal may already carry the integer type one position stamped on it; it is still a
+// literal, so a check against another integer type takes it too.
 fn assignment_types_compatible(target_t: Int, val_t: Int, val_node: Int) -> Int {
     if tc_value_misses_never_slot(target_t, val_t) != 0 { return 0 }
     if types_compatible(target_t, val_t) == 1 { return 1 }
-    let literal_to_sized = is_sized_int(type_kind(target_t)) && val_t == TYPE_INT && is_int_literal_node(val_node)
-    if literal_to_sized { return 1 }
+    let literal_to_int = is_integer_type(target_t) != 0 && is_integer_type(val_t) != 0 && is_int_literal_node(val_node) != 0
+    if literal_to_int { return 1 }
     0
 }
 
@@ -23084,8 +23138,10 @@ fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first_t: Int) ! T
     // resolve_alias_tid on the concrete side, tc_resolve on the metavar side — and a first element
     // whose type is a metavar already BOUND to a sized int needs the second one.
     if is_int_literal_node(elem) != 0 {
-        if is_integer_type(resolve_alias_tid(first_t)) != 0 { return }
-        if is_integer_type(tc_resolve(first_t)) != 0 { return }
+        if is_integer_type(resolve_alias_tid(first_t)) != 0 || is_integer_type(tc_resolve(first_t)) != 0 {
+            tc_literal_takes(elem, first_t)
+            return
+        }
     }
     if tc_tid_has_unbound_metavar(first_t) != 0 || tc_tid_has_unbound_metavar(elem_t) != 0 {
         if tc_unify(first_t, elem_t) == 0 {
@@ -32176,6 +32232,7 @@ fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.R
     tc_pin_tail_ret_generic(ftid, inferred)
     if tc_tid_is_concrete(tc_lookup_node_tid(dflt)) == 0 { tc_publish_node_tid(dflt, inferred) }
     if !reread { tc_walk_stmt_value(dflt) }
+    tc_literal_takes(dflt, ftid)
 }
 
 // Post-order over the value children of `node`. Explicitly iterative: the AST is as deep as

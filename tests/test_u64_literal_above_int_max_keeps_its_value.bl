@@ -8,6 +8,8 @@ type U64Box { v: U64 }
 
 type U64IntPair { a: U64, b: Int }
 
+type U64Default { v: U64 = 9223372036854775808 }
+
 const U64_BIG: U64 = 18446744073709551614
 
 const U64_HALF: U64 = 9223372036854775808
@@ -133,18 +135,83 @@ test "each integer type holds its limits as literals" {
     assert_eq("{i64min} {i64max} {intmin}", "-9223372036854775808 9223372036854775807 -9223372036854775808")
     assert_eq("{i32min} {i32max} {i16min} {i16max} {i8min} {i8max}", "-2147483648 2147483647 -32768 32767 -128 127")
     assert_eq("{u64max} {u32max} {u16max} {u8max}", "18446744073709551615 4294967295 65535 255")
+    let u64min: U64 = 0
+    let u32min: U32 = 0
+    let u16min: U16 = 0
+    let u8min: U8 = 0
+    assert_eq("{u64min} {u32min} {u16min} {u8min}", "0 0 0 0")
+}
+
+test "a literal operand reaches each unsigned maximum" {
+    let a8: U8 = 1
+    let a16: U16 = 1
+    let a32: U32 = 1
+    let a64: U64 = 1
+    assert_eq("{a8 + 254} {a16 + 65534} {a32 + 4294967294}", "255 65535 4294967295")
+    assert_eq("{a64 + 18446744073709551614}", "18446744073709551615")
+}
+
+test "a field default keeps a literal above Int max" {
+    let d = U64Default {}
+    assert_eq("{d.v}", "9223372036854775808")
+}
+
+// A literal outside the other operand's type does not take that type, so the operation
+// still runs in the operand's type and panics instead of truncating the literal first.
+test "a literal operand out of a narrow type's range panics instead of wrapping" {
+    let b: U8 = 5
+    assert_panics(matching: "U8 overflow") { let _ = b + 256 }
+    let i: I8 = 100
+    assert_panics(matching: "I8 overflow") { let _ = i + 200 }
+    let w: U32 = 2
+    assert_panics(matching: "U32 overflow") { let _ = w * 4294967296 }
+    assert_panics(matching: "U8 overflow") {
+        let mut c: U8 = 1
+        c += 300
+    }
+}
+
+test "a U64 division by a zero literal panics" {
+    let t: U64 = 5
+    assert_panics(matching: "division by zero") { let _ = t / 0 }
+    assert_panics(matching: "by zero") { let _ = t % 0 }
+    assert_panics(matching: "division by zero") {
+        let mut m: U64 = 5
+        m /= 0
+    }
+}
+
+fn lead_zero_band(x: Int) -> Str {
+    match x {
+        010 => "ten"
+        011..=019 => "teens"
+        _ => "other"
+    }
+}
+
+// C reads a leading 0 as octal, and `09` is no C constant at all; the literal's value
+// is decimal whatever its spelling.
+test "a literal with leading zeros keeps its decimal value" {
+    let a = 010
+    let b: U64 = 09
+    let n = -010
+    assert_eq("{a} {b} {n}", "10 9 -10")
+    assert_eq(lead_zero_band(10), "ten")
+    assert_eq(lead_zero_band(19), "teens")
+    assert_eq(lead_zero_band(8), "other")
 }
 
 test "U64 overflow names its operands as unsigned values" {
-    assert_panics(matching: "18446744073709551615 + 1") {
+    assert_panics(matching: "18446744073709551615 + 9223372036854775808") {
         let m: U64 = 18446744073709551615
-        let _ = m + 1
+        let _ = m + 9223372036854775808
     }
 }
 
 fn emit_fixture() -> Str {
     [
         "type Box \{ v: U64 }",
+        "type Dflt \{ v: U64 = 9223372036854775808 }",
         "const K: U64 = 9223372036854775808",
         "fn id(x: U64) -> U64 \{ x }",
         "fn band(x: U64) -> Int \{",
@@ -162,6 +229,12 @@ fn emit_fixture() -> Str {
         "    c += 9223372036854775808",
         "    let s = t + 9223372036854775808",
         "    let r = 9223372036854775808 + t",
+        "    let mut xs: List[U64] = []",
+        "    xs.push(9223372036854775808)",
+        "    let ys = [t, 9223372036854775809]",
+        "    let d = Dflt \{}",
+        "    assert_eq(t, 9223372036854775808)",
+        "    io.println(\"\{9223372036854775808 < t} \{9223372036854775808 == t} \{t == 9223372036854775808} \{d.v} \{xs.len()} \{ys.len()}\")",
         "    io.println(\"\{a} \{b.v} \{c} \{s} \{r} \{K} \{id(9223372036854775808)} \{band(t)} \{t < 9223372036854775808}\")",
         "}",
     ].join("\n")
@@ -181,4 +254,19 @@ test "every U64 literal above Int max reaches C as an unsigned constant" {
         assert(all > 0)
         assert_eq(occurrences(c, "UINT64_C({digits})"), all)
     }
+}
+
+// The literal took U64 from the declared type, but it is still a literal: the struct's own
+// field check, made against the instance the literal built, must not report it again.
+test "a literal stamped with a declared type is not a second field error" {
+    let src = [
+        "type GBox[T] \{ v: T }",
+        "fn main() \{",
+        "    let gs: GBox[U64] = GBox \{ v: 5 }",
+        "    io.println(\"\{gs.v}\")",
+        "}",
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "u64_literal_generic_box")
+    assert(out.contains("error"))
+    assert(!out.contains("field `v`"))
 }
