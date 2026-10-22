@@ -1330,12 +1330,14 @@ Duration's `Display` writes the same text as Go's `time.Duration.String`. A dura
 `Bytes` is a contiguous byte buffer — the binary counterpart to `Str`. Where `Str` guarantees UTF-8 validity, `Bytes` carries no encoding invariant.
 
 ```blink
-fn read_binary(path: Str) -> Bytes ! FS.Read {
-    fs.read_bytes(path)
+import std.digest.{Sha256}
+
+fn first_four(data: Bytes) -> Bytes {
+    data.slice(0, 4)            // a copy
 }
 
-fn compute_hash(data: Bytes) -> Bytes ! Crypto.Hash {
-    crypto.hash("sha256", data)
+fn compute_hash(data: Bytes) -> Sha256 {
+    Sha256.of(data)             // pure; see Sha256 below
 }
 
 fn encode(s: Str) -> Bytes {
@@ -1357,7 +1359,7 @@ fn decode(b: Bytes) -> Result[Str, ConversionError] {
 | `slice` | `fn(self, Int, Int) -> Bytes` | Sub-buffer `[start, end)` (copy); clamps (§3.2.1 *Out-of-range indices*) |
 | `concat` | `fn(self, Bytes) -> Bytes` | Concatenation |
 | `to_str` | `fn(self) -> Result[Str, ConversionError]` | UTF-8 decode; `Err` on bad UTF-8 or a NUL byte |
-| `to_hex` | `fn(self) -> Str` | Hex string |
+| `to_hex` | `fn(self) -> Str` | Hex string: lower case, two digits per byte |
 | `to_list` | `fn(self) -> List[U8]` | Convert to list |
 | `from_str` | `fn(Str) -> Bytes` | UTF-8 encode |
 | `from_list` | `fn(List[U8]) -> Bytes` | From list |
@@ -1410,6 +1412,95 @@ Bytes implements: `Sized`, `Eq`, `Clone`, `Debug`, `IntoIterator[U8]`.
 **Why a separate type from `List[U8]`.** `Bytes` is the type for I/O, FFI, and crypto. `List[U8]` makes no contiguous-memory guarantee, so it cannot give FFI a `Ptr[U8]` view. (Panel vote: 5-0.)
 
 **Why Tier 1, not prelude.** `Bytes` is needed by core effects (`FS.Read`, `Net.Connect`, `Crypto.Hash`) but not every program does binary I/O. Tier 1 means it ships with the compiler and is version-locked. The API surface should remain minimal in Tier 1; richer operations (base64, compression) belong in higher tiers. (Panel vote: 5-0.)
+
+##### Sha256 and Sha256State (`std.digest`)
+
+`Sha256` is the SHA-256 digest of a byte sequence. It is always 32 bytes. `Sha256State` is a hasher that takes the input in parts. Both types are `opaque` (§2.12.2). The output is equal to SHA-256 as FIPS 180-4 defines it, and `to_hex` writes the same text that `sha256sum` prints. A digest is a pure function of its input: no function in this subsection has an effect row.
+
+```blink
+import std.digest.{Sha256, Sha256State}
+
+fn digest_of(data: Bytes) -> Sha256 {
+    Sha256.of(data)
+}
+
+fn digest_in_parts(a: Bytes, b: Bytes) -> Str {
+    let mut h = Sha256State.new()
+    h.update(a)
+    h.update(b)
+    h.finish().to_hex()
+}
+
+fn main() ! IO.Print {
+    let d = Sha256.of(Bytes.from_str("abc"))
+    io.println(d.to_hex())
+    // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    let back = Sha256.from_hex(d.to_hex())
+    io.println("{back == Some(d)}")     // true
+}
+```
+
+The impls of `Digest` and `DigestWriter` are in the package that defines the types, so `to_hex`, `to_bytes`, `update` and `finish` need no trait import (§3.6 *Impl visibility*). `import std.digest` or the selective import above is enough.
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `Sha256.of` | `fn(Bytes) -> Sha256` | Digest of the bytes |
+| `Sha256.from_hex` | `fn(Str) -> Option[Sha256]` | Exactly 64 lower-case hex digits; else `None` |
+| `to_hex` | `fn(self) -> Str` | 64 lower-case hex digits (`Digest`) |
+| `to_bytes` | `fn(self) -> Bytes` | A new 32-byte buffer (`Digest`) |
+| `Sha256State.new` | `fn() -> Sha256State` | A hasher that has read no input |
+| `update` | `fn(mut self, Bytes)` | Add bytes to the input (`DigestWriter`) |
+| `finish` | `fn(self) -> Sha256` | Digest of all input so far (`DigestWriter`) |
+
+The list of `Digest` methods is closed: it has no `len`, no `algorithm` and no `Display`. `Sha256.of`, `Sha256.from_hex` and `finish` are the only ways to make a `Sha256`; there is no `from_bytes`. Every `Sha256.<fn>` returns a `Sha256`, or an `Option[Sha256]`. `Sha256` implements `Eq`, `Clone` and `Debug`. It does not implement `Display`, `Hash` or `Ord`. `==` on a `Sha256` is not constant-time: use it only where timing does not matter.
+
+**Laws.** For every `d: Sha256`, every `s: Str` that `Sha256.from_hex` accepts and all `a: Bytes` and `b: Bytes`:
+
+- `d.to_bytes().len() == 32`
+- `d.to_hex()` is 64 lower-case hex digits
+- `Sha256.from_hex(d.to_hex())` gives `Some(d)`
+- `Sha256.from_hex(s)` gives `Some(x)` with `x.to_hex() == s`
+- `Sha256.from_hex` gives `None` for a `Str` with an upper-case digit
+- `Sha256State.new()`, then `update(a)`, then `update(b)`, then `finish()` gives `Sha256.of(a.concat(b))`
+
+`finish` does not consume the hasher and does not reset it. A second call gives the same digest, and a later `update` adds to the same input. The cost of one `update` and the size of the hasher do not depend on the total input length.
+
+`Sha256State` is a value, not a shared cell (§3.6 *Shared cells*). `let h2 = h` makes an independent copy:
+
+```blink
+fn copy_demo() ! IO.Print {
+    let mut h = Sha256State.new()
+    h.update(Bytes.from_str("ab"))
+    let h2 = h                          // copy
+    h.update(Bytes.from_str("c"))
+    let abc = Sha256.of(Bytes.from_str("abc"))
+    let ab = Sha256.of(Bytes.from_str("ab"))
+    io.println("{h.finish() == abc}")   // true
+    io.println("{h2.finish() == ab}")   // true
+}
+```
+
+`Hash` is for container keys and has a seed for each process (§3.6 *Hash Contract and Seeding*). A `Sha256` is not a `Hash` key; it is a stable digest.
+
+**Help texts.** A wrong name or type gets a fix that names the right form. The codes are the existing ones.
+
+| Wrote | Code | Help |
+|-------|------|------|
+| `Sha256.new()` | E0504 | `Sha256State.new()` makes a hasher; `Sha256.of(data)` hashes in one call |
+| `digest.sha256(data)` | E0504 | `Sha256.of(data)` |
+| `import std.sha256` | E1200 | `import std.digest` |
+| a `Sha256` where `Bytes` is expected | type mismatch | `.to_bytes()` |
+| `h.update(x)` with `let h = Sha256State.new()` | E0610 | declare the hasher with `let mut` |
+
+**Why one module with SHA-256 only.** The module is `std.digest`. There is no `std.crypto`, no `std.hash` and no algorithm named by a string, so a wrong algorithm name cannot compile. `Crypto.Hash` (§4.2) stays in the effect list; plain digests do not use it. (Panel vote: 6-0.)
+
+**Why an opaque `Sha256` and not `Bytes`.** A `Bytes` value has any length and any content. A `Sha256` has 32 bytes by construction, so a signature that takes one needs no length check. A `Sha256` cannot be built from arbitrary bytes, so a function that returns one has computed it or parsed it. (Panel vote: 5-1; Minimalism dissented, for `Bytes`.)
+
+**Why `Sha256State` is a value.** A hasher that copies on bind has the same rule as `Bytes`, and a copy can fork a running hash. (Panel vote: 5-1; Minimalism dissented, for no hasher now.)
+
+**Why `Sha256.of`.** One call form for the one-shot case, type-scoped and without a trait or an import beyond the type. (Panel vote: 5-1; Minimalism voted for a free function and asked that the vote count for this form once the opaque type won. The type names `Sha256` and `Sha256State`: 6-0.)
+
+**Why `update` and `finish` are `DigestWriter` methods.** The panel did not vote on trait names. The names `Digest` and `DigestWriter` come from the PLT and DevOps proposals. See [SHA-256 in std rationale](../decisions/sha256-std.md).
 
 ##### Numeric Extensions
 
@@ -3557,6 +3648,8 @@ type Ordering {
 ```
 
 #### Hash Contract and Seeding
+
+`Hash` is for container keys and its value has a seed for each process. For a cryptographic digest, see `Sha256` in §3.2.3 (`std.digest`).
 
 `hash(self) -> U64` returns a hash of the value. Implementations must satisfy the coherence law with `Eq`: for any `a` and `b`, `a == b` implies `a.hash() == b.hash()`. Coherence is a property of `hash` against `eq`.
 

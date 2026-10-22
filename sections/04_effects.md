@@ -164,7 +164,7 @@ effect Time {
 effect Rand           // generate random numbers (leaf effect, operations in §4.4.7)
 
 effect Crypto {
-    effect Hash       // hash functions (SHA, BLAKE, etc.)
+    effect Hash       // hash functions (SHA, BLAKE, etc.); a plain digest is a pure function in std.digest and needs no effect
     effect Sign       // digital signatures
     effect Encrypt    // symmetric/asymmetric encryption
     effect Decrypt    // decryption
@@ -297,7 +297,7 @@ The `IO.Read` operations take and return other types (§4.4.9). The wrapper sele
 | `Env` / `Env.*` | `env` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()`, `env.pid()`, `env.set_var(...)`, `env.remove_var(...)`, `env.exit(...)` (§4.4.3) |
 | `Time` / `Time.*` | `time` | `time.read() -> Instant` (wall clock), `time.monotonic() -> Monotonic`, `time.sleep(Duration)` (§3.2.3) |
 | `Rand` | `rand` | `rand.int(Range[Int])`, `rand.float()`, `rand.bytes(Int)` (§4.4.7) |
-| `Crypto` / `Crypto.*` | `crypto` | `crypto.hash(...)`, `crypto.sign(...)`, `crypto.encrypt(...)`, `crypto.decrypt(...)` |
+| `Crypto` / `Crypto.*` | `crypto` | `crypto.hash(...)`, `crypto.sign(...)`, `crypto.encrypt(...)`, `crypto.decrypt(...)`; a plain SHA-256 digest is the pure `Sha256.of` in `std.digest` and needs no effect |
 | `Process` / `Process.*` | `process` | `process.run(...)`, `process.spawn(...)`, `process.wait(...)`, `process.signal(...)`, `process.exec(...)` (§4.4.8) |
 
 The handle is always the lowercase form of the top-level effect name. Sub-effects do not create separate handles -- they control which *methods* on the handle are available. Declaring `! FS.Read` gives you the `fs` handle, but only `fs.read(...)`, `fs.list_dir(...)` and `fs.stat(...)` compile. Calling `fs.write(...)` with only `FS.Read` declared is a compile error:
