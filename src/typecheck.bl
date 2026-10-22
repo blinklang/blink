@@ -29855,7 +29855,7 @@ type PatternFault {
     UnknownQualifier
     NoSuchVariant(owner: VariantOwner)
     NoVariants(shown: Str, noun: Str)
-    WrongType(named: Str)
+    WrongType(named: Str, tid: Int)
     OnScalar(enum_qual: Str)
 }
 
@@ -29972,11 +29972,11 @@ fn tc_qualified_variant_fault(qual: Str, variant: Str, h: Int, open: Bool) -> Pa
             if open { return PatternFault.Clean }
             if tc_kind_has_no_variants(h) != 0 { return PatternFault.OnScalar(if q.base >= 0 { qual } else { "" }) }
             match tc_variant_owner_of(h) {
-                Some(o) => return if tc_same_owner(o, q) { PatternFault.Clean } else { PatternFault.WrongType(qual) }
+                Some(o) => return if tc_same_owner(o, q) { PatternFault.Clean } else { PatternFault.WrongType(qual, q.base) }
                 None => {}
             }
             let hk = type_kind(h)
-            if hk == TyKind.Struct || hk == TyKind.Tuple { return PatternFault.WrongType(qual) }
+            if hk == TyKind.Struct || hk == TyKind.Tuple { return PatternFault.WrongType(qual, q.base) }
             PatternFault.Clean
         }
         None => {
@@ -30008,15 +30008,16 @@ fn tc_pattern_fault(pat: Int, hint: Int) -> PatternFault ! TypeCheck.Resolve, Di
     match tc_variant_owner_of(h) {
         Some(o) => {
             if tc_owner_has_variant(o, tname) { return PatternFault.Clean }
-            return if tc_named_struct_base(tname) != -1 { PatternFault.WrongType(tname) } else { PatternFault.NoSuchVariant(o) }
+            let named = tc_named_struct_base(tname)
+            return if named != -1 { PatternFault.WrongType(tname, named) } else { PatternFault.NoSuchVariant(o) }
         }
         None => {}
     }
     let named = tc_named_struct_base(tname)
     if named == -1 { return tc_bare_variant_fault(tname, h) }
     let hk = type_kind(h)
-    if hk == TyKind.Struct { return if tc_struct_base_tid(h) == named { PatternFault.Clean } else { PatternFault.WrongType(tname) } }
-    if hk == TyKind.Tuple || tc_kind_has_no_variants(h) != 0 { return PatternFault.WrongType(tname) }
+    if hk == TyKind.Struct { return if tc_struct_base_tid(h) == named { PatternFault.Clean } else { PatternFault.WrongType(tname, named) } }
+    if hk == TyKind.Tuple || tc_kind_has_no_variants(h) != 0 { return PatternFault.WrongType(tname, named) }
     PatternFault.Clean
 }
 
@@ -30127,24 +30128,33 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
             let at = if col == -1 { node_col(pat) } else { col }
             diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` is {noun}; it has no variants", pat, line, at, at + name.byte_len(), "", [])
         }
-        PatternFault.WrongType(named) => {
+        PatternFault.WrongType(named, ptid) => {
             let h = resolve_alias_tid(tc_tid_resolved(hint))
             // An enum its module declares twice (E1016) may have meant the other's variants.
             if tc_type_decl_poisoned(tc_tid_decl_node(h)) { return }
             let at = if col == -1 { node_col(pat) + qual.byte_len() + 1 } else { col }
             let start = if qualified { at - qual.byte_len() - 1 } else { at }
             let end = at + name.byte_len()
-            let msg = "pattern of type `{named}` used on a value of type `{type_to_str(h)}`"
+            // Two types with one name print as `Name (module)` (§10.6); else as written.
+            let (pat_homed, val_s) = if ptid < 0 { (named, type_to_str(h)) } else { tc_type_pair_strs(ptid, h) }
+            let homed = ptid >= 0 && pat_homed != type_to_str(ptid)
+            let msg = "pattern of type `{if homed { pat_homed } else { named }}` used on a value of type `{val_s}`"
             match tc_variant_owner_of(h) {
                 Some(o) => {
-                    let o_shown = tc_owner_shown(o)
-                    let listed = "`{o_shown}` declares: {tc_owner_variant_names(o).join(", ")}"
-                    // A module-qualified name or a span not found in the source is no safe rewrite.
-                    let swap = col != -1 && !o_shown.contains(".") && tc_owner_has_variant(o, name) && tc_owner_variant_form(o, name) == tc_pattern_payload_form(pat)
+                    let listed = "`{if homed { val_s } else { tc_owner_shown(o) }}` declares: {tc_owner_variant_names(o).join(", ")}"
+                    // The rewrite must name the expected type at this site, and a span not found
+                    // in the source is no safe rewrite.
+                    let decl = if o.base < 0 { -1 } else { tc_owner_decl(o) }
+                    let site = if decl == -1 { tc_owner_shown(o) } else { node_name(decl) }
+                    let resolves = match tc_qualifier_owner(site) {
+                        Some(s) => tc_same_owner(s, o)
+                        None => false
+                    }
+                    let swap = col != -1 && resolves && tc_owner_has_variant(o, name) && tc_owner_variant_form(o, name) == tc_pattern_payload_form(pat)
                     let before = diag_entry_count()
-                    diag_error_span_at_notes("TypeError", TYPE_ERROR, msg, pat, line, start, end, if swap { "write `{o_shown}.{name}`; {listed}" } else { listed }, [])
+                    diag_error_span_at_notes("TypeError", TYPE_ERROR, msg, pat, line, start, end, if swap { "write `{site}.{name}`; {listed}" } else { listed }, [])
                     if swap && diag_entry_count() > before {
-                        diag_set_last_fix_at("rename to", "{o_shown}.{name}", line, start, line, end)
+                        diag_set_last_fix_at("rename to", "{site}.{name}", line, start, line, end)
                     }
                 }
                 None => diag_error_span_at_notes("TypeError", TYPE_ERROR, msg, pat, line, start, end, "", [])
@@ -30223,7 +30233,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
     let covers_nothing = match fault {
         PatternFault.NoSuchVariant(_) => true
         PatternFault.NoVariants(_, _) => true
-        PatternFault.WrongType(_) => true
+        PatternFault.WrongType(_, _) => true
         _ => false
     }
     let bad = faulted || poisoned

@@ -1,0 +1,168 @@
+// A pattern that names a namesake type of another module is a TypeError (E0300,
+// sections/03_types.md §3.5 "Qualified names and the wrong type"): types compare by
+// declaration, not by name. Each type prints as `Name (module)` (§10.6 rule 3). The help gives
+// the `T.Q` fix only when that spelling names the expected type at the site. check and both
+// builds report the same rows, each once, with no E0004 and no cascade from the binders.
+// Construction compares by declaration too.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn alpha_src() -> Str {
+    #"pub type Shape { Dot(r: Int), Line }
+pub type Pt { x: Int }
+pub type Mark { Q(Int), R }
+
+pub fn mk() -> Shape { Shape.Dot(1) }
+pub fn mko() -> Option[Shape] { Some(Shape.Dot(2)) }
+pub fn mkp() -> Pt { Pt { x: 3 } }
+pub fn mkm() -> Mark { Mark.Q(4) }
+pub fn take(_s: Shape) -> Int { 0 }
+"#
+}
+
+fn bad_main_src() -> Str {
+    #"import alpha
+
+type Shape { Dot(r: Int), Line }
+type Pt { x: Int }
+type Other { Q(Int) }
+
+fn top() {
+    match alpha.mk() {
+        Shape.Dot(r) => io.println("{r + 1}")
+    }
+}
+
+fn nested() -> Int {
+    match alpha.mko() {
+        Some(Shape.Dot(r)) => r * 2
+        _ => 0
+    }
+}
+
+fn point() -> Int {
+    match alpha.mkp() {
+        Pt { x } => x - 1
+    }
+}
+
+fn mark() -> Int {
+    match alpha.mkm() {
+        Other.Q(v) => v
+        _ => 0
+    }
+}
+
+fn main() {
+    top()
+    io.println("{nested()} {point()} {mark()} {alpha.take(Shape.Line)}")
+}
+"#
+}
+
+fn good_main_src() -> Str {
+    #"import alpha
+import alpha.{Shape as AShape}
+
+type Shape { Dot(r: Int), Line }
+
+fn main() {
+    let a = match alpha.mk() {
+        AShape.Dot(r) => r
+        AShape.Line => 0
+    }
+    let b = match Shape.Dot(5) {
+        Shape.Dot(r) => r
+        Shape.Line => 0
+    }
+    let c = match alpha.mko() {
+        Some(AShape.Dot(r)) => r
+        _ => 0
+    }
+    io.println("{a} {b} {c}")
+}
+"#
+}
+
+// A package whose src/ holds `main.bl` and `alpha.bl`.
+fn project(main_src: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_namesake_pattern.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", main_src)
+    write_file("{dir}/src/alpha.bl", alpha_src())
+    dir
+}
+
+fn count(hay: Str, needle: Str) -> Int {
+    hay.split(needle).len() - 1
+}
+
+// `blink <args> src/main.bl` run in the package `dir`, stderr folded into stdout.
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn assert_none(bad: List[Str]) {
+    for b in bad { io.eprintln(b) }
+    assert_eq(bad.len(), 0)
+}
+
+test "check and both builds give the same five TypeErrors, once each, and nothing else" {
+    let dir = project(bad_main_src())
+    let mut bad: List[Str] = []
+    let wants = [
+        "error[TypeError]: pattern of type `Shape (main)` used on a value of type `Shape (alpha)`\n  --> src/main.bl:9:9\n",
+        "error[TypeError]: pattern of type `Shape (main)` used on a value of type `Shape (alpha)`\n  --> src/main.bl:15:14\n",
+        "  help: `Shape (alpha)` declares: Dot, Line\n",
+        "error[TypeError]: pattern of type `Pt (main)` used on a value of type `Pt (alpha)`\n  --> src/main.bl:22:9\n",
+        "error[TypeError]: pattern of type `Other` used on a value of type `Mark`\n  --> src/main.bl:28:9\n",
+        "  help: write `Mark.Q`; `Mark` declares: Q, R\n  fix: rename to `Mark.Q` at 28:9\n",
+        "error[TypeError]: argument 1 of `alpha.take` expects Shape (alpha), got Shape (main)\n  --> src/main.bl:35:"
+    ]
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = blink_in(dir, args)
+        let mut missing: List[Str] = []
+        for w in wants {
+            if !r.out.contains(w) { missing.push(w) }
+        }
+        let n = count(r.out, "error[TypeError]")
+        let other = count(r.out, "error[") - n
+        // `Shape.Q` cannot name alpha's Shape here, so the namesake rows carry no rewrite.
+        if r.out.contains("write `Shape.") || r.out.contains("rename to `Shape.") { missing.push("no fix for a namesake") }
+        if r.exit_code == 0 || missing.len() > 0 || n != 5 || other != 0 || r.out.contains("internal compiler error") {
+            bad.push("blink {args}: exit {r.exit_code}, {n} E0300, {other} others, missing {missing.join(" | ")}\n{r.out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_none(bad)
+}
+
+test "the JSON rows span the whole path and carry the fix only where the spelling resolves" {
+    let dir = project(bad_main_src())
+    let r = blink_in(dir, "check --json")
+    let _ = sh("rm -rf {dir}")
+    let wants = [
+        "\"code\":\"E0300\",\"message\":\"pattern of type `Shape (main)` used on a value of type `Shape (alpha)`\",\"span\":\{\"file\":\"src/main.bl\",\"line\":9,\"col\":9,\"end_line\":9,\"end_col\":18},\"help\":\"`Shape (alpha)` declares: Dot, Line\"}",
+        "\"message\":\"pattern of type `Pt (main)` used on a value of type `Pt (alpha)`\",\"span\":\{\"file\":\"src/main.bl\",\"line\":22,\"col\":9,\"end_line\":22,\"end_col\":11}"
+    ]
+    for w in wants {
+        if !r.out.contains(w) { io.eprintln("missing: {w}\n{r.out}") }
+        assert(r.out.contains(w))
+    }
+    assert_eq(count(r.out, "\"fix\""), 1)
+}
+
+test "the namesake under its own spelling, and the local type, match as usual" {
+    let dir = project(good_main_src())
+    let c = blink_in(dir, "check")
+    let r = blink_in(dir, "run")
+    let _ = sh("rm -rf {dir}")
+    if c.exit_code != 0 || !r.out.contains("1 5 2") { io.eprintln("{c.out}\n{r.out}") }
+    assert_eq(c.exit_code, 0)
+    assert(r.out.contains("1 5 2"))
+}
