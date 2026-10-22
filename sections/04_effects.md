@@ -1724,7 +1724,13 @@ error[UnresolvedMethod]: no method `lines` on the `io` handle
   = help: or read one line at a time: `loop { match io.read_line() { Some(line) => ..., None => break } }`
 ```
 
-**Migration.** In earlier versions, `io.read_line()` returned `Str`, with `""` for both a blank line and end of input. Code that uses the result as a `Str` now gets a type error. When the value comes from `io.read_line()`, the error has a help line that shows the `match` form:
+**Migration.** In earlier versions, `io.read_line()` returned `Str`, with `""` for both a blank line and end of input. Code that uses the result as a `Str` now gets an error. When the value comes from `io.read_line()`, three diagnostics have a note and a help line that shows the `match` form:
+
+- E0300 (TypeError), for a mismatch between `Option[Str]` and `Str`.
+- E0505 (UnresolvedMethod), for a method call on a value of type `Option[Str]`. The note and help show only when `Str` has a method of that name. For any other name, the error has no note and no help.
+- E0523 (MissingDisplayImpl), for a value of type `Option[Str]` in a string interpolation. Here the `match` help replaces the `.debug()` suggestion.
+
+The diagnostic code does not change. The note and help lines are the same text in each case.
 
 ```
 error[TypeError]: mismatched types
@@ -1737,6 +1743,25 @@ error[TypeError]: mismatched types
   = note: `io.read_line()` returns `None` at end of input and `Some("")` for a blank line
   = help: match on it: `match io.read_line() { Some(line) => ..., None => break }`
 ```
+
+The note and help lines are fixed. The headline and the caret label are the wording of the compiler for each diagnostic, and the example above shows one of them. In the example below, `line.trim()` is E0505 and `"got {line}"` is E0523. Each has the same note and help lines.
+
+```blink
+fn show() ! IO.Read, IO.Print {
+    let line = io.read_line()
+    io.println(line.trim())
+    io.println("got {line}")
+}
+```
+
+A value counts as a value from `io.read_line()` in two cases:
+
+- It is a direct call to `io.read_line()`. This includes a call that is the value of a `return` or of a named argument.
+- It is a name that a `let` binds to a direct call of that form.
+
+These do not count: a copy of the name (`let b = line`), a struct field, the result of a function call, and an element of a collection. A `let mut` name that the code assigns again does not count, and the note and help do not show when an assignment can reach the use. In all of these cases the error has no note and no help.
+
+`+` is not covered by this rule. `line + "!"` is E0521 (StrPlusUnsupported) with no note and no help.
 
 No fix is machine-applicable. The help does not show `?? ""`, because that form gives back the old behavior, where a blank line and end of input look the same.
 
