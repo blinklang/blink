@@ -1115,11 +1115,41 @@ Instant implements: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. Does NOT i
 
 Instant's `Display` writes RFC 9557 in UTC with a `Z` offset: `2026-02-14T12:00:00Z`. A zero fraction of a second is left out. Any other fraction is written without trailing zeros: `2026-02-14T12:00:00.5Z`, `2026-02-14T12:00:00.000000001Z`. An instant before the epoch rounds down to the earlier second: 500 ms before the epoch is `1969-12-31T23:59:59.5Z`. `to_rfc3339` does not change: it always drops the fraction.
 
-**Monotonic** is an opaque type, declared `pub opaque type Monotonic` in `std.time`. Code builds a `Monotonic` only through `time.monotonic()`. It has no epoch, no `Display`, and no conversion to or from `Instant`, so a monotonic reading cannot be mixed with a wall-clock time.
+**Monotonic** is an opaque type, declared `pub opaque type Monotonic` in `std.time`. Code reads the clock through `time.monotonic()`. A `Time` handler builds the reading it returns with the type-scoped function `Monotonic.from_offset`, and any other code can call it too. `Monotonic` has no `Display` and no conversion to or from `Instant`, so a monotonic reading cannot be mixed with a wall-clock time. The clock has no epoch: the origin of the built-in clock is unspecified and can change from one run to the next. Code must not depend on its value.
+
+| Function | Signature | Notes |
+|----------|-----------|-------|
+| `Monotonic.from_offset` | `fn(d: Duration) -> Monotonic` | The reading `d` after the origin of a clock; pure; panics when `d` is negative |
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
-| `since` | `fn(self, earlier: Monotonic) -> Duration` | Time from `earlier` to this reading; never negative when `earlier` was read first |
+| `since` | `fn(self, earlier: Monotonic) -> Duration` | Time from `earlier` to this reading; never negative when `earlier` was read first from the same clock |
+
+`Monotonic.from_offset` panics when `d` is negative, because a monotonic reading is never before its origin. The panic message contains the offset, for example `Monotonic.from_offset: negative offset -5ns; a monotonic reading is never before its origin`.
+
+`since` is the exact signed difference of the two offsets. It is negative when `earlier` is the later reading. It never panics, except on `Int` overflow. Two readings from different clocks, for example one from the built-in clock and one from a handler's `from_offset`, give a `Duration` with no meaning, and no error. `since` is the only way to observe a reading: there is no `to_offset`, no `add`, no comparison and no `Display`.
+
+Where code has no reading yet, it holds a `Monotonic?`. A zero offset is a real reading, not a mark for "not started".
+
+**Why `from_offset` is public.** A `Time` handler can live in any module, and §2.12 has no friend visibility. So a handler outside `std.time` can build a reading only through a `pub` function. Building a value observes no clock, so `Time.Read` still tracks every read of the clock. The type still cannot mix with `Instant`: `from_offset` takes a `Duration`, and no function converts between the two types.
+
+A handler builds each reading from its own state:
+
+```blink
+fn stepping(step: Duration) -> Handler[Time] {
+    let mut elapsed = Duration.nanos(0)
+    handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(0) }
+        fn monotonic() -> Monotonic {
+            elapsed = elapsed.add(step)
+            Monotonic.from_offset(elapsed)
+        }
+        fn sleep(d: Duration) { }
+    }
+}
+```
+
+A `Time` handler that omits `monotonic` gets W0545, and its help names `Monotonic.from_offset` (§4.7.1).
 
 ##### Date and Weekday
 

@@ -1010,15 +1010,21 @@ pub fn mock_clock(start: Instant) -> MockClock {
     MockClock {
         time_handler: handler Time {
             fn read() -> Instant { now }
+            fn monotonic() -> Monotonic { Monotonic.from_offset(now.since(start)) }
             fn sleep(d: Duration) { slept.push(d) }
         },
-        advance_fn: fn(d: Duration) { now = now.add(d) },
+        advance_fn: fn(d: Duration) {
+            if d.to_nanos() < 0 {
+                panic("mock_clock.advance: duration must not be negative, got {d}")
+            }
+            now = now.add(d)
+        },
         elapsed_fn: fn() -> List[Duration] { [..slept] },
     }
 }
 ```
 
-The mock's state lives in the factory's `let mut` bindings `now` and `slept`. The handler and the two closures capture the same bindings, so they share one cell each (§2.8, §4.7). The struct fields are never assigned. A copy of a `MockClock` holds the same handler and closures, so it drives the same clock (§3.6). This is the pattern for every stateful mock in `std.testing`: state in captured `let mut` bindings, methods through a single-type `*Ops` trait.
+The mock's state lives in the factory's `let mut` bindings `now` and `slept`. The monotonic reading comes from `now`, so the two clocks cannot drift apart. The handler and the two closures capture the same bindings, so they share one cell each (§2.8, §4.7). The struct fields are never assigned. A copy of a `MockClock` holds the same handler and closures, so it drives the same clock (§3.6). This is the pattern for every stateful mock in `std.testing`: state in captured `let mut` bindings, methods through a single-type `*Ops` trait.
 
 Construct the controller with a starting instant, plug `.as_handler()` into a `with` block, and (optionally) `.advance(d)` the clock between calls to the code under test to drive time-based control flow:
 
@@ -1048,7 +1054,9 @@ test "timeout fires after configured interval" {
 }
 ```
 
-**`time.read()`** returns the current mock instant. **`time.sleep(d)`** records `d` and does not block. **`.advance(d)`** moves the mock instant forward by `d` — used by tests that need to drive a timeout, retry loop, or rate-limiter past a threshold without consuming wall-clock time. **`.elapsed()`** returns the recorded `List[Duration]` of `time.sleep` calls; tests assert on the sequence of sleeps the code under test issued. `.elapsed()` returns a copy: later handler activity does not change it. Call it again to see later sleeps, and call it once after the run, not in a loop, because each call copies the list.
+**`time.read()`** returns the current mock instant. **`time.monotonic()`** returns the mock reading: the offset of the mock instant from `start`, so it is zero at `start`. **`time.sleep(d)`** records `d` and does not block. **`.advance(d)`** moves the mock instant and the mock monotonic reading forward by `d` — used by tests that need to drive a timeout, retry loop, or rate-limiter past a threshold without consuming wall-clock time. It panics when `d` is negative, and the message contains the value: `mock_clock.advance: duration must not be negative, got -1s`. **`.elapsed()`** returns the recorded `List[Duration]` of `time.sleep` calls; tests assert on the sequence of sleeps the code under test issued. `.elapsed()` returns a copy: later handler activity does not change it. Call it again to see later sleeps, and call it once after the run, not in a loop, because each call copies the list.
+
+Every `std.testing` mock of a `@handle_all` effect implements every primitive operation of the effect, because a test has no outer handler to forward to. An operation that finds no handler panics at run time (§2.20 *Test blocks*, §4.7.1). A later operation that moves the mock wall clock backward, or jumps it, must keep a separate monotonic reading, because `monotonic` here comes from `now`.
 
 ##### `mock_env` — capturing `Env` handler that does not terminate the runner
 

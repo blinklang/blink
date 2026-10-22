@@ -2479,8 +2479,35 @@ warning[PartialHandler]: handler for `Rand` does not implement `float`, `bytes`
   |     ^^^^^^^^^^^^ `Rand` is marked `@handle_all`
   |
   = note: omitted operations go to the enclosing handler, which reads a different random stream; in a test that is the runner's seeded stream (§8.10.4), not this handler's
+  = note: `default.float()` answers from the outer handler; if this handler answers `int` from its own state, answer `float` from the same state
   = help: implement them, or forward on purpose: `fn float() -> Float { default.float() }`
 ```
+
+The second note is the same for every marked effect. The compiler fills in one omitted operation and one operation that the handler implements: "`default.<op>()` answers from the outer handler; if this handler answers `<other op>` from its own state, answer `<op>` from the same state." When the omitted operation returns an opaque type (§2.12.2), the help also names the `pub` type-scoped functions that build that type. The compiler takes these names from the return type, so no list per effect exists. They are the functions that the `PrivateItemAccess` help (E1003) names for that type. An operation that returns a type that is not opaque, such as `Int` or `Bytes`, adds no such line.
+
+`Time` is the case that needs this line. A `Time` handler that answers `read` and omits `monotonic`:
+
+```blink
+fn fixed_clock() -> Handler[Time] {
+    handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(0) }
+        fn sleep(d: Duration) { }
+    }
+}
+```
+
+```
+warning[PartialHandler]: handler for `Time` does not implement `monotonic`
+ --> clock.bl:2:5
+  |
+2 |     handler Time {
+  |     ^^^^^^^^^^^^ `Time` is marked `@handle_all`
+  |
+  = note: `default.monotonic()` answers from the outer handler; if this handler answers `read` from its own state, answer `monotonic` from the same state
+  = help: build the reading with `Monotonic.from_offset(d)` (§3.2.3), or forward on purpose: `fn monotonic() -> Monotonic { default.monotonic() }`
+```
+
+The forward fix is wrong for `Time` in a test. A test block has no outer `Time` handler (§2.20), so `default.monotonic()` finds no handler and panics at run time (*Completeness and auto-delegation*). The fix itself does not change. It stays `default.op(args)`, and the help only says which way to answer.
 
 To silence the warning, write the operation. Any body counts: `default.op(args)` to forward on purpose, a constant, or a panic. An explicit `default.op(args)` gives the same program as the omitted operation. `@allow(PartialHandler)` on a function and the `[lints]` table also work (§4.16.8).
 
