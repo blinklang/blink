@@ -28,13 +28,13 @@ fn listen(port: Port) ! Net {
 
 // The compiler verifies the argument satisfies the refinement
 listen(8080)         // OK: 8080 > 0 && 8080 <= 65535, proven by SMT
-listen(0)            // COMPILE ERROR: 0 does not satisfy (self > 0)
-listen(70000)        // COMPILE ERROR: 70000 does not satisfy (self <= 65535)
+listen(0)            // WARNING (V0002): contract always fails: 0 > 0 is false
+listen(70000)        // WARNING (V0002): contract always fails: 70000 <= 65535 is false
 
 // When the value is dynamic, the compiler inserts a check at the boundary
 fn start_server(config: Config) ! Net {
     let port = config.port      // port is Int, not Port
-    listen(port)                // COMPILE ERROR (V0002): counterexample config.port = 0 does not satisfy Port
+    listen(port)                // runtime check (V0004): config.port may be 0
 }
 
 // Fix: validate at the boundary
@@ -43,6 +43,8 @@ fn start_server(config: Config) -> Result[(), ServerError] ! Net {
     listen(port)                              // OK: port is now Port
 }
 ```
+
+A literal that fails the refinement gets the warning V0002 `ContractAlwaysFails` (§3b.4). The call still panics when it runs. A `@where` refinement on a parameter acts as an implied `@requires` for V0002, so `fn listen(port: Port)` and `@requires(port > 0 && port <= 65535) fn listen(port: Int)` give the same diagnostic at each call site.
 
 #### Refinements on Collection Types
 
@@ -121,11 +123,12 @@ fn get_unchecked[T](list: List[T], index: Int) -> T {
 }
 ```
 
-The `@requires` clause is a promise by the caller: "I guarantee this condition holds before calling you." The compiler verifies at every call site that the precondition is satisfied.
+The `@requires` clause is a promise by the caller: "I guarantee this condition holds before calling you." At every call site, the compiler proves the precondition, finds that it always fails (V0002), or inserts a runtime check (§3b.4).
 
 ```blink
 fn example(items: List[Str]) {
-    get_unchecked(items, 0)     // COMPILE ERROR (V0002): counterexample items = [] violates 0 < items.len()
+    get_unchecked(items, 0)     // runtime check (V0004): items may be empty
+    get_unchecked(["a"], 5)     // WARNING (V0002): contract always fails: 5 < ["a"].len() is false
 }
 
 fn safe_example(items: NonEmpty[Str]) {
@@ -320,7 +323,7 @@ error[TraitImplAddsPrecondition]: an impl of a trait method may not add `@requir
 
 **What a caller assumes.** A call through a bound (`x.m()` with `x: T` and `T: Trait`) checks the trait's `@requires` at the call site and assumes only the trait's `@ensures` after it. Monomorphization never brings in a contract from the impl: a generic function verifies once, against the trait. A call that names the concrete type statically (`s.drop_top()` with `s: IntStack`) checks the same `@requires` and assumes both the trait's and the impl's `@ensures`.
 
-**Parameter binding.** An impl may name its parameters differently from the trait (§3.6). Inherited predicates bind by position, with capture-avoiding substitution. `self` binds to position 0 whatever name the impl gives it. The compiler adds no parameter-name check. Every diagnostic and tool surface that shows an inherited predicate prints both names, for example "trait param `n` (impl param `count`)". This includes hover, `blink query`, and V0002 counterexamples.
+**Parameter binding.** An impl may name its parameters differently from the trait (§3.6). Inherited predicates bind by position, with capture-avoiding substitution. `self` binds to position 0 whatever name the impl gives it. The compiler adds no parameter-name check. Every diagnostic and tool surface that shows an inherited predicate prints both names, for example "trait param `n` (impl param `count`)". This includes hover, `blink query`, V0002 diagnostics, and counterexample notes.
 
 ```blink
 trait Buffer {
@@ -494,31 +497,64 @@ info[V0001]: contract proven
 
 This is the ideal outcome. Well-written contracts on well-written code are often provable. The incentive structure is correct: writing clearer code with tighter types makes contracts easier to prove, which removes the runtime check.
 
-#### Disproven (Compile Error with Counterexample)
+#### Always Fails (Warning)
 
-The solver finds a concrete input that violates the contract. The compiler reports a hard error with the counterexample.
+A `@requires` check always fails when it is false on every run that reaches the call. The compiler reports the warning V0002 `ContractAlwaysFails`. The runtime check stays: when the call runs, it still panics, or raises `validation.contract_violation(...)` at a system boundary (§9.2). A `@where` refinement (§3b.1) acts as an implied `@requires`, with the same code and the same diagnostic.
 
 ```
-error[V0002]: contract violation
- --> account.bl:22:1
+warning[V0002]: contract always fails
+ --> account.bl:45:9
   |
+45|     withdraw(balance, -5)
+  |                       ^^ `-5 > 0` is false
+  |
+ ::: account.bl:22:1
 22| @requires(amount > 0)
-  | ^^^^^^^^^^^^^^^^^^^^^ violated at call site
+  | --------------------- contract declared here
   |
-  = counterexample: amount = -5
-  = note: called from transfer_all() at line 45
-  = fix: add validation before call:
-  |
-44|     if amount > 0 {
-45|         withdraw(account, amount)
-46|     }
+  = note: this call panics at run time
+  = help: pass a value that satisfies `amount > 0`
 ```
 
-This is a real bug caught at compile time with a concrete failing input. The error message tells the developer (or AI) exactly what went wrong and suggests a fix. This is strictly better than a test failure -- it proves the bug exists for a specific input rather than hoping the test suite happened to exercise it.
+The warning names the call site and the folded predicate.
+
+**When it fires.** Every argument that the predicate reads is a literal at the call site, and the folded predicate is `false`. Only the arguments that the predicate reads must be literals. A literal is a tree of literals, parentheses, unary `-`, and `+ - * / %` (the tree of W0708), or a list, string or range literal whose parts are such trees. A `let` or `const` reference stops the tree. The predicate must fold in the const evaluator that compile-time constants use (E0546).
+
+```blink
+@requires(amount > 0)
+fn withdraw(balance: Int, amount: Int) -> Int {
+    balance - amount
+}
+
+fn demo(balance: Int, n: Int) {
+    withdraw(balance, -5)       // WARNING (V0002): `-5 > 0` is false
+    withdraw(balance, n)        // no V0002: n is not a literal; runtime check (V0004)
+    let k = -5
+    withdraw(balance, k)        // no V0002: a `let` reference stops the tree
+}
+
+test "a negative amount panics" {
+    assert_panics { withdraw(10, -5) }   // no V0002 inside assert_panics
+}
+```
+
+**When it does not fire.** V0002 does not fire when the fold panics, when the predicate cannot be evaluated (a call that is not const, an FFI call), or when the evaluator reaches its limit. The outcome is then Unknown, and the runtime check stays.
+
+**Solver hits.** A solver may add a V0002 hit only where it proves that some run reaches the call and that the predicate is false on every run that reaches it. One counterexample never counts. This applies only to solver hits; literal hits fire in dead branches.
+
+**Lint controls.** V0002 has the same shape as W0704 and W0708:
+
+- It does not look through `let` or `const` references.
+- It fires in a branch that never runs.
+- It does not fire inside an `assert_panics` body.
+- `@allow(ContractAlwaysFails)` suppresses it.
+- The level is set under `[lints]` in `blink.toml`: `"off"`, `"warn"` or `"error"`. Only `[lints]` changes the level. `@verify(fallback: "error")` does not.
+
+`@ensures` is not part of V0002 for now.
 
 #### Unknown (Runtime Check by Default)
 
-The solver cannot determine whether the contract holds. The predicate is beyond what the SMT theories can decide, the solver times out, or no solver ran. By default, the compiler inserts a runtime check:
+The solver cannot determine whether the contract holds. The predicate is beyond what the SMT theories can decide, the solver times out, or no solver ran. A counterexample on a dynamic input (a parameter, a field, I/O) is also Unknown: some runs fail and some pass, so the contract does not always fail. By default, the compiler inserts a runtime check:
 
 - A `@requires` check runs at the function's entry, before the body. Every caller gets it.
 - An `@ensures` check runs at each exit of the function, after `result` is known. Each `old(expr)` in the clause is evaluated once at entry and kept for the exit check.
@@ -557,9 +593,11 @@ panic: contract violated: @requires(amount > 0)
 
 **The default is visible.** Each contract that gets a runtime check has the info diagnostic `info[V0004]: contract checked at runtime`. V0004 is silent by default. It shows in the verification report and in `blink query`, with its source: `default`, `explicit`, or `inherited(Trait.method)`.
 
+**Counterexamples.** When the solver finds a counterexample on a dynamic input, the counterexample shows in a note on V0004, in the `blink verify` report, and in V0003 under `@verify(fallback: "error")`. The text of a counterexample is not stable between solver versions. Until the compiler has a solver, no counterexample exists.
+
 #### `@verify` Fallback Values
 
-`@verify(fallback: ...)` sets what happens when the outcome is Unknown. It has no effect on a Proven or Disproven outcome.
+`@verify(fallback: ...)` sets what happens when the outcome is Unknown. It has no effect on a Proven or Always Fails outcome. V0002 fires under every `@verify` value, `"trust"` included. `@verify(fallback: "error")` does not make V0002 an error; only `[lints]` changes its level. A counterexample on a dynamic input is an Unknown outcome, so `"error"` gives V0003 for it.
 
 | Value | When the outcome is Unknown |
 |---|---|
@@ -625,7 +663,7 @@ A default of "error on Unknown" fails this goal while no solver exists, and is w
 | Outcome | Meaning | Runtime cost | Developer action |
 |---|---|---|---|
 | **Proven** | SMT proved the contract | Zero | None needed |
-| **Disproven** | SMT found a counterexample | N/A (won't compile) | Fix the bug |
+| **Always Fails** | The predicate is false on every run that reaches the call (V0002, warning) | Runtime check stays, under every `@verify` value | Fix the call, or `@allow(ContractAlwaysFails)` |
 | **Unknown** (default) | Runtime check inserted (V0004) | Check cost, every build | None needed; see the report for cost |
 | **Unknown** + `"error"` | Proof required | N/A (won't compile, V0003) | Simplify the predicate, or remove `"error"` |
 | **Unknown** + `"trust"` | Accepted without proof | Zero | Document why, audit manually |
