@@ -1306,6 +1306,8 @@ test "setup writes log path before reload" {
 
 **`env.var(name)`** reads from `vars`. **`env.vars()`** returns a copy of `vars`. **`env.set_var(name, value)`** updates `vars` *and* appends `(name, value)` to `writes` — this lets tests distinguish setup-driven environment state from environment writes performed by the CUT. `.set(name, value)` is the test-author-facing mutation that does **not** record into `.writes`; it is for staging environment changes between calls to the CUT. `.writes()` returns a copy: later handler activity does not change it.
 
+**`mock_env` changes what Blink code reads through `Env`.** A real child that `process.run` starts still inherits the real environment. To control the environment of a child in a test, pass `env:` to the op (§4.4.8) or mock `Process`.
+
 **`mock_env` does not currently mock `env.args()` or `env.cwd()`.** Tests that need `args` or `cwd` should either pass them in as function arguments to the CUT (preferred) or fork the controller after `mock_env`'s implementation lands — a `mock_env(initial, args: List[Str], cwd: Str)` overload is a likely follow-up if the usage signal emerges.
 
 ##### Why controller structs, not free-fn factories — two shapes, one rule

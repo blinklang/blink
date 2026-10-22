@@ -952,6 +952,8 @@ The mock lists all eight operations at one level. A handler for an effect with c
 
 **Thread safety:** `env.set_var()` and `env.remove_var()` are process-global mutations. Calls are serialized. In concurrent programs using `! Async`, only one task can modify the environment at a time. Use sparingly — prefer configuration structs over environment mutation.
 
+**Children.** `env.set_var()` and `env.remove_var()` change this program's environment for all later children. To change the environment of one child, pass `env:` to the op (§4.4.8). There is no `set_cwd`: to run one child in another directory, pass `cwd:` to the op (§4.4.8).
+
 ---
 
 #### 4.4.4 DB.Write Scoped Transaction
@@ -1382,21 +1384,32 @@ error[TypeError]: mismatched types
 
 The `process` handle is in scope when a function declares `! Process` or one of its sub-effects. `Process.Spawn` runs other programs, waits for them, and replaces this program with another one. `Process.Signal` sends signals to child processes.
 
+`ChildEnv` says which environment variables a child gets. It describes the child's environment only. The type lives in `std.process`:
+
+```blink
+@derive(Eq, Debug)
+pub type ChildEnv {
+    Inherit                    // this program's environment, as it is when the op runs
+    Change(Map[Str, Str?])     // that environment; Some(v) sets a name to v, None removes it
+    Only(Map[Str, Str])        // exactly these variables, nothing inherited
+}
+```
+
 ```blink
 effect Process {
     effect Spawn {
         /// Run cmd with args, wait for it to exit, and return what it wrote.
-        fn run(cmd: Str, args: List[Str], *, stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]
+        fn run(cmd: Str, args: List[Str], *, stdin: Str? = None, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[ProcessResult, ProcessError]
 
         /// Start cmd with args and return at once.
-        fn spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError]
+        fn spawn(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Child, ProcessError]
 
         /// Wait for a child that spawn started to exit, and return what it wrote.
         fn wait(child: Child) -> Result[ProcessResult, ProcessError]
 
         /// Replace this program with cmd. Returns only if cmd cannot start.
         /// A call also needs Env.Exit (see below).
-        fn exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError]
+        fn exec(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Never, ProcessError]
     }
 
     effect Signal {
@@ -1408,10 +1421,10 @@ effect Process {
 
 | Operation | Signature | Effect |
 |---|---|---|
-| `process.run` | `process.run(cmd: Str, args: List[Str], *, stdin: Option[Str] = None) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
-| `process.spawn` | `process.spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError]` | `Process.Spawn` |
+| `process.run` | `process.run(cmd: Str, args: List[Str], *, stdin: Str? = None, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
+| `process.spawn` | `process.spawn(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Child, ProcessError]` | `Process.Spawn` |
 | `process.wait` | `process.wait(child: Child) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
-| `process.exec` | `process.exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError]` | `Process.Spawn`, `Env.Exit` |
+| `process.exec` | `process.exec(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Never, ProcessError]` | `Process.Spawn`, `Env.Exit` |
 | `process.signal` | `process.signal(child: Child, sig: Int) -> Result[(), ProcessError]` | `Process.Signal` |
 
 **`cmd` is a program, not a command line.** `process.run("git", ["status", "--short"])` runs `git` with two arguments. No shell reads the arguments, so a space or a `$` in an argument is not special. Blink has no shell op. To run a shell command line, run the shell:
@@ -1474,6 +1487,53 @@ fn word_count(text: Str) -> Result[Str, ProcessError] ! Process.Spawn {
 }
 ```
 
+**The child's environment.** With `env: ChildEnv.Inherit`, the default, the child gets this program's environment as it is when the op runs. `ChildEnv.Change(m)` gives the child that environment with each name in `m` set to its `Some(v)` value, and each name with a `None` value removed. `ChildEnv.Only(m)` gives the child exactly the variables in `m` and nothing else. The parameter works the same on `process.run`, `process.spawn` and `process.exec`; on `process.exec` the new program gets that environment.
+
+This program's own environment does not change, and later children do not see the change. The op needs no `Env` effect. A child sees each write of `env.set_var` and `env.remove_var` (§4.4.3) whole or not at all: the read of the inherited environment does not interleave with those writes. A user `handler Env` or `mock_env` (§8.10.3) changes what `env.var` returns to Blink code. It does not change what a real child inherits.
+
+To set one variable for one child, use `Change`:
+
+```blink
+fn test_in_ci() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    process.run("make", ["test"], env: ChildEnv.Change(Map.from([("CI", Some("1"))])))
+}
+```
+
+To remove a variable, give it the value `None`:
+
+```blink
+fn build_without_proxy() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    process.run("make", [], env: ChildEnv.Change(Map.from([("HTTP_PROXY", None)])))
+}
+```
+
+To start a child with a known environment, use `Only`. A bare `cmd` is found on the `PATH` of the child (see *Finding the program*), so give `Only` a `PATH`, or give an absolute `cmd`:
+
+```blink
+fn hermetic_build() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    let clean = ChildEnv.Only(Map.from([("PATH", "/usr/bin:/bin"), ("HOME", "/nonexistent")]))
+    process.run("make", ["all"], env: clean)
+}
+```
+
+A `Change` map has values of type `Str?`. When a map has `Str` values where `Str?` is expected, the type error (`TypeError`, E0300) has a help line that shows the call with each value wrapped in `Some(...)`.
+
+**Finding the program.** A `cmd` that holds no `/` is found on the `PATH` of the child. This is the `PATH` after `env` applies, so a `Change` that sets `PATH` also changes the search. The search happens before the child starts. If no program is found, the call returns `Err` with `ENOENT`; this is not an exit code of a child. Under `Only(m)`, when `m` has no `PATH`, a bare `cmd` gives `ENOENT`.
+
+**Working directory.** With `cwd: None`, the default, the child runs in the working directory of this program. With `cwd: Some(dir)`, the child runs in `dir`. A relative `dir` is relative to the working directory of this program. This program's working directory does not change. `cwd` replaces the `sh -c "cd {dir} && ..."` pattern, which lets a `dir` from user input inject commands.
+
+A relative `cmd` that holds a `/` (for example `./configure`) is resolved against `dir`. A relative entry in the child's `PATH` (for example `.` or `bin`) is also resolved against `dir`. So a `PATH` entry `.` can run a program that is in `dir`: use only absolute `PATH` entries when `dir` is not trusted.
+
+If `dir` does not exist, is not a directory, or the program is not found, the call returns `Err` with `ENOENT`, or with the code the operating system gives (for example `ENOTDIR`), and no child starts. This also holds when `dir` goes away just before the child starts: the call returns `Err`, never an exit code of a child.
+
+```blink
+fn configure(src: Str) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    process.run("./configure", ["--prefix=/usr/local"], cwd: Some(src))
+}
+```
+
+**Strings that cannot reach a child.** An empty environment name, a name that holds `=` or NUL, a value that holds NUL, and a NUL in `cmd` or in any element of `args`, give `Err` with `EINVAL`, and no child starts. This holds for `process.run`, `process.spawn` and `process.exec`.
+
 **`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. `process.wait` on a child that already exited returns the same `ProcessResult` again. The signal numbers are constants in `std.process` (`SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`).
 
 ```blink
@@ -1503,7 +1563,7 @@ fn launch(tool: Str, args: List[Str]) ! Process.Spawn, Env.Exit, IO {
 ```blink
 test "build reports a failed make" {
     let mock = handler Process {
-        fn run(cmd: Str, args: List[Str], stdin: Option[Str]) -> Result[ProcessResult, ProcessError] {
+        fn run(cmd: Str, args: List[Str], stdin: Str?, env: ChildEnv, cwd: Str?) -> Result[ProcessResult, ProcessError] {
             Ok(ProcessResult { out: "", err_out: "no rule for target", exit_code: 2 })
         }
     }
@@ -1513,7 +1573,7 @@ test "build reports a failed make" {
 }
 ```
 
-A handler implements `run` with all three parameters. The default value of `stdin` applies at the call site only.
+A handler implements each op with all its parameters. A default value applies at the call site only. When a handler leaves out a parameter, the error names the missing parameter and offers a fix that adds it.
 
 #### 4.4.9 Standard Input (`IO.Read`)
 
