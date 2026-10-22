@@ -33,6 +33,7 @@ Key facts:
 - The unit type is `()`. `Void` exists only in `Ptr[Void]`
 - No silent type defaults: an empty `[]`, a bare `None` or an unused `Map.new()` is `E0301`. Annotate it, or write `Map.new[K, V]()`, `Set.new[T]()`
 - One empty form per type: `[]` for `List`, `Map.new()`, `Set.new()`, `Bytes.new()`, `StringBuilder.new()`. `Map()`, `Set()`, `Bytes()` and `List.new()` do not exist: each is an error (E0504 or E0505) with a fix
+- An integer literal must fit its type (`let x: U8 = 300` is `E0318`); a literal with no expected type is `Int`. `-128` and `-(128)` are one literal, so `let b: I8 = -128` is valid
 - Type parameters are rigid in a generic body: arithmetic on `T` needs a bound (`T: Add`). Bounds are checked at the call (`E0306`). Explicit call type arguments: `f[T](x)`
 - Keyword parameters follow `--`: `fn f(a: Int, -- b: Str = "x")`. Defaults are constants
 - `Map.remove` returns `Option[V]`. `m[k] = v` is an error; use `m.insert(k, v)`. `channel.new[T](buffer: n)`; `ch.recv()` returns `Option[T]`

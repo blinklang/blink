@@ -66,6 +66,7 @@ import diagnostics.{
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, NOT_DERIVABLE,
     NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, PATTERN_MISSING_REST, diag_set_last_assist_at,
+    INT_LITERAL_OUT_OF_RANGE, diag_has_error_at,
     OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
     POSITIONAL_AFTER_KEYWORD, DUPLICATE_KEYWORD_ARG, UNLABELED_KEYWORD_ARG,
 }
@@ -5742,17 +5743,47 @@ fn is_int_literal_node(node: Int) -> Int {
 // type is recorded on the node, not only accepted: a U64 operand stamped Int is held in a
 // signed temp, and 2^63 reads back as the Int minimum.
 //
-// A literal out of the type's range keeps its Int stamp until the range check rejects it:
-// stamped, it would be truncated to the narrow type in C before the operation could panic.
-fn tc_literal_takes(node: Int, tid: Int) {
+// A literal out of the type's range still takes the type, and is E0318 here: the error stops
+// the build before codegen, and a literal left Int would add a type mismatch after it.
+fn tc_literal_takes(node: Int, tid: Int) ! Diag.Report {
     if node == -1 || is_int_literal_node(node) == 0 { return }
-    let mut t = tc_resolve(resolve_alias_tid(tid))
+    let t = tc_resolve(resolve_alias_tid(tid))
     if is_integer_type(t) == 0 { return }
-    // A literal out of range for its expected type stays Int, even if an earlier expected type
-    // gave it one it fits.
-    if !tc_literal_fits(node, type_kind(t)) { t = TYPE_INT }
+    if !tc_literal_fits(node, type_kind(t)) { tc_report_int_literal_range(node, t, false, "") }
     tc_publish_node_tid(node, t)
     if node_kind(node) == NodeKind.UnaryOp { tc_publish_node_tid(node_left(node), t) }
+}
+
+// error[IntLiteralOutOfRange] (E0318) at `node`, a literal whose value is outside `t`, its
+// type. `default_int` says no expected type reached it, so it is Int by default. A literal
+// is reported once: the passes that check it reach it more than once.
+fn tc_report_int_literal_range(node: Int, t: Int, default_int: Bool, help: Str) ! Diag.Report {
+    if diag_has_error_at(INT_LITERAL_OUT_OF_RANGE, node) { return }
+    let negative = node_kind(node) == NodeKind.UnaryOp
+    tc_report_int_value_range(node, int_lit_node_digits(node), negative, t, default_int, help)
+}
+
+// The E0318 report for a value spelled `digits` (no sign), negative when `negative`.
+fn tc_report_int_value_range(node: Int, digits: Str, negative: Bool, t: Int, default_int: Bool, help: Str) ! Diag.Report {
+    let k = type_kind(t)
+    let value = if negative { "-{digits}" } else { digits }
+    let name = "IntLiteralOutOfRange"
+    if !negative && !tc_digits_within(digits, tc_int_literal_limit(TyKind.U64, false)) {
+        diag_error_at(name, INT_LITERAL_OUT_OF_RANGE, "no integer type holds {value}", node, "")
+        return
+    }
+    if negative && tc_int_literal_limit(k, true) == "" {
+        let msg = if digits == "0" { "-0 is a negative literal" } else { "{value} does not fit in {type_to_str(t)}" }
+        diag_error_at_notes(name, INT_LITERAL_OUT_OF_RANGE, msg, node, "", ["unsigned types hold no negative values"])
+        return
+    }
+    if default_int {
+        diag_error_at(name, INT_LITERAL_OUT_OF_RANGE, "{value} does not fit in Int, the default type", node, help)
+        return
+    }
+    let low = tc_int_literal_limit(k, true)
+    let lowest = if low == "" { "0" } else { "-{low}" }
+    diag_error_at(name, INT_LITERAL_OUT_OF_RANGE, "{value} does not fit in {type_to_str(t)} ({lowest} to {tc_int_literal_limit(k, false)})", node, "")
 }
 
 // The type inference gives an int literal: the one the expected type at it published, or Int.
@@ -5767,7 +5798,7 @@ fn tc_int_literal_type(node: Int) -> Int {
 // only once it is inferred, so this runs after both operands are, and it overrides a type an
 // expected type gave the literal before: in `let x: U64 = n + 1` with `n: Int`, the `1` is
 // Int, and the let reports Int.
-fn tc_literal_takes_operand(lit: Int, other: Int, other_t: Int) -> Bool {
+fn tc_literal_takes_operand(lit: Int, other: Int, other_t: Int) -> Bool ! Diag.Report {
     if is_int_literal_node(lit) == 0 || is_int_literal_node(other) != 0 { return false }
     if tc_tid_is_no_info(other_t) != 0 || is_integer_type(resolve_alias_tid(tc_resolve(other_t))) == 0 { return false }
     tc_literal_takes(lit, other_t)
@@ -5782,15 +5813,12 @@ fn tc_operand_literal_type(node: Int, lt: Int, rt: Int) -> Int ! TypeCheck.Resol
     -1
 }
 
-// Whether the lone literal operand of `node` fits `lit_t`, the type it took.
-fn tc_operand_literal_fits(node: Int, lit_t: Int) -> Bool {
-    let lit = if is_int_literal_node(node_right(node)) != 0 { node_right(node) } else { node_left(node) }
-    tc_literal_fits(lit, type_kind(tc_resolve(resolve_alias_tid(lit_t))))
+fn tc_literal_fits(node: Int, k: TyKind) -> Bool {
+    tc_digits_within(int_lit_node_digits(node), tc_int_literal_limit(k, node_kind(node) == NodeKind.UnaryOp))
 }
 
-fn tc_literal_fits(node: Int, k: TyKind) -> Bool {
-    let digits = int_lit_node_digits(node)
-    let limit = tc_int_literal_limit(k, node_kind(node) == NodeKind.UnaryOp)
+// Whether decimal `digits`, with no leading zeros, are at most `limit`. Nothing is within "".
+fn tc_digits_within(digits: Str, limit: Str) -> Bool {
     if digits == "" || limit == "" { return false }
     digits.byte_len() < limit.byte_len() || (digits.byte_len() == limit.byte_len() && digits <= limit)
 }
@@ -7521,9 +7549,16 @@ fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, Typ
         if is_integer_type(resolve_alias_tid(tc_resolve(expected))) == 0 { return }
         // `T`x`T`->`T` gives both operands the expected `T`. A shift's amount is U32 whatever
         // the expected type, which the BinOp arm of infer_type_uncached publishes.
+        //
+        // A literal beside an operand that is not one takes that operand's type instead, once
+        // it is inferred (tc_literal_takes_operand), so it is not seeded: `T` would range-check
+        // it against a type it does not take.
         if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^" {
-            tc_seed_expected_into_value(node_left(v), expected)
-            tc_seed_expected_into_value(node_right(v), expected)
+            let l = node_left(v)
+            let r = node_right(v)
+            let both = is_int_literal_node(l) != 0 && is_int_literal_node(r) != 0
+            if both || is_int_literal_node(l) == 0 { tc_seed_expected_into_value(l, expected) }
+            if both || is_int_literal_node(r) == 0 { tc_seed_expected_into_value(r, expected) }
         } else if op == "<<" || op == ">>" {
             tc_seed_expected_into_value(node_left(v), expected)
         }
@@ -23344,9 +23379,7 @@ fn tc_check_list_elem_compat(elem: Int, elem_t: Int, idx: Int, first: Int, first
     if is_int_literal_node(elem) != 0 {
         if is_integer_type(resolve_alias_tid(first_t)) != 0 || is_integer_type(tc_resolve(first_t)) != 0 {
             tc_literal_takes(elem, first_t)
-            // A first literal took its type from the expected one; a later literal out of that
-            // type's range keeps Int and mismatches, as it did before the first literal took it.
-            if is_int_literal_node(first) == 0 || tc_literal_fits(elem, type_kind(tc_resolve(resolve_alias_tid(first_t)))) { return }
+            return
         }
     }
     if tc_tid_has_unbound_metavar(first_t) != 0 || tc_tid_has_unbound_metavar(elem_t) != 0 {
@@ -24024,10 +24057,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_tid_is_no_info(rt) == 0 && is_integer_type(rt) == 0 {
                 tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(rt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, rt))
             }
-            // A literal out of the other operand's range keeps Int and so mismatches: unlike
-            // arithmetic, a bitwise operator has no overflow panic, and C would truncate it.
             let lit_t = tc_operand_literal_type(node, lt, rt)
-            if lit_t >= 0 && tc_operand_literal_fits(node, lit_t) { return lit_t }
+            if lit_t >= 0 { return lit_t }
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 && types_compatible(lt, rt) == 0 {
                 tc_error_at("bitwise `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
             }
@@ -24042,7 +24073,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_tid_is_no_info(rt) == 0 && is_shift_amount_type(rt, rhs) == 0 {
                 tc_error_at("shift `{op}` amount must be U32, got {type_to_str(rt)}", node)
             }
-            if tc_tid_is_no_info(lt) == 0 && rhs != -1 && node_kind(rhs) == NodeKind.IntLit {
+            // An amount out of U32's range is E0318 at the literal already.
+            if tc_tid_is_no_info(lt) == 0 && rhs != -1 && node_kind(rhs) == NodeKind.IntLit && tc_literal_fits(rhs, TyKind.U32) {
                 let amt = node_str_val(rhs).to_int()
                 let bw = type_bit_width(lt)
                 if amt < 0 || amt >= bw {
@@ -29370,6 +29402,38 @@ fn tc_check_pattern_types_against(pat: Int, binding_t: Int, subject: Str, refuta
     bad
 }
 
+// A literal pattern and each literal bound of a range pattern take the scrutinee's integer
+// type, and must be in its range (sections/03_types.md §3.2 *Integer literal range*). A
+// pattern spells no sign, and a Char or Bool pattern is no integer literal.
+fn tc_check_int_pattern_range(pat: Int, hint: Int) ! Diag.Report {
+    if hint < 0 { return }
+    let t = tc_resolve(resolve_alias_tid(hint))
+    if is_integer_type(t) == 0 || diag_has_error_at(INT_LITERAL_OUT_OF_RANGE, pat) { return }
+    let limit = tc_int_literal_limit(type_kind(t), false)
+    let mut bounds = [node_str_val(pat)]
+    if node_kind(pat) == NodeKind.RangePattern { bounds.push(node_name(pat)) }
+    for b in bounds {
+        if tc_is_decimal_digits(b) {
+            let digits = int_lit_decimal(b)
+            if !tc_digits_within(digits, limit) {
+                tc_report_int_value_range(pat, digits, false, t, false, "")
+                return
+            }
+        }
+    }
+}
+
+fn tc_is_decimal_digits(s: Str) -> Bool {
+    if s == "" { return false }
+    let mut i = 0
+    while i < s.byte_len() {
+        let c = s.byte_at(i)
+        if c < 48 || c > 57 { return false }
+        i = i + 1
+    }
+    true
+}
+
 // The matched value's name, for the NoSuchVariant note; empty when it is not a plain name.
 fn tc_match_subject(m: Int) -> Str {
     let scrut = node_scrutinee(m)
@@ -30631,6 +30695,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
     // and a nested variant pattern were the shapes nothing published for, and codegen asking
     // one of them for its type found no answer at all.
     if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
+    if kind == NodeKind.IntPattern || kind == NodeKind.RangePattern { tc_check_int_pattern_range(node, tc_pattern_binding_type) }
     // An uppercase name in a refutable pattern is a variant: it is judged below like `Red(x)`.
     // A nullary variant (`None`) and `_` bind nothing, but they still MATCH a value, so they
     // keep the tid published above; only the scope entry is conditional.
@@ -32871,6 +32936,44 @@ fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
 
 // Phases 4 and 5 over one program. Separate from check_types so `blink check` and the test
 // harness reach the same pass by the same name.
+// A literal no expected type reached is Int (sections/03_types.md §3.2 *Integer literal
+// range*). Its type is final only once every pass that can give it one has run, so the range
+// check of a literal that is Int by default waits for the whole walk. A literal that another
+// check reported is not reported again. `order` is the walk's pre-order: a let comes before
+// its value, and a negative literal before the literal under its `-`. The reports follow node
+// order, which is source order, and not the walk's.
+fn tc_report_int_literals_out_of_range(order: List[Int]) ! Diag.Report {
+    let mut under_minus: Map[Int, Int] = Map()
+    let mut let_of: Map[Int, Int] = Map()
+    let mut found: List[Int] = []
+    for n in order {
+        let k = node_kind(n)
+        if k == NodeKind.LetBinding && node_target(n) == -1 && node_type_name(n) == "" && node_name(n) != "" {
+            let v = node_value(n)
+            if v != -1 && is_int_literal_node(v) != 0 { let_of.insert(v, n) }
+        }
+        if is_int_literal_node(n) == 0 || under_minus.contains_key(n) { continue }
+        if k == NodeKind.UnaryOp { under_minus.insert(node_left(n), n) }
+        let stamped = tc_lookup_node_tid(n)
+        if stamped < 0 { continue }
+        let t = tc_resolve(resolve_alias_tid(stamped))
+        if is_integer_type(t) == 0 || tc_literal_fits(n, type_kind(t)) { continue }
+        found.push(n)
+    }
+    for n in found.sort() {
+        let k = node_kind(n)
+        let t = tc_resolve(resolve_alias_tid(tc_lookup_node_tid(n)))
+        let default_int = type_kind(t) == TyKind.Int
+        let mut help = ""
+        let decl = let_of.get(n) ?? -1
+        if default_int && decl != -1 && k == NodeKind.IntLit && tc_literal_fits(n, TyKind.U64) {
+            let m = if node_is_mut(decl) != 0 { "mut " } else { "" }
+            help = "let {m}{node_name(decl)}: U64 = {int_lit_node_digits(n)}"
+        }
+        tc_report_int_literal_range(n, t, default_int, help)
+    }
+}
+
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut owners: List[Int] = List.with_capacity(node_count())
     // tc_stamp_walk fills one slot per node.
@@ -32878,6 +32981,7 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let mut seen: List[Int] = List.with_capacity(node_count())
     let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
     tc_report_unclaimed_calls(order, mods)
+    tc_report_int_literals_out_of_range(order)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp

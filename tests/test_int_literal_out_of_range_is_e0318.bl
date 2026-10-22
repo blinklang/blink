@@ -1,0 +1,400 @@
+// An integer literal stands for the exact integer its digits spell. It must be in the range of
+// the type it takes: the expected type at the literal, or Int when there is none
+// (sections/03_types.md §3.2 *Integer literal range*). When it is not, the compiler gives
+// error[IntLiteralOutOfRange] (E0318) at the literal, never a value cut to the width of the
+// type. A negative literal is one `-` on a literal, with optional parentheses; under an
+// unsigned type each negative literal is E0318, `-0` included.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/int_literal_out_of_range_is_e0318"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+// Runs a program and compares what it prints, line for line.
+fn expect_run(name: Str, src: Str, want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("run {name}.bl")
+    if r.exit_code != 0 { return "{name}: want exit 0, got {r.exit_code}:\n{r.err_out}" }
+    if r.out != lines(want) { return "{name}: want output\n{lines(want)}got\n{r.out}" }
+    ""
+}
+
+// Checks a program that must fail: the error count (none when -1), each wanted text, and each
+// text that must not be in the report.
+fn expect_errors_without(name: Str, src: Str, count: Int, want: List[Str], absent: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("check {name}.bl")
+    if r.exit_code == 0 { return "{name}: want a failed check, got exit 0" }
+    let mut problems: List[Str] = []
+    if count >= 0 && !r.err_out.contains("{count} error(s) found") { problems.push("{name}: want {count} error(s):\n{r.err_out}") }
+    for w in want {
+        if !r.err_out.contains(w) { problems.push("{name}: want `{w}` in:\n{r.err_out}") }
+    }
+    for a in absent {
+        if r.err_out.contains(a) { problems.push("{name}: want no `{a}` in:\n{r.err_out}") }
+    }
+    problems.join("\n")
+}
+
+fn expect_errors(name: Str, src: Str, count: Int, want: List[Str]) -> Str {
+    expect_errors_without(name, src, count, want, [])
+}
+
+fn report(problems: List[Str]) {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "the edges of each integer type compile and keep their value" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("edges_in_range", #"fn main() {
+    let a: I8 = 127
+    let b: I8 = -128
+    let c: U8 = 255
+    let d: U8 = 0
+    let e: I32 = 2147483647
+    let f: I32 = -2147483648
+    let g: U64 = 18446744073709551615
+    let h: Int = 9223372036854775807
+    let i: Int = -9223372036854775808
+    let j = -9223372036854775808
+    io.println("{a} {b} {c} {d}")
+    io.println("{e} {f}")
+    io.println("{g}")
+    io.println("{h} {i} {j}")
+}
+"#, ["127 -128 255 0", "2147483647 -2147483648", "18446744073709551615", "9223372036854775807 -9223372036854775808 -9223372036854775808"]),
+        expect_run("negative_literal_in_parens", #"fn main() {
+    let a: I8 = -(128)
+    let b: I8 = (-128)
+    let c: I8 = -((128))
+    let d = -(9223372036854775808)
+    io.println("{a} {b} {c} {d}")
+}
+"#, ["-128 -128 -128 -9223372036854775808"]),
+        // `-(-5)` and `-(1 + 2)` call Neg on a value, so no expected type reaches the literal
+        // inside them, and they are Int.
+        expect_run("neg_of_a_value_is_no_literal", #"fn main() {
+    let a = -(-9223372036854775807)
+    let b = -(1 + 2)
+    let x: I8 = -128 + 1
+    let c: I8 = -x
+    io.println("{a} {b} {c}")
+}
+"#, ["9223372036854775807 -3 127"]),
+        expect_run("u64_edges_in_patterns_and_operators", #"fn main() {
+    let m: U64 = 18446744073709551615
+    let r = match m {
+        18446744073709551615 => "max"
+        _ => "other"
+    }
+    let top = m & 9223372036854775808
+    let u: U8 = 200
+    let s = match u {
+        0..=127 => "low"
+        128..=255 => "high"
+        _ => "none"
+    }
+    io.println("{r} {top} {s} {u + 55}")
+}
+"#, ["max 9223372036854775808 high 255"]),
+        expect_run("const_edges", #"const LOW: Int = -(9223372036854775808)
+const TOP: U64 = 18446744073709551615
+const MIN8: I8 = -128
+fn main() {
+    io.println("{LOW} {TOP} {MIN8}")
+}
+"#, ["-9223372036854775808 18446744073709551615 -128"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "one past each edge is E0318 with the range of the type" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors("edges_out_of_range", #"fn main() {
+    let _a: I8 = 128
+    let _b: I8 = -129
+    let _c: U8 = 256
+    let _e: I32 = 2147483648
+    let _f: I32 = -2147483649
+    let _h: Int = 9223372036854775808
+    let _i: Int = -9223372036854775809
+}
+"#, 7, [
+            "error[IntLiteralOutOfRange]: 128 does not fit in I8 (-128 to 127)",
+            "error[IntLiteralOutOfRange]: -129 does not fit in I8 (-128 to 127)",
+            "error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)",
+            "error[IntLiteralOutOfRange]: 2147483648 does not fit in I32 (-2147483648 to 2147483647)",
+            "error[IntLiteralOutOfRange]: -2147483649 does not fit in I32 (-2147483648 to 2147483647)",
+            "error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int (-9223372036854775808 to 9223372036854775807)",
+            "error[IntLiteralOutOfRange]: -9223372036854775809 does not fit in Int (-9223372036854775808 to 9223372036854775807)",
+        ]),
+        expect_errors("above_u64_max", #"fn main() {
+    let _g: U64 = 18446744073709551616
+    let _far: U64 = 340282366920938463463374607431768211456
+}
+"#, 2, [
+            "error[IntLiteralOutOfRange]: no integer type holds 18446744073709551616",
+            "error[IntLiteralOutOfRange]: no integer type holds 340282366920938463463374607431768211456",
+        ]),
+        expect_errors("error_points_at_the_literal", #"fn main() {
+    let _c: U8 = 300
+}
+"#, 1, ["--> error_points_at_the_literal.bl:2:18"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "a negative literal under an unsigned type is E0318 whatever its value" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors("negative_under_unsigned", #"fn main() {
+    let _n: U64 = -1
+    let _d: U8 = -1
+    let _p: U8 = -(5)
+    let _q: U32 = (-(7))
+}
+"#, 4, [
+            "error[IntLiteralOutOfRange]: -1 does not fit in U64",
+            "error[IntLiteralOutOfRange]: -1 does not fit in U8",
+            "error[IntLiteralOutOfRange]: -5 does not fit in U8",
+            "error[IntLiteralOutOfRange]: -7 does not fit in U32",
+            "note: unsigned types hold no negative values",
+        ]),
+        expect_errors("negative_zero_under_unsigned", #"fn main() {
+    let _z: U8 = -0
+}
+"#, 1, ["error[IntLiteralOutOfRange]: -0 is a negative literal", "note: unsigned types hold no negative values"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "a literal with no expected type is Int, and the help offers U64 when it fits" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors("default_int_with_help", #"fn main() {
+    let big = 9223372036854775808
+    io.println("{big}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type", "help: let big: U64 = 9223372036854775808"]),
+        expect_errors_without("default_above_u64_has_no_help", #"fn main() {
+    let huge = 18446744073709551616
+    io.println("{huge}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: no integer type holds 18446744073709551616"], ["help:"]),
+        expect_errors_without("default_not_a_let_has_no_let_help", #"fn main() {
+    io.println("{9223372036854775808}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type"], ["help: let"]),
+        expect_errors_without("annotated_let_has_no_let_help", #"fn main() {
+    let _x: Int = 9223372036854775808
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int"], ["help: let"]),
+        expect_errors("default_negative_below_int_min", #"fn main() {
+    let low = -9223372036854775809
+    io.println("{low}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: -9223372036854775809 does not fit in Int, the default type"]),
+        expect_errors("push_to_list_of_unknown_element", #"fn main() {
+    let mut xs = []
+    xs.push(9223372036854775808)
+    io.println("{xs.len()}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]", "9223372036854775808"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "each position that gives an expected type checks the literal" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors("tail_position", #"fn f() -> U8 { 300 }
+fn main() { io.println("{f()}") }
+"#, 1, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"]),
+        expect_errors("return_position", #"fn f(c: Bool) -> U8 {
+    if c { return 256 }
+    1
+}
+fn main() { io.println("{f(true)}") }
+"#, 1, ["error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)"]),
+        expect_errors("call_argument", #"fn take(v: U8) -> U8 { v }
+fn main() { io.println("{take(256)}") }
+"#, 1, ["error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)"]),
+        expect_errors("list_element", #"fn main() {
+    let xs: List[U8] = [1, 300, 2]
+    io.println("{xs.len()}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"]),
+        expect_errors("list_element_beside_a_value", #"fn main() {
+    let u: U8 = 1
+    let xs = [u, 300]
+    io.println("{xs.len()}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"]),
+        expect_errors("variant_payload", #"fn main() {
+    let o: Option[U8] = Some(256)
+    io.println("{o ?? 0}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)"]),
+        expect_errors("struct_field", #"type P { x: I8 }
+fn main() {
+    let p = P { x: 128 }
+    io.println("{p.x}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 128 does not fit in I8 (-128 to 127)"]),
+        expect_errors("assignment", #"fn main() {
+    let mut v: U8 = 1
+    v = 256
+    io.println("{v}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)"]),
+        expect_errors("if_branch", #"fn main() {
+    let c = true
+    let x: U8 = if c { 300 } else { 1 }
+    io.println("{x}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"]),
+        expect_errors("arith_and_compare_operands", #"fn main() {
+    let u: U8 = 255
+    let i: I8 = -1
+    io.println("{u + 300} {u == 256} {-129 < i} {u & 300} {256 | u} {i & 200}")
+}
+"#, 6, [
+            "error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)",
+            "error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)",
+            "error[IntLiteralOutOfRange]: -129 does not fit in I8 (-128 to 127)",
+            "error[IntLiteralOutOfRange]: 200 does not fit in I8 (-128 to 127)",
+        ]),
+        expect_errors("expected_type_reaches_both_operands", #"fn main() {
+    let _x: U8 = 1 + 300
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"]),
+        expect_errors("shift_amount_is_u32", #"fn main() {
+    let v: U64 = 1
+    io.println("{v << 4294967296}")
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 4294967296 does not fit in U32 (0 to 4294967295)"]),
+        expect_errors("shift_left_operand_takes_expected", #"fn main() {
+    let _s: U8 = 256 << 1
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "an out-of-range literal gives one error and no other" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors_without("no_mismatch_after_range_error", #"fn main() {
+    let _x: U8 = 300
+}
+"#, 1, ["IntLiteralOutOfRange"], ["TypeError"]),
+        expect_errors_without("value_operand_keeps_its_type", #"fn main() {
+    let n: Int = 3
+    let _x: U8 = n + 300
+}
+"#, 1, ["variable `_x`: declared type U8 but got Int"], ["IntLiteralOutOfRange"]),
+        // The count is left open: `@allow` of an error name is an error of its own.
+        expect_errors("allow_does_not_turn_it_off", #"@allow(IntLiteralOutOfRange)
+fn main() {
+    let _x: U8 = 300
+}
+"#, -1, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "a literal pattern and a range bound take the scrutinee type" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors_without("literal_pattern", #"fn main() {
+    let u: U8 = 1
+    let s = match u {
+        255 => "max"
+        256 => "past"
+        _ => "other"
+    }
+    io.println(s)
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)"], ["NonExhaustive", "Unreachable", "warning"]),
+        expect_errors_without("range_pattern_bound", #"fn main() {
+    let i: I8 = 1
+    let s = match i {
+        0..=128 => "high"
+        _ => "low"
+    }
+    io.println(s)
+}
+"#, 1, ["error[IntLiteralOutOfRange]: 128 does not fit in I8 (-128 to 127)"], ["NonExhaustive", "Unreachable", "warning"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "a const out of range is E0318, not a const evaluation error" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors_without("const_out_of_range", #"const A: U8 = 300
+const B: I8 = -129
+fn main() { io.println("{A} {B}") }
+"#, 2, [
+            "error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)",
+            "error[IntLiteralOutOfRange]: -129 does not fit in I8 (-128 to 127)",
+        ], ["ConstEvalPanic"]),
+        expect_errors_without("const_negative_unsigned", #"const C: U64 = -1
+fn main() { io.println("{C}") }
+"#, 1, ["error[IntLiteralOutOfRange]: -1 does not fit in U64"], ["ConstEvalPanic"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "blink explain E0318 names IntLiteralOutOfRange" {
+    let r = process_run("build/blink", ["explain", "E0318"])
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("E0318"))
+    assert(r.out.contains("IntLiteralOutOfRange"))
+}
+
+test "blink check, a per-module build and a one-unit build report the same E0318" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/bad.bl", #"fn take(v: U8) -> U8 { v }
+fn main() {
+    let big = 9223372036854775808
+    let _n: U64 = -1
+    io.println("{big} {take(256)}")
+}
+"#)
+    let check = blink_in_dir("check bad.bl")
+    let per_module = blink_in_dir("build bad.bl")
+    let one_unit = blink_in_dir("build --no-per-module bad.bl")
+    let _ = sh("rm -rf {DIR}")
+    assert(check.exit_code != 0)
+    assert(per_module.exit_code != 0)
+    assert(one_unit.exit_code != 0)
+    let shown = check.err_out.replace("error: check failed\n", "")
+    if shown != per_module.err_out || per_module.err_out != one_unit.err_out {
+        io.eprintln("check:\n{check.err_out}\nbuild:\n{per_module.err_out}\none unit:\n{one_unit.err_out}")
+    }
+    assert(shown == per_module.err_out)
+    assert(per_module.err_out == one_unit.err_out)
+    if !check.err_out.contains("3 error(s) found") { io.eprintln(check.err_out) }
+    assert(check.err_out.contains("3 error(s) found"))
+}
