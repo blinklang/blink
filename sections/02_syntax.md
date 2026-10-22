@@ -2230,7 +2230,7 @@ test "unwrap on empty list panics with the expected message" {
 }
 ```
 
-The literal `10 / 0` in the first test gives no warning: `DivisionByLiteralZero` (W0704, §3.6 *Integer Division*) does not fire inside an `assert_panics` body.
+The literal `10 / 0` in the first test gives no warning: `DivisionByLiteralZero` (W0704, §3.6 *Integer Division*) and `LiteralArithmeticOverflow` (W0708, §3.6 *Literal arithmetic overflow*) do not fire inside an `assert_panics` body.
 
 **Form.** The body is a `{ ... }` block, *not* a `fn() { }` closure. It can appear only as the operand of `assert_panics` — it cannot be bound to a variable, passed as a higher-order argument, returned, or stored. This is the same syntactic discipline as the pattern argument of `assert_matches`: the construct is operand-only, so no first-class panic-catching handle ever exists. `assert_panics` itself yields no value (its type is `()`); you cannot write `let x = assert_panics { ... }`. There is no `PanicInfo` binding, no `Result`, no `Bool` — the only observable outcome is whether the surrounding test passes or fails.
 
@@ -2840,7 +2840,7 @@ note: `SHARDS` is 0
    |       ^^^^^^
 ```
 
-Outside the four contexts, a zero divisor is not a compile error: `let a = 10 / 0` compiles and panics at run time. §3.6 *Integer Division* gives the warning for a literal zero divisor.
+Outside the four contexts, a zero divisor is not a compile error: `let a = 10 / 0` compiles and panics at run time. §3.6 *Integer Division* gives the warning for a literal zero divisor. Overflow is the same: outside the four contexts, `let bad: I8 = 127 + 1` compiles and panics at run time, and §3.6 *Literal arithmetic overflow* gives the warning.
 
 #### Visibility
 

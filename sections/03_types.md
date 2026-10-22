@@ -1489,13 +1489,13 @@ In `@ffi` signatures, each sized type maps to the C type in the table. (Panel vo
 
 **Overflow behavior:**
 
-Arithmetic overflow is checked by default. An operation that exceeds the type's range panics at runtime with a descriptive message. The compiler also catches overflow in constant expressions at compile time. A zero divisor is not overflow: in a const context it is a compile error (§2.21, *Const Evaluation Must Succeed*), and elsewhere it panics at run time (§3.6, *Integer Division*). The remainder `%` never exceeds the range, so for a signed type `MIN % -1` is 0 and does not panic (§3.6, *Integer Division*).
+Arithmetic overflow is checked by default. An operation that exceeds the type's range panics at runtime with a descriptive message. In a const context (§2.21), an overflow is `ConstEvalPanic` (E0546), because the compiler evaluates the expression. Anywhere else, the program panics at run time; when the operands are only literals and the result always overflows, the compiler also gives the warning `LiteralArithmeticOverflow` (W0708, §3.6, *Literal arithmetic overflow*). A zero divisor is not overflow: in a const context it is a compile error (§2.21, *Const Evaluation Must Succeed*), and elsewhere it panics at run time (§3.6, *Integer Division*). The remainder `%` never exceeds the range, so for a signed type `MIN % -1` is 0 and does not panic (§3.6, *Integer Division*).
 
 ```blink
 let x: U8 = 255
 let y = x + 1               // RUNTIME PANIC: U8 overflow in addition (255 + 1)
 
-let bad: I8 = 127 + 1       // COMPILE ERROR: constant overflow in I8 (127 + 1 = 128, max 127)
+let bad: I8 = 127 + 1       // RUNTIME PANIC: I8 overflow in addition (127 + 1 = 128, max 127); warning[LiteralArithmeticOverflow]
 ```
 
 For intentional modular arithmetic, use the explicit wrapping methods:
@@ -1654,7 +1654,7 @@ fn main() {
 
 A literal does not wait for a later line to fix its type, as Rust's `{integer}` does. Its type is known at the literal, so it never leaves a type variable that would need a default (§3.4 *Under-Determined Types*).
 
-The compiler performs range checking on all constant expressions assigned to sized types. This catches errors at compile time rather than runtime. Non-constant expressions are checked at runtime via the overflow machinery described above.
+The compiler checks the range of each literal at the literal (E0318, *Integer literal range*). It evaluates an expression only in a const context (§2.21), where an overflow is E0546. Other arithmetic is checked at run time by the overflow machinery described above; for arithmetic on literals only, the warning W0708 reports an overflow that always happens (§3.6, *Literal arithmetic overflow*).
 
 **Why no literal suffixes.** Languages like Rust use `42u8`, `100i32`, etc. Blink omits suffixes because (1) function signatures already provide the context -- `fn process(val: U8)` makes `process(200)` unambiguous; (2) suffixes add visual noise to a language designed for readability; (3) the rare case where disambiguation is needed can use a type annotation: `let x: U8 = 42`. (Panel vote: 4-1, Systems expert preferred constructor syntax `U8(42)`.)
 
@@ -4350,7 +4350,7 @@ When the divisor of an integer `/` or `%` is an integer literal with the value 0
 
 - A `const` reference or a `let` binding with the value 0 does not trigger it.
 - It does no flow analysis, so it also fires in a branch that never runs.
-- It does not fire inside the body of an `assert_panics` block (§2.20). This rule belongs to this warning only; other warnings fire in an `assert_panics` body as they do elsewhere.
+- It does not fire inside the body of an `assert_panics` block (§2.20). This rule belongs to this warning and to `LiteralArithmeticOverflow` (W0708) only; other warnings fire in an `assert_panics` body as they do elsewhere.
 
 ```blink
 let a = 10 / 0          // warning[DivisionByLiteralZero]; RUNTIME PANIC: Int division by zero
@@ -4365,6 +4365,46 @@ fn pages(total: Int) -> Int {
 ```
 
 Suppress the warning on a function with `@allow(DivisionByLiteralZero)`, or set its level with `W0704` under `[lints]` (§4.16.8).
+
+**Literal arithmetic overflow.** Outside a const context (§2.21), an integer operation that always overflows is not a compile error, when its operands are only literals. The expression compiles and panics at run time, as every overflow does (§3.2, *Overflow behavior*). In a const context it is `ConstEvalPanic` (§2.21, *Const Evaluation Must Succeed*). The compiler gives the warning `LiteralArithmeticOverflow` (W0708) for the largest tree of integer literals, defined by `K`. A negative literal `N` (§3.2, *Integer literal range*) is matched first:
+
+```
+K ::= N | L | "(" K ")" | "-" K | K op K        op in { + - * / % }
+```
+
+This grammar is wider than the negative-literal rule in §3.2. There, `-(-5)` is a call to `Neg` and is not a negative literal. Here, a unary `-` over a tree is a node of the tree, so `-(-128)` at `I8` warns because `-MIN` is out of range. `-128` is a negative literal, a leaf, and E0318 governs it. Shifts `<<` and `>>` are not part of the tree.
+
+The warning reads the tree as written. It checks each operation at the type that the checker gives it (§3.2, *Operator operands*). Whether a literal tree in operand position of a non-literal expression takes the type of the other operand is not decided here. The warning uses whatever type the checker gives each operation.
+
+- A `const` reference or a `let` binding stops the tree, whatever its value.
+- It does no flow analysis, so it also fires in a branch that never runs.
+- It does not fire inside the body of an `assert_panics` block (§2.20). This rule belongs to this warning and to `DivisionByLiteralZero` only.
+- It does not fire in a const context (§2.21). `ConstEvalPanic` reports the fault there.
+- It gives one warning for each tree, at the first operation that fails, in evaluation order: the left operand, then the right operand, then the operator.
+- A literal 0 divisor is `DivisionByLiteralZero` (W0704) only. `LiteralArithmeticOverflow` never reports it, and W0704 still fires when W0708 fires on the same tree.
+
+```blink
+let bad: I8 = 127 + 1           // warning[LiteralArithmeticOverflow]; RUNTIME PANIC: I8 overflow in addition
+let c: U8 = 200 * 2             // warning[LiteralArithmeticOverflow]; RUNTIME PANIC: U8 overflow in multiplication
+let n: I8 = -128                // ok: a negative literal, in range
+let m: I8 = -(-128)             // warning[LiteralArithmeticOverflow]; RUNTIME PANIC: I8 overflow in negation
+let d: I8 = (127 + 1) / 0       // warning[LiteralArithmeticOverflow] at 127 + 1; warning[DivisionByLiteralZero] at 0
+let b: U8 = 300                 // error[IntLiteralOutOfRange] (E0318): the literal does not fit
+
+const LIMIT: I8 = 127
+
+fn next() -> I8 {
+    LIMIT + 1                   // no warning: a const reference stops the tree
+}
+
+test "overflow panics" {
+    assert_panics {
+        let _: I8 = 127 + 1     // no warning inside assert_panics
+    }
+}
+```
+
+Suppress the warning on a function with `@allow(LiteralArithmeticOverflow)`, or set its level with `W0708` under `[lints]` (§4.16.8). To make it a build error, write `W0708 = "error"`.
 
 Traits can have default method implementations (`ne` above). Traits can require other traits (`Hash: Eq` means implementing `Hash` requires implementing `Eq`).
 
