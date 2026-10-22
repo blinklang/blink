@@ -2090,7 +2090,7 @@ import pg                    // resolves to libs/pg/src/pg.bl
 import pg.protocol           // resolves to libs/pg/src/protocol.bl
 ```
 
-**Package name grammar.** The `[package].name` field must match `[a-z][a-z0-9_]*` (validated as `error[E1011]`). Hyphens are forbidden. Dots are forbidden in the bare name (dots are the import sub-path separator and are reserved for registry paths per §8.9.2). The constraint exists so that the four-way invariant — `[package].name` = directory name = entry filename stem = `@module(...)` argument — holds character-for-character with no transformation table.
+**Package name grammar.** The `[package].name` field must match `[a-z][a-z0-9_]*` (validated as `error[E1011]`). An empty `name`, and a `name` that is not a string, are also E1011. The span follows §8.9.8. Hyphens are forbidden. Dots are forbidden in the bare name (dots are the import sub-path separator and are reserved for registry paths per §8.9.2). The constraint exists so that the four-way invariant — `[package].name` = directory name = entry filename stem = `@module(...)` argument — holds character-for-character with no transformation table.
 
 **Project root discovery.** A source file's package root is the nearest ancestor directory containing a `blink.toml`, walking up from the file being compiled. `src/` beneath the package root is the source root. Files under `tests/`, `examples/`, and `bench/` are *peers* of `src/`, not children: their imports resolve against the same package root that walking up from `src/` would find. This rule applies uniformly to first-party (self-package) and third-party imports — there is no special-case "self-import" branch.
 
@@ -2423,7 +2423,7 @@ When the entry names a type whose methods the file calls, the note says that the
 | E1008 | Invalid module annotation | `@module(...)` disagrees with parent package or entry file's `[package].name` |
 | E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
 | E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
-| E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar |
+| E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar, is empty, or is not a string |
 | E1012 | Duplicate symbol | A module-level declaration takes a name that an import (`import` or `pub import`) binds: a listed name or a qualifier |
 | E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
 | E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |

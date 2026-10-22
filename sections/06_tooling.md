@@ -479,7 +479,7 @@ mylib = { type = "vendored", path = "vendor/mylib.c" }  # compiled from source
 Net.Connect = "mock-http"                     # test alternative
 ```
 
-**Dependency source table:** Each dependency specifies exactly one source — `version` (registry), `git`, or `path`. Combining sources is an error.
+**Dependency source table:** Each dependency specifies exactly one source — `version` (registry), `git`, or `path`. Combining sources is an error. An entry with no source is an error too (`MissingDependencySource`, §8.9.8).
 
 #### 8.9.4 Version Constraints
 
@@ -572,8 +572,11 @@ Import paths follow the `org/name` structure: `import std.http` maps to the `std
 | A bad value | the value token, quotes included |
 | A bad key | the key |
 | A bad section | the `[header]` |
+| A missing key | the `[header]` of the section that lacks it |
+| A missing section (no `[package]`) | line 1, column 1, zero width |
+| A dependency with no source | the token that names the dependency: the key for the inline form, the whole `[header]` for the table form (`[dependencies."local/utils"]`, quoted dotted segments included) |
 
-There is no fallback position: every manifest diagnostic points at the token at fault.
+There is no fallback position: every manifest diagnostic points at the token at fault, or, when the fault is an absent token, at the position that this table gives.
 
 **Unknown sections.** A top-level section that this specification does not define is the warning `UnknownManifestSection` (W1001). §8.9.3 defines most sections, and §4.16.8 defines `[lints]`. The span is the `[header]`. When a defined section name is close to the unknown one, the help line offers it:
 
@@ -630,8 +633,6 @@ W1002 keeps a manifest that a newer toolchain wrote building on an older toolcha
 
 Each unknown key gets its own diagnostic, in source order. The toolchain checks the whole manifest before the load fails on E1014. The section check comes first: a section that W1001 reports gets no key diagnostic, also when a dotted key at the top level opens that section.
 
-When `[package]` lacks a required key (`name` or `version`) and W1002 fired in `[package]`, the error for the missing key adds a `note:` that points at the unknown key, as E1200 and E1052 do after W1001.
-
 **Edition value.** The `edition` value must name an edition that this toolchain knows (§8.16.1). There is no fallback edition: the toolchain never checks a package under an edition that its manifest does not name. A manifest with no `edition` keeps the default (§8.16.1). The check runs for each package in the dependency graph. The span is the value token. Two errors cover the faults:
 
 | Value | Error | Help |
@@ -679,7 +680,7 @@ error[InvalidEdition]: `edition` must be a string
 
 Neither error is a warning. No `@allow` and no `[lints]` entry lowers it; such an entry is `NotAWarningName` (E0847), as for any error.
 
-When the manifest at fault belongs to a dependency, the error adds a `note:` with a span on the entry of that dependency in the manifest that declares it. When the dependency is not direct, the text of the note also gives the chain from the root package on one line. The chain is the shortest path; among paths of equal length, it is the first in declaration order. The help also offers to pin a release of the dependency that uses an edition this toolchain knows.
+When the manifest at fault belongs to a dependency, the error gets the `note:` and the chain of *Dependency manifests* below. The help also offers to pin a release of the dependency that uses an edition this toolchain knows.
 
 ```
 error[UnsupportedEdition]: this blink does not know edition "2099"
@@ -695,6 +696,82 @@ error[UnsupportedEdition]: this blink does not know edition "2099"
 W1001 and unknown-key diagnostics in the same manifest are still reported. For `UnsupportedEdition` only, each such warning adds a `note:` at the `edition` value. The note states a fact and nothing more: `this manifest names edition 2099, which this blink does not know`. For `InvalidEdition`, the warning has no note.
 
 `blink fmt` still formats a package with an edition error. The language server reports the error and does not type-check that package. `blink migrate --edition <year>` and `blink editions --edition <year>` give the same two errors for a year that names no known edition; the span is the argument (§8.16.3, §8.16.4).
+
+**Reporting.** The toolchain checks the whole manifest and reports every manifest error before the load fails. After a manifest error the toolchain prints no further line about the failed load. The toolchain may print one line that gives the count of errors. That line is not a diagnostic: it does not start with `error:` and it names no fault.
+
+**Dependency manifests.** This rule is for every manifest error. When the manifest at fault is a dependency's, the error adds a `note:` with a span on the dependency's entry in the dependent manifest. When the dependency is not direct, the note also gives the chain from the root on one line, for example `myapp -> auth -> crypto`. The chain is the shortest path. Among paths of equal length, it is the first in declaration order.
+
+**Package keys.** `MissingManifestKey` and `InvalidPackageVersion` are errors of category Manifest. No `@allow` entry and no `[lints]` entry lowers them (`NotAWarningName`, E0847, as for any error).
+
+- `MissingManifestKey` (E1019): the manifest has no `[package]` section, or `[package]` lacks `name` or `version`. With no `[package]` section, the toolchain reports one diagnostic, at line 1, column 1. When `[package]` lacks both keys, it reports one diagnostic for each key, each at the `[package]` header. This code covers only these absent keys. An empty value is not this code.
+- An empty `name`, or a `name` that is not a string, is `InvalidPackageName` (E1011, §10.1). The span is the value. The message for the empty case says that the package name is empty.
+- `InvalidPackageVersion` (E1020): `version` is empty, is not a string, or is not a SemVer 2.0.0 version. The span is the value. The help says that `"1.2"` is a dependency constraint (§8.9.4) and not a package version. For `"1"` and `"1.2"`, the help gives the padded version (`"1.0.0"`, `"1.2.0"`). That edit is not machine-applicable, because the author can mean another version.
+- When an unknown-key diagnostic fired in `[package]`, and that unknown key is the nearest-name match (ERROR_CATALOG.md, *Conventions*) for the missing key, `MissingManifestKey` adds a `note:` at the unknown key. Its help then says to rename the key (``rename `nmae` to `name` ``). An unknown key that is not the nearest-name match, such as `homepage`, gets no note. If the renamed key has a bad value, the next run reports `InvalidPackageName` or `InvalidPackageVersion`.
+
+```toml
+[package]
+version = "0.1.0"
+```
+
+```
+error[MissingManifestKey]: `[package]` has no `name`
+ --> blink.toml:1:1
+  |
+1 | [package]
+  | ^^^^^^^^^ `name` is required
+  = help: add `name = "myapp"` under `[package]`
+```
+
+```toml
+[package]
+name = "myapp"
+version = "1.2"
+```
+
+```
+error[InvalidPackageVersion]: `"1.2"` is not a SemVer 2.0.0 version
+ --> blink.toml:3:11
+  |
+3 | version = "1.2"
+  |           ^^^^^ expected MAJOR.MINOR.PATCH
+  = help: `"1.2"` is a dependency constraint (§8.9.4), not a package version; write `"1.2.0"`
+```
+
+**Dependency sources.** An entry takes exactly one source (§8.9.3). Both codes below are errors of category Manifest, and no `@allow` or `[lints]` entry lowers them. A later source kind uses these two codes. There is no third code for a wrong source.
+
+- `MissingDependencySource` (E1021): the entry has no source. The message says that the dependency "has no source". The help lists the sources that this toolchain supports; a v1 toolchain lists `path` and `git` (§8.9.7). Some keys belong to some sources only. Today the only such key is `tag`, and only `git` takes it. When the entry holds such a key, the help names every source that takes the key (today `git` alone). The toolchain checks the whole entry before it reports this error. When an unknown-field diagnostic fired in the same entry, and that field is the nearest-name match for a source key, this error adds a `note:` at that field. The candidates are source keys only. The two errors have one repair: rename the field. The help says so.
+- `ConflictingDependencySources` (E1022): the entry has two or more sources. The primary span is the second source key in source order. Each other source key has a label in the same snippet, and the number of labels has no limit. The help says that an entry takes exactly one source and asks the user to keep one. It never picks which source to keep, and the error has no machine-applicable fix.
+
+```toml
+[dependencies]
+"local/utils" = { path = "../utils", git = "https://example.com/utils.git" }
+```
+
+```
+error[ConflictingDependencySources]: dependency `local/utils` has two sources
+ --> blink.toml:2:38
+  |
+2 | "local/utils" = { path = "../utils", git = "https://example.com/utils.git" }
+  |                   ----               ^^^ second source
+  |                   |
+  |                   first source
+  = help: a dependency takes exactly one source; keep one of `path` and `git`
+```
+
+```toml
+[dependencies]
+"local/utils" = { pth = "../utils" }
+```
+
+```
+error[MissingDependencySource]: dependency `local/utils` has no source
+ --> blink.toml:2:1
+  |
+2 | "local/utils" = { pth = "../utils" }
+  | ^^^^^^^^^^^^^ needs one source
+  = note: blink.toml:2:19: the unknown field `pth` may be the misspelled `path`
+  = help: rename `pth` to `path`
+```
 
 ---
 
