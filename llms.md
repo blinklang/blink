@@ -36,6 +36,7 @@ Key facts:
 - An integer literal must fit its type (`let x: U8 = 300` is `E0318`); a literal with no expected type is `Int`. `-128` and `-(128)` are one literal, so `let b: I8 = -128` is valid
 - Type parameters are rigid in a generic body: arithmetic on `T` needs a bound (`T: Add`). Bounds are checked at the call (`E0306`). Explicit call type arguments: `f[T](x)`
 - Keyword parameters follow `--`: `fn f(a: Int, -- b: Str = "x")`. Defaults are constants
+- A default must fit every instance of a parameter type that names a type parameter: `x: T = 3` is `E0300`, `x: Option[T] = None` and `xs: List[T] = []` fit. A default never fixes `T`. `[]` is a const only as a keyword or field default
 - `Map.remove` returns `Option[V]`. `m[k] = v` is an error; use `m.insert(k, v)`. `channel.new[T](buffer: n)`; `ch.recv()` returns `Option[T]`
 - `Float` has a total order (`NaN == NaN`, `-0.0 == 0.0`); use `x.ieee_eq(y)` for IEEE equality. `x == -0.0` is also true for `0.0` and warns (W0706); test the sign with `x.is_sign_negative()`
 - `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type

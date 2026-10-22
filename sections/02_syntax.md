@@ -1325,8 +1325,26 @@ fn connect(
 - Default values only allowed on keyword params (after `*`)
 - Default values must be const expressions (see [2.21](#221-const-declarations))
 - Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `*`. Closures, higher-order functions, and the function type of a trait impl method are unaffected. An impl repeats its trait method's marker and keyword names (§3.6). See [3.3](#33-type-inference).
-- A default does not change the function type either: the type has full arity. A direct call fills each omitted keyword parameter with its const default after all written arguments evaluate, and a fn value takes every argument. Whether a parameter typed by a bare type parameter may take a default is not yet specified
+- A default does not change the function type either: the type has full arity. A direct call fills each omitted keyword parameter with its const default after all written arguments evaluate, and a fn value takes every argument. Each fill builds a new value: a call that omits a `List` parameter with default `[]` gets a new empty list
+- **A default fits every instance.** The compiler checks a default once, at its declaration, against the declared parameter type. Each type parameter of the function stays abstract in that check, so a default is legal only if it has the declared type for every choice of the type parameters. An omitted argument adds no constraint to inference: a type parameter comes from the written arguments, from the expected type, or from an explicit `[...]` (§3.4 *Explicit Type Application*). A default never supplies a type parameter (§3 *No erasure*). A call that leaves a type parameter with no source is `error[CannotInferType]` (E0301) at the call (§3.4 *Under-Determined Types*). A default that does not fit is `TypeError` (E0300), reported at the default and never at a call
 - The formatter never reorders arguments, struct-literal fields or list elements. Their written order is their evaluation order (§2.22), so a reorder would change what the program does
+
+```blink
+fn h[T](*, x: T = 3) -> T { x }                       // error: `3` is Int, and `x` is `T` for every `T`
+fn g[T](*, x: Option[T] = None) -> Option[T] { x }    // ok: `None` has type `Option[T]` for every `T`
+fn k[T](*, xs: List[T] = []) -> Int { xs.len() }      // ok: `[]` has type `List[T]` for every `T`
+
+fn h2[T](a: T, *, b: Option[T] = None) -> T { b ?? a }
+
+fn main() {
+    let a = h2(1)               // `T` is Int from `a`; `b` fills with `None`
+    let n: Option[Int] = g()    // `T` is Int from the expected type
+    let m = k[Str]()            // `T` is written at the call
+    g()                         // error[CannotInferType]: nothing fixes `T`; write `g[Int]()`
+}
+```
+
+A `Box[T]` default fits only when each field that mentions `T` takes a value that fits every `T`: for `type Box[T] { v: Option[T] }`, `Box { v: None }` fits and `Box { v: Some(3) }` does not. A parameter of a fn type has no default, because no fn value is a const expression (§2.21).
 
 **Both rules are enforced by `blink check`.** A label written on a positional parameter is rejected, and a keyword parameter supplied without its label is rejected. Neither rule is a style preference, and neither is left to the formatter. The marker exists to make the swap in `transfer(300, bob, alice)` impossible; a rule the checker does not enforce makes nothing impossible, and a normative sentence the compiler does not hold up teaches a calling discipline that does not exist.
 
@@ -1425,6 +1443,8 @@ let config = ServerConfig { port: 3000, debug: true }
 #### Rules
 
 - Default values must be const expressions (see [2.21](#221-const-declarations))
+- A field default on a generic type follows the rule of §2.13 *A default fits every instance*, with the type's own type parameters abstract. A default whose type nests a type parameter, such as `Option[T]`, follows it too: `type Box[T] { x: T = 3 }` is the same error, and `x: Option[T] = None` fits
+- Each construction that omits a field with a default builds a new value for that field
 - Fields without defaults are always required at construction
 - An omitted field takes its default value
 - Struct field defaults do not interact with the type system: `ServerConfig` is the same type regardless of which fields were explicitly provided
@@ -2789,6 +2809,9 @@ A **const expression** is built from a closed set of operations that the compile
 | Const references | Other `const` bindings by name, and type-scoped constants (§2.12.3) | `MAX_PAYLOAD * 2`, `MsgFlags.NONE` |
 | Struct literals | Struct construction with all-const fields | `ServerConfig { port: 8080 }` |
 | Enum variants | Variant construction with const payloads | `LogLevel.Info`, `Some(42)` |
+| Empty list literal | `[]`, in a keyword default or a struct field default only (see below) | `xs: List[Int] = []` |
+
+**The empty list literal.** `[]` is a const expression in a keyword default (§2.13) and in a struct field default (§2.14), and nowhere else. It is not allowed in a `const` declaration or in a range pattern bound. A `List` is a shared cell (§3.6 *Shared cells*), so a `const` that held one would be a shared mutable global. A default has no such problem, because each fill builds a new value: a new empty list at each call that omits the argument, and at each construction that omits the field. A list literal with elements is not a const expression. In a `const` declaration, the error for `[]` names the two places where `[]` is allowed.
 
 What is **not** a const expression:
 
