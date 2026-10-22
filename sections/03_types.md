@@ -2857,7 +2857,8 @@ atomic_pattern ::= "_"                                        // wildcard
                |   TYPE_NAME "(" pattern_list ")"             // constructor
                |   TYPE_NAME "." IDENT "(" pattern_list ")"   // qualified constructor
                |   "(" pattern_list ")"                       // tuple
-               |   TYPE_NAME "{" field_patterns "}"           // struct
+               |   TYPE_NAME "{" field_patterns "}"           // struct, or variant with named fields
+               |   TYPE_NAME "." IDENT "{" field_patterns "}" // qualified variant with named fields
 
 pattern_list  ::= pattern ( "," pattern )*
 
@@ -3034,6 +3035,8 @@ error[TypeError]: pattern of type `Other` used on a value of type `T`
 
 **After the error.** Each binder under a pattern with one of these errors has the poison type (§6.3.5). The compiler still checks the arm body and suppresses each diagnostic that only the poison type causes. *Exhaustiveness* below says how such an arm counts for coverage. These rules apply to `blink check` and to `blink build` alike: each variant pattern resolves to its enum and variant before code generation, or the compiler reports an error, so the two commands report the same diagnostics for one program.
 
+**After a field error.** `NoSuchField` (E0525) and `DuplicateField` (E0316) in a struct pattern or a variant brace pattern (*Struct patterns* below) also leave the arm checked, but the poison is narrower. Only a binder under an unknown label has the poison type. A binder under a label that the type declares keeps the type of its field, and so does a binder under the second of two equal labels. `PatternMissingRest` (E0319) poisons nothing, and an arm with only this error is not a bad arm: the compiler checks it as if the pattern had `..`.
+
 **Literal.** Integer, float, boolean, and string literals match by value equality.
 
 ```blink
@@ -3129,6 +3132,55 @@ error[NonExhaustiveMatch]: non-exhaustive match on List[Str]
 ```
 
 **Struct patterns.** Match struct types by field values. Type name is required (nominal matching). Field punning binds a field to a variable of the same name, so a field named by a keyword cannot use the short form: write `Event { type: t, .. }` (§2.23 *Members and Bindings*). `..` is required when not all fields are listed.
+
+The compiler checks the labels of a struct pattern and of a variant brace pattern (`Rect { w, .. }` and `Shape.Rect { w, .. }`) in the same way. It checks them at every depth and in every pattern position: `match` arms, nested patterns, `let`, `for`, and each alternative of an OR-pattern. The labels form a set, as the labels of a literal do (§2.14 *Checking a Literal's Fields*). The checks run after the type-name checks (E0507, E0547, E0300) of *Qualified names and the wrong type*, in this order:
+
+1. **A label twice** is `DuplicateField` (E0316). The error is at the second label, with a `note:` at the first.
+2. **A label that the type or variant does not declare** is `NoSuchField` (E0525). The candidates for the nearest-name suggestion (Error Catalog, *Conventions*) are the declared fields that the pattern does not already label. With one suggestion, the rename is machine-applicable. With none, the help lists the declared fields and marks those the pattern already labels. For a punned label, as in `Point { x, yy }`, the fix writes `y: yy`. The binder and the arm body stay as they are, so the fix cannot change which name a use in the arm refers to. The help never says "or add the field to `T`" for a pattern label.
+3. **Fields left out with no `..`** is `PatternMissingRest` (E0319). One error for each pattern, at the type or variant name. It lists each missing field and its type, in declaration order. A field that is the one suggestion for an unknown label in the same pattern is not missing. If the list is then empty, the compiler reports nothing. A field default (§2.14) does not count as naming the field: a pattern that leaves out a field with a default still needs `..`. The error gives two fixes, always in this order:
+    1. Add `..`. This fix is machine-applicable and is the preferred fix.
+    2. Write `f: _` for each left-out field `f`. This fix is in structured output, and is never machine-applicable. It keeps the pattern closed: a field that the type gains later is an error again.
+
+`PatternMissingRest` is a different code from `MissingField` (E0315). A literal gives the missing fields values. A pattern only names or skips them.
+
+```blink
+type Point { x: Int, y: Int }
+
+fn sum(p: Point) -> Int {
+    match p {
+        Point { x, y } => x + y                // field punning
+    }
+}
+
+fn sum_long(p: Point) -> Int {
+    match p {
+        Point { x: px, y: py } => px + py      // the same pattern, with a binder for each label
+    }
+}
+```
+
+```blink
+type Point3 { x: Int, y: Int, z: Int }
+
+fn get_x(p: Point3) -> Int {
+    match p {
+        Point3 { x, y } => x        // error[PatternMissingRest]: `z` is left out
+        Point3 { x, yy, .. } => x   // error[NoSuchField]: `yy`
+    }
+}
+```
+
+```
+error[PatternMissingRest]: `Point3` pattern leaves out field `z` (Int) and has no `..`
+  help: add `..`
+  = fix: Point3 { x, y, .. }
+  = fix: Point3 { x, y, z: _ }
+error[NoSuchField]: `Point3` has no field `yy`
+  help: did you mean `y`?
+  = fix: y: yy
+```
+
+The first `PatternMissingRest` fix is machine-applicable. The second is not.
 
 ```blink
 match user {
@@ -3355,7 +3407,7 @@ The exhaustiveness checker handles:
 - **OR-patterns** — union of covered patterns per alternative
 - **`Never` payloads** — a variant whose payload type is `Never` still needs an arm. The checker does not remove the arm because no value can reach it. The arm body may be the payload itself, which has type `Never` and fits any expected type. §3.2 shows the `Err(e) => e` form.
 
-**An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error or one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
+**An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error, one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above, or a `NoSuchField` (E0525) or `DuplicateField` (E0316) error in a struct pattern or a variant brace pattern (*Struct patterns* above). `PatternMissingRest` (E0319) alone does not make a bad arm: the checker treats the pattern as if it had `..`. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
 
 - When a match has an unguarded bad arm, the compiler reports no `NonExhaustiveMatch` (E0004) for that match. The missing coverage is probably the variant that the bad arm tried to name.
 - A guarded bad arm does not turn off E0004. A guarded arm never adds coverage, so an E0004 next to it stays true after the user corrects the name.
