@@ -213,8 +213,11 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | PolyImplUnsupported | E0908 | Polymorphic impl header parses but is not yet compiled (project b1bdnh) | Trait contract | §3.6 |
 | ImplBinderUnused | E0909 | Impl type-parameter binder unused in the impl header's type positions | Trait contract | §3.6 |
 | TraitContractArgArity | E0910 | Impl supplies the wrong number of trait type arguments | Trait contract | §3.6 |
+| MissingSupertraitImpl | E0911 | An impl of a trait whose supertrait the implementing type does not implement; every impl must satisfy each supertrait of its trait | Trait contract | §3.6 |
 | TraitImplAddsPrecondition | E0912 | An impl method of a trait writes `@requires`; the impl inherits the trait method's `@requires` and may not add to it. The `note:` names the inherited contract; the `help:` names the fixes (move it to the trait, a refinement type in the trait's signature, a free fn) | Trait contract | §3b.2 |
 | TrustOnTraitMethod | E0913 | `@verify(fallback: "trust")` on a trait method declaration; only `"runtime"` or `"error"` may be a trait default | Trait contract | §3b.2 |
+| TraitContractKeywordMismatch | E0914 | An impl method does not repeat the keyword parameters of its trait method: the `*` marker is missing, added or in another place, a keyword name differs, or the keyword order differs. The `note:` points at the trait declaration and names the first part that differs; the `help:` prints the expected impl header with no defaults | Trait contract | §3.6 |
+| TraitImplWritesDefault | E0915 | An impl method writes a default on a keyword parameter of its trait method; the impl inherits the trait's default and may not write one, even the same one. The `note:` names the inherited default; the `help:` says to delete the impl's default or to change the trait's | Trait contract | §3.6 |
 | CircularPackageDep | E1002 | Circular package dependency | Modules | §10.5 |
 | PrivateItemAccess | E1003 | Access to private item in another module | Modules | §10.5 |
 | VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |

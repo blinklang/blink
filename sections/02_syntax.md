@@ -1307,7 +1307,7 @@ fn connect(
 - Params after `*` are **keyword-required**: labels required, order-independent at call site. Arguments evaluate in written order, not declaration order, and bind to their parameters after all of them are evaluated (§2.22)
 - Default values only allowed on keyword params (after `*`)
 - Default values must be const expressions (see [2.21](#221-const-declarations))
-- Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `*`. Closures, trait impls, and higher-order functions are unaffected. See [3.3](#33-type-inference).
+- Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `*`. Closures, higher-order functions, and the function type of a trait impl method are unaffected. An impl repeats its trait method's marker and keyword names (§3.6). See [3.3](#33-type-inference).
 - A default does not change the function type either: the type has full arity. A direct call fills each omitted keyword parameter with its const default after all written arguments evaluate, and a fn value takes every argument. Whether a parameter typed by a bare type parameter may take a default is not yet specified
 - The formatter never reorders arguments, struct-literal fields or list elements. Their written order is their evaluation order (§2.22), so a reorder would change what the program does
 
@@ -1386,7 +1386,7 @@ transfer(300, from: bob, to: alice)   // still explicit, reviewer sees intent
 
 Models and people both swap same-typed positional arguments. Keyword labels stop this class of bug at the call site.
 
-**Limit of the guard.** The guard covers direct calls and method calls on a concrete receiver. A fn value carries no labels: after `let g = transfer`, the call `g(300, bob, alice)` type-checks. A call through a trait bound is not covered until the rule that relates a trait method's keyword parameters to its impls is specified.
+**Limit of the guard.** The guard covers direct calls and method calls on a concrete receiver. A fn value carries no labels: after `let g = transfer`, the call `g(300, bob, alice)` type-checks. A call through a trait bound reads the trait method's declaration (§3.6 *Keyword Parameters in Impls*).
 
 ### 2.14 Struct Field Defaults
 

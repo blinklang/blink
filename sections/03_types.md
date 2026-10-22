@@ -4672,6 +4672,56 @@ impl Eq for Color {
 }
 ```
 
+#### Keyword Parameters in Impls
+
+The trait method's declaration governs every call to the method. A call on a concrete receiver (`b.k(1)`), a call through a bound (`t.k(1)` with `T: Kw`) and a qualified call (`Kw.k(b, 1)`) all read the trait method's `*` marker, keyword names and defaults. One method has one call surface. Function types stay free of labels (§2.13): the rules below are a check on the impl's declaration, not on types.
+
+An impl method repeats the marker position and the keyword names of the trait method:
+
+- The impl has the same number of positional parameters before `*` as the trait. Positional parameter names are free, and only their types are checked.
+- The keyword parameters after `*` have the same names in the same order as in the trait. The order is part of the rule because the function type has full arity: a different order gives a different function type.
+- The impl writes no default on a keyword parameter. It inherits the trait's default on every call path, as it inherits the trait's `@requires` (E0912), even when its default has the same value as the trait's. A default that only the impl writes is the same error. To change a default, change the trait, or pass the argument at the call.
+
+```blink
+trait Kw {
+    fn k(self, a: Int, *, d: Int = 1) -> Int
+}
+
+type Box { v: Int }
+type Crate { v: Int }
+type Jar { v: Int }
+type Tin { v: Int }
+
+impl Kw for Box {
+    fn k(self, n: Int, *, d: Int) -> Int { n * d }   // OK: `n` may differ, `d` inherits `= 1`
+}
+
+impl Kw for Crate {
+    fn k(self, a: Int, *, d: Int = 5) -> Int { a * d }   // E0915 -- `d` inherits `= 1` from `Kw.k`
+}
+
+impl Kw for Jar {
+    fn k(self, *, a: Int, d: Int) -> Int { a * d }   // E0914 -- the trait puts `*` after `a`
+}
+
+impl Kw for Tin {
+    fn k(self, a: Int, *, e: Int) -> Int { a * e }   // E0914 -- the trait names the keyword `d`
+}
+
+fn g[T: Kw](t: T) -> Int { t.k(1) }
+
+fn main() {
+    let b = Box { v: 0 }
+    io.println("{b.k(1)} {g(b)} {Kw.k(b, 1)}")   // 1 1 1: the trait's default fills `d` on every path
+}
+```
+
+`E0914 TraitContractKeywordMismatch` reports a marker that is missing, added or in another place, a keyword name that differs, and a keyword order that differs. Its `note:` points at the trait declaration and names the first part that differs. Its `help:` prints the expected impl header: the trait's parameter list, with no defaults. `E0915 TraitImplWritesDefault` reports a default written on a keyword parameter of a trait method. Its `note:` says that the impl inherits the trait's default, and names the value. Its `help:` says to delete the default, or to change the default in the trait. Each code owns a different part of the header, so one fault never gives two errors. When one impl method breaks both rules, E0914 comes first. The header that it prints has no defaults, so that one edit clears both errors (§3.1 rule 3).
+
+A fix for a marker that is missing, added or moved is machine-applicable. So is a fix for keyword order. A fix for a renamed keyword is machine-applicable only when each impl name matches one trait name by position and the new name is free in the body. That fix renames the uses in the body too. Otherwise a rename gets a `help:` only. A fix for E0915 that deletes a default is machine-applicable when the default has the same value as the trait's. A default with another value, or a default that only the impl writes, gets a `help:` only, because the deletion changes the value that a call passes (§3.1 rule 1).
+
+Hover and `blink query` on an impl method show the defaults that it inherits from the trait.
+
 #### Trait Bounds
 
 Generics are constrained by trait bounds:
