@@ -5305,67 +5305,16 @@ fn tc_arm_tail_value_node(body: Int) -> Int {
 // pin through here, so a position cannot fill a binder another position leaves open.
 fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_pin_tail_ret_generic(declared_tid, val_tid)
-    tc_literal_takes(val, declared_tid)
-    let k = node_kind(val)
-    if k == NodeKind.Block {
-        tc_pin_declared_into_tail(declared_tid, val)
-        return
-    }
-    if k == NodeKind.IfExpr {
-        let en = node_else_body(val)
-        if en == -1 { return }
-        tc_pin_declared_into_tail(declared_tid, node_then_body(val))
-        tc_pin_declared_into_tail(declared_tid, en)
-        return
-    }
-    if k == NodeKind.MatchExpr {
-        let arms = node_arms(val)
-        if arms == -1 { return }
-        let mut i = 0
-        while i < sublist_length(arms) {
-            tc_pin_declared_into_tail(declared_tid, node_body(sublist_get(arms, i)))
-            i = i + 1
+    let parts = tc_expected_parts(val, declared_tid)
+    if parts.len() > 0 {
+        for p in parts {
+            tc_pin_declared_into_value(p.expected, p.value, tc_pin_tail_tid(p.value))
         }
         return
     }
+    let k = node_kind(val)
     let d = resolve_alias_tid(tc_resolve(declared_tid))
     if tc_tid_is_no_info(d) != 0 { return }
-    if k == NodeKind.TupleLit {
-        let elems = node_elements(val)
-        if elems == -1 || tc_tid_kind(d) != TyKind.Tuple || tc_tid_child_count(d) != sublist_length(elems) { return }
-        let mut i = 0
-        while i < sublist_length(elems) {
-            let e = sublist_get(elems, i)
-            tc_pin_declared_into_value(tc_tid_child(d, i), e, tc_pin_tail_tid(e))
-            i = i + 1
-        }
-        return
-    }
-    if k == NodeKind.ListLit {
-        let elems = node_elements(val)
-        if elems == -1 || tc_tid_kind(d) != TyKind.List { return }
-        let et = tc_tid_child(d, 0)
-        let mut i = 0
-        while i < sublist_length(elems) {
-            let e = sublist_get(elems, i)
-            // A spread's operand is a whole list, so it meets the list type, not the element.
-            if node_kind(e) == NodeKind.SpreadExpr {
-                let src = node_value(e)
-                if src != -1 { tc_pin_declared_into_value(d, src, tc_pin_tail_tid(src)) }
-            } else {
-                tc_pin_declared_into_value(et, e, tc_pin_tail_tid(e))
-            }
-            i = i + 1
-        }
-        return
-    }
-    // `a ?? b` is a match on `a` whose `Some` arm yields a's value and whose `None` arm is `b`
-    // (sections/03_types.md 3.2), so each arm meets the expected type of the whole.
-    if k == NodeKind.BinOp && node_op(val) == "??" {
-        tc_pin_declared_into_value(make_option_type(d), node_left(val), tc_pin_tail_tid(node_left(val)))
-        tc_pin_declared_into_value(d, node_right(val), tc_pin_tail_tid(node_right(val)))
-        return
-    }
     // `a?` is a match on `a` whose `Ok`/`Some` arm yields the value, so the expected type is
     // that slot of the operand's carrier. The error slot stays the operand's own.
     if k == NodeKind.UnaryOp && node_op(val) == "?" {
@@ -5376,13 +5325,6 @@ fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeC
         } else if tc_tid_kind(ot) == TyKind.Option {
             tc_pin_declared_into_value(make_option_type(d), opnd, ot)
         }
-        return
-    }
-    // `Some(x)`, `Ok(x)` and `Err(x)` build the expected carrier, so x meets its slot.
-    let slot = tc_carrier_slot_built_by_call(val, d)
-    if slot >= 0 {
-        let x = sublist_get(node_args(val), 0)
-        tc_pin_declared_into_value(tc_tid_child(d, slot), x, tc_pin_tail_tid(x))
         return
     }
     // A variant call's payloads are its fields, so each meets its field type at the instance
@@ -5418,6 +5360,92 @@ fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeC
             i = i + 1
         }
     }
+}
+
+// A value position inside a value, with the type expected there.
+type ExpectedPart {
+    value: Int
+    expected: Int
+}
+
+// The positions of `val` that its own expected type reaches, each with the type expected
+// there (sections/03_types.md *Expected type at a site*): each tail of a block, an if or a
+// match; each element of a list or tuple literal; both arms of `??`; the payload of
+// `Some`/`Ok`/`Err`. Read from the syntax alone, so the walk before inference
+// (tc_seed_expected_into_value) and the walk after it (tc_pin_declared_into_value) descend
+// the same positions. Empty when `val` has none.
+fn tc_expected_parts(val: Int, expected: Int) -> List[ExpectedPart] {
+    let mut parts: List[ExpectedPart] = []
+    let k = node_kind(val)
+    if k == NodeKind.Block {
+        tc_push_tail_part(parts, val, expected)
+        return parts
+    }
+    if k == NodeKind.IfExpr {
+        // An `if` with no else branch is a statement and yields no value.
+        if node_else_body(val) == -1 { return parts }
+        tc_push_tail_part(parts, node_then_body(val), expected)
+        tc_push_tail_part(parts, node_else_body(val), expected)
+        return parts
+    }
+    if k == NodeKind.MatchExpr {
+        let arms = node_arms(val)
+        if arms == -1 { return parts }
+        let mut i = 0
+        while i < sublist_length(arms) {
+            tc_push_tail_part(parts, node_body(sublist_get(arms, i)), expected)
+            i = i + 1
+        }
+        return parts
+    }
+    let d = resolve_alias_tid(tc_resolve(expected))
+    if tc_tid_is_no_info(d) != 0 { return parts }
+    if k == NodeKind.TupleLit {
+        let elems = node_elements(val)
+        if elems == -1 || tc_tid_kind(d) != TyKind.Tuple || tc_tid_child_count(d) != sublist_length(elems) { return parts }
+        let mut i = 0
+        while i < sublist_length(elems) {
+            parts.push(ExpectedPart { value: sublist_get(elems, i), expected: tc_tid_child(d, i) })
+            i = i + 1
+        }
+        return parts
+    }
+    if k == NodeKind.ListLit {
+        let elems = node_elements(val)
+        if elems == -1 || tc_tid_kind(d) != TyKind.List { return parts }
+        let et = tc_tid_child(d, 0)
+        let mut i = 0
+        while i < sublist_length(elems) {
+            let e = sublist_get(elems, i)
+            // A spread's operand is a whole list, so it meets the list type, not the element.
+            if node_kind(e) == NodeKind.SpreadExpr {
+                let src = node_value(e)
+                if src != -1 { parts.push(ExpectedPart { value: src, expected: d }) }
+            } else {
+                parts.push(ExpectedPart { value: e, expected: et })
+            }
+            i = i + 1
+        }
+        return parts
+    }
+    // `a ?? b` is a match on `a` whose `Some` arm yields a's value and whose `None` arm is `b`
+    // (sections/03_types.md 3.2), so each arm meets the expected type of the whole.
+    if k == NodeKind.BinOp && node_op(val) == "??" {
+        parts.push(ExpectedPart { value: node_left(val), expected: make_option_type(d) })
+        parts.push(ExpectedPart { value: node_right(val), expected: d })
+        return parts
+    }
+    // `Some(x)`, `Ok(x)` and `Err(x)` build the expected carrier, so x meets its slot.
+    let slot = tc_carrier_slot_built_by_call(val, d)
+    if slot >= 0 {
+        parts.push(ExpectedPart { value: sublist_get(node_args(val), 0), expected: tc_tid_child(d, slot) })
+    }
+    parts
+}
+
+fn tc_push_tail_part(parts: List[ExpectedPart], body: Int, expected: Int) {
+    let v = tc_arm_tail_value_node(body)
+    if v >= 0 { parts.push(ExpectedPart { value: v, expected: expected }) }
 }
 
 // The type of field `name` read at instance `d`: of variant `var_idx` when the literal builds
@@ -5478,25 +5506,31 @@ fn tc_variant_fields_typed_at(var_idx: Int, d: Int) -> Bool {
     tparams == -1 || sublist_length(tparams) == 0 || ty_pool.get(d).unwrap().params_count > 0
 }
 
-// The slot of carrier `d` that a bare `Some(x)`, `Ok(x)` or `Err(x)` call fills, or -1 when
-// `call` is not one. A user variant spelled like a carrier reaches its declaration instead.
+// The slot of carrier `d` that a `Some(x)`, `Ok(x)` or `Err(x)` call fills, bare or qualified
+// (`Option.Some(x)`), or -1 when `call` is not one. A user variant spelled like a carrier
+// reaches its declaration instead.
 fn tc_carrier_slot_built_by_call(call: Int, d: Int) -> Int {
-    if node_kind(call) != NodeKind.Call { return -1 }
-    let callee = node_left(call)
+    let k = node_kind(call)
+    if k != NodeKind.Call && k != NodeKind.MethodCall { return -1 }
     let args = node_args(call)
-    if callee == -1 || node_kind(callee) != NodeKind.Ident || args == -1 || sublist_length(args) != 1 { return -1 }
+    if args == -1 || sublist_length(args) != 1 { return -1 }
     if node_kind(sublist_get(args, 0)) == NodeKind.NamedArg { return -1 }
-    if tc_call_decl_node(call) >= 0 { return -1 }
-    let name = node_name(callee)
+    let mut name = ""
+    if k == NodeKind.MethodCall {
+        // Mirrors the MethodCall arm of infer_type_uncached: a qualifier that is a value is not
+        // the carrier's type.
+        let obj = node_obj(call)
+        if obj == -1 || node_kind(obj) != NodeKind.Ident || tc_tid_is_no_info(nr_get_type(node_name(obj))) == 0 { return -1 }
+        if tc_qualified_carrier(node_name(obj), node_method(call)).is_none() { return -1 }
+        name = node_method(call)
+    } else {
+        let callee = node_left(call)
+        if callee == -1 || node_kind(callee) != NodeKind.Ident || tc_call_decl_node(call) >= 0 { return -1 }
+        name = node_name(callee)
+    }
     let carrier = tc_prelude_carrier_of(name) ?? TyKind.Unknown
     if carrier == TyKind.Unknown || carrier != tc_tid_kind(d) { return -1 }
     if name == "Err" { 1 } else { 0 }
-}
-
-fn tc_pin_declared_into_tail(declared_tid: Int, body: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let v = tc_arm_tail_value_node(body)
-    if v < 0 { return }
-    tc_pin_declared_into_value(declared_tid, v, tc_pin_tail_tid(v))
 }
 
 // The tid the checked walk recorded for a tail inside a value. A fresh infer_type would mint
@@ -5712,10 +5746,32 @@ fn is_int_literal_node(node: Int) -> Int {
 // stamped, it would be truncated to the narrow type in C before the operation could panic.
 fn tc_literal_takes(node: Int, tid: Int) {
     if node == -1 || is_int_literal_node(node) == 0 { return }
-    let t = tc_resolve(resolve_alias_tid(tid))
-    if is_integer_type(t) == 0 || !tc_literal_fits(node, type_kind(t)) { return }
+    let mut t = tc_resolve(resolve_alias_tid(tid))
+    if is_integer_type(t) == 0 { return }
+    // A literal out of range for its expected type stays Int, even if an earlier expected type
+    // gave it one it fits.
+    if !tc_literal_fits(node, type_kind(t)) { t = TYPE_INT }
     tc_publish_node_tid(node, t)
     if node_kind(node) == NodeKind.UnaryOp { tc_publish_node_tid(node_left(node), t) }
+}
+
+// The type inference gives an int literal: the one the expected type at it published, or Int.
+fn tc_int_literal_type(node: Int) -> Int {
+    let t = tc_lookup_node_tid(node)
+    if t >= 0 && is_integer_type(t) != 0 { return t }
+    TYPE_INT
+}
+
+// An int literal operand beside an operand that is not one takes the other's integer type, on
+// either side (sections/03_types.md *Operator operands*). The other operand's type is known
+// only once it is inferred, so this runs after both operands are, and it overrides a type an
+// expected type gave the literal before: in `let x: U64 = n + 1` with `n: Int`, the `1` is
+// Int, and the let reports Int. Whether `lit` took `other_t`.
+fn tc_literal_takes_operand(lit: Int, other: Int, other_t: Int) -> Bool {
+    if is_int_literal_node(lit) == 0 || is_int_literal_node(other) != 0 { return false }
+    if tc_tid_is_no_info(other_t) != 0 || is_integer_type(resolve_alias_tid(tc_resolve(other_t))) == 0 { return false }
+    tc_literal_takes(lit, other_t)
+    true
 }
 
 fn tc_literal_fits(node: Int, k: TyKind) -> Bool {
@@ -6334,6 +6390,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
 @allow(UnrestoredMutation)
 fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_tid_is_no_info(expected_t) != 0 { return }
+    tc_seed_expected_into_value(value_node, expected_t)
     let saved_hint = tc_construct_hint
     tc_construct_hint = resolve_alias_tid(expected_t)
     let arg_t = infer_type(value_node)
@@ -7419,80 +7476,42 @@ fn tc_check_closure_ann_against_declared(cls: Int, declared_fn: Int) ! TypeCheck
 }
 
 // Carry a declared type along the path the VALUE takes to reach the position that declared
-// it, and hand it to the closure that finally sits there.
+// it, and hand it to the int literal or the closure that finally sits there. This runs before
+// the value is inferred, so a literal's type and a closure's signature are known when
+// inference reaches them (sections/03_types.md *Integer literal range*: the literal gets its
+// type at the literal).
 //
-// A closure is not always written where the declaration is written. An `if` used as a value
-// produces its answer from a branch tail, and a List literal produces its element type from
-// its elements, so `let f: fn(Int) -> Int = if p { fn(a) { .. } } else { .. }` declares the
-// type of each tail, not of the `if`. The expectation stopped at the `if` or at the `[`, the
-// closure one level in had nothing to read, and its parameters were reported as
-// under-determined even though the program spelled them out.
+// A literal or a closure is not always written where the declaration is written. An `if` used
+// as a value produces its answer from a branch tail, and a List literal produces its element
+// type from its elements, so `let f: fn(Int) -> Int = if p { fn(a) { .. } } else { .. }`
+// declares the type of each tail, not of the `if`. tc_expected_parts names those positions,
+// and an arithmetic or bitwise operator adds its operands (*Operator operands*).
 //
-// Descent only: the leaf is still the one publisher, so a position this does not understand
-// behaves exactly as it did before, and a branch holding anything but a closure is untouched.
+// Descent only: the leaves are the publishers, so a position this does not understand
+// behaves exactly as it did before, and a value that is neither a literal nor a closure is
+// untouched.
 fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_seed_expected_into_value_at(val, expected, 0)
-}
-
-fn tc_seed_expected_into_value_at(val: Int, expected: Int, depth: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if dbg_channel_on("seedv") != 0 {
-        dbg_trace("seedv", "enter val={val} kind={if val >= 0 { node_kind_name(node_kind(val)) } else { "<none>" }} expected={expected} depth={depth}")
+        dbg_trace("seedv", "enter val={val} kind={if val >= 0 { node_kind_name(node_kind(val)) } else { "<none>" }} expected={expected}")
     }
     if val == -1 || expected < 0 { return }
-    // Nesting this deep is not a shape a declaration can still describe; the cap keeps the
-    // descent finite without depending on the tree being well formed.
-    if depth > 8 { return }
     let mut v = val
     if node_kind(v) == NodeKind.NamedArg { v = node_value(v) }
     if v == -1 { return }
-    let k = node_kind(v)
-    if k == NodeKind.Block {
-        let tail = tc_block_tail_stmt(v)
-        if tail == -1 { return }
-        tc_seed_expected_into_value_at(tc_block_tail_value(tail), expected, depth + 1)
-        return
+    tc_literal_takes(v, expected)
+    for p in tc_expected_parts(v, expected) {
+        tc_seed_expected_into_value(p.value, p.expected)
     }
-    if k == NodeKind.IfExpr {
-        // Both tails answer to the same declaration, and an `if` used as a statement has no
-        // else branch, which the -1 guard at the top of this function absorbs.
-        tc_seed_expected_into_value_at(node_then_body(v), expected, depth + 1)
-        tc_seed_expected_into_value_at(node_else_body(v), expected, depth + 1)
-        return
-    }
-    // Every arm answers to the same declaration, exactly as both tails of an `if` do.
-    //
-    // The two arm spellings reach the value differently. A braced arm body is a Block, whose
-    // tail this function already understands. A braceless arm body is an ExprStmt wrapping the
-    // expression, and that wrapper is the whole reason the expectation used to stop here: the
-    // descent read the wrapper as the value, found no closure, and published nothing.
-    if k == NodeKind.MatchExpr {
-        let arms_sl = node_arms(v)
-        if arms_sl == -1 { return }
-        let n = sublist_length(arms_sl)
-        let mut i = 0
-        while i < n {
-            let b = node_body(sublist_get(arms_sl, i))
-            if b != -1 {
-                let inner = if node_kind(b) == NodeKind.ExprStmt { node_value(b) } else { b }
-                tc_seed_expected_into_value_at(inner, expected, depth + 1)
-            }
-            i = i + 1
-        }
-        return
-    }
-    if k == NodeKind.ListLit {
-        let r = tc_tid_resolved(expected)
-        if r < 0 || r >= ty_pool.len() { return }
-        if ty_pool.get(r).unwrap().kind != TyKind.List { return }
-        let elem = ty_pool.get(r).unwrap().inner1
-        if elem < 0 { return }
-        let elems_sl = node_elements(v)
-        if elems_sl == -1 { return }
-        let n = sublist_length(elems_sl)
-        let mut i = 0
-        while i < n {
-            tc_seed_expected_into_value_at(sublist_get(elems_sl, i), elem, depth + 1)
-            i = i + 1
+    if node_kind(v) == NodeKind.BinOp {
+        let op = node_op(v)
+        if is_integer_type(resolve_alias_tid(tc_resolve(expected))) == 0 { return }
+        // `T`x`T`->`T` gives both operands the expected `T`. A shift's amount is U32 whatever
+        // the expected type, which the BinOp arm of infer_type_uncached publishes.
+        if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^" {
+            tc_seed_expected_into_value(node_left(v), expected)
+            tc_seed_expected_into_value(node_right(v), expected)
+        } else if op == "<<" || op == ">>" {
+            tc_seed_expected_into_value(node_left(v), expected)
         }
         return
     }
@@ -9649,7 +9668,10 @@ fn tc_infer_struct_lit_field_values(stid: Int, node: Int) ! TypeCheck.Resolve, T
         let f = sublist_get(flds_sl, fi)
         let declared = get_struct_field_tid(stid, node_name(f))
         let saved_hint = tc_construct_hint
-        if tc_tid_is_no_info(declared) == 0 { tc_construct_hint = resolve_alias_tid(declared) }
+        if tc_tid_is_no_info(declared) == 0 {
+            tc_seed_expected_into_value(node_value(f), declared)
+            tc_construct_hint = resolve_alias_tid(declared)
+        }
         let vt = infer_type(node_value(f))
         tc_construct_hint = saved_hint
         if tc_tid_is_no_info(declared) == 0 {
@@ -9712,6 +9734,15 @@ fn tc_check_struct_lit_fn_field(v: Int, declared: Int) ! TypeCheck.Resolve, Type
     if node_kind(v) != NodeKind.Closure { return }
     tc_seed_closure_expected_fn(v, declared)
     check_closure_body(v, declared)
+}
+
+// A field value meets its declared field type (sections/03_types.md *Expected type at a site*,
+// item 5). A field declared with the type's own parameter gives no expected type, as a
+// parameter declared with the callee's does (item 4), even when an annotation fixes the
+// parameter at `at_inst`.
+fn tc_seed_declared_field(declared: Int, at_inst: Int, value_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_tid_has_bare_typevar(declared) != 0 { return }
+    tc_seed_expected_into_value(value_node, at_inst)
 }
 
 // A field value inferred under the field's OWN type rather than under the whole literal's.
@@ -9791,6 +9822,7 @@ fn tc_bind_struct_lit_fields(stid: Int, bare: Str, flds_sl: Int, tparams_sl: Int
             // declared type, which is the one carrying the parameters a sibling field or a
             // spread may yet determine.
             let at_inst = tc_field_target_hint(bare, declared)
+            tc_seed_declared_field(declared, at_inst, node_value(f))
             let ftid = tc_infer_field_value_under(at_inst, node_value(f))
             // A field type still naming the struct's own parameter is only half solved, so the
             // walk must not carry it into the value's tails and pin each arm from it. A value
@@ -18607,8 +18639,9 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
         let f = sublist_get(flds_sl, fi)
         let declared = lookup_evfield_type_by_name(var_idx, node_name(f))
         if declared != -1 {
-            let ebare = tc_instance_base_name(enum_tid)
-            let ftid = tc_infer_field_value_under(tc_field_target_hint(ebare, declared), node_value(f))
+            let at_inst = tc_field_target_hint(tc_instance_base_name(enum_tid), declared)
+            tc_seed_declared_field(declared, at_inst, node_value(f))
+            let ftid = tc_infer_field_value_under(at_inst, node_value(f))
             unify_typevar_binds(declared, ftid, binds)
         } else {
             // A field name the variant does not declare is still an expression that must carry
@@ -22855,11 +22888,9 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
     // (03_types.md:1093) and untyped-int-literal coercion to a sized int.
     if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
         if cmp_is_enum_int_pair(lt, rt) == 0 {
-            let lit_r = is_sized_int(type_kind(lt)) != 0 && rt == TYPE_INT && is_int_literal_node(node_right(node)) != 0
-            let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
-            if lit_r { tc_literal_takes(node_right(node), lt) }
-            if lit_l { tc_literal_takes(node_left(node), rt) }
-            if lit_r == 0 && lit_l == 0 {
+            let lit_r = tc_literal_takes_operand(node_right(node), node_left(node), lt)
+            let lit_l = !lit_r && tc_literal_takes_operand(node_left(node), node_right(node), rt)
+            if !lit_r && !lit_l {
                 let relational = if op == "==" || op == "!=" { 0 } else { 1 }
                 let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { reject_ord_less_operands(lt, rt, node) }
                 if refused == 0 && cmp_operands_ok(lt, rt, relational) == 0 {
@@ -23080,6 +23111,7 @@ fn tc_infer_coalesce(node: Int, lt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.R
     let inner = ty_pool.get(opt).unwrap().inner1
     let saved_hint = tc_construct_hint
     if inner >= 0 && tc_tid_is_no_info(inner) == 0 && tc_tid_has_unbound_metavar(inner) == 0 {
+        tc_seed_expected_into_value(node_right(node), inner)
         tc_construct_hint = resolve_alias_tid(inner)
     }
     let rt = infer_type(node_right(node))
@@ -23779,7 +23811,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     let incoming = tc_if_value_ctx
     tc_if_value_ctx = 1
 
-    if kind == NodeKind.IntLit { return TYPE_INT }
+    if kind == NodeKind.IntLit { return tc_int_literal_type(node) }
     if kind == NodeKind.FloatLit { return TYPE_FLOAT }
     if kind == NodeKind.BoolLit { return TYPE_BOOL }
     if kind == NodeKind.CharLit { return TYPE_CHAR }
@@ -23927,6 +23959,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // left side's element type, and it has to be in hand the FIRST time the fallback is
         // typed, not after.
         if op == "??" { return tc_infer_coalesce(node, lt) }
+        // A shift's amount is U32 (sections/03_types.md *Operator operands*).
+        if op == "<<" || op == ">>" { tc_literal_takes(node_right(node), TYPE_U32) }
         let rt = infer_type(node_right(node))
 
         if op == "&&" || op == "||" {
@@ -23954,21 +23988,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if type_kind(resolve_alias_tid(lt)) != TyKind.Typevar || type_to_str(lt) != "Self" {
                 reject_non_numeric_arith_operand(op, rt, node, 0)
             }
-            // A bare int literal takes its type from the surrounding expression
-            // (spec sections/03_types.md:874), so `a * 2` with `a: I32` treats
-            // `2` as I32 and yields I32 — not a rejected `I32 * Int`. Coerce a
-            // literal operand toward the other side's sized-int type, on either
-            // side. The sized result then chains through nested ops.
-            let lit_to_sized_r = is_sized_int(type_kind(lt)) && rt == TYPE_INT && is_int_literal_node(node_right(node))
-            let lit_to_sized_l = is_sized_int(type_kind(rt)) && lt == TYPE_INT && is_int_literal_node(node_left(node))
-            if lit_to_sized_r {
-                tc_literal_takes(node_right(node), lt)
-                return lt
-            }
-            if lit_to_sized_l {
-                tc_literal_takes(node_left(node), rt)
-                return rt
-            }
+            if tc_literal_takes_operand(node_right(node), node_left(node), lt) { return lt }
+            if tc_literal_takes_operand(node_left(node), node_right(node), rt) { return rt }
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
                 if types_compatible(lt, rt) == 0 {
                     tc_error_at("binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
@@ -23984,6 +24005,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_tid_is_no_info(rt) == 0 && is_integer_type(rt) == 0 {
                 tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(rt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, rt))
             }
+            if tc_literal_takes_operand(node_right(node), node_left(node), lt) { return lt }
+            if tc_literal_takes_operand(node_left(node), node_right(node), rt) { return rt }
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 && types_compatible(lt, rt) == 0 {
                 tc_error_at("bitwise `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
             }

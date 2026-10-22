@@ -1,0 +1,455 @@
+// An integer literal gets its type at the literal: the expected type at that point, or Int
+// when there is none (sections/03_types.md §3.2 *Integer literal range*). The expected type
+// reaches each position in §3.4 *Expected type at a site*, each branch of an `if`, each arm of
+// a `match` and the tail of a block, and the operands of an operator as *Operator operands*
+// says. A literal that no expected type reaches stays Int, and an unsolved type variable
+// becomes Int. A value that is not a literal never changes its type.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/int_literal_takes_the_expected_type"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+// Runs a program and compares what it prints, line for line.
+fn expect_run(name: Str, src: Str, want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("run {name}.bl")
+    if r.exit_code != 0 { return "{name}: want exit 0, got {r.exit_code}:\n{r.err_out}" }
+    if r.out != lines(want) { return "{name}: want output\n{lines(want)}got\n{r.out}" }
+    ""
+}
+
+// Checks a program that must fail, and that each wanted text is in its report.
+fn expect_errors(name: Str, src: Str, count: Int, want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("check {name}.bl")
+    if r.exit_code == 0 { return "{name}: want a failed check, got exit 0" }
+    let mut problems: List[Str] = []
+    if !r.err_out.contains("{count} error(s) found") { problems.push("{name}: want {count} error(s):\n{r.err_out}") }
+    for w in want {
+        if !r.err_out.contains(w) { problems.push("{name}: want `{w}` in:\n{r.err_out}") }
+    }
+    problems.join("\n")
+}
+
+fn report(problems: List[Str]) {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "the five reported forms take the expected type" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("bitwise_and", #"fn main() {
+    let v: U32 = 7
+    let a = v & 3
+    io.println("{a}")
+}
+"#, ["3"]),
+        expect_run("list_of_i32", #"fn main() {
+    let xs: List[I32] = [1, 2, 3]
+    io.println("{xs.len()}")
+}
+"#, ["3"]),
+        expect_run("some_of_u64", #"fn main() {
+    let o: Option[U64] = Some(5)
+    io.println("{o ?? 0}")
+}
+"#, ["5"]),
+        expect_run("if_tail_u64", #"fn main() {
+    let c = true
+    let x: U64 = if c { 5 } else { 0 }
+    io.println("{x}")
+}
+"#, ["5"]),
+        expect_run("closure_return_i32", #"fn i32v() -> I32 { 7 }
+fn main() {
+    let f = fn(n: Int) -> I32 { 7 }
+    io.println("{f(1)} {i32v()}")
+}
+"#, ["7 7"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "a literal operand takes the other operand's type, on either side" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("bitwise_either_side", #"fn main() {
+    let v: U32 = 7
+    let s: I16 = -8
+    let m: U64 = 18446744073709551615
+    let a = 12 | v
+    let b = v ^ 1
+    let c = s & 255
+    let d = m & 9223372036854775808
+    let e = 9223372036854775808 | m
+    io.println("{a} {b} {c} {d} {e}")
+}
+"#, ["15 6 248 9223372036854775808 18446744073709551615"]),
+        expect_run("arith_either_side", #"fn main() {
+    let v: U64 = 9223372036854775807
+    let s: I8 = 100
+    let a = v + 1
+    let b = 27 + s
+    io.println("{a} {b}")
+}
+"#, ["9223372036854775808 127"]),
+        expect_run("compare_either_side", #"fn main() {
+    let v: U64 = 9223372036854775808
+    let s: I8 = -5
+    io.println("{v == 9223372036854775808} {-5 == s}")
+}
+"#, ["true true"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "an expected integer type reaches both operands of arithmetic and bitwise operators" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("both_literals", #"fn main() {
+    let s: U64 = 1 + 2
+    let big: U64 = 9223372036854775807 + 1
+    let t: I8 = 100 + 27
+    let m: U64 = 9223372036854775808 | 1
+    let n: I32 = (2 * 3) - 1
+    io.println("{s} {big} {t} {m} {n}")
+}
+"#, ["3 9223372036854775808 127 9223372036854775809 5"]),
+        expect_run("shift_operands", #"fn main() {
+    let top: U64 = 1 << 63
+    let s: I32 = 1 << 30
+    let n: U32 = 3
+    let y: U8 = 1 << n
+    let z: U64 = 9223372036854775808 >> 62
+    io.println("{top} {s} {y} {z}")
+}
+"#, ["9223372036854775808 1073741824 8 2"]),
+        expect_run("negative_literal_operand", #"fn main() {
+    let a: I8 = -100 - 28
+    let b: I32 = -2147483647 - 1
+    io.println("{a} {b}")
+}
+"#, ["-128 -2147483648"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "an expected type reaches block, if and match tails and return values" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("tails", #"fn main() {
+    let c = true
+    let k = 2
+    let a: U64 = if c { 9223372036854775808 } else { 0 }
+    let b: I32 = if c { -7 } else { 0 }
+    let d: U64 = match k {
+        1 => 5
+        _ => 9223372036854775809
+    }
+    let e: I16 = match k {
+        1 => { 5 }
+        _ => -300
+    }
+    let f: U64 = { 9223372036854775810 }
+    let g: U8 = { if c { { 255 } } else { 0 } }
+    io.println("{a} {b} {d} {e} {f} {g}")
+}
+"#, ["9223372036854775808 -7 9223372036854775809 -300 9223372036854775810 255"]),
+        expect_run("returns", #"fn u64_tail() -> U64 { 9223372036854775808 }
+fn u64_ret(c: Bool) -> U64 {
+    if c { return 9223372036854775809 }
+    1
+}
+fn i8_if(c: Bool) -> I8 { if c { -128 } else { 127 } }
+fn main() {
+    let f = fn(n: Int) -> U64 { 9223372036854775810 }
+    let g = fn(n: Int) -> I16 {
+        if n > 0 { return -2 }
+        3
+    }
+    io.println("{u64_tail()} {u64_ret(true)} {i8_if(true)} {f(0)} {g(1)}")
+}
+"#, ["9223372036854775808 9223372036854775809 -128 9223372036854775810 -2"]),
+        expect_run("assignment", #"fn main() {
+    let c = true
+    let mut x: U64 = 0
+    x = if c { 9223372036854775808 } else { 1 }
+    let mut y: I8 = 0
+    y = { -128 }
+    io.println("{x} {y}")
+}
+"#, ["9223372036854775808 -128"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "an expected type reaches list and tuple elements and Some, Ok and Err payloads" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("lists", #"fn count_u8(xs: List[U8]) -> Int { xs.len() }
+fn first_i16(xs: List[I16]) -> I16 { xs.get(0) ?? 0 }
+fn main() {
+    let xs: List[U8] = [1, 255]
+    let ys: List[I8] = [-128, 127]
+    let zs: List[U64] = [9223372036854775808, 1]
+    io.println("{xs.len()} {ys.get(0) ?? 0} {zs.get(0) ?? 0} {count_u8([3])} {first_i16([-300])}")
+}
+"#, ["2 -128 9223372036854775808 1 -300"]),
+        expect_run("tuples", #"fn main() {
+    let t: (U8, I32) = (255, -7)
+    let u: (U64, Int) = (9223372036854775808, 1)
+    io.println("{t.0} {t.1} {u.0} {u.1}")
+}
+"#, ["255 -7 9223372036854775808 1"]),
+        expect_run("carriers", #"fn half(n: U64) -> Option[U64] {
+    if n == 0 { return None }
+    Some(9223372036854775808)
+}
+fn main() {
+    let o: Option[U64] = Some(9223372036854775808)
+    let p: Option[I8] = Some(-128)
+    let q: Option[U64] = Option.Some(9223372036854775809)
+    let r: Result[U64, I32] = Ok(9223372036854775808)
+    let e: Result[U64, I32] = Err(-3)
+    let rv: U64 = match r {
+        Ok(v) => v
+        Err(_) => 0
+    }
+    let ev: I32 = match e {
+        Ok(_) => 0
+        Err(x) => x
+    }
+    io.println("{o ?? 0} {p ?? 0} {q ?? 0} {rv} {ev} {half(1) ?? 0}")
+}
+"#, ["9223372036854775808 -128 9223372036854775809 9223372036854775808 -3 9223372036854775808"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "an expected type reaches field values, variant payloads, arguments and the default of ??" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("fields_and_payloads", #"type P { a: U8, b: U64, c: I32 }
+type W { A(U64), B(I32) }
+fn w_val(w: W) -> Str {
+    match w {
+        W.A(n) => "{n}"
+        W.B(n) => "{n}"
+    }
+}
+fn main() {
+    let c = true
+    let p = P { a: if c { 255 } else { 0 }, b: { 9223372036854775808 }, c: if c { -5 } else { 0 } }
+    let a = W.A(if c { 9223372036854775808 } else { 1 })
+    let b = W.B({ -9 })
+    io.println("{p.a} {p.b} {p.c} {w_val(a)} {w_val(b)}")
+}
+"#, ["255 9223372036854775808 -5 9223372036854775808 -9"]),
+        expect_run("arguments", #"fn takes_u64(n: U64) -> U64 { n }
+fn takes_i8(n: I8) -> I8 { n }
+fn pair[T](a: T, b: T) -> T { b }
+fn main() {
+    let c = true
+    let v: U64 = 1
+    let mut xs: List[U8] = []
+    xs.push(if c { 255 } else { 0 })
+    let i = takes_i8({ -128 })
+    io.println("{takes_u64(if c { 9223372036854775808 } else { 0 })} {i} {xs.get(0) ?? 0} {pair[U64](v, 9223372036854775808)}")
+}
+"#, ["9223372036854775808 -128 255 9223372036854775808"]),
+        expect_run("coalesce_default", #"fn main() {
+    let o: Option[U64] = None
+    let p: Option[I8] = None
+    let c = true
+    let a = o ?? 9223372036854775808
+    let b = p ?? -128
+    let d = o ?? (if c { 9223372036854775809 } else { 0 })
+    io.println("{a} {b} {d}")
+}
+"#, ["9223372036854775808 -128 9223372036854775809"]),
+        expect_run("globals_and_field_defaults", #"let G: List[U8] = [1, 255]
+let H: U64 = if true { 9223372036854775808 } else { 0 }
+type Q { xs: List[U64] = [9223372036854775808], n: I8 = -128 }
+fn main() {
+    let q = Q {}
+    io.println("{G.get(1) ?? 0} {H} {q.xs.get(0) ?? 0} {q.n}")
+}
+"#, ["255 9223372036854775808 9223372036854775808 -128"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "the expected type reaches a literal through nested positions" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("nested", #"fn main() {
+    let c = true
+    let xs: List[U64] = [{ if c { 9223372036854775808 } else { 1 } }]
+    let o: Option[(U8, I32)] = Some((255, -2))
+    let ys: List[Option[U64]] = [Some(9223372036854775808), None]
+    let t: (List[I8], U64) = ([-128], { 1 << 63 })
+    let r: Result[List[U16], I8] = if c { Ok([65535]) } else { Err(-1) }
+    let (oa, ob) = o ?? (0, 0)
+    let rl: U16 = match r {
+        Ok(l) => l.get(0) ?? 0
+        Err(_) => 0
+    }
+    io.println("{xs.get(0) ?? 0} {oa} {ob} {ys.get(0) ?? None ?? 0} {t.0.get(0) ?? 0} {t.1} {rl}")
+}
+"#, ["9223372036854775808 255 -2 9223372036854775808 -128 9223372036854775808 65535"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "a literal that no expected type reaches stays Int" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("no_expected_type", #"fn id[T](x: T) -> T { x }
+fn main() {
+    let n = 5
+    let xs = [1, 2]
+    let o = Some(3)
+    let t = (1, 2)
+    let s = id(3)
+    let mut zs = []
+    zs.push(4)
+    let a: Int = n
+    let b: List[Int] = xs
+    let c: Option[Int] = o
+    let d: (Int, Int) = t
+    let e: Int = s
+    let f: List[Int] = zs
+    io.println("{a} {b.len()} {c ?? 0} {d.0} {e} {f.len()}")
+}
+"#, ["5 2 3 1 3 1"]),
+        expect_run("not_a_tail", #"fn main() {
+    let k = 5
+    let x: U8 = {
+        let a = 300
+        let b: Int = a
+        if k == 300 { 1 } else { 2 }
+    }
+    let y: U64 = if k > 1000000 { 1 } else { 2 }
+    io.println("{x} {y}")
+}
+"#, ["2 2"]),
+    ])
+    report([
+        expect_errors("unsolved_var", #"fn id[T](x: T) -> T { x }
+fn main() {
+    let s: U8 = id(3)
+    io.println("{s}")
+}
+"#, 1, ["variable `s`: declared type U8 but got Int"]),
+        // A payload whose declared type is the variant's type parameter has no expected type
+        // (sections/03_types.md *Expected type at a site*, item 4), so the literal is Int.
+        expect_errors("type_param_payload", #"type Box[T] { Val(T), Empty }
+fn main() {
+    let x: Box[U8] = Box.Val(5)
+    match x {
+        Box.Val(n) => io.println("{n}")
+        Box.Empty => io.println("empty")
+    }
+}
+"#, 1, ["variable `x`: declared type Box[U8] but got Box[Int]"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "a value that is not a literal is not coerced" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors("non_literal_bitwise", #"fn main() {
+    let v: U32 = 7
+    let n: Int = 3
+    let a = v & n
+    io.println("{a}")
+}
+"#, 1, ["bitwise `&`: incompatible types U32 and Int"]),
+        expect_errors("non_literal_operand_under_expected", #"fn main() {
+    let n: Int = 3
+    let x: U64 = n + 1
+    io.println("{x}")
+}
+"#, 1, ["variable `x`: declared type U64 but got Int"]),
+        expect_errors("non_literal_tail", #"fn main() {
+    let n: Int = 3
+    let c = true
+    let x: U64 = if c { n } else { 0 }
+    io.println("{x}")
+}
+"#, 2, ["if branches have incompatible types: Int vs U64", "variable `x`: declared type U64 but got Int"]),
+        expect_errors("int_literal_is_no_float", #"fn main() {
+    let xs: List[Float] = [1, 2]
+    io.println("{xs.len()}")
+}
+"#, 1, ["variable `xs`: declared type List[Float] but got List[Int]"]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "blink check, a per-module build and a one-unit build agree on literal types" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/same.bl", #"fn main() {
+    let c = true
+    let v: U32 = 7
+    let xs: List[U64] = [{ if c { 9223372036854775808 } else { 1 } }]
+    let o: Option[U64] = Some(9223372036854775809)
+    let top: U64 = 1 << 63
+    io.println("{v & 3} {xs.get(0) ?? 0} {o ?? 0} {top}")
+}
+"#)
+    let check = blink_in_dir("check same.bl")
+    let per_module = blink_in_dir("build -o same_pm same.bl")
+    let one_unit = blink_in_dir("build --no-per-module -o same_one same.bl")
+    let pm_out = sh("{DIR}/same_pm")
+    let one_out = sh("{DIR}/same_one")
+    write_file("{DIR}/bad.bl", #"fn main() {
+    let v: U32 = 7
+    let n: Int = 3
+    let x: U64 = n + 1
+    io.println("{v & n} {x}")
+}
+"#)
+    let bad_check = blink_in_dir("check bad.bl")
+    let bad_pm = blink_in_dir("build bad.bl")
+    let bad_one = blink_in_dir("build --no-per-module bad.bl")
+    let _ = sh("rm -rf {DIR}")
+    if check.exit_code != 0 { io.eprintln(check.err_out) }
+    assert(check.exit_code == 0)
+    assert(per_module.exit_code == 0)
+    assert(one_unit.exit_code == 0)
+    let want = "3 9223372036854775808 9223372036854775809 9223372036854775808\n"
+    if pm_out.out != want || one_out.out != want { io.eprintln("per-module:\n{pm_out.out}one unit:\n{one_out.out}") }
+    assert(pm_out.out == want)
+    assert(one_out.out == want)
+    assert(bad_check.exit_code != 0)
+    assert(bad_pm.exit_code != 0)
+    assert(bad_one.exit_code != 0)
+    let shown = bad_check.err_out.replace("error: check failed\n", "")
+    if shown != bad_pm.err_out || bad_pm.err_out != bad_one.err_out {
+        io.eprintln("check:\n{bad_check.err_out}\nbuild:\n{bad_pm.err_out}\none unit:\n{bad_one.err_out}")
+    }
+    assert(shown == bad_pm.err_out)
+    assert(bad_pm.err_out == bad_one.err_out)
+    assert(bad_check.err_out.contains("2 error(s) found"))
+}
