@@ -2003,18 +2003,23 @@ A `help:` line in a diagnostic writes the qualified form, because that form is t
 **Resolution order.** At a bare struct-style construction site `Name { ... }`, the compiler resolves `Name` in this order:
 
 1. **Qualified** — if the site is already written `Enum.Variant { ... }`, that names the variant directly.
-2. **Hint-directed** — the expected type at the site (a binding annotation, a function return type, a function parameter type, or a `Result`/`Option` carrier such as `Ok`/`Err`/`Some`) names an enum that has a variant `Name`. The hint is consulted *first* among the unqualified rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
-3. **Global-unique** — if no hint applies, `Name` resolves to the one enum variant of that name across the whole program. If the name is not globally unique, see the ambiguity rule below.
+2. **Struct in scope** — a struct type `Name` in scope at the site names that struct. The module declares the struct, or binds it by an import entry. A hint never moves resolution past a struct in scope.
+3. **Hint-directed** — the expected type at the site (a binding annotation, a function return type, a function parameter type, or a `Result`/`Option` carrier such as `Ok`/`Err`/`Some`) names an enum that has a variant `Name`. The hint is consulted *first* among the variant rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
+4. **Global-unique** — if no struct is in scope and no hint applies, `Name` resolves to the one enum variant of that name across the whole program. If the name is not globally unique, see the ambiguity rule below.
+
+This list governs `Name { ... }`. *Values come first* (below) governs `Name` and `Name(...)`. A struct has no bare form and no call form, so `Name` and `Name(...)` never find a struct. They follow *Values come first* with no change. The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
 
 Resolution is static. A bare name at a site denotes exactly one entity, and the compiler determines it statically.
 
-**Values come first.** Steps 2 and 3 above apply only when no value binding has the name. At a bare use of `Name`, in an expression or in a call `Name(...)`, the compiler looks in this order, and the first step that finds `Name` decides:
+**Values come first.** At a bare use of `Name`, the hint-directed and global-unique steps above apply only when no value binding has the name. This list governs a bare use of `Name`, in an expression or in a call `Name(...)`. The *Resolution order* list above governs `Name { ... }`. At a bare use, the compiler looks in this order, and the first step that finds `Name` decides:
 
 1. a local binding (a `let`, a parameter, a closure parameter or a pattern binder);
 2. a module-scope value: a `let`, `let mut`, `const` or `fn` of the module, or an imported value;
-3. a variant, by the three steps above.
+3. a variant, by the hint-directed and global-unique steps above.
 
-A hint never moves resolution past a binding. A value that step 2 finds is never a variant of the same package or of the prelude, because that pair is E1016 (§2.12.1). So step 2 can hide only a variant of a dependency enum. A local can hide any variant, and gets W1011 (§10.6 *Shadowing Rules*).
+A hint never moves resolution past a binding. A value that step 2 finds is never a variant of the same package or of the prelude, because that pair is E1016 (§2.12.1). This holds for an imported value too: an import entry that binds such a value is E1016 at the import entry. So step 2 can hide only a variant of a dependency enum. A local can hide any variant, and gets W1011 (§10.6 *Shadowing Rules*).
+
+A struct that the *Resolution order* struct step finds is never a variant of the same package or of the prelude either, because that pair is E0518 (*Name collisions*, below). So that step can hide only a variant of a dependency enum, and W1011 marks it.
 
 ```blink
 // package app; package pal declares `pub type Tone { Warm, Cool }`
@@ -2029,11 +2034,28 @@ fn main() {
 }
 ```
 
-When a value that hides a variant gives a type error at a site with a hint, the error gets a `help:` line that names the qualified variant, for example `Tone.Warm`. The help appears only when the hint names an enum that has a variant of that name.
+When a value that hides a variant gives a type error at a site with a hint, the error gets a `help:` line that names the qualified variant, for example `Tone.Warm`. The same holds when a struct in scope hides the variant at `Name { ... }`: the help names, for example, `Shape.Point { ... }`. The help appears only when the hint names an enum that has a variant of that name.
+
+A struct in scope can hide a dependency variant in the same way:
+
+```blink
+// package app; package geo declares `pub type Shape { Point { x: Int, y: Int }, Circle { r: Int } }`
+import geo.{Shape}
+
+type Point { x: Int, y: Int }     // warning[W1011]: struct `Point` hides variant `Shape.Point`
+
+fn main() {
+    let p = Point { x: 1, y: 2 }  // the struct `Point`
+    let s: Shape = Point { x: 1, y: 2 }
+                                  // error[TypeError]: declared type Shape but got Point
+                                  // help: write `Shape.Point { ... }` for the variant
+    let t: Shape = Shape.Point { x: 1, y: 2 }   // the qualified form always reaches the variant
+}
+```
 
 **Name collisions** fall into two distinct kinds:
 
-- **A struct name equal to an enum variant name** is a **compile error at declaration time** (`error[NameCollision]`), reported over the whole program (so it catches collisions across modules). A name is either a product type or a sum injection — never both. This rule is narrowly scoped to the struct-vs-variant case only; it does not require all constructible names to be globally unique.
+- **A struct name equal to an enum variant name** is a **compile error at declaration time** (`error[NameCollision]`, E0518). The reach is the package, not the module: a struct in one module and a variant of that name in another module of the package collide. The variants of a prelude enum count as declared in every module. A variant of a dependency enum never gives E0518. An import entry that binds a struct named like a variant of the package or of the prelude is also E0518, at the import entry. The fix is an alias: `import geo.{Point as GeoPoint}`. Within one package, a name is either a product type or a sum injection — never both. This rule is narrowly scoped to the struct-vs-variant case only; it does not require all constructible names to be globally unique.
 
 - **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Such a name is resolved by the hint:
 
@@ -2053,7 +2075,7 @@ When a value that hides a variant gives a type error at a site with a hint, the 
   }
   ```
 
-No path ever silently picks a winner between two constructible names: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint). A value that hides a variant is not such a collision. It is a shadow between scopes, by the order in *Values come first*, and W1011 marks it where §10.6 *Shadowing Rules* says.
+No path ever silently picks a winner between two constructible names: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint). A value that hides a variant is not such a collision. It is a shadow between scopes, by the order in *Values come first*, and W1011 marks it where §10.6 *Shadowing Rules* says. A struct that hides a dependency variant is a shadow in the same way, by the struct step in *Resolution order*, and W1011 marks it too.
 
 A bare struct-style construction with a payload in carrier position resolves through the carrier's expected type:
 

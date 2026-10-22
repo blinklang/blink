@@ -941,11 +941,14 @@ The primary span is on the later declaration in source order, and a label marks 
 
 The compiler reports this collision as E1016 too. The reach is the package, not the module: a `fn Leaf` in one module and a variant `Leaf` in another module of the package collide. Two enums that each have a variant `Pending` do not collide with each other (§3.4). The check does not cover a variant of a dependency enum. There, a bare use finds the module-scope value first (§3.4), and W1011 marks the value when an import entry names the variant's type (§10.6 *Shadowing Rules*). A local binding with a variant's name is legal, and gets W1011.
 
+An import entry that binds a value (a `let`, `const` or `fn` of another module) with the name of a variant of the package or of the prelude is E1016 at the import entry. It is not E1012: E1012 is for an import and a declaration of one name in one module. The fix is an item alias: `import pal.{Red as PalRed}`.
+
 ```blink
 // src/paint/colors.bl
 type Color { Red, Green }
 
 // src/paint/mix.bl
+import pal.{Green}           // error[E1016]: `Green` collides with variant `Color.Green`
 fn Red() -> Int { 1 }        // error[E1016]: `Red` collides with variant `Color.Red`
 let Ok = 5                   // error[E1016]: `Ok` collides with variant `Result.Ok`
 ```

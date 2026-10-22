@@ -915,7 +915,7 @@ If the call looked `trim` up again at `T = Str`, it would run a method the bound
 1. The type the block implements the trait for is a built-in type.
 2. A sealed trait already gives that type a method with this name.
 
-The warning fires once per method. It never fires at a call, at a qualified call, or through a generic bound. Its note names the sealed trait, and its help says to rename the method or to call it in the qualified form. The warning is on by default. `@allow(SealedMethodNameCollision)` on the method suppresses it (`@allow` attaches to a `fn`, §11.1), and records that the author chose the name. The warning is never an error.
+The warning fires once per method. It never fires at a call, at a qualified call, or through a generic bound. Its note names the sealed trait, and its help says to rename the method or to call it in the qualified form. The warning is on by default. `@allow(SealedMethodNameCollision)` on the method suppresses it (here, on the method's `fn`; §11.1 lists every target), and records that the author chose the name. The warning is never an error.
 
 ```
 warning[SealedMethodNameCollision]: `Tidy.trim` has the same name as a built-in method on `Str`
