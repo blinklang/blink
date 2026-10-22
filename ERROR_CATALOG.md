@@ -112,7 +112,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | CapabilityBudgetExceeded | E0501 | Function effect exceeds module `@capabilities` budget | Effects | §4.8 |
 | QuestionMarkInvalidOperand | E0502 | `?` operator used on non-Result, non-Option type | Type checking | §3c.2 |
 | UndefinedFunction | E0504 | Call to undefined function | Name resolution | §6.3 |
-| UnresolvedMethod | E0505 | Unresolved method call on variable | Name resolution | §6.3, §3c.4 |
+| UnresolvedMethod | E0505 | Unresolved method call on variable. When a visible effect has an op of that name whose declared first parameter type equals the receiver type, the help gives the handle form (`process.wait(child)`) in its first line. The fix adds the call rewrite and, when the row lacks the effect, the effect to the row, both machine-applicable; with two or more matching effects the help lists each and the fix is not machine-applicable. A type parameter or the poison type matches no op | Name resolution | §6.3, §3c.4, §4.4 |
 | UndefinedVariable | E0506 | Reference to undefined variable | Name resolution | §6.3 |
 | UnknownType | E0507 | Reference to undefined type | Name resolution | §6.3 |
 | QuestionMarkResultInNonResult | E0508 | `?` on Result in function not returning Result | Type checking | §3c.2 |

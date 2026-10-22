@@ -1654,7 +1654,7 @@ At these boundaries, `@requires` violations are routed through the `Validation` 
 }
 ```
 
-Users can swap the validation handler via `with custom_handler { server.serve() }` to customize the response format (422, JSON:API, localized messages) without modifying handler code.
+Users can swap the validation handler via `with custom_handler { net.serve(server) }` to customize the response format (422, JSON:API, localized messages) without modifying handler code.
 
 For internal function calls (Blink calling Blink), the compiler still attempts static proof. If it can prove the caller always satisfies the callee's `@requires`, no runtime check is emitted. If the outcome is Unknown, the callee gets the default runtime check at its entry (§3b.4).
 

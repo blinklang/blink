@@ -191,7 +191,7 @@ error[UndefinedFunction]: undefined function `parse_int`
   = help: `.parse_int()` returns `Result[Int, ConversionError]`; add `?` or match on the result
 ```
 
-**Removed methods.** A row that names a method call also names the receiver type. The compiler looks at such a row only when method lookup fails for a receiver of that type, so `Iterator.chain` and a `chain` method from a user trait on `List` still resolve as usual. The failed call is the usual unresolved-method error (E0505), and it carries the fix from the row. The third column and the `blink fix` rules apply to a method row as they do to a function row. The table holds only names that a released version of Blink or its standard library accepted.
+**Removed methods.** A row that names a method call also names the receiver type. The compiler looks at such a row only when method lookup fails for a receiver of that type, so `Iterator.chain` and a `chain` method from a user trait on `List` still resolve as usual. The failed call is the usual unresolved-method error (E0505), and it carries the fix from the row. The third column and the `blink fix` rules apply to a method row as they do to a function row. The table holds only names that a released version of Blink or its standard library accepted. A released type is replaced when a decision names a successor type for it. A row for a method of a replaced type is keyed by the successor type, because a program that has moved to the new API holds a value of that type. The key does not give the successor type the old method: the call stays an error, and the row gives the fix.
 
 ```
 error[UnresolvedMethod]: no method `contains_key` on `Map[Str, Int]`

@@ -337,6 +337,29 @@ Handles also enable the handler mechanism (section 4.7). Because all effect oper
 
 Rule 2 permits a second tier: a std function or method that has a row but is not a handle op, such as `udp_bind` and `unix_listen` (§4.4.6). Rule 3 permits this only when no handle op made the value that the function consumes. The effect row gates a second-tier function as it gates a handle op, but no handler can intercept it (§4.10).
 
+**A handle op has one call form.** A program calls a handle op through its handle: `handle.op(value, ...)`, as in `process.wait(child)` and `net.serve(server)`. A value that a handle op made is an argument. It is never the receiver. `v.op(...)` is a method call: it searches traits only (§3c.4 *Trait Method Lookup*) and never reaches a handler, also when `v` holds a value that a handle op made. So `child.wait()` is E0505 (UnresolvedMethod). This rule does not apply to `.await` (§4.13).
+
+**E0505 help for a handle op.** Suppose method lookup fails for `v.op(args)`, and a visible effect has an op `op` whose declared first parameter type equals the type of `v`. The type of `v` is its type after inference and alias expansion. The two types must be equal. A type that only converts to the parameter type does not match. Then E0505 names the op and its effect. The first line of the help gives the handle form, `h.op(v, args)`, with `h` the handle of that effect. If the type of `v` is a type parameter or the poison type, no op matches, and the error is plain E0505. If two or more visible effects match, the help lists each match, and the fix is not machine-applicable.
+
+```blink
+pub fn finish(child: Child) -> Result[ProcessResult, ProcessError] {
+    child.wait()
+}
+```
+
+```
+error[UnresolvedMethod]: no method `wait` on type `Child`
+ --> build.bl:2:11
+  |
+2 |     child.wait()
+  |           ^^^^ `Child` has no method `wait`
+  |
+  = help: call it through the handle: `process.wait(child)`
+  = note: `wait` is an operation of `Process.Spawn`; the fix also adds `Process.Spawn` to the row of `finish`
+```
+
+In the structured output (§6.5), this fix carries two edits: the call rewrite and, when the enclosing row lacks the effect, the addition of the effect to that row. Both are machine-applicable when the replacement takes the same arguments. `h.op(v, args)` takes the arguments of the call, in the same order, so both are machine-applicable. No tool writes the row of an `@ffi` declaration, so inside one there is no row edit. The fix has the shape of the removed-name rows below, because a respelled call and a call to a removed name are the same kind of rewrite: each replaces a call by a call to a handle op. The structured output reports the row edit. A change to the row of a `pub fn` changes a public signature, so the report names each row that the fix changes.
+
 **Removed free functions.** Earlier versions of Blink had free functions that performed side effects. Rule 1 removes them. A call to one of these names gives the usual undefined-function error (E0504), with a fix that names the replacement and its effect. The compiler keeps the table below for good. It looks in the table only when name lookup fails, so a program that declares its own `fn read_file` still compiles and calls that function. The table also holds removed handle operations and removed `std` functions that took the place of a handle. A row for a handle operation follows the method rule of §3.2 *Removed methods*: the compiler looks at it only when lookup of that operation fails, and the error is E0505. The fourth column has the same meaning as the third column of the §3.2 table.
 
 | Removed name | Replacement | Effect | Result changes |
@@ -356,6 +379,8 @@ Rule 2 permits a second tier: a std function or method that has a row but is not
 | `process_spawn(cmd, args)` | `process.spawn(cmd, args)` | `Process.Spawn` | yes: `Int` becomes `Result[Child, ProcessError]` |
 | `process_pid_wait(pid)` | `process.wait(child)` | `Process.Spawn` | yes: the argument is a `Child`, and the result becomes a `Result` |
 | `process_pid_kill(pid, sig)`, `process_pid_send_signal(pid, sig)` | `process.signal(child, sig)` | `Process.Signal` | yes: the argument is a `Child`, and the result becomes a `Result` |
+| `child.kill(sig)` on `Child` | `process.signal(child, sig)`; `child.kill(0)` becomes `process.signal(child, SIGKILL)` | `Process.Signal` | yes: `Int` becomes `Result[(), ProcessError]` |
+| `child.send_signal(sig)` on `Child` | `process.signal(child, sig)` | `Process.Signal` | yes: `Int` becomes `Result[(), ProcessError]` |
 | `process_exec(cmd, args)` | `process.exec(cmd, args)` | `Process.Spawn`, `Env.Exit` | yes: the result becomes `Result[Never, ProcessError]` |
 | `unix_socket_listen(p)`, `unix_socket_accept(l)` | `unix_listen(p)`, `listener.accept()` in `std.net` (§4.4.6) | `Net.Listen` | yes: `Int` becomes a `Result` |
 | `unix_socket_connect(p)` | `unix_connect(p)` in `std.net` (§4.4.6) | `Net.Connect` | yes: `Int` becomes `Result[UnixStream, NetError]` |
@@ -378,6 +403,8 @@ error[UndefinedFunction]: undefined function `read_file`
 ```
 
 In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg` and `sqlite_handler` change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
+
+**Rows for methods of `Child`.** The E0505 help for a handle op finds `child.wait()` by its name, so no row lists it. The help cannot find `child.kill(sig)` or `child.send_signal(sig)`, because the op is named `signal`. Rows keyed by the receiver type `Child` cover them (§3.2 *Removed methods*). The released `kill` method used the signal `0` to mean `SIGKILL`. A literal `0` argument to `kill` becomes `SIGKILL`, and a literal argument other than `0` stays as it is. A `kill` argument that is not a literal gets a suggestion, not a machine-applicable fix, because the argument can be `0`. (Panel vote: 6-0. See [One Call Form for Handle Operations rationale](../decisions/handle-op-call-form.md).)
 
 ---
 
@@ -531,14 +558,14 @@ HTTP error status codes (4xx, 5xx) are **not** `NetError` variants — they are 
 
 **Status: v1. Resolved by panel vote: 3-2 minimal value-server, 4-1 functional middleware, 3-2 typed error handler, 4-1 validation effect.**
 
-The `Net.Listen` effect provides HTTP server capabilities. Like `Net.Connect`, it has one core operation (`serve`) with convenience methods for route registration:
+The `Net.Listen` effect provides HTTP server capabilities. It has two operations: `listen` makes a `Server`, and `serve` starts it. Convenience methods register routes:
 
 ```blink
 effect Net {
     effect Listen {
         fn serve(server: Server) -> Result[(), ServerError]
 
-        // Route registration — builds the Server value
+        // Makes an empty Server value
         fn listen(host: Str, port: Int) -> Server
     }
 }
@@ -563,9 +590,11 @@ fn start_server(config: ServerConfig) ! Net.Listen, IO {
     let server = net.listen(config.host, config.port)
     server.route("GET", "/users/:id", handle_get_user)
     server.route("POST", "/users", handle_create_user)
-    server.serve()
+    net.serve(server)
 }
 ```
+
+Route registration builds the `Server` value and is not a `Net.Listen` operation; `net.serve(server)` is the operation that a handler answers.
 
 **Convenience verb methods** mirror `Net.Connect`'s pattern — sugar over `.route()`:
 
@@ -733,7 +762,7 @@ fn start_server(config: ServerConfig) ! Net.Listen, IO {
     let server = net.listen(config.host, config.port)
     server.get("/users/:id", handle_get_user)
     with custom_validation_handler() {
-        server.serve()
+        net.serve(server)
     }
 }
 ```
@@ -761,7 +790,7 @@ test "validation collects violations" {
 
 ##### Server Handler Implementation
 
-Handler implementors implement `serve()` — the core operation. Route registration methods build the `Server` value; the handler receives the fully-configured server:
+A `Net.Listen` handler implements `listen` and `serve`. Route registration methods build the `Server` value; the handler receives the fully-configured server:
 
 ```blink
 fn mock_server() -> Handler[Net.Listen] {
@@ -1079,7 +1108,7 @@ Do not use `fs.stat(p).is_ok()` as an existence test. It reads every error as "a
 
 `FsError`, `FsOp`, `FileInfo` and `FileKind` live in `std.fs` and are named with `import std.fs` — the same way `net.request`'s `NetError` is named with `import std.net`. The `fs` operation handle needs no import (it comes from the `! FS` effect on the signature), but the error *type* a caller matches on does.
 
-**No file handles in v1.** The `fs` surface is exactly the five path-taking operations above. There is no `fs.open`, no `fs.create`, and no handle-taking read — a read is `fs.read(path)`, never `fs.read(handle)`. Streaming and incremental access are a post-v1 addition and will arrive as *methods on a file handle* (`file.read_line()`, `file.write_line(...)`), not as overloads of `fs.read` — Blink has no function overloading. Examples in §4.7 (*Scoped resources: `with...as`*) that open a `Closeable` file handle with `with ... as` illustrate the scoped-resource mechanism against that planned handle API; they are marked there as post-v1.
+**No file handles in v1.** The `fs` surface is exactly the five path-taking operations above. There is no `fs.open`, no `fs.create`, and no handle-taking read — a read is `fs.read(path)`, never `fs.read(handle)`. Streaming and incremental access are a post-v1 addition and will arrive as `fs` handle ops that take a file handle (rule 3 of §4.4), not as overloads of `fs.read` — Blink has no function overloading. Examples in §4.7 (*Scoped resources: `with...as`*) that open a `Closeable` file handle with `with ... as` illustrate the scoped-resource mechanism against that planned handle API; they are marked there as post-v1.
 
 #### 4.4.6 Sockets in `std.net`: UDP and Unix-Domain
 
@@ -1971,15 +2000,15 @@ test "integration test with shared environment" {
 
 Effect handlers manage long-lived, framework-level resources — connection pools, capability providers, test doubles. But functions also acquire short-lived, individual resources: a file handle for one read, a lock held for one critical section, a temp file for one transformation.
 
-The `with...as` construct handles this second tier. The file-handle examples below (`fs.open`, `fs.create`, and the handle methods `read_all` / `write` / `read_line`) are **planned post-v1 API**, shown to illustrate the scoped-resource mechanism — they are not part of the v1 `fs` surface, which is the four path operations in §4.4.5:
+The `with...as` construct handles this second tier. The file-handle examples below (`fs.open`, `fs.create`, and the `fs` handle ops that take a file, such as `fs.read_all`) are **planned post-v1 API**, shown to illustrate the scoped-resource mechanism — they are not part of the v1 `fs` surface, which is the four path operations in §4.4.5:
 
 ```blink
 // Planned (post-v1): the file-handle API. Shown here to illustrate `with ... as`
 // scoped resources; the v1 fs surface is the four path operations in §4.4.5.
 fn copy_file(src_path: Str, dst_path: Str) -> Result[(), FsError] ! FS {
     with fs.open(src_path)? as src, fs.create(dst_path)? as dst {
-        let data = src.read_all()?
-        dst.write(data)?
+        let data = fs.read_all(src)?
+        fs.write_all(dst, data)?
     }
 }
 ```
@@ -2087,7 +2116,7 @@ Scoped resources respect structured concurrency boundaries. A `Closeable` bound 
 fn bad_example() ! FS, Async {
     with fs.open("data.txt")? as file {
         async.spawn(fn() {
-            file.read_all()  // COMPILE ERROR E0601: closeable `file` escapes scope
+            fs.read_all(file)  // COMPILE ERROR E0601: closeable `file` escapes scope
         })
     }
 }
@@ -2098,7 +2127,7 @@ If concurrent tasks need the resource, open it outside or pass the data:
 ```blink
 fn good_example() ! FS, Async {
     let data = with fs.open("data.txt")? as file {
-        file.read_all()?
+        fs.read_all(file)?
     }
     async.scope {
         async.spawn(fn() { process(data) })
@@ -3077,7 +3106,7 @@ Concurrency in Blink is not a language keyword or a function color — it is an 
 |-----------|---------|
 | `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: special syntax; v2: may become a `Scoped` type — see §4.7.2)* |
 | `async.spawn(fn() { ... })` | Launch a concurrent task within the current scope. Returns `Handle[T]`. |
-| `handle.await` | Wait for a spawned task's result. Method on `Handle[T]`, returns `T`. |
+| `handle.await` | Wait for a spawned task's result. Postfix keyword on a `Handle[T]`, not a method call. Returns `T`. |
 | `channel.new[T](buffer: N)` | Create a buffered channel for inter-task communication. |
 
 **The dashboard pattern — fork-join concurrency:**
@@ -3095,7 +3124,7 @@ fn load_dashboard(user_id: UserId) -> Dashboard ! Async, Http {
 }
 ```
 
-`async.spawn` returns a `Handle[T]` — an opaque value representing a running task. `handle.await` is a method on `Handle[T]` that suspends the current task until the spawned task completes and returns its result. The compiler recognizes `.await` as a suspension point and requires `! Async` in the function's effect declaration.
+`async.spawn` returns a `Handle[T]` — an opaque value representing a running task. `handle.await` is a postfix keyword on a `Handle[T]`, not a method call. It is a suspension point: the current task suspends until the spawned task completes, and the expression has the result as its value. The compiler requires `! Async` in the function's effect declaration.
 
 **Handle[T].** A `Handle[T]` is a synchronized object (§3.6 *Synchronized objects*): a copy names the same task. A second `.await`, on the same handle or on a copy, returns the same result again. It does not run the task again. The shared cells that the result reaches are shared between the two results, as with a bind (§3.6 *Shared cells*).
 
@@ -3125,7 +3154,7 @@ A spawned task performs effect operations with the handlers in force at its `asy
 
 **Why `handle.await` and not `async.join(handle)`:**
 
-Blink uses namespaced functions for *creating* concurrent primitives (`async.scope`, `async.spawn`, `channel.new`) but method syntax for *consuming* results (`handle.await`). This follows the data flow: the handle is the thing you're waiting on, so the operation belongs to the handle. It also chains naturally with error propagation:
+Blink uses namespaced functions for *creating* concurrent primitives (`async.scope`, `async.spawn`, `channel.new`) but a postfix keyword for *consuming* results (`handle.await`). A postfix keyword chains naturally with error propagation:
 
 ```blink
 let user = user_handle.await?   // await, then propagate error

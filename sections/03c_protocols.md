@@ -817,7 +817,7 @@ error[EffectHandleShadowed]: cannot shadow effect handle
   = help: choose a different variable name
 ```
 
-Effect handle operations are syntactically identical to method calls (`io.println(msg)`, `db.read(query)`), but they are resolved through the effect system, not through trait lookup. The compiler knows which identifiers are effect handles from the function's `!` declaration, so there is never ambiguity between `io.println()` (effect operation) and a hypothetical trait method `println` on some type — `io` is not a value of any type, it is a capability handle.
+Effect handle operations are syntactically identical to method calls (`io.println(msg)`, `db.read(query)`), but they are resolved through the effect system, not through trait lookup. The compiler knows which identifiers are effect handles from the function's `!` declaration, so there is never ambiguity between `io.println()` (effect operation) and a hypothetical trait method `println` on some type — `io` is not a value of any type, it is a capability handle. A handle op has one call form, through its handle: a value is never the receiver of a handle op, and `v.op(...)` is trait lookup only (§4.4).
 
 **Why reserved.** Effect handles are capability proofs (§4.4). Allowing `let io = something_else` would break the guarantee that `io.println()` always routes through the effect handler chain. The reserved namespace ensures go-to-definition on any effect operation always reaches the effect declaration, and LSP always shows effect operations in autocomplete.
 
