@@ -230,7 +230,7 @@ pub fn transfer(amount: Int, -- from: Account, to: Account) -> Result[(Account, 
 }
 ```
 
-The first `///` line declares human intent — structured, versioned, queryable. `@src` links to requirements. These aren't comments. They're compiler-checked metadata.
+The first `///` line states the intent in plain words. The compiler cannot check prose, but the intent is versioned with the code and `blink query --layer intent` reads it. `@src` links the function to a requirement, and `blink trace` checks those links. `@requires` is a contract that the compiler checks. Making intent fully checkable is a design aim, not a feature of today (see §1.2.1 of the spec).
 
 ---
 
