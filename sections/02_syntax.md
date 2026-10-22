@@ -1000,7 +1000,7 @@ pub let mut shared_counter = 0  // error[PubLetMutForbidden]: `pub let mut` is f
 - A list literal or tuple literal whose elements are static.
 - A struct literal whose field values are static.
 - An enum variant whose payloads are static.
-- An empty-collection constructor with no arguments: `[]`, `Map()`, `Set()`, `Map.new[K, V]()`, `Set.new[T]()`, `List.new()`, `List.new[T]()`.
+- An empty-collection constructor with no arguments: `[]`, `Map.new()`, `Set.new()`, `Map.new[K, V]()`, `Set.new[T]()` (§3.2.2 *Construction and Mutability*).
 - A function literal. Its body does not run at initialization. The compiler checks the body as it checks any function body, and the body's effects go in the literal's type, not in the initializer. A body that reads a `let mut` gives the literal `State` in its row (§4.16).
 
 Nothing else is static. In particular, these are not:
@@ -1029,13 +1029,13 @@ let retries = MAX_RETRIES * 2
 let names = ["ada", "bob"]
 let pair = (1, "one")
 let default_level = Level.Info
-let mut seen: Map[Str, Int] = Map()
-let mut queue: List[Int] = List.new()
+let mut seen: Map[Str, Int] = Map.new()
+let mut queue: List[Int] = []
 let mut tags: Set[Str] = Set.new[Str]()
 let mut limits = Limits { low: 0, high: MAX_RETRIES }
 let double = fn(n: Int) -> Int { n * 2 }
 
-fn build_table() -> Map[Str, Int] { Map() }
+fn build_table() -> Map[Str, Int] { Map.new() }
 fn parse(s: Str) -> Result[Int, Str] { Ok(s.len()) }
 
 // INVALID — compile error E1129
@@ -1072,7 +1072,7 @@ fn ports() -> Map[Str, Int] ! State {
     match port_table {
         Some(t) => t
         None => {
-            let mut t: Map[Str, Int] = Map()
+            let mut t: Map[Str, Int] = Map.new()
             t.insert("http", 80)
             t.insert("https", 443)
             port_table = Some(t)
@@ -1191,6 +1191,21 @@ fn read(*, flags: MsgFlags = MsgFlags.NONE) { /* ... */ }
 let d = Duration.ms(100)
 ```
 
+A generic type takes its function in the same form:
+
+```blink
+pub type Stack[T] {
+    items: List[T]
+}
+
+pub fn Stack.empty[T]() -> Stack[T] {
+    Stack { items: [] }
+}
+
+let a: Stack[Int] = Stack.empty()
+let b = Stack.empty[Str]()
+```
+
 **Constants.** `const T.NAME = <expr>` follows every rule of a plain `const` (§2.21). The right side must be a const expression. A type annotation is optional, with the same rule as a plain `const`. `T.NAME` is a const reference, so it is legal in every place that requires a const expression, such as a keyword default.
 
 **Functions.** `fn T.name(params) -> R` is an ordinary function that has no receiver. A `self` parameter is a compile error: a method belongs to a trait (§3c.4 *No Inherent Methods*). Method syntax `x.name()` never reaches a type-scoped function. Only `T.name(...)` calls it.
@@ -1201,6 +1216,7 @@ let d = Duration.ms(100)
 - **Visibility.** `pub` exports the name. Without `pub`, the name is private to the module, as for any item (§2.12). An opaque type uses this to give the outside its way in.
 - **Use from another module.** Import the type, then write `T.name`. The form `mod.T.name` is E1007.
 - **No constants on generic types for now.** `T` in `const T.NAME` must not take type parameters.
+- **Functions on a generic type declare their own binders.** `fn T.name[A, B](params) -> R` puts the binders after the name, as for any generic function (§3.4 *Explicit Type Application*). The type head takes no list: `fn Stack[T].empty()` is a parse error, and its fix is `fn Stack.empty[T]()`. A call supplies the binders by inference or by a list after the name (`Stack.empty[Int]()`). The language does not check the order of the binders against the order in the type declaration.
 - **One `T.` namespace.** The variants of `T`, its type-scoped constants and functions, and the associated functions that trait impls give `T` (§3c.4) all share the names after `T.`. Two of them with one name are `DuplicateModuleBinding` (E1016). The check covers the whole package, because a trait impl can live in any module of the package (§3.6). When the trait impl is in another package, the declaration site cannot see it, so the clash is an ambiguity at the use site (E0522). Name the trait's function with an impl-qualified call: `(Trait for T).name()` (§3c.4).
 
 **Why a top-level declaration, not a declaration in the type body.** The type body holds only the representation, fields or variants. For an opaque type, the body is the hidden part, and an API inside it would mix the two. The declaration text is also the same as the use text, so a search for `MsgFlags.NONE` finds both.
@@ -2722,7 +2738,7 @@ What is **not** a const expression:
 - Function calls: `some_fn()` — even pure functions
 - Method calls: `"hello".len()` — methods are function calls
 - `let` bindings: referencing a `let` variable is not const
-- Collection constructors: `List.new()`, `Map.new()` — these allocate
+- Collection constructors: `Map.new()`, `Set.new()`, `List.with_capacity(n)` — these allocate
 - Mutable state: anything involving `let mut`
 - An operator on a user type: `MsgFlags.PEEK | MsgFlags.WAITALL`. The operator is a call to a trait impl (§3.6), so §2.21 does not admit it. To use a combination as a default, declare it as its own constant.
 
@@ -2874,7 +2890,7 @@ const MAX_RETRIES = 5
 
 // Module state: a static initializer, set before `main` runs
 let mut request_count = 0
-let mut seen: Map[Str, Int] = Map()
+let mut seen: Map[Str, Int] = Map.new()
 ```
 
 The compiler folds const expressions at compile time. Arithmetic like `1024 * 64` gives `65536`, and struct consts have all fields resolved.

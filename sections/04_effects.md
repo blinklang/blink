@@ -471,7 +471,7 @@ type Request {
 }
 ```
 
-`Request.new()` is compiler-provided (same pattern as `List.new()`, `Map.new()`). Builder methods are provided via the `RequestOps` trait:
+`Request.new()` is compiler-provided (same pattern as `Map.new()`, `Set.new()`). Builder methods are provided via the `RequestOps` trait:
 
 ```blink
 trait RequestOps {
@@ -773,7 +773,7 @@ The validation effect works outside HTTP contexts too — CLI argument validatio
 
 ```blink
 test "validation collects violations" {
-    let violations = List.new()
+    let violations = []
     let mock_validation = handler Validation {
         fn contract_violation(param: Str, constraint: Str, value: Str) -> Response {
             violations.push({ param: param, constraint: constraint, value: value })
@@ -3847,7 +3847,7 @@ looks_like_struct_lit() → writes {pos, pending_comments}
 
 ```blink
 let mut pos = 0
-let mut pending_comments: List[Comment] = List.new()
+let mut pending_comments: List[Comment] = []
 
 fn advance() {                           // writes {pos}
     pos = pos + 1
@@ -3922,7 +3922,7 @@ Callers see `! Parse.Advance` and know that the call moves the parser. A user-de
 **`async.spawn` (§4.13, §2.8).** Two tasks that touch one module-level `let mut` race. A function value passed to `async.spawn` whose effective row contains `State` is `SpawnTouchesModuleState` (E0651). The rule covers a closure literal and a named function alike. The `help:` line says to pass the data in, return it from the task, or use a `Channel` (§4.13).
 
 ```blink
-let mut items: List[Int] = List.new()
+let mut items: List[Int] = []
 
 fn add(n: Int) {
     items.push(n)

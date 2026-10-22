@@ -30,7 +30,8 @@ Key facts:
 - NO `+` or `+=` on strings (E0521) — use interpolation or `.concat()`
 - `mut` goes on each name in a pattern: `let (mut x, y) = pair`, `for (k, mut v) in pairs`, `Some(mut n) =>`. `let mut (x, y)` is `E0613`; `blink fix` rewrites it
 - The unit type is `()`. `Void` exists only in `Ptr[Void]`
-- No silent type defaults: an empty `[]`, a bare `None` or an unused `Map()` is `E0301`. Annotate it, or write `List.new[T]()`, `Map.new[K, V]()`, `Set.new[T]()`
+- No silent type defaults: an empty `[]`, a bare `None` or an unused `Map.new()` is `E0301`. Annotate it, or write `Map.new[K, V]()`, `Set.new[T]()`
+- One empty form per type: `[]` for `List`, `Map.new()`, `Set.new()`, `Bytes.new()`, `StringBuilder.new()`. `Map()`, `Set()`, `Bytes()` and `List.new()` do not exist: each is an error (E0504 or E0505) with a fix
 - Type parameters are rigid in a generic body: arithmetic on `T` needs a bound (`T: Add`). Bounds are checked at the call (`E0306`). Explicit call type arguments: `f[T](x)`
 - Keyword parameters follow `--`: `fn f(a: Int, -- b: Str = "x")`. Defaults are constants
 - `Map.remove` returns `Option[V]`. `m[k] = v` is an error; use `m.insert(k, v)`. `channel.new[T](buffer: n)`; `ch.recv()` returns `Option[T]`

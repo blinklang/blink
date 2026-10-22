@@ -176,6 +176,10 @@ fn lookup(cache: Map[Str, Int?], key: Str) -> Int?? {
 | `parse_float(s)` | `s.parse_float()` | yes: `Float` becomes `Result[Float, ConversionError]`, and text such as `"1.5x"` or `""` gives `Err` |
 | `json_escape_str(s)` | `json.stringify(JsonValue.Str(s))` (§3.6.2) | yes: the result has the surrounding quotes |
 | `list_concat(a, b)` | `a.append(b)` (§3.2.2 *Concatenation*) | no |
+| `Map()`, `Map[K, V]()` | `Map.new()`, `Map.new[K, V]()` (§3.2.2 *Construction and Mutability*) | no |
+| `Set()`, `Set[T]()` | `Set.new()`, `Set.new[T]()` | no |
+| `Bytes()` | `Bytes.new()` | no |
+| `List.new()`, `List.new[T]()` | `[]`, with the element type from an annotation (`let xs: List[T] = []`), from the expected type or from a later use | no |
 | `xs.chain(ys)` on `List` | `xs.append(ys)`; for a lazy sequence, `xs.into_iter().chain(ys.into_iter())` (§3c.1) | no |
 | `m.contains_key(k)` on `Map` | `m.contains(k)` (§3.2.2 *The `Contains` Trait*) | no |
 
@@ -204,9 +208,29 @@ error[UnresolvedMethod]: no method `contains_key` on `Map[Str, Int]`
   = fix: ages.contains("ann")
 ```
 
+**Removed empty forms.** Each type has one empty form (§3.2.2 *Construction and Mutability*). The older forms are errors. Each error carries the fix from its table row:
+
+- **`Map()`, `Map[K, V]()`, `Set()`, `Set[T]()` and `Bytes()`** name a function that does not exist, so each is `error[UndefinedFunction]` (E0504). The machine-applicable fix keeps the type arguments that the code wrote: `Map()` becomes `Map.new()`, `Map[K, V]()` becomes `Map.new[K, V]()`, `Set()` becomes `Set.new()`, `Set[T]()` becomes `Set.new[T]()`, and `Bytes()` becomes `Bytes.new()`.
+- **`List.new()`** names a missing function in the scope of `List`, so it is `error[UnresolvedMethod]` (E0505). The machine-applicable fix writes `[]`. Both forms take their element type from the same sources, so the edit does not change the type.
+- **`List.new[T]()`** is `error[UnresolvedMethod]` (E0505). The fix writes `[]` and the type `List[T]`. It is machine-applicable only when the call is the whole initializer of a `let` whose pattern is a plain name with no annotation. Then one edit writes the annotation and `[]` together: `let xs = List.new[Int]()` becomes `let xs: List[Int] = []`. In any other place the fix is a suggestion only, because the call does not own a place for the annotation. When the `let` has an annotation that disagrees with `[T]`, there is no fix, and the type error stands.
+- **A kept form has no diagnostic.** `let s: Set[Str] = Set.new[Str]()` is correct.
+- **The fix text comes from the table rows above.** There is one source for it.
+
+`List()`, `List[T]()` and `StringBuilder()` have no row. No released version of Blink accepted them, and the table holds only names that a released version accepted. Each is E0504. The help of that error names the one empty form of the type (§6.3.5 *Error Recovery*).
+
+```
+error[UndefinedFunction]: undefined function `Map`
+ --> main.bl:3:15
+  |
+3 |     let ages = Map[Str, Int]()
+  |                ^^^ `Map` is a type, not a function
+  |
+  = fix: Map.new[Str, Int]()
+```
+
 Some names have no method twin, because a different form is the one way. A loop over a collection is a `for` loop: there is no `for_each` method on `List` or `Map`. A method-not-found error for `xs.for_each(f)` or `m.for_each(f)` gives help that shows the `for` loop. A `Str` from a codepoint goes through `Char`. A JSON string goes through the JSON encoder.
 
-(Panel vote: 6-0 on the table. See [Removed Function Forms rationale](../decisions/removed-function-forms.md). The `list_concat`, `List.chain` and `Map.contains_key` rows and the method rows: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
+(Panel vote: 6-0 on the table. See [Removed Function Forms rationale](../decisions/removed-function-forms.md). The `list_concat`, `List.chain` and `Map.contains_key` rows and the method rows: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md). The empty-form rows: 6-0; the owner removed the warning release. See [Empty Collection Constructors rationale](../decisions/empty-collection-constructors.md).)
 
 #### §3.2.1 String Methods
 
@@ -620,7 +644,21 @@ trait StringBuildOps {
 
 ##### Construction and Mutability
 
-Collections are constructed via `Type.new()` for empty collections or literal syntax where available. `List.with_capacity(n)` also makes an empty list (see *Capacity* below). A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A mutation needs a mutable **root**: the first name of the receiver path or of the place must be a `let mut` binding, a `mut` pattern binder (§3.5 *Mutable Binders*) or a `mut` parameter. A mutation is a call to a mutating method, or an assignment `=` or `op=` (§2.22 *Assignment places*). `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`. A `mut` parameter is a mutable root only for a call. An assignment to a parameter, or to a field of one, is `error[E0612] ParamAssign` with or without `mut` (§3.6 *Mutable Parameters*), and the compiler reports it in place of E0610 (§2.22 *Writes that are not to a place*).
+Each type has one form for an empty value (Principle 2). A type that has an empty literal uses it, as `""` is the empty `Str`. Every other type uses `Type.new()`.
+
+| Type | Empty form |
+|------|------------|
+| `List[T]` | `[]` |
+| `Map[K, V]` | `Map.new()` |
+| `Set[T]` | `Set.new()` |
+| `Bytes` | `Bytes.new()` |
+| `StringBuilder` | `StringBuilder.new()` |
+
+The type arguments of an empty value come from the annotation, from the expected type, or from a later use (§3.4 *Under-Determined Types*). Where none of these gives them, write them in a bracket list after the callee, as for any generic function (§3.4 *Explicit Type Application*): `Map.new[Str, Int]()`. No rule is specific to constructors. The standard library declares these constructors with the type's own parameters as their binders, in the type's order: `Map.new[K, V]()`, `Set.new[T]()` and `List.with_capacity[T](n)`. A list of the wrong count is `error[TypeArgArity]` (E0303) on `new`, so `Map.new[Str]()` is an error. A user type's `fn Registry.new[T]()` is an ordinary function (§2.12.3), and the language does not check the order of its binders.
+
+`Map()`, `Map[K, V]()`, `Set()`, `Set[T]()`, `Bytes()`, `List.new()` and `List.new[T]()` are not forms of an empty value (§3.2 *Removed empty forms*). `List.with_capacity(n)` also makes an empty list (see *Capacity* below).
+
+A **mutating method** is a method that declares `mut self` (§3.6 *Mutable Parameters*): `push`, `pop`, `insert`, `remove`, `set` and `clear` on collections, every `write` method on `StringBuilder`, and every writer on `Bytes` (§3.2.3 *Bytes*). A mutation needs a mutable **root**: the first name of the receiver path or of the place must be a `let mut` binding, a `mut` pattern binder (§3.5 *Mutable Binders*) or a `mut` parameter. A mutation is a call to a mutating method, or an assignment `=` or `op=` (§2.22 *Assignment places*). `p.xs.push(x)` needs `p` to be mutable. An immutable root can only call non-mutating methods (`get`, `contains`, `len`, `keys`, `values`, etc.). A violation is `error[E0610] MutationRequiresMut`. A `mut` parameter is a mutable root only for a call. An assignment to a parameter, or to a field of one, is `error[E0612] ParamAssign` with or without `mut` (§3.6 *Mutable Parameters*), and the compiler reports it in place of E0610 (§2.22 *Writes that are not to a place*).
 
 The fix for E0610 depends on how the root is declared:
 
@@ -633,9 +671,10 @@ The fix for E0610 depends on how the root is declared:
 
 ```blink
 // Empty collections
-let mut list = List.new()
+let mut list = []
 let mut map = Map.new()
 let mut set = Set.new()
+let mut typed = Map.new[Str, Int]()             // type arguments written at the call
 
 // Literal syntax (List only)
 let names = ["Alice", "Bob", "Carol"]          // List[Str], immutable
@@ -646,7 +685,7 @@ list.push("hello")                              // OK — list is mut
 names.push("Dave")                              // COMPILE ERROR — names is not mut
 
 // The root of a field path decides (type Form { tags: List[Str] })
-let mut form = Form { tags: List.new() }
+let mut form = Form { tags: [] }
 form.tags.push("new")                           // OK — root `form` is mut
 ```
 
@@ -1222,7 +1261,7 @@ import std.time.{Instant, Date, Weekday}
 
 // Each line starts with a 20-byte stamp: "2026-10-17 09:30:00Z GET /"
 fn count_by_date(lines: List[Str]) -> Result[Map[Date, Int], ConversionError] {
-    let mut counts: Map[Date, Int] = Map()
+    let mut counts: Map[Date, Int] = Map.new()
     for line in lines {
         let d = Instant.parse(line.substring(0, 20))?.date()
         counts.insert(d, (counts.get(d) ?? 0) + 1)
@@ -1641,9 +1680,9 @@ fn main() {
     let z: U8 = -0                          // error[IntLiteralOutOfRange]: -0 is a negative literal
                                             //   note: unsigned types hold no negative values
 
-    let mut xs = List.new()
+    let mut xs = []
     xs.push(9223372036854775808)            // error[IntLiteralOutOfRange]: the element type is not known here, so the literal is Int
-                                            //   help: let mut xs: List[U64] = List.new()
+                                            //   help: let mut xs: List[U64] = []
 
     match mask {
         18446744073709551615 => io.println("max")   // OK: the pattern is U64
@@ -2555,7 +2594,7 @@ fn main() {
 fn main() {
     let xs = [10, 20, 30]
     let pair = (1, "a")
-    let mut ages: Map[Str, Int] = Map()
+    let mut ages: Map[Str, Int] = Map.new()
     ages.insert("bob", 41)
 
     let x = xs[1]          // error[NoIndexOperator]: Blink has no index operator
@@ -2587,7 +2626,7 @@ The example below shows the reason note on the plain stores only. The compound s
 ```blink
 fn main() {
     let mut xs = [10, 20, 30]
-    let mut ages: Map[Str, Int] = Map()
+    let mut ages: Map[Str, Int] = Map.new()
     let i = 1
 
     xs[0] = 5              // error[NoIndexOperator]: Blink has no index operator
@@ -2614,8 +2653,11 @@ fn main() {
 | An expected type fixes the same type arguments that were written | `apply(identity[Int], 3)` | remove the brackets — `apply(identity, 3)` |
 | A binding, and no expected type | `let f = identity[Int]` | annotate and remove the brackets, as one edit — `let f: fn(Int) -> Int = identity` |
 | An expected type fixes different type arguments | `apply(identity[Str], 3)` | none that can be applied by machine; the diagnostic names both types |
+| The list follows a type and a type-scoped function follows the list | `Map[Str, Int].new()` | move the list after the function name — `Map.new[Str, Int]()` |
 
 Removing the brackets is offered first only when the expected type gives the same arguments that were written. Where they differ, removing the brackets would still compile, but it would silently change the instantiation the program asked for. That is a change of meaning, not a repair. The conflict between the written and the expected type is the real defect, and only the author can say which one is correct.
+
+**A list after a type, then a type-scoped function.** `Map[Str, Int].new()` is E0314. The type head takes no list in a term position; a type-scoped function declares its own binders and takes the list after its name (§2.12.3, §3.4 *Explicit Type Application*). For a standard library type the fix is machine-applicable: `Map[Str, Int].new()` becomes `Map.new[Str, Int]()`. For a user type the fix is a suggestion only, because the language does not check that the binders of the function follow the order of the type's parameters. `Registry[Int].new()` may mean `Registry.new[Int]()` or another order of binders.
 
 A binding whose initializer is E0313 or E0314 gets no further E0300 or E0301 from that initializer (§3.1 rule 3).
 
@@ -2631,7 +2673,7 @@ When Hindley-Milner inference finishes a binding with a type variable still unbo
 fn f() {
     let x = []          // error[CannotInferType]: element type of `x` is undetermined
     let n = None        // error[CannotInferType]: the inner type of `n` is undetermined
-    let m = Map()       // error[CannotInferType]: key/value types of `m` are undetermined
+    let m = Map.new()   // error[CannotInferType]: key/value types of `m` are undetermined
 }
 ```
 
@@ -2641,18 +2683,18 @@ The fix in every case is to annotate the binding:
 fn f() {
     let x: List[Int] = []
     let n: Int? = None
-    let m: Map[Str, Int] = Map()
+    let m: Map[Str, Int] = Map.new()
 }
 ```
 
-This is one rule applied uniformly: an empty `[]`, a bare `None`, an empty `Map()`/`Set()`, and an under-constrained generic construction are not four cases — they are one case, "inference left a type variable unbound," reported by one diagnostic.
+This is one rule applied uniformly: an empty `[]`, a bare `None`, an empty `Map.new()`/`Set.new()`, and an under-constrained generic construction are not four cases — they are one case, "inference left a type variable unbound," reported by one diagnostic.
 
 **Later use still determines the type — there is no error when it does.** The error fires only when inference *terminates* with the variable unbound, so a binding constrained by a subsequent use is inferred normally with no annotation:
 
 ```blink
 fn g() {
-    let mut xs = List.new()   // element type inferred from the push below
-    xs.push(1)                // xs : List[Int] — no annotation, no error
+    let mut xs = []   // element type inferred from the push below
+    xs.push(1)        // xs : List[Int] — no annotation, no error
 }
 ```
 
@@ -2675,13 +2717,13 @@ type GKV[K, V] {
 }
 
 fn f() {
-    let b = GKV { m: Map() }   // error[CannotInferType]: type parameters K, V of `GKV`
-                               //   are undetermined — no use constrains them
-    // fix: let b: GKV[Int, Str] = GKV { m: Map() }
+    let b = GKV { m: Map.new() }   // error[CannotInferType]: type parameters K, V of `GKV`
+                                   //   are undetermined — no use constrains them
+    // fix: let b: GKV[Int, Str] = GKV { m: Map.new() }
 }
 ```
 
-The diagnostic points at the binding — where the annotation fix applies — and carries a secondary span at the empty constructor (`Map()` / `[]`) explaining why the parameter is open (`error[CannotInferType]`, E0301 — see [ERROR_CATALOG.md](../ERROR_CATALOG.md)). This mirrors the `AmbiguousConstruction` rule (§3.4): no path ever silently picks a winner.
+The diagnostic points at the binding — where the annotation fix applies — and carries a secondary span at the empty constructor (`Map.new()` / `[]`) explaining why the parameter is open (`error[CannotInferType]`, E0301 — see [ERROR_CATALOG.md](../ERROR_CATALOG.md)). This mirrors the `AmbiguousConstruction` rule (§3.4): no path ever silently picks a winner.
 
 **A type parameter named by no field is reported too.** The rule is the same one: every type parameter the declaration binds must be determined, and a phantom parameter is determined only by an annotation on the binding or by a type-argument list on the literal head. So `let w = W { n: 1 }` for `type W[T] { n: Int }` is `error[CannotInferType]` on `T` — repaired by `let w: W[Int] = W { n: 1 }` or by `let w = W[Int] { n: 1 }`. This follows from *no erasure* (§3.4 *Explicit Type Application*): a phantom parameter is part of the type's identity, so leaving it open leaves the type open. It is also the Hindley-Milner discipline Blink's ancestry (§1.3) shares with OCaml, SML, Haskell, and Rust — an unconstrained type variable is resolved by unification or reported, never assigned a type the program did not ask for.
 
@@ -3473,7 +3515,7 @@ type Ordering {
 - `keys()`, `values()`, `entries()` and `for` give the same order.
 
 ```blink
-let mut scores: Map[Str, Int] = Map()
+let mut scores: Map[Str, Int] = Map.new()
 scores.insert("carol", 3)
 scores.insert("alice", 1)
 scores.insert("carol", 4)
@@ -4211,10 +4253,10 @@ fn main() {
     let pq = p == q
     io.println("{pq}")                              // true
 
-    let mut s1: Set[Int] = Set()
+    let mut s1: Set[Int] = Set.new()
     s1.insert(1)
     s1.insert(2)
-    let mut s2: Set[Int] = Set()
+    let mut s2: Set[Int] = Set.new()
     s2.insert(2)
     s2.insert(1)
     let ss = s1 == s2
@@ -5381,7 +5423,7 @@ empty `Map`; the static type tells them apart.
 @derive(Debug)
 type Inventory { items: List[Str], count: Option[Int], tags: Map[Str, Int] }
 
-let mut tags: Map[Str, Int] = Map()
+let mut tags: Map[Str, Int] = Map.new()
 tags.insert("rare", 1)
 let inv = Inventory { items: ["sword", "shield"], count: Some(2), tags: tags }
 inv.debug()

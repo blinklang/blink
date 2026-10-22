@@ -305,10 +305,10 @@ test "addition works" {
 | Str | `"hello"` | Immutable UTF-8 string |
 | Char | `'a'`, `'\n'` | Unicode scalar value (single-quote literal) |
 | Bool | `true`, `false` | Boolean |
-| List[T] | `[1, 2, 3]` | Dynamic array. Empty list: `[]` with a type from context, or `List.new[T]()`. All elements of a list literal must have one type. |
+| List[T] | `[1, 2, 3]` | Dynamic array. Empty list: `[]`; the type comes from an annotation or a later use. All elements of a list literal must have one type. |
 | () | `()` | Unit type: the type of "no value". Write `-> ()`, `Result[(), E]`, `Map[Str, ()]`. `Void` is valid only inside `Ptr[...]` |
-| Map[K, V] | `Map()` | Hash map (construct with `Map()`, `Map.new[K, V]()` or `Map[K, V]()`, not `{}`) |
-| Set[T] | `Set()` | Hash set (construct with `Set()` or `Set.new[T]()`) |
+| Map[K, V] | `Map.new()` | Hash map (empty: `Map.new()`, or `Map.new[K, V]()` to write the types; not `{}`) |
+| Set[T] | `Set.new()` | Hash set (empty: `Set.new()`, or `Set.new[T]()` to write the type) |
 | Option[T] | `Some(v)`, `None` | Nullable value |
 | Result[T, E] | `Ok(v)`, `Err(e)` | Error-or-value |
 | Ordering | `Less`, `Equal`, `Greater` | Result of `.cmp(other)`; prelude enum auto-imported via `std.traits`. Produced by `@derive(Ord)` and the ordering operators. |
@@ -324,13 +324,15 @@ test "addition works" {
 
 **One spelling per type.** Write `List[T]` for a list type and `T?` for an option type. `[T]` in a type is error `ListTypeBrackets` (E1131). `Option[T]` in a type is error `OptionTypeLongForm` (E1132). Both have a machine-applicable fix.
 
+**One empty form per type.** An empty `List` is `[]`. An empty `Map`, `Set`, `Bytes` or `StringBuilder` is `Type.new()`. These forms do not exist: `Map()`, `Map[K, V]()`, `Set()`, `Set[T]()`, `Bytes()`, `List.new()`, `List.new[T]()`, `List()`, `StringBuilder()`. The first seven are errors (E0504 or E0505) with a fix. `List()` and `StringBuilder()` are E0504 with help that names the one empty form.
+
 **Enums are nominally distinct from `Int`.** An enum value is not interchangeable with `Int` at `let` / argument / return positions — passing one where the other is expected is a type error. Convert explicitly with `.to_int()` / `Type.from_int(n)`. (`==` between an enum and its int still works.)
 
 **Transparent newtypes.** A single-variant enum wrapping exactly one `Int` payload (`pub type Errno { Errno(Int) }`) is lowered to a bare `int64_t` in carriers and at FFI boundaries — no box, no tag. It stays nominally distinct in the type system (so `Result[Int, Errno]` can't confuse the count with the errno) while costing nothing at runtime.
 
 ### Type Inference and Checking Rules
 
-- **A type that nothing fixes is `E0301 CannotInferType`.** This covers an empty `[]`, a bare `None`, `Map()` or `Set()` that no use types, a `channel.new` whose element type nothing fixes, an unannotated closure parameter that no context types, `for x in []`, and a generic call whose type parameter no argument or return names. Fix it with an annotation (`let xs: List[Int] = []`) or an explicit type argument (`List.new[Int]()`, `Map[Str, Int]()`, `Set.new[Int]()`, `channel.new[Int](buffer: 4)`).
+- **A type that nothing fixes is `E0301 CannotInferType`.** This covers an empty `[]`, a bare `None`, `Map.new()` or `Set.new()` that no use types, a `channel.new` whose element type nothing fixes, an unannotated closure parameter that no context types, `for x in []`, and a generic call whose type parameter no argument or return names. Fix it with an annotation (`let xs: List[Int] = []`) or an explicit type argument (`Map.new[Str, Int]()`, `Set.new[Int]()`, `channel.new[Int](buffer: 4)`).
 - **Explicit type arguments at a call:** `pair[Int, Str](1, "a")`, `x.method[T]()`, `mod.f[T]()`. A wrong count is `E0307 CallSiteTypeArgs`. A bare `List` or `Map[Int]` is `E0303 TypeArgArity`.
 - **A type parameter is rigid inside its generic body.** `T` is not `Int`: using it as one is `E0300` at the definition. Arithmetic on `T` needs the trait in the bound (`+` needs `Add`, `-` `Sub`, `*` `Mul`, `/` `Div`, `%` `Rem`, unary `-` `Neg`): `fn add[T: Add](a: T, b: T) -> T { a + b }`.
 - **Bounds and arguments are checked at the call.** `sum("a", "b")` for `fn sum[T: Add]` is `E0306`. Arguments must agree on each type parameter: `pick(1, "a")` is `E0300`.
@@ -643,8 +645,8 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `List.new()` | List[T] | Create an empty list; T comes from context or later use, or write `List.new[T]()` |
-| `List.with_capacity(n)` | List[T] | Create an empty list with room for at least n elements; T as for `List.new()`. n <= 0 is the same as `List.new()` |
+| `[]` | List[T] | Create an empty list; T comes from the annotation or a later use |
+| `List.with_capacity(n)` | List[T] | Create an empty list with room for at least n elements; T as for `[]`, or write `List.with_capacity[T](n)`. n <= 0 is the same as `[]` |
 | `.len()` | Int | Length |
 | `.capacity()` | Int | Elements the list holds before it grows; always >= `.len()` |
 | `.is_empty()` | Bool | Check if empty |
@@ -720,7 +722,7 @@ let first_two = names
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `Map()` / `Map.new[K, V]()` | Map[K,V] | Create empty map (NOT `{}`). Index assignment `m[k] = v` is an error; use `insert` |
+| `Map.new()` / `Map.new[K, V]()` | Map[K,V] | Create empty map (NOT `{}`). Index assignment `m[k] = v` is an error; use `insert` |
 | `.insert(key, val)` | () | Insert/update (method form) |
 | `.get(key)` | Option[V] | Safe lookup — pattern-match `Some(v)` / `None` |
 | `.contains_key(key)` | Bool | Key exists? |
@@ -736,7 +738,7 @@ let first_two = names
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `Set()` / `Set.new[T]()` | Set[T] | Create empty set |
+| `Set.new()` / `Set.new[T]()` | Set[T] | Create empty set |
 | `.insert(elem)` | Bool | Add element to set |
 | `.remove(elem)` | Bool | Remove element from set |
 | `.contains(elem)` | Bool | Membership check |
@@ -748,7 +750,7 @@ let first_two = names
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `Bytes.new()` / `Bytes()` | Bytes | Create empty byte buffer |
+| `Bytes.new()` | Bytes | Create empty byte buffer |
 | `Bytes.zeroed(n)` | Bytes | Create zero-filled buffer of length `n` |
 | `Bytes.from_str(s)` | Bytes | Create from string |
 | `.push(byte)` | () | Append byte (mutates) |
@@ -964,7 +966,7 @@ import std.time.{Instant, Date, Weekday}
 
 // Each line starts with a 20-byte stamp: "2026-10-17 09:30:00Z GET /"
 fn count_by_date(lines: List[Str]) -> Result[Map[Date, Int], ConversionError] {
-    let mut counts: Map[Date, Int] = Map()
+    let mut counts: Map[Date, Int] = Map.new()
     for line in lines {
         let d = Instant.parse(line.substring(0, 20))?.date()
         counts.insert(d, (counts.get(d) ?? 0) + 1)
@@ -1113,7 +1115,7 @@ let output = parts.join("\n")
 write_file("out.txt", output)
 
 // Map usage
-let mut scores: Map[Str, Int] = Map()
+let mut scores: Map[Str, Int] = Map.new()
 scores.insert("alice", 95)
 match scores.get("alice") {
     Some(s) => io.println("Score: {s}")
@@ -1329,7 +1331,7 @@ Run `blink doc --list` to list available modules.
 
 ## Gotchas
 
-- `{}` is NOT an empty map — use `Map()`. `{}` in expression position is a compile error. Similarly, use `Set()` for empty sets.
+- `{}` is NOT an empty map — use `Map.new()`. `{}` in expression position is a compile error. Similarly, use `Set.new()` for empty sets.
 - `file_exists()` returns `Int` (0/1), not `Bool` — use `== 1` or `== 0`
 - `is_dir()` also returns `Int`, not `Bool`
 - `shell_exec()` returns exit code (Int), not stdout — use `process_run()` for output capture

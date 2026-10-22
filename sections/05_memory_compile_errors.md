@@ -508,6 +508,25 @@ error[UndefinedFunction]: undefined function `fetch_users`
    = help: if this is from another module, add: `import auth.{fetch_users}`
 ```
 
+**A callee that names a type.** When the callee names a type and no function of that name is in scope, the call is E0504, and the first `help:` names the one empty form of that type (§3.2.2 *Construction and Mutability*):
+
+- For `List`, the form is `[]`.
+- For a type `T` that has a type-scoped `new` with no parameters, the form is `T.new()`. A `new` that takes parameters is never named.
+- For a struct that the caller can write as a literal, the form is the struct literal.
+- Otherwise the help names no form. An opaque type from another module is one case.
+
+One rule covers every type. It has no case for a name such as `List` or `StringBuilder`. A row of the §3.2 *Removed function forms* table, when it exists for the callee, gives the fix and applies first.
+
+```
+error[UndefinedFunction]: undefined function `List`
+ --> main.bl:2:14
+  |
+2 |     let xs = List()
+  |              ^^^^ `List` is a type, not a function
+  |
+  = help: an empty list is `[]`; the annotation or a later use gives the element type
+```
+
 When a missing import causes cascading errors (one unresolved name triggers many downstream failures), the compiler applies cascade suppression: downstream references to a poison symbol suppress their own diagnostics. A pattern or a construction that names a variant its enum does not declare (`NoSuchVariant`, §3.5 *Pattern Forms*) also makes poison: each binder under the pattern, and each binding of the construction's value, has the poison type. An error count cap (~20 errors) prevents terminal flooding.
 
 ### 6.4 Compiler-as-Service Daemon Architecture
