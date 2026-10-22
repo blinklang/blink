@@ -4,7 +4,11 @@
 
 **Question.** `T?` and `Option[T]` are the same type, and `[T]` and `List[T]` are the same type, so each has two spellings. Principle 2 says there is one way to do each thing; the panel picked one spelling for each.
 
-**Result.** `List[T]` is the only list spelling; `[T]` in a type is W1120 `ListTypeBrackets`. `T?` is the only Option spelling in a type; `Option[T]` there is W1121 `OptionTypeLongForm`. Both are warnings with a machine-applicable fix for one minor release, then errors. The type parser reads `??` as two `?` suffixes (`Int??` = `Option[Option[Int]]`). The §3 "whichever the project chooses" sentence is deleted; no setting picks a spelling. Diagnostics print only the canonical spelling. Spec: §2.2, §3.2 *One Spelling for List and Option Types*, §5, §7 prelude table; ERROR_CATALOG W1120, W1121.
+**Result.** `List[T]` is the only list spelling; `[T]` in a type is E1131 `ListTypeBrackets`. `T?` is the only Option spelling in a type; `Option[T]` there is E1132 `OptionTypeLongForm`. Both are errors at once with a machine-applicable fix (owner amendment below). The type parser reads `??` as two `?` suffixes (`Int??` = `Option[Option[Int]]`). The §3 "whichever the project chooses" sentence is deleted; no setting picks a spelling. Diagnostics print only the canonical spelling. Spec: §2.2, §3.2 *One Spelling for List and Option Types*, §5, §7 prelude table; ERROR_CATALOG E1131, E1132.
+
+### Owner amendment
+
+The owner approved the ruling except the warning release. Blink is pre-1.0, so the change breaks users at once. There is no W1120 and no W1121. `[T]` in a type is error E1131 `ListTypeBrackets`, and `Option[T]` in a type is error E1132 `OptionTypeLongForm`. Each keeps the machine-applicable fix that the panel gave the warning. The panel text below on the warning release (Q1 L1-a, Q2l G3, and the concern on the error-release schedule) is superseded.
 
 ### Panel Deliberation
 
@@ -253,8 +257,8 @@ fn lookup(cache: Map[Str, Int?], key: Str) -> Int?? {
 }
 ```
 
-- `List[T]` is the only list spelling. `[T]` in a type is W1120 `ListTypeBrackets`: a warning with a machine-applicable fix for one minor release, then an error.
-- `T?` is the only Option spelling in a type. `Option[T]` in a type annotation is W1121 `OptionTypeLongForm`: the same warning-then-error path.
+- `List[T]` is the only list spelling. `[T]` in a type is E1131 `ListTypeBrackets`, an error with a machine-applicable fix. There is no warning release.
+- `T?` is the only Option spelling in a type. `Option[T]` in a type annotation is E1132 `OptionTypeLongForm`, an error with the same kind of fix.
 - The type parser reads `??` as two `?` suffixes, so `Int??` is `Option[Option[Int]]`. The expression operator `a ?? b` does not change.
 - `Option` stays a name for paths (`Option.Some`), impl header self types, trait bounds and prose.
 - `?` is a type suffix: `List[Int]?` and `List[Int?]` are different types, and `(Int, Str)?` is an Option of a tuple.
@@ -271,7 +275,8 @@ fn lookup(cache: Map[Str, Int?], key: Str) -> Int?? {
 - **Test the `??` split next to the `a ?? b` operator (Web, DevOps, Systems, PLT):** Web: "Splitting a token in the type parser is a special case that must have tests, including `Int??` next to the `??` operator." DevOps: "`x as Int??` and `a ?? b` edge cases will produce confusing parse errors." Systems: "a bug there could change how `??` parses in expressions." PLT: "the grammar text must state exactly" the split rule.
 - **The formatter today rewrites the other way (DevOps, Systems, Minimalism):** `blink fmt` writes `Int?` as `Option[Int]` today; it must change in the same commit as the spec. Minimalism: "Fix text in old diagnostics (E0301) must be updated in the same change, or it will print the removed form." PLT: "Existing diagnostic goldens must change in the same commit as the formatter and spec, or the gate breaks."
 - **The printer uses the compiler-known Option by identity (Web):** "Printing `Str?` for a user type that shadows `Option` could mislead, so the printer should use the compiler-known type, as the identity rule says."
-- **Schedule the error release so the warning does not linger (Systems, DevOps, Minimalism, Web, PLT):** Systems: "The warning period may become permanent if nobody schedules the hard-error release." DevOps: "If the warning stage lingers past one release, the corpus keeps both spellings."
+- **Bootstrap order (owner amendment):** with no warning release, migrate src/, lib/ and tests/ to `List[T]` and `T?` before or with the compiler change that makes the old spellings errors. Follow the 3-step bootstrap order: add the errors' fixes, migrate with the fix, then turn on the errors.
+- *(superseded by the owner amendment)* **Schedule the error release so the warning does not linger (Systems, DevOps, Minimalism, Web, PLT):** Systems: "The warning period may become permanent if nobody schedules the hard-error release." DevOps: "If the warning stage lingers past one release, the corpus keeps both spellings."
 - **Sweep every copy of the old text (PLT, Web, AI/ML):** PLT: "a grep sweep must find all copies" of the "whichever the project chooses" sentence, including llms docs and the §7 prelude row. AI/ML: "check that no other section repeats the claim."
 - **Spec needs a nested-Option example (AI/ML):** "`Int??` reads like the default operator to a human or model skimming code, so the spec needs one example."
 - **Messages that echo user source (AI/ML, Systems):** AI/ML: "Messages that echo user source text could still show a non-canonical spelling during the warning release." Systems: "Messages that quote user source may then differ from the spelling in that source, which can confuse a reader."

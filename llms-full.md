@@ -322,7 +322,7 @@ test "addition works" {
 | U8 / U16 / U32 / U64 | — | Sized unsigned integers. C-style wrapping casts. FFI use. |
 | Errno | `Errno(rc)` | Transparent zero-cost newtype over `Int` (`pub type Errno { Errno(Int) }`, `import std.errno`). The error arm of the libc `*_bytes` wrappers. Extract the code by matching `Errno(rc)`; no methods in v1. See **Transparent newtypes** below. |
 
-**One spelling per type.** Write `List[T]` for a list type and `T?` for an option type. `[T]` in a type is warning `ListTypeBrackets` (W1120). `Option[T]` in a type is warning `OptionTypeLongForm` (W1121). Both have a machine-applicable fix.
+**One spelling per type.** Write `List[T]` for a list type and `T?` for an option type. `[T]` in a type is error `ListTypeBrackets` (E1131). `Option[T]` in a type is error `OptionTypeLongForm` (E1132). Both have a machine-applicable fix.
 
 **Enums are nominally distinct from `Int`.** An enum value is not interchangeable with `Int` at `let` / argument / return positions — passing one where the other is expected is a type error. Convert explicitly with `.to_int()` / `Type.from_int(n)`. (`==` between an enum and its int still works.)
 

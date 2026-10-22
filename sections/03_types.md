@@ -114,13 +114,13 @@ When a trait bound fails because `Never` has no impl of the trait (E0306), the e
 
 A type position is a parameter, return, field, `let` or type alias annotation, a type argument inside another type, and an explicit type-argument list at a call.
 
-- **`[T]` in a type** is `ListTypeBrackets` (W1120). A generic binder list (`fn f[T]`, `impl[T]`) is not a type. The machine-applicable fix writes `List[T]`. In an expression, square brackets keep their meaning: `[1, 2]` is a list literal and `[..a, ..b]` is a spread.
-- **`Option[T]` in a type** is `OptionTypeLongForm` (W1121). The machine-applicable fix writes `T?`, also inside other types: `List[Option[Int]]` becomes `List[Int?]`, and `f[Option[Int]](x)` becomes `f[Int?](x)`.
+- **`[T]` in a type** is `ListTypeBrackets` (E1131). A generic binder list (`fn f[T]`, `impl[T]`) is not a type. The machine-applicable fix writes `List[T]`. In an expression, square brackets keep their meaning: `[1, 2]` is a list literal and `[..a, ..b]` is a spread.
+- **`Option[T]` in a type** is `OptionTypeLongForm` (E1132). The machine-applicable fix writes `T?`, also inside other types: `List[Option[Int]]` becomes `List[Int?]`, and `f[Option[Int]](x)` becomes `f[Int?](x)`.
 - **`Option` stays a name.** A path (`Option.Some`), the self type of an `impl` header, a trait bound and prose keep the name `Option`. Only the type positions above take `T?`.
 - **`?` is a type suffix.** It applies to the type before it: `List[Int]?` is an optional list, `List[Int?]` is a list of optional values, and `(Int, Str)?` is an optional tuple.
 - **Nested Option.** The type parser reads a `??` token as two `?` suffixes, so `Int??` is `Option[Option[Int]]`. In an expression, `??` stays the defaulting operator.
 - **Identity.** `T?` names the compiler-known `Option` by identity, so a user type named `Option` does not change it (§10.6 *Shadowing Rules*).
-- **Schedule.** W1120 and W1121 are warnings for one minor compiler release. The next minor release makes each an error with the same fix.
+- **No warning release.** E1131 and E1132 are errors at once. Each keeps its machine-applicable fix.
 
 `blink fmt` writes `List[T]` and `T?`. No setting picks another spelling. Diagnostics and their fixes print types the same way: `expected Str?, found Int`, and the E0301 fix `: List[T]`.
 
