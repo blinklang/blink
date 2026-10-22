@@ -1563,7 +1563,7 @@ fn launch(tool: Str, args: List[Str]) ! Process.Spawn, Env.Exit, IO {
 ```blink
 test "build reports a failed make" {
     let mock = handler Process {
-        fn run(cmd: Str, args: List[Str], stdin: Str?, env: ChildEnv, cwd: Str?) -> Result[ProcessResult, ProcessError] {
+        fn run(cmd: Str, args: List[Str], *, stdin: Str?, env: ChildEnv, cwd: Str?) -> Result[ProcessResult, ProcessError] {
             Ok(ProcessResult { out: "", err_out: "no rule for target", exit_code: 2 })
         }
     }
@@ -1573,7 +1573,7 @@ test "build reports a failed make" {
 }
 ```
 
-A handler implements each op with all its parameters. A default value applies at the call site only. When a handler leaves out a parameter, the error names the missing parameter and offers a fix that adds it.
+A handler implements each op with all its parameters, and writes `*,` and the keyword names as the op does. A default value applies at the call site only. When a handler leaves out a parameter, the error names the missing parameter and offers a fix that adds it. The fix is machine-applicable only in the cases of §4.7 *Defining a handler*, *Fixes for a clause*.
 
 #### 4.4.9 Standard Input (`IO.Read`)
 
@@ -2019,7 +2019,50 @@ fn mock_db(data: List[Row]) -> Handler[DB] {
 }
 ```
 
-A handler must implement all operations for the effect it covers (or explicitly delegate unhandled operations to the outer handler). The compiler checks completeness -- you cannot create a `Handler[DB]` that forgets to implement `admin`.
+**Clause signatures.** Each `fn` in a handler is a clause. A clause names one operation of the handled effect and matches the header of that operation. The rule is the same for user effects and for every built-in effect (`FS`, `IO`, `Time`, `Env` and the others). A handler can leave out an operation (§4.7.1 *Completeness and auto-delegation*).
+
+- The clause has the parameters of the operation in the same count, order and types. Its result type equals the result type of the operation. Types are equal after alias expansion. There is no subtyping, so a wider parameter type or a narrower result type is a mismatch. The names of positional parameters are free.
+- The clause writes `*,` where the operation does. After it, the clause writes the keyword names of the operation in the order of the operation. A missing or moved `*,`, or a different keyword name, is a mismatch. A caller picks a keyword argument by name, so the name is what says which value the clause gets. Without this rule, a clause that swaps two keyword parameters of one type would get the wrong values and show no error.
+- The clause writes no default on a parameter. A default value applies at the call site only (§4.4.8).
+- A clause for an operation declared `-> Never` writes `-> Never`, and its body diverges (§4.4.3). A clause that writes `-> Never` for an operation with another result type is a mismatch.
+
+```blink
+effect Shell {
+    fn run(cmd: Str, *, cwd: Str? = None, stdin: Str? = None) -> Result[Str, Str]
+    fn read(path: Str) -> Str
+    fn stop(code: Int) -> Never
+}
+
+fn quiet_shell() -> Handler[Shell] {
+    handler Shell {
+        fn run(cmd: Str, *, cwd: Str?, stdin: Str?) -> Result[Str, Str] { Ok("") }
+        fn read(file: Str) -> Str { "" }
+        fn stop(code: Int) -> Never { panic("stop {code}") }
+    }
+}
+
+fn broken_shell() -> Handler[Shell] {
+    handler Shell {
+        fn run(cmd: Str, *, stdin: Str?, cwd: Str?) -> Result[Str, Str] { Ok("") }   // error[E0548]: keyword names in a different order
+        fn read(path: Int) -> Str { "" }                                            // error[E0548]: parameter 1 is Int, the operation takes Str
+        fn stop(code: Int = 1) -> Never { panic("stop") }                           // error[E0548]: a clause writes no default
+        fn stop(code: Int) -> Never { panic("stop") }                               // error[E0550]: a second clause for `stop`
+        fn remove(path: Str) -> Int { 0 }                                           // error[E0549]: `Shell` has no operation `remove`
+    }
+}
+```
+
+A clause whose arity, a parameter type, result type, `*,` marker or keyword name differs from the operation, or that writes a default, is `HandlerClauseMismatch` (E0548). The message and the JSON output name the part of the header that differs. The `help:` prints the header of the operation as one line to copy. A clause that names no operation of the handled effect is `UnknownHandlerOp` (E0549), and the `note:` lists the operations of the effect. A second or later clause for one operation is `DuplicateHandlerClause` (E0550), with a `note:` at the first clause. Only the first clause is checked for E0548. E0548 and E0549 never fire on one clause. Two clauses with one name that is no operation get E0549 each, and no E0550.
+
+**Fixes for a clause.** These fixes are machine-applicable:
+
+- Delete a default on a clause parameter.
+- Add, delete or move `*,`, and put the keyword names in the order of the operation.
+- Rename a keyword parameter, when the rename maps one name to one name and the new name is free in the body. The fix also renames the uses in the body.
+- Rename a clause to the suggested operation (E0549), when the clause already matches the header of that operation and no other clause names it.
+- Add a missing parameter, when its name does not occur free in the clause body and the place of the parameter is clear. A use in a closure counts, and so does a use of an outer name that the new parameter would hide. The place is not clear when the clause could miss more than one parameter: `fn two(a: Int)` for `two(a: Int, b: Int)`. A keyword parameter goes after `*,` at its place in the operation.
+
+All other fixes are suggestions. A rewrite of the header that changes a parameter type or the result type is not machine-applicable, because the body was written for the old types. The `help:` prints the header, and a code action that the user picks can offer it. E0550 has no machine-applicable fix.
 
 #### Handler composition
 
