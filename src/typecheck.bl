@@ -5305,6 +5305,7 @@ fn tc_arm_tail_value_node(body: Int) -> Int {
 // pin through here, so a position cannot fill a binder another position leaves open.
 fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_pin_tail_ret_generic(declared_tid, val_tid)
+    tc_literal_takes(val, declared_tid)
     let k = node_kind(val)
     if k == NodeKind.Block {
         tc_pin_declared_into_tail(declared_tid, val)
@@ -5700,6 +5701,18 @@ fn is_int_literal_node(node: Int) -> Int {
         if operand != -1 && node_kind(operand) == NodeKind.IntLit { return 1 }
     }
     0
+}
+
+// An int literal accepted where an integer type is expected has that type at the literal
+// (03_types.md §3.2 *Integer literal range*). Codegen reads the literal's own stamp, so the
+// type is recorded on the node, not only accepted: a U64 operand stamped Int is held in a
+// signed temp, and 2^63 reads back as the Int minimum.
+fn tc_literal_takes(node: Int, tid: Int) {
+    if node == -1 || is_int_literal_node(node) == 0 { return }
+    let t = tc_resolve(resolve_alias_tid(tid))
+    if is_integer_type(t) == 0 { return }
+    tc_publish_node_tid(node, t)
+    if node_kind(node) == NodeKind.UnaryOp { tc_publish_node_tid(node_left(node), t) }
 }
 
 // The parameter index a keyword argument names, or -1. Starts at self_offset so a method's
@@ -6225,6 +6238,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
     } else {
         let mut lit_to_int = 0
         if is_int_literal_node(arg_node) != 0 && is_integer_type(resolve_alias_tid(ptid)) != 0 {
+            tc_literal_takes(arg_node, ptid)
             lit_to_int = 1
         }
         // The template-literal coercion, on the same footing as the
@@ -6289,6 +6303,7 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     if tc_tid_has_unbound_metavar(expected_t) != 0 {
         let mut lit_ok = 0
         if is_int_literal_node(value_node) != 0 && is_integer_type(tc_resolve(expected_t)) != 0 {
+            tc_literal_takes(value_node, expected_t)
             lit_ok = 1
         }
         if lit_ok == 0 && tc_unify(expected_t, arg_t) == 0 {
@@ -6300,6 +6315,7 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
     }
     let mut lit_to_int = 0
     if is_int_literal_node(value_node) != 0 && is_integer_type(resolve_alias_tid(expected_t)) != 0 {
+        tc_literal_takes(value_node, expected_t)
         lit_to_int = 1
     }
     // Mirror of check_arg_shapes (the fnsig-backed sibling): the metavar can sit on
@@ -22632,6 +22648,8 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
         if cmp_is_enum_int_pair(lt, rt) == 0 {
             let lit_r = is_sized_int(type_kind(lt)) != 0 && rt == TYPE_INT && is_int_literal_node(node_right(node)) != 0
             let lit_l = is_sized_int(type_kind(rt)) != 0 && lt == TYPE_INT && is_int_literal_node(node_left(node)) != 0
+            if lit_r { tc_literal_takes(node_right(node), lt) }
+            if lit_l { tc_literal_takes(node_left(node), rt) }
             if lit_r == 0 && lit_l == 0 {
                 let relational = if op == "==" || op == "!=" { 0 } else { 1 }
                 let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { reject_ord_less_operands(lt, rt, node) }
@@ -23732,8 +23750,14 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // side. The sized result then chains through nested ops.
             let lit_to_sized_r = is_sized_int(type_kind(lt)) && rt == TYPE_INT && is_int_literal_node(node_right(node))
             let lit_to_sized_l = is_sized_int(type_kind(rt)) && lt == TYPE_INT && is_int_literal_node(node_left(node))
-            if lit_to_sized_r { return lt }
-            if lit_to_sized_l { return rt }
+            if lit_to_sized_r {
+                tc_literal_takes(node_right(node), lt)
+                return lt
+            }
+            if lit_to_sized_l {
+                tc_literal_takes(node_left(node), rt)
+                return rt
+            }
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 {
                 if types_compatible(lt, rt) == 0 {
                     tc_error_at("binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
@@ -29297,6 +29321,8 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // (`x = Err("boom")` pins the mut carrier's other slot).
                     if kind == NodeKind.Assignment {
                         tc_pin_declared_into_value(target_t, val, val_t)
+                    } else {
+                        tc_literal_takes(val, target_t)
                     }
                 }
             }
