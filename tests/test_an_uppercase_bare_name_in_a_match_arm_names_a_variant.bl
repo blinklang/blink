@@ -44,11 +44,14 @@ fn expect_rows(name: Str, src: List[Str], want: List[Str]) -> Str {
         let row = rows.get(i).unwrap()
         let parts = want.get(i).unwrap().split("@")
         let code = parts.get(0).unwrap()
-        let at = parts.get(1).unwrap().split(":")
+        // "line:col" or "line:col-end_col".
+        let span = parts.get(1).unwrap().split("-")
+        let at = span.get(0).unwrap().split(":")
         let msg = parts.get(2).unwrap()
         let help = parts.get(3).unwrap()
         if !row.contains("\"code\":\"{code}\"") { problems.push("{name}: row {i}: want {code} in {row}") }
-        if !row.contains("\"line\":{at.get(0).unwrap()},\"col\":{at.get(1).unwrap()}") { problems.push("{name}: row {i}: want {parts.get(1).unwrap()} in {row}") }
+        let want_at = if span.len() > 1 { "\"line\":{at.get(0).unwrap()},\"col\":{at.get(1).unwrap()},\"end_line\":{at.get(0).unwrap()},\"end_col\":{span.get(1).unwrap()}" } else { "\"line\":{at.get(0).unwrap()},\"col\":{at.get(1).unwrap()}" }
+        if !row.contains(want_at) { problems.push("{name}: row {i}: want {parts.get(1).unwrap()} in {row}") }
         if !row.contains("\"message\":\"{msg}\"") { problems.push("{name}: row {i}: want message {msg} in {row}") }
         if help == "" && row.contains("\"help\":") { problems.push("{name}: row {i}: want no help in {row}") }
         if help != "" && !row.contains("\"help\":\"{help}\"") { problems.push("{name}: row {i}: want help {help} in {row}") }
@@ -72,6 +75,11 @@ let BIND_HELP = "to bind the value, write a lowercase name"
 
 fn guard_help(subject: Str, name: Str) -> Str {
     "{BIND_HELP}\\nto compare with the value `{name}`, write a guard: `{subject} if {subject} == {name} =>`"
+}
+
+// At a nested position the guard cannot replace the whole arm pattern.
+fn nested_guard_help(name: Str) -> Str {
+    "{BIND_HELP}\\nto compare with the value `{name}`, write a lowercase name here and add a guard: `if n == {name}`"
 }
 
 fn on_scalar(name: Str, ty: Str) -> Str {
@@ -146,7 +154,7 @@ test "an uppercase name on a scalar is E0308, with the guard help only when a va
         "    io.println(show(3))",
         "}",
     ], [
-        "E0308@6:9@{on_scalar("MAX", "Int")}@{guard_help("n", "MAX")}",
+        "E0308@6:9-12@{on_scalar("MAX", "Int")}@{guard_help("n", "MAX")}",
         "E0308@13:9@{on_scalar("Red", "Int")}@{BIND_HELP}",
     ])
     let local = expect_rows("local", [
@@ -339,4 +347,225 @@ test "blink check, a per-module build and a one-unit build report the same varia
     assert(check.err_out.contains("error[EnumPatternNeedsEnumScrutinee]: `T` is a type parameter; it has no variants"))
     assert(check.err_out.contains("error[NoSuchVariant]: `Shape` has no variant `Dott`"))
     assert(check.err_out.contains("2 error(s) found"))
+}
+
+test "an uppercase name on a list, map, set, bytes or fn value is E0308, not a catch-all" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let kinds = expect_rows("kinds", [
+        "fn on_list(xs: List[Int]) -> Int \{",
+        "    match xs \{",
+        "        Foo => 0",
+        "        _ => 1",
+        "    }",
+        "}",
+        "",
+        "fn nested(o: Option[List[Int]]) -> Int \{",
+        "    match o \{",
+        "        Some(Empty) => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn on_map(m: Map[Str, Int]) -> Int \{",
+        "    match m \{",
+        "        Foo(v) => v",
+        "        _ => 1",
+        "    }",
+        "}",
+        "",
+        "fn on_set(s: Set[Int]) -> Int \{",
+        "    match s \{",
+        "        Foo => 0",
+        "        _ => 1",
+        "    }",
+        "}",
+        "",
+        "fn on_bytes(b: Bytes) -> Int \{",
+        "    match b \{",
+        "        Foo => 0",
+        "        _ => 1",
+        "    }",
+        "}",
+        "",
+        "fn on_fn(f: fn(Int) -> Int) -> Int \{",
+        "    match f \{",
+        "        Foo => 0",
+        "        _ => 1",
+        "    }",
+        "}",
+        "",
+        "fn main() \{}",
+    ], [
+        "E0308@3:9-12@`List[Int]` is not an enum; it has no variants@{BIND_HELP}",
+        "E0308@10:14-19@`List[Int]` is not an enum; it has no variants@{BIND_HELP}",
+        "E0308@17:9-12@`Map[Str, Int]` is not an enum; it has no variants@",
+        "E0308@24:9-12@`Set[Int]` is not an enum; it has no variants@{BIND_HELP}",
+        "E0308@31:9-12@`Bytes` is not an enum; it has no variants@{BIND_HELP}",
+        "E0308@38:9-12@`Fn(Int) -> Int` is not an enum; it has no variants@{BIND_HELP}",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    report([kinds])
+}
+
+test "a mut before an uppercase name that names no variant is one error spanned at the name" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let gren = expect_rows("mut_gren", [
+        "type Color \{ Red, Green }",
+        "",
+        "fn f(c: Color) -> Int \{",
+        "    match c \{",
+        "        mut Gren => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{f(Color.Red)}\") }",
+    ], ["E0547@5:13-17@`Color` has no variant `Gren`@did you mean `Green`?"])
+    let maxx = expect_rows("mut_maxx", [
+        "fn f(n: Int) -> Int \{",
+        "    match n \{",
+        "        mut MAXX => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{f(1)}\") }",
+    ], ["E0308@3:13-17@{on_scalar("MAXX", "Int")}@{BIND_HELP}"])
+    let _ = sh("rm -rf {DIR}")
+    report([gren, maxx])
+}
+
+test "the guard help shows only where a guard can compare with the value" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}/src")
+    // A second module needs a package.
+    write_file("{DIR}/blink.toml", "[package]\nname = \"guard_help\"\nversion = \"0.1.0\"\n")
+    write_file("{DIR}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{DIR}/src/limits.bl", lines(["pub let CAP = 3"]))
+    let helps = expect_rows("src/helps", [
+        "import limits",
+        "",
+        "const MAX = 10",
+        "const DEBUG = 2",
+        "",
+        "fn nested(o: Option[Int]) -> Int \{",
+        "    match o \{",
+        "        Some(MAX) => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn on_param[T](x: T) -> Int \{",
+        "    match x \{",
+        "        MAX => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn upper_subject(MODE: Int) -> Int \{",
+        "    match MODE \{",
+        "        DEBUG => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn not_selected(n: Int) -> Int \{",
+        "    match n \{",
+        "        CAP => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{limits.CAP}\") }",
+    ], [
+        "E0308@8:14-17@{on_scalar("MAX", "Int")}@{nested_guard_help("MAX")}",
+        "E0308@15:9-12@`T` is a type parameter; it has no variants@{BIND_HELP}",
+        "E0308@22:9-14@{on_scalar("DEBUG", "Int")}@{guard_help("n", "DEBUG")}",
+        "E0308@29:9-12@{on_scalar("CAP", "Int")}@{BIND_HELP}",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    report([helps])
+}
+
+test "a struct qualifier on an enum position is NoSuchVariant, as before" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let qual = expect_rows("struct_qual", [
+        "type Point \{ x: Int, y: Int }",
+        "type Color \{ Red, Green }",
+        "",
+        "fn f(c: Color) -> Int \{",
+        "    match c \{",
+        "        Point.Zed => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{f(Color.Red)}\") }",
+    ], ["E0547@6:15-18@`Point` is a struct; it has no variants@"])
+    let _ = sh("rm -rf {DIR}")
+    report([qual])
+}
+
+test "a lowercase name another enum declares still covers a type parameter" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/lower_param.bl", lines([
+        "type E \{ foo, Bar }",
+        "",
+        "fn f[T](x: T) -> Int \{",
+        "    match x \{",
+        "        foo => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{f(3)}\") }",
+    ]))
+    let r = blink_in_dir("run lower_param.bl")
+    let _ = sh("rm -rf {DIR}")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "0")
+}
+
+test "a qualified variant or a struct pattern on a list or type parameter is E0300, not a catch-all" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let other = expect_rows("other_kinds", [
+        "type Color \{ Red, Green }",
+        "type Point \{ x: Int, y: Int }",
+        "",
+        "fn a(xs: List[Int]) -> Int \{",
+        "    match xs \{",
+        "        Color.Red => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn b(xs: List[Int]) -> Int \{",
+        "    match xs \{",
+        "        Point \{ x, .. } => x",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn c[T](v: T) -> Int \{",
+        "    match v \{",
+        "        Color.Red => 1",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn d[T](v: T) -> Int \{",
+        "    match v \{",
+        "        Point \{ x, .. } => x",
+        "        _ => 0",
+        "    }",
+        "}",
+        "",
+        "fn main() \{ io.println(\"\{a([1])}\{b([1])}\{c(1)}\{d(1)}\") }",
+    ], [
+        "E0300@6:9-18@pattern of type `Color` used on a value of type `List[Int]`@",
+        "E0300@13:9-14@pattern of type `Point` used on a value of type `List[Int]`@",
+        "E0300@20:9-18@pattern of type `Color` used on a value of type `T`@",
+        "E0300@27:9-14@pattern of type `Point` used on a value of type `T`@",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    report([other])
 }

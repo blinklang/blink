@@ -21201,7 +21201,9 @@ fn nr_check_pattern(node: Int, refutable: Bool) ! TypeCheck.Resolve, Diag.Report
         let name = node_name(node)
         if pattern_name_binds(name, refutable) {
             nr_define_mut_at(name, node_is_mut(node), node)
-        } else if node_is_mut(node) != 0 && node_is_mut(node) != BINDER_MUT_RECOVERED {
+        } else if is_variant_name(name) != 0 && node_is_mut(node) != 0 && node_is_mut(node) != BINDER_MUT_RECOVERED {
+            // An uppercase name no enum declares gets one error from the pattern check, at
+            // the name, not a second one about `mut`.
             nr_report_mut_on_variant(node, name)
         }
         return
@@ -28222,16 +28224,36 @@ fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeChec
 // every value covers it. This check does not trust the pattern checks to have caught a
 // variant arm on the parameter: such a match would panic at run time.
 fn tc_check_type_param_match_exhaustive(node: Int, tv: Int, arms_sl: Int) ! TypeCheck.Report, Diag.Report {
-    let mut covered: List[Str] = []
     let mut ai = 0
     while ai < sublist_length(arms_sl) {
         let arm = sublist_get(arms_sl, ai)
-        if node_guard(arm) == -1 && tc_exh_collect_pattern(node_pattern(arm), covered) != 0 { return }
+        if node_guard(arm) == -1 && tc_pattern_covers_type_param(node_pattern(arm)) { return }
         ai = ai + 1
     }
     diag_error_at("NonExhaustiveMatch", NON_EXHAUSTIVE_MATCH,
         "non-exhaustive match: a value of type parameter `{type_to_str(tv)}` is matched by no arm that always runs", node,
         "add a binding arm or a `_ => ...` catch-all arm")
+}
+
+// Whether a pattern matches every value of a type parameter. Only the case of a bare name
+// decides here: a lowercase name binds even when some enum declares it as a variant, since
+// no enum is the type at this position.
+fn tc_pattern_covers_type_param(pat: Int) -> Bool {
+    if pat == -1 { return false }
+    let k = node_kind(pat)
+    if k == NodeKind.WildcardPattern { return true }
+    if k == NodeKind.IdentPattern { return !tc_name_is_upper(node_name(pat)) }
+    if k == NodeKind.AsPattern { return tc_pattern_covers_type_param(node_pattern(pat)) }
+    if k == NodeKind.OrPattern {
+        let alts = node_elements(pat)
+        if alts == -1 { return false }
+        let mut i = 0
+        while i < sublist_length(alts) {
+            if tc_pattern_covers_type_param(sublist_get(alts, i)) { return true }
+            i = i + 1
+        }
+    }
+    false
 }
 
 // Bind a `with <expr> as x { .. }` resource name WITH its type.
@@ -30151,7 +30173,6 @@ fn tc_owner_variant_form(o: VariantOwner, name: Str) -> Int {
 }
 
 fn tc_pattern_payload_form(pat: Int) -> Int {
-    if node_kind(pat) == NodeKind.IdentPattern { return 0 }
     if node_kind(pat) == NodeKind.StructPattern || node_int_val(pat) == 1 { return 2 }
     if node_fields(pat) == -1 { return 0 }
     1
@@ -30171,12 +30192,25 @@ fn tc_bare_variant_fault(name: Str, h: Int) -> PatternFault {
         None => {}
     }
     if tc_kind_has_no_variants(h) != 0 { return PatternFault.OnScalar("") }
+    if !tc_settled_without_variants(h) { return PatternFault.Clean }
     match type_kind(h) {
         TyKind.Struct => PatternFault.NoVariants(type_to_str(h), "a struct")
         TyKind.Tuple => PatternFault.NoVariants(type_to_str(h), "a tuple")
-        // An unknown parameter type (E0507) recovers as an open type variable: it is not one.
-        TyKind.Typevar => if tc_typevar_is_rigid(h) != 0 { PatternFault.NoVariants(type_to_str(h), "a type parameter") } else { PatternFault.Clean }
-        _ => PatternFault.Clean
+        TyKind.Typevar => PatternFault.NoVariants(type_to_str(h), "a type parameter")
+        _ => PatternFault.NoVariants(type_to_str(h), "not an enum")
+    }
+}
+
+// Whether `h`, a type no variant owner claims, is settled and so can match no variant pattern.
+// A type already in error was reported where it went wrong, an enum with no owner is not one
+// this check can read, and an unknown parameter type (E0507) recovers as an open type variable.
+fn tc_settled_without_variants(h: Int) -> Bool {
+    match type_kind(h) {
+        TyKind.Unknown => false
+        TyKind.Never => false
+        TyKind.Enum => false
+        TyKind.Typevar => tc_typevar_is_rigid(h) != 0
+        _ => true
     }
 }
 
@@ -30192,8 +30226,7 @@ fn tc_qualified_variant_fault(qual: Str, variant: Str, h: Int, open: Bool) -> Pa
                 Some(o) => return if tc_same_owner(o, q) { PatternFault.Clean } else { PatternFault.WrongType(qual, q.base) }
                 None => {}
             }
-            let hk = type_kind(h)
-            if hk == TyKind.Struct || hk == TyKind.Tuple { return PatternFault.WrongType(qual, q.base) }
+            if tc_settled_without_variants(h) { return PatternFault.WrongType(qual, q.base) }
             PatternFault.Clean
         }
         None => {
@@ -30236,7 +30269,7 @@ fn tc_pattern_fault(pat: Int, hint: Int) -> PatternFault ! TypeCheck.Resolve, Di
     if named == -1 { return tc_bare_variant_fault(tname, h) }
     let hk = type_kind(h)
     if hk == TyKind.Struct { return if tc_struct_base_tid(h) == named { PatternFault.Clean } else { PatternFault.WrongType(tname, named) } }
-    if hk == TyKind.Tuple || tc_kind_has_no_variants(h) != 0 { return PatternFault.WrongType(tname, named) }
+    if tc_settled_without_variants(h) { return PatternFault.WrongType(tname, named) }
     PatternFault.Clean
 }
 
@@ -30326,13 +30359,22 @@ fn tc_report_no_such_variant_value(node: Int, owner: VariantOwner, qual: Str, na
 }
 
 // The repairs for an uppercase name with no payload at a position that is not an enum: a
-// lowercase name binds the value, and when a value has that name a guard compares with it.
-// The guard binds the matched value under its own name when the match names one.
-fn tc_bare_name_on_non_enum_help(name: Str, subject: Str) -> Str {
+// lowercase name binds the value, and when a value of that name is in scope a guard compares
+// with it. A type parameter has no `==`, so no guard can compare there. At the top of an arm
+// the guard binds the matched value under its own name when the match names one; deeper, the
+// guard cannot replace the whole arm pattern, so the help says where each part goes.
+fn tc_bare_name_on_non_enum_help(name: Str, subject: Str, comparable: Bool) -> Str {
     let bind = "to bind the value, write a lowercase name"
-    // nr_is_defined would mark the value read and hide an unused-value warning on it.
-    if nr_top_index(name) == -1 { return bind }
-    let v = if subject != "" { subject } else { "n" }
+    if !comparable { return bind }
+    // nr_is_defined would mark the value read and hide an unused-value warning on it, and
+    // nr_has_binding answers for a name bound anywhere, not here.
+    let idx = nr_top_index(name)
+    if idx == -1 { return bind }
+    // A declaration this file's import list does not select is not in scope here.
+    if !nr_index_is_local(idx) && nr_unselected_source(name) != "" { return bind }
+    if subject == "" { return "{bind}\nto compare with the value `{name}`, write a lowercase name here and add a guard: `if n == {name}`" }
+    // An uppercase binder would itself name a variant.
+    let v = if tc_name_is_upper(subject) { "n" } else { subject }
     "{bind}\nto compare with the value `{name}`, write a guard: `{v} if {v} == {name} =>`"
 }
 
@@ -30341,7 +30383,9 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
     let qualified = k == NodeKind.EnumPattern && node_type_name(pat) != ""
     let qual = if qualified { node_name(pat) } else { "" }
     let name = if k == NodeKind.StructPattern || qualified { node_type_name(pat) } else { node_name(pat) }
-    let col = if qualified { tc_qualified_name_col(pat, qual, name) } else { node_col(pat) }
+    // `mut Name` starts at `mut`; the name ends where the node does.
+    let ident_end = k == NodeKind.IdentPattern && node_end_col(pat) > 0 && node_end_line(pat) == node_line(pat)
+    let col = if qualified { tc_qualified_name_col(pat, qual, name) } else if ident_end { node_end_col(pat) - name.byte_len() } else { node_col(pat) }
     let line = node_line(pat)
     let bare = !qualified || is_import_module_name(qual) != 0
     match fault {
@@ -30356,8 +30400,11 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
         }
         PatternFault.NoVariants(shown, noun) => {
             let at = if col == -1 { node_col(pat) } else { col }
-            let help = if k == NodeKind.IdentPattern { tc_bare_name_on_non_enum_help(name, subject) } else { "" }
-            diag_error_span_at_notes("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM, "`{shown}` is {noun}; it has no variants", pat, line, at, at + name.byte_len(), help, [])
+            let help = if k == NodeKind.IdentPattern { tc_bare_name_on_non_enum_help(name, subject, noun != "a type parameter") } else { "" }
+            // `Point.Zed` names a variant of `Point` itself, so it reads as a lookup that found
+            // none; only the type at the position makes a bare name's fault a type mismatch.
+            let (dname, dcode) = if bare { ("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM) } else { ("NoSuchVariant", NO_SUCH_VARIANT) }
+            diag_error_span_at_notes(dname, dcode, "`{shown}` is {noun}; it has no variants", pat, line, at, at + name.byte_len(), help, [])
         }
         PatternFault.WrongType(named, ptid) => {
             let h = resolve_alias_tid(tc_tid_resolved(hint))
@@ -30396,13 +30443,15 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
             let help = if enum_qual != "" {
                 "match the enum itself, or cross the boundary explicitly with {enum_qual}.from_int(...), which answers Option[{enum_qual}]"
             } else if k == NodeKind.IdentPattern {
-                tc_bare_name_on_non_enum_help(name, subject)
+                tc_bare_name_on_non_enum_help(name, subject, true)
             } else {
                 "a scalar has no variants: match it with literals, ranges or a binding"
             }
-            diag_error_at("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM,
+            let at = if col == -1 { node_col(pat) + qual.byte_len() + 1 } else { col }
+            let start = if qualified { at - qual.byte_len() - 1 } else { at }
+            diag_error_span_at_notes("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM,
                 "match arm names variant `{shown}`, but the value being matched has type `{type_to_str(resolve_alias_tid(tc_tid_resolved(hint)))}` -- a scalar has no variants",
-                pat, help)
+                pat, line, start, at + name.byte_len(), help, [])
         }
     }
 }
@@ -30443,29 +30492,18 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
     // one of them for its type found no answer at all.
     if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
     // An uppercase name in a refutable pattern is a variant: it is judged below like `Red(x)`.
+    // A nullary variant (`None`) and `_` bind nothing, but they still MATCH a value, so they
+    // keep the tid published above; only the scope entry is conditional.
     if kind == NodeKind.IdentPattern && !(refutable && tc_name_is_upper(node_name(node))) {
         let name = node_name(node)
-        // A nullary variant (`None`) and `_` bind nothing, but they still MATCH a value, and
-        // the value they match is the one the enclosing pattern decomposed to — the same type
-        // a binder in their place would take. So the tid goes on every IdentPattern; only the
-        // scope entry is conditional.
-        if name == "_" || is_variant_name(name) != 0 {
-            if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
-            return false
-        }
-        if name != "_" && is_variant_name(name) == 0 {
-            if tc_pattern_binding_type >= 0 {
-                nr_define_typed(name, node_is_mut(node), tc_pattern_binding_type, node)
-                // Publish on the LEAF node as well as into scope. Every arm above decomposes
-                // the binding hint one level — Option/Result unwrap, tuple element, list
-                // element, enum variant field — so by the time control reaches here the
-                // right answer for this one binder is already computed. Handing codegen the
-                // node's tid lets it read that decomposition instead of walking the pattern a
-                // second time to re-derive it.
-                tc_publish_node_tid(node, tc_pattern_binding_type)
-            } else {
-                nr_define_mut(name, node_is_mut(node))
-            }
+        if !pattern_name_binds(name, refutable) { return false }
+        // Every arm above decomposes the binding hint one level -- Option/Result unwrap, tuple
+        // element, list element, enum variant field -- so the binder's type is already
+        // computed, and the tid published above hands codegen that decomposition.
+        if tc_pattern_binding_type >= 0 {
+            nr_define_typed(name, node_is_mut(node), tc_pattern_binding_type, node)
+        } else {
+            nr_define_mut(name, node_is_mut(node))
         }
         return false
     }
