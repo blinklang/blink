@@ -725,8 +725,8 @@ The match is exhaustive. Add a new variant to `ConfigError` and the compiler tel
 
 ```blink
 type Option[T] {
-    Some(T)
     None
+    Some(T)
 }
 ```
 

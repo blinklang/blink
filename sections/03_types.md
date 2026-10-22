@@ -4455,6 +4455,8 @@ Y* = total ordering semantics. Unsigned types don't impl `Neg`. `Float` doesn't 
 
 `Option`, `Result`, `List`, `Set`, `Map` and tuples implement `Eq` when their parts do — see *Container Equality* below.
 
+**`Option` and `Result` instances.** `Option[T]` and `Result[T, E]` have the instances that `@derive` gives a user sum type with the same variants, for `Eq`, `Ord`, `Clone` and `Debug`. The bounds are the ones that *Generic Type Bound Inference* (§3.6.1) infers: `Option[T]` has the instance when `T` does, and `Result[T, E]` has it when `T` and `E` both do. *Container Equality*, *Ord for `Option` and `Result`* (below), *Clone Semantics* (§3.6.1) and *Debug vs Display* (§3.6.1) state each instance. `Hash` is not one of them: no container has a `Hash` impl (*Hash Contract and Seeding*). This rule does not cover JSON. The JSON instances of `Option` and the absence of one for `Result` are in the *Type Mapping* rows (§3.6.2).
+
 #### Container Equality
 
 The built-in containers implement `Eq` **conditionally**: a container is `Eq` when its parts are `Eq` (vote: 6-0; see [Container Equality rationale](../decisions/container-equality.md)). The compiler provides these impls. The orphan rule (*Trait Coherence*) stops user code from writing them.
@@ -4468,6 +4470,8 @@ The built-in containers implement `Eq` **conditionally**: a container is `Eq` wh
 | `Map[K, V]` | `V: Eq` (`K: Hash` gives `K: Eq`) | the key sets are equal and, for each key, the values are `==` |
 | `Bytes` | always | the lengths are equal and the bytes are equal |
 | tuple | every element is `Eq` | element-wise `==` (§3.8 *Auto-Derived Trait Implementations*) |
+
+`Option` and `Result` are `Eq` as `@derive(Eq)` makes a user sum type with the same variants: the variants must match, and then the payloads must be `==`.
 
 The check recurses through the type. `Option[List[Int]]` is `Eq` because `List[Int]` is `Eq`, because `Int` is `Eq`. `List[Widget]` is `Eq` only when `Widget` has an `Eq` impl or `@derive(Eq)`.
 
@@ -4566,7 +4570,31 @@ fn main() {
 - **Generic fieldless enums.** `type Tag[T] { A  B }` is fieldless as written, so it is `Eq` and `Ord` with no bound on `T`.
 - **The first payload.** When a fieldless enum gets its first payload variant, it loses the implicit `Eq` and `Ord` together. `==`, `<` and `.cmp()` on it are errors until the declaration has the derives or impls.
 
-**Ord.** `Set` and `Map` never implement `Ord`: no order over them is canonical and agrees with membership equality.
+##### Ord for `Option` and `Result`
+
+`Option[T]` is `Ord` when `T: Ord`. `Result[T, E]` is `Ord` when `T: Ord` and `E: Ord`. The order is the one that `@derive(Ord)` gives a user sum type with the same variants: compare the variant first, then the payload (*Sum Type Codegen (Enums)*, §3.6.1). In words:
+
+- `None` is less than every `Some(_)`. Two `Some` values compare by their payloads.
+- Every `Ok(_)` is less than every `Err(_)`. Two `Ok` values compare by their `T` payloads, and two `Err` values compare by their `E` payloads.
+
+The declarations of `Result` and `Option` (§7.2, §7.3) list the variants in this order, so the declaration-order rule for fieldless enums (*Enum Ord* above) and the words above give the same result. `Result[T, E]` needs `E: Ord` also when a program compares only `Ok` values: the bound is on the types, not on the values. The order agrees with the `Eq` of *Container Equality*, so the *Ord laws* below hold.
+
+A tuple, or a type with `@derive(Ord)`, that holds an `Option` or a `Result` is `Ord` when its other parts are. `List[T].sort()` accepts a `T` of `Int?` or `Result[Int, Str]`.
+
+```blink
+@derive(Ord)
+type Row { id: Int, score: Int? }                  // OK: `Int?` is `Ord`
+
+fn main() {
+    let xs = [Some(3), None, Some(1)].sort()       // [None, Some(1), Some(3)]
+    let a = None < Some(0)                         // true
+    let b = Ok(9) < Err("x")                       // true
+    let c = Err("a") < Err("b")                    // true: same variant, compare payloads
+    let d = (Some(1), 0) < (Some(1), 5)            // true: a tuple of `Ord` parts is `Ord`
+}
+```
+
+**Ord.** `Set` and `Map` never implement `Ord`: no order over them is canonical and agrees with membership equality. `Option` and `Result` are `Ord` as stated above, and are not part of this exclusion.
 
 **Eq laws.** An `Eq` impl must be reflexive (`a == a`), symmetric (`a == b` implies `b == a`) and transitive (`a == b` and `b == c` imply `a == c`). The compiler and the container impls may rely on these laws, as `Map` and `Set` rely on the Hash coherence law. Every built-in `Eq` obeys the laws; `Float` obeys them because `NaN == NaN` (*Float Total Ordering*). If a user impl breaks a law, `==` on a container that holds that type returns an unspecified `Bool`. It stays memory-safe.
 
@@ -5145,6 +5173,7 @@ For reference, the seven derivable traits and their required methods:
 - **Value types** (`Int`, `Float`, `Bool`, `Char`, `Str`): a copy of the value. A `Str` cannot change, so no program can see whether a copy shares its bytes.
 - **`Bytes`**: a copy of the value. A write through the clone does not show in the original.
 - **`List`, `Map`, `Set` and other shared cells** (§3.6 *Shared cells*): the clone refers to the same cell. A change made through the clone **does** show in the original — the same as JS spread (`{...obj}`) or Python `copy.copy()`.
+- **`Option` and `Result`**: `Option[T]` is `Clone` when `T: Clone`, and `Result[T, E]` is `Clone` when `T: Clone` and `E: Clone`. The clone has the same variant as the original, and the payload is copied by the `clone` of its own type, so a written `impl Clone` on the payload type runs. When the payload's `clone` gives the same value as `let y = x` (every built-in type and every derived `Clone`), so does the clone of the `Option` or `Result`: a shared cell inside stays shared (the bullet above). It is not a deep copy.
 - **User structs and enums**: `x.clone()` gives the same value as `let y = x`. Each field is copied by its declared type, using the rules above. A field whose declared type is a struct or enum is a value, and its copy is a value too (for example, a payload of the enum's own type, §3.4 *Recursive Types*).
 
 **A write to a place stays in its value.** A write to a place (§2.22) changes only the value that owns that place, even when that value is a copy of another value. Only a shared cell (§3.6 *Shared cells*) or a synchronized object (§3.6 *Synchronized objects*) can change through a second name.
@@ -5160,6 +5189,13 @@ type Tree {
 
 let a = Tree.Node(value: 1, next: Tree.Leaf)
 let b = a.clone()          // same value as `let b = a`
+```
+
+```blink
+fn keep(r: Result[List[Int], Str]) -> (Result[List[Int], Str], Result[List[Int], Str]) {
+    let c = r.clone()      // same value as `let c = r`; the `List` cell stays shared
+    (r, c)
+}
 ```
 
 Deep clone is not provided in v1: no function or method makes a deep copy. `ch.send` copies the shared cells a value reaches, but only as part of the send (§4.13 *Shared cells cross a channel as copies*). A `DeepClone` trait can be added post-v1 for use cases requiring full structural independence.
@@ -5196,7 +5232,9 @@ String interpolation (`"{value}"`) invokes `Display`. Explicit `value.debug()` i
 types as the conditional `Eq` instances (*Container Equality*), so a value that can be compared can
 also be shown, which the assertion built-ins need (§2.20 *Built-in Assertions*). Their element-wise
 rendering and the one remaining exclusion (container map keys) are specified in *Container Debug
-Rendering* below.
+Rendering* below. `Option` and `Result` have the `Debug` that `@derive(Debug)` gives a user sum type
+with the same variants (*Option and Result instances*, §3.6): `Some(42)`, `None`, `Ok(42)`,
+`Err("io")`.
 
 **Debug agrees with Eq.** For a type that is both `Eq` and `Debug`, `a == b` must give
 `a.debug() == b.debug()`. This is a contract of the same kind as `Hash` agreeing with `Eq` (*Hash
@@ -5820,7 +5858,7 @@ A derived implementation satisfies these laws. A hand-written implementation of 
 - **`Eq`**: `==` is reflexive, symmetric and transitive.
 - **`Hash` agrees with `Eq`**: if `a == b`, then `a.hash() == b.hash()`.
 - **`Ord` is total and agrees with `Eq`**: for each `a` and `b`, exactly one of `a < b`, `a == b` and `a > b` holds, and `a.cmp(b)` is `Equal` exactly when `a == b`.
-- **`Serialize` and `Deserialize` round-trip**: for a value `x` of type `T` that holds no NaN or infinite `Float`, `T.from_json(x.to_json())` is `Ok` of a value equal to `x`. A non-finite `Float` does not survive the round trip (§3.6.2 *NaN and Infinity*).
+- **`Serialize` and `Deserialize` round-trip**: for a value `x` of type `T` that holds no NaN or infinite `Float`, and no `Some(v)` where `v.to_json()` is `JsonValue.Null`, `T.from_json(x.to_json())` is `Ok` of a value equal to `x`. A non-finite `Float` does not survive the round trip (§3.6.2 *NaN and Infinity*). A `Some(v)` where `v.to_json()` is `JsonValue.Null` does not survive it either: that position decodes as `None` (§3.6.2 *Option and Result in JSON*).
 
 ##### Error Reporting
 
@@ -5995,11 +6033,77 @@ unknown value "closed" for Status at $.status; expected one of: "open", "in_prog
 | `Float` | `JsonValue.Float` |
 | `Bool` | `JsonValue.Bool` |
 | `Str` | `JsonValue.Str` |
-| `Option[T]` | `JsonValue.Null` for `None`, `T.to_json()` for `Some(v)` |
+| `Option[T]` | `JsonValue.Null` for `None`, `T.to_json()` for `Some(v)`. Decode: `JsonValue.Null` is `None`, any other value is `T.from_json(j)` wrapped in `Some` |
+| `Result[T, E]` | No JSON form in v1: no `Serialize`, no `Deserialize` |
 | `List[T]` | `JsonValue.Array` |
 | Struct with `@derive(Serialize)` | `JsonValue.Object` |
 | Enum with `@derive(Serialize)`, not Str-backed | Tagged object: `{"variant": "Name", "fields": {...}}` |
 | Str-backed enum with `@derive(Serialize)` | `JsonValue.Str` of its backing literal: `"in_progress"` |
+
+##### Option and Result in JSON
+
+The *Type Mapping* rows are the whole JSON rule for these two types. The rule of *Option and Result instances* (§3.6) does not apply to `Serialize` and `Deserialize`.
+
+**`Option[T]`.** `Option[T]` is `Serialize` when `T: Serialize`, and `Deserialize` when `T: Deserialize`. `to_json` gives `JsonValue.Null` for `None` and `T.to_json()` for `Some(v)`. `from_json` gives `Ok(None)` for `JsonValue.Null`. For any other value `j`, it gives `T.from_json(j)` with `Ok(v)` changed to `Ok(Some(v))`. An `Err` from `T.from_json` is the result as it is; `Option` adds no step to its `path`. An `Option[Float]` field that reads `null` as `None` (*NaN and Infinity*) is one case of this rule.
+
+**`Option[Option[T]]`.** The instance stays parametric: `Option[T]` is `Serialize` for every `T: Serialize`, and `T` may be an `Option`. So `fn send[T: Serialize](x: T?) -> JsonValue { x.to_json() }` compiles for every `T`. `Some(None)` and `None` of type `Int??` both give `JsonValue.Null`, and `null` decodes as `None`. The round-trip law (§3.6.1 *Derive Laws*) states this loss. The same loss occurs for `Some(JsonValue.Null)` in an `Option[JsonValue]`, and for any `Some(v)` where a written `to_json` returns `JsonValue.Null`.
+
+A derive stops the common case. `@derive(Serialize)` or `@derive(Deserialize)` on a type with a field whose declared type is `Option[Option[T]]` (written `T??`) is E1401 `NonDerivableTrait`. The check reads the declared type of the field **after alias expansion and before generic substitution**:
+
+- `type MaybeName = Str??`, used as a field type, is an error: the alias is the same type.
+- A field `v: T?` in `type Box[T]` is not an error, and `Box[Int?]` is not an error. The field is not written `T??`. The round-trip law covers `Box[Int?]`: `Some(None)` decodes as `None`.
+
+The check is a front-end check on a written type, like the template-hole rule (§3.6 *Display Format Protocol*, §3b.5), which rejects `Option[Option[T]]` for the same reason. It does not change what `Option[T]` implements.
+
+The error has a `note:` and a `help:`. The `note:` says that the check covers only a field whose declared type is `T??`, and that a generic field (for example `Box[Int?]`), an `Option[JsonValue]` that holds `Some(JsonValue.Null)`, and a written `to_json` that returns `null` still collapse under the round-trip law. The `help:` writes an enum that names each case, with the field's own type for `T`:
+
+```blink
+@derive(Serialize)
+type UserUpdate {
+    name: Str??
+}
+```
+
+```
+error[NonDerivableTrait]: cannot derive `Serialize` for `UserUpdate`
+ --> update.bl:1:9
+  |
+1 | @derive(Serialize)
+  |         ^^^^^^^^^ cannot derive `Serialize`
+  |
+ --> update.bl:3:5
+  |
+3 |     name: Str??
+  |     ^^^^^^^^^^^ `None` and `Some(None)` both encode as `null`
+  |
+  = note: this check covers only a field whose declared type is `T??`. A generic field such as `Box[Int?]`,
+          an `Option[JsonValue]` that holds `Some(JsonValue.Null)`, and a `to_json` that returns `null`
+          still collapse under the round-trip law (§3.6.1 Derive Laws)
+  = help: replace the field type with an enum that names each case:
+            @derive(Serialize, Deserialize)
+            type Patch[T] {
+                Keep
+                Clear
+                Replace(value: T)
+            }
+          and write the field as `name: Patch[Str]`
+```
+
+`Patch[T]` derives with no error, and its JSON is the tagged-object row of the *Type Mapping* table. A PATCH body that must tell "absent" from "set to null" needs this enum.
+
+**`Result[T, E]`.** `Result` has no JSON form in v1. `Result[T, E]` implements neither `Serialize` nor `Deserialize`, for every `T` and `E`, `Result[T, Never]` included. `@derive(Serialize)` or `@derive(Deserialize)` on a type with a field whose type is, or holds, a `Result` is E1401 `NonDerivableTrait`. The `help:` writes the full enum, with the payload types of the field for `T` and `E`, with the variant names `Success` and `Failure`, and with the payload names `value` and `error`. The help never names a variant `Ok` or `Err`: a bare `Ok(x)` must keep its one meaning (§10.6 *Prelude Types*). For a field `outcome: Result[User, ApiError]`:
+
+```
+  = help: Result has no JSON form in v1. Replace the field type with an enum
+          that has the payload types of the field:
+            @derive(Serialize, Deserialize)
+            type Outcome {
+                Success(value: User)
+                Failure(error: ApiError)
+            }
+```
+
+The generic form of that enum is `type Outcome[T, E] { Success(value: T)  Failure(error: E) }`. Its JSON is the tagged-object row of the *Type Mapping* table. Adding a `Result` instance in a later version changes the meaning of no program that compiles today.
 
 ##### Map and Set Order
 
