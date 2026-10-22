@@ -2614,7 +2614,7 @@ There `import b.x.{Q}` binds `x` too. To bind `Q` and `bx` but not `x`, write `i
 
 #### Unused Imports
 
-An import entry is **used** when a name in the file resolves through it, or when a method call in the file resolves to a trait that the entry puts in scope (§3.6 *Impl visibility*). An entry that is not used gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). Deleting an unused entry never changes what the file means.
+An import entry is **used** when a name in the file resolves through it, when a method call in the file resolves to a trait that the entry puts in scope (§3.6 *Impl visibility*), or when a bare variant name resolves to a variant of the enum that the entry names (§3.4 *Resolution order*, *Global-unique*). An entry that is not used gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). Deleting an unused entry never changes what the file means.
 
 A type imported only so that its methods work is unused. The impls in the type's own package go with its values, so the methods resolve without the import:
 

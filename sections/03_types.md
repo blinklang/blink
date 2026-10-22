@@ -2173,20 +2173,61 @@ The bare form (`NotFound { msg: "x" }`) and the qualified form (`QueryError.NotF
 
 **Which spelling to write.** Write the bare form. Write the qualified form only where the bare form cannot reach the variant:
 
-- a name that two or more enums declare, with no expected type at the site (E0519, below);
+- a name that two or more candidate enums declare, with no expected type at the site (E0519, below);
 - a variant that a value binding hides (*Values come first*, below);
 - a user variant that has the name of a prelude variant (`Some`, `None`, `Ok`, `Err`).
 
 A `help:` line in a diagnostic writes the qualified form, because that form is the full name of the variant. It is not a second rule. The examples in this spec follow this guidance: an example uses one spelling for each enum, and it qualifies a variant only to show one of the cases above. `blink fmt` does not change one spelling into the other (below).
 
-**Resolution order.** At a bare struct-style construction site `Name { ... }`, the compiler resolves `Name` in this order:
+**Resolution order.** At a construction site, the compiler resolves a bare `Name` in this order. Steps 1 and 2 apply to the brace form `Name { ... }`. Steps 3 and 4 also decide `Name` and `Name(...)`, once *Values come first* (below) finds no value of that name:
 
 1. **Qualified** — if the site is already written `Enum.Variant { ... }`, that names the variant directly.
 2. **Struct in scope** — a struct type `Name` in scope at the site names that struct. The module declares the struct, or binds it by an import entry. A hint never moves resolution past a struct in scope.
-3. **Hint-directed** — the expected type at the site (a binding annotation, a function return type, a function parameter type, or a `Result`/`Option` carrier such as `Ok`/`Err`/`Some`) names an enum that has a variant `Name`. The hint is consulted *first* among the variant rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
-4. **Global-unique** — if no struct is in scope and no hint applies, `Name` resolves to the one enum variant of that name across the whole program. If the name is not globally unique, see the ambiguity rule below.
+3. **Hint-directed** — the expected type at the site (*Expected type at a site*, below) names an enum that has a variant `Name`. The hint is consulted *first* among the variant rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
+4. **Global-unique** — if no struct is in scope and no hint applies, `Name` resolves to the one variant of that name among the *candidate* enums. If two or more candidates declare `Name`, see the ambiguity rule below. The candidates are:
+   - the enums of the site's module;
+   - the `pub` enums of the other modules of the site's package;
+   - the prelude enums;
+   - each enum of another package that the module binds by an import entry that names the type (`import std.errno.{Errno}`). A whole-module import (`import std.errno`) adds none of its enums.
 
-This list governs `Name { ... }`. *Values come first* (below) governs `Name` and `Name(...)`. A struct has no bare form and no call form, so `Name` and `Name(...)` never find a struct. They follow *Values come first* with no change. The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
+   A non-`pub` enum of another module is never a candidate.
+
+Inside the package, an import never adds or removes a candidate. For an enum of another package, only an import entry that names the type adds it. So a site in a dependency never sees an enum of a package that depends on it: a site in `std` never sees an enum of the program. A new `pub` enum in a dependency changes the meaning of a bare name only in a module that imports that enum by name.
+
+```blink
+// package app; std.time declares `pub type Weekday { Monday, Tuesday, ... }`
+// and std.errno declares `pub type Errno { Errno(Int) }`
+import std.errno.{Errno}
+import std.time
+
+type Day { Monday, Funday }
+
+fn main() {
+    let d = Monday                    // Day.Monday: std's Weekday is not a candidate
+    let e = Errno(5)                  // Errno.Errno: the import entry names the type
+    let w: time.Weekday = Tuesday     // the hint reaches any enum that the site names
+}
+```
+
+The last line writes `Weekday` through the qualifier `time`, so no import entry adds `Weekday` to the candidates. The entry `import std.time.{Weekday}` would add it, and `Monday` on the first line would then be E0519.
+
+A bare name that matches no candidate, but matches a `pub` enum of another package that the module does not import by name, is an undefined-name error at the name: `UndefinedVariable` (E0506) for `Name`, `UndefinedFunction` (E0504) for `Name(...)`. Its `help:` names that enum and gives the qualified form or the import entry as the fix. The binding has the poison type (§6.3.5), so no follow-on error appears.
+
+**Expected type at a site.** A site has the expected type `T` at these positions, and at no other:
+
+1. the value of `let x: T = e`;
+2. the value of an assignment to a place of type `T` (`x = e`, `p.f = e`);
+3. the tail of a function body, and the operand of `return`, where the function declares the return type `T`;
+4. a call or method argument, where the declared parameter type is `T`. A parameter whose type is a type parameter of the callee gives no expected type, unless explicit type arguments fix it: `id[A](Red)` has the expected type `A`, and `id(Red)` has none;
+5. a field value in a struct or variant brace literal, where the declared field type is `T`;
+6. the payload of `Some(e)`, `Ok(e)` or `Err(e)` under an expected `Option[T]` or `Result[T, E]`: `T`, or `E` for `Err`;
+7. each element of a list literal under an expected `List[T]`; element `i` of a tuple literal under an expected tuple type;
+8. the right operand of `a ?? e`: the inner type of `a`;
+9. an operand of `==`, `!=`, `<`, `<=`, `>` or `>=`. If exactly one operand is a bare variant name (or an `if`, `match` or block whose result values are all bare variant names), the other operand has a type of its own, and that type is the expected type of the first. If both operands are such names, neither has an expected type: `Red == Red`, with two enums that declare `Red`, is E0519. A literal operand follows §3.2 *Operator operands*.
+
+An expected type at a position reaches each branch value of an `if`, each arm value of a `match`, and the tail of a block. It does not reach a condition, a guard, a scrutinee, or a statement that is not the tail.
+
+*Values come first* (below) governs `Name` and `Name(...)`. A struct has no bare form and no call form, so those two spellings never find a struct. The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
 
 Resolution is static. A bare name at a site denotes exactly one entity, and the compiler determines it statically.
 
@@ -2245,7 +2286,7 @@ fn main() {
   let s: JobState = Pending   // hint (binding annotation) selects JobState.Pending
   ```
 
-  When a bare construction of a name shared across enums has no hint to resolve it, that specific site is a **compile error** (`error[AmbiguousConstruction]`) requiring qualification:
+  When a bare construction of a name shared across candidate enums has no hint to resolve it, that specific site is a **compile error** (`error[AmbiguousConstruction]`) requiring qualification:
 
   ```blink
   fn f() {
@@ -3032,7 +3073,7 @@ The first character decides, so a reader and the compiler know which names an ar
 
 In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a payload must name a variant.
 
-The program-wide search of §3.4 (step 3) never runs in a pattern, and no value binding, local or module-scope, changes what a pattern means.
+The *Global-unique* step of §3.4 *Resolution order* never runs in a pattern, and no value binding, local or module-scope, changes what a pattern means.
 
 ```blink
 type Color { Red, Green }
