@@ -3998,9 +3998,53 @@ warning[IncompleteStateRestore]: speculative lookahead may leave stale state
           non-mutating alternative
 ```
 
+**Return write set.** The write set stays as it is: every write, on any path. Tools, hover and other diagnostics keep reading it. W0550 and W0551 (§4.16.7) read a smaller set, the **return write set** of the callee. The return write set of a function holds the writes in its write set that lie on some path that reaches the normal return of the function.
+
+- **A path ends only at an expression of type `Never`** (§3.3 *Divergence and Body Completeness*). Nothing else ends a path.
+- **A call adds the return write set of its callee**, not the full write set. It adds it only on the paths of the caller that reach that call and go on after it.
+- **A callee declared `-> Never` adds nothing.** No path goes on after the call.
+- **No `-> Never` is inferred from a body.** The type of a function does not change. A function declared `()` whose every path ends in an expression of type `Never` has an empty return write set, but it is still `()` for typing and for reachability (§3.3).
+- **An `Env.Exit` handler is no exception.** The handler for an op declared `-> Never` cannot return, and its body must diverge (§4.4.3). The call to `env.exit` never comes back to a restore in the caller.
+- **Out of scope.** Paths that a panic ends in the test runner, or in an `assert_panics` block, are not read by these lints.
+
+```blink
+let mut pos = 0
+let mut err = ""
+let mut count = 0
+let mut items: List[Int] = [1, 2, 3]
+
+fn die(msg: Str) ! Env.Exit {                   // writes {err}, on return {}
+    err = msg
+    env.exit(101)
+}
+
+fn item(i: Int) -> Int ! Env.Exit {             // writes {err}, on return {}
+    if i < 0 || i >= items.len() { die("bad index") }
+    items.get(i).unwrap()
+}
+
+fn step(n: Int) -> Int ! Env.Exit {             // writes {err, count}, on return {count}
+    if n < 0 {
+        err = "neg"
+        env.exit(101)
+    }
+    count = count + 1
+    n
+}
+
+fn peek() -> Int ! Env.Exit {
+    let saved = pos
+    let v = item(pos)                           // no warning: `err` is not in the return write set of `item`
+    pos = saved
+    v
+}
+```
+
+The write `err = msg` in `die` has no path to the normal return of `die`, because `env.exit(101)` has type `Never`. So `die` and `item` have an empty return write set. In `step`, the write to `err` comes before `env.exit(101)` and is not in the return write set; the write to `count` is. A caller of `step` that saves and restores `count` gets no warning.
+
 **Write sets do not cross modules.** The compiler does not look inside a function from another module, so a call to it adds nothing to the write set. `State` still crosses modules: the callee's row declares it, and the caller's row gets it (§4.16.1).
 
-**Tooling (not normative).** `blink query --fn` (§8.3), `blink doc` and the LSP show the write set of a function on hover and as an inlay hint, next to its row.
+**Tooling (not normative).** `blink query --fn` (§8.3), `blink doc` and the LSP show the write set of a function on hover and as an inlay hint, next to its row. They show the return write set beside it, for example `writes {err, count} · on return {count}`.
 
 #### 4.16.5 User-Defined Effects as Labels
 
@@ -4068,7 +4112,7 @@ error[SpawnTouchesModuleState]: spawned task touches module state
 
 #### 4.16.7 Diagnostic Precision: W0550 and W0551
 
-The write-set analysis (§4.16.4) produces two warnings related to save/restore patterns in speculative code (lookahead, backtracking). Both lints read the text of one function. They tell a speculative pair from a binding pair, and they check only the speculative one.
+The write-set analysis (§4.16.4) produces two warnings related to save/restore patterns in speculative code (lookahead, backtracking). Both warnings read the *return write set* of the callee (§4.16.4), not its full write set: a write that lies on no path to a normal return of the callee cannot leave stale state in the caller. Both lints read the text of one function. They tell a speculative pair from a binding pair, and they check only the speculative one.
 
 **Save, restore and pair.**
 
@@ -4081,7 +4125,7 @@ The write-set analysis (§4.16.4) produces two warnings related to save/restore 
 - A **binding pair** has at least one call between its save and its restore, and the pair is in a binding at each of them. It is the dynamic-binding form: save, assign, call, restore. The function runs the call with a new value in `G`, and the restore puts the old value back.
 - A **speculative pair** is every other pair: a rollback (save, call, restore), and a pair with a call that comes before the first assignment.
 
-**W0550 (IncompleteStateRestore):** Fires when a function saves SOME module-level `let mut` bindings before a call, but the callee's write set includes additional bindings that are not saved or restored. This is the high-value diagnostic — it catches exactly the speculative-lookahead bugs that motivated the analysis.
+**W0550 (IncompleteStateRestore):** Fires when a function saves SOME module-level `let mut` bindings before a call, but the callee's return write set includes additional bindings that are not saved or restored. This is the high-value diagnostic — it catches exactly the speculative-lookahead bugs that motivated the analysis.
 
 ```
 warning[IncompleteStateRestore]: speculative lookahead may leave stale state
@@ -4092,10 +4136,11 @@ warning[IncompleteStateRestore]: speculative lookahead may leave stale state
   |
   = note: `skip_newlines` writes {pos, pending_comments}
   = note: only `pos` is restored after the call
-  = help: also save and restore `pending_comments`, or verify the mutation is intentional
+  = help: save and restore `pending_comments` around the call, or end that path in a
+          call to a `-> Never` function
 ```
 
-**W0551 (UnrestoredMutation):** Fires when a function that already has a save/restore pattern (i.e., it is doing speculative work) calls a function whose write set includes unsaved bindings. Unlike W0550, W0551 applies to call sites where the caller has *no* saves for the *specific callee* — but the presence of save/restore patterns elsewhere in the function indicates speculative intent.
+**W0551 (UnrestoredMutation):** Fires when a function that already has a save/restore pattern (i.e., it is doing speculative work) calls a function whose return write set includes unsaved bindings. Unlike W0550, W0551 applies to call sites where the caller has *no* saves for the *specific callee* — but the presence of save/restore patterns elsewhere in the function indicates speculative intent.
 
 **Context-aware firing:** W0551 only fires inside functions that already exhibit at least one speculative pair. A binding pair does not count. Functions with no save/restore patterns at all are doing normal sequential mutation and do not trigger W0551. This eliminates false positives from normal code calling utility functions with large write sets.
 
@@ -4116,7 +4161,7 @@ fn compile_module(path: Str) -> Result[Module, CompileError] ! IO {
 }
 ```
 
-**No threshold.** W0551 does not use a write-set size threshold. Inside a speculative context, any unsaved mutation is potentially a bug regardless of how many globals the callee writes. The context-aware heuristic (a speculative pair present) is the sole gating condition.
+**No threshold.** W0551 does not use a threshold on the size of the return write set. Inside a speculative context, any unsaved mutation in the return write set is potentially a bug regardless of how many globals the callee writes. The context-aware heuristic (a speculative pair present) is the sole gating condition.
 
 **Calls in a binding.** W0550 and W0551 check a call against the pairs around it that are not in a binding at that call. A pair that is in a binding at the call adds nothing to the check: the writes of the callee are the intended effect. This holds when the callee also writes `G`, because the restore drops that write. A function can hold both kinds of pair. Each call is checked only against the speculative pairs around it, and a binding pair does not make the function a speculative context.
 
@@ -4146,19 +4191,19 @@ fn looks_ahead() -> Bool {
 }
 ```
 
-A warning that still fires has a `note:` that names the pair and its class. It also has one `help:` line that names the binding shape, for a user who meant a binding:
+**Shape of a warning that still fires.** The write that fires is on a path that reaches a normal return, so the fix is a save and restore, or a path that ends. The warning has a `note:` that names the pair and its class, and a note that names the write site (`file:line`) and the chain of calls from the call site to it. The first `help:` line is the same for both lints. A second `help:` line names the binding shape, for a user who meant a binding:
 
 ```
-warning[IncompleteStateRestore]: speculative lookahead may leave stale state
- --> parser.bl:42:5
+warning[UnrestoredMutation]: call to `item` in `peek` mutates [err]
+ --> parser.bl:42:13
   |
-42 |     let saved = pos
-  |         ^^^^^ saves `pos` before calling `skip_newlines`
+42 |     let v = item(pos)
+  |             ^^^^^^^^^ `item` can return with `err` changed
   |
-  = note: `pos` is saved at 42:9 and restored at 47:5 with no new value set between (speculative pair)
-  = note: `skip_newlines` writes {pos, pending_comments}
-  = note: only `pos` is restored after the call
-  = help: also save and restore `pending_comments`, or verify the mutation is intentional
+  = note: `pos` is saved at 40:9 and restored at 44:5 with no new value set between (speculative pair)
+  = note: `err` is written at parser.bl:17, in `report`, called from `item` at parser.bl:30
+  = help: save and restore `err` around the call, or end that path in a
+          call to a `-> Never` function
   = help: if the function sets a global for this call, assign that global between its save and this call
 ```
 
