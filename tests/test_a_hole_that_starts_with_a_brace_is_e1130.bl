@@ -2,7 +2,8 @@
 // string form and at every depth (sections/02_syntax.md §2.4, "A hole does not start with `{`").
 // Such a hole is the parse error InterpDoubleBrace (E1130), once per bad hole, and the rest of
 // the string and the file still parse. The help names `\{` and `#"..."#` for a literal brace and
-// `( )` for a block; the spec picks no one rewrite, so the row carries no fix.
+// `( )` for a block; the spec picks no one rewrite, so the row carries no fix. The lexer has no
+// t-string forms yet, so they get rows when it does.
 
 import std.process.{ProcessResult}
 
@@ -20,9 +21,13 @@ fn write_case(name: Str, body: Str) {
     write_file("{DIR}/{name}.bl", "fn main() \{\n    let x = 5\n{body}}\n\nfn f(s: Str) -> Str \{ s \}\n")
 }
 
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && $B {args}")
+}
+
 fn check_json(name: Str, body: Str) -> ProcessResult {
     write_case(name, body)
-    sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json {name}.bl")
+    blink_in_dir("check --json {name}.bl")
 }
 
 // Typecheck still runs after a parse error and reports on the tree the parser built for
@@ -36,8 +41,8 @@ fn parser_rows(out: Str) -> List[Str] {
     rows
 }
 
-// Each want is "line:col" of the `{` of the hole's opener (after the `#` in a raw string), in
-// source order.
+// Each want is "line:col:end_line:end_col" in source order: the span runs from the hole's
+// opener (the `{` after the `#` in a raw string) through the `{` that starts the expression.
 fn expect_e1130(name: Str, body: Str, want: List[Str]) -> Str {
     let r = check_json(name, body)
     let mut problems: List[Str] = []
@@ -50,9 +55,11 @@ fn expect_e1130(name: Str, body: Str, want: List[Str]) -> Str {
         let parts = want.get(i).unwrap().split(":")
         let line = parts.get(0).unwrap()
         let col = parts.get(1).unwrap()
+        let end_line = parts.get(2).unwrap()
+        let end_col = parts.get(3).unwrap()
         if !row.contains("\"code\":\"E1130\"") { problems.push("{name}: want E1130 in {row}") }
         if !row.contains("\"name\":\"InterpDoubleBrace\"") { problems.push("{name}: want InterpDoubleBrace in {row}") }
-        if !row.contains("\"line\":{line},\"col\":{col}") { problems.push("{name}: want {line}:{col} in {row}") }
+        if !row.contains("\"line\":{line},\"col\":{col},\"end_line\":{end_line},\"end_col\":{end_col}") { problems.push("{name}: want {line}:{col}-{end_line}:{end_col} in {row}") }
         if row.contains("\"fix\"") { problems.push("{name}: E1130 must not carry a fix: {row}") }
         i = i + 1
     }
@@ -62,19 +69,19 @@ fn expect_e1130(name: Str, body: Str, want: List[Str]) -> Str {
 test "a hole that starts with a brace is E1130 in every string form" {
     let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
     let mut problems: List[Str] = []
-    problems.push(expect_e1130("plain", ln(#"    io.println("a {{x}} b")"#), ["3:19"]))
-    problems.push(expect_e1130("spaced", ln(#"    io.println("a { {x} } b")"#), ["3:19"]))
-    problems.push(expect_e1130("newline", "    io.println(\"a \{\n\{x\}\} b\")\n", ["3:19"]))
-    problems.push(expect_e1130("template", ln(#"    let _ = t"{{x}}""#), ["3:15"]))
-    problems.push(expect_e1130("raw", ln(##"    let _ = #"#{{x}}"#"##), ["3:16"]))
-    problems.push(expect_e1130("raw_template", ln(##"    let _ = t#"#{{x}}"#"##), ["3:17"]))
+    problems.push(expect_e1130("plain", ln(#"    io.println("a {{x}} b")"#), ["3:19:3:21"]))
+    problems.push(expect_e1130("spaced", ln(#"    io.println("a { {x} } b")"#), ["3:19:3:22"]))
+    problems.push(expect_e1130("newline", "    io.println(\"a \{\n\{x\}\} b\")\n", ["3:19:4:2"]))
+    problems.push(expect_e1130("raw", ln(##"    let _ = #"#{{x}}"#"##), ["3:16:3:18"]))
+    problems.push(expect_e1130("raw_depth_2", ln(###"    let _ = ##"a ##{{x}} b"##"###), ["3:20:3:22"]))
+    problems.push(expect_e1130("raw_depth_3", "    let _ = ###\"a ###\{ \{x\}\} b\"###\n", ["3:22:3:25"]))
     let _ = sh("rm -rf {DIR}")
     assert_eq(problems.join("\n").trim(), "")
 }
 
 test "a bad hole inside a hole's string is one E1130 at the inner hole" {
     let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
-    let p = expect_e1130("nested", ln(#"    io.println("a {f("{{x}}")} b")"#), ["3:23"])
+    let p = expect_e1130("nested", ln(#"    io.println("a {f("{{x}}")} b")"#), ["3:23:3:25"])
     let _ = sh("rm -rf {DIR}")
     assert_eq(p, "")
 }
@@ -82,9 +89,9 @@ test "a bad hole inside a hole's string is one E1130 at the inner hole" {
 test "two bad holes are two errors and the file still parses" {
     let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
     let mut problems: List[Str] = []
-    problems.push(expect_e1130("two", ln(#"    io.println("{{x}} and {{x}}")"#), ["3:17", "3:27"]))
+    problems.push(expect_e1130("two", ln(#"    io.println("{{x}} and {{x}}")"#), ["3:17:3:19", "3:27:3:29"]))
     let body = ln(#"    io.println("{{x}} b")"#).concat(ln(#"    io.println("{x} ok")"#)).concat(ln(#"    io.println(" { {x} }")"#))
-    problems.push(expect_e1130("lines", body, ["3:17", "5:18"]))
+    problems.push(expect_e1130("lines", body, ["3:17:3:19", "5:18:5:21"]))
     // A type error after the bad string shows that the parser kept the statements that follow.
     let r = check_json("after", ln(#"    io.println("{{x}}")"#).concat("    let y: Str = 5\n    io.println(y)\n"))
     if !r.err_out.contains("\"line\":4,") { problems.push("after: want a row on line 4:\n{r.err_out}") }
@@ -95,7 +102,7 @@ test "two bad holes are two errors and the file still parses" {
 test "E1130 help names both literal-brace forms and parentheses for a block" {
     let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
     write_case("help", ln(#"    io.println("a {{x}} b")"#))
-    let r = sh("B=$(pwd)/build/blink; cd {DIR} && $B check help.bl")
+    let r = blink_in_dir("check help.bl")
     let _ = sh("rm -rf {DIR}")
     assert_eq(r.exit_code, 1)
     assert(r.err_out.contains("error[InterpDoubleBrace]: a string hole starts with `\{`"))
@@ -105,13 +112,29 @@ test "E1130 help names both literal-brace forms and parentheses for a block" {
 test "check and build report the same E1130" {
     let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
     write_case("same", ln(#"    io.println("a {{x}} b")"#))
-    let c = sh("B=$(pwd)/build/blink; cd {DIR} && $B check same.bl 2>&1")
-    let b = sh("B=$(pwd)/build/blink; cd {DIR} && $B build same.bl 2>&1")
+    let c = blink_in_dir("check same.bl 2>&1")
+    let b = blink_in_dir("build same.bl 2>&1")
     let _ = sh("rm -rf {DIR}")
     assert_eq(c.exit_code, 1)
     assert(b.exit_code != 0)
     assert(c.out.contains("error[InterpDoubleBrace]") && c.out.contains("same.bl:3:19"))
     assert(b.out.contains("error[InterpDoubleBrace]") && b.out.contains("same.bl:3:19"))
+}
+
+// The hole is not parsed as code, so a template's `{{ name }}` and a broken block add no
+// errors of their own.
+test "a bad hole adds no errors for the code inside it" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    problems.push(expect_e1130("template_name", ln(#"    io.println("Hello {{ name }}")"#), ["3:23:3:25"]))
+    let r = check_json("broken_block", ln(#"    io.println("w {{ 1 + }} r")"#).concat("    let y: Str = 5\n    io.println(y)\n"))
+    let mut errors = 0
+    for row in r.err_out.split("\n") {
+        if row.contains("\"severity\":\"error\"") { errors = errors + 1 }
+    }
+    if errors != 2 || !r.err_out.contains("\"code\":\"E1130\"") || !r.err_out.contains("\"line\":4,") { problems.push("broken_block: want E1130 and one type error on line 4:\n{r.err_out}") }
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(problems.join("\n").trim(), "")
 }
 
 test "blink explain E1130 names the rule" {
@@ -121,10 +144,9 @@ test "blink explain E1130 names the rule" {
 }
 
 test "a lone brace in a raw string is text, not a hole" {
-    let x = 5
     assert_eq(#"{{x}}"#, "\{\{x\}\}")
     assert_eq(#"a { {x} } b"#, "a \{ \{x\} \} b")
-    assert_eq(x, 5)
+    assert_eq(##"#{{x}}"##, "#\{\{x\}\}")
 }
 
 test "a hole that starts with a parenthesized block runs" {
@@ -137,5 +159,4 @@ test "an escaped brace is a literal brace" {
     let x = 5
     assert_eq("\{x}", #"{x}"#)
     assert_eq("\{{x}}", #"{5}"#)
-    assert_eq(x, 5)
 }
