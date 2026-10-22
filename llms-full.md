@@ -407,6 +407,8 @@ No implicit promotion between sized types and `Int`. Always use `.to_int()` to w
 | `\{` | literal `{` (suppresses interpolation) |
 | `\}` | literal `}` |
 
+A hole must not start with `{`, whitespace skipped: `"a {{x}} b"` and `"a { {x} } b"` are E1130 InterpDoubleBrace, in every string form. For a literal brace write `\{` or use `#"..."#`. A hole that starts with a block needs parentheses: `"{({ ... })}"`.
+
 ### Extended Strings
 
 Extended strings `#"..."#` allow literal `"` and `\` without escaping. Use `#{expr}` for interpolation.
@@ -416,6 +418,7 @@ let raw = #"path\to\file"#              // no escaping needed
 let json = #"{"key": "value"}"#         // literal quotes
 let msg = #"Hello, #{name}!"#           // interpolation with #{...}
 let nested = ##"contains #"inner"#"##   // depth-2 nesting
+let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 ```
 
 ## Operators

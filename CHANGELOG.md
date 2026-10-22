@@ -30,6 +30,9 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **An unknown `@derive` name is E1402 NotDerivable.** E1112 UnknownDerive is retired. `@derive` resolves a trait name by scope.
 - **An annotation in the wrong position is an error.** This covers an annotation on an effect operation, an annotation other than `@handle_all` on a sub-effect, and `@handle_all` on a field.
 
+### Strings
+- **A string hole whose expression starts with `{` is E1130 InterpDoubleBrace.** This holds in every string form, with any whitespace before the `{`. Before, `"a {{x}} b"` printed `a 5 b`. For a literal brace, write `\{` or use `#"..."#`; to start a hole with a block, write `"{({ ... })}"`. `blink fmt` keeps those parentheses.
+
 ### Standard library
 - **`Str.parse_int()` and `Str.parse_float()` return `Result[_, ConversionError]` and refuse text outside the grammar.** `parse_int` takes an optional `-` and ASCII digits, and refuses overflow. `parse_float` takes `-? DIGITS ('.' DIGITS)? ('e' '-'? DIGITS)?`, `NaN`, `inf` and `-inf`, and does not use the locale. `??` on the result no longer compiles; use `.unwrap_or(d)` or `match`. `Str.to_int()` does not change.
 - **`io.read_line()` returns `Option[Str]`.** A blank line is `Some("")` and end of input is `None`; before, both were `""`. A line ends at `\n` or `\r\n` and has no length limit (before, 4096 bytes).

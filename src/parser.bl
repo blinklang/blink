@@ -11,6 +11,7 @@ import diagnostics.{
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
     TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE, VARIANT_FIELD_DEFAULT_HELP,
+    INTERP_DOUBLE_BRACE,
 }
 
 effect Parse {
@@ -5627,6 +5628,50 @@ fn parse_list_lit() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     nd
 }
 
+// Skips the rest of a hole that does not parse, through its closing brace.
+fn skip_broken_hole() ! Parse.Advance {
+    // Balance BOTH nested strings and nested interpolations while
+    // skipping the broken body. A StringEnd is only the outer
+    // string's terminator when str_depth == 0 — otherwise it closes
+    // a nested escaped-quote string (e.g. `{"a","b"}`), and treating
+    // it as the terminator would leave string-structural tokens
+    // parked for parse_block to spin on. With no nested
+    // strings str_depth stays 0 and this reduces to the original
+    // `at(StringEnd) -> break` behavior, so multi-interp E1106
+    // counts are preserved.
+    let mut interp_depth = 0
+    let mut str_depth = 0
+    while !at(TokenKind.EOF) {
+        if at(TokenKind.StringStart) {
+            str_depth = str_depth + 1
+        } else if at(TokenKind.StringEnd) {
+            if str_depth == 0 {
+                break
+            }
+            str_depth = str_depth - 1
+        } else if at(TokenKind.InterpStart) {
+            interp_depth = interp_depth + 1
+        } else if at(TokenKind.InterpEnd) {
+            if interp_depth == 0 && str_depth == 0 {
+                break
+            }
+            interp_depth = interp_depth - 1
+        }
+        advance()
+    }
+    if at(TokenKind.InterpEnd) {
+        advance()
+    }
+}
+
+// The token index of the `{` that opens a hole's expression, Newlines skipped, or -1 when
+// the expression starts with any other token. `pos` is just past the hole's opener.
+fn hole_lead_brace() -> Int {
+    let mut p = pos
+    while peek_kind_at(p) == TokenKind.Newline { p = p + 1 }
+    if peek_kind_at(p) == TokenKind.LBrace { p } else { -1 }
+}
+
 fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     let is_line = peek_line()
     let is_col = peek_col()
@@ -5647,11 +5692,22 @@ fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
             let errs_before = diag_count
             let entries_before = diag_entry_count()
             advance()
+            let lead = hole_lead_brace()
+            if lead >= 0 {
+                // A hole that opens with `{` reads as neither a literal brace nor a block, so the
+                // whole hole is one error and is not parsed as an expression.
+                let lead_end = if tokens.lines.get(lead).unwrap() == br_line { tokens.end_cols.get(lead).unwrap() } else { br_end_col }
+                diag_error_range("InterpDoubleBrace", INTERP_DOUBLE_BRACE, "a string hole starts with `\{`", br_line, br_col, lead_end, "for a literal brace, write `\\\{` or use `#\"...\"#`; to start the expression with a block, wrap it in `( )`")
+                skip_broken_hole()
+                continue
+            }
             let interp_expr = parse_expr()
             let mut interp_failed = 0
             // A mix of operator groups leaves a whole expression behind, so its E1127 stands
-            // instead of collapsing into InterpParseFailure.
-            if diag_count - errs_before > diag_errors_since(entries_before, MIXED_OPERATOR_PRECEDENCE) {
+            // instead of collapsing into InterpParseFailure. An E1130 belongs to a string nested
+            // in this hole, which recovered on its own.
+            let kept = diag_errors_since(entries_before, MIXED_OPERATOR_PRECEDENCE) + diag_errors_since(entries_before, INTERP_DOUBLE_BRACE)
+            if diag_count - errs_before > kept {
                 interp_failed = 1
             } else if !at(TokenKind.InterpEnd) {
                 interp_failed = 1
@@ -5662,38 +5718,7 @@ fn parse_interp_string() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
                 // escape hatches (decisions/backticks-in-strings.md).
                 diag_truncate(entries_before)
                 diag_error_range("InterpParseFailure", INTERP_PARSE_FAILURE, "could not parse interpolation expression — `\{` starts interpolation inside \"...\" strings", br_line, br_col, br_end_col, "for a literal brace, escape it as `\\\{`; or use an extended string #\"...\"# where braces are literal")
-                // Balance BOTH nested strings and nested interpolations while
-                // skipping the broken body. A StringEnd is only the outer
-                // string's terminator when str_depth == 0 — otherwise it closes
-                // a nested escaped-quote string (e.g. `{"a","b"}`), and treating
-                // it as the terminator would leave string-structural tokens
-                // parked for parse_block to spin on. With no nested
-                // strings str_depth stays 0 and this reduces to the original
-                // `at(StringEnd) -> break` behavior, so multi-interp E1106
-                // counts are preserved.
-                let mut interp_depth = 0
-                let mut str_depth = 0
-                while !at(TokenKind.EOF) {
-                    if at(TokenKind.StringStart) {
-                        str_depth = str_depth + 1
-                    } else if at(TokenKind.StringEnd) {
-                        if str_depth == 0 {
-                            break
-                        }
-                        str_depth = str_depth - 1
-                    } else if at(TokenKind.InterpStart) {
-                        interp_depth = interp_depth + 1
-                    } else if at(TokenKind.InterpEnd) {
-                        if interp_depth == 0 && str_depth == 0 {
-                            break
-                        }
-                        interp_depth = interp_depth - 1
-                    }
-                    advance()
-                }
-                if at(TokenKind.InterpEnd) {
-                    advance()
-                }
+                skip_broken_hole()
             } else {
                 sublist_push(parts, interp_expr)
                 expect(TokenKind.InterpEnd)

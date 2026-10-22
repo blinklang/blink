@@ -23,6 +23,7 @@ See `CHANGELOG.md` (also printed by `blink llms`).
 Key facts:
 - `fn` keyword, `{ }` braces, no semicolons, newline-separated statements
 - `"double quotes"` only, universal interpolation: `"Hello, {name}!"`
+- A hole must not start with `{` (E1130): write `\{` for a literal brace, `"{({ ... })}"` for a block
 - Square bracket generics: `List[T]`, `Map[K, V]`, `Result[T, E]`
 - Error handling: `Result[T, E]` + `?` propagation, `Option[T]` + `??` default
 - Effects: `fn foo() ! IO, DB` — tracked in signatures, provided by handlers
