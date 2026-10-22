@@ -8589,10 +8589,14 @@ fn tc_type_error_naming(msg: Str, at: Int, help: Str, tids: List[Int]) ! TypeChe
 fn tc_type_pair_strs(a: Int, b: Int) -> (Str, Str) {
     let sa = type_to_str(a)
     let sb = type_to_str(b)
+    if !tc_types_share_name(a, b) { return (sa, sb) }
+    (tc_type_with_home(a, sa), tc_type_with_home(b, sb))
+}
+
+fn tc_types_share_name(a: Int, b: Int) -> Bool {
     let head = tc_type_head_name(a)
     // Box[Int] against Box[Str] is one declaration, and the arguments already tell them apart.
-    if head == "" || head != tc_type_head_name(b) || tc_tid_decl_node(a) == tc_tid_decl_node(b) { return (sa, sb) }
-    (tc_type_with_home(a, sa), tc_type_with_home(b, sb))
+    head != "" && head == tc_type_head_name(b) && tc_tid_decl_node(a) != tc_tid_decl_node(b)
 }
 
 // The bare name `tid` is spelled with, without its module or its arguments, or "" for a type
@@ -29914,6 +29918,17 @@ fn tc_same_owner(a: VariantOwner, b: VariantOwner) -> Bool {
     a.base == b.base && a.carrier == b.carrier
 }
 
+// The name that spells `o` at this site, when its declared name resolves back to it there. A
+// namesake shadowed by a local type, or reached only through a renamed import, has none.
+fn tc_owner_site_name(o: VariantOwner) -> Option[Str] {
+    let decl = if o.base < 0 { -1 } else { tc_owner_decl(o) }
+    let name = if decl == -1 { tc_owner_shown(o) } else { node_name(decl) }
+    match tc_qualifier_owner(name) {
+        Some(s) => if tc_same_owner(s, o) { Some(name) } else { None }
+        None => None
+    }
+}
+
 // Declaration order, so the list reads as the type does.
 fn tc_owner_variant_names(o: VariantOwner) -> List[Str] {
     if o.carrier == TyKind.Option { return ["Some", "None"] }
@@ -30136,25 +30151,25 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
             let start = if qualified { at - qual.byte_len() - 1 } else { at }
             let end = at + name.byte_len()
             // Two types with one name print as `Name (module)` (§10.6); else as written.
-            let (pat_homed, val_s) = if ptid < 0 { (named, type_to_str(h)) } else { tc_type_pair_strs(ptid, h) }
-            let homed = ptid >= 0 && pat_homed != type_to_str(ptid)
-            let msg = "pattern of type `{if homed { pat_homed } else { named }}` used on a value of type `{val_s}`"
+            let homed = ptid >= 0 && tc_types_share_name(ptid, h)
+            let (pat_s, val_s) = if homed { tc_type_pair_strs(ptid, h) } else { (named, type_to_str(h)) }
+            let msg = "pattern of type `{pat_s}` used on a value of type `{val_s}`"
             match tc_variant_owner_of(h) {
                 Some(o) => {
-                    let listed = "`{if homed { val_s } else { tc_owner_shown(o) }}` declares: {tc_owner_variant_names(o).join(", ")}"
-                    // The rewrite must name the expected type at this site, and a span not found
-                    // in the source is no safe rewrite.
-                    let decl = if o.base < 0 { -1 } else { tc_owner_decl(o) }
-                    let site = if decl == -1 { tc_owner_shown(o) } else { node_name(decl) }
-                    let resolves = match tc_qualifier_owner(site) {
-                        Some(s) => tc_same_owner(s, o)
-                        None => false
+                    let owner_s = if homed { tc_type_with_home(h, tc_type_head_name(h)) } else { tc_owner_shown(o) }
+                    let listed = "`{owner_s}` declares: {tc_owner_variant_names(o).join(", ")}"
+                    // A span not found in the source is no safe rewrite.
+                    let same_form = col != -1 && tc_owner_has_variant(o, name) && tc_owner_variant_form(o, name) == tc_pattern_payload_form(pat)
+                    let site: Option[Str] = if same_form { tc_owner_site_name(o) } else { None }
+                    let help = match site {
+                        Some(t) => "write `{t}.{name}`; {listed}"
+                        None => listed
                     }
-                    let swap = col != -1 && resolves && tc_owner_has_variant(o, name) && tc_owner_variant_form(o, name) == tc_pattern_payload_form(pat)
                     let before = diag_entry_count()
-                    diag_error_span_at_notes("TypeError", TYPE_ERROR, msg, pat, line, start, end, if swap { "write `{site}.{name}`; {listed}" } else { listed }, [])
-                    if swap && diag_entry_count() > before {
-                        diag_set_last_fix_at("rename to", "{site}.{name}", line, start, line, end)
+                    diag_error_span_at_notes("TypeError", TYPE_ERROR, msg, pat, line, start, end, help, [])
+                    match site {
+                        Some(t) => if diag_entry_count() > before { diag_set_last_fix_at("rename to", "{t}.{name}", line, start, line, end) }
+                        None => {}
                     }
                 }
                 None => diag_error_span_at_notes("TypeError", TYPE_ERROR, msg, pat, line, start, end, "", [])
