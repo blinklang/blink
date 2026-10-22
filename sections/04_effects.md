@@ -1501,7 +1501,7 @@ fn main() ! IO {
     let mut sum = 0
     loop {
         match io.read_line() {
-            Some(line) => sum = sum + line.parse_int().unwrap_or(0)
+            Some(line) => sum = sum + (line.parse_int().ok() ?? 0)
             None => break
         }
     }

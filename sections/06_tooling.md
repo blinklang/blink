@@ -824,7 +824,7 @@ fn sum_lines() -> Int ! IO.Read {
     let mut sum = 0
     loop {
         match io.read_line() {
-            Some(line) => sum = sum + line.parse_int().unwrap_or(0)
+            Some(line) => sum = sum + (line.parse_int().ok() ?? 0)
             None => break
         }
     }
@@ -2016,6 +2016,8 @@ An agent writes correct Blink only when the rules it must obey are in its contex
 #### 8.17.1 The Core
 
 **One source.** The core is made of marked blocks inside this specification. It is not a second text. This specification is the only normative source. The generator builds the core text and the `blink llms` output from it, and nobody edits that output by hand. If the committed core text is not equal to what the generator prints for the current specification, the build fails.
+
+**Reference files in the repository.** `llms.md` and `llms-full.md` are reference files. They state no more and no less than this specification. The `Option` and `Result` method names in their tables, and in the compiler help text, match the tables in §7.6. A `blink` code block in a reference file, and each program in `examples/`, must pass `blink check`. A known failure goes on a list that has an entry for each failure, with the change that clears it. The list can only get shorter.
 
 **Core blocks.** A core block is a marked span of a section:
 

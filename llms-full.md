@@ -322,6 +322,8 @@ test "addition works" {
 | U8 / U16 / U32 / U64 | — | Sized unsigned integers. C-style wrapping casts. FFI use. |
 | Errno | `Errno(rc)` | Transparent zero-cost newtype over `Int` (`pub type Errno { Errno(Int) }`, `import std.errno`). The error arm of the libc `*_bytes` wrappers. Extract the code by matching `Errno(rc)`; no methods in v1. See **Transparent newtypes** below. |
 
+**One spelling per type.** Write `List[T]` for a list type and `T?` for an option type. `[T]` in a type is warning `ListTypeBrackets` (W1120). `Option[T]` in a type is warning `OptionTypeLongForm` (W1121). Both have a machine-applicable fix.
+
 **Enums are nominally distinct from `Int`.** An enum value is not interchangeable with `Int` at `let` / argument / return positions — passing one where the other is expected is a type error. Convert explicitly with `.to_int()` / `Type.from_int(n)`. (`==` between an enum and its int still works.)
 
 **Transparent newtypes.** A single-variant enum wrapping exactly one `Int` payload (`pub type Errno { Errno(Int) }`) is lowered to a bare `int64_t` in carriers and at FFI boundaries — no box, no tag. It stays nominally distinct in the type system (so `Result[Int, Errno]` can't confuse the count with the errno) while costing nothing at runtime.
@@ -431,7 +433,6 @@ let nested = ##"contains #"inner"#"##   // depth-2 nesting
 
 | Function | Returns | Purpose |
 |----------|---------|---------|
-| `read_file(path)` | Str | Read file to string |
 | `write_file(path, content)` | () | Write string to file |
 | `file_exists(path)` | Int | 1 if exists, 0 if not |
 | `is_dir(path)` | Int | 1 if directory |
@@ -822,9 +823,13 @@ let first_two = names
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `.unwrap()` | T | Extract value (panics on None) |
 | `.is_some()` | Bool | Has value? |
 | `.is_none()` | Bool | Empty? |
+| `.unwrap()` | T | Extract value (panics on None) |
+| `.map(fn(T) -> U ! _)` | U? | `Some(f(x))` for `Some(x)`, else `None`. The callback effects pass to the caller |
+| `.ok_or(e)` | Result[T, E] | `Ok(x)` for `Some(x)`, else `Err(e)` |
+
+Not provided: `unwrap_or` (use `??`: `opt_val ?? "default"`), `unwrap_or_else`, `expect`, `and_then` (use `?` or `match`).
 
 Use `??` operator for safe unwrap with default: `opt_val ?? "default"`
 
@@ -834,10 +839,17 @@ Use `?` operator to propagate None: `let val = opt_fn()?` (in Option-returning f
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `.unwrap()` | T | Extract Ok value (panics on Err) |
-| `.unwrap_err()` | E | Extract Err value (panics on Ok) |
 | `.is_ok()` | Bool | Success? |
 | `.is_err()` | Bool | Failure? |
+| `.unwrap()` | T | Extract Ok value (panics on Err) |
+| `.unwrap_err()` | E | Extract Err value (panics on Ok) |
+| `.map(fn(T) -> U ! _)` | Result[U, E] | `Ok(f(x))` for `Ok(x)`, else the same `Err`. The callback effects pass to the caller |
+| `.map_err(fn(E) -> F ! _)` | Result[T, F] | `Err(f(e))` for `Err(e)`, else the same `Ok`. The callback effects pass to the caller |
+| `.ok()` | T? | `Some(x)` for `Ok(x)`, else `None` |
+
+Default from a Result: `r.ok() ?? d`.
+
+Not provided: `unwrap_or` (use `.ok() ??`), `unwrap_or_else`, `expect`, `and_then` (use `?` or `match`).
 
 Use `?` operator to propagate errors: `let val = fallible()?`
 
@@ -1057,6 +1069,8 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 | `@capabilities(...)` | module | Effect ceiling |
 | `@derive(...)` | type | Auto-generate traits. Accepted names: `Serialize`, `Deserialize`, `Eq`, `Ord`, `Clone`, `Hash`, `Debug`. `Ord` synthesizes a lexicographic `.cmp(other) -> Ordering` and auto-includes `Eq` (`Ord: Eq`); enables `<`/`>`/`<=`/`>=`. Each name resolves by scope: in a module that declares its own `Eq`, `@derive(Eq)` names that trait and is rejected; write `import blink.core.{Eq as CoreEq}` and `@derive(CoreEq)`. Any name that is not a derivable compiler-known trait is `E1402 NotDerivable`. |
 | `@src(req)` | fn | Requirement traceability |
+| `@perf(constraint)` | fn | Performance contract, such as `@perf(p99 < 200ms)` or `@perf(memory < 50mb)`. `blink bench --check-contracts` runs the benchmarks and fails when a constraint is violated. `blink fmt` puts it after `@where` |
+| `@alt("ID", "label")` | fn | An alternative implementation of the function with the same name, kept in the codebase and type-checked. `blink alt list`, `blink alt select ID` and `blink alt compare` work with alternatives. `blink.toml` selects the active one per environment (`[alternatives]`) |
 | `@requires(expr)` | fn | Precondition. Needs `@verify(fallback: ...)` on the fn, or it is `V0003 ContractUnverifiable` |
 | `@ensures(expr)` | fn | Postcondition (`result` = return value). Needs `@verify(fallback: ...)` on the fn, or it is `V0003 ContractUnverifiable`; with `"runtime"` it is checked at every return. Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
 | `@where(expr)` | fn, type | Type constraint; on a fn, runtime-checked at param/return coercion |
@@ -1073,23 +1087,23 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 
 ```blink
 // Read + process file
-let content = read_file("data.txt")
-let lines = content.split("\n")
-for line in lines {
-    if line.contains("TODO") {
-        io.println("Found: {line}")
+import std.fs
+
+fn print_todos(path: Str) -> Result[(), FsError] ! FS.Read, IO {
+    let content = fs.read(path)?
+    for line in content.split("\n") {
+        if line.contains("TODO") {
+            io.println("Found: {line}")
+        }
     }
+    Ok(())
 }
 
 // Error handling chain
-fn load_config(path: Str) -> Result[Config, Str] {
-    if file_exists(path) == 0 {
-        return Err("config not found")
-    }
-    let json = read_file(path)
+fn load_config(path: Str) -> Result[Config, Str] ! FS.Read {
+    let json = fs.read(path).map_err(fn(e) { "config not readable: {e}" })?
     Config.from_json(json)
 }
-let config = load_config("config.json")?
 
 // Build output with list
 let mut parts: List[Str] = []

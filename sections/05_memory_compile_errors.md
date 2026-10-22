@@ -638,8 +638,8 @@ type Result[T, E] {
 Functions that can fail return `Result`:
 
 ```blink
-fn read_config(path: Str) -> Result[Config, ConfigError] ! IO {
-    let text = io.read_file(path)?        // returns Err(IOError) on failure
+fn read_config(path: Str) -> Result[Config, ConfigError] ! FS.Read {
+    let text = fs.read(path)?             // returns Err(FsError) on failure
     let parsed = toml.parse(text)?        // returns Err(ParseError) on failure
     let config = validate(parsed)?        // returns Err(ValidationError) on failure
     Ok(config)
@@ -649,8 +649,8 @@ fn read_config(path: Str) -> Result[Config, ConfigError] ! IO {
 The `?` operator desugars to:
 
 ```blink
-// `let text = io.read_file(path)?` becomes:
-let text = match io.read_file(path) {
+// `let text = fs.read(path)?` becomes:
+let text = match fs.read(path) {
     Ok(val) => val
     Err(e) => return Err(e)
 }
@@ -660,13 +660,13 @@ The `?` operator requires the error type to **match exactly** — there is no im
 
 ```blink
 type ConfigError {
-    IO(IOError)
+    Fs(FsError)
     Parse(ParseError)
     Validation(ValidationError)
 }
 
-impl From[IOError] for ConfigError {
-    fn from(e: IOError) -> ConfigError { ConfigError.IO(e) }
+impl From[FsError] for ConfigError {
+    fn from(e: FsError) -> ConfigError { ConfigError.Fs(e) }
 }
 
 impl From[ParseError] for ConfigError {
@@ -678,8 +678,8 @@ impl From[ValidationError] for ConfigError {
 }
 
 // Explicit error conversion at each ? site
-fn read_config(path: Str) -> Result[Config, ConfigError] ! IO {
-    let text = io.read_file(path)
+fn read_config(path: Str) -> Result[Config, ConfigError] ! FS.Read {
+    let text = fs.read(path)
         .map_err(fn(e) { ConfigError.from(e) })?
     let parsed = toml.parse(text)
         .map_err(fn(e) { ConfigError.from(e) })?
@@ -694,7 +694,7 @@ fn read_config(path: Str) -> Result[Config, ConfigError] ! IO {
 ```blink
 match read_config("app.toml") {
     Ok(config) => start_server(config)
-    Err(ConfigError.IO(e)) => io.println("Can't read config: {e}")
+    Err(ConfigError.Fs(e)) => io.println("Can't read config: {e}")
     Err(ConfigError.Parse(e)) => io.println("Bad config syntax: {e}")
     Err(ConfigError.Validation(e)) => io.println("Invalid config: {e}")
 }
@@ -850,7 +850,7 @@ impl[T] Option[T] {
 }
 ```
 
-**The rule.** A `Result` or `Option` method that panics on an arm requires `Debug` on that arm's payload type. The rule applies to every such method, including any method added in a later version. A form that never panics carries no bound: `unwrap_or`, `unwrap_or_else`, `?`, `??` and `match`.
+**The rule.** A `Result` or `Option` method that panics on an arm requires `Debug` on that arm's payload type. The rule applies to every such method, including any method added in a later version. A form that never panics carries no bound: `ok`, `map`, `map_err`, `ok_or`, `?`, `??` and `match` (§7.6).
 
 **Checked at the call.** The compiler checks the bound at each call against the receiver's type. A missing `Debug` is `error[TraitBoundNotSatisfied]` (E0306), the same code that assertions use (§2.20 *Built-in Assertions*). A generic function does not get the bound from its body. A function that calls `.unwrap()` on a `Result[T, E]` with a type parameter `E` declares `E: Debug` itself:
 
@@ -893,7 +893,7 @@ The runtime may add a lead-in such as `panic: ` and a location suffix such as ` 
 
 1. Add `@derive(Debug)` to the type, or `: Debug` to the binder. The compiler offers the `@derive(Debug)` fix only for a type the user declares. It never offers it for a stdlib type or a type from another package.
 2. Use `match` and call `panic` with a message.
-3. Use `unwrap_or` or `unwrap_or_else` when the code must not panic. This changes behavior.
+3. Use `??` on an `Option`, or `.ok() ??` on a `Result`, when the code must not panic. This changes behavior.
 
 ```
 error[E0306]: trait bound not satisfied
@@ -905,7 +905,101 @@ error[E0306]: trait bound not satisfied
    = note: `unwrap` panics on `Err` and shows the error with `debug()`
    = help: add `@derive(Debug)` to `PortError`
    = help: or use `match` and call `panic` with a message
-   = help: or use `unwrap_or` to give a default (this does not panic)
+   = help: or use `.ok() ??` to give a default (this does not panic)
 ```
 
 The stdlib error types, such as `ConversionError`, `FsError`, `DBError` and `NetError`, implement `Debug`, so `.unwrap()` on a stdlib `Result` compiles. Their `Display` impls stay.
+
+### 7.6 Option and Result Methods
+
+The tables below are the full method set of `Option[T]` and `Result[T, E]`. The other forms are `?`, `??` and `match`. A name that is in no table is not a method of the type.
+
+**`Option[T]`**
+
+| Method | Signature | Result |
+|--------|-----------|--------|
+| `is_some` | `fn is_some(self) -> Bool` | `true` for `Some` |
+| `is_none` | `fn is_none(self) -> Bool` | `true` for `None` |
+| `unwrap` | `fn unwrap(self) -> T` | The payload of `Some`; panics on `None` (§7.5) |
+| `map` | `fn map[U](self, f: fn(T) -> U ! _) -> U? ! _` | `Some(f(x))` for `Some(x)`; `None` for `None` |
+| `ok_or` | `fn ok_or[E](self, e: E) -> Result[T, E]` | `Ok(x)` for `Some(x)`; `Err(e)` for `None` |
+
+**`Result[T, E]`**
+
+| Method | Signature | Result |
+|--------|-----------|--------|
+| `is_ok` | `fn is_ok(self) -> Bool` | `true` for `Ok` |
+| `is_err` | `fn is_err(self) -> Bool` | `true` for `Err` |
+| `unwrap` | `fn unwrap(self) -> T` | The payload of `Ok`; panics on `Err` (§7.5) |
+| `unwrap_err` | `fn unwrap_err(self) -> E` | The payload of `Err`; panics on `Ok` (§7.5) |
+| `map` | `fn map[U](self, f: fn(T) -> U ! _) -> Result[U, E] ! _` | `Ok(f(x))` for `Ok(x)`; the same `Err(e)` for `Err(e)` |
+| `map_err` | `fn map_err[F](self, f: fn(E) -> F ! _) -> Result[T, F] ! _` | The same `Ok(x)` for `Ok(x)`; `Err(f(e))` for `Err(e)` |
+| `ok` | `fn ok(self) -> T?` | `Some(x)` for `Ok(x)`; `None` for `Err(_)` |
+
+`unwrap` and `unwrap_err` keep the `Debug` bounds of §7.5. No other method in the tables panics.
+
+The callback of `map` and `map_err` has the effect row `! _`. The method forwards the effects of the callback to its caller, in the same way as `List.map` (§3.2.2, §4.15.2). A callback with no effects makes a call with no effects.
+
+Each method has the meaning of this `match`:
+
+```blink
+impl[T] Option[T] {
+    fn is_some(self) -> Bool { match self { Some(_) => true, None => false } }
+    fn is_none(self) -> Bool { match self { Some(_) => false, None => true } }
+    fn map[U](self, f: fn(T) -> U ! _) -> U? ! _ {
+        match self { Some(x) => Some(f(x)), None => None }
+    }
+    fn ok_or[E](self, e: E) -> Result[T, E] {
+        match self { Some(x) => Ok(x), None => Err(e) }
+    }
+}
+
+impl[T, E] Result[T, E] {
+    fn is_ok(self) -> Bool { match self { Ok(_) => true, Err(_) => false } }
+    fn is_err(self) -> Bool { match self { Ok(_) => false, Err(_) => true } }
+    fn map[U](self, f: fn(T) -> U ! _) -> Result[U, E] ! _ {
+        match self { Ok(x) => Ok(f(x)), Err(e) => Err(e) }
+    }
+    fn map_err[F](self, f: fn(E) -> F ! _) -> Result[T, F] ! _ {
+        match self { Ok(x) => Ok(x), Err(e) => Err(f(e)) }
+    }
+    fn ok(self) -> T? {
+        match self { Ok(x) => Some(x), Err(_) => None }
+    }
+}
+```
+
+`ok_or(e)` evaluates `e` before the call, as each argument is. Use `match` when `e` is costly to build and the value is usually `Some`.
+
+To get a default from a `Result`, drop the error with `ok` and use `??`. To change the error type before `?`, use `map_err`:
+
+```blink
+let n = s.parse_int().ok() ?? 0
+
+fn read_config(path: Str) -> Result[Config, ConfigError] ! FS.Read {
+    let text = fs.read(path).map_err(fn(e) { ConfigError.from(e) })?
+    parse_config(text)
+}
+```
+
+**Names not in the table.** A call to a name that is in no table is E0505 `UnresolvedMethod`. Where a Blink form does the same job, the help names that form. The list below is closed. It holds only names that this specification once used. A new row needs a panel vote. The list is not part of the §3.2 table of removed names, because no released Blink accepted these names.
+
+| Name | Blink form |
+|------|------------|
+| `unwrap_or(d)` | `o ?? d` on an `Option`; `r.ok() ?? d` on a `Result` |
+| `unwrap_or_else(f)` | The same, with the expression that `f` returns in place of `d`; or `match` |
+| `expect(msg)` | `match` with `panic("msg")` in the arm that fails; or `unwrap` |
+| `and_then(f)` | `?` in a function that returns an `Option` or a `Result`; or `match` |
+
+The edit from `unwrap_or(d)` to `??` is machine-applicable only when `d` has no effect and cannot panic: a literal, a local name, or a field read of a local name. In all other cases the diagnostic has help text and no edit. The reason: the argument of a method call runs before the call, but the default of `??` runs only when the left side is `None` (§2.22 *Evaluation Order*). A rewrite of `o.unwrap_or(load())` to `o ?? load()` would stop `load()` from running when the value is `Some`. The help says so.
+
+```
+error[UnresolvedMethod]: no method `unwrap_or` on `Int?`
+ --> src/main.bl:6:15
+   |
+ 6 |     let n = o.unwrap_or(load())
+   |               ^^^^^^^^^ `Option` has no method `unwrap_or`
+   |
+   = help: use `o ?? load()` to give a default
+   = note: `load()` does not run when the value is `Some`; as an argument of `unwrap_or`, it ran every time
+```

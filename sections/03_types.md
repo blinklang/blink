@@ -5850,10 +5850,10 @@ fn parse_port(s: Str) -> Result[Int, ParseError] {
     }
 }
 
-fn read_config(path: Str) -> Result[Config, ConfigError] ! IO {
-    let text = io.read_file(path)?             // IOError -> ConfigError
-    let parsed = parse_toml(text)?             // ParseError -> ConfigError
-    validate_config(parsed)?                    // ValidationError -> ConfigError
+fn read_config(path: Str) -> Result[Config, ConfigError] ! FS.Read {
+    let text = fs.read(path).map_err(fn(e) { ConfigError.from(e) })?
+    let parsed = parse_toml(text).map_err(fn(e) { ConfigError.from(e) })?
+    validate_config(parsed).map_err(fn(e) { ConfigError.from(e) })?
     Ok(parsed)
 }
 ```

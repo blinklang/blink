@@ -257,13 +257,13 @@ trait From[T] {
 
 ```blink
 type ConfigError {
-    IO(IOError)
+    Fs(FsError)
     Parse(ParseError)
     Validation(ValidationError)
 }
 
-impl From[IOError] for ConfigError {
-    fn from(e: IOError) -> ConfigError { ConfigError.IO(e) }
+impl From[FsError] for ConfigError {
+    fn from(e: FsError) -> ConfigError { ConfigError.Fs(e) }
 }
 
 impl From[ParseError] for ConfigError {
@@ -274,7 +274,7 @@ impl From[ParseError] for ConfigError {
 Calling convention: `TargetType.from(value)`.
 
 ```blink
-let err: ConfigError = ConfigError.from(io_error)
+let err: ConfigError = ConfigError.from(fs_error)
 ```
 
 **Every type has a reflexive From impl:** `impl From[T] for T { fn from(value: T) -> T { value } }` is compiler-provided for all types.
@@ -291,8 +291,8 @@ trait Into[T] {
 
 ```blink
 // These are equivalent:
-let err: ConfigError = ConfigError.from(io_error)
-let err: ConfigError = io_error.into()   // works because From[IOError] for ConfigError exists
+let err: ConfigError = ConfigError.from(fs_error)
+let err: ConfigError = fs_error.into()   // works because From[FsError] for ConfigError exists
 ```
 
 **Why auto-derive only.** If users could implement `Into` directly, you could create incoherent pairs (`A: Into[B]` without `B: From[A]`), breaking the bidirectional guarantee. One source of truth: implement `From`, get `Into` for free. (Vote: 4-1, AI/ML dissented wanting no Into at all — but method-call syntax is important for chaining.)
@@ -383,13 +383,13 @@ fn find_user_email(id: Int) -> Option[Str] ! DB {
 **Rule 4: For `Result[T, E1]`, the error type must exactly match the function's `Result[U, E2]` — `E1 == E2`.** There is no automatic `.into()` call on the error variant. Mismatched error types produce E0512.
 
 ```blink
-fn read_config(path: Str) -> Result[Config, ConfigError] ! IO {
+fn read_config(path: Str) -> Result[Config, ConfigError] ! FS.Read {
     // COMPILE ERROR E0512: ? error type mismatch —
-    //   inner type `IoError` does not match function return error type `ConfigError`
-    let text = io.read_file(path)?
+    //   inner type `FsError` does not match function return error type `ConfigError`
+    let text = fs.read(path)?
 
     // Fix: explicit conversion with .map_err()
-    let text = io.read_file(path)
+    let text = fs.read(path)
         .map_err(fn(e) { ConfigError.from(e) })?
     let parsed = toml.parse(text)
         .map_err(fn(e) { ConfigError.from(e) })?
