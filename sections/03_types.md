@@ -2206,6 +2206,24 @@ type Shape {
 }
 ```
 
+**Variant names.** A variant name must start with an uppercase letter: a Unicode `Lu` or `Lt` character. Any other first character is `error[LowercaseVariant]` (E0555) at the variant: a lowercase letter (`circle`), `_` (`_x`, `_X`), or a letter that has no case (`東`). A name in a script that has no case starts with an uppercase letter of another script, such as `V東`.
+
+```blink
+type Shape {
+    circle(Float)      // error[LowercaseVariant]
+    Square(Float)
+}
+```
+
+```
+error[LowercaseVariant]: variant name must start with an uppercase letter
+  help: rename the variant to `Circle`
+```
+
+The rename is machine-applicable only when both of these are true: the first character maps to exactly one `Lu` or `Lt` character, and `K` has no variant and no other `T.` member (§2.12.3) with the new name. The fix renames the declaration and every use. For a `pub` type, it renames the uses in every module of the package. In all other cases the help only says to start the name with an uppercase letter. The compiler keeps the variant under the name as written, so a use of it reports nothing more: one mistake gives one diagnostic.
+
+The first character tells a variant from a binding in a pattern (§3.5 *Bare names: variant or binding*) and from a function in a type path (*Member case*, below). No variant has a lowercase name, so neither needs the declarations of a type to decide what a name means.
+
 #### Why One Keyword
 
 Most languages split these: `struct` + `enum` (Rust), `data class` + `sealed class` (Kotlin), `type` + `datatype` (SML). Two keywords means two mental models, two sets of rules, and an AI that has to decide which one to use.
@@ -2306,6 +2324,26 @@ Step 3 covers these four names only. A user variant never heads a dotted path ba
 
 The compiler picks the reading from scope and namespaces only, never from the members of the type. If `x` is not a member of the type in step 2, the site is an error. The compiler does not read `Name.x` again as a value or as a variant value. So an `impl` that another module adds never changes what an existing site means.
 
+**Member case.** In a type path `K.x`, the first character of `x` decides which members it can name:
+
+- An uppercase first character (Unicode `Lu` or `Lt`) never names a function. `K.X` names a variant of `K` or a type-scoped constant `const K.X` (§2.12.3). When `K` is an enum that has neither, the site is `NoSuchVariant` (E0547).
+- Any other first character never names a variant. `K.x` names a type-scoped function `fn K.x`, an associated function that a trait impl gives `K` (§3c.4), or a type-scoped constant. When `K` has none of these, the site is an unknown member of the type path, never E0547. The candidates of its nearest-name suggestion (ERROR_CATALOG *Conventions*) include the variants of `K`, so `K.zed` suggests the variant `K.Zed`.
+
+No function in a `T.` namespace has an uppercase name (§2.12.3 *Function names*), so each case looks in one set of members, with no order between them.
+
+```blink
+type Level { Low, High }
+
+fn Level.parse(s: Str) -> Level? { /* ... */ }
+
+fn main() {
+    let a = Level.High        // a variant
+    let b = Level.parse("hi") // a type-scoped function
+    let c = Level.Hihg        // error[NoSuchVariant]
+    let d = Level.high        // error: `Level` has no member `high`; the help suggests `Level.High`
+}
+```
+
 A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. A variant with the name of its own enum is E0518 (*Name collisions*, below).
 
 When a site reads a type path and fails (an unknown member or a wrong number of arguments), and a candidate enum has a variant of that name, the error gets a `help:` line that names the qualified variant.
@@ -2389,7 +2427,7 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
 
 No path ever silently picks a winner between two constructible names: a struct and a variant with one name is a declaration-time error (E0518), and a variant carries its enum in an expression. A value with the name of a user variant does not collide with it, because a bare name never reaches a user variant. A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant. That is a shadow between scopes, by the order in *Values come first*, and W1011 marks it (§10.6 *Shadowing Rules*).
 
-**A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
+**A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A name after `K.` that does not start with an uppercase letter is never a variant, so it never gets E0547 (*Member case*, above). A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
 
 ```blink
 type Level { Low, High }
@@ -3149,9 +3187,9 @@ match_arm     ::= pattern guard? "=>" expression
 A pattern is *refutable* when it can fail to match (*Refutable vs Irrefutable Patterns*, below). The rule applies at every refutable pattern position. Today these are the pattern of a `match` arm, at any depth, and the pattern operand of `assert_matches` (§2.20). A future form that takes a refutable pattern uses this rule. In a refutable pattern:
 
 - A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a payload (`Red`, `Red(x)`, `Red { .. }`). A type with that name in scope does not change this: E0554 (§3.4 *Unqualified variant*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
-- A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) keeps the type-directed rule. It is a variant only when the type at that position has a variant of that name. Otherwise a name with no payload is a new binding. A name with a payload always names a variant, so it gets the same errors as an uppercase name: E0308 when the type is not an enum, E0547 when the enum has no variant of that name.
+- A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) never names a variant, because no variant has such a name (§3.4 *Variant names*). With no payload, it is a new binding. With a payload (`x(1)`, `x { .. }`), it is `NoSuchVariant` (E0547) when the type at that position is an enum, and `EnumPatternNeedsEnumScrutinee` (E0308) when it is not.
 
-The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. The protection against a typo covers variants whose names start with an uppercase letter only.
+The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. Every variant name starts with an uppercase letter, so the protection covers every variant.
 
 In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a payload must name a variant.
 
@@ -3222,9 +3260,9 @@ A binder in a refutable pattern cannot have the name of an uppercase variant, be
 - a bare name with no payload and an uppercase first character (`Dott`) when the type at that pattern position is an enum that has no variant of that name;
 - a qualified name `K.Zed`, with or without a payload, when the enum `K` declares no variant `Zed`.
 
-When the type at the pattern position is not an enum (a builtin scalar, a struct, a tuple or a type parameter), a bare name with an uppercase first character, with or without a payload, is `EnumPatternNeedsEnumScrutinee` (E0308), as *Bare names: variant or binding* says. For a struct, the message says that the type has no variants: "`Point` is a struct; it has no variants". For a type parameter, the help suggests no variant. The compiler reports E0308 for a type parameter where the generic function is defined, not at a call.
+When the type at the pattern position is not an enum (a builtin scalar, a struct, a tuple or a type parameter), a bare name with a payload, and a bare name with an uppercase first character and no payload, is `EnumPatternNeedsEnumScrutinee` (E0308), as *Bare names: variant or binding* says. For a struct, the message says that the type has no variants: "`Point` is a struct; it has no variants". For a type parameter, the help suggests no variant. The compiler reports E0308 for a type parameter where the generic function is defined, not at a call.
 
-When the type at the pattern position is not known yet, the compiler reports `CannotInferType` (E0301, §3.4 *Under-Determined Types*), not E0547 or E0308. A variant pattern on a builtin scalar is `EnumPatternNeedsEnumScrutinee` (E0308, §3.4 *Enums Nominally Distinct from Int*). A lowercase bare name with no payload is a binding when the type has no variant of that name, so it never gets E0547.
+When the type at the pattern position is not known yet, the compiler reports `CannotInferType` (E0301, §3.4 *Under-Determined Types*), not E0547 or E0308. A variant pattern on a builtin scalar is `EnumPatternNeedsEnumScrutinee` (E0308, §3.4 *Enums Nominally Distinct from Int*). A bare name with no payload whose first character is not an uppercase letter is a binding, so it never gets E0547.
 
 The rule applies at every depth. In `Some(Somee(v))` on an `Option[Option[Int]]`, the inner pattern is checked against the payload type of `Some`, so `Somee` gets E0547.
 

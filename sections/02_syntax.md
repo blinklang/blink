@@ -53,6 +53,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | List type | `List[T]` only | `List[Str]`, never `[Str]`. Square brackets in a type are a diagnostic. See §3.2 *One Spelling for List and Option Types*. |
 | Option defaulting | `??` | `val ?? default` desugars to match on `Some`/`None`. The default may be a jump: `val ?? return e`. Borrowed from Swift's nil-coalescing. |
 | Type names | `Str`, `Int`, `Bool`, `Float` | Short PascalCase. One casing rule for builtins and user types. Token-efficient — `Str` saves 3 chars over `String`, thousands of times per codebase. |
+| Variant names | `Red`, `Circle(Float)` | Must start with an uppercase letter (E0555). A function after `T.` must not (E0556). So `Color.Red` is a variant and `Duration.ms(100)` is a function, by case alone. See §3.4 *Variant names*. |
 | If/else | Expression, no parens | Always an expression. No parentheses around condition. Else mandatory when value is used. No `if let`. See [2.9](#29-ifelse-expressions). |
 | While/loop | `while` and `loop` | `while cond { }` for conditional, `loop { }` for unconditional. Plain `break`/`continue`. No labels, no `while let`. See [2.11](#211-whileloop). |
 | Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.12](#212-visibility). |
@@ -1247,6 +1248,24 @@ let b = Stack.empty[Str]()
 **Constants.** `const T.NAME = <expr>` follows every rule of a plain `const` (§2.21). The right side must be a const expression. A type annotation is optional, with the same rule as a plain `const`. `T.NAME` is a const reference, so it is legal in every place that requires a const expression, such as a keyword default.
 
 **Functions.** `fn T.name(params) -> R` is an ordinary function that has no receiver. A `self` parameter is a compile error: a method belongs to a trait (§3c.4 *No Inherent Methods*). Method syntax `x.name()` never reaches a type-scoped function. Only `T.name(...)` calls it.
+
+**Function names.** The name after `T.` in `fn T.name` must not start with an uppercase letter (Unicode `Lu` or `Lt`). An uppercase name after `T.` names a variant or a constant, never a function (§3.4 *Member case*), so a function with such a name could never be called. The declaration is `error[UppercaseTypeScopedFn]` (E0556). The message says why, and the help gives the lowercase name:
+
+```blink
+type Conn { fd: Int }
+
+fn Conn.New(fd: Int) -> Conn {     // error[UppercaseTypeScopedFn]
+    Conn { fd: fd }
+}
+```
+
+```
+error[UppercaseTypeScopedFn]: type-scoped function `New` must not start with an uppercase letter
+  note: an uppercase name after `Conn.` is a variant or a constant, never a function
+  help: rename the function to `new`
+```
+
+As for `LowercaseVariant` (§3.4 *Variant names*), the rename is machine-applicable only when the first character maps to exactly one lowercase character and `T` has no other `T.` member with the new name. The fix then renames the declaration and every use. The rule covers the name after `T.` only. A free function may start with an uppercase letter (§2.12.1). An associated function that a trait gives a type (§3c.4) is also reached as `T.name`, so its name in the trait follows the same rule.
 
 **Rules for both kinds:**
 
