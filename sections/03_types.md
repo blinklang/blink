@@ -2621,7 +2621,7 @@ error[TypeError]: mismatched types
 
 `Handler` in `use_it` is the module's own struct (it shadows the compiler-known `Handler[E]`, §10.6 *Shadowing Rules*), so `use_it(5)` is an ordinary type mismatch. It is never a type variable that accepts `5`.
 
-**Hygiene.** Syntax that the compiler expands, and types the compiler inserts, refer to the compiler-known type **by identity**, never by the name that is in scope at the use site. This covers `T?` and `??` (`Option`), `?` (`Result`/`Option`), `for` (`IntoIterator`/`Iterator`), `..`/`..=` (`Range`), `==`/`<` and the other operators (their traits), `with` (`Handler`, `Closeable`), `async.spawn` (`Handle`), template literals (`Template[C]`), literals (`Int`, `Float`, `Str`, `Char`, `Bool`), and every other desugaring in this spec. A trait name that the user writes (a bound, an `impl`, a supertrait clause, a `@derive` argument) is not a desugaring and resolves by scope (§10.6 *Shadowing a Prelude Trait*). A module that declares its own `Option` still gets the builtin `Option` from `x?`:
+**Hygiene.** Syntax that the compiler expands, and types the compiler inserts, refer to the compiler-known type **by identity**, never by the name that is in scope at the use site. This covers `T?` and `??` (`Option`), `?` (`Result`/`Option`), `for` (`IntoIterator`/`Iterator`), `..`/`..=` (`Range`), `==`/`<` and the other operators (their traits), `with` (`Handler`, `Scoped`, `Closeable`), `async.spawn` (`Handle`), template literals (`Template[C]`), literals (`Int`, `Float`, `Str`, `Char`, `Bool`), and every other desugaring in this spec. A trait name that the user writes (a bound, an `impl`, a supertrait clause, a `@derive` argument) is not a desugaring and resolves by scope (§10.6 *Shadowing a Prelude Trait*). A module that declares its own `Option` still gets the builtin `Option` from `x?`:
 
 ```blink
 type Option {
@@ -3613,7 +3613,7 @@ error[ParamAssign]: cannot assign to parameter `a`
 
 The fix-it names a new binding. `let mut a = a` shadows the parameter and triggers `warning[W0603] ShadowedVariable`.
 
-Inside `enter()` of a `BlockHandler` impl, a write to a field of `self` gets a different help line. The usual cause is an attempt to keep state for `exit()`, and a local copy does not reach `exit()`:
+Inside `enter()` of a `Scoped` impl, a write to a field of `self` gets a different help line. The usual cause is an attempt to keep state for `exit()`, and a local copy does not reach `exit()`:
 
 ```
 error[ParamAssign]: cannot assign to parameter `self`
@@ -3626,7 +3626,7 @@ error[ParamAssign]: cannot assign to parameter `self`
   = help: set `start` when the value is built, and build it in the `with` item (§4.7.2)
 ```
 
-This help text appears only in `BlockHandler.enter()`. Every other parameter assignment gets the `let mut` help above.
+This help text appears only in `Scoped.enter()`. Every other parameter assignment gets the `let mut` help above.
 
 **What `mut self` covers.** A method is mutating if and only if it declares `mut self`. The standard library declares `mut self` on methods that change state Blink holds as a value: the contents of a `List`, `Map`, `Set` or `StringBuilder`. A change to state outside the language — memory behind a `Ptr`, a socket, a file, a database — is an effect, tracked by the effect row (§4) and the `@trusted` boundary (§9), not by `mut`. So `Ptr.write` (§9 *Pointer Operations*) and `TcpConn.write` take plain `self`, and a plain `let` pointer can write through.
 
@@ -4540,7 +4540,8 @@ Certain traits have special meaning to the compiler. They are defined in the sta
 | `From[T]` | Infallible type conversion. Enables `Into[T]` auto-derivation. User-implemented. |
 | `Into[T]` | Auto-derived mirror of `From`. Provides `.into()` method syntax. Never user-implemented. |
 | `TryFrom[T]` | Fallible conversion returning `Result[Self, ConversionError]`. Auto-generated for refinement types. |
-| `Closeable` | Signals non-memory resources needing deterministic cleanup. Enables `with...as` scoped resource blocks. |
+| `Closeable` | Signals non-memory resources needing deterministic cleanup. Enables `with...as` scoped resource blocks. A `Closeable` type also implements `Scoped` (§4.7.2). |
+| `Scoped` | Enter and exit around a block. Enables `with` on a scoped value (§4.7.2). Every `Closeable` type implements it, with `Context = Self`. |
 | `Iterator` | Enables `for`-loop iteration, lazy adapter methods (`.map()`, `.filter()`, etc.), and `.collect()` materialization. |
 | `IntoIterator` | Enables a type to be used in `for x in expr`. Collections implement this to produce an `Iterator`. |
 
@@ -4567,7 +4568,7 @@ impl Closeable for FileHandle {
 }
 ```
 
-The compiler uses `Closeable` to power the ScopedValueWithoutWith lint (warn when a `Closeable` or `BlockHandler` value does not go into a `with`) and errors E0601/E0602 (closeable escapes scope). See section 5.5 for the full mechanism.
+The compiler uses `Closeable` to power the ScopedValueWithoutWith lint (warn when a `Scoped` value, `Closeable` types included, does not go into a `with`) and errors E0601/E0602 (closeable escapes scope). See section 5.5 for the full mechanism.
 
 #### §3.6.1 Derive Mechanics
 

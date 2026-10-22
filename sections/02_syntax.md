@@ -55,7 +55,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | If/else | Expression, no parens | Always an expression. No parentheses around condition. Else mandatory when value is used. No `if let`. See [2.9](#29-ifelse-expressions). |
 | While/loop | `while` and `loop` | `while cond { }` for conditional, `loop { }` for unconditional. Plain `break`/`continue`. No labels, no `while let`. See [2.11](#211-whileloop). |
 | Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.12](#212-visibility). |
-| Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; `as` disambiguates. 3-0 over `defer`. |
+| Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; the type of the item disambiguates, and `as` only binds a name. 3-0 over `defer`. |
 | Constants | `const NAME = expr` | Compile-time constants. Distinct from `let` (runtime). Literals + arithmetic + boolean ops + references to other consts. See [2.21](#221-const-declarations). |
 | Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()`, `todo()` and `unreachable()` diverge. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
 | Spread/rest operator | `..` | General spread/rest sigil. Patterns: `{ name, .. }`, `[first, ..]` (ignore rest). Construction: `{ field: val, ..source }` (copy rest), `[..list1, ..list2]` (list spread). See [2.16](#216-spread--rest-operator-). |
@@ -1595,7 +1595,7 @@ The canonical ordering enforced by `blink fmt` is: `@capabilities` first (permis
 
 ### 2.18 Scoped Resources (`with...as`)
 
-The `with...as` construct binds a `Closeable` value to a name and guarantees cleanup when the block exits — whether by normal completion, `?` early return, or any other exit path.
+The `with...as` construct binds a scoped value, such as a `Closeable` value, to a name and guarantees cleanup when the block exits — whether by normal completion, `?` early return, or any other exit path.
 
 ```blink
 // Single resource
@@ -1621,14 +1621,16 @@ let data = with fs.open("cache.dat")? as f {
 
 #### Disambiguation with effect handlers
 
-The `with` keyword serves two roles. The compiler distinguishes them by the presence of `as`:
+The `with` keyword serves two roles. The compiler tells them apart by the type of the item, not by `as`:
 
-| Form | Meaning |
-|------|---------|
-| `with handler_expr { }` | Effect handler — no `as`, expression type is `Handler[E]` |
-| `with expr as name { }` | Scoped resource — has `as`, expression type implements `Closeable` |
+| Item type | Meaning |
+|-----------|---------|
+| `Handler[E]` | Effect handler: install it for the body |
+| A scoped value (`Scoped`, which includes every `Closeable` type) | Enter the value, run the body, exit the value (§4.7) |
 
-Both forms compose in the same `with` statement via comma:
+`as name` only binds a name. It never changes what the item does. Without `as`, the compiler discards the bound value. The full rules are in §4.7.
+
+Both roles compose in the same `with` statement via comma:
 
 ```blink
 with mock_db(fixtures), fs.open("data.txt")? as f {
@@ -1637,7 +1639,7 @@ with mock_db(fixtures), fs.open("data.txt")? as f {
 }
 ```
 
-Here `mock_db(fixtures)` is an effect handler (no `as`) and `f` is a scoped `Closeable` resource.
+Here `mock_db(fixtures)` is an effect handler and `f` is a scoped `Closeable` resource.
 
 #### Rules
 
@@ -1970,7 +1972,7 @@ test "let-bound property closure is not elaborated" {
 
 Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
 
-**Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.7.2 — it runs `BlockHandler.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
+**Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.7.2 — it runs `Scoped.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
 
 **Validation symmetry.** `blink check` and `blink test` apply the same elaboration rule — `?` is valid in a test body iff the body would type-check after the implicit `Result[(), TestError]` elaboration. The two pipelines never disagree.
 
@@ -2019,7 +2021,7 @@ error[E0306]: trait bound not satisfied
 
 **Note:** `assert_matches` is a compiler intrinsic whose second argument is a **pattern** (same syntax as `match` arms), not an expression. It cannot be passed as a higher-order function.
 
-Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe. The test runner's per-test frame is a **runtime catch boundary** in the sense of §4.7.2, so `BlockHandler.exit(false)` and `Closeable.close()` run during the unwind — `with db.transaction() { assert_eq(...) }` rolls back the transaction on assertion failure.
+Assertion failure panics — unwinding to the test runner, which marks the test as failed and continues running other tests. This is the one context where Blink uses panic semantics, since tests are controlled environments where unwinding is safe. The test runner's per-test frame is a **runtime catch boundary** in the sense of §4.7.2, so `Scoped.exit(false)` and `Closeable.close()` run during the unwind — `with db.transaction() { assert_eq(...) }` rolls back the transaction on assertion failure.
 
 **Panel vote: 4-1** for three built-ins (original §2.20 vote). PLT dissented (assert_ne is `assert(a != b)` — Principle 2 violation). See [DECISIONS.md](../DECISIONS.md). Testing framework deliberation added `assert_matches` (4-1, AI/ML dissented) and optional messages (3-2). See [DECISIONS.md](../DECISIONS.md).
 
@@ -2198,7 +2200,7 @@ The literal `10 / 0` in the first test gives no warning: `DivisionByLiteralZero`
 
 **Pass semantics.** A passing `assert_panics` *consumes* the expected panic: the test's status is `"passed"`, **not** `"panicked"`. The top-level `"panicked"` status is reserved for an *unexpected* panic that escapes a test body. See §8.10 for runner output.
 
-**Resource cleanup on the expected panic.** A panic caught by `assert_panics` is a **catchable unwind** in the sense of §4.7.2: in-scope `with`/`Closeable` resources opened *inside* the block run `BlockHandler.exit(false)` / `Closeable.close()` during the unwind, before the runner records the pass.
+**Resource cleanup on the expected panic.** A panic caught by `assert_panics` is a **catchable unwind** in the sense of §4.7.2: in-scope `with`/`Closeable` resources opened *inside* the block run `Scoped.exit(false)` / `Closeable.close()` during the unwind, before the runner records the pass.
 
 ```blink
 test "rolls back on the expected panic" {
@@ -2300,7 +2302,7 @@ test "deposit then withdraw" {
 }
 ```
 
-`with` handlers run their `exit(false)` on assertion failure (§4.7.2 / `BlockHandler` catchable-unwind), so transactional rollback, log capture, and temp-path cleanup all behave correctly across the unwind.
+`with` handlers run their `exit(false)` on assertion failure (§4.7.2 / `Scoped` catchable-unwind), so transactional rollback, log capture, and temp-path cleanup all behave correctly across the unwind.
 
 **Why no `subtest` primitive.** Adding `subtest` as either a stdlib HOF or a compiler-recognized block was deliberated and rejected. The shapes that go beyond `for_each` + flat `test` blocks all require either (a) a second catch-site for `panic` inside `test` (so siblings could continue after one fails), which would contradict §2.20's "panic is untracked divergence; only the test runner catches it" and §4.7.2's deferral of recoverable panics, or (b) sugar that adds language surface without expressivity gain. Future evidence-driven re-evaluation may reopen the question; the current evidence (no shipped feature missing it, `for_each` covers parametric, helper `fn` covers heterogeneous) is that the gap is documentation-shaped, not syntax-shaped.
 
@@ -2581,7 +2583,7 @@ test "platform specific" {
 }
 ```
 
-`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags. Like assertion failure, `skip()` is a catchable unwind in the sense of §4.7.2 — `Closeable.close()` and `BlockHandler.exit(false)` run for any in-scope resources before the test runner records the skip. A test that allocates a temp directory and then `skip()`s on platform mismatch will release the temp directory.
+`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags. Like assertion failure, `skip()` is a catchable unwind in the sense of §4.7.2 — `Closeable.close()` and `Scoped.exit(false)` run for any in-scope resources before the test runner records the skip. A test that allocates a temp directory and then `skip()`s on platform mismatch will release the temp directory.
 
 **When to use which:**
 

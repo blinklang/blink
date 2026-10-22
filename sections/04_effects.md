@@ -907,7 +907,7 @@ The mock lists all eight operations at one level. A handler for an effect with c
 
 #### 4.4.4 DB.Write Scoped Transaction
 
-`db.transaction` implements the `BlockHandler` trait (see §4.7.2), providing automatic `BEGIN`/`COMMIT`/`ROLLBACK` semantics via `with`. It requires the `DB.Write` effect.
+`db.transaction` implements the `Scoped` trait (see §4.7.2), providing automatic `BEGIN`/`COMMIT`/`ROLLBACK` semantics via `with`. It requires the `DB.Write` effect.
 
 ```blink
 fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[(), DBError] ! DB.Write {
@@ -937,11 +937,11 @@ fn transfer(from_id: Int, to_id: Int, amount: Int) -> Result[(), DBError] ! DB.W
 
 **Block semantics, not closure semantics:** The transaction body is a block that runs in the enclosing function's context. The `?` operator propagates errors directly to the enclosing function's `Result` return type, and `return` exits the enclosing function. This is distinct from a closure, where `?` and `return` would operate within the closure's own scope.
 
-**Effect operations go through handles, not bindings:** When `as tx` is used (e.g., to access a savepoint handle), `db.execute()` still routes through the `db` effect handle — `tx` is the `BlockHandler.Context` value, not a replacement for the effect handle.
+**Effect operations go through handles, not bindings:** When `as tx` is used (e.g., to access a savepoint handle), `db.execute()` still routes through the `db` effect handle — `tx` is the `Scoped.Context` value, not a replacement for the effect handle.
 
 **Manual API:** `db.begin()`, `db.commit()`, `db.rollback()` remain available for advanced patterns (nested transactions via SAVEPOINTs, long-running operations). See [db-module-design.md](../decisions/db-module-design.md) Q6.
 
-**History:** Originally specified as special syntax (3-1 vote, see [transaction-block-syntax.md](../decisions/transaction-block-syntax.md)). Superseded by the general `BlockHandler` mechanism (5-0 vote, see [scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md)), which gives the same block semantics through a trait.
+**History:** Originally specified as special syntax (3-1 vote, see [transaction-block-syntax.md](../decisions/transaction-block-syntax.md)). Superseded by the general `Scoped` mechanism (5-0 vote, see [scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md)), which gives the same block semantics through a trait.
 
 ---
 
@@ -1701,7 +1701,7 @@ The LSP displays `main`'s actual effect set as an inlay hint, computed from the 
 
 #### Unhandled user effects
 
-A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `BlockHandler` whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
+A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `Scoped` type whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
 
 ```blink
 effect Store {
@@ -1756,7 +1756,7 @@ with handler_expression {
 }
 ```
 
-A `handler E { ... }` expression captures bindings from its enclosing scope exactly as a closure does (§2.8). A captured `let mut` binding is a shared cell (§3.6 *Shared cells*): writes in a handler op are visible to the enclosing scope and to any closure that captured the same binding. This differs from `BlockHandler` block bodies (§4.7.2), which run in the caller's scope and capture nothing. The `std.testing` mock controllers (§8.10.3) depend on this rule.
+A `handler E { ... }` expression captures bindings from its enclosing scope exactly as a closure does (§2.8). A captured `let mut` binding is a shared cell (§3.6 *Shared cells*): writes in a handler op are visible to the enclosing scope and to any closure that captured the same binding. This differs from `Scoped` block bodies (§4.7.2), which run in the caller's scope and capture nothing. The `std.testing` mock controllers (§8.10.3) depend on this rule.
 
 #### Testing: mock handlers
 
@@ -1944,21 +1944,46 @@ test "export_data writes CSV" {
 }
 ```
 
-The outer `with mock_db(fixtures), temp_fs()` installs effect handlers (no `as`). The inner `with fs.create(...)? as f` is a scoped resource (`as` present). The compiler distinguishes them by the presence of `as`.
+The outer `with mock_db(fixtures), temp_fs()` installs effect handlers. The inner `with fs.create(...)? as f` is a scoped resource, and `as` binds it to `f`. The compiler tells them apart by the type of the item, not by `as`.
 
 #### Disambiguation rules
 
-| Syntax | `as` present? | Type check | Meaning |
-|--------|--------------|------------|---------|
-| `with expr { }` | No | `expr: Handler[E]` | Effect handler |
-| `with expr { }` | No | `expr: T where T: BlockHandler, T.Context == Handler[E]` | Scoped effect handler: `enter()`, install the returned handler for `E`, body, uninstall, `exit(ok)` |
-| `with expr { }` | No | `expr: T where T: BlockHandler, T.Context == ()` | Block handler (no binding) |
-| `with expr as name { }` | Yes | `expr: T where T: Closeable` | Scoped resource |
-| `with expr as name { }` | Yes | `expr: T where T: BlockHandler` | Block handler (with binding); if `T.Context == Handler[E]`, also a scoped effect handler |
+The type of a `with` item decides what the item does. A `with` item has one of two typing rules:
 
-When `as` is absent, the compiler checks `Handler[E]` first, then a `BlockHandler` whose `Context` is `Handler[E]`, then a `BlockHandler` whose `Context` is `()`. Any other `Context` without `as` is an error (E0839). When `as` is present, the compiler checks `Closeable` first, then `BlockHandler`. A type implementing both `Closeable` and `BlockHandler` is a compile error (ambiguity).
+| Item type | Meaning |
+|-----------|---------|
+| `Handler[E]` | Install the handler for `E`, run the body, uninstall the handler. |
+| A scoped value: `T` where `T: Scoped`, which includes every `Closeable` type (§4.7.2) | Call `enter()`. If `T.Context` is `Handler[E]` with a concrete `E`, install the handler that `enter()` returned. Run the body. Uninstall that handler. Call `exit(ok)`. |
 
-`as` never changes what a `with` item does. For a scoped effect handler, `with expr as name { }` installs the handler exactly as `with expr { }` does, and also binds `name` to the same `Handler[E]` value. The typing rule and evaluation order are in §4.7.2, *Scoped effect handlers*.
+`arena` is a keyword item with its own typing rule (§5.2). A `handler E { ... }` expression has type `Handler[E]`, so it takes the first rule.
+
+An item of any other type is a compile error (E0839). If the type is a `Result` or an `Option`, the help text says to add `?`.
+
+`as` binds a name and does nothing else. `as` never changes what a `with` item does:
+
+- For a `Handler[E]` item, `name` is the handler. It is the same first-class value (see *Handlers are values*). It is not a scoped value, so W0610, W0611 and E0601 do not apply to it.
+- For a scoped value, `name` is the value that `enter()` returns (the `Context`). For a `Closeable` type, that is the value itself.
+- Without `as`, a scoped value runs `enter()` and `exit(ok)` as before, and the compiler discards the `Context`. This is legal for every `Context`.
+
+```blink
+with mock_db(fixtures) {
+    // Handler[DB]: installed
+}
+
+with mock_db(fixtures) as h {
+    // The same install. h is the same handler value
+}
+
+with db.transaction() {
+    // Scoped value: enter() and exit(ok) run. The Context is discarded
+}
+
+with db.transaction() as tx {
+    // The same, and tx is the Context
+}
+```
+
+The typing rule and evaluation order for a scoped value are in §4.7.2, *Scoped effect handlers*.
 
 **Comma-separated items nest from left to right.** `with a, b { body }` means `with a { with b { body } }`. The compiler evaluates and type-checks item *i* after items *0..i-1* are entered and their handlers installed, so a later item can use an effect that an earlier item installs. Teardown is LIFO. If item *i* fails through `?`, the `?` fires before item *i* is entered, and the normal unwind of items *0..i-1* runs their `exit(false)` or `close()` (§4.7.2, *Catchable unwind*; §5.5, *Multiple resources*).
 
@@ -1970,7 +1995,7 @@ with mock_db(fixtures), fs.open("x.txt")? as f {
 }
 
 with mock_db(fixtures), db.transaction() {
-    // mock_db provides DB handler, transaction is a BlockHandler
+    // mock_db provides DB handler, transaction is a scoped value
 }
 
 with db.connect("app.db")?, db.transaction() {
@@ -2297,14 +2322,14 @@ In v1, handler type parameters must be concrete effects: `Handler[DB]`, `Handler
 
 ---
 
-### 4.7.2 BlockHandler Trait — Scoped Blocks
+### 4.7.2 Scoped Trait — Scoped Blocks
 
 Records in `decisions/` and DECISIONS.md cite this section as §4.6.3, its earlier number.
 
-The `BlockHandler` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It lets a type accept a block without new syntax for each API.
+The `Scoped` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It lets a type accept a block without new syntax for each API.
 
 ```blink
-trait BlockHandler {
+trait Scoped {
     type Context
 
     fn enter(self) -> Self.Context
@@ -2334,7 +2359,7 @@ The runtime catch frames are the test runner's per-test boundary, the `?`/`retur
 
 **Amendment — `assert_panics` extends the catchable-unwind set (compiler-managed, not user-extensible).** Be precise about what changed: outside a test, a real `panic()` does *not* unwind to any in-process catch frame — it terminates the process and bypasses `exit()`/`close()` (the last row above). `assert_panics` (§2.20) genuinely *adds* a new catch boundary: within the dynamic extent of its block, a panic is caught and converted to a test pass/fail rather than terminating the process. This boundary is **compiler-managed and test-only** — only an `assert_panics` block arms it, is rejected outside a test (E0833), is not nestable (E0834), and exposes **no user-nameable symbol** (there is no `recover`/`catch_panic` a user can call). It therefore does not extend the set of catch boundaries reachable by *user code*; the user-extensible set remains empty, and the fence above holds.
 
-The `panic: Never` typing claim (§2.20, *`panic()` Function*) is preserved: the `assert_panics` construct has type `()`, its body is a recognized block (not a reified `fn` value), and the `matching:` argument binds nothing into user scope — so no user expression acquires a type that witnesses the panic. As with `BlockHandler.exit(false)` itself, the cleanup that runs during an armed-panic unwind cannot receive the panic value, cannot inspect any discriminant beyond `ok: Bool`, cannot suppress the unwind, and cannot rescue the test.
+The `panic: Never` typing claim (§2.20, *`panic()` Function*) is preserved: the `assert_panics` construct has type `()`, its body is a recognized block (not a reified `fn` value), and the `matching:` argument binds nothing into user scope — so no user expression acquires a type that witnesses the panic. As with `Scoped.exit(false)` itself, the cleanup that runs during an armed-panic unwind cannot receive the panic value, cannot inspect any discriminant beyond `ok: Bool`, cannot suppress the unwind, and cannot rescue the test.
 
 The cleanup asymmetry is intentional and must be read carefully: an **armed** (expected) panic runs in-scope `exit(false)`/`close()`; an **unarmed/uncaught** panic still terminates and bypasses them. A resource opened inside an `assert_panics` body is therefore released on the expected panic, whereas the same panic escaping a plain test body is not — armed test boundaries are controlled, like `skip()`, and uncaught divergence is not.
 
@@ -2342,11 +2367,11 @@ The cleanup asymmetry is intentional and must be read carefully: an **armed** (e
 
 **Cleanup that itself panics during an armed unwind.** If an in-scope `exit(false)`/`close()` *itself* panics while unwinding an armed expected panic, the original body panic remains "the expected panic" for `matching:` (E0832) purposes and stays load-bearing as the test's result and unwind cause; the cleanup fault surfaces as a **secondary `warning`-severity `E0824`** on the **same trace frame** (the test runner records it in the per-test record's `cleanup_warnings[]`, additive to the original status — see E0824, §5.5), not as a separate failing record. The panicking cleanup body's own control flow is abandoned at the panic point; remaining LIFO handlers still run (`continue-drain`, per line below).
 
-This rule is uniform across `BlockHandler.exit()` and `Closeable.close()` (§5.5) — every catchable structured unwind runs registered cleanup; uncaught divergence does not.
+This rule is uniform across `Scoped.exit()` and `Closeable.close()` (§5.5) — every catchable structured unwind runs registered cleanup; uncaught divergence does not.
 
 #### Block semantics
 
-`BlockHandler` blocks have block semantics, not closure semantics:
+`Scoped` blocks have block semantics, not closure semantics:
 
 - `?` propagates errors to the **enclosing function's** `Result` return type
 - `return` exits the **enclosing function**, not just the block
@@ -2362,7 +2387,7 @@ with db.transaction() as tx {
     db.execute(t"INSERT INTO orders ...")?
 }
 
-// Without binding — Context is ()
+// Without binding — the Context is discarded
 with metrics.timer("request_duration") {
     handle_request()?
 }
@@ -2373,9 +2398,9 @@ let result = with db.transaction() {
 }
 ```
 
-#### Implementing BlockHandler
+#### Implementing Scoped
 
-Any type can implement `BlockHandler`. A handler gets all its state when it is built: `self` is a by-value copy (§3.6), so `enter()` cannot pass new state to `exit()`. Put the build in a function, and call that function in the `with` item. Step 1 of the *Order* below evaluates the item right before `enter()`, so each `with` gets a new value:
+Any type can implement `Scoped`. A scoped value gets all its state when it is built: `self` is a by-value copy (§3.6), so `enter()` cannot pass new state to `exit()`. Put the build in a function, and call that function in the `with` item. Step 1 of the *Order* below evaluates the item right before `enter()`, so each `with` gets a new value:
 
 ```blink
 pub type Timer {
@@ -2387,7 +2412,7 @@ pub fn timer(label: Str) -> Timer ! Time.Read {
     Timer { label: label, start: time.read() }
 }
 
-impl BlockHandler for Timer {
+impl Scoped for Timer {
     type Context = ()
 
     fn enter(self) -> () {}
@@ -2408,18 +2433,32 @@ Nested items are correct for the same reason. In `with timer("a") { with timer("
 
 A value that is stored and then goes into two `with` items runs `exit()` twice on one state. The scope lints (§5.5) warn about this: W0610 for a value that reaches no `with`, and W0611 for a value that reaches more than one.
 
-`enter()` cannot write to `self`. An assignment such as `self.start = time.read()` is a parameter assignment, which is a compile error (§3.6). Inside `enter()` of a `BlockHandler` impl, that error's help text names the fix: set the field when the value is built, and build the value in the `with` item.
+`enter()` cannot write to `self`. An assignment such as `self.start = time.read()` is a parameter assignment, which is a compile error (§3.6). Inside `enter()` of a `Scoped` impl, that error's help text names the fix: set the field when the value is built, and build the value in the `with` item.
+
+#### Closeable types are scoped values
+
+A type that implements `Closeable` (§3.6) also implements `Scoped`, with these members:
+
+- `type Context = Self`
+- `enter(self)` returns `self`
+- `exit(self, ok)` calls `self.close()`
+
+The effects of `close` are the effects of `exit`. This impl counts for trait bounds: `T: Scoped` accepts a `Closeable` type. A `with` item of a `Closeable` type therefore follows the scoped-value rule of §4.7, and `as` binds the value itself.
+
+A type that writes both `impl Closeable` and `impl Scoped` has two overlapping impls of `Scoped`. This is the ordinary overlapping-impl error. Its help text says "`Closeable` already provides `Scoped` for `T`".
+
+`Handler[E]` has its own rule (§4.7). It does not implement `Scoped`, and it is not a scoped value. W0610, W0611 and E0601 do not apply to a `Handler[E]` item or to the name that `as` binds for it, and a program can store, pass and return a handler. This is different from a scoped effect handler: there the `Handler[E]` is the `Context` of a scoped value, and its binding follows *Interaction with async* below.
 
 #### Scoped effect handlers
 
-A `BlockHandler` whose `Context` is `Handler[E]` is a **scoped effect handler**. The `with` block installs the handler that `enter()` returns, for the block body only. This joins an effect handler and a cleanup in one `with` item. In this example, `sqlite_open` returns `Result[Sqlite3, DBError]`, with `Err(ConnectionError(..))` when the open fails:
+A `Scoped` type whose `Context` is `Handler[E]` is a **scoped effect handler**. The `with` block installs the handler that `enter()` returns, for the block body only. This joins an effect handler and a cleanup in one `with` item. In this example, `sqlite_open` returns `Result[Sqlite3, DBError]`, with `Err(ConnectionError(..))` when the open fails:
 
 ```blink
 pub type Connection {
     handle: Sqlite3
 }
 
-impl BlockHandler for Connection {
+impl Scoped for Connection {
     type Context = Handler[DB]
 
     fn enter(self) -> Handler[DB] {
@@ -2451,18 +2490,18 @@ with db.connect(":memory:")? {
 5. Uninstall the handler
 6. Call `exit(ok)`
 
-Steps 5 and 6 run on every catchable unwind, as for every `BlockHandler`. `exit()` runs after the uninstall, with the outer handlers in place. A `db.*` call inside `exit()` therefore goes to the outer `DB` handler, not to the one this item installed. Use `self` in `exit()`.
+Steps 5 and 6 run on every catchable unwind, as for every scoped value. `exit()` runs after the uninstall, with the outer handlers in place. A `db.*` call inside `exit()` therefore goes to the outer `DB` handler, not to the one this item installed. Use `self` in `exit()`.
 
 **Typing rule.** The item discharges `E` from the effect row of the body. `enter()` and `exit()` are checked against the outer effect row:
 
 ```
-Γ ⊢ e : T    T : BlockHandler    T.Context ≡ Handler[E]
+Γ ⊢ e : T    T : Scoped    T.Context ≡ Handler[E]
 Γ ⊢ body : U ! ρ ∪ {E}
 ───────────────────────────────────────────────
 Γ ⊢ with e { body } : U ! ρ ∪ eff(enter) ∪ eff(exit)
 ```
 
-The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: BlockHandler](t: T) { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. It must then meet the `Context == ()` row. An abstract `Context` does not meet it, so the compiler reports E0839 and names the abstract `Context` as the cause. There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
+The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: Scoped](t: T) { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. `enter()` and `exit()` still run, and the compiler discards the `Context` or binds it to the `as` name. There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
 
 **Binding.** `with expr as name { }` installs the handler and binds `name` to the same `Handler[E]` value. `name` follows the scoping rules in *Interaction with async* below.
 
@@ -2486,13 +2525,13 @@ Because `exit(false)` cannot observe *which* path triggered the unwind, handler 
 
 #### Interaction with async
 
-`BlockHandler` bindings follow the same scoping rules as `Closeable` bindings (E0601, E0602). This includes the `Handler[E]` that `as` binds for a scoped effect handler: that handler uses a resource that `exit()` releases. A `BlockHandler` binding cannot be sent to a spawned task:
+`Scoped` bindings follow the same scoping rules as `Closeable` bindings (E0601, E0602). This includes the `Handler[E]` that `as` binds for a scoped effect handler: that handler uses a resource that `exit()` releases. A `Scoped` binding cannot be sent to a spawned task:
 
 ```blink
 fn bad_example() ! DB, Async {
     with db.transaction() as tx {
         async.spawn(fn() {
-            // COMPILE ERROR: `tx` escapes BlockHandler scope
+            // COMPILE ERROR: `tx` escapes Scoped scope
             use_tx(tx)
         })
     }
@@ -2503,10 +2542,10 @@ fn bad_example() ! DB, Async {
 
 | Block form | Mechanism | Migration status |
 |-----------|-----------|-----------------|
-| `db.transaction { }` | `BlockHandler` | Migrated — uses `with db.transaction() { }` |
-| `async.scope { }` | Special syntax | v1: remains special syntax. v2: migrate to `BlockHandler` |
+| `db.transaction { }` | `Scoped` | Migrated — uses `with db.transaction() { }` |
+| `async.scope { }` | Special syntax | v1: remains special syntax. v2: migrate to `Scoped` |
 
-`async.scope` is not a `BlockHandler` in v1, because its structured concurrency semantics (task cancellation, panic propagation, implicit join at scope exit) need more than `enter()/exit()` provides. Once `BlockHandler` proves itself on simpler use cases, `async.scope` migration will be evaluated for v2.
+`async.scope` is not a `Scoped` type in v1, because its structured concurrency semantics (task cancellation, panic propagation, implicit join at scope exit) need more than `enter()/exit()` provides. Once `Scoped` proves itself on simpler use cases, `async.scope` migration will be evaluated for v2.
 
 **Panel vote: 5-0 (runoff).** See [decisions/scoped-block-mechanism.md](../decisions/scoped-block-mechanism.md).
 
@@ -2890,7 +2929,7 @@ Concurrency in Blink is not a language keyword or a function color — it is an 
 
 | Primitive | Purpose |
 |-----------|---------|
-| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: special syntax; v2: may become a `BlockHandler` — see §4.7.2)* |
+| `async.scope { ... }` | Structured concurrency boundary. All spawned tasks must complete before the scope exits. *(v1: special syntax; v2: may become a `Scoped` type — see §4.7.2)* |
 | `async.spawn(fn() { ... })` | Launch a concurrent task within the current scope. Returns `Handle[T]`. |
 | `handle.await` | Wait for a spawned task's result. Method on `Handle[T]`, returns `T`. |
 | `channel.new[T](buffer: N)` | Create a buffered channel for inter-task communication. |

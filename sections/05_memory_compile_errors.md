@@ -107,9 +107,9 @@ An allocation site inside an `! Arena` function is classified as either **promot
 
 ##### Handler behavior
 
-`with arena { body }` behaves as a `BlockHandler` (§4.7.2), as if the compiler builds a new scope value at each `with arena`. `arena` is a keyword form, not a value that a program can store and enter again. On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
+`with arena { body }` is a keyword item with its own typing rule for promotion and escape (this section). It runs in order like a scoped value (§4.7.2) whose `Context` is `()`. `arena` is a keyword form, not a value that a program can store and enter again. On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
 
-Because the block is a `BlockHandler`, arena enter and exit events appear in `--blink-trace` and `--trace all` output, as for every other block-scoped construct. `! Arena` on a function signature is a *marker* effect. The escape check uses it. It does not select a handler.
+Arena enter and exit events appear in `--blink-trace` and `--trace all` output, as for every other block-scoped construct. `! Arena` on a function signature is a *marker* effect. The escape check uses it. It does not select a handler.
 
 ##### Nesting
 
@@ -219,6 +219,8 @@ trait Closeable {
 
 Any type holding non-memory resources implements `Closeable`. The compiler knows this trait and uses it to power diagnostics and the `with...as` construct.
 
+A `Closeable` type is a scoped value (§4.7.2). It also implements `Scoped`, with `type Context = Self`, an `enter` that returns `self`, and an `exit(ok)` that calls `close()`. The effects of `close` are the effects of `exit`. This impl counts for trait bounds: `T: Scoped` accepts a `Closeable` type. A type that writes both `impl Closeable` and `impl Scoped` gets the overlapping-impl error (§4.7.2).
+
 #### `with...as` desugaring
 
 ```blink
@@ -236,9 +238,9 @@ Desugars to:
 }
 ```
 
-The compiler inserts `name.close()` on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.7.2 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
+`as name` only binds a name. `with expr { body }` runs the same steps, and the compiler discards the value. The compiler inserts `name.close()` on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.7.2 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
 
-This rule is uniform with `BlockHandler.exit()` (§4.7.2): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with conn = db.connect() { assert(...) }` block releases `conn` on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.7.2).
+This rule is uniform with `Scoped.exit()` (§4.7.2): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with db.connect()? as conn { assert(...) }` block releases `conn` on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.7.2).
 
 #### Multiple resources
 
@@ -252,7 +254,7 @@ Cleanup is LIFO — `b.close()` runs before `a.close()`. If `expr2` fails (via `
 
 **W0610 `ScopedValueWithoutWith`: scoped value that does not go into a `with`**
 
-The lint applies to every **scoped value**: a value whose type implements `Closeable` or `BlockHandler` (§4.7.2). It fires when such a value reaches anything other than a `with` item. The check follows the value, not its construction: `let tx = db.transaction()` followed by `with tx { }` does not warn. A scoped value returned from a function is not reported in that function.
+The lint applies to every **scoped value**: a value whose type implements `Scoped` (§4.7.2). Every `Closeable` type implements `Scoped`. A `Handler[E]` value is not a scoped value. It fires when such a value reaches anything other than a `with` item. The check follows the value, not its construction: `let tx = db.transaction()` followed by `with tx { }` does not warn. A scoped value returned from a function is not reported in that function.
 
 The code for this lint is W0610. Code W0600 is `UnusedVariable`, and it never refers to this lint.
 
@@ -272,14 +274,14 @@ warning[ScopedValueWithoutWith]: `Closeable` value used without `with...as`
   = note: upgrade to error in blink.toml: [lints] W0610 = "error"
 ```
 
-For a `BlockHandler`, the help names the `with` form that the type takes:
+For a `Scoped` type that is not `Closeable`, the help names the `with` form that the type takes:
 
 ```
-warning[ScopedValueWithoutWith]: `BlockHandler` value used without `with`
+warning[ScopedValueWithoutWith]: `Scoped` value used without `with`
  --> app.bl:3:9
   |
 3 |     let conn = db.connect("app.db")?
-  |         ^^^^ `Connection` implements `BlockHandler`, but `conn` never goes into a `with`
+  |         ^^^^ `Connection` implements `Scoped`, but `conn` never goes into a `with`
   |
   = help: use it as a `with` item so that `exit()` runs:
   |
@@ -301,7 +303,7 @@ The LSP offers the `with` fix first. It offers the `@allow` fix second, and that
 A scoped value must reach exactly one `with` item. W0611 counts the `with` items that one execution path takes the value into, and fires when the count is two or more. Items on paths that exclude each other (`if`/`else` branches, `match` arms) count once. A `with` in a loop body that enters a value built outside the loop counts as two, unless every path through the body after that `with` leaves the loop. A copy of a scoped value is the same value: `let copy = conn` followed by `with copy` enters `conn`. Its state was fixed when it was built, so a second `exit()` releases it again. It uses the same flow analysis as W0610, and it has the same limit: it does not follow a value into a function it is passed to. No W0611 is not a proof that a value goes into one `with` only, and W0611 is not a safety check: a type that wraps a foreign handle should make a second `exit()` safe (§4.7.2).
 
 ```
-warning[ScopedValueEnteredTwice]: `BlockHandler` value goes into more than one `with`
+warning[ScopedValueEnteredTwice]: `Scoped` value goes into more than one `with`
  --> app.bl:4:14
   |
 2 |     let conn = db.connect("app.db")?
