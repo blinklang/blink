@@ -1077,7 +1077,7 @@ let _ = xs.append([5])         // OK: `let _ =` drops the result on purpose
 xs.pop()                       // OK: pop changes xs
 ```
 
-A statement drops its result when it comes before the last statement of a block, when it is the last statement of a function that returns nothing, when it is the body of a loop, and when it is a branch of an `if` or `match` that itself drops its result. The warning covers only the sealed built-in collection methods. It does not cover a user function or a user method, even one with the same name. `@allow(DiscardedCollectionCopy)` on the enclosing function silences it, as does `W0606 = "off"` under `[lints]`.
+A statement drops its result when it comes before the last statement of a block, when it is the last statement of a function that returns nothing, when it is the body of a loop, and when it is a branch of an `if` or `match` that itself drops its result. The operand of `return` is not a statement result, so it is never dropped (§3.3 *Divergence and Body Completeness*). The warning covers only the sealed built-in collection methods. It does not cover a user function or a user method, even one with the same name. `@allow(DiscardedCollectionCopy)` on the enclosing function silences it, as does `W0606 = "off"` under `[lints]`.
 
 ---
 
@@ -1955,7 +1955,7 @@ Two facts about the type lattice decide every case:
 - **`Never` is a subtype of every type.** `Never` (§3.2) has no values, so a construct
   of type `Never` produces no value and satisfies any expected type.
 - **`()` is a subtype only of `()`.** The unit type is ordinary; a block whose tail type
-  is `()` satisfies `-> ()` (equivalently `-> Void`) and nothing else.
+  is `()` satisfies `-> ()` and nothing else.
 
 A construct has type `Never` when it **provably diverges** — control cannot leave it
 normally:
@@ -1964,7 +1964,7 @@ normally:
   as `panic(msg)`, `todo()`, `unreachable()` (§2.20) and `env.exit(code)` (§4.6), and a
   user function declared `-> Never`. The rule reads the callee's declared result type,
   never its name.
-- A bare `return`, `?`-propagation on the error path, `break`, or `continue` in tail
+- A `return`, with or without a value, `?`-propagation on the error path, `break`, or `continue` in tail
   position — control leaves the block by another edge.
 - A `loop { }` that **no `break` targets** — it runs forever. The search for a targeting
   `break` does not descend into a nested loop (whose `break` targets the inner loop) or
@@ -2056,6 +2056,55 @@ offer `Option[R]`. A diverging tail
 (a call that returns `Never` such as `panic(...)` or `todo()`, or a `loop` no `break`
 targets) is accepted and needs no repair. This
 satisfies the Diagnostic Discipline of §3.1: every rejection names a repair that exists.
+
+**`return` with a value.** `return e` checks `e` against the return type of the nearest
+enclosing function or closure. This holds for every return type, `()` included. A
+mismatch is `TypeError` (E0300), the same fault as for any other return type. In a
+function that returns `()`, these stay legal: `return`, `return ()`, `return e` where
+`e` has type `()`, and `return e` where `e` has type `Never`. The tail drop (§3.2.2,
+*Discarded copies*) applies to the result of the last statement. The operand of
+`return` is not a statement result, so the drop never applies to it.
+
+```blink
+fn lg() {
+    io.println("hi")
+}
+
+fn tail() { 5 }                  // OK: the last statement drops its result
+fn early() { return 5 }          // error[TypeError] (E0300): Int does not match return type ()
+fn typed() -> () { return "s" }  // error[TypeError] (E0300): Str does not match return type ()
+
+fn forward(b: Bool) {
+    if b { return lg() }         // OK: lg() has type ()
+    if b { return () }           // OK
+    if b { return panic("x") }   // OK: the operand has type Never
+    return                       // OK
+}
+```
+
+The help of this E0300 names two repairs, in this order: add `-> T` to the signature, or
+drop the value. Dropping the value keeps a call as its own statement: `return save(x)`
+becomes `save(x)` and then `return`. When `()` comes from an omitted `-> R` or from an
+expected parameter type, the error also points to that place.
+
+**Closures.** A closure with an expected function type takes its return type from that
+type. A closure with no expected type has the one type on which every `return e` and a
+tail that can complete agree, and `()` when there is none.
+
+```blink
+fn h(cb: fn(Int) -> ()) { cb(1) }
+
+h(fn(i: Int) { return i })                  // error[TypeError] (E0300): the expected type gives ()
+h(fn(i: Int) { i })                         // OK: the tail is dropped
+
+let k = fn() { return 5 }                   // fn() -> Int
+let m = fn(b: Bool) { if b { return 5 } }   // error[MissingReturn] (E0311)
+let q = fn() { return panic("x") }          // fn() -> ()
+```
+
+A `return e` whose operand has type `Never` adds no constraint. A tail that can complete
+with `()` after a valued `return` is `MissingReturn` (E0311), as for a named function
+with `-> R`. Exits that disagree are `TypeError` (E0300).
 
 ---
 
