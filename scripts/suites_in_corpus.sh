@@ -10,8 +10,9 @@
 # The corpus compiles and runs every tests/test_*.bl under gen1, whose lib/ is
 # this checkout's lib/, so each suite file already ran there against this
 # tree's stdlib. That holds only for a corpus of THIS tree under gen1: the
-# compiler, the blinkc hash and the commit in the JSON must all match, or the
-# check reads results that no longer describe the code.
+# compiler and the blinkc hash in the JSON must match, and so must its commit
+# or the ci input stamp (below), or the check reads results that no longer
+# describe the code.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -32,7 +33,17 @@ want_head=$(git rev-parse --short HEAD) || exit 2
 got_comp=$(jq -r .compiler "$json")
 got_sha=$(jq -r .blinkc_sha256_prefix "$json")
 got_head=$(jq -r .git_head "$json")
-if [ "$got_comp" != "$comp" ] || [ "$got_sha" != "$want_sha" ] || [ "$got_head" != "$want_head" ]; then
+# ci skips the sweep when its input stamp matches, so after a commit that
+# touches no corpus input the JSON keeps the earlier commit. A matching stamp
+# proves the same tree as HEAD would. CORPUS_OUT is unset because the stamp
+# key hashes every CORPUS_* variable and the sweep ran without it.
+head_ok=0
+if [ "$got_head" = "$want_head" ]; then
+    head_ok=1
+elif [ "$json" -ef build/corpus.json ] && env -u CORPUS_OUT ./scripts/ci_corpus_stamp.sh check; then
+    head_ok=1
+fi
+if [ "$got_comp" != "$comp" ] || [ "$got_sha" != "$want_sha" ] || [ "$head_ok" != 1 ]; then
     echo "suites-in-corpus: ERROR $json is stale: compiler $got_comp blinkc $got_sha head $got_head," >&2
     echo "suites-in-corpus:       want compiler $comp blinkc $want_sha head $want_head" >&2
     exit 2
