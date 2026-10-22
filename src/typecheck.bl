@@ -5,7 +5,7 @@ import unparse.{type_ann_text, unparse_expr}
 import formatter.{effect_op_sig_text}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
-    ann_str_val, impl_provided_by_closeable, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
+    ann_str_val, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
     node_count, node_handlers, node_index, node_int_val, node_is_compiler_known_type_ann, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
@@ -13943,6 +13943,34 @@ fn tc_check_impl_overlap(impls_sl: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 }
 
+// The parser writes a BlockHandler impl for each impl whose header may name Closeable
+// (§4.7.2), before any name resolves. One stays when its impl names the core Closeable over a
+// declared receiver and is the first such impl of that receiver. The rest leave the program,
+// so no later pass sees an impl the source does not give, and an error in the impl itself is
+// reported once, on the impl the author wrote.
+fn tc_drop_unprovided_closeable_impls(program: Int) {
+    let impls_sl = node_methods(program)
+    if impls_sl == -1 { return }
+    let mut drop: Set[Int] = Set()
+    let mut receivers: Set[Str] = Set()
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, i)
+        if impl_provided_by_closeable(im) {
+            let src = closeable_impl_of(im)
+            let recv = tc_impl_target_name(src)
+            let declared = is_known_type(node_name(src)) != 0 || lookup_named_type(recv) != -1
+            if tc_impl_trait_id(src) != "Closeable" || !declared || receivers.contains(recv) {
+                drop.insert(im)
+            } else {
+                receivers.insert(recv)
+            }
+        }
+        i = i + 1
+    }
+    sublist_remove_members(impls_sl, drop)
+}
+
 // ── Main entry point ────────────────────────────────────────────────
 
 fn init_types() ! TypeCheck.Register {
@@ -14212,6 +14240,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Register all type definitions (structs and enums)
     let types_sl = node_fields(program)
     tc_register_type_decls(types_sl)
+    tc_drop_unprovided_closeable_impls(program)
 
     // Kind A: a struct name equal to an enum variant name is a hard error (E0518).
     // Detected over the whole-program symbol table (catches cross-module collisions).
@@ -17476,8 +17505,11 @@ fn tc_type_scoped_ctor_examples(name: Str, tid: Int) -> Str {
     let mut i = 0
     while i < fnsig_pool.len() && found < 2 {
         let fs = fnsig_pool.get(i).unwrap()
-        if fs.name.starts_with(prefix) && fs.ret == tid && !tc_fnsig_takes(fs, tid) {
-            let short = fs.name.byte_slice(prefix.byte_len(), fs.name.byte_len())
+        if fs.name.starts_with(prefix) && fs.ret == tid && !tc_fnsig_takes(fs, tid) && !tc_fn_decl_takes_self(fs.decl) {
+            // A trait impl's function is registered as `{Type}_{Trait}_{fn}`, but a call
+            // spells only the function's own name. A free `{Type}_{fn}` keeps its whole name.
+            let own = if fs.decl >= 0 { node_name(fs.decl) } else { fs.name }
+            let short = if own != fs.name { own } else { fs.name.byte_slice(prefix.byte_len(), fs.name.byte_len()) }
             if out != "" { out = "{out} or " }
             out = "{out}`{name}.{short}(...)`"
             found = found + 1
@@ -17485,6 +17517,14 @@ fn tc_type_scoped_ctor_examples(name: Str, tid: Int) -> Str {
         i = i + 1
     }
     out
+}
+
+// A signature's params leave the receiver out, so a method shows only on its declaration.
+// The receiver is the first param written with no annotation: `self`, or `_self`.
+fn tc_fn_decl_takes_self(decl: Int) -> Bool {
+    if decl < 0 { return false }
+    let params = node_params(decl)
+    params != -1 && sublist_length(params) > 0 && node_type_ann(sublist_get(params, 0)) == -1
 }
 
 fn tc_fnsig_takes(fs: FnSigEntry, tid: Int) -> Bool {
@@ -20522,12 +20562,17 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         tc_errors.push("undefined variable `{name}`")
         let help = if is_import_module_name(name) != 0 {
             nr_missing_import_help(name)
-        } else if tc_undefined_name_help(name) == "" && nr_name_top.contains_key(NR_ITEM_WITHOUT_AS) {
-            // A scoped value entered without `as` has its Context discarded, so a name the
-            // body expected from it is not there (sections/04_effects.md §4.7).
-            "bind it: with ... as {name}"
         } else {
-            tc_undefined_name_help(name)
+            let name_help = tc_undefined_name_help(name)
+            if name_help == "" && nr_name_top.contains_key(NR_ITEM_WITHOUT_AS) {
+                // A scoped value entered without `as` has its Context discarded, so a name the
+                // body expected from it is not there (sections/04_effects.md §4.7). Name
+                // resolution runs before item types are known, and a handler item gives no
+                // Context, so the help holds for either kind of item.
+                "if a with item is a scoped value, bind its Context: with ... as {name}"
+            } else {
+                name_help
+            }
         }
         diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{name}`", node, help)
         return
@@ -20972,6 +21017,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.WithBlock {
         let wh_sl = node_handlers(node)
         nr_push_scope()
+        let mut has_item_without_as = false
         if wh_sl != -1 {
             let mut wi = 0
             while wi < sublist_length(wh_sl) {
@@ -20986,11 +21032,13 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // guard in tc_check_body's WithBlock branch.
                 } else {
                     nr_check_node(wh_item)
-                    if wh_kind != NodeKind.HandlerExpr { nr_scope_push_entry(NR_ITEM_WITHOUT_AS, 0, TYPE_UNKNOWN, -1) }
+                    if wh_kind != NodeKind.HandlerExpr { has_item_without_as = true }
                 }
                 wi = wi + 1
             }
         }
+        // After the items, so a later item does not get the help for an earlier one.
+        if has_item_without_as { nr_scope_push_entry(NR_ITEM_WITHOUT_AS, 0, TYPE_UNKNOWN, -1) }
         nr_check_node(node_body(node))
         nr_pop_scope()
         return
@@ -25426,7 +25474,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // resolving — the qualified call `Trait.method(receiver)` selects one.
             if tc_method_trait_count(tname, method) >= 2 {
                 let names = tc_traits_shown(tc_method_trait_names(tname, method))
-                diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits implemented by {tname} ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`")
+                // The program may not spell BlockHandler at all: `impl Closeable` provides it
+                // (sections/04_effects.md §4.7.2), so the note names the impl that was written.
+                let mut notes: List[Str] = []
+                if tc_type_writes_trait_method(tname, method, "BlockHandler") && tc_type_writes_trait_method(tname, "close", "Closeable") {
+                    notes.push("`impl Closeable for {tname}` provides `BlockHandler` for `{tname}`")
+                }
+                diag_error_at_notes("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits implemented by {tname} ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`", notes)
                 return tc_error_recovery_tid()
             }
             // Resolve through the trait-qualified fnsig key. From/TryFrom register
@@ -28324,16 +28378,18 @@ fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // the parser writes for it. `as` only binds a name, so both item shapes come here. Nothing
 // else has a meaning there. A type typecheck could not settle is left alone, so one mistake
 // reads as one error. A type parameter is a scoped value only by its bound, and its Context
-// is abstract in the body. Returns false when it reports the item.
-fn tc_check_with_item(item: Int, tid0: Int) -> Bool ! Diag.Report {
+// is abstract in the body. The spec does not say what a Never item is. Until it does, one
+// that `as` binds passes and one without `as` is E0839. Returns false when it reports the
+// item.
+fn tc_check_with_item(item: Int, tid0: Int, binds: Bool) -> Bool ! Diag.Report {
     let tid = tc_resolve(tid0)
     if tc_tid_is_no_info(tid) != 0 { return true }
     let k = tc_tid_kind(tid)
-    if k == TyKind.Unknown || k == TyKind.Never { return true }
+    if k == TyKind.Unknown || (k == TyKind.Never && binds) { return true }
     if k == TyKind.Typevar && tc_typevar_is_scoped(tid) { return true }
     // `ffi.scope()` is the arena the FFI chapter scopes with `with ... as` (§5.2).
     if k == TyKind.Handler || k == TyKind.FfiScope { return true }
-    if tc_tid_has_block_handler(tid) != 0 { return true }
+    if tc_tid_has_scoped_impl(tid) { return true }
     // A handler or scoped value is usually acquired through a Result or an Option, and the
     // item then holds the carrier rather than the value it carries.
     let help = if k == TyKind.Result {
@@ -28352,8 +28408,8 @@ fn tc_check_with_item(item: Int, tid0: Int) -> Bool ! Diag.Report {
 // is read, since an impl's `where` bounds it from a frame of its own. A typevar whose binder
 // is not in scope here was not written in this body, so nothing is known and it passes.
 fn tc_typevar_is_scoped(tid: Int) -> Bool {
+    if tc_typevar_binds_here(tid) == 0 { return true }
     let binder = tc_tid_binder(tid)
-    if tc_binder_is_active(binder) == 0 { return true }
     for f in tc_tp_frames {
         if f.binder == binder && (tc_pipe_has(f.traits, "BlockHandler") != 0 || tc_pipe_has(f.traits, "Closeable") != 0) {
             return true
@@ -28362,18 +28418,21 @@ fn tc_typevar_is_scoped(tid: Int) -> Bool {
     false
 }
 
-// The receiver is matched by its declaration node, which every instance of a generic
-// type shares. An impl written for one instance cannot be told from another here, so it
-// answers yes rather than refuse a program codegen may accept.
-fn tc_tid_has_block_handler(tid: Int) -> Int ! Diag.Report {
+// Whether a type implements BlockHandler or Closeable. A Closeable impl counts on its own for
+// a generic receiver, which gets no BlockHandler impl from the parser. The receiver is matched
+// by its declaration node, which every instance of a generic type shares. An impl written for
+// one instance cannot be told from another here, so it answers yes rather than refuse a
+// program codegen may accept.
+fn tc_tid_has_scoped_impl(tid: Int) -> Bool ! Diag.Report {
     let decl = tc_tid_decl_node(tid)
-    if decl < 0 { return 0 }
+    if decl < 0 { return false }
     for im in tc_impl_recv_tids.keys() {
-        if tc_impl_trait_id(im) == "BlockHandler" && tc_tid_decl_node(tc_impl_recv_tid(im)) == decl {
-            return 1
+        let trait_id = tc_impl_trait_id(im)
+        if (trait_id == "BlockHandler" || trait_id == "Closeable") && tc_tid_decl_node(tc_impl_recv_tid(im)) == decl {
+            return true
         }
     }
-    0
+    false
 }
 
 fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -28384,7 +28443,7 @@ fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     let res_tid = infer_type(res_expr)
     tc_with_resource_node = prev_res
     // A refused item binds its name with no type, so uses in the body do not repeat the error.
-    let bind_tid = if tc_check_with_item(res_expr, res_tid) { tc_with_binder_tid(res_tid) } else { tc_unknown_tid() }
+    let bind_tid = if tc_check_with_item(res_expr, res_tid, true) { tc_with_binder_tid(res_tid) } else { tc_unknown_tid() }
     // The node's tid is the BINDER's type, not the resource expression's: codegen's only consumer
     // reads it to stamp the binder's ScopeVar, so keeping the resource type here would just move
     // the same wrong answer one phase later.
@@ -29752,7 +29811,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // the HandlerExpr arm that walks the method bodies, which infer_type does not
                     // do. The two are complements, and the order keeps handler-body diagnostics
                     // reported before any type error on the operand itself.
-                    let _ = tc_check_with_item(wh_item2, infer_type(wh_item2))
+                    let _ = tc_check_with_item(wh_item2, infer_type(wh_item2), false)
                 }
                 wi2 = wi2 + 1
             }

@@ -1351,6 +1351,29 @@ fn sublist_add(sl: Int, node_id: Int) {
     sublists.len.set(sl, n + 1)
 }
 
+// Takes the members `drop` holds out of a closed sublist and keeps the others in order. The
+// kept run is copied to the arena end, as sublist_add grows a closed sublist, so the old run
+// stays whole for a rewind.
+pub fn sublist_remove_members(sl: Int, drop: Set[Int]) {
+    let s = sublists.start.get(sl).unwrap()
+    let n = sublists.len.get(sl).unwrap()
+    if s < 0 || drop.len() == 0 { return }
+    if sl < journal.sl_floor { journal_record(JOURNAL_SUBLIST, sl, s, n, "") }
+    let dest = sublists.arena.len()
+    let mut kept = 0
+    let mut k = 0
+    while k < n {
+        let m = sublists.arena.get(s + k).unwrap()
+        if !drop.contains(m) {
+            sublists.arena.push(m)
+            kept = kept + 1
+        }
+        k = k + 1
+    }
+    sublists.start.set(sl, dest)
+    sublists.len.set(sl, kept)
+}
+
 // Appends to `out` the children of `id` in VALUE position only. A pass that reasons about
 // types walks these and stops at a spelling edge, where there is no value and so no type to
 // find. A walker that runs over every node passes one list down and reuses it.
@@ -2505,7 +2528,8 @@ fn maybe_desugar_expect_panic(decl: Int) ! Parse.Build {
     node_set_body(decl, block_id)
 }
 
-// The str_val of the BlockHandler impl the parser writes for an `impl Closeable`.
+// The str_val of the BlockHandler impl the parser writes for an `impl Closeable`. Its int_val
+// is the id of that impl.
 pub const CLOSEABLE_PROVIDED_IMPL = "Closeable"
 
 // Whether `im` is the BlockHandler impl the parser wrote for an `impl Closeable`, which no
@@ -2514,41 +2538,52 @@ pub fn impl_provided_by_closeable(im: Int) -> Bool {
     node_kind(im) == NodeKind.ImplBlock && node_str_val(im) == CLOSEABLE_PROVIDED_IMPL
 }
 
-// A copy of a type annotation and every annotation inside it, so the nodes of two impls stay
-// apart: a pass that keys on a node id then sees each impl's own.
-fn clone_type_ann(ta: Int) -> Int ! Parse.Build {
-    if ta == -1 { return -1 }
-    let n = node_at(ta)
-    let elems = clone_node_list(n.elements)
-    let ret = clone_type_ann(n.type_ann)
-    let id = node_count()
-    node_push(AstNode { elements: elems, type_ann: ret, ..n })
-    id
+// The `impl Closeable` a provided BlockHandler impl was written for.
+pub fn closeable_impl_of(provided: Int) -> Int {
+    node_int_val(provided)
 }
 
-// Copies a sublist of type annotations or type parameters (whose bounds sit in `elements`).
-fn clone_node_list(sl: Int) -> Int ! Parse.Build {
-    if sl == -1 { return -1 }
-    let out = new_sublist()
-    let mut i = 0
-    while i < sublist_length(sl) {
-        sublist_push(out, clone_type_ann(sublist_get(sl, i)))
-        i = i + 1
+// The names a trait in this file's impl headers can take for the core Closeable: its own,
+// and each alias an import gives a member named Closeable. The parser cannot tell which trait
+// a name reaches, so typecheck drops each provided impl whose header names another trait.
+fn closeable_spellings(import_nodes: List[Int]) -> List[Str] {
+    let mut out = ["Closeable"]
+    for imp in import_nodes {
+        let names = node_args(imp)
+        if names == -1 { continue }
+        let mut i = 0
+        while i < sublist_length(names) {
+            let item = sublist_get(names, i)
+            if node_name(item) == "Closeable" && node_str_val(item) != "" { out.push(node_str_val(item)) }
+            i = i + 1
+        }
     }
-    finalize_sublist(out)
     out
 }
 
+// The `close(self)` method of an impl, or -1. A close of any other shape is not the trait's,
+// and typecheck reports it at the impl.
 fn closeable_close_method(im: Int) -> Int {
     let methods = node_methods(im)
     if methods == -1 { return -1 }
     let mut i = 0
     while i < sublist_length(methods) {
         let m = sublist_get(methods, i)
-        if node_name(m) == "close" { return m }
+        if node_name(m) == "close" {
+            let params = node_params(m)
+            // The receiver is the param written with no annotation: `self`, or `_self`.
+            let one_self = params != -1 && sublist_length(params) == 1 && node_type_ann(sublist_get(params, 0)) == -1
+            return if one_self && node_type_params(m) == -1 { m } else { -1 }
+        }
         i = i + 1
     }
     -1
+}
+
+fn synth_ident(name: Str, line: Int, col: Int) -> Int ! Parse.Build {
+    let id = node_count()
+    node_push(AstNode { kind: NodeKind.Ident, name: name, line: line, col: col })
+    id
 }
 
 fn synth_self_param(line: Int, col: Int) -> Int ! Parse.Build {
@@ -2557,116 +2592,130 @@ fn synth_self_param(line: Int, col: Int) -> Int ! Parse.Build {
     id
 }
 
+fn synth_recv_ann(recv: Str, line: Int, col: Int) -> Int ! Parse.Build {
+    let id = node_count()
+    node_push(AstNode { kind: NodeKind.TypeAnn, name: recv, line: line, col: col })
+    id
+}
+
+fn synth_list_of(ids: List[Int]) -> Int ! Parse.Build {
+    let sl = new_sublist()
+    for id in ids {
+        sublist_push(sl, id)
+    }
+    finalize_sublist(sl)
+    sl
+}
+
 // A block that holds one expression statement, `expr`.
 fn synth_block_of(expr: Int, line: Int, col: Int) -> Int ! Parse.Build {
     let stmt = node_count()
     node_push(AstNode { kind: NodeKind.ExprStmt, value: expr, line: line, col: col })
-    let stmts = new_sublist()
-    sublist_push(stmts, stmt)
-    finalize_sublist(stmts)
+    let stmts = synth_list_of([stmt])
     let block = node_count()
     node_push(AstNode { kind: NodeKind.Block, stmts: stmts, line: line, col: col, end_line: line, end_col: col })
     block
+}
+
+// `fn enter(self) -> R { self }`. It returns the receiver, not `Self`, because a method's
+// return is checked against the receiver the impl names.
+fn synth_closeable_enter(recv: Str, line: Int, col: Int) -> Int ! Parse.Build {
+    let params = synth_list_of([synth_self_param(line, col)])
+    let ret = synth_recv_ann(recv, line, col)
+    let body = synth_block_of(synth_ident("self", line, col), line, col)
+    let id = node_count()
+    node_push(AstNode {
+        kind: NodeKind.FnDef, name: "enter", params: params, body: body,
+        return_type: recv, type_ann: ret, line: line, col: col, end_line: line, end_col: col,
+    })
+    id
+}
+
+// `fn exit(self, _ok: Bool) ! <close's effects> { Closeable.close(self) }`. The call names
+// the trait, so a `close` of another trait on the same type does not make it ambiguous. An
+// impl written through an import alias may sit in a file where `Closeable` names another
+// trait, and a call cannot yet be qualified by an alias, so that exit calls `self.close()`.
+fn synth_closeable_exit(close: Int, by_alias: Bool, line: Int, col: Int) -> Int ! Parse.Build {
+    let ok_ann = synth_recv_ann("Bool", line, col)
+    let ok = node_count()
+    node_push(AstNode { kind: NodeKind.Param, name: "_ok", type_name: "Bool", type_ann: ok_ann, line: line, col: col })
+    let params = synth_list_of([synth_self_param(line, col), ok])
+    let mut effects = -1
+    let close_effects = node_effects(close)
+    if close_effects != -1 {
+        let mut copies: List[Int] = []
+        let mut i = 0
+        while i < sublist_length(close_effects) {
+            let eff = sublist_get(close_effects, i)
+            copies.push(synth_ident(node_name(eff), node_line(eff), node_col(eff)))
+            i = i + 1
+        }
+        effects = synth_list_of(copies)
+    }
+    let callee = synth_ident(if by_alias { "self" } else { "Closeable" }, line, col)
+    let args = if by_alias { synth_list_of([]) } else { synth_list_of([synth_ident("self", line, col)]) }
+    let call = node_count()
+    node_push(AstNode { kind: NodeKind.MethodCall, obj: callee, method: "close", args: args, line: line, col: col })
+    let body = synth_block_of(call, line, col)
+    let id = node_count()
+    node_push(AstNode {
+        kind: NodeKind.FnDef, name: "exit", params: params, body: body,
+        effects: effects, line: line, col: col, end_line: line, end_col: col,
+    })
+    id
 }
 
 // §4.7.2: a Closeable type is a scoped value. It implements BlockHandler with Context = Self,
 // enter returning self, and exit calling close with close's effects. The impl is a real impl
 // so that trait bounds, mono and the `with` lowering see one kind of scoped value:
 //
-//     impl[B] BlockHandler for T[A] where W {
-//         type Context = T[A]
-//         fn enter(self) -> T[A] { self }
-//         fn exit(self, _ok: Bool) ! <close's effects> { self.close() }
+//     impl BlockHandler for R {
+//         type Context = R
+//         fn enter(self) -> R { self }
+//         fn exit(self, _ok: Bool) ! <close's effects> { Closeable.close(self) }
 //     }
 //
-// Context and enter name the receiver, not `Self`, because an associated type and a method
-// return are checked against the receiver the impl names. Returns -1 when `im` is no
-// `impl Closeable` or has no `close` (typecheck reports the missing method).
-fn closeable_provided_impl(im: Int) -> Int ! Parse.Build {
+// Returns -1 when `im` names no spelling of Closeable, has no `close(self)` (typecheck reports
+// the impl), or is generic: a generic impl's methods are lowered per instance, which this
+// compiler does not build, and typecheck takes such a type as a scoped value by its Closeable
+// impl alone.
+fn closeable_provided_impl(im: Int, spellings: List[Str]) -> Int ! Parse.Build {
     if parse_desugar_enabled == 0 { return -1 }
-    if node_trait_name(im) != "Closeable" || node_name(im) == "" { return -1 }
+    let written = node_trait_name(im)
+    let parts = written.split(".")
+    let last = parts.get(parts.len() - 1) ?? written
+    if last != "Closeable" && !spellings.contains(written) { return -1 }
+    let recv = node_name(im)
+    if recv == "" || node_impl_binders(im) != -1 || node_recv_type_args(im) != -1 { return -1 }
     let close = closeable_close_method(im)
     if close == -1 { return -1 }
     let line = node_line(close)
     let col = node_col(close)
-    let recv = node_name(im)
-    let recv_args = node_recv_type_args(im)
-
-    let ctx_args = clone_node_list(recv_args)
-    let ctx_ann = node_count()
-    node_push(AstNode { kind: NodeKind.TypeAnn, name: recv, elements: ctx_args, line: line, col: col })
+    let ctx_ann = synth_recv_ann(recv, line, col)
     let ctx = node_count()
     node_push(AstNode { kind: NodeKind.AssocType, name: "Context", type_name: recv, type_ann: ctx_ann, line: line, col: col })
-    let assoc = new_sublist()
-    sublist_push(assoc, ctx)
-    finalize_sublist(assoc)
-
-    let enter_params = new_sublist()
-    sublist_push(enter_params, synth_self_param(line, col))
-    finalize_sublist(enter_params)
-    let ret_args = clone_node_list(recv_args)
-    let enter_ret = node_count()
-    node_push(AstNode { kind: NodeKind.TypeAnn, name: recv, elements: ret_args, line: line, col: col })
-    let enter_self = node_count()
-    node_push(AstNode { kind: NodeKind.Ident, name: "self", line: line, col: col })
-    let enter_body = synth_block_of(enter_self, line, col)
-    let enter = node_count()
-    node_push(AstNode {
-        kind: NodeKind.FnDef, name: "enter", params: enter_params, body: enter_body,
-        return_type: recv, type_ann: enter_ret, line: line, col: col, end_line: line, end_col: col,
-    })
-
-    let ok_ann = node_count()
-    node_push(AstNode { kind: NodeKind.TypeAnn, name: "Bool", line: line, col: col })
-    let ok = node_count()
-    node_push(AstNode { kind: NodeKind.Param, name: "_ok", type_name: "Bool", type_ann: ok_ann, line: line, col: col })
-    let exit_params = new_sublist()
-    sublist_push(exit_params, synth_self_param(line, col))
-    sublist_push(exit_params, ok)
-    finalize_sublist(exit_params)
-    let mut exit_effects = -1
-    let close_effects = node_effects(close)
-    if close_effects != -1 {
-        exit_effects = new_sublist()
-        let mut i = 0
-        while i < sublist_length(close_effects) {
-            let eff = sublist_get(close_effects, i)
-            let copy = node_count()
-            node_push(AstNode { kind: NodeKind.Ident, name: node_name(eff), line: node_line(eff), col: node_col(eff) })
-            sublist_push(exit_effects, copy)
-            i = i + 1
-        }
-        finalize_sublist(exit_effects)
-    }
-    let exit_self = node_count()
-    node_push(AstNode { kind: NodeKind.Ident, name: "self", line: line, col: col })
-    let no_args = new_sublist()
-    finalize_sublist(no_args)
-    let call = node_count()
-    node_push(AstNode { kind: NodeKind.MethodCall, obj: exit_self, method: "close", args: no_args, line: line, col: col })
-    let exit_body = synth_block_of(call, line, col)
-    let exit = node_count()
-    node_push(AstNode {
-        kind: NodeKind.FnDef, name: "exit", params: exit_params, body: exit_body,
-        effects: exit_effects, line: line, col: col, end_line: line, end_col: col,
-    })
-
-    let methods = new_sublist()
-    sublist_push(methods, enter)
-    sublist_push(methods, exit)
-    finalize_sublist(methods)
-    // The copies are pushed before the impl, so its id is read after them.
-    let binders = clone_node_list(node_impl_binders(im))
-    let impl_args = clone_node_list(recv_args)
-    let where_bounds = clone_node_list(node_impl_where_bounds(im))
+    let assoc = synth_list_of([ctx])
+    let methods = synth_list_of([synth_closeable_enter(recv, line, col), synth_closeable_exit(close, last != "Closeable", line, col)])
     let id = node_count()
     node_push(AstNode {
-        kind: NodeKind.ImplBlock, trait_name: "BlockHandler", name: recv, str_val: CLOSEABLE_PROVIDED_IMPL,
-        methods: methods, assoc_types: assoc,
-        impl_binders: binders, recv_type_args: impl_args, impl_where_bounds: where_bounds,
+        kind: NodeKind.ImplBlock, trait_name: "BlockHandler", name: recv,
+        str_val: CLOSEABLE_PROVIDED_IMPL, int_val: im, methods: methods, assoc_types: assoc,
         line: node_line(im), col: node_col(im), end_line: node_end_line(im), end_col: node_end_col(im),
     })
     id
+}
+
+// Each impl, each followed by the BlockHandler impl the parser writes for it when it is an
+// `impl Closeable`.
+fn with_closeable_provided_impls(impl_nodes: List[Int], import_nodes: List[Int]) -> List[Int] ! Parse.Build {
+    let spellings = closeable_spellings(import_nodes)
+    let mut out: List[Int] = []
+    for im in impl_nodes {
+        out.push(im)
+        let provided = closeable_provided_impl(im, spellings)
+        if provided != -1 { out.push(provided) }
+    }
+    out
 }
 
 // ── Import statements ────────────────────────────────────────────────
@@ -2873,8 +2922,6 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             let im = parse_impl_block()
             attach_pending_annotations(im)
             impl_nodes.push(im)
-            let provided = closeable_provided_impl(im)
-            if provided != -1 { impl_nodes.push(provided) }
         } else if at(TokenKind.Let) {
             let plain = annotations.item.len() == 0
             let lb = parse_let_binding()
@@ -3017,6 +3064,8 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
         fn_bodies.item_firsts.push(pos)
         fn_bodies.item_kinds.push("end")
     }
+    // After the loop, so an import below an impl still names Closeable for it.
+    impl_nodes = with_closeable_provided_impls(impl_nodes, import_nodes)
     // Build sublists from collected node IDs
     let fns = new_sublist()
     let mut i = 0

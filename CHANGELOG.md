@@ -31,6 +31,10 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **An unknown `@derive` name is E1402 NotDerivable.** E1112 UnknownDerive is retired. `@derive` resolves a trait name by scope.
 - **An annotation in the wrong position is an error.** This covers an annotation on an effect operation, an annotation other than `@handle_all` on a sub-effect, and `@handle_all` on a field.
 
+### Effects and `with`
+- **A `with` item bound by `as` must be a `Handler[E]` or a scoped value, the same rule as an item without `as`.** `as` only names the item. Any other item is E0839 NonHandlerWithItem; before, `with 42 as n` or a `Result` bound by `as` ran with no error and closed nothing. Unwrap a `Result` or `Option` item with `?` or `.unwrap()`.
+- **A `Closeable` type is a scoped value: it implements `BlockHandler` with `Context` the type itself.** So a `T: BlockHandler` bound accepts it, and `with r { }` without `as` runs `close()` too. An `impl BlockHandler` for a type that has an `impl Closeable` is E0526 OverlappingImpls. On a type that also has a method `enter` or `exit` from another trait, an unqualified `r.enter()` is E0522 AmbiguousMethodCall; write `Trait.enter(r)`.
+
 ### Strings
 - **A string hole whose expression starts with `{` is E1130 InterpDoubleBrace.** This holds in every string form, with any whitespace before the `{`. Before, `"a {{x}} b"` printed `a 5 b`. For a literal brace, write `\{` or use `#"..."#`; to start a hole with a block, write `"{({ ... })}"`. `blink fmt` keeps those parentheses.
 

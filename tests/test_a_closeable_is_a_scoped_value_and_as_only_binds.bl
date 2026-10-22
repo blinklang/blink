@@ -306,8 +306,173 @@ test "a name used in a with body whose item has no as gets a help line to bind i
         RES_CLOSE,
         "fn main() \{",
         "    with Res \{ n: 1 } \{ io.println(\"\{r.n}\") }",
+        "    with Res \{ n: 1 }, Res \{ n: q } \{ }",
         "}",
-    ], ["E0506@4:38@undefined variable `r`@bind it: with ... as r"])]
+    ], [
+        "E0506@4:38@undefined variable `r`@if a with item is a scoped value, bind its Context: with ... as r",
+        "E0506@5:33@undefined variable `q`@",
+    ])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "an import alias of Closeable makes a scoped value, and a local trait named Closeable does not" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    problems.push(expect_run("alias", [
+        "import blink.core.\{Closeable as CoreCloseable}",
+        RES,
+        "impl CoreCloseable for Res \{ fn close(self) \{ io.println(\"close \{self.n}\") } }",
+        "fn main() \{",
+        "    with Res \{ n: 1 } as r \{ io.println(\"body \{r.n}\") }",
+        "}",
+    ], ["body 1", "close 1"]))
+    problems.push(expect_rows("local_trait", [
+        "trait Closeable \{ fn close(self) }",
+        RES,
+        "impl Closeable for Res \{ fn close(self) \{ } }",
+        "fn main() \{",
+        "    with Res \{ n: 1 } as r \{ }",
+        "}",
+    ], ["E0839@5:10@{not_an_item("Res")}@{OTHER_HELP}"]))
+    problems.push(expect_run("alias_beside_local_trait", [
+        "import blink.core.\{Closeable as CoreCloseable}",
+        "trait Closeable \{ fn close(self) }",
+        RES,
+        "impl CoreCloseable for Res \{ fn close(self) \{ io.println(\"close \{self.n}\") } }",
+        "fn main() \{",
+        "    with Res \{ n: 1 } as r \{ io.println(\"body \{r.n}\") }",
+        "}",
+    ], ["body 1", "close 1"]))
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "the provided exit calls Closeable.close even when another trait also has close" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_run("two_close", [
+        "trait Gate \{ fn close(self) }",
+        RES,
+        RES_CLOSE,
+        "impl Gate for Res \{ fn close(self) \{ io.println(\"gate \{self.n}\") } }",
+        "fn main() \{",
+        "    with Res \{ n: 1 } as r \{ io.println(\"body \{r.n}\") }",
+        "}",
+    ], ["body 1", "close 1"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "a close whose receiver is written _self still makes a scoped value" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_run("under_self", [
+        RES,
+        "impl Closeable for Res \{ fn close(_self) \{ io.println(\"closed\") } }",
+        "fn main() \{",
+        "    with Res \{ n: 1 } as r \{ io.println(\"body \{r.n}\") }",
+        "    with Res \{ n: 2 } \{ }",
+        "}",
+    ], ["body 1", "closed", "closed"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "a Closeable impl that cannot provide BlockHandler reports only its own error" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    problems.push(expect_rows("close_arity", [
+        RES,
+        "impl Closeable for Res \{ fn close(self, _x: Int) \{ } }",
+        "fn main() \{ }",
+    ], ["E0901@2:26@method `close` in impl Closeable for Res has 2 params, expected 1@trait requires 1 parameters (including self)"]))
+    problems.push(expect_rows("unknown_receiver", [
+        "impl Closeable for Nope \{ fn close(self) \{ } }",
+        "fn main() \{ }",
+    ], ["E0507@1:1@unknown type `Nope` in receiver of impl `Closeable`@the receiver must be a declared type, a builtin type, or a name declared in `impl[...]` binders"]))
+    problems.push(expect_rows("two_closeables", [
+        RES,
+        RES_CLOSE,
+        RES_CLOSE,
+        "fn main() \{ }",
+    ], ["E0526@3:1@impl of `Closeable` for `Res` overlaps an earlier impl; Blink does not support specialization@keep one impl, or wrap one receiver in a newtype so the two impls answer for types that share no instance"]))
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "a generic Closeable type keeps close callable" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_run("generic_close", [
+        "type Box[T] \{ v: T }",
+        "impl[T] Closeable for Box[T] \{ fn close(self) \{ io.println(\"closed\") } }",
+        "fn main() \{",
+        "    let b = Box \{ v: 1 }",
+        "    b.close()",
+        "}",
+    ], ["closed"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "a Closeable type's help names a type-scoped constructor, not its enter" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_rows("ctor_help", [
+        RES,
+        RES_CLOSE,
+        "trait Make \{ fn make(n: Int) -> Self }",
+        "impl Make for Res \{ fn make(n: Int) -> Res \{ Res \{ n: n } } }",
+        "fn main() \{",
+        "    let _r = Res(1)",
+        "}",
+    ], ["E0504@6:14@undefined function `Res`@`Res` has no constructor call; build a value with a function of `Res`, such as `Res.make(...)`, or with a struct literal, as in `Res \{ n: ... }`"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "an ambiguous enter on a Closeable type notes the impl that provides BlockHandler" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/door.bl", lines([
+        "trait Door \{ fn enter(self) -> Int }",
+        RES,
+        RES_CLOSE,
+        "impl Door for Res \{ fn enter(self) -> Int \{ self.n } }",
+        "fn main() \{",
+        "    let r = Res \{ n: 1 }",
+        "    let _x = r.enter()",
+        "}",
+    ]))
+    let r = blink_in_dir("check door.bl")
+    let _ = sh("rm -rf {DIR}")
+    if !r.err_out.contains("note: `impl Closeable for Res` provides `BlockHandler` for `Res`") { io.eprintln(r.err_out) }
+    assert(r.err_out.contains("error[AmbiguousMethodCall]: ambiguous method call: `.enter` is defined in multiple traits implemented by Res (BlockHandler and Door)"))
+    assert(r.err_out.contains("note: `impl Closeable for Res` provides `BlockHandler` for `Res`"))
+}
+
+test "a Never item without as is E0839" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_rows("never_item", [
+        "fn boom() -> Never \{ panic(\"boom\") }",
+        "fn main() \{",
+        "    with boom() \{ }",
+        "}",
+    ], ["E0839@3:10@{not_an_item("Never")}@{OTHER_HELP}"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "a scoped value whose Context is a handler keeps its binder in the block" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_rows("handler_context", [
+        "type S \{ n: Int }",
+        "impl BlockHandler for S \{",
+        "    type Context = Handler[IO]",
+        "    fn enter(self) -> Handler[IO] \{ handler IO \{ fn print(_msg: Str) \{ } } }",
+        "    fn exit(self, _ok: Bool) \{ }",
+        "}",
+        "fn leak() -> Handler[IO] \{",
+        "    with S \{ n: 1 } as h \{ return h }",
+        "}",
+        "fn main() \{ }",
+    ], ["E0601@8:35@`h` is scoped to its `with ... as` block and cannot be returned out of it@copy the data you need out of `h` inside the block"])]
     let _ = sh("rm -rf {DIR}")
     report(problems)
 }

@@ -68,13 +68,12 @@ pub type ResourceCleanup {
     // The C function the guard local runs on the way out, or "" when nothing runs. Only
     // FfiScope names one: the runtime's.
     exit_symbol: Str
-    // Whether that function takes the block's success flag as a second argument.
-    passes_ok: Bool
 }
 
 // The trait that claims a scoped value. Held as a name because an impl block's trait is a
 // name, and written once so no comparison against a literal type name is needed.
 let TRAIT_BLOCK_HANDLER = "BlockHandler"
+let TRAIT_CLOSEABLE = "Closeable"
 // The runtime's own scope exit.
 let FFI_SCOPE_EXIT = "blink_ffi_scope_cleanup"
 // async.scope's own exit runner: awaits every handle the scope's body still has running.
@@ -83,7 +82,7 @@ let ASYNC_SCOPE_EXIT = "blink_async_scope_drain"
 // Nothing runs on the way out. This is also what a recorded internal error hands back,
 // so a poisoned answer cannot install a cleanup nobody asked for.
 fn plain_binding() -> ResourceCleanup {
-    ResourceCleanup { protocol: CleanupProtocol.Plain, impl_block: -1, exit_symbol: "", passes_ok: false }
+    ResourceCleanup { protocol: CleanupProtocol.Plain, impl_block: -1, exit_symbol: "" }
 }
 
 // The FFI scope's exit runner, registered once per translation unit before any function
@@ -114,7 +113,8 @@ fn kind_can_carry_impl(k: TyKind) -> Bool {
     k == TyKind.Struct || k == TyKind.Enum
 }
 
-// The impl block of one trait for one type declaration, or -1.
+// The impl block of one trait for one type declaration, or -1, or -2 once it has reported
+// an impl it cannot match.
 //
 // The bridge from an impl block to its receiver is the type name it was written with —
 // the same bridge typecheck's own impl resolution uses — and the declaration node behind
@@ -137,7 +137,7 @@ fn impl_of_trait_for_decl(trait_name: Str, decl: Int, node: Int) -> Int ! Diag.R
                 if args != -1 && sublist_length(args) > 0 {
                     diag_ice_stage_not_built(
                         "matching a {trait_name} impl written for one instance of a generic type", node)
-                    return -1
+                    return -2
                 }
                 return im
             }
@@ -179,7 +179,7 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
     }
     if kind == TyKind.FfiScope {
         return ResourceCleanup { protocol: CleanupProtocol.FfiScope, impl_block: -1,
-            exit_symbol: FFI_SCOPE_EXIT, passes_ok: false }
+            exit_symbol: FFI_SCOPE_EXIT }
     }
     if !kind_can_carry_impl(kind) { return plain_binding() }
     let decl = tc_tid_decl_node(tid)
@@ -198,7 +198,7 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
             "a {TRAIT_BLOCK_HANDLER} reached the resource cleanup path", node,
             "the with stage lowers every block handler through cg_eff_block_handler_calls")
         return ResourceCleanup { protocol: CleanupProtocol.BlockHandler, impl_block: bh,
-            exit_symbol: "", passes_ok: false }
+            exit_symbol: "" }
     }
     plain_binding()
 }
@@ -217,7 +217,8 @@ pub type BlockHandlerCalls {
 let BLOCK_HANDLER_ENTER_METHOD = "enter"
 let BLOCK_HANDLER_EXIT_METHOD = "exit"
 
-// The BlockHandler impl of a with-item expression's type, or -1. The same question
+// The BlockHandler impl of a with-item expression's type, or -1, or -2 once it has reported
+// a scoped value codegen cannot lower. The same question
 // decides both `with` forms: without `as` an item is a block handler or an effect handler,
 // and with it a block handler or a resource.
 pub fn cg_eff_block_handler_impl(expr: Int) -> Int ! Diag.Report {
@@ -227,7 +228,18 @@ pub fn cg_eff_block_handler_impl(expr: Int) -> Int ! Diag.Report {
     if !kind_can_carry_impl(tc_tid_kind(tid)) { return -1 }
     let decl = tc_tid_decl_node(tid)
     if decl < 0 { return -1 }
-    impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, expr)
+    let bh = impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, expr)
+    if bh != -1 { return bh }
+    // The parser writes no BlockHandler impl for a Closeable impl on a generic type, `impl[T]`
+    // or one instance alike, and typecheck still takes the type as a scoped value. Reporting
+    // here, not matching, keeps an impl written for `Box[Int]` from closing a `Box[Str]`.
+    for im in cg_reg_impl_decls() {
+        if tc_impl_trait_id(im) == TRAIT_CLOSEABLE && tc_impl_owner_decl(im) == decl {
+            diag_ice_stage_not_built("a with-item whose Closeable impl is written for a generic type", expr)
+            return -2
+        }
+    }
+    -1
 }
 
 // exit runs from the guard with the ok flag the guard recorded. The guard runner passes no
@@ -1582,7 +1594,7 @@ pub fn cg_eff_lower_handler_install_of(item: Int, handler_tid: Int, handler_valu
     if effect_name == "" {
         diag_ice_at("WithItemNotAHandler", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "with-item type {tid} is not a handler of a named effect", item,
-            "a with-item without `as` must be a Handler[E] or a BlockHandler; typecheck refuses the rest (E0839), so this is a compiler defect")
+            "a with-item that is no scoped value must be a Handler[E]; typecheck refuses the rest (E0839), so this is a compiler defect")
         return -1
     }
     let field = ev_field_of(tid, item)

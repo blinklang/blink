@@ -17,9 +17,10 @@
 #       its name says per_module, objcache or obj_cache.
 # "Part of the compiler" is the import closure of src/blinkc_main.bl and
 # src/cli.bl, plus the test helpers that drive it (compile_test_helpers and
-# the cg, lower and cname test helpers). A file that imports only those is one
-# program over the compiler, which the full per-module corpus in ci-release
-# covers; in units it costs several seconds a file.
+# the cg, lower and cname test helpers). std and the blink.* pseudo-modules
+# count the same, as no second module is built for them. A file that imports
+# only those is one program over the compiler, which the full per-module
+# corpus in ci-release covers; in units it costs several seconds a file.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -36,7 +37,7 @@ while [ -n "$queue" ]; do
         [ -f "src/$i.bl" ] && ! grep -qx "$i" "$compiler" && queue="$queue $i"
     done
 done
-echo std >> "$compiler"
+printf "std\nblink\n" >> "$compiler"
 
 # One grep per test over the whole tree, not several per file: ci runs this
 # beside the gen1 build, and forking per file cost it seconds.
