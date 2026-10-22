@@ -2558,7 +2558,7 @@ When several import entries collide with one declaration, each entry gets its ow
 
 #### Imported Names
 
-Each file has its own binding table. A selective import binds each listed name and its qualifier, and a whole-module import binds only its qualifier. The qualifier is the leaf name of the module path, or the name after the `as` that follows the path (*Import Aliases*). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. The compiler checks each import when it reads it, whether or not the file uses the name.
+Each file has its own binding table. A selective import binds each listed name and its qualifier, and a whole-module import binds only its qualifier. The qualifier is the leaf name of the module path, or the name after the `as` that follows the path (*Import Aliases*). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. Every check on an import entry runs when the compiler reads the import, whether or not the file uses the name. This holds for E1003 (import form), E1005 and E1023.
 
 ```blink
 import auth.{Error}
@@ -2666,9 +2666,9 @@ When the entry names a type whose methods the file calls, the note says that the
 | E1000 | Module not found | No file at resolved path, no matching dependency |
 | E1001 | Duplicate module name | Two files claim same `@module` name |
 | E1002 | Circular package dependency | Cross-package import cycle |
-| E1003 | Private item access | Referencing or importing a function, type, trait, variant or other item that is not `pub` in its declaring module, or using the body of an opaque type outside its declaring module (§2.12.2) |
+| E1003 | Private item access | Referencing or importing a function, type, trait, variant or other item that is not `pub` in its declaring module, or using the body of an opaque type outside its declaring module (§2.12.2). The import form is checked when the import is read (§10.5) |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
-| E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items |
+| E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items. Checked when the import is read (§10.5) |
 | E1006 | Import not selected | A bare name comes from an imported module but is not in the selective import list |
 | E1007 | Module-qualified type member | A type member or variant is reached through a module qualifier (`mod.Type.Member`) instead of an imported type |
 | E1008 | Invalid module annotation | `@module(...)` disagrees with parent package or entry file's `[package].name` |
@@ -2679,6 +2679,7 @@ When the entry names a type whose methods the file calls, the note says that the
 | E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
 | E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |
 | E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), two members of one `T.` namespace in a package share a name (§2.12.3), or a module-level value or type, or an import entry, has the name `Some`, `None`, `Ok` or `Err` (§2.12.1) |
+| E1023 | Unknown import name | A selective import (`import` or `pub import`) lists a name that its module does not declare in either namespace and does not re-export. A name that the module declares without `pub` is E1003. Checked when the import is read (§10.5) |
 
 ```
 error[E1003]: item `Token` is private in module `auth.internal`
@@ -2689,6 +2690,54 @@ error[E1003]: item `Token` is private in module `auth.internal`
   |
   = help: import from the public API: `import auth.{Token}`
 ```
+
+**Unknown import name.** A selective import lists the names that it takes from a module. A listed name that the module does not declare is `UnknownImportName` (E1023). The compiler reports it when it reads the import, whether or not the file uses the name (§10.5 *Imported Names*), and it reports `pub import` the same way. A name that the module declares without `pub` is E1003, not E1023. Names are case-sensitive.
+
+```blink
+// other.bl declares `pub fn x` and `pub fn nothere`
+import other.{x, nothre}       // error[E1023]: module `other` has no item `nothre`
+```
+
+```
+error[E1023]: module `other` has no item `nothre`
+ --> src/main.bl:1:18
+  |
+1 | import other.{x, nothre}
+  |                  ^^^^^^ not declared in `other`
+  |
+  = help: did you mean `nothere`?
+```
+
+The primary span is on the listed name. When the entry has an alias (`nothre as n`), the span stays on `nothre`, the name to the left of `as`.
+
+The help uses the nearest-name rule (ERROR_CATALOG.md, *Conventions*). The candidates are the `pub` items of the module in both namespaces and the names that the module re-exports with `pub import`. A name that the same list already holds is not a candidate. A private item is never a candidate. With no near candidate, the help lists the candidates. The terminal text may shorten the list and count the rest. Structured output lists every candidate. When the module has no candidate, there is no help line.
+
+When the module declares a private item whose name differs from the listed name only in case, a `note:` says that this private item exists. The note gives no fix: it adds no edit to structured output, no code action in an editor, and it never says to make the item `pub`.
+
+```blink
+// other.bl declares a private `fn hidden` and no `Hidden`
+import other.{Hidden}          // error[E1023]: module `other` has no item `Hidden`
+```
+
+```
+error[E1023]: module `other` has no item `Hidden`
+ --> src/main.bl:1:15
+  |
+1 | import other.{Hidden}
+  |               ^^^^^^ not declared in `other`
+  |
+  = note: a private item `hidden` exists in `other`; names are case-sensitive
+```
+
+**Fix.** With one suggestion, the fix is machine-applicable (§8.6). It renames the listed name, and it renames every use in the file that resolves to the name this entry binds. The fix follows name resolution, not text: a local that shadows the name is not a use of the entry, and the fix does not change it. With an alias (`nothre as n`), the uses name the alias, so the fix renames only the listed name. When the new name is already bound in the file, or is bound at any of those uses, the fix is a suggestion only.
+
+**Follow-on diagnostics.** The failed entry still binds its name, or its alias, but the name denotes no item. One mistake gives one diagnostic, so:
+
+- The entry gets no W0602.
+- A use of the name gets no E0504, E0507 or E1006.
+- The entry takes no part in E1005 or E1012.
+
+A qualified name that the module does not declare (`other.nothre()`) keeps its own error, E0505. Its help uses the same candidates and the same nearest-name rule as E1023.
 
 #### Import Aliases
 
