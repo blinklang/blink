@@ -18046,6 +18046,13 @@ type LitFaults {
     missing: List[LitFieldRow]
 }
 
+// Where a repair adds to a brace list. `lead` is ", " after a label and "" inside empty braces.
+type BraceAppend {
+    line: Int
+    col: Int
+    lead: Str
+}
+
 // The type a literal builds, as its diagnostics name it, and the declaration a repair would edit.
 type LitOwner {
     shown: Str
@@ -18248,21 +18255,13 @@ fn tc_report_variant_arity(shown: Str, var_idx: Int, vname: Str, got: Int, node:
 // Every DuplicateField, then every NoSuchField, then MissingField (§2.14 Order). `lit` is the
 // brace literal a fill-in assist edits, or -1 for a paren payload.
 fn tc_report_literal_fields(owner: LitOwner, labels: List[Int], spread: Int, head: Int, lit: Int) ! Diag.Report {
-    // A type its module declares twice (E1016) may have meant either declaration's fields.
-    if tc_type_decl_poisoned(owner.decl) { return }
-    let faults = literal_field_faults(owner.rows, labels, spread == -1)
-    tc_report_duplicate_labels(faults.dups)
-    for u in faults.unknowns { tc_report_unknown_label(owner, labels, u, false) }
+    let faults = tc_report_label_faults(owner, owner.rows, labels, spread == -1, false)
     if faults.missing.len() == 0 { return }
-    let mut shown: List[Str] = []
     let mut fill: List[Str] = []
-    for r in faults.missing {
-        shown.push("`{r.name}` ({type_ann_text(node_value(r.field))})")
-        fill.push("{r.name}: ")
-    }
+    for r in faults.missing { fill.push("{r.name}: ") }
     let one = faults.missing.len() == 1
     let first = faults.missing.get(0).unwrap().name
-    let what = if one { "field {shown.get(0).unwrap()}" } else { "fields {shown.join(", ")}" }
+    let what = tc_missing_fields_phrase(faults.missing)
     let mut help = if one { "add `{first}: ` and a value" } else { "add each missing field with a value" }
     if owner.is_struct && tc_decl_in_root_package(owner.decl) {
         help = if one { "{help}\nor give `{first}` a default in `{owner.shown}`" } else { "{help}\nor give each a default in `{owner.shown}`" }
@@ -18277,12 +18276,40 @@ fn tc_report_literal_fields(owner: LitOwner, labels: List[Int], spread: Int, hea
 fn tc_assist_fill_fields(lit: Int, labels: List[Int], fill: List[Str]) ! Diag.Report {
     let text = fill.join(", ")
     let action = if fill.len() == 1 { "add the missing field" } else { "add the missing fields" }
+    match tc_brace_append_at(lit, labels) {
+        Some(at) => diag_set_last_assist_at(action, "{at.lead}{text}", at.line, at.col)
+        None => {}
+    }
+}
+
+// After the last label, or before the `}` of empty braces. None when the parser kept no end
+// span there, as after a parse error.
+fn tc_brace_append_at(brace: Int, labels: List[Int]) -> Option[BraceAppend] {
     if labels.len() > 0 {
         let last = labels.get(labels.len() - 1).unwrap()
-        if node_end_line(last) > 0 { diag_set_last_assist_at(action, ", {text}", node_end_line(last), node_end_col(last)) }
-    } else if node_end_line(lit) > 0 && node_end_col(lit) > 1 {
-        diag_set_last_assist_at(action, text, node_end_line(lit), node_end_col(lit) - 1)
+        if node_end_line(last) > 0 { return Some(BraceAppend { line: node_end_line(last), col: node_end_col(last), lead: ", " }) }
+        return None
     }
+    if node_end_line(brace) > 0 && node_end_col(brace) > 1 { return Some(BraceAppend { line: node_end_line(brace), col: node_end_col(brace) - 1, lead: "" }) }
+    None
+}
+
+// E0315 and E0319 name the missing fields the same way: each with its declared type.
+fn tc_missing_fields_phrase(missing: List[LitFieldRow]) -> Str {
+    let mut shown: List[Str] = []
+    for r in missing { shown.push("`{r.name}` ({type_ann_text(node_value(r.field))})") }
+    if shown.len() == 1 { "field {shown.get(0).unwrap()}" } else { "fields {shown.join(", ")}" }
+}
+
+// Every DuplicateField, then every NoSuchField (§2.14 Order). The caller reports what is
+// missing, since a literal and a pattern report it with different codes.
+fn tc_report_label_faults(owner: LitOwner, rows: List[LitFieldRow], labels: List[Int], check_missing: Bool, in_pattern: Bool) -> LitFaults ! Diag.Report {
+    // A type its module declares twice (E1016) may have meant either declaration's fields.
+    if tc_type_decl_poisoned(owner.decl) { return LitFaults { dups: [], unknowns: [], missing: [] } }
+    let faults = literal_field_faults(rows, labels, check_missing)
+    tc_report_duplicate_labels(faults.dups)
+    for u in faults.unknowns { tc_report_unknown_label(owner, labels, u, in_pattern) }
+    faults
 }
 
 fn tc_report_duplicate_labels(dups: List[LitDup]) ! Diag.Report {
@@ -18335,51 +18362,40 @@ fn tc_declared_marks(owner: LitOwner, labels: List[Int]) -> List[Str] {
 // too, so no row has a default. The faults come back whether or not this visit reported them,
 // so the arm's recovery is the same on every walk.
 fn tc_check_pattern_labels(owner: Option[LitOwner], pat: Int) -> LitFaults ! Diag.Report {
-    let none = LitFaults { dups: [], unknowns: [], missing: [] }
-    let o = match owner {
-        Some(o) => o
-        None => return none
+    match owner {
+        Some(o) => {
+            let mut rows: List[LitFieldRow] = []
+            for r in o.rows { rows.push(LitFieldRow { has_default: false, ..r }) }
+            let labels = tc_lit_labels(node_fields(pat))
+            let faults = tc_report_label_faults(o, rows, labels, node_inclusive(pat) == 0, true)
+            if faults.missing.len() > 0 { tc_report_pattern_missing_rest(o, pat, labels, faults.missing) }
+            faults
+        }
+        None => LitFaults { dups: [], unknowns: [], missing: [] }
     }
-    // A type its module declares twice (E1016) may have meant either declaration's fields.
-    if tc_type_decl_poisoned(o.decl) { return none }
-    let mut rows: List[LitFieldRow] = []
-    for r in o.rows { rows.push(LitFieldRow { has_default: false, ..r }) }
-    let labels = tc_lit_labels(node_fields(pat))
-    let faults = literal_field_faults(rows, labels, node_inclusive(pat) == 0)
-    tc_report_duplicate_labels(faults.dups)
-    for u in faults.unknowns { tc_report_unknown_label(o, labels, u, true) }
-    if faults.missing.len() > 0 { tc_report_pattern_missing_rest(o, pat, labels, faults.missing) }
-    faults
 }
 
 // One error at the type or variant name. The fixes come in the spec's order: `..` is the
 // machine fix; `f: _` keeps the pattern closed, so it is an assist a person chooses.
 fn tc_report_pattern_missing_rest(owner: LitOwner, pat: Int, labels: List[Int], missing: List[LitFieldRow]) ! Diag.Report {
-    let mut shown: List[Str] = []
     let mut skips: List[Str] = []
-    for r in missing {
-        shown.push("`{r.name}` ({type_ann_text(node_value(r.field))})")
-        skips.push("{r.name}: _")
-    }
-    let what = if missing.len() == 1 { "field {shown.get(0).unwrap()}" } else { "fields {shown.join(", ")}" }
-    let msg = "`{owner.shown}` pattern leaves out {what} and has no `..`"
-    let variant = node_type_name(pat)
-    let qcol = if node_kind(pat) == NodeKind.EnumPattern { tc_qualified_name_col(pat, node_name(pat), variant) } else { -1 }
+    for r in missing { skips.push("{r.name}: _") }
+    let msg = "`{owner.shown}` pattern leaves out {tc_missing_fields_phrase(missing)} and has no `..`"
+    // Both spellings put the error under the name the pattern gives: `Rect` in `Shape.Rect`.
+    let named = node_type_name(pat)
+    let qcol = if node_kind(pat) == NodeKind.EnumPattern { tc_qualified_name_col(pat, node_name(pat), named) } else { node_col(pat) }
     let col = if qcol > 0 { qcol } else { node_col(pat) }
-    let end_col = if qcol > 0 { qcol + variant.byte_len() } else { 0 }
+    let end_col = if qcol > 0 { qcol + named.byte_len() } else { 0 }
     let before = diag_entry_count()
     diag_error_span_at_notes("PatternMissingRest", PATTERN_MISSING_REST, msg, pat, node_line(pat), col, end_col, "add `..`", [])
     if diag_entry_count() == before { return }
     let skip_action = if missing.len() == 1 { "name the left-out field" } else { "name the left-out fields" }
-    if labels.len() > 0 {
-        let last = labels.get(labels.len() - 1).unwrap()
-        if node_end_line(last) > 0 {
-            diag_set_last_fix_at("insert `..`", ", ..", node_end_line(last), node_end_col(last), node_end_line(last), node_end_col(last))
-            diag_set_last_assist_at(skip_action, ", {skips.join(", ")}", node_end_line(last), node_end_col(last))
+    match tc_brace_append_at(pat, labels) {
+        Some(at) => {
+            diag_set_last_fix_at("insert `..`", "{at.lead}..", at.line, at.col, at.line, at.col)
+            diag_set_last_assist_at(skip_action, "{at.lead}{skips.join(", ")}", at.line, at.col)
         }
-    } else if node_end_line(pat) > 0 && node_end_col(pat) > 1 {
-        diag_set_last_fix_at("insert `..`", "..", node_end_line(pat), node_end_col(pat) - 1, node_end_line(pat), node_end_col(pat) - 1)
-        diag_set_last_assist_at(skip_action, skips.join(", "), node_end_line(pat), node_end_col(pat) - 1)
+        None => {}
     }
 }
 
@@ -30338,11 +30354,13 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
 }
 
 // §3.5: only a binder under a label the type does not declare is poison. A binder under a
-// duplicate label still names a declared field, so it keeps that field's type.
-fn tc_unknown_label_names(faults: LitFaults) -> Map[Str, Int] {
-    let mut names: Map[Str, Int] = Map()
-    for u in faults.unknowns { names.insert(node_name(u.at), 1) }
-    names
+// duplicate label still names a declared field, so it keeps that field's type. The check is
+// by name: a repeated unknown label is listed once, and each of its binders is poison.
+fn tc_label_is_unknown(faults: LitFaults, name: Str) -> Bool {
+    for u in faults.unknowns {
+        if node_name(u.at) == name { return true }
+    }
+    false
 }
 
 // An unknown or duplicate label makes the arm cover nothing; leaving fields out does not.
@@ -30467,8 +30485,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
         }
         let flds_sl = node_fields(node)
         let is_struct_pat = node_int_val(node)
-        let labels = if !bad && is_struct_pat != 0 && var_idx >= 0 { tc_check_pattern_labels(tc_variant_literal_owner(var_idx), node) } else { LitFaults { dups: [], unknowns: [], missing: [] } }
-        let unknown = tc_unknown_label_names(labels)
+        let labels = tc_check_pattern_labels(if !bad && is_struct_pat != 0 && var_idx >= 0 { tc_variant_literal_owner(var_idx) } else { None }, node)
         if flds_sl != -1 {
             let mut i = 0
             while i < sublist_length(flds_sl) {
@@ -30478,7 +30495,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                     let fpat = node_pattern(f)
                     let fname = node_name(f)
                     let mut sub_t = -1
-                    if unknown.contains_key(fname) {
+                    if tc_label_is_unknown(labels, fname) {
                         sub_t = poison
                     } else if var_idx >= 0 {
                         sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_name(var_idx, fname), saved_binding)
@@ -30544,8 +30561,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
         } else if struct_tid >= 0 {
             owner = tc_struct_literal_owner(struct_tid)
         }
-        let labels = if bad { LitFaults { dups: [], unknowns: [], missing: [] } } else { tc_check_pattern_labels(owner, node) }
-        let unknown = tc_unknown_label_names(labels)
+        let labels = tc_check_pattern_labels(owner, node)
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
             let mut i = 0
@@ -30559,7 +30575,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                 // the same substitution the qualified variant spelling above already makes,
                 // and the one thing that keeps the two spellings of one pattern in agreement.
                 let mut sub_t = -1
-                if bad || unknown.contains_key(fname) {
+                if bad || tc_label_is_unknown(labels, fname) {
                     sub_t = poison
                 } else if var_idx >= 0 {
                     sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_name(var_idx, fname), saved_binding)

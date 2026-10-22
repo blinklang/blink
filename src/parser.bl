@@ -5983,12 +5983,12 @@ fn report_mut_after_with_as(name_tok: Int) ! Diag.Report {
         "remove `mut`", token_span_text(name_tok, name_tok))
 }
 
-// A `mut` before a pattern that binds no name is reported here (E0613), and the pattern
-// after it parses as written, so one stray `mut` does not hide the errors that follow it.
 // The fields of `T { ... }` and `T.V { ... }`, from the `{`. Each label spans its whole field,
 // and the pattern spans to its `}`, so a repair can insert after the last field or before the
-// brace.
-fn parse_brace_pattern(kind: NodeKind, name: Str, type_name: Str, int_val: Int, sp_line: Int, sp_col: Int) -> Int ! Diag.Report, Parse.Advance, Parse.Build {
+// brace. A labeled field starts at its label, past a stray `mut`, so a rename edits the label;
+// a pun starts at its `mut`, which a relabel keeps. A label that is not a name gets its parse
+// error and no field, so the type checker does not report it again as a field.
+fn parse_brace_pattern(kind: NodeKind, name: Str, type_name: Str, sp_line: Int, sp_col: Int) -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     advance()
     skip_newlines()
     let flds = new_sublist()
@@ -6004,22 +6004,25 @@ fn parse_brace_pattern(kind: NodeKind, name: Str, type_name: Str, int_val: Int, 
             }
             break
         }
-        let fld_line = peek_line()
-        let fld_col = peek_col()
+        let mut fld_line = peek_line()
+        let mut fld_col = peek_col()
         let fld_mut = parse_field_mut()
         let label = pos
+        let is_name = at(TokenKind.Ident)
         let fname = expect_value(TokenKind.Ident)
+        let mut fpat = -1
         if at(TokenKind.Colon) {
             advance()
             skip_newlines()
-            let fpat = parse_pattern()
-            if fld_mut == 1 { report_mut_on_field_label(fname, label, pos - 1, fpat) }
+            fpat = parse_pattern()
+            if fld_mut == 1 && is_name { report_mut_on_field_label(fname, label, pos - 1, fpat) }
+            fld_line = tokens.lines.get(label).unwrap()
+            fld_col = tokens.cols.get(label).unwrap()
+        }
+        if is_name {
+            let pun_mut = if fpat == -1 { fld_mut } else { 0 }
             let sf = node_count()
-            node_push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, line: fld_line, col: fld_col, end_line: tokens.lines.get(pos - 1).unwrap(), end_col: tokens.end_cols.get(pos - 1).unwrap() })
-            sublist_push(flds, sf)
-        } else {
-            let sf = node_count()
-            node_push(AstNode { kind: NodeKind.StructLitField, name: fname, is_mut: fld_mut, line: fld_line, col: fld_col, end_line: tokens.lines.get(pos - 1).unwrap(), end_col: tokens.end_cols.get(pos - 1).unwrap() })
+            node_push(AstNode { kind: NodeKind.StructLitField, name: fname, pattern: fpat, is_mut: pun_mut, line: fld_line, col: fld_col, end_line: tokens.lines.get(pos - 1).unwrap(), end_col: tokens.end_cols.get(pos - 1).unwrap() })
             sublist_push(flds, sf)
         }
         if at(TokenKind.Comma) {
@@ -6032,11 +6035,14 @@ fn parse_brace_pattern(kind: NodeKind, name: Str, type_name: Str, int_val: Int, 
     finalize_sublist(flds)
     let end_line = if closed { tokens.lines.get(pos - 1).unwrap() } else { 0 }
     let end_col = if closed { tokens.end_cols.get(pos - 1).unwrap() } else { 0 }
+    let int_val = if kind == NodeKind.EnumPattern { 1 } else { 0 }
     let nd = node_count()
     node_push(AstNode { kind: kind, name: name, type_name: type_name, fields: flds, int_val: int_val, inclusive: has_rest, line: sp_line, col: sp_col, end_line: end_line, end_col: end_col })
     nd
 }
 
+// A `mut` before a pattern that binds no name is reported here (E0613), and the pattern
+// after it parses as written, so one stray `mut` does not hide the errors that follow it.
 fn parse_single_pattern() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
     if !at(TokenKind.Mut) || at_binder_name_at(pos + 1) {
         return parse_single_pattern_body()
@@ -6208,7 +6214,7 @@ fn parse_single_pattern_body() -> Int ! Diag.Report, Parse.Advance, Parse.Build 
                 return nd
             }
             if at(TokenKind.LBrace) {
-                return parse_brace_pattern(NodeKind.EnumPattern, name, variant, 1, sp_line, sp_col)
+                return parse_brace_pattern(NodeKind.EnumPattern, name, variant, sp_line, sp_col)
             }
             let nd = node_count()
             node_push(AstNode { kind: NodeKind.EnumPattern, name: name, type_name: variant, line: sp_line, col: sp_col })
@@ -6234,7 +6240,7 @@ fn parse_single_pattern_body() -> Int ! Diag.Report, Parse.Advance, Parse.Build 
             return nd
         }
         if at(TokenKind.LBrace) {
-            return parse_brace_pattern(NodeKind.StructPattern, "", name, 0, sp_line, sp_col)
+            return parse_brace_pattern(NodeKind.StructPattern, "", name, sp_line, sp_col)
         }
         if at(TokenKind.As) {
             advance()
