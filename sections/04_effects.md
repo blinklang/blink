@@ -359,7 +359,7 @@ Rule 2 permits a second tier: a std function or method that has a row but is not
 | `process_exec(cmd, args)` | `process.exec(cmd, args)` | `Process.Spawn`, `Env.Exit` | yes: the result becomes `Result[Never, ProcessError]` |
 | `unix_socket_listen(p)`, `unix_socket_accept(l)` | `unix_listen(p)`, `listener.accept()` in `std.net` (§4.4.6) | `Net.Listen` | yes: `Int` becomes a `Result` |
 | `unix_socket_connect(p)` | `unix_connect(p)` in `std.net` (§4.4.6) | `Net.Connect` | yes: `Int` becomes `Result[UnixStream, NetError]` |
-| `socket_read_line(s)`, `socket_write(s, x)`, `unix_socket_close(s)` | `stream.read_line()`, `stream.write(x)`, `stream.close()` on `UnixStream` (§4.4.6) | §4.4.6 | yes: reads and writes return a `Result` |
+| `socket_read_line(s)`, `socket_write(s, x)`, `unix_socket_close(s)` | `stream.read_line()`, `stream.write(x)`, `stream.close()` on `UnixStream`; `conn.read_line()`, `conn.write(x)`, `conn.close()` on `UnixConn` (§4.4.6) | `Net.Connect` on `UnixStream`, `Net.Listen` on `UnixConn` | yes: reads and writes return a `Result` |
 | `io.write(s)` | `io.print_raw(s)` | `IO.Print` | no |
 | `io.write_bytes(b)` | `io.print_raw_bytes(b)` | `IO.Print` | no |
 | `db_connect(path)`, `sqlite_connect(path)` in `std.db_sqlite` | `with db.connect(path)? { }` (§4.7.2 *Scoped effect handlers*) | `DB` | yes: the result becomes `Result[Connection, DBError]` |
@@ -1107,15 +1107,15 @@ pub type SockAddr {
 **Sockets.**
 
 ```blink
-pub fn udp_bind(addr: SockAddr) -> Result[UdpSocket, NetError]            // ! Net.Listen
-pub fn resolve(host: Str, port: Int) -> Result[List[SockAddr], NetError]  // ! Net.DNS
+pub fn udp_bind(addr: SockAddr) -> Result[UdpSocket, NetError] ! Net.Listen
+pub fn resolve(host: Str, port: Int) -> Result[List[SockAddr], NetError] ! Net.DNS
 
 pub trait UdpSocketOps {
-    fn recv_from(self, *, max: Int = 65535) -> Result[(Bytes, SockAddr), NetError]
-    fn send_to(self, data: Bytes, dest: SockAddr) -> Result[(), NetError]   // ! Net.Connect
-    fn local_addr(self) -> Result[SockAddr, NetError]
-    fn set_timeout(self, ms: Int)
-    fn close(self)
+    fn recv_from(self, *, max: Int = 65535) -> Result[(Bytes, SockAddr), NetError] ! Net.Listen
+    fn send_to(self, data: Bytes, dest: SockAddr) -> Result[(), NetError] ! Net.Connect
+    fn local_addr(self) -> Result[SockAddr, NetError] ! Net.Listen
+    fn set_timeout(self, ms: Int) ! Net.Listen
+    fn close(self) ! Net.Listen
 }
 ```
 
@@ -1143,35 +1143,70 @@ fn echo_once() -> Result[(), NetError] ! Net.Listen, Net.Connect {
 `std.net` gives Unix-domain stream sockets the same second-tier shape as UDP: std functions and methods with rows, not `net` handle ops (§4.4 *Every side effect has a row*).
 
 ```blink
-pub fn unix_listen(path: Str) -> Result[UnixListener, NetError]    // ! Net.Listen
-pub fn unix_connect(path: Str) -> Result[UnixStream, NetError]     // ! Net.Connect
+pub fn unix_listen(path: Str) -> Result[UnixListener, NetError] ! Net.Listen
+pub fn unix_connect(path: Str) -> Result[UnixStream, NetError] ! Net.Connect
 
 pub trait UnixListenerOps {
-    fn accept(self) -> Result[UnixStream, NetError]                // ! Net.Listen
-    fn close(self)
+    fn accept(self) -> Result[UnixConn, NetError] ! Net.Listen
+    fn close(self) ! Net.Listen
+}
+
+pub trait UnixConnOps {
+    fn read_line(self) -> Result[Str?, NetError] ! Net.Listen
+    fn write(self, data: Str) -> Result[(), NetError] ! Net.Listen
+    fn close(self) ! Net.Listen
 }
 
 pub trait UnixStreamOps {
-    fn read_line(self) -> Result[Option[Str], NetError]
-    fn write(self, data: Str) -> Result[(), NetError]
-    fn close(self)
+    fn read_line(self) -> Result[Str?, NetError] ! Net.Connect
+    fn write(self, data: Str) -> Result[(), NetError] ! Net.Connect
+    fn close(self) ! Net.Connect
 }
 ```
 
 - `unix_listen` creates a socket node at `path` and listens on it. It needs `Net.Listen` only. A sandbox that denies `FS.Write` but grants `Net.Listen` therefore still lets code create a socket node in any directory that the process can write to.
 - `unix_listen` never removes a file. If `path` already exists, it returns `Err(NetError.Os(op: "bind", code: ...))` with the code `EADDRINUSE`. To replace a stale socket node, the caller deletes it first with `fs.delete(path)`, which needs `FS.Delete`.
-- `accept` blocks until a client connects, then returns the stream to that client.
+- `accept` blocks until a client connects, then returns the connection to that client. `accept` returns a `UnixConn`; `unix_connect` returns a `UnixStream`. The two types have the same methods and different rows (see below).
 - `read_line` returns the next line without its line terminator, or `None` at end of stream.
 - `write` sends all of `data` or returns an error.
 
-Rule 2 (§4.4) requires a row on every method of an open socket. The rows of `recv_from`, `local_addr`, `set_timeout` and `close` on `UdpSocket`, and of `read_line`, `write` and `close` here, are not yet given.
+**Rows of socket methods.** Rule 2 (§4.4) requires a row on every method of an open socket. The row of a method on an open socket follows this rule (panel deliberation [`open-socket-rows`](../decisions/open-socket-rows.md)):
+
+> A method on an open socket carries the row of the function or method that made the socket. A method that sends to a peer address that the caller gives as an argument carries `Net.Connect` in its place.
+>
+> Each socket type has exactly one maker row: when two std functions with different rows make sockets, they return different types.
+
+The first sentence gives `send_to` the row `Net.Connect` alone. It does not add `Net.Connect` to the row of the maker. A later method of a socket type gets its row from this rule.
+
+The second sentence is why `accept` and `unix_connect` return different types. A method has one row for every value of its type. If one type had two makers with different rows, only the union row `! Net.Listen, Net.Connect` would be sound, and it would make a client ask for `Net.Listen` and a server ask for `Net.Connect`. The sentence does not bar a later trait over both stream types. Such a trait takes the union row, and each impl narrows its row (§3.6 *Effect-row subtype for trait impls*, E0904).
+
+| Type | Made by | Method | Row |
+|---|---|---|---|
+| `UdpSocket` | `udp_bind` | `recv_from` | `Net.Listen` |
+| `UdpSocket` | `udp_bind` | `send_to` | `Net.Connect` (the peer address is an argument) |
+| `UdpSocket` | `udp_bind` | `local_addr`, `set_timeout`, `close` | `Net.Listen` |
+| `UnixListener` | `unix_listen` | `accept`, `close` | `Net.Listen` |
+| `UnixConn` | `UnixListener.accept` | `read_line`, `write`, `close` | `Net.Listen` |
+| `UnixStream` | `unix_connect` | `read_line`, `write`, `close` | `Net.Connect` |
+
+When a `UnixConn` is given where a `UnixStream` is expected, or the other way, the type-mismatch error names the other type and the function that makes it:
+
+```
+error[TypeError]: mismatched types
+ --> relay.bl:12:12
+   |
+12 |     handle(conn)
+   |            ^^^^ expected `UnixConn`, found `UnixStream`
+   |
+   = note: `UnixStream` is made by `unix_connect`; `UnixConn` is made by `UnixListener.accept`
+```
 
 ```blink
 import std.net.{NetError, unix_listen}
 
 fn serve_once(path: Str) -> Result[(), NetError] ! Net.Listen {
     let listener = unix_listen(path)?
-    let conn = listener.accept()?
+    let conn = listener.accept()?     // a UnixConn
     match conn.read_line()? {
         Some(line) => conn.write("echo: {line}\n")?
         None => ()
@@ -1179,6 +1214,20 @@ fn serve_once(path: Str) -> Result[(), NetError] ! Net.Listen {
     conn.close()
     listener.close()
     Ok(())
+}
+```
+
+A client uses `unix_connect`. It needs `Net.Connect` alone:
+
+```blink
+import std.net.{NetError, unix_connect}
+
+fn ask(path: Str, question: Str) -> Result[Str?, NetError] ! Net.Connect {
+    let conn = unix_connect(path)?    // a UnixStream
+    conn.write("{question}\n")?
+    let reply = conn.read_line()?
+    conn.close()
+    Ok(reply)
 }
 ```
 
