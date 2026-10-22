@@ -30204,10 +30204,10 @@ fn tc_bare_variant_fault(name: Str, h: Int) -> PatternFault {
 // Whether `h`, a type no variant owner claims, is settled and so can match no variant pattern.
 // A type already in error was reported where it went wrong, an enum with no owner is not one
 // this check can read, and an unknown parameter type (E0507) recovers as an open type variable.
+// Never has no values, so no variant either.
 fn tc_settled_without_variants(h: Int) -> Bool {
     match type_kind(h) {
         TyKind.Unknown => false
-        TyKind.Never => false
         TyKind.Enum => false
         TyKind.Typevar => tc_typevar_is_rigid(h) != 0
         _ => true
@@ -30316,8 +30316,10 @@ fn tc_other_enum_note(name: Str, owner: VariantOwner, subject: Str, site: Int) -
 }
 
 // error[NoSuchVariant] at the variant name, written `name` with payload form `form`. The help
-// never says "add the variant": a misspelling almost never means the enum lacks one.
-fn tc_report_no_such_variant(node: Int, owner: VariantOwner, name: Str, form: Int, col: Int, notes: List[Str]) ! Diag.Report {
+// never says "add the variant": a misspelling almost never means the enum lacks one. The
+// rename starts at `fix_from`, before the name when a `mut` there must go too, since a
+// variant binds nothing.
+fn tc_report_no_such_variant(node: Int, owner: VariantOwner, name: Str, form: Int, col: Int, fix_from: Int, notes: List[Str]) ! Diag.Report {
     // An enum its module declares twice (E1016) may have meant the other's variants.
     if tc_type_decl_poisoned(tc_owner_decl(owner)) { return }
     let shown = tc_owner_shown(owner)
@@ -30330,7 +30332,7 @@ fn tc_report_no_such_variant(node: Int, owner: VariantOwner, name: Str, form: In
     let before = diag_entry_count()
     diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` has no variant `{name}`", node, line, start, end, help, notes)
     if sugg != "" && col != -1 && diag_entry_count() > before && tc_owner_variant_form(owner, sugg) == form {
-        diag_set_last_fix_at("rename to", sugg, line, col, line, end)
+        diag_set_last_fix_at(if fix_from == col { "rename to" } else { "remove `mut` and rename to" }, sugg, line, fix_from, line, end)
     }
 }
 
@@ -30355,27 +30357,45 @@ fn tc_static_method_named(owner: Str, name: Str) -> Bool {
 }
 
 fn tc_report_no_such_variant_value(node: Int, owner: VariantOwner, qual: Str, name: Str, form: Int) ! Diag.Report {
-    tc_report_no_such_variant(node, owner, name, form, tc_qualified_name_col(node, qual, name), [])
+    let col = tc_qualified_name_col(node, qual, name)
+    tc_report_no_such_variant(node, owner, name, form, col, col, [])
 }
 
 // The repairs for an uppercase name with no payload at a position that is not an enum: a
 // lowercase name binds the value, and when a value of that name is in scope a guard compares
-// with it. A type parameter has no `==`, so no guard can compare there. At the top of an arm
-// the guard binds the matched value under its own name when the match names one; deeper, the
-// guard cannot replace the whole arm pattern, so the help says where each part goes.
-fn tc_bare_name_on_non_enum_help(name: Str, subject: Str, comparable: Bool) -> Str {
+// with it. The guard is shown only when it would compile: the value has the type at the
+// position, and that type has `==`. At the top of an arm the guard binds the matched value
+// under its own name when the match names one; deeper, the guard cannot replace the whole
+// arm pattern, so the help says where each part goes.
+fn tc_bare_name_on_non_enum_help(name: Str, subject: Str, hint: Int) -> Str {
     let bind = "to bind the value, write a lowercase name"
-    if !comparable { return bind }
+    if hint < 0 { return bind }
     // nr_is_defined would mark the value read and hide an unused-value warning on it, and
     // nr_has_binding answers for a name bound anywhere, not here.
     let idx = nr_top_index(name)
     if idx == -1 { return bind }
     // A declaration this file's import list does not select is not in scope here.
     if !nr_index_is_local(idx) && nr_unselected_source(name) != "" { return bind }
+    let vt = tc_named_value_tid(name, idx)
+    let h = resolve_alias_tid(tc_tid_resolved(hint))
+    if vt < 0 || resolve_alias_tid(tc_tid_resolved(vt)) != h || tc_eq_need(h, []).len() > 0 { return bind }
     if subject == "" { return "{bind}\nto compare with the value `{name}`, write a lowercase name here and add a guard: `if n == {name}`" }
-    // An uppercase binder would itself name a variant.
-    let v = if tc_name_is_upper(subject) { "n" } else { subject }
+    // An uppercase binder would itself name a variant, and `self` is no binder.
+    let v = if tc_name_is_upper(subject) || subject == "self" { "n" } else { subject }
     "{bind}\nto compare with the value `{name}`, write a guard: `{v} if {v} == {name} =>`"
+}
+
+// The type of the value the scope entry `idx` for `name` holds, or -1 when it is not known.
+// A module-level binding is filed with no type before inference reaches it; its declaration
+// carries the type.
+fn tc_named_value_tid(name: Str, idx: Int) -> Int {
+    let vt = nr_scope_types.get(idx).unwrap()
+    if tc_tid_is_no_info(vt) == 0 { return vt }
+    let here = tc_module_let_decl_node(nr_current_module, name)
+    let decl = if here != -1 { here } else { tc_module_let_decl_node(tc_symbol_module.get(name) ?? "", name) }
+    if decl == -1 { return -1 }
+    let t = tc_lookup_node_tid(decl)
+    if tc_tid_is_no_info(t) == 0 { t } else { -1 }
 }
 
 fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: Str) ! Diag.Report {
@@ -30396,11 +30416,12 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
         }
         PatternFault.NoSuchVariant(owner) => {
             let notes = if bare { tc_other_enum_note(name, owner, subject, pat) } else { [] }
-            tc_report_no_such_variant(pat, owner, name, tc_pattern_payload_form(pat), col, notes)
+            let mut_written = ident_end && node_is_mut(pat) != 0 && node_is_mut(pat) != BINDER_MUT_RECOVERED
+            tc_report_no_such_variant(pat, owner, name, tc_pattern_payload_form(pat), col, if mut_written { node_col(pat) } else { col }, notes)
         }
         PatternFault.NoVariants(shown, noun) => {
             let at = if col == -1 { node_col(pat) } else { col }
-            let help = if k == NodeKind.IdentPattern { tc_bare_name_on_non_enum_help(name, subject, noun != "a type parameter") } else { "" }
+            let help = if k == NodeKind.IdentPattern { tc_bare_name_on_non_enum_help(name, subject, hint) } else { "" }
             // `Point.Zed` names a variant of `Point` itself, so it reads as a lookup that found
             // none; only the type at the position makes a bare name's fault a type mismatch.
             let (dname, dcode) = if bare { ("EnumPatternNeedsEnumScrutinee", ENUM_PATTERN_NON_ENUM) } else { ("NoSuchVariant", NO_SUCH_VARIANT) }
@@ -30443,7 +30464,7 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
             let help = if enum_qual != "" {
                 "match the enum itself, or cross the boundary explicitly with {enum_qual}.from_int(...), which answers Option[{enum_qual}]"
             } else if k == NodeKind.IdentPattern {
-                tc_bare_name_on_non_enum_help(name, subject, true)
+                tc_bare_name_on_non_enum_help(name, subject, hint)
             } else {
                 "a scalar has no variants: match it with literals, ranges or a binding"
             }
@@ -30802,7 +30823,9 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
         } else {
             nr_define_mut(node_name(node), node_is_mut(node))
         }
-        return tc_check_pattern_types(node_pattern(node), subject, poisoned, refutable)
+        // The inner pattern is not the whole arm: a guard written for the subject would drop
+        // the `as` binder.
+        return tc_check_pattern_types(node_pattern(node), "", poisoned, refutable)
     }
     false
 }
