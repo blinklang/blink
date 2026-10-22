@@ -320,7 +320,7 @@ test "addition works" {
 | Template[C] | `"SELECT * FROM t WHERE id = {id}"` | Parameterized template string (context `C` = `DB`, etc.). Interpolated values auto-extracted as parameters. `Raw(expr)` escapes parameterization. |
 | I8 / I16 / I32 | — | Sized signed integers (8/16/32-bit). C-style wrapping casts. FFI use. |
 | U8 / U16 / U32 / U64 | — | Sized unsigned integers. C-style wrapping casts. FFI use. |
-| Errno | `Errno(rc)` | Transparent zero-cost newtype over `Int` (`pub type Errno { Errno(Int) }`, `import std.errno`). The error arm of the libc `*_bytes` wrappers. Extract the code by matching `Errno(rc)`; no methods in v1. See **Transparent newtypes** below. |
+| Errno | `Errno { code: rc }` | Newtype over `Int`: a one-field struct (`pub type Errno { code: Int }`, `import std.errno`). The error arm of the libc `*_bytes` wrappers. Read the code with `e.code`. See **Newtypes** below. |
 
 **One spelling per type.** Write `List[T]` for a list type and `T?` for an option type. `[T]` in a type is error `ListTypeBrackets` (E1131). `Option[T]` in a type is error `OptionTypeLongForm` (E1132). Both have a machine-applicable fix.
 
@@ -328,7 +328,7 @@ test "addition works" {
 
 **Enums are nominally distinct from `Int`.** An enum value is not interchangeable with `Int` at `let` / argument / return positions — passing one where the other is expected is a type error. Convert explicitly with `.to_int()` / `Type.from_int(n)`. (`==` between an enum and its int still works.)
 
-**Transparent newtypes.** A single-variant enum wrapping exactly one `Int` payload (`pub type Errno { Errno(Int) }`) is lowered to a bare `int64_t` in carriers and at FFI boundaries — no box, no tag. It stays nominally distinct in the type system (so `Result[Int, Errno]` can't confuse the count with the errno) while costing nothing at runtime.
+**Newtypes.** A newtype is a struct with exactly one field (`pub type Errno { code: Int }`). It is a new type, distinct from its field type, so `Result[Int, Errno]` cannot confuse the count with the errno. Build it with `Errno { code: 5 }`, read it with `e.code`. There is no implicit conversion in either direction. `type X = Int` is an alias, not a newtype. Blink has no tuple structs and no `newtype` keyword. Name the field for what it holds; use `value` when nothing better fits. JSON follows struct rules (`{"code":2}`). A variant with the name of its own enum (`type Token { Token(Str), End }`) is error E0518.
 
 ### Type Inference and Checking Rules
 
@@ -498,7 +498,7 @@ fs.write(path, content)         // -> Result[(), FsError]
 fs.delete(path)                 // -> Result[(), FsError] (delete file, backed by unlink(2))
 fs.list_dir(dir)                // -> Result[List[Str], FsError] (filenames)
 fs.stat(path)                   // -> Result[FileInfo, FsError] (follows symlinks; FileInfo { kind: FileKind (File|Dir|Other), size: Int, mtime: Instant }; effect: FS.Read)
-// FsError { op: FsOp, path: Str, code: Errno } — the error the fs.* surface returns.
+// FsError { op: FsOp, path: Str, errno: Errno } — the error the fs.* surface returns.
 "{err}"                         // Display renders `op path: message`, e.g. `read /etc/app.toml: No such file or directory`
 err.not_found()                 // -> Bool: true only when the failure was ENOENT (file not there)
 
@@ -1320,9 +1320,9 @@ show(42)          // "42"
 | `std.float` | Float helpers: `fabs(x)` and `is_nan(x)` are `@pure`; `close_to(x, y, tol)` carries an `@ensures` clause. Methods: `x.fabs()`, `x.is_nan()`, `x.close_to(y, t)`. Float's `==` and `<` are a total order (NaN == NaN, NaN sorts above every other value, -0.0 == 0.0); the built-in `x.ieee_eq(y)` is the IEEE 754 escape, where NaN is unequal to everything | `import std.float` |
 | `std.http` | HTTP client and server | `import std.http` |
 | `std.io` | Derived I/O combinators. `read_fully(fd: Int, n: Int) -> Result[Bytes, Errno] ! IO` loops `libc.read_bytes` until exactly `n` bytes are read or EOF (a short read keeps looping; fewer than `n` is returned only at EOF, still `Ok`) | `import std.io` |
-| `std.errno` | `Errno` — transparent zero-cost newtype over `Int` (`pub type Errno { Errno(Int) }`), the error arm of the `*_bytes` syscall wrappers. Match `Errno(rc)` to read the code | `import std.errno` |
+| `std.errno` | `Errno` — newtype over `Int` (`pub type Errno { code: Int }`), the error arm of the `*_bytes` syscall wrappers. Read the code with `e.code` | `import std.errno` |
 | `std.json` | JSON parser and serializer | `import std.json` |
-| `std.libc` | Curated libc syscall wrappers. `Pollfd`, `POLL_EVT_IN/PRI/OUT/ERR/HUP/NVAL`, `poll(fds, timeout_ms) -> Result[List[Pollfd], Str] ! IO` (semantics match `poll(2)`). Binary syscall wrappers returning `Result[…, Errno] ! IO`: `read_bytes(fd, max)` / `recv_bytes(fd, max)` / `getentropy_bytes(n)` → `Result[Bytes, Errno]`, `write_bytes(fd, data)` / `send_bytes(fd, data)` → `Result[Int, Errno]` (count written). A short read/write is `Ok` with a shorter `Bytes` / smaller count; only a `-1` syscall return is `Err(Errno(code))` | `import std.libc` |
+| `std.libc` | Curated libc syscall wrappers. `Pollfd`, `POLL_EVT_IN/PRI/OUT/ERR/HUP/NVAL`, `poll(fds, timeout_ms) -> Result[List[Pollfd], Str] ! IO` (semantics match `poll(2)`). Binary syscall wrappers returning `Result[…, Errno] ! IO`: `read_bytes(fd, max)` / `recv_bytes(fd, max)` / `getentropy_bytes(n)` → `Result[Bytes, Errno]`, `write_bytes(fd, data)` / `send_bytes(fd, data)` → `Result[Int, Errno]` (count written). A short read/write is `Ok` with a shorter `Bytes` / smaller count; only a `-1` syscall return is `Err(Errno { code: rc })` | `import std.libc` |
 | `std.net` | TCP networking: `TcpSocket`, `TcpListener`, `NetError` (`Timeout`, `ConnectionRefused`, `DnsFailure`, `TlsError`, `InvalidUrl`, `BindError`, `ProtocolError`, `IoError`), `tcp_listen`, `tcp_connect`, `tcp_accept`, `tcp_read`, `tcp_write`, `tcp_read_bytes`, `tcp_write_bytes` | `import std.net` |
 | `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)`, `path_parent(path)` (POSIX `dirname(1)` semantics — strips trailing slashes before walking up) | `import std.path` |
 | `std.process` | Process spawning: `spawn(cmd, args) -> Pid`, `Pid.wait()`, `Pid.kill()`, `Pid.send_signal(sig)`. POSIX signal constants: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM` | `import std.process` |

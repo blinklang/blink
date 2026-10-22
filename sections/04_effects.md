@@ -1017,7 +1017,7 @@ fn load(path: Str) -> Result[Config, FsError] ! FS.Read {
 }
 ```
 
-**The error type: `FsError`.** A filesystem failure carries three fields — the operation that failed, the path it failed on, and the underlying OS error code:
+**The error type: `FsError`.** A filesystem failure carries three fields — the operation that failed, the path it failed on, and the underlying OS error:
 
 ```blink
 pub type FsOp {
@@ -1031,11 +1031,11 @@ pub type FsOp {
 pub type FsError {
     op: FsOp
     path: Str
-    code: Errno
+    errno: Errno
 }
 ```
 
-`code` is the `Errno` newtype from `std.errno` — the same `Errno` value that `libc.*` and `io.*` return. `fs` wraps it with the operation and the path so the message can name *what* was being done and *to what*. `Errno` on its own says `ENOENT`; `FsError` says that reading `/etc/app.toml` gave `ENOENT`.
+`errno` is the `Errno` newtype from `std.errno` (§3.4 *Newtypes*) — the same `Errno` value that `libc.*` and `io.*` return. Read the number with `err.errno.code`. `fs` wraps it with the operation and the path so the message can name *what* was being done and *to what*. `Errno` on its own says `ENOENT`; `FsError` says that reading `/etc/app.toml` gave `ENOENT`.
 
 `FsError` implements `Display`. The rendered form follows the convention `op path: message`:
 

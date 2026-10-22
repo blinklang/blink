@@ -710,7 +710,7 @@ pub fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO {
     // the closure inherits the region of the @trusted body
     let rc = data.with_ptr(fn(p) -> I64 { c_write(fd.to_i32(), p, data.len().to_u64()) })
     if rc < 0 {
-        return Err(Errno(c_errno()))
+        return Err(Errno { code: c_errno() })
     }
     Ok(rc)
 }
@@ -1565,7 +1565,7 @@ Each member ships at v1; the set **blocks the v1 release**.
 
 **`recv_bytes` / `send_bytes` take `flags` as a trailing keyword argument** of type `MsgFlags` (§9.1.3.4), with the default `MsgFlags.NONE`. A call that omits `flags` behaves as `flags = 0`, so the examples above do not change. The keyword is part of the v1 signature: labels are call-site sugar, so adding the parameter after v1 would change the function-value type. No separate flagged name (such as `recv_flags_bytes`) exists or will be added.
 
-**Error type.** Every member returns `Result[_, Errno]`, where `Errno` is a newtype over the OS errno `Int`: a single-variant enum, `type Errno { Errno(Int) }`, nominally distinct from `Int` (§3). It carries a name/projection (`.code() -> Int`, named errno constants) so callers match on errno meaningfully rather than on a bare `Int`, and so a `write`'s two return arms (count-written vs errno) are nominally distinct. A rich variant `IoError` hierarchy is **not** part of this gate — it is a separate post-v1 task, layered additively on `Errno` (e.g. `.kind()`) without changing any wrapper signature. `Errno` is domain-neutral; a file read's `ENOSPC` is *not* typed as a network error.
+**Error type.** Every member returns `Result[_, Errno]`, where `Errno` is a newtype over the OS errno `Int`: a one-field struct, `type Errno { code: Int }`, nominally distinct from `Int` (§3.4 *Newtypes*). The field `e.code` reads the number, and named errno constants exist, so callers match on errno meaningfully rather than on a bare `Int`, and so a `write`'s two return arms (count-written vs errno) are nominally distinct. A rich variant `IoError` hierarchy is **not** part of this gate — it is a separate post-v1 task, layered additively on `Errno` (e.g. `.kind()`) without changing any wrapper signature. `Errno` is domain-neutral; a file read's `ENOSPC` is *not* typed as a network error.
 
 **Naming law (normative).** Every `libc` byte-moving syscall wrapper conforms to a fixed shape, so the family is name-predictable and post-v1 additions are mechanical rather than designed:
 
@@ -1649,7 +1649,7 @@ Both follow the naming law of §9.1.3.3: the peer address is a non-buffer out-pa
 
 - The only values are the named constants. This gate ratifies two: `MsgFlags.NONE` (no flags) and `MsgFlags.PEEK` (read a datagram without removing it from the queue). Each is a type-scoped constant (`pub const MsgFlags.NONE = ...`, §2.12.3), so it is a const expression (§2.21) and legal as a keyword default.
 - The bits inside `MsgFlags` use **Blink's** numbering, not the platform's. A named constant has the same meaning on every platform.
-- The wrapper checks the bits before the syscall. A bit that is not a ratified constant returns `Err(Errno(ERR_INVAL))` on every platform, and the syscall does not run. A native value never reaches the kernel as a native flag.
+- The wrapper checks the bits before the syscall. A bit that is not a ratified constant returns `Err(Errno { code: ERR_INVAL })` on every platform, and the syscall does not run. A native value never reaches the kernel as a native flag.
 - `MsgFlags` has no `|` operator yet. The bit-or implementation ships with the second ratified constant that can combine with `PEEK`. A `|` expression is a trait call, so it is not a const expression (§2.21). A combined default is declared as its own constant.
 - New constants (for example `DONTWAIT`, `WAITALL`) are added under the growth gate of §9.1.3.3. Each addition is one constant, and it does not change the meaning of any existing call.
 - User code cannot write `MsgFlags(n)` or `MsgFlags { bits: n }`; either is a compile error (E1003, §2.12.2).

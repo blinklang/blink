@@ -2130,6 +2130,63 @@ let user = User { name: "Alice", email: "alice@example.com", age: 30 }
 let name = user.name
 ```
 
+#### Newtypes
+
+A **newtype** is a struct with exactly one field. It is a new type, distinct from the type of its field:
+
+```blink
+type Errno { code: Int }
+
+fn open_failed(rc: Int) -> Result[Int, Errno] {
+    Err(Errno { code: rc })
+}
+
+fn describe(r: Result[Int, Errno]) -> Str {
+    match r {
+        Ok(n) => "opened {n}"
+        Err(Errno { code }) => "failed with errno {code}"
+    }
+}
+
+fn main() {
+    let e = Errno { code: 5 }
+    let n: Int = e.code           // read the field
+    let bad: Int = e              // error[TypeError]: declared type Int but got Errno
+}
+```
+
+A newtype follows the rules of every other struct. Build it with a struct literal (`Errno { code: 5 }`), read it with `e.code`, and take it apart with a struct pattern. `@derive`, JSON and generics work as for any struct. The JSON form of `Errno { code: 2 }` is `{"code":2}`.
+
+There is no implicit conversion between a newtype and its field type, in either direction. A newtype has no operators of its field type. To use the inner value, read the field.
+
+Name the field for what it holds. Use `value` when nothing better fits.
+
+A type alias is not a newtype. `type Errno = Int` gives a second name to `Int`: both names are the same type.
+
+Blink has no tuple structs and no `newtype` keyword. A single-variant enum is an ordinary enum, not a newtype. To wrap a foreign type so that you can write an impl for it, see *Orphan Rule* (§3.6). For why `(T)` is not a 1-tuple, see *No 1-Tuples* (§3.8).
+
+A form from another language gets an error that names the Blink form. No help line offers an enum form:
+
+```blink
+let a = Errno(5)
+// error[UndefinedFunction]: `Errno` has no constructor call
+//   help: build a value with a struct literal: `Errno { code: 5 }`
+
+let b = e == 2
+// error[TypeError]: expected Errno, got Int
+//   help: read the field: `e.code == 2`
+
+let c = e.0
+// error[NoSuchField]: `Errno` has no field `0`
+//   help: the field is `code`: `e.code`
+
+type Errno(Int)
+// error[ParseError]: Blink has no tuple structs
+//   help: write `type Errno { code: Int }`
+```
+
+When the type has more than one field, the help for the first error writes every field with a placeholder.
+
 #### Sum Types (Enums)
 
 A type with variants is a sum type. Variants can carry data or be unit-like:
@@ -2188,7 +2245,7 @@ A `help:` line in a diagnostic writes the qualified form, because that form is t
    - the enums of the site's module;
    - the `pub` enums of the other modules of the site's package;
    - the prelude enums;
-   - each enum of another package that the module binds by an import entry that names the type (`import std.errno.{Errno}`). A whole-module import (`import std.errno`) adds none of its enums.
+   - each enum of another package that the module binds by an import entry that names the type (`import palette.{Shade}`). A whole-module import (`import palette`) adds none of its enums.
 
    A non-`pub` enum of another module is never a candidate.
 
@@ -2196,15 +2253,15 @@ Inside the package, an import never adds or removes a candidate. For an enum of 
 
 ```blink
 // package app; std.time declares `pub type Weekday { Monday, Tuesday, ... }`
-// and std.errno declares `pub type Errno { Errno(Int) }`
-import std.errno.{Errno}
+// and package palette declares `pub type Shade { Dark, Light }`
+import palette.{Shade}
 import std.time
 
 type Day { Monday, Funday }
 
 fn main() {
     let d = Monday                    // Day.Monday: std's Weekday is not a candidate
-    let e = Errno(5)                  // Errno.Errno: the import entry names the type
+    let c = Dark                      // Shade.Dark: the import entry names the type
     let w: time.Weekday = Tuesday     // the hint reaches any enum that the site names
 }
 ```
@@ -2275,7 +2332,18 @@ fn main() {
 
 **Name collisions** fall into two distinct kinds:
 
-- **A struct name equal to an enum variant name** is a **compile error at declaration time** (`error[NameCollision]`, E0518). The reach is the package, not the module: a struct in one module and a variant of that name in another module of the package collide. The variants of a prelude enum count as declared in every module. A variant of a dependency enum never gives E0518. An import entry that binds a struct named like a variant of the package or of the prelude is also E0518, at the import entry. The fix is an alias: `import geo.{Point as GeoPoint}`. Within one package, a name is either a product type or a sum injection — never both. This rule is narrowly scoped to the struct-vs-variant case only; it does not require all constructible names to be globally unique.
+- **A type name equal to an enum variant name** is a **compile error at declaration time** (`error[NameCollision]`, E0518) in two cases: a struct has the name of a variant, or a variant has the name of its own enum. For a struct, the reach is the package, not the module: a struct in one module and a variant of that name in another module of the package collide. The variants of a prelude enum count as declared in every module. A variant of a dependency enum never gives E0518. An import entry that binds a struct named like a variant of the package or of the prelude is also E0518, at the import entry. The fix is an alias: `import geo.{Point as GeoPoint}`. A variant with the name of its own enum, such as `type Token { Token(Str), End }` or `type Errno { Errno(Int) }`, is E0518 at the variant, once, and not at each use. The type name `Token` would then be both a type and a variant of that type:
+
+  ```
+  error[NameCollision]: variant `Token` has the name of its enum `Token`
+    help: rename the variant: `type Token { Word(Str), End }`
+
+  error[NameCollision]: variant `Errno` has the name of its enum `Errno`
+    help: rename the variant: `type Errno { Code(Int) }`
+    help: to wrap one value, use a one-field struct (*Newtypes*, above): `type Errno { code: Int }`
+  ```
+
+  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique.
 
 - **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Such a name is resolved by the hint:
 
@@ -2363,7 +2431,7 @@ fn main() {
 }
 ```
 
-This is what makes a single-payload enum a real newtype: `type Errno { Errno(Int) }` used as the error arm of `Result[Int, Errno]` cannot be confused with a plain `Int` count, which is the entire reason to prefer it over `Result[Int, Int]`.
+The same holds for every nominal type, including a newtype (*Newtypes*, above): `type Errno { code: Int }` used as the error arm of `Result[Int, Errno]` cannot be confused with a plain `Int` count, which is the entire reason to prefer it over `Result[Int, Int]`.
 
 **Tag Operations.** Three operations use an enum's integer tag: comparison with an `Int`, `Enum.to_int()` and `Enum.from_int()`. They are defined only on a **fieldless enum**, an enum whose variants all have no payload. The first variant in the declaration has the tag 0, and each next variant has the tag one greater.
 
@@ -2379,18 +2447,19 @@ let n = s.to_int()          // OK: State is fieldless
 **Payload enums have no tag operations.** An enum with at least one payload variant has no comparison with `Int`, no `to_int()` and no `from_int()`. Each use is a compile error, `error[TypeError]`. A tag does not identify a payload value, and `from_int` cannot make one. To compare the payload, match on it:
 
 ```blink
-type Code { Code(Int) }
+type Reply { Code(Int), Silent }
 
-let c = Code(5)
-let a = c == 5         // error[TypeError]: Code has a payload variant and does not compare with Int
-                       //   help: match on the payload: match c { Code(n) => n == 5 }
-let b = c.to_int()     // error[TypeError]: to_int() is defined only on fieldless enums
-let ok = match c {
-    Code(n) => n == 5
+let r = Reply.Code(5)
+let a = r == 5         // error[TypeError]: Reply has a payload variant and does not compare with Int
+                       //   help: match on the payload: match r { Reply.Code(n) => n == 5, _ => false }
+let b = r.to_int()     // error[TypeError]: to_int() is defined only on fieldless enums
+let ok = match r {
+    Reply.Code(n) => n == 5
+    Reply.Silent => false
 }
 ```
 
-This rule applies to every enum with a payload, including the stdlib `Errno` (§9.1.3.3).
+This rule applies to every enum with a payload. A newtype is a struct and is not an enum, so this rule does not touch it; the stdlib `Errno` (§9.1.3.3) is a newtype.
 
 > Pattern matching an `Int` scrutinee against enum-variant patterns (`match someInt { State.Idle => ... }`) is the pattern-side dual of the assignability rule and is likewise ill-typed.
 
@@ -4868,7 +4937,7 @@ error[OrphanImpl]: orphan impl
   = help: define a newtype wrapper, or add this impl to the `http` package
 ```
 
-The workaround for the orphan restriction is the **newtype pattern** -- wrap the foreign type in a local struct:
+The workaround for the orphan restriction is the **newtype pattern** (§3.4 *Newtypes*) -- wrap the foreign type in a local struct:
 
 ```blink
 type MyResponse {
@@ -6468,14 +6537,14 @@ fn log(msg: Str) ! IO {
 
 #### No 1-Tuples
 
-`(T)` in type or expression position is always parenthesization, never a 1-tuple. The 1-ary product is isomorphic to `T` and adds no expressiveness. For newtype wrapping, use a named struct:
+`(T)` in type or expression position is always parenthesization, never a 1-tuple. The 1-ary product is isomorphic to `T` and adds no expressiveness. For newtype wrapping, use a one-field struct (§3.4 *Newtypes*):
 
 ```blink
 // Not a 1-tuple — just parenthesized
 let x: (Int) = 42        // same as: let x: Int = 42
 let y = (some_expr)       // same as: let y = some_expr
 
-// For newtype wrapping, use a struct
+// For newtype wrapping, use a one-field struct
 type UserId {
     value: Int
 }
