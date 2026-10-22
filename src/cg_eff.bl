@@ -56,27 +56,26 @@ import diagnostics.{
 
 // ── With-resource cleanup ─────────────────────────────────────────────────────────
 
-// Which of the four protocols a `with <expr> as <name>` resource takes on the way out.
-pub type CleanupProtocol { Plain, Closeable, BlockHandler, FfiScope }
+// Which protocol a `with <expr> as <name>` resource takes on the way out. A Closeable type
+// is a BlockHandler through the impl the parser writes for it (sections/04_effects.md
+// §4.7.2), so it has no protocol of its own.
+pub type CleanupProtocol { Plain, BlockHandler, FfiScope }
 
 pub type ResourceCleanup {
     protocol: CleanupProtocol
     // The impl block carrying the protocol's methods, -1 when no trait answers.
     impl_block: Int
-    // The C function the guard local runs on the way out, already spelled by cname, or ""
-    // when nothing runs. A caller cannot re-derive it: FfiScope's is the runtime's and
-    // Closeable's is an impl method's, and the two are spelled by different producers.
+    // The C function the guard local runs on the way out, or "" when nothing runs. Only
+    // FfiScope names one: the runtime's.
     exit_symbol: Str
     // Whether that function takes the block's success flag as a second argument.
     passes_ok: Bool
 }
 
-// The traits that claim a resource. Held as names because an impl block's trait is a
-// name, and written once each so no comparison against a literal type name is needed.
+// The trait that claims a scoped value. Held as a name because an impl block's trait is a
+// name, and written once so no comparison against a literal type name is needed.
 let TRAIT_BLOCK_HANDLER = "BlockHandler"
-let TRAIT_CLOSEABLE = "Closeable"
-// The one method Closeable declares, and the runtime's own scope exit.
-let CLOSEABLE_EXIT_METHOD = "close"
+// The runtime's own scope exit.
 let FFI_SCOPE_EXIT = "blink_ffi_scope_cleanup"
 // async.scope's own exit runner: awaits every handle the scope's body still has running.
 let ASYNC_SCOPE_EXIT = "blink_async_scope_drain"
@@ -90,7 +89,7 @@ fn plain_binding() -> ResourceCleanup {
 // The FFI scope's exit runner, registered once per translation unit before any function
 // that might use it prints. Its symbol is fixed by the runtime; its resource's spelling
 // comes from layout_of the same way every other stage reads a tid's C type, rather than a
-// literal repeated here. Unlike Closeable's, both are fixed for every FfiScope alike, so
+// literal repeated here. Both are fixed for every FfiScope alike, so
 // one unconditional call covers every unit: an unused runner costs nothing, and printing
 // it only where a WithScope of this exit symbol turns up would need a scan this driver
 // does not otherwise make.
@@ -175,7 +174,7 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
     if kind == TyKind.Unknown || kind == TyKind.Typevar {
         diag_ice_at("UnknownResourceKind", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "resource type {tid} reached codegen unsubstituted, as {tk_name(kind)}", node,
-            "an unsubstituted type cannot be asked which cleanup protocol it takes; a plain binding here would leave a Closeable resource unclosed")
+            "an unsubstituted type cannot be asked which cleanup protocol it takes; a plain binding here would leave a scoped value never exited")
         return plain_binding()
     }
     if kind == TyKind.FfiScope {
@@ -190,8 +189,9 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
             "a nominal type reaching codegen must carry one declaration node; a bare name two modules both declare carries none")
         return plain_binding()
     }
-    // A block handler calls enter before its body, which no resource does, so the with
-    // stage routes it away before asking this. Reaching here means that routing missed it.
+    // A block handler, Closeable types included, calls enter before its body, which no
+    // resource does, so the with stage routes it away before asking this. Reaching here
+    // means that routing missed it.
     let bh = impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, node)
     if bh >= 0 {
         diag_ice_at("BlockHandlerOnResourcePath", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -200,29 +200,7 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
         return ResourceCleanup { protocol: CleanupProtocol.BlockHandler, impl_block: bh,
             exit_symbol: "", passes_ok: false }
     }
-    let cl = impl_of_trait_for_decl(TRAIT_CLOSEABLE, decl, node)
-    if cl >= 0 { return closeable_binding(cl, tid, node) }
     plain_binding()
-}
-
-// Closeable's exit runner is the close method the user wrote. `fn close(self)` is an
-// ordinary impl method, so the declaration stage already emits a C function taking the
-// resource by value, which is exactly the shape the guard hands its stored resource to.
-// Nothing is synthesised here: the symbol is spelled through the same producer that
-// spells the definition, and a literal repeated here would link against nothing the day
-// the definition moved.
-fn closeable_binding(im: Int, tid: Int, node: Int) -> ResourceCleanup ! Diag.Report {
-    let rec = layout_of(tid, Position.Local)
-    if rec.decline_reason != "" {
-        diag_ice_at("UnspellableResourceType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "a {TRAIT_CLOSEABLE} resource has no C spelling for its guard to store", node,
-            "the spelling the resource has at the with-item must spell again where the guard declares it")
-        return plain_binding()
-    }
-    let exit_symbol = c_impl_method_name(im, CLOSEABLE_EXIT_METHOD)
-    print_resource_guard_support(exit_symbol, rec.c_spelling, false)
-    ResourceCleanup { protocol: CleanupProtocol.Closeable, impl_block: im,
-        exit_symbol: exit_symbol, passes_ok: false }
 }
 
 // ── Block handlers ────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ import unparse.{type_ann_text, unparse_expr}
 import formatter.{effect_op_sig_text}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
-    ann_str_val, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
+    ann_str_val, impl_provided_by_closeable, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
     node_count, node_handlers, node_index, node_int_val, node_is_compiler_known_type_ann, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
@@ -48,7 +48,7 @@ import diagnostics.{
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, WITH_ITEM_NOT_A_HANDLER,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
-    TRAIT_CONTRACT_906, TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
+    TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
     CALL_SITE_TYPE_ARGS, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM, NO_INDEX_OPERATOR,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
@@ -8736,7 +8736,7 @@ fn tc_desugaring_forms(tr: Str) -> List[Str] {
         "From" => ["the `.into()` that `From` derives"]
         "Into" => ["`.into()`"]
         "IntoIterator" => ["a `for` loop"]
-        "Closeable" => ["`with ... as`"]
+        "Closeable" => ["`with`"]
         "List" => ["`[T]`", "a list literal"]
         "Option" => ["`T?`", "`??`", "`?`"]
         "Ordering" => ["`<`", "`>`", "`<=`", "`>=`"]
@@ -13754,18 +13754,6 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         if is_poly != 0 && poly_supported == 0 {
             diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "spec §3.6 defines `impl[T] {tc_trait_shown(trait_name)}[T] for Recv[T]`, but compiled support is still in progress; write a separate impl per concrete type for now")
         }
-        let conflict_trait = if trait_name == "BlockHandler" { "Closeable" } else if trait_name == "Closeable" { "BlockHandler" } else { "" }
-        if conflict_trait != "" {
-            let mut ci = 0
-            while ci < sublist_length(impls_sl) {
-                let other = sublist_get(impls_sl, ci)
-                if tc_impl_trait_id(other) == conflict_trait && node_name(other) == impl_type {
-                    diag_error_at("TraitContract", TRAIT_CONTRACT_906, "type `{impl_type}` cannot implement both Closeable and BlockHandler (ambiguous with-block semantics)", im, "remove one of the impl blocks")
-                    break
-                }
-                ci = ci + 1
-            }
-        }
         ii = ii + 1
     }
     tc_check_impl_overlap(impls_sl)
@@ -13939,7 +13927,12 @@ fn tc_check_impl_overlap(impls_sl: Int) ! TypeCheck.Resolve, Diag.Report {
                 if tc_impl_trait_key(earlier) == key {
                     if tc_impls_overlap(earlier, later) != 0 {
                         let what = tc_impl_target_name(later)
-                        diag_error_at("OverlappingImpls", OVERLAPPING_IMPLS, "impl of `{node_trait_name(later)}` for `{what}` overlaps an earlier impl; Blink does not support specialization", later, "keep one impl, or wrap one receiver in a newtype so the two impls answer for types that share no instance")
+                        let help = if impl_provided_by_closeable(earlier) || impl_provided_by_closeable(later) {
+                            "`Closeable` already provides `BlockHandler` for `{what}`; remove one of the two impls"
+                        } else {
+                            "keep one impl, or wrap one receiver in a newtype so the two impls answer for types that share no instance"
+                        }
+                        diag_error_at("OverlappingImpls", OVERLAPPING_IMPLS, "impl of `{node_trait_name(later)}` for `{what}` overlaps an earlier impl; Blink does not support specialization", later, help)
                         break
                     }
                 }
@@ -16617,6 +16610,10 @@ fn nr_or_alt_close(or_start: Int, saved_warn: Int) -> List[Int] {
     }
     kept
 }
+
+// A scope entry no source name can spell, pushed for the body of a `with` that has an item
+// without `as`. While it is in scope, an undefined name gets a help line to bind one.
+let NR_ITEM_WITHOUT_AS = " with item without as"
 
 fn nr_push_scope() {
     nr_scope_frames.push(nr_scope_names.len())
@@ -19618,7 +19615,9 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             if tc_impl_trait_id(im) == "Display" {
                 nr_register_impl_method(impl_type, "display", -1)
             }
-            if tc_impl_trait_id(im) == "BlockHandler" {
+            // A Closeable's Context is the receiver itself, so its binder is the item's own
+            // type, instance arguments and all.
+            if tc_impl_trait_id(im) == "BlockHandler" && !impl_provided_by_closeable(im) {
                 let ctx_sl = node_assoc_types(im)
                 if ctx_sl != -1 {
                     let mut ai = 0
@@ -20521,7 +20520,15 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         if nr_qualifier_module_here(name) != "" { return }
         tc_errors.push("undefined variable `{name}`")
-        let help = if is_import_module_name(name) != 0 { nr_missing_import_help(name) } else { tc_undefined_name_help(name) }
+        let help = if is_import_module_name(name) != 0 {
+            nr_missing_import_help(name)
+        } else if tc_undefined_name_help(name) == "" && nr_name_top.contains_key(NR_ITEM_WITHOUT_AS) {
+            // A scoped value entered without `as` has its Context discarded, so a name the
+            // body expected from it is not there (sections/04_effects.md §4.7).
+            "bind it: with ... as {name}"
+        } else {
+            tc_undefined_name_help(name)
+        }
         diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{name}`", node, help)
         return
     }
@@ -20979,6 +20986,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // guard in tc_check_body's WithBlock branch.
                 } else {
                     nr_check_node(wh_item)
+                    if wh_kind != NodeKind.HandlerExpr { nr_scope_push_entry(NR_ITEM_WITHOUT_AS, 0, TYPE_UNKNOWN, -1) }
                 }
                 wi = wi + 1
             }
@@ -27794,8 +27802,14 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
     tc_current_fn_name = fn_name
     tc_current_fn_node = fn_node
     // An impl method's signature lives under the trait-mangled key, not under the display name the
-    // caller installed on the node.
-    let sig = if tc_current_method_sig_key != "" { lookup_fnsig(tc_current_method_sig_key) } else { lookup_fnsig(fn_name) }
+    // caller installed on the node. Two overlapping impls share that key and the later one owns
+    // it, so the body reads the signature its own declaration made: the overlap is reported once
+    // and does not also read as a wrong return type in the earlier impl.
+    let sig = if tc_current_method_sig_key != "" {
+        fnsig_by_decl.get(fn_node) ?? lookup_fnsig(tc_current_method_sig_key)
+    } else {
+        lookup_fnsig(fn_name)
+    }
     if sig != -1 {
         tc_current_fn_ret = fnsig_pool.get(sig).unwrap().ret
         // Signatures are registered before any impl receiver is in scope, so a `-> Self`
@@ -28305,46 +28319,47 @@ fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     ctx_tid
 }
 
-// A with-item without `as` either installs a Handler[E] or wraps the block in a
-// BlockHandler (sections/04_effects.md, Disambiguation rules). Nothing else has a meaning
-// there. A type typecheck could not settle is left alone, so one mistake reads as one error.
-fn tc_check_with_handler_item(item: Int, tid0: Int) ! Diag.Report {
+// A with-item installs a Handler[E] or enters a scoped value, a type with a BlockHandler impl
+// (sections/04_effects.md §4.7, Disambiguation rules). A Closeable type is one through the impl
+// the parser writes for it. `as` only binds a name, so both item shapes come here. Nothing
+// else has a meaning there. A type typecheck could not settle is left alone, so one mistake
+// reads as one error. A type parameter is a scoped value only by its bound, and its Context
+// is abstract in the body. Returns false when it reports the item.
+fn tc_check_with_item(item: Int, tid0: Int) -> Bool ! Diag.Report {
     let tid = tc_resolve(tid0)
-    if tc_tid_is_no_info(tid) != 0 { return }
+    if tc_tid_is_no_info(tid) != 0 { return true }
     let k = tc_tid_kind(tid)
-    if k == TyKind.Typevar && tc_typevar_binds_here(tid) != 0 {
-        let tp = type_to_str(tid)
-        if tc_pipe_has(tc_tparam_bound_traits(tp), "BlockHandler") != 0 {
-            tc_report_abstract_block_handler_context(item, tp)
-            return
+    if k == TyKind.Unknown || k == TyKind.Never { return true }
+    if k == TyKind.Typevar && tc_typevar_is_scoped(tid) { return true }
+    // `ffi.scope()` is the arena the FFI chapter scopes with `with ... as` (§5.2).
+    if k == TyKind.Handler || k == TyKind.FfiScope { return true }
+    if tc_tid_has_block_handler(tid) != 0 { return true }
+    // A handler or scoped value is usually acquired through a Result or an Option, and the
+    // item then holds the carrier rather than the value it carries.
+    let help = if k == TyKind.Result {
+        "add ? or .unwrap() to use the value the Result holds"
+    } else if k == TyKind.Option {
+        "add ? or .unwrap() to use the value the Option holds"
+    } else {
+        "a with-item installs a Handler[E] or enters a scoped value: a type that implements BlockHandler or Closeable"
+    }
+    diag_error_at("NonHandlerWithItem", WITH_ITEM_NOT_A_HANDLER,
+        "a with-item must be a Handler[E] or a scoped value, got {type_to_str(tid)}", item, help)
+    false
+}
+
+// A type parameter is a scoped value when a bound says so. Every active frame of its binder
+// is read, since an impl's `where` bounds it from a frame of its own. A typevar whose binder
+// is not in scope here was not written in this body, so nothing is known and it passes.
+fn tc_typevar_is_scoped(tid: Int) -> Bool {
+    let binder = tc_tid_binder(tid)
+    if tc_binder_is_active(binder) == 0 { return true }
+    for f in tc_tp_frames {
+        if f.binder == binder && (tc_pipe_has(f.traits, "BlockHandler") != 0 || tc_pipe_has(f.traits, "Closeable") != 0) {
+            return true
         }
     }
-    if k == TyKind.Unknown || k == TyKind.Typevar || k == TyKind.Handler { return }
-    if tc_tid_has_block_handler(tid) != 0 { return }
-    // A scoped handler is usually acquired through a Result, and the item then holds the
-    // Result rather than the handler it carries.
-    let help = if k == TyKind.Result && tc_tid_is_with_handler(ty_pool.get(tid).unwrap().inner1) {
-        "add ? or .unwrap() to use the handler the Result holds"
-    } else {
-        "install a handler here, or bind a resource with `with <expr> as <name>`"
-    }
-    diag_error_at("NonHandlerWithItem", WITH_ITEM_NOT_A_HANDLER,
-        "a with-item without `as` must be a Handler[E] or a BlockHandler, got {type_to_str(tid)}", item, help)
-}
-
-fn tc_tid_is_with_handler(tid0: Int) -> Bool ! Diag.Report {
-    let tid = tc_resolve(tid0)
-    if tc_tid_kind(tid) == TyKind.Handler { return true }
-    tc_tid_has_block_handler(tid) != 0
-}
-
-// A type parameter bounded by BlockHandler leaves its Context abstract, so the with site
-// cannot tell a scoped effect handler from a Context of () (sections/04_effects.md,
-// Scoped effect handlers): it installs no handler and meets no row.
-fn tc_report_abstract_block_handler_context(item: Int, tp: Str) ! Diag.Report {
-    diag_error_at("NonHandlerWithItem", WITH_ITEM_NOT_A_HANDLER,
-        "a with-item without `as` needs a known Context, but `{tp}.Context` is abstract here", item,
-        "call this with a concrete type, or bind the item with `with <expr> as <name>`")
+    false
 }
 
 // The receiver is matched by its declaration node, which every instance of a generic
@@ -28368,7 +28383,8 @@ fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     tc_check_body(res_expr)
     let res_tid = infer_type(res_expr)
     tc_with_resource_node = prev_res
-    let bind_tid = tc_with_binder_tid(res_tid)
+    // A refused item binds its name with no type, so uses in the body do not repeat the error.
+    let bind_tid = if tc_check_with_item(res_expr, res_tid) { tc_with_binder_tid(res_tid) } else { tc_unknown_tid() }
     // The node's tid is the BINDER's type, not the resource expression's: codegen's only consumer
     // reads it to stamp the binder's ScopeVar, so keeping the resource type here would just move
     // the same wrong answer one phase later.
@@ -29736,7 +29752,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // the HandlerExpr arm that walks the method bodies, which infer_type does not
                     // do. The two are complements, and the order keeps handler-body diagnostics
                     // reported before any type error on the operand itself.
-                    tc_check_with_handler_item(wh_item2, infer_type(wh_item2))
+                    let _ = tc_check_with_item(wh_item2, infer_type(wh_item2))
                 }
                 wi2 = wi2 + 1
             }

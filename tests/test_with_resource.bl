@@ -1,43 +1,58 @@
-// `with ... as` binds a resource for the block. An Int handed to `with` without `as` is
-// no handler, so those uses are compile errors (E0839). A file with test rows runs them
-// and not main(), so a test row runs the `as` uses too.
+// `with ... as` binds a scoped value for the block and closes it when the block exits.
+// An Int is no handler and no scoped value, so handing one to `with`, with or without
+// `as`, is a compile error (E0839). A file with test rows runs them and not main(), so a
+// test row runs the `as` uses too.
 
 import compile_test_helpers
+import std.traits
 
-fn make_resource(name: Str) -> Int {
-    io.println("opening resource: {name}")
-    42
+let mut closed: List[Str] = []
+
+type Resource { name: Str, id: Int }
+
+impl Closeable for Resource {
+    fn close(self) {
+        closed.push(self.name)
+    }
 }
 
-fn use_resource(r: Int) {
-    io.println("using resource: {r}")
+fn make_resource(name: Str) -> Resource {
+    io.println("opening resource: {name}")
+    Resource { name: name, id: 42 }
+}
+
+fn use_resource(r: Resource) {
+    io.println("using resource: {r.id}")
 }
 
 fn main() {
     io.println("=== with-as single resource ===")
     with make_resource("file1") as f {
         use_resource(f)
-        io.println("inside with block, f = {f}")
+        io.println("inside with block, f = {f.id}")
     }
     io.println("after with block")
 
     io.println("=== with-as multiple resources ===")
     with make_resource("src") as src, make_resource("dst") as dst {
-        io.println("src = {src}, dst = {dst}")
+        io.println("src = {src.id}, dst = {dst.id}")
     }
     io.println("after multiple resources")
     io.println("all tests passed")
 }
 
-test "with-as binds a single resource and several resources" {
+test "with-as binds a single resource and several resources, and closes them in reverse" {
+    closed.clear()
     with make_resource("file1") as f {
         use_resource(f)
-        assert_eq(f, 42)
+        assert_eq(f.id, 42)
     }
+    assert_eq(closed, ["file1"])
     with make_resource("src") as src, make_resource("dst") as dst {
-        assert_eq(src, 42)
-        assert_eq(dst, 42)
+        assert_eq(src.id, 42)
+        assert_eq(dst.id, 42)
     }
+    assert_eq(closed, ["file1", "dst", "src"])
 }
 
 let setup_fns = "fn make_resource(name: Str) -> Int \{\n    io.println(\"opening resource: \{name}\")\n    42\n}\n\nfn do_setup() -> Int \{\n    io.println(\"setup handler\")\n    0\n}\n\n"
@@ -50,4 +65,9 @@ test "a plain with block over an Int is refused" {
 test "an Int handler mixed with a resource is refused" {
     let src = "{setup_fns}fn main() \{\n    with do_setup(), make_resource(\"mixed_file\") as mf \{\n        io.println(\"mixed block, mf = \{mf}\")\n    }\n}\n"
     compile_test_helpers.expect_compile_error(src, "with_resource_mixed", "E0839")
+}
+
+test "an Int bound with as is refused" {
+    let src = "{setup_fns}fn main() \{\n    with make_resource(\"f\") as f \{\n        io.println(\"f = \{f}\")\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "with_resource_int_as", "E0839")
 }

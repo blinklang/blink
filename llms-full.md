@@ -1182,9 +1182,18 @@ import std.testing.{stdin_from}
 with stdin_from("1\n2") { /* code that reads stdin sees "1\n2" */ }
 ```
 
-## Closeable Trait & `with`-`as` Blocks
+## `with` Items, `as`, and Closeable
 
-Types that implement `Closeable` (from `std.traits`) can be used in `with`-`as` blocks for automatic resource cleanup. `close()` is called on scope exit, including early exits (break, return, error propagation).
+A `with` item is one of two things:
+
+- a `Handler[E]`: the block runs with that handler installed;
+- a scoped value: a type that implements `BlockHandler` (from `std.traits`). Its `enter()` runs before the block and its `exit(ok)` runs after it, on every exit path.
+
+Any other item is E0839, with or without `as`. A `Result` or `Option` item needs `?` first: `with open_resource(path)? as f { ... }`.
+
+`as` only binds a name. It does not change what the item does. `with h as name` installs the handler and binds it; `with v as name` binds the scoped value's Context (what `enter()` returns). Without `as`, the Context is discarded, whatever its type.
+
+A type that implements `Closeable` is a scoped value. The compiler gives it `BlockHandler` with `Context` = the type itself, `enter()` returning the value, and `exit` calling `close()` (with `close()`'s effects). So `close()` runs at block exit, including early exits (break, return, error propagation), and `T: BlockHandler` accepts a Closeable type. Do not also write `impl BlockHandler` for a Closeable type: the two impls overlap, which is a compile error.
 
 ```blink
 import std.traits
@@ -1195,18 +1204,23 @@ impl Closeable for MyResource {
     }
 }
 
-// Single resource — close() called on scope exit
+// close() is called on scope exit
 with open_resource("file.txt") as f {
     io.println("using: {f.name}")
 }
-// f.close() called here automatically
 
-// Multiple resources — close() called in reverse order (b, then a)
+// Without `as`: the value is entered and closed, but not named
+with open_resource("lock") {
+    io.println("holding the lock")
+}
+
+// Multiple resources: closed in reverse order (b, then a)
 with open_resource("a") as a, open_resource("b") as b {
     io.println("using: {a.name} and {b.name}")
 }
-// b.close() called first, then a.close()
 ```
+
+A type parameter is a scoped value only when a bound makes it one: `fn hold[T: Closeable](t: T) { with t { ... } }` is accepted, and `fn hold[T](t: T) { with t { ... } }` is E0839. In a generic body the Context is abstract, so a `with t` there installs no handler.
 
 ## BlockHandler Trait & Scoped Blocks
 

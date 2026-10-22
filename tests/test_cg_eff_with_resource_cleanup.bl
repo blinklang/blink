@@ -1,19 +1,17 @@
 // Which cleanup protocol a `with <expr> as <name>` resource gets, answered from the
 // resource's tid.
 //
-// Four answers. A type that implements BlockHandler hands the block its context and takes
-// an exit(ok) on every path; a type that implements Closeable takes a close(); an FFI
-// scope frees its arena; anything else is a plain binding that runs nothing on the way
-// out. BlockHandler is tried before Closeable so that a type carrying both would take the
-// protocol that also feeds the binder. Typecheck rejects that pair, so the order is a
-// guard rather than a live choice, and the case is proved on the illegal probe below.
+// Three answers. A type that implements BlockHandler hands the block its context and takes
+// an exit(ok) on every path; a Closeable type is one, through the impl the parser writes
+// for it (sections/04_effects.md §4.7.2). An FFI scope frees its arena. Anything else is a
+// plain binding that runs nothing on the way out; typecheck refuses such an item (E0839),
+// so the plain answer is proved on a probe compiled with that error expected, and is the
+// answer codegen gives if that gate ever relaxes.
 //
-// Three of the four carry the symbol the guard local runs on the way out. The FFI scope's
-// is the runtime's own; Closeable's is the close method the user wrote, which is already
-// an ordinary C function taking the resource by value. A BlockHandler must also call
-// enter(), which no resource does, so the with stage lowers it through
-// cg_eff_block_handler_calls and never asks this seam. Asked anyway, the seam answers the
-// protocol with no symbol and one internal error, never a guessed symbol.
+// The FFI scope carries the symbol the guard local runs on the way out: the runtime's own.
+// A BlockHandler must also call enter(), which no resource does, so the with stage lowers
+// it through cg_eff_block_handler_calls and never asks this seam. Asked anyway, the seam
+// answers the protocol with no symbol and one internal error, never a guessed symbol.
 
 import cname.{c_impl_method_name}
 import cname_test_helpers.{find_decl, find_impl}
@@ -33,10 +31,8 @@ import std.io
 fn probe_src() -> Str {
     #"import std.traits
 
-type Plainish { v: Int }
 type Logged { n: Int }
 type Guarded { fd: Int }
-type Boxed[T] { v: T }
 type Latch { Open, Closed }
 
 impl Closeable for Logged {
@@ -53,6 +49,23 @@ impl BlockHandler for Guarded {
     fn exit(self, _ok: Bool) {}
 }
 
+fn main() {
+    let l = Logged { n: 2 }
+    let g = Guarded { fd: 3 }
+    let h = Latch.Open
+    with l as logged { io.println("{logged.n}") }
+    with g as guarded { io.println("{guarded}") }
+    with h as latch { io.println("{latch.to_int()}") }
+    with ffi.scope() as scope { let _ = scope }
+}
+"#
+}
+
+// Items that are neither a handler nor a scoped value: typecheck refuses each (E0839).
+fn refused_probe_src() -> Str {
+    #"type Plainish { v: Int }
+type Boxed[T] { v: T }
+
 fn hold[T](r: T) -> Int {
     with r as unsubstituted {
         0
@@ -61,16 +74,9 @@ fn hold[T](r: T) -> Int {
 
 fn main() {
     let p = Plainish { v: 1 }
-    let l = Logged { n: 2 }
-    let g = Guarded { fd: 3 }
-    let h = Latch.Open
     let bx = Boxed { v: 5 }
     with p as plain { io.println("{plain.v}") }
-    with l as logged { io.println("{logged.n}") }
-    with g as guarded { io.println("{guarded}") }
-    with h as latch { io.println("{latch.to_int()}") }
     with bx as boxed { io.println("{boxed.v}") }
-    with ffi.scope() as scope { let _ = scope }
     io.println("{hold(1)}")
 }
 "#
@@ -122,6 +128,11 @@ fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete
     compile("cg_eff_with_resource_cleanup_probe", probe_src())
 }
 
+fn setup_refused() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    diag_reset()
+    compile_expecting("cg_eff_with_resource_refused_probe", refused_probe_src(), "NonHandlerWithItem")
+}
+
 // One `with <expr> as <name>` item of the probe, named by the binder it introduces. The
 // seam takes the item, so every case below asks it about a resource a program really
 // wrote rather than about a type id assembled by hand.
@@ -130,7 +141,7 @@ fn item(binder: Str) -> Int {
 }
 
 test "a type that implements no protocol is a plain binding that runs nothing" {
-    setup()
+    setup_refused()
     diag_reset()
     let rc = cg_eff_resource_cleanup(item("plain"))
     assert(rc.protocol == CleanupProtocol.Plain)
@@ -141,7 +152,7 @@ test "a type that implements no protocol is a plain binding that runs nothing" {
 // A generic type's instance shares its declaration with every other instance, and no impl
 // claims it, so this is the plain answer reached the long way: through the impl scan.
 test "an instance of a generic type with no impl is a plain binding" {
-    setup()
+    setup_refused()
     diag_reset()
     let rc = cg_eff_resource_cleanup(item("boxed"))
     assert(rc.protocol == CleanupProtocol.Plain)
@@ -149,22 +160,24 @@ test "an instance of a generic type with no impl is a plain binding" {
     assert_eq(cg_ice_count(), 0)
 }
 
-test "a Closeable struct takes the close protocol and names its own impl block" {
+test "a Closeable struct takes the block handler protocol through the impl the parser writes" {
     setup()
     diag_reset()
-    let rc = cg_eff_resource_cleanup(item("logged"))
-    assert(rc.protocol == CleanupProtocol.Closeable)
-    assert_eq(rc.impl_block, find_impl("Logged", "Closeable", ""))
+    let bh = find_impl("Logged", "BlockHandler", "")
+    assert(bh >= 0)
+    assert_eq(cg_eff_block_handler_impl(node_value(item("logged"))), bh)
+    assert_eq(cg_ice_count(), 0)
 }
 
 // An enum carries a declaration an impl block can be written for, exactly as a struct
 // does, so the protocol cannot be keyed on structs alone.
-test "a Closeable enum takes the close protocol and names its own impl block" {
+test "a Closeable enum takes the block handler protocol through the impl the parser writes" {
     setup()
     diag_reset()
-    let rc = cg_eff_resource_cleanup(item("latch"))
-    assert(rc.protocol == CleanupProtocol.Closeable)
-    assert_eq(rc.impl_block, find_impl("Latch", "Closeable", ""))
+    let bh = find_impl("Latch", "BlockHandler", "")
+    assert(bh >= 0)
+    assert_eq(cg_eff_block_handler_impl(node_value(item("latch"))), bh)
+    assert_eq(cg_ice_count(), 0)
 }
 
 // The binder of a BlockHandler resource holds the handler's Context, which for this probe
@@ -178,15 +191,14 @@ test "a BlockHandler resource takes the enter and exit protocol, not its Context
     assert_eq(rc.impl_block, find_impl("Guarded", "BlockHandler", ""))
 }
 
-// The with stage asks this of every item's expression before choosing a path, so a
-// Closeable or plain resource answering an impl here would lose its own cleanup.
+// The with stage asks this of every item's expression before choosing a path, so an FFI
+// scope answering an impl here would lose its own cleanup.
 test "a BlockHandler item's expression answers its impl, and a resource's answers none" {
     setup()
     diag_reset()
     let bh = find_impl("Guarded", "BlockHandler", "")
     assert_eq(cg_eff_block_handler_impl(node_value(item("guarded"))), bh)
-    assert_eq(cg_eff_block_handler_impl(node_value(item("logged"))), -1)
-    assert_eq(cg_eff_block_handler_impl(node_value(item("plain"))), -1)
+    assert_eq(cg_eff_block_handler_impl(node_value(item("scope"))), -1)
     assert_eq(cg_ice_count(), 0)
 }
 
@@ -225,30 +237,33 @@ test "a BlockHandler resource reports exactly one internal error, naming what is
     assert_eq(cg_ice_count(), 1)
 }
 
-// Closeable has its runner: the close method the user wrote. Both probes are checked,
-// because a struct and an enum reach it by different declaration shapes and a fix that
-// only spelled one would leave the other unclosed. The expected symbol is built by the
-// producer the definition is spelled with, never written out, so a rename moves both.
-test "a Closeable struct names the close symbol as its exit runner and reports nothing" {
+// A Closeable's exit is the exit method of the impl the parser writes, and its Context is
+// the value itself. Both probes are checked, because a struct and an enum reach it by
+// different declaration shapes. The expected symbol is built by the producer the
+// definition is spelled with, never written out, so a rename moves both.
+test "a Closeable struct names the impl's exit symbol and takes itself as Context" {
     setup()
     diag_reset()
-    let rc = cg_eff_resource_cleanup(item("logged"))
-    assert_eq(rc.protocol, CleanupProtocol.Closeable)
-    assert_eq(rc.exit_symbol, c_impl_method_name(find_impl("Logged", "Closeable", ""), "close"))
-    assert_eq(rc.passes_ok, false)
+    let bh = find_impl("Logged", "BlockHandler", "")
+    let expr = node_value(item("logged"))
+    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("logged"))
+    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+    assert_eq(calls.context_tid, tid_of_node(expr))
     assert_eq(cg_ice_count(), 0)
 }
 
-test "a Closeable enum names the close symbol as its exit runner and reports nothing" {
+test "a Closeable enum names the impl's exit symbol and takes itself as Context" {
     setup()
     diag_reset()
-    let rc = cg_eff_resource_cleanup(item("latch"))
-    assert_eq(rc.protocol, CleanupProtocol.Closeable)
-    assert_eq(rc.exit_symbol, c_impl_method_name(find_impl("Latch", "Closeable", ""), "close"))
+    let bh = find_impl("Latch", "BlockHandler", "")
+    let expr = node_value(item("latch"))
+    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("latch"))
+    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+    assert_eq(calls.context_tid, tid_of_node(expr))
     assert_eq(cg_ice_count(), 0)
 }
 
-// FfiScope is the one non-Plain protocol with a runner already: the runtime's own
+// FfiScope is the one protocol here with a runner of its own: the runtime's
 // blink_ffi_scope_cleanup, so it reports no internal error.
 test "an FFI scope resource reports no internal error" {
     setup()
@@ -260,9 +275,9 @@ test "an FFI scope resource reports no internal error" {
 }
 
 // An unsubstituted binder cannot be asked which protocol it takes. Answering Plain would
-// leave a Closeable resource unclosed with nothing said about it.
+// leave a scoped value never exited with nothing said about it.
 test "an unsubstituted typevar resource is an internal error, not a plain binding" {
-    setup()
+    setup_refused()
     diag_reset()
     let rc = cg_eff_resource_cleanup(item("unsubstituted"))
     assert(rc.protocol == CleanupProtocol.Plain)

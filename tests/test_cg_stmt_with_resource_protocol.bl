@@ -1,14 +1,13 @@
 // A `with <expr> as <name>` item, wired from the protocol cg_eff_resource_cleanup answers
 // into the IR wrap_resource builds.
 //
-// Plain binds the resource and runs nothing on the way out: no cleanup exists to skip, so
-// this is the one protocol wrap_resource has always been able to lower correctly. An FFI
-// scope wraps the bind in a WithScope naming the runtime's own blink_ffi_scope_cleanup,
-// and a Closeable resource wraps it the same way naming the close method the user wrote.
-// wrap_resource tests for the exit symbol the cleanup record carries rather than for the
-// protocol, so those two go down one path. A BlockHandler never reaches wrap_resource: its
+// A resource that implements no protocol never reaches lowering: typecheck refuses it
+// (E0839), with or without `as`. An FFI scope wraps the bind in a WithScope naming the
+// runtime's own blink_ffi_scope_cleanup. A scoped value never reaches wrap_resource: its
 // binder holds the Context that enter() answers, so the with stage lowers it on a path of
-// its own that calls enter and guards the rest with the exit method the user wrote.
+// its own that calls enter and guards the rest with the exit method. A Closeable type is a
+// scoped value through the BlockHandler impl the compiler provides, so it takes that path
+// too, and its guard names that impl's exit, which calls close().
 
 import std.fs
 import std.io
@@ -20,6 +19,7 @@ import parser.{node_count, node_kind, node_name}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
 import diagnostics.{diag_entries, diag_reset}
+import cg_test_helpers.{cg_probe_compile_but}
 import cname.{c_impl_method_name}
 import cname_test_helpers.{find_impl}
 import cg_stmt.{cg_local_c_name, cg_stmt_reset, lower_fn}
@@ -37,7 +37,6 @@ fn find_fn(name: Str) -> Int {
 fn probe_src() -> Str {
     #"import std.traits
 
-type Plainish { v: Int }
 type Logged { n: Int }
 type Guarded { fd: Int }
 
@@ -49,13 +48,6 @@ impl BlockHandler for Guarded {
     type Context = Int
     fn enter(self) -> Int { self.fd }
     fn exit(self, _ok: Bool) {}
-}
-
-fn plain_case() {
-    let p = Plainish { v: 1 }
-    with p as plain {
-        io.println("{plain.v}")
-    }
 }
 
 fn ffi_case() {
@@ -77,10 +69,21 @@ fn block_handler_case() {
 }
 
 fn main() {
-    plain_case()
     ffi_case()
     closeable_case()
     block_handler_case()
+}
+"#
+}
+
+fn refused_probe_src() -> Str {
+    #"type Plainish { v: Int }
+
+fn main() {
+    let p = Plainish { v: 1 }
+    with p as plain {
+        io.println("{plain.v}")
+    }
 }
 "#
 }
@@ -131,15 +134,19 @@ fn find_kind(id: Int, kind: IrKind) -> Int {
     -1
 }
 
-test "a plain resource still binds with no internal error and no scope guard" {
-    run_probe()
+test "a resource that implements no protocol is refused before it reaches lowering" {
+    ir_reset()
+    layout_reset()
+    cg_stmt_reset()
     diag_reset()
-    let root = lower_fn(find_fn("plain_case"))
-    for err in ir_verify(root) { io.println("VERIFY: {err}") }
-    assert_eq(ir_verify(root).len(), 0)
-    assert(find_kind(root, IrKind.Let) >= 0)
-    assert_eq(find_kind(root, IrKind.WithScope), -1)
-    assert_eq(ices(), 0)
+    let path = "build/cg_stmt_with_resource_refused_probe.bl"
+    let _ = cg_probe_compile_but(path, refused_probe_src(), "NonHandlerWithItem")
+    let _ = fs.delete(path)
+    let mut named = 0
+    for d in diag_entries {
+        if d.message.contains("got Plainish") { named = named + 1 }
+    }
+    assert_eq(named, 1)
 }
 
 test "an FFI scope resource binds, then wraps the rest of the block in a WithScope naming the runtime cleanup" {
@@ -160,10 +167,10 @@ test "an FFI scope resource binds, then wraps the rest of the block in a WithSco
     assert_eq(ices(), 0)
 }
 
-// The close method the user wrote is the exit runner, so the symbol is built by the
-// producer that spells its definition. A literal here would pass while the definition
-// moved, and the guard would then call a function the unit never defines.
-test "a Closeable resource binds, then wraps the rest of the block in a WithScope naming its own close method" {
+// The exit of the BlockHandler impl the compiler provides is the exit runner, so the symbol
+// is built by the producer that spells its definition. A literal here would pass while the
+// definition moved, and the guard would then call a function the unit never defines.
+test "a Closeable resource binds its Context, then wraps the rest of the block in a WithScope naming its provided exit" {
     run_probe()
     diag_reset()
     let root = lower_fn(find_fn("closeable_case"))
@@ -172,13 +179,12 @@ test "a Closeable resource binds, then wraps the rest of the block in a WithScop
     assert(find_kind(root, IrKind.Let) >= 0)
     let scoped = find_kind(root, IrKind.WithScope)
     assert(scoped >= 0)
-    assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Logged", "Closeable", ""), "close"))
-    // The resource kid must read the binder the `with` declared. This case holds the
-    // resource in an enclosing local first, so the guard closing that local instead would
-    // still be a Let and a VarRef, and only the name tells the two apart.
+    assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Logged", "BlockHandler", ""), "exit"))
+    // The guard reads the hidden local enter() was called on, not the binder, which holds
+    // the Context enter() answered: one lowering for every scoped value.
     assert_eq(ir_kid_count(scoped), 2)
     assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
-    assert_eq(ir_c_name(ir_kid(scoped, 0)), cg_local_c_name("logged"))
+    assert(ir_c_name(ir_kid(scoped, 0)) != cg_local_c_name("logged"))
     assert_eq(ices(), 0)
 }
 

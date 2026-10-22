@@ -1,20 +1,15 @@
-// The exit runner a Closeable resource takes on the way out of a `with` block.
+// What a Closeable item runs on the way out of a `with` block.
 //
-// A guard local runs one function when its scope ends, and that function takes the
-// resource by value. Closeable declares exactly that shape: `fn close(self)`. The impl
-// writing it is an ordinary impl block, so the declaration stage already emits an
-// ordinary C function for it, and the guard machinery already wraps an arbitrary symbol
-// of that shape in its own state struct and cleanup attribute. Nothing has to be
-// synthesised: the exit runner is the close method the user wrote.
+// A Closeable type is a scoped value: the parser writes it an `impl BlockHandler` whose
+// Context is the value itself, whose enter returns self and whose exit calls close
+// (sections/04_effects.md §4.7.2). So a Closeable item takes the block handler path like
+// any other BlockHandler, and the resource path, which once ran close through a guard of
+// its own, never sees it. The symbols are read from the producer the definitions are
+// spelled with: a literal repeated here would pass while the definition moved.
 //
-// So the question this file settles is which symbol the cleanup names, and it reads the
-// answer from the same producer the definition is spelled with. A literal repeated here
-// would pass while the definition moved, and the guard would then link against nothing.
-//
-// BlockHandler is deliberately left refusing. Its binder holds the Context that `enter`
-// answers rather than the resource itself, which is a different shape from the one the
-// guard stores, and the row below pins that it still says so rather than silently taking
-// the Closeable path.
+// The resource path still refuses a BlockHandler that reaches it, because its binder
+// holds the Context that `enter` answers rather than the resource itself, and a silent
+// plain answer would leave a value whose exit never runs.
 
 import cname_test_helpers.{find_decl, find_impl}
 import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
@@ -32,7 +27,7 @@ import cg_print.{print_reset, print_take}
 import cg_expr.{cg_expr_reset}
 import cg_stmt.{cg_stmt_reset, lower_block_returning}
 import cg_eff.{
-    CleanupProtocol, cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk,
+    CleanupProtocol, cg_eff_block_handler_calls, cg_eff_block_handler_impl, cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk,
     cg_eff_reset, cg_eff_resource_cleanup, cg_eff_thunk_body_node, cg_eff_thunk_close,
     cg_eff_thunk_open, cg_eff_thunk_symbol,
 }
@@ -126,50 +121,51 @@ fn resource_spelling(binder: Str) -> Str ! Diag.Report {
     layout_of(tid_of_node(node_value(item(binder))), Position.Local).c_spelling
 }
 
-test "a Closeable resource reports no unbuilt stage, because its own close method is the exit runner" {
+// The impl the parser writes is an ordinary impl block, so the with stage finds it the way
+// it finds one the user wrote.
+test "a Closeable item's expression answers the BlockHandler impl the parser wrote for it" {
     setup()
+    let bh = find_impl("Sock", "BlockHandler", "")
+    assert(bh >= 0)
+    let got = cg_eff_block_handler_impl(node_value(item("sock")))
+    if got != bh || ices() != 0 {
+        report_ices("a Closeable item does not answer its BlockHandler impl")
+    }
+    assert_eq(got, bh)
+    assert_eq(ices(), 0)
+}
+
+test "a Closeable item's exit is the exit method of that impl, spelled as its definition is" {
+    setup()
+    let bh = find_impl("Sock", "BlockHandler", "")
+    let expr = node_value(item("sock"))
+    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
+    assert_eq(calls.impl_block, bh)
+    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+    assert_eq(ices(), 0)
+}
+
+// Context = Self, so the binder holds the value itself, at the spelling the value has at
+// the with-item: a binder spelled another way would not compile against the item.
+test "a Closeable item's Context is the resource itself, at the spelling the resource has" {
+    setup()
+    let bh = find_impl("Sock", "BlockHandler", "")
+    let expr = node_value(item("sock"))
+    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
+    assert_eq(layout_of(calls.context_tid, Position.Local).c_spelling, resource_spelling("sock"))
+    assert_eq(ices(), 0)
+}
+
+// The resource path once wrote a guard state struct per Closeable type. Asked about one
+// now, it reports the routing miss and writes no guard support at all.
+test "the resource path asked about a Closeable writes no guard support and reports the miss" {
+    setup()
+    let spelling = resource_spelling("sock")
     let rc = cg_eff_resource_cleanup(item("sock"))
-    if rc.protocol != CleanupProtocol.Closeable || ices() != 0 {
-        report_ices("a Closeable resource still refuses to name an exit runner")
-    }
-    assert_eq(rc.protocol, CleanupProtocol.Closeable)
-    assert_eq(ices(), 0)
-}
-
-test "the exit runner names the close symbol the impl's own definition is spelled with" {
-    setup()
-    let _ = cg_eff_resource_cleanup(item("sock"))
-    let close = c_impl_method_name(find_impl("Sock", "Closeable", ""), "close")
     let text = print_take()
-    if cg_text_occurrences(text, close) == 0 {
-        io.println("FAIL: guard support names no '{close}'\n--- output ---\n{text}")
-    }
-    assert(cg_text_occurrences(text, close) > 0)
-}
-
-// The state struct holds the resource by value and hands it to close by value, so a
-// struct spelled one way at the with-item and another way in the guard would not compile.
-test "the guard support stores the resource at the spelling the resource value has" {
-    setup()
-    let spelling = resource_spelling("sock")
-    let _ = cg_eff_resource_cleanup(item("sock"))
-    let text = print_take()
-    if cg_text_occurrences(text, "{spelling} resource;") != 1 {
-        io.println("FAIL: no '{spelling} resource;' in the guard state\n--- output ---\n{text}")
-    }
-    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
-}
-
-// Two `with` blocks over one Closeable type share one exit runner, and a TU that defined
-// its support twice would not compile, so the support is written once per symbol.
-test "asking twice for one Closeable type writes the guard support once" {
-    setup()
-    let spelling = resource_spelling("sock")
-    let _ = cg_eff_resource_cleanup(item("sock"))
-    let _ = cg_eff_resource_cleanup(item("sock"))
-    let text = print_take()
-    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
-    assert_eq(ices(), 0)
+    assert_eq(rc.protocol, CleanupProtocol.BlockHandler)
+    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 0)
+    assert_eq(ices_saying("BlockHandler"), 1)
 }
 
 // The binder of a BlockHandler resource holds what `enter` answers, not the resource, so

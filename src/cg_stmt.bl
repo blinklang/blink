@@ -22,7 +22,7 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_NEVER, TYPE_STR, TYPE_VOID,
     tc_call_declared_name, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
-    tc_lookup_node_tid, tc_tid_kind, make_list_type,
+    tc_lookup_node_tid, tc_resolve, tc_tid_kind, make_list_type,
     tc_alias_decl_of_ann, tc_ensures_preds_of, tc_is_old_snapshot, tc_requires_preds_of,
 }
 import layout.{
@@ -2530,9 +2530,10 @@ fn flag_ref(span: Int, name: Str) -> Int ! Diag.Report {
 // ── With blocks ───────────────────────────────────────────────────────────
 
 // A `with` binds one or more items around a body: `arena` for a fresh allocation arena, a
-// block handler for enter and exit around the body, `expr as name` for a resource whose
-// cleanup runs on every exit, and anything else for an effect handler. The items nest
-// outside in, so the first item written is the outermost.
+// block handler (Closeable types included) for enter and exit around the body, and an
+// effect handler installed for the body. `as` only binds a name to what the item gives;
+// an `ffi.scope()` bound by it frees its arena on every exit. The items nest outside in,
+// so the first item written is the outermost.
 fn lower_with_block(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     let items = node_handlers(node)
     let n = if items == -1 { 0 } else { sublist_length(items) }
@@ -2548,7 +2549,11 @@ fn wrap_with_items(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, 
     let expr = if kind == NodeKind.WithResource { node_value(item) } else { item }
     let bh = cg_eff_block_handler_impl(expr)
     if bh >= 0 { return wrap_block_handler(node, items, n, i, bh, tail, dest, dest_tid) }
-    if kind == NodeKind.WithResource { return wrap_resource(node, items, n, i, tail, dest, dest_tid) }
+    if kind == NodeKind.WithResource {
+        let et = stmt_tid(expr)
+        if et >= 0 && tc_tid_kind(et) == TyKind.Handler { return wrap_bound_handler(node, items, n, i, tail, dest, dest_tid) }
+        return wrap_resource(node, items, n, i, tail, dest, dest_tid)
+    }
     if kind == NodeKind.Ident && node_name(item) == ARENA_ITEM {
         return wrap_arena(node, items, n, i, tail, dest, dest_tid)
     }
@@ -2599,15 +2604,12 @@ fn as_block(id: Int) -> Int {
 // The resource binds before the body is lowered, so the body reads it, and the resource
 // expression is lowered before the bind, so it cannot read the name it is defining.
 //
-// Which cleanup a resource gets is a question about the traits its type implements:
-// Closeable closes it, BlockHandler hands it the block, an FFI scope frees its arena and
-// a type with none of those is a plain binding. cg_eff_resource_cleanup answers the
-// question and hands back the exit symbol to run on the way out, so this stage tests for
-// a symbol rather than for a protocol: every protocol that names one is wrapped the same
-// way, and a protocol added later needs nothing here. BlockHandler names none, because its
-// binder holds the Context that enter() answers rather than the resource; it records its
-// own internal error and the bind underneath it is left exactly as plain as it always
-// was.
+// Which cleanup a resource gets is a question about its type: an FFI scope frees its arena
+// and anything else is a plain binding. cg_eff_resource_cleanup answers the question and
+// hands back the exit symbol to run on the way out, so this stage tests for a symbol
+// rather than for a protocol. A block handler never comes here, because its binder holds
+// the Context that enter() answers rather than the resource; cg_eff records its own
+// internal error for one that does, and the bind underneath it stays plain.
 fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     let item = sublist_get(items, i)
     let _ = open_scope()
@@ -2638,13 +2640,36 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
     ir_block(item, [bind, rest_block])
 }
 
+// `with h as name` on a Handler[E] installs h for the body just as `with h` does, and the
+// name holds that same handler: it is bound first and the install reads it, so the item's
+// expression runs once.
+fn wrap_bound_handler(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    let item = sublist_get(items, i)
+    let tid = stmt_tid(item)
+    if tid < 0 { return -1 }
+    let value = lower_value(node_value(item))
+    if value < 0 { return -1 }
+    let _ = open_scope()
+    let bind = bind_context(item, value)
+    let rest = if bind < 0 { -1 } else { wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid) }
+    let installed = if rest < 0 { -1 } else { binder_ref(item) }
+    close_scope()
+    if rest < 0 { return -1 }
+    let body = cg_eff_lower_handler_install_of(item, tid, installed, as_block(rest))
+    if body < 0 { return -1 }
+    ir_block(item, [bind, body])
+}
+
 // The handler is held in a hidden local, so enter and the guard's exit(ok) both read the
 // one value the item built. The guard is armed only after enter returns, so an enter that
 // never returns has no exit run for it.
 //
 // A Context of Handler[E] makes the item a scoped effect handler: enter()'s result is
 // installed for the body, inside the guard, so the handler is uninstalled before exit(ok)
-// runs on every way out. `as` binds that same handler and installs it all the same.
+// runs on every way out. `as` binds that same handler and installs it all the same. In a
+// generic body whose item has a type parameter's type, the Context is abstract there and
+// nothing is installed, whatever type the instance gives it (sections/04_effects.md §4.7):
+// the body was checked without that handler, so installing it would change what it does.
 fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     let item = sublist_get(items, i)
     let binds = node_kind(item) == NodeKind.WithResource
@@ -2662,7 +2687,7 @@ fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int,
     // An enter returning Void gives an `as` binder nothing, and typecheck then types the
     // binder as the handler itself, so that is what it holds.
     let void_enter = tc_tid_kind(calls.context_tid) == TyKind.Void
-    let installs = tc_tid_kind(calls.context_tid) == TyKind.Handler
+    let installs = tc_tid_kind(calls.context_tid) == TyKind.Handler && !item_type_is_abstract(expr)
     let mut stmts: List[Int] = [held.stmt]
     let mut installed = -1
     if installs && !binds {
@@ -2687,6 +2712,12 @@ fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int,
     if body < 0 { return -1 }
     stmts.push(ir_with_scope(item, calls.exit_symbol, held.ref, as_block(body)))
     ir_block(item, stmts)
+}
+
+// The item's type as typecheck wrote it, before any instance substitutes it.
+fn item_type_is_abstract(expr: Int) -> Bool {
+    let raw = tc_lookup_node_tid(expr)
+    raw >= 0 && tc_tid_kind(tc_resolve(raw)) == TyKind.Typevar
 }
 
 // A read of the `as` binder bind_context just declared, as a node of its own.

@@ -1,0 +1,344 @@
+// A `with` item has one of two typing rules (sections/04_effects.md §4.7): a Handler[E] is
+// installed for the body, and a scoped value runs enter() before the body and exit(ok)
+// after it. A type that implements Closeable is a scoped value: it also implements
+// BlockHandler with Context = Self, enter returning self and exit calling close (§4.7.2),
+// and that impl counts for trait bounds. `as` only binds a name, so an item bound by `as`
+// is checked the same way as one without it, and any other item is E0839.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/closeable_is_a_scoped_value"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn error_rows(out: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for row in out.trim().split("\n") {
+        if row.contains("\"severity\":\"error\"") { rows.push(row) }
+    }
+    rows
+}
+
+// Each want is "CODE@line:col@message@help", in the order the errors are reported. An empty
+// help means the row has none.
+fn expect_rows(name: Str, src: List[Str], want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", lines(src))
+    let r = blink_in_dir("check --json {name}.bl")
+    let rows = error_rows(r.err_out)
+    let mut problems: List[Str] = []
+    if want.len() > 0 && r.exit_code != 1 { problems.push("{name}: want exit 1, got {r.exit_code}") }
+    if want.len() == 0 && r.exit_code != 0 { problems.push("{name}: want exit 0, got {r.exit_code}:\n{r.err_out}") }
+    if rows.len() != want.len() { problems.push("{name}: want {want.len()} error rows, got {rows.len()}:\n{r.err_out}") }
+    let mut i = 0
+    while i < rows.len() && i < want.len() {
+        let row = rows.get(i).unwrap()
+        let parts = want.get(i).unwrap().split("@")
+        let code = parts.get(0).unwrap()
+        let at = parts.get(1).unwrap().split(":")
+        let msg = parts.get(2).unwrap()
+        let help = parts.get(3).unwrap()
+        if !row.contains("\"code\":\"{code}\"") { problems.push("{name}: row {i}: want {code} in {row}") }
+        if !row.contains("\"line\":{at.get(0).unwrap()},\"col\":{at.get(1).unwrap()}") { problems.push("{name}: row {i}: want {parts.get(1).unwrap()} in {row}") }
+        if !row.contains("\"message\":\"{msg}\"") { problems.push("{name}: row {i}: want message {msg} in {row}") }
+        if help == "" && row.contains("\"help\":") { problems.push("{name}: row {i}: want no help in {row}") }
+        if help != "" && !row.contains("\"help\":\"{help}\"") { problems.push("{name}: row {i}: want help {help} in {row}") }
+        i = i + 1
+    }
+    problems.join("\n")
+}
+
+// Runs a program and compares what it prints, line for line.
+fn expect_run(name: Str, src: List[Str], want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", lines(src))
+    let r = blink_in_dir("run {name}.bl")
+    if r.exit_code != 0 { return "{name}: want exit 0, got {r.exit_code}:\n{r.err_out}" }
+    if r.out != lines(want) { return "{name}: want output\n{lines(want)}got\n{r.out}" }
+    ""
+}
+
+fn report(problems: List[Str]) {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+fn not_an_item(ty: Str) -> Str {
+    "a with-item must be a Handler[E] or a scoped value, got {ty}"
+}
+
+let OTHER_HELP = "a with-item installs a Handler[E] or enters a scoped value: a type that implements BlockHandler or Closeable"
+
+fn unwrap_help(carrier: Str) -> Str {
+    "add ? or .unwrap() to use the value the {carrier} holds"
+}
+
+let RES = "type Res \{ n: Int }"
+let RES_CLOSE = "impl Closeable for Res \{ fn close(self) \{ io.println(\"close \{self.n}\") } }"
+
+test "an item bound by as that is no handler and no scoped value is E0839" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    problems.push(expect_rows("as_items", [
+        RES,
+        RES_CLOSE,
+        "fn open(n: Int) -> Result[Res, Str] \{ Ok(Res \{ n: n }) }",
+        "fn find(n: Int) -> Option[Res] \{ Some(Res \{ n: n }) }",
+        "fn main() \{",
+        "    with open(1) as r \{ io.println(\"body \{r.n}\") }",
+        "    with 5 as x \{ io.println(\"five \{x}\") }",
+        "    with find(2) as f \{ io.println(\"found \{f.n}\") }",
+        "}",
+    ], [
+        "E0839@6:10@{not_an_item("Result[Res, Str]")}@{unwrap_help("Result")}",
+        "E0839@7:10@{not_an_item("Int")}@{OTHER_HELP}",
+        "E0839@8:10@{not_an_item("Option[Res]")}@{unwrap_help("Option")}",
+    ]))
+    problems.push(expect_rows("plain_items", [
+        RES,
+        RES_CLOSE,
+        "fn open(n: Int) -> Result[Res, Str] \{ Ok(Res \{ n: n }) }",
+        "fn main() \{",
+        "    with open(1) \{ io.println(\"body\") }",
+        "    with \"s\" \{ io.println(\"str\") }",
+        "}",
+    ], [
+        "E0839@5:10@{not_an_item("Result[Res, Str]")}@{unwrap_help("Result")}",
+        "E0839@6:10@{not_an_item("Str")}@{OTHER_HELP}",
+    ]))
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+// A type parameter is a scoped value only when a bound says so: an unbounded one, or one
+// bounded by an unrelated trait, may stand for an Int, which is "any other type".
+test "a type parameter is a with-item only when a bound makes it a scoped value" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut problems: List[Str] = []
+    problems.push(expect_rows("tparam_items", [
+        "fn hold[T](t: T) \{ with t as _x \{ io.println(\"hold\") } }",
+        "fn eq[T: Eq](t: T) \{ with t \{ io.println(\"eq\") } }",
+        "fn main() \{ hold(1)",
+        "    eq(2) }",
+    ], [
+        "E0839@1:25@{not_an_item("T")}@{OTHER_HELP}",
+        "E0839@2:27@{not_an_item("T")}@{OTHER_HELP}",
+    ]))
+    problems.push(expect_run("tparam_bounded", [
+        RES,
+        RES_CLOSE,
+        "fn by_bound[T: Closeable](t: T) \{ with t \{ io.println(\"bound\") } }",
+        "trait Named \{ fn name(self) -> Str }",
+        "impl Named for Res \{ fn name(self) -> Str \{ \"res \{self.n}\" } }",
+        "fn second[T: Named + Closeable](t: T) \{ with t as c \{ io.println(c.name()) } }",
+        "fn main() \{",
+        "    by_bound(Res \{ n: 1 })",
+        "    second(Res \{ n: 2 })",
+        "}",
+    ], ["bound", "close 1", "res 2", "close 2"]))
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "a Closeable runs close with and without as, and a BlockHandler bound accepts it" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_run("closeable_runs", [
+        RES,
+        RES_CLOSE,
+        "fn open(n: Int) -> Result[Res, Str] \{ Ok(Res \{ n: n }) }",
+        "fn wrap[T: BlockHandler](t: T) \{",
+        "    with t \{ io.println(\"in wrap\") }",
+        "}",
+        "fn main() \{",
+        "    wrap(Res \{ n: 1 })",
+        "    with Res \{ n: 2 } \{ io.println(\"no as\") }",
+        "    with Res \{ n: 3 } as r \{ io.println(\"as \{r.n}\") }",
+        "    with open(4).unwrap() as r \{ io.println(\"unwrapped \{r.n}\") }",
+        "}",
+    ], ["in wrap", "close 1", "no as", "close 2", "as 3", "close 3", "unwrapped 4", "close 4"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "a scoped value with any Context may go without as, which discards the Context" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_run("context_discarded", [
+        "type Timer \{ label: Str }",
+        "impl BlockHandler for Timer \{",
+        "    type Context = Int",
+        "    fn enter(self) -> Int \{",
+        "        io.println(\"enter \{self.label}\")",
+        "        7",
+        "    }",
+        "    fn exit(self, ok: Bool) \{ io.println(\"exit \{self.label} \{ok}\") }",
+        "}",
+        "type Ctx \{ v: Int }",
+        "type Scope \{ v: Int }",
+        "impl BlockHandler for Scope \{",
+        "    type Context = Ctx",
+        "    fn enter(self) -> Ctx \{ Ctx \{ v: self.v } }",
+        "    fn exit(self, _ok: Bool) \{ io.println(\"scope out\") }",
+        "}",
+        "fn wrap[T: BlockHandler](t: T) \{",
+        "    with t \{ io.println(\"generic body\") }",
+        "}",
+        "fn main() \{",
+        "    with Timer \{ label: \"a\" } \{ io.println(\"body\") }",
+        "    with Scope \{ v: 1 } \{ io.println(\"scope body\") }",
+        "    with Timer \{ label: \"b\" } as n \{ io.println(\"bound \{n}\") }",
+        "    wrap(Timer \{ label: \"c\" })",
+        "}",
+    ], ["enter a", "body", "exit a true", "scope body", "scope out", "enter b", "bound 7", "exit b true", "enter c", "generic body", "exit c true"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "in a generic body an item whose Context is abstract installs no handler" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_run("abstract_context", [
+        "type Quiet \{ tag: Str }",
+        "impl BlockHandler for Quiet \{",
+        "    type Context = Handler[IO]",
+        "    fn enter(self) -> Handler[IO] \{",
+        "        let t = self.tag",
+        "        handler IO \{",
+        "            fn print(msg: Str) \{ io.eprintln(\"[\{t}] \{msg}\") }",
+        "        }",
+        "    }",
+        "    fn exit(self, _ok: Bool) \{ }",
+        "}",
+        "fn wrap[T: BlockHandler](t: T) \{",
+        "    with t \{ io.println(\"generic\") }",
+        "}",
+        "fn main() \{",
+        "    with Quiet \{ tag: \"direct\" } \{ io.println(\"direct\") }",
+        "    wrap(Quiet \{ tag: \"abstract\" })",
+        "}",
+    ], ["generic"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+let MAKE_HANDLER = [
+    "fn make(tag: Str) -> Handler[IO] \{",
+    "    handler IO \{",
+    "        fn print(msg: Str) \{ io.eprintln(\"[\{tag}] \{msg}\") }",
+    "    }",
+    "}",
+]
+
+test "as on a Handler installs the handler and binds it, and the name may leave the block" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut src = MAKE_HANDLER
+    for l in [
+        "fn give() -> Handler[IO] \{",
+        "    with make(\"given\") as h \{",
+        "        io.println(\"inside\")",
+        "        return h",
+        "    }",
+        "}",
+        "fn main() \{",
+        "    let mut saved = make(\"first\")",
+        "    with make(\"bound\") as h \{",
+        "        io.println(\"body\")",
+        "        saved = h",
+        "    }",
+        "    with saved \{ io.println(\"stored\") }",
+        "    with give() \{ io.println(\"returned\") }",
+        "    with make(\"task\") as h2 \{",
+        "        async.scope \{",
+        "            let t = async.spawn(fn() \{ with h2 \{ io.println(\"spawned\") } })",
+        "            let _ = t.await",
+        "        }",
+        "    }",
+        "}",
+    ] { src.push(l) }
+    write_file("{DIR}/handler_as.bl", lines(src))
+    let r = blink_in_dir("run handler_as.bl")
+    let _ = sh("rm -rf {DIR}")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.err_out, "[bound] body\n[bound] stored\n[given] inside\n[given] returned\n[task] spawned\n")
+}
+
+test "impl Closeable and impl BlockHandler on one type are one overlap error" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/both.bl", lines([
+        RES,
+        RES_CLOSE,
+        "impl BlockHandler for Res \{",
+        "    type Context = Int",
+        "    fn enter(self) -> Int \{ self.n }",
+        "    fn exit(self, ok: Bool) \{ }",
+        "}",
+        "fn main() \{ }",
+    ]))
+    let r = blink_in_dir("check --json both.bl")
+    let _ = sh("rm -rf {DIR}")
+    let rows = error_rows(r.err_out)
+    if rows.len() != 1 { io.eprintln(r.err_out) }
+    assert_eq(rows.len(), 1)
+    let row = rows.get(0).unwrap()
+    assert(row.contains("\"line\":3,\"col\":1"))
+    assert(row.contains("\"name\":\"OverlappingImpls\""))
+    assert(row.contains("\"message\":\"impl of `BlockHandler` for `Res` overlaps an earlier impl; Blink does not support specialization\""))
+    assert(row.contains("\"help\":\"`Closeable` already provides `BlockHandler` for `Res`; remove one of the two impls\""))
+}
+
+test "a name used in a with body whose item has no as gets a help line to bind it" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let problems = [expect_rows("unbound", [
+        RES,
+        RES_CLOSE,
+        "fn main() \{",
+        "    with Res \{ n: 1 } \{ io.println(\"\{r.n}\") }",
+        "}",
+    ], ["E0506@4:38@undefined variable `r`@bind it: with ... as r"])]
+    let _ = sh("rm -rf {DIR}")
+    report(problems)
+}
+
+test "blink check, a per-module build and a one-unit build report the same with-item errors" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/same.bl", lines([
+        RES,
+        RES_CLOSE,
+        "fn open(n: Int) -> Result[Res, Str] \{ Ok(Res \{ n: n }) }",
+        "fn main() \{",
+        "    with open(1) as r \{ io.println(\"\{r.n}\") }",
+        "    with 5 \{ io.println(\"five\") }",
+        "}",
+    ]))
+    let check = blink_in_dir("check same.bl")
+    let build = blink_in_dir("build same.bl")
+    let one = blink_in_dir("build --no-per-module same.bl")
+    let _ = sh("rm -rf {DIR}")
+    assert(check.exit_code != 0)
+    assert(build.exit_code != 0)
+    assert(one.exit_code != 0)
+    let shown = check.err_out.replace("error: check failed\n", "")
+    if shown != build.err_out || build.err_out != one.err_out {
+        io.eprintln("check:\n{check.err_out}\nbuild:\n{build.err_out}\none unit:\n{one.err_out}")
+    }
+    assert(shown == build.err_out)
+    assert(build.err_out == one.err_out)
+    let result_row = "error[NonHandlerWithItem]: ".concat(not_an_item("Result[Res, Str]"))
+    let int_row = "error[NonHandlerWithItem]: ".concat(not_an_item("Int"))
+    assert(check.err_out.contains(result_row))
+    assert(check.err_out.contains(int_row))
+    assert(check.err_out.contains("2 error(s) found"))
+}
