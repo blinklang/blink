@@ -1221,7 +1221,7 @@ fn token() -> Bytes ! Rand {
 User code calls only the wrappers. `rand.int(lo, hi)` with two `Int` arguments does not compile. The two-`Int` form is the operation that a `handler Rand { ... }` implements, and that a handler calls as `default.int(lo, hi)` (§4.7.1).
 
 ```blink
-fn always_low() -> Handler[Rand] {
+fn always_low() -> Handler[Rand ! Rand] {
     handler Rand {
         fn int(lo: Int, hi: Int) -> Int { lo }
         fn float() -> Float { default.float() }
@@ -1760,7 +1760,7 @@ fn main() {
 }
 ```
 
-The check runs at compile time, so it cannot see every operation. A handler may be partial, and an operation it omits can still find no handler at run time. That operation panics (§4.7.1 *Completeness and auto-delegation*).
+A partial handler adds its effect to the row at its `with` (§4.7.1, *The clause row*), so this check reports a partial handler that has no outer handler for its effect. An operation call that finds no handler at run time still panics (§4.7.1 *Completeness and auto-delegation*).
 
 ---
 
@@ -1896,11 +1896,11 @@ with handler_a, handler_b, handler_c {
 }
 ```
 
-If two handlers cover the same effect, the leftmost wins (innermost-scope semantics). This is deterministic and predictable.
+Items nest from left to right (see *Disambiguation rules* below), so the rightmost item is the innermost one. If two handlers cover the same effect, the rightmost wins. This is deterministic and predictable.
 
 #### Handlers are values
 
-Handlers are first-class values. They can be stored in variables, passed as arguments, and returned from functions:
+Handlers are first-class values. They can be stored in variables, passed as arguments, and returned from functions. The type of a handler can name the effects that its operation bodies perform outside the handler (see *The clause row* in §4.7.1):
 
 ```blink
 fn make_test_env() -> (Handler[DB], Handler[IO]) {
@@ -1977,7 +1977,7 @@ The type of a `with` item decides what the item does. A `with` item has one of t
 
 | Item type | Meaning |
 |-----------|---------|
-| `Handler[E]` | Install the handler for `E`, run the body, uninstall the handler. |
+| `Handler[E]` or `Handler[E ! R]` | Install the handler for `E`, run the body, uninstall the handler. The enclosing code must hold `R` (§4.7.1, *The clause row*). |
 | A scoped value: `T` where `T: Scoped`, which includes every `Closeable` type (§4.7.2) | Call `enter()`. If `T.Context` is `Handler[E]` with a concrete `E`, install the handler that `enter()` returned. Run the body. Uninstall that handler. Call `exit(ok)`. |
 
 `arena` is a keyword item with its own typing rule (§5.2). A `handler E { ... }` expression has type `Handler[E]`, so it takes the first rule.
@@ -2011,6 +2011,8 @@ with db.transaction() as tx {
 The typing rule and evaluation order for a scoped value are in §4.7.2, *Scoped effect handlers*.
 
 **Comma-separated items nest from left to right.** `with a, b { body }` means `with a { with b { body } }`. The compiler evaluates and type-checks item *i* after items *0..i-1* are entered and their handlers installed, so a later item can use an effect that an earlier item installs. Teardown is LIFO. If item *i* fails through `?`, the `?` fires before item *i* is entered, and the normal unwind of items *0..i-1* runs their `exit(false)` or `close()` (§4.7.2, *Catchable unwind*; §5.5, *Multiple resources*).
+
+The rightmost item is the innermost. In `with a, b { body }`, `b` is inside `a`: an operation of `b` that forwards reaches `a` first (§4.7.1, *The clause row*), and `b` wins over `a` for an effect that both handle. The clause row of each item is checked where the item is installed. The row `R_a` of `a` is checked against the row of the enclosing code. The row `R_b` of `b` is checked against the row of the enclosing code plus the effect that `a` handles.
 
 All forms can appear in the same comma-separated `with`:
 
@@ -2059,11 +2061,11 @@ fn good_example() ! FS, Async {
 
 ### 4.7.1 Handler Type System
 
-`Handler[E]` is a compiler-known generic type parameterized by an effect. It is the type of values produced by `handler E { ... }` expressions. At the source level, `Handler[E]` is a single type constructor.
+`Handler[E]` is a compiler-known generic type parameterized by an effect. It is the type of values produced by `handler E { ... }` expressions. At the source level, `Handler[E]` is a single type constructor. A handler type is `Handler[E]` or `Handler[E ! R]`, where the optional `! R` is the clause row (see *The clause row* below).
 
 #### Type identity
 
-`Handler[E]` is parameterized by a concrete effect. `Handler[DB]`, `Handler[IO]`, and `Handler[Net.Connect]` are distinct types. The type parameter must be a declared effect — `Handler[Int]` is a compile error:
+`Handler[E]` is parameterized by a concrete effect. `Handler[DB]`, `Handler[IO]`, and `Handler[Net.Connect]` are distinct types. `Handler[DB]` and `Handler[DB ! IO.Log]` also differ, because the clause row is part of the type. The type parameter must be a declared effect — `Handler[Int]` is a compile error:
 
 ```
 error[InvalidHandlerTypeParam]: invalid handler type parameter
@@ -2073,6 +2075,72 @@ error[InvalidHandlerTypeParam]: invalid handler type parameter
   |                ^^^ `Int` is not an effect
   |
   = note: Handler[E] requires E to be a declared effect
+```
+
+#### The clause row
+
+A handler type is `Handler[E]` or `Handler[E ! R]`. `R` is the **clause row**: the effects that the operation bodies of the handler perform outside the handler. `Handler[E]` means that `R` is empty. `R` is a concrete effect row, written as on a function type (§4.15.1). In a parameter type it can also be `_` (§4.15.2). The compiler infers `R` for a `handler E { ... }` expression.
+
+`R` is part of the type, in the way the row of a function type is part of that type. A value of type `Handler[E ! R1]` fits where `Handler[E ! R2]` is expected only if every effect of `R1` is in `R2`. This is the same rule as for function types (§4.15.1). `Handler[DB]` fits where `Handler[DB ! IO.Log]` is expected. The reverse is a type error. Projection (*Effect projection* below) keeps `R`.
+
+**What `R` holds.** The body of an operation does not get `E` added to its row. Each of these performs `E` outside the handler, and `E` goes in `R`:
+
+- `default.op(args)` in an operation body.
+- A call through the handle of `E` in an operation body. A handler does not handle its own operations (below), so such a call reaches the same place as `default.op(args)`.
+- An omitted primitive operation. It forwards as if `default.op(args)` were written (below).
+
+An omitted derived operation adds nothing, because its body runs at the call site. A call that an operation body makes through another effect, such as `io.log`, also goes in `R`. It reaches the handlers in force where the operation runs. Handlers of other effects stay in force.
+
+**Where a forward goes.** A forward is a `default.op(args)` call, a call through the handle of `E` in an operation body, or an omitted primitive operation. A forward reaches the handler in force for `E` at the `with` that installed this handler. A handler value that leaves the block where it was built forwards to the handler in force where it is installed, not where it was built.
+
+**Charge at the `with`.** Let `h` have the type `Handler[E ! R]`. Then `with h { body }` needs `R` in the row of the enclosing code. That row is the row of the fn plus the effects that enclosing `with` items install. A missing effect is `UndeclaredEffect` (E0500) at the `with` item. A note points at the call in the operation body that performs the effect, such as the `default.op` call, or at the handler head for an omitted primitive operation. A function with no `!` in its signature therefore cannot reach a real effect through a handler (§4.1):
+
+```blink
+pub fn needs_print() ! IO.Print {
+    io.println("x")
+}
+
+pub fn deleg() {
+    let h = handler IO.Print {
+        fn print(msg: Str) { default.print(msg) }
+        fn print_no_nl(_msg: Str) { }
+    }
+    with h {            // error: `h` performs `IO.Print` outside the handler
+        needs_print()
+    }
+}
+```
+
+```
+error[UndeclaredEffect]: undeclared effect
+  --> deleg.bl:10:10
+   |
+10 |     with h {
+   |          ^ handler `h` performs `IO.Print` outside the handler
+   |
+  ::: deleg.bl:7:30
+   |
+ 7 |         fn print(msg: Str) { default.print(msg) }
+   |                              ------- this call forwards to the enclosing handler
+   |
+   = note: function `deleg` declares no effects
+   = fix: add `IO.Print` to the signature:
+   |
+ 5 | pub fn deleg() ! IO.Print {
+   |                 +++++++++
+```
+
+When the declared return type of a factory is narrower than the row that the handler expression has, the type mismatch carries a fix. The fix writes the inferred row in the declared type:
+
+```
+error[TypeError]: mismatched types
+ --> db.bl:1:30
+  |
+1 | fn logging_db(label: Str) -> Handler[DB] {
+  |                              ^^^^^^^^^^^ expected `Handler[DB]`, found `Handler[DB ! DB, IO.Log]`
+  |
+  = note: the operations of this handler perform `DB, IO.Log` outside the handler
+  = fix: write the row in the declared type: `Handler[DB ! DB, IO.Log]`
 ```
 
 #### First-class values
@@ -2112,12 +2180,14 @@ fn make_handler(config: Config) -> Handler[DB] {
 }
 
 // Pass as function argument
-fn run_with(h: Handler[DB]) ! DB {
+fn run_with(h: Handler[DB ! _]) ! _ {
     with h {
-        do_work()
+        do_work()   // do_work has the row `! DB`; `with h` discharges DB
     }
 }
 ```
+
+Here `run_with` takes any handler for `DB`. The clause row of the argument becomes part of the row of the call (§4.15.2, *Handler parameters*).
 
 A handler value can be stored beyond the scope that created it. It never becomes a dangling reference.
 
@@ -2153,10 +2223,10 @@ error[InsufficientHandlerCoverage]: insufficient handler coverage
 
 #### Completeness and auto-delegation
 
-Handlers may be **partial**: a handler can omit operations of its effect. An operation that has no body in the effect declaration is a **primitive operation**. An operation that has a body in the effect declaration is a **derived operation** (the `Net.Connect` verbs in §4.4.1 are derived operations over the primitive `request`). An omitted primitive operation forwards to the enclosing handler as if `default.op(args)` were written:
+Handlers may be **partial**: a handler can omit operations of its effect. An operation that has no body in the effect declaration is a **primitive operation**. An operation that has a body in the effect declaration is a **derived operation** (the `Net.Connect` verbs in §4.4.1 are derived operations over the primitive `request`). An omitted primitive operation forwards to the enclosing handler as if `default.op(args)` were written. The forward performs the effect outside the handler, so the effect is in the clause row (*The clause row* above). A handler that forwards, or whose operation bodies call other effects, has that row in its type:
 
 ```blink
-fn logging_db(label: Str) -> Handler[DB] {
+fn logging_db(label: Str) -> Handler[DB ! DB, IO.Log] {
     handler DB {
         fn read(query: Template[DB]) -> Result[List[Row], DBError] {
             io.log("{label}: read {query}")
@@ -2184,7 +2254,7 @@ fn mock_net(responses: Map[Str, Str]) -> Handler[Net.Connect] {
     }
 }
 
-fn logging_get() -> Handler[Net.Connect] {
+fn logging_get() -> Handler[Net.Connect ! Net.Connect, IO.Log] {
     handler Net.Connect {
         fn get(url: Str) -> Result[Response, NetError] {
             io.log("GET {url}")
@@ -2205,7 +2275,7 @@ fn main() ! Net, IO {
 
 In `main`, the innermost `Net.Connect` handler is `mock_net`. It omits `get`, so the `get` body from the effect declaration runs, and its `net.request(...)` reaches `mock_net`. The program does not search the outer handlers for a `get` clause, so `logging_get` does not run. The innermost handler alone decides what a derived operation does.
 
-`default` is a contextual name, not a keyword. In the body of a handler operation, `default.op(args)` delegates to the handler that this operation's handler was installed over. Elsewhere, including in a closure written inside an operation body, an unshadowed use of `default` is a compile error (E0544). A local binding named `default` shadows it.
+`default` is a contextual name, not a keyword. In the body of a handler operation, `default.op(args)` delegates to the handler in force for the effect at the `with` that installed this handler (see *The clause row*). Elsewhere, including in a closure written inside an operation body, an unshadowed use of `default` is a compile error (E0544). A local binding named `default` shadows it.
 
 ```blink
 effect Audit {
@@ -2226,7 +2296,7 @@ error[DefaultOutsideHandlerOp]: `default` is only valid inside a handler operati
 8 |     default.record("x")   // error: not in a handler operation
   |     ^^^^^^^
   |
-  = help: `default` forwards to the handler that the enclosing operation's handler was installed over
+  = help: `default` forwards to the handler in force for the effect at the `with` that installed the enclosing operation's handler
   = help: to call the effect from ordinary code, use its handle: `audit.record("x")`
 ```
 
@@ -2257,7 +2327,7 @@ error[DefaultOutsideHandlerOp]: `default` is not valid inside a closure, even in
 
 The second help line follows from the next rule. There is no machine-applicable fix, because a closure that runs after the operation has returned does not reach the same handler.
 
-**A handler does not handle its own operations.** While an operation body of a handler runs, that handler is not in force for the effect it handles. Every call through the effect's handle made while the body runs reaches the handler that this operation's handler was installed over. This holds whether the call is written in the body, in a closure that the body calls, or in a function that the body calls. Handlers of other effects stay in force. In an operation body, `audit.record(m)` and `default.record(m)` therefore do the same thing, and the closure above can be written as:
+**A handler does not handle its own operations.** While an operation body of a handler runs, that handler is not in force for the effect it handles. Every call through the effect's handle made while the body runs reaches the handler in force for the effect at the `with` that installed this operation's handler. This holds whether the call is written in the body, in a closure that the body calls, or in a function that the body calls. Handlers of other effects stay in force. In an operation body, `audit.record(m)` and `default.record(m)` therefore do the same thing, and the closure above can be written as:
 
 ```blink
 with handler Audit {
@@ -2271,9 +2341,9 @@ with handler Audit {
 
 When the operation returns or panics, the handler is in force again. A closure that runs after the operation has returned performs its effects with the handlers in force where it is called (§4.15.4). If no outer handler implements the operation, the call panics, as below.
 
-Auto-delegation means a `Handler[DB]` that only overrides `read` is still a complete `Handler[DB]` — the type system does not distinguish partial from total handlers. At runtime, an omitted primitive operation goes to the nearest enclosing handler that implements it.
+Auto-delegation means a handler that only overrides `read` is still a complete handler for `DB`. Its type is `Handler[DB ! DB]`, because the omitted `write` and `admin` forward. The type system does not track which operations a handler omits. It tracks only the clause row. At runtime, an omitted primitive operation goes to the nearest enclosing handler that implements it.
 
-When no enclosing handler implements the operation, the operation panics. This happens when a partial handler omits it and no outer handler implements it, or when a handler calls `default.op(args)` with no outer handler. The compile-time check at the roots (§4.6 *Unhandled user effects*, §2.20) does not rule this out, because it sees a partial handler as a complete one:
+When no enclosing handler implements the operation, the operation panics. This happens when a partial handler omits it and no outer handler implements it, or when a handler calls `default.op(args)` with no outer handler. For a user effect, the compile-time check at the roots (§4.6 *Unhandled user effects*, §2.20) sees the forward, because the clause row of the partial handler holds the effect. The `with` of such a handler is an error at a root that has no outer handler for the effect:
 
 ```blink
 effect Cache {
@@ -2281,21 +2351,23 @@ effect Cache {
     fn put(key: Str, value: Int)
 }
 
-fn read_only_cache() -> Handler[Cache] {
+fn read_only_cache() -> Handler[Cache ! Cache] {
     handler Cache {
         fn get(key: Str) -> Option[Int] { None }
-        // put omitted -- auto-delegates, but no outer handler implements it
+        // put omitted -- auto-delegates, and no outer handler implements it
     }
 }
 
 fn main() {
-    with read_only_cache() {
-        cache.put("hits", 1)   // panics: no handler for `cache.put`
+    with read_only_cache() {   // error E0539: `Cache` is not discharged outside this handler
+        cache.put("hits", 1)
     }
 }
 ```
 
-The operation never returns and never produces a default value, whatever its return type, `-> Never` included. The panic message contains the operation as a program calls it, `<handle>.<op>` (here `cache.put`; handles are described in §4.4). The rest of the message and the source location are not specified, so a test matches on the operation: `assert_panics(matching: "cache.put") { ... }` (§2.20).
+The run-time rule stays: a call that reaches no handler panics.
+
+The operation never returns and never produces a default value, whatever its return type, `-> Never` included. The panic message contains the operation as a program calls it, `<handle>.<op>` (for example `cache.put`; handles are described in §4.4). The rest of the message and the source location are not specified, so a test matches on the operation: `assert_panics(matching: "cache.put") { ... }` (§2.20).
 
 #### Whole-handler effects: `@handle_all`
 
@@ -2314,7 +2386,7 @@ effect Dice {
 When a handler expression for a marked effect omits a primitive operation of the effect that it handles, the compiler gives the warning `PartialHandler` (W0545). A derived operation never counts, because the effect declaration supplies its body. A handler for a sub-effect counts only the operations of that sub-effect. A handler for a parent effect counts the operations of a marked sub-effect only if it implements one or more of them: a `handler IO { ... }` that implements only `print` gets no warning, and one that implements `read_line` but not `read_bytes` does. The warning is about the handler expression, so it fires in all code, not only in tests:
 
 ```blink
-fn always_high() -> Handler[Rand] {
+fn always_high() -> Handler[Rand ! Rand] {
     handler Rand {
         fn int(lo: Int, hi: Int) -> Int { hi }
     }
@@ -2517,13 +2589,13 @@ with db.connect(":memory:")? {
 
 Steps 5 and 6 run on every catchable unwind, as for every scoped value. `exit()` runs after the uninstall, with the outer handlers in place. A `db.*` call inside `exit()` therefore goes to the outer `DB` handler, not to the one this item installed. Use `self` in `exit()`.
 
-**Typing rule.** The item discharges `E` from the effect row of the body. `enter()` and `exit()` are checked against the outer effect row:
+**Typing rule.** The item discharges `E` from the effect row of the body. `enter()` and `exit()` are checked against the outer effect row. When `Context` is `Handler[E ! R]`, the outer row also holds `R` (§4.7.1, *The clause row*):
 
 ```
-Γ ⊢ e : T    T : Scoped    T.Context ≡ Handler[E]
+Γ ⊢ e : T    T : Scoped    T.Context ≡ Handler[E ! R]
 Γ ⊢ body : U ! ρ ∪ {E}
 ───────────────────────────────────────────────
-Γ ⊢ with e { body } : U ! ρ ∪ eff(enter) ∪ eff(exit)
+Γ ⊢ with e { body } : U ! ρ ∪ R ∪ eff(enter) ∪ eff(exit)
 ```
 
 The rule applies only when `T.Context` normalizes to `Handler[E]` with a concrete `E` at the `with` site. In generic code such as `fn run[T: Scoped](t: T) { with t { } }`, `Context` is abstract: the item installs no handler and discharges no effect. `enter()` and `exit()` still run, and the compiler discards the `Context` or binds it to the `as` name. There are no effect-kinded generics in v1 (§4.7.1), so `E` is always concrete where the rule applies.
@@ -2694,7 +2766,7 @@ In current ecosystems, `npm install` grants a package the full authority of the 
 Capabilities can be narrowed but never widened. A handler that receives `Net.Connect` can restrict it to a subset of allowed behaviors:
 
 ```blink
-fn restricted_net(allowed_hosts: List[Str]) -> Handler[Net.Connect] {
+fn restricted_net(allowed_hosts: List[Str]) -> Handler[Net.Connect ! Net.Connect] {
     handler Net.Connect {
         fn request(req: Request) -> Result[Response, NetError] {
             let host = parse_host(req.url)
@@ -3382,11 +3454,37 @@ fn logged_map[U](self, label: Str, f: fn(T) -> U ! _) -> Iterator[U] ! IO.Log, _
 
 Here `! IO.Log, _` means: this function always requires `IO.Log` (for its own logging), plus whatever the callback needs.
 
+**Handler parameters.** A handler parameter can carry the wildcard in its clause row (§4.7.1, *The clause row*). `Handler[E ! _]` forwards the effects that the operation bodies of the handler perform:
+
+1. `Handler[E ! _]` may appear only where `fn(..) ! _` may: in a parameter type of a function whose own row has `_`.
+2. Inside the callee, `_` is opaque. `with h` is charged `_`, as a call of a `fn() ! _` parameter is.
+3. At each call site, `_` is one union of the rows of all the `! _` arguments: the rows of the closures and the clause rows of the handlers. A handler with an empty clause row adds nothing.
+4. Projection (§4.7.1) keeps the clause row and runs before the union.
+5. The row is never reduced. The caller is charged the full row of each argument (the row of a closure or the clause row of a handler), even when the callee discharges part of it with an inner `with`. This holds the same for closure arguments and handler arguments.
+6. If the caller lacks an effect of the union, E0500 fires at the argument, with the same message shape as for closures.
+
+```blink
+fn run_job(job: fn() -> () ! _, h: Handler[DB ! _]) ! _ {
+    with h {
+        job()
+    }
+}
+
+fn nightly() ! DB, IO.Log {
+    run_job(fn() { io.log("start") }, logging_db("nightly"))
+    // _ = IO.Log (the closure) + DB, IO.Log (the clause row of logging_db)
+}
+
+fn bad_nightly() ! IO.Log {
+    run_job(fn() { io.log("start") }, logging_db("nightly"))   // ERROR E0500: missing DB
+}
+```
+
 #### 4.15.3 Call-Site Resolution
 
 - **Concrete effect function types** (`fn(T) -> U ! IO.Log`): The caller must hold the required effects at the call site.
 
-- **Wildcard forwarding** (`! _`): `_` resolves at each call site to the concrete effects of the callback argument.
+- **Wildcard forwarding** (`! _`): `_` resolves at each call site to the concrete effects of the callback argument. A `Handler[E ! _]` argument counts with its clause row (§4.15.2, *Handler parameters*).
 
 - **Pure callbacks in wildcard positions**: When a pure callback is passed to a `! _` function, `_` resolves to the empty effect set. The function is pure at that call site.
 

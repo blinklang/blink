@@ -1646,7 +1646,7 @@ The `with` keyword serves two roles. The compiler tells them apart by the type o
 
 | Item type | Meaning |
 |-----------|---------|
-| `Handler[E]` | Effect handler: install it for the body |
+| `Handler[E]` or `Handler[E ! R]` | Effect handler: install it for the body (§4.7.1, *The clause row*) |
 | A scoped value (`Scoped`, which includes every `Closeable` type) | Enter the value, run the body, exit the value (§4.7) |
 
 `as name` only binds a name. It never changes what the item does. Without `as`, the compiler discards the bound value. The full rules are in §4.7.

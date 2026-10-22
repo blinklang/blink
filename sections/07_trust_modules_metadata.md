@@ -71,7 +71,7 @@ effect Clock {
 fn raw_clock() -> Int ! Time.Read
 
 // The real implementation calls C; a test installs its own `handler Clock`.
-pub fn real_clock() -> Handler[Clock] {
+pub fn real_clock() -> Handler[Clock ! Time.Read] {
     handler Clock {
         fn cpu_ticks() -> Int {
             raw_clock()

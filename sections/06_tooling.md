@@ -1149,7 +1149,7 @@ test "scheduled job logs progress with mocked clock and env" {
 }
 ```
 
-Each handler intercepts only its own effect; auto-delegation forwards the rest. The handler ordering follows the leftmost-wins rule from §4 — handlers earlier in the `with` clause take precedence for any effect operation either could service.
+Each handler intercepts only its own effect; auto-delegation forwards the rest. The handler ordering follows the nesting rule from §4.7: items nest from left to right, so the rightmost item is the innermost, and it takes precedence for any effect operation either could service.
 
 ##### `record_calls[E]` — rejected outright
 
