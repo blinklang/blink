@@ -346,6 +346,8 @@ Measured: a module `fn Some()` or `fn Less()` is accepted, and the prelude varia
 
 A bare variant is not a function value today: `let f = Leaf` gives "`f` has type Wrap, which is not a function", and `let c: Color = Red` with a `fn Red` in scope gives the C error `_cg_fn_value1`. Proposal 1 does not make a variant a function value. The C error is a separate codegen bug and should get its own ticket.
 
+*Later note:* the ruling *Payload variants as fn values* ([variant-fn-value.md](variant-fn-value.md)) closes this item. A variant with a positional payload, named with no argument list, is now a function value.
+
 **Preference**
 
 Proposal 1. Then the prelude sub-question as error.

@@ -2464,6 +2464,8 @@ error[VariantSpread]: a variant literal cannot copy fields with `..s`
 
 A variant brace literal, and a variant paren payload whose arguments are all labelled, follow the field rules of §2.14 *Checking a Literal's Fields*: `NoSuchField`, `DuplicateField` and `MissingField`. For a labelled paren payload these take the place of the argument-count error, so `Figure.Circle(radius: 1.0, radius: 2.0)` reports `DuplicateField` at the second `radius` and `MissingField` for `tag`, not a count. A paren payload with a positional argument keeps the argument-count `TypeError` (E0300), with a `note:` that lists the variant's fields in order.
 
+A variant with a positional payload, written with no argument list, is a function value (§3.4 *A payload variant named as a value*).
+
 `blink fmt` does not canonicalize between the bare and qualified forms in either direction — a formatter must never change which entity a name resolves to.
 
 #### Enums Are Nominally Distinct from `Int`
@@ -2718,6 +2720,90 @@ fn main() {
 The first `help:` names the **annotation**, not a bracket form. Brackets on a callee supply type arguments to a *call*; this position has no call, so there is nothing for them to attach to. Writing them anyway — `let f = identity[Int]` — is `error[TypeArgsWithoutCall]` (E0314, §3.4 *Postfix Brackets That Are Not a Type Application*).
 
 *Rationale.* The rule this replaces refused `apply(identity, 3)` and accepted `let f = identity` followed by `apply(f, 3)` — the same value, one line apart, separated by where it was written rather than by anything about its type. A rule that distinguishes a term from its own η-expansion is a syntactic filter standing in a typing rule's position, and its prescribed repair — wrapping the name in a closure — means the same program. It refused one spelling of an identical program, it was defeated by one `let`, and it has been deleted rather than restated.
+
+**A payload variant named as a value.** A variant with a positional payload, written with no argument list, is a function value. It may stand wherever a function value is expected, as a generic function's name may. A variant `V(P1, ..., Pn)` of the enum `E[ᾱ]` has the type `fn(P1, ..., Pn) -> E[ᾱ]`: one parameter for each payload type, in declaration order, and an empty effect row. A payload of two or more types gives that many parameters, not one tuple parameter. The binders `ᾱ` are the type parameters of the enum, and the rule above solves them: the expected type fixes them, and a reference whose binders nothing fixes is `error[CannotInferType]` (E0301) at the reference.
+
+The rule covers the prelude variants and user variants alike. `Some` is `fn(T) -> Option[T]`, `Ok` is `fn(T) -> Result[T, E]`, and `Err` is `fn(E) -> Result[T, E]`. `Option.Some`, `Result.Ok` and `Result.Err` are the same values. A user variant is qualified, as in every expression: a bare `Leaf` is still `error[UnqualifiedVariant]` (E0554, *Variant Construction*), and this rule does not apply to it.
+
+```blink
+type Tree {
+    Leaf(Int)
+    Node(Tree, Tree)
+    Empty
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    let opts = xs.map(Some)                         // OK -- fn(Int) -> Option[Int]; map's parameter fixes T = Int
+    let leaves = xs.map(Tree.Leaf)                  // OK -- fn(Int) -> Tree
+    let tree = leaves.fold(Tree.Empty, Tree.Node)   // OK -- fn(Tree, Tree) -> Tree: two parameters
+    let f: fn(Int) -> Option[Int] = Some            // OK -- the annotation fixes T = Int
+    let rs: List[Result[Int, Str]] = xs.map(Ok)     // OK -- the annotation fixes E = Str
+}
+```
+
+`let f = Some` has no expected type, so nothing fixes `T`. In `xs.map(Ok)`, the parameter of `map` fixes `T`, but nothing fixes `E`. Each is E0301 at the reference, and the help names an annotation that fixes the binders:
+
+```blink
+fn main() {
+    let xs = [1, 2, 3]
+    let f = Some                  // error[CannotInferType] -- intentional-error example
+                                  //   `T` of `Some` is unbound at this reference and nothing supplies it
+                                  // help: annotate the binding:
+                                  //   `let f: fn(Int) -> Option[Int] = Some`
+    let rs = xs.map(Ok)           // error[CannotInferType] -- intentional-error example
+                                  //   `E` of `Ok` is unbound at this reference and nothing supplies it
+                                  // help: annotate the binding:
+                                  //   `let rs: List[Result[Int, Str]] = xs.map(Ok)`
+}
+```
+
+A labelled positional payload drops its labels, as every function value does (§2.13 *Limit of the guard*). For `Circle(radius: Float, tag: Int)` of `Figure`, `Figure.Circle` is `fn(Float, Int) -> Figure`.
+
+Three forms are not this function value:
+
+- **A variant with named fields** (a brace payload) is not a function value. It has no positional form, so it names no function. Naming it with no brace literal is `error[TypeError]` (E0300), and the help writes a closure.
+- **A variant with no payload** is a value of its enum, never `fn() -> E`. Where a function is expected, it is a type mismatch (E0300), and the help writes a closure that returns the variant.
+- **`Ok` as a value** is only the one-parameter function `fn(T) -> Result[T, E]`. Where `fn() -> Result[(), E]` is expected, it is a type mismatch (E0300), and the help writes `fn() { Ok(()) }`.
+
+A wrong number of parameters is also a type mismatch (E0300): `Tree.Node` has two parameters, so it does not fit `fn(Tree) -> Tree`, and it does not fit a function of one tuple parameter.
+
+```blink
+type Tree {
+    Leaf(Int)
+    Node(Tree, Tree)
+    Empty
+}
+
+type Shape {
+    Circle { radius: Float }
+    Point
+}
+
+type Color { Red, Green }
+
+fn later(f: fn() -> Color) -> Color { f() }
+
+fn main() {
+    let ss = [1.0, 2.0].map(Shape.Circle)       // error[TypeError] -- intentional-error example
+                                                // help: write `fn(r) { Shape.Circle { radius: r } }`
+    let c = later(Color.Red)                    // error[TypeError]: a type mismatch -- intentional-error example
+                                                // help: write `fn() { Color.Red }`
+    let k: fn() -> Result[(), Str] = Ok         // error[TypeError]: a type mismatch -- intentional-error example
+                                                // help: write `fn() { Ok(()) }`
+    let g: fn(Tree) -> Tree = Tree.Node         // error[TypeError]: a type mismatch -- intentional-error example
+    let pairs = [(Tree.Empty, Tree.Empty)]
+    let ts = pairs.map(Tree.Node)               // error[TypeError]: a type mismatch -- intentional-error example
+                                                //   `map` expects a function of one `(Tree, Tree)` parameter
+}
+```
+
+```
+error[TypeError]: variant `Shape.Circle` has named fields and is not a function value
+  help: write `fn(r) { Shape.Circle { radius: r } }`
+```
+
+*Rationale.* `Some` and `fn(x) { Some(x) }` are the same term, so the rationale above applies word for word: a rule that refused `xs.map(Some)` would refuse one spelling of an identical program. A brace payload has no call form, so no one closure is equal to it. A variant with no payload is a value, not a function: `Color.Red` and `fn() { Color.Red }` are different terms.
 
 **Where the error is reported.** `error[CannotInferType]` (E0301) is reported **where its repair attaches**. For an under-determined *binding* that is the `let` (§3.4 *Under-Determined Types*). For a type parameter with no source it is the call's type-argument position, because that is where the brackets go — including when the call stands alone as a statement and there is no binding to annotate:
 
