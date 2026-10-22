@@ -52,12 +52,11 @@ Never           // The bottom type. No values. The type of code that cannot fini
 
 // Collections
 List[T]         // Growable ordered sequence
-[T]             // Shorthand -- [Str] is List[Str]
 Map[K, V]       // Hash map
 Set[T]          // Hash set
 
 // Core ADTs (defined in stdlib, special compiler support)
-Option[T]       // Some(value) | None
+Option[T]       // Some(value) | None. Written T? in a type
 Result[T, E]    // Ok(value) | Err(error)
 ```
 
@@ -106,9 +105,45 @@ When a trait bound fails because `Never` has no impl of the trait (E0306), the e
 
 **Why `Float` not `F32`/`F64`.** Same reasoning. 64-bit is correct for virtually all floating-point work. If you need 32-bit floats (GPU interop, large arrays where memory matters), that's a future extension, not a v1 concern.
 
-**Why `[T]` sugar for `List[T]`.** Lists are the most common generic type. `[Str]` is 5 characters. `List[Str]` is 9. The sugar is unambiguous (square brackets in type position always mean List) and saves tokens in signatures that use lists heavily. Both forms are valid; the canonical formatter normalizes to whichever the project chooses.
+**One Spelling for List and Option Types.** Each of these types has one spelling in a type position (Principle 2):
 
-**Why `Option` and `Result` are built-in.** These aren't library types bolted on after the fact. The compiler understands them: `T?` desugars to `Option[T]`, the `?` operator desugars to a match on `Result`, `??` desugars to a match on `Option`. Special syntax demands special compiler support.
+| Type | Spelling | Not a spelling |
+|------|----------|----------------|
+| List of `T` | `List[T]` | `[T]` |
+| Option of `T` | `T?` | `Option[T]` |
+
+A type position is a parameter, return, field, `let` or type alias annotation, a type argument inside another type, and an explicit type-argument list at a call.
+
+- **`[T]` in a type** is `ListTypeBrackets` (W1120). A generic binder list (`fn f[T]`, `impl[T]`) is not a type. The machine-applicable fix writes `List[T]`. In an expression, square brackets keep their meaning: `[1, 2]` is a list literal and `[..a, ..b]` is a spread.
+- **`Option[T]` in a type** is `OptionTypeLongForm` (W1121). The machine-applicable fix writes `T?`, also inside other types: `List[Option[Int]]` becomes `List[Int?]`, and `f[Option[Int]](x)` becomes `f[Int?](x)`.
+- **`Option` stays a name.** A path (`Option.Some`), the self type of an `impl` header, a trait bound and prose keep the name `Option`. Only the type positions above take `T?`.
+- **`?` is a type suffix.** It applies to the type before it: `List[Int]?` is an optional list, `List[Int?]` is a list of optional values, and `(Int, Str)?` is an optional tuple.
+- **Nested Option.** The type parser reads a `??` token as two `?` suffixes, so `Int??` is `Option[Option[Int]]`. In an expression, `??` stays the defaulting operator.
+- **Identity.** `T?` names the compiler-known `Option` by identity, so a user type named `Option` does not change it (§10.6 *Shadowing Rules*).
+- **Schedule.** W1120 and W1121 are warnings for one minor compiler release. The next minor release makes each an error with the same fix.
+
+`blink fmt` writes `List[T]` and `T?`. No setting picks another spelling. Diagnostics and their fixes print types the same way: `expected Str?, found Int`, and the E0301 fix `: List[T]`.
+
+```blink
+type Profile {
+    name: Str
+    tags: List[Str]
+    bio: Str?
+    scores: List[Int?]
+}
+
+fn first_tag(p: Profile) -> Str? {
+    p.tags.get(0)
+}
+
+fn lookup(cache: Map[Str, Int?], key: Str) -> Int?? {
+    cache.get(key)
+}
+```
+
+**Why one spelling.** Two spellings of one type is a choice with no effect on the program, and Principle 2 removes such choices. `T?` is the short form of the most common wrapper and the §2.2 locked spelling. `[T]` saved four characters, but it is the same text as a list literal and a generic binder, so `List[T]` stays the one list spelling. Making the long Option form a diagnostic, and not only a formatter rewrite, keeps one spelling in code that never goes through `blink fmt`. (Panel vote: see [Single Type Spellings rationale](../decisions/type-sugar-single-spelling.md).)
+
+**Why `Option` and `Result` are built-in.** These aren't library types bolted on after the fact. The compiler understands them: `T?` is the type-position spelling of `Option[T]`, the `?` operator desugars to a match on `Result`, `??` desugars to a match on `Option`. Special syntax demands special compiler support.
 
 **Stdlib API surface: methods only.** Built-in types expose their API exclusively through trait methods — `.len()`, `.split()`, `.push()`, `.write()`, etc. No function form of a built-in method exists. There is one way to call an operation on a built-in type: method syntax. Constructors use static method syntax on the type name (`Bytes.new()`, `StringBuilder.with_capacity(1024)`, `Duration.ms(100)`). This follows Principle 2 — no decision point between `s.len()` and `str_len(s)`. (Panel vote: 4-1. See [Stdlib API Surface rationale](../decisions/stdlib-api-surface.md).)
 

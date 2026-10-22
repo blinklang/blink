@@ -737,7 +737,7 @@ let name = match user.nickname {
 }
 ```
 
-`T?` is sugar for `Option[T]` in type position:
+`T?` is the one spelling of `Option[T]` in a type (§3.2 *One Spelling for List and Option Types*):
 
 ```blink
 type UserProfile {

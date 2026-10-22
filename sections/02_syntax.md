@@ -49,7 +49,8 @@ All decided through independent design and cross-team voting. None are revisitab
 | Comments | `//` line, `///` doc | No block comments. `///` produces structured data the compiler can query. |
 | Expression-oriented | Last expr is return value | No `return` needed for the final expression. `return` exists only for early exit. |
 | Keyword args | `fn f(a: T, *, b: U)` | Declaration-site `*` marker. Positional before, keyword after. Author decides — caller has no choice. Principle 2 preserved. |
-| Option sugar | `T?` for `Option[T]` | `Str?` means `Option[Str]`. Short in type position, universally understood. |
+| Option type | `T?` only | `Str?` is the one spelling of `Option[Str]` in a type. `Option[Str]` in a type is a diagnostic. Short in type position, universally understood. `Int??` is `Option[Option[Int]]`. See §3.2 *One Spelling for List and Option Types*. |
+| List type | `List[T]` only | `List[Str]`, never `[Str]`. Square brackets in a type are a diagnostic. See §3.2 *One Spelling for List and Option Types*. |
 | Option defaulting | `??` | `val ?? default` desugars to match on `Some`/`None`. Borrowed from Swift's nil-coalescing. |
 | Type names | `Str`, `Int`, `Bool`, `Float` | Short PascalCase. One casing rule for builtins and user types. Token-efficient — `Str` saves 3 chars over `String`, thousands of times per codebase. |
 | If/else | Expression, no parens | Always an expression. No parentheses around condition. Else mandatory when value is used. No `if let`. See [2.9](#29-ifelse-expressions). |
@@ -99,6 +100,17 @@ With universal interpolation, `"Hello, {name}!"` just works. When no `{expr}` is
 
 Holes evaluate left to right, and each hole's value is appended before the next hole starts: `"{next()} {next()}"` calls the first `next()` first (§2.22).
 
+**A hole does not start with `{`.** The first token of a hole's expression must not be `{`. Whitespace before that token does not change this. The rule applies to every string form at every depth: `"..."`, `t"..."`, `#"..."#`, `t#"..."#` and deeper. So `"a {{x}} b"` and `"a { {x} } b"` are compile error E1130 `InterpDoubleBrace`. They are not a hole that holds the block `{x}`. A block in a hole has the same value as its tail expression, so the rule removes no expression that a hole can hold. An expression that must start with a block goes in parentheses: `"{({ ... })}"`. The help names `\{` and `#"..."#` for a literal brace, and `( )` for a block. Inside `#"..."#` a lone `{` is literal text, so `#"{{x}}"#` is the text `{{x}}`, and `#"#{{x}}"#` is E1130.
+
+```blink
+fn main() {
+    let x = 5
+    io.println("a {x} b")     // a 5 b
+    io.println("a \{x} b")    // a {x} b
+    // io.println("a {{x}} b")  -- E1130 InterpDoubleBrace
+}
+```
+
 **Escape sequences.** Strings support the following backslash escapes:
 
 | Escape | Produces |
@@ -113,6 +125,8 @@ Holes evaluate left to right, and each hole's value is appended before the next 
 | `\"` | literal `"` |
 | `\{` | literal `{` (suppresses interpolation) |
 | `\}` | literal `}` |
+
+A bare `}` is literal text in every string form, so `\}` and `}` give the same character. Both are valid, and `blink fmt` keeps the spelling that the author wrote (§2.4.2).
 
 **Char literal escape sequences.** Char literals (`'x'`) share the common escapes with strings (`\n \r \t \\ \b \f \u{H}`). They do not accept `\{`, `\}` or `\"`, and they add `\0` and `\'`:
 
@@ -292,11 +306,17 @@ Rules:
 - Multi-line: extended strings can span multiple lines (newlines are literal)
 - Compile error E1110 if delimiter depth exceeds 3
 - Compile warning W1111 if `{identifier}` appears inside `#"..."#` without `#` prefix (likely forgotten interpolation)
+- Info diagnostic V1100 `EscapeHeavyString` on a `"..."` literal (not `t"..."`) when both are true:
+  1. The body has 3 or more of the escapes `\"`, `\{` and `\\`.
+  2. A `#"..."#` literal of depth 1 to 3 has the same value. This is false when the body has an escape that a `#"..."#` literal cannot write as its character (`\n`, `\r`, `\t`, `\b`, `\f`, `\u{H}`), or when the body's text holds the terminator or the hole opener of every depth up to 3.
 
-When to use which string form:
-- **`"..."`**: most strings — short text, strings needing `\n`/`\t` escapes, simple interpolation
-- **`#"..."#`**: strings with many `"` or `\` — JSON, code generation, regex, C string emission
-- **`#embed("path")`**: large text blobs — templates, documentation, SQL schemas
+  `\}` does not count toward the 3, and it does not stop the diagnostic. The machine-applicable fix writes the `#"..."#` literal at the smallest depth that fits. Each escape becomes its character, and each hole `{expr}` becomes a hole with that depth's opener (`#{expr}` at depth 1).
+- `blink fmt` does not change the kind or the body (escape spelling included) of a literal; the `EscapeHeavyString` fix does.
+
+**Which string form to use.** This rule is guidance for authors and tools, not a compile rule. `blink llms` and the diagnostic help texts copy it:
+- **`"..."`**: most strings — short text, strings that need `\n`/`\t` escapes, interpolation. For one or two literal braces, write `\{`.
+- **`#"..."#`**: text with `"` or `\`, or with many braces — JSON, regex, code generation, C string emission.
+- **`#embed("path")`**: large text — templates, documentation, SQL schemas.
 
 **Panel vote: 5-0** for extended delimiter strings. Parametric extension of existing string syntax (same `"` delimiter, same `Str` type), not a second string syntax. Locked "one string syntax" decision preserved. See [DECISIONS.md](../DECISIONS.md).
 
@@ -2178,7 +2198,7 @@ test "division by zero panics" {
 
 test "unwrap on empty list panics with the expected message" {
     assert_panics(matching: "unwrap called on None") {
-        let xs: [Int] = []
+        let xs: List[Int] = []
         let _ = xs.get(0).unwrap()
     }
 }
@@ -2477,7 +2497,7 @@ A property body may use `?` directly — a fallible call inside the property is 
 
 ```blink
 test "decoded bytes round-trip" {
-    prop_check(fn(raw: [U8]) {
+    prop_check(fn(raw: List[U8]) {
         let decoded = decode(encode(raw))?
         assert_eq(decoded, raw)
     })

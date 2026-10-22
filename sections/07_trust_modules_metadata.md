@@ -2489,7 +2489,7 @@ All built-in types are in the prelude. They are available in every module withou
 
 | Name | Description |
 |------|-------------|
-| `List[T]` | Growable ordered sequence. `[T]` is sugar for `List[T]` |
+| `List[T]` | Growable ordered sequence |
 | `Map[K, V]` | Hash map |
 | `Set[T]` | Hash set |
 
@@ -2497,7 +2497,7 @@ All built-in types are in the prelude. They are available in every module withou
 
 | Name | Description |
 |------|-------------|
-| `Option[T]` | Optional value type |
+| `Option[T]` | Optional value type. `T?` is its spelling in a type (§3.2 *One Spelling for List and Option Types*) |
 | `Some(T)` | `Option` variant: value present |
 | `None` | `Option` variant: value absent |
 | `Result[T, E]` | Success-or-error type |

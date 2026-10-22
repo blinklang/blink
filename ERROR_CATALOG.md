@@ -59,9 +59,11 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | E10xx | Module resolution / imports |
 | W10xx | Modules / manifest |
 | E11xx | Parser / lexer |
+| W11xx | Parser / type spelling |
 | E13xx | Refinement contracts (predicate sublanguage) |
 | E14xx | Generic collections / Hash + Eq bounds |
 | V00xx | Contract verification outcomes |
+| V11xx | String literal hints |
 | I00xx | Internal compiler errors (ICE) |
 
 ---
@@ -248,6 +250,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | MixedOperatorPrecedence | E1127 | An operand of an operator in one integer operator group (arithmetic, shift, `&`, `^`, `\|`) is a bare operator expression of a different group, e.g. `x << n + 1` or `x \| y & 3`. The `help:` line shows both groupings; the language server offers both rewrites, neither machine-applicable | Parser | §2.19 |
 | QualifierAliasAfterList | E1128 | `as` after a selective import list (`import b.x.{Q} as bx`); the qualifier alias goes between the path and the list. Machine-applicable fix writes `import b.x as bx.{Q}` and keeps the list, item aliases included; the import is then checked as fixed, with no second diagnostic for the order | Parser | §10.5 |
 | NonInitExpr | E1129 | The initializer of a module-level `let` or `let mut` is not a static expression: a call, a read of a module `let`, `if`/`match`/block/`with`, string interpolation, `return` or `?`. One diagnostic per initializer; primary span and label on the first part that is not static, secondary labels on the rest. Help gives the fix for the kind: compute in `main` or fill a `let mut` on first use (with its `State` cost), make the source a `const`, or move the code into a function | Type checking | §2.12.1 |
+| InterpDoubleBrace | E1130 | The first token of a string hole's expression is `{`, whitespace skipped, in every string form and depth: `"{{x}}"`, `"{ {x} }"`, `t"{{x}}"`, `#"#{{x}}"#`. `#"{{x}}"#` holds no hole and is not this error. Help: for a literal brace, write `\{` or use `#"..."#`; to start the expression with a block, wrap it in `( )` | Parser | §2.4 |
 | ModuleNotFound | E1200 | Import statement referenced a module that could not be found | Modules | §10.1 |
 | InvalidStringBackedEnum | E1201 | String-backed enum variant value is not a string literal | Type checking | §3 |
 | ContractPredicateNotDecidable | E1300 | Contract predicate uses construct outside SMT-decidable subset | Refinement contracts | §3b |
@@ -303,6 +306,8 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | ShadowedDependency | W1000 | An import matches both a module in the local `src/` and a dependency; the local module wins | Modules | §10.5 |
 | UnknownManifestSection | W1001 | A top-level `blink.toml` section that the spec does not define. Span on the `[header]`; help offers the nearest defined section (see *Conventions*). Promotable by `--strict` and `[lints]`. E1200 and E1052 add a `note:` that points at it when both fire in one build | Manifest | §8.9.8 |
 | ShadowedPreludeName | W1010 | A `type`, type alias, `trait` or `effect` declaration takes a compiler-known type name or prelude trait name that is not reserved; it shadows the builtin in its module. The `help:` line names the `import blink.core.{X as Y}` (or `blink.ffi`) escape | Modules | §10.6 |
+| ListTypeBrackets | W1120 | Square brackets with no name before them in a type position (`xs: [Int]`, `-> [Str]`, `Map[Str, [Int]]`). Machine-applicable fix writes `List[T]`. A list literal or spread in an expression is not this warning. For one minor compiler release; the next makes it an error with the same fix | Parser | §3.2 |
+| OptionTypeLongForm | W1121 | `Option[T]` in a type position: an annotation, a type argument inside another type, or an explicit type-argument list at a call. Machine-applicable fix writes `T?` (`List[Option[Int]]` → `List[Int?]`, `Option[Option[Int]]` → `Int??`). `Option` as a path (`Option.Some`), the self type of an `impl` header and a trait bound are not this warning. For one minor compiler release; the next makes it an error with the same fix | Type checking | §3.2 |
 | DeprecatedUsage | W2000 | Use of an item annotated `@deprecated` | Linting | §6 |
 
 ---
@@ -315,6 +320,7 @@ Info diagnostics never fail a build. They are silent in terminal output by defau
 |------|------|----------|----------|----------|
 | ContractProven | V0001 | The solver proved a contract; it has no runtime check | Contract verification | §3b.4 |
 | ContractRuntimeChecked | V0004 | A contract's outcome is Unknown and it has a runtime check; the source is `default`, `explicit` or `inherited(Trait.method)` | Contract verification | §3b.4 |
+| EscapeHeavyString | V1100 | A `"..."` literal (not `t"..."`) with 3 or more `\"`, `\{` and `\\` escapes, which a `#"..."#` literal of depth 1 to 3 writes with the same value. Machine-applicable fix: that literal at the smallest depth that fits. | String literals | §2.4.2 |
 
 ---
 
