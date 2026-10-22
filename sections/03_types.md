@@ -4455,7 +4455,7 @@ Y* = total ordering semantics. Unsigned types don't impl `Neg`. `Float` doesn't 
 
 `Option`, `Result`, `List`, `Set`, `Map` and tuples implement `Eq` when their parts do — see *Container Equality* below.
 
-**`Option` and `Result` instances.** `Option[T]` and `Result[T, E]` have the instances that `@derive` gives a user sum type with the same variants, for `Eq`, `Ord`, `Clone` and `Debug`. The bounds are the ones that *Generic Type Bound Inference* (§3.6.1) infers: `Option[T]` has the instance when `T` does, and `Result[T, E]` has it when `T` and `E` both do. *Container Equality*, *Ord for `Option` and `Result`* (below), *Clone Semantics* (§3.6.1) and *Debug vs Display* (§3.6.1) state each instance. `Hash` is not one of them: no container has a `Hash` impl (*Hash Contract and Seeding*). This rule does not cover JSON. The JSON instances of `Option` and the absence of one for `Result` are in the *Type Mapping* rows (§3.6.2).
+**`Option` and `Result` instances.** `Option[T]` and `Result[T, E]` have the instances that `@derive` gives a user sum type with the same variants, for `Eq`, `Ord`, `Clone` and `Debug`. The bounds are the ones that *Generic Type Bound Inference* (§3.6.1) infers: `Option[T]` has the instance when `T` does, and `Result[T, E]` has it when `T` and `E` both do. *Container Equality*, *Ord for `Option` and `Result`* (below), *Clone Semantics* (§3.6.1) and *Debug vs Display* (§3.6.1) state each instance. `Hash` is not one of them: no container has a `Hash` impl (*Hash Contract and Seeding*). This rule does not cover JSON. The JSON instances of `Option` and `Result` are in *Option and Result in JSON* (§3.6.2).
 
 #### Container Equality
 
@@ -6034,7 +6034,7 @@ unknown value "closed" for Status at $.status; expected one of: "open", "in_prog
 | `Bool` | `JsonValue.Bool` |
 | `Str` | `JsonValue.Str` |
 | `Option[T]` | `JsonValue.Null` for `None`, `T.to_json()` for `Some(v)`. Decode: `JsonValue.Null` is `None`, any other value is `T.from_json(j)` wrapped in `Some` |
-| `Result[T, E]` | No JSON form in v1: no `Serialize`, no `Deserialize` |
+| `Result[T, E]` | `{"Ok": v}` for `Ok(v)` and `{"Err": e}` for `Err(e)`. Decode: an object with exactly one entry, with the key `"Ok"` or `"Err"` |
 | `List[T]` | `JsonValue.Array` |
 | Struct with `@derive(Serialize)` | `JsonValue.Object` |
 | Enum with `@derive(Serialize)`, not Str-backed | Tagged object: `{"variant": "Name", "fields": {...}}` |
@@ -6042,7 +6042,7 @@ unknown value "closed" for Status at $.status; expected one of: "open", "in_prog
 
 ##### Option and Result in JSON
 
-The *Type Mapping* rows are the whole JSON rule for these two types. The rule of *Option and Result instances* (§3.6) does not apply to `Serialize` and `Deserialize`.
+The *Type Mapping* rows and the text below are the whole JSON rule for these two types. The rule of *Option and Result instances* (§3.6) does not apply to `Serialize` and `Deserialize`.
 
 **`Option[T]`.** `Option[T]` is `Serialize` when `T: Serialize`, and `Deserialize` when `T: Deserialize`. `to_json` gives `JsonValue.Null` for `None` and `T.to_json()` for `Some(v)`. `from_json` gives `Ok(None)` for `JsonValue.Null`. For any other value `j`, it gives `T.from_json(j)` with `Ok(v)` changed to `Ok(Some(v))`. An `Err` from `T.from_json` is the result as it is; `Option` adds no step to its `path`. An `Option[Float]` field that reads `null` as `None` (*NaN and Infinity*) is one case of this rule.
 
@@ -6091,19 +6091,41 @@ error[NonDerivableTrait]: cannot derive `Serialize` for `UserUpdate`
 
 `Patch[T]` derives with no error, and its JSON is the tagged-object row of the *Type Mapping* table. A PATCH body that must tell "absent" from "set to null" needs this enum.
 
-**`Result[T, E]`.** `Result` has no JSON form in v1. `Result[T, E]` implements neither `Serialize` nor `Deserialize`, for every `T` and `E`, `Result[T, Never]` included. `@derive(Serialize)` or `@derive(Deserialize)` on a type with a field whose type is, or holds, a `Result` is E1401 `NonDerivableTrait`. The `help:` writes the full enum, with the payload types of the field for `T` and `E`, with the variant names `Success` and `Failure`, and with the payload names `value` and `error`. The help never names a variant `Ok` or `Err`: a bare `Ok(x)` must keep its one meaning (§10.6 *Prelude Types*). For a field `outcome: Result[User, ApiError]`:
+**`Result[T, E]`.** `Result[T, E]` is `Serialize` when `T: Serialize` and `E: Serialize`, and `Deserialize` when `T: Deserialize` and `E: Deserialize`. `to_json` gives a `JsonValue.Object` with one entry: the key `"Ok"` and the value `v.to_json()` for `Ok(v)`, or the key `"Err"` and the value `e.to_json()` for `Err(e)`. The keys are the variant names as Blink spells them; case matters.
+
+`from_json` accepts a `JsonValue.Object` that has exactly one entry, with the key `"Ok"` or `"Err"`. For `"Ok"` it gives `T.from_json(j)` with `Ok(v)` changed to `Ok(Ok(v))`. For `"Err"` it gives `E.from_json(j)` with `Ok(e)` changed to `Ok(Err(e))`. An `Err` from the payload decode is the result as it is, and `Result` adds no step to its `path`. The first-entry rule for duplicate keys does not apply to `Result`: an object with two entries is an error, even when the keys are equal. Each of these inputs is a `JsonError`:
+
+- an object with no entry, with two or more entries, or with one entry whose key is not exactly `"Ok"` or `"Err"` (for example `"ok"`);
+- a value that is not an object.
+
+The `message` of that error names both keys `"Ok"` and `"Err"`, says that case matters, and contains `at <path>` (*JsonError*). The `path` is the position of the `Result` value.
+
+```blink
+import std.json
+
+@derive(Serialize, Deserialize)
+type Reply {
+    outcome: Result[Int, Str]
+}
+
+fn main() ! IO {
+    io.println(json.encode(Reply { outcome: Ok(7) }))        // {"outcome":{"Ok":7}}
+    io.println(json.encode(Reply { outcome: Err("busy") }))  // {"outcome":{"Err":"busy"}}
+
+    match json.decode[Reply]("{\"outcome\": {\"ok\": 1}}") {
+        Ok(_) => io.println("decoded")
+        Err(e) => io.println(e.message)
+    }
+}
+```
+
+The last call fails. The wording of the message is not fixed, but it has this content:
 
 ```
-  = help: Result has no JSON form in v1. Replace the field type with an enum
-          that has the payload types of the field:
-            @derive(Serialize, Deserialize)
-            type Outcome {
-                Success(value: User)
-                Failure(error: ApiError)
-            }
+expected an object with exactly one key, "Ok" or "Err" (case matters), at $.outcome
 ```
 
-The generic form of that enum is `type Outcome[T, E] { Success(value: T)  Failure(error: E) }`. Its JSON is the tagged-object row of the *Type Mapping* table. Adding a `Result` instance in a later version changes the meaning of no program that compiles today.
+A consumer that reads this JSON from another language checks the `"Ok"` key first: if `outcome` has the key `"Ok"`, the call succeeded and the value is the payload; otherwise it has the key `"Err"`.
 
 ##### Map and Set Order
 

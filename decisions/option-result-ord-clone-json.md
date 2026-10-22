@@ -12,9 +12,9 @@
 - **Q4 (6-0, P4):** one rule sentence: `Option` and `Result` have the instances `@derive` gives a user sum type with the same variants, for `Eq`, `Ord`, `Clone` and `Debug`, with inferred bounds. The per-trait text names them too. JSON has its own rows.
 - **Q5 (6-0, J1):** `Option[T]` is `Deserialize` when `T` is. `null` decodes as `None`. Any other value decodes as `T` wrapped in `Some`.
 - **Q6 (6-0, N2e):** the instance stays parametric. The round-trip law has an exception for `Some(v)` where `v.to_json()` is `null`. `@derive(Serialize)` or `@derive(Deserialize)` on a field with declared type `Option[Option[T]]` (after alias expansion, before generic substitution) is E1401. Phase C was 4-1-1 (Systems N2w, Minimalism N2). Both moved to N2e in Phase D.
-- **Q7 (4-2, R1):** `Result` has no JSON form in v1. A `Result` field under `@derive(Serialize)` or `@derive(Deserialize)` is E1401, and the `help:` writes the full enum. Phase C was 3-3. Phase D moved Systems and PLT from R2 to R1 and AI/ML from R1 to R2s. Web and AI/ML dissent for R2s.
+- **Q7 (4-2 R1 in Phase D; owner amendment: R2s):** `Result[T, E]` is `Serialize` and `Deserialize` when `T` and `E` are. `Ok(v)` is `{"Ok": v}` and `Err(e)` is `{"Err": e}`. Decode needs an object with exactly one entry, with the key `"Ok"` or `"Err"`. Phase C was 3-3. Phase D moved Systems and PLT from R2 to R1 and AI/ML from R1 to R2s, and the panel voted R1 4-2. The owner overrode the vote and sided with Web/Scripting and AI/ML.
 
-**AI-first review:** 5/5 pass, 0 fails. Learnability: one rule, "as `@derive` gives a user sum type". Consistency: the same order and bounds as `@derive` on a user sum type. Generability: a model can write `xs.sort()` and `r.clone()` and expects them to compile. Debuggability: the E1401 `help:` writes the enum to use. Token efficiency: no new syntax and no new trait.
+**AI-first review:** 5/5 pass, 0 fails. Learnability: one rule, "as `@derive` gives a user sum type". Consistency: the same order and bounds as `@derive` on a user sum type. Generability: a model can write `xs.sort()` and `r.clone()` and expects them to compile. Debuggability: the E1401 `help:` for `T??` writes the enum to use, and the `Result` decode error names both keys. Token efficiency: no new syntax and no new trait.
 
 ### Panel Deliberation
 
@@ -1155,7 +1155,7 @@ The moderator relayed the Phase C text of all six seats (`D/relay.md`). Each sea
 
 </details>
 
-**Strict-decode conditions, stated by the panel for a later `Result` mapping.** If a later panel adopts a `Result` JSON form (R2 with lower-case keys, or R2s with the keys `"Ok"` and `"Err"`), the decode is strict:
+**Strict-decode conditions, stated by the panel for a `Result` mapping.** The owner adopted R2s (*Owner amendment*, below), so the decode is strict:
 
 - The value is an object with exactly one entry.
 - The key is `"Ok"` or `"Err"` for R2s (or `"ok"` or `"err"` for R2). Case matters.
@@ -1167,6 +1167,34 @@ The text of the options is in the R2 and R2s bullets of `D/ballot.md`, quoted he
 
 > - **R2:** `{"ok": v}` / `{"err": e}` (lower case), Serialize and Deserialize when `T` and `E` are. Decode needs an object with exactly one entry, key `"ok"` or `"err"` (case matters); two keys, an extra key, no entry or a non-object is a JsonError that names both keys and the path. The first-entry rule does not apply.
 > - **R2s (web, Phase D):** as R2 but with serde's keys `{"Ok": v}` / `{"Err": e}`, the same strict decode.
+
+#### Owner amendment
+
+The owner reviewed the branch and overrode Q7 from R1 to R2s. The owner sided with Web/Scripting and AI/ML. Q7 is R2s. The other questions stand as voted.
+
+Web/Scripting's Phase D reasoning for Q7, verbatim:
+
+> A struct with a per-item outcome (batch endpoint, job queue, cache) should derive Serialize, and one built-in shape stops each team from inventing its own. serde's `{"Ok": v}` is the only one-key shape that already exists in the wild, so a Rust service or a model that guesses it decodes correctly, which removes the interop and wrong-guess concerns raised against lower-case R2. The exactly-one-entry decode makes `{"Ok": 1, "Err": 2}` an error, so no two decoders can disagree.
+
+AI/ML's Phase D reasoning for Q7, verbatim:
+
+> I change my vote. My one argument from my seat against a mapping was that the training-data guess (serde's `{"Ok": v}`) would be wrong under lower-case R2 and fail at run time. R2s removes that decision point: the key is the variant name exactly as Blink spells it, which is also serde's shape, so the model's guess is correct and a derived struct with a `Result` field just works. Strict decode, with an error that names both keys and the path, covers the rest. The irreversibility argument is real, but it belongs to the devops and min seats; from my lens R2s has fewer decision points and fewer failed generations than R1's compile error round trip.
+
+Concerns of the two seats, kept in the spec: the docs show a JSON consumer that checks the `"Ok"` key (Web/Scripting), and the decode error says that case matters and names `"Ok"` and `"Err"` exactly (AI/ML).
+
+**Dissent against the final result (Q7, R2s).** The four R1 voters in Phase D, verbatim:
+
+> **Systems:** A wire shape is the one decision where waiting costs less than choosing: R1 can become R2 later with no break, and R2 can never be taken back without breaking stored data. Under R1 a wrong guess is a compile error with a repair; under R2 or R2s a wrong-case guess compiles and fails at decode. A help line that writes one exact enum gives teams a common shape without a language promise.
+> **Concern:** If the help-line enum is not fixed word for word in the spec, tools and versions will suggest different shapes, and Blink services will disagree on the wire anyway.
+
+> **PLT:** R1 and R2 are both sound, so the tie-break is the smaller commitment: adding an instance later changes the meaning of no program that compiles today, but a wire shape cannot be withdrawn. "Not in v1" and a help line that writes out the enum with the field's own payload types make the absence a stated, reversible decision with a one-step repair. R2s fixes the same permanent shape with only a different key case, so the same argument applies to it.
+> **Concern:** `Never: Serialize` loses its stated use (`Result[User, Never]`) in v1, and teams that need Result on the wire will each write a different enum until a later vote picks one shape.
+
+> **DevOps/Tooling:** A wire shape is a contract that schema generators and non-Blink services read, and we cannot change it after 1.0; R1 can become R2 later with no break. The help line writes the same enum for every user, so teams get one shape, the existing tagged one, not fifty. The serde-guess risk (`{"Ok": v}` vs `{"ok": v}`) turns into a run-time decode error under R2, and R2s only moves the mismatch to JS consumers. "Not in v1" makes a later mapping read as planned.
+> **Concern:** If R1 wins and the help line does not use the field's own payload types and names, users will copy a generic `Ok(value: T)` stub that does not compile, and that diagnostic will feel worse than no mapping at all.
+
+> **Minimalism:** No program in this ticket needs a Result wire shape, and R1 can become R2 later with no break, while R2 or R2s fixes a wire contract that stored data and non-Blink readers depend on. The lower-case vs serde-case split that showed up in Phase D (R2 vs R2s) shows that the shape is still a preference, not a forced answer. Under R1 a wrong guess is a compile error with a written fix; under R2 it compiles and fails at decode.
+> **Concern:** If R2 or R2s wins, the strict decode text (exactly one entry, no first-entry rule) must reach the implementation intact, or `{"ok": 1, "err": "x"}` decodes as `Ok(1)` with no error.
 
 ### Final Spec
 
@@ -1186,6 +1214,11 @@ type Patch[T] {
 type UserUpdate {
     name: Str??   // E1401: use `Patch[Str]`
 }
+
+@derive(Serialize, Deserialize)
+type Reply {
+    outcome: Result[Int, Str]   // {"outcome":{"Ok":7}} or {"outcome":{"Err":"busy"}}
+}
 ```
 
 Locked points:
@@ -1196,12 +1229,15 @@ Locked points:
 - One rule sentence covers `Eq`, `Ord`, `Clone` and `Debug`. JSON has its own rows.
 - `Option[T]: Serialize` when `T: Serialize`, and `Deserialize` when `T: Deserialize`. `null` is `None`. Any other value is `Some` of the decoded `T`.
 - The instance for `Option[Option[T]]` stays parametric. The round-trip law does not hold for `Some(v)` where `v.to_json()` is `null`. A derive on a field declared `T??` is E1401. The check reads the type after alias expansion and before generic substitution. The `note:` names the `Box[Int?]` case in words.
-- `Result` has no JSON form in v1. A derive on a type with a `Result` field is E1401. The `help:` writes the full enum with the payload types of the field.
+- `Result[T, E]: Serialize` when `T` and `E` are `Serialize`, and `Deserialize` when `T` and `E` are `Deserialize`. `Ok(v)` is `{"Ok": v}` and `Err(e)` is `{"Err": e}`. The keys are the variant names as Blink spells them.
+- Decode needs an object with exactly one entry, with the key `"Ok"` or `"Err"`. Two keys, an extra key, no entry, a key in another case (`"ok"`) and a non-object are each a `JsonError` that names both keys, says that case matters, and gives the path. The first-entry rule does not apply to `Result`.
+- The docs show a JSON consumer that checks the `"Ok"` key.
 - Out of scope: a missing key that decodes as `None`, `List[T]: Ord`, a JSON row for tuples, positional payload keys, and `Hash`.
 
 ### Concerns
 
-- Moderator edit to the `help:` names: the panel's examples used `Set(value: T)`, `Ok(value: T)` and `Err(error: E)`. `Set` is a prelude type and `Ok`/`Err` are prelude variants (§10.6), so a bare `Ok(x)` near the suggested enum would have two meanings. The spec writes `Replace(value: T)` and `Success(value: T)` / `Failure(error: E)`. The panel fixed the shape (full enum, field's own payload types, payload names `value` and `error`), not these names; the owner may change them.
+- Moderator edit to the `help:` name: the panel's example used `Set(value: T)`. `Set` is a prelude type (§10.6), so the spec writes `Replace(value: T)`. The panel fixed the shape (full enum, field's own payload type), not this name; the owner may change it.
 - A user can reach the loss through `Box[Int?]`, `Option[JsonValue]` or a written `to_json`. The `note:` and the round-trip law must say the same thing.
-- The `help:` text for a `Result` field must write the payload types of the field. It must not leave `T` and `E` as placeholders.
-- Strict decode, if a `Result` form is adopted later, must reach the implementation as stated above.
+- Strict decode must reach the implementation as stated above: exactly one entry, no first-entry rule, and an error that names `"Ok"` and `"Err"`, says that case matters, and gives the path.
+- A JS or Python consumer used to lower-case keys may write `r.ok`. The docs example shows the `"Ok"` check.
+- The wire shape of `Result` cannot change after 1.0. The four R1 voters' dissent is above.
