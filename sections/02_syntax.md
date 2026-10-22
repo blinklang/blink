@@ -51,7 +51,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Keyword args | `fn f(a: T, *, b: U)` | Declaration-site `*` marker. Positional before, keyword after. Author decides — caller has no choice. Principle 2 preserved. |
 | Option type | `T?` only | `Str?` is the one spelling of `Option[Str]` in a type. `Option[Str]` in a type is a diagnostic. Short in type position, universally understood. `Int??` is `Option[Option[Int]]`. See §3.2 *One Spelling for List and Option Types*. |
 | List type | `List[T]` only | `List[Str]`, never `[Str]`. Square brackets in a type are a diagnostic. See §3.2 *One Spelling for List and Option Types*. |
-| Option defaulting | `??` | `val ?? default` desugars to match on `Some`/`None`. Borrowed from Swift's nil-coalescing. |
+| Option defaulting | `??` | `val ?? default` desugars to match on `Some`/`None`. The default may be a jump: `val ?? return e`. Borrowed from Swift's nil-coalescing. |
 | Type names | `Str`, `Int`, `Bool`, `Float` | Short PascalCase. One casing rule for builtins and user types. Token-efficient — `Str` saves 3 chars over `String`, thousands of times per codebase. |
 | If/else | Expression, no parens | Always an expression. No parentheses around condition. Else mandatory when value is used. No `if let`. See [2.9](#29-ifelse-expressions). |
 | While/loop | `while` and `loop` | `while cond { }` for conditional, `loop { }` for unconditional. Plain `break`/`continue`. No labels, no `while let`. See [2.11](#211-whileloop). |
@@ -801,7 +801,7 @@ loop {
 
 #### `break` and `continue`
 
-`break` exits the innermost loop. `continue` skips to the next iteration. Both are statements — no break-with-value for v1.
+`break` exits the innermost loop. `continue` skips to the next iteration. Both are jumps (*Jumps* below) — no break-with-value for v1.
 
 ```blink
 for item in items {
@@ -828,6 +828,46 @@ for item in items {
 - **Linter recommendation:** `while true { }` should be written as `loop { }`. The linter warns and auto-fixes.
 
 **Panel vote:** Both constructs 3-2. Plain break/continue 3-2. No labels 4-1. No while-let 5-0. See [DECISIONS.md](../DECISIONS.md).
+
+#### Jumps
+
+A **jump** is `return`, `return e`, `break` or `continue`. A jump has type `Never` (§3.3). A jump is not an expression. A jump may stand in these four positions and in no other:
+
+- as a statement (a line of a block)
+- as the tail of a block
+- as the body of a match arm that has no braces
+- as the right operand of `??`
+
+In the last position, `a ?? d` means `match a { Some(n) => n  None => d }`, and `None => return e` is a legal arm. The type of the whole `??` expression comes from the left operand. The operand of `return` takes as much as it can: `o ?? return a ?? b` means `o ?? return (a ?? b)`.
+
+```blink
+fn first_positive(xs: List[Int?]) -> Int {
+    for x in xs {
+        let n = x ?? continue            // jump as the right operand of `??`
+        if n > 0 {
+            return n
+        }
+    }
+    -1
+}
+
+fn name_of(id: Int) -> Result[Str, Error] {
+    let user = find(id) ?? return Err(NotFound)
+    let nick = user.nick ?? alias_of(id) ?? return Err(NotFound)
+    Ok(nick)
+}
+
+fn bad(o: Int?, ok: Bool) -> Int {
+    let a = return 3                     // error[JumpNotAllowedHere]: a jump is not an expression
+    let b = 1 + return 2                 // error[JumpNotAllowedHere]
+    f(return 1)                          // error[JumpNotAllowedHere]
+    let d = o ?? (return 0)              // error[JumpNotAllowedHere]: parentheses wrap an expression
+    let e = ok && return 1               // error[JumpNotAllowedHere]
+    0
+}
+```
+
+Parentheses wrap an expression, so a jump inside parentheses is an error. The machine-applicable fix removes the parentheses.
 
 #### Loop typing and divergence
 
@@ -1796,7 +1836,7 @@ if user.is_admin() || expensive_check(user) {
 }
 ```
 
-**`?` and `??`** are language primitives for `Result`/`Option`. Already specified in §3.5.
+**`?` and `??`** are language primitives for `Result`/`Option`. Already specified in §3.5. The right operand of `??` may be a jump (§2.11 *Jumps*), as in `x ?? return Err(NotFound)`.
 
 **`|>`** is the pipe operator. Already specified in §2.10.
 

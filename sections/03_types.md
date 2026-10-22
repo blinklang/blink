@@ -60,7 +60,7 @@ Option[T]       // Some(value) | None. Written T? in a type
 Result[T, E]    // Ok(value) | Err(error)
 ```
 
-**`Never` is the bottom type.** `Never` has no values. It is the type of a construct that cannot finish normally: a call to `panic(...)`, `todo()` or `unreachable()` (§2.20), a call to a function declared `-> Never`, or a `loop` that no `break` targets. §3.3 *Divergence and Body Completeness* lists every such construct. No literal, constructor or conversion makes a `Never`. Only a construct that diverges (§3.3) has this type. A program may write `Never` in any type position: a return type, a parameter, a field, a `let` annotation, or a type argument such as `Result[Int, Never]`. `Never` is a subtype of every type. Inference never chooses `Never` for a slot that the program left open (§3.4 *Under-Determined Types*). `Never` is not `()`: `()` has one value, and `Never` has none.
+**`Never` is the bottom type.** `Never` has no values. It is the type of a construct that cannot finish normally: a call to `panic(...)`, `todo()` or `unreachable()` (§2.20), a call to a function declared `-> Never`, a jump (§2.11 *Jumps*), or a `loop` that no `break` targets. §3.3 *Divergence and Body Completeness* lists every such construct. No literal, constructor or conversion makes a `Never`. Only a construct that diverges (§3.3) has this type. A program may write `Never` in any type position: a return type, a parameter, a field, a `let` annotation, or a type argument such as `Result[Int, Never]`. `Never` is a subtype of every type. Inference never chooses `Never` for a slot that the program left open (§3.4 *Under-Determined Types*). `Never` is not `()`: `()` has one value, and `Never` has none.
 
 Because `Never` is a subtype of every type (§3.3), a value of type `Never` fits wherever any type is expected. This does not go through a type constructor: `List[Never]` is not a `List[Int]`, `Result[Int, Never]` is not a `Result[Int, Str]`, and `fn() -> Never` is not a `fn() -> Int`. To widen such a value, take it apart and build it again:
 
@@ -1964,8 +1964,8 @@ normally:
   as `panic(msg)`, `todo()`, `unreachable()` (§2.20) and `env.exit(code)` (§4.6), and a
   user function declared `-> Never`. The rule reads the callee's declared result type,
   never its name.
-- A `return`, with or without a value, `?`-propagation on the error path, `break`, or `continue` in tail
-  position — control leaves the block by another edge.
+- A jump (§2.11 *Jumps* lists where one may stand) or `?`-propagation on the error path,
+  in tail position — control leaves the block by another edge.
 - A `loop { }` that **no `break` targets** — it runs forever. The search for a targeting
   `break` does not descend into a nested loop (whose `break` targets the inner loop) or
   into a closure body. See §2.11.

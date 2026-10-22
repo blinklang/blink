@@ -756,6 +756,8 @@ let name = match user.nickname {
 }
 ```
 
+The right operand of `??` is the body of the `None` arm, so it may be a jump (§2.11 *Jumps*): `let user = find(id) ?? return Err(NotFound)`.
+
 `T?` is the one spelling of `Option[T]` in a type (§3.2 *One Spelling for List and Option Types*):
 
 ```blink
