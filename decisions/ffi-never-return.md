@@ -282,3 +282,5 @@ PLT's `-> Option[Never]` case stays open until the general FFI-compatible rule l
 is a legal `@ffi` return for an opaque handle `H`, and §9.1 has no rule that rejects `Never` as the
 type argument. Such a binding would let C produce `Some(x)` with `x : Never`, an introduction form
 that §3.2 forbids. The follow-up covers `@ffi` parameters, return types and type arguments.
+
+The general rule landed: see [FFI Signature Types](ffi-signature-types.md).

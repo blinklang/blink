@@ -45,7 +45,7 @@ The library argument is a key of `[native-dependencies]` in `blink.toml`, or one
 fn c_cos(x: Float) -> Float ! ()
 ```
 
-Outside `lib/std`, prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library.
+Prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library. The one-argument form binds only `c` and `m` symbols. It does not bind a `blink_*` runtime symbol; `lib/std` binds those with `@runtime` (*`@runtime` — The Runtime Bridge*). Every `@ffi` declaration, in either form, follows the rules of *Signature Types*.
 
 #### The Effect Row — Declared by the Author
 
@@ -187,7 +187,145 @@ W0800 on a binding that declares `-> Never` adds a note that states the claim:
            the program panics at the call (`FfiNeverReturned`)
 ```
 
-**`Never` is not FFI-compatible.** It has no C type. In a foreign signature it is legal as the whole return type, as above. `Ptr[Never]` is E0810 (§9.1.1), and an `@ffi.struct` field of type `Never` is E0812 (§9.1.3).
+**`Never` is not FFI-compatible.** It has no C type. In a foreign signature it is legal as the whole return type, as above. Every other use is an error: `Option[Never]` and a `Never` parameter are E0848 (*Signature Types*), `Ptr[Never]` is E0810 (§9.1.1), and an `@ffi.struct` field of type `Never` is E0812 (§9.1.3).
+
+#### Signature Types — What an `@ffi` Declaration May Use
+
+The signature of an `@ffi` declaration is the author's claim about the foreign function (above). A claim can be about a type only when the type has a C form. One closed list says which types have one. The compiler checks every parameter type and the return type against the list, at the declaration. A new entry needs a design-panel vote.
+
+A **parameter type** is one of these:
+
+- a sized scalar: `I8`, `I16`, `I32`, `Int`, `U8`, `U16`, `U32`, `U64`, `F32`, `Float` or `Bool`;
+- `Ptr[T]`, where E0810 decides which `T` is legal (§9.1.1);
+- `Buf[T]`, as §9.1.3.2 allows;
+- an `@ffi.opaque` type `H`, or `Option[H]` (§9.1.4). For `Option[H]`, `None` is the C `NULL` pointer;
+- an `@ffi.struct` type. It crosses by value, as in C.
+
+A **return type** is one of those, or `()` (C `void`), or `Never` as the whole return type.
+
+The list has four more rules:
+
+- **Type arguments.** The only type arguments that a signature may hold are the `T` of `Ptr[T]` or `Buf[T]` and the `H` of `Option[H]`. `Option[Int]`, `Option[Str]`, `Option[Never]`, `Option[Option[H]]`, `List[H]` and `Result[T, E]` are errors.
+- **No type parameters.** An `@ffi` fn has no type parameters. A C symbol has one signature, so each C type needs its own declaration.
+- **Aliases expand first.** The compiler checks the type after it expands each alias. A named type that is not on the list is an error, even when it wraps a scalar.
+- **One report for each type.** `Void` is E0828 (§9.1.1), a bad `Ptr` argument is E0810, and a bad `Buf` argument follows §9.1.3.2. E0848 covers every other type that is not on the list. A type never gets two reports.
+
+The list is stated here once. A rule that needs it points here.
+
+A type that is not on the list is the error `FfiIncompatibleType` (E0848). `Str`, `Bytes`, `List[T]`, `Map[K, V]`, `Result[T, E]`, tuples, closure types, plain structs and enums, trait types, a type parameter, and `Never` as a parameter are not on the list. `Str` is not on it in any position: no `Str` parameter form exists. The `help:` line depends on what the author wrote:
+
+| Wrote | `help:` |
+|---|---|
+| `Str` parameter | take `Ptr[U8]`, and pass `scope.cstr(s)` from the safe wrapper |
+| `Str` or `Option[Str]` return | return `Ptr[U8]`, and read it with `.to_str()` |
+| `Bytes` or `List[U8]` | `Bytes.with_ptr`, or `Buf[U8]` |
+| `Option[Int]`, or `Option` of another type that is not a handle | the bare type |
+| `Option[Never]` | `-> Never` |
+| `Never` parameter | remove the parameter |
+| plain struct | `@ffi.struct` |
+| closure type | not supported |
+| type parameter | one declaration for each type |
+
+Both errors below are E0848:
+
+```
+error[E0848]: `Str` is not FFI-compatible
+ --> env.bl:3:22
+  |
+3 | fn raw_getenv(name: Str) -> Ptr[U8] ! Env
+  |                     ^^^ a parameter of an `@ffi` fn needs a C type
+  |
+  = note: `@trusted` does not cover this error, and `@allow` does not suppress it
+  = help: take `Ptr[U8]`, and pass `scope.cstr(name)` inside `with ffi.scope() as scope`
+```
+
+```
+error[E0848]: `Option[Never]` is not FFI-compatible
+  = note: `Never` is legal only as the whole return type of a foreign function
+  = note: `@trusted` does not cover this error, and `@allow` does not suppress it
+  = help: for a C function that does not return, write `-> Never`
+```
+
+The fix for a `Str` parameter takes `Ptr[U8]` in the `@ffi` declaration. The safe wrapper builds the C string inside an `ffi.scope()`, so the copy and its lifetime show in the source:
+
+```blink
+@ffi("c", "getenv")
+@trusted(audit: "ENV-001")
+fn raw_getenv(name: Ptr[U8]) -> Ptr[U8] ! Env
+
+pub fn getenv(name: Str) -> Option[Str] ! Env {
+    with ffi.scope() as scope {
+        raw_getenv(scope.cstr(name)).to_str()
+    }
+}
+```
+
+```blink
+@ffi.opaque(header: "sqlite3.h", name: "sqlite3")
+type Sqlite3
+
+@ffi.struct(header: "time.h", name: "timespec")
+type Timespec {
+    tv_sec: Int,
+    tv_nsec: Int,
+}
+
+// Legal
+@ffi("sqlite3", "sqlite3_next_stmt")
+@trusted(audit: "DB-005")
+fn raw_next(db: Sqlite3) -> Option[Sqlite3] ! IO
+
+@ffi("c", "difftime")
+@trusted(audit: "LIBC-DIFFTIME")
+fn c_difftime(end: Int, start: Int) -> Float ! ()
+
+@ffi("c", "abort")
+@trusted(audit: "LIBC-ABORT")
+fn c_abort() -> Never ! ()
+
+// Illegal: each is E0848
+@ffi("c", "getenv")
+@trusted(audit: "P")
+fn bad_str(name: Str) -> Ptr[U8] ! Env
+
+@ffi("c", "getenv")
+@trusted(audit: "P")
+fn bad_option(name: Ptr[U8]) -> Option[Str] ! Env
+
+@ffi("c", "abs")
+@trusted(audit: "P")
+fn bad_never(n: Never) -> Int ! ()
+
+@ffi("c", "abs")
+@trusted(audit: "P")
+fn bad_generic[T](x: T) -> Int ! ()
+```
+
+**`@trusted` and `@allow` do not reach E0848.** `@trusted(audit: K)` records what the foreign code does. It cannot give a type a C form. `@allow(FfiIncompatibleType)` is `NotAWarningName` (E0847, §4.16.8), because E0848 is an error. The `note:` of E0848 says the same, and so does its catalog row.
+
+#### `@runtime` — The Runtime Bridge
+
+`lib/std` calls the Blink runtime with `@runtime("blink_symbol")`. It is not a C binding. The runtime has its own ABI, in which `Str`, `List[T]` and closures have a layout that the compiler and the runtime own. The signature of a `@runtime` declaration is part of that trusted base.
+
+```blink
+// lib/std/sb.bl
+@runtime("blink_sb_write")
+fn sb_write(mut sb: StringBuilder, s: Str)
+```
+
+- **Only `lib/std` may use `@runtime`.** A `@runtime` declaration in any other package is the error `InvalidRuntimeBinding` (E0849).
+- **It binds only runtime symbols.** The symbol must start with `blink_`. A symbol that does not is E0849 too. A C function, in `lib/std` or elsewhere, uses `@ffi`.
+- **It is not under the signature rule.** *Signature Types* applies to every `@ffi` declaration, with no exception.
+
+```
+error[E0849]: `@runtime` is reserved for `lib/std`
+ --> app/io.bl:3:1
+  |
+3 | @runtime("blink_sb_write")
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^ this binds the Blink runtime, not a C library
+  |
+  = help: for a C function, use `@ffi("library", "symbol")`
+```
 
 #### Audit-Gated Diagnostics — One Channel, Stated Once
 
@@ -1568,7 +1706,7 @@ pub fn open(path: Str) -> Option[Connection] ! IO {
 
 Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites. The audit records two kinds of crossing.
 
-**Declaration records.** For each `@ffi` declaration, a parameter whose type is `H` or `Option[H]` is a **consume** crossing, and an opaque return type or a `Ptr` out-cell parameter whose pointee contains `H` (defined below) is a **produce** crossing. The audit records these once per declaration, not once per call. Passing a handle by value to an `@ffi` function is therefore not a body site: the handle is the C pointer, so nothing goes back to raw memory, and the call may sit in ordinary code.
+**Declaration records.** For each `@ffi` declaration, a parameter whose type contains `H` (defined below) is a **consume** crossing, and a return type that contains `H`, or a `Ptr` out-cell parameter whose pointee contains `H`, is a **produce** crossing. The audit records these once per declaration, not once per call. Passing a handle by value to an `@ffi` function is therefore not a body site: the handle is the C pointer, so nothing goes back to raw memory, and the call may sit in ordinary code.
 
 **Body sites.** Inside an FFI region (§9.1.1, *Pointer Operations*), and only there:
 
