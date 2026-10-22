@@ -11,14 +11,33 @@ whether the pair is an error, and decides when the declaration gets a warning.
 
 | Q | Question | Result | Vote |
 |---|---|---|---|
-| Q1 | An enum (or alias, trait, effect) named like a variant of another enum: error (E) or legal (L) | **Tied.** E: web, devops, aiml. L: sys, plt, min. The owner breaks the tie. This text writes L: no new error; E0518 stays on the brace form | 3-3 after Phase D |
+| Q1 | An enum (or alias, trait, effect) named like a variant of another enum: error (E) or legal (L) | **Tied.** E: web, devops, aiml. L: sys, plt, min. The owner broke the tie for L, amended: a type named like a variant is legal; a bare variant named like a type in scope is E0554; E0518 stays on the brace form | 3-3 after Phase D |
 | Q2 | Reach of E over the type namespace (counts only if E wins Q1) | V1-all: struct, enum, alias, trait, effect. No spec text on this branch | 5-1 (min: V1-data) |
-| Q3 | W1011 for a type that hides a variant at a dotted head | W2: at the type declaration, once for each hidden variant of a different enum; the type's own enum is exempt; a dependency variant counts only when an import entry names its enum | 6-0 after Phase D |
+| Q3 | W1011 for a type that hides a variant at a dotted head | W2: at the type declaration, once for each hidden variant of a different enum; a dependency variant counts only when an import entry names its enum (the own-enum exemption of the vote is void: a variant with its enum's name is E0518) | 6-0 after Phase D |
 | (agreed in Phase B) | Dotted head order; no fallback; own variant; scope; help lines | See Final Spec | no vote; no seat objected |
 
-**Result:** Q1 tied 3-3 after Phase D; the owner breaks the tie. This text writes L.
+**Result:** Q1 tied 3-3 after Phase D; the owner broke the tie for L, amended (see *Owner tiebreak and amendment*).
 
-**Owner tiebreak:** pending
+**Owner tiebreak:** L, amended.
+
+### Owner tiebreak and amendment
+
+The owner's words, verbatim:
+
+> "I would say: type Color { Red, Green } / type Red { A, B } is legal. And type Color { Red, Green } / Red <-- bad / Color.Red <-- okay. does that hold up?"
+>
+> "every bare is illegal"
+>
+> "Doesn't JsonValue.Bool need to be prefixed anyways to not conflict with builtin Bool?"
+
+Reading: the type `Red` stays legal beside the variant `Color.Red` (L). A bare variant named like a type in scope is an error in an expression, so `Red` is bad and `Color.Red` is fine. The rule covers builtin and prelude types: `JsonValue.Bool` needs its prefix because of the builtin `Bool`. The new error is `VariantNamedLikeType` (E0554).
+
+Scope, asked of the owner afterwards: "every bare is illegal" was said about this ticket's case, not as a rule for every position. The owner chose:
+
+- **Expressions only.** `let c = Red` and `let c: Color = Red` are E0554; an expected type does not make the bare form legal. A pattern still finds its variant from the type of the matched value (§3.5), so `match c { Red => ... }` stays legal.
+- **Builtin and prelude types count.** `Bool(true)` as a `JsonValue` variant is E0554; write `JsonValue.Bool(true)`.
+
+The newtype panel (decisions/newtype.md, 6-0) made a variant with the name of its own enum an error, E0518 at the declaration (`type Token { Token(Str), End }`). So the own-enum case cannot occur, and the own-enum exemptions in the Q3 vote and in Phase B ("Own variant") no longer apply. The panelist quotes below stay as they were written.
 
 ### Panel Deliberation
 
@@ -421,9 +440,9 @@ The moderator sent the Phase C tally and the strongest quotes for and against. E
 > **Q3: W2**
 > Reason: it reuses the existing W1011 shadow condition (02_syntax.md:943), so the panel adds no new warning rule, and it covers the silent same-shape case.
 
-**Result:** Q1 tied 3-3 after Phase D; the owner breaks the tie. This text writes L.
+**Result:** Q1 tied 3-3 after Phase D; the owner broke the tie for L, amended (see *Owner tiebreak and amendment*).
 
-**Owner tiebreak:** pending
+**Owner tiebreak:** L, amended.
 
 ### Concerns
 
@@ -531,7 +550,7 @@ Binding concerns for the implementation:
 - (sys) Under L, the spec says clearly that E0518 is about the brace form only. The sentence is in *Name collisions*.
 - (devops, web, aiml) A dependency variant that a bare use reaches by the global-unique step with no import entry for its enum hides with no warning. The help line is then the only signal, so it must be present.
 
-### Final Spec (text for L)
+### Final Spec (text for L, as the owner amended it)
 
 ```blink
 type Color { Red, Green }
@@ -542,44 +561,42 @@ trait Label { fn label(self) -> Str }
 impl Label for Red { fn label(self) -> Str { "type" } }
 impl Label for Color { fn label(self) -> Str { "variant" } }
 
-type Unit { Unit }                    // no W1011: the variant is in the type's own enum
-impl Label for Unit { fn label(self) -> Str { "unit" } }
-
 fn main() ! IO {
-    let c = Red                       // the variant `Color.Red`: a type is never a bare value
+    let c = Red                       // error[VariantNamedLikeType]: bare `Red` names the type `Red`, not a variant
+                                      // help: write the variant with its enum: `Color.Red`
+    let d = Color.Red                 // the variant
     let r = Red.A                     // type path: variant `A` of the type `Red`
     io.println(Red.label())           // error[TypeError]: function Red.label expects 1 argument(s), got 0
                                       // help: to use the variant, write `Color.Red`
     io.println(Color.Red.label())     // the qualified form always reaches the variant
-    io.println(Unit.Unit.label())     // a member of the variant value, not of the type
 }
 ```
 
 - **Dotted head (agreed in Phase B).** At `Name.x` and `Name.x(...)` the order is: a local or module-scope value named `Name`; then a name in the type namespace (type path); then a bare variant. A bare `Name` and `Name(...)` keep *Values come first*, so a type name is never a bare value (§3.4 *Dotted heads*).
 - **No fallback (agreed in Phase B).** The reading comes from scope and namespaces only. If `x` is not a member of the type, the site is an error. An `impl` added elsewhere never changes what an existing site means.
-- **Own variant (agreed in Phase B).** `type Token { Token(Str), End }` is legal. For `type Unit { Unit }`, `Unit.x` is the type path; `Unit.Unit.x()` reaches the variant value.
+- **Own variant (replaced).** Phase B agreed that `type Token { Token(Str), End }` is legal. The newtype panel made it E0518 at the declaration, so no own-enum exemption remains.
 - **Scope (agreed in Phase B).** "Type path" covers every `T.` member: a variant, `fn T.name`, `const T.X`, a trait associated function.
-- **Help (agreed in Phase B).** A failed type path (unknown member, arity, or a type mismatch such as `let x: Red = Red`), with a bare variant of that name in reach, gets a `help:` line that names the qualified variant.
-- **W1011 (Q3, W2).** At the type declaration, once for each hidden variant of a different enum. The type's own enum is exempt. A dependency variant counts only when an import entry names its enum (§10.6 *Shadowing Rules*). The condition is tied to the bare-variant candidate set by cross-reference. `@allow(ShadowedVariant)` on the `type` silences it for a struct, enum or alias; the `[lints]` table covers a trait or effect.
-- **Q1 (L, pending the owner).** An enum, alias, trait or effect named like a variant is legal. §3.4 *Name collisions* says that E0518 covers a struct because `Name { ... }` reads as both a struct literal and a variant brace literal.
-- **Q2 (V1-all, 5-1).** Applies only if the owner picks E. No spec text on this branch.
+- **Help (agreed in Phase B).** A failed type path (unknown member or arity), with a bare variant of that name in reach, gets a `help:` line that names the qualified variant.
+- **W1011 (Q3, W2).** At the type declaration, once for each hidden variant of a different enum. A dependency variant counts only when an import entry names its enum (§10.6 *Shadowing Rules*). The condition is tied to the bare-variant candidate set by cross-reference. `@allow(ShadowedVariant)` on the `type` silences it for a struct, enum or alias; the `[lints]` table covers a trait or effect.
+- **Q1 (L, owner tiebreak, amended).** An enum, alias, trait or effect named like a variant is legal at its declaration. A bare variant `X` or `X(...)` is `VariantNamedLikeType` (E0554) when a type named `X` is in scope (a declared or imported struct, enum, alias, trait or effect; builtin and prelude types count). The rule holds in every expression; a hint does not make the bare form legal. Patterns are not affected: a pattern finds its variant from the type of the matched value (§3.5). The help writes the variant with its enum, and lists each form when two enums have the variant. The help is machine-applicable with one candidate. §3.4 *Name collisions* says that E0518 covers a struct because `Name { ... }` reads as both a struct literal and a variant brace literal.
+- **Q2 (V1-all, 5-1).** Applied only if the owner picked E. The owner picked L, so no spec text.
 - **Not spec.** The internal compiler error on an unknown member of an enum type path is a compiler bug.
 
 Governing text: §3.4 *Values come first*, *Dotted heads* and *Name collisions*, §10.6 *Shadowing Rules*.
 
 ### Known gaps and follow-ups
 
-1. Implementation: the dotted-head order (value, type, variant) with no fallback on the member set; the help lines on a failed type path; W1011 for a type that hides a variant of a different enum; the internal compiler error on an unknown member of an enum type path (a compiler bug, not spec); tests for each point, including a cross-package pair and `type Unit { Unit }`.
+1. Implementation: the dotted-head order (value, type, variant) with no fallback on the member set; the help lines on a failed type path; W1011 for a type that hides a variant of a different enum; E0554 for a bare variant named like a type in scope, in expressions, hinted positions and patterns; the internal compiler error on an unknown member of an enum type path (a compiler bug, not spec); tests for each point, including a cross-package pair.
 2. Friction already filed: a module `const Red` beside `type Red` in one module is legal, and `Red.x` reads the value with no diagnostic.
-3. If the owner picks E: add E0518 for a type-namespace name (Q2, V1-all) with the same reach as the struct rule; W1011 then covers only dependency variants; the *Name collisions* sentence for L is replaced.
+3. Void: the owner picked L, so E0518 does not extend to the type namespace.
 4. `fn T.name` does not parse today. The dotted-head rule names it as a member of `T.`, as the spec already does (§2.12.3).
 
 #### AI-first review
 
 1. Learnability — PASS. One ordered list for a dotted head: value, type, variant. The qualified variant always reaches the variant.
 2. Consistency — PASS. A type that hides a variant gets W1011 with the same condition as a value that hides one.
-3. Generability — PASS. A model writes `Red.A` for the type and `Color.Red` for the variant, and a bare `Red` stays the variant.
+3. Generability — PASS. A model writes `Red.A` for the type and `Color.Red` for the variant, and a bare `Red` is E0554 with a help that names `Color.Red`.
 4. Debuggability — PASS. A failed type path with a bare variant in reach carries a `help:` line that names the qualified variant.
-5. Token efficiency — PASS. No new syntax and no new error code; the fix is a rename or a qualifier.
+5. Token efficiency — PASS. No new syntax; one new error code, E0554, and its fix is a qualifier.
 
 0 of 5 fail. No flags.

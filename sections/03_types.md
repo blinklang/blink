@@ -2232,7 +2232,8 @@ The bare form (`NotFound { msg: "x" }`) and the qualified form (`QueryError.NotF
 
 - a name that two or more candidate enums declare, with no expected type at the site (E0519, below);
 - a variant that a value binding hides (*Values come first*, below);
-- a user variant that has the name of a prelude variant (`Some`, `None`, `Ok`, `Err`).
+- a user variant that has the name of a prelude variant (`Some`, `None`, `Ok`, `Err`);
+- a variant named like a type in scope (*Dotted heads*, below): the bare form is E0554.
 
 A `help:` line in a diagnostic writes the qualified form, because that form is the full name of the variant. It is not a second rule. The examples in this spec follow this guidance: an example uses one spelling for each enum, and it qualifies a variant only to show one of the cases above. `blink fmt` does not change one spelling into the other (below).
 
@@ -2284,7 +2285,7 @@ A bare name that matches no candidate, but matches a `pub` enum of another packa
 
 An expected type at a position reaches each branch value of an `if`, each arm value of a `match`, and the tail of a block. It does not reach a condition, a guard, a scrutinee, or a statement that is not the tail.
 
-*Values come first* (below) governs `Name` and `Name(...)`. A struct has no bare form and no call form, so those two spellings never find a struct. The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
+*Values come first* (below) governs `Name` and `Name(...)`. A struct has no bare form and no call form, so those two spellings never find a struct. When a type named `Name` is in scope, those two spellings are not a variant either: they are E0554 (*Dotted heads*, below). The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
 
 Resolution is static. A bare name at a site denotes exactly one entity, and the compiler determines it statically.
 
@@ -2334,15 +2335,17 @@ fn main() {
 
 1. a local binding, or a module-scope value, named `Name` (steps 1 and 2 of *Values come first*). Then `Name.x` is a field access or a method call on that value;
 2. a name in the type namespace: a struct, enum, alias, trait or effect. Then `Name.x` is a *type path*: `x` is a member of the `T.` namespace of that type (§2.12.3). A member is a variant, a `fn T.name`, a `const T.X`, or an associated function of a trait;
-3. a bare variant `Name`, found as for a bare use of `Name`. Then `Name.x` is a field access or a method call on the variant value, for example `Green.label()`.
+3. a bare variant `Name`, found as for a bare use of `Name`. Then `Name.x` is a field access or a method call on the variant value, for example `Green.label()`. This step does not run when step 2 finds a type: a bare variant named like a type in scope is an error (*Variant named like a type*, below).
 
 The compiler picks the reading from scope and namespaces only, never from the members of the type. If `x` is not a member of the type in step 2, the site is an error. The compiler does not read `Name.x` again as a value or as a variant value. So an `impl` that another module adds never changes what an existing site means.
 
-A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. When a type has the name of a variant, write the qualified variant to reach a member of the variant value: `Color.Red.label()`. An enum may have a variant with its own name, as in `type Token { Token(Str), End }`. For `type Unit { Unit }`, `Unit.x` is the type path, and `Unit.Unit.x()` reaches a member of the variant value.
+A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. When a type has the name of a variant, write the qualified variant to reach the variant or a member of the variant value: `Color.Red`, `Color.Red.label()`. A variant with the name of its own enum is E0518 (*Name collisions*, below).
 
-When a site reads a type path and fails (an unknown member, a wrong number of arguments, or a type mismatch such as `let x: Red = Red`), and a bare variant of that name is in reach, the error gets a `help:` line that names the qualified variant.
+When a site reads a type path and fails (an unknown member or a wrong number of arguments), and a bare variant of that name is in reach, the error gets a `help:` line that names the qualified variant.
 
-A type in step 2 can hide a variant of a different enum. W1011 marks it at the type declaration, once for each variant that the type hides. The type's own enum is exempt. A variant counts when a bare use of its name in the module can reach it (*Resolution order*, above); for a dependency variant, §10.6 *Shadowing Rules* adds the import-entry condition.
+A type in step 2 can hide a variant of a different enum. W1011 marks it at the type declaration, once for each variant that the type hides. A variant counts when a bare use of its name in the module can reach it (*Resolution order*, above); for a dependency variant, §10.6 *Shadowing Rules* adds the import-entry condition.
+
+**Variant named like a type.** A bare variant `X` or `X(...)` is an error when a type named `X` is in scope. The type is a struct, enum, alias, trait or effect that the module declares or imports, or a builtin or prelude type such as `Bool`, `Str` or `Option`. The error is `error[VariantNamedLikeType]` (E0554). The fix is the qualified form `Enum.X`. The rule holds in every expression, also at a position with an expected type (*Expected type at a site*, above): an expected type does not make the bare form legal. It does not reach patterns: a pattern finds its variant from the type of the matched value (§3.5), so `match c { Red => 1, Green => 2 }` stays legal. When two enums have a variant `X`, the help lists each qualified form. The help is machine-applicable when there is one candidate.
 
 ```blink
 type Color { Red, Green }
@@ -2353,16 +2356,14 @@ trait Label { fn label(self) -> Str }
 impl Label for Red { fn label(self) -> Str { "type" } }
 impl Label for Color { fn label(self) -> Str { "variant" } }
 
-type Unit { Unit }                    // no W1011: the variant is in the type's own enum
-impl Label for Unit { fn label(self) -> Str { "unit" } }
-
 fn main() ! IO {
-    let c = Red                       // the variant `Color.Red`: a type is never a bare value
+    let c = Red                       // error[VariantNamedLikeType]: bare `Red` names the type `Red`, not a variant
+                                      // help: write the variant with its enum: `Color.Red`
+    let d = Color.Red                 // the variant
     let r = Red.A                     // type path: variant `A` of the type `Red`
     io.println(Red.label())           // error[TypeError]: function Red.label expects 1 argument(s), got 0
                                       // help: to use the variant, write `Color.Red`
     io.println(Color.Red.label())     // the qualified form always reaches the variant
-    io.println(Unit.Unit.label())     // a member of the variant value, not of the type
 }
 ```
 
@@ -2379,7 +2380,7 @@ fn main() ! IO {
     help: to wrap one value, use a one-field struct (*Newtypes*, above): `type Errno { code: Int }`
   ```
 
-  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique. For a struct, E0518 holds because `Name { ... }` reads as both a struct literal and a variant brace literal. An enum, alias, trait or effect has no such literal, so a type of one of those kinds named like a variant of a different enum is legal. At a dotted head the type comes before the variant (*Dotted heads*, above), and W1011 marks it.
+  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique. For a struct, E0518 holds because `Name { ... }` reads as both a struct literal and a variant brace literal. An enum, alias, trait or effect has no such literal, so a type of one of those kinds named like a variant of a different enum is legal at its declaration. At a dotted head the type comes before the variant (*Dotted heads*, above), W1011 marks it, and a bare use of the variant is E0554 (*Variant named like a type*, above).
 
 - **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Such a name is resolved by the hint:
 
@@ -3171,7 +3172,7 @@ match_arm     ::= pattern guard? "=>" expression
 
 A pattern is *refutable* when it can fail to match (*Refutable vs Irrefutable Patterns*, below). The rule applies at every refutable pattern position. Today these are the pattern of a `match` arm, at any depth, and the pattern operand of `assert_matches` (§2.20). A future form that takes a refutable pattern uses this rule. In a refutable pattern:
 
-- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a payload (`Red`, `Red(x)`, `Red { .. }`). If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
+- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a payload (`Red`, `Red(x)`, `Red { .. }`). A type with that name in scope does not change this: E0554 (§3.4 *Dotted heads*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
 - A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) keeps the type-directed rule. It is a variant only when the type at that position has a variant of that name. Otherwise a name with no payload is a new binding. A name with a payload always names a variant, so it gets the same errors as an uppercase name: E0308 when the type is not an enum, E0547 when the enum has no variant of that name.
 
 The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. The protection against a typo covers variants whose names start with an uppercase letter only.

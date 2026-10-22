@@ -2847,7 +2847,7 @@ The rule covers every declaration that puts a name in the type namespace: `type`
 
 **Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or imports, are a duplicate, never a shadow. A module qualifier is in both namespaces. One rule covers every pair, and the code tells which pair collided: two imports are E1005 (`AmbiguousImport`), an import entry and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. A local binding that hides a module qualifier (`let auth = 5` makes `auth.login()` a method call, §10.1 *Qualified Access*) is a shadow between nested scopes, so it is legal.
 
-**A binding that hides a variant.** A variant is not a binding, but a bare name finds a value binding before a variant (§3.4 *Values come first*). So a value binding with a variant's name hides the variant in expressions, and only there: in a refutable pattern, an uppercase name still means the variant (§3.5). A struct type in scope hides a variant at `Name { ... }` in the same way (§3.4 *Resolution order*); `Name` and `Name(...)` still mean the variant. A name in the type namespace hides a variant at a dotted head `Name.x` (§3.4 *Dotted heads*); a bare `Name` still means the variant. The compiler emits `ShadowedVariant` (W1011) at the binding or type when it hides one of these:
+**A binding that hides a variant.** A variant is not a binding, but a bare name finds a value binding before a variant (§3.4 *Values come first*). So a value binding with a variant's name hides the variant in expressions, and only there: in a refutable pattern, an uppercase name still means the variant (§3.5). A struct type in scope hides a variant at `Name { ... }` in the same way (§3.4 *Resolution order*). A bare `Name` and `Name(...)` are then E0554, not the variant (§3.4 *Dotted heads*). A name in the type namespace hides a variant at a dotted head `Name.x` (§3.4 *Dotted heads*); a bare `Name` is E0554 too. The compiler emits `ShadowedVariant` (W1011) at the binding or type when it hides one of these:
 
 - a variant of an enum in the same package;
 - a variant of a prelude enum;
@@ -2856,7 +2856,7 @@ The rule covers every declaration that puts a name in the type namespace: `type`
 W1011 covers four kinds of binding:
 
 - a struct type that the module declares, or binds by an import entry, and that hides a dependency variant at the brace form `Name { ... }` (§3.4 *Resolution order*). The trigger is the same: the module imports the variant's enum through an import entry that names it. Only the dependency case can occur here, because a struct with the name of a variant in the same package or the prelude is E0518 (§3.4 *Name collisions*);
-- a type that the module declares (a struct, enum, alias, trait or effect) and that hides a variant of a different enum at a dotted head `Name.x` (§3.4 *Dotted heads*). The variant kinds are the three above. A variant of the type's own enum never gives W1011. A struct that already gets W1011 at the brace form for a variant gets one warning for that variant, not one for each form;
+- a type that the module declares (a struct, enum, alias, trait or effect) and that hides a variant of a different enum at a dotted head `Name.x` (§3.4 *Dotted heads*). The variant kinds are the three above. A variant with the name of its own enum is E0518 (§3.4 *Name collisions*). A struct that already gets W1011 at the brace form for a variant gets one warning for that variant, not one for each form;
 - a module-scope `let`, `let mut`, `const` or `fn`. Only the dependency case can occur here, because a value with the name of a variant in the same package or the prelude is E1016 (§2.12.1);
 - a local binding: a `let`, a parameter, a closure parameter or a pattern binder. A pattern binder in an irrefutable pattern gets W1011. In a refutable pattern, a binder cannot have the name of an uppercase variant, because an uppercase name there is the variant or an error (§3.5). So a binder in a refutable pattern gets W1011 only when its first character is not uppercase and the type at that position has no variant of that name.
 
@@ -2869,7 +2869,7 @@ warning[W1011]: struct `Status` hides variant `Job.Status` (package `jobs`)
 3 | import geo.{Status}
   |             ^^^^^^ hides the variant in `Status { ... }`
   |
-  = note: `Status` and `Status(...)` still mean `Job.Status`; so does a pattern on a `Job` value
+  = note: bare `Status` and `Status(...)` are errors (E0554) in an expression; write `Job.Status`
   = help: alias the import, or write `Job.Status { ... }` for the variant
 ```
 
@@ -2880,7 +2880,7 @@ warning[W1011]: type `Red` hides variant `Color.Red` (module `paint.colors`)
 2 | type Red { A, B }
   |      ^^^ hides the variant in `Red.x`
   |
-  = note: `Red` and `Red(...)` still mean `Color.Red`; `Red.x` is a member of the type `Red`
+  = note: bare `Red` and `Red(...)` are errors (E0554); `Red.x` is a member of the type `Red`
   = help: rename the type, or write `Color.Red` for the variant
 ```
 
