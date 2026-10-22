@@ -632,6 +632,70 @@ Each unknown key gets its own diagnostic, in source order. The toolchain checks 
 
 When `[package]` lacks a required key (`name` or `version`) and W1002 fired in `[package]`, the error for the missing key adds a `note:` that points at the unknown key, as E1200 and E1052 do after W1001.
 
+**Edition value.** The `edition` value must name an edition that this toolchain knows (§8.16.1). There is no fallback edition: the toolchain never checks a package under an edition that its manifest does not name. A manifest with no `edition` keeps the default (§8.16.1). The check runs for each package in the dependency graph. The span is the value token. Two errors cover the faults:
+
+| Value | Error | Help |
+|-------|-------|------|
+| A string of four digits that is a year after the newest edition this toolchain knows (`"2099"`) | `UnsupportedEdition` (E1017) | install a newer `blink`; `blink editions` lists the editions this one knows |
+| Any other value: a string that is not a year, a year before the first edition, a year at or below the newest known edition that names no edition, or a value that is not a string | `InvalidEdition` (E1018) | the nearest known edition (ERROR_CATALOG.md, *Conventions*; the candidates are the known editions); `blink editions` lists them |
+
+`UnsupportedEdition` means that the file may be correct and this toolchain is too old. The message names the version of this toolchain and the newest edition that it knows. The help never offers a lower edition, and the error has no machine-applicable fix: a lower edition checks the package under rules that its author did not choose.
+
+`InvalidEdition` means that the file is wrong for every toolchain. A TOML integer that names a known edition (`edition = 2026`) has a machine-applicable fix that quotes it. No other case has a machine-applicable fix.
+
+```toml
+[package]
+name = "x"
+version = "0.1.0"
+edition = "2099"
+```
+
+```
+error[UnsupportedEdition]: this blink does not know edition "2099"
+ --> blink.toml:4:11
+  |
+4 | edition = "2099"
+  |           ^^^^^^ blink 0.57.0 knows editions up to 2026
+  |
+  = help: install a newer `blink`; `blink editions` lists the editions this one knows
+```
+
+```toml
+[package]
+name = "x"
+version = "0.1.0"
+edition = 2026
+```
+
+```
+error[InvalidEdition]: `edition` must be a string
+ --> blink.toml:4:11
+  |
+4 | edition = 2026
+  |           ^^^^
+  |
+  = help: write the edition as a string: `"2026"`
+```
+
+Neither error is a warning. No `@allow` and no `[lints]` entry lowers it; such an entry is `NotAWarningName` (E0847), as for any error.
+
+When the manifest at fault belongs to a dependency, the error adds a `note:` with a span on the entry of that dependency in the manifest that declares it. When the dependency is not direct, the text of the note also gives the chain from the root package on one line. The chain is the shortest path; among paths of equal length, it is the first in declaration order. The help also offers to pin a release of the dependency that uses an edition this toolchain knows.
+
+```
+error[UnsupportedEdition]: this blink does not know edition "2099"
+ --> ../vendor/crypto/blink.toml:4:11
+  |
+4 | edition = "2099"
+  |           ^^^^^^ blink 0.57.0 knows editions up to 2026
+  |
+  = note: `acme/crypto` is a dependency of `acme/auth` (../vendor/auth/blink.toml:9:1); chain: acme/app -> acme/auth -> acme/crypto
+  = help: install a newer `blink`, or pin a release of `acme/crypto` that uses an edition this blink knows
+```
+
+W1001 and unknown-key diagnostics in the same manifest are still reported. For `UnsupportedEdition` only, each such warning adds a `note:` at the `edition` value. The note states a fact and nothing more: `this manifest names edition 2099, which this blink does not know`. For `InvalidEdition`, the warning has no note.
+
+`blink fmt` still formats a package with an edition error. The language server reports the error and does not type-check that package. `blink migrate --edition <year>` and `blink editions --edition <year>` give the same two errors for a year that names no known edition; the span is the argument (§8.16.3, §8.16.4).
+
 ---
 
 ### 8.10 Built-in Test Runner
@@ -1908,9 +1972,11 @@ edition = "2026"
   1. **Stdlib API** — deprecated functions become errors, new defaults take effect
   2. **Keywords** — a new edition can reserve identifiers (e.g., promoting a soft keyword to a keyword; §2.23 *Soft Keywords*)
   3. **Lint severity** — warnings in edition N can become errors in edition N+1
+
+  The manifest schema does not depend on the edition: the toolchain alone decides which sections and keys it knows. This rule is for spec authors. A section or key that changes what a package builds to — which code it compiles, which code it resolves, or which rules check it — enters the schema only together with a new edition. The change that adds the first such section also adds the error for a package whose edition is too old to use it. A section or key that does not change what the program does when it runs (metadata, tool hints, a setting that changes only speed or size) can enter in any `blink` release. This is why it is safe for an older toolchain to skip an unknown section with W1001 (§8.9.8).
 - **NOT core syntax.** Editions never change the grammar of `fn`, `match`, `let`, `if`, braces, or any core construct. An edition cannot make previously-valid syntax invalid (except for newly reserved keywords). The AST structure is eternal.
 - **Infinite compatibility.** Every edition is supported forever. The compiler never drops support for an older edition. A `edition = "2026"` package compiles with the 2035 compiler. There is no "upgrade or die" — upgrading editions is always voluntary.
-- **Default.** When `edition` is omitted from `blink.toml`, the compiler uses the latest stable edition at the time the compiler was built. For new projects, `blink init` writes the current edition explicitly.
+- **Default.** When `edition` is omitted from `blink.toml`, the compiler uses the latest stable edition at the time the compiler was built. For new projects, `blink init` writes the current edition explicitly. An `edition` that the toolchain does not know is an error (§8.9.8).
 
 **How editions interact with dependencies:** The compiler resolves each package's edition independently. If package A (edition 2028) depends on package B (edition 2026), the compiler checks A against 2028 rules and B against 2026 rules. No edition leaks across package boundaries. This is why editions can only gate per-package concerns (stdlib, keywords, lint) — they cannot change type system semantics or effect resolution, which are cross-package.
 
@@ -2015,7 +2081,7 @@ blink migrate
 **Flags:**
 
 - `--dry-run` — show what would change without modifying files
-- `--edition <year>` — migrate to a specific edition (skipping intermediate editions is allowed; all fixes from intermediate editions are applied cumulatively)
+- `--edition <year>` — migrate to a specific edition (skipping intermediate editions is allowed; all fixes from intermediate editions are applied cumulatively). A year that names no known edition is `UnsupportedEdition` or `InvalidEdition` (§8.9.8), with the span on the argument
 - `--json` — structured JSON output (default when piped)
 
 The `blink migrate` command is idempotent. Running it on a package that is already at the target edition produces no changes.
@@ -2045,13 +2111,14 @@ Edition 2026 (released 2026-06-01)
 
 - `--breaking` — show only items with a `removal` edition (items that will become compile errors)
 - `--json` — structured JSON output for tooling and AI consumption
-- `--edition <year>` — show changes for a specific edition only
+- `--edition <year>` — show changes for a specific edition only. A year that names no known edition is `UnsupportedEdition` or `InvalidEdition` (§8.9.8), with the span on the argument
 
 The changelog is also exposed in the `llms.txt` header (§8.3) as an edition-specific API change summary, giving AI agents immediate awareness of what has changed between the edition a project uses and the current edition.
 
 #### 8.16.5 Edition Cadence
 
 - **At most one edition per year.** Editions are not releases — they are compatibility snapshots. Most years will have zero or one edition.
+- **Names increase.** Each new edition is named for a year after the newest existing edition.
 - **2+ year deprecation window.** Any item deprecated in edition N cannot have `removal` earlier than edition N+2. This gives downstream consumers at minimum two years to migrate.
 - **Infinite backward compatibility.** The compiler never drops edition support. Edition 2026 code compiles with the 2040 compiler.
 - **Enforced semver (v2).** In v2, the package manager enforces that `removal` editions align with major version bumps of the package. A library cannot remove a deprecated API within the same major version. This is not enforced in v1 (path + git deps only, no registry infrastructure).
