@@ -1,0 +1,231 @@
+// The labels of a struct pattern and of a variant brace pattern, bare or qualified, are checked
+// like the labels of a literal, at every depth and in each OR alternative (sections/03_types.md
+// §3.5 *Struct patterns*). In this order: a label twice is DuplicateField (E0316) at the second
+// label; a label the type does not declare is NoSuchField (E0525); fields left out with no `..`
+// is PatternMissingRest (E0319), once per pattern, at the type or variant name. The one
+// suggestion for an unknown label is not counted as left out, and a field default does not
+// count as naming the field.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/brace_patterns_check_their_labels"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+// The match is on line 9 and its first arm on line 10, at column 9.
+fn case_src(subject: Str, arms: List[Str]) -> Str {
+    let mut src = [
+        "type Point \{ x: Int, y: Int }",
+        "type Point3 \{ x: Int, y: Int, z: Int }",
+        "type Conf \{ port: Int, debug: Bool = false }",
+        "type Shape \{ Rect \{ w: Int, h: Int }, Dot }",
+        "type Wrap \{ inner: Point, tag: Int }",
+        "type Shape3 \{ Rect \{ w: Int, h: Int }, Dot, Pair \{ a: Point, b: Int } }",
+        "",
+        "fn f(p: Point, q: Point3, c: Conf, s: Shape, o: Option[Point], wr: Wrap, s3: Shape3) -> Int \{",
+        "    match {subject} \{",
+    ]
+    for a in arms { src.push("        {a}") }
+    src.push("    }")
+    src.push("}")
+    src.push("")
+    src.push("fn main() \{}")
+    lines(src)
+}
+
+fn error_rows(out: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for row in out.trim().split("\n") {
+        if row.contains("\"severity\":\"error\"") { rows.push(row) }
+    }
+    rows
+}
+
+// Each want is "CODE@line:col@message", in the order the errors are reported.
+fn expect_rows(name: Str, subject: Str, arms: List[Str], want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", case_src(subject, arms))
+    let r = blink_in_dir("check --json {name}.bl")
+    let rows = error_rows(r.err_out)
+    let mut problems: List[Str] = []
+    if want.len() == 0 && r.exit_code != 0 { problems.push("{name}: want exit 0, got {r.exit_code}:\n{r.err_out}") }
+    if want.len() > 0 && r.exit_code != 1 { problems.push("{name}: want exit 1, got {r.exit_code}") }
+    if rows.len() != want.len() { problems.push("{name}: want {want.len()} error rows, got {rows.len()}:\n{r.err_out}") }
+    let mut i = 0
+    while i < rows.len() && i < want.len() {
+        let row = rows.get(i).unwrap()
+        let parts = want.get(i).unwrap().split("@")
+        let code = parts.get(0).unwrap()
+        let at = parts.get(1).unwrap().split(":")
+        let msg = parts.get(2).unwrap()
+        if !row.contains("\"code\":\"{code}\"") { problems.push("{name}: row {i}: want {code} in {row}") }
+        if !row.contains("\"line\":{at.get(0).unwrap()},\"col\":{at.get(1).unwrap()}") { problems.push("{name}: row {i}: want {parts.get(1).unwrap()} in {row}") }
+        if !row.contains("\"message\":\"{msg}\"") { problems.push("{name}: row {i}: want message {msg} in {row}") }
+        i = i + 1
+    }
+    problems.join("\n")
+}
+
+test "a struct pattern with an unknown label or with fields left out and no rest is an error" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut p: List[Str] = []
+    p.push(expect_rows("unknown", "p", ["Point \{ x, bogus } => x"], [
+        "E0525@10:20@`Point` has no field `bogus`",
+        "E0319@10:9@`Point` pattern leaves out field `y` (Int) and has no `..`",
+    ]))
+    p.push(expect_rows("left_out", "p", ["Point \{ x } => x"], ["E0319@10:9@`Point` pattern leaves out field `y` (Int) and has no `..`"]))
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(p.join("\n").trim(), "")
+}
+
+test "the spec example gives PatternMissingRest and NoSuchField" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let got = expect_rows("spec", "q", ["Point3 \{ x, y } => x", "Point3 \{ x, yy, .. } => x"], [
+        "E0319@10:9@`Point3` pattern leaves out field `z` (Int) and has no `..`",
+        "E0525@11:21@`Point3` has no field `yy`",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(got, "")
+}
+
+test "a label twice is DuplicateField at the second label, before the other checks" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut p: List[Str] = []
+    p.push(expect_rows("dup", "p", ["Point \{ x, x: z, .. } => x + z"], ["E0316@10:20@field `x` is given twice"]))
+    p.push(expect_rows("all_three", "q", ["Point3 \{ x, x: x2, bogus } => x + x2"], [
+        "E0316@10:21@field `x` is given twice",
+        "E0525@10:28@`Point3` has no field `bogus`",
+        "E0319@10:9@`Point3` pattern leaves out fields `y` (Int), `z` (Int) and has no `..`",
+    ]))
+    p.push(expect_rows("dup_variant", "s", ["Rect \{ w, w: w2, .. } => w + w2", "Dot => 0"], ["E0316@10:19@field `w` is given twice"]))
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(p.join("\n").trim(), "")
+}
+
+test "the one suggestion for an unknown label is not left out, and a shared one is no suggestion" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut p: List[Str] = []
+    p.push(expect_rows("unique", "p", ["Point \{ x, yy } => x + yy"], ["E0525@10:20@`Point` has no field `yy`"]))
+    p.push(expect_rows("shared", "q", ["Point3 \{ x, yy, y2 } => x"], [
+        "E0525@10:21@`Point3` has no field `yy`",
+        "E0525@10:25@`Point3` has no field `y2`",
+        "E0319@10:9@`Point3` pattern leaves out fields `y` (Int), `z` (Int) and has no `..`",
+    ]))
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(p.join("\n").trim(), "")
+}
+
+test "a field default does not count as naming the field" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let got = expect_rows("default", "c", ["Conf \{ port } => port"], ["E0319@10:9@`Conf` pattern leaves out field `debug` (Bool) and has no `..`"])
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(got, "")
+}
+
+test "a variant brace pattern is checked bare and qualified" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut p: List[Str] = []
+    p.push(expect_rows("bare_left_out", "s", ["Rect \{ w } => w", "Dot => 0"], ["E0319@10:9@`Shape.Rect` pattern leaves out field `h` (Int) and has no `..`"]))
+    p.push(expect_rows("bare_unknown", "s", ["Rect \{ w, hh } => w", "Dot => 0"], ["E0525@10:19@`Shape.Rect` has no field `hh`"]))
+    p.push(expect_rows("qualified_unknown", "s", ["Shape.Rect \{ w, hh } => w", "Shape.Dot => 0"], ["E0525@10:25@`Shape.Rect` has no field `hh`"]))
+    p.push(expect_rows("qualified_left_out", "s", ["Shape.Rect \{ h } => h", "Shape.Dot => 0"], ["E0319@10:15@`Shape.Rect` pattern leaves out field `w` (Int) and has no `..`"]))
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(p.join("\n").trim(), "")
+}
+
+test "a nested pattern and each OR alternative are checked" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let mut p: List[Str] = []
+    p.push(expect_rows("in_some", "o", ["Some(Point \{ y }) => y", "None => 0"], ["E0319@10:14@`Point` pattern leaves out field `x` (Int) and has no `..`"]))
+    p.push(expect_rows("in_struct", "wr", ["Wrap \{ inner: Point \{ x }, .. } => x"], ["E0319@10:23@`Point` pattern leaves out field `y` (Int) and has no `..`"]))
+    p.push(expect_rows("in_or", "p", ["Point \{ x, y: 0 } | Point \{ x } => x", "_ => 0"], ["E0319@10:29@`Point` pattern leaves out field `y` (Int) and has no `..`"]))
+    p.push(expect_rows("in_variant", "s3", ["Pair \{ a: Point \{ x }, .. } => x", "_ => 0"], ["E0319@10:19@`Point` pattern leaves out field `y` (Int) and has no `..`"]))
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(p.join("\n").trim(), "")
+}
+
+test "a pattern that labels every field or ends with a rest is accepted and runs" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/ok.bl", lines([
+        "type Point \{ x: Int, y: Int }",
+        "type Conf \{ port: Int, debug: Bool = false }",
+        "type Shape \{ Rect \{ w: Int, h: Int }, Dot }",
+        "",
+        "fn main() \{",
+        "    let p = Point \{ x: 1, y: 2 }",
+        "    let a = match p \{ Point \{ x, y } => x + y }",
+        "    let b = match p \{ Point \{ x, .. } => x }",
+        "    let c = match p \{ Point \{ x: px, y: py } => px * py }",
+        "    let s = Shape.Rect \{ w: 3, h: 4 }",
+        "    let d = match s \{",
+        "        Rect \{ w, h } => w + h",
+        "        Dot => 0",
+        "    }",
+        "    let e = match s \{",
+        "        Shape.Rect \{ w, .. } => w",
+        "        Shape.Dot => 0",
+        "    }",
+        "    let g = match Conf \{ port: 8 } \{ Conf \{ port, debug } => if debug \{ 0 } else \{ port } }",
+        "    let h = match p \{ Point \{ .. } => 5 }",
+        "    io.println(\"\{a} \{b} \{c} \{d} \{e} \{g} \{h}\")",
+        "}",
+    ]))
+    let r = blink_in_dir("run ok.bl")
+    let _ = sh("rm -rf {DIR}")
+    if r.exit_code != 0 { io.eprintln("{r.out}\n{r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "3 1 2 7 3 8 5")
+}
+
+test "blink check, blink build and a one-unit build report the same pattern field errors" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/same.bl", lines([
+        "type Point3 \{ x: Int, y: Int, z: Int }",
+        "",
+        "fn get_x(p: Point3) -> Int \{",
+        "    match p \{",
+        "        Point3 \{ x, y } => x",
+        "        Point3 \{ x, yy, .. } => x",
+        "        Point3 \{ x, x: x2, .. } => x + x2",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        "    io.println(\"\{get_x(Point3 \{ x: 1, y: 2, z: 3 })}\")",
+        "}",
+    ]))
+    let check = blink_in_dir("check same.bl")
+    let build = blink_in_dir("build same.bl")
+    let one = blink_in_dir("build --no-per-module same.bl")
+    let _ = sh("rm -rf {DIR}")
+    assert(check.exit_code != 0)
+    assert(build.exit_code != 0)
+    assert(one.exit_code != 0)
+    let shown = check.err_out.replace("error: check failed\n", "")
+    if shown != build.err_out || build.err_out != one.err_out {
+        io.eprintln("check:\n{check.err_out}\nbuild:\n{build.err_out}\none unit:\n{one.err_out}")
+    }
+    assert(shown == build.err_out)
+    assert(build.err_out == one.err_out)
+    assert(check.err_out.contains("error[PatternMissingRest]: `Point3` pattern leaves out field `z` (Int) and has no `..`"))
+    assert(check.err_out.contains("error[NoSuchField]: `Point3` has no field `yy`"))
+    assert(check.err_out.contains("error[DuplicateField]: field `x` is given twice"))
+    assert(check.err_out.contains("3 error(s) found"))
+}
+
+test "blink explain E0319 names the rule and both fixes" {
+    let r = sh("$(pwd)/build/blink explain E0319")
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("PatternMissingRest"))
+    assert(r.out.contains(".."))
+    assert(r.out.contains("_"))
+}

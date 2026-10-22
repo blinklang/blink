@@ -14,7 +14,7 @@ import parser.{
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
-    node_set_module, node_set_name, node_supertraits, synth_struct_decl, node_end_line, node_end_col, BINDER_MUT_RECOVERED,
+    node_set_module, node_set_name, node_supertraits, synth_struct_decl, node_end_line, node_end_col, node_inclusive, BINDER_MUT_RECOVERED,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
     node_set_params, node_set_stmts, node_set_fields, node_set_arms,
     node_xfail_reason, node_value_child_ids, node_push_value_child_ids, node_spell_child_ids,
@@ -65,7 +65,7 @@ import diagnostics.{
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, NOT_DERIVABLE,
-    NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, diag_set_last_assist_at,
+    NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, PATTERN_MISSING_REST, diag_set_last_assist_at,
     OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
     POSITIONAL_AFTER_KEYWORD, DUPLICATE_KEYWORD_ARG, UNLABELED_KEYWORD_ARG,
 }
@@ -18020,7 +18020,7 @@ fn tc_series(items: List[Str], conj: Str) -> Str {
 
 // ── Literal field checks (§2.14 Checking a Literal's Fields) ─────────
 // Every literal that names fields comes here: a struct literal, a variant brace literal, and a
-// variant paren payload. A struct pattern can plan its own faults with literal_field_faults.
+// variant paren payload. A struct pattern and a variant brace pattern come here too (§3.5).
 
 // A field a literal may label, in declaration order. `field` is its TypeField node; its type
 // is written out only when a report names it.
@@ -18217,7 +18217,7 @@ fn tc_check_variant_paren_payload(var_idx: Int, vname: Str, node: Int) ! TypeChe
             }
             tc_report_variant_arity(owner.shown, var_idx, vname, got, node)
             let faults = literal_field_faults(owner.rows, labels, false)
-            for u in faults.unknowns { tc_report_unknown_label(owner, labels, u) }
+            for u in faults.unknowns { tc_report_unknown_label(owner, labels, u, false) }
         }
         None => tc_report_variant_arity("", var_idx, vname, got, node)
     }
@@ -18251,11 +18251,8 @@ fn tc_report_literal_fields(owner: LitOwner, labels: List[Int], spread: Int, hea
     // A type its module declares twice (E1016) may have meant either declaration's fields.
     if tc_type_decl_poisoned(owner.decl) { return }
     let faults = literal_field_faults(owner.rows, labels, spread == -1)
-    for d in faults.dups {
-        diag_error_at_notes("DuplicateField", DUPLICATE_FIELD, "field `{node_name(d.at)}` is given twice", d.at,
-            "remove one of the two", ["first given here: {node_line(d.first)}:{node_col(d.first)}"])
-    }
-    for u in faults.unknowns { tc_report_unknown_label(owner, labels, u) }
+    tc_report_duplicate_labels(faults.dups)
+    for u in faults.unknowns { tc_report_unknown_label(owner, labels, u, false) }
     if faults.missing.len() == 0 { return }
     let mut shown: List[Str] = []
     let mut fill: List[Str] = []
@@ -18288,17 +18285,33 @@ fn tc_assist_fill_fields(lit: Int, labels: List[Int], fill: List[Str]) ! Diag.Re
     }
 }
 
+fn tc_report_duplicate_labels(dups: List[LitDup]) ! Diag.Report {
+    for d in dups {
+        diag_error_at_notes("DuplicateField", DUPLICATE_FIELD, "field `{node_name(d.at)}` is given twice", d.at,
+            "remove one of the two", ["first given here: {node_line(d.first)}:{node_col(d.first)}"])
+    }
+}
+
 // A variant with no named field cannot take one beside its positional fields, so it gets no
-// "add the field" help.
-fn tc_report_unknown_label(owner: LitOwner, labels: List[Int], u: LitUnknown) ! Diag.Report {
+// "add the field" help. Nor does a pattern label: a pattern only reads the fields a type has.
+fn tc_report_unknown_label(owner: LitOwner, labels: List[Int], u: LitUnknown, in_pattern: Bool) ! Diag.Report {
     let name = node_name(u.at)
-    let add = if owner.rows.len() > 0 && tc_decl_in_root_package(owner.decl) { "\nor add the field to `{owner.shown}`" } else { "" }
+    let add = if !in_pattern && owner.rows.len() > 0 && tc_decl_in_root_package(owner.decl) { "\nor add the field to `{owner.shown}`" } else { "" }
     let msg = "`{owner.shown}` has no field `{name}`"
     if u.suggestion != "" {
         let before = diag_entry_count()
         diag_error_at("NoSuchField", NO_SUCH_FIELD, msg, u.at, "did you mean `{u.suggestion}`?{add}")
         if diag_entry_count() > before {
-            diag_set_last_fix_at("rename to", u.suggestion, node_line(u.at), node_col(u.at), node_line(u.at), node_col(u.at) + name.byte_len())
+            // A punned label is also its binder, so the fix labels the field and keeps the
+            // binder's name: a use in the arm still means what it meant.
+            if in_pattern && node_pattern(u.at) == -1 {
+                if node_end_line(u.at) == node_line(u.at) && node_end_col(u.at) > node_col(u.at) {
+                    let binder = if node_is_mut(u.at) != 0 { "mut {name}" } else { name }
+                    diag_set_last_fix_at("label as", "{u.suggestion}: {binder}", node_line(u.at), node_col(u.at), node_line(u.at), node_end_col(u.at))
+                }
+            } else {
+                diag_set_last_fix_at("rename to", u.suggestion, node_line(u.at), node_col(u.at), node_line(u.at), node_col(u.at) + name.byte_len())
+            }
         }
         return
     }
@@ -18315,6 +18328,59 @@ fn tc_declared_marks(owner: LitOwner, labels: List[Int]) -> List[Str] {
     let mut out: List[Str] = []
     for r in owner.rows { out.push(if given.contains_key(r.name) { "{r.name} (given)" } else { r.name }) }
     out
+}
+
+// §3.5 Struct patterns: the labels of a struct pattern or a variant brace pattern are checked
+// as a literal's are, with `..` in place of `..source`. A pattern must name a defaulted field
+// too, so no row has a default. The faults come back whether or not this visit reported them,
+// so the arm's recovery is the same on every walk.
+fn tc_check_pattern_labels(owner: Option[LitOwner], pat: Int) -> LitFaults ! Diag.Report {
+    let none = LitFaults { dups: [], unknowns: [], missing: [] }
+    let o = match owner {
+        Some(o) => o
+        None => return none
+    }
+    // A type its module declares twice (E1016) may have meant either declaration's fields.
+    if tc_type_decl_poisoned(o.decl) { return none }
+    let mut rows: List[LitFieldRow] = []
+    for r in o.rows { rows.push(LitFieldRow { has_default: false, ..r }) }
+    let labels = tc_lit_labels(node_fields(pat))
+    let faults = literal_field_faults(rows, labels, node_inclusive(pat) == 0)
+    tc_report_duplicate_labels(faults.dups)
+    for u in faults.unknowns { tc_report_unknown_label(o, labels, u, true) }
+    if faults.missing.len() > 0 { tc_report_pattern_missing_rest(o, pat, labels, faults.missing) }
+    faults
+}
+
+// One error at the type or variant name. The fixes come in the spec's order: `..` is the
+// machine fix; `f: _` keeps the pattern closed, so it is an assist a person chooses.
+fn tc_report_pattern_missing_rest(owner: LitOwner, pat: Int, labels: List[Int], missing: List[LitFieldRow]) ! Diag.Report {
+    let mut shown: List[Str] = []
+    let mut skips: List[Str] = []
+    for r in missing {
+        shown.push("`{r.name}` ({type_ann_text(node_value(r.field))})")
+        skips.push("{r.name}: _")
+    }
+    let what = if missing.len() == 1 { "field {shown.get(0).unwrap()}" } else { "fields {shown.join(", ")}" }
+    let msg = "`{owner.shown}` pattern leaves out {what} and has no `..`"
+    let variant = node_type_name(pat)
+    let qcol = if node_kind(pat) == NodeKind.EnumPattern { tc_qualified_name_col(pat, node_name(pat), variant) } else { -1 }
+    let col = if qcol > 0 { qcol } else { node_col(pat) }
+    let end_col = if qcol > 0 { qcol + variant.byte_len() } else { 0 }
+    let before = diag_entry_count()
+    diag_error_span_at_notes("PatternMissingRest", PATTERN_MISSING_REST, msg, pat, node_line(pat), col, end_col, "add `..`", [])
+    if diag_entry_count() == before { return }
+    let skip_action = if missing.len() == 1 { "name the left-out field" } else { "name the left-out fields" }
+    if labels.len() > 0 {
+        let last = labels.get(labels.len() - 1).unwrap()
+        if node_end_line(last) > 0 {
+            diag_set_last_fix_at("insert `..`", ", ..", node_end_line(last), node_end_col(last), node_end_line(last), node_end_col(last))
+            diag_set_last_assist_at(skip_action, ", {skips.join(", ")}", node_end_line(last), node_end_col(last))
+        }
+    } else if node_end_line(pat) > 0 && node_end_col(pat) > 1 {
+        diag_set_last_fix_at("insert `..`", "..", node_end_line(pat), node_end_col(pat) - 1, node_end_line(pat), node_end_col(pat) - 1)
+        diag_set_last_assist_at(skip_action, skips.join(", "), node_end_line(pat), node_end_col(pat) - 1)
+    }
 }
 
 // §3.4: copy-update is for struct literals. The note shows the match that binds the fields.
@@ -30271,6 +30337,19 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
     }
 }
 
+// §3.5: only a binder under a label the type does not declare is poison. A binder under a
+// duplicate label still names a declared field, so it keeps that field's type.
+fn tc_unknown_label_names(faults: LitFaults) -> Map[Str, Int] {
+    let mut names: Map[Str, Int] = Map()
+    for u in faults.unknowns { names.insert(node_name(u.at), 1) }
+    names
+}
+
+// An unknown or duplicate label makes the arm cover nothing; leaving fields out does not.
+fn tc_labels_cover_nothing(faults: LitFaults) -> Bool {
+    faults.dups.len() > 0 || faults.unknowns.len() > 0
+}
+
 // Types `node` against tc_pattern_binding_type and binds its names. Reports each pattern, at
 // any depth, that names nothing the value there can be (§3.5 Pattern Forms), and answers
 // whether there was one. Inference runs this walk many times per node; a repeat report is one
@@ -30387,8 +30466,10 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
             }
         }
         let flds_sl = node_fields(node)
+        let is_struct_pat = node_int_val(node)
+        let labels = if !bad && is_struct_pat != 0 && var_idx >= 0 { tc_check_pattern_labels(tc_variant_literal_owner(var_idx), node) } else { LitFaults { dups: [], unknowns: [], missing: [] } }
+        let unknown = tc_unknown_label_names(labels)
         if flds_sl != -1 {
-            let is_struct_pat = node_int_val(node)
             let mut i = 0
             while i < sublist_length(flds_sl) {
                 let f = sublist_get(flds_sl, i)
@@ -30397,7 +30478,11 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                     let fpat = node_pattern(f)
                     let fname = node_name(f)
                     let mut sub_t = -1
-                    if var_idx >= 0 { sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_name(var_idx, fname), saved_binding) }
+                    if unknown.contains_key(fname) {
+                        sub_t = poison
+                    } else if var_idx >= 0 {
+                        sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_name(var_idx, fname), saved_binding)
+                    }
                     if sub_t < 0 { sub_t = tc_pattern_binding_type }
                     if fpat != -1 {
                         tc_pattern_binding_type = sub_t
@@ -30421,7 +30506,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
             }
         }
         tc_pattern_binding_type = saved_binding
-        return covers_nothing || child_bad
+        return covers_nothing || tc_labels_cover_nothing(labels) || child_bad
     }
     if kind == NodeKind.StructPattern {
         // Resolve the carrier so each field binder is typed from its declared field type,
@@ -30453,6 +30538,14 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                 }
             }
         }
+        let mut owner: Option[LitOwner] = None
+        if var_idx >= 0 {
+            owner = tc_variant_literal_owner(var_idx)
+        } else if struct_tid >= 0 {
+            owner = tc_struct_literal_owner(struct_tid)
+        }
+        let labels = if bad { LitFaults { dups: [], unknowns: [], missing: [] } } else { tc_check_pattern_labels(owner, node) }
+        let unknown = tc_unknown_label_names(labels)
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
             let mut i = 0
@@ -30466,7 +30559,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
                 // the same substitution the qualified variant spelling above already makes,
                 // and the one thing that keeps the two spellings of one pattern in agreement.
                 let mut sub_t = -1
-                if bad {
+                if bad || unknown.contains_key(fname) {
                     sub_t = poison
                 } else if var_idx >= 0 {
                     sub_t = tc_subst_evfield_from_instance(lookup_evfield_type_by_name(var_idx, fname), saved_binding)
@@ -30488,7 +30581,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool) -> Bool ! Typ
             }
         }
         tc_pattern_binding_type = saved_binding
-        return covers_nothing || child_bad
+        return covers_nothing || tc_labels_cover_nothing(labels) || child_bad
     }
     if kind == NodeKind.TuplePattern {
         let saved_binding = tc_pattern_binding_type

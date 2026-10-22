@@ -521,7 +521,7 @@ Pattern matching on responses is natural:
 
 ```blink
 match net.get(url)? {
-    Response { status: 200, body } => process(body)
+    Response { status: 200, body, .. } => process(body)
     Response { status: 404, .. } => Err(AppError.NotFound("resource gone"))
     Response { status, .. } => Err(AppError.Http("unexpected status {status}"))
 }

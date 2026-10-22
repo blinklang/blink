@@ -1,0 +1,125 @@
+// Recovery after a struct pattern's field errors (sections/03_types.md §3.5 *Struct patterns*).
+// Only a binder under a label the type does not declare is poison: a use of it reports
+// nothing more. A binder under a declared label, or under a label given twice, keeps its
+// field's type, so a wrong use of it is still an error. An unknown or duplicate label makes a
+// bad arm, which covers nothing and, when unguarded, turns off NonExhaustiveMatch (E0004).
+// Fields left out with no `..` (E0319) make no bad arm, so the match is still checked.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/struct_pattern_field_faults_poison"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn errors_of(name: Str, body: List[Str]) -> List[Str] {
+    let mut src = [
+        "type Point \{ x: Int, y: Int }",
+        "type Shape \{ Rect \{ w: Int, h: Int }, Dot, Line \{ len: Int } }",
+        "",
+    ]
+    for l in body { src.push(l) }
+    src.push("")
+    src.push("fn main() \{}")
+    write_file("{DIR}/{name}.bl", lines(src))
+    let r = sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B check --json {name}.bl")
+    let mut codes: List[Str] = []
+    for row in r.err_out.trim().split("\n") {
+        if row.contains("\"severity\":\"error\"") {
+            let after = row.split("\"code\":\"").get(1) ?? row
+            codes.push(after.split("\"").get(0) ?? row)
+        }
+    }
+    codes
+}
+
+test "a binder under an unknown label is poison and brings no second error" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let labeled = errors_of("labeled", [
+        "fn f(p: Point) -> Int \{",
+        "    match p \{",
+        "        Point \{ x, bogus: b, .. } => b.nope + b.len()",
+        "    }",
+        "}",
+    ])
+    let punned = errors_of("punned", [
+        "fn f(p: Point) -> Int \{",
+        "    match p \{",
+        "        Point \{ x, yy } => x + yy",
+        "    }",
+        "}",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(labeled.join(","), "E0525")
+    assert_eq(punned.join(","), "E0525")
+}
+
+test "a binder under a declared or a duplicate label keeps its field type" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let declared = errors_of("declared", [
+        "fn f(p: Point) -> Int \{",
+        "    match p \{",
+        "        Point \{ x, bogus, .. } => x.nope",
+        "    }",
+        "}",
+    ])
+    let dup = errors_of("dup", [
+        "fn f(p: Point) -> Int \{",
+        "    match p \{",
+        "        Point \{ x, x: z, .. } => z.nope",
+        "    }",
+        "}",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(declared.join(","), "E0525,E0525")
+    assert_eq(dup.join(","), "E0316,E0525")
+}
+
+test "an unguarded arm with an unknown or duplicate label turns off NonExhaustiveMatch" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let unknown = errors_of("unknown", [
+        "fn f(s: Shape) -> Int \{",
+        "    match s \{",
+        "        Rect \{ w, ww, .. } => w",
+        "    }",
+        "}",
+    ])
+    let dup = errors_of("dup_arm", [
+        "fn f(s: Shape) -> Int \{",
+        "    match s \{",
+        "        Shape.Rect \{ w, w: v, .. } => v",
+        "    }",
+        "}",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(unknown.join(","), "E0525")
+    assert_eq(dup.join(","), "E0316")
+}
+
+test "an arm that only leaves fields out is still checked for exhaustiveness" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let open = errors_of("left_out", [
+        "fn f(s: Shape) -> Int \{",
+        "    match s \{",
+        "        Rect \{ w } => w",
+        "    }",
+        "}",
+    ])
+    let covered = errors_of("left_out_covered", [
+        "fn f(s: Shape) -> Int \{",
+        "    match s \{",
+        "        Rect \{ w } => w",
+        "        Dot => 0",
+        "        Line \{ len } => len",
+        "    }",
+        "}",
+    ])
+    let _ = sh("rm -rf {DIR}")
+    assert_eq(open.join(","), "E0319,E0004")
+    assert_eq(covered.join(","), "E0319")
+}

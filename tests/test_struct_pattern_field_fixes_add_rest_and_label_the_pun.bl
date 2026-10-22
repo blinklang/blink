@@ -1,0 +1,113 @@
+// The repairs of a struct pattern's field errors (sections/03_types.md §3.5 *Struct patterns*).
+// PatternMissingRest (E0319) carries two, in order: `..` is the machine fix, and writing
+// `f: _` for each left-out field is an assist in the JSON output that `blink fix` never
+// applies. A NoSuchField (E0525) with one suggestion renames a written label; for a punned
+// label it writes `y: yy`, so the binder and every use of it in the arm stay as they are.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/struct_pattern_field_fixes"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn fx_src(a: Str, b: Str, c: Str, d: Str) -> Str {
+    lines([
+        "type Point3 \{ x: Int, y: Int, z: Int }",
+        "",
+        "fn a(p: Point3) -> Int \{",
+        "    match p \{",
+        "        {a} => x",
+        "    }",
+        "}",
+        "",
+        "fn b(p: Point3) -> Int \{",
+        "    match p \{",
+        "        {b} => x + yy",
+        "    }",
+        "}",
+        "",
+        "fn c(p: Point3) -> Int \{",
+        "    match p \{",
+        "        {c} => 0",
+        "    }",
+        "}",
+        "",
+        "fn d(p: Point3) -> Int \{",
+        "    match p \{",
+        "        {d} => px + q",
+        "    }",
+        "}",
+        "",
+        "fn main() \{",
+        #"    let p = Point3 { x: 1, y: 2, z: 3 }"#,
+        #"    io.println("{a(p)} {b(p)} {c(p)} {d(p)}")"#,
+        "}",
+    ])
+}
+
+fn broken() -> Str {
+    fx_src("Point3 \{ x, y }", "Point3 \{ x, yy, .. }", "Point3 \{}", "Point3 \{ x: px, yy: q, .. }")
+}
+
+test "the JSON rows carry the rest fix, the field assist and the label fixes" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/fx.bl", broken())
+    let r = blink_in_dir("check --json fx.bl")
+    let _ = sh("rm -rf {DIR}")
+    let mut rows: List[Str] = []
+    for row in r.err_out.trim().split("\n") {
+        if row.contains("\"severity\":\"error\"") { rows.push(row) }
+    }
+    let want = [
+        #"{"severity":"error","name":"PatternMissingRest","code":"E0319","message":"`Point3` pattern leaves out field `z` (Int) and has no `..`","span":{"file":"fx.bl","line":5,"col":9},"help":"add `..`","fix":{"action":"insert `..`","text":", ..","span":{"file":"fx.bl","line":5,"col":22,"end_line":5,"end_col":22}},"assist":{"action":"name the left-out field","text":", z: _","span":{"file":"fx.bl","line":5,"col":22}}}"#,
+        #"{"severity":"error","name":"NoSuchField","code":"E0525","message":"`Point3` has no field `yy`","span":{"file":"fx.bl","line":11,"col":21},"help":"did you mean `y`?","fix":{"action":"label as","text":"y: yy","span":{"file":"fx.bl","line":11,"col":21,"end_line":11,"end_col":23}}}"#,
+        #"{"severity":"error","name":"PatternMissingRest","code":"E0319","message":"`Point3` pattern leaves out fields `x` (Int), `y` (Int), `z` (Int) and has no `..`","span":{"file":"fx.bl","line":17,"col":9},"help":"add `..`","fix":{"action":"insert `..`","text":"..","span":{"file":"fx.bl","line":17,"col":17,"end_line":17,"end_col":17}},"assist":{"action":"name the left-out fields","text":"x: _, y: _, z: _","span":{"file":"fx.bl","line":17,"col":17}}}"#,
+        #"{"severity":"error","name":"NoSuchField","code":"E0525","message":"`Point3` has no field `yy`","span":{"file":"fx.bl","line":23,"col":25},"help":"did you mean `y`?","fix":{"action":"rename to","text":"y","span":{"file":"fx.bl","line":23,"col":25,"end_line":23,"end_col":27}}}"#,
+    ]
+    if rows.join("\n") != want.join("\n") { io.eprintln("got:\n{rows.join("\n")}") }
+    assert_eq(rows.join("\n"), want.join("\n"))
+}
+
+test "blink fix adds the rest and labels the pun, and the result runs" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/fx.bl", broken())
+    let r = blink_in_dir("fix fx.bl")
+    let got = read_file("{DIR}/fx.bl")
+    let run = blink_in_dir("run fx.bl")
+    let _ = sh("rm -rf {DIR}")
+    let want = fx_src("Point3 \{ x, y, .. }", "Point3 \{ x, y: yy, .. }", "Point3 \{..}", "Point3 \{ x: px, y: q, .. }")
+    if got != want { io.eprintln("got file:\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(got == want)
+    assert(r.out.contains("4 fix(es) applied"))
+    assert(!got.contains(": _"))
+    assert_eq(run.exit_code, 0)
+    assert_eq(run.out.trim(), "1 3 0 3")
+}
+
+test "blink check, blink build and a one-unit build agree on the repairs" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/fx.bl", broken())
+    let check = blink_in_dir("check fx.bl")
+    let build = blink_in_dir("build fx.bl")
+    let one = blink_in_dir("build --no-per-module fx.bl")
+    let _ = sh("rm -rf {DIR}")
+    let shown = check.err_out.replace("error: check failed\n", "")
+    if shown != build.err_out || build.err_out != one.err_out {
+        io.eprintln("check:\n{check.err_out}\nbuild:\n{build.err_out}\none unit:\n{one.err_out}")
+    }
+    assert(shown == build.err_out)
+    assert(build.err_out == one.err_out)
+    assert(build.err_out.contains("fix: insert `..` `, ..` at 5:22"))
+    assert(build.err_out.contains("fix: label as `y: yy` at 11:21"))
+    assert(build.err_out.contains("4 error(s) found"))
+}
