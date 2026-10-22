@@ -227,7 +227,7 @@ type Shape {
     Circle(radius: Float)
     Rect(w: Float, h: Float)
 }
-let s = Circle(5.0)
+let s = Shape.Circle(5.0)   // an expression names the enum; only Some, None, Ok, Err are bare
 
 // Pattern matching (expression — returns value)
 let area = match s {
@@ -311,7 +311,7 @@ test "addition works" {
 | Set[T] | `Set.new()` | Hash set (empty: `Set.new()`, or `Set.new[T]()` to write the type) |
 | Option[T] | `Some(v)`, `None` | Nullable value |
 | Result[T, E] | `Ok(v)`, `Err(e)` | Error-or-value |
-| Ordering | `Less`, `Equal`, `Greater` | Result of `.cmp(other)`; prelude enum auto-imported via `std.traits`. Produced by `@derive(Ord)` and the ordering operators. |
+| Ordering | `Ordering.Less`, `Ordering.Equal`, `Ordering.Greater` | Result of `.cmp(other)`; prelude enum auto-imported via `std.traits`. Produced by `@derive(Ord)` and the ordering operators. |
 | Bytes | `Bytes.new()` | Byte buffer |
 | StringBuilder | `StringBuilder.new()` | Mutable string builder |
 | Instant | `time.read()` | Point in time |
@@ -345,10 +345,10 @@ test "addition works" {
 - **A struct or variant literal must name each field once.** A field with no default and no `..source` is `E0315 MissingField`; a label twice is `E0316 DuplicateField`; `..source` in a variant brace literal is `E0317 VariantSpread` (copy-update is for structs only).
 - **A struct or variant brace pattern gets the same label checks.** An unknown label is `E0525 NoSuchField` (the fix for a punned `yy` is `y: yy`), a label twice is `E0316 DuplicateField`, and fields left out with no `..` are `E0319 PatternMissingRest` (the fix adds `..`). `E0525` and `E0316` make a bad arm; `E0319` alone does not.
 - **An integer literal must fit the type it takes, else `E0318 IntLiteralOutOfRange`** (`300 does not fit in U8 (0 to 255)`). The check uses the exact value of the written digits, so no literal wraps. A literal with no expected type is `Int`; the help offers `let big: U64 = N` when the value fits `U64`. `-` on a literal, also through parens (`-(128)`), is one literal: `let b: I8 = -128` is valid, and under an unsigned type every negative literal is `E0318`, `-0` included. Literal patterns, range bounds and `const` values get the same check. `@allow` does not turn it off.
-- **A bare variant name that two or more enums declare, with no expected type, is `E0519 AmbiguousConstruction`.** Write `Enum.Variant` or add a type annotation.
-- **A bare variant named like a type in scope is `E0554 VariantNamedLikeType`**, in an expression, even with an expected type. A pattern still finds the variant from the matched value's type, so `match c { Red => ... }` is fine. The type can be a builtin: write `JsonValue.Bool(true)`, not `Bool(true)`. Write `Enum.Variant`.
+- **In an expression, write a variant with its enum: `Color.Red`, `Shape.Circle(1.0)`, `QueryError.NotFound { msg: m }`.** A bare `Red`, `Circle(1.0)` or `NotFound { ... }` is `E0554 UnqualifiedVariant`, also with an expected type, and also for stdlib enums: `Ordering.Less`, `JsonValue.Bool(true)`. Only `Some`, `None`, `Ok` and `Err` are bare (`Option.Some(1)` is also legal). A pattern does not change: `match c { Red => ... }` finds the variant from the matched value's type.
 - **Two `impl` blocks that can apply to one type for one trait are `E0526 OverlappingImpls`.**
-- **Two module-scope declarations of one name in one namespace are `E1016 DuplicateModuleBinding`** (values: `let`, `const`, `fn`; types: `type`, `alias`, `trait`, `effect`). A `let` or `fn` named like a variant of an enum in the package or the prelude is also `E1016`, and so is an import entry that binds such a value (alias it: `import pal.{Red as PalRed}`). A struct named like a variant of an enum in the package or the prelude is `E0518 NameCollision`, also at an import entry that binds it. At `Name { ... }`, a struct in scope comes before a variant; write `Enum.Variant { ... }` for the variant.
+- **Two module-scope declarations of one name in one namespace are `E1016 DuplicateModuleBinding`** (values: `let`, `const`, `fn`; types: `type`, `alias`, `trait`, `effect`). A `let`, `fn` or type named `Some`, `None`, `Ok` or `Err` is also `E1016`, and so is an import entry that binds one (alias it: `import pal.{Ok as PalOk}`). A name of any other variant is free for a value or a type. A struct named like a variant of an enum in the package or the prelude is `E0518 NameCollision`, also at an import entry that binds it. A bare `Name { ... }` is only a struct literal; write `Enum.Variant { ... }` for the variant.
+- **A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant and warns `W1011 ShadowedVariant`.**
 - **A hole in a template literal `t"..."` whose type is not a Template value type is `E0534 TemplateHoleType`.**
 - **`type`, `trait` or `effect` named like a builtin type or prelude trait shadows it and warns `W1010 ShadowedPreludeName`.** To reach the builtin, write `import blink.core.{Eq as CoreEq}`.
 - **A fn declared `-> Never` must not return, else `E0311`.** `panic(msg)`, `todo()`, `unreachable()` and `skip()` have type `Never`, so they fit any expected type. `todo()` warns `W0703 TodoInCode`.

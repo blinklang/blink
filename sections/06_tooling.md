@@ -134,12 +134,12 @@ The first line of a `///` doc comment serves as the intent declaration — it ca
 /// Validate user credentials against stored hash, returning the user on success
 fn verify_creds(email: Str, pwd: Str) -> Result[User, AuthError] ! DB {
     let user = db.query_one(t"SELECT * FROM users WHERE email = {email}")
-        ?? return Err(NotFound)
+        ?? return Err(AuthError.NotFound)
     if user.locked {
-        return Err(Locked)
+        return Err(AuthError.Locked)
     }
     if !crypto.verify(pwd, user.hash) {
-        return Err(BadCreds)
+        return Err(AuthError.BadCreds)
     }
     Ok(user)
 }
@@ -318,9 +318,9 @@ AI agents frequently generate multiple valid solutions to a problem. In current 
 /// Validate user credentials against stored hash
 fn verify_creds(email: Str, pwd: Str) -> Result[User, AuthError] ! DB {
     let user = db.query_one(t"SELECT * FROM users WHERE email = {email}")
-        ?? return Err(NotFound)
+        ?? return Err(AuthError.NotFound)
     if !crypto.verify(pwd, user.hash) {
-        return Err(BadCreds)
+        return Err(AuthError.BadCreds)
     }
     Ok(user)
 }
@@ -333,13 +333,13 @@ fn verify_creds(email: Str, pwd: Str) -> Result[User, AuthError] ! DB, Cache {
         Some(u) => u
         None => {
             let u = db.query_one(t"SELECT * FROM users WHERE email = {email}")
-                ?? return Err(NotFound)
+                ?? return Err(AuthError.NotFound)
             cache.set("user:{email}", u, ttl: 300)
             u
         }
     }
     if !crypto.verify(pwd, user.hash) {
-        return Err(BadCreds)
+        return Err(AuthError.BadCreds)
     }
     Ok(user)
 }

@@ -2,6 +2,8 @@
 
 # A Type Named Like a Variant — Design Rationale
 
+Superseded in part by [decisions/qualified-variants.md](qualified-variants.md) (E0554 now means `UnqualifiedVariant`).
+
 A `type Red { A, B }` and a variant `Color.Red` can live in one program. The type is in the type namespace.
 The variant is in `Color`'s `T.` namespace. A bare `Red` has one meaning at every site, but the dotted head
 `Red.x` has two readings, and the spec had no rule for it. This ruling states the rule for the dotted head, decides

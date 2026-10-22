@@ -852,8 +852,8 @@ fn first_positive(xs: List[Int?]) -> Int {
 }
 
 fn name_of(id: Int) -> Result[Str, Error] {
-    let user = find(id) ?? return Err(NotFound)
-    let nick = user.nick ?? alias_of(id) ?? return Err(NotFound)
+    let user = find(id) ?? return Err(Error.NotFound)
+    let nick = user.nick ?? alias_of(id) ?? return Err(Error.NotFound)
     Ok(nick)
 }
 
@@ -974,48 +974,46 @@ error[E1016]: `f` is declared twice in module `main`
 
 The primary span is on the later declaration in source order, and a label marks the first. N declarations of one name give N-1 diagnostics, each one pointing at the first declaration. The fix is a suggestion only, never machine-applicable: the compiler cannot know which declaration to rename. The program does not compile. To check the rest of the module after the error, the compiler binds the name to the first declaration. This is error recovery only; it does not make the first declaration the winner.
 
-**A value must not take a variant's name.** A variant is not in the value namespace. It lives in the `T.` namespace of its type (§2.12.3), and §3.4 *Variant Construction* resolves its bare spelling. But a bare name has one meaning at each site (§3.4), so a module-scope `let`, `let mut`, `const` or `fn` collides with:
+**A value or a type must not take the name of a bare variant.** A variant is not in the value namespace. It lives in the `T.` namespace of its type (§2.12.3). In an expression, a user variant always carries its enum (§3.4 *Variant Construction*), so a value or a type with the name of a user variant does not collide with it: `fn Red()` and the variant `Color.Red` can both exist. The four bare variants `Some`, `None`, `Ok` and `Err` are different. A bare `Ok` names the prelude variant in every module, so E1016 also covers:
 
-- a variant of any enum that a module of the same package declares, and
-- a variant of any prelude type (§10.6 *Prelude Types*). The variants of a prelude enum count as declared in every module.
+- a module-scope `let`, `let mut`, `const` or `fn` named `Some`, `None`, `Ok` or `Err`;
+- a type (a `type`, type alias, `trait` or `effect`) named `Some`, `None`, `Ok` or `Err`.
 
-The compiler reports this collision as E1016 too. The reach is the package, not the module: a `fn Leaf` in one module and a variant `Leaf` in another module of the package collide. Two enums that each have a variant `Pending` do not collide with each other (§3.4). The check does not cover a variant of a dependency enum. There, a bare use finds the module-scope value first (§3.4), and W1011 marks the value when an import entry names the variant's type (§10.6 *Shadowing Rules*). A local binding with a variant's name is legal, and gets W1011.
-
-An import entry that binds a value (a `let`, `const` or `fn` of another module) with the name of a variant of the package or of the prelude is E1016 at the import entry. It is not E1012: E1012 is for an import and a declaration of one name in one module. The fix is an item alias: `import pal.{Red as PalRed}`.
+An import entry that binds a value or a type with one of these names is E1016 at the import entry. It is not E1012: E1012 is for an import and a declaration of one name in one module. The fix is an item alias, such as `import pal.{Ok as PalOk}`. A local binding with one of these names is legal, and gets W1011 (§10.6 *Shadowing Rules*).
 
 ```blink
-// src/paint/colors.bl
-type Color { Red, Green }
-
 // src/paint/mix.bl
-import pal.{Green}           // error[E1016]: `Green` collides with variant `Color.Green`
-fn Red() -> Int { 1 }        // error[E1016]: `Red` collides with variant `Color.Red`
+type Color { Red, Green }
+fn Red() -> Int { 1 }        // legal: the variant is always `Color.Red`
 let Ok = 5                   // error[E1016]: `Ok` collides with variant `Result.Ok`
-```
-
-```
-error[E1016]: `Red` collides with variant `Color.Red` (module `paint.colors`)
- --> src/paint/mix.bl:1:4
-  |
-1 | fn Red() -> Int { 1 }
-  |    ^^^ module-scope value has the name of a variant
-  |
-  = note: variant `Color.Red` is declared at src/paint/colors.bl:1:14
-  = help: rename the value; a bare `Red` in this package must have one meaning
+type None { Empty, Full }    // error[E1016]: `None` collides with variant `Option.None`
 ```
 
 ```
 error[E1016]: `Ok` collides with variant `Result.Ok` (prelude)
- --> src/paint/mix.bl:2:5
+ --> src/paint/mix.bl:4:5
   |
-2 | let Ok = 5
+4 | let Ok = 5
   |     ^^ `Ok` is a variant of the prelude type `Result`
   |
-  = note: the variants of a prelude enum count as declared in every module
+  = note: `Some`, `None`, `Ok` and `Err` are bare in every module
   = help: rename the value
 ```
 
-The primary span is always on the value declaration, whatever the source order. The message names the variant's type and the module that declares it, and a `note:` gives the variant's location; when both are in one file, a secondary label marks the variant instead. A prelude variant has no source span, so the message says which prelude type has it. Each value declaration with a variant's name gives one diagnostic. As above, the fix is a suggestion only.
+```
+error[E1016]: `None` collides with variant `Option.None` (prelude)
+ --> src/paint/mix.bl:5:6
+  |
+5 | type None { Empty, Full }
+  |      ^^^^ `None` is a variant of the prelude type `Option`
+  |
+  = note: `Some`, `None`, `Ok` and `Err` are bare in every module
+  = help: rename the type
+```
+
+At an import entry, the help gives an item alias instead, such as `import pal.{None as NoneCode}`.
+
+The primary span is always on the declaration or the import entry, whatever the source order. A prelude variant has no source span, so the message says which prelude type has it. Each declaration with one of these names gives one diagnostic. As above, the fix is a suggestion only.
 
 **`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For a compile-time constant, use `const` (see [2.21](#221-const-declarations)). Use `let` for a value that a `const` cannot hold, such as a list or a function literal. Its initializer must be static (below).
 
@@ -1417,7 +1415,7 @@ let config = ServerConfig { port: 3000, debug: true }
 These rules apply to each literal that names fields:
 
 - a struct literal `T { ... }`, with or without `..source` (§2.16);
-- a variant brace literal, qualified or bare (§3.4);
+- a variant brace literal (§3.4);
 - a variant paren payload whose arguments are **all** labelled (§3.4);
 - the construction shorthand `{ ... }` (§2.15).
 

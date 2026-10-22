@@ -2214,7 +2214,7 @@ In Blink, `type` is `type`. If it has variants, it's a sum. If it has fields, it
 
 #### Variant Construction
 
-Enum variants are constructed by naming the variant and supplying its payload. A variant may be constructed in either of two forms:
+Enum variants are constructed by naming the variant and supplying its payload. In an expression, a variant carries its enum: write `Enum.Variant`, `Enum.Variant(...)` or `Enum.Variant { ... }`. The four variants of `Option` and `Result` are the only exception: write `Some`, `None`, `Ok` and `Err` bare.
 
 ```blink
 type QueryError {
@@ -2222,148 +2222,140 @@ type QueryError {
     Timeout { ms: Int }
 }
 
-let a = QueryError.NotFound { msg: "id 0" }   // qualified
-let b = NotFound { msg: "id 0" }              // bare — resolves to QueryError.NotFound
+let a = QueryError.NotFound { msg: "id 0" }   // a user variant: qualified
+let b = QueryError.Timeout { ms: 30 }
+let c = Some(a)                               // a prelude variant: bare
 ```
 
-The bare form (`NotFound { msg: "x" }`) and the qualified form (`QueryError.NotFound { msg: "x" }`) are equivalent: they construct the same value and emit identical code. Bare construction mirrors the forms that already exist elsewhere in the language — bare tuple-style construction (`Leaf(1)`, see *Generic Types* below) and bare struct-style patterns (`NotFound { msg }` in a `match` arm, §3.5). Construction and pattern matching are duals; both accept the bare and qualified spellings.
+**The rule.** In an expression, a bare user variant is an error (*Unqualified variant*, below). The rule covers all three forms: `X`, `X(...)` and `X { ... }`. A *user variant* here is every variant except `Some`, `None`, `Ok` and `Err`: a variant of an enum of the module, of the package, of a dependency, or of the standard library. So write `Ordering.Less` and `JsonValue.Str("a")`, as for an enum that you declare.
 
-**Which spelling to write.** Write the bare form. Write the qualified form only where the bare form cannot reach the variant:
+Patterns do not change. In a pattern, a bare uppercase name names a variant of the type of the matched value (§3.5 *Pattern Forms*), and the qualified pattern stays legal. So `match c { Red => 1, Green => 2 }` is legal, but `let x = Red` is not.
 
-- a name that two or more candidate enums declare, with no expected type at the site (E0519, below);
-- a variant that a value binding hides (*Values come first*, below);
-- a user variant that has the name of a prelude variant (`Some`, `None`, `Ok`, `Err`);
-- a variant named like a type in scope (*Dotted heads*, below): the bare form is E0554.
+**The bare list.** The list of bare variants is exactly `Some`, `None`, `Ok` and `Err`. These are the variants of `Option` and `Result`, and no others. Their qualified forms (`Option.Some(1)`, `Option.None`, `Result.Ok(x)`, `Result.Err(e)`) stay legal. The list is closed: no other prelude or standard-library enum joins it, and only a new panel vote can change it. `Ordering` (`Less`, `Equal`, `Greater`) and `JsonValue` are qualified like any other enum.
 
-A `help:` line in a diagnostic writes the qualified form, because that form is the full name of the variant. It is not a second rule. The examples in this spec follow this guidance: an example uses one spelling for each enum, and it qualifies a variant only to show one of the cases above. `blink fmt` does not change one spelling into the other (below).
+A bare `Some`, `None`, `Ok` or `Err` in an expression always names the prelude variant. This holds also when a user enum declares a variant of that name: write that variant qualified, as any other user variant. A type named `Some`, `None`, `Ok` or `Err` is a declaration error (E1016, §2.12.1).
 
-**Resolution order.** At a construction site, the compiler resolves a bare `Name` in this order. Steps 1 and 2 apply to the brace form `Name { ... }`. Steps 3 and 4 also decide `Name` and `Name(...)`, once *Values come first* (below) finds no value of that name:
+**Resolving a bare name.** In an expression, a bare uppercase `Name`, `Name(...)` or `Name { ... }` never selects a user variant:
 
-1. **Qualified** — if the site is already written `Enum.Variant { ... }`, that names the variant directly.
-2. **Struct in scope** — a struct type `Name` in scope at the site names that struct. The module declares the struct, or binds it by an import entry. A hint never moves resolution past a struct in scope.
-3. **Hint-directed** — the expected type at the site (*Expected type at a site*, below) names an enum that has a variant `Name`. The hint is consulted *first* among the variant rules so that resolution is determined locally: a distant enum declaration can never retroactively change which variant a site resolves to.
-4. **Global-unique** — if no struct is in scope and no hint applies, `Name` resolves to the one variant of that name among the *candidate* enums. If two or more candidates declare `Name`, see the ambiguity rule below. The candidates are:
-   - the enums of the site's module;
-   - the `pub` enums of the other modules of the site's package;
-   - the prelude enums;
-   - each enum of another package that the module binds by an import entry that names the type (`import palette.{Shade}`). A whole-module import (`import palette`) adds none of its enums.
+- `Name { ... }` reads the type namespace. It is a literal of the struct `Name` (§2.14), when the module declares that struct or binds it by an import entry. A hint never changes this. When no struct `Name` is in scope and a candidate enum (below) has a variant `Name`, the site is E0554. Otherwise the name is undefined.
+- `Name` and `Name(...)` follow *Values come first* (below).
 
-   A non-`pub` enum of another module is never a candidate.
+**Candidates for the help.** When a site is E0554, the compiler finds the variants that the bare name can mean. It uses them only to write the `help:` line. They never give the site a meaning. The *candidate* enums are:
 
-Inside the package, an import never adds or removes a candidate. For an enum of another package, only an import entry that names the type adds it. So a site in a dependency never sees an enum of a package that depends on it: a site in `std` never sees an enum of the program. A new `pub` enum in a dependency changes the meaning of a bare name only in a module that imports that enum by name.
+- the enums of the site's module;
+- the `pub` enums of the other modules of the site's package;
+- the prelude enums;
+- each enum of another package that the module binds by an import entry that names the type (`import palette.{Shade}`). A whole-module import (`import palette`) adds none of its enums.
 
-```blink
-// package app; std.time declares `pub type Weekday { Monday, Tuesday, ... }`
-// and package palette declares `pub type Shade { Dark, Light }`
-import palette.{Shade}
-import std.time
+A non-`pub` enum of another module is never a candidate.
 
-type Day { Monday, Funday }
+A bare name that matches no candidate, but matches a `pub` enum of another package that the module does not import by name, is an undefined-name error at the name: `UndefinedVariable` (E0506) for `Name`, `UndefinedFunction` (E0504) for `Name(...)`. Its `help:` names that enum and gives the import entry and the qualified form as the fix. The binding has the poison type (§6.3.5), so no follow-on error appears.
 
-fn main() {
-    let d = Monday                    // Day.Monday: std's Weekday is not a candidate
-    let c = Dark                      // Shade.Dark: the import entry names the type
-    let w: time.Weekday = Tuesday     // the hint reaches any enum that the site names
-}
-```
-
-The last line writes `Weekday` through the qualifier `time`, so no import entry adds `Weekday` to the candidates. The entry `import std.time.{Weekday}` would add it, and `Monday` on the first line would then be E0519.
-
-A bare name that matches no candidate, but matches a `pub` enum of another package that the module does not import by name, is an undefined-name error at the name: `UndefinedVariable` (E0506) for `Name`, `UndefinedFunction` (E0504) for `Name(...)`. Its `help:` names that enum and gives the qualified form or the import entry as the fix. The binding has the poison type (§6.3.5), so no follow-on error appears.
-
-**Expected type at a site.** A site has the expected type `T` at these positions, and at no other:
+**Expected type at a site.** A site has the expected type `T` at the positions below, and at no other. The list has a job only where a value needs a type from its context: it types a literal (§3.2), and it infers the type argument `T` of `None`, `Some(e)`, `Ok(e)` or `Err(e)`. It does no name resolution. A user variant is always qualified, and a bare `Some`, `None`, `Ok` or `Err` always names the prelude variant, so an expected type never selects a variant.
 
 1. the value of `let x: T = e`;
 2. the value of an assignment to a place of type `T` (`x = e`, `p.f = e`);
 3. the tail of a function body, and the operand of `return`, where the function declares the return type `T`;
-4. a call or method argument, where the declared parameter type is `T`. A parameter whose type is a type parameter of the callee gives no expected type, unless explicit type arguments fix it: `id[A](Red)` has the expected type `A`, and `id(Red)` has none;
+4. a call or method argument, where the declared parameter type is `T`. A parameter whose type is a type parameter of the callee gives no expected type, unless explicit type arguments fix it: `id[Option[Int]](None)` has the expected type `Option[Int]`, and `id(None)` has none;
 5. a field value in a struct or variant brace literal, where the declared field type is `T`;
 6. the payload of `Some(e)`, `Ok(e)` or `Err(e)` under an expected `Option[T]` or `Result[T, E]`: `T`, or `E` for `Err`;
 7. each element of a list literal under an expected `List[T]`; element `i` of a tuple literal under an expected tuple type;
 8. the right operand of `a ?? e`: the inner type of `a`;
-9. an operand of `==`, `!=`, `<`, `<=`, `>` or `>=`. If exactly one operand is a bare variant name (or an `if`, `match` or block whose result values are all bare variant names), the other operand has a type of its own, and that type is the expected type of the first. If both operands are such names, neither has an expected type: `Red == Red`, with two enums that declare `Red`, is E0519. A literal operand follows §3.2 *Operator operands*.
+9. an operand of `==`, `!=`, `<`, `<=`, `>` or `>=`. If exactly one operand is `None`, `Some(e)`, `Ok(e)` or `Err(e)` (or an `if`, `match` or block whose result values all have one of these forms), the other operand has a type of its own, and that type is the expected type of the first. A literal operand follows §3.2 *Operator operands*.
 
 An expected type at a position reaches each branch value of an `if`, each arm value of a `match`, and the tail of a block. It does not reach a condition, a guard, a scrutinee, or a statement that is not the tail.
 
-*Values come first* (below) governs `Name` and `Name(...)`. A struct has no bare form and no call form, so those two spellings never find a struct. When a type named `Name` is in scope, those two spellings are not a variant either: they are E0554 (*Dotted heads*, below). The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
+A struct has no bare form and no call form, so `Name` and `Name(...)` never find a struct. The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
 
 Resolution is static. A bare name at a site denotes exactly one entity, and the compiler determines it statically.
 
-**Values come first.** At a bare use of `Name`, the hint-directed and global-unique steps above apply only when no value binding has the name. This list governs a bare use of `Name`, in an expression or in a call `Name(...)`. The *Resolution order* list above governs `Name { ... }`. The head of a dotted path `Name.x` follows *Dotted heads*, below. At a bare use, the compiler looks in this order, and the first step that finds `Name` decides:
+**Values come first.** At a bare use of `Name` in an expression, or in a call `Name(...)`, the compiler looks in this order, and the first step that finds `Name` decides:
 
 1. a local binding (a `let`, a parameter, a closure parameter or a pattern binder);
 2. a module-scope value: a `let`, `let mut`, `const` or `fn` of the module, or an imported value;
-3. a variant, by the hint-directed and global-unique steps above.
+3. a prelude variant: `Some`, `None`, `Ok` or `Err`.
 
-A hint never moves resolution past a binding. A value that step 2 finds is never a variant of the same package or of the prelude, because that pair is E1016 (§2.12.1). This holds for an imported value too: an import entry that binds such a value is E1016 at the import entry. So step 2 can hide only a variant of a dependency enum. A local can hide any variant, and gets W1011 (§10.6 *Shadowing Rules*).
+If no step finds `Name`, and a candidate enum has a variant `Name`, the site is E0554 (*Unqualified variant*, below). Otherwise the name is undefined: E0506 for `Name`, E0504 for `Name(...)`. The head of a dotted path `Name.x` follows *Dotted heads*, below.
 
-A struct that the *Resolution order* struct step finds is never a variant of the same package or of the prelude either, because that pair is E0518 (*Name collisions*, below). So that step can hide only a variant of a dependency enum, and W1011 marks it.
+Step 2 never finds one of the four names, because a module-scope value with such a name is E1016 (§2.12.1). This holds for an imported value too: an import entry that binds such a value is E1016 at the import entry. A local can have one of the four names. It hides the prelude variant, and gets W1011 (§10.6 *Shadowing Rules*).
+
+A value never hides a user variant, because a bare name never reaches a user variant. A value `Warm` and the variant `Tone.Warm` can both exist, and each spelling names one of them:
 
 ```blink
-// package app; package pal declares `pub type Tone { Warm, Cool }`
-import pal.{Tone}
+type Tone { Warm, Cool }
 
-const Warm = 1                    // warning[W1011]: hides variant `Tone.Warm`
+const Warm = 1                    // legal: the variant is always `Tone.Warm`
 
 fn main() {
-    let t: Tone = Warm            // error[TypeError]: declared type Tone but got Int
+    let n = Warm                  // the const, 1
+    let t = Tone.Warm             // the variant
+    let u: Tone = Warm            // error[TypeError]: declared type Tone but got Int
                                   // help: write `Tone.Warm` for the variant
-    let u: Tone = Tone.Warm       // the qualified form always reaches the variant
 }
 ```
 
-When a value that hides a variant gives a type error at a site with a hint, the error gets a `help:` line that names the qualified variant, for example `Tone.Warm`. The same holds when a struct in scope hides the variant at `Name { ... }`: the help names, for example, `Shape.Point { ... }`. The help appears only when the hint names an enum that has a variant of that name.
+When a value gives a type error at a site whose expected type is an enum with a variant of that name, the error gets a `help:` line that names the qualified variant, for example `Tone.Warm`.
 
-A struct in scope can hide a dependency variant in the same way:
-
-```blink
-// package app; package geo declares `pub type Shape { Point { x: Int, y: Int }, Circle { r: Int } }`
-import geo.{Shape}
-
-type Point { x: Int, y: Int }     // warning[W1011]: struct `Point` hides variant `Shape.Point`
-
-fn main() {
-    let p = Point { x: 1, y: 2 }  // the struct `Point`
-    let s: Shape = Point { x: 1, y: 2 }
-                                  // error[TypeError]: declared type Shape but got Point
-                                  // help: write `Shape.Point { ... }` for the variant
-    let t: Shape = Shape.Point { x: 1, y: 2 }   // the qualified form always reaches the variant
-}
-```
-
-**Dotted heads.** At `Name.x` and `Name.x(...)`, `Name` can be a value, a name in the type namespace, or a bare variant. The compiler looks in this order, and the first step that finds `Name` decides:
+**Dotted heads.** At `Name.x` and `Name.x(...)`, `Name` can be a value, a name in the type namespace, or one of the four prelude variants. The compiler looks in this order, and the first step that finds `Name` decides:
 
 1. a local binding, or a module-scope value, named `Name` (steps 1 and 2 of *Values come first*). Then `Name.x` is a field access or a method call on that value;
 2. a name in the type namespace: a struct, enum, alias, trait or effect. Then `Name.x` is a *type path*: `x` is a member of the `T.` namespace of that type (§2.12.3). A member is a variant, a `fn T.name`, a `const T.X`, or an associated function of a trait;
-3. a bare variant `Name`, found as for a bare use of `Name`. Then `Name.x` is a field access or a method call on the variant value, for example `Green.label()`. This step does not run when step 2 finds a type: a bare variant named like a type in scope is an error (*Variant named like a type*, below).
+3. the prelude variant `None`, or a `Some(...)`, `Ok(...)` or `Err(...)` form. Then `Name.x` is a field access or a method call on the variant value: `None.is_none()` and `Some(x).map(f)` read as the variant.
+
+Step 3 covers these four names only. A user variant never heads a dotted path bare: `Red.x` is always the type or the value `Red`. When steps 1 and 2 find no `Name`, and a candidate enum has a variant `Name`, the site is E0554. So `Green.label()` is an error, and `Color.Green.label()` calls the method on the variant.
 
 The compiler picks the reading from scope and namespaces only, never from the members of the type. If `x` is not a member of the type in step 2, the site is an error. The compiler does not read `Name.x` again as a value or as a variant value. So an `impl` that another module adds never changes what an existing site means.
 
-A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. When a type has the name of a variant, write the qualified variant to reach the variant or a member of the variant value: `Color.Red`, `Color.Red.label()`. A variant with the name of its own enum is E0518 (*Name collisions*, below).
+A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. A variant with the name of its own enum is E0518 (*Name collisions*, below).
 
-When a site reads a type path and fails (an unknown member or a wrong number of arguments), and a bare variant of that name is in reach, the error gets a `help:` line that names the qualified variant.
+When a site reads a type path and fails (an unknown member or a wrong number of arguments), and a candidate enum has a variant of that name, the error gets a `help:` line that names the qualified variant.
 
-A type in step 2 can hide a variant of a different enum. W1011 marks it at the type declaration, once for each variant that the type hides. A variant counts when a bare use of its name in the module can reach it (*Resolution order*, above); for a dependency variant, §10.6 *Shadowing Rules* adds the import-entry condition.
+**Unqualified variant.** A bare user variant in an expression is `error[UnqualifiedVariant]` (E0554). The rule covers `X`, `X(...)` and `X { ... }`. It holds in every expression, also at a position with an expected type (*Expected type at a site*, above): an expected type never makes the bare form legal. A type named `X` in scope does not change it either. It does not reach patterns: a pattern finds its variant from the type of the matched value (§3.5). The help writes the qualified form. When one candidate enum has a variant `X`, the help is machine-applicable. When two or more have it, the help lists each qualified form.
 
-**Variant named like a type.** A bare variant `X` or `X(...)` is an error when a type named `X` is in scope. The type is a struct, enum, alias, trait or effect that the module declares or imports, or a builtin or prelude type such as `Bool`, `Str` or `Option`. The error is `error[VariantNamedLikeType]` (E0554). The fix is the qualified form `Enum.X`. The rule holds in every expression, also at a position with an expected type (*Expected type at a site*, above): an expected type does not make the bare form legal. It does not reach patterns: a pattern finds its variant from the type of the matched value (§3.5), so `match c { Red => 1, Green => 2 }` stays legal. When two enums have a variant `X`, the help lists each qualified form. The help is machine-applicable when there is one candidate.
+```
+error[E0554]: variant `Green` needs its enum in an expression
+  help: write `Color.Green`
+```
 
 ```blink
 type Color { Red, Green }
+type Red { A, B }                 // legal: the type `Red` and the variant `Color.Red` do not collide
 
-type Red { A, B }                     // warning[W1011]: type `Red` hides variant `Color.Red`
-
-trait Label { fn label(self) -> Str }
-impl Label for Red { fn label(self) -> Str { "type" } }
-impl Label for Color { fn label(self) -> Str { "variant" } }
+fn paint(c: Color) -> Str {
+    match c {
+        Red => "red"              // a pattern: the variant `Color.Red`, from the type of `c`
+        Green => "green"
+    }
+}
 
 fn main() ! IO {
-    let c = Red                       // error[VariantNamedLikeType]: bare `Red` names the type `Red`, not a variant
-                                      // help: write the variant with its enum: `Color.Red`
-    let d = Color.Red                 // the variant
-    let r = Red.A                     // type path: variant `A` of the type `Red`
-    io.println(Red.label())           // error[TypeError]: function Red.label expects 1 argument(s), got 0
-                                      // help: to use the variant, write `Color.Red`
-    io.println(Color.Red.label())     // the qualified form always reaches the variant
+    let a = Red                   // error[UnqualifiedVariant]: variant `Red` needs its enum in an expression
+                                  // help: write `Color.Red`
+    let b: Color = Green          // error[UnqualifiedVariant]: an expected type does not make it legal
+                                  // help: write `Color.Green`
+    let c = Color.Red             // the variant
+    let r = Red.A                 // a type path: variant `A` of the type `Red`
+    io.println(paint(c))
+}
+```
+
+The brace form follows the same rule. With no struct `NotFound` in scope, a bare `NotFound { ... }` is E0554, also inside a carrier whose expected type names the enum:
+
+```blink
+type QueryError {
+    NotFound { msg: Str }
+    Timeout { ms: Int }
+}
+
+fn lookup(id: Int) -> Result[Str, QueryError] {
+    if id == 0 {
+        return Err(NotFound { msg: "id 0" })              // error[UnqualifiedVariant]
+                                                          // help: write `QueryError.NotFound { ... }`
+    }
+    if id < 0 {
+        return Err(QueryError.NotFound { msg: "id < 0" })  // the variant
+    }
+    Ok("found")
 }
 ```
 
@@ -2380,38 +2372,22 @@ fn main() ! IO {
     help: to wrap one value, use a one-field struct (*Newtypes*, above): `type Errno { code: Int }`
   ```
 
-  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique. For a struct, E0518 holds because `Name { ... }` reads as both a struct literal and a variant brace literal. An enum, alias, trait or effect has no such literal, so a type of one of those kinds named like a variant of a different enum is legal at its declaration. At a dotted head the type comes before the variant (*Dotted heads*, above), W1011 marks it, and a bare use of the variant is E0554 (*Variant named like a type*, above).
+  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique. For a struct, E0518 holds because `Name { ... }` reads as both a struct literal and a variant brace literal. An enum, alias, trait or effect has no such literal, so a type of one of those kinds named like a variant of a different enum is legal at its declaration. At a dotted head the type comes before the variant (*Dotted heads*, above), and a bare use of the variant is E0554 (*Unqualified variant*, above).
 
-- **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Such a name is resolved by the hint:
+- **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Each use in an expression names its enum. A bare `Pending` is E0554, and its help lists both qualified forms:
 
   ```blink
   type JobState { Pending, Running, Done }
   type NetState { Pending, Connected }
 
-  let s: JobState = Pending   // hint (binding annotation) selects JobState.Pending
-  ```
-
-  When a bare construction of a name shared across candidate enums has no hint to resolve it, that specific site is a **compile error** (`error[AmbiguousConstruction]`) requiring qualification:
-
-  ```blink
-  fn f() {
-      let x = Pending   // error[AmbiguousConstruction]: 'Pending' is a variant of both
-                        // JobState and NetState; qualify as JobState.Pending or NetState.Pending
+  fn main() {
+      let s = JobState.Pending    // the variant of JobState
+      let x = Pending             // error[UnqualifiedVariant]
+                                  // help: write `JobState.Pending` or `NetState.Pending`
   }
   ```
 
-No path ever silently picks a winner between two constructible names: every collision is either a declaration-time error (struct vs variant) or a use-site error requiring qualification (variant vs variant with no hint). A value that hides a variant is not such a collision. It is a shadow between scopes, by the order in *Values come first*, and W1011 marks it where §10.6 *Shadowing Rules* says. A struct that hides a dependency variant is a shadow in the same way, by the struct step in *Resolution order*, and W1011 marks it too. A type that hides a variant at a dotted head is a shadow too, by the order in *Dotted heads*, and W1011 marks it.
-
-A bare struct-style construction with a payload in carrier position resolves through the carrier's expected type:
-
-```blink
-fn lookup(id: Int) -> Result[Str, QueryError] {
-    if id == 0 {
-        return Err(NotFound { msg: "id 0" })   // Err's carrier expects QueryError
-    }
-    Ok("found")
-}
-```
+No path ever silently picks a winner between two constructible names: a struct and a variant with one name is a declaration-time error (E0518), and a variant carries its enum in an expression. A value with the name of a user variant does not collide with it, because a bare name never reaches a user variant. A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant. That is a shadow between scopes, by the order in *Values come first*, and W1011 marks it (§10.6 *Shadowing Rules*).
 
 **A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
 
@@ -2642,7 +2618,7 @@ Type parameters are inferred at construction sites when possible:
 
 ```blink
 let pair = Pair { first: "hello", second: 42 }  // Pair[Str, Int]
-let tree = Branch(Leaf(1), Leaf(2))              // Tree[Int]
+let tree = Tree.Branch(Tree.Leaf(1), Tree.Leaf(2))              // Tree[Int]
 ```
 
 #### Explicit Type Application
@@ -3010,7 +2986,7 @@ fn f() {
 }
 ```
 
-The diagnostic points at the binding — where the annotation fix applies — and carries a secondary span at the empty constructor (`Map.new()` / `[]`) explaining why the parameter is open (`error[CannotInferType]`, E0301 — see [ERROR_CATALOG.md](../ERROR_CATALOG.md)). This mirrors the `AmbiguousConstruction` rule (§3.4): no path ever silently picks a winner.
+The diagnostic points at the binding — where the annotation fix applies — and carries a secondary span at the empty constructor (`Map.new()` / `[]`) explaining why the parameter is open (`error[CannotInferType]`, E0301 — see [ERROR_CATALOG.md](../ERROR_CATALOG.md)). This mirrors the variant rules (§3.4): no path ever silently picks a winner.
 
 **A type parameter named by no field is reported too.** The rule is the same one: every type parameter the declaration binds must be determined, and a phantom parameter is determined only by an annotation on the binding or by a type-argument list on the literal head. So `let w = W { n: 1 }` for `type W[T] { n: Int }` is `error[CannotInferType]` on `T` — repaired by `let w: W[Int] = W { n: 1 }` or by `let w = W[Int] { n: 1 }`. This follows from *no erasure* (§3.4 *Explicit Type Application*): a phantom parameter is part of the type's identity, so leaving it open leaves the type open. It is also the Hindley-Milner discipline Blink's ancestry (§1.3) shares with OCaml, SML, Haskell, and Rust — an unconstrained type variable is resolved by unification or reported, never assigned a type the program did not ask for.
 
@@ -3172,20 +3148,20 @@ match_arm     ::= pattern guard? "=>" expression
 
 A pattern is *refutable* when it can fail to match (*Refutable vs Irrefutable Patterns*, below). The rule applies at every refutable pattern position. Today these are the pattern of a `match` arm, at any depth, and the pattern operand of `assert_matches` (§2.20). A future form that takes a refutable pattern uses this rule. In a refutable pattern:
 
-- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a payload (`Red`, `Red(x)`, `Red { .. }`). A type with that name in scope does not change this: E0554 (§3.4 *Dotted heads*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
+- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a payload (`Red`, `Red(x)`, `Red { .. }`). A type with that name in scope does not change this: E0554 (§3.4 *Unqualified variant*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
 - A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) keeps the type-directed rule. It is a variant only when the type at that position has a variant of that name. Otherwise a name with no payload is a new binding. A name with a payload always names a variant, so it gets the same errors as an uppercase name: E0308 when the type is not an enum, E0547 when the enum has no variant of that name.
 
 The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. The protection against a typo covers variants whose names start with an uppercase letter only.
 
 In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a payload must name a variant.
 
-The *Global-unique* step of §3.4 *Resolution order* never runs in a pattern, and no value binding, local or module-scope, changes what a pattern means.
+No value binding, local or module-scope, changes what a pattern means.
 
 ```blink
 type Color { Red, Green }
 
 fn name(c: Color) -> Str {
-    let Red = 5                    // warning[W1011]: hides variant `Color.Red`
+    let Red = 5                    // a local: the variant stays `Color.Red`
     match c {
         Red => "red"               // still `Color.Red`: the scrutinee is a Color
         Green => "green, not {Red}"  // an expression: `Red` is the local, 5
@@ -3238,7 +3214,7 @@ fn check(n: Int) -> Str {
 }
 ```
 
-A binder in a refutable pattern cannot have the name of an uppercase variant, because that name is the variant. So a pattern binder gets W1011 (§10.6 *Shadowing Rules*) only in an irrefutable pattern, or when its name does not start with an uppercase letter.
+A binder in a refutable pattern cannot have the name of an uppercase variant, because that name is the variant. W1011 (§10.6 *Shadowing Rules*) covers only a binder named `Some`, `None`, `Ok` or `Err`, so a pattern binder gets W1011 only in an irrefutable pattern.
 
 **A variant the enum does not declare.** A variant pattern must name a variant that its enum declares. The compiler reports `error[NoSuchVariant]` (E0547) for:
 
@@ -4357,10 +4333,10 @@ Operators desugar to trait method calls. The full mapping:
 | `-a` | `Neg.neg(a)` | `Neg` |
 | `a == b` | `a.eq(b)` | `Eq` |
 | `a != b` | `a.ne(b)` | `Eq` |
-| `a < b` | `a.cmp(b) == Less` | `Ord` |
-| `a > b` | `a.cmp(b) == Greater` | `Ord` |
-| `a <= b` | `a.cmp(b) != Greater` | `Ord` |
-| `a >= b` | `a.cmp(b) != Less` | `Ord` |
+| `a < b` | `a.cmp(b) == Ordering.Less` | `Ord` |
+| `a > b` | `a.cmp(b) == Ordering.Greater` | `Ord` |
+| `a <= b` | `a.cmp(b) != Ordering.Greater` | `Ord` |
+| `a >= b` | `a.cmp(b) != Ordering.Less` | `Ord` |
 
 Operands must be the same type. Mixed-type arithmetic (`Int + Float`) is a compile error -- use explicit conversion.
 
@@ -4626,7 +4602,7 @@ type Shape { Circle(r: Int)  Sq(s: Int) }
 
 fn main() {
     let c = Color.Red == Color.Green            // OK: fieldless, compares the variant
-    let s = Circle(1) == Circle(1)              // OK: derived
+    let s = Shape.Circle(1) == Shape.Circle(1)              // OK: derived
     let o = Some(Color.Red) == Some(Color.Red)  // OK: `Option[Color]` is `Eq`
     io.println("{c} {s} {o}")                   // false true true
 }
@@ -4662,9 +4638,9 @@ fn biggest[T: Ord](a: T, b: T) -> T {
 
 fn main() {
     let top = biggest(Priority.Low, Priority.High)     // Priority.High
-    let o = Priority.Medium.cmp(Priority.Low)          // Greater
+    let o = Priority.Medium.cmp(Priority.Low)          // Ordering.Greater
     let t = (Priority.Low, 9) < (Priority.High, 0)     // true
-    let bad = Circle(1) < Circle(2)                    // error: `Shape` does not implement `Ord`
+    let bad = Shape.Circle(1) < Shape.Circle(2)                    // error: `Shape` does not implement `Ord`
                                                        //   help: add `@derive(Ord)` to `Shape`
 }
 ```
@@ -4706,11 +4682,11 @@ fn main() {
 
 **Ord laws.** An `Ord` impl must be a total order that agrees with `Eq`:
 
-- `a.cmp(b) == Equal` exactly when `a == b`.
-- `a.cmp(b) == Less` exactly when `b.cmp(a) == Greater`.
-- If `a.cmp(b) == Less` and `b.cmp(c) == Less`, then `a.cmp(c) == Less`.
+- `a.cmp(b) == Ordering.Equal` exactly when `a == b`.
+- `a.cmp(b) == Ordering.Less` exactly when `b.cmp(a) == Ordering.Greater`.
+- If `a.cmp(b) == Ordering.Less` and `b.cmp(c) == Ordering.Less`, then `a.cmp(c) == Ordering.Less`.
 
-A `sort_by` comparator need only be a **total preorder**. It obeys the second and third laws, and `cmp(a, a)` is `Equal`, but it may return `Equal` for two values that are not `==`. A comparator on one field, such as `fn(a, b) { a.age.cmp(b.age) }`, does this, and stability (*The `ListOps` Trait*, §3.2.2) keeps such elements in their input order. Every built-in `Ord` obeys the laws; `Float` obeys them because `NaN` sorts last (*Float Total Ordering*). If a user `Ord` impl or a comparator breaks a law, `sort` and `sort_by` still terminate. They return a permutation of the input, in which each element occurs exactly once, in an unspecified order. They stay memory-safe and do not panic.
+A `sort_by` comparator need only be a **total preorder**. It obeys the second and third laws, and `cmp(a, a)` is `Ordering.Equal`, but it may return `Ordering.Equal` for two values that are not `==`. A comparator on one field, such as `fn(a, b) { a.age.cmp(b.age) }`, does this, and stability (*The `ListOps` Trait*, §3.2.2) keeps such elements in their input order. Every built-in `Ord` obeys the laws; `Float` obeys them because `NaN` sorts last (*Float Total Ordering*). If a user `Ord` impl or a comparator breaks a law, `sort` and `sort_by` still terminate. They return a permutation of the input, in which each element occurs exactly once, in an unspecified order. They stay memory-safe and do not panic.
 
 **Cyclic data.** `List`, `Map` and `Set` are shared cells, so a value can contain itself (for example, through a struct field that holds the list that holds the struct). `==` on cyclic data may not terminate. The compiler adds no cycle guard.
 

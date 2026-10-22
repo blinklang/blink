@@ -2614,7 +2614,7 @@ There `import b.x.{Q}` binds `x` too. To bind `Q` and `bx` but not `x`, write `i
 
 #### Unused Imports
 
-An import entry is **used** when a name in the file resolves through it, when a method call in the file resolves to a trait that the entry puts in scope (§3.6 *Impl visibility*), or when a bare variant name resolves to a variant of the enum that the entry names (§3.4 *Resolution order*, *Global-unique*). An entry that is not used gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). Deleting an unused entry never changes what the file means.
+An import entry is **used** when a name in the file resolves through it, when a method call in the file resolves to a trait that the entry puts in scope (§3.6 *Impl visibility*). An entry that is not used gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). Deleting an unused entry never changes what the file means.
 
 A type imported only so that its methods work is unused. The impls in the type's own package go with its values, so the methods resolve without the import:
 
@@ -2648,7 +2648,7 @@ When the entry names a type whose methods the file calls, the note says that the
 | E1012 | Duplicate symbol | A module-level declaration takes a name that an import (`import` or `pub import`) binds: a listed name or a qualifier |
 | E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
 | E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |
-| E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), two members of one `T.` namespace in a package share a name (§2.12.3), or a module-level value has the name of a variant of an enum in the same package or of a prelude enum (§2.12.1) |
+| E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), two members of one `T.` namespace in a package share a name (§2.12.3), or a module-level value or type, or an import entry, has the name `Some`, `None`, `Ok` or `Err` (§2.12.1) |
 
 ```
 error[E1003]: item `Token` is private in module `auth.internal`
@@ -2738,9 +2738,9 @@ All built-in types are in the prelude. They are available in every module withou
 | `Ok(T)` | `Result` variant: success |
 | `Err(E)` | `Result` variant: error |
 | `Ordering` | Comparison result type |
-| `Less`, `Equal`, `Greater` | `Ordering` variants |
+| `Ordering.Less`, `Ordering.Equal`, `Ordering.Greater` | `Ordering` variants |
 
-The variants in this table count as declared in every module. A module-scope `let`, `let mut`, `const` or `fn` with one of these names is E1016 (§2.12.1). A local binding with one of these names gets W1011 (*Shadowing Rules*). The rule covers every variant of every prelude enum, so a new prelude enum brings its variants under it.
+In an expression, `Some`, `None`, `Ok` and `Err` are bare in every module. Every other variant, the `Ordering` variants too, carries its enum (§3.4 *Variant Construction*). This list of four is closed: a new prelude enum does not add its variants to it. A module-scope `let`, `let mut`, `const` or `fn`, a type, or an import entry named `Some`, `None`, `Ok` or `Err` is E1016 (§2.12.1). A local binding with one of these names gets W1011 (*Shadowing Rules*).
 
 #### Prelude Traits
 
@@ -2847,55 +2847,28 @@ The rule covers every declaration that puts a name in the type namespace: `type`
 
 **Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or imports, are a duplicate, never a shadow. A module qualifier is in both namespaces. One rule covers every pair, and the code tells which pair collided: two imports are E1005 (`AmbiguousImport`), an import entry and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. A local binding that hides a module qualifier (`let auth = 5` makes `auth.login()` a method call, §10.1 *Qualified Access*) is a shadow between nested scopes, so it is legal.
 
-**A binding that hides a variant.** A variant is not a binding, but a bare name finds a value binding before a variant (§3.4 *Values come first*). So a value binding with a variant's name hides the variant in expressions, and only there: in a refutable pattern, an uppercase name still means the variant (§3.5). A struct type in scope hides a variant at `Name { ... }` in the same way (§3.4 *Resolution order*). A bare `Name` and `Name(...)` are then E0554, not the variant (§3.4 *Dotted heads*). A name in the type namespace hides a variant at a dotted head `Name.x` (§3.4 *Dotted heads*); a bare `Name` is E0554 too. The compiler emits `ShadowedVariant` (W1011) at the binding or type when it hides one of these:
+**A binding that hides a prelude variant.** A variant is not a binding. In an expression, a user variant always carries its enum (§3.4 *Variant Construction*), so no binding and no type can hide it. Only the four bare variants `Some`, `None`, `Ok` and `Err` can be hidden. A local binding with one of these names hides the prelude variant in expressions, and only there: in a refutable pattern, the name still means the variant (§3.5). The compiler emits `ShadowedVariant` (W1011) at the binding.
 
-- a variant of an enum in the same package;
-- a variant of a prelude enum;
-- a variant of a dependency enum, when the module imports that enum through an import entry that names it (`import pal.{Tone}`). An import of the whole module (`import pal`) does not count.
+W1011 covers a local binding named `Some`, `None`, `Ok` or `Err`: a `let`, a parameter, a closure parameter, or a binder in an irrefutable pattern. A binder in a refutable pattern never gets W1011, because one of these names there is the variant (§3.5). A module-scope value, a type or an import entry with one of these names is E1016, not W1011 (§2.12.1).
 
-W1011 covers four kinds of binding:
+These are not shadows, and they give no W1011:
 
-- a struct type that the module declares, or binds by an import entry, and that hides a dependency variant at the brace form `Name { ... }` (§3.4 *Resolution order*). The trigger is the same: the module imports the variant's enum through an import entry that names it. Only the dependency case can occur here, because a struct with the name of a variant in the same package or the prelude is E0518 (§3.4 *Name collisions*);
-- a type that the module declares (a struct, enum, alias, trait or effect) and that hides a variant of a different enum at a dotted head `Name.x` (§3.4 *Dotted heads*). The variant kinds are the three above. A variant with the name of its own enum is E0518 (§3.4 *Name collisions*). A struct that already gets W1011 at the brace form for a variant gets one warning for that variant, not one for each form;
-- a module-scope `let`, `let mut`, `const` or `fn`. Only the dependency case can occur here, because a value with the name of a variant in the same package or the prelude is E1016 (§2.12.1);
-- a local binding: a `let`, a parameter, a closure parameter or a pattern binder. A pattern binder in an irrefutable pattern gets W1011. In a refutable pattern, a binder cannot have the name of an uppercase variant, because an uppercase name there is the variant or an error (§3.5). So a binder in a refutable pattern gets W1011 only when its first character is not uppercase and the type at that position has no variant of that name.
-
-A dependency variant whose type the module does not import never gives W1011.
+- a struct, enum, alias, trait or effect with the name of a user variant;
+- a module-scope `let`, `let mut`, `const` or `fn` with the name of a user variant;
+- a local binding with the name of a user variant.
 
 ```
-warning[W1011]: struct `Status` hides variant `Job.Status` (package `jobs`)
- --> src/main.bl:3:13
-  |
-3 | import geo.{Status}
-  |             ^^^^^^ hides the variant in `Status { ... }`
-  |
-  = note: bare `Status` and `Status(...)` are errors (E0554) in an expression; write `Job.Status`
-  = help: alias the import, or write `Job.Status { ... }` for the variant
-```
-
-```
-warning[W1011]: type `Red` hides variant `Color.Red` (module `paint.colors`)
- --> src/paint/colors.bl:2:6
-  |
-2 | type Red { A, B }
-  |      ^^^ hides the variant in `Red.x`
-  |
-  = note: bare `Red` and `Red(...)` are errors (E0554); `Red.x` is a member of the type `Red`
-  = help: rename the type, or write `Color.Red` for the variant
-```
-
-```
-warning[W1011]: `Red` hides variant `Color.Red` (module `paint.colors`)
+warning[W1011]: `Ok` hides the prelude variant `Result.Ok`
  --> src/paint/mix.bl:4:9
   |
-4 |     let Red = 5
-  |         ^^^ hides the variant in expressions
+4 |     let Ok = 5
+  |         ^^ hides the variant in expressions
   |
-  = note: `Red` in a pattern still means `Color.Red`
-  = help: rename the local, or write `Color.Red` for the variant
+  = note: `Ok` in a pattern still means `Result.Ok`
+  = help: rename the local, or write `Result.Ok` for the variant
 ```
 
-`@allow(ShadowedVariant)` on the enclosing `fn` suppresses W1011, as for other warnings (§11.1). For a module-scope `fn`, put it on that `fn`. For a struct, enum or alias that the module declares, put `@allow(ShadowedVariant)` on the `type`. It covers a warning on the type's own name. A trait or effect has no `@allow` site in §11.1. An import entry has no annotation site, and a module-scope `let` or `const` has no enclosing `fn`. For those, and for a trait or effect, the `[lints]` table of `blink.toml` (§4.16.8) controls W1011. W1011 is separate from `ShadowedVariable`, which covers one variable that hides another; a variant is not a variable.
+`@allow(ShadowedVariant)` on the enclosing `fn` suppresses W1011, as for other warnings (§11.1). The `[lints]` table of `blink.toml` (§4.16.8) also controls W1011. W1011 is separate from `ShadowedVariable`, which covers one variable that hides another; a variant is not a variable.
 
 **Diagnostics that involve a shadowing name.** The escape must be visible where the error is, not only at the declaration. So:
 
