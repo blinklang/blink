@@ -1183,7 +1183,7 @@ with handler Metrics {
 
 Handlers nest — inner handlers shadow outer ones for the same effect.
 
-An operation can have a default body in the effect declaration (`fn b() { ... }`); a handler may omit it. `@handle_all` on an effect (or sub-effect) says a handler must write every operation that has no body; a handler that omits one warns `W0545 PartialHandler`. `IO.Read` is such an effect, so a test can handle it with `std.testing.stdin_from(text)`:
+An operation can have a default body in the effect declaration (`fn b() { ... }`); a handler may omit it. The body may perform only the leaf sub-effect it is declared in; any other effect is `DerivedOpForeignEffect` (E0557), so move that logic to a plain `fn` with its own `!` row. `@handle_all` on an effect (or sub-effect) says a handler must write every operation that has no body; a handler that omits one warns `W0545 PartialHandler`. `IO.Read` is such an effect, so a test can handle it with `std.testing.stdin_from(text)`:
 
 ```blink
 import std.testing.{stdin_from}

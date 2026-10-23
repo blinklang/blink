@@ -2481,6 +2481,76 @@ fn main() ! Net, IO {
 
 In `main`, the innermost `Net.Connect` handler is `mock_net`. It omits `get`, so the `get` body from the effect declaration runs, and its `net.request(...)` reaches `mock_net`. The program does not search the outer handlers for a `get` clause, so `logging_get` does not run. The innermost handler alone decides what a derived operation does.
 
+**A derived operation performs only its own effect.** The body of a derived operation runs at the call site, so the caller must hold every effect that the body performs. A caller that holds `! Greet.Say` holds only that sub-effect: children are independent capabilities (§4.3). An operation declaration has no `!` row. A derived operation body therefore may perform only the leaf sub-effect it is declared in. A call through any other effect is `DerivedOpForeignEffect` (E0557). This holds for a built-in effect such as `IO.Log`, for another user effect, and for a sibling sub-effect under the same root. The compiler charges nothing to the handler or to the `with`. A handler that implements the operation itself can use other effects, through its clause row (*The clause row* above).
+
+```blink
+effect Counter {
+    effect Get {
+        fn get() -> Int
+    }
+}
+
+effect Greet {
+    effect Say {
+        fn name() -> Str
+        fn hello() -> Str {
+            "hello {greet.name()} {counter.get()}"   // error: `Counter.Get` is not `Greet.Say`
+        }
+    }
+    effect Loud {
+        fn shout(s: Str) -> Str
+    }
+}
+```
+
+```
+error[DerivedOpForeignEffect]: derived operation `Greet.Say.hello` performs `Counter.Get`
+  --> greet.bl:11:36
+   |
+11 |             "hello {greet.name()} {counter.get()}"
+   |                                    ^^^^^^^^^^^^^ `Counter.Get` is not `Greet.Say`
+   |
+   = note: a derived operation body runs at the call site and may perform only the effect it is declared in, `Greet.Say`
+   = help: move the logic to a plain function that declares the effects it performs
+   = help: or make `hello` a primitive operation, with no body, and implement it in each handler; the clause row of a handler covers other effects
+```
+
+A call to `greet.shout(...)` in the body of `hello` is the same error, with the effect `Greet.Loud`. It has one more help line:
+
+```
+   = help: `Greet.Loud` is a different effect from `Greet.Say`, and may have no handler where `Greet.Say` is handled
+```
+
+The diagnostic has no `fix:` line, because the repair is a design choice. The two repairs are these. First, move the logic to a plain function with its own `!` row:
+
+```blink
+fn hello_logged() -> Str ! Greet.Say, IO.Log {
+    io.log("greeting")
+    greet.hello()
+}
+```
+
+Second, make the operation primitive, and implement it in each handler. The clause row of the handler (§4.7) holds the other effect:
+
+```blink
+effect Wave {
+    effect Say {
+        fn name() -> Str
+        fn hello() -> Str
+    }
+}
+
+fn logging_wave() -> Handler[Wave.Say, IO.Log] {
+    handler Wave.Say {
+        fn name() -> Str { "bob" }
+        fn hello() -> Str {
+            io.log("greeting")
+            "hello bob"
+        }
+    }
+}
+```
+
 `default` is a contextual name, not a keyword. In the body of a handler operation, `default.op(args)` delegates to the handler in force for the effect at the `with` that installed this handler (see *The clause row*). Elsewhere, including in a closure written inside an operation body, an unshadowed use of `default` is a compile error (E0544). A local binding named `default` shadows it.
 
 ```blink
