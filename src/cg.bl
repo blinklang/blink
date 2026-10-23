@@ -108,6 +108,9 @@ pub type CgConfig {
     // it: the unit reads that archive's header and runs its globals init. Empty when the
     // unit links no such archive.
     compiler_archive_modules: Map[Str, Int]
+    // Leave out every test body, the test name and tag tables, and the `--test` hook: the
+    // spec strips tests from release builds. The front end still checks every test body.
+    strip_tests: Int = 0
 }
 
 
@@ -563,8 +566,9 @@ fn subtree_has_kind(id: Int, kind: NodeKind, kids: List[Int]) -> Bool {
 
 // Whether this unit will lower an AsyncScope, answered ahead of emit_definitions: it fuses
 // lowering with printing one body at a time, so the guard support must already be printed
-// by the time the first one needs it. Tests are scanned only for the unit that calls emit_entry.
-fn unit_uses_async_scope(fns: List[Int], methods: List[Int], include_tests: Bool) -> Bool {
+// by the time the first one needs it. `tests` holds the bodies emit_entry will write into this
+// unit, and nothing for any other unit.
+fn unit_uses_async_scope(fns: List[Int], methods: List[Int], tests: List[Int]) -> Bool {
     let mut kids: List[Int] = []
     for f in fns {
         ir_note_source(f)
@@ -583,11 +587,9 @@ fn unit_uses_async_scope(fns: List[Int], methods: List[Int], include_tests: Bool
             }
         }
     }
-    if include_tests {
-        for t in cg_reg_test_decls() {
-            ir_note_source(t)
-            if subtree_has_kind(node_body(t), NodeKind.AsyncScope, kids) { return true }
-        }
+    for t in tests {
+        ir_note_source(t)
+        if subtree_has_kind(node_body(t), NodeKind.AsyncScope, kids) { return true }
     }
     false
 }
@@ -873,10 +875,18 @@ fn tag_arg_is_positional(arg: Int) -> Bool {
 // the caller from its own deferred list), or one name per module that needed one, in
 // module order, under the per-module mode.
 fn emit_entry(cfg: CgConfig, init_fns: List[Str]) ! Diag.Report {
-    let tests = cg_reg_test_decls()
+    let tests = entry_tests(cfg)
     emit_test_bodies(tests)
     print_main_shim(cg_reg_has_main(), tests.len() > 0, program_spawns(),
         cfg.trace_codegen != 0, cfg.deterministic, archive_init_fns(cfg).append(init_fns))
+}
+
+// The test blocks the entry unit writes. Every reader of the entry unit's tests goes
+// through here, so the bodies, the tables, the `--test` hook and the entry unit's reuse
+// key all agree on whether the build keeps them.
+fn entry_tests(cfg: CgConfig) -> List[Int] {
+    if cfg.strip_tests != 0 { return [] }
+    cg_reg_test_decls()
 }
 
 // The init functions of the archives this unit links, in link-layer order, ahead of the
@@ -942,7 +952,8 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     // never reaches emit_entry, so its tests never lower here and are left out of the scan.
     let fns = fns_in_scope(cfg, "", shared, false)
     let methods = methods_in_scope(cfg, "", shared, false)
-    if unit_uses_async_scope(fns, methods, !shared) {
+    let tests = if shared { [] } else { entry_tests(cfg) }
+    if unit_uses_async_scope(fns, methods, tests) {
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
@@ -1222,7 +1233,8 @@ fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: Pro
     // Only the entry module reaches emit_entry, where a test body would lower; scanning
     // every other module's tests too would ask gen0 to declare a symbol that module's own
     // TU never ends up printing a call to.
-    if unit_uses_async_scope(fns, methods, module_key == "__main__") {
+    let tests = if module_key == "__main__" { entry_tests(cfg) } else { [] }
+    if unit_uses_async_scope(fns, methods, tests) {
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
@@ -1345,7 +1357,7 @@ fn emit_module_chunk(module_key: Str, self_header: Str, cfg: CgConfig, fns: List
     cg_decl_emit_ev("extern ")
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
-    if unit_uses_async_scope(fns, methods, false) {
+    if unit_uses_async_scope(fns, methods, []) {
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
@@ -1433,10 +1445,10 @@ fn module_init_fn_names(cfg: CgConfig) -> List[Str] ! Diag.Report {
 // a main and a spawn exist, each test's C symbol and name, and the name of each key table, in
 // the order the unit writes them. The caller adds the init names. A build takes the entry unit
 // only when these are the last build's.
-pub fn entry_unit_facts(program: Int, facts: ProgramFacts) -> List[Str] ! Diag.Report {
+pub fn entry_unit_facts(program: Int, cfg: CgConfig, facts: ProgramFacts) -> List[Str] ! Diag.Report {
     begin_unit(program)
     let mut out = ["main {cg_reg_has_main()}", "spawns {program_spawns()}"]
-    for t in cg_reg_test_decls() {
+    for t in entry_tests(cfg) {
         let name = node_str_val(t)
         out.push("test {c_test_fn_name(t)} {name.byte_len()} {name}")
     }
