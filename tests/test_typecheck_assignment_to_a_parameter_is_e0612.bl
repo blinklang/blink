@@ -1,0 +1,347 @@
+// `=` or `op=` whose root is a parameter, `self` included, is ParamAssign (E0612,
+// sections/02_syntax.md §2.22 *Writes that are not to a place*, case 3; sections/03_types.md
+// §3.6 *Mutable Parameters*). A parameter holds the callee's own copy, so the write never
+// reaches the caller. A bare name and a field path share one check, with or without `mut`,
+// for every kind of parameter. A `Ptr` step comes first (E0611), and a `let` that shadows the
+// parameter is judged as a `let`. ParamAssign ships first as a warning (§3.6 *Rollout*), so
+// check and build both pass and the program still runs.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import compile_test_helpers
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn entries() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity != "info" {
+            out.push("{d.severity} {d.name} {d.code} {d.line}:{d.col}: {d.message} | label: {d.label} | help: {d.help} | notes: {d.notes.join(\"; \")} | fix: {d.fix_action} `{d.fix_text}`")
+        }
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for e in entries() { io.println("  {e}") }
+}
+
+fn error_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+fn param_assign_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == "ParamAssign" || d.code == "E0612" { n = n + 1 }
+    }
+    n
+}
+
+// One ParamAssign, a warning at line:col, with the spec's text, help and note, no fix, and
+// no error beside it.
+fn expect_e0612(label: Str, line: Int, col: Int, name: Str, copy: Str) {
+    let mut ok = param_assign_count() == 1 && error_count() == 0
+    for d in diag_entries {
+        if d.name == "ParamAssign" {
+            if d.severity != "warning" || d.code != "E0612" { ok = false }
+            if d.message != "cannot assign to parameter `{name}`" { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if d.label != "`{name}` is a parameter" { ok = false }
+            if d.help != "copy it to a new name: `let mut {copy} = {name}`" { ok = false }
+            if !d.notes.contains("a write to a parameter changes only this function's copy") { ok = false }
+            if d.fix_action != "" || d.fix_text != "" { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_no_e0612(label: Str) {
+    let ok = param_assign_count() == 0
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "a field write to self in a by-value method is E0612" {
+    probe("build/param_assign_self.bl", #"
+trait Advance {
+    fn step(self) -> Int
+}
+
+type Counter { at: Int }
+
+impl Advance for Counter {
+    fn step(self) -> Int {
+        let v = self.at
+        self.at = self.at + 1
+        v
+    }
+}
+
+fn main() {
+    let c = Counter { at: 0 }
+    let _ = c.step()
+}
+"#)
+    expect_e0612("self.at", 11, 9, "self", "x")
+}
+
+test "a field write to a plain parameter is E0612" {
+    probe("build/param_assign_field.bl", #"
+type Counter { at: Int }
+
+fn bump(c: Counter) {
+    c.at = 5
+}
+
+fn main() { bump(Counter { at: 0 }) }
+"#)
+    expect_e0612("c.at", 5, 5, "c", "x")
+}
+
+test "a nested field, a tuple field and a compound write to a parameter are E0612" {
+    probe("build/param_assign_nested.bl", #"
+type Inner { v: Int }
+type Counter { inner: Inner }
+
+fn deep(c: Counter) {
+    c.inner.v = 1
+}
+
+fn main() { deep(Counter { inner: Inner { v: 0 } }) }
+"#)
+    expect_e0612("c.inner.v", 6, 5, "c", "x")
+    probe("build/param_assign_tuple.bl", #"
+type Counter { pair: (Int, Int) }
+
+fn tup(c: Counter) {
+    c.pair.0 = 1
+}
+
+fn main() { tup(Counter { pair: (0, 0) }) }
+"#)
+    expect_e0612("c.pair.0", 5, 5, "c", "x")
+    probe("build/param_assign_compound.bl", #"
+type Counter { at: Int }
+
+fn comp(c: Counter) {
+    c.at += 1
+}
+
+fn main() { comp(Counter { at: 0 }) }
+"#)
+    expect_e0612("c.at += 1", 5, 5, "c", "x")
+}
+
+test "a bare write to a parameter is E0612, and the copy's name is not one in scope" {
+    probe("build/param_assign_bare.bl", #"
+fn bump(a: Int, b: Int) -> Int {
+    a = b
+    a
+}
+
+fn main() { let _ = bump(1, 2) }
+"#)
+    expect_e0612("a = b", 3, 5, "a", "x")
+    probe("build/param_assign_bare_x.bl", #"
+fn bump(x: Int) -> Int {
+    x += 1
+    x
+}
+
+fn main() { let _ = bump(1) }
+"#)
+    expect_e0612("x += 1", 3, 5, "x", "x_1")
+}
+
+test "a mut parameter and mut self are still E0612" {
+    probe("build/param_assign_mut.bl", #"
+type Counter { at: Int }
+
+fn reset(mut c: Counter) {
+    c.at = 0
+}
+
+fn main() { reset(Counter { at: 1 }) }
+"#)
+    expect_e0612("mut c", 5, 5, "c", "x")
+    probe("build/param_assign_mut_self.bl", #"
+type Counter { at: Int }
+
+trait Reset {
+    fn reset(mut self)
+}
+
+impl Reset for Counter {
+    fn reset(mut self) {
+        self.at = 0
+    }
+}
+
+fn main() {
+    let mut c = Counter { at: 1 }
+    c.reset()
+}
+"#)
+    expect_e0612("mut self", 10, 9, "self", "x")
+}
+
+test "a closure parameter, and a parameter a closure captures, are E0612" {
+    probe("build/param_assign_closure.bl", #"
+type Counter { at: Int }
+
+fn main() {
+    let f = fn(k: Counter) { k.at = 2 }
+    f(Counter { at: 0 })
+}
+"#)
+    expect_e0612("closure param", 5, 30, "k", "x")
+    probe("build/param_assign_captured.bl", #"
+type Counter { at: Int }
+
+fn outer(c: Counter) {
+    let f = fn() { c.at = 2 }
+    f()
+}
+
+fn main() { outer(Counter { at: 0 }) }
+"#)
+    expect_e0612("captured param", 5, 20, "c", "x")
+}
+
+test "a parameter of a generic fn and of a trait default method is E0612" {
+    probe("build/param_assign_generic.bl", #"
+fn pick[T](t: T, u: T) -> T {
+    t = u
+    t
+}
+
+fn main() { let _ = pick(1, 2) }
+"#)
+    expect_e0612("generic param", 3, 5, "t", "x")
+    probe("build/param_assign_default.bl", #"
+trait Doubler {
+    fn dbl(self, n: Int) -> Int {
+        n = n * 2
+        n
+    }
+}
+
+fn main() { }
+"#)
+    expect_e0612("trait default param", 4, 9, "n", "x")
+}
+
+test "a let that shadows a parameter is judged as a let" {
+    probe("build/param_assign_shadow_let.bl", #"
+type Counter { at: Int }
+
+fn shadow(c: Counter) {
+    let c = c
+    c.at = 3
+}
+
+fn main() { shadow(Counter { at: 0 }) }
+"#)
+    let mut ok = param_assign_count() == 0 && error_count() == 1
+    for d in diag_entries {
+        if d.severity == "error" && (d.code != "E0610" || d.line != 6) { ok = false }
+    }
+    if !ok { show("let shadow") }
+    assert(ok)
+    probe("build/param_assign_shadow_let_mut.bl", #"
+type Counter { at: Int }
+
+fn shadow(c: Counter) -> Int {
+    let mut d = c
+    d.at = 3
+    d.at
+}
+
+fn main() { let _ = shadow(Counter { at: 0 }) }
+"#)
+    expect_no_e0612("let mut copy")
+    let clean = error_count() == 0
+    if !clean { show("let mut copy errors") }
+    assert(clean)
+}
+
+test "a mutating call on a mut parameter is not E0612" {
+    probe("build/param_assign_mut_call.bl", #"
+type Server { routes: List[Str] }
+
+fn add(mut srv: Server, r: Str) {
+    srv.routes.push(r)
+}
+
+fn grow(mut xs: List[Int]) {
+    xs.push(1)
+}
+
+fn main() {
+    add(Server { routes: [] }, "/")
+    grow([])
+}
+"#)
+    expect_no_e0612("mut call")
+    let clean = error_count() == 0
+    if !clean { show("mut call errors") }
+    assert(clean)
+}
+
+test "a write through a Ptr parameter is E0611, not E0612" {
+    probe("build/param_assign_ptr.bl", #"
+@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec { iov_base: Ptr[U8], iov_len: U64 }
+
+@trusted(audit: "param-assign-ptr")
+fn set_len(p: Ptr[IoVec], n: U64) {
+    p.iov_len = n
+}
+
+fn main() { }
+"#)
+    let mut ok = param_assign_count() == 0 && error_count() == 1
+    for d in diag_entries {
+        if d.severity == "error" && d.code != "E0611" { ok = false }
+    }
+    if !ok { show("ptr param") }
+    assert(ok)
+}
+
+let MVCE = "trait Advance \{\n    fn step(self) -> Int\n}\n\ntype Counter \{ at: Int }\n\nimpl Advance for Counter \{\n    fn step(self) -> Int \{\n        let v = self.at\n        self.at = self.at + 1\n        v\n    }\n}\n\nfn main() \{\n    let c = Counter \{ at: 0 }\n    let a = c.step()\n    let b = c.step()\n    io.println(\"a=\{a} b=\{b}\")\n}\n"
+
+test "check and build both warn and pass, and the write stays in the callee" {
+    let chk = compile_test_helpers.check_via_cli(MVCE, "param_assign_check")
+    compile_test_helpers.expect_warning(chk, "E0612", "check warns E0612")
+    compile_test_helpers.expect_compiles_clean(chk, "check has no error")
+    let built = compile_test_helpers.compile_and_capture(MVCE, "param_assign_build")
+    compile_test_helpers.expect_warning(built, "E0612", "build warns E0612")
+    compile_test_helpers.expect_compiles_clean(built, "build has no error")
+    let no_ice = !built.contains("\"severity\":\"ice\"")
+    if !no_ice { io.println("FAIL: build ICE: {built}") }
+    assert(no_ice)
+    let run = compile_test_helpers.compile_and_run(MVCE, "param_assign_run")
+    let ran = run.exit_code == 0 && run.out.contains("a=0 b=0")
+    if !ran { io.println("FAIL: run: exit {run.exit_code} out {run.out} err {run.err_out}") }
+    assert(ran)
+}
+
+test "E0612 has a catalog entry and explain text" {
+    compile_test_helpers.verify_catalog_entry("E0612", "ParamAssign")
+}
