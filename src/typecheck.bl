@@ -17808,22 +17808,41 @@ fn tc_report_payload_variant_value(variant: Str, want: Str, closure: Str, node: 
     tc_error_recovery_tid()
 }
 
-// The fewest and most arguments each carrier constructor takes. `Ok()` is `Ok(())`.
+// The fewest and most arguments each carrier constructor takes. `Ok()` is `Ok(())`, so `Ok`
+// takes none only where its payload may be unit.
 fn tc_carrier_arity(variant: Str) -> (Int, Int) {
     match variant {
         "None" => (0, 0)
-        "Ok" => (0, 1)
+        "Ok" => if tc_ok_payload_may_be_unit() { (0, 1) } else { (1, 1) }
         _ => (1, 1)
     }
 }
 
+// Whether the expected type leaves `Ok`'s payload free to be unit: it names no payload, or
+// names unit. A payload it names fixes the count even while the error side is still open, so
+// `r = Ok()` with `r` inferred from `Ok(5)` is the arity error. A callee's own type parameter
+// names nothing at this site, so the call may still solve it to unit.
+fn tc_ok_payload_may_be_unit() -> Bool {
+    if tc_construct_hint < 0 { return true }
+    let h = resolve_alias_tid(tc_construct_hint)
+    if h < 0 || h >= ty_pool.len() { return true }
+    let e = ty_pool.get(h).unwrap()
+    if e.kind != TyKind.Result || e.inner1 < 0 { return true }
+    let payload = tc_resolve(e.inner1)
+    if tc_tid_is_no_info(payload) != 0 || tc_is_unbound_metavar(payload) != 0 { return true }
+    if tc_tid_has_foreign_typevar(payload) != 0 { return true }
+    type_kind(resolve_alias_tid(payload)) == TyKind.Void
+}
+
 // Reports a carrier constructor call of the wrong arity in the words a user variant's gets.
-fn tc_check_carrier_arity(variant: Str, args_sl: Int, call_node: Int) ! TypeCheck.Report, Diag.Report {
+// Answers whether the count fits.
+fn tc_check_carrier_arity(variant: Str, args_sl: Int, call_node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
     let (fewest, most) = tc_carrier_arity(variant)
     let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
-    if got >= fewest && got <= most { return }
+    if got >= fewest && got <= most { return true }
     let want = if fewest == most { "{most}" } else { "{fewest} or {most}" }
     tc_error_at("variant `{variant}` expects {want} argument(s), got {got}", call_node)
+    false
 }
 
 // A carrier constructor call, bare (`Some(x)`) or qualified (`Option.Some(x)`): the one path
@@ -17834,7 +17853,7 @@ fn tc_check_carrier_arity(variant: Str, args_sl: Int, call_node: Int) ! TypeChec
 // that constrains it; an unconstrained one trips the E0301 region boundary. The singleton is
 // excluded from that boundary check, so it must not stand in for an inferable slot.
 fn tc_carrier_call_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_check_carrier_arity(variant, args_sl, call_node)
+    let fits = tc_check_carrier_arity(variant, args_sl, call_node)
     let arg = if args_sl != -1 && sublist_length(args_sl) >= 1 { sublist_get(args_sl, 0) } else { -1 }
     match variant {
         "None" => make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1))
@@ -17843,27 +17862,17 @@ fn tc_carrier_call_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! Type
             make_option_type(infer_carrier_arg(arg, variant))
         }
         "Ok" => {
-            if arg == -1 { return tc_ok_without_payload_tid(call_node) }
-            make_result_type(infer_carrier_arg(arg, variant), tc_carrier_slot_from_hint(TyKind.Result, 2))
+            // A rejected `Ok()` has no payload type: unit would be a second, wrong error
+            // against the payload the expected type names.
+            if arg == -1 && !fits { return tc_error_recovery_tid() }
+            let payload = if arg == -1 { TYPE_VOID } else { infer_carrier_arg(arg, variant) }
+            make_result_type(payload, tc_carrier_slot_from_hint(TyKind.Result, 2))
         }
         _ => {
             if arg == -1 { return make_result_type(make_metavar(), make_metavar()) }
             make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), infer_carrier_arg(arg, variant))
         }
     }
-}
-
-// `Ok()` is `Ok(())`, so its payload is unit and never a slot a later use could pin to
-// another type: that type would need the argument that is missing. Under an expectation
-// that names another payload, a generic one included, it is the arity error `Some()` gets.
-fn tc_ok_without_payload_tid(call_node: Int) -> Int ! TypeCheck.Report, Diag.Report {
-    let expected = tc_resolve(tc_carrier_slot_from_hint(TyKind.Result, 1))
-    let open = tc_tid_is_no_info(expected) != 0 || tc_is_unbound_metavar(expected) != 0
-    if !open && type_kind(resolve_alias_tid(expected)) != TyKind.Void {
-        tc_error_at("variant `Ok` expects 1 argument(s), got 0", call_node)
-        return tc_error_recovery_tid()
-    }
-    make_result_type(TYPE_VOID, tc_carrier_slot_from_hint(TyKind.Result, 2))
 }
 
 fn is_variant_name(name: Str) -> Int {
@@ -26270,12 +26279,22 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // which is exactly what codegen emits for it and what `.read()` hands back.
         if type_kind(obj_t) == TyKind.Ptr {
             let pointee = tc_resolve(ty_pool.get(obj_t).unwrap().inner1)
+            let pointee_k = type_kind(pointee)
             if tc_ptr_ffi_struct_pointee(obj_t) != 0 {
                 let pf = get_struct_field_tid(pointee, fname)
                 if pf != -1 { return pf }
-            } else if type_kind(pointee) == TyKind.Struct && ffi_opaque_type_set.contains_key(pointee) == 0 {
+                if tc_struct_field_provably_absent(pointee, fname) != 0 {
+                    tc_error_naming_types("NoSuchField", NO_SUCH_FIELD, "type {type_to_str(pointee)} has no field `{fname}`", node, "use a declared field, or add the field to the type", [pointee])
+                    return tc_error_recovery_tid()
+                }
+            } else if pointee_k == TyKind.Struct && ffi_opaque_type_set.contains_key(pointee) == 0 {
                 // E0810 refused this pointee. The pair arm asks the same question, so a field
                 // typed here would leave `.read()` and `.write(v)` unclaimed on the field type.
+                return tc_error_recovery_tid()
+            } else if pointee_k != TyKind.Struct && pointee_k != TyKind.Unknown && pointee_k != TyKind.Typevar {
+                // A pointee with no fields of its own, so the pointer has none either.
+                let recv = type_to_str(obj_t)
+                tc_error_naming_types("NoSuchField", NO_SUCH_FIELD, "type {recv} has no field `{fname}`", node, "{recv} has no fields; call a method instead", [obj_t])
                 return tc_error_recovery_tid()
             }
         }
@@ -26385,7 +26404,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     if kind == NodeKind.IfExpr {
         // The condition is always consumed (value context); leave the flag at 1. The branches
         // inherit THIS if's own consumed-ness, so restore `incoming` before descending them.
-        let cond_t = infer_type(node_condition(node))
+        // The condition is a Bool, whatever the if is expected to be.
+        let cond_t = tc_infer_unhinted(node_condition(node))
         if is_bool_compat(cond_t) == 0 {
             tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
         }
@@ -26437,7 +26457,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if arms_sl != -1 && sublist_length(arms_sl) > 0 {
             // The scrutinee is consumed by the match (value context); the arm bodies produce the
             // match's value, so they inherit its own consumed-ness.
-            let scrut_tid = infer_type(node_scrutinee(node))
+            // What the match is expected to be says nothing about what it matches on.
+            let scrut_tid = tc_infer_unhinted(node_scrutinee(node))
             let subject = tc_match_subject(node)
             tc_if_value_ctx = incoming
             // §3.3: `()` is contagious across an arm-bearing form. One arm that falls out
@@ -28965,14 +28986,17 @@ fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
 // known. A temporary root and a parameter root, the cases between them in the spec's order,
 // are other errors and take the write. A pattern binder and the name after `with ... as` go
 // to tc_report_immutable_binder.
-fn tc_check_assign_root(node: Int, target: Int) ! Diag.Report {
+fn tc_check_assign_root(node: Int) ! Diag.Report {
+    let target = node_target(node)
     let mut root = target
     while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
         let obj = node_obj(root)
         if obj == -1 { return }
         let obj_t = tc_resolve(tc_lookup_node_tid(obj))
         if type_kind(resolve_alias_tid(obj_t)) == TyKind.Ptr {
-            tc_report_write_through_ptr(node, target, obj, obj_t)
+            // A step the pointee does not have is reported where it is typed, and `.write()`
+            // on it would be no fix.
+            if tc_tid_is_no_info(tc_lookup_node_tid(root)) == 0 { tc_report_write_through_ptr(node, obj, obj_t) }
             return
         }
         root = obj
@@ -29021,33 +29045,46 @@ fn tc_check_assign_root(node: Int, target: Int) ! Diag.Report {
 // `place = rhs` runs `rhs` before it reads the root, but `p.f.write(rhs)` reads `p` before
 // its argument runs, so the help writes `rhs` in place only when it runs no code, and else
 // binds it on the line before. Help only: no fix is applied.
-fn tc_report_write_through_ptr(node: Int, target: Int, ptr: Int, ptr_t: Int) ! Diag.Report {
+fn tc_report_write_through_ptr(node: Int, ptr: Int, ptr_t: Int) ! Diag.Report {
     let message = "cannot assign through a `Ptr`"
     let mut notes = ["a field behind a `Ptr` is not a place; write it with `.write()`"]
+    let target = node_target(node)
     let path = tc_index_text(target)
     let ptr_text = tc_index_text(ptr)
     let label = if ptr_text == "" { "" } else { "`{ptr_text}` is a `{type_to_str(ptr_t)}`" }
+    // A part the help cannot quote is written as a placeholder, as the index-store help does.
+    let pp = if path == "" { "p.f" } else { path }
     let val = node_value(node)
     let rhs = tc_index_text(val)
     let mut help = ""
-    if path != "" && rhs != "" {
-        if node_kind(node) == NodeKind.CompoundAssign {
-            notes.push("this is a read and then a write, not one atomic step")
-            help = "`{path}.write({unparse_binop_with_lhs("{path}.read()", node_op(node), val)})`"
-        } else if tc_runs_no_code(val) {
-            help = "`{path}.write({rhs})`"
-        } else {
-            // The target is a field step, since an index target never reaches here; a tuple
-            // step such as `p.0` names no binding.
-            let field = node_name(target)
-            let first = if field == "" { 48 } else { field.byte_at(0).to_int() }
-            let name = if first >= 48 && first <= 57 { "v" } else { field }
-            notes.push("the right side runs before `{ptr_text}` is read, so the fix keeps it on its own line")
-            help = "`let {name} = {rhs}`, then `{path}.write({name})`"
-        }
+    if node_kind(node) == NodeKind.CompoundAssign {
+        notes.push("this is a read and then a write, not one atomic step")
+        let read_op = if rhs == "" { "{pp}.read() {node_op(node)} ..." } else { unparse_binop_with_lhs("{pp}.read()", node_op(node), val) }
+        help = "`{pp}.write({read_op})`"
+    } else if rhs != "" && tc_runs_no_code(val) {
+        help = "`{pp}.write({rhs})`"
+    } else {
+        // The target is a field step, since an index target never reaches here; a tuple
+        // step such as `p.0` names no binding.
+        let field = node_name(target)
+        let base = if field == "" || tc_is_decimal_digits(field) { "v" } else { field }
+        let name = tc_name_not_in_scope(base)
+        let shown = if rhs == "" { "..." } else { rhs }
+        let who = if ptr_text == "" { "the `Ptr`" } else { "`{ptr_text}`" }
+        notes.push("the right side runs before {who} is read, so the fix keeps it on its own line")
+        help = "`let {name} = {shown}`, then `{pp}.write({name})`"
     }
     tc_errors.push(message)
     diag_error_label_at_notes("NotAPlace", NOT_A_PLACE, message, target, label, help, notes)
+}
+
+// `base`, or the first of `base_1`, `base_2`, ... that names nothing in scope here, so a
+// binding the help adds shadows nothing the line reads.
+fn tc_name_not_in_scope(base: Str) -> Str {
+    if nr_has_binding(base) == 0 { return base }
+    let mut i = 1
+    while nr_has_binding("{base}_{i}") != 0 { i = i + 1 }
+    "{base}_{i}"
 }
 
 // §2.22: a literal, a name, or a field path of names. It has no operator, call or other
@@ -29062,10 +29099,7 @@ fn tc_runs_no_code(node: Int) -> Bool {
         return operand != -1 && (node_kind(operand) == NodeKind.IntLit || node_kind(operand) == NodeKind.FloatLit)
     }
     if k == NodeKind.InterpString { return tc_is_plain_string_literal(node) }
-    if k == NodeKind.FieldAccess {
-        let obj = node_obj(node)
-        return obj != -1 && (node_kind(obj) == NodeKind.Ident || node_kind(obj) == NodeKind.FieldAccess) && tc_runs_no_code(obj)
-    }
+    if k == NodeKind.FieldAccess { return tc_index_receiver_is_path(node) }
     false
 }
 
@@ -29653,7 +29687,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let mut inferred_tid = TYPE_UNKNOWN
         if val != -1 {
             tc_seed_expected_into_value(val, declared_tid)
-            let let_hint = if tc_tid_is_no_info(declared_tid) == 0 { resolve_alias_tid(declared_tid) } else { tc_construct_hint }
+            // With no annotation the value has no expected type: the expectation of the block
+            // this `let` sits in is the block's TAIL's, not this value's.
+            let let_hint = if tc_tid_is_no_info(declared_tid) == 0 { resolve_alias_tid(declared_tid) } else { -1 }
             // A let binding is expression context (§2.9): infer in value context so an else-less
             // `if` as its value (no value on the false path) is rejected regardless of the
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
@@ -29737,7 +29773,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
-            tc_check_assign_root(node, target)
+            tc_check_assign_root(node)
             let val_t = tc_infer_assigned_value(target_t, val)
             if kind == NodeKind.CompoundAssign {
                 reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)

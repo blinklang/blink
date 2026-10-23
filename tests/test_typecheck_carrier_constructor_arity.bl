@@ -7,27 +7,26 @@
 
 import compile_test_helpers
 
-fn expect_arity_error(body: Str, tag: Str, msg: Str) {
-    let src = "fn main() \{\n{body}\n\}\n"
+// A whole program. Every row also builds, so none may reach codegen as an internal error.
+fn expect_program_error(src: Str, tag: Str, msg: Str) {
     let out = compile_test_helpers.compile_and_capture(src, tag)
     compile_test_helpers.expect_error(out, "E0300", tag)
     compile_test_helpers.expect_contains(out, msg, "{tag} names the variant and counts")
     assert(!out.contains("\"severity\":\"ice\""))
 }
 
-fn expect_arity_ok(body: Str, tag: Str) {
-    let src = "fn main() \{\n{body}\n\}\n"
+fn expect_program_ok(src: Str, tag: Str) {
     let out = compile_test_helpers.compile_and_capture(src, tag)
     compile_test_helpers.expect_compiles_clean(out, tag)
     assert(!out.contains("\"severity\":\"ice\""))
 }
 
-// A whole program, for the rows whose constructor sits in a function of its own.
-fn expect_program_error(src: Str, tag: Str, msg: Str) {
-    let out = compile_test_helpers.compile_and_capture(src, tag)
-    compile_test_helpers.expect_error(out, "E0300", tag)
-    compile_test_helpers.expect_contains(out, msg, "{tag} names the error")
-    assert(!out.contains("\"severity\":\"ice\""))
+fn expect_arity_error(body: Str, tag: Str, msg: Str) {
+    expect_program_error("fn main() \{\n{body}\n\}\n", tag, msg)
+}
+
+fn expect_arity_ok(body: Str, tag: Str) {
+    expect_program_ok("fn main() \{\n{body}\n\}\n", tag)
 }
 
 test "None with an argument is rejected" {
@@ -50,8 +49,12 @@ test "Err with two arguments is rejected" {
     expect_arity_error("    let r: Result[Int, Str] = Err(\"a\", \"b\")\n    let _ = r", "carrier_arity_err_2", "variant `Err` expects 1 argument(s), got 2")
 }
 
-test "Ok with two arguments is rejected" {
-    expect_arity_error("    let r: Result[Int, Str] = Ok(1, 2)\n    let _ = r", "carrier_arity_ok_2", "variant `Ok` expects 0 or 1 argument(s), got 2")
+test "Ok with two arguments under a non-unit payload is rejected with the count that payload takes" {
+    expect_arity_error("    let r: Result[Int, Str] = Ok(1, 2)\n    let _ = r", "carrier_arity_ok_2", "variant `Ok` expects 1 argument(s), got 2")
+}
+
+test "Ok with two arguments under a unit payload is rejected with both counts" {
+    expect_arity_error("    let r: Result[(), Str] = Ok(1, 2)\n    let _ = r", "carrier_arity_ok_2_unit", "variant `Ok` expects 0 or 1 argument(s), got 2")
 }
 
 test "qualified Option.None with an argument is rejected" {
@@ -75,7 +78,7 @@ test "qualified Result.Err with two arguments is rejected" {
 }
 
 test "qualified Result.Ok with two arguments is rejected" {
-    expect_arity_error("    let r: Result[Int, Str] = Result.Ok(1, 2)\n    let _ = r", "carrier_arity_q_ok_2", "variant `Ok` expects 0 or 1 argument(s), got 2")
+    expect_arity_error("    let r: Result[Int, Str] = Result.Ok(1, 2)\n    let _ = r", "carrier_arity_q_ok_2", "variant `Ok` expects 1 argument(s), got 2")
 }
 
 test "carrier constructors of the right arity compile clean" {
@@ -115,8 +118,36 @@ test "Some and Err with no argument under a generic payload are rejected" {
 
 test "Ok with no argument and Ok of unit are one type" {
     expect_arity_ok("    let a: Result[(), Str] = Ok()\n    let b = Ok(())\n    let c = if a.is_ok() \{ a \} else \{ b \}\n    let _ = c", "carrier_arity_ok_0_is_unit")
-    let src = "fn f() -> Result[(), Str] \{ Ok() \}\nfn main() \{ let _ = f() \}\n"
-    let out = compile_test_helpers.compile_and_capture(src, "carrier_arity_ok_0_unit_return")
-    compile_test_helpers.expect_compiles_clean(out, "carrier_arity_ok_0_unit_return")
-    assert(!out.contains("\"severity\":\"ice\""))
+    expect_program_ok("fn f() -> Result[(), Str] \{ Ok() \}\nfn main() \{ let _ = f() \}\n", "carrier_arity_ok_0_unit_return")
+}
+
+test "Ok with no argument under an expectation that already names its error side is rejected" {
+    let src = "fn main() \{\n    let mut r = Ok(5)\n    r = Ok()\n    let _: Result[Int, Str] = r\n\}\n"
+    expect_program_error(src, "carrier_arity_ok_0_open_err", "variant `Ok` expects 1 argument(s), got 0")
+}
+
+test "Ok with no argument in an if branch under a non-unit payload is rejected" {
+    let src = "fn main() \{\n    let r: Result[Int, Str] = if true \{ Ok() \} else \{ Err(\"x\") \}\n    let _ = r\n\}\n"
+    expect_program_error(src, "carrier_arity_ok_0_if_branch", "variant `Ok` expects 1 argument(s), got 0")
+}
+
+// The expected type of a block's tail is not the expected type of a `let` inside the block.
+test "Ok with no argument bound by a plain let inside a block under a non-unit tail is unit" {
+    let src = "fn check(r: Result[(), Str]) -> Bool \{ r.is_ok() \}\nfn f() -> Result[Int, Str] \{\n    let u = Ok()\n    if check(u) \{ Ok(1) \} else \{ Err(\"e\") \}\n\}\nfn main() \{\n    let s: Result[Int, Str] = \{\n        let u = Ok()\n        if check(u) \{ Ok(2) \} else \{ Err(\"e\") \}\n    \}\n    let _ = (f(), s)\n\}\n"
+    expect_program_ok(src, "carrier_arity_ok_0_let_in_block")
+}
+
+test "Ok with no argument as a scrutinee or a condition takes no expectation from the enclosing value" {
+    let srcs = [
+        "fn main() \{\n    let r: Result[Int, Str] = match Ok() \{\n        Ok(_) => Ok(1)\n        Err(e) => Err(e)\n    \}\n    let _ = r\n\}\n",
+        "fn mk() -> Result[(), Str] \{ Ok(()) \}\nfn main() \{\n    let r: Result[Int, Str] = if Ok() == mk() \{ Ok(1) \} else \{ Err(\"e\") \}\n    let _ = r\n\}\n",
+    ]
+    let mut i = 0
+    for src in srcs {
+        let tag = "carrier_arity_ok_0_not_hinted_{i}"
+        let out = compile_test_helpers.compile_and_capture(src, tag)
+        assert(!out.contains("expects 1 argument(s)"))
+        assert(!out.contains("\"severity\":\"ice\""))
+        i = i + 1
+    }
 }

@@ -110,3 +110,60 @@ test "a field written and read through a Ptr with write and read runs" {
     assert_eq(r.exit_code, 0)
     assert_eq(r.out.trim(), "5")
 }
+
+// One error, and it is NoSuchField (E0525) at line:col: a field the pointee lacks is reported
+// as missing, with no `.write()` help for a field that does not exist.
+fn expect_no_such_field(label: Str, line: Int, col: Int, message: Str) {
+    let mut ok = errors().len() == 1
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            if d.name != "NoSuchField" || d.code != "E0525" { ok = false }
+            if d.message != message { ok = false }
+            if d.line != line || d.col != col { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "a write through a Ptr to a field the pointee lacks reports the missing field" {
+    probe(".tmp/ptr_place_missing_field.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.nope = 4\n    }\n}\n")
+    expect_no_such_field("missing field write", 7, 9, "type IoVec has no field `nope`")
+}
+
+test "a read and a write call through a Ptr on a field the pointee lacks report the missing field" {
+    probe(".tmp/ptr_place_missing_field_read.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        let y = p.nope\n        let _ = y\n    }\n}\n")
+    expect_no_such_field("missing field read", 7, 17, "type IoVec has no field `nope`")
+    probe(".tmp/ptr_place_missing_field_write_call.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.nope.write(4)\n    }\n}\n")
+    expect_no_such_field("missing field write call", 7, 9, "type IoVec has no field `nope`")
+}
+
+test "a field through a Ptr to a type with no fields reports the missing field" {
+    probe(".tmp/ptr_place_scalar_pointee.bl", "fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[I32]()\n        p.x = 4\n    }\n}\n")
+    expect_no_such_field("scalar pointee write", 4, 9, "type Ptr[I32] has no field `x`")
+    probe(".tmp/ptr_place_scalar_pointee_read.bl", "fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[I32]()\n        let y = p.x\n        let _ = y\n    }\n}\n")
+    expect_no_such_field("scalar pointee read", 4, 17, "type Ptr[I32] has no field `x`")
+}
+
+test "build reports a missing field through a Ptr, never an internal error" {
+    let out = compile_test_helpers.compile_and_capture("{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        let y = p.nope\n        let _ = y\n    }\n}\n", "ptr_place_missing_field_build")
+    compile_test_helpers.expect_error(out, "E0525", "build gives E0525")
+    let no_ice = !out.contains("\"severity\":\"ice\"")
+    if !no_ice { io.println("FAIL: build ICE: {out}") }
+    assert(no_ice)
+}
+
+test "the name the help binds is not one already in scope" {
+    let node = "@ffi.struct\ntype Node \{ p: Int, n: Int }\n\nfn next() -> Int \{ 9 }\n\n"
+    probe(".tmp/ptr_place_help_name_root.bl", "{node}fn main() \{\n    with ffi.scope() as s \{\n        let p: Ptr[Node] = s.alloc()\n        p.p = next()\n    }\n}\n")
+    expect_e0611("name is the root", 9, 9, "`p` is a `Ptr[Node]`", "`let p_1 = next()`, then `p.p.write(p_1)`", "the right side runs before `p` is read, so the fix keeps it on its own line")
+    probe(".tmp/ptr_place_help_name_local.bl", "{node}fn main() \{\n    let n = 1\n    let n_1 = 2\n    with ffi.scope() as s \{\n        let p: Ptr[Node] = s.alloc()\n        p.n = next() + n + n_1\n    }\n}\n")
+    expect_e0611("name is a local", 11, 9, "`p` is a `Ptr[Node]`", "`let n_2 = next() + n + n_1`, then `p.n.write(n_2)`", "the right side runs before `p` is read, so the fix keeps it on its own line")
+}
+
+test "a right side the help cannot quote still gets the write help" {
+    probe(".tmp/ptr_place_unquoted_rhs.bl", "{IOVEC}fn main() \{\n    let c = true\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = if c \{ 1 } else \{ 2 }\n    }\n}\n")
+    expect_e0611("unquoted rhs", 8, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len = ...`, then `p.iov_len.write(iov_len)`", "the right side runs before `p` is read, so the fix keeps it on its own line")
+    probe(".tmp/ptr_place_unquoted_rhs_compound.bl", "{IOVEC}fn main() \{\n    let c = true\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len += if c \{ 1 } else \{ 2 }\n    }\n}\n")
+    expect_e0611("unquoted rhs op=", 8, 9, "`p` is a `Ptr[IoVec]`", "`p.iov_len.write(p.iov_len.read() + ...)`", NOT_ATOMIC)
+}
