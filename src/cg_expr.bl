@@ -942,9 +942,8 @@ fn x_guarded_binary(site: ArithSite, rec: LayoutRecord, lhs_tid: Int, lhs: Int, 
     if rhs_tid < 0 { return -1 }
     let zero_test = x_operator_needs_guard(site.op, lhs_tid, rhs)
     let min_test = x_needs_min_guard(site.op, lhs_tid, rhs)
-    let left_held = x_hold(lhs_tid, site.lhs_node, lhs)
-    let right_held = x_hold(rhs_tid, site.rhs_node, rhs)
-    if left_held < 0 || right_held < 0 { return -1 }
+    let left_held = x_hold(lhs)
+    let right_held = x_hold(rhs)
     if zero_test {
         let tripped = x_operand_test(site.node, site.op, lhs_tid, rhs_tid, right_held)
         let said = x_guard_message(site.node, site.op, lhs_tid)
@@ -979,11 +978,23 @@ fn x_hoist_min_guard(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Int, rig
 }
 
 // An operand the guard needs to read twice, as a value: already a name, or a fresh temp.
-fn x_hold(tid: Int, node: Int, value: Int) -> Int ! Diag.Report {
+fn x_hold(value: Int) -> Int {
     if ir_kind_is_name(ir_kind(value)) { return value }
-    let bound = x_bind(tid, node, value)
-    if bound == "" { return -1 }
-    x_ref(tid, node, bound)
+    x_temp_of(value)
+}
+
+// A temp bound to `value`, read back. The temp takes the value's own spelling, not the
+// local layout of its tid: a cast keeps the tid of what it converts, so a narrow integer
+// widened for `...` would otherwise be stored back into the narrow type and reach the
+// format unwidened. The value is already lowered, so its spelling is never empty here.
+fn x_temp_of(value: Int) -> Int {
+    let tid = ir_tid(value)
+    let span = ir_span(value)
+    let spelling = ir_c_spelling(value)
+    let form = ir_slot_form(value)
+    let name = c_mint_local("x")
+    x_hoist(ir_let(tid, span, spelling, name, form, value))
+    ir_var_ref(tid, span, spelling, name, form)
 }
 
 // Two operands, lowered and sequenced as the program wrote them. A refused left operand
@@ -1026,9 +1037,7 @@ fn x_hold_operand(end: Int, value: Int) -> Int ! Diag.Report {
     if kind == IrKind.ContainerSpread || kind == IrKind.Box {
         let inner = ir_kid(value, 0)
         if ir_operand_stable(inner) { return value }
-        let held = x_hold_at(end, inner)
-        if held < 0 { return -1 }
-        return ir_with_first_kid(value, held)
+        return ir_with_first_kid(value, x_hold_at(end, inner))
     }
     if ir_operand_stable(value) { return value }
     x_hold_at(end, value)
@@ -1037,24 +1046,14 @@ fn x_hold_operand(end: Int, value: Int) -> Int ! Diag.Report {
 // The value bound to a temp at position `end` of the pending buffer, in front of the
 // statements pushed after it. A Void value has no temp to read, so its statement runs
 // there and its later reads print the placeholder the printer records for it.
-//
-// The temp takes the value's own spelling, not the local layout of its tid: a cast keeps
-// the tid of what it converts, so a narrow integer widened for `...` would otherwise be
-// stored back into the narrow type and reach the format unwidened.
 fn x_hold_at(end: Int, value: Int) -> Int ! Diag.Report {
     let later = x_take_from(end)
-    let tid = ir_tid(value)
     let mut held = value
-    if x_is_void_like(tid) {
+    if x_is_void_like(ir_tid(value)) {
         ir_mark_materialize(value)
         x_hoist(ir_expr_stmt(ir_span(value), value))
     } else {
-        let span = ir_span(value)
-        let spelling = ir_c_spelling(value)
-        let form = ir_slot_form(value)
-        let name = c_mint_local("x")
-        x_hoist(ir_let(tid, span, spelling, name, form, value))
-        held = ir_var_ref(tid, span, spelling, name, form)
+        held = x_temp_of(value)
     }
     let mut i = 0
     while i < later.len() {
@@ -1113,9 +1112,8 @@ fn x_operator_can_overflow(op: Str, tid: Int) -> Bool {
 fn x_checked_arith(site: ArithSite, rec: LayoutRecord, lhs_tid: Int, lhs: Int, rhs: Int) -> Int ! Diag.Report {
     let rhs_tid = tid_of_node(site.rhs_node)
     if rhs_tid < 0 { return -1 }
-    let left = x_hold(lhs_tid, site.lhs_node, lhs)
-    let right = x_hold(rhs_tid, site.rhs_node, rhs)
-    if left < 0 || right < 0 { return -1 }
+    let left = x_hold(lhs)
+    let right = x_hold(rhs)
     let l = x_reread(left)
     let r = x_reread(right)
     let said = x_operands_message(site, lhs_tid, rhs_tid, left, right)
@@ -1440,8 +1438,7 @@ fn x_negative_literal(node: Int, tid: Int, rec: LayoutRecord) -> Int ! Diag.Repo
 // negation in its own type.
 fn x_checked_negation(node: Int, tid: Int, rec: LayoutRecord, operand: Int) -> Int ! Diag.Report {
     let src = node_left(node)
-    let held = x_hold(tid, src, operand)
-    if held < 0 { return -1 }
+    let held = x_hold(operand)
     let spec = x_operand_spec(tid, src)
     let shown = x_reread(held)
     if spec == "" || shown < 0 { return -1 }
