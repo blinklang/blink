@@ -354,6 +354,7 @@ test "addition works" {
 - **A fn declared `-> Never` must not return, else `E0311`.** `panic(msg)`, `todo()`, `unreachable()` and `skip()` have type `Never`, so they fit any expected type. `todo()` warns `W0703 TodoInCode`.
 - **A statement that drops the result of `append`, `slice`, `reverse`, `sort`, `sort_by` (List) or `union` (Set) warns `W0606 DiscardedCollectionCopy`:** they return a new value and do not mutate.
 - **A write through a name that is not `mut` is `E0610`.** This covers `=`, `op=` and a mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` or on a pattern binder. Use `let mut x`, or `mut` before the binder: `Some(mut ys) => ys.push(1)`.
+- **A field behind a `Ptr` is not a place.** `p.f = v` and `p.f += v` for `p: Ptr[S]` are `E0611 NotAPlace`, whatever the root is. Write `p.f.write(v)`, or `p.f.write(p.f.read() + v)`, which is a read and then a write, not one atomic step.
 - **`mut` goes before a name, not before a pattern.** `let mut (x, y) = pair` and `for mut (k, v) in pairs` are `E0613 MutOnPattern`; write `let (mut x, mut y) = pair`. `blink fix` makes this edit.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`** (`E0005 InconsistentPatternBindings`). `Click(mut x, y) | Touch(x, y)` is an error; write `mut x` in both.
 - **`for x in <non-iterable>` is `E0302`.**

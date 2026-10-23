@@ -1,0 +1,112 @@
+// `=` or `op=` whose path takes a step through a `Ptr` is `error[NotAPlace]` (E0611,
+// sections/02_syntax.md §2.22 *Writes that are not to a place*, case 1;
+// sections/07_trust_modules_metadata.md §9.1.3). A field behind a `Ptr` is written with
+// `.write()`. The case comes first, so the root kind does not matter: a `let`, a `let mut` and
+// a parameter all give E0611 and nothing else. The help names the `.write()` form; it is help
+// only, since `p.f.write(rhs)` reads `p` before `rhs` runs and `p.f = rhs` reads it after.
+// The build must report the same error, never an internal compiler error.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import compile_test_helpers
+import std.io
+
+fn probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | label: {d.label} | help: {d.help} | notes: {d.notes.join(\"; \")} | fix: {d.fix_action} `{d.fix_text}`")
+        }
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for e in errors() { io.println("  {e}") }
+}
+
+// One error, and it is E0611 at line:col with this label and help, the not-a-place note
+// plus `extra_note` when it is not empty, and no fix.
+fn expect_e0611(label: Str, line: Int, col: Int, ptr_label: Str, help: Str, extra_note: Str) {
+    let mut ok = errors().len() == 1
+    for d in diag_entries {
+        if d.severity == "error" {
+            if d.name != "NotAPlace" || d.code != "E0611" { ok = false }
+            if d.message != "cannot assign through a `Ptr`" { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if d.label != ptr_label || d.help != help { ok = false }
+            if !d.notes.contains("a field behind a `Ptr` is not a place; write it with `.write()`") { ok = false }
+            if extra_note != "" && !d.notes.contains(extra_note) { ok = false }
+            if d.fix_action != "" || d.fix_text != "" { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+let IOVEC = "@ffi.struct(header: \"sys/uio.h\", name: \"iovec\")\npub type IoVec \{ iov_base: Ptr[U8], iov_len: U64 }\n\n"
+
+let NOT_ATOMIC = "this is a read and then a write, not one atomic step"
+
+test "a write through a Ptr held by a plain let is E0611" {
+    probe(".tmp/ptr_place_let.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = 4\n    }\n}\n")
+    expect_e0611("let", 7, 9, "`p` is a `Ptr[IoVec]`", "`p.iov_len.write(4)`", "")
+}
+
+test "a write through a Ptr held by a let mut is E0611, not a mutability error" {
+    probe(".tmp/ptr_place_let_mut.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let mut p = s.alloc[IoVec]()\n        p.iov_len = 4\n        p = s.alloc[IoVec]()\n    }\n}\n")
+    expect_e0611("let mut", 7, 9, "`p` is a `Ptr[IoVec]`", "`p.iov_len.write(4)`", "")
+}
+
+test "a write through a Ptr parameter is E0611, not a parameter error" {
+    probe(".tmp/ptr_place_param.bl", "{IOVEC}@trusted(audit: \"ptr-place-param\")\nfn set_len(p: Ptr[IoVec], n: U64) \{\n    p.iov_len = n\n}\n\nfn main() \{}\n")
+    expect_e0611("param", 6, 5, "`p` is a `Ptr[IoVec]`", "`p.iov_len.write(n)`", "")
+}
+
+test "a write through a Ptr reached through a field of a plain let is E0611, not a mutability error" {
+    probe(".tmp/ptr_place_mid_path.bl", "{IOVEC}type Holder \{ v: Ptr[IoVec] }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let h = Holder \{ v: s.alloc[IoVec]() }\n        h.v.iov_len = 4\n    }\n}\n")
+    expect_e0611("mid path", 9, 9, "`h.v` is a `Ptr[IoVec]`", "`h.v.iov_len.write(4)`", "")
+}
+
+test "a write to a field nested in the pointee of a Ptr is E0611" {
+    let src = "@ffi.struct\ntype Inner \{ b: Int, c: Int }\n\n@ffi.struct\ntype Outer \{ a: Inner, n: Int }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let p: Ptr[Outer] = s.alloc()\n        p.a.b = 5\n    }\n}\n"
+    probe(".tmp/ptr_place_nested.bl", src)
+    expect_e0611("nested", 10, 9, "`p` is a `Ptr[Outer]`", "`p.a.b.write(5)`", "")
+}
+
+test "a compound write through a Ptr is E0611 with a read-then-write help" {
+    probe(".tmp/ptr_place_compound.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len += 1\n    }\n}\n")
+    expect_e0611("op=", 7, 9, "`p` is a `Ptr[IoVec]`", "`p.iov_len.write(p.iov_len.read() + 1)`", NOT_ATOMIC)
+}
+
+test "a write through a Ptr with a right side that runs code keeps the right side on its own line" {
+    probe(".tmp/ptr_place_effectful_rhs.bl", "{IOVEC}fn next() -> U64 \{ 9 }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = next()\n    }\n}\n")
+    expect_e0611("call rhs", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len = next()`, then `p.iov_len.write(iov_len)`", "the right side runs before `p` is read, so the fix keeps it on its own line")
+}
+
+test "build reports E0611 for a write through a Ptr, never an internal error" {
+    let out = compile_test_helpers.compile_and_capture("{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = 4\n    }\n}\n", "ptr_place_build")
+    compile_test_helpers.expect_error(out, "E0611", "build gives E0611")
+    let no_ice = !out.contains("\"severity\":\"ice\"")
+    if !no_ice { io.println("FAIL: build ICE: {out}") }
+    assert(no_ice)
+}
+
+test "a field written and read through a Ptr with write and read runs" {
+    let src = "import std.io\n\n{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len.write(4)\n        p.iov_len.write(p.iov_len.read() + 1)\n        io.println(\"\{p.iov_len.read()}\")\n    }\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "ptr_place_write_runs")
+    if r.exit_code != 0 { io.println("FAIL: run: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "5")
+}

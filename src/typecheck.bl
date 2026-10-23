@@ -1,7 +1,7 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
-import unparse.{type_ann_text, unparse_expr}
+import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs}
 import formatter.{effect_op_sig_text}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
@@ -33,7 +33,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, diag_error_label_at_notes,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -27781,6 +27781,19 @@ fn tc_name_is_variant_ctor(name: Str) -> Int {
     0
 }
 
+// A string with no interpolated part is a literal. One with a part is a run-time
+// concatenation of whatever the part evaluates to, whatever that part looks like.
+fn tc_is_plain_string_literal(node: Int) -> Bool {
+    let parts = node_elements(node)
+    if parts == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(parts) {
+        if is_literal_string_part(sublist_get(parts, i)) == 0 { return false }
+        i = i + 1
+    }
+    true
+}
+
 fn tc_is_const_expr(e: Int) -> Int {
     if e == -1 { return 0 }
     let k = node_kind(e)
@@ -27818,18 +27831,7 @@ fn tc_is_const_expr(e: Int) -> Int {
         if tc_is_const_expr(node_left(e)) == 0 { return 0 }
         return tc_is_const_expr(node_right(e))
     }
-    // A string with no interpolated part is a literal. One with a part is a run-time
-    // concatenation of whatever the part evaluates to, whatever that part looks like.
-    if k == NodeKind.InterpString {
-        let parts = node_elements(e)
-        if parts == -1 { return 1 }
-        let mut i = 0
-        while i < sublist_length(parts) {
-            if is_literal_string_part(sublist_get(parts, i)) == 0 { return 0 }
-            i = i + 1
-        }
-        return 1
-    }
+    if k == NodeKind.InterpString { return if tc_is_plain_string_literal(e) { 1 } else { 0 } }
     // §2.21 enumerates a closed set and is silent on these three. `#embed` is read by the
     // compiler and can be nothing else, and a bracket literal of const elements is written in
     // the tree today, so refusing either would refuse correct code the section never rules out.
@@ -28958,16 +28960,21 @@ fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
     diag_error_at("MutationRequiresMut", MUTATION_REQUIRES_MUT, "cannot call mutating method `.{method}` on immutable binding `{name}`", node, "declare it as `let mut {name}` at line {node_line(decl)}")
 }
 
-// §2.22 *Writes that are not to a place*, case 4: `=` or `op=` whose root is a plain `let`.
-// Runs once the path's types are known, since the cases before it in the spec's order -- a
-// `Ptr` step, a temporary root, a parameter root -- are other errors and take the write. A
-// pattern binder and the name after `with ... as` go to tc_report_immutable_binder.
-fn tc_check_assign_root(target: Int) ! Diag.Report {
+// §2.22 *Writes that are not to a place*, cases 1 and 4: `=` or `op=` whose path steps
+// through a `Ptr`, then one whose root is a plain `let`. Runs once the path's types are
+// known. A temporary root and a parameter root, the cases between them in the spec's order,
+// are other errors and take the write. A pattern binder and the name after `with ... as` go
+// to tc_report_immutable_binder.
+fn tc_check_assign_root(node: Int, target: Int) ! Diag.Report {
     let mut root = target
     while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
         let obj = node_obj(root)
         if obj == -1 { return }
-        if type_kind(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(obj)))) == TyKind.Ptr { return }
+        let obj_t = tc_resolve(tc_lookup_node_tid(obj))
+        if type_kind(resolve_alias_tid(obj_t)) == TyKind.Ptr {
+            tc_report_write_through_ptr(node, target, obj, obj_t)
+            return
+        }
         root = obj
     }
     if node_kind(root) != NodeKind.Ident { return }
@@ -29009,6 +29016,57 @@ fn tc_check_assign_root(target: Int) ! Diag.Report {
     }
     diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, target,
         "declare it `let mut {name}` only if it must change: `mut` adds `State` to the row of each function that reads or writes it (§4.16)", notes)
+}
+
+// `place = rhs` runs `rhs` before it reads the root, but `p.f.write(rhs)` reads `p` before
+// its argument runs, so the help writes `rhs` in place only when it runs no code, and else
+// binds it on the line before. Help only: no fix is applied.
+fn tc_report_write_through_ptr(node: Int, target: Int, ptr: Int, ptr_t: Int) ! Diag.Report {
+    let message = "cannot assign through a `Ptr`"
+    let mut notes = ["a field behind a `Ptr` is not a place; write it with `.write()`"]
+    let path = tc_index_text(target)
+    let ptr_text = tc_index_text(ptr)
+    let label = if ptr_text == "" { "" } else { "`{ptr_text}` is a `{type_to_str(ptr_t)}`" }
+    let val = node_value(node)
+    let rhs = tc_index_text(val)
+    let mut help = ""
+    if path != "" && rhs != "" {
+        if node_kind(node) == NodeKind.CompoundAssign {
+            notes.push("this is a read and then a write, not one atomic step")
+            help = "`{path}.write({unparse_binop_with_lhs("{path}.read()", node_op(node), val)})`"
+        } else if tc_runs_no_code(val) {
+            help = "`{path}.write({rhs})`"
+        } else {
+            // The target is a field step, since an index target never reaches here; a tuple
+            // step such as `p.0` names no binding.
+            let field = node_name(target)
+            let first = if field == "" { 48 } else { field.byte_at(0).to_int() }
+            let name = if first >= 48 && first <= 57 { "v" } else { field }
+            notes.push("the right side runs before `{ptr_text}` is read, so the fix keeps it on its own line")
+            help = "`let {name} = {rhs}`, then `{path}.write({name})`"
+        }
+    }
+    tc_errors.push(message)
+    diag_error_label_at_notes("NotAPlace", NOT_A_PLACE, message, target, label, help, notes)
+}
+
+// §2.22: a literal, a name, or a field path of names. It has no operator, call or other
+// sub-expression, so it cannot run code.
+fn tc_runs_no_code(node: Int) -> Bool {
+    let k = node_kind(node)
+    if k == NodeKind.IntLit || k == NodeKind.FloatLit || k == NodeKind.CharLit || k == NodeKind.BoolLit || k == NodeKind.Ident {
+        return true
+    }
+    if k == NodeKind.UnaryOp && node_op(node) == "-" {
+        let operand = node_left(node)
+        return operand != -1 && (node_kind(operand) == NodeKind.IntLit || node_kind(operand) == NodeKind.FloatLit)
+    }
+    if k == NodeKind.InterpString { return tc_is_plain_string_literal(node) }
+    if k == NodeKind.FieldAccess {
+        let obj = node_obj(node)
+        return obj != -1 && (node_kind(obj) == NodeKind.Ident || node_kind(obj) == NodeKind.FieldAccess) && tc_runs_no_code(obj)
+    }
+    false
 }
 
 // The mutation check above runs from tc_check_body's MethodCall arm, which is reached only in
@@ -29679,7 +29737,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         if target != -1 && val != -1 {
             let target_t = infer_type(target)
-            tc_check_assign_root(target)
+            tc_check_assign_root(node, target)
             let val_t = tc_infer_assigned_value(target_t, val)
             if kind == NodeKind.CompoundAssign {
                 reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
