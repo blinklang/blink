@@ -4221,13 +4221,19 @@ fn report_manifest_diagnostics(manifest: Str) ! Diag.Report {
     diag_flush()
 }
 
-// A test binary's scratch files live in one directory named for its process id
-// (compile_test_helpers.scratch_root). The exec in the runner's shell keeps that id, and no
-// other code removes the directory, so the runner does once the binary has ended.
-fn remove_test_scratch(pid: Int) {
+// A test binary's scratch files live in the directory the runner names in
+// BLINK_TEST_SCRATCH_DIR (compile_test_helpers.scratch_root makes it). The runner
+// cannot learn the binary's process id, since process_spawn returns a handle, so it picks the
+// name itself: its own process id keeps two runners apart, the file index keeps two binaries
+// of one run apart. No other code removes the directory, so the runner does once the binary
+// has ended.
+fn test_scratch_dir(idx: Int) -> Str {
     let tmp = env.var("TMPDIR") ?? ""
     let base = if tmp == "" { "/tmp" } else { tmp }
-    let dir = "{base}/blink-test-{pid}"
+    "{base}/blink-test-{getpid()}-{idx}"
+}
+
+fn remove_test_scratch(dir: Str) {
     if file_exists(dir) == 1 {
         let _ = process_run("rm", ["-rf", dir])
     }
@@ -4301,7 +4307,9 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             run_cmd = "{run_cmd} --test-tags \"{tags_filter}\""
         }
         // A test reads the null device, never the terminal that started the runner (spec: blink test).
-        let test_rc = shell_exec("{run_cmd} < /dev/null")
+        let scratch = test_scratch_dir(0)
+        let test_rc = shell_exec("BLINK_TEST_SCRATCH_DIR=\"{scratch}\" {run_cmd} < /dev/null")
+        remove_test_scratch(scratch)
         exit(test_rc)
     }
 
@@ -4501,11 +4509,12 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 // A test reads the null device, never the terminal that started the runner
                 // (spec: blink test). The shell sets that up itself because a runner linked
                 // against an older runtime hands its children its own input.
-                let mut targv = ["-c", "exec \"$0\" \"$@\" < /dev/null", bin_path]
+                let scratch = test_scratch_dir(idx)
+                let mut targv = ["-c", "BLINK_TEST_SCRATCH_DIR=\"$1\"; export BLINK_TEST_SCRATCH_DIR; shift; exec \"$0\" \"$@\" < /dev/null", bin_path, scratch]
                 for arg in rcmd { targv.push(arg) }
                 let rpid = process_spawn("/bin/sh", targv)
                 let rr = process_pid_wait(rpid)
-                remove_test_scratch(rpid)
+                remove_test_scratch(scratch)
                 results.send(TestFileResult { idx: idx, built: true, exit_code: rr.exit_code, out: rr.out, err_out: rr.err_out })
                 if dots != 0 {
                     for col in dot_ch {

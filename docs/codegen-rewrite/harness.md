@@ -112,10 +112,12 @@ files share an object cache, and a test that calls the relative path
 Test scratch files are not in the work directory. Each file also gets a private
 `TMPDIR` made with `mktemp -d` (`blink-corpus-XXXXXX` under the caller's
 `TMPDIR`, or `/tmp`). A test gets its scratch dir from
-`compile_test_helpers.scratch_root()`: `$TMPDIR/blink-test-<pid>`, unique for
-each test process. `corpus_one.sh` removes the private `TMPDIR` when the file
-ends, and `blink test` removes the dir of each test binary it runs. A binary
-that you run by hand leaves its dir; delete it yourself.
+`compile_test_helpers.scratch_root()`. `blink test` names a dir
+`$TMPDIR/blink-test-<runner pid>-<index>` for each test binary, passes it in
+`BLINK_TEST_SCRATCH_DIR`, and removes it when the binary ends. Without that
+variable, `scratch_root()` uses `$TMPDIR/blink-test-<pid>`, unique for each
+test process. `corpus_one.sh` removes its private `TMPDIR` when the file ends.
+A binary that you run by hand leaves its dir; delete it yourself.
 
 The pass rule is the same as `blink test`: build with `--debug`, then run
 the binary. A file with `test` blocks and a `fn main(` runs with `--test`.
