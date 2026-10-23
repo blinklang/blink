@@ -106,9 +106,9 @@
 #                            own under TMPDIR, so two runs at once never share
 #                            one (compile_test_helpers.scratch_root() in a test,
 #                            `mktemp -d` in a script). A path under a private
-#                            tree (`{tree}/.tmp/`, `{root}/.tmp/`, `$work/.tmp/`)
-#                            is not counted: it is the compiler's own `.tmp`
-#                            inside a tree the test or script made. This script
+#                            tree (`{tree}/.tmp/`, `$work/.tmp/`) is not counted: it is
+#                            the compiler's own `.tmp` inside a tree the test or
+#                            script made. Nor is a read of `.tmp/*.o`. This script
 #                            and its self-test are not scanned, because they name
 #                            the pattern. Counted in the live tree only: a
 #                            historical ref is materialized with src/ alone
@@ -253,7 +253,7 @@ repo_tmp_uses() {
   [ -d "$1/scripts" ] && dirs="$dirs $1/scripts"
   [ -n "$dirs" ] || { echo 0; return; }
   rg -o -P -g '*.bl' -g '*.sh' -g '!ratchet.sh' -g '!test_ratchet.sh' \
-    '(?<!\{tree\}/)(?<!\{root\}/)(?<!\$work/)\.tmp/' $dirs 2>/dev/null | wc -l | tr -d ' '
+    '(?<![\w.])(?<!\{tree\}/)(?<!\$work/)\.tmp/(?!\*\.o)' $dirs 2>/dev/null | wc -l | tr -d ' '
 }
 
 SPEC_TYPES=sections/07_trust_modules_metadata.md
@@ -365,6 +365,7 @@ tracked_rows_at() {
 walk_branch() {
   base_ref="$1"
   walk=$(mktemp -d)
+  trap 'rm -rf "$walk"' EXIT
   git rev-list --reverse --parents "${base_ref}..HEAD" | while read -r c parents; do
     [ -n "$parents" ] || continue
     [ -d "$walk/$c" ] || materialize_ref "$c" "$walk/$c"
@@ -398,6 +399,8 @@ fi
 [ -f "$baseline" ] || { echo "ratchet: no baseline; run scripts/ratchet.sh --update"; exit 1; }
 
 head1_tracked=""
+failmark=""
+trap 'rm -f "$failmark"; [ -n "${head1_root:-}" ] && [ -z "${RATCHET_HEAD1_DIR:-}" ] && rm -rf "$head1_root"' EXIT
 if [ -n "${RATCHET_HEAD1_DIR:-}" ]; then
   head1_root="$RATCHET_HEAD1_DIR"
   check_root "$head1_root"
@@ -417,7 +420,6 @@ else
 fi
 
 failmark=$(mktemp)
-trap 'rm -f "$failmark"; [ -n "${head1_root:-}" ] && [ -z "${RATCHET_HEAD1_DIR:-}" ] && rm -rf "$head1_root"' EXIT
 
 printf '%-26s %8s %8s %8s\n' metric baseline 'head~1' now
 printf '%s\n' "$rows_now" | while read -r name now; do

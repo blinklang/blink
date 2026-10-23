@@ -135,7 +135,12 @@ list=$(mktemp)
 slice_list=$(mktemp)
 rows=$(mktemp)
 sweep_out=$(mktemp)
-trap 'rm -f "$list" "$slice_list" "$rows" "$sweep_out"' EXIT
+# One scratch root for the sweep: corpus_one.sh makes each row's TMPDIR inside it. A row
+# that stop_running kills with SIGKILL cannot clean up, so the root is removed here, and
+# it names the daemons a row starts by their working dir.
+sweep_tmp=$(mktemp -d "${TMPDIR:-/tmp}/blink-corpus-XXXXXX") || exit 2
+export BLINK_CORPUS_SWEEP_TMP="$sweep_tmp"
+trap 'rm -f "$list" "$slice_list" "$rows" "$sweep_out"; rm -rf "$sweep_tmp"' EXIT
 
 # A ci step that fails beside the corpus makes task stop it with INT, then kill it
 # about 2 s later; the builds and the sweep below would run on to the end with no
@@ -169,8 +174,9 @@ stop_running() {
         [ "$(ps -o ppid= -p "$p" | tr -d ' ')" = "$$" ] && mine+=("$p")
     done
     # A daemon a row starts leaves the tree when it detaches. Each row runs in its
-    # own dir under build/corpus/work, so its working dir finds it.
-    mine+=($(find /proc/[0-9]*/cwd -maxdepth 0 -lname "$(pwd)/build/corpus/work/*" 2>/dev/null \
+    # own dir under build/corpus/work, and a test's scratch tree is under the sweep root,
+    # so either working dir finds it.
+    mine+=($(find /proc/[0-9]*/cwd -maxdepth 0 \( -lname "$(pwd)/build/corpus/work/*" -o -lname "$sweep_tmp/*" \) 2>/dev/null \
         | awk -F/ '{ print $3 }'))
     for _ in 1 2 3 4 5; do
         now=$(tree "${mine[@]}")
@@ -180,6 +186,7 @@ stop_running() {
         seen=$now
     done
     [ -n "$seen" ] && kill -KILL $seen 2>/dev/null
+    rm -rf "$sweep_tmp"
     echo "corpus: stopped by signal, $(echo $seen | wc -w) process(es) killed" >&2
     exit "$1"
 }

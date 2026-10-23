@@ -90,8 +90,10 @@ if grep -qE '^test "|^test\.failing\(' "$f" && grep -q 'fn main(' "$f"; then
   run_args="--test"
 fi
 outcome() {
-  out=$(BLINK_ROOT="$(pwd)" "$1" $run_args 2>/dev/null)
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-test-XXXXXX")
+  out=$(BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1" $run_args 2>/dev/null)
   rc=$?
+  rm -rf "$scratch"
   out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
   if printf '%s\n' "$out" | grep -qE '^test .* \.\.\. '; then
     out=$(printf '%s\n' "$out" | grep -E '^test .* \.\.\. (ok|FAIL|PANIC|SKIP|skipped|xfail|XPASS)|^[0-9]+ passed, ')

@@ -462,6 +462,8 @@ check_repo_tmp() {
 check_repo_tmp test-bare tests/test_scratch_user.bl 'let p = ".tmp/probe/x.bl"' fail
 check_repo_tmp test-var-prefixed tests/test_scratch_user.bl 'let p = "{dir}/.tmp/probe.bl"' fail
 check_repo_tmp script-mktemp scripts/some_gate.sh 'f=$(mktemp .tmp/gate-XXXXXX)' fail
+check_repo_tmp test-root-prefixed tests/test_scratch_user.bl 'let p = "{root}/.tmp/probe.bl"' fail
+check_repo_tmp test-suffix-name-not-counted tests/test_scratch_user.bl 'let p = "{dir}/plain.tmp/x"' pass
 check_repo_tmp test-private-tree tests/test_scratch_user.bl 'shell_exec("mkdir -p {tree}/.tmp")
 write_file("{tree}/.tmp/x.o", "")' pass
 check_repo_tmp script-private-tree scripts/some_gate.sh 'mkdir -p "$work/.tmp/"' pass

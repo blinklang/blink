@@ -1,50 +1,78 @@
-// `blink test` gives each test binary a scratch dir below TMPDIR (BLINK_TEST_SCRATCH_DIR) and
-// removes it once the binary ends, in the one-file and the directory mode. Without that, a run
-// over the whole suite leaves one dir per test file in TMPDIR.
+// `blink test` gives each test binary its own scratch dir below TMPDIR (BLINK_TEST_SCRATCH_DIR)
+// and removes it once the binary ends, in the one-file and the directory mode. Without that, a
+// run over the whole suite leaves one dir per test file in TMPDIR, or two binaries share one.
 // Fixture basenames must be unique per worker: `blink test` writes each binary to build/<basename>.
 
 import compile_test_helpers
 
-fn fixture(name: Str) -> Str {
-    "test \"{name} sees a scratch dir of its own under TMPDIR\" \{\n    let dir = env.var(\"BLINK_TEST_SCRATCH_DIR\") ?? \"\"\n    let tmp = env.var(\"TMPDIR\") ?? \"\"\n    assert(dir != \"\", \"the runner names no scratch dir\")\n    assert(dir.starts_with(tmp), \"scratch dir \{dir} is not below TMPDIR \{tmp}\")\n    shell_exec(\"mkdir -p \{dir} && echo kept > \{dir}/probe\")\n    assert(file_exists(\"\{dir}/probe\") == 1)\n}\n"
+fn fixture(name: Str, seen: Str) -> Str {
+    "test \"{name} writes into its scratch dir\" \{\n    let dir = env.var(\"BLINK_TEST_SCRATCH_DIR\") ?? \"\"\n    let tmp = env.var(\"TMPDIR\") ?? \"\"\n    assert(dir != \"\", \"the runner names no scratch dir\")\n    assert(dir.starts_with(tmp), \"scratch dir \{dir} is not below TMPDIR \{tmp}\")\n    let _ = process_run(\"mkdir\", [\"-p\", dir])\n    write_file(\"\{dir}/probe\", \"kept\")\n    assert(file_exists(\"\{dir}/probe\") == 1)\n    let _ = process_run(\"sh\", [\"-c\", \"echo \\\"$1\\\" >> \\\"$2\\\"\", \"sh\", dir, \"{seen}\"])\n}\n"
 }
 
 fn run_under(tmp: Str, target: Str) -> Str {
-    let r = process_run("sh", ["-c", "TMPDIR={tmp} build/blink test {target} --quiet 2>&1; echo \"exit=$?\""])
+    let r = process_run("sh", ["-c", "TMPDIR=\"$1\" build/blink test \"$2\" --quiet 2>&1; echo \"exit=$?\"", "sh", tmp, target])
     r.out
 }
 
-test "blink test removes the scratch dir of each test binary in directory mode" {
-    let root = "{compile_test_helpers.scratch_root()}/_test_scratch_cleanup_dir"
+fn leftovers(tmp: Str) -> Str {
+    process_run("ls", ["-A", tmp]).out
+}
+
+test "blink test gives each test binary a scratch dir of its own and removes it, in directory mode" {
+    let root = "{compile_test_helpers.scratch_root()}/scratch_cleanup_dir"
     let tmp = "{root}/tmp"
     let src = "{root}/src"
-    shell_exec("rm -rf {root}")
-    shell_exec("mkdir -p {tmp} {src}")
-    write_file("{src}/scratch_cleanup_dir_a_{getpid()}.bl", fixture("a"))
-    write_file("{src}/scratch_cleanup_dir_b_{getpid()}.bl", fixture("b"))
+    let seen = "{root}/seen.txt"
+    let _ = process_run("rm", ["-rf", root])
+    let _ = process_run("mkdir", ["-p", tmp, src])
+    write_file("{src}/scratch_cleanup_dir_a_{getpid()}.bl", fixture("a", seen))
+    write_file("{src}/scratch_cleanup_dir_b_{getpid()}.bl", fixture("b", seen))
 
     let out = run_under(tmp, src)
     let diag = "captured:\n{out}"
     assert(out.contains("2 test files: 2 passed, 0 failed, 0 build errors"), "expected both files to pass; {diag}")
-    let left = process_run("ls", ["-A", tmp]).out
+    let dirs = read_file(seen).trim().split("\n")
+    assert_eq(dirs.len(), 2)
+    let first = dirs.get(0) ?? ""
+    let second = dirs.get(1) ?? ""
+    assert(first != second, "two test binaries shared the scratch dir {first}")
+    let left = leftovers(tmp)
     assert(left == "", "the runner left scratch dirs behind: {left}")
 
-    shell_exec("rm -rf {root}")
+    let _ = process_run("rm", ["-rf", root])
 }
 
 test "blink test removes the scratch dir of a test binary in one-file mode" {
-    let root = "{compile_test_helpers.scratch_root()}/_test_scratch_cleanup_file"
+    let root = "{compile_test_helpers.scratch_root()}/scratch_cleanup_file"
     let tmp = "{root}/tmp"
-    shell_exec("rm -rf {root}")
-    shell_exec("mkdir -p {tmp}")
+    let seen = "{root}/seen.txt"
+    let _ = process_run("rm", ["-rf", root])
+    let _ = process_run("mkdir", ["-p", tmp])
     let file = "{root}/scratch_cleanup_file_{getpid()}.bl"
-    write_file(file, fixture("single"))
+    write_file(file, fixture("single", seen))
 
     let out = run_under(tmp, file)
     let diag = "captured:\n{out}"
     assert(out.contains("exit=0"), "expected the file to pass; {diag}")
-    let left = process_run("ls", ["-A", tmp]).out
+    let left = leftovers(tmp)
     assert(left == "", "the runner left scratch dirs behind: {left}")
 
-    shell_exec("rm -rf {root}")
+    let _ = process_run("rm", ["-rf", root])
+}
+
+test "blink test passes a TMPDIR that holds a quote and a dollar sign to the test binary whole" {
+    let root = "{compile_test_helpers.scratch_root()}/scratch_cleanup_quote"
+    let tmp = "{root}/it's a $HOME dir"
+    let seen = "{root}/seen.txt"
+    let _ = process_run("rm", ["-rf", root])
+    let _ = process_run("mkdir", ["-p", tmp])
+    let file = "{root}/scratch_cleanup_quote_{getpid()}.bl"
+    write_file(file, fixture("quoted", seen))
+
+    let out = run_under(tmp, file)
+    let diag = "captured:\n{out}"
+    assert(out.contains("exit=0"), "expected the file to pass; {diag}")
+    assert(leftovers(tmp) == "", "the runner left scratch dirs behind")
+
+    let _ = process_run("rm", ["-rf", root])
 }
