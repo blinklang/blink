@@ -137,8 +137,9 @@ rows=$(mktemp)
 sweep_out=$(mktemp)
 # One scratch root for the sweep: corpus_one.sh makes each row's TMPDIR inside it. A row
 # that stop_running kills with SIGKILL cannot clean up, so the root is removed here, and
-# it names the daemons a row starts by their working dir.
-sweep_tmp=$(mktemp -d "${TMPDIR:-/tmp}/blink-corpus-XXXXXX") || exit 2
+# it names the daemons a row starts by their working dir. The names are short: a daemon
+# test puts a socket under the scratch dir, and a socket path has a length limit.
+sweep_tmp=$(mktemp -d "${TMPDIR:-/tmp}/bcs-XXXXXX") || exit 2
 export BLINK_CORPUS_SWEEP_TMP="$sweep_tmp"
 trap 'rm -f "$list" "$slice_list" "$rows" "$sweep_out"; rm -rf "$sweep_tmp"' EXIT
 

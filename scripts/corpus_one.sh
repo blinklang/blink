@@ -107,7 +107,11 @@ rm -rf "$work"
 mkdir -p "$work/build" "$work/.tmp"
 # Short, outside the sandbox: a daemon test puts a socket under its scratch dir, and a
 # socket path has a length limit the sandbox path would exceed.
-scratch=$(mktemp -d "${BLINK_CORPUS_SWEEP_TMP:-${TMPDIR:-/tmp}}/blink-corpus-XXXXXX") || exit 2
+if [ -n "${BLINK_CORPUS_SWEEP_TMP:-}" ]; then
+    scratch=$(mktemp -d "$BLINK_CORPUS_SWEEP_TMP/XXXXXX") || exit 2
+else
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-corpus-XXXXXX") || exit 2
+fi
 trap 'rm -rf "$scratch"' EXIT
 export TMPDIR="$scratch"
 # corpus.sh builds each vendored native object once per sweep. The build skips
