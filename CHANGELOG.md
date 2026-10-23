@@ -2,6 +2,50 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.58.0)
+
+### Literals
+- **An integer literal that does not fit its type is E0318 IntLiteralOutOfRange.** Before, the compiler gave a wrong type error, or C cut the value with no error. The check uses the exact digits you wrote. `-(128)` counts as one literal. For an unsigned type, every negative literal is an error, `-0` too. A literal in a pattern or a range bound takes the type of the scrutinee. A `const` value gets E0318 in place of a const evaluation error. On a `let` with no annotation, the help suggests `U64`. Write a value that fits, or use a wider type.
+
+### Patterns
+- **In a match arm, a bare name with an uppercase first letter names a variant; it never binds.** `Gren =>` on an enum is E0547 NoSuchVariant with a nearest-name help; before, it caught every value. `MAX =>` on an `Int` and `None =>` on a type parameter are E0308 EnumPatternNeedsEnumScrutinee, reported in the generic function; before, the second compiled and panicked at run time. To bind, write a lowercase name; to compare with a value, write a guard `n if n == MAX =>`. In an `as` pattern, write `_` for the inner catch-all: `s as _`. `let` and `for` still bind an uppercase name. A variant pattern with a payload on a struct, a tuple or a type parameter moves from E0547 to E0308.
+- **A struct or variant brace pattern must name each field, or end with `..`.** A pattern that leaves fields out and has no `..` is E0319 PatternMissingRest. The fix writes `..`; `f: _` is the other repair. Before, the pattern matched with no error.
+- **A brace pattern checks its labels like a struct literal.** A repeated label is E0316 DuplicateField and an unknown label is E0525 NoSuchField. Before, an unknown label bound a name with no type, and one use of the name stopped the checker. For a punned unknown label, the fix writes `y: yy`.
+- **A range pattern needs bounds of one kind.** `'a'..5` is a parse error: an integer bound pairs with an integer bound and a `Char` bound with a `Char` bound.
+- **A variant pattern on a type with no variants is an error.** This covers `List`, `Map`, `Set`, `Bytes`, a function value and a type parameter. A pattern on `Never` with a payload is E0308 too. Before, it compiled as a pattern that never matched.
+
+### Mutation
+- **`p.f = v` and `p.f op= v` through a `Ptr` are E0611 NotAPlace.** This holds whether the `Ptr` is the root or a field in the path, and for a `let`, a `let mut` or a parameter root. Write the field with `p.f.write(v)`. Before, `blink check` accepted it and the build stopped with an internal compiler error.
+- **A write to a value that no name holds is E0611 NotAPlace.** An example is `mk().f = v`: before, the store was lost with no error. The help binds the value to a name first.
+
+### Effects and `with`
+- **A `with` item bound by `as` must be a `Handler[E]` or a scoped value, the same rule as an item without `as`.** `as` only names the item. Any other item is E0839 NonHandlerWithItem; before, `with 42 as n` or a `Result` bound by `as` ran with no error and closed nothing. Unwrap a `Result` or `Option` item with `?` or `.unwrap()`.
+- **A `Closeable` type is a scoped value: it implements `BlockHandler` with `Context` the type itself.** So a `T: BlockHandler` bound accepts it, and `with r { }` without `as` runs `close()` too. An `impl BlockHandler` for a type that has an `impl Closeable` is E0526 OverlappingImpls. On a type that also has a method `enter` or `exit` from another trait, an unqualified `r.enter()` is E0522 AmbiguousMethodCall; write `Trait.enter(r)`.
+
+### Strings
+- **A string hole whose expression starts with `{` is E1130 InterpDoubleBrace.** This holds in every string form, with any whitespace before the `{`. Before, `"a {{x}} b"` printed `a 5 b`. For a literal brace, write `\{` or use `#"..."#`; to start a hole with a block, write `"{({ ... })}"`. `blink fmt` keeps those parentheses.
+
+### Carriers
+- **`Ok()` with no argument is `Ok(())`.** Under a `Result` whose payload is not `()`, a generic one included, it is the arity error that `Some()` gets. Before, `blink check` accepted it and the build stopped with an internal compiler error.
+
+## What's New (v0.58.0)
+
+- **A write to a parameter, or to a field of one, draws E0612 ParamAssign.** `c.at = 5` and `self.n += 1` change only the copy that the function owns, so the caller never sees them. This holds with or without `mut`. The help says to copy the parameter to a `let mut` name or to return a new value. E0612 is a warning in this release and becomes an error in a later one.
+- **`blink fix` rewrites a write through a `Ptr` to `.write()`.** A right side that runs code moves to a `let` on the line before. For `op=`, and for a place that is not in a block statement, the help stays text only. `blink fix` drops a fix that overlaps another error or fix, so it never rewrites code that is still wrong.
+- **`blink build --release` leaves out `test` blocks.** The release binary has no test bodies, no test tables and no `--test` hook. `blink check` and `blink build` still check each test body, so a type error in a test fails both.
+- **`blink check --json` has an `assist` key** for a repair that a person must finish or choose. E0319 gives `..` as the `fix` and `f: _` as the `assist`.
+
+## Fixes (v0.58.0)
+
+- **An integer literal takes the type that the position expects.** This holds for a bitwise operand, a list element, a `Some` payload, a block, `if` or `match` tail, a return value, a variant field, and an argument to a function value. A `U64` literal above the `Int` maximum keeps its value: `t + 9223372036854775808` no longer panics with an overflow. `b + 256` on a `U8` is E0318; before, it wrapped.
+- **A `U64` division by a literal zero panics.** Before, the program stopped with a fault.
+- **A narrow integer in an interpolation keeps its width.** `"{x} {y ?? 0}"` with `x: I8` printed `-128` as `4294967168` when a later hole used `??`, `?` or a checked operator.
+- **A test name that differs from another only in punctuation builds.** `test "a + b"` and `test "a - b"` gave one C symbol, and `cc` stopped the build. Each name now has its own symbol.
+- **`blink test --json` is valid JSON for any test name, tag, message or path.** Before, a quote, a backslash or a new line broke the report, and long strings were cut.
+- **`blink fmt` keeps what you wrote.** `'a'` stays `'a'` and `true` stays `true` in a pattern; before, it wrote `97` and `1`, which changes the arm. A range bound that names a constant keeps its name. `-(128)` and `-(-5)` keep their parentheses.
+- **`blink fix` keeps the `let mut` fix** when the `let` has its own error, such as `let x: Int = "a"`.
+- **A pattern of a type that has the same name as a type in another module names both.** The error prints `Shape (alpha)`, and the `T.Q` fix shows only where the name resolves.
+
 ## Breaking Changes (v0.57.0)
 
 ### Indexing
@@ -10,7 +54,6 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 ### Mutation and patterns
 - **`mut` before a pattern that binds no name is E0613 MutOnPattern.** This includes `let mut (x, y) = pair`, `for mut (k, v) in pairs` and `mut _`. Before, `let mut (x, y)` made each name mutable. Run `blink fix` to migrate: it writes `let (mut x, mut y) = pair`.
 - **A write through a name that is not `mut` is E0610 MutationRequiresMut.** This covers `=` and `op=` on a plain `let`, and an assignment or a mutating method call on a pattern binder without `mut`. Before, `blink check` accepted an assignment to a plain `let`. `blink fix` inserts the `mut`.
-- **In a match arm, a bare name with an uppercase first letter names a variant; it never binds.** `Gren =>` on an enum is E0547 NoSuchVariant with a nearest-name help; before, it caught every value. `MAX =>` on an `Int` and `None =>` on a type parameter are E0308 EnumPatternNeedsEnumScrutinee, reported in the generic function; before, the second compiled and panicked at run time. To bind, write a lowercase name; to compare with a value, write a guard `n if n == MAX =>`. `let` and `for` still bind an uppercase name. A variant pattern with a payload on a struct, a tuple or a type parameter moves from E0547 to E0308.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`.** If not, it is E0005 InconsistentPatternBindings. The fix writes `mut` in every alternative.
 
 ### Type checks
@@ -30,13 +73,6 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **A declared type named like a built-in type (`Option`, `List`, `Raw`, `Handler`, `Ptr`) means the declaration in its own module,** with W1010 ShadowedPreludeName. A declared type named `Int`, `Str`, `Bool`, `Self`, `Void` or another scalar is E0524 ReservedTypeName.
 - **An unknown `@derive` name is E1402 NotDerivable.** E1112 UnknownDerive is retired. `@derive` resolves a trait name by scope.
 - **An annotation in the wrong position is an error.** This covers an annotation on an effect operation, an annotation other than `@handle_all` on a sub-effect, and `@handle_all` on a field.
-
-### Effects and `with`
-- **A `with` item bound by `as` must be a `Handler[E]` or a scoped value, the same rule as an item without `as`.** `as` only names the item. Any other item is E0839 NonHandlerWithItem; before, `with 42 as n` or a `Result` bound by `as` ran with no error and closed nothing. Unwrap a `Result` or `Option` item with `?` or `.unwrap()`.
-- **A `Closeable` type is a scoped value: it implements `BlockHandler` with `Context` the type itself.** So a `T: BlockHandler` bound accepts it, and `with r { }` without `as` runs `close()` too. An `impl BlockHandler` for a type that has an `impl Closeable` is E0526 OverlappingImpls. On a type that also has a method `enter` or `exit` from another trait, an unqualified `r.enter()` is E0522 AmbiguousMethodCall; write `Trait.enter(r)`.
-
-### Strings
-- **A string hole whose expression starts with `{` is E1130 InterpDoubleBrace.** This holds in every string form, with any whitespace before the `{`. Before, `"a {{x}} b"` printed `a 5 b`. For a literal brace, write `\{` or use `#"..."#`; to start a hole with a block, write `"{({ ... })}"`. `blink fmt` keeps those parentheses.
 
 ### Standard library
 - **`Str.parse_int()` and `Str.parse_float()` return `Result[_, ConversionError]` and refuse text outside the grammar.** `parse_int` takes an optional `-` and ASCII digits, and refuses overflow. `parse_float` takes `-? DIGITS ('.' DIGITS)? ('e' '-'? DIGITS)?`, `NaN`, `inf` and `-inf`, and does not use the locale. `??` on the result no longer compiles; use `.unwrap_or(d)` or `match`. `Str.to_int()` does not change.
@@ -87,8 +123,6 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **`blink fmt` keeps `()`.** Diagnostics print the unit type as `()`.
 - **A field access on a value with no fields is E0525 NoSuchField,** not an internal compiler error. Calling a type name is `UndefinedFunction` with a repair, not an internal compiler error.
 - **A wrong argument count to a carrier constructor, or a payload variant used as a value, is an error.** Method argument counts are checked.
-- **`p.f = v` and `p.f op= v` through a `Ptr` are E0611 NotAPlace.** This holds whether the `Ptr` is the root or a field in the path, and for a `let`, a `let mut` or a parameter root. Write the field with `p.f.write(v)`. Before, `blink check` accepted it and the build stopped with an internal compiler error.
-- **`Ok()` with no argument is `Ok(())`.** Under a `Result` whose payload is not `()`, a generic one included, it is the arity error that `Some()` gets. Before, `blink check` accepted it and the build stopped with an internal compiler error.
 - **`Option.Some(x)` and `Result.Ok(x)` work.** A user variant named `Some` no longer breaks an `Option` match. A module's own `Ordering` type no longer breaks comparisons.
 - **A second import of one module keeps the selections of the first.** A local function named like a prelude function works.
 - **W0501 no longer fires on a correct program.** W0550 and W0551 check every expression position.

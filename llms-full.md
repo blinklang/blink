@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.57.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.58.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.57`, `0.57.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.58`, `0.58.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -355,6 +355,7 @@ test "addition works" {
 - **A statement that drops the result of `append`, `slice`, `reverse`, `sort`, `sort_by` (List) or `union` (Set) warns `W0606 DiscardedCollectionCopy`:** they return a new value and do not mutate.
 - **A write through a name that is not `mut` is `E0610`.** This covers `=`, `op=` and a mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` or on a pattern binder. Use `let mut x`, or `mut` before the binder: `Some(mut ys) => ys.push(1)`.
 - **A field behind a `Ptr` is not a place.** `p.f = v` and `p.f += v` for `p: Ptr[S]` are `E0611 NotAPlace`, whatever the root is. Write `p.f.write(v)`, or `p.f.write(p.f.read() + v)`, which is a read and then a write, not one atomic step.
+- **A parameter is never assigned.** `c.at = 5` or `self.n += 1` on a parameter is `E0612 ParamAssign`, with or without `mut`: the write changes only this function's copy. Copy it to a `let mut` name, or return a new value. In this release E0612 is a warning; it becomes an error in a later one.
 - **`mut` goes before a name, not before a pattern.** `let mut (x, y) = pair` and `for mut (k, v) in pairs` are `E0613 MutOnPattern`; write `let (mut x, mut y) = pair`. `blink fix` makes this edit.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`** (`E0005 InconsistentPatternBindings`). `Click(mut x, y) | Touch(x, y)` is an error; write `mut x` in both.
 - **`for x in <non-iterable>` is `E0302`.**
@@ -1381,6 +1382,8 @@ build/blink update                  # update deps + blink-version in blink.toml
 
 # Output format: --format json prints what --json prints; human is the default.
 # check, build, fmt, run and test take it. --json beside another --format value is an error.
+# A check --json diagnostic can carry "fix" (an edit blink fix applies) and "assist" (an edit
+# a person must finish or choose, such as E0319's `f: _`). Each has action, text and span.
 build/blink check src/main.bl --format json
 
 # blink test --json: per test file, {"results": [...], "summary": {...}}.
@@ -1391,7 +1394,8 @@ build/blink test --json
 # Default builds (no mode flag) compile the C at -O1
 build/blink build src/main.bl
 
-# Release builds (optimized with -O2)
+# Release builds (optimized with -O2). They leave out `test` blocks; check and build still
+# typecheck each test body.
 build/blink build src/main.bl --release
 build/blink build src/main.bl -R
 
