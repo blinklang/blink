@@ -1,0 +1,168 @@
+// Both bounds of a range pattern are literals of one kind: INT_LIT with INT_LIT, or CHAR_LIT
+// with CHAR_LIT (sections/03_types.md, the pattern grammar). A high bound of the other kind is
+// an UnexpectedToken parse error at that bound. A name as the high bound still parses: whether
+// it may name a const is an open spec question, so this file does not decide it.
+
+import std.process.{ProcessResult}
+
+let DIR = ".tmp/range_pattern_bounds_are_literals_of_one_kind"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn expect_run(name: Str, src: Str, want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("run {name}.bl")
+    if r.exit_code != 0 { return "{name}: want exit 0, got {r.exit_code}:\n{r.err_out}" }
+    if r.out != lines(want) { return "{name}: want output\n{lines(want)}got\n{r.out}" }
+    ""
+}
+
+// Checks a program that must fail: the error count (none when -1) and each wanted text.
+fn expect_errors_counted(name: Str, src: Str, count: Int, want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("check {name}.bl")
+    if r.exit_code == 0 { return "{name}: want a failed check, got exit 0" }
+    let mut problems: List[Str] = []
+    if count >= 0 && !r.err_out.contains("{count} error(s) found") { problems.push("{name}: want {count} error(s):\n{r.err_out}") }
+    for w in want {
+        if !r.err_out.contains(w) { problems.push("{name}: want `{w}` in:\n{r.err_out}") }
+    }
+    problems.join("\n")
+}
+
+fn expect_errors(name: Str, src: Str, want: List[Str]) -> Str {
+    expect_errors_counted(name, src, -1, want)
+}
+
+// Checks a program that passes the check, for texts its report must not hold.
+fn expect_clean_without(name: Str, src: Str, absent: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("check {name}.bl")
+    let mut problems: List[Str] = []
+    if r.exit_code != 0 { problems.push("{name}: want exit 0, got {r.exit_code}:\n{r.err_out}") }
+    for a in absent {
+        if r.err_out.contains(a) { problems.push("{name}: want no `{a}` in:\n{r.err_out}") }
+    }
+    problems.join("\n")
+}
+
+fn report(problems: List[Str]) {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "a range whose bounds are one kind of literal runs" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("same_kind", #"fn c(x: Char) -> Str {
+    match x {
+        'a'..='m' => "low"
+        'n'..'z' => "high"
+        _ => "other"
+    }
+}
+
+fn n(x: Int) -> Str {
+    match x {
+        0..=9 => "digit"
+        10..100 => "tens"
+        _ => "big"
+    }
+}
+
+fn main() {
+    io.println("{c('b')} {c('q')} {c('z')} {n(9)} {n(99)} {n(100)}")
+}
+"#, ["low high other digit tens big"]),
+    ])
+}
+
+test "a high bound of the other literal kind is an UnexpectedToken error" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors("char_then_int", #"fn c(x: Char) -> Int {
+    match x {
+        'a'..=122 => 1
+        _ => 0
+    }
+}
+
+fn main() { io.println("{c('b')}") }
+"#, ["UnexpectedToken", "3:15", "a char range ends in a char literal, got INT"]),
+        expect_errors("int_then_char", #"fn n(x: Int) -> Int {
+    match x {
+        65..='Z' => 1
+        _ => 0
+    }
+}
+
+fn main() { io.println("{n(66)}") }
+"#, ["UnexpectedToken", "3:14", "an integer range ends in an integer literal, got CHAR_LIT"]),
+        expect_errors("exclusive_char_then_int", #"fn c(x: Char) -> Int {
+    match x {
+        'a'..5 => 1
+        _ => 0
+    }
+}
+
+fn main() { io.println("{c('b')}") }
+"#, ["UnexpectedToken", "a char range ends in a char literal, got INT"]),
+    ])
+}
+
+test "a name as the high bound still parses" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_clean_without("name_bound", #"const TOP: Char = 'z'
+
+fn c(x: Char) -> Int {
+    match x {
+        'a'..=TOP => 1
+        _ => 0
+    }
+}
+
+fn main() { io.println("{c('b')}") }
+"#, ["UnexpectedToken"]),
+    ])
+}
+
+test "a missing high bound is one error, with no cascade after it" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_errors_counted("missing_bound", #"fn n(x: Int) -> Int {
+    match x {
+        0.. => 1
+        _ => 0
+    }
+}
+
+fn main() { io.println("{n(1)}") }
+"#, 1, ["UnexpectedToken", "3:13", "a range pattern needs a high bound, got =>"]),
+        expect_errors_counted("wildcard_bound", #"fn n(x: Int) -> Int {
+    match x {
+        0..=_ => 1
+        _ => 0
+    }
+}
+
+fn main() { io.println("{n(1)}") }
+"#, 1, ["UnexpectedToken", "3:13", "a range pattern needs a high bound, got `_`"]),
+    ])
+}
