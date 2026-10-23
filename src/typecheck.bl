@@ -33,7 +33,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_warn_label_at_notes,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_warn_label_at_notes, diag_fix_before_starts_with,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -28827,7 +28827,7 @@ fn tc_report_immutable_binder(name: Str, message: Str, at: Int) -> Bool ! Diag.R
     let help = if preview != "" { "declare it `mut` where the pattern binds it: `{preview}`" } else { "declare it `mut` where the pattern binds it: `mut {name}`" }
     tc_errors.push(message)
     let before = diag_entry_count()
-    diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at, help, notes)
+    diag_error_label_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at, label, help, notes)
     if at_name && diag_entry_count() > before {
         diag_set_last_fix_at("insert `mut`", "mut {name}", line, col, line, col + name.byte_len())
     }
@@ -28873,7 +28873,7 @@ fn tc_report_immutable_or_binder(name: Str, message: Str, at: Int, decl: Int, si
     let help = if preview != "" { "declare it `mut` in every alternative that binds it: `{preview}`" } else { "declare it `mut` in every alternative that binds it: `mut {name}`" }
     tc_errors.push(message)
     let before = diag_entry_count()
-    diag_error_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at, help, notes)
+    diag_error_label_at_notes("MutationRequiresMut", MUTATION_REQUIRES_MUT, message, at, label, help, notes)
     if ok && diag_entry_count() > before {
         diag_set_last_fix_at("insert `mut`", fix, line, fix_col, line, fix_end)
     }
@@ -28981,11 +28981,10 @@ fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
     diag_error_at("MutationRequiresMut", MUTATION_REQUIRES_MUT, "cannot call mutating method `.{method}` on immutable binding `{name}`", node, "declare it as `let mut {name}` at line {node_line(decl)}")
 }
 
-// §2.22 *Writes that are not to a place*, cases 1, 3 and 4: `=` or `op=` whose path steps
-// through a `Ptr`, then one whose root is a parameter, then one whose root is a plain `let`.
-// Runs once the path's types are known. A temporary root, case 2, is another error and takes
-// the write. A pattern binder and the name after `with ... as` go to
-// tc_report_immutable_binder.
+// §2.22 *Writes that are not to a place*, in its order: `=` or `op=` whose path steps through
+// a `Ptr`, then one whose root is a temporary, then one whose root is a parameter, then one
+// whose root is a plain `let`. Runs once the path's types are known. A pattern binder and the
+// name after `with ... as` go to tc_report_immutable_binder.
 fn tc_check_assign_root(node: Int) ! Diag.Report {
     let target = node_target(node)
     let mut root = target
@@ -29001,7 +29000,11 @@ fn tc_check_assign_root(node: Int) ! Diag.Report {
         }
         root = obj
     }
-    if node_kind(root) != NodeKind.Ident { return }
+    if node_kind(root) != NodeKind.Ident {
+        // A root whose type is unknown was reported where it was typed.
+        if root != target && tc_tid_is_no_info(tc_lookup_node_tid(root)) == 0 { tc_report_temporary_root(node, root) }
+        return
+    }
     let name = node_name(root)
     let idx = nr_top_index(name)
     if idx == -1 { return }
@@ -29057,9 +29060,42 @@ fn tc_report_param_assign(name: Str, target: Int) ! Diag.Report {
         ["a write to a parameter changes only this function's copy"])
 }
 
-// `place = rhs` runs `rhs` before it reads the root, but `p.f.write(rhs)` reads `p` before
-// its argument runs, so the help writes `rhs` in place only when it runs no code, and else
-// binds it on the line before. Help only: no fix is applied.
+// §2.22 case 2: no name holds the value the path starts from, so the store is lost. Help only,
+// since the binding the help names needs a line of its own and every later use of the value.
+fn tc_report_temporary_root(node: Int, root: Int) ! Diag.Report {
+    let message = "cannot assign to a temporary value"
+    let root_text = tc_index_text(root)
+    let target_text = tc_index_text(node_target(node))
+    let mut help = "bind the value to a `let mut` name first, then assign through that name"
+    if root_text != "" && target_text.starts_with(root_text) {
+        let name = tc_name_not_in_scope(tc_temporary_name(tc_lookup_node_tid(root)))
+        let rhs = tc_index_text(node_value(node))
+        let shown = if rhs == "" { "..." } else { rhs }
+        let op = if node_kind(node) == NodeKind.CompoundAssign { "{node_op(node)}=" } else { "=" }
+        let rest = target_text.byte_slice(root_text.byte_len(), target_text.byte_len())
+        help = "bind it first: `let mut {name} = {root_text}`, then `{name}{rest} {op} {shown}`"
+    }
+    tc_errors.push(message)
+    diag_error_label_at_notes("NotAPlace", NOT_A_PLACE, message, root, "no name holds this value, so the store is lost", help, [])
+}
+
+// The first letter of the type's name, lower case, as the spec's `let mut c = mk()` for a
+// `Config` names it; `v` for a type whose name does not start with a letter.
+fn tc_temporary_name(tid: Int) -> Str {
+    let t = type_to_str(tc_resolve(tid))
+    if t.byte_len() == 0 { return "v" }
+    let b = t.byte_at(0)
+    if b >= 65 && b <= 90 { return t.byte_slice(0, 1).to_lower() }
+    if b >= 97 && b <= 122 { return t.byte_slice(0, 1) }
+    "v"
+}
+
+fn tc_ptr_write_fix() -> Str { "call `.write()`" }
+
+// `place = rhs` runs `rhs` before it reads the root, but `p.f.write(rhs)` reads `p` before its
+// argument runs, so the fix writes `rhs` in place only when it runs no code. Any other `rhs`
+// moves to a `let` on the line before when the write is a statement in a block; elsewhere the
+// two lines are help only, as is the read-then-write of `op=`.
 fn tc_report_write_through_ptr(node: Int, ptr: Int, ptr_t: Int) ! Diag.Report {
     let message = "cannot assign through a `Ptr`"
     let mut notes = ["a field behind a `Ptr` is not a place; write it with `.write()`"]
@@ -29072,25 +29108,97 @@ fn tc_report_write_through_ptr(node: Int, ptr: Int, ptr_t: Int) ! Diag.Report {
     let val = node_value(node)
     let rhs = tc_index_text(val)
     let mut help = ""
+    let mut fix = ""
     if node_kind(node) == NodeKind.CompoundAssign {
         notes.push("this is a read and then a write, not one atomic step")
         let read_op = if rhs == "" { "{pp}.read() {node_op(node)} ..." } else { unparse_binop_with_lhs("{pp}.read()", node_op(node), val) }
         help = "`{pp}.write({read_op})`"
     } else if rhs != "" && tc_runs_no_code(val) {
         help = "`{pp}.write({rhs})`"
+        let rhs_src = tc_assign_rhs_source(node, path)
+        if rhs_src != "" { fix = "{path}.write({rhs_src})" }
     } else {
         // The target is a field step, since an index target never reaches here; a tuple
         // step such as `p.0` names no binding.
         let field = node_name(target)
         let base = if field == "" || tc_is_decimal_digits(field) { "v" } else { field }
-        let name = tc_name_not_in_scope(base)
-        let shown = if rhs == "" { "..." } else { rhs }
+        let name = tc_ptr_fix_name(base, node)
+        let rhs_src = tc_assign_rhs_source(node, path)
+        let one_line = rhs_src != "" && !rhs_src.contains("\n")
+        let shown = if rhs != "" { rhs } else if one_line { rhs_src } else { "..." }
         let who = if ptr_text == "" { "the `Ptr`" } else { "`{ptr_text}`" }
         notes.push("the right side runs before {who} is read, so the fix keeps it on its own line")
         help = "`let {name} = {shown}`, then `{pp}.write({name})`"
+        if rhs_src != "" && tc_is_block_stmt(tc_current_fn_node, node) {
+            let indent = leading_whitespace(diag_source_line(diag_file_for_node(node), node_line(node)))
+            fix = "let {name} = {rhs_src}\n{indent}{path}.write({name})"
+        }
     }
     tc_errors.push(message)
+    let before = diag_entry_count()
     diag_error_label_at_notes("NotAPlace", NOT_A_PLACE, message, target, label, help, notes)
+    if fix != "" && diag_entry_count() > before {
+        diag_set_last_fix_at(tc_ptr_write_fix(), fix, node_line(node), node_col(node), node_end_line(node), node_end_col(node))
+    }
+}
+
+// The source of `rhs` in `path = rhs`, or "" when the statement's source does not start with
+// `path` and `=`, since a fix built from it would then not replace what was written.
+fn tc_assign_rhs_source(node: Int, path: Str) -> Str {
+    if path == "" || node_end_line(node) < node_line(node) { return "" }
+    let src = tc_source_text(diag_file_for_node(node), node_line(node), node_col(node), node_end_line(node), node_end_col(node))
+    if !src.starts_with(path) { return "" }
+    let rest = src.byte_slice(path.byte_len(), src.byte_len()).trim_left()
+    if !rest.starts_with("=") { return "" }
+    rest.byte_slice(1, rest.byte_len()).trim()
+}
+
+// The source from line:col up to end_line:end_col, or "" when the file does not hold it.
+fn tc_source_text(file: Str, line: Int, col: Int, end_line: Int, end_col: Int) -> Str {
+    let mut out = ""
+    let mut l = line
+    while l <= end_line {
+        let text = diag_source_line(file, l)
+        let from = if l == line { col - 1 } else { 0 }
+        let to = if l == end_line { end_col - 1 } else { text.byte_len() }
+        if from < 0 || from > to || to > text.byte_len() { return "" }
+        let part = text.byte_slice(from, to)
+        out = if l == line { part } else { "{out}\n{part}" }
+        l = l + 1
+    }
+    out
+}
+
+// Whether `node` is a statement of a block inside `within`, so a fix can put a line of its own
+// before it. The body of a match arm with no braces is not one.
+fn tc_is_block_stmt(within: Int, node: Int) -> Bool {
+    if within == -1 { return false }
+    if node_kind(within) == NodeKind.Block {
+        let sl = node_stmts(within)
+        let mut i = 0
+        while sl != -1 && i < sublist_length(sl) {
+            if sublist_get(sl, i) == node { return true }
+            i = i + 1
+        }
+    }
+    for c in node_value_child_ids(within) {
+        if c != -1 && tc_is_block_stmt(c, node) { return true }
+    }
+    false
+}
+
+// A name for the `let` a `.write()` fix adds: not in scope here, and not one that an earlier
+// such fix in this function binds, since both land in one edit pass.
+fn tc_ptr_fix_name(base: Str, node: Int) -> Str {
+    let file = diag_file_for_node(node)
+    let from = if tc_current_fn_node == -1 { 1 } else { node_line(tc_current_fn_node) }
+    let mut name = base
+    let mut i = 0
+    while nr_has_binding(name) != 0 || diag_fix_before_starts_with(tc_ptr_write_fix(), file, from, node_line(node), node_col(node), "let {name} = ") {
+        i = i + 1
+        name = "{base}_{i}"
+    }
+    name
 }
 
 // `base`, or the first of `base_1`, `base_2`, ... that names nothing in scope here, so a

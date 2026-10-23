@@ -1,0 +1,84 @@
+// `blink fix` rewrites a field write through a `Ptr` (sections/02_syntax.md §2.22 *Writes that
+// are not to a place*) into `.write()` calls, and the fixed program builds and runs with the
+// values the writes meant. An inert right side is written in place. A right side that runs
+// code moves to a `let` on the line before, so it still runs before the `Ptr` is read. An
+// `op=` and a temporary root get help only and stay as they are. The commands run in a fresh
+// temporary directory, since the test tree itself sits inside a project.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+let IOVEC = ["@ffi.struct(header: \"sys/uio.h\", name: \"iovec\")", "pub type IoVec \{ iov_base: Ptr[U8], iov_len: U64 }", ""]
+
+fn program(body: List[Str]) -> Str {
+    let mut all = ["import std.io", ""]
+    for l in IOVEC { all.push(l) }
+    for l in ["fn next(n: U64) -> U64 \{ n + 1 }", "", "fn main() \{", "    with ffi.scope() as s \{", "        let p = s.alloc[IoVec]()"] { all.push(l) }
+    for l in body { all.push(l) }
+    for l in ["    }", "}"] { all.push(l) }
+    lines(all)
+}
+
+test "blink fix turns writes through a Ptr into write calls and the program runs" {
+    let dir = sh("mktemp -d /tmp/blink_fix_ptr.XXXXXX").out.trim()
+    let src = program([
+        "        p.iov_len = 4",
+        #"        io.println("{p.iov_len.read()}")"#,
+        "        p.iov_len = next(p.iov_len.read())",
+        #"        io.println("{p.iov_len.read()}")"#,
+        "        p.iov_len = next(",
+        "            p.iov_len.read() + p.iov_len.read())",
+        #"        io.println("{p.iov_len.read()}")"#,
+    ])
+    let want = program([
+        "        p.iov_len.write(4)",
+        #"        io.println("{p.iov_len.read()}")"#,
+        "        let iov_len = next(p.iov_len.read())",
+        "        p.iov_len.write(iov_len)",
+        #"        io.println("{p.iov_len.read()}")"#,
+        "        let iov_len_1 = next(",
+        "            p.iov_len.read() + p.iov_len.read())",
+        "        p.iov_len.write(iov_len_1)",
+        #"        io.println("{p.iov_len.read()}")"#,
+    ])
+    write_file("{dir}/ptr_write.bl", src)
+    let r = blink_in(dir, "fix ptr_write.bl")
+    let got = read_file("{dir}/ptr_write.bl")
+    if got != want { io.println("FAIL: want file:\n{want}\ngot (exit {r.exit_code}):\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert_eq(got, want)
+    assert_eq(r.exit_code, 0)
+    let run = blink_in(dir, "run ptr_write.bl")
+    if run.exit_code != 0 { io.println("FAIL: run: {run.err_out}") }
+    assert_eq(run.exit_code, 0)
+    assert_eq(run.out, "4\n5\n11\n")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "blink fix leaves an op= through a Ptr and a write to a temporary as they are" {
+    let dir = sh("mktemp -d /tmp/blink_fix_ptr_help.XXXXXX").out.trim()
+    let mut all: List[Str] = []
+    for l in IOVEC { all.push(l) }
+    for l in ["type Pt \{ x: Int }", "", "fn mk() -> Pt \{ Pt \{ x: 1 } }", "", "fn main() \{", "    mk().x = 5", "    with ffi.scope() as s \{", "        let p = s.alloc[IoVec]()", "        p.iov_len += 1", "    }", "}"] { all.push(l) }
+    let src = lines(all)
+    write_file("{dir}/ptr_help.bl", src)
+    let r = blink_in(dir, "fix ptr_help.bl")
+    let got = read_file("{dir}/ptr_help.bl")
+    if got != src { io.println("FAIL: the file changed:\n{got}") }
+    assert_eq(got, src)
+    assert_eq(r.exit_code, 1)
+    let left = r.out.contains("0 fix(es) applied, 2 diagnostic(s) left")
+    if !left { io.println("FAIL: stdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(left)
+    let _ = sh("rm -rf {dir}")
+}
