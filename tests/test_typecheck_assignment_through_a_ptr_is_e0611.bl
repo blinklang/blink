@@ -242,3 +242,102 @@ test "build reports E0611 for a write to a temporary, never an internal error" {
     if !no_ice { io.println("FAIL: build ICE: {out}") }
     assert(no_ice)
 }
+
+// The NotAPlace entry for the write through a `Ptr`, and how many errors there are in all.
+fn ptr_entry_fix() -> Str {
+    let mut fix = "none"
+    for d in diag_entries {
+        if d.severity == "error" && d.message == "cannot assign through a `Ptr`" { fix = d.fix_text }
+    }
+    fix
+}
+
+test "a write through a Ptr whose right side is wrong gets no fix, so the error stays in sight" {
+    probe(".tmp/ptr_place_rhs_type_error.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = 1.5\n    }\n}\n")
+    let ok = ptr_entry_fix() == "" && errors().len() == 2
+    if !ok { show("rhs type error") }
+    assert(ok)
+    probe(".tmp/ptr_place_rhs_out_of_range.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = -1\n    }\n}\n")
+    let ok2 = ptr_entry_fix() == "" && errors().len() == 2
+    if !ok2 { show("rhs out of range") }
+    assert(ok2)
+}
+
+test "a fix inside the right side of a write through a Ptr goes first, and the outer one waits" {
+    probe(".tmp/ptr_place_rhs_inner_mut.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = \{\n            let t = 1\n            t = 2\n            t\n        }\n    }\n}\n")
+    let mut inner = false
+    for d in diag_entries {
+        if d.name == "MutationRequiresMut" && d.fix_text == "let mut" { inner = true }
+    }
+    let ok = inner && ptr_entry_fix() == "" && errors().len() == 2
+    if !ok { show("inner E0610") }
+    assert(ok)
+    probe(".tmp/ptr_place_rhs_inner_ptr.bl", "{IOVEC}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        let q = s.alloc[IoVec]()\n        p.iov_len = \{\n            let c = fn() \{ q.iov_len = 7 }\n            c()\n            4\n        }\n    }\n}\n")
+    let mut fixes: List[Str] = []
+    for d in diag_entries {
+        if d.fix_action == WRITE_FIX { fixes.push(d.fix_text) }
+    }
+    let ok2 = fixes.len() == 1 && fixes.contains("q.iov_len.write(7)") && errors().len() == 2
+    if !ok2 { show("inner Ptr write") }
+    assert(ok2)
+}
+
+test "a write through a Ptr in a statement the parser could not read gets no fix" {
+    probe(".tmp/ptr_place_parse_error.bl", "{IOVEC}fn next(n: U64) -> U64 \{ n + 1 }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = match 1 \{ 0 => next(6), _ => next(7) }\n        p.iov_len = 9\n    }\n}\n")
+    let mut ok = true
+    for d in diag_entries {
+        if d.fix_action == WRITE_FIX {
+            for e in diag_entries {
+                let after_start = e.line > d.fix_line || (e.line == d.fix_line && e.col >= d.fix_col)
+                let before_end = e.line < d.fix_end_line || (e.line == d.fix_end_line && e.col < d.fix_end_col)
+                if e.severity == "error" && e.message != d.message && after_start && before_end { ok = false }
+            }
+        }
+    }
+    if !ok { show("parse error") }
+    assert(ok)
+}
+
+test "a write through a Ptr in a test block gets the same fix as in a function" {
+    probe(".tmp/ptr_place_test_block.bl", "{IOVEC}fn next(n: U64) -> U64 \{ n + 1 }\n\ntest \"t\" \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = next(1)\n    }\n}\n\nfn main() \{}\n")
+    expect_e0611("test block", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len = next(1)`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len = next(1)\n        p.iov_len.write(iov_len)")
+}
+
+test "the name a Ptr fix binds is not a module or a builtin namespace the code reads" {
+    let w = "@ffi.struct(header: \"sys/uio.h\", name: \"iovec\")\npub type W \{ io: U64, fs: U64 }\n\nfn next(n: U64) -> U64 \{ n + 1 }\n\n"
+    probe(".tmp/ptr_place_name_module.bl", "import std.io\n\n{w}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[W]()\n        p.io = next(1)\n        io.println(\"x\")\n    }\n}\n")
+    expect_e0611("module name", 11, 9, "`p` is a `Ptr[W]`", "`let io_1 = next(1)`, then `p.io.write(io_1)`", OWN_LINE, "let io_1 = next(1)\n        p.io.write(io_1)")
+    probe(".tmp/ptr_place_name_namespace.bl", "{w}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[W]()\n        p.fs = next(1)\n    }\n}\n")
+    expect_e0611("namespace name", 9, 9, "`p` is a `Ptr[W]`", "`let fs_1 = next(1)`, then `p.fs.write(fs_1)`", OWN_LINE, "let fs_1 = next(1)\n        p.fs.write(fs_1)")
+}
+
+test "the name a Ptr fix binds is not one a later let in the same block binds" {
+    let head = "{IOVEC}fn next(n: U64) -> U64 \{ n + 1 }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = next(4)\n"
+    probe(".tmp/ptr_place_name_later_let.bl", "{head}        let iov_len = 7\n        let _ = iov_len\n    }\n}\n")
+    expect_e0611("later let", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len_1 = next(4)`, then `p.iov_len.write(iov_len_1)`", OWN_LINE, "let iov_len_1 = next(4)\n        p.iov_len.write(iov_len_1)")
+    probe(".tmp/ptr_place_name_later_pattern.bl", "{head}        let (iov_len, z) = (7, 8)\n        let _ = iov_len + z\n    }\n}\n")
+    expect_e0611("later pattern let", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len_1 = next(4)`, then `p.iov_len.write(iov_len_1)`", OWN_LINE, "let iov_len_1 = next(4)\n        p.iov_len.write(iov_len_1)")
+}
+
+test "a write to a whole temporary is E0611, never an internal error" {
+    probe(".tmp/temp_root_whole_call.bl", "{TEMP_TYPES}fn main() \{\n    let c = mk()\n    mk() = c\n}\n")
+    expect_temporary("whole call", 19, 5, "")
+    probe(".tmp/temp_root_whole_literal.bl", "fn main() \{\n    1 = 2\n}\n")
+    expect_temporary("whole literal", 2, 5, "")
+    let out = compile_test_helpers.compile_and_capture("{TEMP_TYPES}fn main() \{\n    let c = mk()\n    mk() = c\n}\n", "temp_root_whole_build")
+    compile_test_helpers.expect_error(out, "E0611", "build gives E0611")
+    let no_ice = !out.contains("\"severity\":\"ice\"")
+    if !no_ice { io.println("FAIL: build ICE: {out}") }
+    assert(no_ice)
+}
+
+test "a temporary root under a step that is already an error gets no second report" {
+    probe(".tmp/temp_root_under_index.bl", "{TEMP_TYPES}fn mkl() -> List[Pt] \{ [mk()] }\n\nfn main() \{\n    mkl()[0].x = 5\n}\n")
+    let ok = errors().len() == 1 && errors().get(0).unwrap().starts_with("NoIndexOperator")
+    if !ok { show("index step") }
+    assert(ok)
+    probe(".tmp/temp_root_missing_field.bl", "{TEMP_TYPES}fn main() \{\n    mk().nosuch = 5\n}\n")
+    let ok2 = errors().len() == 1 && errors().get(0).unwrap().starts_with("NoSuchField")
+    if !ok2 { show("missing field") }
+    assert(ok2)
+}

@@ -33,7 +33,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_warn_label_at_notes, diag_fix_before_starts_with,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_warn_label_at_notes, diag_fix_before_starts_with, diag_drop_fix_over_others,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -28985,24 +28985,28 @@ fn tc_check_mutating_method(node: Int, obj: Int, obj_t: Int) ! Diag.Report {
 // a `Ptr`, then one whose root is a temporary, then one whose root is a parameter, then one
 // whose root is a plain `let`. Runs once the path's types are known. A pattern binder and the
 // name after `with ... as` go to tc_report_immutable_binder.
-fn tc_check_assign_root(node: Int) ! Diag.Report {
+fn tc_check_assign_root(node: Int, block: Int, at: Int) ! Diag.Report {
     let target = node_target(node)
     let mut root = target
+    // A step whose type is unknown, or an index step, was reported where it was typed, and a
+    // temporary report would name a path that has no meaning.
+    let mut steps_typed = tc_tid_is_no_info(tc_lookup_node_tid(target)) == 0
     while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
+        if node_kind(root) == NodeKind.IndexExpr { steps_typed = false }
         let obj = node_obj(root)
         if obj == -1 { return }
         let obj_t = tc_resolve(tc_lookup_node_tid(obj))
         if type_kind(resolve_alias_tid(obj_t)) == TyKind.Ptr {
             // A step the pointee does not have is reported where it is typed, and `.write()`
             // on it would be no fix.
-            if tc_tid_is_no_info(tc_lookup_node_tid(root)) == 0 { tc_report_write_through_ptr(node, obj, obj_t) }
+            if tc_tid_is_no_info(tc_lookup_node_tid(root)) == 0 { tc_report_write_through_ptr(node, obj, obj_t, block, at) }
             return
         }
         root = obj
+        if tc_tid_is_no_info(tc_lookup_node_tid(root)) != 0 { steps_typed = false }
     }
     if node_kind(root) != NodeKind.Ident {
-        // A root whose type is unknown was reported where it was typed.
-        if root != target && tc_tid_is_no_info(tc_lookup_node_tid(root)) == 0 { tc_report_temporary_root(node, root) }
+        if steps_typed { tc_report_temporary_root(node, root) }
         return
     }
     let name = node_name(root)
@@ -29066,8 +29070,10 @@ fn tc_report_temporary_root(node: Int, root: Int) ! Diag.Report {
     let message = "cannot assign to a temporary value"
     let root_text = tc_index_text(root)
     let target_text = tc_index_text(node_target(node))
-    let mut help = "bind the value to a `let mut` name first, then assign through that name"
-    if root_text != "" && target_text.starts_with(root_text) {
+    // A whole target that is a temporary has nothing to assign through once bound, and §2.22
+    // gives no help for it.
+    let mut help = if root == node_target(node) { "" } else { "bind the value to a `let mut` name first, then assign through that name" }
+    if root != node_target(node) && root_text != "" && target_text.starts_with(root_text) {
         let name = tc_name_not_in_scope(tc_temporary_name(tc_lookup_node_tid(root)))
         let rhs = tc_index_text(node_value(node))
         let shown = if rhs == "" { "..." } else { rhs }
@@ -29085,8 +29091,7 @@ fn tc_temporary_name(tid: Int) -> Str {
     let t = type_to_str(tc_resolve(tid))
     if t.byte_len() == 0 { return "v" }
     let b = t.byte_at(0)
-    if b >= 65 && b <= 90 { return t.byte_slice(0, 1).to_lower() }
-    if b >= 97 && b <= 122 { return t.byte_slice(0, 1) }
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) { return t.byte_slice(0, 1).to_lower() }
     "v"
 }
 
@@ -29096,7 +29101,7 @@ fn tc_ptr_write_fix() -> Str { "call `.write()`" }
 // argument runs, so the fix writes `rhs` in place only when it runs no code. Any other `rhs`
 // moves to a `let` on the line before when the write is a statement in a block; elsewhere the
 // two lines are help only, as is the read-then-write of `op=`.
-fn tc_report_write_through_ptr(node: Int, ptr: Int, ptr_t: Int) ! Diag.Report {
+fn tc_report_write_through_ptr(node: Int, ptr: Int, ptr_t: Int, block: Int, at: Int) ! Diag.Report {
     let message = "cannot assign through a `Ptr`"
     let mut notes = ["a field behind a `Ptr` is not a place; write it with `.write()`"]
     let target = node_target(node)
@@ -29122,14 +29127,14 @@ fn tc_report_write_through_ptr(node: Int, ptr: Int, ptr_t: Int) ! Diag.Report {
         // step such as `p.0` names no binding.
         let field = node_name(target)
         let base = if field == "" || tc_is_decimal_digits(field) { "v" } else { field }
-        let name = tc_ptr_fix_name(base, node)
+        let name = tc_ptr_fix_name(base, node, block, at)
         let rhs_src = tc_assign_rhs_source(node, path)
         let one_line = rhs_src != "" && !rhs_src.contains("\n")
         let shown = if rhs != "" { rhs } else if one_line { rhs_src } else { "..." }
         let who = if ptr_text == "" { "the `Ptr`" } else { "`{ptr_text}`" }
         notes.push("the right side runs before {who} is read, so the fix keeps it on its own line")
         help = "`let {name} = {shown}`, then `{pp}.write({name})`"
-        if rhs_src != "" && tc_is_block_stmt(tc_current_fn_node, node) {
+        if rhs_src != "" && block != -1 {
             let indent = leading_whitespace(diag_source_line(diag_file_for_node(node), node_line(node)))
             fix = "let {name} = {rhs_src}\n{indent}{path}.write({name})"
         }
@@ -29169,44 +29174,53 @@ fn tc_source_text(file: Str, line: Int, col: Int, end_line: Int, end_col: Int) -
     out
 }
 
-// Whether `node` is a statement of a block inside `within`, so a fix can put a line of its own
-// before it. The body of a match arm with no braces is not one.
-fn tc_is_block_stmt(within: Int, node: Int) -> Bool {
-    if within == -1 { return false }
-    if node_kind(within) == NodeKind.Block {
-        let sl = node_stmts(within)
-        let mut i = 0
-        while sl != -1 && i < sublist_length(sl) {
-            if sublist_get(sl, i) == node { return true }
-            i = i + 1
-        }
-    }
-    for c in node_value_child_ids(within) {
-        if c != -1 && tc_is_block_stmt(c, node) { return true }
-    }
-    false
-}
-
-// A name for the `let` a `.write()` fix adds: not in scope here, and not one that an earlier
-// such fix in this function binds, since both land in one edit pass.
-fn tc_ptr_fix_name(base: Str, node: Int) -> Str {
+// A name for the `let` a `.write()` fix adds to statement `at` of `block`: one that names
+// nothing here, that no later `let` of the block binds, and that no earlier such fix in the
+// block binds. A second `let` of one name in one block does not compile, and every fix lands
+// in one edit pass.
+fn tc_ptr_fix_name(base: Str, node: Int, block: Int, at: Int) -> Str {
     let file = diag_file_for_node(node)
-    let from = if tc_current_fn_node == -1 { 1 } else { node_line(tc_current_fn_node) }
+    let from = if block == -1 { node_line(node) } else { node_line(block) }
     let mut name = base
     let mut i = 0
-    while nr_has_binding(name) != 0 || diag_fix_before_starts_with(tc_ptr_write_fix(), file, from, node_line(node), node_col(node), "let {name} = ") {
+    while tc_fix_name_taken(name) || tc_later_let_binds(block, at, name) || diag_fix_before_starts_with(tc_ptr_write_fix(), file, from, node_line(node), node_col(node), "let {name} = ") {
         i = i + 1
         name = "{base}_{i}"
     }
     name
 }
 
-// `base`, or the first of `base_1`, `base_2`, ... that names nothing in scope here, so a
-// binding the help adds shadows nothing the line reads.
+// Whether a statement of `block` after index `at` is a `let` that binds `name`.
+fn tc_later_let_binds(block: Int, at: Int, name: Str) -> Bool {
+    if block == -1 { return false }
+    let sl = node_stmts(block)
+    let mut i = at + 1
+    while sl != -1 && i < sublist_length(sl) {
+        let stmt = sublist_get(sl, i)
+        if node_kind(stmt) == NodeKind.LetBinding {
+            let pat = node_elements(stmt)
+            if pat == -1 && node_name(stmt) == name { return true }
+            let mut binders: List[Int] = []
+            tc_binders_named(pat, name, binders)
+            if binders.len() > 0 || tc_has_mut_binder(pat, name) { return true }
+        }
+        i = i + 1
+    }
+    false
+}
+
+// A binding of `name` here would hide a binding, or a module, type or function the code
+// may read by that name.
+fn tc_fix_name_taken(name: Str) -> Bool {
+    nr_has_binding(name) != 0 || tc_name_is_item_here(name) != 0
+}
+
+// `base`, or the first of `base_1`, `base_2`, ... that names nothing here, so a binding the
+// help adds hides nothing the line reads.
 fn tc_name_not_in_scope(base: Str) -> Str {
-    if nr_has_binding(base) == 0 { return base }
+    if !tc_fix_name_taken(base) { return base }
     let mut i = 1
-    while nr_has_binding("{base}_{i}") != 0 { i = i + 1 }
+    while tc_fix_name_taken("{base}_{i}") { i = i + 1 }
     "{base}_{i}"
 }
 
@@ -29704,6 +29718,81 @@ fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Res
     if returns_value { tc_infer_value(val) } else { infer_type(val) }
 }
 
+// `block` is the block that holds the statement and `at` its index there, or -1 when the
+// assignment is no statement of a block, such as the body of a match arm with no braces.
+fn tc_check_assignment(node: Int, block: Int, at: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let kind = node_kind(node)
+    let target = node_target(node)
+    let val = node_value(node)
+    if target != -1 && val != -1 && node_kind(target) == NodeKind.IndexExpr {
+        // The target is no place, so neither the root's `mut` nor the value's type is
+        // checked against it; the one report is the store's.
+        let obj_t = infer_type(node_obj(target))
+        let val_t = infer_type(val)
+        let _ = tc_index_pin_open(val_t, tc_index_get_elem(tc_resolve(obj_t)))
+        let type_args = (tc_bracket_sites.get(target) ?? 0) == BRACKET_TYPE_ARGS
+        if !type_args { tc_bracket_sites.insert(target, INDEX_REPORTED) }
+        let _ = infer_type(target)
+        if !type_args && tc_tid_is_no_info(tc_resolve(obj_t)) == 0 {
+            tc_report_index_store(node, obj_t)
+        }
+        return
+    }
+    if target != -1 && val != -1 {
+        let target_t = infer_type(target)
+        let first = diag_entry_count()
+        tc_check_assign_root(node, block, at)
+        let root_reported = diag_entry_count() > first
+        let val_t = tc_infer_assigned_value(target_t, val)
+        if kind == NodeKind.CompoundAssign {
+            reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
+            reject_non_numeric_arith_operand(node_op(node), val_t, node, 0)
+        }
+        if tc_tid_is_no_info(target_t) == 0 && tc_tid_is_no_info(val_t) == 0 {
+            if assignment_types_compatible(target_t, val_t, val) == 0 {
+                if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t) }
+            } else {
+                // An assignment TARGET is a declared-type source for the value's
+                // metavars, not only something to compare against — the same
+                // reasoning as the LetBinding arm of tc_check_body, and the same in-place
+                // unify, so one bind solves the mono name and the field ctor's
+                // kops vtable together. Without it `e = mk()` left the α that
+                // instantiate_return_type minted for mk's return-only T unbound
+                // and it reached emit_struct_lit erased.
+                //
+                // target_t already carries the right expected type for both
+                // spellings: an Ident target resolves through scope, a FieldAccess
+                // target through the field arm, which substitutes the enclosing
+                // instance's concrete args.
+                //
+                // No closure-depth guard, unlike tc_check_returned_value: that
+                // guard exists because tc_current_fn_ret names the closure's own
+                // declared return, not stale ambient state. target_t was never
+                // ambient to begin with: it's read from the
+                // target expression itself, so a closure assigning to a
+                // captured binding pins that binding's own declared type
+                // regardless.
+                //
+                // Assignment only, never CompoundAssign: no compound operator is
+                // defined over any kind tc_pin_admits_declared admits (Map, Set,
+                // generic struct/enum), so the branch would be dead. Excluded on
+                // purpose rather than by accident.
+                //
+                // The same walker as the LetBinding arm, so a block or a branch
+                // around the value does not change what the target fills
+                // (`x = Err("boom")` pins the mut carrier's other slot).
+                if kind == NodeKind.Assignment {
+                    tc_pin_declared_into_value(target_t, val, val_t)
+                } else {
+                    tc_literal_takes(val, target_t)
+                }
+            }
+        }
+        // Every report on the statement is in by now, the value's own and a parse error's.
+        if root_reported { diag_drop_fix_over_others(first) }
+    }
+}
+
 fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Read-then-zero before anything can recurse, so a nested walk never inherits it.
     let in_value = tc_walk_value_tail
@@ -29750,9 +29839,19 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // what the walk already decided.
                 let stmt_hint = if stmt == hint_tail { resolve_alias_tid(tc_current_fn_ret) } else { tc_construct_hint }
                 if stmt == value_tail { tc_walk_value_tail = 1 }
-                tc_check_body_with_hint(stmt, stmt_hint)
-                if stmt != last_stmt || drops_tail { tc_check_dropped_value(stmt) }
                 let sk = node_kind(stmt)
+                if sk == NodeKind.Assignment || sk == NodeKind.CompoundAssign {
+                    // Only a statement of a block can take a line of its own before it, which
+                    // the `.write()` fix for a `Ptr` step needs, so the block names itself.
+                    tc_walk_value_tail = 0
+                    let saved_hint = tc_construct_hint
+                    tc_construct_hint = stmt_hint
+                    tc_check_assignment(stmt, node, i)
+                    tc_construct_hint = saved_hint
+                } else {
+                    tc_check_body_with_hint(stmt, stmt_hint)
+                }
+                if stmt != last_stmt || drops_tail { tc_check_dropped_value(stmt) }
                 if sk == NodeKind.Return || sk == NodeKind.Break || sk == NodeKind.Continue {
                     _found_terminal = 1
                 }
@@ -29878,71 +29977,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
-        let target = node_target(node)
-        let val = node_value(node)
-        if target != -1 && val != -1 && node_kind(target) == NodeKind.IndexExpr {
-            // The target is no place, so neither the root's `mut` nor the value's type is
-            // checked against it; the one report is the store's.
-            let obj_t = infer_type(node_obj(target))
-            let val_t = infer_type(val)
-            let _ = tc_index_pin_open(val_t, tc_index_get_elem(tc_resolve(obj_t)))
-            let type_args = (tc_bracket_sites.get(target) ?? 0) == BRACKET_TYPE_ARGS
-            if !type_args { tc_bracket_sites.insert(target, INDEX_REPORTED) }
-            let _ = infer_type(target)
-            if !type_args && tc_tid_is_no_info(tc_resolve(obj_t)) == 0 {
-                tc_report_index_store(node, obj_t)
-            }
-            return
-        }
-        if target != -1 && val != -1 {
-            let target_t = infer_type(target)
-            tc_check_assign_root(node)
-            let val_t = tc_infer_assigned_value(target_t, val)
-            if kind == NodeKind.CompoundAssign {
-                reject_non_numeric_arith_operand(node_op(node), target_t, node, 0)
-                reject_non_numeric_arith_operand(node_op(node), val_t, node, 0)
-            }
-            if tc_tid_is_no_info(target_t) == 0 && tc_tid_is_no_info(val_t) == 0 {
-                if assignment_types_compatible(target_t, val_t, val) == 0 {
-                    if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t) }
-                } else {
-                    // An assignment TARGET is a declared-type source for the value's
-                    // metavars, not only something to compare against — the same
-                    // reasoning as the LetBinding arm above, and the same in-place
-                    // unify, so one bind solves the mono name and the field ctor's
-                    // kops vtable together. Without it `e = mk()` left the α that
-                    // instantiate_return_type minted for mk's return-only T unbound
-                    // and it reached emit_struct_lit erased.
-                    //
-                    // target_t already carries the right expected type for both
-                    // spellings: an Ident target resolves through scope, a FieldAccess
-                    // target through the field arm, which substitutes the enclosing
-                    // instance's concrete args.
-                    //
-                    // No closure-depth guard, unlike tc_check_returned_value: that
-                    // guard exists because tc_current_fn_ret names the closure's own
-                    // declared return, not stale ambient state. target_t was never
-                    // ambient to begin with: it's read from the
-                    // target expression itself, so a closure assigning to a
-                    // captured binding pins that binding's own declared type
-                    // regardless.
-                    //
-                    // Assignment only, never CompoundAssign: no compound operator is
-                    // defined over any kind tc_pin_admits_declared admits (Map, Set,
-                    // generic struct/enum), so the branch would be dead. Excluded on
-                    // purpose rather than by accident.
-                    //
-                    // The same walker as the LetBinding arm, so a block or a branch
-                    // around the value does not change what the target fills
-                    // (`x = Err("boom")` pins the mut carrier's other slot).
-                    if kind == NodeKind.Assignment {
-                        tc_pin_declared_into_value(target_t, val, val_t)
-                    } else {
-                        tc_literal_takes(val, target_t)
-                    }
-                }
-            }
-        }
+        tc_check_assignment(node, -1, -1)
         return
     }
 
