@@ -89,11 +89,13 @@ run_args=""
 if grep -qE '^test "|^test\.failing\(' "$f" && grep -q 'fn main(' "$f"; then
   run_args="--test"
 fi
+# Both runs share one scratch path, emptied between them: a test that prints a
+# path under it must print the same text from the original and the formatted copy.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-test-XXXXXX")
 outcome() {
-  scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-test-XXXXXX")
+  rm -rf "$scratch" && mkdir -m 700 "$scratch"
   out=$(BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1" $run_args 2>/dev/null)
   rc=$?
-  rm -rf "$scratch"
   out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
   if printf '%s\n' "$out" | grep -qE '^test .* \.\.\. '; then
     out=$(printf '%s\n' "$out" | grep -E '^test .* \.\.\. (ok|FAIL|PANIC|SKIP|skipped|xfail|XPASS)|^[0-9]+ passed, ')
@@ -102,6 +104,7 @@ outcome() {
 }
 orig_outcome=$(outcome "$orig_bin")
 fmt_outcome=$(outcome "$fmt_bin")
+rm -rf "$scratch"
 cleanup
 if [ "$orig_outcome" = "$fmt_outcome" ]; then
   echo "PASS sem_${name}"
