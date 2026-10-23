@@ -87,6 +87,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **`blink fmt` keeps `()`.** Diagnostics print the unit type as `()`.
 - **A field access on a value with no fields is E0525 NoSuchField,** not an internal compiler error. Calling a type name is `UndefinedFunction` with a repair, not an internal compiler error.
 - **A wrong argument count to a carrier constructor, or a payload variant used as a value, is an error.** Method argument counts are checked.
+- **`Ok()` with no argument is `Ok(())`.** Under a `Result` whose payload is not `()`, a generic one included, it is the arity error that `Some()` gets. Before, `blink check` accepted it and the build stopped with an internal compiler error.
 - **`Option.Some(x)` and `Result.Ok(x)` work.** A user variant named `Some` no longer breaks an `Option` match. A module's own `Ordering` type no longer breaks comparisons.
 - **A second import of one module keeps the selections of the first.** A local function named like a prelude function works.
 - **W0501 no longer fires on a correct program.** W0550 and W0551 check every expression position.
