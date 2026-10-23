@@ -619,7 +619,7 @@ Not spec text.
 
 ### Open cases and follow-ups
 
-- A warning for a `Str` that grows in a loop (Q3). It needs its own design (0zrf2e).
+- A warning for a `Str` that grows in a loop (Q3). It needs its own design.
 - A full `Add` law table, and any associativity statement (web, D3).
-- The `Sum` impl at sections/03_types.md:~4545 writes `Add[T, Output = T]`, which does not match `trait Add` (b2bs3n).
-- The `CannotInferType` "empty construction" note on `fn(a, b) { a + b }` (DevOps's probe) is misleading (mnakqv).
+- The `Sum` impl at sections/03_types.md:~4545 writes `Add[T, Output = T]`, which does not match `trait Add`.
+- The `CannotInferType` "empty construction" note on `fn(a, b) { a + b }` (DevOps's probe) is misleading.

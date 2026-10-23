@@ -2,7 +2,7 @@
 
 # Handler Delegation Row — Design Rationale
 
-Spec ticket (bemfjs): a handler clause that forwards (`default.op(..)`, a call through the handled effect, or an omitted primitive operation) performs the handled effect E outside the handler, but the checker gives the clause body E for free. A function with an empty row can then print through the outer handler. Friction ticket 4kx7pr asks which handler a forward reaches.
+Spec ticket: a handler clause that forwards (`default.op(..)`, a call through the handled effect, or an omitted primitive operation) performs the handled effect E outside the handler, but the checker gives the clause body E for free. A function with an empty row can then print through the outer handler. A friction ticket asks which handler a forward reaches.
 
 ### Panel Deliberation
 
@@ -26,7 +26,7 @@ All six seats agreed on the base rule: the "+E" grant on clause bodies goes. `de
 
 ##### Systems
 
-> "So the delegation target for E is **bound at construction**, by one struct copy, with no search at call time. This is what 4kx7pr reports."
+> "So the delegation target for E is **bound at construction**, by one struct copy, with no search at call time. This is what [the forward-target ticket] reports."
 >
 > "The `Handler[E]` type carries no row (L180/L182, §4.7.1). Any rule that charges clause effects at the `with` site has nothing to read when the handler is a parameter, a field, or a returned value. So charging at the `with` site needs a type change. Charging at the literal does not."
 >
@@ -48,7 +48,7 @@ All six seats agreed on the base rule: the "+E" grant on clause bodies goes. `de
 
 ##### DevOps/Tooling
 
-> "One coupling the panel must settle first: **the charge site must be the site that fixes the delegation target (4kx7pr).** If `default.op` reaches the handler in force where the literal was evaluated (what gen1 does today), the literal's fn is the one that uses the outer capability, and we must charge the literal."
+> "One coupling the panel must settle first: **the charge site must be the site that fixes the delegation target ([the forward-target ticket]).** If `default.op` reaches the handler in force where the literal was evaluated (what gen1 does today), the literal's fn is the one that uses the outer capability, and we must charge the literal."
 >
 > "## devops-1 (my pick): charge at the literal; the delegation target is fixed at the literal" — devops
 
@@ -74,7 +74,7 @@ plt's escape probe (plt/escape.bl) decided the debate. A factory `make() ! Audit
 
 ##### devops withdraws devops-1
 
-> "gen1's copy of the vtable at the literal (cg_print.bl:854) is a codegen detail that disagrees with voted text. 4kx7pr is a friction ticket about that disagreement, not an open design point. If we pick construction, we reverse two votes and change a shipped diagnostic. Sys-1, web-1, min-1 and my own devops-1 did that without saying so. I missed it in Phase A." — devops
+> "gen1's copy of the vtable at the literal (cg_print.bl:854) is a codegen detail that disagrees with voted text. The forward-target ticket is a friction ticket about that disagreement, not an open design point. If we pick construction, we reverse two votes and change a shipped diagnostic. Sys-1, web-1, min-1 and my own devops-1 did that without saying so. I missed it in Phase A." — devops
 
 ##### min withdraws min-1
 
@@ -115,8 +115,8 @@ web-1, devops-1 and min-1 (by their authors) and sys-1b (by sys). The ballot off
 
 - **sys:** W. "A `Handler[E]` value is code that runs later at another site, so its row must travel in its type, as a fn type's row does. A forward then reaches only a handler that is in force while the op runs. That closes the use-after-`exit` path that construction binding opens, and it needs no capture." Concern: "Codegen can let R leak into C types or mono keys, which gives one C instance per row and code bloat. The impl ticket must state that R is checked and then erased."
 - **web:** W. "A handler is a bundle of closures, so it should follow the closure rule users already know: the row is in the type, you pay where it runs, and it uses the handlers in force there." Concern: "A factory author who returns `Handler[E]` from a clause that logs or forwards hits a type mismatch on day one. If the fix-it does not write the inferred `! R` into the return type, this becomes the most-asked handler question."
-- **plt:** W. "W is the only pair under which every `with` site holds a proof about the handler that actually answers… §4.1 L11 and Principle 5 stay true as written, with no exception for handler values." Concern: "If 4kx7pr's codegen change (forward resolved at install, not copied at the literal) lands after the row rule, the checker will prove the `with`-site handler while the binary calls the literal-site one. The impl ticket must ship both in one change."
-- **devops:** W. "Only W points the error at a place the user can fix and gives a machine-applicable fix: the `with` item, a `note:` at the `default.op` span or the handler head, and a fix-it that writes the inferred row into a `Handler[...]` return type." Concern: "The impl can ship the `with`-site check before 0z1jhb maps the builtin handle ops. Then R silently omits every builtin effect (`io.log` in a clause adds nothing) and users get a check that looks complete but is not."
+- **plt:** W. "W is the only pair under which every `with` site holds a proof about the handler that actually answers… §4.1 L11 and Principle 5 stay true as written, with no exception for handler values." Concern: "If [the forward-target ticket]'s codegen change (forward resolved at install, not copied at the literal) lands after the row rule, the checker will prove the `with`-site handler while the binary calls the literal-site one. The impl ticket must ship both in one change."
+- **devops:** W. "Only W points the error at a place the user can fix and gives a machine-applicable fix: the `with` item, a `note:` at the `default.op` span or the handler head, and a fix-it that writes the inferred row into a `Handler[...]` return type." Concern: "The impl can ship the `with`-site check before [the handle-op capability ticket] maps the builtin handle ops. Then R silently omits every builtin effect (`io.log` in a clause adds nothing) and users get a check that looks complete but is not."
 - **aiml:** W. "One rule covers both kinds of value that run code later. A closure or a handler carries its row in its type, and the row is charged where the code runs (a call or a `with`), with the handlers in force there." Concern: "Inference makes the row invisible in the common case. A model that has seen only `Handler[E]` may then write that type for a returned forwarding handler… so the fix-it must write the inferred `! R` into the type mechanically."
 - **min:** W. "W reuses the rule closures already follow: the value's type carries its row, and the site that runs the code pays." Concern: "People may read the L180 amendment as permission to put more parameters on `Handler`. The decision file should state that the row slot is the only addition, and it is the same row that fn types carry."
 
@@ -152,9 +152,9 @@ All six voted: for `with a, b`, b forwards to a; R_b is checked against the encl
 ##### V4 — codegen conditions in this file and the implementation ticket only, 6-0
 
 - **sys:** "These conditions decide whether W is zero-cost… They are lowering facts, so they belong in the decision file and the impl ticket, not in sections/. The spec states only the semantics ("the handler in force for E at the `with`"), which leaves the optimisation legal." Concern: "The impl ticket can treat condition 2 as optional and keep the per-literal `blink_alloc` copy beside the new per-`with` fill. That doubles the work and keeps the stale construction-time pointer alive for a later bug to reach."
-- **web:** "One C type for every R and no mono split keep compile times and binary size flat." Concern: "If the decision file is not linked from the impl ticket, the per-`with` copy can drift back to a per-literal copy, and 4kx7pr's behaviour comes back."
+- **web:** "One C type for every R and no mono split keep compile times and binary size flat." Concern: "If the decision file is not linked from the impl ticket, the per-`with` copy can drift back to a per-literal copy, and [the forward-target ticket]'s behaviour comes back."
 - **plt:** "R is a compile-time row and has no run-time meaning, so erasing it… is the correct semantics as well as the cheap one." Concern: "The "skip when E is not in R" fast path depends on R being exact for omitted primitive ops. If inference ever misses an omitted op, the binary calls an unfilled slot. The impl ticket needs a test that pins this case."
-- **devops:** "R erased, with one C type for every R, also keeps `Handler[E ! R]` out of C symbol names, so linker and debugger output stays readable." Concern: "The "skip the fill when E is not in R" step must be tied to the typechecked R; if it reads a stale or approximate R (e.g. before 0z1jhb), a forward reaches an unfilled slot and panics at run time."
+- **devops:** "R erased, with one C type for every R, also keeps `Handler[E ! R]` out of C symbol names, so linker and debugger output stays readable." Concern: "The "skip the fill when E is not in R" step must be tied to the typechecked R; if it reads a stale or approximate R (e.g. before [the handle-op capability ticket]), a forward reaches an unfilled slot and panics at run time."
 - **aiml:** "The spec states only what can be seen in the program: a forward goes to the handler in force for E at the `with`." Concern: "If R is erased in codegen, a missing row check cannot be caught at run time. The typecheck tests must include the cross-fn escape probe and sys's `leak` case as error rows."
 - **min:** "An erased R… keeps the row a type-checker fact with zero run-time cost, which is the cheapest result this ruling can have." Concern: ""Fill may be skipped when E is not in R" is an optimization. The impl ticket must say it is optional, so nobody treats it as a rule."
 
@@ -246,8 +246,8 @@ Locked points:
 ### Amendments
 
 - Amends DECISIONS "Handler type identity" (L180): `Handler` is still one type constructor with one effect argument. The row is the only addition. It is the same row that fn types carry. It is not an effect-kinded generic parameter, so L182 (no effect-kinded generics) holds. Nobody may read this amendment as permission to add other parameters to `Handler`.
-- Settles the forward-target question (4kx7pr) as install. This agrees with the text of DECISIONS L423 and L424 ("installed over") and with the E0544 help text.
-- Corrects the sentence in §4.7 that said the leftmost handler wins. The text now agrees with the `with a { with b }` rule (chore 67e41t, done in this branch).
+- Settles the forward-target question as install. This agrees with the text of DECISIONS L423 and L424 ("installed over") and with the E0544 help text.
+- Corrects the sentence in §4.7 that said the leftmost handler wins. The text now agrees with the `with a { with b }` rule (a chore, done in this branch).
 - Corrects §4.6: the check now sees a partial handler that forwards, because the `with` adds R to the row.
 
 ### Implementation notes
@@ -272,9 +272,9 @@ Condition 3 is optional (min, C_min). Further conditions from the panel concerns
 
 ### Open cases and follow-ups
 
-- 0z1jhb: the built-in handle operations must be mapped first. Without the map, `io.log` in a clause adds nothing to R, and the check is only half enforced. The row check depends on it.
+- Handle-op capability check: the built-in handle operations must be mapped first. Without the map, `io.log` in a clause adds nothing to R, and the check is only half enforced. The row check depends on it.
 - `capture_*` helpers in `lib/std/testing.bl` write module-level state (`let mut`). Under this rule their R holds `State`, so they must move to captured cells before the check turns on.
-- 67e41t: the with-order text fix (L1891 "leftmost wins"). Done in this branch. Older decision files (`mocking-helpers-beyond-io.md`, `arena-expression-form-semantics.md`) keep the old wording as history.
-- 287aax: the return-type `!` ambiguity for function types (04_effects.md L607 and L787) stays open. `Handler[E ! R]` avoids it.
-- n34v3w: with install-time forwarding and R in the type, an omitted `print_raw_bytes` puts `IO.Print` in R. This closes the hole in the `_raw` dispatch ruling (devops).
+- With-order text fix (L1891 "leftmost wins"): done in this branch. Older decision files (`mocking-helpers-beyond-io.md`, `arena-expression-form-semantics.md`) keep the old wording as history.
+- Return-type `!` ambiguity for function types (04_effects.md L607 and L787): stays open. `Handler[E ! R]` avoids it.
+- Raw output ops: with install-time forwarding and R in the type, an omitted `print_raw_bytes` puts `IO.Print` in R. This closes the hole in the `_raw` dispatch ruling (devops).
 - Helper factories that the spec names but does not define (`scoped_fs`, `readonly_fs`, `frozen_time`, `sqlite_handler`) have no row in the spec text. Their bodies are not shown, so each takes the row of its clauses when someone writes it.

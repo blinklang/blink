@@ -23,7 +23,7 @@ The ticket, verbatim:
 
 > **Spec: struct-pattern field faults: code for unknown field (widen E0525?) and for omitted fields without ..**
 >
-> Section 3.5 requires .. when a struct pattern omits fields, but no catalog code covers it, and E0525 NoSuchField names literals and field access only. On v0.57.0 gen1, 'match p { Point { x, bogus } => x }' passes check with only UnusedVariable, and 'match p { Point { x } => x }' passes too. Decide: (1) is an unknown field label in a pattern E0525 (widen the row) and what the help says; (2) the code and fix for a missing .. (reuse the literal MissingField code or a new one; machine-applicable fix adds ..); (3) binder poison and E0004 after the error, as E0547 does. Implementation ticket: 5kwvq2.
+> Section 3.5 requires .. when a struct pattern omits fields, but no catalog code covers it, and E0525 NoSuchField names literals and field access only. On v0.57.0 gen1, 'match p { Point { x, bogus } => x }' passes check with only UnusedVariable, and 'match p { Point { x } => x }' passes too. Decide: (1) is an unknown field label in a pattern E0525 (widen the row) and what the help says; (2) the code and fix for a missing .. (reuse the literal MissingField code or a new one; machine-applicable fix adds ..); (3) binder poison and E0004 after the error, as E0547 does. Implementation ticket: [the struct-pattern field ticket].
 
 Six panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML, minimalism) deliberated in independent-proposal → debate → vote rounds, with one extra round (Phase D) on the two questions that Phase C left open.
 
@@ -168,5 +168,5 @@ Locked points:
 
 ### Related
 
-- Implementation bug 5kwvq2 (unknown field ICE; omitted fields pass check) is blocked on this decision.
-- `let` with a struct pattern does not parse (91vzsn); the `let` position of these rules takes effect when it does.
+- Implementation bug (unknown field ICE; omitted fields pass check) is blocked on this decision.
+- `let` with a struct pattern does not parse; the `let` position of these rules takes effect when it does.

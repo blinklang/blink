@@ -360,7 +360,7 @@ Not spec text.
 
 ### Open cases and follow-ups
 
-- Lowercase variant names (x3wag3): gen1 accepts a lowercase variant, and the spec has no casing rule. A separate `type:spec` ticket asks whether a variant name must start with an uppercase letter. If it says yes, T-lex is the whole rule.
-- No named unreachable-arm diagnostic (7m3gtf): arms after a catch-all are dead and nothing reports them. A real catch-all `other =>` placed first still gets no report.
-- `plt/p2.bl` `pick` soundness bug (t9f9jm): the match on a type-parameter scrutinee that gen1 accepts as exhaustive.
-- W1011 implementation (g4et8v): its scope shrinks. The pattern-binder branch applies only to irrefutable patterns and to names that do not start with an uppercase letter. Trim the ticket before building.
+- Lowercase variant names: gen1 accepts a lowercase variant, and the spec has no casing rule. A separate `type:spec` ticket asks whether a variant name must start with an uppercase letter. If it says yes, T-lex is the whole rule.
+- No named unreachable-arm diagnostic: arms after a catch-all are dead and nothing reports them. A real catch-all `other =>` placed first still gets no report.
+- `plt/p2.bl` `pick` soundness bug: the match on a type-parameter scrutinee that gen1 accepts as exhaustive.
+- W1011 implementation: its scope shrinks. The pattern-binder branch applies only to irrefutable patterns and to names that do not start with an uppercase letter. Trim the ticket before building.

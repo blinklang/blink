@@ -121,10 +121,10 @@ decisions/duplicate-apis.md L63: "The contract (exact bytes, flushed) must survi
   **Concern:** Bytes need a new `(ptr, len)` vtable slot in the runtime, and that slot needs the add-alongside / migrate regen dance. If the slot is skipped, `print_raw_bytes` would have to stay a direct C call.
 - **Web/Scripting**: A
   **Reasoning:** A dev who wraps code in `capture_print` expects every stdout write to land in the list; Python `capsys` and Node stdout mocks work that way, and the raw write is the one they capture most surely. A keeps the byte contract the `_raw` use cases need (exact bytes, flushed) and removes the one property nobody asked for. B and C keep a mode a dev must learn and a test that pins a surprise.
-  **Concern:** Until bemfjs lands, a user mock that omits a primitive op still leaks through delegation, so a dev may read "fixed" in the ruling and still see output on the terminal.
+  **Concern:** Until [the delegation-row ticket] lands, a user mock that omits a primitive op still leaks through delegation, so a dev may read "fixed" in the ruling and still see output on the terminal.
 - **PLT**: A
   **Reasoning:** Today `IO.Print` has operations that no handler can intercept, so a `with` removes the effect from the row while the write still reaches stdout. That makes a proven row false. Under A, every operation of `IO.Print` goes to the innermost handler. Discharge then needs no exception, and the byte contract moves to the default handler unchanged. B is also sound, but it adds a special case to discharge and to the hierarchy that A does not need.
-  **Concern:** A is sound only after bemfjs: until the `with` site's row includes the effects of the handler's clauses, a forwarding handler still writes `_raw` output past the sandbox.
+  **Concern:** A is sound only after [the delegation-row ticket]: until the `with` site's row includes the effects of the handler's clauses, a forwarding handler still writes `_raw` output past the sandbox.
 - **DevOps/Tooling**: A
   **Reasoning:** A is the only option that adds no diagnostic and no new kind of row need for the LSP, `blink query` and hover to model. It also removes the one item that no tool reports today. The test gap and trace gap close at the same time.
   **Concern:** The two tests that assert the bypass (tests/test_std_testing.bl:52, :100) must be inverted and renamed, not deleted. A careless slice might delete them.
@@ -186,23 +186,23 @@ decisions/duplicate-apis.md L63: "The contract (exact bytes, flushed) must survi
 **Q4: b 4-2** (devops, min: a). Settled in Phase D.
 
 - **Systems**: b
-  **Reasoning:** The invariant costs one sentence and holds whatever 1wtepc decides. Without it, `eprint*` keeps writing with no stated row until another vote, and nothing stops a new op from bringing back the hole.
-  **Concern:** The sentence must not read as if it fixes the delegation-row hole (bemfjs). Q10 covers that.
+  **Reasoning:** The invariant costs one sentence and holds whatever [the stderr row ticket] decides. Without it, `eprint*` keeps writing with no stated row until another vote, and nothing stops a new op from bringing back the hole.
+  **Concern:** The sentence must not read as if it fixes the delegation-row hole ([the delegation-row ticket]). Q10 covers that.
 - **Web/Scripting**: b
-  **Reasoning:** One sentence in §4.5, "no Blink operation skips a handler that its row names; only an `@ffi` call does", is the rule a dev and an AI can hold in their head, and it tells the stderr ticket (1wtepc) what it must not break. It adds no name and no placeholder effect.
-  **Concern:** The sentence is false in practice until bemfjs fixes delegation, so it must ship with the Q10 dependence note.
+  **Reasoning:** One sentence in §4.5, "no Blink operation skips a handler that its row names; only an `@ffi` call does", is the rule a dev and an AI can hold in their head, and it tells the stderr ticket ([the stderr row ticket]) what it must not break. It adds no name and no placeholder effect.
+  **Concern:** The sentence is false in practice until [the delegation-row ticket] fixes delegation, so it must ship with the Q10 dependence note.
 - **PLT**: b
-  **Reasoning:** The sentence states the invariant that this ruling restores, in the one normative place for row rules (§4.5). The spec is a blueprint: a stated invariant gives 1wtepc and bemfjs a target to meet, and gives reviewers a rule to check new operations against. Without it, the next unhandleable operation can come in with no rule against it.
-  **Concern:** Until 1wtepc rules on stderr, `io.eprint*` break the new sentence. The ruling must name 1wtepc as the open exception, so the spec does not contradict itself with no explanation.
+  **Reasoning:** The sentence states the invariant that this ruling restores, in the one normative place for row rules (§4.5). The spec is a blueprint: a stated invariant gives [the stderr row ticket] and [the delegation-row ticket] a target to meet, and gives reviewers a rule to check new operations against. Without it, the next unhandleable operation can come in with no rule against it.
+  **Concern:** Until [the stderr row ticket] rules on stderr, `io.eprint*` break the new sentence. The ruling must name [the stderr row ticket] as the open exception, so the spec does not contradict itself with no explanation.
 - **DevOps/Tooling**: a
-  **Reasoning:** Stderr has its own open ticket (1wtepc), and lib/std/testing.bl and 06_tooling.md disagree with §4 about `IO.Eprint`. A §4.5 sentence written now would make a claim that `io.eprint*` does not meet until that ticket lands. That is the same contradiction this ticket exists to remove.
-  **Concern:** 1wtepc could stay at friction priority while the same false-proof hole stays open on stderr. It should be raised to this ticket's priority.
+  **Reasoning:** Stderr has its own open ticket ([the stderr row ticket]), and lib/std/testing.bl and 06_tooling.md disagree with §4 about `IO.Eprint`. A §4.5 sentence written now would make a claim that `io.eprint*` does not meet until that ticket lands. That is the same contradiction this ticket exists to remove.
+  **Concern:** [the stderr row ticket] could stay at friction priority while the same false-proof hole stays open on stderr. It should be raised to this ticket's priority.
 - **AI/ML**: b
-  **Reasoning:** The sentence states, in the place a model reads for the rule, the invariant this ruling restores, and it gives the stderr ticket (1wtepc) a fixed target. It adds no behavior. The spec does not yet name a row for `io.eprint`, so the sentence contradicts no current text.
-  **Concern:** When 1wtepc gives stderr a handler-named row, it must make `io.eprint*` dispatch through it in the same change. If it does not, the new sentence becomes false.
+  **Reasoning:** The sentence states, in the place a model reads for the rule, the invariant this ruling restores, and it gives the stderr ticket ([the stderr row ticket]) a fixed target. It adds no behavior. The spec does not yet name a row for `io.eprint`, so the sentence contradicts no current text.
+  **Concern:** When [the stderr row ticket] gives stderr a handler-named row, it must make `io.eprint*` dispatch through it in the same change. If it does not, the new sentence becomes false.
 - **Minimalism**: a
-  **Reasoning:** Ticket 1wtepc owns stderr. Sys's invariant is the right end state, but stated now it is false on the same page: `io.eprint` and `io.eprintln` skip a handler today (my probe). A normative sentence that the spec itself breaks is the kind of drift this ticket exists to remove. Put the sentence in the stderr ruling, which makes it true.
-  **Concern:** If 1wtepc sits as friction and is not promoted to type:spec, `io.eprint*` keeps the hole and the §1.1 text over-promises. The moderator should promote it.
+  **Reasoning:** Ticket [the stderr row ticket] owns stderr. Sys's invariant is the right end state, but stated now it is false on the same page: `io.eprint` and `io.eprintln` skip a handler today (my probe). A normative sentence that the spec itself breaks is the kind of drift this ticket exists to remove. Put the sentence in the stderr ruling, which makes it true.
+  **Concern:** If [the stderr row ticket] sits as friction and is not promoted to type:spec, `io.eprint*` keeps the hole and the §1.1 text over-promises. The moderator should promote it.
 
 ##### Q5 philosophy
 
@@ -239,7 +239,7 @@ decisions/duplicate-apis.md L63: "The contract (exact bytes, flushed) must survi
   **Concern:** "General" is a soft word; a reader may ask what a non-general `unsafe` block is, so the sentence must name FFI regions as the answer at once.
 - **PLT**: ii
   **Reasoning:** The sentence must not deny that `with ffi.scope()` exists. It is a block where a `Ptr[T]` is used with no check and no `@trusted` record. Option ii makes the text true with the smallest change and keeps the line's real point: Blink has no general unsafe mode.
-  **Concern:** The added sentence must name every FFI region kind of §9.1.1 (`@ffi` body, `@trusted` body, `with ffi.scope()`), or it will become stale when v7g3x4 rules.
+  **Concern:** The added sentence must name every FFI region kind of §9.1.1 (`@ffi` body, `@trusted` body, `with ffi.scope()`), or it will become stale when [the @trusted split ticket] rules.
 - **DevOps/Tooling**: i
   **Reasoning:** A `with ffi.scope()` block is a narrow block where pointer checks are off. "No `unsafe` escape hatch" denies it, and option ii keeps that denial and adds a sentence that contradicts it. Option i says what is true and points at the list.
   **Concern:** The reword must not read as an invitation to write FFI regions. It should keep the "use a different language" steer for low-level systems work.
@@ -255,7 +255,7 @@ decisions/duplicate-apis.md L63: "The contract (exact bytes, flushed) must survi
 **Q7: a 4-2** (devops, sys: b).
 
 - **Systems**: b
-  **Reasoning:** A stated test makes V8 something you can check, the same way 07:209 governs the audit list. devops's three criteria are concrete and match what I asked for. tf7xbe (zero-copy Bytes FFI) is the first entry that would face the test.
+  **Reasoning:** A stated test makes V8 something you can check, the same way 07:209 governs the audit list. devops's three criteria are concrete and match what I asked for. [the zero-copy Bytes ticket] (zero-copy Bytes FFI) is the first entry that would face the test.
   **Concern:** The test should also say what makes a construct a hatch (the compiler assumes a fact it neither proves nor checks at run time). Without that, someone can argue that a new bypass is not on the list at all.
 - **Web/Scripting**: a
   **Reasoning:** A panel vote is the gate that matters, and the membership test in b is three conditions a future panel will argue over at the edges (does a lint count as "can fail CI"?). The closed audit list (scoped-value-trusted-channel.md Q2) already works with a vote and a short criterion.
@@ -319,28 +319,28 @@ decisions/duplicate-apis.md L63: "The contract (exact bytes, flushed) must survi
   **Reasoning:** `trust` suppresses no diagnostic, so the §9.1 membership rule (L209) does not cover it. Its mark is already searchable and reported (`blink verify --deny trust`). A record requirement is new surface with no lost information behind it.
   **Concern:** The asymmetry with `Raw` (audited) and `trust` (not audited) will look arbitrary to a reader. §9.1's list should state why each entry has the mark it has.
 
-##### Q10 bemfjs dependency
+##### Q10 delegation-row dependency
 
 **Q10: yes 5-1** (min: no).
 
 - **Systems**: yes
-  **Reasoning:** Under Q2-b, `print_raw_bytes` is primitive. A handler that omits it forwards to the outer handler, which a `with` has discharged from the row. That is the bemfjs hole. Claiming that Q1 closes the hole on its own would repeat the false-row error this ruling sets out to fix.
-  **Concern:** If bemfjs is decided far later, the spec carries a known caveat. Being honest is still better than a false claim.
+  **Reasoning:** Under Q2-b, `print_raw_bytes` is primitive. A handler that omits it forwards to the outer handler, which a `with` has discharged from the row. That is the [the delegation-row ticket] hole. Claiming that Q1 closes the hole on its own would repeat the false-row error this ruling sets out to fix.
+  **Concern:** If [the delegation-row ticket] is decided far later, the spec carries a known caveat. Being honest is still better than a false claim.
 - **Web/Scripting**: yes
   **Reasoning:** Honest text beats a ruling that claims a fix the compiler does not yet give; a dev who hits the delegation leak must find the reason in the spec, not on a forum.
-  **Concern:** If bemfjs stalls, the note stays in the spec for a long time and reads as an open defect in the language.
+  **Concern:** If [the delegation-row ticket] stalls, the note stays in the spec for a long time and reads as an open defect in the language.
 - **PLT**: yes
-  **Reasoning:** I showed in Phase B that `default.op` delegation lets a function with no row reach the root handler (gen1, package build). If the Q1 text says nothing, readers will take Q1-A as closing the sandbox hole, and it does not do so alone. Naming bemfjs makes the dependency something a reviewer can check.
-  **Concern:** The cross-reference can go stale. When bemfjs lands, the note in the Q1 text must be removed in the same change.
+  **Reasoning:** I showed in Phase B that `default.op` delegation lets a function with no row reach the root handler (gen1, package build). If the Q1 text says nothing, readers will take Q1-A as closing the sandbox hole, and it does not do so alone. Naming [the delegation-row ticket] makes the dependency something a reviewer can check.
+  **Concern:** The cross-reference can go stale. When [the delegation-row ticket] lands, the note in the Q1 text must be removed in the same change.
 - **DevOps/Tooling**: yes
-  **Reasoning:** Q1-A closes the hole only once an omitted operation cannot discharge a row that it forwards past (bemfjs). Saying so keeps the spec honest and gives the implementing slice a dependency it can check. Saying nothing would mean claiming a fix that is not true yet.
-  **Concern:** The sentence must cite the rule by section once bemfjs lands, not by ticket ID. br IDs must not appear in spec text.
+  **Reasoning:** Q1-A closes the hole only once an omitted operation cannot discharge a row that it forwards past ([the delegation-row ticket]). Saying so keeps the spec honest and gives the implementing slice a dependency it can check. Saying nothing would mean claiming a fix that is not true yet.
+  **Concern:** The sentence must cite the rule by section once [the delegation-row ticket] lands, not by ticket ID. br IDs must not appear in spec text.
 - **AI/ML**: yes
-  **Reasoning:** If the text says the hole is closed while bemfjs is still open, a model trusts a claim that is false. A stated dependency keeps the spec honest, and it tells the reader which ticket closes the rest of the hole.
-  **Concern:** The caveat must be removed when bemfjs lands, or it will outlive the fix as stale text.
+  **Reasoning:** If the text says the hole is closed while [the delegation-row ticket] is still open, a model trusts a claim that is false. A stated dependency keeps the spec honest, and it tells the reader which ticket closes the rest of the hole.
+  **Concern:** The caveat must be removed when [the delegation-row ticket] lands, or it will outlive the fix as stale text.
 - **Minimalism**: no
-  **Reasoning:** The spec is a blueprint that states rules, not the status of other rulings. A conditional "this holds only once the delegation-row rule holds" is a status note in normative text, and it goes stale when bemfjs lands. bemfjs fixes §4.7 partial handlers for every effect, and Q1-A does not make that hole worse.
-  **Concern:** Until bemfjs lands, a partial `IO.Print` handler that omits `print_raw_bytes` still forwards past itself. The Q1 chore should add a test that pins the Str case (`io.print_raw` under `capture_print` lands in the list), so the part we did close stays closed.
+  **Reasoning:** The spec is a blueprint that states rules, not the status of other rulings. A conditional "this holds only once the delegation-row rule holds" is a status note in normative text, and it goes stale when [the delegation-row ticket] lands. [the delegation-row ticket] fixes §4.7 partial handlers for every effect, and Q1-A does not make that hole worse.
+  **Concern:** Until [the delegation-row ticket] lands, a partial `IO.Print` handler that omits `print_raw_bytes` still forwards past itself. The Q1 chore should add a test that pins the Str case (`io.print_raw` under `capture_print` lands in the list), so the part we did close stays closed.
 
 #### Phase D — Round 2
 
@@ -350,7 +350,7 @@ Options. Q4: **a** `io.eprint_raw` follows `io.eprint`, no further text; **b1** 
 
 ##### Systems (D1, proposed text)
 
-> No Blink operation skips a handler that its row names; only an `@ffi` call does. The stderr operations (`io.eprint`, `io.eprintln`, `io.eprint_raw`) have no stated row yet; §4.4 and [1wtepc's ruling] will give them one that meets this rule.
+> No Blink operation skips a handler that its row names; only an `@ffi` call does. The stderr operations (`io.eprint`, `io.eprintln`, `io.eprint_raw`) have no stated row yet; §4.4 and [the stderr row ruling] will give them one that meets this rule.
 > There is no ownership model, no manual memory management, and no general `unsafe` block that turns checks off. The one narrow form is an FFI region (§9.1.1), where a `Ptr[T]` may be used without a null or lifetime check; it relaxes only that rule, and each region is marked in source (§9.1). If you need to control individual cache lines, use a different language and call it via FFI.
 
 ##### Web/Scripting (D1, proposed text)
@@ -385,8 +385,8 @@ Options. Q4: **a** `io.eprint_raw` follows `io.eprint`, no further text; **b1** 
 
 ###### Q4 stderr
 **Vote:** b1
-**Reasoning:** I move from b2 to b1. The spec is a blueprint: it states the rule, and the decision file tracks which cases do not meet it yet. As written, the spec gives `io.eprint*` no row and says they are not dispatched, so the rule holds for them. It is not false on the page. web's probe shows the compiler differs from the table (an `IO.Eprint` dispatch with no row). That is a compiler and stdlib mismatch for 1wtepc to settle, not a reason to put status text in §4.5. b1 keeps the rule I asked for and joins devops and min.
-**Concern:** If 1wtepc and bemfjs are not promoted and scheduled, the stated rule and the shipped compiler stay apart, and only the decision file records that.
+**Reasoning:** I move from b2 to b1. The spec is a blueprint: it states the rule, and the decision file tracks which cases do not meet it yet. As written, the spec gives `io.eprint*` no row and says they are not dispatched, so the rule holds for them. It is not false on the page. web's probe shows the compiler differs from the table (an `IO.Eprint` dispatch with no row). That is a compiler and stdlib mismatch for [the stderr row ticket] to settle, not a reason to put status text in §4.5. b1 keeps the rule I asked for and joins devops and min.
+**Concern:** If [the stderr row ticket] and [the delegation-row ticket] are not promoted and scheduled, the stated rule and the shipped compiler stay apart, and only the decision file records that.
 
 ###### Q6 L100
 **Vote:** i (sys D1 text; any i text is fine if it names FFI regions (§9.1.1) and says they relax only the `Ptr[T]` rules)
@@ -403,31 +403,31 @@ Options. Q4: **a** `io.eprint_raw` follows `io.eprint`, no further text; **b1** 
 ###### Q6 L100
 **Vote:** i — web D1 text
 **Reasoning:** It drops the false clause, names FFI regions at once after the colon so "general" is never a riddle, says they relax only the `Ptr[T]` rules, points at §9.1.1 and §9.1 instead of copying them, and keeps the "use a different language" steer word for word. A Rust or TS dev reads it in ten seconds and knows what Blink does not have and where the one narrow form lives.
-**Concern:** If v7g3x4 splits `@trusted`'s region job, "relax only the `Ptr[T]` rules" must still be true of each region kind, or this line needs an edit with that ruling.
+**Concern:** If [the @trusted split ticket] splits `@trusted`'s region job, "relax only the `Ptr[T]` rules" must still be true of each region kind, or this line needs an edit with that ruling.
 
 **PLT**
 
 ###### Q4 stderr
 **Vote:** b2
-**Reasoning:** The §4.5 rule states the invariant that this ruling restores, in the one normative place for row rules, and it gives 1wtepc and bemfjs a target to meet. web's probe shows the stderr text has drifted already: the compiler sends `io.eprintln` to an `IO.Eprint` handler, while the table says "not dispatched". A normative rule whose known exceptions appear only in a decision file repeats that drift, because a reader of the spec sees a rule the compiler breaks and no word on why. Naming the two open cases next to the rule, without ticket IDs, keeps the spec honest about its own gaps.
-**Concern:** Each open-case clause must be removed in the same change that settles it (1wtepc, bemfjs). Otherwise the spec keeps an exception that no longer exists.
+**Reasoning:** The §4.5 rule states the invariant that this ruling restores, in the one normative place for row rules, and it gives [the stderr row ticket] and [the delegation-row ticket] a target to meet. web's probe shows the stderr text has drifted already: the compiler sends `io.eprintln` to an `IO.Eprint` handler, while the table says "not dispatched". A normative rule whose known exceptions appear only in a decision file repeats that drift, because a reader of the spec sees a rule the compiler breaks and no word on why. Naming the two open cases next to the rule, without ticket IDs, keeps the spec honest about its own gaps.
+**Concern:** Each open-case clause must be removed in the same change that settles it ([the stderr row ticket], [the delegation-row ticket]). Otherwise the spec keeps an exception that no longer exists.
 
 ###### Q6 L100
 **Vote:** i (text: plt, or any that names FFI regions at once and points to §9.1.1)
-**Reasoning:** "No `unsafe` escape hatch" is false while `with ffi.scope()` is a block where pointers are not checked. Option ii keeps that false clause and then contradicts it. Option i states the true property, that no construct turns off checks for a whole block, and names the narrow form in the next clause. My D1 text also keeps the "use a different language" steer and does not repeat the region kinds, so it stays correct whichever way v7g3x4 goes.
-**Concern:** If the final text lists the region kinds and does not point to §9.1.1, it becomes a second copy that drifts when v7g3x4 changes what an FFI region is.
+**Reasoning:** "No `unsafe` escape hatch" is false while `with ffi.scope()` is a block where pointers are not checked. Option ii keeps that false clause and then contradicts it. Option i states the true property, that no construct turns off checks for a whole block, and names the narrow form in the next clause. My D1 text also keeps the "use a different language" steer and does not repeat the region kinds, so it stays correct whichever way [the @trusted split ticket] goes.
+**Concern:** If the final text lists the region kinds and does not point to §9.1.1, it becomes a second copy that drifts when [the @trusted split ticket] changes what an FFI region is.
 
 **DevOps/Tooling**
 
 ###### Q4 stderr
 **Vote:** b1
-**Reasoning:** The rule gives a reviewer something to check each new operation against, and it belongs in §4.5. A note in the spec that lists open cases is a statement of current state. It goes stale the day 1wtepc or bemfjs lands, and nobody has a tool that flags the stale text. The decision file is the right home for "what is still open". web's probe shows that the compiler already dispatches `io.eprintln` through `IO.Eprint`, so the stderr case is a spec gap for 1wtepc to close, not a reason to qualify the rule.
-**Concern:** If 1wtepc is not promoted to type:spec, the rule can stay unmet on stderr with nothing in the spec pointing at it.
+**Reasoning:** The rule gives a reviewer something to check each new operation against, and it belongs in §4.5. A note in the spec that lists open cases is a statement of current state. It goes stale the day [the stderr row ticket] or [the delegation-row ticket] lands, and nobody has a tool that flags the stale text. The decision file is the right home for "what is still open". web's probe shows that the compiler already dispatches `io.eprintln` through `IO.Eprint`, so the stderr case is a spec gap for [the stderr row ticket] to close, not a reason to qualify the rule.
+**Concern:** If [the stderr row ticket] is not promoted to type:spec, the rule can stay unmet on stderr with nothing in the spec pointing at it.
 
 ###### Q6 L100
 **Vote:** i (devops D1 text; any text that points at §9.1.1 and §9.1 and keeps the "use a different language" steer is acceptable)
-**Reasoning:** Option ii keeps a clause ("no `unsafe` escape hatch") that the next sentence must contradict. Option i is true, and naming FFI regions at once answers "what is a non-general one?". A pointer and no list of region kinds keeps one copy of the rules, and it stays true whatever v7g3x4 decides.
-**Concern:** A text that lists the region kinds inline makes a second copy of §9.1.1, which drifts when v7g3x4 rules.
+**Reasoning:** Option ii keeps a clause ("no `unsafe` escape hatch") that the next sentence must contradict. Option i is true, and naming FFI regions at once answers "what is a non-general one?". A pointer and no list of region kinds keeps one copy of the rules, and it stays true whatever [the @trusted split ticket] decides.
+**Concern:** A text that lists the region kinds inline makes a second copy of §9.1.1, which drifts when [the @trusted split ticket] rules.
 
 **AI/ML**
 
@@ -438,20 +438,20 @@ Options. Q4: **a** `io.eprint_raw` follows `io.eprint`, no further text; **b1** 
 
 ###### Q6 L100
 **Vote:** i, aiml D1 text (plt's is also acceptable if the region kinds stay a pointer to §9.1.1, not an inline list)
-**Reasoning:** Option i says one true thing, and its second sentence answers "what is a non-general `unsafe`?" at once. A pointer to §9.1.1 and §9.1 keeps one normative copy of the region kinds, so v7g3x4 cannot make this line stale.
+**Reasoning:** Option i says one true thing, and its second sentence answers "what is a non-general `unsafe`?" at once. A pointer to §9.1.1 and §9.1 keeps one normative copy of the region kinds, so [the @trusted split ticket] cannot make this line stale.
 **Concern:** A model may read "the one place a `Ptr[T]` is used without a check" as an invitation to write FFI regions. The "use a different language" steer must stay right after it.
 
 **Minimalism**
 
 ###### Q4 — stderr
 **Vote:** b1
-**Reasoning:** The rule gives 1wtepc and every future op one target in the one normative place for row rules, and it costs one sentence. Web's probe shows the compiler already dispatches `io.eprintln` through an `IO.Eprint` handler. So the stderr case is drift between spec and compiler that 1wtepc must settle, and the decision file is where that open case belongs. Naming open cases next to a normative rule (b2) puts status text in a blueprint, and it goes stale as soon as 1wtepc or bemfjs lands. Then someone has to remember to delete it.
-**Concern:** If 1wtepc is not promoted and voted soon, a reader of §4.5 meets a rule that the stderr table (04_effects.md:241-242, "not dispatched") seems to break. The 1wtepc ruling must fix the table and the dispatch in the same change.
+**Reasoning:** The rule gives [the stderr row ticket] and every future op one target in the one normative place for row rules, and it costs one sentence. Web's probe shows the compiler already dispatches `io.eprintln` through an `IO.Eprint` handler. So the stderr case is drift between spec and compiler that [the stderr row ticket] must settle, and the decision file is where that open case belongs. Naming open cases next to a normative rule (b2) puts status text in a blueprint, and it goes stale as soon as [the stderr row ticket] or [the delegation-row ticket] lands. Then someone has to remember to delete it.
+**Concern:** If [the stderr row ticket] is not promoted and voted soon, a reader of §4.5 meets a rule that the stderr table (04_effects.md:241-242, "not dispatched") seems to break. The [the stderr row ticket] ruling must fix the table and the dispatch in the same change.
 
 ###### Q6 — L100
 **Vote:** i — text: min (D1); I accept any i text that points to §9.1 and does not list the region kinds in §1.3.
-**Reasoning:** "No `unsafe` escape hatch" is false while `with ffi.scope()` exists, and ii keeps that clause. The min text says the region relaxes only `Ptr[T]` checks, answers "general" in the next sentence, and points to §9.1. So it cannot go stale when v7g3x4 changes the region kinds.
-**Concern:** A text that lists the region kinds inline makes a second copy of §9.1.1 that will drift after v7g3x4.
+**Reasoning:** "No `unsafe` escape hatch" is false while `with ffi.scope()` exists, and ii keeps that clause. The min text says the region relaxes only `Ptr[T]` checks, answers "general" in the next sentence, and points to §9.1. So it cannot go stale when [the @trusted split ticket] changes the region kinds.
+**Concern:** A text that lists the region kinds inline makes a second copy of §9.1.1 that will drift after [the @trusted split ticket].
 
 **Round 2 result.** Q4: **b1 4-2** (web, devops, min, sys; plt and aiml: b2). Q6: **i 6-0**.
 
@@ -487,9 +487,9 @@ Locked points:
 
 ### Open cases and follow-ups
 
-- **Stderr row and dispatch (1wtepc).** `io.eprint`, `io.eprintln` and `io.eprint_raw` have no stated row in §4. The §4.4 table says "not dispatched". Web's probe shows the compiler dispatches `io.eprintln` through an `IO.Eprint` handler (`capture_eprint` captures it) in a fn with no row. The ruling on 1wtepc must settle the row, the table and the dispatch in one change, so the §4.5 rule holds for stderr. devops, min and web asked that it move from friction to `type:spec` at this ticket's priority.
-- **Delegation row (bemfjs).** A handler that delegates to the enclosing `default`, or that omits a primitive operation, can send output outward after a `with` has removed the effect from the row. The spec text states this as an open question by section name. When bemfjs lands, that sentence goes in the same change.
-- **`@verify(fallback: "trust")` audit record (4anyf7).** It is the one list entry with no recorded claim. Q9 left it unchanged (6-0); the follow-up ruling decides whether it needs an `audit:` record.
+- **Stderr row and dispatch.** `io.eprint`, `io.eprintln` and `io.eprint_raw` have no stated row in §4. The §4.4 table says "not dispatched". Web's probe shows the compiler dispatches `io.eprintln` through an `IO.Eprint` handler (`capture_eprint` captures it) in a fn with no row. The stderr ruling must settle the row, the table and the dispatch in one change, so the §4.5 rule holds for stderr. devops, min and web asked that it move from friction to `type:spec` at this ticket's priority.
+- **Delegation row.** A handler that delegates to the enclosing `default`, or that omits a primitive operation, can send output outward after a `with` has removed the effect from the row. The spec text states this as an open question by section name. When the delegation-row rule lands, that sentence goes in the same change.
+- **`@verify(fallback: "trust")` audit record.** It is the one list entry with no recorded claim. Q9 left it unchanged (6-0); the follow-up ruling decides whether it needs an `audit:` record.
 - **Q7 membership test.** devops and sys wanted a stated test (one fixed spelling; a `blink` command that lists every site and can fail CI; no `@allow` hides it). plt held that a founding member such as `with ffi.scope()` fails the test today. Soft consensus: a test is a follow-up once each entry is checked against it.
 - **Q6 text pick.** The moderator picked the sys D1 text. Every seat accepts any `i` text that names FFI regions at once, points to §9.1.1 and §9.1, lists no region kinds, and keeps "use a different language".
-- **Split of the `@trusted` region and record jobs (v7g3x4)** remains open and does not change this list: the list names FFI regions and `@trusted` as separate entries.
+- **Split of the `@trusted` region and record jobs** remains open and does not change this list: the list names FFI regions and `@trusted` as separate entries.

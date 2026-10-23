@@ -765,7 +765,7 @@ These are not spec text.
 - Sys: lower a closure-literal argument of `map` or `map_err` to an inline `match`. §2.22 allows it, because making a closure literal does not run its body. Without it, each call allocates a closure.
 - Devops: keep closure spans in diagnostics, so that an effect error inside a forwarded callback points at the effect use in the closure body and not at the `.map(` call (web, devops).
 - The machine-applicable rewrite needs an effect and panic check on the default expression.
-- Related tickets: cn7d21 (`map_err` impl), 1125w6 (friction on `unwrap_or`).
+- Related work: the `map_err` impl and the friction on `unwrap_or`.
 
 ### Open cases and follow-ups
 

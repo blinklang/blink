@@ -4,13 +4,13 @@
 
 ### Panel Deliberation
 
-The ticket (verbatim, br id q8d9jz):
+The ticket (verbatim):
 
 > Title: Spec: how a mock Time handler makes a Monotonic value
 >
 > From the effect-tracked builtins panel: §3.2.3 makes Monotonic opaque, built only by time.monotonic(). §8.10.3 mock_clock (06_tooling.md) has no monotonic op and passes it to the real clock, so a test cannot fake elapsed time. Decide how a handler builds a Monotonic (for example a constructor visible only to handlers, or Monotonic.from_nanos in std.testing).
 >
-> Blocks: 9nyp84 (type:feature) "Builtin Time effect lacks the time.monotonic() -> Monotonic op the spec lists … How a mock handler builds a Monotonic is open in q8d9jz."
+> Blocks: [the Time.monotonic builtin ticket] (type:feature) "Builtin Time effect lacks the time.monotonic() -> Monotonic op the spec lists … How a mock handler builds a Monotonic is open in [the mock Monotonic ticket]."
 
 Six panelists (systems, web/scripting, PLT, DevOps/tooling, AI/ML, minimalism) deliberated. Phase A had independent proposals. Phase B had one round. Phase C was a ballot on Q1 to Q8. Phase D re-voted Q7 only, because Q7 passed 4-2. Quoted text is each panelist's own words, taken from the panel record. "…" marks a cut.
 
