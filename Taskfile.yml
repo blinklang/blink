@@ -79,17 +79,18 @@ tasks:
     cmds:
       - |
         set -e
-        mkdir -p .tmp/peel
-        LOG=".tmp/peel/probe.log"
+        PEEL=$(mktemp -d "${TMPDIR:-/tmp}/blink-peel-XXXXXX")
+        trap 'rm -rf "$PEEL"' EXIT
+        LOG="$PEEL/probe.log"
 
-        cat > .tmp/peel/hello.bl <<'EOF'
+        cat > "$PEEL/hello.bl" <<'EOF'
         fn main() ! IO {
             io.println("hello from peel probe")
         }
         EOF
         find .tmp -maxdepth 1 -name 'sqlite3*.o' -delete 2>/dev/null || true
-        rm -f .tmp/peel/hello
-        if ! {{.BUILD_DIR}}/blink build .tmp/peel/hello.bl --output .tmp/peel/hello > "$LOG" 2>&1; then
+        rm -f "$PEEL/hello"
+        if ! {{.BUILD_DIR}}/blink build "$PEEL/hello.bl" --output "$PEEL/hello" > "$LOG" 2>&1; then
           echo "test-sqlite-peel: FAIL — hello-world build failed"
           tail -40 "$LOG" >&2
           exit 1
@@ -102,14 +103,13 @@ tasks:
         fi
 
         # (b) resulting binary must contain zero sqlite text symbols.
-        SQL_TEXT=$(nm .tmp/peel/hello 2>/dev/null | grep -c -E '^[0-9a-f]+ T (blink_)?sqlite3_' || true)
+        SQL_TEXT=$(nm "$PEEL/hello" 2>/dev/null | grep -c -E '^[0-9a-f]+ T (blink_)?sqlite3_' || true)
         if [ "$SQL_TEXT" -ne 0 ]; then
           echo "test-sqlite-peel: FAIL — non-sqlite binary contains $SQL_TEXT sqlite text symbols (expect 0)"
-          nm .tmp/peel/hello | grep -E '^[0-9a-f]+ T (blink_)?sqlite3_' | head -5 >&2
+          nm "$PEEL/hello" | grep -E '^[0-9a-f]+ T (blink_)?sqlite3_' | head -5 >&2
           exit 1
         fi
 
-        rm -f .tmp/peel/hello
         echo "test-sqlite-peel: PASS"
 
   compile-test:
@@ -210,26 +210,27 @@ tasks:
     vars:
       FMT_SEMANTIC: '{{.FMT_SEMANTIC | default "1"}}'
     cmds:
-      - mkdir -p .tmp
       - |
+        skip_file=$(mktemp "${TMPDIR:-/tmp}/blink-fmt-skip-XXXXXX")
+        trap 'rm -f "$skip_file"' EXIT
         # One marker thread per worker. Boehm sizes its marker pool from the
         # machine, so every fmt worker would otherwise start ~one marker per
         # core and the fan-out oversubscribes by that factor.
         export GC_MARKERS=1
-        printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > .tmp/fmt_skip.txt
+        printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > "$skip_file"
 
         # Under blink-gates.slice the slice already holds memory below this cap,
         # and a scope of its own would move the work out of the slice's CPU cap.
         scope="systemd-run --user --scope -p MemoryMax=50G --quiet"
         grep -q '/blink-gates.slice/' /proc/self/cgroup && scope=""
         golden_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
-        idem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
+        idem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
         # The semantic pass compiles and RUNS every formatted test. Those
         # binaries call the relative build/blink and build/blinkc, which only
         # a release build provides, so the rewrite gate skips this pass.
         sem_results=""
         if [ "{{.FMT_SEMANTIC}}" = 1 ]; then
-          sem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl 2>&1 || true)
+          sem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
         fi
 
         all_results=$(printf '%s\n%s\n%s' "$golden_results" "$idem_results" "$sem_results")
@@ -256,7 +257,6 @@ tasks:
     desc: Run fuzz testing against lexer and parser
     deps: [bootstrap]
     cmds:
-      - mkdir -p .tmp/fuzz_crashes
       - ./scripts/fuzz.sh {{.BLINKC}} {{.CLI_ARGS | default "500"}}
 
   test-installed:
@@ -730,7 +730,7 @@ tasks:
       - task: __ci-corpus-and-fmt
       - ./scripts/ci_corpus_stamp.sh commit
 
-  # The formatter goldens read gen1's blinkc and write only .tmp/, so they run
+  # The formatter goldens read gen1's blinkc and write only under TMPDIR, so they run
   # while the corpus builds its compiler archive on one core, not after the sweep.
   __ci-corpus-and-fmt:
     internal: true
@@ -885,7 +885,7 @@ tasks:
     desc: |
       Measure wall-clock per phase of `task ci-release`. Re-runnable. Outputs:
         build/ci-timings.<mode>.tsv          — one row per phase (cmd, elapsed_s, max_rss_kb, exit_code)
-        .tmp/fmt-{golden,idem,sem}.<mode>.joblog — GNU parallel per-file timings
+        build/fmt-{golden,idem,sem}.<mode>.joblog — GNU parallel per-file timings
       Modes:
         MODE=warm (default) — run as-is; reuses Taskfile `sources:` cache, std-cache, etc.
         MODE=cold           — wipes Taskfile cache + bootstrap outputs + .tmp/ first so every phase
@@ -896,7 +896,10 @@ tasks:
       - |
         MODE="${MODE:-warm}"
         TSV="{{.BUILD_DIR}}/ci-timings.${MODE}.tsv"
-        mkdir -p {{.BUILD_DIR}} .tmp
+        mkdir -p {{.BUILD_DIR}}
+        prof_dir=$(mktemp -d "${TMPDIR:-/tmp}/blink-ci-profile-XXXXXX")
+        trap 'rm -rf "$prof_dir"' EXIT
+        skip_file="$prof_dir/fmt_skip.txt"
         # /usr/bin/time output appended per-phase. -f: format. -a: append. -o: file.
         # %e elapsed seconds (wall), %M max RSS in KB, %C the command.
         # We pass a stable phase label via env so the TSV is grep-friendly even
@@ -914,7 +917,7 @@ tasks:
         printf 'phase\telapsed_s\tmax_rss_kb\texit_code\n' > "$TSV"
         time_phase() {
           phase="$1"; shift
-          time_file=$(mktemp .tmp/ci-profile-time-XXXX)
+          time_file=$(mktemp "$prof_dir/time-XXXX")
           rc=0
           "$TIME_BIN" -f "__CIPROFILE__\t%e\t%M" -o "$time_file" sh -c "$*" || rc=$?
           line=$(grep '^__CIPROFILE__' "$time_file" | tail -1)
@@ -969,15 +972,15 @@ tasks:
 
         # Phase 6: fmt waves — each parallel invocation timed separately and
         # given its own --joblog so per-file timings are available for free.
-        printf "%s\n" test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_test_compile_errors test_map_seed_deterministic > .tmp/fmt_skip.txt
+        printf "%s\n" test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_test_compile_errors test_map_seed_deterministic > "$skip_file"
 
         # Under blink-gates.slice the slice already holds memory below this cap,
         # and a scope of its own would move the work out of the slice's CPU cap.
         scope="systemd-run --user --scope -p MemoryMax=50G --quiet"
         grep -q '/blink-gates.slice/' /proc/self/cgroup && scope=""
-        time_phase fmt-golden "$scope parallel --joblog .tmp/fmt-golden.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl > /dev/null 2>&1 || true"
-        time_phase fmt-idempotent "$scope parallel --joblog .tmp/fmt-idem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl > /dev/null 2>&1 || true"
-        time_phase fmt-semantic "$scope parallel --joblog .tmp/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} .tmp/fmt_skip.txt ::: tests/test_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-golden "$scope parallel --joblog {{.BUILD_DIR}}/fmt-golden.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-idempotent "$scope parallel --joblog {{.BUILD_DIR}}/fmt-idem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} $skip_file ::: tests/test_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-semantic "$scope parallel --joblog {{.BUILD_DIR}}/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} $skip_file ::: tests/test_*.bl > /dev/null 2>&1 || true"
 
         # Phase 7: per-module .o pipeline + gen1/gen2 byte-equality.
         time_phase ci-per-module-checks 'task ci-per-module-checks > /dev/null'
@@ -1002,7 +1005,7 @@ tasks:
           echo "FAILED phases (still timed): $failures"
         fi
         echo "TSV:     $TSV"
-        echo "Joblogs: .tmp/fmt-{golden,idem,sem}.${MODE}.joblog"
+        echo "Joblogs: {{.BUILD_DIR}}/fmt-{golden,idem,sem}.${MODE}.joblog"
         echo ""
         echo "To compare cold vs warm:"
         echo "  MODE=cold task ci-profile && MODE=warm task ci-profile"

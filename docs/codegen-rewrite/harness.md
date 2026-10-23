@@ -103,10 +103,19 @@ an empty program either.
 
 Each file gets its own work directory under `build/corpus/work/<name>/`.
 That directory holds links to `tests/`, `src/`, `lib/`, `bootstrap/` and
-`blink.toml`, a private `.tmp/`, and a private `build/` whose `blink` and
-`blinkc` point at the compiler under test. This is why the corpus can run
-in parallel: no two files share an object cache, and a test that calls
-the relative path `build/blink` reaches the compiler under test.
+`blink.toml`, a private `.tmp/` (the compiler writes the objects of a native
+dependency there), and a private `build/` whose `blink` and `blinkc` point at
+the compiler under test. This is why the corpus can run in parallel: no two
+files share an object cache, and a test that calls the relative path
+`build/blink` reaches the compiler under test.
+
+Test scratch files are not in the work directory. Each file also gets a private
+`TMPDIR` made with `mktemp -d` (`blink-corpus-XXXXXX` under the caller's
+`TMPDIR`, or `/tmp`). A test gets its scratch dir from
+`compile_test_helpers.scratch_root()`: `$TMPDIR/blink-test-<pid>`, unique for
+each test process. `corpus_one.sh` removes the private `TMPDIR` when the file
+ends, and `blink test` removes the dir of each test binary it runs. A binary
+that you run by hand leaves its dir; delete it yourself.
 
 The pass rule is the same as `blink test`: build with `--debug`, then run
 the binary. A file with `test` blocks and a `fn main(` runs with `--test`.

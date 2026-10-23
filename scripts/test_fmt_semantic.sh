@@ -17,7 +17,7 @@ trap 'rm -rf "$WORK"' EXIT
 fail=0
 
 R="$WORK/root"
-mkdir -p "$R/scripts" "$R/tests" "$R/.tmp" "$R/lib/std" "$R/fake"
+mkdir -p "$R/scripts" "$R/tests" "$R/lib/std" "$R/fake"
 cp scripts/run_fmt_semantic.sh scripts/run_fmt_idempotent.sh "$R/scripts/"
 
 # The fake formatter turns SELFTEST_FMT_BREAKS_RUN into SELFTEST_FAILS and adds

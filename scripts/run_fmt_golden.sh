@@ -5,7 +5,7 @@ blinkc="$2"
 name=$(basename "$input" .bl | sed 's/^input_//')
 expected="tests/fmt/expected_${name}.bl"
 [ ! -f "$expected" ] && exit 0
-actual=$(mktemp .tmp/fmt-golden-XXXXXX)
+actual=$(mktemp "${TMPDIR:-/tmp}/fmt-golden-XXXXXX")
 if ! "$blinkc" "$input" "$actual" --emit blink 2>/dev/null; then
   rm -f "$actual"
   echo "FAIL (format) golden_${name}"

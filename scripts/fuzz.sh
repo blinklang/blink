@@ -9,14 +9,15 @@ IGNORE_TIMEOUTS=0
 if [ "${5:-}" = "--ignore-timeouts" ]; then
     IGNORE_TIMEOUTS=1
 fi
-CRASH_DIR=".tmp/fuzz_crashes"
+# Each run keeps its crash inputs in its own dir, so two runs never overwrite
+# each other's crash_N.bl. The dir is removed when the run finds no crash.
+CRASH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/blink-fuzz-XXXXXX")
 
 # A seed must name one run: every input comes from $RANDOM, the mutation corpus is
 # listed in one fixed order, and each run writes its own input file.
 export LC_ALL=C
-mkdir -p "$CRASH_DIR"
-INPUT_FILE=$(mktemp .tmp/fuzz_input_XXXXXX.bl)
-trap 'rm -f "$INPUT_FILE"' EXIT
+INPUT_FILE=$(mktemp "$CRASH_DIR/fuzz_input_XXXXXX.bl")
+trap 'rm -f "$INPUT_FILE"; rmdir "$CRASH_DIR" 2>/dev/null || true' EXIT
 
 # --- Input generators ---
 

@@ -18,13 +18,17 @@
 #
 # Why a sandbox per file: tests reach the compiler through the RELATIVE
 # names `build/blink` and `build/blinkc` (src/compile_test_helpers.bl), and
-# many write scratch files under `.tmp/`. Each file therefore runs with its
-# own working directory that carries symlinks to the real `tests/`, `src/`,
-# `lib/` and `blink.toml`, a private `.tmp/`, and a private `build/` whose
-# `blink`/`blinkc` point at the compiler under test. A private `build/` also
-# means a private object cache, so concurrent files cannot poison each
-# other's cache entries. BLINK_ROOT is never exported: `blink` finds its
-# archive from realpath(argv[0]).
+# the compiler writes the objects of a native dependency under `.tmp`. Each
+# file therefore runs with its own working directory that carries symlinks to
+# the real `tests/`, `src/`, `lib/` and `blink.toml`, a private `.tmp`, and a
+# private `build/` whose `blink`/`blinkc` point at the compiler under test. A
+# private `build/` also means a private object cache, so concurrent files
+# cannot poison each other's cache entries. BLINK_ROOT is never exported:
+# `blink` finds its archive from realpath(argv[0]).
+#
+# A test's own scratch files go under $TMPDIR (compile_test_helpers.scratch_root).
+# Each file gets a TMPDIR of its own, removed when the file's row ends, so the
+# sweep leaves nothing behind and two files never share a scratch directory.
 #
 # Pass rule (same as `blink test` directory mode): build with --debug, then
 # run the binary; a file with test blocks and a `fn main(` runs with --test.
@@ -101,6 +105,11 @@ exec 9> "$root/build/corpus/locks/$base.lock"
 flock 9
 rm -rf "$work"
 mkdir -p "$work/build" "$work/.tmp"
+# Short, outside the sandbox: a daemon test puts a socket under its scratch dir, and a
+# socket path has a length limit the sandbox path would exceed.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-corpus-XXXXXX") || exit 2
+trap 'rm -rf "$scratch"' EXIT
+export TMPDIR="$scratch"
 # corpus.sh builds each vendored native object once per sweep. The build skips
 # its own compile when the object is no older than the source, so -p keeps the
 # mtime; a link instead of a copy saves writing the object into every sandbox.

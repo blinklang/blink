@@ -11,10 +11,10 @@ src_dir=$(dirname "$f")
 # The formatted copy ends in the original file name, so a test that matches its
 # own file name in a panic location or diagnostic still matches.
 fmt_src=$(mktemp --suffix="_$name.bl" "$src_dir/fmt-sem-XXXXXX")
-fmt_c=$(mktemp .tmp/fmt-sem-XXXXXX.c)
-fmt_bin=$(mktemp .tmp/fmt-sem-XXXXXX)
-orig_c=$(mktemp .tmp/fmt-sem-XXXXXX.c)
-orig_bin=$(mktemp .tmp/fmt-sem-XXXXXX)
+fmt_c=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX.c")
+fmt_bin=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX")
+orig_c=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX.c")
+orig_bin=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX")
 cleanup() { rm -f "$fmt_src" "$fmt_c" "$fmt_bin" "$orig_c" "$orig_bin"; }
 # A file the formatter cannot format is a formatter bug; only the skip list
 # may excuse it.
@@ -82,7 +82,7 @@ fi
 # numbers, which formatting changes by design. A file with no test blocks
 # keeps its whole stdout.
 #
-# The binary sits in .tmp/, which has no lib/ beside it, so a test that
+# The binary sits in the scratch dir, which has no lib/ beside it, so a test that
 # compiles a program in process finds the prelude through BLINK_ROOT. A file
 # with both test blocks and a main runs its tests, as in the corpus.
 run_args=""

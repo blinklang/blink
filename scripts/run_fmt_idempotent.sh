@@ -5,8 +5,8 @@ blinkc="$2"
 skip_file="$3"
 name=$(basename "$f" .bl)
 [ -f "$skip_file" ] && grep -qw "$name" "$skip_file" && { echo "SKIP idem_${name}"; exit 0; }
-fmt1=$(mktemp .tmp/fmt-idem1-XXXXXX)
-fmt2=$(mktemp .tmp/fmt-idem2-XXXXXX)
+fmt1=$(mktemp "${TMPDIR:-/tmp}/fmt-idem1-XXXXXX")
+fmt2=$(mktemp "${TMPDIR:-/tmp}/fmt-idem2-XXXXXX")
 # A formatter abort on either pass is a formatter bug; only the skip list may
 # excuse it.
 if ! "$blinkc" "$f" "$fmt1" --emit blink 2>/dev/null; then
