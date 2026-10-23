@@ -1,12 +1,75 @@
 // Two test names differing only in a punctuation character must mangle to
-// distinct C symbols and both must run and report independently.
+// distinct C symbols and both must run and report independently. Each build path
+// that emits the test table is checked: the archive-linked one-unit compile, the CLI's
+// default per-module build, and the CLI's one-unit build.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
 
 import compile_test_helpers.{compile_and_run_test_json}
 
-test.failing(
-    "test names differing only by an operator character compile and both run",
-    reason: "the test-name mangler maps every non-identifier byte to one underscore, so two names that differ only in punctuation get one C function and cc reports a redefinition",
-) {
+// Names that differ only in bytes a C identifier cannot hold, a name spelled the way the
+// old mangle wrote its neighbour, and names spelled the way an escape could look.
+fn colliding_names() -> List[Str] {
+    [
+        "Bool + Bool is rejected",
+        "Bool - Bool is rejected",
+        "Bool__Bool_is_rejected",
+        "a.b",
+        "a,b",
+        "x / y",
+        "x % y",
+        "a b",
+        "a_b",
+        "a  b",
+        "a_20b",
+        "a 20b",
+        "a_5Fb",
+        "a__2B_b",
+        "a + b",
+        "café",
+        "caf",
+    ]
+}
+
+fn fixture_src() -> Str {
+    let mut lines: List[Str] = []
+    for n in colliding_names() {
+        lines.push("test \"{n}\" \{ assert(1 == 1) }")
+    }
+    lines.join("\n").concat("\n")
+}
+
+fn passed_row(name: Str) -> Str {
+    "\"name\":\"{name}\",\"status\":\"passed\""
+}
+
+fn assert_all_passed(out: Str, d: Str) {
+    for n in colliding_names() {
+        assert(out.contains(passed_row(n)), "no passed row for {n}:\n{d}")
+    }
+    assert(out.contains("\"passed\":{colliding_names().len()}"), d)
+    assert(out.contains("\"failed\":0"), d)
+}
+
+type Cli { out: Str, exit: Int }
+
+fn run_cli(tag: Str, flags: List[Str]) -> Cli {
+    let name = "punct_names_{tag}_{getpid()}"
+    let scratch = ".tmp/_test_punct_names_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/{name}.bl"
+    write_file(fixture, fixture_src())
+    let mut args = ["test"]
+    for f in flags { args.push(f) }
+    args.push(fixture)
+    let r = process_run("build/blink", args)
+    shell_exec("rm -rf {scratch}")
+    Cli { out: r.out.concat(r.err_out), exit: r.exit_code }
+}
+
+test "test names differing only by an operator character compile and both run" {
     let src = "test \"Bool + Bool is rejected\" \{ assert(1 == 1) }\ntest \"Bool - Bool is rejected\" \{ assert(1 == 1) }\n"
     let r = compile_and_run_test_json(src, "_punctuation_only_name_diff")
     assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
@@ -14,4 +77,31 @@ test.failing(
     assert(r.out.contains("\"name\":\"Bool - Bool is rejected\",\"status\":\"passed\""))
     assert(r.out.contains("\"passed\":2"))
     assert(r.out.contains("\"failed\":0"))
+}
+
+test "names that collided under the old mangle all run in one archive-linked unit" {
+    let r = compile_and_run_test_json(fixture_src(), "_punctuation_only_name_diff_all")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_all_passed(r.out, r.out)
+}
+
+test "names that collided under the old mangle all run in the default per-module build" {
+    let r = run_cli("pm", ["--json"])
+    assert(r.exit == 0, "exit={r.exit}:\n{r.out}")
+    assert_all_passed(r.out, r.out)
+}
+
+test "names that collided under the old mangle all run in the one-unit CLI build" {
+    let r = run_cli("one", ["--json", "--no-per-module"])
+    assert(r.exit == 0, "exit={r.exit}:\n{r.out}")
+    assert_all_passed(r.out, r.out)
+}
+
+test "a filter on one of the names runs that test alone" {
+    let r = run_cli("filter", ["--json", "--filter", "Bool - Bool"])
+    assert(r.exit == 0, "exit={r.exit}:\n{r.out}")
+    assert(r.out.contains(passed_row("Bool - Bool is rejected")), r.out)
+    assert(!r.out.contains("Bool + Bool"), r.out)
+    assert(!r.out.contains("Bool__Bool"), r.out)
+    assert(r.out.contains("\"total\":1"), r.out)
 }

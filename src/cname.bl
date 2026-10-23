@@ -19,7 +19,7 @@ import typecheck.{
     TAGPOS_INNER, TAGPOS_SYMBOL, TAGPOS_SYMBOL_INNER, TAGPOS_TOP, TyKind, TypePoolEntry, tc_resolve, int_lit_decimal,
     tc_resolve_transparent_alias_name, tc_tid_decl_node, DECL_NODE_AMBIGUOUS, ty_param_list, ty_pool,
     tc_tid_handler_effect, tc_handler_effect_root, is_user_effect_handle_name,
-    sanitize_test_name, tc_enum_has_payload, tc_impl_conv_source, tc_impl_trait_id, tc_impl_method_stem,
+    tc_enum_has_payload, tc_impl_conv_source, tc_impl_trait_id, tc_impl_method_stem,
     tc_impl_conv_stem, tc_impl_recv_spelling, tc_is_shadowable_type_name, tc_sym_escape, tc_tid_kind,
 }
 import parser.{
@@ -147,16 +147,44 @@ pub fn c_global_name(let_node: Int) -> Str {
 // so a name under `blink_test__` can collide with none of them. A test named `run` would
 // otherwise redefine the runner the table is handed to.
 //
-// Distinct per test is the one this cannot promise. The sanitizer drops the bytes a C
-// identifier cannot hold, so two test names that differ only in those bytes arrive here
-// the same and the unit defines one symbol twice. The spec makes a duplicate test name a
-// compile error; until that check exists, nothing upstream of this rules the pair out.
-//
-// The sanitizer is typecheck's, not a second copy. Typecheck already turns the test's
-// string into the name it reports the body under, and a body reported under one spelling
-// and emitted under another is two answers to one question.
+// Distinct per test comes from c_test_name_segment, which no two names share. Two blocks
+// of one name still share a symbol; the spec makes that pair a compile error of its own.
 pub fn c_test_fn_name(tb: Int) -> Str {
-    "blink_test__{sanitize_test_name(node_str_val(tb))}"
+    "blink_test__{c_test_name_segment(node_str_val(tb))}"
+}
+
+// A test's name as identifier bytes, spelled so the name can be read back from it: a letter
+// or digit is itself, and any other byte is `_` and its two upper-case hex digits. A space,
+// the common case, is a bare `_` unless an upper-case hex digit follows it, where a bare `_`
+// would read as the start of an escape. So `_` before two upper-case hex digits is always
+// an escape and any other `_` is a space, and two names that differ in any byte differ here.
+// A map that drops or merges bytes cannot do this: "a+b" and "a-b" become one symbol and
+// the unit defines it twice.
+//
+// Typecheck's sanitize_test_name is a different answer on purpose: it names the body in a
+// message, where it is read, and nothing compares two of them.
+fn c_test_name_segment(name: Str) -> Str {
+    let hex = "0123456789ABCDEF"
+    let mut sb = StringBuilder.with_capacity(name.byte_len() + 8)
+    let mut i = 0
+    while i < name.byte_len() {
+        let ch = name.byte_at(i).to_int()
+        if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
+            sb.write(name.byte_slice(i, i + 1))
+        } else if ch == 32 && !(i + 1 < name.byte_len() && is_upper_hex_digit(name.byte_at(i + 1).to_int())) {
+            sb.write("_")
+        } else {
+            sb.write("_")
+            sb.write(hex.byte_slice(ch / 16, ch / 16 + 1))
+            sb.write(hex.byte_slice(ch % 16, ch % 16 + 1))
+        }
+        i = i + 1
+    }
+    sb.to_str()
+}
+
+fn is_upper_hex_digit(ch: Int) -> Bool {
+    (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 70)
 }
 
 // The identifier-safe stem of a function: what a mono instance name embeds. The module
