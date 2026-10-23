@@ -1,0 +1,181 @@
+// `blink test --json` writes a document any JSON parser accepts, whatever bytes a
+// user's strings hold (spec §8.10). A test name, a tag, an assertion's text and message,
+// the expected and actual values, a panic message, a skip reason, an expected-failure
+// reason and a file path each reach the report as a JSON string, so each one escapes
+// `"`, `\` and every byte below 0x20. Each row parses the report with std.json and reads
+// the user's string back unchanged.
+//
+// Fixture basenames must be unique per worker: `build/blink test` writes the compiled
+// child binary to `build/<basename>`.
+
+import std.json.{json_clear, json_parse, json_get, json_at, json_len, json_as_str}
+
+// Every user string in the fixture carries these: a quote, a backslash, a newline, a tab
+// and a backspace, which has no short escape in JSON.
+fn nasty() -> Str { "q\"b\\n\nt\tc\b." }
+
+// The same, as the fixture's source spells it inside a string literal.
+fn nasty_src() -> Str { #"q\"b\\n\nt\tc\b."# }
+
+fn fixture_lines() -> List[Str] {
+    let n = nasty_src()
+    [
+        "@tags(\"{n}\")",
+        "test \"pass {n}\" \{ assert(true) }",
+        "test \"fail {n}\" \{",
+        "    let s = \"{n}\"",
+        "    assert(s == \"x\", \"msg {n}\")",
+        "}",
+        "test \"eq {n}\" \{ assert_eq(\"{n}\", \"y\") }",
+        "test \"panic {n}\" \{ panic(\"boom {n}\") }",
+        "test \"skip {n}\" \{ skip(\"why {n}\") }",
+        "test.failing(\"xfail {n}\", reason: \"because {n}\") \{ assert(false) }",
+        "",
+    ]
+}
+
+type Run { out: Str, exit: Int }
+
+fn run_json(tag: Str, dir_mode: Bool) -> Run {
+    let scratch = ".tmp/_test_json_escapes_{getpid()}_{tag}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let fixture = "{scratch}/json_esc_{tag}_{getpid()}.bl"
+    write_file(fixture, fixture_lines().join("\n"))
+    let target = if dir_mode { scratch } else { fixture }
+    let r = process_run("build/blink", ["test", "--json", target])
+    shell_exec("rm -rf {scratch}")
+    Run { out: r.out, exit: r.exit_code }
+}
+
+// A JSON document holds no raw byte below 0x20 inside a string; outside one, only
+// whitespace. The runner writes no whitespace but newlines between rows, so any other
+// control byte, or a newline inside a string, means a string carried it raw. std.json
+// accepts a raw newline inside a string, so the parse alone would not catch one.
+fn assert_no_raw_control(out: Str) {
+    let mut in_str = false
+    let mut i = 0
+    while i < out.byte_len() {
+        let b = out.byte_at(i).to_int()
+        assert(b >= 32 || (b == 10 && !in_str), "raw byte {b} at {i}:\n{out}")
+        if in_str && b == 92 {
+            i = i + 2
+            continue
+        }
+        if b == 34 { in_str = !in_str }
+        i = i + 1
+    }
+}
+
+// An unescaped `"` inside a string ends that string early, so the byte after the close is
+// the user's text instead of `,`, `:`, `]` or `}`. Checking that here keeps a bad report
+// from reaching std.json, whose parser can loop forever on a bad token in an array.
+fn assert_strings_close_cleanly(out: Str) {
+    let mut in_str = false
+    let mut i = 0
+    while i < out.byte_len() {
+        let b = out.byte_at(i).to_int()
+        if in_str && b == 92 {
+            i = i + 2
+            continue
+        }
+        if b == 34 {
+            if in_str {
+                let next = if i + 1 < out.byte_len() { out.byte_at(i + 1).to_int() } else { 0 }
+                assert(next == 44 || next == 58 || next == 93 || next == 125, "a string closes before byte {next} at {i}:\n{out}")
+            }
+            in_str = !in_str
+        }
+        i = i + 1
+    }
+    assert(!in_str, "the report ends inside a string:\n{out}")
+}
+
+fn parse_report(out: Str) -> Int {
+    assert_no_raw_control(out)
+    assert_strings_close_cleanly(out)
+    json_clear()
+    let root = json_parse(out)
+    assert(root >= 0, "the report is not JSON:\n{out}")
+    root
+}
+
+// The record whose name is `name`, or -1.
+fn record_named(results: Int, name: Str) -> Int {
+    let mut i = 0
+    while i < json_len(results) {
+        let rec = json_at(results, i)
+        if json_as_str(json_get(rec, "name")) == name { return rec }
+        i = i + 1
+    }
+    -1
+}
+
+fn str_field(rec: Int, key: Str) -> Str {
+    let v = json_get(rec, key)
+    if v < 0 { return "<no {key}>" }
+    json_as_str(v)
+}
+
+fn check_results(results: Int, out: Str) {
+    let n = nasty()
+    assert(results >= 0, "no results array:\n{out}")
+    let pass = record_named(results, "pass {n}")
+    assert(pass >= 0, "no record for the passing test:\n{out}")
+    let tags = json_get(pass, "tags")
+    assert(json_len(tags) == 1, out)
+    assert_eq(json_as_str(json_at(tags, 0)), n)
+
+    let fail = record_named(results, "fail {n}")
+    assert(fail >= 0, "no record for the failing test:\n{out}")
+    assert(str_field(fail, "assertion").contains("\"x\""), out)
+    assert(str_field(fail, "user_message") == "msg {n}", out)
+
+    let eq = record_named(results, "eq {n}")
+    assert(eq >= 0, "no record for the assert_eq test:\n{out}")
+    assert(str_field(eq, "message").contains(n), out)
+
+    let p = record_named(results, "panic {n}")
+    assert(p >= 0, "no record for the panicking test:\n{out}")
+    assert(str_field(p, "message").contains("boom {n}"), out)
+
+    let s = record_named(results, "skip {n}")
+    assert(s >= 0, "no record for the skipped test:\n{out}")
+    assert_eq(str_field(s, "reason"), "why {n}")
+
+    let x = record_named(results, "xfail {n}")
+    assert(x >= 0, "no record for the expected failure:\n{out}")
+    assert_eq(str_field(x, "xfail_reason"), "because {n}")
+}
+
+test "a single-file run escapes every user string in its records" {
+    let r = run_json("one", false)
+    assert(r.exit != 0, "the fixture fails, so the run must too:\n{r.out}")
+    let root = parse_report(r.out)
+    check_results(json_get(root, "results"), r.out)
+}
+
+test "a directory run escapes every user string in its records" {
+    let r = run_json("dir", true)
+    assert(r.exit != 0, "the fixture fails, so the run must too:\n{r.out}")
+    let root = parse_report(r.out)
+    let files = json_get(root, "files")
+    assert(json_len(files) == 1, r.out)
+    // A directory run nests each file's own report under its `results`.
+    check_results(json_get(json_get(json_at(files, 0), "results"), "results"), r.out)
+}
+
+test "a directory run escapes the file path of each record" {
+    let scratch = ".tmp/_test_json_escapes_{getpid()}_path"
+    let dir = "{scratch}/q\"b\\s"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p '{dir}'")
+    let fixture = "{dir}/json_esc_path_{getpid()}.bl"
+    write_file(fixture, "test \"ok\" \{ assert(true) }\n")
+    let r = process_run("build/blink", ["test", "--json", scratch])
+    shell_exec("rm -rf {scratch}")
+    let root = parse_report(r.out)
+    let files = json_get(root, "files")
+    assert(json_len(files) == 1, r.out)
+    assert_eq(str_field(json_at(files, 0), "file"), fixture)
+}
