@@ -428,6 +428,43 @@ check_pool_write lib-qualified lib/std/pool_user.bl 'fn drop_one() { let _ = par
 check_pool_write parser-column-push src/parser.bl 'fn scratch() { columns.child_slots.push(0) }'
 check_pool_write parser-column-set src/parser.bl 'fn scratch() { columns.child_at.set(0, 1) }'
 check_pool_write parser-column-slot src/parser.bl 'fn scratch() { columns.kinds[0] = 3 }'
+
+# repo_tmp_in_tests_and_scripts is an absolute zero gate: a `.tmp/` scratch path
+# added to a test or a script must fail on that row, and a `.tmp/` inside a tree
+# the file made itself (the compiler's own, under test) must not.
+check_repo_tmp() {
+  label="$1"; file="$2"; extra="$3"; want="$4"
+  d="$WORK/repotmp_$label"
+  rm -rf "$d"
+  cp -r "$BASE" "$d"
+  mkdir -p "$d/$(dirname "$file")"
+  printf '%s\n' "$extra" >> "$d/$file"
+  out=$(RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+  rc=$?
+  hit=0
+  printf '%s\n' "$out" | rg -q '^repo_tmp_in_tests_and_scripts .*NONZERO' && hit=1
+  if [ "$want" = fail ] && [ "$rc" = 0 ]; then
+    echo "FAIL repo_tmp-$label: a .tmp/ scratch path did not fail ratchet.sh"
+    fail=1
+  elif [ "$want" = fail ] && [ "$hit" = 0 ]; then
+    echo "FAIL repo_tmp-$label: the run failed, but not on repo_tmp_in_tests_and_scripts"
+    printf '%s\n' "$out"
+    fail=1
+  elif [ "$want" = pass ] && [ "$hit" = 1 ]; then
+    echo "FAIL repo_tmp-$label: a .tmp/ inside a private tree was counted"
+    printf '%s\n' "$out"
+    fail=1
+  else
+    echo "PASS repo_tmp-$label"
+  fi
+}
+
+check_repo_tmp test-bare tests/test_scratch_user.bl 'let p = ".tmp/probe/x.bl"' fail
+check_repo_tmp test-var-prefixed tests/test_scratch_user.bl 'let p = "{dir}/.tmp/probe.bl"' fail
+check_repo_tmp script-mktemp scripts/some_gate.sh 'f=$(mktemp .tmp/gate-XXXXXX)' fail
+check_repo_tmp test-private-tree tests/test_scratch_user.bl 'shell_exec("mkdir -p {tree}/.tmp")
+write_file("{tree}/.tmp/x.o", "")' pass
+check_repo_tmp script-private-tree scripts/some_gate.sh 'mkdir -p "$work/.tmp/"' pass
 check_pool_write parser-column-field src/parser.bl 'fn scratch() { columns.child_slots = [] }'
 check_pool_write parser-column-whole src/parser.bl 'fn scratch() { columns = NodeColumns { kinds: [], child_at: [], child_slots: [] } }'
 

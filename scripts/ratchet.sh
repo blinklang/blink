@@ -100,6 +100,19 @@
 #                            cannot read as a clean 0, and so does a missing
 #                            spec file. A root with no typecheck.bl counts 0
 #
+#   repo_tmp_in_tests_and_scripts
+#                            a `.tmp/` path in a tests/*.bl or scripts/*.sh file;
+#                            absolute zero gate. Scratch files go in a dir of their
+#                            own under TMPDIR, so two runs at once never share
+#                            one (compile_test_helpers.scratch_root() in a test,
+#                            `mktemp -d` in a script). A path under a private
+#                            tree (`{tree}/.tmp/`, `{root}/.tmp/`, `$work/.tmp/`)
+#                            is not counted: it is the compiler's own `.tmp`
+#                            inside a tree the test or script made. This script
+#                            and its self-test are not scanned, because they name
+#                            the pattern. Counted in the live tree only: a
+#                            historical ref is materialized with src/ alone
+#
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
 # lint over the rewrite's files, and fails if that fails. RATCHET_NO_LINT=1
 # skips it (the self-test uses this; the lint has its own proofs).
@@ -126,7 +139,7 @@
 #   RATCHET_BASELINE  baseline file path. Default: scripts/ratchet_baseline.txt
 #   RATCHET_HEAD1_DIR root dir standing in for the previous-commit snapshot,
 #                     bypassing git entirely. Default: unset (materialize
-#                     RATCHET_HEAD1_REF via git into .tmp/ratchet_head1).
+#                     RATCHET_HEAD1_REF via git into a temp dir).
 #   RATCHET_HEAD1_REF git ref to materialize when RATCHET_HEAD1_DIR is unset.
 #   RATCHET_BASE_REF  the ref the branch walk starts from. Default: main. The
 #                     walk is skipped when RATCHET_HEAD1_DIR is set.
@@ -231,6 +244,18 @@ len_in_byte_args() {
     rg -o '\.len\(\)' | wc -l | tr -d ' '
 }
 
+# A `.tmp/` path that is not inside a tree the test or script made itself. The
+# lookbehinds name the private-tree prefixes; the compiler writes its own
+# `.tmp/` inside such a tree, and that is the behavior under test there.
+repo_tmp_uses() {
+  dirs=""
+  [ -d "$1/tests" ] && dirs="$dirs $1/tests"
+  [ -d "$1/scripts" ] && dirs="$dirs $1/scripts"
+  [ -n "$dirs" ] || { echo 0; return; }
+  rg -o -P -g '*.bl' -g '*.sh' -g '!ratchet.sh' -g '!test_ratchet.sh' \
+    '(?<!\{tree\}/)(?<!\{root\}/)(?<!\$work/)\.tmp/' $dirs 2>/dev/null | wc -l | tr -d ' '
+}
+
 SPEC_TYPES=sections/07_trust_modules_metadata.md
 
 # First-column names of the closed table, one per line, without backticks or `[...]`.
@@ -308,6 +333,7 @@ node_pool_writes $(pool_writes "$root")
 str_substring_callers $(( $(cnt '\.(substring|substr)\(' "$allbl") + $(lib_substr "$root") ))
 str_len_in_byte_args $(len_in_byte_args "$root")
 primitive_type_names_outside_spec $(primitive_names_outside_spec "$root")
+repo_tmp_in_tests_and_scripts $(repo_tmp_uses "$root")
 ROWS
 }
 
@@ -377,7 +403,7 @@ if [ -n "${RATCHET_HEAD1_DIR:-}" ]; then
   check_root "$head1_root"
   rows_head1=$(compute_rows "$head1_root")
 elif git rev-parse --verify --quiet "${head1_ref}^{commit}" >/dev/null 2>&1; then
-  head1_root=.tmp/ratchet_head1
+  head1_root=$(mktemp -d)
   materialize_ref "$head1_ref" "$head1_root"
   rows_head1=$(compute_rows "$head1_root")
   # A row added by the commit under test has no previous-commit count:
@@ -391,7 +417,7 @@ else
 fi
 
 failmark=$(mktemp)
-trap 'rm -f "$failmark"' EXIT
+trap 'rm -f "$failmark"; [ -n "${head1_root:-}" ] && [ -z "${RATCHET_HEAD1_DIR:-}" ] && rm -rf "$head1_root"' EXIT
 
 printf '%-26s %8s %8s %8s\n' metric baseline 'head~1' now
 printf '%s\n' "$rows_now" | while read -r name now; do
@@ -411,7 +437,7 @@ printf '%s\n' "$rows_now" | while read -r name now; do
   # Absolute zero gates: an id means nothing to another reader or to training
   # data, and a swallowed decline is a wrong answer waiting to be found.
   case "$name" in
-    br_ids_in_source|br_ids_in_test_comments|layout_decline_unhandled|node_pool_writes|str_substring_callers|str_len_in_byte_args|primitive_type_names_outside_spec)
+    br_ids_in_source|br_ids_in_test_comments|layout_decline_unhandled|node_pool_writes|str_substring_callers|str_len_in_byte_args|primitive_type_names_outside_spec|repo_tmp_in_tests_and_scripts)
       [ "$now" -gt 0 ] && mark="$mark NONZERO(must-be-zero)" ;;
   esac
   printf '%-26s %8s %8s %8s%s\n' "$name" "$base" "$h1" "$now" "$mark"
