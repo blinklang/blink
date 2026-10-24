@@ -62,7 +62,7 @@ fn malloc(size: Int) -> Ptr[Int] ! FFI
 | `.to_str()` | Str | Convert to string (for char*) |
 | `.as_cstr()` | Str | Read as C string |
 | `.offset(i)` | Ptr[T] | Advance by `i * sizeof(T)` strides. Only valid for pointers from `scope.alloc_n[T](n)`; rejected (`E0813`) on a singleton `scope.alloc()`, and `E0838` when the stride is unknown |
-| `.field.read()` / `.field.write(v)` | T / () | Typed field access for `Ptr[@ffi.struct T]` — lowered to direct C field reads/writes |
+| `.field.read()` / `.field.write(v)` | T / () | Typed field access for `Ptr[@ffi.struct T]` — lowered to direct C field reads/writes. A path may run through embedded structs (`p.a.b.read()`); it stops at a `Ptr` field (`h.q.read().b.write(v)`). A path with no `read()`/`write(v)` at its end is `E0850 BareFieldAddress` |
 
 ### ffi.scope() Resource Management
 
@@ -370,7 +370,7 @@ test "addition works" {
 - **A statement that drops the result of `append`, `slice`, `reverse`, `sort`, `sort_by` (List) or `union` (Set) warns `W0606 DiscardedCollectionCopy`:** they return a new value and do not mutate.
 - **A list literal of two spreads and nothing else warns `W0709 BareSpreadConcat`:** write `a.append(b)`; `blink fix` does it. A literal with a plain element, with three sources, or with a source that is a list literal (`[..a, ..[2, 3]]`) does not warn.
 - **A write through a name that is not `mut` is `E0610`.** This covers `=`, `op=` and a mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` or on a pattern binder. Use `let mut x`, or `mut` before the binder: `Some(mut ys) => ys.push(1)`.
-- **A field behind a `Ptr` is not a place.** `p.f = v` and `p.f += v` for `p: Ptr[S]` are `E0611 NotAPlace`, whatever the root is. Write `p.f.write(v)`, or `p.f.write(p.f.read() + v)`, which is a read and then a write, not one atomic step.
+- **A field behind a `Ptr` is not a place.** `p.f = v` and `p.f += v` for `p: Ptr[S]` are `E0611 NotAPlace`, whatever the root is. Write `p.f.write(v)` (same path at any depth, `p.a.b.write(v)`; `h.q.read().b.write(v)` when the path goes through a `Ptr` field), or `p.f.write(p.f.read() + v)`, which is a read and then a write, not one atomic step.
 - **A parameter is never assigned.** `c.at = 5` or `self.n += 1` on a parameter is `E0612 ParamAssign`, with or without `mut`: the write changes only this function's copy. Copy it to a `let mut` name, or return a new value. In this release E0612 is a warning; it becomes an error in a later one.
 - **`mut` goes before a name, not before a pattern.** `let mut (x, y) = pair` and `for mut (k, v) in pairs` are `E0613 MutOnPattern`; write `let (mut x, mut y) = pair`. `blink fix` makes this edit.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`** (`E0005 InconsistentPatternBindings`). `Click(mut x, y) | Touch(x, y)` is an error; write `mut x` in both.

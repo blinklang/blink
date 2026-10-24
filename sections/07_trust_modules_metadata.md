@@ -936,7 +936,7 @@ The compiler gives each value that can carry a pointer a **scope tag**: the `ffi
 | `libc.copy_to_buf(b)` | the innermost `ffi.scope` block around the call |
 | `s.take(p)` | unscoped |
 | `alloc_ptr[T]()`, `null_ptr[T]()` | unscoped |
-| `p.offset(i)`; `p.deref()` or `p.field.read()` that gives a pointer-bearing value | the tag of `p` |
+| `p.offset(i)`; `p.deref()` or `p.field.read()`, at any embedded depth, that gives a pointer-bearing value | the tag of `p` |
 | A struct literal, tuple, `Some(v)`, `Ok(v)` or `Err(v)` | the innermost tag of its parts; unscoped if none has a tag |
 | A closure literal | the innermost tag of the values it captures; unscoped if none has a tag |
 | A pointer-bearing parameter of a closure literal (e.g. the `p` in `bs.with_ptr(fn(p) { ... })`) | a fresh tag whose block is the closure body: it encloses every scope block the body opens, and every tag live around the literal encloses it |
@@ -944,7 +944,7 @@ The compiler gives each value that can carry a pointer a **scope tag**: the `ffi
 
 A **cell** is a place that holds a value after the expression that puts it there ends. The cell's tag decides what it may hold:
 
-- the pointee of a `Ptr` (including a field reached through `p.field`): the tag of the `Ptr`;
+- the pointee of a `Ptr` (including a field reached through `p.field`, at any embedded depth): the tag of the `Ptr`;
 - a `let mut` binding: the innermost `ffi.scope` block around its declaration, or unscoped;
 - a `List`, `Map` or `Set` value: the innermost `ffi.scope` block around the expression that creates it, or unscoped;
 - an effect handler: the innermost `ffi.scope` block around the `with` that installs it, or unscoped.
@@ -953,7 +953,7 @@ A **cell** is a place that holds a value after the expression that puts it there
 
 **`E0601 (tag-mismatch)`.** A value with tag `v` stored into a cell with tag `c` is an error unless `v` encloses `c`. There are exactly four ways to store a value into a cell:
 
-1. **Write.** `c.write(v)` or `c.field.write(v)`, which stores into the pointee; or an assignment `place = v` or `place op= v` to a place (§2.22 *Assignment places*). The cell of an assignment is the place's root `let mut` binding. A store into `x.f.g` or `x.0` is a store into `x`.
+1. **Write.** `c.write(v)` or `c.field.write(v)`, at any embedded depth, which stores into the pointee; or an assignment `place = v` or `place op= v` to a place (§2.22 *Assignment places*). The cell of an assignment is the place's root `let mut` binding. A store into `x.f.g` or `x.0` is a store into `x`.
 2. **Capture.** A closure that captures a value with tag `s` follows the escape rules of a closure that captures a `Closeable` bound by block `s` (§2, *Closures and Scoped Resources*; §5.5): it may not be returned from block `s` or stored in a cell that `s` does not enclose.
 3. **Effect argument.** Passing a tagged value as an argument to an effect operation stores it into the handler that receives it. A handler installed inside block `s` may receive a value with tag `s`; a handler installed outside `s` may not.
 4. **Call beside a pointer-holding argument.** At a call, a tagged value passed next to an argument whose declared parameter type is *pointer-holding* counts as stored into that argument. A parameter type is pointer-holding when a callee can store a pointer through it that the caller can reach after the call: `Ptr[P]` for a pointer-bearing `P` (`Ptr[Ptr[T]]`, or `Ptr[S]` for an `@ffi.struct S` with a `Ptr` field at any depth), or a `List`, `Map` or `Set` whose element type is pointer-bearing. `Ptr[U8]`, `Ptr[Void]` and `Ptr[S]` for a struct with no `Ptr` field are not pointer-holding. So `memcpy(dst, src)` with `dst` and `src` from different scopes is legal, and `c_writev(fd, iov, 2)` (one pointer argument) never pairs anything.
@@ -1376,7 +1376,11 @@ A `Bool` field that mirrors a C `int` field fails the layout check; the diagnost
 
 #### Field access on `Ptr[@ffi.struct T]`
 
-`p.field` on a `Ptr[T]` where `T` is `@ffi.struct` desugars to a typed pointer-to-field that supports `.read()` / `.write(v)`:
+A **field address** is a typed pointer to one field of the pointee. Three rules make it and use it:
+
+1. **Root.** For `p: Ptr[T]` where `T` is `@ffi.struct`, `p.field` is a field address.
+2. **Embedded step.** For a field address `a` whose field type is an `@ffi.struct`, `a.field` is a field address. It lies at the sum of the C offsets along the path. A path of embedded fields has any depth: `p.a.b` is one field address.
+3. **Use.** A field address supports `.read()` and `.write(v)`, and nothing else.
 
 ```blink
 with ffi.scope() as scope {
@@ -1390,9 +1394,71 @@ with ffi.scope() as scope {
 }
 ```
 
-Rule: `p.field.read()` reads the C field at its C offset; `p.field.write(v)` writes it. The layout check described below verifies that the offsets of the declaration match the C ABI.
+Rule: `p.field.read()` reads the C field at its C offset; `p.field.write(v)` writes it. For a path, `.read()` and `.write(v)` use the offset of the last field in `T`. A path of any depth is one address and one access, with no copy of an embedded struct. The layout check described below verifies that the offsets of the declaration match the C ABI.
 
-`p.field` outside a `read()`/`write()` call is rejected. There is no first-class "pointer to field" value. `p.field = v` and `p.field op= v` are `error[NotAPlace]` (E0611), with a fix that calls `write` (§2.22 *Writes that are not to a place*).
+A field address has no name in the source and is not a value. There is no first-class "pointer to field" value, so a field address cannot be bound, passed or returned. A field address outside a `read()`/`write()` call is rejected at every depth (`p.field`, `p.a` and `p.a.b` alike), with `error[BareFieldAddress]`.
+
+A field whose type is an `@ffi.struct` has a field address of its own: `p.a.read()` copies the whole embedded struct, and `p.a.write(Inner { b: 7, c: 8 })` stores it. A field named `read` or `write` is a path step when no call parentheses follow: `p.a.read()` calls `read` on the field address `p.a`, and `p.a.read.read()` reads the field `read` of `a`.
+
+```blink
+@ffi.struct(header: "geo.h", name: "inner")
+pub type Inner { b: Int, c: Int }
+
+@ffi.struct(header: "geo.h", name: "outer")
+pub type Outer { a: Inner, n: Int }
+
+with ffi.scope() as scope {
+    let p: Ptr[Outer] = scope.alloc[Outer]()
+    p.a.b.write(5)                       // one store at offsetof(a) + offsetof(b)
+    p.a.write(Inner { b: 7, c: 8 })      // the whole embedded struct
+    let whole: Inner = p.a.read()
+    io.println("{p.a.b.read()} {whole.c}")
+}
+```
+
+**A path stops at a `Ptr` field.** A `Ptr` field holds a pointer value. To go on from it, the program loads that value first. So for `h: Ptr[Holder]` where `q` is a `Ptr[Inner]` field of `Holder`, `h.q` is a field address of type `Ptr[Inner]`, and `h.q.b` is not a step. Load the pointer with `.read()`, then start a new path from the result.
+
+A `Ptr` value at the root of a path is not a step through a `Ptr` field. For a value `s: Holder`, `s.q` is a `Ptr[Inner]` value, and `s.q.b.write(9)` is legal.
+
+```blink
+@ffi.struct(header: "geo.h", name: "holder")
+pub type Holder { q: Ptr[Inner], n: Int }
+
+with ffi.scope() as scope {
+    let i: Ptr[Inner] = scope.alloc[Inner]()
+    let h: Ptr[Holder] = scope.alloc[Holder]()
+    h.q.write(i)
+    h.q.read().b.write(9)      // load `q`, then store `b`
+    // h.q.b.write(9)          // error[BareFieldAddress]
+
+    let s: Holder = h.deref()
+    s.q.b.write(9)             // `s.q` is a `Ptr` value: it is the root of the path
+}
+```
+
+```
+error[BareFieldAddress]: a field address is not a value
+ --> geo.bl:9:13
+  |
+9 |     let x = p.a.b
+  |             ^^^^^ field address of `Int`
+  |
+  = note: a field address takes only `.read()` and `.write(v)`
+  = help: `p.a.b.read()`
+```
+
+```
+error[BareFieldAddress]: `.b` goes through the pointer in `q`
+ --> link.bl:9:5
+  |
+9 |     h.q.b.write(9)
+  |     ^^^ `h.q` is a field address of type `Ptr[Inner]`
+  |
+  = note: a path does not continue through a `Ptr` field
+  = help: load the pointer first: `h.q.read().b.write(9)`
+```
+
+`p.field = v` and `p.field op= v`, at any depth, are `error[NotAPlace]` (E0611), with a fix that calls `write` on the same path (§2.22 *Writes that are not to a place*).
 
 #### Array allocation: `scope.alloc_n[T](n)`
 

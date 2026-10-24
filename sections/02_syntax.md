@@ -3177,7 +3177,7 @@ fn main() {
 
 #### Assignment places
 
-A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. Each step of a field path names a struct field (`s.f`) or a tuple field (`t.0`), so a path such as `s.f.0` has no sub-expressions that have effects or can fail. No step goes through a `Ptr`: for `p: Ptr[S]`, `p.f = v` is not an assignment to a place, and the help names `p.f.write(v)` (§9.1.3, *Writes that are not to a place* below). `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost. Storage the compiler shares between values is never a place. A feature that adds places must keep that rule (§3.6.1 *Clone Semantics*). A store to a place is rule 1 of E0601 (§9.1.1 *Scope tags*).
+A place is a `let mut` binding, or a field path `s.f.g` whose root is a `let mut` binding. Each step of a field path names a struct field (`s.f`) or a tuple field (`t.0`), so a path such as `s.f.0` has no sub-expressions that have effects or can fail. No step goes through a `Ptr`: for `p: Ptr[S]`, `p.f = v` is not an assignment to a place, and the help calls `write` on the same path (§9.1.3, *Writes that are not to a place* below). `place = rhs` evaluates `rhs`, then reads the root binding, then stores. So a write that `rhs` makes to the same binding, through a closure, is not lost. Storage the compiler shares between values is never a place. A feature that adds places must keep that rule (§3.6.1 *Clone Semantics*). A store to a place is rule 1 of E0601 (§9.1.1 *Scope tags*).
 
 ```blink
 type Stats {
@@ -3229,7 +3229,15 @@ The left side of `=` or `op=` must be a place. When it is not, the compiler chec
 
 When two cases apply, the first one in the list wins. For `mk().p.f = v` case 1 wins, and the help is `mk().p.f.write(v)`. For `fn f(p: Ptr[S]) { p.f = 1 }` case 1 wins over case 3. A `Ptr` write is legal through a plain `let`, a parameter or a temporary (§3.6 *What `mut self` covers*), so "add `mut`" or "copy it to a new name" would not fix the line.
 
-**A write through a `Ptr`.** The fix calls `write` on the same path (§9.1.3 *Field access on `Ptr[@ffi.struct T]`*). `place = rhs` runs `rhs` and then reads the root, but a method call reads its receiver before its arguments (*What each form evaluates*). So `p.f.write(rhs)` reads `p` before `rhs` runs, and when `rhs` changes `p` through a closure, the two forms store to different memory. The fix keeps the order of `place = rhs`:
+**A write through a `Ptr`.** The fix calls `write` on the same path (§9.1.3 *Field access on `Ptr[@ffi.struct T]`*), at any depth of embedded fields: `p.a.b = v` gets `p.a.b.write(v)`. One case changes the path. When the path steps through a `Ptr` field of a field address, a field address cannot go on through that field, so the fix loads the pointer with `.read()` after that field: `h.q.b = v` gets `h.q.read().b.write(v)`. A `Ptr` value at the root of the path is not such a field, so `s.p.f = v` for a value `s` still gets `s.p.f.write(v)`.
+
+```blink
+p.a.b = v      // fix: p.a.b.write(v)
+h.q.b = v      // fix: h.q.read().b.write(v)   (`q` is a `Ptr` field of `h: Ptr[Holder]`)
+s.p.f = v      // fix: s.p.f.write(v)          (`s` is a value; `s.p` is a `Ptr` value)
+```
+
+`place = rhs` runs `rhs` and then reads the root, but a method call reads its receiver before its arguments (*What each form evaluates*). So `p.f.write(rhs)` reads `p` before `rhs` runs, and when `rhs` changes `p` through a closure, the two forms store to different memory. The fix keeps the order of `place = rhs`:
 
 - **`rhs` is inert:** a literal, a name, or a field path of names (`cfg.limit`). It has no operator, call or other sub-expression, so it cannot run code. The machine-applicable fix writes `p.f.write(rhs)`.
 - **Any other `rhs`, when the assignment is a statement in a block:** the machine-applicable fix binds `rhs` to a new name on the line before, and then writes the name: `let v = rhs` and `p.f.write(v)`. The name is one that is not in scope at that line.
