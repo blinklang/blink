@@ -3267,6 +3267,49 @@ op_sig       ::= "fn" IDENT "(" params? ")" ( "->" type )?
 
 `op_sig` is a function signature with no body; `params` and `type` are as in a `fn` declaration (§2). A `child_effect` has no `effect_body`, which is the two-level limit of rule 2. A `child_effect` with empty braces is the same as a bare `child_effect` (rule 4).
 
+**An effect and an operation take no type parameters.** In v1 the name of an effect and the name of an operation, primitive or derived, have no `[...]` after them, as the grammar above shows. A `[...]` in either place is `EffectOpTypeParams` (E0558). The compiler reads the `[...]`, reports one error at it, and goes on, so the user does not see a parse error.
+
+```blink
+effect Store {
+    effect Put {
+        fn put[T](x: T) -> T   // error: an operation takes no type parameters
+    }
+}
+
+effect Cell[T] {               // error: an effect takes no type parameters
+    fn set(x: T)
+}
+```
+
+```
+error[EffectOpTypeParams]: effect operation `Store.Put.put` declares type parameters
+ --> store.bl:3:15
+  |
+3 |         fn put[T](x: T) -> T
+  |               ^^^ type parameters are not allowed in v1
+  |
+  = note: a handler provides each operation of an effect with one fixed signature
+  = help: declare the operation with concrete types (an instantiated type such as `List[Str]` is concrete), and write a generic function that calls it: `fn put_any[T: Display](x: T) -> Str ! Store.Put { store.put(x.display()) }`
+```
+
+`effect Cell[T]` is the same error and the same note. Its headline is "effect `Cell` declares type parameters", and its span is the `[T]` after the name. A bound on the parameter, as in `fn put[T: Display](x: T)`, is refused in the same way.
+
+The repair keeps the operation concrete and puts the generic code in a function, as the standard library does for `io.println` (§4.4):
+
+```blink
+effect Store {
+    effect Put {
+        fn put(x: Str) -> Str
+    }
+}
+
+fn put_any[T: Display](x: T) -> Str ! Store.Put {
+    store.put(x.display())
+}
+```
+
+A derived operation body may call a generic function, and an operation may use an instantiated type in its signature, such as `List[Str]` or `Option[Str]`. Only the operation's own parameter list is closed. A later version may allow type parameters on an operation. This rule is separate from the deferral of effect-kinded generic parameters (§4.7.1 *Generic handler parameters*).
+
 **A row names effects, not operations.** `! Store.get` and `! Clock.now_ms` name no effect, so each is `UnknownEffect` (E0538, §4.3). When the name before the dot is a leaf effect, the diagnostic adds a note that lists the leaf's operations and a help line that names the whole effect. Only the error is normative; the note and help text below are guidance for tools:
 
 ```
