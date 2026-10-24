@@ -4119,7 +4119,7 @@ The exhaustiveness checker handles:
 - **`Never` payloads** — a variant whose payload type is `Never` still needs an arm. The checker does not remove the arm because no value can reach it. The arm body may be the payload itself, which has type `Never` and fits any expected type. §3.2 shows the `Err(e) => e` form.
 - **Unreachable arms** — an arm, or one OR-alternative, that earlier unguarded arms already cover is `UnreachableArm` (W0710), a warning. The check never reports a live arm. It may miss a dead one. It reports at least the shapes listed in *Unreachable arms* below. It never reports an arm for a variant whose payload type is `Never`.
 
-**An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error, one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above, or a `NoSuchField` (E0525) or `DuplicateField` (E0316) error in a struct pattern or a variant brace pattern (*Struct patterns* above). `PatternMissingRest` (E0319) alone does not make a bad arm: the checker treats the pattern as if it had `..`. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
+**An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error, an `EnumPatternNeedsEnumScrutinee` (E0308) error (a variant name on a type that is not an enum, in any form), one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above, or a `NoSuchField` (E0525) or `DuplicateField` (E0316) error in a struct pattern or a variant brace pattern (*Struct patterns* above). `PatternMissingRest` (E0319) alone does not make a bad arm: the checker treats the pattern as if it had `..`. This list governs. The next sentence is a guide for a new pattern error, not a second rule. An error is a bad-arm error when the user cannot repair it without changing which values the arm matches. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
 
 - When a match has an unguarded bad arm, the compiler reports no `NonExhaustiveMatch` (E0004) for that match. The missing coverage is probably the variant that the bad arm tried to name.
 - A guarded bad arm does not turn off E0004. A guarded arm never adds coverage, so an E0004 next to it stays true after the user corrects the name.
@@ -4138,6 +4138,18 @@ fn get_pos(x: Option[Int]) -> Int {
         Somee(v) if v > 0 => v   // error[NoSuchVariant]
         None => 0
     }                            // error[NonExhaustiveMatch]: missing `Some`
+}
+
+fn pick(n: Int) -> Int {
+    match n {
+        Some(y) => y       // error[EnumPatternNeedsEnumScrutinee]; no E0004
+    }
+}
+
+fn pick_guarded[T](x: T) -> Int {
+    match x {
+        None if true => 0        // error[EnumPatternNeedsEnumScrutinee]
+    }                            // error[NonExhaustiveMatch]
 }
 ```
 
