@@ -855,7 +855,7 @@ The head `(Trait for Type)` uses the same words in the same order as the header 
 The rules:
 
 - **A trait instance on the left, a type on the right.** A generic trait takes its full instance, so `(From[U8] for Widget)` and `(From[Char] for Widget)` select different impls. Inside a generic function the type may be a type parameter, under its own name: `(Alpha for T).make()` needs the bound `T: Alpha`.
-- **Only a callee head.** `(Trait for Type)` is valid only directly before `.method(`. It is not a type and not a value: `let m = (Alpha for Widget)` and `(Alpha for Widget).make` without a call are errors.
+- **Only a callee head.** `(Trait for Type)` is valid only directly before `.method(`. It is not a type and not a value: `let m = (Alpha for Widget)` and `(Alpha for Widget).make` without a call are errors. The help for the second names the repair, a closure that makes the call: `fn(n) { (Alpha for Widget).make(n) }`.
 - **The type must implement the trait.** If it does not, the call is `TraitBoundNotSatisfied` (E0306), reported at the head.
 - **The method must belong to the trait.** A method that the trait does not declare is a compile error, the same as `Trait.method(x)` with a method the trait does not have.
 - **A method's own type parameters** follow §3.4 *Explicit Type Application*, as for any callee.
@@ -903,6 +903,8 @@ error[AmbiguousMethodCall]: ambiguous method call
    |   (Alpha for Widget).make()
    |   (Beta for Widget).make()
 ```
+
+When the reference has no call, as in `xs.map(Widget.make)`, the help gives one closure per owner instead, because `(Alpha for Widget).make` with no call is not a value: `fn(n) { (Alpha for Widget).make(n) }`. The closure has the parameters of the associated function and calls the impl-qualified function with them (§3.4 *A type-scoped or associated function named as a value*).
 
 In a generic body the help prints the type parameter under its own name (`(Alpha for T).make()`). For a generic trait it prints the full instance as the bound spells it (`(From[U8] for Widget).from(b)`). A rename of one method is also a fix, and `blink explain E0522` gives it; the help lines give only the calls.
 

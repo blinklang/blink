@@ -3041,6 +3041,79 @@ error[TypeError]: variant `Shape.Circle` has named fields and is not a function 
 
 *Rationale.* `Some` and `fn(x) { Some(x) }` are the same term, so the rationale above applies word for word: a rule that refused `xs.map(Some)` would refuse one spelling of an identical program. A brace payload has no call form, so no one closure is equal to it. A variant with no payload is a value, not a function: `Color.Red` and `fn() { Color.Red }` are different terms.
 
+**A type-scoped or associated function named as a value.** `T.name`, written with no argument list, is a function value when `name` is a function in the `T.` namespace (§2.12.3). It may stand wherever a function value is expected, as a generic function's name may. The rule covers four forms: a type-scoped function (`Duration.ms`), a type-scoped function on a generic type (`Stack.empty`), an associated function that a trait impl gives `T` (`W.make`, `Int.default`), and an associated function reached through a type parameter (`T.from`). Method syntax does not reach it (§2.12.3).
+
+The type is the declaration's type, `fn(P1, ..., Pn) -> R`. A trait associated function reads `Self` as the head type: `W.make` is `fn(Int) -> W`. Through a type parameter `T`, the name `T` is the parameter itself, not a binder: `T.from` in a function with the bound `T: From[U8]` is `fn(U8) -> T`, and nothing is left to solve. The binders of a function are its own list after the name (§2.12.3 *Functions on a generic type declare their own binders*) and no other: `fn Stack.empty[T]()` has the binder `T`, and the type head gives none. The rule above solves them. The expected type fixes them, and a reference whose binders nothing fixes is `error[CannotInferType]` (E0301) at the reference. The note names the reference and the binder. Brackets with no call, as in `Stack.empty[Int]`, are `error[TypeArgsWithoutCall]` (E0314).
+
+```blink
+type Stack[T] {
+    items: List[T]
+}
+
+pub fn Stack.empty[T]() -> Stack[T] {
+    Stack { items: [] }
+}
+
+pub fn Stack.one[T](x: T) -> Stack[T] {
+    Stack { items: [x] }
+}
+
+trait Make {
+    fn make(n: Int) -> Self
+}
+
+type W {
+    v: Int
+}
+
+impl Make for W {
+    fn make(n: Int) -> W { W { v: n } }
+}
+
+fn widen_all[T: From[U8]](bs: List[U8]) -> List[T] {
+    bs.map(T.from)                                 // OK -- fn(U8) -> T; T is the parameter, so nothing is left to solve
+}
+
+fn main() {
+    let f = Duration.ms                            // OK -- fn(Int) -> Duration; it has no binders, so it needs no expected type
+    let ds = [1, 2].map(Duration.ms)               // OK -- List[Duration]
+    let ss = [1, 2].map(Stack.one)                 // OK -- fn(Int) -> Stack[Int]; map's parameter fixes T = Int
+    let e: fn() -> Stack[Int] = Stack.empty        // OK -- the annotation fixes T = Int
+    let g: fn(Int) -> W = W.make                   // OK -- Self is W
+    let h: fn() -> Int = Int.default               // OK -- Self is Int
+}
+```
+
+A reference whose binders nothing fixes, and a bracket list with no call, are errors. The first is E0301 at the reference, and its help names an annotation that fixes the binder:
+
+```blink
+fn main() {
+    let e = Stack.empty                  // error[CannotInferType] -- intentional-error example
+                                         //   `T` of `Stack.empty` is unbound at this reference and nothing supplies it
+                                         // help: annotate the binding:
+                                         //   `let e: fn() -> Stack[Int] = Stack.empty`
+    let b = Stack.empty[Int]             // error[TypeArgsWithoutCall] -- intentional-error example
+}
+```
+
+**A name that two impls give.** When two trait impls give `T` the same name, a bare `T.name` is `error[AmbiguousMethodCall]` (E0522) at the reference, as the call is. `(Trait for T).name` with no call is not a value (§3c.4 *Impl-Qualified Calls*), so the help does not print it. The help prints a closure that calls the impl-qualified function: `fn(n) { (Alpha for Widget).make(n) }`.
+
+**The call and the value.** `T.name` and `T.name(...)` are different terms. `let s: Stack[Int] = Stack.empty` is `error[TypeError]` (E0300), a type mismatch: a function value is not a `Stack[Int]`. The help says to call it: `Stack.empty()`.
+
+```blink
+fn main() {
+    let s: Stack[Int] = Stack.empty      // error[TypeError]: a type mismatch -- intentional-error example
+                                         // help: call it: `Stack.empty()`
+    let w = [1, 2].map(Widget.make)      // error[AmbiguousMethodCall] -- intentional-error example
+                                         //   `make` is in `Alpha` and `Beta` for `Widget`
+                                         // help: write a closure that names one impl:
+                                         //   `fn(n) { (Alpha for Widget).make(n) }`
+                                         //   `fn(n) { (Beta for Widget).make(n) }`
+}
+```
+
+*Rationale.* `Duration.ms` and `fn(n) { Duration.ms(n) }` are the same term, so the rationale above applies word for word: a rule that refused `xs.map(Duration.ms)` would refuse one spelling of an identical program, and the repair it prescribed would be a closure. No new rule is needed: the §3.4 rule that types a top-level function's name types `T.name`.
+
 **Where the error is reported.** `error[CannotInferType]` (E0301) is reported **where its repair attaches**. For an under-determined *binding* that is the `let` (§3.4 *Under-Determined Types*). For a type parameter with no source it is the call's type-argument position, because that is where the brackets go — including when the call stands alone as a statement and there is no binding to annotate:
 
 ```blink

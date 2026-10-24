@@ -1351,7 +1351,7 @@ let b = Stack.empty[Str]()
 
 **Constants.** `const T.NAME = <expr>` follows every rule of a plain `const` (§2.21). The right side must be a const expression. A type annotation is optional, with the same rule as a plain `const`. `T.NAME` is a const reference, so it is legal in every place that requires a const expression, such as a keyword default.
 
-**Functions.** `fn T.name(params) -> R` is an ordinary function that has no receiver. A `self` parameter is a compile error: a method belongs to a trait (§3c.4 *No Inherent Methods*). Method syntax `x.name()` never reaches a type-scoped function. Only `T.name(...)` calls it.
+**Functions.** `fn T.name(params) -> R` is an ordinary function that has no receiver. A `self` parameter is a compile error: a method belongs to a trait (§3c.4 *No Inherent Methods*). Method syntax `x.name()` never reaches a type-scoped function. Only `T.name(...)` calls it. `T.name` with no argument list is a function value (§3.4 *A type-scoped or associated function named as a value*).
 
 **Function names.** The name after `T.` in `fn T.name` must not start with an uppercase letter (Unicode `Lu` or `Lt`). An uppercase name after `T.` names a variant or a constant, never a function (§3.4 *Member case*), so a function with such a name could never be called. The declaration is `error[UppercaseTypeScopedFn]` (E0556). The message says why, and the help gives the lowercase name:
 
