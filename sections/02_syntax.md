@@ -3281,7 +3281,7 @@ The formatter never reorders arguments, struct-literal fields or list elements, 
 The left side of `=` or `op=` must be a place. When it is not, the compiler checks four cases in this order and reports only the first that applies. So the help is always the last fix the line needs:
 
 1. **A step goes through a `Ptr`.** `error[NotAPlace]` (E0611). The `Ptr` can be the root (`p.f = v` for `p: Ptr[S]`) or a field in the middle of the path (`s.p.f = v` for `s.p: Ptr[S]`). The root kind does not matter: a `let`, a `let mut` and a parameter all give E0611.
-2. **The root is a temporary**, such as a call result: `mk().x = 5`. `error[NotAPlace]` (E0611). No name reaches the value, so the store is lost.
+2. **The root is a temporary**, such as a call result: `mk().x = 5`. `error[NotAPlace]` (E0611). No name reaches the value, so the store is lost. To find the root, strip the parentheses and the field steps from the left side. If what is left is not a `let mut` name, it is a temporary. Sometimes no field step is left, and the whole left side is the temporary: `mk() = c`, `1 = 2`, `a + b = 3`, `(a, b) = (b, a)`. A tuple literal and a struct literal are temporaries too, so `(a, 2).0 = 5` and `C { x: 1 }.x = 5` are case 2. A name in parentheses is still that name: `(a) = 3` and `(a).x = 1` are places.
 3. **The root is a parameter**, `self` included. `error[ParamAssign]` (E0612, §3.6 *Mutable Parameters*).
 4. **The root is an immutable binding.** `error[MutationRequiresMut]` (E0610, §3.2.2 *Construction and Mutability*).
 
@@ -3338,6 +3338,64 @@ error[NotAPlace]: cannot assign to a temporary value
   = help: bind it first: `let mut c = mk()`, then `c.x = 5`
 ```
 
+A path that starts in a literal gets the same help: `(a, 2).0 = 5` gets "bind it first: `let mut t = (a, 2)`, then `t.0 = 5`", and `C { x: 1 }.x = 5` gets the same with `C { x: 1 }`.
+
+**A whole left side that is a temporary.** When no field step is left, the "bind it first" help does not fit. After `let mut t = mk()`, the line `t = c` stores into `t`, not into the call result. So the error has no help and no fix. The label is the same as for a path from a temporary, and the caret covers the whole left side, not an inner token. A `note` states the rule, in the word this section uses for it. It is a `note` and not a `help`, because no action exists that the line needs:
+
+```
+error[NotAPlace]: cannot assign to a temporary value
+ --> cfg.bl:5:5
+  |
+5 |     mk() = c
+  |     ^^^^ no name holds this value, so the store is lost
+  |
+  = note: a place is a `let mut` name, or a field path from one
+```
+
+Every other form gets this text, with the caret under all of the left side: a literal (`1 = 2`), an operator result (`a + b = 3`), a block, a cast, a unary operation, a method call, a closure and `x?`. The spec lists no form, because the root rule decides each one.
+
+**A tuple on the left.** Blink has no destructuring assignment. A tuple expression of two or more elements on the left of `=` has the same message, label and rule note as any other whole left side. It adds a second `note`. It adds a `help` only when every element is a place, because the swap that the help shows is wrong advice for `(a, 2) = (b, 3)`. The help is text and is never a fix:
+
+```
+error[NotAPlace]: cannot assign to a temporary value
+ --> swap.bl:6:5
+  |
+6 |     (a, b) = (b, a)
+  |     ^^^^^^ no name holds this value, so the store is lost
+  |
+  = note: a place is a `let mut` name, or a field path from one
+  = note: Blink has no destructuring assignment
+  = help: to swap, use a temporary: `let t = a`, then `a = b`, then `b = t`
+```
+
+For `(a, 2) = (b, 3)` the output is the same, with no `help` line. A destructuring `let` is a different form (§2.2): `let (a, b) = (b, a)` declares two new names that shadow `a` and `b`, and swaps nothing.
+
+**`op=` on a temporary.** A place error stops the check of the left side. So `mk() += 1` reports E0611 only. The operator is not type-checked, and the line gets no second error such as `arithmetic + requires numeric operand`.
+
+```blink
+type C {
+    x: Int
+}
+
+fn mk() -> C {
+    C { x: 1 }
+}
+
+fn main() {
+    let mut a = 1
+    let mut b = 2
+    let c = mk()
+    mk() = c             // error[NotAPlace]: no help
+    1 = 2                // error[NotAPlace]: no help
+    a + b = 3            // error[NotAPlace]: the caret covers `a + b`
+    mk() += 1            // error[NotAPlace], and no other error
+    (a, b) = (b, a)      // error[NotAPlace]: tuple note and swap help
+    (a, 2) = (b, 3)      // error[NotAPlace]: tuple note, no swap help
+    (a, 2).0 = 5         // error[NotAPlace]: bind it first
+    (a) = 3              // a place: parentheses add no value
+}
+```
+
 **An immutable root.** `x = v`, `x op= v` and `s.f = v` on a plain `let` root, or on a pattern binder with no `mut` (§3.5 *Mutable Binders*), are E0610, the same error as a mutating method call on that root. The fix depends on how the root is declared (§3.2.2). An assignment inside a closure to a captured binding gets the same error. A label marks the capture, and the fix goes at the `let`:
 
 ```
@@ -3356,6 +3414,8 @@ error[MutationRequiresMut]: cannot assign to `total`, which is not `mut`
 **Rollout.** The rule of §8.16.1 *Rollout of a new error* applies. NotAPlace (E0611) and E0610 on an assignment are errors from the first release that has them: none of these programs had a meaning under this section. The same holds for E0610 on a pattern binder and for MutOnPattern (E0613, §3.5). ParamAssign (E0612) ships first as a warning (§3.6 *Mutable Parameters*).
 
 **Panel vote: 6-0** on each point: E0610 for an immutable root, NotAPlace for a `Ptr` step and a temporary root, a code for ParamAssign, the order of the four cases, the `Ptr` fix rules, help only for a module-level `let`, and errors at once. The `Ptr` fix rules passed 6-0 in a second round. See [decisions/assignment-place-diagnostics.md](../decisions/assignment-place-diagnostics.md).
+
+**Panel vote, whole left side: 6-0** on the rule note and on the label (6-0 after a second round), 5-1 on the tuple note and swap help (Minimalism dissents), and 3-3 on the text of the tuple note, where the BDFL broke the tie. All six agreed on the rest: one code, no fix, the caret over the whole left side, the root rule, and no second error for `op=`. See [decisions/whole-target-temporary.md](../decisions/whole-target-temporary.md).
 
 ### 2.23 Reserved Words
 
