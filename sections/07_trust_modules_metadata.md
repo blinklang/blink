@@ -2403,6 +2403,32 @@ libs/pg/
 
 A source file with no enclosing `blink.toml` is not part of any package. Bare external imports from such a file are a compile error (E1010); only stdlib imports (`std.*`) and absolute file paths from the compiler driver are allowed.
 
+**Root package.** The *root package* is the package of the nearest `blink.toml` above the file that the tool starts from. `blink check`, `blink build`, `blink test` and the language server each start from one file, so each has one root package, and they all find the same one. The term does not name a workspace root: Blink has no workspaces. The root package owns its `src/`, `tests/`, `examples/` and `bench/`. A path, git or std dependency is not part of the root package, and how the build reaches a package does not change this (§8.9.1).
+
+A help that edits a declaration is offered only for a declaration in the root package. For a type in any other package, that help is absent and no other line takes its place. §2.14 names the helps that this rule gates (E0315, E0525).
+
+```blink
+// app/blink.toml: geo = { path = "../geo" }
+import geo.{Point}
+
+type Local { a: Int, b: Int }
+
+fn main() {
+    let p = Point { x: 1, z: 2 }
+    let q = Local { a: 1, c: 2 }
+}
+```
+
+```
+error[NoSuchField]: `Point` has no field `z`
+  help: did you mean `y`?
+error[NoSuchField]: `Local` has no field `c`
+  help: did you mean `b`?
+  help: or add the field to `Local`
+```
+
+`Local` is in the root package, so it gets both helps. `Point` is in `geo`, so it gets the rename help only. Running the tool from the `geo/` directory makes `geo` the root package, and then `Point` gets both helps.
+
 **`@module` on the entry file.** The entry file's `@module(...)` argument, if present, must equal `[package].name`. If they disagree, the compiler rejects with `error[E1008]`. The annotation may be omitted on the entry file — its meaning is implied by location — but conforming style is to declare it explicitly for parity with non-entry files.
 
 **Failure mode.** When the entry file is missing, the compiler reports a single path:

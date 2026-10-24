@@ -1496,7 +1496,7 @@ error[DuplicateField]: field `x` is given twice
 - `NoSuchField`: the candidates are the declared fields that the literal does not already label. The nearest-name rule of the Error Catalog (*Conventions*) picks at most one. With a suggestion, the `help:` line names it, and the rename is machine-applicable. Without one, the `help:` line lists the declared fields and marks those the literal already gives.
 - `MissingField`: the `help:` line says to add each missing field with a value. It has no machine-applicable fix: a tool cannot choose the value, and an inserted `todo()` would turn a `blink check` error into a panic each time the literal runs.
 - `DuplicateField`: the `help:` line says to remove one of the two. It has no machine-applicable fix, because each field expression is evaluated, and the tool cannot choose which to keep.
-- A second repair that edits the declaration — "or add the field to `T`" on `NoSuchField`, "or give `y` a default in `T`" on a struct's `MissingField` — is offered only when `T` is declared in the package being compiled (§3.1 rule 1).
+- A second repair that edits the declaration — "or add the field to `T`" on `NoSuchField`, "or give `y` a default in `T`" on a struct's `MissingField` — is offered only when `T` is declared in the root package (§10.5 *Project root discovery*; §3.1 rule 1). For a `T` in a dependency, only the first repair shows.
 
 **Convergence (§3.1 rule 3).** When the unique suggestion for an unknown label is a missing field, that field leaves the `MissingField` list. If the list is then empty, `MissingField` does not fire. The typo `Point { x: 1.0, yy: 2.0 }` thus gives one `NoSuchField` with the help `y`, and the one rename clears it.
 
