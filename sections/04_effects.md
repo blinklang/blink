@@ -2123,7 +2123,7 @@ A clause whose arity, a parameter type, result type, `*,` marker or keyword name
 - Rename a clause to the suggested operation (E0549), when the clause already matches the header of that operation and no other clause names it.
 - Add a missing parameter, when its name does not occur free in the clause body and the place of the parameter is clear. A use in a closure counts, and so does a use of an outer name that the new parameter would hide. The place is not clear when the clause could miss more than one parameter: `fn two(a: Int)` for `two(a: Int, b: Int)`. A keyword parameter goes after `*,` at its place in the operation.
 
-All other fixes are suggestions. A rewrite of the header that changes a parameter type or the result type is not machine-applicable, because the body was written for the old types. The `help:` prints the header, and a code action that the user picks can offer it. E0550 has no machine-applicable fix.
+All other fixes have `applicability` `suggestion`. A rewrite of the header that changes a parameter type or the result type is a suggestion, because the body was written for the old types. The `help:` prints the header, and a code action that the user picks can offer it. E0550 has no machine-applicable fix.
 
 #### Handler composition
 

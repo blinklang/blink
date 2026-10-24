@@ -79,7 +79,7 @@ The test: if you can delete a token and the program's meaning doesn't change, th
 
 For an AI, the error message *is* the learning signal. The quality of diagnostics determines how many round-trips it takes to reach correct code. Blink diagnostics are not messages for humans to interpret -- they are structured correction instructions that an AI can apply mechanically.
 
-Every diagnostic includes: the error category, the precise source location, a human-readable explanation, and -- critically -- a machine-applicable fix: the exact edit that resolves the problem. An error like `{kind: "missing_effect", fix: {line: 5, insert: " ! IO"}}` lets the AI self-correct in one round-trip instead of reasoning about what to change. When multiple fixes are possible, the diagnostic enumerates them with confidence scores.
+Every diagnostic includes: the error category, the precise source location, a human-readable explanation, and -- critically -- a machine-applicable fix: the exact edit that resolves the problem. An error like `{kind: "missing_effect", fixes: [{line: 5, insert: " ! IO"}]}` lets the AI self-correct in one round-trip instead of reasoning about what to change. When multiple fixes are possible, the diagnostic lists them in order, preferred first, and marks which are machine-applicable.
 
 This is not a tooling convenience layered on top -- it is a language design constraint. Syntax and semantics are chosen so that errors are *unambiguously correctable*. A grammar that produces parse errors with three possible resolutions is worse than one that produces errors with exactly one resolution, even if the grammar is slightly more verbose. Blink optimizes for diagnostic clarity the same way other languages optimize for runtime performance.
 

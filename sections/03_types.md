@@ -3770,8 +3770,8 @@ The compiler checks the labels of a struct pattern and of a variant brace patter
 1. **A label twice** is `DuplicateField` (E0316). The error is at the second label, with a `note:` at the first.
 2. **A label that the type or variant does not declare** is `NoSuchField` (E0525). The candidates for the nearest-name suggestion (Error Catalog, *Conventions*) are the declared fields that the pattern does not already label. With one suggestion, the rename is machine-applicable. With none, the help lists the declared fields and marks those the pattern already labels. For a punned label, as in `Point { x, yy }`, the fix writes `y: yy`. The binder and the arm body stay as they are, so the fix cannot change which name a use in the arm refers to. The help never says "or add the field to `T`" for a pattern label.
 3. **Fields left out with no `..`** is `PatternMissingRest` (E0319). One error for each pattern, at the type or variant name. It lists each missing field and its type, in declaration order. A field that is the one suggestion for an unknown label in the same pattern is not missing. If the list is then empty, the compiler reports nothing. A field default (§2.14) does not count as naming the field: a pattern that leaves out a field with a default still needs `..`. The error gives two fixes, always in this order:
-    1. Add `..`. This fix is machine-applicable and is the preferred fix.
-    2. Write `f: _` for each left-out field `f`. This fix is in structured output, and is never machine-applicable. It keeps the pattern closed: a field that the type gains later is an error again.
+    1. Add `..`. The `applicability` of this fix is `machine-applicable`, and it is the preferred fix.
+    2. Write `f: _` for each left-out field `f`. The `applicability` of this fix is `suggestion`. It keeps the pattern closed: a field that the type gains later is an error again.
 
 `PatternMissingRest` is a different code from `MissingField` (E0315). A literal gives the missing fields values. A pattern only names or skips them.
 
@@ -3804,15 +3804,16 @@ fn get_x(p: Point3) -> Int {
 
 ```
 error[PatternMissingRest]: `Point3` pattern leaves out field `z` (Int) and has no `..`
-  help: add `..`
-  = fix: Point3 { x, y, .. }
-  = fix: Point3 { x, y, z: _ }
+  = help: add `..`:
+          Point3 { x, y, .. }
+  = help: write `z: _` for the left-out field (not machine-applicable):
+          Point3 { x, y, z: _ }
 error[NoSuchField]: `Point3` has no field `yy`
-  help: did you mean `y`?
-  = fix: y: yy
+  = help: rename the label to `y` and keep the binder `yy`:
+          y: yy
 ```
 
-The first `PatternMissingRest` fix is machine-applicable. The second is not.
+The first `PatternMissingRest` fix is machine-applicable. The second is a suggestion, and the terminal marks it (§8.6).
 
 ```blink
 match user {
@@ -5018,7 +5019,7 @@ warning[FloatSelfComparison]: `x != x` is always false for a Float
   | `<`, `>` | `` `x < x` is always false `` (with the operator as written) | this is false for every value | the comparison is always false; remove it or compare with a different value |
 
   The `<` and `>` rows give no NaN reason, because those comparisons are also always false under IEEE 754. The help writes the operand's text in place of `x`.
-- **Suggested fix only.** For `!=`, the replacement is `x.is_nan()`. For `==`, `<=` and `>=`, it is `!x.is_nan()`. `<` and `>` have no replacement. The `help:` line and the JSON diagnostic (§8.6) carry the exact replacement text, and an editor can offer it as a code action that a person selects. The fix is not machine-applicable: it turns a branch that never runs into one that can run, so `blink fix` never applies it.
+- **Suggested fix only.** For `!=`, the replacement is `x.is_nan()`. For `==`, `<=` and `>=`, it is `!x.is_nan()`. `<` and `>` have no replacement. The `help:` line and the JSON diagnostic (§8.6) carry the exact replacement text, and an editor can offer it as a code action that a person selects. The `applicability` of the fix is `suggestion`: it turns a branch that never runs into one that can run, so `blink fix` never applies it.
 - **`blink explain W0707`** gives the results of the six comparisons for a NaN, in Blink and under IEEE 754 (*Differences from IEEE 754*). It names `!(x >= 0.0)` as a NaN guard that the check does not see and that lets NaN through in Blink.
 - **Index operands.** Blink has no index operator today. A change that adds one must decide whether an indexed operand such as `xs[i]` matches.
 

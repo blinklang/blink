@@ -296,7 +296,7 @@ W0610 is a warning by default, and is upgradeable to an error with `W0610 = "err
   = note: `@trusted` does not suppress `ScopedValueWithoutWith`; use `@allow(ScopedValueWithoutWith)`
 ```
 
-The LSP offers the `with` fix first. It offers the `@allow` fix second, and that fix is never machine-applicable (§8.6).
+The diagnostic lists the `with` fix first. It lists the `@allow` fix second, and the `applicability` of that fix is `suggestion` (§8.6).
 
 **W0611 `ScopedValueEnteredTwice`: scoped value that goes into more than one `with`**
 
@@ -327,7 +327,7 @@ When the value is a call result bound to a name, the fix moves the call into eac
   = note: `@trusted` does not suppress `ScopedValueEnteredTwice`; use `@allow(ScopedValueEnteredTwice)`
 ```
 
-As for W0610, the LSP offers the `with` fix first, and the `@allow` fix second. The `@allow` fix is never machine-applicable (§8.6).
+As for W0610, the diagnostic lists the `with` fix first, and the `@allow` fix second. The `applicability` of the `@allow` fix is `suggestion` (§8.6).
 
 **E0601: closeable escapes scope**
 
@@ -564,16 +564,19 @@ All compiler output is structured JSON with error codes, source spans, human-rea
         }
       ],
       "help": "add arm: `Cancelled => <expr>`",
-      "fix": {
-        "description": "Add missing match arm for `Cancelled`",
-        "edits": [
-          {
-            "file": "order.bl",
-            "span": { "start": { "line": 16, "col": 0 }, "end": { "line": 16, "col": 0 } },
-            "insert": "        Cancelled => todo()\n"
-          }
-        ]
-      },
+      "fixes": [
+        {
+          "description": "Add missing match arm for `Cancelled`",
+          "applicability": "machine-applicable",
+          "edits": [
+            {
+              "file": "order.bl",
+              "span": { "start": { "line": 16, "col": 0 }, "end": { "line": 16, "col": 0 } },
+              "insert": "        Cancelled => todo()\n"
+            }
+          ]
+        }
+      ],
       "related": [
         {
           "message": "`Cancelled` variant defined here",
@@ -594,18 +597,18 @@ Every diagnostic includes:
 | `span` | Exact source location -- file, line, column, length. |
 | `message` | Human-readable description of the problem. |
 | `help` | Short suggestion text. |
-| `fix.edits` | Machine-applicable edits. The AI reads this array and applies the insertions/replacements directly. No parsing, no guessing. |
+| `fixes` | The fixes, preferred first. Each has `applicability` and `edits`. The AI applies the `edits` of a `machine-applicable` fix directly. No parsing, no guessing. Absent when the diagnostic has no fix (§8.6). |
 | `related` | Links to the declaration or definition that caused the error. |
 
 The AI workflow:
 
 1. AI generates or modifies code.
 2. AI calls `blink check --format json`.
-3. If diagnostics come back, the AI reads `fix.edits` from each diagnostic.
-4. AI applies the edits.
+3. If diagnostics come back, the AI reads `fixes` from each diagnostic.
+4. AI applies the edits of the first `machine-applicable` fix.
 5. Repeat until zero diagnostics.
 
-This loop is mechanical. The AI does not need to "understand" the error -- it applies the compiler's suggested fix. When the fix is not mechanical (no `fix.edits` provided), the `help` text and `related` spans give the AI enough context to reason about a solution.
+This loop is mechanical. The AI does not need to "understand" the error -- it applies the compiler's suggested fix. When no fix is machine-applicable (`fixes` is absent, or every fix is a `suggestion`), the `help` text and `related` spans give the AI enough context to reason about a solution.
 
 ### 6.6 CLI Commands
 
@@ -615,7 +618,7 @@ This loop is mechanical. The AI does not need to "understand" the error -- it ap
 | `blink build --target arm64` | Cross-compile | `./myapp` for target arch |
 | `blink run` | Compile + execute in one step | Program output |
 | `blink check` | Type-check without codegen | Structured diagnostics (JSON) |
-| `blink check --format json` | Machine-readable type-check | JSON diagnostics with `fix.edits` |
+| `blink check --format json` | Machine-readable type-check | JSON diagnostics with `fixes` |
 | `blink fix <file>` | Apply machine-applicable fixes | One line per applied fix; the rest as `check` prints them |
 | `blink eval <expr>` | Interpret expression | Result + effect/allocation report |
 | `blink verify` | SMT-based contract verification | Proof results per contract |

@@ -1397,8 +1397,9 @@ build/blink update                  # update deps + blink-version in blink.toml
 
 # Output format: --format json prints what --json prints; human is the default.
 # check, build, fmt, run and test take it. --json beside another --format value is an error.
-# A check --json diagnostic can carry "fix" (an edit blink fix applies) and "assist" (an edit
-# a person must finish or choose, such as E0319's `f: _`). Each has action, text and span.
+# A check --json diagnostic can carry "fixes": fixes in order, preferred first. Each has
+# description, applicability ("machine-applicable" or "suggestion") and edits. blink fix applies
+# the first machine-applicable fix of a diagnostic. E0319 lists `..` first, then `f: _` (a suggestion).
 build/blink check src/main.bl --format json
 
 # blink test --json: per test file, {"results": [...], "summary": {...}}.

@@ -973,7 +973,7 @@ error[E1016]: `f` is declared twice in module `main`
   = help: rename one of the two declarations
 ```
 
-The primary span is on the later declaration in source order, and a label marks the first. N declarations of one name give N-1 diagnostics, each one pointing at the first declaration. The fix is a suggestion only, never machine-applicable: the compiler cannot know which declaration to rename. The program does not compile. To check the rest of the module after the error, the compiler binds the name to the first declaration. This is error recovery only; it does not make the first declaration the winner.
+The primary span is on the later declaration in source order, and a label marks the first. N declarations of one name give N-1 diagnostics, each one pointing at the first declaration. The fix has `applicability` `suggestion`: the compiler cannot know which declaration to rename. The program does not compile. To check the rest of the module after the error, the compiler binds the name to the first declaration. This is error recovery only; it does not make the first declaration the winner.
 
 **A value or a type must not take the name of a bare variant.** A variant is not in the value namespace. It lives in the `T.` namespace of its type (§2.12.3). In an expression, a user variant always carries its enum (§3.4 *Variant Construction*), so a value or a type with the name of a user variant does not collide with it: `fn Red()` and the variant `Color.Red` can both exist. The four bare variants `Some`, `None`, `Ok` and `Err` are different. A bare `Ok` names the prelude variant in every module, so E1016 also covers:
 
@@ -1014,7 +1014,7 @@ error[E1016]: `None` collides with variant `Option.None` (prelude)
 
 At an import entry, the help gives an item alias instead, such as `import pal.{None as NoneCode}`.
 
-The primary span is always on the declaration or the import entry, whatever the source order. A prelude variant has no source span, so the message says which prelude type has it. Each declaration with one of these names gives one diagnostic. As above, the fix is a suggestion only.
+The primary span is always on the declaration or the import entry, whatever the source order. A prelude variant has no source span, so the message says which prelude type has it. Each declaration with one of these names gives one diagnostic. As above, the `applicability` of the fix is `suggestion`.
 
 **`pub let` exports immutable bindings.** A module-level `let` (without `mut`) can be marked `pub` to make it importable by other modules. For a compile-time constant, use `const` (see [2.21](#221-const-declarations)). Use `let` for a value that a `const` cannot hold, such as a list or a function literal. Its initializer must be static (below).
 

@@ -258,7 +258,7 @@ The query system replaces the manual "grep, open file, read surrounding context,
 
 ### 8.6 Structured Diagnostics with Machine-Applicable Fixes
 
-Every compiler diagnostic is structured JSON with a stable schema. Errors include machine-applicable fix suggestions that an AI agent can apply directly — no parsing of freeform error messages, no heuristic extraction of fix hints.
+Every compiler diagnostic is structured JSON with a stable schema. Errors include fixes, and each fix says whether it is machine-applicable. An AI agent can apply a machine-applicable fix directly — no parsing of freeform error messages, no heuristic extraction of fix hints.
 
 ```json
 {
@@ -277,15 +277,18 @@ Every compiler diagnostic is structured JSON with a stable schema. Errors includ
     {"span": {"line": 24, "col": 11}, "message": "missing variant `Locked`"}
   ],
   "help": "add arm for `Locked` variant",
-  "fix": {
-    "description": "Add missing match arm",
-    "edits": [
-      {
-        "span": {"file": "src/auth.bl", "line": 27, "col": 0},
-        "insert": "        Locked => Err(AccountLocked)\n"
-      }
-    ]
-  },
+  "fixes": [
+    {
+      "description": "Add missing match arm",
+      "applicability": "machine-applicable",
+      "edits": [
+        {
+          "span": {"file": "src/auth.bl", "line": 27, "col": 0},
+          "insert": "        Locked => Err(AccountLocked)\n"
+        }
+      ]
+    }
+  ],
   "related": [
     {
       "message": "`AuthError` variant `Locked` defined here",
@@ -300,11 +303,68 @@ What this gives the AI:
 - **Error name** (`NonExhaustiveMatch`) — stable identifier, can be mapped to fix strategies. See [ERROR_CATALOG.md](../ERROR_CATALOG.md)
 - **Error code** (`E0004`) — secondary comblink alias
 - **Exact span** — the AI knows precisely which code to modify
-- **Machine-applicable edits** — the `fix.edits` array contains insert/replace/delete operations the AI can apply verbatim
+- **Fixes** — the `fixes` array lists every fix, preferred first. Each fix has `edits`, insert/replace/delete operations the AI can apply verbatim when the fix is `machine-applicable`
 - **Related locations** — where the type/trait/variant was defined, for context
 - **No guesswork** — the AI doesn't interpret an English sentence and hope it understands what the compiler meant
 
-**Applying fixes.** `blink fix` applies the machine-applicable fixes in a set of diagnostics. When two fixes contain the same edit (same span, same text), it applies that edit once. Two different edits whose spans overlap are a conflict: `blink fix` applies neither and reports both diagnostics.
+**The `fixes` array.** A diagnostic that has a fix has one `fixes` array. A diagnostic with no fix has no `fixes` key: the key is absent, never `null` and never `[]`. Each fix has three keys:
+
+- `description`: text for a person.
+- `applicability`: required. Its value is `"machine-applicable"` or `"suggestion"`. There is no other value.
+- `edits`: an array with at least one edit (the shape of the example above).
+
+A repair that has no edit is not a fix. Its text stays in `help`.
+
+The fixes of one diagnostic are alternatives. They are in order, and the first is the preferred fix. The rule of each diagnostic sets its order (for example, E0319 in §3.5 puts `..` first). This section sets no rule that puts machine-applicable fixes before suggestions.
+
+**Applicability.** A `machine-applicable` fix is one that the AI can apply verbatim: its edits resolve the problem with no choice left to a person. A `suggestion` has edits that a person must choose or finish, and `blink fix` never applies it. A consumer applies a fix only when `applicability` equals `"machine-applicable"`. A missing or unknown value is not applicable.
+
+```json
+{
+  "severity": "error",
+  "name": "PatternMissingRest",
+  "code": "E0319",
+  "message": "`Point3` pattern leaves out field `z` (Int) and has no `..`",
+  "span": {"file": "src/point.bl", "line": 5, "col": 9, "end_line": 5, "end_col": 15},
+  "fixes": [
+    {
+      "description": "add `..`",
+      "applicability": "machine-applicable",
+      "edits": [
+        {"span": {"file": "src/point.bl", "line": 5, "col": 22, "end_line": 5, "end_col": 22}, "insert": ", .."}
+      ]
+    },
+    {
+      "description": "write `z: _` for the left-out field",
+      "applicability": "suggestion",
+      "edits": [
+        {"span": {"file": "src/point.bl", "line": 5, "col": 22, "end_line": 5, "end_col": 22}, "insert": ", z: _"}
+      ]
+    }
+  ]
+}
+```
+
+Both fixes of this diagnostic insert at one place. They are alternatives, so a tool applies one of them.
+
+**Applying fixes.** `blink fix` applies the machine-applicable fixes in a set of diagnostics. For each diagnostic, it applies the first machine-applicable fix and skips the other fixes of that diagnostic. When two fixes contain the same edit (same span, same text), it applies that edit once. Two different edits whose spans overlap are a conflict: `blink fix` applies neither and reports both diagnostics.
+
+**In an editor.** The language server offers a machine-applicable fix as a `quickfix` code action and a suggestion as a `refactor.rewrite` code action. It marks a code action as preferred only for `fixes[0]`, and only when that fix is machine-applicable. When `fixes[0]` is a suggestion, no code action of that diagnostic is preferred.
+
+**In the terminal.** The terminal prints every fix of a diagnostic, in order, as a `help:` line. There is no limit on the number of lines. Each line names its edit. A suggestion has `(not machine-applicable)` after its description, as in E0521 (§2.19):
+
+```
+error[PatternMissingRest]: `Point3` pattern leaves out field `z` (Int) and has no `..`
+ --> src/point.bl:5:9
+  |
+5 |         Point3 { x, y } => x
+  |         ^^^^^^
+  |
+  = help: add `..`:
+          Point3 { x, y, .. }
+  = help: write `z: _` for the left-out field (not machine-applicable):
+          Point3 { x, y, z: _ }
+```
 
 The effect on the generate-compile-fix loop is dramatic. In Python, an AI reads a traceback, infers what went wrong, generates a fix hypothesis, applies it, and hopes. In Blink, the compiler tells the AI exactly what's wrong, exactly where, and often exactly how to fix it. The fix loop becomes mechanical rather than inferential.
 
@@ -2227,15 +2287,18 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
     {"span": {"line": 42, "col": 5}, "message": "deprecated since edition 2026, removal in edition 2028"}
   ],
   "help": "use `login_v2` instead",
-  "fix": {
-    "description": "Replace `login` with `login_v2`",
-    "edits": [
-      {
-        "span": {"file": "src/auth.bl", "line": 42, "col": 5, "end_col": 10},
-        "replace": "login_v2"
-      }
-    ]
-  }
+  "fixes": [
+    {
+      "description": "Replace `login` with `login_v2`",
+      "applicability": "machine-applicable",
+      "edits": [
+        {
+          "span": {"file": "src/auth.bl", "line": 42, "col": 5, "end_col": 10},
+          "replace": "login_v2"
+        }
+      ]
+    }
+  ]
 }
 ```
 
