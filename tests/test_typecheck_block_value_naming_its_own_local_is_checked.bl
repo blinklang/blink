@@ -4,7 +4,7 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types}
+import typecheck.{check_types, tc_hints}
 import diagnostics.{diag_entries, diag_reset}
 import compile_test_helpers
 import std.io
@@ -60,7 +60,9 @@ test "a block value added into a U8 is a TypeError, not a run-time overflow" {
 test "an if or match argument whose branch block names its own local is checked" {
     probe("block_own_local_branch_arg", "fn n8(x: U8) -> U8 \{ x }\nfn main() \{\n    let q: U64 = 300\n    let c = true\n    let r = n8(if c \{\n        let h = q\n        h\n    } else \{ 1 })\n    let r2 = n8(match c \{\n        true => \{\n            let h = q\n            h\n        }\n        false => 1\n    })\n    io.println(\"\{r} \{r2}\")\n}\n")
     expect("if and match argument", [
+        "TypeError E0300 5:16: if branches have incompatible types: U64 vs U8",
         "TypeError E0300 5:16: argument 1 of `n8` expects U8, got U64",
+        "TypeError E0300 14:18: match arms have incompatible types: U64 vs U8",
         "TypeError E0300 9:17: argument 1 of `n8` expects U8, got U64",
     ])
 }
@@ -78,4 +80,69 @@ test "branch blocks whose tails name their own locals compare by those tails" {
     expect("agreeing branches", [])
     probe("block_own_local_branch_disagree", "fn q() -> U64 \{ 7 }\nfn main() \{\n    let c = true\n    let a = if c \{\n        let h = q()\n        h + 1\n    } else \{\n        let s = \"x\"\n        s\n    }\n    io.println(\"\{a}\")\n}\n")
     expect("disagreeing branches", ["TypeError E0300 4:13: if branches have incompatible types: U64 vs Str"])
+}
+
+test "a block value nested many levels deep is checked against its consumer" {
+    probe("block_own_local_deep", "fn n8(x: U8) -> U8 \{ x }\nfn main() \{\n    let q: U64 = 300\n    let c = true\n    let d = n8(\{\n        let _a = 1\n        \{ \{ \{ \{ \{ \{ \{ \{ \{ q } } } } } } } } }\n    })\n    let e: U8 = \{\n        let h = q\n        if c \{ if c \{ if c \{ if c \{ h } else \{ h } } else \{ h } } else \{ h } } else \{ h }\n    }\n    io.println(\"\{d} \{e}\")\n}\n")
+    expect("deep nest", [
+        "TypeError E0300 5:16: argument 1 of `n8` expects U8, got U64",
+        "TypeError E0300 9:5: variable `e`: declared type U8 but got U64",
+    ])
+}
+
+test "a block whose tail is a mismatched if reports the if and its consumer" {
+    probe("block_own_local_tail_if_mismatch", "fn n8(x: U8) -> U8 \{ x }\nfn main() \{\n    let c = true\n    let q: U64 = 300\n    let v = n8(\{\n        let _a = 1\n        if c \{ q } else \{ 1 }\n    })\n    io.println(\"\{v}\")\n}\n")
+    expect("tail if mismatch", [
+        "TypeError E0300 7:9: if branches have incompatible types: U64 vs U8",
+        "TypeError E0300 5:16: argument 1 of `n8` expects U8, got U64",
+    ])
+}
+
+test "a block value argument is walked once, so its error is reported once" {
+    probe("block_own_local_walked_once", "fn takes(xs: List[Int]) -> Int \{ xs.len() }\nfn main() \{\n    let mut l = []\n    let n = takes(\{\n        let k = l\n        let z: Str = k\n        k\n    })\n    io.println(\"\{n}\")\n}\n")
+    let mut z_errors = 0
+    for e in errors() {
+        if e.contains("variable `z`") { z_errors = z_errors + 1 }
+    }
+    if z_errors != 1 { io.println("FAIL: walked once: got {z_errors} errors for `z`") }
+    assert(z_errors == 1)
+}
+
+test "a let inside a block value gets one inlay hint" {
+    probe("block_own_local_one_hint", "fn main() \{\n    let q: U64 = 3\n    let s = \{\n        let a = \{\n            let deep_b = q\n            deep_b\n        }\n        a\n    }\n    io.println(\"\{s}\")\n}\n")
+    // The name is one no stdlib module declares, since tc_hints holds every module's lets.
+    let mut b_hints = 0
+    for h in tc_hints {
+        if h.name == "deep_b" { b_hints = b_hints + 1 }
+    }
+    if b_hints != 1 { io.println("FAIL: one hint: got {b_hints} hints for `deep_b`") }
+    assert(b_hints == 1)
+}
+
+test "a closure result with an unresolved method reports only that method" {
+    probe("block_own_local_closure_cascade", "fn take(v: Int) -> Int \{ v }\nfn main() \{\n    let b = Bytes.from_str(\"hi\")\n    let t = async.scope \{ take(async.spawn(fn() \{ let q = b.nope3()  q.addr() }).await) }\n    let v = take(b.with_ptr(fn(_p) \{ let q = b.nope5()  q.addr() }))\n    io.println(\"\{t} \{v}\")\n}\n")
+    expect("closure cascade", [
+        "UnresolvedMethod E0505 4:59: unresolved method `.nope3` on type Bytes",
+        "UnresolvedMethod E0505 5:46: unresolved method `.nope5` on type Bytes",
+    ])
+}
+
+// The help text of the one FfiScopeNotWithResource error.
+fn ffi_scope_help() -> Str {
+    for d in diag_entries {
+        if d.name == "FfiScopeNotWithResource" { return d.help }
+    }
+    ""
+}
+
+test "an ffi scope inside a block value names the binding that holds it" {
+    probe("block_own_local_ffi_inner", "fn main() \{\n    let total = \{\n        let _junk = 1\n        ffi.scope()\n        5\n    }\n    io.println(\"\{total}\")\n}\n")
+    let inner = ffi_scope_help()
+    probe("block_own_local_ffi_arg", "fn f(x: Int) -> Int \{ x }\nfn main() \{\n    let total = f(\{\n        let _junk = 1\n        ffi.scope()\n        5\n    })\n    io.println(\"\{total}\")\n}\n")
+    let arg = ffi_scope_help()
+    probe("block_own_local_ffi_tail", "fn main() \{\n    let total = \{\n        let _junk = 1\n        ffi.scope()\n    }\n    io.println(\"x\")\n}\n")
+    let tail = ffi_scope_help()
+    let ok = inner.contains("as <name>") && arg.contains("as <name>") && tail.contains("as total")
+    if !ok { io.println("FAIL: ffi binder: inner `{inner}` arg `{arg}` tail `{tail}`") }
+    assert(ok)
 }
