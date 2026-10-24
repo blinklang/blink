@@ -3424,12 +3424,26 @@ match_arm     ::= pattern guard? "=>" expression
 
 A pattern is *refutable* when it can fail to match (*Refutable vs Irrefutable Patterns*, below). The rule applies at every refutable pattern position. Today these are the pattern of a `match` arm, at any depth, and the pattern operand of `assert_matches` (§2.20). A future form that takes a refutable pattern uses this rule. In a refutable pattern:
 
-- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a payload (`Red`, `Red(x)`, `Red { .. }`). A type with that name in scope does not change this: E0554 (§3.4 *Unqualified variant*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
+- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position. The pattern must have the payload form that the variant declares (*The payload form of a variant pattern*, below). A type with that name in scope does not change this: E0554 (§3.4 *Unqualified variant*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
 - A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) never names a variant, because no variant has such a name (§3.4 *Variant names*). With no payload, it is a new binding. With a payload (`x(1)`, `x { .. }`), it is `NoSuchVariant` (E0547) when the type at that position is an enum, and `EnumPatternNeedsEnumScrutinee` (E0308) when it is not.
 
 The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. Every variant name starts with an uppercase letter, so the protection covers every variant.
 
-In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a payload must name a variant.
+In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a payload must name a variant. The payload-form rule (*The payload form of a variant pattern*, below) applies in these patterns too; a bare name with no payload still binds, as this paragraph says.
+
+```blink
+type Span { Range(Int, Int) }
+
+fn width(s: Span) -> Int {
+    let Range(lo, hi) = s          // one sub-pattern for each field
+    hi - lo
+}
+
+fn start(s: Span) -> Int {
+    let Range(lo) = s              // error[TypeError]: `Range` has 2 fields, the pattern has 1
+    lo
+}
+```
 
 No value binding, local or module-scope, changes what a pattern means.
 
@@ -3743,6 +3757,66 @@ The fix is machine-applicable only when module `geo` is imported and the new imp
 
 When one of them fails, the help is text only.
 
+**The payload form of a variant pattern.** A variant pattern has the payload form that its variant declares. The compiler checks the form after it finds the variant, so the checks of *A variant the enum does not declare* and *Qualified names and the wrong type* come first. The rule applies at every depth and in every pattern position.
+
+- A unit variant takes a bare name or a qualified name: `Dot`, `Shape.Dot`.
+- A variant declared with `( )` takes a paren pattern with one sub-pattern for each field, in declaration order: `Circle(r)`, `Rect(w, h)`. A paren pattern has no `..`. Write `_` for a field that the arm does not use.
+- A variant declared with `{ }` takes a brace pattern (*Struct patterns*, below): `At { x, y }`.
+- `V { .. }` is legal on every variant that has a payload, declared with `( )` or with `{ }`. It binds no field and matches every value of the variant.
+
+A pattern that does not have the declared form is `TypeError` (E0300). These are the four cases:
+
+- a bare name or a qualified name with no payload, on a variant that has a payload (`Circle =>` on `Circle(Int)`, or on a variant declared with `{ }`);
+- a paren pattern with fewer or more sub-patterns than the variant has fields;
+- a paren pattern on a variant declared with `{ }`, with any number of sub-patterns;
+- a payload on a unit variant (`Dot(x)`).
+
+Each error has a `note:` that lists the fields of the variant in order. For a unit variant the list is empty. The help gives two fixes, in this order: `V { .. }`, and then, for a variant declared with `( )`, `V(_, _)` with one `_` for each field.
+
+```blink
+type Shape {
+    Circle(Int)
+    Rect(w: Int, h: Int)
+    At { x: Int, y: Int }
+    Dot
+}
+
+fn size(s: Shape) -> Int {
+    match s {
+        Circle => 1           // error[TypeError]: no payload, and `Circle` has one
+        Rect(w) => w          // error[TypeError]: 1 sub-pattern, and `Rect` has 2 fields
+        At(a, b) => a         // error[TypeError]: a paren pattern, and `At` is declared with `{ }`
+        Dot(x) => x           // error[TypeError]: a payload, and `Dot` has none
+    }
+}
+```
+
+```
+error[TypeError]: variant `Circle` has a payload, and the pattern has none
+  note: fields of `Shape.Circle`, in order: Int
+  help: to match every `Circle`, write `Circle { .. }`
+  help: to name each field, write `Circle(_)`
+error[TypeError]: variant `Rect` has 2 fields, and the pattern has 1
+  note: fields of `Shape.Rect`, in order: w (Int), h (Int)
+  help: to match every `Rect`, write `Rect { .. }`
+  help: to name each field, write `Rect(_, _)`
+```
+
+To match every value of a variant that has a payload, write the brace form. Every other arm of `size` above uses a form that fits:
+
+```blink
+fn size(s: Shape) -> Int {
+    match s {
+        Circle { .. } => 1         // every Circle
+        Rect(w, h) => w * h
+        At { x, y } => x + y
+        Dot => 0
+    }
+}
+```
+
+Each of these errors makes a bad arm (*An arm with a bad pattern covers nothing*, below). The compiler cannot know which values the user meant the arm to match, so it does not guess a repair. An unguarded bad arm turns off E0004 for the match, and E0004 comes back when the user fixes the pattern.
+
 **After the error.** Each binder under a pattern with one of these errors has the poison type (§6.3.5). The compiler still checks the arm body and suppresses each diagnostic that only the poison type causes. *Exhaustiveness* below says how such an arm counts for coverage. These rules apply to `blink check` and to `blink build` alike: each variant pattern resolves to its enum and variant before code generation, or the compiler reports an error, so the two commands report the same diagnostics for one program.
 
 **After a field error.** `NoSuchField` (E0525) and `DuplicateField` (E0316) in a struct pattern or a variant brace pattern (*Struct patterns* below) also leave the arm checked, but the poison is narrower. Only a binder under an unknown label has the poison type. A binder under a label that the type declares keeps the type of its field, and so does a binder under the second of two equal labels. `PatternMissingRest` (E0319) poisons nothing, and an arm with only this error is not a bad arm: the compiler checks it as if the pattern had `..`.
@@ -3757,7 +3831,7 @@ match status {
 }
 ```
 
-**Constructor.** Matches enum variants, destructuring their fields.
+**Constructor.** Matches enum variants, destructuring their fields. A constructor pattern has one sub-pattern for each field of its variant, and a bare name does not match a variant that has a payload (*The payload form of a variant pattern*, above).
 
 ```blink
 fn area(shape: Shape) -> Float {
