@@ -1951,7 +1951,7 @@ A Blink source file is a module. A directory containing Blink files is a package
 myapp/
   blink.toml           # project manifest
   src/
-    main.bl          # module: main (entry point)
+    myapp.bl         # module: myapp (package entry)
     auth/
       login.bl       # module: auth.login
       token.bl       # module: auth.token
@@ -1962,6 +1962,51 @@ myapp/
 ```
 
 The module name is derived from the file path relative to `src/`. The directory structure IS the package hierarchy. There is no `mod.bl` index file, no `__init__` file, no module declarations in a parent file.
+
+The file that declares `fn main` is an ordinary module. It takes its name by the same rule: from its path under `src/`, or from `@module`. Any file under `src/` may declare `fn main`, and the file given to `blink build` or `blink run` keeps its path-derived name. So `src/main.bl` is the module `main`, a legal ordinary module, and the package entry is `src/<name>.bl` (§10.5 *Package Entry Resolution*). A file is one module however the build reaches it: the file given to `blink build` or `blink run` and an import of that file name the same module, with one copy of each module-level binding and one set of types.
+
+A sibling imports that file like any other module, selectively or by qualifier (intra-package cycles are allowed, §10.5 *Cycle Detection*):
+
+```blink
+// src/main.bl, given to `blink run src/main.bl`
+import helper
+
+pub fn shared() -> Int {
+    7
+}
+
+fn secret() -> Int {
+    42
+}
+
+fn main() {
+    let n = helper.twice()
+    io.println("{n}")
+}
+```
+
+```blink
+// src/helper.bl
+import main
+
+pub fn twice() -> Int {
+    main.shared() * 2      // qualified access to module `main`
+}
+
+fn peek() -> Int {
+    main.secret()          // error E1003 PrivateItemAccess: `secret` is private to module `main`
+}
+```
+
+In `helper.bl`, `main` binds only the qualifier. The private `fn main` of module `main` is not in the scope of `helper.bl` (§10.2), so `main.shared()` is qualified access. `main.secret()` in `helper.bl` is `PrivateItemAccess` (E1003) on the item `secret` in module `main`. A bare use of a `pub` item of `main` that a selective import of `main` does not list is E1006, and its help offers the qualified form `main.x`, as for any module. If `helper.bl` also declares its own `fn main`, that declaration takes the qualifier's name: E1012 (§10.5 *Imported and Declared Names*).
+
+A file outside `src/`, such as a script or a file under `tests/` or `examples/`, has no module name, and no file can import it. A diagnostic names such a file by its path. The file can still import its own package (§10.5 *Project root discovery*). When an import does not resolve and its path matches a `.bl` file under the package root but outside `src/` (`import util` with only `examples/util.bl`), `ModuleNotFound` adds the help "files outside `src/` are not modules; move the file under `src/`". The help does not appear for any other unresolved import.
+
+```blink
+// src/myapp.bl; the package also has examples/util.bl and no src/util.bl
+import util              // error E1200 ModuleNotFound
+                         // help: files outside `src/` are not modules; move the file under `src/`
+```
 
 **Why file = module:** Go proved this works at scale. One file, one module, one namespace. No indirection. An AI agent looking at `auth/login.bl` knows immediately that it's the `auth.login` module. No configuration to parse, no module maps to resolve.
 
