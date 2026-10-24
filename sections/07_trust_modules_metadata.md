@@ -2837,7 +2837,7 @@ error[E1128]: `as` after the import list
 
 Aliases are local to the importing file. They do not affect the imported module or any other consumers. Two imports in one file that bind one alias to different items are E1005 (*Imported Names*); two files may bind one alias to different items.
 
-An alias that is a compiler-known name (`import auth.{Error as Option}`) shadows it and gets W1010 (§10.6 *Shadowing Rules*).
+An alias that is a compiler-known name (`import auth.{Error as Option}`) shadows it and gets W1010 at the alias, in the importing module. The help names another alias (§10.6 *Shadowing Rules*). A plain import of a name that another module declares as a shadow gets no W1010.
 
 ### 10.6 Module Prelude
 
@@ -2993,7 +2993,40 @@ warning[W1010]: name shadows compiler-known type
           import blink.core.{Handler as EffectHandler}
 ```
 
-The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. It also covers such a name that another module declares and this module imports (`import geo.{Handler}`). Local bindings (`let`) live in the value namespace and are not type declarations. The `effect` clause does not cover the name of a built-in effect (§4.3): a top-level `effect` with such a name is `ReservedEffectName` (E0559), not a shadow.
+The rule covers every declaration that puts a name in the type namespace: `type` (struct or enum), type alias, `trait`, and `effect`. An import is not a declaration. A module that imports such a name gets no W1010; its uses get the note below. An import alias that is a compiler-known name gets W1010 at the alias (§10.5). Local bindings (`let`) live in the value namespace and are not type declarations. The `effect` clause does not cover the name of a built-in effect (§4.3): a top-level `effect` with such a name is `ReservedEffectName` (E0559), not a shadow.
+
+In this example, W1010 fires at the declaration of `Handler` and at the alias `Option`. It does not fire at the import of `Handler`, used or not. A qualified-only import (`import geo.sim`, then `sim.Handler`) binds no bare name and gets no W1010 either.
+
+```blink
+// geo/sim.bl
+pub type Handler {               // warning[W1010]: the declaration
+    n: Int
+}
+
+pub type Error {
+    code: Int
+}
+
+// main.bl
+import geo.sim.{Handler, Error as Option}   // warning[W1010] at `Option` only
+
+fn main() {
+    let h = Handler { n: 1 }
+    io.println("{h.n}")
+}
+```
+
+The alias warning has one `help:` line, a new alias. The alias is the shadow, so the repair is a new alias:
+
+```
+warning[W1010]: name shadows compiler-known type
+ --> main.bl:1:35
+  |
+1 | import geo.sim.{Handler, Error as Option}
+  |                                   ^^^^^^ this alias shadows compiler-known type `Option[T]` (blink.core)
+  |
+  = help: choose another alias: import geo.sim.{Error as SimError}
+```
 
 **Shadowing happens only between nested scopes**: prelude under module, dependency under local module (W1000, §10.5), and outer under inner in a function (§2.2). Two bindings of one name in one namespace of module scope, from declarations or imports, are a duplicate, never a shadow. A module qualifier is in both namespaces. One rule covers every pair, and the code tells which pair collided: two imports are E1005 (`AmbiguousImport`), an import entry and a declaration are E1012 (`DuplicateSymbol`), and two declarations are E1016 (`DuplicateModuleBinding`, §2.12.1). So `import blink.core.{Handler}` together with `type Handler` is E1012 (*Imported and Declared Names*, §10.5), not W1010. A plain `type Handler` with no such import still gets W1010. A local binding that hides a module qualifier (`let auth = 5` makes `auth.login()` a method call, §10.1 *Qualified Access*) is a shadow between nested scopes, so it is legal.
 
@@ -3022,7 +3055,7 @@ warning[W1011]: `Ok` hides the prelude variant `Result.Ok`
 
 **Diagnostics that involve a shadowing name.** The escape must be visible where the error is, not only at the declaration. So:
 
-1. The W1010 `help:` line names the aliased-import fix: `import blink.core.{X as Y}`, or `import blink.ffi.{X as Y}` for `Ptr` and `Buf`.
+1. The W1010 `help:` line at a declaration names the aliased-import fix: `import blink.core.{X as Y}`, or `import blink.ffi.{X as Y}` for `Ptr` and `Buf`. The W1010 at an import alias has one `help:` line, a new alias (see the example above).
 2. Every diagnostic whose subject is a name that shadows a compiler-known type — type-argument arity (E0303), type mismatch (E0300), missing method, and any other — adds a `note:` that gives the shadowing declaration's location and the builtin's home, and repeats the `help:` line from (1).
 3. When two different types with the same name appear in one diagnostic, each prints as `Name (module)`. Hover in the language server uses the same form.
 4. When a local binding hides a module qualifier (§10.1 *Qualified Access*):
