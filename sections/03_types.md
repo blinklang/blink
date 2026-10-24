@@ -2333,13 +2333,43 @@ A bare name that matches no candidate, but matches a `pub` enum of another packa
 2. the value of an assignment to a place of type `T` (`x = e`, `p.f = e`);
 3. the tail of a function body, and the operand of `return`, where the function declares the return type `T`;
 4. a call or method argument, where the declared parameter type is `T`. A parameter whose type is a type parameter of the callee gives no expected type, unless explicit type arguments fix it: `id[Option[Int]](None)` has the expected type `Option[Int]`, and `id(None)` has none;
-5. a field value in a struct or variant brace literal, where the declared field type is `T`;
+5. a field value in a struct or variant brace literal, and the payload of a call-form variant constructor, where the declared field type is `T`. When the expected type of the literal is an instance `G[A1, .., An]` of the literal's own generic type `G`, or the head of the literal writes type arguments, each type parameter of `G` in the declared field or payload type first takes the matching argument. This holds for any generic struct or enum, and for a field type that contains a type parameter, such as `Option[T]` or `List[T]`: items 6 and 7 then apply to the result. If the expected type has a different head, or an unsolved variable at an argument position, that position gives no expected type. A type parameter of a callee still gives no expected type (item 4). A type parameter of the type being built does, when an instance fixes it;
 6. the payload of `Some(e)`, `Ok(e)` or `Err(e)` under an expected `Option[T]` or `Result[T, E]`: `T`, or `E` for `Err`;
 7. each element of a list literal under an expected `List[T]`; element `i` of a tuple literal under an expected tuple type;
 8. the right operand of `a ?? e`: the inner type of `a`;
 9. an operand of `==`, `!=`, `<`, `<=`, `>` or `>=`. If exactly one operand is `None`, `Some(e)`, `Ok(e)` or `Err(e)` (or an `if`, `match` or block whose result values all have one of these forms), the other operand has a type of its own, and that type is the expected type of the first. A literal operand follows §3.2 *Operator operands*.
 
 An expected type at a position reaches each branch value of an `if`, each arm value of a `match`, and the tail of a block. It does not reach a condition, a guard, a scrutinee, or a statement that is not the tail.
+
+An expected instance of the literal's own type fixes the type parameters of the literal (item 5). A callee type parameter does not (item 4):
+
+```blink
+type GBox[T] { v: T }
+type G[T] { o: Option[T], x: List[T] }
+type Box[T] { Val(T)  Empty }
+
+fn id[T](x: T) -> T {
+    x
+}
+
+fn take8(g: GBox[U8]) { }
+
+fn mk() -> GBox[U64] {
+    GBox { v: 5 }                              // 5 : U64
+}
+
+fn main() {
+    let gs: GBox[U64] = GBox { v: 5 }          // 5 : U64
+    let g: G[U8] = G { o: Some(3), x: [1] }    // 3 : U8, 1 : U8
+    let b: Box[U8] = Box.Val(5)                // the payload 5 : U8
+    let l: List[GBox[U8]] = [GBox { v: 3 }]    // item 7, then item 5
+    take8(GBox { v: 3 })                       // 3 : U8
+    let w = GBox[U64] { v: 5 }                 // the head fixes T := U64
+    let n = GBox { v: 5 }                      // no instance: GBox[Int]
+    let h: GBox[U8] = GBox[U64] { v: 5 }       // error[TypeError]: declared type GBox[U8] but got GBox[U64]
+    let a: U8 = id(5)                          // error[TypeError]: declared type U8 but got Int
+}
+```
 
 A struct has no bare form and no call form, so `Name` and `Name(...)` never find a struct. The brace form reads the type namespace, so a local `let` never changes what `Name { ... }` means.
 
