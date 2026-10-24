@@ -2305,6 +2305,8 @@ let c = Some(a)                               // a prelude variant: bare
 
 Patterns do not change. In a pattern, a bare uppercase name names a variant of the type of the matched value (§3.5 *Pattern Forms*), and the qualified pattern stays legal. So `match c { Red => 1, Green => 2 }` is legal, but `let x = Red` is not.
 
+Construction and pattern matching follow one rule: the declared form of a variant, braces or parens, decides which payload form each accepts (*The payload form of a construction*, below).
+
 **The bare list.** The list of bare variants is exactly `Some`, `None`, `Ok` and `Err`. These are the variants of `Option` and `Result`, and no others. Their qualified forms (`Option.Some(1)`, `Option.None`, `Result.Ok(x)`, `Result.Err(e)`) stay legal. The list is closed: no other prelude or standard-library enum joins it, and only a new panel vote can change it. `Ordering` (`Less`, `Equal`, `Greater`) and `JsonValue` are qualified like any other enum.
 
 A bare `Some`, `None`, `Ok` or `Err` in an expression always names the prelude variant. This holds also when a user enum declares a variant of that name: write that variant qualified, as any other user variant. A type named `Some`, `None`, `Ok` or `Err` is a declaration error (E1016, §2.12.1).
@@ -2532,9 +2534,64 @@ error[VariantSpread]: a variant literal cannot copy fields with `..s`
   help: write every field, or match on `s` to bind its fields (copy-update is for struct literals, §2.16)
 ```
 
-A variant brace literal, and a variant paren payload that writes a label, follow the field rules of §2.14 *Checking a Literal's Fields*: `NoSuchField`, `DuplicateField` and `MissingField`. For a paren payload with a label these take the place of the argument-count error, so `Figure.Circle(radius: 1.0, radius: 2.0)` reports `DuplicateField` at the second `radius` and `MissingField` for `tag`, not a count.
+**The payload form of a construction.** A paren payload constructs only a variant declared with `( )`. A brace literal constructs a variant declared with `{ }`, and a variant declared with `( )` whose fields all have names. So the declared form decides which payload forms a variant accepts:
 
-A call may write any field by position or, if the variant names it, by label; a position fills the field at its index. In a paren payload, positional arguments come first. A positional argument after a labelled one is `PositionalAfterKeyword` (E0527), the code that a call gets for the same mistake (§2.13). The field rules then run on what the arguments fill: argument *i* fills field *i*, and a label fills the field it names. A label for a field that an earlier argument filled is `DuplicateField`, with a `note:` at the argument that filled it.
+| Payload | Variant declared with `{ }` | Variant declared with `( )` and named fields | Variant declared with `( )` and no names |
+|---------|-----------------------------|----------------------------------------------|------------------------------------------|
+| brace literal, `V { x: 1, y: 2 }` | ok | ok | `NoSuchField` (E0525) |
+| paren payload, positional, `V(1, 2)` | `TypeError` (E0300) | ok | ok |
+| paren payload, all labelled, `V(x: 1, y: 2)` | `TypeError` (E0300) | ok | `NoSuchField` (E0525) |
+
+```blink
+type Shape {
+    At { x: Int, y: Int }
+    Circle(radius: Float, tag: Int)
+    Pair(Int, Int)
+}
+
+fn main() {
+    let a = Shape.At { x: 1, y: 2 }
+    let b = Shape.Circle(1.0, 3)
+    let c = Shape.Circle(radius: 1.0, tag: 3)
+    let d = Shape.Circle { radius: 1.0, tag: 3 }
+    let e = Shape.Pair(1, 2)
+}
+```
+
+A paren payload on a variant declared with `{ }` is `TypeError` (E0300), whether its arguments are all positional (`Shape.At(1, 2)`), all labelled (`Shape.At(x: 1, y: 2)`, in any order) or mixed (`Shape.At(x: 1, 2)`). The payload gets this one error and no other. The message names the declared form, and the `note:` lists the fields of the variant in order. The help writes the brace literal from the arguments: an argument by position fills the field at its index, and a label fills the field it names. The fix is machine-applicable when each argument fills exactly one field; otherwise the help is not machine-applicable. `blink fix` applies it.
+
+A brace literal on a variant declared with `( )` and no names is `NoSuchField` (E0525), as before. Its help does not offer a nearest name, because the variant has no field name to offer. The help says that the variant has positional fields and writes the paren payload.
+
+```blink
+type Shape {
+    At { x: Int, y: Int }
+    Circle(radius: Float, tag: Int)
+    Pair(Int, Int)
+}
+
+fn main() {
+    let a = Shape.At(1, 2)                  // error[TypeError]
+    let b = Shape.At(x: 1, y: 2)            // error[TypeError]
+    let c = Shape.At(x: 1, 2)               // error[TypeError]: the form only
+    let d = Shape.Circle(radius: 1.0, 3)    // error[PositionalAfterKeyword]: a mixed payload
+    let e = Shape.Pair { a: 1, b: 2 }       // error[NoSuchField]
+}
+```
+
+```
+error[TypeError]: variant `At` is declared with braces, and the payload uses parentheses
+  note: fields of `Shape.At`, in order: x (Int), y (Int)
+  help: write `Shape.At { x: 1, y: 2 }`
+error[PositionalAfterKeyword]: a payload cannot write a positional argument after a labelled one
+  note: `radius:` is the first label
+  help: label every argument, or write the positional arguments first
+error[NoSuchField]: `Shape.Pair` has no field `a`
+  help: `Pair` has positional fields; write `Shape.Pair(1, 2)`
+```
+
+A variant brace literal, and a variant paren payload that writes a label, follow the field rules of §2.14 *Checking a Literal's Fields*: `NoSuchField`, `DuplicateField` and `MissingField`. For a paren payload with a label these take the place of the argument-count error, so `Figure.Circle(radius: 1.0, radius: 2.0)` reports `DuplicateField` at the second `radius` and `MissingField` for `tag`, not a count. These rules apply to a payload whose form the variant accepts.
+
+A call may write any field by position or, if the variant names it, by label; a position fills the field at its index. In a paren payload on a variant declared with `( )`, positional arguments come first. A positional argument after a labelled one is `PositionalAfterKeyword` (E0527), as in any call, with a message that says the payload mixes the two. The `note:` names the first label. The field rules then run on what the arguments fill: argument *i* fills field *i*, and a label fills the field it names. A label for a field that an earlier argument filled is `DuplicateField`, with a `note:` at the argument that filled it.
 
 A wrong number of arguments in a variant paren payload is `VariantArgumentCount` (E0321). It applies to a payload that has no label, and to a payload that has more positional arguments than the variant has fields. It applies to `Some`, `Ok`, `Err`, `None` and to user variants alike. `TypeError` (E0300) stays for an argument of the wrong type. The error has a `note:` that lists the variant's fields in order, for every variant that has fields, `Some`, `Ok` and `Err` too. `MissingField` has the same `note:`. In the `note:`, each field that an argument filled, by position or by label, carries the mark `(given)`.
 
@@ -2553,7 +2610,7 @@ type Figure { Circle(radius: Float, tag: Int) }
 
 fn main() {
     let d = Figure.Circle(1.0, radius: 2.0)       // error[DuplicateField], error[MissingField]
-    let e = Figure.Circle(tag: 2, 1.0)            // error[PositionalAfterKeyword]
+    let e = Figure.Circle(tag: 2, 1.0)            // error[PositionalAfterKeyword]: a mixed payload
     let f = Figure.Circle(1.0)                    // error[VariantArgumentCount]
 }
 ```
@@ -2564,9 +2621,9 @@ error[DuplicateField]: field `radius` is given twice
 error[MissingField]: `Figure.Circle` is missing field `tag` (Int)
   note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)
   help: add `tag: ` and a value
-error[PositionalAfterKeyword]: a positional argument follows a labelled one
+error[PositionalAfterKeyword]: a payload cannot write a positional argument after a labelled one
   note: `tag:` is the first label
-  help: write the positional arguments first
+  help: label every argument, or write the positional arguments first
 error[VariantArgumentCount]: variant `Circle` takes 2 arguments, got 1
   note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)
 ```
@@ -4005,6 +4062,8 @@ fn area(shape: Shape) -> Float {
     }
 }
 ```
+
+A paren pattern that writes labels follows the rule for a paren payload (§3.4 *The payload form of a construction*). So `At(x: a, y: b)` on a variant declared with `{ }` is `TypeError` (E0300), as `At(x: 1, y: 2)` is in an expression. The brace pattern `At { x, y }` is the form that variant takes.
 
 **Nested patterns.** Patterns compose — any sub-position accepts a full pattern.
 

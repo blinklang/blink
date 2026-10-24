@@ -1372,7 +1372,7 @@ Five codes divide the call-site label rules. Each names a distinct mistake, and 
 | `MissingKeywordArg` (E0510) | A keyword parameter received no argument at all | Supply the argument, labelled |
 | `UnlabeledKeywordArg` (E0529) | A keyword parameter received its argument **positionally** | Label the argument already written |
 | `InvalidKeywordArg` (E0511) | A label names no keyword parameter of the callee | Correct the label to one the signature declares |
-| `PositionalAfterKeyword` (E0527) | A positional argument follows a labelled one, in a call or in a variant paren payload (§3.4) | Move it before the first label |
+| `PositionalAfterKeyword` (E0527) | A positional argument follows a labelled one in a call, a variant paren payload included (§3.4) | Move it before the first label |
 | `DuplicateKeywordArg` (E0528) | The same label appears twice in one call | Delete the repeated argument |
 
 ```blink
