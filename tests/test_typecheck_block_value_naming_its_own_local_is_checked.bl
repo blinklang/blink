@@ -1,0 +1,81 @@
+// A block, `if` or `match` value whose tail names a binding the block declares has the type
+// of that tail, so a consumer checks it as it checks the binding written in its place: a U64
+// where a U8 goes is a TypeError at the same place, and not a value that passes unchecked.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import compile_test_helpers
+import std.io
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "{compile_test_helpers.scratch_root()}/{name}.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message}")
+        }
+    }
+    out
+}
+
+// The errors are exactly `want`, in order.
+fn expect(label: Str, want: List[Str]) {
+    let got = errors()
+    let mut ok = got.len() == want.len()
+    let mut i = 0
+    while ok && i < got.len() {
+        if got.get(i).unwrap() != want.get(i).unwrap() { ok = false }
+        i = i + 1
+    }
+    if !ok {
+        io.println("FAIL: {label}: got:")
+        for e in got { io.println("  {e}") }
+    }
+    assert(ok)
+}
+
+test "a block value into a U8 field or a U8 assignment is a TypeError" {
+    probe("block_own_local_field_assign", "type Box \{ v: U8 }\nfn main() \{\n    let q: U64 = 300\n    let b = Box \{ v: \{\n        let h = q\n        h\n    } }\n    let mut x: U8 = 0\n    x = \{\n        let g = q\n        g\n    }\n    io.println(\"\{b.v} \{x}\")\n}\n")
+    expect("field and assign", [
+        "TypeError E0300 4:22: field `v` of `Box`: declared type U8 but got U64",
+        "TypeError E0300 9:5: assignment: cannot assign U64 to U8",
+    ])
+}
+
+test "a block value added into a U8 is a TypeError, not a run-time overflow" {
+    probe("block_own_local_compound", "fn main() \{\n    let q: U64 = 300\n    let mut x: U8 = 1\n    x += \{\n        let h = q\n        h\n    }\n    io.println(\"\{x}\")\n}\n")
+    expect("compound assign", ["TypeError E0300 4:5: assignment: cannot assign U64 to U8"])
+}
+
+test "an if or match argument whose branch block names its own local is checked" {
+    probe("block_own_local_branch_arg", "fn n8(x: U8) -> U8 \{ x }\nfn main() \{\n    let q: U64 = 300\n    let c = true\n    let r = n8(if c \{\n        let h = q\n        h\n    } else \{ 1 })\n    let r2 = n8(match c \{\n        true => \{\n            let h = q\n            h\n        }\n        false => 1\n    })\n    io.println(\"\{r} \{r2}\")\n}\n")
+    expect("if and match argument", [
+        "TypeError E0300 5:16: argument 1 of `n8` expects U8, got U64",
+        "TypeError E0300 9:17: argument 1 of `n8` expects U8, got U64",
+    ])
+}
+
+test "a keyword argument error stays on its label" {
+    probe("block_own_local_keyword_arg", "fn f(a: Int, -- b: U8) -> Int \{ a + b.to_int() }\nfn main() \{\n    let q: U64 = 3\n    let r = f(1, b: \{\n        let h = q\n        h\n    })\n    let r2 = f(1, b: q)\n    io.println(\"\{r} \{r2}\")\n}\n")
+    expect("keyword argument", [
+        "TypeError E0300 4:18: argument 2 of `f` expects U8, got U64",
+        "TypeError E0300 8:19: argument 2 of `f` expects U8, got U64",
+    ])
+}
+
+test "branch blocks whose tails name their own locals compare by those tails" {
+    probe("block_own_local_branch_agree", "fn q() -> U64 \{ 7 }\nfn main() \{\n    let c = true\n    let d: U64 = if c \{\n        let h = q()\n        h * 2\n    } else \{ 1 }\n    io.println(\"\{d}\")\n}\n")
+    expect("agreeing branches", [])
+    probe("block_own_local_branch_disagree", "fn q() -> U64 \{ 7 }\nfn main() \{\n    let c = true\n    let a = if c \{\n        let h = q()\n        h + 1\n    } else \{\n        let s = \"x\"\n        s\n    }\n    io.println(\"\{a}\")\n}\n")
+    expect("disagreeing branches", ["TypeError E0300 4:13: if branches have incompatible types: U64 vs Str"])
+}

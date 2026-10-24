@@ -24500,6 +24500,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                                 return sp_memo
                             }
                         }
+                        // The body is a closure's, not a block of the enclosing fn: its `return`
+                        // leaves the closure. So the inference pass walks it as the closure it is
+                        // and answers what the walk gave the closure.
+                        if tc_boundary_check_active != 0 {
+                            tc_if_value_ctx = 0
+                            check_closure_body(sp_cls, make_fn_type(TYPE_UNKNOWN, []))
+                            let sp_ret = tc_fn_tid_ret(tc_lookup_node_tid(sp_cls))
+                            if sp_ret < 0 { return -1 }
+                            return make_handle_type(sp_ret)
+                        }
                         return make_handle_type(infer_type(node_body(sp_cls)))
                     }
                     return tc_spawn_value_handle(sp_cls)
@@ -25316,12 +25326,18 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 // writes and the one the corpus uses — must NOT type as Void, since Void is not
                 // inert (`n + 1` is E0301-class TypeError, `"{n}"` is MissingDisplayImpl).
                 //
-                // DECLINE, rather than answer. The body's own tail is what types this call, and
-                // it is not memoized until tc_check_body walks the closure one step later — so
-                // the honest answer here is "not yet known", and the LetBinding recovery
-                // fills it in from the body once the walk has run. Re-inferring the body HERE
-                // instead would double-report every diagnostic inside it.
-                if ret_str == "" { return -1 }
+                // The body's own tail types this call, and that tail can name a binding of the
+                // body, so the body is walked in its own scope, as tc_check_body walks it, and
+                // the call answers what the walk gave the closure. The name-resolution pass
+                // walks no bodies, so there the answer is "not yet known".
+                if ret_str == "" {
+                    if tc_boundary_check_active == 0 { return -1 }
+                    tc_if_value_ctx = 0
+                    check_closure_body(cls_node, make_fn_type(TYPE_UNKNOWN, [make_ptr_type(TYPE_U8)]))
+                    let wp_ret = tc_fn_tid_ret(tc_lookup_node_tid(cls_node))
+                    if wp_ret < 0 { return -1 }
+                    return wp_ret
+                }
                 let rt = resolve_type_name(ret_str)
                 if rt == -1 { return TYPE_VOID }
                 return rt
@@ -26518,6 +26534,25 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if tail == -1 { return TYPE_VOID }
         // The tail produces the block's value, so it inherits the block's own consumed-ness.
         tc_if_value_ctx = incoming
+        // A tail can name a binding the block itself declares, which exists only in the
+        // block's own scope. So the block is walked in that scope, and the tail's type is the
+        // one the walk gave it there. A block that is only its tail declares nothing.
+        if sublist_length(node_stmts(node)) > 1 {
+            // The name-resolution pass runs before the inference pass and walks no bodies, so
+            // there the answer is "not yet known". An answer read out of scope would stay in
+            // the memo below and stand for the block.
+            if tc_boundary_check_active == 0 { return TYPE_UNKNOWN }
+            // A walked block keeps its answer, so a consumer that asks again reads it and
+            // does not walk it again. Each nested block value would double the walks.
+            let walked = tc_lookup_node_tid(node)
+            if tc_tid_is_no_info(walked) == 0 && tc_tid_has_unknown(walked) == 0 { return walked }
+            // The walk's own statements are discarded unless they are the tail, which
+            // tc_walk_value_tail marks as consumed or not.
+            tc_if_value_ctx = 0
+            tc_walk_value_tail = incoming
+            tc_check_body(node)
+            return tc_scoped_value_memo(tc_block_tail_value(tail), 0)
+        }
         return infer_type(tc_block_tail_value(tail))
     }
 
