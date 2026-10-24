@@ -3470,13 +3470,12 @@ binder        ::= "mut"? IDENT                                // a name the patt
 atomic_pattern ::= "_"                                        // wildcard
                |   binder                                     // variable binding
                |   INT_LIT                                    // integer literal
-               |   FLOAT_LIT                                  // float literal
+               |   "-" INT_LIT                                // negative integer literal
                |   BOOL_LIT                                   // true | false
                |   STR_LIT                                    // string literal
-               |   INT_LIT ".." INT_LIT                       // exclusive range
-               |   INT_LIT "..=" INT_LIT                      // inclusive range
-               |   CHAR_LIT ".." CHAR_LIT                     // char exclusive range
-               |   CHAR_LIT "..=" CHAR_LIT                    // char inclusive range
+               |   CHAR_LIT                                   // char literal
+               |   range_bound ".." range_bound               // exclusive range
+               |   range_bound "..=" range_bound              // inclusive range
                |   TYPE_NAME                                  // unit variant
                |   TYPE_NAME "." IDENT                        // qualified unit variant
                |   TYPE_NAME "(" pattern_list ")"             // constructor
@@ -3485,6 +3484,9 @@ atomic_pattern ::= "_"                                        // wildcard
                |   TYPE_NAME "{" field_patterns "}"           // struct, or variant with named fields
                |   TYPE_NAME "." IDENT "{" field_patterns "}" // qualified variant with named fields
                |   IDENT "." TYPE_NAME "{" field_patterns "}" // module-qualified struct
+
+range_bound   ::= INT_LIT | "-" INT_LIT | CHAR_LIT
+               |   IDENT | IDENT "." IDENT                    // a const item, bare or qualified (*Range Patterns*)
 
 pattern_list  ::= pattern ( "," pattern )*
 
@@ -3506,6 +3508,64 @@ match_arm     ::= pattern guard? "=>" expression
 **Wildcard.** `_` matches any value and discards it.
 
 **Variable binding.** An identifier binds the matched value to a new variable in the arm body.
+
+**Literal patterns.** An integer, `Bool`, `Str` or `Char` literal is a pattern. It matches the value that is equal to it. A negative integer literal is `-` followed directly by an integer literal. `(-1)` and `-(1)` are not patterns: a `(` opens a tuple pattern, and `-` takes digits only. A literal pattern takes the type of the scrutinee (§3.2 *Integer literal range*), so under an unsigned scrutinee `-1` is `IntLiteralOutOfRange` (E0318).
+
+```blink
+fn sign(x: I8) -> Int {
+    match x {
+        -128..=-1 => -1
+        0 => 0
+        _ => 1
+    }
+}
+
+fn is_minus_one(x: Int) -> Bool {
+    match x {
+        -1 => true
+        _ => false
+    }
+}
+
+fn is_a(c: Char) -> Bool {
+    match c {
+        'a' => true
+        _ => false
+    }
+}
+
+fn unsigned(x: U8) -> Int {
+    match x {
+        -1 => 1           // error[IntLiteralOutOfRange]: -1 does not fit in U8 (0 to 255)
+        _ => 0
+    }
+}
+```
+
+A `Float` literal is not a pattern, and neither is a negative one. It is `FloatLiteralPattern` (E0322). The same holds for a `Float` literal as a range bound. The error is at the literal, and the help names a guard. A guard compares with `==`, so W0706 (§3.6 *Negative Zero Comparison*) covers `-0.0` there.
+
+```blink
+fn half(x: Float) -> Str {
+    match x {
+        0.5 => "half"          // error[FloatLiteralPattern]
+        _ => "other"
+    }
+}
+```
+
+```
+error[FloatLiteralPattern]: a Float literal is not a pattern
+  help: to compare with the value `0.5`, write a guard: `x if x == 0.5 =>`
+```
+
+```blink
+fn half(val: Float) -> Str {
+    match val {
+        x if x == 0.5 => "half"   // OK: a guard compares with `==`
+        _ => "other"
+    }
+}
+```
 
 **Bare names: variant or binding.** The first character of a bare name, and the kind of pattern it is in, decide what the name means.
 
@@ -3533,7 +3593,7 @@ fn start(s: Span) -> Int {
 }
 ```
 
-No value binding, local or module-scope, changes what a pattern means.
+No value binding, local or module-scope, changes what a pattern means, except a `const` item named as a range bound (*Range Patterns*). A local never does.
 
 ```blink
 type Color { Red, Green }
@@ -4285,7 +4345,16 @@ error[InconsistentPatternBindings]: inconsistent bindings in OR-pattern
 
 #### Range Patterns
 
-Integer and character ranges match contiguous value sets. Both `..` (exclusive end) and `..=` (inclusive end) are supported, consistent with range expression syntax (§2.9). Bounds must be const expressions (§2.21). Only `Int`, sized integers (`I8`, `U8`, etc.), and `Char` types are allowed — not `Float` or `Str`. The exhaustiveness checker tracks covered ranges.
+Integer and character ranges match contiguous value sets. Both `..` (exclusive end) and `..=` (inclusive end) are supported, consistent with range expression syntax (§2.9). Only `Int`, sized integers (`I8`, `U8`, etc.), and `Char` types are allowed — not `Float` or `Str`. The exhaustiveness checker tracks covered ranges.
+
+A bound is one of these, and nothing else:
+
+- An integer literal, with an optional `-` (`-128`). A `Char` literal (`'a'`).
+- The name of a `const` item (§2.21), bare (`MAX`) or qualified by its module (`limits.MAX`). The `const` has type `Int`, a sized integer or `Char`. The compiler resolves the name in the normal way (§3.4 *Resolution order*), and a local binding of the same name does not change the result. The compiler evaluates the `const` at type check, so the `const` must have a value that it can compute. The value of the bound must fit the type of the scrutinee, as a literal bound does, so `E0318` applies to it.
+
+A bound is never an expression. `0..=K + 1` is `RangeBoundNotConst` (E0323). So is a name that is not a `const` item of those types, and so is a `const` that depends on itself. It is one error for all of these, and its help names a guard.
+
+A `const` name is a bound only next to `..` or `..=`. A lone `K =>` is still `EnumPatternNeedsEnumScrutinee` (*Bare names: variant or binding*, above).
 
 ```blink
 fn classify_http(code: Int) -> Str {
@@ -4305,6 +4374,47 @@ match score {
     1..=59 => "failing"
     60..=100 => "passing"
     _ => "invalid"
+}
+```
+
+Bounds with a negative literal and with a `const` name:
+
+```blink
+const MAX_RETRIES: Int = 5
+
+fn retry_class(n: Int) -> Str {
+    match n {
+        -1 => "unset"
+        0..=MAX_RETRIES => "retry"        // OK: a const named as a bound
+        _ => "too many"
+    }
+}
+```
+
+A guard is the repair for a bound that is not a literal or a `const` name. A guard does not count toward exhaustiveness, so the `match` needs a `_` arm.
+
+```blink
+const MAX_RETRIES: Int = 5
+
+fn retry_class(n: Int) -> Str {
+    match n {
+        0..=MAX_RETRIES + 1 => "retry"    // error[RangeBoundNotConst]
+        _ => "too many"
+    }
+}
+```
+
+```
+error[RangeBoundNotConst]: a range bound must be a literal or the name of a const
+  help: to use a computed bound, write a guard: `n if n >= 0 && n <= MAX_RETRIES + 1 =>`
+```
+
+```blink
+fn retry_class(code: Int) -> Str {
+    match code {
+        n if n >= 0 && n <= MAX_RETRIES + 1 => "retry"   // OK: a guard takes any expression
+        _ => "too many"
+    }
 }
 ```
 
@@ -5374,7 +5484,7 @@ fn main() {
 
   Either operand can be N, also when the other operand is a literal. The check runs in typecheck on the resolved callee, not on the method name, so a method `eq` on another type that takes a `Float` argument does not fire. It fires only where the impl is concretely `Float` or `F32`: a generic body never warns because of one of its instantiations. A call that compares values inside its own body is not a comparison here, so `xs.contains(-0.0)` does not fire. `min` and `max` do not fire either: when the two values are equal, the sign of the result can depend on which one comes back.
 - **Where.** It fires in test blocks and in the body of an `assert_panics` block (§2.20). The `assert_panics` rule of `DivisionByLiteralZero` does not apply here.
-- **Patterns.** No pattern form can write `-0.0` today (*Pattern Grammar*). A change that adds such a pattern form must bring it under W0706 or make it an error.
+- **Patterns.** No pattern form can write a Float, so `-0.0` cannot be a pattern. A change that adds Float patterns must bring them under W0706 or make them an error.
 
 ```blink
 fn classify(x: Float) -> Str {

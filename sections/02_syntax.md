@@ -2986,7 +2986,7 @@ Const expressions are evaluated in five contexts:
 1. **`const` declarations** — the RHS must be a const expression
 2. **Struct field defaults** — `type Foo { x: Int = <const> }`
 3. **Keyword argument defaults** — `fn f(*, x: Int = <const>)`
-4. **Range pattern bounds** — `match n { 1..=MAX => ... }`
+4. **Range pattern bounds** — `match n { 1..=MAX => ... }`. A bound is a literal or the name of a `const`, not an expression (§3.5 *Range Patterns*).
 5. **Module-level `let` initializers** — each const expression in a static expression (§2.12.1)
 
 ```blink
@@ -3002,7 +3002,7 @@ fn connect(url: Str, *, timeout: Int = TIMEOUT_MS, retries: Int = MAX_RETRIES) !
     // ...
 }
 
-// Range pattern bounds — const expressions
+// Range pattern bounds — a const name
 fn classify(code: Int) -> Str {
     match code {
         0 => "zero"
