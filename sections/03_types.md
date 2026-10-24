@@ -4332,7 +4332,8 @@ implementor exists.
 
 This is the parametricity rule of *Polymorphic Trait Implementations* applied to
 `Self`: a default body may vary behavior only through bounds the trait declares.
-Because every `impl` must satisfy the trait's supertraits, a default body that
+Because every `impl` must satisfy the trait's supertraits, also under its own bounds
+when it is polymorphic (*Polymorphic Trait Implementations*), a default body that
 type-checks under the guarantee set is valid for every implementor — the check is
 complete at the definition.
 
@@ -5259,6 +5260,38 @@ impl[T] Show for Box[T] { ... }          // OK -- T binds the receiver's type ar
 
 This is the mirror image of the W0604 gate (§3.4 *Explicit Type Application*), and the two are consistent rather than contradictory. There, a bound *is* an occurrence, because a generic function's binder can be supplied by an explicit type argument and the bound decides which arguments are accepted. Here there is no supply site at all: impl selection admits no type-argument list, so no use site could ever repair the declaration. That distinction — between *constraining* a type parameter and *determining* it — is what makes a declaration-site **error** the right severity for an impl binder and a **warning** the right severity for a function binder. A declaration is rejected outright only when no use site could ever repair it; where a use site can, the diagnostic goes to the use site and the declaration gets a lint.
 
+**An impl proves each supertrait under its own bounds.** An impl of a trait with supertraits (`Ord: Eq`, `Hash: Eq`) must show that its receiver type implements each supertrait. The impl may use only the bounds it writes, in the binder or in a `where` clause, and the supertraits of those bounds: `T: Ord` gives `T: Eq`. An impl that cannot show a supertrait is `error[MissingSupertraitImpl]` (E0911) at the impl header. A concrete impl is the case with no binder. The check runs once, at the impl. No use site checks it again.
+
+```blink
+type H[T] { v: T }
+
+impl[T: Eq] Eq for H[T] { fn eq(self, o: H[T]) -> Bool { self.v == o.v } }
+
+impl[T] Ord for H[T] { ... }         // E0911 -- H[T] is Eq only where T: Eq
+impl[T: Eq] Ord for H[T] { ... }     // OK
+impl[T: Ord] Ord for H[T] { ... }    // OK -- T: Ord gives T: Eq
+```
+
+(The three `Ord` impls are alternatives. A program has one.)
+
+```
+error[MissingSupertraitImpl]: impl Ord for H[T] requires H[T] to also implement supertrait `Eq` (trait Ord: Eq)
+ --> h.bl:5:6
+  |
+5 | impl[T] Ord for H[T] { ... }
+  |      ^ `H[T]` is `Eq` only where `T: Eq`
+  |
+  = help: add the bound: `impl[T: Eq] Ord for H[T]`
+```
+
+The help is machine-applicable. It adds only the bounds that the impl's own bounds do not already give, in the form the impl already uses: `: Eq` after a bare parameter, ` + Eq` on a bound list, or an item in the `where` clause. If the receiver type has no impl of the supertrait at all, the help is to derive it or to write it (`@derive(Eq)` on the type, or a hand-written `impl Eq`).
+
+**No implied bounds.** The compiler never adds a bound that the user did not write. `impl[T] Ord for H[T]` does not mean `impl[T: Eq] Ord for H[T]`. A polymorphic impl varies behavior only through the bounds it writes.
+
+**A derived supertrait impl.** The supertrait impl can come from `@derive`. The rule, the code, the message and the help are the same as for a hand-written pair, and a label or note points at the `@derive(...)` attribute. With `@derive(Eq)` on `H[T]`, the hand-written `impl[T] Ord for H[T]` is E0911, and the help is `impl[T: Eq] Ord for H[T]`. For the bounds of a derived impl, see *Supertrait Auto-Derivation*.
+
+This rule makes the claim in *Operations on `Self` in a Default Body* true for a polymorphic impl. A generic function with `T: Loud` can call a method of `Named` on `T` (`trait Loud: Named`), because every impl of `Loud` proved `Named` under its own bounds.
+
 **Instantiations.** Each distinct instantiation (`List[Int]`, `List[Str]`, `List[User]`, etc.) is a distinct type.
 
 **No runtime type information.** Blink exposes no `size_of[T]`, `is_pointer_kind[T]`, `TypeRepr[T]`, `align_of[T]`, or `TypeId[T]` forms — neither to user code nor as `@compiler_internal` primitives.
@@ -6071,6 +6104,8 @@ Some traits have supertraits: `Ord` requires `Eq`, `Hash` requires `Eq`. When de
 3. If the type has a hand-written `impl Eq`, deriving `Ord` or `Hash` is an error, `DeriveOverHandWrittenEq`
 
 This means `@derive(Ord)` implicitly derives `Eq` if not already present. Rule 3 exists because a hand-written `Eq` is usually coarser than the structure, so a structural `Hash` or `Ord` would break the laws in *Derive Laws* below, and a `Map` or `Set` keyed on the type would give wrong results with no error. The diagnostic gives two fixes: derive `Eq` in place of the hand-written impl, or write `Hash` (or `Ord`) by hand so that it agrees with the hand-written `Eq`. The supertrait is the compiler-known `Eq` by identity, also in a module that shadows `Eq` (§10.6 *Shadowing a Prelude Trait*). Redundant listing like `@derive(Eq, Ord)` is allowed — no error, no warning. The `Eq` derivation happens once regardless.
+
+The `Eq` that `@derive(Ord)` or `@derive(Hash)` adds carries the bounds that `@derive(Eq)` would carry (*Generic Type Bound Inference*), whether the derives are in one `@derive` attribute or in more than one. For `type H[T] { v: T }`, the added `Eq` is `impl[T: Eq] Eq for H[T]`, and `@derive(Ord)` gives `impl[T: Ord] Ord for H[T]`. The bound `T: Ord` gives `T: Eq`, so the pair meets the supertrait rule in *Polymorphic Trait Implementations* (E0911).
 
 ##### Derive Laws
 
