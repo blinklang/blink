@@ -3191,6 +3191,8 @@ fn h() {
 
 There is no exception for a value that is "never used in a way that would expose the missing type." Whether the under-determined value is later observed is a whole-function property; making the binding's legality depend on it would break locality of reasoning (§1) — you could no longer tell whether `let x = []` is valid without reading the rest of the body, and a later edit adding `x.push(y)` could retroactively change the binding's status. The binding is judged at the binding, once.
 
+**A later use does not choose an impl.** `xs.push(1)` fixes the type that `xs` holds. It does not reopen the choice of an impl. A call through a generic type's qualifier that matches two impls, such as `Box.from(xs)`, is E0301 at the call, whatever a later statement does with the result (§3c.2 *A Generic Qualifier That Matches Two Impls*).
+
 **Under-determination flows through construction.** An under-constrained generic construction is the same error, reported at the binding, with the enclosing constructor's parameters named:
 
 ```blink

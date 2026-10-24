@@ -297,6 +297,115 @@ let err: ConfigError = fs_error.into()   // works because From[FsError] for Conf
 
 **Why auto-derive only.** If users could implement `Into` directly, you could create incoherent pairs (`A: Into[B]` without `B: From[A]`), breaking the bidirectional guarantee. One source of truth: implement `From`, get `Into` for free. (Vote: 4-1, AI/ML dissented wanting no Into at all — but method-call syntax is important for chaining.)
 
+#### A Generic Qualifier That Matches Two Impls
+
+`Box.from(x)` names the type `Box` and leaves its type parameters open. The compiler finds them from the argument and from the expected type. Sometimes the argument matches more than one impl of the trait. The two impls below do not overlap: `List[T]` and `List[List[T]]` never describe one type for the same `T`, so `Box[Int]` and `Box[List[Int]]` each have one `From` impl (§3.6 *No Impl Overlap*). But the argument `[[1, 2], [3]]` matches both impls, and each gives a different type: `Box[List[Int]]` by the first, `Box[Int]` by the second.
+
+```blink
+type Box[T] { v: List[T] }
+
+impl[T] From[List[T]] for Box[T] {
+    fn from(x: List[T]) -> Box[T] { Box { v: x } }
+}
+
+impl[T] From[List[List[T]]] for Box[T] {
+    fn from(x: List[List[T]]) -> Box[T] {
+        let mut out: List[T] = []
+        for xs in x {
+            for e in xs { out.push(e) }
+        }
+        Box { v: out }
+    }
+}
+```
+
+**Refusal is the rule.** A call that matches more than one impl is `error[CannotInferType]` (E0301). The compiler reports it at the call. No impl wins because it is more specific. Blink has no specialization (§3.6 *No Impl Overlap*), so a new impl in a library can make a call an error, but it never changes which impl an existing call runs. The rule covers every trait method that a program calls through a generic type's qualifier, not only `from`. It also covers `x.into()`: the compiler derives `Into` from `From`, so the candidates are the `From` impls.
+
+**Two things pick the impl:**
+
+- **The expected type of the call.** An annotation on a binding, a parameter type, a return type and a field type all fix the type parameters, and then one impl matches.
+- **The impl-qualified head** (*Impl-Qualified Calls* below). It names one impl by its full instance and needs no expected type.
+
+Nothing else picks. A type list on the callee, as in `Box.from[Int](xs)`, binds the type parameters of `from`. `from` has none, so the call stays E0301. A type list on the type head, as in `Box[Int].from(xs)`, is an error (§3.4 *Postfix Brackets That Are Not a Type Application*).
+
+**A later use does not pick.** In §3.4 *Under-Determined Types*, a later use can fix the type of a binding: `xs.push(1)` fixes `let mut xs = []`. An impl is not a type variable. The call chooses which function body runs, and the choice is complete at the call. A later statement does not reopen it, so a distant edit never changes which body a call runs.
+
+```blink
+fn count(b: Box[Int]) -> Int { b.v.len() }
+
+fn flat(xs: List[List[Int]]) -> Box[Int] { Box.from(xs) }
+
+fn main() {
+    let one = Box.from([1, 2])                        // OK: only the first impl matches
+    let a: Box[Int] = Box.from([[1, 2], [3]])         // OK: the annotation picks the second impl
+    let b: Box[List[Int]] = Box.from([[1, 2], [3]])   // OK: the annotation picks the first impl
+    let c = count(Box.from([[1, 2], [3]]))            // OK: the parameter type picks the second impl
+    let d: Box[Int] = [[1, 2], [3]].into()            // OK: `into` follows the same rule
+    let e = (From[List[List[Int]]] for Box[Int]).from([[1, 2], [3]])   // OK: the head names one impl
+}
+```
+
+```blink
+fn main() {
+    let a = Box.from([[1, 2], [3]])        // COMPILE ERROR E0301: two impls match, and nothing picks
+    let f = Box.from([[1, 2], [3]])        // COMPILE ERROR E0301: a later use does not pick
+    let n: Int = f.v.get(0).unwrap()
+    let g = Box.from[Int]([[1, 2], [3]])   // COMPILE ERROR E0301: `from` has no type parameter for `[Int]`
+    let h = Box[Int].from([[1, 2], [3]])   // COMPILE ERROR: a type head takes no type list in a term position
+}
+```
+
+```blink
+type Wrap[T] { v: T }
+
+impl[T] From[Wrap[List[T]]] for Wrap[T] {
+    fn from(w: Wrap[List[T]]) -> Wrap[T] { Wrap { v: w.v.get(0).unwrap() } }
+}
+
+fn main() {
+    let w: Wrap[Int] = Wrap { v: 1 }
+    let x = Wrap.from(w)                   // OK: only `From[T] for T` matches, so `x` is Wrap[Int]
+
+    let ws: Wrap[List[Int]] = Wrap { v: [1] }
+    let y = Wrap.from(ws)                  // COMPILE ERROR E0301: `From[T] for T` gives Wrap[List[Int]], the impl above gives Wrap[Int]
+}
+```
+
+**The diagnostic.** The spec fixes this content, not the wording:
+
+- Each candidate impl, with the type it gives.
+- A note that a later use does not choose between them.
+- One `help:`. When a `let` receives the result of the call directly, the help is an annotation, and it names each type that a candidate gives, as in `let a: Box[Int] = ...`. When no `let` receives the result (a statement, or a call that a method chain continues, as in `Box.from(xs).v.len()`), the help is one impl-qualified head for each candidate.
+- For `x.into()`, the diagnostic points at `.into()` and names the `From` impls, not `Into`.
+
+```
+error[CannotInferType]: `Box.from` on `List[List[Int]]` matches more than one impl
+  --> main.bl:15:13
+   |
+15 |     let a = Box.from([[1, 2], [3]])
+   |             ^^^^^^^^ matches two impls
+   |
+   = note: `impl From[List[T]] for Box[T]` gives `Box[List[Int]]`
+   = note: `impl From[List[List[T]]] for Box[T]` gives `Box[Int]`
+   = note: a later use of `a` does not choose between them
+   = help: annotate the binding with the type you want: `let a: Box[Int] = ...` or `let a: Box[List[Int]] = ...`
+```
+
+```
+error[CannotInferType]: `Box.from` on `List[List[Int]]` matches more than one impl
+  --> main.bl:15:13
+   |
+15 |     let n = Box.from([[1, 2], [3]]).v.len()
+   |             ^^^^^^^^ matches two impls
+   |
+   = note: `impl From[List[T]] for Box[T]` gives `Box[List[Int]]`
+   = note: `impl From[List[List[T]]] for Box[T]` gives `Box[Int]`
+   = note: a later use does not choose between them
+   = help: name the impl to use:
+   |   (From[List[List[Int]]] for Box[List[Int]]).from(...)
+   |   (From[List[List[Int]]] for Box[Int]).from(...)
+```
+
 #### The `TryFrom` Trait
 
 ```blink
