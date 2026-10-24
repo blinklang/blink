@@ -1053,6 +1053,17 @@ Nothing else is static. In particular, these are not:
 
 The rule is the same for `let`, `let mut` and `pub let`. Because no initializer reads another module binding or runs a function, no initializer can see another one. The spec does not define the order in which module bindings are initialized, and the order cannot change any value. A cycle between initializers cannot occur.
 
+A const expression in an initializer that would panic is error E0546 (§2.21).
+
+```blink
+let a = 10 / 0                  // error[ConstEvalPanic]: division by zero
+let xs = [1, 10 / 0]            // error[ConstEvalPanic]: at the list element
+
+fn main() {
+    let b = 10 / 0              // compiles, gives a warning, and panics at run time
+}
+```
+
 ```blink
 const MAX_RETRIES = 5
 
@@ -2877,12 +2888,13 @@ Only struct **literal** syntax (`Type { field: value }`) is const. Constructor f
 
 #### Where Const Expressions Are Required
 
-Const expressions are required in four contexts:
+Const expressions are evaluated in five contexts:
 
 1. **`const` declarations** — the RHS must be a const expression
 2. **Struct field defaults** — `type Foo { x: Int = <const> }`
 3. **Keyword argument defaults** — `fn f(*, x: Int = <const>)`
 4. **Range pattern bounds** — `match n { 1..=MAX => ... }`
+5. **Module-level `let` initializers** — each const expression in a static expression (§2.12.1)
 
 ```blink
 // Struct field defaults — const expressions
@@ -2910,7 +2922,7 @@ fn classify(code: Int) -> Str {
 
 #### Const Evaluation Must Succeed
 
-The compiler evaluates each const expression in the four contexts above. If an operation in that evaluation would panic at run time, the program does not compile, and the error is `ConstEvalPanic` (E0546). This covers integer `/` and `%` by zero (§3.6, *Integer Division*), signed `MIN / -1`, and integer overflow (§3.2, *Overflow behavior*). The rule is the same in each context. An `assert_panics` body (§2.20) does not change it, because a compile error is not a run-time panic.
+The compiler evaluates each const expression in the five contexts above. If an operation in that evaluation would panic at run time, the program does not compile, and the error is `ConstEvalPanic` (E0546). This covers integer `/` and `%` by zero (§3.6, *Integer Division*), signed `MIN / -1`, and integer overflow (§3.2, *Overflow behavior*). The rule is the same in each context. An `assert_panics` body (§2.20) does not change it, because a compile error is not a run-time panic.
 
 ```blink
 const SHARDS = 0
@@ -2920,7 +2932,12 @@ const TOO_BIG = 9223372036854775807 + 1         // error[ConstEvalPanic]: Int ov
 type Pool {
     size: Int = 64 % SHARDS                     // error[ConstEvalPanic]: division by zero
 }
+
+let share = 100 / SHARDS                        // error[ConstEvalPanic]: division by zero
+let sizes = [1, 64 % SHARDS]                    // error[ConstEvalPanic]: division by zero, at the list element
 ```
+
+A module-level `let` or `let mut` initializer is a static expression (§2.12.1). The rule applies to each const expression in it: the whole initializer, a list or tuple element, a struct field, a variant payload, and a `const` reference. The body of a function literal is not part of the initializer and does not run at initialization, so the rule does not reach it. A literal that is out of range is E0318, not E0546, as in the other contexts (§3.2, *Integer literal range*).
 
 The error points at the subexpression that fails. It has one `note:` for each `const` reference that leads to the failing value, so the reader can find the const that holds the 0:
 
@@ -2938,7 +2955,7 @@ note: `SHARDS` is 0
    |       ^^^^^^
 ```
 
-Outside the four contexts, a zero divisor is not a compile error: `let a = 10 / 0` compiles and panics at run time. §3.6 *Integer Division* gives the warning for a literal zero divisor. Overflow is the same: outside the four contexts, `let bad: I8 = 127 + 1` compiles and panics at run time, and §3.6 *Literal arithmetic overflow* gives the warning.
+Outside the five contexts, a zero divisor is not a compile error: a local `let a = 10 / 0` in a function body compiles and panics at run time. §3.6 *Integer Division* gives the warning for a literal zero divisor. Overflow is the same: outside the five contexts, a local `let bad: I8 = 127 + 1` compiles and panics at run time, and §3.6 *Literal arithmetic overflow* gives the warning. The warnings W0704 and W0708 do not fire in a const context, so they do not fire in a module-level initializer.
 
 #### Visibility
 
@@ -2959,7 +2976,7 @@ There is no `const mut` — constants are inherently immutable. `const mut` is a
 
 | | `const` | `let` |
 |-|---------|-------|
-| Evaluation | Compile time | Program start, before `main` |
+| Evaluation | Compile time | Compile time for const parts; program start for the rest |
 | RHS | Must be const expression | Must be static expression (§2.12.1) |
 | Mutability | Never | `let mut` allowed |
 | `pub` export | Yes | Yes (immutable only) |

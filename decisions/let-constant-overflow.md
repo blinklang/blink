@@ -158,7 +158,7 @@ test "overflow panics" {
 }
 ```
 
-- "Const expression" has meaning only in the four contexts of §2.21. E0546 applies there. W0708 does not fire there.
+- "Const expression" has meaning only in the five contexts of §2.21. E0546 applies there. W0708 does not fire there. (A later panel changed the count from four to five; see [Module-Level Initializer Is a Const Context](module-init-const-eval.md). The rule is the same.)
 - Outside those contexts, overflow in literal-only arithmetic compiles and panics at run time. The compiler gives `LiteralArithmeticOverflow` (W0708).
 - The tree is `K ::= N | L | "(" K ")" | "-" K | K op K`, with `op` in `+ - * / %`. A negative literal `N` is matched first, so `-128` is a leaf and E0318 governs it. `-(-128)` at `I8` is a unary `-` node over a tree and warns. The spec says that this grammar is wider than the negative-literal rule of §3.2.
 - W0708 checks the largest literal-only tree, at the type the checker gives each operation. The spec states no rule for the type of a literal tree in operand position.
