@@ -1,0 +1,485 @@
+// A literal operand takes the integer type of the other operand, on either side, whatever
+// that operand is: a local, a let bound to a Ptr read, a field, a method result or a call
+// (sections/03_types.md §3.2 *Operator operands*). The checker walks a body once before a
+// local's type is settled, so `next(q * 2)` with `let q: U64` must not read there as an Int
+// argument. Each position the rule names gets a row. An operand that is a block with its own
+// let gets rows too: its operator must still be checked where the value goes. The commands
+// run in a fresh scratch directory, since the test tree itself sits inside a project.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+// Runs a program and compares what it prints, line for line. `blink check` must pass too.
+fn expect_run(dir: Str, name: Str, src: Str, want: List[Str]) -> Str {
+    write_file("{dir}/{name}.bl", src)
+    let c = blink_in(dir, "check {name}.bl")
+    if c.exit_code != 0 { return "{name}: want check exit 0, got {c.exit_code}:\n{c.err_out}" }
+    let r = blink_in(dir, "run {name}.bl")
+    if r.exit_code != 0 { return "{name}: want exit 0, got {r.exit_code}:\n{r.err_out}" }
+    if r.out != lines(want) { return "{name}: want output\n{lines(want)}got\n{r.out}" }
+    ""
+}
+
+// Checks a program that must fail, that each wanted text is in its report, that no internal
+// error is in it, and that the build reports the same errors.
+fn expect_errors(dir: Str, name: Str, src: Str, count: Int, want: List[Str]) -> Str {
+    write_file("{dir}/{name}.bl", src)
+    let r = blink_in(dir, "check {name}.bl")
+    if r.exit_code == 0 { return "{name}: want a failed check, got exit 0" }
+    let mut problems: List[Str] = []
+    if !"\n{r.err_out}".contains("\n{count} error(s) found\n") { problems.push("{name}: want {count} error(s):\n{r.err_out}") }
+    if r.err_out.contains("internal compiler error") { problems.push("{name}: an ICE:\n{r.err_out}") }
+    for w in want {
+        if !r.err_out.contains(w) { problems.push("{name}: want `{w}` in:\n{r.err_out}") }
+    }
+    let b = blink_in(dir, "build {name}.bl")
+    if b.err_out != r.err_out.replace("error: check failed\n", "") { problems.push("{name}: check and build disagree:\ncheck:\n{r.err_out}\nbuild:\n{b.err_out}") }
+    problems.join("\n")
+}
+
+fn report(problems: List[Str]) {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+fn fresh_dir(name: Str) -> Str {
+    let dir = "{compile_test_helpers.scratch_root()}/literal_operand_{name}"
+    let _ = sh("rm -rf {dir}; mkdir -p {dir}")
+    dir
+}
+
+test "a literal beside a Ptr field read takes its type in a call argument" {
+    let dir = fresh_dir("ptr_read")
+    report([
+        expect_run(dir, "ptr_read", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec { iov_base: Ptr[U8], iov_len: U64 }
+fn next(n: U64) -> U64 { n + 1 }
+fn main() {
+    with ffi.scope() as s {
+        let p = s.alloc[IoVec]()
+        p.iov_len.write(4)
+        let r = p.iov_len.read()
+        let b = next(r * 2)
+        let c = next(2 * p.iov_len.read())
+        let t: U64 = r * 2
+        let d = next(p.iov_len.read() + p.iov_len.read())
+        let e = next(p.iov_len.read() * 2)
+        io.println("{b} {c} {t} {d} {e}")
+    }
+}
+"#, ["9 9 8 9 9"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a literal takes the type of a local, field or method result of every sized type, on either side" {
+    let dir = fresh_dir("sized")
+    report([
+        expect_run(dir, "sized_locals", #"fn n64(n: U64) -> U64 { n }
+fn n32(n: U32) -> U32 { n }
+fn n16(n: U16) -> U16 { n }
+fn n8(n: U8) -> U8 { n }
+fn i32_(n: I32) -> I32 { n }
+fn i16_(n: I16) -> I16 { n }
+fn i8_(n: I8) -> I8 { n }
+fn main() {
+    let a: U64 = 4
+    let b: U32 = 4
+    let c: U16 = 4
+    let d: U8 = 4
+    let e: I32 = -4
+    let f: I16 = -4
+    let g: I8 = -4
+    let r1 = n64(a * 2)
+    let r2 = n32(b * 2)
+    let r3 = n16(c * 2)
+    let r4 = n8(d * 2)
+    let r5 = i32_(e * 2)
+    let r6 = i16_(f * 2)
+    let r7 = i8_(g * 2)
+    io.println("{r1} {r2} {r3} {r4} {r5} {r6} {r7}")
+    let l1 = n64(2 * a)
+    let l2 = n32(2 * b)
+    let l3 = n16(2 * c)
+    let l4 = n8(2 * d)
+    let l5 = i32_(2 * e)
+    let l6 = i16_(2 * f)
+    let l7 = i8_(2 * g)
+    io.println("{l1} {l2} {l3} {l4} {l5} {l6} {l7}")
+}
+"#, ["8 8 8 8 -8 -8 -8", "8 8 8 8 -8 -8 -8"]),
+        expect_run(dir, "field_and_method", #"type Holder { v: U64 }
+trait Getter {
+    fn get(self) -> U64
+}
+impl Getter for Holder {
+    fn get(self) -> U64 { self.v }
+}
+fn n64(n: U64) -> U64 { n }
+fn main() {
+    let h = Holder { v: 4 }
+    let f1 = n64(h.v * 2)
+    let f2 = n64(2 * h.v)
+    let m1 = n64(h.get() * 2)
+    let m2 = n64(2 * h.get())
+    io.println("{f1} {f2} {m1} {m2}")
+}
+"#, ["8 8 8 8"]),
+        expect_run(dir, "negative_literal", #"fn i64_(n: I64) -> I64 { n }
+fn i32_(n: I32) -> I32 { n }
+fn i8_(n: I8) -> I8 { n }
+fn main() {
+    let e: I32 = 5
+    let g: I8 = 5
+    let h: I64 = 5
+    io.println("{i32_(e * -1)} {i32_(-1 * e)} {i8_(g * -1)} {i8_(-1 * g)} {i64_(h * -2)} {i32_(e + -3)} {i8_(g - -3)}")
+}
+"#, ["-5 -5 -5 -5 -10 2 8"]),
+        expect_run(dir, "sized_shifts", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec { iov_base: Ptr[U8], iov_len: U64 }
+fn n64(n: U64) -> U64 { n }
+fn n32(n: U32) -> U32 { n }
+fn n8(n: U8) -> U8 { n }
+fn main() {
+    let s: U32 = 3
+    let b: U8 = 3
+    with ffi.scope() as sc {
+        let p = sc.alloc[IoVec]()
+        p.iov_len.write(4)
+        let r = p.iov_len.read()
+        io.println("{n32(s << 2)} {n32(s >> 1)} {n8(b << 1)} {n64(r << 2)} {n64(r >> 1)} {n64(p.iov_len.read() << 2)}")
+    }
+}
+"#, ["12 1 6 16 2 16"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}
+
+test "every position the operand rule names gives the literal the operand's type" {
+    let dir = fresh_dir("positions")
+    report([
+        expect_run(dir, "positions", #"fn n64(n: U64) -> U64 { n }
+fn flag(x: Bool) -> Bool { x }
+fn twice() -> U64 {
+    let q: U64 = 3
+    q * 2
+}
+fn ret_early(c: Bool) -> U64 {
+    let q: U64 = 5
+    if c { return q + 1 }
+    0
+}
+fn main() {
+    let q: U64 = 4
+    let s: U32 = 3
+    let t: U64 = q * 2
+    let mut x: U64 = 1
+    x += 2
+    x *= q
+    let a1 = n64((q * 2) + 1)
+    let a2 = n64(1 + (2 * q))
+    io.println("{a1} {a2} {twice()} {ret_early(true)} {t} {x}")
+    let c1 = flag(q * 2 == 8)
+    let c2 = flag(8 == 2 * q)
+    let c3 = flag(q < 5)
+    io.println("{c1} {c2} {c3}")
+    let s1 = n64(q << 2)
+    let s2 = n64(q >> 1)
+    let s3 = n64(q << s)
+    io.println("{s1} {s2} {s3}")
+    let b1 = n64(q & 6)
+    let b2 = n64(5 | q)
+    let b3 = n64(q ^ 1)
+    let b4 = n64(q - 1)
+    let b5 = n64(q / 2)
+    let b6 = n64(q % 3)
+    io.println("{b1} {b2} {b3} {b4} {b5} {b6}")
+}
+"#, ["9 9 6 6 8 12", "true true true", "16 2 32", "4 5 5 3 2 1"]),
+        expect_run(dir, "value_positions", #"type Box64 { v: U64 }
+fn n64(n: U64) -> U64 { n }
+fn id[T](x: T) -> T { x }
+fn pair[T](a: T, b: T) -> T {
+    let _u = a
+    b
+}
+fn first(t: (U64, Int)) -> U64 { t.0 }
+fn kw(a: U64, -- b: U64 = 1) -> U64 { a + b }
+fn main() {
+    let q: U64 = 4
+    let b = Box64 { v: q * 2 }
+    let o = Some(q * 2)
+    let t = first((q * 2, 1))
+    let i = n64(id(q * 2))
+    let p = n64(pair(q, 2 * q))
+    let g = fn(a: U64) -> U64 { a }
+    let f = g(2 * q)
+    let k = kw(1, b: q * 2)
+    io.println("{b.v} {o ?? 0} {t} {i} {p} {f} {k}")
+}
+"#, ["8 8 8 8 8 8 9"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a literal beside a generic call takes its solved type, and a non-integer operand stays an error" {
+    let dir = fresh_dir("solved")
+    report([
+        expect_run(dir, "generic_call", #"fn next(n: U64) -> U64 { n + 1 }
+fn id[T](x: T) -> T { x }
+fn main() {
+    let r: U64 = 4
+    let t = id(r)
+    io.println("{next(2 * id(r))} {next(id(r) * 2)} {next(id(r) & 2)} {next(2 | id(r))} {next(id(r) << 1)} {next(2 * t)}")
+}
+"#, ["9 9 1 7 9 9"]),
+        expect_errors(dir, "own_type_parameter", #"fn f[T](x: T) -> T { 2 * x }
+fn g[T](x: T) -> T { x & 2 }
+fn h[T](x: T) -> T { x << 1 }
+fn main() {
+    io.println("{f(1)} {g(1)} {h(1)}")
+}
+"#, 5, ["arithmetic `*` requires the Mul bound on type parameter T", "binary `*`: incompatible types Int and T", "bitwise `&` requires integer operand, got T", "shift `<<` requires integer left operand, got T"]),
+        expect_errors(dir, "solved_to_str_bitwise", #"fn first[T](xs: List[T]) -> T { xs.get(0).unwrap() }
+fn takes(s: Str) { io.println(s) }
+fn main() {
+    takes(first([]) | 2)
+}
+"#, 1, ["bitwise `|` requires integer operand"]),
+        expect_errors(dir, "solved_to_str_arith", #"fn first[T](xs: List[T]) -> T { xs.get(0).unwrap() }
+fn takes(s: Str) { io.println(s) }
+fn main() {
+    takes(2 + first([]))
+}
+"#, 2, ["argument 1 of `takes` expects Str"]),
+        expect_errors(dir, "solved_to_bool_shift", #"fn mk[T]() -> T { panic("x") }
+fn takes(s: Bool) { io.println("{s}") }
+fn main() {
+    if false { takes(mk() >> 1) }
+    io.println("done")
+}
+"#, 1, ["shift `>>` requires integer left operand"]),
+        expect_errors(dir, "solved_to_float_arith", #"fn first[T](xs: List[T]) -> T { xs.get(0).unwrap() }
+fn takes(f: Float) { io.println("{f}") }
+fn main() {
+    let xs = []
+    takes(1 + first(xs))
+}
+"#, 2, ["argument 1 of `takes` expects Float"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a literal out of the operand's range and an Int operand are still errors" {
+    let dir = fresh_dir("errors")
+    report([
+        expect_errors(dir, "out_of_range", #"fn n8(n: U8) -> U8 { n }
+fn main() {
+    let d: U8 = 4
+    let a = n8(d * 300)
+    let b = n8(256 + d)
+    io.println("{a} {b}")
+}
+"#, 2, ["error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)", "error[IntLiteralOutOfRange]: 256 does not fit in U8 (0 to 255)"]),
+        expect_errors(dir, "int_operand", #"fn n64(n: U64) -> U64 { n }
+fn main() {
+    let n: Int = 4
+    let a = n64(n * 2)
+    let b = n64(2 * n)
+    io.println("{a} {b}")
+}
+"#, 2, ["error[TypeError]: argument 1 of `n64` expects U64, got Int"]),
+        expect_errors(dir, "negative_beside_unsigned", #"fn n64(n: U64) -> U64 { n }
+fn n8(n: U8) -> U8 { n }
+fn main() {
+    let d: U8 = 4
+    let q: U64 = 4
+    io.println("{n8(d * -1)} {n64(-1 * q)}")
+}
+"#, 2, ["error[IntLiteralOutOfRange]: -1 does not fit in U8", "error[IntLiteralOutOfRange]: -1 does not fit in U64"]),
+        expect_errors(dir, "out_of_signed_range", #"fn i8_(n: I8) -> I8 { n }
+fn main() {
+    let g: I8 = 4
+    io.println("{i8_(g * 200)} {i8_(-200 + g)}")
+}
+"#, 2, ["200 does not fit in I8 (-128 to 127)", "-200 does not fit in I8 (-128 to 127)"]),
+        expect_errors(dir, "wider_operand", #"fn n8(n: U8) -> U8 { n }
+fn main() {
+    let q: U64 = 4
+    io.println("{n8(q >> 1)} {n8(q * 2)} {n8(2 * q)}")
+}
+"#, 3, ["argument 1 of `n8` expects U8, got U64"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}
+
+test "an operator on an operand with an earlier error reports no second error" {
+    let dir = fresh_dir("after_error")
+    report([
+        expect_errors(dir, "shift_after_error", #"fn main() {
+    let a = nope().to_u32()
+    let s = a >> 2
+    let _ = s.wrapping_add(s)
+}
+"#, 1, ["undefined function `nope`"]),
+        expect_errors(dir, "literal_beside_error", #"fn main() {
+    let a = nope().to_u32()
+    let s = (a & 255) + 1
+    let _ = s.wrapping_add(s)
+}
+"#, 1, ["undefined function `nope`"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a block operand that names its own local is checked where its operator's value goes" {
+    let dir = fresh_dir("block_operand")
+    report([
+        expect_errors(dir, "into_field_and_assign", #"type Box { v: U8 }
+fn main() {
+    let q: U64 = 300
+    let b = Box { v: { let h = q
+        h } * 2 }
+    io.println("{b.v}")
+    let mut x: U8 = 0
+    x = { let h = q
+        h } * 2
+    io.println("{x}")
+}
+"#, 2, ["field `v` of `Box`: declared type U8 but got U64", "assignment: cannot assign U64 to U8"]),
+        expect_errors(dir, "into_return", #"fn f(q: U64) -> U8 {
+    return { let h = q
+        h } * 2
+}
+fn main() {
+    io.println("{f(300)}")
+}
+"#, 1, ["return value type U64 does not match function `f` return type U8"]),
+        expect_errors(dir, "into_fn_value_and_compound", #"fn main() {
+    let q: U64 = 300
+    let g = fn(a: U8) -> U8 { a }
+    io.println("{g({ let h = q
+        h } * 2)}")
+    let mut y: U8 = 1
+    y += { let h = q
+        h } * 2
+    io.println("{y}")
+}
+"#, 2, ["function `g` argument 0 expects U8, got U64", "assignment: cannot assign U64 to U8"]),
+        expect_errors(dir, "into_if_branch", #"fn pick(c: Bool) -> U8 {
+    let q: U64 = 300
+    let x: U8 = if c { { let h = q
+        h } * 2 } else { 1 }
+    x
+}
+fn main() {
+    io.println("{pick(true)}")
+}
+"#, 2, ["if branches have incompatible types: U64 vs U8", "variable `x`: declared type U8 but got U64"]),
+        expect_errors(dir, "beside_a_typed_operand", #"fn main() {
+    let q: U64 = 300
+    let d = ({ let h = q
+        h } * 2).to_u8()
+    io.println("{d}")
+    let x: U8 = 1
+    let y = x + { let g = q
+        g } * 2
+    io.println("{y}")
+}
+"#, 1, ["binary `+`: incompatible types U8 and U64"]),
+        expect_errors(dir, "generic_first", #"fn pair[T](a: T, b: T) -> T {
+    let _u = b
+    a
+}
+fn main() {
+    let q: U64 = 300
+    let d: U8 = 1
+    let x = pair({ let h = q
+        h } * 2, d)
+    io.println("{x}")
+}
+"#, 1, ["argument 2 of `pair` expects U64, got U8"]),
+        expect_errors(dir, "generic_second", #"fn pair[T](a: T, b: T) -> T {
+    let _u = b
+    a
+}
+fn main() {
+    let q: U64 = 300
+    let d: U8 = 1
+    let x = pair(d, { let h = q
+        h } * 2)
+    io.println("{x}")
+}
+"#, 1, ["argument 2 of `pair` expects U8, got U64"]),
+        expect_errors(dir, "spread_source", #"fn main() {
+    let q: U8 = 7
+    let strs: List[Str] = ["a", "b"]
+    let xs = [{ let h = q
+        h }, ..strs]
+    io.println("{xs.len()}")
+}
+"#, 1, ["list spread source has element type Str but the list is built from U8"]),
+        expect_run(dir, "carriers_and_pairs", #"fn id[T](x: T) -> T { x }
+fn main() {
+    let q: U64 = 300
+    let o = Some({ let h = q
+        h } * 2)
+    io.println("{o ?? 0}")
+    let r = id({ let h = q
+        h } * 2)
+    io.println("{r}")
+    let mut xs = []
+    xs.push({ let h = q
+        h } * 2)
+    let t: U64 = xs.get(0).unwrap()
+    io.println("{t}")
+    let z = ({ let h = q
+        h } * 2) + ({ let g = q
+        g } * 3)
+    io.println("{z}")
+}
+"#, ["600", "600", "600", "1500"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a literal beside a block operand in a field default is checked where its value goes" {
+    let dir = fresh_dir("field_default")
+    report([
+        expect_errors(dir, "field_default_operator", #"let Q: U64 = 300
+fn n8(n: U8) -> U8 { n }
+type T { x: U8 = n8({ let h = Q
+    h } * 2) }
+fn main() {
+    let t = T {}
+    io.println("{t.x}")
+}
+"#, 1, ["argument 1 of `n8` expects U8, got U64"]),
+        expect_errors(dir, "field_default_block_error", #"type T { x: U8 = { let h: U8 = "a"
+    h } }
+fn main() {
+    let t = T {}
+    io.println("{t.x}")
+}
+"#, 1, ["variable `h`: declared type U8 but got Str"]),
+    ])
+    let _ = sh("rm -rf {dir}")
+}

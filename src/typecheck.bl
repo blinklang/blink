@@ -5815,6 +5815,34 @@ fn tc_operand_literal_type(node: Int, lt: Int, rt: Int) -> Int ! TypeCheck.Resol
     -1
 }
 
+// A lone int literal has the other operand's type, so the operator has that type too. The
+// literal's default Int would be a type nobody wrote.
+fn tc_lone_literal_beside(lit: Int, other: Int) -> Bool {
+    is_int_literal_node(lit) != 0 && is_int_literal_node(other) == 0
+}
+
+// A metavar, or another declaration's type parameter such as a generic call's result, that
+// nothing has solved yet.
+fn tc_operand_type_unsolved(tid0: Int) -> Bool {
+    if tc_tid_is_no_info(tid0) != 0 { return false }
+    let tid = tc_resolve(tid0)
+    tc_is_unbound_metavar(tid) != 0 || tc_typevar_is_open(tid) != 0
+}
+
+// An operand has no type yet that an operator could reject when no walk has typed it, or when
+// it is unsolved in the name-resolution walk, which a later walk repeats with the types
+// settled. Past that walk nothing checks the operator again once its operand is solved, so
+// an unsolved operand there is checked as it stands.
+fn tc_operand_type_open(tid: Int) -> Bool {
+    tc_tid_is_no_info(tid) != 0 || (tc_boundary_check_active == 0 && tc_operand_type_unsolved(tid))
+}
+
+// The type a lone literal takes from the other operand, unless that operand is unsolved past
+// the name-resolution walk (see tc_operand_type_open).
+fn tc_literal_takes_other(lit: Int, other: Int, other_t: Int) -> Bool {
+    tc_lone_literal_beside(lit, other) && (tc_operand_type_open(other_t) || !tc_operand_type_unsolved(other_t))
+}
+
 fn tc_literal_fits(node: Int, k: TyKind) -> Bool {
     tc_digits_within(int_lit_node_digits(node), tc_int_literal_limit(k, node_kind(node) == NodeKind.UnaryOp))
 }
@@ -24064,14 +24092,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     tc_error_at("binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
                 }
             }
+            if tc_literal_takes_other(node_right(node), node_left(node), lt) { return lt }
+            if tc_literal_takes_other(node_left(node), node_right(node), rt) { return rt }
             if tc_tid_is_no_info(lt) == 0 { return lt }
             return rt
         }
         if op == "&" || op == "|" || op == "^" {
-            if tc_tid_is_no_info(lt) == 0 && is_integer_type(lt) == 0 {
+            if !tc_operand_type_open(lt) && is_integer_type(lt) == 0 {
                 tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(lt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, lt))
             }
-            if tc_tid_is_no_info(rt) == 0 && is_integer_type(rt) == 0 {
+            if !tc_operand_type_open(rt) && is_integer_type(rt) == 0 {
                 tc_error_at_code("bitwise `{op}` requires integer operand, got {type_to_str(rt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, rt))
             }
             let lit_t = tc_operand_literal_type(node, lt, rt)
@@ -24079,15 +24109,17 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tc_tid_is_no_info(lt) == 0 && tc_tid_is_no_info(rt) == 0 && types_compatible(lt, rt) == 0 {
                 tc_error_at("bitwise `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}", node)
             }
+            if tc_literal_takes_other(node_right(node), node_left(node), lt) { return lt }
+            if tc_literal_takes_other(node_left(node), node_right(node), rt) { return rt }
             if tc_tid_is_no_info(lt) == 0 { return lt }
             return rt
         }
         if op == "<<" || op == ">>" {
-            if tc_tid_is_no_info(lt) == 0 && is_integer_type(lt) == 0 {
+            if !tc_operand_type_open(lt) && is_integer_type(lt) == 0 {
                 tc_error_at_code("shift `{op}` requires integer left operand, got {type_to_str(lt)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, lt))
             }
             let rhs = node_right(node)
-            if tc_tid_is_no_info(rt) == 0 && is_shift_amount_type(rt, rhs) == 0 {
+            if !tc_operand_type_open(rt) && is_shift_amount_type(rt, rhs) == 0 {
                 tc_error_at("shift `{op}` amount must be U32, got {type_to_str(rt)}", node)
             }
             // An amount out of U32's range is E0318 at the literal already.
@@ -24098,8 +24130,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     tc_error_at("shift `{op}` amount {amt} out of range for {type_to_str(lt)} (must be 0..{bw})", node)
                 }
             }
-            if tc_tid_is_no_info(lt) == 0 { return lt }
-            return TYPE_INT
+            // A shift has its left operand's type, so while nothing has set that type, the
+            // shift's is not known either.
+            return lt
         }
         if tc_tid_is_no_info(lt) == 0 { return lt }
         return rt
@@ -32826,6 +32859,10 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
     // global-initializer walk sets the same global for the same reason.
     let saved_module = nr_current_module
     nr_current_module = node_module(td)
+    // A default is a value walked in its own scope, as a body's values are, so a block in it
+    // is typed by walking it, not left unknown as the name-resolution pass leaves one.
+    let saved_boundary = tc_boundary_check_active
+    tc_boundary_check_active = 1
     let mut i = 0
     while i < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, i)
@@ -32843,6 +32880,7 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
         }
         i = i + 1
     }
+    tc_boundary_check_active = saved_boundary
     nr_current_module = saved_module
     tc_pop_tparam_scope(tparams)
 }
