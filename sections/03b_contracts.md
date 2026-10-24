@@ -518,7 +518,7 @@ warning[V0002]: contract always fails
 
 The warning names the call site and the folded predicate.
 
-**When it fires.** Every argument that the predicate reads is a literal at the call site, and the folded predicate is `false`. Only the arguments that the predicate reads must be literals. A literal is a tree of literals, parentheses, unary `-`, and `+ - * / %` (the tree of W0708), or a list, string or range literal whose parts are such trees. A `let` or `const` reference stops the tree. The predicate must fold in the const evaluator that compile-time constants use (E0546).
+**When it fires.** Every argument that the predicate reads is a literal at the call site, and the folded predicate is `false`. Only the arguments that the predicate reads must be literals. A literal is a tree of literals, parentheses, unary `-`, and `+ - * / %`, or a list, string or range literal whose parts are such trees. A `let` or `const` reference stops the tree. The predicate must fold in the const evaluator that compile-time constants use (E0546).
 
 ```blink
 @requires(amount > 0)

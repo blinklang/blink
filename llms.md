@@ -33,7 +33,7 @@ Key facts:
 - The unit type is `()`. `Void` exists only in `Ptr[Void]`
 - No silent type defaults: an empty `[]`, a bare `None` or an unused `Map.new()` is `E0301`. Annotate it, or write `Map.new[K, V]()`, `Set.new[T]()`
 - One empty form per type: `[]` for `List`, `Map.new()`, `Set.new()`, `Bytes.new()`, `StringBuilder.new()`. `Map()`, `Set()`, `Bytes()` and `List.new()` do not exist: each is an error (E0504 or E0505) with a fix
-- An integer literal must fit its type (`let x: U8 = 300` is `E0318`); a literal with no expected type is `Int`. `-128` and `-(128)` are one literal, so `let b: I8 = -128` is valid
+- An integer literal must fit its type (`let x: U8 = 300` is `E0318`); a literal with no expected type is `Int`. `-128` and `-(128)` are one literal, so `let b: I8 = -128` is valid. A tree of only literals (`x + (2 * 3)`) takes the type of the other operand
 - Type parameters are rigid in a generic body: arithmetic on `T` needs a bound (`T: Add`). Bounds are checked at the call (`E0306`). Explicit call type arguments: `f[T](x)`
 - Keyword parameters follow `--`: `fn f(a: Int, -- b: Str = "x")`. Defaults are constants
 - A default must fit every instance of a parameter type that names a type parameter: `x: T = 3` is `E0300`, `x: Option[T] = None` and `xs: List[T] = []` fit. A default never fixes `T`. `[]` is a const only as a keyword or field default

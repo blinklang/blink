@@ -1767,7 +1767,8 @@ process(300)              // error[IntLiteralOutOfRange]: 300 does not fit in U8
   L ::= INT_LIT | "(" L ")"
   ```
   `-128`, `(-128)` and `-(128)` match. `-(-5)`, `-(1 + 2)` and `-x` do not match: each is a call to `Neg` (§3.6). Under a signed type, the range check uses the negative value, so `let b: I8 = -128` is valid, and `-9223372036854775808` is the `Int` minimum. Under an unsigned type, every negative literal is E0318, whatever its value, `-0` included. The error has the note `unsigned types hold no negative values`. `-x` on an unsigned value keeps the `Neg` error.
-- **Operator operands.** For `+ - * / % & | ^ == != < <= > >=`, a literal operand (a negative literal included) takes the integer type of the other operand, on either side. When an expected integer type `T` reaches one of `+ - * / % & | ^`, whose type is `T`×`T`→`T`, both operands are checked against `T`. A comparison gives `Bool`, so an expected type does not reach its operands. When both operands are literals and no type reaches them, both are `Int`. The right operand of `<<` and `>>` is `U32`, and the left operand gets the expected type, if there is one. This list is the only statement of operator positions for a literal; other sections refer to it.
+- **Operator operands.** For `+ - * / % & | ^ == != < <= > >=`, a literal operand (a negative literal included), or a *literal tree*, takes the integer type of the other operand, on either side. A literal tree is `K` in §3.6 *Literal arithmetic overflow*: literals, parentheses, unary `-`, and the operators `+ - * / % & | ^ << >>`. A tree with a name or a call in it is not a literal tree. The checker finds the type of the other operand first, then checks the whole tree against that type, so each literal in the tree takes it. Unary `-` over a tree passes the type to the tree. A comparison passes the type of the other operand to the tree, but it gives `Bool`, so an expected type does not reach its operands. When an expected integer type `T` reaches one of `+ - * / % & | ^`, whose type is `T`×`T`→`T`, both operands are checked against `T`. When both operands are literals or literal trees and no type reaches them, both are `Int`. When the type is a type variable that nothing has solved yet, the variable becomes `Int`. The right operand of `<<` and `>>`, a literal or a literal tree, is `U32`, and the left operand gets the expected type, if there is one; inside a literal tree, the left operand of a shift gets the type of the tree. This list is the only statement of operator positions for a literal or a literal tree; other sections refer to it.
+- **A literal tree that does not fit.** The range check applies to each literal in the tree, at the type the tree takes. A literal that does not fit is E0318 at that literal. When every literal fits but an operation overflows, the program compiles, gives W0708 (§3.6), and panics at run time, as `let bad: I8 = 127 + 1` does.
 - **Patterns.** A literal pattern and a literal bound of a range pattern take the type of the scrutinee and follow the same rule. A negative bound under an unsigned scrutinee is E0318.
 - **Const contexts.** A literal out of range in a const context (§2.21) is E0318, not `ConstEvalPanic` (E0546), because nothing is evaluated. E0546 is for evaluation that would panic, such as overflow in an operation.
 
@@ -1802,7 +1803,26 @@ fn main() {
 }
 ```
 
-A literal does not wait for a later line to fix its type, as Rust's `{integer}` does. Its type is known at the literal, so it never leaves a type variable that would need a default (§3.4 *Under-Determined Types*).
+```blink
+fn trees(x: I8, u: U8, m: U64) -> U64 {
+    let a = x + (2 * 3)         // OK: the tree is I8
+    let b = x + 2 * 3           // OK: precedence makes 2 * 3 a tree, and it is I8
+    let c = (127 + 1) + x       // OK: the tree is I8 on the left side too
+                                //   warning[LiteralArithmeticOverflow]; RUNTIME PANIC: I8 overflow in addition
+    let d = x + -(2 * 3)        // OK: unary - passes I8 to the tree
+    let e = u < (100 + 100)     // OK: the comparison passes U8 to the tree; 200 fits
+    let f = u << (1 + 1)        // OK: the amount is a tree of type U32
+    let g = m & (1 << 63)       // OK: the tree is U64; 63 is the U32 shift amount
+    let h = u + (200 + 100)     // OK: 200 and 100 fit in U8
+                                //   warning[LiteralArithmeticOverflow]; RUNTIME PANIC: U8 overflow in addition
+    let k = u + (300 - 100)     // error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)
+    let n = 1 + (2 * 3)         // OK: both operands are literal trees and no type reaches them, so Int
+    let p = x + (n * 3)         // error: `n` is a name, so (n * 3) is not a literal tree; it is Int
+    m
+}
+```
+
+A literal, or a literal tree, does not wait for a later line to fix its type, as Rust's `{integer}` does. Its type is known at the operation that holds it. For a literal tree in operand position, that operation is the enclosing operator, which has the tree as an operand, and not the root operator of the tree. So the type never leaves a type variable that would need a default (§3.4 *Under-Determined Types*).
 
 The compiler checks the range of each literal at the literal (E0318, *Integer literal range*). It evaluates an expression only in a const context (§2.21), where an overflow is E0546. Other arithmetic is checked at run time by the overflow machinery described above; for arithmetic on literals only, the warning W0708 reports an overflow that always happens (§3.6, *Literal arithmetic overflow*).
 
@@ -5241,12 +5261,14 @@ Suppress the warning on a function with `@allow(DivisionByLiteralZero)`, or set 
 **Literal arithmetic overflow.** Outside a const context (§2.21), an integer operation that always overflows is not a compile error, when its operands are only literals. The expression compiles and panics at run time, as every overflow does (§3.2, *Overflow behavior*). In a const context it is `ConstEvalPanic` (§2.21, *Const Evaluation Must Succeed*). The compiler gives the warning `LiteralArithmeticOverflow` (W0708) for the largest tree of integer literals, defined by `K`. A negative literal `N` (§3.2, *Integer literal range*) is matched first:
 
 ```
-K ::= N | L | "(" K ")" | "-" K | K op K        op in { + - * / % }
+K ::= N | L | "(" K ")" | "-" K | K op K        op in { + - * / % & | ^ << >> }
 ```
 
-This grammar is wider than the negative-literal rule in §3.2. There, `-(-5)` is a call to `Neg` and is not a negative literal. Here, a unary `-` over a tree is a node of the tree, so `-(-128)` at `I8` warns because `-MIN` is out of range. `-128` is a negative literal, a leaf, and E0318 governs it. Shifts `<<` and `>>` are not part of the tree.
+This grammar is wider than the negative-literal rule in §3.2. There, `-(-5)` is a call to `Neg` and is not a negative literal. Here, a unary `-` over a tree is a node of the tree, so `-(-128)` at `I8` warns because `-MIN` is out of range. `-128` is a negative literal, a leaf, and E0318 governs it.
 
-The warning reads the tree as written. It checks each operation at the type that the checker gives it (§3.2, *Operator operands*). Whether a literal tree in operand position of a non-literal expression takes the type of the other operand is not decided here. The warning uses whatever type the checker gives each operation.
+`K` is the one definition of a literal tree for this section and for §3.2 *Operator operands*. The operators `& | ^` never give this warning. A shift `<<` or `>>` gives it by the shift rule in §3.2 *Bitwise operations*, which this section does not restate.
+
+The warning reads the tree as written. It checks each operation at the type that the checker gives it. A literal tree in operand position takes its type by §3.2 *Operator operands*.
 
 - A `const` reference or a `let` binding stops the tree, whatever its value.
 - It does no flow analysis, so it also fires in a branch that never runs.
@@ -5262,6 +5284,12 @@ let n: I8 = -128                // ok: a negative literal, in range
 let m: I8 = -(-128)             // warning[LiteralArithmeticOverflow]; RUNTIME PANIC: I8 overflow in negation
 let d: I8 = (127 + 1) / 0       // warning[LiteralArithmeticOverflow] at 127 + 1; warning[DivisionByLiteralZero] at 0
 let b: U8 = 300                 // error[IntLiteralOutOfRange] (E0318): the literal does not fit
+let k: U8 = 255 & (15 | 240)    // ok: `& | ^` never give the warning
+let s: U8 = 1 << 3              // ok: a shift by 3 does not panic
+
+fn tree_in_operand(x: I8) -> I8 {
+    x + (127 + 1)               // warning[LiteralArithmeticOverflow]; RUNTIME PANIC: I8 overflow in addition
+}
 
 const LIMIT: I8 = 127
 
