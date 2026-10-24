@@ -2443,7 +2443,7 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
 
 No path ever silently picks a winner between two constructible names: a struct and a variant with one name is a declaration-time error (E0518), and a variant carries its enum in an expression. A value with the name of a user variant does not collide with it, because a bare name never reaches a user variant. A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant. That is a shadow between scopes, by the order in *Values come first*, and W1011 marks it (§10.6 *Shadowing Rules*).
 
-**A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A name after `K.` that does not start with an uppercase letter is never a variant, so it never gets E0547 (*Member case*, above). A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
+**A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A name after `K.` that does not start with an uppercase letter is never a variant, so it never gets E0547 (*Member case*, above). A `Q` that is not an enum is E0547 in an expression too (`Int.Zed`, `Point.Zed(1)`). The message says what `Q` is, as in a pattern. A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
 
 ```blink
 type Level { Low, High }
@@ -2457,6 +2457,20 @@ fn main() {
 ```
 error[NoSuchVariant]: `Level` has no variant `Hihg`
   help: did you mean `High`?
+```
+
+```blink
+type Point { x: Int, y: Int }
+
+fn main() {
+    let a = Int.Zed          // error[NoSuchVariant]
+    let b = Point.Zed(1)     // error[NoSuchVariant]
+}
+```
+
+```
+error[NoSuchVariant]: `Int` is not an enum; it has no variants
+error[NoSuchVariant]: `Point` is a struct; it has no variants
 ```
 
 Variant construction does not accept `..source`; copy-update (§2.16) applies to struct literals only. Every variant field must be supplied.
@@ -3443,9 +3457,23 @@ A binder in a refutable pattern cannot have the name of an uppercase variant, be
 - a bare name with no payload and an uppercase first character (`Dott`) when the type at that pattern position is an enum that has no variant of that name;
 - a qualified name `K.Zed`, with or without a payload, when the enum `K` declares no variant `Zed`.
 
-When the type at the pattern position is not an enum (a builtin scalar, a struct, a tuple or a type parameter), a bare name with a payload, and a bare name with an uppercase first character and no payload, is `EnumPatternNeedsEnumScrutinee` (E0308), as *Bare names: variant or binding* says. For a struct, the message says that the type has no variants: "`Point` is a struct; it has no variants". For a type parameter, the help suggests no variant. The compiler reports E0308 for a type parameter where the generic function is defined, not at a call.
+A variant pattern needs an enum. When the type at the pattern position is not an enum, a bare name with a payload, and a bare name with an uppercase first character and no payload, is `EnumPatternNeedsEnumScrutinee` (E0308), as *Bare names: variant or binding* says. The rule is "not an enum". These types are examples, not a full list: a builtin scalar, a struct, a tuple, a `List` or a `Map`, and a type parameter. A type alias is resolved first, so an alias of an enum is an enum. For a struct, the message says that the type has no variants: "`Point` is a struct; it has no variants". For a scalar or a builtin generic type, the message says: "`Int` is not an enum; it has no variants". For a type parameter, the help suggests no variant. The compiler reports E0308 for a type parameter where the generic function is defined, not at a call.
 
-When the type at the pattern position is not known yet, the compiler reports `CannotInferType` (E0301, §3.4 *Under-Determined Types*), not E0547 or E0308. A variant pattern on a builtin scalar is `EnumPatternNeedsEnumScrutinee` (E0308, §3.4 *Enums Nominally Distinct from Int*). A bare name with no payload whose first character is not an uppercase letter is a binding, so it never gets E0547.
+```blink
+fn total(xs: List[Int]) -> Int {
+    match xs {
+        Empty => 0         // error[EnumPatternNeedsEnumScrutinee]
+        _ => 1
+    }
+}
+```
+
+```
+error[EnumPatternNeedsEnumScrutinee]: `List[Int]` is not an enum; it has no variants
+  help: to bind the value, write a lowercase name
+```
+
+When the type at the pattern position is not known yet, the compiler reports `CannotInferType` (E0301, §3.4 *Under-Determined Types*), not E0547 or E0308. A variant pattern on a builtin scalar, bare or qualified, is `EnumPatternNeedsEnumScrutinee` (E0308, §3.4 *Enums Nominally Distinct from Int*). A qualified pattern `Q.V` where `Q` is not an enum is a different error: it is E0547 (*Qualified names and the wrong type*, below). A bare name with no payload whose first character is not an uppercase letter is a binding, so it never gets E0547.
 
 The rule applies at every depth. In `Some(Somee(v))` on an `Option[Option[Int]]`, the inner pattern is checked against the payload type of `Some`, so `Somee` gets E0547.
 
@@ -3495,10 +3523,10 @@ error[NoSuchVariant]: `Token` has no variant `Lit`
 **Qualified names and the wrong type.** The compiler checks a qualified pattern `Q.V` in this order, and the first failure is the only error for that pattern:
 
 1. Resolve `Q`. A name that is not a type is `UnknownType` (E0507).
-2. Look up `V` in `Q`. A variant that `Q` does not declare is E0547, and the message names `Q`.
+2. Look up `V` in `Q`. A variant that `Q` does not declare is E0547, and the message names `Q`. If `Q` is a type that is not an enum, `Q` declares no variant, and the error is E0547. The message says what `Q` is. The scrutinee type does not change this.
 3. Compare `Q` with the type at the pattern position. A different type is `TypeError` (E0300).
 
-So `Other.Zed` on a `T` scrutinee gives one E0547 for `Other`, and no E0300. A qualified variant of a different enum, such as `Other.Q(v)` on a `T` scrutinee, is E0300, the same error as `let t: T = Other.Q(1)`. A struct pattern of a different struct type, such as `Q { y }` on a `P` scrutinee, is also E0300. The header names both types, and the span is the whole path (`Other.Q`) or type name (`Q`). The help lists the variants of the expected type. When that type declares a variant with the same name and the same payload form, the help gives the fix `T.Q`, and the fix is machine-applicable.
+So `Other.Zed` on a `T` scrutinee gives one E0547 for `Other`, and no E0300. `Point.Zed` on a `Color` scrutinee, where `Point` is a struct, gives one E0547 too. A qualified variant of a different enum, such as `Other.Q(v)` on a `T` scrutinee, is E0300, the same error as `let t: T = Other.Q(1)`. A struct pattern of a different struct type, such as `Q { y }` on a `P` scrutinee, is also E0300. The header names both types, and the span is the whole path (`Other.Q`) or type name (`Q`). The help lists the variants of the expected type. When that type declares a variant with the same name and the same payload form, the help gives the fix `T.Q`, and the fix is machine-applicable.
 
 ```blink
 type T { A(Int), Q(Int) }
@@ -3516,6 +3544,86 @@ fn f(x: T) -> Int {
 error[TypeError]: pattern of type `Other` used on a value of type `T`
   help: write `T.Q`; `T` declares: A, Q
 ```
+
+A type parameter is equal only to itself. A qualified enum pattern or a struct pattern on a scrutinee of a type parameter is E0300, with or without bounds. The compiler reports it where the generic function is defined, not at a call.
+
+```blink
+type Color { Red, Green }
+
+fn name[T](t: T) -> Str {
+    match t {
+        Color.Red => "red"     // error[TypeError]
+        _ => "other"
+    }
+}
+```
+
+```
+error[TypeError]: pattern of type `Color` used on a value of type `T`
+```
+
+A qualified pattern `Q.V` where `Q` is not an enum is E0547, whatever the scrutinee type. The header names what `Q` is. For a struct it says: "`Point` is a struct; it has no variants". For a scalar or a builtin generic type it says: "`Int` is not an enum; it has no variants". The span is the variant name.
+
+```blink
+type Point { x: Int, y: Int }
+type Color { Red, Green }
+
+fn f(c: Color) -> Int {
+    match c {
+        Point.Zed => 1     // error[NoSuchVariant]
+        _ => 0
+    }
+}
+
+fn g(xs: List[Int]) -> Int {
+    match xs {
+        List.Zed(v) => v   // error[NoSuchVariant]
+        _ => 0
+    }
+}
+```
+
+```
+error[NoSuchVariant]: `Point` is a struct; it has no variants
+error[NoSuchVariant]: `List[Int]` is not an enum; it has no variants
+```
+
+Step 3 has one exception. On an `Int` (or another builtin number type), a qualified variant of an enum is `EnumPatternNeedsEnumScrutinee` (E0308), and the help suggests a conversion. The exception is for a builtin scalar position only. On a struct, a `List`, a tuple or a type parameter, the same pattern is E0300. These types are examples, not a full list.
+
+```blink
+type Color { Red, Green }
+type Point { x: Int, y: Int }
+
+fn from_int(n: Int) -> Str {
+    match n {
+        Color.Red => "red"   // error[EnumPatternNeedsEnumScrutinee]
+        _ => "other"
+    }
+}
+
+fn from_point(p: Point) -> Str {
+    match p {
+        Color.Red => "red"   // error[TypeError]
+        _ => "other"
+    }
+}
+
+fn from_list(xs: List[Int]) -> Int {
+    match xs {
+        Option.Some(v) => v  // error[TypeError]
+        _ => 0
+    }
+}
+```
+
+```
+error[EnumPatternNeedsEnumScrutinee]: match arm names variant `Color.Red`, but the value being matched has type `Int` -- a scalar has no variants
+  help: match the enum itself, or cross the boundary explicitly with Color.from_int(...), which answers Option[Color]
+error[TypeError]: pattern of type `Color` used on a value of type `Point`
+error[TypeError]: pattern of type `Option` used on a value of type `List[Int]`
+```
+
+A type alias resolves at step 1. A qualified pattern through an alias of an enum is legal.
 
 **After the error.** Each binder under a pattern with one of these errors has the poison type (§6.3.5). The compiler still checks the arm body and suppresses each diagnostic that only the poison type causes. *Exhaustiveness* below says how such an arm counts for coverage. These rules apply to `blink check` and to `blink build` alike: each variant pattern resolves to its enum and variant before code generation, or the compiler reports an error, so the two commands report the same diagnostics for one program.
 
