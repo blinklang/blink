@@ -3279,7 +3279,7 @@ The rows are in canonical order (see *Canonical Ordering* below).
 | `@tags("tag", ...)` | test block | no | String tags for test filtering. See §2.20. | checked |
 | `@skip` or `@skip("reason")` | test block | no | Static, unconditional skip: the compiler type-checks the body and the runner does not run it. For a skip that depends on run-time state, call `skip()` in the body instead. See §2.20 *Skipping Tests*. | checked |
 | `@allow(WarningName, ...)` | fn, type | yes: the names add up | Suppresses the named warnings inside the annotated function, or inside the type declaration and its body. It does not reach an `impl` block declared apart from the type. Overrides `blink.toml` `[lints]` for that scope. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842); a live name that is not a warning name is `NotAWarningName` (E0847). See §4.16.8. | checked |
-| `@deprecated(since, removal, replacement, fix)` | fn, type, trait method | no | Deprecates **use**: a call, or a reference to the type. Fields: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). W2000 when the current edition is before `removal`, E2001 from `removal` on. A `fix` of `"replace"` or `"inline"` gives a machine-applicable fix. On a trait method it deprecates calls, not overrides; for overrides see `@deprecate_override`. See §8.16.2. | checked |
+| `@deprecated(since, removal, replacement, fix)` | fn, type, trait method | no | Deprecates **use**: a call, or a reference to the type. Each key is written `key: value`, and the keys may come in any order. Keys: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). W2000 when the current edition is before `removal`, E2001 from `removal` on. A `fix` of `"replace"` or `"inline"` gives a machine-applicable fix. On a trait method it deprecates calls, not overrides; for overrides see `@deprecate_override`. See §8.16.2. | checked |
 | `@deprecate_override` | trait method with a default body | no | Deprecates **overriding** the default: an impl that overrides it gets `OverrideOfDeprecatedDefault` (W0731) at the override. Calls are not affected. It is the first step of the move to `final` (§3.6 *The `final` Modifier*). A method may carry both `@deprecated` and `@deprecate_override`. | checked |
 
 #### Status
@@ -3310,6 +3310,43 @@ error[AnnotationNotSupported]: `@perf` is not supported by this toolchain
    `@effects` keeps its own diagnostic, `EffectsAnnotationRemoved` (§9.1).
 2. **Targets.** An annotation on a target that its row does not list is `UnexpectedAnnotation` (E1110).
 3. **Repeats.** A name may occur only once on one declaration, unless its row says it repeats. A second occurrence is `DuplicateAnnotation`. The Repeats column says how repeated occurrences combine.
+4. **Arguments.** The Annotation column of a row writes the one form that row accepts. Arguments that do not match that form are `AnnotationArguments` (E1134). It is an error. It is never a warning, and the compiler never accepts it. These are the cases:
+   - Arguments on a row that takes none: `@handle_all(B)`, `@pure(x)`.
+   - No arguments on a row that needs them: `@requires`, `@derive`.
+   - The wrong number of arguments, or an argument of the wrong kind: `@ffi("c", "abs", "extra")`, `@skip(1, 2)`.
+   - A named key that the row does not list: `@trusted(why: "x")`, `@verify(mode: "error")`.
+
+   The compiler reads any argument list in one general form and then compares it with the row. It does this before it looks up any name or scope, so a mismatch never causes a second error from name lookup. A list that does not parse at all ends at its closing `)`, and the rest of the declaration is still checked.
+
+   An annotation gets one diagnostic. Where a row has its own code for the exact failure, that code is the diagnostic: a bare `@trusted` is `TrustedRequiresAudit` (E0836), `@derive(Foo)` is `NotDerivable` (E1402), and the `@allow` and `@verify` codes in the table keep their cases (E0842, E0847, E0913). An unknown key is always `AnnotationArguments`, `@trusted` included.
+
+   An annotation with a mismatch is invalid. The compiler does not check its claim, but it still checks the rest of the declaration.
+
+   The primary span is the bad argument. When there are too many arguments, it is the first extra argument. When there are too few, it is the argument list. When the annotation has no argument list, it is the annotation name. The help prints the form of the row from the Annotation column. For an unknown key that is close to a key the row lists, the help also says which key the user probably meant.
+
+   The language server offers one quick fix, "remove arguments", on a row that takes none. It offers no other automatic fix, because a fix that wrote a new argument list would guess the value. `blink fmt` leaves an annotation with a mismatch as it is written. It does not report this error.
+
+```
+error[AnnotationArguments]: `@ffi` takes 2 arguments, found 3
+  --> src/clib.bl:3:18
+   |
+ 3 | @ffi("c", "abs", "extra")
+   |                  ^^^^^^^ this argument is extra
+   |
+   = help: the form is `@ffi("lib", "sym")`
+```
+
+```
+error[AnnotationArguments]: `@handle_all` takes no arguments
+  --> src/clock.bl:1:13
+   |
+ 1 | @handle_all(B)
+   |             ^ this annotation takes no arguments
+   |
+   = help: the form is `@handle_all`
+```
+
+   A second `@handle_all` on the same effect is not this error. It is `DuplicateAnnotation` (rule 3).
 
 #### Canonical Ordering
 
