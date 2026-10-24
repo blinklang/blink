@@ -1091,6 +1091,8 @@ A file's module name comes from its path under `src/` (`src/auth/token.bl` is `a
 
 Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are visible — unselected items produce a compile error for bare names, but qualified access (`mod.item`) still works. Aliases (`as`) rename the item at the import site; the original name is no longer accessible. When two modules export the same name and both are imported without selection, the compiler emits an ambiguity error — use qualified access (`foo.name()` vs `bar.name()`) or selective imports to disambiguate.
 
+**Qualified effect names:** `! lib.Log` and `! lib.Store.Read` work in every effect slot (a row, `handler`, `with handler`, `Handler[...]`, `@capabilities(...)`, `Template[...]`). The first part of a dotted name resolves by import lookup, not by case. A bare and a qualified spelling of one effect are the same effect. The handle is the lowercase declared name, with no qualifier and no alias: `lib.Log` and `l.Log` both give `log.log(...)`, and `lib.log.log(...)` is not valid. An alias renames the name in the file only, not the handle. Two effects with one handle in one row (`! a.Log, b.Log`) are `E0562 EffectHandleCollision`. A first part that is both an import qualifier and an effect is `E0561 AmbiguousEffectQualifier`: alias the import. A name in an effect slot that is not an effect is `E0538 UnknownEffect`.
+
 ## Annotations (ordered)
 
 | Annotation | Target | Purpose |

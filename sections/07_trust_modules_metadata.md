@@ -2121,6 +2121,16 @@ impl Sh for lib.Pt {                // the receiver slot
 fn show[U: lib.Tr](u: U) -> Str { u.name() }    // a bound
 ```
 
+- A qualified effect name works in every slot that takes the bare effect name: an effect row, `handler`, `with handler`, `Handler[...]`, `@capabilities(...)` and `Template[...]`. The qualifier is the import's leaf name or its alias, as for a type. The qualifier does not change the handle that the effect gives. The handle is the lowercase form of the declared effect name, so `lib.Log` gives `log` and not `lib.log` (§4.12 *Qualified effect names*). A qualified and a bare spelling of one effect name the same effect (§4.3 *A qualified effect name*).
+
+```blink
+import lib
+
+fn note() ! lib.Log {
+    log.log("saved")
+}
+```
+
 **No wildcard imports.** `import auth.*` does not exist. Every name in scope is explicitly imported. This is non-negotiable for locality of reasoning — an AI reading a file can determine every available name from the import block alone.
 
 #### 10.1.1 No Inline Modules

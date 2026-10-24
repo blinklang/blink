@@ -242,6 +242,93 @@ A test that needs a fake clock does not declare a second `Time`. It writes a han
 
 Declaring a parent is syntactic sugar for declaring all children. `! FS` and `! FS.Read, FS.Write, FS.Delete, FS.Watch` are identical to the compiler. The short form exists for the (rare) functions that genuinely need everything; the long form is what most functions should use.
 
+**A qualified effect name.** An effect name can carry the qualifier of the module that declares it: `! lib.Log`, `! lib.Store.Read`. The form works in every slot that takes the bare name (§10.1 *Qualified Access*). The first part of a dotted name resolves by import lookup, not by case. If an import qualifier in scope has that name, the part is a module and the rest names the effect: in `lib.Store.Read`, `lib` is the module and `Store.Read` is the effect. If no import qualifier has that name, the name is parent.child, as in `FS.Read`. Case is a style rule only. It does not decide how a name resolves.
+
+A bare name and a qualified name for one effect name the same effect. A name means the declaration, not the spelling (§3.4 *Identity, not spelling, selects behavior*). The two spellings mix in one row, and the row keeps the effect once:
+
+```blink
+import lib
+import lib.{Log}
+
+fn both() ! lib.Log, Log {    // lib.Log and Log are one effect
+    log.log("get")
+}
+
+fn main() {
+    with handler lib.Log {
+        fn log(msg: Str) { }
+    } {
+        both()
+    }
+}
+```
+
+A qualified sub-effect has three parts, the module and then the effect path:
+
+```blink
+fn load(k: Str) -> Int ! lib.Store.Read {
+    store.get(k)
+}
+```
+
+**A dotted name must not be both a module and an effect.** If an import qualifier and an effect have the first part's spelling, the name is ambiguous. The compiler rejects it with `AmbiguousEffectQualifier` (E0561). The error names the fix: give the import an alias (§10.5 *Import Aliases*).
+
+```blink
+import vendor.FS              // the module qualifier is `FS`; the module declares `Read`
+
+fn load() ! FS.Read {         // E0561: `FS` is also the built-in effect FS
+    fs.read("a.txt")
+}
+```
+
+```
+error[AmbiguousEffectQualifier]: `FS.Read` is both a module path and an effect name
+ --> app.bl:3:12
+  |
+3 | fn load() ! FS.Read {
+  |             ^^ `FS` is an import qualifier and an effect
+  |
+  = help: give the import an alias: `import vendor.FS as vendor_fs`
+```
+
+**Every failure in an effect slot is E0538.** `UnknownEffect` (E0538) covers each name in an effect slot that does not resolve to an effect. The message is different for each cause, and the message always says that an effect was expected. There are three causes:
+
+```
+error[UnknownEffect]: unknown module `nosuch` in effect `nosuch.Log`
+ --> app.bl:3:14
+  |
+3 | fn f() ! nosuch.Log {
+  |          ^^^^^^ no module `nosuch` is imported; an effect was expected
+```
+
+```
+error[UnknownEffect]: module `lib` does not export an effect `Nope`
+ --> app.bl:3:14
+  |
+3 | fn f() ! lib.Nope {
+  |          ^^^^^^^^ no effect `Nope` in `lib`
+```
+
+```
+error[UnknownEffect]: `lib.Pt` is not an effect
+ --> app.bl:3:14
+  |
+3 | fn f() ! lib.Pt {
+  |          ^^^^^^ `Pt` is a type; an effect was expected
+```
+
+A bare name that no import brings in is also E0538. If exactly one import exports an effect with that name, the diagnostic adds a help line with the qualified spelling. If two or more imports export the name, the help line is not shown, because the compiler does not choose for the author:
+
+```
+error[UnknownEffect]: unknown effect `Log`
+ --> app.bl:4:14
+  |
+4 | fn f() ! Log {
+  |          ^^^ no effect named `Log` is in scope
+  |
+  = help: did you mean `lib.Log`?
+```
+
 **Why hierarchical and not flat:**
 
 A flat list of 30+ effects is unusable. Hierarchy provides two things: (1) grouping -- `FS.*` are all filesystem-related, so the handle namespace is coherent; and (2) a short form -- when a function genuinely needs all filesystem operations, `! FS` is one annotation, not four. The hierarchy matches how humans and AI think about capability domains.
@@ -3306,6 +3393,42 @@ User-defined effects get their own handles. The handle name is the lowercase for
 | `Metrics` | `metrics` |
 | `Email` | `email` |
 | `Payment` | `payment` |
+
+**Qualified effect names and handles.** The handle is the lowercase form of the declared effect name. How a row spells the name does not change it, and an `as` alias on the import does not change it. So `lib.Log`, `Log` and `l.Log` (with `import lib as l`) all give the handle `log`. A handle is never qualified: `lib.log.log(...)` is not valid. The compiler rejects it with the help line "the handle is `log`; write `log.log(...)`".
+
+```blink
+import lib
+
+fn note() ! lib.Log {
+    log.log("saved")          // the handle is `log`
+    // lib.log.log("saved")   // not valid: help says to write `log.log(...)`
+}
+```
+
+**One handle for two effects.** A row can hold two effects that have the same handle, such as `a.Log` and `b.Log`. The compiler rejects the row with `EffectHandleCollision` (E0562). The error names both effects. To fix it, put each use in its own function, or rename one effect.
+
+```blink
+import a
+import b
+
+fn both() ! a.Log, b.Log {    // E0562: both effects have the handle `log`
+    log.log("x")
+}
+```
+
+```
+error[EffectHandleCollision]: effects `a.Log` and `b.Log` have the same handle `log`
+ --> app.bl:4:12
+  |
+4 | fn both() ! a.Log, b.Log {
+  |             -----  ^^^^^ `b.Log` also has the handle `log`
+  |             |
+  |             `a.Log` has the handle `log`
+  |
+  = help: put each use in its own function, or rename one of the effects
+```
+
+**A handle wins over a module qualifier.** In an expression, a reserved handle wins over a module qualifier of the same spelling (§3c.4 *Effect Handle Operations*). Suppose a function declares `! Log` and the file has `import util.log`. Then `log.format(...)` is a call on the handle `log`, not a call into the module. The diagnostic that follows names the fix: give the import an alias, `import util.log as logging`. The same name outside a function that declares the effect is the module qualifier.
 
 **Defining effect operations:**
 
