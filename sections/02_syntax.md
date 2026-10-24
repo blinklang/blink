@@ -1269,7 +1269,7 @@ As for `LowercaseVariant` (§3.4 *Variant names*), the rename is machine-applica
 
 **Rules for both kinds:**
 
-- **Only the declaring module.** `T` must be a type that the same module declares. `const Other.X` or `fn Other.f()` for a type from another module is a compile error, and the message names the module that declares `Other`. The constants of a builtin type, such as `Float.INF`, belong to the prelude, which declares `Float`.
+- **Only the declaring module.** `T` must be a type that the same module declares. `const Other.X` or `fn Other.f()` for a type from another module is a compile error, and the message names the module that declares `Other`. The constants of a builtin type, such as `Float.INF`, belong to the prelude, which declares `Float` (§3.2 *Built-in Float Methods*).
 - **Visibility.** `pub` exports the name. Without `pub`, the name is private to the module, as for any item (§2.12). An opaque type uses this to give the outside its way in.
 - **Use from another module.** Import the type, then write `T.name`. The form `mod.T.name` is E1007.
 - **No constants on generic types for now.** `T` in `const T.NAME` must not take type parameters.

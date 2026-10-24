@@ -828,13 +828,15 @@ let first_two = names
 | `.eq(other)` / `.cmp(other)` | Bool / Ordering | Total order, as `==` and `<` below |
 | `.ieee_eq(other)` | Bool | IEEE 754 equality: `NaN.ieee_eq(NaN)` is `false`, `0.0.ieee_eq(-0.0)` is `true` |
 | `.is_nan()` | Bool | NaN check (needs `import std.float`) |
+| `.is_finite()` | Bool | `true` unless the value is a NaN or an infinity; built-in, no import (`F32` too) |
+| `.is_infinite()` | Bool | `true` for `inf` and `-inf` only; a NaN is neither finite nor infinite |
 | `.truncate()` | Int | Drop the fraction |
 | `.to_int_checked()` | Result | Float to Int; fails out of range |
 | `.to_bits()` | U64 | IEEE 754 bit pattern (`F32`: `U32`); not a conversion |
 | `Float.from_bits(b)` | Float | Value with bit pattern `b: U64` (`F32.from_bits(U32)`); every pattern is valid, NaN payloads are kept |
 | `.is_sign_negative()` | Bool | The sign bit: `true` for `-0.0` and for a NaN with the sign bit set |
 
-`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign, use `x.is_sign_negative()`. A comparison with a written `-0.0` operand (`x == -0.0`, `x < -0.0`, `x.ieee_eq(-0.0)`, `assert_eq(x, -0.0)`) gives the same result for `0.0` and warns `NegativeZeroComparison` (W0706). To test for negative zero, use `x == 0.0 && x.is_sign_negative()`. Equal bits imply `==`, but `==` does not imply equal bits. `to_bits`, `from_bits` and `is_sign_negative` need no import.
+`Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign, use `x.is_sign_negative()`. A comparison with a written `-0.0` operand (`x == -0.0`, `x < -0.0`, `x.ieee_eq(-0.0)`, `assert_eq(x, -0.0)`) gives the same result for `0.0` and warns `NegativeZeroComparison` (W0706). To test for negative zero, use `x == 0.0 && x.is_sign_negative()`. Equal bits imply `==`, but `==` does not imply equal bits. `to_bits`, `from_bits` and `is_sign_negative` need no import. `Float.INF` is positive infinity (`-Float.INF` is negative infinity) and `Float.NAN` is a NaN with no fixed sign or payload; both need no import. `x == Float.NAN` is `true` for every NaN, so test for NaN with `x.is_nan()`, and for a finite value with `x.is_finite()`.
 
 ## Option[T] Methods
 

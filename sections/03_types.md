@@ -4607,6 +4607,7 @@ fn clamp(x: Float, lo: Float, hi: Float) -> Float {
 `x > max` is true for NaN, so it rejects NaN; under IEEE 754 it is false, and NaN passes. `x >= min` is also true for NaN, so it accepts NaN, where IEEE code would reject it. A guard such as `!(x >= 0.0)` does not reject NaN in Blink.
 
 - To test for NaN, use `x.is_nan()` (*Built-in Float Methods*).
+- To test for a finite value, use `x.is_finite()` (*Built-in Float Methods*).
 - For IEEE equality, use `x.ieee_eq(y)`.
 - `x != x` is always false in Blink. The compiler gives the warning `FloatSelfComparison` (W0707) for it and for the other comparisons of a value with itself (*Float Self Comparison*).
 
@@ -4620,6 +4621,10 @@ fn clamp(x: Float, lo: Float, hi: Float) -> Float {
 | `from_bits` | `fn(U64) -> Float` (static) | `fn(U32) -> F32` (static) | The value with that bit pattern |
 | `is_sign_negative` | `fn(self) -> Bool` | `fn(self) -> Bool` | The sign bit |
 | `is_nan` | `fn(self) -> Bool` | `fn(self) -> Bool` | `true` exactly when the value is a NaN, of any sign or payload |
+| `is_infinite` | `fn(self) -> Bool` | `fn(self) -> Bool` | `true` exactly when the value is `inf` or `-inf` |
+| `is_finite` | `fn(self) -> Bool` | `fn(self) -> Bool` | `true` exactly when the value is neither a NaN nor an infinity |
+
+A NaN is neither finite nor infinite. `0.0`, `-0.0` and every subnormal value are finite.
 
 `from_bits` is total: every bit pattern is a value, so it returns `Float` (`F32`), not an `Option`. `to_bits` is not a conversion and has no `From` impl (§3c.3 *The `to_` rule for scalars*). A bitwise operator on a `Float` is a type error (§3.2.3 *Sized Integer Types*); its help names `to_bits()`.
 
@@ -4630,6 +4635,9 @@ fn clamp(x: Float, lo: Float, hi: Float) -> Float {
 - **Arithmetic.** An operation that gives a NaN does not fix the sign or payload of that NaN.
 - **Sign.** `x.is_sign_negative()` is `true` exactly when the sign bit of `x` is set. That includes `-0.0` and a NaN with the sign bit set. `1.0 / x < 0.0` is `false` for every NaN, so it is not a sign test. To test for negative zero, use `x == 0.0 && x.is_sign_negative()`.
 - **NaN test.** `x.is_nan() == !x.ieee_eq(x)`. `x != x` is not a NaN test, because it is always false (*Differences from IEEE 754*).
+- **Classes.** For every `x`, exactly one of `x.is_nan()`, `x.is_infinite()` and `x.is_finite()` is `true`.
+- **Infinity test.** For `Float`, `x.is_infinite() == (x == Float.INF || x == -Float.INF)`. A NaN is not `==` to either infinity.
+- **Finite test.** `x.is_finite()` is `true` exactly when the exponent field of `x.to_bits()` is not all ones.
 - **Copies keep every bit.** Copy, move, storage, and passing to or from an `@ffi` function keep every bit of a `Float` or `F32`. This law does not cover what C code does with the value.
 
 ```blink
@@ -4644,6 +4652,26 @@ fn main() {
     assert(nan.is_nan())                     // any payload is a NaN
     assert(nan.to_bits() == 9221120237041090561) // the payload is kept
     io.println(z.to_bits().display())        // 9223372036854775808
+}
+```
+
+**Constants.** `Float` has two constants. They need no import, because the prelude declares them (§2.12.3 *Type-Scoped Declarations*).
+
+- `Float.INF` is positive infinity. Negative infinity is `-Float.INF`.
+- `Float.NAN` is a quiet NaN. The spec does not fix its sign or its payload.
+
+`x == Float.NAN` is `true` for every NaN in Blink (*Float Total Ordering*). The preferred test is `x.is_nan()`. `F32.INF` and `F32.NAN` are not defined until `F32` is supported.
+
+```blink
+fn main() {
+    let inf = Float.INF
+    assert(inf.is_infinite() && (-inf).is_infinite())
+    assert(!inf.is_finite())
+    assert(Float.NAN.is_nan())
+    assert(!Float.NAN.is_finite())           // a NaN is neither finite
+    assert(!Float.NAN.is_infinite())         // nor infinite
+    assert(1.5.is_finite() && (-0.0).is_finite())
+    assert(0.0 / 0.0 == Float.NAN)           // every NaN is == every NaN; prefer is_nan()
 }
 ```
 
@@ -6367,6 +6395,20 @@ The first message is for `json.parse("\{\"a\": NaN}")`. The second is for a deri
 `JsonValue` implements `Eq` with structural `==`: two values are equal when they are the same variant and their payloads are equal. A `Float` payload compares as in *Float Total Ordering*, so `JsonValue.Float(0.0)` equals `JsonValue.Float(-0.0)`. `Object` compares its `fields` as a list, so entry order and duplicate keys count. `JsonValue.Int(1)` does not equal `JsonValue.Float(1.0)`. `JsonValue` does not implement `Hash`, because `Float` does not.
 
 A non-finite `Float` does not survive the round trip. A `Float` field that holds one encodes as `null`, and decoding that `null` into the field gives `Err`. An `Option[Float]` field that holds `Some` of a non-finite `Float` decodes as `None`.
+
+To write a different value for a non-finite `Float`, test it with `x.is_finite()` before the encode:
+
+```blink
+import std.json
+
+fn reading_json(x: Float) -> Str {
+    if x.is_finite() {
+        json.encode(x)
+    } else {
+        json.encode(0.0)    // not null, so the reader can decode it as a Float
+    }
+}
+```
 
 ##### Str-Backed Enums
 

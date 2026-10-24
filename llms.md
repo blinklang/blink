@@ -38,7 +38,7 @@ Key facts:
 - Keyword parameters follow `--`: `fn f(a: Int, -- b: Str = "x")`. Defaults are constants
 - A default must fit every instance of a parameter type that names a type parameter: `x: T = 3` is `E0300`, `x: Option[T] = None` and `xs: List[T] = []` fit. A default never fixes `T`. `[]` is a const only as a keyword or field default
 - `Map.remove` returns `Option[V]`. `m[k] = v` is an error; use `m.insert(k, v)`. `channel.new[T](buffer: n)`; `ch.recv()` returns `Option[T]`
-- `Float` has a total order (`NaN == NaN`, `-0.0 == 0.0`); use `x.ieee_eq(y)` for IEEE equality. `x == -0.0` is also true for `0.0` and warns (W0706); test the sign with `x.is_sign_negative()`
+- `Float` has a total order (`NaN == NaN`, `-0.0 == 0.0`); use `x.ieee_eq(y)` for IEEE equality. `x == -0.0` is also true for `0.0` and warns (W0706); test the sign with `x.is_sign_negative()`; test for NaN with `x.is_nan()` and for a finite value with `x.is_finite()` (`x.is_infinite()` for `Float.INF` or `-Float.INF`)
 - `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type
 - `blink build`, `run` and `test` compile one C unit per module. `--no-per-module` or `BLINK_PER_MODULE=0` builds one C unit, to bisect a per-module bug
 
