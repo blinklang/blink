@@ -69,8 +69,8 @@ import cg_eff.{
 }
 import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_display_or_placeholder,
-    cc_values_equal, cc_is_ptr_write_stmt, lower_spread_copy, cc_is_skip_call, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
-    cg_call_channel_take, cg_call_cursor_walk, cg_call_str_step, for_in_iteration_of,
+    cc_values_equal, cc_is_ptr_write_stmt, cc_is_skip_call, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
+    cg_call_channel_take, cg_call_cursor_walk, cg_call_str_step, for_in_iteration_of, lower_spread_copy,
 }
 import unparse.{unparse_expr}
 import cg_promote.{
@@ -200,7 +200,10 @@ fn cur_scope() -> Int {
 // stage's lowerer is one line and a build without that stage fails loudly at each value
 // rather than emitting a statement with a hole in it.
 fn lower_value(node: Int) -> Int ! Diag.Report {
-    let value = lower_expr(node)
+    value_or_poison(lower_expr(node), node)
+}
+
+fn value_or_poison(value: Int, node: Int) -> Int ! Diag.Report {
     if value >= 0 { return value }
     poison_value(node)
 }
@@ -1532,17 +1535,24 @@ fn lower_return(node: Int) -> Int ! Diag.Report {
 //
 // Answers false on a stop, having left `out` as it found it.
 fn lower_stmt_hoisted(s: Int, tail: Int, dest: Str, dest_tid: Int, out: List[Int]) -> Bool ! Diag.Report {
-    let mark = cg_expr_pending_count()
     let value_mark = cg_expr_value_count()
+    let ok = lower_stmt_materialised(s, tail, dest, dest_tid, out)
+    // Each temp is declared inside this statement, so the row naming it ends here too: a
+    // generic body lowers once per instance over the same nodes, and a later instance must
+    // not read a temp an earlier one declared.
+    cg_expr_drop_values(value_mark)
+    ok
+}
+
+fn lower_stmt_materialised(s: Int, tail: Int, dest: Str, dest_tid: Int, out: List[Int]) -> Bool ! Diag.Report {
+    let mark = cg_expr_pending_count()
     if !materialise_or_drop(s, mark) { return false }
     let left = cg_expr_pending_leaves_from(mark)
     if left >= 0 { return lower_stmt_left(s, mark, left, out) }
     let lowered = lower_stmt_tail(s, tail, dest, dest_tid)
     if lowered < 0 {
-        // The statements filled temps only the stopped statement reads, so they go nowhere,
-        // and the rows naming those temps go with them.
+        // The statements filled temps only the stopped statement reads, so they go nowhere.
         let _dropped = cg_expr_take_pending(mark)
-        cg_expr_drop_values(value_mark)
         return false
     }
     cg_expr_drain_pending(mark, out)
@@ -1671,7 +1681,8 @@ fn mv_stmt(s: Int) -> Bool ! Diag.Report {
 // function. Recorded here in the order the walk passed it, so a value-position construct
 // reached afterward can hoist each one into a temp of its own standing in front of it,
 // in that same order, rather than being refused outright. `hoistable` is false for a value
-// with no type of its own, and for anything read while computing an assignment's target --
+// with no type of its own (a spread is judged by its source's type, the type of the copy
+// it moves), and for anything read while computing an assignment's target --
 // hoisting a target would read a place that is about to be written instead of reaching the
 // place itself, so nothing found there is ever safe to move. Whether a node has a type of
 // its own is answered by tc_lookup_node_tid, never by stmt_tid: a bare name resolved
@@ -1687,8 +1698,20 @@ let mut mv_in_target: Bool = false
 
 // Work the walk may not move an arm above unless it hoists it first. Whatever follows in
 // the same statement asks the record built here before it decides.
-fn mv_moves_work(node: Int) -> Bool ! Diag.Report {
-    mv_work.push(MvWork { node: node, hoistable: !mv_in_target && tc_lookup_node_tid(node) >= 0 })
+fn mv_moves_work(node: Int) -> Bool ! Diag.Report { mv_record(node, node) }
+
+// `typed` is the node whose type decides whether `node` can stand in a temp.
+fn mv_record(node: Int, typed: Int) -> Bool ! Diag.Report {
+    mv_work.push(MvWork { node: node, hoistable: !mv_in_target && tc_lookup_node_tid(typed) >= 0 })
+    true
+}
+
+fn mv_all_hoistable() -> Bool {
+    let mut i = 0
+    while i < mv_work.len() {
+        if !mv_work.get(i).unwrap().hoistable { return false }
+        i = i + 1
+    }
     true
 }
 
@@ -1745,8 +1768,8 @@ fn mv_interp_holes(e: Int) -> Bool ! Diag.Report {
 }
 
 // One expression, in the order its parts run. A kind whose parts this does not know is
-// walked no further and counts as work, so nothing inside it is moved and nothing after it
-// is either.
+// not walked into: it counts as one work item, so nothing inside it moves on its own, and
+// it moves whole only when it has a type.
 fn mv_expr(e: Int) -> Bool ! Diag.Report {
     if e < 0 { return true }
     match node_kind(e) {
@@ -1794,12 +1817,7 @@ fn mv_call_leaves(e: Int) -> Bool ! Diag.Report {
     if mv_in_target { return false }
     let tid = tc_lookup_node_tid(e)
     if tid < 0 || tc_tid_kind(tid) != TyKind.Never { return false }
-    let mut i = 0
-    while i < mv_work.len() {
-        if !mv_work.get(i).unwrap().hoistable { return false }
-        i = i + 1
-    }
-    true
+    mv_all_hoistable()
 }
 
 // Never has no value, so whatever reads this call's result is dead, and C has no value of
@@ -1844,11 +1862,12 @@ fn mv_struct_lit(e: Int) -> Bool ! Diag.Report {
 }
 
 // A spread has no type of its own; the copy it moves is a list of its source's type, so
-// the source's type is what decides whether the copy can stand in a temp.
+// the source's type is what decides whether the copy can stand in a temp. A bare name's
+// read is the copy's own first step, so it needs no temp ahead of the copy.
 fn mv_spread(e: Int) -> Bool ! Diag.Report {
-    if !mv_expr(node_value(e)) { return false }
-    mv_work.push(MvWork { node: e, hoistable: !mv_in_target && tc_lookup_node_tid(node_value(e)) >= 0 })
-    true
+    let src = node_value(e)
+    if node_kind(src) != NodeKind.Ident && !mv_expr(src) { return false }
+    mv_record(e, src)
 }
 
 // The part of a value-position expression that lowers ahead of the statements that fill
@@ -1924,12 +1943,8 @@ fn mv_binop(e: Int) -> Bool ! Diag.Report {
 // the moment one item cannot be hoisted, so the caller reports the same refusal a walk
 // with no hoisting at all would have given.
 fn mv_hoist_pending() -> Bool ! Diag.Report {
+    if !mv_all_hoistable() { return false }
     let mut i = 0
-    while i < mv_work.len() {
-        if !mv_work.get(i).unwrap().hoistable { return false }
-        i = i + 1
-    }
-    i = 0
     while i < mv_work.len() {
         mv_hoist_one(mv_work.get(i).unwrap())
         i = i + 1
@@ -1952,15 +1967,9 @@ fn mv_hoist_one(w: MvWork) ! Diag.Report {
     let rec = layout_at(tid, Position.Local, w.node)
     let _ = ensure_typedef_for(tid)
     let name = c_mint_local("hoist")
-    let value = if spread { mv_spread_copy(w.node) } else { lower_value(w.node) }
+    let value = if spread { value_or_poison(lower_spread_copy(w.node), w.node) } else { lower_value(w.node) }
     cg_expr_push_pending(w.node, ir_let(tid, w.node, rec.c_spelling, name, rec.slot_form, value))
     cg_expr_register_value(read, name, tid)
-}
-
-fn mv_spread_copy(node: Int) -> Int ! Diag.Report {
-    let copy = lower_spread_copy(node)
-    if copy >= 0 { return copy }
-    poison_value(node)
 }
 
 // The temp for one value-position `if` or `match`: declared unset, filled by the arms,

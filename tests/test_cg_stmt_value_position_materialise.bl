@@ -23,7 +23,7 @@ import cg_stmt.{cg_stmt_reset, lower_block, lower_fn}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_expr.{cg_expr_reset, cg_expr_pending_count}
 import lower_test_helpers.{
-    assert_eq_str, ice_count, shape,
+    assert_eq_str, ice_count, last_ice, shape,
 }
 
 fn find_fn(name: Str) -> Int {
@@ -288,8 +288,64 @@ test "an if standing after a list spread moves the spread's copy above the arms"
 }
 "#, "main")
     assert_eq_str("block shape", shape(body),
-        "Block(Let(Const), Let(ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))), Let(VarRef), Let(ContainerNew(ContainerSpread(VarRef))), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(ContainerNew(ContainerSpread(VarRef), Cast(Cast(VarRef)))), Let(ContainerNew(Cast(VarRef))))")
+        "Block(Let(Const), Let(ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))), Let(ContainerNew(ContainerSpread(VarRef))), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let(ContainerNew(ContainerSpread(VarRef), Cast(Cast(VarRef)))), Let(ContainerNew(Cast(VarRef))))")
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// A `?` after a spread that calls nothing cannot write the list, so the spread reads its
+// source in place, and the list is copied once, by the literal.
+test "a spread before a guard that calls nothing copies its source once" {
+    let body = probe_fn("cg_stmt_spread_before_plain_guard", #"fn pick(xs: List[Int], o: Option[Int]) -> Option[List[Int]] {
+    Some([..xs, o?])
+}
+"#, "pick")
+    assert_eq_str("block shape", shape(body), "Block(Let(VarRef), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Return(CarrierWrap(Const, ContainerNew(ContainerSpread(VarRef), Cast(Cast(CarrierUnwrap(VarRef)))))))")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// A guard that calls a function can write the list the spread reads, so the spread's copy
+// is taken ahead of the call, and the literal spreads the copy.
+test "a spread before a guard that calls a function copies its source ahead of the call" {
+    let body = probe_fn("cg_stmt_spread_before_calling_guard", #"fn grow(mut l: List[Int]) -> Option[Int] {
+    l.push(9)
+    Some(l.len())
+}
+fn pick(mut xs: List[Int]) -> Option[List[Int]] {
+    Some([..xs, grow(xs)?])
+}
+"#, "pick")
+    assert_eq_str("block shape", shape(body), "Block(Let(ContainerNew(ContainerSpread(VarRef))), Let(CallDirect(VarRef)), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Return(CarrierWrap(Const, ContainerNew(ContainerSpread(VarRef), Cast(Cast(CarrierUnwrap(VarRef)))))))")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// A literal as the spread source is a list no other name holds, so the call cannot reach
+// it, and it is held as it stands rather than copied.
+test "a literal spread source before a calling guard is held without a copy" {
+    let body = probe_fn("cg_stmt_literal_spread_before_calling_guard", #"fn grow(mut l: List[Int]) -> Option[Int] {
+    l.push(9)
+    Some(l.len())
+}
+fn pick(mut xs: List[Int]) -> Option[List[Int]] {
+    Some([..[1, 2], grow(xs)?])
+}
+"#, "pick")
+    assert_eq_str("block shape", shape(body), "Block(Let(ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))), Let(CallDirect(VarRef)), If(Binary(CarrierTag(VarRef), Const), Block(Return(CarrierWrap(Const)))), Return(CarrierWrap(Const, ContainerNew(ContainerSpread(VarRef), Cast(Cast(CarrierUnwrap(VarRef)))))))")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+}
+
+// An assignment's target is read where it is written, so nothing found there may move,
+// and an if in the value after it has no place for its arms. It refuses by name.
+test "an if after a field assignment's target refuses because the target cannot move" {
+    let body = probe_fn("cg_stmt_value_after_field_target", #"type P { n: Int }
+fn main() {
+    let c = 1
+    let mut p = P { n: 0 }
+    p.n = if c > 0 { 1 } else { 2 }
+}
+"#, "main")
+    assert_eq_str("block shape", shape(body), "Block")
+    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
+    assert_eq_str("refusals recorded", "{ice_count()}", "1")
 }
 
 // The literal writes `b` and leaves `a` to its default. A default is a const

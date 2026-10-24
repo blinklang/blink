@@ -49,13 +49,14 @@ import ir.{
     ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
     ir_carrier_unwrap, ir_carrier_tag, ir_call_runtime, ir_let, ir_assign, ir_return,
     ir_expr_stmt, ir_if, ir_block, ir_enum_new, ir_unreachable, ir_panic_catch_exit, ir_binds_statement,
-    ir_operand_stable, ir_mark_materialize, ir_with_first_kid,
+    ir_operand_stable, ir_does_work, ir_mark_materialize, ir_with_first_kid,
 }
 import cg_stmt.{cg_stmt_return_value, cg_stmt_materialise_where_run}
 import cg_call.{
     lower_call, lower_operator_method, lower_display_of_value, cg_call_display_resolves,
     lower_spread, lower_element_store, cc_enum_variant_construct,
     lower_await_expr, lower_fn_value, lower_channel_new, cc_panic_line, cg_call_container_ctor,
+    cg_call_spread_copy,
 }
 import cg_eff.{cg_eff_lower_closure, cg_eff_lower_handler_expr}
 import mono.{instance_of_type}
@@ -235,10 +236,9 @@ pub fn cg_expr_register_value(node: Int, c_name: Str, tid: Int) {
 // back to cg_expr_drop_values when it stops, the way it marks the pending buffer.
 pub fn cg_expr_value_count() -> Int { cx_value_keys.len() }
 
-// The rows named past `mark`, removed. The statements that declared those temps are
-// dropped when a statement stops, so a row that outlived them would name a temp no C
-// declares, and it would outlive the function that made it: the only other clearer
-// runs once per unit.
+// The rows named past `mark`, removed. A statement drops the rows it named when it ends,
+// stopped or not: a row that outlived it would name a temp no C in scope declares, and a
+// later instance of the same generic body, lowered over the same nodes, would read it.
 pub fn cg_expr_drop_values(mark: Int) {
     let mut i = cx_value_keys.len()
     while i > mark {
@@ -1029,26 +1029,38 @@ pub fn cg_expr_sequence(values: List[Int], ends: List[Int], all: Bool) -> List[I
     values
 }
 
-// A spread is not a value of its own: it copies its source into the literal being built,
-// so the copy is what is held, and the literal spreads the copy. A list is a shared cell
-// (sections/03_types.md 3.6), so holding the source alone would let a later statement write
-// the cells the spread copies, even through a name that is stable. A box is held by its
+// A spread is not a value of its own: it copies its source into the literal being built.
+// A list is a shared cell (sections/03_types.md 3.6), so when a later statement calls code,
+// holding the source alone would let that code write the cells the spread copies, even
+// through a name that is stable; then the copy is what is held, and the literal spreads the
+// copy. A source that is a literal is a list no other name holds, and statements that call
+// nothing write no list, so then the source is held as any operand is. A box is held by its
 // source: its spelling is the pointer, not the value's type, so a temp declared at the
 // value's type could not take it.
 fn x_hold_operand(end: Int, value: Int) -> Int ! Diag.Report {
     let kind = ir_kind(value)
     if kind == IrKind.ContainerSpread {
-        let tid = ir_tid(value)
-        let copy = ir_container_new(tid, ir_span(value), ir_c_spelling(value), cg_call_container_ctor(tid), "", [value])
-        return ir_with_first_kid(value, x_hold_at(end, copy))
+        let src = ir_kid(value, 0)
+        if ir_kind(src) != IrKind.ContainerNew && x_pending_works_from(end) {
+            return ir_with_first_kid(value, x_hold_at(end, cg_call_spread_copy(value)))
+        }
     }
-    if kind == IrKind.Box {
+    if kind == IrKind.Box || kind == IrKind.ContainerSpread {
         let inner = ir_kid(value, 0)
         if ir_operand_stable(inner) { return value }
         return ir_with_first_kid(value, x_hold_at(end, inner))
     }
     if ir_operand_stable(value) { return value }
     x_hold_at(end, value)
+}
+
+fn x_pending_works_from(end: Int) -> Bool {
+    let mut i = end
+    while i < cx_pending.len() {
+        if ir_does_work(cx_pending.get(i).unwrap()) { return true }
+        i = i + 1
+    }
+    false
 }
 
 // The value bound to a temp at position `end` of the pending buffer, in front of the
