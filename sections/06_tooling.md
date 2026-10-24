@@ -869,6 +869,8 @@ A `panicked` record has no `cause`, no `error` object and no `assertion` fields.
 
 `message` and `span` have one meaning on every status that carries them: `message` is the text of the outcome, and `span` is where the outcome fired.
 
+A `failed` or `panicked` record of a test that calls `for_each` can also carry `case`, the label of the case that supplied the outcome. A `cases` entry carries the payload of its own status. Both rules are in §8.10.2, *Table-driven tests: `for_each`*.
+
 **Summary and exit code.** The `summary` object on every `file` line and on the `run` line always carries all six keys — `total`, `passed`, `failed`, `panicked`, `skipped`, `duration_ms` — even when a count is `0`. The counts partition the `test` lines it covers:
 
 ```
@@ -1111,11 +1113,116 @@ test "add handles signs" {
 
 **Label uniqueness.** Duplicate labels within the same `for_each` call panic at the start of the offending iteration with `for_each: duplicate case label "<label>" at indices <j> and <i>`. Uniqueness is checked at runtime — labels are arbitrary `Str` values and may be computed, so static checking would be over-constrained. Empty-string labels are allowed but two empty strings still collide.
 
-**Failure attribution.** The test record carries a `cases` array with one entry for each case that ran. An entry holds the case `label` and its `status`, a value from the closed status enum (`passed | failed | panicked | skipped`). A `panicked` entry also carries `message` and, when known, `span` (§8.10, *Panicked records*).
+**Failure attribution.** The test record carries a `cases` array with one entry for each case that ran. An entry holds the case `label` and its `status`, a value from the closed status enum (`passed | failed | panicked | skipped`). It also holds the payload that a top-level record of that status holds:
+
+| Entry `status` | Payload in the entry |
+|----------------|----------------------|
+| `passed` | none |
+| `failed` | `message`, `span`, `cause`, and the fields of that `cause` (§8.10, *Failure `cause` discriminator*) |
+| `panicked` | `message` and, when known, `span` (§8.10, *Panicked records*) |
+| `skipped` | `reason` |
 
 A case that fails or panics does not stop the loop. The runner records the case and runs the next one, so every case runs on every invocation.
 
-The parent test's status is the most severe status among its cases, in the order `panicked > failed > passed`. The parent is `skipped` only when every case is skipped. A duplicate-label panic is a panic: that case records `panicked`.
+**The parent record.** The outcomes of a test are its cases and the body's own outcome. The body's own outcome is the result of the code that is outside every case, such as code after the `for_each` call. The parent record reports one outcome:
+
+- The parent `status` is the most severe status among the outcomes, in the order `panicked > failed > passed`.
+- The parent takes `message`, `span`, `cause` and every field of that `cause` from one outcome: the first outcome, in execution order, that has the parent's status. The parent never takes fields from two outcomes.
+- The parent is `skipped` only when at least one case ran, every case skipped, and the body did not fail or panic. Its `reason` is the `reason` of the first skipped case.
+- A `for_each` call with an empty case list adds no outcome. If nothing else fails, the test passes.
+
+A duplicate-label panic is a panic: that case records `panicked`.
+
+```blink
+// tests/test_table.bl
+import std.testing
+
+test "signs" {
+    testing.for_each([("a", 1), ("b", 2), ("c", 3)], fn(v: Int) {
+        assert_eq(v, 1)
+    })
+}
+```
+
+Cases `b` and `c` fail. Both have the status `failed`, and `b` ran first, so the parent reports `b`:
+
+```json
+{"record": "test", "file": "tests/test_table.bl", "name": "signs", "status": "failed", "cause": "assertion", "case": "b", "assertion": "assert_eq(v, 1)", "expected": "1", "actual": "2", "introspection": [], "omitted": [], "span": {"file": "tests/test_table.bl", "line": 6, "col": 9},
+ "cases": [
+   {"label": "a", "status": "passed"},
+   {"label": "b", "status": "failed", "cause": "assertion", "assertion": "assert_eq(v, 1)", "expected": "1", "actual": "2", "introspection": [], "omitted": [], "span": {"file": "tests/test_table.bl", "line": 6, "col": 9}},
+   {"label": "c", "status": "failed", "cause": "assertion", "assertion": "assert_eq(v, 1)", "expected": "1", "actual": "3", "introspection": [], "omitted": [], "span": {"file": "tests/test_table.bl", "line": 6, "col": 9}}]}
+```
+
+The body's own code takes part on equal terms. A panic after the call outranks the failed cases, so the parent is `panicked` with the message of that panic. The panic is not lost:
+
+```blink
+test "signs then panic" {
+    testing.for_each([("a", 1), ("b", 2), ("c", 3)], fn(v: Int) {
+        assert_eq(v, 1)
+    })
+    panic("after the table")
+}
+```
+
+A failed `assert_eq` after the call has the same status as case `b`, and `b` ran first, so the parent still reports `b`. The later failure does not appear in the parent.
+
+When every case skips, the first skipped case gives the parent `reason`. Each entry in `cases` keeps its own `reason`:
+
+```blink
+test "all skipped" {
+    testing.for_each([("a", 1), ("b", 2)], fn(v: Int) {
+        if v == 1 {
+            skip("no network")
+        }
+        skip("no disk")
+    })
+}
+```
+
+The parent has `"status": "skipped"` and `"reason": "no network"`. The entry for `a` has `"reason": "no network"`, and the entry for `b` has `"reason": "no disk"`. If the body fails after this loop, the parent is `failed`.
+
+An empty case list passes. It is not `skipped`, because no case ran:
+
+```blink
+test "empty table" {
+    testing.for_each([], fn(_v: Int) {
+        assert(false)
+    })
+}
+```
+
+**The `case` field.** A `failed` or `panicked` parent record carries `case`, the label of the case whose outcome the parent reports. `case` is absent on a `passed` parent and on a `skipped` parent. It is also absent when the body's own code supplied the outcome, as in `signs then panic`.
+
+**Nested `for_each`.** A case body can call `for_each`. The label of an inner case is the outer label, `/`, and the inner label. The outer case also has its own entry in `cases`, and its `status` is the most severe status inside it. When the outcome of the parent comes from a case inside a case, `case` is the path of the innermost one:
+
+```blink
+test "nested" {
+    testing.for_each([("outer1", 1), ("outer2", 2)], fn(o: Int) {
+        testing.for_each([("inner1", 10), ("inner2", 20)], fn(i: Int) {
+            assert(o + i == 11)
+        })
+    })
+}
+```
+
+The parent is `failed` with `"case": "outer1/inner2"`. The `cases` array has six entries, with the labels `outer1/inner1`, `outer1/inner2`, `outer1`, `outer2/inner1`, `outer2/inner2` and `outer2`. The path is an opaque display key. A tool does not parse it. A `/` inside a label has no special meaning, so a label that holds `/` can give the same key as the path of another case.
+
+**A panic in a case and `assert_panics`.** A case records its own panic. An `assert_panics` block around the `for_each` call does not consume that panic, and the parent is `panicked`:
+
+```blink
+test "assert_panics does not see a case panic" {
+    assert_panics {
+        testing.for_each([("a", 1)], fn(_v: Int) {
+            panic("case panics")
+        })
+    }
+}
+```
+
+The case `a` records `panicked` with the panic message. The parent is `panicked`. The catch boundary of a case is in §4.7.2, *Catchable unwind*.
+
+**Human output.** The human output for a parent record names the case label of the outcome that it prints. This section does not set the line form, and it does not set how many lines a runner prints for one test.
 
 **Why explicit labels, not auto-generated names.** Two cases that stringify the same way (`(1.0, 1.0)` and `(1.0, 1.0)` from different file lines) would collide if names were auto-generated from `Display`. Forcing a label makes the case identifier deterministic and meaningful in CI logs. The two-token cost (`"label",`) is the price of unambiguous failure attribution.
 
