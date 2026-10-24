@@ -210,7 +210,7 @@ blink query --type "* -> Result[*, AuthError]"
 ```json
 {
   "matches": [
-    {"function": "auth.login", "signature": "fn(Str, Str, Str) -> AuthResult ! IO, DB, Cache"},
+    {"function": "auth.login", "signature": "fn(Str, Str, Str) -> AuthResult ! (IO, DB, Cache)"},
     {"function": "auth.verify_creds", "signature": "fn(Str, Str) -> Result[User, AuthError] ! DB"},
     {"function": "auth.check_rate", "signature": "fn(Str) -> Result[Int, AuthError] ! Cache"}
   ]
@@ -403,6 +403,12 @@ What this means in practice:
 - **Diffs are always semantic.** Every line in a diff represents a behavioral change, never a formatting change. No "reformatted the whole file" noise commits.
 - **No bikeshedding.** Tabs vs spaces, brace placement, line length — none of these are decisions. They are answered by the grammar itself.
 - **One spelling for a one-jump operand.** A `??` right operand that is a block with only one jump (§2.11 *Jumps*) is written without braces: `?? { return e }` becomes `?? return e`. A braceless match arm with one jump (`None => return 0`) stays on one line.
+- **One spelling for a one-effect row.** `blink fmt` rewrites `! (A)` to `! A`. It keeps every parenthesis that decides which fn owns a row, so `-> (fn(A) -> B) ! R` and `-> (fn(A) -> B ! R)` stay as written (§4.15.1, *Which fn owns a row*):
+
+  ```blink
+  fn a() -> (fn(Int) -> Int ! (IO.Log)) ! FS.Read { ... }   // before
+  fn a() -> (fn(Int) -> Int ! IO.Log) ! FS.Read { ... }     // after
+  ```
 - **Deterministic output.** Given any syntactically valid Blink program, `blink fmt` produces exactly one output. Two developers formatting the same code always get identical results.
 - **Variant order is meaning.** `blink fmt` never reorders the variants of an enum, and no auto-fix or refactor tool does so without a request from the user. Variant order sets `to_int()`, the comparison with `Int` and the enum's `Ord` (§3.4 *Tag Operations*, §3.6 *Enum Ord*).
 

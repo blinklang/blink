@@ -675,21 +675,21 @@ type Route {
 Middleware uses functional wrapping: `fn(handler) -> handler`. A middleware function takes a handler and returns a new handler that wraps it:
 
 ```blink
-fn with_logging(handler: fn(Request) -> Response) -> fn(Request) -> Response ! IO.Log {
+fn with_logging(next: fn(Request) -> Response) -> (fn(Request) -> Response ! IO.Log) {
     fn(req: Request) -> Response {
         io.log("Request: {req.method} {req.path}")
-        let resp = handler(req)
+        let resp = next(req)
         io.log("Response: {resp.status}")
         resp
     }
 }
 
-fn with_auth(handler: fn(Request) -> Response) -> fn(Request) -> Response {
+fn with_auth(next: fn(Request) -> Response) -> fn(Request) -> Response {
     fn(req: Request) -> Response {
         match req.header("Authorization") {
             Some(token) => {
                 // validate token...
-                handler(req)
+                next(req)
             }
             None => Response.unauthorized("Missing Authorization header")
         }
@@ -855,7 +855,7 @@ test "server starts with routes" {
 **Static file serving:** Not a language-level concern. Implement as a handler function:
 
 ```blink
-fn static_files(root: Str) -> fn(Request) -> Response ! FS.Read {
+fn static_files(root: Str) -> (fn(Request) -> Response ! FS.Read) {
     fn(req: Request) -> Response {
         let path = "{root}/{req.path}"
         match fs.read(path) {
@@ -2321,7 +2321,7 @@ error[InvalidHandlerTypeParam]: invalid handler type parameter
 
 #### The clause row
 
-A handler type is `Handler[E]` or `Handler[E ! R]`. `R` is the **clause row**: the effects that the operation bodies of the handler perform outside the handler. `Handler[E]` means that `R` is empty. `R` is a concrete effect row, written as on a function type (§4.15.1). In a parameter type it can also be `_` (§4.15.2). The compiler infers `R` for a `handler E { ... }` expression.
+A handler type is `Handler[E]` or `Handler[E ! R]`. `R` is the **clause row**: the effects that the operation bodies of the handler perform outside the handler. `Handler[E]` means that `R` is empty. `R` is a concrete effect row, written as on a function type (§4.15.1): one effect bare, and two or more as `Handler[E ! (A, B)]`. The `]` ends `R`. In a parameter type it can also be `_` (§4.15.2). The compiler infers `R` for a `handler E { ... }` expression.
 
 `R` is part of the type, in the way the row of a function type is part of that type. A value of type `Handler[E ! R1]` fits where `Handler[E ! R2]` is expected only if every effect of `R1` is in `R2`. This is the same rule as for function types (§4.15.1). `Handler[DB]` fits where `Handler[DB ! IO.Log]` is expected. The reverse is a type error. Projection (*Effect projection* below) keeps `R`.
 
@@ -3787,12 +3787,94 @@ fn with_logging(f: fn(Str) -> () ! IO.Log) ! IO.Log {
     f("done")
 }
 
-// Function type with multiple effects
-fn transform(f: fn(Row) -> Row ! DB.Read, IO.Log) -> List[Row] ! DB.Read, IO.Log {
+// Function type with multiple effects: the row is in parentheses
+fn transform(f: fn(Row) -> Row ! (DB.Read, IO.Log)) -> List[Row] ! DB.Read, IO.Log {
     let rows = db.query(t"SELECT * FROM data")?
     rows.map(fn(r) { f(r) })
 }
 ```
+
+A row on a function type follows two rules:
+
+- A bare row holds one effect or `_`. A row of two or more effects is written `! (A, B)`. A comma after a bare row ends the row and starts the next item of the list, so `! (A, B)` is the only form that keeps both effects in a parameter list, a type argument list or a tuple type. A declaration keeps its bare list, because `{` ends it. `! (A)` means the same as `! A`.
+- In `Handler[E ! R]`, the `]` ends `R` (§4.7.1, *The clause row*).
+
+```blink
+fn pick(f: fn(Row) -> Row ! DB.Read, n: Int) -> Int ! DB.Read { n }       // one effect, bare
+fn pick2(f: fn(Row) -> Row ! (DB.Read, IO.Log), n: Int) -> Int { n }      // two effects, in parentheses
+```
+
+A comma after a bare row never joins a second effect to it. `fn t(f: fn(Row) -> Row ! DB.Read, IO.Log)` is the error `RowListNeedsParens` (E1136), with the fix that writes `! (DB.Read, IO.Log)`:
+
+```
+error[RowListNeedsParens]: a row of two or more effects needs parentheses here
+ --> app.bl:1:24
+  |
+1 | fn t(f: fn(Row) -> Row ! DB.Read, IO.Log) {
+  |                        ^^^^^^^^^^^^^^^^^ a comma ends a bare row
+  |
+  = help: write `! (DB.Read, IO.Log)`
+```
+
+##### Which fn owns a row
+
+A row after a function type belongs to that function type. A row after the return type of a declaration belongs to the declaration. The two rules meet when the return type is itself a function type: in `-> fn(A) -> B ! R`, `R` can belong to the returned function type or to the declaration. The compiler does not pick one. It reports `RowOwnerAmbiguous` (E1135), and the writer chooses with parentheses. Parentheses around a type are grouping (§3.8), so they add no token and no type.
+
+```blink
+// The returned fn has the row. `with_logging` itself is pure.
+fn with_logging(next: fn(Request) -> Response) -> (fn(Request) -> Response ! IO.Log) {
+    fn(req: Request) -> Response {
+        io.log("Request: {req.path}")
+        next(req)
+    }
+}
+
+// The declaration has the row. The returned fn is pure.
+fn open_reader(path: Str) -> (fn(Int) -> Int) ! FS.Read {
+    let size = match fs.read(path) {
+        Ok(text) => text.len()
+        Err(_) => 0
+    }
+    fn(n: Int) -> Int { n + size }
+}
+
+// Both: building the closure needs FS.Read, calling it needs IO.Log.
+fn make(path: Str) -> (fn(Int) -> Int ! IO.Log) ! FS.Read {
+    let size = match fs.read(path) {
+        Ok(text) => text.len()
+        Err(_) => 0
+    }
+    fn(n: Int) -> Int {
+        io.log("n={n}")
+        n + size
+    }
+}
+
+// Deeper: the parentheses give the row to the innermost fn type.
+fn deep() -> fn() -> (fn() -> Int ! IO.Log) {
+    fn() -> (fn() -> Int ! IO.Log) {
+        fn() -> Int {
+            io.log("deep")
+            1
+        }
+    }
+}
+```
+
+```
+error[RowOwnerAmbiguous]: a row after a fn type result has two owners
+ --> app.bl:1:27
+  |
+1 | fn mk() -> fn(Int) -> Int ! IO.Log {
+  |                           ^^^^^^^^ `IO.Log` can belong to `mk` or to the returned fn type
+  |
+  = help: to give `IO.Log` to the returned fn type, write `-> (fn(Int) -> Int ! IO.Log)`
+  = help: to give `IO.Log` to `mk`, write `-> (fn(Int) -> Int) ! IO.Log`
+```
+
+The same rule holds in a type position. A bare row after a function type whose result is a function type is an error, and the writer puts the result in parentheses. `f: fn(A) -> fn(B) -> C ! R` is an error. `f: fn(A) -> (fn(B) -> C ! R)` gives `R` to the inner function type. `f: fn(A) -> (fn(B) -> C) ! R` gives `R` to the outer function type. An `@ffi` declaration that returns a function type needs its row on the declaration, so it is written `-> (fn() -> T) ! FFI`.
+
+When the body of a declaration performs an effect that only the returned function type declares, or the reverse, the ordinary `UndeclaredEffect` check fires. If the return type of that declaration is a function type, the error has a `note:` that says which function owns the row that is written.
 
 The effect annotation on a function type is part of the type identity. `fn(Int) -> Int` and `fn(Int) -> Int ! IO` are different types — the compiler rejects passing an effectful callback where a pure one is expected:
 
