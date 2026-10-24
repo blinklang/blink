@@ -3298,10 +3298,76 @@ s.p.f = v      // fix: s.p.f.write(v)          (`s` is a value; `s.p` is a `Ptr`
 `place = rhs` runs `rhs` and then reads the root, but a method call reads its receiver before its arguments (*What each form evaluates*). So `p.f.write(rhs)` reads `p` before `rhs` runs, and when `rhs` changes `p` through a closure, the two forms store to different memory. The fix keeps the order of `place = rhs`:
 
 - **`rhs` is inert:** a literal, a name, or a field path of names (`cfg.limit`). It has no operator, call or other sub-expression, so it cannot run code. The machine-applicable fix writes `p.f.write(rhs)`.
-- **Any other `rhs`, when the assignment is a statement in a block:** the machine-applicable fix binds `rhs` to a new name on the line before, and then writes the name: `let v = rhs` and `p.f.write(v)`. The name is one that is not in scope at that line.
+- **Any other `rhs`, when the assignment is a statement in a block:** the machine-applicable fix binds `rhs` to a new name on the line before, with the type of the field, and then writes the name: `let v: T = rhs` and `p.f.write(v)`. The name is one that is not in scope at that line.
 - **Otherwise**, for example the body of a match arm with no braces: help only. The help shows the two-line form.
 
 `p.f op= rhs` through a `Ptr` gets help only, in every case: `p.f.write(p.f.read() op rhs)`. A note says this is a read and then a write, not one atomic step.
+
+**The type of the new name.** `T` is the type of the field at that `Ptr` type, not the inferred type of `rhs`. `place = rhs` gives `rhs` the type of the place as its expected type. A `let` gets no expected type from the later `write`, so only the annotation keeps the meaning of the original line:
+
+```blink
+import blink.ffi
+
+@ffi.struct
+type IoVec {
+    iov_base: Int
+    iov_len: U64
+}
+
+fn main() {
+    with ffi.scope() as s {
+        let p = s.alloc[IoVec]()
+        // fix for: p.iov_len = 18446744073709551615 - 1
+        let iov_len: U64 = 18446744073709551615 - 1
+        p.iov_len.write(iov_len)
+        io.println("{p.iov_len.read()}")
+    }
+}
+```
+
+With no `: U64`, the literal takes the type `Int`, and the `let` is `IntLiteralOutOfRange`. The annotation also keeps an error that the original line gave. For `p.x = n + 1` with `n: Int` and a field `x: I8`, the fix `let x: I8 = n + 1` reports `cannot assign Int to I8` at the `let`.
+
+The fix prints a spelling of `T` only when every name in it, generic arguments included, resolves at the fix line to the same type, by the lookup that the type checker uses. The fix never adds an import. The compiler tries the spellings in this order and prints the first that resolves:
+
+1. **The checker's form of `T`.** A name that resolves prints as it is. An alias prints as the alias if the alias resolves at the line, and as its target if only the target resolves.
+2. **The qualified form**, for a bare name that does not resolve at the line when the name of its module does: `inner.Inner`.
+3. **No spelling resolves.** The fix is help only. A note comes first and names the import to add. Then the two help lines show the type with its home module: `let i: inner.Inner = mk()`, then `p.i.write(i)`. A private type with no public path has no such spelling, so the help gives the type in words.
+
+```blink
+import blink.ffi
+import inner
+import inner.{Outer, mk}
+
+fn main() {
+    with ffi.scope() as s {
+        let p = s.alloc[Outer]()
+        // fix for: p.i = mk()
+        // `inner` declares `Inner`, `Outer { i: Inner }` and `mk`; `Inner` is not selected
+        let i: inner.Inner = mk()
+        p.i.write(i)
+    }
+}
+```
+
+When the file has no `import inner`, no spelling resolves. The help names the import first:
+
+```
+error[NotAPlace]: cannot assign through a `Ptr`
+ --> main.bl:7:5
+  |
+7 |     p.i = mk()
+  |     ^^^ `p` is a `Ptr[Outer]`
+  |
+  = note: a field behind a `Ptr` is not a place; write it with `.write()`
+  = note: the right side runs before `p` is read, so the fix keeps it on its own line
+  = note: the type of `Outer.i` is `Inner` from module `inner`; add `import inner` first
+  = help: `let i: inner.Inner = mk()`, then `p.i.write(i)`
+```
+
+```blink
+@ffi.struct
+type PollFd { fd: I32, events: I16, revents: I16 }
+```
 
 ```
 error[NotAPlace]: cannot assign through a `Ptr`
@@ -3312,7 +3378,7 @@ error[NotAPlace]: cannot assign through a `Ptr`
   |
   = note: a field behind a `Ptr` is not a place; write it with `.write()`
   = note: the right side runs before `p` is read, so the fix keeps it on its own line
-  = help: `let events = next_events()`, then `p.events.write(events)`
+  = help: `let events: I16 = next_events()`, then `p.events.write(events)`
 ```
 
 ```
@@ -3416,6 +3482,8 @@ error[MutationRequiresMut]: cannot assign to `total`, which is not `mut`
 **Panel vote: 6-0** on each point: E0610 for an immutable root, NotAPlace for a `Ptr` step and a temporary root, a code for ParamAssign, the order of the four cases, the `Ptr` fix rules, help only for a module-level `let`, and errors at once. The `Ptr` fix rules passed 6-0 in a second round. See [decisions/assignment-place-diagnostics.md](../decisions/assignment-place-diagnostics.md).
 
 **Panel vote, whole left side: 6-0** on the rule note and on the label (6-0 after a second round), 5-1 on the tuple note and swap help (Minimalism dissents), and 3-3 on the text of the tuple note, where the BDFL broke the tie. All six agreed on the rest: one code, no fix, the caret over the whole left side, the root rule, and no second error for `op=`. See [decisions/whole-target-temporary.md](../decisions/whole-target-temporary.md).
+
+**Panel vote** on the type of the new name in the `Ptr` fix: 6-0 on the typed `let` and the resolve check. A qualified spelling when the module resolves: 5-1. Help with the home-qualified type when no spelling resolves: 3-3, owner broke the tie. Alias, then target: 4-2. The `PollFd` sample with `I16`: 5-1. `T` at that `Ptr` type: 5-1. See [decisions/ptr-write-fix-type.md](../decisions/ptr-write-fix-type.md).
 
 ### 2.23 Reserved Words
 
