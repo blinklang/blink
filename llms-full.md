@@ -1210,7 +1210,7 @@ A `with` item is one of two things:
 - a `Handler[E]`: the block runs with that handler installed;
 - a scoped value: a type that implements `BlockHandler` (from `std.traits`). Its `enter()` runs before the block and its `exit(ok)` runs after it, on every exit path.
 
-Any other item is E0839, with or without `as`. A `Result` or `Option` item needs `?` first: `with open_resource(path)? as f { ... }`.
+Any other item is E0839, with or without `as`. A `Result` or `Option` item needs `?` first: `with open_resource(path)? as f { ... }`. An item of type `Never` (`with panic("x") { }`, `with todo() as v { }`) is also E0839. Remove the `with`, or write the item as a statement.
 
 `as` only binds a name. It does not change what the item does. `with h as name` installs the handler and binds it; `with v as name` binds the scoped value's Context (what `enter()` returns). Without `as`, the Context is discarded, whatever its type.
 

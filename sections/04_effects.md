@@ -2226,6 +2226,29 @@ The type of a `with` item decides what the item does. A `with` item has one of t
 
 An item of any other type is a compile error (E0839). If the type is a `Result` or an `Option`, the help text says to add `?`.
 
+An item of type `Never` (§3.3) is also E0839, with or without `as`, and at any place in a comma list. This is a rule of `with`. It does not follow from subsumption, and the spec has no general rule for an operand of type `Never`.
+
+```blink
+fn stub(h: Handler[Log]) {
+    with panic("x") { }          // E0839
+    with todo() as v { }         // E0839, the same as without `as`
+    with h, panic("x") { }       // E0839 on the second item
+}
+```
+
+```
+error[E0839]: a with-item must be a Handler[E] or a scoped value, got Never
+  = help: this item never finishes, so the body cannot run. Remove the `with`, or write the item as a statement.
+```
+
+To keep the item, write it as a statement and remove the `with`:
+
+```blink
+fn stub() {
+    todo()
+}
+```
+
 `as` binds a name and does nothing else. `as` never changes what a `with` item does:
 
 - For a `Handler[E]` item, `name` is the handler. It is the same first-class value (see *Handlers are values*). It is not a scoped value, so W0610, W0611 and E0601 do not apply to it.
