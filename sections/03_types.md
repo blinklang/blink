@@ -3426,6 +3426,7 @@ A pattern is *refutable* when it can fail to match (*Refutable vs Irrefutable Pa
 
 - A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position. The pattern must have the payload form that the variant declares (*The payload form of a variant pattern*, below). A type with that name in scope does not change this: E0554 (§3.4 *Unqualified variant*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
 - A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) never names a variant, because no variant has such a name (§3.4 *Variant names*). With no payload, it is a new binding. With a payload (`x(1)`, `x { .. }`), it is `NoSuchVariant` (E0547) when the type at that position is an enum, and `EnumPatternNeedsEnumScrutinee` (E0308) when it is not.
+- The name before `as` (`name as pattern`, *Pattern Binding (`as`)*) is a binder, never a variant. If its first character is an uppercase letter, it is `UppercaseBinder` (E0560), whatever the type at that position and whatever the name means in scope. The checker does not look the name up as a variant or as a constant. It binds the name as written, so the arm body has no `UndefinedVariable` (E0506) from it. The pattern after `as` is checked as usual. The arm is a bad arm (*Exhaustiveness*, below).
 
 The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. Every variant name starts with an uppercase letter, so the protection covers every variant.
 
@@ -3505,6 +3506,80 @@ fn check(n: Int) -> Str {
 ```
 
 A binder in a refutable pattern cannot have the name of an uppercase variant, because that name is the variant. W1011 (§10.6 *Shadowing Rules*) covers only a binder named `Some`, `None`, `Ok` or `Err`, so a pattern binder gets W1011 only in an irrefutable pattern.
+
+**An uppercase binder before `as`.** In a refutable pattern, the name before `as` does not start with an uppercase letter. The rule has the same reason as the rule for a bare name: a binder named `MAX` or `Red` would hide a constant or a variant, and a binder is not a pattern, so it never tests a value. The error is `UppercaseBinder` (E0560). The span is the binder. One code covers a name that is a variant (`Red`), a name that is a constant (`MAX`) and a name that is neither (`Whole`). The compiler does not use E0308 or E0547 here, because the user wrote a binder and not a variant. An irrefutable pattern does not change: a bare name with no payload binds there, as the rule above says.
+
+```blink
+type Color { Red, Green }
+type Shape { Circle(Float), Square(Float) }
+const MAX = 10
+
+fn f(c: Color) -> Int {
+    match c {
+        Red as Green => 1               // error[UppercaseBinder]
+        _ => 0
+    }
+}
+
+fn g(n: Int) -> Int {
+    match n {
+        MAX as m => m + 1               // error[UppercaseBinder]
+        _ => 0
+    }
+}
+
+fn h(s: Shape) -> Float {
+    match s {
+        Whole as Shape.Circle(r) => r   // error[UppercaseBinder]
+        _ => 0.0
+    }
+}
+```
+
+```
+error[UppercaseBinder]: binder `Red` starts with an uppercase letter
+  help: to bind the value, write `red as Green`
+  help: to match the variant, write `Red`
+error[UppercaseBinder]: binder `MAX` starts with an uppercase letter
+  help: to bind the value, write `max as m`
+  help: to compare with the constant `MAX`, write a guard: `m if m == MAX`
+error[UppercaseBinder]: binder `Whole` starts with an uppercase letter
+  help: to bind the value, write `whole as Shape.Circle(r)`
+```
+
+The first `help:` of each error is the lowercase rename. It is the only machine-applicable fix, and only when the new name is the name of no other binder in the arm. The help "to match the variant, write `Red`" is plain text, never a fix: it drops the pattern after `as`, so it changes the arm. The compiler prints it only when the type at that position has a variant of that name. The guard help is plain text too. The compiler prints it only when a constant of that name is in scope.
+
+The correct forms:
+
+```blink
+fn size(s: Shape) -> Float {
+    match s {
+        Shape.Circle(r) => r
+        Shape.Square(w) => w
+    }
+}
+
+fn f(c: Color) -> Int {
+    match c {
+        red as Green => red.to_int() + 1   // OK: `red` is a new name for the value
+        _ => 0
+    }
+}
+
+fn g(n: Int) -> Int {
+    match n {
+        m if m == MAX => m + 1             // OK: a guard compares with the constant
+        _ => 0
+    }
+}
+
+fn h(s: Shape) -> Float {
+    match s {
+        whole as Shape.Circle(_) => size(whole)
+        _ => 0.0
+    }
+}
+```
 
 **A variant the enum does not declare.** A variant pattern must name a variant that its enum declares. The compiler reports `error[NoSuchVariant]` (E0547) for:
 
@@ -4058,7 +4133,7 @@ match score {
 
 #### Pattern Binding (`as`)
 
-Bind the matched value to a name while simultaneously destructuring it. The bound name gets the pre-destructured value (scrutinee type). Syntax: `name as pattern`.
+Bind the matched value to a name while simultaneously destructuring it. The bound name gets the pre-destructured value (scrutinee type). Syntax: `name as pattern`. In a refutable pattern, `name` starts with a lowercase letter or `_`.
 
 ```blink
 match get_config() {
@@ -4078,7 +4153,7 @@ match event {
 
 #### Mutable Binders (`mut`)
 
-A **binder** is a name that a pattern binds: a variable binding, a punned field name, or the name before `as`. A binder is immutable, like a `let` binding (§2.2). To make a binder mutable, write `mut` directly before it. `let mut x = v` is the one-binder case of this rule. The rule is the same in `let`, `for`, `match` arms and parameter patterns.
+A **binder** is a name that a pattern binds: a variable binding, a punned field name, or the name before `as`. In a refutable pattern, a binder does not start with an uppercase letter (*Bare names: variant or binding*). A binder is immutable, like a `let` binding (§2.2). To make a binder mutable, write `mut` directly before it. `let mut x = v` is the one-binder case of this rule. The rule is the same in `let`, `for`, `match` arms and parameter patterns.
 
 ```blink
 fn widen(pair: (Int, Int), pts: List[(Str, Int)], o: Int?) {
@@ -4193,7 +4268,7 @@ The exhaustiveness checker handles:
 - **`Never` payloads** — a variant whose payload type is `Never` still needs an arm. The checker does not remove the arm because no value can reach it. The arm body may be the payload itself, which has type `Never` and fits any expected type. §3.2 shows the `Err(e) => e` form.
 - **Unreachable arms** — an arm, or one OR-alternative, that earlier unguarded arms already cover is `UnreachableArm` (W0710), a warning. The check never reports a live arm. It may miss a dead one. It reports at least the shapes listed in *Unreachable arms* below. It never reports an arm for a variant whose payload type is `Never`.
 
-**An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error, an `EnumPatternNeedsEnumScrutinee` (E0308) error (a variant name on a type that is not an enum, in any form), one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above, or a `NoSuchField` (E0525) or `DuplicateField` (E0316) error in a struct pattern or a variant brace pattern (*Struct patterns* above). `PatternMissingRest` (E0319) alone does not make a bad arm: the checker treats the pattern as if it had `..`. This list governs. The next sentence is a guide for a new pattern error, not a second rule. An error is a bad-arm error when the user cannot repair it without changing which values the arm matches. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
+**An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error, an `EnumPatternNeedsEnumScrutinee` (E0308) error (a variant name on a type that is not an enum, in any form), an `UppercaseBinder` (E0560) error, one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above, or a `NoSuchField` (E0525) or `DuplicateField` (E0316) error in a struct pattern or a variant brace pattern (*Struct patterns* above). `PatternMissingRest` (E0319) alone does not make a bad arm: the checker treats the pattern as if it had `..`. This list governs. The next sentence is a guide for a new pattern error, not a second rule. An error is a bad-arm error when the user cannot repair it without changing which values the arm matches. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
 
 - When a match has an unguarded bad arm, the compiler reports no `NonExhaustiveMatch` (E0004) for that match. The missing coverage is probably the variant that the bad arm tried to name.
 - A guarded bad arm does not turn off E0004. A guarded arm never adds coverage, so an E0004 next to it stays true after the user corrects the name.
@@ -4224,6 +4299,15 @@ fn pick_guarded[T](x: T) -> Int {
     match x {
         None if true => 0        // error[EnumPatternNeedsEnumScrutinee]
     }                            // error[NonExhaustiveMatch]
+}
+
+type Color { Red, Green }
+
+fn pick(c: Color) -> Int {
+    match c {
+        Red as x => x.to_int()   // error[UppercaseBinder]; no E0004 for `Green`
+        Green => 2               // checked as usual; not unreachable
+    }
 }
 ```
 
