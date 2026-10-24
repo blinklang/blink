@@ -523,7 +523,7 @@ The cause class is part of the contract. The wording of `message` is not, so pro
 - **Round trip.** `x.display().parse_float() == Ok(x)` for every `Float` `x` (§3.6 *Float Text Form*).
 - **Int text is Float text.** When `t.parse_int()` gives `Ok`, `t.parse_float()` gives `Ok` with that value, rounded to nearest, ties to even.
 - **One number reader.** `json.parse` first matches its own RFC 8259 number grammar (§3.6.2 *Numbers*). For a JSON number `t` that becomes a `JsonValue.Float`, the value is `t.parse_float()`, and when that gives `Err`, `json.parse` gives `Err`. `parse_float` does not decide what JSON accepts.
-- **Literals.** The text of every Blink `Float` literal parses with `parse_float` to the value of that literal. This law does not require the literal grammar to accept every text that `parse_float` accepts.
+- **Literals.** The text of every Blink `Float` literal, with its `_` separators removed, parses with `parse_float` to the value of that literal. This law does not require the literal grammar to accept every text that `parse_float` accepts (§2.4.4).
 - **Finite in, finite out.** A `numeric` text never gives NaN or ±infinity.
 
 ```blink
@@ -1746,7 +1746,7 @@ let g = e.pow(7)             // 128
 
 **Literal syntax:**
 
-Integer literals have no suffix syntax. The type is determined by context: the expected type from a variable annotation, function parameter, or surrounding expression. When no context is available, an unadorned integer literal defaults to `Int`.
+The text of a literal (`0xFF`, `1_000`, `1e-7`) follows the grammar in §2.4.4. Integer literals have no suffix syntax. The type is determined by context: the expected type from a variable annotation, function parameter, or surrounding expression. When no context is available, an unadorned integer literal defaults to `Int`.
 
 ```blink
 let byte: U8 = 255       // OK: 255 fits in U8
@@ -1758,7 +1758,7 @@ process(200)              // OK: literal 200 fits in U8
 process(300)              // error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)
 ```
 
-**Integer literal range.** An integer literal stands for the exact integer that its digits spell, in every base that the literal grammar allows. A literal in any base is a value, never a bit pattern. The literal gets its type at the literal: the expected type at that point, or `Int` when there is none. When the literal is checked against a type variable that nothing has solved yet, that variable becomes `Int`. The value must be in the range of the literal's type (*Type table* above). If it is not, the compiler gives `error[IntLiteralOutOfRange]` (E0318) at the literal. E0318 is the same for every integer type, and no `@allow` or `[lints]` setting turns it off.
+**Integer literal range.** An integer literal stands for the exact integer that its digits spell, in every base that the literal grammar allows (decimal, `0x`, `0b` and `0o`; §2.4.4). A literal in any base is a value, never a bit pattern. The literal gets its type at the literal: the expected type at that point, or `Int` when there is none. When the literal is checked against a type variable that nothing has solved yet, that variable becomes `Int`. The value must be in the range of the literal's type (*Type table* above). If it is not, the compiler gives `error[IntLiteralOutOfRange]` (E0318) at the literal. E0318 is the same for every integer type, and no `@allow` or `[lints]` setting turns it off.
 
 - **No expected type.** The message says that the literal has the default type `Int`. When the value fits in `U64`, a `help:` offers an annotation, such as `let x: U64 = ...`. When the value is above the `U64` maximum (2^64-1), the message says that no integer type holds the value, and there is no `help:`.
 - **Negative literals.** One unary `-` directly before an integer literal, with optional parentheses, makes one *negative literal*. Its value is the negated value of the literal. The check reads the expression as written, as W0704 and W0706 do (§3.6):
@@ -5363,9 +5363,9 @@ fn main() {
 - **Written negative zero.** The check reads the operand as written. The operand is one unary `-` over a float literal with the value zero, with optional parentheses:
   ```
   N ::= "-" Z | "(" N ")"
-  Z ::= FLOAT_LIT with the value zero | "(" Z ")"
+  Z ::= FLOAT_LIT whose mantissa digits are all zero, with any exponent | "(" Z ")"
   ```
-  `-0.0`, `(-0.0)`, `-(0.0)` and `-0e0` match. `-(-0.0)` has two `-` and does not match. A `const` reference or a `let` binding that holds -0.0 does not trigger the warning, and neither do `0.0 * -1.0`, `-x` or `Float.from_bits(...)`. The check does no flow analysis, so it also fires in a branch that never runs.
+  `-0.0`, `(-0.0)`, `-(0.0)`, `-0e0` and `-0.0e5` match. `-(-0.0)` has two `-` and does not match. A `const` reference or a `let` binding that holds -0.0 does not trigger the warning, and neither do `0.0 * -1.0`, `-x` or `Float.from_bits(...)`. The check does no flow analysis, so it also fires in a branch that never runs.
 - **Comparisons.** The warning fires when an argument is N and the call resolves to the `Float` or `F32` impl of one of these:
   - `Eq`: `==`, `!=`, `x.eq(y)`, `x.ne(y)`
   - `Ord`: `<`, `<=`, `>`, `>=`, `x.cmp(y)`
@@ -6614,7 +6614,7 @@ This separation is critical: calling `Display.display()` first and then decompos
    - When k < −4 or k ≥ 16, write d₁, then `.`, then d₂…dₙ (or `0` when n is 1), then `e`, then `-` when k < 0, then the magnitude of k in decimal. The exponent has no `+` and no leading zeros (`1.0e16`, `1.5e-7`, `5.0e-324`).
 6. **Fixed characters.** The decimal mark is always `.`, and the text has no digit grouping. The output depends on neither the locale nor the C library.
 
-Every finite output matches `-? DIGITS '.' DIGITS ('e' '-'? DIGITS)?`. It always contains `.`, so a `Float` never renders as text that reads as an `Int`. This keeps `[1.0, 2.0].debug()` apart from `[1, 2].debug()`, and keeps a `Float` written as a JSON number a `JsonValue.Float` when `json.parse` reads it back (§3.6.2).
+Every finite output matches `-? DIGITS '.' DIGITS ('e' '-'? DIGITS)?`. After the optional `-`, every such text is a valid `FLOAT_LIT` (§2.4.4). It always contains `.`, so a `Float` never renders as text that reads as an `Int`. This keeps `[1.0, 2.0].debug()` apart from `[1, 2].debug()`, and keeps a `Float` written as a JSON number a `JsonValue.Float` when `json.parse` reads it back (§3.6.2).
 
 ```blink
 fn main() {

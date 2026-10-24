@@ -370,6 +370,99 @@ A forgotten `t` is a compile error, not a silent bug. That is the difference fro
 
 **Panel vote: 6-0** on all nine questions. See [DECISIONS.md](../DECISIONS.md) and the [rationale](../decisions/template-literal-prefix.md).
 
+#### 2.4.4 Numeric Literals
+
+An integer literal is `INT_LIT`. A float literal is `FLOAT_LIT`. Patterns, ranges and const values use the same two tokens. This is their grammar:
+
+```
+INT_LIT   = DEC | "0x" HEX | "0b" BIN | "0o" OCT
+DEC       = "0" | NZ ( "_"? DIGIT )*
+HEX       = HEXD ( "_"? HEXD )*           HEXD = 0-9, a-f or A-F
+BIN       = BD ( "_"? BD )*               BD   = 0 or 1
+OCT       = OD ( "_"? OD )*               OD   = 0 to 7
+FLOAT_LIT = DEC "." DIGITS EXP? | DEC EXP
+EXP       = "e" "-"? DIGITS
+DIGITS    = DIGIT ( "_"? DIGIT )*         DIGIT = 0-9, NZ = 1-9
+```
+
+```blink
+let mask = 0x0F                          // Int, value 15
+let big = 1_000_000                      // Int
+let bits = 0b1010_0101                   // Int, value 165
+let mode = 0o755                         // Int, value 493
+let wide: U64 = 0xFFFF_FFFF_FFFF_FFFF    // OK: the value 2^64-1 fits U64
+let ratio = 1_0.2_5                      // Float, value 10.25
+let tiny = 1e-7                          // Float
+let huge = 1.0e16                        // Float
+let zero = 0e5                           // Float, value 0.0
+```
+
+Rules:
+
+- **Bases.** A literal is decimal, or it starts with `0x` (hex), `0b` (binary) or `0o` (octal). The prefix is lowercase. A hex digit is upper or lower case: `0xff` and `0xFF` are the same value. Only decimal digits can make a `Float`: there is no hex float.
+- **Digit separator.** `_` can stand only between two digits of one run of digits. A run is the integer digits, the digits after the prefix, the digits after `.`, or the digits of the exponent. `_` has no meaning: `1_000` and `1000` are the same literal. `1__0`, `1_`, `0x_FF`, `1_.5` and `1e_5` are errors.
+- **Leading zero.** A decimal integer part of more than one digit does not start with `0`. `0`, `0.5` and `0e5` are literals. `007` and `00.5` are errors.
+- **Float.** A `FLOAT_LIT` has `.` with digits on both sides, or an exponent, or both. `1e5` is a `Float`, not an `Int`, so `let n: Int = 1e5` is `error[TypeError]` (E0300), as `1.0` is. The exponent mark is `e`, in lowercase, and the only sign is `-`: `1E5` and `1e+5` are errors. A float literal has the `Float` value nearest to its decimal value. A literal whose value rounds to infinity is `FloatLiteralOutOfRange` (E1138). A value that rounds to zero or to a subnormal number is not an error: `1e-999` is `0.0`.
+- **The point.** A `.` is part of a literal only when a digit follows it. So `1..3`, `t.0` and `1.max(2)` read as they read without this subsection, and `.5` and `1.` are not literals. Write `0.5` and `1.0`.
+- **No sign.** A literal has no sign. `-` is the unary operator, and §3.2 *Integer literal range* gives the rule for `-` in front of an integer literal.
+- **A value, not a bit pattern.** A literal in any base stands for the exact number that its digits spell, and the length of the digit run has no limit. `0xFFFF_FFFF_FFFF_FFFF` is 2^64-1: it is valid under `U64`, and under `Int` it is `error[IntLiteralOutOfRange]` (E0318). The type comes from context, as for every integer literal (§3.2 *Literal syntax*).
+- **Text.** A `Float` literal, with its `_` removed, is a text that `parse_float` accepts (§3.2.1 *Parsing*). `blink fmt` keeps the spelling of a literal: the base, the case of hex digits and the place of each `_`.
+
+```blink
+let a: Int = 0xFFFF_FFFF_FFFF_FFFF       // error[IntLiteralOutOfRange] (E0318)
+let b: Int = 1e5                         // error[TypeError] (E0300): 1e5 is a Float
+let c = 0xff == 0xFF                     // OK: true
+```
+
+**Malformed literals.** A run of ASCII letters, digits and `_` that starts with a digit and does not match the grammar is one lexer error, `MalformedNumericLiteral` (E1137). A `.` joins the run only when a digit follows it. In a decimal literal, a `+` or `-` joins the run when it follows `e` and a digit follows it. So `1e+5` is one run, and `0xe+5` is the hex literal `0xe`, then `+`, then `5`. The error has one message for each cause, and its span covers the whole run:
+
+| Cause | Example | Help |
+|-------|---------|------|
+| uppercase prefix | `0XFF`, `0B1`, `0O7` | write the prefix in lowercase: `0xFF` (machine-applicable) |
+| uppercase exponent mark | `1E5` | write `1e5` (machine-applicable) |
+| `+` in the exponent | `1e+5` | write `1e5` (machine-applicable) |
+| leading zero | `007`, `0755`, `00.5` | write `7`, or `0o7` for an octal number |
+| `_` not between two digits | `1__0`, `1_`, `0x_FF`, `1_.5`, `1e_5` | put `_` only between two digits |
+| no digit after the prefix | `0x`, `0b`, `0o` | write at least one digit after the prefix |
+| a digit that the base does not have | `0b102`, `0o9` | name the base and the digit |
+| no digit after the exponent mark | `1e` | write the digits of the exponent |
+| suffix | `100u8`, `1.5f32`, `10i64` | Blink has no literal suffix; the type comes from context: write `let x: U8 = 100` |
+| hex float | `0x1.8p3` | Blink has no hex float |
+
+```
+error[MalformedNumericLiteral]: leading zero in `0755`
+ --> chmod.bl:2:16
+  |
+2 |     let mode = 0755
+  |                ^^^^ a decimal literal cannot start with `0`
+  |
+  = help: write `755` for the decimal number, or `0o755` for the octal number
+```
+
+```
+error[MalformedNumericLiteral]: `+` in the exponent of `1e+5`
+ --> scale.bl:2:13
+  |
+2 |     let k = 1e+5
+  |             ^^^^ an exponent has no `+`
+  |
+  = help: write `1e5`
+```
+
+**Out of range.** A `Float` literal that rounds to infinity is `FloatLiteralOutOfRange` (E1138). The help names the largest finite `Float`:
+
+```
+error[FloatLiteralOutOfRange]: `1e999` is too large for `Float`
+ --> big.bl:2:13
+  |
+2 |     let x = 1e999
+  |             ^^^^^ rounds to infinity
+  |
+  = help: the largest finite `Float` is 1.7976931348623157e308
+```
+
+**Recovery.** A lexer error is an error: no `@allow` or `[lints]` entry reaches it (§4.16.8). After the error, the lexer reads the whole malformed text as one literal token and goes on. So one bad literal gives one diagnostic, and no `UndefinedVariable` or type error follows from it.
+
 ### 2.5 Contested: No Semicolons
 
 **Winner: newlines (voted as locked decision)**

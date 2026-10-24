@@ -1551,7 +1551,7 @@ blink test --seed 0xDEADBEEFCAFE1234   # fixed seed
 blink test                              # entropy-seeded; seed printed on failure
 ```
 
-The `--seed` flag accepts either a `0x`-prefixed hex literal or a decimal integer. Without `--seed`, the runner picks a fresh seed from OS entropy at the start of each invocation. In both cases the seed is the **suite seed** — it is the root from which every property test's input stream and every effect-handler installation derives a deterministic sub-seed.
+The `--seed` flag accepts either a `0x`-prefixed hex value or a decimal integer, for example `--seed 0x2A` or `--seed 42`. Without `--seed`, the runner picks a fresh seed from OS entropy at the start of each invocation. In both cases the seed is the **suite seed** — it is the root from which every property test's input stream and every effect-handler installation derives a deterministic sub-seed.
 
 **Per-property sub-seed derivation.** Inside a test that uses `prop_check`, the runner does not pass the suite seed directly to the property's RNG. Instead it derives a stable per-property sub-seed. The sub-seed is a deterministic function of the suite seed and the bare property name. The name has no module prefix, so that moving a test between modules does not invalidate a reproducer. Within a binary, two `prop_check` blocks with the same `test "<name>"` are rejected by the runner — the runner emits a diagnostic listing both locations and exits with non-zero status, because this derivation would otherwise have them silently share a stream.
 
