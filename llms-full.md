@@ -847,6 +847,15 @@ let first_two = names
 | `.to_bits()` | U64 | IEEE 754 bit pattern (`F32`: `U32`); not a conversion |
 | `Float.from_bits(b)` | Float | Value with bit pattern `b: U64` (`F32.from_bits(U32)`); every pattern is valid, NaN payloads are kept |
 | `.is_sign_negative()` | Bool | The sign bit: `true` for `-0.0` and for a NaN with the sign bit set |
+| `.abs()` / `.sqrt()` | Float | Sign bit cleared / square root (`(-0.0).sqrt()` is `-0.0`); exact; no import |
+| `.min(y)` / `.max(y)` | Float | Smaller / larger in the total order; `NaN.max(x)` is NaN, `NaN.min(x)` is `x`; a tie returns `self` |
+| `.clamp(lo, hi)` | Float | Limit to `[lo, hi]`; NaN receiver gives NaN; panics on a NaN bound or `lo > hi`; not the same as `x.max(lo).min(hi)` |
+| `.pow(y)` / `.exp()` | Float | C99 `pow`; e to the power of `self` |
+| `.ln()` / `.log2()` / `.log10()` | Float | Logarithms. There is no `.log()` (E0505; the help names these three) |
+| `.sin()` / `.cos()` / `.tan()` / `.asin()` / `.acos()` / `.atan()` | Float | Trigonometry in radians |
+| `y.atan2(x)` | Float | Angle of the point (x, y); `self` is y |
+| `.is_finite()` / `.is_infinite()` | Bool | With `is_nan`, these split the values into NaN, infinite and finite |
+| `Float.PI`, `E`, `INF`, `NAN`, `MAX`, `EPSILON`, `MIN_POSITIVE` | Float | Constants (also on `F32`); `MIN_POSITIVE` is the smallest positive normal value. No `MIN` and no `NEG_INF`: write `-Float.MAX`, `-Float.INF` |
 
 `Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign, use `x.is_sign_negative()`. A comparison with a written `-0.0` operand (`x == -0.0`, `x < -0.0`, `x.ieee_eq(-0.0)`, `assert_eq(x, -0.0)`) gives the same result for `0.0` and warns `NegativeZeroComparison` (W0706). To test for negative zero, use `x == 0.0 && x.is_sign_negative()`. Equal bits imply `==`, but `==` does not imply equal bits. `to_bits`, `from_bits` and `is_sign_negative` need no import. `Float.INF` is positive infinity (`-Float.INF` is negative infinity) and `Float.NAN` is a NaN with no fixed sign or payload; both need no import. `x == Float.NAN` is `true` for every NaN, so test for NaN with `x.is_nan()`, and for a finite value with `x.is_finite()`.
 
@@ -1348,7 +1357,7 @@ show(42)          // "42"
 | `std.args` | CLI argument parsing (flags, options, commands) | `import std.args` |
 | `std.arena` | Arena introspection: `bytes_used()` returns live bytes in the innermost active `with arena { }` block | `import std.arena` |
 | `std.db` | SQLite database with effect-based API (`DB.Read`, `DB.Write`), `Template[DB]` parameterization, `Row`, `Stmt`, `DBError`, transactions | `import std.db` |
-| `std.float` | Float helpers: `fabs(x)` and `is_nan(x)` are `@pure`; `close_to(x, y, tol)` carries an `@ensures` clause. Methods: `x.fabs()`, `x.is_nan()`, `x.close_to(y, t)`. Float's `==` and `<` are a total order (NaN == NaN, NaN sorts above every other value, -0.0 == 0.0); the built-in `x.ieee_eq(y)` is the IEEE 754 escape, where NaN is unequal to everything | `import std.float` |
+| `std.float` | Float helpers: `is_nan(x)` is `@pure`; `close_to(x, y, tol)` carries an `@ensures` clause. Methods: `x.is_nan()`, `x.close_to(y, t)`. There is no `fabs`: use the built-in `x.abs()`. Float's `==` and `<` are a total order (NaN == NaN, NaN sorts above every other value, -0.0 == 0.0); the built-in `x.ieee_eq(y)` is the IEEE 754 escape, where NaN is unequal to everything | `import std.float` |
 | `std.http` | HTTP client and server | `import std.http` |
 | `std.io` | Derived I/O combinators. `read_fully(fd: Int, n: Int) -> Result[Bytes, Errno] ! IO` loops `libc.read_bytes` until exactly `n` bytes are read or EOF (a short read keeps looping; fewer than `n` is returned only at EOF, still `Ok`) | `import std.io` |
 | `std.errno` | `Errno` — newtype over `Int` (`pub type Errno { code: Int }`), the error arm of the `*_bytes` syscall wrappers. Read the code with `e.code` | `import std.errno` |

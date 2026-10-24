@@ -1922,6 +1922,101 @@ let n = 7.6.round().truncate()   // 8 (Int)
 
 `round` takes no digit count. To show a `Float` with a fixed number of decimal places, use `display_fixed` (§3.6.1 *Fixed-Decimal and Zero-Padded Forms*), which returns a `Str`. There is no `round_even`, `trunc` or `round(digits)`. (Panel vote: 6-0.)
 
+#### §3.2.6 Float Math
+
+`Float` and `F32` have built-in math methods and constants. They need no import. There are no free math functions: `std.math` holds `BigInt` only, and `std.num` holds no math. Each row covers both types. On `F32`, `Self` is `F32`, each row runs at binary32 width, and no step promotes to `Float`.
+
+| Method | Signature | Result | Exact |
+|--------|-----------|--------|-------|
+| `abs` | `fn(self) -> Self` | The value with the sign bit cleared, so `(-0.0).abs()` is `0.0` | yes |
+| `sqrt` | `fn(self) -> Self` | The square root; `(-0.0).sqrt()` is `-0.0`; a negative value other than `-0.0` gives NaN | yes |
+| `min` | `fn(self, Self) -> Self` | The smaller value in the total order (*Float Total Ordering*); a tie returns `self` | yes |
+| `max` | `fn(self, Self) -> Self` | The larger value in the total order; a tie returns `self` | yes |
+| `clamp` | `fn(self, Self, Self) -> Self` | `self` limited to `[lo, hi]`; a NaN receiver gives NaN; panics if `lo` or `hi` is NaN, or if `lo > hi` | yes |
+| `pow` | `fn(self, Self) -> Self` | `self` to the power of the argument, as C99 `pow` | no |
+| `exp` | `fn(self) -> Self` | e to the power of `self` | no |
+| `ln` | `fn(self) -> Self` | The natural logarithm | no |
+| `log2` | `fn(self) -> Self` | The base-2 logarithm | no |
+| `log10` | `fn(self) -> Self` | The base-10 logarithm | no |
+| `sin`, `cos`, `tan` | `fn(self) -> Self` | The sine, cosine and tangent of an angle in radians | no |
+| `asin`, `acos`, `atan` | `fn(self) -> Self` | The inverse sine, cosine and tangent, in radians | no |
+| `atan2` | `fn(self, Self) -> Self` | The angle in radians of the point (x, y), where `self` is y and the argument is x | no |
+| `is_finite` | `fn(self) -> Bool` | `true` exactly when the value is neither NaN nor infinite | yes |
+| `is_infinite` | `fn(self) -> Bool` | `true` exactly when the value is `inf` or `-inf` | yes |
+
+**No panic.** No method in the table panics on a value outside its domain. Each gives the IEEE 754 result: `(-1.0).sqrt()` is NaN, `0.0.ln()` is `-inf`, and `2.0.asin()` is NaN. The only panics are the `clamp` cases in the row above.
+
+**Exact rows and library rows.** The rows marked "yes" give the one correct result, the same on every target. The other rows use the C math library at the width of the type. Their last bit can differ between targets, and between a call that the compiler evaluates at compile time and the same call at run time. `blink build` never changes an IEEE 754 result of a `Float` operation (§7 *CPU Baseline and Accelerated Code*), so the rules for NaN, infinity and `-0.0` hold.
+
+**`min` and `max`.** The two methods use the total order, not the C functions `fmin` and `fmax`. `Float.NAN.max(x)` is NaN, where `fmax(NaN, x)` is `x`. `Float.NAN.min(x)` is `x`, as with `fmin`.
+
+**`clamp`.** `x.clamp(lo, hi)` is not the same as `x.max(lo).min(hi)`. The chain does not panic on bad bounds, and for a NaN receiver it gives `hi`; `clamp` gives NaN.
+
+```blink
+let a = 9.0.sqrt()                       // 3.0
+let b = (-0.0).sqrt().is_sign_negative() // true: the sign of zero stays
+let c = (-1.0).sqrt().is_nan()           // true: no panic
+let d = Float.NAN.max(1.0).is_nan()      // true
+let e = Float.NAN.min(1.0)               // 1.0
+let f = 5.0.clamp(0.0, 1.0)              // 1.0
+let g = Float.NAN.clamp(0.0, 1.0).is_nan() // true
+let h = 1.0.clamp(2.0, 0.0)              // RUNTIME PANIC: lo > hi
+let angle = 1.0.atan2(1.0)               // y.atan2(x)
+```
+
+**Classes.** `is_nan`, `is_finite` and `is_infinite` split the value set into three parts: NaN, infinite and finite. Each value is in exactly one part. There is no `is_normal` and no `is_subnormal`: they would split the finite part.
+
+**No `log`, no `Int.sqrt`.** `log` is not a name in the table, because it can mean any of three bases. A call `x.log()` is E0505 `UnresolvedMethod`. The help names `ln`, `log2` and `log10`. `Int` has no math method: `5.sqrt()` is an error, and the code is `5.to_float().sqrt()`.
+
+```
+error[UnresolvedMethod]: no method `log` on `Float`
+ --> src/main.bl:3:15
+   |
+ 3 |     let y = x.log()
+   |               ^^^ `Float` has no method `log`
+   |
+   = help: use `ln` for the natural logarithm, `log2` for base 2, or `log10` for base 10
+```
+
+**Math as a function.** A call `math.sqrt(x)` with no `math` in scope is E0506 `UndefinedVariable`. The help says that `sqrt` is a method and shows `x.sqrt()`. The rule covers each name in the table. The wording of both helps is not fixed; the content is.
+
+```
+error[UndefinedVariable]: cannot find `math` in this scope
+ --> src/main.bl:3:13
+   |
+ 3 |     let y = math.sqrt(x)
+   |             ^^^^ not found in this scope
+   |
+   = help: `sqrt` is a method on `Float`: write `x.sqrt()`
+```
+
+`std.float.fabs` does not exist. It returned `-0.0` for `-0.0`; use `x.abs()`.
+
+**Constants.** `Float` and `F32` have these constants (§2.12.3 *Type-Scoped Declarations*). Each is a `const T.NAME` of the prelude, with no import.
+
+| Name | Value |
+|------|-------|
+| `PI` | The nearest value to pi (binary64 on `Float`, binary32 on `F32`) |
+| `E` | The nearest value to e, in the same way |
+| `INF` | Positive infinity |
+| `NAN` | A NaN. `Float.NAN == Float.NAN` is `true` in the total order |
+| `MAX` | The largest finite value |
+| `EPSILON` | The gap between `1.0` and the next larger value: 2^-52 on `Float`, 2^-23 on `F32` |
+| `MIN_POSITIVE` | The smallest positive *normal* value (C `DBL_MIN`, `FLT_MIN`); a subnormal value is smaller |
+
+There is no `MIN` and no `NEG_INF`. Write `-Float.MAX` and `-Float.INF`. Constants for `Int` and the sized integers are a separate spec question.
+
+```blink
+let big = -Float.MAX
+let none = -Float.INF
+let tau = 2.0 * Float.PI
+let step = 1.0 + Float.EPSILON
+```
+
+A comparison `x == Float.NAN` has no lint: in the total order it is `true` for a NaN. To test for NaN, use `x.is_nan()`.
+
+There is no `hypot`. (Panel vote on the method set: 5-1; on `MIN_POSITIVE`: 5-1; on `hypot`: 5-1; on `is_infinite`: 6-0; on `clamp`: 3-3, owner broke tie; on a NaN receiver of `clamp`: 4-2; on a NaN or inverted bound of `clamp`: 5-1; on the `Int` constants: 6-0; on a lint for `x == Float.NAN`: 5-1; on the content of the two helps: 4-2.)
+
 ---
 
 ### 3.3 Type Inference
@@ -5532,7 +5627,7 @@ fn clamp(x: Float, lo: Float, hi: Float) -> Float {
 
 #### Built-in Float Methods
 
-`Float` and `F32` have these built-in methods that work on the IEEE 754 form of a value. They need no import. Each row covers both types.
+`Float` and `F32` have these built-in methods that work on the IEEE 754 form of a value. They need no import. Each row covers both types. The math methods (`sqrt`, `min`, `max`, `is_finite`, `is_infinite` and the others) and the constants are in §3.2.6 *Float Math*.
 
 | Method | Signature on `Float` | Signature on `F32` | Returns |
 |--------|----------------------|--------------------|---------|

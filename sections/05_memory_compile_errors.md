@@ -1015,6 +1015,8 @@ fn read_config(path: Str) -> Result[Config, ConfigError] ! FS.Read {
 | `expect(msg)` | `match` with `panic("msg")` in the arm that fails; or `unwrap` |
 | `and_then(f)` | `?` in a function that returns an `Option` or a `Result`; or `match` |
 
+The name `log` on a `Float` or `F32` is a second source of E0505 with required help. It is not a row of this table, because this specification never used it. The help names `ln`, `log2` and `log10` (§3.2.6 *Float Math*).
+
 The edit from `unwrap_or(d)` to `??` is machine-applicable only when `d` has no effect and cannot panic: a literal, a local name, or a field read of a local name. In all other cases the diagnostic has help text and no edit. The reason: the argument of a method call runs before the call, but the default of `??` runs only when the left side is `None` (§2.22 *Evaluation Order*). A rewrite of `o.unwrap_or(load())` to `o ?? load()` would stop `load()` from running when the value is `Some`. The help says so.
 
 ```
