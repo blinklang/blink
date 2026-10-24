@@ -1,0 +1,287 @@
+// A qualified variant `Q.V` where `Q` is a type that is not an enum is NoSuchVariant (E0547),
+// in a pattern and in an expression, whatever the type at the position (sections/03_types.md
+// §3.5 *Qualified names and the wrong type*, step 2, and §3.4 *A variant the enum does not
+// declare*). `Q` declares no variant. The header says what `Q` is, and the span is the
+// variant name. Binders under such a pattern and a `let` of such a value have the poison
+// type, so nothing cascades and no node is left without a type.
+//
+// Each row checks the exact set of errors a program gets, so an extra error, a missing one or
+// an internal error fails it as surely as a wrong message.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+// Every error, warning and internal error the program gets: span, code, message and help.
+fn diags_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/tc_qualified_variant_no_variants_src.bl"
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        out.push("{d.line}:{d.col}-{d.end_col}: {d.code} {d.message} | help: {d.help}")
+    }
+    out
+}
+
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.eprintln("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// "line:col-end_col" of the first `word` on the line marked `marker`.
+fn span(src: Str, marker: Str, word: Str) -> Str {
+    let line = line_of(src, marker)
+    let col = src.split("\n").get(line - 1).unwrap().index_of(word).unwrap() + 1
+    "{line}:{col}-{col + word.byte_len()}"
+}
+
+fn assert_diags(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = diags_of(src)
+    let mut ok = got.len() == want.len()
+    for w in want {
+        if !got.contains(w) { ok = false }
+    }
+    if !ok {
+        io.eprintln("FAIL: want:")
+        for w in want { io.eprintln("    {w}") }
+        io.eprintln("  got:")
+        for g in got { io.eprintln("    {g}") }
+    }
+    assert(ok)
+}
+
+fn no_variants(src: Str, marker: Str, message: Str) -> Str {
+    "{span(src, marker, "Zed")}: E0547 {message} | help: "
+}
+
+test "a qualified variant pattern on a builtin type is E0547 and says the type is not an enum" {
+    let src = #"fn on_list(xs: List[Int]) -> Int {
+    match xs {
+        List.Zed(v) => v  // LIST
+        _ => 0
+    }
+}
+
+fn on_int(n: Int) -> Int {
+    match n {
+        Int.Zed => 1  // INT
+        _ => 0
+    }
+}
+
+fn on_str(s: Str) -> Int {
+    match s {
+        Str.Zed => 1  // STR
+        _ => 0
+    }
+}
+
+fn on_map(m: Map[Str, Int]) -> Int {
+    match m {
+        Map.Zed { k } => k  // MAP
+        _ => 0
+    }
+}
+
+fn on_set(s: Set[Int]) -> Int {
+    match s {
+        Set.Zed(v) => v  // SET
+        _ => 0
+    }
+}
+
+fn on_bytes(b: Bytes) -> Int {
+    match b {
+        Bytes.Zed => 1  // BYTES
+        _ => 0
+    }
+}
+
+fn main() {
+    let total = on_list([1]) + on_int(1) + on_str("s") + on_map(Map.new()) + on_set(Set.new()) + on_bytes(Bytes.new())
+    io.println("{total}")
+}
+"#
+    assert_diags(src, [
+        no_variants(src, "LIST", "`List[Int]` is not an enum; it has no variants"),
+        no_variants(src, "INT", "`Int` is not an enum; it has no variants"),
+        no_variants(src, "STR", "`Str` is not an enum; it has no variants"),
+        no_variants(src, "MAP", "`Map[Str, Int]` is not an enum; it has no variants"),
+        no_variants(src, "SET", "`Set[Int]` is not an enum; it has no variants"),
+        no_variants(src, "BYTES", "`Bytes` is not an enum; it has no variants")
+    ])
+}
+
+test "a qualified variant pattern on a struct, a tuple, a fn type or a type parameter is E0547" {
+    let src = #"type Point { x: Int, y: Int }
+type Pair = (Int, Int)
+type Step = fn(Int) -> Int
+
+fn on_struct(p: Point) -> Int {
+    match p {
+        Point.Zed(v) => v  // STRUCT
+        _ => 0
+    }
+}
+
+fn on_tuple(p: Pair) -> Int {
+    match p {
+        Pair.Zed => 1  // TUPLE
+        _ => 0
+    }
+}
+
+fn on_fn(f: Step) -> Int {
+    match f {
+        Step.Zed => 1  // FN
+        _ => 0
+    }
+}
+
+fn on_param[T](t: T) -> Int {
+    match t {
+        T.Zed => 1  // PARAM
+        _ => 0
+    }
+}
+
+fn main() {
+    let total = on_struct(Point { x: 1, y: 2 }) + on_tuple((1, 2)) + on_fn(fn(n: Int) -> Int { n }) + on_param(1)
+    io.println("{total}")
+}
+"#
+    assert_diags(src, [
+        no_variants(src, "STRUCT", "`Point` is a struct; it has no variants"),
+        no_variants(src, "TUPLE", "`Pair` is a tuple; it has no variants"),
+        no_variants(src, "FN", "`Step` is not an enum; it has no variants"),
+        no_variants(src, "PARAM", "`T` is a type parameter; it has no variants")
+    ])
+}
+
+test "the qualifier decides, not the scrutinee: List.Zed on an Int is E0547 for List" {
+    let src = #"type Color { Red, Green }
+
+fn on_int(n: Int) -> Int {
+    match n {
+        List.Zed(v) => v  // LIST
+        _ => 0
+    }
+}
+
+fn on_enum(c: Color) -> Int {
+    match c {
+        Int.Zed => 1  // INT
+        _ => 0
+    }
+}
+
+fn main() { io.println("{on_int(1) + on_enum(Color.Red)}") }
+"#
+    assert_diags(src, [
+        no_variants(src, "LIST", "`List` is not an enum; it has no variants"),
+        no_variants(src, "INT", "`Int` is not an enum; it has no variants")
+    ])
+}
+
+test "a qualified variant value on a type with no variants is E0547 and its binding is poison" {
+    let src = #"type Point { x: Int, y: Int }
+type Pair = (Int, Int)
+type Step = fn(Int) -> Int
+
+fn main() {
+    let a = Int.Zed  // INT
+    let b = List.Zed(1)  // LIST
+    let c = Str.Zed  // STR
+    let d = Point.Zed  // UNIT
+    let e = Point.Zed(1)  // PAREN
+    let f = Point.Zed { x: 1 }  // BRACE
+    let g = Pair.Zed  // TUPLE
+    let h = Step.Zed(1)  // FN
+    let i = Map.Zed  // MAP
+    io.println("{a} {b} {c} {d} {e} {f} {g} {h} {i}")
+}
+"#
+    assert_diags(src, [
+        no_variants(src, "INT", "`Int` is not an enum; it has no variants"),
+        no_variants(src, "LIST", "`List` is not an enum; it has no variants"),
+        no_variants(src, "STR", "`Str` is not an enum; it has no variants"),
+        no_variants(src, "UNIT", "`Point` is a struct; it has no variants"),
+        no_variants(src, "PAREN", "`Point` is a struct; it has no variants"),
+        no_variants(src, "BRACE", "`Point` is a struct; it has no variants"),
+        no_variants(src, "TUPLE", "`Pair` is a tuple; it has no variants"),
+        no_variants(src, "FN", "`Step` is not an enum; it has no variants"),
+        no_variants(src, "MAP", "`Map` is not an enum; it has no variants")
+    ])
+}
+
+test "a misspelled variant of a real enum still gets its nearest-name help" {
+    let src = #"type Color { Red, Green }
+
+fn f(c: Color) -> Int {
+    match c {
+        Color.Gren => 1  // PAT
+        _ => 0
+    }
+}
+
+fn main() {
+    let c = Color.Gren  // VAL
+    io.println("{f(c)}")
+}
+"#
+    let pat = span(src, "PAT", "Gren")
+    let val = span(src, "VAL", "Gren")
+    assert_diags(src, [
+        "{pat}: E0547 `Color` has no variant `Gren` | help: did you mean `Green`?",
+        "{val}: E0547 `Color` has no variant `Gren` | help: did you mean `Green`?"
+    ])
+}
+
+test "the valid neighbors stay clean: a static call and real variants" {
+    let src = #"type Color { Red, Green }
+
+fn main() {
+    let xs: List[Int] = List.new()
+    let c = Color.Green
+    let o = Option.Some(1)
+    let s = match c {
+        Color.Red => "red"
+        Color.Green => "green"
+    }
+    io.println("{xs.len()} {s} {o ?? 0}")
+}
+"#
+    assert_diags(src, [])
+}
+
+// Float and F32 declare these constants (sections/03_types.md §3.2.6 *Constants*), so the
+// names are not missing variants, whatever else the compiler does with them today.
+test "a constant that Float declares is not reported as a missing variant" {
+    let src = #"fn main() {
+    let a = Float.NAN
+    let b = F32.MIN_POSITIVE
+    io.println("{a} {b}")
+}
+"#
+    let mut bad: List[Str] = []
+    for d in diags_of(src) {
+        if d.contains(" E0547 ") { bad.push(d) }
+    }
+    for b in bad { io.eprintln("got: {b}") }
+    assert(bad.len() == 0)
+}

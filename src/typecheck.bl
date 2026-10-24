@@ -23572,6 +23572,14 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     }
                     None => {}
                 }
+                match tc_value_on_non_enum(qual, vname) {
+                    Some((shown, noun)) => {
+                        tc_report_no_variants_value(node, qual, vname, shown, noun)
+                        tc_infer_orphan_field_values(node_fields(node))
+                        return tc_error_recovery_tid()
+                    }
+                    None => {}
+                }
                 let etid = lookup_named_type(sname)
                 if etid != -1 {
                     check_deprecated_type(sname, node)
@@ -24573,6 +24581,15 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         tc_report_no_such_variant_value(node, owner, cname, method, 1)
                         let _ = tc_infer_arg_tids(node_args(node))
                         // Reported here, so the method-resolution flush adds no UnknownMethod.
+                        tc_unresolved_method_hard.insert(node, 1)
+                        return tc_error_recovery_tid()
+                    }
+                    None => {}
+                }
+                match tc_value_on_non_enum(cname, method) {
+                    Some((shown, noun)) => {
+                        tc_report_no_variants_value(node, cname, method, shown, noun)
+                        let _ = tc_infer_arg_tids(node_args(node))
                         tc_unresolved_method_hard.insert(node, 1)
                         return tc_error_recovery_tid()
                     }
@@ -26178,6 +26195,13 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 match tc_value_missing_variant(obj_name, fname) {
                     Some(owner) => {
                         tc_report_no_such_variant_value(node, owner, obj_name, fname, 0)
+                        return tc_error_recovery_tid()
+                    }
+                    None => {}
+                }
+                match tc_value_on_non_enum(obj_name, fname) {
+                    Some((shown, noun)) => {
+                        tc_report_no_variants_value(node, obj_name, fname, shown, noun)
                         return tc_error_recovery_tid()
                     }
                     None => {}
@@ -30656,9 +30680,31 @@ fn tc_settled_without_variants(h: Int) -> Bool {
     }
 }
 
+// What a qualifier that names a type with no variants is, for the NoSuchVariant header: the
+// name the header writes and the words after "is" (§3.5 *Qualified names and the wrong
+// type*, step 2). None when `qual` names no type, an enum, a prelude carrier or a module. The
+// header writes the qualifier as the program does, except that a bare builtin generic head
+// on a value of that head shows the value's type (`List[Int]`); `h` is that resolved type,
+// or -1 when there is none.
+fn tc_non_enum_qualifier(qual: Str, h: Int) -> Option[(Str, Str)] ! TypeCheck.Resolve, Diag.Report {
+    if is_import_module_name(qual) != 0 || is_builtin_namespace(qual) != 0 { return None }
+    if tc_name_is_tparam_in_scope(qual) != 0 { return Some((qual, "a type parameter")) }
+    if is_known_type(qual) == 0 || tc_qualifier_owner(qual).is_some() { return None }
+    let rt = resolve_alias_tid(resolve_type_name(qual))
+    let shown = if h >= 0 && lookup_named_type(qual) == -1 && tc_type_head_name(h) == qual { type_to_str(h) } else { qual }
+    if rt < 0 { return Some((shown, "not an enum")) }
+    match type_kind(rt) {
+        TyKind.Struct => Some((shown, "a struct"))
+        TyKind.Tuple => Some((shown, "a tuple"))
+        // An enum no owner claims was reported where it went wrong.
+        TyKind.Enum => None
+        _ => Some((shown, "not an enum"))
+    }
+}
+
 // The order of checks is the spec's: resolve the qualifier, look the variant up in it, then
 // compare it with the type at the position.
-fn tc_qualified_variant_fault(qual: Str, variant: Str, h: Int, open: Bool) -> PatternFault {
+fn tc_qualified_variant_fault(qual: Str, variant: Str, h: Int, open: Bool) -> PatternFault ! TypeCheck.Resolve, Diag.Report {
     match tc_qualifier_owner(qual) {
         Some(q) => {
             if !tc_owner_has_variant(q, variant) { return PatternFault.NoSuchVariant(q) }
@@ -30672,9 +30718,11 @@ fn tc_qualified_variant_fault(qual: Str, variant: Str, h: Int, open: Bool) -> Pa
             PatternFault.Clean
         }
         None => {
-            let qtid = lookup_named_type(qual)
-            if qtid == -1 && is_known_type(qual) == 0 && is_builtin_namespace(qual) == 0 { return PatternFault.UnknownQualifier }
-            if qtid != -1 && type_kind(resolve_alias_tid(qtid)) == TyKind.Struct { return PatternFault.NoVariants(qual, "a struct") }
+            match tc_non_enum_qualifier(qual, if open { -1 } else { h }) {
+                Some((shown, noun)) => return PatternFault.NoVariants(shown, noun)
+                None => {}
+            }
+            if lookup_named_type(qual) == -1 && is_known_type(qual) == 0 && is_builtin_namespace(qual) == 0 { return PatternFault.UnknownQualifier }
             PatternFault.Clean
         }
     }
@@ -30792,6 +30840,38 @@ fn tc_value_missing_variant(qual: Str, name: Str) -> Option[VariantOwner] {
         }
         None => None
     }
+}
+
+// The NoSuchVariant header for a construction `qual.name` (§3.4) whose qualifier is a type
+// with no variants. An uppercase name after such a type can still mean one of the constants
+// Float and F32 declare (§3.2.6 *Constants*); any other first character never names a variant.
+fn tc_value_on_non_enum(qual: Str, name: Str) -> Option[(Str, Str)] ! TypeCheck.Resolve, Diag.Report {
+    if !tc_name_is_upper(name) || tc_static_method_named(qual, name) { return None }
+    match tc_non_enum_qualifier(qual, -1) {
+        Some(found) => if tc_float_const_named(qual, name) { None } else { Some(found) }
+        None => None
+    }
+}
+
+fn tc_float_const_named(qual: Str, name: Str) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    // F32 has no type of its own yet, so only its name says what it is.
+    if qual != "F32" && type_to_str(resolve_alias_tid(resolve_type_name(qual))) != "Float" { return false }
+    match name {
+        "PI" => true
+        "E" => true
+        "INF" => true
+        "NAN" => true
+        "MAX" => true
+        "EPSILON" => true
+        "MIN_POSITIVE" => true
+        _ => false
+    }
+}
+
+fn tc_report_no_variants_value(node: Int, qual: Str, name: Str, shown: Str, noun: Str) ! Diag.Report {
+    let col = tc_qualified_name_col(node, qual, name)
+    let start = if col == -1 { node_col(node) } else { col }
+    diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` is {noun}; it has no variants", node, node_line(node), start, start + name.byte_len(), "", [])
 }
 
 fn tc_static_method_named(owner: Str, name: Str) -> Bool {
