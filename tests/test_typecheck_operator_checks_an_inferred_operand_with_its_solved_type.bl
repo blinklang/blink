@@ -1,0 +1,177 @@
+// An operator checks its operands with the types they end up with (sections/03_types.md §3.2
+// *Operator operands*). An operand whose type is still a type variable when the operator is
+// checked gets that type from a later line: a closure parameter from the call, a generic
+// call's result from where the value goes. Two rules settle it.
+//
+// A lone int literal beside an operand that nothing has solved yet does not wait for a later
+// line (§3.2, "does not wait"): the variable becomes the expected integer type when one
+// reaches the operator, and Int when none does. So `fn(x) { 1 + x }` takes an Int, and a call
+// with a U64 is an argument error, as it is for `fn(x: Int)`. The fix is to annotate the
+// parameter.
+//
+// An operand with no literal beside it is checked once its type is solved, against the same
+// rule the operator applies to a written type, and the error is at the operator. An operand
+// that nothing ever solves is E0301, never an internal error.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+// Every error a source draws, as `line:col code message`, so a row states the whole answer.
+fn probe_errors(stem: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.line}:{d.col} {d.code} {d.message}") }
+    }
+    out
+}
+
+fn assert_errors(stem: Str, src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = probe_errors(stem, src)
+    if got != want { io.println("FAIL: {stem}:\n got  {got.join(" | ")}\n want {want.join(" | ")}") }
+    assert(got == want)
+}
+
+// The literal beside the parameter makes it Int, so a U64 argument does not fit.
+test "a literal beside a closure parameter makes the parameter Int, on either side" {
+    assert_errors("arith_literal_left", #"fn main() {
+    let n: U64 = 3
+    let h = fn(x) { 1 + x }
+    io.println("{h(n)}")
+}
+"#, ["4:18 E0300 function `h` argument 0 expects Int, got U64"])
+    assert_errors("bitwise_literal_right", #"fn main() {
+    let n: U64 = 3
+    let h = fn(x) { x & 1 }
+    io.println("{h(n)}")
+}
+"#, ["4:18 E0300 function `h` argument 0 expects Int, got U64"])
+    assert_errors("compare_literal_right", #"fn main() {
+    let n: U64 = 3
+    let h = fn(x) { x < 1 }
+    io.println("{h(n)}")
+}
+"#, ["4:18 E0300 function `h` argument 0 expects Int, got U64"])
+    assert_errors("compound_assign_literal", #"fn main() {
+    let n: U64 = 3
+    let h = fn(x) {
+        let mut y = x
+        y += 1
+        y
+    }
+    io.println("{h(n)}")
+}
+"#, ["8:18 E0300 function `h` argument 0 expects Int, got U64"])
+}
+
+// The expected type reaches the operator, so the variable takes it, not Int.
+test "an expected integer type beside a literal solves the operand to that type" {
+    assert_errors("expected_type_solves_closure_param", #"fn main() {
+    let n: U64 = 3
+    let h = fn(x) {
+        let r: U64 = x + 1
+        r
+    }
+    io.println("{h(n)}")
+}
+"#, [])
+    assert_errors("expected_type_solves_generic_result", #"fn mk[T]() -> T { panic("never called") }
+fn main() {
+    let w: U8 = mk() + 1
+    io.println("{w}")
+}
+"#, [])
+    assert_errors("expected_type_bounds_the_literal", #"fn mk[T]() -> T { panic("never called") }
+fn main() {
+    let w: U8 = mk() + 300
+    io.println("{w}")
+}
+"#, ["3:24 E0318 300 does not fit in U8 (0 to 255)"])
+}
+
+// With no integer expected, the variable is Int, so a Str or Float slot refuses the value.
+test "a literal beside an unsolved generic result makes it Int against a non-integer slot" {
+    assert_errors("generic_result_times_literal_to_str", #"fn mk[T]() -> T { panic("never called") }
+fn takes(s: Str) { io.println(s) }
+fn main() { takes(mk() * 2) }
+"#, ["3:24 E0300 argument 1 of `takes` expects Str, got Int"])
+    assert_errors("generic_result_or_literal_to_str", #"fn first[T](xs: List[T]) -> T { xs.get(0).unwrap() }
+fn takes(s: Str) { io.println(s) }
+fn main() { takes(first([]) | 2) }
+"#, ["3:29 E0300 argument 1 of `takes` expects Str, got Int"])
+    assert_errors("literal_plus_generic_result_to_float", #"fn first[T](xs: List[T]) -> T { xs.get(0).unwrap() }
+fn takes(s: Float) { io.println("{s}") }
+fn main() { takes(2 + first([])) }
+"#, ["3:21 E0300 argument 1 of `takes` expects Float, got Int"])
+}
+
+// No literal: the operator is checked once a later line solves the operand, at the operator.
+test "an operand solved after its operator is checked with the solved type" {
+    assert_errors("arith_solved_later_to_str", #"fn mk[T]() -> T { panic("never called") }
+fn takes(s: Str) { io.println(s) }
+fn main() {
+    let v = mk()
+    let w = v * v
+    takes(v)
+}
+"#, ["5:15 E0300 arithmetic `*` requires numeric operand, got Str"])
+    assert_errors("bitwise_solved_later_to_str", #"fn mk[T]() -> T { panic("never called") }
+fn takes(s: Str) { io.println(s) }
+fn main() {
+    let v = mk()
+    let w = v | v
+    takes(v)
+}
+"#, ["5:15 E0300 bitwise `|` requires integer operand, got Str"])
+    assert_errors("shift_solved_later_to_str", #"fn mk[T]() -> T { panic("never called") }
+fn takes(s: Str) { io.println(s) }
+fn main() {
+    let v = mk()
+    let w = v << 1
+    takes(v)
+}
+"#, ["5:15 E0300 shift `<<` requires integer left operand, got Str"])
+    assert_errors("closure_param_solved_by_call_to_str", #"fn takes(s: Str) { io.println(s) }
+fn main() {
+    let a = fn(x) { x * x }
+    takes(a("s"))
+}
+"#, ["3:23 E0300 arithmetic `*` requires numeric operand, got Str"])
+    assert_errors("compare_solved_by_call", #"fn main() {
+    let d = fn(x, y) { x < y }
+    io.println("{d(3, "s")}")
+}
+"#, ["2:26 E0300 binary `<`: incompatible types Int and Str"])
+    assert_errors("compound_assign_solved_by_call", #"fn main() {
+    let c = fn(x, y) {
+        let mut a = x
+        a += y
+        a
+    }
+    io.println(c("s", "t"))
+}
+"#, ["4:9 E0300 arithmetic `+` requires numeric operand, got Str"])
+}
+
+// Nothing solves the operand: the value is under-determined.
+test "an operand that nothing solves is E0301, not an internal error" {
+    assert_errors("shift_never_solved", #"fn mk[T]() -> T { panic("never called") }
+fn main() {
+    let v = mk()
+    let w = v << 1
+    io.println("{w}")
+}
+"#, ["4:5 E0301 cannot infer a type for `w`: it is never given one by an annotation or a later use", "3:5 E0301 cannot infer a type for `v`: it is never given one by an annotation or a later use"])
+    assert_errors("arith_never_solved", #"fn mk[T]() -> T { panic("never called") }
+fn main() {
+    let w = mk() * mk()
+    io.println("{w}")
+}
+"#, ["3:5 E0301 cannot infer a type for `w`: it is never given one by an annotation or a later use", "3:20 E0301 type parameter `T` of `mk` is unbound at this call and nothing supplies it"])
+}

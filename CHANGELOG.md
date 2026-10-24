@@ -2,6 +2,10 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Changes (unreleased)
+
+- **An operator checks an inferred operand with the type it ends up with.** A lone integer literal beside a closure parameter that nothing has typed yet makes the parameter `Int`, unless an expected integer type reaches the operator. So `let h = fn(x) { x + 1 }` called with a `U64` is a type error at the call; before, it compiled. Annotate the parameter: `fn(x: U64) { x + 1 }`. An operand with no literal beside it, such as `fn(x) { x * x }`, takes its type from the call, and a wrong type, such as `Str`, is an error at the operator; before, `blink check` accepted it and the build stopped with an internal compiler error. An operand that nothing types is E0301 CannotInferType.
+
 ## Breaking Changes (v0.58.0)
 
 ### Literals
