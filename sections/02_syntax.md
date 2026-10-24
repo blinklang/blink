@@ -1348,7 +1348,7 @@ A `Box[T]` default fits only when each field that mentions `T` takes a value tha
 
 **Both rules are enforced by `blink check`.** A label written on a positional parameter is rejected, and a keyword parameter supplied without its label is rejected. Neither rule is a style preference, and neither is left to the formatter. The marker exists to make the swap in `transfer(300, bob, alice)` impossible; a rule the checker does not enforce makes nothing impossible, and a normative sentence the compiler does not hold up teaches a calling discipline that does not exist.
 
-**Where a label resolves.** A call-site label resolves in the callee's **keyword-parameter namespace** — the parameters declared after `*`, and nothing else. This rule governs calls to functions and to methods. A label in a variant-payload application or a struct literal names a **field**, not a parameter, and is outside this rule; the rule governing those labels is stated separately.
+**Where a label resolves.** A call-site label resolves in the callee's **keyword-parameter namespace** — the parameters declared after `*`, and nothing else. This rule governs calls to functions and to methods. A label in a variant-payload application or a struct literal names a **field**, not a parameter, and is outside this rule; the rule governing those labels is stated separately. One part of the ordering rule reaches a variant payload: a positional argument after a label there is `PositionalAfterKeyword` (E0527), as in a call (§3.4 *Variant Construction*).
 
 **Extent of enforcement.** The rule is stated for every call against a declared `fn` signature, **method calls included**. A rule that held for `f(x: 1)` and not for `b.f(x: 1)` would select two behaviours by the receiver's spelling.
 
@@ -1361,7 +1361,7 @@ Five codes divide the call-site label rules. Each names a distinct mistake, and 
 | `MissingKeywordArg` (E0510) | A keyword parameter received no argument at all | Supply the argument, labelled |
 | `UnlabeledKeywordArg` (E0529) | A keyword parameter received its argument **positionally** | Label the argument already written |
 | `InvalidKeywordArg` (E0511) | A label names no keyword parameter of the callee | Correct the label to one the signature declares |
-| `PositionalAfterKeyword` (E0527) | A positional argument follows a labelled one | Move it before the first label |
+| `PositionalAfterKeyword` (E0527) | A positional argument follows a labelled one, in a call or in a variant paren payload (§3.4) | Move it before the first label |
 | `DuplicateKeywordArg` (E0528) | The same label appears twice in one call | Delete the repeated argument |
 
 ```blink
@@ -1455,7 +1455,7 @@ These rules apply to each literal that names fields:
 
 - a struct literal `T { ... }`, with or without `..source` (§2.16);
 - a variant brace literal (§3.4);
-- a variant paren payload whose arguments are **all** labelled (§3.4);
+- a variant paren payload that writes a label (§3.4);
 - the construction shorthand `{ ... }` (§2.15).
 
 In each literal, the labels form a set. `blink check` reports three faults:
@@ -1463,8 +1463,10 @@ In each literal, the labels form a set. `blink check` reports three faults:
 | Fault | Diagnostic | Where it points |
 |-------|------------|-----------------|
 | A label names a field that the type does not declare | `NoSuchField` (E0525) | the label |
-| A label appears twice | `DuplicateField` (E0316) | the second label, with a `note:` at the first |
+| A label appears twice, or a label names a field that a positional argument of a variant payload filled | `DuplicateField` (E0316) | the second label, with a `note:` at the first label or at the argument that filled the field |
 | A field without a default has no label, and there is no `..source` | `MissingField` (E0315) | the type or variant name; for the shorthand, its opening `{` |
+
+In a variant paren payload, argument *i* written by position fills field *i* before these checks run (§3.4).
 
 `MissingField` fires once per literal. It lists every missing field, with its type, in declaration order. A variant field has no default (§3.4), so a variant literal must label every field of its variant.
 

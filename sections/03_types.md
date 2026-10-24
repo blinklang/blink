@@ -2224,6 +2224,22 @@ The rename is machine-applicable only when both of these are true: the first cha
 
 The first character tells a variant from a binding in a pattern (§3.5 *Bare names: variant or binding*) and from a function in a type path (*Member case*, below). No variant has a lowercase name, so neither needs the declarations of a type to decide what a name means.
 
+**Fields of a paren variant.** A paren variant names every field or none. A variant that declares both an unnamed field and a named field, in either order, is `error[MixedVariantFields]` (E0320) at the variant. A label could not name the unnamed field, so no label rule would be complete for it.
+
+```blink
+type Shape {
+    Circle(radius: Float, tag: Int)    // ok: every field has a name
+    Pair(Int, Int)                     // ok: no field has a name
+    Both(Int, b: Int)                  // error[MixedVariantFields]
+    Rev(a: Int, Int)                   // error[MixedVariantFields]
+}
+```
+
+```
+error[MixedVariantFields]: variant `Both` declares both named and unnamed fields
+  help: name every field or none
+```
+
 #### Why One Keyword
 
 Most languages split these: `struct` + `enum` (Rust), `data class` + `sealed class` (Kotlin), `type` + `datatype` (SML). Two keywords means two mental models, two sets of rules, and an AI that has to decide which one to use.
@@ -2462,7 +2478,44 @@ error[VariantSpread]: a variant literal cannot copy fields with `..s`
   help: write every field, or match on `s` to bind its fields (copy-update is for struct literals, §2.16)
 ```
 
-A variant brace literal, and a variant paren payload whose arguments are all labelled, follow the field rules of §2.14 *Checking a Literal's Fields*: `NoSuchField`, `DuplicateField` and `MissingField`. For a labelled paren payload these take the place of the argument-count error, so `Figure.Circle(radius: 1.0, radius: 2.0)` reports `DuplicateField` at the second `radius` and `MissingField` for `tag`, not a count. A paren payload with a positional argument keeps the argument-count `TypeError` (E0300), with a `note:` that lists the variant's fields in order.
+A variant brace literal, and a variant paren payload that writes a label, follow the field rules of §2.14 *Checking a Literal's Fields*: `NoSuchField`, `DuplicateField` and `MissingField`. For a paren payload with a label these take the place of the argument-count error, so `Figure.Circle(radius: 1.0, radius: 2.0)` reports `DuplicateField` at the second `radius` and `MissingField` for `tag`, not a count.
+
+A call may write any field by position or, if the variant names it, by label; a position fills the field at its index. In a paren payload, positional arguments come first. A positional argument after a labelled one is `PositionalAfterKeyword` (E0527), the code that a call gets for the same mistake (§2.13). The field rules then run on what the arguments fill: argument *i* fills field *i*, and a label fills the field it names. A label for a field that an earlier argument filled is `DuplicateField`, with a `note:` at the argument that filled it.
+
+The argument-count `TypeError` (E0300) applies only to a payload that has no label, and to a payload that has more positional arguments than the variant has fields. It has a `note:` that lists the variant's fields in order. `MissingField` has the same `note:`. In the `note:`, each field that an argument filled, by position or by label, carries the mark `(given)`.
+
+```blink
+type Figure { Circle(radius: Float, tag: Int) }
+
+fn main() {
+    let a = Figure.Circle(1.0, 2)                 // ok
+    let b = Figure.Circle(1.5, tag: 2)            // ok
+    let c = Figure.Circle(tag: 2, radius: 1.5)    // ok
+}
+```
+
+```blink
+type Figure { Circle(radius: Float, tag: Int) }
+
+fn main() {
+    let d = Figure.Circle(1.0, radius: 2.0)       // error[DuplicateField], error[MissingField]
+    let e = Figure.Circle(tag: 2, 1.0)            // error[PositionalAfterKeyword]
+    let f = Figure.Circle(1.0)                    // error[TypeError]
+}
+```
+
+```
+error[DuplicateField]: field `radius` is given twice
+  note: argument 1 filled `radius`
+error[MissingField]: `Figure.Circle` is missing field `tag` (Int)
+  note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)
+  help: add `tag: ` and a value
+error[PositionalAfterKeyword]: a positional argument follows a labelled one
+  note: `tag:` is the first label
+  help: write the positional arguments first
+error[TypeError]: variant `Circle` expects 2 argument(s), got 1
+  note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)
+```
 
 A variant with a positional payload, written with no argument list, is a function value (§3.4 *A payload variant named as a value*).
 
