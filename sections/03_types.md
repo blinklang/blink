@@ -4018,12 +4018,13 @@ The exhaustiveness checker handles:
 - **Guards** — treated as opaque (may be false), so guarded arms do not contribute to exhaustiveness
 - **OR-patterns** — union of covered patterns per alternative
 - **`Never` payloads** — a variant whose payload type is `Never` still needs an arm. The checker does not remove the arm because no value can reach it. The arm body may be the payload itself, which has type `Never` and fits any expected type. §3.2 shows the `Err(e) => e` form.
+- **Unreachable arms** — an arm, or one OR-alternative, that earlier unguarded arms already cover is `UnreachableArm` (W0710), a warning. The check never reports a live arm. It may miss a dead one. It reports at least the shapes listed in *Unreachable arms* below. It never reports an arm for a variant whose payload type is `Never`.
 
 **An arm with a bad pattern covers nothing.** A *bad arm* is an arm whose pattern, at any depth, has a `NoSuchVariant` (E0547) error, one of the pattern `TypeError` (E0300) errors of *Pattern Forms* above, or a `NoSuchField` (E0525) or `DuplicateField` (E0316) error in a struct pattern or a variant brace pattern (*Struct patterns* above). `PatternMissingRest` (E0319) alone does not make a bad arm: the checker treats the pattern as if it had `..`. The checker treats a bad arm as an arm that matches no value. It never treats it as `_`. Then:
 
 - When a match has an unguarded bad arm, the compiler reports no `NonExhaustiveMatch` (E0004) for that match. The missing coverage is probably the variant that the bad arm tried to name.
 - A guarded bad arm does not turn off E0004. A guarded arm never adds coverage, so an E0004 next to it stays true after the user corrects the name.
-- The compiler reports no unreachable arm for the bad arm itself. Each other check runs as usual, E0005 included. Because the bad arm covers nothing, it never makes a later arm look unreachable, and each such report stays true whatever repair the user makes.
+- The compiler reports no `UnreachableArm` (W0710) for the bad arm itself. Each other check runs as usual, E0005 included. Because the bad arm covers nothing, it never makes a later arm look unreachable, and each such report stays true whatever repair the user makes.
 
 ```blink
 fn get(x: Option[Int]) -> Int {
@@ -4040,6 +4041,112 @@ fn get_pos(x: Option[Int]) -> Int {
     }                            // error[NonExhaustiveMatch]: missing `Some`
 }
 ```
+
+**Unreachable arms.** Arms run from top to bottom: the first arm that matches runs. An arm is *unreachable* when the unguarded arms above it already match every value that its pattern matches. It never runs. This does not change what the program does, so it is a warning, not an error: `UnreachableArm` (W0710), with the header "unreachable match arm". The primary span is the pattern, not the body.
+
+- **Never a live arm.** The check never reports an arm that some value can reach. It may miss an arm that no value can reach. A pattern with a refutable payload does not cover its variant: `Some(5)` above `Some(v)` is a live arm and gets no report. Range, tuple, struct and `Str` patterns may be missed.
+- **Guards.** A guarded arm above covers nothing, because its guard may be false (the *Guards* rule of the list above). A guarded arm below gets a report when the unguarded arms above cover its pattern: the guard does not change that.
+- **The reports that the check must give.** The check reports at least these arms: an arm after an unguarded `_` or bare binding; and an arm whose pattern is a variant, `true`, `false` or a literal that an earlier unguarded arm already names, when that variant's payload patterns are all irrefutable. It also always reports a pattern that is identical to an earlier unguarded pattern, in the same arm (an OR-alternative) or in an earlier arm. The test for this is equality of the two patterns, not a cover of refutable payloads. The check may miss any other dead arm.
+- **OR-patterns.** Each dead alternative gets its own report, at the span of that alternative. When every alternative is dead, the arm gets one report.
+- **More than one arm covers.** When no one earlier arm covers the pattern but the earlier arms cover it together, each earlier arm that is needed gets a label. A label never points at an arm that the cover does not need.
+- **`Never` payloads.** The check never reports an arm for a variant whose payload type is `Never`. It does not reason about types with no values.
+- **Bad arms.** A bad arm covers nothing and gets no report (above).
+
+```blink
+fn after_catch_all(x: Option[Int]) -> Int {
+    match x {
+        _ => 0
+        Some(v) => v          // warning[UnreachableArm]
+        None => 1             // warning[UnreachableArm]
+    }
+}
+
+fn repeated_variant(x: Option[Int]) -> Int {
+    match x {
+        None => 0
+        None => 1             // warning[UnreachableArm]
+        Some(v) => v
+    }
+}
+
+fn repeated_bool(b: Bool) -> Int {
+    match b {
+        true => 1
+        false => 0
+        true => 2             // warning[UnreachableArm]
+    }
+}
+
+fn repeated_literal(n: Int) -> Int {
+    match n {
+        1 => 10
+        1 => 11               // warning[UnreachableArm]
+        _ => 0
+    }
+}
+
+fn repeated_pattern(x: Option[Int]) -> Int {
+    match x {
+        Some(1) | Some(1) => 1    // warning[UnreachableArm] on the second alternative
+        Some(1) => 2              // warning[UnreachableArm]
+        Some(_) => 3
+        None => 0
+    }
+}
+```
+
+The next functions show the other rules:
+
+```blink
+fn live_arm(x: Option[Int]) -> Int {
+    match x {
+        Some(5) => 1          // not reported
+        Some(v) => v          // not reported: `Some(5)` does not cover `Some(v)`
+        None => 0
+    }
+}
+
+fn may_miss(n: Int) -> Int {
+    match n {
+        0..=10 => 1
+        5 => 2                // dead, and the check may miss it
+        _ => 0
+    }
+}
+
+fn joint_cover(x: Option[Int]) -> Int {
+    match x {
+        None => 0
+        Some(v) => v
+        None | Some(_) => 9   // warning[UnreachableArm]: both arms above are needed
+    }
+}
+
+fn guarded(x: Option[Int]) -> Int {
+    match x {
+        Some(v) if v > 0 => v     // covers nothing
+        Some(v) => 0 - v          // not reported
+        Some(_) => 5              // warning[UnreachableArm]: `Some(v)` covers it
+        None => 0
+    }
+}
+```
+
+```
+warning[UnreachableArm]: unreachable match arm
+ --> src/shape.bl:5:9
+  |
+3 |         other => 0
+  |         ----- this arm matches every value
+5 |         Circle(r) => r * r
+  |         ^^^^^^^^^ no value reaches this arm
+  |
+  = help: remove the arm, or move it above `other`
+```
+
+For `joint_cover`, the report puts a label on each of the two arms above (`None` and `Some(v)`) and the primary span on `None | Some(_)`.
+
+The help is text only. No fix is machine-applicable, because the mistake may be in the earlier arm, so `blink fix` never changes the arms. Suppress the warning on a function with `@allow(UnreachableArm)`, or set its level with `W0710 = "off"` or `W0710 = "error"` under `[lints]` (§4.16.8).
 
 **Why exhaustiveness matters for AI.** The single most common bug AI-generated code produces is the forgotten case. A missing `None` handler, an unhandled error variant, an enum value added without updating all consumers. Exhaustive matching makes this class of bug structurally impossible. The compiler mechanically identifies what's missing and suggests the fix. An AI agent can apply the fix automatically — this is the generate-compile-fix loop working as designed.
 
