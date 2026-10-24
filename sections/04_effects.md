@@ -4545,7 +4545,32 @@ warning[UnrestoredMutation]: call to `item` in `peek` mutates [err]
 **Known limits.**
 
 - **Any other assignment counts.** The rule reads the text, not the value. A lookahead that sets the cursor first (`pos = start`, then `parse_item()`) or moves it first (`pos = pos + 1`, then `try_item()`) is a binding pair by this rule. Globals that the callee writes and nothing saves give no warning there.
-- **Exit paths.** A `?` or an early `return` between the assignment and the restore leaves the bound value in `G`. Neither W0550 nor W0551 looks at exit paths, so a binding pair or a speculative pair that misses its restore on such an exit gives no warning.
+- **Exit paths.** A `?` or an early `return` between the assignment and the restore leaves the bound value in `G`. Neither W0550 nor W0551 looks at exit paths, so a binding pair or a speculative pair that misses its restore on such an exit gives no warning. An exit can keep the new value on purpose, for example a parser that keeps its cursor after a successful lookahead, so text alone cannot tell it from a leak. To restore on every exit, save and restore in a wrapper function that calls the body, or write the restore before each exit.
+
+```blink
+let mut hint = 0
+
+fn check(n: Int) -> Result[Int, Str] {
+    if n < 0 { return Err("negative") }
+    Ok(n + hint)
+}
+
+fn infer_body(n: Int) -> Result[Int, Str] {
+    let a = check(n)?
+    let b = check(a)?
+    Ok(a + b)
+}
+
+fn infer(n: Int) -> Result[Int, Str] {
+    let saved = hint
+    hint = -1
+    let r = infer_body(n)
+    hint = saved
+    r
+}
+```
+
+`infer_body` leaves through `?` and `return`, and `infer` restores `hint` on each of those exits.
 
 #### 4.16.8 Warning Suppression
 
