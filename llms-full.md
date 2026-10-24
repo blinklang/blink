@@ -360,6 +360,7 @@ test "addition works" {
 - **`type`, `trait` or `effect` named like a builtin type or prelude trait shadows it and warns `W1010 ShadowedPreludeName`.** To reach the builtin, write `import blink.core.{Eq as CoreEq}`. A module that imports such a declaration gets no W1010; an import alias that is a compiler-known name (`import geo.sim.{Error as Option}`) gets it at the alias.
 - **A fn declared `-> Never` must not return, else `E0311`.** `panic(msg)`, `todo()`, `unreachable()` and `skip()` have type `Never`, so they fit any expected type. `todo()` warns `W0703 TodoInCode`.
 - **A statement that drops the result of `append`, `slice`, `reverse`, `sort`, `sort_by` (List) or `union` (Set) warns `W0606 DiscardedCollectionCopy`:** they return a new value and do not mutate.
+- **A list literal of two spreads and nothing else warns `W0709 BareSpreadConcat`:** write `a.append(b)`; `blink fix` does it. A literal with a plain element, with three sources, or with a source that is a list literal (`[..a, ..[2, 3]]`) does not warn.
 - **A write through a name that is not `mut` is `E0610`.** This covers `=`, `op=` and a mutating method (`push`, `pop`, `set`, `clear`, `insert`, `remove`) on a plain `let` or on a pattern binder. Use `let mut x`, or `mut` before the binder: `Some(mut ys) => ys.push(1)`.
 - **A field behind a `Ptr` is not a place.** `p.f = v` and `p.f += v` for `p: Ptr[S]` are `E0611 NotAPlace`, whatever the root is. Write `p.f.write(v)`, or `p.f.write(p.f.read() + v)`, which is a read and then a write, not one atomic step.
 - **A parameter is never assigned.** `c.at = 5` or `self.n += 1` on a parameter is `E0612 ParamAssign`, with or without `mut`: the write changes only this function's copy. Copy it to a `let mut` name, or return a new value. In this release E0612 is a warning; it becomes an error in a later one.
@@ -674,7 +675,7 @@ let s = str_from_code_point(65)         // -> Str ("A"), from std.str
 | `.insert(idx, val)` | () | Insert at idx, shift the rest right (mutates); idx == len appends, idx outside 0..=len panics |
 | `.remove(idx)` | T | Remove and return the element at idx, shift the rest left (mutates); idx outside 0..len panics |
 | `.contains(elem)` | Bool | Membership check by `==`; needs `T: Eq` |
-| `.append(other)` | List[T] | Concatenate, returns a new list |
+| `.append(other)` | List[T] | Concatenate, returns a new list. Two lists join with this, not `[..a, ..b]` (`W0709 BareSpreadConcat`) |
 | `.slice(start, end)` | List[T] | Sub-list |
 | `.join(sep)` | Str | Join as string (List[Str]) |
 | `.map(fn(T)->U)` | List[U] | Transform each |

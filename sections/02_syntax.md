@@ -60,7 +60,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; the type of the item disambiguates, and `as` only binds a name. 3-0 over `defer`. |
 | Constants | `const NAME = expr` | Compile-time constants. Distinct from `let` (runtime). Literals + arithmetic + boolean ops + references to other consts. See [2.21](#221-const-declarations). |
 | Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()`, `todo()` and `unreachable()` diverge. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
-| Spread/rest operator | `..` | General spread/rest sigil. Patterns: `{ name, .. }`, `[first, ..]` (ignore rest). Construction: `{ field: val, ..source }` (copy rest), `[..list1, ..list2]` (list spread). See [2.16](#216-spread--rest-operator-). |
+| Spread/rest operator | `..` | General spread/rest sigil. Patterns: `{ name, .. }`, `[first, ..]` (ignore rest). Construction: `{ field: val, ..source }` (copy rest), `[..list1, x, ..list2]` (list spread). See [2.16](#216-spread--rest-operator-). |
 
 **Local bindings.** These forms bind a name in a local scope:
 
@@ -1624,7 +1624,7 @@ let interleaved = [..heads, separator, ..tails]
 - Spreads can appear at **any position** (unlike struct `..source` which must be last) — lists are ordered sequences with no key conflicts.
 - Spreads evaluate **left-to-right** and produce a new list (eager copy, not lazy view). `[..a, ..a]` copies `a` twice. Spreads and plain elements evaluate together in written order (§2.22).
 - Runtime cost: O(n) per spread source — same as any eager list construction.
-- Two lists and nothing else join with `a.append(b)`, not `[..a, ..b]` (§3.2.2 *Concatenation*).
+- Two lists and nothing else join with `a.append(b)`, not `[..a, ..b]` (§3.2.2 *Concatenation*; warning `BareSpreadConcat`, W0709).
 
 **Panel vote: 5-0** for including list spread in v1. The pattern/construction duality (`[first, ..]` deconstructs, `[..list, extra]` constructs) and absence of `.clone()` on lists made this essential. See [DECISIONS.md](../DECISIONS.md).
 

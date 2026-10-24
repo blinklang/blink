@@ -860,6 +860,26 @@ let framed = [header, ..rows, footer]     // literal with extra elements
 let merged = [..a, ..b, ..c]              // three sources
 ```
 
+A list literal of exactly two spreads and nothing else gets the warning `BareSpreadConcat` (W0709), unless one of the two sources is itself a list literal. `blink fix` rewrites the literal to `a.append(b)`. It only suggests the edit when a comment sits inside the literal. A first source that is not a primary or postfix expression goes in parentheses in the edit. ERROR_CATALOG.md has the full rule.
+
+```blink
+let bad = [..a, ..b]                      // W0709: write a.append(b)
+let kept = [..a, ..[2, 3]]                // OK: a source is a list literal
+let also_kept = [..[], ..a]               // OK: a source is a list literal
+let framed = [..a, 0, ..b]                // OK: a plain element
+let from_option = [..x ?? y, ..z]         // W0709: the edit is (x ?? y).append(z)
+```
+
+```
+warning[W0709]: two lists join with `append`, not a spread
+ --> m.bl:3:13
+  |
+3 |     let z = [..x, ..y]
+  |             ^^^^^^^^^^ two spreads and no other element
+  |
+  = help: write `x.append(y)`
+```
+
 (Panel vote: 5-1, Minimalism dissenting for spread only; 6-0 on the cost text. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
 
 **Sorting.** `sort` and `sort_by` return a sorted copy. The receiver keeps its order. Both sorts are **stable**: elements that compare `Equal` keep their input order. There is no unstable sort. `sort` needs `T: Ord`. `sort_by` takes a comparator that returns `Ordering` (§3.6) and needs no bound on `T`. `xs.sort()` gives the same result as `xs.sort_by(fn(a, b) { a.cmp(b) })`. Because `sort` returns a copy, `xs.sort()` as a bare statement does nothing, and it draws warning W0606 (*Discarded copies* below).
