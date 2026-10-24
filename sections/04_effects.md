@@ -2792,6 +2792,8 @@ Both methods have an impl-chosen row (§4.15.2): each impl declares the effects 
 | Panic caught by the case frame of `std.testing.for_each` (§8.10.2) | `false` |
 | Uncaught panic (`panic()`, arithmetic overflow, OOB index) outside a runtime catch frame, or a fatal runtime error | *bypasses `exit()` entirely* |
 
+A failed assertion in the cleanup that runs on any of these paths can change the test result. *Cleanup that fails an assertion*, below, gives the rule.
+
 A **fatal runtime error** is a fault the runtime cannot recover from: OOM, stack overflow, or foreign code that ends the process. The runtime ends the process at once. Nothing unwinds, and no `exit()` or `close()` runs.
 
 The runtime catch frames are the test runner's per-test boundary, the `?`/`return` desugar, and — within a test only — the boundary armed by an `assert_panics` block (§2.20) and the frame that the test runner puts around each case of `std.testing.for_each` (§8.10.2). The case frame records a panic in its case as `panicked` and the loop goes on. An enclosing `assert_panics` block does not see that panic. The case frame belongs to the test runner, and user code cannot create a frame of its own. The set of runtime catch boundaries is **exhaustively defined by this spec and cannot be extended by user code**. Introducing user-level panic recovery (e.g., `recover`, `catch_panic`) would require a separate spec amendment that re-evaluates `exit()`/`close()` semantics under the new boundary set.
@@ -2804,7 +2806,60 @@ The cleanup asymmetry is intentional and must be read carefully: an **armed** (e
 
 **Concurrency.** The armed state is **per-test (thread-local)**. An `assert_panics` in one test or task must never catch a panic raised on a different spawned task; arming is scoped to the calling frame's thread. This is normative, not implementation-defined.
 
-**Cleanup that itself panics during an armed unwind.** If an in-scope `exit(false)`/`close()` *itself* panics while unwinding an armed expected panic, the original body panic remains "the expected panic" for `matching:` (E0832) purposes and stays load-bearing as the test's result and unwind cause; the cleanup fault surfaces as a **secondary `warning`-severity `E0824`** on the **same trace frame** (the test runner records it in the per-test record's `cleanup_warnings[]`, additive to the original status — see E0824, §5.5), not as a separate failing record. The panicking cleanup body's own control flow is abandoned at the panic point; remaining LIFO handlers still run (`continue-drain`, per line below).
+**Cleanup that itself panics during an armed unwind.** If an in-scope `exit(false)`/`close()` *itself* panics while unwinding an armed expected panic, the original body panic remains "the expected panic" for `matching:` (E0832) purposes and stays load-bearing as the test's result and unwind cause; the cleanup fault surfaces as a **secondary `warning`-severity `E0824`** on the **same trace frame** (the test runner records it in the per-test record's `cleanup_warnings[]`, additive to the original status — see E0824, §5.5), not as a separate failing record. The panicking cleanup body's own control flow is abandoned at the panic point; remaining LIFO handlers still run (`continue-drain`, per line below). In this rule, *cleanup fault* means a panic. A failed assertion in a cleanup follows the next rule.
+
+**Cleanup that fails an assertion.** A failed `assert`, `assert_eq`, `assert_ne` or `assert_matches` in `exit(false)`/`close()` is the test's first failure, unless the unwind already carries a failure. An assertion failure and an E0832 mismatch are failures. An expected panic that `assert_panics` catches, and `skip()`, are not failures. So:
+
+- If the unwind carries no failure, the cleanup assertion fails the test. This holds for normal completion, `?`, `return`, `skip()`, and an expected panic that `matching:` accepts. The record is `failed` and its payload is the cleanup assertion, with its span, message and values. A `skip()` reason is dropped.
+- If the unwind already carries a failure, that first failure stays the result. The later cleanup assertion is a `warning`-severity `E0824` entry in `cleanup_warnings[]`. The entry has the same shape as for a panic: `code` and `message`. The message holds the full text of the assertion failure.
+
+Remaining LIFO handlers still run in both cases.
+
+```blink
+import std.testing
+
+type Lease { held: Bool }
+
+impl Closeable for Lease {
+    fn close(self) {
+        assert(!self.held, "lease still held")
+    }
+}
+
+test "close fails after an expected panic" {
+    assert_panics(matching: "boom") {
+        with Lease { held: true } as _l {
+            panic("boom")
+        }
+    }
+    // failed: payload "lease still held"; no E0824 entry
+}
+
+test "close fails after a skip" {
+    with Lease { held: true } as _l {
+        testing.skip("later")
+    }
+    // failed: payload "lease still held"; the skip reason is dropped
+}
+
+test "the first failure stays the result" {
+    with Lease { held: true } as _l {
+        assert_eq(1, 2)
+    }
+    // failed: payload is the assert_eq; "lease still held" is an E0824 entry
+}
+
+test "a mismatch stays the result" {
+    assert_panics(matching: "zzz") {
+        with Lease { held: true } as _l {
+            panic("boom")
+        }
+    }
+    // failed: E0832; "lease still held" is an E0824 entry
+}
+```
+
+A `close` that calls `panic("leak")` instead of asserting is a cleanup fault. In the first test the result is then `passed`, with an E0824 entry.
 
 This rule is uniform across `Scoped.exit()` and `Closeable.close()` (§5.5) — every catchable structured unwind runs registered cleanup; uncaught divergence does not.
 
@@ -2957,7 +3012,7 @@ A failed acquisition uses `?` on the item: `with db.connect(p)? { }`. The `?` fi
 - **Inspect or suppress the unwind value** — `exit(self, ok: Bool)` receives only the success bit; it cannot read the panic message, the propagated error, or the `skip()` reason
 - **Retry the block** — no mechanism to re-enter the block body
 - **Transform the block's result** — `exit()` returns `()`, not a modified value
-- **Replace errors** — if `exit()` itself panics on a catchable-unwind path, the original panic is preserved as the unwind cause; the test runner reports the original failure as the test's result, not the cleanup panic. The cleanup panic surfaces as a secondary `warning`-severity `E0824` (`CleanupPanickedDuringUnwind`) on the same trace frame, so the author can see the cleanup bug without losing the primary cause. On a stacked `with...as` chain, remaining handlers in the LIFO stack still run — the ordering matches the multi-cleanup test registrar decision's Q2 ruling (`continue-drain`, 6-0): short-circuiting would leak resources held by deeper-stacked handlers
+- **Replace errors** — if `exit()` itself panics on a catchable-unwind path, the original panic is preserved as the unwind cause; the test runner reports the original failure as the test's result, not the cleanup panic. The cleanup panic surfaces as a secondary `warning`-severity `E0824` (`CleanupPanickedDuringUnwind`) on the same trace frame, so the author can see the cleanup bug without losing the primary cause. A failed assertion in `exit()` is not a panic: it fails the test unless the unwind already carries a failure, and then it is an E0824 entry (*Cleanup that fails an assertion*, above). On a stacked `with...as` chain, remaining handlers in the LIFO stack still run — the ordering matches the multi-cleanup test registrar decision's Q2 ruling (`continue-drain`, 6-0): short-circuiting would leak resources held by deeper-stacked handlers
 - **Catch uncaught panics** — process-terminating panics bypass `exit()` entirely
 
 Because `exit(false)` cannot observe *which* path triggered the unwind, handler authors must design `exit` to be safe under every catchable-unwind path. A handler that should commit on success and roll back on any failure pattern-matches on `ok`; a handler that always releases (timer, lock) ignores `ok`.

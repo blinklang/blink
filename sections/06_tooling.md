@@ -893,7 +893,7 @@ The summary line always shows `passed` and `failed`. It shows `panicked` and `sk
 11 passed, 2 failed, 1 panicked (of 14)
 ```
 
-**Cleanup warnings.** A record of any status can carry a `cleanup_warnings` array. Each entry is `{"code": "E0824", "message": <cleanup panic message>}`. When a cleanup (`exit(false)` or `close()`) panics during a catchable unwind, the runner adds an entry and does not change the status (§4.7.2, E0824; cleanup in §5.5). The test keeps one record. This includes a panic in cleanup while an armed `assert_panics` unwinds: the expected panic sets the status (`passed`, or `failed` under E0832), and the cleanup panic is an E0824 entry on that record, not a separate `panicked` record:
+**Cleanup warnings.** A record of any status can carry a `cleanup_warnings` array. Each entry is `{"code": "E0824", "message": <cleanup panic message>}`. When a cleanup (`exit(false)` or `close()`) panics during a catchable unwind, the runner adds an entry and does not change the status (§4.7.2, E0824; cleanup in §5.5). A cleanup that fails an assertion adds an entry only when the unwind already carries a failure (an assertion failure or an E0832 mismatch); the message then holds the full text of the assertion failure. With no earlier failure, the cleanup assertion fails the test and adds no entry (§4.7.2, *Cleanup that fails an assertion*). The test keeps one record. This includes a panic in cleanup while an armed `assert_panics` unwinds: the expected panic sets the status (`passed`, or `failed` under E0832), and the cleanup panic is an E0824 entry on that record, not a separate `panicked` record:
 
 ```json
 {"name": "rejects bad header", "status": "passed", "duration_ms": 2,

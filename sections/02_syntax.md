@@ -2725,7 +2725,7 @@ test "platform specific" {
 }
 ```
 
-`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags. Like assertion failure, `skip()` is a catchable unwind in the sense of §4.7.2 — `Closeable.close()` and `Scoped.exit(false)` run for any in-scope resources before the test runner records the skip. A test that allocates a temp directory and then `skip()`s on platform mismatch will release the temp directory.
+`skip(reason: Str) -> Never` is a built-in available in test blocks. It unwinds to the test runner (same machinery as assertion failure panics) and marks the test as `"skipped"` with the given reason. Use `skip()` for decisions that depend on runtime state: platform detection, environment variables, feature flags. Like assertion failure, `skip()` is a catchable unwind in the sense of §4.7.2 — `Closeable.close()` and `Scoped.exit(false)` run for any in-scope resources before the test runner records the skip. A test that allocates a temp directory and then `skip()`s on platform mismatch will release the temp directory. If a cleanup that runs during the skip fails an assertion, the test is `failed` and the skip reason is dropped (§4.7.2, *Cleanup that fails an assertion*).
 
 **When to use which:**
 
