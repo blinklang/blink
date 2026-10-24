@@ -792,9 +792,10 @@ Each interpolation hole in a template literal becomes one value, by the hole's s
 | `Option[T]`, where `T` is a type in the rows above | `Some(x)` gives the value for `x`; `None` gives `TemplateValue.Null` |
 | `Raw[Str]` | No value: the text folds into the parts (see below; `Raw` wraps only a `Str`) |
 
-`Display` is not invoked on a hole (§3.6 *Display Format Protocol*). Any other hole type is `error[TemplateHoleType]` (E0534). That includes `Char`, `U64`, `Option[Option[T]]` (`None` and `Some(None)` would both give `Null`, and the handler could not tell them apart), and every struct, enum, tuple and collection. The compiler reports it at typecheck, at the hole, and never at codegen. Each `help:` line is a repair that compiles and keeps the value a parameter:
+`Display` is not invoked on a hole (§3.6 *Display Format Protocol*). Any other hole type is `error[TemplateHoleType]` (E0534). That includes `Char`, `U64`, `Option[Option[T]]` (`None` and `Some(None)` would both give `Null`, and the handler could not tell them apart), and every struct, enum, tuple and collection. A hole whose type is or contains a type parameter, such as `Option[T]`, is E0534, whatever the bounds. The compiler reports it at typecheck, at the hole, and never at codegen. Each `help:` line is a repair that compiles and keeps the value a parameter:
 
 - the type has `Display`: send its text, `{p.display()}`
+- a type parameter `T`: add `T: Display` and send its text, `{x.display()}`, or name a concrete type
 - a struct with fields of a valid type: send a field, `{p.id}`
 - `U64`: convert first, `let n = Int.try_from(big)?`, then `{n}`
 - `List[U8]`: send it as bytes, `{Bytes.from_list(xs)}`
@@ -813,6 +814,37 @@ error[TemplateHoleType]: `Point` cannot be a Template value
           integers, F32, and Option of these
   = help: send it as a string value: `{p.display()}`
   = help: or send its fields: `{p.x}`
+```
+
+The error for a type parameter is in the generic definition, once, whether or not a call exists. A call that sets the parameter gets no error from this rule, and no template value is chosen at mono:
+
+```blink
+fn count_rows(t: Template[DB]) -> Int { t.values().len() }
+
+fn by_key[T](key: T) -> Int {
+    count_rows(t"SELECT * FROM users WHERE k = {key}")           // error[TemplateHoleType]
+}
+
+fn by_text[T: Display](key: T) -> Int {
+    count_rows(t"SELECT * FROM users WHERE k = {key.display()}") // ok: the hole is a `Str`
+}
+
+fn by_int(key: Int) -> Int {
+    count_rows(t"SELECT * FROM users WHERE k = {key}")           // ok: a concrete type
+}
+```
+
+```
+error[TemplateHoleType]: `T` cannot be a Template value
+ --> keys.bl:4:49
+  |
+4 |     count_rows(t"SELECT * FROM users WHERE k = {key}")
+  |                                                 ^ `T` is a type parameter; a caller may set it to any type
+  |
+  = note: Template values are Int, Float, Bool, Str, Bytes, the narrower
+          integers, F32, and Option of these
+  = help: with `T: Display`, send its text: `{key.display()}`
+  = help: or name a concrete type: `key: Int`
 ```
 
 #### The Context Parameter `C` (normative)
