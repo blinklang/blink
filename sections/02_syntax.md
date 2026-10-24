@@ -3177,7 +3177,7 @@ error[MutationRequiresMut]: cannot assign to `total`, which is not `mut`
   = help: declare it `let mut total`
 ```
 
-**Rollout.** NotAPlace (E0611) and E0610 on an assignment are errors from the first release that has them. None of these programs had a meaning under this section. The same holds for E0610 on a pattern binder and for MutOnPattern (E0613, §3.5). ParamAssign (E0612) keeps the rollout of §3.6 *Mutable Parameters*.
+**Rollout.** The rule of §8.16.1 *Rollout of a new error* applies. NotAPlace (E0611) and E0610 on an assignment are errors from the first release that has them: none of these programs had a meaning under this section. The same holds for E0610 on a pattern binder and for MutOnPattern (E0613, §3.5). ParamAssign (E0612) ships first as a warning (§3.6 *Mutable Parameters*).
 
 **Panel vote: 6-0** on each point: E0610 for an immutable root, NotAPlace for a `Ptr` step and a temporary root, a code for ParamAssign, the order of the four cases, the `Ptr` fix rules, help only for a module-level `let`, and errors at once. The `Ptr` fix rules passed 6-0 in a second round. See [decisions/assignment-place-diagnostics.md](../decisions/assignment-place-diagnostics.md).
 

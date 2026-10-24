@@ -2058,6 +2058,16 @@ edition = "2026"
 - **Infinite compatibility.** Every edition is supported forever. The compiler never drops support for an older edition. A `edition = "2026"` package compiles with the 2035 compiler. There is no "upgrade or die" — upgrading editions is always voluntary.
 - **Default.** When `edition` is omitted from `blink.toml`, the compiler uses the latest stable edition at the time the compiler was built. For new projects, `blink init` writes the current edition explicitly. An `edition` that the toolchain does not know is an error (§8.9.8).
 
+**Rollout of a new error.** A new error that rejects a program that compiled and ran as written ships first as a warning with a machine-applicable fix that `blink fix` applies, and becomes an error in the next release. The diagnostic keeps its name and code when it becomes an error. A new error for a program that had no meaning is an error from the first release that has it. A program has no meaning if it ICEs or miscompiles, or if the spec never allowed it. A section that adds an error points to this rule and keeps no copy of it.
+
+The warning and the error have one code when only the severity changes. They have two codes when the warning and the error name different properties: `W0731` and `E0731` (§3.6 *Migration: `@deprecate_override` warning hop*) are two codes because an override of a deprecated default and an override of a sealed method are two different faults.
+
+```blink
+fn ok_now() -> Result[(), Str] { Ok(()) }     // ok
+fn warns() -> Result[(), Str] { Ok() }        // warning[VariantArgumentCount], error in the next release: Ok() compiled and ran
+fn never() -> Result[Int, Str] { Ok() }       // error[VariantArgumentCount] at once: it has no meaning
+```
+
 **How editions interact with dependencies:** The compiler resolves each package's edition independently. If package A (edition 2028) depends on package B (edition 2026), the compiler checks A against 2028 rules and B against 2026 rules. No edition leaks across package boundaries. This is why editions can only gate per-package concerns (stdlib, keywords, lint) — they cannot change type system semantics or effect resolution, which are cross-package.
 
 **Editions vs. the language version.** The cross-package type-system constants that editions cannot reach are fixed by the **language version** — the compiler/spec revision reported by `blink --version` (§9.1.3, line `blink 0.3.0 (stdlib 0.3.0)`), not the per-package `edition` and not package semver. The bridge alphabet (§9.1.3.2) is the first such constant: the set of element types `T` that flow through the byte-bridge primitives is identical for every package in a build regardless of any package's edition. Your edition does not and cannot change it — there is no per-package opt-in. The language version is not a third versioning *knob*: it is simply which `blink` binary you are running, the way `node`/`python` version is fixed by the interpreter you invoke, never declared in a manifest.

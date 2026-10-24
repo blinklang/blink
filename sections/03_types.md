@@ -2482,7 +2482,7 @@ A variant brace literal, and a variant paren payload that writes a label, follow
 
 A call may write any field by position or, if the variant names it, by label; a position fills the field at its index. In a paren payload, positional arguments come first. A positional argument after a labelled one is `PositionalAfterKeyword` (E0527), the code that a call gets for the same mistake (§2.13). The field rules then run on what the arguments fill: argument *i* fills field *i*, and a label fills the field it names. A label for a field that an earlier argument filled is `DuplicateField`, with a `note:` at the argument that filled it.
 
-The argument-count `TypeError` (E0300) applies only to a payload that has no label, and to a payload that has more positional arguments than the variant has fields. It has a `note:` that lists the variant's fields in order. `MissingField` has the same `note:`. In the `note:`, each field that an argument filled, by position or by label, carries the mark `(given)`.
+A wrong number of arguments in a variant paren payload is `VariantArgumentCount` (E0321). It applies to a payload that has no label, and to a payload that has more positional arguments than the variant has fields. It applies to `Some`, `Ok`, `Err`, `None` and to user variants alike. `TypeError` (E0300) stays for an argument of the wrong type. The error has a `note:` that lists the variant's fields in order, for every variant that has fields, `Some`, `Ok` and `Err` too. `MissingField` has the same `note:`. In the `note:`, each field that an argument filled, by position or by label, carries the mark `(given)`.
 
 ```blink
 type Figure { Circle(radius: Float, tag: Int) }
@@ -2500,7 +2500,7 @@ type Figure { Circle(radius: Float, tag: Int) }
 fn main() {
     let d = Figure.Circle(1.0, radius: 2.0)       // error[DuplicateField], error[MissingField]
     let e = Figure.Circle(tag: 2, 1.0)            // error[PositionalAfterKeyword]
-    let f = Figure.Circle(1.0)                    // error[TypeError]
+    let f = Figure.Circle(1.0)                    // error[VariantArgumentCount]
 }
 ```
 
@@ -2513,8 +2513,50 @@ error[MissingField]: `Figure.Circle` is missing field `tag` (Int)
 error[PositionalAfterKeyword]: a positional argument follows a labelled one
   note: `tag:` is the first label
   help: write the positional arguments first
-error[TypeError]: variant `Circle` expects 2 argument(s), got 1
+error[VariantArgumentCount]: variant `Circle` takes 2 arguments, got 1
   note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)
+```
+
+A variant with no payload that gets arguments (`None(1)`, `Shape.Dot(1.0)`) is `VariantArgumentCount` too. The message says that the variant takes no arguments, and it has no `note:`. The help gives the one repair: remove the parentheses. The spec fixes that repair, not the exact words of the help.
+
+**`Ok` takes one argument.** `Ok` has one field, as `Some` and `Err` do. The unit success is `Ok(())`, so `Ok()` is `VariantArgumentCount`:
+
+- Where the success type is `()`, `Ok()` is a warning, with a machine-applicable fix to `Ok(())`. It becomes an error in the next release, and the diagnostic keeps its name and code (§8.16.1 *Rollout of a new error*).
+- Where the success type is not `()`, `Ok()` is an error at once, with no fix. That program has no meaning, and `Ok(())` would be the wrong value there.
+- Every other wrong count is an error at once.
+
+In `let r = Ok()` the success type is not known. While `Ok()` is a warning, the compiler cannot say if the arity diagnostic is a warning or an error, so it reports `CannotInferType` (E0301) only. When `Ok()` is an error, it reports the arity error first and not E0301: a rejected term gives no type to infer from.
+
+```blink
+fn done() -> Result[(), Str] { Ok(()) }       // ok: the unit success
+fn one() -> Option[Int] { Some(1) }           // ok
+```
+
+```blink
+type Shape { Sq(Float, Float), Dot }
+
+fn a() -> Result[(), Str] { Ok() }            // warning[VariantArgumentCount]: fix is Ok(())
+fn b() -> Result[Int, Str] { Ok() }           // error[VariantArgumentCount]: at once, no fix
+fn c() -> Option[Int] { Some() }              // error[VariantArgumentCount]
+fn d() -> Shape { Shape.Dot(1.0) }            // error[VariantArgumentCount]
+```
+
+```
+warning[VariantArgumentCount]: variant `Ok` takes 1 argument, got 0
+  note: fields of `Ok`, in order: T
+  help: write `Ok(())`
+error[VariantArgumentCount]: variant `Ok` takes 1 argument, got 0
+  note: fields of `Ok`, in order: T
+error[VariantArgumentCount]: variant `Some` takes 1 argument, got 0
+  note: fields of `Some`, in order: T
+error[VariantArgumentCount]: variant `Shape.Dot` takes no arguments, got 1
+  help: remove the parentheses
+```
+
+```blink
+fn main() {
+    let r = Ok()    // warning stage: error[CannotInferType] only; later: error[VariantArgumentCount] only
+}
 ```
 
 A variant with a positional payload, written with no argument list, is a function value (§3.4 *A payload variant named as a value*).
@@ -4370,7 +4412,7 @@ impl Display for Marker {
 
 `MutAliasOfImmutable` checks direct aliases only. An alias made through a call result (`id(a)`) or a struct literal (`W { xs: a }`) passes it. An immutable `let` is not a promise that the value behind it never changes (§3.2.2).
 
-**Rollout.** Each new error in this subsection ships first as a warning with a machine-applicable fix that `blink fix` applies, and becomes an error in the next release. A diagnostic keeps its name and code when it becomes an error.
+**Rollout.** Each new error in this subsection follows the rule of §8.16.1 *Rollout of a new error*.
 
 #### Operations on `Self` in a Default Body
 
