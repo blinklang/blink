@@ -269,12 +269,12 @@ fn main() {
     assert_diags(src, [])
 }
 
-// Float and F32 declare these constants (sections/03_types.md §3.2.6 *Constants*), so the
-// names are not missing variants, whatever else the compiler does with them today.
+// Float declares these constants (sections/03_types.md §3.2.6 *Constants*), so the names are
+// not missing variants, whatever else the compiler does with them today.
 test "a constant that Float declares is not reported as a missing variant" {
     let src = #"fn main() {
     let a = Float.NAN
-    let b = F32.MIN_POSITIVE
+    let b = Float.MIN_POSITIVE
     io.println("{a} {b}")
 }
 "#
@@ -284,4 +284,155 @@ test "a constant that Float declares is not reported as a missing variant" {
     }
     for b in bad { io.eprintln("got: {b}") }
     assert(bad.len() == 0)
+}
+
+// The errors in `diags_of(src)` that contain `part`.
+fn diags_with(src: Str, part: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let mut out: List[Str] = []
+    for d in diags_of(src) {
+        if d.contains(part) { out.push(d) }
+    }
+    out
+}
+
+// Inside an impl, `Self` is the impl's type (§3.5): an enum's `Self` has its variants, a
+// struct's `Self` has none, and either one reaches the type's associated fns.
+test "Self in an impl names the impl's type" {
+    let src = #"trait Named {
+    fn Fresh() -> Self
+    fn Again() -> Self
+}
+
+type Color { Red, Green, Rgb(Int) }
+type Point { x: Int }
+
+impl Named for Color {
+    fn Fresh() -> Self { Self.Rgb(7) }
+    fn Again() -> Self { Self.Gren }  // SELFENUM
+}
+
+impl Named for Point {
+    fn Fresh() -> Self { Self.Zed(1) }  // SELFSTRUCT
+    fn Again() -> Self { Self.Fresh() }
+}
+
+fn name(c: Color) -> Str {
+    match c {
+        Color.Red => "red"
+        _ => "other"
+    }
+}
+
+trait Shown {
+    fn shown(self) -> Str
+}
+
+impl Shown for Color {
+    fn shown(self) -> Str {
+        match self {
+            Self.Red => "red"
+            Self.Green => "green"
+            Self.Rgb(n) => "rgb {n}"
+        }
+    }
+}
+
+fn main() {
+    io.println("{name(Color.Fresh())} {Color.Red.shown()} {Point.Again().x}")
+}
+"#
+    let gren = span(src, "SELFENUM", "Gren")
+    assert_diags(src, [
+        "{gren}: E0547 `Color` has no variant `Gren` | help: did you mean `Green`?",
+        no_variants(src, "SELFSTRUCT", "`Self` is a struct; it has no variants")
+    ])
+}
+
+test "an alias of a struct reaches the struct's associated fns" {
+    let src = #"trait Named {
+    fn Fresh() -> Self
+}
+
+type Point { x: Int }
+type P = Point
+
+impl Named for Point {
+    fn Fresh() -> Self { Point { x: 1 } }
+}
+
+fn main() {
+    let p = P.Fresh()
+    io.println("{p.x}")
+}
+"#
+    assert_diags(src, [])
+}
+
+test "a core type imported under another name keeps its variants" {
+    let src = #"import blink.core.{Option as Opt}
+
+fn f(o: Option[Int]) -> Int {
+    match o {
+        Opt.Some(v) => v
+        Opt.None => 0
+    }
+}
+
+fn main() {
+    let a = Opt.Some(3)
+    let b: Option[Int] = Opt.None
+    io.println("{f(a)} {f(b)}")
+}
+"#
+    let bad = diags_with(src, " E0547 ")
+    for b in bad { io.eprintln("got: {b}") }
+    assert(bad.len() == 0)
+}
+
+// The unknown type is reported where the alias names it; the qualifier adds nothing.
+test "a qualifier whose type did not resolve gets no second error" {
+    let src = #"type Bad = Missing
+type Many = List[Missing]
+
+fn f(n: Int) -> Int {
+    match n {
+        Bad.Zed => 1
+        _ => 0
+    }
+}
+
+fn main() {
+    let a = Bad.Zed
+    let c = Many.Zed
+    io.println("{f(1)}")
+}
+"#
+    let bad = diags_with(src, " E0547 ")
+    for b in bad { io.eprintln("got: {b}") }
+    assert(bad.len() == 0)
+}
+
+// F32 and F64 are reserved names the compiler does not build yet, so any use of them is the
+// reserved-type error, a declared constant included.
+test "a member of a reserved float type is the reserved-type error" {
+    let src = #"fn f(n: Int) -> Int {
+    match n {
+        F64.Zed => 1
+        _ => 0
+    }
+}
+
+fn main() {
+    let a = F64.Zed
+    let b = F32.PI
+    io.println("{f(1)}")
+}
+"#
+    let bad = diags_with(src, " E0547 ")
+    let reserved = diags_with(src, "is reserved but not yet supported")
+    for b in bad { io.eprintln("got: {b}") }
+    if reserved.len() != 3 {
+        for d in diags_of(src) { io.eprintln("diag: {d}") }
+    }
+    assert(bad.len() == 0 && reserved.len() == 3)
 }
