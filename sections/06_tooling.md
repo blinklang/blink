@@ -864,6 +864,8 @@ test "add is commutative" {
 }
 ```
 
+`blink test` builds each file as a test build (§2.20), so the file's tests are in the program that it runs.
+
 **Why first-class syntax, not a library:**
 
 - The compiler knows about tests. It can type-check test bodies against the function under test, catch type mismatches in assertions at compile time, and provide structured test output in the same JSON format as diagnostics.

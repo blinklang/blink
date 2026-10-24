@@ -2077,7 +2077,37 @@ test "description string" { body }
 - The body is a block expression evaluated by the test runner.
 - `test` blocks are top-level declarations (peers of `fn`, `type`, etc.). They see all items in their file's module (§10.1).
 - Test names must be unique within their module scope. Duplicate names are a compile error.
-- Tests are stripped from release builds. They exist only when compiled with `blink test`.
+- A **test build** is the build that `blink test` makes. No other command makes one.
+- Test bodies, test names, tags and the test runner exist only in a test build. Every other build, with any option, omits them.
+- `blink check` and every build type-check test blocks, also a block that the build omits.
+- A built program reserves no command-line flag for tests. `./app --test` gives `--test` to `main`, like any other argument.
+
+```blink
+fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+fn main() {
+    io.println("{add(1, 2)}")
+}
+
+test "add works" {
+    assert_eq(add(1, 2), 3)
+}
+```
+
+`blink test` builds this file as a test build and runs `add works`. `blink build` and `blink run` make a program that has no `add works` test. All of them reject a test body that has a type error.
+
+```blink
+fn main() {
+    let argv = env.args()
+    if argv.contains("--test") {
+        io.println("connection ok")
+    }
+}
+```
+
+A program from `blink build` has no test runner. `./app --test` runs `main`, and `env.args()` holds `--test`.
 
 #### Effect Model: Pure by Default
 
@@ -2216,11 +2246,11 @@ test "let-bound property closure is not elaborated" {
 }
 ```
 
-Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in both `blink check` and `blink test`.
+Each `?` site inside an elaborated property closure renders via `Display[E]` and stamps `TestError.error_type` with the static name of `E` **at that site** — distinct `?` sites in one property may produce distinct `error_type` values (something a single declared error type could not express, since `?` performs no implicit conversion, §3c.2 Rule 4). `?` on an `Option[T]` operand is covered by the same elaboration: the `None` arm yields `TestError { message: "None", error_type: "Option", origin: <span> }`, identical to the test-body lowering. A returned `Err(TestError { ... })` is treated as "property failed for this input": the shrinker minimizes the generated input exactly as it does for an assertion failure, and the failure block prints the rendered error beneath the same `shrunk input:` line (see §8.10 Runner Output). This elaboration applies in `blink check` and in every build.
 
 **Composition with `with`, `skip()`, panics, assertions.** `?` propagating an `Err` is one of the **catchable unwinds** of §4.7.2 — it runs `Scoped.exit(false)` and `Closeable.close()` on the way out, identical to assertion failure and `skip()`. Doc-tests are compiled as ordinary tests and obey the same rule.
 
-**Validation symmetry.** `blink check` and `blink test` apply the same elaboration rule — `?` is valid in a test body iff the body would type-check after the implicit `Result[(), TestError]` elaboration. The two pipelines never disagree.
+**Validation symmetry.** `blink check` and every build apply the same elaboration rule — `?` is valid in a test body iff the body would type-check after the implicit `Result[(), TestError]` elaboration. They never disagree.
 
 **Failure rendering.** A test that returns `Err(TestError { ... })` produces NDJSON `status: "failed"` with a new `cause` discriminator field (see §8.10 Runner Output). The `cause` enum is closed: `"assertion" | "propagated_error"`. Power-assert introspection is not applied to `?`-propagated errors (there is no source `assert(...)` to decompose); the `TestError.message` field provides the rendered context.
 
@@ -2772,7 +2802,7 @@ test "full order flow" {
 }
 ```
 
-The `@tags(...)` annotation attaches string tags to a test block for structured filtering. Tags are compile-time metadata — stripped with test bodies in release builds.
+The `@tags(...)` annotation attaches string tags to a test block for structured filtering. Tags are compile-time metadata. They exist only in a test build, with the test bodies.
 
 **CLI filtering:**
 
@@ -2886,7 +2916,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 - `@tags(...)` annotation for structured filtering
 - `@skip` annotation for unconditional compile-time skip (body still type-checked)
 - `skip(reason: Str) -> Never` built-in for conditional runtime skip
-- Stripped from release builds
+- Exist only in a test build
 - JSON structured output via `blink test --json`
 
 ### 2.21 Const Declarations

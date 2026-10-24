@@ -1396,6 +1396,8 @@ Run `blink doc --list` to list available modules.
 build/blink build src/main.bl     # compile to build/main
 build/blink run src/main.bl       # compile + run
 build/blink test                    # discover + run all test blocks
+# `blink test` makes the test build. No other command makes one, so every other build,
+# with any option, leaves out `test` blocks. Every build still typechecks each test body.
 build/blink check src/main.bl     # typecheck without compiling
 build/blink fix src/main.bl       # apply the machine-applicable fixes of its diagnostics
 build/blink fmt src/main.bl       # format in place
@@ -1420,8 +1422,7 @@ build/blink test --json
 # Default builds (no mode flag) compile the C at -O1
 build/blink build src/main.bl
 
-# Release builds (optimized with -O2). They leave out `test` blocks; check and build still
-# typecheck each test body.
+# Release builds (optimized with -O2)
 build/blink build src/main.bl --release
 build/blink build src/main.bl -R
 
