@@ -2104,7 +2104,7 @@ test "description string" { body }
 - `test` is a keyword. The description is a `Str` literal (no interpolation — must be a static string for test discovery).
 - The body is a block expression evaluated by the test runner.
 - `test` blocks are top-level declarations (peers of `fn`, `type`, etc.). They see all items in their file's module (§10.1).
-- Test names must be unique within their module scope. Duplicate names are a compile error.
+- Test names must be unique within their module. Two tests of one module with the same name are a compile error: `DuplicateTestName` (E0851). A `test` and a `test.failing` (§8.10.6) share one name space. Two names are the same when their `Str` values are equal after escapes decode, not when their spelling is equal. A test name is not a binding, so a `fn`, `let` or `type` of the same text does not collide with it.
 - A **test build** is the build that `blink test` makes. No other command makes one.
 - Test bodies, test names, tags and the test runner exist only in a test build. Every other build, with any option, omits them.
 - `blink check` and every build type-check test blocks, also a block that the build omits.
@@ -2786,6 +2786,57 @@ test "decoded bytes round-trip" {
     })
 }
 ```
+
+#### Duplicate Test Names
+
+The compiler reports `DuplicateTestName` (E0851) when `blink check` reads the module, so `blink test` does not reach the C compiler. The primary span is the name literal of the later test, and a label marks the first. N tests of one name give N-1 diagnostics, each one pointing at the first test. The fix is a suggestion only, never machine-applicable: the compiler cannot know which test to rename. When the two spellings differ, a note shows the shared value.
+
+The compiler still checks the body of the later test, so one run shows every error in it. This is error recovery only: the program does not compile and no test runs.
+
+```blink
+// Valid: a test name is not a binding, so it does not collide with `a`
+fn a() -> Int { 1 }
+
+test "a" { assert_eq(a(), 1) }
+test "b" { assert_eq(a(), 1) }
+```
+
+```blink
+// INVALID: compile error E0851
+test "deposit" { assert(true) }
+test "deposit" { assert(true) }    // error[E0851]: test `deposit` is declared twice in module `main`
+
+test "ab" { assert(true) }
+test "a\u{62}" { assert(true) }    // error[E0851]: the value of "a\u{62}" is "ab"
+test.failing("ab", reason: "not built yet") { assert(false) }    // error[E0851]: `test.failing` shares the name space
+```
+
+```
+error[E0851]: test `deposit` is declared twice in module `main`
+ --> src/main.bl:2:6
+  |
+1 | test "deposit" { assert(true) }
+  |      --------- first declared here
+2 | test "deposit" { assert(true) }
+  |      ^^^^^^^^^ declared again here
+  |
+  = help: give each test its own name
+```
+
+```
+error[E0851]: test `ab` is declared twice in module `main`
+ --> src/main.bl:2:6
+  |
+1 | test "ab" { assert(true) }
+  |      ---- first declared here
+2 | test "a\u{62}" { assert(true) }
+  |      ^^^^^^^^^ declared again here
+  |
+  = note: both names have the value "ab"
+  = help: give each test its own name
+```
+
+`blink explain E0851` gives the reason: the name of a test is its key in `blink test --filter` and in the test report.
 
 #### Test Scope
 

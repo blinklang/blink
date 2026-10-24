@@ -1795,7 +1795,7 @@ test.failing(
 }
 ```
 
-`reason: Str` is **mandatory** and must be non-empty. It tells *why* the test is expected to fail. A missing or empty `reason:` is error E0835. `test.failing` takes no other arguments. To point at tracked work, write the reference in `reason:`.
+`reason: Str` is **mandatory** and must be non-empty. It tells *why* the test is expected to fail. A missing or empty `reason:` is error E0835. `test.failing` takes no other arguments. To point at tracked work, write the reference in `reason:`. A `test.failing` test shares the name space of `test` (§2.20).
 
 ##### Encoding in the NDJSON record
 
