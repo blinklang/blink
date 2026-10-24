@@ -1146,7 +1146,7 @@ if result.exit_code == 0 {
 
 ## User-Defined Effects
 
-Declare custom effects with `effect` blocks. Sub-effects group related operations.
+Declare custom effects with `effect` blocks. Sub-effects group related operations. A top-level effect may not take the name of a built-in effect (`FS`, `Net`, `DB`, `IO`, `Env`, `Time`, `Rand`, `Crypto`, `Process`, `State`, `Async`): `effect Time` is `ReservedEffectName` (E0559). To replace the clock in a test, write `handler Time { ... }` and use `with`.
 
 ```blink
 effect Metrics {

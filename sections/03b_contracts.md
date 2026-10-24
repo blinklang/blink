@@ -833,6 +833,8 @@ Four rules limit this type:
 3. **Only a top-level effect gives a type.** `Template[DB.Read]` is `error[SubEffectAsType]` (E0536), whose `help:` names the parent effect `DB`.
 4. **A marker type is also a valid context.** A context with no effect, such as HTML, declares one: `type Html {}`.
 
+A built-in effect name does not reserve a type name (§4.3). In a module that declares `type DB`, `DB` in a type position is that type, so `Template[DB]` there names the user type.
+
 *(Non-normative: a later lint may warn on an effect's type written in a position that holds values, such as `Map[Str, DB]`. Such a lint warns at the written annotation only, never through a generic binder, and is never an error.)*
 
 **`C` comes from how the template is used.** A template literal has type `Template[α]`, where α is a new type variable (§2.4.3). The type that the site expects solves α, by the same bidirectional check as for any other expression. A later use in the same definition can also solve it, as for `[]` and `None` (§3.4 *Under-Determined Types*). `C` is never inferred from the effects in the enclosing signature. If α is not solved at the end of inference for the definition, the literal is `error[CannotInferType]` (E0301), and the span points at the `t"..."` literal. If two uses need different contexts, the error is at the second use, and a `note:` names the use that set `C`.

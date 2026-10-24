@@ -177,6 +177,8 @@ effect Process {
 
 effect State          // reads or writes module-level `let mut` (leaf effect: no operations, no handler, §4.16)
 
+effect Async          // spawn and join concurrent tasks (§4.13)
+
 ```
 
 **Granting rules:**
@@ -204,6 +206,39 @@ error[UnknownEffect]: unknown effect `FFI`
 ```
 
 No fix is machine-applicable: an effect row on an `@ffi` decl is a claim about foreign code, and no tool writes that claim for the author.
+
+**A built-in effect name is reserved.** A top-level `effect` declaration may not take the name of a built-in effect: `FS`, `Net`, `DB`, `IO`, `Env`, `Time`, `Rand`, `Crypto`, `Process`, `State` or `Async`. The error is `ReservedEffectName` (E0559). It holds in every module, `pub` or not, with or without sub-effects. So `Time` in a row, in `with`, in a handler and in a `time.x()` call is always the built-in effect, in every module, and no import is needed to reach it. The rule covers the top-level name only. A sub-effect may have the name of a built-in effect, because its handle is the handle of its parent. The rule reserves the `effect` declaration only. A `type` with a built-in effect name is legal, and in a type position the user type is the one named in its module.
+
+```blink
+effect Clock {
+    effect Time {                      // legal: a sub-effect, and its handle is `clock`
+        fn now() -> Int
+    }
+}
+
+type Time { t: Int }                   // legal: a type, not an effect
+
+fn stamp() -> Int ! Clock.Time {
+    clock.now()
+}
+
+fn wall() -> Instant ! Time.Read {     // `Time` is the built-in effect
+    time.read()
+}
+```
+
+```
+error[ReservedEffectName]: `Time` is a built-in effect name
+ --> clock.bl:1:8
+  |
+1 | effect Time {
+  |        ^^^^ reserved: `Time` is a built-in effect
+  |
+  = help: rename it, for example `effect Clock`
+  = help: to replace the clock in tests, write `handler Time { ... }` and use `with`
+```
+
+A test that needs a fake clock does not declare a second `Time`. It writes a handler for the built-in one (§4.7).
 
 Declaring a parent is syntactic sugar for declaring all children. `! FS` and `! FS.Read, FS.Write, FS.Delete, FS.Watch` are identical to the compiler. The short form exists for the (rare) functions that genuinely need everything; the long form is what most functions should use.
 
@@ -299,6 +334,7 @@ The `IO.Read` operations take and return other types (§4.4.9). The wrapper sele
 | `Rand` | `rand` | `rand.int(Range[Int])`, `rand.float()`, `rand.bytes(Int)` (§4.4.7) |
 | `Crypto` / `Crypto.*` | `crypto` | `crypto.hash(...)`, `crypto.sign(...)`, `crypto.encrypt(...)`, `crypto.decrypt(...)`; a plain SHA-256 digest is the pure `Sha256.of` in `std.digest` and needs no effect |
 | `Process` / `Process.*` | `process` | `process.run(...)`, `process.spawn(...)`, `process.wait(...)`, `process.signal(...)`, `process.exec(...)` (§4.4.8) |
+| `Async` | `async` | `async.spawn(...)`, `async.scope(...)` (§4.13) |
 
 The handle is always the lowercase form of the top-level effect name. Sub-effects do not create separate handles -- they control which *methods* on the handle are available. Declaring `! FS.Read` gives you the `fs` handle, but only `fs.read(...)`, `fs.list_dir(...)` and `fs.stat(...)` compile. Calling `fs.write(...)` with only `FS.Read` declared is a compile error:
 
@@ -3168,7 +3204,7 @@ effect Payment {
 }
 ```
 
-User-defined effects follow all the same rules as built-in effects: hierarchical, handle-based, handler-swappable, composable, budget-constrained.
+User-defined effects follow all the same rules as built-in effects: hierarchical, handle-based, handler-swappable, composable, budget-constrained. A user-defined top-level effect may not take the name of a built-in effect (`ReservedEffectName`, E0559, §4.3).
 
 ```blink
 fn charge_customer(order: Order) -> Result[Charge, PaymentError] ! Payment.Charge, IO.Log {
