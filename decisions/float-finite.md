@@ -191,7 +191,7 @@ fn main() {
 
 - `is_finite` and `is_infinite` are built-in methods on `Float` and `F32`, in the *Built-in Float Methods* table, with no import and no `std.float` free fn. A NaN is neither.
 - Laws: exactly one of `is_nan`, `is_infinite`, `is_finite` holds; `x.is_infinite() == (x == Float.INF || x == -Float.INF)`; `x.is_finite()` is `true` exactly when the exponent field of `x.to_bits()` is not all ones.
-- `Float.INF` and `Float.NAN` are prelude constants. `Float.NAN` is a quiet NaN with no fixed sign or payload. `F32.INF` and `F32.NAN` are not defined until `F32` ships.
+- `Float.INF` and `Float.NAN` are prelude constants. `Float.NAN` is a quiet NaN with no fixed sign or payload. The `F32` constants are in the float-math ruling (§3.2.6).
 - `x == Float.NAN` is `true` for every NaN; `x.is_nan()` is the preferred test.
 - The NaN-test bullets gain "to test for a finite value, use `x.is_finite()`". *Differences from IEEE 754* gets no line.
 - The JSON guard example uses `Str` and `json.encode` with a non-null fallback.

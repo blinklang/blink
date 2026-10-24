@@ -854,7 +854,6 @@ let first_two = names
 | `.ln()` / `.log2()` / `.log10()` | Float | Logarithms. There is no `.log()` (E0505; the help names these three) |
 | `.sin()` / `.cos()` / `.tan()` / `.asin()` / `.acos()` / `.atan()` | Float | Trigonometry in radians |
 | `y.atan2(x)` | Float | Angle of the point (x, y); `self` is y |
-| `.is_finite()` / `.is_infinite()` | Bool | With `is_nan`, these split the values into NaN, infinite and finite |
 | `Float.PI`, `E`, `INF`, `NAN`, `MAX`, `EPSILON`, `MIN_POSITIVE` | Float | Constants (also on `F32`); `MIN_POSITIVE` is the smallest positive normal value. No `MIN` and no `NEG_INF`: write `-Float.MAX`, `-Float.INF` |
 
 `Float` has a total order: `==`, `<` and sort treat `NaN` as equal to itself and above all numbers, and `-0.0` as equal to `0.0`. Use `ieee_eq` for IEEE comparison. No `Float` equality tells `-0.0` from `0.0`; to test the sign, use `x.is_sign_negative()`. A comparison with a written `-0.0` operand (`x == -0.0`, `x < -0.0`, `x.ieee_eq(-0.0)`, `assert_eq(x, -0.0)`) gives the same result for `0.0` and warns `NegativeZeroComparison` (W0706). To test for negative zero, use `x == 0.0 && x.is_sign_negative()`. Equal bits imply `==`, but `==` does not imply equal bits. `to_bits`, `from_bits` and `is_sign_negative` need no import. `Float.INF` is positive infinity (`-Float.INF` is negative infinity) and `Float.NAN` is a NaN with no fixed sign or payload; both need no import. `x == Float.NAN` is `true` for every NaN, so test for NaN with `x.is_nan()`, and for a finite value with `x.is_finite()`.

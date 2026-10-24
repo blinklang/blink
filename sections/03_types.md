@@ -5635,8 +5635,6 @@ fn clamp(x: Float, lo: Float, hi: Float) -> Float {
 | `from_bits` | `fn(U64) -> Float` (static) | `fn(U32) -> F32` (static) | The value with that bit pattern |
 | `is_sign_negative` | `fn(self) -> Bool` | `fn(self) -> Bool` | The sign bit |
 | `is_nan` | `fn(self) -> Bool` | `fn(self) -> Bool` | `true` exactly when the value is a NaN, of any sign or payload |
-| `is_infinite` | `fn(self) -> Bool` | `fn(self) -> Bool` | `true` exactly when the value is `inf` or `-inf` |
-| `is_finite` | `fn(self) -> Bool` | `fn(self) -> Bool` | `true` exactly when the value is neither a NaN nor an infinity |
 
 A NaN is neither finite nor infinite. `0.0`, `-0.0` and every subnormal value are finite.
 
@@ -5649,8 +5647,7 @@ A NaN is neither finite nor infinite. `0.0`, `-0.0` and every subnormal value ar
 - **Arithmetic.** An operation that gives a NaN does not fix the sign or payload of that NaN.
 - **Sign.** `x.is_sign_negative()` is `true` exactly when the sign bit of `x` is set. That includes `-0.0` and a NaN with the sign bit set. `1.0 / x < 0.0` is `false` for every NaN, so it is not a sign test. To test for negative zero, use `x == 0.0 && x.is_sign_negative()`.
 - **NaN test.** `x.is_nan() == !x.ieee_eq(x)`. `x != x` is not a NaN test, because it is always false (*Differences from IEEE 754*).
-- **Classes.** For every `x`, exactly one of `x.is_nan()`, `x.is_infinite()` and `x.is_finite()` is `true`.
-- **Infinity test.** For `Float`, `x.is_infinite() == (x == Float.INF || x == -Float.INF)`. A NaN is not `==` to either infinity.
+- **Infinity test.** `x.is_infinite() == (x == Float.INF || x == -Float.INF)`; for `F32`, with `F32.INF`. A NaN is not `==` to either infinity.
 - **Finite test.** `x.is_finite()` is `true` exactly when the exponent field of `x.to_bits()` is not all ones.
 - **Copies keep every bit.** Copy, move, storage, and passing to or from an `@ffi` function keep every bit of a `Float` or `F32`. This law does not cover what C code does with the value.
 
@@ -5669,12 +5666,7 @@ fn main() {
 }
 ```
 
-**Constants.** `Float` has two constants. They need no import, because the prelude declares them (§2.12.3 *Type-Scoped Declarations*).
-
-- `Float.INF` is positive infinity. Negative infinity is `-Float.INF`.
-- `Float.NAN` is a quiet NaN. The spec does not fix its sign or its payload.
-
-`x == Float.NAN` is `true` for every NaN in Blink (*Float Total Ordering*). The preferred test is `x.is_nan()`. `F32.INF` and `F32.NAN` are not defined until `F32` is supported.
+**Constants.** `INF` and `NAN` on `Float` and `F32` are in §3.2.6 *Float Math*. Negative infinity is `-Float.INF`. The spec does not fix the sign or the payload of `NAN`. `x == Float.NAN` is `true` for every NaN in Blink (*Float Total Ordering*). The preferred test is `x.is_nan()`.
 
 ```blink
 fn main() {
