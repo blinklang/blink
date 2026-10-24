@@ -1758,9 +1758,9 @@ process(200)              // OK: literal 200 fits in U8
 process(300)              // error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)
 ```
 
-**Integer literal range.** An integer literal stands for the exact integer that its digits spell, in every base that the literal grammar allows (decimal, `0x`, `0b` and `0o`; §2.4.4). A literal in any base is a value, never a bit pattern. The literal gets its type at the literal: the expected type at that point, or `Int` when there is none. When the literal is checked against a type variable that nothing has solved yet, that variable becomes `Int`. The value must be in the range of the literal's type (*Type table* above). If it is not, the compiler gives `error[IntLiteralOutOfRange]` (E0318) at the literal. E0318 is the same for every integer type, and no `@allow` or `[lints]` setting turns it off.
+**Integer literal range.** An integer literal stands for the exact integer that its digits spell, in every base that the literal grammar allows (decimal, `0x`, `0b` and `0o`; §2.4.4). A literal in any base is a value, never a bit pattern. The literal gets its type at the literal: the expected type at that point, or `Int` when there is none. The expected type of the call reaches the type variables of its result type before the arguments are checked. When the literal is checked against a type variable that nothing has solved yet, that variable becomes `Int`. The value must be in the range of the literal's type (*Type table* above). If it is not, the compiler gives `error[IntLiteralOutOfRange]` (E0318) at the literal. E0318 is the same for every integer type, and no `@allow` or `[lints]` setting turns it off.
 
-- **No expected type.** The message says that the literal has the default type `Int`. When the value fits in `U64`, a `help:` offers an annotation, such as `let x: U64 = ...`. When the value is above the `U64` maximum (2^64-1), the message says that no integer type holds the value, and there is no `help:`.
+- **No expected type.** The message says that the literal has the default type `Int`. When the value fits in `U64`, a `help:` offers an annotation, such as `let x: U64 = ...`. When the value is above the `U64` maximum (2^64-1), the message says that no integer type holds the value, and there is no `help:`. A literal that is checked against a type variable that nothing has solved has no expected type. It gets this message, in a generic call (`id(n)`), a constructor (`Some(n)`), a list literal (`[1, n]`) and a push to a list whose element type is open. A message with a range, such as `does not fit in U8 (0 to 255)`, is only for a type that the program wrote. The `help:` names the repair that reaches the variable (§3.4). For every generic call, that is an explicit type-argument list (§3.4 *Explicit Type Application*). For a constructor, a list literal or a push, it is an annotation on the binding. When the callee has more type parameters than the literal reaches, there is no `help:`. After E0318, the compiler gives no other error for the same literal.
 - **Negative literals.** One unary `-` directly before an integer literal, with optional parentheses, makes one *negative literal*. Its value is the negated value of the literal. The check reads the expression as written, as W0704 and W0706 do (§3.6):
   ```
   N ::= "-" L | "(" N ")"
@@ -1773,6 +1773,9 @@ process(300)              // error[IntLiteralOutOfRange]: 300 does not fit in U8
 - **Const contexts.** A literal out of range in a const context (§2.21) is E0318, not `ConstEvalPanic` (E0546), because nothing is evaluated. E0546 is for evaluation that would panic, such as overflow in an operation.
 
 ```blink
+fn id[T](x: T) -> T { x }
+fn show[T](x: T) { }
+
 fn is_sign_negative_bits(x: Float) -> Bool {
     (x.to_bits() & 9223372036854775808) != 0   // OK: both literals are U64
 }
@@ -1795,6 +1798,14 @@ fn main() {
     let mut xs = []
     xs.push(9223372036854775808)            // error[IntLiteralOutOfRange]: the element type is not known here, so the literal is Int
                                             //   help: let mut xs: List[U64] = []
+
+    let w: U64 = id(9223372036854775808)    // OK: U64 reaches T before the argument is checked
+    let y = id(9223372036854775808)         // error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type
+                                            //   help: let y = id[U64](9223372036854775808)
+    let o = Some(9223372036854775808)       // error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type
+                                            //   help: let o: Option[U64] = Some(9223372036854775808)
+    show(9223372036854775808)               // error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type
+                                            //   help: show[U64](9223372036854775808)
 
     match mask {
         18446744073709551615 => io.println("max")   // OK: the pattern is U64
