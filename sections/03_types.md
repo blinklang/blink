@@ -3412,7 +3412,7 @@ guard         ::= "if" expression
 match_arm     ::= pattern guard? "=>" expression
 ```
 
-`TYPE_NAME` and `IDENT` are both identifiers. The two lines `TYPE_NAME "." IDENT "{" ... "}"` and `IDENT "." TYPE_NAME "{" ... "}"` have the shape `A.B { ... }`. The parser reads both as one form. Letter case does not choose between them: resolution does (*Qualified names and the wrong type*, below). In the second line, `IDENT` is a name that resolves to an imported module. In a refutable pattern, the first character of a bare name decides whether it is a variant or a binding (*Bare names: variant or binding*, below). A `mut` before a name that is a variant is not a binder (*Mutable Binders*, below).
+`TYPE_NAME` and `IDENT` are both identifiers. The two lines `TYPE_NAME "." IDENT "{" ... "}"` and `IDENT "." TYPE_NAME "{" ... "}"` have the shape `A.B { ... }`. The parser reads both as one form. Letter case does not choose between them: resolution does (*Qualified names and the wrong type*, below). In the second line, `IDENT` is a name that resolves to an imported module. In a refutable pattern, the first character of a bare name decides whether it is a variant or a binding (*Bare names: variant or binding*, below). A name before `{` never binds, so the first character does not decide it (*Brace patterns*, below). A `mut` before a name that is a variant is not a binder (*Mutable Binders*, below).
 
 #### Pattern Forms
 
@@ -3424,13 +3424,13 @@ match_arm     ::= pattern guard? "=>" expression
 
 A pattern is *refutable* when it can fail to match (*Refutable vs Irrefutable Patterns*, below). The rule applies at every refutable pattern position. Today these are the pattern of a `match` arm, at any depth, and the pattern operand of `assert_matches` (§2.20). A future form that takes a refutable pattern uses this rule. In a refutable pattern:
 
-- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position. The pattern must have the payload form that the variant declares (*The payload form of a variant pattern*, below). A type with that name in scope does not change this: E0554 (§3.4 *Unqualified variant*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547).
-- A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) never names a variant, because no variant has such a name (§3.4 *Variant names*). With no payload, it is a new binding. With a payload (`x(1)`, `x { .. }`), it is `NoSuchVariant` (E0547) when the type at that position is an enum, and `EnumPatternNeedsEnumScrutinee` (E0308) when it is not.
+- A bare name whose first character is an uppercase letter (Unicode `Lu` or `Lt`) names a variant of the type at that position, with or without a paren payload (`Red`, `Red(x)`). The pattern must have the payload form that the variant declares (*The payload form of a variant pattern*, below). A type with that name in scope does not change this: E0554 (§3.4 *Unqualified variant*) covers expressions only. If that type is not an enum, it is `EnumPatternNeedsEnumScrutinee` (E0308). If the enum has no variant of that name, it is `NoSuchVariant` (E0547). A name with a brace payload (`Red { .. }`) follows *Brace patterns*, below.
+- A bare name whose first character is not an uppercase letter (a lowercase letter, `_`, or a letter that has no case) never names a variant, because no variant has such a name (§3.4 *Variant names*). With no payload, it is a new binding. With a paren payload (`x(1)`), it is `NoSuchVariant` (E0547) when the type at that position is an enum, and `EnumPatternNeedsEnumScrutinee` (E0308) when it is not. A brace payload (`x { .. }`) follows *Brace patterns*, below.
 - The name before `as` (`name as pattern`, *Pattern Binding (`as`)*) is a binder, never a variant. If its first character is an uppercase letter, it is `UppercaseBinder` (E0560), whatever the type at that position and whatever the name means in scope. The checker does not look the name up as a variant or as a constant. It binds the name as written, so the arm body has no `UndefinedVariable` (E0506) from it. The pattern after `as` is checked as usual. The arm is a bad arm (*Exhaustiveness*, below).
 
 The first character decides, so a reader and the compiler know which names an arm binds before they know the type of the scrutinee. The rule has this reason: without it, a typo (`Dott`) or the name of a constant (`MAX`) would be a new binding that matches every value. That binding hides every later arm and turns off the exhaustiveness check. Every variant name starts with an uppercase letter, so the protection covers every variant.
 
-In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a payload must name a variant. The payload-form rule (*The payload form of a variant pattern*, below) applies in these patterns too; a bare name with no payload still binds, as this paragraph says.
+In an irrefutable pattern (`let`, a parameter, a closure parameter, `for`), any bare name with no payload is a new binding, and W1011 applies as §10.6 *Shadowing Rules* says. A bare name with a paren payload must name a variant. A name with a brace payload follows *Brace patterns*, below: `let User { name, .. } = u` is a struct pattern. The payload-form rule (*The payload form of a variant pattern*, below) applies in these patterns too; a bare name with no payload still binds, as this paragraph says.
 
 ```blink
 type Span { Range(Int, Int) }
@@ -3581,13 +3581,101 @@ fn h(s: Shape) -> Float {
 }
 ```
 
+**Brace patterns.** In `Name { field_patterns }`, `Name` is never a new binding. So the first-character rule of *Bare names: variant or binding* does not apply to it, and the case of `Name` does not decide the pattern. The type at the pattern position decides, and the compiler does not look in scope first. The rule is the same at every pattern position: `match` arms at any depth, each alternative of an OR-pattern, `assert_matches`, `let`, `for`, and parameters. So `let User { name, .. } = u` is a struct pattern.
+
+| The type at the position is | `Name` is | Result |
+|---|---|---|
+| an enum | a variant of that enum | that variant |
+| an enum | a struct in scope, and not a variant | `TypeError` (E0300); the help lists the variants |
+| an enum | neither | `NoSuchVariant` (E0547) |
+| a struct | that struct | a struct pattern |
+| a struct, a builtin type, a tuple or a type parameter | another type in scope | `TypeError` (E0300) |
+| a struct, a builtin type, a tuple or a type parameter | no type, and a variant of a visible enum | `EnumPatternNeedsEnumScrutinee` (E0308) |
+| a struct, a builtin type, a tuple or a type parameter | no type, and no variant of a visible enum | `UnknownType` (E0507); the help gives the nearest type name |
+
+When the position is an enum that declares a variant `Name`, a struct `Name` in scope does not change the result. So a new `import` cannot change the meaning of an arm. If an error occurs inside such an arm (a wrong field label, for example), the diagnostic has a `note:` that says a struct `Name` is also in scope. It has no `help:`, because the arm is valid. To name the variant in a way that scope cannot change, write `Enum.Name { .. }`: a qualified name resolves by its path (*Qualified names and the wrong type*, below).
+
+The search for a visible enum with a variant `Name` runs only after the name has failed to resolve. It can change the code of an error. It never changes the meaning of a valid pattern. A bare name or a paren payload on a struct (`Point(x)`) stays E0308, as *Bare names: variant or binding* says.
+
+```blink
+type Point { x: Int, y: Int }
+type point3 { x: Int }
+type Shape { At { x: Int, y: Int }, Dot }
+
+fn px(p: Point) -> Int {
+    match p {
+        Point { x, .. } => x           // the struct at this position
+    }
+}
+
+fn sx(s: Shape) -> Int {
+    match s {
+        At { x, .. } => x              // a variant of Shape
+        Dot => 0
+    }
+}
+
+fn qx(s: Shape) -> Int {
+    match s {
+        Shape.At { x, .. } => x        // the variant, by path
+        Shape.Dot => 0
+    }
+}
+
+fn lx(p: point3) -> Int {
+    match p {
+        point3 { x } => x              // a struct name need not start with an uppercase letter
+    }
+}
+```
+
+A name that is no type, on a struct, is E0507. It is not E0308 (`Point` has no variants) and not E0300 (no second type exists):
+
+```blink
+fn bad(p: Point) -> Int {
+    match p {
+        Pointt { x, .. } => x          // error[UnknownType]
+    }
+}
+```
+
+```
+error[UnknownType]: unknown type `Pointt`
+  help: did you mean `Point`?
+```
+
+A name that is a variant of a visible enum, on a type that is not an enum, gets E0308 with the help of *Bare names: variant or binding*:
+
+```blink
+type Color { Red, Green }
+
+fn f(n: Int) -> Int {
+    match n {
+        Red { x } => x                 // error[EnumPatternNeedsEnumScrutinee]: Int has no variant `Red`
+        _ => 0
+    }
+}
+```
+
+A struct that is not a variant of the enum at the position is E0300, with the variants in the help:
+
+```blink
+fn g(s: Shape) -> Int {
+    match s {
+        Point { x, .. } => x           // error[TypeError]: pattern of type `Point` used on a value of type `Shape`
+        _ => 0
+    }
+}
+```
+
 **A variant the enum does not declare.** A variant pattern must name a variant that its enum declares. The compiler reports `error[NoSuchVariant]` (E0547) for:
 
-- a bare name with a payload (`Somee(v)`, `Zed { .. }`) when the type at that pattern position is an enum that has no variant of that name;
+- a bare name with a paren payload (`Somee(v)`) when the type at that pattern position is an enum that has no variant of that name;
+- a name with a brace payload (`Zed { .. }`) when the type at that pattern position is an enum that has no variant of that name and no struct of that name is in scope (*Brace patterns*);
 - a bare name with no payload and an uppercase first character (`Dott`) when the type at that pattern position is an enum that has no variant of that name;
 - a qualified name `K.Zed`, with or without a payload, when the enum `K` declares no variant `Zed`.
 
-A variant pattern needs an enum. When the type at the pattern position is not an enum, a bare name with a payload, and a bare name with an uppercase first character and no payload, is `EnumPatternNeedsEnumScrutinee` (E0308), as *Bare names: variant or binding* says. The rule is "not an enum". These types are examples, not a full list: a builtin scalar, a struct, a tuple, a `List` or a `Map`, and a type parameter. A type alias is resolved first, so an alias of an enum is an enum. For a struct, the message says that the type has no variants: "`Point` is a struct; it has no variants". For a scalar or a builtin generic type, the message says: "`Int` is not an enum; it has no variants". For a type parameter, the help suggests no variant. The compiler reports E0308 for a type parameter where the generic function is defined, not at a call.
+A variant pattern needs an enum. When the type at the pattern position is not an enum, a bare name with a paren payload, and a bare name with an uppercase first character and no payload, is `EnumPatternNeedsEnumScrutinee` (E0308), as *Bare names: variant or binding* says. A name with a brace payload follows *Brace patterns*. The rule is "not an enum". These types are examples, not a full list: a builtin scalar, a struct, a tuple, a `List` or a `Map`, and a type parameter. A type alias is resolved first, so an alias of an enum is an enum. For a struct, the message says that the type has no variants: "`Point` is a struct; it has no variants". For a scalar or a builtin generic type, the message says: "`Int` is not an enum; it has no variants". For a type parameter, the help suggests no variant. The compiler reports E0308 for a type parameter where the generic function is defined, not at a call.
 
 ```blink
 fn total(xs: List[Int]) -> Int {
@@ -3657,7 +3745,7 @@ error[NoSuchVariant]: `Token` has no variant `Lit`
 2. Look up `V` in `Q`. A variant that `Q` does not declare is E0547, and the message names `Q`. If `Q` is a type that is not an enum, `Q` declares no variant, and the error is E0547. The message says what `Q` is. The scrutinee type does not change this.
 3. Compare `Q` with the type at the pattern position. A different type is `TypeError` (E0300).
 
-So `Other.Zed` on a `T` scrutinee gives one E0547 for `Other`, and no E0300. `Point.Zed` on a `Color` scrutinee, where `Point` is a struct, gives one E0547 too. A qualified variant of a different enum, such as `Other.Q(v)` on a `T` scrutinee, is E0300, the same error as `let t: T = Other.Q(1)`. A struct pattern of a different struct type, such as `Q { y }` on a `P` scrutinee, is also E0300. The header names both types, and the span is the whole path (`Other.Q`) or type name (`Q`). The help lists the variants of the expected type. When that type declares a variant with the same name and the same payload form, the help gives the fix `T.Q`, and the fix is machine-applicable.
+So `Other.Zed` on a `T` scrutinee gives one E0547 for `Other`, and no E0300. `Point.Zed` on a `Color` scrutinee, where `Point` is a struct, gives one E0547 too. A qualified variant of a different enum, such as `Other.Q(v)` on a `T` scrutinee, is E0300, the same error as `let t: T = Other.Q(1)`. A struct pattern of a different struct type, such as `Q { y }` on a `P` scrutinee, is also E0300 (*Brace patterns*, above, gives the other cases of a brace head). The header names both types, and the span is the whole path (`Other.Q`) or type name (`Q`). The help lists the variants of the expected type. When that type declares a variant with the same name and the same payload form, the help gives the fix `T.Q`, and the fix is machine-applicable.
 
 ```blink
 type T { A(Int), Q(Int) }
@@ -3990,7 +4078,7 @@ error[NonExhaustiveMatch]: non-exhaustive match on List[Str]
   = help: add a `_` wildcard arm or `[_, _, ..] rest pattern
 ```
 
-**Struct patterns.** Match struct types by field values. Type name is required (nominal matching). Field punning binds a field to a variable of the same name, so a field named by a keyword cannot use the short form: write `Event { type: t, .. }` (§2.23 *Members and Bindings*). `..` is required when not all fields are listed.
+**Struct patterns.** Match struct types by field values. Type name is required (nominal matching). The name is a struct type, or a variant of the enum at that position (*Brace patterns*, above); a different struct type is E0300 (*Qualified names and the wrong type*, above). Field punning binds a field to a variable of the same name, so a field named by a keyword cannot use the short form: write `Event { type: t, .. }` (§2.23 *Members and Bindings*). `..` is required when not all fields are listed.
 
 The compiler checks the labels of a struct pattern and of a variant brace pattern (`Rect { w, .. }`, `geo.Rect { w, .. }` and `Shape.Rect { w, .. }`) in the same way. It checks them at every depth and in every pattern position: `match` arms, nested patterns, `let`, `for`, and each alternative of an OR-pattern. The labels form a set, as the labels of a literal do (§2.14 *Checking a Literal's Fields*). The checks run after the type-name checks (E0507, E0547, E0300) of *Qualified names and the wrong type*, in this order:
 
