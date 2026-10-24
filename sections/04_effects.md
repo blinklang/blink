@@ -4459,7 +4459,21 @@ fn parse_with_fallback() -> Node {
 }
 ```
 
-`@allow` takes the warning name (PascalCase) as its argument. It suppresses all instances of that warning within the annotated function. Multiple warnings can be suppressed: `@allow(UnrestoredMutation, IncompleteStateRestore)`.
+`@allow` takes the warning name (PascalCase) as its argument. It suppresses all instances of that warning inside the annotated function or test block. Multiple warnings can be suppressed: `@allow(UnrestoredMutation, IncompleteStateRestore)`.
+
+The scope is the source text of the body. On a test block it covers closures and `assert_panics` blocks written in the test. It does not follow a call into another function: that function needs its own `@allow`.
+
+```blink
+@allow(NegativeZeroComparison)
+test "a written negative zero equals zero" {
+    let x = 0.0
+    assert(x == -0.0)
+    assert_panics {
+        assert(x == -0.0)
+        panic("expected")
+    }
+}
+```
 
 **Project-wide: `blink.toml` `[lints]` section**
 
@@ -4471,7 +4485,7 @@ W0550 = "error"     # upgrade IncompleteStateRestore to error
 
 Valid severity levels: `"off"` (suppress), `"warn"` (default for W0550/W0551), `"error"` (fail compilation).
 
-**Precedence:** Function-level `@allow` always overrides project-level `blink.toml` configuration. A function annotated with `@allow(UnrestoredMutation)` will not emit W0551 even if `blink.toml` sets `W0551 = "error"`.
+**Precedence:** An `@allow` on a function or test block always overrides project-level `blink.toml` configuration. A function annotated with `@allow(UnrestoredMutation)` will not emit W0551 even if `blink.toml` sets `W0551 = "error"`.
 
 **Only warnings.** `@allow` and `[lints]` reach only the diagnostics listed under *Warning Names* in ERROR_CATALOG.md. The catalog row decides, not the severity in effect: a warning that `--strict`, `--strict-struct-layout` or `"error"` under `[lints]` makes fail the build is still a warning name, so `@allow` reaches it. Any other live name is the error `NotAWarningName` (E0847): a name under *Error Names* (`ContractUnverifiable` V0003 included), a name under *Info Names*, or an internal compiler error. An error means the compiler cannot give the program a meaning, so a suppressed error would reach code generation or run as wrong code. Like E0842, E0847 is refused, not ignored. No `@allow` or `[lints]` entry suppresses it or changes its severity, every level is refused (`"error"` included), and the compiler reports each such argument and key, not only the first. The named error still fires at its own site; E0847 does not replace it.
 

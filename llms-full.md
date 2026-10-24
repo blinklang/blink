@@ -1101,7 +1101,7 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 | `@ffi("lib", "sym")` | fn | FFI binding — link to C function |
 | `@trusted` | fn | FFI audit marker — function reviewed for safety |
 | `@verify(fallback: "runtime" \| "trust")` | fn | What to do with a `@requires`/`@ensures` the compiler cannot prove (today: every one). `"runtime"` checks it and panics on violation; `"trust"` accepts it unchecked |
-| `@allow(UnusedVariable)` | fn, type | Suppress specific diagnostic warning, by name |
+| `@allow(UnusedVariable)` | fn, type, test block | Suppress specific diagnostic warning, by name. On a test block it covers the whole body, closures and `assert_panics` blocks included; it does not reach a helper fn the test calls |
 | `@deprecated(msg)` | fn, type | Deprecation warning. Optional: `since`, `removal`, `replacement`, `fix` fields |
 
 ## Common Patterns
