@@ -2084,7 +2084,7 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 ```
 
 **Rules:**
-- Qualified access works for functions (`auth.login()`), types (`auth.Token`), traits (`auth.Verifier`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`.
+- Qualified access works for functions (`auth.login()`), types (`auth.Token`), traits (`auth.Verifier`), and constants (`auth.MAX_RETRIES`). Enum variants use their type qualifier: `Role.Admin`, not `auth.Role.Admin`. This holds in a pattern too: `auth.Role.Admin` and `auth.Role.Admin { .. }` are E1007 (§3.5 *Module-qualified struct patterns*).
 - Only the leaf module name is used as qualifier. `import std.num` enables `num.parse_int()`, not `std.num.parse_int()`. For modules with the same leaf name, use aliases: `import legacy.auth as legacy_auth`. To keep bare names, put the alias between the path and the list: `import legacy.auth as legacy_auth.{Token}` (*Import Aliases*, §10.5).
 - Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works. So a selective import binds its qualifier too: `import auth.{login}` binds `login` and `auth`, and `import auth as a.{login}` binds `login` and `a`.
 - A whole-module import binds only its qualifier. If `import foo` and `import bar` both export `helper`, nothing collides: call `foo.helper()` or `bar.helper()`. Two imports that bind one name, bare name or qualifier, are E1005 (*Imported Names*, §10.5). A module-level declaration that takes a qualifier's name is E1012 (*Imported and Declared Names*, §10.5).
@@ -2095,6 +2095,7 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
   - a supertrait clause (`trait Sh: lib.Tr`)
   - the argument of `@derive(...)`
   - the head of an impl-qualified call (`(lib.Mk for W).make()`, §3c.4 *Impl-Qualified Calls*)
+  - the type name of a struct pattern (`lib.Pt { x, .. }`, §3.5 *Module-qualified struct patterns*)
 
   The receiver of an impl header is a type position, so it takes `lib.Pt` by the rule for types. The list names the slots of the language today. The general rule also covers a slot that the list does not name. Naming a trait with a qualifier puts nothing in scope (§3.6 *Impl visibility*).
 

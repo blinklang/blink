@@ -3397,6 +3397,7 @@ atomic_pattern ::= "_"                                        // wildcard
                |   "(" pattern_list ")"                       // tuple
                |   TYPE_NAME "{" field_patterns "}"           // struct, or variant with named fields
                |   TYPE_NAME "." IDENT "{" field_patterns "}" // qualified variant with named fields
+               |   IDENT "." TYPE_NAME "{" field_patterns "}" // module-qualified struct
 
 pattern_list  ::= pattern ( "," pattern )*
 
@@ -3411,7 +3412,7 @@ guard         ::= "if" expression
 match_arm     ::= pattern guard? "=>" expression
 ```
 
-`TYPE_NAME` and `IDENT` are both identifiers. In a refutable pattern, the first character of a bare name decides whether it is a variant or a binding (*Bare names: variant or binding*, below). A `mut` before a name that is a variant is not a binder (*Mutable Binders*, below).
+`TYPE_NAME` and `IDENT` are both identifiers. The two lines `TYPE_NAME "." IDENT "{" ... "}"` and `IDENT "." TYPE_NAME "{" ... "}"` have the shape `A.B { ... }`. The parser reads both as one form. Letter case does not choose between them: resolution does (*Qualified names and the wrong type*, below). In the second line, `IDENT` is a name that resolves to an imported module. In a refutable pattern, the first character of a bare name decides whether it is a variant or a binding (*Bare names: variant or binding*, below). A `mut` before a name that is a variant is not a binder (*Mutable Binders*, below).
 
 #### Pattern Forms
 
@@ -3560,8 +3561,9 @@ error[NoSuchVariant]: `Token` has no variant `Lit`
   help: `Token` declares: Num, Plus
 ```
 
-**Qualified names and the wrong type.** The compiler checks a qualified pattern `Q.V` in this order, and the first failure is the only error for that pattern:
+**Qualified names and the wrong type.** The parser reads `A.B { ... }` as one dotted-brace form, and `A.B` the same way. The compiler checks a qualified pattern in this order, and the first failure is the only error for that pattern:
 
+0. Resolve `A`. If `A` names a type in scope, the pattern is `Q.V` with `Q` = `A` and `V` = `B`, and steps 1 to 3 run for it. Otherwise, if `A` names an imported module (§10.1 *Qualified Access*), `A.B { ... }` is a module-qualified struct pattern (*Module-qualified struct patterns*, below). If `A` names neither, `Q` = `A` and step 1 reports it.
 1. Resolve `Q`. A name that is not a type is `UnknownType` (E0507).
 2. Look up `V` in `Q`. A variant that `Q` does not declare is E0547, and the message names `Q`. If `Q` is a type that is not an enum, `Q` declares no variant, and the error is E0547. The message says what `Q` is. The scrutinee type does not change this.
 3. Compare `Q` with the type at the pattern position. A different type is `TypeError` (E0300).
@@ -3665,6 +3667,82 @@ error[TypeError]: pattern of type `Option` used on a value of type `List[Int]`
 
 A type alias resolves at step 1. A qualified pattern through an alias of an enum is legal.
 
+**Module-qualified struct patterns.** `mod.Type { field_patterns }` is a struct pattern for the struct `Type` that module `mod` declares. It is valid at each place where the bare `Type { ... }` is valid: a match arm, a nested pattern, an alternative of an OR pattern, `let`, `for`, and a parameter. The label checks E0525, E0316 and E0319 (*Struct patterns* below) apply to it without change. The qualified spelling of a struct is `mod.Type`. The qualified spelling of a variant is `Type.Variant`. The two spellings are different forms, and step 0 above chooses between them by resolution.
+
+```blink
+import geo
+
+fn px(p: geo.Point) -> Int {
+    match p {
+        geo.Point { x, .. } => x
+    }
+}
+
+fn py(geo.Point { y, .. }: geo.Point) -> Int {
+    y
+}
+```
+
+For `mod.Type { ... }` the steps run as follows:
+
+- Step 1: a type that module `mod` does not declare is `UnknownType` (E0507). A name `mod` that is neither a type nor an imported module gets the same error as any other unknown qualifier.
+- Step 2 does not run. The pattern names a struct, so the compiler looks up no variant, and E0547 does not apply.
+- Step 3: a struct of a different type than the scrutinee is E0300.
+- `geo.Shape { .. }`, where `Shape` is an enum, gets the same diagnostic as the bare `Shape { .. }`. The diagnostic names the type as `geo.Shape`.
+
+```blink
+import geo
+
+fn bad(p: geo.Point) -> Int {
+    match p {
+        geo.Point { x, z, .. } => x    // error[NoSuchField]
+    }
+}
+```
+
+**A name that is a type and a module.** When `A` names a type in scope and also names an imported module, the type wins (step 0). The pattern `A.B { ... }` is then `Q.V` with `Q` = `A`, and the error is about the type, not the module. The compiler adds a `note:` that names the module and the fix: give the module an alias (§10.5 *Import Aliases*) and write the alias as the qualifier. The note appears only when `A` also names an imported module. When `A` is only a type, the compiler gives no note.
+
+```blink
+import Option
+
+fn f(p: Option.Point) -> Int {
+    match p {
+        Option.Point { x, .. } => x    // error[NoSuchVariant]
+    }
+}
+```
+
+```
+error[NoSuchVariant]: `Option` has no variant `Point`
+  note: `Option` is also an imported module; to use its type `Point`, give the module an alias with `import Option as opt` and write `opt.Point { x, .. }`
+```
+
+**A type qualified twice.** `mod.Type.Variant` and `mod.Type.Variant { ... }` in a pattern are `ModuleQualifiedType` (E1007), as in every other position (§10.1 *Qualified Access*). A variant is reached through its type, so the help tells the user to import the type and to write `Type.Variant`.
+
+```blink
+import geo
+
+fn area(s: geo.Shape) -> Int {
+    match s {
+        geo.Shape.Circle { r } => r    // error[E1007]
+        _ => 0
+    }
+}
+```
+
+```
+error[E1007]: a type member or variant is reached through a module qualifier (`geo.Shape.Circle`) instead of an imported type
+  help: import the type and write `Shape.Circle`: add `import geo.{Shape}`
+```
+
+The fix is machine-applicable only when module `geo` is imported and the new import line is a pure addition. An import line is a pure addition when all three of these hold:
+
+- No binding in the module is named `Shape`.
+- No alias in the module names the type `geo.Shape`.
+- No selective import of `geo` exists in the module that the new name could join instead.
+
+When one of them fails, the help is text only.
+
 **After the error.** Each binder under a pattern with one of these errors has the poison type (§6.3.5). The compiler still checks the arm body and suppresses each diagnostic that only the poison type causes. *Exhaustiveness* below says how such an arm counts for coverage. These rules apply to `blink check` and to `blink build` alike: each variant pattern resolves to its enum and variant before code generation, or the compiler reports an error, so the two commands report the same diagnostics for one program.
 
 **After a field error.** `NoSuchField` (E0525) and `DuplicateField` (E0316) in a struct pattern or a variant brace pattern (*Struct patterns* below) also leave the arm checked, but the poison is narrower. Only a binder under an unknown label has the poison type. A binder under a label that the type declares keeps the type of its field, and so does a binder under the second of two equal labels. `PatternMissingRest` (E0319) poisons nothing, and an arm with only this error is not a bad arm: the compiler checks it as if the pattern had `..`.
@@ -3765,7 +3843,7 @@ error[NonExhaustiveMatch]: non-exhaustive match on List[Str]
 
 **Struct patterns.** Match struct types by field values. Type name is required (nominal matching). Field punning binds a field to a variable of the same name, so a field named by a keyword cannot use the short form: write `Event { type: t, .. }` (§2.23 *Members and Bindings*). `..` is required when not all fields are listed.
 
-The compiler checks the labels of a struct pattern and of a variant brace pattern (`Rect { w, .. }` and `Shape.Rect { w, .. }`) in the same way. It checks them at every depth and in every pattern position: `match` arms, nested patterns, `let`, `for`, and each alternative of an OR-pattern. The labels form a set, as the labels of a literal do (§2.14 *Checking a Literal's Fields*). The checks run after the type-name checks (E0507, E0547, E0300) of *Qualified names and the wrong type*, in this order:
+The compiler checks the labels of a struct pattern and of a variant brace pattern (`Rect { w, .. }`, `geo.Rect { w, .. }` and `Shape.Rect { w, .. }`) in the same way. It checks them at every depth and in every pattern position: `match` arms, nested patterns, `let`, `for`, and each alternative of an OR-pattern. The labels form a set, as the labels of a literal do (§2.14 *Checking a Literal's Fields*). The checks run after the type-name checks (E0507, E0547, E0300) of *Qualified names and the wrong type*, in this order:
 
 1. **A label twice** is `DuplicateField` (E0316). The error is at the second label, with a `note:` at the first.
 2. **A label that the type or variant does not declare** is `NoSuchField` (E0525). The candidates for the nearest-name suggestion (Error Catalog, *Conventions*) are the declared fields that the pattern does not already label. With one suggestion, the rename is machine-applicable. With none, the help lists the declared fields and marks those the pattern already labels. For a punned label, as in `Point { x, yy }`, the fix writes `y: yy`. The binder and the arm body stay as they are, so the fix cannot change which name a use in the arm refers to. The help never says "or add the field to `T`" for a pattern label.

@@ -234,7 +234,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | VersionConflict | E1004 | Diamond dependency — incompatible package versions | Modules | §10.5 |
 | AmbiguousImport | E1005 | Two imports in one file bind one name (bare name or module qualifier) to different items; the check uses the name after `as`. A selective import binds its qualifier too, so `import a.x.{P}` + `import b.x.{Q}` is E1005 on `x`; help gives `import b.x as bx.{Q}`. Two imports of the same item get W0602 instead; a selective import's qualifier bound again to the same module gets nothing. Replaces W0602 on the colliding entry. Checked when the import is read (§10.5) | Modules | §10.5 |
 | ImportNotSelected | E1006 | Selective import does not list the referenced symbol. Help: add the name to the import list, or use qualified access `mod.name`. The help keeps the qualified-access clause for every module, the file that declares `fn main` included (§10.1). Not reported for a use of a name that an E1023 entry lists | Modules | §10.5 |
-| ModuleQualifiedType | E1007 | Type referenced via module-qualified path is invalid | Modules | §10.5 |
+| ModuleQualifiedType | E1007 | A type member or variant is reached through a module qualifier (`mod.Type.Member`) instead of an imported type | Modules | §10.5 |
 | InvalidModuleAnnotation | E1008 | `@module` value does not match parent package name | Modules | §10.1 |
 | PackageEntryNotFound | E1009 | Package entry file `<pkg>/src/<name>.bl` is missing | Modules | §10.1 |
 | OrphanFile | E1010 | Source file has no enclosing `blink.toml` | Modules | §10.1 |
