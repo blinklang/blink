@@ -366,6 +366,8 @@ error[PatternMissingRest]: `Point3` pattern leaves out field `z` (Int) and has n
           Point3 { x, y, z: _ }
 ```
 
+**Insertions at one offset.** Two insertions (edits with an empty span) at the same offset do not overlap, so they are not a conflict: `blink fix` applies both. When they come from different parameters of one function, it applies them in parameter order, never in the order of the diagnostics (§3.6 *Mutable Parameters*).
+
 The effect on the generate-compile-fix loop is dramatic. In Python, an AI reads a traceback, infers what went wrong, generates a fix hypothesis, applies it, and hopes. In Blink, the compiler tells the AI exactly what's wrong, exactly where, and often exactly how to fix it. The fix loop becomes mechanical rather than inferential.
 
 ---

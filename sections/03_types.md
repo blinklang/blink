@@ -5207,18 +5207,18 @@ fn fill((mut xs, n): (List[Int], Int)) -> Int {
 }
 ```
 
-**A parameter is never assigned.** An assignment to a parameter, or to a field of one, is always a compile error, `error[E0612] ParamAssign`, with or without `mut`, `self` included. Such a write changes only the callee's copy of the value (§3.6 *`self` is always passed by value*), so the caller never sees it. To change a value locally, copy it to a new `let mut` name:
+**A parameter is never assigned.** An assignment to a parameter, or to a field of one, is always a compile error, `error[E0612] ParamAssign`, with or without `mut`, `self` included. Such a write changes only the callee's copy of the value (§3.6 *`self` is always passed by value*), so the caller never sees it. To change a value locally, copy it to a `let mut` name. The copy can keep the parameter's name, and each later use names the copy:
 
 ```blink
 fn gcd(a: Int, b: Int) -> Int {
-    let mut x = a
-    let mut y = b
-    while y != 0 {
-        let t = y
-        y = x % y
-        x = t
+    let mut a = a
+    let mut b = b
+    while b != 0 {
+        let t = b
+        b = a % b
+        a = t
     }
-    x
+    a
 }
 
 trait WithX {
@@ -5240,10 +5240,54 @@ error[ParamAssign]: cannot assign to parameter `a`
   |         ^ `a` is a parameter
   |
   = note: a write to a parameter changes only this function's copy
-  = help: copy it to a new name: `let mut x = a`
+  = help: shadow it at the top of the body: `let mut a = a`
 ```
 
-The fix-it names a new binding. `let mut a = a` shadows the parameter and triggers `warning[W0603] ShadowedVariable`.
+The help shows the real name of the parameter and the exact line. The line is correct only at the start of the body. A `let mut a = a` after the first write leaves the error in place.
+
+**The fix.** `blink fix` repairs a write to a parameter `p` with one line: `let mut p = p`, a top-level statement at the start of the body that owns `p`. The line keeps the name, so it adds no name and no later use changes. Each use after the line, in a nested block or a closure too, names the copy. The write already changed only a copy, so the fix keeps the meaning of the program. The fix covers:
+
+- an assignment to the parameter (`a = b`);
+- a write to a field of the parameter (`c.at = 5`);
+- a binder in a parameter pattern;
+- a write in a nested block, or in a closure, to a parameter of an outer function: the line goes at the start of that function's body;
+- a write to a closure's own parameter: the line goes at the start of the closure body.
+
+```blink
+fn clamp(n: Int) -> Int {
+    let mut n = n                       // `blink fix` inserts this line
+    if n > 9 {
+        n = 9
+    }
+    n
+}
+
+fn run(base: Int) -> Int {
+    let add = fn(step: Int) -> Int {
+        let mut step = step             // a closure's own parameter: start of the closure body
+        step = step + base
+        step
+    }
+    add(1)
+}
+```
+
+Several writes to one parameter give one line. A function that writes two parameters gets one line for each, in parameter order: `gcd` above gets `let mut a = a`, then `let mut b = b`. Each diagnostic carries only the line for its own parameter (§8.6). The line raises no `warning[W0603] ShadowedVariable` (§2.12.1 *Function-local shadowing*).
+
+A write to a field of a parameter changes only the copy, so the fix does not make the write visible to the caller. The note of the diagnostic says so:
+
+```
+error[ParamAssign]: cannot assign to parameter `c`
+ --> bump.bl:4:5
+  |
+4 |     c.at = 5
+  |     ^^^^ `c` is a parameter
+  |
+  = note: a write to a parameter changes only this function's copy; to give the caller the new value, return it
+  = help: shadow it at the top of the body: `let mut c = c`
+```
+
+Two cases have help only and no fix. A write to `self`, or to a field of `self`, has no fix because `self` is not a legal `let` name (§2.23): the help says to build a new value and return it, as `with_x` above does. A write in `Scoped.enter()` has no fix either, as the next diagnostic shows.
 
 Inside `enter()` of a `Scoped` impl, a write to a field of `self` gets a different help line. The usual cause is an attempt to keep state for `exit()`, and a local copy does not reach `exit()`:
 
@@ -5258,7 +5302,7 @@ error[ParamAssign]: cannot assign to parameter `self`
   = help: set `start` when the value is built, and build it in the `with` item (§4.7.2)
 ```
 
-This help text appears only in `Scoped.enter()`. Every other parameter assignment gets the `let mut` help above.
+This help text appears only in `Scoped.enter()`. A write to any other parameter gets the `shadow it` help above, with a fix.
 
 **What `mut self` covers.** A method is mutating if and only if it declares `mut self`. The standard library declares `mut self` on methods that change state Blink holds as a value: the contents of a `List`, `Map`, `Set` or `StringBuilder`. A change to state outside the language — memory behind a `Ptr`, a socket, a file, a database — is an effect, tracked by the effect row (§4) and the `@trusted` boundary (§9), not by `mut`. So `Ptr.write` (§9 *Pointer Operations*) and `TcpConn.write` take plain `self`, and a plain `let` pointer can write through.
 
@@ -5289,7 +5333,7 @@ impl Display for Marker {
 
 `MutAliasOfImmutable` checks direct aliases only. An alias made through a call result (`id(a)`) or a struct literal (`W { xs: a }`) passes it. An immutable `let` is not a promise that the value behind it never changes (§3.2.2).
 
-**Rollout.** Each new error in this subsection follows the rule of §8.16.1 *Rollout of a new error*.
+**Rollout.** Each new error in this subsection follows the rule of §8.16.1 *Rollout of a new error*. The warning carries a machine-applicable fix where one exists that keeps the program's meaning; otherwise it carries help only.
 
 #### Operations on `Self` in a Default Body
 

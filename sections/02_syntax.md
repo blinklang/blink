@@ -1239,6 +1239,34 @@ fn transform(x: Int) -> Int {
 }
 ```
 
+**A copy of a parameter under its own name gets no `warning[W0603] ShadowedVariable`.** The exemption has three conditions. The `let` is a top-level statement of the body that owns the parameter, a function or a closure. The name is a parameter of that function or closure. The initializer is the bare name. The line `blink fix` writes for `ParamAssign` has this form (§3.6 *Mutable Parameters*). Any other `let` that reuses a parameter name keeps W0603, such as `let a = a + 1` at the top of the body, or `let a = a` in a nested block:
+
+```blink
+fn gcd(a: Int, b: Int) -> Int {
+    let mut a = a                       // no W0603: bare copy at the top of the body
+    let mut b = b                       // no W0603
+    while b != 0 {
+        let t = b
+        b = a % b
+        a = t
+    }
+    a
+}
+
+fn grow(a: Int) -> Int {
+    let a = a + 1                       // W0603: the initializer is not the bare name
+    a
+}
+
+fn pick(a: Int, flag: Bool) -> Int {
+    if flag {
+        let a = a                       // W0603: not a top-level statement of the body
+        return a + 1
+    }
+    a
+}
+```
+
 ### 2.12.2 Opaque Types
 
 `pub type T { ... }` exports the name `T` and its body: its fields or its variants. Code in any module can build a `T`, match on it, and read its fields. `pub opaque type T { ... }` exports only the name. The body is visible only in the module that declares `T`.
