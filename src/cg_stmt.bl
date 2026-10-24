@@ -69,7 +69,7 @@ import cg_eff.{
 }
 import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_display_or_placeholder,
-    cc_values_equal, cc_is_ptr_write_stmt, cc_is_skip_call, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
+    cc_values_equal, cc_is_ptr_write_stmt, lower_spread_copy, cc_is_skip_call, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
     cg_call_channel_take, cg_call_cursor_walk, cg_call_str_step, for_in_iteration_of,
 }
 import unparse.{unparse_expr}
@@ -1688,13 +1688,6 @@ let mut mv_in_target: Bool = false
 // Work the walk may not move an arm above unless it hoists it first. Whatever follows in
 // the same statement asks the record built here before it decides.
 fn mv_moves_work(node: Int) -> Bool ! Diag.Report {
-    // A spread copies its source into the container being built; the walk knows nothing
-    // about when that copy runs relative to the container's other elements, so it is never
-    // safe to hoist even when typecheck gave it a type.
-    if node_kind(node) == NodeKind.SpreadExpr {
-        mv_work.push(MvWork { node: node, hoistable: false })
-        return true
-    }
     mv_work.push(MvWork { node: node, hoistable: !mv_in_target && tc_lookup_node_tid(node) >= 0 })
     true
 }
@@ -1780,6 +1773,8 @@ fn mv_expr(e: Int) -> Bool ! Diag.Report {
         // A hole runs before the formatter call that reads it.
         NodeKind.InterpString => mv_after(mv_interp_holes(e), e)
         NodeKind.StructLit => mv_struct_lit(e)
+        // A spread reads its source, then copies the source's elements into the literal.
+        NodeKind.SpreadExpr => mv_spread(e)
         // A call's left is the callee, which runs before its arguments.
         NodeKind.Call => mv_call(e, node_left(e))
         NodeKind.MethodCall => mv_call(e, node_obj(e))
@@ -1793,8 +1788,8 @@ fn mv_call(e: Int, head: Int) -> Bool ! Diag.Report {
 }
 
 // A call of type Never that every passed work item can move above. One that sits after
-// unhoistable work -- inside an assignment's target, after a spread -- keeps its place
-// and is lowered where it stands, as before.
+// unhoistable work -- inside an assignment's target -- keeps its place and is lowered
+// where it stands, as before.
 fn mv_call_leaves(e: Int) -> Bool ! Diag.Report {
     if mv_in_target { return false }
     let tid = tc_lookup_node_tid(e)
@@ -1845,6 +1840,14 @@ fn mv_struct_lit(e: Int) -> Bool ! Diag.Report {
         if !mv_expr(node_value(sublist_get(given, i))) { return false }
         i = i + 1
     }
+    true
+}
+
+// A spread has no type of its own; the copy it moves is a list of its source's type, so
+// the source's type is what decides whether the copy can stand in a temp.
+fn mv_spread(e: Int) -> Bool ! Diag.Report {
+    if !mv_expr(node_value(e)) { return false }
+    mv_work.push(MvWork { node: e, hoistable: !mv_in_target && tc_lookup_node_tid(node_value(e)) >= 0 })
     true
 }
 
@@ -1938,14 +1941,26 @@ fn mv_hoist_pending() -> Bool ! Diag.Report {
 // One work item, lowered into a temp exactly the way any other value would be, and named
 // to the expression stage the same way a value-position construct's own temp is: a later
 // read of this same node substitutes a read of the temp instead of lowering it again.
+//
+// A spread moves as the copy it makes, and the temp is named to its source, so the
+// literal's own spread lowers unchanged and spreads the copy. A source that is itself a
+// value-position construct is named again, to the copy, which is the only read left of it.
 fn mv_hoist_one(w: MvWork) ! Diag.Report {
-    let tid = stmt_tid(w.node)
+    let spread = node_kind(w.node) == NodeKind.SpreadExpr
+    let read = if spread { node_value(w.node) } else { w.node }
+    let tid = stmt_tid(read)
     let rec = layout_at(tid, Position.Local, w.node)
     let _ = ensure_typedef_for(tid)
     let name = c_mint_local("hoist")
-    let value = lower_value(w.node)
+    let value = if spread { mv_spread_copy(w.node) } else { lower_value(w.node) }
     cg_expr_push_pending(w.node, ir_let(tid, w.node, rec.c_spelling, name, rec.slot_form, value))
-    cg_expr_register_value(w.node, name, tid)
+    cg_expr_register_value(read, name, tid)
+}
+
+fn mv_spread_copy(node: Int) -> Int ! Diag.Report {
+    let copy = lower_spread_copy(node)
+    if copy >= 0 { return copy }
+    poison_value(node)
 }
 
 // The temp for one value-position `if` or `match`: declared unset, filled by the arms,
