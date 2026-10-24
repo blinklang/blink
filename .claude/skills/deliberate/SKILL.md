@@ -82,7 +82,7 @@ The Minimalism panelist is explicitly allowed to propose **"do nothing / reject 
 - The spec gap (br task title and description, verbatim).
 - The "already decided" list from Step 2.
 - Their domain-voice reminder (see Expert Profiles).
-- An instruction to produce one or more proposals. Each proposal must include:
+- An instruction to produce one or more proposals. A proposal states **behavior**: what compiles, what errors (with which code), what runs and what it outputs. It does not propose spec sentences; the writer chooses the wording later (Step 9). Each proposal must include:
   - A Blink code example using correct syntax (`fn` keyword, `{ }` braces, no semicolons, double quotes for strings, `.len()` method-call style, `[T]` for generics).
   - Tradeoffs anchored in the panelist's domain.
   - A short cross-language note when relevant.
@@ -101,6 +101,8 @@ After all 6 proposals are in, the moderator groups them. The dedupe is **mechani
 If grouping is judgment-call ("are these the same?"), list both versions and let the panel collapse it in Phase B.
 
 Outputs: a deduped option-space derived from panelist input only, plus a list of sub-questions / variations that need debate.
+
+**Every option shows its result.** On every digest and ballot, each option carries a short Blink snippet (or the output, diagnostic or JSON it produces) that shows how it differs from the other options. Take the snippet from the proposer's own example; if they gave none, ask them for one by procedural DM. Do not write it yourself. **The panel decides behavior, not phrasing.** If two options produce the same code and output, they differ only in wording: merge them into one option and drop the difference from the digest and ballot. Put each side's wording concern (for example "the text must not imply X") on a writer-notes list, which goes to the writer in Step 9. Do the same in Phase B and Phase D: when a panelist argues over phrasing, a procedural DM may say "that point is wording; it goes to the writer notes", and the digest relays it under writer notes, not as an open question. Every ballot question must have options that differ in observable behavior.
 
 ## Phase B — Open debate (conditional)
 
@@ -133,7 +135,9 @@ Vote format per question:
 
 Wait for all 6 votes. Tally per question. Identify dissent.
 
-**On a tie (3-3):** report the tie to the user along with each side's reasoning and ask them to cast the deciding vote. Record the tiebreak as part of the tally (e.g., "3-3 → user broke tie for A").
+**On a tie (3-3):** report the tie to the user along with each side's reasoning and ask them to cast the deciding vote. Show each side as a snippet of the code or output it gives, then the reasoning in plain words. Record the tiebreak as part of the tally (e.g., "3-3 → user broke tie for A").
+
+**Wording-only ties do not go to the user.** Phase A.5 should keep wording off the ballot. If one slips through and a tied or no-majority question is wording-only (every option gives the same behavior, see Phase A.5), do not ask for a tiebreak. Record the behavior the panel agreed, mark the question "wording to the writer", and give the writer each side's stated concern. The writer drafts the text in plain words with examples (Step 9), meeting those concerns; the user judges the wording in the branch diff. Do not vote on sentences. When you explain any question to the user, use plain words and examples; never relay panel wording as the explanation.
 
 **Pause and report to the user before any spec writing.** This is the votes-in checkpoint. The user signs off on the tally (and any soft-consensus interpretation) before Phase E or any subsequent step.
 
@@ -188,7 +192,9 @@ If **0–1 fail** → proceed to Step 9.
 Write the new spec content into the appropriate `sections/*.md` file:
 - Match existing section style (heading levels, code block format, cross-references).
 - Find the correct insertion point (after related content, maintaining section numbering).
-- Include Blink code examples that follow all syntax rules.
+- **Every new or changed rule gets an example.** The example shows the rule's effect: accepted code and its result, or rejected code and its error code. Each edge case the panel decided (NaN, empty input, collision, and so on) gets its own line or case. Prefer an example to a new rule sentence when the behavior already follows from an existing rule. Pure chores (a cross-reference fix, a typo) need no example.
+- You choose the wording. Meet every item on the writer-notes list from Phase A.5, and say in the report how you met each one.
+- Blink code examples follow all syntax rules.
 - Cross-reference other sections where relevant (e.g., "see §3.6 for trait resolution").
 - If a new subsection number is needed, use the next available number in that section.
 
@@ -263,12 +269,13 @@ Brief bullet list of the locked design points.
 ## Step 11: Quality Checks
 
 Before finishing, verify:
-1. All Blink code examples use correct syntax (`fn`, `{ }`, no semicolons, double quotes, `.len()` not `.len`, `[T]` generics).
-2. No contradiction with existing decisions in DECISIONS.md.
-3. Section numbering is correct and continuous.
-4. Cross-references (§X.Y) point to real sections.
-5. The DECISIONS.md table row matches the format of existing rows.
-6. Decision file's Phase A / Phase B / Phase C sections quote panelists verbatim — no paraphrasing.
+1. Each new or changed rule has an example that shows its effect, including each decided edge case.
+2. All Blink code examples use correct syntax (`fn`, `{ }`, no semicolons, double quotes, `.len()` not `.len`, `[T]` generics).
+3. No contradiction with existing decisions in DECISIONS.md.
+4. Section numbering is correct and continuous.
+5. Cross-references (§X.Y) point to real sections.
+6. The DECISIONS.md table row matches the format of existing rows.
+7. Decision file's Phase A / Phase B / Phase C sections quote panelists verbatim — no paraphrasing.
 
 ## Step 12: Report
 
