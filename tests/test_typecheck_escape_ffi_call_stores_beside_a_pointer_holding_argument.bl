@@ -715,3 +715,442 @@ test "a list that holds only outer pointers may leave the inner scope" {
 }
 "#), "")
 }
+
+// Every call form maps its arguments onto the declared parameters the same way.
+
+test "a qualified call that passes the receiver first is a call store into the list argument" {
+    let src = #"type Bag {
+    n: Int
+}
+
+trait Sink {
+    fn sink(self, ps: List[Ptr[U8]], p: Ptr[U8])
+}
+
+impl Sink for Bag {
+    @trusted(audit: "X-6")
+    fn sink(self, ps: List[Ptr[U8]], p: Ptr[U8]) {
+        ps.push(p)
+    }
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        let bag = Bag { n: 1 }
+        with ffi.scope() as inner {
+            Bag.sink(bag, ps, inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+"#
+    assert_eq(calls_in("call_qualified_self", src), "PtrTagMismatch@21\n")
+    assert(message_in("call_qualified_self_msg", src).contains("`ps: List[Ptr[U8]]`"))
+}
+
+test "a trait method called through a bound reads the trait's declared parameter types" {
+    assert_eq(calls_in("call_through_bound", #"trait Sink {
+    fn sink(self, ps: List[Ptr[U8]], p: Ptr[U8])
+}
+
+type Bag {
+    n: Int
+}
+
+impl Sink for Bag {
+    @trusted(audit: "X-6")
+    fn sink(self, ps: List[Ptr[U8]], p: Ptr[U8]) {
+        ps.push(p)
+    }
+}
+
+fn go[T: Sink](t: T) {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        with ffi.scope() as inner {
+            t.sink(ps, inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+
+fn main() {
+    go(Bag { n: 1 })
+}
+"#), "PtrTagMismatch@20\n")
+}
+
+test "a type parameter of a trait method is not pointer-holding, through a bound or not" {
+    assert_eq(errors_in("call_generic_trait_param", #"type Bag {
+    n: Int
+}
+
+trait Look {
+    fn look[U](self, a: U, p: Ptr[U8]) -> Int
+}
+
+impl Look for Bag {
+    fn look[U](self, a: U, p: Ptr[U8]) -> Int {
+        self.n
+    }
+}
+
+fn go[T: Look](t: T) {
+    with ffi.scope() as outer {
+        let ps: List[Ptr[U8]] = [outer.alloc[U8]()]
+        with ffi.scope() as inner {
+            let _ = t.look(ps, inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+
+fn go2(t: Bag) {
+    with ffi.scope() as outer {
+        let ps: List[Ptr[U8]] = [outer.alloc[U8]()]
+        with ffi.scope() as inner {
+            let _ = t.look(ps, inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+
+fn main() {
+    go(Bag { n: 1 })
+    go2(Bag { n: 1 })
+}
+"#), "")
+}
+
+test "a Ptr argument of the wrong type is judged by its declared parameter type" {
+    let src = #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "X-4")
+fn two_void(a: Ptr[Void], b: Ptr[Void]) -> Bool {
+    a.is_null() || b.is_null()
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let v = outer.alloc[IoVec]()
+        with ffi.scope() as inner {
+            let _ = two_void(v, inner.alloc[U8]())
+        }
+    }
+}
+"#
+    let mut tag_mismatch = 0
+    for d in all_errors_in("call_void_mistyped", src) {
+        if d.name == "PtrTagMismatch" { tag_mismatch = tag_mismatch + 1 }
+    }
+    assert_eq(tag_mismatch, 0)
+}
+
+test "a method that does not resolve stores nothing beside its receiver" {
+    let src = #"@trusted(audit: "X-3")
+fn keep(xs: List[Ptr[U8]], p: Ptr[U8]) {
+}
+
+@trusted(audit: "X-4")
+fn run() {
+    with ffi.scope() as outer {
+        let mut xs: List[Ptr[U8]] = []
+        xs.push(outer.alloc[U8]())
+        with ffi.scope() as inner {
+            xs.keep(inner.alloc[U8]())
+        }
+        let _ = xs.len()
+    }
+}
+
+fn main() {
+    run()
+}
+"#
+    let mut tag_mismatch = 0
+    let mut unresolved = 0
+    for d in all_errors_in("call_unresolved_method", src) {
+        if d.name == "PtrTagMismatch" { tag_mismatch = tag_mismatch + 1 }
+        if d.name == "UnresolvedMethod" { unresolved = unresolved + 1 }
+    }
+    assert_eq(tag_mismatch, 0)
+    assert_eq(unresolved, 1)
+}
+
+test "a pointer-holding argument never pairs with itself" {
+    assert_eq(errors_in("call_holder_alone", #"@trusted(audit: "X-8")
+fn count(ps: List[Ptr[U8]]) -> Int {
+    ps.len()
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        with ffi.scope() as inner {
+            ps.push(inner.alloc[U8]())
+            let _ = count(ps)
+        }
+        let _ = ps.len()
+    }
+}
+"#), "PtrTagMismatch@10\n")
+}
+
+// A list keeps the cell of the expression that created it, however it is reached.
+
+test "a struct literal holds the list its field was given, not a new one" {
+    assert_eq(calls_in("creation_struct_field", #"type Holder {
+    items: List[Ptr[U8]]
+}
+
+@trusted(audit: "X-2")
+fn main() {
+    let mut xs: List[Ptr[U8]] = []
+    with ffi.scope() as s {
+        let mut h = Holder { items: xs }
+        h.items.push(s.alloc[U8]())
+    }
+    let _ = xs.len()
+}
+"#), "PtrTagMismatch@10\n")
+}
+
+test "a struct literal that spreads an older struct holds that struct's lists" {
+    assert_eq(calls_in("creation_struct_spread", #"type Holder {
+    items: List[Ptr[U8]]
+}
+
+@trusted(audit: "X-2")
+fn main() {
+    let h0 = Holder { items: [] }
+    with ffi.scope() as s {
+        let mut h = Holder { ..h0 }
+        h.items.push(s.alloc[U8]())
+    }
+    let _ = h0.items.len()
+}
+"#), "PtrTagMismatch@10\n")
+}
+
+test "a match arm binder holds the list of the scrutinee" {
+    assert_eq(calls_in("creation_match_arm", #"fn main() {
+    with ffi.scope() as outer {
+        let o: Option[List[Ptr[U8]]] = Some([outer.alloc[U8]()])
+        with ffi.scope() as inner {
+            match o {
+                Some(mut xs) => xs.push(inner.alloc[U8]())
+                None => {}
+            }
+        }
+        let _ = o
+    }
+}
+"#), "PtrTagMismatch@6\n")
+}
+
+test "a match arm binder over a list of its own scope may take a pointer of that scope" {
+    assert_eq(errors_in("creation_match_arm_same_scope", #"fn main() {
+    with ffi.scope() as outer {
+        with ffi.scope() as inner {
+            let o: Option[List[Ptr[U8]]] = Some([outer.alloc[U8]()])
+            match o {
+                Some(mut xs) => xs.push(inner.alloc[U8]())
+                None => {}
+            }
+        }
+    }
+}
+"#), "")
+}
+
+test "a list literal that spreads an older list is a new list" {
+    assert_eq(errors_in("creation_spread", #"@trusted(audit: "X-1")
+fn run(xs: List[Ptr[U8]]) {
+    with ffi.scope() as s {
+        let mut ws = [..xs, s.alloc[U8]()]
+        ws.push(s.alloc[U8]())
+        let _ = ws.len()
+    }
+}
+
+fn main() {
+    run([])
+}
+"#), "")
+}
+
+test "a list literal that holds an older list as an element still holds that list" {
+    assert_eq(calls_in("creation_list_of_lists", #"@trusted(audit: "X-1")
+fn run(xs: List[Ptr[U8]]) {
+    with ffi.scope() as s {
+        let a = [xs]
+        a.get(0).unwrap().push(s.alloc[U8]())
+        let _ = a.len()
+    }
+}
+
+fn main() {
+    run([])
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "a list parameter of a closure literal outlives every scope the closure body opens" {
+    assert_eq(calls_in("creation_closure_param", #"@trusted(audit: "X-1")
+fn g(ps: List[Ptr[U8]]) {
+    let f = fn(xs: List[Ptr[U8]]) {
+        with ffi.scope() as s {
+            xs.push(s.alloc[U8]())
+        }
+    }
+    f(ps)
+}
+
+fn main() {
+    let ps: List[Ptr[U8]] = []
+    g(ps)
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "a list stored into through a method that returns part of it may not leave the scope" {
+    assert_eq(errors_in("push_through_projection_then_tail", #"fn main() {
+    let b = with ffi.scope() as s {
+        let mut m: Map[Int, List[Ptr[U8]]] = Map()
+        m.insert(1, [])
+        m.get(1).unwrap().push(s.alloc[U8]())
+        m
+    }
+    let _ = b.len()
+}
+"#), "PtrEscapesFfiScope@6\n")
+}
+
+// The note on the argument that set a tag appears only when the call rule set it.
+
+test "a variant constructor is not the call rule, so the error names no argument of it" {
+    let msg = message_in("source_variant_ctor", #"fn main() {
+    with ffi.scope() as outer {
+        let mut mv: Map[Int, Option[Ptr[U8]]] = Map()
+        with ffi.scope() as inner {
+            let p = inner.alloc[U8]()
+            mv.insert(1, Some(p))
+        }
+        let _ = mv.len()
+    }
+}
+"#)
+    assert(msg.contains("stored by call"))
+    assert(!msg.contains("its tag comes from argument"))
+}
+
+test "a let mut binding assigned again names no argument of its first value" {
+    let msg = message_in("source_reassigned", #"@trusted(audit: "X-1")
+fn id(x: Ptr[U8]) -> Ptr[U8] {
+    x
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut cell: Ptr[U8] = outer.alloc[U8]()
+        with ffi.scope() as s {
+            let pa = s.alloc[U8]()
+            let pb = s.alloc[U8]()
+            let mut q = id(pa)
+            q = pb
+            cell = q
+        }
+        let _ = cell.is_null()
+    }
+}
+"#)
+    assert(msg.contains("stored by assignment"))
+    assert(!msg.contains("its tag comes from argument"))
+}
+
+// In a trusted body only a parameter has the caller's tag; a cell the body declares has none.
+
+test "a let mut cell a trusted body declares is unscoped in the message" {
+    let src = #"@trusted(audit: "X-1")
+fn f(q: Ptr[U8]) -> Int {
+    let mut c: Ptr[U8] = q
+    with ffi.scope() as inner {
+        let b = inner.alloc[U8]()
+        c = b
+    }
+    if c.is_null() { 0 } else { 1 }
+}
+
+fn main() {
+    let _ = f(alloc_ptr[U8]())
+}
+"#
+    let msg = message_in("trusted_local_cell_msg", src)
+    assert(msg.contains("`c` (unscoped)"))
+    assert(!msg.contains("caller"))
+    assert(!help_in("trusted_local_cell_help", src).contains("allocate"))
+}
+
+test "a list a trusted body creates is unscoped in the message" {
+    let src = #"@trusted(audit: "X-1")
+fn h() -> Int {
+    let mut xs: List[Ptr[U8]] = []
+    with ffi.scope() as inner {
+        let b = inner.alloc[U8]()
+        xs.push(b)
+    }
+    xs.len()
+}
+
+fn main() {
+    let _ = h()
+}
+"#
+    assert_eq(calls_in("trusted_local_list", src), "PtrTagMismatch@6\n")
+    let msg = message_in("trusted_local_list_msg", src)
+    assert(msg.contains("`xs` (unscoped)"))
+    assert(!msg.contains("caller"))
+}
+
+test "a list a trusted body creates may take a pointer parameter" {
+    assert_eq(errors_in("trusted_local_list_param_ptr", #"@trusted(audit: "X-1")
+fn h(p: Ptr[U8]) -> Int {
+    let mut xs: List[Ptr[U8]] = []
+    xs.push(p)
+    let mut c: Ptr[U8] = alloc_ptr[U8]()
+    c = p
+    if c.is_null() { 0 } else { xs.len() }
+}
+
+fn main() {
+    with ffi.scope() as s {
+        let _ = h(s.alloc[U8]())
+    }
+}
+"#), "")
+}
+
+test "the help for a store into a list parameter of a trusted body offers only take" {
+    let src = #"@trusted(audit: "X-1")
+fn g(xs: List[Ptr[U8]]) -> Int {
+    with ffi.scope() as inner {
+        let b = inner.alloc[U8]()
+        xs.push(b)
+    }
+    xs.len()
+}
+
+fn main() {
+    let _ = g([])
+}
+"#
+    assert(message_in("trusted_param_list_msg", src).contains("caller"))
+    let help = help_in("trusted_param_list_help", src)
+    assert(help.contains("inner.take("))
+    assert(!help.contains("allocate"))
+}
