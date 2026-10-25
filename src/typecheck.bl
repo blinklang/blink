@@ -9,7 +9,7 @@ import parser.{
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
     node_count, node_handlers, node_index, node_int_val, node_is_compiler_known_type_ann, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
-    node_left, node_line, node_method, node_methods, node_module, node_name, node_obj,
+    int_op_group, node_left, node_line, node_method, node_methods, node_module, node_name, node_obj,
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
@@ -5766,10 +5766,8 @@ fn is_literal_tree_node(node: Int) -> Bool {
     if is_int_literal_node(node) != 0 { return true }
     let k = node_kind(node)
     if k == NodeKind.UnaryOp { return node_op(node) == "-" && is_literal_tree_node(node_left(node)) }
-    if k != NodeKind.BinOp { return false }
-    let op = node_op(node)
-    let tree_op = op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>"
-    tree_op && is_literal_tree_node(node_left(node)) && is_literal_tree_node(node_right(node))
+    if k != NodeKind.BinOp || int_op_group(node_op(node)) == 0 { return false }
+    is_literal_tree_node(node_left(node)) && is_literal_tree_node(node_right(node))
 }
 
 // An int literal accepted where an integer type is expected has that type at the literal
@@ -5782,24 +5780,36 @@ fn is_literal_tree_node(node: Int) -> Bool {
 //
 // A literal tree takes the type at each literal and at each operation, since codegen reads an
 // operation's width from its stamp: `(127 + 1) + x` with `x: I8` overflows I8. A shift's
-// amount is U32 whatever the tree's type.
+// amount is U32 whatever the tree's type, which the BinOp arm of infer_type_uncached gives it.
 fn tc_literal_takes(node: Int, tid: Int) ! TypeCheck.Report, Diag.Report {
     if !is_literal_tree_node(node) { return }
     let t = tc_resolve(resolve_alias_tid(tid))
     if is_integer_type(t) == 0 { return }
-    if is_int_literal_node(node) == 0 {
+    tc_literal_tree_takes(node, t)
+}
+
+// tc_literal_takes over a node known to be a literal tree, with `t` a resolved integer type.
+//
+// Unary `-` over a tree is a Neg call, and an unsigned type has no Neg (03_types.md §3.2
+// *Negative literals*), so `u + -(2 * 3)` with `u: U8` is an error where `u + -6` is E0318.
+fn tc_literal_tree_takes(node: Int, t: Int) ! TypeCheck.Report, Diag.Report {
+    if is_int_literal_node(node) != 0 {
+        if !tc_literal_fits(node, type_kind(t)) { tc_report_int_literal_range(node, t, false, "") }
         tc_publish_node_tid(node, t)
-        if node_kind(node) == NodeKind.UnaryOp { return tc_literal_takes(node_left(node), t) }
-        tc_literal_takes(node_left(node), t)
-        let op = node_op(node)
-        if op != "<<" && op != ">>" { return tc_literal_takes(node_right(node), t) }
-        tc_literal_takes(node_right(node), TYPE_U32)
-        tc_check_shift_literal_amount(node, t)
+        if node_kind(node) == NodeKind.UnaryOp { tc_publish_node_tid(node_left(node), t) }
         return
     }
-    if !tc_literal_fits(node, type_kind(t)) { tc_report_int_literal_range(node, t, false, "") }
     tc_publish_node_tid(node, t)
-    if node_kind(node) == NodeKind.UnaryOp { tc_publish_node_tid(node_left(node), t) }
+    if node_kind(node) == NodeKind.UnaryOp {
+        if tc_int_literal_limit(type_kind(t), true) != "" { return tc_literal_tree_takes(node_left(node), t) }
+        if !diag_has_error_at(TYPE_ERROR, node, node_col(node)) {
+            tc_error_at("unary `-` requires a signed operand, got {type_to_str(t)}", node)
+        }
+        return
+    }
+    tc_literal_tree_takes(node_left(node), t)
+    let op = node_op(node)
+    if op != "<<" && op != ">>" { tc_literal_tree_takes(node_right(node), t) }
 }
 
 // error[IntLiteralOutOfRange] (E0318) at `node`, a literal whose value is outside `t`, its
@@ -5856,15 +5866,16 @@ fn tc_literal_takes_operand(lit: Int, other: Int, other_t: Int) -> Bool ! TypeCh
 }
 
 // The type a literal operand of `node` took from the other operand, or -1 when neither
-// operand is a lone literal beside an integer.
+// operand is a literal or literal tree beside an integer.
 fn tc_operand_literal_type(node: Int, lt: Int, rt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_literal_takes_operand(node_right(node), node_left(node), lt) { return lt }
     if tc_literal_takes_operand(node_left(node), node_right(node), rt) { return rt }
     -1
 }
 
-// A lone int literal, or a literal tree, has the other operand's type, so the operator has
-// that type too. The literal's default Int would be a type nobody wrote.
+// An int literal or literal tree beside an operand that is neither has the other operand's
+// type, so the operator has that type too. The literal's default Int would be a type nobody
+// wrote.
 fn tc_lone_literal_beside(lit: Int, other: Int) -> Bool {
     is_literal_tree_node(lit) && !is_literal_tree_node(other)
 }
@@ -5885,7 +5896,7 @@ fn tc_operand_type_open(tid: Int) -> Bool {
     tc_tid_is_no_info(tid) != 0 || (tc_boundary_check_active == 0 && tc_operand_type_unsolved(tid))
 }
 
-// The type a lone literal takes from the other operand, unless that operand is unsolved past
+// The type a literal or literal tree takes from the other operand, unless that operand is unsolved past
 // the name-resolution walk (see tc_operand_type_open).
 fn tc_literal_takes_other(lit: Int, other: Int, other_t: Int) -> Bool {
     tc_lone_literal_beside(lit, other) && (tc_operand_type_open(other_t) || !tc_operand_type_unsolved(other_t))
@@ -7647,7 +7658,9 @@ fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, Typ
     let mut v = val
     if node_kind(v) == NodeKind.NamedArg { v = node_value(v) }
     if v == -1 { return }
-    tc_literal_takes(v, expected)
+    // A literal tree is typed whole by tc_literal_takes; descending into it as well would walk
+    // each subtree again from every level above it.
+    if is_literal_tree_node(v) { return tc_literal_takes(v, expected) }
     for p in tc_expected_parts(v, expected) {
         tc_seed_expected_into_value(p.value, p.expected)
     }
@@ -7663,9 +7676,8 @@ fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, Typ
         if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^" {
             let l = node_left(v)
             let r = node_right(v)
-            let both = is_literal_tree_node(l) && is_literal_tree_node(r)
-            if both || !is_literal_tree_node(l) { tc_seed_expected_into_value(l, expected) }
-            if both || !is_literal_tree_node(r) { tc_seed_expected_into_value(r, expected) }
+            if !is_literal_tree_node(l) { tc_seed_expected_into_value(l, expected) }
+            if !is_literal_tree_node(r) { tc_seed_expected_into_value(r, expected) }
         } else if op == "<<" || op == ">>" {
             tc_seed_expected_into_value(node_left(v), expected)
         }
@@ -23143,7 +23155,7 @@ fn tc_recheck_unary_operator(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
     tc_check_unary_operand(node, node_op(node), t)
 }
 
-// The type of `+ - * / % & | ^`: the type a lone literal took, else the literal-free side's.
+// The type of `+ - * / % & | ^`: the type a literal operand took, else the literal-free side's.
 fn tc_operator_result_type(node: Int, lit_t: Int, lt: Int, rt: Int) -> Int {
     if lit_t >= 0 { return lit_t }
     if tc_literal_takes_other(node_right(node), node_left(node), lt) { return lt }
@@ -23180,7 +23192,7 @@ fn tc_check_str_plus(node: Int, op: Str, lt: Int, rt: Int) -> Bool ! Diag.Report
 }
 
 // The operand checks of `+ - * / %`, shared by the operator and by tc_recheck_operators so
-// the two cannot drift. Answers the type a lone literal operand took, or -1.
+// the two cannot drift. Answers the type a literal operand took, or -1.
 fn tc_check_arith_operands(node: Int, op: Str, lt: Int, rt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     reject_non_numeric_arith_operand(op, lt, node, 0)
     // Skip the right operand only when the left is `Self` and already reported
@@ -23224,21 +23236,24 @@ fn tc_check_shift_operands(node: Int, op: Str, lt: Int, rt: Int) ! TypeCheck.Res
     if !tc_operand_type_pending(rt) && is_shift_amount_type(rt, rhs) == 0 {
         tc_error_at("shift `{op}` amount must be U32, got {type_to_str(rt)}", node)
     }
-    if !tc_operand_type_pending(lt) { tc_check_shift_literal_amount(node, lt) }
 }
 
 // A literal amount must be below the width of the shifted type. Codegen guards no shift by a
-// literal amount (cg_expr.bl x_operator_needs_guard), so the check runs again at the type a
-// literal tree takes once it holds the shift. An amount out of U32's range is E0318 at the
-// literal already.
-fn tc_check_shift_literal_amount(node: Int, lt: Int) ! TypeCheck.Report, Diag.Report {
+// literal amount (cg_expr.bl x_operator_needs_guard). The check reads the shift's final type:
+// a literal tree that holds the shift takes its type after inference types the shift, and an
+// amount checked earlier would be checked against Int. An amount out of U32's range is E0318
+// at the literal already.
+fn tc_check_shift_literal_amount(node: Int) ! TypeCheck.Report, Diag.Report {
     let rhs = node_right(node)
     if rhs == -1 || node_kind(rhs) != NodeKind.IntLit || !tc_literal_fits(rhs, TyKind.U32) { return }
-    if diag_has_error_at(TYPE_ERROR, node, node_col(node)) { return }
+    let stamped = tc_lookup_node_tid(node)
+    if stamped < 0 { return }
+    let t = tc_resolve(resolve_alias_tid(stamped))
+    if is_integer_type(t) == 0 { return }
     let amt = node_str_val(rhs).to_int()
-    let bw = type_bit_width(lt)
+    let bw = type_bit_width(t)
     if amt < 0 || amt >= bw {
-        tc_error_at("shift `{node_op(node)}` amount {amt} out of range for {type_to_str(lt)} (must be 0..{bw})", node)
+        tc_error_at("shift `{node_op(node)}` amount {amt} out of range for {type_to_str(t)} (must be 0..{bw})", node)
     }
 }
 
@@ -33564,10 +33579,14 @@ fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
 // A literal beside an operand that is not an integer stays Int, and the operator or the
 // operand is the error there: reporting the literal too would explain one mistake twice. A
 // program with no error yet gets the report, so no literal reaches codegen out of range.
-fn tc_report_int_literals_out_of_range(order: List[Int]) ! Diag.Report {
+//
+// A shift by a literal amount is checked here too (tc_check_shift_literal_amount), since its
+// type is final only at the same point, and it is skipped in a tree the literals are skipped in.
+fn tc_report_literals_out_of_range(order: List[Int]) ! TypeCheck.Report, Diag.Report {
     let mut skip: Set[Int] = Set()
     let mut let_of: Map[Int, Int] = Map()
     let mut found: List[Int] = []
+    let mut shifts: List[Int] = []
     for n in order {
         let k = node_kind(n)
         if k == NodeKind.LetBinding && node_target(n) == -1 && node_type_name(n) == "" && node_name(n) != "" {
@@ -33577,6 +33596,8 @@ fn tc_report_int_literals_out_of_range(order: List[Int]) ! Diag.Report {
         if k == NodeKind.BinOp {
             tc_skip_literal_beside_non_integer(node_left(n), node_right(n), skip)
             tc_skip_literal_beside_non_integer(node_right(n), node_left(n), skip)
+            let op = node_op(n)
+            if (op == "<<" || op == ">>") && !skip.contains(n) { shifts.push(n) }
         }
         if is_int_literal_node(n) == 0 || skip.contains(n) { continue }
         if k == NodeKind.UnaryOp { skip.insert(node_left(n)) }
@@ -33600,10 +33621,11 @@ fn tc_report_int_literals_out_of_range(order: List[Int]) ! Diag.Report {
         }
         tc_report_int_literal_range(n, t, default_int, help)
     }
+    for n in shifts.sort() { tc_check_shift_literal_amount(n) }
 }
 
 fn tc_skip_literal_beside_non_integer(lit: Int, other: Int, skip: Set[Int]) {
-    if lit == -1 || other == -1 || !tc_lone_literal_beside(lit, other) { return }
+    if other == -1 || !tc_lone_literal_beside(lit, other) { return }
     if diag_any_errors_since(0) == 0 { return }
     let other_t = tc_lookup_node_tid(other)
     if other_t >= 0 && is_integer_type(tc_resolve(resolve_alias_tid(other_t))) != 0 { return }
@@ -33631,7 +33653,7 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let mut seen: List[Int] = List.with_capacity(node_count())
     let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
     tc_report_unclaimed_calls(order, mods)
-    tc_report_int_literals_out_of_range(order)
+    tc_report_literals_out_of_range(order)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp

@@ -28,34 +28,74 @@ fn assert_errors(stem: Str, src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Pa
     assert(got == want)
 }
 
+// The rows bind the operator to a `let` with no annotation, so no expected type reaches the
+// tree and the type it takes comes from the other operand alone.
 test "a literal that does not fit the type the tree takes is E0318 at that literal" {
-    assert_errors("tree_right_literal_too_big", #"fn f(u: U8) -> U8 { u + (300 - 100) }
-"#, ["1:26 E0318 300 does not fit in U8 (0 to 255)"])
-    assert_errors("tree_left_literal_too_big", #"fn f(x: I8) -> I8 { (2 * 200) + x }
-"#, ["1:26 E0318 200 does not fit in I8 (-128 to 127)"])
+    assert_errors("tree_right_literal_too_big", #"fn f(u: U8) { let k = u + (300 - 100) }
+"#, ["1:28 E0318 300 does not fit in U8 (0 to 255)"])
+    assert_errors("tree_left_literal_too_big", #"fn f(x: I8) { let r = (2 * 200) + x }
+"#, ["1:28 E0318 200 does not fit in I8 (-128 to 127)"])
     assert_errors("tree_comparison_literal_too_big", #"fn f(u: U16) -> Bool { u < (70000 + 1) }
 "#, ["1:29 E0318 70000 does not fit in U16 (0 to 65535)"])
-    assert_errors("tree_negative_literal_unsigned", #"fn f(u: U32) -> U32 { u + (2 * -1) }
-"#, ["1:32 E0318 -1 does not fit in U32"])
-    assert_errors("tree_wide_literal_takes_u64", #"fn f(m: U64) -> U64 { m & (9223372036854775808 | 1) }
-fn g(m: U64) -> U64 { m & (18446744073709551616 | 1) }
-"#, ["2:28 E0318 no integer type holds 18446744073709551616"])
+    assert_errors("tree_negative_literal_unsigned", #"fn f(u: U32) { let r = u + (2 * -1) }
+"#, ["1:33 E0318 -1 does not fit in U32"])
+    assert_errors("tree_wide_literal_takes_u64", #"fn f(m: U64) { let a = m & (9223372036854775808 | 1) }
+fn g(m: U64) { let b = m & (18446744073709551616 | 1) }
+"#, ["2:29 E0318 no integer type holds 18446744073709551616"])
+    assert_errors("tree_without_parentheses", #"fn f(x: I8) { let b = x + 2 * 3 }
+fn g(x: I8) { let c = x + 300 * 1 }
+"#, ["2:27 E0318 300 does not fit in I8 (-128 to 127)"])
 }
 
 test "every literal of a tree that fits compiles, even when an operation overflows" {
-    assert_errors("tree_fits_and_overflows", #"fn f(u: U8) -> U8 { u + (200 + 100) }
-fn g(x: I8) -> I8 { (127 + 1) + x }
+    assert_errors("tree_fits_and_overflows", #"fn f(u: U8) { let a = u + (200 + 100) }
+fn g(x: I8) { let b = (127 + 1) + x }
 "#, [])
 }
 
 test "the shift amount tree is U32 and the shifted literal takes the tree's type" {
     assert_errors("tree_shift_amount_too_big", #"fn f(q: U64) -> U64 { q << (4294967296 - 1) }
 "#, ["1:29 E0318 4294967296 does not fit in U32 (0 to 4294967295)"])
-    assert_errors("tree_shift_left_takes_tree_type", #"fn f(u: U8) -> U8 { u & (256 << 1) }
-"#, ["1:26 E0318 256 does not fit in U8 (0 to 255)"])
-    assert_errors("tree_shift_amount_past_tree_width", #"fn f(u: U8) -> U8 { u & (1 << 9) }
-fn g(u: U8) -> U8 { (1 << 7) | u }
-"#, ["1:28 E0300 shift `<<` amount 9 out of range for U8 (must be 0..8)"])
+    assert_errors("tree_shift_left_takes_tree_type", #"fn f(u: U8) { let a = u & (256 << 1) }
+"#, ["1:28 E0318 256 does not fit in U8 (0 to 255)"])
+    assert_errors("tree_shift_amount_past_tree_width", #"fn f(u: U8) { let a = u & (1 << 9) }
+fn g(u: U8) { let b = (1 << 7) | u }
+"#, ["1:30 E0300 shift `<<` amount 9 out of range for U8 (must be 0..8)"])
+    assert_errors("tree_shift_amount_past_expected_width", #"fn h() { let a: U8 = 1 << 9 }
+fn k() { let b: U8 = (1 << 9) | 1 }
+"#, [
+        "1:24 E0300 shift `<<` amount 9 out of range for U8 (must be 0..8)",
+        "2:25 E0300 shift `<<` amount 9 out of range for U8 (must be 0..8)",
+    ])
+}
+
+// An amount of 64 or more is out of range for Int as well, so the message must name the type
+// the tree takes and not the Int the tree has before it takes one.
+test "a shift amount past the tree's width names the type the tree takes" {
+    assert_errors("tree_shift_amount_past_int_width", #"type Byte = U8
+fn f(u: U8) { let a = u & (1 << 70) }
+fn g(u: U8) -> U8 { (1 << 64) | u }
+fn h(b: Byte) { let c = b == (1 >> 9) }
+fn k() { let d = 1 << 70 }
+"#, [
+        "2:30 E0300 shift `<<` amount 70 out of range for U8 (must be 0..8)",
+        "3:24 E0300 shift `<<` amount 64 out of range for U8 (must be 0..8)",
+        "4:33 E0300 shift `>>` amount 9 out of range for U8 (must be 0..8)",
+        "5:20 E0300 shift `<<` amount 70 out of range for Int (must be 0..64)",
+    ])
+}
+
+test "a shift of a value that is not an integer reports the left operand only" {
+    assert_errors("shift_float_left_operand", #"fn f(x: Float) -> Float { x << 70 }
+"#, ["1:29 E0300 shift `<<` requires integer left operand, got Float"])
+}
+
+// `-(2 * 3)` is a call to Neg, and unsigned types do not implement Neg (sections/03_types.md
+// §3.2 *Integer literal range*), so the tree's unsigned type does not make it compile.
+test "unary minus over a literal tree that takes an unsigned type is an error" {
+    assert_errors("tree_neg_unsigned", #"fn f(u: U8) { let a = u + -(2 * 3) }
+fn g(x: I8) { let b = x + -(2 * 3) }
+"#, ["1:27 E0300 unary `-` requires a signed operand, got U8"])
 }
 
 test "a tree with a name in it is not a literal tree" {
