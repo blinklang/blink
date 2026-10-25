@@ -6,12 +6,12 @@ import parser.{
     node_target, node_iterable, node_is_mut, node_start, node_end, node_obj,
     node_method, node_index, node_params, node_args, node_stmts, node_arms,
     node_fields, node_elements, node_line, node_col, node_binder_col,
-    node_push_value_child_ids, sublist_get, sublist_length,
+    node_push_value_child_ids, node_value_child_ids, node_handlers, sublist_get, sublist_length,
 }
 import typecheck.{
     tc_call_decl_is_fn, tc_call_decl_node, tc_call_declared_name, tc_global_decl_node,
     tc_ident_binder_node, tc_let_binder_is_discard, tc_prelude_carrier_of, tc_ticked_names,
-    TyKind, tc_lookup_node_tid, tc_tid_kind,
+    TyKind, tc_lookup_node_tid, tc_resolve, tc_tid_kind,
 }
 import diagnostics.{
     Diag, diag_warn_at_notes, diag_source_file, diag_file_for_node,
@@ -88,17 +88,25 @@ let mut writes_words: Int = 0
 // the callee's writes (typically <5) instead of all globals.
 let mut fn_writes_idx: List[List[Int]] = []
 
+fn bits_has(bits: List[U64], fn_idx: Int, gi: Int) -> Bool {
+    let word = bits.get(fn_idx * writes_words + gi / 64).unwrap()
+    (word & (1.to_u64() << (gi % 64).to_u32())) != 0.to_u64()
+}
+
+fn bits_set(bits: List[U64], fn_idx: Int, gi: Int) {
+    let wi = fn_idx * writes_words + gi / 64
+    bits.set(wi, bits.get(wi).unwrap() | (1.to_u64() << (gi % 64).to_u32()))
+}
+
 fn mat_has_write(fn_idx: Int, gi: Int) -> Int {
-    let word = writes_bits.get(fn_idx * writes_words + gi / 64).unwrap()
-    if (word & (1.to_u64() << (gi % 64).to_u32())) != 0.to_u64() {
+    if bits_has(writes_bits, fn_idx, gi) {
         return 1
     }
     0
 }
 
 fn mat_set_write(fn_idx: Int, gi: Int) {
-    let wi = fn_idx * writes_words + gi / 64
-    writes_bits.set(wi, writes_bits.get(wi).unwrap() | (1.to_u64() << (gi % 64).to_u32()))
+    bits_set(writes_bits, fn_idx, gi)
     fn_writes_idx.get(fn_idx).unwrap().push(gi)
 }
 
@@ -135,6 +143,25 @@ fn extract_ident_name(node: Int) -> Option[Str] {
     None
 }
 
+// The global an assignment writes: the target itself, or the global whose field or element
+// it sets. "" when the target names no global by itself.
+fn assign_root_name(target: Int) -> Str {
+    if target == -1 {
+        return ""
+    }
+    let tk = node_kind(target)
+    if tk == NodeKind.Ident {
+        return node_name(target)
+    }
+    if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
+        let obj = node_obj(target)
+        if obj != -1 && node_kind(obj) == NodeKind.Ident {
+            return node_name(obj)
+        }
+    }
+    ""
+}
+
 fn walk_expr(node: Int, fn_idx: Int) {
     if node == -1 {
         return
@@ -142,33 +169,9 @@ fn walk_expr(node: Int, fn_idx: Int) {
     let kind = node_kind(node)
 
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
-        let target = node_target(node)
-        if target != -1 {
-            let tk = node_kind(target)
-            if tk == NodeKind.Ident {
-                let tname = node_name(target)
-                if is_global(tname) != 0 {
-                    add_write(fn_idx, tname)
-                }
-            }
-            if tk == NodeKind.FieldAccess {
-                let obj = node_obj(target)
-                if obj != -1 && node_kind(obj) == NodeKind.Ident {
-                    let oname = node_name(obj)
-                    if is_global(oname) != 0 {
-                        add_write(fn_idx, oname)
-                    }
-                }
-            }
-            if tk == NodeKind.IndexExpr {
-                let obj = node_obj(target)
-                if obj != -1 && node_kind(obj) == NodeKind.Ident {
-                    let oname = node_name(obj)
-                    if is_global(oname) != 0 {
-                        add_write(fn_idx, oname)
-                    }
-                }
-            }
+        let root = assign_root_name(node_target(node))
+        if is_global(root) != 0 {
+            add_write(fn_idx, root)
         }
         walk_expr(node_value(node), fn_idx)
         return
@@ -607,10 +610,15 @@ type RetWrites {
     globals: List[List[Int]]
     sites: List[List[Int]]
     vias: List[List[Int]]
-    // The calls that go on to the return of their caller.
-    edge_from: List[Int]
-    edge_to: List[Int]
-    edge_node: List[Int]
+    // Per callee: each fn whose call to it goes on to that fn's return, and the call.
+    callers: List[List[Int]]
+    call_nodes: List[List[Int]]
+    // Per node, whether every path through it ends inside it; filled when first asked.
+    diverges: Map[Int, Bool]
+    // Per (loop, whether the path after it goes on, whether its body's `return` does), the
+    // flag at its head. A nested loop is then walked once per key, not once per walk of
+    // each loop around it.
+    heads: Map[Int, Bool]
 }
 
 // Where the paths of one body go. A closure body gets its own: its `return` ends the
@@ -625,18 +633,16 @@ type RwPath {
 }
 
 fn rw_has(r: RetWrites, fn_idx: Int, gi: Int) -> Bool {
-    let word = r.bits.get(fn_idx * writes_words + gi / 64).unwrap()
-    (word & (1.to_u64() << (gi % 64).to_u32())) != 0.to_u64()
+    gi >= 0 && bits_has(r.bits, fn_idx, gi)
 }
 
 // Keeps the set inside the write set: a write the write-set walk does not see is not
 // added here either.
 fn rw_add(r: RetWrites, fn_idx: Int, gi: Int, site: Int, via: Int) -> Bool {
-    if rw_has(r, fn_idx, gi) || mat_has_write(fn_idx, gi) == 0 {
+    if gi < 0 || rw_has(r, fn_idx, gi) || mat_has_write(fn_idx, gi) == 0 {
         return false
     }
-    let wi = fn_idx * writes_words + gi / 64
-    r.bits.set(wi, r.bits.get(wi).unwrap() | (1.to_u64() << (gi % 64).to_u32()))
+    bits_set(r.bits, fn_idx, gi)
     r.globals.get(fn_idx).unwrap().push(gi)
     r.sites.get(fn_idx).unwrap().push(site)
     r.vias.get(fn_idx).unwrap().push(via)
@@ -644,15 +650,14 @@ fn rw_add(r: RetWrites, fn_idx: Int, gi: Int, site: Int, via: Int) -> Bool {
 }
 
 fn rw_write(r: RetWrites, p: RwPath, name: Str, node: Int, on: Bool) {
-    if !on || is_global(name) == 0 {
-        return
+    if on {
+        let _ = rw_add(r, p.fn_idx, global_index(name), node, -1)
     }
-    let _ = rw_add(r, p.fn_idx, global_index(name), node, -1)
 }
 
 fn rw_is_never(node: Int) -> Bool {
     let tid = tc_lookup_node_tid(node)
-    tid >= 0 && tc_tid_kind(tid) == TyKind.Never
+    tid >= 0 && tc_tid_kind(tc_resolve(tid)) == TyKind.Never
 }
 
 fn rw_top(flags: List[Bool]) -> Bool {
@@ -660,22 +665,98 @@ fn rw_top(flags: List[Bool]) -> Bool {
     n > 0 && flags.get(n - 1).unwrap()
 }
 
-// The write targets mirror walk_expr: a global, a field of one, or an element of one.
-fn rw_assign_root(target: Int) -> Str {
-    if target == -1 {
-        return ""
-    }
-    let tk = node_kind(target)
-    if tk == NodeKind.Ident {
-        return node_name(target)
-    }
-    if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
-        let obj = node_obj(target)
-        if obj != -1 && node_kind(obj) == NodeKind.Ident {
-            return node_name(obj)
+fn rw_any_diverges(r: RetWrites, ids: List[Int]) -> Bool {
+    for id in ids {
+        if rw_diverges(r, id) {
+            return true
         }
     }
-    ""
+    false
+}
+
+// Whether every path through `node` ends inside it, so what runs after it in the same
+// sequence never runs. A jump ends it there, as it goes elsewhere. Only a call reads its
+// own type: a block, a branch or a loop is Never because of its parts, so their parts
+// decide.
+fn rw_diverges(r: RetWrites, node: Int) -> Bool {
+    if node == -1 {
+        return false
+    }
+    match r.diverges.get(node) {
+        Some(d) => return d
+        None => {}
+    }
+    let d = rw_diverges_of(r, node)
+    r.diverges.insert(node, d)
+    d
+}
+
+fn rw_diverges_of(r: RetWrites, node: Int) -> Bool {
+    let kind = node_kind(node)
+    if kind == NodeKind.Return || kind == NodeKind.Break || kind == NodeKind.Continue {
+        return true
+    }
+    // These finish without running their bodies here.
+    if kind == NodeKind.FnDef || kind == NodeKind.Closure || kind == NodeKind.AsyncSpawn || kind == NodeKind.AssertPanics {
+        return false
+    }
+    if kind == NodeKind.Block {
+        let stmts = node_stmts(node)
+        if stmts == -1 {
+            return false
+        }
+        let mut i = 0
+        while i < sublist_length(stmts) {
+            if rw_diverges(r, sublist_get(stmts, i)) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if kind == NodeKind.IfExpr {
+        let e = node_else_body(node)
+        return rw_diverges(r, node_condition(node)) || (e != -1 && rw_diverges(r, node_then_body(node)) && rw_diverges(r, e))
+    }
+    if kind == NodeKind.MatchExpr {
+        if rw_diverges(r, node_scrutinee(node)) {
+            return true
+        }
+        let arms = node_arms(node)
+        if arms == -1 || sublist_length(arms) == 0 {
+            return false
+        }
+        let mut i = 0
+        while i < sublist_length(arms) {
+            if !rw_diverges(r, node_body(sublist_get(arms, i))) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if rw_is_short_circuit(node) || (kind == NodeKind.UnaryOp && node_op(node) == "?") {
+        return rw_diverges(r, node_left(node))
+    }
+    if kind == NodeKind.WhileLoop {
+        return rw_diverges(r, node_condition(node))
+    }
+    if kind == NodeKind.ForIn {
+        return rw_diverges(r, node_iterable(node))
+    }
+    // A `loop` finishes only through a `break` of its own, which typecheck reads into its type.
+    if kind == NodeKind.LoopExpr {
+        return rw_is_never(node)
+    }
+    if (kind == NodeKind.Call || kind == NodeKind.MethodCall) && rw_is_never(node) {
+        return true
+    }
+    // Every other kind runs each of its value children before it finishes.
+    rw_any_diverges(r, node_value_child_ids(node))
+}
+
+fn rw_is_short_circuit(node: Int) -> Bool {
+    node_kind(node) == NodeKind.BinOp && (node_op(node) == "&&" || node_op(node) == "||" || node_op(node) == "??")
 }
 
 // The children run left to right, so the walk takes them right to left.
@@ -694,24 +775,35 @@ fn rw_walk_kids(r: RetWrites, p: RwPath, node: Int, after: Bool) -> Bool {
 
 // A loop's head, the least fixpoint of `head = enter(body, head)`. The flag only grows, so
 // a second walk settles it.
-fn rw_walk_loop(r: RetWrites, p: RwPath, body: Int, exit: Bool, cond: Int, falls_out: Bool) -> Bool {
+fn rw_walk_loop(r: RetWrites, p: RwPath, node: Int, exit: Bool) -> Bool {
+    let key = node * 4 + (if exit { 2 } else { 0 }) + (if p.ret { 1 } else { 0 })
+    match r.heads.get(key) {
+        Some(h) => return h
+        None => {}
+    }
+    let kind = node_kind(node)
+    let cond = if kind == NodeKind.WhileLoop { node_condition(node) } else { -1 }
+    // A `while` or a `for` can end without a `break`; a `loop` cannot.
+    let falls_out = kind != NodeKind.LoopExpr
     let mut head = false
     loop {
         p.brk.push(exit)
         p.cont.push(head)
-        let b = rw_walk(r, p, body, head)
+        let b = rw_walk(r, p, node_body(node), head)
         let _ = p.brk.pop()
         let _ = p.cont.pop()
         let next = rw_walk(r, p, cond, (falls_out && exit) || b)
         if next == head {
-            return head
+            break
         }
         head = next
     }
+    r.heads.insert(key, head)
+    head
 }
 
 // Whether a path from just before `node` reaches the return, given whether the path from
-// just after it does.
+// just after it does. A child that runs after one that diverges is walked with `false`.
 fn rw_walk(r: RetWrites, p: RwPath, node: Int, after: Bool) -> Bool {
     if node == -1 {
         return after
@@ -734,48 +826,84 @@ fn rw_walk(r: RetWrites, p: RwPath, node: Int, after: Bool) -> Bool {
         let _ = rw_walk(r, inner, node_body(node), after)
         return after
     }
-    let out = after && !rw_is_never(node)
     if kind == NodeKind.Block {
         let stmts = node_stmts(node)
-        let mut on = out
-        if stmts != -1 {
-            let mut i = sublist_length(stmts)
-            while i > 0 {
-                i = i - 1
-                on = rw_walk(r, p, sublist_get(stmts, i), on)
-            }
+        if stmts == -1 {
+            return after
+        }
+        let n = sublist_length(stmts)
+        if n == 0 {
+            return after
+        }
+        let mut last = 0
+        while last < n - 1 && !rw_diverges(r, sublist_get(stmts, last)) {
+            last = last + 1
+        }
+        let mut on = after
+        let mut i = last + 1
+        while i > 0 {
+            i = i - 1
+            on = rw_walk(r, p, sublist_get(stmts, i), on)
         }
         return on
     }
     if kind == NodeKind.IfExpr {
-        let t = rw_walk(r, p, node_then_body(node), out)
-        let e = rw_walk(r, p, node_else_body(node), out)
-        return rw_walk(r, p, node_condition(node), t || e)
+        let cond = node_condition(node)
+        let on = after && !rw_diverges(r, cond)
+        let t = rw_walk(r, p, node_then_body(node), on)
+        let e = rw_walk(r, p, node_else_body(node), on)
+        return rw_walk(r, p, cond, t || e)
     }
     if kind == NodeKind.MatchExpr {
-        return rw_walk(r, p, node_scrutinee(node), rw_walk_arms(r, p, node_arms(node), out))
+        let scrut = node_scrutinee(node)
+        let on = after && !rw_diverges(r, scrut)
+        return rw_walk(r, p, scrut, rw_walk_arms(r, p, node_arms(node), on))
     }
-    if kind == NodeKind.BinOp && (node_op(node) == "&&" || node_op(node) == "||" || node_op(node) == "??") {
-        let right = rw_walk(r, p, node_right(node), out)
-        return rw_walk(r, p, node_left(node), out || right)
+    if rw_is_short_circuit(node) {
+        let left = node_left(node)
+        let right = rw_walk(r, p, node_right(node), after && !rw_diverges(r, left))
+        return rw_walk(r, p, left, after || right)
     }
     if kind == NodeKind.UnaryOp && node_op(node) == "?" {
-        return rw_walk(r, p, node_left(node), out || p.ret)
+        return rw_walk(r, p, node_left(node), after || p.ret)
     }
     if kind == NodeKind.WhileLoop {
-        return rw_walk_loop(r, p, node_body(node), out, node_condition(node), true)
+        if rw_diverges(r, node_condition(node)) {
+            return rw_walk(r, p, node_condition(node), false)
+        }
+        return rw_walk_loop(r, p, node, after)
     }
     if kind == NodeKind.LoopExpr {
-        return rw_walk_loop(r, p, node_body(node), out, -1, false)
+        return rw_walk_loop(r, p, node, after)
     }
     if kind == NodeKind.ForIn {
-        let head = rw_walk_loop(r, p, node_body(node), out, -1, true)
-        return rw_walk(r, p, node_iterable(node), head)
+        let iter = node_iterable(node)
+        let head = if rw_diverges(r, iter) { false } else { rw_walk_loop(r, p, node, after) }
+        return rw_walk(r, p, iter, head)
     }
+    if kind == NodeKind.WithBlock {
+        // The resources open in order before the body runs.
+        let mut res: List[Int] = []
+        let hs = node_handlers(node)
+        let mut h = 0
+        while hs != -1 && h < sublist_length(hs) {
+            res.push(sublist_get(hs, h))
+            h = h + 1
+        }
+        let mut on = rw_walk(r, p, node_body(node), after && !rw_any_diverges(r, res))
+        let mut i = res.len()
+        while i > 0 {
+            i = i - 1
+            on = rw_walk(r, p, res.get(i).unwrap(), on)
+        }
+        return on
+    }
+    // The node's own step, a store or a call, runs after all its children.
+    let live = after && !rw_diverges(r, node)
     if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
         let target = node_target(node)
-        rw_write(r, p, rw_assign_root(target), node, out)
-        let on = rw_walk(r, p, node_value(node), out)
+        rw_write(r, p, assign_root_name(target), node, live)
+        let on = rw_walk(r, p, node_value(node), live)
         if target == -1 || node_kind(target) == NodeKind.Ident {
             return on
         }
@@ -784,49 +912,40 @@ fn rw_walk(r: RetWrites, p: RwPath, node: Int, after: Bool) -> Bool {
     if kind == NodeKind.MethodCall {
         let obj = node_obj(node)
         if obj != -1 && node_kind(obj) == NodeKind.Ident && is_mutating_method(node_method(node)) != 0 {
-            rw_write(r, p, node_name(obj), node, out)
+            rw_write(r, p, node_name(obj), node, live)
         }
     }
-    if kind == NodeKind.Call && out {
+    if kind == NodeKind.Call && live {
         let callee_name = extract_ident_name(node_left(node))
         if callee_name.is_some() {
             let callee_idx = fn_index(callee_name.unwrap())
             if callee_idx >= 0 {
-                r.edge_from.push(p.fn_idx)
-                r.edge_to.push(callee_idx)
-                r.edge_node.push(node)
+                r.callers.get(callee_idx).unwrap().push(p.fn_idx)
+                r.call_nodes.get(callee_idx).unwrap().push(node)
             }
         }
     }
-    rw_walk_kids(r, p, node, out)
+    rw_walk_kids(r, p, node, live)
 }
 
-// A guard that fails moves on to a later arm, so a guard's path goes on when its own arm's
-// does or any arm's does.
+// Trying an arm leads to its guard, or its body when it has none, if the pattern matches,
+// and to the next arm if it does not. A guard that fails moves on to the next arm too, so
+// the walk takes the arms last to first.
 fn rw_walk_arms(r: RetWrites, p: RwPath, arms: Int, after: Bool) -> Bool {
     if arms == -1 {
         return false
     }
-    let n = sublist_length(arms)
-    let mut bodies: List[Bool] = []
-    let mut any = false
-    let mut i = 0
-    while i < n {
-        let b = rw_walk(r, p, node_body(sublist_get(arms, i)), after)
-        bodies.push(b)
-        any = any || b
-        i = i + 1
+    let mut next = false
+    let mut i = sublist_length(arms)
+    while i > 0 {
+        i = i - 1
+        let arm = sublist_get(arms, i)
+        let guard = node_guard(arm)
+        let b = rw_walk(r, p, node_body(arm), after && !rw_diverges(r, guard))
+        let g = if guard == -1 { b } else { rw_walk(r, p, guard, b || next) }
+        next = g || next
     }
-    let mut enter = false
-    i = 0
-    while i < n {
-        let guard = node_guard(sublist_get(arms, i))
-        let b = bodies.get(i).unwrap()
-        let g = if guard == -1 { b } else { rw_walk(r, p, guard, b || any) }
-        enter = enter || g
-        i = i + 1
-    }
-    enter
+    next
 }
 
 // The least fixpoint over the call edges that go on to a return, as propagate_writes does
@@ -834,7 +953,10 @@ fn rw_walk_arms(r: RetWrites, p: RwPath, arms: Int, after: Bool) -> Bool {
 // `vias` from any fn ends at a write.
 fn rw_compute(fns: Int) -> RetWrites {
     let n_fns = ma_fn_names.len()
-    let r = RetWrites { bits: [], globals: [], sites: [], vias: [], edge_from: [], edge_to: [], edge_node: [] }
+    let r = RetWrites {
+        bits: [], globals: [], sites: [], vias: [], callers: [], call_nodes: [],
+        diverges: Map.new(), heads: Map.new(),
+    }
     let mut i = 0
     while i < n_fns * writes_words {
         r.bits.push(0.to_u64())
@@ -845,28 +967,21 @@ fn rw_compute(fns: Int) -> RetWrites {
         r.globals.push([])
         r.sites.push([])
         r.vias.push([])
+        r.callers.push([])
+        r.call_nodes.push([])
         i = i + 1
     }
     let kids: List[Int] = []
     i = 0
     while i < n_fns {
-        let p = RwPath { fn_idx: i, ret: true, brk: [], cont: [], kids: kids }
-        let _ = rw_walk(r, p, node_body(sublist_get(fns, i)), true)
+        // rw_add keeps the set inside the write set, so a fn that writes nothing adds nothing.
+        if fn_writes_idx.get(i).unwrap().len() > 0 {
+            let p = RwPath { fn_idx: i, ret: true, brk: [], cont: [], kids: kids }
+            let _ = rw_walk(r, p, node_body(sublist_get(fns, i)), true)
+        }
         i = i + 1
     }
 
-    let n_edges = r.edge_from.len()
-    let mut callers: List[List[Int]] = []
-    i = 0
-    while i < n_fns {
-        callers.push([])
-        i = i + 1
-    }
-    let mut e = 0
-    while e < n_edges {
-        callers.get(r.edge_to.get(e).unwrap()).unwrap().push(e)
-        e = e + 1
-    }
     let mut queue: List[Int] = []
     let mut queued: List[Bool] = []
     i = 0
@@ -886,12 +1001,15 @@ fn rw_compute(fns: Int) -> RetWrites {
         let gs = r.globals.get(callee).unwrap()
         // Snapshot length: a self edge grows the list being read.
         let n_gs = gs.len()
-        for edge in callers.get(callee).unwrap() {
-            let caller = r.edge_from.get(edge).unwrap()
+        let froms = r.callers.get(callee).unwrap()
+        let nodes = r.call_nodes.get(callee).unwrap()
+        let mut e = 0
+        while e < froms.len() {
+            let caller = froms.get(e).unwrap()
             let mut grew = false
             let mut k = 0
             while k < n_gs {
-                if rw_add(r, caller, gs.get(k).unwrap(), r.edge_node.get(edge).unwrap(), callee) {
+                if rw_add(r, caller, gs.get(k).unwrap(), nodes.get(e).unwrap(), callee) {
                     grew = true
                 }
                 k = k + 1
@@ -900,6 +1018,7 @@ fn rw_compute(fns: Int) -> RetWrites {
                 queue.push(caller)
                 queued.set(caller, true)
             }
+            e = e + 1
         }
     }
     r
@@ -1272,7 +1391,7 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
                 if checked.len() == 0 {
                     note_pair = i
                 }
-                if restored_pair < 0 && is_global(global) != 0 && rw_has(w.ret, callee_idx, global_index(global)) {
+                if restored_pair < 0 && fn_has_write(callee_idx, global) != 0 {
                     restored_pair = i
                 }
                 checked.push(global)
@@ -1283,20 +1402,22 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
 
     let wstart = ma_write_starts.get(callee_idx).unwrap()
     let mut write_items: List[Str] = []
+    let mut return_items: List[Str] = []
     let mut unsaved: List[Str] = []
     let mut restored: List[Str] = []
-    // The write set names every write, in the note; only the return write set is checked.
+    // A pair saves any global the callee writes, but only one the callee can return with
+    // changed needs a save.
     let mut wi = 0
     while wi < wcount {
         let gname = ma_write_items.get(wstart + wi).unwrap()
         write_items.push(gname)
-        if !rw_has(w.ret, callee_idx, global_index(gname)) {
-            wi = wi + 1
-            continue
+        let on_return = rw_has(w.ret, callee_idx, global_index(gname))
+        if on_return {
+            return_items.push(gname)
         }
         if checked.contains(gname) {
             restored.push(gname)
-        } else if !bound.contains(gname) {
+        } else if on_return && !bound.contains(gname) {
             unsaved.push(gname)
         }
         wi = wi + 1
@@ -1304,7 +1425,10 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
     if unsaved.len() == 0 {
         return
     }
-    let writes_note = "`{callee}` writes \{{str_join(write_items, ", ")}}"
+    let mut writes_note = "`{callee}` writes \{{str_join(write_items, ", ")}}"
+    if return_items.len() < write_items.len() {
+        writes_note = "{writes_note} · on return \{{str_join(return_items, ", ")}}"
+    }
     let site_note = rw_write_site_note(w.ret, callee_idx, global_index(unsaved.get(0).unwrap()))
     let missing = str_join(unsaved, ", ")
 

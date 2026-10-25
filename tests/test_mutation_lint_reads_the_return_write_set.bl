@@ -495,3 +495,262 @@ test "break and continue carry a write on to the return" {
     assert_eq(mutation_lints(out), 1)
     compile_test_helpers.expect_contains(out, "call to `scan` in `look` mutates [seen, count];", "loop names seen and count")
 }
+
+// A store runs after its value, and a call after its arguments, so a value or an argument
+// of type Never ends the path before the write. So does a statement after a call to a
+// `-> Never` function in the same block.
+test "a write after an expression of type Never is not in the return write set" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut code = 0"#,
+        #"let mut items: List[Int] = []"#,
+        #""#,
+        #"fn fail() -> Never ! Env.Exit {"#,
+        #"    env.exit(3)"#,
+        #"}"#,
+        #""#,
+        #"fn note(n: Int) {"#,
+        #"    code = n"#,
+        #"}"#,
+        #""#,
+        #"fn stop(c: Int) ! Env.Exit {"#,
+        #"    if c == 1 { code = fail() }"#,
+        #"    if c == 2 { items.push(fail()) }"#,
+        #"    if c == 3 { note(fail()) }"#,
+        #"    if c == 4 {"#,
+        #"        fail()"#,
+        #"        code = 1"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look(c: Int) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    stop(c)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(0)"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_write_after_never")
+}
+
+// The `if` has no else, so the path where `c` is false goes on to the return, and the write
+// before the `if` goes with it.
+test "a trailing if whose branch ends in env.exit keeps the writes before it" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn step(c: Bool) ! Env.Exit {"#,
+        #"    count = count + 1"#,
+        #"    if c { env.exit(2) }"#,
+        #"}"#,
+        #""#,
+        #"fn look(c: Bool) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    step(c)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(false)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_trailing_if_exit"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 11, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `step` in `look` mutates [count];", "trailing if names count")
+}
+
+// A `with` opens its resource before the body runs, so the resource is on the path the body
+// takes, here a `return`. The write of `count` at line 13 puts `count` in the write set
+// of `use_it` directly; the warning comes through the call to `acquire`.
+test "the resource of a with block is on the path its body takes to the return" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"type Res { n: Int }"#,
+        #"impl Closeable for Res { fn close(_self) {} }"#,
+        #""#,
+        #"fn fail() -> Never ! Env.Exit {"#,
+        #"    env.exit(3)"#,
+        #"}"#,
+        #""#,
+        #"fn acquire() -> Res {"#,
+        #"    count = count + 1"#,
+        #"    Res { n: 1 }"#,
+        #"}"#,
+        #""#,
+        #"fn use_it(x: Int) -> Int ! Env.Exit {"#,
+        #"    if x > 5 {"#,
+        #"        count = 2"#,
+        #"        fail()"#,
+        #"    }"#,
+        #"    with acquire() as r {"#,
+        #"        return r.n + x"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look() -> Int ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    let v = use_it(1)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = look()"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_with_resource_return"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 28, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    let file = scratch_file(tag)
+    compile_test_helpers.expect_contains(out, "`count` is written at {file}:12, in `acquire`, called from `use_it` at {file}:21", "with resource write-site note")
+}
+
+// A guard that fails moves on to the arms after it, not the ones before it. Here every arm
+// after the guard ends in a call to a `-> Never` function, so the write in the guard does
+// not reach the return, though the first arm does.
+test "a failed match guard goes on only to the arms after it" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn fail() -> Never ! Env.Exit {"#,
+        #"    env.exit(3)"#,
+        #"}"#,
+        #""#,
+        #"fn bump() -> Bool {"#,
+        #"    count = count + 1"#,
+        #"    true"#,
+        #"}"#,
+        #""#,
+        #"fn pick(x: Int) ! Env.Exit {"#,
+        #"    match x {"#,
+        #"        1 => {}"#,
+        #"        _ if bump() => fail()"#,
+        #"        _ => fail()"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look(x: Int) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    pick(x)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(1)"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_guard_later_arms")
+}
+
+// `err` is in the write set of `step` but not in its return write set. The pair around the
+// call still saves it, so the warning is W0550, and its notes say which writes reach the
+// return.
+test "a pair that saves a global off the return path is still a save around the call" {
+    let src = [
+        #"let mut err = """#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn step(n: Int) -> Int ! Env.Exit {"#,
+        #"    if n < 0 {"#,
+        #"        err = "neg""#,
+        #"        env.exit(101)"#,
+        #"    }"#,
+        #"    count = count + 1"#,
+        #"    n"#,
+        #"}"#,
+        #""#,
+        #"fn peek(n: Int) -> Int ! Env.Exit {"#,
+        #"    let se = err"#,
+        #"    let v = step(n)"#,
+        #"    err = se"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = peek(1)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_pair_off_return_path"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0550", 15, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `step` in `peek` mutates [count] which are not saved/restored (write-set: 2 globals, saved: 1)", "off-path pair header")
+    compile_test_helpers.expect_contains(out, #"`step` writes {err, count} · on return {count}"#, "off-path writes note")
+    compile_test_helpers.expect_contains(out, "only [err] is restored after the call", "off-path restored note")
+}
+
+// The closure's type says it returns Never only once typecheck infers it from the body; the
+// call still ends the path.
+test "a call of a closure whose Never return is inferred ends the path" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn stop_on(c: Bool) ! Env.Exit {"#,
+        #"    let stop = fn() {"#,
+        #"        env.exit(3)"#,
+        #"    }"#,
+        #"    if c {"#,
+        #"        count = count + 1"#,
+        #"        stop()"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look(c: Bool) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    stop_on(c)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(true)"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_inferred_never_closure")
+}
+
+// A loop's head is settled in a bounded number of walks of its body, and a nested loop
+// inside it is not walked again for each of them. With an early return after each loop,
+// 28 levels took 2^28 walks of the inner body.
+test "deeply nested loops with early returns are walked a bounded number of times" {
+    let depth = 28
+    let mut lines: List[Str] = [#"let mut pos = 0"#, #"let mut count = 0"#, #""#, #"fn spin() {"#]
+    let mut i = 0
+    while i < depth {
+        lines.push(#"while count < 3 {"#)
+        i = i + 1
+    }
+    lines.push(#"count = count + 1"#)
+    i = 0
+    while i < depth {
+        lines.push(#"}"#)
+        lines.push(#"if count > 5 { return }"#)
+        i = i + 1
+    }
+    lines.push(#"}"#)
+    lines.push(#""#)
+    lines.push(#"fn look() {"#)
+    lines.push(#"    let saved = pos"#)
+    lines.push(#"    spin()"#)
+    lines.push(#"    pos = saved"#)
+    lines.push(#"}"#)
+    lines.push(#""#)
+    lines.push(#"fn main() { look() }"#)
+    let tag = "_rw_nested_loops"
+    let out = compile_test_helpers.compile_and_capture(lines.join("\n"), tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    compile_test_helpers.expect_contains(out, "call to `spin` in `look` mutates [count];", "nested loops names count")
+}
